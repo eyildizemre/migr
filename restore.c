@@ -7,8 +7,6 @@
 #include "detect.h"
 #include "utils.h"
 
-extern int verbose;
-
 static int file_exists(const char *path)
 {
     struct stat st;
@@ -19,12 +17,18 @@ static int copy_to_home(const char *src, const char *home)
 {
     char cmd[1024];
     snprintf(cmd, sizeof(cmd), "cp -r '%s' '%s/'", src, home);
-    
+
+    if (dry_run)
+    {
+        printf("  Would restore: %s -> %s/\n", src, home);
+        return 0;
+    }
+
     if (verbose)
     {
         printf("  Restoring: %s\n", src);
     }
-    
+
     return system(cmd);
 }
 
@@ -45,7 +49,11 @@ int restore(const char *source)
         return 1;
     }
 
-    if (!confirm_action("This will restore files to your home directory. Continue?"))
+    if (dry_run)
+    {
+        printf("Dry run mode enabled. No changes will be made.\n\n");
+    }
+    else if (!confirm_action("This will restore files to your home directory. Continue?"))
     {
         printf("Cancelled.\n");
         return 0;
@@ -83,32 +91,29 @@ int restore(const char *source)
 
     char pkg_path[512];
     snprintf(pkg_path, sizeof(pkg_path), "%s/packages.txt", source);
-    
+
     if (file_exists(pkg_path))
     {
         printf("\n[Packages]\n");
-        
+
         distro_t distro = detect_distro();
         char cmd[1024];
-        
+
         switch (distro)
         {
             case DISTRO_DEBIAN:
-                printf("Installing packages (this may take a while)...\n");
-                snprintf(cmd, sizeof(cmd), 
-                    "sudo dpkg --set-selections < '%s' && sudo apt-get dselect-upgrade -y", 
+                snprintf(cmd, sizeof(cmd),
+                    "sudo dpkg --set-selections < '%s' && sudo apt-get dselect-upgrade -y",
                     pkg_path);
                 break;
             case DISTRO_FEDORA:
-                printf("Installing packages (this may take a while)...\n");
-                snprintf(cmd, sizeof(cmd), 
-                    "sudo dnf install -y $(cat '%s')", 
+                snprintf(cmd, sizeof(cmd),
+                    "sudo dnf install -y $(cat '%s')",
                     pkg_path);
                 break;
             case DISTRO_ARCH:
-                printf("Installing packages (this may take a while)...\n");
-                snprintf(cmd, sizeof(cmd), 
-                    "sudo pacman -S --needed - < '%s'", 
+                snprintf(cmd, sizeof(cmd),
+                    "sudo pacman -S --needed - < '%s'",
                     pkg_path);
                 break;
             default:
@@ -116,14 +121,22 @@ int restore(const char *source)
                 cmd[0] = '\0';
                 break;
         }
-        
+
         if (cmd[0] != '\0')
         {
-            if (verbose)
+            if (dry_run)
             {
-                printf("Running: %s\n", cmd);
+                printf("  Would run: %s\n", cmd);
             }
-            system(cmd);
+            else
+            {
+                printf("Installing packages (this may take a while)...\n");
+                if (verbose)
+                {
+                    printf("Running: %s\n", cmd);
+                }
+                system(cmd);
+            }
         }
     }
     else
@@ -132,7 +145,10 @@ int restore(const char *source)
     }
 
     printf("\n===========================================================\n");
-    printf("Restore complete: %d items restored\n", count);
+    if (dry_run)
+        printf("Dry run complete: %d items would be restored\n", count);
+    else
+        printf("Restore complete: %d items restored\n", count);
     printf("===========================================================\n");
 
     return 0;
