@@ -10,57 +10,72 @@
 
 int main(int argc, char *argv[])
 {
-    // If no arguments or only -report flag, show report
+    char *command = NULL;
+    char *arg = NULL;
+
     if (argc < 2)
     {
         report();
         return 0;
     }
 
-    // -v flag control (verbose mode)
     for (int i = 1; i < argc; i++)
     {
         if (strcmp(argv[i], "-v") == 0)
         {
             verbose = 1;
         }
+        else if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--dry-run") == 0)
+        {
+            dry_run = 1;
+        }
+        else if (command == NULL)
+        {
+            command = argv[i];
+        }
+        else if (arg == NULL)
+        {
+            arg = argv[i];
+        }
     }
 
-    // Check main flags
-    if (strcmp(argv[1], "-report") == 0)
+    if (command == NULL)
     {
         report();
     }
-    else if (strcmp(argv[1], "-backup") == 0)
+    else if (strcmp(command, "-report") == 0)
     {
-        if (argc < 3)
+        report();
+    }
+    else if (strcmp(command, "-backup") == 0)
+    {
+        if (arg == NULL)
         {
             printf("Usage: migr -backup <PATH>\n");
             return 1;
         }
-        backup(argv[2]);
+        backup(arg);
     }
-    else if (strcmp(argv[1], "-packages") == 0)
+    else if (strcmp(command, "-packages") == 0)
     {
-        char *path = (argc >= 3) ? argv[2] : NULL;
-        packages(path);
+        packages(arg);
     }
-    else if (strcmp(argv[1], "-restore") == 0)
+    else if (strcmp(command, "-restore") == 0)
     {
-        if (argc < 3)
+        if (arg == NULL)
         {
             printf("Usage: migr -restore <source>\n");
             return 1;
         }
-        restore(argv[2]);
+        restore(arg);
     }
-    else if (strcmp(argv[1], "-help") == 0)
+    else if (strcmp(command, "-help") == 0)
     {
         print_help();
     }
     else
     {
-        printf("Unknown flag: %s\n", argv[1]);
+        printf("Unknown flag: %s\n", command);
         printf("For help: migr -help\n");
         return 1;
     }
