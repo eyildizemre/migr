@@ -8,15 +8,19 @@
 #include "packages.h"
 #include "utils.h"
 
-extern int verbose;
-
 // create directory if it doesn't exist
 static int create_dir(const char *path)
 {
     struct stat st;
     if (stat(path, &st) == 0)
         return 0;
-    
+
+    if (dry_run)
+    {
+        printf("[dry-run] Would create directory: %s\n", path);
+        return 0;
+    }
+
     if (mkdir(path, 0755) != 0)
     {
         printf("Error: Could not create directory %s\n", path);
@@ -30,12 +34,18 @@ static int copy_item(const char *src, const char *dest)
 {
     char cmd[1024];
     snprintf(cmd, sizeof(cmd), "cp -r '%s' '%s' 2>/dev/null", src, dest);
-    
+
+    if (dry_run)
+    {
+        printf("  Would copy: %s -> %s\n", src, dest);
+        return 0;
+    }
+
     if (verbose)
     {
         printf("  Copying: %s\n", src);
     }
-    
+
     return system(cmd);
 }
 
@@ -64,11 +74,16 @@ int backup(const char *target)
     if (create_dir(backup_dir) != 0)
         return 1;
 
+    if (dry_run)
+    {
+        printf("Dry run mode enabled. No changes will be made.\n\n");
+    }
+
     printf("Backing up to: %s\n\n", backup_dir);
 
     // copy main directories
     const char *main_dirs[] = {"Documents", "Desktop", "Projects", NULL};
-    
+
     // copy dotfiles
     const char *dotfiles[] = {".ssh", ".gnupg", ".gitconfig", ".bashrc", ".profile", NULL};
 
@@ -102,10 +117,21 @@ int backup(const char *target)
     printf("\n[Packages]\n");
     char pkg_path[512];
     snprintf(pkg_path, sizeof(pkg_path), "%s/packages.txt", backup_dir);
-    packages(pkg_path);
+
+    if (dry_run)
+    {
+        printf("  Would export package list to: %s\n", pkg_path);
+    }
+    else
+    {
+        packages(pkg_path);
+    }
 
     printf("\n===========================================================\n");
-    printf("Backup complete: %d items copied\n", count);
+    if (dry_run)
+        printf("Dry run complete: %d items would be copied\n", count);
+    else
+        printf("Backup complete: %d items copied\n", count);
     printf("Location: %s\n", backup_dir);
     printf("===========================================================\n");
 

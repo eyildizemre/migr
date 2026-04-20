@@ -4,6 +4,7 @@
 #include "utils.h"
 
 int verbose = 0;
+int dry_run = 0;
 
 void print_help(void)
 {
@@ -13,6 +14,7 @@ void print_help(void)
     printf("  -backup <PATH>        Backup the files & directories to the specified PATH\n");
     printf("  -packages             List packages that are installed on the setup\n");
     printf("  -restore <SOURCE>     Restore files & directories from the specified source\n");
+    printf(" -n, --dry-run Preview actions without making changes\n");
     printf("  -help                 Display this help message\n");
 }
 
