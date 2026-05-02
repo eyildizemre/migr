@@ -10,6 +10,7 @@
 #include <string.h>
 #include <time.h>
 #include <limits.h> // to use PATH_MAX
+#include <errno.h>
 
 static int preserve_metadata(const char *path, const struct stat *st)
 {
@@ -105,7 +106,7 @@ int clone_recursive(const char *src, const char *dest)
     {
 
         int dst = mkdir(dest, st.st_mode);
-        if (dst == -1)
+        if (dst == -1 && errno != EEXIST) // If the directory already exists, we can ignore the error
         {
             return -1;
         }
