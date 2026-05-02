@@ -141,3 +141,59 @@ int clone_recursive(const char *src, const char *dest)
 
     return -1; // unsupported file type
 }
+
+int get_dir_size(const char *path, off_t *size)
+{
+    struct stat st;
+    if (lstat(path, &st) != 0)
+    {
+        return -1;
+    }
+
+    // If it's a symlink, we don't follow it, so we just add the size of the link itself
+    if (S_ISLNK(st.st_mode))
+    {        
+        *size += st.st_size;
+        return 0;
+    }
+
+    // If it's a regular file, add its size to the total
+    if (S_ISREG(st.st_mode))
+    {
+        *size += st.st_size;
+        return 0;
+    }
+
+    // If it's a directory, recursively calculate the size of its contents
+    if (S_ISDIR(st.st_mode))
+    {
+        DIR *dir = opendir(path);
+        if (dir == NULL)
+        {
+            return -1;
+        }
+
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL)
+        {
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            {
+                continue;
+            }
+
+            char new_path[PATH_MAX];
+            snprintf(new_path, sizeof(new_path), "%s/%s", path, entry->d_name);
+
+            *size += st.st_size; // add the size of the directory entry itself
+            
+            if (get_dir_size(new_path, size) != 0)
+            {
+                closedir(dir);
+                return -1;
+            }
+        }
+
+        closedir(dir);
+    }
+    return 0;
+}
