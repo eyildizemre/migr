@@ -1,9 +1,11 @@
 #define _GNU_SOURCE
 #include <stdio.h>
+#include <stdlib.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <dirent.h>
 #include <string.h>
 #include <time.h>
@@ -167,6 +169,8 @@ int get_dir_size(const char *path, off_t *size)
     // If it's a directory, recursively calculate the size of its contents
     if (S_ISDIR(st.st_mode))
     {
+        *size += st.st_size; // add the size of the directory itself
+
         DIR *dir = opendir(path);
         if (dir == NULL)
         {
@@ -184,8 +188,6 @@ int get_dir_size(const char *path, off_t *size)
             char new_path[PATH_MAX];
             snprintf(new_path, sizeof(new_path), "%s/%s", path, entry->d_name);
 
-            *size += st.st_size; // add the size of the directory entry itself
-            
             if (get_dir_size(new_path, size) != 0)
             {
                 closedir(dir);
@@ -196,4 +198,41 @@ int get_dir_size(const char *path, off_t *size)
         closedir(dir);
     }
     return 0;
+}
+
+int run_command(char *const argv[])
+{
+    pid_t pid = fork();
+
+    if (pid == -1)
+    {
+        return -1; // fork failed
+    }
+    else if (pid == 0)
+    {
+        // Child process
+        execvp(argv[0], argv);
+        
+        // If execvp returns, it means it failed
+        perror("execvp");
+        _exit(1); // _exit() is used to exit immediately since we're in a child process. 
+                  // exit() could've caused issues because it might flush stdio buffers that are shared with the parent process.
+    }
+    else 
+    {
+        // Parent process
+        int status;
+
+        // Wait for the child process to finish so it won't become a zombie process
+        if (waitpid(pid, &status, 0) == -1)
+        {
+            return -1;
+        }
+
+        if(WIFEXITED(status))
+        {
+            return WEXITSTATUS(status); // return the exit status of the child process
+        }
+    }
+    return -1; // should not reach here
 }
