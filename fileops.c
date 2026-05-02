@@ -237,3 +237,56 @@ int run_command(char *const argv[])
     }
     return -1; // should not reach here
 }
+
+int run_command_capture(char *const argv[], char *output, size_t output_size)
+{
+    int pipefd[2];
+    if (pipe(pipefd) == -1)
+    {
+        return -1; // pipe creation failed
+    }
+
+    pid_t pid = fork();
+    if (pid == -1)
+    {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return -1; // fork failed
+    }
+    else if (pid == 0)
+    {
+        // Child process
+        close(pipefd[0]); // Close the read end of the pipe
+        
+        dup2(pipefd[1], STDOUT_FILENO); // Redirect stdout to the write end of the pipe
+        close(pipefd[1]); // Close the original write end of the pipe
+        
+        execvp(argv[0], argv); // Execute the command
+
+        // If execvp returns, it means it failed
+        perror("execvp");
+        _exit(1); // Exit immediately since we're in a child process
+    }
+    else
+    {
+        // Parent process
+        close(pipefd[1]); // Close the write end of the pipe
+
+        size_t total = 0;
+        ssize_t bytes_read;
+        while ((bytes_read = read(pipefd[0], output + total, output_size - total - 1)) > 0)
+        {
+            total += bytes_read;
+        }
+        output[total] = '\0'; // Null-terminate the output string
+
+        close(pipefd[0]); // Close the read end of the pipe
+        int status;
+        waitpid(pid, &status, 0); // Wait for the child process to finish
+        
+        if (WIFEXITED(status)) {
+            return WEXITSTATUS(status); // Return the exit status of the child process
+        }
+    }
+    return -1; // should not reach here
+}
