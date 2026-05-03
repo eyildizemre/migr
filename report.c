@@ -1,10 +1,13 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <limits.h>
 #include "report.h"
 #include "detect.h"
+#include "fileops.h"
 #include "utils.h"
 
 extern int verbose;
@@ -21,53 +24,8 @@ static int file_exists(const char *path)
     return (stat(path, &st) == 0);
 }
 
-static void get_size(const char *path, char *size_buf, size_t buf_len)
-{
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "du -sh '%s' 2>/dev/null | cut -f1", path);
 
-    FILE *pipe = popen(cmd, "r");
-    if (pipe == NULL)
-    {
-        strncpy(size_buf, "???", buf_len);
-        return;
-    }
-
-    if (fgets(size_buf, buf_len, pipe) == NULL)
-    {
-        strncpy(size_buf, "???", buf_len);
-    }
-    else
-    {
-        size_buf[strcspn(size_buf, "\n")] = '\0';
-    }
-
-    pclose(pipe);
-}
-
-static long get_size_bytes(const char *path)
-{
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "du -sb '%s' 2>/dev/null | cut -f1", path);
-
-    FILE *pipe = popen(cmd, "r");
-    if (pipe == NULL)
-    {
-        return 0;
-    }
-
-    char buf[64];
-    long size = 0;
-    if (fgets(buf, sizeof(buf), pipe) != NULL)
-    {
-        size = atol(buf);
-    }
-
-    pclose(pipe);
-    return size;
-}
-
-static void format_size(long bytes, char *buf, size_t len)
+static void format_size(off_t bytes, char *buf, size_t len)
 {
     if (bytes >= 1073741824)
     {
@@ -83,7 +41,7 @@ static void format_size(long bytes, char *buf, size_t len)
     }
     else
     {
-        snprintf(buf, len, "%ldB", bytes);
+        snprintf(buf, len, "%lldB", (long long)bytes);
     }
 }
 
@@ -114,7 +72,7 @@ int report(void)
     printf("Distro: %s\n", get_distro_name(distro));
     printf("Home:   %s\n", home);
 
-    char path[512];
+    char path[PATH_MAX];
     char size[32];
 
     // main user directories
@@ -126,7 +84,9 @@ int report(void)
         snprintf(path, sizeof(path), "%s/%s", home, main_dirs[i]);
         if (dir_exists(path))
         {
-            get_size(path, size, sizeof(size));
+            off_t bytes_size = 0;
+            get_dir_size(path, &bytes_size);
+            format_size(bytes_size, size, sizeof(size));
             print_item(main_dirs[i], size);
         }
     }
@@ -140,7 +100,9 @@ int report(void)
         snprintf(path, sizeof(path), "%s/%s", home, dotfiles[i]);
         if (file_exists(path))
         {
-            get_size(path, size, sizeof(size));
+            off_t bytes_size = 0;
+            get_dir_size(path, &bytes_size);
+            format_size(bytes_size, size, sizeof(size));
             print_item(dotfiles[i], size);
         }
     }
@@ -154,7 +116,9 @@ int report(void)
         snprintf(path, sizeof(path), "%s/%s", home, dev_dirs[i]);
         if (dir_exists(path))
         {
-            get_size(path, size, sizeof(size));
+            off_t bytes_size = 0;
+            get_dir_size(path, &bytes_size);
+            format_size(bytes_size, size, sizeof(size));
             print_item(dev_dirs[i], size);
         }
     }
@@ -169,7 +133,9 @@ int report(void)
         snprintf(path, sizeof(path), "%s/%s", home, browsers[i]);
         if (dir_exists(path))
         {
-            get_size(path, size, sizeof(size));
+            off_t bytes_size = 0;
+            get_dir_size(path, &bytes_size);
+            format_size(bytes_size, size, sizeof(size));
             print_item(browser_names[i], size);
         }
     }
@@ -178,14 +144,16 @@ int report(void)
     const char *critical_dirs[] = {"Documents", "Desktop", "Projects", NULL};
     const char *critical_dots[] = {".ssh", ".gnupg", ".gitconfig", ".bashrc", NULL};
     
-    long critical_total = 0;
+    off_t critical_total = 0;
 
     for (int i = 0; critical_dirs[i] != NULL; i++)
     {
         snprintf(path, sizeof(path), "%s/%s", home, critical_dirs[i]);
         if (file_exists(path))
         {
-            critical_total += get_size_bytes(path);
+            off_t temp_size = 0;
+            get_dir_size(path, &temp_size);
+            critical_total += temp_size;
         }
     }
 
@@ -194,7 +162,9 @@ int report(void)
         snprintf(path, sizeof(path), "%s/%s", home, critical_dots[i]);
         if (file_exists(path))
         {
-            critical_total += get_size_bytes(path);
+            off_t temp_size = 0;
+            get_dir_size(path, &temp_size);
+            critical_total += temp_size;
         }
     }
 
