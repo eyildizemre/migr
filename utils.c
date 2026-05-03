@@ -1,5 +1,4 @@
 #include <stdio.h>
-#include <string.h>
 
 #include "utils.h"
 
@@ -8,14 +7,18 @@ int dry_run = 0;
 
 void print_help(void)
 {
-    printf("Usage: migr [OPTIONS]\n");
+    printf("Usage: ./migr [COMMAND] [OPTIONS]\n");
+    printf("\n");
+    printf("Commands:\n");
+    printf("  -report               Show backup analysis report (default when no arguments given)\n");
+    printf("  -backup <PATH>        Copy critical files and packages to PATH\n");
+    printf("  -packages [FILE]      List installed packages; optionally save to FILE\n");
+    printf("  -restore <SOURCE>     Restore files and packages from a backup at SOURCE\n");
+    printf("\n");
     printf("Options:\n");
-    printf("  -report               Generate a report of files & directories that need to be backup\n");
-    printf("  -backup <PATH>        Backup the files & directories to the specified PATH\n");
-    printf("  -packages             List packages that are installed on the setup\n");
-    printf("  -restore <SOURCE>     Restore files & directories from the specified source\n");
-    printf(" -n, --dry-run Preview actions without making changes\n");
-    printf("  -help                 Display this help message\n");
+    printf("  -n, --dry-run         Preview actions without making changes\n");
+    printf("  -v                    Verbose output (combine with any flag)\n");
+    printf("  -help                 Show help\n");
 }
 
 int confirm_action(const char *message)
