@@ -125,7 +125,7 @@ int backup(const char *target)
 
     // package list
     printf("\n[Packages]\n");
-    char pkg_path[PATH_MAX];
+    char pkg_path[PATH_MAX + sizeof("/packages.txt")]; // ensure enough space for path + filename
     snprintf(pkg_path, sizeof(pkg_path), "%s/packages.txt", backup_dir);
 
     if (dry_run)
