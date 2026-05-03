@@ -57,6 +57,14 @@ int clone_recursive(const char *src, const char *dest)
     // Check if the reference is a normal file
     if(S_ISREG(st.st_mode))
     {
+        struct stat dest_st;
+        if (lstat(dest, &dest_st) == 0 &&
+            dest_st.st_size == st.st_size &&
+            dest_st.st_mtim.tv_sec == st.st_mtim.tv_sec)
+        {
+            return 0; // already cloned, skip
+        }
+
         int src_fd = open(src, O_RDONLY);
         if (src_fd == -1)
         {
