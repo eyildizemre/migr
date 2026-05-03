@@ -1,83 +1,95 @@
 #include <stdio.h>
-#include <string.h>
+#include <getopt.h>
 
-#include "detect.h"
-#include "report.h"
 #include "backup.h"
 #include "packages.h"
+#include "report.h"
 #include "restore.h"
 #include "utils.h"
 
+typedef enum {
+    ACTION_NONE,
+    ACTION_REPORT,
+    ACTION_BACKUP,
+    ACTION_PACKAGES,
+    ACTION_RESTORE,
+    ACTION_HELP
+} Action;
+
 int main(int argc, char *argv[])
 {
-    char *command = NULL;
-    char *arg = NULL;
+    static struct option long_options[] = {
+        {"report",   no_argument,       NULL, 'r'},
+        {"backup",   required_argument, NULL, 'b'},
+        {"packages", no_argument,       NULL, 'p'},
+        {"restore",  required_argument, NULL, 's'},
+        {"dry-run",  no_argument,       NULL, 'n'},
+        {"help",     no_argument,       NULL, 'h'},
+        {NULL,       0,                 NULL,  0 }
+    };
 
-    if (argc < 2)
+    Action action = ACTION_NONE;
+    char *path = NULL;
+    int opt;
+
+    // Use getopt_long_only to support single-dash long arguments seamlessly
+    // (e.g., './migr -backup' instead of requiring './migr --backup')
+    while ((opt = getopt_long_only(argc, argv, "nv", long_options, NULL)) != -1)
     {
-        report();
-        return 0;
+        switch (opt)
+        {
+            case 'v': verbose = 1;              break;
+            case 'n': dry_run = 1;              break;
+            case 'r': action = ACTION_REPORT;   break;
+            case 'b': action = ACTION_BACKUP;   path = optarg; break;
+            case 'p':
+                action = ACTION_PACKAGES;
+                // WORKAROUND: getopt's `optional_argument` strictly requires '=' syntax (-packages=file).
+                // To support space-separated syntax (-packages file.txt) and match our CLI design,
+                // we declare it as `no_argument` and manually peek ahead at argv[optind].
+                if (optind < argc && argv[optind][0] != '-')
+                    path = argv[optind++];
+                break;
+            case 's': action = ACTION_RESTORE;  path = optarg; break;
+            case 'h': action = ACTION_HELP;     break;
+            case '?':
+            default:
+                printf("For help: ./migr -help\n");
+                return 1;
+        }
     }
 
-    for (int i = 1; i < argc; i++)
+    // --- EXECUTION PHASE ---
+    // Dispatching actions only after all flags are fully parsed ensures 
+    // that argument order does not matter (e.g., `-n -backup path` vs `-backup path -n`).
+    switch (action)
     {
-        if (strcmp(argv[i], "-v") == 0)
-        {
-            verbose = 1;
-        }
-        else if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--dry-run") == 0)
-        {
-            dry_run = 1;
-        }
-        else if (command == NULL)
-        {
-            command = argv[i];
-        }
-        else if (arg == NULL)
-        {
-            arg = argv[i];
-        }
-    }
-
-    if (command == NULL)
-    {
-        report();
-    }
-    else if (strcmp(command, "-report") == 0)
-    {
-        report();
-    }
-    else if (strcmp(command, "-backup") == 0)
-    {
-        if (arg == NULL)
-        {
-            printf("Usage: migr -backup <PATH>\n");
-            return 1;
-        }
-        backup(arg);
-    }
-    else if (strcmp(command, "-packages") == 0)
-    {
-        packages(arg);
-    }
-    else if (strcmp(command, "-restore") == 0)
-    {
-        if (arg == NULL)
-        {
-            printf("Usage: migr -restore <source>\n");
-            return 1;
-        }
-        restore(arg);
-    }
-    else if (strcmp(command, "-help") == 0)
-    {
-        print_help();
-    }
-    else
-    {
-        printf("Unknown flag: %s\n", command);
-        printf("For help: migr -help\n");
-        return 1;
+        case ACTION_NONE:
+        case ACTION_REPORT:
+            report();
+            break;
+        case ACTION_BACKUP:
+            if (path == NULL)
+            {
+                printf("Usage: ./migr -backup <PATH>\n");
+                return 1;
+            }
+            backup(path);
+            break;
+        case ACTION_PACKAGES:
+            packages(path);
+            break;
+        case ACTION_RESTORE:
+            if (path == NULL)
+            {
+                printf("Usage: ./migr -restore <SOURCE>\n");
+                return 1;
+            }
+            restore(path);
+            break;
+        case ACTION_HELP:
+            print_help();
+            break;
     }
 
     return 0;
