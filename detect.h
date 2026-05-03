@@ -10,7 +10,7 @@ typedef enum
 } distro_t;
 
 distro_t detect_distro(void);
-const char* get_package_cmd(distro_t distro);
+char *const *get_package_cmd(distro_t distro);
 const char* get_distro_name(distro_t distro);
 
 #endif

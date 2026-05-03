@@ -38,18 +38,18 @@ distro_t detect_distro(void)
     return DISTRO_UNKNOWN;
 }
 
-const char* get_package_cmd(distro_t distro)
+char *const *get_package_cmd(distro_t distro)
 {
+    static char *const debian_cmd[] = {"dpkg", "--get-selections", NULL};
+    static char *const fedora_cmd[] = {"rpm", "-qa", NULL};
+    static char *const arch_cmd[]   = {"pacman", "-Qe", NULL};
+
     switch (distro)
     {
-        case DISTRO_DEBIAN:
-            return "dpkg --get-selections";
-        case DISTRO_FEDORA:
-            return "rpm -qa";
-        case DISTRO_ARCH:
-            return "pacman -Qe";
-        default:
-            return NULL;
+        case DISTRO_DEBIAN: return debian_cmd;
+        case DISTRO_FEDORA: return fedora_cmd;
+        case DISTRO_ARCH:   return arch_cmd;
+        default:            return NULL;
     }
 }
 

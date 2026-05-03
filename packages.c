@@ -3,6 +3,7 @@
 #include <string.h>
 #include "packages.h"
 #include "detect.h"
+#include "fileops.h"
 #include "utils.h"
 
 extern int verbose;
@@ -10,7 +11,7 @@ extern int verbose;
 int packages(const char *path)
 {
     distro_t distro = detect_distro();
-    const char *cmd = get_package_cmd(distro);
+    char *const *cmd = get_package_cmd(distro);
 
     if (cmd == NULL)
     {
@@ -21,55 +22,55 @@ int packages(const char *path)
     if (verbose)
     {
         printf("Detected: %s\n", get_distro_name(distro));
-        printf("Running: %s\n", cmd);
+        printf("Running: %s %s\n", cmd[0], cmd[1]);
     }
 
-    FILE *pipe = popen(cmd, "r");
-    if (pipe == NULL)
+    size_t buf_size = 5 * 1024 * 1024; // 5 MB
+    char *buffer = malloc(buf_size);
+    if (buffer == NULL)
     {
-        printf("Error: Could not run package command.\n");
+        printf("Error: Could not allocate buffer.\n");
         return 1;
     }
 
-    FILE *out = NULL;
+    buffer[0] = '\0';
+
+    if (run_command_capture(cmd, buffer, buf_size) != 0)
+    {
+        printf("Error: Could not run package command.\n");
+        free(buffer);
+        return 1;
+    }
+
+    int count = 0;
+    for (char *p = buffer; *p; p++)
+    {
+        if (*p == '\n')
+            count++;
+    }
+
     if (path != NULL)
     {
-        out = fopen(path, "w");
+        FILE *out = fopen(path, "w");
         if (out == NULL)
         {
             printf("Error: Could not open %s for writing.\n", path);
-            pclose(pipe);
+            free(buffer);
             return 1;
         }
-    }
-
-    char line[512];
-    int count = 0;
-
-    while (fgets(line, sizeof(line), pipe))
-    {
-        if (path != NULL)
-        {
-            fputs(line, out);
-        }
-        else
-        {
-            printf("%s", line);
-        }
-        count++;
-    }
-
-    pclose(pipe);
-
-    if (out != NULL)
-    {
+        fputs(buffer, out);
         fclose(out);
         printf("Saved %d packages to %s\n", count, path);
     }
-    else if (verbose)
+    else
     {
-        printf("\nTotal: %d packages\n", count);
+        printf("%s", buffer);
+        if (verbose)
+        {
+            printf("\nTotal: %d packages\n", count);
+        }
     }
 
+    free(buffer);
     return 0;
 }
