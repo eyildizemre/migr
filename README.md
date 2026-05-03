@@ -21,14 +21,28 @@ make
 ## Usage
 
 ```bash
-migr                        # show backup analysis report
-migr -report                # same as above
-migr -backup <PATH>         # copy critical files to PATH
-migr -packages [PATH]       # list installed packages (optionally save to file)
-migr -restore <SOURCE>      # restore files and packages from a backup
-migr -help                  # show help
-migr -v ...                 # verbose mode (combine with any flag)
+./migr
+./migr -report
+./migr -backup <PATH>
+./migr -packages [FILE]
+./migr -restore <SOURCE>
 ```
+
+## Options
+
+```
+-report               Show backup analysis report (default when no arguments given)
+-backup <PATH>        Copy critical files and packages to PATH
+-packages [FILE]      List installed packages; optionally save to FILE
+-restore <SOURCE>     Restore files and packages from a backup at SOURCE
+-n, --dry-run         Preview actions without making changes
+-v                    Verbose output (combine with any flag)
+-help                 Show help
+```
+
+## Key Features
+
+- **Smart Resume:** Interrupted backups resume automatically — files already cloned (matching size and timestamp) are skipped.
 
 ## What Gets Backed Up
 
@@ -42,16 +56,26 @@ migr -v ...                 # verbose mode (combine with any flag)
 
 Running `migr` or `migr -report` scans your home directory and shows sizes for main directories, dotfiles, dev tools, and browsers — plus a critical backup size estimate.
 
+## Under the Hood
+
+This tool was fully refactored to eliminate all shell-based execution. It no longer calls `system()` or `popen()` anywhere in the codebase — functions that silently pass strings to `/bin/sh` and are a well-known vector for shell injection vulnerabilities.
+
+In their place, a custom pure C POSIX engine handles all I/O and process execution:
+
+- **`clone_recursive()`** — recursive file and directory copying via `open`/`read`/`write`/`mkdir`/`readdir`, with full metadata preservation (`chmod`, `utimensat`) and symlink handling. Replaces `cp -r`.
+- **`get_dir_size()`** — recursive directory size calculation via `lstat` and `dirent`. Replaces `du`.
+- **`run_command()`** — shell-free subprocess execution via `fork`/`execvp`/`waitpid`. Replaces `system()`.
+- **`run_command_capture()`** — same as above, with stdout captured into a buffer via an anonymous `pipe`. Replaces `popen()`.
+
+Package listing and restoration commands (`dpkg`, `rpm`, `pacman`, `dnf`, `apt-get`, `xargs`) are launched directly as process arguments — no shell is ever spawned. Size reporting uses native `off_t` arithmetic throughout for correct behaviour on both 32-bit (LFS) and 64-bit architectures.
+
 ## Planned
 
 - Compressed backups
-- Dry-run mode
-- Rollback support
 - Granular backup selection (interactive per-directory prompts)
 - Comprehensive vs. critical-only backup modes
 - Cloud storage support
 - Packaging for DNF / APT / Pacman
-- Shell injection hardening
 
 ## License
 
