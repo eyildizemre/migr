@@ -71,11 +71,13 @@ Package listing and restoration commands (`dpkg`, `rpm`, `pacman`, `dnf`, `apt-g
 
 ## Planned
 
-- Compressed backups
-- Granular backup selection (interactive per-directory prompts)
 - Comprehensive vs. critical-only backup modes
+- Localization (xdg-user-dirs support)
+- Logging
+- Compressed backups
 - Cloud storage support
 - Packaging for DNF / APT / Pacman
+- Granular backup selection (interactive per-directory prompts)
 
 ## License
 
