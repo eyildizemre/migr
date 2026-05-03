@@ -1,10 +1,13 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <limits.h>
 
 #include "backup.h"
+#include "fileops.h"
 #include "packages.h"
 #include "utils.h"
 
@@ -29,12 +32,8 @@ static int create_dir(const char *path)
     return 0;
 }
 
-// copy with cp -r
 static int copy_item(const char *src, const char *dest)
 {
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd), "cp -r '%s' '%s' 2>/dev/null", src, dest);
-
     if (dry_run)
     {
         printf("  Would copy: %s -> %s\n", src, dest);
@@ -46,7 +45,18 @@ static int copy_item(const char *src, const char *dest)
         printf("  Copying: %s\n", src);
     }
 
-    return system(cmd);
+    const char *name = strrchr(src, '/');
+    name = name ? name + 1 : src;
+
+    char full_dest[PATH_MAX];
+    snprintf(full_dest, sizeof(full_dest), "%s/%s", dest, name);
+
+    if (clone_recursive(src, full_dest) != 0)
+    {
+        printf("Error: Failed to copy %s\n", src);
+        return 1;
+    }
+    return 0;
 }
 
 int backup(const char *target)
@@ -65,7 +75,7 @@ int backup(const char *target)
     }
 
     // create backup directory with date
-    char backup_dir[512];
+    char backup_dir[PATH_MAX];
     time_t now = time(NULL);
     struct tm *t = localtime(&now);
     snprintf(backup_dir, sizeof(backup_dir), "%s/migr_backup_%04d%02d%02d",
@@ -87,7 +97,7 @@ int backup(const char *target)
     // copy dotfiles
     const char *dotfiles[] = {".ssh", ".gnupg", ".gitconfig", ".bashrc", ".profile", NULL};
 
-    char src[512];
+    char src[PATH_MAX];
     struct stat st;
     int count = 0;
 
@@ -115,7 +125,7 @@ int backup(const char *target)
 
     // package list
     printf("\n[Packages]\n");
-    char pkg_path[512];
+    char pkg_path[PATH_MAX];
     snprintf(pkg_path, sizeof(pkg_path), "%s/packages.txt", backup_dir);
 
     if (dry_run)
