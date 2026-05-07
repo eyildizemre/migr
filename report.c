@@ -141,7 +141,7 @@ int report(void)
     }
 
     // most important paths for backup
-    const char *critical_dirs[] = {"Documents", "Desktop", "Projects", NULL};
+    const char *critical_dirs[] = {"Documents", "Downloads", "Pictures", NULL};
     const char *critical_dots[] = {".ssh", ".gnupg", ".gitconfig", ".bashrc", NULL};
     
     off_t critical_total = 0;
@@ -174,7 +174,7 @@ int report(void)
     printf("\n===========================================================\n");
     printf("CRITICAL BACKUP ESTIMATE:\n");
     printf("  %s\n", critical_size);
-    printf("  (Documents, Desktop, Projects, .ssh, .gnupg, .gitconfig, .bashrc)\n");
+    printf("  (Documents, Downloads, Pictures, .ssh, .gnupg, .gitconfig, .bashrc)\n");
     printf("===========================================================\n");
 
     return 0;
