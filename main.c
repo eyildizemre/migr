@@ -66,27 +66,23 @@ int main(int argc, char *argv[])
     {
         case ACTION_NONE:
         case ACTION_REPORT:
-            report();
-            break;
+            return report();
         case ACTION_BACKUP:
             if (path == NULL)
             {
                 printf("Usage: ./migr -backup <PATH>\n");
                 return 1;
             }
-            backup(path);
-            break;
+            return backup(path);
         case ACTION_PACKAGES:
-            packages(path);
-            break;
+            return packages(path);
         case ACTION_RESTORE:
             if (path == NULL)
             {
                 printf("Usage: ./migr -restore <SOURCE>\n");
                 return 1;
             }
-            restore(path);
-            break;
+            return restore(path);
         case ACTION_HELP:
             print_help();
             break;
