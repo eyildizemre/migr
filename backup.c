@@ -32,7 +32,7 @@ static int create_dir(const char *path)
     return 0;
 }
 
-static int copy_item(const char *src, const char *dest)
+static int clone_item(const char *src, const char *dest)
 {
     if (dry_run)
     {
@@ -59,7 +59,7 @@ static int copy_item(const char *src, const char *dest)
     return 0;
 }
 
-int backup(const char *target)
+int backup(const char *target, BackupMode mode, char **paths)
 {
     char *home = getenv("HOME");
     if (home == NULL)
@@ -68,13 +68,15 @@ int backup(const char *target)
         return 1;
     }
 
-    // create target directory
-    if (create_dir(target) != 0)
+    if (mode == BACKUP_PATHS && (paths == NULL || paths[0] == NULL))
     {
+        printf("Error: -paths requires at least one path argument.\n");
         return 1;
     }
 
-    // create backup directory with date
+    if (create_dir(target) != 0)
+        return 1;
+
     char backup_dir[PATH_MAX];
     time_t now = time(NULL);
     struct tm *t = localtime(&now);
@@ -85,56 +87,70 @@ int backup(const char *target)
         return 1;
 
     if (dry_run)
-    {
         printf("Dry run mode enabled. No changes will be made.\n\n");
-    }
 
     printf("Backing up to: %s\n\n", backup_dir);
 
-    // copy main directories
-    const char *main_dirs[] = {"Documents", "Desktop", "Projects", NULL};
-
-    // copy dotfiles
-    const char *dotfiles[] = {".ssh", ".gnupg", ".gitconfig", ".bashrc", ".profile", NULL};
-
-    char src[PATH_MAX];
     struct stat st;
     int count = 0;
 
-    printf("[Main Directories]\n");
-    for (int i = 0; main_dirs[i] != NULL; i++)
+    if (mode == BACKUP_PATHS)
     {
-        snprintf(src, sizeof(src), "%s/%s", home, main_dirs[i]);
-        if (stat(src, &st) == 0)
+        printf("[Custom Paths]\n");
+        for (int i = 0; paths[i] != NULL; i++)
         {
-            copy_item(src, backup_dir);
-            count++;
+            if (stat(paths[i], &st) == 0)
+            {
+                clone_item(paths[i], backup_dir);
+                count++;
+            }
+            else
+            {
+                printf("  Warning: Path not found, skipping: %s\n", paths[i]);
+            }
         }
-    }
-
-    printf("\n[Dotfiles]\n");
-    for (int i = 0; dotfiles[i] != NULL; i++)
-    {
-        snprintf(src, sizeof(src), "%s/%s", home, dotfiles[i]);
-        if (stat(src, &st) == 0)
-        {
-            copy_item(src, backup_dir);
-            count++;
-        }
-    }
-
-    // package list
-    printf("\n[Packages]\n");
-    char pkg_path[PATH_MAX + sizeof("/packages.txt")]; // ensure enough space for path + filename
-    snprintf(pkg_path, sizeof(pkg_path), "%s/packages.txt", backup_dir);
-
-    if (dry_run)
-    {
-        printf("  Would export package list to: %s\n", pkg_path);
     }
     else
     {
-        packages(pkg_path);
+        const char *critical_dirs[]      = {"Documents", "Downloads", "Pictures", NULL};
+        const char *comprehensive_dirs[] = {"Documents", "Desktop", "Downloads", "Pictures",
+                                            "Videos", "Music", "Projects", NULL};
+        const char *dotfiles[]           = {".ssh", ".gnupg", ".gitconfig", ".bashrc", ".profile", NULL};
+
+        const char **main_dirs = (mode == BACKUP_COMPREHENSIVE) ? comprehensive_dirs : critical_dirs; // use comprehensive list for comprehensive mode, otherwise critical list
+
+        char src[PATH_MAX];
+
+        printf("[Main Directories]\n");
+        for (int i = 0; main_dirs[i] != NULL; i++)
+        {
+            snprintf(src, sizeof(src), "%s/%s", home, main_dirs[i]);
+            if (stat(src, &st) == 0)
+            {
+                clone_item(src, backup_dir);
+                count++;
+            }
+        }
+
+        printf("\n[Dotfiles]\n");
+        for (int i = 0; dotfiles[i] != NULL; i++)
+        {
+            snprintf(src, sizeof(src), "%s/%s", home, dotfiles[i]);
+            if (stat(src, &st) == 0)
+            {
+                clone_item(src, backup_dir);
+                count++;
+            }
+        }
+
+        printf("\n[Packages]\n");
+        char pkg_path[PATH_MAX + sizeof("/packages.txt")]; // ensure enough space for path + filename
+        snprintf(pkg_path, sizeof(pkg_path), "%s/packages.txt", backup_dir);
+
+        if (dry_run)
+            printf("  Would export package list to: %s\n", pkg_path);
+        else
+            packages(pkg_path);
     }
 
     printf("\n===========================================================\n");
