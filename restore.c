@@ -16,7 +16,7 @@ static int file_exists(const char *path)
     return (stat(path, &st) == 0);
 }
 
-static int copy_to_home(const char *src, const char *home)
+static int clone_to_home(const char *src, const char *home)
 {
     if (dry_run)
     {
@@ -84,7 +84,7 @@ int restore(const char *source)
         snprintf(src_path, sizeof(src_path), "%s/%s", source, main_dirs[i]);
         if (file_exists(src_path))
         {
-            copy_to_home(src_path, home);
+            clone_to_home(src_path, home);
             count++;
         }
     }
@@ -95,7 +95,7 @@ int restore(const char *source)
         snprintf(src_path, sizeof(src_path), "%s/%s", source, dotfiles[i]);
         if (file_exists(src_path))
         {
-            copy_to_home(src_path, home);
+            clone_to_home(src_path, home);
             count++;
         }
     }
