@@ -11,7 +11,10 @@ $(TARGET): $(OBJS)
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
+test: $(TARGET)
+	cd tests && bash test.sh
+
 clean:
 	rm -f $(OBJS) $(TARGET)
 
-.PHONY: clean
+.PHONY: clean test
