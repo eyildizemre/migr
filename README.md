@@ -32,12 +32,20 @@ make
 
 ```
 -report               Show backup analysis report (default when no arguments given)
--backup <PATH>        Copy critical files and packages to PATH
+-backup <PATH>        Clone files and packages to PATH
 -packages [FILE]      List installed packages; optionally save to FILE
 -restore <SOURCE>     Restore files and packages from a backup at SOURCE
 -n, --dry-run         Preview actions without making changes
 -v                    Verbose output (combine with any flag)
 -help                 Show help
+```
+
+Backup mode flags (combine with `-backup`):
+
+```
+-critical             Back up Documents, Downloads, Pictures, and dotfiles (default)
+-comprehensive        Back up everything except system files
+-paths <PATH...>      Back up specific paths provided by the user
 ```
 
 ## Key Features
@@ -46,11 +54,15 @@ make
 
 ## What Gets Backed Up
 
-**Directories:** Documents, Desktop, Projects
+**`-critical` (default):** Documents, Downloads, Pictures — the irreplaceable files most likely to exist nowhere else.
 
-**Dotfiles:** .ssh, .gnupg, .gitconfig, .bashrc, .profile
+**`-comprehensive`:** Everything `-critical` covers, plus Desktop, Videos, Music, and Projects.
 
-**Packages:** Full package list via dpkg/rpm/pacman (saved as packages.txt, reinstalled on restore)
+**`-paths`:** Exactly what you specify — no assumptions made.
+
+**Dotfiles (all modes except `-paths`):** .ssh, .gnupg, .gitconfig, .bashrc, .profile
+
+**Packages (all modes except `-paths`):** Full package list via dpkg/rpm/pacman (saved as packages.txt, reinstalled on restore)
 
 ## Report
 
@@ -62,7 +74,7 @@ This tool was fully refactored to eliminate all shell-based execution. It no lon
 
 In their place, a custom pure C POSIX engine handles all I/O and process execution:
 
-- **`clone_recursive()`** — recursive file and directory copying via `open`/`read`/`write`/`mkdir`/`readdir`, with full metadata preservation (`chmod`, `utimensat`) and symlink handling. Replaces `cp -r`.
+- **`clone_recursive()`** — recursive file and directory cloning via `open`/`read`/`write`/`mkdir`/`readdir`, with full metadata preservation (`chmod`, `utimensat`) and symlink handling. Replaces `cp -r`.
 - **`get_dir_size()`** — recursive directory size calculation via `lstat` and `dirent`. Replaces `du`.
 - **`run_command()`** — shell-free subprocess execution via `fork`/`execvp`/`waitpid`. Replaces `system()`.
 - **`run_command_capture()`** — same as above, with stdout captured into a buffer via an anonymous `pipe`. Replaces `popen()`.
@@ -71,13 +83,15 @@ Package listing and restoration commands (`dpkg`, `rpm`, `pacman`, `dnf`, `apt-g
 
 ## Planned
 
-- Comprehensive vs. critical-only backup modes
-- Localization (xdg-user-dirs support)
-- Logging
-- Compressed backups
-- Cloud storage support
-- Packaging for DNF / APT / Pacman
-- Granular backup selection (interactive per-directory prompts)
+- [x] Dry-run mode
+- [x] Pure C refactor
+- [x] Comprehensive vs. critical-only backup modes
+- [ ] Localization (xdg-user-dirs support)
+- [ ] Logging
+- [ ] Compressed backups
+- [ ] Cloud storage support
+- [ ] Packaging for DNF / APT / Pacman
+- [ ] Granular backup selection (interactive per-directory prompts)
 
 ## License
 
