@@ -62,6 +62,8 @@ Backup mode flags (combine with `-backup`):
 
 **Dotfiles (all modes except `-paths`):** .ssh, .gnupg, .gitconfig, .bashrc, .profile
 
+**Browser Profiles (all modes except `-paths`):** Firefox, Chrome, Chromium, Brave, Vivaldi, Edge, Opera — only the profiles present on the system are copied.
+
 **Packages (all modes except `-paths`):** Full package list via dpkg/rpm/pacman (saved as packages.txt, reinstalled on restore)
 
 ## Report
