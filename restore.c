@@ -43,6 +43,55 @@ static int clone_to_home(const char *src, const char *home)
     return 0;
 }
 
+// Restore a backup-relative path (e.g. ".config/google-chrome") back into home,
+// creating any intermediate parent directories as needed.
+// Returns 1 if restored, 0 if not in backup, -1 on error.
+static int restore_nested(const char *source, const char *home, const char *rel_path)
+{
+    char src[PATH_MAX], dest[PATH_MAX];
+    snprintf(src, sizeof(src), "%s/%s", source, rel_path);
+
+    if (!file_exists(src))
+        return 0;
+
+    snprintf(dest, sizeof(dest), "%s/%s", home, rel_path);
+
+    const char *slash = strrchr(rel_path, '/');
+    if (slash)
+    {
+        char parent[PATH_MAX];
+        snprintf(parent, sizeof(parent), "%s/%.*s", home, (int)(slash - rel_path), rel_path);
+        if (!file_exists(parent))
+        {
+            if (dry_run)
+            {
+                printf("  Would create: %s\n", parent);
+            }
+            else if (mkdir(parent, 0755) != 0)
+            {
+                printf("Error: Could not create directory %s\n", parent);
+                return -1;
+            }
+        }
+    }
+
+    if (dry_run)
+    {
+        printf("  Would restore: %s -> %s\n", src, dest);
+        return 1;
+    }
+
+    if (verbose)
+        printf("  Restoring: %s\n", src);
+
+    if (clone_recursive(src, dest) != 0)
+    {
+        printf("Error: Failed to restore %s\n", src);
+        return -1;
+    }
+    return 1;
+}
+
 int restore(const char *source)
 {
     char *home = getenv("HOME");
@@ -98,6 +147,24 @@ int restore(const char *source)
             clone_to_home(src_path, home);
             count++;
         }
+    }
+
+    const char *browser_configs[] = {
+        ".mozilla",
+        ".config/google-chrome",
+        ".config/chromium",
+        ".config/BraveSoftware",
+        ".config/vivaldi",
+        ".config/microsoft-edge",
+        ".config/opera",
+        NULL
+    };
+
+    printf("\n[Browser Profiles]\n");
+    for (int i = 0; browser_configs[i] != NULL; i++)
+    {
+        int r = restore_nested(source, home, browser_configs[i]);
+        if (r > 0) count++;
     }
 
     char pkg_path[PATH_MAX];

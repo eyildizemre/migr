@@ -59,6 +59,45 @@ static int clone_item(const char *src, const char *dest)
     return 0;
 }
 
+// Clone a home-relative path (e.g. ".config/google-chrome") into backup_dir,
+// preserving the directory structure. Returns 1 if copied, 0 if not found, -1 on error.
+static int clone_nested(const char *home, const char *backup_dir, const char *rel_path)
+{
+    char src[PATH_MAX], dest[PATH_MAX];
+    snprintf(src, sizeof(src), "%s/%s", home, rel_path);
+
+    struct stat st;
+    if (stat(src, &st) != 0)
+        return 0;
+
+    snprintf(dest, sizeof(dest), "%s/%s", backup_dir, rel_path);
+
+    const char *slash = strrchr(rel_path, '/');
+    if (slash)
+    {
+        char parent[PATH_MAX];
+        snprintf(parent, sizeof(parent), "%s/%.*s", backup_dir, (int)(slash - rel_path), rel_path);
+        if (create_dir(parent) != 0)
+            return -1;
+    }
+
+    if (dry_run)
+    {
+        printf("  Would copy: %s -> %s\n", src, dest);
+        return 1;
+    }
+
+    if (verbose)
+        printf("  Copying: %s\n", src);
+
+    if (clone_recursive(src, dest) != 0)
+    {
+        printf("Error: Failed to copy %s\n", src);
+        return -1;
+    }
+    return 1;
+}
+
 int backup(const char *target, BackupMode mode, char **paths)
 {
     char *home = getenv("HOME");
@@ -141,6 +180,24 @@ int backup(const char *target, BackupMode mode, char **paths)
                 clone_item(src, backup_dir);
                 count++;
             }
+        }
+
+        const char *browser_configs[] = {
+            ".mozilla",
+            ".config/google-chrome",
+            ".config/chromium",
+            ".config/BraveSoftware",
+            ".config/vivaldi",
+            ".config/microsoft-edge",
+            ".config/opera",
+            NULL
+        };
+
+        printf("\n[Browser Profiles]\n");
+        for (int i = 0; browser_configs[i] != NULL; i++)
+        {
+            int r = clone_nested(home, backup_dir, browser_configs[i]);
+            if (r > 0) count++;
         }
 
         printf("\n[Packages]\n");
