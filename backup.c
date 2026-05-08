@@ -10,6 +10,7 @@
 #include "fileops.h"
 #include "packages.h"
 #include "utils.h"
+#include "xdg.h"
 
 // create directory if it doesn't exist
 static int create_dir(const char *path)
@@ -151,22 +152,42 @@ int backup(const char *target, BackupMode mode, char **paths)
     }
     else
     {
-        const char *critical_dirs[]      = {"Documents", "Downloads", "Pictures", NULL};
-        const char *comprehensive_dirs[] = {"Documents", "Desktop", "Downloads", "Pictures",
-                                            "Videos", "Music", "Projects", NULL};
+        // Resolve localized XDG directory paths from ~/.config/user-dirs.dirs;
+        // silently falls back to English names if the file is absent or a key is missing.
+        // Note: the XDG key for downloads is XDG_DOWNLOAD_DIR (singular).
+        static const char * const xdg_keys[]      = {
+            "XDG_DOCUMENTS_DIR", "XDG_DOWNLOAD_DIR", "XDG_PICTURES_DIR",
+            "XDG_DESKTOP_DIR",   "XDG_VIDEOS_DIR",   "XDG_MUSIC_DIR"
+        };
+        static const char * const xdg_fallbacks[] = {
+            "Documents", "Downloads", "Pictures",
+            "Desktop",   "Videos",   "Music"
+        };
+        enum { XDG_DIR_COUNT = 6 };
+        char *xdg_dirs[XDG_DIR_COUNT];
+        xdg_resolve(home, xdg_keys, xdg_fallbacks, xdg_dirs, XDG_DIR_COUNT);
+
+        // Projects is not a standard XDG directory
+        char projects_path[PATH_MAX];
+        snprintf(projects_path, sizeof(projects_path), "%s/Projects", home);
+
+        // indices: 0=Documents 1=Downloads 2=Pictures 3=Desktop 4=Videos 5=Music
+        const char *critical_dirs[]      = {xdg_dirs[0], xdg_dirs[1], xdg_dirs[2], NULL};
+        const char *comprehensive_dirs[] = {xdg_dirs[0], xdg_dirs[1], xdg_dirs[2],
+                                            xdg_dirs[3], xdg_dirs[4], xdg_dirs[5], projects_path, NULL};
         const char *dotfiles[]           = {".ssh", ".gnupg", ".gitconfig", ".bashrc", ".profile", NULL};
 
-        const char **main_dirs = (mode == BACKUP_COMPREHENSIVE) ? comprehensive_dirs : critical_dirs; // use comprehensive list for comprehensive mode, otherwise critical list
+        const char **main_dirs = (mode == BACKUP_COMPREHENSIVE) ? comprehensive_dirs : critical_dirs;
 
         char src[PATH_MAX];
 
         printf("[Main Directories]\n");
         for (int i = 0; main_dirs[i] != NULL; i++)
         {
-            snprintf(src, sizeof(src), "%s/%s", home, main_dirs[i]);
-            if (stat(src, &st) == 0)
+            // main_dirs[i] is a full absolute path from xdg_resolve (or projects_path)
+            if (stat(main_dirs[i], &st) == 0)
             {
-                clone_item(src, backup_dir);
+                clone_item(main_dirs[i], backup_dir);
                 count++;
             }
         }
@@ -208,6 +229,9 @@ int backup(const char *target, BackupMode mode, char **paths)
             printf("  Would export package list to: %s\n", pkg_path);
         else
             packages(pkg_path);
+
+        for (int i = 0; i < XDG_DIR_COUNT; i++)
+            free(xdg_dirs[i]);
     }
 
     printf("\n===========================================================\n");

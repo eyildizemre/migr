@@ -9,6 +9,7 @@
 #include "detect.h"
 #include "fileops.h"
 #include "utils.h"
+#include "xdg.h"
 
 static int file_exists(const char *path)
 {
@@ -121,21 +122,59 @@ int restore(const char *source)
 
     printf("Restoring from: %s\n\n", source);
 
-    const char *main_dirs[] = {"Documents", "Desktop", "Projects", NULL};
+    // Resolve XDG dirs on the target system to determine restore destinations.
+    // Same-locale restores (e.g. Turkish→Turkish) work fully automatically.
+    // Cross-locale restores (e.g. Turkish backup on an English system) require
+    // a manual rename since the backup stores the source locale's directory names.
+    static const char * const xdg_keys[]      = {
+        "XDG_DOCUMENTS_DIR", "XDG_DOWNLOAD_DIR", "XDG_PICTURES_DIR",
+        "XDG_DESKTOP_DIR",   "XDG_VIDEOS_DIR",   "XDG_MUSIC_DIR"
+    };
+    static const char * const xdg_fallbacks[] = {
+        "Documents", "Downloads", "Pictures",
+        "Desktop",   "Videos",   "Music"
+    };
+    enum { XDG_RESTORE_COUNT = 6 };
+    char *xdg_dirs[XDG_RESTORE_COUNT];
+    xdg_resolve(home, xdg_keys, xdg_fallbacks, xdg_dirs, XDG_RESTORE_COUNT);
+
     const char *dotfiles[] = {".ssh", ".gnupg", ".gitconfig", ".bashrc", ".profile", NULL};
 
     char src_path[PATH_MAX];
     int count = 0;
 
     printf("[Main Directories]\n");
-    for (int i = 0; main_dirs[i] != NULL; i++)
+    for (int i = 0; i < XDG_RESTORE_COUNT; i++)
     {
-        snprintf(src_path, sizeof(src_path), "%s/%s", source, main_dirs[i]);
+        // xdg_dirs[i] is the full target path; its basename is what the backup stored
+        const char *name = strrchr(xdg_dirs[i], '/');
+        name = name ? name + 1 : xdg_dirs[i];
+
+        snprintf(src_path, sizeof(src_path), "%s/%s", source, name);
         if (file_exists(src_path))
         {
-            clone_to_home(src_path, home);
+            if (dry_run)
+                printf("  Would restore: %s -> %s/\n", src_path, xdg_dirs[i]);
+            else
+            {
+                if (verbose)
+                    printf("  Restoring: %s\n", src_path);
+                if (clone_recursive(src_path, xdg_dirs[i]) != 0)
+                    printf("Error: Failed to restore %s\n", src_path);
+            }
             count++;
         }
+    }
+
+    for (int i = 0; i < XDG_RESTORE_COUNT; i++)
+        free(xdg_dirs[i]);
+
+    // Projects is not a standard XDG directory
+    snprintf(src_path, sizeof(src_path), "%s/Projects", source);
+    if (file_exists(src_path))
+    {
+        clone_to_home(src_path, home);
+        count++;
     }
 
     printf("\n[Dotfiles]\n");
