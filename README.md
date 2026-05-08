@@ -51,6 +51,7 @@ Backup mode flags (combine with `-backup`):
 ## Key Features
 
 - **Smart Resume:** Interrupted backups resume automatically — files already cloned (matching size and timestamp) are skipped.
+- **Localization:** Directory names are resolved via `xdg-user-dirs` — if your Documents folder is `Belgeler`, migr finds and backs it up correctly without any configuration.
 
 ## What Gets Backed Up
 
@@ -88,7 +89,8 @@ Package listing and restoration commands (`dpkg`, `rpm`, `pacman`, `dnf`, `apt-g
 - [x] Dry-run mode
 - [x] Pure C refactor
 - [x] Comprehensive vs. critical-only backup modes
-- [ ] Localization (xdg-user-dirs support)
+- [x] Localization (xdg-user-dirs support)
+- [ ] Cross-locale restore mapping (manifest system)
 - [ ] Logging
 - [ ] Compressed backups
 - [ ] Cloud storage support
