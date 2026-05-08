@@ -17,17 +17,23 @@ setup() {
 
     mkdir -p "$HOME/Documents"
     mkdir -p "$HOME/Desktop"
+    mkdir -p "$HOME/Downloads"
+    mkdir -p "$HOME/Pictures"
     mkdir -p "$HOME/Projects"
     mkdir -p "$HOME/.ssh"
     mkdir -p "$HOME/.gnupg"
+    mkdir -p "$HOME/.mozilla/firefox/profile"
+    mkdir -p "$HOME/.config/google-chrome/Default"
     mkdir -p "$BACKUP_DIR"
 
-    echo "test doc" > "$HOME/Documents/note.txt"
-    echo "secret" > "$HOME/.ssh/config"
-    echo "gituser" > "$HOME/.gitconfig"
+    echo "test doc"  > "$HOME/Documents/note.txt"
+    echo "secret"    > "$HOME/.ssh/config"
+    echo "gituser"   > "$HOME/.gitconfig"
     echo "alias ll='ls -la'" > "$HOME/.bashrc"
-    echo "export PATH" > "$HOME/.profile"
+    echo "export PATH"       > "$HOME/.profile"
     ln -s "$HOME/Documents/note.txt" "$HOME/Documents/shortcut"
+    echo "places"    > "$HOME/.mozilla/firefox/profile/places.sqlite"
+    echo "prefs"     > "$HOME/.config/google-chrome/Default/Preferences"
 }
 
 teardown() {
@@ -132,6 +138,18 @@ test_backup() {
         echo -e "  ${RED}✗${NC} Symlink not copied as symlink: '$actual_backup/Documents/shortcut'"
         exit 1
     fi
+
+    # browser profiles backed up at the correct nested paths
+    assert_file_exists "$actual_backup/.mozilla/firefox/profile/places.sqlite"
+    assert_file_exists "$actual_backup/.config/google-chrome/Default/Preferences"
+
+    # Desktop must not appear in a critical backup
+    if [ -e "$actual_backup/Desktop" ]; then
+        echo -e "  ${RED}✗${NC} Desktop should not be in a critical backup"
+        exit 1
+    else
+        echo -e "  ${GREEN}✓${NC} Desktop correctly excluded from critical backup."
+    fi
 }
 
 test_restore() {
@@ -157,6 +175,10 @@ test_restore() {
     assert_file_exists "$HOME/Documents/note.txt"
     assert_file_exists "$HOME/.ssh/config"
     assert_file_exists "$HOME/.bashrc"
+
+    # nested browser profiles must restore to the correct location, not $HOME/firefox or $HOME/google-chrome
+    assert_file_exists "$HOME/.mozilla/firefox/profile/places.sqlite"
+    assert_file_exists "$HOME/.config/google-chrome/Default/Preferences"
 }
 
 test_packages() {
@@ -175,12 +197,70 @@ test_packages() {
     fi
 }
 
+test_comprehensive() {
+    echo -e "${BLUE}::${NC} Phase 7: -backup -comprehensive"
+
+    local comp_backup="$TEST_DIR/backup_comprehensive"
+    mkdir -p "$comp_backup"
+
+    # Desktop was not restored by the critical backup in Phase 4, so recreate it
+    mkdir -p "$HOME/Desktop"
+    echo "icon" > "$HOME/Desktop/browser.desktop"
+
+    local output
+    output=$(../migr -backup "$comp_backup" -comprehensive)
+
+    assert_contains "$output" "Backup complete"
+
+    local actual_backup
+    actual_backup=$(find "$comp_backup" -maxdepth 1 -name 'migr_backup_*' -type d | head -1)
+
+    # Desktop is in comprehensive but NOT critical — its presence proves the right mode ran
+    assert_file_exists "$actual_backup/Desktop"
+    assert_file_exists "$actual_backup/Documents"
+}
+
+test_paths() {
+    echo -e "${BLUE}::${NC} Phase 8: -backup -paths"
+
+    local paths_backup="$TEST_DIR/backup_paths"
+    mkdir -p "$paths_backup"
+
+    local output
+    output=$(../migr -backup "$paths_backup" -paths "$HOME/Documents")
+
+    assert_contains "$output" "Backup complete"
+
+    local actual_backup
+    actual_backup=$(find "$paths_backup" -maxdepth 1 -name 'migr_backup_*' -type d | head -1)
+
+    # specified path is present
+    assert_file_exists "$actual_backup/Documents"
+
+    # dotfiles must be absent — paths mode makes no assumptions
+    if [ -e "$actual_backup/.bashrc" ]; then
+        echo -e "  ${RED}✗${NC} .bashrc should not be in a -paths backup"
+        exit 1
+    else
+        echo -e "  ${GREEN}✓${NC} Dotfiles correctly excluded from -paths backup."
+    fi
+
+    # packages.txt must be absent
+    if [ -e "$actual_backup/packages.txt" ]; then
+        echo -e "  ${RED}✗${NC} packages.txt should not be in a -paths backup"
+        exit 1
+    else
+        echo -e "  ${GREEN}✓${NC} packages.txt correctly excluded from -paths backup."
+    fi
+}
+
 test_errors() {
-    echo -e "${BLUE}::${NC} Phase 6: error paths"
+    echo -e "${BLUE}::${NC} Phase 9: error paths"
 
     assert_exits_nonzero ../migr -backup
     assert_exits_nonzero ../migr -restore
     assert_exits_nonzero ../migr -restore /nonexistent/path
+    assert_exits_nonzero ../migr -backup "$BACKUP_DIR" -paths
 }
 
 
@@ -192,5 +272,7 @@ test_dry_run
 test_backup
 test_restore
 test_packages
+test_comprehensive
+test_paths
 test_errors
 echo -e "${GREEN}all tests passed${NC}"
