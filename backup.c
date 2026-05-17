@@ -172,17 +172,19 @@ int backup(const char *target, BackupMode mode, char **paths)
         snprintf(projects_path, sizeof(projects_path), "%s/Projects", home);
 
         // indices: 0=Documents 1=Downloads 2=Pictures 3=Desktop 4=Videos 5=Music
+        // NULL terminators are used to mark the end of the arrays for iteration
         const char *critical_dirs[]      = {xdg_dirs[0], xdg_dirs[1], xdg_dirs[2], NULL};
         const char *comprehensive_dirs[] = {xdg_dirs[0], xdg_dirs[1], xdg_dirs[2],
                                             xdg_dirs[3], xdg_dirs[4], xdg_dirs[5], projects_path, NULL};
         const char *dotfiles[]           = {".ssh", ".gnupg", ".gitconfig", ".bashrc", ".profile", NULL};
 
+        // main_dirs acts as a pointer to the first char* element of the selected array
         const char **main_dirs = (mode == BACKUP_COMPREHENSIVE) ? comprehensive_dirs : critical_dirs;
 
         char src[PATH_MAX];
 
         printf("[Main Directories]\n");
-        for (int i = 0; main_dirs[i] != NULL; i++)
+        for (int i = 0; main_dirs[i] != NULL; i++) // NULL terminator indicates end of array
         {
             // main_dirs[i] is a full absolute path from xdg_resolve (or projects_path)
             if (stat(main_dirs[i], &st) == 0)
