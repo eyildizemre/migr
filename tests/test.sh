@@ -10,7 +10,9 @@ NC='\033[0m'
 
 # --- 1. SETUP & TEARDOWN ---
 setup() {
-    TEST_DIR=$(mktemp -d)
+    TEST_DIR=$(mktemp -d) # opens a subshell, runs `mktemp -d`, and assigns output to TEST_DIR
+    # export makes the variable available to subprocesses 
+    # since child processes won't have access to parent shell's variables by default
     export TEST_DIR
     export HOME="$TEST_DIR/home"
     export BACKUP_DIR="$TEST_DIR/backup_drive"
@@ -70,7 +72,7 @@ assert_file_exists() {
 
 # `if` suppresses set -e, letting us safely test commands expected to fail
 assert_exits_nonzero() {
-    if "$@" 2>/dev/null; then
+    if "$@" 2>/dev/null; then # "$@" is used to pass spaces and multiple arguments correctly
         echo -e "  ${RED}✗${NC} Expected non-zero exit from: $*"
         exit 1
     else
@@ -99,10 +101,11 @@ test_dry_run() {
 
     assert_contains "$output" "Dry run"
 
-    # assert no backup directory was actually created on disk
+    # override shell behavior of treating an empty query as literal string
+    # to prevent false positives when no backup dirs exist yet 
     shopt -s nullglob
     backup_dirs=("$BACKUP_DIR"/migr_backup_*)
-    shopt -u nullglob
+    shopt -u nullglob # reset to default behavior
     if [ "${#backup_dirs[@]}" -gt 0 ]; then
         echo -e "  ${RED}✗${NC} Dry run wrote files to disk!"
         exit 1
@@ -167,7 +170,7 @@ test_restore() {
     rm -f "$actual_backup/packages.txt"
 
     local output
-    # restore() calls confirm_action() — pipe "y" to satisfy the prompt
+    # restore() calls confirm_action() — pipe "y" to mock user interaction
     output=$(echo "y" | ../migr -restore "$actual_backup")
 
     assert_contains "$output" "Restore complete"
@@ -176,7 +179,8 @@ test_restore() {
     assert_file_exists "$HOME/.ssh/config"
     assert_file_exists "$HOME/.bashrc"
 
-    # nested browser profiles must restore to the correct location, not $HOME/firefox or $HOME/google-chrome
+    # nested browser profiles must restore to the correct location, 
+    # not $HOME/firefox or $HOME/google-chrome
     assert_file_exists "$HOME/.mozilla/firefox/profile/places.sqlite"
     assert_file_exists "$HOME/.config/google-chrome/Default/Preferences"
 }
