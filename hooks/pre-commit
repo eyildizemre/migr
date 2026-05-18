@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# migr pre-commit hook
+
+# Halt immediately on any error, including those hidden within pipelines
+set -eo pipefail
+
+# Is this a C/shell/Makefile change? If not, skip the build and tests to save time
+if ! git diff --cached --name-only | grep -qE '\.(c|h|sh)$|(^|/)Makefile$'; then
+    echo "→ No C/shell/Makefile changes staged, skipping build & tests."
+    exit 0
+fi
+
+echo "▶ Running pre-commit checks..."
+
+if ! make > /tmp/migr-build.log 2>&1; then
+    echo "× Build failed. See /tmp/migr-build.log for details."
+    exit 1
+fi
+
+if ! make test > /tmp/migr-test.log 2>&1; then
+    echo "× Tests failed. See /tmp/migr-test.log for details."
+    exit 1
+fi
+
+echo "✓ All checks passed!"
+exit 0
