@@ -18,6 +18,12 @@ Originally written in one day for an Intro to CS final project.
 make
 ```
 
+To activate the pre-commit hook (runs build + tests when C/shell/Makefile changes are staged), run this once after cloning:
+
+```bash
+git config core.hooksPath hooks
+```
+
 ## Usage
 
 ```bash
