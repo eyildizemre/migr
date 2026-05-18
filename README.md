@@ -57,7 +57,7 @@ Backup mode flags (combine with `-backup`):
 
 **`-critical` (default):** Documents, Downloads, Pictures — the irreplaceable files most likely to exist nowhere else.
 
-**`-comprehensive`:** Everything `-critical` covers, plus Desktop, Videos, Music, and Projects.
+**`-comprehensive`:** Everything `-critical` covers, plus Desktop, Videos, and Music.
 
 **`-paths`:** Exactly what you specify — no assumptions made.
 
@@ -92,9 +92,10 @@ Package listing and restoration commands (`dpkg`, `rpm`, `pacman`, `dnf`, `apt-g
 - [x] Localization (xdg-user-dirs support)
 - [ ] Cross-locale restore mapping (manifest system)
 - [ ] Logging
-- [ ] Compressed backups
-- [ ] Cloud storage support
-- [ ] Packaging for DNF / APT / Pacman
+- [ ] Network configuration backup
+- [ ] Self-contained backup (embed static binary)
+- [ ] Cloud storage support (via rclone)
+- [ ] Provide pre-built .deb, .rpm, and AUR packages
 - [ ] Granular backup selection (interactive per-directory prompts)
 
 ## License
