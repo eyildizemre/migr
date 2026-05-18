@@ -96,7 +96,7 @@ Package listing and restoration commands (`dpkg`, `rpm`, `pacman`, `dnf`, `apt-g
 - [x] Pure C refactor
 - [x] Comprehensive vs. critical-only backup modes
 - [x] Localization (xdg-user-dirs support)
-- [ ] Cross-locale restore mapping (manifest system)
+- [x] Cross-locale restore mapping (manifest system)
 - [ ] Logging
 - [ ] Network configuration backup
 - [ ] Self-contained backup (embed static binary)
