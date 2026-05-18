@@ -2,7 +2,7 @@ CC = gcc
 CFLAGS = -Wall -Wextra -g
 
 TARGET = migr
-SRCS = main.c detect.c report.c backup.c packages.c restore.c utils.c fileops.c xdg.c
+SRCS = main.c detect.c report.c backup.c packages.c restore.c utils.c fileops.c xdg.c manifest.c
 OBJS = $(SRCS:.c=.o)
 
 $(TARGET): $(OBJS)

@@ -8,6 +8,7 @@
 #include "restore.h"
 #include "detect.h"
 #include "fileops.h"
+#include "manifest.h"
 #include "utils.h"
 #include "xdg.h"
 
@@ -122,10 +123,10 @@ int restore(const char *source)
 
     printf("Restoring from: %s\n\n", source);
 
-    // Resolve XDG dirs on the target system to determine restore destinations.
-    // Same-locale restores (e.g. Turkish→Turkish) work fully automatically.
-    // Cross-locale restores (e.g. Turkish backup on an English system) require
-    // a manual rename since the backup stores the source locale's directory names.
+    // Resolve XDG dirs on the target (destination) system.
+    // manifest.txt from the backup records the source locale's directory names, so
+    // cross-locale restores (e.g. Turkish backup → English system) map correctly.
+    // If the manifest is absent (old backup), fall back to the target basename.
     static const char * const xdg_keys[]      = {
         "XDG_DOCUMENTS_DIR", "XDG_DOWNLOAD_DIR", "XDG_PICTURES_DIR",
         "XDG_DESKTOP_DIR",   "XDG_VIDEOS_DIR",   "XDG_MUSIC_DIR"
@@ -138,6 +139,9 @@ int restore(const char *source)
     char *xdg_dirs[XDG_RESTORE_COUNT];
     xdg_resolve(home, xdg_keys, xdg_fallbacks, xdg_dirs, XDG_RESTORE_COUNT);
 
+    char *manifest_names[XDG_RESTORE_COUNT];
+    int has_manifest = (manifest_read(source, manifest_names, XDG_RESTORE_COUNT) == 0);
+
     const char *dotfiles[] = {".ssh", ".gnupg", ".gitconfig", ".bashrc", ".profile", NULL};
 
     char src_path[PATH_MAX];
@@ -146,9 +150,17 @@ int restore(const char *source)
     printf("[Main Directories]\n");
     for (int i = 0; i < XDG_RESTORE_COUNT; i++)
     {
-        // xdg_dirs[i] is the full target path; its basename is what the backup stored
-        const char *name = strrchr(xdg_dirs[i], '/');
-        name = name ? name + 1 : xdg_dirs[i];
+        // Use the manifest-recorded name (source locale) to locate the backup directory,
+        // then restore to xdg_dirs[i] (destination locale). Falls back to the destination
+        // basename when no manifest is present (same-locale or pre-manifest backup).
+        const char *name;
+        if (has_manifest && manifest_names[i] != NULL)
+            name = manifest_names[i];
+        else
+        {
+            const char *p = strrchr(xdg_dirs[i], '/');
+            name = p ? p + 1 : xdg_dirs[i];
+        }
 
         snprintf(src_path, sizeof(src_path), "%s/%s", source, name);
         if (file_exists(src_path))
@@ -168,6 +180,9 @@ int restore(const char *source)
 
     for (int i = 0; i < XDG_RESTORE_COUNT; i++)
         free(xdg_dirs[i]);
+
+    for (int i = 0; i < XDG_RESTORE_COUNT; i++)
+        free(manifest_names[i]);
 
     // Projects is not a standard XDG directory
     snprintf(src_path, sizeof(src_path), "%s/Projects", source);

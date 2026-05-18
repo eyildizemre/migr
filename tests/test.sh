@@ -153,6 +153,15 @@ test_backup() {
     else
         echo -e "  ${GREEN}✓${NC} Desktop correctly excluded from critical backup."
     fi
+
+    # manifest.txt must be present and contain at least one XDG key
+    assert_file_exists "$actual_backup/manifest.txt"
+    if grep -q "XDG_DOCUMENTS_DIR=" "$actual_backup/manifest.txt"; then
+        echo -e "  ${GREEN}✓${NC} manifest.txt contains XDG_DOCUMENTS_DIR entry."
+    else
+        echo -e "  ${RED}✗${NC} manifest.txt missing XDG_DOCUMENTS_DIR entry!"
+        exit 1
+    fi
 }
 
 test_restore() {
@@ -255,6 +264,14 @@ test_paths() {
         exit 1
     else
         echo -e "  ${GREEN}✓${NC} packages.txt correctly excluded from -paths backup."
+    fi
+
+    # manifest.txt must also be absent — paths mode makes no XDG assumptions
+    if [ -e "$actual_backup/manifest.txt" ]; then
+        echo -e "  ${RED}✗${NC} manifest.txt should not be in a -paths backup"
+        exit 1
+    else
+        echo -e "  ${GREEN}✓${NC} manifest.txt correctly excluded from -paths backup."
     fi
 }
 

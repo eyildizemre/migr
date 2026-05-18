@@ -8,6 +8,7 @@
 
 #include "backup.h"
 #include "fileops.h"
+#include "manifest.h"
 #include "packages.h"
 #include "utils.h"
 #include "xdg.h"
@@ -169,6 +170,16 @@ int backup(const char *target, BackupMode mode, char **paths)
         char *xdg_dirs[XDG_DIR_COUNT];
         xdg_resolve(home, xdg_keys, xdg_fallbacks, xdg_dirs, XDG_DIR_COUNT);
 
+        // Capture basenames for cross-locale restoration (e.g. "/home/user/Belgeler" -> "Belgeler").
+        // Instead of allocating new memory, use pointer arithmetic to point directly 
+        // to the character following the last '/' in the existing path string.
+        const char *basenames[XDG_DIR_COUNT];
+        for (int i = 0; i < XDG_DIR_COUNT; i++)
+        {
+            const char *last_slash = strrchr(xdg_dirs[i], '/');
+            basenames[i] = last_slash ? last_slash + 1 : xdg_dirs[i];
+        }
+
         // Projects is not a standard XDG directory
         char projects_path[PATH_MAX];
         snprintf(projects_path, sizeof(projects_path), "%s/Projects", home);
@@ -233,6 +244,11 @@ int backup(const char *target, BackupMode mode, char **paths)
             printf("  Would export package list to: %s\n", pkg_path);
         else
             packages(pkg_path);
+
+        if (dry_run)
+            printf("  Would write manifest: %s/manifest.txt\n", backup_dir);
+        else
+            manifest_write(backup_dir, basenames, XDG_DIR_COUNT);
 
         for (int i = 0; i < XDG_DIR_COUNT; i++)
             free(xdg_dirs[i]);
