@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Halt on any error, and print commands as they are executed
-set -e
+# Halt on any error, fail on undefined variables, and catch pipeline failures
+set -euo pipefail
 
 GREEN='\033[0;32m'
 RED='\033[0;31m'
