@@ -1,0 +1,13 @@
+# Auto detect text files and normalize line endings to LF
+* text=auto eol=lf
+
+# C source and header files should be treated as text and normalized to LF
+*.c text diff=cpp
+*.h text diff=cpp
+
+# Critical scripts and build instructions must remain as LF
+*.sh text eol=lf
+Makefile text eol=lf
+
+# Documentation
+*.md text
