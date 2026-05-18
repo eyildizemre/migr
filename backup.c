@@ -73,6 +73,8 @@ static int clone_nested(const char *home, const char *backup_dir, const char *re
 
     snprintf(dest, sizeof(dest), "%s/%s", backup_dir, rel_path);
 
+    // Split the path to create parent directories first.
+    // The OS kernel will throw ENOENT if we try to copy into a non-existent parent directory.
     const char *slash = strrchr(rel_path, '/');
     if (slash)
     {
