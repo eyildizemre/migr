@@ -1,7 +1,8 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -g
+CFLAGS = -Wall -Wextra -g -I src
 
 TARGET = migr
+VPATH = src
 SRCS = main.c detect.c report.c backup.c packages.c restore.c utils.c fileops.c xdg.c manifest.c
 OBJS = $(SRCS:.c=.o)
 
