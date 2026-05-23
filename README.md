@@ -1,12 +1,12 @@
 # migr
 
-A CLI tool for migrating between Linux distributions. Detects your distro, backs up critical directories and dotfiles, exports your package list, and restores everything on the new system.
+A CLI tool for migrating between Linux distributions. Detects your distro, backs up your main directories, browser profiles, and dotfiles, exports your package list, and restores everything on the new system.
 
 Built out of necessity — I was moving from Ubuntu to Fedora, stressing over browser configs, SSH keys, and dotfiles. This automates what I was doing by hand.
 
 Originally written in one day for an Intro to CS final project.
 
-## Supported Distributions
+## Target Distributions
 
 - Debian / Ubuntu / Mint
 - Fedora / RHEL / CentOS
