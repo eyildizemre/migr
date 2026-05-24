@@ -30,7 +30,7 @@ git config core.hooksPath hooks
 ./migr
 ./migr -report
 ./migr -backup <PATH>
-./migr -packages [FILE]
+./migr -packages <FILE>
 ./migr -restore <SOURCE>
 ```
 
@@ -39,7 +39,7 @@ git config core.hooksPath hooks
 ```
 -report               Show backup analysis report (default when no arguments given)
 -backup <PATH>        Clone files and packages to PATH
--packages [FILE]      List installed packages; optionally save to FILE
+-packages <FILE>      Export installed packages to FILE
 -restore <SOURCE>     Restore files and packages from a backup at SOURCE
 -n, --dry-run         Preview actions without making changes
 -v                    Verbose output (combine with any flag)

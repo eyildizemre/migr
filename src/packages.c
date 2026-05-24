@@ -49,27 +49,16 @@ int packages(const char *path)
             count++;
     }
 
-    if (path != NULL)
+    FILE *out = fopen(path, "w");
+    if (out == NULL)
     {
-        FILE *out = fopen(path, "w");
-        if (out == NULL)
-        {
-            printf("Error: Could not open %s for writing.\n", path);
-            free(buffer);
-            return 1;
-        }
-        fputs(buffer, out);
-        fclose(out);
-        printf("Saved %d packages to %s\n", count, path);
+        printf("Error: Could not open %s for writing.\n", path);
+        free(buffer);
+        return 1;
     }
-    else
-    {
-        printf("%s", buffer);
-        if (verbose)
-        {
-            printf("\nTotal: %d packages\n", count);
-        }
-    }
+    fputs(buffer, out);
+    fclose(out);
+    printf("Saved %d packages to %s\n", count, path);
 
     free(buffer);
     return 0;

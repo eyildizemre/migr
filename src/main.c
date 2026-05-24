@@ -98,6 +98,12 @@ int main(int argc, char *argv[])
             ret = backup(path, mode, user_paths);
             break;
         case ACTION_PACKAGES:
+            if (path == NULL)
+            {
+                printf("Usage: ./migr -packages <FILE>\n");
+                ret = 1;
+                break;
+            }
             ret = packages(path);
             break;
         case ACTION_RESTORE:
