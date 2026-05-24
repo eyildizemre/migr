@@ -230,35 +230,187 @@ int restore(const char *source)
 
         distro_t distro = detect_distro();
 
-        char *const debian_cmd[] = {"xargs", "-a", pkg_path, "sudo", "apt-get", "install", "-y", NULL};
-        char *const fedora_cmd[] = {"xargs", "-a", pkg_path, "sudo", "dnf", "install", "-y", NULL};
-        char *const arch_cmd[]   = {"xargs", "-a", pkg_path, "sudo", "pacman", "-S", "--needed", "--noconfirm", NULL};
-        char *const *cmd_args = NULL;
-
-        switch (distro)
+        if (distro == DISTRO_UNKNOWN)
         {
-            case DISTRO_DEBIAN: cmd_args = debian_cmd; break;
-            case DISTRO_FEDORA: cmd_args = fedora_cmd; break;
-            case DISTRO_ARCH:   cmd_args = arch_cmd;   break;
-            default:
-                printf("Warning: Unknown distro, skipping package install.\n");
-                break;
+            printf("Warning: Unrecognized distro, skipping package install.\n");
         }
-
-        if (cmd_args != NULL)
+        else if (dry_run)
         {
-            if (dry_run)
+            printf("  Would install packages from: %s\n", pkg_path);
+        }
+        else
+        {
+            printf("Installing packages (this may take a while)...\n");
+
+            FILE *pkg_file = fopen(pkg_path, "r");
+            if (pkg_file == NULL)
             {
-                printf("  Would install packages from: %s\n", pkg_path);
+                printf("Error: Could not read %s\n", pkg_path);
             }
             else
             {
-                printf("Installing packages (this may take a while)...\n");
-                if (verbose)
+                // Collect filtered package names into a dynamic array
+                int pkg_cap = 256;
+                int pkg_count = 0;
+                char **pkgs = malloc(pkg_cap * sizeof(char *));
+
+                if (pkgs != NULL)
                 {
-                    printf("Running: xargs -a %s ...\n", pkg_path);
+                    char line[512];
+                    char pkg_name[256];
+
+                    while (fgets(line, sizeof(line), pkg_file) != NULL)
+                    {
+                        if (sscanf(line, "%255s", pkg_name) != 1)
+                            continue;
+
+                        // dpkg format: "pkg\tstatus" — only install "install" entries
+                        char *tab = strchr(line, '\t');
+                        if (tab != NULL && strncmp(tab + 1, "install", 7) != 0)
+                            continue;
+
+                        if (pkg_count == pkg_cap)
+                        {
+                            pkg_cap *= 2;
+                            char **tmp = realloc(pkgs, pkg_cap * sizeof(char *));
+                            if (tmp == NULL) break;
+                            pkgs = tmp;
+                        }
+                        pkgs[pkg_count] = strdup(pkg_name);
+                        if (pkgs[pkg_count] != NULL)
+                            pkg_count++;
+                    }
                 }
-                run_command(cmd_args);
+                fclose(pkg_file);
+
+                // Build batch command prefix per distro
+                char *batch_prefix[6];
+                int prefix = 0;
+                switch (distro)
+                {
+                    case DISTRO_DEBIAN:
+                        batch_prefix[0] = "sudo";
+                        batch_prefix[1] = "apt-get";
+                        batch_prefix[2] = "install";
+                        batch_prefix[3] = "-y";
+                        batch_prefix[4] = "-m";
+                        prefix = 5;
+                        break;
+                    case DISTRO_FEDORA:
+                        batch_prefix[0] = "sudo";
+                        batch_prefix[1] = "dnf";
+                        batch_prefix[2] = "install";
+                        batch_prefix[3] = "-y";
+                        prefix = 4;
+                        break;
+                    case DISTRO_ARCH:
+                        batch_prefix[0] = "sudo";
+                        batch_prefix[1] = "pacman";
+                        batch_prefix[2] = "-S";
+                        batch_prefix[3] = "--needed";
+                        batch_prefix[4] = "--noconfirm";
+                        prefix = 5;
+                        break;
+                    default: break;
+                }
+
+                int installed = 0, skipped = 0;
+
+                if (pkgs != NULL && pkg_count > 0 && prefix > 0)
+                {
+                    // Phase 1: single batch install
+                    char **batch_argv = malloc((prefix + pkg_count + 1) * sizeof(char *));
+                    if (batch_argv != NULL)
+                    {
+                        for (int i = 0; i < prefix; i++)
+                            batch_argv[i] = batch_prefix[i];
+                        for (int i = 0; i < pkg_count; i++)
+                            batch_argv[prefix + i] = pkgs[i];
+                        batch_argv[prefix + pkg_count] = NULL;
+
+                        int rc = run_command((char *const *)batch_argv);
+                        free(batch_argv);
+
+                        if (rc == 0)
+                        {
+                            installed = pkg_count;
+                        }
+                        else
+                        {
+                            // Phase 2: per-package fallback, track failures
+                            char skipped_path[PATH_MAX];
+                            snprintf(skipped_path, sizeof(skipped_path), "%s/skipped-packages.txt", home);
+                            FILE *skipped_f = NULL;
+
+                            for (int i = 0; i < pkg_count; i++)
+                            {
+                                char *install_cmd[8];
+                                switch (distro)
+                                {
+                                    case DISTRO_DEBIAN:
+                                        install_cmd[0] = "sudo";
+                                        install_cmd[1] = "apt-get";
+                                        install_cmd[2] = "install";
+                                        install_cmd[3] = "-y";
+                                        install_cmd[4] = "-m";
+                                        install_cmd[5] = pkgs[i];
+                                        install_cmd[6] = NULL;
+                                        break;
+                                    case DISTRO_FEDORA:
+                                        install_cmd[0] = "sudo";
+                                        install_cmd[1] = "dnf";
+                                        install_cmd[2] = "install";
+                                        install_cmd[3] = "-y";
+                                        install_cmd[4] = pkgs[i];
+                                        install_cmd[5] = NULL;
+                                        break;
+                                    case DISTRO_ARCH:
+                                        install_cmd[0] = "sudo";
+                                        install_cmd[1] = "pacman";
+                                        install_cmd[2] = "-S";
+                                        install_cmd[3] = "--needed";
+                                        install_cmd[4] = "--noconfirm";
+                                        install_cmd[5] = pkgs[i];
+                                        install_cmd[6] = NULL;
+                                        break;
+                                    default:
+                                        install_cmd[0] = NULL;
+                                        break;
+                                }
+
+                                if (install_cmd[0] == NULL) continue;
+
+                                if (run_command((char *const *)install_cmd) != 0)
+                                {
+                                    if (skipped_f == NULL)
+                                        skipped_f = fopen(skipped_path, "w");
+                                    if (skipped_f != NULL)
+                                        fprintf(skipped_f, "%s\n", pkgs[i]);
+                                    skipped++;
+                                }
+                                else
+                                {
+                                    installed++;
+                                }
+                            }
+
+                            if (skipped_f != NULL)
+                            {
+                                fclose(skipped_f);
+                                printf("  Skipped packages written to: %s\n", skipped_path);
+                            }
+                        }
+                    }
+                }
+
+                if (pkgs != NULL)
+                {
+                    for (int i = 0; i < pkg_count; i++)
+                        free(pkgs[i]);
+                    free(pkgs);
+                }
+
+                printf("  %d installed, %d skipped.\n", installed, skipped);
             }
         }
     }

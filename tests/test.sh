@@ -282,6 +282,7 @@ test_errors() {
     assert_exits_nonzero ../migr -restore
     assert_exits_nonzero ../migr -restore /nonexistent/path
     assert_exits_nonzero ../migr -backup "$BACKUP_DIR" -paths
+    assert_exits_nonzero ../migr -packages
 }
 
 
