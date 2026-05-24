@@ -31,6 +31,8 @@ distro_t detect_distro(void)
             {
                 return DISTRO_ARCH;
             }
+
+            return DISTRO_UNKNOWN;
         }
     }
 
