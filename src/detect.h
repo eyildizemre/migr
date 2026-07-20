@@ -10,13 +10,30 @@ typedef enum
 } distro_t;
 
 /**
+ * @brief Identifies a Linux distribution by parsing an os-release file at a given path.
+ *
+ * Reads both the ID= and ID_LIKE= fields and matches their values against known
+ * keywords for the Debian, Fedora, and Arch families. ID= takes precedence; ID_LIKE=
+ * is consulted only when ID= is unrecognized, which is what lets derivatives such as
+ * Pop!_OS, elementary, or Nobara resolve to their parent family. The whole file is
+ * read before deciding, since os-release does not guarantee key order.
+ *
+ * Exposed separately from detect_distro() so the parsing logic can be exercised
+ * against synthetic os-release files without depending on the host system.
+ *
+ * @param os_release_path Path to the os-release file to parse.
+ * @return The detected distro_t value, or DISTRO_UNKNOWN if the file is missing
+ *         or neither field names a supported family.
+ */
+distro_t detect_distro_from(const char *os_release_path);
+
+/**
  * @brief Identifies the running Linux distribution by parsing /etc/os-release.
  *
- * Reads the ID= field and matches it against known keywords for Debian-based,
- * Fedora-based, and Arch-based families.
+ * Thin wrapper over detect_distro_from() using the system os-release path.
  *
  * @return The detected distro_t value, or DISTRO_UNKNOWN if the file is missing
- *         or the ID value is not recognized.
+ *         or the distribution is not recognized.
  */
 distro_t detect_distro(void);
 

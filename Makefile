@@ -12,10 +12,16 @@ $(TARGET): $(OBJS)
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-test: $(TARGET)
+TEST_DETECT = tests/test_detect
+
+$(TEST_DETECT): tests/test_detect.c detect.o
+	$(CC) $(CFLAGS) -o $@ tests/test_detect.c detect.o
+
+test: $(TARGET) $(TEST_DETECT)
+	./$(TEST_DETECT)
 	cd tests && bash test.sh
 
 clean:
-	rm -f $(OBJS) $(TARGET)
+	rm -f $(OBJS) $(TARGET) $(TEST_DETECT)
 
 .PHONY: clean test

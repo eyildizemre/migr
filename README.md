@@ -8,9 +8,21 @@ Originally written in one day for an Intro to CS final project.
 
 ## Target Distributions
 
-- Debian / Ubuntu / Mint
-- Fedora / RHEL / CentOS
-- Arch / Manjaro / EndeavourOS
+`migr` targets three package-manager families:
+
+| Family | Package manager | Examples |
+|---|---|---|
+| Debian | `dpkg` / `apt` | Debian, Ubuntu, Mint, Pop!_OS, elementary, Zorin |
+| Fedora | `rpm` / `dnf` | Fedora, RHEL, CentOS, Nobara |
+| Arch | `pacman` | Arch, Manjaro, EndeavourOS, Garuda |
+
+Derivatives are resolved through the `ID_LIKE` field of `/etc/os-release`, so a
+distribution works even if it is not named above, as long as it declares one of these
+families and uses its package manager.
+
+Distributions outside these three — openSUSE, Void, Gentoo, and others — are detected
+as unknown. Files, dotfiles, and browser profiles are still backed up and restored
+normally; only the package list is skipped.
 
 ## Build
 

@@ -1,3 +1,4 @@
 *.o
 migr
+tests/test_detect
 docs/TODO.md
