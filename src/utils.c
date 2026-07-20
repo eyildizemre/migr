@@ -7,18 +7,31 @@ int dry_run = 0;
 
 void print_help(void)
 {
-    printf("Usage: ./migr [COMMAND] [OPTIONS]\n");
+    printf("Usage: ./migr <COMMAND> [ARGUMENTS] [OPTIONS]\n");
     printf("\n");
     printf("Commands:\n");
-    printf("  -report               Show backup analysis report (default when no arguments given)\n");
-    printf("  -backup <PATH>        Copy critical files and packages to PATH\n");
-    printf("  -packages [FILE]      List installed packages; optionally save to FILE\n");
-    printf("  -restore <SOURCE>     Restore files and packages from a backup at SOURCE\n");
+    printf("  report                Show backup analysis report (default when no command given)\n");
+    printf("  backup <PATH>         Copy files and packages to PATH\n");
+    printf("  packages <FILE>       Export the installed package list to FILE\n");
+    printf("  restore <SOURCE>      Restore files and packages from a backup at SOURCE\n");
+    printf("  help                  Show this help\n");
+    printf("\n");
+    printf("Backup scope (backup only, mutually exclusive):\n");
+    printf("  --critical            Documents, Downloads, Pictures, and dotfiles (default)\n");
+    printf("  --comprehensive       Everything --critical covers, plus Desktop, Videos, Music\n");
+    printf("  <PATH...>             Paths listed after the destination are backed up\n");
+    printf("                        exactly as given, with no assumptions\n");
     printf("\n");
     printf("Options:\n");
     printf("  -n, --dry-run         Preview actions without making changes\n");
-    printf("  -v                    Verbose output (combine with any flag)\n");
-    printf("  -help                 Show help\n");
+    printf("  -v, --verbose         Verbose output\n");
+    printf("  -h, --help            Show this help\n");
+    printf("\n");
+    printf("Examples:\n");
+    printf("  ./migr backup /mnt/drive\n");
+    printf("  ./migr backup /mnt/drive --comprehensive\n");
+    printf("  ./migr backup /mnt/drive ~/Documents ~/Projects\n");
+    printf("  ./migr restore /mnt/drive/migr_backup_20260720\n");
 }
 
 int confirm_action(const char *message)

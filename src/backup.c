@@ -111,9 +111,9 @@ int backup(const char *target, BackupMode mode, char **paths)
         return 1;
     }
 
-    if (mode == BACKUP_PATHS && (paths == NULL || paths[0] == NULL))
+    if (mode == BACKUP_EXPLICIT_PATHS && (paths == NULL || paths[0] == NULL))
     {
-        printf("Error: -paths requires at least one path argument.\n");
+        printf("Error: explicit-paths mode requires at least one path argument.\n");
         return 1;
     }
 
@@ -137,9 +137,9 @@ int backup(const char *target, BackupMode mode, char **paths)
     struct stat st;
     int count = 0;
 
-    if (mode == BACKUP_PATHS)
+    if (mode == BACKUP_EXPLICIT_PATHS)
     {
-        printf("[Custom Paths]\n");
+        printf("[Explicit Paths]\n");
         for (int i = 0; paths[i] != NULL; i++)
         {
             if (stat(paths[i], &st) == 0)

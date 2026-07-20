@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <getopt.h>
+#include <string.h>
 
 #include "backup.h"
 #include "packages.h"
@@ -17,70 +18,141 @@ typedef enum {
     ACTION_HELP
 } Action;
 
+static void action_lookup(const char *arg, Action *action)
+{
+    if (strcmp(arg, "report") == 0)
+        *action = ACTION_REPORT;
+    else if (strcmp(arg, "backup") == 0)
+        *action = ACTION_BACKUP;
+    else if (strcmp(arg, "packages") == 0)
+        *action = ACTION_PACKAGES;
+    else if (strcmp(arg, "restore") == 0)
+        *action = ACTION_RESTORE;
+    else if (strcmp(arg, "help") == 0)
+        *action = ACTION_HELP;
+    else
+        *action = ACTION_NONE;
+}
+
 int main(int argc, char *argv[])
 {
+    if (argc < 2) // No arguments provided; default to report action
+    {
+        report();
+        return 0;
+    }
+
     static struct option long_options[] = {
-        {"report",         no_argument,       NULL, 'r'},
-        {"backup",         required_argument, NULL, 'b'},
-        {"packages",       no_argument,       NULL, 'p'},
-        {"restore",        required_argument, NULL, 's'},
         {"dry-run",        no_argument,       NULL, 'n'},
+        {"verbose",        no_argument,       NULL, 'v'},
         {"help",           no_argument,       NULL, 'h'},
         {"critical",       no_argument,       NULL, 'c'},
         {"comprehensive",  no_argument,       NULL, 'C'},
-        {"paths",          no_argument,       NULL, 'P'},
         {NULL,             0,                 NULL,  0 }
     };
 
-    Action action = ACTION_NONE;
+    Action action;
+
+    if (argv[1][0] == '-')
+    {
+        action = ACTION_NONE;
+        optind = 1; // Start parsing from the first argument
+    }
+    else 
+    {
+        action_lookup(argv[1], &action);
+        if (action == ACTION_NONE)
+        {
+            printf("Unknown command: %s\n", argv[1]);
+            return 1;
+        }
+        optind = 2; // Start parsing after the first argument (the action)
+    }
+
     char *path = NULL;
     BackupMode mode = BACKUP_CRITICAL;
-    char **user_paths = NULL;
-    int path_count = 0;
+    static char *no_paths[] = { NULL }; // Used when no user-supplied paths are given
+    char **user_paths = no_paths;
     int opt;
+    int mode_flag_given = 0;
 
-    // Use getopt_long_only to support single-dash long arguments seamlessly
-    // (e.g., './migr -backup' instead of requiring './migr --backup')
-    while ((opt = getopt_long_only(argc, argv, "nv", long_options, NULL)) != -1)
+    // Parse options only. optind was set above to skip the command word, or left
+    // at 1 when no command was given (e.g. `migr --help`). getopt_long permutes
+    // argv as it scans, so once the loop ends every non-option argument sits
+    // contiguously starting at argv[optind] — that is where positionals are read.
+    while ((opt = getopt_long(argc, argv, "nvh", long_options, NULL)) != -1)
     {
         switch (opt)
         {
-            case 'v': verbose = 1;                   break;
-            case 'n': dry_run = 1;                   break;
-            case 'r': action = ACTION_REPORT;        break;
-            case 'b': action = ACTION_BACKUP;        path = optarg; break;
-            case 'p':
-                action = ACTION_PACKAGES;
-                // WORKAROUND: getopt's `optional_argument` strictly requires '=' syntax (-packages=file).
-                // To support space-separated syntax (-packages file.txt) and match our CLI design,
-                // we declare it as `no_argument` and manually peek ahead at argv[optind].
-                if (optind < argc && argv[optind][0] != '-')
-                    path = argv[optind++];
-                break;
-            case 's': action = ACTION_RESTORE;       path = optarg; break;
-            case 'h': action = ACTION_HELP;          break;
-            case 'c': mode = BACKUP_CRITICAL;        break;
-            case 'C': mode = BACKUP_COMPREHENSIVE;   break;
-            case 'P':
-                mode = BACKUP_PATHS;
-                while (optind < argc && argv[optind][0] != '-')
-                {
-                    user_paths = realloc(user_paths, (path_count + 2) * sizeof(char *));
-                    user_paths[path_count++] = argv[optind++];
-                    user_paths[path_count] = NULL;
-                }
-                break;
-            case '?':
-            default:
-                printf("For help: ./migr -help\n");
-                free(user_paths);
+        case 'v':
+            verbose = 1;
+            break;
+        case 'n':
+            dry_run = 1;
+            break;
+        case 'h':
+            action = ACTION_HELP;
+            break;
+        case 'c':
+        case 'C':
+            // Both flags write the same variable, so a second one would silently
+            // overwrite the first. Reject instead of letting the last one win.
+            if (mode_flag_given)
+            {
+                printf("Error: --critical and --comprehensive are mutually exclusive.\n");
                 return 1;
+            }
+            mode = (opt == 'C') ? BACKUP_COMPREHENSIVE : BACKUP_CRITICAL;
+            mode_flag_given = 1;
+            break;
+        case '?':
+        default:
+            printf("For help: ./migr --help\n");
+            return 1;
         }
     }
 
+    if (optind < argc)
+    {
+        // First positional is the destination (or source, for restore). Any further
+        // positionals are user-supplied paths; they point into argv rather than
+        // heap memory, and are NULL-terminated for free because argv[argc] is NULL.
+        path = argv[optind];
+        user_paths = &argv[optind + 1];
+
+        // If user-supplied paths are present, the mode must be BACKUP_EXPLICIT_PATHS. 
+        // If a mode flag was also given, that's an error.
+        if (user_paths[0] != NULL)
+        {
+            if (mode_flag_given)
+            {
+                printf("Error: cannot combine --critical/--comprehensive with explicit paths.\n");
+                return 1;
+            }
+            mode = BACKUP_EXPLICIT_PATHS;
+        }
+    }
+
+    // Cross-cutting validation: reject anything the chosen command has no use for.
+    // This runs here because it is the first point where every input is known —
+    // options from the parse loop, positionals from the block above. Command-specific
+    // checks ("is my required argument present?") stay in the dispatch switch, since
+    // their usage messages belong to the command.
+    if (mode_flag_given && action != ACTION_BACKUP)
+    {
+        printf("Error: --critical/--comprehensive apply only to 'backup'.\n");
+        return 1;
+    }
+    if (path != NULL && (action == ACTION_REPORT || action == ACTION_NONE))
+    {
+        printf("Error: 'report' takes no arguments.\n");
+        return 1;
+    }
+
     // --- EXECUTION PHASE ---
-    // Dispatching actions only after all flags are fully parsed ensures
-    // that argument order does not matter (e.g., `-n -backup path` vs `-backup path -n`).
+    // Dispatching only after parsing completes means option position is irrelevant
+    // (`migr backup -n /mnt` and `migr backup /mnt -n` behave identically), and the
+    // positional arguments above are already settled by getopt's permutation.
     int ret = 0;
     switch (action)
     {
@@ -91,7 +163,7 @@ int main(int argc, char *argv[])
         case ACTION_BACKUP:
             if (path == NULL)
             {
-                printf("Usage: ./migr -backup <PATH> [-critical | -comprehensive | -paths <PATH...>]\n");
+                printf("Usage: ./migr backup <PATH> [--critical | --comprehensive | <PATH...>]\n");
                 ret = 1;
                 break;
             }
@@ -100,7 +172,13 @@ int main(int argc, char *argv[])
         case ACTION_PACKAGES:
             if (path == NULL)
             {
-                printf("Usage: ./migr -packages <FILE>\n");
+                printf("Usage: ./migr packages <FILE>\n");
+                ret = 1;
+                break;
+            }
+            if (user_paths[0] != NULL)
+            {
+                printf("Error: packages does not accept additional paths.\n");
                 ret = 1;
                 break;
             }
@@ -109,7 +187,13 @@ int main(int argc, char *argv[])
         case ACTION_RESTORE:
             if (path == NULL)
             {
-                printf("Usage: ./migr -restore <SOURCE>\n");
+                printf("Usage: ./migr restore <SOURCE>\n");
+                ret = 1;
+                break;
+            }
+            if (user_paths[0] != NULL)
+            {
+                printf("Error: restore does not accept additional paths.\n");
                 ret = 1;
                 break;
             }
@@ -120,6 +204,5 @@ int main(int argc, char *argv[])
             break;
     }
 
-    free(user_paths);
     return ret;
 }

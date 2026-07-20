@@ -28,30 +28,43 @@ git config core.hooksPath hooks
 
 ```bash
 ./migr
-./migr -report
-./migr -backup <PATH>
-./migr -packages <FILE>
-./migr -restore <SOURCE>
+./migr report
+./migr backup <PATH>
+./migr packages <FILE>
+./migr restore <SOURCE>
+```
+
+## Commands
+
+```
+report                Show backup analysis report (default when no command given)
+backup <PATH>         Clone files and packages to PATH
+packages <FILE>       Export installed packages to FILE
+restore <SOURCE>      Restore files and packages from a backup at SOURCE
+help                  Show help
 ```
 
 ## Options
 
 ```
--report               Show backup analysis report (default when no arguments given)
--backup <PATH>        Clone files and packages to PATH
--packages <FILE>      Export installed packages to FILE
--restore <SOURCE>     Restore files and packages from a backup at SOURCE
 -n, --dry-run         Preview actions without making changes
--v                    Verbose output (combine with any flag)
--help                 Show help
+-v, --verbose         Verbose output
+-h, --help            Show help
 ```
 
-Backup mode flags (combine with `-backup`):
+Backup scope (`backup` only, mutually exclusive):
 
 ```
--critical             Back up Documents, Downloads, Pictures, and dotfiles (default)
--comprehensive        Back up everything except system files
--paths <PATH...>      Back up specific paths provided by the user
+--critical            Back up Documents, Downloads, Pictures, and dotfiles (default)
+--comprehensive       Back up everything except system files
+<PATH...>             Paths listed after the destination are backed up exactly as
+                      given, with no assumptions
+```
+
+```bash
+./migr backup /mnt/drive
+./migr backup /mnt/drive --comprehensive
+./migr backup /mnt/drive ~/Documents ~/Projects
 ```
 
 ## Key Features
@@ -61,21 +74,21 @@ Backup mode flags (combine with `-backup`):
 
 ## What Gets Backed Up
 
-**`-critical` (default):** Documents, Downloads, Pictures — the irreplaceable files most likely to exist nowhere else.
+**`--critical` (default):** Documents, Downloads, Pictures — the irreplaceable files most likely to exist nowhere else.
 
-**`-comprehensive`:** Everything `-critical` covers, plus Desktop, Videos, and Music.
+**`--comprehensive`:** Everything `--critical` covers, plus Desktop, Videos, and Music.
 
-**`-paths`:** Exactly what you specify — no assumptions made.
+**Explicit paths:** Exactly what you specify — no assumptions made.
 
-**Dotfiles (all modes except `-paths`):** .ssh, .gnupg, .gitconfig, .bashrc, .profile
+**Dotfiles (all scopes except explicit paths):** .ssh, .gnupg, .gitconfig, .bashrc, .profile
 
-**Browser Profiles (all modes except `-paths`):** Firefox, Chrome, Chromium, Brave, Vivaldi, Edge, Opera — only the profiles present on the system are copied.
+**Browser Profiles (all scopes except explicit paths):** Firefox, Chrome, Chromium, Brave, Vivaldi, Edge, Opera — only the profiles present on the system are copied.
 
-**Packages (all modes except `-paths`):** Full package list via dpkg/rpm/pacman (saved as packages.txt, reinstalled on restore)
+**Packages (all scopes except explicit paths):** Full package list via dpkg/rpm/pacman (saved as packages.txt, reinstalled on restore)
 
 ## Report
 
-Running `migr` or `migr -report` scans your home directory and shows sizes for main directories, dotfiles, dev tools, and browsers — plus a critical backup size estimate.
+Running `migr` or `migr report` scans your home directory and shows sizes for main directories, dotfiles, dev tools, and browsers — plus a critical backup size estimate.
 
 ## Under the Hood
 
@@ -100,9 +113,7 @@ Package listing and restoration commands (`dpkg`, `rpm`, `pacman`, `dnf`, `apt-g
 - [ ] Logging
 - [ ] Network configuration backup
 - [ ] Self-contained backup (embed static binary)
-- [ ] Cloud storage support (via rclone)
 - [ ] Provide pre-built .deb, .rpm, and AUR packages
-- [ ] Granular backup selection (interactive per-directory prompts)
 
 ## License
 

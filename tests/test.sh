@@ -83,10 +83,10 @@ assert_exits_nonzero() {
 
 # --- 3. LIFECYCLE ---
 test_report() {
-    echo -e "${BLUE}::${NC} Phase 1: -report"
+    echo -e "${BLUE}::${NC} Phase 1: report"
 
     local output
-    output=$(../migr -report)
+    output=$(../migr report)
 
     assert_contains "$output" ".bashrc"
     assert_contains "$output" ".ssh"
@@ -94,10 +94,10 @@ test_report() {
 }
 
 test_dry_run() {
-    echo -e "${BLUE}::${NC} Phase 2: -dry-run"
+    echo -e "${BLUE}::${NC} Phase 2: --dry-run"
 
     local output
-    output=$(../migr -backup "$BACKUP_DIR" -n)
+    output=$(../migr backup "$BACKUP_DIR" -n)
 
     assert_contains "$output" "Dry run"
 
@@ -115,11 +115,11 @@ test_dry_run() {
 }
 
 test_backup() {
-    echo -e "${BLUE}::${NC} Phase 3: -backup"
+    echo -e "${BLUE}::${NC} Phase 3: backup"
 
     local output
     # -v needed: without it, individual filenames are not printed
-    output=$(../migr -backup "$BACKUP_DIR" -v)
+    output=$(../migr backup "$BACKUP_DIR" -v)
 
     assert_contains "$output" "Backup complete"
     assert_contains "$output" ".bashrc"
@@ -165,7 +165,7 @@ test_backup() {
 }
 
 test_restore() {
-    echo -e "${BLUE}::${NC} Phase 4: -restore"
+    echo -e "${BLUE}::${NC} Phase 4: restore"
 
     # wipe home to simulate a fresh system
     rm -rf "$HOME"
@@ -180,7 +180,7 @@ test_restore() {
 
     local output
     # restore() calls confirm_action() — pipe "y" to mock user interaction
-    output=$(echo "y" | ../migr -restore "$actual_backup")
+    output=$(echo "y" | ../migr restore "$actual_backup")
 
     assert_contains "$output" "Restore complete"
 
@@ -195,10 +195,10 @@ test_restore() {
 }
 
 test_packages() {
-    echo -e "${BLUE}::${NC} Phase 5: -packages"
+    echo -e "${BLUE}::${NC} Phase 5: packages"
 
     local pkg_file="$TEST_DIR/pkgs.txt"
-    ../migr -packages "$pkg_file"
+    ../migr packages "$pkg_file"
 
     assert_file_exists "$pkg_file"
 
@@ -211,7 +211,7 @@ test_packages() {
 }
 
 test_comprehensive() {
-    echo -e "${BLUE}::${NC} Phase 7: -backup -comprehensive"
+    echo -e "${BLUE}::${NC} Phase 7: backup --comprehensive"
 
     local comp_backup="$TEST_DIR/backup_comprehensive"
     mkdir -p "$comp_backup"
@@ -221,7 +221,7 @@ test_comprehensive() {
     echo "icon" > "$HOME/Desktop/browser.desktop"
 
     local output
-    output=$(../migr -backup "$comp_backup" -comprehensive)
+    output=$(../migr backup "$comp_backup" --comprehensive)
 
     assert_contains "$output" "Backup complete"
 
@@ -233,14 +233,14 @@ test_comprehensive() {
     assert_file_exists "$actual_backup/Documents"
 }
 
-test_paths() {
-    echo -e "${BLUE}::${NC} Phase 8: -backup -paths"
+test_explicit_paths() {
+    echo -e "${BLUE}::${NC} Phase 8: backup <PATH...>"
 
     local paths_backup="$TEST_DIR/backup_paths"
     mkdir -p "$paths_backup"
 
     local output
-    output=$(../migr -backup "$paths_backup" -paths "$HOME/Documents")
+    output=$(../migr backup "$paths_backup" "$HOME/Documents")
 
     assert_contains "$output" "Backup complete"
 
@@ -250,39 +250,58 @@ test_paths() {
     # specified path is present
     assert_file_exists "$actual_backup/Documents"
 
-    # dotfiles must be absent — paths mode makes no assumptions
+    # dotfiles must be absent — explicit-paths mode makes no assumptions
     if [ -e "$actual_backup/.bashrc" ]; then
-        echo -e "  ${RED}✗${NC} .bashrc should not be in a -paths backup"
+        echo -e "  ${RED}✗${NC} .bashrc should not be in an explicit-paths backup"
         exit 1
     else
-        echo -e "  ${GREEN}✓${NC} Dotfiles correctly excluded from -paths backup."
+        echo -e "  ${GREEN}✓${NC} Dotfiles correctly excluded from explicit-paths backup."
     fi
 
     # packages.txt must be absent
     if [ -e "$actual_backup/packages.txt" ]; then
-        echo -e "  ${RED}✗${NC} packages.txt should not be in a -paths backup"
+        echo -e "  ${RED}✗${NC} packages.txt should not be in an explicit-paths backup"
         exit 1
     else
-        echo -e "  ${GREEN}✓${NC} packages.txt correctly excluded from -paths backup."
+        echo -e "  ${GREEN}✓${NC} packages.txt correctly excluded from explicit-paths backup."
     fi
 
-    # manifest.txt must also be absent — paths mode makes no XDG assumptions
+    # manifest.txt must also be absent — explicit-paths mode makes no XDG assumptions
     if [ -e "$actual_backup/manifest.txt" ]; then
-        echo -e "  ${RED}✗${NC} manifest.txt should not be in a -paths backup"
+        echo -e "  ${RED}✗${NC} manifest.txt should not be in an explicit-paths backup"
         exit 1
     else
-        echo -e "  ${GREEN}✓${NC} manifest.txt correctly excluded from -paths backup."
+        echo -e "  ${GREEN}✓${NC} manifest.txt correctly excluded from explicit-paths backup."
     fi
 }
 
 test_errors() {
     echo -e "${BLUE}::${NC} Phase 9: error paths"
 
-    assert_exits_nonzero ../migr -backup
-    assert_exits_nonzero ../migr -restore
-    assert_exits_nonzero ../migr -restore /nonexistent/path
-    assert_exits_nonzero ../migr -backup "$BACKUP_DIR" -paths
-    assert_exits_nonzero ../migr -packages
+    # missing required arguments
+    assert_exits_nonzero ../migr backup
+    assert_exits_nonzero ../migr restore
+    assert_exits_nonzero ../migr packages
+    assert_exits_nonzero ../migr restore /nonexistent/path
+
+    # unrecognised command word
+    assert_exits_nonzero ../migr bogus
+
+    # the two scope flags are mutually exclusive
+    assert_exits_nonzero ../migr backup "$BACKUP_DIR" --critical --comprehensive
+
+    # a scope flag cannot be combined with explicit paths
+    assert_exits_nonzero ../migr backup "$BACKUP_DIR" --comprehensive "$HOME/Documents"
+
+    # scope flags apply to backup only
+    assert_exits_nonzero ../migr restore "$BACKUP_DIR" --comprehensive
+
+    # commands that take exactly one positional reject extras
+    assert_exits_nonzero ../migr restore "$BACKUP_DIR" /tmp/extra
+    assert_exits_nonzero ../migr packages /tmp/one /tmp/two
+
+    # report takes no arguments at all
+    assert_exits_nonzero ../migr report /tmp/somewhere
 }
 
 
@@ -295,6 +314,6 @@ test_backup
 test_restore
 test_packages
 test_comprehensive
-test_paths
+test_explicit_paths
 test_errors
 echo -e "${GREEN}all tests passed${NC}"
