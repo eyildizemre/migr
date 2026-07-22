@@ -96,7 +96,7 @@ Backup scope (`backup` only, mutually exclusive):
 
 **Browser Profiles (all scopes except explicit paths):** Firefox, Chrome, Chromium, Brave, Vivaldi, Edge, Opera — only the profiles present on the system are copied.
 
-**Packages (all scopes except explicit paths):** Full package list via dpkg/rpm/pacman (saved as packages.txt, reinstalled on restore)
+**Packages (all scopes except explicit paths):** The list of packages you explicitly installed — not the thousands of dependencies pulled in alongside them — saved as packages.txt and reinstalled on restore. Anything the new distribution cannot resolve is written to `skipped-packages.txt` rather than silently dropped.
 
 ## Report
 
@@ -113,7 +113,7 @@ In their place, a custom pure C POSIX engine handles all I/O and process executi
 - **`run_command()`** — shell-free subprocess execution via `fork`/`execvp`/`waitpid`. Replaces `system()`.
 - **`run_command_capture()`** — same as above, with stdout captured into a buffer via an anonymous `pipe`. Replaces `popen()`.
 
-Package listing and restoration commands (`dpkg`, `rpm`, `pacman`, `dnf`, `apt-get`, `xargs`) are launched directly as process arguments — no shell is ever spawned. Size reporting uses native `off_t` arithmetic throughout for correct behaviour on both 32-bit (LFS) and 64-bit architectures.
+Package listing and restoration commands (`apt-mark`, `dnf`, `pacman`, `apt-get`) are launched directly as process arguments — no shell is ever spawned. Size reporting uses native `off_t` arithmetic throughout for correct behaviour on both 32-bit (LFS) and 64-bit architectures.
 
 ## Planned
 

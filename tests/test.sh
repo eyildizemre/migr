@@ -202,12 +202,75 @@ test_packages() {
 
     assert_file_exists "$pkg_file"
 
-    if [ -s "$pkg_file" ]; then
-        echo -e "  ${GREEN}✓${NC} Package list is non-empty."
+    # The listing command differs per distribution, but the file it produces must not:
+    # one bare package name per line, everywhere. Restore reads the same format no
+    # matter which distro wrote the backup, so a per-distro quirk in the query would
+    # break restore silently. These checks are the format contract.
+
+    local line_count
+    line_count=$(wc -l < "$pkg_file")
+
+    # A query format that emits no line separators still produces a large, non-empty
+    # file — so count lines, not bytes. Any real system has more than ten packages.
+    if [ "$line_count" -ge 10 ]; then
+        echo -e "  ${GREEN}✓${NC} Package list has $line_count lines."
     else
-        echo -e "  ${RED}✗${NC} Package list is empty: '$pkg_file'"
+        echo -e "  ${RED}✗${NC} Only $line_count line(s) — export likely collapsed into one record."
+        echo "  First 200 bytes:"
+        head -c 200 "$pkg_file"
         exit 1
     fi
+
+    # A version column (pacman -Qe) or a status column (dpkg --get-selections) both
+    # appear as a second field. Bare names never contain whitespace.
+    if grep -qE '[[:space:]]' "$pkg_file"; then
+        echo -e "  ${RED}✗${NC} Lines contain whitespace — expected bare names, got:"
+        grep -nE '[[:space:]]' "$pkg_file" | head -3
+        exit 1
+    else
+        echo -e "  ${GREEN}✓${NC} Every line is a bare package name."
+    fi
+
+    # A blank line would become an empty install argument during restore.
+    if grep -qE '^$' "$pkg_file"; then
+        echo -e "  ${RED}✗${NC} Package list contains blank lines."
+        exit 1
+    else
+        echo -e "  ${GREEN}✓${NC} No blank lines."
+    fi
+
+    # Nothing is named this. A line this long means records ran together.
+    if awk 'length($0) > 100 { exit 1 }' "$pkg_file"; then
+        echo -e "  ${GREEN}✓${NC} No implausibly long entries."
+    else
+        echo -e "  ${RED}✗${NC} A line exceeds 100 characters — records likely ran together."
+        exit 1
+    fi
+
+    # An architecture suffix normally means the query printed full NEVRA (rpm -qa)
+    # rather than names. Such lines are well-formed, so none of the checks above notice
+    # them, yet they are useless on the target system.
+    #
+    # This cannot be an outright ban: a few packages genuinely carry one in their name.
+    # Fedora's akmod-built kernel modules are the known case — kmod-nvidia is literally
+    # named kmod-nvidia-<kernel version>.x86_64. So compare proportions instead. A
+    # correct export has a handful at most; a NEVRA export has essentially all of them.
+    local suffixed
+    suffixed=$(grep -cE '\.(x86_64|noarch|i686|aarch64|armv7hl)$' "$pkg_file" || true)
+
+    if [ "$((suffixed * 10))" -gt "$line_count" ]; then
+        echo -e "  ${RED}✗${NC} $suffixed of $line_count entries carry architecture suffixes — query is printing NEVRA, not names:"
+        grep -nE '\.(x86_64|noarch|i686|aarch64|armv7hl)$' "$pkg_file" | head -3
+        exit 1
+    else
+        echo -e "  ${GREEN}✓${NC} Architecture suffixes within normal range ($suffixed of $line_count)."
+    fi
+
+    # The checks above cannot know what a valid name looks like on a distribution this
+    # suite has never run on. Print a sample so a human can confirm the shape — this is
+    # the point of running the suite inside an Ubuntu or Arch VM.
+    echo -e "  ${BLUE}i${NC} First 3 entries (confirm these look like package names):"
+    head -3 "$pkg_file" | sed 's/^/      /'
 }
 
 test_comprehensive() {

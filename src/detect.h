@@ -40,8 +40,14 @@ distro_t detect_distro(void);
 /**
  * @brief Returns the package-listing argv for the given distribution.
  *
+ * Every command lists only explicitly-installed packages — not transitive
+ * dependencies — and emits one plain package name per line, so all three
+ * distributions produce the same file format.
+ *
+ * Debian → apt-mark showmanual; Fedora → dnf repoquery --userinstalled;
+ * Arch → pacman -Qeq.
+ *
  * The returned array is statically allocated and must not be freed.
- * Debian → dpkg --get-selections; Fedora → rpm -qa; Arch → pacman -Qe.
  *
  * @param distro The detected distribution.
  * @return A NULL-terminated argv suitable for run_command_capture(), or NULL for DISTRO_UNKNOWN.

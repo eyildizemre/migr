@@ -55,9 +55,21 @@ distro_t detect_distro(void)
 
 char *const *get_package_cmd(distro_t distro)
 {
-    static char *const debian_cmd[] = {"dpkg", "--get-selections", NULL};
-    static char *const fedora_cmd[] = {"rpm", "-qa", NULL};
-    static char *const arch_cmd[]   = {"pacman", "-Qe", NULL};
+    // Each command lists only explicitly-installed packages, one plain name per line.
+    // Listing every installed package instead would export thousands of transitive
+    // dependencies (2457 vs 432 on a stock Fedora 44 workstation) whose names differ
+    // sharply between distributions — and which the target package manager resolves on
+    // its own anyway. The manual set is smaller and made of top-level names that agree
+    // far better across distros, which is what makes package restore worth attempting.
+    static char *const debian_cmd[] = {"apt-mark", "showmanual", NULL};
+
+    // dnf's queryformat requires the two-character escape "\\n". A real newline byte is
+    // copied through uninterpreted, collapsing the entire output into one record.
+    static char *const fedora_cmd[] = {"dnf", "repoquery", "--userinstalled",
+                                       "--qf", "%{name}\\n", NULL};
+
+    // -q strips the version column that plain -Qe appends after each name.
+    static char *const arch_cmd[]   = {"pacman", "-Qeq", NULL};
 
     switch (distro)
     {

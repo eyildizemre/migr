@@ -264,7 +264,11 @@ int restore(const char *source)
                         if (sscanf(line, "%255s", pkg_name) != 1)
                             continue;
 
-                        // dpkg format: "pkg\tstatus" — only install "install" entries
+                        // Backups written before the switch to explicitly-installed
+                        // package lists used `dpkg --get-selections`, whose format is
+                        // "pkg\tstatus" and which includes deinstalled entries. Current
+                        // backups are plain names with no tab, so this only fires for
+                        // older files — kept so they still restore correctly.
                         char *tab = strchr(line, '\t');
                         if (tab != NULL && strncmp(tab + 1, "install", 7) != 0)
                             continue;
