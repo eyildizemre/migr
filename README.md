@@ -115,6 +115,11 @@ In their place, a custom pure C POSIX engine handles all I/O and process executi
 
 Package listing and restoration commands (`apt-mark`, `dnf`, `pacman`, `apt-get`) are launched directly as process arguments — no shell is ever spawned. Size reporting uses native `off_t` arithmetic throughout for correct behaviour on both 32-bit (LFS) and 64-bit architectures.
 
+## Design Decisions
+
+Why things are the way they are — including what was rejected, and why — is
+recorded in [docs/DECISIONS.md](docs/DECISIONS.md).
+
 ## Planned
 
 - [x] Dry-run mode
