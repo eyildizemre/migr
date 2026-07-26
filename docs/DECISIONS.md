@@ -329,3 +329,30 @@ the single-transaction rationale carries the decision from here on.
   line, no blank lines, no run-together records, architecture suffixes below a
   proportion threshold (an outright ban is impossible: `kmod-nvidia` on Fedora
   genuinely embeds kernel version and arch in its package *name*).
+
+---
+
+## D13 — 2026-07-26 — Sparse-file support is deferred out of the sidecar
+
+**Status:** Decided — deferred
+
+**Decision:** The sidecar (D6) will not preserve file sparseness in its initial
+implementation. A sparse file is backed up and restored as a full, non-sparse file of
+the same visible size and contents; only the on-disk hole structure is lost.
+
+**Why:** Of every dimension the sidecar handles, sparse files are the lowest value and
+the highest complexity. They are rare in a home directory — the main producers are VM
+disk images and similar, which are large enough that users typically exclude them
+anyway. Preserving sparseness needs `SEEK_HOLE`/`SEEK_DATA` extent mapping on backup
+and `ftruncate` + positioned `pwrite` on restore, a materially more involved code path
+than any other dimension. The cost/value ratio does not justify carrying it in the
+first version.
+
+**Consequence:** restoring a sparse file inflates it to its full allocated size on
+disk. For the rare large sparse file this can be a surprising space cost, which is the
+main reason to revisit.
+
+**Revisit if:** sparse files turn out to matter in practice, or once the higher-value
+dimensions (metadata, symlinks, filenames, xattrs) are complete and stable.
+
+See docs/sidecar-plan.md for the full implementation plan.
