@@ -34,6 +34,10 @@ setup() {
     echo "alias ll='ls -la'" > "$HOME/.bashrc"
     echo "export PATH"       > "$HOME/.profile"
     ln -s "$HOME/Documents/note.txt" "$HOME/Documents/shortcut"
+    # 0600 file + an absolute symlink to it: backing up the symlink must not
+    # chmod the target. Regression fixture for the symlink source-mutation bug.
+    chmod 600 "$HOME/.ssh/config"
+    ln -s "$HOME/.ssh/config" "$HOME/Documents/cfg-link"
     echo "places"    > "$HOME/.mozilla/firefox/profile/places.sqlite"
     echo "prefs"     > "$HOME/.config/google-chrome/Default/Preferences"
 }
@@ -139,6 +143,27 @@ test_backup() {
         echo -e "  ${GREEN}✓${NC} Symlink preserved."
     else
         echo -e "  ${RED}✗${NC} Symlink not copied as symlink: '$actual_backup/Documents/shortcut'"
+        exit 1
+    fi
+
+    # the absolute symlink must actually have been copied — otherwise the source-mode
+    # check below passes vacuously (nothing was there to mutate the target through)
+    if [ -L "$actual_backup/Documents/cfg-link" ] && \
+       [ "$(readlink "$actual_backup/Documents/cfg-link")" = "$HOME/.ssh/config" ]; then
+        echo -e "  ${GREEN}✓${NC} Absolute symlink copied with target intact."
+    else
+        echo -e "  ${RED}✗${NC} cfg-link not copied as a symlink to $HOME/.ssh/config"
+        exit 1
+    fi
+
+    # backing up an absolute symlink must not chmod its target: the source .ssh/config
+    # must still be 0600, not 0777 (regression for the symlink source-mutation bug)
+    local cfg_mode
+    cfg_mode=$(stat -c '%a' "$HOME/.ssh/config")
+    if [ "$cfg_mode" = "600" ]; then
+        echo -e "  ${GREEN}✓${NC} Symlink target permissions unchanged (source not mutated)."
+    else
+        echo -e "  ${RED}✗${NC} Backup mutated symlink target: .ssh/config is now $cfg_mode, expected 600"
         exit 1
     fi
 

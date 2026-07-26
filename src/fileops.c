@@ -14,7 +14,11 @@
 
 static int preserve_metadata(const char *path, const struct stat *st)
 {
-    chmod(path, st->st_mode);
+    // Never chmod a symlink: chmod() follows the link and would change the target's
+    // mode (for an absolute link, the real source file). Symlinks have no meaningful
+    // permissions of their own on Linux, so there is nothing to preserve here.
+    if (!S_ISLNK(st->st_mode))
+        chmod(path, st->st_mode);
 
     struct timespec times[2];
     times[0] = st->st_atim; // access time
