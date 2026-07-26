@@ -136,6 +136,7 @@ int backup(const char *target, BackupMode mode, char **paths)
 
     struct stat st;
     int count = 0;
+    int had_error = 0; // set when any file copy fails, so success is never faked
 
     if (mode == BACKUP_EXPLICIT_PATHS)
     {
@@ -144,8 +145,10 @@ int backup(const char *target, BackupMode mode, char **paths)
         {
             if (stat(paths[i], &st) == 0)
             {
-                clone_item(paths[i], backup_dir);
-                count++;
+                if (clone_item(paths[i], backup_dir) == 0)
+                    count++;
+                else
+                    had_error = 1;
             }
             else
             {
@@ -202,8 +205,10 @@ int backup(const char *target, BackupMode mode, char **paths)
             // main_dirs[i] is a full absolute path from xdg_resolve (or projects_path)
             if (stat(main_dirs[i], &st) == 0)
             {
-                clone_item(main_dirs[i], backup_dir);
-                count++;
+                if (clone_item(main_dirs[i], backup_dir) == 0)
+                    count++;
+                else
+                    had_error = 1;
             }
         }
 
@@ -213,8 +218,10 @@ int backup(const char *target, BackupMode mode, char **paths)
             snprintf(src, sizeof(src), "%s/%s", home, dotfiles[i]);
             if (stat(src, &st) == 0)
             {
-                clone_item(src, backup_dir);
-                count++;
+                if (clone_item(src, backup_dir) == 0)
+                    count++;
+                else
+                    had_error = 1;
             }
         }
 
@@ -234,6 +241,7 @@ int backup(const char *target, BackupMode mode, char **paths)
         {
             int r = clone_nested(home, backup_dir, browser_configs[i]);
             if (r > 0) count++;
+            else if (r < 0) had_error = 1;
         }
 
         printf("\n[Packages]\n");
@@ -257,10 +265,12 @@ int backup(const char *target, BackupMode mode, char **paths)
     printf("\n===========================================================\n");
     if (dry_run)
         printf("Dry run complete: %d items would be copied\n", count);
+    else if (had_error)
+        printf("Backup finished with errors: %d items copied, some items failed\n", count);
     else
         printf("Backup complete: %d items copied\n", count);
     printf("Location: %s\n", backup_dir);
     printf("===========================================================\n");
 
-    return 0;
+    return had_error ? 1 : 0;
 }

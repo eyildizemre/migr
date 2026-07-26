@@ -298,6 +298,39 @@ test_packages() {
     head -3 "$pkg_file" | sed 's/^/      /'
 }
 
+test_error_propagation() {
+    echo -e "${BLUE}::${NC} Phase 6: backup error propagation"
+
+    # A 0000 file is denied even to its owner, so the copy's open() fails — a durable
+    # failure that (unlike a FIFO) stays a failure after special-file support lands.
+    # Root bypasses permission bits, so the reproduction only holds as a normal user.
+    if [ "$(id -u)" -eq 0 ]; then
+        echo -e "  ${BLUE}i${NC} Skipped (root bypasses 0000 permissions)."
+        return
+    fi
+
+    local err_backup="$TEST_DIR/backup_err"
+    mkdir -p "$err_backup"
+    echo "unreadable" > "$HOME/locked.txt"
+    chmod 000 "$HOME/locked.txt"
+
+    local output rc
+    # `if` suppresses set -e; output is captured whether the command exits 0 or not
+    if output=$(../migr backup "$err_backup" "$HOME/locked.txt" 2>&1); then rc=0; else rc=$?; fi
+    chmod 644 "$HOME/locked.txt"  # restore so teardown and later phases are unaffected
+
+    if [ "$rc" -ne 0 ]; then
+        echo -e "  ${GREEN}✓${NC} A failed copy exits non-zero ($rc), not 0."
+    else
+        echo -e "  ${RED}✗${NC} A failed copy still exited 0!"
+        echo "$output"
+        exit 1
+    fi
+
+    # and the summary must not claim plain success
+    assert_contains "$output" "errors"
+}
+
 test_comprehensive() {
     echo -e "${BLUE}::${NC} Phase 7: backup --comprehensive"
 
@@ -401,6 +434,7 @@ test_dry_run
 test_backup
 test_restore
 test_packages
+test_error_propagation
 test_comprehensive
 test_explicit_paths
 test_errors
