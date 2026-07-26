@@ -394,6 +394,29 @@ test_explicit_paths() {
     else
         echo -e "  ${GREEN}✓${NC} manifest.txt correctly excluded from explicit-paths backup."
     fi
+
+    # A trailing slash must not flatten a directory into the backup root and
+    # overwrite another explicit item with the same child name.
+    local trailing_backup="$TEST_DIR/backup_paths_trailing"
+    mkdir -p "$HOME/dir_a" "$HOME/dir_b" "$trailing_backup"
+    echo A > "$HOME/dir_a/same.txt"
+    echo B > "$HOME/dir_b/same.txt"
+
+    output=$(../migr backup "$trailing_backup" "$HOME/dir_a/same.txt" "$HOME/dir_b/")
+    assert_contains "$output" "Backup complete"
+
+    local trailing_actual
+    trailing_actual=$(find "$trailing_backup" -maxdepth 1 -name 'migr_backup_*' -type d | head -1)
+    assert_file_exists "$trailing_actual/same.txt"
+    assert_file_exists "$trailing_actual/dir_b/same.txt"
+
+    if [ "$(cat "$trailing_actual/same.txt")" = "A" ] && \
+       [ "$(cat "$trailing_actual/dir_b/same.txt")" = "B" ]; then
+        echo -e "  ${GREEN}✓${NC} Trailing slash preserved both explicit items."
+    else
+        echo -e "  ${RED}✗${NC} Trailing slash caused explicit items to overwrite or merge."
+        exit 1
+    fi
 }
 
 test_errors() {
@@ -423,6 +446,15 @@ test_errors() {
 
     # report takes no arguments at all
     assert_exits_nonzero ../migr report /tmp/somewhere
+
+    # explicit paths sharing a basename must be refused, not silently merged/overwritten
+    mkdir -p "$HOME/dir_a" "$HOME/dir_b"
+    echo A > "$HOME/dir_a/same.txt"
+    echo B > "$HOME/dir_b/same.txt"
+    assert_exits_nonzero ../migr backup "$BACKUP_DIR" "$HOME/dir_a/same.txt" "$HOME/dir_b/same.txt"
+
+    # The filesystem root has no leaf name to place under the backup directory.
+    assert_exits_nonzero ../migr backup "$BACKUP_DIR" /
 }
 
 

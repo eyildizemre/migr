@@ -13,6 +13,21 @@
 #include "utils.h"
 #include "xdg.h"
 
+// Return the final path component as a span, ignoring trailing slashes.
+static size_t path_leaf(const char *path, const char **leaf)
+{
+    const char *end = path + strlen(path);
+    while (end > path && end[-1] == '/')
+        end--;
+
+    const char *start = end;
+    while (start > path && start[-1] != '/')
+        start--;
+
+    *leaf = start;
+    return (size_t)(end - start);
+}
+
 // create directory if it doesn't exist
 static int create_dir(const char *path)
 {
@@ -47,11 +62,16 @@ static int clone_item(const char *src, const char *dest)
         printf("  Copying: %s\n", src);
     }
 
-    const char *name = strrchr(src, '/');
-    name = name ? name + 1 : src;
+    const char *name;
+    size_t name_len = path_leaf(src, &name);
+    if (name_len == 0)
+    {
+        printf("Error: Path has no destination name: %s\n", src);
+        return 1;
+    }
 
     char full_dest[PATH_MAX];
-    snprintf(full_dest, sizeof(full_dest), "%s/%s", dest, name);
+    snprintf(full_dest, sizeof(full_dest), "%s/%.*s", dest, (int)name_len, name);
 
     if (clone_recursive(src, full_dest) != 0)
     {
@@ -115,6 +135,45 @@ int backup(const char *target, BackupMode mode, char **paths)
     {
         printf("Error: explicit-paths mode requires at least one path argument.\n");
         return 1;
+    }
+
+    // Two explicit paths that share a basename would clone to the same destination
+    // name and silently overwrite (files) or merge (directories). Refuse rather than
+    // lose data. Deterministic disambiguation is planned with the sidecar's EXPLICIT_n
+    // roots; until then, refusing is the safe behaviour.
+    if (mode == BACKUP_EXPLICIT_PATHS)
+    {
+        for (int i = 0; paths[i] != NULL; i++)
+        {
+            const char *name;
+            if (path_leaf(paths[i], &name) == 0)
+            {
+                printf("Error: explicit path has no destination name: %s\n", paths[i]);
+                return 1;
+            }
+        }
+
+        for (int i = 0; paths[i] != NULL; i++)
+        {
+            const char *left_name;
+            size_t left_len = path_leaf(paths[i], &left_name);
+
+            for (int j = i + 1; paths[j] != NULL; j++)
+            {
+                const char *right_name;
+                size_t right_len = path_leaf(paths[j], &right_name);
+
+                if (left_len == right_len &&
+                    memcmp(left_name, right_name, left_len) == 0)
+                {
+                    printf("Error: these paths share the name '%.*s' and would overwrite each other:\n",
+                           (int)left_len, left_name);
+                    printf("  %s\n  %s\n", paths[i], paths[j]);
+                    printf("Rename one or back them up separately.\n");
+                    return 1;
+                }
+            }
+        }
     }
 
     if (create_dir(target) != 0)
