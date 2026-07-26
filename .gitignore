@@ -2,4 +2,5 @@
 migr
 tests/test_detect
 tests/test_pathjoin
+tests/test_special_files
 docs/TODO.md

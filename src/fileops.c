@@ -161,7 +161,42 @@ int clone_recursive(const char *src, const char *dest)
         return 0;
     }
 
-    return -1; // unsupported file type
+    // FIFO: recreate the node itself. Never open it as a regular file — reading a
+    // FIFO blocks until a writer appears, which would hang the whole backup. An
+    // existing FIFO at dest is accepted so an interrupted backup can resume.
+    if (S_ISFIFO(st.st_mode))
+    {
+        if (mkfifo(dest, st.st_mode & 07777) != 0)
+        {
+            struct stat dest_st;
+            if (errno != EEXIST ||
+                lstat(dest, &dest_st) != 0 ||
+                !S_ISFIFO(dest_st.st_mode))
+            {
+                return -1;
+            }
+        }
+
+        preserve_metadata(dest, &st);
+        return 0;
+    }
+
+    // Sockets and device nodes carry no copyable content: a socket is a runtime
+    // IPC endpoint, a device node needs root to recreate. Skip either with a
+    // warning rather than failing the enclosing directory over it.
+    if (S_ISSOCK(st.st_mode))
+    {
+        printf("  Warning: skipping socket (runtime-only): %s\n", src);
+        return 0;
+    }
+    if (S_ISCHR(st.st_mode) || S_ISBLK(st.st_mode))
+    {
+        printf("  Warning: skipping %s device node: %s\n",
+               S_ISCHR(st.st_mode) ? "character" : "block", src);
+        return 0;
+    }
+
+    return -1; // unknown file type (unreachable on Linux); refuse defensively
 }
 
 int get_dir_size(const char *path, off_t *size)
@@ -183,6 +218,14 @@ int get_dir_size(const char *path, off_t *size)
     if (S_ISREG(st.st_mode))
     {
         *size += st.st_size;
+        return 0;
+    }
+
+    // FIFOs, sockets, and device nodes carry no payload bytes. Contribute nothing
+    // and stay silent: measurement feeds the report, which must not be chatty.
+    if (S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode) ||
+        S_ISCHR(st.st_mode) || S_ISBLK(st.st_mode))
+    {
         return 0;
     }
 
@@ -220,8 +263,10 @@ int get_dir_size(const char *path, off_t *size)
         }
 
         closedir(dir);
+        return 0;
     }
-    return 0;
+
+    return -1; // unknown file type (unreachable on Linux); refuse defensively
 }
 
 int run_command(char *const argv[])

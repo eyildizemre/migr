@@ -108,7 +108,7 @@ This tool was fully refactored to eliminate all shell-based execution. It no lon
 
 In their place, a custom pure C POSIX engine handles all I/O and process execution:
 
-- **`clone_recursive()`** — recursive file and directory cloning via `open`/`read`/`write`/`mkdir`/`readdir`, preserving permissions and timestamps (`chmod`, `utimensat`) and copying symlinks as symlinks. Replaces `cp -r`.
+- **`clone_recursive()`** — recursive file and directory cloning via POSIX APIs, preserving permissions and timestamps, copying symlinks as symlinks and FIFOs as FIFOs, and skipping sockets and device nodes with a warning. Replaces `cp -r`.
 - **`get_dir_size()`** — recursive directory size calculation via `lstat` and `dirent`. Replaces `du`.
 - **`run_command()`** — shell-free subprocess execution via `fork`/`execvp`/`waitpid`. Replaces `system()`.
 - **`run_command_capture()`** — same as above, with stdout captured into a buffer via an anonymous `pipe`. Replaces `popen()`.

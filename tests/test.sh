@@ -29,6 +29,7 @@ setup() {
     mkdir -p "$BACKUP_DIR"
 
     echo "test doc"  > "$HOME/Documents/note.txt"
+    mkfifo "$HOME/Documents/events.fifo"
     echo "secret"    > "$HOME/.ssh/config"
     echo "gituser"   > "$HOME/.gitconfig"
     echo "alias ll='ls -la'" > "$HOME/.bashrc"
@@ -160,6 +161,13 @@ test_backup() {
     assert_file_exists "$actual_backup/.ssh/config"
     assert_file_exists "$actual_backup/.bashrc"
 
+    if [ -p "$actual_backup/Documents/events.fifo" ]; then
+        echo -e "  ${GREEN}✓${NC} FIFO preserved as a FIFO."
+    else
+        echo -e "  ${RED}✗${NC} FIFO not copied as a FIFO: '$actual_backup/Documents/events.fifo'"
+        exit 1
+    fi
+
     # verify symlink was faithfully copied as a symlink, not a regular file
     if [ -L "$actual_backup/Documents/shortcut" ]; then
         echo -e "  ${GREEN}✓${NC} Symlink preserved."
@@ -234,6 +242,13 @@ test_restore() {
     assert_file_exists "$HOME/Documents/note.txt"
     assert_file_exists "$HOME/.ssh/config"
     assert_file_exists "$HOME/.bashrc"
+
+    if [ -p "$HOME/Documents/events.fifo" ]; then
+        echo -e "  ${GREEN}✓${NC} FIFO restored as a FIFO."
+    else
+        echo -e "  ${RED}✗${NC} FIFO not restored as a FIFO: '$HOME/Documents/events.fifo'"
+        exit 1
+    fi
 
     # nested browser profiles must restore to the correct location, 
     # not $HOME/firefox or $HOME/google-chrome

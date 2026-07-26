@@ -90,7 +90,11 @@ int report(void)
         if (dir_exists(path))
         {
             off_t bytes_size = 0;
-            get_dir_size(path, &bytes_size);
+            if (get_dir_size(path, &bytes_size) != 0)
+            {
+                had_error = 1;
+                continue;
+            }
             format_size(bytes_size, size, sizeof(size));
             print_item(main_dirs[i], size);
         }
@@ -110,7 +114,11 @@ int report(void)
         if (file_exists(path))
         {
             off_t bytes_size = 0;
-            get_dir_size(path, &bytes_size);
+            if (get_dir_size(path, &bytes_size) != 0)
+            {
+                had_error = 1;
+                continue;
+            }
             format_size(bytes_size, size, sizeof(size));
             print_item(dotfiles[i], size);
         }
@@ -130,7 +138,11 @@ int report(void)
         if (dir_exists(path))
         {
             off_t bytes_size = 0;
-            get_dir_size(path, &bytes_size);
+            if (get_dir_size(path, &bytes_size) != 0)
+            {
+                had_error = 1;
+                continue;
+            }
             format_size(bytes_size, size, sizeof(size));
             print_item(dev_dirs[i], size);
         }
@@ -151,7 +163,11 @@ int report(void)
         if (dir_exists(path))
         {
             off_t bytes_size = 0;
-            get_dir_size(path, &bytes_size);
+            if (get_dir_size(path, &bytes_size) != 0)
+            {
+                had_error = 1;
+                continue;
+            }
             format_size(bytes_size, size, sizeof(size));
             print_item(browser_names[i], size);
         }
@@ -173,8 +189,10 @@ int report(void)
         if (file_exists(path))
         {
             off_t temp_size = 0;
-            get_dir_size(path, &temp_size);
-            critical_total += temp_size;
+            if (get_dir_size(path, &temp_size) == 0)
+                critical_total += temp_size;
+            else
+                had_error = 1;
         }
     }
 
@@ -188,8 +206,10 @@ int report(void)
         if (file_exists(path))
         {
             off_t temp_size = 0;
-            get_dir_size(path, &temp_size);
-            critical_total += temp_size;
+            if (get_dir_size(path, &temp_size) == 0)
+                critical_total += temp_size;
+            else
+                had_error = 1;
         }
     }
 
@@ -204,7 +224,7 @@ int report(void)
 
     if (had_error)
     {
-        printf("\nWarning: some paths could not be built (HOME too long); "
+        printf("\nWarning: some paths could not be measured; "
                "this report is incomplete.\n");
         return 1;
     }
