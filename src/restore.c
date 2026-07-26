@@ -20,22 +20,26 @@ static int file_exists(const char *path)
 
 static int clone_to_home(const char *src, const char *home)
 {
-    if (dry_run)
-    {
-        printf("  Would restore: %s -> %s/\n", src, home);
-        return 0;
-    }
-
-    if (verbose)
-    {
-        printf("  Restoring: %s\n", src);
-    }
-
+    // Resolve the destination before the dry-run branch so a path that would be
+    // refused live is refused in dry-run too: the preview must match reality.
     const char *name = strrchr(src, '/');
     name = name ? name + 1 : src;
 
     char full_dest[PATH_MAX];
-    snprintf(full_dest, sizeof(full_dest), "%s/%s", home, name);
+    if (path_join(full_dest, sizeof(full_dest), home, name) != 0)
+    {
+        printf("Error: Failed to restore %s\n", src);
+        return 1;
+    }
+
+    if (dry_run)
+    {
+        printf("  Would restore: %s -> %s\n", src, full_dest);
+        return 0;
+    }
+
+    if (verbose)
+        printf("  Restoring: %s\n", src);
 
     if (clone_recursive(src, full_dest) != 0)
     {
@@ -51,18 +55,21 @@ static int clone_to_home(const char *src, const char *home)
 static int restore_nested(const char *source, const char *home, const char *rel_path)
 {
     char src[PATH_MAX], dest[PATH_MAX];
-    snprintf(src, sizeof(src), "%s/%s", source, rel_path);
+    if (path_join(src, sizeof(src), source, rel_path) != 0)
+        return -1;
 
     if (!file_exists(src))
         return 0;
 
-    snprintf(dest, sizeof(dest), "%s/%s", home, rel_path);
+    if (path_join(dest, sizeof(dest), home, rel_path) != 0)
+        return -1;
 
     const char *slash = strrchr(rel_path, '/');
     if (slash)
     {
         char parent[PATH_MAX];
-        snprintf(parent, sizeof(parent), "%s/%.*s", home, (int)(slash - rel_path), rel_path);
+        if (path_join_n(parent, sizeof(parent), home, rel_path, (size_t)(slash - rel_path)) != 0)
+            return -1;
         if (!file_exists(parent))
         {
             if (dry_run)
@@ -136,7 +143,13 @@ int restore(const char *source)
     };
     enum { XDG_RESTORE_COUNT = 6 };
     char *xdg_dirs[XDG_RESTORE_COUNT];
-    xdg_resolve(home, xdg_keys, xdg_fallbacks, xdg_dirs, XDG_RESTORE_COUNT);
+    if (xdg_resolve(home, xdg_keys, xdg_fallbacks, xdg_dirs, XDG_RESTORE_COUNT) != 0)
+    {
+        printf("Error: HOME path too long to resolve user directories\n");
+        for (int i = 0; i < XDG_RESTORE_COUNT; i++)
+            free(xdg_dirs[i]);
+        return 1;
+    }
 
     char *manifest_names[XDG_RESTORE_COUNT];
     int has_manifest = (manifest_read(source, manifest_names, XDG_RESTORE_COUNT) == 0);
@@ -145,6 +158,7 @@ int restore(const char *source)
 
     char src_path[PATH_MAX];
     int count = 0;
+    int had_error = 0;
 
     printf("[Main Directories]\n");
     for (int i = 0; i < XDG_RESTORE_COUNT; i++)
@@ -160,19 +174,31 @@ int restore(const char *source)
             name = p ? p + 1 : xdg_dirs[i];
         }
 
-        snprintf(src_path, sizeof(src_path), "%s/%s", source, name);
+        if (path_join(src_path, sizeof(src_path), source, name) != 0)
+        {
+            printf("  Warning: path too long, skipping: %s/%s\n", source, name);
+            had_error = 1;
+            continue;
+        }
         if (file_exists(src_path))
         {
             if (dry_run)
+            {
                 printf("  Would restore: %s -> %s/\n", src_path, xdg_dirs[i]);
+                count++;
+            }
             else
             {
                 if (verbose)
                     printf("  Restoring: %s\n", src_path);
                 if (clone_recursive(src_path, xdg_dirs[i]) != 0)
+                {
                     printf("Error: Failed to restore %s\n", src_path);
+                    had_error = 1;
+                }
+                else
+                    count++;
             }
-            count++;
         }
     }
 
@@ -183,21 +209,34 @@ int restore(const char *source)
         free(manifest_names[i]);
 
     // Projects is not a standard XDG directory
-    snprintf(src_path, sizeof(src_path), "%s/Projects", source);
-    if (file_exists(src_path))
+    if (path_join(src_path, sizeof(src_path), source, "Projects") != 0)
     {
-        clone_to_home(src_path, home);
-        count++;
+        printf("  Warning: path too long, skipping: %s/Projects\n", source);
+        had_error = 1;
+    }
+    else if (file_exists(src_path))
+    {
+        if (clone_to_home(src_path, home) == 0)
+            count++;
+        else
+            had_error = 1;
     }
 
     printf("\n[Dotfiles]\n");
     for (int i = 0; dotfiles[i] != NULL; i++)
     {
-        snprintf(src_path, sizeof(src_path), "%s/%s", source, dotfiles[i]);
+        if (path_join(src_path, sizeof(src_path), source, dotfiles[i]) != 0)
+        {
+            printf("  Warning: path too long, skipping: %s/%s\n", source, dotfiles[i]);
+            had_error = 1;
+            continue;
+        }
         if (file_exists(src_path))
         {
-            clone_to_home(src_path, home);
-            count++;
+            if (clone_to_home(src_path, home) == 0)
+                count++;
+            else
+                had_error = 1;
         }
     }
 
@@ -216,13 +255,19 @@ int restore(const char *source)
     for (int i = 0; browser_configs[i] != NULL; i++)
     {
         int r = restore_nested(source, home, browser_configs[i]);
-        if (r > 0) count++;
+        if (r > 0)
+            count++;
+        else if (r < 0)
+            had_error = 1;
     }
 
     char pkg_path[PATH_MAX];
-    snprintf(pkg_path, sizeof(pkg_path), "%s/packages.txt", source);
-
-    if (file_exists(pkg_path))
+    if (path_join(pkg_path, sizeof(pkg_path), source, "packages.txt") != 0)
+    {
+        printf("  Warning: package list path too long, skipping\n");
+        had_error = 1;
+    }
+    else if (file_exists(pkg_path))
     {
         printf("\n[Packages]\n");
 
@@ -338,7 +383,9 @@ int restore(const char *source)
                         {
                             // Phase 2: per-package fallback, track failures
                             char skipped_path[PATH_MAX];
-                            snprintf(skipped_path, sizeof(skipped_path), "%s/skipped-packages.txt", home);
+                            int can_write_skip_log =
+                                path_join(skipped_path, sizeof(skipped_path), home,
+                                          "skipped-packages.txt") == 0;
                             FILE *skipped_f = NULL;
 
                             for (int i = 0; i < pkg_count; i++)
@@ -381,8 +428,22 @@ int restore(const char *source)
 
                                 if (run_command((char *const *)install_cmd) != 0)
                                 {
-                                    if (skipped_f == NULL)
+                                    if (!can_write_skip_log)
+                                    {
+                                        if (skipped == 0)
+                                            printf("Error: Could not write skipped package log\n");
+                                        had_error = 1;
+                                    }
+                                    else if (skipped_f == NULL)
+                                    {
                                         skipped_f = fopen(skipped_path, "w");
+                                        if (skipped_f == NULL)
+                                        {
+                                            printf("Error: Could not write skipped package log\n");
+                                            can_write_skip_log = 0;
+                                            had_error = 1;
+                                        }
+                                    }
                                     if (skipped_f != NULL)
                                         fprintf(skipped_f, "%s\n", pkgs[i]);
                                     skipped++;
@@ -419,11 +480,16 @@ int restore(const char *source)
     }
 
     printf("\n===========================================================\n");
-    if (dry_run)
+    if (dry_run && had_error)
+        printf("Dry run finished with errors: %d items would be restored, some items failed validation\n",
+               count);
+    else if (dry_run)
         printf("Dry run complete: %d items would be restored\n", count);
+    else if (had_error)
+        printf("Restore finished with errors: %d items restored, some items failed\n", count);
     else
         printf("Restore complete: %d items restored\n", count);
     printf("===========================================================\n");
 
-    return 0;
+    return had_error ? 1 : 0;
 }

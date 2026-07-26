@@ -12,6 +12,8 @@
 #include <limits.h> // to use PATH_MAX
 #include <errno.h>
 
+#include "utils.h" // path_join
+
 static int preserve_metadata(const char *path, const struct stat *st)
 {
     // Never chmod a symlink: chmod() follows the link and would change the target's
@@ -139,8 +141,13 @@ int clone_recursive(const char *src, const char *dest)
 
             char new_src[PATH_MAX];
             char new_dest[PATH_MAX];
-            snprintf(new_src, sizeof(new_src), "%s/%s", src, entry->d_name);
-            snprintf(new_dest, sizeof(new_dest), "%s/%s", dest, entry->d_name);
+            // Paths grow as we descend; refuse rather than act on a truncated one.
+            if (path_join(new_src, sizeof(new_src), src, entry->d_name) != 0 ||
+                path_join(new_dest, sizeof(new_dest), dest, entry->d_name) != 0)
+            {
+                closedir(op);
+                return -1;
+            }
 
             if (clone_recursive(new_src, new_dest) != 0)
             {
@@ -199,7 +206,11 @@ int get_dir_size(const char *path, off_t *size)
             }
 
             char new_path[PATH_MAX];
-            snprintf(new_path, sizeof(new_path), "%s/%s", path, entry->d_name);
+            if (path_join(new_path, sizeof(new_path), path, entry->d_name) != 0)
+            {
+                closedir(dir);
+                return -1;
+            }
 
             if (get_dir_size(new_path, size) != 0)
             {

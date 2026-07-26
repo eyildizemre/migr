@@ -38,8 +38,7 @@ int main(int argc, char *argv[])
 {
     if (argc < 2) // No arguments provided; default to report action
     {
-        report();
-        return 0;
+        return report();
     }
 
     static struct option long_options[] = {

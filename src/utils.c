@@ -1,9 +1,30 @@
 #include <stdio.h>
+#include <string.h>
+#include <limits.h>
 
 #include "utils.h"
 
 int verbose = 0;
 int dry_run = 0;
+
+int path_join_n(char *buf, size_t size, const char *dir,
+                const char *name, size_t name_len)
+{
+    // The "%.*s" precision is an int; a name_len past INT_MAX would overflow the
+    // cast. Production callers stay under PATH_MAX, but reject it rather than
+    // rely on that invariant holding forever.
+    if (name_len > INT_MAX)
+        return -1;
+    int n = snprintf(buf, size, "%s/%.*s", dir, (int)name_len, name);
+    if (n < 0 || (size_t)n >= size)
+        return -1;
+    return 0;
+}
+
+int path_join(char *buf, size_t size, const char *dir, const char *name)
+{
+    return path_join_n(buf, size, dir, name, strlen(name));
+}
 
 void print_help(void)
 {

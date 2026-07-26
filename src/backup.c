@@ -51,17 +51,8 @@ static int create_dir(const char *path)
 
 static int clone_item(const char *src, const char *dest)
 {
-    if (dry_run)
-    {
-        printf("  Would copy: %s -> %s\n", src, dest);
-        return 0;
-    }
-
-    if (verbose)
-    {
-        printf("  Copying: %s\n", src);
-    }
-
+    // Compute the destination before the dry-run branch so a path that would be
+    // refused live is refused in dry-run too: the preview must match reality.
     const char *name;
     size_t name_len = path_leaf(src, &name);
     if (name_len == 0)
@@ -71,7 +62,20 @@ static int clone_item(const char *src, const char *dest)
     }
 
     char full_dest[PATH_MAX];
-    snprintf(full_dest, sizeof(full_dest), "%s/%.*s", dest, (int)name_len, name);
+    if (path_join_n(full_dest, sizeof(full_dest), dest, name, name_len) != 0)
+    {
+        printf("Error: Destination path too long for %s\n", src);
+        return 1;
+    }
+
+    if (dry_run)
+    {
+        printf("  Would copy: %s -> %s\n", src, full_dest);
+        return 0;
+    }
+
+    if (verbose)
+        printf("  Copying: %s\n", src);
 
     if (clone_recursive(src, full_dest) != 0)
     {
@@ -86,13 +90,15 @@ static int clone_item(const char *src, const char *dest)
 static int clone_nested(const char *home, const char *backup_dir, const char *rel_path)
 {
     char src[PATH_MAX], dest[PATH_MAX];
-    snprintf(src, sizeof(src), "%s/%s", home, rel_path);
+    if (path_join(src, sizeof(src), home, rel_path) != 0)
+        return -1;
 
     struct stat st;
     if (stat(src, &st) != 0)
         return 0;
 
-    snprintf(dest, sizeof(dest), "%s/%s", backup_dir, rel_path);
+    if (path_join(dest, sizeof(dest), backup_dir, rel_path) != 0)
+        return -1;
 
     // Split the path to create parent directories first.
     // The OS kernel will throw ENOENT if we try to copy into a non-existent parent directory.
@@ -100,7 +106,8 @@ static int clone_nested(const char *home, const char *backup_dir, const char *re
     if (slash)
     {
         char parent[PATH_MAX];
-        snprintf(parent, sizeof(parent), "%s/%.*s", backup_dir, (int)(slash - rel_path), rel_path);
+        if (path_join_n(parent, sizeof(parent), backup_dir, rel_path, (size_t)(slash - rel_path)) != 0)
+            return -1;
         if (create_dir(parent) != 0)
             return -1;
     }
@@ -182,8 +189,13 @@ int backup(const char *target, BackupMode mode, char **paths)
     char backup_dir[PATH_MAX];
     time_t now = time(NULL);
     struct tm *t = localtime(&now);
-    snprintf(backup_dir, sizeof(backup_dir), "%s/migr_backup_%04d%02d%02d",
-             target, t->tm_year + 1900, t->tm_mon + 1, t->tm_mday);
+    int dir_len = snprintf(backup_dir, sizeof(backup_dir), "%s/migr_backup_%04d%02d%02d",
+                           target, t->tm_year + 1900, t->tm_mon + 1, t->tm_mday);
+    if (dir_len < 0 || (size_t)dir_len >= sizeof(backup_dir))
+    {
+        printf("Error: Backup path too long: %s\n", target);
+        return 1;
+    }
 
     if (create_dir(backup_dir) != 0)
         return 1;
@@ -230,7 +242,13 @@ int backup(const char *target, BackupMode mode, char **paths)
         };
         enum { XDG_DIR_COUNT = 6 };
         char *xdg_dirs[XDG_DIR_COUNT];
-        xdg_resolve(home, xdg_keys, xdg_fallbacks, xdg_dirs, XDG_DIR_COUNT);
+        if (xdg_resolve(home, xdg_keys, xdg_fallbacks, xdg_dirs, XDG_DIR_COUNT) != 0)
+        {
+            printf("Error: HOME path too long to resolve user directories\n");
+            for (int i = 0; i < XDG_DIR_COUNT; i++)
+                free(xdg_dirs[i]);
+            return 1;
+        }
 
         // Capture basenames for cross-locale restoration (e.g. "/home/user/Belgeler" -> "Belgeler").
         // Instead of allocating new memory, use pointer arithmetic to point directly 
@@ -244,7 +262,13 @@ int backup(const char *target, BackupMode mode, char **paths)
 
         // Projects is not a standard XDG directory
         char projects_path[PATH_MAX];
-        snprintf(projects_path, sizeof(projects_path), "%s/Projects", home);
+        if (path_join(projects_path, sizeof(projects_path), home, "Projects") != 0)
+        {
+            printf("Error: Home path too long to build Projects path\n");
+            for (int i = 0; i < XDG_DIR_COUNT; i++)
+                free(xdg_dirs[i]);
+            return 1;
+        }
 
         // indices: 0=Documents 1=Downloads 2=Pictures 3=Desktop 4=Videos 5=Music
         // NULL terminators are used to mark the end of the arrays for iteration
@@ -274,7 +298,12 @@ int backup(const char *target, BackupMode mode, char **paths)
         printf("\n[Dotfiles]\n");
         for (int i = 0; dotfiles[i] != NULL; i++)
         {
-            snprintf(src, sizeof(src), "%s/%s", home, dotfiles[i]);
+            if (path_join(src, sizeof(src), home, dotfiles[i]) != 0)
+            {
+                printf("  Warning: path too long, skipping: %s/%s\n", home, dotfiles[i]);
+                had_error = 1;
+                continue;
+            }
             if (stat(src, &st) == 0)
             {
                 if (clone_item(src, backup_dir) == 0)
@@ -304,10 +333,13 @@ int backup(const char *target, BackupMode mode, char **paths)
         }
 
         printf("\n[Packages]\n");
-        char pkg_path[PATH_MAX + sizeof("/packages.txt")]; // ensure enough space for path + filename
-        snprintf(pkg_path, sizeof(pkg_path), "%s/packages.txt", backup_dir);
-
-        if (dry_run)
+        char pkg_path[PATH_MAX];
+        if (path_join(pkg_path, sizeof(pkg_path), backup_dir, "packages.txt") != 0)
+        {
+            printf("  Warning: package list path too long, skipping\n");
+            had_error = 1;
+        }
+        else if (dry_run)
             printf("  Would export package list to: %s\n", pkg_path);
         else
             packages(pkg_path);

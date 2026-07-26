@@ -5,20 +5,21 @@
 #include <limits.h>
 
 #include "xdg.h"
+#include "utils.h" // path_join
 
-void xdg_resolve(const char *home,
-                 const char * const *keys,
-                 const char * const *fallbacks,
-                 char **out,
-                 int n)
+int xdg_resolve(const char *home,
+                const char * const *keys,
+                const char * const *fallbacks,
+                char **out,
+                int n)
 {
     for (int i = 0; i < n; i++)
         out[i] = NULL;
 
     char config[PATH_MAX];
-    snprintf(config, sizeof(config), "%s/.config/user-dirs.dirs", home);
-
-    FILE *f = fopen(config, "r");
+    FILE *f = NULL;
+    if (path_join(config, sizeof(config), home, ".config/user-dirs.dirs") == 0)
+        f = fopen(config, "r");
     if (f != NULL)
     {
         char line[PATH_MAX + 32];
@@ -50,28 +51,38 @@ void xdg_resolve(const char *home,
                     val[--vlen] = '\0';
 
                 char resolved[PATH_MAX];
+                int rn;
                 if (strncmp(val, "$HOME/", 6) == 0)
-                    snprintf(resolved, sizeof(resolved), "%s/%s", home, val + 6);
+                    rn = snprintf(resolved, sizeof(resolved), "%s/%s", home, val + 6);
                 else if (val[0] == '/')
-                    snprintf(resolved, sizeof(resolved), "%s", val);
+                    rn = snprintf(resolved, sizeof(resolved), "%s", val);
                 else
-                    snprintf(resolved, sizeof(resolved), "%s/%s", home, fallbacks[i]);
+                    rn = snprintf(resolved, sizeof(resolved), "%s/%s", home, fallbacks[i]);
 
-                out[i] = strdup(resolved);
+                // On truncation leave out[i] NULL; the fallback loop below fills it.
+                if (rn >= 0 && (size_t)rn < sizeof(resolved))
+                    out[i] = strdup(resolved);
                 break;
             }
         }
         fclose(f);
     }
 
-    // fill in any keys not found in the config with English defaults
+    // Fill any key not found in the config with the English default. Every path
+    // must stay absolute: a bare relative name would resolve against the caller's
+    // CWD, so if even home/<fallback> overflows PATH_MAX we leave the entry NULL
+    // and report failure instead of storing something unsafe.
+    int ok = 1;
     for (int i = 0; i < n; i++)
     {
         if (out[i] == NULL)
         {
             char fallback[PATH_MAX];
-            snprintf(fallback, sizeof(fallback), "%s/%s", home, fallbacks[i]);
-            out[i] = strdup(fallback);
+            if (path_join(fallback, sizeof(fallback), home, fallbacks[i]) != 0)
+                ok = 0;
+            else if ((out[i] = strdup(fallback)) == NULL)
+                ok = 0;
         }
     }
+    return ok ? 0 : -1;
 }

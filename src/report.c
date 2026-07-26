@@ -74,6 +74,7 @@ int report(void)
 
     char path[PATH_MAX];
     char size[32];
+    int had_error = 0; // set if any path could not be built, so the estimate never lies
 
     // main user directories
     const char *main_dirs[] = {"Documents", "Desktop", "Downloads", "Pictures", "Videos", "Music", "Projects", NULL};
@@ -81,7 +82,11 @@ int report(void)
     print_section("MAIN DIRECTORIES");
     for (int i = 0; main_dirs[i] != NULL; i++)
     {
-        snprintf(path, sizeof(path), "%s/%s", home, main_dirs[i]);
+        if (path_join(path, sizeof(path), home, main_dirs[i]) != 0)
+        {
+            had_error = 1;
+            continue;
+        }
         if (dir_exists(path))
         {
             off_t bytes_size = 0;
@@ -97,7 +102,11 @@ int report(void)
     print_section("DOTFILES & CONFIG");
     for (int i = 0; dotfiles[i] != NULL; i++)
     {
-        snprintf(path, sizeof(path), "%s/%s", home, dotfiles[i]);
+        if (path_join(path, sizeof(path), home, dotfiles[i]) != 0)
+        {
+            had_error = 1;
+            continue;
+        }
         if (file_exists(path))
         {
             off_t bytes_size = 0;
@@ -113,7 +122,11 @@ int report(void)
     print_section("DEV TOOLS (re-downloadable)");
     for (int i = 0; dev_dirs[i] != NULL; i++)
     {
-        snprintf(path, sizeof(path), "%s/%s", home, dev_dirs[i]);
+        if (path_join(path, sizeof(path), home, dev_dirs[i]) != 0)
+        {
+            had_error = 1;
+            continue;
+        }
         if (dir_exists(path))
         {
             off_t bytes_size = 0;
@@ -130,7 +143,11 @@ int report(void)
     print_section("BROWSERS");
     for (int i = 0; browsers[i] != NULL; i++)
     {
-        snprintf(path, sizeof(path), "%s/%s", home, browsers[i]);
+        if (path_join(path, sizeof(path), home, browsers[i]) != 0)
+        {
+            had_error = 1;
+            continue;
+        }
         if (dir_exists(path))
         {
             off_t bytes_size = 0;
@@ -148,7 +165,11 @@ int report(void)
 
     for (int i = 0; critical_dirs[i] != NULL; i++)
     {
-        snprintf(path, sizeof(path), "%s/%s", home, critical_dirs[i]);
+        if (path_join(path, sizeof(path), home, critical_dirs[i]) != 0)
+        {
+            had_error = 1;
+            continue;
+        }
         if (file_exists(path))
         {
             off_t temp_size = 0;
@@ -159,7 +180,11 @@ int report(void)
 
     for (int i = 0; critical_dots[i] != NULL; i++)
     {
-        snprintf(path, sizeof(path), "%s/%s", home, critical_dots[i]);
+        if (path_join(path, sizeof(path), home, critical_dots[i]) != 0)
+        {
+            had_error = 1;
+            continue;
+        }
         if (file_exists(path))
         {
             off_t temp_size = 0;
@@ -177,5 +202,11 @@ int report(void)
     printf("  (Documents, Downloads, Pictures, .ssh, .gnupg, .gitconfig, .bashrc)\n");
     printf("===========================================================\n");
 
+    if (had_error)
+    {
+        printf("\nWarning: some paths could not be built (HOME too long); "
+               "this report is incomplete.\n");
+        return 1;
+    }
     return 0;
 }

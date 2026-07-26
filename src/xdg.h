@@ -7,19 +7,27 @@
  * Searches the config file for each key in keys[] and expands the value:
  * "$HOME/path" prefixes are substituted with home, and absolute paths are
  * used as-is. The resolved absolute path is malloc'd and stored in out[i];
- * the caller is responsible for freeing every entry. If the config file is
- * missing or a key is absent, out[i] is set to "$HOME/<fallbacks[i]>".
+ * the caller is responsible for freeing every entry (freeing is safe even on
+ * failure, since unresolved entries are left NULL). If the config file is
+ * missing or a key is absent, out[i] falls back to home/<fallbacks[i]>.
+ *
+ * Every produced path is absolute. A relative fallback is never stored: a bare
+ * name would make the caller act on the current working directory instead of
+ * home. If HOME is so long that even a fallback path would overflow PATH_MAX,
+ * that entry is left NULL and the function reports failure — the caller must
+ * then abort rather than operate on a partial result.
  *
  * @param home      The user's home directory path.
  * @param keys      Array of n XDG key names to look up (e.g. "XDG_DOCUMENTS_DIR").
  * @param fallbacks Parallel array of n English fallback directory names (e.g. "Documents").
  * @param out       Caller-supplied array of n char* pointers; filled with malloc'd absolute paths.
  * @param n         Number of entries in keys, fallbacks, and out.
+ * @return 0 if every entry resolved to an absolute path, -1 if any could not.
  */
-void xdg_resolve(const char *home,
-                 const char * const *keys,
-                 const char * const *fallbacks,
-                 char **out,
-                 int n);
+int xdg_resolve(const char *home,
+                const char * const *keys,
+                const char * const *fallbacks,
+                char **out,
+                int n);
 
 #endif

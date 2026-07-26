@@ -1,4 +1,5 @@
 *.o
 migr
 tests/test_detect
+tests/test_pathjoin
 docs/TODO.md

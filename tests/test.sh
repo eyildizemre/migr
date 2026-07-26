@@ -84,6 +84,28 @@ assert_exits_nonzero() {
     fi
 }
 
+# Stronger form: the command must exit non-zero AND print an expected message.
+# This distinguishes a clean, intentional refusal from a crash that also happens
+# to exit non-zero (e.g. a segfault on a NULL path), which a bare exit-code check
+# would wave through.
+assert_fails_with() {
+    local expected="$1"; shift
+    local out rc
+    set +e
+    out=$("$@" 2>&1)
+    rc=$?
+    set -e
+    if [ "$rc" -ne 0 ] && [[ "$out" == *"$expected"* ]]; then
+        # Deliberately omit "$*" here: these commands carry a multi-KB HOME that
+        # would flood the log. The expected message identifies the case.
+        echo -e "  ${GREEN}✓${NC} Refused with '$expected'"
+    else
+        echo -e "  ${RED}✗${NC} Expected non-zero exit and '$expected' from: $*"
+        echo "  exit=$rc  output: $out"
+        exit 1
+    fi
+}
+
 
 # --- 3. LIFECYCLE ---
 test_report() {
@@ -457,6 +479,81 @@ test_errors() {
     assert_exits_nonzero ../migr backup "$BACKUP_DIR" /
 }
 
+test_truncation() {
+    echo -e "${BLUE}::${NC} Phase 10: path truncation safety"
+
+    # A HOME so long that home/<anything> overflows PATH_MAX. It need not exist:
+    # path_join fails on length alone, before any filesystem access.
+    local longhome
+    longhome="/$(head -c 4100 </dev/zero | tr '\0' h)"
+
+    # Gap 1: xdg_resolve must refuse, not fall back to a relative "Documents" that
+    # backup would then create in the current working directory. The message check
+    # confirms a clean refusal rather than a crash on a NULL path. `env HOME=...`
+    # sets the oversized HOME for this one command only, so it never leaks onward.
+    assert_fails_with "HOME path too long" \
+        env HOME="$longhome" ../migr backup "$BACKUP_DIR" --critical
+
+    # Same guard on restore. --dry-run skips the interactive confirm yet still
+    # reaches xdg_resolve before touching anything.
+    mkdir -p "$TEST_DIR/dummy_src"
+    assert_fails_with "HOME path too long" \
+        env HOME="$longhome" ../migr restore "$TEST_DIR/dummy_src" --dry-run
+
+    # Gap 3: report must not present a silent 0B estimate as success.
+    assert_fails_with "report is incomplete" \
+        env HOME="$longhome" ../migr report
+
+    # Gap 2: a per-item destination that overflows PATH_MAX must be refused in
+    # dry-run exactly as it is live, so the preview cannot promise a copy that
+    # would fail. Build a target long enough that backup_dir/<leaf> overflows while
+    # backup_dir itself still fits, so clone_item trips rather than the date check.
+    local deep="$TEST_DIR/deep" comp
+    comp=$(head -c 100 </dev/zero | tr '\0' c)
+    while [ ${#deep} -lt 3850 ]; do deep="$deep/$comp"; done
+    mkdir -p "$deep" # must exist: create_dir is non-recursive, so the live run
+                     # needs the target already present to reach clone_item
+    local leaf src
+    leaf=$(head -c 250 </dev/zero | tr '\0' x)
+    src="$TEST_DIR/$leaf"
+    echo hi > "$src"
+
+    local dry live live_out
+    set +e
+    ../migr backup "$deep" "$src" --dry-run >/dev/null 2>&1
+    dry=$?
+    live_out=$(../migr backup "$deep" "$src" 2>&1)
+    live=$?
+    set -e
+
+    if [ "$dry" -eq "$live" ] && [ "$dry" -ne 0 ] && [[ "$live_out" == *"Destination path too long"* ]]; then
+        echo -e "  ${GREEN}✓${NC} Truncating destination refused identically in dry-run and live (exit $dry)."
+    else
+        echo -e "  ${RED}✗${NC} dry-run/live parity broken: dry=$dry live=$live"
+        echo "  live output: $live_out"
+        exit 1
+    fi
+
+    # XDG fallback paths can still fit while a longer nested browser destination
+    # does not. restore_nested must propagate that item failure to restore().
+    local deep_home="$TEST_DIR/deep_home" room part_len
+    mkdir "$deep_home"
+    while [ ${#deep_home} -lt 4080 ]; do
+        room=$((4080 - ${#deep_home} - 1))
+        [ "$room" -le 0 ] && break
+        part_len=100
+        [ "$room" -lt "$part_len" ] && part_len=$room
+        comp=$(head -c "$part_len" </dev/zero | tr '\0' h)
+        deep_home="$deep_home/$comp"
+        mkdir "$deep_home"
+    done
+
+    mkdir -p "$TEST_DIR/dummy_src/.config/google-chrome/Default"
+    echo prefs > "$TEST_DIR/dummy_src/.config/google-chrome/Default/Preferences"
+    assert_fails_with "finished with errors" \
+        env HOME="$deep_home" ../migr restore "$TEST_DIR/dummy_src" --dry-run
+}
+
 
 # --- 4. RUN TESTS ---
 echo -e "${BLUE}migr integration tests${NC}"
@@ -470,4 +567,5 @@ test_error_propagation
 test_comprehensive
 test_explicit_paths
 test_errors
+test_truncation
 echo -e "${GREEN}all tests passed${NC}"

@@ -5,6 +5,7 @@
 #include <limits.h>
 
 #include "manifest.h"
+#include "utils.h" // path_join
 
 const char * const manifest_keys[MANIFEST_XDG_COUNT] = {
     "XDG_DOCUMENTS_DIR", "XDG_DOWNLOAD_DIR", "XDG_PICTURES_DIR",
@@ -14,7 +15,11 @@ const char * const manifest_keys[MANIFEST_XDG_COUNT] = {
 int manifest_write(const char *backup_dir, const char * const *basenames, int n)
 {
     char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/manifest.txt", backup_dir);
+    if (path_join(path, sizeof(path), backup_dir, "manifest.txt") != 0)
+    {
+        printf("Warning: Could not write manifest.txt\n");
+        return 1;
+    }
 
     FILE *f = fopen(path, "w");
     if (f == NULL)
@@ -39,7 +44,8 @@ int manifest_read(const char *backup_dir, char **out, int n)
         out[i] = NULL;
 
     char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/manifest.txt", backup_dir);
+    if (path_join(path, sizeof(path), backup_dir, "manifest.txt") != 0)
+        return 1;
 
     FILE *f = fopen(path, "r");
     if (f == NULL)

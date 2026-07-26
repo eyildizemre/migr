@@ -13,15 +13,20 @@ $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 TEST_DETECT = tests/test_detect
+TEST_PATHJOIN = tests/test_pathjoin
 
 $(TEST_DETECT): tests/test_detect.c detect.o
 	$(CC) $(CFLAGS) -o $@ tests/test_detect.c detect.o
 
-test: $(TARGET) $(TEST_DETECT)
+$(TEST_PATHJOIN): tests/test_pathjoin.c utils.o
+	$(CC) $(CFLAGS) -o $@ tests/test_pathjoin.c utils.o
+
+test: $(TARGET) $(TEST_DETECT) $(TEST_PATHJOIN)
 	./$(TEST_DETECT)
+	./$(TEST_PATHJOIN)
 	cd tests && bash test.sh
 
 clean:
-	rm -f $(OBJS) $(TARGET) $(TEST_DETECT)
+	rm -f $(OBJS) $(TARGET) $(TEST_DETECT) $(TEST_PATHJOIN)
 
 .PHONY: clean test
