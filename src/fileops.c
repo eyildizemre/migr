@@ -12,6 +12,7 @@
 #include <limits.h> // to use PATH_MAX
 #include <errno.h>
 
+#include "fileops.h" // CloneContext
 #include "utils.h" // path_join
 
 static int preserve_metadata(const char *path, const struct stat *st)
@@ -30,8 +31,10 @@ static int preserve_metadata(const char *path, const struct stat *st)
     return 0;
 }
 
-// Recursively clones a file or directory from src to dest, preserving metadata and handling symlinks
-int clone_recursive(const char *src, const char *dest) 
+// The recursive clone core. Direction-agnostic today; the CloneContext is threaded so
+// later phases can branch on it (e.g. a backup writing a sidecar) without re-plumbing.
+// Reached only through the backup_capture / restore_native public entries below.
+static int clone_tree(const CloneContext *ctx, const char *src, const char *dest)
 {
     struct stat st;
     
@@ -149,7 +152,7 @@ int clone_recursive(const char *src, const char *dest)
                 return -1;
             }
 
-            if (clone_recursive(new_src, new_dest) != 0)
+            if (clone_tree(ctx, new_src, new_dest) != 0)
             {
                 closedir(op);
                 return -1;
@@ -197,6 +200,25 @@ int clone_recursive(const char *src, const char *dest)
     }
 
     return -1; // unknown file type (unreachable on Linux); refuse defensively
+}
+
+int backup_capture(const CloneContext *ctx, const char *src, const char *dest)
+{
+    // Fail closed on a mis-dispatched context rather than running a native clone blindly:
+    // a wrong direction or an unimplemented representation must not silently produce a
+    // native tree where a sidecar was required.
+    if (ctx == NULL || ctx->operation != CLONE_BACKUP ||
+        ctx->representation != CLONE_NATIVE_TREE)
+        return -1;
+    return clone_tree(ctx, src, dest);
+}
+
+int restore_native(const CloneContext *ctx, const char *src, const char *dest)
+{
+    if (ctx == NULL || ctx->operation != CLONE_RESTORE ||
+        ctx->representation != CLONE_NATIVE_TREE)
+        return -1;
+    return clone_tree(ctx, src, dest);
 }
 
 int get_dir_size(const char *path, off_t *size)

@@ -1,4 +1,4 @@
-// Unit tests for the special-file policy in clone_recursive() and get_dir_size().
+// Unit tests for the special-file policy in the clone engine (via backup_capture) and get_dir_size().
 //
 // These types cannot be exercised reliably through the CLI: a socket must be
 // created with bind(), a device node needs root, and opening a FIFO as a regular
@@ -7,6 +7,9 @@
 // its contents), while sockets and device nodes are skipped without a destination
 // and add no bytes to a size measurement. /dev/null stands in as a character
 // device the test can reach without privileges.
+//
+// A final group checks the orchestration contract the same entries enforce: a NULL,
+// wrong-direction, or portable context is refused, never silently cloned.
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -44,6 +47,9 @@ int main(void)
 {
     printf(BLUE "::" NC " special files (unit)\n");
 
+    // The clone engine is direction-agnostic here; a capture-direction context suffices.
+    CloneContext ctx = { .operation = CLONE_BACKUP, .representation = CLONE_NATIVE_TREE };
+
     char root[] = "/tmp/migr_special_XXXXXX";
     if (mkdtemp(root) == NULL)
     {
@@ -74,7 +80,7 @@ int main(void)
 
     struct stat st = {0};
     struct stat src_st = {0};
-    int fifo_created = clone_recursive(src_fifo, dest_fifo) == 0 &&
+    int fifo_created = backup_capture(&ctx, src_fifo, dest_fifo) == 0 &&
                        lstat(src_fifo, &src_st) == 0 &&
                        lstat(dest_fifo, &st) == 0 &&
                        S_ISFIFO(st.st_mode);
@@ -82,7 +88,7 @@ int main(void)
           "FIFO is recreated as a FIFO");
     check(fifo_created && (st.st_mode & 0777) == (src_st.st_mode & 0777),
           "FIFO permissions are preserved");
-    check(clone_recursive(src_fifo, dest_fifo) == 0,
+    check(backup_capture(&ctx, src_fifo, dest_fifo) == 0,
           "an existing destination FIFO is accepted on resume");
 
     off_t size = 17;
@@ -118,7 +124,7 @@ int main(void)
     }
 
     errno = 0;
-    check(clone_recursive(src_socket, dest_socket) == 0 &&
+    check(backup_capture(&ctx, src_socket, dest_socket) == 0 &&
           lstat(dest_socket, &st) == -1 &&
           errno == ENOENT,
           "Unix socket is skipped without creating a destination");
@@ -132,7 +138,7 @@ int main(void)
           "/dev/null is available as the device-node fixture");
     errno = 0;
     check(device_fixture &&
-          clone_recursive("/dev/null", dest_device) == 0 &&
+          backup_capture(&ctx, "/dev/null", dest_device) == 0 &&
           lstat(dest_device, &st) == -1 &&
           errno == ENOENT,
           "device node is skipped without creating a destination");
@@ -142,6 +148,25 @@ int main(void)
           get_dir_size("/dev/null", &size) == 0 &&
           size == 29,
           "device node contributes no payload bytes");
+
+    // Context validation: the public entries enforce the orchestration contract, so a
+    // dispatch mistake fails closed instead of silently running a native clone. Each entry
+    // is checked independently for the refusal; one final check confirms that no refused
+    // call wrote anything (dest_device is absent — the device above was skipped). Keeping
+    // the "no write" assertion separate stops one broken entry from poisoning the others.
+    CloneContext restore_ctx = { .operation = CLONE_RESTORE, .representation = CLONE_NATIVE_TREE };
+    CloneContext portable_ctx = { .operation = CLONE_BACKUP, .representation = CLONE_PORTABLE_SIDECAR };
+
+    check(backup_capture(NULL, src_fifo, dest_device) == -1,
+          "backup_capture refuses a NULL context");
+    check(backup_capture(&restore_ctx, src_fifo, dest_device) == -1,
+          "backup_capture refuses a restore context");
+    check(restore_native(&ctx, src_fifo, dest_device) == -1,
+          "restore_native refuses a backup context");
+    check(backup_capture(&portable_ctx, src_fifo, dest_device) == -1,
+          "portable representation is refused, not run as a native clone");
+    check(lstat(dest_device, &st) == -1,
+          "a refused context writes no destination");
 
     close(socket_fd);
     unlink(src_socket);

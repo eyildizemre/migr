@@ -18,7 +18,7 @@ static int file_exists(const char *path)
     return (stat(path, &st) == 0);
 }
 
-static int clone_to_home(const char *src, const char *home)
+static int clone_to_home(const CloneContext *ctx, const char *src, const char *home)
 {
     // Resolve the destination before the dry-run branch so a path that would be
     // refused live is refused in dry-run too: the preview must match reality.
@@ -41,7 +41,7 @@ static int clone_to_home(const char *src, const char *home)
     if (verbose)
         printf("  Restoring: %s\n", src);
 
-    if (clone_recursive(src, full_dest) != 0)
+    if (restore_native(ctx, src, full_dest) != 0)
     {
         printf("Error: Failed to restore %s\n", src);
         return 1;
@@ -52,7 +52,7 @@ static int clone_to_home(const char *src, const char *home)
 // Restore a backup-relative path (e.g. ".config/google-chrome") back into home,
 // creating any intermediate parent directories as needed.
 // Returns 1 if restored, 0 if not in backup, -1 on error.
-static int restore_nested(const char *source, const char *home, const char *rel_path)
+static int restore_nested(const CloneContext *ctx, const char *source, const char *home, const char *rel_path)
 {
     char src[PATH_MAX], dest[PATH_MAX];
     if (path_join(src, sizeof(src), source, rel_path) != 0)
@@ -93,7 +93,7 @@ static int restore_nested(const char *source, const char *home, const char *rel_
     if (verbose)
         printf("  Restoring: %s\n", src);
 
-    if (clone_recursive(src, dest) != 0)
+    if (restore_native(ctx, src, dest) != 0)
     {
         printf("Error: Failed to restore %s\n", src);
         return -1;
@@ -160,6 +160,9 @@ int restore(const char *source)
     int count = 0;
     int had_error = 0;
 
+    // Restore always writes a native tree here; a portable source is a later phase.
+    CloneContext ctx = { .operation = CLONE_RESTORE, .representation = CLONE_NATIVE_TREE };
+
     printf("[Main Directories]\n");
     for (int i = 0; i < XDG_RESTORE_COUNT; i++)
     {
@@ -191,7 +194,7 @@ int restore(const char *source)
             {
                 if (verbose)
                     printf("  Restoring: %s\n", src_path);
-                if (clone_recursive(src_path, xdg_dirs[i]) != 0)
+                if (restore_native(&ctx, src_path, xdg_dirs[i]) != 0)
                 {
                     printf("Error: Failed to restore %s\n", src_path);
                     had_error = 1;
@@ -216,7 +219,7 @@ int restore(const char *source)
     }
     else if (file_exists(src_path))
     {
-        if (clone_to_home(src_path, home) == 0)
+        if (clone_to_home(&ctx, src_path, home) == 0)
             count++;
         else
             had_error = 1;
@@ -233,7 +236,7 @@ int restore(const char *source)
         }
         if (file_exists(src_path))
         {
-            if (clone_to_home(src_path, home) == 0)
+            if (clone_to_home(&ctx, src_path, home) == 0)
                 count++;
             else
                 had_error = 1;
@@ -254,7 +257,7 @@ int restore(const char *source)
     printf("\n[Browser Profiles]\n");
     for (int i = 0; browser_configs[i] != NULL; i++)
     {
-        int r = restore_nested(source, home, browser_configs[i]);
+        int r = restore_nested(&ctx, source, home, browser_configs[i]);
         if (r > 0)
             count++;
         else if (r < 0)

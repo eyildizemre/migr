@@ -17,9 +17,9 @@ incremental patching left the previous version self-contradictory.
 
 ## The central architectural fact
 
-`clone_recursive(src, dest)` is **symmetric and direction-agnostic**. Both backup and
-restore call it — backup.c in 2 places, restore.c in 3. It just copies a tree from src
-to dest, the same code in both directions.
+Before Phase A, `clone_recursive(src, dest)` was **symmetric and direction-agnostic**: both
+backup and restore called it — backup.c in 2 places, restore.c in 3 — just copying a tree from
+src to dest, the same code in both directions.
 
 The sidecar is **inherently asymmetric**, and there is no single "one recursion with a
 direction flag." There are **three orchestrations**, sharing low-level helpers (byte

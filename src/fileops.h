@@ -4,21 +4,44 @@
 #include <sys/types.h>
 
 /**
- * @brief Recursively clones a file or directory from src to dest.
+ * @brief How a clone is oriented and represented.
  *
- * Handles regular files, directories, symlinks, and FIFOs. Unix sockets and
- * device nodes are skipped with a warning — a socket is a runtime endpoint and
- * a device node needs root to recreate, so neither can be copied meaningfully.
- * Preserves permissions, access time, and modification time via
- * chmod and utimensat. Regular files are skipped if dest already exists with
- * a matching size and modification timestamp, enabling interrupted backups
- * to resume without re-copying.
+ * `operation` is the direction the tree flows — a backup captures the source, a restore
+ * writes it back. `representation` is whether metadata a destination cannot hold natively
+ * is instead carried in a sidecar; every clone is a CLONE_NATIVE_TREE for now,
+ * CLONE_PORTABLE_SIDECAR is reserved for later phases.
+ */
+typedef enum { CLONE_BACKUP, CLONE_RESTORE } CloneOperation;
+typedef enum { CLONE_NATIVE_TREE, CLONE_PORTABLE_SIDECAR } CloneRepresentation;
+
+typedef struct {
+    CloneOperation operation;
+    CloneRepresentation representation;
+} CloneContext;
+
+/**
+ * @brief Public entries to the recursive clone engine.
  *
+ * `backup_capture` captures a source tree into a backup; `restore_native` writes a tree
+ * back from a backup. Each enforces its half of the orchestration contract and then
+ * delegates to one shared native core: regular files, directories, symlinks and FIFOs are
+ * reproduced; Unix sockets and device nodes are skipped with a warning; permissions and
+ * access/modification times are preserved; an already-matching regular file is skipped so
+ * an interrupted run resumes. They are separate names so the two orchestrations can later
+ * diverge (e.g. a backup writing a sidecar) without reworking call sites.
+ *
+ * The context is validated, not merely carried: a NULL ctx, a mismatched operation, or an
+ * unimplemented representation is refused rather than run, so a dispatch mistake fails
+ * closed instead of writing a native tree to a destination that needed a sidecar. Only
+ * CLONE_NATIVE_TREE is implemented currently; CLONE_PORTABLE_SIDECAR is refused.
+ *
+ * @param ctx  Clone orientation and representation; must not be NULL.
  * @param src  Path to the source file, directory, or symlink.
  * @param dest Destination path to create.
- * @return 0 on success, -1 on error.
+ * @return 0 on success, -1 on error or a rejected context.
  */
-int clone_recursive(const char *src, const char *dest);
+int backup_capture(const CloneContext *ctx, const char *src, const char *dest);
+int restore_native(const CloneContext *ctx, const char *src, const char *dest);
 
 /**
  * @brief Accumulates the total byte size of a file tree into *size.

@@ -49,7 +49,7 @@ static int create_dir(const char *path)
     return 0;
 }
 
-static int clone_item(const char *src, const char *dest)
+static int clone_item(const CloneContext *ctx, const char *src, const char *dest)
 {
     // Compute the destination before the dry-run branch so a path that would be
     // refused live is refused in dry-run too: the preview must match reality.
@@ -77,7 +77,7 @@ static int clone_item(const char *src, const char *dest)
     if (verbose)
         printf("  Copying: %s\n", src);
 
-    if (clone_recursive(src, full_dest) != 0)
+    if (backup_capture(ctx, src, full_dest) != 0)
     {
         printf("Error: Failed to copy %s\n", src);
         return 1;
@@ -87,7 +87,7 @@ static int clone_item(const char *src, const char *dest)
 
 // Clone a home-relative path (e.g. ".config/google-chrome") into backup_dir,
 // preserving the directory structure. Returns 1 if copied, 0 if not found, -1 on error.
-static int clone_nested(const char *home, const char *backup_dir, const char *rel_path)
+static int clone_nested(const CloneContext *ctx, const char *home, const char *backup_dir, const char *rel_path)
 {
     char src[PATH_MAX], dest[PATH_MAX];
     if (path_join(src, sizeof(src), home, rel_path) != 0)
@@ -121,7 +121,7 @@ static int clone_nested(const char *home, const char *backup_dir, const char *re
     if (verbose)
         printf("  Copying: %s\n", src);
 
-    if (clone_recursive(src, dest) != 0)
+    if (backup_capture(ctx, src, dest) != 0)
     {
         printf("Error: Failed to copy %s\n", src);
         return -1;
@@ -209,6 +209,9 @@ int backup(const char *target, BackupMode mode, char **paths)
     int count = 0;
     int had_error = 0; // set when any file copy fails, so success is never faked
 
+    // A later phase sets representation from the destination capability probe; native for now.
+    CloneContext ctx = { .operation = CLONE_BACKUP, .representation = CLONE_NATIVE_TREE };
+
     if (mode == BACKUP_EXPLICIT_PATHS)
     {
         printf("[Explicit Paths]\n");
@@ -216,7 +219,7 @@ int backup(const char *target, BackupMode mode, char **paths)
         {
             if (stat(paths[i], &st) == 0)
             {
-                if (clone_item(paths[i], backup_dir) == 0)
+                if (clone_item(&ctx, paths[i], backup_dir) == 0)
                     count++;
                 else
                     had_error = 1;
@@ -288,7 +291,7 @@ int backup(const char *target, BackupMode mode, char **paths)
             // main_dirs[i] is a full absolute path from xdg_resolve (or projects_path)
             if (stat(main_dirs[i], &st) == 0)
             {
-                if (clone_item(main_dirs[i], backup_dir) == 0)
+                if (clone_item(&ctx, main_dirs[i], backup_dir) == 0)
                     count++;
                 else
                     had_error = 1;
@@ -306,7 +309,7 @@ int backup(const char *target, BackupMode mode, char **paths)
             }
             if (stat(src, &st) == 0)
             {
-                if (clone_item(src, backup_dir) == 0)
+                if (clone_item(&ctx, src, backup_dir) == 0)
                     count++;
                 else
                     had_error = 1;
@@ -327,7 +330,7 @@ int backup(const char *target, BackupMode mode, char **paths)
         printf("\n[Browser Profiles]\n");
         for (int i = 0; browser_configs[i] != NULL; i++)
         {
-            int r = clone_nested(home, backup_dir, browser_configs[i]);
+            int r = clone_nested(&ctx, home, backup_dir, browser_configs[i]);
             if (r > 0) count++;
             else if (r < 0) had_error = 1;
         }
