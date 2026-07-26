@@ -133,11 +133,8 @@ int main(int argc, char *argv[])
         }
     }
 
-    // Cross-cutting validation: reject anything the chosen command has no use for.
-    // This runs here because it is the first point where every input is known —
-    // options from the parse loop, positionals from the block above. Command-specific
-    // checks ("is my required argument present?") stay in the dispatch switch, since
-    // their usage messages belong to the command.
+    // Cross-cutting checks: reject inputs the chosen command has no use for.
+    // Required-argument checks stay with their command in the dispatch below.
     if (mode_flag_given && action != ACTION_BACKUP)
     {
         printf("Error: --critical/--comprehensive apply only to 'backup'.\n");

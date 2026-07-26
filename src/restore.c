@@ -103,7 +103,6 @@ int restore(const char *source)
         return 1;
     }
 
-    // check source directory exists
     struct stat st;
     if (stat(source, &st) != 0 || !S_ISDIR(st.st_mode))
     {
@@ -150,9 +149,8 @@ int restore(const char *source)
     printf("[Main Directories]\n");
     for (int i = 0; i < XDG_RESTORE_COUNT; i++)
     {
-        // Use the manifest-recorded name (source locale) to locate the backup directory,
-        // then restore to xdg_dirs[i] (destination locale). Falls back to the destination
-        // basename when no manifest is present (same-locale or pre-manifest backup).
+        // The manifest name locates the source-locale directory; xdg_dirs[i] is the
+        // destination-locale path. Fall back to its basename if the manifest/key is absent.
         const char *name;
         if (has_manifest && manifest_names[i] != NULL)
             name = manifest_names[i];
@@ -249,7 +247,6 @@ int restore(const char *source)
             }
             else
             {
-                // Collect filtered package names into a dynamic array
                 int pkg_cap = 256;
                 int pkg_count = 0;
                 char **pkgs = malloc(pkg_cap * sizeof(char *));
@@ -264,11 +261,9 @@ int restore(const char *source)
                         if (sscanf(line, "%255s", pkg_name) != 1)
                             continue;
 
-                        // Backups written before the switch to explicitly-installed
-                        // package lists used `dpkg --get-selections`, whose format is
-                        // "pkg\tstatus" and which includes deinstalled entries. Current
-                        // backups are plain names with no tab, so this only fires for
-                        // older files — kept so they still restore correctly.
+                        // Preserve compatibility with old dpkg "pkg\tstatus" backups by
+                        // skipping deinstall entries. Current backups contain plain names;
+                        // see docs/DECISIONS.md D12.
                         char *tab = strchr(line, '\t');
                         if (tab != NULL && strncmp(tab + 1, "install", 7) != 0)
                             continue;
@@ -287,7 +282,6 @@ int restore(const char *source)
                 }
                 fclose(pkg_file);
 
-                // Build batch command prefix per distro
                 char *batch_prefix[6];
                 int prefix = 0;
                 switch (distro)
@@ -322,7 +316,8 @@ int restore(const char *source)
 
                 if (pkgs != NULL && pkg_count > 0 && prefix > 0)
                 {
-                    // Phase 1: single batch install
+                    // Try one batch first; fall back per package below.
+                    // See docs/DECISIONS.md D2.
                     char **batch_argv = malloc((prefix + pkg_count + 1) * sizeof(char *));
                     if (batch_argv != NULL)
                     {

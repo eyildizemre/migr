@@ -56,11 +56,7 @@ distro_t detect_distro(void)
 char *const *get_package_cmd(distro_t distro)
 {
     // Each command lists only explicitly-installed packages, one plain name per line.
-    // Listing every installed package instead would export thousands of transitive
-    // dependencies (2457 vs 432 on a stock Fedora 44 workstation) whose names differ
-    // sharply between distributions — and which the target package manager resolves on
-    // its own anyway. The manual set is smaller and made of top-level names that agree
-    // far better across distros, which is what makes package restore worth attempting.
+    // See docs/DECISIONS.md D12.
     static char *const debian_cmd[] = {"apt-mark", "showmanual", NULL};
 
     // dnf's queryformat requires the two-character escape "\\n". A real newline byte is
