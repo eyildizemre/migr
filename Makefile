@@ -3,7 +3,7 @@ CFLAGS = -Wall -Wextra -g -I src
 
 TARGET = migr
 VPATH = src
-SRCS = main.c detect.c report.c backup.c packages.c restore.c utils.c fileops.c xdg.c manifest.c
+SRCS = main.c detect.c report.c backup.c packages.c restore.c utils.c fileops.c fsprobe.c xdg.c manifest.c
 OBJS = $(SRCS:.c=.o)
 
 $(TARGET): $(OBJS)
@@ -37,6 +37,6 @@ test: $(TARGET) $(TEST_DETECT) $(TEST_PATHJOIN) $(TEST_SPECIAL_FILES) $(TEST_FSP
 	cd tests && bash test.sh
 
 clean:
-	rm -f $(OBJS) fsprobe.o $(TARGET) $(TEST_DETECT) $(TEST_PATHJOIN) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE)
+	rm -f $(OBJS) $(TARGET) $(TEST_DETECT) $(TEST_PATHJOIN) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE)
 
 .PHONY: clean test

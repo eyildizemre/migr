@@ -3,11 +3,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <time.h>
 #include <limits.h>
+#include <errno.h>
 
 #include "backup.h"
 #include "fileops.h"
+#include "fsprobe.h"
 #include "manifest.h"
 #include "packages.h"
 #include "utils.h"
@@ -33,7 +36,21 @@ static int create_dir(const char *path)
 {
     struct stat st;
     if (stat(path, &st) == 0)
+    {
+        if (!S_ISDIR(st.st_mode))
+        {
+            printf("Error: %s exists but is not a directory\n", path);
+            return 1;
+        }
         return 0;
+    }
+    if (errno != ENOENT)
+    {
+        // A real access failure (e.g. EACCES) must not masquerade as "absent";
+        // otherwise dry-run would promise to create something it cannot reach.
+        printf("Error: Could not access %s\n", path);
+        return 1;
+    }
 
     if (dry_run)
     {
@@ -47,6 +64,61 @@ static int create_dir(const char *path)
         return 1;
     }
     return 0;
+}
+
+// Validate and, if needed, create the top-level backup destination.
+// Sets *created only when THIS call made the directory, so a later refusal can
+// roll back exactly what we created — never a pre-existing directory, and never
+// one a racing process slipped in between our check and mkdir.
+static int ensure_target_root(const char *path, int *created)
+{
+    *created = 0;
+
+    struct stat st;
+    if (stat(path, &st) == 0)
+    {
+        if (!S_ISDIR(st.st_mode))
+        {
+            printf("Error: %s exists but is not a directory\n", path);
+            return 1;
+        }
+        return 0;
+    }
+    if (errno != ENOENT)
+    {
+        printf("Error: Could not access %s\n", path);
+        return 1;
+    }
+
+    if (dry_run)
+    {
+        printf("[dry-run] Would create directory: %s\n", path);
+        return 0;
+    }
+
+    if (mkdir(path, 0755) == 0)
+    {
+        *created = 1;
+        return 0;
+    }
+    if (errno == EEXIST)
+    {
+        // Lost a race: someone created the path between our stat and mkdir.
+        // Accept it only if it is a directory, and never claim we made it.
+        if (stat(path, &st) != 0)
+        {
+            printf("Error: Could not access %s\n", path);
+            return 1;
+        }
+        if (!S_ISDIR(st.st_mode))
+        {
+            printf("Error: %s exists but is not a directory\n", path);
+            return 1;
+        }
+        return 0;
+    }
+    printf("Error: Could not create directory %s\n", path);
+    return 1;
 }
 
 static int clone_item(const CloneContext *ctx, const char *src, const char *dest)
@@ -183,9 +255,8 @@ int backup(const char *target, BackupMode mode, char **paths)
         }
     }
 
-    if (create_dir(target) != 0)
-        return 1;
-
+    // Build the dated backup path first: it is pure string work, so a path that
+    // is too long fails before we create anything and needs no rollback.
     char backup_dir[PATH_MAX];
     time_t now = time(NULL);
     struct tm *t = localtime(&now);
@@ -197,8 +268,46 @@ int backup(const char *target, BackupMode mode, char **paths)
         return 1;
     }
 
-    if (create_dir(backup_dir) != 0)
+    int target_created = 0;
+    if (ensure_target_root(target, &target_created) != 0)
         return 1;
+
+    // Probe the destination and choose a representation before creating anything more.
+    // --dry-run skips it: the probe writes to the destination, which would break the
+    // "no changes" contract, so dry-run keeps the native preview. Native proceeds as
+    // before; portable is refused (not built yet); an unreliable probe is fatal, never a
+    // silent fall-through. If we created the destination root this run and then refuse,
+    // roll it back so a rejected attempt leaves nothing behind.
+    CloneRepresentation repr = CLONE_NATIVE_TREE;
+    if (!dry_run)
+    {
+        FsCapabilityProfile profile;
+        if (fsprobe(target, &profile) != 0)
+        {
+            printf("Error: could not probe the destination filesystem at %s\n", target);
+            if (target_created) rmdir(target);
+            return 1;
+        }
+        if (select_representation(&profile, &repr) != 0)
+        {
+            printf("Error: the destination filesystem at %s is not usable for backup\n", target);
+            if (target_created) rmdir(target);
+            return 1;
+        }
+        if (repr != CLONE_NATIVE_TREE)
+        {
+            printf("Error: %s cannot natively hold Linux file metadata, and portable mode is "
+                   "not implemented yet — refusing rather than losing it.\n", target);
+            if (target_created) rmdir(target);
+            return 1;
+        }
+    }
+
+    if (create_dir(backup_dir) != 0)
+    {
+        if (target_created) rmdir(target);
+        return 1;
+    }
 
     if (dry_run)
         printf("Dry run mode enabled. No changes will be made.\n\n");
@@ -209,8 +318,8 @@ int backup(const char *target, BackupMode mode, char **paths)
     int count = 0;
     int had_error = 0; // set when any file copy fails, so success is never faked
 
-    // A later phase sets representation from the destination capability probe; native for now.
-    CloneContext ctx = { .operation = CLONE_BACKUP, .representation = CLONE_NATIVE_TREE };
+    // Representation chosen by the probe above (native here; portable already refused).
+    CloneContext ctx = { .operation = CLONE_BACKUP, .representation = repr };
 
     if (mode == BACKUP_EXPLICIT_PATHS)
     {

@@ -570,6 +570,75 @@ test_truncation() {
 }
 
 
+test_probe_refusal() {
+    echo -e "${BLUE}::${NC} Phase 11: destination probe (backup preflight)"
+
+    # A regular file is not a valid destination: reject it up front, in both live
+    # and dry-run, before writing anything. This needs no special privilege.
+    local file_dest="$TEST_DIR/not_a_dir"
+    : > "$file_dest"
+    assert_fails_with "is not a directory" ../migr backup "$file_dest"
+    assert_fails_with "is not a directory" ../migr backup "$file_dest" --dry-run
+    rm -f "$file_dest"
+
+    # The remaining cases lean on directory mode bits, which root ignores.
+    if [ "$(id -u)" = "0" ]; then
+        echo -e "  ${GREEN}✓${NC} (mode-bit cases skipped as root: they do not restrict root)"
+        return
+    fi
+
+    # A read-only destination that already exists: fsprobe cannot create its temp
+    # subdirectory, so a live backup must refuse — and must not delete the dir it
+    # did not create.
+    local ro_dest="$TEST_DIR/readonly_dest"
+    mkdir -p "$ro_dest"
+    chmod 555 "$ro_dest"
+    assert_fails_with "could not probe" ../migr backup "$ro_dest"
+    if [ ! -d "$ro_dest" ]; then
+        echo -e "  ${RED}✗${NC} pre-existing read-only dest was removed on refusal"
+        exit 1
+    fi
+
+    # Same read-only destination under --dry-run: no probe, no writes, clean exit.
+    local dr_out dr_rc
+    set +e
+    dr_out=$(../migr backup "$ro_dest" --dry-run 2>&1)
+    dr_rc=$?
+    set -e
+    if [ "$dr_rc" -ne 0 ]; then
+        echo -e "  ${RED}✗${NC} dry-run on read-only dest should succeed; exit=$dr_rc"
+        echo "  output: $dr_out"
+        exit 1
+    fi
+    if compgen -G "$ro_dest/migr_backup_*" > /dev/null; then
+        echo -e "  ${RED}✗${NC} dry-run wrote a backup dir into a read-only dest"
+        exit 1
+    fi
+    echo -e "  ${GREEN}✓${NC} dry-run on read-only dest refused nothing and wrote nothing"
+    chmod 755 "$ro_dest" # restore the write bit so teardown can remove it
+
+    # A destination migr creates itself, then hits a probe refusal: the empty root
+    # it made this run must be rolled back. umask 0222 makes mkdir() yield a 0555
+    # root that fsprobe cannot write into; the umask stays inside the subshell.
+    local new_dest="$TEST_DIR/new_probe_failure"
+    local nd_out nd_rc
+    set +e
+    nd_out=$(umask 0222; ../migr backup "$new_dest" 2>&1)
+    nd_rc=$?
+    set -e
+    if [ "$nd_rc" -eq 0 ] || [[ "$nd_out" != *"could not probe"* ]]; then
+        echo -e "  ${RED}✗${NC} expected probe refusal on self-created 0555 root; exit=$nd_rc"
+        echo "  output: $nd_out"
+        exit 1
+    fi
+    if [ -e "$new_dest" ]; then
+        echo -e "  ${RED}✗${NC} migr-created root not rolled back after probe refusal"
+        exit 1
+    fi
+    echo -e "  ${GREEN}✓${NC} migr-created root rolled back after probe refusal"
+}
+
+
 # --- 4. RUN TESTS ---
 echo -e "${BLUE}migr integration tests${NC}"
 setup
@@ -583,4 +652,5 @@ test_comprehensive
 test_explicit_paths
 test_errors
 test_truncation
+test_probe_refusal
 echo -e "${GREEN}all tests passed${NC}"
