@@ -15,6 +15,7 @@ $(TARGET): $(OBJS)
 TEST_DETECT = tests/test_detect
 TEST_PATHJOIN = tests/test_pathjoin
 TEST_SPECIAL_FILES = tests/test_special_files
+TEST_FSPROBE = tests/test_fsprobe
 
 $(TEST_DETECT): tests/test_detect.c detect.o
 	$(CC) $(CFLAGS) -o $@ tests/test_detect.c detect.o
@@ -25,13 +26,17 @@ $(TEST_PATHJOIN): tests/test_pathjoin.c utils.o
 $(TEST_SPECIAL_FILES): tests/test_special_files.c fileops.o utils.o
 	$(CC) $(CFLAGS) -o $@ tests/test_special_files.c fileops.o utils.o
 
-test: $(TARGET) $(TEST_DETECT) $(TEST_PATHJOIN) $(TEST_SPECIAL_FILES)
+$(TEST_FSPROBE): tests/test_fsprobe.c fsprobe.o utils.o
+	$(CC) $(CFLAGS) -o $@ tests/test_fsprobe.c fsprobe.o utils.o
+
+test: $(TARGET) $(TEST_DETECT) $(TEST_PATHJOIN) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE)
 	./$(TEST_DETECT)
 	./$(TEST_PATHJOIN)
 	./$(TEST_SPECIAL_FILES)
+	./$(TEST_FSPROBE)
 	cd tests && bash test.sh
 
 clean:
-	rm -f $(OBJS) $(TARGET) $(TEST_DETECT) $(TEST_PATHJOIN) $(TEST_SPECIAL_FILES)
+	rm -f $(OBJS) fsprobe.o $(TARGET) $(TEST_DETECT) $(TEST_PATHJOIN) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE)
 
 .PHONY: clean test

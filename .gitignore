@@ -3,4 +3,5 @@ migr
 tests/test_detect
 tests/test_pathjoin
 tests/test_special_files
+tests/test_fsprobe
 docs/TODO.md
