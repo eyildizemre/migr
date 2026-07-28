@@ -281,22 +281,43 @@ truncated/oversized record, payload-symlink redirect — are **mandatory**, not 
 
 ## Roots and addressing
 
-Records are keyed by `(logical root, relative path)`, never by a persisted absolute
-source path.
+Entry records are keyed by `(logical root, relative path)`, never by repeating an
+absolute source path in every entry. The manifest's root table owns the mapping from
+each logical root to its source and restore policy.
 
 - **XDG roots** reuse the existing manifest keys (`XDG_DOCUMENTS_DIR`, …), which already
   carry canonical cross-locale identity — no `xdg:documents`-style scheme is needed.
 - **Explicit-paths roots** get ordinal ids (`EXPLICIT_0`, `EXPLICIT_1`, …), which fixes
-  the backup-side basename collision (prerequisite bug #3).
+  the backup-side basename collision (prerequisite bug #3). The ordinal is identity,
+  not by itself a restore address.
 
-But ordinal ids only solve the **backup** side. **Where does `EXPLICIT_0` restore to?**
-This is an unresolved product decision (see "Open decisions"): the original absolute
-path? a basename under `$HOME`? prompt the user? exclude explicit backups from automatic
-restore? Note the related pre-existing gap: today's `restore()` looks for XDG dirs,
-dotfiles, browser configs, and packages — it has **no path for arbitrarily-named
-explicit items**, so explicit-paths backups are effectively not restorable now. Each
-ordinal root therefore needs a minimal recorded source/destination policy, not the full
-logical-root framework.
+### Phase A2 root policy
+
+- Every user-derived filesystem object lives below the container's `data/` namespace.
+  Only migr-owned control artifacts live at the container root (D15).
+- Explicit roots keep accepting valid paths inside and outside `$HOME`; an external path
+  is not a new rejection condition (D16).
+- A root proven to be inside the source `$HOME` gets a `HOME_RELATIVE` policy: its
+  normalized home-relative address is recreated below the target `$HOME`.
+- Every other valid root gets `MANUAL_NATIVE`: it remains directly accessible in its
+  `data/EXPLICIT_n` tree and restore reports it, but does not invent a destination.
+- Classification is component-based and symlink-aware, not a string-prefix test. A
+  selected leaf symlink remains the object being backed up; ancestor traversal must not
+  make an external object appear home-relative.
+- All explicit roots are validated before container creation. An invalid, duplicate or
+  overlapping root rejects the whole invocation rather than silently dropping one of
+  the paths the user requested.
+- Portable capture refuses a root with `MANUAL_NATIVE` before writing payload. Encoded
+  names, symlink placeholders and sidecar metadata are not a usable manual backup
+  without a migr restore policy. A future staging, mapped, or guarded original-location
+  policy may replace this gate.
+
+The future `conf include` mechanism will feed the same root-addressing model, but it is
+not yet decided that every include becomes `HOME_RELATIVE`. A configured child may
+overlap an XDG root whose target is locale-dependent. Built-in and configured selections
+must eventually be resolved into one normalized, non-overlapping root set before the
+manifest is written; include/exclude precedence and XDG-child addressing belong to the
+`conf` design, not Phase A2.
 
 ---
 
@@ -307,8 +328,10 @@ needs it to carry at least:
 
 - a manifest format version;
 - native/portable mode and container layout;
-- source scope/identity fields used to match a partial job for resume;
-- logical-root mappings, including the eventual `EXPLICIT_n` policy;
+- source identity (`machine-id` + numeric uid when available) and the normalized root
+  set used to match a partial job for resume;
+- logical-root mappings, including D16's `HOME_RELATIVE` / `MANUAL_NATIVE` explicit-root
+  policies;
 - the sidecar format version when a sidecar is present.
 
 This is required even for native backups, which deliberately have no sidecar and
@@ -335,15 +358,16 @@ migr_backup_YYYYMMDD_HHMMSS[-N].partial/   ->   migr_backup_YYYYMMDD_HHMMSS[-N]/
 
 The date-only name was insufficient: it could not represent a second backup on the same
 day, a rename onto an existing final directory, or a clean resume identity. `HHMMSS[-N]`
-is enough — no UUID. The manifest additionally records at least the source scope/identity
-needed to match a resume to its job.
+is enough — no UUID. Allocation considers both partial and final names, claims the
+partial name atomically, and finalization never replaces an existing final container.
+Resume matching uses the format/representation, a stable source identity and the
+normalized root set — never the timestamp or scope label alone.
 
 **Mandatory invariant — control names never collide with payload:** a payload item must
 never be able to overwrite `manifest.txt`, `packages.txt`, or `sidecar.migr`. This is
 non-negotiable in backup software; "rare" is not an acceptable defence for silent data
-loss. The mechanism may be a `data/` payload namespace (cleanest) or reserved-name
-pre-scan rejection (lighter) — but *some* mechanism is required. This reverses an earlier
-draft that called it optional.
+loss. Phase A2 uses a `data/` payload namespace; reserved-name pre-scan rejection was
+considered but not chosen.
 
 ---
 
@@ -384,9 +408,11 @@ in G), so no single phase carries "make everything faithful at once."
   probe/preflight tests were added (`e6d367b`, `ac301da`, `ea1a3d9`).
 - **Phase A2 — Versioned container.** `.partial` + atomic rename + control/payload
   non-collision; versioned manifest + legacy detection. The first observable format
-  change, kept separate from the refactor so it is reviewed on its own: tested that
-  legacy backups still restore through the isolated legacy path and new backups adopt the
-  new layout.
+  change, kept separate from the refactor so it is reviewed on its own. It also introduces
+  D16's explicit-root table: home-relative roots restore automatically; external native
+  roots are reported but left in place; invalid root sets fail before container creation.
+  Test that legacy backups still restore through the isolated legacy path and new backups
+  adopt the new layout.
 - **Phase B — Format + core metadata.** Finalize the byte grammar; sidecar writer/reader
   with magic+version, committed entry groups, truncated-tail and precedence; finalize the
   deletion representation needed by H; mode/uid/gid/mtime plus the atime decision; file
@@ -425,8 +451,16 @@ should not be added until such a user-facing need exists.
 - **Unit (any filesystem, dev machine):** probe, percent-encode/decode roundtrip, sidecar
   record write/parse roundtrip (including file size, length-prefixed binary xattr values
   containing NUL, incomplete entry groups, truncated tail, precedence, xattr removal on
-  replacement, unknown version), versioned/unversioned/unknown manifest handling, and
-  `user.*` xattr roundtrip. Separate test binaries in the `tests/test_detect.c` mould.
+  replacement, unknown version), versioned/unversioned/unknown manifest handling,
+  explicit-root policy roundtrip, and `user.*` xattr roundtrip. Separate test binaries in
+  the `tests/test_detect.c` mould.
+- **Phase A2 container/root integration:** same-second invocations choose distinct names;
+  a failed backup never publishes a final container; an existing final is never replaced;
+  a home-contained explicit root restores to the same target-home-relative address; an
+  external root remains in `data/EXPLICIT_n` and is reported without being restored;
+  missing, duplicate, or overlapping explicit roots refuse the whole invocation before
+  container creation; leaf and ancestor symlink cases exercise component-aware
+  classification.
 - **Portable orchestration integration (once that path exists):** run full
   backup→restore fixtures on real lossy filesystems. If a narrowly scoped test-only seam
   is needed for faster native-filesystem runs, it may supply a synthetic profile to the
@@ -460,10 +494,14 @@ should not be added until such a user-facing need exists.
   with a warning (no `had_error`). What a *lossy* destination does (a FIFO placeholder+record
   vs skip; sockets/devices always skipped) is still open and belongs to Phase C/D, not the
   current engine.
-- **Before Phase A2:** the control/payload non-collision mechanism (`data/` vs reserved-name
-  rejection); the container naming (`HHMMSS[-N]`) and its resume-identity fields.
-- **Before Phase A2:** explicit-root restore semantics — where `EXPLICIT_n` restores to,
-  or whether explicit backups are marked manual-restore.
+- **Before Phase A2 — settled by D15/D16:** payload lives under `data/`; a unique
+  `HHMMSS[-N].partial` is atomically finalized without replacing an existing container;
+  resume identity includes stable source identity and the normalized root set. Explicit
+  paths remain arbitrary: home-contained roots are `HOME_RELATIVE`, other native roots
+  are reported as `MANUAL_NATIVE`, and portable capture refuses a manual-only root.
+- **When `conf` is designed:** define include/exclude precedence and resolve overlaps
+  between configured paths and locale-mapped XDG roots before emitting the manifest root
+  set.
 - **Before Phase B:** the exact record byte grammar and the resume record semantics
   (`DELETE` + last-wins vs atomic rewrite; append-only per D6 favours the former).
 - **Before Phase B:** whether atime is part of the fidelity contract; if not, record the

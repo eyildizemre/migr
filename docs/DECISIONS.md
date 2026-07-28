@@ -400,3 +400,94 @@ testing shortcut.
 
 **Relationship:** Refines D6 by defining how migr chooses its native or portable
 representation.
+
+---
+
+## D15 — 2026-07-28 — Versioned backup containers isolate payload and finalize atomically
+
+**Status:** Decided — not yet implemented
+
+**Decision:** A versioned backup container reserves its root for migr-owned control
+artifacts (`manifest.txt`, `packages.txt`, `sidecar.migr`, and the shipped binary when
+requested). Every user-derived filesystem object lives below `data/`.
+
+A live backup writes to:
+
+```
+migr_backup_YYYYMMDD_HHMMSS[-N].partial/
+```
+
+Candidate allocation considers both partial and final names and atomically claims a
+unique partial directory. Success atomically renames it to the same name without
+`.partial`; finalization must never replace an existing final container. A failed or
+interrupted backup therefore cannot look complete.
+
+The versioned manifest records the representation, normalized logical-root set, and a
+stable source identity for resume matching. The source identity is the machine id plus
+numeric uid when both are available; an invocation that cannot establish identity does
+not adopt an existing partial. A timestamp or scope label alone never proves that two
+invocations are the same job.
+
+**Why:** A payload named `manifest.txt` must not overwrite format state, and a second
+backup in the same second must not merge with either an in-progress or completed
+container. The `data/` boundary makes ownership visible instead of maintaining an
+ever-growing reserved-name list. Partial-to-final publication gives completion a single
+observable boundary while preserving interrupted work for resume.
+
+**Rejected:** flat control and payload names; reserved-name pre-scan; date-only
+containers; check-then-rename finalization that can replace a concurrent result; UUIDs
+in user-facing container names.
+
+**Relationship:** Supports D6's resume contract and follows D14's requirement that
+representation be selected before the container is created.
+
+---
+
+## D16 — 2026-07-28 — Explicit roots keep arbitrary capture, with bounded restore policies
+
+**Status:** Decided — not yet implemented
+
+**Decision:** `migr backup <DEST> <PATH...>` continues to accept valid filesystem paths
+both inside and outside the source `$HOME`; being outside `$HOME` is not itself an
+error. Each root receives an ordinal identity (`EXPLICIT_0`, `EXPLICIT_1`, …), a
+separate payload location below `data/`, and one manifest restore policy:
+
+- **`HOME_RELATIVE`:** when component-aware resolution proves that the selected object
+  is below the source `$HOME`, the manifest records its normalized home-relative path
+  and restore recreates it at the same relative address below the target `$HOME`.
+- **`MANUAL_NATIVE`:** every other valid root is captured on a native destination and
+  remains directly accessible in its `data/EXPLICIT_n` tree, but automatic restore does
+  not choose a destination for it. Restore must list every such root and its recorded
+  source path rather than silently ignoring it.
+
+Classification is not a string-prefix check. A selected symlink is the object being
+backed up and is not followed merely to classify it; ancestor traversal must not make an
+external object appear home-relative. All roots are validated before container creation.
+A missing, invalid, duplicate, or overlapping root rejects the whole invocation rather
+than silently producing less than the user requested. Existing unversioned explicit
+backups have no trustworthy root mapping and remain legacy/manual; restore does not
+guess.
+
+`MANUAL_NATIVE` is also a representation gate: portable capture must refuse an
+invocation containing such a root before writing payload until a faithful external-root
+restore policy exists. This is currently automatic because all portable capture is
+unimplemented and refused; later portable work must preserve the narrower gate rather
+than creating an encoded tree that migr cannot replay.
+
+**Why:** Explicit mode exists precisely to make no scope assumptions, so an arbitrary
+source path should not be rejected merely because automatic placement is undefined.
+Home-relative roots have one safe, locale-independent destination. External roots do
+not: restoring to the original absolute path may require privilege, overwrite unrelated
+state, or target a path that has different meaning on the new distribution. Native
+backups retain D8's `cp -a` exit right; portable backups do not, hence the representation
+gate.
+
+**Rejected:** rejecting every `$HOME`-external source; restoring external roots to their
+original absolute paths without an explicit safety contract; silently skipping invalid
+inputs; treating a restore-addressless portable tree as a usable backup.
+
+**Revisit if:** a concrete external-root workflow justifies a staging root, an explicit
+source-to-destination mapping, or a guarded original-location restore contract.
+
+**Relationship:** Refines D11's explicit-path syntax with root addressing and applies
+D8's native exit-right boundary.
