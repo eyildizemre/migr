@@ -5,4 +5,5 @@ tests/test_pathjoin
 tests/test_special_files
 tests/test_fsprobe
 tests/test_manifest
+tests/test_container
 docs/TODO.md

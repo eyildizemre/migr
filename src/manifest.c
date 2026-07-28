@@ -1,11 +1,14 @@
 #define _GNU_SOURCE
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <limits.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "manifest.h"
 #include "utils.h" // path_join
@@ -483,7 +486,8 @@ static int parse_root_line(char *line, ManifestRoot *root)
 // our own magic that happens to leave a "VERSION=..."-looking line first --
 // is ambiguous and must not be silently treated as "probably the old
 // format". legacy_manifest_read() remains the actual legacy parser; this
-// only decides whether to route there at all.
+// only decides whether to route there at all. Returns -1 on a stream error,
+// 0 when no key is found, and 1 when a recognized key is found.
 static int contains_legacy_key(const char *line1, FILE *f)
 {
     char scratch[PATH_MAX + 32]; // legacy lines are always short: "XDG_KEY=basename"
@@ -501,26 +505,17 @@ static int contains_legacy_key(const char *line1, FILE *f)
                     return 1;
         }
         if (fgets(scratch, sizeof(scratch), f) == NULL)
-            return 0; // EOF, or a read fault -- either way, no key was found
+            return ferror(f) ? -1 : 0;
         cur = scratch;
     }
 }
 
-ManifestStatus manifest_read_v1(const char *backup_dir, Manifest *out)
+// Parses manifest.txt content from an already-open, readable stream -- shared
+// by manifest_read_v1() (opens by path) and manifest_read_v1_at() (opens by
+// directory fd), so the two can never classify the same magic/version/content
+// differently. Always takes ownership of f: every return path fclose()s it.
+static ManifestStatus manifest_parse_v1_body(FILE *f, Manifest *out)
 {
-    if (out != NULL)
-        memset(out, 0, sizeof(*out));
-    if (backup_dir == NULL || out == NULL)
-        return MANIFEST_STATUS_IO_ERROR;
-
-    char path[PATH_MAX];
-    if (path_join(path, sizeof(path), backup_dir, "manifest.txt") != 0)
-        return MANIFEST_STATUS_IO_ERROR;
-
-    FILE *f = fopen(path, "r");
-    if (f == NULL)
-        return (errno == ENOENT) ? MANIFEST_STATUS_MISSING : MANIFEST_STATUS_IO_ERROR;
-
     char line[MANIFEST_MAX_LINE];
     int rc = read_line(f, line, sizeof(line));
     if (rc == -2)
@@ -534,9 +529,11 @@ ManifestStatus manifest_read_v1(const char *backup_dir, Manifest *out)
         // line; rc==1 but different content). Only genuinely legacy-shaped
         // content -- at least one recognized XDG key anywhere in the file --
         // is routed to the legacy path; see contains_legacy_key().
-        int is_legacy = (rc == 1) && contains_legacy_key(line, f);
+        int legacy_status = (rc == 1) ? contains_legacy_key(line, f) : 0;
         fclose(f);
-        return is_legacy ? MANIFEST_STATUS_LEGACY : MANIFEST_STATUS_MALFORMED;
+        if (legacy_status < 0)
+            return MANIFEST_STATUS_IO_ERROR;
+        return legacy_status > 0 ? MANIFEST_STATUS_LEGACY : MANIFEST_STATUS_MALFORMED;
     }
 
     ManifestStatus fail_status = MANIFEST_STATUS_MALFORMED;
@@ -624,6 +621,164 @@ fail:
     free(m.roots);
     memset(out, 0, sizeof(*out));
     return fail_status;
+}
+
+ManifestStatus manifest_read_v1(const char *backup_dir, Manifest *out)
+{
+    if (out != NULL)
+        memset(out, 0, sizeof(*out));
+    if (backup_dir == NULL || out == NULL)
+        return MANIFEST_STATUS_IO_ERROR;
+
+    char path[PATH_MAX];
+    if (path_join(path, sizeof(path), backup_dir, "manifest.txt") != 0)
+        return MANIFEST_STATUS_IO_ERROR;
+
+    FILE *f = fopen(path, "r");
+    if (f == NULL)
+        return (errno == ENOENT) ? MANIFEST_STATUS_MISSING : MANIFEST_STATUS_IO_ERROR;
+
+    return manifest_parse_v1_body(f, out);
+}
+
+ManifestStatus manifest_read_v1_at(int container_fd, Manifest *out)
+{
+    if (out != NULL)
+        memset(out, 0, sizeof(*out));
+    if (out == NULL)
+        return MANIFEST_STATUS_IO_ERROR;
+
+    int fd = openat(container_fd, "manifest.txt", O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+    if (fd < 0)
+    {
+        if (errno == ENOENT)
+            return MANIFEST_STATUS_MISSING;
+        // Two open()-time failures mean "this is a non-regular object", not
+        // an operational error: O_NOFOLLOW makes a symlink fail with ELOOP
+        // rather than being followed, and open() can never succeed on a Unix
+        // domain socket at all -- it always fails ENXIO, regardless of flags,
+        // so a socket never even reaches the fstat()+S_ISREG check below.
+        if (errno == ELOOP || errno == ENXIO)
+            return MANIFEST_STATUS_MALFORMED;
+        return MANIFEST_STATUS_IO_ERROR;
+    }
+
+    // A FIFO/device opened O_NONBLOCK never blocks here even with no writer
+    // on the other end. fstat() failing outright is a genuine operational
+    // fault (IO_ERROR); fstat() succeeding but reporting a non-regular mode
+    // (FIFO, device, directory) means "not adoptable" (MALFORMED) -- the two
+    // must not be collapsed into one, or a real I/O fault would be silently
+    // treated as just another non-regular candidate.
+    struct stat st;
+    if (fstat(fd, &st) != 0)
+    {
+        close(fd);
+        return MANIFEST_STATUS_IO_ERROR;
+    }
+    if (!S_ISREG(st.st_mode))
+    {
+        close(fd);
+        return MANIFEST_STATUS_MALFORMED;
+    }
+
+    FILE *f = fdopen(fd, "r");
+    if (f == NULL)
+    {
+        close(fd);
+        return MANIFEST_STATUS_IO_ERROR;
+    }
+
+    return manifest_parse_v1_body(f, out);
+}
+
+// Two roots are the same identity if every field the manifest actually
+// records about them matches -- not just id, which by itself only proves
+// they occupy the same slot, not that the slot means the same thing.
+static int root_identity_equal(const ManifestRoot *a, const ManifestRoot *b)
+{
+    if (strcmp(a->id, b->id) != 0)
+        return 0;
+    if (a->policy != b->policy)
+        return 0;
+    if (strcmp(a->payload_path, b->payload_path) != 0)
+        return 0;
+    if (strcmp(a->source_path, b->source_path) != 0)
+        return 0;
+    if (a->has_restore_path != b->has_restore_path)
+        return 0;
+    if (a->has_restore_path && strcmp(a->restore_path, b->restore_path) != 0)
+        return 0;
+    return 1;
+}
+
+static int root_ptr_id_cmp(const void *pa, const void *pb)
+{
+    const ManifestRoot *a = *(const ManifestRoot * const *)pa;
+    const ManifestRoot *b = *(const ManifestRoot * const *)pb;
+    return strcmp(a->id, b->id);
+}
+
+ManifestIdentityComparison manifest_resume_identity_compare(const Manifest *a, const Manifest *b)
+{
+    if (a == NULL || b == NULL)
+        return MANIFEST_IDENTITY_DIFFERENT;
+    if (a->version != b->version)
+        return MANIFEST_IDENTITY_DIFFERENT;
+    if (a->representation != b->representation)
+        return MANIFEST_IDENTITY_DIFFERENT;
+    if (a->scope != b->scope)
+        return MANIFEST_IDENTITY_DIFFERENT;
+    if (a->sidecar_version != b->sidecar_version)
+        return MANIFEST_IDENTITY_DIFFERENT;
+    if (!a->has_source_identity || !b->has_source_identity)
+        return MANIFEST_IDENTITY_DIFFERENT;
+    if (strcmp(a->machine_id, b->machine_id) != 0)
+        return MANIFEST_IDENTITY_DIFFERENT;
+    if (a->source_uid != b->source_uid)
+        return MANIFEST_IDENTITY_DIFFERENT;
+    if (a->root_count != b->root_count)
+        return MANIFEST_IDENTITY_DIFFERENT;
+    if (a->root_count == 0)
+        return MANIFEST_IDENTITY_EQUAL;
+    if (a->roots == NULL || b->roots == NULL)
+        return MANIFEST_IDENTITY_DIFFERENT;
+
+    // Root sets are equal irrespective of on-disk/in-memory order: sort a
+    // fresh array of pointers per side (never mutating the caller's roots)
+    // by id, then compare pairwise.
+    int n = a->root_count;
+    ManifestIdentityComparison result;
+    const ManifestRoot **sa = malloc((size_t)n * sizeof(*sa));
+    const ManifestRoot **sb = malloc((size_t)n * sizeof(*sb));
+    if (sa == NULL || sb == NULL)
+    {
+        // An allocation failure is an operational failure, not proof the two
+        // manifests differ -- the caller must not treat this the same as a
+        // genuine mismatch (see container_adopt(), docs/DECISIONS.md D15).
+        result = MANIFEST_IDENTITY_ERROR;
+        goto done;
+    }
+
+    for (int i = 0; i < n; i++)
+    {
+        sa[i] = &a->roots[i];
+        sb[i] = &b->roots[i];
+    }
+    qsort(sa, (size_t)n, sizeof(*sa), root_ptr_id_cmp);
+    qsort(sb, (size_t)n, sizeof(*sb), root_ptr_id_cmp);
+
+    result = MANIFEST_IDENTITY_EQUAL;
+    for (int i = 0; i < n; i++)
+        if (!root_identity_equal(sa[i], sb[i]))
+        {
+            result = MANIFEST_IDENTITY_DIFFERENT;
+            break;
+        }
+
+done:
+    free(sa);
+    free(sb);
+    return result;
 }
 
 int manifest_write_v1(const char *backup_dir, const Manifest *m)

@@ -165,6 +165,74 @@ typedef struct {
 ManifestStatus manifest_read_v1(const char *backup_dir, Manifest *out);
 
 /**
+ * @brief Reads and classifies container_fd's manifest.txt (docs/DECISIONS.md D15).
+ *
+ * Identical classification to manifest_read_v1() -- both share the same body
+ * parser, so a manifest's magic/version/content never reads differently
+ * depending on which function opened it. The two differ only in how they
+ * reach an open, readable stream:
+ *
+ * manifest.txt is opened by directory fd (never by re-resolving a path), with
+ * O_NONBLOCK so an entry that turns out to be a FIFO can never hang this call
+ * even with no writer on the other end, O_NOFOLLOW so a symlink is refused at
+ * open() (ELOOP) rather than followed, and an explicit ENXIO check because
+ * open() can never succeed on a Unix domain socket at all, regardless of
+ * flags. A subsequent fstat()+S_ISREG check catches every other non-regular
+ * object that *does* open successfully (FIFO, device, directory). All three
+ * -- ELOOP, ENXIO, and a non-regular S_ISREG -- classify as
+ * MANIFEST_STATUS_MALFORMED before a single byte is read; a genuine fstat()
+ * failure, distinctly, is MANIFEST_STATUS_IO_ERROR. This is deliberately
+ * stricter than manifest_read_v1(), which treats manifest.txt-
+ * as-a-directory as MANIFEST_STATUS_IO_ERROR: a path this caller was given
+ * directly is trusted to be what production wrote, while a directory entry
+ * discovered while scanning for adoption (docs/DECISIONS.md D15) may be
+ * foreign, so any non-regular object there is simply "not adoptable", full
+ * stop.
+ *
+ * @param container_fd Directory fd of the candidate container.
+ * @param out           Populated on MANIFEST_STATUS_VALID; caller must
+ *                       eventually pass it to manifest_free() in that case.
+ * @return The classified status.
+ */
+ManifestStatus manifest_read_v1_at(int container_fd, Manifest *out);
+
+/**
+ * @brief Outcome of manifest_resume_identity_compare().
+ *
+ * A three-way result, not a bool: comparing two root tables allocates, and an
+ * allocation failure must never be indistinguishable from a genuine mismatch.
+ * A caller (container_adopt(), docs/DECISIONS.md D15) that collapsed ERROR
+ * into DIFFERENT would silently turn an operational failure into "no match,
+ * safe to reserve a brand-new container" -- exactly the wrong conclusion.
+ */
+typedef enum {
+    MANIFEST_IDENTITY_DIFFERENT, /**< Well-formed comparison; not the same job. */
+    MANIFEST_IDENTITY_EQUAL,     /**< Well-formed comparison; the same resumable job. */
+    MANIFEST_IDENTITY_ERROR      /**< The comparison itself could not be completed
+                                       (allocation failure). Callers must treat this
+                                       as an operational failure, not as DIFFERENT. */
+} ManifestIdentityComparison;
+
+/**
+ * @brief Compares two manifests' full resume identity (docs/DECISIONS.md D15).
+ *
+ * Two manifests are the same resumable job only if version, representation,
+ * scope, sidecar_version, and source identity (machine_id + source_uid, both
+ * present on both sides) all match exactly, and their root tables carry the
+ * same set of roots -- compared by identity fields (id, policy, payload_path,
+ * source_path, and restore_path/has_restore_path), independent of on-disk or
+ * in-memory order. A timestamp or scope label alone is never sufficient
+ * (docs/DECISIONS.md D15); this is the one function that decides the question.
+ *
+ * @return MANIFEST_IDENTITY_EQUAL or MANIFEST_IDENTITY_DIFFERENT for any
+ *         well-formed comparison (including when either side lacks a source
+ *         identity, which is always DIFFERENT); MANIFEST_IDENTITY_ERROR only
+ *         if the comparison itself could not be completed (allocation
+ *         failure while comparing root tables) -- never silently DIFFERENT.
+ */
+ManifestIdentityComparison manifest_resume_identity_compare(const Manifest *a, const Manifest *b);
+
+/**
  * @brief Writes a versioned manifest to backup_dir/manifest.txt in full.
  *
  * A single fopen/write/fclose sequence: the container's own atomic
