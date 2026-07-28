@@ -2,8 +2,8 @@
 
 Working design document for the sidecar feature (see DECISIONS.md D6). This is
 scaffolding: phases get checked off and details shift as reality pushes back. The
-durable rationale lives in DECISIONS.md (D6, D13, and more as they are decided); this
-file is the how, not the why.
+durable rationale lives in DECISIONS.md (D6, D13, D14, and more as they are decided);
+this file is the how, not the why.
 
 This plan has been through three rounds of a longer, more maximalist external design
 review. The review's architecture is declined (see "Declined" at the end), but it
@@ -21,9 +21,9 @@ Before Phase A, `clone_recursive(src, dest)` was **symmetric and direction-agnos
 backup and restore called it — backup.c in 2 places, restore.c in 3 — just copying a tree from
 src to dest, the same code in both directions.
 
-The sidecar is **inherently asymmetric**, and there is no single "one recursion with a
-direction flag." There are **three orchestrations**, sharing low-level helpers (byte
-copy, metadata apply/capture, encode/decode) but not one loop:
+The sidecar is **inherently asymmetric**. Its eventual shape has **three
+orchestrations**, sharing low-level helpers (byte copy, metadata apply/capture,
+encode/decode) but not one permanently shared loop:
 
 - **backup** — walk the source tree, capture each entry, write payload; in portable
   mode also write the sidecar;
@@ -32,62 +32,67 @@ copy, metadata apply/capture, encode/decode) but not one loop:
 - **portable restore** — **sidecar-driven**: iterate the sidecar and replay, because
   the physical names are encoded and the sidecar is authoritative.
 
-Direction is an **explicit enum** (`CLONE_BACKUP` / `CLONE_RESTORE`) carried in a
-`clone_ctx` struct, alongside the destination mode (native / portable), the roots, the
-sidecar handle, capability flags, and hardlink state. No "null-ish" context is allowed
-to imply behaviour by its absence. A "sink hierarchy" was proposed to express the three
-orchestrations and is declined — three explicit loops over shared helpers achieve the
-same separation without the class machinery.
+Phase A established the boundary without manufacturing divergence early:
+`backup_capture()` and `restore_native()` validate a `CloneContext` and currently
+delegate to one private `clone_tree()` core while their native behaviour is still
+identical. `CloneContext` currently carries only the explicit operation
+(`CLONE_BACKUP` / `CLONE_RESTORE`) and representation (`CLONE_NATIVE_TREE` /
+`CLONE_PORTABLE_SIDECAR`). It can gain roots, sidecar state, capability data, or
+hardlink state only when a later phase gives those fields a real consumer. Portable
+restore remains a future sidecar-driven orchestration. No "null-ish" context is allowed
+to imply behaviour by its absence. A "sink hierarchy" was proposed and declined —
+explicit entry points that split as their algorithms actually diverge achieve the
+needed separation without class machinery.
 
 ---
 
-## Prerequisites — data-plane bugs, fixed on `main` first
+## Prerequisites — data-plane bugs fixed on `main` before Phase A
 
-These are **not sidecar work.** They are real defects in the current copy engine,
-verified by testing, that must be fixed before a sidecar is built on top — a format
-layered over an engine that corrupts the source or hides errors is built on sand. Each
-lands on `main` as its own commit with a regression test.
+These were **not sidecar work.** They were real defects in the copy engine, verified by
+testing and fixed before the sidecar branch was built on top. All five landed on `main`
+with regression coverage:
 
 1. **Backup mutates the source through a symlink** (critical, security). `preserve_metadata`
    calls plain `chmod(dest, ...)` on a symlink path; `chmod` follows the link. For an
    absolute symlink, `dest` points at the real source file, so its mode is overwritten
    with the symlink's own `0777`. **Verified:** a source `target.txt` went `0600 → 0777`
    through a backup. For `.ssh` this both breaks the key and exposes it, and it violates
-   the invariant that backup never modifies the source. Fix: type-aware metadata — never
-   `chmod` a symlink path; use `fchmodat`/`AT_SYMLINK_NOFOLLOW` or skip mode on symlinks.
+   the invariant that backup never modifies the source. Resolved by never calling
+   `chmod` on a symlink path (`71ac757`).
 2. **Failed copies report success.** A recursive copy failure propagates a `-1` that
    `backup()` ignores; it still prints `Backup complete` and exits `0`. **Verified**
    with a FIFO. Sidecar finalization cannot be trusted until errors reach the CLI and
-   prevent a "complete" verdict. Fix: propagate copy/metadata failures to the backup
-   result and the exit code.
+   prevent a "complete" verdict. Resolved by propagating copy failures through
+   `backup()` to the process result (`ac47bfd`).
 3. **Explicit-paths basename collision loses data.** Two explicit paths sharing a
    basename both clone to the same name; files overwrite, directories merge. **Verified:**
    `migr backup /dst ~/a/foo.txt ~/b/foo.txt` kept only one `foo.txt`, yet reported
    `2 items copied`. Explicit-paths mode also writes no manifest, so there is no
-   disambiguation at all. Fix: detect the collision and refuse (or deterministically
-   disambiguate) rather than silently overwrite.
+   disambiguation at all. Resolved by detecting and refusing basename collisions
+   (`a2aa086`).
 4. **Unchecked `snprintf` path assembly.** `PATH_MAX` buffers are filled without checking
-   for truncation, silently producing wrong paths. Low severity now, but filename
-   encoding (Phase D) can expand a name past the buffer. Fix: check `snprintf` returns;
-   consider `openat`/`fstatat` traversal longer term.
-5. **Special files break the copy.** `clone_recursive` handles symlink/regular/directory
-   and returns `-1` for anything else. A FIFO or socket — `.gnupg` contains sockets —
-   aborts its subtree. **This fix needs the native/portable FIFO policy decided first**
-   (see "Open decisions"): on `main` there is no portable mode, so the fix is native-only
-   (skip sockets with a warning; `mkfifo` for FIFOs where the destination supports it;
-   reject device nodes). The portable representation comes with the sidecar.
-
-Items 1–4 can start immediately. Item 5 waits on one small policy decision.
+   for truncation, silently producing wrong paths. Low severity then, but filename
+   encoding (Phase D) can expand a name past the buffer. Resolved by checking bounded
+   path construction and refusing truncation (`0af8aa3`); `openat`/`fstatat` traversal
+   remains a possible longer-term improvement where safety requires it.
+5. **Special files break the copy.** The old recursive clone handled only
+   symlink/regular/directory and returned `-1` for anything else. A FIFO or socket —
+   `.gnupg` contains sockets — aborted its subtree. The landed native policy recreates
+   FIFOs with `mkfifo`; sockets and device nodes are skipped with a warning because
+   neither carries backup payload bytes (`73bd703`). Portable FIFO representation
+   remains a later sidecar decision.
 
 ---
 
 ## What still breaks on a lossy destination (the sidecar's job)
 
-Beyond the bugs above, on exFAT/NTFS the engine loses metadata silently: `chmod`/
-`utimensat` fail with their returns ignored, so permissions and timestamps vanish with
-no error. `.ssh` restores as `0644` instead of `0600`. That silent loss is what the
-sidecar repairs — in portable mode by recording it, and in native mode by actually
-applying it (which today it does not; see below).
+Before Phase A, an exFAT/NTFS backup could lose metadata silently: `chmod`/
+`utimensat` failures are still ignored by the native clone core, so permissions and
+timestamps could vanish with no error. Phase A now probes the destination first and
+refuses a non-native verdict before creating a backup container, closing that silent
+loss path while portable mode is absent. The sidecar's job is to turn that safe refusal
+into a faithful portable backup — recording metadata in portable mode and making the
+corresponding native application paths report failure rather than pretend success.
 
 ---
 
@@ -124,24 +129,31 @@ unqualified claim that all filesystem state is already preserved.
 ## Capability probe (Phase A, grows per phase)
 
 At backup start, on the destination root, empirically create a temp dir and exercise
-what migr depends on, cleaning up after. Phase A covers the basics (mode round-trip,
-symlink, an illegal char, a `user.*` xattr); each later phase extends the bitset with
-what it needs (timestamp precision, case sensitivity, hardlink, filename classes,
-ownership behaviour). Refinements:
+what migr depends on, cleaning up after. Phase A implements six probes: mode round-trip,
+symlink, FIFO, a corpus of raw names, case sensitivity, and a `user.*` xattr. Each later
+phase extends the profile only when it introduces another native semantic, such as
+ownership behaviour, timestamp precision, or hardlinks. Refinements:
 
-- **Distinguish ENOTSUP from EPERM.** `chown` always fails for a non-root user — a
-  privilege issue, not a lossy-filesystem signal — and must not by itself trigger
-  portable mode.
+- **Classify in the syscall's context.** For Phase A's capability attempts
+  (`chmod`, `symlink`, `mkfifo`, `setxattr`) on a fresh directory migr owns,
+  `ENOTSUP`/`EOPNOTSUPP` and `EPERM`/`EACCES` mean that semantic is unavailable.
+  Supporting-operation failures remain operational errors. A future ownership
+  probe must classify `chown` separately: non-root `EPERM` is a privilege result,
+  not evidence of a lossy filesystem.
 - **Do not silently fall back.** If a destination that should be POSIX fails the probe
   for an unexpected reason, report the failure rather than quietly switching to portable
   mode; a silent switch could hide a broken environment.
-- The verdict is not "POSIX filesystem" but "verified every native semantic migr
-  implements." Only then is native mode selected.
+- The verdict is not "POSIX filesystem" but "verified every semantic required by the
+  current native profile." Only then is native mode selected.
 
-**Testability:** mode selection accepts an injected/forced capability profile, so the
-portable path is testable on the dev machine's btrfs without a mounted lossy filesystem.
-The probe is the single most correctness-critical piece — a wrong native verdict loses
-silently — so it is tested hardest.
+The probe only measures. A separate pure
+`select_representation(profile, out)` function applies the policy from D14, so unit
+tests exercise the complete native/portable/refuse decision matrix with synthetic
+profiles without exposing a production override. Those tests prove the selector, not
+the full portable orchestration; real mounted filesystems remain necessary to validate
+the probe and its wiring. Once the portable pipeline exists, a test-only seam may be
+added if needed to exercise that orchestration on a native development filesystem, but
+it must not be reachable through the production CLI, environment, or configuration.
 
 ---
 
@@ -300,8 +312,8 @@ needs it to carry at least:
 - the sidecar format version when a sidecar is present.
 
 This is required even for native backups, which deliberately have no sidecar and
-therefore cannot use the sidecar magic to identify their layout. Phase A introduces the
-versioned manifest reader/writer together with explicit legacy detection:
+therefore cannot use the sidecar magic to identify their layout. Phase A2 introduces
+the versioned manifest reader/writer together with explicit legacy detection:
 
 - a recognized new version is parsed according to that schema;
 - an unknown new version is rejected rather than guessed;
@@ -360,11 +372,16 @@ next. Native fidelity is **not** front-loaded into one phase; each dimension's N
 column is delivered in that dimension's phase (mode/uid/gid in B, xattr in E, hardlink
 in G), so no single phase carries "make everything faithful at once."
 
-- **Phase A — Structural foundation (no behaviour change).** `clone_ctx` refactor into
-  the three orchestrations; empirical probe with forced-profile injection and mode
-  selection wired, but the portable path stubbed so a capable destination behaves exactly
-  as today. All existing tests pass **unchanged** — this is the regression-safe baseline
-  everything else builds on, and its whole value is that it changes nothing observable.
+- **Phase A — Structural foundation (complete).** `CloneContext { operation,
+  representation }`; distinct `backup_capture()` and `restore_native()` entries over
+  the private native `clone_tree()` core; standalone six-capability `fsprobe()` plus
+  pure `select_representation()`; and backup preflight wiring. Native destinations
+  retain the existing copy behaviour. An unavailable native semantic selects portable,
+  but backup currently refuses that verdict before creating the dated container because
+  portable capture is not implemented; an unreliable probe also refuses rather than
+  silently falling through. Restore remains native, dry-run does not probe, and there is
+  no production capability override. Existing regression tests remained green and new
+  probe/preflight tests were added (`e6d367b`, `ac301da`, `ea1a3d9`).
 - **Phase A2 — Versioned container.** `.partial` + atomic rename + control/payload
   non-collision; versioned manifest + legacy detection. The first observable format
   change, kept separate from the refactor so it is reviewed on its own: tested that
@@ -410,9 +427,11 @@ should not be added until such a user-facing need exists.
   containing NUL, incomplete entry groups, truncated tail, precedence, xattr removal on
   replacement, unknown version), versioned/unversioned/unknown manifest handling, and
   `user.*` xattr roundtrip. Separate test binaries in the `tests/test_detect.c` mould.
-- **Forced-portable integration (dev machine):** inject a capability profile forcing
-  portable mode, run full backup→restore fixtures on btrfs. Proves control flow without a
-  mounted lossy filesystem.
+- **Portable orchestration integration (once that path exists):** run full
+  backup→restore fixtures on real lossy filesystems. If a narrowly scoped test-only seam
+  is needed for faster native-filesystem runs, it may supply a synthetic profile to the
+  orchestration, but it must not create a production override and cannot replace the
+  real-filesystem matrix.
 - **Interruption boundaries:** inject interruption after payload close, during `ENTRY`,
   between `XATTR` sub-records, before/after `ENTRY_COMMIT`, and around deletion handling;
   resume must either redo the entry or use one complete committed state, never a partial
@@ -426,7 +445,8 @@ should not be added until such a user-facing need exists.
   driver** (D6 names all three families), run in the VMs (mount needs root).
 - **Roundtrip is mandatory** for every dimension: encode-then-decode must equal the
   original.
-- **Regression:** existing 45+14 assertions stay green from Phase A on.
+- **Regression:** the complete existing regression suite stays green from Phase A on;
+  new phase-specific tests are additive.
 - **Durable error-propagation fixture:** the regression for prerequisite #2 must not
   permanently rely on FIFO being unsupported, because prerequisite #5 changes that
   behaviour. Use a failure that remains a failure after special-file support lands.
@@ -440,9 +460,9 @@ should not be added until such a user-facing need exists.
   with a warning (no `had_error`). What a *lossy* destination does (a FIFO placeholder+record
   vs skip; sockets/devices always skipped) is still open and belongs to Phase C/D, not the
   current engine.
-- **Before Phase A:** the control/payload non-collision mechanism (`data/` vs reserved-name
+- **Before Phase A2:** the control/payload non-collision mechanism (`data/` vs reserved-name
   rejection); the container naming (`HHMMSS[-N]`) and its resume-identity fields.
-- **Before Phase A:** explicit-root restore semantics — where `EXPLICIT_n` restores to,
+- **Before Phase A2:** explicit-root restore semantics — where `EXPLICIT_n` restores to,
   or whether explicit backups are marked manual-restore.
 - **Before Phase B:** the exact record byte grammar and the resume record semantics
   (`DELETE` + last-wins vs atomic rewrite; append-only per D6 favours the former).
@@ -462,17 +482,19 @@ should not be added until such a user-facing need exists.
 
 ## Declined from the review
 
-Adopted: the verified bugs, the three-orchestration framing, explicit direction enum,
+Adopted: the verified bugs, the eventual three-orchestration framing, explicit
+operation and representation enums,
 `EXPLICIT_n` ordinal roots, committed entry groups, truncated-tail,
 payload→sidecar commit ordering, versioned manifest + legacy detection, native-mode
 fidelity per dimension, `HHMMSS` container + mandatory non-collision invariant,
 deletion semantics reserved before format freeze, restore ordering, component-safe
 no-follow traversal + mandatory negative tests, real exFAT/NTFS in the final matrix,
-probe ENOTSUP/EPERM + no-silent-fallback.
+contextual probe-error classification + no-silent-fallback.
 Declined, with reasons:
 
-- **The `LogicalEntry` / sink hierarchy.** Enterprise abstraction for a ~300-line C file;
-  three explicit loops over shared helpers do the same job.
+- **The `LogicalEntry` / sink hierarchy.** Enterprise abstraction for the current C
+  engine; explicit entry points can split into separate loops over shared helpers when
+  their algorithms actually diverge.
 - **The full logical-root framework** (per-root destination-policy tables, richer than the
   minimal ordinal roots + per-root policy actually needed).
 - **Per-entry checksums / integrity fields**, and **`fsync` power-loss durability.**
@@ -505,6 +527,8 @@ the repository's authoritative documents at their gates:
   bug means silent data corruption. Hence the strict phasing and mandatory roundtrips.
 - The probe is the critical path: a wrong native verdict writes no sidecar and loses
   silently. Test it hardest.
-- Lossy-fs behaviour cannot be exercised on the dev machine (mount needs root); the
-  forced-profile tests cover control flow there, and each phase's driver-level test closes
-  on real exFAT/NTFS in the VMs.
+- Lossy-filesystem behaviour is outside the unprivileged default suite because mounting
+  test filesystems needs root. Synthetic profiles cover the selector's decision matrix;
+  loopback filesystems in the VMs cover the real probe and backup wiring. As portable
+  orchestration grows, optional test-only seams may shorten iteration but never replace
+  real exFAT/NTFS/vfat tests.

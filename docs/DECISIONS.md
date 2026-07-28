@@ -356,3 +356,47 @@ main reason to revisit.
 dimensions (metadata, symlinks, filenames, xattrs) are complete and stable.
 
 See docs/sidecar-plan.md for the full implementation plan.
+
+---
+
+## D14 — 2026-07-27 — Backup representation is selected empirically, without a production override
+
+**Status:** Implemented
+
+**Decision:** Before a live backup creates its dated container, `fsprobe()` measures the
+destination filesystem and produces a per-capability profile, and a separate pure
+`select_representation()` reduces that profile with fail-closed precedence:
+
+- all required capabilities supported → native representation;
+- any capability unavailable, with no operational error → portable representation;
+- any operational error or invalid result → refuse the backup.
+
+The production CLI, environment, and configuration cannot force a representation or
+replace the measured profile. Until portable capture exists, a portable verdict is
+refused before the container is created — a temporary implementation boundary, not a
+rejection of lossy filesystems.
+
+**Why:** A false native verdict silently loses the exact metadata the sidecar exists to
+protect, so a user-facing force-native path would turn a safety check into an opt-out
+from data integrity. For the same reason an unexpected probe failure is refused, not
+read as "portable": it could equally mean a full, read-only, or damaged destination.
+
+Keeping measurement (`fsprobe`) separate from policy (`select_representation`) makes both
+reviewable — the selector's whole native/portable/refuse matrix is deterministic under
+synthetic profiles, so no production override is needed to test it, while mounted
+filesystems validate that the probe observes reality. That covers the selector, not
+portable orchestration; when that pipeline exists, a narrowly scoped test-only seam may
+drive it on a native development filesystem, but it must not be reachable through a
+release binary, CLI, environment, or configuration, and never replaces real
+exFAT/NTFS/vfat tests.
+
+**Rejected:** filesystem-name allowlists in place of empirical checks; production
+force-native/force-portable controls; treating an operational probe failure as a request
+for portable mode.
+
+**Revisit if:** a real user workflow requires portable representation on a filesystem
+that passed the native profile — a product decision with its own safety contract, not a
+testing shortcut.
+
+**Relationship:** Refines D6 by defining how migr chooses its native or portable
+representation.
