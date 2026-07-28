@@ -152,7 +152,7 @@ int restore(const char *source)
     }
 
     char *manifest_names[XDG_RESTORE_COUNT];
-    int has_manifest = (manifest_read(source, manifest_names, XDG_RESTORE_COUNT) == 0);
+    int has_manifest = (legacy_manifest_read(source, manifest_names, XDG_RESTORE_COUNT) == 0);
 
     const char *dotfiles[] = {".ssh", ".gnupg", ".gitconfig", ".bashrc", ".profile", NULL};
 

@@ -459,7 +459,7 @@ int backup(const char *target, BackupMode mode, char **paths)
         if (dry_run)
             printf("  Would write manifest: %s/manifest.txt\n", backup_dir);
         else
-            manifest_write(backup_dir, basenames, XDG_DIR_COUNT);
+            legacy_manifest_write(backup_dir, basenames, XDG_DIR_COUNT);
 
         for (int i = 0; i < XDG_DIR_COUNT; i++)
             free(xdg_dirs[i]);

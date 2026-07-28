@@ -16,6 +16,7 @@ TEST_DETECT = tests/test_detect
 TEST_PATHJOIN = tests/test_pathjoin
 TEST_SPECIAL_FILES = tests/test_special_files
 TEST_FSPROBE = tests/test_fsprobe
+TEST_MANIFEST = tests/test_manifest
 
 $(TEST_DETECT): tests/test_detect.c detect.o
 	$(CC) $(CFLAGS) -o $@ tests/test_detect.c detect.o
@@ -29,14 +30,18 @@ $(TEST_SPECIAL_FILES): tests/test_special_files.c fileops.o utils.o
 $(TEST_FSPROBE): tests/test_fsprobe.c fsprobe.o utils.o
 	$(CC) $(CFLAGS) -o $@ tests/test_fsprobe.c fsprobe.o utils.o
 
-test: $(TARGET) $(TEST_DETECT) $(TEST_PATHJOIN) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE)
+$(TEST_MANIFEST): tests/test_manifest.c manifest.o utils.o
+	$(CC) $(CFLAGS) -o $@ tests/test_manifest.c manifest.o utils.o
+
+test: $(TARGET) $(TEST_DETECT) $(TEST_PATHJOIN) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE) $(TEST_MANIFEST)
 	./$(TEST_DETECT)
 	./$(TEST_PATHJOIN)
 	./$(TEST_SPECIAL_FILES)
 	./$(TEST_FSPROBE)
+	./$(TEST_MANIFEST)
 	cd tests && bash test.sh
 
 clean:
-	rm -f $(OBJS) $(TARGET) $(TEST_DETECT) $(TEST_PATHJOIN) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE)
+	rm -f $(OBJS) $(TARGET) $(TEST_DETECT) $(TEST_PATHJOIN) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE) $(TEST_MANIFEST)
 
 .PHONY: clean test

@@ -1,9 +1,25 @@
 #ifndef MANIFEST_H
 #define MANIFEST_H
 
-#define MANIFEST_XDG_COUNT 6
+#include <limits.h>   /* PATH_MAX */
+#include <sys/types.h> /* uid_t */
 
-extern const char * const manifest_keys[MANIFEST_XDG_COUNT]; /**< Canonical XDG key names, parallel to the xdg_resolve arrays. */
+#include "fileops.h" /* CloneRepresentation */
+
+/**
+ * @brief Legacy manifest: an unversioned "KEY=value" file recording only XDG
+ * directory basenames, so restore can locate source-locale directories when the
+ * source and destination locales differ.
+ *
+ * Superseded by the versioned manifest below (docs/DECISIONS.md D15/D16), but kept
+ * verbatim under an explicit "legacy" name: production still writes and reads this
+ * format exclusively until the versioned container lands, and existing backups on
+ * disk only have this format to restore from.
+ */
+
+#define LEGACY_MANIFEST_XDG_COUNT 6
+
+extern const char * const legacy_manifest_keys[LEGACY_MANIFEST_XDG_COUNT]; /**< Canonical XDG key names, parallel to the xdg_resolve arrays. */
 
 /**
  * @brief Writes manifest.txt to backup_dir recording the XDG key-to-dirname mapping.
@@ -12,16 +28,16 @@ extern const char * const manifest_keys[MANIFEST_XDG_COUNT]; /**< Canonical XDG 
  * correct directories when the source and destination locales differ.
  *
  * @param backup_dir Directory in which manifest.txt is created.
- * @param basenames  Array of n directory basenames parallel to manifest_keys[].
+ * @param basenames  Array of n directory basenames parallel to legacy_manifest_keys[].
  * @param n          Number of entries to write.
  * @return 0 on success, 1 if the file cannot be opened for writing.
  */
-int manifest_write(const char *backup_dir, const char * const *basenames, int n);
+int legacy_manifest_write(const char *backup_dir, const char * const *basenames, int n);
 
 /**
  * @brief Parses manifest.txt from backup_dir and extracts XDG directory basenames.
  *
- * Each out[i] is set to a strdup'd value matching manifest_keys[i], or left
+ * Each out[i] is set to a strdup'd value matching legacy_manifest_keys[i], or left
  * NULL if the key is absent from the file. The caller must free every
  * non-NULL entry. Returns 1 without modifying out[] if the file does not exist,
  * allowing the caller to fall back to the target system's basename.
@@ -31,6 +47,142 @@ int manifest_write(const char *backup_dir, const char * const *basenames, int n)
  * @param n          Number of entries to look up.
  * @return 0 if manifest.txt was found and parsed, 1 if the file does not exist.
  */
-int manifest_read(const char *backup_dir, char **out, int n);
+int legacy_manifest_read(const char *backup_dir, char **out, int n);
+
+/* ------------------------------------------------------------------------- */
+/* Versioned manifest (docs/DECISIONS.md D15, D16) — not yet wired into       */
+/* backup.c/restore.c. Production still writes and reads only the legacy     */
+/* format above; this model and its round-trip are introduced on their own   */
+/* so the container/root wiring lands as a separate, reviewable step.        */
+/* ------------------------------------------------------------------------- */
+
+#define MANIFEST_CURRENT_VERSION 1
+#define MANIFEST_MAX_ROOTS       4096  /**< Resource-exhaustion ceiling, not an expected count. */
+#define MANIFEST_ID_MAX          64
+#define MANIFEST_MACHINE_ID_MAX  128
+
+/**
+ * @brief Every distinguishable outcome of reading manifest.txt.
+ *
+ * Kept as separate values rather than a bool so a caller can route MISSING and
+ * LEGACY to the same fallback behaviour while still telling them apart in tests
+ * and diagnostics, and so MALFORMED/UNKNOWN_VERSION are never silently treated
+ * as MISSING (that would let a corrupt versioned manifest quietly fall back to
+ * "no manifest" behaviour instead of refusing).
+ */
+typedef enum {
+    MANIFEST_STATUS_MISSING,         /**< No manifest.txt in backup_dir at all. */
+    MANIFEST_STATUS_LEGACY,          /**< Not the versioned magic, and contains at least one recognized
+                                           legacy_manifest_keys[] "KEY=value" line -- genuinely the old
+                                           unversioned manifest. An empty file, or content that merely
+                                           looks KEY=value-shaped without a recognized key (including a
+                                           corrupted/truncated attempt at the versioned magic), is
+                                           MALFORMED instead: silently guessing "probably legacy" could
+                                           route real corruption through the legacy fallback path. */
+    MANIFEST_STATUS_VALID,           /**< Magic + MANIFEST_CURRENT_VERSION, parsed successfully; *out is populated. */
+    MANIFEST_STATUS_UNKNOWN_VERSION, /**< Magic present, VERSION is well-formed but not one this build understands. */
+    MANIFEST_STATUS_MALFORMED,       /**< Magic present, current version, but the content violates the grammar. */
+    MANIFEST_STATUS_IO_ERROR         /**< open/read/allocation failure unrelated to file content. */
+} ManifestStatus;
+
+/**
+ * @brief How a root's restore destination is determined (docs/DECISIONS.md D16).
+ */
+typedef enum {
+    ROOT_POLICY_XDG,           /**< Restored via the target's own xdg_resolve(), same as today. */
+    ROOT_POLICY_HOME_RELATIVE, /**< Restored at the same path relative to the target $HOME. */
+    ROOT_POLICY_MANUAL_NATIVE  /**< Captured (native only) but not restored automatically. */
+} RootPolicy;
+
+/**
+ * @brief Mirrors backup.h's BackupMode by value, defined independently.
+ *
+ * manifest.h has no other dependency on backup.h's orchestration-level types
+ * (its only local-header dependency is the foundational fileops.h, for
+ * CloneRepresentation), and a persistence format should not need to reach up
+ * into a specific caller's mode enum. The three values are kept in sync with
+ * BackupMode by convention and by the tests that exercise both, not by a
+ * shared type.
+ */
+typedef enum {
+    MANIFEST_SCOPE_CRITICAL,
+    MANIFEST_SCOPE_COMPREHENSIVE,
+    MANIFEST_SCOPE_EXPLICIT
+} ManifestScope;
+
+/**
+ * @brief One captured root: its identity, restore policy, and both its
+ * container-relative payload location and its source-side address.
+ *
+ * restore_path is meaningful only for ROOT_POLICY_HOME_RELATIVE, and
+ * has_restore_path (not an empty string) is what marks that — an empty
+ * home-relative path is itself a legitimate value (the root is $HOME itself).
+ */
+typedef struct {
+    char id[MANIFEST_ID_MAX];        /**< e.g. "EXPLICIT_0" or an XDG key such as "XDG_DOCUMENTS_DIR". */
+    RootPolicy policy;
+    char payload_path[PATH_MAX];     /**< Location under the container's data/, relative. */
+    char source_path[PATH_MAX];      /**< Source-side identity: XDG basename, home-relative path, or absolute path. */
+    char restore_path[PATH_MAX];     /**< Target-side restore address; meaningful only when has_restore_path. */
+    int has_restore_path;
+} ManifestRoot;
+
+/**
+ * @brief The versioned manifest: format identity, representation/scope, optional
+ * resume identity, and the full root table.
+ *
+ * roots is a heap array owned by this struct; manifest_free() releases it.
+ * has_source_identity is set only when both machine_id and source_uid are
+ * available (docs/DECISIONS.md D15) — one without the other is not adopted as
+ * a partial identity.
+ */
+typedef struct {
+    int version;
+    CloneRepresentation representation;
+    ManifestScope scope;
+    int sidecar_version; /**< 0 means no sidecar is present. */
+    int has_source_identity;
+    char machine_id[MANIFEST_MACHINE_ID_MAX];
+    uid_t source_uid;
+    int root_count;
+    ManifestRoot *roots;
+} Manifest;
+
+/**
+ * @brief Reads and classifies backup_dir/manifest.txt.
+ *
+ * Distinguishes every failure class explicitly (see ManifestStatus) rather than
+ * collapsing them into a single boolean, so a corrupt or unsupported-version
+ * manifest is never treated the same as "no manifest" or silently guessed at.
+ * *out is populated only when the return value is MANIFEST_STATUS_VALID; on
+ * every other status *out is left zeroed (no partial/inconsistent state).
+ *
+ * @param backup_dir Directory containing manifest.txt.
+ * @param out        Populated on MANIFEST_STATUS_VALID; caller must eventually
+ *                   pass it to manifest_free() in that case.
+ * @return The classified status.
+ */
+ManifestStatus manifest_read_v1(const char *backup_dir, Manifest *out);
+
+/**
+ * @brief Writes a versioned manifest to backup_dir/manifest.txt in full.
+ *
+ * A single fopen/write/fclose sequence: the container's own atomic
+ * .partial-to-final rename (docs/DECISIONS.md D15) is what makes an interrupted
+ * write harmless, so this function does not need its own temp-file dance. Every
+ * write is checked, including fflush/fclose; any failure removes no state but
+ * returns non-zero so the caller can refuse rather than finalize a container
+ * with a truncated manifest.
+ *
+ * @param backup_dir Directory in which manifest.txt is created.
+ * @param m          The manifest to serialize; must not be NULL.
+ * @return 0 on success, 1 on any error.
+ */
+int manifest_write_v1(const char *backup_dir, const Manifest *m);
+
+/**
+ * @brief Releases the heap-owned root array. Safe on NULL and on an all-zero Manifest.
+ */
+void manifest_free(Manifest *m);
 
 #endif
