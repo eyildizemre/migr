@@ -585,6 +585,37 @@ test_truncation() {
         echo "  live exit=$deep_home_live_rc output: $deep_home_live_out"
         exit 1
     fi
+
+    # If even one XDG fallback cannot be represented, legacy restore must stop
+    # before restoring unrelated items. Continuing after a partial XDG
+    # resolution would change the established legacy error boundary.
+    local too_deep_home="$TEST_DIR/too_deep_home"
+    mkdir "$too_deep_home"
+    while [ ${#too_deep_home} -lt 4088 ]; do
+        room=$((4088 - ${#too_deep_home} - 1))
+        [ "$room" -le 0 ] && break
+        part_len=100
+        [ "$room" -lt "$part_len" ] && part_len=$room
+        comp=$(head -c "$part_len" </dev/zero | tr '\0' z)
+        too_deep_home="$too_deep_home/$comp"
+        mkdir "$too_deep_home"
+    done
+    echo legacy-dotfile > "$TEST_DIR/dummy_src/.bashrc"
+
+    local too_deep_out too_deep_rc
+    set +e
+    too_deep_out=$(env HOME="$too_deep_home" ../migr restore "$TEST_DIR/dummy_src" --dry-run 2>&1)
+    too_deep_rc=$?
+    set -e
+    if [ "$too_deep_rc" -ne 0 ] &&
+       [[ "$too_deep_out" == *"HOME path too long"* ]] &&
+       [[ "$too_deep_out" != *"Would restore: .bashrc"* ]]; then
+        echo -e "  ${GREEN}✓${NC} Legacy restore stops when XDG destinations cannot all be resolved."
+    else
+        echo -e "  ${RED}✗${NC} Legacy XDG failure leaked into a partial restore"
+        echo "  exit=$too_deep_rc output: $too_deep_out"
+        exit 1
+    fi
 }
 
 test_restore_path_safety() {
@@ -647,8 +678,95 @@ test_restore_path_safety() {
 }
 
 
+test_v1_restore_dispatch() {
+    echo -e "${BLUE}::${NC} Phase 12: versioned (v1) manifest restore dispatch"
+
+    # A hand-crafted v1 manifest exercises CLI restore independently of the
+    # backup writer. PAYLOAD/SOURCE/RESTORE need no percent-encoding here since
+    # every byte used is in the encoder's safe set (see src/manifest.c's
+    # grammar comment).
+    local v1_src="$TEST_DIR/v1_src"
+    local v1_home="$TEST_DIR/v1_home"
+    mkdir -p "$v1_src/data/EXPLICIT_0" "$v1_src/data/EXPLICIT_1" "$v1_home"
+    echo "project-note" > "$v1_src/data/EXPLICIT_0/note.txt"
+    echo "external-note" > "$v1_src/data/EXPLICIT_1/external.txt"
+    cat > "$v1_src/manifest.txt" <<'EOF'
+MIGR_MANIFEST
+VERSION=1
+REPRESENTATION=native
+SCOPE=explicit
+SIDECAR_VERSION=0
+ROOT_COUNT=2
+ROOT ID=EXPLICIT_0 POLICY=HOME_RELATIVE PAYLOAD=EXPLICIT_0 SOURCE=Documents/project RESTORE=Documents/project
+ROOT ID=EXPLICIT_1 POLICY=MANUAL_NATIVE PAYLOAD=EXPLICIT_1 SOURCE=/mnt/external/project
+EOF
+
+    local dry_out
+    dry_out=$(env HOME="$v1_home" ../migr restore "$v1_src" --dry-run)
+    assert_contains "$dry_out" "[Roots]"
+    assert_contains "$dry_out" "Would restore: EXPLICIT_0 -> ~/Documents/project"
+    assert_contains "$dry_out" "[Manual Roots]"
+    assert_contains "$dry_out" "/mnt/external/project"
+
+    local live_out
+    live_out=$(printf 'y\n' | env HOME="$v1_home" ../migr restore "$v1_src")
+    assert_contains "$live_out" "Restore complete"
+    assert_file_exists "$v1_home/Documents/project/note.txt"
+    if [ "$(cat "$v1_home/Documents/project/note.txt")" = "project-note" ]; then
+        echo -e "  ${GREEN}✓${NC} HOME_RELATIVE root content matches the backup payload."
+    else
+        echo -e "  ${RED}✗${NC} HOME_RELATIVE root content does not match"
+        exit 1
+    fi
+    if [ ! -e "$v1_home/EXPLICIT_1" ] && [ ! -e "$v1_home/external.txt" ] && [ ! -e "$v1_home/external-note" ]; then
+        echo -e "  ${GREEN}✓${NC} MANUAL_NATIVE root was not auto-restored into home."
+    else
+        echo -e "  ${RED}✗${NC} MANUAL_NATIVE root was unexpectedly restored"
+        exit 1
+    fi
+    assert_contains "$live_out" "/mnt/external/project"
+
+    # A .partial-named source is refused before manifest dispatch
+    # (docs/DECISIONS.md D15) -- an interrupted backup may be incomplete.
+    local partial_src="$TEST_DIR/migr_backup_20260101_000000.partial"
+    mkdir -p "$partial_src"
+    assert_fails_with "in-progress or abandoned" ../migr restore "$partial_src" --dry-run
+
+    # An unrecognized manifest version refuses the whole restore before ever
+    # reaching the confirmation prompt -- no piped "y" is needed here.
+    local unknown_src="$TEST_DIR/unknown_version_src"
+    mkdir -p "$unknown_src"
+    printf 'MIGR_MANIFEST\nVERSION=999\n' > "$unknown_src/manifest.txt"
+    assert_fails_with "does not understand" env HOME="$v1_home" ../migr restore "$unknown_src"
+
+    # packages.txt is fd-anchored: a symlinked file must never be followed into
+    # an arbitrary location.
+    local pkg_src="$TEST_DIR/pkg_symlink_src"
+    local pkg_home="$TEST_DIR/pkg_symlink_home"
+    local pkg_outside="$TEST_DIR/pkg_outside_secret.txt"
+    mkdir -p "$pkg_src" "$pkg_home"
+    echo "outside-secret-content" > "$pkg_outside"
+    ln -s "$pkg_outside" "$pkg_src/packages.txt"
+
+    local pkg_live_out pkg_live_rc
+    set +e
+    pkg_live_out=$(printf 'y\n' | env HOME="$pkg_home" ../migr restore "$pkg_src" 2>&1)
+    pkg_live_rc=$?
+    set -e
+    if [ "$pkg_live_rc" -ne 0 ] &&
+       [[ "$pkg_live_out" == *"packages.txt"* ]] &&
+       [ "$(cat "$pkg_outside")" = "outside-secret-content" ]; then
+        echo -e "  ${GREEN}✓${NC} A symlinked packages.txt is refused, its target left untouched."
+    else
+        echo -e "  ${RED}✗${NC} Symlinked packages.txt handling diverged"
+        echo "  exit=$pkg_live_rc output: $pkg_live_out"
+        exit 1
+    fi
+}
+
+
 test_probe_refusal() {
-    echo -e "${BLUE}::${NC} Phase 12: destination probe (backup preflight)"
+    echo -e "${BLUE}::${NC} Phase 13: destination probe (backup preflight)"
 
     # A regular file is not a valid destination: reject it up front, in both live
     # and dry-run, before writing anything. This needs no special privilege.
@@ -730,5 +848,6 @@ test_explicit_paths
 test_errors
 test_truncation
 test_restore_path_safety
+test_v1_restore_dispatch
 test_probe_refusal
 echo -e "${GREEN}all tests passed${NC}"

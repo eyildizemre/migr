@@ -12,9 +12,8 @@
  * source and destination locales differ.
  *
  * Superseded by the versioned manifest below (docs/DECISIONS.md D15/D16), but kept
- * verbatim under an explicit "legacy" name: production still writes and reads this
- * format exclusively until the versioned container lands, and existing backups on
- * disk only have this format to restore from.
+ * verbatim under an explicit "legacy" name: current backup production still writes
+ * it, and restore must continue to read existing backups that carry it.
  */
 
 #define LEGACY_MANIFEST_XDG_COUNT 6
@@ -50,10 +49,7 @@ int legacy_manifest_write(const char *backup_dir, const char * const *basenames,
 int legacy_manifest_read(const char *backup_dir, char **out, int n);
 
 /* ------------------------------------------------------------------------- */
-/* Versioned manifest (docs/DECISIONS.md D15, D16) — not yet wired into       */
-/* backup.c/restore.c. Production still writes and reads only the legacy     */
-/* format above; this model and its round-trip are introduced on their own   */
-/* so the container/root wiring lands as a separate, reviewable step.        */
+/* Versioned manifest (docs/DECISIONS.md D15, D16).                          */
 /* ------------------------------------------------------------------------- */
 
 #define MANIFEST_CURRENT_VERSION 1

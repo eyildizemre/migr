@@ -867,6 +867,61 @@ static void test_adopt_ignores_names_outside_the_grammar(void)
 }
 
 /* ========================================================================= */
+/* container_name_is_partial()                                             */
+/* ========================================================================= */
+
+static void test_name_is_partial_matches_the_reserve_grammar(void)
+{
+    printf(BLUE "::" NC " container: public name classifiers match the reserve/finalize grammar\n");
+
+    check(container_name_is_partial(NULL) == 0, "a NULL name is not partial");
+    check(container_name_is_final(NULL) == 0, "a NULL name is not final");
+    check(container_name_is_partial("") == 0, "an empty name is not partial");
+    check(container_name_is_final("") == 0, "an empty name is not final");
+
+    static const char *valid_partials[] = {
+        "migr_backup_20260101_000000.partial",
+        "migr_backup_20260101_000000-1.partial",
+        "migr_backup_20260101_000000-42.partial",
+    };
+    for (size_t i = 0; i < sizeof(valid_partials) / sizeof(valid_partials[0]); i++)
+        check(container_name_is_partial(valid_partials[i]) != 0,
+              "a genuine .partial container name is recognized");
+
+    static const char *valid_finals[] = {
+        "migr_backup_20260101_000000",
+        "migr_backup_20260101_000000-1",
+        "migr_backup_20260101_000000-42",
+    };
+    for (size_t i = 0; i < sizeof(valid_finals) / sizeof(valid_finals[0]); i++)
+        check(container_name_is_final(valid_finals[i]) != 0,
+              "a genuine finalized container name is recognized");
+
+    static const char *not_partials[] = {
+        "migr_backup_20260101_000000",              // finalized: no ".partial" at all
+        "migr_backup_20260101_000000-0.partial",    // "-0": never produced (no leading-zero suffix)
+        "migr_backup_20260101_00000.partial",       // stamp one digit short
+        "not_migr_backup_20260101_000000.partial",  // wrong prefix
+        "myfiles.partial",                          // an unrelated directory, not ours
+        "migr_backup_20260101_000000.partial/",     // trailing slash: not a bare leaf name
+    };
+    for (size_t i = 0; i < sizeof(not_partials) / sizeof(not_partials[0]); i++)
+        check(container_name_is_partial(not_partials[i]) == 0,
+              "a name outside the exact grammar is not treated as partial");
+
+    static const char *not_finals[] = {
+        "migr_backup_20260101_000000.partial",
+        "migr_backup_20260101_000000-0",
+        "migr_backup_20260101_00000",
+        "not_migr_backup_20260101_000000",
+        "migr_backup_20260101_000000/",
+    };
+    for (size_t i = 0; i < sizeof(not_finals) / sizeof(not_finals[0]); i++)
+        check(container_name_is_final(not_finals[i]) == 0,
+              "a name outside the exact grammar is not treated as final");
+}
+
+/* ========================================================================= */
 /* manifest_read_v1_at() non-regular-object handling                       */
 /* ========================================================================= */
 
@@ -1019,6 +1074,7 @@ int main(void)
     test_adopt_rejects_non_valid_manifests();
     test_adopt_fails_closed_on_scan_error();
     test_adopt_ignores_names_outside_the_grammar();
+    test_name_is_partial_matches_the_reserve_grammar();
 
     test_manifest_read_v1_at_rejects_non_regular();
     test_resume_identity_compare_ignores_root_order();

@@ -19,6 +19,7 @@ TEST_FSPROBE = tests/test_fsprobe
 TEST_MANIFEST = tests/test_manifest
 TEST_CONTAINER = tests/test_container
 TEST_RESTORE_NATIVE = tests/test_restore_native
+TEST_RESTORE_DISPATCH = tests/test_restore_dispatch
 
 $(TEST_DETECT): tests/test_detect.c detect.o
 	$(CC) $(CFLAGS) -o $@ tests/test_detect.c detect.o
@@ -41,7 +42,10 @@ $(TEST_CONTAINER): tests/test_container.c container.o manifest.o utils.o
 $(TEST_RESTORE_NATIVE): tests/test_restore_native.c fileops.o utils.o
 	$(CC) $(CFLAGS) -o $@ tests/test_restore_native.c fileops.o utils.o
 
-test: $(TARGET) $(TEST_DETECT) $(TEST_PATHJOIN) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE) $(TEST_MANIFEST) $(TEST_CONTAINER) $(TEST_RESTORE_NATIVE)
+$(TEST_RESTORE_DISPATCH): tests/test_restore_dispatch.c restore.o fileops.o manifest.o container.o utils.o xdg.o detect.o
+	$(CC) $(CFLAGS) -o $@ tests/test_restore_dispatch.c restore.o fileops.o manifest.o container.o utils.o xdg.o detect.o
+
+test: $(TARGET) $(TEST_DETECT) $(TEST_PATHJOIN) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE) $(TEST_MANIFEST) $(TEST_CONTAINER) $(TEST_RESTORE_NATIVE) $(TEST_RESTORE_DISPATCH)
 	./$(TEST_DETECT)
 	./$(TEST_PATHJOIN)
 	./$(TEST_SPECIAL_FILES)
@@ -49,9 +53,10 @@ test: $(TARGET) $(TEST_DETECT) $(TEST_PATHJOIN) $(TEST_SPECIAL_FILES) $(TEST_FSP
 	./$(TEST_MANIFEST)
 	./$(TEST_CONTAINER)
 	./$(TEST_RESTORE_NATIVE)
+	./$(TEST_RESTORE_DISPATCH)
 	cd tests && bash test.sh
 
 clean:
-	rm -f $(OBJS) $(TARGET) $(TEST_DETECT) $(TEST_PATHJOIN) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE) $(TEST_MANIFEST) $(TEST_CONTAINER) $(TEST_RESTORE_NATIVE)
+	rm -f $(OBJS) $(TARGET) $(TEST_DETECT) $(TEST_PATHJOIN) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE) $(TEST_MANIFEST) $(TEST_CONTAINER) $(TEST_RESTORE_NATIVE) $(TEST_RESTORE_DISPATCH)
 
 .PHONY: clean test

@@ -175,4 +175,33 @@ ContainerStatus container_finalize(BackupContainer *container);
  */
 void container_close(BackupContainer *container);
 
+/**
+ * @brief Whether name matches the exact ".partial" leaf grammar
+ * container_reserve() can produce (docs/DECISIONS.md D15) -- i.e. whether it
+ * names an in-progress or abandoned container, not a finalized one.
+ *
+ * Shares parse_partial_name()'s grammar so the naming rule stays defined in
+ * one place: a name that merely happens to end in ".partial" without matching
+ * the "migr_backup_YYYYMMDD_HHMMSS[-N].partial" shape is not considered ours
+ * and is reported as not partial.
+ *
+ * @param name A single path component (a leaf name, not a full path).
+ * @return Non-zero if name matches the partial-container grammar, 0 otherwise
+ *         (including a NULL name).
+ */
+int container_name_is_partial(const char *name);
+
+/**
+ * @brief Whether name matches the exact finalized-container leaf grammar
+ * container_finalize() can publish.
+ *
+ * This is the same grammar as container_name_is_partial(), without the
+ * ".partial" suffix.
+ *
+ * @param name A single path component (a leaf name, not a full path).
+ * @return Non-zero if name matches the finalized-container grammar, 0
+ *         otherwise (including a NULL name).
+ */
+int container_name_is_final(const char *name);
+
 #endif

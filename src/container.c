@@ -455,3 +455,28 @@ void container_close(BackupContainer *container)
     container->dir_fd = -1;
     container->partial_fd = -1;
 }
+
+int container_name_is_partial(const char *name)
+{
+    if (name == NULL)
+        return 0;
+    char final_out[CONTAINER_NAME_MAX];
+    int suffix;
+    return parse_partial_name(name, final_out, &suffix) ? 1 : 0;
+}
+
+int container_name_is_final(const char *name)
+{
+    if (name == NULL)
+        return 0;
+
+    char partial_name[CONTAINER_NAME_MAX];
+    int n = snprintf(partial_name, sizeof(partial_name), "%s%s",
+                     name, CONTAINER_PARTIAL_SUFFIX);
+    if (n < 0 || (size_t)n >= sizeof(partial_name))
+        return 0;
+
+    char final_out[CONTAINER_NAME_MAX];
+    int suffix;
+    return parse_partial_name(partial_name, final_out, &suffix) ? 1 : 0;
+}
