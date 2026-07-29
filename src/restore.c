@@ -16,19 +16,11 @@
 #include "utils.h"
 #include "xdg.h"
 
-// The standard XDG "main directories" this codebase captures and restores.
-// Shared by both restore paths: legacy records them as "KEY=value" lines in
-// an unversioned manifest.txt; a v1 manifest records them as root-table
-// entries whose id is one of these same keys (docs/DECISIONS.md D16).
-static const char * const xdg_keys[]      = {
-    "XDG_DOCUMENTS_DIR", "XDG_DOWNLOAD_DIR", "XDG_PICTURES_DIR",
-    "XDG_DESKTOP_DIR",   "XDG_VIDEOS_DIR",   "XDG_MUSIC_DIR"
-};
-static const char * const xdg_fallbacks[] = {
-    "Documents", "Downloads", "Pictures",
-    "Desktop",   "Videos",   "Music"
-};
-enum { XDG_RESTORE_COUNT = 6 };
+// The canonical XDG key/fallback table (xdg.h) is shared by both restore
+// paths: legacy records them as "KEY=value" lines in an unversioned
+// manifest.txt; a v1 manifest records them as root-table entries whose id is
+// one of these same keys (docs/DECISIONS.md D16).
+#define XDG_RESTORE_COUNT XDG_KEY_COUNT
 
 static int xdg_key_index(const char *id)
 {

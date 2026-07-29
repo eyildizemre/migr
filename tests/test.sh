@@ -616,6 +616,51 @@ test_truncation() {
         echo "  exit=$too_deep_rc output: $too_deep_out"
         exit 1
     fi
+
+    # A HOME whose canonical (realpath) form is short and valid, but whose raw
+    # lexical form is far past PATH_MAX (many "/a/.." segments that cancel out
+    # under resolution), must succeed exactly as the short canonical form
+    # would. Regression for backup.c resolving the legacy manifest's XDG
+    # basenames against the raw environment value instead of the same
+    # canonicalized HOME the planner already validated: that raw value could
+    # overflow PATH_MAX on its own even when the canonical form does not,
+    # failing only after the dated backup directory (and packages.txt) had
+    # already been created.
+    local canon_base="$TEST_DIR/canon_home" canon_raw
+    local canon_state="$canon_base/.local/state"
+    local canon_cache="$canon_base/.cache"
+    local canon_config="$canon_base/.config"
+    mkdir -p "$canon_base/a" "$canon_state" "$canon_cache" "$canon_config"
+    canon_raw="$canon_base"
+    while [ ${#canon_raw} -lt 4200 ]; do
+        canon_raw="$canon_raw/a/.."
+    done
+
+    local canon_backup="$TEST_DIR/canon_backup"
+    mkdir -p "$canon_backup"
+    local canon_out
+    # Keep the package manager's own state/cache/config paths canonical so this
+    # fixture measures migr's HOME normalization rather than an external tool's
+    # handling of the deliberately pathological lexical spelling.
+    canon_out=$(env HOME="$canon_raw" \
+                    XDG_STATE_HOME="$canon_state" \
+                    XDG_CACHE_HOME="$canon_cache" \
+                    XDG_CONFIG_HOME="$canon_config" \
+                    ../migr backup "$canon_backup" --critical 2>&1)
+    assert_contains "$canon_out" "Backup complete"
+
+    local canon_actual
+    canon_actual=$(find "$canon_backup" -maxdepth 1 -name 'migr_backup_*' -type d | head -1)
+    if [ -n "$canon_actual" ] &&
+       [ -f "$canon_actual/packages.txt" ] &&
+       grep -q "XDG_DOCUMENTS_DIR=" "$canon_actual/manifest.txt" 2>/dev/null &&
+       [[ "$canon_out" != *"Error:"* ]]; then
+        echo -e "  ${GREEN}✓${NC} A canonically-short-but-lexically-long HOME backs up cleanly, packages and manifest included."
+    else
+        echo -e "  ${RED}✗${NC} Expected a full backup+manifest even though raw \$HOME was lexically past PATH_MAX"
+        echo "  output: $canon_out"
+        exit 1
+    fi
 }
 
 test_restore_path_safety() {

@@ -19,7 +19,9 @@ typedef enum {
  *
  * @param target Destination directory; the dated backup subdirectory is created inside it.
  * @param mode   Selects which files are included (BACKUP_CRITICAL, BACKUP_COMPREHENSIVE, or BACKUP_EXPLICIT_PATHS).
- * @param paths  NULL-terminated array of absolute paths; required when mode is BACKUP_EXPLICIT_PATHS, ignored otherwise.
+ * @param paths  NULL-terminated array of paths (absolute, or relative to the
+ *               current working directory); required when mode is
+ *               BACKUP_EXPLICIT_PATHS, ignored otherwise.
  * @return 0 on success, 1 on error.
  */
 int backup(const char *target, BackupMode mode, char **paths);

@@ -2,6 +2,18 @@
 #define XDG_H
 
 /**
+ * @brief The standard XDG "main directories" this codebase captures and
+ * restores, in a single canonical order shared by every caller (backup's
+ * root planner, legacy manifest read/write, and restore) so the key set is
+ * never redefined more than once.
+ *
+ * Note: the XDG key for downloads is XDG_DOWNLOAD_DIR (singular).
+ */
+#define XDG_KEY_COUNT 6
+extern const char * const xdg_keys[XDG_KEY_COUNT];
+extern const char * const xdg_fallbacks[XDG_KEY_COUNT];
+
+/**
  * @brief Parses ~/.config/user-dirs.dirs and resolves XDG directory keys in one pass.
  *
  * Searches the config file for each key in keys[] and expands the value:

@@ -9,6 +9,7 @@
 #include <errno.h>
 
 #include "backup.h"
+#include "backup_plan.h"
 #include "fileops.h"
 #include "fsprobe.h"
 #include "manifest.h"
@@ -157,18 +158,31 @@ static int clone_item(const CloneContext *ctx, const char *src, const char *dest
     return 0;
 }
 
-// Clone a home-relative path (e.g. ".config/google-chrome") into backup_dir,
-// preserving the directory structure. Returns 1 if copied, 0 if not found, -1 on error.
-static int clone_nested(const CloneContext *ctx, const char *home, const char *backup_dir, const char *rel_path)
+// Clones a known-existing source into backup_dir/rel_path, preserving
+// rel_path's own directory structure (its parent components, e.g. ".config",
+// are created first). Unlike the flat clone_item(), rel_path may itself
+// contain '/'.
+//
+// src is the caller's already-resolved, already-verified source address
+// (BackupPlanRoot.capture_path) -- never re-derived from home+rel_path here,
+// and checked with lstat() rather than a symlink-following stat(): the plan
+// already proved this exact object (a dangling symlink included) exists, so
+// re-deriving the path and re-stat()ing it could silently disagree with the
+// plan for a dangling leaf symlink, dropping a promised root without ever
+// reporting an error. A source that has genuinely vanished (or become
+// inaccessible) since planning is therefore a real error here, never a
+// silent "not found, skip" -- the plan already promised this root would be
+// captured. Returns 1 if copied, -1 on error.
+static int clone_nested(const CloneContext *ctx, const char *src, const char *backup_dir, const char *rel_path)
 {
-    char src[PATH_MAX], dest[PATH_MAX];
-    if (path_join(src, sizeof(src), home, rel_path) != 0)
-        return -1;
-
     struct stat st;
-    if (stat(src, &st) != 0)
-        return 0;
+    if (lstat(src, &st) != 0)
+    {
+        printf("Error: Could not access %s\n", src);
+        return -1;
+    }
 
+    char dest[PATH_MAX];
     if (path_join(dest, sizeof(dest), backup_dir, rel_path) != 0)
         return -1;
 
@@ -201,6 +215,79 @@ static int clone_nested(const CloneContext *ctx, const char *home, const char *b
     return 1;
 }
 
+// Transitional flat-layout compatibility gates (docs/DECISIONS.md D16
+// roadmap): the planner itself accepts two explicit roots sharing a
+// basename, and a "/" MANUAL_NATIVE root, as legitimate distinct roots --
+// but today's writer still clones every root to a single flat
+// backup_dir/<basename>, which cannot represent either. Both checks belong
+// here, not in backup_plan.c, and must be deleted outright once A2.6's
+// data/EXPLICIT_n addressing replaces this writer.
+static int flat_layout_incompatible(const BackupPlan *plan)
+{
+    for (int i = 0; i < plan->root_count; i++)
+    {
+        if (plan->roots[i].group != BACKUP_ROOT_EXPLICIT)
+            continue;
+
+        const char *name_i;
+        size_t len_i = path_leaf(plan->roots[i].capture_path, &name_i);
+        if (len_i == 0)
+        {
+            printf("Error: '%s' has no destination name; the current flat backup layout "
+                   "cannot represent it.\n", plan->roots[i].capture_path);
+            return 1;
+        }
+
+        for (int j = i + 1; j < plan->root_count; j++)
+        {
+            if (plan->roots[j].group != BACKUP_ROOT_EXPLICIT)
+                continue;
+
+            const char *name_j;
+            size_t len_j = path_leaf(plan->roots[j].capture_path, &name_j);
+            if (len_i == len_j && memcmp(name_i, name_j, len_i) == 0)
+            {
+                printf("Error: these paths share the name '%.*s' and would overwrite each other:\n",
+                       (int)len_i, name_i);
+                printf("  %s\n  %s\n", plan->roots[i].capture_path, plan->roots[j].capture_path);
+                printf("Rename one or back them up separately.\n");
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+// Clones one planned root according to its presentation group: MAIN and
+// EXPLICIT roots are flat-copied by basename (clone_item); DOTFILE and
+// BROWSER roots preserve their home-relative structure (clone_nested), since
+// several of them nest under a shared parent (e.g. ".config/google-chrome").
+// Both pass root->capture_path -- the plan's own already-verified source
+// address -- directly; neither re-derives or re-classifies it.
+static void clone_plan_root(const CloneContext *ctx, const char *backup_dir,
+                           const BackupPlanRoot *root, int *count, int *had_error)
+{
+    if (root->group == BACKUP_ROOT_DOTFILE || root->group == BACKUP_ROOT_BROWSER)
+    {
+        if (clone_nested(ctx, root->capture_path, backup_dir, root->manifest_root.restore_path) > 0)
+            (*count)++;
+        else
+            *had_error = 1;
+        return;
+    }
+
+    if (clone_item(ctx, root->capture_path, backup_dir) == 0)
+        (*count)++;
+    else
+        *had_error = 1;
+}
+
+static void free_xdg_dirs_arr(char **dirs)
+{
+    for (int i = 0; i < XDG_KEY_COUNT; i++)
+        free(dirs[i]);
+}
+
 int backup(const char *target, BackupMode mode, char **paths)
 {
     char *home = getenv("HOME");
@@ -210,48 +297,45 @@ int backup(const char *target, BackupMode mode, char **paths)
         return 1;
     }
 
-    if (mode == BACKUP_EXPLICIT_PATHS && (paths == NULL || paths[0] == NULL))
+    // The plan is built before anything about the destination is even looked
+    // at: it is read-only over the source side (never touches target, never
+    // reads dry_run), so a rejected plan -- live or --dry-run alike -- never
+    // creates or mutates anything (docs/DECISIONS.md D16 roadmap, A2.5).
+    BackupPlan plan;
+    if (backup_plan_build(home, mode, (const char *const *)paths, &plan) != 0)
+        return 1;
+
+    if (flat_layout_incompatible(&plan))
     {
-        printf("Error: explicit-paths mode requires at least one path argument.\n");
+        backup_plan_free(&plan);
         return 1;
     }
 
-    // Two explicit paths that share a basename would clone to the same destination
-    // name and silently overwrite (files) or merge (directories). Refuse rather than
-    // lose data. Deterministic disambiguation is planned with the sidecar's EXPLICIT_n
-    // roots; until then, refusing is the safe behaviour.
-    if (mode == BACKUP_EXPLICIT_PATHS)
+    // The legacy manifest.txt format always records all six XDG basenames,
+    // including roots --critical does not capture. They therefore still need
+    // a resolution separate from the selected plan roots, but use the shared
+    // canonical key table and the same canonical HOME basis. Resolve them
+    // before any destination mutation -- not after the dated directory,
+    // packages, or copies already exist -- so a lexically long raw HOME cannot
+    // make this legacy-only step fail after the planner already succeeded
+    // (docs/DECISIONS.md D16 roadmap).
+    char *xdg_dirs[XDG_KEY_COUNT] = { NULL };
+    const char *basenames[XDG_KEY_COUNT] = { NULL };
+    if (mode != BACKUP_EXPLICIT_PATHS)
     {
-        for (int i = 0; paths[i] != NULL; i++)
+        char home_real[PATH_MAX];
+        if (realpath(home, home_real) == NULL ||
+            xdg_resolve(home_real, xdg_keys, xdg_fallbacks, xdg_dirs, XDG_KEY_COUNT) != 0)
         {
-            const char *name;
-            if (path_leaf(paths[i], &name) == 0)
-            {
-                printf("Error: explicit path has no destination name: %s\n", paths[i]);
-                return 1;
-            }
+            printf("Error: HOME path too long to resolve user directories\n");
+            free_xdg_dirs_arr(xdg_dirs);
+            backup_plan_free(&plan);
+            return 1;
         }
-
-        for (int i = 0; paths[i] != NULL; i++)
+        for (int i = 0; i < XDG_KEY_COUNT; i++)
         {
-            const char *left_name;
-            size_t left_len = path_leaf(paths[i], &left_name);
-
-            for (int j = i + 1; paths[j] != NULL; j++)
-            {
-                const char *right_name;
-                size_t right_len = path_leaf(paths[j], &right_name);
-
-                if (left_len == right_len &&
-                    memcmp(left_name, right_name, left_len) == 0)
-                {
-                    printf("Error: these paths share the name '%.*s' and would overwrite each other:\n",
-                           (int)left_len, left_name);
-                    printf("  %s\n  %s\n", paths[i], paths[j]);
-                    printf("Rename one or back them up separately.\n");
-                    return 1;
-                }
-            }
+            const char *last_slash = strrchr(xdg_dirs[i], '/');
+            basenames[i] = last_slash ? last_slash + 1 : xdg_dirs[i];
         }
     }
 
@@ -265,12 +349,18 @@ int backup(const char *target, BackupMode mode, char **paths)
     if (dir_len < 0 || (size_t)dir_len >= sizeof(backup_dir))
     {
         printf("Error: Backup path too long: %s\n", target);
+        free_xdg_dirs_arr(xdg_dirs);
+        backup_plan_free(&plan);
         return 1;
     }
 
     int target_created = 0;
     if (ensure_target_root(target, &target_created) != 0)
+    {
+        free_xdg_dirs_arr(xdg_dirs);
+        backup_plan_free(&plan);
         return 1;
+    }
 
     // Probe the destination and choose a representation before creating anything more.
     // --dry-run skips it: the probe writes to the destination, which would break the
@@ -286,12 +376,16 @@ int backup(const char *target, BackupMode mode, char **paths)
         {
             printf("Error: could not probe the destination filesystem at %s\n", target);
             if (target_created) rmdir(target);
+            free_xdg_dirs_arr(xdg_dirs);
+            backup_plan_free(&plan);
             return 1;
         }
         if (select_representation(&profile, &repr) != 0)
         {
             printf("Error: the destination filesystem at %s is not usable for backup\n", target);
             if (target_created) rmdir(target);
+            free_xdg_dirs_arr(xdg_dirs);
+            backup_plan_free(&plan);
             return 1;
         }
         if (repr != CLONE_NATIVE_TREE)
@@ -299,6 +393,8 @@ int backup(const char *target, BackupMode mode, char **paths)
             printf("Error: %s cannot natively hold Linux file metadata, and portable mode is "
                    "not implemented yet — refusing rather than losing it.\n", target);
             if (target_created) rmdir(target);
+            free_xdg_dirs_arr(xdg_dirs);
+            backup_plan_free(&plan);
             return 1;
         }
     }
@@ -306,6 +402,8 @@ int backup(const char *target, BackupMode mode, char **paths)
     if (create_dir(backup_dir) != 0)
     {
         if (target_created) rmdir(target);
+        free_xdg_dirs_arr(xdg_dirs);
+        backup_plan_free(&plan);
         return 1;
     }
 
@@ -314,7 +412,6 @@ int backup(const char *target, BackupMode mode, char **paths)
 
     printf("Backing up to: %s\n\n", backup_dir);
 
-    struct stat st;
     int count = 0;
     int had_error = 0; // set when any file copy fails, so success is never faked
 
@@ -324,125 +421,25 @@ int backup(const char *target, BackupMode mode, char **paths)
     if (mode == BACKUP_EXPLICIT_PATHS)
     {
         printf("[Explicit Paths]\n");
-        for (int i = 0; paths[i] != NULL; i++)
-        {
-            if (stat(paths[i], &st) == 0)
-            {
-                if (clone_item(&ctx, paths[i], backup_dir) == 0)
-                    count++;
-                else
-                    had_error = 1;
-            }
-            else
-            {
-                printf("  Warning: Path not found, skipping: %s\n", paths[i]);
-            }
-        }
+        for (int i = 0; i < plan.root_count; i++)
+            clone_plan_root(&ctx, backup_dir, &plan.roots[i], &count, &had_error);
     }
     else
     {
-        // Resolve localized XDG directory paths from ~/.config/user-dirs.dirs;
-        // silently falls back to English names if the file is absent or a key is missing.
-        // Note: the XDG key for downloads is XDG_DOWNLOAD_DIR (singular).
-        static const char * const xdg_keys[]      = {
-            "XDG_DOCUMENTS_DIR", "XDG_DOWNLOAD_DIR", "XDG_PICTURES_DIR",
-            "XDG_DESKTOP_DIR",   "XDG_VIDEOS_DIR",   "XDG_MUSIC_DIR"
-        };
-        static const char * const xdg_fallbacks[] = {
-            "Documents", "Downloads", "Pictures",
-            "Desktop",   "Videos",   "Music"
-        };
-        enum { XDG_DIR_COUNT = 6 };
-        char *xdg_dirs[XDG_DIR_COUNT];
-        if (xdg_resolve(home, xdg_keys, xdg_fallbacks, xdg_dirs, XDG_DIR_COUNT) != 0)
-        {
-            printf("Error: HOME path too long to resolve user directories\n");
-            for (int i = 0; i < XDG_DIR_COUNT; i++)
-                free(xdg_dirs[i]);
-            return 1;
-        }
-
-        // Capture basenames for cross-locale restoration (e.g. "/home/user/Belgeler" -> "Belgeler").
-        // Instead of allocating new memory, use pointer arithmetic to point directly 
-        // to the character following the last '/' in the existing path string.
-        const char *basenames[XDG_DIR_COUNT];
-        for (int i = 0; i < XDG_DIR_COUNT; i++)
-        {
-            const char *last_slash = strrchr(xdg_dirs[i], '/');
-            basenames[i] = last_slash ? last_slash + 1 : xdg_dirs[i];
-        }
-
-        // Projects is not a standard XDG directory
-        char projects_path[PATH_MAX];
-        if (path_join(projects_path, sizeof(projects_path), home, "Projects") != 0)
-        {
-            printf("Error: Home path too long to build Projects path\n");
-            for (int i = 0; i < XDG_DIR_COUNT; i++)
-                free(xdg_dirs[i]);
-            return 1;
-        }
-
-        // indices: 0=Documents 1=Downloads 2=Pictures 3=Desktop 4=Videos 5=Music
-        // NULL terminators are used to mark the end of the arrays for iteration
-        const char *critical_dirs[]      = {xdg_dirs[0], xdg_dirs[1], xdg_dirs[2], NULL};
-        const char *comprehensive_dirs[] = {xdg_dirs[0], xdg_dirs[1], xdg_dirs[2],
-                                            xdg_dirs[3], xdg_dirs[4], xdg_dirs[5], projects_path, NULL};
-        const char *dotfiles[]           = {".ssh", ".gnupg", ".gitconfig", ".bashrc", ".profile", NULL};
-
-        // main_dirs acts as a pointer to the first char* element of the selected array
-        const char **main_dirs = (mode == BACKUP_COMPREHENSIVE) ? comprehensive_dirs : critical_dirs;
-
-        char src[PATH_MAX];
-
         printf("[Main Directories]\n");
-        for (int i = 0; main_dirs[i] != NULL; i++) // NULL terminator indicates end of array
-        {
-            // main_dirs[i] is a full absolute path from xdg_resolve (or projects_path)
-            if (stat(main_dirs[i], &st) == 0)
-            {
-                if (clone_item(&ctx, main_dirs[i], backup_dir) == 0)
-                    count++;
-                else
-                    had_error = 1;
-            }
-        }
+        for (int i = 0; i < plan.root_count; i++)
+            if (plan.roots[i].group == BACKUP_ROOT_MAIN)
+                clone_plan_root(&ctx, backup_dir, &plan.roots[i], &count, &had_error);
 
         printf("\n[Dotfiles]\n");
-        for (int i = 0; dotfiles[i] != NULL; i++)
-        {
-            if (path_join(src, sizeof(src), home, dotfiles[i]) != 0)
-            {
-                printf("  Warning: path too long, skipping: %s/%s\n", home, dotfiles[i]);
-                had_error = 1;
-                continue;
-            }
-            if (stat(src, &st) == 0)
-            {
-                if (clone_item(&ctx, src, backup_dir) == 0)
-                    count++;
-                else
-                    had_error = 1;
-            }
-        }
-
-        const char *browser_configs[] = {
-            ".mozilla",
-            ".config/google-chrome",
-            ".config/chromium",
-            ".config/BraveSoftware",
-            ".config/vivaldi",
-            ".config/microsoft-edge",
-            ".config/opera",
-            NULL
-        };
+        for (int i = 0; i < plan.root_count; i++)
+            if (plan.roots[i].group == BACKUP_ROOT_DOTFILE)
+                clone_plan_root(&ctx, backup_dir, &plan.roots[i], &count, &had_error);
 
         printf("\n[Browser Profiles]\n");
-        for (int i = 0; browser_configs[i] != NULL; i++)
-        {
-            int r = clone_nested(&ctx, home, backup_dir, browser_configs[i]);
-            if (r > 0) count++;
-            else if (r < 0) had_error = 1;
-        }
+        for (int i = 0; i < plan.root_count; i++)
+            if (plan.roots[i].group == BACKUP_ROOT_BROWSER)
+                clone_plan_root(&ctx, backup_dir, &plan.roots[i], &count, &had_error);
 
         printf("\n[Packages]\n");
         char pkg_path[PATH_MAX];
@@ -459,11 +456,11 @@ int backup(const char *target, BackupMode mode, char **paths)
         if (dry_run)
             printf("  Would write manifest: %s/manifest.txt\n", backup_dir);
         else
-            legacy_manifest_write(backup_dir, basenames, XDG_DIR_COUNT);
-
-        for (int i = 0; i < XDG_DIR_COUNT; i++)
-            free(xdg_dirs[i]);
+            legacy_manifest_write(backup_dir, basenames, XDG_KEY_COUNT);
     }
+
+    free_xdg_dirs_arr(xdg_dirs);
+    backup_plan_free(&plan);
 
     printf("\n===========================================================\n");
     if (dry_run)

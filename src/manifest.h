@@ -118,7 +118,9 @@ typedef struct {
     char id[MANIFEST_ID_MAX];        /**< e.g. "EXPLICIT_0" or an XDG key such as "XDG_DOCUMENTS_DIR". */
     RootPolicy policy;
     char payload_path[PATH_MAX];     /**< Location under the container's data/, relative. */
-    char source_path[PATH_MAX];      /**< Source-side identity: XDG basename, home-relative path, or absolute path. */
+    char source_path[PATH_MAX];      /**< Source-side identity: a home-relative path for
+                                           ROOT_POLICY_HOME_RELATIVE, or a normalized absolute
+                                           capture address for ROOT_POLICY_XDG/ROOT_POLICY_MANUAL_NATIVE. */
     char restore_path[PATH_MAX];     /**< Target-side restore address; meaningful only when has_restore_path. */
     int has_restore_path;
 } ManifestRoot;

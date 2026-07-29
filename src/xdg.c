@@ -7,6 +7,15 @@
 #include "xdg.h"
 #include "utils.h" // path_join
 
+const char * const xdg_keys[XDG_KEY_COUNT]      = {
+    "XDG_DOCUMENTS_DIR", "XDG_DOWNLOAD_DIR", "XDG_PICTURES_DIR",
+    "XDG_DESKTOP_DIR",   "XDG_VIDEOS_DIR",   "XDG_MUSIC_DIR"
+};
+const char * const xdg_fallbacks[XDG_KEY_COUNT] = {
+    "Documents", "Downloads", "Pictures",
+    "Desktop",   "Videos",   "Music"
+};
+
 int xdg_resolve(const char *home,
                 const char * const *keys,
                 const char * const *fallbacks,
