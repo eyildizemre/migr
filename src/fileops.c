@@ -33,7 +33,7 @@ static int preserve_metadata(const char *path, const struct stat *st)
 
 // The recursive clone core. Direction-agnostic today; the CloneContext is threaded so
 // later phases can branch on it (e.g. a backup writing a sidecar) without re-plumbing.
-// Reached only through the backup_capture / restore_native public entries below.
+// Reached only through backup_capture below.
 static int clone_tree(const CloneContext *ctx, const char *src, const char *dest)
 {
     struct stat st;
@@ -213,12 +213,714 @@ int backup_capture(const CloneContext *ctx, const char *src, const char *dest)
     return clone_tree(ctx, src, dest);
 }
 
-int restore_native(const CloneContext *ctx, const char *src, const char *dest)
+/* ========================================================================= */
+/* FD-anchored native restore core (docs/DECISIONS.md D15 and D16).          */
+/*                                                                          */
+/* Deliberately independent of clone_tree() above: backup_capture() and its */
+/* walker are unchanged by this section. Both the source payload and the    */
+/* destination are treated as untrusted -- every intermediate is opened by  */
+/* directory fd with O_NOFOLLOW, a path component is never re-resolved by   */
+/* string, and a symlink at the final address is refused rather than        */
+/* written through.                                                        */
+/* ========================================================================= */
+
+// A path component can never be longer than NAME_MAX; sizing leaf buffers to
+// this (rather than PATH_MAX) is what lets the walker below proceed
+// component-by-component without ever concatenating a full path string.
+#define RESTORE_LEAF_MAX (NAME_MAX + 1)
+
+typedef enum {
+    RESTORE_RESOLVE_ERROR = -1,
+    RESTORE_RESOLVE_MISSING = 0,
+    RESTORE_RESOLVE_OK = 1
+} RestoreResolveResult;
+
+typedef enum {
+    RESTORE_VALIDATE,
+    RESTORE_APPLY
+} RestorePass;
+
+// Validates a relative address before any traversal is attempted: a leading
+// '/', any ".." component, a bare ".", or an empty interior/trailing
+// component (e.g. "a//b" or "a/") are all refused outright -- never
+// normalized into some other, unintended address. Does not accept an
+// overall empty string; callers special-case "" as "the root object itself"
+// before ever reaching this function, since it names zero components, not
+// one rejected empty component.
+static int relative_path_is_safe(const char *rel)
 {
-    if (ctx == NULL || ctx->operation != CLONE_RESTORE ||
-        ctx->representation != CLONE_NATIVE_TREE)
+    if (rel[0] == '/')
+        return 0;
+
+    size_t start = 0;
+    size_t len = strlen(rel);
+    for (size_t i = 0; i <= len; i++)
+    {
+        if (rel[i] == '/' || rel[i] == '\0')
+        {
+            size_t comp_len = i - start;
+            if (comp_len == 0)
+                return 0; // "//" or a trailing slash
+            if (comp_len == 1 && rel[start] == '.')
+                return 0;
+            if (comp_len == 2 && rel[start] == '.' && rel[start + 1] == '.')
+                return 0;
+            start = i + 1;
+        }
+    }
+    return 1;
+}
+
+static int fd_is_directory(int fd)
+{
+    struct stat st;
+    return fstat(fd, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static int same_object(const struct stat *left, const struct stat *right)
+{
+    return left->st_dev == right->st_dev && left->st_ino == right->st_ino;
+}
+
+static int copy_leaf_name(const char *rel, char *out_leaf, size_t leaf_size)
+{
+    const char *leaf = strrchr(rel, '/');
+    leaf = leaf == NULL ? rel : leaf + 1;
+    size_t len = strlen(leaf);
+    if (len >= leaf_size)
         return -1;
-    return clone_tree(ctx, src, dest);
+    memcpy(out_leaf, leaf, len + 1);
+    return 0;
+}
+
+// Walks every component before rel's leaf from root_fd. An OK result owns
+// *out_parent_fd; MISSING means a no-create walk encountered an absent
+// intermediate. Existing intermediate symlinks and wrong object types fail.
+static RestoreResolveResult resolve_parent(int root_fd, const char *rel,
+                                           int create_intermediates,
+                                           int *out_parent_fd,
+                                           char *out_leaf, size_t leaf_size)
+{
+    *out_parent_fd = -1;
+    if (copy_leaf_name(rel, out_leaf, leaf_size) != 0)
+        return RESTORE_RESOLVE_ERROR;
+
+    if (rel[0] == '\0')
+    {
+        int fd = fcntl(root_fd, F_DUPFD_CLOEXEC, 0);
+        if (fd < 0)
+            return RESTORE_RESOLVE_ERROR;
+        *out_parent_fd = fd;
+        return RESTORE_RESOLVE_OK;
+    }
+
+    int cur_fd = fcntl(root_fd, F_DUPFD_CLOEXEC, 0);
+    if (cur_fd < 0)
+        return RESTORE_RESOLVE_ERROR;
+
+    const char *p = rel;
+    for (;;)
+    {
+        const char *slash = strchr(p, '/');
+        size_t comp_len = slash ? (size_t)(slash - p) : strlen(p);
+
+        char comp[RESTORE_LEAF_MAX];
+        if (comp_len >= sizeof(comp))
+        {
+            close(cur_fd);
+            return RESTORE_RESOLVE_ERROR;
+        }
+        memcpy(comp, p, comp_len);
+        comp[comp_len] = '\0';
+
+        if (slash == NULL)
+        {
+            *out_parent_fd = cur_fd;
+            return RESTORE_RESOLVE_OK;
+        }
+
+        int next_fd = openat(cur_fd, comp,
+                             O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (next_fd < 0 && errno == ENOENT && create_intermediates)
+        {
+            if (mkdirat(cur_fd, comp, 0700) != 0 && errno != EEXIST)
+            {
+                close(cur_fd);
+                return RESTORE_RESOLVE_ERROR;
+            }
+            next_fd = openat(cur_fd, comp,
+                             O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        }
+        if (next_fd < 0)
+        {
+            int saved_errno = errno;
+            close(cur_fd);
+            if (!create_intermediates && saved_errno == ENOENT)
+                return RESTORE_RESOLVE_MISSING;
+            return RESTORE_RESOLVE_ERROR;
+        }
+
+        close(cur_fd);
+        cur_fd = next_fd;
+        p = slash + 1;
+    }
+}
+
+static int open_source_object(int source_parent_fd, const char *source_leaf,
+                              struct stat *st)
+{
+    int fd = source_leaf[0] == '\0'
+        ? fcntl(source_parent_fd, F_DUPFD_CLOEXEC, 0)
+        : openat(source_parent_fd, source_leaf, O_PATH | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    if (fstat(fd, st) != 0)
+    {
+        int saved_errno = errno;
+        close(fd);
+        errno = saved_errno;
+        return -1;
+    }
+    return fd;
+}
+
+static int destination_status(int dest_parent_fd, const char *dest_leaf,
+                              struct stat *st, int *exists)
+{
+    if (dest_parent_fd < 0)
+    {
+        *exists = 0;
+        return 0;
+    }
+
+    if (dest_leaf[0] == '\0')
+    {
+        if (fstat(dest_parent_fd, st) != 0)
+            return -1;
+        *exists = 1;
+        return 0;
+    }
+
+    if (fstatat(dest_parent_fd, dest_leaf, st, AT_SYMLINK_NOFOLLOW) == 0)
+    {
+        *exists = 1;
+        return 0;
+    }
+    if (errno == ENOENT)
+    {
+        *exists = 0;
+        return 0;
+    }
+    return -1;
+}
+
+static int open_source_regular(int source_parent_fd, const char *source_leaf,
+                               const struct stat *object_st, struct stat *opened_st)
+{
+    int fd = openat(source_parent_fd, source_leaf,
+                    O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    if (fstat(fd, opened_st) != 0 || !S_ISREG(opened_st->st_mode) ||
+        !same_object(object_st, opened_st))
+    {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static int open_destination_regular(int dest_parent_fd, const char *dest_leaf,
+                                    mode_t mode, struct stat *opened_st,
+                                    int *created)
+{
+    *created = 0;
+    for (int attempt = 0; attempt < 2; attempt++)
+    {
+        int fd = openat(dest_parent_fd, dest_leaf,
+                        O_WRONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
+        if (fd >= 0)
+        {
+            if (fstat(fd, opened_st) == 0 && S_ISREG(opened_st->st_mode))
+                return fd;
+            close(fd);
+            return -1;
+        }
+        if (errno != ENOENT)
+            return -1;
+
+        fd = openat(dest_parent_fd, dest_leaf,
+                    O_WRONLY | O_CREAT | O_EXCL | O_NONBLOCK |
+                    O_NOFOLLOW | O_CLOEXEC, mode);
+        if (fd >= 0)
+        {
+            if (fstat(fd, opened_st) == 0 && S_ISREG(opened_st->st_mode))
+            {
+                *created = 1;
+                return fd;
+            }
+            close(fd);
+            return -1;
+        }
+        if (errno != EEXIST)
+            return -1;
+    }
+    return -1;
+}
+
+static int open_source_directory(int source_object_fd,
+                                 const struct stat *object_st,
+                                 struct stat *opened_st)
+{
+    int fd = openat(source_object_fd, ".",
+                    O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    if (fstat(fd, opened_st) != 0 || !S_ISDIR(opened_st->st_mode) ||
+        !same_object(object_st, opened_st))
+    {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static int open_destination_directory(RestorePass pass,
+                                      int dest_parent_fd, const char *dest_leaf)
+{
+    if (dest_parent_fd < 0)
+        return pass == RESTORE_VALIDATE ? -2 : -1;
+    if (dest_leaf[0] == '\0')
+    {
+        int fd = fcntl(dest_parent_fd, F_DUPFD_CLOEXEC, 0);
+        if (fd < 0 || !fd_is_directory(fd))
+        {
+            if (fd >= 0)
+                close(fd);
+            return -1;
+        }
+        return fd;
+    }
+
+    int fd = openat(dest_parent_fd, dest_leaf,
+                    O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd >= 0)
+        return fd;
+    if (errno != ENOENT)
+        return -1;
+    if (pass == RESTORE_VALIDATE)
+        return -2;
+
+    if (mkdirat(dest_parent_fd, dest_leaf, 0700) != 0 && errno != EEXIST)
+        return -1;
+    return openat(dest_parent_fd, dest_leaf,
+                  O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+}
+
+static int open_destination_fifo(int dest_parent_fd, const char *dest_leaf,
+                                 mode_t mode, struct stat *opened_st)
+{
+    int fd = openat(dest_parent_fd, dest_leaf,
+                    O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0 && errno == ENOENT)
+    {
+        if (mkfifoat(dest_parent_fd, dest_leaf, mode) != 0 && errno != EEXIST)
+            return -1;
+        fd = openat(dest_parent_fd, dest_leaf,
+                    O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
+    }
+    if (fd < 0)
+        return -1;
+    if (fstat(fd, opened_st) == 0 && S_ISFIFO(opened_st->st_mode))
+        return fd;
+    close(fd);
+    return -1;
+}
+
+// The same recursive dispatcher serves mutation-free validation and the
+// actual restore. A negative destination parent means the corresponding
+// destination subtree does not exist during validation.
+static int restore_entry_at(RestorePass pass,
+                            int source_parent_fd, const char *source_leaf,
+                            int dest_parent_fd, const char *dest_leaf)
+{
+    int source_is_root = source_leaf[0] == '\0';
+    int dest_is_root = dest_leaf[0] == '\0';
+
+    struct stat source_st;
+    int source_object_fd = open_source_object(source_parent_fd, source_leaf,
+                                               &source_st);
+    if (source_object_fd < 0)
+        return -1;
+
+    struct stat dest_st;
+    int dest_exists;
+    if (destination_status(dest_parent_fd, dest_leaf, &dest_st,
+                           &dest_exists) != 0)
+    {
+        close(source_object_fd);
+        return -1;
+    }
+    if (dest_exists && S_ISLNK(dest_st.st_mode))
+    {
+        close(source_object_fd);
+        return -1;
+    }
+
+    if (S_ISLNK(source_st.st_mode))
+    {
+        if (source_is_root || dest_is_root || dest_exists)
+        {
+            close(source_object_fd);
+            return -1;
+        }
+
+        char target[PATH_MAX];
+        ssize_t len = readlinkat(source_object_fd, "", target, sizeof(target));
+        if (len < 0 || (size_t)len == sizeof(target))
+        {
+            close(source_object_fd);
+            return -1;
+        }
+        close(source_object_fd);
+        if (pass == RESTORE_VALIDATE)
+            return 0;
+
+        target[len] = '\0';
+        if (symlinkat(target, dest_parent_fd, dest_leaf) != 0)
+            return -1;
+
+        struct timespec times[2] = { source_st.st_atim, source_st.st_mtim };
+        return utimensat(dest_parent_fd, dest_leaf, times,
+                         AT_SYMLINK_NOFOLLOW) == 0 ? 0 : -1;
+    }
+
+    if (S_ISREG(source_st.st_mode))
+    {
+        if (source_is_root || dest_is_root ||
+            (dest_exists && !S_ISREG(dest_st.st_mode)))
+        {
+            close(source_object_fd);
+            return -1;
+        }
+
+        struct stat opened_source_st;
+        int src_fd = open_source_regular(source_parent_fd, source_leaf,
+                                         &source_st, &opened_source_st);
+        close(source_object_fd);
+        if (src_fd < 0)
+            return -1;
+        if (pass == RESTORE_VALIDATE)
+        {
+            close(src_fd);
+            return 0;
+        }
+
+        struct stat opened_dest_st;
+        int dest_created;
+        int dst_fd = open_destination_regular(dest_parent_fd, dest_leaf,
+                                               opened_source_st.st_mode & 07777,
+                                               &opened_dest_st, &dest_created);
+        if (dst_fd < 0)
+        {
+            close(src_fd);
+            return -1;
+        }
+        if (!dest_created &&
+            opened_dest_st.st_size == opened_source_st.st_size &&
+            opened_dest_st.st_mtim.tv_sec == opened_source_st.st_mtim.tv_sec)
+        {
+            close(src_fd);
+            close(dst_fd);
+            return 0;
+        }
+        if (ftruncate(dst_fd, 0) != 0)
+        {
+            close(src_fd);
+            close(dst_fd);
+            return -1;
+        }
+
+        char buffer[8192];
+        int failed = 0;
+        for (;;)
+        {
+            ssize_t bytes_read = read(src_fd, buffer, sizeof(buffer));
+            if (bytes_read == 0)
+                break;
+            if (bytes_read < 0)
+            {
+                failed = 1;
+                break;
+            }
+
+            ssize_t written = 0;
+            while (written < bytes_read)
+            {
+                ssize_t res = write(dst_fd, buffer + written, bytes_read - written);
+                if (res <= 0)
+                {
+                    failed = 1;
+                    break;
+                }
+                written += res;
+            }
+            if (failed)
+                break;
+        }
+
+        if (!failed)
+        {
+            struct timespec times[2] = {
+                opened_source_st.st_atim, opened_source_st.st_mtim
+            };
+            if (fchmod(dst_fd, opened_source_st.st_mode & 07777) != 0 ||
+                futimens(dst_fd, times) != 0)
+                failed = 1;
+        }
+
+        close(src_fd);
+        close(dst_fd);
+        return failed ? -1 : 0;
+    }
+
+    if (S_ISDIR(source_st.st_mode))
+    {
+        if (dest_exists && !S_ISDIR(dest_st.st_mode))
+        {
+            close(source_object_fd);
+            return -1;
+        }
+
+        struct stat opened_source_st;
+        int source_dir_fd = open_source_directory(source_object_fd, &source_st,
+                                                  &opened_source_st);
+        close(source_object_fd);
+        if (source_dir_fd < 0)
+            return -1;
+
+        int dest_dir_fd = open_destination_directory(pass, dest_parent_fd,
+                                                     dest_leaf);
+        if (dest_dir_fd == -1)
+        {
+            close(source_dir_fd);
+            return -1;
+        }
+        if (dest_dir_fd == -2)
+            dest_dir_fd = -1;
+
+        int scan_fd = fcntl(source_dir_fd, F_DUPFD_CLOEXEC, 0);
+        DIR *dirp = scan_fd < 0 ? NULL : fdopendir(scan_fd);
+        if (dirp == NULL)
+        {
+            if (scan_fd >= 0)
+                close(scan_fd);
+            close(source_dir_fd);
+            if (dest_dir_fd >= 0)
+                close(dest_dir_fd);
+            return -1;
+        }
+
+        int failed = 0;
+        for (;;)
+        {
+            errno = 0;
+            struct dirent *entry = readdir(dirp);
+            if (entry == NULL)
+            {
+                if (errno != 0)
+                    failed = 1;
+                break;
+            }
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+                continue;
+            if (restore_entry_at(pass, source_dir_fd, entry->d_name,
+                                 dest_dir_fd, entry->d_name) != 0)
+            {
+                failed = 1;
+                break;
+            }
+        }
+        closedir(dirp);
+
+        if (!failed && pass == RESTORE_APPLY)
+        {
+            struct timespec times[2] = {
+                opened_source_st.st_atim, opened_source_st.st_mtim
+            };
+            if (fchmod(dest_dir_fd, opened_source_st.st_mode & 07777) != 0 ||
+                futimens(dest_dir_fd, times) != 0)
+                failed = 1;
+        }
+
+        close(source_dir_fd);
+        if (dest_dir_fd >= 0)
+            close(dest_dir_fd);
+        return failed ? -1 : 0;
+    }
+
+    if (S_ISFIFO(source_st.st_mode))
+    {
+        if (source_is_root || dest_is_root ||
+            (dest_exists && !S_ISFIFO(dest_st.st_mode)))
+        {
+            close(source_object_fd);
+            return -1;
+        }
+        close(source_object_fd);
+
+        if (pass == RESTORE_VALIDATE)
+            return 0;
+
+        struct stat opened_dest_st;
+        int dest_fd = open_destination_fifo(dest_parent_fd, dest_leaf,
+                                            source_st.st_mode & 07777,
+                                            &opened_dest_st);
+        if (dest_fd < 0)
+            return -1;
+        struct timespec times[2] = { source_st.st_atim, source_st.st_mtim };
+        int rc = (fchmod(dest_fd, source_st.st_mode & 07777) == 0 &&
+                  futimens(dest_fd, times) == 0) ? 0 : -1;
+        close(dest_fd);
+        return rc;
+    }
+
+    if (S_ISSOCK(source_st.st_mode))
+    {
+        close(source_object_fd);
+        if (pass == RESTORE_APPLY)
+            printf("  Warning: skipping socket (runtime-only)%s%s\n",
+                   source_leaf[0] ? ": " : "", source_leaf);
+        return 0;
+    }
+    if (S_ISCHR(source_st.st_mode) || S_ISBLK(source_st.st_mode))
+    {
+        close(source_object_fd);
+        if (pass == RESTORE_APPLY)
+            printf("  Warning: skipping %s device node%s%s\n",
+                   S_ISCHR(source_st.st_mode) ? "character" : "block",
+                   source_leaf[0] ? ": " : "", source_leaf);
+        return 0;
+    }
+
+    close(source_object_fd);
+    return -1;
+}
+
+static int restore_arguments_valid(const CloneContext *ctx,
+                                   int source_root_fd, const char *source_rel,
+                                   int destination_root_fd, const char *destination_rel)
+{
+    if (ctx == NULL || ctx->operation != CLONE_RESTORE || ctx->representation != CLONE_NATIVE_TREE)
+        return 0;
+    if (source_root_fd < 0 || destination_root_fd < 0 ||
+        source_rel == NULL || destination_rel == NULL)
+        return 0;
+    if (!fd_is_directory(source_root_fd) || !fd_is_directory(destination_root_fd))
+        return 0;
+    if (source_rel[0] != '\0' && !relative_path_is_safe(source_rel))
+        return 0;
+    if (destination_rel[0] != '\0' && !relative_path_is_safe(destination_rel))
+        return 0;
+    return 1;
+}
+
+RestoreSourceStatus restore_native_source_status_at(int source_root_fd,
+                                                     const char *source_rel)
+{
+    if (source_root_fd < 0 || source_rel == NULL ||
+        !fd_is_directory(source_root_fd))
+        return RESTORE_SOURCE_ERROR;
+    if (source_rel[0] != '\0' && !relative_path_is_safe(source_rel))
+        return RESTORE_SOURCE_ERROR;
+
+    int source_parent_fd = -1;
+    char source_leaf[RESTORE_LEAF_MAX];
+    RestoreResolveResult result =
+        resolve_parent(source_root_fd, source_rel, 0, &source_parent_fd,
+                       source_leaf, sizeof(source_leaf));
+    if (result == RESTORE_RESOLVE_MISSING)
+        return RESTORE_SOURCE_MISSING;
+    if (result != RESTORE_RESOLVE_OK)
+        return RESTORE_SOURCE_ERROR;
+
+    struct stat st;
+    int object_fd = open_source_object(source_parent_fd, source_leaf, &st);
+    int saved_errno = errno;
+    close(source_parent_fd);
+    if (object_fd >= 0)
+    {
+        close(object_fd);
+        return RESTORE_SOURCE_PRESENT;
+    }
+    return saved_errno == ENOENT
+        ? RESTORE_SOURCE_MISSING
+        : RESTORE_SOURCE_ERROR;
+}
+
+int restore_native_preflight_at(const CloneContext *ctx,
+                                int source_root_fd, const char *source_rel,
+                                int destination_root_fd, const char *destination_rel)
+{
+    if (!restore_arguments_valid(ctx, source_root_fd, source_rel,
+                                 destination_root_fd, destination_rel))
+        return -1;
+
+    int source_parent_fd = -1;
+    char source_leaf[RESTORE_LEAF_MAX];
+    if (resolve_parent(source_root_fd, source_rel, 0, &source_parent_fd,
+                       source_leaf, sizeof(source_leaf)) != RESTORE_RESOLVE_OK)
+        return -1;
+
+    int dest_parent_fd = -1;
+    char dest_leaf[RESTORE_LEAF_MAX];
+    RestoreResolveResult dest_result =
+        resolve_parent(destination_root_fd, destination_rel, 0,
+                       &dest_parent_fd, dest_leaf, sizeof(dest_leaf));
+    if (dest_result == RESTORE_RESOLVE_ERROR)
+    {
+        close(source_parent_fd);
+        return -1;
+    }
+
+    int rc = restore_entry_at(RESTORE_VALIDATE, source_parent_fd, source_leaf,
+                              dest_parent_fd, dest_leaf);
+
+    close(source_parent_fd);
+    if (dest_parent_fd >= 0)
+        close(dest_parent_fd);
+    return rc;
+}
+
+int restore_native_at(const CloneContext *ctx,
+                      int source_root_fd, const char *source_rel,
+                      int destination_root_fd, const char *destination_rel)
+{
+    if (restore_native_preflight_at(ctx, source_root_fd, source_rel,
+                                    destination_root_fd, destination_rel) != 0)
+        return -1;
+
+    int source_parent_fd = -1;
+    char source_leaf[RESTORE_LEAF_MAX];
+    if (resolve_parent(source_root_fd, source_rel, 0, &source_parent_fd,
+                       source_leaf, sizeof(source_leaf)) != RESTORE_RESOLVE_OK)
+        return -1;
+
+    int dest_parent_fd = -1;
+    char dest_leaf[RESTORE_LEAF_MAX];
+    if (resolve_parent(destination_root_fd, destination_rel, 1,
+                       &dest_parent_fd, dest_leaf,
+                       sizeof(dest_leaf)) != RESTORE_RESOLVE_OK)
+    {
+        close(source_parent_fd);
+        return -1;
+    }
+
+    int rc = restore_entry_at(RESTORE_APPLY, source_parent_fd, source_leaf,
+                              dest_parent_fd, dest_leaf);
+    close(source_parent_fd);
+    close(dest_parent_fd);
+    return rc;
 }
 
 int get_dir_size(const char *path, off_t *size)

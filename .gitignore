@@ -6,4 +6,5 @@ tests/test_special_files
 tests/test_fsprobe
 tests/test_manifest
 tests/test_container
+tests/test_restore_native
 docs/TODO.md

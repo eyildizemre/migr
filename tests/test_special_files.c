@@ -154,15 +154,16 @@ int main(void)
     // is checked independently for the refusal; one final check confirms that no refused
     // call wrote anything (dest_device is absent — the device above was skipped). Keeping
     // the "no write" assertion separate stops one broken entry from poisoning the others.
-    CloneContext restore_ctx = { .operation = CLONE_RESTORE, .representation = CLONE_NATIVE_TREE };
     CloneContext portable_ctx = { .operation = CLONE_BACKUP, .representation = CLONE_PORTABLE_SIDECAR };
 
     check(backup_capture(NULL, src_fifo, dest_device) == -1,
           "backup_capture refuses a NULL context");
+    CloneContext restore_ctx = {
+        .operation = CLONE_RESTORE,
+        .representation = CLONE_NATIVE_TREE
+    };
     check(backup_capture(&restore_ctx, src_fifo, dest_device) == -1,
           "backup_capture refuses a restore context");
-    check(restore_native(&ctx, src_fifo, dest_device) == -1,
-          "restore_native refuses a backup context");
     check(backup_capture(&portable_ctx, src_fifo, dest_device) == -1,
           "portable representation is refused, not run as a native clone");
     check(lstat(dest_device, &st) == -1,

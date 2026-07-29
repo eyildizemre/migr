@@ -1,9 +1,12 @@
 #define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <limits.h>
+#include <unistd.h>
 
 #include "restore.h"
 #include "detect.h"
@@ -12,93 +15,107 @@
 #include "utils.h"
 #include "xdg.h"
 
+// Used only for packages.txt, which is read directly (fopen), never through
+// the restore_native_at() core -- out of scope for the fd-anchoring below.
 static int file_exists(const char *path)
 {
     struct stat st;
     return (stat(path, &st) == 0);
 }
 
-static int clone_to_home(const CloneContext *ctx, const char *src, const char *home)
+// Returns 1 if restored (or safely previewed), 0 if absent, and -1 if the
+// source or destination fails the native-restore contract.
+static int restore_home_item(const CloneContext *ctx, int source_root_fd,
+                             int home_fd, const char *rel_path)
 {
-    // Resolve the destination before the dry-run branch so a path that would be
-    // refused live is refused in dry-run too: the preview must match reality.
-    const char *name = strrchr(src, '/');
-    name = name ? name + 1 : src;
-
-    char full_dest[PATH_MAX];
-    if (path_join(full_dest, sizeof(full_dest), home, name) != 0)
+    RestoreSourceStatus status =
+        restore_native_source_status_at(source_root_fd, rel_path);
+    if (status == RESTORE_SOURCE_MISSING)
+        return 0;
+    if (status == RESTORE_SOURCE_ERROR)
     {
-        printf("Error: Failed to restore %s\n", src);
-        return 1;
+        printf("Error: Failed to inspect %s\n", rel_path);
+        return -1;
     }
 
     if (dry_run)
     {
-        printf("  Would restore: %s -> %s\n", src, full_dest);
-        return 0;
-    }
-
-    if (verbose)
-        printf("  Restoring: %s\n", src);
-
-    if (restore_native(ctx, src, full_dest) != 0)
-    {
-        printf("Error: Failed to restore %s\n", src);
-        return 1;
-    }
-    return 0;
-}
-
-// Restore a backup-relative path (e.g. ".config/google-chrome") back into home,
-// creating any intermediate parent directories as needed.
-// Returns 1 if restored, 0 if not in backup, -1 on error.
-static int restore_nested(const CloneContext *ctx, const char *source, const char *home, const char *rel_path)
-{
-    char src[PATH_MAX], dest[PATH_MAX];
-    if (path_join(src, sizeof(src), source, rel_path) != 0)
-        return -1;
-
-    if (!file_exists(src))
-        return 0;
-
-    if (path_join(dest, sizeof(dest), home, rel_path) != 0)
-        return -1;
-
-    const char *slash = strrchr(rel_path, '/');
-    if (slash)
-    {
-        char parent[PATH_MAX];
-        if (path_join_n(parent, sizeof(parent), home, rel_path, (size_t)(slash - rel_path)) != 0)
-            return -1;
-        if (!file_exists(parent))
+        if (restore_native_preflight_at(ctx, source_root_fd, rel_path,
+                                        home_fd, rel_path) != 0)
         {
-            if (dry_run)
-            {
-                printf("  Would create: %s\n", parent);
-            }
-            else if (mkdir(parent, 0755) != 0)
-            {
-                printf("Error: Could not create directory %s\n", parent);
-                return -1;
-            }
+            printf("Error: Failed to restore %s\n", rel_path);
+            return -1;
         }
-    }
-
-    if (dry_run)
-    {
-        printf("  Would restore: %s -> %s\n", src, dest);
+        printf("  Would restore: %s\n", rel_path);
         return 1;
     }
 
     if (verbose)
-        printf("  Restoring: %s\n", src);
+        printf("  Restoring: %s\n", rel_path);
 
-    if (restore_native(ctx, src, dest) != 0)
+    if (restore_native_at(ctx, source_root_fd, rel_path, home_fd, rel_path) != 0)
     {
-        printf("Error: Failed to restore %s\n", src);
+        printf("Error: Failed to restore %s\n", rel_path);
         return -1;
     }
     return 1;
+}
+
+// Existing XDG destinations are caller-selected trust roots and may themselves
+// be symlinks or live outside HOME. If only the final component is absent, its
+// parent becomes the trust root and the fd-anchored core creates the leaf.
+static int open_xdg_destination_anchor(const char *path, int *out_fd,
+                                       char *out_rel, size_t rel_size)
+{
+    int fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd >= 0)
+    {
+        *out_fd = fd;
+        out_rel[0] = '\0';
+        return 0;
+    }
+    if (errno != ENOENT)
+        return -1;
+
+    char *copy = strdup(path);
+    if (copy == NULL)
+        return -1;
+
+    size_t len = strlen(copy);
+    while (len > 1 && copy[len - 1] == '/')
+        copy[--len] = '\0';
+
+    char *slash = strrchr(copy, '/');
+    const char *leaf = slash == NULL ? copy : slash + 1;
+    size_t leaf_len = strlen(leaf);
+    if (leaf_len == 0 || leaf_len >= rel_size)
+    {
+        free(copy);
+        return -1;
+    }
+    memcpy(out_rel, leaf, leaf_len + 1);
+
+    const char *parent;
+    if (slash == NULL)
+        parent = ".";
+    else if (slash == copy)
+    {
+        slash[1] = '\0';
+        parent = copy;
+    }
+    else
+    {
+        *slash = '\0';
+        parent = copy;
+    }
+
+    fd = open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    free(copy);
+    if (fd < 0)
+        return -1;
+
+    *out_fd = fd;
+    return 0;
 }
 
 int restore(const char *source)
@@ -151,12 +168,34 @@ int restore(const char *source)
         return 1;
     }
 
+    // Opened once each and reused for every restore_native_at() call below --
+    // the trust boundary the fd-anchored core is built on (docs/DECISIONS.md
+    // D15 and D16). Read-only opens, harmless even in dry-run mode.
+    // Deliberately placed after xdg_resolve(): its own length-based refusal
+    // (checked above) must still be what a pathologically long HOME reports.
+    int source_root_fd = open(source, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (source_root_fd < 0)
+    {
+        printf("Error: Could not open source directory: %s\n", source);
+        for (int i = 0; i < XDG_RESTORE_COUNT; i++)
+            free(xdg_dirs[i]);
+        return 1;
+    }
+    int home_fd = open(home, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (home_fd < 0)
+    {
+        printf("Error: Could not open home directory: %s\n", home);
+        close(source_root_fd);
+        for (int i = 0; i < XDG_RESTORE_COUNT; i++)
+            free(xdg_dirs[i]);
+        return 1;
+    }
+
     char *manifest_names[XDG_RESTORE_COUNT];
     int has_manifest = (legacy_manifest_read(source, manifest_names, XDG_RESTORE_COUNT) == 0);
 
     const char *dotfiles[] = {".ssh", ".gnupg", ".gitconfig", ".bashrc", ".profile", NULL};
 
-    char src_path[PATH_MAX];
     int count = 0;
     int had_error = 0;
 
@@ -177,32 +216,49 @@ int restore(const char *source)
             name = p ? p + 1 : xdg_dirs[i];
         }
 
-        if (path_join(src_path, sizeof(src_path), source, name) != 0)
+        RestoreSourceStatus source_status =
+            restore_native_source_status_at(source_root_fd, name);
+        if (source_status == RESTORE_SOURCE_MISSING)
+            continue;
+        if (source_status == RESTORE_SOURCE_ERROR)
         {
-            printf("  Warning: path too long, skipping: %s/%s\n", source, name);
+            printf("Error: Failed to inspect %s\n", name);
             had_error = 1;
             continue;
         }
-        if (file_exists(src_path))
+
+        int xdg_dest_fd;
+        char destination_rel[NAME_MAX + 1];
+        if (open_xdg_destination_anchor(xdg_dirs[i], &xdg_dest_fd,
+                                        destination_rel,
+                                        sizeof(destination_rel)) != 0)
+        {
+            printf("Error: Failed to restore %s\n", name);
+            had_error = 1;
+            continue;
+        }
+
+        if (!dry_run && verbose)
+            printf("  Restoring: %s\n", name);
+
+        int restore_rc = dry_run
+            ? restore_native_preflight_at(&ctx, source_root_fd, name,
+                                          xdg_dest_fd, destination_rel)
+            : restore_native_at(&ctx, source_root_fd, name,
+                                xdg_dest_fd, destination_rel);
+        if (restore_rc != 0)
+        {
+            printf("Error: Failed to restore %s\n", name);
+            had_error = 1;
+        }
+        else
         {
             if (dry_run)
-            {
-                printf("  Would restore: %s -> %s/\n", src_path, xdg_dirs[i]);
-                count++;
-            }
-            else
-            {
-                if (verbose)
-                    printf("  Restoring: %s\n", src_path);
-                if (restore_native(&ctx, src_path, xdg_dirs[i]) != 0)
-                {
-                    printf("Error: Failed to restore %s\n", src_path);
-                    had_error = 1;
-                }
-                else
-                    count++;
-            }
+                printf("  Would restore: %s -> %s/\n", name, xdg_dirs[i]);
+            count++;
         }
+
+        close(xdg_dest_fd);
     }
 
     for (int i = 0; i < XDG_RESTORE_COUNT; i++)
@@ -212,35 +268,22 @@ int restore(const char *source)
         free(manifest_names[i]);
 
     // Projects is not a standard XDG directory
-    if (path_join(src_path, sizeof(src_path), source, "Projects") != 0)
-    {
-        printf("  Warning: path too long, skipping: %s/Projects\n", source);
+    int restore_result =
+        restore_home_item(&ctx, source_root_fd, home_fd, "Projects");
+    if (restore_result > 0)
+        count++;
+    else if (restore_result < 0)
         had_error = 1;
-    }
-    else if (file_exists(src_path))
-    {
-        if (clone_to_home(&ctx, src_path, home) == 0)
-            count++;
-        else
-            had_error = 1;
-    }
 
     printf("\n[Dotfiles]\n");
     for (int i = 0; dotfiles[i] != NULL; i++)
     {
-        if (path_join(src_path, sizeof(src_path), source, dotfiles[i]) != 0)
-        {
-            printf("  Warning: path too long, skipping: %s/%s\n", source, dotfiles[i]);
+        restore_result =
+            restore_home_item(&ctx, source_root_fd, home_fd, dotfiles[i]);
+        if (restore_result > 0)
+            count++;
+        else if (restore_result < 0)
             had_error = 1;
-            continue;
-        }
-        if (file_exists(src_path))
-        {
-            if (clone_to_home(&ctx, src_path, home) == 0)
-                count++;
-            else
-                had_error = 1;
-        }
     }
 
     const char *browser_configs[] = {
@@ -257,10 +300,12 @@ int restore(const char *source)
     printf("\n[Browser Profiles]\n");
     for (int i = 0; browser_configs[i] != NULL; i++)
     {
-        int r = restore_nested(&ctx, source, home, browser_configs[i]);
-        if (r > 0)
+        restore_result =
+            restore_home_item(&ctx, source_root_fd, home_fd,
+                              browser_configs[i]);
+        if (restore_result > 0)
             count++;
-        else if (r < 0)
+        else if (restore_result < 0)
             had_error = 1;
     }
 
@@ -494,5 +539,7 @@ int restore(const char *source)
         printf("Restore complete: %d items restored\n", count);
     printf("===========================================================\n");
 
+    close(home_fd);
+    close(source_root_fd);
     return had_error ? 1 : 0;
 }

@@ -108,7 +108,7 @@ This tool was fully refactored to eliminate all shell-based execution. It no lon
 
 In their place, a custom pure C POSIX engine handles all I/O and process execution:
 
-- **`backup_capture()` / `restore_native()`** — the two public entries to one recursive clone engine, capturing a tree into a backup and restoring it back. Clone files and directories via POSIX APIs, preserving permissions and timestamps, reproducing symlinks and FIFOs, and skipping sockets and device nodes with a warning. Replaces `cp -r`.
+- **`backup_capture()` / `restore_native_at()`** — separate backup and restore walkers. Backup captures pathname-based source trees; restore anchors both payload and destination traversal to directory file descriptors. Both preserve permissions and timestamps, reproduce symlinks and FIFOs, and skip sockets and device nodes with a warning. Replaces `cp -r`.
 - **`get_dir_size()`** — recursive directory size calculation via `lstat` and `dirent`. Replaces `du`.
 - **`run_command()`** — shell-free subprocess execution via `fork`/`execvp`/`waitpid`. Replaces `system()`.
 - **`run_command_capture()`** — same as above, with stdout captured into a buffer via an anonymous `pipe`. Replaces `popen()`.

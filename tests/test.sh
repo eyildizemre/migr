@@ -549,8 +549,9 @@ test_truncation() {
         exit 1
     fi
 
-    # XDG fallback paths can still fit while a longer nested browser destination
-    # does not. restore_nested must propagate that item failure to restore().
+    # The fd-anchored restore core resolves destination_rel component by
+    # component and never concatenates the full browser path. A deep but valid
+    # HOME must therefore work in both preview and live restore.
     local deep_home="$TEST_DIR/deep_home" room part_len
     mkdir "$deep_home"
     while [ ${#deep_home} -lt 4080 ]; do
@@ -565,13 +566,89 @@ test_truncation() {
 
     mkdir -p "$TEST_DIR/dummy_src/.config/google-chrome/Default"
     echo prefs > "$TEST_DIR/dummy_src/.config/google-chrome/Default/Preferences"
-    assert_fails_with "finished with errors" \
-        env HOME="$deep_home" ../migr restore "$TEST_DIR/dummy_src" --dry-run
+    local deep_home_out deep_home_rc deep_home_live_out deep_home_live_rc
+    set +e
+    deep_home_out=$(env HOME="$deep_home" ../migr restore "$TEST_DIR/dummy_src" --dry-run 2>&1)
+    deep_home_rc=$?
+    deep_home_live_out=$(printf 'y\n' | env HOME="$deep_home" ../migr restore "$TEST_DIR/dummy_src" 2>&1)
+    deep_home_live_rc=$?
+    set -e
+    if [ "$deep_home_rc" -eq 0 ] &&
+       [ "$deep_home_live_rc" -eq 0 ] &&
+       [[ "$deep_home_out" == *"Dry run complete"* ]] &&
+       [[ "$deep_home_live_out" == *"Restore complete"* ]] &&
+       (cd "$deep_home" && grep -q '^prefs$' .config/google-chrome/Default/Preferences); then
+        echo -e "  ${GREEN}✓${NC} A deep-but-real HOME previews and restores without a PATH_MAX join."
+    else
+        echo -e "  ${RED}✗${NC} Expected a deep HOME to preview and restore cleanly"
+        echo "  dry exit=$deep_home_rc output: $deep_home_out"
+        echo "  live exit=$deep_home_live_rc output: $deep_home_live_out"
+        exit 1
+    fi
+}
+
+test_restore_path_safety() {
+    echo -e "${BLUE}::${NC} Phase 11: restore path safety"
+
+    # A dangling final symlink is a filesystem object in the payload, not a
+    # missing source. Preview must see it and live restore must recreate its
+    # stored target string without following it.
+    local dangling_src="$TEST_DIR/dangling_src"
+    local dangling_home="$TEST_DIR/dangling_home"
+    mkdir -p "$dangling_src" "$dangling_home"
+    ln -s "missing-target" "$dangling_src/.bashrc"
+
+    local dry_out dry_rc live_out live_rc
+    set +e
+    dry_out=$(env HOME="$dangling_home" ../migr restore "$dangling_src" --dry-run 2>&1)
+    dry_rc=$?
+    live_out=$(printf 'y\n' | env HOME="$dangling_home" ../migr restore "$dangling_src" 2>&1)
+    live_rc=$?
+    set -e
+    if [ "$dry_rc" -eq 0 ] &&
+       [ "$live_rc" -eq 0 ] &&
+       [[ "$dry_out" == *"Would restore: .bashrc"* ]] &&
+       [[ "$live_out" == *"Restore complete"* ]] &&
+       [ -L "$dangling_home/.bashrc" ] &&
+       [ "$(readlink "$dangling_home/.bashrc")" = "missing-target" ]; then
+        echo -e "  ${GREEN}✓${NC} Dangling payload symlink is previewed and restored as a symlink."
+    else
+        echo -e "  ${RED}✗${NC} Dangling payload symlink handling diverged"
+        echo "  dry exit=$dry_rc output: $dry_out"
+        echo "  live exit=$live_rc output: $live_out"
+        exit 1
+    fi
+
+    # An intermediate payload symlink must be refused by both modes. The file
+    # behind it exists, so a path-following implementation would copy it.
+    local unsafe_src="$TEST_DIR/unsafe_src"
+    local unsafe_home="$TEST_DIR/unsafe_home"
+    local outside_src="$TEST_DIR/outside_src"
+    mkdir -p "$unsafe_src" "$unsafe_home" "$outside_src/google-chrome/Default"
+    echo "outside-prefs" > "$outside_src/google-chrome/Default/Preferences"
+    ln -s "$outside_src" "$unsafe_src/.config"
+
+    set +e
+    dry_out=$(env HOME="$unsafe_home" ../migr restore "$unsafe_src" --dry-run 2>&1)
+    dry_rc=$?
+    live_out=$(printf 'y\n' | env HOME="$unsafe_home" ../migr restore "$unsafe_src" 2>&1)
+    live_rc=$?
+    set -e
+    if [ "$dry_rc" -ne 0 ] &&
+       [ "$live_rc" -ne 0 ] &&
+       [ ! -e "$unsafe_home/.config/google-chrome/Default/Preferences" ]; then
+        echo -e "  ${GREEN}✓${NC} Dry-run and live restore both refuse an intermediate payload symlink."
+    else
+        echo -e "  ${RED}✗${NC} Intermediate payload symlink refusal diverged"
+        echo "  dry exit=$dry_rc output: $dry_out"
+        echo "  live exit=$live_rc output: $live_out"
+        exit 1
+    fi
 }
 
 
 test_probe_refusal() {
-    echo -e "${BLUE}::${NC} Phase 11: destination probe (backup preflight)"
+    echo -e "${BLUE}::${NC} Phase 12: destination probe (backup preflight)"
 
     # A regular file is not a valid destination: reject it up front, in both live
     # and dry-run, before writing anything. This needs no special privilege.
@@ -652,5 +729,6 @@ test_comprehensive
 test_explicit_paths
 test_errors
 test_truncation
+test_restore_path_safety
 test_probe_refusal
 echo -e "${GREEN}all tests passed${NC}"

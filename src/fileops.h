@@ -20,15 +20,12 @@ typedef struct {
 } CloneContext;
 
 /**
- * @brief Public entries to the recursive clone engine.
+ * @brief Pathname-based backup entry to the recursive clone engine.
  *
- * `backup_capture` captures a source tree into a backup; `restore_native` writes a tree
- * back from a backup. Each enforces its half of the orchestration contract and then
- * delegates to one shared native core: regular files, directories, symlinks and FIFOs are
- * reproduced; Unix sockets and device nodes are skipped with a warning; permissions and
- * access/modification times are preserved; an already-matching regular file is skipped so
- * an interrupted run resumes. They are separate names so the two orchestrations can later
- * diverge (e.g. a backup writing a sidecar) without reworking call sites.
+ * `backup_capture` captures a source tree into a backup. Regular files, directories,
+ * symlinks and FIFOs are reproduced; Unix sockets and device nodes are skipped with a
+ * warning; permissions and access/modification times are preserved; an already-matching
+ * regular file is skipped so an interrupted run resumes.
  *
  * The context is validated, not merely carried: a NULL ctx, a mismatched operation, or an
  * unimplemented representation is refused rather than run, so a dispatch mistake fails
@@ -41,7 +38,84 @@ typedef struct {
  * @return 0 on success, -1 on error or a rejected context.
  */
 int backup_capture(const CloneContext *ctx, const char *src, const char *dest);
-int restore_native(const CloneContext *ctx, const char *src, const char *dest);
+
+/**
+ * @brief Result of checking a restore source beneath a directory fd.
+ */
+typedef enum {
+    RESTORE_SOURCE_ERROR = -1,
+    RESTORE_SOURCE_MISSING = 0,
+    RESTORE_SOURCE_PRESENT = 1
+} RestoreSourceStatus;
+
+/**
+ * @brief Checks whether a source object exists without following symlinks.
+ *
+ * Intermediate components are resolved beneath source_root_fd with O_NOFOLLOW.
+ * A dangling symlink at the final component is therefore PRESENT, while a
+ * missing component is MISSING. Unsafe relative addresses and operational
+ * failures are ERROR.
+ */
+RestoreSourceStatus restore_native_source_status_at(int source_root_fd,
+                                                     const char *source_rel);
+
+/**
+ * @brief Validates an FD-anchored native restore without mutating the destination.
+ *
+ * Uses the same recursive walker and safety rules as restore_native_at(). It
+ * checks lexical paths, source traversal, destination traversal and existing
+ * destination object types, but does not promise that later writes cannot fail
+ * for operational reasons such as permissions or free space.
+ */
+int restore_native_preflight_at(const CloneContext *ctx,
+                                int source_root_fd, const char *source_rel,
+                                int destination_root_fd, const char *destination_rel);
+
+/**
+ * @brief FD-anchored native restore core (docs/DECISIONS.md D15 and D16).
+ *
+ * source_root_fd and destination_root_fd are directory fds the caller opens
+ * exactly once (its own trust boundary), and source_rel/destination_rel are
+ * relative addresses resolved underneath them component-by-component -- never
+ * by string concatenation. Both the backup payload and the destination are
+ * treated as untrusted: neither an intermediate symlink nor a symlink at the
+ * final address is followed or silently replaced.
+ *
+ * source_rel must name an existing entry (no intermediate component is ever
+ * created reading the source). destination_rel's intermediate components are
+ * created as plain directories if missing; an existing intermediate that is
+ * not a genuine, non-symlink directory is refused, not silently accepted.
+ *
+ * An empty string ("") is a valid relative address on either side, meaning
+ * "the root object itself" (docs/DECISIONS.md D16: an empty HOME_RELATIVE
+ * restore_path legitimately addresses $HOME itself) -- this is the one case
+ * with zero path components, distinct from a rejected empty *interior*
+ * component. Anything else that is lexically invalid (a leading '/', any
+ * ".." component, an empty interior/trailing component, or a bare ".")  is
+ * refused before any mutation is attempted; nothing is normalized into some
+ * other address.
+ *
+ * This function never closes source_root_fd or destination_root_fd; the
+ * caller owns them for as long as it needs them (e.g. across several calls
+ * restoring several top-level items from the same backup into the same
+ * destination). Every fd this function itself opens while recursing is
+ * closed before returning.
+ *
+ * Before mutating the destination, this function runs the same recursive
+ * checks exposed by restore_native_preflight_at().
+ *
+ * @param ctx                Clone orientation; must be CLONE_RESTORE +
+ *                            CLONE_NATIVE_TREE.
+ * @param source_root_fd      Open directory fd anchoring source_rel.
+ * @param source_rel          Relative address of the source object, or "".
+ * @param destination_root_fd Open directory fd anchoring destination_rel.
+ * @param destination_rel     Relative address of the destination object, or "".
+ * @return 0 on success, -1 on error, a rejected context, or a lexically
+ *         invalid or unsafe relative address.
+ */
+int restore_native_at(const CloneContext *ctx,
+                       int source_root_fd, const char *source_rel,
+                       int destination_root_fd, const char *destination_rel);
 
 /**
  * @brief Accumulates the total byte size of a file tree into *size.
