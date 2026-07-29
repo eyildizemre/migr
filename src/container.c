@@ -456,6 +456,24 @@ void container_close(BackupContainer *container)
     container->partial_fd = -1;
 }
 
+int container_root_fd(const BackupContainer *container)
+{
+    if (container == NULL || container->state == CONTAINER_STATE_EMPTY)
+        return -1;
+    return container->partial_fd;
+}
+
+const char *container_current_name(const BackupContainer *container)
+{
+    if (container == NULL)
+        return NULL;
+    if (container->state == CONTAINER_STATE_FINALIZED)
+        return container->final_name;
+    if (container->state == CONTAINER_STATE_PARTIAL)
+        return container->partial_name;
+    return NULL;
+}
+
 int container_name_is_partial(const char *name)
 {
     if (name == NULL)

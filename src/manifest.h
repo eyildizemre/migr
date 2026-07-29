@@ -11,27 +11,14 @@
  * directory basenames, so restore can locate source-locale directories when the
  * source and destination locales differ.
  *
- * Superseded by the versioned manifest below (docs/DECISIONS.md D15/D16), but kept
- * verbatim under an explicit "legacy" name: current backup production still writes
- * it, and restore must continue to read existing backups that carry it.
+ * Read-only, and superseded by the versioned manifest below (docs/DECISIONS.md
+ * D15/D16): production writes versioned manifests exclusively, and this reader
+ * exists so backups taken by earlier versions of migr stay restorable.
  */
 
 #define LEGACY_MANIFEST_XDG_COUNT 6
 
 extern const char * const legacy_manifest_keys[LEGACY_MANIFEST_XDG_COUNT]; /**< Canonical XDG key names, parallel to the xdg_resolve arrays. */
-
-/**
- * @brief Writes manifest.txt to backup_dir recording the XDG key-to-dirname mapping.
- *
- * Stores one "KEY=basename" line per entry so that restore can locate the
- * correct directories when the source and destination locales differ.
- *
- * @param backup_dir Directory in which manifest.txt is created.
- * @param basenames  Array of n directory basenames parallel to legacy_manifest_keys[].
- * @param n          Number of entries to write.
- * @return 0 on success, 1 if the file cannot be opened for writing.
- */
-int legacy_manifest_write(const char *backup_dir, const char * const *basenames, int n);
 
 /**
  * @brief Parses manifest.txt from backup_dir and extracts XDG directory basenames.
@@ -231,14 +218,33 @@ typedef enum {
 ManifestIdentityComparison manifest_resume_identity_compare(const Manifest *a, const Manifest *b);
 
 /**
+ * @brief Writes a versioned manifest to container_fd's manifest.txt in full.
+ *
+ * This is how production writes a manifest: the container's directory fd is
+ * already open and locked, so manifest.txt is created with openat() and
+ * O_NOFOLLOW rather than by rebuilding a path string a symlink could redirect.
+ *
+ * The whole model is validated before the file is opened at all. Opening
+ * truncates, so a failure discovered partway through serialization would
+ * otherwise leave a truncated manifest.txt behind; validating first means this
+ * either writes nothing or writes something manifest_read_v1_at() is
+ * guaranteed to accept. A single open/write/close sequence suffices without a
+ * temp-file dance because the container's own atomic .partial-to-final rename
+ * (docs/DECISIONS.md D15) is what makes an interrupted write harmless. Every
+ * write is checked, including fflush/fclose.
+ *
+ * @param container_fd Directory fd of the container; not closed here.
+ * @param m            The manifest to serialize; must not be NULL.
+ * @return 0 on success, 1 on any error.
+ */
+int manifest_write_v1_at(int container_fd, const Manifest *m);
+
+/**
  * @brief Writes a versioned manifest to backup_dir/manifest.txt in full.
  *
- * A single fopen/write/fclose sequence: the container's own atomic
- * .partial-to-final rename (docs/DECISIONS.md D15) is what makes an interrupted
- * write harmless, so this function does not need its own temp-file dance. Every
- * write is checked, including fflush/fclose; any failure removes no state but
- * returns non-zero so the caller can refuse rather than finalize a container
- * with a truncated manifest.
+ * Opens backup_dir as a directory and defers to manifest_write_v1_at(), so both
+ * entries share one validator and one serializer and can never produce
+ * different bytes for the same model.
  *
  * @param backup_dir Directory in which manifest.txt is created.
  * @param m          The manifest to serialize; must not be NULL.

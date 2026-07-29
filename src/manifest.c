@@ -14,40 +14,14 @@
 #include "utils.h" // path_join
 
 /* ========================================================================= */
-/* Legacy manifest — unchanged behaviour, renamed to make production's use   */
-/* of it explicit now that a versioned model exists alongside it.           */
+/* Legacy manifest — read-only. Production writes versioned manifests only;  */
+/* this reader exists so backups taken by earlier versions stay restorable.  */
 /* ========================================================================= */
 
 const char * const legacy_manifest_keys[LEGACY_MANIFEST_XDG_COUNT] = {
     "XDG_DOCUMENTS_DIR", "XDG_DOWNLOAD_DIR", "XDG_PICTURES_DIR",
     "XDG_DESKTOP_DIR",   "XDG_VIDEOS_DIR",   "XDG_MUSIC_DIR"
 };
-
-int legacy_manifest_write(const char *backup_dir, const char * const *basenames, int n)
-{
-    char path[PATH_MAX];
-    if (path_join(path, sizeof(path), backup_dir, "manifest.txt") != 0)
-    {
-        printf("Warning: Could not write manifest.txt\n");
-        return 1;
-    }
-
-    FILE *f = fopen(path, "w");
-    if (f == NULL)
-    {
-        printf("Warning: Could not write manifest.txt\n");
-        return 1;
-    }
-
-    for (int i = 0; i < n; i++)
-    {
-        // Write key-value pairs to manifest
-        fprintf(f, "%s=%s\n", legacy_manifest_keys[i], basenames[i]);
-    }
-
-    fclose(f);
-    return 0;
-}
 
 int legacy_manifest_read(const char *backup_dir, char **out, int n)
 {
@@ -781,17 +755,16 @@ done:
     return result;
 }
 
-int manifest_write_v1(const char *backup_dir, const Manifest *m)
+// Full validation of the model, with no filesystem access whatsoever. Opening
+// the destination truncates it immediately, so validating the *entire* model
+// before that happens is what guarantees a write either does nothing at all or
+// produces a file manifest_read_v1() is guaranteed to accept -- never a
+// truncated or content-invalid manifest.txt left behind by a failure
+// discovered partway through writing.
+static int manifest_model_is_invalid(const Manifest *m)
 {
-    if (backup_dir == NULL || m == NULL)
+    if (m == NULL)
         return 1;
-
-    // ---- Full validation pass, no filesystem access below this point. ----
-    // fopen(path, "w") truncates immediately; validating the *entire* model
-    // first guarantees this function either writes nothing at all, or writes
-    // a file manifest_read_v1() is guaranteed to accept -- never a truncated
-    // or content-invalid manifest.txt left behind by a failure discovered
-    // partway through writing.
 
     if (m->version != MANIFEST_CURRENT_VERSION)
         return 1;
@@ -845,16 +818,17 @@ int manifest_write_v1(const char *backup_dir, const Manifest *m)
         }
     }
 
-    // ---- Every field is proven valid and reader-compatible; only now does
-    // this function touch the filesystem. ----
+    return 0;
+}
 
-    char path[PATH_MAX];
-    if (path_join(path, sizeof(path), backup_dir, "manifest.txt") != 0)
-        return 1;
-
-    FILE *f = fopen(path, "w");
-    if (f == NULL)
-        return 1;
+// The one serializer. Both public writers reach the filesystem differently but
+// produce identical bytes through this function, so the two entries can never
+// drift into two subtly different on-disk formats. Only ever called on a model
+// manifest_model_is_invalid() has already accepted.
+static int manifest_serialize(FILE *f, const Manifest *m)
+{
+    const char *repr_str = representation_to_string(m->representation);
+    const char *scope_str = scope_to_string(m->scope);
 
     int failed = 0;
     if (fprintf(f, "%s\n", MANIFEST_MAGIC) < 0) failed = 1;
@@ -903,9 +877,48 @@ int manifest_write_v1(const char *backup_dir, const Manifest *m)
     }
 
     if (!failed && fflush(f) != 0) failed = 1;
-    if (fclose(f) != 0) failed = 1;
+    return failed ? 1 : 0;
+}
+
+int manifest_write_v1_at(int container_fd, const Manifest *m)
+{
+    if (container_fd < 0 || manifest_model_is_invalid(m))
+        return 1;
+
+    // O_NOFOLLOW so a symlink standing where manifest.txt belongs fails the
+    // open (ELOOP) rather than having the container's own format state written
+    // through it to somewhere else.
+    int fd = openat(container_fd, "manifest.txt",
+                    O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0644);
+    if (fd < 0)
+        return 1;
+
+    FILE *f = fdopen(fd, "w");
+    if (f == NULL)
+    {
+        close(fd);
+        return 1;
+    }
+
+    int failed = manifest_serialize(f, m);
+    if (fclose(f) != 0) // also closes fd
+        failed = 1;
 
     return failed ? 1 : 0;
+}
+
+int manifest_write_v1(const char *backup_dir, const Manifest *m)
+{
+    if (backup_dir == NULL || manifest_model_is_invalid(m))
+        return 1;
+
+    int dir_fd = open(backup_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dir_fd < 0)
+        return 1;
+
+    int rc = manifest_write_v1_at(dir_fd, m);
+    close(dir_fd);
+    return rc;
 }
 
 void manifest_free(Manifest *m)

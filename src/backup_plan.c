@@ -295,7 +295,7 @@ static int resolve_builtin_candidate(const char *raw, char *capture_path, size_t
 // A missing built-in (ENOENT/ENOTDIR, from resolve_builtin_candidate) is
 // simply left out of the plan; any other resolution failure or an
 // unsupported object type is a real error and aborts the whole build
-// (docs/DECISIONS.md D16 roadmap: every failure other than a genuinely
+// (docs/DECISIONS.md D16: every failure other than a genuinely
 // missing optional root is fatal). Every capture_path here -- XDG included --
 // goes through the same
 // ancestor-symlink-resolving, leaf-preserving normalization explicit roots
@@ -428,10 +428,10 @@ static int explicit_cmp(const void *a, const void *b)
 
 // Explicit roots are normalized and classified up front, then sorted by
 // normalized path before EXPLICIT_n ids are assigned -- so argv order can
-// never change which root gets which id (docs/DECISIONS.md D16 roadmap).
+// never change which root gets which id (docs/DECISIONS.md D16).
 // A missing/unresolvable/wrong-type path rejects the whole call; two roots
-// sharing a basename are accepted here as distinct roots (today's flat
-// writer's own limitation is the caller's problem, not this module's).
+// sharing a basename are distinct roots, each addressed by its own id rather
+// than by that shared name.
 static int build_explicit_roots(const char *home_real, const char *const *explicit_paths,
                                 RootBuilder *rb)
 {
@@ -604,6 +604,57 @@ int backup_plan_build(const char *home, BackupMode mode,
 
     out->roots = rb.items;
     out->root_count = rb.count;
+    return 0;
+}
+
+// The destination is resolved differently from a root, because it is used
+// differently: a root is an object to *copy*, so a symlink named as a root is
+// captured as itself and must not be dereferenced. A destination is a place to
+// *write into*, so what matters is where the writes actually land -- a symlink
+// pointing back into the source tree would otherwise slip past containment
+// while the copy fed on itself.
+//
+// An existing destination is therefore resolved in full, final component
+// included. One that does not exist yet has no target to follow, so its parent
+// is canonicalized and the leaf appended -- the same algebra roots use, applied
+// to the one component that is about to be created.
+static int resolve_destination(const char *destination, char *out, size_t out_size)
+{
+    char resolved[PATH_MAX];
+    if (realpath(destination, resolved) != NULL)
+    {
+        if (strlen(resolved) >= out_size)
+            return -1;
+        strcpy(out, resolved);
+        return 0;
+    }
+    return resolve_leaf_preserving(destination, out, out_size);
+}
+
+int backup_plan_destination_conflicts(const BackupPlan *plan, const char *destination)
+{
+    if (plan == NULL || destination == NULL)
+        return 0;
+
+    // If neither the destination nor its parent can be resolved there is
+    // nothing to compare and nothing to create either: a non-recursive mkdir of
+    // that address fails on its own, without this check having to guess.
+    char dest_real[PATH_MAX];
+    if (resolve_destination(destination, dest_real, sizeof(dest_real)) != 0)
+        return 0;
+
+    for (int i = 0; i < plan->root_count; i++)
+    {
+        const char *root = plan->roots[i].capture_path;
+        if (strcmp(root, dest_real) != 0 && !is_ancestor(root, dest_real))
+            continue;
+
+        printf("Error: the backup destination is inside %s, which this backup would "
+               "capture.\n", root);
+        printf("  Writing a backup into a tree it is copying makes the copy consume "
+               "itself; choose a destination outside every selected root.\n");
+        return 1;
+    }
     return 0;
 }
 

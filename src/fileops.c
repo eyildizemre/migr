@@ -15,174 +15,274 @@
 #include "fileops.h" // CloneContext
 #include "utils.h" // path_join
 
-static int preserve_metadata(const char *path, const struct stat *st)
+/* ========================================================================= */
+/* Native backup capture: pathname-based source, FD-anchored destination.   */
+/*                                                                          */
+/* The source side is read through ordinary paths (it is the user's own     */
+/* tree, addressed exactly as they named it). The destination side never is:*/
+/* every step down uses openat/mkdirat/fstatat under a directory fd the     */
+/* caller owns, with O_NOFOLLOW everywhere, so neither an intermediate nor  */
+/* a final symlink inside the container can redirect a write outside it --  */
+/* which is what makes resuming into an adopted, previously-written         */
+/* container safe (docs/DECISIONS.md D15).                                  */
+/* ========================================================================= */
+
+// Metadata is applied through an already-open fd wherever the object type
+// permits one, so nothing swapped in at the destination address between
+// creation and this call can redirect a chmod onto a different object. A
+// symlink is the one type with no usable fd: chmod() would follow it and
+// change the target's mode (for an absolute link, the real source file), so
+// only its own timestamps are preserved, via AT_SYMLINK_NOFOLLOW.
+static void preserve_metadata_fd(int fd, const struct stat *st)
 {
-    // Never chmod a symlink: chmod() follows the link and would change the target's
-    // mode (for an absolute link, the real source file). Symlinks have no meaningful
-    // permissions of their own on Linux, so there is nothing to preserve here.
-    if (!S_ISLNK(st->st_mode))
-        chmod(path, st->st_mode);
+    fchmod(fd, st->st_mode & 07777);
 
     struct timespec times[2];
-    times[0] = st->st_atim; // access time
-    times[1] = st->st_mtim; // modification time
-    utimensat(AT_FDCWD, path, times, AT_SYMLINK_NOFOLLOW); // preserve times without following symlinks
+    times[0] = st->st_atim;
+    times[1] = st->st_mtim;
+    futimens(fd, times);
+}
 
+static void preserve_symlink_times(int dir_fd, const char *leaf, const struct stat *st)
+{
+    struct timespec times[2];
+    times[0] = st->st_atim;
+    times[1] = st->st_mtim;
+    utimensat(dir_fd, leaf, times, AT_SYMLINK_NOFOLLOW);
+}
+
+// A destination address this walker accepts is exactly one path component.
+// Anything with a '/' would be a path to re-resolve, which is precisely what
+// the fd anchoring exists to avoid; "." and ".." address the parent rather
+// than a new object.
+static int destination_leaf_is_safe(const char *leaf)
+{
+    return leaf != NULL && leaf[0] != '\0' &&
+           strchr(leaf, '/') == NULL &&
+           strcmp(leaf, ".") != 0 &&
+           strcmp(leaf, "..") != 0;
+}
+
+static int capture_entry_at(const CloneContext *ctx, const char *src,
+                            int dest_dir_fd, const char *leaf);
+
+// An identical symlink already at this address is work a previous run
+// finished, so resuming past it succeeds. Any other object there -- a
+// symlink to somewhere else included -- is a genuine collision and is
+// refused rather than replaced.
+static int capture_symlink_at(const char *src, int dest_dir_fd, const char *leaf,
+                              const struct stat *st)
+{
+    char link_target[PATH_MAX];
+    ssize_t len = readlink(src, link_target, sizeof(link_target) - 1);
+    if (len < 0)
+        return -1;
+    link_target[len] = '\0';
+
+    if (symlinkat(link_target, dest_dir_fd, leaf) != 0)
+    {
+        if (errno != EEXIST)
+            return -1;
+
+        struct stat dest_st;
+        if (fstatat(dest_dir_fd, leaf, &dest_st, AT_SYMLINK_NOFOLLOW) != 0 ||
+            !S_ISLNK(dest_st.st_mode))
+            return -1;
+
+        char existing[PATH_MAX];
+        ssize_t existing_len = readlinkat(dest_dir_fd, leaf, existing, sizeof(existing) - 1);
+        if (existing_len < 0)
+            return -1;
+        existing[existing_len] = '\0';
+
+        if (strcmp(existing, link_target) != 0)
+            return -1;
+    }
+
+    preserve_symlink_times(dest_dir_fd, leaf, st);
     return 0;
 }
 
-// The recursive clone core. Direction-agnostic today; the CloneContext is threaded so
-// later phases can branch on it (e.g. a backup writing a sidecar) without re-plumbing.
-// Reached only through backup_capture below.
-static int clone_tree(const CloneContext *ctx, const char *src, const char *dest)
+// A write() that reports zero bytes for a non-zero request has made no
+// progress and never will on a retry, so it is treated as the failure it is
+// rather than spun on forever.
+static int copy_file_contents(int src_fd, int dest_fd)
 {
-    struct stat st;
-    
-    if (lstat(src, &st)!= 0)
+    char buffer[8192];
+    ssize_t bytes_read;
+    while ((bytes_read = read(src_fd, buffer, sizeof(buffer))) > 0)
+    {
+        ssize_t bytes_written = 0;
+        while (bytes_written < bytes_read)
+        {
+            ssize_t res = write(dest_fd, buffer + bytes_written,
+                                (size_t)(bytes_read - bytes_written));
+            if (res <= 0)
+                return -1;
+            bytes_written += res;
+        }
+    }
+    return bytes_read < 0 ? -1 : 0;
+}
+
+static int capture_regular_at(const char *src, int dest_dir_fd, const char *leaf,
+                              const struct stat *st)
+{
+    struct stat dest_st;
+    if (fstatat(dest_dir_fd, leaf, &dest_st, AT_SYMLINK_NOFOLLOW) == 0)
+    {
+        // A matching size and mtime is the resume signal; a different type at
+        // the same address is a collision, never something to truncate.
+        if (!S_ISREG(dest_st.st_mode))
+            return -1;
+        if (dest_st.st_size == st->st_size &&
+            dest_st.st_mtim.tv_sec == st->st_mtim.tv_sec)
+            return 0;
+    }
+    else if (errno != ENOENT)
     {
         return -1;
     }
 
-    // Check if the reference is a symlink
-    if(S_ISLNK(st.st_mode))
+    int src_fd = open(src, O_RDONLY | O_CLOEXEC);
+    if (src_fd < 0)
+        return -1;
+
+    // O_NOFOLLOW makes a symlink planted at this address fail the open with
+    // ELOOP instead of being written through; O_TRUNC can therefore only ever
+    // apply to the regular file the check above already accepted.
+    int dest_fd = openat(dest_dir_fd, leaf,
+                         O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC,
+                         st->st_mode & 07777);
+    if (dest_fd < 0)
     {
-        char link_target[PATH_MAX]; // buffer for symlink target path
-        ssize_t len = readlink(src, link_target, sizeof(link_target) - 1); // leave space for null terminator
-        if (len == -1)
-        {
-            return -1;
-        }
-        link_target[len] = '\0'; // null terminator
-
-        if (symlink(link_target, dest) != 0)
-        {
-            return -1;
-        }
-
-        preserve_metadata(dest, &st);
-        return 0;
+        close(src_fd);
+        return -1;
     }
 
-    // Check if the reference is a normal file
-    if(S_ISREG(st.st_mode))
+    int failed = copy_file_contents(src_fd, dest_fd) != 0;
+    if (!failed)
+        preserve_metadata_fd(dest_fd, st);
+
+    // A write deferred by the kernel (quota, ENOSPC, a network filesystem)
+    // can surface only here, so a failed close means the payload is not
+    // actually complete and must be reported as such.
+    if (close(dest_fd) != 0)
+        failed = 1;
+    close(src_fd);
+    return failed ? -1 : 0;
+}
+
+// The directory is created with owner-only access and given the source's real
+// mode by preserve_metadata_fd() only after its whole subtree is written.
+// Creating it with the final mode up front would make a read-only source
+// directory (e.g. 0555) impossible to descend into and populate, and the
+// transient 0700 is never more permissive to group or other than the mode it
+// ends up with.
+static int capture_directory_at(const CloneContext *ctx, const char *src,
+                                int dest_dir_fd, const char *leaf,
+                                const struct stat *st)
+{
+    if (mkdirat(dest_dir_fd, leaf, 0700) != 0 && errno != EEXIST)
+        return -1;
+
+    // O_NOFOLLOW rejects a symlink standing where the directory should be
+    // (descending through it would write payload outside the container);
+    // O_DIRECTORY rejects every other wrong type in the same call.
+    int child_fd = openat(dest_dir_fd, leaf,
+                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (child_fd < 0)
+        return -1;
+
+    DIR *dir = opendir(src);
+    if (dir == NULL)
+    {
+        close(child_fd);
+        return -1;
+    }
+
+    int failed = 0;
+    struct dirent *entry;
+    for (;;)
+    {
+        // readdir() reports both "end of directory" and "read failed" as NULL;
+        // only errno tells them apart. Without this reset a real read error
+        // would look like a complete directory, and the container would be
+        // finalized around a silently short subtree.
+        errno = 0;
+        entry = readdir(dir);
+        if (entry == NULL)
+        {
+            if (errno != 0)
+                failed = 1;
+            break;
+        }
+
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            continue;
+
+        // Only the source path grows as we descend; refuse rather than act on
+        // a truncated one. The destination never concatenates at all.
+        char child_src[PATH_MAX];
+        if (path_join(child_src, sizeof(child_src), src, entry->d_name) != 0 ||
+            capture_entry_at(ctx, child_src, child_fd, entry->d_name) != 0)
+        {
+            failed = 1;
+            break;
+        }
+    }
+
+    if (closedir(dir) != 0)
+        failed = 1;
+    if (!failed)
+        preserve_metadata_fd(child_fd, st);
+    close(child_fd);
+    return failed ? -1 : 0;
+}
+
+// Recreate the node itself, never its contents: reading a FIFO blocks until a
+// writer appears, which would hang the whole backup. An existing FIFO at this
+// address is accepted so an interrupted backup can resume past it.
+static int capture_fifo_at(int dest_dir_fd, const char *leaf, const struct stat *st)
+{
+    if (mkfifoat(dest_dir_fd, leaf, st->st_mode & 07777) != 0)
     {
         struct stat dest_st;
-        if (lstat(dest, &dest_st) == 0 &&
-            dest_st.st_size == st.st_size &&
-            dest_st.st_mtim.tv_sec == st.st_mtim.tv_sec)
-        {
-            return 0; // already cloned, skip
-        }
-
-        int src_fd = open(src, O_RDONLY);
-        if (src_fd == -1)
-        {
+        if (errno != EEXIST ||
+            fstatat(dest_dir_fd, leaf, &dest_st, AT_SYMLINK_NOFOLLOW) != 0 ||
+            !S_ISFIFO(dest_st.st_mode))
             return -1;
-        }
-
-        int dest_fd = open(dest, O_WRONLY | O_CREAT | O_TRUNC, st.st_mode);
-        if (dest_fd == -1)
-        {
-            close(src_fd);
-            return -1;
-        }
-
-        char buffer[8192];
-        ssize_t bytes_read;
-        while ((bytes_read = read(src_fd, buffer, sizeof(buffer))) > 0)
-        {
-            ssize_t bytes_written = 0;
-            while (bytes_written < bytes_read)
-            {
-                ssize_t res = write(dest_fd, buffer + bytes_written, bytes_read - bytes_written);
-                if (res == -1)
-                {
-                    close(src_fd);
-                    close(dest_fd);
-                    return -1;
-                }
-                bytes_written += res;
-            }
-        }
-
-        if (bytes_read == -1)
-        {
-            close(src_fd);
-            close(dest_fd);
-            return -1;
-        }
-
-        close(src_fd);
-        close(dest_fd);
-        preserve_metadata(dest, &st);
-        return 0;
     }
 
-    // Check if the reference is a directory
+    // O_RDONLY | O_NONBLOCK is the one way to open a FIFO that returns
+    // immediately with no writer on the other end. The fd is opened purely so
+    // the metadata below goes through an fd like every other type here, rather
+    // than through a path a swap could redirect.
+    int fifo_fd = openat(dest_dir_fd, leaf,
+                         O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
+    if (fifo_fd < 0)
+        return -1;
+
+    preserve_metadata_fd(fifo_fd, st);
+    close(fifo_fd);
+    return 0;
+}
+
+static int capture_entry_at(const CloneContext *ctx, const char *src,
+                            int dest_dir_fd, const char *leaf)
+{
+    struct stat st;
+    if (lstat(src, &st) != 0)
+        return -1;
+
+    if (S_ISLNK(st.st_mode))
+        return capture_symlink_at(src, dest_dir_fd, leaf, &st);
+    if (S_ISREG(st.st_mode))
+        return capture_regular_at(src, dest_dir_fd, leaf, &st);
     if (S_ISDIR(st.st_mode))
-    {
-
-        int dst = mkdir(dest, st.st_mode);
-        if (dst == -1 && errno != EEXIST) // If the directory already exists, we can ignore the error
-        {
-            return -1;
-        }
-
-        DIR *op = opendir(src);
-        if (op == NULL)
-        {
-            return -1;
-        }
-
-        struct dirent *entry;
-        while ((entry = readdir(op)) != NULL)
-        {
-            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
-            {
-                continue;
-            }
-
-            char new_src[PATH_MAX];
-            char new_dest[PATH_MAX];
-            // Paths grow as we descend; refuse rather than act on a truncated one.
-            if (path_join(new_src, sizeof(new_src), src, entry->d_name) != 0 ||
-                path_join(new_dest, sizeof(new_dest), dest, entry->d_name) != 0)
-            {
-                closedir(op);
-                return -1;
-            }
-
-            if (clone_tree(ctx, new_src, new_dest) != 0)
-            {
-                closedir(op);
-                return -1;
-            }
-        }
-
-        closedir(op);
-        preserve_metadata(dest, &st);
-        return 0;
-    }
-
-    // FIFO: recreate the node itself. Never open it as a regular file — reading a
-    // FIFO blocks until a writer appears, which would hang the whole backup. An
-    // existing FIFO at dest is accepted so an interrupted backup can resume.
+        return capture_directory_at(ctx, src, dest_dir_fd, leaf, &st);
     if (S_ISFIFO(st.st_mode))
-    {
-        if (mkfifo(dest, st.st_mode & 07777) != 0)
-        {
-            struct stat dest_st;
-            if (errno != EEXIST ||
-                lstat(dest, &dest_st) != 0 ||
-                !S_ISFIFO(dest_st.st_mode))
-            {
-                return -1;
-            }
-        }
-
-        preserve_metadata(dest, &st);
-        return 0;
-    }
+        return capture_fifo_at(dest_dir_fd, leaf, &st);
 
     // Sockets and device nodes carry no copyable content: a socket is a runtime
     // IPC endpoint, a device node needs root to recreate. Skip either with a
@@ -202,7 +302,8 @@ static int clone_tree(const CloneContext *ctx, const char *src, const char *dest
     return -1; // unknown file type (unreachable on Linux); refuse defensively
 }
 
-int backup_capture(const CloneContext *ctx, const char *src, const char *dest)
+int backup_capture_at(const CloneContext *ctx, const char *source_path,
+                      int destination_root_fd, const char *destination_leaf)
 {
     // Fail closed on a mis-dispatched context rather than running a native clone blindly:
     // a wrong direction or an unimplemented representation must not silently produce a
@@ -210,18 +311,20 @@ int backup_capture(const CloneContext *ctx, const char *src, const char *dest)
     if (ctx == NULL || ctx->operation != CLONE_BACKUP ||
         ctx->representation != CLONE_NATIVE_TREE)
         return -1;
-    return clone_tree(ctx, src, dest);
+    if (source_path == NULL || destination_root_fd < 0 ||
+        !destination_leaf_is_safe(destination_leaf))
+        return -1;
+
+    return capture_entry_at(ctx, source_path, destination_root_fd, destination_leaf);
 }
 
 /* ========================================================================= */
 /* FD-anchored native restore core (docs/DECISIONS.md D15 and D16).          */
 /*                                                                          */
-/* Deliberately independent of clone_tree() above: backup_capture() and its */
-/* walker are unchanged by this section. Both the source payload and the    */
-/* destination are treated as untrusted -- every intermediate is opened by  */
-/* directory fd with O_NOFOLLOW, a path component is never re-resolved by   */
-/* string, and a symlink at the final address is refused rather than        */
-/* written through.                                                        */
+/* Separate from the capture walker above because the trust boundaries       */
+/* differ: restore treats the backup payload as untrusted too, resolving     */
+/* both sides component-by-component under directory fds, and refuses a      */
+/* symlink at a final destination address rather than writing through it.    */
 /* ========================================================================= */
 
 // A path component can never be longer than NAME_MAX; sizing leaf buffers to

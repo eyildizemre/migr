@@ -9,13 +9,13 @@
 /**
  * @brief Presentation/current-execution grouping for a planned root.
  *
- * Purely about which section of today's flat backup output a root prints
- * under (and, for BACKUP_ROOT_DOTFILE/BACKUP_ROOT_BROWSER, whether it is
- * cloned via the nested home-relative cloner instead of the flat one) --
- * orthogonal to manifest_root.policy, which is the actual restore semantics
+ * Purely about which heading a root is listed under in backup output. It
+ * never determines where a root's payload is written -- that address is
+ * manifest_root.payload_path alone -- and it is orthogonal to
+ * manifest_root.policy, which is the actual restore semantics
  * (docs/DECISIONS.md D16). BACKUP_ROOT_MAIN covers both true XDG roots and
- * the home-relative "Projects" root: today's output prints both under the
- * same "[Main Directories]" section.
+ * the home-relative "Projects" root: both are listed under the same
+ * "[Main Directories]" heading.
  */
 typedef enum {
     BACKUP_ROOT_MAIN,
@@ -75,10 +75,9 @@ typedef struct {
  * argument order never changes root identity), and classified
  * ROOT_POLICY_HOME_RELATIVE or ROOT_POLICY_MANUAL_NATIVE by whether it
  * resolves under HOME (docs/DECISIONS.md D16). Two explicit roots that
- * happen to share a basename are both accepted here as distinct roots --
- * today's flat legacy writer's own inability to represent that is a
- * transitional restriction the caller must enforce separately, not part of
- * this contract.
+ * happen to share a basename are distinct roots here and stay distinct
+ * downstream: each has its own payload_path, so neither can shadow the
+ * other.
  *
  * Any invalid, missing (explicit only), inaccessible, duplicate, overlapping,
  * unsupported-type (socket/device), or resource-exhausting input rejects the
@@ -99,6 +98,27 @@ typedef struct {
  */
 int backup_plan_build(const char *home, BackupMode mode,
                       const char *const *explicit_paths, BackupPlan *out);
+
+/**
+ * @brief Whether writing a backup to destination would place it inside a tree
+ * the plan is going to capture.
+ *
+ * A destination equal to, or below, any selected root makes the capture feed
+ * on its own output: every object written into the destination becomes another
+ * object still to be captured. Comparison is on the same normalized
+ * capture_path addresses the plan already validated, at component boundaries,
+ * so a lexical prefix does not count and a selected symlink (which is captured
+ * as itself, never descended into) cannot produce a false positive.
+ *
+ * Read-only, like the rest of this module: callers must ask before creating or
+ * probing the destination, so a refusal costs nothing on disk in a live run or
+ * a dry run alike.
+ *
+ * @param plan        A built plan; NULL reports no conflict.
+ * @param destination The backup destination, which need not exist yet.
+ * @return 1 if the invocation must be refused (a message is printed), 0 otherwise.
+ */
+int backup_plan_destination_conflicts(const BackupPlan *plan, const char *destination);
 
 /**
  * @brief Releases the heap-owned root array. Safe on NULL and on an

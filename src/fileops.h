@@ -20,24 +20,41 @@ typedef struct {
 } CloneContext;
 
 /**
- * @brief Pathname-based backup entry to the recursive clone engine.
+ * @brief Captures a source tree into an open destination directory.
  *
- * `backup_capture` captures a source tree into a backup. Regular files, directories,
- * symlinks and FIFOs are reproduced; Unix sockets and device nodes are skipped with a
- * warning; permissions and access/modification times are preserved; an already-matching
- * regular file is skipped so an interrupted run resumes.
+ * Regular files, directories, symlinks and FIFOs are reproduced; Unix sockets and
+ * device nodes are skipped with a warning; permissions and access/modification times
+ * are preserved.
  *
- * The context is validated, not merely carried: a NULL ctx, a mismatched operation, or an
- * unimplemented representation is refused rather than run, so a dispatch mistake fails
- * closed instead of writing a native tree to a destination that needed a sidecar. Only
- * CLONE_NATIVE_TREE is implemented currently; CLONE_PORTABLE_SIDECAR is refused.
+ * The source is addressed by pathname, exactly as the caller named it. The
+ * destination never is: destination_root_fd is a directory fd the caller opens once
+ * and continues to own, and every step below it uses openat/mkdirat/fstatat with
+ * O_NOFOLLOW. No intermediate or final symlink inside the destination is ever
+ * followed, so payload cannot be redirected outside the container it belongs to
+ * (docs/DECISIONS.md D15) -- including when writing into a container a previous,
+ * interrupted run already populated.
  *
- * @param ctx  Clone orientation and representation; must not be NULL.
- * @param src  Path to the source file, directory, or symlink.
- * @param dest Destination path to create.
- * @return 0 on success, -1 on error or a rejected context.
+ * Resuming is address-by-address, and only where the existing object proves the work
+ * was already done: a regular file whose size and mtime match is skipped, a symlink
+ * with the identical target is accepted, and an existing directory or FIFO is
+ * accepted when it is genuinely that type. Every other collision -- a differing
+ * symlink target, or any type mismatch -- is an error, never an overwrite.
+ *
+ * The context is validated, not merely carried: a NULL ctx, a mismatched operation, or
+ * an unimplemented representation is refused rather than run, so a dispatch mistake
+ * fails closed instead of writing a native tree to a destination that needed a
+ * sidecar. Only CLONE_NATIVE_TREE is implemented currently; CLONE_PORTABLE_SIDECAR is
+ * refused.
+ *
+ * @param ctx                 Clone orientation and representation; must not be NULL.
+ * @param source_path         Path to the source file, directory, or symlink.
+ * @param destination_root_fd Open directory fd anchoring destination_leaf; never closed here.
+ * @param destination_leaf    Exactly one path component to create beneath it; a name
+ *                            containing '/', or "." or "..", is refused.
+ * @return 0 on success, -1 on error, a rejected context, or an unsafe leaf.
  */
-int backup_capture(const CloneContext *ctx, const char *src, const char *dest);
+int backup_capture_at(const CloneContext *ctx, const char *source_path,
+                      int destination_root_fd, const char *destination_leaf);
 
 /**
  * @brief Result of checking a restore source beneath a directory fd.

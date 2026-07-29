@@ -1,5 +1,5 @@
-// Unit tests for the deterministic backup root planner (docs/DECISIONS.md D16
-// roadmap, A2.5): backup_plan_build()/backup_plan_free(), declared in
+// Unit tests for the deterministic backup root planner (docs/DECISIONS.md
+// D16): backup_plan_build()/backup_plan_free(), declared in
 // backup_plan.h. Covers the built-in catalog (XDG main directories,
 // dotfiles, browser profiles, comprehensive-only Projects), explicit-path
 // normalization and classification (HOME containment at component
@@ -722,6 +722,87 @@ static void test_home_slash_classifies_descendant_as_home_relative(void)
 /* Set validation and determinism                                          */
 /* ========================================================================= */
 
+static void test_destination_inside_a_root_is_a_conflict(void)
+{
+    printf(BLUE "::" NC " set: a destination equal to or below a selected root is reported as a conflict\n");
+
+    char home[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_home");
+    mkdir_p(home);
+    char docs[PATH_MAX];
+    join_path(docs, sizeof(docs), home, "Documents");
+    mkdir_p(docs);
+    char outside[PATH_MAX];
+    fresh_mkdtemp(outside, sizeof(outside), "plan_outside");
+
+    char *paths[] = { docs, NULL };
+    BackupPlan plan;
+    check(backup_plan_build(home, BACKUP_EXPLICIT_PATHS, (const char *const *)paths, &plan) == 0,
+          "the plan builds");
+
+    char inside[PATH_MAX], deeper[PATH_MAX], sibling[PATH_MAX];
+    join_path(inside, sizeof(inside), docs, "backup");      // does not exist yet
+    join_path(deeper, sizeof(deeper), docs, "a");
+    mkdir_p(deeper);
+    char deeper_child[PATH_MAX];
+    join_path(deeper_child, sizeof(deeper_child), deeper, "b");
+    // A lexical near-miss: "Documents2" shares a prefix but not a component
+    // boundary, so it is a perfectly good destination.
+    int n = snprintf(sibling, sizeof(sibling), "%s2", docs);
+    check(n > 0 && (size_t)n < sizeof(sibling), "fixture: build the prefix-trap sibling");
+    mkdir_p(sibling);
+
+    check(backup_plan_destination_conflicts(&plan, docs) == 1,
+          "a destination equal to the root itself conflicts");
+    check(backup_plan_destination_conflicts(&plan, inside) == 1,
+          "a not-yet-existing destination directly inside the root conflicts");
+    check(backup_plan_destination_conflicts(&plan, deeper_child) == 1,
+          "a destination deeper inside the root conflicts");
+    check(backup_plan_destination_conflicts(&plan, sibling) == 0,
+          "a lexical-prefix sibling of the root is not a conflict");
+    check(backup_plan_destination_conflicts(&plan, outside) == 0,
+          "a destination outside every root is not a conflict");
+
+    // A destination is a place to write into, so unlike a root it must be
+    // followed through its final symlink: a link that lives outside every root
+    // but points inside one still writes inside one.
+    char alias[PATH_MAX], alias_target[PATH_MAX];
+    join_path(alias, sizeof(alias), outside, "target_link");
+    join_path(alias_target, sizeof(alias_target), docs, "aliased");
+    mkdir_p(alias_target);
+    check(symlink(alias_target, alias) == 0,
+          "fixture: a symlink outside every root pointing to a directory inside one");
+    check(backup_plan_destination_conflicts(&plan, alias) == 1,
+          "a destination symlink resolving into a root conflicts, despite living outside it");
+
+    char benign_alias[PATH_MAX], benign_target[PATH_MAX];
+    join_path(benign_target, sizeof(benign_target), outside, "real_destination");
+    mkdir_p(benign_target);
+    join_path(benign_alias, sizeof(benign_alias), outside, "benign_link");
+    check(symlink(benign_target, benign_alias) == 0,
+          "fixture: a symlink pointing to a directory outside every root");
+    check(backup_plan_destination_conflicts(&plan, benign_alias) == 0,
+          "a destination symlink resolving outside every root is still usable");
+    check(backup_plan_destination_conflicts(NULL, outside) == 0 &&
+          backup_plan_destination_conflicts(&plan, NULL) == 0,
+          "NULL arguments report no conflict rather than crashing");
+
+    backup_plan_free(&plan);
+
+    // "/" is every other path's ancestor, so no destination can ever sit
+    // outside it.
+    char *root_paths[] = { (char *)"/", NULL };
+    BackupPlan root_plan;
+    check(backup_plan_build(home, BACKUP_EXPLICIT_PATHS, (const char *const *)root_paths, &root_plan) == 0,
+          "a plan whose only root is '/' builds");
+    check(backup_plan_destination_conflicts(&root_plan, outside) == 1,
+          "with '/' selected, every destination conflicts");
+    backup_plan_free(&root_plan);
+
+    remove_tree(home); // sibling lives inside it, so this removes both
+    remove_tree(outside);
+}
+
 static void test_duplicate_explicit_root_is_rejected(void)
 {
     printf(BLUE "::" NC " set: an explicit root repeated verbatim is rejected as a duplicate\n");
@@ -1011,21 +1092,31 @@ static int dir_exists(const char *path)
     return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
-static int find_backup_subdir(const char *target, char *out, size_t out_size)
+// Locates the single finalized container under target and writes its data/
+// path, which is where every planned root's payload lands. A leftover
+// ".partial" is deliberately not accepted: a successful backup never leaves
+// one, so treating it as the result would mask exactly that failure.
+static int find_payload_dir(const char *target, char *out, size_t out_size)
 {
     DIR *d = opendir(target);
     if (d == NULL)
         return 0;
+
     struct dirent *e;
     int found = 0;
     while ((e = readdir(d)) != NULL)
     {
-        if (strncmp(e->d_name, "migr_backup_", 12) == 0)
-        {
-            join_path(out, out_size, target, e->d_name);
-            found = 1;
-            break;
-        }
+        size_t len = strlen(e->d_name);
+        if (strncmp(e->d_name, "migr_backup_", 12) != 0)
+            continue;
+        if (len >= 8 && strcmp(e->d_name + len - 8, ".partial") == 0)
+            continue;
+
+        char container[PATH_MAX];
+        join_path(container, sizeof(container), target, e->d_name);
+        join_path(out, out_size, container, "data");
+        found = 1;
+        break;
     }
     closedir(d);
     return found;
@@ -1095,41 +1186,6 @@ static void test_overlap_rejected_before_destination_created_live_and_dry_run(vo
     remove_tree(target_parent);
 }
 
-static void test_same_basename_gate_runs_before_destination_creation(void)
-{
-    printf(BLUE "::" NC " production: the transitional same-basename gate refuses before the destination exists\n");
-
-    char home[PATH_MAX];
-    fresh_mkdtemp(home, sizeof(home), "plan_home");
-    mkdir_p(home);
-    setenv("HOME", home, 1);
-
-    char dir_a[PATH_MAX], dir_b[PATH_MAX], same_a[PATH_MAX], same_b[PATH_MAX];
-    join_path(dir_a, sizeof(dir_a), home, "dir_a");
-    mkdir_p(dir_a);
-    join_path(dir_b, sizeof(dir_b), home, "dir_b");
-    mkdir_p(dir_b);
-    join_path(same_a, sizeof(same_a), dir_a, "same.txt");
-    write_file(same_a, "A");
-    join_path(same_b, sizeof(same_b), dir_b, "same.txt");
-    write_file(same_b, "B");
-    char *paths[] = { same_a, same_b, NULL };
-
-    char target_parent[PATH_MAX];
-    fresh_mkdtemp(target_parent, sizeof(target_parent), "plan_target_parent");
-    char dest[PATH_MAX];
-    join_path(dest, sizeof(dest), target_parent, "dest");
-
-    dry_run = 0;
-    char output[8192];
-    int rc = run_backup_capturing(dest, BACKUP_EXPLICIT_PATHS, paths, output, sizeof(output));
-    check(rc != 0, "the flat-layout same-basename gate refuses the backup");
-    check(!dir_exists(dest), "the destination directory was never created");
-
-    remove_tree(home);
-    remove_tree(target_parent);
-}
-
 static void test_dangling_explicit_leaf_symlink_is_captured_as_symlink(void)
 {
     printf(BLUE "::" NC " production: a dangling explicit leaf symlink is captured as a symlink, not skipped or dereferenced\n");
@@ -1151,12 +1207,12 @@ static void test_dangling_explicit_leaf_symlink_is_captured_as_symlink(void)
     int rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths, output, sizeof(output));
     check(rc == 0, "backup succeeds capturing a dangling leaf symlink");
 
-    char backup_subdir[PATH_MAX];
-    check(find_backup_subdir(target, backup_subdir, sizeof(backup_subdir)),
-          "the dated backup subdirectory was created");
+    char payload_dir[PATH_MAX];
+    check(find_payload_dir(target, payload_dir, sizeof(payload_dir)),
+          "a finalized container with a data/ namespace was created");
 
     char copied_link[PATH_MAX];
-    join_path(copied_link, sizeof(copied_link), backup_subdir, "danglink");
+    join_path(copied_link, sizeof(copied_link), payload_dir, "EXPLICIT_0");
     struct stat st;
     check(lstat(copied_link, &st) == 0 && S_ISLNK(st.st_mode),
           "the dangling symlink was captured as a symlink, not skipped or turned into something else");
@@ -1187,11 +1243,11 @@ static void test_dangling_builtin_dotfile_is_captured_not_silently_dropped(void)
     int rc = run_backup_capturing(target, BACKUP_CRITICAL, paths, output, sizeof(output));
     check(rc == 0, "backup succeeds");
 
-    char backup_subdir[PATH_MAX];
-    check(find_backup_subdir(target, backup_subdir, sizeof(backup_subdir)),
-          "the dated backup subdirectory was created");
+    char payload_dir[PATH_MAX];
+    check(find_payload_dir(target, payload_dir, sizeof(payload_dir)),
+          "a finalized container with a data/ namespace was created");
     char copied_profile[PATH_MAX];
-    join_path(copied_profile, sizeof(copied_profile), backup_subdir, ".profile");
+    join_path(copied_profile, sizeof(copied_profile), payload_dir, "BUILTIN_DOT_PROFILE");
     struct stat st;
     check(lstat(copied_profile, &st) == 0 && S_ISLNK(st.st_mode),
           "the dangling .profile symlink the plan promised to capture actually made it into the backup");
@@ -1200,9 +1256,9 @@ static void test_dangling_builtin_dotfile_is_captured_not_silently_dropped(void)
     remove_tree(target);
 }
 
-static void test_target_path_too_long_does_not_leak_the_plan(void)
+static void test_unusable_target_does_not_leak_the_plan(void)
 {
-    printf(BLUE "::" NC " production: a destination whose dated subdirectory path overflows PATH_MAX does not leak the plan\n");
+    printf(BLUE "::" NC " production: a destination that cannot even be inspected does not leak the plan\n");
 
     char home[PATH_MAX];
     fresh_mkdtemp(home, sizeof(home), "plan_home");
@@ -1212,8 +1268,8 @@ static void test_target_path_too_long_does_not_leak_the_plan(void)
     join_path(profile, sizeof(profile), home, ".profile");
     write_file(profile, "x");
 
-    // Long enough that target + "/migr_backup_YYYYMMDD_HHMMSS" overflows
-    // PATH_MAX, while target itself still fits in its own buffer.
+    // A target too long for the kernel to resolve at all: it fails at the very
+    // first stat(), after the plan has been built and before a container exists.
     char target[PATH_MAX];
     size_t fill = sizeof(target) - 10;
     memset(target, 'x', fill);
@@ -1223,8 +1279,8 @@ static void test_target_path_too_long_does_not_leak_the_plan(void)
     dry_run = 0;
     char output[8192];
     int rc = run_backup_capturing(target, BACKUP_CRITICAL, paths, output, sizeof(output));
-    check(rc != 0, "backup refuses a target whose dated subdirectory path would overflow PATH_MAX");
-    check(strstr(output, "Backup path too long") != NULL, "the refusal names the reason");
+    check(rc != 0, "backup refuses a target it cannot inspect");
+    check(strstr(output, "Could not access") != NULL, "the refusal names the reason");
     // Valgrind (run separately over this binary) is what actually proves the
     // plan built for this call was freed rather than leaked; this test's own
     // job is just to exercise the exact code path that leak lived on.
@@ -1258,6 +1314,7 @@ int main(void)
     test_root_slash_is_valid_manual_native();
     test_home_slash_classifies_descendant_as_home_relative();
 
+    test_destination_inside_a_root_is_a_conflict();
     test_duplicate_explicit_root_is_rejected();
     test_directory_ancestor_descendant_overlap_is_rejected();
     test_leaf_symlink_root_does_not_falsely_overlap_target();
@@ -1269,10 +1326,9 @@ int main(void)
 
     test_missing_explicit_path_rejects_before_target_creation();
     test_overlap_rejected_before_destination_created_live_and_dry_run();
-    test_same_basename_gate_runs_before_destination_creation();
     test_dangling_explicit_leaf_symlink_is_captured_as_symlink();
     test_dangling_builtin_dotfile_is_captured_not_silently_dropped();
-    test_target_path_too_long_does_not_leak_the_plan();
+    test_unusable_target_does_not_leak_the_plan();
 
     if (failures > 0)
     {

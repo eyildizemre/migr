@@ -52,7 +52,7 @@ void print_help(void)
     printf("  ./migr backup /mnt/drive\n");
     printf("  ./migr backup /mnt/drive --comprehensive\n");
     printf("  ./migr backup /mnt/drive ~/Documents ~/Projects\n");
-    printf("  ./migr restore /mnt/drive/migr_backup_20260720\n");
+    printf("  ./migr restore /mnt/drive/migr_backup_20260720_143012\n");
 }
 
 int confirm_action(const char *message)

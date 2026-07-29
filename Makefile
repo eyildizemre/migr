@@ -46,8 +46,8 @@ $(TEST_RESTORE_NATIVE): tests/test_restore_native.c fileops.o utils.o
 $(TEST_RESTORE_DISPATCH): tests/test_restore_dispatch.c restore.o fileops.o manifest.o container.o utils.o xdg.o detect.o
 	$(CC) $(CFLAGS) -o $@ tests/test_restore_dispatch.c restore.o fileops.o manifest.o container.o utils.o xdg.o detect.o
 
-$(TEST_BACKUP_PLAN): tests/test_backup_plan.c backup.o backup_plan.o fileops.o fsprobe.o manifest.o packages.o utils.o xdg.o detect.o
-	$(CC) $(CFLAGS) -o $@ tests/test_backup_plan.c backup.o backup_plan.o fileops.o fsprobe.o manifest.o packages.o utils.o xdg.o detect.o
+$(TEST_BACKUP_PLAN): tests/test_backup_plan.c backup.o backup_plan.o container.o fileops.o fsprobe.o manifest.o packages.o utils.o xdg.o detect.o
+	$(CC) $(CFLAGS) -o $@ tests/test_backup_plan.c backup.o backup_plan.o container.o fileops.o fsprobe.o manifest.o packages.o utils.o xdg.o detect.o
 
 test: $(TARGET) $(TEST_DETECT) $(TEST_PATHJOIN) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE) $(TEST_MANIFEST) $(TEST_CONTAINER) $(TEST_RESTORE_NATIVE) $(TEST_RESTORE_DISPATCH) $(TEST_BACKUP_PLAN)
 	./$(TEST_DETECT)

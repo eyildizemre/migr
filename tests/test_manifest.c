@@ -1,12 +1,17 @@
 // Unit tests for the versioned manifest model (docs/DECISIONS.md D15, D16) and for
-// the renamed legacy manifest, which production still exclusively writes/reads.
+// the legacy manifest, which is now read-only.
 //
-// manifest_percent_encode/decode and manifest_read_v1/manifest_write_v1 are declared
-// in manifest.h even though most of them are exercised only through the round trip
-// here; they are not yet called from backup.c/restore.c (that wiring is a later,
-// separate commit), so this binary is the only thing exercising them for now.
+// Both public writers are covered: manifest_write_v1_at(), which is what
+// production calls with the container's own directory fd, and the pathname
+// entry that wraps it. They share one validator and one serializer, and the
+// cases below assert that shared-ness directly rather than assuming it.
+//
+// manifest_percent_encode/decode are file-local to manifest.c and are proven
+// here indirectly, through round trips carrying the exact problem bytes the
+// format exists to survive.
 
 #define _GNU_SOURCE
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -181,12 +186,24 @@ static void test_legacy_detection(void)
 {
     printf(BLUE "::" NC " versioned manifest: legacy detection\n");
 
-    // A real legacy file, written by the (renamed) legacy API.
+    // Production no longer writes this format at all, so the fixture is the
+    // literal on-disk shape earlier versions of migr produced -- exactly what a
+    // reader that must keep those backups restorable has to accept.
     const char *basenames[LEGACY_MANIFEST_XDG_COUNT] = {
         "Belgeler", "Indirilenler", "Resimler", "Masaustu", "Videolar", "Muzik"
     };
-    check(legacy_manifest_write(test_dir, basenames, LEGACY_MANIFEST_XDG_COUNT) == 0,
-          "legacy_manifest_write still succeeds");
+    char legacy_path[512];
+    snprintf(legacy_path, sizeof(legacy_path), "%s/manifest.txt", test_dir);
+    {
+        FILE *f = fopen(legacy_path, "w");
+        check(f != NULL, "fixture: an unversioned manifest.txt can be written");
+        if (f != NULL)
+        {
+            for (int i = 0; i < LEGACY_MANIFEST_XDG_COUNT; i++)
+                fprintf(f, "%s=%s\n", legacy_manifest_keys[i], basenames[i]);
+            fclose(f);
+        }
+    }
 
     Manifest m;
     check(manifest_read_v1(test_dir, &m) == MANIFEST_STATUS_LEGACY,
@@ -583,6 +600,110 @@ static void test_write_rejects_inconsistent_input(void)
     }
 }
 
+// Reads a whole file into buf; returns its length, or -1.
+static long slurp(const char *path, char *buf, size_t buf_size)
+{
+    FILE *f = fopen(path, "r");
+    if (f == NULL)
+        return -1;
+    size_t n = fread(buf, 1, buf_size - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    return (long)n;
+}
+
+static void fill_reference_manifest(Manifest *m, ManifestRoot *roots)
+{
+    memset(m, 0, sizeof(*m));
+    m->version = MANIFEST_CURRENT_VERSION;
+    m->representation = CLONE_NATIVE_TREE;
+    m->scope = MANIFEST_SCOPE_CRITICAL;
+    m->sidecar_version = 0;
+    m->has_source_identity = 1;
+    strcpy(m->machine_id, "0123456789abcdef0123456789abcdef");
+    m->source_uid = 1000;
+
+    memset(roots, 0, 2 * sizeof(*roots));
+    strcpy(roots[0].id, "XDG_DOCUMENTS_DIR");
+    roots[0].policy = ROOT_POLICY_XDG;
+    strcpy(roots[0].payload_path, "XDG_DOCUMENTS_DIR");
+    strcpy(roots[0].source_path, "/home/u/Belgeler");
+
+    strcpy(roots[1].id, "BUILTIN_DOT_SSH");
+    roots[1].policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(roots[1].payload_path, "BUILTIN_DOT_SSH");
+    strcpy(roots[1].source_path, ".ssh");
+    strcpy(roots[1].restore_path, ".ssh");
+    roots[1].has_restore_path = 1;
+
+    m->root_count = 2;
+    m->roots = roots;
+}
+
+static void test_fd_writer(void)
+{
+    printf(BLUE "::" NC " versioned manifest: fd-relative writer\n");
+
+    Manifest m;
+    ManifestRoot roots[2];
+    fill_reference_manifest(&m, roots);
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/manifest.txt", test_dir);
+
+    remove_manifest(test_dir);
+    int dir_fd = open(test_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    check(dir_fd >= 0, "fixture: the container directory opens");
+    check(manifest_write_v1_at(dir_fd, &m) == 0, "manifest_write_v1_at succeeds");
+
+    Manifest read;
+    check(manifest_read_v1_at(dir_fd, &read) == MANIFEST_STATUS_VALID,
+          "what it wrote reads back as VALID through the fd reader");
+    check(read.root_count == 2 &&
+          strcmp(read.roots[0].id, "XDG_DOCUMENTS_DIR") == 0 &&
+          read.roots[0].policy == ROOT_POLICY_XDG &&
+          strcmp(read.roots[1].restore_path, ".ssh") == 0,
+          "the root table round-trips through the fd writer");
+    manifest_free(&read);
+
+    // Both entries must produce identical bytes: they are the same serializer
+    // reached two ways, and a container's manifest must not depend on how the
+    // caller happened to address it.
+    char fd_bytes[4096];
+    long fd_len = slurp(path, fd_bytes, sizeof(fd_bytes));
+    remove_manifest(test_dir);
+    check(manifest_write_v1(test_dir, &m) == 0, "manifest_write_v1 succeeds on the same model");
+    char path_bytes[4096];
+    long path_len = slurp(path, path_bytes, sizeof(path_bytes));
+    check(fd_len > 0 && fd_len == path_len && memcmp(fd_bytes, path_bytes, (size_t)fd_len) == 0,
+          "the fd and pathname writers produce byte-identical output");
+
+    // A symlink standing where manifest.txt belongs must not be written
+    // through: the format state would land wherever it points.
+    remove_manifest(test_dir);
+    char outside[512];
+    snprintf(outside, sizeof(outside), "%s/outside.txt", test_dir);
+    write_raw(outside, "untouched");
+    check(symlink(outside, path) == 0, "fixture: manifest.txt is a symlink to another file");
+
+    check(manifest_write_v1_at(dir_fd, &m) == 1,
+          "manifest_write_v1_at refuses to write through a symlinked manifest.txt");
+    char after[512];
+    check(slurp(outside, after, sizeof(after)) == 9 && strcmp(after, "untouched") == 0,
+          "the symlink's target is unchanged");
+    check(manifest_write_v1(test_dir, &m) == 1,
+          "the pathname writer refuses the same symlink");
+    check(slurp(outside, after, sizeof(after)) == 9 && strcmp(after, "untouched") == 0,
+          "the symlink's target is still unchanged");
+
+    unlink(path);
+    unlink(outside);
+    close(dir_fd);
+
+    check(manifest_write_v1_at(-1, &m) == 1, "an invalid container fd is refused");
+    check(manifest_write_v1_at(0, NULL) == 1, "a NULL manifest is refused");
+}
+
 int main(void)
 {
     printf(BLUE "::" NC " manifest (unit)\n");
@@ -601,6 +722,7 @@ int main(void)
     test_malformed_variants();
     test_io_error();
     test_write_rejects_inconsistent_input();
+    test_fd_writer();
 
     rmdir(test_dir);
 

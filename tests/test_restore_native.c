@@ -1,7 +1,8 @@
 // Unit tests for the FD-anchored native restore core (docs/DECISIONS.md D15
 // and D16): restore_native_at(), restore_native_preflight_at(), and
-// restore_native_source_status_at(), all declared in fileops.h. Backup's own
-// path-based walker (clone_tree() / backup_capture()) is untouched by this
+// restore_native_source_status_at(), all declared in fileops.h. The capture
+// direction has its own walker (backup_capture_at(), which anchors only its
+// destination and reads the source by pathname); it is untouched by this
 // module and is covered separately by tests/test_special_files.c.
 //
 // restore_native_at() always runs restore_native_preflight_at()'s exact

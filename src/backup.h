@@ -4,18 +4,29 @@
 typedef enum {
     BACKUP_CRITICAL,      /**< Documents, Downloads, Pictures, dotfiles, browser profiles, and packages. */
     BACKUP_COMPREHENSIVE, /**< Everything in BACKUP_CRITICAL plus Desktop, Videos, Music, and Projects. */
-    BACKUP_EXPLICIT_PATHS          /**< Only the caller-supplied paths; no dotfiles, packages, or manifest. */
+    BACKUP_EXPLICIT_PATHS          /**< Only the caller-supplied paths; no dotfiles and no package list. */
 } BackupMode;
 
 /**
- * @brief Backs up files from HOME to a dated subdirectory inside target.
+ * @brief Backs up files from HOME into a versioned container inside target.
  *
- * Creates target/migr_backup_YYYYMMDD/ and copies files according to mode.
+ * Writes to target/migr_backup_YYYYMMDD_HHMMSS[-N].partial/ and publishes it
+ * with an atomic no-replace rename to the same name without the suffix, so an
+ * interrupted backup can never look complete (docs/DECISIONS.md D15). Every
+ * captured object lives below the container's data/, addressed by its manifest
+ * root id; manifest.txt and packages.txt are migr-owned control artifacts at
+ * the container root.
+ *
  * BACKUP_CRITICAL copies Documents, Downloads, Pictures, dotfiles, browser
  * profiles, and the package list. BACKUP_COMPREHENSIVE adds Desktop, Videos,
- * Music, and Projects. BACKUP_EXPLICIT_PATHS copies only the caller-supplied paths.
- * A manifest.txt recording XDG directory names is written for all modes except
- * BACKUP_EXPLICIT_PATHS.
+ * Music, and Projects. BACKUP_EXPLICIT_PATHS copies only the caller-supplied
+ * paths and exports no package list. Every mode writes a versioned manifest.txt:
+ * it carries the format version, representation and root table, so a container
+ * without one is not a backup migr can restore.
+ *
+ * When an earlier run of the same job (docs/DECISIONS.md D15: representation,
+ * scope, root table, machine id and uid) left exactly one unfinished container
+ * behind, this resumes into it instead of starting a second one.
  *
  * @param target Destination directory; the dated backup subdirectory is created inside it.
  * @param mode   Selects which files are included (BACKUP_CRITICAL, BACKUP_COMPREHENSIVE, or BACKUP_EXPLICIT_PATHS).

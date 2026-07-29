@@ -1,71 +1,24 @@
 #define _GNU_SOURCE
+#include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <unistd.h>
+#include <sys/types.h>
 #include <time.h>
-#include <limits.h>
-#include <errno.h>
+#include <unistd.h>
 
 #include "backup.h"
 #include "backup_plan.h"
+#include "container.h"
 #include "fileops.h"
 #include "fsprobe.h"
 #include "manifest.h"
 #include "packages.h"
 #include "utils.h"
-#include "xdg.h"
-
-// Return the final path component as a span, ignoring trailing slashes.
-static size_t path_leaf(const char *path, const char **leaf)
-{
-    const char *end = path + strlen(path);
-    while (end > path && end[-1] == '/')
-        end--;
-
-    const char *start = end;
-    while (start > path && start[-1] != '/')
-        start--;
-
-    *leaf = start;
-    return (size_t)(end - start);
-}
-
-// create directory if it doesn't exist
-static int create_dir(const char *path)
-{
-    struct stat st;
-    if (stat(path, &st) == 0)
-    {
-        if (!S_ISDIR(st.st_mode))
-        {
-            printf("Error: %s exists but is not a directory\n", path);
-            return 1;
-        }
-        return 0;
-    }
-    if (errno != ENOENT)
-    {
-        // A real access failure (e.g. EACCES) must not masquerade as "absent";
-        // otherwise dry-run would promise to create something it cannot reach.
-        printf("Error: Could not access %s\n", path);
-        return 1;
-    }
-
-    if (dry_run)
-    {
-        printf("[dry-run] Would create directory: %s\n", path);
-        return 0;
-    }
-
-    if (mkdir(path, 0755) != 0)
-    {
-        printf("Error: Could not create directory %s\n", path);
-        return 1;
-    }
-    return 0;
-}
 
 // Validate and, if needed, create the top-level backup destination.
 // Sets *created only when THIS call made the directory, so a later refusal can
@@ -87,6 +40,8 @@ static int ensure_target_root(const char *path, int *created)
     }
     if (errno != ENOENT)
     {
+        // A real access failure (e.g. EACCES) must not masquerade as "absent";
+        // otherwise dry-run would promise to create something it cannot reach.
         printf("Error: Could not access %s\n", path);
         return 1;
     }
@@ -122,170 +77,223 @@ static int ensure_target_root(const char *path, int *created)
     return 1;
 }
 
-static int clone_item(const CloneContext *ctx, const char *src, const char *dest)
+/* ------------------------------------------------------------------------- */
+/* Source identity (docs/DECISIONS.md D15).                                  */
+/* ------------------------------------------------------------------------- */
+
+// Machine id plus uid is what proves two invocations are the same job, so an
+// unreadable or malformed machine id is not fatal: the backup still runs, it
+// just cannot adopt an existing partial, because a timestamp or scope label
+// alone never proves identity. Anything the manifest writer would reject is
+// treated as unavailable rather than written out and turned into a fatal
+// manifest failure later.
+static int read_machine_id(char *out, size_t out_size)
 {
-    // Compute the destination before the dry-run branch so a path that would be
-    // refused live is refused in dry-run too: the preview must match reality.
-    const char *name;
-    size_t name_len = path_leaf(src, &name);
-    if (name_len == 0)
-    {
-        printf("Error: Path has no destination name: %s\n", src);
-        return 1;
-    }
+    static const char *const sources[] = {
+        "/etc/machine-id",
+        "/var/lib/dbus/machine-id",
+        NULL
+    };
 
-    char full_dest[PATH_MAX];
-    if (path_join_n(full_dest, sizeof(full_dest), dest, name, name_len) != 0)
+    for (int i = 0; sources[i] != NULL; i++)
     {
-        printf("Error: Destination path too long for %s\n", src);
-        return 1;
-    }
+        FILE *f = fopen(sources[i], "r");
+        if (f == NULL)
+            continue;
 
-    if (dry_run)
-    {
-        printf("  Would copy: %s -> %s\n", src, full_dest);
+        char line[MANIFEST_MACHINE_ID_MAX];
+        char *read = fgets(line, sizeof(line), f);
+        fclose(f);
+        if (read == NULL)
+            continue;
+
+        line[strcspn(line, "\r\n")] = '\0';
+        size_t len = strlen(line);
+        if (len == 0 || len >= out_size)
+            continue;
+
+        int hex = 1;
+        for (size_t c = 0; c < len; c++)
+            if (!isxdigit((unsigned char)line[c]))
+                hex = 0;
+        if (!hex)
+            continue;
+
+        memcpy(out, line, len + 1);
         return 0;
     }
+    return -1;
+}
 
-    if (verbose)
-        printf("  Copying: %s\n", src);
+/* ------------------------------------------------------------------------- */
+/* Plan to manifest.                                                          */
+/* ------------------------------------------------------------------------- */
 
-    if (backup_capture(ctx, src, full_dest) != 0)
+// The manifest is production's resume identity, not a byproduct of it: this is
+// the model container_adopt() matches against and the model that is written
+// into the container. The root table is copied entry by entry into its own
+// array — a BackupPlanRoot embeds a ManifestRoot but is larger, so the plan's
+// roots are not a ManifestRoot[] and must never be handed to the manifest API
+// as one.
+static int manifest_from_plan(const BackupPlan *plan, Manifest *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->version = MANIFEST_CURRENT_VERSION;
+    out->representation = CLONE_NATIVE_TREE; // replaced by the probe's verdict
+    out->scope = plan->scope;
+    out->sidecar_version = 0;
+    out->root_count = plan->root_count;
+
+    if (plan->root_count > 0)
     {
-        printf("Error: Failed to copy %s\n", src);
-        return 1;
+        out->roots = calloc((size_t)plan->root_count, sizeof(*out->roots));
+        if (out->roots == NULL)
+        {
+            printf("Error: out of memory building the backup manifest\n");
+            return -1;
+        }
+        for (int i = 0; i < plan->root_count; i++)
+            out->roots[i] = plan->roots[i].manifest_root;
     }
+
+    char machine_id[MANIFEST_MACHINE_ID_MAX];
+    if (read_machine_id(machine_id, sizeof(machine_id)) == 0)
+    {
+        memcpy(out->machine_id, machine_id, strlen(machine_id) + 1);
+        out->source_uid = getuid();
+        out->has_source_identity = 1;
+    }
+
     return 0;
 }
 
-// Clones a known-existing source into backup_dir/rel_path, preserving
-// rel_path's own directory structure (its parent components, e.g. ".config",
-// are created first). Unlike the flat clone_item(), rel_path may itself
-// contain '/'.
-//
-// src is the caller's already-resolved, already-verified source address
-// (BackupPlanRoot.capture_path) -- never re-derived from home+rel_path here,
-// and checked with lstat() rather than a symlink-following stat(): the plan
-// already proved this exact object (a dangling symlink included) exists, so
-// re-deriving the path and re-stat()ing it could silently disagree with the
-// plan for a dangling leaf symlink, dropping a promised root without ever
-// reporting an error. A source that has genuinely vanished (or become
-// inaccessible) since planning is therefore a real error here, never a
-// silent "not found, skip" -- the plan already promised this root would be
-// captured. Returns 1 if copied, -1 on error.
-static int clone_nested(const CloneContext *ctx, const char *src, const char *backup_dir, const char *rel_path)
+/* ------------------------------------------------------------------------- */
+/* Container payload namespace.                                              */
+/* ------------------------------------------------------------------------- */
+
+// Every user-derived object lives below data/ (docs/DECISIONS.md D15), so the
+// container root stays reserved for migr's own control artifacts. Opened with
+// O_NOFOLLOW | O_DIRECTORY: in an adopted container this entry may already
+// exist, and only a genuine directory is acceptable — a symlink there would
+// otherwise place the whole payload outside the container.
+static int open_data_dir(int container_fd)
 {
-    struct stat st;
-    if (lstat(src, &st) != 0)
-    {
-        printf("Error: Could not access %s\n", src);
+    if (mkdirat(container_fd, "data", 0700) != 0 && errno != EEXIST)
         return -1;
-    }
-
-    char dest[PATH_MAX];
-    if (path_join(dest, sizeof(dest), backup_dir, rel_path) != 0)
-        return -1;
-
-    // Split the path to create parent directories first.
-    // The OS kernel will throw ENOENT if we try to copy into a non-existent parent directory.
-    const char *slash = strrchr(rel_path, '/');
-    if (slash)
-    {
-        char parent[PATH_MAX];
-        if (path_join_n(parent, sizeof(parent), backup_dir, rel_path, (size_t)(slash - rel_path)) != 0)
-            return -1;
-        if (create_dir(parent) != 0)
-            return -1;
-    }
-
-    if (dry_run)
-    {
-        printf("  Would copy: %s -> %s\n", src, dest);
-        return 1;
-    }
-
-    if (verbose)
-        printf("  Copying: %s\n", src);
-
-    if (backup_capture(ctx, src, dest) != 0)
-    {
-        printf("Error: Failed to copy %s\n", src);
-        return -1;
-    }
-    return 1;
+    return openat(container_fd, "data", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
 }
 
-// Transitional flat-layout compatibility gates (docs/DECISIONS.md D16
-// roadmap): the planner itself accepts two explicit roots sharing a
-// basename, and a "/" MANUAL_NATIVE root, as legitimate distinct roots --
-// but today's writer still clones every root to a single flat
-// backup_dir/<basename>, which cannot represent either. Both checks belong
-// here, not in backup_plan.c, and must be deleted outright once A2.6's
-// data/EXPLICIT_n addressing replaces this writer.
-static int flat_layout_incompatible(const BackupPlan *plan)
+/* ------------------------------------------------------------------------- */
+/* Presentation.                                                              */
+/* ------------------------------------------------------------------------- */
+
+// Grouping is presentation only: it selects which heading a root prints under,
+// never where its payload goes. That address is the manifest's payload_path.
+static const struct {
+    BackupRootGroup group;
+    const char *heading;
+} root_sections[] = {
+    { BACKUP_ROOT_MAIN,     "[Main Directories]" },
+    { BACKUP_ROOT_DOTFILE,  "[Dotfiles]" },
+    { BACKUP_ROOT_BROWSER,  "[Browser Profiles]" },
+    { BACKUP_ROOT_EXPLICIT, "[Explicit Paths]" },
+};
+enum { ROOT_SECTION_COUNT = sizeof(root_sections) / sizeof(root_sections[0]) };
+
+static void preview_roots(const BackupPlan *plan, int *count)
 {
-    for (int i = 0; i < plan->root_count; i++)
+    for (int s = 0; s < ROOT_SECTION_COUNT; s++)
     {
-        if (plan->roots[i].group != BACKUP_ROOT_EXPLICIT)
-            continue;
-
-        const char *name_i;
-        size_t len_i = path_leaf(plan->roots[i].capture_path, &name_i);
-        if (len_i == 0)
+        int printed_heading = 0;
+        for (int i = 0; i < plan->root_count; i++)
         {
-            printf("Error: '%s' has no destination name; the current flat backup layout "
-                   "cannot represent it.\n", plan->roots[i].capture_path);
-            return 1;
-        }
-
-        for (int j = i + 1; j < plan->root_count; j++)
-        {
-            if (plan->roots[j].group != BACKUP_ROOT_EXPLICIT)
+            const BackupPlanRoot *root = &plan->roots[i];
+            if (root->group != root_sections[s].group)
                 continue;
 
-            const char *name_j;
-            size_t len_j = path_leaf(plan->roots[j].capture_path, &name_j);
-            if (len_i == len_j && memcmp(name_i, name_j, len_i) == 0)
+            if (!printed_heading)
             {
-                printf("Error: these paths share the name '%.*s' and would overwrite each other:\n",
-                       (int)len_i, name_i);
-                printf("  %s\n  %s\n", plan->roots[i].capture_path, plan->roots[j].capture_path);
-                printf("Rename one or back them up separately.\n");
-                return 1;
+                printf("\n%s\n", root_sections[s].heading);
+                printed_heading = 1;
+            }
+            printf("  Would capture: %s -> data/%s\n",
+                   root->capture_path, root->manifest_root.payload_path);
+            (*count)++;
+        }
+    }
+}
+
+static void capture_roots(const CloneContext *ctx, const BackupPlan *plan, int data_fd,
+                          int *count, int *had_error)
+{
+    for (int s = 0; s < ROOT_SECTION_COUNT; s++)
+    {
+        int printed_heading = 0;
+        for (int i = 0; i < plan->root_count; i++)
+        {
+            const BackupPlanRoot *root = &plan->roots[i];
+            if (root->group != root_sections[s].group)
+                continue;
+
+            if (!printed_heading)
+            {
+                printf("\n%s\n", root_sections[s].heading);
+                printed_heading = 1;
+            }
+            if (verbose)
+                printf("  Capturing: %s -> data/%s\n",
+                       root->capture_path, root->manifest_root.payload_path);
+
+            if (backup_capture_at(ctx, root->capture_path, data_fd,
+                                  root->manifest_root.payload_path) != 0)
+            {
+                printf("Error: Failed to capture %s\n", root->capture_path);
+                *had_error = 1;
+            }
+            else
+            {
+                (*count)++;
             }
         }
     }
-    return 0;
 }
 
-// Clones one planned root according to its presentation group: MAIN and
-// EXPLICIT roots are flat-copied by basename (clone_item); DOTFILE and
-// BROWSER roots preserve their home-relative structure (clone_nested), since
-// several of them nest under a shared parent (e.g. ".config/google-chrome").
-// Both pass root->capture_path -- the plan's own already-verified source
-// address -- directly; neither re-derives or re-classifies it.
-static void clone_plan_root(const CloneContext *ctx, const char *backup_dir,
-                           const BackupPlanRoot *root, int *count, int *had_error)
+/* ------------------------------------------------------------------------- */
+
+// Claims the container this invocation will write into: the one an earlier,
+// interrupted run of the same job left behind if there is exactly one, a fresh
+// one otherwise. Only CONTAINER_ERR_NO_MATCH means "nothing to resume"; every
+// other adopt failure — an ambiguous match, an I/O error mid-scan — fails the
+// whole invocation rather than quietly starting a second container beside work
+// that may already exist.
+static int claim_container(const char *target, const Manifest *manifest,
+                           BackupContainer *out, int *adopted)
 {
-    if (root->group == BACKUP_ROOT_DOTFILE || root->group == BACKUP_ROOT_BROWSER)
+    *adopted = 0;
+
+    ContainerStatus status = container_adopt(target, manifest, out);
+    if (status == CONTAINER_OK)
     {
-        if (clone_nested(ctx, root->capture_path, backup_dir, root->manifest_root.restore_path) > 0)
-            (*count)++;
+        *adopted = 1;
+        return 0;
+    }
+    if (status != CONTAINER_ERR_NO_MATCH)
+    {
+        if (status == CONTAINER_ERR_AMBIGUOUS)
+            printf("Error: more than one interrupted backup under %s matches this job; "
+                   "resuming would be a guess. Remove or move the ones you do not want.\n",
+                   target);
         else
-            *had_error = 1;
-        return;
+            printf("Error: could not examine existing backups under %s\n", target);
+        return -1;
     }
 
-    if (clone_item(ctx, root->capture_path, backup_dir) == 0)
-        (*count)++;
-    else
-        *had_error = 1;
-}
-
-static void free_xdg_dirs_arr(char **dirs)
-{
-    for (int i = 0; i < XDG_KEY_COUNT; i++)
-        free(dirs[i]);
+    if (container_reserve(target, time(NULL), out) != CONTAINER_OK)
+    {
+        printf("Error: Could not create a backup container under %s\n", target);
+        return -1;
+    }
+    return 0;
 }
 
 int backup(const char *target, BackupMode mode, char **paths)
@@ -300,177 +308,231 @@ int backup(const char *target, BackupMode mode, char **paths)
     // The plan is built before anything about the destination is even looked
     // at: it is read-only over the source side (never touches target, never
     // reads dry_run), so a rejected plan -- live or --dry-run alike -- never
-    // creates or mutates anything (docs/DECISIONS.md D16 roadmap, A2.5).
+    // creates or mutates anything (docs/DECISIONS.md D16).
     BackupPlan plan;
     if (backup_plan_build(home, mode, (const char *const *)paths, &plan) != 0)
         return 1;
 
-    if (flat_layout_incompatible(&plan))
+    // Asked before the destination is created, probed or previewed, so a
+    // destination inside a selected root is refused identically in a live run
+    // and a dry run, with nothing written either way.
+    if (backup_plan_destination_conflicts(&plan, target))
     {
         backup_plan_free(&plan);
         return 1;
     }
 
-    // The legacy manifest.txt format always records all six XDG basenames,
-    // including roots --critical does not capture. They therefore still need
-    // a resolution separate from the selected plan roots, but use the shared
-    // canonical key table and the same canonical HOME basis. Resolve them
-    // before any destination mutation -- not after the dated directory,
-    // packages, or copies already exist -- so a lexically long raw HOME cannot
-    // make this legacy-only step fail after the planner already succeeded
-    // (docs/DECISIONS.md D16 roadmap).
-    char *xdg_dirs[XDG_KEY_COUNT] = { NULL };
-    const char *basenames[XDG_KEY_COUNT] = { NULL };
-    if (mode != BACKUP_EXPLICIT_PATHS)
+    Manifest manifest;
+    if (manifest_from_plan(&plan, &manifest) != 0)
     {
-        char home_real[PATH_MAX];
-        if (realpath(home, home_real) == NULL ||
-            xdg_resolve(home_real, xdg_keys, xdg_fallbacks, xdg_dirs, XDG_KEY_COUNT) != 0)
+        backup_plan_free(&plan);
+        return 1;
+    }
+
+    int count = 0;
+
+    if (dry_run)
+    {
+        // The destination is inspected exactly as a live run would inspect it,
+        // and nothing beyond that: no probe (it writes), no container, no
+        // manifest, no data/, no package export.
+        int target_created = 0;
+        if (ensure_target_root(target, &target_created) != 0)
         {
-            printf("Error: HOME path too long to resolve user directories\n");
-            free_xdg_dirs_arr(xdg_dirs);
+            manifest_free(&manifest);
             backup_plan_free(&plan);
             return 1;
         }
-        for (int i = 0; i < XDG_KEY_COUNT; i++)
-        {
-            const char *last_slash = strrchr(xdg_dirs[i], '/');
-            basenames[i] = last_slash ? last_slash + 1 : xdg_dirs[i];
-        }
-    }
 
-    // Build the dated backup path first: it is pure string work, so a path that
-    // is too long fails before we create anything and needs no rollback.
-    char backup_dir[PATH_MAX];
-    time_t now = time(NULL);
-    struct tm *t = localtime(&now);
-    int dir_len = snprintf(backup_dir, sizeof(backup_dir), "%s/migr_backup_%04d%02d%02d",
-                           target, t->tm_year + 1900, t->tm_mon + 1, t->tm_mday);
-    if (dir_len < 0 || (size_t)dir_len >= sizeof(backup_dir))
-    {
-        printf("Error: Backup path too long: %s\n", target);
-        free_xdg_dirs_arr(xdg_dirs);
+        printf("Dry run mode enabled. No changes will be made.\n\n");
+        printf("Would create a versioned backup container under: %s\n", target);
+        printf("  Its migr_backup_<timestamp> name is chosen when the backup actually runs.\n");
+
+        preview_roots(&plan, &count);
+
+        printf("\n[Controls]\n");
+        printf("  Would write manifest.txt\n");
+        if (mode != BACKUP_EXPLICIT_PATHS)
+            printf("  Would export package list to packages.txt\n");
+
+        printf("\n===========================================================\n");
+        printf("Dry run complete: %d items would be copied\n", count);
+        printf("===========================================================\n");
+
+        manifest_free(&manifest);
         backup_plan_free(&plan);
-        return 1;
+        return 0;
     }
 
     int target_created = 0;
     if (ensure_target_root(target, &target_created) != 0)
     {
-        free_xdg_dirs_arr(xdg_dirs);
+        manifest_free(&manifest);
         backup_plan_free(&plan);
         return 1;
     }
 
-    // Probe the destination and choose a representation before creating anything more.
-    // --dry-run skips it: the probe writes to the destination, which would break the
-    // "no changes" contract, so dry-run keeps the native preview. Native proceeds as
-    // before; portable is refused (not built yet); an unreliable probe is fatal, never a
-    // silent fall-through. If we created the destination root this run and then refuse,
-    // roll it back so a rejected attempt leaves nothing behind.
+    // Probe the destination and choose a representation before any container
+    // exists. Portable is refused (not built yet); an unreliable probe is
+    // fatal, never a silent fall-through. If we created the destination root
+    // this run and then refuse, roll it back so a rejected attempt leaves
+    // nothing behind.
     CloneRepresentation repr = CLONE_NATIVE_TREE;
-    if (!dry_run)
+    FsCapabilityProfile profile;
+    const char *refusal = NULL;
+    if (fsprobe(target, &profile) != 0)
+        refusal = "could not probe the destination filesystem at";
+    else if (select_representation(&profile, &repr) != 0)
+        refusal = "the destination filesystem is not usable for backup at";
+    else if (repr != CLONE_NATIVE_TREE)
+        refusal = "portable representation is not implemented yet, so migr refuses "
+                  "rather than lose Linux file metadata at";
+
+    if (refusal != NULL)
     {
-        FsCapabilityProfile profile;
-        if (fsprobe(target, &profile) != 0)
-        {
-            printf("Error: could not probe the destination filesystem at %s\n", target);
-            if (target_created) rmdir(target);
-            free_xdg_dirs_arr(xdg_dirs);
-            backup_plan_free(&plan);
-            return 1;
-        }
-        if (select_representation(&profile, &repr) != 0)
-        {
-            printf("Error: the destination filesystem at %s is not usable for backup\n", target);
-            if (target_created) rmdir(target);
-            free_xdg_dirs_arr(xdg_dirs);
-            backup_plan_free(&plan);
-            return 1;
-        }
-        if (repr != CLONE_NATIVE_TREE)
-        {
-            printf("Error: %s cannot natively hold Linux file metadata, and portable mode is "
-                   "not implemented yet — refusing rather than losing it.\n", target);
-            if (target_created) rmdir(target);
-            free_xdg_dirs_arr(xdg_dirs);
-            backup_plan_free(&plan);
-            return 1;
-        }
+        printf("Error: %s %s\n", refusal, target);
+        if (target_created) rmdir(target);
+        manifest_free(&manifest);
+        backup_plan_free(&plan);
+        return 1;
     }
 
-    if (create_dir(backup_dir) != 0)
+    // The representation is part of the resume identity, so it must be settled
+    // before the manifest is matched against an existing partial.
+    manifest.representation = repr;
+
+    BackupContainer container = {0};
+    int adopted = 0;
+    if (claim_container(target, &manifest, &container, &adopted) != 0)
     {
         if (target_created) rmdir(target);
-        free_xdg_dirs_arr(xdg_dirs);
+        manifest_free(&manifest);
         backup_plan_free(&plan);
         return 1;
     }
 
-    if (dry_run)
-        printf("Dry run mode enabled. No changes will be made.\n\n");
+    int container_fd = container_root_fd(&container);
+    int had_error = 0;
+    // A partial is only worth resuming if its manifest proves which job it
+    // belongs to. A fresh container whose manifest never got written can never
+    // be adopted, so it must not be reported as resumable.
+    int resumable = 1;
 
-    printf("Backing up to: %s\n\n", backup_dir);
-
-    int count = 0;
-    int had_error = 0; // set when any file copy fails, so success is never faked
-
-    // Representation chosen by the probe above (native here; portable already refused).
-    CloneContext ctx = { .operation = CLONE_BACKUP, .representation = repr };
-
-    if (mode == BACKUP_EXPLICIT_PATHS)
+    // A fresh container gets its manifest before any payload: it is the format
+    // discriminator, the representation record and the root table, so a
+    // container without one is not a v1 container at all. An adopted one
+    // already carries a manifest that was read back and matched during
+    // adoption; rewriting it would truncate proven-good state for no gain.
+    if (!adopted && manifest_write_v1_at(container_fd, &manifest) != 0)
     {
-        printf("[Explicit Paths]\n");
-        for (int i = 0; i < plan.root_count; i++)
-            clone_plan_root(&ctx, backup_dir, &plan.roots[i], &count, &had_error);
+        printf("Error: Could not write manifest.txt into the backup container\n");
+        had_error = 1;
+        resumable = 0;
     }
-    else
+
+    int data_fd = -1;
+    if (!had_error)
     {
-        printf("[Main Directories]\n");
-        for (int i = 0; i < plan.root_count; i++)
-            if (plan.roots[i].group == BACKUP_ROOT_MAIN)
-                clone_plan_root(&ctx, backup_dir, &plan.roots[i], &count, &had_error);
-
-        printf("\n[Dotfiles]\n");
-        for (int i = 0; i < plan.root_count; i++)
-            if (plan.roots[i].group == BACKUP_ROOT_DOTFILE)
-                clone_plan_root(&ctx, backup_dir, &plan.roots[i], &count, &had_error);
-
-        printf("\n[Browser Profiles]\n");
-        for (int i = 0; i < plan.root_count; i++)
-            if (plan.roots[i].group == BACKUP_ROOT_BROWSER)
-                clone_plan_root(&ctx, backup_dir, &plan.roots[i], &count, &had_error);
-
-        printf("\n[Packages]\n");
-        char pkg_path[PATH_MAX];
-        if (path_join(pkg_path, sizeof(pkg_path), backup_dir, "packages.txt") != 0)
+        data_fd = open_data_dir(container_fd);
+        if (data_fd < 0)
         {
-            printf("  Warning: package list path too long, skipping\n");
+            printf("Error: Could not open the container's data/ directory\n");
             had_error = 1;
         }
-        else if (dry_run)
-            printf("  Would export package list to: %s\n", pkg_path);
-        else
-            packages(pkg_path);
-
-        if (dry_run)
-            printf("  Would write manifest: %s/manifest.txt\n", backup_dir);
-        else
-            legacy_manifest_write(backup_dir, basenames, XDG_KEY_COUNT);
     }
 
-    free_xdg_dirs_arr(xdg_dirs);
-    backup_plan_free(&plan);
+    if (!had_error)
+    {
+        printf("Backing up to: %s/%s\n", target, container_current_name(&container));
+        if (adopted)
+            printf("Resuming an interrupted backup of the same job.\n");
+
+        CloneContext ctx = { .operation = CLONE_BACKUP, .representation = repr };
+        capture_roots(&ctx, &plan, data_fd, &count, &had_error);
+        close(data_fd);
+
+        // packages.txt is a migr-owned control artifact, not a payload root, so
+        // it stays at the container root. Restore acts on whichever one it
+        // finds without re-deriving the backup's scope, so this slot must
+        // always end up matching this invocation: a fresh list for a scope that
+        // exports one, and demonstrably empty for a scope that does not.
+        // Anything else -- a stale list inside an adopted container, or one
+        // planted there -- would otherwise be published and later replayed.
+        printf("\n[Packages]\n");
+        if (mode == BACKUP_EXPLICIT_PATHS)
+        {
+            if (packages_clear_at(container_fd, "packages.txt") != 0)
+            {
+                printf("Error: could not clear packages.txt from the backup container\n");
+                had_error = 1;
+            }
+            else
+            {
+                printf("  No package list: explicit paths are backed up exactly as given.\n");
+            }
+        }
+        else
+        {
+            // A missing package list is tolerable and has always been a
+            // warning; a control slot that could not be made safe is not.
+            int pkg = packages_at(container_fd, "packages.txt");
+            if (pkg < 0)
+            {
+                printf("Error: could not clear packages.txt from the backup container\n");
+                had_error = 1;
+            }
+            else if (pkg > 0)
+            {
+                printf("  Warning: no package list was written for this backup.\n");
+            }
+        }
+    }
 
     printf("\n===========================================================\n");
-    if (dry_run)
-        printf("Dry run complete: %d items would be copied\n", count);
-    else if (had_error)
+
+    if (had_error)
+    {
+        // Nothing is published: an incomplete container must never look
+        // complete.
         printf("Backup finished with errors: %d items copied, some items failed\n", count);
-    else
-        printf("Backup complete: %d items copied\n", count);
-    printf("Location: %s\n", backup_dir);
+        if (resumable)
+            printf("Incomplete backup kept for resume: %s/%s\n",
+                   target, container_current_name(&container));
+        else
+            printf("Unusable container left behind; it cannot be resumed, remove it: %s/%s\n",
+                   target, container_current_name(&container));
+        printf("===========================================================\n");
+        container_close(&container);
+        manifest_free(&manifest);
+        backup_plan_free(&plan);
+        return 1;
+    }
+
+    ContainerStatus final_status = container_finalize(&container);
+    if (final_status != CONTAINER_OK)
+    {
+        if (final_status == CONTAINER_ERR_FINAL_EXISTS)
+            printf("Error: a completed backup already occupies this container's final name\n");
+        else if (final_status == CONTAINER_ERR_NOREPLACE)
+            printf("Error: %s does not support the atomic rename migr publishes backups with\n", target);
+        else
+            printf("Error: Could not publish the completed backup container\n");
+
+        printf("Incomplete backup kept for resume: %s/%s\n",
+               target, container_current_name(&container));
+        printf("===========================================================\n");
+        container_close(&container);
+        manifest_free(&manifest);
+        backup_plan_free(&plan);
+        return 1;
+    }
+
+    printf("Backup complete: %d items copied\n", count);
+    printf("Location: %s/%s\n", target, container_current_name(&container));
     printf("===========================================================\n");
 
-    return had_error ? 1 : 0;
+    container_close(&container);
+    manifest_free(&manifest);
+    backup_plan_free(&plan);
+    return 0;
 }

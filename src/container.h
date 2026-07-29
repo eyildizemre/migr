@@ -176,6 +176,31 @@ ContainerStatus container_finalize(BackupContainer *container);
 void container_close(BackupContainer *container);
 
 /**
+ * @brief The container directory's own fd, for writing control artifacts and
+ * data/ beneath it.
+ *
+ * Borrowed, not transferred: the handle keeps ownership (and keeps its flock()
+ * held through this same fd), so the caller must not close it. Valid for as
+ * long as the handle is not closed -- including across container_finalize(),
+ * which renames the directory without changing its identity.
+ *
+ * @return The fd, or -1 for NULL or a handle in CONTAINER_STATE_EMPTY.
+ */
+int container_root_fd(const BackupContainer *container);
+
+/**
+ * @brief The container's live leaf name: the ".partial" name while reserved or
+ * adopted, the published name once finalized.
+ *
+ * Lets a caller report where a container actually is without reaching into the
+ * handle or reconstructing the name from the D15 grammar itself.
+ *
+ * @return A pointer into the handle (valid until it is closed or reused), or
+ *         NULL for NULL or a handle in CONTAINER_STATE_EMPTY.
+ */
+const char *container_current_name(const BackupContainer *container);
+
+/**
  * @brief Whether name matches the exact ".partial" leaf grammar
  * container_reserve() can produce (docs/DECISIONS.md D15) -- i.e. whether it
  * names an in-progress or abandoned container, not a finalized one.
