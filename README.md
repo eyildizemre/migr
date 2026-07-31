@@ -173,6 +173,8 @@ recorded in [docs/DECISIONS.md](docs/DECISIONS.md).
 - [x] Localization (xdg-user-dirs support)
 - [x] Cross-locale restore mapping (manifest system)
 - [x] Resumable versioned backup containers
+- [ ] Backups to filesystems that cannot hold Linux metadata (exFAT/NTFS/FAT32)
+- [ ] VS Code extension list backup and restore
 - [ ] Logging
 - [ ] Network configuration backup
 - [ ] Self-contained backup (embed static binary)
