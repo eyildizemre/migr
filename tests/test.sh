@@ -8,10 +8,20 @@ RED='\033[0;31m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
+# Every backup whose scope exports a package list forks the distribution's real
+# listing command, and a single `dnf repoquery` costs more than the entire rest
+# of this suite. Only Phase 5 is about that command's own output; every other
+# phase just needs *a* package list to exist. So the suite runs with stubs ahead
+# of the real tools on PATH, and Phase 5 restores REAL_PATH to exercise the
+# genuine one exactly once.
+STUB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/stubs" && pwd)"
+export REAL_PATH="$PATH"
+export PATH="$STUB_DIR:$PATH"
+
 # --- 1. SETUP & TEARDOWN ---
 setup() {
     TEST_DIR=$(mktemp -d) # opens a subshell, runs `mktemp -d`, and assigns output to TEST_DIR
-    # export makes the variable available to subprocesses 
+    # export makes the variable available to subprocesses
     # since child processes won't have access to parent shell's variables by default
     export TEST_DIR
     export HOME="$TEST_DIR/home"
@@ -336,7 +346,10 @@ test_packages() {
     echo -e "${BLUE}::${NC} Phase 5: packages"
 
     local pkg_file="$TEST_DIR/pkgs.txt"
-    ../migr packages "$pkg_file"
+    # The one phase that runs the distribution's genuine listing command: every
+    # assertion below is about what that command actually produces, so a stub
+    # here would assert nothing at all.
+    PATH="$REAL_PATH" ../migr packages "$pkg_file"
 
     assert_file_exists "$pkg_file"
 

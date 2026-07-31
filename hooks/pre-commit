@@ -4,9 +4,11 @@
 # Halt immediately on any error, including those hidden within pipelines
 set -eo pipefail
 
-# Is this a C/shell/Makefile change? If not, skip the build and tests to save time
-if ! git diff --cached --name-only | grep -qE '\.(c|h|sh)$|(^|/)Makefile$'; then
-    echo "→ No C/shell/Makefile changes staged, skipping build & tests."
+# Does anything staged affect the build or the suite? If not, skip both to save
+# time. tests/stubs/* is matched by path rather than extension on purpose: those
+# files shadow real command names on PATH, so they cannot carry one.
+if ! git diff --cached --name-only | grep -qE '\.(c|h|sh)$|(^|/)Makefile$|^tests/stubs/'; then
+    echo "→ Nothing staged that the build or tests depend on, skipping both."
     exit 0
 fi
 

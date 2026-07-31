@@ -58,7 +58,11 @@ test: $(TARGET) $(TEST_DETECT) $(TEST_PATHJOIN) $(TEST_SPECIAL_FILES) $(TEST_FSP
 	./$(TEST_CONTAINER)
 	./$(TEST_RESTORE_NATIVE)
 	./$(TEST_RESTORE_DISPATCH)
-	./$(TEST_BACKUP_PLAN)
+# This one drives backup() end to end, so a successful --critical run forks the
+# distribution's real package listing command. Give it the same stubs test.sh
+# uses; only test.sh's own Phase 5 is about that command's real output. Each
+# recipe line runs in its own shell, so this never reaches the line below.
+	PATH="$(CURDIR)/tests/stubs:$$PATH" ./$(TEST_BACKUP_PLAN)
 	cd tests && bash test.sh
 
 clean:
