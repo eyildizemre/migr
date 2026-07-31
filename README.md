@@ -50,7 +50,7 @@ git config core.hooksPath hooks
 
 ```
 report                Show backup analysis report (default when no command given)
-backup <PATH>         Clone files and packages to PATH
+backup <PATH>         Create a resumable backup container under PATH
 packages <FILE>       Export installed packages to FILE
 restore <SOURCE>      Restore files and packages from a backup at SOURCE
 help                  Show help
@@ -98,6 +98,51 @@ Backup scope (`backup` only, mutually exclusive):
 
 **Packages (all scopes except explicit paths):** The list of packages you explicitly installed — not the thousands of dependencies pulled in alongside them — saved as packages.txt and reinstalled on restore. Anything the new distribution cannot resolve is written to `skipped-packages.txt` rather than silently dropped.
 
+## Backup Containers
+
+A successful live backup is published as:
+
+```
+migr_backup_YYYYMMDD_HHMMSS[-N]/
+```
+
+While the backup is running, migr writes to the same name with a `.partial` suffix.
+A failed or interrupted backup is never published as complete; a later invocation of
+the same job can resume a matching usable partial. Restore refuses `.partial`
+containers. If multiple backups begin in the same second, `-1`, `-2`, and so on keep
+their names distinct without replacing an existing backup.
+
+The container root is reserved for migr-owned control files. Everything selected from
+the user's filesystem lives below `data/`:
+
+```
+migr_backup_YYYYMMDD_HHMMSS[-N]/
+├── manifest.txt
+├── packages.txt        # present when this scope exports a package list
+└── data/
+    └── <logical roots>
+```
+
+`manifest.txt` records the version, representation, scope, root table, and stable source
+identity when one is available. Older unversioned and manifest-less backups remain
+readable through an isolated legacy restore path.
+
+Explicit paths keep accepting valid sources both inside and outside `$HOME`. A root
+proven to be inside the source home is restored automatically to the same relative
+location below the target home. An external root is still captured on a native
+destination, under `data/EXPLICIT_n`, but restore only reports its recorded source and
+backup location; it does not guess where to write it.
+
+The backup destination must resolve outside every selected root, including through
+symlinks. Otherwise migr refuses the entire invocation before creating anything, so a
+backup can never recurse into and consume its own output.
+
+Before a live backup creates a container, migr probes the destination filesystem.
+Portable capture is not implemented yet, so a destination that cannot faithfully hold
+the required Linux semantics is refused rather than used with silent metadata loss.
+External explicit roots also remain ineligible for future portable capture until they
+have a faithful restore-address policy.
+
 ## Report
 
 Running `migr` or `migr report` scans your home directory and shows sizes for main directories, dotfiles, dev tools, and browsers — plus a critical backup size estimate.
@@ -108,7 +153,7 @@ This tool was fully refactored to eliminate all shell-based execution. It no lon
 
 In their place, a custom pure C POSIX engine handles all I/O and process execution:
 
-- **`backup_capture()` / `restore_native_at()`** — separate backup and restore walkers. Backup captures pathname-based source trees; restore anchors both payload and destination traversal to directory file descriptors. Both preserve permissions and timestamps, reproduce symlinks and FIFOs, and skip sockets and device nodes with a warning. Replaces `cp -r`.
+- **`backup_capture_at()` / `restore_native_at()`** — separate backup and restore walkers. Backup reads a pathname-based source into a directory-fd-anchored payload destination; restore anchors both payload and destination traversal to directory file descriptors. Both preserve permissions and timestamps, reproduce symlinks and FIFOs, and skip sockets and device nodes with a warning. Replaces `cp -r`.
 - **`get_dir_size()`** — recursive directory size calculation via `lstat` and `dirent`. Replaces `du`.
 - **`run_command()`** — shell-free subprocess execution via `fork`/`execvp`/`waitpid`. Replaces `system()`.
 - **`run_command_capture()`** — same as above, with stdout captured into a buffer via an anonymous `pipe`. Replaces `popen()`.
@@ -127,6 +172,7 @@ recorded in [docs/DECISIONS.md](docs/DECISIONS.md).
 - [x] Comprehensive vs. critical-only backup modes
 - [x] Localization (xdg-user-dirs support)
 - [x] Cross-locale restore mapping (manifest system)
+- [x] Resumable versioned backup containers
 - [ ] Logging
 - [ ] Network configuration backup
 - [ ] Self-contained backup (embed static binary)

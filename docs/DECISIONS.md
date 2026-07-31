@@ -405,7 +405,7 @@ representation.
 
 ## D15 — 2026-07-28 — Versioned backup containers isolate payload and finalize atomically
 
-**Status:** Decided — not yet implemented
+**Status:** Implemented — container namespace and lifecycle
 
 **Decision:** A versioned backup container reserves its root for migr-owned control
 artifacts (`manifest.txt`, `packages.txt`, `sidecar.migr`, and the shipped binary when
@@ -445,7 +445,7 @@ representation be selected before the container is created.
 
 ## D16 — 2026-07-28 — Explicit roots keep arbitrary capture, with bounded restore policies
 
-**Status:** Decided — not yet implemented
+**Status:** Implemented
 
 **Decision:** `migr backup <DEST> <PATH...>` continues to accept valid filesystem paths
 both inside and outside the source `$HOME`; being outside `$HOME` is not itself an

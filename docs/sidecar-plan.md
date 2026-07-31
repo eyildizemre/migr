@@ -32,17 +32,21 @@ encode/decode) but not one permanently shared loop:
 - **portable restore** — **sidecar-driven**: iterate the sidecar and replay, because
   the physical names are encoded and the sidecar is authoritative.
 
-Phase A established the boundary without manufacturing divergence early:
-`backup_capture()` and `restore_native()` validate a `CloneContext` and currently
-delegate to one private `clone_tree()` core while their native behaviour is still
-identical. `CloneContext` currently carries only the explicit operation
-(`CLONE_BACKUP` / `CLONE_RESTORE`) and representation (`CLONE_NATIVE_TREE` /
-`CLONE_PORTABLE_SIDECAR`). It can gain roots, sidecar state, capability data, or
-hardlink state only when a later phase gives those fields a real consumer. Portable
-restore remains a future sidecar-driven orchestration. No "null-ish" context is allowed
-to imply behaviour by its absence. A "sink hierarchy" was proposed and declined —
-explicit entry points that split as their algorithms actually diverge achieve the
-needed separation without class machinery.
+Phase A established the boundary without manufacturing divergence early: its
+`backup_capture()` and `restore_native()` entries initially delegated to one private
+`clone_tree()` core. Phase A2 introduced the first necessary divergence and removed
+that shared walker. Production backup now uses `backup_capture_at()` to read a
+pathname-based source into an already-open payload directory, while
+`restore_native_at()` anchors both payload and destination traversal to directory file
+descriptors. Their remaining shared contract is the explicit `CloneContext`; they share
+neither an orchestration loop nor walker-specific helpers. `CloneContext` carries the
+operation (`CLONE_BACKUP` / `CLONE_RESTORE`) and representation (`CLONE_NATIVE_TREE` /
+`CLONE_PORTABLE_SIDECAR`); it should gain sidecar, capability, or hardlink state only
+when a later phase gives that state a real consumer. Portable restore remains a future
+sidecar-driven orchestration. No "null-ish" context is allowed to imply behaviour by
+its absence. A "sink hierarchy" was proposed and declined — explicit entry points that
+split as their algorithms actually diverge achieve the needed separation without
+class machinery.
 
 ---
 
@@ -68,8 +72,9 @@ with regression coverage:
    basename both clone to the same name; files overwrite, directories merge. **Verified:**
    `migr backup /dst ~/a/foo.txt ~/b/foo.txt` kept only one `foo.txt`, yet reported
    `2 items copied`. Explicit-paths mode also writes no manifest, so there is no
-   disambiguation at all. Resolved by detecting and refusing basename collisions
-   (`a2aa086`).
+   disambiguation at all. Initially contained on `main` by detecting and refusing
+   basename collisions (`a2aa086`); Phase A2 replaced that temporary refusal with
+   stable ordinal payload roots (`ec89e18`, `2e2329a`).
 4. **Unchecked `snprintf` path assembly.** `PATH_MAX` buffers are filled without checking
    for truncation, silently producing wrong paths. Low severity then, but filename
    encoding (Phase D) can expand a name past the buffer. Resolved by checking bounded
@@ -323,8 +328,8 @@ manifest is written; include/exclude precedence and XDG-child addressing belong 
 
 ## Manifest evolution and legacy detection
 
-The current manifest has no version and records only XDG basenames. The new container
-needs it to carry at least:
+Legacy manifests have no version and record only XDG basenames. Phase A2 added a v1
+manifest carrying:
 
 - a manifest format version;
 - native/portable mode and container layout;
@@ -335,15 +340,15 @@ needs it to carry at least:
 - the sidecar format version when a sidecar is present.
 
 This is required even for native backups, which deliberately have no sidecar and
-therefore cannot use the sidecar magic to identify their layout. Phase A2 introduces
-the versioned manifest reader/writer together with explicit legacy detection:
+therefore cannot use the sidecar magic to identify their layout. The versioned reader
+and writer now coexist with explicit legacy detection:
 
 - a recognized new version is parsed according to that schema;
 - an unknown new version is rejected rather than guessed;
 - the existing unversioned XDG-key manifest, and the older manifests-absent layout, use
   an isolated legacy restore path.
 
-The exact textual manifest grammar can stay small; versioning and an unambiguous legacy
+The textual grammar remains deliberately small; versioning and an unambiguous legacy
 boundary are the requirements.
 
 ---
@@ -397,22 +402,27 @@ column is delivered in that dimension's phase (mode/uid/gid in B, xattr in E, ha
 in G), so no single phase carries "make everything faithful at once."
 
 - **Phase A — Structural foundation (complete).** `CloneContext { operation,
-  representation }`; distinct `backup_capture()` and `restore_native()` entries over
-  the private native `clone_tree()` core; standalone six-capability `fsprobe()` plus
-  pure `select_representation()`; and backup preflight wiring. Native destinations
-  retain the existing copy behaviour. An unavailable native semantic selects portable,
-  but backup currently refuses that verdict before creating the dated container because
-  portable capture is not implemented; an unreliable probe also refuses rather than
-  silently falling through. Restore remains native, dry-run does not probe, and there is
-  no production capability override. Existing regression tests remained green and new
-  probe/preflight tests were added (`e6d367b`, `ac301da`, `ea1a3d9`).
-- **Phase A2 — Versioned container.** `.partial` + atomic rename + control/payload
-  non-collision; versioned manifest + legacy detection. The first observable format
-  change, kept separate from the refactor so it is reviewed on its own. It also introduces
-  D16's explicit-root table: home-relative roots restore automatically; external native
-  roots are reported but left in place; invalid root sets fail before container creation.
-  Test that legacy backups still restore through the isolated legacy path and new backups
-  adopt the new layout.
+  representation }`; the initial distinct backup/restore entries over one private
+  native walker; standalone six-capability `fsprobe()` plus pure
+  `select_representation()`; and backup preflight wiring. Native destinations retained
+  the existing copy behaviour. Its policy still holds: an unavailable native semantic
+  selects portable, but backup refuses that verdict before creating any container
+  because portable capture is not implemented; an unreliable probe also refuses rather
+  than silently falling through. Restore remains native, dry-run does not probe, and
+  there is no production capability override. Existing regression tests remained green
+  and new probe/preflight tests were added (`e6d367b`, `ac301da`, `ea1a3d9`).
+- **Phase A2 — Versioned container (complete).** The first observable format change:
+  strict v1 manifest + isolated legacy detection; deterministic root planning;
+  directory-fd-anchored backup and restore destinations; `.partial` reservation,
+  matching-job adoption and no-replace finalization; and mandatory `data/`
+  control/payload separation. D16's explicit-root table restores home-relative roots
+  automatically and reports external native roots without inventing a destination.
+  Invalid root sets fail before destination mutation, incomplete backups never look
+  final, and legacy backups remain restorable. The contract landed in `758ab35`; the
+  implementation followed in `2a4bc4b`, `606dae3`, `90d1b41`, `0373bfa`, `ec89e18`,
+  and `2e2329a`. The full suite and native roundtrip passed on Fedora, Ubuntu and Arch;
+  real vfat loopbacks on both VMs selected portable, refused before container creation,
+  and left the mounted destinations empty.
 - **Phase B — Format + core metadata.** Finalize the byte grammar; sidecar writer/reader
   with magic+version, committed entry groups, truncated-tail and precedence; finalize the
   deletion representation needed by H; mode/uid/gid/mtime plus the atime decision; file
@@ -454,13 +464,13 @@ should not be added until such a user-facing need exists.
   replacement, unknown version), versioned/unversioned/unknown manifest handling,
   explicit-root policy roundtrip, and `user.*` xattr roundtrip. Separate test binaries in
   the `tests/test_detect.c` mould.
-- **Phase A2 container/root integration:** same-second invocations choose distinct names;
-  a failed backup never publishes a final container; an existing final is never replaced;
-  a home-contained explicit root restores to the same target-home-relative address; an
-  external root remains in `data/EXPLICIT_n` and is reported without being restored;
-  missing, duplicate, or overlapping explicit roots refuse the whole invocation before
-  container creation; leaf and ancestor symlink cases exercise component-aware
-  classification.
+- **Phase A2 container/root integration (complete):** same-second invocations choose
+  distinct names; a failed backup never publishes a final container; an existing final
+  is never replaced; a home-contained explicit root restores to the same
+  target-home-relative address; an external root remains in `data/EXPLICIT_n` and is
+  reported without being restored; missing, duplicate, or overlapping explicit roots
+  refuse the whole invocation before container creation; leaf and ancestor symlink
+  cases exercise component-aware classification.
 - **Portable orchestration integration (once that path exists):** run full
   backup→restore fixtures on real lossy filesystems. If a narrowly scoped test-only seam
   is needed for faster native-filesystem runs, it may supply a synthetic profile to the
@@ -494,11 +504,12 @@ should not be added until such a user-facing need exists.
   with a warning (no `had_error`). What a *lossy* destination does (a FIFO placeholder+record
   vs skip; sockets/devices always skipped) is still open and belongs to Phase C/D, not the
   current engine.
-- **Before Phase A2 — settled by D15/D16:** payload lives under `data/`; a unique
-  `HHMMSS[-N].partial` is atomically finalized without replacing an existing container;
-  resume identity includes stable source identity and the normalized root set. Explicit
-  paths remain arbitrary: home-contained roots are `HOME_RELATIVE`, other native roots
-  are reported as `MANUAL_NATIVE`, and portable capture refuses a manual-only root.
+- **Phase A2 — settled and implemented by D15/D16:** payload lives under `data/`; a
+  unique `HHMMSS[-N].partial` is atomically finalized without replacing an existing
+  container; resume identity includes stable source identity and the normalized root
+  set. Explicit paths remain arbitrary: home-contained roots are `HOME_RELATIVE`, other
+  native roots are reported as `MANUAL_NATIVE`, and portable capture refuses a
+  manual-only root.
 - **When `conf` is designed:** define include/exclude precedence and resolve overlaps
   between configured paths and locale-mapped XDG roots before emitting the manifest root
   set.
@@ -509,10 +520,11 @@ should not be added until such a user-facing need exists.
 - **Before Phase B:** source-change behaviour (retry, fail, or explicit warning) and the
   operation result when required metadata cannot be captured or replayed. Phase E extends
   the same result policy to xattrs/ACLs.
-  - *Existing precedent (`main`):* a `packages.txt` / `manifest.txt` write failure is a
-    warning, not a backup-level error — the payload copy is what "backup" means, these are
-    aids. The sidecar result policy should stay consistent with this and not silently promote
-    such failures to errors.
+  - *Existing precedent:* the required v1 `manifest.txt` is part of container validity,
+    so a write failure blocks finalization; package export remains optional and warns
+    without invalidating copied payload. A portable sidecar is fidelity-critical, not
+    analogous to the package list, so its eventual failure policy must preserve that
+    distinction.
 - **Before declaring D8 implemented:** reconcile D13 with native sparse files — preserve
   holes in native mode, or document that "full fidelity" has a sparse-file exception.
 
@@ -550,10 +562,10 @@ The throughline holds: adopt what the review *found*, decline the scale it *assu
 The plan is the active implementation guide, but accepted choices must be reflected in
 the repository's authoritative documents at their gates:
 
-- update D6/D8 when atime, sparse fidelity, container, or format behaviour is settled;
+- update D6/D8 when atime, sparse fidelity, or sidecar-format behaviour is settled;
 - keep D13's native/portable boundary consistent with the dimension table;
-- update `docs/TODO.md` to match this phase plan and remove its old skippable
-  `--no-prescan` wording;
+- Phase A2's landed container/root behaviour is synchronized across D15/D16,
+  `docs/TODO.md`, and README;
 - update README's D8/full-fidelity claim only when the accepted native contract is
   actually implemented.
 
