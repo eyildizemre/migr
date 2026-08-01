@@ -564,8 +564,7 @@ the repository's authoritative documents at their gates:
 
 - update D6/D8 when atime, sparse fidelity, or sidecar-format behaviour is settled;
 - keep D13's native/portable boundary consistent with the dimension table;
-- Phase A2's landed container/root behaviour is synchronized across D15/D16,
-  `docs/TODO.md`, and README;
+- Phase A2's landed container/root behaviour is synchronized across D15/D16 and README;
 - update README's D8/full-fidelity claim only when the accepted native contract is
   actually implemented.
 
