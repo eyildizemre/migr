@@ -610,6 +610,21 @@ descriptor, and a post-copy `fstat` must match the pre-copy device, inode, type,
 mode, uid/gid, timestamps, and ctime. A source change is fatal; there is no retry that
 could silently join two different source states.
 
+Native restore reads its own source (the payload tree it is restoring from) under the
+same discipline, not only capture's read of the user's original files. The entry-gate
+tests added ahead of the native metadata-fidelity work surfaced a concrete instance of
+why this matters: `restore_entry_at()`'s directory branch always recurses during
+`RESTORE_VALIDATE` (unlike the FIFO/regular branches, which return before touching
+content), so its own `readdir()` perturbs the source directory's atime before
+`RESTORE_APPLY` takes its metadata snapshot -- restored directory (and symlink) atime
+is not currently exact. The fix is a single read-only metadata snapshot taken once per
+source object, before `RESTORE_VALIDATE` runs, reused by `RESTORE_APPLY` rather than
+re-read from a second, later open. This is preferred over merely adding `O_NOATIME` to
+restore's reads (which would stop the atime corruption but leave the redundant
+double-read in place) because it is the same "read-only inventory before mutation"
+shape already required above for the ownership preflight, done in the same pass rather
+than deferred to a later one.
+
 Portable restore performs a global read-only preflight and then per-entry
 fd-anchored, component-by-component revalidation with `O_NOFOLLOW`. Absolute paths,
 `..`, empty interior components, symlink redirects, two distinct logical entries that
