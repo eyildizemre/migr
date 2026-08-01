@@ -11,6 +11,7 @@
 
 #define _GNU_SOURCE
 #include <dirent.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -132,6 +133,40 @@ int main(void)
                    repr == CLONE_NATIVE_TREE ? "native" : "portable");
         else
             printf("    (observed verdict: refuse)\n");
+    }
+
+    int root_fd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    check(root_fd >= 0, "timestamp probe root opens by fd");
+    if (root_fd >= 0)
+    {
+        struct timespec original[2] = {
+            { .tv_sec = 1700010101, .tv_nsec = 111111111 },
+            { .tv_sec = 1700010202, .tv_nsec = 222222222 }
+        };
+        check(futimens(root_fd, original) == 0,
+              "timestamp probe fixture times are set");
+        struct stat before;
+        check(fstat(root_fd, &before) == 0,
+              "timestamp probe fixture times are readable");
+
+        int nsec_exact = -1;
+        int timestamp_rc = fsprobe_timestamps_fd(root_fd, &nsec_exact);
+        check(timestamp_rc == 0 && (nsec_exact == 0 || nsec_exact == 1),
+              "fd-anchored timestamp probe runs and reports nsec policy");
+
+        struct stat after;
+        int times_preserved = fstat(root_fd, &after) == 0 &&
+                              after.st_atim.tv_sec == before.st_atim.tv_sec &&
+                              after.st_mtim.tv_sec == before.st_mtim.tv_sec;
+        if (timestamp_rc == 0 && nsec_exact)
+            times_preserved = times_preserved &&
+                              after.st_atim.tv_nsec == before.st_atim.tv_nsec &&
+                              after.st_mtim.tv_nsec == before.st_mtim.tv_nsec;
+        check(times_preserved,
+              "fd-anchored timestamp probe restores anchor core times");
+        check(fsprobe_timestamps_fd(-1, &nsec_exact) == -1,
+              "timestamp probe rejects an invalid root fd");
+        close(root_fd);
     }
 
     // No residue: the root must be readable and empty again (fsprobe removed its subdir),

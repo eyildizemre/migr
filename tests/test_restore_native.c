@@ -650,8 +650,14 @@ static void test_skips_socket_without_failing(void)
             int bind_rc =
                 bind(sock_fd, (struct sockaddr *)&addr, sizeof(addr));
             if (bind_rc != 0)
-                perror("fixture bind");
-            check(bind_rc == 0, "fixture: bind the socket into proj/");
+            {
+                if (errno == EPERM || errno == EACCES || errno == EAFNOSUPPORT)
+                    printf(BLUE "  (skipped: Unix socket bind unavailable on this host)\n" NC);
+                else
+                    check(0, "fixture: bind the socket into proj/");
+            }
+            else
+                check(1, "fixture: bind the socket into proj/");
         }
         close(sock_fd);
     }

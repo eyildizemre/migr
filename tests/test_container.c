@@ -977,12 +977,20 @@ static void test_manifest_read_v1_at_rejects_non_regular(void)
             // -Wformat-truncation false positive seen elsewhere in this
             // codebase for a cross-statement bound gcc can't see.
             memcpy(addr.sun_path, manifest_path, manifest_path_len + 1);
-            check(bind(sock_fd, (struct sockaddr *)&addr, sizeof(addr)) == 0,
-                  "fixture: bind the socket to manifest.txt's path");
-            check(manifest_read_v1_at(c.partial_fd, &m) == MANIFEST_STATUS_MALFORMED,
-                  "manifest.txt as a Unix domain socket is refused as malformed");
+            int bind_rc = bind(sock_fd, (struct sockaddr *)&addr, sizeof(addr));
+            if (bind_rc == 0)
+            {
+                check(1, "fixture: bind the socket to manifest.txt's path");
+                check(manifest_read_v1_at(c.partial_fd, &m) == MANIFEST_STATUS_MALFORMED,
+                      "manifest.txt as a Unix domain socket is refused as malformed");
+                check(unlink(manifest_path) == 0,
+                      "fixture cleanup: remove the socket");
+            }
+            else if (errno == EPERM || errno == EACCES || errno == EAFNOSUPPORT)
+                printf(BLUE "  (skipped: Unix socket bind unavailable on this host)\n" NC);
+            else
+                check(0, "fixture: bind the socket to manifest.txt's path");
             close(sock_fd);
-            check(unlink(manifest_path) == 0, "fixture cleanup: remove the socket");
         }
     }
     else

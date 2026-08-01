@@ -960,16 +960,26 @@ static void test_socket_root_is_rejected(void)
         memset(&addr, 0, sizeof(addr));
         addr.sun_family = AF_UNIX;
         memcpy(addr.sun_path, sockpath, strlen(sockpath) + 1);
-        check(bind(sock_fd, (struct sockaddr *)&addr, sizeof(addr)) == 0, "fixture: bind the socket");
-
-        char *paths[] = { sockpath, NULL };
-        BackupPlan plan;
-        check(backup_plan_build(home, BACKUP_EXPLICIT_PATHS, (const char *const *)paths, &plan) != 0,
-              "a socket is refused as a backup root");
-        check(plan.root_count == 0 && plan.roots == NULL, "the rejected plan is left safely empty");
+        int bind_rc = bind(sock_fd, (struct sockaddr *)&addr, sizeof(addr));
+        if (bind_rc == 0)
+        {
+            check(1, "fixture: bind the socket");
+            char *paths[] = { sockpath, NULL };
+            BackupPlan plan;
+            check(backup_plan_build(home, BACKUP_EXPLICIT_PATHS,
+                                    (const char *const *)paths, &plan) != 0,
+                  "a socket is refused as a backup root");
+            check(plan.root_count == 0 && plan.roots == NULL,
+                  "the rejected plan is left safely empty");
+            backup_plan_free(&plan);
+            unlink(sockpath);
+        }
+        else if (errno == EPERM || errno == EACCES || errno == EAFNOSUPPORT)
+            printf(BLUE "  (skipped: Unix socket bind unavailable on this host)\n" NC);
+        else
+            check(0, "fixture: bind the socket");
 
         close(sock_fd);
-        unlink(sockpath);
     }
 
     remove_tree(home);

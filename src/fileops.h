@@ -14,10 +14,15 @@
 typedef enum { CLONE_BACKUP, CLONE_RESTORE } CloneOperation;
 typedef enum { CLONE_NATIVE_TREE, CLONE_PORTABLE_SIDECAR } CloneRepresentation;
 
-typedef struct {
+typedef struct CloneContext {
     CloneOperation operation;
     CloneRepresentation representation;
+    int timestamp_policy_configured;
+    int nsec_exact;
+    int metadata_preflight_done;
 } CloneContext;
+
+typedef struct MetadataProfiles MetadataProfiles;
 
 /**
  * @brief Captures a source tree into an open destination directory.
@@ -87,6 +92,20 @@ RestoreSourceStatus restore_native_source_status_at(int source_root_fd,
 int restore_native_preflight_at(const CloneContext *ctx,
                                 int source_root_fd, const char *source_rel,
                                 int destination_root_fd, const char *destination_rel);
+
+/**
+ * @brief Collects native-restore metadata profiles without probing or mutating.
+ *
+ * This is the read-only half of the restore ownership preflight. It is useful
+ * to aggregate all roots before confirmation, so a single later probe can
+ * reject the invocation before any destination payload is changed.
+ */
+int restore_native_metadata_inventory_at(const CloneContext *ctx,
+                                          int source_root_fd,
+                                          const char *source_rel,
+                                          int destination_root_fd,
+                                          const char *destination_rel,
+                                          MetadataProfiles *profiles);
 
 /**
  * @brief FD-anchored native restore core (docs/DECISIONS.md D15 and D16).

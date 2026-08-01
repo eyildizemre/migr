@@ -14,6 +14,7 @@ typedef enum {
     FS_CAP_RAW_NAMES,       // a corpus of Windows-hostile names round-trips byte-for-byte
     FS_CAP_CASE_SENSITIVE,  // "a" and "A" are distinct entries (else foo/FOO collide -> loss)
     FS_CAP_XATTR,           // a user.* xattr is set, read back exact, and removed
+    FS_CAP_TIMESTAMPS,      // atime/mtime seconds and ordering round-trip on file and dir
     FS_CAP_COUNT
 } FsCapability;
 
@@ -31,6 +32,7 @@ typedef struct {
 
 typedef struct {
     FsCapabilityResult capabilities[FS_CAP_COUNT];
+    int nsec_exact; // timestamp nanoseconds round-trip exactly; not a verdict input
 } FsCapabilityProfile;
 
 /**
@@ -51,6 +53,15 @@ typedef struct {
  *         must never be treated as a "go portable" signal.
  */
 int fsprobe(const char *existing_root, FsCapabilityProfile *out);
+
+/**
+ * @brief Measures timestamp fidelity under an already-open directory fd.
+ *
+ * The probe creates and removes a private child directory below root_fd and
+ * performs the same regular-file and directory seconds/order round-trip as
+ * fsprobe(), without constructing a full pathname.
+ */
+int fsprobe_timestamps_fd(int root_fd, int *nsec_exact);
 
 /**
  * @brief Reduce a capability profile to a clone representation.

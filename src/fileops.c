@@ -13,6 +13,7 @@
 #include <errno.h>
 
 #include "fileops.h" // CloneContext
+#include "metadata.h"
 #include "utils.h" // path_join
 
 /* ========================================================================= */
@@ -26,30 +27,6 @@
 /* which is what makes resuming into an adopted, previously-written         */
 /* container safe (docs/DECISIONS.md D15).                                  */
 /* ========================================================================= */
-
-// Metadata is applied through an already-open fd wherever the object type
-// permits one, so nothing swapped in at the destination address between
-// creation and this call can redirect a chmod onto a different object. A
-// symlink is the one type with no usable fd: chmod() would follow it and
-// change the target's mode (for an absolute link, the real source file), so
-// only its own timestamps are preserved, via AT_SYMLINK_NOFOLLOW.
-static void preserve_metadata_fd(int fd, const struct stat *st)
-{
-    fchmod(fd, st->st_mode & 07777);
-
-    struct timespec times[2];
-    times[0] = st->st_atim;
-    times[1] = st->st_mtim;
-    futimens(fd, times);
-}
-
-static void preserve_symlink_times(int dir_fd, const char *leaf, const struct stat *st)
-{
-    struct timespec times[2];
-    times[0] = st->st_atim;
-    times[1] = st->st_mtim;
-    utimensat(dir_fd, leaf, times, AT_SYMLINK_NOFOLLOW);
-}
 
 // A destination address this walker accepts is exactly one path component.
 // Anything with a '/' would be a path to re-resolve, which is precisely what
@@ -71,7 +48,8 @@ static int capture_entry_at(const CloneContext *ctx, const char *src,
 // symlink to somewhere else included -- is a genuine collision and is
 // refused rather than replaced.
 static int capture_symlink_at(const char *src, int dest_dir_fd, const char *leaf,
-                              const struct stat *st)
+                              const struct stat *st,
+                              MetadataTimestampPolicy policy)
 {
     char link_target[PATH_MAX];
     ssize_t len = readlink(src, link_target, sizeof(link_target) - 1);
@@ -99,8 +77,10 @@ static int capture_symlink_at(const char *src, int dest_dir_fd, const char *leaf
             return -1;
     }
 
-    preserve_symlink_times(dest_dir_fd, leaf, st);
-    return 0;
+    struct stat after;
+    if (lstat(src, &after) != 0 || !metadata_symlink_unchanged(st, &after))
+        return -1;
+    return metadata_apply_symlink_at(dest_dir_fd, leaf, st, policy);
 }
 
 // A write() that reports zero bytes for a non-zero request has made no
@@ -125,35 +105,73 @@ static int copy_file_contents(int src_fd, int dest_fd)
     return bytes_read < 0 ? -1 : 0;
 }
 
-static int capture_regular_at(const char *src, int dest_dir_fd, const char *leaf,
+static int capture_regular_at(const CloneContext *ctx, const char *src,
+                              int dest_dir_fd, const char *leaf,
                               const struct stat *st)
 {
+    MetadataTimestampPolicy policy = metadata_policy_from_context(ctx);
+    int src_fd = open(src, O_RDONLY | O_NOATIME | O_CLOEXEC | O_NOFOLLOW);
+    if (src_fd < 0)
+        return -1;
+
+    struct stat source_snapshot;
+    if (fstat(src_fd, &source_snapshot) != 0 ||
+        !S_ISREG(source_snapshot.st_mode) ||
+        !metadata_source_unchanged(st, &source_snapshot))
+    {
+        close(src_fd);
+        return -1;
+    }
+
     struct stat dest_st;
     if (fstatat(dest_dir_fd, leaf, &dest_st, AT_SYMLINK_NOFOLLOW) == 0)
     {
         // A matching size and mtime is the resume signal; a different type at
         // the same address is a collision, never something to truncate.
         if (!S_ISREG(dest_st.st_mode))
+        {
+            close(src_fd);
             return -1;
-        if (dest_st.st_size == st->st_size &&
-            dest_st.st_mtim.tv_sec == st->st_mtim.tv_sec)
-            return 0;
+        }
+        if (dest_st.st_size == source_snapshot.st_size &&
+            dest_st.st_mtim.tv_sec == source_snapshot.st_mtim.tv_sec &&
+            policy.nsec_exact &&
+            dest_st.st_mtim.tv_nsec == source_snapshot.st_mtim.tv_nsec)
+        {
+            int dest_fd = openat(dest_dir_fd, leaf,
+                                 O_WRONLY | O_NOFOLLOW | O_CLOEXEC);
+            if (dest_fd < 0)
+            {
+                close(src_fd);
+                return -1;
+            }
+            struct stat opened_dest;
+            int failed = fstat(dest_fd, &opened_dest) != 0 ||
+                         !S_ISREG(opened_dest.st_mode) ||
+                         metadata_apply_fd(dest_fd, &source_snapshot, policy) != 0;
+            struct stat after;
+            if (!failed && (fstat(src_fd, &after) != 0 ||
+                            !metadata_source_unchanged(&source_snapshot, &after)))
+                failed = 1;
+            if (close(dest_fd) != 0)
+                failed = 1;
+            if (close(src_fd) != 0)
+                failed = 1;
+            return failed ? -1 : 0;
+        }
     }
     else if (errno != ENOENT)
     {
+        close(src_fd);
         return -1;
     }
-
-    int src_fd = open(src, O_RDONLY | O_CLOEXEC);
-    if (src_fd < 0)
-        return -1;
 
     // O_NOFOLLOW makes a symlink planted at this address fail the open with
     // ELOOP instead of being written through; O_TRUNC can therefore only ever
     // apply to the regular file the check above already accepted.
     int dest_fd = openat(dest_dir_fd, leaf,
                          O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC,
-                         st->st_mode & 07777);
+                         source_snapshot.st_mode & 07777);
     if (dest_fd < 0)
     {
         close(src_fd);
@@ -161,20 +179,25 @@ static int capture_regular_at(const char *src, int dest_dir_fd, const char *leaf
     }
 
     int failed = copy_file_contents(src_fd, dest_fd) != 0;
-    if (!failed)
-        preserve_metadata_fd(dest_fd, st);
+    struct stat after;
+    if (!failed && (fstat(src_fd, &after) != 0 ||
+                    !metadata_source_unchanged(&source_snapshot, &after)))
+        failed = 1;
+    if (!failed && metadata_apply_fd(dest_fd, &source_snapshot, policy) != 0)
+        failed = 1;
 
     // A write deferred by the kernel (quota, ENOSPC, a network filesystem)
     // can surface only here, so a failed close means the payload is not
     // actually complete and must be reported as such.
     if (close(dest_fd) != 0)
         failed = 1;
-    close(src_fd);
+    if (close(src_fd) != 0)
+        failed = 1;
     return failed ? -1 : 0;
 }
 
 // The directory is created with owner-only access and given the source's real
-// mode by preserve_metadata_fd() only after its whole subtree is written.
+// mode by metadata_apply_fd() only after its whole subtree is written.
 // Creating it with the final mode up front would make a read-only source
 // directory (e.g. 0555) impossible to descend into and populate, and the
 // transient 0700 is never more permissive to group or other than the mode it
@@ -194,9 +217,30 @@ static int capture_directory_at(const CloneContext *ctx, const char *src,
     if (child_fd < 0)
         return -1;
 
-    DIR *dir = opendir(src);
+    int source_fd = open(src, O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                              O_NOATIME | O_CLOEXEC);
+    if (source_fd < 0)
+    {
+        close(child_fd);
+        return -1;
+    }
+    struct stat source_snapshot;
+    if (fstat(source_fd, &source_snapshot) != 0 ||
+        !S_ISDIR(source_snapshot.st_mode) ||
+        !metadata_source_unchanged(st, &source_snapshot))
+    {
+        close(source_fd);
+        close(child_fd);
+        return -1;
+    }
+
+    int scan_fd = fcntl(source_fd, F_DUPFD_CLOEXEC, 0);
+    DIR *dir = scan_fd < 0 ? NULL : fdopendir(scan_fd);
     if (dir == NULL)
     {
+        if (scan_fd >= 0)
+            close(scan_fd);
+        close(source_fd);
         close(child_fd);
         return -1;
     }
@@ -234,16 +278,25 @@ static int capture_directory_at(const CloneContext *ctx, const char *src,
 
     if (closedir(dir) != 0)
         failed = 1;
-    if (!failed)
-        preserve_metadata_fd(child_fd, st);
-    close(child_fd);
+    struct stat after;
+    if (!failed && (fstat(source_fd, &after) != 0 ||
+                    !metadata_source_unchanged(&source_snapshot, &after)))
+        failed = 1;
+    if (!failed && metadata_apply_fd(child_fd, &source_snapshot,
+                                     metadata_policy_from_context(ctx)) != 0)
+        failed = 1;
+    if (close(source_fd) != 0)
+        failed = 1;
+    if (close(child_fd) != 0)
+        failed = 1;
     return failed ? -1 : 0;
 }
 
 // Recreate the node itself, never its contents: reading a FIFO blocks until a
 // writer appears, which would hang the whole backup. An existing FIFO at this
 // address is accepted so an interrupted backup can resume past it.
-static int capture_fifo_at(int dest_dir_fd, const char *leaf, const struct stat *st)
+static int capture_fifo_at(const CloneContext *ctx, int dest_dir_fd,
+                           const char *leaf, const struct stat *st)
 {
     if (mkfifoat(dest_dir_fd, leaf, st->st_mode & 07777) != 0)
     {
@@ -263,9 +316,13 @@ static int capture_fifo_at(int dest_dir_fd, const char *leaf, const struct stat 
     if (fifo_fd < 0)
         return -1;
 
-    preserve_metadata_fd(fifo_fd, st);
-    close(fifo_fd);
-    return 0;
+    struct stat opened;
+    int failed = fstat(fifo_fd, &opened) != 0 || !S_ISFIFO(opened.st_mode) ||
+                 metadata_apply_fd(fifo_fd, st,
+                                    metadata_policy_from_context(ctx)) != 0;
+    if (close(fifo_fd) != 0)
+        failed = 1;
+    return failed ? -1 : 0;
 }
 
 static int capture_entry_at(const CloneContext *ctx, const char *src,
@@ -275,14 +332,15 @@ static int capture_entry_at(const CloneContext *ctx, const char *src,
     if (lstat(src, &st) != 0)
         return -1;
 
+    MetadataTimestampPolicy policy = metadata_policy_from_context(ctx);
     if (S_ISLNK(st.st_mode))
-        return capture_symlink_at(src, dest_dir_fd, leaf, &st);
+        return capture_symlink_at(src, dest_dir_fd, leaf, &st, policy);
     if (S_ISREG(st.st_mode))
-        return capture_regular_at(src, dest_dir_fd, leaf, &st);
+        return capture_regular_at(ctx, src, dest_dir_fd, leaf, &st);
     if (S_ISDIR(st.st_mode))
         return capture_directory_at(ctx, src, dest_dir_fd, leaf, &st);
     if (S_ISFIFO(st.st_mode))
-        return capture_fifo_at(dest_dir_fd, leaf, &st);
+        return capture_fifo_at(ctx, dest_dir_fd, leaf, &st);
 
     // Sockets and device nodes carry no copyable content: a socket is a runtime
     // IPC endpoint, a device node needs root to recreate. Skip either with a
@@ -469,6 +527,78 @@ static RestoreResolveResult resolve_parent(int root_fd, const char *rel,
     }
 }
 
+// Returns a duplicate fd for the directory in which the destination root will
+// actually be created or traversed. Existing directory roots use the root
+// directory itself; an absent leaf (or an absent intermediate) uses the
+// nearest existing parent. This is deliberately separate from resolve_parent:
+// a missing intermediate must remain a missing destination during validation,
+// not be mistaken for a shorter path under that parent.
+static int destination_metadata_anchor(int root_fd, const char *rel)
+{
+    if (root_fd < 0 || rel == NULL ||
+        (rel[0] != '\0' && !relative_path_is_safe(rel)))
+        return -1;
+
+    int current = fcntl(root_fd, F_DUPFD_CLOEXEC, 0);
+    if (current < 0)
+        return -1;
+    if (rel[0] == '\0')
+        return current;
+
+    const char *p = rel;
+    for (;;)
+    {
+        const char *slash = strchr(p, '/');
+        size_t length = slash == NULL ? strlen(p) : (size_t)(slash - p);
+        if (length == 0 || length > NAME_MAX)
+        {
+            close(current);
+            return -1;
+        }
+
+        if (slash == NULL)
+        {
+            struct stat final_st;
+            if (fstatat(current, p, &final_st, AT_SYMLINK_NOFOLLOW) != 0)
+            {
+                if (errno == ENOENT)
+                    return current;
+                close(current);
+                return -1;
+            }
+            if (!S_ISDIR(final_st.st_mode))
+                return current;
+
+            int final_fd = openat(current, p,
+                                  O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                                  O_CLOEXEC);
+            if (final_fd < 0)
+            {
+                close(current);
+                return -1;
+            }
+            close(current);
+            return final_fd;
+        }
+
+        char component[NAME_MAX + 1];
+        memcpy(component, p, length);
+        component[length] = '\0';
+        int next = openat(current, component,
+                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (next < 0)
+        {
+            if (errno == ENOENT)
+                return current;
+            close(current);
+            return -1;
+        }
+        close(current);
+        current = next;
+        p = slash + 1;
+    }
+}
+
 static int open_source_object(int source_parent_fd, const char *source_leaf,
                               struct stat *st)
 {
@@ -521,7 +651,7 @@ static int open_source_regular(int source_parent_fd, const char *source_leaf,
                                const struct stat *object_st, struct stat *opened_st)
 {
     int fd = openat(source_parent_fd, source_leaf,
-                    O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
+                    O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_NOATIME | O_CLOEXEC);
     if (fd < 0)
         return -1;
     if (fstat(fd, opened_st) != 0 || !S_ISREG(opened_st->st_mode) ||
@@ -576,7 +706,7 @@ static int open_source_directory(int source_object_fd,
                                  struct stat *opened_st)
 {
     int fd = openat(source_object_fd, ".",
-                    O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+                    O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NOATIME | O_CLOEXEC);
     if (fd < 0)
         return -1;
     if (fstat(fd, opened_st) != 0 || !S_ISDIR(opened_st->st_mode) ||
@@ -640,12 +770,34 @@ static int open_destination_fifo(int dest_parent_fd, const char *dest_leaf,
     return -1;
 }
 
+/* Keep preflight examples useful without making their display path a new
+ * traversal constraint. A deeply nested fd-anchored payload can exceed
+ * PATH_MAX as a string; in that case retain its leaf as a bounded hint. */
+static void metadata_child_path(const char *parent, const char *leaf,
+                                char out[PATH_MAX])
+{
+    if (parent == NULL || parent[0] == '\0')
+    {
+        (void)snprintf(out, PATH_MAX, "%s", leaf);
+        return;
+    }
+
+    int n = snprintf(out, PATH_MAX, "%s/%s", parent, leaf);
+    if (n >= 0 && n < PATH_MAX)
+        return;
+    (void)snprintf(out, PATH_MAX, ".../%s", leaf);
+}
+
 // The same recursive dispatcher serves mutation-free validation and the
 // actual restore. A negative destination parent means the corresponding
 // destination subtree does not exist during validation.
-static int restore_entry_at(RestorePass pass,
+static int restore_entry_at(const CloneContext *ctx, RestorePass pass,
                             int source_parent_fd, const char *source_leaf,
-                            int dest_parent_fd, const char *dest_leaf)
+                            int dest_parent_fd, const char *dest_leaf,
+                            const char *logical_path,
+                            MetadataSnapshots *snapshots,
+                            MetadataProfiles *profiles,
+                            int metadata_anchor_fd)
 {
     int source_is_root = source_leaf[0] == '\0';
     int dest_is_root = dest_leaf[0] == '\0';
@@ -670,6 +822,47 @@ static int restore_entry_at(RestorePass pass,
         return -1;
     }
 
+    struct stat desired_st = source_st;
+    if (pass == RESTORE_VALIDATE)
+    {
+        if (metadata_snapshot_record(snapshots, &source_st) != 0)
+        {
+            close(source_object_fd);
+            return -1;
+        }
+        // One profile anchor governs the whole restore root.  It is the
+        // actual destination root when that directory exists, otherwise the
+        // nearest existing parent chosen before the walk began.  Descending
+        // into payload directories must not turn each child directory into a
+        // new probe domain: ACLs and access policy may differ between roots,
+        // but the plan deliberately bounds profiles by restore roots.
+        int profile_failed = profiles != NULL && metadata_anchor_fd < 0;
+        if (!profile_failed && profiles != NULL &&
+            !S_ISSOCK(source_st.st_mode) &&
+            !S_ISCHR(source_st.st_mode) &&
+            !S_ISBLK(source_st.st_mode) &&
+            metadata_profiles_add(profiles, metadata_anchor_fd, &source_st,
+                                  dest_exists ? &dest_st : NULL,
+                                  logical_path) != 0)
+            profile_failed = 1;
+        if (profile_failed)
+        {
+            close(source_object_fd);
+            return -1;
+        }
+    }
+    else
+    {
+        const MetadataSnapshot *snapshot = metadata_snapshot_find(snapshots,
+                                                                   &source_st);
+        if (snapshot == NULL || !metadata_snapshot_matches(snapshot, &source_st) ||
+            metadata_snapshot_to_stat(snapshot, &desired_st) != 0)
+        {
+            close(source_object_fd);
+            return -1;
+        }
+    }
+
     if (S_ISLNK(source_st.st_mode))
     {
         if (source_is_root || dest_is_root || dest_exists)
@@ -679,8 +872,17 @@ static int restore_entry_at(RestorePass pass,
         }
 
         char target[PATH_MAX];
-        ssize_t len = readlinkat(source_object_fd, "", target, sizeof(target));
-        if (len < 0 || (size_t)len == sizeof(target))
+        ssize_t len = readlinkat(source_parent_fd, source_leaf,
+                                 target, sizeof(target) - 1);
+        if (len < 0 || (size_t)len == sizeof(target) - 1)
+        {
+            close(source_object_fd);
+            return -1;
+        }
+        struct stat after;
+        if (fstatat(source_parent_fd, source_leaf, &after,
+                    AT_SYMLINK_NOFOLLOW) != 0 ||
+            !metadata_symlink_unchanged(&desired_st, &after))
         {
             close(source_object_fd);
             return -1;
@@ -691,11 +893,11 @@ static int restore_entry_at(RestorePass pass,
 
         target[len] = '\0';
         if (symlinkat(target, dest_parent_fd, dest_leaf) != 0)
+        {
             return -1;
-
-        struct timespec times[2] = { source_st.st_atim, source_st.st_mtim };
-        return utimensat(dest_parent_fd, dest_leaf, times,
-                         AT_SYMLINK_NOFOLLOW) == 0 ? 0 : -1;
+        }
+        return metadata_apply_symlink_at(dest_parent_fd, dest_leaf, &desired_st,
+                                         metadata_policy_from_context(ctx));
     }
 
     if (S_ISREG(source_st.st_mode))
@@ -711,31 +913,46 @@ static int restore_entry_at(RestorePass pass,
         int src_fd = open_source_regular(source_parent_fd, source_leaf,
                                          &source_st, &opened_source_st);
         close(source_object_fd);
-        if (src_fd < 0)
+        if (src_fd < 0 || !metadata_source_unchanged(&desired_st,
+                                                      &opened_source_st))
+        {
+            if (src_fd >= 0)
+                close(src_fd);
             return -1;
+        }
         if (pass == RESTORE_VALIDATE)
         {
-            close(src_fd);
-            return 0;
+            return close(src_fd) == 0 ? 0 : -1;
         }
 
         struct stat opened_dest_st;
         int dest_created;
         int dst_fd = open_destination_regular(dest_parent_fd, dest_leaf,
-                                               opened_source_st.st_mode & 07777,
+                                               desired_st.st_mode & 07777,
                                                &opened_dest_st, &dest_created);
         if (dst_fd < 0)
         {
             close(src_fd);
             return -1;
         }
-        if (!dest_created &&
-            opened_dest_st.st_size == opened_source_st.st_size &&
-            opened_dest_st.st_mtim.tv_sec == opened_source_st.st_mtim.tv_sec)
+        MetadataTimestampPolicy policy = metadata_policy_from_context(ctx);
+        int content_skip = !dest_created &&
+            opened_dest_st.st_size == desired_st.st_size &&
+            opened_dest_st.st_mtim.tv_sec == desired_st.st_mtim.tv_sec &&
+            policy.nsec_exact &&
+            opened_dest_st.st_mtim.tv_nsec == desired_st.st_mtim.tv_nsec;
+        if (content_skip)
         {
-            close(src_fd);
-            close(dst_fd);
-            return 0;
+            int failed = metadata_apply_fd(dst_fd, &desired_st, policy) != 0;
+            struct stat after;
+            if (!failed && (fstat(src_fd, &after) != 0 ||
+                            !metadata_source_unchanged(&desired_st, &after)))
+                failed = 1;
+            if (close(src_fd) != 0)
+                failed = 1;
+            if (close(dst_fd) != 0)
+                failed = 1;
+            return failed ? -1 : 0;
         }
         if (ftruncate(dst_fd, 0) != 0)
         {
@@ -774,16 +991,18 @@ static int restore_entry_at(RestorePass pass,
 
         if (!failed)
         {
-            struct timespec times[2] = {
-                opened_source_st.st_atim, opened_source_st.st_mtim
-            };
-            if (fchmod(dst_fd, opened_source_st.st_mode & 07777) != 0 ||
-                futimens(dst_fd, times) != 0)
+            struct stat after;
+            if (fstat(src_fd, &after) != 0 ||
+                !metadata_source_unchanged(&desired_st, &after))
                 failed = 1;
         }
+        if (!failed && metadata_apply_fd(dst_fd, &desired_st, policy) != 0)
+            failed = 1;
 
-        close(src_fd);
-        close(dst_fd);
+        if (close(src_fd) != 0)
+            failed = 1;
+        if (close(dst_fd) != 0)
+            failed = 1;
         return failed ? -1 : 0;
     }
 
@@ -799,8 +1018,13 @@ static int restore_entry_at(RestorePass pass,
         int source_dir_fd = open_source_directory(source_object_fd, &source_st,
                                                   &opened_source_st);
         close(source_object_fd);
-        if (source_dir_fd < 0)
+        if (source_dir_fd < 0 ||
+            !metadata_source_unchanged(&desired_st, &opened_source_st))
+        {
+            if (source_dir_fd >= 0)
+                close(source_dir_fd);
             return -1;
+        }
 
         int dest_dir_fd = open_destination_directory(pass, dest_parent_fd,
                                                      dest_leaf);
@@ -837,22 +1061,29 @@ static int restore_entry_at(RestorePass pass,
             }
             if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
                 continue;
-            if (restore_entry_at(pass, source_dir_fd, entry->d_name,
-                                 dest_dir_fd, entry->d_name) != 0)
+            char child_logical_path[PATH_MAX];
+            metadata_child_path(logical_path, entry->d_name,
+                                child_logical_path);
+            if (restore_entry_at(ctx, pass, source_dir_fd, entry->d_name,
+                                 dest_dir_fd, entry->d_name,
+                                 child_logical_path, snapshots, profiles,
+                                 metadata_anchor_fd) != 0)
             {
                 failed = 1;
                 break;
             }
         }
-        closedir(dirp);
+        if (closedir(dirp) != 0)
+            failed = 1;
 
         if (!failed && pass == RESTORE_APPLY)
         {
-            struct timespec times[2] = {
-                opened_source_st.st_atim, opened_source_st.st_mtim
-            };
-            if (fchmod(dest_dir_fd, opened_source_st.st_mode & 07777) != 0 ||
-                futimens(dest_dir_fd, times) != 0)
+            struct stat after;
+            if (fstat(source_dir_fd, &after) != 0 ||
+                !metadata_source_unchanged(&desired_st, &after))
+                failed = 1;
+            if (!failed && metadata_apply_fd(dest_dir_fd, &desired_st,
+                                             metadata_policy_from_context(ctx)) != 0)
                 failed = 1;
         }
 
@@ -877,15 +1108,15 @@ static int restore_entry_at(RestorePass pass,
 
         struct stat opened_dest_st;
         int dest_fd = open_destination_fifo(dest_parent_fd, dest_leaf,
-                                            source_st.st_mode & 07777,
+                                            desired_st.st_mode & 07777,
                                             &opened_dest_st);
         if (dest_fd < 0)
             return -1;
-        struct timespec times[2] = { source_st.st_atim, source_st.st_mtim };
-        int rc = (fchmod(dest_fd, source_st.st_mode & 07777) == 0 &&
-                  futimens(dest_fd, times) == 0) ? 0 : -1;
-        close(dest_fd);
-        return rc;
+        int failed = metadata_apply_fd(dest_fd, &desired_st,
+                                       metadata_policy_from_context(ctx)) != 0;
+        if (close(dest_fd) != 0)
+            failed = 1;
+        return failed ? -1 : 0;
     }
 
     if (S_ISSOCK(source_st.st_mode))
@@ -986,21 +1217,45 @@ int restore_native_preflight_at(const CloneContext *ctx,
         return -1;
     }
 
-    int rc = restore_entry_at(RESTORE_VALIDATE, source_parent_fd, source_leaf,
-                              dest_parent_fd, dest_leaf);
-
+    MetadataSnapshots snapshots;
+    MetadataProfiles profiles;
+    metadata_snapshots_init(&snapshots);
+    metadata_profiles_init(&profiles);
+    int metadata_anchor_fd = destination_metadata_anchor(destination_root_fd,
+                                                          destination_rel);
+    if (metadata_anchor_fd < 0)
+    {
+        close(source_parent_fd);
+        if (dest_parent_fd >= 0)
+            close(dest_parent_fd);
+        metadata_snapshots_free(&snapshots);
+        metadata_profiles_free(&profiles);
+        return -1;
+    }
+    int rc = restore_entry_at(ctx, RESTORE_VALIDATE, source_parent_fd,
+                              source_leaf, dest_parent_fd, dest_leaf,
+                              source_rel, &snapshots, &profiles,
+                              metadata_anchor_fd);
+    close(metadata_anchor_fd);
     close(source_parent_fd);
     if (dest_parent_fd >= 0)
         close(dest_parent_fd);
+    metadata_snapshots_free(&snapshots);
+    metadata_profiles_free(&profiles);
     return rc;
 }
 
-int restore_native_at(const CloneContext *ctx,
-                      int source_root_fd, const char *source_rel,
-                      int destination_root_fd, const char *destination_rel)
+int restore_native_metadata_inventory_at(const CloneContext *ctx,
+                                          int source_root_fd,
+                                          const char *source_rel,
+                                          int destination_root_fd,
+                                          const char *destination_rel,
+                                          MetadataProfiles *profiles)
 {
-    if (restore_native_preflight_at(ctx, source_root_fd, source_rel,
-                                    destination_root_fd, destination_rel) != 0)
+    if (profiles == NULL || !restore_arguments_valid(ctx, source_root_fd,
+                                                     source_rel,
+                                                     destination_root_fd,
+                                                     destination_rel))
         return -1;
 
     int source_parent_fd = -1;
@@ -1011,18 +1266,109 @@ int restore_native_at(const CloneContext *ctx,
 
     int dest_parent_fd = -1;
     char dest_leaf[RESTORE_LEAF_MAX];
-    if (resolve_parent(destination_root_fd, destination_rel, 1,
-                       &dest_parent_fd, dest_leaf,
-                       sizeof(dest_leaf)) != RESTORE_RESOLVE_OK)
+    RestoreResolveResult dest_result =
+        resolve_parent(destination_root_fd, destination_rel, 0,
+                       &dest_parent_fd, dest_leaf, sizeof(dest_leaf));
+    if (dest_result == RESTORE_RESOLVE_ERROR)
     {
         close(source_parent_fd);
         return -1;
     }
 
-    int rc = restore_entry_at(RESTORE_APPLY, source_parent_fd, source_leaf,
-                              dest_parent_fd, dest_leaf);
+    MetadataSnapshots snapshots;
+    metadata_snapshots_init(&snapshots);
+    int metadata_anchor_fd = destination_metadata_anchor(destination_root_fd,
+                                                          destination_rel);
+    if (metadata_anchor_fd < 0)
+    {
+        close(source_parent_fd);
+        if (dest_parent_fd >= 0)
+            close(dest_parent_fd);
+        metadata_snapshots_free(&snapshots);
+        return -1;
+    }
+    int rc = restore_entry_at(ctx, RESTORE_VALIDATE, source_parent_fd,
+                              source_leaf, dest_parent_fd, dest_leaf,
+                              source_rel, &snapshots, profiles,
+                              metadata_anchor_fd);
+    close(metadata_anchor_fd);
     close(source_parent_fd);
-    close(dest_parent_fd);
+    if (dest_parent_fd >= 0)
+        close(dest_parent_fd);
+    metadata_snapshots_free(&snapshots);
+    return rc;
+}
+
+int restore_native_at(const CloneContext *ctx,
+                      int source_root_fd, const char *source_rel,
+                      int destination_root_fd, const char *destination_rel)
+{
+    int source_parent_fd = -1;
+    char source_leaf[RESTORE_LEAF_MAX];
+    if (!restore_arguments_valid(ctx, source_root_fd, source_rel,
+                                 destination_root_fd, destination_rel) ||
+        resolve_parent(source_root_fd, source_rel, 0, &source_parent_fd,
+                       source_leaf, sizeof(source_leaf)) != RESTORE_RESOLVE_OK)
+        return -1;
+
+    int dest_parent_fd = -1;
+    char dest_leaf[RESTORE_LEAF_MAX];
+    RestoreResolveResult dest_result =
+        resolve_parent(destination_root_fd, destination_rel, 0,
+                       &dest_parent_fd, dest_leaf,
+                       sizeof(dest_leaf));
+    if (dest_result == RESTORE_RESOLVE_ERROR)
+    {
+        close(source_parent_fd);
+        return -1;
+    }
+
+    MetadataSnapshots snapshots;
+    MetadataProfiles profiles;
+    metadata_snapshots_init(&snapshots);
+    metadata_profiles_init(&profiles);
+    int metadata_anchor_fd = destination_metadata_anchor(destination_root_fd,
+                                                          destination_rel);
+    if (metadata_anchor_fd < 0)
+    {
+        close(source_parent_fd);
+        if (dest_parent_fd >= 0)
+            close(dest_parent_fd);
+        metadata_snapshots_free(&snapshots);
+        metadata_profiles_free(&profiles);
+        return -1;
+    }
+    int rc = restore_entry_at(ctx, RESTORE_VALIDATE, source_parent_fd,
+                              source_leaf, dest_parent_fd, dest_leaf,
+                              source_rel, &snapshots, &profiles,
+                              metadata_anchor_fd);
+    close(metadata_anchor_fd);
+    if (rc == 0 && !ctx->metadata_preflight_done &&
+        metadata_profiles_probe(&profiles,
+                                metadata_policy_from_context(ctx)) != 0)
+        rc = -1;
+
+    if (rc == 0)
+    {
+        if (dest_parent_fd >= 0)
+            close(dest_parent_fd);
+        dest_parent_fd = -1;
+        dest_result = resolve_parent(destination_root_fd, destination_rel, 1,
+                                     &dest_parent_fd, dest_leaf,
+                                     sizeof(dest_leaf));
+        if (dest_result != RESTORE_RESOLVE_OK)
+            rc = -1;
+    }
+    if (rc == 0)
+        rc = restore_entry_at(ctx, RESTORE_APPLY, source_parent_fd,
+                              source_leaf, dest_parent_fd, dest_leaf,
+                              source_rel, &snapshots, NULL,
+                              destination_root_fd);
+    close(source_parent_fd);
+    if (dest_parent_fd >= 0)
+        close(dest_parent_fd);
+    metadata_snapshots_free(&snapshots);
+    metadata_profiles_free(&profiles);
     return rc;
 }
 

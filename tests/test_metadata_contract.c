@@ -1,27 +1,23 @@
-// Unit tests pinning down the current paired capture/restore metadata contract
-// (docs/DECISIONS.md D17) for every file kind -- regular files, directories,
-// symlinks, FIFOs, sockets, and device nodes -- as a fixed baseline before any
-// behaviour change, exercised through the real backup_capture_at() and
-// restore_native_at() entry points rather than a synthetic stand-in.
+// Unit tests for the native metadata contract (docs/DECISIONS.md D17) across
+// regular files, directories, symlinks, FIFOs, sockets, and device nodes,
+// exercised through the real backup_capture_at() and restore_native_at()
+// entry points rather than a synthetic stand-in. Capture and restore both
+// assert exact mode, atime/mtime, and (via the ownership preflight) uid/gid
+// across the whole matrix.
 //
-// Regular file and directory capture, and regular/FIFO restore, assert exact
-// mode and atime/mtime. Directory and symlink restore compare mtime only, on
-// purpose: restore_entry_at()'s directory branch always recurses during
-// RESTORE_VALIDATE (unlike the FIFO/regular branches, which return before
-// touching content), so its own readdir() perturbs the source's atime before
-// RESTORE_APPLY takes its metadata snapshot -- restored directory (and
-// symlink) atime is not currently exact. This is a real gap in the as-built
-// native path, not a weak assertion: docs/DECISIONS.md D17's "Source and
-// restore safety" section requires O_NOATIME only on capture's reads, not on
-// restore's own traversal of the payload it is restoring from. Tracked there
-// as a follow-up fix for the native metadata-fidelity work, rather than
-// silently asserted around here.
+// Content resume-skip is covered on both the capture and restore sides for
+// regular files: matching size+mtime_sec+mtime_nsec keeps existing
+// destination content when nsec_exact holds (the default fixture policy).
+// test_capture_recopies_without_nsec_exact() checks the opposite -- on a
+// coarse-timestamp destination, content is always recopied even on a
+// same-size match, because size+mtime_sec alone cannot prove the content did
+// not change.
 //
-// The regular-file cases also cover resume-skip (matching size+mtime_sec keeps
-// existing destination content) on both the capture and restore sides. The
-// foreign-ownership case documents today's known loss -- a non-self uid/gid is
-// not preserved -- rather than fixing it; the native metadata-fidelity work
-// that follows is where that gets a preflight.
+// test_foreign_ownership_gap() asserts the preflight's actual guarantee: a
+// foreign uid/gid round-trips through capture and restore rather than being
+// silently dropped. test_metadata_helper_failure_paths() exercises
+// metadata.c's own error paths (invalid fd, NULL stat, NULL profile set)
+// directly, since the matrix above only ever reaches its happy path.
 
 #define _GNU_SOURCE
 
@@ -40,6 +36,7 @@
 #include <unistd.h>
 
 #include "fileops.h"
+#include "metadata.h"
 #include "utils.h"
 
 #define GREEN "\033[0;32m"
@@ -220,11 +217,6 @@ static int same_core_times(const struct stat *actual, const struct stat *expecte
            same_timespec(actual->st_mtim, expected->st_mtim);
 }
 
-static int same_mtime(const struct stat *actual, const struct stat *expected)
-{
-    return same_timespec(actual->st_mtim, expected->st_mtim);
-}
-
 static int same_mode(const struct stat *actual, const struct stat *expected)
 {
     return (actual->st_mode & 07777) == (expected->st_mode & 07777);
@@ -365,8 +357,7 @@ static int setup_case(const MatrixCase *test_case, const char *source_root,
 
 static int check_payload_shape(const MatrixCase *test_case,
                                const char *path, const struct stat *source_st,
-                               const char *case_name, const char *phase,
-                               int compare_atime)
+                               const char *case_name, const char *phase)
 {
     struct stat actual;
     if (lstat(path, &actual) != 0)
@@ -387,12 +378,9 @@ static int check_payload_shape(const MatrixCase *test_case,
             fatal("could not format a test label");
         check_result(same_mode(&actual, source_st), case_name, property);
 
-        if (snprintf(property, sizeof(property), "%s %s", phase,
-                     compare_atime ? "atime/mtime" : "mtime") < 0)
+        if (snprintf(property, sizeof(property), "%s atime/mtime", phase) < 0)
             fatal("could not format a test label");
-        check_result((compare_atime ? same_core_times(&actual, source_st)
-                                    : same_mtime(&actual, source_st)),
-                     case_name, property);
+        check_result(same_core_times(&actual, source_st), case_name, property);
     }
     else if (test_case->kind == KIND_SYMLINK)
     {
@@ -405,12 +393,9 @@ static int check_payload_shape(const MatrixCase *test_case,
         check_result(length == 10 && length >= 0 && strcmp(target, "target.txt") == 0,
                      case_name, property);
 
-        if (snprintf(property, sizeof(property), "%s link %s", phase,
-                     compare_atime ? "times" : "mtime") < 0)
+        if (snprintf(property, sizeof(property), "%s link times", phase) < 0)
             fatal("could not format a test label");
-        check_result((compare_atime ? same_core_times(&actual, source_st)
-                                    : same_mtime(&actual, source_st)),
-                     case_name, property);
+        check_result(same_core_times(&actual, source_st), case_name, property);
     }
 
     return 1;
@@ -476,7 +461,7 @@ static void run_matrix_case(const MatrixCase *test_case)
     else
     {
         check_payload_shape(test_case, capture_path, &source_st,
-                            test_case->name, "capture", 1);
+                            test_case->name, "capture");
         if (test_case->kind == KIND_DIRECTORY)
             check_directory_child(capture_path, test_case->name, "capture");
 
@@ -527,9 +512,7 @@ static void run_matrix_case(const MatrixCase *test_case)
     else
     {
         check_payload_shape(test_case, restore_path, &captured_st,
-                            test_case->name, "restore",
-                            test_case->kind == KIND_REGULAR ||
-                            test_case->kind == KIND_FIFO);
+                            test_case->name, "restore");
         if (test_case->kind == KIND_DIRECTORY)
             check_directory_child(restore_path, test_case->name, "restore");
 
@@ -600,9 +583,9 @@ static void test_foreign_ownership_gap(void)
     struct stat captured_st;
     if (lstat(capture_path, &captured_st) != 0)
         fatal("could not inspect the captured ownership fixture");
-    check_result(captured_st.st_uid != source_st.st_uid ||
-                 captured_st.st_gid != source_st.st_gid,
-                 case_name, "capture exposes current uid/gid loss");
+    check_result(captured_st.st_uid == source_st.st_uid &&
+                 captured_st.st_gid == source_st.st_gid,
+                 case_name, "capture preserves uid/gid");
 
     int source_fd = open_directory(source_root);
     int restore_fd = open_directory(restore_root);
@@ -615,10 +598,102 @@ static void test_foreign_ownership_gap(void)
     struct stat restored_st;
     if (lstat(restore_path, &restored_st) != 0)
         fatal("could not inspect the restored ownership fixture");
-    check_result(restored_st.st_uid != source_st.st_uid ||
-                 restored_st.st_gid != source_st.st_gid,
-                 case_name, "restore exposes current uid/gid loss");
+    check_result(restored_st.st_uid == source_st.st_uid &&
+                 restored_st.st_gid == source_st.st_gid,
+                 case_name, "restore preserves uid/gid");
 
+    remove_tree(base);
+}
+
+static void test_capture_recopies_without_nsec_exact(void)
+{
+    const char *case_name = "coarse";
+    char base[PATH_MAX], source_root[PATH_MAX], capture_root[PATH_MAX];
+    char source_path[PATH_MAX], capture_path[PATH_MAX];
+    make_temp_root(base, sizeof(base));
+    join_or_die(source_root, sizeof(source_root), base, "source");
+    join_or_die(capture_root, sizeof(capture_root), base, "capture");
+    if (mkdir(source_root, 0700) != 0 || mkdir(capture_root, 0700) != 0)
+        fatal("could not create the coarse timestamp roots");
+    join_or_die(source_path, sizeof(source_path), source_root, "entry");
+    join_or_die(capture_path, sizeof(capture_path), capture_root, "entry");
+    write_file(source_path, "0123456789abcdef");
+    set_metadata(source_path, 0600, regular_times, 0);
+
+    const CloneContext coarse_ctx = {
+        .operation = CLONE_BACKUP,
+        .representation = CLONE_NATIVE_TREE,
+        .timestamp_policy_configured = 1,
+        .nsec_exact = 0,
+        .metadata_preflight_done = 1
+    };
+    int capture_fd = open_directory(capture_root);
+    check_result(backup_capture_at(&coarse_ctx, source_path, capture_fd,
+                                   "entry") == 0,
+                 case_name, "initial capture result");
+    close(capture_fd);
+
+    write_file(capture_path, "fedcba9876543210");
+    if (utimensat(AT_FDCWD, capture_path, regular_times, 0) != 0)
+        fatal("could not prepare the coarse resume fixture");
+
+    capture_fd = open_directory(capture_root);
+    check_result(backup_capture_at(&coarse_ctx, source_path, capture_fd,
+                                   "entry") == 0,
+                 case_name, "coarse resume capture result");
+    close(capture_fd);
+    check_result(file_equals(capture_path, "0123456789abcdef"), case_name,
+                 "coarse timestamp policy recopies same-size content");
+    remove_tree(base);
+}
+
+static void test_metadata_helper_failure_paths(void)
+{
+    const char *case_name = "helpers";
+    char base[PATH_MAX];
+    make_temp_root(base, sizeof(base));
+
+    char file_path[PATH_MAX];
+    join_or_die(file_path, sizeof(file_path), base, "file");
+    write_file(file_path, "metadata-helper");
+
+    int root_fd = open_directory(base);
+    struct stat st;
+    if (fstat(root_fd, &st) != 0)
+        fatal("could not inspect the helper fixture root");
+    MetadataTimestampPolicy policy = { .nsec_exact = 1, .configured = 1 };
+
+    check_result(metadata_apply_fd(-1, &st, policy) == -1,
+                 case_name, "apply rejects an invalid fd");
+    check_result(metadata_apply_fd(root_fd, NULL, policy) == -1,
+                 case_name, "apply rejects a NULL desired stat");
+    check_result(metadata_apply_symlink_at(-1, "file", &st, policy) == -1,
+                 case_name, "symlink apply rejects an invalid directory fd");
+    check_result(metadata_profiles_probe(NULL, policy) == -1,
+                 case_name, "profile probe rejects a NULL profile set");
+
+    MetadataProfiles profiles;
+    metadata_profiles_init(&profiles);
+    check_result(metadata_profiles_add(&profiles, -1, &st, NULL, NULL) == -1,
+                 case_name, "profile collection rejects an invalid anchor fd");
+    check_result(metadata_profiles_probe(&profiles, policy) == 0,
+                 case_name, "an empty profile set needs no live probe");
+
+    MetadataSnapshots snapshots;
+    metadata_snapshots_init(&snapshots);
+    check_result(metadata_snapshot_record(&snapshots, &st) == 0,
+                 case_name, "snapshot records a stat");
+    check_result(metadata_snapshot_find(&snapshots, &st) != NULL,
+                 case_name, "snapshot lookup finds the recorded object");
+    check_result(metadata_snapshot_matches(metadata_snapshot_find(&snapshots, &st),
+                                           &st),
+                 case_name, "snapshot matches unchanged metadata");
+    check_result(metadata_source_unchanged(&st, &st),
+                 case_name, "source comparison accepts identical stats");
+
+    metadata_snapshots_free(&snapshots);
+    metadata_profiles_free(&profiles);
+    check_result(close(root_fd) == 0, case_name, "helper fixture fd closes cleanly");
     remove_tree(base);
 }
 
@@ -637,6 +712,8 @@ int main(void)
 
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
         run_matrix_case(&cases[i]);
+    test_capture_recopies_without_nsec_exact();
+    test_metadata_helper_failure_paths();
     test_foreign_ownership_gap();
 
     if (failures != 0)

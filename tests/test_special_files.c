@@ -157,23 +157,38 @@ int main(void)
           "FIFO contributes no payload bytes");
 
     int socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    struct sockaddr_un address;
-    memset(&address, 0, sizeof(address));
-    address.sun_family = AF_UNIX;
-    if (strlen(src_socket) >= sizeof(address.sun_path) || socket_fd == -1)
-        fatal("could not create Unix socket fixture");
-    strcpy(address.sun_path, src_socket);
-    if (bind(socket_fd, (struct sockaddr *)&address, sizeof(address)) != 0)
-        fatal("could not bind Unix socket fixture");
+    if (socket_fd < 0 && (errno == EPERM || errno == EACCES ||
+                          errno == EAFNOSUPPORT))
+    {
+        printf("  " BLUE "-" NC " Unix socket fixture unavailable on this host\n");
+    }
+    else
+    {
+        struct sockaddr_un address;
+        memset(&address, 0, sizeof(address));
+        address.sun_family = AF_UNIX;
+        if (strlen(src_socket) >= sizeof(address.sun_path))
+            fatal("Unix socket fixture path is too long");
+        strcpy(address.sun_path, src_socket);
+        if (bind(socket_fd, (struct sockaddr *)&address, sizeof(address)) != 0)
+        {
+            if (errno == EPERM || errno == EACCES || errno == EAFNOSUPPORT)
+                printf("  " BLUE "-" NC " Unix socket fixture unavailable on this host\n");
+            else
+                fatal("could not bind Unix socket fixture");
+        }
+        else
+        {
+            errno = 0;
+            check(backup_capture_at(&ctx, src_socket, dest_fd, "copied.socket") == 0 &&
+                  lstat(dest_socket, &st) == -1 && errno == ENOENT,
+                  "Unix socket is skipped without creating a destination");
 
-    errno = 0;
-    check(backup_capture_at(&ctx, src_socket, dest_fd, "copied.socket") == 0 &&
-          lstat(dest_socket, &st) == -1 && errno == ENOENT,
-          "Unix socket is skipped without creating a destination");
-
-    size = 23;
-    check(get_dir_size(src_socket, &size) == 0 && size == 23,
-          "Unix socket contributes no payload bytes");
+            size = 23;
+            check(get_dir_size(src_socket, &size) == 0 && size == 23,
+                  "Unix socket contributes no payload bytes");
+        }
+    }
 
     int device_fixture = lstat("/dev/null", &st) == 0 && S_ISCHR(st.st_mode);
     check(device_fixture, "/dev/null is available as the device-node fixture");
@@ -349,7 +364,8 @@ int main(void)
           "no refused call wrote a destination");
 
     close(dest_fd);
-    close(socket_fd); // must precede removal: the bound socket is a fixture file
+    if (socket_fd >= 0)
+        close(socket_fd); // must precede removal: the bound socket is a fixture file
     remove_tree(root);
 
     if (failures > 0)

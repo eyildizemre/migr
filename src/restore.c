@@ -12,7 +12,9 @@
 #include "container.h"
 #include "detect.h"
 #include "fileops.h"
+#include "fsprobe.h"
 #include "manifest.h"
+#include "metadata.h"
 #include "utils.h"
 #include "xdg.h"
 
@@ -36,6 +38,174 @@ static void free_xdg_dirs(char **dirs)
         free(dirs[i]);
 }
 
+typedef struct {
+    dev_t device;
+    ino_t inode;
+    int fd;
+    int nsec_exact;
+} RestoreTimestampAnchor;
+
+typedef struct {
+    RestoreTimestampAnchor *items;
+    size_t count;
+    size_t capacity;
+} RestoreTimestampAnchors;
+
+static void restore_timestamp_anchors_init(RestoreTimestampAnchors *anchors)
+{
+    memset(anchors, 0, sizeof(*anchors));
+}
+
+static void restore_timestamp_anchors_free(RestoreTimestampAnchors *anchors)
+{
+    if (anchors == NULL)
+        return;
+    for (size_t i = 0; i < anchors->count; i++)
+        close(anchors->items[i].fd);
+    free(anchors->items);
+    memset(anchors, 0, sizeof(*anchors));
+}
+
+// Find the directory whose filesystem permissions and timestamp behaviour
+// govern a destination root. Existing directory roots use themselves; an
+// absent leaf or intermediate uses the nearest existing parent. This mirrors
+// the restore walk without treating a missing intermediate as a shorter path.
+static int restore_destination_anchor_fd(int root_fd, const char *rel)
+{
+    if (root_fd < 0 || rel == NULL || rel[0] == '/')
+        return -1;
+
+    int current = fcntl(root_fd, F_DUPFD_CLOEXEC, 0);
+    if (current < 0)
+        return -1;
+    if (rel[0] == '\0')
+        return current;
+
+    const char *p = rel;
+    for (;;)
+    {
+        const char *slash = strchr(p, '/');
+        size_t length = slash == NULL ? strlen(p) : (size_t)(slash - p);
+        if (length == 0 || length > NAME_MAX ||
+            (length == 1 && p[0] == '.') ||
+            (length == 2 && p[0] == '.' && p[1] == '.'))
+        {
+            close(current);
+            return -1;
+        }
+
+        if (slash == NULL)
+        {
+            struct stat final_st;
+            if (fstatat(current, p, &final_st, AT_SYMLINK_NOFOLLOW) != 0)
+            {
+                if (errno == ENOENT)
+                    return current;
+                close(current);
+                return -1;
+            }
+            if (!S_ISDIR(final_st.st_mode))
+                return current;
+
+            int final_fd = openat(current, p,
+                                  O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                                  O_CLOEXEC);
+            if (final_fd < 0)
+            {
+                close(current);
+                return -1;
+            }
+            close(current);
+            return final_fd;
+        }
+
+        char component[NAME_MAX + 1];
+        memcpy(component, p, length);
+        component[length] = '\0';
+        int next = openat(current, component,
+                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (next < 0)
+        {
+            if (errno == ENOENT)
+                return current;
+            close(current);
+            return -1;
+        }
+        close(current);
+        current = next;
+        p = slash + 1;
+    }
+}
+
+static int restore_timestamp_anchor_add(RestoreTimestampAnchors *anchors,
+                                         int fd)
+{
+    if (anchors == NULL || fd < 0)
+        return -1;
+
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISDIR(st.st_mode))
+        return -1;
+    for (size_t i = 0; i < anchors->count; i++)
+        if (anchors->items[i].device == st.st_dev &&
+            anchors->items[i].inode == st.st_ino)
+            return 0;
+
+    if (anchors->count == anchors->capacity)
+    {
+        size_t capacity = anchors->capacity == 0 ? 8 : anchors->capacity * 2;
+        RestoreTimestampAnchor *items = realloc(anchors->items,
+                                                capacity * sizeof(*items));
+        if (items == NULL)
+            return -1;
+        anchors->items = items;
+        anchors->capacity = capacity;
+    }
+
+    int copy = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+    if (copy < 0)
+        return -1;
+    anchors->items[anchors->count].device = st.st_dev;
+    anchors->items[anchors->count].inode = st.st_ino;
+    anchors->items[anchors->count].fd = copy;
+    anchors->items[anchors->count].nsec_exact = 1;
+    anchors->count++;
+    return 0;
+}
+
+static int restore_timestamp_anchor_probe(RestoreTimestampAnchors *anchors)
+{
+    if (anchors == NULL)
+        return -1;
+    for (size_t i = 0; i < anchors->count; i++)
+    {
+        if (fsprobe_timestamps_fd(anchors->items[i].fd,
+                                  &anchors->items[i].nsec_exact) != 0)
+            return -1;
+    }
+    return 0;
+}
+
+static int restore_timestamp_anchor_policy(const RestoreTimestampAnchors *anchors,
+                                            int fd, int *nsec_exact)
+{
+    if (anchors == NULL || fd < 0 || nsec_exact == NULL)
+        return -1;
+    struct stat st;
+    if (fstat(fd, &st) != 0)
+        return -1;
+    for (size_t i = 0; i < anchors->count; i++)
+    {
+        if (anchors->items[i].device == st.st_dev &&
+            anchors->items[i].inode == st.st_ino)
+        {
+            *nsec_exact = anchors->items[i].nsec_exact;
+            return 0;
+        }
+    }
+    return -1;
+}
+
 // Restores one item whose source and destination relative addresses may
 // differ (e.g. a v1 root's "data/<payload>" source vs. its own restore
 // address), sharing the exact same status/preflight/apply behavior for
@@ -47,7 +217,8 @@ static void free_xdg_dirs(char **dirs)
 static int restore_item_at(const CloneContext *ctx,
                            int source_root_fd, const char *source_rel,
                            int dest_root_fd, const char *dest_rel,
-                           const char *label, int source_required)
+                           const char *label, int source_required,
+                           const RestoreTimestampAnchors *timestamp_anchors)
 {
     RestoreSourceStatus status = restore_native_source_status_at(source_root_fd, source_rel);
     if (status == RESTORE_SOURCE_MISSING)
@@ -65,9 +236,31 @@ static int restore_item_at(const CloneContext *ctx,
         return -1;
     }
 
+    CloneContext effective_ctx = *ctx;
+    int policy_anchor_fd = restore_destination_anchor_fd(dest_root_fd, dest_rel);
+    if (policy_anchor_fd < 0)
+    {
+        printf("Error: Failed to inspect restore destination for %s\n", label);
+        return -1;
+    }
+    if (timestamp_anchors != NULL &&
+        restore_timestamp_anchor_policy(timestamp_anchors, policy_anchor_fd,
+                                        &effective_ctx.nsec_exact) != 0)
+    {
+        close(policy_anchor_fd);
+        printf("Error: Restore destination was not covered by timestamp preflight for %s\n",
+               label);
+        return -1;
+    }
+    if (timestamp_anchors != NULL)
+        effective_ctx.timestamp_policy_configured = 1;
+    close(policy_anchor_fd);
+    const CloneContext *run_ctx = &effective_ctx;
+
     if (dry_run)
     {
-        if (restore_native_preflight_at(ctx, source_root_fd, source_rel, dest_root_fd, dest_rel) != 0)
+        if (restore_native_preflight_at(run_ctx, source_root_fd, source_rel,
+                                        dest_root_fd, dest_rel) != 0)
         {
             printf("Error: Failed to restore %s\n", label);
             return -1;
@@ -78,7 +271,8 @@ static int restore_item_at(const CloneContext *ctx,
     if (verbose)
         printf("  Restoring: %s\n", label);
 
-    if (restore_native_at(ctx, source_root_fd, source_rel, dest_root_fd, dest_rel) != 0)
+    if (restore_native_at(run_ctx, source_root_fd, source_rel, dest_root_fd,
+                          dest_rel) != 0)
     {
         printf("Error: Failed to restore %s\n", label);
         return -1;
@@ -88,10 +282,12 @@ static int restore_item_at(const CloneContext *ctx,
 
 // A backup-relative path restored directly into home under the same name on
 // both sides (legacy's Projects/dotfiles/browser-config items).
-static int restore_home_item(const CloneContext *ctx, int source_root_fd, int home_fd, const char *rel_path)
+static int restore_home_item(const CloneContext *ctx, int source_root_fd,
+                             int home_fd, const char *rel_path,
+                             const RestoreTimestampAnchors *timestamp_anchors)
 {
     int rc = restore_item_at(ctx, source_root_fd, rel_path, home_fd, rel_path,
-                             rel_path, 0);
+                             rel_path, 0, timestamp_anchors);
     if (rc > 0 && dry_run)
         printf("  Would restore: %s\n", rel_path);
     return rc;
@@ -158,7 +354,8 @@ static int open_xdg_destination_anchor(const char *path, int *out_fd,
 // from an unversioned or manifest-absent backup. This path preserves the
 // legacy layout and its all-or-nothing XDG destination resolution.
 static int restore_legacy(const char *source, int source_root_fd, const char *home, int home_fd,
-                          const CloneContext *ctx, int *count, int *had_error)
+                          const CloneContext *ctx, int *count, int *had_error,
+                          const RestoreTimestampAnchors *timestamp_anchors)
 {
     printf("[Main Directories]\n");
     char *xdg_dirs[XDG_RESTORE_COUNT];
@@ -212,7 +409,8 @@ static int restore_legacy(const char *source, int source_root_fd, const char *ho
             }
 
             int rc = restore_item_at(ctx, source_root_fd, name, xdg_dest_fd,
-                                     destination_rel, name, 0);
+                                     destination_rel, name, 0,
+                                     timestamp_anchors);
             if (rc > 0 && dry_run)
                 printf("  Would restore: %s -> %s/\n", name, xdg_dirs[i]);
             if (rc > 0)
@@ -230,7 +428,8 @@ static int restore_legacy(const char *source, int source_root_fd, const char *ho
     }
 
     // Projects is not a standard XDG directory
-    int rc = restore_home_item(ctx, source_root_fd, home_fd, "Projects");
+    int rc = restore_home_item(ctx, source_root_fd, home_fd, "Projects",
+                               timestamp_anchors);
     if (rc > 0)
         (*count)++;
     else if (rc < 0)
@@ -240,7 +439,8 @@ static int restore_legacy(const char *source, int source_root_fd, const char *ho
     printf("\n[Dotfiles]\n");
     for (int i = 0; dotfiles[i] != NULL; i++)
     {
-        rc = restore_home_item(ctx, source_root_fd, home_fd, dotfiles[i]);
+        rc = restore_home_item(ctx, source_root_fd, home_fd, dotfiles[i],
+                               timestamp_anchors);
         if (rc > 0)
             (*count)++;
         else if (rc < 0)
@@ -260,7 +460,8 @@ static int restore_legacy(const char *source, int source_root_fd, const char *ho
     printf("\n[Browser Profiles]\n");
     for (int i = 0; browser_configs[i] != NULL; i++)
     {
-        rc = restore_home_item(ctx, source_root_fd, home_fd, browser_configs[i]);
+        rc = restore_home_item(ctx, source_root_fd, home_fd, browser_configs[i],
+                               timestamp_anchors);
         if (rc > 0)
             (*count)++;
         else if (rc < 0)
@@ -314,11 +515,217 @@ static int validate_v1_payloads(int source_root_fd, const Manifest *m)
     return failed ? -1 : 0;
 }
 
+static int restore_metadata_item(const CloneContext *ctx,
+                                 int source_root_fd, const char *source_rel,
+                                 int destination_root_fd,
+                                 const char *destination_rel,
+                                 const char *label, int required,
+                                 MetadataProfiles *profiles,
+                                 RestoreTimestampAnchors *timestamp_anchors)
+{
+    RestoreSourceStatus status =
+        restore_native_source_status_at(source_root_fd, source_rel);
+    if (status == RESTORE_SOURCE_MISSING)
+    {
+        if (required)
+            printf("Error: Manifest root %s is missing its declared payload\n",
+                   label);
+        return required ? -1 : 0;
+    }
+    if (status == RESTORE_SOURCE_ERROR)
+    {
+        printf("Error: Failed to inspect %s\n", label);
+        return -1;
+    }
+    int metadata_anchor_fd = restore_destination_anchor_fd(destination_root_fd,
+                                                           destination_rel);
+    if (metadata_anchor_fd < 0)
+    {
+        printf("Error: Failed to inspect restore destination for %s\n", label);
+        return -1;
+    }
+    int anchor_failed = restore_timestamp_anchor_add(timestamp_anchors,
+                                                      metadata_anchor_fd) != 0;
+    if (close(metadata_anchor_fd) != 0)
+        anchor_failed = 1;
+    if (anchor_failed)
+    {
+        printf("Error: Failed to inspect restore destination for %s\n", label);
+        return -1;
+    }
+    if (restore_native_metadata_inventory_at(ctx, source_root_fd, source_rel,
+                                             destination_root_fd,
+                                             destination_rel, profiles) != 0)
+    {
+        printf("Error: Failed to inventory metadata for %s\n", label);
+        return -1;
+    }
+    return 0;
+}
+
+static int restore_legacy_metadata_inventory(const char *source,
+                                             int source_root_fd,
+                                             const char *home, int home_fd,
+                                             const CloneContext *ctx,
+                                             MetadataProfiles *profiles,
+                                             RestoreTimestampAnchors *timestamp_anchors)
+{
+    char *xdg_dirs[XDG_RESTORE_COUNT] = {0};
+    if (xdg_resolve(home, xdg_keys, xdg_fallbacks, xdg_dirs,
+                    XDG_RESTORE_COUNT) != 0)
+    {
+        free_xdg_dirs(xdg_dirs);
+        printf("Error: HOME path too long to resolve user directories\n");
+        return -1;
+    }
+
+    char *manifest_names[XDG_RESTORE_COUNT] = {0};
+    (void)legacy_manifest_read(source, manifest_names, XDG_RESTORE_COUNT);
+    int failed = 0;
+    for (int i = 0; i < XDG_RESTORE_COUNT; i++)
+    {
+        const char *name = manifest_names[i];
+        if (name == NULL)
+        {
+            const char *slash = strrchr(xdg_dirs[i], '/');
+            name = slash == NULL ? xdg_dirs[i] : slash + 1;
+        }
+
+        /* Legacy XDG roots are optional. Inspect the source first so a
+         * missing source does not make an otherwise irrelevant destination
+         * path fatal (the restore path has always skipped such roots). */
+        RestoreSourceStatus source_status =
+            restore_native_source_status_at(source_root_fd, name);
+        if (source_status == RESTORE_SOURCE_MISSING)
+            continue;
+        if (source_status == RESTORE_SOURCE_ERROR)
+        {
+            printf("Error: Failed to inspect %s\n", name);
+            failed = 1;
+            continue;
+        }
+
+        int destination_fd = -1;
+        char destination_rel[NAME_MAX + 1];
+        if (open_xdg_destination_anchor(xdg_dirs[i], &destination_fd,
+                                         destination_rel,
+                                         sizeof(destination_rel)) != 0)
+        {
+            printf("Error: Failed to resolve restore destination %s\n",
+                   xdg_dirs[i]);
+            failed = 1;
+            continue;
+        }
+        if (restore_metadata_item(ctx, source_root_fd, name, destination_fd,
+                                  destination_rel, name, 0, profiles,
+                                  timestamp_anchors) != 0)
+            failed = 1;
+        if (close(destination_fd) != 0)
+            failed = 1;
+    }
+
+    const char *home_items[] = {
+        "Projects", ".ssh", ".gnupg", ".gitconfig", ".bashrc", ".profile",
+        ".mozilla", ".config/google-chrome", ".config/chromium",
+        ".config/BraveSoftware", ".config/vivaldi",
+        ".config/microsoft-edge", ".config/opera", NULL
+    };
+    for (int i = 0; home_items[i] != NULL; i++)
+        if (restore_metadata_item(ctx, source_root_fd, home_items[i], home_fd,
+                                  home_items[i], home_items[i], 0,
+                                  profiles, timestamp_anchors) != 0)
+            failed = 1;
+
+    for (int i = 0; i < XDG_RESTORE_COUNT; i++)
+        free(manifest_names[i]);
+    free_xdg_dirs(xdg_dirs);
+    return failed ? -1 : 0;
+}
+
+static int restore_v1_metadata_inventory(int source_root_fd, const char *home,
+                                         int home_fd, const Manifest *m,
+                                         const CloneContext *ctx,
+                                         MetadataProfiles *profiles,
+                                         RestoreTimestampAnchors *timestamp_anchors)
+{
+    char *xdg_dirs[XDG_RESTORE_COUNT] = {0};
+    int xdg_ready = 0;
+    int failed = 0;
+
+    for (int i = 0; i < m->root_count; i++)
+    {
+        const ManifestRoot *root = &m->roots[i];
+        if (root->policy == ROOT_POLICY_MANUAL_NATIVE)
+            continue;
+
+        char source_rel[PATH_MAX + 8];
+        if (v1_payload_rel(root, source_rel, sizeof(source_rel)) != 0)
+        {
+            printf("Error: Manifest root %s has an invalid payload address\n",
+                   root->id);
+            failed = 1;
+            continue;
+        }
+
+        int destination_fd = home_fd;
+        int close_destination = 0;
+        char destination_rel[PATH_MAX + 8];
+        if (root->policy == ROOT_POLICY_HOME_RELATIVE)
+        {
+            if (snprintf(destination_rel, sizeof(destination_rel), "%s",
+                         root->restore_path) >= (int)sizeof(destination_rel))
+            {
+                failed = 1;
+                continue;
+            }
+        }
+        else
+        {
+            if (!xdg_ready)
+            {
+                if (xdg_resolve(home, xdg_keys, xdg_fallbacks, xdg_dirs,
+                                XDG_RESTORE_COUNT) != 0)
+                {
+                    free_xdg_dirs(xdg_dirs);
+                    printf("Error: HOME path too long to resolve user directories\n");
+                    return -1;
+                }
+                xdg_ready = 1;
+            }
+            int idx = xdg_key_index(root->id);
+            if (idx < 0 || open_xdg_destination_anchor(xdg_dirs[idx],
+                                                        &destination_fd,
+                                                        destination_rel,
+                                                        sizeof(destination_rel)) != 0)
+            {
+                printf("Error: Failed to resolve restore destination %s\n",
+                       root->id);
+                failed = 1;
+                continue;
+            }
+            close_destination = 1;
+        }
+
+        if (restore_metadata_item(ctx, source_root_fd, source_rel,
+                                  destination_fd, destination_rel, root->id,
+                                  1, profiles, timestamp_anchors) != 0)
+            failed = 1;
+        if (close_destination && close(destination_fd) != 0)
+            failed = 1;
+    }
+
+    if (xdg_ready)
+        free_xdg_dirs(xdg_dirs);
+    return failed ? -1 : 0;
+}
+
 // Restores a valid native v1 manifest's root table (docs/DECISIONS.md D15,
 // D16). HOME_RELATIVE roots restore beneath home, XDG roots map to the target
 // locale, and MANUAL_NATIVE roots are reported without being auto-restored.
 static void restore_v1(const char *source, int source_root_fd, const char *home, int home_fd,
-                       const CloneContext *ctx, const Manifest *m, int *count, int *had_error)
+                       const CloneContext *ctx, const Manifest *m, int *count,
+                       int *had_error,
+                       const RestoreTimestampAnchors *timestamp_anchors)
 {
     printf("[Roots]\n");
 
@@ -343,7 +750,8 @@ static void restore_v1(const char *source, int source_root_fd, const char *home,
         if (root->policy == ROOT_POLICY_HOME_RELATIVE)
         {
             int rc = restore_item_at(ctx, source_root_fd, source_rel, home_fd,
-                                     root->restore_path, root->id, 1);
+                                     root->restore_path, root->id, 1,
+                                     timestamp_anchors);
             if (rc > 0 && dry_run)
             {
                 if (root->restore_path[0] != '\0')
@@ -395,7 +803,8 @@ static void restore_v1(const char *source, int source_root_fd, const char *home,
         }
 
         int rc = restore_item_at(ctx, source_root_fd, source_rel, xdg_dest_fd,
-                                 destination_rel, root->id, 1);
+                                 destination_rel, root->id, 1,
+                                 timestamp_anchors);
         if (rc > 0 && dry_run)
             printf("  Would restore: %s -> %s/\n", root->id, xdg_dirs[idx]);
         if (rc > 0)
@@ -791,26 +1200,6 @@ int restore(const char *source)
         return 1;
     }
 
-    if (dry_run)
-    {
-        printf("Dry run mode enabled. No changes will be made.\n\n");
-    }
-    else if (!confirm_action("This will restore files to your home directory. Continue?"))
-    {
-        printf("Cancelled.\n");
-        if (mst == MANIFEST_STATUS_VALID)
-            manifest_free(&m);
-        close(source_root_fd);
-        return 0;
-    }
-
-    printf("Restoring from: %s\n\n", source);
-
-    // Opened once and reused for every restore_native_at() call below -- the
-    // trust boundary the fd-anchored core is built on (docs/DECISIONS.md D15
-    // and D16). Read-only, harmless even in dry-run mode. A path this long
-    // (ENAMETOOLONG) is what xdg_resolve() below would also refuse on, so
-    // that specific case gets the same "HOME path too long" wording.
     int home_fd = open(home, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (home_fd < 0)
     {
@@ -824,22 +1213,104 @@ int restore(const char *source)
         return 1;
     }
 
+    CloneContext ctx = {
+        .operation = CLONE_RESTORE,
+        .representation = CLONE_NATIVE_TREE
+    };
+    MetadataProfiles metadata_profiles;
+    metadata_profiles_init(&metadata_profiles);
+    RestoreTimestampAnchors timestamp_anchors;
+    restore_timestamp_anchors_init(&timestamp_anchors);
+    int metadata_inventory_failed;
+    if (mst == MANIFEST_STATUS_VALID)
+        metadata_inventory_failed = restore_v1_metadata_inventory(
+            source_root_fd, home, home_fd, &m, &ctx, &metadata_profiles,
+            &timestamp_anchors);
+    else
+        metadata_inventory_failed = restore_legacy_metadata_inventory(
+            source, source_root_fd, home, home_fd, &ctx, &metadata_profiles,
+            &timestamp_anchors);
+    if (metadata_inventory_failed != 0)
+    {
+        printf("Error: native metadata preflight failed; no destination was changed\n");
+        metadata_profiles_free(&metadata_profiles);
+        restore_timestamp_anchors_free(&timestamp_anchors);
+        if (mst == MANIFEST_STATUS_VALID)
+            manifest_free(&m);
+        close(home_fd);
+        close(source_root_fd);
+        return 1;
+    }
+    metadata_profiles_report(&metadata_profiles);
+
+    if (dry_run)
+    {
+        printf("Dry run mode enabled. No changes will be made.\n\n");
+    }
+    else if (!confirm_action("This will restore files to your home directory. Continue?"))
+    {
+        printf("Cancelled.\n");
+        metadata_profiles_free(&metadata_profiles);
+        restore_timestamp_anchors_free(&timestamp_anchors);
+        if (mst == MANIFEST_STATUS_VALID)
+            manifest_free(&m);
+        close(home_fd);
+        close(source_root_fd);
+        return 0;
+    }
+
+    printf("Restoring from: %s\n\n", source);
+
     int count = 0;
     int had_error = 0;
 
-    // Restore always writes a native tree here; a portable source is a later phase.
-    CloneContext ctx = { .operation = CLONE_RESTORE, .representation = CLONE_NATIVE_TREE };
+    if (!dry_run)
+    {
+        if (restore_timestamp_anchor_probe(&timestamp_anchors) != 0)
+        {
+            printf("Error: native timestamp preflight failed; no destination was changed\n");
+            metadata_profiles_free(&metadata_profiles);
+            restore_timestamp_anchors_free(&timestamp_anchors);
+            if (mst == MANIFEST_STATUS_VALID)
+                manifest_free(&m);
+            close(home_fd);
+            close(source_root_fd);
+            return 1;
+        }
+        // ctx's own timestamp_policy_configured/nsec_exact are never read for
+        // an actual apply: restore_item_at() always builds its own
+        // per-destination-anchor copy from timestamp_anchors before using it.
+        if (metadata_profiles_probe(&metadata_profiles,
+                                    (MetadataTimestampPolicy){
+                                        .nsec_exact = 0,
+                                        .configured = 1
+                                    }) != 0)
+        {
+            printf("Error: native metadata preflight failed; no destination was changed\n");
+            metadata_profiles_free(&metadata_profiles);
+            restore_timestamp_anchors_free(&timestamp_anchors);
+            if (mst == MANIFEST_STATUS_VALID)
+                manifest_free(&m);
+            close(home_fd);
+            close(source_root_fd);
+            return 1;
+        }
+        ctx.metadata_preflight_done = 1;
+    }
 
     if (mst == MANIFEST_STATUS_VALID)
     {
-        restore_v1(source, source_root_fd, home, home_fd, &ctx, &m, &count, &had_error);
+        restore_v1(source, source_root_fd, home, home_fd, &ctx, &m, &count,
+                   &had_error, &timestamp_anchors);
         manifest_free(&m);
     }
     else
     {
         if (restore_legacy(source, source_root_fd, home, home_fd, &ctx,
-                           &count, &had_error) != 0)
+                           &count, &had_error, &timestamp_anchors) != 0)
         {
+            metadata_profiles_free(&metadata_profiles);
+            restore_timestamp_anchors_free(&timestamp_anchors);
             close(home_fd);
             close(source_root_fd);
             return 1;
@@ -862,5 +1333,7 @@ int restore(const char *source)
 
     close(home_fd);
     close(source_root_fd);
+    metadata_profiles_free(&metadata_profiles);
+    restore_timestamp_anchors_free(&timestamp_anchors);
     return had_error ? 1 : 0;
 }
