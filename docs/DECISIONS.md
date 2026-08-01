@@ -698,10 +698,28 @@ there is no interior corruption.
 Resource ceilings cover root ids, logical/physical paths, xattr names and values,
 xattrs per entry, live entries, total sidecar bytes, parser allocation, numeric
 timestamps, uid/gid, mode, and regular-file size. Every length and arithmetic
-operation is checked before allocation or casting. The implementation must publish
-the concrete sidecar ceiling constants before the sidecar codec is implemented; this
-decision fixes the categories and fail-closed behaviour without making a
-host-dependent limit part of the wire format.
+operation is checked before allocation or casting. This decision fixes the
+categories and fail-closed behaviour without making a host-dependent limit part
+of the wire format.
+
+The concrete constants, published here before the sidecar codec is implemented:
+
+| Constant | Value | Basis |
+|---|---|---|
+| `SIDECAR_MAX_ROOT_ID` | 64 | `MANIFEST_ID_MAX` (D16) -- a sidecar root id names a manifest root table entry |
+| `SIDECAR_MAX_PATH` | 4096 | `PATH_MAX`, logical and physical paths alike |
+| `SIDECAR_MAX_SYMLINK_TARGET` | 4096 | `PATH_MAX`; the type-specific field reserved above, not yet written |
+| `SIDECAR_MAX_XATTR_NAME` | 255 | Linux `XATTR_NAME_MAX` |
+| `SIDECAR_MAX_XATTR_VALUE` | 65536 | Linux `XATTR_SIZE_MAX`; `setxattr`/`getxattr` accept nothing larger |
+| `SIDECAR_MAX_XATTRS_PER_ENTRY` | 256 | generous relative to `XATTR_SIZE_MAX`/`XATTR_NAME_MAX`, still bounded |
+| `SIDECAR_MAX_LIVE_ENTRIES` | 2^20 (1,048,576) | resource-exhaustion ceiling, not an expected count -- same role as `MANIFEST_MAX_ROOTS`/`METADATA_MAX_PROFILES` |
+| `SIDECAR_MAX_TOTAL_BYTES` | 4 GiB | consistent with the live-entry ceiling at a generous per-entry average |
+| `SIDECAR_MAX_ALLOC_BUDGET` | 1 GiB | the parser's own heap use, live-state map included; the sidecar is streamed, never loaded whole, so this is smaller than `SIDECAR_MAX_TOTAL_BYTES` on purpose |
+| timestamp seconds | signed, full range | already fixed above ("timestamp seconds are signed") |
+| timestamp nanoseconds | `0..999999999` | already fixed above |
+| uid / gid | unsigned, 32-bit | matches `uid_t`/`gid_t` width; wire stays unsigned per the field above |
+| mode | unsigned, `0..07777` | permission and special bits only, per the field above |
+| regular-file size | unsigned | a file's size is never negative; this does not revisit "size... are unsigned" above, only gives it no further ceiling beyond the wire's own width |
 
 ### Boundaries and relationships
 
