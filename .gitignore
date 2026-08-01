@@ -9,4 +9,5 @@ tests/test_container
 tests/test_restore_native
 tests/test_restore_dispatch
 tests/test_backup_plan
+tests/test_metadata_contract
 docs/scratch/
