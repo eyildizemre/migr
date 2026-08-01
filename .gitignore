@@ -10,4 +10,5 @@ tests/test_restore_native
 tests/test_restore_dispatch
 tests/test_backup_plan
 tests/test_metadata_contract
+tests/test_sidecar
 docs/scratch/
