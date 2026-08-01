@@ -491,3 +491,229 @@ source-to-destination mapping, or a guarded original-location restore contract.
 
 **Relationship:** Refines D11's explicit-path syntax with root addressing and applies
 D8's native exit-right boundary.
+
+---
+
+## D17 — 2026-08-01 — Sidecar v1 and the core metadata contract are frozen
+
+**Status:** Decided — Phase B implementation pending
+
+**Decision:** Phase B uses a versioned, NUL-framed, append-only sidecar as the
+authoritative state log for portable capture and resume. The sidecar and its payload
+form one committed state, and native metadata handling adopts the same exact numeric
+ownership, mode, and timestamp contract. This entry freezes the wire grammar,
+interruption rules, metadata policy, and the boundaries that remain outside Phase B.
+
+### Committed state and resume
+
+For a new entry, the writer completes and closes the payload before writing its
+`ENTRY` and `XATTR` records; `ENTRY_COMMIT` is the only operation that makes the group
+live. When replacing an already committed entry, the writer first commits a `DELETE`
+for the old key, then replaces the payload, then writes and commits the new entry
+group. An interruption after payload mutation therefore cannot leave old metadata
+describing incomplete new bytes.
+
+The reader applies **last committed state wins** per key: a later committed group for
+the same key supersedes the earlier group, and a committed `DELETE` removes the key's
+live state. Committed group order is the implicit generation. Because the writer
+always `DELETE`s before replacing, a duplicate committed `ENTRY` without an
+intervening `DELETE` is a reader-side last-wins case, not corruption.
+
+Portable resume reconciles the previous committed live-key set with the keys visited
+by the new source walk. Each stale key is deleted from the sidecar and its physical
+payload is removed without following symlinks; any cleanup or final inventory failure
+blocks finalization. A crash after a `DELETE` but before payload unlink leaves the key
+non-live, so a later resume can remove the orphan safely. This guarantees process
+interruption recovery, not power-loss durability; `fsync` is outside the contract.
+
+Native resume still has a separate stale-entry gap: without a committed key log, a
+source entry deleted between runs can remain in the native payload. That is explicitly
+owned by Phase H, whose acceptance criterion is that deleted files/subtrees do not
+survive a successful resumed final backup and that deletion failure blocks
+finalization.
+
+### Core metadata and ownership preflight
+
+Atime, mtime, mode, and numeric uid/gid are core metadata. Native v1 and legacy
+restore read the desired ownership from the payload tree; portable restore reads it
+from committed sidecar state, while portable backup records true ownership without
+applying it to the destination. Required metadata capture, apply, or readback failure
+is fatal: backup returns nonzero and does not finalize, and restore leaves the
+destination unchanged on its rejection path. UID remapping and current-user
+normalization are not performed.
+
+Metadata application is ordered and verified as:
+
+```text
+fchown -> fchmod -> futimens -> fstat readback
+```
+
+The ownership preflight is read-only during inventory and uses an anonymous
+`O_TMPFILE|O_EXCL|O_RDWR|O_CLOEXEC` inode for each distinct privilege-relevant
+profile. A profile is privilege-relevant when any of the following is true:
+
+- the desired uid differs from the effective uid;
+- the desired gid is outside the effective and supplementary groups;
+- setuid or setgid is requested; or
+- an existing destination object has an initial uid different from the effective
+  uid, or an initial gid outside the effective and supplementary groups (including
+  the case where the desired uid happens to equal the effective uid).
+
+The probe applies the exact sequence above and verifies the resulting metadata. For
+an existing destination profile, it first models the observed initial uid/gid on the
+anonymous inode; failure there is itself a refusal because the real destination could
+not be transitioned safely either. A failure of any required profile rejects the whole
+invocation; no partial success is published. Self-owned, setid-free profiles do not
+need this write probe and rely on the POSIX ownership guarantee.
+
+The probe anchor is the actual destination root, or the nearest existing parent when
+that root does not yet exist. It is not the mount point. Mount identity is retained
+only as the uid-mapping domain in the profile key; a mount-wide identity must not make
+an unwritable mount root stand in for a writable descendant. The metadata profile
+limit is `MAX_METADATA_PROFILES = 65536`: exceeding it rejects the invocation before
+mutation, so the probe and report budgets stay bounded. Diagnostic path examples are
+bounded by `MAX_PREFLIGHT_EXAMPLES = 16`.
+
+If a privilege-relevant anchor cannot perform `O_TMPFILE`, migr has no mutation-free
+proof of the required authorization and refuses that invocation; there is no named
+scratch fallback. Dry-run performs only read-only inventory and may report which
+profiles require a live probe, but it must not claim that the live verdict is known.
+Probe success is evidence for that anchor and profile at that instant only; a later
+apply/readback failure remains fatal and is not silently reclassified.
+
+### Timestamp and resume policy
+
+Phase B adds a new destination capability, `FS_CAP_TIMESTAMPS`, which is supported
+when both regular files and directories preserve atime and mtime at second granularity
+and preserve the ordering of two distinct round-trip samples. Filesystem names and
+guessed resolutions are never used as evidence. Nanosecond round-trip equality is
+recorded separately in the destination capability profile as `nsec_exact` (it is a
+probe measurement, not a sidecar field) and does not affect the representation
+verdict.
+
+When `nsec_exact` is false, metadata application writes the canonical
+`{source_seconds, 0}` value for atime and mtime and verifies both the seconds and the
+zero nanoseconds. Native content resume-skip is allowed only when `nsec_exact` is true
+and `size + mtime_sec + mtime_nsec` matches. Otherwise regular-file content is copied
+again; metadata is always reapplied and verified. Portable resume uses committed
+sidecar state rather than destination timestamps.
+
+### Source and restore safety
+
+Native and portable capture use the same source snapshot contract: final objects are
+opened with `O_NOFOLLOW` and the type-appropriate flags, payload-readable regular
+files and directories are opened with `O_NOATIME` so migr's own reads do not perturb
+the captured source atime. If `O_NOATIME` is refused (a non-owner without
+`CAP_FOWNER`), capture fails closed before reading the payload rather than silently
+falling back to a read that would change atime. Metadata is captured from the open
+descriptor, and a post-copy `fstat` must match the pre-copy device, inode, type, size,
+mode, uid/gid, timestamps, and ctime. A source change is fatal; there is no retry that
+could silently join two different source states.
+
+Portable restore performs a global read-only preflight and then per-entry
+fd-anchored, component-by-component revalidation with `O_NOFOLLOW`. Absolute paths,
+`..`, empty interior components, symlink redirects, two distinct logical entries that
+resolve to the same physical address, file-as-ancestor relationships,
+manifest-external roots, unsupported types, and nonzero xattr counts before their
+respective phases are rejected before persistent destination mutation. (A repeated
+logical key across committed groups is collapsed by last-committed-wins, so it never
+becomes two entries.) Confirmation precedes the live probe, and a probe rejection
+guarantees no changed user payload, named scratch entry, or descriptor residue.
+
+The Phase B file-kind policy is:
+
+- regular files: content plus exact core metadata;
+- directories: children first, then exact post-order metadata;
+- symlinks: native no-follow behaviour remains; portable handling waits for Phase C;
+- FIFOs: native exact metadata, portable handling remains fail-closed;
+- sockets and device nodes: warning and skip, with an earlier committed state deleted
+  before the skip can leave stale payload visible.
+
+### Sidecar v1 wire grammar
+
+The file begins with the byte sequence `MIGR_SIDECAR\0` followed by canonical version
+`1\0`. Record tags are `ENTRY\0`, `XATTR\0`, `ENTRY_COMMIT\0`, and `DELETE\0`.
+Every field except the xattr value is a NUL-terminated byte sequence: NUL-free byte
+strings (root id, logical path, physical path, object kind, and xattr name) and
+numeric fields alike end at their NUL. Xattr values are arbitrary bytes and are
+encoded as a canonical length field followed by exactly that many raw bytes. Numeric
+fields use canonical ASCII decimal with fixed signedness (timestamp seconds are
+signed; nanoseconds, mode, uid, gid, size, and count are unsigned), explicit upper
+bounds, and checked overflow; host `long`, `uid_t`, and `off_t` representations never
+appear on disk. Nanoseconds are restricted to `0..999999999`.
+
+The field order is fixed:
+
+```text
+ENTRY:
+  tag, root_id, logical_path, physical_path, object_kind,
+  mode, uid, gid,
+  atime_sec, atime_nsec, mtime_sec, mtime_nsec,
+  size, xattr_count, kind-specific fields
+
+XATTR:
+  tag, name, value_length, value_bytes
+
+ENTRY_COMMIT:
+  tag
+
+DELETE:
+  tag, root_id, logical_path
+```
+
+`mode` contains permission and special bits; object type is carried separately by
+`object_kind`. `size` is meaningful for regular files. File, directory, and FIFO
+records have no type-extra field. Symlink target bytes and hardlink references have
+reserved type-specific positions in the v1 grammar, but their writers remain disabled
+until their respective phases, and portable restore refuses them meanwhile.
+
+An `ENTRY` must be followed by exactly its declared number of `XATTR` records and an
+`ENTRY_COMMIT`. A standalone `DELETE(root_id, logical_path)` becomes committed at the
+end of its path field. Unknown record, object-kind, or version; opening a second
+group before the first is committed; and illegal record order are fatal. An
+incomplete final record at EOF is a truncated tail and is discarded. A complete group
+without `ENTRY_COMMIT` produces no live state; malformed data in the interior of the
+file makes the sidecar unusable. A complete record whose content is invalid (unknown
+tag, out-of-range value) is corruption wherever it sits, including at EOF — only a
+record whose declared extent runs past EOF at the file's end is a truncated tail. The
+parser returns the last valid boundary after the header or the latest complete
+`ENTRY_COMMIT`/`DELETE`; adoption may truncate only to that boundary after proving
+there is no interior corruption.
+
+Resource ceilings cover root ids, logical/physical paths, xattr names and values,
+xattrs per entry, live entries, total sidecar bytes, parser allocation, numeric
+timestamps, uid/gid, mode, and regular-file size. Every length and arithmetic
+operation is checked before allocation or casting. The implementation must publish
+the concrete sidecar ceiling constants before the sidecar codec is implemented; this
+decision fixes the categories and fail-closed behaviour without making a
+host-dependent limit part of the wire format.
+
+### Boundaries and relationships
+
+Production portable dispatch remains disabled through Phase B. Portable symlink/FIFO
+handling, xattrs/ACLs, illegal-name encoding, case collisions, hardlinks, and sparse
+preservation remain in their designated later phases; D13's sparse-file boundary is
+unchanged. D17 refines D8 by defining what “full fidelity” means for the accepted
+contract and does not claim that the implementation is already complete.
+
+**Why:** Sidecar state is both a format and a crash-recovery protocol. Freezing the
+commit boundary, metadata semantics, and rejection policy before writing the parser
+prevents an apparently valid partial backup from being published with stale metadata,
+silently degraded ownership, or an ambiguous tail. Keeping the grammar byte-oriented
+and resource-bounded also makes untrusted restore input reviewable and portable across
+architectures.
+
+**Rejected:** power-loss durability via `fsync`; silent UID/GID normalization; named
+probe scratch files; mount-point substitution for the actual destination anchor;
+atomic sidecar rewrite as an alternative to `DELETE` + last-committed-wins;
+timestamp-based content skipping when nanoseconds are not exact; treating probe
+errors as portable mode; production portable dispatch before the later safety phases;
+and preserving sparse layout in the initial sidecar.
+
+**Relationship:** D17 refines D6's append-only sidecar direction and D8's native
+fidelity promise, applies D13's sparse boundary and D14's empirical fail-closed
+representation policy, and records the Phase H native stale-reconciliation debt.
+Relative to D6's sketch, D17 supersedes the "symlink stored as a regular file holding
+the target path" representation in favour of reserved inline target bytes in the
+record; D6 keeps its number and this entry names the reversal, per the append-only
+rule.
