@@ -791,6 +791,15 @@ static void visited_free(PortableVisited *visited)
     free(visited);
 }
 
+static void visited_dispose(PortableVisited *visited)
+{
+    if (visited == NULL)
+        return;
+    visited_reset(visited);
+    free(visited->slots);
+    memset(visited, 0, sizeof(*visited));
+}
+
 static int visited_add(PortableVisited *visited, const char *root_id,
                        const char *logical)
 {
@@ -848,6 +857,138 @@ static int visited_add(PortableVisited *visited, const char *root_id,
     slot->hash = hash;
     visited->count++;
     return 0;
+}
+
+static int visited_contains(const PortableVisited *visited,
+                            const char *root_id, const char *logical)
+{
+    if (visited == NULL || root_id == NULL || logical == NULL)
+        return -1;
+    if (visited->capacity == 0)
+        return 0;
+
+    size_t root_length = strlen(root_id);
+    size_t logical_length = strlen(logical);
+    uint64_t hash = visited_hash(visited, root_id, root_length, logical,
+                                 logical_length);
+    size_t index = SIZE_MAX;
+    int location = visited_locate(visited, root_id, root_length, logical,
+                                  logical_length, hash, &index);
+    if (location < 0)
+        return -1;
+    return location == 1 ? 1 : 0;
+}
+
+typedef struct {
+    char *logical;
+    char *physical;
+} StaleKey;
+
+typedef struct {
+    StaleKey *items;
+    size_t count;
+    size_t capacity;
+    int failed;
+} StaleKeys;
+
+static void stale_keys_free(StaleKeys *keys)
+{
+    if (keys == NULL)
+        return;
+    for (size_t index = 0; index < keys->count; index++) {
+        free(keys->items[index].logical);
+        free(keys->items[index].physical);
+    }
+    free(keys->items);
+    memset(keys, 0, sizeof(*keys));
+}
+
+static int sidecar_bytes_to_text(SidecarBytes bytes, char **out)
+{
+    if (out == NULL || bytes.length >= PATH_MAX ||
+        (bytes.length != 0 && bytes.data == NULL) ||
+        (bytes.length != 0 && memchr(bytes.data, '\0', bytes.length) != NULL))
+        return -1;
+    char *copy = malloc(bytes.length + 1U);
+    if (copy == NULL)
+        return -1;
+    if (bytes.length != 0)
+        memcpy(copy, bytes.data, bytes.length);
+    copy[bytes.length] = '\0';
+    *out = copy;
+    return 0;
+}
+
+static int stale_keys_append(StaleKeys *keys, SidecarBytes logical,
+                             SidecarBytes physical)
+{
+    if (keys == NULL)
+        return -1;
+    if (keys->count >= SIDECAR_MAX_LIVE_ENTRIES)
+        return -1;
+    if (keys->count == keys->capacity) {
+        size_t capacity = keys->capacity == 0 ? 16U : keys->capacity * 2U;
+        if (capacity > SIDECAR_MAX_LIVE_ENTRIES)
+            capacity = SIDECAR_MAX_LIVE_ENTRIES;
+        if (capacity < keys->capacity || capacity > SIZE_MAX / sizeof(*keys->items))
+            return -1;
+        StaleKey *items = realloc(keys->items, capacity * sizeof(*items));
+        if (items == NULL)
+            return -1;
+        keys->items = items;
+        keys->capacity = capacity;
+    }
+
+    StaleKey item = {0};
+    if (sidecar_bytes_to_text(logical, &item.logical) != 0 ||
+        sidecar_bytes_to_text(physical, &item.physical) != 0) {
+        free(item.logical);
+        free(item.physical);
+        return -1;
+    }
+    keys->items[keys->count++] = item;
+    return 0;
+}
+
+typedef struct {
+    PortableCaptureContext *context;
+    const char *root_id;
+    StaleKeys *stale;
+} StaleCollection;
+
+static int collect_stale_key(const SidecarLiveView *view, void *argument)
+{
+    StaleCollection *collection = argument;
+    if (collection == NULL || collection->context == NULL ||
+        collection->root_id == NULL || collection->stale == NULL ||
+        view == NULL || view->entry == NULL)
+        return 1;
+    if (!sidecar_bytes_equal(
+            view->entry->root_id,
+            (SidecarBytes){ (const unsigned char *)collection->root_id,
+                            strlen(collection->root_id) }))
+        return 0;
+
+    char *logical = NULL;
+    if (sidecar_bytes_to_text(view->entry->logical_path, &logical) != 0) {
+        collection->stale->failed = 1;
+        return 1;
+    }
+    int present = visited_contains(collection->context->visited,
+                                   collection->root_id, logical);
+    free(logical);
+    if (present < 0) {
+        collection->stale->failed = 1;
+        return 1;
+    }
+    if (present == 0) {
+        if (!sidecar_bytes_equal(view->entry->logical_path,
+                                 view->entry->physical_path) ||
+            stale_keys_append(collection->stale, view->entry->logical_path,
+                              view->entry->physical_path) != 0)
+            collection->stale->failed = 1;
+    }
+    return collection->stale->failed;
 }
 
 static int key_is_live(PortableCaptureContext *context,
@@ -947,6 +1088,388 @@ static int append_group(PortableCaptureContext *context,
             return -1;
     status = sidecar_log_append_entry_commit(context->sidecar);
     return status == SIDECAR_STATUS_OK ? 0 : -1;
+}
+
+static int remove_payload_relative(int data_fd, const char *payload_root,
+                                   const char *physical)
+{
+    if (data_fd < 0 || payload_root == NULL || physical == NULL)
+        return -1;
+
+    int root_parent = -1;
+    char root_leaf[NAME_MAX + 1U];
+    if (open_existing_payload_parent(data_fd, payload_root, &root_parent,
+                                     root_leaf, sizeof(root_leaf)) != 0)
+        return errno == ENOENT ? 0 : -1;
+
+    if (physical[0] == '\0') {
+        int result = remove_leaf(root_parent, root_leaf);
+        int saved = errno;
+        if (close(root_parent) != 0 && result == 0) {
+            result = -1;
+            saved = EIO;
+        }
+        errno = saved;
+        return result;
+    }
+
+    int payload_fd = open_child_directory(root_parent, root_leaf);
+    int saved = errno;
+    if (payload_fd >= 0) {
+        if (close(root_parent) != 0) {
+            saved = errno;
+            close(payload_fd);
+            errno = saved;
+            return -1;
+        }
+    } else if (close(root_parent) != 0) {
+        saved = errno;
+    }
+    if (payload_fd < 0) {
+        errno = saved;
+        return errno == ENOENT ? 0 : -1;
+    }
+
+    int parent_fd = -1;
+    char leaf[NAME_MAX + 1U];
+    if (open_existing_payload_parent(payload_fd, physical, &parent_fd,
+                                     leaf, sizeof(leaf)) != 0) {
+        saved = errno;
+        if (close(payload_fd) != 0)
+            return -1;
+        errno = saved;
+        return errno == ENOENT ? 0 : -1;
+    }
+    int result = remove_leaf(parent_fd, leaf);
+    saved = errno;
+    if (close(parent_fd) != 0 && result == 0) {
+        result = -1;
+        saved = EIO;
+    }
+    if (close(payload_fd) != 0 && result == 0) {
+        result = -1;
+        saved = EIO;
+    }
+    errno = saved;
+    return result;
+}
+
+typedef struct {
+    char **items;
+    size_t count;
+    size_t capacity;
+} InventoryOrphans;
+
+static void inventory_orphans_free(InventoryOrphans *orphans)
+{
+    if (orphans == NULL)
+        return;
+    for (size_t index = 0; index < orphans->count; index++)
+        free(orphans->items[index]);
+    free(orphans->items);
+    memset(orphans, 0, sizeof(*orphans));
+}
+
+static int inventory_orphans_append(InventoryOrphans *orphans,
+                                    const char *relative)
+{
+    if (orphans == NULL || relative == NULL)
+        return -1;
+    if (orphans->count >= SIDECAR_MAX_LIVE_ENTRIES)
+        return -1;
+    if (orphans->count == orphans->capacity) {
+        size_t capacity = orphans->capacity == 0 ? 16U : orphans->capacity * 2U;
+        if (capacity > SIDECAR_MAX_LIVE_ENTRIES)
+            capacity = SIDECAR_MAX_LIVE_ENTRIES;
+        if (capacity < orphans->capacity ||
+            capacity > SIZE_MAX / sizeof(*orphans->items))
+            return -1;
+        char **items = realloc(orphans->items, capacity * sizeof(*items));
+        if (items == NULL)
+            return -1;
+        orphans->items = items;
+        orphans->capacity = capacity;
+    }
+    char *copy = strdup(relative);
+    if (copy == NULL)
+        return -1;
+    orphans->items[orphans->count++] = copy;
+    return 0;
+}
+
+typedef struct {
+    PortableCaptureContext *context;
+    const char *root_id;
+    PortableVisited live_paths;
+    PortableVisited seen_paths;
+    InventoryOrphans orphans;
+    int orphan_root;
+    int failed;
+    size_t live_count;
+} InventoryState;
+
+static int inventory_live_callback(const SidecarLiveView *view, void *argument)
+{
+    InventoryState *inventory = argument;
+    if (inventory == NULL || inventory->root_id == NULL ||
+        view == NULL || view->entry == NULL)
+        return 1;
+    if (!sidecar_bytes_equal(
+            view->entry->root_id,
+            (SidecarBytes){ (const unsigned char *)inventory->root_id,
+                            strlen(inventory->root_id) }))
+        return 0;
+    if (!sidecar_bytes_equal(view->entry->logical_path,
+                             view->entry->physical_path)) {
+        inventory->failed = 1;
+        return 1;
+    }
+
+    char *physical = NULL;
+    if (sidecar_bytes_to_text(view->entry->physical_path, &physical) != 0) {
+        inventory->failed = 1;
+        return 1;
+    }
+    int inserted = visited_add(&inventory->live_paths, inventory->root_id,
+                               physical);
+    free(physical);
+    if (inserted != 0) {
+        inventory->failed = 1;
+        return 1;
+    }
+    inventory->live_count++;
+    return 0;
+}
+
+static int inventory_scan_node(InventoryState *inventory,
+                               int parent_fd, const char *leaf,
+                               const char *relative, int is_root)
+{
+    struct stat st;
+    if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) != 0)
+        return errno == ENOENT ? 0 : -1;
+
+    SidecarBytes key = {
+        (const unsigned char *)relative, strlen(relative)
+    };
+    SidecarLiveView live_view;
+    int live = sidecar_log_find(inventory->context->sidecar,
+                                (SidecarBytes){
+                                    (const unsigned char *)inventory->root_id,
+                                    strlen(inventory->root_id)
+                                }, key, &live_view);
+    if (live < 0)
+        return -1;
+    if (live == 0) {
+        int deleted = sidecar_log_find_deleted(
+            inventory->context->sidecar,
+            (SidecarBytes){ (const unsigned char *)inventory->root_id,
+                            strlen(inventory->root_id) },
+            key, &live_view);
+        if (deleted < 0)
+            return -1;
+        if (deleted == 1) {
+            if (is_root)
+                inventory->orphan_root = 1;
+            else if (inventory_orphans_append(&inventory->orphans,
+                                              relative) != 0)
+                return -1;
+            return 0;
+        }
+        inventory->failed = 1;
+        return -1;
+    }
+
+    if (visited_add(&inventory->seen_paths, inventory->root_id, relative) != 0)
+        return -1;
+    if ((live_view.entry->kind == SIDECAR_KIND_DIRECTORY) !=
+        (S_ISDIR(st.st_mode) != 0))
+        return -1;
+    if (!S_ISDIR(st.st_mode))
+        return 0;
+
+    int directory_fd = open_child_directory(parent_fd, leaf);
+    if (directory_fd < 0)
+        return -1;
+    int scan_fd = duplicate_fd(directory_fd);
+    DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
+    if (directory == NULL) {
+        if (scan_fd >= 0)
+            close(scan_fd);
+        close(directory_fd);
+        return -1;
+    }
+
+    int failed = 0;
+    for (;;) {
+        errno = 0;
+        struct dirent *entry = readdir(directory);
+        if (entry == NULL) {
+            if (errno != 0)
+                failed = 1;
+            break;
+        }
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0)
+            continue;
+        char child_relative[SIDECAR_MAX_PATH + 1U];
+        if (append_logical(child_relative, sizeof(child_relative), relative,
+                           entry->d_name) != 0 ||
+            inventory_scan_node(inventory, directory_fd, entry->d_name,
+                                child_relative, 0) != 0) {
+            failed = 1;
+            break;
+        }
+    }
+    if (closedir(directory) != 0)
+        failed = 1;
+    if (close(directory_fd) != 0)
+        failed = 1;
+    return failed ? -1 : 0;
+}
+
+static int inventory_seen_callback(const SidecarLiveView *view,
+                                   void *argument)
+{
+    InventoryState *inventory = argument;
+    if (inventory == NULL || inventory->root_id == NULL ||
+        view == NULL || view->entry == NULL)
+        return 1;
+    if (!sidecar_bytes_equal(
+            view->entry->root_id,
+            (SidecarBytes){ (const unsigned char *)inventory->root_id,
+                            strlen(inventory->root_id) }))
+        return 0;
+    char *physical = NULL;
+    if (sidecar_bytes_to_text(view->entry->physical_path, &physical) != 0) {
+        inventory->failed = 1;
+        return 1;
+    }
+    int present = visited_contains(&inventory->seen_paths,
+                                   inventory->root_id, physical);
+    free(physical);
+    if (present != 1) {
+        inventory->failed = 1;
+        return 1;
+    }
+    return 0;
+}
+
+static int reconcile_inventory(PortableCaptureContext *context,
+                               const PortableRootSpec *root)
+{
+    InventoryState inventory;
+    memset(&inventory, 0, sizeof(inventory));
+    inventory.context = context;
+    inventory.root_id = root->id;
+    inventory.live_paths.hash_salt = sidecar_process_salt();
+    inventory.seen_paths.hash_salt = inventory.live_paths.hash_salt;
+
+    SidecarStatus status = sidecar_log_foreach(context->sidecar,
+                                               inventory_live_callback,
+                                               &inventory);
+    if (status != SIDECAR_STATUS_OK || inventory.failed)
+        goto fail;
+
+    int root_parent = -1;
+    char root_leaf[NAME_MAX + 1U];
+    if (open_existing_payload_parent(context->data_fd, root->payload_path,
+                                     &root_parent, root_leaf,
+                                     sizeof(root_leaf)) != 0) {
+        if (errno == ENOENT && inventory.live_count == 0) {
+            inventory_orphans_free(&inventory.orphans);
+            visited_dispose(&inventory.live_paths);
+            visited_dispose(&inventory.seen_paths);
+            return 0;
+        }
+        goto fail;
+    }
+
+    if (inventory_scan_node(&inventory, root_parent, root_leaf, "", 1) != 0)
+        goto close_fail;
+    if (close(root_parent) != 0)
+        goto fail;
+    root_parent = -1;
+
+    if (inventory.orphan_root) {
+        portable_test_interrupt_if(PORTABLE_TEST_BEFORE_STALE_UNLINK);
+        if (remove_payload_relative(context->data_fd, root->payload_path,
+                                     "") != 0)
+            goto fail;
+        portable_test_interrupt_if(PORTABLE_TEST_AFTER_STALE_UNLINK);
+    }
+    for (size_t index = 0; index < inventory.orphans.count; index++) {
+        portable_test_interrupt_if(PORTABLE_TEST_BEFORE_STALE_UNLINK);
+        if (remove_payload_relative(context->data_fd, root->payload_path,
+                                     inventory.orphans.items[index]) != 0)
+            goto fail;
+        portable_test_interrupt_if(PORTABLE_TEST_AFTER_STALE_UNLINK);
+    }
+
+    status = sidecar_log_foreach(context->sidecar, inventory_seen_callback,
+                                 &inventory);
+    if (status != SIDECAR_STATUS_OK || inventory.failed)
+        goto fail;
+
+    inventory_orphans_free(&inventory.orphans);
+    visited_dispose(&inventory.live_paths);
+    visited_dispose(&inventory.seen_paths);
+    return 0;
+
+close_fail:
+    {
+        int saved = errno;
+        close(root_parent);
+        errno = saved;
+    }
+fail:
+    inventory_orphans_free(&inventory.orphans);
+    visited_dispose(&inventory.live_paths);
+    visited_dispose(&inventory.seen_paths);
+    return -1;
+}
+
+static int reconcile_root(PortableCaptureContext *context,
+                          const PortableRootSpec *root)
+{
+    StaleKeys stale;
+    memset(&stale, 0, sizeof(stale));
+    StaleCollection collection = {
+        .context = context,
+        .root_id = root->id,
+        .stale = &stale
+    };
+    SidecarStatus status = sidecar_log_foreach(context->sidecar,
+                                               collect_stale_key,
+                                               &collection);
+    if (status != SIDECAR_STATUS_OK || stale.failed)
+        goto fail;
+
+    for (size_t index = 0; index < stale.count; index++) {
+        SidecarDelete deletion = {
+            .root_id = { (const unsigned char *)root->id,
+                        strlen(root->id) },
+            .logical_path = { (const unsigned char *)stale.items[index].logical,
+                              strlen(stale.items[index].logical) }
+        };
+        if (sidecar_log_append_delete(context->sidecar, &deletion) !=
+            SIDECAR_STATUS_OK)
+            goto fail;
+        portable_test_interrupt_if(PORTABLE_TEST_AFTER_STALE_DELETE);
+        portable_test_interrupt_if(PORTABLE_TEST_BEFORE_STALE_UNLINK);
+        if (remove_payload_relative(context->data_fd, root->payload_path,
+                                    stale.items[index].physical) != 0)
+            goto fail;
+        portable_test_interrupt_if(PORTABLE_TEST_AFTER_STALE_UNLINK);
+    }
+
+    stale_keys_free(&stale);
+    portable_test_interrupt_if(PORTABLE_TEST_BEFORE_FINAL_INVENTORY);
+    return reconcile_inventory(context, root);
+
+fail:
+    stale_keys_free(&stale);
+    return -1;
 }
 
 static int read_source_stat(int source_parent, const char *source_name,
@@ -1563,7 +2086,8 @@ int portable_capture_fresh_at(int container_fd,
     int failed = portable_capture_context_init(&context, data_fd, &sidecar,
                                                request->nsec_exact) != 0;
     for (size_t index = 0; !failed && index < request->root_count; index++)
-        if (portable_capture_root(&context, &request->roots[index]) != 0)
+        if (portable_capture_root(&context, &request->roots[index]) != 0 ||
+            reconcile_root(&context, &request->roots[index]) != 0)
             failed = 1;
     portable_capture_context_close(&context);
     if (sidecar_log_close(&sidecar) != SIDECAR_STATUS_OK)
@@ -1665,7 +2189,8 @@ int portable_capture_resume_at(int container_fd,
     if (!failed) {
         context.resume_mode = 1;
         for (size_t index = 0; index < request->root_count; index++) {
-            if (portable_capture_root(&context, &request->roots[index]) != 0) {
+            if (portable_capture_root(&context, &request->roots[index]) != 0 ||
+                reconcile_root(&context, &request->roots[index]) != 0) {
                 failed = 1;
                 break;
             }

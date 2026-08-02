@@ -126,6 +126,9 @@ typedef struct {
     uint64_t generation;
 } SidecarLiveView;
 
+typedef int (*SidecarLiveCallback)(const SidecarLiveView *view,
+                                   void *context);
+
 /* Record fields passed to the callback are borrowed until it returns. */
 int sidecar_live_entry_count_allowed(uint64_t count);
 
@@ -169,6 +172,10 @@ SidecarStatus sidecar_log_append_delete(SidecarLog *log,
 size_t sidecar_log_live_count(const SidecarLog *log);
 int sidecar_log_find(const SidecarLog *log, SidecarBytes root_id,
                      SidecarBytes logical_path, SidecarLiveView *out);
+SidecarStatus sidecar_log_foreach(SidecarLog *log, SidecarLiveCallback callback,
+                                   void *context);
+int sidecar_log_find_deleted(const SidecarLog *log, SidecarBytes root_id,
+                             SidecarBytes logical_path, SidecarLiveView *out);
 
 #ifdef SIDECAR_TEST_HOOKS
 typedef enum {

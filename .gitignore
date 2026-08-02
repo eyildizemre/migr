@@ -16,4 +16,6 @@ tests/test_sidecar_scale
 tests/test_portable_capture
 tests/test_portable_capture_scale
 tests/test_portable_resume
+tests/test_portable_reconcile
+tests/test_portable_reconcile_scale
 docs/scratch/

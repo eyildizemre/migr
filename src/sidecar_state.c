@@ -477,10 +477,10 @@ static SidecarStatus map_rehash(StateMemory *memory, StateMap *map,
     for (size_t old_index = 0; old_index < map->capacity; old_index++)
     {
         MapSlot *old_slot = &map->slots[old_index];
-        if (old_slot->state != MAP_SLOT_LIVE)
+        if (old_slot->state == MAP_SLOT_EMPTY)
             continue;
         size_t index = (size_t)old_slot->hash & (new_capacity - 1U);
-        while (new_slots[index].state == MAP_SLOT_LIVE)
+        while (new_slots[index].state != MAP_SLOT_EMPTY)
             index = (index + 1U) & (new_capacity - 1U);
         new_slots[index] = *old_slot;
     }
@@ -490,11 +490,10 @@ static SidecarStatus map_rehash(StateMemory *memory, StateMap *map,
                    map->capacity * sizeof(*map->slots));
     map->slots = new_slots;
     map->capacity = new_capacity;
-    map->tombstones = 0;
     return SIDECAR_STATUS_OK;
 }
 
-/* Returns 1 for a matching live slot, 0 for an insertion slot, -1 if full. */
+/* Returns 1 for live, 2 for a matching tombstone, 0 for insertion, -1 full. */
 static int map_locate(const StateMap *map, SidecarBytes root_id,
                       SidecarBytes logical_path, uint64_t hash,
                       size_t *out_index)
@@ -524,6 +523,12 @@ static int map_locate(const StateMap *map, SidecarBytes root_id,
         }
         if (slot->state == MAP_SLOT_TOMBSTONE)
         {
+            if (slot->hash == hash &&
+                key_matches(&slot->entry.entry, root_id, logical_path))
+            {
+                *out_index = index;
+                return 2;
+            }
             if (first_tombstone == MAP_INDEX_NONE)
                 first_tombstone = index;
         }
@@ -578,7 +583,7 @@ static void map_free(StateMemory *memory, StateMap *map)
         return;
     for (size_t index = 0; index < map->capacity; index++)
     {
-        if (map->slots[index].state == MAP_SLOT_LIVE)
+        if (map->slots[index].state != MAP_SLOT_EMPTY)
             clear_entry(memory, &map->slots[index].entry);
     }
     if (map->slots != NULL)
@@ -605,7 +610,7 @@ static SidecarStatus map_prepare_commit(StateMemory *memory, StateMap *map,
     size_t index = MAP_INDEX_NONE;
     int location = map_locate(map, pending->entry.root_id,
                               pending->entry.logical_path, hash, &index);
-    if (location == 1)
+    if (location == 1 || location == 2)
     {
         if (existing_index != NULL)
             *existing_index = index;
@@ -645,7 +650,10 @@ static void map_apply_commit(StateMemory *memory, StateMap *map,
     else
     {
         if (slot->state == MAP_SLOT_TOMBSTONE)
+        {
+            clear_entry(memory, &slot->entry);
             map->tombstones--;
+        }
         map->count++;
     }
     slot->entry = pending->entry;
@@ -661,18 +669,19 @@ static SidecarStatus map_apply_delete(StateMemory *memory, StateMap *map,
                                       SidecarBytes root_id,
                                       SidecarBytes logical_path)
 {
+    (void)memory;
     if (map->generation == UINT64_MAX)
     {
         errno = E2BIG;
         return SIDECAR_STATUS_LIMIT;
     }
-    size_t index = map_find(map, root_id, logical_path);
+    size_t index = MAP_INDEX_NONE;
+    int location = map_locate(map, root_id, logical_path,
+                              map_hash(map, root_id, logical_path), &index);
     map->generation++;
-    if (index == MAP_INDEX_NONE)
+    if (location != 1 || index == MAP_INDEX_NONE)
         return SIDECAR_STATUS_OK;
     MapSlot *slot = &map->slots[index];
-    clear_entry(memory, &slot->entry);
-    slot->hash = 0;
     slot->state = MAP_SLOT_TOMBSTONE;
     map->count--;
     map->tombstones++;
@@ -1177,6 +1186,63 @@ int sidecar_log_find(const SidecarLog *log, SidecarBytes root_id,
     const SidecarLogImplementation *implementation = log->implementation;
     size_t index = map_find(&implementation->map, root_id, logical_path);
     if (index == MAP_INDEX_NONE)
+        return 0;
+    const StateEntry *entry = &implementation->map.slots[index].entry;
+    out->entry = &entry->entry;
+    out->xattrs = entry->xattrs;
+    out->xattr_count = entry->entry.xattr_count;
+    out->generation = entry->generation;
+    return 1;
+}
+
+SidecarStatus sidecar_log_foreach(SidecarLog *log, SidecarLiveCallback callback,
+                                  void *context)
+{
+    SidecarLogImplementation *implementation = NULL;
+    SidecarStatus status = ready_log(log, &implementation);
+    if (status != SIDECAR_STATUS_OK)
+        return status;
+    if (callback == NULL)
+        return SIDECAR_STATUS_INVALID_ARGUMENT;
+
+    for (size_t index = 0; index < implementation->map.capacity; index++)
+    {
+        MapSlot *slot = &implementation->map.slots[index];
+        if (slot->state != MAP_SLOT_LIVE)
+            continue;
+        SidecarLiveView view = {
+            .entry = &slot->entry.entry,
+            .xattrs = slot->entry.xattrs,
+            .xattr_count = slot->entry.entry.xattr_count,
+            .generation = slot->entry.generation
+        };
+        if (callback(&view, context) != 0)
+            return SIDECAR_STATUS_CALLBACK;
+    }
+    return SIDECAR_STATUS_OK;
+}
+
+int sidecar_log_find_deleted(const SidecarLog *log, SidecarBytes root_id,
+                             SidecarBytes logical_path, SidecarLiveView *out)
+{
+    if (out == NULL)
+    {
+        set_invalid_error();
+        return -1;
+    }
+    memset(out, 0, sizeof(*out));
+    if (log == NULL || log->implementation == NULL ||
+        !valid_key(root_id, logical_path))
+    {
+        set_invalid_error();
+        return -1;
+    }
+    const SidecarLogImplementation *implementation = log->implementation;
+    size_t index = MAP_INDEX_NONE;
+    int location = map_locate(&implementation->map, root_id, logical_path,
+                              map_hash(&implementation->map, root_id,
+                                       logical_path), &index);
+    if (location != 2 || index == MAP_INDEX_NONE)
         return 0;
     const StateEntry *entry = &implementation->map.slots[index].entry;
     out->entry = &entry->entry;
