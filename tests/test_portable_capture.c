@@ -5,7 +5,7 @@
 // built on top of this one.
 //
 // Regular/directory capture is checked byte-exact against the source, with
-// xattrs captured and the resulting sidecar's group count verified. §1.5's
+// xattrs captured and the resulting sidecar's group count verified. D17's
 // source snapshot contract (final object opened `O_NOFOLLOW` +
 // `O_NOATIME`, pre/post `fstat`) is exercised implicitly through every
 // capture, not tested as a separate unit, since it has no observable effect
