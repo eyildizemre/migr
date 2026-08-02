@@ -2,6 +2,7 @@
 #define PORTABLE_RESTORE_H
 
 #include <stddef.h>
+#include <limits.h>
 #include <sys/types.h>
 
 #include "manifest.h"
@@ -28,6 +29,14 @@ typedef struct {
     MetadataProfiles profiles;
 } PortableRestorePreflightReport;
 
+typedef struct {
+    size_t live_count;
+    size_t applied_count;
+    size_t failed_count;
+    char failed_root_id[MANIFEST_ID_MAX];
+    char failed_logical_path[PATH_MAX];
+} PortableRestoreReplayReport;
+
 /* The caller initializes and releases the report around one preflight. */
 void portable_restore_preflight_report_init(
     PortableRestorePreflightReport *report);
@@ -38,5 +47,12 @@ void portable_restore_preflight_report_free(
 int portable_restore_preflight_at(
     const PortableRestoreRequest *request,
     PortableRestorePreflightReport *report);
+
+void portable_restore_replay_report_init(PortableRestoreReplayReport *report);
+
+/* Applies live sidecar entries with fd-anchored revalidation and metadata. */
+int portable_restore_replay_at(
+    const PortableRestoreRequest *request,
+    PortableRestoreReplayReport *report);
 
 #endif

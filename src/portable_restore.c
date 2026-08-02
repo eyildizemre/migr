@@ -73,6 +73,25 @@ typedef struct {
     int failed;
 } PayloadInventory;
 
+typedef struct {
+    const SidecarEntry *entry;
+    size_t root_index;
+    char destination[PATH_MAX];
+    size_t depth;
+} ReplayEntry;
+
+typedef struct {
+    ReplayEntry *items;
+    size_t count;
+    size_t capacity;
+    PreflightMemory memory;
+    const Manifest *manifest;
+    RootMap root_map;
+    int data_fd;
+    int destination_home_fd;
+    PortableRestoreReplayReport *report;
+} ReplayCollection;
+
 static void *preflight_alloc(PreflightMemory *memory, size_t size)
 {
     if (memory == NULL || size == 0 ||
@@ -1325,5 +1344,928 @@ fail:
     if (report->violation_count == 0)
         report_violation(report, SIZE_MAX, "preflight");
     report_print(report);
+    return -1;
+}
+
+static void replay_copy_bytes(char *destination, size_t destination_size,
+                              SidecarBytes source)
+{
+    if (destination == NULL || destination_size == 0)
+        return;
+    size_t length = source.length < destination_size - 1U
+        ? source.length : destination_size - 1U;
+    if (length != 0 && source.data != NULL)
+        memcpy(destination, source.data, length);
+    destination[length] = '\0';
+}
+
+static void replay_report_failure(PortableRestoreReplayReport *report,
+                                  const Manifest *manifest,
+                                  size_t root_index,
+                                  SidecarBytes logical)
+{
+    if (report == NULL)
+        return;
+    if (report->failed_count != SIZE_MAX)
+        report->failed_count++;
+    if (manifest != NULL && root_index < (size_t)manifest->root_count)
+        snprintf(report->failed_root_id, sizeof(report->failed_root_id), "%s",
+                 manifest->roots[root_index].id);
+    replay_copy_bytes(report->failed_logical_path,
+                      sizeof(report->failed_logical_path), logical);
+}
+
+static int replay_entries_reserve(ReplayCollection *collection, size_t extra)
+{
+    if (collection == NULL || extra > SIDECAR_MAX_LIVE_ENTRIES -
+                                   collection->count)
+    {
+        errno = E2BIG;
+        return -1;
+    }
+    size_t needed = collection->count + extra;
+    if (needed <= collection->capacity)
+        return 0;
+    size_t capacity = collection->capacity == 0 ? 16U :
+        collection->capacity * 2U;
+    if (capacity < needed)
+        capacity = needed;
+    if (capacity > SIDECAR_MAX_LIVE_ENTRIES ||
+        capacity > SIZE_MAX / sizeof(*collection->items))
+    {
+        errno = E2BIG;
+        return -1;
+    }
+    size_t old_size = collection->capacity * sizeof(*collection->items);
+    size_t new_size = capacity * sizeof(*collection->items);
+    ReplayEntry *items = preflight_realloc(&collection->memory,
+                                           collection->items,
+                                           old_size, new_size);
+    if (items == NULL)
+        return -1;
+    memset(items + collection->capacity, 0,
+           (capacity - collection->capacity) * sizeof(*items));
+    collection->items = items;
+    collection->capacity = capacity;
+    return 0;
+}
+
+static void replay_collection_free(ReplayCollection *collection)
+{
+    if (collection == NULL)
+        return;
+    preflight_free(&collection->memory, collection->items,
+                   collection->capacity * sizeof(*collection->items));
+    collection->items = NULL;
+    collection->count = 0;
+    collection->capacity = 0;
+    root_map_free(&collection->root_map);
+}
+
+static int replay_manifest_valid(const Manifest *manifest)
+{
+    if (manifest == NULL || manifest->version != MANIFEST_CURRENT_VERSION ||
+        manifest->representation != CLONE_PORTABLE_SIDECAR ||
+        manifest->sidecar_version != SIDECAR_VERSION ||
+        manifest->root_count < 0 || manifest->root_count > MANIFEST_MAX_ROOTS ||
+        (manifest->root_count != 0 && manifest->roots == NULL))
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    for (int index = 0; index < manifest->root_count; index++)
+    {
+        const ManifestRoot *root = &manifest->roots[index];
+        if (!manifest_text_valid(root->id, sizeof(root->id), 1) ||
+            !manifest_text_valid(root->payload_path,
+                                 sizeof(root->payload_path), 1) ||
+            !manifest_text_valid(root->source_path,
+                                 sizeof(root->source_path), 0) ||
+            !manifest_text_valid(root->restore_path,
+                                 sizeof(root->restore_path), 0) ||
+            !relative_path_valid(root->payload_path, 0) ||
+            root->policy < ROOT_POLICY_XDG ||
+            root->policy > ROOT_POLICY_MANUAL_NATIVE ||
+            root->policy == ROOT_POLICY_MANUAL_NATIVE ||
+            (root->policy == ROOT_POLICY_HOME_RELATIVE &&
+             (!root->has_restore_path ||
+              !relative_path_valid(root->restore_path, 1))) ||
+            (root->policy != ROOT_POLICY_HOME_RELATIVE &&
+             root->has_restore_path))
+        {
+            errno = EINVAL;
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int replay_stat_from_entry(const SidecarEntry *entry,
+                                  struct stat *desired)
+{
+    if (entry == NULL || desired == NULL ||
+        entry->mode > SIDECAR_MAX_MODE ||
+        entry->atime_nsec > SIDECAR_MAX_NSEC ||
+        entry->mtime_nsec > SIDECAR_MAX_NSEC ||
+        entry->uid > SIDECAR_MAX_UID_GID ||
+        entry->gid > SIDECAR_MAX_UID_GID)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    memset(desired, 0, sizeof(*desired));
+    desired->st_mode = entry->mode |
+        (entry->kind == SIDECAR_KIND_DIRECTORY ? S_IFDIR : S_IFREG);
+    desired->st_uid = (uid_t)entry->uid;
+    desired->st_gid = (gid_t)entry->gid;
+    if ((uintmax_t)desired->st_uid != entry->uid ||
+        (uintmax_t)desired->st_gid != entry->gid)
+    {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    desired->st_atim.tv_sec = (time_t)entry->atime_sec;
+    desired->st_atim.tv_nsec = (long)entry->atime_nsec;
+    desired->st_mtim.tv_sec = (time_t)entry->mtime_sec;
+    desired->st_mtim.tv_nsec = (long)entry->mtime_nsec;
+    if ((int64_t)desired->st_atim.tv_sec != entry->atime_sec ||
+        (int64_t)desired->st_mtim.tv_sec != entry->mtime_sec)
+    {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    return 0;
+}
+
+static size_t replay_path_depth(const char *path)
+{
+    if (path == NULL || path[0] == '\0')
+        return 0;
+    size_t depth = 1;
+    for (const char *cursor = path; *cursor != '\0'; cursor++)
+        if (*cursor == '/')
+            depth++;
+    return depth;
+}
+
+static int replay_entry_compare(const void *left, const void *right)
+{
+    const ReplayEntry *a = left;
+    const ReplayEntry *b = right;
+    if (a->depth < b->depth)
+        return -1;
+    if (a->depth > b->depth)
+        return 1;
+    return strcmp(a->destination, b->destination);
+}
+
+static int replay_collect_entry(const SidecarLiveView *view, void *argument)
+{
+    ReplayCollection *collection = argument;
+    if (collection == NULL || view == NULL || view->entry == NULL)
+        return 1;
+
+    const SidecarEntry *entry = view->entry;
+    size_t root_index = root_map_find(&collection->root_map,
+                                      collection->manifest,
+                                      entry->root_id);
+    if (root_index == SIZE_MAX ||
+        !sidecar_path_valid(entry->logical_path, 1) ||
+        !sidecar_path_valid(entry->physical_path, 1) ||
+        (entry->kind != SIDECAR_KIND_REGULAR &&
+         entry->kind != SIDECAR_KIND_DIRECTORY) ||
+        entry->xattr_count != 0 ||
+        (entry->kind == SIDECAR_KIND_DIRECTORY && entry->size != 0))
+    {
+        replay_report_failure(collection->report, collection->manifest,
+                              root_index, entry->logical_path);
+        return 1;
+    }
+
+    char logical[PATH_MAX];
+    replay_copy_bytes(logical, sizeof(logical), entry->logical_path);
+    if (entry->logical_path.length >= sizeof(logical) ||
+        entry->physical_path.length >= PATH_MAX)
+    {
+        replay_report_failure(collection->report, collection->manifest,
+                              root_index, entry->logical_path);
+        return 1;
+    }
+
+    struct stat desired;
+    if (replay_stat_from_entry(entry, &desired) != 0)
+    {
+        replay_report_failure(collection->report, collection->manifest,
+                              root_index, entry->logical_path);
+        return 1;
+    }
+
+    if (replay_entries_reserve(collection, 1) != 0)
+    {
+        replay_report_failure(collection->report, collection->manifest,
+                              root_index, entry->logical_path);
+        return 1;
+    }
+    ReplayEntry *replay = &collection->items[collection->count];
+    memset(replay, 0, sizeof(*replay));
+    const ManifestRoot *root = &collection->manifest->roots[root_index];
+    if (destination_path_build(root, logical, replay->destination,
+                               sizeof(replay->destination)) != 0 ||
+        (replay->destination[0] == '\0' &&
+         entry->kind != SIDECAR_KIND_DIRECTORY))
+    {
+        replay_report_failure(collection->report, collection->manifest,
+                              root_index, entry->logical_path);
+        return 1;
+    }
+    replay->entry = entry;
+    replay->root_index = root_index;
+    replay->depth = replay_path_depth(replay->destination);
+    collection->count++;
+    if (collection->report->live_count != SIZE_MAX)
+        collection->report->live_count++;
+    return 0;
+}
+
+static int replay_payload_path_build(const ManifestRoot *root,
+                                     SidecarBytes physical,
+                                     char *out, size_t out_size)
+{
+    if (root == NULL || out == NULL || out_size == 0 ||
+        !sidecar_path_valid(physical, 1))
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    size_t root_length = strlen(root->payload_path);
+    if (root_length == 0 || root_length >= out_size ||
+        physical.length > out_size - root_length - 1U)
+    {
+        errno = E2BIG;
+        return -1;
+    }
+    memcpy(out, root->payload_path, root_length);
+    if (physical.length == 0)
+    {
+        out[root_length] = '\0';
+        return 0;
+    }
+    out[root_length] = '/';
+    memcpy(out + root_length + 1U, physical.data, physical.length);
+    out[root_length + 1U + physical.length] = '\0';
+    return 0;
+}
+
+static int replay_open_existing_relative(int base_fd, const char *relative,
+                                          int flags, int *out_fd,
+                                          struct stat *out_stat)
+{
+    if (base_fd < 0 || relative == NULL || out_fd == NULL ||
+        !relative_path_valid(relative, 0))
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    *out_fd = -1;
+    char copy[PATH_MAX];
+    size_t length = strlen(relative);
+    memcpy(copy, relative, length + 1U);
+    int current = duplicate_noatime_directory(base_fd);
+    if (current < 0)
+        return -1;
+
+    char *cursor = copy;
+    for (;;)
+    {
+        char *slash = strchr(cursor, '/');
+        if (slash != NULL)
+            *slash = '\0';
+        if (slash != NULL)
+        {
+            int next = openat(current, cursor,
+                              O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                                  O_NOATIME | O_CLOEXEC);
+            if (next < 0)
+            {
+                int saved = errno;
+                close(current);
+                errno = saved;
+                return -1;
+            }
+            if (close(current) != 0)
+            {
+                int saved = errno;
+                close(next);
+                errno = saved;
+                return -1;
+            }
+            current = next;
+            cursor = slash + 1U;
+            continue;
+        }
+
+        int fd = openat(current, cursor, flags | O_NOFOLLOW | O_CLOEXEC);
+        int saved = errno;
+        if (fd < 0)
+        {
+            close(current);
+            errno = saved;
+            return -1;
+        }
+        if (out_stat != NULL && fstat(fd, out_stat) != 0)
+        {
+            saved = errno;
+            close(fd);
+            close(current);
+            errno = saved;
+            return -1;
+        }
+        if (close(current) != 0)
+        {
+            saved = errno;
+            close(fd);
+            errno = saved;
+            return -1;
+        }
+        *out_fd = fd;
+        return 0;
+    }
+}
+
+static int replay_open_payload(int data_fd, const ManifestRoot *root,
+                               const SidecarEntry *entry, int *out_fd,
+                               struct stat *out_stat)
+{
+    if (data_fd < 0 || root == NULL || entry == NULL || out_fd == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    char path[PATH_MAX];
+    if (replay_payload_path_build(root, entry->physical_path, path,
+                                  sizeof(path)) != 0)
+        return -1;
+    int flags = O_RDONLY | O_NOATIME;
+    if (entry->kind == SIDECAR_KIND_DIRECTORY)
+        flags |= O_DIRECTORY;
+    int fd = -1;
+    struct stat st;
+    if (replay_open_existing_relative(data_fd, path, flags, &fd, &st) != 0)
+        return -1;
+    if ((entry->kind == SIDECAR_KIND_DIRECTORY && !S_ISDIR(st.st_mode)) ||
+        (entry->kind == SIDECAR_KIND_REGULAR &&
+         (!S_ISREG(st.st_mode) || st.st_size < 0 ||
+          (uintmax_t)st.st_size != entry->size)))
+    {
+        int saved = EIO;
+        close(fd);
+        errno = saved;
+        return -1;
+    }
+    if (out_stat != NULL)
+        *out_stat = st;
+    *out_fd = fd;
+    return 0;
+}
+
+static int replay_ensure_parent_directory(int parent_fd, const char *name,
+                                           int *out_fd)
+{
+    if (parent_fd < 0 || name == NULL || !text_component_valid(
+            name, strlen(name)) || out_fd == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    struct stat st;
+    if (fstatat(parent_fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0)
+    {
+        if (!S_ISDIR(st.st_mode))
+        {
+            errno = ENOTDIR;
+            return -1;
+        }
+        *out_fd = openat(parent_fd, name,
+                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        return *out_fd < 0 ? -1 : 0;
+    }
+    if (errno != ENOENT)
+        return -1;
+    if (mkdirat(parent_fd, name, 0700) != 0 && errno != EEXIST)
+        return -1;
+    *out_fd = openat(parent_fd, name,
+                     O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    return *out_fd < 0 ? -1 : 0;
+}
+
+static int replay_open_destination_parent(int home_fd, const char *path,
+                                           int *parent_out, char *leaf,
+                                           size_t leaf_size)
+{
+    if (home_fd < 0 || path == NULL || parent_out == NULL || leaf == NULL ||
+        leaf_size == 0 || !relative_path_valid(path, 1))
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    int current = duplicate_noatime_directory(home_fd);
+    if (current < 0)
+        return -1;
+    if (path[0] == '\0')
+    {
+        leaf[0] = '\0';
+        *parent_out = current;
+        return 0;
+    }
+
+    char copy[PATH_MAX];
+    memcpy(copy, path, strlen(path) + 1U);
+    char *cursor = copy;
+    for (;;)
+    {
+        char *slash = strchr(cursor, '/');
+        if (slash != NULL)
+            *slash = '\0';
+        if (slash == NULL)
+        {
+            size_t length = strlen(cursor);
+            if (length == 0 || length >= leaf_size)
+            {
+                int saved = EINVAL;
+                close(current);
+                errno = saved;
+                return -1;
+            }
+            memcpy(leaf, cursor, length + 1U);
+            *parent_out = current;
+            return 0;
+        }
+
+        int next = -1;
+        if (replay_ensure_parent_directory(current, cursor, &next) != 0)
+        {
+            int saved = errno;
+            close(current);
+            errno = saved;
+            return -1;
+        }
+        if (close(current) != 0)
+        {
+            int saved = errno;
+            close(next);
+            errno = saved;
+            return -1;
+        }
+        current = next;
+        cursor = slash + 1U;
+    }
+}
+
+static int replay_open_destination_directory(int parent_fd, const char *leaf,
+                                              int *out_fd)
+{
+    if (parent_fd < 0 || leaf == NULL || out_fd == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    if (leaf[0] == '\0')
+    {
+        *out_fd = duplicate_noatime_directory(parent_fd);
+        return *out_fd < 0 ? -1 : 0;
+    }
+    struct stat st;
+    if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) == 0)
+    {
+        if (!S_ISDIR(st.st_mode))
+        {
+            errno = ENOTDIR;
+            return -1;
+        }
+    }
+    else if (errno == ENOENT)
+    {
+        if (mkdirat(parent_fd, leaf, 0700) != 0 && errno != EEXIST)
+            return -1;
+        if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) != 0 ||
+            !S_ISDIR(st.st_mode))
+        {
+            errno = ENOTDIR;
+            return -1;
+        }
+    }
+    else
+        return -1;
+    *out_fd = openat(parent_fd, leaf,
+                     O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    return *out_fd < 0 ? -1 : 0;
+}
+
+static int replay_open_destination_regular(int parent_fd, const char *leaf,
+                                            int *out_fd)
+{
+    if (parent_fd < 0 || leaf == NULL || leaf[0] == '\0' || out_fd == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    struct stat st;
+    if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) == 0)
+    {
+        if (!S_ISREG(st.st_mode))
+        {
+            errno = EEXIST;
+            return -1;
+        }
+        int fd = openat(parent_fd, leaf,
+                        O_WRONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+        if (fd < 0)
+            return -1;
+        if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode))
+        {
+            int saved = errno == 0 ? EIO : errno;
+            close(fd);
+            errno = saved;
+            return -1;
+        }
+        *out_fd = fd;
+        return 0;
+    }
+    if (errno != ENOENT)
+        return -1;
+    int fd = openat(parent_fd, leaf,
+                    O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW |
+                        O_NONBLOCK | O_CLOEXEC,
+                    0600);
+    if (fd < 0)
+        return -1;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode))
+    {
+        int saved = errno == 0 ? EIO : errno;
+        close(fd);
+        unlinkat(parent_fd, leaf, 0);
+        errno = saved;
+        return -1;
+    }
+    *out_fd = fd;
+    return 0;
+}
+
+static int replay_copy_regular(int source_fd, int destination_fd,
+                               uint64_t expected_size)
+{
+    if (source_fd < 0 || destination_fd < 0)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    if (ftruncate(destination_fd, 0) != 0)
+        return -1;
+    unsigned char buffer[65536];
+    uint64_t copied = 0;
+    for (;;)
+    {
+        ssize_t received = read(source_fd, buffer, sizeof(buffer));
+        if (received < 0 && errno == EINTR)
+            continue;
+        if (received < 0)
+            return -1;
+        if (received == 0)
+            break;
+        if ((uint64_t)received > UINT64_MAX - copied)
+        {
+            errno = EOVERFLOW;
+            return -1;
+        }
+        copied += (uint64_t)received;
+        size_t offset = 0;
+        while (offset < (size_t)received)
+        {
+            ssize_t written = write(destination_fd, buffer + offset,
+                                     (size_t)received - offset);
+            if (written < 0 && errno == EINTR)
+                continue;
+            if (written <= 0)
+                return -1;
+            offset += (size_t)written;
+        }
+    }
+    if (copied != expected_size)
+    {
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
+static int replay_destination_parent(const ReplayCollection *collection,
+                                     const ReplayEntry *replay,
+                                     int *parent_out, char *leaf,
+                                     size_t leaf_size)
+{
+    if (collection == NULL || replay == NULL || parent_out == NULL ||
+        leaf == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    return replay_open_destination_parent(collection->destination_home_fd,
+                                          replay->destination, parent_out,
+                                          leaf, leaf_size);
+}
+
+static int replay_apply_regular(ReplayCollection *collection,
+                                ReplayEntry *replay)
+{
+    const ManifestRoot *root = &collection->manifest->roots[
+        replay->root_index];
+    const SidecarEntry *entry = replay->entry;
+    struct stat desired;
+    if (replay_stat_from_entry(entry, &desired) != 0)
+        return -1;
+
+    int source_fd = -1;
+    struct stat source_before;
+    if (replay_open_payload(collection->data_fd, root, entry, &source_fd,
+                            &source_before) != 0)
+        return -1;
+    int parent_fd = -1;
+    char leaf[NAME_MAX + 1U];
+    int destination_fd = -1;
+    int result = replay_destination_parent(collection, replay, &parent_fd,
+                                           leaf, sizeof(leaf));
+    if (result == 0)
+        result = replay_open_destination_regular(parent_fd, leaf,
+                                                 &destination_fd);
+    if (result == 0)
+        result = replay_copy_regular(source_fd, destination_fd, entry->size);
+    if (result == 0)
+    {
+        struct stat source_after;
+        if (fstat(source_fd, &source_after) != 0 ||
+            !metadata_source_unchanged(&source_before, &source_after))
+        {
+            errno = EIO;
+            result = -1;
+        }
+    }
+    if (result == 0)
+    {
+        MetadataTimestampPolicy policy = {
+            .nsec_exact = 1,
+            .configured = 1
+        };
+        result = metadata_apply_fd(destination_fd, &desired, policy);
+    }
+
+    int saved = errno;
+    if (destination_fd >= 0 && close(destination_fd) != 0 && result == 0)
+    {
+        result = -1;
+        saved = EIO;
+    }
+    if (parent_fd >= 0 && close(parent_fd) != 0 && result == 0)
+    {
+        result = -1;
+        saved = EIO;
+    }
+    if (close(source_fd) != 0 && result == 0)
+    {
+        result = -1;
+        saved = EIO;
+    }
+    errno = saved;
+    return result;
+}
+
+static int replay_prepare_directory(ReplayCollection *collection,
+                                     ReplayEntry *replay)
+{
+    const ManifestRoot *root = &collection->manifest->roots[
+        replay->root_index];
+    const SidecarEntry *entry = replay->entry;
+    int source_fd = -1;
+    struct stat source_st;
+    if (replay_open_payload(collection->data_fd, root, entry, &source_fd,
+                            &source_st) != 0)
+        return -1;
+
+    int parent_fd = -1;
+    int destination_fd = -1;
+    char leaf[NAME_MAX + 1U];
+    int result = replay_destination_parent(collection, replay, &parent_fd,
+                                           leaf, sizeof(leaf));
+    if (result == 0)
+        result = replay_open_destination_directory(parent_fd, leaf,
+                                                   &destination_fd);
+
+    int saved = errno;
+    if (destination_fd >= 0 && close(destination_fd) != 0 && result == 0)
+    {
+        result = -1;
+        saved = EIO;
+    }
+    if (parent_fd >= 0 && close(parent_fd) != 0 && result == 0)
+    {
+        result = -1;
+        saved = EIO;
+    }
+    if (close(source_fd) != 0 && result == 0)
+    {
+        result = -1;
+        saved = EIO;
+    }
+    errno = saved;
+    return result;
+}
+
+static int replay_apply_directory_metadata(ReplayCollection *collection,
+                                            ReplayEntry *replay)
+{
+    const SidecarEntry *entry = replay->entry;
+    struct stat desired;
+    if (replay_stat_from_entry(entry, &desired) != 0)
+        return -1;
+    int parent_fd = -1;
+    int destination_fd = -1;
+    char leaf[NAME_MAX + 1U];
+    int result = replay_destination_parent(collection, replay, &parent_fd,
+                                           leaf, sizeof(leaf));
+    if (result == 0)
+    {
+        struct stat existing;
+        if (leaf[0] == '\0')
+            destination_fd = duplicate_noatime_directory(parent_fd);
+        else if (fstatat(parent_fd, leaf, &existing,
+                         AT_SYMLINK_NOFOLLOW) == 0 &&
+                 S_ISDIR(existing.st_mode))
+            destination_fd = openat(parent_fd, leaf,
+                                    O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                                        O_CLOEXEC);
+        else
+        {
+            errno = ENOTDIR;
+            result = -1;
+        }
+        if (destination_fd < 0 && result == 0)
+            result = -1;
+    }
+    if (result == 0)
+    {
+        MetadataTimestampPolicy policy = {
+            .nsec_exact = 1,
+            .configured = 1
+        };
+        result = metadata_apply_fd(destination_fd, &desired, policy);
+    }
+
+    int saved = errno;
+    if (destination_fd >= 0 && close(destination_fd) != 0 && result == 0)
+    {
+        result = -1;
+        saved = EIO;
+    }
+    if (parent_fd >= 0 && close(parent_fd) != 0 && result == 0)
+    {
+        result = -1;
+        saved = EIO;
+    }
+    errno = saved;
+    return result;
+}
+
+static int replay_run(ReplayCollection *collection)
+{
+    if (collection == NULL || collection->report == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    qsort(collection->items, collection->count, sizeof(*collection->items),
+          replay_entry_compare);
+
+    for (size_t index = 0; index < collection->count; index++)
+    {
+        ReplayEntry *replay = &collection->items[index];
+        int result = replay->entry->kind == SIDECAR_KIND_DIRECTORY
+            ? replay_prepare_directory(collection, replay)
+            : replay_apply_regular(collection, replay);
+        if (result != 0)
+        {
+            replay_report_failure(collection->report, collection->manifest,
+                                  replay->root_index,
+                                  replay->entry->logical_path);
+            return -1;
+        }
+        if (replay->entry->kind == SIDECAR_KIND_REGULAR)
+        {
+            if (collection->report->applied_count != SIZE_MAX)
+                collection->report->applied_count++;
+        }
+    }
+
+    for (size_t index = collection->count; index != 0; index--)
+    {
+        ReplayEntry *replay = &collection->items[index - 1U];
+        if (replay->entry->kind != SIDECAR_KIND_DIRECTORY)
+            continue;
+        if (replay_apply_directory_metadata(collection, replay) != 0)
+        {
+            replay_report_failure(collection->report, collection->manifest,
+                                  replay->root_index,
+                                  replay->entry->logical_path);
+            return -1;
+        }
+        if (collection->report->applied_count != SIZE_MAX)
+            collection->report->applied_count++;
+    }
+    return 0;
+}
+
+void portable_restore_replay_report_init(PortableRestoreReplayReport *report)
+{
+    if (report == NULL)
+        return;
+    memset(report, 0, sizeof(*report));
+}
+
+int portable_restore_replay_at(const PortableRestoreRequest *request,
+                               PortableRestoreReplayReport *report)
+{
+    if (request == NULL || report == NULL || request->source_container_fd < 0 ||
+        request->destination_home_fd < 0 || request->manifest == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    if (replay_manifest_valid(request->manifest) != 0)
+    {
+        replay_report_failure(report, request->manifest, SIZE_MAX,
+                              (SidecarBytes){0});
+        return -1;
+    }
+
+    ReplayCollection collection = {
+        .manifest = request->manifest,
+        .data_fd = -1,
+        .destination_home_fd = request->destination_home_fd,
+        .report = report
+    };
+    if (root_map_build(&collection.root_map, request->manifest) != 0)
+        goto fail;
+
+    struct stat home_st;
+    if (fstat(request->destination_home_fd, &home_st) != 0 ||
+        !S_ISDIR(home_st.st_mode))
+    {
+        errno = ENOTDIR;
+        goto fail;
+    }
+    if (sidecar_is_complete_readonly(request->source_container_fd) != 0)
+        goto fail;
+    collection.data_fd = openat(request->source_container_fd, "data",
+                                O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                                    O_NOATIME | O_CLOEXEC);
+    if (collection.data_fd < 0)
+        goto fail;
+
+    SidecarLog sidecar = {0};
+    if (sidecar_log_adopt_at(request->source_container_fd, &sidecar) !=
+        SIDECAR_OPEN_RESUMABLE)
+    {
+        close(collection.data_fd);
+        collection.data_fd = -1;
+        goto fail;
+    }
+    SidecarStatus status = sidecar_log_foreach(&sidecar,
+                                               replay_collect_entry,
+                                               &collection);
+    if (status == SIDECAR_STATUS_OK)
+        status = replay_run(&collection);
+    int result = status == SIDECAR_STATUS_OK ? 0 : -1;
+    if (sidecar_log_close(&sidecar) != SIDECAR_STATUS_OK)
+        result = -1;
+    if (close(collection.data_fd) != 0)
+        result = -1;
+    collection.data_fd = -1;
+    if (result == 0)
+    {
+        replay_collection_free(&collection);
+        return 0;
+    }
+    if (report->failed_count == 0)
+        replay_report_failure(report, request->manifest, SIZE_MAX,
+                              (SidecarBytes){0});
+    replay_collection_free(&collection);
+    return -1;
+
+fail:
+    if (collection.data_fd >= 0)
+        close(collection.data_fd);
+    if (report->failed_count == 0)
+        replay_report_failure(report, request->manifest, SIZE_MAX,
+                              (SidecarBytes){0});
+    replay_collection_free(&collection);
     return -1;
 }
