@@ -12,4 +12,5 @@ tests/test_backup_plan
 tests/test_metadata_contract
 tests/test_sidecar
 tests/test_sidecar_state
+tests/test_sidecar_scale
 docs/scratch/

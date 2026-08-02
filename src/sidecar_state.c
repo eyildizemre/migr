@@ -8,6 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/random.h>
+#include <time.h>
 #include <unistd.h>
 
 typedef struct {
@@ -20,11 +22,25 @@ typedef struct {
     uint64_t generation;
 } StateEntry;
 
+typedef enum {
+    MAP_SLOT_EMPTY = 0,
+    MAP_SLOT_LIVE,
+    MAP_SLOT_TOMBSTONE
+} MapSlotState;
+
 typedef struct {
-    StateEntry *items;
+    StateEntry entry;
+    uint64_t hash;
+    MapSlotState state;
+} MapSlot;
+
+typedef struct {
+    MapSlot *slots;
     size_t count;
+    size_t tombstones;
     size_t capacity;
     uint64_t generation;
+    uint64_t hash_salt;
 } StateMap;
 
 typedef struct {
@@ -333,83 +349,241 @@ static int key_matches(const SidecarEntry *entry, SidecarBytes root_id,
                    logical_path.length) == 0);
 }
 
-static int map_find(const StateMap *map, SidecarBytes root_id,
-                    SidecarBytes logical_path)
+#define MAP_INDEX_NONE SIZE_MAX
+#define MAP_INITIAL_CAPACITY 16U
+
+#ifdef SIDECAR_STATE_TEST_HOOKS
+static uint64_t state_test_probe_count;
+
+static void count_probe(void)
 {
-    for (size_t index = 0; index < map->count; index++)
-    {
-        if (key_matches(&map->items[index].entry, root_id, logical_path))
-            return (int)index;
-    }
-    return -1;
+    if (state_test_probe_count != UINT64_MAX)
+        state_test_probe_count++;
 }
 
-static SidecarStatus map_resize(StateMemory *memory, StateMap *map,
-                                size_t needed, StateEntry **out_items,
-                                size_t *out_capacity)
+uint64_t sidecar_state_test_probe_count(void)
 {
-    if (out_items == NULL || out_capacity == NULL)
+    return state_test_probe_count;
+}
+
+void sidecar_state_test_reset_probe_count(void)
+{
+    state_test_probe_count = 0;
+}
+#else
+static void count_probe(void)
+{
+}
+#endif
+
+static uint64_t mix_hash(uint64_t value)
+{
+    value ^= value >> 30;
+    value *= UINT64_C(0xbf58476d1ce4e5b9);
+    value ^= value >> 27;
+    value *= UINT64_C(0x94d049bb133111eb);
+    return value ^ (value >> 31);
+}
+
+static uint64_t process_hash_salt(void)
+{
+    static uint64_t salt;
+    static int initialized;
+    if (initialized)
+        return salt;
+
+    uint64_t random_value = 0;
+    ssize_t result = getrandom(&random_value, sizeof(random_value),
+                               GRND_NONBLOCK);
+    if (result == (ssize_t)sizeof(random_value))
+        salt = random_value;
+    else
     {
-        errno = EINVAL;
-        return SIDECAR_STATUS_INVALID_ARGUMENT;
+        struct timespec now;
+        memset(&now, 0, sizeof(now));
+        (void)clock_gettime(CLOCK_MONOTONIC, &now);
+        uint64_t fallback = (uint64_t)now.tv_sec;
+        fallback ^= (uint64_t)now.tv_nsec << 32;
+        fallback ^= (uint64_t)(unsigned long)getpid();
+        fallback ^= (uint64_t)(uintptr_t)&salt;
+        salt = mix_hash(fallback);
     }
-    if (needed <= map->capacity)
+    initialized = 1;
+    return salt;
+}
+
+static uint64_t fnv1a_bytes(uint64_t hash, const unsigned char *data,
+                            size_t length)
+{
+    for (size_t index = 0; index < length; index++)
     {
-        *out_items = map->items;
-        *out_capacity = map->capacity;
-        return SIDECAR_STATUS_OK;
+        hash ^= data[index];
+        hash *= UINT64_C(1099511628211);
     }
-    size_t capacity = map->capacity == 0 ? 16U : map->capacity;
-    while (capacity < needed)
+    return hash;
+}
+
+static uint64_t fnv1a_uint64(uint64_t hash, uint64_t value)
+{
+    for (size_t index = 0; index < sizeof(value); index++)
     {
-        if (capacity > SIDECAR_MAX_LIVE_ENTRIES / 2U)
-        {
-            capacity = SIDECAR_MAX_LIVE_ENTRIES;
-            break;
-        }
-        capacity *= 2U;
+        hash ^= (unsigned char)(value >> (index * 8U));
+        hash *= UINT64_C(1099511628211);
     }
-    if (capacity < needed || capacity > SIDECAR_MAX_LIVE_ENTRIES ||
-        capacity > SIZE_MAX / sizeof(*map->items))
+    return hash;
+}
+
+static uint64_t map_hash(const StateMap *map, SidecarBytes root_id,
+                         SidecarBytes logical_path)
+{
+    uint64_t hash = UINT64_C(1469598103934665603) ^ map->hash_salt;
+    hash = fnv1a_uint64(hash, (uint64_t)root_id.length);
+    hash = fnv1a_bytes(hash, root_id.data, root_id.length);
+    hash = fnv1a_uint64(hash, (uint64_t)logical_path.length);
+    return fnv1a_bytes(hash, logical_path.data, logical_path.length);
+}
+
+static size_t map_max_capacity(void)
+{
+    if (SIDECAR_MAX_LIVE_ENTRIES > SIZE_MAX / 2U)
+        return SIZE_MAX & ~(SIZE_MAX >> 1);
+    return (size_t)SIDECAR_MAX_LIVE_ENTRIES * 2U;
+}
+
+static int map_capacity_valid(size_t capacity)
+{
+    return capacity >= MAP_INITIAL_CAPACITY &&
+           (capacity & (capacity - 1U)) == 0;
+}
+
+static SidecarStatus map_rehash(StateMemory *memory, StateMap *map,
+                                size_t new_capacity)
+{
+    if (memory == NULL || map == NULL || !map_capacity_valid(new_capacity) ||
+        new_capacity > map_max_capacity() ||
+        new_capacity > SIZE_MAX / sizeof(MapSlot))
     {
         errno = E2BIG;
         return SIDECAR_STATUS_LIMIT;
     }
 
-    size_t size = capacity * sizeof(*map->items);
-    size_t old_size = map->capacity * sizeof(*map->items);
-    if (memory == NULL || memory->bytes < (uint64_t)old_size ||
-        (uint64_t)size > SIDECAR_MAX_ALLOC_BUDGET -
-            (memory->bytes - (uint64_t)old_size))
-    {
-        errno = E2BIG;
-        return SIDECAR_STATUS_LIMIT;
-    }
-    StateEntry *items = realloc(map->items, size);
-    if (items == NULL)
+    size_t new_size = new_capacity * sizeof(MapSlot);
+    MapSlot *new_slots = state_alloc(memory, new_size);
+    if (new_slots == NULL)
         return errno == ENOMEM ? SIDECAR_STATUS_ALLOCATION
                                : SIDECAR_STATUS_LIMIT;
-    memory->bytes = memory->bytes - (uint64_t)old_size + (uint64_t)size;
-    if (size > old_size)
-        memset((unsigned char *)items + old_size, 0, size - old_size);
-    *out_items = items;
-    *out_capacity = capacity;
+    memset(new_slots, 0, new_size);
+
+    for (size_t old_index = 0; old_index < map->capacity; old_index++)
+    {
+        MapSlot *old_slot = &map->slots[old_index];
+        if (old_slot->state != MAP_SLOT_LIVE)
+            continue;
+        size_t index = (size_t)old_slot->hash & (new_capacity - 1U);
+        while (new_slots[index].state == MAP_SLOT_LIVE)
+            index = (index + 1U) & (new_capacity - 1U);
+        new_slots[index] = *old_slot;
+    }
+
+    if (map->slots != NULL)
+        state_free(memory, map->slots,
+                   map->capacity * sizeof(*map->slots));
+    map->slots = new_slots;
+    map->capacity = new_capacity;
+    map->tombstones = 0;
     return SIDECAR_STATUS_OK;
+}
+
+/* Returns 1 for a matching live slot, 0 for an insertion slot, -1 if full. */
+static int map_locate(const StateMap *map, SidecarBytes root_id,
+                      SidecarBytes logical_path, uint64_t hash,
+                      size_t *out_index)
+{
+    if (out_index == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    if (map == NULL || map->capacity == 0)
+    {
+        *out_index = MAP_INDEX_NONE;
+        return 0;
+    }
+
+    size_t first_tombstone = MAP_INDEX_NONE;
+    size_t index = (size_t)hash & (map->capacity - 1U);
+    for (size_t probes = 0; probes < map->capacity; probes++)
+    {
+        count_probe();
+        const MapSlot *slot = &map->slots[index];
+        if (slot->state == MAP_SLOT_EMPTY)
+        {
+            *out_index = first_tombstone == MAP_INDEX_NONE
+                ? index : first_tombstone;
+            return 0;
+        }
+        if (slot->state == MAP_SLOT_TOMBSTONE)
+        {
+            if (first_tombstone == MAP_INDEX_NONE)
+                first_tombstone = index;
+        }
+        else if (slot->hash == hash &&
+                 key_matches(&slot->entry.entry, root_id, logical_path))
+        {
+            *out_index = index;
+            return 1;
+        }
+        index = (index + 1U) & (map->capacity - 1U);
+    }
+
+    *out_index = first_tombstone;
+    return first_tombstone == MAP_INDEX_NONE ? -1 : 0;
+}
+
+static size_t map_find(const StateMap *map, SidecarBytes root_id,
+                       SidecarBytes logical_path)
+{
+    size_t index = MAP_INDEX_NONE;
+    if (map_locate(map, root_id, logical_path,
+                   map_hash(map, root_id, logical_path), &index) == 1)
+        return index;
+    return MAP_INDEX_NONE;
+}
+
+static SidecarStatus map_prepare_insert(StateMemory *memory, StateMap *map)
+{
+    if (map->capacity == 0)
+        return map_rehash(memory, map, MAP_INITIAL_CAPACITY);
+
+    size_t used = map->count + map->tombstones;
+    if (used == SIZE_MAX || used + 1U <= map->capacity / 2U)
+        return SIDECAR_STATUS_OK;
+
+    size_t new_capacity = map->capacity;
+    if (map->count + 1U > map->capacity / 2U)
+    {
+        if (new_capacity > map_max_capacity() / 2U)
+        {
+            errno = E2BIG;
+            return SIDECAR_STATUS_LIMIT;
+        }
+        new_capacity *= 2U;
+    }
+    return map_rehash(memory, map, new_capacity);
 }
 
 static void map_free(StateMemory *memory, StateMap *map)
 {
     if (map == NULL)
         return;
-    for (size_t index = 0; index < map->count; index++)
-        clear_entry(memory, &map->items[index]);
-    if (map->items != NULL)
+    for (size_t index = 0; index < map->capacity; index++)
     {
-        size_t size = map->capacity * sizeof(*map->items);
-        if (memory != NULL && (uint64_t)size <= memory->bytes)
-            memory->bytes -= (uint64_t)size;
-        free(map->items);
+        if (map->slots[index].state == MAP_SLOT_LIVE)
+            clear_entry(memory, &map->slots[index].entry);
     }
+    if (map->slots != NULL)
+        state_free(memory, map->slots,
+                   map->capacity * sizeof(*map->slots));
     memset(map, 0, sizeof(*map));
 }
 
@@ -426,27 +600,35 @@ static SidecarStatus map_prepare_commit(StateMemory *memory, StateMap *map,
         errno = E2BIG;
         return SIDECAR_STATUS_LIMIT;
     }
-    int index = map_find(map, pending->entry.root_id,
-                         pending->entry.logical_path);
-    if (existing_index != NULL)
-        *existing_index = index < 0 ? map->count : (size_t)index;
-    if (index >= 0)
+    uint64_t hash = map_hash(map, pending->entry.root_id,
+                             pending->entry.logical_path);
+    size_t index = MAP_INDEX_NONE;
+    int location = map_locate(map, pending->entry.root_id,
+                              pending->entry.logical_path, hash, &index);
+    if (location == 1)
+    {
+        if (existing_index != NULL)
+            *existing_index = index;
         return SIDECAR_STATUS_OK;
+    }
     if (!sidecar_live_entry_count_allowed((uint64_t)map->count + 1U))
     {
         errno = E2BIG;
         return SIDECAR_STATUS_LIMIT;
     }
-    if (map->count + 1U <= map->capacity)
-        return SIDECAR_STATUS_OK;
-    StateEntry *items = NULL;
-    size_t capacity = 0;
-    SidecarStatus status = map_resize(memory, map, map->count + 1U,
-                                      &items, &capacity);
+    SidecarStatus status = map_prepare_insert(memory, map);
     if (status != SIDECAR_STATUS_OK)
         return status;
-    map->items = items;
-    map->capacity = capacity;
+
+    location = map_locate(map, pending->entry.root_id,
+                          pending->entry.logical_path, hash, &index);
+    if (location != 0 || index == MAP_INDEX_NONE)
+    {
+        errno = E2BIG;
+        return SIDECAR_STATUS_LIMIT;
+    }
+    if (existing_index != NULL)
+        *existing_index = index;
     return SIDECAR_STATUS_OK;
 }
 #if defined(__GNUC__) && !defined(__clang__)
@@ -457,18 +639,20 @@ static void map_apply_commit(StateMemory *memory, StateMap *map,
                              PendingEntry *pending, size_t existing_index)
 {
     map->generation++;
-    size_t target_index = existing_index;
-    if (existing_index < map->count)
-    {
-        clear_entry(memory, &map->items[existing_index]);
-        map->items[existing_index] = pending->entry;
-    }
+    MapSlot *slot = &map->slots[existing_index];
+    if (slot->state == MAP_SLOT_LIVE)
+        clear_entry(memory, &slot->entry);
     else
     {
-        target_index = map->count;
-        map->items[map->count++] = pending->entry;
+        if (slot->state == MAP_SLOT_TOMBSTONE)
+            map->tombstones--;
+        map->count++;
     }
-    map->items[target_index].generation = map->generation;
+    slot->entry = pending->entry;
+    slot->hash = map_hash(map, slot->entry.entry.root_id,
+                          slot->entry.entry.logical_path);
+    slot->state = MAP_SLOT_LIVE;
+    slot->entry.generation = map->generation;
     pending->entry = (StateEntry){0};
     pending->xattrs_seen = 0;
 }
@@ -482,16 +666,16 @@ static SidecarStatus map_apply_delete(StateMemory *memory, StateMap *map,
         errno = E2BIG;
         return SIDECAR_STATUS_LIMIT;
     }
-    int index = map_find(map, root_id, logical_path);
+    size_t index = map_find(map, root_id, logical_path);
     map->generation++;
-    if (index < 0)
+    if (index == MAP_INDEX_NONE)
         return SIDECAR_STATUS_OK;
-    clear_entry(memory, &map->items[index]);
-    if ((size_t)index + 1U < map->count)
-        memmove(&map->items[index], &map->items[index + 1],
-                (map->count - (size_t)index - 1U) * sizeof(*map->items));
+    MapSlot *slot = &map->slots[index];
+    clear_entry(memory, &slot->entry);
+    slot->hash = 0;
+    slot->state = MAP_SLOT_TOMBSTONE;
     map->count--;
-    memset(&map->items[map->count], 0, sizeof(*map->items));
+    map->tombstones++;
     return SIDECAR_STATUS_OK;
 }
 
@@ -661,6 +845,7 @@ static SidecarLogImplementation *allocate_log(int fd)
     if (log == NULL)
         return NULL;
     log->fd = fd;
+    log->map.hash_salt = process_hash_salt();
     return log;
 }
 
@@ -990,10 +1175,10 @@ int sidecar_log_find(const SidecarLog *log, SidecarBytes root_id,
         return -1;
     }
     const SidecarLogImplementation *implementation = log->implementation;
-    int index = map_find(&implementation->map, root_id, logical_path);
-    if (index < 0)
+    size_t index = map_find(&implementation->map, root_id, logical_path);
+    if (index == MAP_INDEX_NONE)
         return 0;
-    const StateEntry *entry = &implementation->map.items[index];
+    const StateEntry *entry = &implementation->map.slots[index].entry;
     out->entry = &entry->entry;
     out->xattrs = entry->xattrs;
     out->xattr_count = entry->entry.xattr_count;
