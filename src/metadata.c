@@ -16,6 +16,8 @@
 
 #ifdef METADATA_TEST_HOOKS
 static uint64_t metadata_probe_calls;
+static MetadataTestProbeHook metadata_probe_hook;
+static void *metadata_probe_hook_context;
 
 uint64_t metadata_test_probe_count(void)
 {
@@ -25,6 +27,12 @@ uint64_t metadata_test_probe_count(void)
 void metadata_test_reset_probe_count(void)
 {
     metadata_probe_calls = 0;
+}
+
+void metadata_test_set_probe_hook(MetadataTestProbeHook hook, void *context)
+{
+    metadata_probe_hook = hook;
+    metadata_probe_hook_context = context;
 }
 #endif
 
@@ -271,6 +279,8 @@ int metadata_profiles_probe(const MetadataProfiles *profiles,
 {
 #ifdef METADATA_TEST_HOOKS
     metadata_probe_calls++;
+    if (metadata_probe_hook != NULL)
+        metadata_probe_hook(metadata_probe_hook_context);
 #endif
     if (profiles == NULL)
         return -1;

@@ -282,7 +282,11 @@ static int run_preflight(Fixture *fixture)
     PortableRestoreRequest request = {
         .source_container_fd = fixture->container_fd,
         .manifest = &manifest,
-        .destination_home_fd = fixture->home_fd
+        .destination_home_fd = fixture->home_fd,
+        .destination_timestamp_policy = {
+            .nsec_exact = 1,
+            .configured = 1
+        }
     };
     int result = portable_restore_preflight_at(&request, &report);
     portable_restore_preflight_report_free(&report);
@@ -299,7 +303,11 @@ static int run_replay(Fixture *fixture, PortableRestoreReplayReport *report)
     PortableRestoreRequest request = {
         .source_container_fd = fixture->container_fd,
         .manifest = &manifest,
-        .destination_home_fd = fixture->home_fd
+        .destination_home_fd = fixture->home_fd,
+        .destination_timestamp_policy = {
+            .nsec_exact = 1,
+            .configured = 1
+        }
     };
     portable_restore_replay_report_init(report);
     int result = portable_restore_replay_at(&request, report);

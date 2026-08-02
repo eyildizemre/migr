@@ -14,6 +14,7 @@
 #include <unistd.h>
 
 #include "sidecar.h"
+#include "utils.h"
 
 typedef struct {
     uint64_t bytes;
@@ -89,6 +90,7 @@ typedef struct {
     RootMap root_map;
     int data_fd;
     int destination_home_fd;
+    MetadataTimestampPolicy timestamp_policy;
     PortableRestoreReplayReport *report;
 } ReplayCollection;
 
@@ -2011,13 +2013,8 @@ static int replay_apply_regular(ReplayCollection *collection,
         }
     }
     if (result == 0)
-    {
-        MetadataTimestampPolicy policy = {
-            .nsec_exact = 1,
-            .configured = 1
-        };
-        result = metadata_apply_fd(destination_fd, &desired, policy);
-    }
+        result = metadata_apply_fd(destination_fd, &desired,
+                                   collection->timestamp_policy);
 
     int saved = errno;
     if (destination_fd >= 0 && close(destination_fd) != 0 && result == 0)
@@ -2112,13 +2109,8 @@ static int replay_apply_directory_metadata(ReplayCollection *collection,
             result = -1;
     }
     if (result == 0)
-    {
-        MetadataTimestampPolicy policy = {
-            .nsec_exact = 1,
-            .configured = 1
-        };
-        result = metadata_apply_fd(destination_fd, &desired, policy);
-    }
+        result = metadata_apply_fd(destination_fd, &desired,
+                                   collection->timestamp_policy);
 
     int saved = errno;
     if (destination_fd >= 0 && close(destination_fd) != 0 && result == 0)
@@ -2190,6 +2182,21 @@ void portable_restore_replay_report_init(PortableRestoreReplayReport *report)
     memset(report, 0, sizeof(*report));
 }
 
+static int replay_timestamp_policy(const PortableRestoreRequest *request,
+                                   MetadataTimestampPolicy *out)
+{
+    if (request == NULL || out == NULL ||
+        !request->destination_timestamp_policy.configured ||
+        (request->destination_timestamp_policy.nsec_exact != 0 &&
+         request->destination_timestamp_policy.nsec_exact != 1))
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    *out = request->destination_timestamp_policy;
+    return 0;
+}
+
 int portable_restore_replay_at(const PortableRestoreRequest *request,
                                PortableRestoreReplayReport *report)
 {
@@ -2199,7 +2206,9 @@ int portable_restore_replay_at(const PortableRestoreRequest *request,
         errno = EINVAL;
         return -1;
     }
-    if (replay_manifest_valid(request->manifest) != 0)
+    MetadataTimestampPolicy timestamp_policy;
+    if (replay_timestamp_policy(request, &timestamp_policy) != 0 ||
+        replay_manifest_valid(request->manifest) != 0)
     {
         replay_report_failure(report, request->manifest, SIZE_MAX,
                               (SidecarBytes){0});
@@ -2210,6 +2219,7 @@ int portable_restore_replay_at(const PortableRestoreRequest *request,
         .manifest = request->manifest,
         .data_fd = -1,
         .destination_home_fd = request->destination_home_fd,
+        .timestamp_policy = timestamp_policy,
         .report = report
     };
     if (root_map_build(&collection.root_map, request->manifest) != 0)
@@ -2268,4 +2278,77 @@ fail:
                               (SidecarBytes){0});
     replay_collection_free(&collection);
     return -1;
+}
+
+static void portable_restore_preview(
+    const PortableRestorePreflightReport *report)
+{
+    if (report == NULL)
+        return;
+    printf("Portable restore dry run: %zu live entr%s would be applied\n",
+           report->live_count, report->live_count == 1 ? "y" : "ies");
+    for (size_t index = 0; index < report->root_count; index++)
+        if (report->roots[index].live_count != 0)
+            printf("  root %s: %zu live entr%s\n",
+                   report->roots[index].id,
+                   report->roots[index].live_count,
+                   report->roots[index].live_count == 1 ? "y" : "ies");
+}
+
+int portable_restore_at(const PortableRestoreRequest *request,
+                        PortableRestoreReplayReport *report)
+{
+    if (request == NULL || report == NULL || request->source_container_fd < 0 ||
+        request->destination_home_fd < 0 || request->manifest == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    portable_restore_replay_report_init(report);
+    MetadataTimestampPolicy policy;
+    if (replay_timestamp_policy(request, &policy) != 0)
+        return -1;
+    PortableRestorePreflightReport preflight;
+    portable_restore_preflight_report_init(&preflight);
+    int result = portable_restore_preflight_at(request, &preflight);
+    if (result != 0)
+    {
+        portable_restore_preflight_report_free(&preflight);
+        return -1;
+    }
+
+    if (dry_run)
+    {
+        report->live_count = preflight.live_count;
+        portable_restore_preview(&preflight);
+        portable_restore_preflight_report_free(&preflight);
+        return 0;
+    }
+
+    metadata_profiles_report(&preflight.profiles);
+    if (!confirm_action("This will restore portable files to the destination. Continue?"))
+    {
+        printf("Cancelled.\n");
+        portable_restore_preflight_report_free(&preflight);
+        return 0;
+    }
+
+    if (metadata_profiles_probe(&preflight.profiles, policy) != 0)
+    {
+        report->live_count = preflight.live_count;
+        printf("Error: portable metadata probe failed; no destination was changed\n");
+        portable_restore_preflight_report_free(&preflight);
+        return -1;
+    }
+
+    result = portable_restore_replay_at(request, report);
+    if (result != 0)
+        printf("Portable restore stopped: %zu applied, %zu failed\n",
+               report->applied_count, report->failed_count);
+    else
+        printf("Portable restore complete: %zu applied\n",
+               report->applied_count);
+    portable_restore_preflight_report_free(&preflight);
+    return result;
 }

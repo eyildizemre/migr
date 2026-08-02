@@ -68,8 +68,11 @@ int metadata_profiles_probe(const MetadataProfiles *profiles,
 void metadata_profiles_report(const MetadataProfiles *profiles);
 
 #ifdef METADATA_TEST_HOOKS
+typedef void (*MetadataTestProbeHook)(void *context);
+
 uint64_t metadata_test_probe_count(void);
 void metadata_test_reset_probe_count(void);
+void metadata_test_set_probe_hook(MetadataTestProbeHook hook, void *context);
 #endif
 
 void metadata_snapshots_init(MetadataSnapshots *snapshots);

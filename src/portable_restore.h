@@ -12,6 +12,8 @@ typedef struct {
     int source_container_fd;
     const Manifest *manifest;
     int destination_home_fd;
+    /* Measured policy for the destination filesystem. */
+    MetadataTimestampPolicy destination_timestamp_policy;
 } PortableRestoreRequest;
 
 typedef struct {
@@ -54,5 +56,9 @@ void portable_restore_replay_report_init(PortableRestoreReplayReport *report);
 int portable_restore_replay_at(
     const PortableRestoreRequest *request,
     PortableRestoreReplayReport *report);
+
+/* Confirmation-gated composition of preflight, probe, and replay. */
+int portable_restore_at(const PortableRestoreRequest *request,
+                       PortableRestoreReplayReport *report);
 
 #endif

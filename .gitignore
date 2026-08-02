@@ -20,4 +20,5 @@ tests/test_portable_reconcile
 tests/test_portable_reconcile_scale
 tests/test_portable_restore_preflight
 tests/test_portable_restore_replay
+tests/test_portable_restore_orchestrate
 docs/scratch/
