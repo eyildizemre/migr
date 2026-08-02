@@ -1,10 +1,33 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -g -I src
 
+CHECK_STRICT_FLAGS = $(CFLAGS) -Wpedantic -Werror
+CHECK_SANITIZE_FLAGS = $(CHECK_STRICT_FLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer
+ANALYZER_CC = gcc
+ANALYZER_FLAGS = $(CFLAGS) -Wpedantic -Werror -fanalyzer
+
+# Valgrind covers the stateful sidecar/portable/restore paths and file-operation
+# walkers. Scale tests, simple parsers, and the package-manager integration are
+# excluded because they add little memory coverage at disproportionate cost.
+VALGRIND_TESTS = \
+	tests/test_sidecar \
+	tests/test_sidecar_state \
+	tests/test_portable_capture \
+	tests/test_portable_resume \
+	tests/test_portable_reconcile \
+	tests/test_portable_restore_preflight \
+	tests/test_portable_restore_replay \
+	tests/test_portable_restore_orchestrate \
+	tests/test_special_files \
+	tests/test_restore_native \
+	tests/test_restore_dispatch \
+	tests/test_metadata_contract
+
 TARGET = migr
 VPATH = src
 SRCS = main.c detect.c report.c backup.c backup_plan.c packages.c restore.c utils.c fileops.c fsprobe.c xdg.c manifest.c container.c metadata.c
 OBJS = $(SRCS:.c=.o)
+ANALYZER_SRCS = $(wildcard src/*.c)
 
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS)
@@ -140,7 +163,64 @@ test: $(TARGET) $(TEST_DETECT) $(TEST_PATHJOIN) $(TEST_SPECIAL_FILES) $(TEST_FSP
 	PATH="$(CURDIR)/tests/stubs:$$PATH" ./$(TEST_BACKUP_PLAN)
 	cd tests && bash test.sh
 
+# The host Phase B gate: rebuild and run the complete functional suite with
+# warnings treated as errors under GCC and, when installed, Clang. The default
+# CFLAGS remain unchanged; this target cleans its temporary flag-specific build.
+check-strict:
+	@set -e; \
+	trap '$(MAKE) clean >/dev/null' EXIT; \
+	$(MAKE) clean; \
+	$(MAKE) CC=gcc CFLAGS="$(CHECK_STRICT_FLAGS)" test; \
+	if command -v clang >/dev/null 2>&1; then \
+		$(MAKE) clean; \
+		$(MAKE) CC=clang CFLAGS="$(CHECK_STRICT_FLAGS)" test; \
+	else \
+		echo "check-strict: clang not found; GCC-only strict check."; \
+	fi
+
+# The host Phase B sanitizer gate: rebuild every object, including test-hook
+# variants, and run the full suite with AddressSanitizer and UBSan. Leak
+# detection and halt-on-error are inherited by the integration test as well.
+check-sanitize:
+	@set -e; \
+	trap '$(MAKE) clean >/dev/null' EXIT; \
+	$(MAKE) clean; \
+	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
+	UBSAN_OPTIONS=halt_on_error=1 \
+	$(MAKE) CFLAGS="$(CHECK_SANITIZE_FLAGS)" test
+
+# The host Phase B Valgrind gate runs the memory-sensitive core only. The scale
+# binaries, simple parsers, and package-manager integration are excluded: they
+# are covered by make test and make the leak gate disproportionately slow.
+check-valgrind:
+	@set -e; \
+	trap '$(MAKE) clean >/dev/null' EXIT; \
+	$(MAKE) clean; \
+	$(MAKE) CFLAGS="$(CHECK_STRICT_FLAGS)" $(VALGRIND_TESTS); \
+	for binary in $(VALGRIND_TESTS); do \
+		echo "==> valgrind ./$$binary"; \
+		valgrind --error-exitcode=1 --trace-children=yes --leak-check=full --track-origins=yes ./$$binary; \
+	done
+
+# The host Phase B static-analysis gate: GCC analyzes every source file
+# compile-only. Tests are intentionally outside this target's scope.
+check-analyze:
+	@set -e; \
+	for source in $(ANALYZER_SRCS); do \
+		echo "==> gcc -fanalyzer $$source"; \
+		$(ANALYZER_CC) $(ANALYZER_FLAGS) -fsyntax-only "$$source"; \
+	done
+
+# Run the complete host gate in the roadmap order. Each prerequisite target
+# fails immediately, so a green result means every individual gate was run.
+check:
+	$(MAKE) test
+	$(MAKE) check-strict
+	$(MAKE) check-sanitize
+	$(MAKE) check-valgrind
+	$(MAKE) check-analyze
+
 clean:
 	rm -f $(OBJS) sidecar.o sidecar_test.o sidecar_state.o sidecar_state_test.o portable.o portable_test.o portable_restore_test.o metadata_test.o $(TARGET) $(TEST_DETECT) $(TEST_PATHJOIN) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE) $(TEST_MANIFEST) $(TEST_CONTAINER) $(TEST_RESTORE_NATIVE) $(TEST_RESTORE_DISPATCH) $(TEST_BACKUP_PLAN) $(TEST_METADATA_CONTRACT) $(TEST_SIDECAR) $(TEST_SIDECAR_STATE) $(TEST_SIDECAR_SCALE) $(TEST_PORTABLE_CAPTURE) $(TEST_PORTABLE_CAPTURE_SCALE) $(TEST_PORTABLE_RESUME) $(TEST_PORTABLE_RECONCILE) $(TEST_PORTABLE_RECONCILE_SCALE) $(TEST_PORTABLE_RESTORE_PREFLIGHT) $(TEST_PORTABLE_RESTORE_REPLAY) $(TEST_PORTABLE_RESTORE_ORCHESTRATE)
 
-.PHONY: clean test
+.PHONY: clean test check-strict check-sanitize check-valgrind check-analyze check
