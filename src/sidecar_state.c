@@ -385,7 +385,7 @@ static uint64_t mix_hash(uint64_t value)
     return value ^ (value >> 31);
 }
 
-static uint64_t process_hash_salt(void)
+uint64_t sidecar_process_salt(void)
 {
     static uint64_t salt;
     static int initialized;
@@ -845,7 +845,7 @@ static SidecarLogImplementation *allocate_log(int fd)
     if (log == NULL)
         return NULL;
     log->fd = fd;
-    log->map.hash_salt = process_hash_salt();
+    log->map.hash_salt = sidecar_process_salt();
     return log;
 }
 

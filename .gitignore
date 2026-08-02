@@ -13,4 +13,6 @@ tests/test_metadata_contract
 tests/test_sidecar
 tests/test_sidecar_state
 tests/test_sidecar_scale
+tests/test_portable_capture
+tests/test_portable_capture_scale
 docs/scratch/

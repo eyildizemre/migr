@@ -1,0 +1,1355 @@
+#define _GNU_SOURCE
+
+#include "portable.h"
+
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <inttypes.h>
+#include <limits.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/xattr.h>
+#include <unistd.h>
+
+#include "metadata.h"
+
+typedef struct {
+    SidecarXattr *items;
+    size_t count;
+    size_t capacity;
+} PortableXattrs;
+
+typedef struct {
+    char *root_id;
+    char *logical_path;
+    size_t root_length;
+    size_t logical_length;
+    uint64_t hash;
+} PortableVisitedSlot;
+
+typedef struct {
+    PortableVisitedSlot *slots;
+    size_t count;
+    size_t capacity;
+    uint64_t hash_salt;
+} PortableVisited;
+
+#define VISITED_INITIAL_CAPACITY 16U
+
+#ifdef PORTABLE_CAPTURE_TEST_HOOKS
+static uint64_t portable_test_probe_count;
+
+static void visited_count_probe(void)
+{
+    if (portable_test_probe_count != UINT64_MAX)
+        portable_test_probe_count++;
+}
+
+uint64_t portable_capture_test_probe_count(void)
+{
+    return portable_test_probe_count;
+}
+
+void portable_capture_test_reset_probe_count(void)
+{
+    portable_test_probe_count = 0;
+}
+#else
+static void visited_count_probe(void)
+{
+}
+#endif
+
+static size_t bounded_strlen(const char *value, size_t maximum)
+{
+    if (value == NULL)
+        return 0;
+    return strnlen(value, maximum + 1U);
+}
+
+static int copy_text(char *destination, size_t destination_size,
+                     const char *source)
+{
+    if (destination == NULL || destination_size == 0 || source == NULL)
+        return -1;
+    size_t length = bounded_strlen(source, destination_size - 1U);
+    if (length >= destination_size)
+        return -1;
+    memcpy(destination, source, length + 1U);
+    return 0;
+}
+
+static int safe_id(const char *id)
+{
+    if (id == NULL || id[0] == '\0' || strlen(id) >= MANIFEST_ID_MAX)
+        return 0;
+    for (size_t index = 0; id[index] != '\0'; index++)
+        if (!(id[index] >= 'a' && id[index] <= 'z') &&
+            !(id[index] >= 'A' && id[index] <= 'Z') &&
+            !(id[index] >= '0' && id[index] <= '9') &&
+            id[index] != '_' && id[index] != '-')
+            return 0;
+    return 1;
+}
+
+static int safe_component(const char *component)
+{
+    if (component == NULL || component[0] == '\0' ||
+        strcmp(component, ".") == 0 || strcmp(component, "..") == 0 ||
+        strchr(component, '/') != NULL || strlen(component) > NAME_MAX)
+        return 0;
+    return 1;
+}
+
+static int safe_relative_path(const char *path)
+{
+    if (path == NULL || path[0] == '\0' || path[0] == '/')
+        return 0;
+    size_t length = bounded_strlen(path, PATH_MAX);
+    if (length == 0 || length >= PATH_MAX || path[length - 1U] == '/')
+        return 0;
+
+    char copy[PATH_MAX];
+    memcpy(copy, path, length + 1U);
+    char *cursor = copy;
+    for (;;) {
+        char *slash = strchr(cursor, '/');
+        if (slash != NULL)
+            *slash = '\0';
+        if (!safe_component(cursor))
+            return 0;
+        if (slash == NULL)
+            return 1;
+        cursor = slash + 1;
+    }
+}
+
+static int append_logical(char *destination, size_t destination_size,
+                          const char *parent, const char *name)
+{
+    if (destination == NULL || parent == NULL || !safe_component(name))
+        return -1;
+    size_t parent_length = bounded_strlen(parent, destination_size);
+    size_t name_length = strlen(name);
+    if (parent_length >= destination_size ||
+        name_length > destination_size - parent_length - 1U)
+        return -1;
+
+    size_t offset = 0;
+    if (parent_length != 0) {
+        memcpy(destination, parent, parent_length);
+        offset = parent_length;
+        destination[offset++] = '/';
+    }
+    memcpy(destination + offset, name, name_length + 1U);
+    return 0;
+}
+
+static int duplicate_fd(int fd)
+{
+    return fcntl(fd, F_DUPFD_CLOEXEC, 0);
+}
+
+static int open_child_directory(int parent_fd, const char *name)
+{
+    return openat(parent_fd, name,
+                  O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+}
+
+static int remove_leaf(int parent_fd, const char *name);
+
+static int remove_directory_tree(int parent_fd, const char *name)
+{
+    int directory_fd = openat(parent_fd, name,
+                              O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (directory_fd < 0)
+        return -1;
+
+    int scan_fd = duplicate_fd(directory_fd);
+    DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
+    if (directory == NULL) {
+        if (scan_fd >= 0)
+            close(scan_fd);
+        close(directory_fd);
+        return -1;
+    }
+
+    int failed = 0;
+    for (;;) {
+        errno = 0;
+        struct dirent *entry = readdir(directory);
+        if (entry == NULL) {
+            if (errno != 0)
+                failed = 1;
+            break;
+        }
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0)
+            continue;
+        if (remove_leaf(directory_fd, entry->d_name) != 0) {
+            failed = 1;
+            break;
+        }
+    }
+    if (closedir(directory) != 0)
+        failed = 1;
+    if (close(directory_fd) != 0)
+        failed = 1;
+    if (failed)
+        return -1;
+    return unlinkat(parent_fd, name, AT_REMOVEDIR) == 0 ? 0 : -1;
+}
+
+static int remove_leaf(int parent_fd, const char *name)
+{
+    struct stat st;
+    if (fstatat(parent_fd, name, &st, AT_SYMLINK_NOFOLLOW) != 0)
+        return errno == ENOENT ? 0 : -1;
+    if (S_ISDIR(st.st_mode))
+        return remove_directory_tree(parent_fd, name);
+    return unlinkat(parent_fd, name, 0) == 0 ? 0 : -1;
+}
+
+static int open_payload_parent(int data_fd, const char *relative,
+                               int *parent_out, char *leaf, size_t leaf_size)
+{
+    if (data_fd < 0 || parent_out == NULL || leaf == NULL ||
+        !safe_relative_path(relative) || leaf_size == 0)
+        return -1;
+
+    size_t length = strlen(relative);
+    char copy[PATH_MAX];
+    memcpy(copy, relative, length + 1U);
+    int current = duplicate_fd(data_fd);
+    if (current < 0)
+        return -1;
+
+    char *cursor = copy;
+    for (;;) {
+        char *slash = strchr(cursor, '/');
+        if (slash != NULL)
+            *slash = '\0';
+        if (slash == NULL) {
+            int result = copy_text(leaf, leaf_size, cursor);
+            if (result == 0) {
+                *parent_out = current;
+                return 0;
+            }
+            close(current);
+            return -1;
+        }
+
+        int next = open_child_directory(current, cursor);
+        if (next < 0 && errno == ENOENT) {
+            if (mkdirat(current, cursor, 0700) != 0 && errno != EEXIST) {
+                close(current);
+                return -1;
+            }
+            next = open_child_directory(current, cursor);
+        }
+        if (next < 0) {
+            close(current);
+            return -1;
+        }
+        close(current);
+        current = next;
+        cursor = slash + 1;
+    }
+}
+
+static int ensure_directory_leaf(int parent_fd, const char *leaf, int *out_fd)
+{
+    if (parent_fd < 0 || !safe_component(leaf) || out_fd == NULL)
+        return -1;
+
+    struct stat st;
+    if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) == 0) {
+        if (S_ISDIR(st.st_mode)) {
+            *out_fd = open_child_directory(parent_fd, leaf);
+            return *out_fd < 0 ? -1 : 0;
+        }
+        if (remove_leaf(parent_fd, leaf) != 0)
+            return -1;
+    } else if (errno != ENOENT) {
+        return -1;
+    }
+
+    if (mkdirat(parent_fd, leaf, 0700) != 0 && errno != EEXIST)
+        return -1;
+    *out_fd = open_child_directory(parent_fd, leaf);
+    return *out_fd < 0 ? -1 : 0;
+}
+
+static int ensure_regular_leaf(int parent_fd, const char *leaf, int *out_fd)
+{
+    if (parent_fd < 0 || !safe_component(leaf) || out_fd == NULL)
+        return -1;
+
+    struct stat st;
+    if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) == 0) {
+        if (remove_leaf(parent_fd, leaf) != 0)
+            return -1;
+    } else if (errno != ENOENT) {
+        return -1;
+    }
+
+    int fd = openat(parent_fd, leaf,
+                    O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_NONBLOCK |
+                        O_CLOEXEC,
+                    0600);
+    if (fd < 0)
+        return -1;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        int saved = errno == 0 ? EIO : errno;
+        close(fd);
+        unlinkat(parent_fd, leaf, 0);
+        errno = saved;
+        return -1;
+    }
+    *out_fd = fd;
+    return 0;
+}
+
+static void xattrs_free(PortableXattrs *xattrs)
+{
+    if (xattrs == NULL)
+        return;
+    for (size_t index = 0; index < xattrs->count; index++) {
+        free((void *)xattrs->items[index].name.data);
+        free((void *)xattrs->items[index].value.data);
+    }
+    free(xattrs->items);
+    memset(xattrs, 0, sizeof(*xattrs));
+}
+
+static int xattrs_reserve(PortableXattrs *xattrs, size_t extra)
+{
+    if (extra > SIDECAR_MAX_XATTRS_PER_ENTRY - xattrs->count)
+        return -1;
+    size_t needed = xattrs->count + extra;
+    if (needed <= xattrs->capacity)
+        return 0;
+    size_t capacity = xattrs->capacity == 0 ? 4U : xattrs->capacity * 2U;
+    if (capacity < needed)
+        capacity = needed;
+    if (capacity > SIDECAR_MAX_XATTRS_PER_ENTRY)
+        capacity = SIDECAR_MAX_XATTRS_PER_ENTRY;
+    SidecarXattr *items = realloc(xattrs->items, capacity * sizeof(*items));
+    if (items == NULL)
+        return -1;
+    memset(items + xattrs->capacity, 0,
+           (capacity - xattrs->capacity) * sizeof(*items));
+    xattrs->items = items;
+    xattrs->capacity = capacity;
+    return 0;
+}
+
+static int collect_xattrs(int fd, PortableXattrs *out)
+{
+    if (fd < 0 || out == NULL)
+        return -1;
+    memset(out, 0, sizeof(*out));
+
+    errno = 0;
+    ssize_t length = flistxattr(fd, NULL, 0);
+    if (length < 0) {
+        if (errno == ENOTSUP || errno == EOPNOTSUPP || errno == ENODATA)
+            return 0;
+        return -1;
+    }
+    if ((uint64_t)length > SIDECAR_MAX_XATTRS_PER_ENTRY *
+                           (uint64_t)(SIDECAR_MAX_XATTR_NAME + 1U))
+        return -1;
+    if (length == 0)
+        return 0;
+
+    char *names = malloc((size_t)length);
+    if (names == NULL)
+        return -1;
+    ssize_t received = flistxattr(fd, names, (size_t)length);
+    if (received != length) {
+        free(names);
+        return -1;
+    }
+
+    size_t offset = 0;
+    while (offset < (size_t)received) {
+        size_t name_length = strnlen(names + offset,
+                                    (size_t)received - offset);
+        if (name_length == 0 || name_length > SIDECAR_MAX_XATTR_NAME ||
+            name_length == (size_t)received - offset) {
+            free(names);
+            xattrs_free(out);
+            return -1;
+        }
+        if (xattrs_reserve(out, 1) != 0) {
+            free(names);
+            xattrs_free(out);
+            return -1;
+        }
+
+        unsigned char *name_copy = malloc(name_length);
+        if (name_copy == NULL) {
+            free(names);
+            xattrs_free(out);
+            return -1;
+        }
+        memcpy(name_copy, names + offset, name_length);
+
+        errno = 0;
+        ssize_t value_length = fgetxattr(fd, names + offset, NULL, 0);
+        if (value_length < 0 || (uint64_t)value_length > SIDECAR_MAX_XATTR_VALUE) {
+            free(name_copy);
+            free(names);
+            xattrs_free(out);
+            return -1;
+        }
+        unsigned char *value_copy = NULL;
+        if (value_length > 0) {
+            value_copy = malloc((size_t)value_length);
+            if (value_copy == NULL) {
+                free(name_copy);
+                free(names);
+                xattrs_free(out);
+                return -1;
+            }
+            ssize_t reread = fgetxattr(fd, names + offset, value_copy,
+                                       (size_t)value_length);
+            if (reread != value_length) {
+                free(name_copy);
+                free(value_copy);
+                free(names);
+                xattrs_free(out);
+                return -1;
+            }
+        }
+        out->items[out->count++] = (SidecarXattr){
+            .name = { name_copy, name_length },
+            .value = { value_copy, (size_t)value_length }
+        };
+        offset += name_length + 1U;
+    }
+    free(names);
+    return 0;
+}
+
+static int time_to_i64(time_t value, int64_t *out)
+{
+    if (out == NULL)
+        return -1;
+    intmax_t converted = (intmax_t)value;
+    if ((time_t)converted != value || converted < INT64_MIN ||
+        converted > INT64_MAX)
+        return -1;
+    *out = (int64_t)converted;
+    return 0;
+}
+
+static int entry_from_stat(const char *root_id, const char *logical,
+                           const struct stat *st, int nsec_exact,
+                           PortableXattrs *xattrs, SidecarEntry *out)
+{
+    int64_t atime_sec;
+    int64_t mtime_sec;
+    if (root_id == NULL || logical == NULL || st == NULL || out == NULL ||
+        (st->st_mode & 07777) > SIDECAR_MAX_MODE || st->st_uid > UINT32_MAX ||
+        st->st_gid > UINT32_MAX || st->st_size < 0 ||
+        (uintmax_t)st->st_size > UINT64_MAX ||
+        time_to_i64(st->st_atim.tv_sec, &atime_sec) != 0 ||
+        time_to_i64(st->st_mtim.tv_sec, &mtime_sec) != 0)
+        return -1;
+    if (st->st_atim.tv_nsec < 0 || st->st_atim.tv_nsec > SIDECAR_MAX_NSEC ||
+        st->st_mtim.tv_nsec < 0 || st->st_mtim.tv_nsec > SIDECAR_MAX_NSEC)
+        return -1;
+
+    memset(out, 0, sizeof(*out));
+    out->root_id = (SidecarBytes){ (const unsigned char *)root_id,
+                                   strlen(root_id) };
+    out->logical_path = (SidecarBytes){ (const unsigned char *)logical,
+                                        strlen(logical) };
+    out->physical_path = out->logical_path;
+    out->kind = S_ISREG(st->st_mode) ? SIDECAR_KIND_REGULAR
+                                     : SIDECAR_KIND_DIRECTORY;
+    out->mode = (uint32_t)(st->st_mode & 07777);
+    out->uid = (uint32_t)st->st_uid;
+    out->gid = (uint32_t)st->st_gid;
+    out->atime_sec = atime_sec;
+    out->mtime_sec = mtime_sec;
+    out->atime_nsec = nsec_exact ? (uint32_t)st->st_atim.tv_nsec : 0;
+    out->mtime_nsec = nsec_exact ? (uint32_t)st->st_mtim.tv_nsec : 0;
+    out->size = S_ISREG(st->st_mode) ? (uint64_t)st->st_size : 0;
+    out->xattr_count = xattrs == NULL ? 0U : (uint32_t)xattrs->count;
+    return 0;
+}
+
+static uint64_t visited_fnv1a_bytes(uint64_t hash,
+                                    const unsigned char *data,
+                                    size_t length)
+{
+    for (size_t index = 0; index < length; index++)
+    {
+        hash ^= data[index];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static uint64_t visited_fnv1a_uint64(uint64_t hash, uint64_t value)
+{
+    for (size_t index = 0; index < sizeof(value); index++)
+    {
+        hash ^= (unsigned char)(value >> (index * 8U));
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static uint64_t visited_hash(const PortableVisited *visited,
+                             const char *root_id, size_t root_length,
+                             const char *logical, size_t logical_length)
+{
+    uint64_t hash = UINT64_C(1469598103934665603) ^ visited->hash_salt;
+    hash = visited_fnv1a_uint64(hash, (uint64_t)root_length);
+    hash = visited_fnv1a_bytes(hash, (const unsigned char *)root_id,
+                               root_length);
+    hash = visited_fnv1a_uint64(hash, (uint64_t)logical_length);
+    return visited_fnv1a_bytes(hash, (const unsigned char *)logical,
+                               logical_length);
+}
+
+static size_t visited_max_capacity(void)
+{
+    if (SIDECAR_MAX_LIVE_ENTRIES > SIZE_MAX / 2U)
+        return SIZE_MAX & ~(SIZE_MAX >> 1);
+    return (size_t)SIDECAR_MAX_LIVE_ENTRIES * 2U;
+}
+
+static int visited_capacity_valid(size_t capacity)
+{
+    return capacity >= VISITED_INITIAL_CAPACITY &&
+           (capacity & (capacity - 1U)) == 0;
+}
+
+static int visited_rehash(PortableVisited *visited, size_t new_capacity)
+{
+    if (visited == NULL || !visited_capacity_valid(new_capacity) ||
+        new_capacity > visited_max_capacity() ||
+        new_capacity > SIZE_MAX / sizeof(*visited->slots))
+        return -1;
+
+    PortableVisitedSlot *new_slots = calloc(new_capacity,
+                                            sizeof(*new_slots));
+    if (new_slots == NULL)
+        return -1;
+
+    for (size_t old_index = 0; old_index < visited->capacity; old_index++)
+    {
+        PortableVisitedSlot *old_slot = &visited->slots[old_index];
+        if (old_slot->root_id == NULL)
+            continue;
+        size_t index = (size_t)old_slot->hash & (new_capacity - 1U);
+        while (new_slots[index].root_id != NULL)
+            index = (index + 1U) & (new_capacity - 1U);
+        new_slots[index] = *old_slot;
+    }
+
+    free(visited->slots);
+    visited->slots = new_slots;
+    visited->capacity = new_capacity;
+    return 0;
+}
+
+/* Returns 1 for a matching slot, 0 for an empty insertion slot, -1 if full. */
+static int visited_locate(const PortableVisited *visited,
+                          const char *root_id, size_t root_length,
+                          const char *logical, size_t logical_length,
+                          uint64_t hash, size_t *out_index)
+{
+    if (visited == NULL || out_index == NULL)
+        return -1;
+    if (visited->capacity == 0)
+    {
+        *out_index = SIZE_MAX;
+        return 0;
+    }
+
+    size_t index = (size_t)hash & (visited->capacity - 1U);
+    for (size_t probes = 0; probes < visited->capacity; probes++)
+    {
+        visited_count_probe();
+        const PortableVisitedSlot *slot = &visited->slots[index];
+        if (slot->root_id == NULL)
+        {
+            *out_index = index;
+            return 0;
+        }
+        if (slot->hash == hash && slot->root_length == root_length &&
+            slot->logical_length == logical_length &&
+            memcmp(slot->root_id, root_id, root_length) == 0 &&
+            memcmp(slot->logical_path, logical, logical_length) == 0)
+        {
+            *out_index = index;
+            return 1;
+        }
+        index = (index + 1U) & (visited->capacity - 1U);
+    }
+
+    *out_index = SIZE_MAX;
+    return -1;
+}
+
+static void visited_slot_free(PortableVisitedSlot *slot)
+{
+    if (slot == NULL)
+        return;
+    free(slot->root_id);
+    free(slot->logical_path);
+    memset(slot, 0, sizeof(*slot));
+}
+
+static int visited_reset(PortableVisited *visited)
+{
+    if (visited == NULL)
+        return -1;
+    for (size_t index = 0; index < visited->capacity; index++)
+        visited_slot_free(&visited->slots[index]);
+    visited->count = 0;
+    return 0;
+}
+
+static void visited_free(PortableVisited *visited)
+{
+    if (visited == NULL)
+        return;
+    visited_reset(visited);
+    free(visited->slots);
+    free(visited);
+}
+
+static int visited_add(PortableVisited *visited, const char *root_id,
+                       const char *logical)
+{
+    if (visited == NULL || root_id == NULL || logical == NULL)
+        return -1;
+    size_t root_length = strlen(root_id);
+    size_t logical_length = strlen(logical);
+    if (root_length == SIZE_MAX || logical_length == SIZE_MAX)
+        return -1;
+
+    uint64_t hash = visited_hash(visited, root_id, root_length, logical,
+                                 logical_length);
+    if (visited->capacity == 0 &&
+        visited_rehash(visited, VISITED_INITIAL_CAPACITY) != 0)
+        return -1;
+
+    size_t index = SIZE_MAX;
+    int location = visited_locate(visited, root_id, root_length, logical,
+                                  logical_length, hash, &index);
+    if (location == 1)
+        return 1;
+    if (location < 0)
+        return -1;
+    if (visited->count >= SIDECAR_MAX_LIVE_ENTRIES)
+        return -1;
+
+    if (visited->count + 1U > visited->capacity / 2U)
+    {
+        if (visited->capacity > visited_max_capacity() / 2U ||
+            visited_rehash(visited, visited->capacity * 2U) != 0)
+            return -1;
+        location = visited_locate(visited, root_id, root_length, logical,
+                                  logical_length, hash, &index);
+        if (location != 0)
+            return -1;
+    }
+
+    char *root_copy = malloc(root_length + 1U);
+    if (root_copy == NULL)
+        return -1;
+    char *logical_copy = malloc(logical_length + 1U);
+    if (logical_copy == NULL)
+    {
+        free(root_copy);
+        return -1;
+    }
+    memcpy(root_copy, root_id, root_length + 1U);
+    memcpy(logical_copy, logical, logical_length + 1U);
+
+    PortableVisitedSlot *slot = &visited->slots[index];
+    slot->root_id = root_copy;
+    slot->logical_path = logical_copy;
+    slot->root_length = root_length;
+    slot->logical_length = logical_length;
+    slot->hash = hash;
+    visited->count++;
+    return 0;
+}
+
+static int key_is_live(PortableCaptureContext *context,
+                       const char *root_id, const char *logical)
+{
+    SidecarLiveView view;
+    SidecarBytes root = { (const unsigned char *)root_id, strlen(root_id) };
+    SidecarBytes path = { (const unsigned char *)logical, strlen(logical) };
+    int found = sidecar_log_find(context->sidecar, root, path, &view);
+    return found < 0 ? -1 : found;
+}
+
+static int tombstone_if_live(PortableCaptureContext *context,
+                             const char *root_id, const char *logical)
+{
+    int live = key_is_live(context, root_id, logical);
+    if (live < 0)
+        return -1;
+    if (!live)
+        return 0;
+    SidecarDelete deletion = {
+        .root_id = { (const unsigned char *)root_id, strlen(root_id) },
+        .logical_path = { (const unsigned char *)logical, strlen(logical) }
+    };
+    return sidecar_log_append_delete(context->sidecar, &deletion) ==
+                   SIDECAR_STATUS_OK ? 0 : -1;
+}
+
+static int tombstone_destination_children(PortableCaptureContext *context,
+                                          const char *root_id,
+                                          const char *logical,
+                                          int parent_fd,
+                                          const char *leaf)
+{
+    struct stat st;
+    if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) != 0)
+        return errno == ENOENT ? 0 : -1;
+    if (!S_ISDIR(st.st_mode))
+        return 0;
+
+    int directory_fd = open_child_directory(parent_fd, leaf);
+    if (directory_fd < 0)
+        return -1;
+    int scan_fd = duplicate_fd(directory_fd);
+    DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
+    if (directory == NULL) {
+        if (scan_fd >= 0)
+            close(scan_fd);
+        close(directory_fd);
+        return -1;
+    }
+
+    int failed = 0;
+    for (;;) {
+        errno = 0;
+        struct dirent *entry = readdir(directory);
+        if (entry == NULL) {
+            if (errno != 0)
+                failed = 1;
+            break;
+        }
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0)
+            continue;
+
+        char child_logical[SIDECAR_MAX_PATH + 1U];
+        if (append_logical(child_logical, sizeof(child_logical), logical,
+                           entry->d_name) != 0 ||
+            tombstone_if_live(context, root_id, child_logical) != 0 ||
+            tombstone_destination_children(context, root_id, child_logical,
+                                           directory_fd, entry->d_name) != 0) {
+            failed = 1;
+            break;
+        }
+    }
+    if (closedir(directory) != 0)
+        failed = 1;
+    if (close(directory_fd) != 0)
+        failed = 1;
+    return failed ? -1 : 0;
+}
+
+static int append_group(PortableCaptureContext *context,
+                        const SidecarEntry *entry,
+                        const PortableXattrs *xattrs)
+{
+    SidecarStatus status = sidecar_log_append_entry(context->sidecar, entry);
+    if (status != SIDECAR_STATUS_OK)
+        return -1;
+    for (size_t index = 0; xattrs != NULL && index < xattrs->count; index++)
+        if (sidecar_log_append_xattr(context->sidecar, &xattrs->items[index]) !=
+            SIDECAR_STATUS_OK)
+            return -1;
+    status = sidecar_log_append_entry_commit(context->sidecar);
+    return status == SIDECAR_STATUS_OK ? 0 : -1;
+}
+
+static int read_source_stat(int source_parent, const char *source_name,
+                            const char *root_path, struct stat *out)
+{
+    if (out == NULL)
+        return -1;
+    if (source_parent >= 0)
+        return fstatat(source_parent, source_name, out, AT_SYMLINK_NOFOLLOW);
+    return lstat(root_path, out);
+}
+
+static int open_source_node(int source_parent, const char *source_name,
+                            const char *root_path, const struct stat *st)
+{
+    int flags = O_RDONLY | O_NOFOLLOW | O_NOATIME | O_CLOEXEC;
+    if (S_ISDIR(st->st_mode))
+        flags |= O_DIRECTORY;
+    if (source_parent >= 0)
+        return openat(source_parent, source_name, flags);
+    return open(root_path, flags);
+}
+
+static int copy_regular(int source_fd, int destination_fd, off_t expected_size)
+{
+    unsigned char buffer[65536];
+    uint64_t copied = 0;
+    for (;;) {
+        ssize_t received = read(source_fd, buffer, sizeof(buffer));
+        if (received < 0 && errno == EINTR)
+            continue;
+        if (received < 0)
+            return -1;
+        if (received == 0)
+            break;
+        if ((uint64_t)received > UINT64_MAX - copied)
+            return -1;
+        copied += (uint64_t)received;
+
+        size_t offset = 0;
+        while (offset < (size_t)received) {
+            ssize_t written = write(destination_fd, buffer + offset,
+                                     (size_t)received - offset);
+            if (written < 0 && errno == EINTR)
+                continue;
+            if (written <= 0)
+                return -1;
+            offset += (size_t)written;
+        }
+    }
+    return expected_size >= 0 && copied == (uint64_t)expected_size ? 0 : -1;
+}
+
+static int capture_node(PortableCaptureContext *context,
+                        const PortableRootSpec *root,
+                        const char *logical, int source_parent,
+                        const char *source_name, const char *root_path,
+                        int destination_parent, const char *destination_leaf);
+
+static int capture_directory(PortableCaptureContext *context,
+                             const PortableRootSpec *root,
+                             const char *logical, int source_fd,
+                             const struct stat *before, int destination_fd,
+                             PortableXattrs *xattrs)
+{
+    int scan_fd = duplicate_fd(source_fd);
+    DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
+    if (directory == NULL) {
+        if (scan_fd >= 0)
+            close(scan_fd);
+        return -1;
+    }
+
+    int failed = 0;
+    for (;;) {
+        errno = 0;
+        struct dirent *entry = readdir(directory);
+        if (entry == NULL) {
+            if (errno != 0)
+                failed = 1;
+            break;
+        }
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0)
+            continue;
+
+        char child_logical[SIDECAR_MAX_PATH + 1U];
+        if (append_logical(child_logical, sizeof(child_logical), logical,
+                           entry->d_name) != 0) {
+            failed = 1;
+            break;
+        }
+        if (capture_node(context, root, child_logical, source_fd,
+                         entry->d_name, NULL, destination_fd,
+                         entry->d_name) != 0) {
+            failed = 1;
+            break;
+        }
+    }
+    if (closedir(directory) != 0)
+        failed = 1;
+
+    struct stat after;
+    if (!failed && (fstat(source_fd, &after) != 0 ||
+                    !metadata_source_unchanged(before, &after)))
+        failed = 1;
+
+    if (close(source_fd) != 0)
+        failed = 1;
+    if (failed) {
+        xattrs_free(xattrs);
+        close(destination_fd);
+        return -1;
+    }
+
+    SidecarEntry sidecar_entry;
+    if (entry_from_stat(root->id, logical, before, context->nsec_exact,
+                        xattrs, &sidecar_entry) != 0 ||
+        append_group(context, &sidecar_entry, xattrs) != 0) {
+        xattrs_free(xattrs);
+        close(destination_fd);
+        return -1;
+    }
+    xattrs_free(xattrs);
+    return close(destination_fd) == 0 ? 0 : -1;
+}
+
+static int capture_regular(PortableCaptureContext *context,
+                           const PortableRootSpec *root,
+                           const char *logical, int source_fd,
+                           const struct stat *before,
+                           int destination_parent,
+                           const char *destination_leaf,
+                           int destination_is_root,
+                           PortableXattrs *xattrs)
+{
+    if (tombstone_if_live(context, root->id, logical) != 0) {
+        xattrs_free(xattrs);
+        close(source_fd);
+        return -1;
+    }
+
+    int parent_fd = destination_parent;
+    char root_leaf[NAME_MAX + 1U];
+    if (destination_is_root) {
+        if (open_payload_parent(context->data_fd, root->payload_path,
+                                &parent_fd, root_leaf, sizeof(root_leaf)) != 0) {
+            xattrs_free(xattrs);
+            close(source_fd);
+            return -1;
+        }
+        destination_leaf = root_leaf;
+    }
+    if (tombstone_destination_children(context, root->id, logical, parent_fd,
+                                       destination_leaf) != 0) {
+        if (destination_is_root)
+            close(parent_fd);
+        xattrs_free(xattrs);
+        close(source_fd);
+        return -1;
+    }
+
+    int destination_fd;
+    if (ensure_regular_leaf(parent_fd, destination_leaf, &destination_fd) != 0) {
+        if (destination_is_root)
+            close(parent_fd);
+        xattrs_free(xattrs);
+        close(source_fd);
+        return -1;
+    }
+    if (copy_regular(source_fd, destination_fd, before->st_size) != 0) {
+        close(destination_fd);
+        if (destination_is_root)
+            close(parent_fd);
+        xattrs_free(xattrs);
+        close(source_fd);
+        return -1;
+    }
+
+    struct stat after;
+    int failed = fstat(source_fd, &after) != 0 ||
+                 !metadata_source_unchanged(before, &after);
+    if (close(destination_fd) != 0)
+        failed = 1;
+    if (close(source_fd) != 0)
+        failed = 1;
+    if (destination_is_root)
+        close(parent_fd);
+    if (failed) {
+        xattrs_free(xattrs);
+        return -1;
+    }
+
+    SidecarEntry sidecar_entry;
+    failed = entry_from_stat(root->id, logical, before, context->nsec_exact,
+                             xattrs, &sidecar_entry) != 0 ||
+             append_group(context, &sidecar_entry, xattrs) != 0;
+    xattrs_free(xattrs);
+    return failed ? -1 : 0;
+}
+
+static int capture_special(PortableCaptureContext *context,
+                           const PortableRootSpec *root,
+                           const char *logical, int destination_parent,
+                           const char *destination_leaf,
+                           int destination_is_root, const struct stat *st)
+{
+    if (visited_add(context->visited, root->id, logical) != 0)
+        return -1;
+    if (tombstone_if_live(context, root->id, logical) != 0)
+        return -1;
+
+    int parent_fd = destination_parent;
+    char root_leaf[NAME_MAX + 1U];
+    if (destination_is_root) {
+        if (open_payload_parent(context->data_fd, root->payload_path,
+                                &parent_fd, root_leaf, sizeof(root_leaf)) != 0)
+            return -1;
+        destination_leaf = root_leaf;
+    }
+    if (tombstone_destination_children(context, root->id, logical, parent_fd,
+                                       destination_leaf) != 0) {
+        if (destination_is_root)
+            close(parent_fd);
+        return -1;
+    }
+    if (remove_leaf(parent_fd, destination_leaf) != 0) {
+        if (destination_is_root)
+            close(parent_fd);
+        return -1;
+    }
+    if (destination_is_root)
+        close(parent_fd);
+
+    const char *kind = S_ISSOCK(st->st_mode) ? "socket" : "device";
+    printf("Warning: skipping unsupported %s %s\n", kind,
+           logical[0] == '\0' ? root->capture_path : logical);
+    return 0;
+}
+
+static int capture_node(PortableCaptureContext *context,
+                        const PortableRootSpec *root,
+                        const char *logical, int source_parent,
+                        const char *source_name, const char *root_path,
+                        int destination_parent, const char *destination_leaf)
+{
+    struct stat before;
+    if (read_source_stat(source_parent, source_name, root_path, &before) != 0)
+        return -1;
+
+    int is_root = source_parent < 0;
+    if (S_ISSOCK(before.st_mode) || S_ISCHR(before.st_mode) ||
+        S_ISBLK(before.st_mode))
+        return capture_special(context, root, logical, destination_parent,
+                               destination_leaf, is_root, &before);
+    if (S_ISLNK(before.st_mode) || S_ISFIFO(before.st_mode)) {
+        errno = EOPNOTSUPP;
+        return -1;
+    }
+    if (!S_ISREG(before.st_mode) && !S_ISDIR(before.st_mode)) {
+        errno = EOPNOTSUPP;
+        return -1;
+    }
+
+    int source_fd = open_source_node(source_parent, source_name, root_path,
+                                     &before);
+    if (source_fd < 0)
+        return -1;
+    struct stat opened;
+    if (fstat(source_fd, &opened) != 0 ||
+        !metadata_source_unchanged(&before, &opened)) {
+        close(source_fd);
+        return -1;
+    }
+
+    PortableXattrs xattrs;
+    if (collect_xattrs(source_fd, &xattrs) != 0) {
+        close(source_fd);
+        return -1;
+    }
+    if (visited_add(context->visited, root->id, logical) != 0) {
+        xattrs_free(&xattrs);
+        close(source_fd);
+        return -1;
+    }
+
+    if (S_ISREG(before.st_mode))
+        return capture_regular(context, root, logical, source_fd, &before,
+                               destination_parent, destination_leaf, is_root,
+                               &xattrs);
+
+    if (tombstone_if_live(context, root->id, logical) != 0) {
+        xattrs_free(&xattrs);
+        close(source_fd);
+        return -1;
+    }
+
+    int parent_fd = destination_parent;
+    char root_leaf[NAME_MAX + 1U];
+    if (is_root) {
+        if (open_payload_parent(context->data_fd, root->payload_path,
+                                &parent_fd, root_leaf, sizeof(root_leaf)) != 0) {
+            xattrs_free(&xattrs);
+            close(source_fd);
+            return -1;
+        }
+        destination_leaf = root_leaf;
+    }
+
+    int destination_fd;
+    if (ensure_directory_leaf(parent_fd, destination_leaf, &destination_fd) != 0) {
+        if (is_root)
+            close(parent_fd);
+        xattrs_free(&xattrs);
+        close(source_fd);
+        return -1;
+    }
+    if (capture_directory(context, root, logical, source_fd, &before,
+                          destination_fd, &xattrs) != 0) {
+        if (is_root)
+            close(parent_fd);
+        return -1;
+    }
+    if (is_root)
+        close(parent_fd);
+    return 0;
+}
+
+static int root_spec_valid(const PortableRootSpec *root)
+{
+    if (root == NULL || !safe_id(root->id) || root->capture_path == NULL ||
+        root->capture_path[0] != '/' || !safe_relative_path(root->payload_path) ||
+        root->source_path == NULL)
+        return 0;
+    if (root->policy < ROOT_POLICY_XDG ||
+        root->policy > ROOT_POLICY_MANUAL_NATIVE)
+        return 0;
+    if (root->policy == ROOT_POLICY_MANUAL_NATIVE)
+        return 0;
+    if (root->policy == ROOT_POLICY_HOME_RELATIVE) {
+        if (!root->has_restore_path || root->restore_path == NULL)
+            return 0;
+    } else if (root->has_restore_path) {
+        return 0;
+    }
+    if (root->has_restore_path && root->restore_path == NULL)
+        return 0;
+    if (root->has_restore_path && root->restore_path[0] != '\0' &&
+        !safe_relative_path(root->restore_path))
+        return 0;
+    return strlen(root->capture_path) < PATH_MAX &&
+           strlen(root->source_path) < PATH_MAX &&
+           (!root->has_restore_path || strlen(root->restore_path) < PATH_MAX);
+}
+
+static int relative_paths_overlap(const char *left, const char *right)
+{
+    size_t left_length = strlen(left);
+    size_t right_length = strlen(right);
+    if (left_length <= right_length &&
+        strncmp(left, right, left_length) == 0 &&
+        (left_length == right_length || right[left_length] == '/'))
+        return 1;
+    if (right_length < left_length &&
+        strncmp(left, right, right_length) == 0 &&
+        left[right_length] == '/')
+        return 1;
+    return 0;
+}
+
+static int build_manifest(const PortableCaptureRequest *request,
+                          Manifest *manifest)
+{
+    memset(manifest, 0, sizeof(*manifest));
+    manifest->version = MANIFEST_CURRENT_VERSION;
+    manifest->representation = CLONE_PORTABLE_SIDECAR;
+    manifest->scope = request->scope;
+    manifest->sidecar_version = SIDECAR_VERSION;
+    manifest->has_source_identity = request->has_source_identity != 0;
+    if (manifest->has_source_identity) {
+        if (request->machine_id == NULL ||
+            copy_text(manifest->machine_id, sizeof(manifest->machine_id),
+                      request->machine_id) != 0)
+            return -1;
+        manifest->source_uid = request->source_uid;
+    }
+
+    if (request->root_count > MANIFEST_MAX_ROOTS ||
+        (request->root_count != 0 && request->roots == NULL))
+        return -1;
+    manifest->root_count = (int)request->root_count;
+    if (request->root_count == 0)
+        return 0;
+    manifest->roots = calloc(request->root_count, sizeof(*manifest->roots));
+    if (manifest->roots == NULL)
+        return -1;
+
+    for (size_t index = 0; index < request->root_count; index++) {
+        const PortableRootSpec *source = &request->roots[index];
+        ManifestRoot *destination = &manifest->roots[index];
+        if (!root_spec_valid(source))
+            goto fail;
+        for (size_t previous = 0; previous < index; previous++) {
+            if (strcmp(request->roots[previous].id, source->id) == 0 ||
+                relative_paths_overlap(request->roots[previous].payload_path,
+                                       source->payload_path))
+                goto fail;
+        }
+        if (copy_text(destination->id, sizeof(destination->id), source->id) != 0 ||
+            copy_text(destination->payload_path, sizeof(destination->payload_path),
+                      source->payload_path) != 0 ||
+            copy_text(destination->source_path, sizeof(destination->source_path),
+                      source->source_path) != 0)
+            goto fail;
+        destination->policy = source->policy;
+        destination->has_restore_path = source->has_restore_path;
+        if (source->has_restore_path &&
+            copy_text(destination->restore_path, sizeof(destination->restore_path),
+                      source->restore_path) != 0)
+            goto fail;
+    }
+    return 0;
+
+fail:
+    manifest_free(manifest);
+    return -1;
+}
+
+static int fresh_namespace_is_empty(int container_fd)
+{
+    struct stat st;
+    if (fstatat(container_fd, "manifest.txt", &st, AT_SYMLINK_NOFOLLOW) == 0)
+        return -1;
+    if (errno != ENOENT)
+        return -1;
+    if (fstatat(container_fd, SIDECAR_SLOT_NAME, &st,
+                AT_SYMLINK_NOFOLLOW) == 0)
+        return -1;
+    if (errno != ENOENT)
+        return -1;
+    if (fstatat(container_fd, "data", &st, AT_SYMLINK_NOFOLLOW) != 0)
+        return errno == ENOENT ? 0 : -1;
+    if (!S_ISDIR(st.st_mode))
+        return -1;
+    int data_fd = openat(container_fd, "data",
+                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (data_fd < 0)
+        return -1;
+    int empty = 1;
+    int scan_fd = duplicate_fd(data_fd);
+    DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
+    if (directory == NULL) {
+        if (scan_fd >= 0)
+            close(scan_fd);
+        close(data_fd);
+        return -1;
+    }
+    for (;;) {
+        errno = 0;
+        struct dirent *entry = readdir(directory);
+        if (entry == NULL) {
+            if (errno != 0)
+                empty = 0;
+            break;
+        }
+        if (strcmp(entry->d_name, ".") != 0 &&
+            strcmp(entry->d_name, "..") != 0) {
+            empty = 0;
+            break;
+        }
+    }
+    if (closedir(directory) != 0)
+        empty = 0;
+    if (close(data_fd) != 0)
+        empty = 0;
+    return empty ? 0 : -1;
+}
+
+int portable_capture_context_init(PortableCaptureContext *context,
+                                  int data_fd, SidecarLog *sidecar,
+                                  int nsec_exact)
+{
+    if (context == NULL || data_fd < 0 || sidecar == NULL ||
+        sidecar->implementation == NULL)
+        return -1;
+    struct stat st;
+    if (fstat(data_fd, &st) != 0 || !S_ISDIR(st.st_mode))
+        return -1;
+    memset(context, 0, sizeof(*context));
+    PortableVisited *visited = calloc(1, sizeof(*visited));
+    if (visited == NULL)
+        return -1;
+    context->data_fd = data_fd;
+    context->sidecar = sidecar;
+    context->nsec_exact = nsec_exact != 0;
+    visited->hash_salt = sidecar_process_salt();
+    context->visited = visited;
+    return 0;
+}
+
+void portable_capture_context_close(PortableCaptureContext *context)
+{
+    if (context == NULL)
+        return;
+    visited_free(context->visited);
+    memset(context, 0, sizeof(*context));
+}
+
+int portable_capture_root(PortableCaptureContext *context,
+                          const PortableRootSpec *root)
+{
+    if (context == NULL || context->visited == NULL ||
+        context->data_fd < 0 || context->sidecar == NULL ||
+        !root_spec_valid(root))
+        return -1;
+    PortableVisited *visited = context->visited;
+    if (visited_reset(visited) != 0)
+        return -1;
+    return capture_node(context, root, "", -1, NULL, root->capture_path,
+                        -1, NULL);
+}
+
+int portable_capture_fresh_at(int container_fd,
+                              const PortableCaptureRequest *request)
+{
+    if (container_fd < 0 || request == NULL ||
+        request->scope < MANIFEST_SCOPE_CRITICAL ||
+        request->scope > MANIFEST_SCOPE_EXPLICIT ||
+        fresh_namespace_is_empty(container_fd) != 0)
+        return -1;
+
+    Manifest manifest;
+    if (build_manifest(request, &manifest) != 0)
+        return -1;
+    if (manifest_write_v1_at(container_fd, &manifest) != 0) {
+        manifest_free(&manifest);
+        return -1;
+    }
+
+    if (mkdirat(container_fd, "data", 0700) != 0 && errno != EEXIST) {
+        manifest_free(&manifest);
+        return -1;
+    }
+    int data_fd = openat(container_fd, "data",
+                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (data_fd < 0) {
+        manifest_free(&manifest);
+        return -1;
+    }
+
+    SidecarLog sidecar = {0};
+    if (sidecar_log_create_at(container_fd, &sidecar) != SIDECAR_OPEN_FRESH) {
+        close(data_fd);
+        manifest_free(&manifest);
+        return -1;
+    }
+
+    PortableCaptureContext context = {0};
+    int failed = portable_capture_context_init(&context, data_fd, &sidecar,
+                                               request->nsec_exact) != 0;
+    for (size_t index = 0; !failed && index < request->root_count; index++)
+        if (portable_capture_root(&context, &request->roots[index]) != 0)
+            failed = 1;
+    portable_capture_context_close(&context);
+    if (sidecar_log_close(&sidecar) != SIDECAR_STATUS_OK)
+        failed = 1;
+    if (close(data_fd) != 0)
+        failed = 1;
+    manifest_free(&manifest);
+    return failed ? -1 : 0;
+}

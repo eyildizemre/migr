@@ -129,6 +129,8 @@ typedef struct {
 /* Record fields passed to the callback are borrowed until it returns. */
 int sidecar_live_entry_count_allowed(uint64_t count);
 
+uint64_t sidecar_process_salt(void);
+
 const char *sidecar_status_string(SidecarStatus status);
 const char *sidecar_object_kind_name(SidecarObjectKind kind);
 int sidecar_object_kind_parse(SidecarBytes field, SidecarObjectKind *out);
