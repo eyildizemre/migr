@@ -532,6 +532,15 @@ owned by Phase H, whose acceptance criterion is that deleted files/subtrees do n
 survive a successful resumed final backup and that deletion failure blocks
 finalization.
 
+The live-state map's lookup and insert must not be a linear scan per operation once
+this log is wired into production capture/restore: a backup can hold up to
+`SIDECAR_MAX_LIVE_ENTRIES` (2^20) objects, and O(n) work per object makes the whole
+walk O(n^2) over the entry count -- not acceptable at that ceiling, regardless of
+which data structure eventually replaces the scan. The first state-log implementation
+uses one because it is not yet reachable from production and its own tests run with
+small fixture counts; that is the only reason it is tolerable today, and it must not
+reach production in that shape.
+
 ### Core metadata and ownership preflight
 
 Atime, mtime, mode, and numeric uid/gid are core metadata. Native v1 and legacy
