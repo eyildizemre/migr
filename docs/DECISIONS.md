@@ -541,6 +541,39 @@ uses one because it is not yet reachable from production and its own tests run w
 small fixture counts; that is the only reason it is tolerable today, and it must not
 reach production in that shape.
 
+The replacement is a hash table (open addressing, tombstoned deletes, salted
+FNV-1a over `(root_id, logical_path)`), not a balanced tree. The two access
+patterns this map actually serves -- capture is insert-heavy, restore is
+lookup-heavy -- are both O(1) amortized on a hash table; a sorted array's
+O(n) `memmove` per insert would leave capture at O(n^2) regardless of its
+O(log n) lookup, so it does not solve this on its own. A real balanced tree
+(red-black, AVL, B-tree) would give a guaranteed O(log n) bound with no
+insert-side gap, but its only structural advantage over a hash table --
+ordered iteration -- is never used: nothing here needs the live-state map
+itself to produce entries in any particular order. Insertion order for
+prioritized capture (e.g. backing up `--critical` paths first even when
+`--critical` was not passed) is a walk-scheduling concern that belongs to
+the caller enumerating source roots, not to this map, and is unaffected by
+which structure holds committed state. A hand-written balancing
+implementation is also simply more failure-prone in C than open addressing,
+in exactly the code that already carries the highest memory-safety bar in
+this codebase.
+
+The hash is seeded per process (using `getrandom()` when available, with a
+best-effort non-cryptographic fallback derived from the monotonic clock, pid,
+and a process-local address value) even though no realistic attacker scenario
+exists for `migr` today: adopting a resumed backup or reading a restore source
+is a single-user, single-machine, on-demand operation, not a shared, always-on
+service parsing anonymous input, and `SIDECAR_MAX_LIVE_ENTRIES` already bounds
+the worst case a crafted collision could produce. The randomized seed is kept
+anyway for three reasons, none of them a defence against a threat that does not
+exist yet: it costs nothing wire-format-side (the hash lives only in memory,
+never on disk, so it cannot bump the sidecar format); it costs only a few lines
+because the codebase already has an established pattern for obtaining
+process-local randomness; and it keeps faith with this document's own
+"sidecar and payload are untrusted input" posture, which the fixed-seed
+alternative would have been the one place to quietly abandon.
+
 ### Core metadata and ownership preflight
 
 Atime, mtime, mode, and numeric uid/gid are core metadata. Native v1 and legacy
