@@ -1042,6 +1042,32 @@ test_container_production() {
         exit 1
     fi
 
+    # A destination is a write location, so its final symlink must be followed
+    # when the link resolves outside the selected source root.
+    local link_src="$TEST_DIR/cp_fix_verify_src"
+    local link_real="$TEST_DIR/cp_fix_verify_real"
+    local link_path="$TEST_DIR/cp_fix_verify_link"
+    mkdir -p "$link_src" "$link_real"
+    echo symlink-target > "$link_src/file.txt"
+    ln -s "$link_real" "$link_path"
+
+    local link_out link_rc link_final_count link_final
+    set +e
+    link_out=$(../migr backup "$link_path" "$link_src" 2>&1)
+    link_rc=$?
+    set -e
+    link_final=$(containers_matching "$link_real" final)
+    link_final_count=$(printf '%s' "$link_final" | grep -c . || true)
+    if [ "$link_rc" -eq 0 ] && [ "$link_final_count" -eq 1 ] &&
+       [ "$(cat "$link_real"/migr_backup_*/data/EXPLICIT_0/file.txt)" = "symlink-target" ] &&
+       [[ "$link_out" == *"Backup complete"* ]]; then
+        echo -e "  ${GREEN}✓${NC} A destination final symlink is followed for a valid backup."
+    else
+        echo -e "  ${RED}✗${NC} A valid destination final symlink was rejected"
+        echo "  exit=$link_rc output: $link_out"
+        exit 1
+    fi
+
     # --- an unreadable root: fail, keep a valid partial, then resume it ---
     # Root bypasses permission bits, so the unreadable-file reproduction only
     # holds as a normal user.

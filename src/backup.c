@@ -490,8 +490,7 @@ int backup(const char *target, BackupMode mode, char **paths)
 
         MetadataProfiles advisory_profiles;
         metadata_profiles_init(&advisory_profiles);
-        int advisory_fd = open(target, O_RDONLY | O_DIRECTORY |
-                                        O_NOFOLLOW | O_CLOEXEC);
+        int advisory_fd = open(target, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
         if (advisory_fd >= 0)
         {
             if (backup_metadata_preflight(&plan, advisory_fd, -1,
@@ -532,8 +531,7 @@ int backup(const char *target, BackupMode mode, char **paths)
         return 1;
     }
 
-    int target_fd = open(target, O_RDONLY | O_DIRECTORY |
-                                  O_NOFOLLOW | O_CLOEXEC);
+    int target_fd = open(target, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (target_fd < 0)
     {
         printf("Error: Could not open backup destination %s\n", target);
