@@ -31,15 +31,20 @@
 
 #include "sidecar.h"
 
+#define GREEN "\033[0;32m"
+#define RED   "\033[0;31m"
+#define BLUE  "\033[0;34m"
+#define NC    "\033[0m"
+
 static int failures;
 
 static void check(int condition, const char *label)
 {
     if (condition)
-        printf("  v %s\n", label);
+        printf("  " GREEN "v" NC " %s\n", label);
     else
     {
-        printf("  x %s\n", label);
+        printf("  " RED "x" NC " %s\n", label);
         failures++;
     }
 }
@@ -118,7 +123,7 @@ static SidecarXattr sample_xattr(void)
 
 static void test_fresh_and_live_map(int container_fd)
 {
-    printf(":: fresh sidecar and committed live state\n");
+    printf(BLUE "::" NC " fresh sidecar and committed live state\n");
     check(reset_slot(container_fd) == 0, "slot starts absent");
 
     SidecarLog log = {0};
@@ -184,7 +189,7 @@ static void test_fresh_and_live_map(int container_fd)
 
 static void test_sequence_guards(int container_fd)
 {
-    printf(":: append sequence and reserved kind guards\n");
+    printf(BLUE "::" NC " append sequence and reserved kind guards\n");
     check(reset_slot(container_fd) == 0, "old slot is removed");
     SidecarLog log = {0};
     check(sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH,
@@ -221,7 +226,7 @@ static void test_sequence_guards(int container_fd)
 
 static void test_missing_and_slot_types(int container_fd)
 {
-    printf(":: slot classification and no-follow policy\n");
+    printf(BLUE "::" NC " slot classification and no-follow policy\n");
     SidecarLog log = {0};
     check(reset_slot(container_fd) == 0, "slot is absent for adoption");
     check(sidecar_log_adopt_at(container_fd, &log) == SIDECAR_OPEN_MISSING,
@@ -299,7 +304,7 @@ static void test_missing_and_slot_types(int container_fd)
 
 static void test_truncated_tail(int container_fd)
 {
-    printf(":: adoption truncates only an EOF tail\n");
+    printf(BLUE "::" NC " adoption truncates only an EOF tail\n");
     check(reset_slot(container_fd) == 0, "tail slot is absent");
     SidecarLog log = {0};
     check(sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH,
@@ -358,7 +363,7 @@ static void test_truncated_tail(int container_fd)
 
 static void test_interior_corruption_and_hardlink(int container_fd)
 {
-    printf(":: unusable content and hardlink refusal\n");
+    printf(BLUE "::" NC " unusable content and hardlink refusal\n");
     check(reset_slot(container_fd) == 0, "corruption slot is absent");
     int fd = openat(container_fd, SIDECAR_SLOT_NAME,
                     O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);

@@ -30,6 +30,11 @@
 
 #include "sidecar.h"
 
+#define GREEN "\033[0;32m"
+#define RED   "\033[0;31m"
+#define BLUE  "\033[0;34m"
+#define NC    "\033[0m"
+
 #define SCALE_ENTRY_COUNT 50000U
 
 extern uint64_t sidecar_state_test_probe_count(void);
@@ -40,10 +45,10 @@ static int failures;
 static void check(int condition, const char *label)
 {
     if (condition)
-        printf("  v %s\n", label);
+        printf("  " GREEN "v" NC " %s\n", label);
     else
     {
-        printf("  x %s\n", label);
+        printf("  " RED "x" NC " %s\n", label);
         failures++;
     }
 }
@@ -69,7 +74,7 @@ static SidecarEntry make_entry(const char *root, const char *logical,
 
 int main(void)
 {
-    printf(":: salted live-state hash scale\n");
+    printf(BLUE "::" NC " salted live-state hash scale\n");
     char directory[] = "/tmp/migr_sidecar_scale_XXXXXX";
     if (mkdtemp(directory) == NULL)
     {

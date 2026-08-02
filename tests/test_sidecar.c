@@ -35,15 +35,20 @@
 
 #include "sidecar.h"
 
+#define GREEN "\033[0;32m"
+#define RED   "\033[0;31m"
+#define BLUE  "\033[0;34m"
+#define NC    "\033[0m"
+
 static int failures;
 
 static void check(int condition, const char *label)
 {
     if (condition)
-        printf("  v %s\n", label);
+        printf("  " GREEN "v" NC " %s\n", label);
     else
     {
-        printf("  x %s\n", label);
+        printf("  " RED "x" NC " %s\n", label);
         failures++;
     }
 }
@@ -239,7 +244,7 @@ static int roundtrip_callback(const SidecarRecord *record, void *context)
 
 static void test_header_and_roundtrip(int fd)
 {
-    printf(":: sidecar header and record round trip\n");
+    printf(BLUE "::" NC " sidecar header and record round trip\n");
     check(reset_file(fd) == 0, "temporary sidecar is reset");
     check(sidecar_write_header(fd) == 0, "canonical header writes");
 
@@ -281,7 +286,7 @@ static void test_header_and_roundtrip(int fd)
 
 static void test_writer_validation(int fd)
 {
-    printf(":: sidecar writer validation and ceilings\n");
+    printf(BLUE "::" NC " sidecar writer validation and ceilings\n");
     SidecarEntry entry = sample_entry();
     uint64_t before = 0;
 
@@ -369,7 +374,7 @@ done:
 
 static void test_tail_and_boundary(int fd)
 {
-    printf(":: sidecar tail recovery and boundaries\n");
+    printf(BLUE "::" NC " sidecar tail recovery and boundaries\n");
     RawBuffer buffer = {0};
     check(append_header(&buffer, "1") == 0 &&
           append_regular_entry(&buffer, "420", "0") == 0 &&
@@ -406,7 +411,7 @@ static void test_tail_and_boundary(int fd)
 
 static void test_corruption_and_versions(int fd)
 {
-    printf(":: sidecar corruption classification\n");
+    printf(BLUE "::" NC " sidecar corruption classification\n");
     RawBuffer buffer = {0};
     SidecarParseResult result;
     SidecarStatus status;
@@ -459,7 +464,7 @@ static int reserved_kind_callback(const SidecarRecord *record, void *context)
 
 static void test_reserved_kind_parsing(int fd)
 {
-    printf(":: sidecar reserved kind grammar\n");
+    printf(BLUE "::" NC " sidecar reserved kind grammar\n");
     RawBuffer buffer = {0};
     check(append_header(&buffer, "1") == 0 && raw_tag(&buffer, "ENTRY") == 0 &&
           raw_text_field(&buffer, "ROOT") == 0 &&
@@ -490,7 +495,7 @@ static void test_reserved_kind_parsing(int fd)
 
 static void test_total_limit(int fd)
 {
-    printf(":: sidecar total-byte ceiling\n");
+    printf(BLUE "::" NC " sidecar total-byte ceiling\n");
     if (sizeof(off_t) < 8)
     {
         check(1, "host off_t is too narrow for the four-gigabyte fixture");
@@ -507,7 +512,7 @@ static void test_total_limit(int fd)
 
 static void test_live_entry_ceiling(void)
 {
-    printf(":: sidecar live-entry ceiling helper\n");
+    printf(BLUE "::" NC " sidecar live-entry ceiling helper\n");
     check(sidecar_live_entry_count_allowed(SIDECAR_MAX_LIVE_ENTRIES),
           "live-entry count at its ceiling is accepted");
     check(!sidecar_live_entry_count_allowed(
