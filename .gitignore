@@ -15,4 +15,5 @@ tests/test_sidecar_state
 tests/test_sidecar_scale
 tests/test_portable_capture
 tests/test_portable_capture_scale
+tests/test_portable_resume
 docs/scratch/

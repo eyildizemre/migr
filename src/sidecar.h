@@ -170,4 +170,24 @@ size_t sidecar_log_live_count(const SidecarLog *log);
 int sidecar_log_find(const SidecarLog *log, SidecarBytes root_id,
                      SidecarBytes logical_path, SidecarLiveView *out);
 
+#ifdef SIDECAR_TEST_HOOKS
+typedef enum {
+    SIDECAR_TEST_INTERRUPT_NONE = 0,
+    SIDECAR_TEST_BEFORE_ENTRY,
+    SIDECAR_TEST_AFTER_ENTRY,
+    SIDECAR_TEST_MID_ENTRY,
+    SIDECAR_TEST_BEFORE_XATTR,
+    SIDECAR_TEST_AFTER_XATTR,
+    SIDECAR_TEST_MID_XATTR,
+    SIDECAR_TEST_BEFORE_ENTRY_COMMIT,
+    SIDECAR_TEST_AFTER_ENTRY_COMMIT,
+    SIDECAR_TEST_MID_ENTRY_COMMIT,
+    SIDECAR_TEST_BEFORE_DELETE,
+    SIDECAR_TEST_AFTER_DELETE,
+    SIDECAR_TEST_MID_DELETE
+} SidecarTestInterruptPoint;
+
+void sidecar_test_set_interrupt(SidecarTestInterruptPoint point);
+#endif
+
 #endif

@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -27,6 +28,16 @@ static const char kind_directory[] = "directory";
 static const char kind_fifo[] = "fifo";
 static const char kind_symlink[] = "symlink";
 static const char kind_hardlink[] = "hardlink";
+
+#ifdef SIDECAR_TEST_HOOKS
+static volatile sig_atomic_t sidecar_test_interrupt_point =
+    SIDECAR_TEST_INTERRUPT_NONE;
+
+void sidecar_test_set_interrupt(SidecarTestInterruptPoint point)
+{
+    sidecar_test_interrupt_point = point;
+}
+#endif
 
 #define SIDECAR_TAG_MAX 32U
 #define SIDECAR_KIND_MAX 32U
@@ -252,8 +263,12 @@ static int write_all(int fd, const unsigned char *data, size_t length)
     return 0;
 }
 
-static int append_buffer(int fd, const SidecarBuffer *buffer)
+static int append_buffer(int fd, const SidecarBuffer *buffer,
+                         int record_type)
 {
+#ifndef SIDECAR_TEST_HOOKS
+    (void)record_type;
+#endif
     if (fd < 0 || buffer == NULL || buffer->data == NULL || buffer->length == 0)
     {
         set_invalid_error();
@@ -273,7 +288,49 @@ static int append_buffer(int fd, const SidecarBuffer *buffer)
 
     if (lseek(fd, 0, SEEK_END) < 0)
         return -1;
-    return write_all(fd, buffer->data, buffer->length);
+
+#ifdef SIDECAR_TEST_HOOKS
+    SidecarTestInterruptPoint before = SIDECAR_TEST_INTERRUPT_NONE;
+    SidecarTestInterruptPoint after = SIDECAR_TEST_INTERRUPT_NONE;
+    SidecarTestInterruptPoint middle = SIDECAR_TEST_INTERRUPT_NONE;
+    if (record_type == SIDECAR_RECORD_ENTRY) {
+        before = SIDECAR_TEST_BEFORE_ENTRY;
+        after = SIDECAR_TEST_AFTER_ENTRY;
+        middle = SIDECAR_TEST_MID_ENTRY;
+    } else if (record_type == SIDECAR_RECORD_XATTR) {
+        before = SIDECAR_TEST_BEFORE_XATTR;
+        after = SIDECAR_TEST_AFTER_XATTR;
+        middle = SIDECAR_TEST_MID_XATTR;
+    } else if (record_type == SIDECAR_RECORD_ENTRY_COMMIT) {
+        before = SIDECAR_TEST_BEFORE_ENTRY_COMMIT;
+        after = SIDECAR_TEST_AFTER_ENTRY_COMMIT;
+        middle = SIDECAR_TEST_MID_ENTRY_COMMIT;
+    } else if (record_type == SIDECAR_RECORD_DELETE) {
+        before = SIDECAR_TEST_BEFORE_DELETE;
+        after = SIDECAR_TEST_AFTER_DELETE;
+        middle = SIDECAR_TEST_MID_DELETE;
+    }
+    if (before != SIDECAR_TEST_INTERRUPT_NONE &&
+        sidecar_test_interrupt_point == (sig_atomic_t)before)
+        (void)kill(getpid(), SIGKILL);
+    if (middle != SIDECAR_TEST_INTERRUPT_NONE &&
+        sidecar_test_interrupt_point == (sig_atomic_t)middle) {
+        size_t partial = buffer->length / 2U;
+        if (partial == 0)
+            partial = 1U;
+        if (write_all(fd, buffer->data, partial) != 0)
+            return -1;
+        (void)kill(getpid(), SIGKILL);
+    }
+#endif
+
+    int result = write_all(fd, buffer->data, buffer->length);
+#ifdef SIDECAR_TEST_HOOKS
+    if (result == 0 && after != SIDECAR_TEST_INTERRUPT_NONE &&
+        sidecar_test_interrupt_point == (sig_atomic_t)after)
+        (void)kill(getpid(), SIGKILL);
+#endif
+    return result;
 }
 
 static int validate_entry(const SidecarEntry *entry)
@@ -402,7 +459,7 @@ int sidecar_write_header(int fd)
     }
     if (buffer_append_field(&buffer, magic) == 0 &&
         buffer_append_field(&buffer, version) == 0)
-        result = append_buffer(fd, &buffer);
+        result = append_buffer(fd, &buffer, -1);
     buffer_free(&buffer);
     return result;
 }
@@ -412,7 +469,7 @@ int sidecar_write_entry(int fd, const SidecarEntry *entry)
     SidecarBuffer buffer = {0};
     int result = -1;
     if (build_entry_buffer(entry, &buffer) == 0)
-        result = append_buffer(fd, &buffer);
+        result = append_buffer(fd, &buffer, SIDECAR_RECORD_ENTRY);
     buffer_free(&buffer);
     return result;
 }
@@ -422,7 +479,7 @@ int sidecar_write_xattr(int fd, const SidecarXattr *xattr)
     SidecarBuffer buffer = {0};
     int result = -1;
     if (build_xattr_buffer(xattr, &buffer) == 0)
-        result = append_buffer(fd, &buffer);
+        result = append_buffer(fd, &buffer, SIDECAR_RECORD_XATTR);
     buffer_free(&buffer);
     return result;
 }
@@ -432,7 +489,7 @@ int sidecar_write_entry_commit(int fd)
     SidecarBuffer buffer = {0};
     int result = -1;
     if (buffer_append_tag(&buffer, tag_entry_commit) == 0)
-        result = append_buffer(fd, &buffer);
+        result = append_buffer(fd, &buffer, SIDECAR_RECORD_ENTRY_COMMIT);
     buffer_free(&buffer);
     return result;
 }
@@ -445,7 +502,7 @@ int sidecar_write_delete(int fd, const SidecarDelete *deletion)
         buffer_append_tag(&buffer, tag_delete) == 0 &&
         buffer_append_field(&buffer, deletion->root_id) == 0 &&
         buffer_append_field(&buffer, deletion->logical_path) == 0)
-        result = append_buffer(fd, &buffer);
+        result = append_buffer(fd, &buffer, SIDECAR_RECORD_DELETE);
     buffer_free(&buffer);
     return result;
 }

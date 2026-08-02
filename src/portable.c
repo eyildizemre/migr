@@ -13,6 +13,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/xattr.h>
+#include <signal.h>
 #include <unistd.h>
 
 #include "metadata.h"
@@ -61,6 +62,27 @@ void portable_capture_test_reset_probe_count(void)
 #else
 static void visited_count_probe(void)
 {
+}
+#endif
+
+#ifdef PORTABLE_CAPTURE_TEST_HOOKS
+static volatile sig_atomic_t portable_test_interrupt_point =
+    PORTABLE_TEST_INTERRUPT_NONE;
+
+void portable_capture_test_set_interrupt(PortableTestInterruptPoint point)
+{
+    portable_test_interrupt_point = point;
+}
+
+static void portable_test_interrupt_if(PortableTestInterruptPoint point)
+{
+    if (portable_test_interrupt_point == (sig_atomic_t)point)
+        (void)kill(getpid(), SIGKILL);
+}
+#else
+static void portable_test_interrupt_if(int point)
+{
+    (void)point;
 }
 #endif
 
@@ -253,6 +275,50 @@ static int open_payload_parent(int data_fd, const char *relative,
         }
         if (next < 0) {
             close(current);
+            return -1;
+        }
+        close(current);
+        current = next;
+        cursor = slash + 1;
+    }
+}
+
+/* Opens an existing payload parent without creating any component. */
+static int open_existing_payload_parent(int data_fd, const char *relative,
+                                        int *parent_out, char *leaf,
+                                        size_t leaf_size)
+{
+    if (data_fd < 0 || parent_out == NULL || leaf == NULL ||
+        !safe_relative_path(relative) || leaf_size == 0)
+        return -1;
+
+    size_t length = strlen(relative);
+    char copy[PATH_MAX];
+    memcpy(copy, relative, length + 1U);
+    int current = duplicate_fd(data_fd);
+    if (current < 0)
+        return -1;
+
+    char *cursor = copy;
+    for (;;) {
+        char *slash = strchr(cursor, '/');
+        if (slash != NULL)
+            *slash = '\0';
+        if (slash == NULL) {
+            int result = copy_text(leaf, leaf_size, cursor);
+            if (result == 0) {
+                *parent_out = current;
+                return 0;
+            }
+            close(current);
+            return -1;
+        }
+
+        int next = open_child_directory(current, cursor);
+        if (next < 0) {
+            int saved = errno;
+            close(current);
+            errno = saved;
             return -1;
         }
         close(current);
@@ -486,6 +552,101 @@ static int entry_from_stat(const char *root_id, const char *logical,
     return 0;
 }
 
+static int sidecar_bytes_equal(SidecarBytes left, SidecarBytes right)
+{
+    return left.length == right.length &&
+           (left.length == 0 ||
+            (left.data != NULL && right.data != NULL &&
+             memcmp(left.data, right.data, left.length) == 0));
+}
+
+static int xattrs_equal(const PortableXattrs *current,
+                        const SidecarLiveView *previous)
+{
+    if (current == NULL || previous == NULL ||
+        current->count != previous->xattr_count)
+        return 0;
+    unsigned char matched[SIDECAR_MAX_XATTRS_PER_ENTRY] = {0};
+    for (size_t index = 0; index < current->count; index++) {
+        SidecarBytes name = current->items[index].name;
+        SidecarBytes value = current->items[index].value;
+        int found = 0;
+        for (size_t candidate = 0; candidate < previous->xattr_count;
+             candidate++) {
+            if (matched[candidate])
+                continue;
+            if (sidecar_bytes_equal(name, previous->xattrs[candidate].name) &&
+                sidecar_bytes_equal(value,
+                                    previous->xattrs[candidate].value)) {
+                matched[candidate] = 1;
+                found = 1;
+                break;
+            }
+        }
+        if (!found)
+            return 0;
+    }
+    return 1;
+}
+
+static int entries_equal(const SidecarEntry *current,
+                         const SidecarLiveView *previous,
+                         const PortableXattrs *xattrs)
+{
+    if (current == NULL || previous == NULL || previous->entry == NULL)
+        return 0;
+    const SidecarEntry *entry = previous->entry;
+    return sidecar_bytes_equal(current->root_id, entry->root_id) &&
+           sidecar_bytes_equal(current->logical_path, entry->logical_path) &&
+           sidecar_bytes_equal(current->physical_path, entry->physical_path) &&
+           current->kind == entry->kind && current->mode == entry->mode &&
+           current->uid == entry->uid && current->gid == entry->gid &&
+           current->atime_sec == entry->atime_sec &&
+           current->atime_nsec == entry->atime_nsec &&
+           current->mtime_sec == entry->mtime_sec &&
+           current->mtime_nsec == entry->mtime_nsec &&
+           current->size == entry->size &&
+           sidecar_bytes_equal(current->symlink_target, entry->symlink_target) &&
+           sidecar_bytes_equal(current->hardlink_root_id,
+                               entry->hardlink_root_id) &&
+           sidecar_bytes_equal(current->hardlink_logical_path,
+                               entry->hardlink_logical_path) &&
+           xattrs_equal(xattrs, previous);
+}
+
+static int existing_payload_matches(int data_fd, const char *payload_path,
+                                    int destination_parent,
+                                    const char *destination_leaf,
+                                    int destination_is_root,
+                                    uint64_t expected_size)
+{
+    int parent_fd = destination_parent;
+    char root_leaf[NAME_MAX + 1U];
+    if (destination_is_root) {
+        if (open_existing_payload_parent(data_fd, payload_path, &parent_fd,
+                                         root_leaf, sizeof(root_leaf)) != 0)
+            return errno == ENOENT ? 0 : -1;
+        destination_leaf = root_leaf;
+    }
+
+    struct stat st;
+    int result = fstatat(parent_fd, destination_leaf, &st,
+                         AT_SYMLINK_NOFOLLOW);
+    int saved = errno;
+    if (destination_is_root && close(parent_fd) != 0 && result == 0) {
+        result = -1;
+        saved = EIO;
+    }
+    if (result != 0) {
+        errno = saved;
+        return errno == ENOENT ? 0 : -1;
+    }
+    if (!S_ISREG(st.st_mode) || st.st_size < 0 ||
+        (uintmax_t)st.st_size != expected_size)
+        return 0;
+    return 1;
+}
+
 static uint64_t visited_fnv1a_bytes(uint64_t hash,
                                     const unsigned char *data,
                                     size_t length)
@@ -711,8 +872,12 @@ static int tombstone_if_live(PortableCaptureContext *context,
         .root_id = { (const unsigned char *)root_id, strlen(root_id) },
         .logical_path = { (const unsigned char *)logical, strlen(logical) }
     };
-    return sidecar_log_append_delete(context->sidecar, &deletion) ==
-                   SIDECAR_STATUS_OK ? 0 : -1;
+    portable_test_interrupt_if(PORTABLE_TEST_BEFORE_REPLACEMENT_DELETE);
+    int result = sidecar_log_append_delete(context->sidecar, &deletion) ==
+                         SIDECAR_STATUS_OK ? 0 : -1;
+    if (result == 0)
+        portable_test_interrupt_if(PORTABLE_TEST_AFTER_REPLACEMENT_DELETE);
+    return result;
 }
 
 static int tombstone_destination_children(PortableCaptureContext *context,
@@ -945,6 +1110,7 @@ static int capture_regular(PortableCaptureContext *context,
     }
 
     int destination_fd;
+    portable_test_interrupt_if(PORTABLE_TEST_BEFORE_PAYLOAD_REPLACE);
     if (ensure_regular_leaf(parent_fd, destination_leaf, &destination_fd) != 0) {
         if (destination_is_root)
             close(parent_fd);
@@ -952,6 +1118,8 @@ static int capture_regular(PortableCaptureContext *context,
         close(source_fd);
         return -1;
     }
+    portable_test_interrupt_if(PORTABLE_TEST_AFTER_PAYLOAD_REPLACE);
+    portable_test_interrupt_if(PORTABLE_TEST_BEFORE_PAYLOAD_WRITE);
     if (copy_regular(source_fd, destination_fd, before->st_size) != 0) {
         close(destination_fd);
         if (destination_is_root)
@@ -960,12 +1128,15 @@ static int capture_regular(PortableCaptureContext *context,
         close(source_fd);
         return -1;
     }
+    portable_test_interrupt_if(PORTABLE_TEST_AFTER_PAYLOAD_WRITE);
 
     struct stat after;
     int failed = fstat(source_fd, &after) != 0 ||
                  !metadata_source_unchanged(before, &after);
+    portable_test_interrupt_if(PORTABLE_TEST_BEFORE_PAYLOAD_CLOSE);
     if (close(destination_fd) != 0)
         failed = 1;
+    portable_test_interrupt_if(PORTABLE_TEST_AFTER_PAYLOAD_CLOSE);
     if (close(source_fd) != 0)
         failed = 1;
     if (destination_is_root)
@@ -1066,6 +1237,44 @@ static int capture_node(PortableCaptureContext *context,
         xattrs_free(&xattrs);
         close(source_fd);
         return -1;
+    }
+
+    if (S_ISREG(before.st_mode) && context->resume_mode) {
+        SidecarBytes root_key = {
+            (const unsigned char *)root->id, strlen(root->id)
+        };
+        SidecarBytes logical_key = {
+            (const unsigned char *)logical, strlen(logical)
+        };
+        SidecarLiveView previous;
+        int live = sidecar_log_find(context->sidecar, root_key, logical_key,
+                                    &previous);
+        if (live < 0) {
+            xattrs_free(&xattrs);
+            close(source_fd);
+            return -1;
+        }
+        if (live == 1) {
+            SidecarEntry current;
+            int matches = entry_from_stat(root->id, logical, &before,
+                                          context->nsec_exact, &xattrs,
+                                          &current) == 0 &&
+                          entries_equal(&current, &previous, &xattrs);
+            if (matches) {
+                int payload = existing_payload_matches(
+                    context->data_fd, root->payload_path, destination_parent,
+                    destination_leaf, is_root, current.size);
+                if (payload < 0) {
+                    xattrs_free(&xattrs);
+                    close(source_fd);
+                    return -1;
+                }
+                if (payload == 1) {
+                    xattrs_free(&xattrs);
+                    return close(source_fd) == 0 ? 0 : -1;
+                }
+            }
+        }
     }
 
     if (S_ISREG(before.st_mode))
@@ -1210,6 +1419,40 @@ fail:
     return -1;
 }
 
+static int data_namespace_is_empty(int data_fd)
+{
+    if (data_fd < 0)
+        return -1;
+    struct stat st;
+    if (fstat(data_fd, &st) != 0 || !S_ISDIR(st.st_mode))
+        return -1;
+    int empty = 1;
+    int scan_fd = duplicate_fd(data_fd);
+    DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
+    if (directory == NULL) {
+        if (scan_fd >= 0)
+            close(scan_fd);
+        return -1;
+    }
+    for (;;) {
+        errno = 0;
+        struct dirent *entry = readdir(directory);
+        if (entry == NULL) {
+            if (errno != 0)
+                empty = 0;
+            break;
+        }
+        if (strcmp(entry->d_name, ".") != 0 &&
+            strcmp(entry->d_name, "..") != 0) {
+            empty = 0;
+            break;
+        }
+    }
+    if (closedir(directory) != 0)
+        empty = 0;
+    return empty ? 0 : -1;
+}
+
 static int fresh_namespace_is_empty(int container_fd)
 {
     struct stat st;
@@ -1230,34 +1473,10 @@ static int fresh_namespace_is_empty(int container_fd)
                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (data_fd < 0)
         return -1;
-    int empty = 1;
-    int scan_fd = duplicate_fd(data_fd);
-    DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
-    if (directory == NULL) {
-        if (scan_fd >= 0)
-            close(scan_fd);
-        close(data_fd);
-        return -1;
-    }
-    for (;;) {
-        errno = 0;
-        struct dirent *entry = readdir(directory);
-        if (entry == NULL) {
-            if (errno != 0)
-                empty = 0;
-            break;
-        }
-        if (strcmp(entry->d_name, ".") != 0 &&
-            strcmp(entry->d_name, "..") != 0) {
-            empty = 0;
-            break;
-        }
-    }
-    if (closedir(directory) != 0)
-        empty = 0;
+    int result = data_namespace_is_empty(data_fd);
     if (close(data_fd) != 0)
-        empty = 0;
-    return empty ? 0 : -1;
+        result = -1;
+    return result;
 }
 
 int portable_capture_context_init(PortableCaptureContext *context,
@@ -1320,6 +1539,7 @@ int portable_capture_fresh_at(int container_fd,
         manifest_free(&manifest);
         return -1;
     }
+    portable_test_interrupt_if(PORTABLE_TEST_AFTER_MANIFEST);
 
     if (mkdirat(container_fd, "data", 0700) != 0 && errno != EEXIST) {
         manifest_free(&manifest);
@@ -1351,5 +1571,112 @@ int portable_capture_fresh_at(int container_fd,
     if (close(data_fd) != 0)
         failed = 1;
     manifest_free(&manifest);
+    return failed ? -1 : 0;
+}
+
+/* Returns 0 with an open data directory, 1 when data is absent, -1 otherwise. */
+static int open_existing_data(int container_fd, int *out_fd)
+{
+    if (container_fd < 0 || out_fd == NULL)
+        return -1;
+    *out_fd = -1;
+    struct stat st;
+    if (fstatat(container_fd, "data", &st, AT_SYMLINK_NOFOLLOW) != 0)
+        return errno == ENOENT ? 1 : -1;
+    if (!S_ISDIR(st.st_mode))
+        return -1;
+    int fd = openat(container_fd, "data",
+                    O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    *out_fd = fd;
+    return 0;
+}
+
+static int create_resume_data(int container_fd, int *out_fd)
+{
+    if (container_fd < 0 || out_fd == NULL)
+        return -1;
+    if (mkdirat(container_fd, "data", 0700) != 0 && errno != EEXIST)
+        return -1;
+    int state = open_existing_data(container_fd, out_fd);
+    return state == 0 ? 0 : -1;
+}
+
+int portable_capture_resume_at(int container_fd,
+                               const PortableCaptureRequest *request)
+{
+    if (container_fd < 0 || request == NULL ||
+        request->scope < MANIFEST_SCOPE_CRITICAL ||
+        request->scope > MANIFEST_SCOPE_EXPLICIT)
+        return -1;
+
+    Manifest expected;
+    if (build_manifest(request, &expected) != 0)
+        return -1;
+
+    Manifest existing;
+    ManifestStatus manifest_status = manifest_read_v1_at(container_fd,
+                                                         &existing);
+    if (manifest_status != MANIFEST_STATUS_VALID) {
+        manifest_free(&expected);
+        return -1;
+    }
+    ManifestIdentityComparison identity =
+        manifest_resume_identity_compare(&existing, &expected);
+    if (identity != MANIFEST_IDENTITY_EQUAL) {
+        manifest_free(&existing);
+        manifest_free(&expected);
+        return -1;
+    }
+
+    int data_fd = -1;
+    int data_state = open_existing_data(container_fd, &data_fd);
+    if (data_state < 0) {
+        manifest_free(&existing);
+        manifest_free(&expected);
+        return -1;
+    }
+    int data_missing = data_state == 1;
+
+    SidecarLog sidecar = {0};
+    SidecarOpenStatus sidecar_status = sidecar_log_adopt_at(container_fd,
+                                                            &sidecar);
+    int failed = 0;
+    if (sidecar_status == SIDECAR_OPEN_MISSING) {
+        if (data_missing) {
+            if (create_resume_data(container_fd, &data_fd) != 0)
+                failed = 1;
+        }
+        if (!failed && data_namespace_is_empty(data_fd) != 0)
+            failed = 1;
+        if (!failed &&
+            sidecar_log_create_at(container_fd, &sidecar) !=
+                SIDECAR_OPEN_FRESH)
+            failed = 1;
+    } else if (sidecar_status != SIDECAR_OPEN_RESUMABLE || data_missing) {
+        failed = 1;
+    }
+
+    PortableCaptureContext context = {0};
+    if (!failed && portable_capture_context_init(&context, data_fd, &sidecar,
+                                                request->nsec_exact) != 0)
+        failed = 1;
+    if (!failed) {
+        context.resume_mode = 1;
+        for (size_t index = 0; index < request->root_count; index++) {
+            if (portable_capture_root(&context, &request->roots[index]) != 0) {
+                failed = 1;
+                break;
+            }
+        }
+    }
+    portable_capture_context_close(&context);
+    if (sidecar_log_close(&sidecar) != SIDECAR_STATUS_OK)
+        failed = 1;
+    if (data_fd >= 0 && close(data_fd) != 0)
+        failed = 1;
+    manifest_free(&existing);
+    manifest_free(&expected);
     return failed ? -1 : 0;
 }

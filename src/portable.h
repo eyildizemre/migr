@@ -46,6 +46,7 @@ typedef struct PortableCaptureContext {
     int data_fd;
     SidecarLog *sidecar;
     int nsec_exact;
+    int resume_mode;
     void *visited;
 } PortableCaptureContext;
 
@@ -71,5 +72,36 @@ int portable_capture_root(PortableCaptureContext *context,
  */
 int portable_capture_fresh_at(int container_fd,
                               const PortableCaptureRequest *request);
+
+/**
+ * Resumes a portable capture in an existing versioned partial container.
+ * The manifest must match request; it is never rewritten by this function.
+ */
+int portable_capture_resume_at(int container_fd,
+                               const PortableCaptureRequest *request);
+
+typedef enum {
+    PORTABLE_TEST_INTERRUPT_NONE = 0,
+    PORTABLE_TEST_AFTER_MANIFEST,
+    PORTABLE_TEST_BEFORE_REPLACEMENT_DELETE,
+    PORTABLE_TEST_AFTER_REPLACEMENT_DELETE,
+    PORTABLE_TEST_BEFORE_PAYLOAD_REPLACE,
+    PORTABLE_TEST_AFTER_PAYLOAD_REPLACE,
+    PORTABLE_TEST_BEFORE_PAYLOAD_WRITE,
+    PORTABLE_TEST_AFTER_PAYLOAD_WRITE,
+    PORTABLE_TEST_BEFORE_PAYLOAD_CLOSE,
+    PORTABLE_TEST_AFTER_PAYLOAD_CLOSE
+} PortableTestInterruptPoint;
+
+/*
+ * Unlike SidecarTestInterruptPoint, this enum stays visible in every build:
+ * portable.c calls portable_test_interrupt_if() with these constants at
+ * unconditional call sites (not wrapped in #ifdef), relying on it compiling
+ * down to a real no-op stub when PORTABLE_CAPTURE_TEST_HOOKS is off. Only the
+ * setter below is part of the D14 seam.
+ */
+#ifdef PORTABLE_CAPTURE_TEST_HOOKS
+void portable_capture_test_set_interrupt(PortableTestInterruptPoint point);
+#endif
 
 #endif
