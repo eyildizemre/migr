@@ -6,6 +6,7 @@
 
 #define SIDECAR_MAGIC "MIGR_SIDECAR"
 #define SIDECAR_VERSION 1
+#define SIDECAR_SLOT_NAME "sidecar.migr"
 
 #define SIDECAR_MAX_ROOT_ID 64U
 #define SIDECAR_MAX_PATH 4096U
@@ -52,6 +53,17 @@ typedef enum {
     SIDECAR_STATUS_UNSUPPORTED_KIND,
     SIDECAR_STATUS_CALLBACK
 } SidecarStatus;
+
+typedef enum {
+    SIDECAR_OPEN_FRESH = 0,
+    SIDECAR_OPEN_RESUMABLE,
+    SIDECAR_OPEN_MISSING,
+    SIDECAR_OPEN_EXISTS,
+    SIDECAR_OPEN_UNUSABLE,
+    SIDECAR_OPEN_IO_ERROR,
+    SIDECAR_OPEN_ALLOCATION,
+    SIDECAR_OPEN_INVALID_ARGUMENT
+} SidecarOpenStatus;
 
 typedef struct {
     SidecarBytes root_id;
@@ -101,6 +113,19 @@ typedef struct {
     uint64_t allocation_peak;
 } SidecarParseResult;
 
+typedef struct SidecarLog {
+    /* Zero-initialize before the first create/adopt call. */
+    void *implementation;
+} SidecarLog;
+
+typedef struct {
+    /* These pointers are borrowed until the next log mutation or close. */
+    const SidecarEntry *entry;
+    const SidecarXattr *xattrs;
+    size_t xattr_count;
+    uint64_t generation;
+} SidecarLiveView;
+
 /* Record fields passed to the callback are borrowed until it returns. */
 int sidecar_live_entry_count_allowed(uint64_t count);
 
@@ -123,5 +148,24 @@ int sidecar_write_delete(int fd, const SidecarDelete *deletion);
  */
 SidecarStatus sidecar_parse_fd(int fd, SidecarRecordCallback callback,
                                void *context, SidecarParseResult *result);
+
+const char *sidecar_open_status_string(SidecarOpenStatus status);
+
+/* The container directory fd is borrowed; the returned log owns its slot fd. */
+SidecarOpenStatus sidecar_log_create_at(int container_fd, SidecarLog *out);
+SidecarOpenStatus sidecar_log_adopt_at(int container_fd, SidecarLog *out);
+SidecarStatus sidecar_log_close(SidecarLog *log);
+
+SidecarStatus sidecar_log_append_entry(SidecarLog *log,
+                                       const SidecarEntry *entry);
+SidecarStatus sidecar_log_append_xattr(SidecarLog *log,
+                                       const SidecarXattr *xattr);
+SidecarStatus sidecar_log_append_entry_commit(SidecarLog *log);
+SidecarStatus sidecar_log_append_delete(SidecarLog *log,
+                                        const SidecarDelete *deletion);
+
+size_t sidecar_log_live_count(const SidecarLog *log);
+int sidecar_log_find(const SidecarLog *log, SidecarBytes root_id,
+                     SidecarBytes logical_path, SidecarLiveView *out);
 
 #endif
