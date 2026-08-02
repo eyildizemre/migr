@@ -14,6 +14,20 @@
 #include "fileops.h"
 #include "metadata.h"
 
+#ifdef METADATA_TEST_HOOKS
+static uint64_t metadata_probe_calls;
+
+uint64_t metadata_test_probe_count(void)
+{
+    return metadata_probe_calls;
+}
+
+void metadata_test_reset_probe_count(void)
+{
+    metadata_probe_calls = 0;
+}
+#endif
+
 static int same_timespec(struct timespec left, struct timespec right)
 {
     return left.tv_sec == right.tv_sec && left.tv_nsec == right.tv_nsec;
@@ -255,6 +269,9 @@ static int probe_one_profile(const MetadataProfile *profile,
 int metadata_profiles_probe(const MetadataProfiles *profiles,
                             MetadataTimestampPolicy policy)
 {
+#ifdef METADATA_TEST_HOOKS
+    metadata_probe_calls++;
+#endif
     if (profiles == NULL)
         return -1;
     for (size_t i = 0; i < profiles->count; i++)

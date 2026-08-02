@@ -67,6 +67,11 @@ int metadata_profiles_probe(const MetadataProfiles *profiles,
                             MetadataTimestampPolicy policy);
 void metadata_profiles_report(const MetadataProfiles *profiles);
 
+#ifdef METADATA_TEST_HOOKS
+uint64_t metadata_test_probe_count(void);
+void metadata_test_reset_probe_count(void);
+#endif
+
 void metadata_snapshots_init(MetadataSnapshots *snapshots);
 void metadata_snapshots_free(MetadataSnapshots *snapshots);
 int metadata_snapshot_record(MetadataSnapshots *snapshots,
