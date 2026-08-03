@@ -156,7 +156,10 @@ RestoreNativeStatus restore_native_preflight_at(
  * to aggregate all roots before confirmation, so a single later probe can
  * reject the invocation before any destination payload is changed. It returns
  * RESTORE_NATIVE_SOURCE_SAFE_READ when source inspection would require an
- * atime-changing fallback.
+ * atime-changing fallback. Symlink target strings are deliberately not read
+ * by this inventory walk: on Linux, readlinkat() itself perturbs a symlink's
+ * atime (docs/DECISIONS.md D17 as-built), while the later restore pass still
+ * performs ordinary target validation before applying the saved metadata.
  */
 RestoreNativeStatus restore_native_metadata_inventory_at(
     const CloneContext *ctx, int source_root_fd, const char *source_rel,

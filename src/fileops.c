@@ -965,11 +965,14 @@ static void metadata_child_path(const char *parent, const char *leaf,
 // The same recursive dispatcher serves mutation-free validation and the
 // actual restore. A negative destination parent means the corresponding
 // destination subtree does not exist during validation.
+// The explicit symlink-read flag keeps metadata inventory from perturbing
+// source atime; other validation and apply walks retain target checks (D17).
 static RestoreNativeStatus restore_entry_at(
     const CloneContext *ctx, RestorePass pass, int source_parent_fd,
     const char *source_leaf, int dest_parent_fd, const char *dest_leaf,
     const char *logical_path, MetadataSnapshots *snapshots,
     MetadataProfiles *profiles, int metadata_anchor_fd,
+    int skip_symlink_target_read,
     RestoreNativeReport *restore_report)
 {
     int source_is_root = source_leaf[0] == '\0';
@@ -1042,6 +1045,12 @@ static RestoreNativeStatus restore_entry_at(
         {
             close(source_object_fd);
             return -1;
+        }
+
+        if (pass == RESTORE_VALIDATE && skip_symlink_target_read)
+        {
+            close(source_object_fd);
+            return RESTORE_NATIVE_OK;
         }
 
         char target[PATH_MAX];
@@ -1269,7 +1278,7 @@ static RestoreNativeStatus restore_entry_at(
             RestoreNativeStatus child_status = restore_entry_at(
                 ctx, pass, source_dir_fd, entry->d_name, dest_dir_fd,
                 entry->d_name, child_logical_path, snapshots, profiles,
-                metadata_anchor_fd, restore_report);
+                metadata_anchor_fd, skip_symlink_target_read, restore_report);
             if (child_status != RESTORE_NATIVE_OK)
             {
                 failed = 1;
@@ -1450,7 +1459,7 @@ RestoreNativeStatus restore_native_preflight_at(
     int rc = restore_entry_at(ctx, RESTORE_VALIDATE, source_parent_fd,
                               source_leaf, dest_parent_fd, dest_leaf,
                               source_rel, &snapshots, &profiles,
-                              metadata_anchor_fd, NULL);
+                              metadata_anchor_fd, 0, NULL);
     close(metadata_anchor_fd);
     close(source_parent_fd);
     if (dest_parent_fd >= 0)
@@ -1503,7 +1512,7 @@ RestoreNativeStatus restore_native_metadata_inventory_at(
     int rc = restore_entry_at(ctx, RESTORE_VALIDATE, source_parent_fd,
                               source_leaf, dest_parent_fd, dest_leaf,
                               source_rel, &snapshots, profiles,
-                              metadata_anchor_fd, NULL);
+                              metadata_anchor_fd, 1, NULL);
     close(metadata_anchor_fd);
     close(source_parent_fd);
     if (dest_parent_fd >= 0)
@@ -1571,7 +1580,7 @@ RestoreNativeStatus restore_native_at_report(
     int rc = restore_entry_at(ctx, RESTORE_VALIDATE, source_parent_fd,
                               source_leaf, dest_parent_fd, dest_leaf,
                               source_rel, &snapshots, &profiles,
-                              metadata_anchor_fd, report);
+                              metadata_anchor_fd, 0, report);
     close(metadata_anchor_fd);
     if (rc == 0 && !ctx->metadata_preflight_done &&
         metadata_profiles_probe(&profiles,
@@ -1593,7 +1602,7 @@ RestoreNativeStatus restore_native_at_report(
         rc = restore_entry_at(ctx, RESTORE_APPLY, source_parent_fd,
                               source_leaf, dest_parent_fd, dest_leaf,
                               source_rel, &snapshots, NULL,
-                              destination_root_fd, report);
+                              destination_root_fd, 0, report);
     if (rc != RESTORE_NATIVE_OK && report->failed_count == 0)
         restore_report_failure(report, source_rel);
     close(source_parent_fd);

@@ -47,6 +47,7 @@ TEST_RESTORE_NATIVE = tests/test_restore_native
 TEST_RESTORE_SOURCE_READ = tests/test_restore_source_read
 TEST_BACKUP_SOURCE_READ = tests/test_backup_source_read
 TEST_RESTORE_DISPATCH = tests/test_restore_dispatch
+TEST_RESTORE_ATIME = tests/test_restore_atime
 TEST_BACKUP_PLAN = tests/test_backup_plan
 TEST_METADATA_CONTRACT = tests/test_metadata_contract
 TEST_SIDECAR = tests/test_sidecar
@@ -96,6 +97,9 @@ $(TEST_BACKUP_SOURCE_READ): tests/test_backup_source_read.c backup_test.o backup
 
 $(TEST_RESTORE_DISPATCH): tests/test_restore_dispatch.c restore.o fileops.o metadata.o fsprobe.o manifest.o container.o utils.o xdg.o detect.o
 	$(CC) $(CFLAGS) -o $@ tests/test_restore_dispatch.c restore.o fileops.o metadata.o fsprobe.o manifest.o container.o utils.o xdg.o detect.o
+
+$(TEST_RESTORE_ATIME): tests/test_restore_atime.c restore.o fileops.o metadata.o fsprobe.o manifest.o container.o utils.o xdg.o detect.o
+	$(CC) $(CFLAGS) -o $@ tests/test_restore_atime.c restore.o fileops.o metadata.o fsprobe.o manifest.o container.o utils.o xdg.o detect.o
 
 $(TEST_BACKUP_PLAN): tests/test_backup_plan.c backup.o backup_plan.o container.o fileops.o metadata.o fsprobe.o manifest.o packages.o utils.o xdg.o detect.o
 	$(CC) $(CFLAGS) -o $@ tests/test_backup_plan.c backup.o backup_plan.o container.o fileops.o metadata.o fsprobe.o manifest.o packages.o utils.o xdg.o detect.o
@@ -151,7 +155,7 @@ $(TEST_PORTABLE_RESTORE_REPLAY): tests/test_portable_restore_replay.c portable_r
 $(TEST_PORTABLE_RESTORE_ORCHESTRATE): tests/test_portable_restore_orchestrate.c portable_restore_test.o sidecar.o sidecar_state.o manifest.o metadata_test.o utils.o
 	$(CC) $(CFLAGS) -DMETADATA_TEST_HOOKS -o $@ tests/test_portable_restore_orchestrate.c portable_restore_test.o sidecar.o sidecar_state.o manifest.o metadata_test.o utils.o
 
-test: $(TARGET) $(TEST_DETECT) $(TEST_PATHJOIN) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE) $(TEST_MANIFEST) $(TEST_CONTAINER) $(TEST_RESTORE_NATIVE) $(TEST_RESTORE_SOURCE_READ) $(TEST_BACKUP_SOURCE_READ) $(TEST_RESTORE_DISPATCH) $(TEST_BACKUP_PLAN) $(TEST_METADATA_CONTRACT) $(TEST_SIDECAR) $(TEST_SIDECAR_STATE) $(TEST_SIDECAR_SCALE) $(TEST_PORTABLE_CAPTURE) $(TEST_PORTABLE_CAPTURE_SCALE) $(TEST_PORTABLE_RESUME) $(TEST_PORTABLE_RECONCILE) $(TEST_PORTABLE_RECONCILE_SCALE) $(TEST_PORTABLE_RESTORE_PREFLIGHT) $(TEST_PORTABLE_RESTORE_REPLAY) $(TEST_PORTABLE_RESTORE_ORCHESTRATE)
+test: $(TARGET) $(TEST_DETECT) $(TEST_PATHJOIN) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE) $(TEST_MANIFEST) $(TEST_CONTAINER) $(TEST_RESTORE_NATIVE) $(TEST_RESTORE_SOURCE_READ) $(TEST_BACKUP_SOURCE_READ) $(TEST_RESTORE_DISPATCH) $(TEST_RESTORE_ATIME) $(TEST_BACKUP_PLAN) $(TEST_METADATA_CONTRACT) $(TEST_SIDECAR) $(TEST_SIDECAR_STATE) $(TEST_SIDECAR_SCALE) $(TEST_PORTABLE_CAPTURE) $(TEST_PORTABLE_CAPTURE_SCALE) $(TEST_PORTABLE_RESUME) $(TEST_PORTABLE_RECONCILE) $(TEST_PORTABLE_RECONCILE_SCALE) $(TEST_PORTABLE_RESTORE_PREFLIGHT) $(TEST_PORTABLE_RESTORE_REPLAY) $(TEST_PORTABLE_RESTORE_ORCHESTRATE)
 	./$(TEST_DETECT)
 	./$(TEST_PATHJOIN)
 	./$(TEST_SPECIAL_FILES)
@@ -162,6 +166,7 @@ test: $(TARGET) $(TEST_DETECT) $(TEST_PATHJOIN) $(TEST_SPECIAL_FILES) $(TEST_FSP
 	./$(TEST_RESTORE_SOURCE_READ)
 	./$(TEST_BACKUP_SOURCE_READ)
 	./$(TEST_RESTORE_DISPATCH)
+	./$(TEST_RESTORE_ATIME)
 	./$(TEST_METADATA_CONTRACT)
 	./$(TEST_SIDECAR)
 	./$(TEST_SIDECAR_STATE)
@@ -239,6 +244,6 @@ check:
 	$(MAKE) check-analyze
 
 clean:
-	rm -f $(OBJS) backup_test.o fileops_test.o sidecar.o sidecar_test.o sidecar_state.o sidecar_state_test.o portable.o portable_test.o portable_restore_test.o metadata_test.o $(TARGET) $(TEST_DETECT) $(TEST_PATHJOIN) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE) $(TEST_MANIFEST) $(TEST_CONTAINER) $(TEST_RESTORE_NATIVE) $(TEST_RESTORE_SOURCE_READ) $(TEST_BACKUP_SOURCE_READ) $(TEST_RESTORE_DISPATCH) $(TEST_BACKUP_PLAN) $(TEST_METADATA_CONTRACT) $(TEST_SIDECAR) $(TEST_SIDECAR_STATE) $(TEST_SIDECAR_SCALE) $(TEST_PORTABLE_CAPTURE) $(TEST_PORTABLE_CAPTURE_SCALE) $(TEST_PORTABLE_RESUME) $(TEST_PORTABLE_RECONCILE) $(TEST_PORTABLE_RECONCILE_SCALE) $(TEST_PORTABLE_RESTORE_PREFLIGHT) $(TEST_PORTABLE_RESTORE_REPLAY) $(TEST_PORTABLE_RESTORE_ORCHESTRATE)
+	rm -f $(OBJS) backup_test.o fileops_test.o sidecar.o sidecar_test.o sidecar_state.o sidecar_state_test.o portable.o portable_test.o portable_restore_test.o metadata_test.o $(TARGET) $(TEST_DETECT) $(TEST_PATHJOIN) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE) $(TEST_MANIFEST) $(TEST_CONTAINER) $(TEST_RESTORE_NATIVE) $(TEST_RESTORE_SOURCE_READ) $(TEST_BACKUP_SOURCE_READ) $(TEST_RESTORE_DISPATCH) $(TEST_RESTORE_ATIME) $(TEST_BACKUP_PLAN) $(TEST_METADATA_CONTRACT) $(TEST_SIDECAR) $(TEST_SIDECAR_STATE) $(TEST_SIDECAR_SCALE) $(TEST_PORTABLE_CAPTURE) $(TEST_PORTABLE_CAPTURE_SCALE) $(TEST_PORTABLE_RESUME) $(TEST_PORTABLE_RECONCILE) $(TEST_PORTABLE_RECONCILE_SCALE) $(TEST_PORTABLE_RESTORE_PREFLIGHT) $(TEST_PORTABLE_RESTORE_REPLAY) $(TEST_PORTABLE_RESTORE_ORCHESTRATE)
 
 .PHONY: clean test check-strict check-sanitize check-valgrind check-analyze check
