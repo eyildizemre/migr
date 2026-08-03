@@ -37,4 +37,12 @@ typedef enum {
  */
 int backup(const char *target, BackupMode mode, char **paths);
 
+#ifdef BACKUP_TEST_HOOKS
+typedef void (*BackupTestInventoryHook)(const char *source_path,
+                                        void *context);
+
+void backup_test_set_inventory_hook(BackupTestInventoryHook hook,
+                                    void *context);
+#endif
+
 #endif

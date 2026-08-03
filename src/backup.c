@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
+#include <stdint.h>
 #include <unistd.h>
 
 #include "backup.h"
@@ -21,6 +22,24 @@
 #include "metadata.h"
 #include "packages.h"
 #include "utils.h"
+
+#ifdef BACKUP_TEST_HOOKS
+static BackupTestInventoryHook backup_test_inventory_hook;
+static void *backup_test_inventory_context;
+
+void backup_test_set_inventory_hook(BackupTestInventoryHook hook,
+                                    void *context)
+{
+    backup_test_inventory_hook = hook;
+    backup_test_inventory_context = context;
+}
+
+static void backup_test_before_source_open(const char *source_path)
+{
+    if (backup_test_inventory_hook != NULL)
+        backup_test_inventory_hook(source_path, backup_test_inventory_context);
+}
+#endif
 
 // Validate and, if needed, create the top-level backup destination.
 // Sets *created only when THIS call made the directory, so a later refusal can
@@ -317,10 +336,64 @@ static int metadata_existing_at(int root_fd, const char *rel,
     }
 }
 
+typedef struct {
+    size_t refusal_count;
+    size_t uninspected_subtree_count;
+    size_t example_count;
+    char examples[METADATA_MAX_PREFLIGHT_EXAMPLES][PATH_MAX];
+} SourceReadRefusals;
+
+static void source_read_refusals_init(SourceReadRefusals *refusals)
+{
+    if (refusals != NULL)
+        memset(refusals, 0, sizeof(*refusals));
+}
+
+static void source_read_refusal_record(SourceReadRefusals *refusals,
+                                       const char *source_path,
+                                       int uninspected_subtree)
+{
+    if (refusals == NULL)
+        return;
+    if (refusals->refusal_count != SIZE_MAX)
+        refusals->refusal_count++;
+    if (uninspected_subtree &&
+        refusals->uninspected_subtree_count != SIZE_MAX)
+        refusals->uninspected_subtree_count++;
+    if (source_path == NULL ||
+        refusals->example_count >= METADATA_MAX_PREFLIGHT_EXAMPLES)
+        return;
+
+    int n = snprintf(refusals->examples[refusals->example_count],
+                     sizeof(refusals->examples[0]), "%s", source_path);
+    if (n >= 0 && (size_t)n < sizeof(refusals->examples[0]))
+        refusals->example_count++;
+}
+
+static void source_read_refusals_report(const SourceReadRefusals *refusals)
+{
+    if (refusals == NULL || refusals->refusal_count == 0)
+        return;
+
+    printf("Error: could not safely read %zu source object(s): the kernel "
+           "refused the O_NOATIME open (ownership or CAP_FOWNER is "
+           "required); no O_NOATIME-less retry was attempted.\n",
+           refusals->refusal_count);
+    for (size_t i = 0; i < refusals->example_count; i++)
+        printf("  source-read example: %s\n", refusals->examples[i]);
+    if (refusals->refusal_count > refusals->example_count)
+        printf("  ... additional source-read refusals omitted\n");
+    if (refusals->uninspected_subtree_count > 0)
+        printf("  %zu source subtree(s) could not be inspected; their contents "
+               "are unknown, not zero.\n",
+               refusals->uninspected_subtree_count);
+}
+
 static int backup_metadata_inventory(const char *source_path, int anchor_fd,
                                      int destination_root_fd,
                                      const char *destination_rel,
-                                     MetadataProfiles *profiles)
+                                     MetadataProfiles *profiles,
+                                     SourceReadRefusals *refusals)
 {
     struct stat source_st;
     if (lstat(source_path, &source_st) != 0)
@@ -347,10 +420,20 @@ static int backup_metadata_inventory(const char *source_path, int anchor_fd,
 
     if (S_ISREG(source_st.st_mode))
     {
+#ifdef BACKUP_TEST_HOOKS
+        backup_test_before_source_open(source_path);
+#endif
         int fd = open(source_path, O_RDONLY | O_NOFOLLOW | O_NOATIME |
                                       O_CLOEXEC);
         if (fd < 0)
+        {
+            if (errno == EPERM)
+            {
+                source_read_refusal_record(refusals, source_path, 0);
+                return 0;
+            }
             return -1;
+        }
         struct stat opened;
         int failed = fstat(fd, &opened) != 0 ||
                      !metadata_source_unchanged(&source_st, &opened);
@@ -362,10 +445,20 @@ static int backup_metadata_inventory(const char *source_path, int anchor_fd,
     if (!S_ISDIR(source_st.st_mode))
         return 0;
 
+#ifdef BACKUP_TEST_HOOKS
+    backup_test_before_source_open(source_path);
+#endif
     int source_fd = open(source_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
                                       O_NOATIME | O_CLOEXEC);
     if (source_fd < 0)
+    {
+        if (errno == EPERM)
+        {
+            source_read_refusal_record(refusals, source_path, 1);
+            return 0;
+        }
         return -1;
+    }
     struct stat opened;
     if (fstat(source_fd, &opened) != 0 ||
         !metadata_source_unchanged(&source_st, &opened))
@@ -406,7 +499,7 @@ static int backup_metadata_inventory(const char *source_path, int anchor_fd,
                       destination_rel, entry->d_name) != 0 ||
             backup_metadata_inventory(child_source, anchor_fd,
                                       destination_root_fd, child_destination,
-                                      profiles) != 0)
+                                      profiles, refusals) != 0)
         {
             failed = 1;
             break;
@@ -424,7 +517,8 @@ static int backup_metadata_inventory(const char *source_path, int anchor_fd,
 
 static int backup_metadata_preflight(const BackupPlan *plan, int anchor_fd,
                                      int destination_root_fd,
-                                     MetadataProfiles *profiles)
+                                     MetadataProfiles *profiles,
+                                     SourceReadRefusals *refusals)
 {
     for (int i = 0; i < plan->root_count; i++)
     {
@@ -432,7 +526,7 @@ static int backup_metadata_preflight(const BackupPlan *plan, int anchor_fd,
         if (backup_metadata_inventory(root->capture_path, anchor_fd,
                                       destination_root_fd,
                                       root->manifest_root.payload_path,
-                                      profiles) != 0)
+                                      profiles, refusals) != 0)
             return -1;
     }
     return 0;
@@ -490,11 +584,26 @@ int backup(const char *target, BackupMode mode, char **paths)
 
         MetadataProfiles advisory_profiles;
         metadata_profiles_init(&advisory_profiles);
+        SourceReadRefusals advisory_refusals;
+        source_read_refusals_init(&advisory_refusals);
         int advisory_fd = open(target, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
         if (advisory_fd >= 0)
         {
-            if (backup_metadata_preflight(&plan, advisory_fd, -1,
-                                          &advisory_profiles) != 0)
+            int advisory_failed = backup_metadata_preflight(
+                &plan, advisory_fd, -1, &advisory_profiles,
+                &advisory_refusals) != 0;
+            if (advisory_refusals.refusal_count > 0)
+            {
+                source_read_refusals_report(&advisory_refusals);
+                printf("Error: native metadata preflight refused the source; "
+                       "no container was created\n");
+                close(advisory_fd);
+                metadata_profiles_free(&advisory_profiles);
+                manifest_free(&manifest);
+                backup_plan_free(&plan);
+                return 1;
+            }
+            if (advisory_failed)
                 printf("Warning: could not complete the read-only metadata preview; "
                        "the live backup will recheck it before writing.\n");
             else
@@ -573,6 +682,8 @@ int backup(const char *target, BackupMode mode, char **paths)
 
     MetadataProfiles metadata_profiles;
     metadata_profiles_init(&metadata_profiles);
+    SourceReadRefusals source_read_refusals;
+    source_read_refusals_init(&source_read_refusals);
     BackupContainer container = {0};
     int adopted = 0;
     ContainerStatus adopt_status = container_adopt(target, &manifest, &container);
@@ -586,8 +697,10 @@ int backup(const char *target, BackupMode mode, char **paths)
         if (!metadata_failed)
             metadata_failed = backup_metadata_preflight(
                 &plan, adopted_data_fd, adopted_data_fd,
-                &metadata_profiles) != 0;
-        if (!metadata_failed)
+                &metadata_profiles, &source_read_refusals) != 0;
+        if (source_read_refusals.refusal_count > 0)
+            metadata_failed = 1;
+        if (!metadata_failed && source_read_refusals.refusal_count == 0)
         {
             metadata_profiles_report(&metadata_profiles);
             metadata_failed = metadata_profiles_probe(
@@ -598,7 +711,14 @@ int backup(const char *target, BackupMode mode, char **paths)
         {
             if (adopted_data_fd >= 0)
                 close(adopted_data_fd);
-            printf("Error: native metadata preflight failed; no payload was changed\n");
+            if (source_read_refusals.refusal_count > 0)
+            {
+                source_read_refusals_report(&source_read_refusals);
+                printf("Error: native metadata preflight refused the source; "
+                       "no payload was changed\n");
+            }
+            else
+                printf("Error: native metadata preflight failed; no payload was changed\n");
             container_close(&container);
             metadata_profiles_free(&metadata_profiles);
             close(target_fd);
@@ -612,8 +732,11 @@ int backup(const char *target, BackupMode mode, char **paths)
     else if (adopt_status == CONTAINER_ERR_NO_MATCH)
     {
         int metadata_failed = backup_metadata_preflight(
-            &plan, target_fd, -1, &metadata_profiles) != 0;
-        if (!metadata_failed)
+            &plan, target_fd, -1, &metadata_profiles,
+            &source_read_refusals) != 0;
+        if (source_read_refusals.refusal_count > 0)
+            metadata_failed = 1;
+        if (!metadata_failed && source_read_refusals.refusal_count == 0)
         {
             metadata_profiles_report(&metadata_profiles);
             metadata_failed = metadata_profiles_probe(
@@ -622,7 +745,14 @@ int backup(const char *target, BackupMode mode, char **paths)
         }
         if (metadata_failed)
         {
-            printf("Error: native metadata preflight failed; no container was created\n");
+            if (source_read_refusals.refusal_count > 0)
+            {
+                source_read_refusals_report(&source_read_refusals);
+                printf("Error: native metadata preflight refused the source; "
+                       "no container was created\n");
+            }
+            else
+                printf("Error: native metadata preflight failed; no container was created\n");
             metadata_profiles_free(&metadata_profiles);
             close(target_fd);
             if (target_created) rmdir(target);
