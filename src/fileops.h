@@ -1,6 +1,8 @@
 #ifndef FILEOPS_H
 #define FILEOPS_H
 
+#include <limits.h>
+#include <stddef.h>
 #include <sys/types.h>
 
 /**
@@ -70,6 +72,20 @@ typedef enum {
     RESTORE_SOURCE_PRESENT = 1
 } RestoreSourceStatus;
 
+typedef enum {
+    RESTORE_NATIVE_ERROR = -1,
+    RESTORE_NATIVE_OK = 0,
+    RESTORE_NATIVE_SOURCE_SAFE_READ = -2
+} RestoreNativeStatus;
+
+typedef struct {
+    size_t applied_count;
+    size_t failed_count;
+    char failed_logical_path[PATH_MAX];
+} RestoreNativeReport;
+
+void restore_native_report_init(RestoreNativeReport *report);
+
 /**
  * @brief Checks whether a source object exists without following symlinks.
  *
@@ -87,25 +103,27 @@ RestoreSourceStatus restore_native_source_status_at(int source_root_fd,
  * Uses the same recursive walker and safety rules as restore_native_at(). It
  * checks lexical paths, source traversal, destination traversal and existing
  * destination object types, but does not promise that later writes cannot fail
- * for operational reasons such as permissions or free space.
+ * for operational reasons such as permissions or free space. A source regular
+ * file or directory that cannot be opened with O_NOATIME returns
+ * RESTORE_NATIVE_SOURCE_SAFE_READ; no O_NOATIME-less read is attempted.
  */
-int restore_native_preflight_at(const CloneContext *ctx,
-                                int source_root_fd, const char *source_rel,
-                                int destination_root_fd, const char *destination_rel);
+RestoreNativeStatus restore_native_preflight_at(
+    const CloneContext *ctx, int source_root_fd, const char *source_rel,
+    int destination_root_fd, const char *destination_rel);
 
 /**
  * @brief Collects native-restore metadata profiles without probing or mutating.
  *
  * This is the read-only half of the restore ownership preflight. It is useful
  * to aggregate all roots before confirmation, so a single later probe can
- * reject the invocation before any destination payload is changed.
+ * reject the invocation before any destination payload is changed. It returns
+ * RESTORE_NATIVE_SOURCE_SAFE_READ when source inspection would require an
+ * atime-changing fallback.
  */
-int restore_native_metadata_inventory_at(const CloneContext *ctx,
-                                          int source_root_fd,
-                                          const char *source_rel,
-                                          int destination_root_fd,
-                                          const char *destination_rel,
-                                          MetadataProfiles *profiles);
+RestoreNativeStatus restore_native_metadata_inventory_at(
+    const CloneContext *ctx, int source_root_fd, const char *source_rel,
+    int destination_root_fd, const char *destination_rel,
+    MetadataProfiles *profiles);
 
 /**
  * @brief FD-anchored native restore core (docs/DECISIONS.md D15 and D16).
@@ -146,12 +164,33 @@ int restore_native_metadata_inventory_at(const CloneContext *ctx,
  * @param source_rel          Relative address of the source object, or "".
  * @param destination_root_fd Open directory fd anchoring destination_rel.
  * @param destination_rel     Relative address of the destination object, or "".
- * @return 0 on success, -1 on error, a rejected context, or a lexically
- *         invalid or unsafe relative address.
+ * @param report            Optional per-call replay result; it is reset before
+ *                          use and records applied/failed entries.
+ * @return RESTORE_NATIVE_OK on success, RESTORE_NATIVE_ERROR on an ordinary
+ *         failure, or RESTORE_NATIVE_SOURCE_SAFE_READ when a source open that
+ *         requires O_NOATIME is refused. No O_NOATIME-less retry is attempted.
  */
-int restore_native_at(const CloneContext *ctx,
-                       int source_root_fd, const char *source_rel,
-                       int destination_root_fd, const char *destination_rel);
+RestoreNativeStatus restore_native_at_report(
+    const CloneContext *ctx, int source_root_fd, const char *source_rel,
+    int destination_root_fd, const char *destination_rel,
+    RestoreNativeReport *report);
+
+RestoreNativeStatus restore_native_at(
+    const CloneContext *ctx, int source_root_fd, const char *source_rel,
+    int destination_root_fd, const char *destination_rel);
+
+#ifdef FILEOPS_TEST_HOOKS
+typedef enum {
+    RESTORE_TEST_SOURCE_READ_NONE = 0,
+    RESTORE_TEST_SOURCE_READ_VALIDATE = 1,
+    RESTORE_TEST_SOURCE_READ_APPLY = 2
+} RestoreNativeTestSourceReadMode;
+
+void restore_native_test_set_source_read_mode(
+    RestoreNativeTestSourceReadMode mode);
+
+void restore_native_test_fail_source_read_after(size_t successful_opens);
+#endif
 
 /**
  * @brief Accumulates the total byte size of a file tree into *size.

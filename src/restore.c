@@ -206,6 +206,23 @@ static int restore_timestamp_anchor_policy(const RestoreTimestampAnchors *anchor
     return -1;
 }
 
+// Reports the kernel's strict source-read refusal without suggesting an
+// atime-changing fallback; a live replay also includes its partial counts.
+static void report_source_safe_read_refusal(const char *label,
+                                            const RestoreNativeReport *report)
+{
+    printf("Error: Could not safely read source for %s: the kernel refused "
+           "the O_NOATIME open; an O_NOATIME-less retry was not attempted "
+           "because it could change atime (ownership or CAP_FOWNER is "
+           "required).\n", label);
+    if (report != NULL && report->failed_count != 0)
+        printf("Error: Native restore stopped at %s: %zu item(s) applied, "
+               "%zu failed.\n",
+               report->failed_logical_path[0] != '\0'
+                   ? report->failed_logical_path : label,
+               report->applied_count, report->failed_count);
+}
+
 // Restores one item whose source and destination relative addresses may
 // differ (e.g. a v1 root's "data/<payload>" source vs. its own restore
 // address), sharing the exact same status/preflight/apply behavior for
@@ -259,10 +276,14 @@ static int restore_item_at(const CloneContext *ctx,
 
     if (dry_run)
     {
-        if (restore_native_preflight_at(run_ctx, source_root_fd, source_rel,
-                                        dest_root_fd, dest_rel) != 0)
+        RestoreNativeStatus native_status = restore_native_preflight_at(
+            run_ctx, source_root_fd, source_rel, dest_root_fd, dest_rel);
+        if (native_status != RESTORE_NATIVE_OK)
         {
-            printf("Error: Failed to restore %s\n", label);
+            if (native_status == RESTORE_NATIVE_SOURCE_SAFE_READ)
+                report_source_safe_read_refusal(label, NULL);
+            else
+                printf("Error: Failed to restore %s\n", label);
             return -1;
         }
         return 1;
@@ -271,10 +292,15 @@ static int restore_item_at(const CloneContext *ctx,
     if (verbose)
         printf("  Restoring: %s\n", label);
 
-    if (restore_native_at(run_ctx, source_root_fd, source_rel, dest_root_fd,
-                          dest_rel) != 0)
+    RestoreNativeReport report;
+    RestoreNativeStatus native_status = restore_native_at_report(
+        run_ctx, source_root_fd, source_rel, dest_root_fd, dest_rel, &report);
+    if (native_status != RESTORE_NATIVE_OK)
     {
-        printf("Error: Failed to restore %s\n", label);
+        if (native_status == RESTORE_NATIVE_SOURCE_SAFE_READ)
+            report_source_safe_read_refusal(label, &report);
+        else
+            printf("Error: Failed to restore %s\n", label);
         return -1;
     }
     return 1;
@@ -515,13 +541,11 @@ static int validate_v1_payloads(int source_root_fd, const Manifest *m)
     return failed ? -1 : 0;
 }
 
-static int restore_metadata_item(const CloneContext *ctx,
-                                 int source_root_fd, const char *source_rel,
-                                 int destination_root_fd,
-                                 const char *destination_rel,
-                                 const char *label, int required,
-                                 MetadataProfiles *profiles,
-                                 RestoreTimestampAnchors *timestamp_anchors)
+static RestoreNativeStatus restore_metadata_item(
+    const CloneContext *ctx, int source_root_fd, const char *source_rel,
+    int destination_root_fd, const char *destination_rel, const char *label,
+    int required, MetadataProfiles *profiles,
+    RestoreTimestampAnchors *timestamp_anchors)
 {
     RestoreSourceStatus status =
         restore_native_source_status_at(source_root_fd, source_rel);
@@ -530,19 +554,19 @@ static int restore_metadata_item(const CloneContext *ctx,
         if (required)
             printf("Error: Manifest root %s is missing its declared payload\n",
                    label);
-        return required ? -1 : 0;
+        return required ? RESTORE_NATIVE_ERROR : RESTORE_NATIVE_OK;
     }
     if (status == RESTORE_SOURCE_ERROR)
     {
         printf("Error: Failed to inspect %s\n", label);
-        return -1;
+        return RESTORE_NATIVE_ERROR;
     }
     int metadata_anchor_fd = restore_destination_anchor_fd(destination_root_fd,
                                                            destination_rel);
     if (metadata_anchor_fd < 0)
     {
         printf("Error: Failed to inspect restore destination for %s\n", label);
-        return -1;
+        return RESTORE_NATIVE_ERROR;
     }
     int anchor_failed = restore_timestamp_anchor_add(timestamp_anchors,
                                                       metadata_anchor_fd) != 0;
@@ -551,24 +575,17 @@ static int restore_metadata_item(const CloneContext *ctx,
     if (anchor_failed)
     {
         printf("Error: Failed to inspect restore destination for %s\n", label);
-        return -1;
+        return RESTORE_NATIVE_ERROR;
     }
-    if (restore_native_metadata_inventory_at(ctx, source_root_fd, source_rel,
-                                             destination_root_fd,
-                                             destination_rel, profiles) != 0)
-    {
-        printf("Error: Failed to inventory metadata for %s\n", label);
-        return -1;
-    }
-    return 0;
+    return restore_native_metadata_inventory_at(ctx, source_root_fd, source_rel,
+                                                destination_root_fd,
+                                                destination_rel, profiles);
 }
 
-static int restore_legacy_metadata_inventory(const char *source,
-                                             int source_root_fd,
-                                             const char *home, int home_fd,
-                                             const CloneContext *ctx,
-                                             MetadataProfiles *profiles,
-                                             RestoreTimestampAnchors *timestamp_anchors)
+static RestoreNativeStatus restore_legacy_metadata_inventory(
+    const char *source, int source_root_fd, const char *home, int home_fd,
+    const CloneContext *ctx, MetadataProfiles *profiles,
+    RestoreTimestampAnchors *timestamp_anchors)
 {
     char *xdg_dirs[XDG_RESTORE_COUNT] = {0};
     if (xdg_resolve(home, xdg_keys, xdg_fallbacks, xdg_dirs,
@@ -582,6 +599,7 @@ static int restore_legacy_metadata_inventory(const char *source,
     char *manifest_names[XDG_RESTORE_COUNT] = {0};
     (void)legacy_manifest_read(source, manifest_names, XDG_RESTORE_COUNT);
     int failed = 0;
+    RestoreNativeStatus result = RESTORE_NATIVE_OK;
     for (int i = 0; i < XDG_RESTORE_COUNT; i++)
     {
         const char *name = manifest_names[i];
@@ -616,10 +634,15 @@ static int restore_legacy_metadata_inventory(const char *source,
             failed = 1;
             continue;
         }
-        if (restore_metadata_item(ctx, source_root_fd, name, destination_fd,
-                                  destination_rel, name, 0, profiles,
-                                  timestamp_anchors) != 0)
+        RestoreNativeStatus item_status = restore_metadata_item(
+            ctx, source_root_fd, name, destination_fd, destination_rel, name,
+            0, profiles, timestamp_anchors);
+        if (item_status != RESTORE_NATIVE_OK)
+        {
             failed = 1;
+            if (item_status == RESTORE_NATIVE_SOURCE_SAFE_READ)
+                result = RESTORE_NATIVE_SOURCE_SAFE_READ;
+        }
         if (close(destination_fd) != 0)
             failed = 1;
     }
@@ -631,26 +654,34 @@ static int restore_legacy_metadata_inventory(const char *source,
         ".config/microsoft-edge", ".config/opera", NULL
     };
     for (int i = 0; home_items[i] != NULL; i++)
-        if (restore_metadata_item(ctx, source_root_fd, home_items[i], home_fd,
-                                  home_items[i], home_items[i], 0,
-                                  profiles, timestamp_anchors) != 0)
+    {
+        RestoreNativeStatus item_status = restore_metadata_item(
+            ctx, source_root_fd, home_items[i], home_fd, home_items[i],
+            home_items[i], 0, profiles, timestamp_anchors);
+        if (item_status != RESTORE_NATIVE_OK)
+        {
             failed = 1;
+            if (item_status == RESTORE_NATIVE_SOURCE_SAFE_READ)
+                result = RESTORE_NATIVE_SOURCE_SAFE_READ;
+        }
+    }
 
     for (int i = 0; i < XDG_RESTORE_COUNT; i++)
         free(manifest_names[i]);
     free_xdg_dirs(xdg_dirs);
-    return failed ? -1 : 0;
+    return result != RESTORE_NATIVE_OK
+        ? result : (failed ? RESTORE_NATIVE_ERROR : RESTORE_NATIVE_OK);
 }
 
-static int restore_v1_metadata_inventory(int source_root_fd, const char *home,
-                                         int home_fd, const Manifest *m,
-                                         const CloneContext *ctx,
-                                         MetadataProfiles *profiles,
-                                         RestoreTimestampAnchors *timestamp_anchors)
+static RestoreNativeStatus restore_v1_metadata_inventory(
+    int source_root_fd, const char *home, int home_fd, const Manifest *m,
+    const CloneContext *ctx, MetadataProfiles *profiles,
+    RestoreTimestampAnchors *timestamp_anchors)
 {
     char *xdg_dirs[XDG_RESTORE_COUNT] = {0};
     int xdg_ready = 0;
     int failed = 0;
+    RestoreNativeStatus result = RESTORE_NATIVE_OK;
 
     for (int i = 0; i < m->root_count; i++)
     {
@@ -706,17 +737,23 @@ static int restore_v1_metadata_inventory(int source_root_fd, const char *home,
             close_destination = 1;
         }
 
-        if (restore_metadata_item(ctx, source_root_fd, source_rel,
-                                  destination_fd, destination_rel, root->id,
-                                  1, profiles, timestamp_anchors) != 0)
+        RestoreNativeStatus item_status = restore_metadata_item(
+            ctx, source_root_fd, source_rel, destination_fd, destination_rel,
+            root->id, 1, profiles, timestamp_anchors);
+        if (item_status != RESTORE_NATIVE_OK)
+        {
             failed = 1;
+            if (item_status == RESTORE_NATIVE_SOURCE_SAFE_READ)
+                result = RESTORE_NATIVE_SOURCE_SAFE_READ;
+        }
         if (close_destination && close(destination_fd) != 0)
             failed = 1;
     }
 
     if (xdg_ready)
         free_xdg_dirs(xdg_dirs);
-    return failed ? -1 : 0;
+    return result != RESTORE_NATIVE_OK
+        ? result : (failed ? RESTORE_NATIVE_ERROR : RESTORE_NATIVE_OK);
 }
 
 // Restores a valid native v1 manifest's root table (docs/DECISIONS.md D15,
@@ -1221,7 +1258,7 @@ int restore(const char *source)
     metadata_profiles_init(&metadata_profiles);
     RestoreTimestampAnchors timestamp_anchors;
     restore_timestamp_anchors_init(&timestamp_anchors);
-    int metadata_inventory_failed;
+    RestoreNativeStatus metadata_inventory_failed;
     if (mst == MANIFEST_STATUS_VALID)
         metadata_inventory_failed = restore_v1_metadata_inventory(
             source_root_fd, home, home_fd, &m, &ctx, &metadata_profiles,
@@ -1232,7 +1269,10 @@ int restore(const char *source)
             &timestamp_anchors);
     if (metadata_inventory_failed != 0)
     {
-        printf("Error: native metadata preflight failed; no destination was changed\n");
+        if (metadata_inventory_failed == RESTORE_NATIVE_SOURCE_SAFE_READ)
+            report_source_safe_read_refusal("native restore payload", NULL);
+        else
+            printf("Error: native metadata preflight failed; no destination was changed\n");
         metadata_profiles_free(&metadata_profiles);
         restore_timestamp_anchors_free(&timestamp_anchors);
         if (mst == MANIFEST_STATUS_VALID)

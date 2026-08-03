@@ -7,6 +7,7 @@ tests/test_fsprobe
 tests/test_manifest
 tests/test_container
 tests/test_restore_native
+tests/test_restore_source_read
 tests/test_restore_dispatch
 tests/test_backup_plan
 tests/test_metadata_contract

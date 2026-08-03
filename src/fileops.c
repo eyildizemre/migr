@@ -11,6 +11,7 @@
 #include <time.h>
 #include <limits.h> // to use PATH_MAX
 #include <errno.h>
+#include <stdint.h>
 
 #include "fileops.h" // CloneContext
 #include "metadata.h"
@@ -401,6 +402,68 @@ typedef enum {
     RESTORE_APPLY
 } RestorePass;
 
+typedef enum {
+    SOURCE_OPEN_ERROR = -1,
+    SOURCE_OPEN_OK = 0,
+    SOURCE_OPEN_SAFE_READ = -2
+} SourceOpenStatus;
+
+#ifdef FILEOPS_TEST_HOOKS
+static RestoreNativeTestSourceReadMode source_read_test_mode;
+static size_t source_read_test_apply_successes;
+static size_t source_read_test_apply_failure_after = SIZE_MAX;
+
+void restore_native_test_set_source_read_mode(
+    RestoreNativeTestSourceReadMode mode)
+{
+    source_read_test_mode = mode;
+    source_read_test_apply_successes = 0;
+    source_read_test_apply_failure_after =
+        mode == RESTORE_TEST_SOURCE_READ_APPLY ? 0 : SIZE_MAX;
+}
+
+void restore_native_test_fail_source_read_after(size_t successful_opens)
+{
+    source_read_test_mode = RESTORE_TEST_SOURCE_READ_APPLY;
+    source_read_test_apply_successes = 0;
+    source_read_test_apply_failure_after = successful_opens;
+}
+
+static int source_read_test_refused(RestorePass pass)
+{
+    if (pass == RESTORE_VALIDATE &&
+        source_read_test_mode == RESTORE_TEST_SOURCE_READ_VALIDATE)
+        return 1;
+    if (pass != RESTORE_APPLY ||
+        source_read_test_mode != RESTORE_TEST_SOURCE_READ_APPLY)
+        return 0;
+    if (source_read_test_apply_successes >=
+        source_read_test_apply_failure_after)
+        return 1;
+    source_read_test_apply_successes++;
+    return 0;
+}
+#endif
+
+static void restore_report_failure(RestoreNativeReport *report,
+                                   const char *logical_path)
+{
+    if (report == NULL)
+        return;
+    if (report->failed_count != SIZE_MAX)
+        report->failed_count++;
+    if (report->failed_count != 1 || logical_path == NULL)
+        return;
+    (void)snprintf(report->failed_logical_path,
+                   sizeof(report->failed_logical_path), "%s", logical_path);
+}
+
+static void restore_report_applied(RestoreNativeReport *report)
+{
+    if (report != NULL && report->applied_count != SIZE_MAX)
+        report->applied_count++;
+}
+
 // Validates a relative address before any traversal is attempted: a leading
 // '/', any ".." component, a bare ".", or an empty interior/trailing
 // component (e.g. "a//b" or "a/") are all refused outright -- never
@@ -647,20 +710,31 @@ static int destination_status(int dest_parent_fd, const char *dest_leaf,
     return -1;
 }
 
-static int open_source_regular(int source_parent_fd, const char *source_leaf,
-                               const struct stat *object_st, struct stat *opened_st)
+static SourceOpenStatus open_source_regular(
+    RestorePass pass, int source_parent_fd, const char *source_leaf,
+    const struct stat *object_st, struct stat *opened_st, int *out_fd)
 {
+    *out_fd = -1;
+    (void)pass;
+#ifdef FILEOPS_TEST_HOOKS
+    if (source_read_test_refused(pass))
+    {
+        errno = EPERM;
+        return SOURCE_OPEN_SAFE_READ;
+    }
+#endif
     int fd = openat(source_parent_fd, source_leaf,
                     O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_NOATIME | O_CLOEXEC);
     if (fd < 0)
-        return -1;
+        return errno == EPERM ? SOURCE_OPEN_SAFE_READ : SOURCE_OPEN_ERROR;
     if (fstat(fd, opened_st) != 0 || !S_ISREG(opened_st->st_mode) ||
         !same_object(object_st, opened_st))
     {
         close(fd);
-        return -1;
+        return SOURCE_OPEN_ERROR;
     }
-    return fd;
+    *out_fd = fd;
+    return SOURCE_OPEN_OK;
 }
 
 static int open_destination_regular(int dest_parent_fd, const char *dest_leaf,
@@ -701,21 +775,31 @@ static int open_destination_regular(int dest_parent_fd, const char *dest_leaf,
     return -1;
 }
 
-static int open_source_directory(int source_object_fd,
-                                 const struct stat *object_st,
-                                 struct stat *opened_st)
+static SourceOpenStatus open_source_directory(
+    RestorePass pass, int source_object_fd, const struct stat *object_st,
+    struct stat *opened_st, int *out_fd)
 {
+    *out_fd = -1;
+    (void)pass;
+#ifdef FILEOPS_TEST_HOOKS
+    if (source_read_test_refused(pass))
+    {
+        errno = EPERM;
+        return SOURCE_OPEN_SAFE_READ;
+    }
+#endif
     int fd = openat(source_object_fd, ".",
                     O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NOATIME | O_CLOEXEC);
     if (fd < 0)
-        return -1;
+        return errno == EPERM ? SOURCE_OPEN_SAFE_READ : SOURCE_OPEN_ERROR;
     if (fstat(fd, opened_st) != 0 || !S_ISDIR(opened_st->st_mode) ||
         !same_object(object_st, opened_st))
     {
         close(fd);
-        return -1;
+        return SOURCE_OPEN_ERROR;
     }
-    return fd;
+    *out_fd = fd;
+    return SOURCE_OPEN_OK;
 }
 
 static int open_destination_directory(RestorePass pass,
@@ -791,13 +875,12 @@ static void metadata_child_path(const char *parent, const char *leaf,
 // The same recursive dispatcher serves mutation-free validation and the
 // actual restore. A negative destination parent means the corresponding
 // destination subtree does not exist during validation.
-static int restore_entry_at(const CloneContext *ctx, RestorePass pass,
-                            int source_parent_fd, const char *source_leaf,
-                            int dest_parent_fd, const char *dest_leaf,
-                            const char *logical_path,
-                            MetadataSnapshots *snapshots,
-                            MetadataProfiles *profiles,
-                            int metadata_anchor_fd)
+static RestoreNativeStatus restore_entry_at(
+    const CloneContext *ctx, RestorePass pass, int source_parent_fd,
+    const char *source_leaf, int dest_parent_fd, const char *dest_leaf,
+    const char *logical_path, MetadataSnapshots *snapshots,
+    MetadataProfiles *profiles, int metadata_anchor_fd,
+    RestoreNativeReport *restore_report)
 {
     int source_is_root = source_leaf[0] == '\0';
     int dest_is_root = dest_leaf[0] == '\0';
@@ -889,15 +972,21 @@ static int restore_entry_at(const CloneContext *ctx, RestorePass pass,
         }
         close(source_object_fd);
         if (pass == RESTORE_VALIDATE)
-            return 0;
+            return RESTORE_NATIVE_OK;
 
         target[len] = '\0';
         if (symlinkat(target, dest_parent_fd, dest_leaf) != 0)
         {
             return -1;
         }
-        return metadata_apply_symlink_at(dest_parent_fd, dest_leaf, &desired_st,
-                                         metadata_policy_from_context(ctx));
+        int failed = metadata_apply_symlink_at(dest_parent_fd, dest_leaf,
+                                               &desired_st,
+                                               metadata_policy_from_context(ctx)) != 0;
+        if (!failed)
+            restore_report_applied(restore_report);
+        else
+            restore_report_failure(restore_report, logical_path);
+        return failed ? RESTORE_NATIVE_ERROR : RESTORE_NATIVE_OK;
     }
 
     if (S_ISREG(source_st.st_mode))
@@ -910,19 +999,26 @@ static int restore_entry_at(const CloneContext *ctx, RestorePass pass,
         }
 
         struct stat opened_source_st;
-        int src_fd = open_source_regular(source_parent_fd, source_leaf,
-                                         &source_st, &opened_source_st);
+        int src_fd;
+        SourceOpenStatus source_status = open_source_regular(
+            pass, source_parent_fd, source_leaf, &source_st, &opened_source_st,
+            &src_fd);
         close(source_object_fd);
-        if (src_fd < 0 || !metadata_source_unchanged(&desired_st,
-                                                      &opened_source_st))
+        if (source_status == SOURCE_OPEN_SAFE_READ)
+        {
+            restore_report_failure(restore_report, logical_path);
+            return RESTORE_NATIVE_SOURCE_SAFE_READ;
+        }
+        if (source_status != SOURCE_OPEN_OK ||
+            !metadata_source_unchanged(&desired_st, &opened_source_st))
         {
             if (src_fd >= 0)
                 close(src_fd);
-            return -1;
+            return RESTORE_NATIVE_ERROR;
         }
         if (pass == RESTORE_VALIDATE)
         {
-            return close(src_fd) == 0 ? 0 : -1;
+            return close(src_fd) == 0 ? RESTORE_NATIVE_OK : RESTORE_NATIVE_ERROR;
         }
 
         struct stat opened_dest_st;
@@ -952,7 +1048,11 @@ static int restore_entry_at(const CloneContext *ctx, RestorePass pass,
                 failed = 1;
             if (close(dst_fd) != 0)
                 failed = 1;
-            return failed ? -1 : 0;
+            if (!failed && pass == RESTORE_APPLY)
+                restore_report_applied(restore_report);
+            else if (failed && pass == RESTORE_APPLY)
+                restore_report_failure(restore_report, logical_path);
+            return failed ? RESTORE_NATIVE_ERROR : RESTORE_NATIVE_OK;
         }
         if (ftruncate(dst_fd, 0) != 0)
         {
@@ -1003,7 +1103,11 @@ static int restore_entry_at(const CloneContext *ctx, RestorePass pass,
             failed = 1;
         if (close(dst_fd) != 0)
             failed = 1;
-        return failed ? -1 : 0;
+        if (!failed && pass == RESTORE_APPLY)
+            restore_report_applied(restore_report);
+        else if (failed && pass == RESTORE_APPLY)
+            restore_report_failure(restore_report, logical_path);
+        return failed ? RESTORE_NATIVE_ERROR : RESTORE_NATIVE_OK;
     }
 
     if (S_ISDIR(source_st.st_mode))
@@ -1015,15 +1119,22 @@ static int restore_entry_at(const CloneContext *ctx, RestorePass pass,
         }
 
         struct stat opened_source_st;
-        int source_dir_fd = open_source_directory(source_object_fd, &source_st,
-                                                  &opened_source_st);
+        int source_dir_fd;
+        SourceOpenStatus source_status = open_source_directory(
+            pass, source_object_fd, &source_st, &opened_source_st,
+            &source_dir_fd);
         close(source_object_fd);
-        if (source_dir_fd < 0 ||
+        if (source_status == SOURCE_OPEN_SAFE_READ)
+        {
+            restore_report_failure(restore_report, logical_path);
+            return RESTORE_NATIVE_SOURCE_SAFE_READ;
+        }
+        if (source_status != SOURCE_OPEN_OK ||
             !metadata_source_unchanged(&desired_st, &opened_source_st))
         {
             if (source_dir_fd >= 0)
                 close(source_dir_fd);
-            return -1;
+            return RESTORE_NATIVE_ERROR;
         }
 
         int dest_dir_fd = open_destination_directory(pass, dest_parent_fd,
@@ -1049,6 +1160,7 @@ static int restore_entry_at(const CloneContext *ctx, RestorePass pass,
         }
 
         int failed = 0;
+        RestoreNativeStatus subtree_status = RESTORE_NATIVE_OK;
         for (;;)
         {
             errno = 0;
@@ -1064,12 +1176,14 @@ static int restore_entry_at(const CloneContext *ctx, RestorePass pass,
             char child_logical_path[PATH_MAX];
             metadata_child_path(logical_path, entry->d_name,
                                 child_logical_path);
-            if (restore_entry_at(ctx, pass, source_dir_fd, entry->d_name,
-                                 dest_dir_fd, entry->d_name,
-                                 child_logical_path, snapshots, profiles,
-                                 metadata_anchor_fd) != 0)
+            RestoreNativeStatus child_status = restore_entry_at(
+                ctx, pass, source_dir_fd, entry->d_name, dest_dir_fd,
+                entry->d_name, child_logical_path, snapshots, profiles,
+                metadata_anchor_fd, restore_report);
+            if (child_status != RESTORE_NATIVE_OK)
             {
                 failed = 1;
+                subtree_status = child_status;
                 break;
             }
         }
@@ -1090,7 +1204,14 @@ static int restore_entry_at(const CloneContext *ctx, RestorePass pass,
         close(source_dir_fd);
         if (dest_dir_fd >= 0)
             close(dest_dir_fd);
-        return failed ? -1 : 0;
+        if (!failed && pass == RESTORE_APPLY)
+            restore_report_applied(restore_report);
+        else if (failed && pass == RESTORE_APPLY &&
+                 subtree_status == RESTORE_NATIVE_OK)
+            restore_report_failure(restore_report, logical_path);
+        if (failed && subtree_status == RESTORE_NATIVE_OK)
+            subtree_status = RESTORE_NATIVE_ERROR;
+        return failed ? subtree_status : RESTORE_NATIVE_OK;
     }
 
     if (S_ISFIFO(source_st.st_mode))
@@ -1104,7 +1225,7 @@ static int restore_entry_at(const CloneContext *ctx, RestorePass pass,
         close(source_object_fd);
 
         if (pass == RESTORE_VALIDATE)
-            return 0;
+            return RESTORE_NATIVE_OK;
 
         struct stat opened_dest_st;
         int dest_fd = open_destination_fifo(dest_parent_fd, dest_leaf,
@@ -1116,7 +1237,11 @@ static int restore_entry_at(const CloneContext *ctx, RestorePass pass,
                                        metadata_policy_from_context(ctx)) != 0;
         if (close(dest_fd) != 0)
             failed = 1;
-        return failed ? -1 : 0;
+        if (!failed)
+            restore_report_applied(restore_report);
+        else
+            restore_report_failure(restore_report, logical_path);
+        return failed ? RESTORE_NATIVE_ERROR : RESTORE_NATIVE_OK;
     }
 
     if (S_ISSOCK(source_st.st_mode))
@@ -1125,7 +1250,7 @@ static int restore_entry_at(const CloneContext *ctx, RestorePass pass,
         if (pass == RESTORE_APPLY)
             printf("  Warning: skipping socket (runtime-only)%s%s\n",
                    source_leaf[0] ? ": " : "", source_leaf);
-        return 0;
+        return RESTORE_NATIVE_OK;
     }
     if (S_ISCHR(source_st.st_mode) || S_ISBLK(source_st.st_mode))
     {
@@ -1134,7 +1259,7 @@ static int restore_entry_at(const CloneContext *ctx, RestorePass pass,
             printf("  Warning: skipping %s device node%s%s\n",
                    S_ISCHR(source_st.st_mode) ? "character" : "block",
                    source_leaf[0] ? ": " : "", source_leaf);
-        return 0;
+        return RESTORE_NATIVE_OK;
     }
 
     close(source_object_fd);
@@ -1192,9 +1317,9 @@ RestoreSourceStatus restore_native_source_status_at(int source_root_fd,
         : RESTORE_SOURCE_ERROR;
 }
 
-int restore_native_preflight_at(const CloneContext *ctx,
-                                int source_root_fd, const char *source_rel,
-                                int destination_root_fd, const char *destination_rel)
+RestoreNativeStatus restore_native_preflight_at(
+    const CloneContext *ctx, int source_root_fd, const char *source_rel,
+    int destination_root_fd, const char *destination_rel)
 {
     if (!restore_arguments_valid(ctx, source_root_fd, source_rel,
                                  destination_root_fd, destination_rel))
@@ -1235,7 +1360,7 @@ int restore_native_preflight_at(const CloneContext *ctx,
     int rc = restore_entry_at(ctx, RESTORE_VALIDATE, source_parent_fd,
                               source_leaf, dest_parent_fd, dest_leaf,
                               source_rel, &snapshots, &profiles,
-                              metadata_anchor_fd);
+                              metadata_anchor_fd, NULL);
     close(metadata_anchor_fd);
     close(source_parent_fd);
     if (dest_parent_fd >= 0)
@@ -1245,12 +1370,10 @@ int restore_native_preflight_at(const CloneContext *ctx,
     return rc;
 }
 
-int restore_native_metadata_inventory_at(const CloneContext *ctx,
-                                          int source_root_fd,
-                                          const char *source_rel,
-                                          int destination_root_fd,
-                                          const char *destination_rel,
-                                          MetadataProfiles *profiles)
+RestoreNativeStatus restore_native_metadata_inventory_at(
+    const CloneContext *ctx, int source_root_fd, const char *source_rel,
+    int destination_root_fd, const char *destination_rel,
+    MetadataProfiles *profiles)
 {
     if (profiles == NULL || !restore_arguments_valid(ctx, source_root_fd,
                                                      source_rel,
@@ -1290,7 +1413,7 @@ int restore_native_metadata_inventory_at(const CloneContext *ctx,
     int rc = restore_entry_at(ctx, RESTORE_VALIDATE, source_parent_fd,
                               source_leaf, dest_parent_fd, dest_leaf,
                               source_rel, &snapshots, profiles,
-                              metadata_anchor_fd);
+                              metadata_anchor_fd, NULL);
     close(metadata_anchor_fd);
     close(source_parent_fd);
     if (dest_parent_fd >= 0)
@@ -1299,10 +1422,27 @@ int restore_native_metadata_inventory_at(const CloneContext *ctx,
     return rc;
 }
 
-int restore_native_at(const CloneContext *ctx,
-                      int source_root_fd, const char *source_rel,
-                      int destination_root_fd, const char *destination_rel)
+void restore_native_report_init(RestoreNativeReport *report)
 {
+    if (report == NULL)
+        return;
+    memset(report, 0, sizeof(*report));
+}
+
+RestoreNativeStatus restore_native_at_report(
+    const CloneContext *ctx, int source_root_fd, const char *source_rel,
+    int destination_root_fd, const char *destination_rel,
+    RestoreNativeReport *report)
+{
+    RestoreNativeReport local_report;
+    if (report == NULL)
+    {
+        restore_native_report_init(&local_report);
+        report = &local_report;
+    }
+    else
+        restore_native_report_init(report);
+
     int source_parent_fd = -1;
     char source_leaf[RESTORE_LEAF_MAX];
     if (!restore_arguments_valid(ctx, source_root_fd, source_rel,
@@ -1341,7 +1481,7 @@ int restore_native_at(const CloneContext *ctx,
     int rc = restore_entry_at(ctx, RESTORE_VALIDATE, source_parent_fd,
                               source_leaf, dest_parent_fd, dest_leaf,
                               source_rel, &snapshots, &profiles,
-                              metadata_anchor_fd);
+                              metadata_anchor_fd, report);
     close(metadata_anchor_fd);
     if (rc == 0 && !ctx->metadata_preflight_done &&
         metadata_profiles_probe(&profiles,
@@ -1363,13 +1503,24 @@ int restore_native_at(const CloneContext *ctx,
         rc = restore_entry_at(ctx, RESTORE_APPLY, source_parent_fd,
                               source_leaf, dest_parent_fd, dest_leaf,
                               source_rel, &snapshots, NULL,
-                              destination_root_fd);
+                              destination_root_fd, report);
+    if (rc != RESTORE_NATIVE_OK && report->failed_count == 0)
+        restore_report_failure(report, source_rel);
     close(source_parent_fd);
     if (dest_parent_fd >= 0)
         close(dest_parent_fd);
     metadata_snapshots_free(&snapshots);
     metadata_profiles_free(&profiles);
     return rc;
+}
+
+RestoreNativeStatus restore_native_at(
+    const CloneContext *ctx, int source_root_fd, const char *source_rel,
+    int destination_root_fd, const char *destination_rel)
+{
+    return restore_native_at_report(ctx, source_root_fd, source_rel,
+                                    destination_root_fd, destination_rel,
+                                    NULL);
 }
 
 int get_dir_size(const char *path, off_t *size)
