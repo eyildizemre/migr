@@ -27,6 +27,32 @@ typedef struct CloneContext {
 typedef struct MetadataProfiles MetadataProfiles;
 
 /**
+ * @brief Result of a native backup capture.
+ *
+ * BACKUP_CAPTURE_SOURCE_SAFE_READ is distinct from an ordinary I/O failure: the
+ * source could not be opened with O_NOATIME and was not retried without it
+ * (docs/DECISIONS.md D17).
+ */
+typedef enum {
+    BACKUP_CAPTURE_ERROR = -1,
+    BACKUP_CAPTURE_OK = 0,
+    BACKUP_CAPTURE_SOURCE_SAFE_READ = -2
+} BackupCaptureStatus;
+
+typedef struct {
+    char failed_source_path[PATH_MAX];
+} BackupCaptureReport;
+
+void backup_capture_report_init(BackupCaptureReport *report);
+
+#ifdef BACKUP_TEST_HOOKS
+typedef void (*BackupTestCaptureHook)(const char *source_path,
+                                      void *context);
+
+void backup_test_set_capture_hook(BackupTestCaptureHook hook, void *context);
+#endif
+
+/**
  * @brief Captures a source tree into an open destination directory.
  *
  * Regular files, directories, symlinks and FIFOs are reproduced; Unix sockets and
@@ -58,10 +84,22 @@ typedef struct MetadataProfiles MetadataProfiles;
  * @param destination_root_fd Open directory fd anchoring destination_leaf; never closed here.
  * @param destination_leaf    Exactly one path component to create beneath it; a name
  *                            containing '/', or "." or "..", is refused.
- * @return 0 on success, -1 on error, a rejected context, or an unsafe leaf.
+ * @return BACKUP_CAPTURE_OK on success, BACKUP_CAPTURE_ERROR on an ordinary
+ *         failure, or BACKUP_CAPTURE_SOURCE_SAFE_READ when O_NOATIME access
+ *         was refused.
  */
-int backup_capture_at(const CloneContext *ctx, const char *source_path,
-                      int destination_root_fd, const char *destination_leaf);
+BackupCaptureStatus backup_capture_at_report(
+    const CloneContext *ctx, const char *source_path,
+    int destination_root_fd, const char *destination_leaf,
+    BackupCaptureReport *report);
+
+/**
+ * @brief Captures a source object without requiring a refusal report.
+ */
+BackupCaptureStatus backup_capture_at(const CloneContext *ctx,
+                                       const char *source_path,
+                                       int destination_root_fd,
+                                       const char *destination_leaf);
 
 /**
  * @brief Result of checking a restore source beneath a directory fd.

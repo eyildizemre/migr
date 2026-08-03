@@ -1,5 +1,5 @@
-// Source-safe-read refusal coverage for native backup metadata preflight
-// (docs/DECISIONS.md D17). The root-only cases use a dropped child
+// Source-safe-read refusal coverage for native backup metadata preflight and
+// capture (docs/DECISIONS.md D17). The root-only cases use a dropped child
 // identity so O_NOATIME receives a real kernel EPERM rather than a simulated
 // status; ordinary users skip these privilege-dependent fixtures.
 
@@ -21,6 +21,7 @@
 #include <unistd.h>
 
 #include "backup.h"
+#include "fileops.h"
 #include "utils.h"
 
 #define GREEN "\033[0;32m"
@@ -35,6 +36,7 @@ static int failures;
 static int skips;
 
 static int has_effective_cap_chown(void);
+static int has_effective_cap_fowner(void);
 
 static void check_result(int condition, const char *label)
 {
@@ -328,6 +330,21 @@ static int has_effective_cap_chown(void)
     return (effective & 1ULL) != 0;
 }
 
+static int has_effective_cap_fowner(void)
+{
+    FILE *status = fopen("/proc/self/status", "r");
+    if (status == NULL)
+        return 0;
+
+    char line[128];
+    unsigned long long effective = 0;
+    while (fgets(line, sizeof(line), status) != NULL)
+        if (sscanf(line, "CapEff: %llx", &effective) == 1)
+            break;
+    fclose(status);
+    return (effective & (1ULL << 3)) != 0;
+}
+
 static void test_inventory_race(uid_t uid, gid_t gid)
 {
     printf(BLUE "::" NC " backup metadata preflight: ownership race becomes a source-safe-read refusal\n");
@@ -494,6 +511,257 @@ static void test_self_owned_tree(uid_t uid, gid_t gid)
     remove_tree(base);
 }
 
+static int run_capture_as(const char *source, const char *destination,
+                          uid_t uid, gid_t gid)
+{
+    pid_t child = fork();
+    if (child < 0)
+        fatal("could not fork the capture child");
+    if (child == 0)
+    {
+        if (!drop_identity(uid, gid) || has_effective_cap_fowner())
+            _exit(CHILD_SKIP);
+        int destination_fd = open(destination, O_RDONLY | O_DIRECTORY |
+                                   O_CLOEXEC);
+        if (destination_fd < 0)
+            _exit(2);
+        BackupCaptureReport report;
+        BackupCaptureStatus status = backup_capture_at_report(
+            &(CloneContext){
+                .operation = CLONE_BACKUP,
+                .representation = CLONE_NATIVE_TREE,
+                .timestamp_policy_configured = 1,
+                .nsec_exact = 1,
+                .metadata_preflight_done = 1
+            }, source, destination_fd, "entry", &report);
+        int okay = status == BACKUP_CAPTURE_SOURCE_SAFE_READ &&
+                   strcmp(report.failed_source_path, source) == 0;
+        close(destination_fd);
+        _exit(okay ? 0 : 1);
+    }
+
+    int status = 0;
+    if (waitpid(child, &status, 0) < 0)
+        fatal("could not wait for the capture child");
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+static int count_container_names(const char *path, int partial)
+{
+    const char prefix[] = "migr_backup_";
+    const char suffix[] = ".partial";
+    DIR *dir = opendir(path);
+    if (dir == NULL)
+        return -1;
+
+    int count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL)
+    {
+        if (strncmp(entry->d_name, prefix, sizeof(prefix) - 1) != 0)
+            continue;
+        size_t length = strlen(entry->d_name);
+        int is_partial = length >= sizeof(suffix) - 1 &&
+                         strcmp(entry->d_name + length - (sizeof(suffix) - 1),
+                                suffix) == 0;
+        if (is_partial == partial)
+            count++;
+    }
+    int close_status = closedir(dir);
+    return close_status == 0 ? count : -1;
+}
+
+typedef struct {
+    int ready_fd;
+    int release_fd;
+    const char *pause_path;
+} CaptureBarrier;
+
+static void capture_barrier_hook(const char *source_path, void *context)
+{
+    CaptureBarrier *barrier = context;
+    if (barrier == NULL || strcmp(source_path, barrier->pause_path) != 0)
+        return;
+
+    char ready = has_effective_cap_fowner() ? 's' : 'r';
+    char release;
+    if (write(barrier->ready_fd, &ready, 1) != 1)
+        _exit(CHILD_SKIP);
+    if (ready == 's' || read(barrier->release_fd, &release, 1) != 1)
+        _exit(CHILD_SKIP);
+}
+
+static int run_backup_capture_race(const char *target, const char *home,
+                                   const char *source, const char *pause_path,
+                                   uid_t uid, gid_t gid, char *output,
+                                   size_t output_size)
+{
+    int ready[2], release[2], output_pipe[2];
+    if (pipe(ready) != 0 || pipe(release) != 0 || pipe(output_pipe) != 0)
+        fatal("could not create capture race pipes");
+
+    CaptureBarrier barrier = {
+        .ready_fd = ready[1],
+        .release_fd = release[0],
+        .pause_path = pause_path
+    };
+    backup_test_set_capture_hook(capture_barrier_hook, &barrier);
+
+    pid_t child = fork();
+    if (child < 0)
+        fatal("could not fork the capture race child");
+    if (child == 0)
+    {
+        close(ready[0]);
+        close(release[1]);
+        close(output_pipe[0]);
+        if (dup2(output_pipe[1], STDOUT_FILENO) < 0)
+            _exit(2);
+        close(output_pipe[1]);
+        if (!drop_identity(uid, gid) || setenv("HOME", home, 1) != 0)
+        {
+            char skipped = 's';
+            (void)write(ready[1], &skipped, 1);
+            _exit(CHILD_SKIP);
+        }
+        dry_run = 0;
+        char *paths[] = { (char *)source, NULL };
+        int result = backup(target, BACKUP_EXPLICIT_PATHS, paths);
+        fflush(stdout);
+        _exit(result == 0 ? 0 : 1);
+    }
+
+    close(ready[1]);
+    close(release[0]);
+    close(output_pipe[1]);
+    char ready_byte;
+    if (read(ready[0], &ready_byte, 1) != 1)
+        fatal("capture barrier was not reached");
+    close(ready[0]);
+
+    if (ready_byte == 's')
+    {
+        close(release[1]);
+        size_t skipped_total = 0;
+        while (skipped_total + 1 < output_size)
+        {
+            ssize_t received = read(output_pipe[0], output + skipped_total,
+                                    output_size - skipped_total - 1);
+            if (received <= 0)
+                break;
+            skipped_total += (size_t)received;
+        }
+        output[skipped_total] = '\0';
+        close(output_pipe[0]);
+        int skipped_status = 0;
+        if (waitpid(child, &skipped_status, 0) < 0)
+            fatal("could not wait for the skipped capture child");
+        backup_test_set_capture_hook(NULL, NULL);
+        return CHILD_SKIP;
+    }
+    if (ready_byte != 'r')
+        fatal("capture barrier sent an invalid status");
+
+    if (chown(pause_path, 0, 0) != 0)
+        fatal("could not change the captured file owner");
+    char release_byte = 'r';
+    if (write(release[1], &release_byte, 1) != 1)
+        fatal("could not release the capture barrier");
+    close(release[1]);
+
+    size_t total = 0;
+    while (total + 1 < output_size)
+    {
+        ssize_t received = read(output_pipe[0], output + total,
+                                output_size - total - 1);
+        if (received <= 0)
+            break;
+        total += (size_t)received;
+    }
+    output[total] = '\0';
+    close(output_pipe[0]);
+
+    int status = 0;
+    if (waitpid(child, &status, 0) < 0)
+        fatal("could not wait for the capture race child");
+    backup_test_set_capture_hook(NULL, NULL);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+static void test_capture_refusal(uid_t uid, gid_t gid)
+{
+    printf(BLUE "::" NC " native capture: O_NOATIME refusal is typed and identifies its source\n");
+
+    char base[PATH_MAX], source[PATH_MAX], source_dir[PATH_MAX];
+    char destination[PATH_MAX], destination_dir[PATH_MAX];
+    make_root(base, sizeof(base));
+    join_path(source, sizeof(source), base, "foreign.txt");
+    join_path(source_dir, sizeof(source_dir), base, "foreign-dir");
+    join_path(destination, sizeof(destination), base, "destination");
+    join_path(destination_dir, sizeof(destination_dir), base, "destination-dir");
+    write_file(source, "foreign", 0, 0);
+    make_directory(source_dir, 0, 0);
+    make_directory(destination, uid, gid);
+    make_directory(destination_dir, uid, gid);
+
+    int result = run_capture_as(source, destination, uid, gid);
+    if (result == CHILD_SKIP)
+    {
+        skip_case("capture refusal", "dropped child retained CAP_FOWNER");
+        remove_tree(base);
+        return;
+    }
+    check_result(result == 0, "capture returns the source-safe-read status");
+    check_result(directory_entry_count(destination) == 0,
+                 "capture refusal creates no destination entry");
+
+    result = run_capture_as(source_dir, destination_dir, uid, gid);
+    check_result(result == 0,
+                 "directory capture returns the source-safe-read status");
+    check_result(directory_entry_count(destination_dir) == 0,
+                 "directory refusal creates no destination entry");
+    remove_tree(base);
+}
+
+static void test_capture_race(uid_t uid, gid_t gid)
+{
+    printf(BLUE "::" NC " native capture: ownership change after inventory is a source-safe-read refusal\n");
+
+    char base[PATH_MAX], source[PATH_MAX], home[PATH_MAX], target[PATH_MAX];
+    char file[PATH_MAX];
+    make_root(base, sizeof(base));
+    join_path(source, sizeof(source), base, "source");
+    join_path(home, sizeof(home), base, "home");
+    join_path(target, sizeof(target), base, "target");
+    join_path(file, sizeof(file), source, "captured.txt");
+    make_directory(source, uid, gid);
+    make_directory(home, uid, gid);
+    make_directory(target, uid, gid);
+    write_file(file, "capture race", uid, gid);
+
+    char output[65536];
+    int result = run_backup_capture_race(target, home, source, file, uid, gid,
+                                         output, sizeof(output));
+    if (result == CHILD_SKIP)
+    {
+        skip_case("capture race", "dropped child retained CAP_FOWNER");
+        remove_tree(base);
+        return;
+    }
+    check_result(result == 1, "capture-time ownership change rejects the backup");
+    check_result(contains(output, "Could not safely read source for"),
+                 "capture reports a distinct source-safe-read refusal");
+    check_result(contains(output, file),
+                 "capture refusal identifies the failed source path");
+    check_result(contains(output, "Incomplete backup kept for resume"),
+                 "capture refusal keeps the existing partial container policy");
+    check_result(count_container_names(target, 1) == 1,
+                 "capture refusal leaves one partial container");
+    check_result(count_container_names(target, 0) == 0,
+                 "capture refusal publishes no final container");
+    remove_tree(base);
+}
+
 int main(void)
 {
     printf(BLUE "::" NC " native backup source-safe-read tests\n");
@@ -513,6 +781,8 @@ int main(void)
     test_uninspected_subtree(uid, gid);
     test_ownership_probe_rejection(uid, gid);
     test_self_owned_tree(uid, gid);
+    test_capture_refusal(uid, gid);
+    test_capture_race(uid, gid);
 
     if (failures > 0)
     {

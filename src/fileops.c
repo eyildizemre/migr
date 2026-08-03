@@ -41,8 +41,37 @@ static int destination_leaf_is_safe(const char *leaf)
            strcmp(leaf, "..") != 0;
 }
 
-static int capture_entry_at(const CloneContext *ctx, const char *src,
-                            int dest_dir_fd, const char *leaf);
+static void capture_report_source_refusal(BackupCaptureReport *report,
+                                          const char *source_path)
+{
+    if (report == NULL || report->failed_source_path[0] != '\0' ||
+        source_path == NULL)
+        return;
+    (void)snprintf(report->failed_source_path,
+                   sizeof(report->failed_source_path), "%s", source_path);
+}
+
+#ifdef BACKUP_TEST_HOOKS
+static BackupTestCaptureHook backup_test_capture_hook;
+static void *backup_test_capture_context;
+
+void backup_test_set_capture_hook(BackupTestCaptureHook hook, void *context)
+{
+    backup_test_capture_hook = hook;
+    backup_test_capture_context = context;
+}
+
+static void backup_test_before_capture_source_open(const char *source_path)
+{
+    if (backup_test_capture_hook != NULL)
+        backup_test_capture_hook(source_path, backup_test_capture_context);
+}
+#endif
+
+static BackupCaptureStatus capture_entry_at(const CloneContext *ctx,
+                                            const char *src,
+                                            int dest_dir_fd, const char *leaf,
+                                            BackupCaptureReport *report);
 
 // An identical symlink already at this address is work a previous run
 // finished, so resuming past it succeeds. Any other object there -- a
@@ -106,14 +135,24 @@ static int copy_file_contents(int src_fd, int dest_fd)
     return bytes_read < 0 ? -1 : 0;
 }
 
-static int capture_regular_at(const CloneContext *ctx, const char *src,
-                              int dest_dir_fd, const char *leaf,
-                              const struct stat *st)
+static BackupCaptureStatus capture_regular_at(
+    const CloneContext *ctx, const char *src, int dest_dir_fd,
+    const char *leaf, const struct stat *st, BackupCaptureReport *report)
 {
     MetadataTimestampPolicy policy = metadata_policy_from_context(ctx);
+#ifdef BACKUP_TEST_HOOKS
+    backup_test_before_capture_source_open(src);
+#endif
     int src_fd = open(src, O_RDONLY | O_NOATIME | O_CLOEXEC | O_NOFOLLOW);
     if (src_fd < 0)
-        return -1;
+    {
+        if (errno == EPERM)
+        {
+            capture_report_source_refusal(report, src);
+            return BACKUP_CAPTURE_SOURCE_SAFE_READ;
+        }
+        return BACKUP_CAPTURE_ERROR;
+    }
 
     struct stat source_snapshot;
     if (fstat(src_fd, &source_snapshot) != 0 ||
@@ -121,7 +160,7 @@ static int capture_regular_at(const CloneContext *ctx, const char *src,
         !metadata_source_unchanged(st, &source_snapshot))
     {
         close(src_fd);
-        return -1;
+        return BACKUP_CAPTURE_ERROR;
     }
 
     struct stat dest_st;
@@ -132,7 +171,7 @@ static int capture_regular_at(const CloneContext *ctx, const char *src,
         if (!S_ISREG(dest_st.st_mode))
         {
             close(src_fd);
-            return -1;
+            return BACKUP_CAPTURE_ERROR;
         }
         if (dest_st.st_size == source_snapshot.st_size &&
             dest_st.st_mtim.tv_sec == source_snapshot.st_mtim.tv_sec &&
@@ -144,7 +183,7 @@ static int capture_regular_at(const CloneContext *ctx, const char *src,
             if (dest_fd < 0)
             {
                 close(src_fd);
-                return -1;
+                return BACKUP_CAPTURE_ERROR;
             }
             struct stat opened_dest;
             int failed = fstat(dest_fd, &opened_dest) != 0 ||
@@ -158,13 +197,13 @@ static int capture_regular_at(const CloneContext *ctx, const char *src,
                 failed = 1;
             if (close(src_fd) != 0)
                 failed = 1;
-            return failed ? -1 : 0;
+            return failed ? BACKUP_CAPTURE_ERROR : BACKUP_CAPTURE_OK;
         }
     }
     else if (errno != ENOENT)
     {
         close(src_fd);
-        return -1;
+        return BACKUP_CAPTURE_ERROR;
     }
 
     // O_NOFOLLOW makes a symlink planted at this address fail the open with
@@ -176,7 +215,7 @@ static int capture_regular_at(const CloneContext *ctx, const char *src,
     if (dest_fd < 0)
     {
         close(src_fd);
-        return -1;
+        return BACKUP_CAPTURE_ERROR;
     }
 
     int failed = copy_file_contents(src_fd, dest_fd) != 0;
@@ -194,7 +233,7 @@ static int capture_regular_at(const CloneContext *ctx, const char *src,
         failed = 1;
     if (close(src_fd) != 0)
         failed = 1;
-    return failed ? -1 : 0;
+    return failed ? BACKUP_CAPTURE_ERROR : BACKUP_CAPTURE_OK;
 }
 
 // The directory is created with owner-only access and given the source's real
@@ -203,27 +242,23 @@ static int capture_regular_at(const CloneContext *ctx, const char *src,
 // directory (e.g. 0555) impossible to descend into and populate, and the
 // transient 0700 is never more permissive to group or other than the mode it
 // ends up with.
-static int capture_directory_at(const CloneContext *ctx, const char *src,
-                                int dest_dir_fd, const char *leaf,
-                                const struct stat *st)
+static BackupCaptureStatus capture_directory_at(
+    const CloneContext *ctx, const char *src, int dest_dir_fd,
+    const char *leaf, const struct stat *st, BackupCaptureReport *report)
 {
-    if (mkdirat(dest_dir_fd, leaf, 0700) != 0 && errno != EEXIST)
-        return -1;
-
-    // O_NOFOLLOW rejects a symlink standing where the directory should be
-    // (descending through it would write payload outside the container);
-    // O_DIRECTORY rejects every other wrong type in the same call.
-    int child_fd = openat(dest_dir_fd, leaf,
-                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-    if (child_fd < 0)
-        return -1;
-
+#ifdef BACKUP_TEST_HOOKS
+    backup_test_before_capture_source_open(src);
+#endif
     int source_fd = open(src, O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
                               O_NOATIME | O_CLOEXEC);
     if (source_fd < 0)
     {
-        close(child_fd);
-        return -1;
+        if (errno == EPERM)
+        {
+            capture_report_source_refusal(report, src);
+            return BACKUP_CAPTURE_SOURCE_SAFE_READ;
+        }
+        return BACKUP_CAPTURE_ERROR;
     }
     struct stat source_snapshot;
     if (fstat(source_fd, &source_snapshot) != 0 ||
@@ -231,8 +266,24 @@ static int capture_directory_at(const CloneContext *ctx, const char *src,
         !metadata_source_unchanged(st, &source_snapshot))
     {
         close(source_fd);
-        close(child_fd);
-        return -1;
+        return BACKUP_CAPTURE_ERROR;
+    }
+
+    if (mkdirat(dest_dir_fd, leaf, 0700) != 0 && errno != EEXIST)
+    {
+        close(source_fd);
+        return BACKUP_CAPTURE_ERROR;
+    }
+
+    // O_NOFOLLOW rejects a symlink standing where the directory should be
+    // (descending through it would write payload outside the container);
+    // O_DIRECTORY rejects every other wrong type in the same call.
+    int child_fd = openat(dest_dir_fd, leaf,
+                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (child_fd < 0)
+    {
+        close(source_fd);
+        return BACKUP_CAPTURE_ERROR;
     }
 
     int scan_fd = fcntl(source_fd, F_DUPFD_CLOEXEC, 0);
@@ -243,10 +294,10 @@ static int capture_directory_at(const CloneContext *ctx, const char *src,
             close(scan_fd);
         close(source_fd);
         close(child_fd);
-        return -1;
+        return BACKUP_CAPTURE_ERROR;
     }
 
-    int failed = 0;
+    BackupCaptureStatus result = BACKUP_CAPTURE_OK;
     struct dirent *entry;
     for (;;)
     {
@@ -259,7 +310,7 @@ static int capture_directory_at(const CloneContext *ctx, const char *src,
         if (entry == NULL)
         {
             if (errno != 0)
-                failed = 1;
+                result = BACKUP_CAPTURE_ERROR;
             break;
         }
 
@@ -269,28 +320,45 @@ static int capture_directory_at(const CloneContext *ctx, const char *src,
         // Only the source path grows as we descend; refuse rather than act on
         // a truncated one. The destination never concatenates at all.
         char child_src[PATH_MAX];
-        if (path_join(child_src, sizeof(child_src), src, entry->d_name) != 0 ||
-            capture_entry_at(ctx, child_src, child_fd, entry->d_name) != 0)
+        if (path_join(child_src, sizeof(child_src), src, entry->d_name) != 0)
         {
-            failed = 1;
+            result = BACKUP_CAPTURE_ERROR;
+            break;
+        }
+        BackupCaptureStatus child_status = capture_entry_at(
+            ctx, child_src, child_fd, entry->d_name, report);
+        if (child_status != BACKUP_CAPTURE_OK)
+        {
+            result = child_status;
             break;
         }
     }
 
     if (closedir(dir) != 0)
-        failed = 1;
+    {
+        if (result == BACKUP_CAPTURE_OK)
+            result = BACKUP_CAPTURE_ERROR;
+    }
     struct stat after;
-    if (!failed && (fstat(source_fd, &after) != 0 ||
-                    !metadata_source_unchanged(&source_snapshot, &after)))
-        failed = 1;
-    if (!failed && metadata_apply_fd(child_fd, &source_snapshot,
-                                     metadata_policy_from_context(ctx)) != 0)
-        failed = 1;
+    if (result == BACKUP_CAPTURE_OK &&
+        (fstat(source_fd, &after) != 0 ||
+         !metadata_source_unchanged(&source_snapshot, &after)))
+        result = BACKUP_CAPTURE_ERROR;
+    if (result == BACKUP_CAPTURE_OK &&
+        metadata_apply_fd(child_fd, &source_snapshot,
+                          metadata_policy_from_context(ctx)) != 0)
+        result = BACKUP_CAPTURE_ERROR;
     if (close(source_fd) != 0)
-        failed = 1;
+    {
+        if (result == BACKUP_CAPTURE_OK)
+            result = BACKUP_CAPTURE_ERROR;
+    }
     if (close(child_fd) != 0)
-        failed = 1;
-    return failed ? -1 : 0;
+    {
+        if (result == BACKUP_CAPTURE_OK)
+            result = BACKUP_CAPTURE_ERROR;
+    }
+    return result;
 }
 
 // Recreate the node itself, never its contents: reading a FIFO blocks until a
@@ -326,20 +394,22 @@ static int capture_fifo_at(const CloneContext *ctx, int dest_dir_fd,
     return failed ? -1 : 0;
 }
 
-static int capture_entry_at(const CloneContext *ctx, const char *src,
-                            int dest_dir_fd, const char *leaf)
+static BackupCaptureStatus capture_entry_at(const CloneContext *ctx,
+                                            const char *src,
+                                            int dest_dir_fd, const char *leaf,
+                                            BackupCaptureReport *report)
 {
     struct stat st;
     if (lstat(src, &st) != 0)
-        return -1;
+        return BACKUP_CAPTURE_ERROR;
 
     MetadataTimestampPolicy policy = metadata_policy_from_context(ctx);
     if (S_ISLNK(st.st_mode))
         return capture_symlink_at(src, dest_dir_fd, leaf, &st, policy);
     if (S_ISREG(st.st_mode))
-        return capture_regular_at(ctx, src, dest_dir_fd, leaf, &st);
+        return capture_regular_at(ctx, src, dest_dir_fd, leaf, &st, report);
     if (S_ISDIR(st.st_mode))
-        return capture_directory_at(ctx, src, dest_dir_fd, leaf, &st);
+        return capture_directory_at(ctx, src, dest_dir_fd, leaf, &st, report);
     if (S_ISFIFO(st.st_mode))
         return capture_fifo_at(ctx, dest_dir_fd, leaf, &st);
 
@@ -358,23 +428,43 @@ static int capture_entry_at(const CloneContext *ctx, const char *src,
         return 0;
     }
 
-    return -1; // unknown file type (unreachable on Linux); refuse defensively
+    return BACKUP_CAPTURE_ERROR; // unknown file type; refuse defensively
 }
 
-int backup_capture_at(const CloneContext *ctx, const char *source_path,
-                      int destination_root_fd, const char *destination_leaf)
+void backup_capture_report_init(BackupCaptureReport *report)
 {
+    if (report == NULL)
+        return;
+    memset(report, 0, sizeof(*report));
+}
+
+BackupCaptureStatus backup_capture_at_report(
+    const CloneContext *ctx, const char *source_path,
+    int destination_root_fd, const char *destination_leaf,
+    BackupCaptureReport *report)
+{
+    backup_capture_report_init(report);
     // Fail closed on a mis-dispatched context rather than running a native clone blindly:
     // a wrong direction or an unimplemented representation must not silently produce a
     // native tree where a sidecar was required.
     if (ctx == NULL || ctx->operation != CLONE_BACKUP ||
         ctx->representation != CLONE_NATIVE_TREE)
-        return -1;
+        return BACKUP_CAPTURE_ERROR;
     if (source_path == NULL || destination_root_fd < 0 ||
         !destination_leaf_is_safe(destination_leaf))
-        return -1;
+        return BACKUP_CAPTURE_ERROR;
 
-    return capture_entry_at(ctx, source_path, destination_root_fd, destination_leaf);
+    return capture_entry_at(ctx, source_path, destination_root_fd,
+                            destination_leaf, report);
+}
+
+BackupCaptureStatus backup_capture_at(const CloneContext *ctx,
+                                      const char *source_path,
+                                      int destination_root_fd,
+                                      const char *destination_leaf)
+{
+    return backup_capture_at_report(ctx, source_path, destination_root_fd,
+                                    destination_leaf, NULL);
 }
 
 /* ========================================================================= */

@@ -265,10 +265,26 @@ static void capture_roots(const CloneContext *ctx, const BackupPlan *plan, int d
                 printf("  Capturing: %s -> data/%s\n",
                        root->capture_path, root->manifest_root.payload_path);
 
-            if (backup_capture_at(ctx, root->capture_path, data_fd,
-                                  root->manifest_root.payload_path) != 0)
+            BackupCaptureReport capture_report;
+            BackupCaptureStatus capture_status = backup_capture_at_report(
+                ctx, root->capture_path, data_fd,
+                root->manifest_root.payload_path, &capture_report);
+            if (capture_status != BACKUP_CAPTURE_OK)
             {
-                printf("Error: Failed to capture %s\n", root->capture_path);
+                if (capture_status == BACKUP_CAPTURE_SOURCE_SAFE_READ)
+                {
+                    const char *failed_source =
+                        capture_report.failed_source_path[0] != '\0'
+                            ? capture_report.failed_source_path
+                            : root->capture_path;
+                    printf("Error: Could not safely read source for %s: the "
+                           "kernel refused the O_NOATIME open; an "
+                           "O_NOATIME-less retry was not attempted because "
+                           "it could change atime (ownership or CAP_FOWNER "
+                           "is required).\n", failed_source);
+                }
+                else
+                    printf("Error: Failed to capture %s\n", root->capture_path);
                 *had_error = 1;
             }
             else

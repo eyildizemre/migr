@@ -83,7 +83,7 @@ $(TEST_RESTORE_NATIVE): tests/test_restore_native.c fileops.o metadata.o utils.o
 	$(CC) $(CFLAGS) -o $@ tests/test_restore_native.c fileops.o metadata.o utils.o
 
 fileops_test.o: src/fileops.c src/fileops.h src/metadata.h
-	$(CC) $(CFLAGS) -DFILEOPS_TEST_HOOKS -c src/fileops.c -o $@
+	$(CC) $(CFLAGS) -DFILEOPS_TEST_HOOKS -DBACKUP_TEST_HOOKS -c src/fileops.c -o $@
 
 $(TEST_RESTORE_SOURCE_READ): tests/test_restore_source_read.c fileops_test.o metadata.o utils.o
 	$(CC) $(CFLAGS) -DFILEOPS_TEST_HOOKS -o $@ tests/test_restore_source_read.c fileops_test.o metadata.o utils.o
@@ -91,8 +91,8 @@ $(TEST_RESTORE_SOURCE_READ): tests/test_restore_source_read.c fileops_test.o met
 backup_test.o: src/backup.c src/backup.h src/backup_plan.h src/fileops.h src/metadata.h
 	$(CC) $(CFLAGS) -DBACKUP_TEST_HOOKS -c src/backup.c -o $@
 
-$(TEST_BACKUP_SOURCE_READ): tests/test_backup_source_read.c backup_test.o backup_plan.o container.o fileops.o metadata.o fsprobe.o manifest.o packages.o utils.o xdg.o detect.o
-	$(CC) $(CFLAGS) -DBACKUP_TEST_HOOKS -o $@ tests/test_backup_source_read.c backup_test.o backup_plan.o container.o fileops.o metadata.o fsprobe.o manifest.o packages.o utils.o xdg.o detect.o
+$(TEST_BACKUP_SOURCE_READ): tests/test_backup_source_read.c backup_test.o backup_plan.o container.o fileops_test.o metadata.o fsprobe.o manifest.o packages.o utils.o xdg.o detect.o
+	$(CC) $(CFLAGS) -DBACKUP_TEST_HOOKS -o $@ tests/test_backup_source_read.c backup_test.o backup_plan.o container.o fileops_test.o metadata.o fsprobe.o manifest.o packages.o utils.o xdg.o detect.o
 
 $(TEST_RESTORE_DISPATCH): tests/test_restore_dispatch.c restore.o fileops.o metadata.o fsprobe.o manifest.o container.o utils.o xdg.o detect.o
 	$(CC) $(CFLAGS) -o $@ tests/test_restore_dispatch.c restore.o fileops.o metadata.o fsprobe.o manifest.o container.o utils.o xdg.o detect.o

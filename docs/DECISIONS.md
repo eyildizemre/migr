@@ -655,7 +655,8 @@ could silently join two different source states.
 Backup metadata preflight accumulates these source-safe-read blockers independently
 from destination ownership profiles and reports bounded path examples before the
 destination probe. An unopenable directory is also counted as an uninspected subtree;
-its descendants are not represented as a precise affected-object count.
+its descendants are not represented as a precise affected-object count. The capture
+pass preserves the same strict refusal if ownership changes after preflight.
 
 Native restore reads its own source (the payload tree it is restoring from) under the
 same discipline, not only capture's read of the user's original files. The entry-gate
