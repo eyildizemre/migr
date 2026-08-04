@@ -437,8 +437,9 @@ in G), so no single phase carries "make everything faithful at once."
   final backup, and deletion failure blocks finalization) — recorded in D17 and here.
   Production portable dispatch remains disabled through Phase B (D14), including the
   B.5 gate; enabling it is a later, post-safety-phases decision.
-- **Phase C — Symlinks.** Native no-follow metadata (bug #1 already fixed on main);
-  portable placeholder + record.
+- **Phase C — Symlinks.** **Status: in progress (2026-08-04, D18).** Native
+  no-follow metadata (bug #1 already fixed on main); portable placeholder +
+  record, with the representation and fail-closed boundaries defined by D18.
 - **Phase D — Illegal filenames + pre-scan.** Encode on disk, true name in record;
   `NAME_MAX` handling for expanded names; the up-front unrepresentable-name report.
 - **Phase E — xattrs / ACLs.** Native `setxattr`; portable sub-records; distinguish

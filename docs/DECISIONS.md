@@ -826,3 +826,95 @@ source-safe-read refusal classes surfaced by the VM matrix (restore-side and
 backup-side `O_NOATIME`/EPERM) are reflected in the "Source and restore safety"
 section; the restore symlink-atime limitation is reflected in "Restore atime
 exactness (as-built)".
+
+---
+
+## D18 — 2026-08-04 — Portable symlink handling: placeholder node + record
+
+**Status:** Decided — Phase C implementation pending
+
+**Decision:** Portable symlinks use a payload placeholder and a sidecar record.
+The placeholder is an empty regular file (`size=0`) at the symlink's payload
+path; it never contains the target and is never read as the target. The sidecar
+entry has `kind=symlink` and carries the target plus the symlink's core metadata
+(`mode`, `uid`, `gid`, `atime`, and `mtime`). This preserves the invariant that
+every live sidecar key has a corresponding payload node.
+
+### C-1 — Symlink representation
+
+The target is read from the source link and stored only in the sidecar record;
+the placeholder's bytes are always empty and its type is always regular.
+
+### C-2 — Symlink metadata
+
+- Mode is recorded, but portable replay never calls `chmod` for a symlink,
+  because a path-based mode change follows the link. Replay applies ownership
+  with `fchownat(..., AT_SYMLINK_NOFOLLOW)`, applies timestamps with
+  `utimensat(..., AT_SYMLINK_NOFOLLOW)`, and verifies the result by readback.
+
+### C-3 — Source-change detection
+
+- Capture takes an `lstat` snapshot before `readlinkat`, reads the target, then
+  checks `metadata_symlink_unchanged` against a second no-follow metadata read.
+  A changed link is a fatal source-change error; capture does not retry it.
+
+### C-4 — Ownership preflight
+
+- Portable capture does not run an ownership preflight or call `chown` for a
+  source symlink; the source's true ownership is recorded in the sidecar.
+  Portable restore includes symlink entries in the ownership profile and applies
+  ownership with the no-follow operation above.
+
+### C-5 — Lossy destinations
+
+- If `FS_CAP_SYMLINK` is unavailable, representation selection already chooses
+  portable. If replay's `symlinkat` fails with `EOPNOTSUPP` or `EROFS`, the entry
+  is rejected fail-closed; it is never silently dropped or degraded.
+
+### C-6 — Portable FIFO boundary
+
+- Portable FIFO handling remains outside Phase C and fail-closed. Its
+  placeholder-versus-record policy is left open for a later decision.
+
+### C-7 — Test-only boundary
+
+- All Phase C orchestration is exposed only through D14 test-only seams.
+  Production portable dispatch remains disabled until the later safety gates.
+
+### C-8 — Symlink xattrs
+
+Symlink xattrs are collected with the no-follow path APIs `llistxattr` and
+`lgetxattr`; a symlink has no readable fd on which the regular fd-based xattr
+APIs could operate. Until Phase E implements replay, a symlink entry with
+`xattr_count != 0` is rejected fail-closed. Xattrs are never silently omitted
+or rewritten as an empty set.
+
+### Scope boundary
+
+The C-1 through C-8 rules apply to portable symlink handling only; native
+no-follow behaviour is covered by the existing metadata contract and its entry
+gate. Operational probe errors remain fatal under D14 rather than becoming a
+portable verdict.
+
+**Why:** These rules freeze the representation and rejection boundaries before
+the symlink parser, capture walker, and replay walker are written. A
+payload-less representation was rejected because it would make the universal
+"every live key has a payload node" invariant exceptional in the capture,
+reconciliation, and restore-inventory paths. Keeping a placeholder preserves
+that invariant without putting target bytes in the payload, while the
+fail-closed rules prevent unsupported metadata or filesystem operations from
+becoming silent data loss.
+
+**Rejected:** payload-less symlink entries; silently writing `xattr_count=0`
+for a symlink with xattrs; bringing portable FIFO handling into Phase C;
+opening production portable dispatch in Phase C; and promising source-symlink
+atime preservation, which Linux `readlinkat` cannot guarantee under the
+no-atime discipline.
+
+**Relationship:** D18 keeps D17's replacement of D6's target-storage sketch:
+the target lives in the sidecar record, not in payload content. It settles the
+question D17 left open by retaining D6's payload node as an empty placeholder,
+so the live-key-to-payload-node invariant remains universal. It extends D7's
+fail-closed xattr rule to symlinks, remains subject to D14's empirical
+representation and test-only-dispatch boundary, and leaves hardlinks to Phase
+G, illegal-name encoding to Phase D, and xattr replay to Phase E.
