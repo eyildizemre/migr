@@ -143,6 +143,27 @@ the required Linux semantics is refused rather than used with silent metadata lo
 External explicit roots also remain ineligible for future portable capture until they
 have a faithful restore-address policy.
 
+## Core Metadata Fidelity
+
+Native backup and restore preserve the exact numeric ownership (uid/gid), permission
+mode, and atime/mtime timestamps for regular files, directories, FIFOs, and symlinks.
+Ownership is recorded truthfully and applied best-effort: a non-root user who cannot
+`chown` sees a warning per entry, never a silent normalization, and any metadata
+read-back mismatch after a reported success aborts the operation (a filesystem that
+lies is refused). Restored directories and symlinks receive the exact saved atime;
+the source symlink's own atime cannot be preserved across restore because Linux
+`readlinkat()` perturbs it with no suppression flag — a documented kernel limitation,
+not a silent degradation.
+
+Destinations that cannot faithfully hold these semantics are detected by an
+on-disk capability probe before anything is written: a filesystem that loses
+metadata (for example exFAT/NTFS/FAT32) is refused for capture, not silently
+degraded. Portable capture to such filesystems (with a sidecar state log preserving
+the true metadata) is implemented behind a test-only seam but is not yet wired into
+the public CLI; it will become available only after the remaining safety phases
+(see [docs/sidecar-plan.md](docs/sidecar-plan.md)). Until then the probe refusal is
+the production behaviour — a failed backup is safer than a silent metadata loss.
+
 ## Report
 
 Running `migr` or `migr report` scans your home directory and shows sizes for main directories, dotfiles, dev tools, and browsers — plus a critical backup size estimate.

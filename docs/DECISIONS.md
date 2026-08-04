@@ -496,7 +496,7 @@ D8's native exit-right boundary.
 
 ## D17 — 2026-08-01 — Sidecar v1 and the core metadata contract are frozen
 
-**Status:** Decided — Phase B implementation pending
+**Status:** Implemented (Phase B closed 2026-08-04; as-built notes in "Restore atime exactness" and "Relationship" below)
 
 **Decision:** Phase B uses a versioned, NUL-framed, append-only sidecar as the
 authoritative state log for portable capture and resume. The sidecar and its payload
@@ -663,15 +663,33 @@ same discipline, not only capture's read of the user's original files. The entry
 tests added ahead of the native metadata-fidelity work surfaced a concrete instance of
 why this matters: `restore_entry_at()`'s directory branch always recurses during
 `RESTORE_VALIDATE` (unlike the FIFO/regular branches, which return before touching
-content), so its own `readdir()` perturbs the source directory's atime before
-`RESTORE_APPLY` takes its metadata snapshot -- restored directory (and symlink) atime
-is not currently exact. The fix is a single read-only metadata snapshot taken once per
-source object, before `RESTORE_VALIDATE` runs, reused by `RESTORE_APPLY` rather than
-re-read from a second, later open. This is preferred over merely adding `O_NOATIME` to
-restore's reads (which would stop the atime corruption but leave the redundant
-double-read in place) because it is the same "read-only inventory before mutation"
-shape already required above for the ownership preflight, done in the same pass rather
-than deferred to a later one.
+content), so its own `readdir()` could perturb the source directory's atime before
+`RESTORE_APPLY` took its metadata snapshot. The fix adopted -- a single read-only
+metadata snapshot taken once per source object, before `RESTORE_VALIDATE` runs,
+reused by `RESTORE_APPLY` rather than re-read from a second, later open -- is
+implemented. This is preferred over merely adding `O_NOATIME` to restore's reads
+(which would stop the atime corruption but leave the redundant double-read in place)
+because it is the same "read-only inventory before mutation" shape already required
+above for the ownership preflight, done in the same pass rather than deferred to a
+later one. The remaining symlink-atime limitation, and the additional preflight fix
+it required, are described in "Restore atime exactness (as-built)" below.
+
+### Restore atime exactness (as-built)
+
+Implemented as described above, with one kernel limitation now made explicit:
+destination symlink atime is exact (the pre-mutation snapshot is recorded before
+`RESTORE_VALIDATE` reads the target, and `RESTORE_APPLY` applies that recorded value),
+but the *source* symlink's atime cannot be preserved across restore. On Linux,
+`readlinkat()` itself updates the symlink's atime and no flag suppresses it —
+`O_NOATIME` applies only to `open()`, and `O_PATH` descriptors do not help — so any
+restore that must read a symlink target perturbs the source symlink's atime. This is
+outside migr's control (barring a `noatime` mount, which migr cannot assume), and the
+restore contract does not promise source-symlink atime preservation. To keep the
+destination exact, no walk may read a symlink target before the real restore's
+snapshot: the metadata-ownership preflight (`restore_native_metadata_inventory_at`)
+skips symlink target reads entirely (`skip_symlink_target_read`), while the dry-run
+preflight and the real `RESTORE_VALIDATE`/`RESTORE_APPLY` passes still perform
+ordinary target validation.
 
 Portable restore performs a global read-only preflight and then per-entry
 fd-anchored, component-by-component revalidation with `O_NOFOLLOW`. Absolute paths,
@@ -798,3 +816,13 @@ Relative to D6's sketch, D17 supersedes the "symlink stored as a regular file ho
 the target path" representation in favour of reserved inline target bytes in the
 record; D6 keeps its number and this entry names the reversal, per the append-only
 rule.
+
+As-built (Phase B, 2026-08-04): the sidecar codec, portable capture/resume core,
+portable restore preflight/replay/orchestration, and the native core-metadata
+fidelity work are all implemented and gated (host `make check` matrix, Ubuntu/Arch
+VM matrix, Fedora parity with the known Phase E xattr gap). Production portable
+dispatch remains disabled, per "Boundaries and relationships" above. Two
+source-safe-read refusal classes surfaced by the VM matrix (restore-side and
+backup-side `O_NOATIME`/EPERM) are reflected in the "Source and restore safety"
+section; the restore symlink-atime limitation is reflected in "Restore atime
+exactness (as-built)".

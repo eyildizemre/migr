@@ -428,6 +428,15 @@ in G), so no single phase carries "make everything faithful at once."
   deletion representation needed by H; mode/uid/gid/mtime plus the atime decision; file
   size for resume; payload→entry-group commit ordering; source-change and metadata
   failure behaviour; restore ordering.
+  **Status: complete (2026-08-04).** Codec, portable capture/resume core, portable
+  restore preflight/replay/orchestration, and native core-metadata fidelity are
+  implemented and gated (host `make check`; Ubuntu/Arch VM matrix; Fedora parity with
+  the known Phase E xattr gap). D17 is marked Implemented with as-built notes. One
+  debt is deliberately handed to Phase H: native resume's stale-entry reconciliation
+  (sidecar-backed oracle; deleted files/subtrees must not survive a successful resumed
+  final backup, and deletion failure blocks finalization) — recorded in D17 and here.
+  Production portable dispatch remains disabled through Phase B (D14), including the
+  B.5 gate; enabling it is a later, post-safety-phases decision.
 - **Phase C — Symlinks.** Native no-follow metadata (bug #1 already fixed on main);
   portable placeholder + record.
 - **Phase D — Illegal filenames + pre-scan.** Encode on disk, true name in record;
