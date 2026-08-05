@@ -1462,8 +1462,26 @@ static int replay_manifest_valid(const Manifest *manifest)
     return 0;
 }
 
-static int replay_stat_from_entry(const SidecarEntry *entry,
-                                  struct stat *desired)
+int replay_entry_valid(const SidecarEntry *entry)
+{
+    if (entry == NULL ||
+        (entry->kind != SIDECAR_KIND_REGULAR &&
+         entry->kind != SIDECAR_KIND_DIRECTORY &&
+         entry->kind != SIDECAR_KIND_SYMLINK) ||
+        entry->xattr_count != 0 ||
+        ((entry->kind == SIDECAR_KIND_DIRECTORY ||
+          entry->kind == SIDECAR_KIND_SYMLINK) && entry->size != 0))
+        return 0;
+    if (entry->kind != SIDECAR_KIND_SYMLINK)
+        return 1;
+    return entry->symlink_target.data != NULL &&
+           entry->symlink_target.length != 0 &&
+           entry->symlink_target.length <= SIDECAR_MAX_SYMLINK_TARGET &&
+           memchr(entry->symlink_target.data, '\0',
+                  entry->symlink_target.length) == NULL;
+}
+
+int replay_stat_from_entry(const SidecarEntry *entry, struct stat *desired)
 {
     if (entry == NULL || desired == NULL ||
         entry->mode > SIDECAR_MAX_MODE ||
@@ -1477,8 +1495,12 @@ static int replay_stat_from_entry(const SidecarEntry *entry,
     }
 
     memset(desired, 0, sizeof(*desired));
-    desired->st_mode = entry->mode |
-        (entry->kind == SIDECAR_KIND_DIRECTORY ? S_IFDIR : S_IFREG);
+    mode_t type = S_IFREG;
+    if (entry->kind == SIDECAR_KIND_SYMLINK)
+        type = S_IFLNK;
+    else if (entry->kind == SIDECAR_KIND_DIRECTORY)
+        type = S_IFDIR;
+    desired->st_mode = entry->mode | type;
     desired->st_uid = (uid_t)entry->uid;
     desired->st_gid = (gid_t)entry->gid;
     if ((uintmax_t)desired->st_uid != entry->uid ||
@@ -1522,6 +1544,38 @@ static int replay_entry_compare(const void *left, const void *right)
     return strcmp(a->destination, b->destination);
 }
 
+static int replay_open_payload(int data_fd, const ManifestRoot *root,
+                               const SidecarEntry *entry, int *out_fd,
+                               struct stat *out_stat);
+
+static int replay_symlink_placeholder_valid(const ReplayCollection *collection,
+                                            const ManifestRoot *root,
+                                            const SidecarEntry *entry)
+{
+    if (collection == NULL || root == NULL || entry == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    int payload_fd = -1;
+    struct stat payload_st;
+    if (replay_open_payload(collection->data_fd, root, entry, &payload_fd,
+                            &payload_st) != 0)
+        return -1;
+    int result = S_ISREG(payload_st.st_mode) && payload_st.st_size == 0
+        ? 0 : -1;
+    int saved = errno;
+    if (result != 0)
+        saved = EIO;
+    if (close(payload_fd) != 0 && result == 0)
+    {
+        result = -1;
+        saved = EIO;
+    }
+    errno = saved;
+    return result;
+}
+
 static int replay_collect_entry(const SidecarLiveView *view, void *argument)
 {
     ReplayCollection *collection = argument;
@@ -1535,10 +1589,16 @@ static int replay_collect_entry(const SidecarLiveView *view, void *argument)
     if (root_index == SIZE_MAX ||
         !sidecar_path_valid(entry->logical_path, 1) ||
         !sidecar_path_valid(entry->physical_path, 1) ||
-        (entry->kind != SIDECAR_KIND_REGULAR &&
-         entry->kind != SIDECAR_KIND_DIRECTORY) ||
-        entry->xattr_count != 0 ||
-        (entry->kind == SIDECAR_KIND_DIRECTORY && entry->size != 0))
+        !replay_entry_valid(entry))
+    {
+        replay_report_failure(collection->report, collection->manifest,
+                              root_index, entry->logical_path);
+        return 1;
+    }
+
+    const ManifestRoot *root = &collection->manifest->roots[root_index];
+    if (entry->kind == SIDECAR_KIND_SYMLINK &&
+        replay_symlink_placeholder_valid(collection, root, entry) != 0)
     {
         replay_report_failure(collection->report, collection->manifest,
                               root_index, entry->logical_path);
@@ -1571,7 +1631,6 @@ static int replay_collect_entry(const SidecarLiveView *view, void *argument)
     }
     ReplayEntry *replay = &collection->items[collection->count];
     memset(replay, 0, sizeof(*replay));
-    const ManifestRoot *root = &collection->manifest->roots[root_index];
     if (destination_path_build(root, logical, replay->destination,
                                sizeof(replay->destination)) != 0 ||
         (replay->destination[0] == '\0' &&

@@ -19,6 +19,10 @@
 #include "portable_restore.h"
 #include "sidecar.h"
 
+extern int replay_entry_valid(const SidecarEntry *entry);
+extern int replay_stat_from_entry(const SidecarEntry *entry,
+                                  struct stat *desired);
+
 #define GREEN "\033[0;32m"
 #define RED   "\033[0;31m"
 #define BLUE  "\033[0;34m"
@@ -251,6 +255,11 @@ static int append_entries(SidecarLog *log, const SidecarEntry *entries,
     {
         if (sidecar_log_append_entry(log, &entries[index]) !=
                 SIDECAR_STATUS_OK ||
+            (entries[index].xattr_count != 0 &&
+             sidecar_log_append_xattr(log, &(SidecarXattr){
+                 .name = text_bytes("user.migr_test"),
+                 .value = text_bytes("value")
+             }) != SIDECAR_STATUS_OK) ||
             sidecar_log_append_entry_commit(log) != SIDECAR_STATUS_OK)
             return -1;
     }
@@ -313,6 +322,118 @@ static int run_replay(Fixture *fixture, PortableRestoreReplayReport *report)
     int result = portable_restore_replay_at(&request, report);
     manifest_free(&manifest);
     return result;
+}
+
+static void test_symlink_collection_validation(void)
+{
+    printf(BLUE "::" NC " portable symlink replay collection validation\n");
+    SidecarEntry entry = entry_for("ROOT", "link", "link",
+                                   SIDECAR_KIND_SYMLINK, 0, 0777,
+                                   1700000300, 11, 1700000301, 22);
+    entry.symlink_target = text_bytes("target");
+
+    struct stat desired;
+    check(replay_entry_valid(&entry),
+          "well-formed symlink entry is accepted by collection validation");
+    check(replay_stat_from_entry(&entry, &desired) == 0 &&
+              S_ISLNK(desired.st_mode) &&
+              (desired.st_mode & 07777) == 0777 &&
+              desired.st_uid == (uid_t)geteuid() &&
+              desired.st_gid == (gid_t)getegid() &&
+              desired.st_atim.tv_sec == 1700000300 &&
+              desired.st_atim.tv_nsec == 11 &&
+              desired.st_mtim.tv_sec == 1700000301 &&
+              desired.st_mtim.tv_nsec == 22,
+          "symlink desired stat carries type, ownership, and timestamps");
+
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "symlink collection fixture is created");
+    if (opened == 0)
+    {
+        make_dir_at(fixture.data_fd, "ROOT", 0700);
+        write_file_at(fixture.data_fd, "ROOT/link", "");
+        write_file_at(fixture.home_fd, "restored", "sentinel");
+        check(write_sidecar(&fixture, &entry, 1, NULL) == 0,
+              "well-formed symlink sidecar is committed");
+        PortableRestoreReplayReport report;
+        int result = run_replay(&fixture, &report);
+        char restored[PATH_MAX];
+        path_join(restored, sizeof(restored), fixture.home, "/restored");
+        check(result != 0 && report.live_count == 1 &&
+                  report.failed_count == 1 &&
+                  strcmp(report.failed_logical_path, "link") == 0,
+              "collection accepts the symlink before destination validation fails");
+        check(file_equals_noatime(restored, "sentinel"),
+              "collection failure leaves the destination untouched");
+        fixture_close(&fixture);
+    }
+
+    Fixture missing;
+    opened = fixture_open(&missing, &root);
+    check(opened == 0, "missing-placeholder fixture is created");
+    if (opened == 0)
+    {
+        make_dir_at(missing.data_fd, "ROOT", 0700);
+        check(write_sidecar(&missing, &entry, 1, NULL) == 0,
+              "missing-placeholder sidecar is committed");
+        PortableRestoreReplayReport report;
+        int result = run_replay(&missing, &report);
+        check(result != 0 && report.live_count == 0 &&
+                  report.failed_count == 1,
+              "missing symlink placeholder is rejected during collection");
+        fixture_close(&missing);
+    }
+
+    Fixture redirected;
+    opened = fixture_open(&redirected, &root);
+    check(opened == 0, "payload-redirect fixture is created");
+    if (opened == 0)
+    {
+        make_dir_at(redirected.data_fd, "ROOT", 0700);
+        char outside[PATH_MAX], payload_link[PATH_MAX];
+        path_join(outside, sizeof(outside), redirected.base, "/outside");
+        if (mkdir(outside, 0700) != 0)
+            fatal("could not create payload redirect target");
+        path_join(payload_link, sizeof(payload_link), redirected.base,
+                  "/container/data/ROOT/link");
+        check(symlink(outside, payload_link) == 0,
+              "payload placeholder symlink is planted");
+        check(write_sidecar(&redirected, &entry, 1, NULL) == 0,
+              "payload-redirect sidecar is committed");
+        PortableRestoreReplayReport report;
+        int result = run_replay(&redirected, &report);
+        check(result != 0 && report.live_count == 0 &&
+                  report.failed_count == 1,
+              "payload placeholder redirect is rejected during collection");
+        fixture_close(&redirected);
+    }
+
+    SidecarEntry empty_target = entry;
+    empty_target.symlink_target = (SidecarBytes){0};
+    check(!replay_entry_valid(&empty_target),
+          "empty symlink target is rejected");
+
+    SidecarEntry xattr = entry;
+    xattr.xattr_count = 1;
+    check(!replay_entry_valid(&xattr),
+          "symlink xattrs remain rejected before Phase E");
+
+    SidecarEntry sized = entry;
+    sized.size = 1;
+    check(!replay_entry_valid(&sized),
+          "nonzero symlink size is rejected");
+
+    unsigned char oversized_target[SIDECAR_MAX_SYMLINK_TARGET + 1U];
+    memset(oversized_target, 'x', sizeof(oversized_target));
+    SidecarEntry oversized = entry;
+    oversized.symlink_target = (SidecarBytes){
+        .data = oversized_target,
+        .length = sizeof(oversized_target)
+    };
+    check(!replay_entry_valid(&oversized),
+          "oversized symlink target is rejected");
 }
 
 static int metadata_exact(const char *path, mode_t mode, uid_t uid, gid_t gid,
@@ -490,6 +611,7 @@ static void test_tombstone_skipped(void)
 
 int main(void)
 {
+    test_symlink_collection_validation();
     test_normal_replay();
     test_payload_swap();
     test_tombstone_skipped();
