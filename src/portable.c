@@ -497,6 +497,96 @@ static int collect_xattrs(int fd, PortableXattrs *out)
     return 0;
 }
 
+static int collect_symlink_xattrs(const char *path, PortableXattrs *out)
+{
+    if (path == NULL || out == NULL)
+        return -1;
+    memset(out, 0, sizeof(*out));
+
+    errno = 0;
+    ssize_t length = llistxattr(path, NULL, 0);
+    if (length < 0) {
+        if (errno == ENOTSUP || errno == EOPNOTSUPP || errno == ENODATA)
+            return 0;
+        return -1;
+    }
+    if ((uint64_t)length > SIDECAR_MAX_XATTRS_PER_ENTRY *
+                           (uint64_t)(SIDECAR_MAX_XATTR_NAME + 1U))
+        return -1;
+    if (length == 0)
+        return 0;
+
+    char *names = malloc((size_t)length);
+    if (names == NULL)
+        return -1;
+    ssize_t received = llistxattr(path, names, (size_t)length);
+    if (received != length) {
+        free(names);
+        return -1;
+    }
+
+    size_t offset = 0;
+    while (offset < (size_t)received) {
+        size_t name_length = strnlen(names + offset,
+                                    (size_t)received - offset);
+        if (name_length == 0 || name_length > SIDECAR_MAX_XATTR_NAME ||
+            name_length == (size_t)received - offset) {
+            free(names);
+            xattrs_free(out);
+            return -1;
+        }
+        if (xattrs_reserve(out, 1) != 0) {
+            free(names);
+            xattrs_free(out);
+            return -1;
+        }
+
+        unsigned char *name_copy = malloc(name_length);
+        if (name_copy == NULL) {
+            free(names);
+            xattrs_free(out);
+            return -1;
+        }
+        memcpy(name_copy, names + offset, name_length);
+
+        errno = 0;
+        ssize_t value_length = lgetxattr(path, names + offset, NULL, 0);
+        if (value_length < 0 ||
+            (uint64_t)value_length > SIDECAR_MAX_XATTR_VALUE) {
+            free(name_copy);
+            free(names);
+            xattrs_free(out);
+            return -1;
+        }
+        unsigned char *value_copy = NULL;
+        if (value_length > 0) {
+            value_copy = malloc((size_t)value_length);
+            if (value_copy == NULL) {
+                free(name_copy);
+                free(names);
+                xattrs_free(out);
+                return -1;
+            }
+            ssize_t reread = lgetxattr(path, names + offset, value_copy,
+                                       (size_t)value_length);
+            if (reread != value_length) {
+                free(name_copy);
+                free(value_copy);
+                free(names);
+                xattrs_free(out);
+                return -1;
+            }
+        }
+        out->items[out->count++] = (SidecarXattr){
+            .name = { name_copy, name_length },
+            .value = { value_copy, (size_t)value_length }
+        };
+        offset += name_length + 1U;
+    }
+    free(names);
+    return 0;
+}
+
 static int time_to_i64(time_t value, int64_t *out)
 {
     if (out == NULL)
@@ -1487,6 +1577,44 @@ static int read_source_stat(int source_parent, const char *source_name,
     return lstat(root_path, out);
 }
 
+static int source_symlink_target(int source_parent, const char *source_name,
+                                 const char *root_path, char *target,
+                                 size_t target_size)
+{
+    if (target == NULL || target_size == 0)
+        return -1;
+    ssize_t length;
+    if (source_parent >= 0) {
+        if (source_name == NULL)
+            return -1;
+        length = readlinkat(source_parent, source_name, target, target_size);
+    } else {
+        if (root_path == NULL)
+            return -1;
+        length = readlink(root_path, target, target_size);
+    }
+    if (length <= 0 || (size_t)length >= target_size)
+        return -1;
+    target[length] = '\0';
+    return (int)length;
+}
+
+static int source_symlink_xattr_path(int source_parent,
+                                     const char *source_name,
+                                     const char *root_path, char *path,
+                                     size_t path_size)
+{
+    if (path == NULL || path_size == 0)
+        return -1;
+    if (source_parent < 0)
+        return copy_text(path, path_size, root_path);
+    if (source_name == NULL || !safe_component(source_name))
+        return -1;
+    int length = snprintf(path, path_size, "/proc/self/fd/%d/%s",
+                          source_parent, source_name);
+    return length < 0 || (size_t)length >= path_size ? -1 : 0;
+}
+
 static int open_source_node(int source_parent, const char *source_name,
                             const char *root_path, const struct stat *st)
 {
@@ -1721,6 +1849,101 @@ static int capture_special(PortableCaptureContext *context,
     return 0;
 }
 
+static int capture_symlink(PortableCaptureContext *context,
+                           const PortableRootSpec *root,
+                           const char *logical, int source_parent,
+                           const char *source_name, const char *root_path,
+                           int destination_parent,
+                           const char *destination_leaf,
+                           int destination_is_root,
+                           const struct stat *before)
+{
+    char target[SIDECAR_MAX_SYMLINK_TARGET + 1U];
+    int target_length = source_symlink_target(source_parent, source_name,
+                                              root_path, target,
+                                              sizeof(target));
+    if (target_length < 0)
+        return -1;
+
+    char source_path[PATH_MAX];
+    if (source_symlink_xattr_path(source_parent, source_name, root_path,
+                                  source_path, sizeof(source_path)) != 0)
+        return -1;
+    PortableXattrs xattrs;
+    if (collect_symlink_xattrs(source_path, &xattrs) != 0)
+        return -1;
+
+    // The final consistency check runs after every path-based read (target,
+    // then xattrs) rather than right after the target read: symlinks have no
+    // usable fd (open_source_node's O_NOFOLLOW would hit ELOOP), so each read
+    // above re-resolves the path independently and nothing pins them to one
+    // inode the way capture_regular's single fd does. One check positioned
+    // last covers the read window for both.
+    struct stat after;
+    if (read_source_stat(source_parent, source_name, root_path, &after) != 0 ||
+        !metadata_symlink_unchanged(before, &after)) {
+        xattrs_free(&xattrs);
+        return -1;
+    }
+
+    if (visited_add(context->visited, root->id, logical) != 0) {
+        xattrs_free(&xattrs);
+        return -1;
+    }
+
+    if (tombstone_if_live(context, root->id, logical) != 0) {
+        xattrs_free(&xattrs);
+        return -1;
+    }
+
+    int parent_fd = destination_parent;
+    char root_leaf[NAME_MAX + 1U];
+    if (destination_is_root) {
+        if (open_payload_parent(context->data_fd, root->payload_path,
+                                &parent_fd, root_leaf,
+                                sizeof(root_leaf)) != 0) {
+            xattrs_free(&xattrs);
+            return -1;
+        }
+        destination_leaf = root_leaf;
+    }
+
+    if (tombstone_destination_children(context, root->id, logical, parent_fd,
+                                       destination_leaf) != 0) {
+        if (destination_is_root)
+            close(parent_fd);
+        xattrs_free(&xattrs);
+        return -1;
+    }
+
+    int destination_fd;
+    if (ensure_regular_leaf(parent_fd, destination_leaf,
+                            &destination_fd) != 0) {
+        if (destination_is_root)
+            close(parent_fd);
+        xattrs_free(&xattrs);
+        return -1;
+    }
+    int failed = close(destination_fd) != 0;
+    if (destination_is_root && close(parent_fd) != 0)
+        failed = 1;
+    if (failed) {
+        xattrs_free(&xattrs);
+        return -1;
+    }
+
+    SidecarBytes target_bytes = {
+        (const unsigned char *)target, (size_t)target_length
+    };
+    SidecarEntry entry;
+    failed = entry_from_stat(root->id, logical, before,
+                             context->nsec_exact, &xattrs, &entry,
+                             &target_bytes) != 0 ||
+             append_group(context, &entry, &xattrs) != 0;
+    xattrs_free(&xattrs);
+    return failed ? -1 : 0;
+}
+
 static int capture_node(PortableCaptureContext *context,
                         const PortableRootSpec *root,
                         const char *logical, int source_parent,
@@ -1736,10 +1959,14 @@ static int capture_node(PortableCaptureContext *context,
         S_ISBLK(before.st_mode))
         return capture_special(context, root, logical, destination_parent,
                                destination_leaf, is_root, &before);
-    if (S_ISLNK(before.st_mode) || S_ISFIFO(before.st_mode)) {
+    if (S_ISFIFO(before.st_mode)) {
         errno = EOPNOTSUPP;
         return -1;
     }
+    if (S_ISLNK(before.st_mode))
+        return capture_symlink(context, root, logical, source_parent,
+                               source_name, root_path, destination_parent,
+                               destination_leaf, is_root, &before);
     if (!S_ISREG(before.st_mode) && !S_ISDIR(before.st_mode)) {
         errno = EOPNOTSUPP;
         return -1;

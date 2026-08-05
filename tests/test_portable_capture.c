@@ -1,4 +1,4 @@
-// Unit tests for the portable capture core (docs/DECISIONS.md D17): the
+// Unit tests for the portable capture core (docs/DECISIONS.md D17/D18): the
 // fresh-capture-only walk over regular files and directories, behind the
 // test-only direct API (D14 -- never reachable from a release binary). No
 // resume, no adopt, no interruption testing here; those are separate steps
@@ -14,8 +14,9 @@
 // sidecar log before the new `ENTRY` group -- for both same-kind updates
 // and type changes (regular to directory and back), including that a type
 // change replaces the destination inode rather than truncating an existing
-// one out from under a concurrent reader. Symlinks and FIFOs are confirmed
-// fail-closed without ever being opened; sockets and devices are
+// one out from under a concurrent reader. Symlinks are captured as empty
+// payload placeholders plus sidecar records; FIFOs remain fail-closed without
+// ever being opened; sockets and devices are
 // warning-and-skip, including tombstoning a previously captured version and
 // removing its stale payload. `MANUAL_NATIVE` roots are refused before any
 // portable mutation.
@@ -247,6 +248,13 @@ typedef struct {
     int commits;
     int valid;
     int expected_xattr_seen;
+    int symlink_seen;
+    int symlink_target_ok;
+    int symlink_xattr_seen;
+    int symlink_regular_xattr_leaked;
+    int symlink_xattr_count;
+    int symlink_entry_xattr_count;
+    int symlink_entry_open;
 } FreshSidecarCheck;
 
 static int fresh_sidecar_callback(const SidecarRecord *record, void *opaque)
@@ -258,12 +266,32 @@ static int fresh_sidecar_callback(const SidecarRecord *record, void *opaque)
         if (entry->root_id.length != 4 ||
             memcmp(entry->root_id.data, "ROOT", 4) != 0 ||
             (entry->kind != SIDECAR_KIND_DIRECTORY &&
-             entry->kind != SIDECAR_KIND_REGULAR))
+             entry->kind != SIDECAR_KIND_REGULAR &&
+             entry->kind != SIDECAR_KIND_SYMLINK))
             check_state->valid = 0;
+        check_state->symlink_entry_open = entry->kind == SIDECAR_KIND_SYMLINK;
+        if (check_state->symlink_entry_open) {
+            static const char expected_path[] = "nested/link";
+            static const char expected_target[] = "file.txt";
+            check_state->symlink_seen = 1;
+            check_state->symlink_entry_xattr_count =
+                (int)entry->xattr_count;
+            check_state->symlink_xattr_count = 0;
+            check_state->symlink_target_ok =
+                entry->logical_path.length == sizeof(expected_path) - 1U &&
+                memcmp(entry->logical_path.data, expected_path,
+                       sizeof(expected_path) - 1U) == 0 &&
+                entry->size == 0 &&
+                entry->symlink_target.length == sizeof(expected_target) - 1U &&
+                memcmp(entry->symlink_target.data, expected_target,
+                       sizeof(expected_target) - 1U) == 0;
+        }
     } else if (record->type == SIDECAR_RECORD_XATTR) {
         const SidecarXattr *xattr = &record->value.xattr;
         static const char expected_name[] = "user.migr_test";
         static const char expected_value[] = "portable-xattr";
+        static const char symlink_name[] = "user.migr_symlink";
+        static const char symlink_value[] = "symlink-xattr";
         check_state->xattrs++;
         if (xattr->name.length == sizeof(expected_name) - 1U &&
             memcmp(xattr->name.data, expected_name,
@@ -272,8 +300,28 @@ static int fresh_sidecar_callback(const SidecarRecord *record, void *opaque)
             memcmp(xattr->value.data, expected_value,
                    sizeof(expected_value) - 1U) == 0)
             check_state->expected_xattr_seen = 1;
+        if (check_state->symlink_entry_open) {
+            check_state->symlink_xattr_count++;
+            if (xattr->name.length == sizeof(expected_name) - 1U &&
+                memcmp(xattr->name.data, expected_name,
+                       sizeof(expected_name) - 1U) == 0)
+                check_state->symlink_regular_xattr_leaked = 1;
+            if (xattr->name.length == sizeof(symlink_name) - 1U &&
+                memcmp(xattr->name.data, symlink_name,
+                       sizeof(symlink_name) - 1U) == 0 &&
+                xattr->value.length == sizeof(symlink_value) - 1U &&
+                memcmp(xattr->value.data, symlink_value,
+                       sizeof(symlink_value) - 1U) == 0)
+                check_state->symlink_xattr_seen = 1;
+        }
     } else if (record->type == SIDECAR_RECORD_ENTRY_COMMIT) {
         check_state->commits++;
+        if (check_state->symlink_entry_open) {
+            if (check_state->symlink_xattr_count !=
+                check_state->symlink_entry_xattr_count)
+                check_state->valid = 0;
+            check_state->symlink_entry_open = 0;
+        }
     }
     return 0;
 }
@@ -356,10 +404,14 @@ static void test_fresh_capture(const char *source, int container_fd,
     printf(BLUE "::" NC " fresh regular and directory capture\n");
     char nested[PATH_MAX];
     char file[PATH_MAX];
+    char link[PATH_MAX];
     join_path(nested, sizeof(nested), source, "nested");
     join_path(file, sizeof(file), nested, "file.txt");
+    join_path(link, sizeof(link), nested, "link");
     make_directory(nested);
     write_file(file, "portable payload", 16);
+    if (symlink("file.txt", link) != 0)
+        fixture_fatal("could not create symlink fixture");
 
     int xattr_expected = 1;
     static const char xattr_name[] = "user.migr_test";
@@ -371,6 +423,19 @@ static void test_fresh_capture(const char *source, int container_fd,
             skip_check("xattr fixture unavailable on this filesystem");
         } else {
             fixture_fatal("could not create xattr fixture");
+        }
+    }
+
+    int symlink_xattr_expected = 1;
+    static const char symlink_xattr_name[] = "user.migr_symlink";
+    static const char symlink_xattr_value[] = "symlink-xattr";
+    if (lsetxattr(link, symlink_xattr_name, symlink_xattr_value,
+                 sizeof(symlink_xattr_value) - 1U, 0) != 0) {
+        if (errno == ENOTSUP || errno == EOPNOTSUPP || errno == EPERM) {
+            symlink_xattr_expected = 0;
+            skip_check("symlink xattr fixture unavailable on this filesystem");
+        } else {
+            fixture_fatal("could not create symlink xattr fixture");
         }
     }
 
@@ -396,19 +461,33 @@ static void test_fresh_capture(const char *source, int container_fd,
     join_path(payload, sizeof(payload), container_path, "data/ROOT/nested/file.txt");
     check(file_equals(payload, "portable payload"),
           "regular payload is byte-exact under data");
+    join_path(payload, sizeof(payload), container_path, "data/ROOT/nested/link");
+    struct stat link_payload_stat;
+    check(lstat(payload, &link_payload_stat) == 0 &&
+              S_ISREG(link_payload_stat.st_mode) &&
+              link_payload_stat.st_size == 0 && file_equals(payload, ""),
+          "symlink payload is an empty regular placeholder");
 
     int slot_fd = openat(container_fd, SIDECAR_SLOT_NAME,
                          O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     FreshSidecarCheck sidecar_check = { .valid = 1 };
     SidecarParseResult parse_result;
+    SidecarStatus parse_status = SIDECAR_STATUS_INVALID_ARGUMENT;
+    if (slot_fd >= 0)
+        parse_status = sidecar_parse_fd(slot_fd, fresh_sidecar_callback,
+                                        &sidecar_check, &parse_result);
     check(slot_fd >= 0 &&
-          sidecar_parse_fd(slot_fd, fresh_sidecar_callback, &sidecar_check,
-                           &parse_result) == SIDECAR_STATUS_OK &&
-          sidecar_check.valid && sidecar_check.entries == 3 &&
-          sidecar_check.commits == 3 &&
+          parse_status == SIDECAR_STATUS_OK &&
+          sidecar_check.valid && sidecar_check.entries == 4 &&
+          sidecar_check.commits == 4 && sidecar_check.symlink_seen &&
+          sidecar_check.symlink_target_ok &&
+          !sidecar_check.symlink_regular_xattr_leaked &&
+          (!symlink_xattr_expected ||
+           (sidecar_check.symlink_xattr_seen &&
+            sidecar_check.symlink_entry_xattr_count >= 1)) &&
           (!xattr_expected ||
            sidecar_check.expected_xattr_seen),
-          "sidecar contains complete groups and captured xattrs");
+          "sidecar contains complete groups, symlink target, and xattrs");
     if (slot_fd >= 0)
         close(slot_fd);
 }
@@ -485,6 +564,27 @@ static void test_replacement_and_type_change(const char *source,
     check(sidecar_log_find(&log, bytes("FILE"), bytes("child"),
                            &(SidecarLiveView){0}) == 0,
           "directory-to-regular replacement tombstones old child state");
+
+    if (unlink(file) != 0 || symlink("replacement-target", file) != 0)
+        fixture_fatal("could not replace regular source with symlink");
+    check(portable_capture_root(&context, &root) == 0,
+          "regular-to-symlink replacement succeeds");
+    join_path(payload, sizeof(payload), replacement_container, "data/FILE");
+    check(lstat(payload, &st) == 0 && S_ISREG(st.st_mode) &&
+              st.st_size == 0 && file_equals(payload, ""),
+          "symlink replacement leaves an empty placeholder");
+    SidecarLiveView symlink_view;
+    int symlink_found = sidecar_log_find(&log, bytes("FILE"), bytes(""),
+                                         &symlink_view);
+    check(symlink_found == 1 && symlink_view.entry->kind == SIDECAR_KIND_SYMLINK &&
+              symlink_view.entry->symlink_target.length ==
+                  sizeof("replacement-target") - 1U &&
+              memcmp(symlink_view.entry->symlink_target.data,
+                     "replacement-target",
+                     sizeof("replacement-target") - 1U) == 0,
+          "replacement sidecar records the symlink target");
+    if (unlink(file) != 0)
+        fixture_fatal("could not remove symlink replacement fixture");
     close_live_capture(container_fd, &log, &context);
 }
 
