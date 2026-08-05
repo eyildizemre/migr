@@ -187,9 +187,9 @@ static void test_fresh_and_live_map(int container_fd)
           "adopted log closes cleanly");
 }
 
-static void test_sequence_guards(int container_fd)
+static void test_sequence_and_hardlink_guards(int container_fd)
 {
-    printf(BLUE "::" NC " append sequence and reserved kind guards\n");
+    printf(BLUE "::" NC " append sequence and hardlink guards\n");
     check(reset_slot(container_fd) == 0, "old slot is removed");
     SidecarLog log = {0};
     check(sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH,
@@ -215,13 +215,31 @@ static void test_sequence_guards(int container_fd)
     symlink.symlink_target = (SidecarBytes){
         (const unsigned char *)"target", 6
     };
-    check(sidecar_log_append_entry(&log, &symlink) ==
-              SIDECAR_STATUS_UNSUPPORTED_KIND,
-          "reserved symlink writer is rejected without opening a group");
-    check(sidecar_log_live_count(&log) == 1,
-          "unsupported entry does not change live state");
+    check(sidecar_log_append_entry(&log, &symlink) == SIDECAR_STATUS_OK,
+          "well-formed symlink entry opens a group");
+    check(sidecar_log_append_entry_commit(&log) == SIDECAR_STATUS_OK,
+          "symlink entry commits");
+    check(sidecar_log_live_count(&log) == 2,
+          "committed symlink entry is live");
+
+    SidecarLiveView view;
+    check(sidecar_log_find(&log, symlink.root_id, symlink.logical_path, &view) == 1 &&
+          view.entry != NULL && view.entry->kind == SIDECAR_KIND_SYMLINK &&
+          view.entry->symlink_target.length == 6 &&
+          memcmp(view.entry->symlink_target.data, "target", 6) == 0,
+          "live symlink target is copied into the state map");
     check(sidecar_log_close(&log) == SIDECAR_STATUS_OK,
           "guard log closes");
+
+    check(sidecar_log_adopt_at(container_fd, &log) == SIDECAR_OPEN_RESUMABLE &&
+          sidecar_log_live_count(&log) == 2,
+          "adopted state retains the committed symlink");
+    check(sidecar_log_find(&log, symlink.root_id, symlink.logical_path, &view) == 1 &&
+          view.entry != NULL && view.entry->symlink_target.length == 6 &&
+          memcmp(view.entry->symlink_target.data, "target", 6) == 0,
+          "adopted symlink target remains byte-exact");
+    check(sidecar_log_close(&log) == SIDECAR_STATUS_OK,
+          "adopted guard log closes");
 }
 
 static void test_missing_and_slot_types(int container_fd)
@@ -429,7 +447,7 @@ int main(void)
     }
 
     test_fresh_and_live_map(container_fd);
-    test_sequence_guards(container_fd);
+    test_sequence_and_hardlink_guards(container_fd);
     test_missing_and_slot_types(container_fd);
     test_truncated_tail(container_fd);
     test_interior_corruption_and_hardlink(container_fd);

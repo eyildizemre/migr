@@ -348,8 +348,7 @@ static int validate_entry(const SidecarEntry *entry)
         return -1;
     }
 
-    if (entry->kind == SIDECAR_KIND_SYMLINK ||
-        entry->kind == SIDECAR_KIND_HARDLINK)
+    if (entry->kind == SIDECAR_KIND_HARDLINK)
     {
         errno = EOPNOTSUPP;
         return -1;
@@ -365,8 +364,20 @@ static int validate_entry(const SidecarEntry *entry)
         set_invalid_error();
         return -1;
     }
-    if (entry->symlink_target.length != 0 || entry->hardlink_root_id.length != 0 ||
-        entry->hardlink_logical_path.length != 0)
+    if (entry->kind == SIDECAR_KIND_SYMLINK)
+    {
+        if (validate_bytes(entry->symlink_target,
+                           SIDECAR_MAX_SYMLINK_TARGET, 1) != 0 ||
+            entry->hardlink_root_id.length != 0 ||
+            entry->hardlink_logical_path.length != 0)
+        {
+            set_invalid_error();
+            return -1;
+        }
+    }
+    else if (entry->symlink_target.length != 0 ||
+             entry->hardlink_root_id.length != 0 ||
+             entry->hardlink_logical_path.length != 0)
     {
         set_invalid_error();
         return -1;
@@ -410,21 +421,27 @@ static int build_entry_buffer(const SidecarEntry *entry, SidecarBuffer *buffer)
         return -1;
     }
 
-    return buffer_append_tag(buffer, tag_entry) == 0 &&
-           buffer_append_field(buffer, entry->root_id) == 0 &&
-           buffer_append_field(buffer, entry->logical_path) == 0 &&
-           buffer_append_field(buffer, entry->physical_path) == 0 &&
-           buffer_append_field(buffer, (SidecarBytes){
-               (const unsigned char *)kind, strlen(kind) }) == 0 &&
-           buffer_append_uint(buffer, entry->mode) == 0 &&
-           buffer_append_uint(buffer, entry->uid) == 0 &&
-           buffer_append_uint(buffer, entry->gid) == 0 &&
-           buffer_append_int(buffer, entry->atime_sec) == 0 &&
-           buffer_append_uint(buffer, entry->atime_nsec) == 0 &&
-           buffer_append_int(buffer, entry->mtime_sec) == 0 &&
-           buffer_append_uint(buffer, entry->mtime_nsec) == 0 &&
-           buffer_append_uint(buffer, entry->size) == 0 &&
-           buffer_append_uint(buffer, entry->xattr_count) == 0 ? 0 : -1;
+    if (buffer_append_tag(buffer, tag_entry) != 0 ||
+        buffer_append_field(buffer, entry->root_id) != 0 ||
+        buffer_append_field(buffer, entry->logical_path) != 0 ||
+        buffer_append_field(buffer, entry->physical_path) != 0 ||
+        buffer_append_field(buffer, (SidecarBytes){
+            (const unsigned char *)kind, strlen(kind) }) != 0 ||
+        buffer_append_uint(buffer, entry->mode) != 0 ||
+        buffer_append_uint(buffer, entry->uid) != 0 ||
+        buffer_append_uint(buffer, entry->gid) != 0 ||
+        buffer_append_int(buffer, entry->atime_sec) != 0 ||
+        buffer_append_uint(buffer, entry->atime_nsec) != 0 ||
+        buffer_append_int(buffer, entry->mtime_sec) != 0 ||
+        buffer_append_uint(buffer, entry->mtime_nsec) != 0 ||
+        buffer_append_uint(buffer, entry->size) != 0 ||
+        buffer_append_uint(buffer, entry->xattr_count) != 0)
+        return -1;
+
+    if (entry->kind == SIDECAR_KIND_SYMLINK &&
+        buffer_append_field(buffer, entry->symlink_target) != 0)
+        return -1;
+    return 0;
 }
 
 static int build_xattr_buffer(const SidecarXattr *xattr, SidecarBuffer *buffer)

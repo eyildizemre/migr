@@ -17,12 +17,13 @@
 // (ftruncate, no data written) to exercise the real 4 GiB limit without
 // actually allocating or writing that much. Tail recovery distinguishes a
 // clean EOF mid-record (truncated tail, resumable) from malformed content
-// anywhere in the file (interior corruption, unusable) per D17; the reserved
-// symlink/hardlink kind fields are confirmed parseable even though
-// sidecar.c's own writer refuses to produce them yet.
+// anywhere in the file (interior corruption, unusable) per D17. Symlink
+// records are exercised through the writer and reader; hardlink records remain
+// a writer rejection until their later representation phase.
 
 #define _GNU_SOURCE
 
+#include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
@@ -360,16 +361,136 @@ static void test_writer_validation(int fd)
     entry.atime_nsec = 0;
     entry.root_id = (SidecarBytes){ (const unsigned char *)"bad\0root", 8 };
     check(sidecar_write_entry(fd, &entry) != 0, "NUL-containing fields are refused");
-    entry.root_id = (SidecarBytes){ (const unsigned char *)"ROOT", 4 };
-    entry.kind = SIDECAR_KIND_SYMLINK;
-    check(sidecar_write_entry(fd, &entry) != 0,
-          "reserved symlink writer remains disabled");
 
 done:
     free(root);
     free(path);
     free(name);
     free(value);
+}
+
+typedef struct {
+    const unsigned char *target;
+    size_t target_length;
+    int entries;
+    int valid;
+} SymlinkRoundTripState;
+
+static int symlink_roundtrip_callback(const SidecarRecord *record,
+                                      void *context)
+{
+    SymlinkRoundTripState *state = context;
+    if (record->type != SIDECAR_RECORD_ENTRY)
+        return 0;
+
+    const SidecarEntry *entry = &record->value.entry;
+    state->entries++;
+    if (entry->kind != SIDECAR_KIND_SYMLINK || entry->size != 0 ||
+        entry->symlink_target.length != state->target_length ||
+        (state->target_length != 0 &&
+         memcmp(entry->symlink_target.data, state->target,
+                state->target_length) != 0))
+        state->valid = 0;
+    return 0;
+}
+
+static void test_symlink_writer(int fd)
+{
+    printf(BLUE "::" NC " symlink writer validation and round trip\n");
+    static const unsigned char target[] = "../target";
+
+    SidecarEntry entry = sample_entry();
+    entry.kind = SIDECAR_KIND_SYMLINK;
+    entry.size = 0;
+    entry.xattr_count = 0;
+    entry.symlink_target = (SidecarBytes){ target, sizeof(target) - 1U };
+    check(reset_file(fd) == 0 && sidecar_write_header(fd) == 0 &&
+          sidecar_write_entry(fd, &entry) == 0 &&
+          sidecar_write_entry_commit(fd) == 0,
+          "well-formed symlink entry writes");
+
+    SymlinkRoundTripState state = {
+        .target = target,
+        .target_length = sizeof(target) - 1U,
+        .valid = 1
+    };
+    SidecarParseResult result;
+    check(sidecar_parse_fd(fd, symlink_roundtrip_callback, &state, &result) ==
+              SIDECAR_STATUS_OK && state.valid && state.entries == 1,
+          "written symlink target round-trips byte-for-byte");
+
+    entry = sample_entry();
+    entry.kind = SIDECAR_KIND_SYMLINK;
+    entry.size = 0;
+    entry.xattr_count = 0;
+    entry.symlink_target = (SidecarBytes){ NULL, 0 };
+    errno = 0;
+    check(reset_file(fd) == 0 && sidecar_write_header(fd) == 0 &&
+          sidecar_write_entry(fd, &entry) != 0 && errno == EINVAL,
+          "empty symlink target is rejected as malformed");
+
+    entry = sample_entry();
+    entry.kind = SIDECAR_KIND_SYMLINK;
+    entry.size = 0;
+    entry.xattr_count = 0;
+    entry.symlink_target = (SidecarBytes){ target, sizeof(target) - 1U };
+    entry.hardlink_root_id = entry.root_id;
+    errno = 0;
+    check(reset_file(fd) == 0 && sidecar_write_header(fd) == 0 &&
+          sidecar_write_entry(fd, &entry) != 0 && errno == EINVAL,
+          "symlink hardlink fields are rejected");
+
+    entry = sample_entry();
+    entry.kind = SIDECAR_KIND_SYMLINK;
+    entry.size = 1;
+    entry.xattr_count = 0;
+    entry.symlink_target = (SidecarBytes){ target, sizeof(target) - 1U };
+    errno = 0;
+    check(reset_file(fd) == 0 && sidecar_write_header(fd) == 0 &&
+          sidecar_write_entry(fd, &entry) != 0 && errno == EINVAL,
+          "non-zero symlink size is rejected");
+
+    entry = sample_entry();
+    entry.kind = SIDECAR_KIND_HARDLINK;
+    entry.size = 0;
+    entry.xattr_count = 0;
+    errno = 0;
+    check(reset_file(fd) == 0 && sidecar_write_header(fd) == 0 &&
+          sidecar_write_entry(fd, &entry) != 0 && errno == EOPNOTSUPP,
+          "hardlink writer remains unsupported");
+
+    unsigned char *long_target = malloc(SIDECAR_MAX_SYMLINK_TARGET + 1U);
+    check(long_target != NULL, "symlink boundary fixture allocates");
+    if (long_target != NULL)
+    {
+        memset(long_target, 't', SIDECAR_MAX_SYMLINK_TARGET + 1U);
+        entry = sample_entry();
+        entry.kind = SIDECAR_KIND_SYMLINK;
+        entry.size = 0;
+        entry.xattr_count = 0;
+        entry.symlink_target = (SidecarBytes){
+            long_target, SIDECAR_MAX_SYMLINK_TARGET
+        };
+        check(reset_file(fd) == 0 && sidecar_write_header(fd) == 0 &&
+              sidecar_write_entry(fd, &entry) == 0,
+              "symlink target at its ceiling is accepted");
+        entry.symlink_target.length++;
+        errno = 0;
+        check(sidecar_write_entry(fd, &entry) != 0 && errno == EINVAL,
+              "symlink target over its ceiling is rejected");
+        free(long_target);
+    }
+
+    static const unsigned char nul_target[] = { 'a', '\0', 'b' };
+    entry = sample_entry();
+    entry.kind = SIDECAR_KIND_SYMLINK;
+    entry.size = 0;
+    entry.xattr_count = 0;
+    entry.symlink_target = (SidecarBytes){ nul_target, sizeof(nul_target) };
+    errno = 0;
+    check(reset_file(fd) == 0 && sidecar_write_header(fd) == 0 &&
+          sidecar_write_entry(fd, &entry) != 0 && errno == EINVAL,
+          "NUL-containing symlink target is rejected");
 }
 
 static void test_tail_and_boundary(int fd)
@@ -451,7 +572,7 @@ static void test_corruption_and_versions(int fd)
     raw_free(&buffer);
 }
 
-static int reserved_kind_callback(const SidecarRecord *record, void *context)
+static int symlink_kind_callback(const SidecarRecord *record, void *context)
 {
     int *count = context;
     if (record->type == SIDECAR_RECORD_ENTRY &&
@@ -462,9 +583,9 @@ static int reserved_kind_callback(const SidecarRecord *record, void *context)
     return 0;
 }
 
-static void test_reserved_kind_parsing(int fd)
+static void test_symlink_kind_parsing(int fd)
 {
-    printf(BLUE "::" NC " sidecar reserved kind grammar\n");
+    printf(BLUE "::" NC " sidecar symlink grammar\n");
     RawBuffer buffer = {0};
     check(append_header(&buffer, "1") == 0 && raw_tag(&buffer, "ENTRY") == 0 &&
           raw_text_field(&buffer, "ROOT") == 0 &&
@@ -482,14 +603,14 @@ static void test_reserved_kind_parsing(int fd)
           raw_text_field(&buffer, "0") == 0 &&
           raw_text_field(&buffer, "../target") == 0 &&
           append_commit(&buffer) == 0 && set_raw_file(fd, &buffer) == 0,
-          "reserved symlink record fixture is written");
+          "raw symlink record fixture is written");
 
     int seen = 0;
     SidecarParseResult result;
-    SidecarStatus status = sidecar_parse_fd(fd, reserved_kind_callback, &seen,
+    SidecarStatus status = sidecar_parse_fd(fd, symlink_kind_callback, &seen,
                                             &result);
     check(status == SIDECAR_STATUS_OK && seen == 1,
-          "reserved symlink field parses without writer support");
+          "symlink target field parses from a raw record");
     raw_free(&buffer);
 }
 
@@ -533,9 +654,10 @@ int main(void)
 
     test_header_and_roundtrip(fd);
     test_writer_validation(fd);
+    test_symlink_writer(fd);
     test_tail_and_boundary(fd);
     test_corruption_and_versions(fd);
-    test_reserved_kind_parsing(fd);
+    test_symlink_kind_parsing(fd);
     test_total_limit(fd);
     test_live_entry_ceiling();
 
