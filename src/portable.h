@@ -7,6 +7,12 @@
 #include "manifest.h"
 #include "sidecar.h"
 
+typedef struct {
+    SidecarXattr *items;
+    size_t count;
+    size_t capacity;
+} PortableXattrs;
+
 /**
  * A source root and its container address for a portable capture.
  *

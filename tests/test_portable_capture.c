@@ -42,6 +42,14 @@
 #include "portable.h"
 #include "sidecar.h"
 
+extern int entry_from_stat(const char *root_id, const char *logical,
+                           const struct stat *st, int nsec_exact,
+                           PortableXattrs *xattrs, SidecarEntry *out,
+                           const SidecarBytes *symlink_target);
+extern int entries_equal(const SidecarEntry *current,
+                         const SidecarLiveView *previous,
+                         const PortableXattrs *xattrs);
+
 #define GREEN "\033[0;32m"
 #define RED   "\033[0;31m"
 #define BLUE  "\033[0;34m"
@@ -171,6 +179,58 @@ static PortableRootSpec root_spec(const char *id, const char *source,
 static SidecarBytes bytes(const char *text)
 {
     return (SidecarBytes){ (const unsigned char *)text, strlen(text) };
+}
+
+static void test_entry_helpers(const char *source)
+{
+    printf(BLUE "::" NC " portable symlink entry helpers\n");
+    char link_path[PATH_MAX];
+    join_path(link_path, sizeof(link_path), source, "entry-helper-link");
+    if (symlink("../target", link_path) != 0)
+        fixture_fatal("could not create symlink helper fixture");
+
+    struct stat link_stat;
+    if (lstat(link_path, &link_stat) != 0)
+        fixture_fatal("could not inspect symlink helper fixture");
+    PortableXattrs empty_xattrs = {0};
+    SidecarBytes target = bytes("../target");
+    SidecarEntry entry;
+    check(entry_from_stat("LINK", "item", &link_stat, 1,
+                          &empty_xattrs, &entry, &target) == 0,
+          "entry_from_stat accepts a symlink target");
+    check(entry.kind == SIDECAR_KIND_SYMLINK && entry.size == 0 &&
+              entry.xattr_count == 0 &&
+              entry.symlink_target.length == target.length &&
+              memcmp(entry.symlink_target.data, target.data, target.length) == 0,
+          "symlink entry preserves kind, zero size, and target bytes");
+
+    SidecarEntry symlink_entry = entry;
+
+    check(entry_from_stat("LINK", "item", &link_stat, 1,
+                          &empty_xattrs, &entry, NULL) != 0,
+          "symlink entry without a target is rejected");
+    SidecarBytes empty_target = {0};
+    check(entry_from_stat("LINK", "item", &link_stat, 1,
+                          &empty_xattrs, &entry, &empty_target) != 0,
+          "symlink entry with an empty target is rejected");
+
+    SidecarEntry previous = symlink_entry;
+    previous.symlink_target = target;
+    SidecarLiveView view = {
+        .entry = &previous,
+        .xattrs = NULL,
+        .xattr_count = 0,
+        .generation = 0
+    };
+    entry = previous;
+    check(entries_equal(&entry, &view, &empty_xattrs) != 0,
+          "entries_equal accepts identical symlink targets");
+    entry.symlink_target = bytes("other-target");
+    check(entries_equal(&entry, &view, &empty_xattrs) == 0,
+          "entries_equal rejects different symlink targets");
+
+    if (unlink(link_path) != 0)
+        fixture_fatal("could not remove symlink helper fixture");
 }
 
 static int live_kind(SidecarLog *log, const char *root, const char *logical,
@@ -541,6 +601,7 @@ int main(void)
     if (container_fd < 0)
         fixture_fatal("could not open container fixture");
 
+    test_entry_helpers(source_path);
     test_fresh_capture(source_path, container_fd, container_path);
     test_replacement_and_type_change(source_path, root_path);
     test_unsupported_types(source_path, root_path);

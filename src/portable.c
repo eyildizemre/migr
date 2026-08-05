@@ -19,12 +19,6 @@
 #include "metadata.h"
 
 typedef struct {
-    SidecarXattr *items;
-    size_t count;
-    size_t capacity;
-} PortableXattrs;
-
-typedef struct {
     char *root_id;
     char *logical_path;
     size_t root_length;
@@ -515,9 +509,10 @@ static int time_to_i64(time_t value, int64_t *out)
     return 0;
 }
 
-static int entry_from_stat(const char *root_id, const char *logical,
-                           const struct stat *st, int nsec_exact,
-                           PortableXattrs *xattrs, SidecarEntry *out)
+int entry_from_stat(const char *root_id, const char *logical,
+                    const struct stat *st, int nsec_exact,
+                    PortableXattrs *xattrs, SidecarEntry *out,
+                    const SidecarBytes *symlink_target)
 {
     int64_t atime_sec;
     int64_t mtime_sec;
@@ -538,8 +533,12 @@ static int entry_from_stat(const char *root_id, const char *logical,
     out->logical_path = (SidecarBytes){ (const unsigned char *)logical,
                                         strlen(logical) };
     out->physical_path = out->logical_path;
-    out->kind = S_ISREG(st->st_mode) ? SIDECAR_KIND_REGULAR
-                                     : SIDECAR_KIND_DIRECTORY;
+    if (S_ISLNK(st->st_mode))
+        out->kind = SIDECAR_KIND_SYMLINK;
+    else if (S_ISREG(st->st_mode))
+        out->kind = SIDECAR_KIND_REGULAR;
+    else
+        out->kind = SIDECAR_KIND_DIRECTORY;
     out->mode = (uint32_t)(st->st_mode & 07777);
     out->uid = (uint32_t)st->st_uid;
     out->gid = (uint32_t)st->st_gid;
@@ -549,6 +548,12 @@ static int entry_from_stat(const char *root_id, const char *logical,
     out->mtime_nsec = nsec_exact ? (uint32_t)st->st_mtim.tv_nsec : 0;
     out->size = S_ISREG(st->st_mode) ? (uint64_t)st->st_size : 0;
     out->xattr_count = xattrs == NULL ? 0U : (uint32_t)xattrs->count;
+    if (out->kind == SIDECAR_KIND_SYMLINK) {
+        if (symlink_target == NULL || symlink_target->data == NULL ||
+            symlink_target->length == 0)
+            return -1;
+        out->symlink_target = *symlink_target;
+    }
     return 0;
 }
 
@@ -589,9 +594,9 @@ static int xattrs_equal(const PortableXattrs *current,
     return 1;
 }
 
-static int entries_equal(const SidecarEntry *current,
-                         const SidecarLiveView *previous,
-                         const PortableXattrs *xattrs)
+int entries_equal(const SidecarEntry *current,
+                  const SidecarLiveView *previous,
+                  const PortableXattrs *xattrs)
 {
     if (current == NULL || previous == NULL || previous->entry == NULL)
         return 0;
@@ -1587,7 +1592,7 @@ static int capture_directory(PortableCaptureContext *context,
 
     SidecarEntry sidecar_entry;
     if (entry_from_stat(root->id, logical, before, context->nsec_exact,
-                        xattrs, &sidecar_entry) != 0 ||
+                        xattrs, &sidecar_entry, NULL) != 0 ||
         append_group(context, &sidecar_entry, xattrs) != 0) {
         xattrs_free(xattrs);
         close(destination_fd);
@@ -1671,7 +1676,7 @@ static int capture_regular(PortableCaptureContext *context,
 
     SidecarEntry sidecar_entry;
     failed = entry_from_stat(root->id, logical, before, context->nsec_exact,
-                             xattrs, &sidecar_entry) != 0 ||
+                             xattrs, &sidecar_entry, NULL) != 0 ||
              append_group(context, &sidecar_entry, xattrs) != 0;
     xattrs_free(xattrs);
     return failed ? -1 : 0;
@@ -1781,7 +1786,7 @@ static int capture_node(PortableCaptureContext *context,
             SidecarEntry current;
             int matches = entry_from_stat(root->id, logical, &before,
                                           context->nsec_exact, &xattrs,
-                                          &current) == 0 &&
+                                          &current, NULL) == 0 &&
                           entries_equal(&current, &previous, &xattrs);
             if (matches) {
                 int payload = existing_payload_matches(
