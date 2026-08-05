@@ -691,13 +691,16 @@ int entries_equal(const SidecarEntry *current,
     if (current == NULL || previous == NULL || previous->entry == NULL)
         return 0;
     const SidecarEntry *entry = previous->entry;
+    /* Reading a symlink target may update its source atime; D18 does not
+     * promise source-symlink atime preservation, so atime is not a resume key. */
     return sidecar_bytes_equal(current->root_id, entry->root_id) &&
            sidecar_bytes_equal(current->logical_path, entry->logical_path) &&
            sidecar_bytes_equal(current->physical_path, entry->physical_path) &&
            current->kind == entry->kind && current->mode == entry->mode &&
            current->uid == entry->uid && current->gid == entry->gid &&
-           current->atime_sec == entry->atime_sec &&
-           current->atime_nsec == entry->atime_nsec &&
+           (current->kind == SIDECAR_KIND_SYMLINK ||
+            (current->atime_sec == entry->atime_sec &&
+             current->atime_nsec == entry->atime_nsec)) &&
            current->mtime_sec == entry->mtime_sec &&
            current->mtime_nsec == entry->mtime_nsec &&
            current->size == entry->size &&
@@ -1891,6 +1894,45 @@ static int capture_symlink(PortableCaptureContext *context,
         return -1;
     }
 
+    SidecarBytes target_bytes = {
+        (const unsigned char *)target, (size_t)target_length
+    };
+    SidecarEntry entry;
+    if (entry_from_stat(root->id, logical, before, context->nsec_exact,
+                        &xattrs, &entry, &target_bytes) != 0) {
+        xattrs_free(&xattrs);
+        return -1;
+    }
+
+    if (context->resume_mode) {
+        SidecarBytes root_key = {
+            (const unsigned char *)root->id, strlen(root->id)
+        };
+        SidecarBytes logical_key = {
+            (const unsigned char *)logical, strlen(logical)
+        };
+        SidecarLiveView previous;
+        int live = sidecar_log_find(context->sidecar, root_key, logical_key,
+                                    &previous);
+        if (live < 0) {
+            xattrs_free(&xattrs);
+            return -1;
+        }
+        if (live == 1 && entries_equal(&entry, &previous, &xattrs)) {
+            int payload = existing_payload_matches(
+                context->data_fd, root->payload_path, destination_parent,
+                destination_leaf, destination_is_root, 0);
+            if (payload < 0) {
+                xattrs_free(&xattrs);
+                return -1;
+            }
+            if (payload == 1) {
+                xattrs_free(&xattrs);
+                return 0;
+            }
+        }
+    }
+
     if (tombstone_if_live(context, root->id, logical) != 0) {
         xattrs_free(&xattrs);
         return -1;
@@ -1917,6 +1959,7 @@ static int capture_symlink(PortableCaptureContext *context,
     }
 
     int destination_fd;
+    portable_test_interrupt_if(PORTABLE_TEST_BEFORE_PAYLOAD_REPLACE);
     if (ensure_regular_leaf(parent_fd, destination_leaf,
                             &destination_fd) != 0) {
         if (destination_is_root)
@@ -1924,6 +1967,7 @@ static int capture_symlink(PortableCaptureContext *context,
         xattrs_free(&xattrs);
         return -1;
     }
+    portable_test_interrupt_if(PORTABLE_TEST_AFTER_PAYLOAD_REPLACE);
     int failed = close(destination_fd) != 0;
     if (destination_is_root && close(parent_fd) != 0)
         failed = 1;
@@ -1932,14 +1976,7 @@ static int capture_symlink(PortableCaptureContext *context,
         return -1;
     }
 
-    SidecarBytes target_bytes = {
-        (const unsigned char *)target, (size_t)target_length
-    };
-    SidecarEntry entry;
-    failed = entry_from_stat(root->id, logical, before,
-                             context->nsec_exact, &xattrs, &entry,
-                             &target_bytes) != 0 ||
-             append_group(context, &entry, &xattrs) != 0;
+    failed = append_group(context, &entry, &xattrs) != 0;
     xattrs_free(&xattrs);
     return failed ? -1 : 0;
 }

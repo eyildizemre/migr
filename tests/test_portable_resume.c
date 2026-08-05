@@ -1,8 +1,10 @@
 // Resume, adopt, and interruption-safety coverage for the portable capture
-// seam (docs/DECISIONS.md D17): committed-entry skip on an unchanged source
-// (inode + full metadata/xattr equality + on-disk payload size), forced
-// recapture on a missing or changed payload, pristine-namespace gating before
-// a fresh sidecar is ever recovered onto a partial (manifest written, data/
+// seam (docs/DECISIONS.md D17): committed-entry skip on unchanged regular and
+// symlink sources (inode + metadata/xattr equality; symlink source atime is
+// excluded per D18 because target reads may update it + on-disk payload shape),
+// forced recapture on a missing or changed payload, and pristine-namespace
+// gating before a fresh sidecar is ever recovered onto a partial (manifest written,
+// data/
 // absent or empty, sidecar absent), refusal (not silent freshening) of a
 // non-empty data/ without a sidecar and of a corrupt or symlinked sidecar
 // slot, truncated-tail adoption, a manifest-identity mismatch refusing to
@@ -150,6 +152,17 @@ static int file_equals(const char *path, const char *expected)
     return result;
 }
 
+static int symlink_equals(const char *path, const char *expected)
+{
+    char target[SIDECAR_MAX_SYMLINK_TARGET + 1U];
+    ssize_t length = readlink(path, target, sizeof(target));
+    if (length < 0 || (size_t)length >= sizeof(target))
+        return 0;
+    size_t expected_length = strlen(expected);
+    return (size_t)length == expected_length &&
+           memcmp(target, expected, expected_length) == 0;
+}
+
 static PortableRootSpec root_spec(const char *id, const char *source,
                                   const char *payload)
 {
@@ -294,6 +307,144 @@ static void test_resume_skips_and_replaces(const char *base)
     check(file_equals(payload_b, "after"),
           "a missing or changed committed payload is recaptured");
     close(container_fd);
+}
+
+static int prepare_symlink_replacement(const char *base, const char *label,
+                                       PortableRootSpec *root,
+                                       PortableCaptureRequest *request,
+                                       int *container_fd)
+{
+    char source_path[PATH_MAX];
+    char container_path[PATH_MAX];
+    join_path(source_path, sizeof(source_path), base, label);
+    char container_name[PATH_MAX];
+    int written = snprintf(container_name, sizeof(container_name),
+                           "%s-container", label);
+    if (written < 0 || (size_t)written >= sizeof(container_name))
+        return -1;
+    join_path(container_path, sizeof(container_path), base, container_name);
+    make_directory(source_path);
+
+    char link_path[PATH_MAX];
+    join_path(link_path, sizeof(link_path), source_path, "link");
+    if (symlink("before-target", link_path) != 0)
+        return -1;
+    char *stable_link = strdup(link_path);
+    if (stable_link == NULL)
+        fixture_fatal("could not retain symlink source path");
+
+    *root = root_spec("LINK", stable_link, "LINK");
+    *request = request_for(root, "c3c0");
+    if (fresh_capture(container_path, request, container_fd) != 0) {
+        free(stable_link);
+        return -1;
+    }
+    return 0;
+}
+
+static void replace_symlink_target(const char *path, const char *target)
+{
+    if (unlink(path) != 0 || symlink(target, path) != 0)
+        fixture_fatal("could not replace symlink fixture target");
+}
+
+static int symlink_live_target(int container_fd, const char *expected)
+{
+    SidecarLog log = {0};
+    if (sidecar_log_adopt_at(container_fd, &log) != SIDECAR_OPEN_RESUMABLE)
+        return 0;
+    SidecarLiveView view;
+    int found = sidecar_log_find(
+        &log,
+        (SidecarBytes){ (const unsigned char *)"LINK", 4 },
+        (SidecarBytes){ (const unsigned char *)"", 0 }, &view);
+    size_t expected_length = strlen(expected);
+    int result = found == 1 && view.entry->kind == SIDECAR_KIND_SYMLINK &&
+                 view.entry->symlink_target.length == expected_length &&
+                 memcmp(view.entry->symlink_target.data, expected,
+                        expected_length) == 0;
+    if (sidecar_log_close(&log) != SIDECAR_STATUS_OK)
+        return 0;
+    return result;
+}
+
+static int symlink_placeholder(int container_fd)
+{
+    int data_fd = openat(container_fd, "data",
+                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (data_fd < 0)
+        return 0;
+    struct stat st;
+    int result = fstatat(data_fd, "LINK", &st, AT_SYMLINK_NOFOLLOW) == 0 &&
+                 S_ISREG(st.st_mode) && st.st_size == 0;
+    if (close(data_fd) != 0)
+        result = 0;
+    return result;
+}
+
+static void test_symlink_resume(const char *base)
+{
+    printf(BLUE "::" NC " symlink resume skip and target replacement\n");
+    PortableRootSpec root;
+    PortableCaptureRequest request;
+    int container_fd = -1;
+    char container_path[PATH_MAX];
+    join_path(container_path, sizeof(container_path), base,
+              "symlink-resume-container");
+    check(prepare_symlink_replacement(base, "symlink-resume", &root,
+                                      &request, &container_fd) == 0,
+          "symlink resume fixture has a committed predecessor");
+    if (container_fd < 0)
+        return;
+
+    char slot_path[PATH_MAX];
+    join_path(slot_path, sizeof(slot_path), container_path,
+              SIDECAR_SLOT_NAME);
+    char payload_path[PATH_MAX];
+    join_path(payload_path, sizeof(payload_path), container_path,
+              "data/LINK");
+    struct stat payload_before;
+    struct stat sidecar_before;
+    check(lstat(payload_path, &payload_before) == 0 &&
+              S_ISREG(payload_before.st_mode) && payload_before.st_size == 0 &&
+              stat(slot_path, &sidecar_before) == 0,
+          "symlink placeholder and sidecar exist before resume");
+    check(symlink_live_target(container_fd, "before-target"),
+          "initial symlink entry records its target");
+
+    portable_capture_test_set_interrupt(PORTABLE_TEST_INTERRUPT_NONE);
+    sidecar_test_set_interrupt(SIDECAR_TEST_INTERRUPT_NONE);
+    check(portable_capture_resume_at(container_fd, &request) == 0,
+          "resume accepts an unchanged symlink");
+    struct stat payload_after;
+    struct stat sidecar_after;
+    check(lstat(payload_path, &payload_after) == 0 &&
+              payload_after.st_ino == payload_before.st_ino &&
+              stat(slot_path, &sidecar_after) == 0 &&
+              sidecar_after.st_size == sidecar_before.st_size &&
+              symlink_placeholder(container_fd) &&
+              symlink_live_target(container_fd, "before-target"),
+          "unchanged symlink resume leaves payload and sidecar untouched");
+
+    check(portable_capture_resume_at(container_fd, &request) == 0,
+          "a second unchanged symlink resume remains idempotent");
+    check(stat(slot_path, &sidecar_after) == 0 &&
+              sidecar_after.st_size == sidecar_before.st_size,
+          "repeated unchanged resume appends no sidecar group");
+
+    replace_symlink_target(root.capture_path, "after-target");
+    check(symlink_equals(root.capture_path, "after-target"),
+          "fixture exposes the changed symlink target");
+    check(portable_capture_resume_at(container_fd, &request) == 0,
+          "resume recaptures a changed symlink target");
+    check(symlink_placeholder(container_fd) &&
+              symlink_live_target(container_fd, "after-target") &&
+              stat(slot_path, &sidecar_after) == 0 &&
+              sidecar_after.st_size > sidecar_before.st_size,
+          "changed symlink gets a fresh group and intact placeholder");
+
+    close(container_fd);
+    free((void *)root.capture_path);
 }
 
 static void test_missing_sidecar(const char *base)
@@ -566,6 +717,98 @@ static void test_sigkill_boundaries(const char *base)
     }
 }
 
+static int symlink_xattr_fixture_available(void)
+{
+    char base[] = "/tmp/migr_portable_resume_symlink_xattr_XXXXXX";
+    if (mkdtemp(base) == NULL)
+        return 0;
+    char link_path[PATH_MAX];
+    join_path(link_path, sizeof(link_path), base, "link");
+    int available = symlink("target", link_path) == 0;
+    if (available && lsetxattr(link_path, "user.migr_symlink_resume", "x", 1,
+                               0) != 0) {
+        if (errno == ENOTSUP || errno == EOPNOTSUPP || errno == EPERM)
+            available = 0;
+        else
+            fixture_fatal("could not probe symlink xattr support");
+    }
+    if (unlink(link_path) != 0 || rmdir(base) != 0)
+        fixture_fatal("could not remove symlink xattr probe");
+    return available;
+}
+
+static void test_symlink_sigkill_boundaries(const char *base)
+{
+    printf(BLUE "::" NC " symlink SIGKILL interruption boundaries\n");
+    struct {
+        const char *label;
+        PortableTestInterruptPoint portable_point;
+        SidecarTestInterruptPoint sidecar_point;
+    } cases[] = {
+        { "delete-before", PORTABLE_TEST_BEFORE_REPLACEMENT_DELETE,
+          SIDECAR_TEST_INTERRUPT_NONE },
+        { "delete-after", PORTABLE_TEST_AFTER_REPLACEMENT_DELETE,
+          SIDECAR_TEST_INTERRUPT_NONE },
+        { "payload-replace-before", PORTABLE_TEST_BEFORE_PAYLOAD_REPLACE,
+          SIDECAR_TEST_INTERRUPT_NONE },
+        { "payload-replace-after", PORTABLE_TEST_AFTER_PAYLOAD_REPLACE,
+          SIDECAR_TEST_INTERRUPT_NONE },
+        { "entry-middle", PORTABLE_TEST_INTERRUPT_NONE,
+          SIDECAR_TEST_MID_ENTRY },
+        { "xattr-middle", PORTABLE_TEST_INTERRUPT_NONE,
+          SIDECAR_TEST_MID_XATTR },
+        { "commit-before", PORTABLE_TEST_INTERRUPT_NONE,
+          SIDECAR_TEST_BEFORE_ENTRY_COMMIT },
+        { "commit-after", PORTABLE_TEST_INTERRUPT_NONE,
+          SIDECAR_TEST_AFTER_ENTRY_COMMIT },
+        { "commit-middle", PORTABLE_TEST_INTERRUPT_NONE,
+          SIDECAR_TEST_MID_ENTRY_COMMIT }
+    };
+    int xattr_available = symlink_xattr_fixture_available();
+
+    for (size_t index = 0; index < sizeof(cases) / sizeof(cases[0]); index++) {
+        if (!xattr_available && strcmp(cases[index].label, "xattr-middle") == 0) {
+            skip_check("symlink xattr interruption fixture unavailable");
+            continue;
+        }
+
+        PortableRootSpec root;
+        PortableCaptureRequest request;
+        int container_fd = -1;
+        char label[NAME_MAX];
+        int length = snprintf(label, sizeof(label), "symlink-interrupt-%s",
+                              cases[index].label);
+        if (length < 0 || (size_t)length >= sizeof(label))
+            fixture_fatal("symlink interruption label is too long");
+        check(prepare_symlink_replacement(base, label, &root, &request,
+                                           &container_fd) == 0,
+              "symlink interruption fixture has a committed predecessor");
+        if (container_fd < 0)
+            continue;
+
+        replace_symlink_target(root.capture_path, "after-target");
+
+        if (strcmp(cases[index].label, "xattr-middle") == 0 &&
+            lsetxattr(root.capture_path, "user.migr_symlink_resume", "value",
+                      5, 0) != 0)
+            fixture_fatal("could not create symlink xattr interruption fixture");
+
+        int killed = run_resume_interrupt(container_fd, &request,
+                                          cases[index].portable_point,
+                                          cases[index].sidecar_point);
+        check(killed == 0, cases[index].label);
+        portable_capture_test_set_interrupt(PORTABLE_TEST_INTERRUPT_NONE);
+        sidecar_test_set_interrupt(SIDECAR_TEST_INTERRUPT_NONE);
+        check(portable_capture_resume_at(container_fd, &request) == 0,
+              "a killed symlink capture remains resumable");
+        check(symlink_placeholder(container_fd) &&
+                  symlink_live_target(container_fd, "after-target"),
+              "resumed symlink capture has the target and placeholder");
+        close(container_fd);
+        free((void *)root.capture_path);
+    }
+}
+
 static void test_identity_mismatch(const char *base)
 {
     printf(BLUE "::" NC " resume identity gate\n");
@@ -599,11 +842,13 @@ int main(void)
         fixture_fatal("could not create fixture root");
 
     test_resume_skips_and_replaces(base);
+    test_symlink_resume(base);
     test_missing_sidecar(base);
     test_nonempty_without_sidecar(base);
     test_unsafe_sidecar(base);
     test_truncated_tail(base);
     test_sigkill_boundaries(base);
+    test_symlink_sigkill_boundaries(base);
     test_identity_mismatch(base);
 
     remove_tree(base);

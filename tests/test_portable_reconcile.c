@@ -302,6 +302,63 @@ static void test_deleted_file(const char *base)
     close_fixture(&fixture);
 }
 
+static void test_deleted_symlink(const char *base)
+{
+    printf(BLUE "::" NC " stale symlink reconciliation\n");
+    char source[PATH_MAX];
+    char container[PATH_MAX];
+    join_path(source, sizeof(source), base, "symlink-source");
+    join_path(container, sizeof(container), base, "symlink-container");
+    make_directory(source);
+    make_directory(container);
+
+    char link_path[PATH_MAX];
+    join_path(link_path, sizeof(link_path), source, "gone");
+    if (symlink("gone-target", link_path) != 0)
+        fixture_fatal("could not create stale symlink fixture");
+
+    PortableRootSpec root = {
+        .id = "ROOT",
+        .policy = ROOT_POLICY_HOME_RELATIVE,
+        .capture_path = source,
+        .payload_path = "ROOT",
+        .source_path = source,
+        .restore_path = "fixture",
+        .has_restore_path = 1
+    };
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .has_source_identity = 1,
+        .machine_id = "c3c1",
+        .source_uid = getuid(),
+        .roots = &root,
+        .root_count = 1,
+        .nsec_exact = 1
+    };
+    int container_fd = open(container, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open stale symlink container");
+    check(portable_capture_fresh_at(container_fd, &request) == 0,
+          "initial capture creates a symlink placeholder");
+
+    char payload[PATH_MAX];
+    join_path(payload, sizeof(payload), container, "data/ROOT/gone");
+    check(path_exists(payload),
+          "captured symlink has a payload placeholder before deletion");
+    if (unlink(link_path) != 0)
+        fixture_fatal("could not remove stale symlink source");
+    check(portable_capture_resume_at(container_fd, &request) == 0,
+          "resume reconciles a deleted source symlink");
+    int live = -1;
+    int deleted = -1;
+    check(sidecar_state(&(Fixture){ .container_fd = container_fd }, "gone",
+                         &live, &deleted) == 0 && live == 0 && deleted == 1,
+          "deleted symlink is non-live with retained deletion provenance");
+    check(path_missing(payload),
+          "deleted symlink placeholder is removed from the container");
+    close(container_fd);
+}
+
 static void test_deleted_subtree(const char *base)
 {
     printf(BLUE "::" NC " stale subtree reconciliation\n");
@@ -474,6 +531,7 @@ int main(void)
         fixture_fatal("could not create fixture root");
 
     test_deleted_file(base);
+    test_deleted_symlink(base);
     test_deleted_subtree(base);
     test_cleanup_failure(base);
     test_inventory_mismatch(base);
