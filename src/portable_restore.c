@@ -674,8 +674,12 @@ static int collect_metadata_profile(const Collection *collection,
         errno = E2BIG;
         return -1;
     }
-    desired.st_mode = entry->mode |
-        (entry->kind == SIDECAR_KIND_DIRECTORY ? S_IFDIR : S_IFREG);
+    mode_t type = S_IFREG;
+    if (entry->kind == SIDECAR_KIND_SYMLINK)
+        type = S_IFLNK;
+    else if (entry->kind == SIDECAR_KIND_DIRECTORY)
+        type = S_IFDIR;
+    desired.st_mode = entry->mode | type;
 
     int anchor = -1;
     struct stat existing;
@@ -748,7 +752,8 @@ static int collect_entry(const SidecarLiveView *view, void *argument)
         return 0;
     }
     if (entry->kind != SIDECAR_KIND_REGULAR &&
-        entry->kind != SIDECAR_KIND_DIRECTORY)
+        entry->kind != SIDECAR_KIND_DIRECTORY &&
+        entry->kind != SIDECAR_KIND_SYMLINK)
     {
         report_violation(report, root_index, "unsupported-kind");
         return 0;
@@ -2095,6 +2100,58 @@ static int replay_apply_regular(ReplayCollection *collection,
     return result;
 }
 
+static int replay_apply_symlink(ReplayCollection *collection,
+                                ReplayEntry *replay)
+{
+    if (collection == NULL || replay == NULL || replay->entry == NULL ||
+        replay->entry->kind != SIDECAR_KIND_SYMLINK ||
+        !replay_entry_valid(replay->entry))
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    const SidecarEntry *entry = replay->entry;
+    struct stat desired;
+    if (replay_stat_from_entry(entry, &desired) != 0)
+        return -1;
+
+    size_t target_length = entry->symlink_target.length;
+    char target[SIDECAR_MAX_SYMLINK_TARGET + 1U];
+    memcpy(target, entry->symlink_target.data, target_length);
+    target[target_length] = '\0';
+
+    int parent_fd = -1;
+    char leaf[NAME_MAX + 1U];
+    int result = replay_destination_parent(collection, replay, &parent_fd,
+                                           leaf, sizeof(leaf));
+    if (result == 0)
+    {
+        struct stat existing;
+        if (fstatat(parent_fd, leaf, &existing, AT_SYMLINK_NOFOLLOW) == 0)
+        {
+            errno = EEXIST;
+            result = -1;
+        }
+        else if (errno != ENOENT)
+            result = -1;
+    }
+    if (result == 0 && symlinkat(target, parent_fd, leaf) != 0)
+        result = -1;
+    if (result == 0)
+        result = metadata_apply_symlink_at(parent_fd, leaf, &desired,
+                                           collection->timestamp_policy);
+
+    int saved = errno;
+    if (parent_fd >= 0 && close(parent_fd) != 0 && result == 0)
+    {
+        result = -1;
+        saved = EIO;
+    }
+    errno = saved;
+    return result;
+}
+
 static int replay_prepare_directory(ReplayCollection *collection,
                                      ReplayEntry *replay)
 {
@@ -2199,9 +2256,13 @@ static int replay_run(ReplayCollection *collection)
     for (size_t index = 0; index < collection->count; index++)
     {
         ReplayEntry *replay = &collection->items[index];
-        int result = replay->entry->kind == SIDECAR_KIND_DIRECTORY
-            ? replay_prepare_directory(collection, replay)
-            : replay_apply_regular(collection, replay);
+        int result;
+        if (replay->entry->kind == SIDECAR_KIND_SYMLINK)
+            result = replay_apply_symlink(collection, replay);
+        else if (replay->entry->kind == SIDECAR_KIND_DIRECTORY)
+            result = replay_prepare_directory(collection, replay);
+        else
+            result = replay_apply_regular(collection, replay);
         if (result != 0)
         {
             replay_report_failure(collection->report, collection->manifest,
@@ -2209,7 +2270,8 @@ static int replay_run(ReplayCollection *collection)
                                   replay->entry->logical_path);
             return -1;
         }
-        if (replay->entry->kind == SIDECAR_KIND_REGULAR)
+        if (replay->entry->kind == SIDECAR_KIND_REGULAR ||
+            replay->entry->kind == SIDECAR_KIND_SYMLINK)
         {
             if (collection->report->applied_count != SIZE_MAX)
                 collection->report->applied_count++;

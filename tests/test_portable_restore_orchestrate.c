@@ -144,6 +144,267 @@ static int metadata_exact(const char *path, mode_t mode, uid_t uid, gid_t gid,
            st.st_mtim.tv_nsec == mtime_nsec;
 }
 
+static int symlink_exact(const char *path, const char *target, mode_t mode,
+                         uid_t uid, gid_t gid, int64_t atime_sec,
+                         long atime_nsec, int64_t mtime_sec,
+                         long mtime_nsec)
+{
+    struct stat st;
+    if (lstat(path, &st) != 0 || !S_ISLNK(st.st_mode) ||
+        (st.st_mode & 07777) != mode || st.st_uid != uid ||
+        st.st_gid != gid || st.st_atim.tv_sec != (time_t)atime_sec ||
+        st.st_atim.tv_nsec != atime_nsec ||
+        st.st_mtim.tv_sec != (time_t)mtime_sec ||
+        st.st_mtim.tv_nsec != mtime_nsec)
+        return 0;
+
+    char actual[SIDECAR_MAX_SYMLINK_TARGET + 1U];
+    ssize_t length = readlink(path, actual, sizeof(actual) - 1U);
+    size_t expected_length = strlen(target);
+    if (length < 0 || (size_t)length != expected_length)
+        return 0;
+    actual[length] = '\0';
+    return memcmp(actual, target, expected_length) == 0;
+}
+
+typedef struct {
+    char base[PATH_MAX];
+    char container[PATH_MAX];
+    char home[PATH_MAX];
+    int container_fd;
+    int data_fd;
+    int home_fd;
+} Fixture;
+
+typedef struct {
+    char sentinel[PATH_MAX];
+    char target[PATH_MAX];
+    int called;
+    int sentinel_untouched;
+    int target_absent;
+} ProbeObservation;
+
+static SidecarBytes text_bytes(const char *text);
+static SidecarEntry entry_for(const char *root, const char *logical,
+                              const char *physical, SidecarObjectKind kind,
+                              uint64_t size, uint32_t mode, uint32_t uid,
+                              uint32_t gid, int64_t atime_sec,
+                              uint32_t atime_nsec, int64_t mtime_sec,
+                              uint32_t mtime_nsec);
+static ManifestRoot root_for(void);
+static void fixture_close(Fixture *fixture);
+static int fixture_open(Fixture *fixture, ManifestRoot *root);
+static int write_sidecar(Fixture *fixture, const SidecarEntry *entries,
+                         size_t count);
+static void probe_observer(void *context);
+static int run_orchestration(Fixture *fixture,
+                             PortableRestoreReplayReport *report,
+                             int nsec_exact, const char *answer);
+
+static void build_symlink_payload(Fixture *fixture)
+{
+    make_dir_at(fixture->data_fd, "ROOT", 0700);
+    write_file_at(fixture->data_fd, "ROOT/link", "");
+    write_file_at(fixture->home_fd, "sentinel_target", "untouched");
+}
+
+static void test_symlink_orchestration(void)
+{
+    printf(BLUE "::" NC " end-to-end portable symlink replay\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "symlink orchestration fixture is created");
+    if (opened != 0)
+        return;
+
+    build_symlink_payload(&fixture);
+    uint32_t uid = (uint32_t)geteuid();
+    uint32_t gid = (uint32_t)getegid();
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  uid, gid, 1700000400, 123, 1700000401, 456),
+        entry_for("ROOT", "link", "link", SIDECAR_KIND_SYMLINK, 0, 0711,
+                  uid, gid, 1700000410, 123456789, 1700000420, 987654321)
+    };
+    entries[1].symlink_target = text_bytes("../sentinel_target");
+    check(write_sidecar(&fixture, entries, 2) == 0,
+          "symlink orchestration sidecar is committed");
+
+    Manifest manifest;
+    int manifest_status = manifest_read_v1_at(fixture.container_fd,
+                                               &manifest);
+    PortableRestorePreflightReport preflight;
+    portable_restore_preflight_report_init(&preflight);
+    PortableRestoreRequest preflight_request = {
+        .source_container_fd = fixture.container_fd,
+        .manifest = &manifest,
+        .destination_home_fd = fixture.home_fd,
+        .destination_timestamp_policy = {
+            .nsec_exact = 1,
+            .configured = 1
+        }
+    };
+    int preflight_result = manifest_status == MANIFEST_STATUS_VALID
+        ? portable_restore_preflight_at(&preflight_request, &preflight) : -1;
+    check(preflight_result == 0 && preflight.live_count == 2 &&
+              preflight.violation_count == 0 && preflight.root_count == 1 &&
+              preflight.roots != NULL && preflight.roots[0].live_count == 2,
+          "symlink participates in the full preflight inventory");
+    portable_restore_preflight_report_free(&preflight);
+    if (manifest_status == MANIFEST_STATUS_VALID)
+        manifest_free(&manifest);
+
+    char sentinel[PATH_MAX], target[PATH_MAX], target_link[PATH_MAX];
+    path_join_fixture(sentinel, sizeof(sentinel), fixture.home,
+                      "/sentinel_target");
+    path_join_fixture(target, sizeof(target), fixture.home, "/restored");
+    path_join_fixture(target_link, sizeof(target_link), target, "/link");
+    ProbeObservation observation = {0};
+    snprintf(observation.sentinel, sizeof(observation.sentinel), "%s",
+             sentinel);
+    snprintf(observation.target, sizeof(observation.target), "%s",
+             target_link);
+    metadata_test_reset_probe_count();
+    metadata_test_set_probe_hook(probe_observer, &observation);
+
+    PortableRestoreReplayReport report;
+    int result = run_orchestration(&fixture, &report, 1, "y\n");
+    metadata_test_set_probe_hook(NULL, NULL);
+    check(result == 0 && report.live_count == 2 &&
+              report.applied_count == 2 && report.failed_count == 0,
+          "confirmation, probe, and symlink replay complete successfully");
+    check(metadata_test_probe_count() == 1 && observation.called &&
+              observation.sentinel_untouched && observation.target_absent,
+          "symlink probe runs before its destination is created");
+    check(symlink_exact(target_link, "../sentinel_target", 0777,
+                        (uid_t)uid, (gid_t)gid, 1700000410, 123456789,
+                        1700000420, 987654321),
+          "destination symlink target and no-follow metadata are exact");
+    struct stat target_st;
+    check(stat(sentinel, &target_st) == 0 && S_ISREG(target_st.st_mode) &&
+              (target_st.st_mode & 07777) == 0600 &&
+              file_equals(sentinel, "untouched"),
+          "symlink metadata never follows and changes its target");
+    struct stat placeholder;
+    check(fstatat(fixture.data_fd, "ROOT/link", &placeholder,
+                  AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(placeholder.st_mode) &&
+              placeholder.st_size == 0,
+          "empty payload placeholder remains an untouched regular file");
+    fixture_close(&fixture);
+}
+
+static void test_symlink_ownership_rejection(void)
+{
+    printf(BLUE "::" NC " symlink ownership probe rejection\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "symlink ownership fixture is created");
+    if (opened != 0)
+        return;
+
+    build_symlink_payload(&fixture);
+    uint32_t uid = (uint32_t)geteuid();
+    uint32_t gid = (uint32_t)getegid();
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  uid, gid, 1700000500, 1, 1700000501, 2),
+        entry_for("ROOT", "link", "link", SIDECAR_KIND_SYMLINK, 0, 0700,
+                  UINT32_MAX, gid, 1700000510, 3, 1700000511, 4)
+    };
+    entries[1].symlink_target = text_bytes("target");
+    check(write_sidecar(&fixture, entries, 2) == 0,
+          "symlink ownership sidecar is committed");
+
+    Manifest manifest;
+    check(manifest_read_v1_at(fixture.container_fd, &manifest) ==
+              MANIFEST_STATUS_VALID, "symlink ownership manifest is readable");
+    PortableRestorePreflightReport preflight;
+    portable_restore_preflight_report_init(&preflight);
+    PortableRestoreRequest request = {
+        .source_container_fd = fixture.container_fd,
+        .manifest = &manifest,
+        .destination_home_fd = fixture.home_fd,
+        .destination_timestamp_policy = {
+            .nsec_exact = 1,
+            .configured = 1
+        }
+    };
+    int preflight_result = portable_restore_preflight_at(&request, &preflight);
+    check(preflight_result == 0 && preflight.violation_count == 0 &&
+              preflight.live_count == 2 && preflight.profiles.count != 0 &&
+              preflight.profiles.affected_objects != 0,
+          "foreign symlink ownership reaches the metadata profile");
+    portable_restore_preflight_report_free(&preflight);
+    manifest_free(&manifest);
+
+    write_file_at(fixture.home_fd, "sentinel", "untouched");
+    char sentinel[PATH_MAX], target[PATH_MAX];
+    path_join_fixture(sentinel, sizeof(sentinel), fixture.home, "/sentinel");
+    path_join_fixture(target, sizeof(target), fixture.home, "/restored");
+    ProbeObservation observation = {0};
+    snprintf(observation.sentinel, sizeof(observation.sentinel), "%s",
+             sentinel);
+    snprintf(observation.target, sizeof(observation.target), "%s", target);
+    metadata_test_reset_probe_count();
+    metadata_test_set_probe_hook(probe_observer, &observation);
+    PortableRestoreReplayReport report;
+    int result = run_orchestration(&fixture, &report, 1, "y\n");
+    metadata_test_set_probe_hook(NULL, NULL);
+    check(result != 0 && metadata_test_probe_count() == 1 &&
+              report.live_count == 2 && report.applied_count == 0,
+          "foreign symlink ownership is refused by the post-confirmation probe");
+    check(observation.called && observation.sentinel_untouched &&
+              observation.target_absent && access(target, F_OK) != 0,
+          "ownership rejection leaves no destination mutation");
+    fixture_close(&fixture);
+}
+
+static void test_symlink_destination_conflict(void)
+{
+    printf(BLUE "::" NC " portable symlink destination conflict\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "symlink conflict fixture is created");
+    if (opened != 0)
+        return;
+
+    build_symlink_payload(&fixture);
+    make_dir_at(fixture.home_fd, "restored", 0700);
+    int restored_fd = openat(fixture.home_fd, "restored",
+                             O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (restored_fd < 0)
+        fatal("could not open symlink conflict destination");
+    write_file_at(restored_fd, "link", "existing");
+    close(restored_fd);
+
+    uint32_t uid = (uint32_t)geteuid();
+    uint32_t gid = (uint32_t)getegid();
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  uid, gid, 1700000600, 1, 1700000601, 2),
+        entry_for("ROOT", "link", "link", SIDECAR_KIND_SYMLINK, 0, 0777,
+                  uid, gid, 1700000610, 3, 1700000611, 4)
+    };
+    entries[1].symlink_target = text_bytes("target");
+    check(write_sidecar(&fixture, entries, 2) == 0,
+          "symlink conflict sidecar is committed");
+    PortableRestoreReplayReport report;
+    int result = run_orchestration(&fixture, &report, 1, "y\n");
+    check(result != 0 && report.live_count == 2 &&
+              report.applied_count == 0 && report.failed_count == 1 &&
+              strcmp(report.failed_logical_path, "link") == 0,
+          "existing destination leaf is rejected as a replay conflict");
+    char existing[PATH_MAX];
+    path_join_fixture(existing, sizeof(existing), fixture.home,
+                      "/restored/link");
+    check(file_equals(existing, "existing"),
+          "destination conflict leaves the existing regular file intact");
+    fixture_close(&fixture);
+}
+
 static SidecarBytes text_bytes(const char *text)
 {
     return (SidecarBytes){
@@ -188,15 +449,6 @@ static ManifestRoot root_for(void)
     snprintf(root.restore_path, sizeof(root.restore_path), "restored");
     return root;
 }
-
-typedef struct {
-    char base[PATH_MAX];
-    char container[PATH_MAX];
-    char home[PATH_MAX];
-    int container_fd;
-    int data_fd;
-    int home_fd;
-} Fixture;
 
 static void fixture_close(Fixture *fixture)
 {
@@ -352,14 +604,6 @@ static void confirmation_end(ConfirmationInput *input)
         fatal("could not restore confirmation input");
     input->saved_stdin = -1;
 }
-
-typedef struct {
-    char sentinel[PATH_MAX];
-    char target[PATH_MAX];
-    int called;
-    int sentinel_untouched;
-    int target_absent;
-} ProbeObservation;
 
 static void probe_observer(void *context)
 {
@@ -622,6 +866,9 @@ static void test_coarse_timestamp_policy(void)
 int main(void)
 {
     test_normal_orchestration();
+    test_symlink_orchestration();
+    test_symlink_ownership_rejection();
+    test_symlink_destination_conflict();
     test_probe_rejection();
     test_dry_run();
     test_coarse_timestamp_policy();
