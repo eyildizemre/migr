@@ -12,6 +12,9 @@
 // coarse-timestamp destination, content is always recopied even on a
 // same-size match, because size+mtime_sec alone cannot prove the content did
 // not change.
+// Symlinks additionally exercise dynamic target fidelity, capture-side
+// metadata re-application, and the native restore refusal for an existing
+// final destination symlink.
 //
 // test_foreign_ownership_gap() asserts the preflight's actual guarantee: a
 // foreign uid/gid round-trips through capture and restore rather than being
@@ -206,6 +209,18 @@ static int file_equals(const char *path, const char *expected)
            memcmp(buffer, expected, expected_length) == 0;
 }
 
+static void read_link_target_or_die(const char *path, char *target,
+                                    size_t target_size)
+{
+    if (target_size == 0)
+        fatal("symlink target buffer is empty");
+
+    ssize_t length = readlink(path, target, target_size);
+    if (length < 0 || (size_t)length >= target_size)
+        fatal("could not read a complete symlink target");
+    target[length] = '\0';
+}
+
 static int same_timespec(struct timespec left, struct timespec right)
 {
     return left.tv_sec == right.tv_sec && left.tv_nsec == right.tv_nsec;
@@ -357,6 +372,7 @@ static int setup_case(const MatrixCase *test_case, const char *source_root,
 
 static int check_payload_shape(const MatrixCase *test_case,
                                const char *path, const struct stat *source_st,
+                               const char *expected_target,
                                const char *case_name, const char *phase)
 {
     struct stat actual;
@@ -384,14 +400,23 @@ static int check_payload_shape(const MatrixCase *test_case,
     }
     else if (test_case->kind == KIND_SYMLINK)
     {
+        /*
+         * docs/DECISIONS.md D17/D18: Linux readlinkat() has no no-atime
+         * variant, so reading a source symlink may perturb its atime. The
+         * contract asserts destination link times exactly; source-symlink
+         * atime preservation is not promised.
+         */
         if (snprintf(property, sizeof(property), "%s link target", phase) < 0)
             fatal("could not format a test label");
         char target[PATH_MAX];
-        ssize_t length = readlink(path, target, sizeof(target) - 1);
-        if (length >= 0)
-            target[length] = '\0';
-        check_result(length == 10 && length >= 0 && strcmp(target, "target.txt") == 0,
-                     case_name, property);
+        ssize_t length = readlink(path, target, sizeof(target));
+        size_t expected_length = expected_target == NULL
+                                     ? 0
+                                     : strlen(expected_target);
+        int target_matches = expected_target != NULL && length >= 0 &&
+                             (size_t)length == expected_length &&
+                             memcmp(target, expected_target, expected_length) == 0;
+        check_result(target_matches, case_name, property);
 
         if (snprintf(property, sizeof(property), "%s link times", phase) < 0)
             fatal("could not format a test label");
@@ -421,6 +446,7 @@ static void run_matrix_case(const MatrixCase *test_case)
     char source_path[PATH_MAX];
     char capture_path[PATH_MAX];
     char restore_path[PATH_MAX];
+    char source_target[PATH_MAX];
 
     make_temp_root(base, sizeof(base));
     join_or_die(source_root, sizeof(source_root), base, "source");
@@ -441,6 +467,13 @@ static void run_matrix_case(const MatrixCase *test_case)
         return;
     }
 
+    const char *expected_target = NULL;
+    if (test_case->kind == KIND_SYMLINK)
+    {
+        read_link_target_or_die(source_path, source_target,
+                                sizeof(source_target));
+        expected_target = source_target;
+    }
     struct stat source_st;
     if (lstat(source_path, &source_st) != 0)
         fatal("could not inspect the source fixture");
@@ -461,6 +494,7 @@ static void run_matrix_case(const MatrixCase *test_case)
     else
     {
         check_payload_shape(test_case, capture_path, &source_st,
+                            expected_target,
                             test_case->name, "capture");
         if (test_case->kind == KIND_DIRECTORY)
             check_directory_child(capture_path, test_case->name, "capture");
@@ -477,6 +511,19 @@ static void run_matrix_case(const MatrixCase *test_case)
             close(resume_fd);
             check_result(file_equals(capture_path, "fedcba9876543210"),
                          test_case->name, "capture resume skips matching size/mtime");
+        }
+        else if (test_case->kind == KIND_SYMLINK)
+        {
+            struct stat reapply_source_st;
+            if (lstat(source_path, &reapply_source_st) != 0)
+                fatal("could not inspect the source before capture reapply");
+            set_metadata(capture_path, 0777, regular_times, 1);
+            if (backup_capture_at(&BACKUP_CTX, source_path, capture_fd,
+                                  "entry") != 0)
+                fatal("could not reapply capture symlink metadata");
+            check_payload_shape(test_case, capture_path, &reapply_source_st,
+                                expected_target, test_case->name,
+                                "capture reapply");
         }
         close(capture_fd);
     }
@@ -512,6 +559,7 @@ static void run_matrix_case(const MatrixCase *test_case)
     else
     {
         check_payload_shape(test_case, restore_path, &captured_st,
+                            expected_target,
                             test_case->name, "restore");
         if (test_case->kind == KIND_DIRECTORY)
             check_directory_child(restore_path, test_case->name, "restore");
@@ -530,6 +578,36 @@ static void run_matrix_case(const MatrixCase *test_case)
             close(destination_fd);
             check_result(file_equals(restore_path, "0011223344556677"),
                          test_case->name, "restore resume skips matching size/mtime");
+        }
+        else if (test_case->kind == KIND_SYMLINK)
+        {
+            struct stat before, after;
+            char before_target[PATH_MAX];
+            char after_target[PATH_MAX];
+            read_link_target_or_die(restore_path, before_target,
+                                    sizeof(before_target));
+            if (lstat(restore_path, &before) != 0)
+                fatal("could not inspect the restored symlink before refusal");
+            int source_fd = open_directory(capture_root);
+            int destination_fd = open_directory(restore_root);
+            check_result(restore_native_at(&RESTORE_CTX, source_fd, "entry",
+                                           destination_fd, "entry") != 0,
+                         test_case->name,
+                         "restore refuses an existing final symlink");
+            close(source_fd);
+            close(destination_fd);
+            if (lstat(restore_path, &after) != 0)
+                fatal("could not inspect the restored symlink after refusal");
+            read_link_target_or_die(restore_path, after_target,
+                                    sizeof(after_target));
+            check_result(before.st_dev == after.st_dev &&
+                             before.st_ino == after.st_ino &&
+                             same_core_times(&before, &after),
+                         test_case->name,
+                         "restore refusal leaves symlink metadata untouched");
+            check_result(strcmp(before_target, after_target) == 0,
+                         test_case->name,
+                         "restore refusal leaves symlink target untouched");
         }
     }
 
