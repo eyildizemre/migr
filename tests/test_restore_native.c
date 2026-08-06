@@ -480,6 +480,61 @@ static void test_restores_nested_files_and_directories(void)
     remove_tree(dest_root);
 }
 
+static void test_restores_names_with_problem_bytes(void)
+{
+    printf(BLUE "::" NC " restore_native_at: native accepts every filename byte unencoded (D19)\n");
+
+    char source_root[PATH_MAX], dest_root[PATH_MAX];
+    fresh_mkdtemp(source_root, sizeof(source_root), "restore_src");
+    fresh_mkdtemp(dest_root, sizeof(dest_root), "restore_dst");
+
+    char problem_name[64] = "space:percent%";
+    size_t name_len = strlen(problem_name);
+    problem_name[name_len++] = (char)0xFF;
+    problem_name[name_len] = '\0';
+
+    char source_path[PATH_MAX];
+    join_path(source_path, sizeof(source_path), source_root, problem_name);
+    write_file(source_path, "native-problem-name");
+
+    int source_fd = open_dir_fd(source_root);
+    int dest_fd = open_dir_fd(dest_root);
+
+    check(restore_native_at(&RESTORE_CTX, source_fd, problem_name,
+                            dest_fd, problem_name) == 0,
+          "restoring a filename containing space, colon, percent, and 0xFF succeeds");
+
+    char dest_path[PATH_MAX];
+    join_path(dest_path, sizeof(dest_path), dest_root, problem_name);
+    struct stat st;
+    check(lstat(dest_path, &st) == 0 && S_ISREG(st.st_mode),
+          "the native destination contains the byte-identical problem name");
+
+    int found = 0;
+    DIR *dir = opendir(dest_root);
+    if (dir != NULL)
+    {
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL)
+        {
+            size_t entry_len = strlen(entry->d_name);
+            if (entry_len == name_len &&
+                memcmp(entry->d_name, problem_name, name_len) == 0)
+            {
+                found = 1;
+                break;
+            }
+        }
+        closedir(dir);
+    }
+    check(found, "readdir observes the original native filename bytes, without encoding");
+
+    close(source_fd);
+    close(dest_fd);
+    remove_tree(source_root);
+    remove_tree(dest_root);
+}
+
 static void test_regular_file_resume_and_overwrite(void)
 {
     printf(BLUE "::" NC " restore_native_at: an existing regular file resumes (matching) or is overwritten (stale)\n");
@@ -827,6 +882,7 @@ int main(void)
     test_rejects_lexically_invalid_relative_paths();
 
     test_restores_nested_files_and_directories();
+    test_restores_names_with_problem_bytes();
     test_regular_file_resume_and_overwrite();
     test_restores_fifo();
     test_rejects_wrong_existing_destination_types();

@@ -296,6 +296,14 @@ static void test_malformed_variants(void)
         "'%%' not followed by two hex digits");
 
     check_malformed(
+        "ROOT ID=EXPLICIT_0 POLICY=HOME_RELATIVE PAYLOAD=a SOURCE=a% RESTORE=a\n",
+        "a trailing '%%' with no hex digits is refused");
+
+    check_malformed(
+        "ROOT ID=EXPLICIT_0 POLICY=HOME_RELATIVE PAYLOAD=a SOURCE=a%4 RESTORE=a\n",
+        "a trailing '%%' with only one hex digit is refused");
+
+    check_malformed(
         "ROOT ID=EXPLICIT_0 POLICY=HOME_RELATIVE PAYLOAD=a SOURCE=a%00hidden RESTORE=a\n",
         "'%%00' (an embedded NUL) is refused, not silently truncated");
 
@@ -449,6 +457,44 @@ static void test_malformed_variants(void)
               "a line far longer than the bounded read buffer");
         remove_manifest(test_dir);
     }
+}
+
+static void test_decode_overflow_is_refused(void)
+{
+    printf(BLUE "::" NC " versioned manifest: decoded path overflow is refused\n");
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/manifest.txt", test_dir);
+    FILE *f = fopen(path, "w");
+    if (f == NULL)
+    {
+        printf(RED "could not write fixture %s" NC "\n", path);
+        exit(1);
+    }
+
+    fputs(
+        "MIGR_MANIFEST\n"
+        "VERSION=1\n"
+        "REPRESENTATION=native\n"
+        "SCOPE=critical\n"
+        "SIDECAR_VERSION=0\n"
+        "ROOT_COUNT=1\n"
+        "ROOT ID=EXPLICIT_0 POLICY=MANUAL_NATIVE PAYLOAD=a SOURCE=",
+        f);
+
+    // PATH_MAX repetitions decode to PATH_MAX bytes, which cannot fit in the
+    // PATH_MAX-sized field (one byte is needed for the terminating NUL). The
+    // encoded value is only 3 * PATH_MAX bytes, well below the manifest line
+    // ceiling of roughly 9 * PATH_MAX bytes, so this isolates decode overflow.
+    for (size_t i = 0; i < PATH_MAX; i++)
+        fputs("%41", f);
+    fputc('\n', f);
+    fclose(f);
+
+    Manifest m;
+    check(manifest_read_v1(test_dir, &m) == MANIFEST_STATUS_MALFORMED,
+          "a decoded SOURCE reaching PATH_MAX is refused, not truncated");
+    remove_manifest(test_dir);
 }
 
 static void test_io_error(void)
@@ -720,6 +766,7 @@ int main(void)
     test_legacy_detection();
     test_unknown_version();
     test_malformed_variants();
+    test_decode_overflow_is_refused();
     test_io_error();
     test_write_rejects_inconsistent_input();
     test_fd_writer();
