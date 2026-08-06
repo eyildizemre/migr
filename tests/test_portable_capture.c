@@ -50,6 +50,8 @@ extern int entry_from_stat(const char *root_id, const char *logical,
                            const SidecarBytes *symlink_target);
 extern int append_physical(char *destination, size_t destination_size,
                            const char *parent, const char *encoded_leaf);
+extern int prescan_report_add(PortablePrescanReport *report,
+                              const PortablePrescanViolation *violation);
 extern int entries_equal(const SidecarEntry *current,
                          const SidecarLiveView *previous,
                          const PortableXattrs *xattrs);
@@ -333,6 +335,52 @@ static void test_append_physical(void)
           "physical path refuses a leaf that does not fit");
     check(append_physical(output, 6, "parent", "leaf") != 0,
           "physical path refuses a parent that does not fit");
+}
+
+static void test_prescan_report(void)
+{
+    printf(BLUE "::" NC " portable pre-scan report storage\n");
+    PortablePrescanReport report;
+    portable_prescan_report_init(&report);
+    check(report.total_count == 0 && report.examples == NULL &&
+              report.example_count == 0 && report.example_capacity == 0,
+          "pre-scan report initializes empty");
+
+    PortablePrescanViolation violation = {
+        .kind = PORTABLE_PRESCAN_NAME_TOO_LONG,
+        .limit = 255,
+        .actual = 258
+    };
+    strcpy(violation.root_id, "ROOT");
+    strcpy(violation.logical_path, "nested/illegal-name");
+    check(prescan_report_add(&report, &violation) == 0,
+          "pre-scan report accepts a violation");
+    check(report.total_count == 1 && report.example_count == 1 &&
+              report.examples[0].kind == PORTABLE_PRESCAN_NAME_TOO_LONG &&
+              strcmp(report.examples[0].root_id, "ROOT") == 0 &&
+              strcmp(report.examples[0].logical_path,
+                     "nested/illegal-name") == 0 &&
+              report.examples[0].limit == 255 &&
+              report.examples[0].actual == 258,
+          "pre-scan violation fields round-trip");
+
+    for (size_t index = 1; index < PORTABLE_PRESCAN_MAX_EXAMPLES + 8U;
+         index++) {
+        PortablePrescanViolation extra = {
+            .kind = PORTABLE_PRESCAN_PATH_TOO_LONG,
+            .limit = PATH_MAX,
+            .actual = PATH_MAX + index
+        };
+        if (prescan_report_add(&report, &extra) != 0)
+            fixture_fatal("could not append pre-scan violation");
+    }
+    check(report.total_count == PORTABLE_PRESCAN_MAX_EXAMPLES + 8U &&
+              report.example_count == PORTABLE_PRESCAN_MAX_EXAMPLES,
+          "pre-scan examples are bounded while total count remains complete");
+    portable_prescan_report_free(&report);
+    check(report.total_count == 0 && report.examples == NULL &&
+              report.example_count == 0 && report.example_capacity == 0,
+          "pre-scan report frees all storage");
 }
 
 static void test_entry_helpers(const char *source)
@@ -794,9 +842,41 @@ static int create_live_capture(const char *container_path, int *container_fd,
         return -1;
     int data_fd = openat(*container_fd, "data",
                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-    if (data_fd < 0 || portable_capture_context_init(context, data_fd, log, 1) != 0)
+    if (data_fd < 0 ||
+        portable_capture_context_init(context, data_fd, log, 1, 1) != 0)
         return -1;
     return 0;
+}
+
+static void close_live_capture(int container_fd, SidecarLog *log,
+                               PortableCaptureContext *context);
+
+static void test_capture_context_flags(const char *base)
+{
+    printf(BLUE "::" NC " portable capture context capability flags\n");
+    char container_path[PATH_MAX];
+    join_path(container_path, sizeof(container_path), base,
+              "context-flags-container");
+
+    SidecarLog log = {0};
+    PortableCaptureContext context = {0};
+    int container_fd = -1;
+    check(create_live_capture(container_path, &container_fd, &log,
+                              &context) == 0,
+          "capture context initializes for flag checks");
+    if (container_fd < 0)
+        return;
+    check(context.case_sensitive == 1,
+          "capture context preserves a case-sensitive verdict");
+
+    int data_fd = context.data_fd;
+    portable_capture_context_close(&context);
+    check(portable_capture_context_init(&context, data_fd, &log, 1, 0) == 0,
+          "capture context accepts a case-insensitive verdict");
+    check(context.case_sensitive == 0,
+          "capture context preserves a case-insensitive verdict");
+    close_live_capture(container_fd, &log, &context);
+    remove_tree(container_path);
 }
 
 static void close_live_capture(int container_fd, SidecarLog *log,
@@ -1116,10 +1196,12 @@ int main(void)
 
     test_entry_helpers(source_path);
     test_append_physical();
+    test_prescan_report();
     test_encoded_payload_names(root_path);
     test_nested_encoded_directories(root_path);
     test_name_and_path_limits(root_path);
     test_fresh_capture(source_path, container_fd, container_path);
+    test_capture_context_flags(root_path);
     test_replacement_and_type_change(source_path, root_path);
     test_unsupported_types(source_path, root_path);
     test_preflight_refusal(source_path);

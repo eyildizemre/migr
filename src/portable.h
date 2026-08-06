@@ -42,7 +42,35 @@ typedef struct {
     const PortableRootSpec *roots;
     size_t root_count;
     int nsec_exact;
+    int case_sensitive;
 } PortableCaptureRequest;
+
+typedef enum {
+    PORTABLE_PRESCAN_NAME_TOO_LONG,
+    PORTABLE_PRESCAN_PATH_TOO_LONG,
+    PORTABLE_PRESCAN_CASE_COLLISION
+} PortablePrescanViolationKind;
+
+typedef struct {
+    char root_id[MANIFEST_ID_MAX];
+    char logical_path[SIDECAR_MAX_PATH + 1U];
+    PortablePrescanViolationKind kind;
+    size_t limit;
+    size_t actual;
+    char collides_with_logical_path[SIDECAR_MAX_PATH + 1U];
+} PortablePrescanViolation;
+
+#define PORTABLE_PRESCAN_MAX_EXAMPLES 64U
+
+typedef struct {
+    size_t total_count;
+    PortablePrescanViolation *examples;
+    size_t example_count;
+    size_t example_capacity;
+} PortablePrescanReport;
+
+void portable_prescan_report_init(PortablePrescanReport *report);
+void portable_prescan_report_free(PortablePrescanReport *report);
 
 /**
  * State used by the direct portable capture seam. The data and sidecar
@@ -52,6 +80,7 @@ typedef struct PortableCaptureContext {
     int data_fd;
     SidecarLog *sidecar;
     int nsec_exact;
+    int case_sensitive;
     int resume_mode;
     void *visited;
 } PortableCaptureContext;
@@ -62,7 +91,7 @@ typedef struct PortableCaptureContext {
  */
 int portable_capture_context_init(PortableCaptureContext *context,
                                   int data_fd, SidecarLog *sidecar,
-                                  int nsec_exact);
+                                  int nsec_exact, int case_sensitive);
 
 /** Releases allocations owned by a capture context without closing handles. */
 void portable_capture_context_close(PortableCaptureContext *context);

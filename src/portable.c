@@ -37,6 +37,46 @@ typedef struct {
 #define VISITED_INITIAL_CAPACITY 16U
 #define PORTABLE_MAX_READBACK_NAMES SIDECAR_MAX_LIVE_ENTRIES
 
+void portable_prescan_report_init(PortablePrescanReport *report)
+{
+    if (report != NULL)
+        memset(report, 0, sizeof(*report));
+}
+
+void portable_prescan_report_free(PortablePrescanReport *report)
+{
+    if (report == NULL)
+        return;
+    free(report->examples);
+    memset(report, 0, sizeof(*report));
+}
+
+int prescan_report_add(PortablePrescanReport *report,
+                       const PortablePrescanViolation *violation)
+{
+    if (report == NULL || violation == NULL)
+        return -1;
+    if (report->total_count != SIZE_MAX)
+        report->total_count++;
+    if (report->example_count >= PORTABLE_PRESCAN_MAX_EXAMPLES)
+        return 0;
+
+    if (report->example_count == report->example_capacity) {
+        size_t capacity = report->example_capacity == 0
+            ? 8U : report->example_capacity * 2U;
+        if (capacity > PORTABLE_PRESCAN_MAX_EXAMPLES)
+            capacity = PORTABLE_PRESCAN_MAX_EXAMPLES;
+        PortablePrescanViolation *examples = realloc(
+            report->examples, capacity * sizeof(*examples));
+        if (examples == NULL)
+            return -1;
+        report->examples = examples;
+        report->example_capacity = capacity;
+    }
+    report->examples[report->example_count++] = *violation;
+    return 0;
+}
+
 #ifdef PORTABLE_CAPTURE_TEST_HOOKS
 static uint64_t portable_test_probe_count;
 static uint64_t portable_test_readback_scan_count;
@@ -2513,7 +2553,7 @@ static int fresh_namespace_is_empty(int container_fd)
 
 int portable_capture_context_init(PortableCaptureContext *context,
                                   int data_fd, SidecarLog *sidecar,
-                                  int nsec_exact)
+                                  int nsec_exact, int case_sensitive)
 {
     if (context == NULL || data_fd < 0 || sidecar == NULL ||
         sidecar->implementation == NULL)
@@ -2528,6 +2568,7 @@ int portable_capture_context_init(PortableCaptureContext *context,
     context->data_fd = data_fd;
     context->sidecar = sidecar;
     context->nsec_exact = nsec_exact != 0;
+    context->case_sensitive = case_sensitive != 0;
     visited->hash_salt = sidecar_process_salt();
     context->visited = visited;
     return 0;
@@ -2593,7 +2634,8 @@ int portable_capture_fresh_at(int container_fd,
 
     PortableCaptureContext context = {0};
     int failed = portable_capture_context_init(&context, data_fd, &sidecar,
-                                               request->nsec_exact) != 0;
+                                               request->nsec_exact,
+                                               request->case_sensitive) != 0;
     for (size_t index = 0; !failed && index < request->root_count; index++)
         if (portable_capture_root(&context, &request->roots[index]) != 0 ||
             reconcile_root(&context, &request->roots[index]) != 0)
@@ -2693,7 +2735,8 @@ int portable_capture_resume_at(int container_fd,
 
     PortableCaptureContext context = {0};
     if (!failed && portable_capture_context_init(&context, data_fd, &sidecar,
-                                                request->nsec_exact) != 0)
+                                                request->nsec_exact,
+                                                request->case_sensitive) != 0)
         failed = 1;
     if (!failed) {
         context.resume_mode = 1;

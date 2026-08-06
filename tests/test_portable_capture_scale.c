@@ -154,7 +154,7 @@ int main(void)
                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (data_fd < 0 ||
         sidecar_log_create_at(container_fd, &sidecar) != SIDECAR_OPEN_FRESH ||
-        portable_capture_context_init(&context, data_fd, &sidecar, 1) != 0)
+        portable_capture_context_init(&context, data_fd, &sidecar, 1, 1) != 0)
         fixture_fatal("could not initialize portable capture");
 
     PortableRootSpec root = root_spec(source_path);
