@@ -956,6 +956,11 @@ static int analyze_entries(PreflightMemory *memory,
             continue;
         if (strcmp(previous->physical, current->physical) == 0)
         {
+            /* Unreachable via collect_entry() as of D.4b: every entry that
+             * reaches this array has already passed physical_matches_logical(),
+             * and component_percent_encode() is injective, so two different
+             * logical paths can no longer produce the same physical path.
+             * Kept as defense-in-depth in case that upstream guarantee changes. */
             if (strcmp(previous->logical, current->logical) != 0)
                 report_violation(report, current->root_index,
                                  current->logical);

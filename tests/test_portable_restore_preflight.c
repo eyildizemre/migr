@@ -436,11 +436,13 @@ static void test_path_and_mapping_refusals(void)
                                    SIDECAR_KIND_REGULAR, 0);
     run_refusal_case("empty-component", &root, &empty, 1, prepare_root_dir);
 
+    /* Both aliases are now rejected by the physical/logical invariant before
+     * duplicate-path analysis; retain the two-entry shape as an early refusal. */
     SidecarEntry duplicate[] = {
         entry_for("ROOT", "a", "shared", SIDECAR_KIND_REGULAR, 3),
         entry_for("ROOT", "b", "shared", SIDECAR_KIND_REGULAR, 3)
     };
-    run_refusal_case("duplicate-physical", &root, duplicate, 2,
+    run_refusal_case("physical-mismatch-before-duplicate", &root, duplicate, 2,
                      prepare_root_dir);
 
     SidecarEntry ancestor[] = {
