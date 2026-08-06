@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "encoding.h"
 #include "manifest.h"
 #include "utils.h" // path_join
 
@@ -133,100 +134,6 @@ static int id_is_valid(const char *id)
         if (!is_id_safe_char((unsigned char)id[i]))
             return 0;
     return 1;
-}
-
-static int is_encode_safe_char(unsigned char c)
-{
-    return isalnum(c) || c == '.' || c == '_' || c == '/' || c == '-';
-}
-
-// Bytewise percent-encode: every byte outside the safe set becomes "%XX"
-// (uppercase hex). Operates on raw is a NUL-terminated C string; paths never
-// contain an embedded NUL at the syscall level, so treating it as a string
-// (rather than requiring an explicit length) is sufficient here.
-static int manifest_percent_encode(const char *raw, char *out, size_t out_size)
-{
-    if (raw == NULL || out == NULL || out_size == 0)
-        return -1;
-
-    size_t o = 0;
-    for (size_t i = 0; raw[i] != '\0'; i++)
-    {
-        unsigned char c = (unsigned char)raw[i];
-        if (is_encode_safe_char(c))
-        {
-            if (o + 1 >= out_size)
-                return -1;
-            out[o++] = (char)c;
-        }
-        else
-        {
-            if (o + 3 >= out_size)
-                return -1;
-            static const char hex[] = "0123456789ABCDEF";
-            out[o++] = '%';
-            out[o++] = hex[(c >> 4) & 0xF];
-            out[o++] = hex[c & 0xF];
-        }
-    }
-    out[o] = '\0';
-    return 0;
-}
-
-static int hex_digit_value(char c)
-{
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    return -1;
-}
-
-// Decodes a manifest_percent_encode()-produced value. Fail-closed: any raw
-// byte outside the safe set that is not part of a well-formed "%XX" escape is
-// malformed input (our own writer never produces such a line), as is a "%" not
-// followed by two valid hex digits or a result that would not fit out_size.
-static int manifest_percent_decode(const char *encoded, char *out, size_t out_size)
-{
-    if (encoded == NULL || out == NULL || out_size == 0)
-        return -1;
-
-    size_t o = 0;
-    for (size_t i = 0; encoded[i] != '\0'; i++)
-    {
-        unsigned char c = (unsigned char)encoded[i];
-        int byte;
-        if (c == '%')
-        {
-            int hi = hex_digit_value(encoded[i + 1] != '\0' ? encoded[i + 1] : '\0');
-            int lo = hex_digit_value(encoded[i + 2] != '\0' ? encoded[i + 2] : '\0');
-            if (hi < 0 || lo < 0)
-                return -1;
-            byte = (hi << 4) | lo;
-            i += 2;
-        }
-        else if (is_encode_safe_char(c))
-        {
-            byte = c;
-        }
-        else
-        {
-            return -1; // raw byte our encoder would never emit unescaped
-        }
-
-        // A decoded NUL would silently truncate every C-string operation
-        // downstream (strcmp/strlen/strcpy) at that point, hiding whatever
-        // followed it. manifest_percent_encode() never produces "%00" for a
-        // real path (paths cannot contain NUL at the syscall level), so this
-        // can only be corruption or tampering -- refuse it, don't truncate.
-        if (byte == 0)
-            return -1;
-
-        if (o + 1 >= out_size)
-            return -1;
-        out[o++] = (char)byte;
-    }
-    out[o] = '\0';
-    return 0;
 }
 
 static const char *root_policy_to_string(RootPolicy p)
@@ -416,19 +323,25 @@ static int parse_root_line(char *line, ManifestRoot *root)
         }
         else if (line_key_is(tok, "PAYLOAD", key_len))
         {
-            if (seen_payload || manifest_percent_decode(value, root->payload_path, sizeof(root->payload_path)) != 0)
+            if (seen_payload || encoding_percent_decode(ENCODING_MODE_MANIFEST_PATH,
+                                                        value, root->payload_path,
+                                                        sizeof(root->payload_path)) != 0)
                 return -1;
             seen_payload = 1;
         }
         else if (line_key_is(tok, "SOURCE", key_len))
         {
-            if (seen_source || manifest_percent_decode(value, root->source_path, sizeof(root->source_path)) != 0)
+            if (seen_source || encoding_percent_decode(ENCODING_MODE_MANIFEST_PATH,
+                                                       value, root->source_path,
+                                                       sizeof(root->source_path)) != 0)
                 return -1;
             seen_source = 1;
         }
         else if (line_key_is(tok, "RESTORE", key_len))
         {
-            if (seen_restore || manifest_percent_decode(value, root->restore_path, sizeof(root->restore_path)) != 0)
+            if (seen_restore || encoding_percent_decode(ENCODING_MODE_MANIFEST_PATH,
+                                                        value, root->restore_path,
+                                                        sizeof(root->restore_path)) != 0)
                 return -1;
             root->has_restore_path = 1;
             seen_restore = 1;
@@ -794,15 +707,21 @@ static int manifest_model_is_invalid(const Manifest *m)
             const ManifestRoot *r = &m->roots[i];
             if (!id_is_valid(r->id) || root_policy_to_string(r->policy) == NULL)
                 return 1;
-            if (manifest_percent_encode(r->payload_path, scratch, sizeof(scratch)) != 0)
+            if (encoding_percent_encode(ENCODING_MODE_MANIFEST_PATH,
+                                        r->payload_path, scratch,
+                                        sizeof(scratch)) != 0)
                 return 1;
-            if (manifest_percent_encode(r->source_path, scratch, sizeof(scratch)) != 0)
+            if (encoding_percent_encode(ENCODING_MODE_MANIFEST_PATH,
+                                        r->source_path, scratch,
+                                        sizeof(scratch)) != 0)
                 return 1;
             if (r->policy == ROOT_POLICY_HOME_RELATIVE)
             {
                 if (!r->has_restore_path)
                     return 1;
-                if (manifest_percent_encode(r->restore_path, scratch, sizeof(scratch)) != 0)
+                if (encoding_percent_encode(ENCODING_MODE_MANIFEST_PATH,
+                                            r->restore_path, scratch,
+                                            sizeof(scratch)) != 0)
                     return 1;
             }
             else if (r->has_restore_path)
@@ -858,12 +777,18 @@ static int manifest_serialize(FILE *f, const Manifest *m)
         const ManifestRoot *r = &m->roots[i];
         const char *policy_str = root_policy_to_string(r->policy);
         if (policy_str == NULL) { failed = 1; break; }
-        if (manifest_percent_encode(r->payload_path, enc_payload, sizeof(enc_payload)) != 0) { failed = 1; break; }
-        if (manifest_percent_encode(r->source_path, enc_source, sizeof(enc_source)) != 0) { failed = 1; break; }
+        if (encoding_percent_encode(ENCODING_MODE_MANIFEST_PATH,
+                                    r->payload_path, enc_payload,
+                                    sizeof(enc_payload)) != 0) { failed = 1; break; }
+        if (encoding_percent_encode(ENCODING_MODE_MANIFEST_PATH,
+                                    r->source_path, enc_source,
+                                    sizeof(enc_source)) != 0) { failed = 1; break; }
 
         if (r->policy == ROOT_POLICY_HOME_RELATIVE)
         {
-            if (manifest_percent_encode(r->restore_path, enc_restore, sizeof(enc_restore)) != 0) { failed = 1; break; }
+            if (encoding_percent_encode(ENCODING_MODE_MANIFEST_PATH,
+                                        r->restore_path, enc_restore,
+                                        sizeof(enc_restore)) != 0) { failed = 1; break; }
             if (fprintf(f, "ROOT ID=%s POLICY=%s PAYLOAD=%s SOURCE=%s RESTORE=%s\n",
                         r->id, policy_str, enc_payload, enc_source, enc_restore) < 0)
                 failed = 1;

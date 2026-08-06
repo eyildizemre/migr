@@ -27,7 +27,7 @@ VALGRIND_TESTS = \
 
 TARGET = migr
 VPATH = src
-SRCS = main.c detect.c report.c backup.c backup_plan.c packages.c restore.c utils.c fileops.c fsprobe.c xdg.c manifest.c container.c metadata.c
+SRCS = main.c detect.c report.c backup.c backup_plan.c packages.c restore.c utils.c fileops.c fsprobe.c xdg.c manifest.c encoding.c container.c metadata.c
 OBJS = $(SRCS:.c=.o)
 ANALYZER_SRCS = $(wildcard src/*.c)
 
@@ -42,6 +42,7 @@ TEST_PATHJOIN = tests/test_pathjoin
 TEST_SPECIAL_FILES = tests/test_special_files
 TEST_FSPROBE = tests/test_fsprobe
 TEST_MANIFEST = tests/test_manifest
+TEST_ENCODING = tests/test_encoding
 TEST_CONTAINER = tests/test_container
 TEST_RESTORE_NATIVE = tests/test_restore_native
 TEST_RESTORE_SOURCE_READ = tests/test_restore_source_read
@@ -74,11 +75,14 @@ $(TEST_SPECIAL_FILES): tests/test_special_files.c fileops.o metadata.o utils.o
 $(TEST_FSPROBE): tests/test_fsprobe.c fsprobe.o utils.o
 	$(CC) $(CFLAGS) -o $@ tests/test_fsprobe.c fsprobe.o utils.o
 
-$(TEST_MANIFEST): tests/test_manifest.c manifest.o utils.o
-	$(CC) $(CFLAGS) -o $@ tests/test_manifest.c manifest.o utils.o
+$(TEST_MANIFEST): tests/test_manifest.c manifest.o encoding.o utils.o
+	$(CC) $(CFLAGS) -o $@ tests/test_manifest.c manifest.o encoding.o utils.o
 
-$(TEST_CONTAINER): tests/test_container.c container.o manifest.o utils.o
-	$(CC) $(CFLAGS) -o $@ tests/test_container.c container.o manifest.o utils.o
+$(TEST_ENCODING): tests/test_encoding.c encoding.o
+	$(CC) $(CFLAGS) -o $@ tests/test_encoding.c encoding.o
+
+$(TEST_CONTAINER): tests/test_container.c container.o manifest.o encoding.o utils.o
+	$(CC) $(CFLAGS) -o $@ tests/test_container.c container.o manifest.o encoding.o utils.o
 
 $(TEST_RESTORE_NATIVE): tests/test_restore_native.c fileops.o metadata.o utils.o
 	$(CC) $(CFLAGS) -o $@ tests/test_restore_native.c fileops.o metadata.o utils.o
@@ -92,17 +96,17 @@ $(TEST_RESTORE_SOURCE_READ): tests/test_restore_source_read.c fileops_test.o met
 backup_test.o: src/backup.c src/backup.h src/backup_plan.h src/fileops.h src/metadata.h
 	$(CC) $(CFLAGS) -DBACKUP_TEST_HOOKS -c src/backup.c -o $@
 
-$(TEST_BACKUP_SOURCE_READ): tests/test_backup_source_read.c backup_test.o backup_plan.o container.o fileops_test.o metadata.o fsprobe.o manifest.o packages.o utils.o xdg.o detect.o
-	$(CC) $(CFLAGS) -DBACKUP_TEST_HOOKS -o $@ tests/test_backup_source_read.c backup_test.o backup_plan.o container.o fileops_test.o metadata.o fsprobe.o manifest.o packages.o utils.o xdg.o detect.o
+$(TEST_BACKUP_SOURCE_READ): tests/test_backup_source_read.c backup_test.o backup_plan.o container.o fileops_test.o metadata.o fsprobe.o manifest.o encoding.o packages.o utils.o xdg.o detect.o
+	$(CC) $(CFLAGS) -DBACKUP_TEST_HOOKS -o $@ tests/test_backup_source_read.c backup_test.o backup_plan.o container.o fileops_test.o metadata.o fsprobe.o manifest.o encoding.o packages.o utils.o xdg.o detect.o
 
-$(TEST_RESTORE_DISPATCH): tests/test_restore_dispatch.c restore.o fileops.o metadata.o fsprobe.o manifest.o container.o utils.o xdg.o detect.o
-	$(CC) $(CFLAGS) -o $@ tests/test_restore_dispatch.c restore.o fileops.o metadata.o fsprobe.o manifest.o container.o utils.o xdg.o detect.o
+$(TEST_RESTORE_DISPATCH): tests/test_restore_dispatch.c restore.o fileops.o metadata.o fsprobe.o manifest.o encoding.o container.o utils.o xdg.o detect.o
+	$(CC) $(CFLAGS) -o $@ tests/test_restore_dispatch.c restore.o fileops.o metadata.o fsprobe.o manifest.o encoding.o container.o utils.o xdg.o detect.o
 
-$(TEST_RESTORE_ATIME): tests/test_restore_atime.c restore.o fileops.o metadata.o fsprobe.o manifest.o container.o utils.o xdg.o detect.o
-	$(CC) $(CFLAGS) -o $@ tests/test_restore_atime.c restore.o fileops.o metadata.o fsprobe.o manifest.o container.o utils.o xdg.o detect.o
+$(TEST_RESTORE_ATIME): tests/test_restore_atime.c restore.o fileops.o metadata.o fsprobe.o manifest.o encoding.o container.o utils.o xdg.o detect.o
+	$(CC) $(CFLAGS) -o $@ tests/test_restore_atime.c restore.o fileops.o metadata.o fsprobe.o manifest.o encoding.o container.o utils.o xdg.o detect.o
 
-$(TEST_BACKUP_PLAN): tests/test_backup_plan.c backup.o backup_plan.o container.o fileops.o metadata.o fsprobe.o manifest.o packages.o utils.o xdg.o detect.o
-	$(CC) $(CFLAGS) -o $@ tests/test_backup_plan.c backup.o backup_plan.o container.o fileops.o metadata.o fsprobe.o manifest.o packages.o utils.o xdg.o detect.o
+$(TEST_BACKUP_PLAN): tests/test_backup_plan.c backup.o backup_plan.o container.o fileops.o metadata.o fsprobe.o manifest.o encoding.o packages.o utils.o xdg.o detect.o
+	$(CC) $(CFLAGS) -o $@ tests/test_backup_plan.c backup.o backup_plan.o container.o fileops.o metadata.o fsprobe.o manifest.o encoding.o packages.o utils.o xdg.o detect.o
 
 $(TEST_METADATA_CONTRACT): tests/test_metadata_contract.c fileops.o metadata.o utils.o
 	$(CC) $(CFLAGS) -o $@ tests/test_metadata_contract.c fileops.o metadata.o utils.o
@@ -119,26 +123,26 @@ sidecar_state_test.o: src/sidecar_state.c src/sidecar.h
 $(TEST_SIDECAR_SCALE): tests/test_sidecar_scale.c sidecar.o sidecar_state_test.o
 	$(CC) $(CFLAGS) -o $@ tests/test_sidecar_scale.c sidecar.o sidecar_state_test.o
 
-$(TEST_PORTABLE_CAPTURE): tests/test_portable_capture.c portable.o sidecar.o sidecar_state.o manifest.o metadata.o utils.o
-	$(CC) $(CFLAGS) -o $@ tests/test_portable_capture.c portable.o sidecar.o sidecar_state.o manifest.o metadata.o utils.o
+$(TEST_PORTABLE_CAPTURE): tests/test_portable_capture.c portable.o sidecar.o sidecar_state.o manifest.o encoding.o metadata.o utils.o
+	$(CC) $(CFLAGS) -o $@ tests/test_portable_capture.c portable.o sidecar.o sidecar_state.o manifest.o encoding.o metadata.o utils.o
 
 portable_test.o: src/portable.c src/portable.h src/sidecar.h
 	$(CC) $(CFLAGS) -DPORTABLE_CAPTURE_TEST_HOOKS -c src/portable.c -o $@
 
-$(TEST_PORTABLE_CAPTURE_SCALE): tests/test_portable_capture_scale.c portable_test.o sidecar.o sidecar_state.o manifest.o metadata.o utils.o
-	$(CC) $(CFLAGS) -o $@ tests/test_portable_capture_scale.c portable_test.o sidecar.o sidecar_state.o manifest.o metadata.o utils.o
+$(TEST_PORTABLE_CAPTURE_SCALE): tests/test_portable_capture_scale.c portable_test.o sidecar.o sidecar_state.o manifest.o encoding.o metadata.o utils.o
+	$(CC) $(CFLAGS) -o $@ tests/test_portable_capture_scale.c portable_test.o sidecar.o sidecar_state.o manifest.o encoding.o metadata.o utils.o
 
 sidecar_test.o: src/sidecar.c src/sidecar.h
 	$(CC) $(CFLAGS) -DSIDECAR_TEST_HOOKS -c src/sidecar.c -o $@
 
-$(TEST_PORTABLE_RESUME): tests/test_portable_resume.c portable_test.o sidecar_test.o sidecar_state_test.o manifest.o metadata.o utils.o
-	$(CC) $(CFLAGS) -DPORTABLE_CAPTURE_TEST_HOOKS -DSIDECAR_TEST_HOOKS -o $@ tests/test_portable_resume.c portable_test.o sidecar_test.o sidecar_state_test.o manifest.o metadata.o utils.o
+$(TEST_PORTABLE_RESUME): tests/test_portable_resume.c portable_test.o sidecar_test.o sidecar_state_test.o manifest.o encoding.o metadata.o utils.o
+	$(CC) $(CFLAGS) -DPORTABLE_CAPTURE_TEST_HOOKS -DSIDECAR_TEST_HOOKS -o $@ tests/test_portable_resume.c portable_test.o sidecar_test.o sidecar_state_test.o manifest.o encoding.o metadata.o utils.o
 
-$(TEST_PORTABLE_RECONCILE): tests/test_portable_reconcile.c portable_test.o sidecar.o sidecar_state.o manifest.o metadata.o utils.o
-	$(CC) $(CFLAGS) -DPORTABLE_CAPTURE_TEST_HOOKS -o $@ tests/test_portable_reconcile.c portable_test.o sidecar.o sidecar_state.o manifest.o metadata.o utils.o
+$(TEST_PORTABLE_RECONCILE): tests/test_portable_reconcile.c portable_test.o sidecar.o sidecar_state.o manifest.o encoding.o metadata.o utils.o
+	$(CC) $(CFLAGS) -DPORTABLE_CAPTURE_TEST_HOOKS -o $@ tests/test_portable_reconcile.c portable_test.o sidecar.o sidecar_state.o manifest.o encoding.o metadata.o utils.o
 
-$(TEST_PORTABLE_RECONCILE_SCALE): tests/test_portable_reconcile_scale.c portable_test.o sidecar.o sidecar_state_test.o manifest.o metadata.o utils.o
-	$(CC) $(CFLAGS) -DPORTABLE_CAPTURE_TEST_HOOKS -o $@ tests/test_portable_reconcile_scale.c portable_test.o sidecar.o sidecar_state_test.o manifest.o metadata.o utils.o
+$(TEST_PORTABLE_RECONCILE_SCALE): tests/test_portable_reconcile_scale.c portable_test.o sidecar.o sidecar_state_test.o manifest.o encoding.o metadata.o utils.o
+	$(CC) $(CFLAGS) -DPORTABLE_CAPTURE_TEST_HOOKS -o $@ tests/test_portable_reconcile_scale.c portable_test.o sidecar.o sidecar_state_test.o manifest.o encoding.o metadata.o utils.o
 
 portable_restore_test.o: src/portable_restore.c src/portable_restore.h src/sidecar.h src/manifest.h src/metadata.h
 	$(CC) $(CFLAGS) -c src/portable_restore.c -o $@
@@ -146,21 +150,22 @@ portable_restore_test.o: src/portable_restore.c src/portable_restore.h src/sidec
 metadata_test.o: src/metadata.c src/metadata.h src/fileops.h
 	$(CC) $(CFLAGS) -DMETADATA_TEST_HOOKS -c src/metadata.c -o $@
 
-$(TEST_PORTABLE_RESTORE_PREFLIGHT): tests/test_portable_restore_preflight.c portable_restore_test.o sidecar.o sidecar_state.o manifest.o metadata_test.o utils.o
-	$(CC) $(CFLAGS) -DMETADATA_TEST_HOOKS -o $@ tests/test_portable_restore_preflight.c portable_restore_test.o sidecar.o sidecar_state.o manifest.o metadata_test.o utils.o
+$(TEST_PORTABLE_RESTORE_PREFLIGHT): tests/test_portable_restore_preflight.c portable_restore_test.o sidecar.o sidecar_state.o manifest.o encoding.o metadata_test.o utils.o
+	$(CC) $(CFLAGS) -DMETADATA_TEST_HOOKS -o $@ tests/test_portable_restore_preflight.c portable_restore_test.o sidecar.o sidecar_state.o manifest.o encoding.o metadata_test.o utils.o
 
-$(TEST_PORTABLE_RESTORE_REPLAY): tests/test_portable_restore_replay.c portable_restore_test.o sidecar.o sidecar_state.o manifest.o metadata.o utils.o
-	$(CC) $(CFLAGS) -o $@ tests/test_portable_restore_replay.c portable_restore_test.o sidecar.o sidecar_state.o manifest.o metadata.o utils.o
+$(TEST_PORTABLE_RESTORE_REPLAY): tests/test_portable_restore_replay.c portable_restore_test.o sidecar.o sidecar_state.o manifest.o encoding.o metadata.o utils.o
+	$(CC) $(CFLAGS) -o $@ tests/test_portable_restore_replay.c portable_restore_test.o sidecar.o sidecar_state.o manifest.o encoding.o metadata.o utils.o
 
-$(TEST_PORTABLE_RESTORE_ORCHESTRATE): tests/test_portable_restore_orchestrate.c portable_restore_test.o sidecar.o sidecar_state.o manifest.o metadata_test.o utils.o
-	$(CC) $(CFLAGS) -DMETADATA_TEST_HOOKS -o $@ tests/test_portable_restore_orchestrate.c portable_restore_test.o sidecar.o sidecar_state.o manifest.o metadata_test.o utils.o
+$(TEST_PORTABLE_RESTORE_ORCHESTRATE): tests/test_portable_restore_orchestrate.c portable_restore_test.o sidecar.o sidecar_state.o manifest.o encoding.o metadata_test.o utils.o
+	$(CC) $(CFLAGS) -DMETADATA_TEST_HOOKS -o $@ tests/test_portable_restore_orchestrate.c portable_restore_test.o sidecar.o sidecar_state.o manifest.o encoding.o metadata_test.o utils.o
 
-test: $(TARGET) $(TEST_DETECT) $(TEST_PATHJOIN) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE) $(TEST_MANIFEST) $(TEST_CONTAINER) $(TEST_RESTORE_NATIVE) $(TEST_RESTORE_SOURCE_READ) $(TEST_BACKUP_SOURCE_READ) $(TEST_RESTORE_DISPATCH) $(TEST_RESTORE_ATIME) $(TEST_BACKUP_PLAN) $(TEST_METADATA_CONTRACT) $(TEST_SIDECAR) $(TEST_SIDECAR_STATE) $(TEST_SIDECAR_SCALE) $(TEST_PORTABLE_CAPTURE) $(TEST_PORTABLE_CAPTURE_SCALE) $(TEST_PORTABLE_RESUME) $(TEST_PORTABLE_RECONCILE) $(TEST_PORTABLE_RECONCILE_SCALE) $(TEST_PORTABLE_RESTORE_PREFLIGHT) $(TEST_PORTABLE_RESTORE_REPLAY) $(TEST_PORTABLE_RESTORE_ORCHESTRATE)
+test: $(TARGET) $(TEST_DETECT) $(TEST_PATHJOIN) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE) $(TEST_MANIFEST) $(TEST_ENCODING) $(TEST_CONTAINER) $(TEST_RESTORE_NATIVE) $(TEST_RESTORE_SOURCE_READ) $(TEST_BACKUP_SOURCE_READ) $(TEST_RESTORE_DISPATCH) $(TEST_RESTORE_ATIME) $(TEST_BACKUP_PLAN) $(TEST_METADATA_CONTRACT) $(TEST_SIDECAR) $(TEST_SIDECAR_STATE) $(TEST_SIDECAR_SCALE) $(TEST_PORTABLE_CAPTURE) $(TEST_PORTABLE_CAPTURE_SCALE) $(TEST_PORTABLE_RESUME) $(TEST_PORTABLE_RECONCILE) $(TEST_PORTABLE_RECONCILE_SCALE) $(TEST_PORTABLE_RESTORE_PREFLIGHT) $(TEST_PORTABLE_RESTORE_REPLAY) $(TEST_PORTABLE_RESTORE_ORCHESTRATE)
 	./$(TEST_DETECT)
 	./$(TEST_PATHJOIN)
 	./$(TEST_SPECIAL_FILES)
 	./$(TEST_FSPROBE)
 	./$(TEST_MANIFEST)
+	./$(TEST_ENCODING)
 	./$(TEST_CONTAINER)
 	./$(TEST_RESTORE_NATIVE)
 	./$(TEST_RESTORE_SOURCE_READ)
@@ -244,6 +249,6 @@ check:
 	$(MAKE) check-analyze
 
 clean:
-	rm -f $(OBJS) backup_test.o fileops_test.o sidecar.o sidecar_test.o sidecar_state.o sidecar_state_test.o portable.o portable_test.o portable_restore_test.o metadata_test.o $(TARGET) $(TEST_DETECT) $(TEST_PATHJOIN) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE) $(TEST_MANIFEST) $(TEST_CONTAINER) $(TEST_RESTORE_NATIVE) $(TEST_RESTORE_SOURCE_READ) $(TEST_BACKUP_SOURCE_READ) $(TEST_RESTORE_DISPATCH) $(TEST_RESTORE_ATIME) $(TEST_BACKUP_PLAN) $(TEST_METADATA_CONTRACT) $(TEST_SIDECAR) $(TEST_SIDECAR_STATE) $(TEST_SIDECAR_SCALE) $(TEST_PORTABLE_CAPTURE) $(TEST_PORTABLE_CAPTURE_SCALE) $(TEST_PORTABLE_RESUME) $(TEST_PORTABLE_RECONCILE) $(TEST_PORTABLE_RECONCILE_SCALE) $(TEST_PORTABLE_RESTORE_PREFLIGHT) $(TEST_PORTABLE_RESTORE_REPLAY) $(TEST_PORTABLE_RESTORE_ORCHESTRATE)
+	rm -f $(OBJS) backup_test.o fileops_test.o sidecar.o sidecar_test.o sidecar_state.o sidecar_state_test.o portable.o portable_test.o portable_restore_test.o metadata_test.o $(TARGET) $(TEST_DETECT) $(TEST_PATHJOIN) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE) $(TEST_MANIFEST) $(TEST_ENCODING) $(TEST_CONTAINER) $(TEST_RESTORE_NATIVE) $(TEST_RESTORE_SOURCE_READ) $(TEST_BACKUP_SOURCE_READ) $(TEST_RESTORE_DISPATCH) $(TEST_RESTORE_ATIME) $(TEST_BACKUP_PLAN) $(TEST_METADATA_CONTRACT) $(TEST_SIDECAR) $(TEST_SIDECAR_STATE) $(TEST_SIDECAR_SCALE) $(TEST_PORTABLE_CAPTURE) $(TEST_PORTABLE_CAPTURE_SCALE) $(TEST_PORTABLE_RESUME) $(TEST_PORTABLE_RECONCILE) $(TEST_PORTABLE_RECONCILE_SCALE) $(TEST_PORTABLE_RESTORE_PREFLIGHT) $(TEST_PORTABLE_RESTORE_REPLAY) $(TEST_PORTABLE_RESTORE_ORCHESTRATE)
 
 .PHONY: clean test check-strict check-sanitize check-valgrind check-analyze check
