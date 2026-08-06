@@ -165,6 +165,27 @@ static int append_logical(char *destination, size_t destination_size,
     return 0;
 }
 
+int append_physical(char *destination, size_t destination_size,
+                    const char *parent, const char *encoded_leaf)
+{
+    if (destination == NULL || parent == NULL || encoded_leaf == NULL)
+        return -1;
+    size_t parent_length = bounded_strlen(parent, destination_size);
+    size_t leaf_length = strlen(encoded_leaf);
+    if (parent_length >= destination_size ||
+        leaf_length > destination_size - parent_length - 1U)
+        return -1;
+
+    size_t offset = 0;
+    if (parent_length != 0) {
+        memcpy(destination, parent, parent_length);
+        offset = parent_length;
+        destination[offset++] = '/';
+    }
+    memcpy(destination + offset, encoded_leaf, leaf_length + 1U);
+    return 0;
+}
+
 static int duplicate_fd(int fd)
 {
     return fcntl(fd, F_DUPFD_CLOEXEC, 0);
@@ -600,13 +621,15 @@ static int time_to_i64(time_t value, int64_t *out)
 }
 
 int entry_from_stat(const char *root_id, const char *logical,
+                    const char *physical,
                     const struct stat *st, int nsec_exact,
                     PortableXattrs *xattrs, SidecarEntry *out,
                     const SidecarBytes *symlink_target)
 {
     int64_t atime_sec;
     int64_t mtime_sec;
-    if (root_id == NULL || logical == NULL || st == NULL || out == NULL ||
+    if (root_id == NULL || logical == NULL || physical == NULL ||
+        st == NULL || out == NULL ||
         (st->st_mode & 07777) > SIDECAR_MAX_MODE || st->st_uid > UINT32_MAX ||
         st->st_gid > UINT32_MAX || st->st_size < 0 ||
         (uintmax_t)st->st_size > UINT64_MAX ||
@@ -622,7 +645,8 @@ int entry_from_stat(const char *root_id, const char *logical,
                                    strlen(root_id) };
     out->logical_path = (SidecarBytes){ (const unsigned char *)logical,
                                         strlen(logical) };
-    out->physical_path = out->logical_path;
+    out->physical_path = (SidecarBytes){ (const unsigned char *)physical,
+                                         strlen(physical) };
     if (S_ISLNK(st->st_mode))
         out->kind = SIDECAR_KIND_SYMLINK;
     else if (S_ISREG(st->st_mode))
@@ -1661,13 +1685,15 @@ static int copy_regular(int source_fd, int destination_fd, off_t expected_size)
 
 static int capture_node(PortableCaptureContext *context,
                         const PortableRootSpec *root,
-                        const char *logical, int source_parent,
+                        const char *logical, const char *physical,
+                        int source_parent,
                         const char *source_name, const char *root_path,
                         int destination_parent, const char *destination_leaf);
 
 static int capture_directory(PortableCaptureContext *context,
                              const PortableRootSpec *root,
-                             const char *logical, int source_fd,
+                             const char *logical, const char *physical,
+                             int source_fd,
                              const struct stat *before, int destination_fd,
                              PortableXattrs *xattrs)
 {
@@ -1698,7 +1724,8 @@ static int capture_directory(PortableCaptureContext *context,
             failed = 1;
             break;
         }
-        if (capture_node(context, root, child_logical, source_fd,
+        if (capture_node(context, root, child_logical, child_logical,
+                         source_fd,
                          entry->d_name, NULL, destination_fd,
                          entry->d_name) != 0) {
             failed = 1;
@@ -1722,7 +1749,8 @@ static int capture_directory(PortableCaptureContext *context,
     }
 
     SidecarEntry sidecar_entry;
-    if (entry_from_stat(root->id, logical, before, context->nsec_exact,
+    if (entry_from_stat(root->id, logical, physical, before,
+                        context->nsec_exact,
                         xattrs, &sidecar_entry, NULL) != 0 ||
         append_group(context, &sidecar_entry, xattrs) != 0) {
         xattrs_free(xattrs);
@@ -1735,7 +1763,8 @@ static int capture_directory(PortableCaptureContext *context,
 
 static int capture_regular(PortableCaptureContext *context,
                            const PortableRootSpec *root,
-                           const char *logical, int source_fd,
+                           const char *logical, const char *physical,
+                           int source_fd,
                            const struct stat *before,
                            int destination_parent,
                            const char *destination_leaf,
@@ -1806,7 +1835,8 @@ static int capture_regular(PortableCaptureContext *context,
     }
 
     SidecarEntry sidecar_entry;
-    failed = entry_from_stat(root->id, logical, before, context->nsec_exact,
+    failed = entry_from_stat(root->id, logical, physical, before,
+                             context->nsec_exact,
                              xattrs, &sidecar_entry, NULL) != 0 ||
              append_group(context, &sidecar_entry, xattrs) != 0;
     xattrs_free(xattrs);
@@ -1854,7 +1884,8 @@ static int capture_special(PortableCaptureContext *context,
 
 static int capture_symlink(PortableCaptureContext *context,
                            const PortableRootSpec *root,
-                           const char *logical, int source_parent,
+                           const char *logical, const char *physical,
+                           int source_parent,
                            const char *source_name, const char *root_path,
                            int destination_parent,
                            const char *destination_leaf,
@@ -1898,7 +1929,8 @@ static int capture_symlink(PortableCaptureContext *context,
         (const unsigned char *)target, (size_t)target_length
     };
     SidecarEntry entry;
-    if (entry_from_stat(root->id, logical, before, context->nsec_exact,
+    if (entry_from_stat(root->id, logical, physical, before,
+                        context->nsec_exact,
                         &xattrs, &entry, &target_bytes) != 0) {
         xattrs_free(&xattrs);
         return -1;
@@ -1983,7 +2015,8 @@ static int capture_symlink(PortableCaptureContext *context,
 
 static int capture_node(PortableCaptureContext *context,
                         const PortableRootSpec *root,
-                        const char *logical, int source_parent,
+                        const char *logical, const char *physical,
+                        int source_parent,
                         const char *source_name, const char *root_path,
                         int destination_parent, const char *destination_leaf)
 {
@@ -2001,7 +2034,7 @@ static int capture_node(PortableCaptureContext *context,
         return -1;
     }
     if (S_ISLNK(before.st_mode))
-        return capture_symlink(context, root, logical, source_parent,
+        return capture_symlink(context, root, logical, physical, source_parent,
                                source_name, root_path, destination_parent,
                                destination_leaf, is_root, &before);
     if (!S_ISREG(before.st_mode) && !S_ISDIR(before.st_mode)) {
@@ -2048,7 +2081,7 @@ static int capture_node(PortableCaptureContext *context,
         }
         if (live == 1) {
             SidecarEntry current;
-            int matches = entry_from_stat(root->id, logical, &before,
+            int matches = entry_from_stat(root->id, logical, physical, &before,
                                           context->nsec_exact, &xattrs,
                                           &current, NULL) == 0 &&
                           entries_equal(&current, &previous, &xattrs);
@@ -2070,7 +2103,8 @@ static int capture_node(PortableCaptureContext *context,
     }
 
     if (S_ISREG(before.st_mode))
-        return capture_regular(context, root, logical, source_fd, &before,
+        return capture_regular(context, root, logical, physical, source_fd,
+                               &before,
                                destination_parent, destination_leaf, is_root,
                                &xattrs);
 
@@ -2100,7 +2134,7 @@ static int capture_node(PortableCaptureContext *context,
         close(source_fd);
         return -1;
     }
-    if (capture_directory(context, root, logical, source_fd, &before,
+    if (capture_directory(context, root, logical, physical, source_fd, &before,
                           destination_fd, &xattrs) != 0) {
         if (is_root)
             close(parent_fd);
@@ -2311,7 +2345,7 @@ int portable_capture_root(PortableCaptureContext *context,
     PortableVisited *visited = context->visited;
     if (visited_reset(visited) != 0)
         return -1;
-    return capture_node(context, root, "", -1, NULL, root->capture_path,
+    return capture_node(context, root, "", "", -1, NULL, root->capture_path,
                         -1, NULL);
 }
 
