@@ -52,6 +52,25 @@ extern int append_physical(char *destination, size_t destination_size,
                            const char *parent, const char *encoded_leaf);
 extern int prescan_report_add(PortablePrescanReport *report,
                               const PortablePrescanViolation *violation);
+typedef struct {
+    char *folded_key;
+    char *logical_path;
+    size_t key_length;
+    uint64_t hash;
+} PortableCaseFoldSlot;
+typedef struct {
+    PortableCaseFoldSlot *slots;
+    size_t count;
+    size_t capacity;
+    uint64_t hash_salt;
+} PortableCaseFoldSet;
+extern void ascii_fold_copy(char *destination, size_t destination_size,
+                            const char *source);
+extern int case_fold_set_find_or_insert(PortableCaseFoldSet *set,
+                                        const char *folded_key,
+                                        const char *logical_path,
+                                        char **out_logical_path);
+extern void case_fold_set_free(PortableCaseFoldSet *set);
 extern int entries_equal(const SidecarEntry *current,
                          const SidecarLiveView *previous,
                          const PortableXattrs *xattrs);
@@ -335,6 +354,237 @@ static void test_prescan_report(void)
     check(report.total_count == 0 && report.examples == NULL &&
               report.example_count == 0 && report.example_capacity == 0,
           "pre-scan report frees all storage");
+}
+
+static void test_case_fold_helpers(void)
+{
+    printf(BLUE "::" NC " ASCII case-fold sibling set\n");
+    char folded[32];
+    ascii_fold_copy(folded, sizeof(folded), "Foo/BAR");
+    check(strcmp(folded, "foo/bar") == 0,
+          "ASCII letters are folded while separators remain unchanged");
+
+    static const char non_ascii[] = "caf\xc3\x89";
+    ascii_fold_copy(folded, sizeof(folded), non_ascii);
+    check(strcmp(folded, non_ascii) == 0 &&
+              (unsigned char)folded[3] == 0xc3U &&
+              (unsigned char)folded[4] == 0x89U,
+          "bytes outside ASCII are preserved byte-for-byte");
+
+    struct {
+        char bytes[4];
+        char guard;
+    } short_buffer = { { 0 }, '!' };
+    ascii_fold_copy(short_buffer.bytes, sizeof(short_buffer.bytes), "ABCDE");
+    check(strcmp(short_buffer.bytes, "abc") == 0 &&
+              short_buffer.guard == '!',
+          "ASCII folding terminates within a short destination");
+
+    PortableCaseFoldSet set = { .hash_salt = sidecar_process_salt() };
+    char *existing = NULL;
+    check(case_fold_set_find_or_insert(&set, "foo", "Foo", &existing) == 0 &&
+              existing == NULL,
+          "a fresh folded sibling is inserted");
+    check(case_fold_set_find_or_insert(&set, "foo", "foo", &existing) == 1 &&
+              existing != NULL && strcmp(existing, "Foo") == 0,
+          "a folded collision returns the first logical path");
+
+    int inserted = 0;
+    for (size_t index = 0; index < 40U; index++) {
+        char key[32];
+        char logical[32];
+        int key_length = snprintf(key, sizeof(key), "key-%zu", index);
+        int logical_length = snprintf(logical, sizeof(logical),
+                                      "path-%zu", index);
+        if (key_length < 0 || (size_t)key_length >= sizeof(key) ||
+            logical_length < 0 || (size_t)logical_length >= sizeof(logical))
+            fixture_fatal("could not build case-fold helper fixture");
+        existing = NULL;
+        if (case_fold_set_find_or_insert(&set, key, logical, &existing) != 0)
+            fixture_fatal("case-fold sibling set rejected a fresh key");
+        inserted++;
+    }
+    check(inserted == 40 && set.count == 41 && set.capacity >= 64U,
+          "case-fold sibling set grows through open-addressing rehashes");
+    case_fold_set_free(&set);
+    check(set.slots == NULL && set.count == 0 && set.capacity == 0,
+          "case-fold sibling set frees every stored path");
+}
+
+static int missing_container_entry(int container_fd, const char *name)
+{
+    struct stat st;
+    return fstatat(container_fd, name, &st, AT_SYMLINK_NOFOLLOW) != 0 &&
+           errno == ENOENT;
+}
+
+static int empty_capture_container(int container_fd)
+{
+    return missing_container_entry(container_fd, "manifest.txt") &&
+           missing_container_entry(container_fd, "data") &&
+           missing_container_entry(container_fd, SIDECAR_SLOT_NAME);
+}
+
+static int collision_pair_matches(const PortablePrescanViolation *violation,
+                                  const char *first, const char *second)
+{
+    if (violation == NULL || violation->kind != PORTABLE_PRESCAN_CASE_COLLISION)
+        return 0;
+    return (strcmp(violation->logical_path, first) == 0 &&
+            strcmp(violation->collides_with_logical_path, second) == 0) ||
+           (strcmp(violation->logical_path, second) == 0 &&
+            strcmp(violation->collides_with_logical_path, first) == 0);
+}
+
+static int case_name_member(const char *name, const char *const *names,
+                            size_t name_count)
+{
+    for (size_t index = 0; index < name_count; index++)
+        if (strcmp(name, names[index]) == 0)
+            return 1;
+    return 0;
+}
+
+static int run_case_fixture(const char *base, const char *label,
+                            const char *const *names, size_t name_count,
+                            int case_sensitive, char *source_path,
+                            size_t source_size, char *container_path,
+                            size_t container_size, int *container_fd,
+                            PortablePrescanReport *report)
+{
+    join_path(source_path, source_size, base, label);
+    char container_label[PATH_MAX];
+    int label_length = snprintf(container_label, sizeof(container_label),
+                                "%s-container", label);
+    if (label_length < 0 || (size_t)label_length >= sizeof(container_label))
+        fixture_fatal("case-fold fixture label is too long");
+    join_path(container_path, container_size, base, container_label);
+    make_directory(source_path);
+    make_directory(container_path);
+
+    for (size_t index = 0; index < name_count; index++) {
+        char path[PATH_MAX];
+        join_path(path, sizeof(path), source_path, names[index]);
+        write_file(path, "x", 1);
+    }
+
+    *container_fd = open(container_path,
+                          O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (*container_fd < 0)
+        fixture_fatal("could not open case-fold container");
+    PortableRootSpec root = root_spec("CASE", source_path, "CASE");
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .roots = &root,
+        .root_count = 1,
+        .nsec_exact = 1,
+        .case_sensitive = case_sensitive
+    };
+    portable_prescan_report_init(report);
+    return portable_capture_fresh_at(*container_fd, &request, report);
+}
+
+static void test_case_collision_prescan(const char *base)
+{
+    printf(BLUE "::" NC " ASCII case-collision pre-scan\n");
+    static const char *const pair[] = { "Foo", "foo" };
+    char source_path[PATH_MAX];
+    char container_path[PATH_MAX];
+    int container_fd;
+    PortablePrescanReport report;
+
+    int result = run_case_fixture(base, "case-collision", pair,
+                                  sizeof(pair) / sizeof(pair[0]), 0,
+                                  source_path, sizeof(source_path),
+                                  container_path, sizeof(container_path),
+                                  &container_fd, &report);
+    check(result != 0 && report.total_count == 1 &&
+              report.example_count == 1 &&
+              strcmp(report.examples[0].root_id, "CASE") == 0 &&
+              collision_pair_matches(&report.examples[0], "Foo", "foo"),
+          "case-insensitive pre-scan reports both ASCII-colliding siblings");
+    check(empty_capture_container(container_fd),
+          "case-collision refusal leaves the container namespace untouched");
+    portable_prescan_report_free(&report);
+    close(container_fd);
+    remove_tree(source_path);
+    remove_tree(container_path);
+
+    result = run_case_fixture(base, "case-sensitive", pair,
+                              sizeof(pair) / sizeof(pair[0]), 1,
+                              source_path, sizeof(source_path),
+                              container_path, sizeof(container_path),
+                              &container_fd, &report);
+    struct stat st;
+    check(result == 0 && report.total_count == 0,
+          "case-sensitive pre-scan permits distinct ASCII siblings");
+    check(fstatat(container_fd, "data/CASE/Foo", &st,
+                  AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(st.st_mode) &&
+              fstatat(container_fd, "data/CASE/foo", &st,
+                      AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(st.st_mode),
+          "case-sensitive capture keeps both payload names");
+    portable_prescan_report_free(&report);
+    close(container_fd);
+    remove_tree(source_path);
+    remove_tree(container_path);
+
+    static const char *const prefixes[] = { "Foo", "Foobar", "foo2" };
+    result = run_case_fixture(base, "case-prefix", prefixes,
+                              sizeof(prefixes) / sizeof(prefixes[0]), 0,
+                              source_path, sizeof(source_path),
+                              container_path, sizeof(container_path),
+                              &container_fd, &report);
+    check(result == 0 && report.total_count == 0,
+          "case pre-scan does not confuse prefixes with collisions");
+    portable_prescan_report_free(&report);
+    close(container_fd);
+    remove_tree(source_path);
+    remove_tree(container_path);
+
+    static const char *const three_way[] = { "Foo", "foo", "FOO" };
+    result = run_case_fixture(base, "case-three-way", three_way,
+                              sizeof(three_way) / sizeof(three_way[0]), 0,
+                              source_path, sizeof(source_path),
+                              container_path, sizeof(container_path),
+                              &container_fd, &report);
+    int pairs_are_valid = report.example_count == 2;
+    for (size_t index = 0; index < report.example_count; index++) {
+        const PortablePrescanViolation *violation = &report.examples[index];
+        pairs_are_valid = pairs_are_valid &&
+                          violation->kind == PORTABLE_PRESCAN_CASE_COLLISION &&
+                          violation->logical_path[0] != '\0' &&
+                          violation->collides_with_logical_path[0] != '\0' &&
+                          strcmp(violation->logical_path,
+                                 violation->collides_with_logical_path) != 0 &&
+                          case_name_member(violation->logical_path, three_way,
+                                           sizeof(three_way) /
+                                               sizeof(three_way[0])) &&
+                          case_name_member(
+                              violation->collides_with_logical_path,
+                              three_way,
+                              sizeof(three_way) / sizeof(three_way[0]));
+    }
+    check(result != 0 && report.total_count == 2 && pairs_are_valid,
+          "three ASCII case variants produce two collision violations");
+    check(empty_capture_container(container_fd),
+          "three-way collision refusal leaves the container untouched");
+    portable_prescan_report_free(&report);
+    close(container_fd);
+    remove_tree(source_path);
+    remove_tree(container_path);
+
+    static const char *const non_ascii[] = { "caf\xc3\xa9", "caf\xc3\x89" };
+    result = run_case_fixture(base, "case-non-ascii", non_ascii,
+                              sizeof(non_ascii) / sizeof(non_ascii[0]), 0,
+                              source_path, sizeof(source_path),
+                              container_path, sizeof(container_path),
+                              &container_fd, &report);
+    check(result == 0 && report.total_count == 0,
+          "non-ASCII case folding remains deferred to destination probing");
+    portable_prescan_report_free(&report);
+    close(container_fd);
+    remove_tree(source_path);
+    remove_tree(container_path);
 }
 
 static void test_entry_helpers(const char *source)
@@ -1248,6 +1498,8 @@ int main(void)
     test_entry_helpers(source_path);
     test_append_physical();
     test_prescan_report();
+    test_case_fold_helpers();
+    test_case_collision_prescan(root_path);
     test_encoded_payload_names(root_path);
     test_nested_encoded_directories(root_path);
     test_name_and_path_limits(root_path);

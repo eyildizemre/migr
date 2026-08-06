@@ -1184,6 +1184,159 @@ static int visited_contains(const PortableVisited *visited,
 }
 
 typedef struct {
+    char *folded_key;
+    char *logical_path;
+    size_t key_length;
+    uint64_t hash;
+} PortableCaseFoldSlot;
+
+typedef struct {
+    PortableCaseFoldSlot *slots;
+    size_t count;
+    size_t capacity;
+    uint64_t hash_salt;
+} PortableCaseFoldSet;
+
+static uint64_t case_fold_hash(const PortableCaseFoldSet *set,
+                               const char *folded_key, size_t key_length)
+{
+    uint64_t hash = UINT64_C(1469598103934665603) ^ set->hash_salt;
+    hash = visited_fnv1a_uint64(hash, (uint64_t)key_length);
+    return visited_fnv1a_bytes(hash, (const unsigned char *)folded_key,
+                               key_length);
+}
+
+static int case_fold_set_rehash(PortableCaseFoldSet *set,
+                                size_t new_capacity)
+{
+    if (set == NULL || !visited_capacity_valid(new_capacity) ||
+        new_capacity > visited_max_capacity() ||
+        new_capacity > SIZE_MAX / sizeof(*set->slots) ||
+        (set->capacity != 0 && set->slots == NULL))
+        return -1;
+
+    PortableCaseFoldSlot *new_slots = calloc(new_capacity,
+                                             sizeof(*new_slots));
+    if (new_slots == NULL)
+        return -1;
+
+    for (size_t old_index = 0; old_index < set->capacity; old_index++) {
+        PortableCaseFoldSlot *old_slot = &set->slots[old_index];
+        if (old_slot->folded_key == NULL)
+            continue;
+        size_t index = (size_t)old_slot->hash & (new_capacity - 1U);
+        while (new_slots[index].folded_key != NULL)
+            index = (index + 1U) & (new_capacity - 1U);
+        new_slots[index] = *old_slot;
+    }
+
+    free(set->slots);
+    set->slots = new_slots;
+    set->capacity = new_capacity;
+    return 0;
+}
+
+void ascii_fold_copy(char *destination, size_t destination_size,
+                     const char *source)
+{
+    if (destination == NULL || destination_size == 0)
+        return;
+    size_t index = 0;
+    if (source != NULL) {
+        for (; source[index] != '\0' && index + 1U < destination_size;
+             index++)
+            destination[index] = (source[index] >= 'A' &&
+                                  source[index] <= 'Z')
+                ? (char)(source[index] + ('a' - 'A'))
+                : source[index];
+    }
+    destination[index] = '\0';
+}
+
+int case_fold_set_find_or_insert(PortableCaseFoldSet *set,
+                                 const char *folded_key,
+                                 const char *logical_path,
+                                 char **out_logical_path)
+{
+    if (set == NULL || folded_key == NULL || logical_path == NULL ||
+        out_logical_path == NULL)
+        return -1;
+    *out_logical_path = NULL;
+
+    size_t key_length = strlen(folded_key);
+    size_t logical_length = strlen(logical_path);
+    if (key_length == SIZE_MAX || logical_length == SIZE_MAX)
+        return -1;
+    if (set->capacity == 0) {
+        if (set->hash_salt == 0)
+            set->hash_salt = sidecar_process_salt();
+        if (case_fold_set_rehash(set, VISITED_INITIAL_CAPACITY) != 0)
+            return -1;
+    }
+
+    uint64_t hash = case_fold_hash(set, folded_key, key_length);
+    size_t index = (size_t)hash & (set->capacity - 1U);
+    int empty_slot = 0;
+    for (size_t probes = 0; probes < set->capacity; probes++) {
+        PortableCaseFoldSlot *slot = &set->slots[index];
+        if (slot->folded_key == NULL) {
+            empty_slot = 1;
+            break;
+        }
+        if (slot->hash == hash && slot->key_length == key_length &&
+            memcmp(slot->folded_key, folded_key, key_length) == 0) {
+            *out_logical_path = slot->logical_path;
+            return 1;
+        }
+        index = (index + 1U) & (set->capacity - 1U);
+    }
+
+    if (!empty_slot || set->count + 1U > set->capacity / 2U) {
+        if (set->count >= SIDECAR_MAX_LIVE_ENTRIES ||
+            set->capacity > visited_max_capacity() / 2U ||
+            case_fold_set_rehash(set, set->capacity * 2U) != 0)
+            return -1;
+        index = (size_t)hash & (set->capacity - 1U);
+        while (set->slots[index].folded_key != NULL)
+            index = (index + 1U) & (set->capacity - 1U);
+    }
+
+    if (key_length > SIZE_MAX - 1U || logical_length > SIZE_MAX - 1U)
+        return -1;
+    char *key_copy = malloc(key_length + 1U);
+    if (key_copy == NULL)
+        return -1;
+    char *logical_copy = malloc(logical_length + 1U);
+    if (logical_copy == NULL) {
+        free(key_copy);
+        return -1;
+    }
+    memcpy(key_copy, folded_key, key_length + 1U);
+    memcpy(logical_copy, logical_path, logical_length + 1U);
+
+    set->slots[index] = (PortableCaseFoldSlot){
+        .folded_key = key_copy,
+        .logical_path = logical_copy,
+        .key_length = key_length,
+        .hash = hash
+    };
+    set->count++;
+    return 0;
+}
+
+void case_fold_set_free(PortableCaseFoldSet *set)
+{
+    if (set == NULL)
+        return;
+    for (size_t index = 0; index < set->capacity; index++) {
+        free(set->slots[index].folded_key);
+        free(set->slots[index].logical_path);
+    }
+    free(set->slots);
+    memset(set, 0, sizeof(*set));
+}
+
+typedef struct {
     char *logical;
     char *physical;
 } StaleKey;
@@ -2436,10 +2589,29 @@ static int prescan_record_violation(PortablePrescanReport *report,
     return prescan_report_add(report, &violation);
 }
 
+static int prescan_record_case_collision(PortablePrescanReport *report,
+                                         const char *root_id,
+                                         const char *logical_path,
+                                         const char *collides_with)
+{
+    PortablePrescanViolation violation = {
+        .kind = PORTABLE_PRESCAN_CASE_COLLISION
+    };
+    if (copy_text(violation.root_id, sizeof(violation.root_id), root_id) != 0 ||
+        copy_text(violation.logical_path, sizeof(violation.logical_path),
+                  logical_path) != 0 ||
+        copy_text(violation.collides_with_logical_path,
+                  sizeof(violation.collides_with_logical_path),
+                  collides_with) != 0)
+        return -1;
+    return prescan_report_add(report, &violation);
+}
+
 static int prescan_directory(int source_fd, const char *logical,
                              const char *physical, const char *root_id,
                              const char *payload_path,
-                             PortablePrescanReport *report)
+                             PortablePrescanReport *report,
+                             int case_sensitive)
 {
     if (source_fd < 0 || logical == NULL || physical == NULL ||
         root_id == NULL || payload_path == NULL || report == NULL)
@@ -2452,6 +2624,10 @@ static int prescan_directory(int source_fd, const char *logical,
             close(scan_fd);
         return -1;
     }
+
+    PortableCaseFoldSet siblings = {0};
+    if (!case_sensitive)
+        siblings.hash_salt = sidecar_process_salt();
 
     int failed = 0;
     for (;;) {
@@ -2518,6 +2694,27 @@ static int prescan_directory(int source_fd, const char *logical,
             continue;
         }
 
+        if (!case_sensitive) {
+            char folded[NAME_MAX + 1U];
+            ascii_fold_copy(folded, sizeof(folded), scratch);
+            char *existing_logical = NULL;
+            int found = case_fold_set_find_or_insert(
+                &siblings, folded, child_logical, &existing_logical);
+            if (found < 0) {
+                failed = 1;
+                break;
+            }
+            if (found == 1) {
+                if (prescan_record_case_collision(
+                        report, root_id, child_logical,
+                        existing_logical) != 0) {
+                    failed = 1;
+                    break;
+                }
+                continue;
+            }
+        }
+
         struct stat child_stat;
         if (read_source_stat(source_fd, entry->d_name, NULL, &child_stat) != 0) {
             failed = 1;
@@ -2532,7 +2729,7 @@ static int prescan_directory(int source_fd, const char *logical,
             }
             int child_result = prescan_directory(
                 child_fd, child_logical, child_physical, root_id,
-                payload_path, report);
+                payload_path, report, case_sensitive);
             if (close(child_fd) != 0)
                 child_result = -1;
             if (child_result != 0) {
@@ -2543,11 +2740,12 @@ static int prescan_directory(int source_fd, const char *logical,
     }
     if (closedir(directory) != 0)
         failed = 1;
+    case_fold_set_free(&siblings);
     return failed ? -1 : 0;
 }
 
 static int prescan_root(const PortableRootSpec *root,
-                        PortablePrescanReport *report)
+                        PortablePrescanReport *report, int case_sensitive)
 {
     if (!root_spec_valid(root) || report == NULL)
         return -1;
@@ -2562,7 +2760,7 @@ static int prescan_root(const PortableRootSpec *root,
     if (root_fd < 0)
         return -1;
     int result = prescan_directory(root_fd, "", "", root->id,
-                                   root->payload_path, report);
+                                   root->payload_path, report, case_sensitive);
     if (close(root_fd) != 0)
         result = -1;
     return result;
@@ -2575,7 +2773,8 @@ static int prescan_request(const PortableCaptureRequest *request,
         return -1;
     int failed = 0;
     for (size_t index = 0; index < request->root_count; index++)
-        if (prescan_root(&request->roots[index], report) != 0)
+        if (prescan_root(&request->roots[index], report,
+                         request->case_sensitive) != 0)
             failed = 1;
     return failed || report->total_count != 0 ? -1 : 0;
 }
