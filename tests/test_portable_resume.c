@@ -219,7 +219,7 @@ static int run_fresh_interrupt(int container_fd,
         return -1;
     if (child == 0) {
         portable_capture_test_set_interrupt(point);
-        int result = portable_capture_fresh_at(container_fd, request);
+        int result = portable_capture_fresh_at(container_fd, request, NULL);
         _exit(result == 0 ? 0 : 1);
     }
     int status = 0;
@@ -239,7 +239,7 @@ static int run_resume_interrupt(int container_fd,
     if (child == 0) {
         portable_capture_test_set_interrupt(portable_point);
         sidecar_test_set_interrupt(sidecar_point);
-        int result = portable_capture_resume_at(container_fd, request);
+        int result = portable_capture_resume_at(container_fd, request, NULL);
         _exit(result == 0 ? 0 : 1);
     }
     int status = 0;
@@ -255,7 +255,7 @@ static int fresh_capture(const char *container_path,
     *container_fd = create_container(container_path);
     if (*container_fd < 0)
         return -1;
-    return portable_capture_fresh_at(*container_fd, request);
+    return portable_capture_fresh_at(*container_fd, request, NULL);
 }
 
 static void test_resume_skips_and_replaces(const char *base)
@@ -298,7 +298,7 @@ static void test_resume_skips_and_replaces(const char *base)
     write_file(source_b, "after");
     portable_capture_test_set_interrupt(PORTABLE_TEST_INTERRUPT_NONE);
     sidecar_test_set_interrupt(SIDECAR_TEST_INTERRUPT_NONE);
-    check(portable_capture_resume_at(container_fd, &request) == 0,
+    check(portable_capture_resume_at(container_fd, &request, NULL) == 0,
           "resume adopts the existing sidecar");
 
     struct stat after_a;
@@ -344,7 +344,7 @@ static void test_encoded_resume(const char *base)
               stat(slot_path, &sidecar_before) == 0,
           "encoded payload and sidecar exist before resume");
 
-    check(portable_capture_resume_at(container_fd, &request) == 0,
+    check(portable_capture_resume_at(container_fd, &request, NULL) == 0,
           "resume accepts an unchanged encoded source");
     struct stat payload_after;
     check(lstat(payload_path, &payload_after) == 0 &&
@@ -458,7 +458,7 @@ static void test_symlink_resume(const char *base)
 
     portable_capture_test_set_interrupt(PORTABLE_TEST_INTERRUPT_NONE);
     sidecar_test_set_interrupt(SIDECAR_TEST_INTERRUPT_NONE);
-    check(portable_capture_resume_at(container_fd, &request) == 0,
+    check(portable_capture_resume_at(container_fd, &request, NULL) == 0,
           "resume accepts an unchanged symlink");
     struct stat payload_after;
     struct stat sidecar_after;
@@ -470,7 +470,7 @@ static void test_symlink_resume(const char *base)
               symlink_live_target(container_fd, "before-target"),
           "unchanged symlink resume leaves payload and sidecar untouched");
 
-    check(portable_capture_resume_at(container_fd, &request) == 0,
+    check(portable_capture_resume_at(container_fd, &request, NULL) == 0,
           "a second unchanged symlink resume remains idempotent");
     check(stat(slot_path, &sidecar_after) == 0 &&
               sidecar_after.st_size == sidecar_before.st_size,
@@ -479,7 +479,7 @@ static void test_symlink_resume(const char *base)
     replace_symlink_target(root.capture_path, "after-target");
     check(symlink_equals(root.capture_path, "after-target"),
           "fixture exposes the changed symlink target");
-    check(portable_capture_resume_at(container_fd, &request) == 0,
+    check(portable_capture_resume_at(container_fd, &request, NULL) == 0,
           "resume recaptures a changed symlink target");
     check(symlink_placeholder(container_fd) &&
               symlink_live_target(container_fd, "after-target") &&
@@ -515,7 +515,7 @@ static void test_missing_sidecar(const char *base)
     check(!missing_at(container_fd, "manifest.txt") &&
           missing_at(container_fd, SIDECAR_SLOT_NAME),
           "manifest exists while sidecar is still absent");
-    check(portable_capture_resume_at(container_fd, &request) == 0,
+    check(portable_capture_resume_at(container_fd, &request, NULL) == 0,
           "resume creates a sidecar only for the pristine namespace");
     check(!missing_at(container_fd, SIDECAR_SLOT_NAME),
           "recovery creates the sidecar slot");
@@ -552,7 +552,7 @@ static void test_nonempty_without_sidecar(const char *base)
                             O_CLOEXEC, 0600);
     if (orphan_fd < 0 || close(orphan_fd) != 0 || close(data_fd) != 0)
         fixture_fatal("could not create orphan payload");
-    check(portable_capture_resume_at(container_fd, &request) != 0,
+    check(portable_capture_resume_at(container_fd, &request, NULL) != 0,
           "resume refuses a nonempty data namespace without a sidecar");
     check(missing_at(container_fd, SIDECAR_SLOT_NAME),
           "refusal does not silently create a fresh sidecar");
@@ -589,7 +589,7 @@ static void test_unsafe_sidecar(const char *base)
     join_path(slot_path, sizeof(slot_path), container_path, SIDECAR_SLOT_NAME);
     if (symlink(target_path, slot_path) != 0)
         fixture_fatal("could not create unsafe sidecar symlink");
-    check(portable_capture_resume_at(container_fd, &request) != 0,
+    check(portable_capture_resume_at(container_fd, &request, NULL) != 0,
           "a symlink sidecar is unusable rather than followed");
     check(missing_at(container_fd, "data"),
           "unsafe sidecar refusal leaves the missing data namespace absent");
@@ -601,7 +601,7 @@ static void test_unsafe_sidecar(const char *base)
     if (malformed_fd < 0 || write(malformed_fd, "garbage", 7) != 7 ||
         close(malformed_fd) != 0)
         fixture_fatal("could not write malformed sidecar fixture");
-    check(portable_capture_resume_at(container_fd, &request) != 0,
+    check(portable_capture_resume_at(container_fd, &request, NULL) != 0,
           "an interior-corrupt sidecar is unusable rather than freshened");
     check(file_equals(target_path, "not a sidecar"),
           "malformed-sidecar refusal leaves the unrelated target untouched");
@@ -638,7 +638,7 @@ static void test_truncated_tail(const char *base)
     struct stat before;
     if (stat(slot_path, &before) != 0)
         fixture_fatal("could not stat tailed sidecar");
-    check(portable_capture_resume_at(container_fd, &request) == 0,
+    check(portable_capture_resume_at(container_fd, &request, NULL) == 0,
           "resume truncates an incomplete final sidecar record");
     struct stat after;
     check(stat(slot_path, &after) == 0 && after.st_size < before.st_size,
@@ -752,7 +752,7 @@ static void test_sigkill_boundaries(const char *base)
         check(killed == 0, cases[index].label);
         portable_capture_test_set_interrupt(PORTABLE_TEST_INTERRUPT_NONE);
         sidecar_test_set_interrupt(SIDECAR_TEST_INTERRUPT_NONE);
-        check(portable_capture_resume_at(container_fd, &request) == 0,
+        check(portable_capture_resume_at(container_fd, &request, NULL) == 0,
               "a killed capture remains resumable");
         check(file_equals(root.capture_path, "after"),
               "source remains intact after interruption recovery");
@@ -843,7 +843,7 @@ static void test_symlink_sigkill_boundaries(const char *base)
         check(killed == 0, cases[index].label);
         portable_capture_test_set_interrupt(PORTABLE_TEST_INTERRUPT_NONE);
         sidecar_test_set_interrupt(SIDECAR_TEST_INTERRUPT_NONE);
-        check(portable_capture_resume_at(container_fd, &request) == 0,
+        check(portable_capture_resume_at(container_fd, &request, NULL) == 0,
               "a killed symlink capture remains resumable");
         check(symlink_placeholder(container_fd) &&
                   symlink_live_target(container_fd, "after-target"),
@@ -873,7 +873,7 @@ static void test_identity_mismatch(const char *base)
     if (container_fd < 0)
         return;
     PortableCaptureRequest mismatch = request_for(&root, "c2");
-    check(portable_capture_resume_at(container_fd, &mismatch) != 0,
+    check(portable_capture_resume_at(container_fd, &mismatch, NULL) != 0,
           "a different source identity cannot adopt the partial");
     close(container_fd);
 }

@@ -151,7 +151,7 @@ int main(void)
         .root_count = 1,
         .nsec_exact = 1
     };
-    check(portable_capture_fresh_at(container_fd, &request) == 0,
+    check(portable_capture_fresh_at(container_fd, &request, NULL) == 0,
           "50,000-entry fixture captures successfully");
 
     for (unsigned int index = 0; index < SCALE_ENTRY_COUNT / 2U; index++) {
@@ -164,7 +164,7 @@ int main(void)
 
     portable_capture_test_reset_probe_count();
     sidecar_state_test_reset_probe_count();
-    check(portable_capture_resume_at(container_fd, &request) == 0,
+    check(portable_capture_resume_at(container_fd, &request, NULL) == 0,
           "resume reconciles 25,000 stale entries");
     uint64_t visited_probes = portable_capture_test_probe_count();
     uint64_t map_probes = sidecar_state_test_probe_count();

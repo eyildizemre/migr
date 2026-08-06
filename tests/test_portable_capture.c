@@ -236,52 +236,6 @@ static int file_equals(const char *path, const char *expected)
     return result;
 }
 
-static int directory_fd_is_empty(int directory_fd)
-{
-    int scan_fd = fcntl(directory_fd, F_DUPFD_CLOEXEC, 0);
-    DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
-    if (directory == NULL) {
-        if (scan_fd >= 0)
-            close(scan_fd);
-        return 0;
-    }
-
-    int empty = 1;
-    for (;;) {
-        errno = 0;
-        struct dirent *entry = readdir(directory);
-        if (entry == NULL) {
-            if (errno != 0)
-                empty = 0;
-            break;
-        }
-        if (strcmp(entry->d_name, ".") != 0 &&
-            strcmp(entry->d_name, "..") != 0) {
-            empty = 0;
-            break;
-        }
-    }
-    if (closedir(directory) != 0)
-        empty = 0;
-    return empty;
-}
-
-static int relative_directory_is_empty(int base_fd, const char *relative)
-{
-    if (base_fd < 0 || relative == NULL || relative[0] == '\0' ||
-        strlen(relative) >= PATH_MAX)
-        return 0;
-    int directory_fd = openat(base_fd, relative,
-                               O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
-                                   O_CLOEXEC);
-    if (directory_fd < 0)
-        return 0;
-    int result = directory_fd_is_empty(directory_fd);
-    if (close(directory_fd) != 0)
-        result = 0;
-    return result;
-}
-
 static PortableRootSpec root_spec(const char *id, const char *source,
                                   const char *payload)
 {
@@ -489,8 +443,12 @@ static void test_encoded_payload_names(const char *base)
         .root_count = 1,
         .nsec_exact = 1
     };
-    check(portable_capture_fresh_at(container_fd, &request) == 0,
-          "capture accepts escaped and valid UTF-8 names");
+    PortablePrescanReport report;
+    portable_prescan_report_init(&report);
+    check(portable_capture_fresh_at(container_fd, &request, &report) == 0 &&
+              report.total_count == 0,
+          "pre-scan accepts escaped and valid UTF-8 names");
+    portable_prescan_report_free(&report);
 
     char data_path[PATH_MAX];
     join_path(data_path, sizeof(data_path), container_path, "data/NAMES");
@@ -563,7 +521,7 @@ static void test_nested_encoded_directories(const char *base)
         .root_count = 1,
         .nsec_exact = 1
     };
-    check(portable_capture_fresh_at(container_fd, &request) == 0,
+    check(portable_capture_fresh_at(container_fd, &request, NULL) == 0,
           "nested encoded directories capture successfully");
 
     char payload_first[PATH_MAX];
@@ -641,14 +599,27 @@ static void test_name_and_path_limits(const char *base)
         .root_count = 1,
         .nsec_exact = 1
     };
-    check(portable_capture_fresh_at(container_fd, &request) != 0,
-          "an encoded leaf exceeding NAME_MAX refuses capture");
-    int data_fd = openat(container_fd, "data",
-                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-    check(data_fd >= 0 && relative_directory_is_empty(data_fd, "NAMES"),
-          "NAME_MAX refusal leaves no payload child");
-    if (data_fd >= 0)
-        close(data_fd);
+    PortablePrescanReport report;
+    portable_prescan_report_init(&report);
+    check(portable_capture_fresh_at(container_fd, &request, &report) != 0 &&
+              report.total_count == 1 && report.example_count == 1 &&
+              report.examples[0].kind == PORTABLE_PRESCAN_NAME_TOO_LONG &&
+              strcmp(report.examples[0].root_id, "NAMES") == 0 &&
+              strcmp(report.examples[0].logical_path, oversized_name) == 0 &&
+              report.examples[0].limit == NAME_MAX &&
+              report.examples[0].actual == oversized_length * 3U,
+          "NAME_MAX violation is reported before capture");
+    struct stat st;
+    check(fstatat(container_fd, "manifest.txt", &st,
+                  AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT &&
+              fstatat(container_fd, "data", &st,
+                      AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT &&
+              fstatat(container_fd, SIDECAR_SLOT_NAME, &st,
+                      AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT,
+          "NAME_MAX refusal leaves the container namespace untouched");
+    check(portable_capture_fresh_at(container_fd, &request, NULL) != 0,
+          "NAME_MAX refusal does not depend on a report consumer");
+    portable_prescan_report_free(&report);
     close(container_fd);
     remove_tree(source_path);
     remove_tree(container_path);
@@ -680,19 +651,99 @@ static void test_name_and_path_limits(const char *base)
         fixture_fatal("could not open path-limit container");
     root = root_spec("PATH", source_path, long_payload);
     request.roots = &root;
-    check(portable_capture_fresh_at(container_fd, &request) != 0,
-          "a physical payload path exceeding PATH_MAX refuses capture");
-    data_fd = openat(container_fd, "data",
-                     O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-    check(data_fd >= 0 &&
-              relative_directory_is_empty(data_fd, long_payload),
-          "PATH_MAX refusal leaves no payload child");
-    if (data_fd >= 0)
-        close(data_fd);
+    portable_prescan_report_init(&report);
+    check(portable_capture_fresh_at(container_fd, &request, &report) != 0 &&
+              report.total_count == 1 && report.example_count == 1 &&
+              report.examples[0].kind == PORTABLE_PRESCAN_PATH_TOO_LONG &&
+              strcmp(report.examples[0].root_id, "PATH") == 0 &&
+              strcmp(report.examples[0].logical_path, "child") == 0 &&
+              report.examples[0].limit == PATH_MAX &&
+              report.examples[0].actual == PATH_MAX + 5U,
+          "PATH_MAX violation is reported before capture");
+    check(fstatat(container_fd, "manifest.txt", &st,
+                  AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT &&
+              fstatat(container_fd, "data", &st,
+                      AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT &&
+              fstatat(container_fd, SIDECAR_SLOT_NAME, &st,
+                      AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT,
+          "PATH_MAX refusal leaves the container namespace untouched");
+    portable_prescan_report_free(&report);
     close(container_fd);
     free(long_payload);
     remove_tree(source_path);
     remove_tree_fd(container_path);
+}
+
+static void test_prescan_multiple_roots(const char *base)
+{
+    printf(BLUE "::" NC " pre-scan aggregates violations across roots\n");
+    char source_a[PATH_MAX];
+    char source_b[PATH_MAX];
+    char container_path[PATH_MAX];
+    join_path(source_a, sizeof(source_a), base, "multi-source-a");
+    join_path(source_b, sizeof(source_b), base, "multi-source-b");
+    join_path(container_path, sizeof(container_path), base,
+              "multi-container");
+    make_directory(source_a);
+    make_directory(source_b);
+    make_directory(container_path);
+
+    char oversized_name[NAME_MAX + 1U];
+    size_t oversized_length = NAME_MAX / 3U + 1U;
+    memset(oversized_name, ':', oversized_length);
+    oversized_name[oversized_length] = '\0';
+    char path[PATH_MAX];
+    join_path(path, sizeof(path), source_a, oversized_name);
+    write_file(path, "a", 1);
+    join_path(path, sizeof(path), source_b, oversized_name);
+    write_file(path, "b", 1);
+
+    int container_fd = open(container_path,
+                             O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open multi-root container");
+    PortableRootSpec roots[2] = {
+        root_spec("ROOT_A", source_a, "A"),
+        root_spec("ROOT_B", source_b, "B")
+    };
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .roots = roots,
+        .root_count = 2,
+        .nsec_exact = 1
+    };
+    PortablePrescanReport report;
+    portable_prescan_report_init(&report);
+    check(portable_capture_fresh_at(container_fd, &request, &report) != 0 &&
+              report.total_count == 2 && report.example_count == 2,
+          "pre-scan reports every violation across multiple roots");
+    int root_a_seen = 0;
+    int root_b_seen = 0;
+    for (size_t index = 0; index < report.example_count; index++) {
+        const PortablePrescanViolation *violation = &report.examples[index];
+        if (violation->kind == PORTABLE_PRESCAN_NAME_TOO_LONG &&
+            strcmp(violation->logical_path, oversized_name) == 0) {
+            if (strcmp(violation->root_id, "ROOT_A") == 0)
+                root_a_seen = 1;
+            if (strcmp(violation->root_id, "ROOT_B") == 0)
+                root_b_seen = 1;
+        }
+    }
+    check(root_a_seen && root_b_seen,
+          "pre-scan examples retain each violating root identity");
+    struct stat st;
+    check(fstatat(container_fd, "manifest.txt", &st,
+                  AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT &&
+              fstatat(container_fd, "data", &st,
+                      AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT &&
+              fstatat(container_fd, SIDECAR_SLOT_NAME, &st,
+                      AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT,
+          "multi-root refusal leaves the container untouched");
+    portable_prescan_report_free(&report);
+    close(container_fd);
+    remove_tree(source_a);
+    remove_tree(source_b);
+    remove_tree(container_path);
 }
 
 static int live_kind(SidecarLog *log, const char *root, const char *logical,
@@ -940,7 +991,7 @@ static void test_fresh_capture(const char *source, int container_fd,
         .root_count = 1,
         .nsec_exact = 1
     };
-    check(portable_capture_fresh_at(container_fd, &request) == 0,
+    check(portable_capture_fresh_at(container_fd, &request, NULL) == 0,
           "fresh portable capture succeeds");
 
     Manifest manifest;
@@ -1167,7 +1218,7 @@ static void test_preflight_refusal(const char *source)
         .roots = &manual,
         .root_count = 1
     };
-    check(portable_capture_fresh_at(container_fd, &request) != 0,
+    check(portable_capture_fresh_at(container_fd, &request, NULL) != 0,
           "MANUAL_NATIVE is rejected before portable mutation");
     struct stat st;
     check(fstatat(container_fd, "manifest.txt", &st,
@@ -1200,6 +1251,7 @@ int main(void)
     test_encoded_payload_names(root_path);
     test_nested_encoded_directories(root_path);
     test_name_and_path_limits(root_path);
+    test_prescan_multiple_roots(root_path);
     test_fresh_capture(source_path, container_fd, container_path);
     test_capture_context_flags(root_path);
     test_replacement_and_type_change(source_path, root_path);

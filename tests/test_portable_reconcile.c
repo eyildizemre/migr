@@ -203,7 +203,7 @@ static int prepare_fixture(const char *base, const char *label,
     if (fixture->container_fd < 0)
         return -1;
     int result = portable_capture_fresh_at(fixture->container_fd,
-                                           &fixture->request);
+                                           &fixture->request, NULL);
     if (result != 0) {
         close(fixture->container_fd);
         fixture->container_fd = -1;
@@ -262,7 +262,7 @@ static int run_resume_interrupt(const Fixture *fixture,
     if (child == 0) {
         portable_capture_test_set_interrupt(point);
         int result = portable_capture_resume_at(fixture->container_fd,
-                                                &fixture->request);
+                                                &fixture->request, NULL);
         _exit(result == 0 ? 0 : 1);
     }
     int status = 0;
@@ -290,7 +290,7 @@ static void test_deleted_file(const char *base)
     if (unlink(source_gone) != 0)
         fixture_fatal("could not remove source file");
     check(portable_capture_resume_at(fixture.container_fd,
-                                     &fixture.request) == 0,
+                                     &fixture.request, NULL) == 0,
           "resume reconciles a source file deleted between runs");
     int live = -1;
     int deleted = -1;
@@ -338,7 +338,7 @@ static void test_deleted_symlink(const char *base)
     int container_fd = open(container, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (container_fd < 0)
         fixture_fatal("could not open stale symlink container");
-    check(portable_capture_fresh_at(container_fd, &request) == 0,
+    check(portable_capture_fresh_at(container_fd, &request, NULL) == 0,
           "initial capture creates a symlink placeholder");
 
     char payload[PATH_MAX];
@@ -347,7 +347,7 @@ static void test_deleted_symlink(const char *base)
           "captured symlink has a payload placeholder before deletion");
     if (unlink(link_path) != 0)
         fixture_fatal("could not remove stale symlink source");
-    check(portable_capture_resume_at(container_fd, &request) == 0,
+    check(portable_capture_resume_at(container_fd, &request, NULL) == 0,
           "resume reconciles a deleted source symlink");
     int live = -1;
     int deleted = -1;
@@ -402,11 +402,11 @@ static void test_deleted_subtree(const char *base)
     int container_fd = open(container, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (container_fd < 0)
         fixture_fatal("could not open subtree container");
-    check(portable_capture_fresh_at(container_fd, &request) == 0,
+    check(portable_capture_fresh_at(container_fd, &request, NULL) == 0,
           "subtree fixture is captured");
     if (unlink(child) != 0 || rmdir(subtree) != 0)
         fixture_fatal("could not remove source subtree");
-    check(portable_capture_resume_at(container_fd, &request) == 0,
+    check(portable_capture_resume_at(container_fd, &request, NULL) == 0,
           "resume reconciles a deleted source subtree");
     char payload_subtree[PATH_MAX];
     join_path(payload_subtree, sizeof(payload_subtree), container,
@@ -441,14 +441,14 @@ static void test_cleanup_failure(const char *base)
     if (unlink(source_gone) != 0 || chmod(fixture.payload_root, 0500) != 0)
         fixture_fatal("could not prepare undeletable payload");
     int result = portable_capture_resume_at(fixture.container_fd,
-                                             &fixture.request);
+                                             &fixture.request, NULL);
     check(result != 0, "unlink failure blocks portable finalization");
     check(path_exists(fixture.payload_gone),
           "failed cleanup leaves the payload for a later resume");
     if (chmod(fixture.payload_root, 0700) != 0)
         fixture_fatal("could not restore payload permissions");
     check(portable_capture_resume_at(fixture.container_fd,
-                                     &fixture.request) == 0,
+                                     &fixture.request, NULL) == 0,
           "later resume retries and completes the cleanup");
     check(path_missing(fixture.payload_gone),
           "retry removes the previously protected payload");
@@ -467,7 +467,7 @@ static void test_inventory_mismatch(const char *base)
     join_path(planted, sizeof(planted), fixture.payload_root, "planted");
     write_file(planted, "unexpected");
     check(portable_capture_resume_at(fixture.container_fd,
-                                     &fixture.request) != 0,
+                                     &fixture.request, NULL) != 0,
           "uncommitted payload blocks finalization");
     check(path_exists(planted),
           "inventory refusal does not delete an unknown payload");
@@ -503,7 +503,7 @@ static void test_interrupt_boundary(const char *base,
     check(path_exists(fixture.payload_gone) == payload_survives,
           "payload state at the interruption boundary is deterministic");
     check(portable_capture_resume_at(fixture.container_fd,
-                                     &fixture.request) == 0,
+                                     &fixture.request, NULL) == 0,
           "resume completes the interrupted reconciliation");
     check(path_exists(fixture.payload_gone) == !delete_source,
           "resumed reconciliation leaves the expected payload inventory");

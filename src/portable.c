@@ -2418,6 +2418,168 @@ static int root_spec_valid(const PortableRootSpec *root)
            (!root->has_restore_path || strlen(root->restore_path) < PATH_MAX);
 }
 
+static int prescan_record_violation(PortablePrescanReport *report,
+                                    const char *root_id,
+                                    const char *logical_path,
+                                    PortablePrescanViolationKind kind,
+                                    size_t limit, size_t actual)
+{
+    PortablePrescanViolation violation = {
+        .kind = kind,
+        .limit = limit,
+        .actual = actual
+    };
+    if (copy_text(violation.root_id, sizeof(violation.root_id), root_id) != 0 ||
+        copy_text(violation.logical_path, sizeof(violation.logical_path),
+                  logical_path) != 0)
+        return -1;
+    return prescan_report_add(report, &violation);
+}
+
+static int prescan_directory(int source_fd, const char *logical,
+                             const char *physical, const char *root_id,
+                             const char *payload_path,
+                             PortablePrescanReport *report)
+{
+    if (source_fd < 0 || logical == NULL || physical == NULL ||
+        root_id == NULL || payload_path == NULL || report == NULL)
+        return -1;
+
+    int scan_fd = duplicate_fd(source_fd);
+    DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
+    if (directory == NULL) {
+        if (scan_fd >= 0)
+            close(scan_fd);
+        return -1;
+    }
+
+    int failed = 0;
+    for (;;) {
+        errno = 0;
+        struct dirent *entry = readdir(directory);
+        if (entry == NULL) {
+            if (errno != 0)
+                failed = 1;
+            break;
+        }
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0)
+            continue;
+
+        char child_logical[SIDECAR_MAX_PATH + 1U];
+        if (append_logical(child_logical, sizeof(child_logical), logical,
+                           entry->d_name) != 0) {
+            failed = 1;
+            break;
+        }
+
+        char scratch[3U * NAME_MAX + 4U];
+        if (encoding_percent_encode(ENCODING_MODE_COMPONENT, entry->d_name,
+                                    scratch, sizeof(scratch)) != 0) {
+            failed = 1;
+            break;
+        }
+
+        size_t encoded_length = strlen(scratch);
+        if (encoded_length > NAME_MAX) {
+            if (prescan_record_violation(
+                    report, root_id, child_logical,
+                    PORTABLE_PRESCAN_NAME_TOO_LONG, NAME_MAX,
+                    encoded_length) != 0)
+                failed = 1;
+            if (failed)
+                break;
+            continue;
+        }
+
+        char child_physical[SIDECAR_MAX_PATH + 1U];
+        if (append_physical(child_physical, sizeof(child_physical), physical,
+                            scratch) != 0) {
+            failed = 1;
+            break;
+        }
+
+        size_t payload_root_length = strlen(payload_path);
+        size_t physical_length = strlen(child_physical);
+        /* Keep this arithmetic in sync with replay_payload_path_build() and
+         * capture_directory(). */
+        if (payload_root_length == 0 || payload_root_length >= PATH_MAX ||
+            physical_length > PATH_MAX - payload_root_length - 1U) {
+            if (payload_root_length > SIZE_MAX - 1U ||
+                physical_length > SIZE_MAX - payload_root_length - 1U)
+                failed = 1;
+            else if (prescan_record_violation(
+                         report, root_id, child_logical,
+                         PORTABLE_PRESCAN_PATH_TOO_LONG, PATH_MAX,
+                         payload_root_length + 1U + physical_length) != 0)
+                failed = 1;
+            if (failed)
+                break;
+            continue;
+        }
+
+        struct stat child_stat;
+        if (read_source_stat(source_fd, entry->d_name, NULL, &child_stat) != 0) {
+            failed = 1;
+            break;
+        }
+        if (S_ISDIR(child_stat.st_mode)) {
+            int child_fd = open_source_node(source_fd, entry->d_name, NULL,
+                                            &child_stat);
+            if (child_fd < 0) {
+                failed = 1;
+                break;
+            }
+            int child_result = prescan_directory(
+                child_fd, child_logical, child_physical, root_id,
+                payload_path, report);
+            if (close(child_fd) != 0)
+                child_result = -1;
+            if (child_result != 0) {
+                failed = 1;
+                break;
+            }
+        }
+    }
+    if (closedir(directory) != 0)
+        failed = 1;
+    return failed ? -1 : 0;
+}
+
+static int prescan_root(const PortableRootSpec *root,
+                        PortablePrescanReport *report)
+{
+    if (!root_spec_valid(root) || report == NULL)
+        return -1;
+
+    struct stat st;
+    if (read_source_stat(-1, NULL, root->capture_path, &st) != 0)
+        return -1;
+    if (!S_ISDIR(st.st_mode))
+        return 0;
+
+    int root_fd = open_source_node(-1, NULL, root->capture_path, &st);
+    if (root_fd < 0)
+        return -1;
+    int result = prescan_directory(root_fd, "", "", root->id,
+                                   root->payload_path, report);
+    if (close(root_fd) != 0)
+        result = -1;
+    return result;
+}
+
+static int prescan_request(const PortableCaptureRequest *request,
+                           PortablePrescanReport *report)
+{
+    if (request == NULL || report == NULL)
+        return -1;
+    int failed = 0;
+    for (size_t index = 0; index < request->root_count; index++)
+        if (prescan_root(&request->roots[index], report) != 0)
+            failed = 1;
+    return failed || report->total_count != 0 ? -1 : 0;
+}
+
 static int relative_paths_overlap(const char *left, const char *right)
 {
     size_t left_length = strlen(left);
@@ -2597,13 +2759,31 @@ int portable_capture_root(PortableCaptureContext *context,
 }
 
 int portable_capture_fresh_at(int container_fd,
-                              const PortableCaptureRequest *request)
+                              const PortableCaptureRequest *request,
+                              PortablePrescanReport *report)
 {
     if (container_fd < 0 || request == NULL ||
         request->scope < MANIFEST_SCOPE_CRITICAL ||
         request->scope > MANIFEST_SCOPE_EXPLICIT ||
+        request->root_count > MANIFEST_MAX_ROOTS ||
+        (request->root_count != 0 && request->roots == NULL) ||
         fresh_namespace_is_empty(container_fd) != 0)
         return -1;
+
+    PortablePrescanReport local_report;
+    int owns_report = report == NULL;
+    PortablePrescanReport *active_report = report;
+    if (owns_report) {
+        portable_prescan_report_init(&local_report);
+        active_report = &local_report;
+    }
+    if (prescan_request(request, active_report) != 0) {
+        if (owns_report)
+            portable_prescan_report_free(&local_report);
+        return -1;
+    }
+    if (owns_report)
+        portable_prescan_report_free(&local_report);
 
     Manifest manifest;
     if (build_manifest(request, &manifest) != 0)
@@ -2679,12 +2859,30 @@ static int create_resume_data(int container_fd, int *out_fd)
 }
 
 int portable_capture_resume_at(int container_fd,
-                               const PortableCaptureRequest *request)
+                               const PortableCaptureRequest *request,
+                               PortablePrescanReport *report)
 {
     if (container_fd < 0 || request == NULL ||
         request->scope < MANIFEST_SCOPE_CRITICAL ||
-        request->scope > MANIFEST_SCOPE_EXPLICIT)
+        request->scope > MANIFEST_SCOPE_EXPLICIT ||
+        request->root_count > MANIFEST_MAX_ROOTS ||
+        (request->root_count != 0 && request->roots == NULL))
         return -1;
+
+    PortablePrescanReport local_report;
+    int owns_report = report == NULL;
+    PortablePrescanReport *active_report = report;
+    if (owns_report) {
+        portable_prescan_report_init(&local_report);
+        active_report = &local_report;
+    }
+    if (prescan_request(request, active_report) != 0) {
+        if (owns_report)
+            portable_prescan_report_free(&local_report);
+        return -1;
+    }
+    if (owns_report)
+        portable_prescan_report_free(&local_report);
 
     Manifest expected;
     if (build_manifest(request, &expected) != 0)

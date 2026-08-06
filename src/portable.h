@@ -101,19 +101,25 @@ int portable_capture_root(PortableCaptureContext *context,
                           const PortableRootSpec *root);
 
 /**
- * Writes a portable v1 manifest, creates data/ and sidecar.migr, and captures
- * all roots into a fresh container directory. This direct API is intentionally
- * separate from production backup() dispatch.
+ * Runs the mandatory D19 source pre-scan before writing a portable v1 manifest,
+ * then creates data/ and sidecar.migr and captures all roots into a fresh
+ * container directory. The caller initializes and owns report when non-NULL;
+ * NULL requests the same refusal behaviour without diagnostics. This direct
+ * API is intentionally separate from production backup() dispatch.
  */
 int portable_capture_fresh_at(int container_fd,
-                              const PortableCaptureRequest *request);
+                              const PortableCaptureRequest *request,
+                              PortablePrescanReport *report);
 
 /**
- * Resumes a portable capture in an existing versioned partial container.
- * The manifest must match request; it is never rewritten by this function.
+ * Runs the mandatory D19 source pre-scan, then resumes a portable capture in
+ * an existing versioned partial container. The manifest must match request; it
+ * is never rewritten by this function. report follows the fresh-entry-point
+ * ownership rules above.
  */
 int portable_capture_resume_at(int container_fd,
-                               const PortableCaptureRequest *request);
+                               const PortableCaptureRequest *request,
+                               PortablePrescanReport *report);
 
 typedef enum {
     PORTABLE_TEST_INTERRUPT_NONE = 0,
