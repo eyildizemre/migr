@@ -164,6 +164,14 @@ the public CLI; it will become available only after the remaining safety phases
 (see [docs/sidecar-plan.md](docs/sidecar-plan.md)). Until then the probe refusal is
 the production behaviour — a failed backup is safer than a silent metadata loss.
 
+Portable capture and replay also handle symlinks behind the same D14 test-only
+seam: the payload contains an empty regular placeholder while the sidecar
+record carries the target and core metadata, so the target is never written into
+the payload. Symlink xattrs are collected, but replay refuses an entry that has
+any until Phase E implements xattr replay; this is a deliberate fail-closed
+boundary rather than silent metadata loss. Production portable dispatch remains
+disabled at this stage.
+
 ## Report
 
 Running `migr` or `migr report` scans your home directory and shows sizes for main directories, dotfiles, dev tools, and browsers — plus a critical backup size estimate.

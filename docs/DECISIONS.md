@@ -831,7 +831,7 @@ exactness (as-built)".
 
 ## D18 — 2026-08-04 — Portable symlink handling: placeholder node + record
 
-**Status:** Decided — Phase C implementation pending
+**Status:** Implemented (Phase C closed 2026-08-06; as-built notes below)
 
 **Decision:** Portable symlinks use a payload placeholder and a sidecar record.
 The placeholder is an empty regular file (`size=0`) at the symlink's payload
@@ -895,6 +895,19 @@ The C-1 through C-8 rules apply to portable symlink handling only; native
 no-follow behaviour is covered by the existing metadata contract and its entry
 gate. Operational probe errors remain fatal under D14 rather than becoming a
 portable verdict.
+
+### As-built (Phase C, 2026-08-06)
+
+The D14 test-only portable capture and replay seams were exercised against real
+vfat loopback containers on Arch and Ubuntu. Both systems round-tripped a
+symlink byte-for-byte: capture wrote an empty regular placeholder in the
+container and replay recreated the destination link with the exact target.
+On Fedora, the same real-filesystem round-trip reached the deliberate Phase E
+boundary: the symlink carried an automatic `security.selinux` xattr, so replay
+refused it fail-closed and left no destination residue rather than silently
+discarding the xattr. Production portable dispatch remains disabled and still
+refuses lossy vfat destinations before creating a container, also without
+residue. FIFO handling was not changed by Phase C and remains fail-closed.
 
 **Why:** These rules freeze the representation and rejection boundaries before
 the symlink parser, capture walker, and replay walker are written. A
