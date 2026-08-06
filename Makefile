@@ -18,6 +18,7 @@ VALGRIND_TESTS = \
 	tests/test_portable_restore_preflight \
 	tests/test_portable_restore_replay \
 	tests/test_portable_restore_orchestrate \
+	tests/test_portable_restore_invariant \
 	tests/test_special_files \
 	tests/test_restore_native \
 	tests/test_restore_source_read \
@@ -62,6 +63,7 @@ TEST_PORTABLE_RECONCILE_SCALE = tests/test_portable_reconcile_scale
 TEST_PORTABLE_RESTORE_PREFLIGHT = tests/test_portable_restore_preflight
 TEST_PORTABLE_RESTORE_REPLAY = tests/test_portable_restore_replay
 TEST_PORTABLE_RESTORE_ORCHESTRATE = tests/test_portable_restore_orchestrate
+TEST_PORTABLE_RESTORE_INVARIANT = tests/test_portable_restore_invariant
 
 $(TEST_DETECT): tests/test_detect.c detect.o
 	$(CC) $(CFLAGS) -o $@ tests/test_detect.c detect.o
@@ -144,7 +146,7 @@ $(TEST_PORTABLE_RECONCILE): tests/test_portable_reconcile.c portable_test.o side
 $(TEST_PORTABLE_RECONCILE_SCALE): tests/test_portable_reconcile_scale.c portable_test.o sidecar.o sidecar_state_test.o manifest.o encoding.o metadata.o utils.o
 	$(CC) $(CFLAGS) -DPORTABLE_CAPTURE_TEST_HOOKS -o $@ tests/test_portable_reconcile_scale.c portable_test.o sidecar.o sidecar_state_test.o manifest.o encoding.o metadata.o utils.o
 
-portable_restore_test.o: src/portable_restore.c src/portable_restore.h src/sidecar.h src/manifest.h src/metadata.h
+portable_restore_test.o: src/portable_restore.c src/portable_restore.h src/sidecar.h src/manifest.h src/metadata.h src/encoding.h
 	$(CC) $(CFLAGS) -c src/portable_restore.c -o $@
 
 metadata_test.o: src/metadata.c src/metadata.h src/fileops.h
@@ -159,7 +161,10 @@ $(TEST_PORTABLE_RESTORE_REPLAY): tests/test_portable_restore_replay.c portable_r
 $(TEST_PORTABLE_RESTORE_ORCHESTRATE): tests/test_portable_restore_orchestrate.c portable_restore_test.o sidecar.o sidecar_state.o manifest.o encoding.o metadata_test.o utils.o
 	$(CC) $(CFLAGS) -DMETADATA_TEST_HOOKS -o $@ tests/test_portable_restore_orchestrate.c portable_restore_test.o sidecar.o sidecar_state.o manifest.o encoding.o metadata_test.o utils.o
 
-test: $(TARGET) $(TEST_DETECT) $(TEST_PATHJOIN) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE) $(TEST_MANIFEST) $(TEST_ENCODING) $(TEST_CONTAINER) $(TEST_RESTORE_NATIVE) $(TEST_RESTORE_SOURCE_READ) $(TEST_BACKUP_SOURCE_READ) $(TEST_RESTORE_DISPATCH) $(TEST_RESTORE_ATIME) $(TEST_BACKUP_PLAN) $(TEST_METADATA_CONTRACT) $(TEST_SIDECAR) $(TEST_SIDECAR_STATE) $(TEST_SIDECAR_SCALE) $(TEST_PORTABLE_CAPTURE) $(TEST_PORTABLE_CAPTURE_SCALE) $(TEST_PORTABLE_RESUME) $(TEST_PORTABLE_RECONCILE) $(TEST_PORTABLE_RECONCILE_SCALE) $(TEST_PORTABLE_RESTORE_PREFLIGHT) $(TEST_PORTABLE_RESTORE_REPLAY) $(TEST_PORTABLE_RESTORE_ORCHESTRATE)
+$(TEST_PORTABLE_RESTORE_INVARIANT): tests/test_portable_restore_invariant.c portable_restore_test.o sidecar.o sidecar_state.o manifest.o encoding.o metadata.o utils.o
+	$(CC) $(CFLAGS) -o $@ tests/test_portable_restore_invariant.c portable_restore_test.o sidecar.o sidecar_state.o manifest.o encoding.o metadata.o utils.o
+
+test: $(TARGET) $(TEST_DETECT) $(TEST_PATHJOIN) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE) $(TEST_MANIFEST) $(TEST_ENCODING) $(TEST_CONTAINER) $(TEST_RESTORE_NATIVE) $(TEST_RESTORE_SOURCE_READ) $(TEST_BACKUP_SOURCE_READ) $(TEST_RESTORE_DISPATCH) $(TEST_RESTORE_ATIME) $(TEST_BACKUP_PLAN) $(TEST_METADATA_CONTRACT) $(TEST_SIDECAR) $(TEST_SIDECAR_STATE) $(TEST_SIDECAR_SCALE) $(TEST_PORTABLE_CAPTURE) $(TEST_PORTABLE_CAPTURE_SCALE) $(TEST_PORTABLE_RESUME) $(TEST_PORTABLE_RECONCILE) $(TEST_PORTABLE_RECONCILE_SCALE) $(TEST_PORTABLE_RESTORE_PREFLIGHT) $(TEST_PORTABLE_RESTORE_REPLAY) $(TEST_PORTABLE_RESTORE_ORCHESTRATE) $(TEST_PORTABLE_RESTORE_INVARIANT)
 	./$(TEST_DETECT)
 	./$(TEST_PATHJOIN)
 	./$(TEST_SPECIAL_FILES)
@@ -184,6 +189,7 @@ test: $(TARGET) $(TEST_DETECT) $(TEST_PATHJOIN) $(TEST_SPECIAL_FILES) $(TEST_FSP
 	./$(TEST_PORTABLE_RESTORE_PREFLIGHT)
 	./$(TEST_PORTABLE_RESTORE_REPLAY)
 	./$(TEST_PORTABLE_RESTORE_ORCHESTRATE)
+	./$(TEST_PORTABLE_RESTORE_INVARIANT)
 # This one drives backup() end to end, so a successful --critical run forks the
 # distribution's real package listing command. Give it the same stubs test.sh
 # uses; only test.sh's own Phase 5 is about that command's real output. Each
@@ -249,6 +255,6 @@ check:
 	$(MAKE) check-analyze
 
 clean:
-	rm -f $(OBJS) backup_test.o fileops_test.o sidecar.o sidecar_test.o sidecar_state.o sidecar_state_test.o portable.o portable_test.o portable_restore_test.o metadata_test.o $(TARGET) $(TEST_DETECT) $(TEST_PATHJOIN) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE) $(TEST_MANIFEST) $(TEST_ENCODING) $(TEST_CONTAINER) $(TEST_RESTORE_NATIVE) $(TEST_RESTORE_SOURCE_READ) $(TEST_BACKUP_SOURCE_READ) $(TEST_RESTORE_DISPATCH) $(TEST_RESTORE_ATIME) $(TEST_BACKUP_PLAN) $(TEST_METADATA_CONTRACT) $(TEST_SIDECAR) $(TEST_SIDECAR_STATE) $(TEST_SIDECAR_SCALE) $(TEST_PORTABLE_CAPTURE) $(TEST_PORTABLE_CAPTURE_SCALE) $(TEST_PORTABLE_RESUME) $(TEST_PORTABLE_RECONCILE) $(TEST_PORTABLE_RECONCILE_SCALE) $(TEST_PORTABLE_RESTORE_PREFLIGHT) $(TEST_PORTABLE_RESTORE_REPLAY) $(TEST_PORTABLE_RESTORE_ORCHESTRATE)
+	rm -f $(OBJS) backup_test.o fileops_test.o sidecar.o sidecar_test.o sidecar_state.o sidecar_state_test.o portable.o portable_test.o portable_restore_test.o metadata_test.o $(TARGET) $(TEST_DETECT) $(TEST_PATHJOIN) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE) $(TEST_MANIFEST) $(TEST_ENCODING) $(TEST_CONTAINER) $(TEST_RESTORE_NATIVE) $(TEST_RESTORE_SOURCE_READ) $(TEST_BACKUP_SOURCE_READ) $(TEST_RESTORE_DISPATCH) $(TEST_RESTORE_ATIME) $(TEST_BACKUP_PLAN) $(TEST_METADATA_CONTRACT) $(TEST_SIDECAR) $(TEST_SIDECAR_STATE) $(TEST_SIDECAR_SCALE) $(TEST_PORTABLE_CAPTURE) $(TEST_PORTABLE_CAPTURE_SCALE) $(TEST_PORTABLE_RESUME) $(TEST_PORTABLE_RECONCILE) $(TEST_PORTABLE_RECONCILE_SCALE) $(TEST_PORTABLE_RESTORE_PREFLIGHT) $(TEST_PORTABLE_RESTORE_REPLAY) $(TEST_PORTABLE_RESTORE_ORCHESTRATE) $(TEST_PORTABLE_RESTORE_INVARIANT)
 
 .PHONY: clean test check-strict check-sanitize check-valgrind check-analyze check

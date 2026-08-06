@@ -25,4 +25,5 @@ tests/test_portable_restore_preflight
 tests/test_portable_restore_replay
 tests/test_portable_restore_orchestrate
 tests/test_encoding
+tests/test_portable_restore_invariant
 docs/scratch/

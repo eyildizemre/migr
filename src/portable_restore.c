@@ -13,6 +13,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "encoding.h"
 #include "sidecar.h"
 #include "utils.h"
 
@@ -225,6 +226,62 @@ static int sidecar_path_valid(SidecarBytes bytes, int allow_empty)
         component_start = index + 1U;
     }
     return 1;
+}
+
+/*
+ * True only when physical is the per-component
+ * ENCODING_MODE_COMPONENT encoding of logical, joined with '/'.  Callers
+ * validate both paths with sidecar_path_valid() before using this predicate.
+ */
+int physical_matches_logical(SidecarBytes logical, SidecarBytes physical)
+{
+    size_t logical_index = 0;
+    size_t physical_index = 0;
+
+    for (;;) {
+        if (logical_index == logical.length ||
+            physical_index == physical.length)
+            return logical_index == logical.length &&
+                   physical_index == physical.length;
+
+        size_t logical_start = logical_index;
+        while (logical_index < logical.length &&
+               logical.data[logical_index] != '/')
+            logical_index++;
+        size_t logical_component_length = logical_index - logical_start;
+
+        size_t physical_start = physical_index;
+        while (physical_index < physical.length &&
+               physical.data[physical_index] != '/')
+            physical_index++;
+        size_t physical_component_length = physical_index - physical_start;
+
+        if (logical_component_length == 0 ||
+            logical_component_length > NAME_MAX ||
+            physical_component_length == 0 ||
+            physical_component_length > NAME_MAX)
+            return 0;
+
+        char raw[NAME_MAX + 1U];
+        memcpy(raw, logical.data + logical_start, logical_component_length);
+        raw[logical_component_length] = '\0';
+
+        char encoded[NAME_MAX + 1U];
+        if (encoding_percent_encode(ENCODING_MODE_COMPONENT, raw, encoded,
+                                    sizeof(encoded)) != 0)
+            return 0;
+
+        size_t encoded_length = strlen(encoded);
+        if (physical_component_length != encoded_length ||
+            memcmp(physical.data + physical_start, encoded,
+                   physical_component_length) != 0)
+            return 0;
+
+        if (logical_index < logical.length)
+            logical_index++;
+        if (physical_index < physical.length)
+            physical_index++;
+    }
 }
 
 static void report_violation(PortableRestorePreflightReport *report,
