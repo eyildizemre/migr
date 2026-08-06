@@ -172,6 +172,14 @@ any until Phase E implements xattr replay; this is a deliberate fail-closed
 boundary rather than silent metadata loss. Production portable dispatch remains
 disabled at this stage.
 
+Portable payload names are percent-encoded on disk while the sidecar preserves
+the true logical name; restore always creates that logical name, never a decoded
+or re-derived substitute. An encoded component or path exceeding `NAME_MAX` or
+`PATH_MAX`, or a case collision on a case-insensitive destination, refuses the
+entire invocation before anything is written rather than silently skipping an
+entry. This remains behind the D14 test-only seam; production portable dispatch
+is still disabled.
+
 ## Report
 
 Running `migr` or `migr report` scans your home directory and shows sizes for main directories, dotfiles, dev tools, and browsers — plus a critical backup size estimate.

@@ -936,7 +936,7 @@ G, illegal-name encoding to Phase D, and xattr replay to Phase E.
 
 ## D19 — 2026-08-06 — Portable illegal-filename handling: encode on disk, true name in the record
 
-**Status:** Decided — Phase D implementation pending
+**Status:** Implemented (Phase D closed 2026-08-07; as-built notes below)
 
 **Decision:** A portable payload node is written under a percent-encoded name,
 while the sidecar keeps the true name. The logical path contains the original
@@ -1026,6 +1026,24 @@ verification makes UTF-8 pass-through safe without expanding the capability
 probe's raw-name corpus: it catches Unicode normalisation and any other
 destination-side name transformation that was not anticipated.
 
+### N-10 — Case folding is measured, not predicted
+
+A case-insensitive destination's non-ASCII folding rule cannot be predicted
+from mount options or filesystem format; it must be measured. The pre-scan finds
+candidate siblings cheaply with an ASCII-lowercased skeleton that replaces every
+non-ASCII byte with one placeholder. This is sound because a filesystem's
+case-folding table cannot change a name's length, so names with different
+skeletons cannot collide under any folding rule. Only real candidate groups are
+then probed by creating their encoded names in a destination scratch directory
+and reading back which names survived. Collision attribution uses the
+destination's directory listing rather than a by-name lookup: real vfat showed
+that a losing name's `open(..., O_CREAT|O_EXCL)` detects the collision reliably,
+while a subsequent `stat()`/`fstatat()` of that same byte string is not reliable
+for non-ASCII names. This directional inconsistency in the Linux vfat driver's
+`utf8` NLS handling was confirmed across three independent kernels. ASCII
+folding remains an in-memory check; only genuine non-ASCII candidates reach the
+destination probe, so an all-ASCII tree pays no extra I/O.
+
 ### Scope boundary
 
 Native capture and restore are untouched: native destinations accept every
@@ -1064,3 +1082,26 @@ dropping data, while making the physical-name encoding and mandatory pre-scan
 explicit for the portable payload. Native metadata, xattrs, hardlinks, sparse
 layout, and production portable dispatch remain governed by their existing
 decisions and later phase boundaries.
+
+### As-built (Phase D, 2026-08-07)
+
+The mandatory pre-scan now refuses an encoded component over `NAME_MAX` or an
+encoded payload path over `PATH_MAX` before writing any payload byte. Real vfat
+loopback runs in the VM gate proved both refusal paths and left no container
+residue. The same matrix exercised ASCII and non-ASCII case collisions on Arch,
+Ubuntu, and Fedora: `Foo`/`foo` was refused on case-insensitive destinations,
+and `café`/`CAFÉ` was refused where the destination actually folded those
+names. A resume that would otherwise overwrite an existing captured file is
+also refused, with the existing payload left byte-for-byte unchanged.
+
+The VM gate exposed the concrete kernel behaviour behind N-10: the create-time
+`EEXIST` result and a later `fstatat()` lookup can disagree for a non-ASCII name.
+Non-ASCII folding also varied by kernel, not only by mount option. Kernel
+`7.1.5-arch1-2` folded non-ASCII case for an `iocharset=iso8859-1` mount,
+whereas `7.0.0-28-generic` and `6.19.10` did not. Measuring the destination on
+each run handled both outcomes without a code change. Production portable
+dispatch remains disabled under D14; all of this behaviour is reachable only
+through the existing test-only seam. Fedora's plain regular-file/directory
+portable round-trip still meets the same automatic `security.selinux` xattr
+wall already recorded for symlinks in D18, so that Phase E boundary is neither
+new nor a Phase D regression.
