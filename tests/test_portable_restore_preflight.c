@@ -463,6 +463,12 @@ static void test_path_and_mapping_refusals(void)
                                    SIDECAR_KIND_REGULAR, 0);
     xattr.xattr_count = 1;
     run_refusal_case("xattr", &root, &xattr, 1, prepare_root_dir);
+
+    SidecarEntry mismatch = entry_for("ROOT", "innocuous.txt",
+                                      "something-else.txt",
+                                      SIDECAR_KIND_REGULAR, 7);
+    run_refusal_case("physical-mismatch", &root, &mismatch, 1,
+                     prepare_root_dir);
 }
 
 static void test_symlink_refusals(void)

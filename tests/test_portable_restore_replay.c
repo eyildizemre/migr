@@ -450,6 +450,37 @@ static int metadata_exact(const char *path, mode_t mode, uid_t uid, gid_t gid,
            st.st_mtim.tv_nsec == mtime_nsec;
 }
 
+static void test_physical_logical_mismatch(void)
+{
+    printf(BLUE "::" NC " physical/logical invariant during replay\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "physical-mismatch fixture is created");
+    if (opened != 0)
+        return;
+
+    make_dir_at(fixture.data_fd, "ROOT", 0700);
+    write_file_at(fixture.data_fd, "ROOT/something-else.txt", "payload");
+    write_file_at(fixture.home_fd, "sentinel", "untouched");
+    SidecarEntry mismatch = entry_for(
+        "ROOT", "innocuous.txt", "something-else.txt",
+        SIDECAR_KIND_REGULAR, 7, 0644, 1700000000, 0, 1700000000, 0);
+    check(write_sidecar(&fixture, &mismatch, 1, NULL) == 0,
+          "physical-mismatch sidecar is committed");
+
+    PortableRestoreReplayReport report;
+    int result = run_replay(&fixture, &report);
+    check(result != 0 && report.failed_count == 1 &&
+              strcmp(report.failed_logical_path, "innocuous.txt") == 0,
+          "replay refuses a mismatched physical path");
+    char sentinel[PATH_MAX];
+    path_join(sentinel, sizeof(sentinel), fixture.home, "/sentinel");
+    check(file_equals_noatime(sentinel, "untouched"),
+          "physical-mismatch refusal leaves the destination untouched");
+    fixture_close(&fixture);
+}
+
 static void test_normal_replay(void)
 {
     printf(BLUE "::" NC " normal replay and exact metadata\n");
@@ -612,6 +643,7 @@ static void test_tombstone_skipped(void)
 int main(void)
 {
     test_symlink_collection_validation();
+    test_physical_logical_mismatch();
     test_normal_replay();
     test_payload_swap();
     test_tombstone_skipped();

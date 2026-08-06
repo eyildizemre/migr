@@ -808,6 +808,12 @@ static int collect_entry(const SidecarLiveView *view, void *argument)
             return 1;
         return 0;
     }
+    if (!physical_matches_logical(entry->logical_path,
+                                  entry->physical_path))
+    {
+        report_violation(report, root_index, "physical-mismatch");
+        return 0;
+    }
     if (entry->kind != SIDECAR_KIND_REGULAR &&
         entry->kind != SIDECAR_KIND_DIRECTORY &&
         entry->kind != SIDECAR_KIND_SYMLINK)
@@ -1651,7 +1657,9 @@ static int replay_collect_entry(const SidecarLiveView *view, void *argument)
     if (root_index == SIZE_MAX ||
         !sidecar_path_valid(entry->logical_path, 1) ||
         !sidecar_path_valid(entry->physical_path, 1) ||
-        !replay_entry_valid(entry))
+        !replay_entry_valid(entry) ||
+        !physical_matches_logical(entry->logical_path,
+                                  entry->physical_path))
     {
         replay_report_failure(collection->report, collection->manifest,
                               root_index, entry->logical_path);
