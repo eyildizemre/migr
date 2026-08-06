@@ -80,6 +80,7 @@ int prescan_report_add(PortablePrescanReport *report,
 #ifdef PORTABLE_CAPTURE_TEST_HOOKS
 static uint64_t portable_test_probe_count;
 static uint64_t portable_test_readback_scan_count;
+static uint64_t portable_test_case_probe_count;
 
 static void visited_count_probe(void)
 {
@@ -106,8 +107,28 @@ void portable_capture_test_reset_readback_scan_count(void)
 {
     portable_test_readback_scan_count = 0;
 }
+
+uint64_t portable_capture_test_case_probe_count(void)
+{
+    return portable_test_case_probe_count;
+}
+
+void portable_capture_test_reset_case_probe_count(void)
+{
+    portable_test_case_probe_count = 0;
+}
+
+static void case_probe_count(void)
+{
+    if (portable_test_case_probe_count != UINT64_MAX)
+        portable_test_case_probe_count++;
+}
 #else
 static void visited_count_probe(void)
+{
+}
+
+static void case_probe_count(void)
 {
 }
 #endif
@@ -1188,6 +1209,7 @@ typedef struct {
     char *logical_path;
     size_t key_length;
     uint64_t hash;
+    size_t value_index;
 } PortableCaseFoldSlot;
 
 typedef struct {
@@ -1253,14 +1275,15 @@ void ascii_fold_copy(char *destination, size_t destination_size,
     destination[index] = '\0';
 }
 
-int case_fold_set_find_or_insert(PortableCaseFoldSet *set,
-                                 const char *folded_key,
-                                 const char *logical_path,
-                                 char **out_logical_path)
+static int case_fold_set_find_or_insert_value(
+    PortableCaseFoldSet *set, const char *folded_key,
+    const char *logical_path, size_t value_index, size_t *out_value_index,
+    char **out_logical_path)
 {
     if (set == NULL || folded_key == NULL || logical_path == NULL ||
-        out_logical_path == NULL)
+        out_value_index == NULL || out_logical_path == NULL)
         return -1;
+    *out_value_index = SIZE_MAX;
     *out_logical_path = NULL;
 
     size_t key_length = strlen(folded_key);
@@ -1285,6 +1308,7 @@ int case_fold_set_find_or_insert(PortableCaseFoldSet *set,
         }
         if (slot->hash == hash && slot->key_length == key_length &&
             memcmp(slot->folded_key, folded_key, key_length) == 0) {
+            *out_value_index = slot->value_index;
             *out_logical_path = slot->logical_path;
             return 1;
         }
@@ -1318,10 +1342,22 @@ int case_fold_set_find_or_insert(PortableCaseFoldSet *set,
         .folded_key = key_copy,
         .logical_path = logical_copy,
         .key_length = key_length,
-        .hash = hash
+        .hash = hash,
+        .value_index = value_index
     };
     set->count++;
     return 0;
+}
+
+int case_fold_set_find_or_insert(PortableCaseFoldSet *set,
+                                 const char *folded_key,
+                                 const char *logical_path,
+                                 char **out_logical_path)
+{
+    size_t value_index = SIZE_MAX;
+    return case_fold_set_find_or_insert_value(set, folded_key, logical_path,
+                                              SIZE_MAX, &value_index,
+                                              out_logical_path);
 }
 
 void case_fold_set_free(PortableCaseFoldSet *set)
@@ -2607,14 +2643,323 @@ static int prescan_record_case_collision(PortablePrescanReport *report,
     return prescan_report_add(report, &violation);
 }
 
+#define PORTABLE_CASE_PROBE_DIR ".migr-case-probe"
+#define PORTABLE_SKELETON_PLACEHOLDER '\001'
+
+/*
+ * The encoded component alphabet is ASCII alnum/._-% plus valid UTF-8 bytes;
+ * invalid bytes are percent-encoded.  A control byte therefore cannot occur
+ * in an encoded name.  Replacing every non-ASCII byte with that one marker
+ * yields a sound candidate filter: vfat NLS tables and exFAT/NTFS up-case
+ * tables map one code unit to one code unit, so a folding rule cannot change a
+ * component's length or make two different skeletons equal.
+ */
+void skeleton_copy(char *destination, size_t destination_size,
+                   const char *source)
+{
+    if (destination == NULL || destination_size == 0)
+        return;
+    size_t index = 0;
+    if (source != NULL) {
+        for (; source[index] != '\0' && index + 1U < destination_size;
+             index++) {
+            unsigned char byte = (unsigned char)source[index];
+            if (byte >= 0x80U)
+                destination[index] = PORTABLE_SKELETON_PLACEHOLDER;
+            else if (byte >= 'A' && byte <= 'Z')
+                destination[index] = (char)(byte + ('a' - 'A'));
+            else
+                destination[index] = source[index];
+        }
+    }
+    destination[index] = '\0';
+}
+
+typedef struct {
+    char **encoded_names;
+    char **logical_paths;
+    size_t count;
+    size_t capacity;
+    int ascii_collision;
+} PortableCaseProbeGroup;
+
+typedef struct {
+    PortableCaseProbeGroup *items;
+    size_t count;
+    size_t capacity;
+} PortableCaseProbeGroups;
+
+typedef struct {
+    int container_fd;
+    int scratch_fd;
+    int scratch_created;
+} PortableCaseProbeState;
+
+static char *portable_text_duplicate(const char *text)
+{
+    if (text == NULL)
+        return NULL;
+    size_t length = strlen(text);
+    if (length == SIZE_MAX)
+        return NULL;
+    char *copy = malloc(length + 1U);
+    if (copy == NULL)
+        return NULL;
+    memcpy(copy, text, length + 1U);
+    return copy;
+}
+
+static void case_probe_group_free(PortableCaseProbeGroup *group)
+{
+    if (group == NULL)
+        return;
+    for (size_t index = 0; index < group->count; index++) {
+        free(group->encoded_names[index]);
+        free(group->logical_paths[index]);
+    }
+    free(group->encoded_names);
+    free(group->logical_paths);
+    memset(group, 0, sizeof(*group));
+}
+
+static void case_probe_groups_free(PortableCaseProbeGroups *groups)
+{
+    if (groups == NULL)
+        return;
+    for (size_t index = 0; index < groups->count; index++)
+        case_probe_group_free(&groups->items[index]);
+    free(groups->items);
+    memset(groups, 0, sizeof(*groups));
+}
+
+static int case_probe_group_append(PortableCaseProbeGroup *group,
+                                  const char *encoded,
+                                  const char *logical)
+{
+    if (group == NULL || encoded == NULL || logical == NULL ||
+        group->count >= SIDECAR_MAX_LIVE_ENTRIES)
+        return -1;
+    if (group->count == group->capacity) {
+        size_t capacity = group->capacity == 0 ? 4U : group->capacity * 2U;
+        if (capacity < group->capacity ||
+            capacity > SIDECAR_MAX_LIVE_ENTRIES)
+            capacity = SIDECAR_MAX_LIVE_ENTRIES;
+        if (capacity > SIZE_MAX / sizeof(*group->encoded_names) ||
+            capacity > SIZE_MAX / sizeof(*group->logical_paths))
+            return -1;
+        char **encoded_names = realloc(group->encoded_names,
+                                       capacity * sizeof(*encoded_names));
+        if (encoded_names == NULL)
+            return -1;
+        char **logical_paths = realloc(group->logical_paths,
+                                       capacity * sizeof(*logical_paths));
+        if (logical_paths == NULL) {
+            group->encoded_names = encoded_names;
+            return -1;
+        }
+        group->encoded_names = encoded_names;
+        group->logical_paths = logical_paths;
+        group->capacity = capacity;
+    }
+
+    char *encoded_copy = portable_text_duplicate(encoded);
+    if (encoded_copy == NULL)
+        return -1;
+    char *logical_copy = portable_text_duplicate(logical);
+    if (logical_copy == NULL) {
+        free(encoded_copy);
+        return -1;
+    }
+    group->encoded_names[group->count] = encoded_copy;
+    group->logical_paths[group->count] = logical_copy;
+    group->count++;
+    return 0;
+}
+
+static int case_probe_groups_add(PortableCaseProbeGroups *groups,
+                                 const char *encoded, const char *logical,
+                                 size_t *out_index)
+{
+    if (groups == NULL || out_index == NULL ||
+        groups->count >= SIDECAR_MAX_LIVE_ENTRIES)
+        return -1;
+    if (groups->count == groups->capacity) {
+        size_t capacity = groups->capacity == 0 ? 8U : groups->capacity * 2U;
+        if (capacity < groups->capacity ||
+            capacity > SIDECAR_MAX_LIVE_ENTRIES)
+            capacity = SIDECAR_MAX_LIVE_ENTRIES;
+        if (capacity > SIZE_MAX / sizeof(*groups->items))
+            return -1;
+        PortableCaseProbeGroup *items = realloc(
+            groups->items, capacity * sizeof(*items));
+        if (items == NULL)
+            return -1;
+        memset(items + groups->capacity, 0,
+               (capacity - groups->capacity) * sizeof(*items));
+        groups->items = items;
+        groups->capacity = capacity;
+    }
+
+    size_t index = groups->count++;
+    if (case_probe_group_append(&groups->items[index], encoded, logical) != 0) {
+        groups->count--;
+        case_probe_group_free(&groups->items[index]);
+        return -1;
+    }
+    *out_index = index;
+    return 0;
+}
+
+static int case_probe_prepare(PortableCaseProbeState *state)
+{
+    if (state == NULL || state->container_fd < 0)
+        return -1;
+    if (state->scratch_fd >= 0)
+        return 0;
+    if (mkdirat(state->container_fd, PORTABLE_CASE_PROBE_DIR, 0700) != 0)
+        return -1;
+    state->scratch_created = 1;
+    state->scratch_fd = openat(state->container_fd, PORTABLE_CASE_PROBE_DIR,
+                               O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                                   O_CLOEXEC);
+    if (state->scratch_fd >= 0)
+        return 0;
+    int saved = errno;
+    if (unlinkat(state->container_fd, PORTABLE_CASE_PROBE_DIR,
+                 AT_REMOVEDIR) != 0) {
+        saved = EIO;
+        state->scratch_created = 1;
+    } else {
+        state->scratch_created = 0;
+    }
+    errno = saved;
+    return -1;
+}
+
+static int case_probe_cleanup(PortableCaseProbeState *state)
+{
+    if (state == NULL)
+        return -1;
+    int failed = 0;
+    if (state->scratch_fd >= 0 && close(state->scratch_fd) != 0)
+        failed = 1;
+    state->scratch_fd = -1;
+    if (state->scratch_created) {
+        if (remove_directory_tree(state->container_fd,
+                                  PORTABLE_CASE_PROBE_DIR) != 0)
+            failed = 1;
+        state->scratch_created = 0;
+    }
+    return failed ? -1 : 0;
+}
+
+static int case_probe_group(PortableCaseProbeState *state,
+                            const PortableCaseProbeGroup *group,
+                            const char *root_id,
+                            PortablePrescanReport *report)
+{
+    if (state == NULL || group == NULL || root_id == NULL || report == NULL ||
+        group->count < 2U || case_probe_prepare(state) != 0)
+        return -1;
+    case_probe_count();
+
+    int failed = 0;
+    for (size_t index = 0; index < group->count; index++) {
+        int fd = openat(state->scratch_fd, group->encoded_names[index],
+                        O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                        0600);
+        if (fd >= 0) {
+            if (close(fd) != 0)
+                failed = 1;
+        } else if (errno != EEXIST) {
+            failed = 1;
+        } else {
+            /* A later lookup of this byte string is not reliable for
+             * non-ASCII case aliases on vfat; the read-back pass below
+             * attributes collisions from the directory entries that
+             * survived. */
+        }
+        if (failed)
+            break;
+    }
+
+    unsigned char *survived = NULL;
+    if (!failed) {
+        survived = calloc(group->count, sizeof(*survived));
+        if (survived == NULL)
+            failed = 1;
+    }
+    if (!failed) {
+        int scan_fd = duplicate_fd(state->scratch_fd);
+        DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
+        if (directory == NULL) {
+            if (scan_fd >= 0)
+                close(scan_fd);
+            failed = 1;
+        } else {
+            for (;;) {
+                errno = 0;
+                struct dirent *entry = readdir(directory);
+                if (entry == NULL) {
+                    if (errno != 0)
+                        failed = 1;
+                    break;
+                }
+                if (strcmp(entry->d_name, ".") == 0 ||
+                    strcmp(entry->d_name, "..") == 0)
+                    continue;
+                for (size_t index = 0; index < group->count; index++)
+                    if (!survived[index] &&
+                        strcmp(entry->d_name,
+                               group->encoded_names[index]) == 0) {
+                        survived[index] = 1;
+                        break;
+                    }
+            }
+            if (closedir(directory) != 0)
+                failed = 1;
+        }
+    }
+
+    if (!failed) {
+        size_t representative = SIZE_MAX;
+        for (size_t index = 0; index < group->count; index++)
+            if (survived[index]) {
+                representative = index;
+                break;
+            }
+        if (representative == SIZE_MAX) {
+            failed = 1;
+        } else {
+            for (size_t index = 0;
+                 index < group->count && !failed; index++)
+                if (!survived[index] &&
+                    prescan_record_case_collision(
+                        report, root_id, group->logical_paths[index],
+                        group->logical_paths[representative]) != 0)
+                    failed = 1;
+        }
+    }
+
+    for (size_t index = 0; index < group->count; index++) {
+        if (unlinkat(state->scratch_fd, group->encoded_names[index], 0) != 0 &&
+            errno != ENOENT)
+            failed = 1;
+    }
+    free(survived);
+    return failed ? -1 : 0;
+}
+
 static int prescan_directory(int source_fd, const char *logical,
                              const char *physical, const char *root_id,
                              const char *payload_path,
                              PortablePrescanReport *report,
-                             int case_sensitive)
+                             int case_sensitive,
+                             PortableCaseProbeState *probe_state)
 {
     if (source_fd < 0 || logical == NULL || physical == NULL ||
-        root_id == NULL || payload_path == NULL || report == NULL)
+        root_id == NULL || payload_path == NULL || report == NULL ||
+        probe_state == NULL)
         return -1;
 
     int scan_fd = duplicate_fd(source_fd);
@@ -2626,6 +2971,8 @@ static int prescan_directory(int source_fd, const char *logical,
     }
 
     PortableCaseFoldSet siblings = {0};
+    PortableCaseFoldSet skeletons = {0};
+    PortableCaseProbeGroups groups = {0};
     if (!case_sensitive)
         siblings.hash_salt = sidecar_process_salt();
 
@@ -2694,7 +3041,40 @@ static int prescan_directory(int source_fd, const char *logical,
             continue;
         }
 
+        size_t skeleton_group_index = SIZE_MAX;
         if (!case_sensitive) {
+            char skeleton[NAME_MAX + 1U];
+            skeleton_copy(skeleton, sizeof(skeleton), scratch);
+            size_t new_group_index = groups.count;
+            if (case_probe_groups_add(&groups, scratch, child_logical,
+                                      &new_group_index) != 0) {
+                failed = 1;
+                break;
+            }
+            size_t existing_group_index = SIZE_MAX;
+            char *existing_skeleton_path = NULL;
+            int skeleton_found = case_fold_set_find_or_insert_value(
+                &skeletons, skeleton, child_logical, new_group_index,
+                &existing_group_index, &existing_skeleton_path);
+            if (skeleton_found < 0) {
+                failed = 1;
+                break;
+            }
+            if (skeleton_found == 0) {
+                skeleton_group_index = new_group_index;
+            } else {
+                case_probe_group_free(&groups.items[new_group_index]);
+                groups.count--;
+                skeleton_group_index = existing_group_index;
+                if (skeleton_group_index >= groups.count ||
+                    case_probe_group_append(
+                        &groups.items[skeleton_group_index], scratch,
+                        child_logical) != 0) {
+                    failed = 1;
+                    break;
+                }
+            }
+
             char folded[NAME_MAX + 1U];
             ascii_fold_copy(folded, sizeof(folded), scratch);
             char *existing_logical = NULL;
@@ -2705,6 +3085,7 @@ static int prescan_directory(int source_fd, const char *logical,
                 break;
             }
             if (found == 1) {
+                groups.items[skeleton_group_index].ascii_collision = 1;
                 if (prescan_record_case_collision(
                         report, root_id, child_logical,
                         existing_logical) != 0) {
@@ -2729,7 +3110,7 @@ static int prescan_directory(int source_fd, const char *logical,
             }
             int child_result = prescan_directory(
                 child_fd, child_logical, child_physical, root_id,
-                payload_path, report, case_sensitive);
+                payload_path, report, case_sensitive, probe_state);
             if (close(child_fd) != 0)
                 child_result = -1;
             if (child_result != 0) {
@@ -2740,14 +3121,27 @@ static int prescan_directory(int source_fd, const char *logical,
     }
     if (closedir(directory) != 0)
         failed = 1;
+    if (!failed && !case_sensitive) {
+        for (size_t index = 0; index < groups.count; index++) {
+            PortableCaseProbeGroup *group = &groups.items[index];
+            if (group->count > 1U && !group->ascii_collision &&
+                case_probe_group(probe_state, group, root_id, report) != 0) {
+                failed = 1;
+                break;
+            }
+        }
+    }
     case_fold_set_free(&siblings);
+    case_fold_set_free(&skeletons);
+    case_probe_groups_free(&groups);
     return failed ? -1 : 0;
 }
 
 static int prescan_root(const PortableRootSpec *root,
-                        PortablePrescanReport *report, int case_sensitive)
+                        PortablePrescanReport *report, int case_sensitive,
+                        PortableCaseProbeState *probe_state)
 {
-    if (!root_spec_valid(root) || report == NULL)
+    if (!root_spec_valid(root) || report == NULL || probe_state == NULL)
         return -1;
 
     struct stat st;
@@ -2760,22 +3154,30 @@ static int prescan_root(const PortableRootSpec *root,
     if (root_fd < 0)
         return -1;
     int result = prescan_directory(root_fd, "", "", root->id,
-                                   root->payload_path, report, case_sensitive);
+                                   root->payload_path, report, case_sensitive,
+                                   probe_state);
     if (close(root_fd) != 0)
         result = -1;
     return result;
 }
 
-static int prescan_request(const PortableCaptureRequest *request,
+static int prescan_request(int container_fd,
+                           const PortableCaptureRequest *request,
                            PortablePrescanReport *report)
 {
-    if (request == NULL || report == NULL)
+    if (container_fd < 0 || request == NULL || report == NULL)
         return -1;
+    PortableCaseProbeState probe_state = {
+        .container_fd = container_fd,
+        .scratch_fd = -1
+    };
     int failed = 0;
     for (size_t index = 0; index < request->root_count; index++)
         if (prescan_root(&request->roots[index], report,
-                         request->case_sensitive) != 0)
+                         request->case_sensitive, &probe_state) != 0)
             failed = 1;
+    if (case_probe_cleanup(&probe_state) != 0)
+        failed = 1;
     return failed || report->total_count != 0 ? -1 : 0;
 }
 
@@ -2976,7 +3378,7 @@ int portable_capture_fresh_at(int container_fd,
         portable_prescan_report_init(&local_report);
         active_report = &local_report;
     }
-    if (prescan_request(request, active_report) != 0) {
+    if (prescan_request(container_fd, request, active_report) != 0) {
         if (owns_report)
             portable_prescan_report_free(&local_report);
         return -1;
@@ -3075,7 +3477,7 @@ int portable_capture_resume_at(int container_fd,
         portable_prescan_report_init(&local_report);
         active_report = &local_report;
     }
-    if (prescan_request(request, active_report) != 0) {
+    if (prescan_request(container_fd, request, active_report) != 0) {
         if (owns_report)
             portable_prescan_report_free(&local_report);
         return -1;

@@ -39,6 +39,8 @@ extern uint64_t portable_capture_test_probe_count(void);
 extern void portable_capture_test_reset_probe_count(void);
 extern uint64_t portable_capture_test_readback_scan_count(void);
 extern void portable_capture_test_reset_readback_scan_count(void);
+extern uint64_t portable_capture_test_case_probe_count(void);
+extern void portable_capture_test_reset_case_probe_count(void);
 
 static int failures;
 
@@ -116,6 +118,83 @@ static PortableRootSpec root_spec(const char *source)
     };
 }
 
+static void test_case_probe_hooks(const char *fixture)
+{
+    char source_path[PATH_MAX];
+    char container_path[PATH_MAX];
+    if (snprintf(source_path, sizeof(source_path), "%s/case-source",
+                 fixture) < 0 ||
+        snprintf(container_path, sizeof(container_path),
+                 "%s/case-container", fixture) < 0 ||
+        mkdir(source_path, 0700) != 0 || mkdir(container_path, 0700) != 0)
+        fixture_fatal("could not create case-probe fixtures");
+
+    int source_fd = open(source_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int container_fd = open(container_path,
+                            O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (source_fd < 0 || container_fd < 0)
+        fixture_fatal("could not open case-probe fixtures");
+    if (make_named_fixture_file(source_fd, "alpha") != 0 ||
+        make_named_fixture_file(source_fd, "beta") != 0)
+        fixture_fatal("could not create ASCII case-probe fixture");
+
+    PortableRootSpec root = root_spec(source_path);
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .roots = &root,
+        .root_count = 1,
+        .nsec_exact = 1,
+        .case_sensitive = 0
+    };
+    PortablePrescanReport report;
+    portable_prescan_report_init(&report);
+    portable_capture_test_reset_case_probe_count();
+    check(portable_capture_fresh_at(container_fd, &request, &report) == 0 &&
+              report.total_count == 0 &&
+              portable_capture_test_case_probe_count() == 0,
+          "all-ASCII pre-scan performs zero destination case probes");
+    struct stat probe_stat;
+    check(fstatat(container_fd, ".migr-case-probe", &probe_stat,
+                  AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT,
+          "all-ASCII pre-scan creates no case-probe directory");
+    portable_prescan_report_free(&report);
+    close(source_fd);
+    close(container_fd);
+    remove_tree(source_path);
+    remove_tree(container_path);
+
+    if (snprintf(source_path, sizeof(source_path), "%s/case-source-utf8",
+                 fixture) < 0 ||
+        snprintf(container_path, sizeof(container_path),
+                 "%s/case-container-utf8", fixture) < 0 ||
+        mkdir(source_path, 0700) != 0 || mkdir(container_path, 0700) != 0)
+        fixture_fatal("could not create UTF-8 case-probe fixtures");
+    source_fd = open(source_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    container_fd = open(container_path,
+                        O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (source_fd < 0 || container_fd < 0)
+        fixture_fatal("could not open UTF-8 case-probe fixtures");
+    if (make_named_fixture_file(source_fd, "caf\xc3\xa9") != 0 ||
+        make_named_fixture_file(source_fd, "caf\xc3\x89") != 0)
+        fixture_fatal("could not create UTF-8 case-probe fixture");
+
+    root = root_spec(source_path);
+    portable_prescan_report_init(&report);
+    portable_capture_test_reset_case_probe_count();
+    check(portable_capture_fresh_at(container_fd, &request, &report) == 0 &&
+              report.total_count == 0 &&
+              portable_capture_test_case_probe_count() == 1,
+          "one residual skeleton group performs exactly one probe");
+    check(fstatat(container_fd, ".migr-case-probe", &probe_stat,
+                  AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT,
+          "successful case probe removes its scratch directory");
+    portable_prescan_report_free(&report);
+    close(source_fd);
+    close(container_fd);
+    remove_tree(source_path);
+    remove_tree(container_path);
+}
+
 int main(void)
 {
     printf(BLUE "::" NC " portable visited hash scale\n");
@@ -186,6 +265,8 @@ int main(void)
           "mixed ASCII and UTF-8 fixture captures successfully");
     check(portable_capture_test_readback_scan_count() == 1,
           "UTF-8 names trigger one batched destination read-back");
+
+    test_case_probe_hooks(fixture);
 
     portable_capture_context_close(&context);
     check(sidecar_log_close(&sidecar) == SIDECAR_STATUS_OK,

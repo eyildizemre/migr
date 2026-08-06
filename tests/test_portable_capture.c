@@ -57,6 +57,7 @@ typedef struct {
     char *logical_path;
     size_t key_length;
     uint64_t hash;
+    size_t value_index;
 } PortableCaseFoldSlot;
 typedef struct {
     PortableCaseFoldSlot *slots;
@@ -66,6 +67,8 @@ typedef struct {
 } PortableCaseFoldSet;
 extern void ascii_fold_copy(char *destination, size_t destination_size,
                             const char *source);
+extern void skeleton_copy(char *destination, size_t destination_size,
+                          const char *source);
 extern int case_fold_set_find_or_insert(PortableCaseFoldSet *set,
                                         const char *folded_key,
                                         const char *logical_path,
@@ -409,6 +412,33 @@ static void test_case_fold_helpers(void)
     case_fold_set_free(&set);
     check(set.slots == NULL && set.count == 0 && set.capacity == 0,
           "case-fold sibling set frees every stored path");
+
+    char skeleton[32];
+    skeleton_copy(skeleton, sizeof(skeleton), "cafe");
+    check(strcmp(skeleton, "cafe") == 0,
+          "ASCII skeleton preserves non-letter bytes");
+    skeleton_copy(skeleton, sizeof(skeleton), "caf\xc3\xa9");
+    char cafe_skeleton[32];
+    strcpy(cafe_skeleton, skeleton);
+    skeleton_copy(skeleton, sizeof(skeleton), "CAF\xc3\x89");
+    check(strcmp(skeleton, cafe_skeleton) == 0 &&
+              (unsigned char)skeleton[3] == 1U &&
+              (unsigned char)skeleton[4] == 1U,
+          "skeleton maps non-ASCII bytes to a common placeholder");
+    char alpha_skeleton[32];
+    char alpha_two_skeleton[32];
+    skeleton_copy(alpha_skeleton, sizeof(alpha_skeleton), "alpha.txt");
+    skeleton_copy(alpha_two_skeleton, sizeof(alpha_two_skeleton), "alpha2.txt");
+    check(strcmp(alpha_skeleton, alpha_two_skeleton) != 0,
+          "different ASCII skeletons remain separate candidates");
+    struct {
+        char bytes[4];
+        char guard;
+    } short_skeleton = { { 0 }, '!' };
+    skeleton_copy(short_skeleton.bytes, sizeof(short_skeleton.bytes),
+                  "caf\xc3\xa9");
+    check(short_skeleton.bytes[3] == '\0' && short_skeleton.guard == '!',
+          "skeleton folding terminates within a short destination");
 }
 
 static int missing_container_entry(int container_fd, const char *name)
@@ -582,6 +612,118 @@ static void test_case_collision_prescan(const char *base)
     check(result == 0 && report.total_count == 0,
           "non-ASCII case folding remains deferred to destination probing");
     portable_prescan_report_free(&report);
+    close(container_fd);
+    remove_tree(source_path);
+    remove_tree(container_path);
+}
+
+#define CASE_PROBE_DIR ".migr-case-probe"
+
+static void test_case_probe(const char *base)
+{
+    printf(BLUE "::" NC " measured non-ASCII case pre-scan\n");
+    static const char *const non_ascii[] = {
+        "caf\xc3\xa9", "caf\xc3\x89"
+    };
+    char source_path[PATH_MAX];
+    char container_path[PATH_MAX];
+    int container_fd;
+    PortablePrescanReport report;
+
+    int result = run_case_fixture(base, "case-probe", non_ascii,
+                                  sizeof(non_ascii) / sizeof(non_ascii[0]), 0,
+                                  source_path, sizeof(source_path),
+                                  container_path, sizeof(container_path),
+                                  &container_fd, &report);
+    check(result == 0 && report.total_count == 0,
+          "case-sensitive host measures non-ASCII candidates without refusing");
+    check(missing_container_entry(container_fd, CASE_PROBE_DIR),
+          "successful candidate probing removes its scratch directory");
+    portable_prescan_report_free(&report);
+    close(container_fd);
+    remove_tree(source_path);
+    remove_tree(container_path);
+
+    join_path(source_path, sizeof(source_path), base, "case-probe-ascii");
+    join_path(container_path, sizeof(container_path), base,
+              "case-probe-ascii-container");
+    make_directory(source_path);
+    make_directory(container_path);
+    char ascii_path[PATH_MAX];
+    join_path(ascii_path, sizeof(ascii_path), source_path, "alpha.txt");
+    write_file(ascii_path, "x", 1);
+    join_path(ascii_path, sizeof(ascii_path), source_path, "beta.txt");
+    write_file(ascii_path, "y", 1);
+    container_fd = open(container_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open ASCII probe container");
+    int marker_fd = openat(container_fd, CASE_PROBE_DIR,
+                           O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (marker_fd < 0)
+        fixture_fatal("could not create ASCII probe marker");
+    close(marker_fd);
+    PortableRootSpec root = root_spec("CASE", source_path, "CASE");
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .roots = &root,
+        .root_count = 1,
+        .nsec_exact = 1,
+        .case_sensitive = 0
+    };
+    portable_prescan_report_init(&report);
+    check(portable_capture_fresh_at(container_fd, &request, &report) == 0 &&
+              report.total_count == 0,
+          "all-ASCII tree succeeds without attempting a case probe");
+    struct stat marker_stat;
+    check(fstatat(container_fd, CASE_PROBE_DIR, &marker_stat,
+                  AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(marker_stat.st_mode),
+          "all-ASCII tree leaves the pre-existing probe marker untouched");
+    portable_prescan_report_free(&report);
+    if (unlinkat(container_fd, CASE_PROBE_DIR, 0) != 0)
+        fixture_fatal("could not remove ASCII probe marker");
+    close(container_fd);
+    remove_tree(source_path);
+    remove_tree(container_path);
+
+    join_path(source_path, sizeof(source_path), base, "case-probe-failure");
+    join_path(container_path, sizeof(container_path), base,
+              "case-probe-failure-container");
+    make_directory(source_path);
+    make_directory(container_path);
+    for (size_t index = 0; index < sizeof(non_ascii) / sizeof(non_ascii[0]);
+         index++) {
+        char path[PATH_MAX];
+        join_path(path, sizeof(path), source_path, non_ascii[index]);
+        write_file(path, "x", 1);
+    }
+    container_fd = open(container_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open probe failure container");
+    marker_fd = openat(container_fd, CASE_PROBE_DIR,
+                       O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (marker_fd < 0)
+        fixture_fatal("could not create probe failure marker");
+    close(marker_fd);
+    portable_prescan_report_init(&report);
+    PortableRootSpec failure_root = root_spec("CASE", source_path, "CASE");
+    PortableCaptureRequest failure_request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .roots = &failure_root,
+        .root_count = 1,
+        .nsec_exact = 1,
+        .case_sensitive = 0
+    };
+    result = portable_capture_fresh_at(container_fd, &failure_request,
+                                       &report);
+    check(result != 0 && report.total_count == 0 &&
+              empty_capture_container(container_fd),
+          "an unavailable probe scratch directory fails before mutation");
+    check(fstatat(container_fd, CASE_PROBE_DIR, &marker_stat,
+                  AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(marker_stat.st_mode),
+          "probe failure does not remove an unrelated pre-existing entry");
+    portable_prescan_report_free(&report);
+    if (unlinkat(container_fd, CASE_PROBE_DIR, 0) != 0)
+        fixture_fatal("could not remove probe failure marker");
     close(container_fd);
     remove_tree(source_path);
     remove_tree(container_path);
@@ -1500,6 +1642,7 @@ int main(void)
     test_prescan_report();
     test_case_fold_helpers();
     test_case_collision_prescan(root_path);
+    test_case_probe(root_path);
     test_encoded_payload_names(root_path);
     test_nested_encoded_directories(root_path);
     test_name_and_path_limits(root_path);
