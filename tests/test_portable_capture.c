@@ -108,6 +108,74 @@ static void remove_tree(const char *path)
         fixture_fatal("could not walk fixture tree");
 }
 
+static int remove_fd_entry(int parent_fd, const char *name);
+
+static int remove_fd_children(int directory_fd)
+{
+    int scan_fd = fcntl(directory_fd, F_DUPFD_CLOEXEC, 0);
+    DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
+    if (directory == NULL) {
+        if (scan_fd >= 0)
+            close(scan_fd);
+        return -1;
+    }
+
+    int failed = 0;
+    for (;;) {
+        errno = 0;
+        struct dirent *entry = readdir(directory);
+        if (entry == NULL) {
+            if (errno != 0)
+                failed = 1;
+            break;
+        }
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0)
+            continue;
+        if (remove_fd_entry(directory_fd, entry->d_name) != 0) {
+            failed = 1;
+            break;
+        }
+    }
+    if (closedir(directory) != 0)
+        failed = 1;
+    return failed ? -1 : 0;
+}
+
+static int remove_fd_entry(int parent_fd, const char *name)
+{
+    struct stat st;
+    if (fstatat(parent_fd, name, &st, AT_SYMLINK_NOFOLLOW) != 0)
+        return errno == ENOENT ? 0 : -1;
+    if (!S_ISDIR(st.st_mode))
+        return unlinkat(parent_fd, name, 0) == 0 ? 0 : -1;
+
+    int directory_fd = openat(parent_fd, name,
+                              O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                                  O_CLOEXEC);
+    if (directory_fd < 0)
+        return -1;
+    int failed = remove_fd_children(directory_fd);
+    if (close(directory_fd) != 0)
+        failed = -1;
+    if (failed != 0)
+        return -1;
+    return unlinkat(parent_fd, name, AT_REMOVEDIR) == 0 ? 0 : -1;
+}
+
+static void remove_tree_fd(const char *path)
+{
+    int directory_fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (directory_fd < 0) {
+        if (errno == ENOENT)
+            return;
+        fixture_fatal("could not open fixture tree for fd cleanup");
+    }
+    if (remove_fd_children(directory_fd) != 0 || close(directory_fd) != 0 ||
+        rmdir(path) != 0)
+        fixture_fatal("could not remove fixture tree by descriptor");
+}
+
 static void join_path(char *out, size_t size, const char *left,
                       const char *right)
 {
@@ -166,6 +234,52 @@ static int file_equals(const char *path, const char *expected)
     return result;
 }
 
+static int directory_fd_is_empty(int directory_fd)
+{
+    int scan_fd = fcntl(directory_fd, F_DUPFD_CLOEXEC, 0);
+    DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
+    if (directory == NULL) {
+        if (scan_fd >= 0)
+            close(scan_fd);
+        return 0;
+    }
+
+    int empty = 1;
+    for (;;) {
+        errno = 0;
+        struct dirent *entry = readdir(directory);
+        if (entry == NULL) {
+            if (errno != 0)
+                empty = 0;
+            break;
+        }
+        if (strcmp(entry->d_name, ".") != 0 &&
+            strcmp(entry->d_name, "..") != 0) {
+            empty = 0;
+            break;
+        }
+    }
+    if (closedir(directory) != 0)
+        empty = 0;
+    return empty;
+}
+
+static int relative_directory_is_empty(int base_fd, const char *relative)
+{
+    if (base_fd < 0 || relative == NULL || relative[0] == '\0' ||
+        strlen(relative) >= PATH_MAX)
+        return 0;
+    int directory_fd = openat(base_fd, relative,
+                               O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                                   O_CLOEXEC);
+    if (directory_fd < 0)
+        return 0;
+    int result = directory_fd_is_empty(directory_fd);
+    if (close(directory_fd) != 0)
+        result = 0;
+    return result;
+}
+
 static PortableRootSpec root_spec(const char *id, const char *source,
                                   const char *payload)
 {
@@ -183,6 +297,25 @@ static PortableRootSpec root_spec(const char *id, const char *source,
 static SidecarBytes bytes(const char *text)
 {
     return (SidecarBytes){ (const unsigned char *)text, strlen(text) };
+}
+
+static int sidecar_bytes_match_text(SidecarBytes value, const char *text)
+{
+    if (text == NULL)
+        return 0;
+    size_t length = strlen(text);
+    return value.length == length &&
+           (length == 0 || memcmp(value.data, text, length) == 0);
+}
+
+static int live_entry_paths(SidecarLog *log, const char *root,
+                            const char *logical, const char *physical)
+{
+    SidecarLiveView view;
+    int found = sidecar_log_find(log, bytes(root), bytes(logical), &view);
+    return found == 1 &&
+           sidecar_bytes_match_text(view.entry->logical_path, logical) &&
+           sidecar_bytes_match_text(view.entry->physical_path, physical);
 }
 
 static void test_append_physical(void)
@@ -246,12 +379,272 @@ static void test_entry_helpers(const char *source)
     entry = previous;
     check(entries_equal(&entry, &view, &empty_xattrs) != 0,
           "entries_equal accepts identical symlink targets");
+    entry.physical_path = bytes("different-physical");
+    check(entries_equal(&entry, &view, &empty_xattrs) == 0,
+          "entries_equal rejects different physical paths");
+    entry.physical_path = previous.physical_path;
     entry.symlink_target = bytes("other-target");
     check(entries_equal(&entry, &view, &empty_xattrs) == 0,
           "entries_equal rejects different symlink targets");
 
     if (unlink(link_path) != 0)
         fixture_fatal("could not remove symlink helper fixture");
+}
+
+static void test_encoded_payload_names(const char *base)
+{
+    printf(BLUE "::" NC " encoded payload names and sidecar paths\n");
+    static const struct {
+        const char *logical;
+        const char *physical;
+    } names[] = {
+        { "colon:name", "colon%3Aname" },
+        { "question?name", "question%3Fname" },
+        { "space name", "space%20name" },
+        { "percent%name", "percent%25name" },
+        { "trailing.", "trailing%2E" },
+        { "日本", "日本" },
+        { "ç", "ç" },
+        { "🙂", "🙂" }
+    };
+    static const char invalid_name[] = {
+        'i', 'n', 'v', 'a', 'l', 'i', 'd', (char)0xff, 'n', 'a', 'm', 'e',
+        '\0'
+    };
+    static const char invalid_physical[] = "invalid%FFname";
+
+    char source_path[PATH_MAX];
+    char container_path[PATH_MAX];
+    join_path(source_path, sizeof(source_path), base, "encoded-names-source");
+    join_path(container_path, sizeof(container_path), base,
+              "encoded-names-container");
+    make_directory(source_path);
+    make_directory(container_path);
+
+    for (size_t index = 0; index < sizeof(names) / sizeof(names[0]); index++) {
+        char path[PATH_MAX];
+        join_path(path, sizeof(path), source_path, names[index].logical);
+        write_file(path, "x", 1);
+    }
+    char invalid_path[PATH_MAX];
+    join_path(invalid_path, sizeof(invalid_path), source_path, invalid_name);
+    write_file(invalid_path, "x", 1);
+
+    int container_fd = open(container_path,
+                             O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open encoded-name container");
+    PortableRootSpec root = root_spec("NAMES", source_path, "NAMES");
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .roots = &root,
+        .root_count = 1,
+        .nsec_exact = 1
+    };
+    check(portable_capture_fresh_at(container_fd, &request) == 0,
+          "capture accepts escaped and valid UTF-8 names");
+
+    char data_path[PATH_MAX];
+    join_path(data_path, sizeof(data_path), container_path, "data/NAMES");
+    for (size_t index = 0; index < sizeof(names) / sizeof(names[0]); index++) {
+        char payload[PATH_MAX];
+        join_path(payload, sizeof(payload), data_path, names[index].physical);
+        check(file_equals(payload, "x"),
+              "payload uses the expected encoded or raw UTF-8 leaf");
+    }
+    char invalid_payload[PATH_MAX];
+    join_path(invalid_payload, sizeof(invalid_payload), data_path,
+              invalid_physical);
+    check(file_equals(invalid_payload, "x"),
+          "invalid UTF-8 bytes are escaped in the payload name");
+
+    SidecarLog log = {0};
+    int adopted = sidecar_log_adopt_at(container_fd, &log) ==
+                  SIDECAR_OPEN_RESUMABLE;
+    check(adopted, "encoded-name sidecar can be reopened");
+    if (adopted) {
+        for (size_t index = 0; index < sizeof(names) / sizeof(names[0]);
+             index++)
+            check(live_entry_paths(&log, "NAMES", names[index].logical,
+                                   names[index].physical),
+                  "sidecar preserves logical and physical name paths");
+        check(live_entry_paths(&log, "NAMES", invalid_name, invalid_physical),
+              "sidecar preserves an invalid-byte logical name separately");
+        check(sidecar_log_close(&log) == SIDECAR_STATUS_OK,
+              "encoded-name sidecar closes cleanly");
+    }
+    close(container_fd);
+    remove_tree(source_path);
+    remove_tree(container_path);
+}
+
+static void test_nested_encoded_directories(const char *base)
+{
+    printf(BLUE "::" NC " reconcile nested encoded directories\n");
+    char source_path[PATH_MAX];
+    char container_path[PATH_MAX];
+    join_path(source_path, sizeof(source_path), base,
+              "nested-encoded-source");
+    join_path(container_path, sizeof(container_path), base,
+              "nested-encoded-container");
+    make_directory(source_path);
+    make_directory(container_path);
+
+    char first_path[PATH_MAX];
+    char second_path[PATH_MAX];
+    join_path(first_path, sizeof(first_path), source_path, "weird?dir");
+    join_path(second_path, sizeof(second_path), first_path, "また:dir");
+    make_directory(first_path);
+    make_directory(second_path);
+
+    char first_file[PATH_MAX];
+    char second_file[PATH_MAX];
+    join_path(first_file, sizeof(first_file), first_path, "inner.txt");
+    join_path(second_file, sizeof(second_file), second_path, "deep.txt");
+    write_file(first_file, "inner", sizeof("inner") - 1U);
+    write_file(second_file, "deep", sizeof("deep") - 1U);
+
+    int container_fd = open(container_path,
+                             O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open nested encoded container");
+    PortableRootSpec root = root_spec("NESTED", source_path, "NESTED");
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .roots = &root,
+        .root_count = 1,
+        .nsec_exact = 1
+    };
+    check(portable_capture_fresh_at(container_fd, &request) == 0,
+          "nested encoded directories capture successfully");
+
+    char payload_first[PATH_MAX];
+    char payload_second[PATH_MAX];
+    join_path(payload_first, sizeof(payload_first), container_path,
+              "data/NESTED/weird%3Fdir");
+    join_path(payload_second, sizeof(payload_second), payload_first,
+              "また%3Adir");
+    char payload_first_file[PATH_MAX];
+    char payload_second_file[PATH_MAX];
+    join_path(payload_first_file, sizeof(payload_first_file), payload_first,
+              "inner.txt");
+    join_path(payload_second_file, sizeof(payload_second_file), payload_second,
+              "deep.txt");
+    check(file_equals(payload_first_file, "inner"),
+          "first encoded directory contains its file");
+    check(file_equals(payload_second_file, "deep"),
+          "second encoded directory contains its file");
+
+    SidecarLog log = {0};
+    int adopted = sidecar_log_adopt_at(container_fd, &log) ==
+                  SIDECAR_OPEN_RESUMABLE;
+    check(adopted, "nested encoded sidecar can be reopened");
+    if (adopted) {
+        check(live_entry_paths(&log, "NESTED", "weird?dir",
+                               "weird%3Fdir"),
+              "first directory keeps logical and physical paths");
+        check(live_entry_paths(&log, "NESTED", "weird?dir/inner.txt",
+                               "weird%3Fdir/inner.txt"),
+              "first nested file keeps logical and physical paths");
+        check(live_entry_paths(&log, "NESTED", "weird?dir/また:dir",
+                               "weird%3Fdir/また%3Adir"),
+              "second directory keeps logical and physical paths");
+        check(live_entry_paths(&log, "NESTED",
+                               "weird?dir/また:dir/deep.txt",
+                               "weird%3Fdir/また%3Adir/deep.txt"),
+              "second nested file keeps logical and physical paths");
+        check(sidecar_log_close(&log) == SIDECAR_STATUS_OK,
+              "nested encoded sidecar closes cleanly");
+    }
+    close(container_fd);
+    remove_tree(source_path);
+    remove_tree(container_path);
+}
+
+static void test_name_and_path_limits(const char *base)
+{
+    printf(BLUE "::" NC " encoded name and payload path limits\n");
+
+    char source_path[PATH_MAX];
+    char container_path[PATH_MAX];
+    join_path(source_path, sizeof(source_path), base, "name-limit-source");
+    join_path(container_path, sizeof(container_path), base,
+              "name-limit-container");
+    make_directory(source_path);
+    make_directory(container_path);
+
+    char oversized_name[NAME_MAX + 1U];
+    size_t oversized_length = NAME_MAX / 3U + 1U;
+    memset(oversized_name, ':', oversized_length);
+    oversized_name[oversized_length] = '\0';
+    char oversized_path[PATH_MAX];
+    join_path(oversized_path, sizeof(oversized_path), source_path,
+              oversized_name);
+    write_file(oversized_path, "x", 1);
+
+    int container_fd = open(container_path,
+                             O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open name-limit container");
+    PortableRootSpec root = root_spec("NAMES", source_path, "NAMES");
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .roots = &root,
+        .root_count = 1,
+        .nsec_exact = 1
+    };
+    check(portable_capture_fresh_at(container_fd, &request) != 0,
+          "an encoded leaf exceeding NAME_MAX refuses capture");
+    int data_fd = openat(container_fd, "data",
+                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    check(data_fd >= 0 && relative_directory_is_empty(data_fd, "NAMES"),
+          "NAME_MAX refusal leaves no payload child");
+    if (data_fd >= 0)
+        close(data_fd);
+    close(container_fd);
+    remove_tree(source_path);
+    remove_tree(container_path);
+
+    join_path(source_path, sizeof(source_path), base, "path-limit-source");
+    join_path(container_path, sizeof(container_path), base,
+              "path-limit-container");
+    make_directory(source_path);
+    make_directory(container_path);
+    char child_path[PATH_MAX];
+    join_path(child_path, sizeof(child_path), source_path, "child");
+    write_file(child_path, "x", 1);
+
+    char *long_payload = malloc(PATH_MAX);
+    if (long_payload == NULL)
+        fixture_fatal("could not allocate long payload path");
+    size_t target_length = PATH_MAX - 1U;
+    size_t offset = 0;
+    while (offset + 2U < target_length) {
+        long_payload[offset++] = 'a';
+        long_payload[offset++] = '/';
+    }
+    long_payload[offset++] = 'a';
+    long_payload[offset] = '\0';
+
+    container_fd = open(container_path,
+                         O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open path-limit container");
+    root = root_spec("PATH", source_path, long_payload);
+    request.roots = &root;
+    check(portable_capture_fresh_at(container_fd, &request) != 0,
+          "a physical payload path exceeding PATH_MAX refuses capture");
+    data_fd = openat(container_fd, "data",
+                     O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    check(data_fd >= 0 &&
+              relative_directory_is_empty(data_fd, long_payload),
+          "PATH_MAX refusal leaves no payload child");
+    if (data_fd >= 0)
+        close(data_fd);
+    close(container_fd);
+    free(long_payload);
+    remove_tree(source_path);
+    remove_tree_fd(container_path);
 }
 
 static int live_kind(SidecarLog *log, const char *root, const char *logical,
@@ -723,6 +1116,9 @@ int main(void)
 
     test_entry_helpers(source_path);
     test_append_physical();
+    test_encoded_payload_names(root_path);
+    test_nested_encoded_directories(root_path);
+    test_name_and_path_limits(root_path);
     test_fresh_capture(source_path, container_fd, container_path);
     test_replacement_and_type_change(source_path, root_path);
     test_unsupported_types(source_path, root_path);

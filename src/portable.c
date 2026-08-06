@@ -16,6 +16,7 @@
 #include <signal.h>
 #include <unistd.h>
 
+#include "encoding.h"
 #include "metadata.h"
 
 typedef struct {
@@ -34,9 +35,11 @@ typedef struct {
 } PortableVisited;
 
 #define VISITED_INITIAL_CAPACITY 16U
+#define PORTABLE_MAX_READBACK_NAMES SIDECAR_MAX_LIVE_ENTRIES
 
 #ifdef PORTABLE_CAPTURE_TEST_HOOKS
 static uint64_t portable_test_probe_count;
+static uint64_t portable_test_readback_scan_count;
 
 static void visited_count_probe(void)
 {
@@ -53,8 +56,30 @@ void portable_capture_test_reset_probe_count(void)
 {
     portable_test_probe_count = 0;
 }
+
+uint64_t portable_capture_test_readback_scan_count(void)
+{
+    return portable_test_readback_scan_count;
+}
+
+void portable_capture_test_reset_readback_scan_count(void)
+{
+    portable_test_readback_scan_count = 0;
+}
 #else
 static void visited_count_probe(void)
+{
+}
+#endif
+
+#ifdef PORTABLE_CAPTURE_TEST_HOOKS
+static void portable_readback_scan_count(void)
+{
+    if (portable_test_readback_scan_count != UINT64_MAX)
+        portable_test_readback_scan_count++;
+}
+#else
+static void portable_readback_scan_count(void)
 {
 }
 #endif
@@ -427,6 +452,123 @@ static int xattrs_reserve(PortableXattrs *xattrs, size_t extra)
     xattrs->items = items;
     xattrs->capacity = capacity;
     return 0;
+}
+
+typedef struct {
+    char **names;
+    size_t count;
+    size_t capacity;
+} PendingReadbackNames;
+
+static void pending_readback_names_free(PendingReadbackNames *pending)
+{
+    if (pending == NULL)
+        return;
+    for (size_t index = 0; index < pending->count; index++)
+        free(pending->names[index]);
+    free(pending->names);
+    memset(pending, 0, sizeof(*pending));
+}
+
+static int pending_readback_names_reserve(PendingReadbackNames *pending,
+                                          size_t extra)
+{
+    if (pending == NULL ||
+        extra > PORTABLE_MAX_READBACK_NAMES - pending->count)
+        return -1;
+    size_t needed = pending->count + extra;
+    if (needed <= pending->capacity)
+        return 0;
+
+    size_t capacity = pending->capacity == 0 ? 16U : pending->capacity * 2U;
+    if (capacity < needed)
+        capacity = needed;
+    if (capacity > PORTABLE_MAX_READBACK_NAMES)
+        capacity = PORTABLE_MAX_READBACK_NAMES;
+    if (capacity > SIZE_MAX / sizeof(*pending->names))
+        return -1;
+
+    char **names = realloc(pending->names, capacity * sizeof(*names));
+    if (names == NULL)
+        return -1;
+    memset(names + pending->capacity, 0,
+           (capacity - pending->capacity) * sizeof(*names));
+    pending->names = names;
+    pending->capacity = capacity;
+    return 0;
+}
+
+static int pending_readback_names_add(PendingReadbackNames *pending,
+                                      const char *name)
+{
+    if (pending == NULL || name == NULL ||
+        pending_readback_names_reserve(pending, 1) != 0)
+        return -1;
+    size_t length = strlen(name);
+    char *copy = malloc(length + 1U);
+    if (copy == NULL)
+        return -1;
+    memcpy(copy, name, length + 1U);
+    pending->names[pending->count++] = copy;
+    return 0;
+}
+
+static int encoded_name_has_raw_high_byte(const char *encoded)
+{
+    if (encoded == NULL)
+        return 0;
+    for (size_t index = 0; encoded[index] != '\0'; index++)
+        if ((unsigned char)encoded[index] >= 0x80U)
+            return 1;
+    return 0;
+}
+
+static int verify_pending_readback_names(int destination_fd,
+                                         const PendingReadbackNames *pending)
+{
+    if (destination_fd < 0 || pending == NULL)
+        return -1;
+    if (pending->count == 0)
+        return 0;
+
+    unsigned char *found = calloc(pending->count, sizeof(*found));
+    if (found == NULL)
+        return -1;
+    int scan_fd = duplicate_fd(destination_fd);
+    DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
+    if (directory == NULL) {
+        if (scan_fd >= 0)
+            close(scan_fd);
+        free(found);
+        return -1;
+    }
+    portable_readback_scan_count();
+
+    int failed = 0;
+    for (;;) {
+        errno = 0;
+        struct dirent *entry = readdir(directory);
+        if (entry == NULL) {
+            if (errno != 0)
+                failed = 1;
+            break;
+        }
+        for (size_t index = 0; index < pending->count; index++) {
+            if (!found[index] &&
+                strcmp(entry->d_name, pending->names[index]) == 0) {
+                found[index] = 1;
+                break;
+            }
+        }
+    }
+    if (closedir(directory) != 0)
+        failed = 1;
+    for (size_t index = 0; index < pending->count; index++)
+        if (!found[index]) {
+            failed = 1;
+        }
+    free(found);
+    return failed ? -1 : 0;
 }
 
 static int collect_xattrs(int fd, PortableXattrs *out)
@@ -1323,6 +1465,7 @@ typedef struct {
     PortableCaptureContext *context;
     const char *root_id;
     PortableVisited live_paths;
+    PortableVisited physical_directories;
     PortableVisited seen_paths;
     InventoryOrphans orphans;
     int orphan_root;
@@ -1341,12 +1484,6 @@ static int inventory_live_callback(const SidecarLiveView *view, void *argument)
             (SidecarBytes){ (const unsigned char *)inventory->root_id,
                             strlen(inventory->root_id) }))
         return 0;
-    if (!sidecar_bytes_equal(view->entry->logical_path,
-                             view->entry->physical_path)) {
-        inventory->failed = 1;
-        return 1;
-    }
-
     char *physical = NULL;
     if (sidecar_bytes_to_text(view->entry->physical_path, &physical) != 0) {
         inventory->failed = 1;
@@ -1354,12 +1491,20 @@ static int inventory_live_callback(const SidecarLiveView *view, void *argument)
     }
     int inserted = visited_add(&inventory->live_paths, inventory->root_id,
                                physical);
-    free(physical);
     if (inserted != 0) {
         inventory->failed = 1;
+        free(physical);
+        return 1;
+    }
+    if (view->entry->kind == SIDECAR_KIND_DIRECTORY &&
+        visited_add(&inventory->physical_directories, inventory->root_id,
+                    physical) != 0) {
+        inventory->failed = 1;
+        free(physical);
         return 1;
     }
     inventory->live_count++;
+    free(physical);
     return 0;
 }
 
@@ -1382,6 +1527,28 @@ static int inventory_scan_node(InventoryState *inventory,
                                 }, key, &live_view);
     if (live < 0)
         return -1;
+    SidecarObjectKind expected_kind = SIDECAR_KIND_REGULAR;
+    if (live == 1 &&
+        sidecar_bytes_equal(live_view.entry->physical_path, key))
+        expected_kind = live_view.entry->kind;
+    else {
+        int physical_present = visited_contains(&inventory->live_paths,
+                                                inventory->root_id, relative);
+        if (physical_present < 0)
+            return -1;
+        if (physical_present == 1) {
+            int is_directory = visited_contains(
+                &inventory->physical_directories, inventory->root_id,
+                relative);
+            if (is_directory < 0)
+                return -1;
+            live = 1;
+            expected_kind = is_directory == 1 ? SIDECAR_KIND_DIRECTORY :
+                                                SIDECAR_KIND_REGULAR;
+        } else if (live == 1) {
+            live = 0;
+        }
+    }
     if (live == 0) {
         int deleted = sidecar_log_find_deleted(
             inventory->context->sidecar,
@@ -1404,7 +1571,7 @@ static int inventory_scan_node(InventoryState *inventory,
 
     if (visited_add(&inventory->seen_paths, inventory->root_id, relative) != 0)
         return -1;
-    if ((live_view.entry->kind == SIDECAR_KIND_DIRECTORY) !=
+    if ((expected_kind == SIDECAR_KIND_DIRECTORY) !=
         (S_ISDIR(st.st_mode) != 0))
         return -1;
     if (!S_ISDIR(st.st_mode))
@@ -1485,6 +1652,7 @@ static int reconcile_inventory(PortableCaptureContext *context,
     inventory.context = context;
     inventory.root_id = root->id;
     inventory.live_paths.hash_salt = sidecar_process_salt();
+    inventory.physical_directories.hash_salt = inventory.live_paths.hash_salt;
     inventory.seen_paths.hash_salt = inventory.live_paths.hash_salt;
 
     SidecarStatus status = sidecar_log_foreach(context->sidecar,
@@ -1501,6 +1669,7 @@ static int reconcile_inventory(PortableCaptureContext *context,
         if (errno == ENOENT && inventory.live_count == 0) {
             inventory_orphans_free(&inventory.orphans);
             visited_dispose(&inventory.live_paths);
+            visited_dispose(&inventory.physical_directories);
             visited_dispose(&inventory.seen_paths);
             return 0;
         }
@@ -1535,6 +1704,7 @@ static int reconcile_inventory(PortableCaptureContext *context,
 
     inventory_orphans_free(&inventory.orphans);
     visited_dispose(&inventory.live_paths);
+    visited_dispose(&inventory.physical_directories);
     visited_dispose(&inventory.seen_paths);
     return 0;
 
@@ -1547,6 +1717,7 @@ close_fail:
 fail:
     inventory_orphans_free(&inventory.orphans);
     visited_dispose(&inventory.live_paths);
+    visited_dispose(&inventory.physical_directories);
     visited_dispose(&inventory.seen_paths);
     return -1;
 }
@@ -1697,6 +1868,7 @@ static int capture_directory(PortableCaptureContext *context,
                              const struct stat *before, int destination_fd,
                              PortableXattrs *xattrs)
 {
+    PendingReadbackNames pending = {0};
     int scan_fd = duplicate_fd(source_fd);
     DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
     if (directory == NULL) {
@@ -1724,10 +1896,39 @@ static int capture_directory(PortableCaptureContext *context,
             failed = 1;
             break;
         }
-        if (capture_node(context, root, child_logical, child_logical,
-                         source_fd,
-                         entry->d_name, NULL, destination_fd,
-                         entry->d_name) != 0) {
+
+        char encoded_leaf[NAME_MAX + 1U];
+        if (encoding_percent_encode(ENCODING_MODE_COMPONENT, entry->d_name,
+                                    encoded_leaf, sizeof(encoded_leaf)) != 0) {
+            failed = 1;
+            break;
+        }
+
+        char child_physical[SIDECAR_MAX_PATH + 1U];
+        if (append_physical(child_physical, sizeof(child_physical), physical,
+                            encoded_leaf) != 0) {
+            failed = 1;
+            break;
+        }
+
+        size_t payload_root_length = strlen(root->payload_path);
+        size_t physical_length = strlen(child_physical);
+        /* Keep this arithmetic in sync with replay_payload_path_build(). */
+        if (payload_root_length == 0 || payload_root_length >= PATH_MAX ||
+            physical_length > PATH_MAX - payload_root_length - 1U) {
+            failed = 1;
+            break;
+        }
+
+        if (encoded_name_has_raw_high_byte(encoded_leaf) &&
+            pending_readback_names_add(&pending, encoded_leaf) != 0) {
+            failed = 1;
+            break;
+        }
+
+        if (capture_node(context, root, child_logical, child_physical,
+                         source_fd, entry->d_name, NULL, destination_fd,
+                         encoded_leaf) != 0) {
             failed = 1;
             break;
         }
@@ -1740,9 +1941,12 @@ static int capture_directory(PortableCaptureContext *context,
                     !metadata_source_unchanged(before, &after)))
         failed = 1;
 
+    if (!failed && verify_pending_readback_names(destination_fd, &pending) != 0)
+        failed = 1;
     if (close(source_fd) != 0)
         failed = 1;
     if (failed) {
+        pending_readback_names_free(&pending);
         xattrs_free(xattrs);
         close(destination_fd);
         return -1;
@@ -1753,10 +1957,12 @@ static int capture_directory(PortableCaptureContext *context,
                         context->nsec_exact,
                         xattrs, &sidecar_entry, NULL) != 0 ||
         append_group(context, &sidecar_entry, xattrs) != 0) {
+        pending_readback_names_free(&pending);
         xattrs_free(xattrs);
         close(destination_fd);
         return -1;
     }
+    pending_readback_names_free(&pending);
     xattrs_free(xattrs);
     return close(destination_fd) == 0 ? 0 : -1;
 }

@@ -37,6 +37,8 @@
 
 extern uint64_t portable_capture_test_probe_count(void);
 extern void portable_capture_test_reset_probe_count(void);
+extern uint64_t portable_capture_test_readback_scan_count(void);
+extern void portable_capture_test_reset_readback_scan_count(void);
 
 static int failures;
 
@@ -81,17 +83,24 @@ static void remove_tree(const char *path)
         fixture_fatal("could not walk fixture tree");
 }
 
-static int make_fixture_file(int source_fd, unsigned int index)
+static int make_named_fixture_file(int source_fd, const char *name)
 {
-    char name[32];
-    int length = snprintf(name, sizeof(name), "entry-%05u", index);
-    if (length < 0 || (size_t)length >= sizeof(name))
+    if (name == NULL)
         return -1;
     int fd = openat(source_fd, name,
                     O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     if (fd < 0)
         return -1;
     return close(fd);
+}
+
+static int make_fixture_file(int source_fd, unsigned int index)
+{
+    char name[32];
+    int length = snprintf(name, sizeof(name), "entry-%05u", index);
+    if (length < 0 || (size_t)length >= sizeof(name))
+        return -1;
+    return make_named_fixture_file(source_fd, name);
 }
 
 static PortableRootSpec root_spec(const char *source)
@@ -150,8 +159,11 @@ int main(void)
 
     PortableRootSpec root = root_spec(source_path);
     portable_capture_test_reset_probe_count();
+    portable_capture_test_reset_readback_scan_count();
     check(portable_capture_root(&context, &root) == 0,
           "capture of 20,000-file fixture succeeds");
+    check(portable_capture_test_readback_scan_count() == 0,
+          "ASCII-only directory skips destination read-back");
     check(sidecar_log_live_count(&sidecar) == SCALE_ENTRY_COUNT + 1U,
           "visited set admits the root and every child exactly once");
 
@@ -162,6 +174,18 @@ int main(void)
           "visited probes remain bounded linearly");
     check(probes < (count * count) / UINT64_C(1000),
           "visited probes remain far below quadratic work");
+
+    static const char *utf8_names[] = { "日本", "ç", "🙂", "また" };
+    for (size_t index = 0;
+         index < sizeof(utf8_names) / sizeof(utf8_names[0]); index++)
+        if (make_named_fixture_file(source_fd, utf8_names[index]) != 0)
+            fixture_fatal("could not create UTF-8 scale fixture file");
+
+    portable_capture_test_reset_readback_scan_count();
+    check(portable_capture_root(&context, &root) == 0,
+          "mixed ASCII and UTF-8 fixture captures successfully");
+    check(portable_capture_test_readback_scan_count() == 1,
+          "UTF-8 names trigger one batched destination read-back");
 
     portable_capture_context_close(&context);
     check(sidecar_log_close(&sidecar) == SIDECAR_STATUS_OK,

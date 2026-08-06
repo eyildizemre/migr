@@ -309,6 +309,50 @@ static void test_resume_skips_and_replaces(const char *base)
     close(container_fd);
 }
 
+static void test_encoded_resume(const char *base)
+{
+    printf(BLUE "::" NC " resume skip for an encoded payload leaf\n");
+    char source_path[PATH_MAX];
+    char container_path[PATH_MAX];
+    join_path(source_path, sizeof(source_path), base, "encoded-resume-source");
+    join_path(container_path, sizeof(container_path), base,
+              "encoded-resume-container");
+    make_directory(source_path);
+
+    char source_file[PATH_MAX];
+    join_path(source_file, sizeof(source_file), source_path, "question?name");
+    write_file(source_file, "encoded");
+
+    PortableRootSpec root = root_spec("ENCODED", source_path, "ENCODED");
+    PortableCaptureRequest request = request_for(&root, "a1e");
+    int container_fd = -1;
+    check(fresh_capture(container_path, &request, &container_fd) == 0,
+          "encoded-name fixture is captured before resume");
+    if (container_fd < 0)
+        return;
+
+    char payload_path[PATH_MAX];
+    join_path(payload_path, sizeof(payload_path), container_path,
+              "data/ENCODED/question%3Fname");
+    char slot_path[PATH_MAX];
+    join_path(slot_path, sizeof(slot_path), container_path,
+              SIDECAR_SLOT_NAME);
+    struct stat payload_before;
+    struct stat sidecar_before;
+    check(lstat(payload_path, &payload_before) == 0 &&
+              file_equals(payload_path, "encoded") &&
+              stat(slot_path, &sidecar_before) == 0,
+          "encoded payload and sidecar exist before resume");
+
+    check(portable_capture_resume_at(container_fd, &request) == 0,
+          "resume accepts an unchanged encoded source");
+    struct stat payload_after;
+    check(lstat(payload_path, &payload_after) == 0 &&
+              payload_after.st_ino == payload_before.st_ino,
+          "unchanged encoded payload is skipped in place");
+    close(container_fd);
+}
+
 static int prepare_symlink_replacement(const char *base, const char *label,
                                        PortableRootSpec *root,
                                        PortableCaptureRequest *request,
@@ -842,6 +886,7 @@ int main(void)
         fixture_fatal("could not create fixture root");
 
     test_resume_skips_and_replaces(base);
+    test_encoded_resume(base);
     test_symlink_resume(base);
     test_missing_sidecar(base);
     test_nonempty_without_sidecar(base);
