@@ -442,8 +442,9 @@ in G), so no single phase carries "make everything faithful at once."
   the representation and fail-closed boundaries defined by D18. The real
   Arch/Ubuntu/Fedora VM-gate matrix passed, including the expected Fedora
   symlink-xattr refusal at the Phase E boundary.
-- **Phase D — Illegal filenames + pre-scan.** Encode on disk, true name in record;
-  `NAME_MAX` handling for expanded names; the up-front unrepresentable-name report.
+- **Phase D — Illegal filenames + pre-scan.** **Status: in progress (2026-08-06,
+  D19).** Encode on disk, true name in record; `NAME_MAX` and `PATH_MAX` handling
+  for expanded names; the up-front unrepresentable-name report.
 - **Phase E — xattrs / ACLs.** Native `setxattr`; portable sub-records; distinguish
   absent / unsupported / denied / error.
 - **Phase F — Case collisions.** Deterministic, `readdir`-order-independent suffix.

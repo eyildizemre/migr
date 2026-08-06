@@ -931,3 +931,136 @@ so the live-key-to-payload-node invariant remains universal. It extends D7's
 fail-closed xattr rule to symlinks, remains subject to D14's empirical
 representation and test-only-dispatch boundary, and leaves hardlinks to Phase
 G, illegal-name encoding to Phase D, and xattr replay to Phase E.
+
+---
+
+## D19 — 2026-08-06 — Portable illegal-filename handling: encode on disk, true name in the record
+
+**Status:** Decided — Phase D implementation pending
+
+**Decision:** A portable payload node is written under a percent-encoded name,
+while the sidecar keeps the true name. The logical path contains the original
+bytes and is the only path restore writes to the destination; the physical path
+contains the encoded name and exists only inside the payload tree. A mandatory
+read-only pre-scan reports every name that cannot be represented before any
+payload bytes are written. An unrepresentable name refuses the run by default;
+it is never silently skipped.
+
+### N-1 — Component safe set
+
+The encoding scheme is byte-oriented and injective: every byte outside the
+safe set becomes `%XX` with uppercase hexadecimal, and `%` itself is always
+encoded as `%25`. The payload safe set differs from the manifest's because it
+describes filename validity rather than line-parsing safety:
+
+- `/` is never safe. It cannot occur in a single `readdir` name, but allowing
+  it through would create an unintended directory component in the physical
+  path.
+- `.` is safe inside a component, but a component whose last byte is `.` has
+  that byte encoded as `%2E`. Encoding only the final byte prevents a
+  destination that strips trailing dots from changing the name.
+- Well-formed UTF-8 sequences pass through unencoded. Invalid UTF-8 is
+  escaped, including overlong forms, lone continuation bytes, truncated
+  sequences, surrogates, and code points beyond U+10FFFF.
+
+### N-2 — Encoded names and `NAME_MAX`
+
+The length limit applies to the encoded component, because escaping can
+triple its byte length. A component whose encoded form exceeds `NAME_MAX`
+refuses the run by default; it is never silently skipped, since a skipped
+entry would make the backup appear complete while being incomplete.
+
+### N-3 — Logical and physical paths
+
+The logical path is the original name and is the only path restore writes to a
+destination; POSIX destinations accept every byte. The physical path is the
+encoded name and is meaningful only relative to the payload tree. Visited-set
+and live-map keys remain logical, so encoding does not change resume or
+reconciliation identity.
+
+### N-4 — Binding physical to logical
+
+Replay re-encodes the logical path and verifies that the result is byte-for-byte
+identical to the recorded physical path, refusing the entry otherwise. The
+sidecar is untrusted input: path validation alone proves only that a physical
+path remains below the payload root, not that it names the node corresponding
+to the logical path. Because the encoder produced the physical path, malformed
+escapes are covered by this equality check and replay needs no decoder; the
+destination name always comes from the logical path.
+
+### N-5 — Mandatory pre-scan
+
+Before capture writes anything, a read-only pass maps every name and produces
+an unrepresentable-name report. The report contains a total and a bounded set
+of examples, each identifying the violated limit and the amount by which it is
+violated. The pass cannot be disabled. A later interface may suppress a
+confirmation prompt, but it may not suppress the scan.
+
+### N-6 — One encoding scheme, two safe sets
+
+The encoder and decoder live in one shared module used by both the manifest and
+the portable payload. The safe set is selected by an explicit mode argument;
+there is no implicit default. One implementation prevents the two copies from
+drifting apart, while the explicit mode prevents a caller from accidentally
+inheriting the wrong safe set.
+
+### N-7 — Test-only boundary
+
+All Phase D encoding and pre-scan behaviour remains behind the existing
+test-only portable seam. Production dispatch to the portable representation
+stays closed.
+
+### N-8 — Encoded paths and `PATH_MAX`
+
+A tree whose individual components fit `NAME_MAX` can still exceed `PATH_MAX`
+after encoding and joining. Capture checks the complete payload path, including
+the payload root, and refuses by default on overflow. This is a separate
+refusal class from the encoded-component `NAME_MAX` limit and is reported
+separately.
+
+### N-9 — The written name is verified, not predicted
+
+After creating a payload node, capture reads the name back from its parent
+directory and compares it byte-for-byte with the intended physical name. This
+verification makes UTF-8 pass-through safe without expanding the capability
+probe's raw-name corpus: it catches Unicode normalisation and any other
+destination-side name transformation that was not anticipated.
+
+### Scope boundary
+
+Native capture and restore are untouched: native destinations accept every
+byte, and no native path is encoded. Case-insensitive destinations may still
+map two distinct encoded names onto one node; the pre-scan detects that case
+collision and refuses by default, while resolving it with a disambiguating
+suffix remains part of the case-collision work. Encoding interacts with xattrs,
+hardlinks, and sparse files, but those concerns remain in their respective
+phases. A user-confirmed path that proceeds past an unrepresentable name is
+out of scope; supporting it would require the container to record its own
+incompleteness so restore could report it.
+
+**Why:** Portable payloads need names that survive filesystems with stricter
+filename rules without losing the original names that users must see on
+restore. Keeping logical and physical paths separate lets the payload use a
+validated, injective representation while the sidecar remains authoritative
+for the destination name. The mandatory pre-scan and fail-closed refusal keep
+an unsupported tree from being published as a complete backup, and read-back
+verification checks the destination's actual behaviour rather than assuming
+that a capability label predicts every name transformation.
+
+**Rejected:** reusing the manifest's safe set unchanged, because it leaves a
+trailing `.` untouched and escapes every non-ASCII byte, turning an ordinary
+28-character Japanese name into a `NAME_MAX` overflow (three bytes per
+character, three characters per escaped byte); adding a non-ASCII case to the
+raw-name capability corpus, because that corpus selects the representation and
+would turn a probe result into a blanket refusal while portable dispatch is
+closed; and skipping unrepresentable names with a final warning, because the
+resulting container would look complete while silently omitting data.
+
+**Relationship:** D19 builds on D17's grammar, where logical and physical paths
+are already separate fields (which capture has so far kept identical), and
+applies D14's test-only boundary and fail-closed representation policy. It
+follows D18's rule that a representation gap refuses rather than silently
+dropping data, while making the physical-name encoding and mandatory pre-scan
+explicit for the portable payload. Native metadata, xattrs, hardlinks, sparse
+layout, and production portable dispatch remain governed by their existing
+decisions and later phase boundaries.
