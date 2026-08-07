@@ -35,6 +35,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <sys/xattr.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -235,6 +236,13 @@ static int same_core_times(const struct stat *actual, const struct stat *expecte
 static int same_mode(const struct stat *actual, const struct stat *expected)
 {
     return (actual->st_mode & 07777) == (expected->st_mode & 07777);
+}
+
+static int xattr_is_absent(const char *path, const char *name)
+{
+    errno = 0;
+    ssize_t length = getxattr(path, name, NULL, 0);
+    return length < 0 && errno == ENODATA;
 }
 
 static void set_metadata(const char *path, mode_t mode,
@@ -683,6 +691,56 @@ static void test_foreign_ownership_gap(void)
     remove_tree(base);
 }
 
+static void test_native_xattr_not_copied(void)
+{
+    const char *case_name = "xattr";
+    char base[PATH_MAX], source_root[PATH_MAX], capture_root[PATH_MAX];
+    char restore_root[PATH_MAX], source_path[PATH_MAX], capture_path[PATH_MAX];
+    char restore_path[PATH_MAX];
+    make_temp_root(base, sizeof(base));
+    join_or_die(source_root, sizeof(source_root), base, "source");
+    join_or_die(capture_root, sizeof(capture_root), base, "capture");
+    join_or_die(restore_root, sizeof(restore_root), base, "restore");
+    if (mkdir(source_root, 0700) != 0 || mkdir(capture_root, 0700) != 0 ||
+        mkdir(restore_root, 0700) != 0)
+        fatal("could not create the xattr roots");
+    join_or_die(source_path, sizeof(source_path), source_root, "entry");
+    write_file(source_path, "has-an-xattr");
+    if (setxattr(source_path, "user.migr_test", "value", 5, 0) != 0)
+    {
+        if (errno == ENOTSUP || errno == EOPNOTSUPP ||
+            errno == EPERM || errno == EACCES)
+        {
+            skip_case(case_name, "this filesystem does not support user xattrs");
+            remove_tree(base);
+            return;
+        }
+        fatal("could not create the xattr fixture");
+    }
+
+    int capture_fd = open_directory(capture_root);
+    check_result(backup_capture_at(&BACKUP_CTX, source_path,
+                                   capture_fd, "entry") == 0,
+                 case_name, "capture result");
+    close(capture_fd);
+    join_or_die(capture_path, sizeof(capture_path), capture_root, "entry");
+    check_result(xattr_is_absent(capture_path, "user.migr_test"), case_name,
+                 "captured payload carries no source xattr (today's baseline)");
+
+    int source_fd = open_directory(capture_root);
+    int restore_fd = open_directory(restore_root);
+    check_result(restore_native_at(&RESTORE_CTX, source_fd, "entry",
+                                   restore_fd, "entry") == 0,
+                 case_name, "restore result");
+    close(source_fd);
+    close(restore_fd);
+    join_or_die(restore_path, sizeof(restore_path), restore_root, "entry");
+    check_result(xattr_is_absent(restore_path, "user.migr_test"), case_name,
+                 "restored destination carries no source xattr (today's baseline)");
+
+    remove_tree(base);
+}
+
 static void test_capture_recopies_without_nsec_exact(void)
 {
     const char *case_name = "coarse";
@@ -793,6 +851,7 @@ int main(void)
     test_capture_recopies_without_nsec_exact();
     test_metadata_helper_failure_paths();
     test_foreign_ownership_gap();
+    test_native_xattr_not_copied();
 
     if (failures != 0)
     {

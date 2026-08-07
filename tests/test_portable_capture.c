@@ -781,6 +781,79 @@ static void test_entry_helpers(const char *source)
     check(entries_equal(&entry, &view, &empty_xattrs) == 0,
           "entries_equal rejects different symlink targets");
 
+    SidecarXattr previous_one[] = {
+        { .name = bytes("user.a"), .value = bytes("one") }
+    };
+    SidecarXattr current_one[] = {
+        { .name = bytes("user.a"), .value = bytes("one") }
+    };
+    PortableXattrs current_one_xattrs = {
+        .items = current_one,
+        .count = 1,
+        .capacity = 1
+    };
+    SidecarLiveView xattr_view = {
+        .entry = &previous,
+        .xattrs = previous_one,
+        .xattr_count = 1,
+        .generation = 0
+    };
+    entry = previous;
+    check(entries_equal(&entry, &xattr_view, &current_one_xattrs) != 0,
+          "entries_equal accepts an identical xattr");
+
+    SidecarXattr changed_value[] = {
+        { .name = bytes("user.a"), .value = bytes("two") }
+    };
+    PortableXattrs changed_value_xattrs = {
+        .items = changed_value,
+        .count = 1,
+        .capacity = 1
+    };
+    check(entries_equal(&entry, &xattr_view, &changed_value_xattrs) == 0,
+          "entries_equal rejects a changed xattr value");
+
+    SidecarXattr changed_name[] = {
+        { .name = bytes("user.b"), .value = bytes("one") }
+    };
+    PortableXattrs changed_name_xattrs = {
+        .items = changed_name,
+        .count = 1,
+        .capacity = 1
+    };
+    check(entries_equal(&entry, &xattr_view, &changed_name_xattrs) == 0,
+          "entries_equal rejects a changed xattr name");
+
+    SidecarXattr current_pair[] = {
+        { .name = bytes("user.a"), .value = bytes("one") },
+        { .name = bytes("user.b"), .value = bytes("two") }
+    };
+    PortableXattrs current_pair_xattrs = {
+        .items = current_pair,
+        .count = 2,
+        .capacity = 2
+    };
+    check(entries_equal(&entry, &xattr_view, &current_pair_xattrs) == 0,
+          "entries_equal rejects a different xattr count");
+
+    SidecarXattr previous_pair[] = {
+        { .name = bytes("user.a"), .value = bytes("one") },
+        { .name = bytes("user.b"), .value = bytes("two") }
+    };
+    SidecarXattr swapped_pair[] = {
+        { .name = bytes("user.b"), .value = bytes("two") },
+        { .name = bytes("user.a"), .value = bytes("one") }
+    };
+    PortableXattrs swapped_pair_xattrs = {
+        .items = swapped_pair,
+        .count = 2,
+        .capacity = 2
+    };
+    xattr_view.xattrs = previous_pair;
+    xattr_view.xattr_count = 2;
+    check(entries_equal(&entry, &xattr_view, &swapped_pair_xattrs) != 0,
+          "entries_equal accepts the same xattrs in a different order");
+
     if (unlink(link_path) != 0)
         fixture_fatal("could not remove symlink helper fixture");
 }
