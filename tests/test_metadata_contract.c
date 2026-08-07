@@ -238,6 +238,16 @@ static int same_mode(const struct stat *actual, const struct stat *expected)
     return (actual->st_mode & 07777) == (expected->st_mode & 07777);
 }
 
+static int same_applied_metadata(const struct stat *left,
+                                 const struct stat *right)
+{
+    return left->st_mode == right->st_mode &&
+           left->st_uid == right->st_uid &&
+           left->st_gid == right->st_gid &&
+           same_timespec(left->st_atim, right->st_atim) &&
+           same_timespec(left->st_mtim, right->st_mtim);
+}
+
 static int xattr_is_absent(const char *path, const char *name)
 {
     errno = 0;
@@ -833,6 +843,76 @@ static void test_metadata_helper_failure_paths(void)
     remove_tree(base);
 }
 
+static void test_metadata_apply_split_equivalence(void)
+{
+    const char *case_name = "split";
+    char base[PATH_MAX], file_legacy[PATH_MAX], file_split[PATH_MAX];
+    char link_legacy[PATH_MAX], link_split[PATH_MAX];
+    make_temp_root(base, sizeof(base));
+    join_or_die(file_legacy, sizeof(file_legacy), base, "file-legacy");
+    join_or_die(file_split, sizeof(file_split), base, "file-split");
+    join_or_die(link_legacy, sizeof(link_legacy), base, "link-legacy");
+    join_or_die(link_split, sizeof(link_split), base, "link-split");
+
+    write_file(file_legacy, "split-equivalence");
+    write_file(file_split, "split-equivalence");
+    set_metadata(file_legacy, 0640, regular_times, 0);
+    set_metadata(file_split, 0640, regular_times, 0);
+    if (symlink("split-target", link_legacy) != 0 ||
+        symlink("split-target", link_split) != 0)
+        fatal("could not create split-equivalence symlinks");
+    set_metadata(link_legacy, 0777, symlink_times, 1);
+    set_metadata(link_split, 0777, symlink_times, 1);
+
+    struct stat desired_file, desired_link;
+    if (lstat(file_legacy, &desired_file) != 0 ||
+        lstat(link_legacy, &desired_link) != 0)
+        fatal("could not inspect split-equivalence fixtures");
+
+    MetadataTimestampPolicy policy = { .nsec_exact = 1, .configured = 1 };
+    int file_legacy_fd = open(file_legacy, O_RDWR | O_CLOEXEC);
+    int file_split_fd = open(file_split, O_RDWR | O_CLOEXEC);
+    if (file_legacy_fd < 0 || file_split_fd < 0)
+        fatal("could not open split-equivalence files");
+    check_result(metadata_apply_fd(file_legacy_fd, &desired_file, policy) == 0,
+                 case_name, "fd wrapper result");
+    check_result(metadata_apply_ownership_and_mode_fd(file_split_fd,
+                                                      &desired_file) == 0 &&
+                 metadata_apply_times_fd(file_split_fd, &desired_file,
+                                         policy) == 0,
+                 case_name, "fd split result");
+    if (close(file_legacy_fd) != 0 || close(file_split_fd) != 0)
+        fatal("could not close split-equivalence files");
+
+    struct stat file_legacy_st, file_split_st;
+    if (lstat(file_legacy, &file_legacy_st) != 0 ||
+        lstat(file_split, &file_split_st) != 0)
+        fatal("could not inspect split-equivalence file results");
+    check_result(same_applied_metadata(&file_legacy_st, &file_split_st),
+                 case_name, "fd results are equivalent");
+
+    int root_fd = open_directory(base);
+    check_result(metadata_apply_symlink_at(root_fd, "link-legacy", &desired_link,
+                                           policy) == 0,
+                 case_name, "symlink wrapper result");
+    check_result(metadata_apply_symlink_ownership_at(root_fd, "link-split",
+                                                     &desired_link) == 0 &&
+                 metadata_apply_symlink_times_at(root_fd, "link-split",
+                                                 &desired_link, policy) == 0,
+                 case_name, "symlink split result");
+    if (close(root_fd) != 0)
+        fatal("could not close split-equivalence root");
+
+    struct stat link_legacy_st, link_split_st;
+    if (lstat(link_legacy, &link_legacy_st) != 0 ||
+        lstat(link_split, &link_split_st) != 0)
+        fatal("could not inspect split-equivalence symlink results");
+    check_result(same_applied_metadata(&link_legacy_st, &link_split_st),
+                 case_name, "symlink results are equivalent");
+
+    remove_tree(base);
+}
+
 int main(void)
 {
     printf(BLUE "::" NC " native file-kind metadata contract (entry gate)\n");
@@ -850,6 +930,7 @@ int main(void)
         run_matrix_case(&cases[i]);
     test_capture_recopies_without_nsec_exact();
     test_metadata_helper_failure_paths();
+    test_metadata_apply_split_equivalence();
     test_foreign_ownership_gap();
     test_native_xattr_not_copied();
 

@@ -97,8 +97,17 @@ int metadata_symlink_unchanged(const struct stat *before,
 
 int metadata_apply_fd(int fd, const struct stat *desired,
                       MetadataTimestampPolicy policy);
+int metadata_apply_ownership_and_mode_fd(int fd,
+                                         const struct stat *desired);
+int metadata_apply_times_fd(int fd, const struct stat *desired,
+                            MetadataTimestampPolicy policy);
 int metadata_apply_symlink_at(int dir_fd, const char *leaf,
                               const struct stat *desired,
                               MetadataTimestampPolicy policy);
+int metadata_apply_symlink_ownership_at(int dir_fd, const char *leaf,
+                                        const struct stat *desired);
+int metadata_apply_symlink_times_at(int dir_fd, const char *leaf,
+                                    const struct stat *desired,
+                                    MetadataTimestampPolicy policy);
 
 #endif

@@ -427,17 +427,22 @@ static int metadata_stat_core_matches(const struct stat *actual,
            same_timespec(actual->st_mtim, mtime);
 }
 
-int metadata_apply_fd(int fd, const struct stat *desired,
-                      MetadataTimestampPolicy policy)
+int metadata_apply_ownership_and_mode_fd(int fd, const struct stat *desired)
 {
     if (fd < 0 || desired == NULL)
         return -1;
-
     if (fchown(fd, desired->st_uid, desired->st_gid) != 0)
         return -1;
     if (fchmod(fd, desired->st_mode & 07777) != 0)
         return -1;
+    return 0;
+}
 
+int metadata_apply_times_fd(int fd, const struct stat *desired,
+                            MetadataTimestampPolicy policy)
+{
+    if (fd < 0 || desired == NULL)
+        return -1;
     struct timespec times[2] = {
         metadata_canonical_time(desired->st_atim, policy),
         metadata_canonical_time(desired->st_mtim, policy)
@@ -456,14 +461,30 @@ int metadata_apply_fd(int fd, const struct stat *desired,
     return 0;
 }
 
-int metadata_apply_symlink_at(int dir_fd, const char *leaf,
-                              const struct stat *desired,
-                              MetadataTimestampPolicy policy)
+int metadata_apply_fd(int fd, const struct stat *desired,
+                      MetadataTimestampPolicy policy)
+{
+    if (metadata_apply_ownership_and_mode_fd(fd, desired) != 0)
+        return -1;
+    return metadata_apply_times_fd(fd, desired, policy);
+}
+
+int metadata_apply_symlink_ownership_at(int dir_fd, const char *leaf,
+                                        const struct stat *desired)
 {
     if (dir_fd < 0 || leaf == NULL || desired == NULL)
         return -1;
     if (fchownat(dir_fd, leaf, desired->st_uid, desired->st_gid,
                  AT_SYMLINK_NOFOLLOW) != 0)
+        return -1;
+    return 0;
+}
+
+int metadata_apply_symlink_times_at(int dir_fd, const char *leaf,
+                                    const struct stat *desired,
+                                    MetadataTimestampPolicy policy)
+{
+    if (dir_fd < 0 || leaf == NULL || desired == NULL)
         return -1;
 
     struct timespec times[2] = {
@@ -485,6 +506,15 @@ int metadata_apply_symlink_at(int dir_fd, const char *leaf,
         return -1;
     }
     return 0;
+}
+
+int metadata_apply_symlink_at(int dir_fd, const char *leaf,
+                              const struct stat *desired,
+                              MetadataTimestampPolicy policy)
+{
+    if (metadata_apply_symlink_ownership_at(dir_fd, leaf, desired) != 0)
+        return -1;
+    return metadata_apply_symlink_times_at(dir_fd, leaf, desired, policy);
 }
 
 int metadata_snapshot_matches(const MetadataSnapshot *snapshot,
