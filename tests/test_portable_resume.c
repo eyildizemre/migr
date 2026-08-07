@@ -309,6 +309,21 @@ static void test_resume_skips_and_replaces(const char *base)
     close(container_fd);
 }
 
+static int regular_xattr_fixture_available(void)
+{
+    char base[] = "/tmp/migr_portable_resume_xattr_XXXXXX";
+    int fd = mkstemp(base);
+    if (fd < 0)
+        return 0;
+    close(fd);
+    int available = 1;
+    if (setxattr(base, "user.migr_resume", "x", 1, 0) != 0 &&
+        (errno == ENOTSUP || errno == EOPNOTSUPP || errno == EPERM))
+        available = 0;
+    unlink(base);
+    return available;
+}
+
 /*
  * Answers "does this entry's live xattr set consist of exactly these
  * name/value pairs?" for a single-entry root. Returns 1 on exact match
@@ -380,21 +395,7 @@ static void test_resume_xattr_equivalence(const char *base)
 {
     printf(BLUE "::" NC " resume xattr equivalence (added/changed/removed)\n");
 
-    /* Probe filesystem xattr support once; user.* only (fixtures run
-     * unprivileged). Reuses the existing idiom from the SIGKILL cases:
-     * unsupported -> skip, don't fail. */
-    int xattr_available = 1;
-    char xattr_probe[] = "/tmp/migr_resume_xattr_probe_XXXXXX";
-    int probe_fd = mkstemp(xattr_probe);
-    if (probe_fd >= 0)
-    {
-        close(probe_fd);
-        if (setxattr(xattr_probe, "user.migr_resume", "x", 1, 0) != 0 &&
-            (errno == ENOTSUP || errno == EOPNOTSUPP || errno == EPERM))
-            xattr_available = 0;
-        unlink(xattr_probe);
-    }
-    if (!xattr_available)
+    if (!regular_xattr_fixture_available())
     {
         skip_check("xattr resume fixture unavailable on this filesystem");
         return;
@@ -868,16 +869,7 @@ static void test_sigkill_boundaries(const char *base)
           SIDECAR_TEST_MID_ENTRY_COMMIT }
     };
 
-    int xattr_available = 1;
-    char xattr_probe[] = "/tmp/migr_portable_resume_xattr_XXXXXX";
-    int probe_fd = mkstemp(xattr_probe);
-    if (probe_fd >= 0) {
-        close(probe_fd);
-        if (setxattr(xattr_probe, "user.migr_resume", "x", 1, 0) != 0 &&
-            (errno == ENOTSUP || errno == EOPNOTSUPP || errno == EPERM))
-            xattr_available = 0;
-        unlink(xattr_probe);
-    }
+    int xattr_available = regular_xattr_fixture_available();
     for (size_t index = 0; index < sizeof(cases) / sizeof(cases[0]); index++) {
         if (!xattr_available && strcmp(cases[index].label, "xattr-middle") == 0) {
             skip_check("xattr interruption fixture unavailable on this filesystem");
@@ -911,6 +903,16 @@ static void test_sigkill_boundaries(const char *base)
               "a killed capture remains resumable");
         check(file_equals(root.capture_path, "after"),
               "source remains intact after interruption recovery");
+        if (strcmp(cases[index].label, "xattr-middle") == 0)
+        {
+            const char *const names[1] = { "user.migr_resume" };
+            const char *const values[1] = { "value" };
+            check(live_xattr_set_exact(container_fd, "ROOT", "",
+                                       names, values, 1),
+                  "xattr set is exact after a mid-XATTR SIGKILL: "
+                  "the half-written record did not survive and the "
+                  "completed record is present");
+        }
         close(container_fd);
         free((void *)root.capture_path);
     }
@@ -934,6 +936,60 @@ static int symlink_xattr_fixture_available(void)
     if (unlink(link_path) != 0 || rmdir(base) != 0)
         fixture_fatal("could not remove symlink xattr probe");
     return available;
+}
+
+static void test_stale_xattr_interruption(const char *base)
+{
+    printf(BLUE "::" NC " stale xattr does not survive a mid-XATTR SIGKILL\n");
+    if (!regular_xattr_fixture_available())
+    {
+        skip_check("xattr interruption fixture unavailable on this filesystem");
+        return;
+    }
+
+    char source_path[PATH_MAX];
+    char container_path[PATH_MAX];
+    join_path(source_path, sizeof(source_path), base, "stale-xattr-source");
+    join_path(container_path, sizeof(container_path), base,
+              "stale-xattr-container");
+    make_directory(source_path);
+    char source_file[PATH_MAX];
+    join_path(source_file, sizeof(source_file), source_path, "file");
+    write_file(source_file, "content");
+    if (setxattr(source_file, "user.migr_stale", "old", 3, 0) != 0)
+        fixture_fatal("could not plant the stale xattr fixture");
+
+    PortableRootSpec root = root_spec("ROOT", source_file, "ROOT");
+    PortableCaptureRequest request = request_for(&root, "c2");
+    int container_fd = -1;
+    check(fresh_capture(container_path, &request, &container_fd) == 0,
+          "predecessor is committed with the stale xattr");
+    if (container_fd < 0)
+        return;
+
+    /* Replace the source's xattr set: the stale attribute is removed and a
+     * fresh one added, so the interrupted run still has an XATTR record to
+     * write (SIDECAR_TEST_MID_XATTR only fires while one is being written). */
+    if (removexattr(source_file, "user.migr_stale") != 0 ||
+        setxattr(source_file, "user.migr_fresh", "new", 3, 0) != 0)
+        fixture_fatal("could not switch the source xattr set");
+
+    check(run_resume_interrupt(container_fd, &request,
+                               PORTABLE_TEST_INTERRUPT_NONE,
+                               SIDECAR_TEST_MID_XATTR) == 0,
+          "resume is killed mid-XATTR-record");
+    portable_capture_test_set_interrupt(PORTABLE_TEST_INTERRUPT_NONE);
+    sidecar_test_set_interrupt(SIDECAR_TEST_INTERRUPT_NONE);
+    check(portable_capture_resume_at(container_fd, &request, NULL) == 0,
+          "interrupted resume recovers");
+
+    const char *const names[1] = { "user.migr_fresh" };
+    const char *const values[1] = { "new" };
+    check(live_xattr_set_exact(container_fd, "ROOT", "",
+                               names, values, 1),
+          "live set is exactly the fresh attribute after recovery "
+          "(stale attribute gone, no partial leftover)");
+    close(container_fd);
 }
 
 static void test_symlink_sigkill_boundaries(const char *base)
@@ -1049,6 +1105,7 @@ int main(void)
     test_unsafe_sidecar(base);
     test_truncated_tail(base);
     test_sigkill_boundaries(base);
+    test_stale_xattr_interruption(base);
     test_symlink_sigkill_boundaries(base);
     test_identity_mismatch(base);
 
