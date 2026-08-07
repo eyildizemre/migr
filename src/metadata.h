@@ -59,6 +59,19 @@ typedef struct MetadataSnapshots {
     size_t capacity;
 } MetadataSnapshots;
 
+enum {
+    METADATA_XATTR_NS_USER     = 1u << 0,
+    METADATA_XATTR_NS_SECURITY = 1u << 1,
+    METADATA_XATTR_NS_SYSTEM   = 1u << 2,
+    METADATA_XATTR_NS_TRUSTED  = 1u << 3
+};
+
+typedef struct {
+    unsigned int regular_namespaces;
+    unsigned int directory_namespaces;
+    unsigned int symlink_namespaces;
+} MetadataXattrRequirements;
+
 void metadata_profiles_init(MetadataProfiles *profiles);
 void metadata_profiles_free(MetadataProfiles *profiles);
 int metadata_profiles_add(MetadataProfiles *profiles, int anchor_fd,
@@ -68,6 +81,10 @@ int metadata_profiles_add(MetadataProfiles *profiles, int anchor_fd,
 int metadata_profiles_probe(const MetadataProfiles *profiles,
                             MetadataTimestampPolicy policy);
 void metadata_profiles_report(const MetadataProfiles *profiles);
+int metadata_xattr_capability_probe(
+    int anchor_fd, const MetadataXattrRequirements *required);
+int metadata_xattr_namespaces_fd(int fd, unsigned int *out);
+int metadata_xattr_namespaces_path(const char *path, unsigned int *out);
 
 #ifdef METADATA_TEST_HOOKS
 typedef void (*MetadataTestProbeHook)(void *context);

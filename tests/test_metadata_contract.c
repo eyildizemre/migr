@@ -284,6 +284,71 @@ static int xattr_value_equals(const char *path, const char *name,
     return matches;
 }
 
+static size_t count_named_probe_entries(const char *root)
+{
+    DIR *dir = opendir(root);
+    if (dir == NULL)
+        fatal("could not scan the xattr probe fixture root");
+
+    size_t count = 0;
+    for (;;)
+    {
+        errno = 0;
+        struct dirent *entry = readdir(dir);
+        if (entry == NULL)
+        {
+            if (errno != 0)
+            {
+                closedir(dir);
+                fatal("could not read the xattr probe fixture root");
+            }
+            break;
+        }
+        if (strncmp(entry->d_name, ".migr-xattr-probe-", 18) == 0)
+            count++;
+    }
+    if (closedir(dir) != 0)
+        fatal("could not close the xattr probe fixture root");
+    return count;
+}
+
+static size_t count_entries(const char *root)
+{
+    DIR *dir = opendir(root);
+    if (dir == NULL)
+        fatal("could not scan the restore fixture root");
+
+    size_t count = 0;
+    for (;;)
+    {
+        errno = 0;
+        struct dirent *entry = readdir(dir);
+        if (entry == NULL)
+        {
+            if (errno != 0)
+            {
+                closedir(dir);
+                fatal("could not read the restore fixture root");
+            }
+            break;
+        }
+        if (strcmp(entry->d_name, ".") != 0 &&
+            strcmp(entry->d_name, "..") != 0)
+            count++;
+    }
+    if (closedir(dir) != 0)
+        fatal("could not close the restore fixture root");
+    return count;
+}
+
+static int make_shm_root(char *path, size_t path_size)
+{
+    int length = snprintf(path, path_size, "/dev/shm/migr_metadata_gate_XXXXXX");
+    if (length < 0 || (size_t)length >= path_size)
+        return 0;
+    return mkdtemp(path) != NULL;
+}
+
 static void set_metadata(const char *path, mode_t mode,
                          const struct timespec times[2], int nofollow)
 {
@@ -758,6 +823,16 @@ static void test_native_xattrs_captured(void)
         }
         fatal("could not create the xattr fixture");
     }
+    unsigned int source_namespaces = 0;
+    if (metadata_xattr_namespaces_path(source_path, &source_namespaces) != 0)
+        fatal("could not inspect the xattr fixture namespaces");
+    if ((source_namespaces & METADATA_XATTR_NS_SECURITY) != 0)
+    {
+        skip_case(case_name,
+                  "automatic security labels are outside this xattr round-trip fixture");
+        remove_tree(base);
+        return;
+    }
 
     int capture_fd = open_directory(capture_root);
     check_result(backup_capture_at(&BACKUP_CTX, source_path,
@@ -1006,6 +1081,206 @@ static void test_metadata_helper_failure_paths(void)
     remove_tree(base);
 }
 
+static int xattr_probe_fixture_unavailable(int value)
+{
+    return value == EINVAL || value == ENOTSUP || value == EOPNOTSUPP ||
+           value == ENOSYS || value == EPERM || value == EACCES;
+}
+
+static void test_metadata_xattr_capability_probe(void)
+{
+    const char *case_name = "xattr-gate";
+    char base[PATH_MAX];
+    if (!make_shm_root(base, sizeof(base)))
+    {
+        skip_case(case_name, "a private tmpfs fixture is unavailable");
+        return;
+    }
+    int root_fd = open_directory(base);
+
+    MetadataXattrRequirements none = {0};
+    check_result(metadata_xattr_capability_probe(root_fd, &none) == 0,
+                 case_name, "no namespace flags are a true no-op");
+    check_result(count_named_probe_entries(base) == 0,
+                 case_name, "the no-op gate creates no scratch entry");
+
+    const struct {
+        const char *label;
+        MetadataXattrRequirements required;
+    } kinds[] = {
+        { "regular user namespace", {
+            .regular_namespaces = METADATA_XATTR_NS_USER
+        } },
+        { "directory user namespace", {
+            .directory_namespaces = METADATA_XATTR_NS_USER
+        } },
+        { "symlink user namespace", {
+            .symlink_namespaces = METADATA_XATTR_NS_USER
+        } }
+    };
+    for (size_t i = 0; i < sizeof(kinds) / sizeof(kinds[0]); i++)
+    {
+        errno = 0;
+        int result = metadata_xattr_capability_probe(root_fd,
+                                                     &kinds[i].required);
+        int saved_errno = errno;
+        if (result != 0 && xattr_probe_fixture_unavailable(saved_errno))
+            skip_case(case_name, kinds[i].label);
+        else
+            check_result(result == 0, case_name, kinds[i].label);
+        check_result(count_named_probe_entries(base) == 0,
+                     case_name, "the kind probe leaves no scratch entry");
+    }
+
+    check_result(close(root_fd) == 0, case_name,
+                 "the capability fixture fd closes cleanly");
+    remove_tree(base);
+}
+
+static void test_metadata_xattr_gate_no_unrelated_namespace(void)
+{
+    const char *case_name = "xattr-regression";
+    char base[PATH_MAX];
+    if (!make_shm_root(base, sizeof(base)))
+    {
+        skip_case(case_name, "a private tmpfs fixture is unavailable");
+        return;
+    }
+
+    char source_root[PATH_MAX], destination_root[PATH_MAX];
+    char source_path[PATH_MAX], destination_path[PATH_MAX];
+    join_or_die(source_root, sizeof(source_root), base, "source");
+    join_or_die(destination_root, sizeof(destination_root), base, "destination");
+    if (mkdir(source_root, 0700) != 0 || mkdir(destination_root, 0700) != 0)
+        fatal("could not create the xattr regression roots");
+    join_or_die(source_path, sizeof(source_path), source_root, "entry");
+    join_or_die(destination_path, sizeof(destination_path), destination_root,
+                "entry");
+    write_file(source_path, "xattr-regression");
+
+    unsigned int namespaces = 0;
+    if (metadata_xattr_namespaces_path(source_path, &namespaces) != 0)
+        fatal("could not inspect the xattr regression source");
+    if ((namespaces & (METADATA_XATTR_NS_SYSTEM |
+                       METADATA_XATTR_NS_TRUSTED)) != 0)
+    {
+        skip_case(case_name,
+                  "the fixture carries an unprobeable non-security namespace");
+        remove_tree(base);
+        return;
+    }
+    if ((namespaces & METADATA_XATTR_NS_SECURITY) == 0)
+    {
+        if (setxattr(source_path, "user.migr_regression", "user", 4, 0) != 0)
+        {
+            if (xattr_probe_fixture_unavailable(errno))
+                skip_case(case_name, "user xattrs are unavailable");
+            else
+                fatal("could not create the user-only regression fixture");
+            remove_tree(base);
+            return;
+        }
+        if (metadata_xattr_namespaces_path(source_path, &namespaces) != 0)
+            fatal("could not inspect the user-only regression source");
+    }
+
+    int source_fd = open_directory(source_root);
+    int destination_fd = open_directory(destination_root);
+    RestoreNativeReport report;
+    RestoreNativeStatus result = restore_native_at_report(
+        &RESTORE_CTX, source_fd, "entry", destination_fd, "entry", &report);
+    check_result(result == RESTORE_NATIVE_OK, case_name,
+                 (namespaces & METADATA_XATTR_NS_SECURITY) != 0
+                     ? "security-only payload is not refused by the capability gate"
+                     : "user-only payload succeeds without unrelated namespace probing");
+    check_result(file_equals(destination_path, "xattr-regression"), case_name,
+                 "the regression payload is restored");
+    check_result(report.failed_count == 0 && report.applied_count > 0,
+                 case_name, "the regression report is successful");
+    close(source_fd);
+    close(destination_fd);
+    remove_tree(base);
+}
+
+static void test_metadata_xattr_gate_trusted_refusal(void)
+{
+    const char *case_name = "xattr-trusted";
+    if (geteuid() == 0)
+    {
+        skip_case(case_name, "trusted namespace refusal needs a non-root process");
+        return;
+    }
+
+    char base[PATH_MAX];
+    if (!make_shm_root(base, sizeof(base)))
+    {
+        skip_case(case_name, "a private tmpfs fixture is unavailable");
+        return;
+    }
+    char source_root[PATH_MAX], destination_root[PATH_MAX];
+    char source_path[PATH_MAX], sentinel_path[PATH_MAX];
+    join_or_die(source_root, sizeof(source_root), base, "source");
+    join_or_die(destination_root, sizeof(destination_root), base, "destination");
+    if (mkdir(source_root, 0700) != 0 || mkdir(destination_root, 0700) != 0)
+        fatal("could not create the trusted xattr roots");
+    join_or_die(source_path, sizeof(source_path), source_root, "entry");
+    join_or_die(sentinel_path, sizeof(sentinel_path), destination_root,
+                "sentinel");
+    write_file(source_path, "trusted-payload");
+    if (setxattr(source_path, "trusted.migr_test", "trusted", 7, 0) != 0)
+    {
+        if (xattr_probe_fixture_unavailable(errno))
+            skip_case(case_name, "trusted xattrs are unavailable");
+        else
+            fatal("could not create the trusted xattr fixture");
+        remove_tree(base);
+        return;
+    }
+    unsigned int source_namespaces = 0;
+    if (metadata_xattr_namespaces_path(source_path, &source_namespaces) != 0)
+        fatal("could not inspect the trusted xattr fixture");
+    if ((source_namespaces & METADATA_XATTR_NS_TRUSTED) == 0)
+    {
+        skip_case(case_name,
+                  "the trusted fixture was not retained by the filesystem");
+        remove_tree(base);
+        return;
+    }
+
+    int destination_fd = open_directory(destination_root);
+    MetadataXattrRequirements required = {
+        .regular_namespaces = METADATA_XATTR_NS_TRUSTED
+    };
+    errno = 0;
+    int probe_result = metadata_xattr_capability_probe(destination_fd, &required);
+    int probe_errno = errno;
+    if (probe_result == 0)
+    {
+        skip_case(case_name, "the destination supports trusted xattrs");
+        close(destination_fd);
+        remove_tree(base);
+        return;
+    }
+    if (!xattr_probe_fixture_unavailable(probe_errno))
+        fatal("trusted capability probe failed unexpectedly");
+
+    write_file(sentinel_path, "untouched");
+    size_t before_entries = count_entries(destination_root);
+    int source_fd = open_directory(source_root);
+    RestoreNativeReport report;
+    RestoreNativeStatus result = restore_native_at_report(
+        &RESTORE_CTX, source_fd, "entry", destination_fd, "entry", &report);
+    check_result(result != RESTORE_NATIVE_OK, case_name,
+                 "unsupported trusted namespace refuses restore");
+    check_result(count_entries(destination_root) == before_entries, case_name,
+                 "trusted refusal creates no destination entry");
+    check_result(file_equals(sentinel_path, "untouched"), case_name,
+                 "trusted refusal leaves the sentinel untouched");
+    close(source_fd);
+    close(destination_fd);
+    remove_tree(base);
+}
+
 static void test_metadata_apply_split_equivalence(void)
 {
     const char *case_name = "split";
@@ -1093,6 +1368,9 @@ int main(void)
         run_matrix_case(&cases[i]);
     test_capture_recopies_without_nsec_exact();
     test_metadata_helper_failure_paths();
+    test_metadata_xattr_capability_probe();
+    test_metadata_xattr_gate_no_unrelated_namespace();
+    test_metadata_xattr_gate_trusted_refusal();
     test_metadata_apply_split_equivalence();
     test_foreign_ownership_gap();
     test_native_xattrs_captured();

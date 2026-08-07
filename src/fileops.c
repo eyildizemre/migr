@@ -1020,7 +1020,8 @@ static RestoreNativeStatus restore_entry_at(
     const CloneContext *ctx, RestorePass pass, int source_parent_fd,
     const char *source_leaf, int dest_parent_fd, const char *dest_leaf,
     const char *logical_path, MetadataSnapshots *snapshots,
-    MetadataProfiles *profiles, int metadata_anchor_fd,
+    MetadataProfiles *profiles, MetadataXattrRequirements *xattr_requirements,
+    int metadata_anchor_fd,
     int skip_symlink_target_read,
     RestoreNativeReport *restore_report)
 {
@@ -1094,6 +1095,22 @@ static RestoreNativeStatus restore_entry_at(
         {
             close(source_object_fd);
             return -1;
+        }
+
+        if (pass == RESTORE_VALIDATE && xattr_requirements != NULL)
+        {
+            char source_xattr_path[PATH_MAX];
+            unsigned int namespaces = 0;
+            if (metadata_symlink_xattr_path(source_parent_fd, source_leaf,
+                                            source_xattr_path,
+                                            sizeof(source_xattr_path)) != 0 ||
+                metadata_xattr_namespaces_path(source_xattr_path,
+                                               &namespaces) != 0)
+            {
+                close(source_object_fd);
+                return -1;
+            }
+            xattr_requirements->symlink_namespaces |= namespaces;
         }
 
         if (pass == RESTORE_VALIDATE && skip_symlink_target_read)
@@ -1190,6 +1207,16 @@ static RestoreNativeStatus restore_entry_at(
         }
         if (pass == RESTORE_VALIDATE)
         {
+            if (xattr_requirements != NULL)
+            {
+                unsigned int namespaces = 0;
+                if (metadata_xattr_namespaces_fd(src_fd, &namespaces) != 0)
+                {
+                    close(src_fd);
+                    return RESTORE_NATIVE_ERROR;
+                }
+                xattr_requirements->regular_namespaces |= namespaces;
+            }
             return close(src_fd) == 0 ? RESTORE_NATIVE_OK : RESTORE_NATIVE_ERROR;
         }
 
@@ -1335,6 +1362,17 @@ static RestoreNativeStatus restore_entry_at(
             return RESTORE_NATIVE_ERROR;
         }
 
+        if (pass == RESTORE_VALIDATE && xattr_requirements != NULL)
+        {
+            unsigned int namespaces = 0;
+            if (metadata_xattr_namespaces_fd(source_dir_fd, &namespaces) != 0)
+            {
+                close(source_dir_fd);
+                return RESTORE_NATIVE_ERROR;
+            }
+            xattr_requirements->directory_namespaces |= namespaces;
+        }
+
         int dest_dir_fd = open_destination_directory(pass, dest_parent_fd,
                                                      dest_leaf);
         if (dest_dir_fd == -1)
@@ -1377,7 +1415,8 @@ static RestoreNativeStatus restore_entry_at(
             RestoreNativeStatus child_status = restore_entry_at(
                 ctx, pass, source_dir_fd, entry->d_name, dest_dir_fd,
                 entry->d_name, child_logical_path, snapshots, profiles,
-                metadata_anchor_fd, skip_symlink_target_read, restore_report);
+                xattr_requirements, metadata_anchor_fd,
+                skip_symlink_target_read, restore_report);
             if (child_status != RESTORE_NATIVE_OK)
             {
                 failed = 1;
@@ -1575,7 +1614,7 @@ RestoreNativeStatus restore_native_preflight_at(
     int rc = restore_entry_at(ctx, RESTORE_VALIDATE, source_parent_fd,
                               source_leaf, dest_parent_fd, dest_leaf,
                               source_rel, &snapshots, &profiles,
-                              metadata_anchor_fd, 0, NULL);
+                              NULL, metadata_anchor_fd, 0, NULL);
     close(metadata_anchor_fd);
     close(source_parent_fd);
     if (dest_parent_fd >= 0)
@@ -1628,7 +1667,7 @@ RestoreNativeStatus restore_native_metadata_inventory_at(
     int rc = restore_entry_at(ctx, RESTORE_VALIDATE, source_parent_fd,
                               source_leaf, dest_parent_fd, dest_leaf,
                               source_rel, &snapshots, profiles,
-                              metadata_anchor_fd, 1, NULL);
+                              NULL, metadata_anchor_fd, 1, NULL);
     close(metadata_anchor_fd);
     close(source_parent_fd);
     if (dest_parent_fd >= 0)
@@ -1680,6 +1719,7 @@ RestoreNativeStatus restore_native_at_report(
 
     MetadataSnapshots snapshots;
     MetadataProfiles profiles;
+    MetadataXattrRequirements xattr_requirements = {0};
     metadata_snapshots_init(&snapshots);
     metadata_profiles_init(&profiles);
     int metadata_anchor_fd = destination_metadata_anchor(destination_root_fd,
@@ -1696,12 +1736,17 @@ RestoreNativeStatus restore_native_at_report(
     int rc = restore_entry_at(ctx, RESTORE_VALIDATE, source_parent_fd,
                               source_leaf, dest_parent_fd, dest_leaf,
                               source_rel, &snapshots, &profiles,
-                              metadata_anchor_fd, 0, report);
-    close(metadata_anchor_fd);
+                              &xattr_requirements, metadata_anchor_fd, 0,
+                              report);
     if (rc == 0 && !ctx->metadata_preflight_done &&
         metadata_profiles_probe(&profiles,
                                 metadata_policy_from_context(ctx)) != 0)
         rc = -1;
+    if (rc == 0 && !ctx->metadata_preflight_done &&
+        metadata_xattr_capability_probe(metadata_anchor_fd,
+                                        &xattr_requirements) != 0)
+        rc = -1;
+    close(metadata_anchor_fd);
 
     if (rc == 0)
     {
@@ -1718,7 +1763,7 @@ RestoreNativeStatus restore_native_at_report(
         rc = restore_entry_at(ctx, RESTORE_APPLY, source_parent_fd,
                               source_leaf, dest_parent_fd, dest_leaf,
                               source_rel, &snapshots, NULL,
-                              destination_root_fd, 0, report);
+                              NULL, destination_root_fd, 0, report);
     if (rc != RESTORE_NATIVE_OK && report->failed_count == 0)
         restore_report_failure(report, source_rel);
     close(source_parent_fd);
