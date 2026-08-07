@@ -26,6 +26,7 @@ extern int replay_stat_from_entry(const SidecarEntry *entry,
 
 #define GREEN "\033[0;32m"
 #define RED   "\033[0;31m"
+#define YELLOW "\033[0;33m"
 #define BLUE  "\033[0;34m"
 #define NC    "\033[0m"
 
@@ -250,7 +251,7 @@ static int fixture_open(Fixture *fixture, ManifestRoot *root)
 }
 
 static int append_entries(SidecarLog *log, const SidecarEntry *entries,
-                          size_t count)
+                          size_t count, const char *xattr_name)
 {
     for (size_t index = 0; index < count; index++)
     {
@@ -258,7 +259,8 @@ static int append_entries(SidecarLog *log, const SidecarEntry *entries,
                 SIDECAR_STATUS_OK ||
             (entries[index].xattr_count != 0 &&
              sidecar_log_append_xattr(log, &(SidecarXattr){
-                 .name = text_bytes("user.migr_test"),
+                 .name = text_bytes(xattr_name != NULL
+                                        ? xattr_name : "user.migr_test"),
                  .value = text_bytes("value")
              }) != SIDECAR_STATUS_OK) ||
             sidecar_log_append_entry_commit(log) != SIDECAR_STATUS_OK)
@@ -268,12 +270,13 @@ static int append_entries(SidecarLog *log, const SidecarEntry *entries,
 }
 
 static int write_sidecar(Fixture *fixture, const SidecarEntry *entries,
-                         size_t count, const SidecarDelete *deletion)
+                         size_t count, const SidecarDelete *deletion,
+                         const char *xattr_name)
 {
     SidecarLog log = {0};
     if (sidecar_log_create_at(fixture->container_fd, &log) !=
             SIDECAR_OPEN_FRESH ||
-        append_entries(&log, entries, count) != 0 ||
+        append_entries(&log, entries, count, xattr_name) != 0 ||
         (deletion != NULL && sidecar_log_append_delete(&log, deletion) !=
              SIDECAR_STATUS_OK) ||
         sidecar_log_close(&log) != SIDECAR_STATUS_OK)
@@ -356,7 +359,7 @@ static void test_symlink_collection_validation(void)
         make_dir_at(fixture.data_fd, "ROOT", 0700);
         write_file_at(fixture.data_fd, "ROOT/link", "");
         write_file_at(fixture.home_fd, "restored", "sentinel");
-        check(write_sidecar(&fixture, &entry, 1, NULL) == 0,
+        check(write_sidecar(&fixture, &entry, 1, NULL, NULL) == 0,
               "well-formed symlink sidecar is committed");
         PortableRestoreReplayReport report;
         int result = run_replay(&fixture, &report);
@@ -377,7 +380,7 @@ static void test_symlink_collection_validation(void)
     if (opened == 0)
     {
         make_dir_at(missing.data_fd, "ROOT", 0700);
-        check(write_sidecar(&missing, &entry, 1, NULL) == 0,
+        check(write_sidecar(&missing, &entry, 1, NULL, NULL) == 0,
               "missing-placeholder sidecar is committed");
         PortableRestoreReplayReport report;
         int result = run_replay(&missing, &report);
@@ -401,7 +404,7 @@ static void test_symlink_collection_validation(void)
                   "/container/data/ROOT/link");
         check(symlink(outside, payload_link) == 0,
               "payload placeholder symlink is planted");
-        check(write_sidecar(&redirected, &entry, 1, NULL) == 0,
+        check(write_sidecar(&redirected, &entry, 1, NULL, NULL) == 0,
               "payload-redirect sidecar is committed");
         PortableRestoreReplayReport report;
         int result = run_replay(&redirected, &report);
@@ -467,7 +470,7 @@ static void test_physical_logical_mismatch(void)
     SidecarEntry mismatch = entry_for(
         "ROOT", "innocuous.txt", "something-else.txt",
         SIDECAR_KIND_REGULAR, 7, 0644, 1700000000, 0, 1700000000, 0);
-    check(write_sidecar(&fixture, &mismatch, 1, NULL) == 0,
+    check(write_sidecar(&fixture, &mismatch, 1, NULL, NULL) == 0,
           "physical-mismatch sidecar is committed");
 
     PortableRestoreReplayReport report;
@@ -515,7 +518,7 @@ static void test_normal_replay(void)
                   SIDECAR_KIND_REGULAR, strlen("portable payload"), 0640,
                   1700000040, 333333333, 1700000050, 444444444)
     };
-    check(write_sidecar(&fixture, entries, 3, NULL) == 0,
+    check(write_sidecar(&fixture, entries, 3, NULL, NULL) == 0,
           "normal replay sidecar is committed");
     write_file_at(fixture.home_fd, "sentinel", "untouched");
     check(run_preflight(&fixture) == 0, "normal state passes preflight");
@@ -570,7 +573,7 @@ static void test_xattr_replay(void)
                   1700000102, 3, 1700000103, 4)
     };
     entries[1].xattr_count = 1;
-    check(write_sidecar(&fixture, entries, 2, NULL) == 0,
+    check(write_sidecar(&fixture, entries, 2, NULL, NULL) == 0,
           "xattr-bearing sidecar is committed");
     check(run_preflight(&fixture) == 0, "xattr state passes preflight");
 
@@ -612,7 +615,7 @@ static void test_xattr_reconciliation(void)
                   1700000102, 3, 1700000103, 4)
     };
     entries[1].xattr_count = 1;
-    check(write_sidecar(&fixture, entries, 2, NULL) == 0,
+    check(write_sidecar(&fixture, entries, 2, NULL, NULL) == 0,
           "xattr reconciliation sidecar is committed");
     check(run_preflight(&fixture) == 0, "xattr reconciliation passes preflight");
 
@@ -649,6 +652,95 @@ static void test_xattr_reconciliation(void)
     fixture_close(&fixture);
 }
 
+static void test_gate_refuses_trusted_before_mutation(void)
+{
+    printf(BLUE "::" NC " pre-mutation gate refuses a trusted.* payload\n");
+    if (geteuid() == 0)
+    {
+        printf(YELLOW "- " NC " trusted.* gate refusal skipped: running as root\n");
+        return;
+    }
+
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "gate-refusal fixture is created");
+    if (opened != 0)
+        return;
+
+    make_dir_at(fixture.data_fd, "ROOT", 0700);
+    write_file_at(fixture.data_fd, "ROOT/file", "payload");
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000100, 1, 1700000101, 2),
+        entry_for("ROOT", "file", "file", SIDECAR_KIND_REGULAR, 7, 0600,
+                  1700000102, 3, 1700000103, 4)
+    };
+    entries[1].xattr_count = 1;
+    check(write_sidecar(&fixture, entries, 2, NULL, "trusted.migr_test") == 0,
+          "trusted.* sidecar is committed");
+
+    char sentinel[PATH_MAX];
+    path_join(sentinel, sizeof(sentinel), fixture.home, "/sentinel");
+    write_file_at(fixture.home_fd, "sentinel", "untouched");
+
+    PortableRestoreReplayReport report;
+    int result = run_replay(&fixture, &report);
+    check(result != 0, "gate refuses a trusted.* payload");
+    check(report.applied_count == 0 && report.failed_count == 1,
+          "gate refusal applies nothing and reports one failure");
+    check(file_equals_noatime(sentinel, "untouched"),
+          "gate refusal leaves the destination sentinel untouched");
+
+    char restored_file[PATH_MAX];
+    path_join(restored_file, sizeof(restored_file), fixture.home,
+              "/restored/file");
+    check(access(restored_file, F_OK) != 0,
+          "gate refusal never creates the entry's destination path");
+    fixture_close(&fixture);
+}
+
+static void test_gate_allows_security_only(void)
+{
+    printf(BLUE "::" NC " pre-mutation gate does not refuse a security.*-only payload\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "security-only fixture is created");
+    if (opened != 0)
+        return;
+
+    make_dir_at(fixture.data_fd, "ROOT", 0700);
+    write_file_at(fixture.data_fd, "ROOT/file", "payload");
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000100, 1, 1700000101, 2),
+        entry_for("ROOT", "file", "file", SIDECAR_KIND_REGULAR, 7, 0600,
+                  1700000102, 3, 1700000103, 4)
+    };
+    entries[1].xattr_count = 1;
+    check(write_sidecar(&fixture, entries, 2, NULL, "security.selinux") == 0,
+          "security.*-only sidecar is committed");
+
+    PortableRestoreReplayReport report;
+    int result = run_replay(&fixture, &report);
+
+    char restored_file[PATH_MAX];
+    path_join(restored_file, sizeof(restored_file), fixture.home,
+              "/restored/file");
+    /*
+     * The gate must not refuse a security.*-only payload (the probe masks
+     * that namespace out). The apply itself may still fail on hosts where
+     * writing an arbitrary security.* value is policy-refused -- so assert
+     * specifically that replay got past the gate and into replay_run: the
+     * destination tree was created. Do not assert overall success.
+     */
+    check(access(restored_file, F_OK) == 0,
+          "security.*-only payload passes the gate and reaches replay");
+    (void)result;
+    fixture_close(&fixture);
+}
+
 static void test_payload_swap(void)
 {
     printf(BLUE "::" NC " per-entry payload revalidation\n");
@@ -669,7 +761,7 @@ static void test_payload_swap(void)
         entry_for("ROOT", "file", "file", SIDECAR_KIND_REGULAR, 8, 0600,
                   1700000102, 3, 1700000103, 4)
     };
-    check(write_sidecar(&fixture, entries, 3, NULL) == 0,
+    check(write_sidecar(&fixture, entries, 3, NULL, NULL) == 0,
           "payload-swap sidecar is committed");
     check(run_preflight(&fixture) == 0, "payload-swap state passes preflight");
 
@@ -724,7 +816,7 @@ static void test_tombstone_skipped(void)
         .root_id = text_bytes("ROOT"),
         .logical_path = text_bytes("deleted")
     };
-    check(write_sidecar(&fixture, entries, 2, &deletion) == 0,
+    check(write_sidecar(&fixture, entries, 2, &deletion, NULL) == 0,
           "tombstone sidecar is committed");
     check(run_preflight(&fixture) == 0,
           "tombstoned state passes preflight without payload");
@@ -746,6 +838,8 @@ int main(void)
     test_normal_replay();
     test_xattr_replay();
     test_xattr_reconciliation();
+    test_gate_refuses_trusted_before_mutation();
+    test_gate_allows_security_only();
     test_payload_swap();
     test_tombstone_skipped();
     printf("%s%s%s\n", failures == 0 ? GREEN : RED,

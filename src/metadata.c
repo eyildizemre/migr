@@ -651,17 +651,36 @@ static int metadata_xattr_names_read(const MetadataXattrTarget *target,
     return 0;
 }
 
+unsigned int metadata_xattr_namespace_bytes(const unsigned char *name,
+                                            size_t length)
+{
+    static const struct {
+        const char *prefix;
+        size_t prefix_length;
+        unsigned int bit;
+    } prefixes[] = {
+        { "user.", 5, METADATA_XATTR_NS_USER },
+        { "security.", 9, METADATA_XATTR_NS_SECURITY },
+        { "system.", 7, METADATA_XATTR_NS_SYSTEM },
+        { "trusted.", 8, METADATA_XATTR_NS_TRUSTED }
+    };
+    if (name == NULL)
+        return 0;
+    for (size_t index = 0;
+         index < sizeof(prefixes) / sizeof(prefixes[0]); index++)
+        if (length >= prefixes[index].prefix_length &&
+            memcmp(name, prefixes[index].prefix,
+                   prefixes[index].prefix_length) == 0)
+            return prefixes[index].bit;
+    return 0;
+}
+
 static unsigned int metadata_xattr_namespace(const char *name)
 {
-    if (strncmp(name, "user.", 5) == 0)
-        return METADATA_XATTR_NS_USER;
-    if (strncmp(name, "security.", 9) == 0)
-        return METADATA_XATTR_NS_SECURITY;
-    if (strncmp(name, "system.", 7) == 0)
-        return METADATA_XATTR_NS_SYSTEM;
-    if (strncmp(name, "trusted.", 8) == 0)
-        return METADATA_XATTR_NS_TRUSTED;
-    return 0;
+    if (name == NULL)
+        return 0;
+    return metadata_xattr_namespace_bytes((const unsigned char *)name,
+                                          strlen(name));
 }
 
 static int metadata_xattr_namespaces_target(const MetadataXattrTarget *target,

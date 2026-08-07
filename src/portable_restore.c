@@ -95,6 +95,7 @@ typedef struct {
     int destination_home_fd;
     MetadataTimestampPolicy timestamp_policy;
     PortableRestoreReplayReport *report;
+    MetadataXattrRequirements xattr_requirements;
 } ReplayCollection;
 
 static void *preflight_alloc(PreflightMemory *memory, size_t size)
@@ -1714,6 +1715,30 @@ static int replay_collect_entry(const SidecarLiveView *view, void *argument)
     replay->entry = entry;
     replay->xattrs = view->xattrs;
     replay->xattr_count = view->xattr_count;
+    /*
+     * Accumulate the xattr namespace requirements for the pre-mutation
+     * capability gate (D20 E-9). The sidecar's xattr names are not
+     * NUL-terminated, so the length-aware classifier is required; and the
+     * security.* bit is kept for the matrix but masked out by the probe
+     * itself (METADATA_XATTR_NS_PROBED), so no branch is needed here.
+     */
+    if (view->xattr_count != 0)
+    {
+        unsigned int *kind_namespaces =
+            entry->kind == SIDECAR_KIND_REGULAR
+                ? &collection->xattr_requirements.regular_namespaces
+                : entry->kind == SIDECAR_KIND_DIRECTORY
+                    ? &collection->xattr_requirements.directory_namespaces
+                    : entry->kind == SIDECAR_KIND_SYMLINK
+                        ? &collection->xattr_requirements.symlink_namespaces
+                        : NULL;
+        if (kind_namespaces != NULL)
+            for (size_t xindex = 0; xindex < view->xattr_count; xindex++)
+                *kind_namespaces |=
+                    metadata_xattr_namespace_bytes(
+                        view->xattrs[xindex].name.data,
+                        view->xattrs[xindex].name.length);
+    }
     replay->root_index = root_index;
     replay->depth = replay_path_depth(replay->destination);
     collection->count++;
@@ -2459,9 +2484,25 @@ int portable_restore_replay_at(const PortableRestoreRequest *request,
     SidecarStatus status = sidecar_log_foreach(&sidecar,
                                                replay_collect_entry,
                                                &collection);
-    if (status == SIDECAR_STATUS_OK)
-        status = replay_run(&collection);
+    /* Past this point the failure carrier is a plain 0/-1, not a
+     * SidecarStatus: neither the capability gate below nor replay_run
+     * reports a sidecar-log condition, so neither has an honest
+     * SidecarStatus to return. */
     int result = status == SIDECAR_STATUS_OK ? 0 : -1;
+    /*
+     * Pre-mutation xattr capability gate (D20 E-9). A single probe at the
+     * destination home cannot observe a subtree on a different mount with
+     * different xattr support (e.g. ~/usb on vfat under an ext4 home);
+     * such a failure surfaces later through E-3's fail-closed partial
+     * result, exactly the class D20 E-9's closing paragraph assigns to
+     * post-gate failures.
+     */
+    if (result == 0 &&
+        metadata_xattr_capability_probe(collection.destination_home_fd,
+                                        &collection.xattr_requirements) != 0)
+        result = -1;
+    if (result == 0)
+        result = replay_run(&collection);
     if (sidecar_log_close(&sidecar) != SIDECAR_STATUS_OK)
         result = -1;
     if (close(collection.data_fd) != 0)

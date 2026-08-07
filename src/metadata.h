@@ -86,6 +86,14 @@ int metadata_xattr_capability_probe(
 int metadata_xattr_namespaces_fd(int fd, unsigned int *out);
 int metadata_xattr_namespaces_path(const char *path, unsigned int *out);
 
+/*
+ * Length-aware xattr namespace classifier for non-NUL-terminated names
+ * (sidecar SidecarBytes). The four namespace prefixes live only here;
+ * metadata.c's NUL-terminated wrapper shares this implementation.
+ */
+unsigned int metadata_xattr_namespace_bytes(const unsigned char *name,
+                                            size_t length);
+
 #ifdef METADATA_TEST_HOOKS
 typedef void (*MetadataTestProbeHook)(void *context);
 
