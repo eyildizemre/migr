@@ -447,11 +447,12 @@ in G), so no single phase carries "make everything faithful at once."
   destination-measured case-collision detection. The real Arch/Ubuntu/Fedora
   VM-gate matrix passed, including the expected Fedora portable xattr refusal at
   the Phase E boundary.
-- **Phase E — xattrs / ACLs.** **Status: in progress (2026-08-07, D20).**
-  Native and portable generic exact-set xattr/ACL capture and replay; a
-  pre-mutation capability gate refuses unsupported destinations before any
-  payload write; a security.* transplant carries a documented, unenforced
-  semantic-risk caveat.
+- **Phase E — xattrs / ACLs.** **Status: complete (2026-08-08).** Native and
+  portable generic exact-set xattr/ACL capture and replay landed, with a
+  pre-mutation capability gate that refuses unsupported destinations before
+  any payload write and the documented `security.*` semantic-risk boundary.
+  The real Arch/Ubuntu/Fedora VM-gate matrix passed, including a real
+  xattr-capable ext4 loopback destination rather than only vfat.
 - **Phase F — Case collisions.** Deterministic, `readdir`-order-independent suffix.
 - **Phase G — Hardlinks.** `(st_dev, st_ino)` grouping; native `link()` / portable dense
   copy; space accounting in the pre-scan.

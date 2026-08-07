@@ -1110,7 +1110,7 @@ new nor a Phase D regression.
 
 ## D20 — 2026-08-07 — Portable and native xattr/ACL handling: generic capture and replay, no framework-specific code
 
-**Status:** Decided — Phase E implementation pending
+**Status:** Implemented (Phase E closed 2026-08-08; as-built notes below)
 
 **Decision:** Both portable and native destinations capture and replay
 every extended attribute through the generic `getxattr`/`setxattr` family,
@@ -1325,3 +1325,38 @@ object kind, and to the pre-mutation capability gate's own existence.
 Hardlink xattr-sharing remains Phase G's concern, and the `security.*`
 cross-policy semantic risk noted in E-10 is left to a future, not-yet-
 designed user-confirmed skip mechanism rather than solved here.
+
+### As-built (Phase E, 2026-08-08)
+
+Native capture, native restore, portable capture, and portable replay now
+reconcile the destination's extended-attribute set exactly against the
+source's in both directions, including removal of an attribute present only
+at the destination. The pre-mutation capability gate refuses an invocation
+before any payload write when a required object-kind and namespace combination
+is unusable at the destination. The host suite and `make check` (strict GCC
+and Clang, sanitizers, Valgrind, and `-fanalyzer`) passed on Arch, Ubuntu, and
+Fedora against `f563623`, with no compiler diagnostics and no Valgrind errors.
+
+The VM gate also exercised a real ext4 loopback destination: `user.*` values
+round-tripped byte-for-byte for both a regular file and a directory, and a
+stale destination attribute was removed by the next replay. A payload carrying 
+extended attributes was refused before any mutation against a real vfat loopback
+destination, leaving zero destination residue. On Fedora, an automatic
+`security.selinux` label round-tripped byte-for-byte, including on a symlink;
+this proved E-4's ordinary-symlink rule against a real label rather than a
+synthetic host fixture.
+
+E-8's two halves were both proven in the VM gate. Running as root, a stale
+`security.*` attribute absent from the payload was genuinely removed, while
+Fedora's own `security.selinux` remained non-removable even for root and was
+tolerated as the documented `EACCES` case. The test first established that
+root could set, read, and remove an arbitrary `security.*` name on ext4 and
+tmpfs on all three distributions, so the removal proof was measured rather
+than assumed. Production portable dispatch remains disabled under D14; all
+of these paths are reachable only through the existing test-only seam.
+
+This implementation supersedes D18 C-8's temporary rule that a symlink entry
+with `xattr_count != 0` is rejected until Phase E. Symlink extended attributes
+are now replayed through the no-follow `l*` family under E-3's ordinary
+fail-closed rule; D18 C-8 and the Phase C/D as-built records remain unchanged
+as historical entries.

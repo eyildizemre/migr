@@ -167,10 +167,9 @@ the production behaviour — a failed backup is safer than a silent metadata los
 Portable capture and replay also handle symlinks behind the same D14 test-only
 seam: the payload contains an empty regular placeholder while the sidecar
 record carries the target and core metadata, so the target is never written into
-the payload. Symlink xattrs are collected, but replay refuses an entry that has
-any until Phase E implements xattr replay; this is a deliberate fail-closed
-boundary rather than silent metadata loss. Production portable dispatch remains
-disabled at this stage.
+the payload. Symlink xattrs are collected and replayed through the no-follow
+`l*` family, with exact-set reconciliation and the same fail-closed rules as
+other object kinds. Production portable dispatch remains disabled at this stage.
 
 Portable payload names are percent-encoded on disk while the sidecar preserves
 the true logical name; restore always creates that logical name, never a decoded
