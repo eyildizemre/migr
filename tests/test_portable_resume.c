@@ -309,6 +309,161 @@ static void test_resume_skips_and_replaces(const char *base)
     close(container_fd);
 }
 
+/*
+ * Answers "does this entry's live xattr set consist of exactly these
+ * name/value pairs?" for a single-entry root. Returns 1 on exact match
+ * (count included), 0 otherwise. view.xattrs is borrowed from the open
+ * log, so the check happens before sidecar_log_close.
+ */
+static int live_xattr_set_exact(int container_fd, const char *root_id,
+                                const char *logical,
+                                const char *const *names,
+                                const char *const *values, size_t count)
+{
+    SidecarLog log = {0};
+    if (sidecar_log_adopt_at(container_fd, &log) != SIDECAR_OPEN_RESUMABLE)
+        return 0;
+    SidecarLiveView view;
+    int found = sidecar_log_find(
+        &log,
+        (SidecarBytes){ (const unsigned char *)root_id, strlen(root_id) },
+        (SidecarBytes){ (const unsigned char *)logical, strlen(logical) },
+        &view);
+    if (found != 1 || view.entry == NULL)
+    {
+        (void)sidecar_log_close(&log);
+        return 0;
+    }
+    /* Count only user.* xattrs: an SELinux-enabled host auto-assigns
+     * security.selinux on every object, which capture faithfully records
+     * (D20 E-1) but which is not part of what this test asserts. */
+    size_t user_count = 0;
+    for (size_t index = 0; index < view.xattr_count; index++)
+        if (view.xattrs[index].name.length >= 5 &&
+            memcmp(view.xattrs[index].name.data, "user.", 5) == 0)
+            user_count++;
+    if (user_count != count)
+    {
+        (void)sidecar_log_close(&log);
+        return 0;
+    }
+    int exact = 1;
+    for (size_t index = 0; index < count; index++)
+    {
+        int matched = 0;
+        for (size_t candidate = 0; candidate < view.xattr_count; candidate++)
+        {
+            const SidecarXattr *xattr = &view.xattrs[candidate];
+            if (xattr->name.length < 5 ||
+                memcmp(xattr->name.data, "user.", 5) != 0)
+                continue;
+            size_t name_length = strlen(names[index]);
+            size_t value_length = strlen(values[index]);
+            if (xattr->name.length == name_length &&
+                memcmp(xattr->name.data, names[index], name_length) == 0 &&
+                xattr->value.length == value_length &&
+                memcmp(xattr->value.data, values[index], value_length) == 0)
+            {
+                matched = 1;
+                break;
+            }
+        }
+        if (!matched)
+            exact = 0;
+    }
+    if (sidecar_log_close(&log) != SIDECAR_STATUS_OK)
+        return 0;
+    return exact;
+}
+
+static void test_resume_xattr_equivalence(const char *base)
+{
+    printf(BLUE "::" NC " resume xattr equivalence (added/changed/removed)\n");
+
+    /* Probe filesystem xattr support once; user.* only (fixtures run
+     * unprivileged). Reuses the existing idiom from the SIGKILL cases:
+     * unsupported -> skip, don't fail. */
+    int xattr_available = 1;
+    char xattr_probe[] = "/tmp/migr_resume_xattr_probe_XXXXXX";
+    int probe_fd = mkstemp(xattr_probe);
+    if (probe_fd >= 0)
+    {
+        close(probe_fd);
+        if (setxattr(xattr_probe, "user.migr_resume", "x", 1, 0) != 0 &&
+            (errno == ENOTSUP || errno == EOPNOTSUPP || errno == EPERM))
+            xattr_available = 0;
+        unlink(xattr_probe);
+    }
+    if (!xattr_available)
+    {
+        skip_check("xattr resume fixture unavailable on this filesystem");
+        return;
+    }
+
+    char source_path[PATH_MAX];
+    char container_path[PATH_MAX];
+    join_path(source_path, sizeof(source_path), base, "xattr-source");
+    join_path(container_path, sizeof(container_path), base, "xattr-container");
+    make_directory(source_path);
+    char source_file[PATH_MAX];
+    join_path(source_file, sizeof(source_file), source_path, "entry");
+    write_file(source_file, "unchanged-content");
+
+    PortableRootSpec roots[1] = { root_spec("X", source_file, "X") };
+    PortableCaptureRequest request = request_for(&roots[0], "c1");
+    request.roots = roots;
+    request.root_count = 1;
+    int container_fd = -1;
+    check(fresh_capture(container_path, &request, &container_fd) == 0,
+          "xattr resume fixture is captured");
+    if (container_fd < 0)
+        return;
+
+    static const char *const no_names[1] = { NULL };
+    static const char *const no_values[1] = { NULL };
+
+    /* Direction 1: added -- source gains an xattr it did not have. */
+    check(setxattr(source_file, "user.migr_resume", "added", 5, 0) == 0,
+          "fixture: an xattr is added to the source");
+    portable_capture_test_set_interrupt(PORTABLE_TEST_INTERRUPT_NONE);
+    sidecar_test_set_interrupt(SIDECAR_TEST_INTERRUPT_NONE);
+    check(portable_capture_resume_at(container_fd, &request, NULL) == 0,
+          "resume after adding an xattr succeeds");
+    const char *const added_names[1] = { "user.migr_resume" };
+    const char *const added_values[1] = { "added" };
+    check(live_xattr_set_exact(container_fd, "X", "",
+                               added_names, added_values, 1),
+          "live sidecar entry carries the added xattr exactly");
+
+    /* Direction 2: changed -- same name, different value. */
+    check(setxattr(source_file, "user.migr_resume", "changed", 7, 0) == 0,
+          "fixture: the xattr value is changed on the source");
+    portable_capture_test_set_interrupt(PORTABLE_TEST_INTERRUPT_NONE);
+    sidecar_test_set_interrupt(SIDECAR_TEST_INTERRUPT_NONE);
+    check(portable_capture_resume_at(container_fd, &request, NULL) == 0,
+          "resume after changing an xattr value succeeds");
+    const char *const changed_names[1] = { "user.migr_resume" };
+    const char *const changed_values[1] = { "changed" };
+    check(live_xattr_set_exact(container_fd, "X", "",
+                               changed_names, changed_values, 1),
+          "live sidecar entry carries the changed xattr value exactly");
+
+    /* Direction 3: removed -- source loses the xattr it had. Content and
+     * size are identical across all three mutations, so only the sidecar's
+     * recorded set (count included) proves the removal was re-captured. */
+    check(removexattr(source_file, "user.migr_resume") == 0,
+          "fixture: the xattr is removed from the source");
+    portable_capture_test_set_interrupt(PORTABLE_TEST_INTERRUPT_NONE);
+    sidecar_test_set_interrupt(SIDECAR_TEST_INTERRUPT_NONE);
+    check(portable_capture_resume_at(container_fd, &request, NULL) == 0,
+          "resume after removing an xattr succeeds");
+    check(live_xattr_set_exact(container_fd, "X", "",
+                               no_names, no_values, 0),
+          "live sidecar entry carries no xattrs after removal");
+
+    close(container_fd);
+}
+
 static void test_encoded_resume(const char *base)
 {
     printf(BLUE "::" NC " resume skip for an encoded payload leaf\n");
@@ -886,6 +1041,7 @@ int main(void)
         fixture_fatal("could not create fixture root");
 
     test_resume_skips_and_replaces(base);
+    test_resume_xattr_equivalence(base);
     test_encoded_resume(base);
     test_symlink_resume(base);
     test_missing_sidecar(base);
