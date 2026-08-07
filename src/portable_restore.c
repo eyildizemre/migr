@@ -77,6 +77,8 @@ typedef struct {
 
 typedef struct {
     const SidecarEntry *entry;
+    const SidecarXattr *xattrs;
+    size_t xattr_count;
     size_t root_index;
     char destination[PATH_MAX];
     size_t depth;
@@ -821,11 +823,6 @@ static int collect_entry(const SidecarLiveView *view, void *argument)
         report_violation(report, root_index, "unsupported-kind");
         return 0;
     }
-    if (entry->xattr_count != 0)
-    {
-        report_violation(report, root_index, "xattrs");
-        return 0;
-    }
     if (entry->kind != SIDECAR_KIND_REGULAR && entry->size != 0)
     {
         report_violation(report, root_index, "invalid-size");
@@ -1541,7 +1538,6 @@ int replay_entry_valid(const SidecarEntry *entry)
         (entry->kind != SIDECAR_KIND_REGULAR &&
          entry->kind != SIDECAR_KIND_DIRECTORY &&
          entry->kind != SIDECAR_KIND_SYMLINK) ||
-        entry->xattr_count != 0 ||
         ((entry->kind == SIDECAR_KIND_DIRECTORY ||
           entry->kind == SIDECAR_KIND_SYMLINK) && entry->size != 0))
         return 0;
@@ -1716,6 +1712,8 @@ static int replay_collect_entry(const SidecarLiveView *view, void *argument)
         return 1;
     }
     replay->entry = entry;
+    replay->xattrs = view->xattrs;
+    replay->xattr_count = view->xattr_count;
     replay->root_index = root_index;
     replay->depth = replay_path_depth(replay->destination);
     collection->count++;
@@ -2147,8 +2145,14 @@ static int replay_apply_regular(ReplayCollection *collection,
         }
     }
     if (result == 0)
-        result = metadata_apply_fd(destination_fd, &desired,
-                                   collection->timestamp_policy);
+        result = metadata_apply_ownership_and_mode_fd(destination_fd,
+                                                      &desired);
+    if (result == 0)
+        result = metadata_apply_xattrs_fd(destination_fd, replay->xattrs,
+                                          replay->xattr_count);
+    if (result == 0)
+        result = metadata_apply_times_fd(destination_fd, &desired,
+                                         collection->timestamp_policy);
 
     int saved = errno;
     if (destination_fd >= 0 && close(destination_fd) != 0 && result == 0)
@@ -2209,8 +2213,15 @@ static int replay_apply_symlink(ReplayCollection *collection,
     if (result == 0 && symlinkat(target, parent_fd, leaf) != 0)
         result = -1;
     if (result == 0)
-        result = metadata_apply_symlink_at(parent_fd, leaf, &desired,
-                                           collection->timestamp_policy);
+        result = metadata_apply_symlink_ownership_at(parent_fd, leaf,
+                                                     &desired);
+    if (result == 0)
+        result = metadata_apply_xattrs_symlink_at(parent_fd, leaf,
+                                                  replay->xattrs,
+                                                  replay->xattr_count);
+    if (result == 0)
+        result = metadata_apply_symlink_times_at(parent_fd, leaf, &desired,
+                                                 collection->timestamp_policy);
 
     int saved = errno;
     if (parent_fd >= 0 && close(parent_fd) != 0 && result == 0)
@@ -2295,8 +2306,14 @@ static int replay_apply_directory_metadata(ReplayCollection *collection,
             result = -1;
     }
     if (result == 0)
-        result = metadata_apply_fd(destination_fd, &desired,
-                                   collection->timestamp_policy);
+        result = metadata_apply_ownership_and_mode_fd(destination_fd,
+                                                      &desired);
+    if (result == 0)
+        result = metadata_apply_xattrs_fd(destination_fd, replay->xattrs,
+                                          replay->xattr_count);
+    if (result == 0)
+        result = metadata_apply_times_fd(destination_fd, &desired,
+                                         collection->timestamp_policy);
 
     int saved = errno;
     if (destination_fd >= 0 && close(destination_fd) != 0 && result == 0)

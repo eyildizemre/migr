@@ -461,16 +461,42 @@ static void test_path_and_mapping_refusals(void)
     run_refusal_case("unsupported-kind", &root, &fifo, 1,
                      prepare_root_dir);
 
-    SidecarEntry xattr = entry_for("ROOT", "xattr", "xattr",
-                                   SIDECAR_KIND_REGULAR, 0);
-    xattr.xattr_count = 1;
-    run_refusal_case("xattr", &root, &xattr, 1, prepare_root_dir);
-
     SidecarEntry mismatch = entry_for("ROOT", "innocuous.txt",
                                       "something-else.txt",
                                       SIDECAR_KIND_REGULAR, 7);
     run_refusal_case("physical-mismatch", &root, &mismatch, 1,
                      prepare_root_dir);
+}
+
+static void test_xattr_entry_acceptance(void)
+{
+    printf(BLUE "::" NC " xattr-bearing entries pass preflight\n");
+    ManifestRoot root = root_for("ROOT", "ROOT", "restored");
+    Fixture fixture;
+    int opened = fixture_open(&fixture, "xattr-accept", &root, 1);
+    check(opened == 0, "xattr fixture is created");
+    if (opened != 0)
+        return;
+    make_root_payload(&fixture);
+    write_file_at(fixture.data_fd, "ROOT/file", "hello");
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0),
+        entry_for("ROOT", "file", "file", SIDECAR_KIND_REGULAR, 5)
+    };
+    entries[1].xattr_count = 1;
+    check(write_sidecar(&fixture, entries, 2) == 0,
+          "xattr-bearing sidecar is committed");
+    char sentinel[PATH_MAX];
+    fixture_path(sentinel, sizeof(sentinel), fixture.home, "/sentinel");
+    write_file_at(fixture.home_fd, "sentinel", "untouched");
+    PortableRestorePreflightReport report;
+    int result = run_preflight(&fixture, &report);
+    check(result == 0,
+          "xattr-bearing entries pass preflight (replay can now apply them)");
+    check(file_equals(sentinel, "untouched"),
+          "xattr acceptance preflight leaves the destination untouched");
+    portable_restore_preflight_report_free(&report);
+    fixture_close(&fixture);
 }
 
 static void test_symlink_refusals(void)
@@ -696,6 +722,7 @@ int main(void)
 {
     test_valid_and_profiles();
     test_missing_payload();
+    test_xattr_entry_acceptance();
     test_path_and_mapping_refusals();
     test_symlink_refusals();
     test_malformed_sidecars();

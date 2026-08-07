@@ -744,10 +744,29 @@ static int metadata_apply_xattrs_target(const MetadataXattrTarget *target,
         size_t name_length = strlen(name);
         if (!metadata_xattr_input_contains(xattrs, count, name))
         {
-            if (metadata_xattr_remove(target, name) != 0 && errno != ENODATA)
+            if (metadata_xattr_remove(target, name) != 0)
             {
-                free(existing_names);
-                return -1;
+                /*
+                 * ENODATA means it's already gone -- idempotent success.
+                 * security.* additionally tolerates EACCES/EPERM: the
+                 * destination's LSM (SELinux/AppArmor) auto-assigns this
+                 * namespace's values, and an unprivileged caller predictably
+                 * can't remove one (mirrors the capability probe's own
+                 * security.* rationale). A privileged caller that genuinely
+                 * can remove a stale security.* attribute still does --
+                 * this only tolerates the failure, it doesn't skip the
+                 * attempt, so E-8's exact-set guarantee still holds
+                 * wherever it's actually achievable.
+                 */
+                int tolerated = errno == ENODATA ||
+                    (metadata_xattr_namespace(name) ==
+                         METADATA_XATTR_NS_SECURITY &&
+                     (errno == EACCES || errno == EPERM));
+                if (!tolerated)
+                {
+                    free(existing_names);
+                    return -1;
+                }
             }
         }
         offset += name_length + 1U;

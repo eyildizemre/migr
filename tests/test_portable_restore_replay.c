@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
 #include "manifest.h"
@@ -417,8 +418,8 @@ static void test_symlink_collection_validation(void)
 
     SidecarEntry xattr = entry;
     xattr.xattr_count = 1;
-    check(!replay_entry_valid(&xattr),
-          "symlink xattrs remain rejected before Phase E");
+    check(replay_entry_valid(&xattr),
+          "xattr-bearing symlink entries are valid (replay now applies them)");
 
     SidecarEntry sized = entry;
     sized.size = 1;
@@ -550,6 +551,104 @@ static void test_normal_replay(void)
     fixture_close(&fixture);
 }
 
+static void test_xattr_replay(void)
+{
+    printf(BLUE "::" NC " replay applies the payload's exact xattr set\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "xattr replay fixture is created");
+    if (opened != 0)
+        return;
+
+    make_dir_at(fixture.data_fd, "ROOT", 0700);
+    write_file_at(fixture.data_fd, "ROOT/file", "payload");
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000100, 1, 1700000101, 2),
+        entry_for("ROOT", "file", "file", SIDECAR_KIND_REGULAR, 7, 0600,
+                  1700000102, 3, 1700000103, 4)
+    };
+    entries[1].xattr_count = 1;
+    check(write_sidecar(&fixture, entries, 2, NULL) == 0,
+          "xattr-bearing sidecar is committed");
+    check(run_preflight(&fixture) == 0, "xattr state passes preflight");
+
+    PortableRestoreReplayReport report;
+    int result = run_replay(&fixture, &report);
+    check(result == 0 && report.applied_count == 2 &&
+              report.failed_count == 0,
+          "xattr-bearing entries replay successfully");
+
+    char restored_file[PATH_MAX];
+    path_join(restored_file, sizeof(restored_file), fixture.home,
+              "/restored/file");
+    char value[64];
+    ssize_t length = getxattr(restored_file, "user.migr_test", value,
+                              sizeof(value));
+    check(length == (ssize_t)strlen("value") &&
+              memcmp(value, "value", (size_t)length) == 0,
+          "payload xattr is applied to the destination");
+
+    fixture_close(&fixture);
+}
+
+static void test_xattr_reconciliation(void)
+{
+    printf(BLUE "::" NC " replay reconciles stale and changed destination xattrs\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "xattr reconciliation fixture is created");
+    if (opened != 0)
+        return;
+
+    make_dir_at(fixture.data_fd, "ROOT", 0700);
+    write_file_at(fixture.data_fd, "ROOT/file", "payload");
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000100, 1, 1700000101, 2),
+        entry_for("ROOT", "file", "file", SIDECAR_KIND_REGULAR, 7, 0600,
+                  1700000102, 3, 1700000103, 4)
+    };
+    entries[1].xattr_count = 1;
+    check(write_sidecar(&fixture, entries, 2, NULL) == 0,
+          "xattr reconciliation sidecar is committed");
+    check(run_preflight(&fixture) == 0, "xattr reconciliation passes preflight");
+
+    PortableRestoreReplayReport report;
+    check(run_replay(&fixture, &report) == 0 && report.failed_count == 0,
+          "first replay applies the payload xattr set");
+
+    /* Plant a stale xattr and a changed value directly on the destination,
+     * then restore again over the same destination: exact-set reconciliation
+     * must remove the stale one and overwrite the changed one. */
+    char restored_file[PATH_MAX];
+    path_join(restored_file, sizeof(restored_file), fixture.home,
+              "/restored/file");
+    check(setxattr(restored_file, "user.migr_stale", "stale", 5, 0) == 0,
+          "fixture: a stale destination xattr is planted");
+    check(setxattr(restored_file, "user.migr_test", "old-value", 9, 0) == 0,
+          "fixture: the payload xattr name is set to a different value");
+
+    PortableRestoreReplayReport second_report;
+    check(run_replay(&fixture, &second_report) == 0 &&
+              second_report.failed_count == 0,
+          "second replay succeeds over the same destination");
+
+    char value[64];
+    ssize_t length = getxattr(restored_file, "user.migr_test", value,
+                              sizeof(value));
+    check(length == (ssize_t)strlen("value") &&
+              memcmp(value, "value", (size_t)length) == 0,
+          "changed destination xattr is overwritten to the payload value");
+    check(getxattr(restored_file, "user.migr_stale", value, sizeof(value)) < 0 &&
+              errno == ENODATA,
+          "stale destination xattr is removed by exact-set reconciliation");
+
+    fixture_close(&fixture);
+}
+
 static void test_payload_swap(void)
 {
     printf(BLUE "::" NC " per-entry payload revalidation\n");
@@ -645,6 +744,8 @@ int main(void)
     test_symlink_collection_validation();
     test_physical_logical_mismatch();
     test_normal_replay();
+    test_xattr_replay();
+    test_xattr_reconciliation();
     test_payload_swap();
     test_tombstone_skipped();
     printf("%s%s%s\n", failures == 0 ? GREEN : RED,

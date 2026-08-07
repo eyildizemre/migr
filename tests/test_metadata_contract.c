@@ -1202,6 +1202,59 @@ static void test_metadata_xattr_gate_no_unrelated_namespace(void)
     remove_tree(base);
 }
 
+static void test_metadata_apply_xattrs_tolerates_foreign_security(void)
+{
+    const char *case_name = "xattr-security-tolerance";
+    char base[PATH_MAX];
+    if (!make_shm_root(base, sizeof(base)))
+    {
+        skip_case(case_name, "a private tmpfs fixture is unavailable");
+        return;
+    }
+
+    char path[PATH_MAX];
+    join_or_die(path, sizeof(path), base, "entry");
+    write_file(path, "security-tolerance");
+
+    unsigned int namespaces = 0;
+    if (metadata_xattr_namespaces_path(path, &namespaces) != 0)
+        fatal("could not inspect the security-tolerance fixture");
+    if ((namespaces & METADATA_XATTR_NS_SECURITY) == 0)
+    {
+        skip_case(case_name,
+                  "the destination does not auto-assign a security.* xattr");
+        remove_tree(base);
+        return;
+    }
+
+    unsigned char label[256];
+    ssize_t label_length = get_xattr_value(path, "security.selinux", label,
+                                           sizeof(label), 0);
+    if (label_length < 0)
+        fatal("could not read the auto-assigned security label");
+
+    /* An empty target set (SidecarXattr count 0) is exactly what a payload
+     * captured on a non-SELinux source looks like: no security.* entry at
+     * all. Applying it must not fail just because the destination's LSM
+     * auto-assigned a security.selinux label this call didn't ask for and
+     * can't remove without privilege -- it must tolerate that, not refuse
+     * the whole entry (this is the exact regression E.3a's own tests hit
+     * on an SELinux-enabled host before metadata_apply_xattrs_target
+     * learned to tolerate EACCES/EPERM specifically for security.*). */
+    int fd = open(path, O_WRONLY);
+    if (fd < 0)
+        fatal("could not open the security-tolerance fixture");
+    check_result(metadata_apply_xattrs_fd(fd, NULL, 0) == 0, case_name,
+                 "applying an empty xattr set tolerates an unremovable "
+                 "auto-assigned security.* attribute");
+    check_result(xattr_value_equals(path, "security.selinux", label,
+                                    (size_t)label_length, 0),
+                 case_name,
+                 "the untouched security.* attribute keeps its original value");
+    close(fd);
+    remove_tree(base);
+}
+
 static void test_metadata_xattr_gate_trusted_refusal(void)
 {
     const char *case_name = "xattr-trusted";
@@ -1370,6 +1423,7 @@ int main(void)
     test_metadata_helper_failure_paths();
     test_metadata_xattr_capability_probe();
     test_metadata_xattr_gate_no_unrelated_namespace();
+    test_metadata_apply_xattrs_tolerates_foreign_security();
     test_metadata_xattr_gate_trusted_refusal();
     test_metadata_apply_split_equivalence();
     test_foreign_ownership_gap();

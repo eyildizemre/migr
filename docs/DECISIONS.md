@@ -1204,6 +1204,28 @@ recorded set. Resume equivalence for an entry is not size/mtime alone: an
 entry whose extended-attribute set no longer matches byte-for-byte is not
 eligible to be skipped as unchanged.
 
+**`security.*` stale removal tolerates, but still attempts, the LSM's own
+refusal.** A destination object gets a `security.*` value (typically
+`security.selinux`) assigned automatically by the kernel/LSM at creation
+time, independent of anything migr writes -- so a payload whose source
+never carried a `security.*` value (for example, one captured on a
+non-SELinux system, then restored onto an SELinux-enabled one) makes exact-
+set reconciliation see a destination attribute that "shouldn't" be there.
+Removing it requires privilege (`CAP_MAC_ADMIN` or an equivalent LSM
+grant) an ordinary restore does not have, so this specific removal
+tolerates `EACCES`/`EPERM` the same way removal already tolerates
+`ENODATA` for an attribute that's already gone -- an idempotent-style
+non-failure, not a silent skip. The removal is still attempted every time,
+not bypassed by namespace name: a caller that genuinely holds the
+privilege to remove a stale `security.*` value still does, and E-8's
+exact-set guarantee still holds wherever it's actually achievable. Only
+the specific, expected-for-most-callers privilege failure is tolerated,
+mirroring E-9's own `security.*` carve-out (that gate's probe is excluded
+entirely because no synthetic value can generalize the policy-specific
+accept/reject decision; this is the same underlying fact -- `security.*`
+is LSM-owned, not filesystem-owned -- showing up in the reconciliation
+step E-9 itself defers to).
+
 ### E-9 — A pre-mutation capability gate, tightly scoped
 
 Before either native or portable replay mutates any user payload, a
