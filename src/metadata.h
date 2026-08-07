@@ -113,6 +113,8 @@ int metadata_apply_symlink_times_at(int dir_fd, const char *leaf,
                                     MetadataTimestampPolicy policy);
 int metadata_apply_xattrs_fd(int fd, const SidecarXattr *xattrs,
                              size_t count);
+int metadata_symlink_xattr_path(int dir_fd, const char *leaf,
+                                char *path, size_t path_size);
 int metadata_apply_xattrs_symlink_at(int dir_fd, const char *leaf,
                                      const SidecarXattr *xattrs, size_t count);
 

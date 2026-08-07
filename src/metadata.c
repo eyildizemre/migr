@@ -729,8 +729,8 @@ static int metadata_safe_xattr_component(const char *component)
     return 1;
 }
 
-static int metadata_symlink_xattr_path(int dir_fd, const char *leaf,
-                                       char *path, size_t path_size)
+int metadata_symlink_xattr_path(int dir_fd, const char *leaf,
+                                char *path, size_t path_size)
 {
     if (dir_fd < 0 || path == NULL || path_size == 0 ||
         !metadata_safe_xattr_component(leaf))

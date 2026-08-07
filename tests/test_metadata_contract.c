@@ -736,8 +736,8 @@ static void test_native_xattrs_captured(void)
     char base[PATH_MAX], source_root[PATH_MAX], capture_root[PATH_MAX];
     char restore_root[PATH_MAX], source_path[PATH_MAX], capture_path[PATH_MAX];
     char restore_path[PATH_MAX];
-    char source_dir[PATH_MAX], capture_dir[PATH_MAX];
-    char source_link[PATH_MAX], capture_link[PATH_MAX];
+    char source_dir[PATH_MAX], capture_dir[PATH_MAX], restore_dir[PATH_MAX];
+    char source_link[PATH_MAX], capture_link[PATH_MAX], restore_link[PATH_MAX];
     make_temp_root(base, sizeof(base));
     join_or_die(source_root, sizeof(source_root), base, "source");
     join_or_die(capture_root, sizeof(capture_root), base, "capture");
@@ -809,11 +809,38 @@ static void test_native_xattrs_captured(void)
     close(source_fd);
     close(restore_fd);
     join_or_die(restore_path, sizeof(restore_path), restore_root, "entry");
-    check_result(xattr_is_absent(restore_path, "user.migr_test", 0), case_name,
-                 "native restore still leaves xattrs unapplied");
+    check_result(xattr_value_equals(restore_path, "user.migr_test", "changed",
+                                    7, 0),
+                 case_name, "native restore applies payload xattr value");
+
+    if (setxattr(restore_path, "user.migr_stale", "stale", 5, 0) != 0)
+        fatal("could not create the stale restore xattr fixture");
+    source_fd = open_directory(capture_root);
+    restore_fd = open_directory(restore_root);
+    check_result(restore_native_at(&RESTORE_CTX, source_fd, "entry",
+                                   restore_fd, "entry") == 0,
+                 case_name, "restore removes a stale destination xattr");
+    close(source_fd);
+    close(restore_fd);
+    check_result(xattr_is_absent(restore_path, "user.migr_stale", 0), case_name,
+                 "native restore removes a stale xattr");
+
+    if (setxattr(restore_path, "user.migr_test", "destination", 11, 0) != 0)
+        fatal("could not change the destination xattr fixture");
+    source_fd = open_directory(capture_root);
+    restore_fd = open_directory(restore_root);
+    check_result(restore_native_at(&RESTORE_CTX, source_fd, "entry",
+                                   restore_fd, "entry") == 0,
+                 case_name, "restore updates a changed destination xattr");
+    close(source_fd);
+    close(restore_fd);
+    check_result(xattr_value_equals(restore_path, "user.migr_test", "changed",
+                                    7, 0),
+                 case_name, "native restore updates a changed xattr value");
 
     join_or_die(source_dir, sizeof(source_dir), source_root, "directory");
     join_or_die(capture_dir, sizeof(capture_dir), capture_root, "directory");
+    join_or_die(restore_dir, sizeof(restore_dir), restore_root, "directory");
     if (mkdir(source_dir, 0700) != 0)
         fatal("could not create the directory xattr fixture");
     char child_path[PATH_MAX];
@@ -837,10 +864,21 @@ static void test_native_xattrs_captured(void)
         check_result(xattr_value_equals(capture_dir, "user.migr_directory",
                                         "directory", 9, 0),
                      case_name, "directory capture preserves xattr value");
+        source_fd = open_directory(capture_root);
+        restore_fd = open_directory(restore_root);
+        check_result(restore_native_at(&RESTORE_CTX, source_fd, "directory",
+                                       restore_fd, "directory") == 0,
+                     case_name, "directory restore result");
+        close(source_fd);
+        close(restore_fd);
+        check_result(xattr_value_equals(restore_dir, "user.migr_directory",
+                                        "directory", 9, 0),
+                     case_name, "directory restore applies xattr value");
     }
 
     join_or_die(source_link, sizeof(source_link), source_root, "link");
     join_or_die(capture_link, sizeof(capture_link), capture_root, "link");
+    join_or_die(restore_link, sizeof(restore_link), restore_root, "link");
     if (symlink("target.txt", source_link) != 0)
         fatal("could not create the symlink xattr fixture");
     if (lsetxattr(source_link, "user.migr_symlink", "symlink", 7, 0) != 0)
@@ -861,6 +899,16 @@ static void test_native_xattrs_captured(void)
         check_result(xattr_value_equals(capture_link, "user.migr_symlink",
                                         "symlink", 7, 1),
                      case_name, "symlink capture preserves xattr value");
+        source_fd = open_directory(capture_root);
+        restore_fd = open_directory(restore_root);
+        check_result(restore_native_at(&RESTORE_CTX, source_fd, "link",
+                                       restore_fd, "link") == 0,
+                     case_name, "symlink restore result");
+        close(source_fd);
+        close(restore_fd);
+        check_result(xattr_value_equals(restore_link, "user.migr_symlink",
+                                        "symlink", 7, 1),
+                     case_name, "symlink restore applies xattr value");
     }
 
     remove_tree(base);

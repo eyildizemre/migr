@@ -1123,13 +1123,37 @@ static RestoreNativeStatus restore_entry_at(
             return RESTORE_NATIVE_OK;
 
         target[len] = '\0';
+        char source_xattr_path[PATH_MAX];
+        PortableXattrs xattrs = {0};
+        int failed = metadata_symlink_xattr_path(source_parent_fd,
+                                                 source_leaf,
+                                                 source_xattr_path,
+                                                 sizeof(source_xattr_path));
+        if (!failed &&
+            collect_symlink_xattrs(source_xattr_path, &xattrs) != 0)
+            failed = 1;
+        if (failed)
+        {
+            xattrs_free(&xattrs);
+            return RESTORE_NATIVE_ERROR;
+        }
         if (symlinkat(target, dest_parent_fd, dest_leaf) != 0)
         {
+            xattrs_free(&xattrs);
             return -1;
         }
-        int failed = metadata_apply_symlink_at(dest_parent_fd, dest_leaf,
-                                               &desired_st,
-                                               metadata_policy_from_context(ctx)) != 0;
+        failed = metadata_apply_symlink_ownership_at(dest_parent_fd, dest_leaf,
+                                                     &desired_st) != 0;
+        if (!failed &&
+            metadata_apply_xattrs_symlink_at(dest_parent_fd, dest_leaf,
+                                             xattrs.items, xattrs.count) != 0)
+            failed = 1;
+        if (!failed &&
+            metadata_apply_symlink_times_at(
+                dest_parent_fd, dest_leaf, &desired_st,
+                metadata_policy_from_context(ctx)) != 0)
+            failed = 1;
+        xattrs_free(&xattrs);
         if (!failed)
             restore_report_applied(restore_report);
         else
@@ -1187,11 +1211,22 @@ static RestoreNativeStatus restore_entry_at(
             opened_dest_st.st_mtim.tv_nsec == desired_st.st_mtim.tv_nsec;
         if (content_skip)
         {
-            int failed = metadata_apply_fd(dst_fd, &desired_st, policy) != 0;
+            int failed = metadata_apply_ownership_and_mode_fd(dst_fd,
+                                                               &desired_st) != 0;
+            PortableXattrs xattrs = {0};
+            if (!failed && collect_xattrs(src_fd, &xattrs) != 0)
+                failed = 1;
             struct stat after;
             if (!failed && (fstat(src_fd, &after) != 0 ||
                             !metadata_source_unchanged(&desired_st, &after)))
                 failed = 1;
+            if (!failed && metadata_apply_xattrs_fd(dst_fd, xattrs.items,
+                                                    xattrs.count) != 0)
+                failed = 1;
+            if (!failed && metadata_apply_times_fd(dst_fd, &desired_st,
+                                                   policy) != 0)
+                failed = 1;
+            xattrs_free(&xattrs);
             if (close(src_fd) != 0)
                 failed = 1;
             if (close(dst_fd) != 0)
@@ -1237,6 +1272,17 @@ static RestoreNativeStatus restore_entry_at(
                 break;
         }
 
+        PortableXattrs xattrs = {0};
+        if (!failed &&
+            metadata_apply_ownership_and_mode_fd(dst_fd, &desired_st) != 0)
+            failed = 1;
+        // collect_xattrs() reads the payload's *current* xattrs -- unlike
+        // desired_st (a snapshot from an earlier pass), there is no
+        // pre-recorded xattr set to fall back on, so this read must fall
+        // inside the same before/after window the content copy above is
+        // already verified against, not after it.
+        if (!failed && collect_xattrs(src_fd, &xattrs) != 0)
+            failed = 1;
         if (!failed)
         {
             struct stat after;
@@ -1244,8 +1290,12 @@ static RestoreNativeStatus restore_entry_at(
                 !metadata_source_unchanged(&desired_st, &after))
                 failed = 1;
         }
-        if (!failed && metadata_apply_fd(dst_fd, &desired_st, policy) != 0)
+        if (!failed && metadata_apply_xattrs_fd(dst_fd, xattrs.items,
+                                                xattrs.count) != 0)
             failed = 1;
+        if (!failed && metadata_apply_times_fd(dst_fd, &desired_st, policy) != 0)
+            failed = 1;
+        xattrs_free(&xattrs);
 
         if (close(src_fd) != 0)
             failed = 1;
@@ -1340,13 +1390,30 @@ static RestoreNativeStatus restore_entry_at(
 
         if (!failed && pass == RESTORE_APPLY)
         {
+            PortableXattrs xattrs = {0};
+            if (!failed &&
+                metadata_apply_ownership_and_mode_fd(dest_dir_fd,
+                                                      &desired_st) != 0)
+                failed = 1;
+            // collect_xattrs() reads the payload's *current* xattrs -- unlike
+            // desired_st (a snapshot from an earlier pass), there is no
+            // pre-recorded xattr set to fall back on, so this read must fall
+            // inside the same before/after window the subtree walk above is
+            // already verified against, not after it.
+            if (!failed && collect_xattrs(source_dir_fd, &xattrs) != 0)
+                failed = 1;
             struct stat after;
-            if (fstat(source_dir_fd, &after) != 0 ||
-                !metadata_source_unchanged(&desired_st, &after))
+            if (!failed && (fstat(source_dir_fd, &after) != 0 ||
+                            !metadata_source_unchanged(&desired_st, &after)))
                 failed = 1;
-            if (!failed && metadata_apply_fd(dest_dir_fd, &desired_st,
-                                             metadata_policy_from_context(ctx)) != 0)
+            if (!failed && metadata_apply_xattrs_fd(dest_dir_fd, xattrs.items,
+                                                    xattrs.count) != 0)
                 failed = 1;
+            if (!failed &&
+                metadata_apply_times_fd(dest_dir_fd, &desired_st,
+                                        metadata_policy_from_context(ctx)) != 0)
+                failed = 1;
+            xattrs_free(&xattrs);
         }
 
         close(source_dir_fd);
