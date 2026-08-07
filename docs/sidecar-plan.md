@@ -255,8 +255,8 @@ Phase B; silent acceptance is not an option.
 
 1. create the entry and write content;
 2. apply ownership (uid/gid);
-3. apply xattrs / ACL-related metadata;
-4. apply mode;
+3. apply mode;
+4. apply xattrs / ACL-related metadata;
 5. apply timestamps **last**.
 
 Directory metadata is applied **post-order**, after children exist — traversal mutates
@@ -447,8 +447,11 @@ in G), so no single phase carries "make everything faithful at once."
   destination-measured case-collision detection. The real Arch/Ubuntu/Fedora
   VM-gate matrix passed, including the expected Fedora portable xattr refusal at
   the Phase E boundary.
-- **Phase E — xattrs / ACLs.** Native `setxattr`; portable sub-records; distinguish
-  absent / unsupported / denied / error.
+- **Phase E — xattrs / ACLs.** **Status: in progress (2026-08-07, D20).**
+  Native and portable generic exact-set xattr/ACL capture and replay; a
+  pre-mutation capability gate refuses unsupported destinations before any
+  payload write; a security.* transplant carries a documented, unenforced
+  semantic-risk caveat.
 - **Phase F — Case collisions.** Deterministic, `readdir`-order-independent suffix.
 - **Phase G — Hardlinks.** `(st_dev, st_ino)` grouping; native `link()` / portable dense
   copy; space accounting in the pre-scan.

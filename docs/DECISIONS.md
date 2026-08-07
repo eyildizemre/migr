@@ -1105,3 +1105,183 @@ through the existing test-only seam. Fedora's plain regular-file/directory
 portable round-trip still meets the same automatic `security.selinux` xattr
 wall already recorded for symlinks in D18, so that Phase E boundary is neither
 new nor a Phase D regression.
+
+---
+
+## D20 — 2026-08-07 — Portable and native xattr/ACL handling: generic capture and replay, no framework-specific code
+
+**Status:** Decided — Phase E implementation pending
+
+**Decision:** Both portable and native destinations capture and replay
+every extended attribute through the generic `getxattr`/`setxattr` family,
+with no framework-specific code path for SELinux, AppArmor, or any other
+xattr consumer (D7). POSIX ACLs are not a separate mechanism: they travel
+as the `system.posix_acl_access`/`system.posix_acl_default` xattrs like any
+other extended attribute. Both capture and replay reconcile an **exact**
+set, not an additive one: an attribute present at the destination but
+absent from the source is removed, not left stale. Replay applies
+ownership, then mode, then the exact extended-attribute set, then
+timestamps; a destination that cannot hold a captured namespace or object
+kind at all is detected and refused before any payload mutation, and a
+`setxattr`/`lsetxattr`/`fsetxattr`/`removexattr` failure discovered after
+that refuses the affected entry fail-closed, the same way an
+unrepresentable name or a case collision already does.
+
+### E-1 — Namespace scope
+
+Every namespace is captured and replayed with no exception: `user.*`,
+`security.*`, `system.*`, `trusted.*`. D7's framework-agnosticism means no
+namespace question is asked at capture time; whatever `getxattr` returns is
+stored, and whatever the destination's `setxattr` accepts is written. A
+namespace an environment doesn't support is not a silent omission -- it
+surfaces through E-9's capability gate or E-3's fail-closed write rule,
+never through a quiet capture-side filter.
+
+### E-2 — Apply order and the POSIX ACL mask
+
+Extended attributes are applied **after** mode, not before:
+`chown → chmod → xattr → times`. A POSIX ACL's `mask` entry is recomputed
+by the kernel as a side effect of `chmod` whenever the file already carries
+an ACL. Writing the ACL before `chmod` would let the following `chmod`
+silently overwrite the mask that was just restored; applying it after
+`chmod` makes the captured ACL bytes the final, authoritative state.
+`rsync -A` and `cp --preserve=xattr` order their own ACL restore the same
+way, for the same reason -- this is not a migr-specific choice, it is what
+POSIX ACL semantics require.
+
+### E-3 — A failed read, write, or removal refuses the entry, never drops it
+
+A capture-side read failure, a replay-side `setxattr`/`lsetxattr`/
+`fsetxattr` failure, or a stale-attribute `removexattr` failure (other than
+`ENODATA`, which is an idempotent success when removing something already
+gone) refuses the affected entry fail-closed -- for every object kind,
+including symlinks, with no exception for any namespace. Backup cannot
+finalize over such a failure. If a replay/TOCTOU failure surfaces after
+E-9's capability gate has already passed, the invocation does not silently
+succeed and does not promise to roll back what was already applied: it
+returns non-zero with an honest applied/failed count, the same contract
+D17 already established for restore in general. This is the same rule D18
+and D19 established for a representation the destination cannot hold:
+refuse and say so, never silently omit the data.
+
+### E-4 — Symlinks are an ordinary case, not an exception
+
+`lsetxattr`/`lgetxattr`/`llistxattr`/`lremovexattr` are real, standard
+Linux syscalls -- portable capture has used the read side
+(`lgetxattr`/`llistxattr`) for symlinks since Phase C (D18 C-8). Symlink
+extended attributes are captured and replayed with the same `l*` family
+under the same E-3 fail-closed rule as every other kind; they are not
+collected-but-unwritable, and D18 C-8's own text already expected this
+("Until Phase E implements replay").
+
+### E-5 — Apply order is shared
+
+`create → chown → chmod → (remove stale, then set) extended attributes →
+times → readback` is the same sequence for both native and portable
+replay, extending D17's existing `chown → chmod → times` order (see D17's
+"Restore atime exactness" and its as-built notes) with one inserted step
+rather than replacing it.
+
+### E-6 — Ceilings are unchanged
+
+`SIDECAR_MAX_XATTRS_PER_ENTRY`, `MAX_XATTR_NAME`, and `MAX_XATTR_VALUE`
+stay exactly as D17 froze them. Phase E does not touch these limits.
+
+### E-7 — Test-only boundary
+
+All of Phase E's capture and replay behaviour remains behind the existing
+D14 test-only seam. Production portable dispatch stays disabled.
+
+### E-8 — Exact-set reconciliation, both directions
+
+Capture is not read-only with respect to the payload/destination's
+extended attributes: an attribute the destination already carries but the
+source no longer has is removed, not left behind. This applies symmetrically
+-- native capture reconciles the payload object's attribute set against the
+live source on every run (not only on first capture), and native/portable
+replay reconciles the destination object's set against the sidecar's
+recorded set. Resume equivalence for an entry is not size/mtime alone: an
+entry whose extended-attribute set no longer matches byte-for-byte is not
+eligible to be skipped as unchanged.
+
+### E-9 — A pre-mutation capability gate, tightly scoped
+
+Before either native or portable replay mutates any user payload, a
+capability gate checks whether the destination can hold what the sidecar
+requires, and refuses the whole invocation before any mutation if not.
+Its scope is deliberately narrow, fixed here rather than left to whoever
+implements it:
+
+- **Once per invocation, not once per entry.** Namespace support is a
+  property of the destination, not of any individual file.
+- **Name only, not the captured value.** The gate attempts to set and
+  remove one representative attribute name per required namespace, in an
+  isolated scratch fixture that is always cleaned up. It does not write
+  the actual captured value. A value-specific rejection (for example a
+  destination's own per-value size ceiling) is not this gate's concern --
+  it surfaces later through E-3's ordinary replay-time fail-closed check,
+  since `MAX_XATTR_VALUE` is already a value ceiling migr enforces on its
+  own side regardless.
+- **One check per object kind actually present.** Regular/directory
+  objects (`f*` family) and symlinks (`l*` family) reach the destination
+  through mechanically different syscalls, so each required combination of
+  object kind and namespace is checked independently.
+
+A failure discovered after this gate has already passed (a race, a
+mid-replay policy change, anything the gate could not have observed) is
+not this gate's failure to catch -- it falls to E-3's ordinary fail-closed
+rule with an honest partial result, not a broken promise from the gate.
+
+### E-10 — The `security.*` semantic-transplant risk is a written boundary, not a filter or a runtime warning
+
+`security.*` is captured and replayed like any other namespace (E-1) --
+there is no default filter excluding it. But a successful `setxattr` of a
+`security.*` value does not mean the transplanted label is correct on the
+destination's own security policy; a label can be written successfully and
+still be semantically wrong on a system with a different policy, a class
+of error no syscall-failure check can ever catch, because the write itself
+does not fail. This decision does not solve that -- it is written down
+here as a known, accepted boundary, not a runtime warning (D14's test-only
+seam has no real runtime user to warn), and not resolved by silently
+excluding `security.*` from capture, which would leave the backup quietly
+incomplete for that namespace. A future, not-yet-designed user-confirmed
+omission mechanism is where this eventually gets a real answer.
+
+**Why:** D8's full-fidelity promise has stood with an acknowledged, empty
+gap for native xattrs since before Phase B; Phase C and Phase D's own
+capture code already collects xattrs on every portable entry, so the
+remaining work is replay, exact-set reconciliation, and the native side,
+not new collection logic. Ordering extended attributes after mode rather
+than before is required by POSIX ACL semantics, not a preference.
+Fail-closed on a write failure, and a pre-mutation capability gate ahead of
+it, keep a destination's real limitations from becoming silent data loss or
+a half-applied backup -- the same discipline D18 and D19 already
+established for symlink xattrs and unrepresentable names respectively. The
+capability gate's scope is fixed narrowly (E-9) rather than left
+open-ended, following the precedent D-10/N-10 already set: a
+measure-rather-than-predict mechanism's shape belongs in the decision, not
+rediscovered per-implementation.
+
+**Rejected:** a framework-specific code path for SELinux or any other xattr
+consumer, and calling `restorecon` or an equivalent, both ruled out by D7;
+treating symlink extended attributes as permanently unwritable, which is
+factually wrong (`lsetxattr` exists) and contradicts D18 C-8's own text;
+silently excluding the `security.*` namespace from capture by default to
+avoid cross-policy transplant risk, rejected because it would make the
+backup quietly incomplete for that namespace with no visible record, the
+same failure shape D16, D18, and D19 have consistently refused to allow
+elsewhere in this project; and a capability gate that probes captured
+values rather than names alone, rejected as unnecessary cost for a class of
+failure E-3's ordinary fail-closed replay-time check already covers.
+
+**Relationship:** D20 makes D7's framework-agnosticism concrete for
+extended attributes and ACLs. It keeps D17's `chown → chmod → times` apply
+order intact, inserting extended attributes as one more step rather than
+restructuring it, and shares that order between native and portable. It
+extends D18's C-5/C-8 and D19's N-2/N-5/N-8/N-10 rule -- a representation
+gap is measured and refused fail-closed, never silently dropped or
+predicted from a table -- to every extended attribute namespace and every
+object kind, and to the pre-mutation capability gate's own existence.
+Hardlink xattr-sharing remains Phase G's concern, and the `security.*`
+cross-policy semantic risk noted in E-10 is left to a future, not-yet-
+designed user-confirmed skip mechanism rather than solved here.
