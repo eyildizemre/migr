@@ -1226,6 +1226,24 @@ implements it:
   objects (`f*` family) and symlinks (`l*` family) reach the destination
   through mechanically different syscalls, so each required combination of
   object kind and namespace is checked independently.
+- **`security.*` is out of this gate's probe, by name.** Unlike the other
+  three namespaces, `security.*` writes are validated by the destination's
+  loaded LSM policy (SELinux, AppArmor), not by generic filesystem/
+  namespace support. An invented probe name has no universally-valid
+  placeholder value the way `system.*`'s POSIX ACL wire format does --
+  whether a given `security.*` value is accepted is inherently policy- and
+  value-specific, exactly the class of rejection this gate's own
+  name-only design already excludes above ("a value-specific rejection
+  ... is not this gate's concern"). Probing it anyway would make the gate
+  refuse essentially every restore of a payload sourced from an
+  SELinux-enabled system, regardless of whether the destination genuinely
+  supports `security.*` (it almost always does -- it's using the
+  namespace on every file already). This is E-10's written, accepted
+  cross-policy boundary surfacing in the gate's own mechanism shape, not a
+  new exception. `security.*` presence is still tracked for the kind ×
+  namespace matrix's bookkeeping; it is simply never fed into the probe.
+  Its actual acceptance on replay remains E-3's ordinary fail-closed
+  check, same as any other value-specific rejection.
 
 A failure discovered after this gate has already passed (a race, a
 mid-replay policy change, anything the gate could not have observed) is
