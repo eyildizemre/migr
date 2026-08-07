@@ -481,7 +481,7 @@ static int ensure_regular_leaf(int parent_fd, const char *leaf, int *out_fd)
     return 0;
 }
 
-static void xattrs_free(PortableXattrs *xattrs)
+void xattrs_free(PortableXattrs *xattrs)
 {
     if (xattrs == NULL)
         return;
@@ -632,7 +632,7 @@ static int verify_pending_readback_names(int destination_fd,
     return failed ? -1 : 0;
 }
 
-static int collect_xattrs(int fd, PortableXattrs *out)
+int collect_xattrs(int fd, PortableXattrs *out)
 {
     if (fd < 0 || out == NULL)
         return -1;
@@ -721,7 +721,7 @@ static int collect_xattrs(int fd, PortableXattrs *out)
     return 0;
 }
 
-static int collect_symlink_xattrs(const char *path, PortableXattrs *out)
+int collect_symlink_xattrs(const char *path, PortableXattrs *out)
 {
     if (path == NULL || out == NULL)
         return -1;

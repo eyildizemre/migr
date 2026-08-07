@@ -15,6 +15,7 @@
 
 #include "fileops.h" // CloneContext
 #include "metadata.h"
+#include "portable.h"
 #include "utils.h" // path_join
 
 /* ========================================================================= */
@@ -107,10 +108,24 @@ static int capture_symlink_at(const char *src, int dest_dir_fd, const char *leaf
             return -1;
     }
 
+    PortableXattrs xattrs = {0};
+    int failed = metadata_apply_symlink_ownership_at(dest_dir_fd, leaf, st);
+    if (!failed && collect_symlink_xattrs(src, &xattrs) != 0)
+        failed = 1;
+
     struct stat after;
-    if (lstat(src, &after) != 0 || !metadata_symlink_unchanged(st, &after))
-        return -1;
-    return metadata_apply_symlink_at(dest_dir_fd, leaf, st, policy);
+    if (!failed &&
+        (lstat(src, &after) != 0 || !metadata_symlink_unchanged(st, &after)))
+        failed = 1;
+    if (!failed && metadata_apply_xattrs_symlink_at(dest_dir_fd, leaf,
+                                                    xattrs.items,
+                                                    xattrs.count) != 0)
+        failed = 1;
+    if (!failed && metadata_apply_symlink_times_at(dest_dir_fd, leaf, st,
+                                                   policy) != 0)
+        failed = 1;
+    xattrs_free(&xattrs);
+    return failed ? -1 : 0;
 }
 
 // A write() that reports zero bytes for a non-zero request has made no
@@ -187,12 +202,25 @@ static BackupCaptureStatus capture_regular_at(
             }
             struct stat opened_dest;
             int failed = fstat(dest_fd, &opened_dest) != 0 ||
-                         !S_ISREG(opened_dest.st_mode) ||
-                         metadata_apply_fd(dest_fd, &source_snapshot, policy) != 0;
+                         !S_ISREG(opened_dest.st_mode);
+            PortableXattrs xattrs = {0};
+            if (!failed &&
+                metadata_apply_ownership_and_mode_fd(dest_fd,
+                                                     &source_snapshot) != 0)
+                failed = 1;
+            if (!failed && collect_xattrs(src_fd, &xattrs) != 0)
+                failed = 1;
             struct stat after;
             if (!failed && (fstat(src_fd, &after) != 0 ||
                             !metadata_source_unchanged(&source_snapshot, &after)))
                 failed = 1;
+            if (!failed && metadata_apply_xattrs_fd(dest_fd, xattrs.items,
+                                                    xattrs.count) != 0)
+                failed = 1;
+            if (!failed &&
+                metadata_apply_times_fd(dest_fd, &source_snapshot, policy) != 0)
+                failed = 1;
+            xattrs_free(&xattrs);
             if (close(dest_fd) != 0)
                 failed = 1;
             if (close(src_fd) != 0)
@@ -219,12 +247,22 @@ static BackupCaptureStatus capture_regular_at(
     }
 
     int failed = copy_file_contents(src_fd, dest_fd) != 0;
+    PortableXattrs xattrs = {0};
+    if (!failed &&
+        metadata_apply_ownership_and_mode_fd(dest_fd, &source_snapshot) != 0)
+        failed = 1;
+    if (!failed && collect_xattrs(src_fd, &xattrs) != 0)
+        failed = 1;
     struct stat after;
     if (!failed && (fstat(src_fd, &after) != 0 ||
                     !metadata_source_unchanged(&source_snapshot, &after)))
         failed = 1;
-    if (!failed && metadata_apply_fd(dest_fd, &source_snapshot, policy) != 0)
+    if (!failed && metadata_apply_xattrs_fd(dest_fd, xattrs.items,
+                                            xattrs.count) != 0)
         failed = 1;
+    if (!failed && metadata_apply_times_fd(dest_fd, &source_snapshot, policy) != 0)
+        failed = 1;
+    xattrs_free(&xattrs);
 
     // A write deferred by the kernel (quota, ENOSPC, a network filesystem)
     // can surface only here, so a failed close means the payload is not
@@ -237,7 +275,8 @@ static BackupCaptureStatus capture_regular_at(
 }
 
 // The directory is created with owner-only access and given the source's real
-// mode by metadata_apply_fd() only after its whole subtree is written.
+// mode by metadata_apply_ownership_and_mode_fd() only after its whole subtree
+// is written.
 // Creating it with the final mode up front would make a read-only source
 // directory (e.g. 0555) impossible to descend into and populate, and the
 // transient 0700 is never more permissive to group or other than the mode it
@@ -339,15 +378,25 @@ static BackupCaptureStatus capture_directory_at(
         if (result == BACKUP_CAPTURE_OK)
             result = BACKUP_CAPTURE_ERROR;
     }
+    PortableXattrs xattrs = {0};
+    if (result == BACKUP_CAPTURE_OK &&
+        metadata_apply_ownership_and_mode_fd(child_fd, &source_snapshot) != 0)
+        result = BACKUP_CAPTURE_ERROR;
+    if (result == BACKUP_CAPTURE_OK && collect_xattrs(source_fd, &xattrs) != 0)
+        result = BACKUP_CAPTURE_ERROR;
     struct stat after;
     if (result == BACKUP_CAPTURE_OK &&
         (fstat(source_fd, &after) != 0 ||
          !metadata_source_unchanged(&source_snapshot, &after)))
         result = BACKUP_CAPTURE_ERROR;
     if (result == BACKUP_CAPTURE_OK &&
-        metadata_apply_fd(child_fd, &source_snapshot,
-                          metadata_policy_from_context(ctx)) != 0)
+        metadata_apply_xattrs_fd(child_fd, xattrs.items, xattrs.count) != 0)
         result = BACKUP_CAPTURE_ERROR;
+    if (result == BACKUP_CAPTURE_OK &&
+        metadata_apply_times_fd(child_fd, &source_snapshot,
+                                metadata_policy_from_context(ctx)) != 0)
+        result = BACKUP_CAPTURE_ERROR;
+    xattrs_free(&xattrs);
     if (close(source_fd) != 0)
     {
         if (result == BACKUP_CAPTURE_OK)

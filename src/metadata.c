@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/statfs.h>
+#include <sys/xattr.h>
 #include <time.h>
 #include <stdint.h>
 #include <unistd.h>
@@ -515,6 +516,250 @@ int metadata_apply_symlink_at(int dir_fd, const char *leaf,
     if (metadata_apply_symlink_ownership_at(dir_fd, leaf, desired) != 0)
         return -1;
     return metadata_apply_symlink_times_at(dir_fd, leaf, desired, policy);
+}
+
+typedef struct {
+    int fd;
+    const char *path;
+} MetadataXattrTarget;
+
+static int metadata_xattr_unsupported_errno(int value)
+{
+    return value == ENOTSUP || value == EOPNOTSUPP || value == ENODATA;
+}
+
+static ssize_t metadata_xattr_list(const MetadataXattrTarget *target,
+                                   char *names, size_t size)
+{
+    if (target == NULL)
+        return -1;
+    if (target->fd >= 0)
+        return flistxattr(target->fd, names, size);
+    if (target->path != NULL)
+        return llistxattr(target->path, names, size);
+    errno = EINVAL;
+    return -1;
+}
+
+static int metadata_xattr_remove(const MetadataXattrTarget *target,
+                                 const char *name)
+{
+    if (target == NULL || name == NULL)
+        return -1;
+    if (target->fd >= 0)
+        return fremovexattr(target->fd, name);
+    if (target->path != NULL)
+        return lremovexattr(target->path, name);
+    errno = EINVAL;
+    return -1;
+}
+
+static int metadata_xattr_set(const MetadataXattrTarget *target,
+                              const char *name, const void *value,
+                              size_t value_length)
+{
+    if (target == NULL || name == NULL || (value == NULL && value_length != 0))
+        return -1;
+    if (target->fd >= 0)
+        return fsetxattr(target->fd, name, value, value_length, 0);
+    if (target->path != NULL)
+        return lsetxattr(target->path, name, value, value_length, 0);
+    errno = EINVAL;
+    return -1;
+}
+
+static int metadata_xattr_input_valid(const SidecarXattr *xattrs, size_t count)
+{
+    if (count > SIDECAR_MAX_XATTRS_PER_ENTRY ||
+        (count != 0 && xattrs == NULL))
+        return -1;
+
+    for (size_t index = 0; index < count; index++)
+    {
+        const SidecarXattr *current = &xattrs[index];
+        if (current->name.data == NULL || current->name.length == 0 ||
+            current->name.length > SIDECAR_MAX_XATTR_NAME ||
+            memchr(current->name.data, '\0', current->name.length) != NULL ||
+            current->value.length > SIDECAR_MAX_XATTR_VALUE ||
+            (current->value.length != 0 && current->value.data == NULL))
+            return -1;
+        for (size_t previous = 0; previous < index; previous++)
+            if (xattrs[previous].name.length == current->name.length &&
+                memcmp(xattrs[previous].name.data, current->name.data,
+                       current->name.length) == 0)
+                return -1;
+    }
+    return 0;
+}
+
+static int metadata_xattr_names_valid(const char *names, size_t length,
+                                      size_t *count)
+{
+    if ((length != 0 && names == NULL) || count == NULL)
+        return -1;
+
+    size_t found = 0;
+    size_t offset = 0;
+    while (offset < length)
+    {
+        size_t name_length = strnlen(names + offset, length - offset);
+        if (name_length == 0 || name_length > SIDECAR_MAX_XATTR_NAME ||
+            name_length == length - offset ||
+            found == SIDECAR_MAX_XATTRS_PER_ENTRY)
+            return -1;
+        found++;
+        offset += name_length + 1U;
+    }
+    *count = found;
+    return 0;
+}
+
+static int metadata_xattr_names_read(const MetadataXattrTarget *target,
+                                     char **out_names, size_t *out_count)
+{
+    if (target == NULL || out_names == NULL || out_count == NULL)
+        return -1;
+    *out_names = NULL;
+    *out_count = 0;
+
+    errno = 0;
+    ssize_t required = metadata_xattr_list(target, NULL, 0);
+    if (required < 0)
+    {
+        if (metadata_xattr_unsupported_errno(errno))
+            return 0;
+        return -1;
+    }
+    if ((uintmax_t)required >
+        (uintmax_t)SIDECAR_MAX_XATTRS_PER_ENTRY *
+            (uintmax_t)(SIDECAR_MAX_XATTR_NAME + 1U))
+        return -1;
+    if (required == 0)
+        return 0;
+
+    char *names = malloc((size_t)required);
+    if (names == NULL)
+        return -1;
+    ssize_t received = metadata_xattr_list(target, names, (size_t)required);
+    if (received != required || metadata_xattr_names_valid(
+                                    names, (size_t)received, out_count) != 0)
+    {
+        free(names);
+        return -1;
+    }
+    *out_names = names;
+    return 0;
+}
+
+static int metadata_xattr_input_contains(const SidecarXattr *xattrs,
+                                         size_t count, const char *name)
+{
+    size_t name_length = strlen(name);
+    for (size_t index = 0; index < count; index++)
+        if (xattrs[index].name.length == name_length &&
+            memcmp(xattrs[index].name.data, name, name_length) == 0)
+            return 1;
+    return 0;
+}
+
+static int metadata_apply_xattrs_target(const MetadataXattrTarget *target,
+                                        const SidecarXattr *xattrs,
+                                        size_t count)
+{
+    if (target == NULL ||
+        metadata_xattr_input_valid(xattrs, count) != 0)
+        return -1;
+
+    char *existing_names = NULL;
+    size_t existing_count = 0;
+    if (metadata_xattr_names_read(target, &existing_names,
+                                  &existing_count) != 0)
+        return -1;
+
+    size_t offset = 0;
+    for (size_t index = 0; index < existing_count; index++)
+    {
+        char *name = existing_names + offset;
+        size_t name_length = strlen(name);
+        if (!metadata_xattr_input_contains(xattrs, count, name))
+        {
+            if (metadata_xattr_remove(target, name) != 0 && errno != ENODATA)
+            {
+                free(existing_names);
+                return -1;
+            }
+        }
+        offset += name_length + 1U;
+    }
+
+    for (size_t index = 0; index < count; index++)
+    {
+        const SidecarXattr *current = &xattrs[index];
+        char *name = malloc(current->name.length + 1U);
+        if (name == NULL)
+        {
+            free(existing_names);
+            return -1;
+        }
+        memcpy(name, current->name.data, current->name.length);
+        name[current->name.length] = '\0';
+
+        static const unsigned char empty_value;
+        const void *value = current->value.length == 0 ? &empty_value :
+                                                         current->value.data;
+        int failed = metadata_xattr_set(target, name, value,
+                                        current->value.length);
+        free(name);
+        if (failed != 0)
+        {
+            free(existing_names);
+            return -1;
+        }
+    }
+    free(existing_names);
+    return 0;
+}
+
+static int metadata_safe_xattr_component(const char *component)
+{
+    if (component == NULL || component[0] == '\0' ||
+        strcmp(component, ".") == 0 || strcmp(component, "..") == 0 ||
+        strchr(component, '/') != NULL || strlen(component) > NAME_MAX)
+        return 0;
+    return 1;
+}
+
+static int metadata_symlink_xattr_path(int dir_fd, const char *leaf,
+                                       char *path, size_t path_size)
+{
+    if (dir_fd < 0 || path == NULL || path_size == 0 ||
+        !metadata_safe_xattr_component(leaf))
+        return -1;
+    int length = snprintf(path, path_size, "/proc/self/fd/%d/%s", dir_fd,
+                          leaf);
+    return length < 0 || (size_t)length >= path_size ? -1 : 0;
+}
+
+int metadata_apply_xattrs_fd(int fd, const SidecarXattr *xattrs, size_t count)
+{
+    MetadataXattrTarget target = { .fd = fd, .path = NULL };
+    return metadata_apply_xattrs_target(&target, xattrs, count);
+}
+
+int metadata_apply_xattrs_symlink_at(int dir_fd, const char *leaf,
+                                     const SidecarXattr *xattrs, size_t count)
+{
+    char path[PATH_MAX];
+    if (metadata_symlink_xattr_path(dir_fd, leaf, path, sizeof(path)) != 0)
+        return -1;
+
+    struct stat st;
+    if (fstatat(dir_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) != 0 ||
+        !S_ISLNK(st.st_mode))
+        return -1;
+
+    MetadataXattrTarget target = { .fd = -1, .path = path };
+    return metadata_apply_xattrs_target(&target, xattrs, count);
 }
 
 int metadata_snapshot_matches(const MetadataSnapshot *snapshot,

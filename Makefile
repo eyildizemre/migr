@@ -28,7 +28,7 @@ VALGRIND_TESTS = \
 
 TARGET = migr
 VPATH = src
-SRCS = main.c detect.c report.c backup.c backup_plan.c packages.c restore.c utils.c fileops.c fsprobe.c xdg.c manifest.c encoding.c container.c metadata.c
+SRCS = main.c detect.c report.c backup.c backup_plan.c packages.c restore.c utils.c fileops.c fsprobe.c xdg.c manifest.c encoding.c container.c metadata.c portable.c sidecar.c sidecar_state.c
 OBJS = $(SRCS:.c=.o)
 ANALYZER_SRCS = $(wildcard src/*.c)
 
@@ -71,8 +71,8 @@ $(TEST_DETECT): tests/test_detect.c detect.o
 $(TEST_PATHJOIN): tests/test_pathjoin.c utils.o
 	$(CC) $(CFLAGS) -o $@ tests/test_pathjoin.c utils.o
 
-$(TEST_SPECIAL_FILES): tests/test_special_files.c fileops.o metadata.o utils.o
-	$(CC) $(CFLAGS) -o $@ tests/test_special_files.c fileops.o metadata.o utils.o
+$(TEST_SPECIAL_FILES): tests/test_special_files.c fileops.o metadata.o portable.o sidecar.o sidecar_state.o manifest.o encoding.o utils.o
+	$(CC) $(CFLAGS) -o $@ tests/test_special_files.c fileops.o metadata.o portable.o sidecar.o sidecar_state.o manifest.o encoding.o utils.o
 
 $(TEST_FSPROBE): tests/test_fsprobe.c fsprobe.o utils.o
 	$(CC) $(CFLAGS) -o $@ tests/test_fsprobe.c fsprobe.o utils.o
@@ -86,32 +86,32 @@ $(TEST_ENCODING): tests/test_encoding.c encoding.o
 $(TEST_CONTAINER): tests/test_container.c container.o manifest.o encoding.o utils.o
 	$(CC) $(CFLAGS) -o $@ tests/test_container.c container.o manifest.o encoding.o utils.o
 
-$(TEST_RESTORE_NATIVE): tests/test_restore_native.c fileops.o metadata.o utils.o
-	$(CC) $(CFLAGS) -o $@ tests/test_restore_native.c fileops.o metadata.o utils.o
+$(TEST_RESTORE_NATIVE): tests/test_restore_native.c fileops.o metadata.o portable.o sidecar.o sidecar_state.o manifest.o encoding.o utils.o
+	$(CC) $(CFLAGS) -o $@ tests/test_restore_native.c fileops.o metadata.o portable.o sidecar.o sidecar_state.o manifest.o encoding.o utils.o
 
-fileops_test.o: src/fileops.c src/fileops.h src/metadata.h
+fileops_test.o: src/fileops.c src/fileops.h src/metadata.h src/portable.h
 	$(CC) $(CFLAGS) -DFILEOPS_TEST_HOOKS -DBACKUP_TEST_HOOKS -c src/fileops.c -o $@
 
-$(TEST_RESTORE_SOURCE_READ): tests/test_restore_source_read.c fileops_test.o metadata.o utils.o
-	$(CC) $(CFLAGS) -DFILEOPS_TEST_HOOKS -o $@ tests/test_restore_source_read.c fileops_test.o metadata.o utils.o
+$(TEST_RESTORE_SOURCE_READ): tests/test_restore_source_read.c fileops_test.o metadata.o portable.o sidecar.o sidecar_state.o manifest.o encoding.o utils.o
+	$(CC) $(CFLAGS) -DFILEOPS_TEST_HOOKS -o $@ tests/test_restore_source_read.c fileops_test.o metadata.o portable.o sidecar.o sidecar_state.o manifest.o encoding.o utils.o
 
 backup_test.o: src/backup.c src/backup.h src/backup_plan.h src/fileops.h src/metadata.h
 	$(CC) $(CFLAGS) -DBACKUP_TEST_HOOKS -c src/backup.c -o $@
 
-$(TEST_BACKUP_SOURCE_READ): tests/test_backup_source_read.c backup_test.o backup_plan.o container.o fileops_test.o metadata.o fsprobe.o manifest.o encoding.o packages.o utils.o xdg.o detect.o
-	$(CC) $(CFLAGS) -DBACKUP_TEST_HOOKS -o $@ tests/test_backup_source_read.c backup_test.o backup_plan.o container.o fileops_test.o metadata.o fsprobe.o manifest.o encoding.o packages.o utils.o xdg.o detect.o
+$(TEST_BACKUP_SOURCE_READ): tests/test_backup_source_read.c backup_test.o backup_plan.o container.o fileops_test.o metadata.o portable.o sidecar.o sidecar_state.o fsprobe.o manifest.o encoding.o packages.o utils.o xdg.o detect.o
+	$(CC) $(CFLAGS) -DBACKUP_TEST_HOOKS -o $@ tests/test_backup_source_read.c backup_test.o backup_plan.o container.o fileops_test.o metadata.o portable.o sidecar.o sidecar_state.o fsprobe.o manifest.o encoding.o packages.o utils.o xdg.o detect.o
 
-$(TEST_RESTORE_DISPATCH): tests/test_restore_dispatch.c restore.o fileops.o metadata.o fsprobe.o manifest.o encoding.o container.o utils.o xdg.o detect.o
-	$(CC) $(CFLAGS) -o $@ tests/test_restore_dispatch.c restore.o fileops.o metadata.o fsprobe.o manifest.o encoding.o container.o utils.o xdg.o detect.o
+$(TEST_RESTORE_DISPATCH): tests/test_restore_dispatch.c restore.o fileops.o metadata.o portable.o sidecar.o sidecar_state.o fsprobe.o manifest.o encoding.o container.o utils.o xdg.o detect.o
+	$(CC) $(CFLAGS) -o $@ tests/test_restore_dispatch.c restore.o fileops.o metadata.o portable.o sidecar.o sidecar_state.o fsprobe.o manifest.o encoding.o container.o utils.o xdg.o detect.o
 
-$(TEST_RESTORE_ATIME): tests/test_restore_atime.c restore.o fileops.o metadata.o fsprobe.o manifest.o encoding.o container.o utils.o xdg.o detect.o
-	$(CC) $(CFLAGS) -o $@ tests/test_restore_atime.c restore.o fileops.o metadata.o fsprobe.o manifest.o encoding.o container.o utils.o xdg.o detect.o
+$(TEST_RESTORE_ATIME): tests/test_restore_atime.c restore.o fileops.o metadata.o portable.o sidecar.o sidecar_state.o fsprobe.o manifest.o encoding.o container.o utils.o xdg.o detect.o
+	$(CC) $(CFLAGS) -o $@ tests/test_restore_atime.c restore.o fileops.o metadata.o portable.o sidecar.o sidecar_state.o fsprobe.o manifest.o encoding.o container.o utils.o xdg.o detect.o
 
-$(TEST_BACKUP_PLAN): tests/test_backup_plan.c backup.o backup_plan.o container.o fileops.o metadata.o fsprobe.o manifest.o encoding.o packages.o utils.o xdg.o detect.o
-	$(CC) $(CFLAGS) -o $@ tests/test_backup_plan.c backup.o backup_plan.o container.o fileops.o metadata.o fsprobe.o manifest.o encoding.o packages.o utils.o xdg.o detect.o
+$(TEST_BACKUP_PLAN): tests/test_backup_plan.c backup.o backup_plan.o container.o fileops.o metadata.o portable.o sidecar.o sidecar_state.o fsprobe.o manifest.o encoding.o packages.o utils.o xdg.o detect.o
+	$(CC) $(CFLAGS) -o $@ tests/test_backup_plan.c backup.o backup_plan.o container.o fileops.o metadata.o portable.o sidecar.o sidecar_state.o fsprobe.o manifest.o encoding.o packages.o utils.o xdg.o detect.o
 
-$(TEST_METADATA_CONTRACT): tests/test_metadata_contract.c fileops.o metadata.o utils.o
-	$(CC) $(CFLAGS) -o $@ tests/test_metadata_contract.c fileops.o metadata.o utils.o
+$(TEST_METADATA_CONTRACT): tests/test_metadata_contract.c fileops.o metadata.o portable.o sidecar.o sidecar_state.o manifest.o encoding.o utils.o
+	$(CC) $(CFLAGS) -o $@ tests/test_metadata_contract.c fileops.o metadata.o portable.o sidecar.o sidecar_state.o manifest.o encoding.o utils.o
 
 $(TEST_SIDECAR): tests/test_sidecar.c sidecar.o
 	$(CC) $(CFLAGS) -o $@ tests/test_sidecar.c sidecar.o

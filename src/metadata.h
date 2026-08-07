@@ -7,6 +7,8 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
+#include "sidecar.h"
+
 typedef struct CloneContext CloneContext;
 
 #define METADATA_MAX_PROFILES 65536U
@@ -109,5 +111,9 @@ int metadata_apply_symlink_ownership_at(int dir_fd, const char *leaf,
 int metadata_apply_symlink_times_at(int dir_fd, const char *leaf,
                                     const struct stat *desired,
                                     MetadataTimestampPolicy policy);
+int metadata_apply_xattrs_fd(int fd, const SidecarXattr *xattrs,
+                             size_t count);
+int metadata_apply_xattrs_symlink_at(int dir_fd, const char *leaf,
+                                     const SidecarXattr *xattrs, size_t count);
 
 #endif

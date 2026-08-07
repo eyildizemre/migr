@@ -248,11 +248,40 @@ static int same_applied_metadata(const struct stat *left,
            same_timespec(left->st_mtim, right->st_mtim);
 }
 
-static int xattr_is_absent(const char *path, const char *name)
+static ssize_t get_xattr_value(const char *path, const char *name,
+                               void *value, size_t value_size, int nofollow)
 {
     errno = 0;
-    ssize_t length = getxattr(path, name, NULL, 0);
+    if (nofollow)
+        return lgetxattr(path, name, value, value_size);
+    return getxattr(path, name, value, value_size);
+}
+
+static int xattr_is_absent(const char *path, const char *name, int nofollow)
+{
+    ssize_t length = get_xattr_value(path, name, NULL, 0, nofollow);
     return length < 0 && errno == ENODATA;
+}
+
+static int xattr_value_equals(const char *path, const char *name,
+                              const void *expected, size_t expected_length,
+                              int nofollow)
+{
+    ssize_t length = get_xattr_value(path, name, NULL, 0, nofollow);
+    if (length < 0 || (size_t)length != expected_length)
+        return 0;
+    if (expected_length == 0)
+        return 1;
+
+    unsigned char *value = malloc(expected_length);
+    if (value == NULL)
+        fatal("could not allocate xattr test buffer");
+    ssize_t received = get_xattr_value(path, name, value, expected_length,
+                                       nofollow);
+    int matches = received == (ssize_t)expected_length &&
+                  memcmp(value, expected, expected_length) == 0;
+    free(value);
+    return matches;
 }
 
 static void set_metadata(const char *path, mode_t mode,
@@ -701,12 +730,14 @@ static void test_foreign_ownership_gap(void)
     remove_tree(base);
 }
 
-static void test_native_xattr_not_copied(void)
+static void test_native_xattrs_captured(void)
 {
     const char *case_name = "xattr";
     char base[PATH_MAX], source_root[PATH_MAX], capture_root[PATH_MAX];
     char restore_root[PATH_MAX], source_path[PATH_MAX], capture_path[PATH_MAX];
     char restore_path[PATH_MAX];
+    char source_dir[PATH_MAX], capture_dir[PATH_MAX];
+    char source_link[PATH_MAX], capture_link[PATH_MAX];
     make_temp_root(base, sizeof(base));
     join_or_die(source_root, sizeof(source_root), base, "source");
     join_or_die(capture_root, sizeof(capture_root), base, "capture");
@@ -734,8 +765,41 @@ static void test_native_xattr_not_copied(void)
                  case_name, "capture result");
     close(capture_fd);
     join_or_die(capture_path, sizeof(capture_path), capture_root, "entry");
-    check_result(xattr_is_absent(capture_path, "user.migr_test"), case_name,
-                 "captured payload carries no source xattr (today's baseline)");
+    check_result(xattr_value_equals(capture_path, "user.migr_test", "value", 5,
+                                    0),
+                 case_name, "fresh regular capture preserves xattr value");
+
+    if (setxattr(source_path, "user.migr_other", "stale", 5, 0) != 0)
+        fatal("could not create the second xattr fixture");
+    capture_fd = open_directory(capture_root);
+    check_result(backup_capture_at(&BACKUP_CTX, source_path,
+                                   capture_fd, "entry") == 0,
+                 case_name, "regular capture adds a second xattr");
+    close(capture_fd);
+    check_result(xattr_value_equals(capture_path, "user.migr_other", "stale", 5,
+                                    0),
+                 case_name, "fresh regular capture preserves all xattrs");
+
+    if (removexattr(source_path, "user.migr_other") != 0)
+        fatal("could not remove the source xattr fixture");
+    capture_fd = open_directory(capture_root);
+    check_result(backup_capture_at(&BACKUP_CTX, source_path,
+                                   capture_fd, "entry") == 0,
+                 case_name, "resume capture reconciles removed xattr");
+    close(capture_fd);
+    check_result(xattr_is_absent(capture_path, "user.migr_other", 0), case_name,
+                 "resume capture removes a stale destination xattr");
+
+    if (setxattr(source_path, "user.migr_test", "changed", 7, 0) != 0)
+        fatal("could not change the source xattr fixture");
+    capture_fd = open_directory(capture_root);
+    check_result(backup_capture_at(&BACKUP_CTX, source_path,
+                                   capture_fd, "entry") == 0,
+                 case_name, "resume capture reconciles changed xattr");
+    close(capture_fd);
+    check_result(xattr_value_equals(capture_path, "user.migr_test", "changed", 7,
+                                    0),
+                 case_name, "resume capture updates a changed xattr value");
 
     int source_fd = open_directory(capture_root);
     int restore_fd = open_directory(restore_root);
@@ -745,8 +809,59 @@ static void test_native_xattr_not_copied(void)
     close(source_fd);
     close(restore_fd);
     join_or_die(restore_path, sizeof(restore_path), restore_root, "entry");
-    check_result(xattr_is_absent(restore_path, "user.migr_test"), case_name,
-                 "restored destination carries no source xattr (today's baseline)");
+    check_result(xattr_is_absent(restore_path, "user.migr_test", 0), case_name,
+                 "native restore still leaves xattrs unapplied");
+
+    join_or_die(source_dir, sizeof(source_dir), source_root, "directory");
+    join_or_die(capture_dir, sizeof(capture_dir), capture_root, "directory");
+    if (mkdir(source_dir, 0700) != 0)
+        fatal("could not create the directory xattr fixture");
+    char child_path[PATH_MAX];
+    join_or_die(child_path, sizeof(child_path), source_dir, "child");
+    write_file(child_path, "directory-xattr-child");
+    if (setxattr(source_dir, "user.migr_directory", "directory", 9, 0) != 0)
+    {
+        if (errno == ENOTSUP || errno == EOPNOTSUPP || errno == EPERM ||
+            errno == EACCES)
+            skip_case(case_name, "directory user xattrs are unavailable");
+        else
+            fatal("could not create the directory xattr fixture");
+    }
+    else
+    {
+        capture_fd = open_directory(capture_root);
+        check_result(backup_capture_at(&BACKUP_CTX, source_dir,
+                                       capture_fd, "directory") == 0,
+                     case_name, "directory capture result");
+        close(capture_fd);
+        check_result(xattr_value_equals(capture_dir, "user.migr_directory",
+                                        "directory", 9, 0),
+                     case_name, "directory capture preserves xattr value");
+    }
+
+    join_or_die(source_link, sizeof(source_link), source_root, "link");
+    join_or_die(capture_link, sizeof(capture_link), capture_root, "link");
+    if (symlink("target.txt", source_link) != 0)
+        fatal("could not create the symlink xattr fixture");
+    if (lsetxattr(source_link, "user.migr_symlink", "symlink", 7, 0) != 0)
+    {
+        if (errno == ENOTSUP || errno == EOPNOTSUPP || errno == EPERM ||
+            errno == EACCES)
+            skip_case(case_name, "symlink user xattrs are unavailable");
+        else
+            fatal("could not create the symlink xattr fixture");
+    }
+    else
+    {
+        capture_fd = open_directory(capture_root);
+        check_result(backup_capture_at(&BACKUP_CTX, source_link,
+                                       capture_fd, "link") == 0,
+                     case_name, "symlink capture result");
+        close(capture_fd);
+        check_result(xattr_value_equals(capture_link, "user.migr_symlink",
+                                        "symlink", 7, 1),
+                     case_name, "symlink capture preserves xattr value");
+    }
 
     remove_tree(base);
 }
@@ -932,7 +1047,7 @@ int main(void)
     test_metadata_helper_failure_paths();
     test_metadata_apply_split_equivalence();
     test_foreign_ownership_gap();
-    test_native_xattr_not_copied();
+    test_native_xattrs_captured();
 
     if (failures != 0)
     {

@@ -13,6 +13,10 @@ typedef struct {
     size_t capacity;
 } PortableXattrs;
 
+void xattrs_free(PortableXattrs *xattrs);
+int collect_xattrs(int fd, PortableXattrs *out);
+int collect_symlink_xattrs(const char *path, PortableXattrs *out);
+
 /**
  * A source root and its container address for a portable capture.
  *
