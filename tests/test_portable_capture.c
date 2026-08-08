@@ -475,6 +475,28 @@ static int case_name_member(const char *name, const char *const *names,
     return 0;
 }
 
+static int collision_example_matches_names(
+    const PortablePrescanViolation *violation, const char *const *names,
+    size_t name_count)
+{
+    if (violation == NULL || names == NULL ||
+        violation->kind != PORTABLE_PRESCAN_CASE_COLLISION ||
+        strcmp(violation->root_id, "CASE") != 0 ||
+        !case_name_member(violation->logical_path, names, name_count) ||
+        !case_name_member(violation->collides_with_logical_path, names,
+                          name_count) ||
+        strcmp(violation->logical_path,
+               violation->collides_with_logical_path) == 0)
+        return 0;
+
+    char left[SIDECAR_MAX_PATH + 1U];
+    char right[SIDECAR_MAX_PATH + 1U];
+    ascii_fold_copy(left, sizeof(left), violation->logical_path);
+    ascii_fold_copy(right, sizeof(right),
+                    violation->collides_with_logical_path);
+    return strcmp(left, right) == 0;
+}
+
 static int run_case_fixture(const char *base, const char *label,
                             const char *const *names, size_t name_count,
                             int case_sensitive, char *source_path,
@@ -595,7 +617,7 @@ static void test_case_collision_prescan(const char *base)
                               sizeof(three_way) / sizeof(three_way[0]));
     }
     check(result != 0 && report.total_count == 2 && pairs_are_valid,
-          "three ASCII case variants produce two collision violations");
+          "three ASCII case variants count each losing name (total_count == 2)");
     check(empty_capture_container(container_fd),
           "three-way collision refusal leaves the container untouched");
     portable_prescan_report_free(&report);
@@ -611,6 +633,108 @@ static void test_case_collision_prescan(const char *base)
                               &container_fd, &report);
     check(result == 0 && report.total_count == 0,
           "non-ASCII case folding remains deferred to destination probing");
+    portable_prescan_report_free(&report);
+    close(container_fd);
+    remove_tree(source_path);
+    remove_tree(container_path);
+}
+
+static void test_case_collision_report_cap(const char *base)
+{
+    printf(BLUE "::" NC " bounded case-collision report\n");
+    enum {
+        COLLISION_PAIR_COUNT = PORTABLE_PRESCAN_MAX_EXAMPLES + 8U,
+        COLLISION_NAME_COUNT = COLLISION_PAIR_COUNT * 2U
+    };
+    char storage[COLLISION_NAME_COUNT][32];
+    const char *names[COLLISION_NAME_COUNT];
+    for (size_t index = 0; index < COLLISION_PAIR_COUNT; index++) {
+        int upper_length = snprintf(storage[index * 2U],
+                                    sizeof(storage[index * 2U]), "Pair%03zu",
+                                    index);
+        int lower_length = snprintf(storage[index * 2U + 1U],
+                                    sizeof(storage[index * 2U + 1U]),
+                                    "pair%03zu", index);
+        if (upper_length < 0 || lower_length < 0 ||
+            (size_t)upper_length >= sizeof(storage[index * 2U]) ||
+            (size_t)lower_length >= sizeof(storage[index * 2U + 1U]))
+            fixture_fatal("could not build bounded collision fixture");
+        names[index * 2U] = storage[index * 2U];
+        names[index * 2U + 1U] = storage[index * 2U + 1U];
+    }
+
+    char source_path[PATH_MAX];
+    char container_path[PATH_MAX];
+    int container_fd;
+    PortablePrescanReport report;
+    int result = run_case_fixture(
+        base, "case-report-cap", names, COLLISION_NAME_COUNT, 0,
+        source_path, sizeof(source_path), container_path,
+        sizeof(container_path), &container_fd, &report);
+    int examples_are_real = report.example_count ==
+                                PORTABLE_PRESCAN_MAX_EXAMPLES;
+    for (size_t index = 0;
+         index < report.example_count && examples_are_real; index++)
+        examples_are_real = collision_example_matches_names(
+            &report.examples[index], names, COLLISION_NAME_COUNT);
+    check(result != 0 && report.total_count == COLLISION_PAIR_COUNT &&
+              report.example_count == PORTABLE_PRESCAN_MAX_EXAMPLES &&
+              examples_are_real,
+          "collision report caps examples at 64 while total_count keeps every loser");
+    check(empty_capture_container(container_fd),
+          "bounded collision refusal leaves the container namespace untouched");
+    portable_prescan_report_free(&report);
+    close(container_fd);
+    remove_tree(source_path);
+    remove_tree(container_path);
+}
+
+static void test_case_collision_directory_scope(const char *base)
+{
+    printf(BLUE "::" NC " directory-local case collisions\n");
+    char source_path[PATH_MAX];
+    char container_path[PATH_MAX];
+    join_path(source_path, sizeof(source_path), base, "case-directory-scope");
+    join_path(container_path, sizeof(container_path), base,
+              "case-directory-scope-container");
+    make_directory(source_path);
+    make_directory(container_path);
+
+    char left_path[PATH_MAX];
+    char right_path[PATH_MAX];
+    join_path(left_path, sizeof(left_path), source_path, "left");
+    join_path(right_path, sizeof(right_path), source_path, "right");
+    make_directory(left_path);
+    make_directory(right_path);
+    char path[PATH_MAX];
+    join_path(path, sizeof(path), left_path, "Foo");
+    write_file(path, "left", 4);
+    join_path(path, sizeof(path), right_path, "foo");
+    write_file(path, "right", 5);
+
+    int container_fd = open(container_path,
+                             O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open directory-scope container");
+    PortableRootSpec root = root_spec("CASE", source_path, "CASE");
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .roots = &root,
+        .root_count = 1,
+        .nsec_exact = 1,
+        .case_sensitive = 0
+    };
+    PortablePrescanReport report;
+    portable_prescan_report_init(&report);
+    int result = portable_capture_fresh_at(container_fd, &request, &report);
+    check(result == 0 && report.total_count == 0,
+          "same names in different directories do not collide");
+    struct stat st;
+    check(fstatat(container_fd, "data/CASE/left/Foo", &st,
+                  AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(st.st_mode) &&
+              fstatat(container_fd, "data/CASE/right/foo", &st,
+                      AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(st.st_mode),
+          "directory-local names are both captured under their own parents");
     portable_prescan_report_free(&report);
     close(container_fd);
     remove_tree(source_path);
@@ -1715,6 +1839,8 @@ int main(void)
     test_prescan_report();
     test_case_fold_helpers();
     test_case_collision_prescan(root_path);
+    test_case_collision_report_cap(root_path);
+    test_case_collision_directory_scope(root_path);
     test_case_probe(root_path);
     test_encoded_payload_names(root_path);
     test_nested_encoded_directories(root_path);
