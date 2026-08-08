@@ -1360,3 +1360,155 @@ with `xattr_count != 0` is rejected until Phase E. Symlink extended attributes
 are now replayed through the no-follow `l*` family under E-3's ordinary
 fail-closed rule; D18 C-8 and the Phase C/D as-built records remain unchanged
 as historical entries.
+
+---
+
+## D21 — 2026-08-08 — Portable case-collision resolution: deterministic suffix
+
+**Status:** Decided — Phase F implementation pending
+
+**Decision:** Portable capture resolves case collisions in the payload namespace
+with a deterministic, `readdir`-order-independent suffix while preserving D19
+N-10's destination-backed measurement discipline. The suffix is a structural
+`collision_suffix` field in the sidecar v2 `ENTRY` record, present for every
+entry; an empty field means that the entry has no suffix. The **real physical
+path contains the suffix** when one is assigned, but the suffix is never carried
+to the restore destination, where the logical name is written.
+
+### F-1 — Deterministic assignment order
+
+Encoded sibling names are ordered by unsigned byte-wise lexicographic order,
+independent of `readdir()` order. Each candidate first tries an empty suffix;
+later members of a collision group begin with canonical `N=1,2,...`. If a
+destination reservation or readback rejects a candidate, the allocator advances
+to the next canonical suffix. Therefore the first sorted candidate is preferred
+without being promised a suffix-free name under every measured destination
+state.
+
+### F-2a — Structural wire field
+
+In sidecar v2, every `ENTRY` contains `collision_suffix` in a fixed position
+immediately after `physical_path`. The empty value is the semantic
+no-collision case; writing the field only for colliding entries is not a valid
+wire encoding because the NUL-separated grammar would become ambiguous.
+
+### F-2b — Canonical suffix form
+
+The suffix is `%7E` followed by a decimal `N` (`%7E1`, `%7E2`, ...). `N` is at
+least one, has no leading zeroes, uses an uppercase `E`, and is bounded before
+allocation by the sidecar, component, and path ceilings. The form stays inside
+D19's encoded on-disk alphabet because the raw `~` byte is encoded as `%7E`.
+
+### F-2c — Physical path carries the suffix
+
+`SidecarEntry.physical_path` is the actual payload path, including its suffix.
+The suffix is stored separately so restore can authenticate the relationship;
+it is not a reason to omit the suffix from the payload name and it is never
+re-derived from the logical name. A collision candidate's physical leaf is
+`encode_component(logical_leaf) + collision_suffix`.
+
+### F-2d — Destination authority for candidate allocation
+
+The source-set ordering and candidate numbering are deterministic, but final
+candidate names are verified on the destination with the existing probe and
+readback discipline. Reservation and attribution are hash-based and must not
+reintroduce a wall-clock dependency or an O(n^2) scan. On resume, a name owned
+by the current container/sidecar for the same logical entry is not an external
+collision; stale owned names and foreign names are handled explicitly rather
+than silently overwritten.
+
+An ASCII suffix alone cannot prove how an encoded candidate relates to every
+non-ASCII name on a particular filesystem. For example, a raw `foo~1` becomes
+`foo%7E1` and may still fold with another candidate. The destination, not a
+filesystem-name prediction, remains authoritative.
+
+### F-3 — Parent-prefix physical/logical invariant
+
+The restore invariant is not entry-local. Because capture derives a child's
+physical path from its parent's physical path, a directory suffix is embedded
+in every descendant physical path. For a non-root entry, the recorded
+`physical_path` must equal the **immediate parent's recorded `physical_path`**,
+then `/`, then `encode_component(logical_leaf) + collision_suffix`. A root-level
+entry uses the manifest root's `payload_path` as its parent and performs no
+parent-entry lookup. A missing parent entry is malformed and is refused. This
+single parent-prefix check inductively covers all ancestor suffixes without
+guessing them from logical paths.
+
+### F-4 — Complete assignment plan
+
+The pre-scan produces a bounded plan keyed by `(root_id, logical_path)` and
+containing the actual `physical_path`, `collision_suffix`, and reservation data.
+Fresh and resume capture contexts consume this plan; walkers never invent a
+fallback suffix. A source-set change between pre-scan and capture (including a
+new or missing entry) is a fail-closed source-plan mismatch rather than an
+opportunity to silently choose a different name.
+
+### F-5 — Root payload namespace
+
+`ManifestRoot.payload_path` addresses are a separate namespace. Overlapping,
+duplicate, or case-equivalent root payload paths are rejected before mutation;
+F does not introduce a root suffix field. Where non-ASCII equivalence cannot
+be inferred, the same destination probe/readback authority is used.
+
+### F-6 — Limits and report semantics
+
+`NAME_MAX` and `PATH_MAX` checks include the suffix. A suffix-induced overflow is
+fatal. The pre-scan's fatal count contains only unresolved violations; resolved
+collisions are tracked separately (with bounded diagnostics where useful) and
+must not be allowed to make the old `total_count != 0` gate reject a successful
+resolution.
+
+### F-7 — Resume and reconciliation
+
+Each invocation recomputes the plan from the complete current source set. Adding
+or removing a sibling can renumber a collision group and therefore changes
+physical paths; that is an explicit replacement, not an unchanged-entry skip.
+The old physical nodes must be reconciled and must not survive as stale payload
+after a successful finalization. The same rule applies when an interrupted
+partial is adopted.
+
+### F-8 — Source-change fail-closed behaviour
+
+If capture observes a logical entry outside the plan, a planned entry disappears,
+the source object no longer matches its snapshot/identity, or the reserved
+physical name no longer passes the final destination check, capture fails
+without fallback allocation and publishes no final container. Same-invocation
+source drift is not silently reconciled.
+
+### F-9 — Test-only boundary
+
+The planner, assignment seams, and probe counters remain behind D14's test-only
+boundary. Production portable dispatch stays disabled; no production override,
+environment switch, or broad callback framework is introduced for testing.
+
+### F-10 — Wire version
+
+`SIDECAR_VERSION` advances from 1 to 2. The sidecar header, manifest
+`sidecar_version`, writer, reader, state map, and restore path use the same v2
+contract; `MANIFEST_CURRENT_VERSION` does not change. A legacy v1 sidecar is an
+unknown version and is refused rather than being guessed into the new grammar.
+
+**Why:** These decisions must be fixed before the codec and collision planner
+are implemented. The wire field, the root namespace boundary, destination
+measurement, and parent-prefix restore rule are format and safety contracts,
+not implementation details that can be rediscovered independently in each
+walker. Keeping the plan a pure function of the ordered source set gives fresh
+and resume captures the same logical-to-physical mapping, while target-backed
+candidate verification prevents a convenient ASCII assumption from becoming a
+silent data-loss path.
+
+**Rejected:** target-independent, computation-only suffix allocation, because an
+ASCII suffix cannot prove non-ASCII folding; a suffix kept only in the sidecar
+and omitted from the physical payload path, because payload lookup must use the
+actual path on disk; an entry-local restore invariant, because an ancestor's
+suffix is embedded in the entire descendant subtree; carrying the suffix to the
+restore destination, because restore writes the logical name; and backward
+compatibility with v1, because no released containers exist and v1 is explicitly
+refused by the v2 grammar.
+
+**Relationship:** D21 preserves D19 N-10's destination-backed measurement and
+extends D19's N-2/N-8 `NAME_MAX`/`PATH_MAX` limits to include the suffix. It bumps
+D17's sidecar v1 grammar to v2, generalizes N-4's physical/logical invariant to
+the parent-prefix form, and remains subject to D14's test-only boundary. Root
+payload paths remain governed by the manifest/root policy, hardlinks are deferred
+to Phase G, and sparse-file layout remains deferred under D13.
