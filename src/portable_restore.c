@@ -200,6 +200,10 @@ static uint64_t parent_map_hash(SidecarBytes root_id,
     return fnv1a_bytes(hash, logical_path.data, logical_path.length);
 }
 
+static int parent_map_find(const ParentMap *map, SidecarBytes root_id,
+                           SidecarBytes logical_path,
+                           SidecarBytes *physical_out);
+
 static int text_component_valid(const char *component, size_t length)
 {
     return component != NULL && length != 0 && length <= NAME_MAX &&
@@ -266,16 +270,32 @@ static int sidecar_path_valid(SidecarBytes bytes, int allow_empty)
     return 1;
 }
 
-/*
- * True only when physical is the per-component
- * ENCODING_MODE_COMPONENT encoding of logical, joined with '/'.  Callers
- * validate both paths with sidecar_path_valid() before using this predicate.
- * docs/DECISIONS.md D21 (F.2b): capture still emits an empty collision
- * suffix, so this predicate has no suffix-aware matching. A suffixed physical
- * path is rejected by the current invariant; F.3 will extend it to
- * parent-prefix matching when collision resolution is implemented.
- */
-int physical_matches_logical(SidecarBytes logical, SidecarBytes physical)
+static int collision_suffix_valid(SidecarBytes suffix)
+{
+    if (suffix.length == 0)
+        return 1;
+    if (suffix.data == NULL || suffix.length < 4U ||
+        suffix.length > SIDECAR_MAX_COLLISION_SUFFIX ||
+        suffix.data[0] != '%' || suffix.data[1] != '7' ||
+        suffix.data[2] != 'E' || suffix.data[3] < '1' ||
+        suffix.data[3] > '9')
+        return 0;
+
+    uint64_t value = (uint64_t)(suffix.data[3] - '0');
+    for (size_t index = 4U; index < suffix.length; index++)
+    {
+        if (suffix.data[index] < '0' || suffix.data[index] > '9' ||
+            value > (UINT64_MAX - (uint64_t)(suffix.data[index] - '0')) /
+                UINT64_C(10))
+            return 0;
+        value = value * UINT64_C(10) +
+                (uint64_t)(suffix.data[index] - '0');
+    }
+    return value != 0;
+}
+
+static int physical_matches_logical_with_suffix(
+    SidecarBytes logical, SidecarBytes physical, SidecarBytes suffix)
 {
     size_t logical_index = 0;
     size_t physical_index = 0;
@@ -314,9 +334,17 @@ int physical_matches_logical(SidecarBytes logical, SidecarBytes physical)
             return 0;
 
         size_t encoded_length = strlen(encoded);
-        if (physical_component_length != encoded_length ||
+        int last_component = logical_index == logical.length;
+        if (last_component && suffix.length > NAME_MAX - encoded_length)
+            return 0;
+        size_t expected_length = encoded_length +
+                                 (last_component ? suffix.length : 0U);
+        if (physical_component_length != expected_length ||
             memcmp(physical.data + physical_start, encoded,
-                   physical_component_length) != 0)
+                   encoded_length) != 0 ||
+            (last_component && suffix.length != 0 &&
+             memcmp(physical.data + physical_start + encoded_length,
+                    suffix.data, suffix.length) != 0))
             return 0;
 
         if (logical_index < logical.length)
@@ -324,6 +352,75 @@ int physical_matches_logical(SidecarBytes logical, SidecarBytes physical)
         if (physical_index < physical.length)
             physical_index++;
     }
+}
+
+/*
+ * True only when physical is the per-component
+ * ENCODING_MODE_COMPONENT encoding of logical, joined with '/'.
+ * Callers validate both paths with sidecar_path_valid() first.
+ * docs/DECISIONS.md D21 (F-2b/F-3) defines the suffix-aware leaf form and
+ * the parent-prefix relationship used by the restore gates below.
+ */
+int physical_matches_logical(SidecarBytes logical, SidecarBytes physical)
+{
+    return physical_matches_logical_with_suffix(logical, physical,
+                                                 (SidecarBytes){0});
+}
+
+static int entry_physical_matches_parent(const ManifestRoot *root,
+                                         const ParentMap *parent_map,
+                                         const SidecarEntry *entry)
+{
+    if (root == NULL || parent_map == NULL || entry == NULL ||
+        !collision_suffix_valid(entry->collision_suffix) ||
+        !sidecar_path_valid(entry->logical_path, 1) ||
+        !sidecar_path_valid(entry->physical_path, 1) ||
+        root->payload_path[0] == '\0')
+        return 0;
+
+    if (entry->logical_path.length == 0)
+        return entry->collision_suffix.length == 0 &&
+               entry->physical_path.length == 0;
+
+    size_t logical_leaf_start = 0;
+    for (size_t index = entry->logical_path.length; index > 0; index--)
+        if (entry->logical_path.data[index - 1U] == '/')
+        {
+            logical_leaf_start = index;
+            break;
+        }
+
+    SidecarBytes logical_parent = {
+        .data = entry->logical_path.data,
+        .length = logical_leaf_start == 0 ? 0 : logical_leaf_start - 1U
+    };
+    SidecarBytes logical_leaf = {
+        .data = entry->logical_path.data + logical_leaf_start,
+        .length = entry->logical_path.length - logical_leaf_start
+    };
+    SidecarBytes physical_leaf = entry->physical_path;
+
+    if (logical_parent.length != 0)
+    {
+        SidecarBytes parent_physical = {0};
+        int found = parent_map_find(parent_map, entry->root_id,
+                                    logical_parent, &parent_physical);
+        if (found != 1 || parent_physical.length == 0 ||
+            parent_physical.data == NULL ||
+            parent_physical.length >= entry->physical_path.length ||
+            entry->physical_path.data == NULL ||
+            memcmp(entry->physical_path.data, parent_physical.data,
+                   parent_physical.length) != 0 ||
+            entry->physical_path.data[parent_physical.length] != '/')
+            return 0;
+        physical_leaf.data = entry->physical_path.data +
+                             parent_physical.length + 1U;
+        physical_leaf.length = entry->physical_path.length -
+                               parent_physical.length - 1U;
+    }
+
+    return physical_matches_logical_with_suffix(logical_leaf, physical_leaf,
+                                                 entry->collision_suffix);
 }
 
 static void report_violation(PortableRestorePreflightReport *report,
@@ -1019,8 +1116,9 @@ static int collect_entry(const SidecarLiveView *view, void *argument)
             return 1;
         return 0;
     }
-    if (!physical_matches_logical(entry->logical_path,
-                                  entry->physical_path))
+    if (!entry_physical_matches_parent(
+            &collection->manifest->roots[root_index],
+            &collection->parent_map, entry))
     {
         report_violation(report, root_index, "physical-mismatch");
         return 0;
@@ -1163,10 +1261,11 @@ static int analyze_entries(PreflightMemory *memory,
         if (strcmp(previous->physical, current->physical) == 0)
         {
             /* Unreachable via collect_entry() as of D.4b: every entry that
-             * reaches this array has already passed physical_matches_logical(),
-             * and component_percent_encode() is injective, so two different
-             * logical paths can no longer produce the same physical path.
-             * Kept as defense-in-depth in case that upstream guarantee changes. */
+             * reaches this array has already passed the physical/logical
+             * validator, and component_percent_encode() is injective, so two
+             * different logical paths can no longer produce the same physical
+             * path. Kept as defense-in-depth in case that upstream guarantee
+             * changes. */
             if (strcmp(previous->logical, current->logical) != 0)
                 report_violation(report, current->root_index,
                                  current->logical);
@@ -1877,8 +1976,9 @@ static int replay_collect_entry(const SidecarLiveView *view, void *argument)
         !sidecar_path_valid(entry->logical_path, 1) ||
         !sidecar_path_valid(entry->physical_path, 1) ||
         !replay_entry_valid(entry) ||
-        !physical_matches_logical(entry->logical_path,
-                                  entry->physical_path))
+        !entry_physical_matches_parent(
+            &collection->manifest->roots[root_index],
+            &collection->parent_map, entry))
     {
         replay_report_failure(collection->report, collection->manifest,
                               root_index, entry->logical_path);

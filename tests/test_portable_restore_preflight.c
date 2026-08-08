@@ -1,5 +1,5 @@
 // Unit tests for the portable restore preflight gate (docs/DECISIONS.md
-// D17): portable_restore_preflight_at() is the read-only validation layer of
+// D17/D21): portable_restore_preflight_at() is the read-only validation layer of
 // the portable restore path — it checks an untrusted portable container
 // without mutating anything: no destination write, no container write, no
 // O_TMPFILE probe. Ownership profiles are only *collected* here; the probe
@@ -305,6 +305,62 @@ static int append_raw_sidecar(Fixture *fixture, const unsigned char *data,
     return result;
 }
 
+static int raw_field(unsigned char *buffer, size_t capacity, size_t *length,
+                     const unsigned char *data, size_t data_length)
+{
+    if (buffer == NULL || length == NULL || *length >= capacity ||
+        data_length >= capacity - *length)
+        return -1;
+    if (data_length != 0)
+        memcpy(buffer + *length, data, data_length);
+    *length += data_length;
+    buffer[(*length)++] = '\0';
+    return 0;
+}
+
+static int raw_text_field(unsigned char *buffer, size_t capacity,
+                          size_t *length, const char *text)
+{
+    return raw_field(buffer, capacity, length,
+                     (const unsigned char *)text, strlen(text));
+}
+
+static int append_raw_suffix_entry(Fixture *fixture,
+                                   const unsigned char *suffix,
+                                   size_t suffix_length)
+{
+    unsigned char raw[512];
+    size_t length = 0;
+    if (raw_text_field(raw, sizeof(raw), &length, "ENTRY") != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, "ROOT") != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, "file") != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, "file") != 0 ||
+        raw_field(raw, sizeof(raw), &length, suffix, suffix_length) != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, "regular") != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, "600") != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, "0") != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, "0") != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, "0") != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, "0") != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, "0") != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, "0") != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, "0") != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, "0") != 0)
+        return -1;
+
+    static const unsigned char commit[] = {
+        'E', 'N', 'T', 'R', 'Y', '_', 'C', 'O', 'M', 'M', 'I', 'T', '\0'
+    };
+    SidecarLog log = {0};
+    if (sidecar_log_create_at(fixture->container_fd, &log) !=
+            SIDECAR_OPEN_FRESH ||
+        sidecar_log_close(&log) != SIDECAR_STATUS_OK ||
+        append_raw_sidecar(fixture, raw, length) != 0 ||
+        append_raw_sidecar(fixture, commit, sizeof(commit)) != 0)
+        return -1;
+    return 0;
+}
+
 static int run_preflight(Fixture *fixture, PortableRestorePreflightReport *report)
 {
     Manifest manifest;
@@ -466,6 +522,190 @@ static void test_path_and_mapping_refusals(void)
                                       SIDECAR_KIND_REGULAR, 7);
     run_refusal_case("physical-mismatch", &root, &mismatch, 1,
                      prepare_root_dir);
+}
+
+static void run_suffix_refusal_case(const char *label, const char *suffix,
+                                    const char *physical,
+                                    ManifestRoot *root)
+{
+    Fixture fixture;
+    int opened = fixture_open(&fixture, label, root, 1);
+    check(opened == 0, "suffix-refusal fixture is created");
+    if (opened != 0)
+        return;
+    make_root_payload(&fixture);
+    char payload_path[PATH_MAX];
+    int payload_length = snprintf(payload_path, sizeof(payload_path),
+                                  "ROOT/%s", physical);
+    if (payload_length < 0 || (size_t)payload_length >= sizeof(payload_path))
+        fatal("suffix fixture payload path is too long");
+    write_file_at(fixture.data_fd, payload_path, "payload");
+    SidecarEntry entry = entry_for("ROOT", "file", physical,
+                                   SIDECAR_KIND_REGULAR, 0);
+    entry.collision_suffix = text_bytes(suffix);
+    check(write_sidecar(&fixture, &entry, 1) == 0,
+          "suffix-refusal sidecar is committed");
+    write_file_at(fixture.home_fd, "sentinel", "untouched");
+    char sentinel[PATH_MAX];
+    fixture_path(sentinel, sizeof(sentinel), fixture.home, "/sentinel");
+    PortableRestorePreflightReport report;
+    check(run_preflight(&fixture, &report) != 0 &&
+              file_equals(sentinel, "untouched"),
+          label);
+    portable_restore_preflight_report_free(&report);
+    fixture_close(&fixture);
+}
+
+static void run_raw_suffix_refusal_case(const char *label,
+                                        const unsigned char *suffix,
+                                        size_t suffix_length,
+                                        ManifestRoot *root)
+{
+    Fixture fixture;
+    int opened = fixture_open(&fixture, label, root, 1);
+    check(opened == 0, "raw suffix-refusal fixture is created");
+    if (opened != 0)
+        return;
+    make_root_payload(&fixture);
+    write_file_at(fixture.data_fd, "ROOT/file", "payload");
+    check(append_raw_suffix_entry(&fixture, suffix, suffix_length) == 0,
+          "raw malformed suffix record is committed");
+    PortableRestorePreflightReport report;
+    check(run_preflight(&fixture, &report) != 0 &&
+              report.violation_count != 0,
+          label);
+    portable_restore_preflight_report_free(&report);
+    fixture_close(&fixture);
+}
+
+static void test_collision_suffix_validation(void)
+{
+    printf(BLUE "::" NC " parent-prefix and collision-suffix validation\n");
+    ManifestRoot root = root_for("ROOT", "ROOT", "restored");
+    Fixture fixture;
+    int opened = fixture_open(&fixture, "suffix-valid", &root, 1);
+    check(opened == 0, "suffixed-tree fixture is created");
+    if (opened == 0)
+    {
+        make_root_payload(&fixture);
+        int payload_root = openat(fixture.data_fd, "ROOT",
+                                  O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (payload_root < 0)
+            fatal("could not open suffixed payload root");
+        if (mkdirat(payload_root, "dir%7E1", 0700) != 0)
+            fatal("could not create suffixed payload directory");
+        int suffixed_dir = openat(payload_root, "dir%7E1",
+                                  O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (suffixed_dir < 0)
+            fatal("could not open suffixed payload directory");
+        write_file_at(suffixed_dir, "file", "nested");
+        close(suffixed_dir);
+        write_file_at(payload_root, "Foo%7E1", "leaf");
+        close(payload_root);
+
+        SidecarEntry entries[] = {
+            entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0),
+            entry_for("ROOT", "dir", "dir%7E1",
+                      SIDECAR_KIND_DIRECTORY, 0),
+            entry_for("ROOT", "dir/file", "dir%7E1/file",
+                      SIDECAR_KIND_REGULAR, 6),
+            entry_for("ROOT", "Foo", "Foo%7E1", SIDECAR_KIND_REGULAR, 4)
+        };
+        entries[1].collision_suffix = text_bytes("%7E1");
+        entries[3].collision_suffix = text_bytes("%7E1");
+        check(write_sidecar(&fixture, entries, 4) == 0,
+              "suffixed-tree sidecar is committed");
+        PortableRestorePreflightReport report;
+        int result = run_preflight(&fixture, &report);
+        check(result == 0 && report.live_count == 4 &&
+                  report.violation_count == 0,
+              "suffixed ancestor and suffixed leaf pass preflight");
+        portable_restore_preflight_report_free(&report);
+        fixture_close(&fixture);
+    }
+
+    run_suffix_refusal_case("suffix-lower-e", "%7e1", "file%7e1", &root);
+    run_suffix_refusal_case("suffix-zero", "%7E0", "file%7E0", &root);
+    run_suffix_refusal_case("suffix-leading-zero", "%7E01",
+                            "file%7E01", &root);
+    run_suffix_refusal_case("suffix-no-digits", "%7E", "file%7E", &root);
+    run_suffix_refusal_case("suffix-overflow",
+                            "%7E18446744073709551616",
+                            "file%7E18446744073709551616", &root);
+    static const unsigned char embedded_nul[] = { '%', '7', 'E', '\0', '1' };
+    run_raw_suffix_refusal_case("suffix-embedded-nul", embedded_nul,
+                                sizeof(embedded_nul), &root);
+    unsigned char overlong[SIDECAR_MAX_COLLISION_SUFFIX + 1U];
+    memset(overlong, '1', sizeof(overlong));
+    overlong[0] = '%';
+    overlong[1] = '7';
+    overlong[2] = 'E';
+    run_raw_suffix_refusal_case("suffix-over-ceiling", overlong,
+                                sizeof(overlong), &root);
+
+    Fixture missing;
+    opened = fixture_open(&missing, "missing-parent", &root, 1);
+    check(opened == 0, "missing-parent fixture is created");
+    if (opened == 0)
+    {
+        make_root_payload(&missing);
+        SidecarEntry child = entry_for("ROOT", "dir/file", "dir/file",
+                                       SIDECAR_KIND_REGULAR, 0);
+        check(write_sidecar(&missing, &child, 1) == 0,
+              "missing-parent sidecar is committed");
+        PortableRestorePreflightReport report;
+        check(run_preflight(&missing, &report) != 0,
+              "missing parent entry is refused");
+        portable_restore_preflight_report_free(&report);
+        fixture_close(&missing);
+    }
+
+    Fixture mismatch;
+    opened = fixture_open(&mismatch, "parent-mismatch", &root, 1);
+    check(opened == 0, "parent-mismatch fixture is created");
+    if (opened == 0)
+    {
+        make_root_payload(&mismatch);
+        int payload_root = openat(mismatch.data_fd, "ROOT",
+                                  O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (payload_root < 0)
+            fatal("could not open parent-mismatch payload root");
+        if (mkdirat(payload_root, "dir%7E1", 0700) != 0)
+            fatal("could not create parent-mismatch payload directory");
+        close(payload_root);
+        SidecarEntry entries[] = {
+            entry_for("ROOT", "dir", "dir%7E1",
+                      SIDECAR_KIND_DIRECTORY, 0),
+            entry_for("ROOT", "dir/file", "other/file",
+                      SIDECAR_KIND_REGULAR, 0)
+        };
+        entries[0].collision_suffix = text_bytes("%7E1");
+        check(write_sidecar(&mismatch, entries, 2) == 0,
+              "parent-mismatch sidecar is committed");
+        PortableRestorePreflightReport report;
+        check(run_preflight(&mismatch, &report) != 0,
+              "parent physical-prefix mismatch is refused");
+        portable_restore_preflight_report_free(&report);
+        fixture_close(&mismatch);
+    }
+
+    Fixture root_suffix;
+    opened = fixture_open(&root_suffix, "root-suffix", &root, 1);
+    check(opened == 0, "root-suffix fixture is created");
+    if (opened == 0)
+    {
+        make_root_payload(&root_suffix);
+        SidecarEntry entry = entry_for("ROOT", "", "",
+                                       SIDECAR_KIND_DIRECTORY, 0);
+        entry.collision_suffix = text_bytes("%7E1");
+        check(write_sidecar(&root_suffix, &entry, 1) == 0,
+              "root-suffix sidecar is committed");
+        PortableRestorePreflightReport report;
+        check(run_preflight(&root_suffix, &report) != 0,
+              "root payload entry cannot carry a collision suffix");
+        portable_restore_preflight_report_free(&report);
+        fixture_close(&root_suffix);
+    }
 }
 
 static void test_xattr_entry_acceptance(void)
@@ -724,6 +964,7 @@ int main(void)
     test_missing_payload();
     test_xattr_entry_acceptance();
     test_path_and_mapping_refusals();
+    test_collision_suffix_validation();
     test_symlink_refusals();
     test_malformed_sidecars();
     test_raw_nul_and_root_gap();

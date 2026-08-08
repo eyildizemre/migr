@@ -1,4 +1,4 @@
-// Portable restore replay tests (docs/DECISIONS.md D17): this fixture drives
+// Portable restore replay tests (docs/DECISIONS.md D17/D21): this fixture drives
 // the mutation layer only after the read-only preflight, then checks exact core
 // metadata, fd-anchored payload revalidation, parent-first directory creation,
 // post-order directory metadata, and last-committed tombstone semantics.
@@ -284,6 +284,75 @@ static int write_sidecar(Fixture *fixture, const SidecarEntry *entries,
     return 0;
 }
 
+static int append_raw_sidecar(Fixture *fixture, const unsigned char *data,
+                               size_t length)
+{
+    int fd = openat(fixture->container_fd, SIDECAR_SLOT_NAME,
+                    O_WRONLY | O_APPEND | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    int result = write(fd, data, length) == (ssize_t)length ? 0 : -1;
+    if (close(fd) != 0)
+        result = -1;
+    return result;
+}
+
+static int raw_field(unsigned char *buffer, size_t capacity, size_t *length,
+                     const unsigned char *data, size_t data_length)
+{
+    if (buffer == NULL || length == NULL || *length >= capacity ||
+        data_length >= capacity - *length)
+        return -1;
+    if (data_length != 0)
+        memcpy(buffer + *length, data, data_length);
+    *length += data_length;
+    buffer[(*length)++] = '\0';
+    return 0;
+}
+
+static int raw_text_field(unsigned char *buffer, size_t capacity,
+                          size_t *length, const char *text)
+{
+    return raw_field(buffer, capacity, length,
+                     (const unsigned char *)text, strlen(text));
+}
+
+static int append_raw_suffix_entry(Fixture *fixture,
+                                   const unsigned char *suffix,
+                                   size_t suffix_length)
+{
+    unsigned char raw[512];
+    size_t length = 0;
+    if (raw_text_field(raw, sizeof(raw), &length, "ENTRY") != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, "ROOT") != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, "file") != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, "file") != 0 ||
+        raw_field(raw, sizeof(raw), &length, suffix, suffix_length) != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, "regular") != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, "600") != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, "0") != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, "0") != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, "0") != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, "0") != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, "0") != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, "0") != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, "0") != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, "0") != 0)
+        return -1;
+
+    static const unsigned char commit[] = {
+        'E', 'N', 'T', 'R', 'Y', '_', 'C', 'O', 'M', 'M', 'I', 'T', '\0'
+    };
+    SidecarLog log = {0};
+    if (sidecar_log_create_at(fixture->container_fd, &log) !=
+            SIDECAR_OPEN_FRESH ||
+        sidecar_log_close(&log) != SIDECAR_STATUS_OK ||
+        append_raw_sidecar(fixture, raw, length) != 0 ||
+        append_raw_sidecar(fixture, commit, sizeof(commit)) != 0)
+        return -1;
+    return 0;
+}
+
 static int run_preflight(Fixture *fixture)
 {
     Manifest manifest;
@@ -483,6 +552,202 @@ static void test_physical_logical_mismatch(void)
     check(file_equals_noatime(sentinel, "untouched"),
           "physical-mismatch refusal leaves the destination untouched");
     fixture_close(&fixture);
+}
+
+static void run_replay_suffix_refusal(const char *label, const char *suffix,
+                                      const char *physical,
+                                      ManifestRoot *root)
+{
+    Fixture fixture;
+    int opened = fixture_open(&fixture, root);
+    check(opened == 0, "suffix-refusal replay fixture is created");
+    if (opened != 0)
+        return;
+    make_dir_at(fixture.data_fd, "ROOT", 0700);
+    char payload_path[PATH_MAX];
+    int payload_length = snprintf(payload_path, sizeof(payload_path),
+                                  "ROOT/%s", physical);
+    if (payload_length < 0 || (size_t)payload_length >= sizeof(payload_path))
+        fatal("suffix fixture payload path is too long");
+    write_file_at(fixture.data_fd, payload_path, "payload");
+    SidecarEntry entry = entry_for("ROOT", "file", physical,
+                                   SIDECAR_KIND_REGULAR, 0, 0600,
+                                   1700000000, 0, 1700000001, 0);
+    entry.collision_suffix = text_bytes(suffix);
+    check(write_sidecar(&fixture, &entry, 1, NULL, NULL) == 0,
+          "suffix-refusal replay sidecar is committed");
+    PortableRestoreReplayReport report;
+    int result = run_replay(&fixture, &report);
+    check(result != 0 && report.failed_count == 1 &&
+              strcmp(report.failed_logical_path, "file") == 0,
+          label);
+    fixture_close(&fixture);
+}
+
+static void run_raw_replay_suffix_refusal(const char *label,
+                                          const unsigned char *suffix,
+                                          size_t suffix_length,
+                                          ManifestRoot *root)
+{
+    Fixture fixture;
+    int opened = fixture_open(&fixture, root);
+    check(opened == 0, "raw suffix-refusal replay fixture is created");
+    if (opened != 0)
+        return;
+    make_dir_at(fixture.data_fd, "ROOT", 0700);
+    write_file_at(fixture.data_fd, "ROOT/file", "payload");
+    check(append_raw_suffix_entry(&fixture, suffix, suffix_length) == 0,
+          "raw malformed suffix replay record is committed");
+    PortableRestoreReplayReport report;
+    int result = run_replay(&fixture, &report);
+    check(result != 0 && report.failed_count == 1,
+          label);
+    fixture_close(&fixture);
+}
+
+static void test_collision_suffix_validation(void)
+{
+    printf(BLUE "::" NC " parent-prefix and collision-suffix replay\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "suffixed replay fixture is created");
+    if (opened == 0)
+    {
+        make_dir_at(fixture.data_fd, "ROOT", 0700);
+        int payload_root = openat(fixture.data_fd, "ROOT",
+                                  O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (payload_root < 0)
+            fatal("could not open suffixed replay payload root");
+        make_dir_at(payload_root, "dir%7E1", 0700);
+        int suffixed_dir = openat(payload_root, "dir%7E1",
+                                  O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (suffixed_dir < 0)
+            fatal("could not open suffixed replay directory");
+        write_file_at(suffixed_dir, "file", "nested");
+        close(suffixed_dir);
+        write_file_at(payload_root, "Foo%7E1", "leaf");
+        close(payload_root);
+
+        SidecarEntry entries[] = {
+            entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                      1700000000, 0, 1700000001, 0),
+            entry_for("ROOT", "dir", "dir%7E1",
+                      SIDECAR_KIND_DIRECTORY, 0, 0700,
+                      1700000002, 0, 1700000003, 0),
+            entry_for("ROOT", "dir/file", "dir%7E1/file",
+                      SIDECAR_KIND_REGULAR, 6, 0600,
+                      1700000004, 0, 1700000005, 0),
+            entry_for("ROOT", "Foo", "Foo%7E1", SIDECAR_KIND_REGULAR, 4,
+                      0600, 1700000006, 0, 1700000007, 0)
+        };
+        entries[1].collision_suffix = text_bytes("%7E1");
+        entries[3].collision_suffix = text_bytes("%7E1");
+        check(write_sidecar(&fixture, entries, 4, NULL, NULL) == 0,
+              "suffixed replay sidecar is committed");
+        check(run_preflight(&fixture) == 0,
+              "suffixed ancestor state passes preflight");
+        PortableRestoreReplayReport report;
+        int result = run_replay(&fixture, &report);
+        check(result == 0 && report.live_count == 4 &&
+                  report.applied_count == 4 && report.failed_count == 0,
+              "suffixed ancestor and suffixed leaf replay successfully");
+        char nested[PATH_MAX], leaf[PATH_MAX];
+        path_join(nested, sizeof(nested), fixture.home,
+                  "/restored/dir/file");
+        path_join(leaf, sizeof(leaf), fixture.home, "/restored/Foo");
+        check(file_equals_noatime(nested, "nested"),
+              "child beneath a suffixed directory is restored by logical name");
+        check(file_equals_noatime(leaf, "leaf"),
+              "suffixed physical leaf is not exposed at the destination");
+        fixture_close(&fixture);
+    }
+
+    run_replay_suffix_refusal("suffix-lower-e", "%7e1", "file%7e1", &root);
+    run_replay_suffix_refusal("suffix-zero", "%7E0", "file%7E0", &root);
+    run_replay_suffix_refusal("suffix-leading-zero", "%7E01",
+                              "file%7E01", &root);
+    run_replay_suffix_refusal("suffix-no-digits", "%7E", "file%7E", &root);
+    run_replay_suffix_refusal("suffix-overflow",
+                              "%7E18446744073709551616",
+                              "file%7E18446744073709551616", &root);
+    static const unsigned char embedded_nul[] = { '%', '7', 'E', '\0', '1' };
+    run_raw_replay_suffix_refusal("suffix-embedded-nul", embedded_nul,
+                                  sizeof(embedded_nul), &root);
+    unsigned char overlong[SIDECAR_MAX_COLLISION_SUFFIX + 1U];
+    memset(overlong, '1', sizeof(overlong));
+    overlong[0] = '%';
+    overlong[1] = '7';
+    overlong[2] = 'E';
+    run_raw_replay_suffix_refusal("suffix-over-ceiling", overlong,
+                                  sizeof(overlong), &root);
+
+    Fixture missing;
+    opened = fixture_open(&missing, &root);
+    check(opened == 0, "missing-parent replay fixture is created");
+    if (opened == 0)
+    {
+        make_dir_at(missing.data_fd, "ROOT", 0700);
+        SidecarEntry child = entry_for("ROOT", "dir/file", "dir/file",
+                                       SIDECAR_KIND_REGULAR, 0, 0600,
+                                       1700000010, 0, 1700000011, 0);
+        check(write_sidecar(&missing, &child, 1, NULL, NULL) == 0,
+              "missing-parent replay sidecar is committed");
+        PortableRestoreReplayReport report;
+        check(run_replay(&missing, &report) != 0 &&
+                  report.failed_count == 1,
+              "missing parent entry is refused during replay");
+        fixture_close(&missing);
+    }
+
+    Fixture mismatch;
+    opened = fixture_open(&mismatch, &root);
+    check(opened == 0, "parent-mismatch replay fixture is created");
+    if (opened == 0)
+    {
+        make_dir_at(mismatch.data_fd, "ROOT", 0700);
+        int payload_root = openat(mismatch.data_fd, "ROOT",
+                                  O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (payload_root < 0)
+            fatal("could not open parent-mismatch replay root");
+        make_dir_at(payload_root, "dir%7E1", 0700);
+        close(payload_root);
+        SidecarEntry entries[] = {
+            entry_for("ROOT", "dir", "dir%7E1",
+                      SIDECAR_KIND_DIRECTORY, 0, 0700,
+                      1700000012, 0, 1700000013, 0),
+            entry_for("ROOT", "dir/file", "other/file",
+                      SIDECAR_KIND_REGULAR, 0, 0600,
+                      1700000014, 0, 1700000015, 0)
+        };
+        entries[0].collision_suffix = text_bytes("%7E1");
+        check(write_sidecar(&mismatch, entries, 2, NULL, NULL) == 0,
+              "parent-mismatch replay sidecar is committed");
+        PortableRestoreReplayReport report;
+        check(run_replay(&mismatch, &report) != 0 &&
+                  report.failed_count == 1,
+              "parent physical-prefix mismatch is refused during replay");
+        fixture_close(&mismatch);
+    }
+
+    Fixture root_suffix;
+    opened = fixture_open(&root_suffix, &root);
+    check(opened == 0, "root-suffix replay fixture is created");
+    if (opened == 0)
+    {
+        make_dir_at(root_suffix.data_fd, "ROOT", 0700);
+        SidecarEntry entry = entry_for("ROOT", "", "",
+                                       SIDECAR_KIND_DIRECTORY, 0, 0700,
+                                       1700000016, 0, 1700000017, 0);
+        entry.collision_suffix = text_bytes("%7E1");
+        check(write_sidecar(&root_suffix, &entry, 1, NULL, NULL) == 0,
+              "root-suffix replay sidecar is committed");
+        PortableRestoreReplayReport report;
+        check(run_replay(&root_suffix, &report) != 0 &&
+                  report.failed_count == 1,
+              "root payload entry cannot carry a collision suffix");
+        fixture_close(&root_suffix);
+    }
 }
 
 static void test_normal_replay(void)
@@ -835,6 +1100,7 @@ int main(void)
 {
     test_symlink_collection_validation();
     test_physical_logical_mismatch();
+    test_collision_suffix_validation();
     test_normal_replay();
     test_xattr_replay();
     test_xattr_reconciliation();
