@@ -235,6 +235,10 @@ static int sidecar_path_valid(SidecarBytes bytes, int allow_empty)
  * True only when physical is the per-component
  * ENCODING_MODE_COMPONENT encoding of logical, joined with '/'.  Callers
  * validate both paths with sidecar_path_valid() before using this predicate.
+ * docs/DECISIONS.md D21 (F.2b): capture still emits an empty collision
+ * suffix, so this predicate has no suffix-aware matching. A suffixed physical
+ * path is rejected by the current invariant; F.3 will extend it to
+ * parent-prefix matching when collision resolution is implemented.
  */
 int physical_matches_logical(SidecarBytes logical, SidecarBytes physical)
 {

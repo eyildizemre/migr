@@ -1,5 +1,5 @@
 // Resume, adopt, and interruption-safety coverage for the portable capture
-// seam (docs/DECISIONS.md D17): committed-entry skip on unchanged regular and
+// seam (docs/DECISIONS.md D17/D21): committed-entry skip on unchanged regular and
 // symlink sources (inode + metadata/xattr equality; symlink source atime is
 // excluded per D18 because target reads may update it + on-disk payload shape),
 // forced recapture on a missing or changed payload, and pristine-namespace
@@ -39,6 +39,10 @@
 #include "manifest.h"
 #include "portable.h"
 #include "sidecar.h"
+
+extern int entries_equal(const SidecarEntry *current,
+                         const SidecarLiveView *previous,
+                         const PortableXattrs *xattrs);
 
 #define GREEN "\033[0;32m"
 #define RED   "\033[0;31m"
@@ -208,6 +212,36 @@ static int missing_at(int directory_fd, const char *name)
 static int child_killed_by(int status)
 {
     return WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL;
+}
+
+static SidecarBytes resume_bytes(const char *text)
+{
+    return (SidecarBytes){ (const unsigned char *)text, strlen(text) };
+}
+
+static void test_collision_suffix_resume_key(void)
+{
+    printf(BLUE "::" NC " collision suffix resume identity\n");
+    SidecarEntry current = {0};
+    SidecarEntry previous = {0};
+    current.root_id = previous.root_id = resume_bytes("ROOT");
+    current.logical_path = previous.logical_path = resume_bytes("file");
+    current.physical_path = previous.physical_path = resume_bytes("file");
+    SidecarLiveView view = {
+        .entry = &previous,
+        .xattrs = NULL,
+        .xattr_count = 0,
+        .generation = 0
+    };
+    PortableXattrs no_xattrs = {0};
+
+    current.collision_suffix = resume_bytes("%7E1");
+    check(entries_equal(&current, &view, &no_xattrs) == 0,
+          "a changed collision suffix forces resume replacement");
+
+    current.collision_suffix = (SidecarBytes){0};
+    check(entries_equal(&current, &view, &no_xattrs) != 0,
+          "identical empty collision suffixes preserve resume equality");
 }
 
 static int run_fresh_interrupt(int container_fd,
@@ -1096,6 +1130,7 @@ int main(void)
     if (mkdtemp(base) == NULL)
         fixture_fatal("could not create fixture root");
 
+    test_collision_suffix_resume_key();
     test_resume_skips_and_replaces(base);
     test_resume_xattr_equivalence(base);
     test_encoded_resume(base);

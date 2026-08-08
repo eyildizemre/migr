@@ -843,6 +843,8 @@ int entry_from_stat(const char *root_id, const char *logical,
         st->st_mtim.tv_nsec < 0 || st->st_mtim.tv_nsec > SIDECAR_MAX_NSEC)
         return -1;
 
+    /* docs/DECISIONS.md D21: capture emits an empty collision suffix until
+     * collision resolution is implemented. */
     memset(out, 0, sizeof(*out));
     out->root_id = (SidecarBytes){ (const unsigned char *)root_id,
                                    strlen(root_id) };
@@ -923,6 +925,8 @@ int entries_equal(const SidecarEntry *current,
     return sidecar_bytes_equal(current->root_id, entry->root_id) &&
            sidecar_bytes_equal(current->logical_path, entry->logical_path) &&
            sidecar_bytes_equal(current->physical_path, entry->physical_path) &&
+           sidecar_bytes_equal(current->collision_suffix,
+                               entry->collision_suffix) &&
            current->kind == entry->kind && current->mode == entry->mode &&
            current->uid == entry->uid && current->gid == entry->gid &&
            (current->kind == SIDECAR_KIND_SYMLINK ||
