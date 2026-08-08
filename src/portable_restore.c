@@ -32,6 +32,19 @@ typedef struct {
 } RootMap;
 
 typedef struct {
+    SidecarBytes root_id;
+    SidecarBytes logical_path;
+    SidecarBytes physical_path;
+    int used;
+} ParentMapSlot;
+
+typedef struct {
+    ParentMapSlot *slots;
+    size_t count;
+    size_t capacity;
+} ParentMap;
+
+typedef struct {
     size_t root_index;
     char *logical;
     char *physical;
@@ -53,6 +66,7 @@ typedef struct {
     const Manifest *manifest;
     PortableRestorePreflightReport *report;
     RootMap root_map;
+    ParentMap parent_map; /* Parent-prefix validation consumes this (D21). */
     size_t *root_order;
     PreflightEntries *entries;
     int destination_home_fd;
@@ -91,6 +105,7 @@ typedef struct {
     PreflightMemory memory;
     const Manifest *manifest;
     RootMap root_map;
+    ParentMap parent_map; /* Parent-prefix validation consumes this (D21). */
     int data_fd;
     int destination_home_fd;
     MetadataTimestampPolicy timestamp_policy;
@@ -163,6 +178,26 @@ static uint64_t fnv1a_bytes(uint64_t hash, const unsigned char *data,
         hash *= UINT64_C(1099511628211);
     }
     return hash;
+}
+
+static uint64_t fnv1a_uint64(uint64_t hash, uint64_t value)
+{
+    for (size_t index = 0; index < sizeof(value); index++)
+    {
+        hash ^= (unsigned char)(value >> (index * 8U));
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static uint64_t parent_map_hash(SidecarBytes root_id,
+                                SidecarBytes logical_path)
+{
+    uint64_t hash = UINT64_C(1469598103934665603);
+    hash = fnv1a_uint64(hash, (uint64_t)root_id.length);
+    hash = fnv1a_bytes(hash, root_id.data, root_id.length);
+    hash = fnv1a_uint64(hash, (uint64_t)logical_path.length);
+    return fnv1a_bytes(hash, logical_path.data, logical_path.length);
 }
 
 static int text_component_valid(const char *component, size_t length)
@@ -395,6 +430,175 @@ static size_t root_map_find(const RootMap *map, const Manifest *manifest,
         index = (index + 1U) & (map->capacity - 1U);
     }
     return SIZE_MAX;
+}
+
+static int parent_map_key_valid(SidecarBytes root_id,
+                                SidecarBytes logical_path)
+{
+    return root_id.length <= SIDECAR_MAX_ROOT_ID && root_id.length != 0 &&
+           root_id.data != NULL && logical_path.length <= SIDECAR_MAX_PATH &&
+           (logical_path.length == 0 || logical_path.data != NULL);
+}
+
+static int parent_map_find(const ParentMap *map, SidecarBytes root_id,
+                           SidecarBytes logical_path,
+                           SidecarBytes *physical_out)
+{
+    if (physical_out == NULL || !parent_map_key_valid(root_id, logical_path))
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    *physical_out = (SidecarBytes){0};
+    if (map == NULL || map->capacity == 0 || map->slots == NULL)
+        return 0;
+
+    size_t index = (size_t)parent_map_hash(root_id, logical_path) &
+                   (map->capacity - 1U);
+    for (size_t probes = 0; probes < map->capacity; probes++)
+    {
+        const ParentMapSlot *slot = &map->slots[index];
+        if (!slot->used)
+            return 0;
+        if (slot->root_id.length == root_id.length &&
+            slot->logical_path.length == logical_path.length &&
+            (root_id.length == 0 ||
+             memcmp(slot->root_id.data, root_id.data, root_id.length) == 0) &&
+            (logical_path.length == 0 ||
+             memcmp(slot->logical_path.data, logical_path.data,
+                    logical_path.length) == 0))
+        {
+            *physical_out = slot->physical_path;
+            return 1;
+        }
+        index = (index + 1U) & (map->capacity - 1U);
+    }
+    return 0;
+}
+
+static int parent_map_init(ParentMap *map, PreflightMemory *memory,
+                           size_t expected)
+{
+    if (map == NULL || memory == NULL || expected > SIDECAR_MAX_LIVE_ENTRIES)
+    {
+        errno = E2BIG;
+        return -1;
+    }
+    memset(map, 0, sizeof(*map));
+    if (expected > SIZE_MAX / 2U)
+    {
+        errno = E2BIG;
+        return -1;
+    }
+    size_t minimum = expected * 2U;
+    size_t capacity = 16U;
+    while (capacity < minimum)
+    {
+        if (capacity > SIZE_MAX / 2U)
+        {
+            errno = E2BIG;
+            return -1;
+        }
+        capacity *= 2U;
+    }
+    if (capacity > SIZE_MAX / sizeof(*map->slots))
+    {
+        errno = E2BIG;
+        return -1;
+    }
+    size_t size = capacity * sizeof(*map->slots);
+    map->slots = preflight_alloc(memory, size);
+    if (map->slots == NULL)
+        return -1;
+    memset(map->slots, 0, size);
+    map->capacity = capacity;
+    return 0;
+}
+
+static void parent_map_free(PreflightMemory *memory, ParentMap *map)
+{
+    if (map == NULL)
+        return;
+    preflight_free(memory, map->slots,
+                   map->capacity * sizeof(*map->slots));
+    memset(map, 0, sizeof(*map));
+}
+
+static int parent_map_insert(ParentMap *map, SidecarBytes root_id,
+                             SidecarBytes logical_path,
+                             SidecarBytes physical_path)
+{
+    SidecarBytes existing = {0};
+    int found = parent_map_find(map, root_id, logical_path, &existing);
+    if (found != 0)
+    {
+        errno = found < 0 ? errno : EINVAL;
+        return -1;
+    }
+    if (!parent_map_key_valid(root_id, logical_path) ||
+        physical_path.length > SIDECAR_MAX_PATH ||
+        (physical_path.length != 0 && physical_path.data == NULL) ||
+        map == NULL || map->slots == NULL || map->capacity == 0 ||
+        map->count >= map->capacity)
+    {
+        errno = E2BIG;
+        return -1;
+    }
+
+    size_t index = (size_t)parent_map_hash(root_id, logical_path) &
+                   (map->capacity - 1U);
+    for (size_t probes = 0; probes < map->capacity; probes++)
+    {
+        ParentMapSlot *slot = &map->slots[index];
+        if (!slot->used)
+        {
+            slot->root_id = root_id;
+            slot->logical_path = logical_path;
+            slot->physical_path = physical_path;
+            slot->used = 1;
+            map->count++;
+            return 0;
+        }
+        index = (index + 1U) & (map->capacity - 1U);
+    }
+    errno = E2BIG;
+    return -1;
+}
+
+static int parent_map_collect(const SidecarLiveView *view, void *argument)
+{
+    ParentMap *map = argument;
+    if (map == NULL || view == NULL || view->entry == NULL)
+    {
+        errno = EINVAL;
+        return 1;
+    }
+    return parent_map_insert(map, view->entry->root_id,
+                             view->entry->logical_path,
+                             view->entry->physical_path) == 0 ? 0 : 1;
+}
+
+static int parent_map_build(ParentMap *map, PreflightMemory *memory,
+                            SidecarLog *sidecar)
+{
+    if (map == NULL || memory == NULL || sidecar == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    size_t live_count = sidecar_log_live_count(sidecar);
+    if (parent_map_init(map, memory, live_count) != 0)
+        return -1;
+    SidecarStatus status = sidecar_log_foreach(sidecar, parent_map_collect,
+                                               map);
+    if (status != SIDECAR_STATUS_OK)
+    {
+        int saved = errno;
+        parent_map_free(memory, map);
+        errno = saved == 0 ? EIO : saved;
+        return -1;
+    }
+    return 0;
 }
 
 static int root_order_compare(const void *left, const void *right,
@@ -1284,6 +1488,7 @@ static void collection_free(Collection *collection, PreflightEntries *entries,
                    collection->report == NULL ? 0
                        : collection->report->root_count * sizeof(size_t));
     collection->root_order = NULL;
+    parent_map_free(&collection->memory, &collection->parent_map);
     root_map_free(&collection->root_map);
 }
 
@@ -1363,6 +1568,13 @@ int portable_restore_preflight_at(
         goto fail;
     }
 
+    if (parent_map_build(&collection.parent_map, &collection.memory,
+                         &sidecar) != 0)
+    {
+        sidecar_log_close(&sidecar);
+        close(data_fd);
+        goto fail;
+    }
     SidecarStatus status = sidecar_log_foreach(&sidecar, collect_entry,
                                                &collection);
     if (status != SIDECAR_STATUS_OK)
@@ -1496,6 +1708,7 @@ static void replay_collection_free(ReplayCollection *collection)
     collection->items = NULL;
     collection->count = 0;
     collection->capacity = 0;
+    parent_map_free(&collection->memory, &collection->parent_map);
     root_map_free(&collection->root_map);
 }
 
@@ -2481,6 +2694,14 @@ int portable_restore_replay_at(const PortableRestoreRequest *request,
     if (sidecar_log_adopt_at(request->source_container_fd, &sidecar) !=
         SIDECAR_OPEN_RESUMABLE)
     {
+        close(collection.data_fd);
+        collection.data_fd = -1;
+        goto fail;
+    }
+    if (parent_map_build(&collection.parent_map, &collection.memory,
+                         &sidecar) != 0)
+    {
+        sidecar_log_close(&sidecar);
         close(collection.data_fd);
         collection.data_fd = -1;
         goto fail;
