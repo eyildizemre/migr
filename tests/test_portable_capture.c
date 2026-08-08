@@ -1,4 +1,4 @@
-// Unit tests for the portable capture core (docs/DECISIONS.md D17/D18): the
+// Unit tests for the portable capture core (docs/DECISIONS.md D17/D18/D19/D21): the
 // fresh-capture-only walk over regular files and directories, behind the
 // test-only direct API (D14 -- never reachable from a release binary). No
 // resume, no adopt, no interruption testing here; those are separate steps
@@ -340,6 +340,30 @@ static void test_prescan_report(void)
               report.examples[0].actual == 258,
           "pre-scan violation fields round-trip");
 
+    PortablePrescanReport collision_report;
+    portable_prescan_report_init(&collision_report);
+    PortablePrescanViolation collision = {
+        .kind = PORTABLE_PRESCAN_CASE_COLLISION,
+        .limit = 0,
+        .actual = 0
+    };
+    strcpy(collision.root_id, "CASE");
+    strcpy(collision.logical_path, "Foo");
+    strcpy(collision.collides_with_logical_path, "foo");
+    check(prescan_report_add(&collision_report, &collision) == 0 &&
+              collision_report.total_count == 1 &&
+              collision_report.example_count == 1 &&
+              collision_report.examples[0].kind ==
+                  PORTABLE_PRESCAN_CASE_COLLISION &&
+              strcmp(collision_report.examples[0].root_id, "CASE") == 0 &&
+              strcmp(collision_report.examples[0].logical_path, "Foo") == 0 &&
+              strcmp(collision_report.examples[0].collides_with_logical_path,
+                     "foo") == 0 &&
+              collision_report.examples[0].limit == 0 &&
+              collision_report.examples[0].actual == 0,
+          "case-collision fields keep a non-empty pair and zero limit/actual");
+    portable_prescan_report_free(&collision_report);
+
     for (size_t index = 1; index < PORTABLE_PRESCAN_MAX_EXAMPLES + 8U;
          index++) {
         PortablePrescanViolation extra = {
@@ -639,6 +663,59 @@ static void test_case_collision_prescan(const char *base)
     remove_tree(container_path);
 }
 
+/* F.1b baseline: ASCII-fold and destination-probed case collisions are fatal
+ * today. F.4 is expected to turn these collision assertions into successful
+ * suffix resolution while keeping NAME_MAX and PATH_MAX violations fatal. */
+static void test_mixed_prescan_violations(const char *base)
+{
+    printf(BLUE "::" NC " mixed pre-scan violation fate\n");
+    static const char *const collision_names[] = { "Foo", "foo" };
+    char oversized_name[NAME_MAX + 1U];
+    size_t oversized_length = NAME_MAX / 3U + 1U;
+    memset(oversized_name, ':', oversized_length);
+    oversized_name[oversized_length] = '\0';
+    const char *names[] = {
+        collision_names[0], collision_names[1], oversized_name
+    };
+
+    char source_path[PATH_MAX];
+    char container_path[PATH_MAX];
+    int container_fd;
+    PortablePrescanReport report;
+    int result = run_case_fixture(
+        base, "case-mixed-violations", names, sizeof(names) / sizeof(names[0]),
+        0, source_path, sizeof(source_path), container_path,
+        sizeof(container_path), &container_fd, &report);
+
+    int name_violation = 0;
+    int collision_violation = 0;
+    for (size_t index = 0; index < report.example_count; index++) {
+        const PortablePrescanViolation *violation = &report.examples[index];
+        if (violation->kind == PORTABLE_PRESCAN_NAME_TOO_LONG &&
+            strcmp(violation->root_id, "CASE") == 0 &&
+            strcmp(violation->logical_path, oversized_name) == 0 &&
+            violation->limit == NAME_MAX &&
+            violation->actual == oversized_length * 3U)
+            name_violation = 1;
+        if (collision_example_matches_names(
+                violation, collision_names,
+                sizeof(collision_names) / sizeof(collision_names[0])) &&
+            violation->limit == 0 && violation->actual == 0)
+            collision_violation = 1;
+    }
+    check(result != 0 && report.total_count == 2 &&
+              report.example_count == 2,
+          "one collision and one NAME_MAX violation are both fatal today");
+    check(name_violation && collision_violation,
+          "mixed violations retain exact NAME_MAX and collision fields");
+    check(empty_capture_container(container_fd),
+          "mixed violation refusal leaves the container untouched");
+    portable_prescan_report_free(&report);
+    close(container_fd);
+    remove_tree(source_path);
+    remove_tree(container_path);
+}
+
 static void test_case_collision_report_cap(const char *base)
 {
     printf(BLUE "::" NC " bounded case-collision report\n");
@@ -840,6 +917,7 @@ static void test_case_probe(const char *base)
     result = portable_capture_fresh_at(container_fd, &failure_request,
                                        &report);
     check(result != 0 && report.total_count == 0 &&
+              report.example_count == 0 &&
               empty_capture_container(container_fd),
           "an unavailable probe scratch directory fails before mutation");
     check(fstatat(container_fd, CASE_PROBE_DIR, &marker_stat,
@@ -1839,6 +1917,7 @@ int main(void)
     test_prescan_report();
     test_case_fold_helpers();
     test_case_collision_prescan(root_path);
+    test_mixed_prescan_violations(root_path);
     test_case_collision_report_cap(root_path);
     test_case_collision_directory_scope(root_path);
     test_case_probe(root_path);
