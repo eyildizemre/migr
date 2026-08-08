@@ -67,14 +67,43 @@ typedef struct {
 #define PORTABLE_PRESCAN_MAX_EXAMPLES 64U
 
 typedef struct {
+    char root_id[MANIFEST_ID_MAX];
+    char logical_path[SIDECAR_MAX_PATH + 1U];
+    char physical_path[SIDECAR_MAX_PATH + 1U];
+    char collision_suffix[SIDECAR_MAX_COLLISION_SUFFIX + 1U];
+} PortableCollisionPlanEntry;
+
+typedef struct {
+    PortableCollisionPlanEntry *entries;
+    size_t count;
+    size_t capacity;
+    int sorted;
+} PortableCollisionPlan;
+
+typedef struct {
     size_t total_count;
     PortablePrescanViolation *examples;
     size_t example_count;
     size_t example_capacity;
+    PortableCollisionPlan collision_plan;
 } PortablePrescanReport;
 
 void portable_prescan_report_init(PortablePrescanReport *report);
 void portable_prescan_report_free(PortablePrescanReport *report);
+
+void portable_collision_plan_init(PortableCollisionPlan *plan);
+void portable_collision_plan_free(PortableCollisionPlan *plan);
+const PortableCollisionPlanEntry *portable_collision_plan_find(
+    const PortableCollisionPlan *plan, const char *root_id,
+    const char *logical_path);
+
+/* Runs the read-only pre-scan and fills the collision plan without applying
+ * the capture gate. Violations remain in report->total_count; the ordinary
+ * capture entry points continue to refuse them until the walker consumes the
+ * plan (docs/DECISIONS.md D21, F-4). */
+int portable_collision_plan_build(int container_fd,
+                                  const PortableCaptureRequest *request,
+                                  PortablePrescanReport *report);
 
 /**
  * State used by the direct portable capture seam. The data and sidecar

@@ -48,6 +48,7 @@ void portable_prescan_report_free(PortablePrescanReport *report)
     if (report == NULL)
         return;
     free(report->examples);
+    portable_collision_plan_free(&report->collision_plan);
     memset(report, 0, sizeof(*report));
 }
 
@@ -183,6 +184,209 @@ static int copy_text(char *destination, size_t destination_size,
         return -1;
     memcpy(destination, source, length + 1U);
     return 0;
+}
+
+void portable_collision_plan_init(PortableCollisionPlan *plan)
+{
+    if (plan != NULL)
+        memset(plan, 0, sizeof(*plan));
+}
+
+void portable_collision_plan_free(PortableCollisionPlan *plan)
+{
+    if (plan == NULL)
+        return;
+    free(plan->entries);
+    memset(plan, 0, sizeof(*plan));
+}
+
+static int portable_collision_plan_compare(const void *left, const void *right)
+{
+    const PortableCollisionPlanEntry *left_entry = left;
+    const PortableCollisionPlanEntry *right_entry = right;
+    int root_result = strcmp(left_entry->root_id, right_entry->root_id);
+    if (root_result != 0)
+        return root_result;
+    return strcmp(left_entry->logical_path, right_entry->logical_path);
+}
+
+static void portable_collision_plan_sort(PortableCollisionPlan *plan)
+{
+    if (plan == NULL || plan->sorted)
+        return;
+    if (plan->count > 1U)
+        qsort(plan->entries, plan->count, sizeof(*plan->entries),
+              portable_collision_plan_compare);
+    plan->sorted = 1;
+}
+
+static int prescan_record_violation(PortablePrescanReport *report,
+                                    const char *root_id,
+                                    const char *logical_path,
+                                    PortablePrescanViolationKind kind,
+                                    size_t limit, size_t actual);
+int append_physical(char *destination, size_t destination_size,
+                    const char *parent, const char *encoded_leaf);
+
+static const PortableRootSpec *portable_collision_plan_root(
+    const PortableCaptureRequest *request, const char *root_id)
+{
+    if (request == NULL || root_id == NULL)
+        return NULL;
+    for (size_t index = 0; index < request->root_count; index++)
+        if (strcmp(request->roots[index].id, root_id) == 0)
+            return &request->roots[index];
+    return NULL;
+}
+
+static int portable_collision_plan_rewrite_parents(
+    PortablePrescanReport *report, const PortableCaptureRequest *request)
+{
+    if (report == NULL || request == NULL)
+        return -1;
+    PortableCollisionPlan *plan = &report->collision_plan;
+    if (!plan->sorted)
+        portable_collision_plan_sort(plan);
+
+    /* Recursion discovers child groups before its parent receives a suffix.
+     * Rebind descendants to the nearest planned ancestor after the complete
+     * deterministic plan is sorted (docs/DECISIONS.md D21, F-3). */
+    for (size_t index = 0; index < plan->count; index++) {
+        PortableCollisionPlanEntry *entry = &plan->entries[index];
+        const char *slash = strrchr(entry->logical_path, '/');
+        if (slash == NULL)
+            continue;
+
+        char parent_logical[SIDECAR_MAX_PATH + 1U];
+        size_t parent_length = (size_t)(slash - entry->logical_path);
+        const PortableCollisionPlanEntry *parent = NULL;
+        while (parent_length != 0) {
+            if (parent_length > SIDECAR_MAX_PATH)
+                return -1;
+            memcpy(parent_logical, entry->logical_path, parent_length);
+            parent_logical[parent_length] = '\0';
+            parent = portable_collision_plan_find(
+                plan, entry->root_id, parent_logical);
+            if (parent != NULL)
+                break;
+            const char *previous_slash = strrchr(parent_logical, '/');
+            parent_length = previous_slash == NULL
+                ? 0U
+                : (size_t)(previous_slash - parent_logical);
+        }
+        if (parent == NULL)
+            continue;
+
+        size_t ancestor_depth = 1U;
+        for (const char *cursor = parent_logical; *cursor != '\0'; cursor++)
+            if (*cursor == '/')
+                ancestor_depth++;
+        const char *leaf = entry->physical_path;
+        for (size_t component = 0; component < ancestor_depth; component++) {
+            const char *component_slash = strchr(leaf, '/');
+            if (component_slash == NULL)
+                return -1;
+            leaf = component_slash + 1;
+        }
+        if (*leaf == '\0')
+            return -1;
+
+        char rewritten[SIDECAR_MAX_PATH + 1U];
+        if (append_physical(rewritten, sizeof(rewritten), parent->physical_path,
+                            leaf) != 0)
+            return -1;
+        const PortableRootSpec *root =
+            portable_collision_plan_root(request, entry->root_id);
+        if (root == NULL)
+            return -1;
+        size_t payload_length = strlen(root->payload_path);
+        size_t physical_length = strlen(rewritten);
+        if (payload_length > SIZE_MAX - 1U ||
+            physical_length > SIZE_MAX - payload_length - 1U)
+            return -1;
+        size_t actual_path = payload_length + 1U + physical_length;
+        if (actual_path >= PATH_MAX) {
+            if (prescan_record_violation(
+                    report, entry->root_id, entry->logical_path,
+                    PORTABLE_PRESCAN_PATH_TOO_LONG, PATH_MAX,
+                    actual_path) != 0)
+                return -1;
+            return -1;
+        }
+        if (copy_text(entry->physical_path, sizeof(entry->physical_path),
+                      rewritten) != 0)
+            return -1;
+    }
+    return 0;
+}
+
+static int portable_collision_plan_add(PortableCollisionPlan *plan,
+                                       const char *root_id,
+                                       const char *logical_path,
+                                       const char *physical_path,
+                                       const char *collision_suffix)
+{
+    if (plan == NULL || root_id == NULL || logical_path == NULL ||
+        physical_path == NULL || collision_suffix == NULL ||
+        plan->count >= SIDECAR_MAX_LIVE_ENTRIES)
+        return -1;
+
+    if (plan->count == plan->capacity) {
+        size_t capacity = plan->capacity == 0 ? 8U : plan->capacity * 2U;
+        if (capacity < plan->capacity ||
+            capacity > SIDECAR_MAX_LIVE_ENTRIES)
+            capacity = SIDECAR_MAX_LIVE_ENTRIES;
+        if (capacity > SIZE_MAX / sizeof(*plan->entries))
+            return -1;
+        PortableCollisionPlanEntry *entries = realloc(
+            plan->entries, capacity * sizeof(*entries));
+        if (entries == NULL)
+            return -1;
+        plan->entries = entries;
+        plan->capacity = capacity;
+    }
+
+    PortableCollisionPlanEntry *entry = &plan->entries[plan->count];
+    memset(entry, 0, sizeof(*entry));
+    if (copy_text(entry->root_id, sizeof(entry->root_id), root_id) != 0 ||
+        copy_text(entry->logical_path, sizeof(entry->logical_path),
+                  logical_path) != 0 ||
+        copy_text(entry->physical_path, sizeof(entry->physical_path),
+                  physical_path) != 0 ||
+        copy_text(entry->collision_suffix, sizeof(entry->collision_suffix),
+                  collision_suffix) != 0)
+        return -1;
+    plan->count++;
+    plan->sorted = 0;
+    return 0;
+}
+
+const PortableCollisionPlanEntry *portable_collision_plan_find(
+    const PortableCollisionPlan *plan, const char *root_id,
+    const char *logical_path)
+{
+    if (plan == NULL || root_id == NULL || logical_path == NULL ||
+        !plan->sorted)
+        return NULL;
+
+    size_t low = 0;
+    size_t high = plan->count;
+    while (low < high) {
+        size_t middle = low + (high - low) / 2U;
+        const PortableCollisionPlanEntry *entry = &plan->entries[middle];
+        int root_result = strcmp(entry->root_id, root_id);
+        if (root_result < 0 ||
+            (root_result == 0 &&
+             strcmp(entry->logical_path, logical_path) < 0))
+            low = middle + 1U;
+        else
+            high = middle;
+    }
+    if (low < plan->count &&
+        strcmp(plan->entries[low].root_id, root_id) == 0 &&
+        strcmp(plan->entries[low].logical_path, logical_path) == 0)
+        return &plan->entries[low];
+    return NULL;
 }
 
 static int safe_id(const char *id)
@@ -1362,6 +1566,28 @@ int case_fold_set_find_or_insert(PortableCaseFoldSet *set,
     return case_fold_set_find_or_insert_value(set, folded_key, logical_path,
                                               SIZE_MAX, &value_index,
                                               out_logical_path);
+}
+
+static int case_fold_set_contains(const PortableCaseFoldSet *set,
+                                  const char *key)
+{
+    if (set == NULL || key == NULL || set->capacity == 0 ||
+        set->slots == NULL)
+        return 0;
+
+    size_t key_length = strlen(key);
+    uint64_t hash = case_fold_hash(set, key, key_length);
+    size_t index = (size_t)hash & (set->capacity - 1U);
+    for (size_t probes = 0; probes < set->capacity; probes++) {
+        const PortableCaseFoldSlot *slot = &set->slots[index];
+        if (slot->folded_key == NULL)
+            return 0;
+        if (slot->hash == hash && slot->key_length == key_length &&
+            memcmp(slot->folded_key, key, key_length) == 0)
+            return 1;
+        index = (index + 1U) & (set->capacity - 1U);
+    }
+    return 0;
 }
 
 void case_fold_set_free(PortableCaseFoldSet *set)
@@ -2857,101 +3083,437 @@ static int case_probe_cleanup(PortableCaseProbeState *state)
     return failed ? -1 : 0;
 }
 
-static int case_probe_group(PortableCaseProbeState *state,
-                            const PortableCaseProbeGroup *group,
-                            const char *root_id,
-                            PortablePrescanReport *report)
+typedef struct {
+    const char *encoded;
+    const char *logical;
+    char suffix[SIDECAR_MAX_COLLISION_SUFFIX + 1U];
+} PortableCollisionAssignment;
+
+static int portable_collision_assignment_compare(const void *left,
+                                                 const void *right)
 {
-    if (state == NULL || group == NULL || root_id == NULL || report == NULL ||
-        group->count < 2U || case_probe_prepare(state) != 0)
+    const PortableCollisionAssignment *left_entry = left;
+    const PortableCollisionAssignment *right_entry = right;
+    int encoded_result = strcmp(left_entry->encoded, right_entry->encoded);
+    if (encoded_result != 0)
+        return encoded_result;
+    return strcmp(left_entry->logical, right_entry->logical);
+}
+
+static int collision_suffix_format(uint64_t number, char *out,
+                                   size_t out_size)
+{
+    if (out == NULL || out_size == 0)
         return -1;
-    case_probe_count();
+    if (number == 0) {
+        out[0] = '\0';
+        return 0;
+    }
+    int length = snprintf(out, out_size, "%%7E%" PRIu64, number);
+    return length < 0 || (size_t)length >= out_size ||
+                   (size_t)length > SIDECAR_MAX_COLLISION_SUFFIX
+               ? -1
+               : 0;
+}
 
+/* Returns 0 for a valid path, 1 for a NAME_MAX overflow, 2 for PATH_MAX. */
+static int collision_paths_build(const char *parent_physical,
+                                 const char *payload_path,
+                                 const char *encoded, const char *suffix,
+                                 char *leaf, size_t leaf_size,
+                                 char *physical, size_t physical_size,
+                                 size_t *actual_name, size_t *actual_path)
+{
+    if (parent_physical == NULL || payload_path == NULL || encoded == NULL ||
+        suffix == NULL || leaf == NULL || physical == NULL ||
+        actual_name == NULL || actual_path == NULL)
+        return -1;
+    size_t encoded_length = strlen(encoded);
+    size_t suffix_length = strlen(suffix);
+    if (encoded_length > SIZE_MAX - suffix_length)
+        return -1;
+    *actual_name = encoded_length + suffix_length;
+    if (*actual_name > NAME_MAX || *actual_name >= leaf_size)
+        return 1;
+
+    size_t parent_length = bounded_strlen(parent_physical, physical_size);
+    if (parent_length >= physical_size)
+        return -1;
+    size_t separator_length = parent_length == 0 ? 0U : 1U;
+    if (parent_length > SIZE_MAX - separator_length ||
+        parent_length + separator_length >
+            SIZE_MAX - *actual_name)
+        return -1;
+    size_t physical_length = parent_length + separator_length + *actual_name;
+    size_t payload_length = strlen(payload_path);
+    if (payload_length > SIZE_MAX - 1U ||
+        physical_length > SIZE_MAX - payload_length - 1U)
+        return -1;
+    *actual_path = payload_length + 1U + physical_length;
+    if (physical_length >= physical_size || *actual_path >= PATH_MAX)
+        return 2;
+
+    memcpy(leaf, encoded, encoded_length);
+    memcpy(leaf + encoded_length, suffix, suffix_length + 1U);
+    if (append_physical(physical, physical_size, parent_physical, leaf) != 0)
+        return -1;
+    return 0;
+}
+
+static int case_probe_readback_matches(const PortableCaseFoldSet *expected,
+                                       int directory_fd)
+{
+    if (expected == NULL || directory_fd < 0)
+        return -1;
+    int scan_fd = duplicate_fd(directory_fd);
+    DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
+    if (directory == NULL) {
+        if (scan_fd >= 0)
+            close(scan_fd);
+        return -1;
+    }
+    rewinddir(directory);
+
+    size_t observed = 0;
     int failed = 0;
-    for (size_t index = 0; index < group->count; index++) {
-        int fd = openat(state->scratch_fd, group->encoded_names[index],
-                        O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
-                        0600);
-        if (fd >= 0) {
-            if (close(fd) != 0)
+    for (;;) {
+        errno = 0;
+        struct dirent *entry = readdir(directory);
+        if (entry == NULL) {
+            if (errno != 0)
                 failed = 1;
-        } else if (errno != EEXIST) {
-            failed = 1;
-        } else {
-            /* A later lookup of this byte string is not reliable for
-             * non-ASCII case aliases on vfat; the read-back pass below
-             * attributes collisions from the directory entries that
-             * survived. */
-        }
-        if (failed)
             break;
-    }
-
-    unsigned char *survived = NULL;
-    if (!failed) {
-        survived = calloc(group->count, sizeof(*survived));
-        if (survived == NULL)
-            failed = 1;
-    }
-    if (!failed) {
-        int scan_fd = duplicate_fd(state->scratch_fd);
-        DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
-        if (directory == NULL) {
-            if (scan_fd >= 0)
-                close(scan_fd);
-            failed = 1;
-        } else {
-            for (;;) {
-                errno = 0;
-                struct dirent *entry = readdir(directory);
-                if (entry == NULL) {
-                    if (errno != 0)
-                        failed = 1;
-                    break;
-                }
-                if (strcmp(entry->d_name, ".") == 0 ||
-                    strcmp(entry->d_name, "..") == 0)
-                    continue;
-                for (size_t index = 0; index < group->count; index++)
-                    if (!survived[index] &&
-                        strcmp(entry->d_name,
-                               group->encoded_names[index]) == 0) {
-                        survived[index] = 1;
-                        break;
-                    }
-            }
-            if (closedir(directory) != 0)
-                failed = 1;
         }
-    }
-
-    if (!failed) {
-        size_t representative = SIZE_MAX;
-        for (size_t index = 0; index < group->count; index++)
-            if (survived[index]) {
-                representative = index;
-                break;
-            }
-        if (representative == SIZE_MAX) {
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0)
+            continue;
+        if (!case_fold_set_contains(expected, entry->d_name)) {
             failed = 1;
-        } else {
-            for (size_t index = 0;
-                 index < group->count && !failed; index++)
-                if (!survived[index] &&
-                    prescan_record_case_collision(
-                        report, root_id, group->logical_paths[index],
-                        group->logical_paths[representative]) != 0)
-                    failed = 1;
+            break;
         }
+        observed++;
     }
+    if (closedir(directory) != 0)
+        failed = 1;
+    return failed || observed != expected->count ? -1 : 0;
+}
 
-    for (size_t index = 0; index < group->count; index++) {
-        if (unlinkat(state->scratch_fd, group->encoded_names[index], 0) != 0 &&
+static int case_probe_reserved_name_contains(
+    const PortableCaseFoldSet *reserved_names, const char *payload_path,
+    const char *physical)
+{
+    if (reserved_names == NULL || payload_path == NULL || physical == NULL)
+        return 0;
+    char full_path[SIDECAR_MAX_PATH + 1U];
+    if (append_physical(full_path, sizeof(full_path), payload_path,
+                        physical) != 0)
+        return 0;
+    char reservation_key[SIDECAR_MAX_PATH + 1U];
+    ascii_fold_copy(reservation_key, sizeof(reservation_key), full_path);
+    return case_fold_set_contains(reserved_names, reservation_key);
+}
+
+static int case_probe_source_name_contains(
+    const PortableCaseFoldSet *source_names, const char *physical)
+{
+    if (source_names == NULL || physical == NULL)
+        return 0;
+    char reservation_key[SIDECAR_MAX_PATH + 1U];
+    skeleton_copy(reservation_key, sizeof(reservation_key), physical);
+    return case_fold_set_contains(source_names, reservation_key);
+}
+
+static int case_probe_reserve_name(PortableCaseFoldSet *reserved_names,
+                                   const char *payload_path,
+                                   const char *parent_physical,
+                                   const char *leaf, char *physical,
+                                   size_t physical_size)
+{
+    if (reserved_names == NULL || payload_path == NULL ||
+        parent_physical == NULL ||
+        leaf == NULL || physical == NULL ||
+        append_physical(physical, physical_size, parent_physical, leaf) != 0)
+        return -1;
+    char full_path[SIDECAR_MAX_PATH + 1U];
+    if (append_physical(full_path, sizeof(full_path), payload_path,
+                        physical) != 0)
+        return -1;
+
+    char reservation_key[SIDECAR_MAX_PATH + 1U];
+    ascii_fold_copy(reservation_key, sizeof(reservation_key), full_path);
+    char *existing = NULL;
+    int result = case_fold_set_find_or_insert(reserved_names,
+                                              reservation_key, physical,
+                                              &existing);
+    return result < 0 ? -1 : result == 1 ? 1 : 0;
+}
+
+static int case_probe_group_names_free(PortableCaseProbeState *state,
+                                       const PortableCaseFoldSet *names)
+{
+    if (state == NULL || names == NULL || state->scratch_fd < 0)
+        return -1;
+    int failed = 0;
+    for (size_t index = 0; index < names->capacity; index++) {
+        const PortableCaseFoldSlot *slot = &names->slots[index];
+        if (slot->folded_key != NULL &&
+            unlinkat(state->scratch_fd, slot->folded_key, 0) != 0 &&
             errno != ENOENT)
             failed = 1;
     }
-    free(survived);
     return failed ? -1 : 0;
+}
+
+static int case_probe_group(PortableCaseProbeState *state,
+                            const PortableCaseProbeGroup *group,
+                            const char *root_id,
+                            const char *parent_physical,
+                            const char *payload_path,
+                            const PortableCaseFoldSet *source_names,
+                            PortableCaseFoldSet *reserved_names,
+                            PortablePrescanReport *report)
+{
+    if (state == NULL || group == NULL || root_id == NULL ||
+        parent_physical == NULL || payload_path == NULL || source_names == NULL ||
+        reserved_names == NULL || report == NULL || group->count < 2U ||
+        case_probe_prepare(state) != 0)
+        return -1;
+    case_probe_count();
+
+    PortableCollisionAssignment *assignments = calloc(
+        group->count, sizeof(*assignments));
+    int failed = assignments == NULL;
+    if (!failed) {
+        for (size_t index = 0; index < group->count; index++) {
+            assignments[index].encoded = group->encoded_names[index];
+            assignments[index].logical = group->logical_paths[index];
+        }
+        qsort(assignments, group->count, sizeof(*assignments),
+              portable_collision_assignment_compare);
+    }
+
+    PortableCaseFoldSet initial_names = {0};
+    int collision = group->ascii_collision;
+    for (size_t index = 0; index < group->count && !failed; index++) {
+        char leaf[SIDECAR_MAX_PATH + 1U];
+        char physical[SIDECAR_MAX_PATH + 1U];
+        size_t actual_name = 0;
+        size_t actual_path = 0;
+        int path_status = collision_paths_build(
+            parent_physical, payload_path, assignments[index].encoded, "",
+            leaf, sizeof(leaf), physical, sizeof(physical), &actual_name,
+            &actual_path);
+        if (path_status != 0) {
+            if (path_status == 1)
+                (void)prescan_record_violation(
+                    report, root_id, assignments[index].logical,
+                    PORTABLE_PRESCAN_NAME_TOO_LONG, NAME_MAX, actual_name);
+            else if (path_status == 2)
+                (void)prescan_record_violation(
+                    report, root_id, assignments[index].logical,
+                    PORTABLE_PRESCAN_PATH_TOO_LONG, PATH_MAX, actual_path);
+            failed = 1;
+            break;
+        }
+        if (case_probe_reserved_name_contains(reserved_names, payload_path,
+                                              physical)) {
+            collision = 1;
+            continue;
+        }
+
+        int fd = openat(state->scratch_fd, leaf,
+                        O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                        0600);
+        if (fd >= 0) {
+            if (close(fd) != 0) {
+                failed = 1;
+                break;
+            }
+            char *existing = NULL;
+            if (case_fold_set_find_or_insert(&initial_names, leaf, leaf,
+                                             &existing) < 0) {
+                failed = 1;
+                break;
+            }
+        } else if (errno == EEXIST) {
+            collision = 1;
+        } else {
+            failed = 1;
+            break;
+        }
+    }
+
+    if (!failed && case_probe_readback_matches(&initial_names,
+                                                state->scratch_fd) != 0)
+        failed = 1;
+    if (!failed && initial_names.count != group->count)
+        collision = 1;
+
+    if (!failed && !collision) {
+        for (size_t index = 0; index < group->count && !failed; index++) {
+            char physical[SIDECAR_MAX_PATH + 1U];
+            if (case_probe_reserve_name(reserved_names, payload_path,
+                                        parent_physical,
+                                        assignments[index].encoded, physical,
+                                        sizeof(physical)) != 0)
+                failed = 1;
+        }
+    }
+
+    if (case_probe_group_names_free(state, &initial_names) != 0)
+        failed = 1;
+    case_fold_set_free(&initial_names);
+
+    PortableCaseFoldSet names = {0};
+    PortableCaseFoldSet reserved_leaves = {0};
+    if (!failed && collision) {
+        for (size_t index = 0; index < group->count && !failed; index++) {
+            uint64_t suffix_number = index == 0 ? 0 : 1;
+            for (;;) {
+                if (collision_suffix_format(
+                        suffix_number, assignments[index].suffix,
+                        sizeof(assignments[index].suffix)) != 0) {
+                    failed = 1;
+                    break;
+                }
+                char leaf[SIDECAR_MAX_PATH + 1U];
+                char physical[SIDECAR_MAX_PATH + 1U];
+                size_t actual_name = 0;
+                size_t actual_path = 0;
+                int path_status = collision_paths_build(
+                    parent_physical, payload_path, assignments[index].encoded,
+                    assignments[index].suffix, leaf, sizeof(leaf), physical,
+                    sizeof(physical), &actual_name, &actual_path);
+                if (path_status != 0) {
+                    if (path_status == 1)
+                        (void)prescan_record_violation(
+                            report, root_id, assignments[index].logical,
+                            PORTABLE_PRESCAN_NAME_TOO_LONG, NAME_MAX,
+                            actual_name);
+                    else if (path_status == 2)
+                        (void)prescan_record_violation(
+                            report, root_id, assignments[index].logical,
+                            PORTABLE_PRESCAN_PATH_TOO_LONG, PATH_MAX,
+                            actual_path);
+                    failed = 1;
+                    break;
+                }
+                char reservation_key[SIDECAR_MAX_PATH + 1U];
+                skeleton_copy(reservation_key, sizeof(reservation_key), leaf);
+                if (case_fold_set_contains(&reserved_leaves,
+                                           reservation_key) ||
+                    (assignments[index].suffix[0] != '\0' &&
+                     case_probe_source_name_contains(source_names, physical)) ||
+                     case_probe_reserved_name_contains(reserved_names,
+                                                       payload_path,
+                                                       physical)) {
+                    if (suffix_number == UINT64_MAX) {
+                        failed = 1;
+                        break;
+                    }
+                    suffix_number++;
+                    continue;
+                }
+
+                int fd = openat(state->scratch_fd, leaf,
+                                O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW |
+                                    O_CLOEXEC,
+                                0600);
+                if (fd >= 0) {
+                    if (close(fd) != 0) {
+                        failed = 1;
+                        break;
+                    }
+                    char *existing = NULL;
+                    if (case_fold_set_find_or_insert(
+                            &reserved_leaves, reservation_key, reservation_key,
+                            &existing) < 0 ||
+                        case_fold_set_find_or_insert(&names, leaf, leaf,
+                                                     &existing) < 0 ||
+                        case_probe_reserve_name(reserved_names, payload_path,
+                                                parent_physical, leaf, physical,
+                                                sizeof(physical)) != 0) {
+                        failed = 1;
+                        break;
+                    }
+                    break;
+                }
+                if (errno != EEXIST || suffix_number == UINT64_MAX) {
+                    failed = 1;
+                    break;
+                }
+                suffix_number++;
+            }
+        }
+
+        if (!failed && case_probe_readback_matches(&names,
+                                                    state->scratch_fd) != 0)
+            failed = 1;
+    }
+
+    if (!failed && collision) {
+        size_t representative = SIZE_MAX;
+        for (size_t index = 0; index < group->count; index++)
+            if (assignments[index].suffix[0] == '\0') {
+                representative = index;
+                break;
+            }
+        if (representative == SIZE_MAX)
+            representative = 0;
+        for (size_t index = 0; index < group->count && !failed; index++) {
+            char leaf[SIDECAR_MAX_PATH + 1U];
+            char physical[SIDECAR_MAX_PATH + 1U];
+            size_t actual_name = 0;
+            size_t actual_path = 0;
+            int path_status = collision_paths_build(
+                parent_physical, payload_path, assignments[index].encoded,
+                assignments[index].suffix, leaf, sizeof(leaf), physical,
+                sizeof(physical), &actual_name, &actual_path);
+            if (path_status != 0 || portable_collision_plan_add(
+                                        &report->collision_plan, root_id,
+                                        assignments[index].logical, physical,
+                                        assignments[index].suffix) != 0) {
+                failed = 1;
+                break;
+            }
+            if (index != representative && !group->ascii_collision &&
+                prescan_record_case_collision(
+                    report, root_id, assignments[index].logical,
+                    assignments[representative].logical) != 0)
+                failed = 1;
+        }
+    }
+
+    if (case_probe_group_names_free(state, &names) != 0)
+        failed = 1;
+    case_fold_set_free(&names);
+    case_fold_set_free(&reserved_leaves);
+    free(assignments);
+    return failed ? -1 : 0;
+}
+
+static int case_probe_reserve_singleton(PortableCaseProbeState *state,
+                                        const PortableCaseProbeGroup *group,
+                                        const char *parent_physical,
+                                        const char *payload_path,
+                                        const PortableCaseFoldSet *source_names,
+                                        PortableCaseFoldSet *reserved_names)
+{
+    if (state == NULL || group == NULL || parent_physical == NULL ||
+        payload_path == NULL || source_names == NULL || reserved_names == NULL ||
+        group->count != 1U)
+        return -1;
+    char physical[SIDECAR_MAX_PATH + 1U];
+    if (append_physical(physical, sizeof(physical), parent_physical,
+                        group->encoded_names[0]) != 0)
+        return -1;
+    if (!case_probe_source_name_contains(source_names, physical))
+        return -1;
+    return case_probe_reserve_name(reserved_names, payload_path,
+                                   parent_physical, group->encoded_names[0],
+                                   physical, sizeof(physical)) != 0
+               ? -1
+               : 0;
 }
 
 static int prescan_directory(int source_fd, const char *logical,
@@ -3096,7 +3658,6 @@ static int prescan_directory(int source_fd, const char *logical,
                     failed = 1;
                     break;
                 }
-                continue;
             }
         }
 
@@ -3125,11 +3686,46 @@ static int prescan_directory(int source_fd, const char *logical,
     }
     if (closedir(directory) != 0)
         failed = 1;
+
+    PortableCaseFoldSet source_names = {0};
+    PortableCaseFoldSet reserved_names = {0};
+    if (!failed) {
+        /* Reserve every unsuffixed source name before allocating suffixes so
+         * a generated %7EN cannot depend on group/readdir order (D21 F-1/F-2d). */
+        for (size_t group_index = 0;
+             group_index < groups.count && !failed; group_index++) {
+            PortableCaseProbeGroup *group = &groups.items[group_index];
+            for (size_t index = 0; index < group->count; index++) {
+                char source_physical[SIDECAR_MAX_PATH + 1U];
+                if (append_physical(source_physical, sizeof(source_physical),
+                                    physical,
+                                    group->encoded_names[index]) != 0) {
+                    failed = 1;
+                    break;
+                }
+                char source_key[SIDECAR_MAX_PATH + 1U];
+                skeleton_copy(source_key, sizeof(source_key), source_physical);
+                char *existing = NULL;
+                if (case_fold_set_find_or_insert(
+                        &source_names, source_key, source_physical,
+                        &existing) < 0) {
+                    failed = 1;
+                    break;
+                }
+            }
+        }
+    }
     if (!failed && !case_sensitive) {
         for (size_t index = 0; index < groups.count; index++) {
             PortableCaseProbeGroup *group = &groups.items[index];
-            if (group->count > 1U && !group->ascii_collision &&
-                case_probe_group(probe_state, group, root_id, report) != 0) {
+            int group_result = group->count == 1U
+                ? case_probe_reserve_singleton(probe_state, group, physical,
+                                               payload_path,
+                                               &source_names, &reserved_names)
+                : case_probe_group(probe_state, group, root_id, physical,
+                                   payload_path, &source_names, &reserved_names,
+                                   report);
+            if (group_result != 0) {
                 failed = 1;
                 break;
             }
@@ -3137,6 +3733,8 @@ static int prescan_directory(int source_fd, const char *logical,
     }
     case_fold_set_free(&siblings);
     case_fold_set_free(&skeletons);
+    case_fold_set_free(&source_names);
+    case_fold_set_free(&reserved_names);
     case_probe_groups_free(&groups);
     return failed ? -1 : 0;
 }
@@ -3165,9 +3763,10 @@ static int prescan_root(const PortableRootSpec *root,
     return result;
 }
 
-static int prescan_request(int container_fd,
-                           const PortableCaptureRequest *request,
-                           PortablePrescanReport *report)
+static int prescan_request_internal(int container_fd,
+                                    const PortableCaptureRequest *request,
+                                    PortablePrescanReport *report,
+                                    int reject_violations)
 {
     if (container_fd < 0 || request == NULL || report == NULL)
         return -1;
@@ -3182,7 +3781,32 @@ static int prescan_request(int container_fd,
             failed = 1;
     if (case_probe_cleanup(&probe_state) != 0)
         failed = 1;
-    return failed || report->total_count != 0 ? -1 : 0;
+    portable_collision_plan_sort(&report->collision_plan);
+    if (!failed && portable_collision_plan_rewrite_parents(report, request) != 0)
+        failed = 1;
+    return failed || (reject_violations && report->total_count != 0)
+               ? -1
+               : 0;
+}
+
+static int prescan_request(int container_fd,
+                           const PortableCaptureRequest *request,
+                           PortablePrescanReport *report)
+{
+    return prescan_request_internal(container_fd, request, report, 1);
+}
+
+int portable_collision_plan_build(int container_fd,
+                                  const PortableCaptureRequest *request,
+                                  PortablePrescanReport *report)
+{
+    if (container_fd < 0 || request == NULL || report == NULL ||
+        request->scope < MANIFEST_SCOPE_CRITICAL ||
+        request->scope > MANIFEST_SCOPE_EXPLICIT ||
+        request->root_count > MANIFEST_MAX_ROOTS ||
+        (request->root_count != 0 && request->roots == NULL))
+        return -1;
+    return prescan_request_internal(container_fd, request, report, 0);
 }
 
 static int relative_paths_overlap(const char *left, const char *right)

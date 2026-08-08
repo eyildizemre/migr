@@ -663,6 +663,269 @@ static void test_case_collision_prescan(const char *base)
     remove_tree(container_path);
 }
 
+static int collision_plan_entry_matches(
+    const PortableCollisionPlanEntry *entry, const char *root_id,
+    const char *logical, const char *physical, const char *suffix)
+{
+    return entry != NULL && strcmp(entry->root_id, root_id) == 0 &&
+           strcmp(entry->logical_path, logical) == 0 &&
+           strcmp(entry->physical_path, physical) == 0 &&
+           strcmp(entry->collision_suffix, suffix) == 0;
+}
+
+static void test_collision_plan(const char *base)
+{
+    printf(BLUE "::" NC " deterministic case-collision assignment plan\n");
+    static const char *const pair[] = { "Foo", "foo" };
+    char source_path[PATH_MAX];
+    char container_path[PATH_MAX];
+    int container_fd;
+    PortablePrescanReport report;
+    int result = run_case_fixture(
+        base, "case-plan", pair, sizeof(pair) / sizeof(pair[0]), 0,
+        source_path, sizeof(source_path), container_path,
+        sizeof(container_path), &container_fd, &report);
+    const PortableCollisionPlanEntry *upper =
+        portable_collision_plan_find(&report.collision_plan, "CASE", "Foo");
+    const PortableCollisionPlanEntry *lower =
+        portable_collision_plan_find(&report.collision_plan, "CASE", "foo");
+    check(result != 0 && report.collision_plan.count == 2 &&
+              collision_plan_entry_matches(upper, "CASE", "Foo", "Foo", "") &&
+              collision_plan_entry_matches(lower, "CASE", "foo",
+                                            "foo%7E1", "%7E1"),
+          "ASCII collision plan keeps the sorted representative and suffixes the loser");
+
+    PortablePrescanReport direct;
+    portable_prescan_report_init(&direct);
+    PortableRootSpec root = root_spec("CASE", source_path, "CASE");
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .roots = &root,
+        .root_count = 1,
+        .nsec_exact = 1,
+        .case_sensitive = 0
+    };
+    check(portable_collision_plan_build(container_fd, &request, &direct) == 0 &&
+              direct.total_count == 1 && direct.collision_plan.count == 2 &&
+              portable_collision_plan_find(&direct.collision_plan, "CASE",
+                                           "foo") != NULL,
+          "direct plan builder exposes collisions without opening the capture gate");
+    portable_prescan_report_free(&direct);
+    portable_prescan_report_free(&report);
+    close(container_fd);
+    remove_tree(source_path);
+    remove_tree(container_path);
+
+    static const char *const three_way[] = { "Foo", "foo", "FOO" };
+    result = run_case_fixture(
+        base, "case-plan-three-way", three_way,
+        sizeof(three_way) / sizeof(three_way[0]), 0, source_path,
+        sizeof(source_path), container_path, sizeof(container_path),
+        &container_fd, &report);
+    const PortableCollisionPlanEntry *all_upper =
+        portable_collision_plan_find(&report.collision_plan, "CASE", "FOO");
+    upper = portable_collision_plan_find(&report.collision_plan, "CASE", "Foo");
+    lower = portable_collision_plan_find(&report.collision_plan, "CASE", "foo");
+    check(result != 0 && report.collision_plan.count == 3 &&
+              collision_plan_entry_matches(all_upper, "CASE", "FOO", "FOO",
+                                            "") &&
+              collision_plan_entry_matches(upper, "CASE", "Foo", "Foo%7E1",
+                                            "%7E1") &&
+              collision_plan_entry_matches(lower, "CASE", "foo", "foo%7E2",
+                                            "%7E2"),
+          "three-way collision plan assigns canonical suffixes in byte order");
+    portable_prescan_report_free(&report);
+    close(container_fd);
+    remove_tree(source_path);
+    remove_tree(container_path);
+
+    static const char *const suffix_alias[] = { "Foo", "foo", "foo~1" };
+    result = run_case_fixture(
+        base, "case-plan-reservation", suffix_alias,
+        sizeof(suffix_alias) / sizeof(suffix_alias[0]), 0, source_path,
+        sizeof(source_path), container_path, sizeof(container_path),
+        &container_fd, &report);
+    lower = portable_collision_plan_find(&report.collision_plan, "CASE",
+                                         "foo");
+    const PortableCollisionPlanEntry *literal_suffix =
+        portable_collision_plan_find(&report.collision_plan, "CASE", "foo~1");
+    check(result != 0 && report.collision_plan.count == 2 &&
+              collision_plan_entry_matches(lower, "CASE", "foo",
+                                            "foo%7E2", "%7E2") &&
+              literal_suffix == NULL,
+          "a source name already occupying %7E1 forces the collision plan to use %7E2");
+    portable_prescan_report_free(&report);
+    close(container_fd);
+    remove_tree(source_path);
+    remove_tree(container_path);
+
+    static const char *const unicode_suffix_alias[] = {
+        "Caf\xc3\xa9", "caf\xc3\xa9", "CAF\xc3\x89~1"
+    };
+    result = run_case_fixture(
+        base, "case-plan-unicode-reservation", unicode_suffix_alias,
+        sizeof(unicode_suffix_alias) / sizeof(unicode_suffix_alias[0]), 0,
+        source_path, sizeof(source_path), container_path,
+        sizeof(container_path), &container_fd, &report);
+    const PortableCollisionPlanEntry *unicode_lower =
+        portable_collision_plan_find(&report.collision_plan, "CASE",
+                                     "caf\xc3\xa9");
+    check(result != 0 && report.collision_plan.count == 2 &&
+              collision_plan_entry_matches(unicode_lower, "CASE",
+                                            "caf\xc3\xa9",
+                                            "caf\xc3\xa9%7E2", "%7E2"),
+          "the collision plan reserves Unicode-equivalent source names before choosing a suffix");
+    portable_prescan_report_free(&report);
+    close(container_fd);
+    remove_tree(source_path);
+    remove_tree(container_path);
+
+    char source_a[PATH_MAX];
+    char source_b[PATH_MAX];
+    join_path(source_a, sizeof(source_a), base, "case-plan-root-a");
+    join_path(source_b, sizeof(source_b), base, "case-plan-root-b");
+    join_path(container_path, sizeof(container_path), base,
+              "case-plan-root-container");
+    make_directory(source_a);
+    make_directory(source_b);
+    make_directory(container_path);
+    char path_a[PATH_MAX];
+    char path_b[PATH_MAX];
+    join_path(path_a, sizeof(path_a), source_a, "Foo");
+    write_file(path_a, "a", 1);
+    join_path(path_a, sizeof(path_a), source_a, "foo");
+    write_file(path_a, "b", 1);
+    join_path(path_b, sizeof(path_b), source_b, "Foo");
+    write_file(path_b, "c", 1);
+    join_path(path_b, sizeof(path_b), source_b, "foo");
+    write_file(path_b, "d", 1);
+    container_fd = open(container_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open multi-root collision container");
+    PortableRootSpec roots[2] = {
+        root_spec("ROOT_A", source_a, "A"),
+        root_spec("ROOT_B", source_b, "B")
+    };
+    request.roots = roots;
+    request.root_count = 2;
+    portable_prescan_report_init(&report);
+    result = portable_capture_fresh_at(container_fd, &request, &report);
+    const PortableCollisionPlanEntry *root_a_upper =
+        portable_collision_plan_find(&report.collision_plan, "ROOT_A", "Foo");
+    const PortableCollisionPlanEntry *root_a_lower =
+        portable_collision_plan_find(&report.collision_plan, "ROOT_A", "foo");
+    const PortableCollisionPlanEntry *root_b_upper =
+        portable_collision_plan_find(&report.collision_plan, "ROOT_B", "Foo");
+    const PortableCollisionPlanEntry *root_b_lower =
+        portable_collision_plan_find(&report.collision_plan, "ROOT_B", "foo");
+    check(result != 0 && report.collision_plan.count == 4 &&
+              collision_plan_entry_matches(root_a_upper, "ROOT_A", "Foo",
+                                            "Foo", "") &&
+              collision_plan_entry_matches(root_a_lower, "ROOT_A", "foo",
+                                            "foo%7E1", "%7E1") &&
+              collision_plan_entry_matches(root_b_upper, "ROOT_B", "Foo",
+                                            "Foo", "") &&
+              collision_plan_entry_matches(root_b_lower, "ROOT_B", "foo",
+                                            "foo%7E1", "%7E1"),
+          "separate payload roots receive independent collision reservations");
+    portable_prescan_report_free(&report);
+    close(container_fd);
+    remove_tree(source_a);
+    remove_tree(source_b);
+    remove_tree(container_path);
+
+    join_path(source_path, sizeof(source_path), base, "case-plan-nested");
+    join_path(container_path, sizeof(container_path), base,
+              "case-plan-nested-container");
+    make_directory(source_path);
+    make_directory(container_path);
+    char upper_dir[PATH_MAX];
+    char lower_dir[PATH_MAX];
+    join_path(upper_dir, sizeof(upper_dir), source_path, "Foo");
+    join_path(lower_dir, sizeof(lower_dir), source_path, "foo");
+    make_directory(upper_dir);
+    make_directory(lower_dir);
+    char middle_dir[PATH_MAX];
+    join_path(middle_dir, sizeof(middle_dir), lower_dir, "middle");
+    make_directory(middle_dir);
+    char upper_middle_dir[PATH_MAX];
+    join_path(upper_middle_dir, sizeof(upper_middle_dir), upper_dir,
+              "middle");
+    make_directory(upper_middle_dir);
+    char upper_child[PATH_MAX];
+    char lower_child[PATH_MAX];
+    join_path(upper_child, sizeof(upper_child), middle_dir, "A");
+    join_path(lower_child, sizeof(lower_child), middle_dir, "a");
+    write_file(upper_child, "x", 1);
+    write_file(lower_child, "y", 1);
+    join_path(upper_child, sizeof(upper_child), upper_middle_dir, "A");
+    join_path(lower_child, sizeof(lower_child), upper_middle_dir, "a");
+    write_file(upper_child, "u", 1);
+    write_file(lower_child, "v", 1);
+    container_fd = open(container_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open nested collision container");
+    portable_prescan_report_init(&report);
+    root = root_spec("CASE", source_path, "CASE");
+    request.roots = &root;
+    request.root_count = 1;
+    result = portable_capture_fresh_at(container_fd, &request, &report);
+    const PortableCollisionPlanEntry *nested_upper =
+        portable_collision_plan_find(&report.collision_plan, "CASE",
+                                     "foo/middle/A");
+    const PortableCollisionPlanEntry *nested_lower =
+        portable_collision_plan_find(&report.collision_plan, "CASE",
+                                     "foo/middle/a");
+    const PortableCollisionPlanEntry *upper_nested_upper =
+        portable_collision_plan_find(&report.collision_plan, "CASE",
+                                     "Foo/middle/A");
+    const PortableCollisionPlanEntry *upper_nested_lower =
+        portable_collision_plan_find(&report.collision_plan, "CASE",
+                                     "Foo/middle/a");
+    check(result != 0 && report.collision_plan.count == 6 &&
+              collision_plan_entry_matches(
+                  portable_collision_plan_find(&report.collision_plan, "CASE",
+                                               "foo"),
+                  "CASE", "foo", "foo%7E1", "%7E1") &&
+              collision_plan_entry_matches(nested_upper, "CASE",
+                                            "foo/middle/A",
+                                            "foo%7E1/middle/A", "") &&
+              collision_plan_entry_matches(nested_lower, "CASE",
+                                            "foo/middle/a",
+                                            "foo%7E1/middle/a%7E1",
+                                            "%7E1") &&
+              collision_plan_entry_matches(upper_nested_upper, "CASE",
+                                            "Foo/middle/A", "Foo/middle/A",
+                                            "") &&
+              collision_plan_entry_matches(upper_nested_lower, "CASE",
+                                            "Foo/middle/a", "Foo/middle/a%7E1",
+                                            "%7E1"),
+          "nested plans include both colliding subtrees and inherit their ancestors' prefixes");
+    portable_prescan_report_free(&report);
+    close(container_fd);
+    remove_tree(source_path);
+    remove_tree(container_path);
+
+    static const char *const non_ascii[] = {
+        "caf\xc3\xa9", "caf\xc3\x89"
+    };
+    result = run_case_fixture(
+        base, "case-plan-non-ascii", non_ascii,
+        sizeof(non_ascii) / sizeof(non_ascii[0]), 0, source_path,
+        sizeof(source_path), container_path, sizeof(container_path),
+        &container_fd, &report);
+    if (report.collision_plan.count == 0 && result == 0) {
+        skip_check("non-ASCII plan is deferred when the measured host is case-sensitive");
+    } else {
+        check(result != 0 && report.collision_plan.count == 2,
+              "destination-probed non-ASCII collision produces a plan");
+    }
+    portable_prescan_report_free(&report);
+    close(container_fd);
+    remove_tree(source_path);
+    remove_tree(container_path);
+}
+
 /* F.1b baseline: ASCII-fold and destination-probed case collisions are fatal
  * today. F.4 is expected to turn these collision assertions into successful
  * suffix resolution while keeping NAME_MAX and PATH_MAX violations fatal. */
@@ -756,8 +1019,9 @@ static void test_case_collision_report_cap(const char *base)
             &report.examples[index], names, COLLISION_NAME_COUNT);
     check(result != 0 && report.total_count == COLLISION_PAIR_COUNT &&
               report.example_count == PORTABLE_PRESCAN_MAX_EXAMPLES &&
+              report.collision_plan.count == COLLISION_NAME_COUNT &&
               examples_are_real,
-          "collision report caps examples at 64 while total_count keeps every loser");
+          "collision diagnostics stay bounded while the plan keeps every candidate");
     check(empty_capture_container(container_fd),
           "bounded collision refusal leaves the container namespace untouched");
     portable_prescan_report_free(&report);
@@ -806,6 +1070,8 @@ static void test_case_collision_directory_scope(const char *base)
     int result = portable_capture_fresh_at(container_fd, &request, &report);
     check(result == 0 && report.total_count == 0,
           "same names in different directories do not collide");
+    check(report.collision_plan.count == 0,
+          "directory-local non-collisions produce no assignment entries");
     struct stat st;
     check(fstatat(container_fd, "data/CASE/left/Foo", &st,
                   AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(st.st_mode) &&
@@ -1917,6 +2183,7 @@ int main(void)
     test_prescan_report();
     test_case_fold_helpers();
     test_case_collision_prescan(root_path);
+    test_collision_plan(root_path);
     test_mixed_prescan_violations(root_path);
     test_case_collision_report_cap(root_path);
     test_case_collision_directory_scope(root_path);
