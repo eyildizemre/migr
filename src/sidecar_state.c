@@ -187,6 +187,8 @@ static void clear_entry(StateMemory *memory, StateEntry *entry)
                entry->entry.logical_path.length);
     state_free(memory, (void *)entry->entry.physical_path.data,
                entry->entry.physical_path.length);
+    state_free(memory, (void *)entry->entry.collision_suffix.data,
+               entry->entry.collision_suffix.length);
     state_free(memory, (void *)entry->entry.symlink_target.data,
                entry->entry.symlink_target.length);
     state_free(memory, (void *)entry->entry.hardlink_root_id.data,
@@ -236,6 +238,8 @@ static SidecarStatus copy_entry(StateMemory *memory, const SidecarEntry *source,
         !bytes_valid(source->root_id, SIDECAR_MAX_ROOT_ID, 1) ||
         !bytes_valid(source->logical_path, SIDECAR_MAX_PATH, 0) ||
         !bytes_valid(source->physical_path, SIDECAR_MAX_PATH, 0) ||
+        !bytes_valid(source->collision_suffix,
+                     SIDECAR_MAX_COLLISION_SUFFIX, 0) ||
         source->atime_nsec > SIDECAR_MAX_NSEC ||
         source->mtime_nsec > SIDECAR_MAX_NSEC ||
         source->mode > SIDECAR_MAX_MODE ||
@@ -285,6 +289,7 @@ static SidecarStatus copy_entry(StateMemory *memory, const SidecarEntry *source,
     destination->entry.root_id.data = NULL;
     destination->entry.logical_path.data = NULL;
     destination->entry.physical_path.data = NULL;
+    destination->entry.collision_suffix.data = NULL;
     destination->entry.symlink_target.data = NULL;
     destination->entry.hardlink_root_id.data = NULL;
     destination->entry.hardlink_logical_path.data = NULL;
@@ -301,6 +306,11 @@ static SidecarStatus copy_entry(StateMemory *memory, const SidecarEntry *source,
         goto fail;
     status = copy_bytes(memory, source->physical_path, SIDECAR_MAX_PATH, 0,
                         &destination->entry.physical_path);
+    if (status != SIDECAR_STATUS_OK)
+        goto fail;
+    status = copy_bytes(memory, source->collision_suffix,
+                        SIDECAR_MAX_COLLISION_SUFFIX, 0,
+                        &destination->entry.collision_suffix);
     if (status != SIDECAR_STATUS_OK)
         goto fail;
     status = copy_bytes(memory, source->symlink_target,

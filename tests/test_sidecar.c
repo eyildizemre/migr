@@ -1,4 +1,4 @@
-// Unit tests for the sidecar v1 codec (docs/DECISIONS.md D17): magic/version
+// Unit tests for the sidecar v2 codec (docs/DECISIONS.md D17/D21): magic/version
 // header, ENTRY/XATTR/ENTRY_COMMIT/DELETE record framing, canonical numeric
 // parsing, and every SIDECAR_MAX_* ceiling declared there. This is the codec
 // alone -- no live-state map, no resume, no adopt; that stateful layer is a
@@ -150,6 +150,7 @@ static int append_regular_entry(RawBuffer *buffer, const char *mode,
            raw_text_field(buffer, "ROOT") == 0 &&
            raw_text_field(buffer, "dir/file") == 0 &&
            raw_text_field(buffer, "payload/file") == 0 &&
+           raw_text_field(buffer, "") == 0 &&
            raw_text_field(buffer, "regular") == 0 &&
            raw_text_field(buffer, mode) == 0 &&
            raw_text_field(buffer, "1000") == 0 &&
@@ -251,7 +252,7 @@ static void test_header_and_roundtrip(int fd)
 
     unsigned char actual[32] = {0};
     ssize_t count = pread(fd, actual, sizeof(actual), 0);
-    const unsigned char expected[] = SIDECAR_MAGIC "\0" "1\0";
+    const unsigned char expected[] = SIDECAR_MAGIC "\0" "2\0";
     check(count == (ssize_t)sizeof(expected) - 1 &&
           memcmp(actual, expected, sizeof(expected) - 1U) == 0,
           "header bytes are byte-exact");
@@ -367,6 +368,92 @@ done:
     free(path);
     free(name);
     free(value);
+}
+
+typedef struct {
+    const unsigned char *expected;
+    size_t expected_length;
+    int entries;
+    int valid;
+} CollisionSuffixRoundTripState;
+
+static int collision_suffix_callback(const SidecarRecord *record,
+                                     void *context)
+{
+    CollisionSuffixRoundTripState *state = context;
+    if (record->type != SIDECAR_RECORD_ENTRY)
+        return 0;
+
+    const SidecarBytes suffix = record->value.entry.collision_suffix;
+    state->entries++;
+    if (suffix.length != state->expected_length ||
+        (suffix.length != 0 &&
+         memcmp(suffix.data, state->expected, suffix.length) != 0))
+        state->valid = 0;
+    return 0;
+}
+
+static void test_collision_suffix(int fd)
+{
+    printf(BLUE "::" NC " collision suffix codec contract\n");
+    static const unsigned char suffix[] = "%7E1";
+    SidecarEntry entry = sample_entry();
+    entry.xattr_count = 0;
+    entry.collision_suffix = (SidecarBytes){ suffix, sizeof(suffix) - 1U };
+
+    check(reset_file(fd) == 0 && sidecar_write_header(fd) == 0 &&
+          sidecar_write_entry(fd, &entry) == 0 &&
+          sidecar_write_entry_commit(fd) == 0,
+          "non-empty collision suffix writes");
+    CollisionSuffixRoundTripState state = {
+        .expected = suffix,
+        .expected_length = sizeof(suffix) - 1U,
+        .valid = 1
+    };
+    SidecarParseResult result;
+    check(sidecar_parse_fd(fd, collision_suffix_callback, &state, &result) ==
+              SIDECAR_STATUS_OK && state.valid && state.entries == 1,
+          "non-empty collision suffix round-trips byte-for-byte");
+
+    entry = sample_entry();
+    entry.xattr_count = 0;
+    state = (CollisionSuffixRoundTripState){ .valid = 1 };
+    check(reset_file(fd) == 0 && sidecar_write_header(fd) == 0 &&
+          sidecar_write_entry(fd, &entry) == 0 &&
+          sidecar_write_entry_commit(fd) == 0 &&
+          sidecar_parse_fd(fd, collision_suffix_callback, &state, &result) ==
+              SIDECAR_STATUS_OK && state.valid && state.entries == 1,
+          "empty collision suffix round-trips as the structural empty field");
+
+    unsigned char *oversized = malloc(SIDECAR_MAX_COLLISION_SUFFIX + 1U);
+    check(oversized != NULL, "collision suffix ceiling fixture allocates");
+    if (oversized != NULL)
+    {
+        memset(oversized, 's', SIDECAR_MAX_COLLISION_SUFFIX + 1U);
+        entry = sample_entry();
+        entry.xattr_count = 0;
+        entry.collision_suffix = (SidecarBytes){
+            oversized, SIDECAR_MAX_COLLISION_SUFFIX
+        };
+        check(reset_file(fd) == 0 && sidecar_write_header(fd) == 0 &&
+              sidecar_write_entry(fd, &entry) == 0,
+              "collision suffix at its ceiling is accepted");
+        entry.collision_suffix.length++;
+        errno = 0;
+        check(sidecar_write_entry(fd, &entry) != 0 && errno == EINVAL,
+              "collision suffix over its ceiling is refused");
+        free(oversized);
+    }
+
+    static const unsigned char nul_suffix[] = { 's', '\0', '1' };
+    entry = sample_entry();
+    entry.xattr_count = 0;
+    entry.collision_suffix = (SidecarBytes){ nul_suffix,
+                                             sizeof(nul_suffix) };
+    errno = 0;
+    check(reset_file(fd) == 0 && sidecar_write_header(fd) == 0 &&
+          sidecar_write_entry(fd, &entry) != 0 && errno == EINVAL,
+          "NUL-containing collision suffix is refused");
 }
 
 typedef struct {
@@ -497,7 +584,7 @@ static void test_tail_and_boundary(int fd)
 {
     printf(BLUE "::" NC " sidecar tail recovery and boundaries\n");
     RawBuffer buffer = {0};
-    check(append_header(&buffer, "1") == 0 &&
+    check(append_header(&buffer, "2") == 0 &&
           append_regular_entry(&buffer, "420", "0") == 0 &&
           append_commit(&buffer) == 0,
           "valid prefix fixture is built");
@@ -516,7 +603,7 @@ static void test_tail_and_boundary(int fd)
 
     check(set_raw_file(fd, &buffer) == 0, "prefix is restored");
     RawBuffer uncommitted = {0};
-    check(append_header(&uncommitted, "1") == 0 &&
+    check(append_header(&uncommitted, "2") == 0 &&
           append_regular_entry(&uncommitted, "420", "0") == 0 &&
           set_raw_file(fd, &uncommitted) == 0,
           "uncommitted group is written");
@@ -537,8 +624,8 @@ static void test_corruption_and_versions(int fd)
     SidecarParseResult result;
     SidecarStatus status;
 
-    check(append_header(&buffer, "2") == 0 && set_raw_file(fd, &buffer) == 0,
-          "unknown version fixture is written");
+    check(append_header(&buffer, "1") == 0 && set_raw_file(fd, &buffer) == 0,
+          "legacy v1 version fixture is written");
     status = sidecar_parse_fd(fd, NULL, NULL, &result);
     check(status == SIDECAR_STATUS_UNKNOWN_VERSION,
           "unknown version is not treated as an empty sidecar");
@@ -553,7 +640,7 @@ static void test_corruption_and_versions(int fd)
 
     raw_free(&buffer);
     memset(&buffer, 0, sizeof(buffer));
-    check(append_header(&buffer, "1") == 0 &&
+    check(append_header(&buffer, "2") == 0 &&
           append_regular_entry(&buffer, "0420", "0") == 0 &&
           append_commit(&buffer) == 0 && set_raw_file(fd, &buffer) == 0,
           "non-canonical numeric fixture is written");
@@ -563,7 +650,7 @@ static void test_corruption_and_versions(int fd)
 
     raw_free(&buffer);
     memset(&buffer, 0, sizeof(buffer));
-    check(append_header(&buffer, "1") == 0 && raw_tag(&buffer, "UNKNOWN") == 0 &&
+    check(append_header(&buffer, "2") == 0 && raw_tag(&buffer, "UNKNOWN") == 0 &&
           set_raw_file(fd, &buffer) == 0,
           "unknown tag fixture is written");
     status = sidecar_parse_fd(fd, NULL, NULL, &result);
@@ -587,10 +674,11 @@ static void test_symlink_kind_parsing(int fd)
 {
     printf(BLUE "::" NC " sidecar symlink grammar\n");
     RawBuffer buffer = {0};
-    check(append_header(&buffer, "1") == 0 && raw_tag(&buffer, "ENTRY") == 0 &&
+    check(append_header(&buffer, "2") == 0 && raw_tag(&buffer, "ENTRY") == 0 &&
           raw_text_field(&buffer, "ROOT") == 0 &&
           raw_text_field(&buffer, "link") == 0 &&
           raw_text_field(&buffer, "payload/link") == 0 &&
+          raw_text_field(&buffer, "") == 0 &&
           raw_text_field(&buffer, "symlink") == 0 &&
           raw_text_field(&buffer, "0") == 0 &&
           raw_text_field(&buffer, "1000") == 0 &&
@@ -654,6 +742,7 @@ int main(void)
 
     test_header_and_roundtrip(fd);
     test_writer_validation(fd);
+    test_collision_suffix(fd);
     test_symlink_writer(fd);
     test_tail_and_boundary(fd);
     test_corruption_and_versions(fd);

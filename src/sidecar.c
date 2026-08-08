@@ -339,6 +339,8 @@ static int validate_entry(const SidecarEntry *entry)
         validate_bytes(entry->root_id, SIDECAR_MAX_ROOT_ID, 1) != 0 ||
         validate_bytes(entry->logical_path, SIDECAR_MAX_PATH, 0) != 0 ||
         validate_bytes(entry->physical_path, SIDECAR_MAX_PATH, 0) != 0 ||
+        validate_bytes(entry->collision_suffix,
+                       SIDECAR_MAX_COLLISION_SUFFIX, 0) != 0 ||
         entry->atime_nsec > SIDECAR_MAX_NSEC ||
         entry->mtime_nsec > SIDECAR_MAX_NSEC ||
         entry->mode > SIDECAR_MAX_MODE ||
@@ -425,6 +427,7 @@ static int build_entry_buffer(const SidecarEntry *entry, SidecarBuffer *buffer)
         buffer_append_field(buffer, entry->root_id) != 0 ||
         buffer_append_field(buffer, entry->logical_path) != 0 ||
         buffer_append_field(buffer, entry->physical_path) != 0 ||
+        buffer_append_field(buffer, entry->collision_suffix) != 0 ||
         buffer_append_field(buffer, (SidecarBytes){
             (const unsigned char *)kind, strlen(kind) }) != 0 ||
         buffer_append_uint(buffer, entry->mode) != 0 ||
@@ -820,6 +823,7 @@ static void free_entry(SidecarReader *reader, SidecarEntry *entry)
     reader_free(reader, (void *)entry->root_id.data);
     reader_free(reader, (void *)entry->logical_path.data);
     reader_free(reader, (void *)entry->physical_path.data);
+    reader_free(reader, (void *)entry->collision_suffix.data);
     reader_free(reader, (void *)entry->symlink_target.data);
     reader_free(reader, (void *)entry->hardlink_root_id.data);
     reader_free(reader, (void *)entry->hardlink_logical_path.data);
@@ -837,6 +841,10 @@ static SidecarStatus parse_entry(SidecarReader *reader, SidecarEntry *entry)
     if (status != SIDECAR_STATUS_OK)
         goto fail;
     status = read_required_field(reader, SIDECAR_MAX_PATH, &entry->physical_path);
+    if (status != SIDECAR_STATUS_OK)
+        goto fail;
+    status = read_required_field(reader, SIDECAR_MAX_COLLISION_SUFFIX,
+                                 &entry->collision_suffix);
     if (status != SIDECAR_STATUS_OK)
         goto fail;
 

@@ -5,11 +5,12 @@
 #include <stdint.h>
 
 #define SIDECAR_MAGIC "MIGR_SIDECAR"
-#define SIDECAR_VERSION 1
+#define SIDECAR_VERSION 2
 #define SIDECAR_SLOT_NAME "sidecar.migr"
 
 #define SIDECAR_MAX_ROOT_ID 64U
 #define SIDECAR_MAX_PATH 4096U
+#define SIDECAR_MAX_COLLISION_SUFFIX 32U
 #define SIDECAR_MAX_SYMLINK_TARGET 4096U
 #define SIDECAR_MAX_XATTR_NAME 255U
 #define SIDECAR_MAX_XATTR_VALUE 65536U
@@ -69,6 +70,7 @@ typedef struct {
     SidecarBytes root_id;
     SidecarBytes logical_path;
     SidecarBytes physical_path;
+    SidecarBytes collision_suffix;
     SidecarObjectKind kind;
     uint32_t mode;
     uint32_t uid;

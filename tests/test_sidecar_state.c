@@ -1,4 +1,4 @@
-// Unit tests for the sidecar v1 state log (docs/DECISIONS.md D17): the
+// Unit tests for the sidecar v2 state log (docs/DECISIONS.md D17/D21): the
 // `(root_id, logical_path)`-keyed live-state map built on top of the sidecar
 // codec's record framing, with last-committed-wins semantics, DELETE
 // handling, the fd-anchored no-follow single-link slot, and adopt-time
@@ -152,8 +152,9 @@ static void test_fresh_and_live_map(int container_fd)
     check(found == 1 && view.entry != NULL && view.xattr_count == 1 &&
           view.entry->size == 17 && view.xattrs[0].value.length == 4 &&
           view.xattrs[0].value.data[0] == 0 &&
-          view.xattrs[0].value.data[2] == 0xff && view.generation == 1,
-          "lookup returns copied entry, xattr, and generation");
+          view.xattrs[0].value.data[2] == 0xff && view.generation == 1 &&
+          view.entry->collision_suffix.length == 0,
+          "lookup returns copied entry, empty suffix, xattr, and generation");
 
     SidecarEntry replacement = entry_for("ROOT", "file", "payload/new", 23, 0);
     check(sidecar_log_append_entry(&log, &replacement) == SIDECAR_STATUS_OK &&
@@ -211,7 +212,11 @@ static void test_sequence_and_hardlink_guards(int container_fd)
           "a complete group can be committed after the guard failures");
 
     SidecarEntry symlink = entry_for("ROOT", "link", "payload/link", 0, 0);
+    static const unsigned char collision_suffix[] = "%7E1";
     symlink.kind = SIDECAR_KIND_SYMLINK;
+    symlink.collision_suffix = (SidecarBytes){
+        collision_suffix, sizeof(collision_suffix) - 1U
+    };
     symlink.symlink_target = (SidecarBytes){
         (const unsigned char *)"target", 6
     };
@@ -226,8 +231,12 @@ static void test_sequence_and_hardlink_guards(int container_fd)
     check(sidecar_log_find(&log, symlink.root_id, symlink.logical_path, &view) == 1 &&
           view.entry != NULL && view.entry->kind == SIDECAR_KIND_SYMLINK &&
           view.entry->symlink_target.length == 6 &&
-          memcmp(view.entry->symlink_target.data, "target", 6) == 0,
-          "live symlink target is copied into the state map");
+          memcmp(view.entry->symlink_target.data, "target", 6) == 0 &&
+          view.entry->collision_suffix.length ==
+              sizeof(collision_suffix) - 1U &&
+          memcmp(view.entry->collision_suffix.data, collision_suffix,
+                 sizeof(collision_suffix) - 1U) == 0,
+          "live symlink target and collision suffix are copied into the state map");
     check(sidecar_log_close(&log) == SIDECAR_STATUS_OK,
           "guard log closes");
 
@@ -236,8 +245,12 @@ static void test_sequence_and_hardlink_guards(int container_fd)
           "adopted state retains the committed symlink");
     check(sidecar_log_find(&log, symlink.root_id, symlink.logical_path, &view) == 1 &&
           view.entry != NULL && view.entry->symlink_target.length == 6 &&
-          memcmp(view.entry->symlink_target.data, "target", 6) == 0,
-          "adopted symlink target remains byte-exact");
+          memcmp(view.entry->symlink_target.data, "target", 6) == 0 &&
+          view.entry->collision_suffix.length ==
+              sizeof(collision_suffix) - 1U &&
+          memcmp(view.entry->collision_suffix.data, collision_suffix,
+                 sizeof(collision_suffix) - 1U) == 0,
+          "adopted symlink target and collision suffix remain byte-exact");
     check(sidecar_log_close(&log) == SIDECAR_STATUS_OK,
           "adopted guard log closes");
 }
@@ -385,7 +398,7 @@ static void test_interior_corruption_and_hardlink(int container_fd)
     check(reset_slot(container_fd) == 0, "corruption slot is absent");
     int fd = openat(container_fd, SIDECAR_SLOT_NAME,
                     O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-    static const unsigned char corrupt[] = SIDECAR_MAGIC "\0" "1\0UNKNOWN\0";
+    static const unsigned char corrupt[] = SIDECAR_MAGIC "\0" "2\0UNKNOWN\0";
     check(fd >= 0 && write_all_test(fd, corrupt, sizeof(corrupt) - 1U) == 0,
           "interior corruption fixture is written");
     if (fd >= 0)
