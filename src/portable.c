@@ -34,6 +34,19 @@ typedef struct {
     uint64_t hash_salt;
 } PortableVisited;
 
+typedef struct {
+    char *root_id;
+    char *physical_path;
+    char *logical_path;
+} PortableOwnedPath;
+
+typedef struct {
+    PortableOwnedPath *items;
+    size_t count;
+    size_t capacity;
+    int sorted;
+} PortableOwnedPaths;
+
 #define VISITED_INITIAL_CAPACITY 16U
 #define PORTABLE_MAX_READBACK_NAMES SIDECAR_MAX_LIVE_ENTRIES
 
@@ -76,6 +89,13 @@ int prescan_report_add(PortablePrescanReport *report,
     }
     report->examples[report->example_count++] = *violation;
     return 0;
+}
+
+static void prescan_report_refresh_unresolved(PortablePrescanReport *report)
+{
+    if (report == NULL || report->total_count < report->collision_count)
+        return;
+    report->unresolved_count = report->total_count - report->collision_count;
 }
 
 #ifdef PORTABLE_CAPTURE_TEST_HOOKS
@@ -227,6 +247,8 @@ static int prescan_record_violation(PortablePrescanReport *report,
                                     size_t limit, size_t actual);
 int append_physical(char *destination, size_t destination_size,
                     const char *parent, const char *encoded_leaf);
+void skeleton_copy(char *destination, size_t destination_size,
+                   const char *source);
 
 static const PortableRootSpec *portable_collision_plan_root(
     const PortableCaptureRequest *request, const char *root_id)
@@ -1028,7 +1050,7 @@ static int time_to_i64(time_t value, int64_t *out)
 }
 
 int entry_from_stat(const char *root_id, const char *logical,
-                    const char *physical,
+                    const char *physical, const char *collision_suffix,
                     const struct stat *st, int nsec_exact,
                     PortableXattrs *xattrs, SidecarEntry *out,
                     const SidecarBytes *symlink_target)
@@ -1036,6 +1058,7 @@ int entry_from_stat(const char *root_id, const char *logical,
     int64_t atime_sec;
     int64_t mtime_sec;
     if (root_id == NULL || logical == NULL || physical == NULL ||
+        collision_suffix == NULL ||
         st == NULL || out == NULL ||
         (st->st_mode & 07777) > SIDECAR_MAX_MODE || st->st_uid > UINT32_MAX ||
         st->st_gid > UINT32_MAX || st->st_size < 0 ||
@@ -1047,8 +1070,6 @@ int entry_from_stat(const char *root_id, const char *logical,
         st->st_mtim.tv_nsec < 0 || st->st_mtim.tv_nsec > SIDECAR_MAX_NSEC)
         return -1;
 
-    /* docs/DECISIONS.md D21: capture emits an empty collision suffix until
-     * collision resolution is implemented. */
     memset(out, 0, sizeof(*out));
     out->root_id = (SidecarBytes){ (const unsigned char *)root_id,
                                    strlen(root_id) };
@@ -1056,6 +1077,8 @@ int entry_from_stat(const char *root_id, const char *logical,
                                         strlen(logical) };
     out->physical_path = (SidecarBytes){ (const unsigned char *)physical,
                                          strlen(physical) };
+    out->collision_suffix = (SidecarBytes){
+        (const unsigned char *)collision_suffix, strlen(collision_suffix) };
     if (S_ISLNK(st->st_mode))
         out->kind = SIDECAR_KIND_SYMLINK;
     else if (S_ISREG(st->st_mode))
@@ -1642,6 +1665,124 @@ static int sidecar_bytes_to_text(SidecarBytes bytes, char **out)
     return 0;
 }
 
+static void portable_owned_paths_free(PortableOwnedPaths *paths)
+{
+    if (paths == NULL)
+        return;
+    for (size_t index = 0; index < paths->count; index++) {
+        free(paths->items[index].root_id);
+        free(paths->items[index].physical_path);
+        free(paths->items[index].logical_path);
+    }
+    free(paths->items);
+    memset(paths, 0, sizeof(*paths));
+}
+
+static int portable_owned_paths_append(PortableOwnedPaths *paths,
+                                       const SidecarLiveView *view)
+{
+    if (paths == NULL || view == NULL || view->entry == NULL ||
+        paths->count >= SIDECAR_MAX_LIVE_ENTRIES)
+        return -1;
+    if (paths->count == paths->capacity) {
+        size_t capacity = paths->capacity == 0 ? 16U : paths->capacity * 2U;
+        if (capacity > SIDECAR_MAX_LIVE_ENTRIES)
+            capacity = SIDECAR_MAX_LIVE_ENTRIES;
+        if (capacity < paths->capacity ||
+            capacity > SIZE_MAX / sizeof(*paths->items))
+            return -1;
+        PortableOwnedPath *items = realloc(paths->items,
+                                           capacity * sizeof(*items));
+        if (items == NULL)
+            return -1;
+        paths->items = items;
+        paths->capacity = capacity;
+    }
+
+    PortableOwnedPath item = {0};
+    if (sidecar_bytes_to_text(view->entry->root_id, &item.root_id) != 0 ||
+        sidecar_bytes_to_text(view->entry->physical_path,
+                              &item.physical_path) != 0 ||
+        sidecar_bytes_to_text(view->entry->logical_path,
+                              &item.logical_path) != 0) {
+        free(item.root_id);
+        free(item.physical_path);
+        free(item.logical_path);
+        return -1;
+    }
+    paths->items[paths->count++] = item;
+    return 0;
+}
+
+static int portable_owned_paths_callback(const SidecarLiveView *view,
+                                         void *argument)
+{
+    PortableOwnedPaths *paths = argument;
+    return portable_owned_paths_append(paths, view) == 0 ? 0 : 1;
+}
+
+static int portable_owned_path_compare(const void *left, const void *right)
+{
+    const PortableOwnedPath *left_path = left;
+    const PortableOwnedPath *right_path = right;
+    int result = strcmp(left_path->root_id, right_path->root_id);
+    if (result != 0)
+        return result;
+    return strcmp(left_path->physical_path, right_path->physical_path);
+}
+
+static int portable_owned_paths_load(PortableOwnedPaths *paths,
+                                     SidecarLog *sidecar)
+{
+    if (paths == NULL || sidecar == NULL)
+        return -1;
+    SidecarStatus status = sidecar_log_foreach(
+        sidecar, portable_owned_paths_callback, paths);
+    if (status != SIDECAR_STATUS_OK)
+        return -1;
+    if (paths->count > 1U)
+        qsort(paths->items, paths->count, sizeof(*paths->items),
+              portable_owned_path_compare);
+    for (size_t index = 1; index < paths->count; index++) {
+        PortableOwnedPath *previous = &paths->items[index - 1U];
+        PortableOwnedPath *current = &paths->items[index];
+        if (strcmp(previous->root_id, current->root_id) == 0 &&
+            strcmp(previous->physical_path, current->physical_path) == 0)
+            return -1;
+    }
+    paths->sorted = 1;
+    return 0;
+}
+
+static const char *portable_owned_paths_owner(
+    const PortableOwnedPaths *paths, const char *root_id,
+    const char *physical_path)
+{
+    if (paths == NULL || !paths->sorted || root_id == NULL ||
+        physical_path == NULL)
+        return NULL;
+    size_t low = 0;
+    size_t high = paths->count;
+    while (low < high) {
+        size_t middle = low + (high - low) / 2U;
+        const PortableOwnedPath *item = &paths->items[middle];
+        int result = strcmp(item->root_id, root_id);
+        if (result == 0)
+            result = strcmp(item->physical_path, physical_path);
+        if (result < 0)
+            low = middle + 1U;
+        else
+            high = middle;
+    }
+    if (low == paths->count)
+        return NULL;
+    const PortableOwnedPath *item = &paths->items[low];
+    return strcmp(item->root_id, root_id) == 0 &&
+                   strcmp(item->physical_path, physical_path) == 0
+               ? item->logical_path
+               : NULL;
+}
+
 static int stale_keys_append(StaleKeys *keys, SidecarBytes logical,
                              SidecarBytes physical)
 {
@@ -1705,9 +1846,7 @@ static int collect_stale_key(const SidecarLiveView *view, void *argument)
         return 1;
     }
     if (present == 0) {
-        if (!sidecar_bytes_equal(view->entry->logical_path,
-                                 view->entry->physical_path) ||
-            stale_keys_append(collection->stale, view->entry->logical_path,
+        if (stale_keys_append(collection->stale, view->entry->logical_path,
                               view->entry->physical_path) != 0)
             collection->stale->failed = 1;
     }
@@ -1722,6 +1861,57 @@ static int key_is_live(PortableCaptureContext *context,
     SidecarBytes path = { (const unsigned char *)logical, strlen(logical) };
     int found = sidecar_log_find(context->sidecar, root, path, &view);
     return found < 0 ? -1 : found;
+}
+
+static int remove_payload_relative(int data_fd, const char *payload_root,
+                                   const char *physical);
+
+static int capture_destination_is_safe(const PortableCaptureContext *context,
+                                       const PortableRootSpec *root,
+                                       const char *logical,
+                                       const char *physical,
+                                       int parent_fd, const char *leaf)
+{
+    if (context == NULL || root == NULL || logical == NULL ||
+        physical == NULL || parent_fd < 0 || !safe_component(leaf))
+        return -1;
+    struct stat st;
+    if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) != 0)
+        return errno == ENOENT ? 0 : -1;
+
+    if (!context->resume_mode)
+        return 0;
+    if (context->owned_paths == NULL)
+        return -1;
+    const PortableOwnedPaths *owned = context->owned_paths;
+    const char *owner = portable_owned_paths_owner(owned, root->id,
+                                                   physical);
+    if (owner != NULL && strcmp(owner, logical) == 0)
+        return 0;
+
+    /* A resume may have been interrupted after its DELETE record was
+     * committed but before the replacement payload was published.  The
+     * matching tombstone is still this container's ownership proof for the
+     * old physical name; a missing or mismatching tombstone remains foreign. */
+    SidecarLiveView deleted;
+    SidecarBytes root_key = {
+        (const unsigned char *)root->id, strlen(root->id)
+    };
+    SidecarBytes logical_key = {
+        (const unsigned char *)logical, strlen(logical)
+    };
+    int found = sidecar_log_find_deleted(context->sidecar, root_key,
+                                         logical_key, &deleted);
+    if (found < 0)
+        return -1;
+    return found == 1 &&
+                   sidecar_bytes_equal(
+                       deleted.entry->physical_path,
+                       (SidecarBytes){
+                           (const unsigned char *)physical,
+                           strlen(physical) })
+               ? 0
+               : -1;
 }
 
 static int tombstone_if_live(PortableCaptureContext *context,
@@ -1742,6 +1932,62 @@ static int tombstone_if_live(PortableCaptureContext *context,
     if (result == 0)
         portable_test_interrupt_if(PORTABLE_TEST_AFTER_REPLACEMENT_DELETE);
     return result;
+}
+
+static int replace_live_capture(PortableCaptureContext *context,
+                                const PortableRootSpec *root,
+                                const char *logical,
+                                const char *physical)
+{
+    if (context == NULL || root == NULL || logical == NULL ||
+        root->payload_path == NULL)
+        return -1;
+
+    SidecarBytes root_key = {
+        (const unsigned char *)root->id, strlen(root->id)
+    };
+    SidecarBytes logical_key = {
+        (const unsigned char *)logical, strlen(logical)
+    };
+    SidecarLiveView previous;
+    int live = sidecar_log_find(context->sidecar, root_key, logical_key,
+                                &previous);
+    if (live < 0)
+        return -1;
+    if (!live)
+        return 0;
+
+    int remove_old = physical != NULL &&
+        !sidecar_bytes_equal(previous.entry->physical_path,
+                             (SidecarBytes){
+                                 (const unsigned char *)physical,
+                                 strlen(physical) });
+    char *old_physical = NULL;
+    if (remove_old &&
+        sidecar_bytes_to_text(previous.entry->physical_path, &old_physical) != 0)
+        return -1;
+
+    SidecarDelete deletion = {
+        .root_id = root_key,
+        .logical_path = logical_key
+    };
+    portable_test_interrupt_if(PORTABLE_TEST_BEFORE_REPLACEMENT_DELETE);
+    if (sidecar_log_append_delete(context->sidecar, &deletion) !=
+        SIDECAR_STATUS_OK) {
+        free(old_physical);
+        return -1;
+    }
+    portable_test_interrupt_if(PORTABLE_TEST_AFTER_REPLACEMENT_DELETE);
+
+    if (remove_old) {
+        int result = remove_payload_relative(context->data_fd,
+                                             root->payload_path,
+                                             old_physical);
+        free(old_physical);
+        if (result != 0)
+            return -1;
+    }
+    return 0;
 }
 
 static int tombstone_destination_children(PortableCaptureContext *context,
@@ -2313,6 +2559,83 @@ static int copy_regular(int source_fd, int destination_fd, off_t expected_size)
     return expected_size >= 0 && copied == (uint64_t)expected_size ? 0 : -1;
 }
 
+static int physical_path_parent_matches(const char *physical,
+                                        const char *parent)
+{
+    if (physical == NULL || parent == NULL)
+        return 0;
+    const char *slash = strrchr(physical, '/');
+    if (slash == NULL)
+        return parent[0] == '\0';
+    size_t parent_length = (size_t)(slash - physical);
+    return strlen(parent) == parent_length &&
+           memcmp(physical, parent, parent_length) == 0;
+}
+
+static int physical_path_leaf(const char *physical, char *leaf,
+                              size_t leaf_size)
+{
+    if (physical == NULL || leaf == NULL || leaf_size == 0 ||
+        physical[0] == '\0')
+        return -1;
+    const char *slash = strrchr(physical, '/');
+    const char *name = slash == NULL ? physical : slash + 1;
+    if (!safe_component(name))
+        return -1;
+    return copy_text(leaf, leaf_size, name);
+}
+
+static int capture_plan_child(const PortableCaptureContext *context,
+                              const PortableRootSpec *root,
+                              const char *logical, const char *parent_physical,
+                              const char *encoded_leaf,
+                              char *physical, size_t physical_size,
+                              char *leaf, size_t leaf_size)
+{
+    if (context == NULL || root == NULL || logical == NULL ||
+        parent_physical == NULL || encoded_leaf == NULL || physical == NULL ||
+        leaf == NULL)
+        return -1;
+
+    const PortableCollisionPlanEntry *planned =
+        portable_collision_plan_find(context->collision_plan, root->id,
+                                     logical);
+    if (planned == NULL) {
+        if (append_physical(physical, physical_size, parent_physical,
+                            encoded_leaf) != 0 ||
+            copy_text(leaf, leaf_size, encoded_leaf) != 0)
+            return -1;
+        return 0;
+    }
+
+    if (!physical_path_parent_matches(planned->physical_path,
+                                      parent_physical) ||
+        copy_text(physical, physical_size, planned->physical_path) != 0 ||
+        physical_path_leaf(planned->physical_path, leaf, leaf_size) != 0)
+        return -1;
+    return 0;
+}
+
+static int capture_plan_entries_seen(const PortableCaptureContext *context,
+                                    const PortableRootSpec *root)
+{
+    if (context == NULL || root == NULL)
+        return -1;
+    const PortableCollisionPlan *plan = context->collision_plan;
+    if (plan == NULL)
+        return 0;
+    for (size_t index = 0; index < plan->count; index++) {
+        const PortableCollisionPlanEntry *entry = &plan->entries[index];
+        if (strcmp(entry->root_id, root->id) != 0)
+            continue;
+        int present = visited_contains(context->visited, root->id,
+                                       entry->logical_path);
+        if (present != 1)
+            return -1;
+    }
+    return 0;
+}
+
 static int capture_node(PortableCaptureContext *context,
                         const PortableRootSpec *root,
                         const char *logical, const char *physical,
@@ -2325,7 +2648,8 @@ static int capture_directory(PortableCaptureContext *context,
                              const char *logical, const char *physical,
                              int source_fd,
                              const struct stat *before, int destination_fd,
-                             PortableXattrs *xattrs)
+                             PortableXattrs *xattrs,
+                             const char *collision_suffix)
 {
     PendingReadbackNames pending = {0};
     int scan_fd = duplicate_fd(source_fd);
@@ -2337,6 +2661,12 @@ static int capture_directory(PortableCaptureContext *context,
     }
 
     int failed = 0;
+    PortableCaseFoldSet observed_skeletons = {0};
+    PortableCaseFoldSet observed_ascii = {0};
+    if (!context->case_sensitive)
+        observed_skeletons.hash_salt = sidecar_process_salt();
+    if (!context->case_sensitive)
+        observed_ascii.hash_salt = sidecar_process_salt();
     for (;;) {
         errno = 0;
         struct dirent *entry = readdir(directory);
@@ -2363,9 +2693,57 @@ static int capture_directory(PortableCaptureContext *context,
             break;
         }
 
+        if (!context->case_sensitive) {
+            char skeleton[NAME_MAX + 1U];
+            char ascii_skeleton[NAME_MAX + 1U];
+            skeleton_copy(skeleton, sizeof(skeleton), encoded_leaf);
+            ascii_fold_copy(ascii_skeleton, sizeof(ascii_skeleton),
+                            encoded_leaf);
+            char *existing_logical = NULL;
+            int duplicate = case_fold_set_find_or_insert(
+                &observed_skeletons, skeleton, child_logical,
+                &existing_logical);
+            char *existing_ascii_logical = NULL;
+            int ascii_duplicate = case_fold_set_find_or_insert(
+                &observed_ascii, ascii_skeleton, child_logical,
+                &existing_ascii_logical);
+            const PortableCollisionPlanEntry *current_plan =
+                portable_collision_plan_find(context->collision_plan,
+                                              root->id, child_logical);
+            const PortableCollisionPlanEntry *existing_plan =
+                duplicate == 1
+                    ? portable_collision_plan_find(context->collision_plan,
+                                                   root->id, existing_logical)
+                    : NULL;
+            const PortableCollisionPlanEntry *existing_ascii_plan =
+                ascii_duplicate == 1
+                    ? portable_collision_plan_find(
+                          context->collision_plan, root->id,
+                          existing_ascii_logical)
+                    : NULL;
+            /* A case-folded sibling group is valid only when the pre-scan
+             * planned both members.  ASCII folding is authoritative for the
+             * deterministic collision class; the broader skeleton catches a
+             * newly added non-ASCII twin only when the pre-scan had planned
+             * that candidate group, avoiding false refusals for distinct
+             * names that the destination probe kept separate (D21, F-8). */
+            if (duplicate < 0 || ascii_duplicate < 0 ||
+                (ascii_duplicate == 1 &&
+                 (current_plan == NULL || existing_ascii_plan == NULL)) ||
+                (duplicate == 1 &&
+                 (current_plan != NULL || existing_plan != NULL) &&
+                 (current_plan == NULL || existing_plan == NULL))) {
+                failed = 1;
+                break;
+            }
+        }
+
         char child_physical[SIDECAR_MAX_PATH + 1U];
-        if (append_physical(child_physical, sizeof(child_physical), physical,
-                            encoded_leaf) != 0) {
+        char child_leaf[NAME_MAX + 1U];
+        if (capture_plan_child(context, root, child_logical, physical,
+                               encoded_leaf, child_physical,
+                               sizeof(child_physical), child_leaf,
+                               sizeof(child_leaf)) != 0) {
             failed = 1;
             break;
         }
@@ -2379,21 +2757,24 @@ static int capture_directory(PortableCaptureContext *context,
             break;
         }
 
-        if (encoded_name_has_raw_high_byte(encoded_leaf) &&
-            pending_readback_names_add(&pending, encoded_leaf) != 0) {
+        if (encoded_name_has_raw_high_byte(child_leaf) &&
+            pending_readback_names_add(&pending, child_leaf) != 0) {
             failed = 1;
             break;
         }
 
         if (capture_node(context, root, child_logical, child_physical,
                          source_fd, entry->d_name, NULL, destination_fd,
-                         encoded_leaf) != 0) {
+                         child_leaf) != 0) {
             failed = 1;
             break;
         }
     }
     if (closedir(directory) != 0)
         failed = 1;
+
+    case_fold_set_free(&observed_skeletons);
+    case_fold_set_free(&observed_ascii);
 
     struct stat after;
     if (!failed && (fstat(source_fd, &after) != 0 ||
@@ -2412,7 +2793,7 @@ static int capture_directory(PortableCaptureContext *context,
     }
 
     SidecarEntry sidecar_entry;
-    if (entry_from_stat(root->id, logical, physical, before,
+    if (entry_from_stat(root->id, logical, physical, collision_suffix, before,
                         context->nsec_exact,
                         xattrs, &sidecar_entry, NULL) != 0 ||
         append_group(context, &sidecar_entry, xattrs) != 0) {
@@ -2429,6 +2810,7 @@ static int capture_directory(PortableCaptureContext *context,
 static int capture_regular(PortableCaptureContext *context,
                            const PortableRootSpec *root,
                            const char *logical, const char *physical,
+                           const char *collision_suffix,
                            int source_fd,
                            const struct stat *before,
                            int destination_parent,
@@ -2436,12 +2818,6 @@ static int capture_regular(PortableCaptureContext *context,
                            int destination_is_root,
                            PortableXattrs *xattrs)
 {
-    if (tombstone_if_live(context, root->id, logical) != 0) {
-        xattrs_free(xattrs);
-        close(source_fd);
-        return -1;
-    }
-
     int parent_fd = destination_parent;
     char root_leaf[NAME_MAX + 1U];
     if (destination_is_root) {
@@ -2452,6 +2828,15 @@ static int capture_regular(PortableCaptureContext *context,
             return -1;
         }
         destination_leaf = root_leaf;
+    }
+    if (capture_destination_is_safe(context, root, logical, physical,
+                                    parent_fd, destination_leaf) != 0 ||
+        replace_live_capture(context, root, logical, physical) != 0) {
+        if (destination_is_root)
+            close(parent_fd);
+        xattrs_free(xattrs);
+        close(source_fd);
+        return -1;
     }
     if (tombstone_destination_children(context, root->id, logical, parent_fd,
                                        destination_leaf) != 0) {
@@ -2500,7 +2885,8 @@ static int capture_regular(PortableCaptureContext *context,
     }
 
     SidecarEntry sidecar_entry;
-    failed = entry_from_stat(root->id, logical, physical, before,
+    failed = entry_from_stat(root->id, logical, physical, collision_suffix,
+                             before,
                              context->nsec_exact,
                              xattrs, &sidecar_entry, NULL) != 0 ||
              append_group(context, &sidecar_entry, xattrs) != 0;
@@ -2510,13 +2896,12 @@ static int capture_regular(PortableCaptureContext *context,
 
 static int capture_special(PortableCaptureContext *context,
                            const PortableRootSpec *root,
-                           const char *logical, int destination_parent,
+                           const char *logical, const char *physical,
+                           int destination_parent,
                            const char *destination_leaf,
                            int destination_is_root, const struct stat *st)
 {
     if (visited_add(context->visited, root->id, logical) != 0)
-        return -1;
-    if (tombstone_if_live(context, root->id, logical) != 0)
         return -1;
 
     int parent_fd = destination_parent;
@@ -2526,6 +2911,13 @@ static int capture_special(PortableCaptureContext *context,
                                 &parent_fd, root_leaf, sizeof(root_leaf)) != 0)
             return -1;
         destination_leaf = root_leaf;
+    }
+    if (capture_destination_is_safe(context, root, logical, physical,
+                                    parent_fd, destination_leaf) != 0 ||
+        replace_live_capture(context, root, logical, physical) != 0) {
+        if (destination_is_root)
+            close(parent_fd);
+        return -1;
     }
     if (tombstone_destination_children(context, root->id, logical, parent_fd,
                                        destination_leaf) != 0) {
@@ -2550,6 +2942,7 @@ static int capture_special(PortableCaptureContext *context,
 static int capture_symlink(PortableCaptureContext *context,
                            const PortableRootSpec *root,
                            const char *logical, const char *physical,
+                           const char *collision_suffix,
                            int source_parent,
                            const char *source_name, const char *root_path,
                            int destination_parent,
@@ -2594,7 +2987,7 @@ static int capture_symlink(PortableCaptureContext *context,
         (const unsigned char *)target, (size_t)target_length
     };
     SidecarEntry entry;
-    if (entry_from_stat(root->id, logical, physical, before,
+    if (entry_from_stat(root->id, logical, physical, collision_suffix, before,
                         context->nsec_exact,
                         &xattrs, &entry, &target_bytes) != 0) {
         xattrs_free(&xattrs);
@@ -2630,11 +3023,6 @@ static int capture_symlink(PortableCaptureContext *context,
         }
     }
 
-    if (tombstone_if_live(context, root->id, logical) != 0) {
-        xattrs_free(&xattrs);
-        return -1;
-    }
-
     int parent_fd = destination_parent;
     char root_leaf[NAME_MAX + 1U];
     if (destination_is_root) {
@@ -2645,6 +3033,14 @@ static int capture_symlink(PortableCaptureContext *context,
             return -1;
         }
         destination_leaf = root_leaf;
+    }
+    if (capture_destination_is_safe(context, root, logical, physical,
+                                    parent_fd, destination_leaf) != 0 ||
+        replace_live_capture(context, root, logical, physical) != 0) {
+        if (destination_is_root)
+            close(parent_fd);
+        xattrs_free(&xattrs);
+        return -1;
     }
 
     if (tombstone_destination_children(context, root->id, logical, parent_fd,
@@ -2689,17 +3085,29 @@ static int capture_node(PortableCaptureContext *context,
     if (read_source_stat(source_parent, source_name, root_path, &before) != 0)
         return -1;
 
+    const char *collision_suffix = "";
+    const PortableCollisionPlanEntry *planned =
+        portable_collision_plan_find(context->collision_plan, root->id,
+                                     logical);
+    if (planned != NULL) {
+        if (strcmp(planned->physical_path, physical) != 0)
+            return -1;
+        collision_suffix = planned->collision_suffix;
+    }
+
     int is_root = source_parent < 0;
     if (S_ISSOCK(before.st_mode) || S_ISCHR(before.st_mode) ||
         S_ISBLK(before.st_mode))
-        return capture_special(context, root, logical, destination_parent,
-                               destination_leaf, is_root, &before);
+        return capture_special(context, root, logical, physical,
+                               destination_parent, destination_leaf, is_root,
+                               &before);
     if (S_ISFIFO(before.st_mode)) {
         errno = EOPNOTSUPP;
         return -1;
     }
     if (S_ISLNK(before.st_mode))
-        return capture_symlink(context, root, logical, physical, source_parent,
+        return capture_symlink(context, root, logical, physical,
+                               collision_suffix, source_parent,
                                source_name, root_path, destination_parent,
                                destination_leaf, is_root, &before);
     if (!S_ISREG(before.st_mode) && !S_ISDIR(before.st_mode)) {
@@ -2746,7 +3154,8 @@ static int capture_node(PortableCaptureContext *context,
         }
         if (live == 1) {
             SidecarEntry current;
-            int matches = entry_from_stat(root->id, logical, physical, &before,
+            int matches = entry_from_stat(root->id, logical, physical,
+                                          collision_suffix, &before,
                                           context->nsec_exact, &xattrs,
                                           &current, NULL) == 0 &&
                           entries_equal(&current, &previous, &xattrs);
@@ -2768,16 +3177,11 @@ static int capture_node(PortableCaptureContext *context,
     }
 
     if (S_ISREG(before.st_mode))
-        return capture_regular(context, root, logical, physical, source_fd,
+        return capture_regular(context, root, logical, physical,
+                               collision_suffix, source_fd,
                                &before,
                                destination_parent, destination_leaf, is_root,
                                &xattrs);
-
-    if (tombstone_if_live(context, root->id, logical) != 0) {
-        xattrs_free(&xattrs);
-        close(source_fd);
-        return -1;
-    }
 
     int parent_fd = destination_parent;
     char root_leaf[NAME_MAX + 1U];
@@ -2791,6 +3195,16 @@ static int capture_node(PortableCaptureContext *context,
         destination_leaf = root_leaf;
     }
 
+    if (capture_destination_is_safe(context, root, logical, physical,
+                                    parent_fd, destination_leaf) != 0 ||
+        replace_live_capture(context, root, logical, physical) != 0) {
+        if (is_root)
+            close(parent_fd);
+        xattrs_free(&xattrs);
+        close(source_fd);
+        return -1;
+    }
+
     int destination_fd;
     if (ensure_directory_leaf(parent_fd, destination_leaf, &destination_fd) != 0) {
         if (is_root)
@@ -2800,7 +3214,7 @@ static int capture_node(PortableCaptureContext *context,
         return -1;
     }
     if (capture_directory(context, root, logical, physical, source_fd, &before,
-                          destination_fd, &xattrs) != 0) {
+                          destination_fd, &xattrs, collision_suffix) != 0) {
         if (is_root)
             close(parent_fd);
         return -1;
@@ -2870,6 +3284,10 @@ static int prescan_record_case_collision(PortablePrescanReport *report,
                   sizeof(violation.collides_with_logical_path),
                   collides_with) != 0)
         return -1;
+    if (report == NULL)
+        return -1;
+    if (report->collision_count != SIZE_MAX)
+        report->collision_count++;
     return prescan_report_add(report, &violation);
 }
 
@@ -3784,7 +4202,9 @@ static int prescan_request_internal(int container_fd,
     portable_collision_plan_sort(&report->collision_plan);
     if (!failed && portable_collision_plan_rewrite_parents(report, request) != 0)
         failed = 1;
-    return failed || (reject_violations && report->total_count != 0)
+    if (!failed)
+        prescan_report_refresh_unresolved(report);
+    return failed || (reject_violations && report->unresolved_count != 0)
                ? -1
                : 0;
 }
@@ -3956,12 +4376,18 @@ int portable_capture_context_init(PortableCaptureContext *context,
     PortableVisited *visited = calloc(1, sizeof(*visited));
     if (visited == NULL)
         return -1;
+    PortableOwnedPaths *owned_paths = calloc(1, sizeof(*owned_paths));
+    if (owned_paths == NULL) {
+        free(visited);
+        return -1;
+    }
     context->data_fd = data_fd;
     context->sidecar = sidecar;
     context->nsec_exact = nsec_exact != 0;
     context->case_sensitive = case_sensitive != 0;
     visited->hash_salt = sidecar_process_salt();
     context->visited = visited;
+    context->owned_paths = owned_paths;
     return 0;
 }
 
@@ -3970,6 +4396,8 @@ void portable_capture_context_close(PortableCaptureContext *context)
     if (context == NULL)
         return;
     visited_free(context->visited);
+    portable_owned_paths_free(context->owned_paths);
+    free(context->owned_paths);
     memset(context, 0, sizeof(*context));
 }
 
@@ -3983,8 +4411,11 @@ int portable_capture_root(PortableCaptureContext *context,
     PortableVisited *visited = context->visited;
     if (visited_reset(visited) != 0)
         return -1;
-    return capture_node(context, root, "", "", -1, NULL, root->capture_path,
-                        -1, NULL);
+    int result = capture_node(context, root, "", "", -1, NULL,
+                              root->capture_path, -1, NULL);
+    if (result != 0)
+        return result;
+    return capture_plan_entries_seen(context, root);
 }
 
 int portable_capture_fresh_at(int container_fd,
@@ -4006,56 +4437,65 @@ int portable_capture_fresh_at(int container_fd,
         portable_prescan_report_init(&local_report);
         active_report = &local_report;
     }
-    if (prescan_request(container_fd, request, active_report) != 0) {
-        if (owns_report)
-            portable_prescan_report_free(&local_report);
-        return -1;
-    }
-    if (owns_report)
-        portable_prescan_report_free(&local_report);
+    Manifest manifest = {0};
+    SidecarLog sidecar = {0};
+    PortableCaptureContext context = {0};
+    int manifest_ready = 0;
+    int data_fd = -1;
+    int sidecar_ready = 0;
+    int context_ready = 0;
+    int result = -1;
 
-    Manifest manifest;
+    if (prescan_request(container_fd, request, active_report) != 0)
+        goto done;
     if (build_manifest(request, &manifest) != 0)
-        return -1;
-    if (manifest_write_v1_at(container_fd, &manifest) != 0) {
-        manifest_free(&manifest);
-        return -1;
-    }
+        goto done;
+    manifest_ready = 1;
+    if (manifest_write_v1_at(container_fd, &manifest) != 0)
+        goto done;
     portable_test_interrupt_if(PORTABLE_TEST_AFTER_MANIFEST);
 
     if (mkdirat(container_fd, "data", 0700) != 0 && errno != EEXIST) {
-        manifest_free(&manifest);
-        return -1;
+        goto done;
     }
-    int data_fd = openat(container_fd, "data",
-                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    data_fd = openat(container_fd, "data",
+                     O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (data_fd < 0) {
-        manifest_free(&manifest);
-        return -1;
+        goto done;
     }
 
-    SidecarLog sidecar = {0};
     if (sidecar_log_create_at(container_fd, &sidecar) != SIDECAR_OPEN_FRESH) {
-        close(data_fd);
-        manifest_free(&manifest);
-        return -1;
+        goto done;
     }
+    sidecar_ready = 1;
 
-    PortableCaptureContext context = {0};
     int failed = portable_capture_context_init(&context, data_fd, &sidecar,
                                                request->nsec_exact,
                                                request->case_sensitive) != 0;
+    if (!failed) {
+        context_ready = 1;
+        context.collision_plan = &active_report->collision_plan;
+        if (portable_owned_paths_load(context.owned_paths, &sidecar) != 0)
+            failed = 1;
+    }
     for (size_t index = 0; !failed && index < request->root_count; index++)
         if (portable_capture_root(&context, &request->roots[index]) != 0 ||
             reconcile_root(&context, &request->roots[index]) != 0)
             failed = 1;
-    portable_capture_context_close(&context);
-    if (sidecar_log_close(&sidecar) != SIDECAR_STATUS_OK)
-        failed = 1;
-    if (close(data_fd) != 0)
-        failed = 1;
-    manifest_free(&manifest);
-    return failed ? -1 : 0;
+    result = failed ? -1 : 0;
+
+done:
+    if (context_ready)
+        portable_capture_context_close(&context);
+    if (sidecar_ready && sidecar_log_close(&sidecar) != SIDECAR_STATUS_OK)
+        result = -1;
+    if (data_fd >= 0 && close(data_fd) != 0)
+        result = -1;
+    if (manifest_ready)
+        manifest_free(&manifest);
+    if (owns_report)
+        portable_prescan_report_free(&local_report);
+    return result;
 }
 
 /* Returns 0 with an open data directory, 1 when data is absent, -1 otherwise. */
@@ -4105,43 +4545,35 @@ int portable_capture_resume_at(int container_fd,
         portable_prescan_report_init(&local_report);
         active_report = &local_report;
     }
-    if (prescan_request(container_fd, request, active_report) != 0) {
-        if (owns_report)
-            portable_prescan_report_free(&local_report);
-        return -1;
-    }
-    if (owns_report)
-        portable_prescan_report_free(&local_report);
+    Manifest expected = {0};
+    Manifest existing = {0};
+    SidecarLog sidecar = {0};
+    PortableCaptureContext context = {0};
+    int data_fd = -1;
+    int context_ready = 0;
+    int result = -1;
 
-    Manifest expected;
+    if (prescan_request(container_fd, request, active_report) != 0)
+        goto done;
     if (build_manifest(request, &expected) != 0)
-        return -1;
+        goto done;
 
-    Manifest existing;
     ManifestStatus manifest_status = manifest_read_v1_at(container_fd,
                                                          &existing);
     if (manifest_status != MANIFEST_STATUS_VALID) {
-        manifest_free(&expected);
-        return -1;
+        goto done;
     }
     ManifestIdentityComparison identity =
         manifest_resume_identity_compare(&existing, &expected);
     if (identity != MANIFEST_IDENTITY_EQUAL) {
-        manifest_free(&existing);
-        manifest_free(&expected);
-        return -1;
+        goto done;
     }
 
-    int data_fd = -1;
     int data_state = open_existing_data(container_fd, &data_fd);
-    if (data_state < 0) {
-        manifest_free(&existing);
-        manifest_free(&expected);
-        return -1;
-    }
+    if (data_state < 0)
+        goto done;
     int data_missing = data_state == 1;
 
-    SidecarLog sidecar = {0};
     SidecarOpenStatus sidecar_status = sidecar_log_adopt_at(container_fd,
                                                             &sidecar);
     int failed = 0;
@@ -4160,14 +4592,18 @@ int portable_capture_resume_at(int container_fd,
         failed = 1;
     }
 
-    PortableCaptureContext context = {0};
     if (!failed && portable_capture_context_init(&context, data_fd, &sidecar,
                                                 request->nsec_exact,
                                                 request->case_sensitive) != 0)
         failed = 1;
     if (!failed) {
+        context_ready = 1;
         context.resume_mode = 1;
-        for (size_t index = 0; index < request->root_count; index++) {
+        context.collision_plan = &active_report->collision_plan;
+        if (portable_owned_paths_load(context.owned_paths, &sidecar) != 0)
+            failed = 1;
+        for (size_t index = 0; !failed && index < request->root_count;
+             index++) {
             if (portable_capture_root(&context, &request->roots[index]) != 0 ||
                 reconcile_root(&context, &request->roots[index]) != 0) {
                 failed = 1;
@@ -4175,12 +4611,18 @@ int portable_capture_resume_at(int container_fd,
             }
         }
     }
-    portable_capture_context_close(&context);
+    result = failed ? -1 : 0;
+
+done:
+    if (context_ready)
+        portable_capture_context_close(&context);
     if (sidecar_log_close(&sidecar) != SIDECAR_STATUS_OK)
-        failed = 1;
+        result = -1;
     if (data_fd >= 0 && close(data_fd) != 0)
-        failed = 1;
+        result = -1;
     manifest_free(&existing);
     manifest_free(&expected);
-    return failed ? -1 : 0;
+    if (owns_report)
+        portable_prescan_report_free(&local_report);
+    return result;
 }

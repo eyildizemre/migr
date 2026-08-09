@@ -1,8 +1,7 @@
-// Unit tests for the portable capture core (docs/DECISIONS.md D17/D18/D19/D21): the
-// fresh-capture-only walk over regular files and directories, behind the
-// test-only direct API (D14 -- never reachable from a release binary). No
-// resume, no adopt, no interruption testing here; those are separate steps
-// built on top of this one.
+// Unit tests for the portable capture core (docs/DECISIONS.md D17/D18/D19/D21):
+// the fresh and resumed walks over regular files and directories, behind the
+// test-only direct API (D14 -- never reachable from a release binary), including
+// the collision plan's physical-name and source-plan invariants.
 //
 // Regular/directory capture is checked byte-exact against the source, with
 // xattrs captured and the resulting sidecar's group count verified. D17's
@@ -45,6 +44,7 @@
 
 extern int entry_from_stat(const char *root_id, const char *logical,
                            const char *physical,
+                           const char *collision_suffix,
                            const struct stat *st, int nsec_exact,
                            PortableXattrs *xattrs, SidecarEntry *out,
                            const SidecarBytes *symlink_target);
@@ -199,6 +199,12 @@ static void remove_tree_fd(const char *path)
         rmdir(path) != 0)
         fixture_fatal("could not remove fixture tree by descriptor");
 }
+
+static int create_live_capture(const char *container_path, int *container_fd,
+                               SidecarLog *log,
+                               PortableCaptureContext *context);
+static void close_live_capture(int container_fd, SidecarLog *log,
+                               PortableCaptureContext *context);
 
 static void join_path(char *out, size_t size, const char *left,
                       const char *right)
@@ -574,13 +580,35 @@ static void test_case_collision_prescan(const char *base)
                                   source_path, sizeof(source_path),
                                   container_path, sizeof(container_path),
                                   &container_fd, &report);
-    check(result != 0 && report.total_count == 1 &&
+    check(result == 0 && report.total_count == 1 &&
               report.example_count == 1 &&
               strcmp(report.examples[0].root_id, "CASE") == 0 &&
               collision_pair_matches(&report.examples[0], "Foo", "foo"),
           "case-insensitive pre-scan reports both ASCII-colliding siblings");
-    check(empty_capture_container(container_fd),
-          "case-collision refusal leaves the container namespace untouched");
+    struct stat collision_stat;
+    SidecarLog collision_log = {0};
+    int collision_log_open = sidecar_log_adopt_at(container_fd,
+                                                   &collision_log) ==
+                             SIDECAR_OPEN_RESUMABLE;
+    SidecarLiveView collision_upper = {0};
+    SidecarLiveView collision_lower = {0};
+    int collision_entries = collision_log_open &&
+        sidecar_log_find(&collision_log, bytes("CASE"), bytes("Foo"),
+                         &collision_upper) == 1 &&
+        sidecar_log_find(&collision_log, bytes("CASE"), bytes("foo"),
+                         &collision_lower) == 1;
+    check(fstatat(container_fd, "data/CASE/Foo", &collision_stat,
+                  AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(collision_stat.st_mode) &&
+              fstatat(container_fd, "data/CASE/foo%7E1", &collision_stat,
+                      AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(collision_stat.st_mode) &&
+              collision_entries &&
+              sidecar_bytes_match_text(collision_upper.entry->collision_suffix,
+                                        "") &&
+              sidecar_bytes_match_text(collision_lower.entry->collision_suffix,
+                                        "%7E1"),
+          "resolved collision writes both physical payloads and suffix fields");
+    if (collision_log_open)
+        sidecar_log_close(&collision_log);
     portable_prescan_report_free(&report);
     close(container_fd);
     remove_tree(source_path);
@@ -640,10 +668,15 @@ static void test_case_collision_prescan(const char *base)
                               three_way,
                               sizeof(three_way) / sizeof(three_way[0]));
     }
-    check(result != 0 && report.total_count == 2 && pairs_are_valid,
+    check(result == 0 && report.total_count == 2 && pairs_are_valid,
           "three ASCII case variants count each losing name (total_count == 2)");
-    check(empty_capture_container(container_fd),
-          "three-way collision refusal leaves the container untouched");
+    check(fstatat(container_fd, "data/CASE/FOO", &st,
+                  AT_SYMLINK_NOFOLLOW) == 0 &&
+              fstatat(container_fd, "data/CASE/Foo%7E1", &st,
+                      AT_SYMLINK_NOFOLLOW) == 0 &&
+              fstatat(container_fd, "data/CASE/foo%7E2", &st,
+                      AT_SYMLINK_NOFOLLOW) == 0,
+          "three-way collision writes every planned physical payload");
     portable_prescan_report_free(&report);
     close(container_fd);
     remove_tree(source_path);
@@ -689,7 +722,7 @@ static void test_collision_plan(const char *base)
         portable_collision_plan_find(&report.collision_plan, "CASE", "Foo");
     const PortableCollisionPlanEntry *lower =
         portable_collision_plan_find(&report.collision_plan, "CASE", "foo");
-    check(result != 0 && report.collision_plan.count == 2 &&
+    check(result == 0 && report.collision_plan.count == 2 &&
               collision_plan_entry_matches(upper, "CASE", "Foo", "Foo", "") &&
               collision_plan_entry_matches(lower, "CASE", "foo",
                                             "foo%7E1", "%7E1"),
@@ -726,7 +759,7 @@ static void test_collision_plan(const char *base)
         portable_collision_plan_find(&report.collision_plan, "CASE", "FOO");
     upper = portable_collision_plan_find(&report.collision_plan, "CASE", "Foo");
     lower = portable_collision_plan_find(&report.collision_plan, "CASE", "foo");
-    check(result != 0 && report.collision_plan.count == 3 &&
+    check(result == 0 && report.collision_plan.count == 3 &&
               collision_plan_entry_matches(all_upper, "CASE", "FOO", "FOO",
                                             "") &&
               collision_plan_entry_matches(upper, "CASE", "Foo", "Foo%7E1",
@@ -749,7 +782,7 @@ static void test_collision_plan(const char *base)
                                          "foo");
     const PortableCollisionPlanEntry *literal_suffix =
         portable_collision_plan_find(&report.collision_plan, "CASE", "foo~1");
-    check(result != 0 && report.collision_plan.count == 2 &&
+    check(result == 0 && report.collision_plan.count == 2 &&
               collision_plan_entry_matches(lower, "CASE", "foo",
                                             "foo%7E2", "%7E2") &&
               literal_suffix == NULL,
@@ -770,7 +803,7 @@ static void test_collision_plan(const char *base)
     const PortableCollisionPlanEntry *unicode_lower =
         portable_collision_plan_find(&report.collision_plan, "CASE",
                                      "caf\xc3\xa9");
-    check(result != 0 && report.collision_plan.count == 2 &&
+    check(result == 0 && report.collision_plan.count == 2 &&
               collision_plan_entry_matches(unicode_lower, "CASE",
                                             "caf\xc3\xa9",
                                             "caf\xc3\xa9%7E2", "%7E2"),
@@ -818,7 +851,7 @@ static void test_collision_plan(const char *base)
         portable_collision_plan_find(&report.collision_plan, "ROOT_B", "Foo");
     const PortableCollisionPlanEntry *root_b_lower =
         portable_collision_plan_find(&report.collision_plan, "ROOT_B", "foo");
-    check(result != 0 && report.collision_plan.count == 4 &&
+    check(result == 0 && report.collision_plan.count == 4 &&
               collision_plan_entry_matches(root_a_upper, "ROOT_A", "Foo",
                                             "Foo", "") &&
               collision_plan_entry_matches(root_a_lower, "ROOT_A", "foo",
@@ -882,7 +915,7 @@ static void test_collision_plan(const char *base)
     const PortableCollisionPlanEntry *upper_nested_lower =
         portable_collision_plan_find(&report.collision_plan, "CASE",
                                      "Foo/middle/a");
-    check(result != 0 && report.collision_plan.count == 6 &&
+    check(result == 0 && report.collision_plan.count == 6 &&
               collision_plan_entry_matches(
                   portable_collision_plan_find(&report.collision_plan, "CASE",
                                                "foo"),
@@ -901,6 +934,11 @@ static void test_collision_plan(const char *base)
                                             "Foo/middle/a", "Foo/middle/a%7E1",
                                             "%7E1"),
           "nested plans include both colliding subtrees and inherit their ancestors' prefixes");
+    struct stat nested_payload_stat;
+    check(fstatat(container_fd, "data/CASE/foo%7E1/middle/a%7E1",
+                  &nested_payload_stat, AT_SYMLINK_NOFOLLOW) == 0 &&
+              S_ISREG(nested_payload_stat.st_mode),
+          "capture places a child under its suffixed ancestor");
     portable_prescan_report_free(&report);
     close(container_fd);
     remove_tree(source_path);
@@ -917,7 +955,7 @@ static void test_collision_plan(const char *base)
     if (report.collision_plan.count == 0 && result == 0) {
         skip_check("non-ASCII plan is deferred when the measured host is case-sensitive");
     } else {
-        check(result != 0 && report.collision_plan.count == 2,
+        check(result == 0 && report.collision_plan.count == 2,
               "destination-probed non-ASCII collision produces a plan");
     }
     portable_prescan_report_free(&report);
@@ -926,9 +964,8 @@ static void test_collision_plan(const char *base)
     remove_tree(container_path);
 }
 
-/* F.1b baseline: ASCII-fold and destination-probed case collisions are fatal
- * today. F.4 is expected to turn these collision assertions into successful
- * suffix resolution while keeping NAME_MAX and PATH_MAX violations fatal. */
+/* Mixed pre-scan baseline: resolved case collisions are no longer fatal, while
+ * NAME_MAX and PATH_MAX violations remain fatal (docs/DECISIONS.md D21, F-4/F-6). */
 static void test_mixed_prescan_violations(const char *base)
 {
     printf(BLUE "::" NC " mixed pre-scan violation fate\n");
@@ -967,8 +1004,9 @@ static void test_mixed_prescan_violations(const char *base)
             collision_violation = 1;
     }
     check(result != 0 && report.total_count == 2 &&
+              report.collision_count == 1 && report.unresolved_count == 1 &&
               report.example_count == 2,
-          "one collision and one NAME_MAX violation are both fatal today");
+          "a resolved collision is non-fatal, but the NAME_MAX violation remains fatal");
     check(name_violation && collision_violation,
           "mixed violations retain exact NAME_MAX and collision fields");
     check(empty_capture_container(container_fd),
@@ -1017,13 +1055,14 @@ static void test_case_collision_report_cap(const char *base)
          index < report.example_count && examples_are_real; index++)
         examples_are_real = collision_example_matches_names(
             &report.examples[index], names, COLLISION_NAME_COUNT);
-    check(result != 0 && report.total_count == COLLISION_PAIR_COUNT &&
+    check(result == 0 && report.total_count == COLLISION_PAIR_COUNT &&
               report.example_count == PORTABLE_PRESCAN_MAX_EXAMPLES &&
               report.collision_plan.count == COLLISION_NAME_COUNT &&
               examples_are_real,
           "collision diagnostics stay bounded while the plan keeps every candidate");
-    check(empty_capture_container(container_fd),
-          "bounded collision refusal leaves the container namespace untouched");
+    check(fstatat(container_fd, "data/CASE/Pair000", &((struct stat){0}),
+                  AT_SYMLINK_NOFOLLOW) == 0,
+          "bounded collision plan is consumed without losing payloads");
     portable_prescan_report_free(&report);
     close(container_fd);
     remove_tree(source_path);
@@ -1078,6 +1117,256 @@ static void test_case_collision_directory_scope(const char *base)
               fstatat(container_fd, "data/CASE/right/foo", &st,
                       AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(st.st_mode),
           "directory-local names are both captured under their own parents");
+    portable_prescan_report_free(&report);
+    close(container_fd);
+    remove_tree(source_path);
+    remove_tree(container_path);
+}
+
+static int prepare_collision_plan_capture(const char *source_path,
+                                          const char *container_path,
+                                          const char *const *names,
+                                          size_t name_count,
+                                          int *container_fd,
+                                          SidecarLog *log,
+                                          PortableCaptureContext *context,
+                                          PortableRootSpec *root,
+                                          PortablePrescanReport *report)
+{
+    if (source_path == NULL || container_path == NULL || names == NULL ||
+        container_fd == NULL || log == NULL || context == NULL ||
+        root == NULL || report == NULL)
+        return -1;
+    make_directory(source_path);
+    for (size_t index = 0; index < name_count; index++) {
+        char path[PATH_MAX];
+        join_path(path, sizeof(path), source_path, names[index]);
+        write_file(path, "x", 1);
+    }
+    *container_fd = -1;
+    *log = (SidecarLog){0};
+    *context = (PortableCaptureContext){0};
+    if (create_live_capture(container_path, container_fd, log, context) != 0)
+        return -1;
+    *root = root_spec("CASE", source_path, "CASE");
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .roots = root,
+        .root_count = 1,
+        .nsec_exact = 1,
+        .case_sensitive = 0
+    };
+    portable_prescan_report_init(report);
+    if (portable_collision_plan_build(*container_fd, &request, report) != 0)
+        return -1;
+    context->case_sensitive = 0;
+    context->collision_plan = &report->collision_plan;
+    return 0;
+}
+
+static void test_capture_source_plan_mismatch(const char *base)
+{
+    printf(BLUE "::" NC " source-plan mismatch is fail-closed\n");
+    static const char *const pair[] = { "Foo", "foo" };
+    char source_path[PATH_MAX];
+    char container_path[PATH_MAX];
+    join_path(source_path, sizeof(source_path), base,
+              "collision-mismatch-remove");
+    join_path(container_path, sizeof(container_path), base,
+              "collision-mismatch-remove-container");
+    int container_fd = -1;
+    SidecarLog log = {0};
+    PortableCaptureContext context = {0};
+    PortableRootSpec root = {0};
+    PortablePrescanReport report;
+    int prepared = prepare_collision_plan_capture(
+        source_path, container_path, pair, sizeof(pair) / sizeof(pair[0]),
+        &container_fd, &log, &context, &root, &report);
+    check(prepared == 0 && report.collision_plan.count == 2,
+          "a plan is built before the source is changed");
+    if (prepared == 0) {
+        char removed[PATH_MAX];
+        join_path(removed, sizeof(removed), source_path, "foo");
+        if (unlink(removed) != 0)
+            fixture_fatal("could not remove the planned collision member");
+        check(portable_capture_root(&context, &root) != 0,
+              "a planned collision member disappearing aborts capture");
+    }
+    portable_prescan_report_free(&report);
+    close_live_capture(container_fd, &log, &context);
+    remove_tree(source_path);
+    remove_tree(container_path);
+
+    join_path(source_path, sizeof(source_path), base,
+              "collision-mismatch-add");
+    join_path(container_path, sizeof(container_path), base,
+              "collision-mismatch-add-container");
+    static const char *const singleton[] = { "foo" };
+    prepared = prepare_collision_plan_capture(
+        source_path, container_path, singleton,
+        sizeof(singleton) / sizeof(singleton[0]), &container_fd, &log,
+        &context, &root, &report);
+    check(prepared == 0 && report.collision_plan.count == 0,
+          "a collision-free source produces no assignment entries");
+    if (prepared == 0) {
+        char added[PATH_MAX];
+        join_path(added, sizeof(added), source_path, "Foo");
+        write_file(added, "x", 1);
+        check(portable_capture_root(&context, &root) != 0,
+              "a new case twin absent from the plan aborts capture");
+    }
+    portable_prescan_report_free(&report);
+    close_live_capture(container_fd, &log, &context);
+    remove_tree(source_path);
+    remove_tree(container_path);
+}
+
+static void test_collision_resume(const char *base)
+{
+    printf(BLUE "::" NC " owned collision names on resume\n");
+    char source_path[PATH_MAX];
+    char container_path[PATH_MAX];
+    join_path(source_path, sizeof(source_path), base,
+              "collision-resume-source");
+    join_path(container_path, sizeof(container_path), base,
+              "collision-resume-container");
+    make_directory(source_path);
+    make_directory(container_path);
+    char upper[PATH_MAX];
+    char lower[PATH_MAX];
+    join_path(upper, sizeof(upper), source_path, "Foo");
+    join_path(lower, sizeof(lower), source_path, "foo");
+    write_file(upper, "upper", 5);
+    write_file(lower, "lower", 5);
+
+    int container_fd = open(container_path,
+                             O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open collision resume container");
+    PortableRootSpec root = root_spec("CASE", source_path, "CASE");
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .roots = &root,
+        .root_count = 1,
+        .nsec_exact = 1,
+        .case_sensitive = 1,
+        .has_source_identity = 1,
+        .machine_id = "0123456789abcdef",
+        .source_uid = getuid()
+    };
+    PortablePrescanReport report;
+    portable_prescan_report_init(&report);
+    check(portable_capture_fresh_at(container_fd, &request, &report) == 0,
+          "an unsuffixed predecessor is captured on a case-sensitive verdict");
+    portable_prescan_report_free(&report);
+
+    request.case_sensitive = 0;
+    portable_prescan_report_init(&report);
+    check(portable_capture_resume_at(container_fd, &request, &report) == 0,
+          "resume consumes the new collision plan for the owned container");
+    struct stat st;
+    int upper_payload = fstatat(container_fd, "data/CASE/Foo", &st,
+                                AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(st.st_mode);
+    int lower_payload = fstatat(container_fd, "data/CASE/foo%7E1", &st,
+                                AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(st.st_mode);
+    int stale_payload = fstatat(container_fd, "data/CASE/foo", &st,
+                                 AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT;
+    check(upper_payload && lower_payload && stale_payload,
+          "resume relocates the owned loser and removes its stale physical name");
+
+    SidecarLog log = {0};
+    SidecarLiveView upper_view = {0};
+    SidecarLiveView lower_view = {0};
+    int opened = sidecar_log_adopt_at(container_fd, &log) ==
+                 SIDECAR_OPEN_RESUMABLE;
+    int found = opened &&
+        sidecar_log_find(&log, bytes("CASE"), bytes("Foo"), &upper_view) == 1 &&
+        sidecar_log_find(&log, bytes("CASE"), bytes("foo"), &lower_view) == 1;
+    check(found && sidecar_bytes_match_text(upper_view.entry->physical_path,
+                                            "Foo") &&
+              sidecar_bytes_match_text(upper_view.entry->collision_suffix,
+                                       "") &&
+              sidecar_bytes_match_text(lower_view.entry->physical_path,
+                                       "foo%7E1") &&
+              sidecar_bytes_match_text(lower_view.entry->collision_suffix,
+                                       "%7E1"),
+          "resume records the owned physical relocation and planned suffix");
+    if (opened)
+        sidecar_log_close(&log);
+    portable_prescan_report_free(&report);
+    close(container_fd);
+    remove_tree(source_path);
+    remove_tree(container_path);
+}
+
+static void test_collision_foreign_resume(const char *base)
+{
+    printf(BLUE "::" NC " foreign collision payload is not overwritten on resume\n");
+    char source_path[PATH_MAX];
+    char container_path[PATH_MAX];
+    join_path(source_path, sizeof(source_path), base,
+              "collision-foreign-source");
+    join_path(container_path, sizeof(container_path), base,
+              "collision-foreign-container");
+    make_directory(source_path);
+    char upper[PATH_MAX];
+    char lower[PATH_MAX];
+    join_path(upper, sizeof(upper), source_path, "Foo");
+    join_path(lower, sizeof(lower), source_path, "foo");
+    write_file(upper, "upper", 5);
+    write_file(lower, "lower", 5);
+
+    make_directory(container_path);
+    int container_fd = open(container_path,
+                             O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open foreign collision container");
+    PortableRootSpec root = root_spec("CASE", source_path, "CASE");
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .roots = &root,
+        .root_count = 1,
+        .nsec_exact = 1,
+        .case_sensitive = 1,
+        .has_source_identity = 1,
+        .machine_id = "0123456789abcdef",
+        .source_uid = getuid()
+    };
+    PortablePrescanReport report;
+    portable_prescan_report_init(&report);
+    check(portable_capture_fresh_at(container_fd, &request, &report) == 0,
+          "foreign-resume predecessor is captured");
+    portable_prescan_report_free(&report);
+
+    int data_fd = openat(container_fd, "data",
+                         O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int payload_fd = data_fd < 0 ? -1 : openat(
+        data_fd, "CASE", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    int foreign_fd = payload_fd < 0 ? -1 : openat(
+        payload_fd, "foo%7E1", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+        0600);
+    if (foreign_fd < 0 || write(foreign_fd, "foreign", 7) != 7 ||
+        close(foreign_fd) != 0) {
+        if (foreign_fd >= 0)
+            close(foreign_fd);
+        if (payload_fd >= 0)
+            close(payload_fd);
+        if (data_fd >= 0)
+            close(data_fd);
+        fixture_fatal("could not plant foreign collision payload");
+    }
+    close(payload_fd);
+    close(data_fd);
+
+    request.case_sensitive = 0;
+    portable_prescan_report_init(&report);
+    check(portable_capture_resume_at(container_fd, &request, &report) != 0,
+          "resume refuses a foreign planned payload instead of overwriting it");
+    char foreign_path[PATH_MAX];
+    join_path(foreign_path, sizeof(foreign_path), container_path,
+              "data/CASE/foo%7E1");
+    check(file_equals(foreign_path, "foreign"),
+          "foreign payload content remains untouched after refusal");
     portable_prescan_report_free(&report);
     close(container_fd);
     remove_tree(source_path);
@@ -1211,7 +1500,7 @@ static void test_entry_helpers(const char *source)
     PortableXattrs empty_xattrs = {0};
     SidecarBytes target = bytes("../target");
     SidecarEntry entry;
-    check(entry_from_stat("LINK", "item", "item", &link_stat, 1,
+    check(entry_from_stat("LINK", "item", "item", "", &link_stat, 1,
                           &empty_xattrs, &entry, &target) == 0,
           "entry_from_stat accepts a symlink target");
     check(entry.kind == SIDECAR_KIND_SYMLINK && entry.size == 0 &&
@@ -1222,11 +1511,11 @@ static void test_entry_helpers(const char *source)
 
     SidecarEntry symlink_entry = entry;
 
-    check(entry_from_stat("LINK", "item", "item", &link_stat, 1,
+    check(entry_from_stat("LINK", "item", "item", "", &link_stat, 1,
                           &empty_xattrs, &entry, NULL) != 0,
           "symlink entry without a target is rejected");
     SidecarBytes empty_target = {0};
-    check(entry_from_stat("LINK", "item", "item", &link_stat, 1,
+    check(entry_from_stat("LINK", "item", "item", "", &link_stat, 1,
                           &empty_xattrs, &entry, &empty_target) != 0,
           "symlink entry with an empty target is rejected");
 
@@ -1832,9 +2121,6 @@ static int create_live_capture(const char *container_path, int *container_fd,
     return 0;
 }
 
-static void close_live_capture(int container_fd, SidecarLog *log,
-                               PortableCaptureContext *context);
-
 static void test_capture_context_flags(const char *base)
 {
     printf(BLUE "::" NC " portable capture context capability flags\n");
@@ -2187,6 +2473,9 @@ int main(void)
     test_mixed_prescan_violations(root_path);
     test_case_collision_report_cap(root_path);
     test_case_collision_directory_scope(root_path);
+    test_capture_source_plan_mismatch(root_path);
+    test_collision_resume(root_path);
+    test_collision_foreign_resume(root_path);
     test_case_probe(root_path);
     test_encoded_payload_names(root_path);
     test_nested_encoded_directories(root_path);

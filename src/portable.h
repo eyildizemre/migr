@@ -82,6 +82,8 @@ typedef struct {
 
 typedef struct {
     size_t total_count;
+    size_t collision_count;
+    size_t unresolved_count;
     PortablePrescanViolation *examples;
     size_t example_count;
     size_t example_capacity;
@@ -98,9 +100,9 @@ const PortableCollisionPlanEntry *portable_collision_plan_find(
     const char *logical_path);
 
 /* Runs the read-only pre-scan and fills the collision plan without applying
- * the capture gate. Violations remain in report->total_count; the ordinary
- * capture entry points continue to refuse them until the walker consumes the
- * plan (docs/DECISIONS.md D21, F-4). */
+ * the capture gate. total_count remains the diagnostic count of every
+ * violation; unresolved_count is the fatal subset after planned collisions
+ * are accounted for (docs/DECISIONS.md D21, F-4/F-6). */
 int portable_collision_plan_build(int container_fd,
                                   const PortableCaptureRequest *request,
                                   PortablePrescanReport *report);
@@ -115,7 +117,9 @@ typedef struct PortableCaptureContext {
     int nsec_exact;
     int case_sensitive;
     int resume_mode;
+    const PortableCollisionPlan *collision_plan;
     void *visited;
+    void *owned_paths;
 } PortableCaptureContext;
 
 /**
