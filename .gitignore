@@ -26,4 +26,5 @@ tests/test_portable_restore_replay
 tests/test_portable_restore_orchestrate
 tests/test_encoding
 tests/test_portable_restore_invariant
+tests/test_portable_collision_scale
 docs/scratch/

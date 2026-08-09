@@ -2,6 +2,7 @@
 #define PORTABLE_H
 
 #include <stddef.h>
+#include <stdint.h>
 #include <sys/types.h>
 
 #include "manifest.h"
@@ -184,6 +185,11 @@ typedef enum {
  */
 #ifdef PORTABLE_CAPTURE_TEST_HOOKS
 void portable_capture_test_set_interrupt(PortableTestInterruptPoint point);
+uint64_t portable_capture_test_case_fs_probe_count(void);
+void portable_capture_test_reset_case_fs_probe_count(void);
+uint64_t portable_capture_test_relocation_scan_count(void);
+void portable_capture_test_reset_relocation_scan_count(void);
+uint64_t portable_capture_test_relocation_remove_count(void);
 #endif
 
 #endif

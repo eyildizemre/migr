@@ -102,6 +102,9 @@ static void prescan_report_refresh_unresolved(PortablePrescanReport *report)
 static uint64_t portable_test_probe_count;
 static uint64_t portable_test_readback_scan_count;
 static uint64_t portable_test_case_probe_count;
+static uint64_t portable_test_case_fs_probe_count;
+static uint64_t portable_test_relocation_scan_count;
+static uint64_t portable_test_relocation_remove_count;
 
 static void visited_count_probe(void)
 {
@@ -139,10 +142,54 @@ void portable_capture_test_reset_case_probe_count(void)
     portable_test_case_probe_count = 0;
 }
 
+uint64_t portable_capture_test_case_fs_probe_count(void)
+{
+    return portable_test_case_fs_probe_count;
+}
+
+void portable_capture_test_reset_case_fs_probe_count(void)
+{
+    portable_test_case_fs_probe_count = 0;
+}
+
+uint64_t portable_capture_test_relocation_scan_count(void)
+{
+    return portable_test_relocation_scan_count;
+}
+
+void portable_capture_test_reset_relocation_scan_count(void)
+{
+    portable_test_relocation_scan_count = 0;
+    portable_test_relocation_remove_count = 0;
+}
+
+uint64_t portable_capture_test_relocation_remove_count(void)
+{
+    return portable_test_relocation_remove_count;
+}
+
 static void case_probe_count(void)
 {
     if (portable_test_case_probe_count != UINT64_MAX)
         portable_test_case_probe_count++;
+}
+
+static void case_fs_probe_count(void)
+{
+    if (portable_test_case_fs_probe_count != UINT64_MAX)
+        portable_test_case_fs_probe_count++;
+}
+
+static void relocation_scan_count(void)
+{
+    if (portable_test_relocation_scan_count != UINT64_MAX)
+        portable_test_relocation_scan_count++;
+}
+
+static void relocation_remove_count(void)
+{
+    if (portable_test_relocation_remove_count != UINT64_MAX)
+        portable_test_relocation_remove_count++;
 }
 #else
 static void visited_count_probe(void)
@@ -150,6 +197,18 @@ static void visited_count_probe(void)
 }
 
 static void case_probe_count(void)
+{
+}
+
+static void case_fs_probe_count(void)
+{
+}
+
+static void relocation_scan_count(void)
+{
+}
+
+static void relocation_remove_count(void)
 {
 }
 #endif
@@ -2253,6 +2312,7 @@ static int prepare_collision_relocations(PortableCaptureContext *context,
 
         size_t candidate_count = 0;
         for (size_t index = 0; index < owned->count; index++) {
+            relocation_scan_count();
             PortableOwnedPath *candidate = &owned->items[index];
             if (strcmp(candidate->root_id, root->id) != 0 ||
                 !relative_path_is_same_or_descendant(
@@ -2278,6 +2338,7 @@ static int prepare_collision_relocations(PortableCaptureContext *context,
         }
         int failed = 0;
         for (size_t index = 0; index < owned->count; index++) {
+            relocation_scan_count();
             PortableOwnedPath *candidate = &owned->items[index];
             if (strcmp(candidate->root_id, root->id) == 0 &&
                 relative_path_is_same_or_descendant(
@@ -2296,6 +2357,7 @@ static int prepare_collision_relocations(PortableCaptureContext *context,
             size_t selected_index = SIZE_MAX;
             size_t selected_depth = 0;
             for (size_t index = 0; index < owned->count; index++) {
+                relocation_scan_count();
                 if (selected[index] != 1)
                     continue;
                 size_t depth = relative_path_depth(
@@ -2305,8 +2367,12 @@ static int prepare_collision_relocations(PortableCaptureContext *context,
                     selected_depth = depth;
                 }
             }
-            if (selected_index == SIZE_MAX ||
-                remove_owned_payload_relative(
+            if (selected_index == SIZE_MAX) {
+                failed = 1;
+                break;
+            }
+            relocation_remove_count();
+            if (remove_owned_payload_relative(
                     context->data_fd, root->payload_path,
                     owned->items[selected_index].physical_path) != 0) {
                 failed = 1;
@@ -3662,9 +3728,11 @@ static int case_probe_prepare(PortableCaseProbeState *state)
         return -1;
     if (state->scratch_fd >= 0)
         return 0;
+    case_fs_probe_count();
     if (mkdirat(state->container_fd, PORTABLE_CASE_PROBE_DIR, 0700) != 0)
         return -1;
     state->scratch_created = 1;
+    case_fs_probe_count();
     state->scratch_fd = openat(state->container_fd, PORTABLE_CASE_PROBE_DIR,
                                O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
                                    O_CLOEXEC);
@@ -4088,6 +4156,7 @@ static int case_probe_group(PortableCaseProbeState *state,
             continue;
         }
 
+        case_fs_probe_count();
         int fd = openat(state->scratch_fd, leaf,
                         O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
                         0600);
@@ -4182,6 +4251,7 @@ static int case_probe_group(PortableCaseProbeState *state,
                     continue;
                 }
 
+                case_fs_probe_count();
                 int fd = openat(state->scratch_fd, leaf,
                                 O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW |
                                     O_CLOEXEC,
