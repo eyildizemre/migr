@@ -1299,6 +1299,211 @@ static void test_collision_resume(const char *base)
     remove_tree(container_path);
 }
 
+static void test_collision_resume_renumbering(const char *base)
+{
+    printf(BLUE "::" NC " resume renumbers an owned collision predecessor\n");
+    char source_path[PATH_MAX];
+    char container_path[PATH_MAX];
+    join_path(source_path, sizeof(source_path), base,
+              "collision-renumber-source");
+    join_path(container_path, sizeof(container_path), base,
+              "collision-renumber-container");
+    make_directory(source_path);
+    make_directory(container_path);
+
+    static const char *const winners[] = {
+        "Ab", "Az", "Ba", "Foo", "Bar", "Baz"
+    };
+    static const char *const losers[] = {
+        "aB", "aZ", "ba", "foo", "bar", "baz"
+    };
+    const char *winner = NULL;
+    const char *loser = NULL;
+    char winner_path[PATH_MAX];
+    char loser_path[PATH_MAX];
+    DIR *directory;
+    struct dirent *first;
+    for (size_t index = 0; index < sizeof(winners) / sizeof(winners[0]);
+         index++) {
+        join_path(winner_path, sizeof(winner_path), source_path,
+                  winners[index]);
+        join_path(loser_path, sizeof(loser_path), source_path,
+                  losers[index]);
+        write_file(loser_path, "original", 8);
+        write_file(winner_path, "new", 3);
+
+        /* The winner must be visited first; otherwise ordinary replacement
+         * can remove the occupied slot before the relocation pass is used. */
+        directory = opendir(source_path);
+        if (directory == NULL)
+            fixture_fatal("could not inspect collision source order");
+        first = readdir(directory);
+        while (first != NULL &&
+               (strcmp(first->d_name, ".") == 0 ||
+                strcmp(first->d_name, "..") == 0))
+            first = readdir(directory);
+        int winner_first = first != NULL &&
+                           strcmp(first->d_name, winners[index]) == 0;
+        if (closedir(directory) != 0)
+            fixture_fatal("could not close collision source directory");
+        if (unlink(winner_path) != 0 || unlink(loser_path) != 0)
+            fixture_fatal("could not reset collision source fixture");
+        if (winner_first) {
+            winner = winners[index];
+            loser = losers[index];
+            break;
+        }
+    }
+    if (winner == NULL || loser == NULL)
+        fixture_fatal("could not find a winner-first collision fixture");
+    join_path(winner_path, sizeof(winner_path), source_path, winner);
+    join_path(loser_path, sizeof(loser_path), source_path, loser);
+    write_file(loser_path, "original", 8);
+    write_file(winner_path, "new", 3);
+    directory = opendir(source_path);
+    if (directory == NULL)
+        fixture_fatal("could not verify final collision source order");
+    first = readdir(directory);
+    while (first != NULL &&
+           (strcmp(first->d_name, ".") == 0 ||
+            strcmp(first->d_name, "..") == 0))
+        first = readdir(directory);
+    int final_winner_first = first != NULL &&
+                             strcmp(first->d_name, winner) == 0;
+    if (closedir(directory) != 0 || !final_winner_first)
+        fixture_fatal("collision source order changed while preparing fixture");
+
+    int container_fd = open(container_path,
+                             O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open collision renumber container");
+    PortableRootSpec root = root_spec("CASE", source_path, "CASE");
+    if (mkdirat(container_fd, "data", 0700) != 0 ||
+        mkdirat(container_fd, "data/CASE", 0700) != 0)
+        fixture_fatal("could not create collision payload namespace");
+
+    ManifestRoot manifest_root = {0};
+    if (snprintf(manifest_root.id, sizeof(manifest_root.id), "%s", root.id) < 0 ||
+        snprintf(manifest_root.payload_path,
+                 sizeof(manifest_root.payload_path), "%s", root.payload_path) < 0 ||
+        snprintf(manifest_root.source_path,
+                 sizeof(manifest_root.source_path), "%s", root.source_path) < 0 ||
+        snprintf(manifest_root.restore_path,
+                 sizeof(manifest_root.restore_path), "%s", root.restore_path) < 0)
+        fixture_fatal("could not prepare collision manifest root");
+    manifest_root.policy = root.policy;
+    manifest_root.has_restore_path = root.has_restore_path;
+    Manifest manifest = {
+        .version = MANIFEST_CURRENT_VERSION,
+        .representation = CLONE_PORTABLE_SIDECAR,
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .sidecar_version = SIDECAR_VERSION,
+        .has_source_identity = 1,
+        .source_uid = getuid(),
+        .root_count = 1,
+        .roots = &manifest_root
+    };
+    if (snprintf(manifest.machine_id, sizeof(manifest.machine_id),
+                 "%s", "0123456789abcdef") < 0 ||
+        manifest_write_v1_at(container_fd, &manifest) != 0)
+        fixture_fatal("could not write collision manifest");
+
+    char target_path[PATH_MAX];
+    join_path(target_path, sizeof(target_path), container_path,
+              "data/CASE");
+    char occupied_path[PATH_MAX];
+    join_path(occupied_path, sizeof(occupied_path), target_path, winner);
+    /* This is a host-side alias fixture: byte-exact lookup cannot make
+     * fstatat() treat two spellings as one slot.  The planted slot and the
+     * predecessor's physical field therefore share the spelling probed by
+     * the new winner; the logical key remains the loser being renumbered. */
+    write_file(occupied_path, "original", 8);
+
+    struct stat root_stat;
+    struct stat loser_stat;
+    if (stat(source_path, &root_stat) != 0 ||
+        stat(loser_path, &loser_stat) != 0)
+        fixture_fatal("could not stat collision predecessor");
+    PortableXattrs empty_xattrs = {0};
+    SidecarEntry root_predecessor = {0};
+    SidecarEntry predecessor = {0};
+    if (entry_from_stat("CASE", "", "", "", &root_stat, 1,
+                        &empty_xattrs, &root_predecessor, NULL) != 0 ||
+        entry_from_stat("CASE", loser, winner, "", &loser_stat, 1,
+                        &empty_xattrs, &predecessor, NULL) != 0)
+        fixture_fatal("could not prepare collision predecessor");
+    SidecarLog predecessor_log = {0};
+    if (sidecar_log_create_at(container_fd, &predecessor_log) !=
+            SIDECAR_OPEN_FRESH ||
+        sidecar_log_append_entry(&predecessor_log, &root_predecessor) !=
+            SIDECAR_STATUS_OK ||
+        sidecar_log_append_entry_commit(&predecessor_log) !=
+            SIDECAR_STATUS_OK ||
+        sidecar_log_append_entry(&predecessor_log, &predecessor) !=
+            SIDECAR_STATUS_OK ||
+        sidecar_log_append_entry_commit(&predecessor_log) !=
+            SIDECAR_STATUS_OK ||
+        sidecar_log_close(&predecessor_log) != SIDECAR_STATUS_OK)
+        fixture_fatal("could not write collision predecessor");
+
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .roots = &root,
+        .root_count = 1,
+        .nsec_exact = 1,
+        .case_sensitive = 0,
+        .has_source_identity = 1,
+        .machine_id = "0123456789abcdef",
+        .source_uid = getuid()
+    };
+    PortablePrescanReport report;
+    portable_prescan_report_init(&report);
+    int resume_result = portable_capture_resume_at(container_fd, &request,
+                                                   &report);
+    check(resume_result == 0,
+          "resume succeeds when a new lexical winner renumbers the owner");
+    struct stat st;
+    char expected_loser[NAME_MAX + 1];
+    int suffix_length = snprintf(expected_loser, sizeof(expected_loser),
+                                 "%s%%7E1", loser);
+    if (suffix_length < 0 || (size_t)suffix_length >= sizeof(expected_loser))
+        fixture_fatal("could not prepare collision suffix");
+    char winner_payload_name[PATH_MAX];
+    char loser_payload_name[PATH_MAX];
+    join_path(winner_payload_name, sizeof(winner_payload_name), target_path,
+              winner);
+    join_path(loser_payload_name, sizeof(loser_payload_name), target_path,
+              expected_loser);
+    int winner_payload = stat(winner_payload_name, &st) == 0 &&
+                         S_ISREG(st.st_mode);
+    int loser_payload = stat(loser_payload_name, &st) == 0 &&
+                        S_ISREG(st.st_mode);
+    check(winner_payload && loser_payload &&
+              file_equals(occupied_path, "new") &&
+              file_equals(loser_payload_name, "original"),
+          "resume leaves the winner and the renumbered predecessor intact");
+
+    SidecarLog log = {0};
+    SidecarLiveView upper_view = {0};
+    SidecarLiveView lower_view = {0};
+    int opened = sidecar_log_adopt_at(container_fd, &log) ==
+                 SIDECAR_OPEN_RESUMABLE;
+    int found = opened &&
+        sidecar_log_find(&log, bytes("CASE"), bytes(winner), &upper_view) == 1 &&
+        sidecar_log_find(&log, bytes("CASE"), bytes(loser), &lower_view) == 1;
+    check(found && sidecar_bytes_match_text(upper_view.entry->physical_path,
+                                            winner) &&
+              sidecar_bytes_match_text(lower_view.entry->physical_path,
+                                       expected_loser),
+          "resume records both the winner and the renumbered physical path");
+    if (opened)
+        sidecar_log_close(&log);
+    portable_prescan_report_free(&report);
+    close(container_fd);
+    remove_tree(source_path);
+    remove_tree(container_path);
+}
+
 static void test_collision_foreign_resume(const char *base)
 {
     printf(BLUE "::" NC " foreign collision payload is not overwritten on resume\n");
@@ -2661,6 +2866,7 @@ int main(void)
     test_case_collision_directory_scope(root_path);
     test_capture_source_plan_mismatch(root_path);
     test_collision_resume(root_path);
+    test_collision_resume_renumbering(root_path);
     test_collision_foreign_resume(root_path);
     test_case_probe(root_path);
     test_encoded_payload_names(root_path);

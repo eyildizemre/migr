@@ -1783,6 +1783,27 @@ static const char *portable_owned_paths_owner(
                : NULL;
 }
 
+static int relative_path_is_same_or_descendant(const char *path,
+                                               const char *prefix)
+{
+    if (path == NULL || prefix == NULL)
+        return 0;
+    size_t prefix_length = strlen(prefix);
+    return strncmp(path, prefix, prefix_length) == 0 &&
+           (path[prefix_length] == '\0' || path[prefix_length] == '/');
+}
+
+static size_t relative_path_depth(const char *path)
+{
+    if (path == NULL || path[0] == '\0')
+        return 0;
+    size_t depth = 1U;
+    for (const char *cursor = path; *cursor != '\0'; cursor++)
+        if (*cursor == '/')
+            depth++;
+    return depth;
+}
+
 static int stale_keys_append(StaleKeys *keys, SidecarBytes logical,
                              SidecarBytes physical)
 {
@@ -2121,6 +2142,184 @@ static int remove_payload_relative(int data_fd, const char *payload_root,
     }
     errno = saved;
     return result;
+}
+
+/* Remove one owned payload entry without recursively touching its children.
+ * The collision relocation pass removes descendants first; a non-empty
+ * directory therefore fails closed instead of deleting an unowned entry. */
+static int remove_owned_payload_relative(int data_fd, const char *payload_root,
+                                         const char *physical)
+{
+    if (data_fd < 0 || payload_root == NULL || physical == NULL ||
+        !safe_relative_path(physical))
+        return -1;
+
+    int root_parent = -1;
+    char root_leaf[NAME_MAX + 1U];
+    if (open_existing_payload_parent(data_fd, payload_root, &root_parent,
+                                     root_leaf, sizeof(root_leaf)) != 0)
+        return errno == ENOENT ? 0 : -1;
+
+    int payload_fd = open_child_directory(root_parent, root_leaf);
+    int saved = errno;
+    if (close(root_parent) != 0) {
+        if (payload_fd >= 0)
+            close(payload_fd);
+        return -1;
+    }
+    if (payload_fd < 0) {
+        errno = saved;
+        return errno == ENOENT ? 0 : -1;
+    }
+
+    int parent_fd = -1;
+    char leaf[NAME_MAX + 1U];
+    if (open_existing_payload_parent(payload_fd, physical, &parent_fd,
+                                     leaf, sizeof(leaf)) != 0) {
+        saved = errno;
+        close(payload_fd);
+        errno = saved;
+        return errno == ENOENT ? 0 : -1;
+    }
+
+    struct stat st;
+    int result = 0;
+    if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+        result = errno == ENOENT ? 0 : -1;
+    } else {
+        result = unlinkat(parent_fd, leaf, S_ISDIR(st.st_mode)
+                                      ? AT_REMOVEDIR : 0) == 0 ? 0 : -1;
+    }
+    saved = errno;
+    if (close(parent_fd) != 0 && result == 0) {
+        result = -1;
+        saved = EIO;
+    }
+    if (close(payload_fd) != 0 && result == 0) {
+        result = -1;
+        saved = EIO;
+    }
+    errno = saved;
+    return result;
+}
+
+static int prepare_collision_relocations(PortableCaptureContext *context,
+                                          const PortableRootSpec *root)
+{
+    if (context == NULL || root == NULL)
+        return -1;
+    if (!context->resume_mode || context->collision_plan == NULL)
+        return 0;
+    if (context->owned_paths == NULL)
+        return -1;
+
+    PortableOwnedPaths *owned = context->owned_paths;
+    const PortableCollisionPlan *plan = context->collision_plan;
+    for (size_t plan_index = 0; plan_index < plan->count; plan_index++) {
+        const PortableCollisionPlanEntry *planned = &plan->entries[plan_index];
+        if (strcmp(planned->root_id, root->id) != 0)
+            continue;
+
+        SidecarBytes root_key = {
+            (const unsigned char *)root->id, strlen(root->id)
+        };
+        SidecarBytes logical_key = {
+            (const unsigned char *)planned->logical_path,
+            strlen(planned->logical_path)
+        };
+        SidecarLiveView previous;
+        int live = sidecar_log_find(context->sidecar, root_key, logical_key,
+                                    &previous);
+        if (live < 0)
+            return -1;
+        if (!live)
+            continue;
+        if (sidecar_bytes_equal(
+                previous.entry->physical_path,
+                (SidecarBytes){
+                    (const unsigned char *)planned->physical_path,
+                    strlen(planned->physical_path) }))
+            continue;
+
+        char *old_physical = NULL;
+        if (sidecar_bytes_to_text(previous.entry->physical_path,
+                                  &old_physical) != 0 ||
+            old_physical[0] == '\0' ||
+            !safe_relative_path(old_physical) ||
+            !safe_relative_path(planned->physical_path)) {
+            free(old_physical);
+            return -1;
+        }
+
+        size_t candidate_count = 0;
+        for (size_t index = 0; index < owned->count; index++) {
+            PortableOwnedPath *candidate = &owned->items[index];
+            if (strcmp(candidate->root_id, root->id) != 0 ||
+                !relative_path_is_same_or_descendant(
+                    candidate->logical_path, planned->logical_path))
+                continue;
+            if (!relative_path_is_same_or_descendant(candidate->physical_path,
+                                                     old_physical) ||
+                !safe_relative_path(candidate->physical_path)) {
+                free(old_physical);
+                return -1;
+            }
+            candidate_count++;
+        }
+        if (candidate_count == 0) {
+            free(old_physical);
+            return -1;
+        }
+
+        unsigned char *selected = calloc(owned->count, sizeof(*selected));
+        if (selected == NULL) {
+            free(old_physical);
+            return -1;
+        }
+        int failed = 0;
+        for (size_t index = 0; index < owned->count; index++) {
+            PortableOwnedPath *candidate = &owned->items[index];
+            if (strcmp(candidate->root_id, root->id) == 0 &&
+                relative_path_is_same_or_descendant(
+                    candidate->logical_path, planned->logical_path)) {
+                selected[index] = 1;
+                if (tombstone_if_live(context, root->id,
+                                      candidate->logical_path) != 0) {
+                    failed = 1;
+                    break;
+                }
+            }
+        }
+
+        for (size_t removed = 0; !failed && removed < candidate_count;
+             removed++) {
+            size_t selected_index = SIZE_MAX;
+            size_t selected_depth = 0;
+            for (size_t index = 0; index < owned->count; index++) {
+                if (selected[index] != 1)
+                    continue;
+                size_t depth = relative_path_depth(
+                    owned->items[index].physical_path);
+                if (selected_index == SIZE_MAX || depth > selected_depth) {
+                    selected_index = index;
+                    selected_depth = depth;
+                }
+            }
+            if (selected_index == SIZE_MAX ||
+                remove_owned_payload_relative(
+                    context->data_fd, root->payload_path,
+                    owned->items[selected_index].physical_path) != 0) {
+                failed = 1;
+                break;
+            }
+            selected[selected_index] = 2;
+        }
+        free(selected);
+        free(old_physical);
+        if (failed)
+            return -1;
+    }
+    return 0;
 }
 
 typedef struct {
@@ -4678,6 +4877,8 @@ int portable_capture_root(PortableCaptureContext *context,
         return -1;
     PortableVisited *visited = context->visited;
     if (visited_reset(visited) != 0)
+        return -1;
+    if (prepare_collision_relocations(context, root) != 0)
         return -1;
     int result = capture_node(context, root, "", "", -1, NULL,
                               root->capture_path, -1, NULL);
