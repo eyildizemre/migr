@@ -1896,6 +1896,192 @@ static void test_name_and_path_limits(const char *base)
     remove_tree_fd(container_path);
 }
 
+static int root_payload_violation_matches(
+    const PortablePrescanViolation *violation, const char *root_id,
+    const char *payload_path, const char *collides_with)
+{
+    return violation != NULL &&
+           violation->kind == PORTABLE_PRESCAN_CASE_COLLISION &&
+           strcmp(violation->root_id, root_id) == 0 &&
+           strcmp(violation->logical_path, payload_path) == 0 &&
+           strcmp(violation->collides_with_logical_path,
+                  collides_with) == 0;
+}
+
+static void test_root_payload_namespace(const char *base)
+{
+    printf(BLUE "::" NC " root payload namespace case-equivalence\n");
+    char source_a[PATH_MAX];
+    char source_b[PATH_MAX];
+    char container_path[PATH_MAX];
+    char file_path[PATH_MAX];
+    join_path(source_a, sizeof(source_a), base, "root-namespace-a");
+    join_path(source_b, sizeof(source_b), base, "root-namespace-b");
+    join_path(container_path, sizeof(container_path), base,
+              "root-namespace-container");
+    make_directory(source_a);
+    make_directory(source_b);
+    make_directory(container_path);
+    join_path(file_path, sizeof(file_path), source_a, "a");
+    write_file(file_path, "a", 1);
+    join_path(file_path, sizeof(file_path), source_b, "b");
+    write_file(file_path, "b", 1);
+
+    PortableRootSpec roots[2] = {
+        root_spec("ROOT_A", source_a, "Foo"),
+        root_spec("ROOT_B", source_b, "foo")
+    };
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .roots = roots,
+        .root_count = 2,
+        .nsec_exact = 1,
+        .case_sensitive = 1
+    };
+    PortablePrescanReport report;
+    portable_prescan_report_init(&report);
+    int container_fd = open(container_path,
+                             O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open root namespace container");
+    int result = portable_capture_fresh_at(container_fd, &request, &report);
+    int root_violation = report.example_count == 1 &&
+        root_payload_violation_matches(&report.examples[0], "ROOT_B", "foo",
+                                       "Foo");
+    check(result != 0 && report.total_count == 1 &&
+              report.collision_count == 0 && report.unresolved_count == 1 &&
+              root_violation,
+          "ASCII case-equivalent root payload paths are refused before mutation");
+    check(empty_capture_container(container_fd),
+          "root namespace refusal leaves the container untouched");
+    portable_prescan_report_free(&report);
+    close(container_fd);
+
+    join_path(container_path, sizeof(container_path), base,
+              "root-namespace-plan-container");
+    make_directory(container_path);
+    container_fd = open(container_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open root namespace plan container");
+    portable_prescan_report_init(&report);
+    result = portable_collision_plan_build(container_fd, &request, &report);
+    root_violation = report.example_count == 1 &&
+        root_payload_violation_matches(&report.examples[0], "ROOT_B", "foo",
+                                       "Foo");
+    check(result == 0 && report.total_count == 1 &&
+              report.collision_count == 0 && report.unresolved_count == 1 &&
+              root_violation && empty_capture_container(container_fd),
+          "plan-build pre-scan reports the root collision without mutation");
+    portable_prescan_report_free(&report);
+    close(container_fd);
+    remove_tree(container_path);
+    remove_tree(source_a);
+    remove_tree(source_b);
+
+    join_path(container_path, sizeof(container_path), base,
+              "root-namespace-overlap-container");
+    make_directory(container_path);
+    roots[0] = root_spec("ROOT_A", source_a, "a");
+    roots[1] = root_spec("ROOT_B", source_b, "a/b");
+    make_directory(source_a);
+    make_directory(source_b);
+    container_fd = open(container_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open root overlap container");
+    portable_prescan_report_init(&report);
+    result = portable_capture_fresh_at(container_fd, &request, &report);
+    check(result != 0 && report.total_count == 1 &&
+              report.unresolved_count == 1 &&
+              root_payload_violation_matches(&report.examples[0], "ROOT_B",
+                                             "a/b", "a"),
+          "byte-wise root payload overlap remains refused");
+    portable_prescan_report_free(&report);
+    close(container_fd);
+    remove_tree(source_a);
+    remove_tree(source_b);
+    remove_tree(container_path);
+
+    join_path(container_path, sizeof(container_path), base,
+              "root-namespace-distinct-container");
+    make_directory(source_a);
+    make_directory(source_b);
+    make_directory(container_path);
+    roots[0] = root_spec("ROOT_A", source_a, "Foo");
+    roots[1] = root_spec("ROOT_B", source_b, "Bar");
+    container_fd = open(container_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open distinct root namespace container");
+    portable_prescan_report_init(&report);
+    result = portable_capture_fresh_at(container_fd, &request, &report);
+    struct stat st;
+    check(result == 0 && report.total_count == 0 &&
+              report.collision_plan.count == 0 &&
+              fstatat(container_fd, "data/Foo", &st,
+                      AT_SYMLINK_NOFOLLOW) == 0 && S_ISDIR(st.st_mode) &&
+              fstatat(container_fd, "data/Bar", &st,
+                      AT_SYMLINK_NOFOLLOW) == 0 && S_ISDIR(st.st_mode),
+          "distinct root payload paths remain usable without a root suffix");
+    portable_prescan_report_free(&report);
+    close(container_fd);
+    remove_tree(source_a);
+    remove_tree(source_b);
+    remove_tree(container_path);
+
+    static const char unicode_cafe[] = "Caf\xc3\xa9";
+    static const char unicode_cafe_upper[] = "CAF\xc3\x89";
+    join_path(container_path, sizeof(container_path), base,
+              "root-namespace-unicode-container");
+    make_directory(source_a);
+    make_directory(source_b);
+    make_directory(container_path);
+    roots[0] = root_spec("ROOT_A", source_a, unicode_cafe);
+    roots[1] = root_spec("ROOT_B", source_b, unicode_cafe_upper);
+    container_fd = open(container_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open Unicode root namespace container");
+    portable_prescan_report_init(&report);
+    result = portable_capture_fresh_at(container_fd, &request, &report);
+    int unicode_allowed = result == 0 && report.total_count == 0 &&
+        report.collision_plan.count == 0 &&
+        fstatat(container_fd, "data/Caf\xc3\xa9", &st,
+                AT_SYMLINK_NOFOLLOW) == 0 &&
+        fstatat(container_fd, "data/CAF\xc3\x89", &st,
+                AT_SYMLINK_NOFOLLOW) == 0;
+    int unicode_refused = result != 0 && report.total_count == 1 &&
+        report.collision_count == 0 && report.unresolved_count == 1 &&
+        report.example_count == 1 &&
+        root_payload_violation_matches(&report.examples[0], "ROOT_B",
+                                       "CAF\xc3\x89", "Caf\xc3\xa9") &&
+        empty_capture_container(container_fd);
+    check(unicode_allowed || unicode_refused,
+          "non-ASCII root paths use destination probing or fail closed");
+    portable_prescan_report_free(&report);
+    close(container_fd);
+    remove_tree(source_a);
+    remove_tree(source_b);
+    remove_tree(container_path);
+
+    join_path(container_path, sizeof(container_path), base,
+              "root-namespace-id-container");
+    make_directory(source_a);
+    make_directory(source_b);
+    make_directory(container_path);
+    roots[0] = root_spec("SAME", source_a, "Foo");
+    roots[1] = root_spec("SAME", source_b, "Bar");
+    container_fd = open(container_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open duplicate root id container");
+    portable_prescan_report_init(&report);
+    result = portable_capture_fresh_at(container_fd, &request, &report);
+    check(result != 0 && empty_capture_container(container_fd),
+          "duplicate root ids remain refused without introducing a suffix");
+    portable_prescan_report_free(&report);
+    close(container_fd);
+    remove_tree(source_a);
+    remove_tree(source_b);
+    remove_tree(container_path);
+}
+
 static void test_prescan_multiple_roots(const char *base)
 {
     printf(BLUE "::" NC " pre-scan aggregates violations across roots\n");
@@ -2481,6 +2667,7 @@ int main(void)
     test_nested_encoded_directories(root_path);
     test_name_and_path_limits(root_path);
     test_prescan_multiple_roots(root_path);
+    test_root_payload_namespace(root_path);
     test_fresh_capture(source_path, container_fd, container_path);
     test_capture_context_flags(root_path);
     test_replacement_and_type_change(source_path, root_path);

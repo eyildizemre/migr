@@ -2659,7 +2659,6 @@ static int capture_directory(PortableCaptureContext *context,
             close(scan_fd);
         return -1;
     }
-
     int failed = 0;
     PortableCaseFoldSet observed_skeletons = {0};
     PortableCaseFoldSet observed_ascii = {0};
@@ -3501,6 +3500,157 @@ static int case_probe_cleanup(PortableCaseProbeState *state)
     return failed ? -1 : 0;
 }
 
+static int root_spec_valid(const PortableRootSpec *root);
+
+/* Read back one scratch-directory component exactly as the filesystem
+ * reports it.  A successful mkdirat() that is only reachable through a
+ * differently-spelled directory entry is not a trustworthy no-collision
+ * result, so root-namespace probing treats that as a collision or an I/O
+ * failure rather than guessing (docs/DECISIONS.md D21, F-5). */
+static int root_probe_exact_name(int directory_fd, const char *name)
+{
+    if (directory_fd < 0 || !safe_component(name))
+        return -1;
+    int scan_fd = duplicate_fd(directory_fd);
+    DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
+    if (directory == NULL) {
+        if (scan_fd >= 0)
+            close(scan_fd);
+        return -1;
+    }
+
+    rewinddir(directory);
+
+    int found = 0;
+    int failed = 0;
+    for (;;) {
+        errno = 0;
+        struct dirent *entry = readdir(directory);
+        if (entry == NULL) {
+            if (errno != 0)
+                failed = 1;
+            break;
+        }
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0)
+            continue;
+        if (strcmp(entry->d_name, name) == 0) {
+            found = 1;
+            break;
+        }
+    }
+    if (closedir(directory) != 0)
+        failed = 1;
+    return failed ? -1 : found;
+}
+
+/* Creates a relative scratch path component by component.  Return values:
+ * 0 means every component was created or already existed with the exact
+ * spelling, 1 means the destination folded a component to another spelling,
+ * and -1 means the probe could not establish a reliable result. */
+static int root_probe_make_path(int root_fd, const char *relative)
+{
+    if (root_fd < 0 || !safe_relative_path(relative))
+        return -1;
+    size_t length = strlen(relative);
+    char copy[PATH_MAX];
+    memcpy(copy, relative, length + 1U);
+    int current = duplicate_fd(root_fd);
+    if (current < 0)
+        return -1;
+
+    char *cursor = copy;
+    int result = 0;
+    for (;;) {
+        char *slash = strchr(cursor, '/');
+        if (slash != NULL)
+            *slash = '\0';
+
+        int made = mkdirat(current, cursor, 0700);
+        if (made != 0) {
+            if (errno != EEXIST) {
+                result = -1;
+                break;
+            }
+            int exact = root_probe_exact_name(current, cursor);
+            if (exact < 0) {
+                result = -1;
+                break;
+            }
+            if (exact == 0) {
+                result = 1;
+                break;
+            }
+        } else if (root_probe_exact_name(current, cursor) != 1) {
+            result = -1;
+            break;
+        }
+
+        int next = open_child_directory(current, cursor);
+        if (next < 0) {
+            result = -1;
+            break;
+        }
+        if (close(current) != 0) {
+            close(next);
+            result = -1;
+            break;
+        }
+        current = next;
+        if (slash == NULL)
+            break;
+        cursor = slash + 1;
+    }
+    if (close(current) != 0 && result == 0)
+        result = -1;
+    return result;
+}
+
+static int root_probe_pair(PortableCaseProbeState *state,
+                           const PortableRootSpec *left,
+                           const PortableRootSpec *right,
+                           size_t pair_index)
+{
+    if (state == NULL || left == NULL || right == NULL ||
+        !root_spec_valid(left) || !root_spec_valid(right) ||
+        state->container_fd < 0 || case_probe_prepare(state) != 0)
+        return -1;
+
+    char probe_name[64];
+    int name_length = snprintf(probe_name, sizeof(probe_name),
+                               "root-pair-%zu", pair_index);
+    if (name_length < 0 || (size_t)name_length >= sizeof(probe_name) ||
+        mkdirat(state->scratch_fd, probe_name, 0700) != 0)
+        return -1;
+
+    int probe_fd = open_child_directory(state->scratch_fd, probe_name);
+    if (probe_fd < 0) {
+        (void)remove_directory_tree(state->scratch_fd, probe_name);
+        return -1;
+    }
+
+    int first = root_probe_make_path(probe_fd, left->payload_path);
+    int second = first == 0
+        ? root_probe_make_path(probe_fd, right->payload_path)
+        : -1;
+    int failed = close(probe_fd) != 0;
+    if (remove_directory_tree(state->scratch_fd, probe_name) != 0)
+        failed = 1;
+    if (failed || first < 0 || second < 0)
+        return -1;
+    return second == 1 ? 1 : 0;
+}
+
+static int root_payload_path_has_non_ascii(const char *path)
+{
+    if (path == NULL)
+        return 0;
+    for (size_t index = 0; path[index] != '\0'; index++)
+        if ((unsigned char)path[index] >= 0x80U)
+            return 1;
+    return 0;
+}
+
 typedef struct {
     const char *encoded;
     const char *logical;
@@ -4157,6 +4307,137 @@ static int prescan_directory(int source_fd, const char *logical,
     return failed ? -1 : 0;
 }
 
+static int relative_paths_overlap(const char *left, const char *right)
+{
+    size_t left_length = strlen(left);
+    size_t right_length = strlen(right);
+    if (left_length <= right_length &&
+        strncmp(left, right, left_length) == 0 &&
+        (left_length == right_length || right[left_length] == '/'))
+        return 1;
+    if (right_length < left_length &&
+        strncmp(left, right, right_length) == 0 &&
+        left[right_length] == '/')
+        return 1;
+    return 0;
+}
+
+static int root_payload_paths_ascii_overlap(const char *left,
+                                            const char *right)
+{
+    if (left == NULL || right == NULL)
+        return 0;
+    char left_folded[PATH_MAX];
+    char right_folded[PATH_MAX];
+    ascii_fold_copy(left_folded, sizeof(left_folded), left);
+    ascii_fold_copy(right_folded, sizeof(right_folded), right);
+    return relative_paths_overlap(left_folded, right_folded);
+}
+
+/* Root payload paths do not participate in the leaf suffix plan.  Their
+ * namespace is checked here, before manifest/data/sidecar mutation: ASCII
+ * folding is deterministic, while plausible non-ASCII pairs are verified by
+ * the same scratch mkdir/readback authority used for destination probing
+ * (docs/DECISIONS.md D21, F-5). */
+static int prescan_root_payload_namespace(
+    const PortableCaptureRequest *request, PortablePrescanReport *report,
+    PortableCaseProbeState *probe_state)
+{
+    if (request == NULL || report == NULL || probe_state == NULL)
+        return -1;
+
+    int failed = 0;
+    for (size_t right_index = 0; right_index < request->root_count;
+         right_index++) {
+        const PortableRootSpec *right = &request->roots[right_index];
+        if (!root_spec_valid(right)) {
+            failed = 1;
+            continue;
+        }
+        for (size_t left_index = 0; left_index < right_index;
+             left_index++) {
+            const PortableRootSpec *left = &request->roots[left_index];
+            if (!root_spec_valid(left)) {
+                failed = 1;
+                continue;
+            }
+            if (!relative_paths_overlap(left->payload_path,
+                                        right->payload_path) &&
+                !root_payload_paths_ascii_overlap(left->payload_path,
+                                                   right->payload_path))
+                continue;
+
+            PortablePrescanViolation violation = {
+                .kind = PORTABLE_PRESCAN_CASE_COLLISION
+            };
+            if (copy_text(violation.root_id, sizeof(violation.root_id),
+                          right->id) != 0 ||
+                copy_text(violation.logical_path,
+                          sizeof(violation.logical_path),
+                          right->payload_path) != 0 ||
+                copy_text(violation.collides_with_logical_path,
+                          sizeof(violation.collides_with_logical_path),
+                          left->payload_path) != 0 ||
+                prescan_report_add(report, &violation) != 0)
+                failed = 1;
+        }
+    }
+
+    if (failed)
+        return -1;
+
+    for (size_t right_index = 0; right_index < request->root_count;
+         right_index++) {
+        const PortableRootSpec *right = &request->roots[right_index];
+        if (!root_payload_path_has_non_ascii(right->payload_path))
+            continue;
+        char right_skeleton[PATH_MAX];
+        skeleton_copy(right_skeleton, sizeof(right_skeleton),
+                      right->payload_path);
+        for (size_t left_index = 0; left_index < right_index;
+             left_index++) {
+            const PortableRootSpec *left = &request->roots[left_index];
+            if (!root_payload_path_has_non_ascii(left->payload_path))
+                continue;
+            if (relative_paths_overlap(left->payload_path,
+                                       right->payload_path) ||
+                root_payload_paths_ascii_overlap(left->payload_path,
+                                                 right->payload_path))
+                continue;
+            char left_skeleton[PATH_MAX];
+            skeleton_copy(left_skeleton, sizeof(left_skeleton),
+                          left->payload_path);
+            if (strcmp(left_skeleton, right_skeleton) != 0)
+                continue;
+            int probe = root_probe_pair(probe_state, left, right,
+                                        left_index + right_index);
+            if (probe < 0) {
+                failed = 1;
+                break;
+            }
+            if (probe == 1) {
+                PortablePrescanViolation violation = {
+                    .kind = PORTABLE_PRESCAN_CASE_COLLISION
+                };
+                if (copy_text(violation.root_id,
+                              sizeof(violation.root_id), right->id) != 0 ||
+                    copy_text(violation.logical_path,
+                              sizeof(violation.logical_path),
+                              right->payload_path) != 0 ||
+                    copy_text(violation.collides_with_logical_path,
+                              sizeof(violation.collides_with_logical_path),
+                              left->payload_path) != 0 ||
+                    prescan_report_add(report, &violation) != 0)
+                    failed = 1;
+                break;
+            }
+        }
+        if (failed)
+            break;
+    }
+    return failed ? -1 : 0;
+}
+
 static int prescan_root(const PortableRootSpec *root,
                         PortablePrescanReport *report, int case_sensitive,
                         PortableCaseProbeState *probe_state)
@@ -4197,6 +4478,8 @@ static int prescan_request_internal(int container_fd,
         if (prescan_root(&request->roots[index], report,
                          request->case_sensitive, &probe_state) != 0)
             failed = 1;
+    if (prescan_root_payload_namespace(request, report, &probe_state) != 0)
+        failed = 1;
     if (case_probe_cleanup(&probe_state) != 0)
         failed = 1;
     portable_collision_plan_sort(&report->collision_plan);
@@ -4227,21 +4510,6 @@ int portable_collision_plan_build(int container_fd,
         (request->root_count != 0 && request->roots == NULL))
         return -1;
     return prescan_request_internal(container_fd, request, report, 0);
-}
-
-static int relative_paths_overlap(const char *left, const char *right)
-{
-    size_t left_length = strlen(left);
-    size_t right_length = strlen(right);
-    if (left_length <= right_length &&
-        strncmp(left, right, left_length) == 0 &&
-        (left_length == right_length || right[left_length] == '/'))
-        return 1;
-    if (right_length < left_length &&
-        strncmp(left, right, right_length) == 0 &&
-        left[right_length] == '/')
-        return 1;
-    return 0;
 }
 
 static int build_manifest(const PortableCaptureRequest *request,
