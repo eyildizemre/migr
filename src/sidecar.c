@@ -350,11 +350,6 @@ static int validate_entry(const SidecarEntry *entry)
         return -1;
     }
 
-    if (entry->kind == SIDECAR_KIND_HARDLINK)
-    {
-        errno = EOPNOTSUPP;
-        return -1;
-    }
     if (entry->kind < SIDECAR_KIND_REGULAR ||
         entry->kind > SIDECAR_KIND_HARDLINK)
     {
@@ -372,6 +367,17 @@ static int validate_entry(const SidecarEntry *entry)
                            SIDECAR_MAX_SYMLINK_TARGET, 1) != 0 ||
             entry->hardlink_root_id.length != 0 ||
             entry->hardlink_logical_path.length != 0)
+        {
+            set_invalid_error();
+            return -1;
+        }
+    }
+    else if (entry->kind == SIDECAR_KIND_HARDLINK)
+    {
+        if (entry->symlink_target.length != 0 ||
+            entry->xattr_count != 0 ||
+            validate_bytes(entry->hardlink_root_id, SIDECAR_MAX_ROOT_ID, 1) != 0 ||
+            validate_bytes(entry->hardlink_logical_path, SIDECAR_MAX_PATH, 1) != 0)
         {
             set_invalid_error();
             return -1;
@@ -441,8 +447,14 @@ static int build_entry_buffer(const SidecarEntry *entry, SidecarBuffer *buffer)
         buffer_append_uint(buffer, entry->xattr_count) != 0)
         return -1;
 
-    if (entry->kind == SIDECAR_KIND_SYMLINK &&
-        buffer_append_field(buffer, entry->symlink_target) != 0)
+    if (entry->kind == SIDECAR_KIND_SYMLINK)
+    {
+        if (buffer_append_field(buffer, entry->symlink_target) != 0)
+            return -1;
+    }
+    else if (entry->kind == SIDECAR_KIND_HARDLINK &&
+             (buffer_append_field(buffer, entry->hardlink_root_id) != 0 ||
+              buffer_append_field(buffer, entry->hardlink_logical_path) != 0))
         return -1;
     return 0;
 }

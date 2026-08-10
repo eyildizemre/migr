@@ -1,4 +1,4 @@
-// Unit tests for the sidecar v2 codec (docs/DECISIONS.md D17/D21): magic/version
+// Unit tests for the sidecar v2 codec (docs/DECISIONS.md D17/D21/D22): magic/version
 // header, ENTRY/XATTR/ENTRY_COMMIT/DELETE record framing, canonical numeric
 // parsing, and every SIDECAR_MAX_* ceiling declared there. This is the codec
 // alone -- no live-state map, no resume, no adopt; that stateful layer is a
@@ -17,9 +17,9 @@
 // (ftruncate, no data written) to exercise the real 4 GiB limit without
 // actually allocating or writing that much. Tail recovery distinguishes a
 // clean EOF mid-record (truncated tail, resumable) from malformed content
-// anywhere in the file (interior corruption, unusable) per D17. Symlink
-// records are exercised through the writer and reader; hardlink records remain
-// a writer rejection until their later representation phase.
+// anywhere in the file (interior corruption, unusable) per D17. Symlink and
+// hardlink records are exercised through the writer and reader, including
+// their kind-specific field validation.
 
 #define _GNU_SOURCE
 
@@ -481,9 +481,33 @@ static int symlink_roundtrip_callback(const SidecarRecord *record,
     return 0;
 }
 
-static void test_symlink_writer(int fd)
+typedef struct {
+    int entries;
+    int valid;
+} HardlinkRoundTripState;
+
+static int hardlink_roundtrip_callback(const SidecarRecord *record,
+                                       void *context)
 {
-    printf(BLUE "::" NC " symlink writer validation and round trip\n");
+    HardlinkRoundTripState *state = context;
+    if (record->type != SIDECAR_RECORD_ENTRY)
+        return 0;
+
+    const SidecarEntry *entry = &record->value.entry;
+    state->entries++;
+    if (entry->kind != SIDECAR_KIND_HARDLINK || entry->size != 0 ||
+        entry->xattr_count != 0 || entry->hardlink_root_id.length != 4 ||
+        memcmp(entry->hardlink_root_id.data, "ROOT", 4) != 0 ||
+        entry->hardlink_logical_path.length != 8 ||
+        memcmp(entry->hardlink_logical_path.data, "dir/file", 8) != 0 ||
+        entry->symlink_target.length != 0)
+        state->valid = 0;
+    return 0;
+}
+
+static void test_symlink_and_hardlink_writer(int fd)
+{
+    printf(BLUE "::" NC " symlink and hardlink writer validation and round trip\n");
     static const unsigned char target[] = "../target";
 
     SidecarEntry entry = sample_entry();
@@ -541,10 +565,51 @@ static void test_symlink_writer(int fd)
     entry.kind = SIDECAR_KIND_HARDLINK;
     entry.size = 0;
     entry.xattr_count = 0;
+    entry.hardlink_root_id = entry.root_id;
+    entry.hardlink_logical_path = entry.logical_path;
+    check(reset_file(fd) == 0 && sidecar_write_header(fd) == 0 &&
+          sidecar_write_entry(fd, &entry) == 0 &&
+          sidecar_write_entry_commit(fd) == 0,
+          "well-formed hardlink entry writes");
+
+    HardlinkRoundTripState hardlink_state = { .valid = 1 };
+    check(sidecar_parse_fd(fd, hardlink_roundtrip_callback, &hardlink_state,
+                           &result) == SIDECAR_STATUS_OK &&
+          hardlink_state.valid && hardlink_state.entries == 1,
+          "hardlink reference fields round-trip byte-for-byte");
+
+    entry.hardlink_root_id = (SidecarBytes){ NULL, 0 };
     errno = 0;
     check(reset_file(fd) == 0 && sidecar_write_header(fd) == 0 &&
-          sidecar_write_entry(fd, &entry) != 0 && errno == EOPNOTSUPP,
-          "hardlink writer remains unsupported");
+          sidecar_write_entry(fd, &entry) != 0 && errno == EINVAL,
+          "hardlink missing root reference is rejected");
+
+    entry = sample_entry();
+    entry.kind = SIDECAR_KIND_HARDLINK;
+    entry.size = 0;
+    entry.xattr_count = 0;
+    entry.hardlink_root_id = entry.root_id;
+    entry.hardlink_logical_path = (SidecarBytes){ NULL, 0 };
+    errno = 0;
+    check(reset_file(fd) == 0 && sidecar_write_header(fd) == 0 &&
+          sidecar_write_entry(fd, &entry) != 0 && errno == EINVAL,
+          "hardlink missing logical reference is rejected");
+
+    entry.hardlink_logical_path = entry.logical_path;
+    entry.xattr_count = 1;
+    errno = 0;
+    check(reset_file(fd) == 0 && sidecar_write_header(fd) == 0 &&
+          sidecar_write_entry(fd, &entry) != 0 && errno == EINVAL,
+          "hardlink xattrs are rejected");
+
+    entry.xattr_count = 0;
+    entry.symlink_target = (SidecarBytes){
+        (const unsigned char *)"target", 6
+    };
+    errno = 0;
+    check(reset_file(fd) == 0 && sidecar_write_header(fd) == 0 &&
+          sidecar_write_entry(fd, &entry) != 0 && errno == EINVAL,
+          "hardlink symlink target is rejected");
 
     unsigned char *long_target = malloc(SIDECAR_MAX_SYMLINK_TARGET + 1U);
     check(long_target != NULL, "symlink boundary fixture allocates");
@@ -743,7 +808,7 @@ int main(void)
     test_header_and_roundtrip(fd);
     test_writer_validation(fd);
     test_collision_suffix(fd);
-    test_symlink_writer(fd);
+    test_symlink_and_hardlink_writer(fd);
     test_tail_and_boundary(fd);
     test_corruption_and_versions(fd);
     test_symlink_kind_parsing(fd);

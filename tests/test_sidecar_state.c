@@ -1,4 +1,4 @@
-// Unit tests for the sidecar v2 state log (docs/DECISIONS.md D17/D21): the
+// Unit tests for the sidecar v2 state log (docs/DECISIONS.md D17/D21/D22): the
 // `(root_id, logical_path)`-keyed live-state map built on top of the sidecar
 // codec's record framing, with last-committed-wins semantics, DELETE
 // handling, the fd-anchored no-follow single-link slot, and adopt-time
@@ -63,6 +63,45 @@ static int write_all_test(int fd, const void *data, size_t length)
         written += (size_t)result;
     }
     return 0;
+}
+
+static int write_raw_field(int fd, const void *data, size_t length)
+{
+    unsigned char terminator = 0;
+    return write_all_test(fd, data, length) == 0 &&
+           write_all_test(fd, &terminator, sizeof(terminator)) == 0 ? 0 : -1;
+}
+
+static int write_raw_text_field(int fd, const char *text)
+{
+    return text == NULL ? -1 : write_raw_field(fd, text, strlen(text));
+}
+
+static int write_raw_hardlink_with_xattr(int fd)
+{
+    static const unsigned char value[] = { 0x00, 0x41, 0xff, 0x00 };
+    return write_raw_text_field(fd, "ENTRY") == 0 &&
+           write_raw_text_field(fd, "ROOT") == 0 &&
+           write_raw_text_field(fd, "copy") == 0 &&
+           write_raw_text_field(fd, "payload/copy") == 0 &&
+           write_raw_text_field(fd, "") == 0 &&
+           write_raw_text_field(fd, "hardlink") == 0 &&
+           write_raw_text_field(fd, "416") == 0 &&
+           write_raw_text_field(fd, "1000") == 0 &&
+           write_raw_text_field(fd, "1001") == 0 &&
+           write_raw_text_field(fd, "-3") == 0 &&
+           write_raw_text_field(fd, "7") == 0 &&
+           write_raw_text_field(fd, "42") == 0 &&
+           write_raw_text_field(fd, "99") == 0 &&
+           write_raw_text_field(fd, "0") == 0 &&
+           write_raw_text_field(fd, "1") == 0 &&
+           write_raw_text_field(fd, "ROOT") == 0 &&
+           write_raw_text_field(fd, "file") == 0 &&
+           write_raw_text_field(fd, "XATTR") == 0 &&
+           write_raw_text_field(fd, "user.state") == 0 &&
+           write_raw_text_field(fd, "4") == 0 &&
+           write_all_test(fd, value, sizeof(value)) == 0 &&
+           write_raw_text_field(fd, "ENTRY_COMMIT") == 0 ? 0 : -1;
 }
 
 static int slot_fd(int container_fd, int flags)
@@ -190,7 +229,7 @@ static void test_fresh_and_live_map(int container_fd)
 
 static void test_sequence_and_hardlink_guards(int container_fd)
 {
-    printf(BLUE "::" NC " append sequence and hardlink guards\n");
+    printf(BLUE "::" NC " append sequence and hardlink validation\n");
     check(reset_slot(container_fd) == 0, "old slot is removed");
     SidecarLog log = {0};
     check(sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH,
@@ -237,12 +276,53 @@ static void test_sequence_and_hardlink_guards(int container_fd)
           memcmp(view.entry->collision_suffix.data, collision_suffix,
                  sizeof(collision_suffix) - 1U) == 0,
           "live symlink target and collision suffix are copied into the state map");
+
+    SidecarEntry hardlink = entry_for("ROOT", "copy", "payload/copy", 0, 0);
+    hardlink.kind = SIDECAR_KIND_HARDLINK;
+    hardlink.hardlink_root_id = hardlink.root_id;
+    hardlink.hardlink_logical_path = entry.logical_path;
+    check(sidecar_log_append_entry(&log, &hardlink) == SIDECAR_STATUS_OK &&
+          sidecar_log_append_entry_commit(&log) == SIDECAR_STATUS_OK,
+          "well-formed hardlink entry opens and commits");
+    check(sidecar_log_live_count(&log) == 3,
+          "committed hardlink entry is live");
+    check(sidecar_log_find(&log, hardlink.root_id, hardlink.logical_path,
+                           &view) == 1 && view.entry != NULL &&
+          view.entry->kind == SIDECAR_KIND_HARDLINK &&
+          view.entry->hardlink_root_id.length == 4 &&
+          memcmp(view.entry->hardlink_root_id.data, "ROOT", 4) == 0 &&
+          view.entry->hardlink_logical_path.length == 4 &&
+          memcmp(view.entry->hardlink_logical_path.data, "file", 4) == 0,
+          "hardlink reference fields are copied into the state map");
+
+    SidecarEntry invalid = hardlink;
+    invalid.hardlink_root_id = (SidecarBytes){ NULL, 0 };
+    check(sidecar_log_append_entry(&log, &invalid) ==
+              SIDECAR_STATUS_INVALID_ARGUMENT,
+          "hardlink missing root reference is refused by the state map");
+    invalid = hardlink;
+    invalid.hardlink_logical_path = (SidecarBytes){ NULL, 0 };
+    check(sidecar_log_append_entry(&log, &invalid) ==
+              SIDECAR_STATUS_INVALID_ARGUMENT,
+          "hardlink missing logical reference is refused by the state map");
+    invalid = hardlink;
+    invalid.xattr_count = 1;
+    check(sidecar_log_append_entry(&log, &invalid) ==
+              SIDECAR_STATUS_INVALID_ARGUMENT,
+          "hardlink xattrs are refused by the state map");
+    invalid = hardlink;
+    invalid.symlink_target = (SidecarBytes){
+        (const unsigned char *)"target", 6
+    };
+    check(sidecar_log_append_entry(&log, &invalid) ==
+              SIDECAR_STATUS_INVALID_ARGUMENT,
+          "hardlink symlink target is refused by the state map");
     check(sidecar_log_close(&log) == SIDECAR_STATUS_OK,
           "guard log closes");
 
     check(sidecar_log_adopt_at(container_fd, &log) == SIDECAR_OPEN_RESUMABLE &&
-          sidecar_log_live_count(&log) == 2,
-          "adopted state retains the committed symlink");
+          sidecar_log_live_count(&log) == 3,
+          "adopted state retains symlink and hardlink entries");
     check(sidecar_log_find(&log, symlink.root_id, symlink.logical_path, &view) == 1 &&
           view.entry != NULL && view.entry->symlink_target.length == 6 &&
           memcmp(view.entry->symlink_target.data, "target", 6) == 0 &&
@@ -251,8 +331,34 @@ static void test_sequence_and_hardlink_guards(int container_fd)
           memcmp(view.entry->collision_suffix.data, collision_suffix,
                  sizeof(collision_suffix) - 1U) == 0,
           "adopted symlink target and collision suffix remain byte-exact");
+    check(sidecar_log_find(&log, hardlink.root_id, hardlink.logical_path,
+                           &view) == 1 && view.entry != NULL &&
+          view.entry->kind == SIDECAR_KIND_HARDLINK &&
+          view.entry->hardlink_root_id.length == 4 &&
+          view.entry->hardlink_logical_path.length == 4 &&
+          memcmp(view.entry->hardlink_logical_path.data, "file", 4) == 0,
+          "adopted hardlink reference fields remain byte-exact");
     check(sidecar_log_close(&log) == SIDECAR_STATUS_OK,
           "adopted guard log closes");
+}
+
+static void test_hardlink_adopt_validation(int container_fd)
+{
+    printf(BLUE "::" NC " adopt validates hardlink records independently\n");
+    check(reset_slot(container_fd) == 0, "adopt fixture slot is absent");
+    int fd = openat(container_fd, SIDECAR_SLOT_NAME,
+                    O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    int written = fd >= 0 && sidecar_write_header(fd) == 0 &&
+                  write_raw_hardlink_with_xattr(fd) == 0;
+    check(written, "raw hardlink+xattr fixture bypasses the writer validator");
+    if (fd >= 0)
+        close(fd);
+
+    SidecarLog log = {0};
+    check(sidecar_log_adopt_at(container_fd, &log) == SIDECAR_OPEN_UNUSABLE,
+          "adoption rejects hardlink xattrs through copy_entry");
+    check(reset_slot(container_fd) == 0,
+          "malformed adopt fixture is removed");
 }
 
 static void test_missing_and_slot_types(int container_fd)
@@ -461,6 +567,7 @@ int main(void)
 
     test_fresh_and_live_map(container_fd);
     test_sequence_and_hardlink_guards(container_fd);
+    test_hardlink_adopt_validation(container_fd);
     test_missing_and_slot_types(container_fd);
     test_truncated_tail(container_fd);
     test_interior_corruption_and_hardlink(container_fd);

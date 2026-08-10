@@ -278,6 +278,11 @@ static SidecarStatus copy_entry(StateMemory *memory, const SidecarEntry *source,
         set_invalid_error();
         return SIDECAR_STATUS_INVALID_ARGUMENT;
     }
+    if (source->kind == SIDECAR_KIND_HARDLINK && source->xattr_count != 0)
+    {
+        set_invalid_error();
+        return SIDECAR_STATUS_INVALID_ARGUMENT;
+    }
     if (source->kind != SIDECAR_KIND_SYMLINK &&
         source->symlink_target.length != 0)
     {
@@ -707,7 +712,7 @@ static int valid_key(SidecarBytes root_id, SidecarBytes logical_path)
 
 static int append_entry_supported(const SidecarEntry *entry)
 {
-    return entry != NULL && entry->kind != SIDECAR_KIND_HARDLINK;
+    return entry != NULL;
 }
 
 static int update_boundary(SidecarLogImplementation *log)
