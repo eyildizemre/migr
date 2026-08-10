@@ -23,6 +23,8 @@
 extern int replay_entry_valid(const SidecarEntry *entry);
 extern int replay_stat_from_entry(const SidecarEntry *entry,
                                   struct stat *desired);
+extern int replay_hardlink_identity_matches(const struct stat *linked,
+                                            const struct stat *reference);
 
 #define GREEN "\033[0;32m"
 #define RED   "\033[0;31m"
@@ -507,6 +509,28 @@ static void test_symlink_collection_validation(void)
     };
     check(!replay_entry_valid(&oversized),
           "oversized symlink target is rejected");
+}
+
+static void test_hardlink_identity_validation(void)
+{
+    printf(BLUE "::" NC " hardlink identity readback validation\n");
+    struct stat linked = {0};
+    struct stat reference = {0};
+    linked.st_dev = 1;
+    linked.st_ino = 42;
+    reference.st_dev = 1;
+    reference.st_ino = 42;
+    check(replay_hardlink_identity_matches(&linked, &reference),
+          "matching dev/ino is accepted");
+
+    reference.st_ino = 43;
+    check(!replay_hardlink_identity_matches(&linked, &reference),
+          "mismatched ino is rejected");
+
+    reference.st_ino = 42;
+    reference.st_dev = 2;
+    check(!replay_hardlink_identity_matches(&linked, &reference),
+          "mismatched dev is rejected");
 }
 
 static int metadata_exact(const char *path, mode_t mode, uid_t uid, gid_t gid,
@@ -1099,6 +1123,7 @@ static void test_tombstone_skipped(void)
 int main(void)
 {
     test_symlink_collection_validation();
+    test_hardlink_identity_validation();
     test_physical_logical_mismatch();
     test_collision_suffix_validation();
     test_normal_replay();

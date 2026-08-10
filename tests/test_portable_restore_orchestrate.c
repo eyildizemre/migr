@@ -208,6 +208,19 @@ static void build_symlink_payload(Fixture *fixture)
     write_file_at(fixture->home_fd, "sentinel_target", "untouched");
 }
 
+static void build_hardlink_payload(Fixture *fixture)
+{
+    make_dir_at(fixture->data_fd, "ROOT", 0700);
+    int root_fd = openat(fixture->data_fd, "ROOT",
+                         O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (root_fd < 0)
+        fatal("could not open hardlink payload root");
+    write_file_at(root_fd, "alias", "");
+    write_file_at(root_fd, "representative", "hardlink payload");
+    if (close(root_fd) != 0)
+        fatal("could not close hardlink payload root");
+}
+
 static void test_symlink_orchestration(void)
 {
     printf(BLUE "::" NC " end-to-end portable symlink replay\n");
@@ -735,6 +748,264 @@ static void test_normal_orchestration(void)
     fixture_close(&fixture);
 }
 
+static void test_hardlink_orchestration(void)
+{
+    printf(BLUE "::" NC " end-to-end portable hardlink replay\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "hardlink orchestration fixture is created");
+    if (opened != 0)
+        return;
+
+    build_hardlink_payload(&fixture);
+    uint32_t uid = (uint32_t)geteuid();
+    uint32_t gid = (uint32_t)getegid();
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  uid, gid, 1700000700, 1, 1700000701, 2),
+        entry_for("ROOT", "representative", "representative",
+                  SIDECAR_KIND_REGULAR, strlen("hardlink payload"), 0640,
+                  uid, gid, 1700000710, 3, 1700000711, 4),
+        entry_for("ROOT", "alias", "alias", SIDECAR_KIND_HARDLINK, 0,
+                  0640, uid, gid, 1700000720, 5, 1700000721, 6)
+    };
+    entries[2].hardlink_root_id = text_bytes("ROOT");
+    entries[2].hardlink_logical_path = text_bytes("representative");
+    check(write_sidecar(&fixture, entries, 3) == 0,
+          "hardlink orchestration sidecar is committed");
+
+    struct stat placeholder_before;
+    check(fstatat(fixture.data_fd, "ROOT/alias", &placeholder_before,
+                  AT_SYMLINK_NOFOLLOW) == 0 &&
+              S_ISREG(placeholder_before.st_mode) &&
+              placeholder_before.st_size == 0,
+          "hardlink payload placeholder starts as an empty regular file");
+
+    PortableRestoreReplayReport report;
+    int result = run_orchestration(&fixture, &report, 1, "y\n");
+    check(result == 0 && report.live_count == 3 &&
+              report.applied_count == 3 && report.failed_count == 0,
+          "hardlink replay succeeds with a complete summary");
+
+    char representative[PATH_MAX], alias[PATH_MAX];
+    path_join_fixture(representative, sizeof(representative), fixture.home,
+                      "/restored/representative");
+    path_join_fixture(alias, sizeof(alias), fixture.home, "/restored/alias");
+    struct stat representative_st, alias_st, placeholder_after;
+    check(stat(representative, &representative_st) == 0 &&
+              stat(alias, &alias_st) == 0 &&
+              S_ISREG(representative_st.st_mode) &&
+              S_ISREG(alias_st.st_mode) &&
+              representative_st.st_dev == alias_st.st_dev &&
+              representative_st.st_ino == alias_st.st_ino &&
+              file_equals(alias, "hardlink payload"),
+          "hardlink destination shares the representative inode and content");
+    check(metadata_exact(representative, 0640, (uid_t)uid, (gid_t)gid,
+                         1700000710, 3, 1700000711, 4),
+          "hardlink uses the representative's metadata without reapplying it");
+    check(fstatat(fixture.data_fd, "ROOT/alias", &placeholder_after,
+                  AT_SYMLINK_NOFOLLOW) == 0 &&
+              placeholder_after.st_dev == placeholder_before.st_dev &&
+              placeholder_after.st_ino == placeholder_before.st_ino &&
+              placeholder_after.st_size == 0,
+          "hardlink payload placeholder remains untouched");
+    fixture_close(&fixture);
+}
+
+static void test_hardlink_cross_root(void)
+{
+    printf(BLUE "::" NC " portable hardlink cross-root reference\n");
+    ManifestRoot roots[2] = { root_for(), root_for() };
+    snprintf(roots[0].id, sizeof(roots[0].id), "ROOT_A");
+    snprintf(roots[0].payload_path, sizeof(roots[0].payload_path),
+             "ROOT_A");
+    snprintf(roots[0].source_path, sizeof(roots[0].source_path),
+             "/source/ROOT_A");
+    snprintf(roots[0].restore_path, sizeof(roots[0].restore_path),
+             "restored-a");
+    snprintf(roots[1].id, sizeof(roots[1].id), "ROOT_B");
+    snprintf(roots[1].payload_path, sizeof(roots[1].payload_path),
+             "ROOT_B");
+    snprintf(roots[1].source_path, sizeof(roots[1].source_path),
+             "/source/ROOT_B");
+    snprintf(roots[1].restore_path, sizeof(roots[1].restore_path),
+             "restored-b");
+
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &roots[0]);
+    check(opened == 0, "cross-root hardlink fixture is created");
+    if (opened != 0)
+        return;
+    Manifest manifest_model = {
+        .version = MANIFEST_CURRENT_VERSION,
+        .representation = CLONE_PORTABLE_SIDECAR,
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .sidecar_version = SIDECAR_VERSION,
+        .root_count = 2,
+        .roots = roots
+    };
+    check(manifest_write_v1_at(fixture.container_fd, &manifest_model) == 0,
+          "cross-root manifest is committed");
+
+    make_dir_at(fixture.data_fd, "ROOT_A", 0700);
+    make_dir_at(fixture.data_fd, "ROOT_B", 0700);
+    int root_a_fd = openat(fixture.data_fd, "ROOT_A",
+                           O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int root_b_fd = openat(fixture.data_fd, "ROOT_B",
+                           O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (root_a_fd < 0 || root_b_fd < 0)
+        fatal("could not open cross-root payload roots");
+    write_file_at(root_a_fd, "representative", "cross-root payload");
+    write_file_at(root_b_fd, "alias", "");
+    if (close(root_a_fd) != 0 || close(root_b_fd) != 0)
+        fatal("could not close cross-root payload roots");
+
+    uint32_t uid = (uint32_t)geteuid();
+    uint32_t gid = (uint32_t)getegid();
+    SidecarEntry entries[] = {
+        entry_for("ROOT_A", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  uid, gid, 1700000800, 1, 1700000801, 2),
+        entry_for("ROOT_A", "representative", "representative",
+                  SIDECAR_KIND_REGULAR, strlen("cross-root payload"), 0640,
+                  uid, gid, 1700000810, 3, 1700000811, 4),
+        entry_for("ROOT_B", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  uid, gid, 1700000820, 5, 1700000821, 6),
+        entry_for("ROOT_B", "alias", "alias", SIDECAR_KIND_HARDLINK, 0,
+                  0640, uid, gid, 1700000830, 7, 1700000831, 8)
+    };
+    entries[3].hardlink_root_id = text_bytes("ROOT_A");
+    entries[3].hardlink_logical_path = text_bytes("representative");
+    check(write_sidecar(&fixture, entries, 4) == 0,
+          "cross-root hardlink sidecar is committed");
+
+    PortableRestoreReplayReport report;
+    int result = run_orchestration(&fixture, &report, 1, "y\n");
+    check(result == 0 && report.live_count == 4 &&
+              report.applied_count == 4 && report.failed_count == 0,
+          "cross-root hardlink replay succeeds");
+    char representative[PATH_MAX], alias[PATH_MAX];
+    path_join_fixture(representative, sizeof(representative), fixture.home,
+                      "/restored-a/representative");
+    path_join_fixture(alias, sizeof(alias), fixture.home,
+                      "/restored-b/alias");
+    struct stat representative_st, alias_st;
+    check(stat(representative, &representative_st) == 0 &&
+              stat(alias, &alias_st) == 0 &&
+              representative_st.st_dev == alias_st.st_dev &&
+              representative_st.st_ino == alias_st.st_ino &&
+              file_equals(alias, "cross-root payload"),
+          "cross-root hardlink shares the referenced inode");
+    fixture_close(&fixture);
+}
+
+static void assert_hardlink_reference_refused(Fixture *fixture,
+                                               const SidecarEntry *entries,
+                                               size_t count,
+                                               const char *label)
+{
+    check(write_sidecar(fixture, entries, count) == 0,
+          "malformed hardlink sidecar is committed");
+    PortableRestoreReplayReport report;
+    int result = run_orchestration(fixture, &report, 1, "y\n");
+    char destination[PATH_MAX];
+    path_join_fixture(destination, sizeof(destination), fixture->home,
+                      "/restored/alias");
+    char root_destination[PATH_MAX];
+    path_join_fixture(root_destination, sizeof(root_destination),
+                      fixture->home, "/restored");
+    check(result != 0 && report.failed_count != 0 &&
+              strcmp(report.failed_logical_path, "alias") == 0 &&
+              access(destination, F_OK) != 0 &&
+              access(root_destination, F_OK) != 0, label);
+}
+
+static void test_hardlink_reference_failures(void)
+{
+    printf(BLUE "::" NC " malformed portable hardlink references\n");
+    uint32_t uid = (uint32_t)geteuid();
+    uint32_t gid = (uint32_t)getegid();
+
+    ManifestRoot missing_root = root_for();
+    Fixture missing_fixture;
+    int opened = fixture_open(&missing_fixture, &missing_root);
+    check(opened == 0, "missing-reference fixture is created");
+    if (opened == 0)
+    {
+        build_hardlink_payload(&missing_fixture);
+        SidecarEntry entries[] = {
+            entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                      uid, gid, 1700000900, 1, 1700000901, 2),
+            entry_for("ROOT", "representative", "representative",
+                      SIDECAR_KIND_REGULAR, strlen("hardlink payload"), 0640,
+                      uid, gid, 1700000905, 2, 1700000906, 3),
+            entry_for("ROOT", "alias", "alias", SIDECAR_KIND_HARDLINK, 0,
+                      0640, uid, gid, 1700000910, 3, 1700000911, 4)
+        };
+        entries[2].hardlink_root_id = text_bytes("ROOT");
+        entries[2].hardlink_logical_path = text_bytes("missing");
+        assert_hardlink_reference_refused(
+            &missing_fixture, entries, 3,
+            "a hardlink with a missing reference is refused before replay");
+        fixture_close(&missing_fixture);
+    }
+
+    ManifestRoot self_root = root_for();
+    Fixture self_fixture;
+    opened = fixture_open(&self_fixture, &self_root);
+    check(opened == 0, "self-reference fixture is created");
+    if (opened == 0)
+    {
+        build_hardlink_payload(&self_fixture);
+        SidecarEntry entries[] = {
+            entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                      uid, gid, 1700000920, 5, 1700000921, 6),
+            entry_for("ROOT", "representative", "representative",
+                      SIDECAR_KIND_REGULAR, strlen("hardlink payload"), 0640,
+                      uid, gid, 1700000925, 6, 1700000926, 7),
+            entry_for("ROOT", "alias", "alias", SIDECAR_KIND_HARDLINK, 0,
+                      0640, uid, gid, 1700000930, 7, 1700000931, 8)
+        };
+        entries[2].hardlink_root_id = text_bytes("ROOT");
+        entries[2].hardlink_logical_path = text_bytes("alias");
+        assert_hardlink_reference_refused(
+            &self_fixture, entries, 3,
+            "a self-referencing hardlink is refused before replay");
+        fixture_close(&self_fixture);
+    }
+
+    ManifestRoot nonregular_root = root_for();
+    Fixture nonregular_fixture;
+    opened = fixture_open(&nonregular_fixture, &nonregular_root);
+    check(opened == 0, "non-regular-reference fixture is created");
+    if (opened == 0)
+    {
+        make_dir_at(nonregular_fixture.data_fd, "ROOT", 0700);
+        int root_fd = openat(nonregular_fixture.data_fd, "ROOT",
+                             O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (root_fd < 0)
+            fatal("could not open non-regular hardlink payload root");
+        make_dir_at(root_fd, "target", 0700);
+        write_file_at(root_fd, "alias", "");
+        if (close(root_fd) != 0)
+            fatal("could not close non-regular hardlink payload root");
+        SidecarEntry entries[] = {
+            entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                      uid, gid, 1700000940, 9, 1700000941, 10),
+            entry_for("ROOT", "target", "target", SIDECAR_KIND_DIRECTORY,
+                      0, 0700, uid, gid, 1700000950, 11, 1700000951, 12),
+            entry_for("ROOT", "alias", "alias", SIDECAR_KIND_HARDLINK, 0,
+                      0640, uid, gid, 1700000960, 13, 1700000961, 14)
+        };
+        entries[2].hardlink_root_id = text_bytes("ROOT");
+        entries[2].hardlink_logical_path = text_bytes("target");
+        assert_hardlink_reference_refused(
+            &nonregular_fixture, entries, 3,
+            "a hardlink targeting a directory is refused before replay");
+        fixture_close(&nonregular_fixture);
+    }
+}
+
 static void test_probe_rejection(void)
 {
     printf(BLUE "::" NC " confirmation followed by probe rejection\n");
@@ -866,6 +1137,9 @@ static void test_coarse_timestamp_policy(void)
 int main(void)
 {
     test_normal_orchestration();
+    test_hardlink_orchestration();
+    test_hardlink_cross_root();
+    test_hardlink_reference_failures();
     test_symlink_orchestration();
     test_symlink_ownership_rejection();
     test_symlink_destination_conflict();

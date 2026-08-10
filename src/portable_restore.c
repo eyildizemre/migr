@@ -94,7 +94,9 @@ typedef struct {
     const SidecarXattr *xattrs;
     size_t xattr_count;
     size_t root_index;
+    size_t hardlink_ref_root_index;
     char destination[PATH_MAX];
+    char hardlink_ref_destination[PATH_MAX];
     size_t depth;
 } ReplayEntry;
 
@@ -106,6 +108,7 @@ typedef struct {
     const Manifest *manifest;
     RootMap root_map;
     ParentMap parent_map; /* Parent-prefix validation consumes this (D21). */
+    const SidecarLog *sidecar;
     int data_fd;
     int destination_home_fd;
     MetadataTimestampPolicy timestamp_policy;
@@ -1125,7 +1128,8 @@ static int collect_entry(const SidecarLiveView *view, void *argument)
     }
     if (entry->kind != SIDECAR_KIND_REGULAR &&
         entry->kind != SIDECAR_KIND_DIRECTORY &&
-        entry->kind != SIDECAR_KIND_SYMLINK)
+        entry->kind != SIDECAR_KIND_SYMLINK &&
+        entry->kind != SIDECAR_KIND_HARDLINK)
     {
         report_violation(report, root_index, "unsupported-kind");
         return 0;
@@ -1854,9 +1858,9 @@ int replay_entry_valid(const SidecarEntry *entry)
     if (entry == NULL ||
         (entry->kind != SIDECAR_KIND_REGULAR &&
          entry->kind != SIDECAR_KIND_DIRECTORY &&
-         entry->kind != SIDECAR_KIND_SYMLINK) ||
-        ((entry->kind == SIDECAR_KIND_DIRECTORY ||
-          entry->kind == SIDECAR_KIND_SYMLINK) && entry->size != 0))
+         entry->kind != SIDECAR_KIND_SYMLINK &&
+         entry->kind != SIDECAR_KIND_HARDLINK) ||
+        (entry->kind != SIDECAR_KIND_REGULAR && entry->size != 0))
         return 0;
     if (entry->kind != SIDECAR_KIND_SYMLINK)
         return 1;
@@ -1986,12 +1990,54 @@ static int replay_collect_entry(const SidecarLiveView *view, void *argument)
     }
 
     const ManifestRoot *root = &collection->manifest->roots[root_index];
-    if (entry->kind == SIDECAR_KIND_SYMLINK &&
+    if ((entry->kind == SIDECAR_KIND_SYMLINK ||
+         entry->kind == SIDECAR_KIND_HARDLINK) &&
         replay_symlink_placeholder_valid(collection, root, entry) != 0)
     {
         replay_report_failure(collection->report, collection->manifest,
                               root_index, entry->logical_path);
         return 1;
+    }
+
+    size_t hardlink_ref_root_index = SIZE_MAX;
+    char hardlink_ref_destination[PATH_MAX] = {0};
+    if (entry->kind == SIDECAR_KIND_HARDLINK)
+    {
+        SidecarLiveView referenced;
+        if (collection->sidecar == NULL ||
+            !sidecar_log_find(collection->sidecar,
+                              entry->hardlink_root_id,
+                              entry->hardlink_logical_path, &referenced) ||
+            referenced.entry == NULL ||
+            referenced.entry->kind != SIDECAR_KIND_REGULAR ||
+            !sidecar_path_valid(referenced.entry->logical_path, 1) ||
+            referenced.entry->logical_path.length >= PATH_MAX)
+        {
+            replay_report_failure(collection->report, collection->manifest,
+                                  root_index, entry->logical_path);
+            return 1;
+        }
+        hardlink_ref_root_index = root_map_find(&collection->root_map,
+                                                collection->manifest,
+                                                entry->hardlink_root_id);
+        if (hardlink_ref_root_index == SIZE_MAX)
+        {
+            replay_report_failure(collection->report, collection->manifest,
+                                  root_index, entry->logical_path);
+            return 1;
+        }
+        char reference_logical[PATH_MAX];
+        replay_copy_bytes(reference_logical, sizeof(reference_logical),
+                          referenced.entry->logical_path);
+        if (destination_path_build(
+                &collection->manifest->roots[hardlink_ref_root_index],
+                reference_logical, hardlink_ref_destination,
+                sizeof(hardlink_ref_destination)) != 0)
+        {
+            replay_report_failure(collection->report, collection->manifest,
+                                  root_index, entry->logical_path);
+            return 1;
+        }
     }
 
     char logical[PATH_MAX];
@@ -2032,6 +2078,9 @@ static int replay_collect_entry(const SidecarLiveView *view, void *argument)
     replay->entry = entry;
     replay->xattrs = view->xattrs;
     replay->xattr_count = view->xattr_count;
+    replay->hardlink_ref_root_index = hardlink_ref_root_index;
+    memcpy(replay->hardlink_ref_destination, hardlink_ref_destination,
+           sizeof(replay->hardlink_ref_destination));
     /*
      * Accumulate the xattr namespace requirements for the pre-mutation
      * capability gate (D20 E-9). The sidecar's xattr names are not
@@ -2575,6 +2624,93 @@ static int replay_apply_symlink(ReplayCollection *collection,
     return result;
 }
 
+int replay_hardlink_identity_matches(const struct stat *linked,
+                                     const struct stat *reference)
+{
+    return linked != NULL && reference != NULL &&
+           linked->st_dev == reference->st_dev &&
+           linked->st_ino == reference->st_ino;
+}
+
+static int replay_apply_hardlink(ReplayCollection *collection,
+                                 ReplayEntry *replay)
+{
+    if (collection == NULL || replay == NULL || replay->entry == NULL ||
+        replay->entry->kind != SIDECAR_KIND_HARDLINK ||
+        !replay_entry_valid(replay->entry) ||
+        replay->hardlink_ref_root_index >=
+            (size_t)collection->manifest->root_count ||
+        replay->hardlink_ref_destination[0] == '\0' ||
+        !relative_path_valid(replay->hardlink_ref_destination, 0))
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    int parent_fd = -1;
+    int ref_parent_fd = -1;
+    char leaf[NAME_MAX + 1U];
+    char ref_leaf[NAME_MAX + 1U];
+    int result = replay_destination_parent(collection, replay, &parent_fd,
+                                           leaf, sizeof(leaf));
+    if (result == 0)
+        result = replay_open_destination_parent(
+            collection->destination_home_fd,
+            replay->hardlink_ref_destination, &ref_parent_fd, ref_leaf,
+            sizeof(ref_leaf));
+
+    struct stat reference_before;
+    if (result == 0 &&
+        (ref_leaf[0] == '\0' ||
+         fstatat(ref_parent_fd, ref_leaf, &reference_before,
+                 AT_SYMLINK_NOFOLLOW) != 0 ||
+         !S_ISREG(reference_before.st_mode)))
+    {
+        errno = EIO;
+        result = -1;
+    }
+    if (result == 0)
+    {
+        struct stat existing;
+        if (fstatat(parent_fd, leaf, &existing, AT_SYMLINK_NOFOLLOW) == 0)
+        {
+            errno = EEXIST;
+            result = -1;
+        }
+        else if (errno != ENOENT)
+            result = -1;
+    }
+    if (result == 0 && linkat(ref_parent_fd, ref_leaf, parent_fd, leaf, 0) != 0)
+        result = -1;
+    if (result == 0)
+    {
+        struct stat linked;
+        struct stat reference_after;
+        if (fstatat(parent_fd, leaf, &linked, AT_SYMLINK_NOFOLLOW) != 0 ||
+            fstatat(ref_parent_fd, ref_leaf, &reference_after,
+                    AT_SYMLINK_NOFOLLOW) != 0 ||
+            !replay_hardlink_identity_matches(&linked, &reference_after))
+        {
+            errno = EIO;
+            result = -1;
+        }
+    }
+
+    int saved = errno;
+    if (ref_parent_fd >= 0 && close(ref_parent_fd) != 0 && result == 0)
+    {
+        result = -1;
+        saved = EIO;
+    }
+    if (parent_fd >= 0 && close(parent_fd) != 0 && result == 0)
+    {
+        result = -1;
+        saved = EIO;
+    }
+    errno = saved;
+    return result;
+}
+
 static int replay_prepare_directory(ReplayCollection *collection,
                                      ReplayEntry *replay)
 {
@@ -2686,6 +2822,8 @@ static int replay_run(ReplayCollection *collection)
     {
         ReplayEntry *replay = &collection->items[index];
         int result;
+        if (replay->entry->kind == SIDECAR_KIND_HARDLINK)
+            continue;
         if (replay->entry->kind == SIDECAR_KIND_SYMLINK)
             result = replay_apply_symlink(collection, replay);
         else if (replay->entry->kind == SIDECAR_KIND_DIRECTORY)
@@ -2705,6 +2843,22 @@ static int replay_run(ReplayCollection *collection)
             if (collection->report->applied_count != SIZE_MAX)
                 collection->report->applied_count++;
         }
+    }
+
+    for (size_t index = 0; index < collection->count; index++)
+    {
+        ReplayEntry *replay = &collection->items[index];
+        if (replay->entry->kind != SIDECAR_KIND_HARDLINK)
+            continue;
+        if (replay_apply_hardlink(collection, replay) != 0)
+        {
+            replay_report_failure(collection->report, collection->manifest,
+                                  replay->root_index,
+                                  replay->entry->logical_path);
+            return -1;
+        }
+        if (collection->report->applied_count != SIZE_MAX)
+            collection->report->applied_count++;
     }
 
     for (size_t index = collection->count; index != 0; index--)
@@ -2798,6 +2952,7 @@ int portable_restore_replay_at(const PortableRestoreRequest *request,
         collection.data_fd = -1;
         goto fail;
     }
+    collection.sidecar = &sidecar;
     if (parent_map_build(&collection.parent_map, &collection.memory,
                          &sidecar) != 0)
     {
