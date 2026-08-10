@@ -453,10 +453,13 @@ in G), so no single phase carries "make everything faithful at once."
   any payload write and the documented `security.*` semantic-risk boundary.
   The real Arch/Ubuntu/Fedora VM-gate matrix passed, including a real
   xattr-capable ext4 loopback destination rather than only vfat.
-- **Phase F — Case collisions.** **Status: in progress (2026-08-08, D21).**
-  Deterministic, `readdir`-order-independent suffix, concretized by D21's v2
-  `collision_suffix` field, destination-backed candidate verification, and
-  parent-prefix physical/logical restore invariant.
+- **Phase F — Case collisions.** **Status: complete (2026-08-10).**
+  Deterministic, `readdir`-order-independent suffix landed via D21's v2
+  `collision_suffix` field, destination-backed candidate verification, and the
+  parent-prefix physical/logical restore invariant. The real
+  Arch/Ubuntu/Fedora VM-gate matrix passed, including real vfat ASCII and
+  measured non-ASCII fold resolution, resume renumbering, and the
+  destination-probed root-namespace collision gate.
 - **Phase G — Hardlinks.** `(st_dev, st_ino)` grouping; native `link()` / portable dense
   copy; space accounting in the pre-scan.
 - **Phase H — Resume.** Sidecar as the comparison oracle (true size+mtime+type); the

@@ -1365,7 +1365,7 @@ as historical entries.
 
 ## D21 — 2026-08-08 — Portable case-collision resolution: deterministic suffix
 
-**Status:** Decided — Phase F implementation pending
+**Status:** Implemented (Phase F closed 2026-08-10; as-built notes below)
 
 **Decision:** Portable capture resolves case collisions in the payload namespace
 with a deterministic, `readdir`-order-independent suffix while preserving D19
@@ -1512,3 +1512,31 @@ D17's sidecar v1 grammar to v2, generalizes N-4's physical/logical invariant to
 the parent-prefix form, and remains subject to D14's test-only boundary. Root
 payload paths remain governed by the manifest/root policy, hardlinks are deferred
 to Phase G, and sparse-file layout remains deferred under D13.
+
+### As-built (Phase F, 2026-08-10)
+
+The host suite and `make check` (strict GCC and Clang, sanitizers, Valgrind, and
+`-fanalyzer`) passed on Arch, Ubuntu, and Fedora against `c7896a0`, with no
+compiler diagnostics, Valgrind errors, or sanitizer errors.
+
+The VM gate exercised a real case-insensitive vfat destination. ASCII
+`Foo`/`foo` and measured non-ASCII `café`/`CAFÉ` collisions were resolved with
+deterministic suffixes. A real source `foo~1` file forced the plan to skip to
+`%7E2`, and descendants (including a symlink) of a suffixed directory were
+placed beneath the correct physical parent. A capture declaring
+`case_sensitive=1` invented no suffixes.
+
+Resume renumbering was also verified: adding a new sibling that sorts before an
+existing owner released the owner's old physical name and moved it to its new
+suffix-bearing name without changing its content. That path exposed and fixed
+a real bug (`6e43026`, amended through `c7896a0`), and the correction was
+verified on real vfat.
+
+The F-5 root-payload namespace probe detected a measured root-pair collision on
+a real case-insensitive destination, closing a gap that host tests could not
+prove. Host-only scale tests kept collision-plan work within linear bounds for
+4,000 entries and measured risk-11 renumbering cost for both a single entry and
+a nested directory with 2,000 descendants.
+
+Production portable dispatch remains disabled under D14; all of these paths are
+reachable only through the existing test-only seam.

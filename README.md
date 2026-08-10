@@ -173,11 +173,12 @@ other object kinds. Production portable dispatch remains disabled at this stage.
 
 Portable payload names are percent-encoded on disk while the sidecar preserves
 the true logical name; restore always creates that logical name, never a decoded
-or re-derived substitute. An encoded component or path exceeding `NAME_MAX` or
-`PATH_MAX`, or a case collision on a case-insensitive destination, refuses the
-entire invocation before anything is written rather than silently skipping an
-entry. This remains behind the D14 test-only seam; production portable dispatch
-is still disabled.
+or re-derived substitute. On a case-insensitive destination, sibling collisions
+are resolved deterministically with a `%7EN` suffix on the payload name; only
+unresolvable cases such as `NAME_MAX`/`PATH_MAX` overflow or a root-payload
+namespace collision refuse the entire invocation before anything is written.
+This remains behind the D14 test-only seam; production portable dispatch is
+still disabled.
 
 ## Report
 
