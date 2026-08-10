@@ -40,7 +40,9 @@ extern int entry_from_stat(const char *root_id, const char *logical,
                            const char *collision_suffix,
                            const struct stat *st, int nsec_exact,
                            PortableXattrs *xattrs, SidecarEntry *out,
-                           const SidecarBytes *symlink_target);
+                           const SidecarBytes *symlink_target,
+                           const SidecarBytes *hardlink_root_id,
+                           const SidecarBytes *hardlink_logical_path);
 
 static int failures;
 
@@ -258,7 +260,7 @@ static void rewrite_owned_predecessor(int container_fd, int source_fd)
     PortableXattrs empty_xattrs = {0};
     SidecarEntry predecessor = {0};
     if (entry_from_stat("ROOT", "foo", "Foo", "", &source_stat, 1,
-                        &empty_xattrs, &predecessor, NULL) != 0)
+                        &empty_xattrs, &predecessor, NULL, NULL, NULL) != 0)
         fixture_fatal("could not prepare the collision predecessor record");
 
     SidecarLog log = {0};

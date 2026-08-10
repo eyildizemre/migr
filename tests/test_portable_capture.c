@@ -47,7 +47,9 @@ extern int entry_from_stat(const char *root_id, const char *logical,
                            const char *collision_suffix,
                            const struct stat *st, int nsec_exact,
                            PortableXattrs *xattrs, SidecarEntry *out,
-                           const SidecarBytes *symlink_target);
+                           const SidecarBytes *symlink_target,
+                           const SidecarBytes *hardlink_root_id,
+                           const SidecarBytes *hardlink_logical_path);
 extern int append_physical(char *destination, size_t destination_size,
                            const char *parent, const char *encoded_leaf);
 extern int prescan_report_add(PortablePrescanReport *report,
@@ -1428,9 +1430,10 @@ static void test_collision_resume_renumbering(const char *base)
     SidecarEntry root_predecessor = {0};
     SidecarEntry predecessor = {0};
     if (entry_from_stat("CASE", "", "", "", &root_stat, 1,
-                        &empty_xattrs, &root_predecessor, NULL) != 0 ||
+                        &empty_xattrs, &root_predecessor, NULL, NULL,
+                        NULL) != 0 ||
         entry_from_stat("CASE", loser, winner, "", &loser_stat, 1,
-                        &empty_xattrs, &predecessor, NULL) != 0)
+                        &empty_xattrs, &predecessor, NULL, NULL, NULL) != 0)
         fixture_fatal("could not prepare collision predecessor");
     SidecarLog predecessor_log = {0};
     if (sidecar_log_create_at(container_fd, &predecessor_log) !=
@@ -1693,20 +1696,27 @@ static void test_case_probe(const char *base)
 
 static void test_entry_helpers(const char *source)
 {
-    printf(BLUE "::" NC " portable symlink entry helpers\n");
+    printf(BLUE "::" NC " portable entry helpers\n");
     char link_path[PATH_MAX];
+    char regular_path[PATH_MAX];
     join_path(link_path, sizeof(link_path), source, "entry-helper-link");
+    join_path(regular_path, sizeof(regular_path), source,
+              "entry-helper-regular");
     if (symlink("../target", link_path) != 0)
         fixture_fatal("could not create symlink helper fixture");
+    write_file(regular_path, "hardlink-helper", 15);
 
     struct stat link_stat;
     if (lstat(link_path, &link_stat) != 0)
         fixture_fatal("could not inspect symlink helper fixture");
+    struct stat regular_stat;
+    if (stat(regular_path, &regular_stat) != 0)
+        fixture_fatal("could not inspect regular helper fixture");
     PortableXattrs empty_xattrs = {0};
     SidecarBytes target = bytes("../target");
     SidecarEntry entry;
     check(entry_from_stat("LINK", "item", "item", "", &link_stat, 1,
-                          &empty_xattrs, &entry, &target) == 0,
+                          &empty_xattrs, &entry, &target, NULL, NULL) == 0,
           "entry_from_stat accepts a symlink target");
     check(entry.kind == SIDECAR_KIND_SYMLINK && entry.size == 0 &&
               entry.xattr_count == 0 &&
@@ -1717,12 +1727,42 @@ static void test_entry_helpers(const char *source)
     SidecarEntry symlink_entry = entry;
 
     check(entry_from_stat("LINK", "item", "item", "", &link_stat, 1,
-                          &empty_xattrs, &entry, NULL) != 0,
+                          &empty_xattrs, &entry, NULL, NULL, NULL) != 0,
           "symlink entry without a target is rejected");
     SidecarBytes empty_target = {0};
     check(entry_from_stat("LINK", "item", "item", "", &link_stat, 1,
-                          &empty_xattrs, &entry, &empty_target) != 0,
+                          &empty_xattrs, &entry, &empty_target, NULL, NULL) != 0,
           "symlink entry with an empty target is rejected");
+
+    SidecarBytes hardlink_root = bytes("HL");
+    SidecarBytes hardlink_logical = bytes("representative");
+    check(entry_from_stat("HL", "alias", "alias", "", &regular_stat, 1,
+                          &empty_xattrs, &entry, NULL, &hardlink_root,
+                          &hardlink_logical) == 0 &&
+              entry.kind == SIDECAR_KIND_HARDLINK && entry.size == 0 &&
+              entry.xattr_count == 0 &&
+              sidecar_bytes_match_text(entry.hardlink_root_id, "HL") &&
+              sidecar_bytes_match_text(entry.hardlink_logical_path,
+                                       "representative"),
+          "entry_from_stat builds a zero-byte HARDLINK record");
+    PortableXattrs one_xattr = {0};
+    SidecarXattr xattr_item = {0};
+    one_xattr.items = &xattr_item;
+    one_xattr.count = 1;
+    check(entry_from_stat("HL", "alias", "alias", "", &regular_stat, 1,
+                          &one_xattr, &entry, NULL, &hardlink_root,
+                          &hardlink_logical) != 0,
+          "a HARDLINK record with non-empty xattrs is rejected");
+    check(entry_from_stat("HL", "alias", "alias", "", &regular_stat, 1,
+                          &empty_xattrs, &entry, NULL, &hardlink_root,
+                          NULL) != 0,
+          "a HARDLINK record with one missing reference is rejected");
+    unsigned char nul_reference[] = {'H', 'L', '\0', 'x'};
+    SidecarBytes nul_root = {nul_reference, sizeof(nul_reference)};
+    check(entry_from_stat("HL", "alias", "alias", "", &regular_stat, 1,
+                          &empty_xattrs, &entry, NULL, &nul_root,
+                          &hardlink_logical) != 0,
+          "a HARDLINK reference containing NUL is rejected");
 
     SidecarEntry previous = symlink_entry;
     previous.symlink_target = target;
@@ -1818,6 +1858,8 @@ static void test_entry_helpers(const char *source)
 
     if (unlink(link_path) != 0)
         fixture_fatal("could not remove symlink helper fixture");
+    if (unlink(regular_path) != 0)
+        fixture_fatal("could not remove regular helper fixture");
 }
 
 static void test_encoded_payload_names(const char *base)
@@ -2646,6 +2688,323 @@ static void test_fresh_capture(const char *source, int container_fd,
         close(slot_fd);
 }
 
+static int sidecar_view_physical_path(const SidecarLiveView *view,
+                                      char *path, size_t path_size)
+{
+    if (view == NULL || view->entry == NULL || path == NULL || path_size == 0 ||
+        view->entry->physical_path.length >= path_size ||
+        (view->entry->physical_path.length != 0 &&
+         view->entry->physical_path.data == NULL))
+        return -1;
+    memcpy(path, view->entry->physical_path.data,
+           view->entry->physical_path.length);
+    path[view->entry->physical_path.length] = '\0';
+    return 0;
+}
+
+static void test_portable_hardlinks(const char *base)
+{
+    printf(BLUE "::" NC " portable hardlink capture and resume\n");
+    char source[PATH_MAX];
+    char container[PATH_MAX];
+    char first[PATH_MAX];
+    char second[PATH_MAX];
+    char single[PATH_MAX];
+    join_path(source, sizeof(source), base, "hardlink-source");
+    join_path(container, sizeof(container), base, "hardlink-container");
+    join_path(first, sizeof(first), source, "first");
+    join_path(second, sizeof(second), source, "second");
+    join_path(single, sizeof(single), source, "single");
+    make_directory(source);
+    make_directory(container);
+    write_file(first, "hardlink-content", 16);
+    if (link(first, second) != 0)
+        fixture_fatal("could not create hardlink pair");
+    write_file(single, "singleton", 9);
+
+    int xattr_expected = 1;
+    static const char xattr_name[] = "user.migr_hardlink";
+    static const char xattr_value[] = "shared-value";
+    if (setxattr(second, xattr_name, xattr_value, sizeof(xattr_value) - 1U,
+                 0) != 0) {
+        if (errno == ENOTSUP || errno == EOPNOTSUPP || errno == EPERM) {
+            xattr_expected = 0;
+            skip_check("hardlink xattr fixture unavailable on this filesystem");
+        } else {
+            fixture_fatal("could not create hardlink xattr fixture");
+        }
+    }
+
+    int container_fd = open(container, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open hardlink container");
+    PortableRootSpec root = root_spec("HL", source, "HL");
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .has_source_identity = 1,
+        .machine_id = "0123456789abcdef",
+        .source_uid = getuid(),
+        .roots = &root,
+        .root_count = 1,
+        .nsec_exact = 1,
+        .case_sensitive = 1
+    };
+    check(portable_capture_fresh_at(container_fd, &request, NULL) == 0,
+          "hardlink pair capture succeeds");
+
+    SidecarLog log = {0};
+    SidecarOpenStatus open_status = sidecar_log_adopt_at(container_fd, &log);
+    check(open_status == SIDECAR_OPEN_RESUMABLE,
+          "hardlink sidecar can be reopened");
+    if (open_status == SIDECAR_OPEN_RESUMABLE) {
+        SidecarLiveView first_view = {0};
+        SidecarLiveView second_view = {0};
+        SidecarLiveView single_view = {0};
+        int first_found = sidecar_log_find(&log, bytes("HL"), bytes("first"),
+                                           &first_view);
+        int second_found = sidecar_log_find(&log, bytes("HL"), bytes("second"),
+                                            &second_view);
+        int pair_found = first_found == 1 && second_found == 1;
+        int one_regular = pair_found &&
+                          ((first_view.entry->kind == SIDECAR_KIND_REGULAR) !=
+                           (second_view.entry->kind == SIDECAR_KIND_REGULAR));
+        int one_hardlink = pair_found &&
+                           ((first_view.entry->kind == SIDECAR_KIND_HARDLINK) !=
+                            (second_view.entry->kind == SIDECAR_KIND_HARDLINK));
+        check(one_regular && one_hardlink,
+              "one hardlink member is regular and the other is HARDLINK");
+
+        const SidecarLiveView *representative = NULL;
+        const SidecarLiveView *hardlink = NULL;
+        if (pair_found) {
+            if (first_view.entry->kind == SIDECAR_KIND_REGULAR) {
+                representative = &first_view;
+                hardlink = &second_view;
+            } else if (second_view.entry->kind == SIDECAR_KIND_REGULAR) {
+                representative = &second_view;
+                hardlink = &first_view;
+            }
+        }
+        int reference_ok = pair_found && one_regular && one_hardlink &&
+                           sidecar_bytes_match_text(
+                               hardlink->entry->hardlink_root_id, "HL") &&
+                           hardlink->entry->hardlink_logical_path.length ==
+                               representative->entry->logical_path.length &&
+                           memcmp(hardlink->entry->hardlink_logical_path.data,
+                                  representative->entry->logical_path.data,
+                                  representative->entry->logical_path.length) == 0;
+        check(reference_ok,
+              "HARDLINK record points to the first-seen representative");
+        check(pair_found && representative != NULL && hardlink != NULL &&
+                  hardlink->entry->size == 0 &&
+                  hardlink->xattr_count == 0,
+              "HARDLINK record owns an empty placeholder and no xattrs");
+        check(!xattr_expected || (representative != NULL &&
+                                  representative->xattr_count >= 1),
+              "only the representative carries the shared xattr");
+
+        char representative_path[PATH_MAX];
+        char hardlink_path[PATH_MAX];
+        int representative_path_ok =
+            sidecar_view_physical_path(representative, representative_path,
+                                       sizeof(representative_path)) == 0;
+        int hardlink_path_ok =
+            sidecar_view_physical_path(hardlink, hardlink_path,
+                                       sizeof(hardlink_path)) == 0;
+        char data_root[PATH_MAX];
+        join_path(data_root, sizeof(data_root), container, "data/HL");
+        char payload[PATH_MAX];
+        struct stat hardlink_stat = {0};
+        int representative_payload = 0;
+        int hardlink_payload = 0;
+        if (representative_path_ok && hardlink_path_ok) {
+            join_path(payload, sizeof(payload), data_root, representative_path);
+            representative_payload = file_equals(payload, "hardlink-content");
+            join_path(payload, sizeof(payload), data_root, hardlink_path);
+            hardlink_payload = lstat(payload, &hardlink_stat) == 0 &&
+                               S_ISREG(hardlink_stat.st_mode) &&
+                               hardlink_stat.st_size == 0;
+        }
+        check(representative_payload && hardlink_payload,
+              "regular payload is copied once and HARDLINK payload is empty");
+
+        check(sidecar_log_find(&log, bytes("HL"), bytes("single"),
+                               &single_view) == 1 &&
+                  single_view.entry->kind == SIDECAR_KIND_REGULAR,
+              "a singly-linked file remains REGULAR");
+
+        struct stat representative_before = {0};
+        int representative_stat_ok = representative_path_ok;
+        if (representative_stat_ok) {
+            join_path(payload, sizeof(payload), data_root, representative_path);
+            representative_stat_ok = stat(payload, &representative_before) == 0;
+        }
+        sidecar_log_close(&log);
+
+        PortablePrescanReport report;
+        portable_prescan_report_init(&report);
+        check(portable_capture_resume_at(container_fd, &request, &report) == 0,
+              "unchanged hardlink group resumes successfully");
+        portable_prescan_report_free(&report);
+
+        open_status = sidecar_log_adopt_at(container_fd, &log);
+        SidecarLiveView resumed_first = {0};
+        SidecarLiveView resumed_second = {0};
+        int resumed_pair = open_status == SIDECAR_OPEN_RESUMABLE &&
+                           sidecar_log_find(&log, bytes("HL"), bytes("first"),
+                                            &resumed_first) == 1 &&
+                           sidecar_log_find(&log, bytes("HL"), bytes("second"),
+                                            &resumed_second) == 1;
+        check(resumed_pair &&
+                  ((resumed_first.entry->kind == SIDECAR_KIND_HARDLINK) !=
+                   (resumed_second.entry->kind == SIDECAR_KIND_HARDLINK)),
+              "resume preserves the hardlink classification");
+        if (representative_stat_ok) {
+            join_path(payload, sizeof(payload), data_root, representative_path);
+            struct stat representative_after = {0};
+            check(stat(payload, &representative_after) == 0 &&
+                      representative_after.st_ino == representative_before.st_ino &&
+                      representative_after.st_mtim.tv_sec ==
+                          representative_before.st_mtim.tv_sec &&
+                      representative_after.st_mtim.tv_nsec ==
+                          representative_before.st_mtim.tv_nsec,
+                  "resume does not rewrite an unchanged representative payload");
+        }
+        sidecar_log_close(&log);
+    }
+    close(container_fd);
+    remove_tree(source);
+    remove_tree(container);
+}
+
+static void test_portable_hardlinks_cross_root(const char *base)
+{
+    printf(BLUE "::" NC " portable hardlink groups across roots\n");
+    char source_a[PATH_MAX];
+    char source_b[PATH_MAX];
+    char container[PATH_MAX];
+    char file_a[PATH_MAX];
+    char file_b[PATH_MAX];
+    join_path(source_a, sizeof(source_a), base, "hardlink-cross-a");
+    join_path(source_b, sizeof(source_b), base, "hardlink-cross-b");
+    join_path(container, sizeof(container), base, "hardlink-cross-container");
+    join_path(file_a, sizeof(file_a), source_a, "file");
+    join_path(file_b, sizeof(file_b), source_b, "alias");
+    make_directory(source_a);
+    make_directory(source_b);
+    make_directory(container);
+    write_file(file_a, "cross-root", 10);
+    if (link(file_a, file_b) != 0)
+        fixture_fatal("could not create cross-root hardlink");
+
+    int container_fd = open(container, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open cross-root hardlink container");
+    PortableRootSpec roots[] = {
+        root_spec("ROOT_A", source_a, "A"),
+        root_spec("ROOT_B", source_b, "B")
+    };
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .roots = roots,
+        .root_count = 2,
+        .nsec_exact = 1,
+        .case_sensitive = 1
+    };
+    check(portable_capture_fresh_at(container_fd, &request, NULL) == 0,
+          "cross-root hardlink capture succeeds");
+    SidecarLog log = {0};
+    SidecarOpenStatus status = sidecar_log_adopt_at(container_fd, &log);
+    SidecarLiveView first = {0};
+    SidecarLiveView second = {0};
+    int found = status == SIDECAR_OPEN_RESUMABLE &&
+                sidecar_log_find(&log, bytes("ROOT_A"), bytes("file"),
+                                 &first) == 1 &&
+                sidecar_log_find(&log, bytes("ROOT_B"), bytes("alias"),
+                                 &second) == 1;
+    check(found && first.entry->kind == SIDECAR_KIND_REGULAR &&
+              second.entry->kind == SIDECAR_KIND_HARDLINK,
+          "the second root records a cross-root HARDLINK");
+    check(found && sidecar_bytes_match_text(second.entry->hardlink_root_id,
+                                            "ROOT_A") &&
+              second.entry->hardlink_logical_path.length ==
+                  first.entry->logical_path.length &&
+              memcmp(second.entry->hardlink_logical_path.data,
+                     first.entry->logical_path.data,
+                     first.entry->logical_path.length) == 0,
+          "cross-root HARDLINK references the first root's representative");
+    sidecar_log_close(&log);
+    close(container_fd);
+    remove_tree(source_a);
+    remove_tree(source_b);
+    remove_tree(container);
+}
+
+static void test_portable_hardlinks_collision(const char *base)
+{
+    printf(BLUE "::" NC " hardlinks under a suffixed collision parent\n");
+    char source[PATH_MAX];
+    char container[PATH_MAX];
+    char upper[PATH_MAX];
+    char lower[PATH_MAX];
+    char target[PATH_MAX];
+    char alias[PATH_MAX];
+    join_path(source, sizeof(source), base, "hardlink-collision-source");
+    join_path(container, sizeof(container), base,
+              "hardlink-collision-container");
+    join_path(upper, sizeof(upper), source, "Foo");
+    join_path(lower, sizeof(lower), source, "foo");
+    join_path(target, sizeof(target), lower, "target");
+    join_path(alias, sizeof(alias), lower, "alias");
+    make_directory(source);
+    make_directory(container);
+    make_directory(upper);
+    make_directory(lower);
+    write_file(target, "collision-hardlink", 18);
+    if (link(target, alias) != 0)
+        fixture_fatal("could not create collision hardlink");
+
+    int container_fd = open(container, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open collision hardlink container");
+    PortableRootSpec root = root_spec("CASE", source, "CASE");
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .roots = &root,
+        .root_count = 1,
+        .nsec_exact = 1,
+        .case_sensitive = 0
+    };
+    check(portable_capture_fresh_at(container_fd, &request, NULL) == 0,
+          "hardlink capture under a case collision succeeds");
+    SidecarLog log = {0};
+    SidecarOpenStatus status = sidecar_log_adopt_at(container_fd, &log);
+    SidecarLiveView target_view = {0};
+    SidecarLiveView alias_view = {0};
+    int found = status == SIDECAR_OPEN_RESUMABLE &&
+                sidecar_log_find(&log, bytes("CASE"), bytes("foo/target"),
+                                 &target_view) == 1 &&
+                sidecar_log_find(&log, bytes("CASE"), bytes("foo/alias"),
+                                 &alias_view) == 1;
+    char target_physical[PATH_MAX];
+    char alias_physical[PATH_MAX];
+    int paths_ok = found &&
+                   sidecar_view_physical_path(&target_view, target_physical,
+                                              sizeof(target_physical)) == 0 &&
+                   sidecar_view_physical_path(&alias_view, alias_physical,
+                                              sizeof(alias_physical)) == 0;
+    check(paths_ok && strncmp(target_physical, "foo%7E1/", 8) == 0 &&
+              strncmp(alias_physical, "foo%7E1/", 8) == 0,
+          "hardlink payload paths inherit the collision suffix");
+    check(found && ((target_view.entry->kind == SIDECAR_KIND_HARDLINK) !=
+                   (alias_view.entry->kind == SIDECAR_KIND_HARDLINK)),
+          "collision planning does not duplicate the hardlink group");
+    sidecar_log_close(&log);
+    close(container_fd);
+    remove_tree(source);
+    remove_tree(container);
+}
+
 static void test_replacement_and_type_change(const char *source,
                                              const char *base_path)
 {
@@ -2875,6 +3234,9 @@ int main(void)
     test_prescan_multiple_roots(root_path);
     test_root_payload_namespace(root_path);
     test_fresh_capture(source_path, container_fd, container_path);
+    test_portable_hardlinks(root_path);
+    test_portable_hardlinks_cross_root(root_path);
+    test_portable_hardlinks_collision(root_path);
     test_capture_context_flags(root_path);
     test_replacement_and_type_change(source_path, root_path);
     test_unsupported_types(source_path, root_path);

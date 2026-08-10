@@ -120,6 +120,7 @@ typedef struct PortableCaptureContext {
     int resume_mode;
     const PortableCollisionPlan *collision_plan;
     void *visited;
+    void *inode_map;
     void *owned_paths;
 } PortableCaptureContext;
 

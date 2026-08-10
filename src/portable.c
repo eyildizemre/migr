@@ -1112,10 +1112,14 @@ int entry_from_stat(const char *root_id, const char *logical,
                     const char *physical, const char *collision_suffix,
                     const struct stat *st, int nsec_exact,
                     PortableXattrs *xattrs, SidecarEntry *out,
-                    const SidecarBytes *symlink_target)
+                    const SidecarBytes *symlink_target,
+                    const SidecarBytes *hardlink_root_id,
+                    const SidecarBytes *hardlink_logical_path)
 {
     int64_t atime_sec;
     int64_t mtime_sec;
+    int hardlink_requested = hardlink_root_id != NULL ||
+                             hardlink_logical_path != NULL;
     if (root_id == NULL || logical == NULL || physical == NULL ||
         collision_suffix == NULL ||
         st == NULL || out == NULL ||
@@ -1128,6 +1132,19 @@ int entry_from_stat(const char *root_id, const char *logical,
     if (st->st_atim.tv_nsec < 0 || st->st_atim.tv_nsec > SIDECAR_MAX_NSEC ||
         st->st_mtim.tv_nsec < 0 || st->st_mtim.tv_nsec > SIDECAR_MAX_NSEC)
         return -1;
+    if (hardlink_requested &&
+        (hardlink_root_id == NULL || hardlink_logical_path == NULL ||
+         !S_ISREG(st->st_mode) || symlink_target != NULL ||
+         (xattrs != NULL && xattrs->count != 0) ||
+         hardlink_root_id->data == NULL || hardlink_root_id->length == 0 ||
+         hardlink_root_id->length > SIDECAR_MAX_ROOT_ID ||
+         memchr(hardlink_root_id->data, '\0', hardlink_root_id->length) != NULL ||
+         hardlink_logical_path->data == NULL ||
+         hardlink_logical_path->length == 0 ||
+         hardlink_logical_path->length > SIDECAR_MAX_PATH ||
+         memchr(hardlink_logical_path->data, '\0',
+                hardlink_logical_path->length) != NULL))
+        return -1;
 
     memset(out, 0, sizeof(*out));
     out->root_id = (SidecarBytes){ (const unsigned char *)root_id,
@@ -1138,7 +1155,9 @@ int entry_from_stat(const char *root_id, const char *logical,
                                          strlen(physical) };
     out->collision_suffix = (SidecarBytes){
         (const unsigned char *)collision_suffix, strlen(collision_suffix) };
-    if (S_ISLNK(st->st_mode))
+    if (hardlink_requested)
+        out->kind = SIDECAR_KIND_HARDLINK;
+    else if (S_ISLNK(st->st_mode))
         out->kind = SIDECAR_KIND_SYMLINK;
     else if (S_ISREG(st->st_mode))
         out->kind = SIDECAR_KIND_REGULAR;
@@ -1151,9 +1170,16 @@ int entry_from_stat(const char *root_id, const char *logical,
     out->mtime_sec = mtime_sec;
     out->atime_nsec = nsec_exact ? (uint32_t)st->st_atim.tv_nsec : 0;
     out->mtime_nsec = nsec_exact ? (uint32_t)st->st_mtim.tv_nsec : 0;
-    out->size = S_ISREG(st->st_mode) ? (uint64_t)st->st_size : 0;
-    out->xattr_count = xattrs == NULL ? 0U : (uint32_t)xattrs->count;
-    if (out->kind == SIDECAR_KIND_SYMLINK) {
+    out->size = out->kind == SIDECAR_KIND_HARDLINK
+                    ? 0U
+                    : (S_ISREG(st->st_mode) ? (uint64_t)st->st_size : 0U);
+    out->xattr_count = out->kind == SIDECAR_KIND_HARDLINK
+                           ? 0U
+                           : (xattrs == NULL ? 0U : (uint32_t)xattrs->count);
+    if (out->kind == SIDECAR_KIND_HARDLINK) {
+        out->hardlink_root_id = *hardlink_root_id;
+        out->hardlink_logical_path = *hardlink_logical_path;
+    } else if (out->kind == SIDECAR_KIND_SYMLINK) {
         if (symlink_target == NULL || symlink_target->data == NULL ||
             symlink_target->length == 0)
             return -1;
@@ -1492,6 +1518,166 @@ static int visited_contains(const PortableVisited *visited,
     if (location < 0)
         return -1;
     return location == 1 ? 1 : 0;
+}
+
+typedef struct {
+    dev_t device;
+    ino_t inode;
+    char *root_id;
+    char *logical_path;
+    size_t root_length;
+    size_t logical_length;
+    uint64_t hash;
+} PortableInodeSlot;
+
+typedef struct {
+    PortableInodeSlot *slots;
+    size_t count;
+    size_t capacity;
+    uint64_t hash_salt;
+} PortableInodeMap;
+
+static uint64_t inode_map_hash(const PortableInodeMap *map, dev_t device,
+                               ino_t inode)
+{
+    uint64_t hash = UINT64_C(1469598103934665603) ^ map->hash_salt;
+    hash = visited_fnv1a_uint64(hash, (uint64_t)device);
+    return visited_fnv1a_uint64(hash, (uint64_t)inode);
+}
+
+static int inode_map_rehash(PortableInodeMap *map, size_t new_capacity)
+{
+    if (map == NULL || !visited_capacity_valid(new_capacity) ||
+        new_capacity > visited_max_capacity() ||
+        new_capacity > SIZE_MAX / sizeof(*map->slots))
+        return -1;
+
+    PortableInodeSlot *new_slots = calloc(new_capacity,
+                                          sizeof(*new_slots));
+    if (new_slots == NULL)
+        return -1;
+
+    for (size_t old_index = 0; old_index < map->capacity; old_index++) {
+        PortableInodeSlot *old_slot = &map->slots[old_index];
+        if (old_slot->root_id == NULL)
+            continue;
+        size_t index = (size_t)old_slot->hash & (new_capacity - 1U);
+        while (new_slots[index].root_id != NULL)
+            index = (index + 1U) & (new_capacity - 1U);
+        new_slots[index] = *old_slot;
+    }
+
+    free(map->slots);
+    map->slots = new_slots;
+    map->capacity = new_capacity;
+    return 0;
+}
+
+static int inode_map_locate(const PortableInodeMap *map, dev_t device,
+                            ino_t inode, uint64_t hash, size_t *out_index)
+{
+    if (map == NULL || out_index == NULL)
+        return -1;
+    if (map->capacity == 0) {
+        *out_index = SIZE_MAX;
+        return 0;
+    }
+
+    size_t index = (size_t)hash & (map->capacity - 1U);
+    for (size_t probes = 0; probes < map->capacity; probes++) {
+        const PortableInodeSlot *slot = &map->slots[index];
+        if (slot->root_id == NULL) {
+            *out_index = index;
+            return 0;
+        }
+        if (slot->hash == hash && slot->device == device &&
+            slot->inode == inode) {
+            *out_index = index;
+            return 1;
+        }
+        index = (index + 1U) & (map->capacity - 1U);
+    }
+
+    *out_index = SIZE_MAX;
+    return -1;
+}
+
+/* Returns 0 for a new representative and 1 for a hardlink member. */
+static int inode_map_find_or_insert(PortableInodeMap *map, dev_t device,
+                                    ino_t inode, const char *root_id,
+                                    const char *logical,
+                                    const PortableInodeSlot **out_slot)
+{
+    if (map == NULL || root_id == NULL || logical == NULL || out_slot == NULL)
+        return -1;
+    *out_slot = NULL;
+    size_t root_length = strlen(root_id);
+    size_t logical_length = strlen(logical);
+    if (root_length == SIZE_MAX || logical_length == SIZE_MAX ||
+        root_length > SIDECAR_MAX_ROOT_ID || logical_length > SIDECAR_MAX_PATH)
+        return -1;
+
+    uint64_t hash = inode_map_hash(map, device, inode);
+    if (map->capacity == 0 &&
+        inode_map_rehash(map, VISITED_INITIAL_CAPACITY) != 0)
+        return -1;
+
+    size_t index = SIZE_MAX;
+    int location = inode_map_locate(map, device, inode, hash, &index);
+    if (location == 1) {
+        *out_slot = &map->slots[index];
+        return 1;
+    }
+    if (location < 0)
+        return -1;
+    if (map->count >= SIDECAR_MAX_LIVE_ENTRIES)
+        return -1;
+
+    if (map->count + 1U > map->capacity / 2U) {
+        if (map->capacity > visited_max_capacity() / 2U ||
+            inode_map_rehash(map, map->capacity * 2U) != 0)
+            return -1;
+        location = inode_map_locate(map, device, inode, hash, &index);
+        if (location != 0)
+            return -1;
+    }
+
+    char *root_copy = malloc(root_length + 1U);
+    if (root_copy == NULL)
+        return -1;
+    char *logical_copy = malloc(logical_length + 1U);
+    if (logical_copy == NULL) {
+        free(root_copy);
+        return -1;
+    }
+    memcpy(root_copy, root_id, root_length + 1U);
+    memcpy(logical_copy, logical, logical_length + 1U);
+
+    PortableInodeSlot *slot = &map->slots[index];
+    *slot = (PortableInodeSlot){
+        .device = device,
+        .inode = inode,
+        .root_id = root_copy,
+        .logical_path = logical_copy,
+        .root_length = root_length,
+        .logical_length = logical_length,
+        .hash = hash
+    };
+    map->count++;
+    *out_slot = slot;
+    return 0;
+}
+
+static void inode_map_free(PortableInodeMap *map)
+{
+    if (map == NULL)
+        return;
+    for (size_t index = 0; index < map->capacity; index++) {
+        free(map->slots[index].root_id);
+        free(map->slots[index].logical_path);
+    }
+    free(map->slots);
+    free(map);
 }
 
 typedef struct {
@@ -3059,7 +3245,7 @@ static int capture_directory(PortableCaptureContext *context,
     SidecarEntry sidecar_entry;
     if (entry_from_stat(root->id, logical, physical, collision_suffix, before,
                         context->nsec_exact,
-                        xattrs, &sidecar_entry, NULL) != 0 ||
+                        xattrs, &sidecar_entry, NULL, NULL, NULL) != 0 ||
         append_group(context, &sidecar_entry, xattrs) != 0) {
         pending_readback_names_free(&pending);
         xattrs_free(xattrs);
@@ -3152,7 +3338,7 @@ static int capture_regular(PortableCaptureContext *context,
     failed = entry_from_stat(root->id, logical, physical, collision_suffix,
                              before,
                              context->nsec_exact,
-                             xattrs, &sidecar_entry, NULL) != 0 ||
+                             xattrs, &sidecar_entry, NULL, NULL, NULL) != 0 ||
              append_group(context, &sidecar_entry, xattrs) != 0;
     xattrs_free(xattrs);
     return failed ? -1 : 0;
@@ -3253,7 +3439,7 @@ static int capture_symlink(PortableCaptureContext *context,
     SidecarEntry entry;
     if (entry_from_stat(root->id, logical, physical, collision_suffix, before,
                         context->nsec_exact,
-                        &xattrs, &entry, &target_bytes) != 0) {
+                        &xattrs, &entry, &target_bytes, NULL, NULL) != 0) {
         xattrs_free(&xattrs);
         return -1;
     }
@@ -3338,6 +3524,117 @@ static int capture_symlink(PortableCaptureContext *context,
     return failed ? -1 : 0;
 }
 
+static int capture_hardlink(PortableCaptureContext *context,
+                            const PortableRootSpec *root,
+                            const char *logical, const char *physical,
+                            const char *collision_suffix,
+                            int source_fd, const struct stat *before,
+                            int destination_parent,
+                            const char *destination_leaf,
+                            int destination_is_root,
+                            const PortableInodeSlot *representative)
+{
+    if (context == NULL || root == NULL || logical == NULL ||
+        physical == NULL || collision_suffix == NULL || source_fd < 0 ||
+        before == NULL || representative == NULL)
+        return -1;
+
+    SidecarBytes hardlink_root_id = {
+        (const unsigned char *)representative->root_id,
+        representative->root_length
+    };
+    SidecarBytes hardlink_logical_path = {
+        (const unsigned char *)representative->logical_path,
+        representative->logical_length
+    };
+    SidecarEntry entry;
+    PortableXattrs empty_xattrs = {0};
+    if (entry_from_stat(root->id, logical, physical, collision_suffix, before,
+                        context->nsec_exact, &empty_xattrs, &entry, NULL,
+                        &hardlink_root_id, &hardlink_logical_path) != 0) {
+        close(source_fd);
+        return -1;
+    }
+
+    if (context->resume_mode) {
+        SidecarBytes root_key = {
+            (const unsigned char *)root->id, strlen(root->id)
+        };
+        SidecarBytes logical_key = {
+            (const unsigned char *)logical, strlen(logical)
+        };
+        SidecarLiveView previous;
+        int live = sidecar_log_find(context->sidecar, root_key, logical_key,
+                                    &previous);
+        if (live < 0) {
+            close(source_fd);
+            return -1;
+        }
+        if (live == 1 && entries_equal(&entry, &previous, &empty_xattrs)) {
+            int payload = existing_payload_matches(
+                context->data_fd, root->payload_path, destination_parent,
+                destination_leaf, destination_is_root, 0);
+            if (payload < 0) {
+                close(source_fd);
+                return -1;
+            }
+            if (payload == 1)
+                return close(source_fd) == 0 ? 0 : -1;
+        }
+    }
+
+    int parent_fd = destination_parent;
+    char root_leaf[NAME_MAX + 1U];
+    if (destination_is_root) {
+        if (open_payload_parent(context->data_fd, root->payload_path,
+                                &parent_fd, root_leaf,
+                                sizeof(root_leaf)) != 0) {
+            close(source_fd);
+            return -1;
+        }
+        destination_leaf = root_leaf;
+    }
+    if (capture_destination_is_safe(context, root, logical, physical,
+                                    parent_fd, destination_leaf) != 0 ||
+        replace_live_capture(context, root, logical, physical) != 0) {
+        if (destination_is_root)
+            close(parent_fd);
+        close(source_fd);
+        return -1;
+    }
+    if (tombstone_destination_children(context, root->id, logical, parent_fd,
+                                       destination_leaf) != 0) {
+        if (destination_is_root)
+            close(parent_fd);
+        close(source_fd);
+        return -1;
+    }
+
+    int destination_fd;
+    portable_test_interrupt_if(PORTABLE_TEST_BEFORE_PAYLOAD_REPLACE);
+    if (ensure_regular_leaf(parent_fd, destination_leaf, &destination_fd) != 0) {
+        if (destination_is_root)
+            close(parent_fd);
+        close(source_fd);
+        return -1;
+    }
+    portable_test_interrupt_if(PORTABLE_TEST_AFTER_PAYLOAD_REPLACE);
+
+    struct stat after;
+    int failed = fstat(source_fd, &after) != 0 ||
+                 !metadata_source_unchanged(before, &after);
+    if (close(destination_fd) != 0)
+        failed = 1;
+    if (destination_is_root && close(parent_fd) != 0)
+        failed = 1;
+    if (close(source_fd) != 0)
+        failed = 1;
+    if (failed)
+        return -1;
+
+    return append_group(context, &entry, NULL) == 0 ? 0 : -1;
+}
+
 static int capture_node(PortableCaptureContext *context,
                         const PortableRootSpec *root,
                         const char *logical, const char *physical,
@@ -3390,13 +3687,33 @@ static int capture_node(PortableCaptureContext *context,
         return -1;
     }
 
-    PortableXattrs xattrs;
-    if (collect_xattrs(source_fd, &xattrs) != 0) {
+    if (visited_add(context->visited, root->id, logical) != 0) {
         close(source_fd);
         return -1;
     }
-    if (visited_add(context->visited, root->id, logical) != 0) {
-        xattrs_free(&xattrs);
+
+    const PortableInodeSlot *representative = NULL;
+    if (S_ISREG(before.st_mode)) {
+        int inode_state = inode_map_find_or_insert(
+            context->inode_map, opened.st_dev, opened.st_ino, root->id,
+            logical, &representative);
+        if (inode_state < 0) {
+            close(source_fd);
+            return -1;
+        }
+        int same_logical_entry = inode_state == 1 && representative != NULL &&
+                                 strcmp(representative->root_id, root->id) == 0 &&
+                                 strcmp(representative->logical_path, logical) == 0;
+        if (inode_state == 1 && !same_logical_entry) {
+            return capture_hardlink(context, root, logical, physical,
+                                    collision_suffix, source_fd, &before,
+                                    destination_parent, destination_leaf,
+                                    is_root, representative);
+        }
+    }
+
+    PortableXattrs xattrs;
+    if (collect_xattrs(source_fd, &xattrs) != 0) {
         close(source_fd);
         return -1;
     }
@@ -3421,7 +3738,7 @@ static int capture_node(PortableCaptureContext *context,
             int matches = entry_from_stat(root->id, logical, physical,
                                           collision_suffix, &before,
                                           context->nsec_exact, &xattrs,
-                                          &current, NULL) == 0 &&
+                                          &current, NULL, NULL, NULL) == 0 &&
                           entries_equal(&current, &previous, &xattrs);
             if (matches) {
                 int payload = existing_payload_matches(
@@ -4918,12 +5235,20 @@ int portable_capture_context_init(PortableCaptureContext *context,
         free(visited);
         return -1;
     }
+    PortableInodeMap *inode_map = calloc(1, sizeof(*inode_map));
+    if (inode_map == NULL) {
+        free(owned_paths);
+        free(visited);
+        return -1;
+    }
     context->data_fd = data_fd;
     context->sidecar = sidecar;
     context->nsec_exact = nsec_exact != 0;
     context->case_sensitive = case_sensitive != 0;
     visited->hash_salt = sidecar_process_salt();
+    inode_map->hash_salt = sidecar_process_salt();
     context->visited = visited;
+    context->inode_map = inode_map;
     context->owned_paths = owned_paths;
     return 0;
 }
@@ -4933,6 +5258,7 @@ void portable_capture_context_close(PortableCaptureContext *context)
     if (context == NULL)
         return;
     visited_free(context->visited);
+    inode_map_free(context->inode_map);
     portable_owned_paths_free(context->owned_paths);
     free(context->owned_paths);
     memset(context, 0, sizeof(*context));
@@ -4942,9 +5268,11 @@ int portable_capture_root(PortableCaptureContext *context,
                           const PortableRootSpec *root)
 {
     if (context == NULL || context->visited == NULL ||
+        context->inode_map == NULL ||
         context->data_fd < 0 || context->sidecar == NULL ||
         !root_spec_valid(root))
         return -1;
+    /* visited is root-local; inode_map spans every root in this context. */
     PortableVisited *visited = context->visited;
     if (visited_reset(visited) != 0)
         return -1;
