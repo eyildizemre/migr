@@ -1540,3 +1540,100 @@ a nested directory with 2,000 descendants.
 
 Production portable dispatch remains disabled under D14; all of these paths are
 reachable only through the existing test-only seam.
+
+---
+
+## D22 — 2026-08-11 — Hardlink handling: group reference, placeholder node, sticky-seed representative
+
+**Status:** Decided (locked in planning; implementation follows in G.1–G.9)
+
+**Decision:** Portable capture records the first-seen member of each `(st_dev,
+st_ino)` group as a regular file and later members as hardlink records carrying
+a group reference; every record still owns a payload node, with hardlink nodes
+represented by empty placeholders. Portable restore replays the group with
+`link()`. Native fresh capture preserves hardlink identity with real `link()`,
+while native restore continues to duplicate because it reads no sidecar; resume
+representatives are sticky-seeded from the existing sidecar state before the
+walk.
+
+### G-1 — Portable payload node: placeholder (D18 pattern)
+
+Every hardlink record owns its own zero-byte payload node. The first-seen
+representative carries the regular-file bytes; later hardlink members carry
+empty placeholders, and restore creates the links between those nodes. This
+keeps D18's live-key-to-payload-node invariant universal. Node-less records are
+rejected because they would require a separate restore branch and break that
+invariant. The rule does not alter D21 F-5's separate root-payload namespace.
+
+### G-2 — Restore ordering: capture's first-seen-first order
+
+The sidecar record order is authoritative: capture writes the first-seen
+representative as `REGULAR` before its hardlink members. Restore trusts that
+order, and a `HARDLINK` record whose referenced `REGULAR` record is absent is
+malformed and refused fail-closed. A two-pass restore is rejected as replay
+architecture bloat; deferred binding is rejected because it adds memory and
+postpones an unresolved-reference failure until the end.
+
+### G-3 — Cross-root reference validation
+
+`hardlink_root_id` may refer to a different manifest root. Restore must verify
+that the referenced root is present in the same container manifest before
+following the group reference. A missing root makes the group malformed and is
+refused fail-closed rather than guessed or silently copied.
+
+### G-4 — Xattr only on the representative member
+
+Capture collects extended attributes only for the first, `REGULAR` member; a
+`HARDLINK` record carries no xattrs. Because restore's `link()` shares the
+representative inode, its xattrs arrive automatically, so a second
+`setxattr` on the linked member is unnecessary and introduces avoidable risk
+under SELinux. A hardlink record with `xattr_count != 0` is malformed and is
+refused. This closes the hardlink xattr-sharing debt left by D20 E-10.
+
+### G-5 — Native fresh capture links; native restore duplicates
+
+Native fresh capture preserves hardlink identity with a real `link()`: a later
+occurrence of an already-seen `(st_dev, st_ino)` group links to the captured
+representative instead of recopying its bytes. Native restore continues to
+duplicate, as recorded by the sidecar plan's native column, because it has no
+hardlink record and reads no sidecar; a manifest v2 for native restore is out
+of scope. Native resume's stale/deleted handling remains Phase H's debt because
+native capture keeps no committed-key log.
+
+### G-6 — Resume representative stability: sticky-seed
+
+`readdir()` order is not stable across runs, and the Phase F resume-renumbering
+bug (`6e43026`) demonstrated the cost of treating a resumed walk as fresh. At
+the point where `portable_owned_paths_load` already scans the sidecar once,
+resume also reads each live entry's kind. A live `REGULAR` path that still
+carries the same inode seeds that inode's representative in the map before the
+walk, so other members encountered later become `HARDLINK` records
+automatically. If the former representative is gone from the source, the map
+starts empty for that inode and G-2's first-seen rule is the fallback. This
+follows the proven `prepare_collision_relocations` pattern: read current state
+from the sidecar first, then steer the walk.
+
+**Why:** Hardlink identity is part of filesystem fidelity, so portable capture
+must preserve one inode group without creating a second copy of its bytes or
+silently losing the relationship. Empty placeholder nodes preserve D18's
+universal payload invariant while record order gives restore a single-pass,
+bounded binding rule. Manifest roots and representative-only xattrs keep
+references and metadata explicit and fail-closed. Native capture can preserve
+the relationship directly with `link()` without expanding native restore into
+a sidecar reader, and sticky seeding prevents an unchanged resumed source from
+being needlessly rewritten merely because directory enumeration order changed.
+
+**Rejected:** node-less hardlink records, because they break D18's payload-node
+invariant; two-pass restore, because it bloats the replay architecture; deferred
+binding, because unresolved references would be discovered only after the walk;
+rebuilding an empty inode map on every resume, because unstable enumeration can
+flip the representative and force needless rewrites; and a manifest v2 for
+native restore, because native restore does not consume sidecar state and that
+compatibility expansion is outside G-5.
+
+**Relationship:** D22 preserves D17/D18's metadata and payload-node invariant,
+extends D19's encoded physical-path rules to hardlink groups, and closes the
+xattr-sharing debt explicitly left by D20 E-10. D21's collision suffixes and
+hardlink groups both shape the physical payload paths, while D14's test-only
+boundary remains in force through Phase G. Native stale-entry reconciliation is
+left to Phase H, and sparse-file handling remains governed by D13.

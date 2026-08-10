@@ -460,8 +460,13 @@ in G), so no single phase carries "make everything faithful at once."
   Arch/Ubuntu/Fedora VM-gate matrix passed, including real vfat ASCII and
   measured non-ASCII fold resolution, resume renumbering, and the
   destination-probed root-namespace collision gate.
-- **Phase G — Hardlinks.** `(st_dev, st_ino)` grouping; native `link()` / portable dense
-  copy; space accounting in the pre-scan.
+- **Phase G — Hardlinks.** **Status: in progress (2026-08-11, D22).** Group
+  reference via `(st_dev, st_ino)`; portable hardlink records carry an empty
+  placeholder node (D18 pattern) and restore replays the group with `link()`;
+  native fresh capture preserves identity with `link()` while native restore
+  keeps duplicating (documented debt); resume representatives are
+  sticky-seeded from the sidecar to stay stable across `readdir` order
+  changes.
 - **Phase H — Resume.** Sidecar as the comparison oracle (true size+mtime+type); the
   deletion/precedence algorithm selected in B; drop stale entries. Commit-ordering is
   already in place from B.
