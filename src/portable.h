@@ -190,6 +190,12 @@ typedef enum {
 void portable_capture_test_set_interrupt(PortableTestInterruptPoint point);
 uint64_t portable_capture_test_case_fs_probe_count(void);
 void portable_capture_test_reset_case_fs_probe_count(void);
+uint64_t portable_capture_test_inode_map_probe_count(void);
+void portable_capture_test_reset_inode_map_probe_count(void);
+uint64_t portable_capture_test_prescan_inode_probe_count(void);
+void portable_capture_test_reset_prescan_inode_probe_count(void);
+uint64_t portable_capture_test_sticky_seed_lstat_count(void);
+void portable_capture_test_reset_sticky_seed_lstat_count(void);
 uint64_t portable_capture_test_relocation_scan_count(void);
 void portable_capture_test_reset_relocation_scan_count(void);
 uint64_t portable_capture_test_relocation_remove_count(void);

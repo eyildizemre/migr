@@ -113,6 +113,9 @@ static uint64_t portable_test_case_probe_count;
 static uint64_t portable_test_case_fs_probe_count;
 static uint64_t portable_test_relocation_scan_count;
 static uint64_t portable_test_relocation_remove_count;
+static uint64_t portable_test_inode_map_probe_count;
+static uint64_t portable_test_prescan_inode_probe_count;
+static uint64_t portable_test_sticky_seed_lstat_count;
 
 static void visited_count_probe(void)
 {
@@ -160,6 +163,36 @@ void portable_capture_test_reset_case_fs_probe_count(void)
     portable_test_case_fs_probe_count = 0;
 }
 
+uint64_t portable_capture_test_inode_map_probe_count(void)
+{
+    return portable_test_inode_map_probe_count;
+}
+
+void portable_capture_test_reset_inode_map_probe_count(void)
+{
+    portable_test_inode_map_probe_count = 0;
+}
+
+uint64_t portable_capture_test_prescan_inode_probe_count(void)
+{
+    return portable_test_prescan_inode_probe_count;
+}
+
+void portable_capture_test_reset_prescan_inode_probe_count(void)
+{
+    portable_test_prescan_inode_probe_count = 0;
+}
+
+uint64_t portable_capture_test_sticky_seed_lstat_count(void)
+{
+    return portable_test_sticky_seed_lstat_count;
+}
+
+void portable_capture_test_reset_sticky_seed_lstat_count(void)
+{
+    portable_test_sticky_seed_lstat_count = 0;
+}
+
 uint64_t portable_capture_test_relocation_scan_count(void)
 {
     return portable_test_relocation_scan_count;
@@ -188,6 +221,24 @@ static void case_fs_probe_count(void)
         portable_test_case_fs_probe_count++;
 }
 
+static void inode_map_count_probe(void)
+{
+    if (portable_test_inode_map_probe_count != UINT64_MAX)
+        portable_test_inode_map_probe_count++;
+}
+
+static void prescan_inode_count_probe(void)
+{
+    if (portable_test_prescan_inode_probe_count != UINT64_MAX)
+        portable_test_prescan_inode_probe_count++;
+}
+
+static void sticky_seed_count_lstat(void)
+{
+    if (portable_test_sticky_seed_lstat_count != UINT64_MAX)
+        portable_test_sticky_seed_lstat_count++;
+}
+
 static void relocation_scan_count(void)
 {
     if (portable_test_relocation_scan_count != UINT64_MAX)
@@ -209,6 +260,18 @@ static void case_probe_count(void)
 }
 
 static void case_fs_probe_count(void)
+{
+}
+
+static void inode_map_count_probe(void)
+{
+}
+
+static void prescan_inode_count_probe(void)
+{
+}
+
+static void sticky_seed_count_lstat(void)
 {
 }
 
@@ -1596,6 +1659,7 @@ static int prescan_inode_set_locate(const PrescanInodeSet *set,
     size_t index = (size_t)hash & (set->capacity - 1U);
     for (size_t probes = 0; probes < set->capacity; probes++)
     {
+        prescan_inode_count_probe();
         const PrescanInodeSlot *slot = &set->slots[index];
         if (!slot->used)
         {
@@ -1730,6 +1794,7 @@ static int inode_map_locate(const PortableInodeMap *map, dev_t device,
 
     size_t index = (size_t)hash & (map->capacity - 1U);
     for (size_t probes = 0; probes < map->capacity; probes++) {
+        inode_map_count_probe();
         const PortableInodeSlot *slot = &map->slots[index];
         if (slot->root_id == NULL) {
             *out_index = index;
@@ -2107,8 +2172,12 @@ static int sticky_seed_callback(const SidecarLiveView *view, void *argument)
     }
 
     struct stat source_stat;
-    if (source_path_ready && lstat(source_path, &source_stat) == 0 &&
-        S_ISREG(source_stat.st_mode)) {
+    int source_exists = 0;
+    if (source_path_ready) {
+        sticky_seed_count_lstat();
+        source_exists = lstat(source_path, &source_stat) == 0;
+    }
+    if (source_exists && S_ISREG(source_stat.st_mode)) {
         const PortableInodeSlot *slot = NULL;
         if (inode_map_find_or_insert(state->inode_map, source_stat.st_dev,
                                      source_stat.st_ino, root_id, logical,
