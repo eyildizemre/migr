@@ -50,6 +50,8 @@ typedef struct {
 #define VISITED_INITIAL_CAPACITY 16U
 #define PORTABLE_MAX_READBACK_NAMES SIDECAR_MAX_LIVE_ENTRIES
 
+static void prescan_inode_set_free(void *opaque);
+
 void portable_prescan_report_init(PortablePrescanReport *report)
 {
     if (report != NULL)
@@ -62,6 +64,11 @@ void portable_prescan_report_free(PortablePrescanReport *report)
         return;
     free(report->examples);
     portable_collision_plan_free(&report->collision_plan);
+    if (report->inode_seen != NULL)
+    {
+        prescan_inode_set_free(report->inode_seen);
+        report->inode_seen = NULL;
+    }
     memset(report, 0, sizeof(*report));
 }
 
@@ -1518,6 +1525,143 @@ static int visited_contains(const PortableVisited *visited,
     if (location < 0)
         return -1;
     return location == 1 ? 1 : 0;
+}
+
+typedef struct {
+    dev_t device;
+    ino_t inode;
+    uint64_t hash;
+    int used;
+} PrescanInodeSlot;
+
+typedef struct {
+    PrescanInodeSlot *slots;
+    size_t count;
+    size_t capacity;
+    uint64_t hash_salt;
+} PrescanInodeSet;
+
+static uint64_t prescan_inode_hash(const PrescanInodeSet *set,
+                                   dev_t device, ino_t inode)
+{
+    uint64_t hash = UINT64_C(1469598103934665603) ^ set->hash_salt;
+    hash = visited_fnv1a_uint64(hash, (uint64_t)device);
+    return visited_fnv1a_uint64(hash, (uint64_t)inode);
+}
+
+static int prescan_inode_set_rehash(PrescanInodeSet *set,
+                                    size_t new_capacity)
+{
+    if (set == NULL || !visited_capacity_valid(new_capacity) ||
+        new_capacity > visited_max_capacity() ||
+        new_capacity > SIZE_MAX / sizeof(*set->slots))
+        return -1;
+
+    PrescanInodeSlot *new_slots = calloc(new_capacity,
+                                         sizeof(*new_slots));
+    if (new_slots == NULL)
+        return -1;
+
+    for (size_t old_index = 0; old_index < set->capacity; old_index++)
+    {
+        PrescanInodeSlot *old_slot = &set->slots[old_index];
+        if (!old_slot->used)
+            continue;
+        size_t index = (size_t)old_slot->hash & (new_capacity - 1U);
+        while (new_slots[index].used)
+            index = (index + 1U) & (new_capacity - 1U);
+        new_slots[index] = *old_slot;
+    }
+
+    free(set->slots);
+    set->slots = new_slots;
+    set->capacity = new_capacity;
+    return 0;
+}
+
+/* Returns 1 for an existing inode, 0 for an empty insertion slot, -1 if full. */
+static int prescan_inode_set_locate(const PrescanInodeSet *set,
+                                    dev_t device, ino_t inode, uint64_t hash,
+                                    size_t *out_index)
+{
+    if (set == NULL || out_index == NULL)
+        return -1;
+    if (set->capacity == 0)
+    {
+        *out_index = SIZE_MAX;
+        return 0;
+    }
+
+    size_t index = (size_t)hash & (set->capacity - 1U);
+    for (size_t probes = 0; probes < set->capacity; probes++)
+    {
+        const PrescanInodeSlot *slot = &set->slots[index];
+        if (!slot->used)
+        {
+            *out_index = index;
+            return 0;
+        }
+        if (slot->hash == hash && slot->device == device &&
+            slot->inode == inode)
+        {
+            *out_index = index;
+            return 1;
+        }
+        index = (index + 1U) & (set->capacity - 1U);
+    }
+
+    *out_index = SIZE_MAX;
+    return -1;
+}
+
+/* Returns 0 for a newly seen inode and 1 when it was already counted. */
+static int prescan_inode_set_find_or_insert(PrescanInodeSet *set,
+                                            dev_t device, ino_t inode)
+{
+    if (set == NULL)
+        return -1;
+
+    uint64_t hash = prescan_inode_hash(set, device, inode);
+    if (set->capacity == 0 &&
+        prescan_inode_set_rehash(set, VISITED_INITIAL_CAPACITY) != 0)
+        return -1;
+
+    size_t index = SIZE_MAX;
+    int location = prescan_inode_set_locate(set, device, inode, hash, &index);
+    if (location == 1)
+        return 1;
+    if (location < 0)
+        return -1;
+    if (set->count >= SIDECAR_MAX_LIVE_ENTRIES)
+        return -1;
+
+    if (set->count + 1U > set->capacity / 2U)
+    {
+        if (set->capacity > visited_max_capacity() / 2U ||
+            prescan_inode_set_rehash(set, set->capacity * 2U) != 0)
+            return -1;
+        location = prescan_inode_set_locate(set, device, inode, hash, &index);
+        if (location != 0)
+            return -1;
+    }
+
+    set->slots[index] = (PrescanInodeSlot){
+        .device = device,
+        .inode = inode,
+        .hash = hash,
+        .used = 1
+    };
+    set->count++;
+    return 0;
+}
+
+static void prescan_inode_set_free(void *opaque)
+{
+    PrescanInodeSet *set = opaque;
+    if (set == NULL)
+        return;
+    free(set->slots);
+    free(set);
 }
 
 typedef struct {
@@ -4835,6 +4979,39 @@ static int prescan_directory(int source_fd, const char *logical,
             if (child_result != 0) {
                 failed = 1;
                 break;
+            }
+        }
+        else if (S_ISREG(child_stat.st_mode)) {
+            int already_counted = 0;
+            if (child_stat.st_nlink > 1) {
+                PrescanInodeSet *seen = report->inode_seen;
+                if (seen == NULL) {
+                    seen = calloc(1, sizeof(*seen));
+                    report->inode_seen = seen;
+                    if (seen == NULL ||
+                        prescan_inode_set_rehash(
+                            seen, VISITED_INITIAL_CAPACITY) != 0) {
+                        failed = 1;
+                        break;
+                    }
+                    seen->hash_salt = sidecar_process_salt();
+                }
+                int seen_status = prescan_inode_set_find_or_insert(
+                    seen, child_stat.st_dev, child_stat.st_ino);
+                if (seen_status < 0) {
+                    failed = 1;
+                    break;
+                }
+                already_counted = seen_status == 1;
+            }
+            if (!already_counted) {
+                if (child_stat.st_size < 0 ||
+                    report->total_size >
+                        UINT64_MAX - (uint64_t)child_stat.st_size) {
+                    failed = 1;
+                    break;
+                }
+                report->total_size += (uint64_t)child_stat.st_size;
             }
         }
     }

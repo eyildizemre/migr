@@ -89,6 +89,8 @@ typedef struct {
     size_t example_count;
     size_t example_capacity;
     PortableCollisionPlan collision_plan;
+    uint64_t total_size; /* Dense-copy bytes; hardlink groups count once. */
+    void *inode_seen;    /* Opaque pre-scan inode set. */
 } PortablePrescanReport;
 
 void portable_prescan_report_init(PortablePrescanReport *report);

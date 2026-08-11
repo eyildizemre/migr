@@ -2749,6 +2749,14 @@ static void test_portable_hardlinks(const char *base)
         .nsec_exact = 1,
         .case_sensitive = 1
     };
+    PortablePrescanReport prescan_report;
+    portable_prescan_report_init(&prescan_report);
+    check(portable_collision_plan_build(container_fd, &request,
+                                         &prescan_report) == 0 &&
+              prescan_report.total_size == 25U &&
+              prescan_report.total_size != 41U,
+          "pre-scan counts a hardlink group once (25 bytes, not 41)");
+    portable_prescan_report_free(&prescan_report);
     check(portable_capture_fresh_at(container_fd, &request, NULL) == 0,
           "hardlink pair capture succeeds");
 
@@ -2911,6 +2919,14 @@ static void test_portable_hardlinks_cross_root(const char *base)
         .nsec_exact = 1,
         .case_sensitive = 1
     };
+    PortablePrescanReport prescan_report;
+    portable_prescan_report_init(&prescan_report);
+    check(portable_collision_plan_build(container_fd, &request,
+                                         &prescan_report) == 0 &&
+              prescan_report.total_size == 10U &&
+              prescan_report.total_size != 20U,
+          "pre-scan counts a cross-root hardlink group once");
+    portable_prescan_report_free(&prescan_report);
     check(portable_capture_fresh_at(container_fd, &request, NULL) == 0,
           "cross-root hardlink capture succeeds");
     SidecarLog log = {0};
