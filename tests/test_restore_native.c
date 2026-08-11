@@ -480,6 +480,69 @@ static void test_restores_nested_files_and_directories(void)
     remove_tree(dest_root);
 }
 
+static void test_duplicates_hardlinked_payload_files(void)
+{
+    printf(BLUE "::" NC " restore_native_at: hardlinked payload files restore as distinct inodes\n");
+
+    char source_root[PATH_MAX], dest_root[PATH_MAX];
+    fresh_mkdtemp(source_root, sizeof(source_root), "restore_src");
+    fresh_mkdtemp(dest_root, sizeof(dest_root), "restore_dst");
+
+    char payload_root[PATH_MAX], source_first[PATH_MAX], source_second[PATH_MAX];
+    join_path(payload_root, sizeof(payload_root), source_root, "payload");
+    check(mkdir(payload_root, 0755) == 0,
+          "fixture: create hardlink payload directory");
+    join_path(source_first, sizeof(source_first), payload_root, "first");
+    join_path(source_second, sizeof(source_second), payload_root, "second");
+    write_file(source_first, "hardlink-content");
+    check(link(source_first, source_second) == 0,
+          "fixture: create two hardlinked payload files");
+
+    struct stat source_first_st;
+    struct stat source_second_st;
+    int source_pair_ok = lstat(source_first, &source_first_st) == 0 &&
+                         lstat(source_second, &source_second_st) == 0 &&
+                         source_first_st.st_dev == source_second_st.st_dev &&
+                         source_first_st.st_ino == source_second_st.st_ino &&
+                         source_first_st.st_nlink == 2;
+    check(source_pair_ok,
+          "the restore fixture's payload files share one source inode");
+
+    int source_fd = open_dir_fd(source_root);
+    int dest_fd = open_dir_fd(dest_root);
+    check(restore_native_at(&RESTORE_CTX, source_fd, "payload",
+                            dest_fd, "payload") == 0,
+          "restoring a payload with hardlinked files succeeds");
+
+    char dest_first[PATH_MAX], dest_second[PATH_MAX];
+    join_path(dest_first, sizeof(dest_first), dest_root, "payload/first");
+    join_path(dest_second, sizeof(dest_second), dest_root, "payload/second");
+    struct stat dest_first_st;
+    struct stat dest_second_st;
+    int destination_files_ok = lstat(dest_first, &dest_first_st) == 0 &&
+                                lstat(dest_second, &dest_second_st) == 0 &&
+                                S_ISREG(dest_first_st.st_mode) &&
+                                S_ISREG(dest_second_st.st_mode);
+    check(destination_files_ok,
+          "both hardlinked payload paths restore as regular files");
+
+    char first_content[64], second_content[64];
+    read_file(dest_first, first_content, sizeof(first_content));
+    read_file(dest_second, second_content, sizeof(second_content));
+    check(destination_files_ok &&
+              strcmp(first_content, "hardlink-content") == 0 &&
+              strcmp(second_content, "hardlink-content") == 0,
+          "duplicated hardlink payload files preserve their content");
+    check(destination_files_ok &&
+              dest_first_st.st_ino != dest_second_st.st_ino,
+          "native restore deliberately duplicates the hardlink inode");
+
+    close(source_fd);
+    close(dest_fd);
+    remove_tree(source_root);
+    remove_tree(dest_root);
+}
+
 static void test_restores_names_with_problem_bytes(void)
 {
     printf(BLUE "::" NC " restore_native_at: native accepts every filename byte unencoded (D19)\n");
@@ -882,6 +945,7 @@ int main(void)
     test_rejects_lexically_invalid_relative_paths();
 
     test_restores_nested_files_and_directories();
+    test_duplicates_hardlinked_payload_files();
     test_restores_names_with_problem_bytes();
     test_regular_file_resume_and_overwrite();
     test_restores_fifo();

@@ -204,6 +204,14 @@ RestoreNativeStatus restore_native_metadata_inventory_at(
  * Before mutating the destination, this function runs the same recursive
  * checks exposed by restore_native_preflight_at().
  *
+ * This function does not detect or recreate hardlinks: two payload paths
+ * that share an inode in the source container are restored as two
+ * independent regular files (identical content, distinct destination
+ * inodes). This is deliberate (docs/DECISIONS.md D22 G-5) -- native
+ * restore reads no sidecar and the manifest carries no hardlink record,
+ * so hardlink identity is preserved only through native capture's link()
+ * (fileops.c's capture_hardlink_at), not through restore.
+ *
  * @param ctx                Clone orientation; must be CLONE_RESTORE +
  *                            CLONE_NATIVE_TREE.
  * @param source_root_fd      Open directory fd anchoring source_rel.

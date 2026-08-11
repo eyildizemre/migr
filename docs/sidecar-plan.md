@@ -108,7 +108,8 @@ D8 promises that a native (ext4/btrfs) backup is fully faithful and recoverable 
 
 - does **not** copy UID/GID;
 - does **not** copy xattrs/ACLs;
-- does **not** preserve hardlink identity (it duplicates).
+- does **not** preserve hardlink identity through restore (native capture now
+  links since G.4, but native restore still duplicates).
 
 So a migr backup to ext4 is currently *less* faithful than `cp -a`, and D8's claim does
 not yet hold. Therefore this is not "add a portable branch to a working engine." It is
