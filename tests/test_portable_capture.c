@@ -2885,6 +2885,206 @@ static void test_portable_hardlinks(const char *base)
     remove_tree(container);
 }
 
+static void test_portable_hardlinks_sticky_seed(const char *base)
+{
+    printf(BLUE "::" NC " resume keeps the recorded hardlink representative\n");
+    char source[PATH_MAX];
+    char container[PATH_MAX];
+    char first_path[PATH_MAX];
+    char second_path[PATH_MAX];
+    join_path(source, sizeof(source), base, "hardlink-sticky-source");
+    join_path(container, sizeof(container), base, "hardlink-sticky-container");
+    join_path(first_path, sizeof(first_path), source, "first");
+    join_path(second_path, sizeof(second_path), source, "second");
+    make_directory(source);
+    make_directory(container);
+    write_file(first_path, "sticky-content", 14);
+    if (link(first_path, second_path) != 0)
+        fixture_fatal("could not create sticky-seed hardlink pair");
+
+    char first_seen[NAME_MAX + 1U];
+    DIR *directory = opendir(source);
+    if (directory == NULL)
+        fixture_fatal("could not inspect sticky-seed source order");
+    struct dirent *entry = NULL;
+    for (;;) {
+        errno = 0;
+        entry = readdir(directory);
+        if (entry == NULL)
+            break;
+        if (strcmp(entry->d_name, ".") != 0 &&
+            strcmp(entry->d_name, "..") != 0)
+            break;
+    }
+    if (entry == NULL || strlen(entry->d_name) >= sizeof(first_seen) ||
+        (strcmp(entry->d_name, "first") != 0 &&
+         strcmp(entry->d_name, "second") != 0) ||
+        snprintf(first_seen, sizeof(first_seen), "%s", entry->d_name) < 0 ||
+        closedir(directory) != 0)
+        fixture_fatal("could not determine sticky-seed source order");
+
+    const char *old_representative = strcmp(first_seen, "first") == 0
+        ? "second" : "first";
+    const char *old_member = strcmp(old_representative, "first") == 0
+        ? "second" : "first";
+
+    int container_fd = open(container, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open sticky-seed container");
+    if (mkdirat(container_fd, "data", 0700) != 0 ||
+        mkdirat(container_fd, "data/HL", 0700) != 0)
+        fixture_fatal("could not create sticky-seed payload namespace");
+
+    char data_root[PATH_MAX];
+    char representative_payload[PATH_MAX];
+    char member_payload[PATH_MAX];
+    join_path(data_root, sizeof(data_root), container, "data/HL");
+    join_path(representative_payload, sizeof(representative_payload),
+              data_root, old_representative);
+    join_path(member_payload, sizeof(member_payload), data_root, old_member);
+    write_file(representative_payload, "sticky-content", 14);
+    write_file(member_payload, "", 0);
+
+    struct stat source_root_stat;
+    struct stat representative_stat;
+    struct stat member_stat;
+    if (stat(source, &source_root_stat) != 0 ||
+        stat(strcmp(old_representative, "first") == 0 ? first_path :
+             second_path, &representative_stat) != 0 ||
+        stat(strcmp(old_member, "first") == 0 ? first_path : second_path,
+             &member_stat) != 0)
+        fixture_fatal("could not stat sticky-seed source fixture");
+
+    int source_fd = open(strcmp(old_representative, "first") == 0
+                              ? first_path : second_path,
+                          O_RDONLY | O_NOATIME | O_CLOEXEC);
+    PortableXattrs representative_xattrs = {0};
+    if (source_fd < 0 || collect_xattrs(source_fd, &representative_xattrs) != 0 ||
+        close(source_fd) != 0)
+        fixture_fatal("could not collect sticky-seed source xattrs");
+
+    PortableRootSpec root = root_spec("HL", source, "HL");
+    ManifestRoot manifest_root = {
+        .id = "HL",
+        .policy = ROOT_POLICY_HOME_RELATIVE,
+        .payload_path = "HL",
+        .source_path = "",
+        .restore_path = "",
+        .has_restore_path = 1
+    };
+    Manifest manifest = {
+        .version = MANIFEST_CURRENT_VERSION,
+        .representation = CLONE_PORTABLE_SIDECAR,
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .sidecar_version = SIDECAR_VERSION,
+        .has_source_identity = 1,
+        .source_uid = getuid(),
+        .root_count = 1,
+        .roots = &manifest_root
+    };
+    if (snprintf(manifest.machine_id, sizeof(manifest.machine_id),
+                 "%s", "0123456789abcdef") < 0 ||
+        manifest_write_v1_at(container_fd, &manifest) != 0)
+        fixture_fatal("could not write sticky-seed manifest");
+
+    PortableXattrs empty_xattrs = {0};
+    SidecarEntry root_entry = {0};
+    SidecarEntry representative_entry = {0};
+    SidecarEntry member_entry = {0};
+    SidecarBytes hardlink_root_id = bytes("HL");
+    SidecarBytes hardlink_logical_path = bytes(old_representative);
+    if (entry_from_stat("HL", "", "", "", &source_root_stat, 1,
+                        &empty_xattrs, &root_entry, NULL, NULL, NULL) != 0 ||
+        entry_from_stat("HL", old_representative, old_representative, "",
+                        &representative_stat, 1, &representative_xattrs,
+                        &representative_entry, NULL, NULL, NULL) != 0 ||
+        entry_from_stat("HL", old_member, old_member, "", &member_stat, 1,
+                        &empty_xattrs, &member_entry, NULL,
+                        &hardlink_root_id, &hardlink_logical_path) != 0)
+        fixture_fatal("could not prepare sticky-seed sidecar entries");
+
+    SidecarLog log = {0};
+    if (sidecar_log_create_at(container_fd, &log) != SIDECAR_OPEN_FRESH ||
+        sidecar_log_append_entry(&log, &root_entry) != SIDECAR_STATUS_OK ||
+        sidecar_log_append_entry_commit(&log) != SIDECAR_STATUS_OK ||
+        sidecar_log_append_entry(&log, &representative_entry) !=
+            SIDECAR_STATUS_OK)
+        fixture_fatal("could not write sticky-seed sidecar");
+    for (size_t index = 0; index < representative_xattrs.count; index++)
+        if (sidecar_log_append_xattr(&log,
+                                     &representative_xattrs.items[index]) !=
+            SIDECAR_STATUS_OK)
+            fixture_fatal("could not write sticky-seed xattrs");
+    if (sidecar_log_append_entry_commit(&log) != SIDECAR_STATUS_OK ||
+        sidecar_log_append_entry(&log, &member_entry) != SIDECAR_STATUS_OK ||
+        sidecar_log_append_entry_commit(&log) != SIDECAR_STATUS_OK ||
+        sidecar_log_close(&log) != SIDECAR_STATUS_OK)
+        fixture_fatal("could not write sticky-seed sidecar");
+    xattrs_free(&representative_xattrs);
+
+    struct stat representative_before;
+    struct stat member_before;
+    int payload_stats = stat(representative_payload, &representative_before) == 0 &&
+                        stat(member_payload, &member_before) == 0;
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .has_source_identity = 1,
+        .machine_id = "0123456789abcdef",
+        .source_uid = getuid(),
+        .roots = &root,
+        .root_count = 1,
+        .nsec_exact = 1,
+        .case_sensitive = 1
+    };
+    PortablePrescanReport report;
+    portable_prescan_report_init(&report);
+    check(payload_stats && portable_capture_resume_at(container_fd, &request,
+                                                       &report) == 0,
+          "resume succeeds with the recorded representative visited second");
+    portable_prescan_report_free(&report);
+
+    SidecarLiveView representative_view = {0};
+    SidecarLiveView member_view = {0};
+    int opened = sidecar_log_adopt_at(container_fd, &log) ==
+                 SIDECAR_OPEN_RESUMABLE;
+    int entries_found = opened &&
+        sidecar_log_find(&log, bytes("HL"), bytes(old_representative),
+                         &representative_view) == 1 &&
+        sidecar_log_find(&log, bytes("HL"), bytes(old_member), &member_view) == 1;
+    check(entries_found && representative_view.entry->kind ==
+              SIDECAR_KIND_REGULAR &&
+              member_view.entry->kind == SIDECAR_KIND_HARDLINK &&
+              sidecar_bytes_match_text(member_view.entry->hardlink_root_id,
+                                       "HL") &&
+              sidecar_bytes_match_text(member_view.entry->hardlink_logical_path,
+                                       old_representative),
+          "resume preserves the recorded representative and hardlink reference");
+
+    struct stat representative_after = {0};
+    struct stat member_after = {0};
+    int representative_after_ok = stat(representative_payload,
+                                       &representative_after) == 0;
+    int member_after_ok = stat(member_payload, &member_after) == 0;
+    int payload_unchanged = payload_stats &&
+        representative_after_ok && member_after_ok &&
+        representative_after.st_ino == representative_before.st_ino &&
+        representative_after.st_mtim.tv_sec == representative_before.st_mtim.tv_sec &&
+        representative_after.st_mtim.tv_nsec == representative_before.st_mtim.tv_nsec &&
+        member_after.st_ino == member_before.st_ino &&
+        member_after.st_size == 0 &&
+        member_after.st_mtim.tv_sec == member_before.st_mtim.tv_sec &&
+        member_after.st_mtim.tv_nsec == member_before.st_mtim.tv_nsec;
+    check(payload_unchanged,
+          "resume leaves the representative and placeholder payloads untouched");
+    check(entries_found && member_after_ok && member_after.st_size == 0,
+          "hardlink placeholder remains present after reconciliation");
+    if (opened)
+        sidecar_log_close(&log);
+    close(container_fd);
+    remove_tree(source);
+    remove_tree(container);
+}
+
 static void test_portable_hardlinks_cross_root(const char *base)
 {
     printf(BLUE "::" NC " portable hardlink groups across roots\n");
@@ -3251,6 +3451,7 @@ int main(void)
     test_root_payload_namespace(root_path);
     test_fresh_capture(source_path, container_fd, container_path);
     test_portable_hardlinks(root_path);
+    test_portable_hardlinks_sticky_seed(root_path);
     test_portable_hardlinks_cross_root(root_path);
     test_portable_hardlinks_collision(root_path);
     test_capture_context_flags(root_path);

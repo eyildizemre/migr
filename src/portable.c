@@ -18,6 +18,7 @@
 
 #include "encoding.h"
 #include "metadata.h"
+#include "utils.h"
 
 typedef struct {
     char *root_id;
@@ -2052,6 +2053,92 @@ static int sidecar_bytes_to_text(SidecarBytes bytes, char **out)
     copy[bytes.length] = '\0';
     *out = copy;
     return 0;
+}
+
+typedef struct {
+    PortableInodeMap *inode_map;
+    const PortableCaptureRequest *request;
+    int failed;
+} StickySeedState;
+
+static const PortableRootSpec *find_root_by_id(
+    const PortableCaptureRequest *request, const char *root_id)
+{
+    if (request == NULL || root_id == NULL)
+        return NULL;
+    for (size_t index = 0; index < request->root_count; index++)
+        if (strcmp(request->roots[index].id, root_id) == 0)
+            return &request->roots[index];
+    return NULL;
+}
+
+static int sticky_seed_callback(const SidecarLiveView *view, void *argument)
+{
+    StickySeedState *state = argument;
+    if (state == NULL || state->inode_map == NULL || state->request == NULL ||
+        view == NULL || view->entry == NULL)
+        return 1;
+    if (view->entry->kind != SIDECAR_KIND_REGULAR)
+        return 0;
+
+    char *root_id = NULL;
+    char *logical = NULL;
+    if (sidecar_bytes_to_text(view->entry->root_id, &root_id) != 0 ||
+        sidecar_bytes_to_text(view->entry->logical_path, &logical) != 0) {
+        free(root_id);
+        free(logical);
+        state->failed = 1;
+        return 1;
+    }
+
+    const PortableRootSpec *root = find_root_by_id(state->request, root_id);
+    char source_path[PATH_MAX];
+    int source_path_ready = 0;
+    if (root != NULL) {
+        if (logical[0] == '\0') {
+            int length = snprintf(source_path, sizeof(source_path), "%s",
+                                  root->capture_path);
+            source_path_ready = length >= 0 &&
+                                 (size_t)length < sizeof(source_path);
+        } else {
+            source_path_ready = path_join(source_path, sizeof(source_path),
+                                          root->capture_path, logical) == 0;
+        }
+    }
+
+    struct stat source_stat;
+    if (source_path_ready && lstat(source_path, &source_stat) == 0 &&
+        S_ISREG(source_stat.st_mode)) {
+        const PortableInodeSlot *slot = NULL;
+        if (inode_map_find_or_insert(state->inode_map, source_stat.st_dev,
+                                     source_stat.st_ino, root_id, logical,
+                                     &slot) < 0) {
+            state->failed = 1;
+            free(root_id);
+            free(logical);
+            return 1;
+        }
+    }
+
+    free(root_id);
+    free(logical);
+    return 0;
+}
+
+static int sticky_seed_inode_map(PortableInodeMap *inode_map,
+                                 const PortableCaptureRequest *request,
+                                 SidecarLog *sidecar)
+{
+    if (inode_map == NULL || request == NULL || sidecar == NULL)
+        return -1;
+    StickySeedState state = {
+        .inode_map = inode_map,
+        .request = request,
+        .failed = 0
+    };
+    SidecarStatus status = sidecar_log_foreach(sidecar, sticky_seed_callback,
+                                               &state);
+    return status == SIDECAR_STATUS_OK && state.failed == 0 ? 0 : -1;
 }
 
 static void portable_owned_paths_free(PortableOwnedPaths *paths)
@@ -5519,7 +5606,8 @@ int portable_capture_fresh_at(int container_fd,
     if (!failed) {
         context_ready = 1;
         context.collision_plan = &active_report->collision_plan;
-        if (portable_owned_paths_load(context.owned_paths, &sidecar) != 0)
+        if (portable_owned_paths_load(context.owned_paths, &sidecar) != 0 ||
+            sticky_seed_inode_map(context.inode_map, request, &sidecar) != 0)
             failed = 1;
     }
     for (size_t index = 0; !failed && index < request->root_count; index++)
@@ -5644,7 +5732,8 @@ int portable_capture_resume_at(int container_fd,
         context_ready = 1;
         context.resume_mode = 1;
         context.collision_plan = &active_report->collision_plan;
-        if (portable_owned_paths_load(context.owned_paths, &sidecar) != 0)
+        if (portable_owned_paths_load(context.owned_paths, &sidecar) != 0 ||
+            sticky_seed_inode_map(context.inode_map, request, &sidecar) != 0)
             failed = 1;
         for (size_t index = 0; !failed && index < request->root_count;
              index++) {
