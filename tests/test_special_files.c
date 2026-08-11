@@ -38,6 +38,9 @@
 #include "fileops.h"
 #include "utils.h"
 
+extern int native_hardlink_identity_matches(const struct stat *linked,
+                                            const struct stat *reference);
+
 #define GREEN "\033[0;32m"
 #define RED   "\033[0;31m"
 #define BLUE  "\033[0;34m"
@@ -99,9 +102,181 @@ static int file_contains(const char *path, const char *expected)
     return strcmp(buffer, expected) == 0;
 }
 
+static void test_native_hardlinks(void)
+{
+    printf(BLUE "::" NC " native hardlink capture (unit)\n");
+
+    char root[] = "/tmp/migr_native_hardlink_XXXXXX";
+    if (mkdtemp(root) == NULL)
+        fatal("could not create native hardlink test root");
+
+    char source[PATH_MAX], destination[PATH_MAX];
+    if (path_join(source, sizeof(source), root, "source") != 0 ||
+        path_join(destination, sizeof(destination), root, "destination") != 0 ||
+        mkdir(source, 0755) != 0 || mkdir(destination, 0755) != 0)
+        fatal("could not create native hardlink test directories");
+
+    char first_dir[PATH_MAX], second_dir[PATH_MAX];
+    char first[PATH_MAX], second[PATH_MAX];
+    if (path_join(first_dir, sizeof(first_dir), source, "first") != 0 ||
+        path_join(second_dir, sizeof(second_dir), source, "second") != 0 ||
+        mkdir(first_dir, 0755) != 0 || mkdir(second_dir, 0755) != 0 ||
+        path_join(first, sizeof(first), first_dir, "representative") != 0 ||
+        path_join(second, sizeof(second), second_dir, "alias") != 0)
+        fatal("could not create native hardlink source layout");
+
+    write_file(first, "native-hardlink-content");
+    if (link(first, second) != 0)
+        fatal("could not create native hardlink source pair");
+    if (chmod(first, 0640) != 0)
+        fatal("could not set native hardlink source mode");
+    struct timespec times[2] = {
+        { .tv_sec = 1234567890, .tv_nsec = 123456789 },
+        { .tv_sec = 1234567890, .tv_nsec = 987654321 }
+    };
+    if (utimensat(AT_FDCWD, first, times, 0) != 0)
+        fatal("could not set native hardlink source times");
+
+    struct stat source_st;
+    check(lstat(first, &source_st) == 0 && lstat(second, &source_st) == 0,
+          "native hardlink source pair is present");
+    struct stat first_source_st;
+    struct stat second_source_st;
+    int source_pair_ok = lstat(first, &first_source_st) == 0 &&
+                         lstat(second, &second_source_st) == 0 &&
+                         first_source_st.st_dev == second_source_st.st_dev &&
+                         first_source_st.st_ino == second_source_st.st_ino &&
+                         first_source_st.st_nlink == 2;
+    check(source_pair_ok, "native hardlink source pair shares one inode");
+
+    int destination_fd = open(destination, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (destination_fd < 0)
+        fatal("could not open native hardlink destination");
+
+    void *map = native_inode_map_create();
+    if (map == NULL)
+        fatal("could not create native hardlink inode map");
+    CloneContext context = {
+        .operation = CLONE_BACKUP,
+        .representation = CLONE_NATIVE_TREE,
+        .timestamp_policy_configured = 1,
+        .nsec_exact = 1,
+        .metadata_preflight_done = 1,
+        .inode_map = map
+    };
+
+    check(backup_capture_at(&context, source, destination_fd, "tree") == 0,
+          "nested native hardlink capture succeeds");
+
+    char destination_first[PATH_MAX], destination_second[PATH_MAX];
+    if (path_join(destination_first, sizeof(destination_first), destination,
+                  "tree/first/representative") != 0 ||
+        path_join(destination_second, sizeof(destination_second), destination,
+                  "tree/second/alias") != 0)
+        fatal("could not build native hardlink destination paths");
+    struct stat destination_first_st;
+    struct stat destination_second_st;
+    int destination_pair_ok =
+        lstat(destination_first, &destination_first_st) == 0 &&
+        lstat(destination_second, &destination_second_st) == 0 &&
+        native_hardlink_identity_matches(&destination_first_st,
+                                         &destination_second_st) &&
+        destination_first_st.st_nlink == 2 &&
+        file_contains(destination_first, "native-hardlink-content") &&
+        file_contains(destination_second, "native-hardlink-content");
+    check(destination_pair_ok,
+          "nested native hardlink capture preserves the destination inode");
+    check(destination_pair_ok &&
+              (destination_first_st.st_mode & 07777) ==
+                  (first_source_st.st_mode & 07777) &&
+              destination_first_st.st_uid == first_source_st.st_uid &&
+              destination_first_st.st_gid == first_source_st.st_gid &&
+              destination_first_st.st_atim.tv_sec == first_source_st.st_atim.tv_sec &&
+              destination_first_st.st_atim.tv_nsec == first_source_st.st_atim.tv_nsec &&
+              destination_first_st.st_mtim.tv_sec == first_source_st.st_mtim.tv_sec &&
+              destination_first_st.st_mtim.tv_nsec == first_source_st.st_mtim.tv_nsec,
+          "native hardlink representative metadata is preserved");
+    native_inode_map_free(map);
+
+    map = native_inode_map_create();
+    if (map == NULL)
+        fatal("could not create native hardlink resume map");
+    context.inode_map = map;
+    check(backup_capture_at(&context, source, destination_fd, "tree") == 0,
+          "native hardlink capture resumes an existing pair");
+    struct stat resumed_first_st;
+    struct stat resumed_second_st;
+    int resumed_pair_ok = lstat(destination_first, &resumed_first_st) == 0 &&
+                          lstat(destination_second, &resumed_second_st) == 0 &&
+                          native_hardlink_identity_matches(&resumed_first_st,
+                                                           &resumed_second_st);
+    check(resumed_pair_ok, "resume keeps both native hardlink names linked");
+    native_inode_map_free(map);
+
+    char source_a[PATH_MAX], source_b[PATH_MAX];
+    char source_a_file[PATH_MAX], source_b_file[PATH_MAX];
+    char destination_a[PATH_MAX], destination_b[PATH_MAX];
+    if (path_join(source_a, sizeof(source_a), root, "source-a") != 0 ||
+        path_join(source_b, sizeof(source_b), root, "source-b") != 0 ||
+        mkdir(source_a, 0755) != 0 || mkdir(source_b, 0755) != 0 ||
+        path_join(source_a_file, sizeof(source_a_file), source_a, "payload") != 0 ||
+        path_join(source_b_file, sizeof(source_b_file), source_b, "payload") != 0)
+        fatal("could not create cross-root native hardlink sources");
+    write_file(source_a_file, "cross-root-content");
+    if (link(source_a_file, source_b_file) != 0)
+        fatal("could not create cross-root native hardlink pair");
+    if (path_join(destination_a, sizeof(destination_a), destination, "root-a") != 0 ||
+        path_join(destination_b, sizeof(destination_b), destination, "root-b") != 0 ||
+        mkdir(destination_a, 0755) != 0 || mkdir(destination_b, 0755) != 0)
+        fatal("could not create cross-root native hardlink destinations");
+
+    map = native_inode_map_create();
+    if (map == NULL)
+        fatal("could not create native cross-root hardlink map");
+    context.inode_map = map;
+    check(backup_capture_at(&context, source_a, destination_fd, "root-a") == 0 &&
+              backup_capture_at(&context, source_b, destination_fd, "root-b") == 0,
+          "cross-root native hardlink capture succeeds");
+    char destination_a_file[PATH_MAX], destination_b_file[PATH_MAX];
+    if (path_join(destination_a_file, sizeof(destination_a_file), destination_a,
+                  "payload") != 0 ||
+        path_join(destination_b_file, sizeof(destination_b_file), destination_b,
+                  "payload") != 0)
+        fatal("could not build cross-root native hardlink destinations");
+    struct stat destination_a_st;
+    struct stat destination_b_st;
+    check(lstat(destination_a_file, &destination_a_st) == 0 &&
+              lstat(destination_b_file, &destination_b_st) == 0 &&
+              native_hardlink_identity_matches(&destination_a_st,
+                                               &destination_b_st) &&
+              destination_a_st.st_nlink == 2,
+          "native hardlinks remain linked across capture roots");
+    native_inode_map_free(map);
+
+    struct stat identity_a = {0};
+    struct stat identity_b = {0};
+    identity_a.st_dev = 1;
+    identity_a.st_ino = 2;
+    identity_b = identity_a;
+    check(native_hardlink_identity_matches(&identity_a, &identity_b),
+          "native hardlink identity accepts matching device and inode");
+    identity_b.st_ino++;
+    check(!native_hardlink_identity_matches(&identity_a, &identity_b),
+          "native hardlink identity rejects an inode mismatch");
+    identity_b = identity_a;
+    identity_b.st_dev++;
+    check(!native_hardlink_identity_matches(&identity_a, &identity_b),
+          "native hardlink identity rejects a device mismatch");
+
+    close(destination_fd);
+    remove_tree(root);
+}
+
 int main(void)
 {
     printf(BLUE "::" NC " backup capture walker (unit)\n");
+
+    test_native_hardlinks();
 
     CloneContext ctx = { .operation = CLONE_BACKUP, .representation = CLONE_NATIVE_TREE };
 

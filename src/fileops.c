@@ -69,6 +69,202 @@ static void backup_test_before_capture_source_open(const char *source_path)
 }
 #endif
 
+typedef struct {
+    dev_t device;
+    ino_t inode;
+    int parent_fd;
+    char leaf[NAME_MAX + 1U];
+    int used;
+} NativeInodeSlot;
+
+typedef struct {
+    NativeInodeSlot *slots;
+    size_t count;
+    size_t capacity;
+} NativeInodeMap;
+
+static uint64_t native_inode_hash(dev_t device, ino_t inode)
+{
+    const uint64_t offset = UINT64_C(1469598103934665603);
+    const uint64_t prime = UINT64_C(1099511628211);
+    unsigned char bytes[sizeof(device) + sizeof(inode)];
+    uint64_t hash = offset;
+
+    memcpy(bytes, &device, sizeof(device));
+    memcpy(bytes + sizeof(device), &inode, sizeof(inode));
+    for (size_t i = 0; i < sizeof(bytes); i++)
+    {
+        hash ^= bytes[i];
+        hash *= prime;
+    }
+    return hash;
+}
+
+static int native_inode_map_rehash(NativeInodeMap *map, size_t capacity)
+{
+    if (map == NULL || capacity < 16U ||
+        (capacity & (capacity - 1U)) != 0 ||
+        capacity > SIZE_MAX / sizeof(*map->slots))
+        return -1;
+
+    NativeInodeSlot *slots = calloc(capacity, sizeof(*slots));
+    if (slots == NULL)
+        return -1;
+
+    for (size_t i = 0; i < map->capacity; i++)
+    {
+        NativeInodeSlot *old_slot = &map->slots[i];
+        if (!old_slot->used)
+            continue;
+
+        size_t index = (size_t)native_inode_hash(old_slot->device,
+                                                  old_slot->inode) &
+                       (capacity - 1U);
+        while (slots[index].used)
+            index = (index + 1U) & (capacity - 1U);
+        slots[index] = *old_slot;
+    }
+
+    free(map->slots);
+    map->slots = slots;
+    map->capacity = capacity;
+    return 0;
+}
+
+static int native_inode_map_locate(const NativeInodeMap *map,
+                                   dev_t device, ino_t inode,
+                                   size_t *out_index)
+{
+    if (map == NULL || out_index == NULL)
+        return -1;
+    if (map->capacity == 0)
+    {
+        *out_index = SIZE_MAX;
+        return 0;
+    }
+
+    size_t index = (size_t)native_inode_hash(device, inode) &
+                   (map->capacity - 1U);
+    for (size_t probes = 0; probes < map->capacity; probes++)
+    {
+        const NativeInodeSlot *slot = &map->slots[index];
+        if (!slot->used)
+        {
+            *out_index = index;
+            return 0;
+        }
+        if (slot->device == device && slot->inode == inode)
+        {
+            *out_index = index;
+            return 1;
+        }
+        index = (index + 1U) & (map->capacity - 1U);
+    }
+
+    *out_index = SIZE_MAX;
+    return -1;
+}
+
+void *native_inode_map_create(void)
+{
+    NativeInodeMap *map = calloc(1, sizeof(*map));
+    if (map == NULL || native_inode_map_rehash(map, 16U) != 0)
+    {
+        if (map != NULL)
+        {
+            free(map->slots);
+            free(map);
+        }
+        return NULL;
+    }
+    return map;
+}
+
+void native_inode_map_free(void *opaque_map)
+{
+    NativeInodeMap *map = opaque_map;
+    if (map == NULL)
+        return;
+    for (size_t i = 0; i < map->capacity; i++)
+        if (map->slots[i].used)
+            close(map->slots[i].parent_fd);
+    free(map->slots);
+    free(map);
+}
+
+static int native_inode_map_find(const NativeInodeMap *map,
+                                 dev_t device, ino_t inode,
+                                 int *parent_fd_out, char *leaf_out,
+                                 size_t leaf_size)
+{
+    if (map == NULL || parent_fd_out == NULL || leaf_out == NULL ||
+        leaf_size == 0)
+        return -1;
+
+    size_t index = SIZE_MAX;
+    int location = native_inode_map_locate(map, device, inode, &index);
+    if (location < 0)
+        return -1;
+    if (location == 0)
+        return 0;
+
+    const NativeInodeSlot *slot = &map->slots[index];
+    size_t length = strnlen(slot->leaf, sizeof(slot->leaf));
+    if (length >= leaf_size)
+        return -1;
+    *parent_fd_out = slot->parent_fd;
+    memcpy(leaf_out, slot->leaf, length + 1U);
+    return 1;
+}
+
+static int native_inode_map_insert(NativeInodeMap *map, dev_t device,
+                                   ino_t inode, int parent_fd,
+                                   const char *leaf)
+{
+    if (map == NULL || parent_fd < 0 || leaf == NULL)
+        return -1;
+    size_t leaf_length = strnlen(leaf, NAME_MAX + 1U);
+    if (leaf_length == 0 || leaf_length > NAME_MAX)
+        return -1;
+
+    size_t index = SIZE_MAX;
+    int location = native_inode_map_locate(map, device, inode, &index);
+    if (location < 0)
+        return -1;
+    if (location == 1)
+        return 0;
+
+    if (map->count >= map->capacity - map->capacity / 3U)
+    {
+        if (map->capacity > SIZE_MAX / 2U ||
+            native_inode_map_rehash(map, map->capacity * 2U) != 0)
+            return -1;
+        location = native_inode_map_locate(map, device, inode, &index);
+        if (location != 0)
+            return -1;
+    }
+
+    int duplicate_fd = fcntl(parent_fd, F_DUPFD_CLOEXEC, 0);
+    if (duplicate_fd < 0)
+        return -1;
+    NativeInodeSlot *slot = &map->slots[index];
+    slot->device = device;
+    slot->inode = inode;
+    slot->parent_fd = duplicate_fd;
+    memcpy(slot->leaf, leaf, leaf_length + 1U);
+    slot->used = 1;
+    map->count++;
+    return 0;
+}
+
+int native_hardlink_identity_matches(const struct stat *linked,
+                                     const struct stat *reference)
+{
+    return linked != NULL && reference != NULL &&
+           linked->st_dev == reference->st_dev &&
+           linked->st_ino == reference->st_ino;
+}
+
 static BackupCaptureStatus capture_entry_at(const CloneContext *ctx,
                                             const char *src,
                                             int dest_dir_fd, const char *leaf,
@@ -150,6 +346,63 @@ static int copy_file_contents(int src_fd, int dest_fd)
     return bytes_read < 0 ? -1 : 0;
 }
 
+static BackupCaptureStatus capture_hardlink_at(
+    int src_fd, int dest_dir_fd, const char *leaf,
+    int representative_parent_fd, const char *representative_leaf,
+    const struct stat *source_snapshot)
+{
+    if (source_snapshot == NULL || !S_ISREG(source_snapshot->st_mode) ||
+        representative_parent_fd < 0 ||
+        !destination_leaf_is_safe(leaf) ||
+        !destination_leaf_is_safe(representative_leaf))
+    {
+        close(src_fd);
+        return BACKUP_CAPTURE_ERROR;
+    }
+
+    struct stat source_after;
+    int source_failed = fstat(src_fd, &source_after) != 0 ||
+                        !metadata_source_unchanged(source_snapshot,
+                                                   &source_after);
+    if (close(src_fd) != 0)
+        source_failed = 1;
+    if (source_failed)
+        return BACKUP_CAPTURE_ERROR;
+
+    // The map records the destination representative, not the source inode:
+    // a copied source and its payload necessarily have different identities.
+    // The representative's destination inode is therefore the authority for
+    // both resume validation and the post-link identity check.
+    struct stat representative;
+    if (fstatat(representative_parent_fd, representative_leaf,
+                &representative, AT_SYMLINK_NOFOLLOW) != 0 ||
+        !S_ISREG(representative.st_mode))
+        return BACKUP_CAPTURE_ERROR;
+
+    struct stat existing;
+    if (fstatat(dest_dir_fd, leaf, &existing, AT_SYMLINK_NOFOLLOW) == 0)
+    {
+        if (native_hardlink_identity_matches(&existing, &representative))
+            return BACKUP_CAPTURE_OK;
+        return BACKUP_CAPTURE_ERROR;
+    }
+    if (errno != ENOENT)
+        return BACKUP_CAPTURE_ERROR;
+
+    if (linkat(representative_parent_fd, representative_leaf, dest_dir_fd,
+               leaf, 0) != 0)
+        return BACKUP_CAPTURE_ERROR;
+
+    struct stat linked;
+    if (fstatat(dest_dir_fd, leaf, &linked, AT_SYMLINK_NOFOLLOW) != 0 ||
+        !native_hardlink_identity_matches(&linked, &representative))
+    {
+        errno = EIO;
+        return BACKUP_CAPTURE_ERROR;
+    }
+    return BACKUP_CAPTURE_OK;
+}
+
 static BackupCaptureStatus capture_regular_at(
     const CloneContext *ctx, const char *src, int dest_dir_fd,
     const char *leaf, const struct stat *st, BackupCaptureReport *report)
@@ -176,6 +429,28 @@ static BackupCaptureStatus capture_regular_at(
     {
         close(src_fd);
         return BACKUP_CAPTURE_ERROR;
+    }
+
+    if (ctx->inode_map != NULL && source_snapshot.st_nlink > 1)
+    {
+        NativeInodeMap *map = ctx->inode_map;
+        int representative_parent_fd = -1;
+        char representative_leaf[NAME_MAX + 1U];
+        int found = native_inode_map_find(map, source_snapshot.st_dev,
+                                          source_snapshot.st_ino,
+                                          &representative_parent_fd,
+                                          representative_leaf,
+                                          sizeof(representative_leaf));
+        if (found < 0)
+        {
+            close(src_fd);
+            return BACKUP_CAPTURE_ERROR;
+        }
+        if (found > 0)
+            return capture_hardlink_at(src_fd, dest_dir_fd, leaf,
+                                       representative_parent_fd,
+                                       representative_leaf,
+                                       &source_snapshot);
     }
 
     struct stat dest_st;
@@ -225,7 +500,15 @@ static BackupCaptureStatus capture_regular_at(
                 failed = 1;
             if (close(src_fd) != 0)
                 failed = 1;
-            return failed ? BACKUP_CAPTURE_ERROR : BACKUP_CAPTURE_OK;
+            if (failed)
+                return BACKUP_CAPTURE_ERROR;
+            if (ctx->inode_map != NULL && source_snapshot.st_nlink > 1 &&
+                native_inode_map_insert(ctx->inode_map,
+                                        source_snapshot.st_dev,
+                                        source_snapshot.st_ino,
+                                        dest_dir_fd, leaf) != 0)
+                return BACKUP_CAPTURE_ERROR;
+            return BACKUP_CAPTURE_OK;
         }
     }
     else if (errno != ENOENT)
@@ -271,7 +554,13 @@ static BackupCaptureStatus capture_regular_at(
         failed = 1;
     if (close(src_fd) != 0)
         failed = 1;
-    return failed ? BACKUP_CAPTURE_ERROR : BACKUP_CAPTURE_OK;
+    if (failed)
+        return BACKUP_CAPTURE_ERROR;
+    if (ctx->inode_map != NULL && source_snapshot.st_nlink > 1 &&
+        native_inode_map_insert(ctx->inode_map, source_snapshot.st_dev,
+                                source_snapshot.st_ino, dest_dir_fd, leaf) != 0)
+        return BACKUP_CAPTURE_ERROR;
+    return BACKUP_CAPTURE_OK;
 }
 
 // The directory is created with owner-only access and given the source's real

@@ -22,7 +22,12 @@ typedef struct CloneContext {
     int timestamp_policy_configured;
     int nsec_exact;
     int metadata_preflight_done;
+    void *inode_map; /* NativeInodeMap, backup-only; NULL disables tracking. */
 } CloneContext;
+
+/* Opaque native-capture hardlink map ownership. */
+void *native_inode_map_create(void);
+void native_inode_map_free(void *map);
 
 typedef struct MetadataProfiles MetadataProfiles;
 
