@@ -111,6 +111,22 @@ D8 promises that a native (ext4/btrfs) backup is fully faithful and recoverable 
 - does **not** preserve hardlink identity through restore (native capture now
   links since G.4, but native restore still duplicates).
 
+**Separately, a selection-logic gap (found during G.8's VM-gate planning,
+2026-08-11):** `fsprobe.h`'s own `FsCapability` enum has no hardlink entry —
+its header comment already flags this ("ownership, timestamp precision,
+hardlinks, ... come later"), and `select_representation()` inherits the
+omission. A destination that satisfies every *other* probed capability
+(mode, symlinks, FIFOs, raw names, case-sensitivity, xattrs, timestamps) but
+cannot hardlink would still be selected as `CLONE_NATIVE_TREE`, and G.4's
+`capture_hardlink_at()` would then fail the whole backup the first time it
+hit a hardlinked source pair — a real gap, though a narrow one in practice
+(no common Linux-native destination filesystem passes every other check
+while failing hardlinks specifically; this is why it wasn't caught by any
+earlier VM-gate pass, and why G.8's own VM-gate scenarios don't attempt to
+reproduce it with a real filesystem). Left as documented debt rather than a
+locked decision — a future phase should either add an `FS_CAP_HARDLINK`
+probe or explicitly decide the risk is acceptable.
+
 So a migr backup to ext4 is currently *less* faithful than `cp -a`, and D8's claim does
 not yet hold. Therefore this is not "add a portable branch to a working engine." It is
 "bring the engine to full fidelity, with a **native and a portable representation for
