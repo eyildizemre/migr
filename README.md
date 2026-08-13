@@ -180,6 +180,18 @@ namespace collision refuse the entire invocation before anything is written.
 This remains behind the D14 test-only seam; production portable dispatch is
 still disabled.
 
+Hardlinked files keep their shared identity across both representations.
+Native capture links a later occurrence of an already-seen file to its first
+copy instead of duplicating its bytes; native restore does not read the
+sidecar and cannot recreate the link, so it duplicates on restore (a
+documented limitation). Portable capture records the first-seen file as
+regular and every later occurrence as a hardlink record referencing it,
+including across different backup roots; restore replays the group with
+`link()`, and because the link shares the representative's inode, its
+extended attributes arrive automatically without a second write. This
+remains behind the D14 test-only seam; production portable dispatch is
+still disabled.
+
 ## Report
 
 Running `migr` or `migr report` scans your home directory and shows sizes for main directories, dotfiles, dev tools, and browsers — plus a critical backup size estimate.

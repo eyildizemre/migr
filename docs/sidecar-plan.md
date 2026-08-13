@@ -477,13 +477,17 @@ in G), so no single phase carries "make everything faithful at once."
   Arch/Ubuntu/Fedora VM-gate matrix passed, including real vfat ASCII and
   measured non-ASCII fold resolution, resume renumbering, and the
   destination-probed root-namespace collision gate.
-- **Phase G — Hardlinks.** **Status: in progress (2026-08-11, D22).** Group
+- **Phase G — Hardlinks.** **Status: complete (2026-08-13).** Group
   reference via `(st_dev, st_ino)`; portable hardlink records carry an empty
   placeholder node (D18 pattern) and restore replays the group with `link()`;
   native fresh capture preserves identity with `link()` while native restore
   keeps duplicating (documented debt); resume representatives are
   sticky-seeded from the sidecar to stay stable across `readdir` order
-  changes.
+  changes. The real Arch/Ubuntu/Fedora VM-gate matrix passed, including a
+  cross-root pair shared through both native and portable capture on real
+  ext4, a portable `HARDLINK` record failing cleanly onto real vfat (which
+  cannot `linkat()`), and Fedora's automatic `security.selinux` sharing
+  through the shared inode.
 - **Phase H — Resume.** Sidecar as the comparison oracle (true size+mtime+type); the
   deletion/precedence algorithm selected in B; drop stale entries. Commit-ordering is
   already in place from B.

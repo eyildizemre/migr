@@ -1545,7 +1545,7 @@ reachable only through the existing test-only seam.
 
 ## D22 — 2026-08-11 — Hardlink handling: group reference, placeholder node, sticky-seed representative
 
-**Status:** Decided (locked in planning; implementation follows in G.1–G.9)
+**Status:** Implemented (Phase G closed 2026-08-13; as-built notes below)
 
 **Decision:** Portable capture records the first-seen member of each `(st_dev,
 st_ino)` group as a regular file and later members as hardlink records carrying
@@ -1637,3 +1637,58 @@ xattr-sharing debt explicitly left by D20 E-10. D21's collision suffixes and
 hardlink groups both shape the physical payload paths, while D14's test-only
 boundary remains in force through Phase G. Native stale-entry reconciliation is
 left to Phase H, and sparse-file handling remains governed by D13.
+
+### As-built (Phase G, 2026-08-13)
+
+The host suite and `make check` (strict GCC and Clang, sanitizers, Valgrind,
+and `-fanalyzer`) passed cleanly against `2f6327f`, with no compiler
+diagnostics, Valgrind errors, or sanitizer errors.
+
+G-2's decision text states that restore "trusts" capture's first-seen-first
+record order. Implementation-time investigation (G.3) found this assumption
+does not hold: `sidecar_log_foreach` iterates the sidecar's state map in
+hash-bucket order — a pure function of each entry's key hash, unrelated to
+append order — and `replay_run`'s own pre-apply sort orders entries by path
+depth then name, also unrelated to hardlink structure. No such order exists to
+trust; reverting to a single ordered pass broke `test_hardlink_orchestration`
+outright ("alias" sorts before "representative"). The as-built fix is not the
+"two-pass restore" G-2 rejected — a wholesale second pass over the entire
+entry set — but a targeted second pass restricted to `HARDLINK`-kind entries
+only: `replay_run` applies every `REGULAR`, `SYMLINK`, and directory-prep
+entry exactly as designed, then filters the same already-collected set for
+`HARDLINK` entries and applies those once every representative is guaranteed
+to be on disk. This costs one `O(n)` filter over data already in memory, not an
+additional traversal. G-2's fail-closed missing-reference rule and its
+rejection of deferred binding both hold as decided: reference resolution
+happens eagerly during collection, before `replay_run` runs at all, so an
+unresolved or malformed reference is refused before any hardlink-kind entry
+is ever considered for application.
+
+G-1, G-3, G-4, G-5, and G-6 matched their locked text with no corrections
+needed at implementation time; G-6's sticky-seed fallback was specifically
+traced across all four representative/member presence combinations across a
+resume boundary and found to already cover every one without additional code.
+
+The VM gate exercised real hardlink pairs on Arch, Ubuntu, and Fedora: a
+native capture (real `link()`) and a portable capture+replay (real sidecar
+`HARDLINK` record + `linkat()`) both correctly shared one inode across two
+separate manifest roots on a real ext4 destination
+(`hardlink-native-portable-seam`); a portable `HARDLINK` record replayed onto a
+real vfat destination — which cannot `linkat()` — failed with an honest
+partial count rather than a silent fallback or a false success
+(`portable-hardlink-vfat-dest`); and on Fedora specifically, a native
+hardlink alias's `security.selinux` label was confirmed genuinely automatic
+through the shared inode, with no second `setxattr` call
+(`hardlink-selinux-xattr-sharing`; correctly a no-op on Arch/Ubuntu, which
+carry no automatic security labelling). A full regression pass of every
+existing VM-gate scenario also ran clean on all three VMs alongside these
+three.
+
+Host-only scale tests (5,000 real hardlink pairs) kept the pre-scan inode set,
+the capture-time inode map, and the resume sticky-seed pass within their
+linear probe budgets; mutating the inode map's hash function to a constant
+confirmed the O(n²) guard actually fires (~25 million probes, four assertions
+broken).
+
+Production portable dispatch remains disabled under D14; every path above is
+reachable only through the existing test-only seam.
