@@ -281,6 +281,30 @@ typedef struct {
     uint64_t hash_salt;
 } NativeVisitedSet;
 
+#ifdef NATIVE_VISITED_TEST_HOOKS
+static uint64_t native_visited_probe_counter;
+
+static void native_visited_count_probe(void)
+{
+    if (native_visited_probe_counter != UINT64_MAX)
+        native_visited_probe_counter++;
+}
+
+uint64_t native_visited_test_probe_count(void)
+{
+    return native_visited_probe_counter;
+}
+
+void native_visited_test_reset_probe_count(void)
+{
+    native_visited_probe_counter = 0;
+}
+#else
+static void native_visited_count_probe(void)
+{
+}
+#endif
+
 static uint64_t native_visited_fnv1a_bytes(uint64_t hash,
                                            const unsigned char *data,
                                            size_t length)
@@ -368,6 +392,7 @@ static int native_visited_locate(const NativeVisitedSet *set,
     size_t index = (size_t)hash & (set->capacity - 1U);
     for (size_t probes = 0; probes < set->capacity; probes++)
     {
+        native_visited_count_probe();
         const NativeVisitedSlot *slot = &set->slots[index];
         if (slot->root_key == NULL)
         {

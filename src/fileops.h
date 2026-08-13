@@ -3,6 +3,7 @@
 
 #include <limits.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <sys/types.h>
 
 /**
@@ -33,6 +34,11 @@ void native_inode_map_free(void *map);
 /* Opaque native-capture visited-path set ownership (docs/DECISIONS.md D23). */
 void *native_visited_create(void);
 void native_visited_free(void *visited);
+
+#ifdef NATIVE_VISITED_TEST_HOOKS
+uint64_t native_visited_test_probe_count(void);
+void native_visited_test_reset_probe_count(void);
+#endif
 
 typedef struct {
     char failed_relative_path[PATH_MAX];
