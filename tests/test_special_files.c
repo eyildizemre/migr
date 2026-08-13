@@ -40,6 +40,8 @@
 
 extern int native_hardlink_identity_matches(const struct stat *linked,
                                             const struct stat *reference);
+extern int native_visited_contains(const void *set, const char *root_key,
+                                   const char *rel_path);
 
 #define GREEN "\033[0;32m"
 #define RED   "\033[0;31m"
@@ -272,11 +274,117 @@ static void test_native_hardlinks(void)
     remove_tree(root);
 }
 
+static void test_native_visited_paths(void)
+{
+    printf(BLUE "::" NC " native capture visited paths (unit)\n");
+
+    char root[] = "/tmp/migr_native_visited_XXXXXX";
+    if (mkdtemp(root) == NULL)
+        fatal("could not create native visited test root");
+
+    char source[PATH_MAX], destination[PATH_MAX], file[PATH_MAX];
+    char subdir[PATH_MAX], nested[PATH_MAX], link_path[PATH_MAX];
+    char fifo[PATH_MAX], socket_path[PATH_MAX];
+    if (path_join(source, sizeof(source), root, "source") != 0 ||
+        path_join(destination, sizeof(destination), root, "destination") != 0 ||
+        path_join(file, sizeof(file), source, "file.txt") != 0 ||
+        path_join(subdir, sizeof(subdir), source, "subdir") != 0 ||
+        path_join(nested, sizeof(nested), subdir, "nested.txt") != 0 ||
+        path_join(link_path, sizeof(link_path), source, "link") != 0 ||
+        path_join(fifo, sizeof(fifo), source, "fifo") != 0 ||
+        path_join(socket_path, sizeof(socket_path), source, "sock") != 0 ||
+        mkdir(source, 0755) != 0 || mkdir(destination, 0755) != 0 ||
+        mkdir(subdir, 0755) != 0)
+        fatal("could not create native visited test layout");
+    write_file(file, "visited-file");
+    write_file(nested, "visited-nested");
+    if (symlink("visited-target", link_path) != 0 ||
+        mkfifo(fifo, 0640) != 0)
+        fatal("could not create native visited test entries");
+
+    int socket_available = 0;
+    int socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (socket_fd < 0)
+    {
+        if (errno != EPERM && errno != EACCES && errno != EAFNOSUPPORT)
+            fatal("could not create native visited socket fixture");
+    }
+    else
+    {
+        struct sockaddr_un address;
+        memset(&address, 0, sizeof(address));
+        address.sun_family = AF_UNIX;
+        if (strlen(socket_path) >= sizeof(address.sun_path))
+            fatal("native visited socket fixture path is too long");
+        strcpy(address.sun_path, socket_path);
+        if (bind(socket_fd, (struct sockaddr *)&address, sizeof(address)) == 0)
+            socket_available = 1;
+        else if (errno != EPERM && errno != EACCES && errno != EAFNOSUPPORT)
+            fatal("could not bind native visited socket fixture");
+        close(socket_fd);
+        if (!socket_available)
+            unlink(socket_path);
+    }
+
+    int destination_fd = open(destination, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (destination_fd < 0)
+        fatal("could not open native visited destination");
+    void *visited = native_visited_create();
+    if (visited == NULL)
+        fatal("could not create native visited set");
+    CloneContext context = {
+        .operation = CLONE_BACKUP,
+        .representation = CLONE_NATIVE_TREE,
+        .timestamp_policy_configured = 1,
+        .nsec_exact = 1,
+        .metadata_preflight_done = 1,
+        .visited = visited
+    };
+
+    check(backup_capture_at(&context, source, destination_fd, "tree") == 0,
+          "native capture with visited tracking succeeds");
+    check(native_visited_contains(context.visited, "tree", "") == 1,
+          "visited set records the root object");
+    check(native_visited_contains(context.visited, "tree", "file.txt") == 1,
+          "visited set records a regular file");
+    check(native_visited_contains(context.visited, "tree", "subdir") == 1,
+          "visited set records a nested directory");
+    check(native_visited_contains(context.visited, "tree",
+                                  "subdir/nested.txt") == 1,
+          "visited set records a nested regular file without a leading slash");
+    check(native_visited_contains(context.visited, "tree", "link") == 1,
+          "visited set records a symlink");
+    check(native_visited_contains(context.visited, "tree", "fifo") == 1,
+          "visited set records a FIFO");
+    if (socket_available)
+        check(native_visited_contains(context.visited, "tree", "sock") == 0,
+              "visited set excludes a skipped socket");
+    else
+        printf("  " BLUE "-" NC " Unix socket fixture unavailable on this host\n");
+    struct stat device_st;
+    int device_available = lstat("/dev/null", &device_st) == 0 &&
+                           S_ISCHR(device_st.st_mode);
+    if (device_available)
+        check(backup_capture_at(&context, "/dev/null", destination_fd,
+                                "device") == 0 &&
+                  native_visited_contains(context.visited, "device", "") == 0,
+              "visited set excludes a skipped device node");
+    else
+        printf("  " BLUE "-" NC " device-node fixture unavailable on this host\n");
+    check(native_visited_contains(context.visited, "tree", "/file.txt") == 0,
+          "visited set does not add a leading slash to relative paths");
+
+    native_visited_free(context.visited);
+    close(destination_fd);
+    remove_tree(root);
+}
+
 int main(void)
 {
     printf(BLUE "::" NC " backup capture walker (unit)\n");
 
     test_native_hardlinks();
+    test_native_visited_paths();
 
     CloneContext ctx = { .operation = CLONE_BACKUP, .representation = CLONE_NATIVE_TREE };
 

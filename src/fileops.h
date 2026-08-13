@@ -23,11 +23,16 @@ typedef struct CloneContext {
     int nsec_exact;
     int metadata_preflight_done;
     void *inode_map; /* NativeInodeMap, backup-only; NULL disables tracking. */
+    void *visited; /* Native visited-path set, backup-only; NULL disables tracking. */
 } CloneContext;
 
 /* Opaque native-capture hardlink map ownership. */
 void *native_inode_map_create(void);
 void native_inode_map_free(void *map);
+
+/* Opaque native-capture visited-path set ownership (docs/DECISIONS.md D23). */
+void *native_visited_create(void);
+void native_visited_free(void *visited);
 
 typedef struct MetadataProfiles MetadataProfiles;
 

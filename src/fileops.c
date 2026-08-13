@@ -16,6 +16,7 @@
 #include "fileops.h" // CloneContext
 #include "metadata.h"
 #include "portable.h"
+#include "sidecar.h"
 #include "utils.h" // path_join
 
 /* ========================================================================= */
@@ -265,9 +266,270 @@ int native_hardlink_identity_matches(const struct stat *linked,
            linked->st_ino == reference->st_ino;
 }
 
+typedef struct {
+    char *root_key;
+    size_t root_key_length;
+    char *rel_path;
+    size_t rel_path_length;
+    uint64_t hash;
+} NativeVisitedSlot;
+
+typedef struct {
+    NativeVisitedSlot *slots;
+    size_t count;
+    size_t capacity;
+    uint64_t hash_salt;
+} NativeVisitedSet;
+
+static uint64_t native_visited_fnv1a_bytes(uint64_t hash,
+                                           const unsigned char *data,
+                                           size_t length)
+{
+    for (size_t index = 0; index < length; index++)
+    {
+        hash ^= data[index];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static uint64_t native_visited_fnv1a_uint64(uint64_t hash, uint64_t value)
+{
+    for (size_t index = 0; index < sizeof(value); index++)
+    {
+        hash ^= (unsigned char)(value >> (index * 8U));
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static uint64_t native_visited_hash(const NativeVisitedSet *set,
+                                    const char *root_key,
+                                    size_t root_key_length,
+                                    const char *rel_path,
+                                    size_t rel_path_length)
+{
+    uint64_t hash = UINT64_C(1469598103934665603) ^ set->hash_salt;
+    hash = native_visited_fnv1a_uint64(hash, (uint64_t)root_key_length);
+    hash = native_visited_fnv1a_bytes(hash,
+                                      (const unsigned char *)root_key,
+                                      root_key_length);
+    hash = native_visited_fnv1a_uint64(hash, (uint64_t)rel_path_length);
+    return native_visited_fnv1a_bytes(hash,
+                                      (const unsigned char *)rel_path,
+                                      rel_path_length);
+}
+
+static int native_visited_rehash(NativeVisitedSet *set, size_t capacity)
+{
+    if (set == NULL || capacity < 16U ||
+        (capacity & (capacity - 1U)) != 0 ||
+        capacity > SIZE_MAX / sizeof(*set->slots))
+        return -1;
+
+    NativeVisitedSlot *slots = calloc(capacity, sizeof(*slots));
+    if (slots == NULL)
+        return -1;
+
+    for (size_t old_index = 0; old_index < set->capacity; old_index++)
+    {
+        NativeVisitedSlot *old_slot = &set->slots[old_index];
+        if (old_slot->root_key == NULL)
+            continue;
+
+        size_t index = (size_t)old_slot->hash & (capacity - 1U);
+        while (slots[index].root_key != NULL)
+            index = (index + 1U) & (capacity - 1U);
+        slots[index] = *old_slot;
+    }
+
+    free(set->slots);
+    set->slots = slots;
+    set->capacity = capacity;
+    return 0;
+}
+
+/* Returns 1 for a matching slot, 0 for an empty insertion slot, -1 if full. */
+static int native_visited_locate(const NativeVisitedSet *set,
+                                 const char *root_key,
+                                 size_t root_key_length,
+                                 const char *rel_path,
+                                 size_t rel_path_length, uint64_t hash,
+                                 size_t *out_index)
+{
+    if (set == NULL || out_index == NULL)
+        return -1;
+    if (set->capacity == 0)
+    {
+        *out_index = SIZE_MAX;
+        return 0;
+    }
+
+    size_t index = (size_t)hash & (set->capacity - 1U);
+    for (size_t probes = 0; probes < set->capacity; probes++)
+    {
+        const NativeVisitedSlot *slot = &set->slots[index];
+        if (slot->root_key == NULL)
+        {
+            *out_index = index;
+            return 0;
+        }
+        if (slot->hash == hash &&
+            slot->root_key_length == root_key_length &&
+            slot->rel_path_length == rel_path_length &&
+            memcmp(slot->root_key, root_key, root_key_length) == 0 &&
+            memcmp(slot->rel_path, rel_path, rel_path_length) == 0)
+        {
+            *out_index = index;
+            return 1;
+        }
+        index = (index + 1U) & (set->capacity - 1U);
+    }
+
+    *out_index = SIZE_MAX;
+    return -1;
+}
+
+static void native_visited_slot_free(NativeVisitedSlot *slot)
+{
+    if (slot == NULL)
+        return;
+    free(slot->root_key);
+    free(slot->rel_path);
+    memset(slot, 0, sizeof(*slot));
+}
+
+void *native_visited_create(void)
+{
+    NativeVisitedSet *set = calloc(1, sizeof(*set));
+    if (set == NULL)
+        return NULL;
+    set->hash_salt = sidecar_process_salt();
+    if (native_visited_rehash(set, 16U) != 0)
+    {
+        free(set);
+        return NULL;
+    }
+    return set;
+}
+
+void native_visited_free(void *opaque_set)
+{
+    NativeVisitedSet *set = opaque_set;
+    if (set == NULL)
+        return;
+    for (size_t index = 0; index < set->capacity; index++)
+        native_visited_slot_free(&set->slots[index]);
+    free(set->slots);
+    free(set);
+}
+
+static int native_visited_add(void *opaque_set, const char *root_key,
+                              const char *rel_path)
+{
+    NativeVisitedSet *set = opaque_set;
+    if (set == NULL || root_key == NULL || rel_path == NULL)
+        return -1;
+
+    size_t root_key_length = strlen(root_key);
+    size_t rel_path_length = strlen(rel_path);
+    if (root_key_length == SIZE_MAX || rel_path_length == SIZE_MAX)
+        return -1;
+
+    uint64_t hash = native_visited_hash(set, root_key, root_key_length,
+                                        rel_path, rel_path_length);
+    size_t index = SIZE_MAX;
+    int location = native_visited_locate(set, root_key, root_key_length,
+                                          rel_path, rel_path_length, hash,
+                                          &index);
+    if (location == 1)
+        return 1;
+    if (location < 0)
+        return -1;
+
+    if (set->count >= set->capacity - set->capacity / 3U)
+    {
+        if (set->capacity > SIZE_MAX / 2U ||
+            native_visited_rehash(set, set->capacity * 2U) != 0)
+            return -1;
+        location = native_visited_locate(set, root_key, root_key_length,
+                                          rel_path, rel_path_length, hash,
+                                          &index);
+        if (location != 0)
+            return -1;
+    }
+
+    char *root_copy = malloc(root_key_length + 1U);
+    if (root_copy == NULL)
+        return -1;
+    char *rel_copy = malloc(rel_path_length + 1U);
+    if (rel_copy == NULL)
+    {
+        free(root_copy);
+        return -1;
+    }
+    memcpy(root_copy, root_key, root_key_length + 1U);
+    memcpy(rel_copy, rel_path, rel_path_length + 1U);
+
+    NativeVisitedSlot *slot = &set->slots[index];
+    slot->root_key = root_copy;
+    slot->root_key_length = root_key_length;
+    slot->rel_path = rel_copy;
+    slot->rel_path_length = rel_path_length;
+    slot->hash = hash;
+    set->count++;
+    return 0;
+}
+
+int native_visited_contains(const void *opaque_set, const char *root_key,
+                            const char *rel_path)
+{
+    const NativeVisitedSet *set = opaque_set;
+    if (set == NULL || root_key == NULL || rel_path == NULL)
+        return -1;
+    if (set->capacity == 0)
+        return 0;
+
+    size_t root_key_length = strlen(root_key);
+    size_t rel_path_length = strlen(rel_path);
+    uint64_t hash = native_visited_hash(set, root_key, root_key_length,
+                                        rel_path, rel_path_length);
+    size_t index = SIZE_MAX;
+    int location = native_visited_locate(set, root_key, root_key_length,
+                                          rel_path, rel_path_length, hash,
+                                          &index);
+    if (location < 0)
+        return -1;
+    return location == 1 ? 1 : 0;
+}
+
+static int append_relative(char *destination, size_t destination_size,
+                            const char *parent, const char *name)
+{
+    if (destination == NULL || parent == NULL || name == NULL)
+        return -1;
+    size_t parent_length = strnlen(parent, destination_size);
+    size_t name_length = strlen(name);
+    if (parent_length >= destination_size ||
+        name_length > destination_size - parent_length - 1U)
+        return -1;
+
+    size_t offset = 0;
+    if (parent_length != 0)
+    {
+        memcpy(destination, parent, parent_length);
+        offset = parent_length;
+        destination[offset++] = '/';
+    }
+    memcpy(destination + offset, name, name_length + 1U);
+    return 0;
+}
+
 static BackupCaptureStatus capture_entry_at(const CloneContext *ctx,
                                             const char *src,
                                             int dest_dir_fd, const char *leaf,
+                                            const char *root_key,
+                                            const char *rel_path,
                                             BackupCaptureReport *report);
 
 // An identical symlink already at this address is work a previous run
@@ -572,7 +834,8 @@ static BackupCaptureStatus capture_regular_at(
 // ends up with.
 static BackupCaptureStatus capture_directory_at(
     const CloneContext *ctx, const char *src, int dest_dir_fd,
-    const char *leaf, const struct stat *st, BackupCaptureReport *report)
+    const char *leaf, const struct stat *st, const char *root_key,
+    const char *rel_path, BackupCaptureReport *report)
 {
 #ifdef BACKUP_TEST_HOOKS
     backup_test_before_capture_source_open(src);
@@ -653,8 +916,16 @@ static BackupCaptureStatus capture_directory_at(
             result = BACKUP_CAPTURE_ERROR;
             break;
         }
+        char child_rel[PATH_MAX];
+        if (append_relative(child_rel, sizeof(child_rel), rel_path,
+                            entry->d_name) != 0)
+        {
+            result = BACKUP_CAPTURE_ERROR;
+            break;
+        }
         BackupCaptureStatus child_status = capture_entry_at(
-            ctx, child_src, child_fd, entry->d_name, report);
+            ctx, child_src, child_fd, entry->d_name, root_key, child_rel,
+            report);
         if (child_status != BACKUP_CAPTURE_OK)
         {
             result = child_status;
@@ -735,6 +1006,8 @@ static int capture_fifo_at(const CloneContext *ctx, int dest_dir_fd,
 static BackupCaptureStatus capture_entry_at(const CloneContext *ctx,
                                             const char *src,
                                             int dest_dir_fd, const char *leaf,
+                                            const char *root_key,
+                                            const char *rel_path,
                                             BackupCaptureReport *report)
 {
     struct stat st;
@@ -742,31 +1015,41 @@ static BackupCaptureStatus capture_entry_at(const CloneContext *ctx,
         return BACKUP_CAPTURE_ERROR;
 
     MetadataTimestampPolicy policy = metadata_policy_from_context(ctx);
+    BackupCaptureStatus status;
+    int trackable = 1;
     if (S_ISLNK(st.st_mode))
-        return capture_symlink_at(src, dest_dir_fd, leaf, &st, policy);
-    if (S_ISREG(st.st_mode))
-        return capture_regular_at(ctx, src, dest_dir_fd, leaf, &st, report);
-    if (S_ISDIR(st.st_mode))
-        return capture_directory_at(ctx, src, dest_dir_fd, leaf, &st, report);
-    if (S_ISFIFO(st.st_mode))
-        return capture_fifo_at(ctx, dest_dir_fd, leaf, &st);
-
-    // Sockets and device nodes carry no copyable content: a socket is a runtime
-    // IPC endpoint, a device node needs root to recreate. Skip either with a
-    // warning rather than failing the enclosing directory over it.
-    if (S_ISSOCK(st.st_mode))
+        status = capture_symlink_at(src, dest_dir_fd, leaf, &st, policy);
+    else if (S_ISREG(st.st_mode))
+        status = capture_regular_at(ctx, src, dest_dir_fd, leaf, &st, report);
+    else if (S_ISDIR(st.st_mode))
+        status = capture_directory_at(ctx, src, dest_dir_fd, leaf, &st,
+                                      root_key, rel_path, report);
+    else if (S_ISFIFO(st.st_mode))
+        status = capture_fifo_at(ctx, dest_dir_fd, leaf, &st);
+    else if (S_ISSOCK(st.st_mode))
     {
+        // Sockets and device nodes carry no copyable content: a socket is a
+        // runtime IPC endpoint, a device node needs root to recreate. Skip
+        // either with a warning rather than failing the enclosing directory.
         printf("  Warning: skipping socket (runtime-only): %s\n", src);
-        return 0;
+        trackable = 0;
+        status = BACKUP_CAPTURE_OK;
     }
-    if (S_ISCHR(st.st_mode) || S_ISBLK(st.st_mode))
+    else if (S_ISCHR(st.st_mode) || S_ISBLK(st.st_mode))
     {
         printf("  Warning: skipping %s device node: %s\n",
                S_ISCHR(st.st_mode) ? "character" : "block", src);
-        return 0;
+        trackable = 0;
+        status = BACKUP_CAPTURE_OK;
     }
+    else
+        return BACKUP_CAPTURE_ERROR;
 
-    return BACKUP_CAPTURE_ERROR; // unknown file type; refuse defensively
+    if (status == BACKUP_CAPTURE_OK && trackable && ctx->visited != NULL &&
+        native_visited_add(ctx->visited, root_key, rel_path) < 0)
+        return BACKUP_CAPTURE_ERROR;
+
+    return status;
 }
 
 void backup_capture_report_init(BackupCaptureReport *report)
@@ -793,7 +1076,7 @@ BackupCaptureStatus backup_capture_at_report(
         return BACKUP_CAPTURE_ERROR;
 
     return capture_entry_at(ctx, source_path, destination_root_fd,
-                            destination_leaf, report);
+                            destination_leaf, destination_leaf, "", report);
 }
 
 BackupCaptureStatus backup_capture_at(const CloneContext *ctx,

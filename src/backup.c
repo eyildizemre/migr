@@ -846,11 +846,14 @@ int backup(const char *target, BackupMode mode, char **paths)
             .timestamp_policy_configured = 1,
             .nsec_exact = profile.nsec_exact,
             .metadata_preflight_done = 1,
-            .inode_map = native_inode_map_create()
+            .inode_map = native_inode_map_create(),
+            .visited = native_visited_create()
         };
-        if (ctx.inode_map == NULL)
+        if (ctx.inode_map == NULL || ctx.visited == NULL)
         {
-            printf("Error: Could not initialize native hardlink tracking\n");
+            printf("Error: Could not initialize native hardlink/resume tracking\n");
+            native_inode_map_free(ctx.inode_map);
+            native_visited_free(ctx.visited);
             had_error = 1;
         }
         else
@@ -858,6 +861,8 @@ int backup(const char *target, BackupMode mode, char **paths)
             capture_roots(&ctx, &plan, data_fd, &count, &had_error);
             native_inode_map_free(ctx.inode_map);
             ctx.inode_map = NULL;
+            native_visited_free(ctx.visited);
+            ctx.visited = NULL;
         }
         close(data_fd);
 
