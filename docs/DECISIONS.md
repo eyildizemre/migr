@@ -1692,3 +1692,103 @@ broken).
 
 Production portable dispatch remains disabled under D14; every path above is
 reachable only through the existing test-only seam.
+
+---
+
+## D23 — 2026-08-13 — Native stale reconciliation without a new log format
+
+**Status:** Decided (locked in planning; implementation follows in H.1–H.5)
+
+**Decision:** Native resume keeps the existing nsec-gated content-resume
+oracle and reconciles stale destination entries by scanning the destination
+tree directly after a clean capture of every root. The destination tree is
+the complete record of what was captured; no additional committed-key log or
+wire format is introduced.
+
+### H-1 — Native resume-skip remains nsec-exact
+
+Native content resume-skip is allowed only when `nsec_exact` is true and the
+source and destination agree on size, `mtime_sec`, and `mtime_nsec`. Otherwise
+the content is copied again. The existing nsec-exact-gated comparison in
+`src/fileops.c` remains unchanged. A destination that cannot prove
+nsec-granular timestamp round-trip therefore cannot take the skip path and
+falls back to a safe recopy.
+
+### H-2 — Reconcile stale entries by scanning the destination tree
+
+After all roots' capture completes cleanly, each root's destination subtree is
+scanned directly with the established `openat`/`fstatat`/`O_NOFOLLOW`
+discipline. Every relative path absent from the walk's visited-set is stale
+and is deleted. Native `data/<root>` has no percent-encoding or collision
+suffix, so its destination tree is a lossless one-to-one mirror of the
+captured source. There is no committed-key log, new wire format,
+truncation rule, or log commit-ordering requirement.
+
+A deletion interrupted halfway through is found again on the next resume:
+the destination tree is rescanned, and deletion is idempotent because an
+already-absent entry is tolerated as `ENOENT`.
+
+### H-3 — Deletion safety and fail-closed boundaries
+
+Deletion is permitted only for destination entries absent from the visited-set
+and only after a clean walk. Although a root that completes cleanly has its own
+complete visited-set, deletion is withheld for every root until all roots
+succeed, as a deliberate additional safety margin rather than something the
+incomplete root's data alone would require. The capture path therefore keeps a
+single cumulative error flag across all roots; only when it is clear does the
+scan-and-delete phase begin.
+
+The per-root scan is safe because source `capture_path` overlap is already
+rejected by `validate_no_duplicates_or_overlap` in `src/backup_plan.c`, while
+destination `payload_path` uniqueness is guaranteed structurally by the root
+naming scheme rather than checked as a runtime overlap condition.
+
+Sockets and device nodes are skipped by native capture with a warning rather
+than failing the enclosing directory, and are not recorded in the visited-set.
+If a source path is now a socket or device node, the corresponding destination
+path must therefore be absent after reconciliation; an older regular file at
+that path must not be preserved as visited.
+
+Only user-derived objects below `data/` are eligible for this reconciliation;
+the container root remains migr-owned. Deletion uses `unlinkat`/`rmdir` with
+`AT_SYMLINK_NOFOLLOW` and never follows a symlink. Directories are deleted
+post-order. Any deletion failure sets the cumulative error flag and blocks
+finalization, so deleted files or subtrees cannot survive a successfully
+resumed final backup.
+
+### H-4 — No commit-ordering discipline
+
+There is no log whose records must be ordered against payload mutation. The
+destination tree is, at every moment, the complete and consistent record of
+what was actually captured. A half-finished deletion is handled by H-2's
+next-run rescan and does not require a separate commit protocol.
+
+The "committed key log" wording in D17 and D22 G-5 denotes a
+state-comparison capability, not a literal file format. D23 satisfies that
+requirement with the visited-set compared against the destination tree and
+introduces no new on-disk format.
+
+**Why:** Native capture already has a lossless destination namespace and a
+resume oracle for content. A post-walk comparison against a visited-set makes
+stale-entry removal explicit while preserving interruption safety: an
+incomplete walk cannot authorize deletion, and an interrupted deletion is
+rediscovered on the next run. The nsec-exact gate prevents a coarse timestamp
+filesystem from being treated as safely resumable.
+
+**Rejected:** A committed-key log plus a destination diff is rejected because
+it would add another file format, writer and reader, truncated-tail recovery
+rules, and commit-ordering discipline without providing information the
+destination tree does not already contain. Deleting each stale entry during
+the capture walk is rejected because it is more invasive and can leave a
+half-deleted tree when the process is interrupted.
+
+**Relationship:** D23 preserves D6's resume-oracle rationale: the sidecar has
+the true size and mtime, while native resume takes its skip path only under
+the measured `nsec_exact` gate. It assigns the native stale-entry gap noted in
+D17 to a direct destination-tree comparison, keeps D17's nsec-exact skip
+unchanged, and supplies the deletion acceptance condition described there.
+It uses D15's container ownership and `data/` boundary, and gives the same
+"without a committed key log" wording in D22 G-5 its concrete visited-set
+meaning. D14 continues to keep portable dispatch test-only; H's reconciliation
+is native production-path work, while direct portable dispatch remains
+disabled.
