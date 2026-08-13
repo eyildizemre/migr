@@ -1089,6 +1089,352 @@ BackupCaptureStatus backup_capture_at(const CloneContext *ctx,
 }
 
 /* ========================================================================= */
+/* Native stale reconciliation (docs/DECISIONS.md D23).                      */
+/*                                                                          */
+/* The visited set is complete only after every root has captured without an */
+/* error. Reconciliation therefore scans first and deletes only after all    */
+/* directory handles used by that scan have been closed. A root object       */
+/* recorded by capture is preserved; an intentionally skipped special root  */
+/* is unvisited and is reconciled like any other stale object.               */
+/* ========================================================================= */
+
+typedef struct {
+    char **items;
+    size_t count;
+    size_t capacity;
+} NativeStaleList;
+
+static void native_stale_list_free(NativeStaleList *list)
+{
+    if (list == NULL)
+        return;
+    for (size_t index = 0; index < list->count; index++)
+        free(list->items[index]);
+    free(list->items);
+    memset(list, 0, sizeof(*list));
+}
+
+static int native_stale_list_append(NativeStaleList *list,
+                                    const char *rel_path)
+{
+    if (list == NULL || rel_path == NULL)
+        return -1;
+    if (list->count == list->capacity)
+    {
+        size_t capacity = list->capacity == 0 ? 16U : list->capacity * 2U;
+        if (capacity < list->capacity ||
+            capacity > SIZE_MAX / sizeof(*list->items))
+            return -1;
+        char **items = realloc(list->items, capacity * sizeof(*items));
+        if (items == NULL)
+            return -1;
+        list->items = items;
+        list->capacity = capacity;
+    }
+    char *copy = strdup(rel_path);
+    if (copy == NULL)
+        return -1;
+    list->items[list->count++] = copy;
+    return 0;
+}
+
+static int native_reconcile_scan_node(const void *visited,
+                                      const char *root_key, int parent_fd,
+                                      const char *leaf, const char *rel_path,
+                                      NativeStaleList *stale)
+{
+    int contains = native_visited_contains(visited, root_key, rel_path);
+    if (contains < 0)
+        return -1;
+    if (contains == 0)
+        return native_stale_list_append(stale, rel_path);
+
+    struct stat st;
+    if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) != 0)
+        return -1;
+    if (!S_ISDIR(st.st_mode))
+        return 0;
+
+    int child_fd = openat(parent_fd, leaf,
+                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (child_fd < 0)
+        return -1;
+    int scan_fd = fcntl(child_fd, F_DUPFD_CLOEXEC, 0);
+    DIR *dir = scan_fd < 0 ? NULL : fdopendir(scan_fd);
+    if (dir == NULL)
+    {
+        if (scan_fd >= 0)
+            close(scan_fd);
+        close(child_fd);
+        return -1;
+    }
+
+    int failed = 0;
+    struct dirent *entry;
+    for (;;)
+    {
+        errno = 0;
+        entry = readdir(dir);
+        if (entry == NULL)
+        {
+            if (errno != 0)
+                failed = 1;
+            break;
+        }
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0)
+            continue;
+
+        char child_rel[PATH_MAX];
+        if (append_relative(child_rel, sizeof(child_rel), rel_path,
+                            entry->d_name) != 0 ||
+            native_reconcile_scan_node(visited, root_key, child_fd,
+                                       entry->d_name, child_rel, stale) != 0)
+        {
+            failed = 1;
+            break;
+        }
+    }
+    if (closedir(dir) != 0)
+        failed = 1;
+    if (close(child_fd) != 0)
+        failed = 1;
+    return failed ? -1 : 0;
+}
+
+static int native_remove_leaf(int parent_fd, const char *leaf);
+
+static int native_remove_directory_tree(int parent_fd, const char *leaf)
+{
+    int directory_fd = openat(parent_fd, leaf,
+                               O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (directory_fd < 0)
+        return -1;
+    int scan_fd = fcntl(directory_fd, F_DUPFD_CLOEXEC, 0);
+    DIR *dir = scan_fd < 0 ? NULL : fdopendir(scan_fd);
+    if (dir == NULL)
+    {
+        if (scan_fd >= 0)
+            close(scan_fd);
+        close(directory_fd);
+        return -1;
+    }
+
+    int failed = 0;
+    struct dirent *entry;
+    for (;;)
+    {
+        errno = 0;
+        entry = readdir(dir);
+        if (entry == NULL)
+        {
+            if (errno != 0)
+                failed = 1;
+            break;
+        }
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0)
+            continue;
+        if (native_remove_leaf(directory_fd, entry->d_name) != 0)
+        {
+            failed = 1;
+            break;
+        }
+    }
+    if (closedir(dir) != 0)
+        failed = 1;
+    if (close(directory_fd) != 0)
+        failed = 1;
+    if (failed)
+        return -1;
+    if (unlinkat(parent_fd, leaf, AT_REMOVEDIR) == 0 || errno == ENOENT)
+        return 0;
+    return -1;
+}
+
+static int native_remove_leaf(int parent_fd, const char *leaf)
+{
+    struct stat st;
+    if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) != 0)
+        return errno == ENOENT ? 0 : -1;
+    if (S_ISDIR(st.st_mode))
+        return native_remove_directory_tree(parent_fd, leaf);
+    if (unlinkat(parent_fd, leaf, 0) == 0 || errno == ENOENT)
+        return 0;
+    return -1;
+}
+
+static int native_open_relative_parent(int root_fd, const char *rel_path,
+                                       int *parent_out, char *leaf_out,
+                                       size_t leaf_size)
+{
+    if (root_fd < 0 || rel_path == NULL || rel_path[0] == '\0' ||
+        parent_out == NULL || leaf_out == NULL || leaf_size == 0)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    size_t length = strlen(rel_path);
+    if (length >= PATH_MAX)
+    {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    char copy[PATH_MAX];
+    memcpy(copy, rel_path, length + 1U);
+
+    int current = fcntl(root_fd, F_DUPFD_CLOEXEC, 0);
+    if (current < 0)
+        return -1;
+    char *cursor = copy;
+    for (;;)
+    {
+        char *slash = strchr(cursor, '/');
+        if (slash != NULL)
+            *slash = '\0';
+        if (slash == NULL)
+        {
+            size_t leaf_length = strlen(cursor);
+            if (leaf_length >= leaf_size)
+            {
+                errno = ENAMETOOLONG;
+                close(current);
+                return -1;
+            }
+            memcpy(leaf_out, cursor, leaf_length + 1U);
+            *parent_out = current;
+            return 0;
+        }
+
+        int next = openat(current, cursor,
+                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (close(current) != 0)
+        {
+            if (next >= 0)
+                close(next);
+            return -1;
+        }
+        if (next < 0)
+            return -1;
+        current = next;
+        cursor = slash + 1;
+    }
+}
+
+void native_reconcile_report_init(NativeReconcileReport *report)
+{
+    if (report == NULL)
+        return;
+    memset(report, 0, sizeof(*report));
+}
+
+NativeReconcileStatus native_reconcile_stale_at(const void *visited,
+                                                const char *root_key,
+                                                int data_fd,
+                                                NativeReconcileReport *report)
+{
+    native_reconcile_report_init(report);
+    if (visited == NULL || root_key == NULL || data_fd < 0)
+        return NATIVE_RECONCILE_ERROR;
+
+    int root_visited = native_visited_contains(visited, root_key, "");
+    if (root_visited < 0)
+        return NATIVE_RECONCILE_ERROR;
+
+    struct stat root_st;
+    if (fstatat(data_fd, root_key, &root_st, AT_SYMLINK_NOFOLLOW) != 0)
+        return NATIVE_RECONCILE_ERROR;
+    if (root_visited == 0)
+    {
+        if (native_remove_leaf(data_fd, root_key) == 0)
+            return NATIVE_RECONCILE_OK;
+        if (report != NULL)
+            (void)snprintf(report->failed_relative_path,
+                           sizeof(report->failed_relative_path), "%s",
+                           root_key);
+        return NATIVE_RECONCILE_ERROR;
+    }
+    if (!S_ISDIR(root_st.st_mode))
+        return NATIVE_RECONCILE_OK;
+
+    int root_fd = openat(data_fd, root_key,
+                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (root_fd < 0)
+        return NATIVE_RECONCILE_ERROR;
+    int scan_fd = fcntl(root_fd, F_DUPFD_CLOEXEC, 0);
+    DIR *dir = scan_fd < 0 ? NULL : fdopendir(scan_fd);
+    if (dir == NULL)
+    {
+        if (scan_fd >= 0)
+            close(scan_fd);
+        close(root_fd);
+        return NATIVE_RECONCILE_ERROR;
+    }
+
+    NativeStaleList stale = {0};
+    int scan_failed = 0;
+    struct dirent *entry;
+    for (;;)
+    {
+        errno = 0;
+        entry = readdir(dir);
+        if (entry == NULL)
+        {
+            if (errno != 0)
+                scan_failed = 1;
+            break;
+        }
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0)
+            continue;
+        if (native_reconcile_scan_node(visited, root_key, root_fd,
+                                       entry->d_name, entry->d_name,
+                                       &stale) != 0)
+        {
+            scan_failed = 1;
+            break;
+        }
+    }
+    if (closedir(dir) != 0)
+        scan_failed = 1;
+
+    NativeReconcileStatus result = NATIVE_RECONCILE_OK;
+    if (scan_failed)
+        result = NATIVE_RECONCILE_ERROR;
+    else
+    {
+        for (size_t index = 0; index < stale.count; index++)
+        {
+            int parent_fd = -1;
+            char leaf[NAME_MAX + 1U];
+            int open_result = native_open_relative_parent(
+                root_fd, stale.items[index], &parent_fd, leaf, sizeof(leaf));
+            int remove_result;
+            if (open_result == 0)
+                remove_result = native_remove_leaf(parent_fd, leaf);
+            else
+                remove_result = errno == ENOENT ? 0 : -1;
+            if (open_result != 0 || remove_result != 0)
+            {
+                result = NATIVE_RECONCILE_ERROR;
+                if (report != NULL && report->failed_relative_path[0] == '\0')
+                    (void)snprintf(report->failed_relative_path,
+                                   sizeof(report->failed_relative_path), "%s",
+                                   stale.items[index]);
+            }
+            if (parent_fd >= 0 && close(parent_fd) != 0)
+                result = NATIVE_RECONCILE_ERROR;
+        }
+    }
+
+    native_stale_list_free(&stale);
+    if (close(root_fd) != 0)
+        result = NATIVE_RECONCILE_ERROR;
+    return result;
+}
+
+/* ========================================================================= */
 /* FD-anchored native restore core (docs/DECISIONS.md D15 and D16).          */
 /*                                                                          */
 /* Separate from the capture walker above because the trust boundaries       */

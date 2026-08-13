@@ -1011,8 +1011,144 @@ test_probe_refusal() {
 }
 
 
+test_native_stale_reconciliation() {
+    # The two roots are deliberately separate. capture_directory_at stops
+    # the current root at its first child error, so putting the broken
+    # fixture beside the file under test would make the result depend on
+    # readdir() order.
+    local sr_dest="$TEST_DIR/cp_stale_reconcile"
+    local sr_keep="$TEST_DIR/cp_stale_reconcile_a_keep"
+    local sr_broken="$TEST_DIR/cp_stale_reconcile_b_broken"
+    mkdir -p "$sr_dest" "$sr_keep" "$sr_broken"
+    echo will-be-deleted > "$sr_keep/gone.txt"
+    echo stays-forever   > "$sr_keep/keeps.txt"
+    for i in $(seq -w 0 4999); do
+        echo filler > "$sr_keep/filler-$i"
+    done
+    echo locked > "$sr_broken/locked.txt"
+
+    local sr_race_pid sr_race_status
+    (
+        for _ in $(seq 1 1000); do
+            if compgen -G "$sr_dest/migr_backup_*.partial" > /dev/null; then
+                chmod 000 "$sr_broken"
+                exit 0
+            fi
+        sleep 0.001
+        done
+        exit 1
+    ) &
+    sr_race_pid=$!
+    local sr_first_out sr_first_rc
+    set +e
+    sr_first_out=$(../migr backup "$sr_dest" "$sr_keep" "$sr_broken" 2>&1)
+    sr_first_rc=$?
+    set -e
+    set +e
+    wait "$sr_race_pid"
+    sr_race_status=$?
+    set -e
+
+    local sr_partial
+    sr_partial=$(containers_matching "$sr_dest" partial)
+    if [ "$sr_first_rc" -eq 0 ] || [ "$sr_race_status" -ne 0 ] ||
+       [ -z "$sr_partial" ] || [ ! -f "$sr_partial/data/EXPLICIT_0/gone.txt" ]; then
+        echo -e "  ${RED}✗${NC} Reconciliation fixture did not produce a partial containing the keep root"
+        echo "  exit=$sr_first_rc race=$sr_race_status output: $sr_first_out"
+        return 1
+    fi
+    chmod 755 "$sr_broken"
+    rm -f "$sr_keep/gone.txt"
+
+    local sr_final sr_second_out
+    sr_second_out=$(../migr backup "$sr_dest" "$sr_keep" "$sr_broken" 2>&1)
+    sr_final=$(sole_final_container "$sr_dest")
+    assert_no_partial "$sr_dest"
+    if [ ! -e "$sr_final/data/EXPLICIT_0/gone.txt" ] &&
+       [ "$(cat "$sr_final/data/EXPLICIT_0/keeps.txt")" = "stays-forever" ] &&
+       [ "$(cat "$sr_final/data/EXPLICIT_1/locked.txt")" = "locked" ]; then
+        echo -e "  ${GREEN}✓${NC} A disappeared source file is removed from the resumed final backup."
+    else
+        echo -e "  ${RED}✗${NC} Stale reconciliation removed the wrong thing, or not the right one"
+        echo "  output: $sr_second_out"
+        return 1
+    fi
+
+    local sg_dest="$TEST_DIR/cp_stale_reconcile_gate"
+    local sg_keep="$TEST_DIR/cp_stale_reconcile_gate_a_keep"
+    local sg_broken="$TEST_DIR/cp_stale_reconcile_gate_b_broken"
+    mkdir -p "$sg_dest" "$sg_keep" "$sg_broken"
+    echo will-survive > "$sg_keep/gone.txt"
+    echo stays         > "$sg_keep/keeps.txt"
+    for i in $(seq -w 0 4999); do
+        echo filler > "$sg_keep/filler-$i"
+    done
+    echo locked > "$sg_broken/locked.txt"
+
+    (
+        for _ in $(seq 1 1000); do
+            if compgen -G "$sg_dest/migr_backup_*.partial" > /dev/null; then
+                chmod 000 "$sg_broken"
+                exit 0
+            fi
+            sleep 0.001
+        done
+        exit 1
+    ) &
+    local sg_race_pid=$!
+    set +e
+    ../migr backup "$sg_dest" "$sg_keep" "$sg_broken" >/dev/null 2>&1
+    local sg_first_rc=$?
+    wait "$sg_race_pid"
+    local sg_first_race=$?
+    set -e
+    local sg_partial
+    sg_partial=$(containers_matching "$sg_dest" partial)
+    if [ "$sg_first_rc" -eq 0 ] || [ "$sg_first_race" -ne 0 ] ||
+       [ -z "$sg_partial" ] || [ ! -f "$sg_partial/data/EXPLICIT_0/gone.txt" ]; then
+        echo -e "  ${RED}✗${NC} Global reconciliation gate fixture did not produce its first partial"
+        return 1
+    fi
+
+    chmod 755 "$sg_broken"
+    rm -f "$sg_keep/gone.txt"
+    (
+        for _ in $(seq 1 1000); do
+            if compgen -G "$sg_dest/migr_backup_*.partial" > /dev/null; then
+                chmod 000 "$sg_broken"
+                exit 0
+            fi
+            sleep 0.001
+        done
+        exit 1
+    ) &
+    local sg_second_race_pid=$!
+    set +e
+    ../migr backup "$sg_dest" "$sg_keep" "$sg_broken" >/dev/null 2>&1
+    local sg_second_rc=$?
+    wait "$sg_second_race_pid"
+    local sg_second_race=$?
+    set -e
+    chmod 755 "$sg_broken"
+    sg_partial=$(containers_matching "$sg_dest" partial)
+    if [ "$sg_second_rc" -ne 0 ] && [ "$sg_second_race" -eq 0 ] &&
+       [ -z "$(containers_matching "$sg_dest" final)" ] &&
+       [ -f "$sg_partial/data/EXPLICIT_0/gone.txt" ]; then
+        echo -e "  ${GREEN}✓${NC} An incomplete walk leaves stale payload untouched and blocks finalization."
+    else
+        echo -e "  ${RED}✗${NC} An incomplete walk authorized stale deletion"
+        return 1
+    fi
+}
+
 test_container_production() {
     echo -e "${BLUE}::${NC} Phase 14: versioned container production wiring"
+
+    if [ "$(id -u)" -eq 0 ]; then
+        echo -e "  ${BLUE}i${NC} Native stale-reconciliation permission cases skipped (root bypasses 0000 permissions)."
+    else
+        test_native_stale_reconciliation
+    fi
 
     # --- dry-run creates nothing at all, not even the destination root ---
     local dry_dest="$TEST_DIR/cp_dry/never_created"

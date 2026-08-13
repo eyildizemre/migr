@@ -34,6 +34,30 @@ void native_inode_map_free(void *map);
 void *native_visited_create(void);
 void native_visited_free(void *visited);
 
+typedef struct {
+    char failed_relative_path[PATH_MAX];
+} NativeReconcileReport;
+
+void native_reconcile_report_init(NativeReconcileReport *report);
+
+typedef enum {
+    NATIVE_RECONCILE_ERROR = -1,
+    NATIVE_RECONCILE_OK = 0
+} NativeReconcileStatus;
+
+/**
+ * @brief Removes destination entries absent from a completed native capture.
+ *
+ * The caller must invoke this only after every root in the capture walk has
+ * completed successfully. The destination is traversed beneath data_fd with
+ * no-follow fd operations; a root object recorded by the capture is never a
+ * reconciliation target. A root deliberately skipped as an unsupported
+ * special file is unvisited and is therefore stale (docs/DECISIONS.md D23).
+ */
+NativeReconcileStatus native_reconcile_stale_at(
+    const void *visited, const char *root_key, int data_fd,
+    NativeReconcileReport *report);
+
 typedef struct MetadataProfiles MetadataProfiles;
 
 /**

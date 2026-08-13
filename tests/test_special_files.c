@@ -49,6 +49,7 @@ extern int native_visited_contains(const void *set, const char *root_key,
 #define NC    "\033[0m"
 
 static int failures = 0;
+static int skips = 0;
 
 static void check(int condition, const char *label)
 {
@@ -65,6 +66,12 @@ static void fatal(const char *message)
 {
     printf(RED "%s" NC "\n", message);
     exit(1);
+}
+
+static void skip_check(const char *label)
+{
+    printf("  " BLUE "-" NC " %s\n", label);
+    skips++;
 }
 
 static void write_file(const char *path, const char *content)
@@ -379,12 +386,170 @@ static void test_native_visited_paths(void)
     remove_tree(root);
 }
 
+static void test_native_reconciliation(void)
+{
+    printf(BLUE "::" NC " native stale reconciliation (unit)\n");
+
+    char root[] = "/tmp/migr_native_reconcile_XXXXXX";
+    if (mkdtemp(root) == NULL)
+        fatal("could not create native reconciliation test root");
+
+    char source[PATH_MAX], destination[PATH_MAX], source_file[PATH_MAX];
+    char source_keep[PATH_MAX];
+    char source_subdir[PATH_MAX], source_nested[PATH_MAX];
+    char tree[PATH_MAX], keep[PATH_MAX], nested[PATH_MAX];
+    char gone[PATH_MAX], stale_dir[PATH_MAX], stale_nested[PATH_MAX];
+    char walk_stale[PATH_MAX], blocked[PATH_MAX], blocked_child[PATH_MAX];
+    char outside_stale[PATH_MAX], single[PATH_MAX];
+    char empty_source[PATH_MAX], root_only[PATH_MAX], root_only_child[PATH_MAX];
+    char skipped_root[PATH_MAX], skipped_child[PATH_MAX];
+    if (path_join(source, sizeof(source), root, "source") != 0 ||
+        path_join(destination, sizeof(destination), root, "destination") != 0 ||
+        path_join(source_file, sizeof(source_file), source, "single.txt") != 0 ||
+        path_join(source_keep, sizeof(source_keep), source, "keep.txt") != 0 ||
+        path_join(source_subdir, sizeof(source_subdir), source, "subdir") != 0 ||
+        path_join(source_nested, sizeof(source_nested), source_subdir,
+                  "nested.txt") != 0 ||
+        path_join(tree, sizeof(tree), destination, "tree") != 0 ||
+        path_join(keep, sizeof(keep), tree, "keep.txt") != 0 ||
+        path_join(nested, sizeof(nested), tree, "subdir/nested.txt") != 0 ||
+        path_join(gone, sizeof(gone), tree, "gone.txt") != 0 ||
+        path_join(stale_dir, sizeof(stale_dir), tree, "stale_dir") != 0 ||
+        path_join(stale_nested, sizeof(stale_nested), stale_dir,
+                  "nested.txt") != 0 ||
+        path_join(walk_stale, sizeof(walk_stale), tree, "walk-stale.txt") != 0 ||
+        path_join(blocked, sizeof(blocked), tree, "blocked") != 0 ||
+        path_join(blocked_child, sizeof(blocked_child), blocked, "child.txt") != 0 ||
+        path_join(outside_stale, sizeof(outside_stale), tree,
+                  "outside-stale.txt") != 0 ||
+        path_join(single, sizeof(single), destination, "single") != 0 ||
+        path_join(empty_source, sizeof(empty_source), root, "empty-source") != 0 ||
+        path_join(root_only, sizeof(root_only), destination, "root-only") != 0 ||
+        path_join(root_only_child, sizeof(root_only_child), root_only,
+                  "stale.txt") != 0 ||
+        path_join(skipped_root, sizeof(skipped_root), destination,
+                  "skipped-root") != 0 ||
+        path_join(skipped_child, sizeof(skipped_child), skipped_root,
+                  "stale.txt") != 0)
+        fatal("could not build native reconciliation paths");
+    if (mkdir(source, 0755) != 0 || mkdir(destination, 0755) != 0 ||
+        mkdir(source_subdir, 0755) != 0 || mkdir(empty_source, 0755) != 0)
+        fatal("could not create native reconciliation directories");
+    write_file(source_file, "single-source");
+    write_file(source_keep, "keep");
+    write_file(source_nested, "nested");
+
+    int destination_fd = open(destination, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (destination_fd < 0)
+        fatal("could not open native reconciliation destination");
+    void *visited = native_visited_create();
+    if (visited == NULL)
+        fatal("could not create native reconciliation visited set");
+    CloneContext context = {
+        .operation = CLONE_BACKUP,
+        .representation = CLONE_NATIVE_TREE,
+        .timestamp_policy_configured = 1,
+        .nsec_exact = 1,
+        .metadata_preflight_done = 1,
+        .visited = visited
+    };
+    check(backup_capture_at(&context, source, destination_fd, "tree") == 0,
+          "native reconciliation fixture is captured");
+    write_file(gone, "stale-file");
+    if (mkdir(stale_dir, 0755) != 0)
+        fatal("could not create stale directory fixture");
+    write_file(stale_nested, "stale-subtree");
+
+    NativeReconcileReport report;
+    check(native_reconcile_stale_at(visited, "tree", destination_fd,
+                                    &report) == NATIVE_RECONCILE_OK,
+          "stale scan and deletion succeeds after a clean capture");
+    check(access(gone, F_OK) != 0 && access(keep, F_OK) == 0 &&
+              access(nested, F_OK) == 0,
+          "selective reconciliation removes only the unvisited file");
+    check(access(stale_dir, F_OK) != 0,
+          "reconciliation removes an unvisited subtree recursively");
+
+    if (geteuid() == 0)
+        skip_check("permission-based native reconciliation failures require a non-root user");
+    else
+    {
+        write_file(walk_stale, "must-survive-scan-error");
+        char captured_subdir[PATH_MAX];
+        if (path_join(captured_subdir, sizeof(captured_subdir), tree,
+                      "subdir") != 0 || chmod(captured_subdir, 0000) != 0)
+            fatal("could not make a visited directory unreadable");
+        native_reconcile_report_init(&report);
+        check(native_reconcile_stale_at(visited, "tree", destination_fd,
+                                        &report) == NATIVE_RECONCILE_ERROR &&
+                  access(walk_stale, F_OK) == 0,
+              "a scan error prevents every deletion in that run");
+        if (chmod(captured_subdir, 0755) != 0)
+            fatal("could not restore the visited directory permissions");
+
+        if (mkdir(blocked, 0755) != 0)
+            fatal("could not create blocked stale directory");
+        write_file(blocked_child, "blocked");
+        if (chmod(blocked, 0000) != 0)
+            fatal("could not make stale directory undeletable");
+        write_file(outside_stale, "outside");
+        native_reconcile_report_init(&report);
+        check(native_reconcile_stale_at(visited, "tree", destination_fd,
+                                        &report) == NATIVE_RECONCILE_ERROR &&
+                  report.failed_relative_path[0] != '\0' &&
+                  access(blocked, F_OK) == 0 && access(outside_stale, F_OK) != 0,
+              "a deletion failure is reported while later stale entries are attempted");
+        if (chmod(blocked, 0755) != 0)
+            fatal("could not restore blocked stale directory permissions");
+    }
+
+    check(backup_capture_at(&context, empty_source, destination_fd,
+                            "root-only") == 0,
+          "an empty source directory records its root object");
+    write_file(root_only_child, "stale-child");
+    native_reconcile_report_init(&report);
+    check(native_reconcile_stale_at(visited, "root-only", destination_fd,
+                                    &report) == NATIVE_RECONCILE_OK &&
+              access(root_only, F_OK) == 0 &&
+              access(root_only_child, F_OK) != 0,
+          "a visited root is preserved while its stale child is removed");
+
+    if (mkdir(skipped_root, 0755) != 0)
+        fatal("could not create skipped-root fixture");
+    write_file(skipped_child, "stale-child");
+    void *empty_visited = native_visited_create();
+    if (empty_visited == NULL)
+        fatal("could not create empty reconciliation visited set");
+    native_reconcile_report_init(&report);
+    check(native_reconcile_stale_at(empty_visited, "skipped-root",
+                                    destination_fd, &report) == NATIVE_RECONCILE_OK &&
+              access(skipped_root, F_OK) != 0,
+          "an unvisited skipped root and its stale subtree are removed");
+    native_visited_free(empty_visited);
+
+    check(backup_capture_at(&context, source_file, destination_fd, "single") == 0,
+          "a non-directory root can be captured for reconciliation");
+    native_reconcile_report_init(&report);
+    check(native_reconcile_stale_at(visited, "single", destination_fd,
+                                    &report) == NATIVE_RECONCILE_OK &&
+              access(single, F_OK) == 0,
+          "a non-directory root is left untouched");
+    check(native_reconcile_stale_at(visited, "missing", destination_fd,
+                                    &report) == NATIVE_RECONCILE_ERROR,
+          "a missing root fails closed instead of being treated as empty");
+
+    native_visited_free(visited);
+    close(destination_fd);
+    remove_tree(root);
+}
+
 int main(void)
 {
     printf(BLUE "::" NC " backup capture walker (unit)\n");
 
     test_native_hardlinks();
     test_native_visited_paths();
+    test_native_reconciliation();
 
     CloneContext ctx = { .operation = CLONE_BACKUP, .representation = CLONE_NATIVE_TREE };
 
@@ -656,5 +821,7 @@ int main(void)
         printf(RED "%d capture walker test(s) failed" NC "\n", failures);
         return 1;
     }
+    if (skips > 0)
+        printf(BLUE "%d capture walker test(s) skipped" NC "\n", skips);
     return 0;
 }

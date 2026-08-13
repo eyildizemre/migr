@@ -295,6 +295,27 @@ static void capture_roots(const CloneContext *ctx, const BackupPlan *plan, int d
     }
 }
 
+static void reconcile_roots(const void *visited, const BackupPlan *plan,
+                            int data_fd, int *had_error)
+{
+    for (int i = 0; i < plan->root_count; i++)
+    {
+        const BackupPlanRoot *root = &plan->roots[i];
+        NativeReconcileReport report;
+        if (native_reconcile_stale_at(
+                visited, root->manifest_root.payload_path, data_fd,
+                &report) != NATIVE_RECONCILE_OK)
+        {
+            printf("Error: Could not reconcile stale entries under data/%s",
+                   root->manifest_root.payload_path);
+            if (report.failed_relative_path[0] != '\0')
+                printf(" (%s)", report.failed_relative_path);
+            printf("\n");
+            *had_error = 1;
+        }
+    }
+}
+
 static int metadata_existing_at(int root_fd, const char *rel,
                                 struct stat *out, int *exists)
 {
@@ -859,6 +880,8 @@ int backup(const char *target, BackupMode mode, char **paths)
         else
         {
             capture_roots(&ctx, &plan, data_fd, &count, &had_error);
+            if (!had_error)
+                reconcile_roots(ctx.visited, &plan, data_fd, &had_error);
             native_inode_map_free(ctx.inode_map);
             ctx.inode_map = NULL;
             native_visited_free(ctx.visited);
