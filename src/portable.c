@@ -17,6 +17,7 @@
 #include <unistd.h>
 
 #include "encoding.h"
+#include "hash.h"
 #include "metadata.h"
 #include "utils.h"
 
@@ -1359,39 +1360,17 @@ static int existing_payload_matches(int data_fd, const char *payload_path,
     return 1;
 }
 
-static uint64_t visited_fnv1a_bytes(uint64_t hash,
-                                    const unsigned char *data,
-                                    size_t length)
-{
-    for (size_t index = 0; index < length; index++)
-    {
-        hash ^= data[index];
-        hash *= UINT64_C(1099511628211);
-    }
-    return hash;
-}
-
-static uint64_t visited_fnv1a_uint64(uint64_t hash, uint64_t value)
-{
-    for (size_t index = 0; index < sizeof(value); index++)
-    {
-        hash ^= (unsigned char)(value >> (index * 8U));
-        hash *= UINT64_C(1099511628211);
-    }
-    return hash;
-}
-
 static uint64_t visited_hash(const PortableVisited *visited,
                              const char *root_id, size_t root_length,
                              const char *logical, size_t logical_length)
 {
-    uint64_t hash = UINT64_C(1469598103934665603) ^ visited->hash_salt;
-    hash = visited_fnv1a_uint64(hash, (uint64_t)root_length);
-    hash = visited_fnv1a_bytes(hash, (const unsigned char *)root_id,
-                               root_length);
-    hash = visited_fnv1a_uint64(hash, (uint64_t)logical_length);
-    return visited_fnv1a_bytes(hash, (const unsigned char *)logical,
-                               logical_length);
+    uint64_t hash = HASH_FNV1A_OFFSET_BASIS ^ visited->hash_salt;
+    hash = hash_fnv1a_uint64(hash, (uint64_t)root_length);
+    hash = hash_fnv1a_bytes(hash, (const unsigned char *)root_id,
+                            root_length);
+    hash = hash_fnv1a_uint64(hash, (uint64_t)logical_length);
+    return hash_fnv1a_bytes(hash, (const unsigned char *)logical,
+                            logical_length);
 }
 
 static size_t visited_max_capacity(void)
@@ -1608,9 +1587,9 @@ typedef struct {
 static uint64_t prescan_inode_hash(const PrescanInodeSet *set,
                                    dev_t device, ino_t inode)
 {
-    uint64_t hash = UINT64_C(1469598103934665603) ^ set->hash_salt;
-    hash = visited_fnv1a_uint64(hash, (uint64_t)device);
-    return visited_fnv1a_uint64(hash, (uint64_t)inode);
+    uint64_t hash = HASH_FNV1A_OFFSET_BASIS ^ set->hash_salt;
+    hash = hash_fnv1a_uint64(hash, (uint64_t)device);
+    return hash_fnv1a_uint64(hash, (uint64_t)inode);
 }
 
 static int prescan_inode_set_rehash(PrescanInodeSet *set,
@@ -1749,9 +1728,9 @@ typedef struct {
 static uint64_t inode_map_hash(const PortableInodeMap *map, dev_t device,
                                ino_t inode)
 {
-    uint64_t hash = UINT64_C(1469598103934665603) ^ map->hash_salt;
-    hash = visited_fnv1a_uint64(hash, (uint64_t)device);
-    return visited_fnv1a_uint64(hash, (uint64_t)inode);
+    uint64_t hash = HASH_FNV1A_OFFSET_BASIS ^ map->hash_salt;
+    hash = hash_fnv1a_uint64(hash, (uint64_t)device);
+    return hash_fnv1a_uint64(hash, (uint64_t)inode);
 }
 
 static int inode_map_rehash(PortableInodeMap *map, size_t new_capacity)
@@ -1908,10 +1887,10 @@ typedef struct {
 static uint64_t case_fold_hash(const PortableCaseFoldSet *set,
                                const char *folded_key, size_t key_length)
 {
-    uint64_t hash = UINT64_C(1469598103934665603) ^ set->hash_salt;
-    hash = visited_fnv1a_uint64(hash, (uint64_t)key_length);
-    return visited_fnv1a_bytes(hash, (const unsigned char *)folded_key,
-                               key_length);
+    uint64_t hash = HASH_FNV1A_OFFSET_BASIS ^ set->hash_salt;
+    hash = hash_fnv1a_uint64(hash, (uint64_t)key_length);
+    return hash_fnv1a_bytes(hash, (const unsigned char *)folded_key,
+                            key_length);
 }
 
 static int case_fold_set_rehash(PortableCaseFoldSet *set,

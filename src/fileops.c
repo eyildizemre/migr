@@ -14,6 +14,7 @@
 #include <stdint.h>
 
 #include "fileops.h" // CloneContext
+#include "hash.h"
 #include "metadata.h"
 #include "portable.h"
 #include "sidecar.h"
@@ -305,43 +306,19 @@ static void native_visited_count_probe(void)
 }
 #endif
 
-static uint64_t native_visited_fnv1a_bytes(uint64_t hash,
-                                           const unsigned char *data,
-                                           size_t length)
-{
-    for (size_t index = 0; index < length; index++)
-    {
-        hash ^= data[index];
-        hash *= UINT64_C(1099511628211);
-    }
-    return hash;
-}
-
-static uint64_t native_visited_fnv1a_uint64(uint64_t hash, uint64_t value)
-{
-    for (size_t index = 0; index < sizeof(value); index++)
-    {
-        hash ^= (unsigned char)(value >> (index * 8U));
-        hash *= UINT64_C(1099511628211);
-    }
-    return hash;
-}
-
 static uint64_t native_visited_hash(const NativeVisitedSet *set,
                                     const char *root_key,
                                     size_t root_key_length,
                                     const char *rel_path,
                                     size_t rel_path_length)
 {
-    uint64_t hash = UINT64_C(1469598103934665603) ^ set->hash_salt;
-    hash = native_visited_fnv1a_uint64(hash, (uint64_t)root_key_length);
-    hash = native_visited_fnv1a_bytes(hash,
-                                      (const unsigned char *)root_key,
-                                      root_key_length);
-    hash = native_visited_fnv1a_uint64(hash, (uint64_t)rel_path_length);
-    return native_visited_fnv1a_bytes(hash,
-                                      (const unsigned char *)rel_path,
-                                      rel_path_length);
+    uint64_t hash = HASH_FNV1A_OFFSET_BASIS ^ set->hash_salt;
+    hash = hash_fnv1a_uint64(hash, (uint64_t)root_key_length);
+    hash = hash_fnv1a_bytes(hash, (const unsigned char *)root_key,
+                            root_key_length);
+    hash = hash_fnv1a_uint64(hash, (uint64_t)rel_path_length);
+    return hash_fnv1a_bytes(hash, (const unsigned char *)rel_path,
+                            rel_path_length);
 }
 
 static int native_visited_rehash(NativeVisitedSet *set, size_t capacity)

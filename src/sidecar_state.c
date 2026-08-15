@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "sidecar.h"
+#include "hash.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -428,35 +429,14 @@ uint64_t sidecar_process_salt(void)
     return salt;
 }
 
-static uint64_t fnv1a_bytes(uint64_t hash, const unsigned char *data,
-                            size_t length)
-{
-    for (size_t index = 0; index < length; index++)
-    {
-        hash ^= data[index];
-        hash *= UINT64_C(1099511628211);
-    }
-    return hash;
-}
-
-static uint64_t fnv1a_uint64(uint64_t hash, uint64_t value)
-{
-    for (size_t index = 0; index < sizeof(value); index++)
-    {
-        hash ^= (unsigned char)(value >> (index * 8U));
-        hash *= UINT64_C(1099511628211);
-    }
-    return hash;
-}
-
 static uint64_t map_hash(const StateMap *map, SidecarBytes root_id,
                          SidecarBytes logical_path)
 {
-    uint64_t hash = UINT64_C(1469598103934665603) ^ map->hash_salt;
-    hash = fnv1a_uint64(hash, (uint64_t)root_id.length);
-    hash = fnv1a_bytes(hash, root_id.data, root_id.length);
-    hash = fnv1a_uint64(hash, (uint64_t)logical_path.length);
-    return fnv1a_bytes(hash, logical_path.data, logical_path.length);
+    uint64_t hash = HASH_FNV1A_OFFSET_BASIS ^ map->hash_salt;
+    hash = hash_fnv1a_uint64(hash, (uint64_t)root_id.length);
+    hash = hash_fnv1a_bytes(hash, root_id.data, root_id.length);
+    hash = hash_fnv1a_uint64(hash, (uint64_t)logical_path.length);
+    return hash_fnv1a_bytes(hash, logical_path.data, logical_path.length);
 }
 
 static size_t map_max_capacity(void)
