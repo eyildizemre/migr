@@ -1697,7 +1697,7 @@ reachable only through the existing test-only seam.
 
 ## D23 — 2026-08-13 — Native stale reconciliation without a new log format
 
-**Status:** Decided (locked in planning; implementation follows in H.1–H.5)
+**Status:** Implemented (Phase H closed 2026-08-14; as-built notes below)
 
 **Decision:** Native resume keeps the existing nsec-gated content-resume
 oracle and reconciles stale destination entries by scanning the destination
@@ -1792,3 +1792,53 @@ It uses D15's container ownership and `data/` boundary, and gives the same
 meaning. D14 continues to keep portable dispatch test-only; H's reconciliation
 is native production-path work, while direct portable dispatch remains
 disabled.
+
+### As-built (Phase H, 2026-08-14)
+
+The host suite and `make check` (strict GCC and Clang, sanitizers,
+Valgrind, and `-fanalyzer`) passed cleanly against `bbdcc02`, with no
+compiler diagnostics, Valgrind errors, or sanitizer errors.
+
+H-1 through H-4 matched their locked text with no corrections needed at
+implementation time -- unlike D22's G-2, nothing decided here turned out to
+rest on a false premise once built.
+
+One narrow, deliberately-unaddressed edge case was found and left as
+recorded debt rather than fixed: `native_reconcile_stale_at` (`fileops.c`)
+returns an error, rather than treating it as a no-op success, when a root
+is both absent from the visited-set *and* absent from the destination
+entirely (`fstatat` `ENOENT`). The only way to reach that combination is a
+root whose source object changes to a socket or device node between plan
+validation and actual capture -- a TOCTOU race outside this project's
+stated threat model (D17's "no realistic attacker scenario" reasoning),
+since `root_type_allowed` (`backup_plan.c`) already refuses to construct a
+socket/device-node root in the first place. The existing "a root that was
+never part of this run's own capture fails closed rather than being treated
+as empty" behavior is deliberately conservative and a real test locks it in
+on purpose; a clean fix would need the caller to distinguish "genuinely
+attempted and skipped this run" from "never part of the plan," which the
+current API does not do.
+
+The VM gate (Arch, Ubuntu, Fedora) exercised native stale reconciliation on
+real ext4 and btrfs (Arch's minimal image ships no btrfs-progs; recorded as
+not-applicable there, not a failure): a file deleted from source between a
+captured run and its resume is absent from the resumed final backup on
+both filesystems. A real `SIGKILL` mid-resume -- interrupting a run that
+had both fresh content still to capture and stale content still to
+reconcile -- specifically verified H-2/H-4's central claim that an
+interrupted deletion needs no commit protocol: the next clean resume
+converged to the fully correct final state (every stale survivor gone,
+every fresh file present) with no special recovery path, exactly as H-4
+predicted. A full regression pass of every existing VM-gate scenario also
+ran clean on all three VMs alongside these.
+
+Host-only scale tests (20,000 captured objects) kept the visited-set's
+insertion and reconciliation's lookup within linear probe budgets in both
+directions; mutating the visited-set's hash function to a constant
+confirmed the O(n²) guard actually fires (~200 million probes, all four
+assertions broken).
+
+Unlike the D14 test-only seam every portable-representation paragraph in
+this file and the README is gated behind, this phase's reconciliation is
+native production-path work: it runs on every real backup today, not only
+through a test-only entry point.

@@ -488,9 +488,16 @@ in G), so no single phase carries "make everything faithful at once."
   ext4, a portable `HARDLINK` record failing cleanly onto real vfat (which
   cannot `linkat()`), and Fedora's automatic `security.selinux` sharing
   through the shared inode.
-- **Phase H — Resume.** Sidecar as the comparison oracle (true size+mtime+type); the
-  deletion/precedence algorithm selected in B; drop stale entries. Commit-ordering is
-  already in place from B.
+- **Phase H — Native resume oracle + stale reconciliation.** **Status:
+  complete (2026-08-14).** Native resume-skip stays exactly as D17 already
+  locked it (`nsec_exact`-gated size+mtime); the gap D17 actually assigned
+  to this phase -- a source-deleted file surviving in the native payload
+  across a resume -- is closed by scanning the destination tree directly
+  against the walk's visited-path set after every root captures cleanly,
+  with no new committed-key log or wire format (D23). The real
+  Arch/Ubuntu/Fedora VM-gate matrix passed on real ext4 and btrfs, including
+  a live `SIGKILL` mid-resume whose next clean resume converged to the
+  fully correct final state with no special recovery path.
 - **Deferred — sparse files** (D13).
 
 ---

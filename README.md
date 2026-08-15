@@ -192,6 +192,17 @@ extended attributes arrive automatically without a second write. This
 remains behind the D14 test-only seam; production portable dispatch is
 still disabled.
 
+Native backups also reconcile themselves on resume: after every root
+captures cleanly, migr scans the destination tree directly and removes any
+file or subtree whose source counterpart is gone, so a file deleted from
+source cannot survive a resumed backup. Deletion only ever runs after a
+completely clean capture -- an interrupted or partially failed run leaves
+the destination untouched -- and an interruption during the removal itself
+is safely picked up and finished on the next resume, with no separate
+recovery step. Unlike the sidecar-based paths above, this is native
+production-path work today: it runs on every real backup, not only through
+a test-only entry point.
+
 ## Report
 
 Running `migr` or `migr report` scans your home directory and shows sizes for main directories, dotfiles, dev tools, and browsers — plus a critical backup size estimate.
