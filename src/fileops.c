@@ -125,6 +125,8 @@ static int native_inode_map_rehash(NativeInodeMap *map, size_t capacity)
     return 0;
 }
 
+static void native_inode_map_count_probe(void);
+
 static int native_inode_map_locate(const NativeInodeMap *map,
                                    dev_t device, ino_t inode,
                                    size_t *out_index)
@@ -141,6 +143,7 @@ static int native_inode_map_locate(const NativeInodeMap *map,
                    (map->capacity - 1U);
     for (size_t probes = 0; probes < map->capacity; probes++)
     {
+        native_inode_map_count_probe();
         const NativeInodeSlot *slot = &map->slots[index];
         if (!slot->used)
         {
@@ -292,8 +295,30 @@ void native_visited_test_reset_probe_count(void)
 {
     native_visited_probe_counter = 0;
 }
+
+static uint64_t native_inode_map_probe_counter;
+
+static void native_inode_map_count_probe(void)
+{
+    if (native_inode_map_probe_counter != UINT64_MAX)
+        native_inode_map_probe_counter++;
+}
+
+uint64_t native_inode_map_test_probe_count(void)
+{
+    return native_inode_map_probe_counter;
+}
+
+void native_inode_map_test_reset_probe_count(void)
+{
+    native_inode_map_probe_counter = 0;
+}
 #else
 static void native_visited_count_probe(void)
+{
+}
+
+static void native_inode_map_count_probe(void)
 {
 }
 #endif

@@ -38,6 +38,8 @@ void native_visited_free(void *visited);
 #ifdef NATIVE_VISITED_TEST_HOOKS
 uint64_t native_visited_test_probe_count(void);
 void native_visited_test_reset_probe_count(void);
+uint64_t native_inode_map_test_probe_count(void);
+void native_inode_map_test_reset_probe_count(void);
 #endif
 
 typedef struct {
