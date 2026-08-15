@@ -14,6 +14,7 @@
 #include <unistd.h>
 
 #include "encoding.h"
+#include "hash.h"
 #include "sidecar.h"
 #include "utils.h"
 
@@ -42,6 +43,7 @@ typedef struct {
     ParentMapSlot *slots;
     size_t count;
     size_t capacity;
+    uint64_t hash_salt;
 } ParentMap;
 
 typedef struct {
@@ -172,35 +174,15 @@ static uint64_t fnv1a_text(const char *text)
     return hash;
 }
 
-static uint64_t fnv1a_bytes(uint64_t hash, const unsigned char *data,
-                            size_t length)
-{
-    for (size_t index = 0; index < length; index++)
-    {
-        hash ^= data[index];
-        hash *= UINT64_C(1099511628211);
-    }
-    return hash;
-}
-
-static uint64_t fnv1a_uint64(uint64_t hash, uint64_t value)
-{
-    for (size_t index = 0; index < sizeof(value); index++)
-    {
-        hash ^= (unsigned char)(value >> (index * 8U));
-        hash *= UINT64_C(1099511628211);
-    }
-    return hash;
-}
-
-static uint64_t parent_map_hash(SidecarBytes root_id,
+static uint64_t parent_map_hash(const ParentMap *map,
+                                SidecarBytes root_id,
                                 SidecarBytes logical_path)
 {
-    uint64_t hash = UINT64_C(1469598103934665603);
-    hash = fnv1a_uint64(hash, (uint64_t)root_id.length);
-    hash = fnv1a_bytes(hash, root_id.data, root_id.length);
-    hash = fnv1a_uint64(hash, (uint64_t)logical_path.length);
-    return fnv1a_bytes(hash, logical_path.data, logical_path.length);
+    uint64_t hash = HASH_FNV1A_OFFSET_BASIS ^ map->hash_salt;
+    hash = hash_fnv1a_uint64(hash, (uint64_t)root_id.length);
+    hash = hash_fnv1a_bytes(hash, root_id.data, root_id.length);
+    hash = hash_fnv1a_uint64(hash, (uint64_t)logical_path.length);
+    return hash_fnv1a_bytes(hash, logical_path.data, logical_path.length);
 }
 
 static int parent_map_find(const ParentMap *map, SidecarBytes root_id,
@@ -518,8 +500,8 @@ static size_t root_map_find(const RootMap *map, const Manifest *manifest,
     if (map == NULL || manifest == NULL || map->capacity == 0 ||
         id.length == 0 || id.data == NULL)
         return SIZE_MAX;
-    uint64_t hash = fnv1a_bytes(UINT64_C(1469598103934665603),
-                                id.data, id.length);
+    uint64_t hash = hash_fnv1a_bytes(HASH_FNV1A_OFFSET_BASIS, id.data,
+                                     id.length);
     size_t index = (size_t)hash & (map->capacity - 1U);
     for (size_t probes = 0; probes < map->capacity; probes++)
     {
@@ -553,7 +535,7 @@ static int parent_map_find(const ParentMap *map, SidecarBytes root_id,
     if (map == NULL || map->capacity == 0 || map->slots == NULL)
         return 0;
 
-    size_t index = (size_t)parent_map_hash(root_id, logical_path) &
+    size_t index = (size_t)parent_map_hash(map, root_id, logical_path) &
                    (map->capacity - 1U);
     for (size_t probes = 0; probes < map->capacity; probes++)
     {
@@ -585,6 +567,7 @@ static int parent_map_init(ParentMap *map, PreflightMemory *memory,
         return -1;
     }
     memset(map, 0, sizeof(*map));
+    map->hash_salt = sidecar_process_salt();
     if (expected > SIZE_MAX / 2U)
     {
         errno = E2BIG;
@@ -645,7 +628,7 @@ static int parent_map_insert(ParentMap *map, SidecarBytes root_id,
         return -1;
     }
 
-    size_t index = (size_t)parent_map_hash(root_id, logical_path) &
+    size_t index = (size_t)parent_map_hash(map, root_id, logical_path) &
                    (map->capacity - 1U);
     for (size_t probes = 0; probes < map->capacity; probes++)
     {

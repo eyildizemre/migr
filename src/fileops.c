@@ -83,23 +83,15 @@ typedef struct {
     NativeInodeSlot *slots;
     size_t count;
     size_t capacity;
+    uint64_t hash_salt;
 } NativeInodeMap;
 
-static uint64_t native_inode_hash(dev_t device, ino_t inode)
+static uint64_t native_inode_hash(const NativeInodeMap *map, dev_t device,
+                                  ino_t inode)
 {
-    const uint64_t offset = UINT64_C(1469598103934665603);
-    const uint64_t prime = UINT64_C(1099511628211);
-    unsigned char bytes[sizeof(device) + sizeof(inode)];
-    uint64_t hash = offset;
-
-    memcpy(bytes, &device, sizeof(device));
-    memcpy(bytes + sizeof(device), &inode, sizeof(inode));
-    for (size_t i = 0; i < sizeof(bytes); i++)
-    {
-        hash ^= bytes[i];
-        hash *= prime;
-    }
-    return hash;
+    uint64_t hash = HASH_FNV1A_OFFSET_BASIS ^ map->hash_salt;
+    hash = hash_fnv1a_uint64(hash, (uint64_t)device);
+    return hash_fnv1a_uint64(hash, (uint64_t)inode);
 }
 
 static int native_inode_map_rehash(NativeInodeMap *map, size_t capacity)
@@ -119,7 +111,7 @@ static int native_inode_map_rehash(NativeInodeMap *map, size_t capacity)
         if (!old_slot->used)
             continue;
 
-        size_t index = (size_t)native_inode_hash(old_slot->device,
+        size_t index = (size_t)native_inode_hash(map, old_slot->device,
                                                   old_slot->inode) &
                        (capacity - 1U);
         while (slots[index].used)
@@ -145,7 +137,7 @@ static int native_inode_map_locate(const NativeInodeMap *map,
         return 0;
     }
 
-    size_t index = (size_t)native_inode_hash(device, inode) &
+    size_t index = (size_t)native_inode_hash(map, device, inode) &
                    (map->capacity - 1U);
     for (size_t probes = 0; probes < map->capacity; probes++)
     {
@@ -170,13 +162,13 @@ static int native_inode_map_locate(const NativeInodeMap *map,
 void *native_inode_map_create(void)
 {
     NativeInodeMap *map = calloc(1, sizeof(*map));
-    if (map == NULL || native_inode_map_rehash(map, 16U) != 0)
+    if (map == NULL)
+        return NULL;
+    map->hash_salt = sidecar_process_salt();
+    if (native_inode_map_rehash(map, 16U) != 0)
     {
-        if (map != NULL)
-        {
-            free(map->slots);
-            free(map);
-        }
+        free(map->slots);
+        free(map);
         return NULL;
     }
     return map;
