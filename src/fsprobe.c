@@ -579,6 +579,7 @@ int select_representation(const FsCapabilityProfile *profile, CloneRepresentatio
             case FS_CAP_UNAVAILABLE:
                 any_unavailable = 1;
                 break;
+            case FS_CAP_UNSET:  // never probed: refuse rather than guess
             case FS_CAP_ERROR:
                 return -1; // measurement untrustworthy: refuse
             default:

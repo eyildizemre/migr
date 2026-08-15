@@ -94,6 +94,11 @@ int main(void)
     check(select_representation(&p, &repr) == -1,
           "an unknown status -> refusal (fail closed, not native)");
 
+    p = all_supported();
+    p.capabilities[FS_CAP_HARDLINK].status = FS_CAP_UNSET;
+    check(select_representation(&p, &repr) == -1,
+          "an unset (never-probed) capability -> refusal, not native");
+
     // NULL arguments are refused, not dereferenced.
     p = all_supported();
     check(select_representation(NULL, &repr) == -1, "NULL profile -> refusal");

@@ -20,6 +20,7 @@ typedef enum {
 } FsCapability;
 
 typedef enum {
+    FS_CAP_UNSET,        // never probed; a forgotten dispatch line must not look supported
     FS_CAP_SUPPORTED,    // exercised and round-tripped faithfully
     FS_CAP_UNAVAILABLE,  // the semantic is not here (ENOTSUP, or a silent round-trip mismatch)
                          // -> a sidecar is needed to carry it: portable
