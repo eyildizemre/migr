@@ -125,7 +125,9 @@ while failing hardlinks specifically; this is why it wasn't caught by any
 earlier VM-gate pass, and why G.8's own VM-gate scenarios don't attempt to
 reproduce it with a real filesystem). Left as documented debt rather than a
 locked decision — a future phase should either add an `FS_CAP_HARDLINK`
-probe or explicitly decide the risk is acceptable.
+probe or explicitly decide the risk is acceptable. Closed 2026-08-15: an
+`FS_CAP_HARDLINK` probe now measures this directly (`fsprobe.c`), so
+`select_representation()` no longer has this blind spot.
 
 So a migr backup to ext4 is currently *less* faithful than `cp -a`, and D8's claim does
 not yet hold. Therefore this is not "add a portable branch to a working engine." It is

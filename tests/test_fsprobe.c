@@ -73,6 +73,11 @@ int main(void)
           "case-insensitive target -> portable, not native");
 
     p = all_supported();
+    p.capabilities[FS_CAP_HARDLINK].status = FS_CAP_UNAVAILABLE;
+    check(select_representation(&p, &repr) == 0 && repr == CLONE_PORTABLE_SIDECAR,
+          "a destination that can't hardlink -> portable, not native");
+
+    p = all_supported();
     p.capabilities[FS_CAP_MODE].status = FS_CAP_ERROR;
     check(select_representation(&p, &repr) == -1,
           "an operational error -> refusal");

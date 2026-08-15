@@ -6,7 +6,7 @@
 // Capabilities migr's native mode depends on. Each is exercised on the destination
 // with a create -> read-back -> delete round-trip, so a filesystem that accepts a
 // call but silently mangles the value still counts as lacking the capability. The
-// set grows per phase (ownership, timestamp precision, hardlinks, ... come later).
+// set grows per phase (ownership, timestamp precision, ... come later).
 typedef enum {
     FS_CAP_MODE,            // permission bits survive a chmod round-trip (file and dir)
     FS_CAP_SYMLINK,         // a symlink is created, typed as a link, target read back exact
@@ -15,6 +15,7 @@ typedef enum {
     FS_CAP_CASE_SENSITIVE,  // "a" and "A" are distinct entries (else foo/FOO collide -> loss)
     FS_CAP_XATTR,           // a user.* xattr is set, read back exact, and removed
     FS_CAP_TIMESTAMPS,      // atime/mtime seconds and ordering round-trip on file and dir
+    FS_CAP_HARDLINK,        // link() creates a second name sharing one inode (dev+ino)
     FS_CAP_COUNT
 } FsCapability;
 

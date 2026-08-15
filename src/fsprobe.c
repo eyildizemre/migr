@@ -16,7 +16,7 @@
 #include "utils.h" // path_join
 
 // Classify the errno of a *refused capability attempt* (used only via cap_refused, for
-// chmod/symlink/mkfifo/setxattr). The taxonomy is a first cut, good enough for A.2/A.3
+// chmod/symlink/mkfifo/setxattr/link). The taxonomy is a first cut, good enough for A.2/A.3
 // (where any non-native verdict is refused anyway); the exact per-filesystem errno
 // behaviour is nailed down by the real exFAT/NTFS integration tests before portable mode
 // (Phase B) depends on the unavailable/error distinction.
@@ -167,6 +167,39 @@ static FsCapabilityResult probe_case_sensitive(const char *dir)
     else
         r = cap_error(errno);
     unlink(lower);
+    return r;
+}
+
+// Two names share one inode after link(); a filesystem without hardlinks either
+// refuses link() outright (the FAT family) or, in principle, could silently fail to
+// share the inode. dev+ino equality is the same identity check backup.c's own native
+// hardlink capture already uses -- mirror it here rather than inventing a second
+// comparison.
+static FsCapabilityResult probe_hardlink(const char *dir)
+{
+    char original[PATH_MAX], linked[PATH_MAX];
+    if (path_join(original, sizeof(original), dir, "hardlink_probe_a") != 0 ||
+        path_join(linked, sizeof(linked), dir, "hardlink_probe_b") != 0)
+        return cap_error(ENAMETOOLONG);
+
+    int fd = open(original, O_CREAT | O_WRONLY | O_EXCL, 0600);
+    if (fd < 0)
+        return cap_error(errno);      // creating the test file failed: operational
+    close(fd);
+
+    FsCapabilityResult r = cap_ok();
+    if (link(original, linked) != 0)
+        r = cap_refused(errno);       // the filesystem refused link: capability attempt
+    else
+    {
+        struct stat st_a, st_b;
+        if (lstat(original, &st_a) != 0 || lstat(linked, &st_b) != 0)
+            r = cap_error(errno);     // inspecting the result failed: operational
+        else if (st_a.st_dev != st_b.st_dev || st_a.st_ino != st_b.st_ino)
+            r = cap_mismatch();       // two entries do not share one inode
+        unlink(linked);
+    }
+    unlink(original);
     return r;
 }
 
@@ -522,6 +555,7 @@ int fsprobe(const char *existing_root, FsCapabilityProfile *out)
     out->capabilities[FS_CAP_XATTR]          = probe_xattr(probe_dir);
     out->capabilities[FS_CAP_TIMESTAMPS]    = probe_timestamps(probe_dir,
                                                                  &out->nsec_exact);
+    out->capabilities[FS_CAP_HARDLINK]      = probe_hardlink(probe_dir);
 
     // Every probe cleans up after itself; if anything lingered, the directory will not
     // be empty and rmdir fails — treat that as an unreliable probe run.
