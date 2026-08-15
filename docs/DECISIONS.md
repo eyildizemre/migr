@@ -192,7 +192,10 @@ neither.
 
 ## D8 — 2026-07-19 — Document that ext4/btrfs destinations need none of this
 
-**Status:** Decided — not yet written into README
+**Status:** Implemented — the no-encoding/no-sidecar/exit-rights claim is now stated
+explicitly in README's "Core Metadata Fidelity" section (2026-08-15). Substantively
+satisfied well before this date by the accumulated native-fidelity work in Phases
+B/E/G/H; only the explicit statement in these terms had never actually landed.
 
 **Decision:** README should state that formatting the backup drive as ext4 or btrfs
 gives full fidelity with no encoding and no sidecar.

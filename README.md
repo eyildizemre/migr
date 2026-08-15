@@ -145,6 +145,12 @@ have a faithful restore-address policy.
 
 ## Core Metadata Fidelity
 
+On a native destination — ext4, btrfs, or any other filesystem that can hold full
+Linux semantics — a migr backup is nothing more than a plain, browsable copy of the
+source tree: no encoding, no sidecar file, and no migr-specific format of any kind.
+The backup can be fully recovered with `cp -a` on any Linux system, with or without
+migr itself (see [docs/DECISIONS.md](docs/DECISIONS.md) D8).
+
 Native backup and restore preserve the exact numeric ownership (uid/gid), permission
 mode, and atime/mtime timestamps for regular files, directories, FIFOs, and symlinks.
 Ownership is recorded truthfully and applied best-effort: a non-root user who cannot
