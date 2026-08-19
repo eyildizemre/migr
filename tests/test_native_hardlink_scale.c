@@ -183,6 +183,8 @@ int main(void)
             identity_ok = 0;
     }
     check(identity_ok, "all captured hardlink pairs retain inode identity");
+    check(native_inode_map_test_dir_fd_count(inode_map) == 1U,
+          "5,000 hardlink groups in one destination directory share a single pooled fd");
 
     if (close(tree_fd) != 0)
         fixture_fatal("could not close captured native tree");

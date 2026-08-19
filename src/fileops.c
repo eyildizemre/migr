@@ -80,10 +80,25 @@ typedef struct {
 } NativeInodeSlot;
 
 typedef struct {
+    dev_t device;
+    ino_t inode;
+    int fd;
+    int used;
+} NativeDirFdSlot;
+
+typedef struct {
+    NativeDirFdSlot *slots;
+    size_t count;
+    size_t capacity;
+    uint64_t hash_salt;
+} NativeDirFdPool;
+
+typedef struct {
     NativeInodeSlot *slots;
     size_t count;
     size_t capacity;
     uint64_t hash_salt;
+    NativeDirFdPool dir_pool;
 } NativeInodeMap;
 
 static uint64_t native_inode_hash(const NativeInodeMap *map, dev_t device,
@@ -162,12 +177,136 @@ static int native_inode_map_locate(const NativeInodeMap *map,
     return -1;
 }
 
+static uint64_t native_dir_fd_hash(const NativeDirFdPool *pool,
+                                   dev_t device, ino_t inode)
+{
+    uint64_t hash = HASH_FNV1A_OFFSET_BASIS ^ pool->hash_salt;
+    hash = hash_fnv1a_uint64(hash, (uint64_t)device);
+    return hash_fnv1a_uint64(hash, (uint64_t)inode);
+}
+
+static int native_dir_fd_pool_rehash(NativeDirFdPool *pool, size_t capacity)
+{
+    if (pool == NULL || capacity < 16U ||
+        (capacity & (capacity - 1U)) != 0 ||
+        capacity > SIZE_MAX / sizeof(*pool->slots))
+        return -1;
+
+    NativeDirFdSlot *slots = calloc(capacity, sizeof(*slots));
+    if (slots == NULL)
+        return -1;
+
+    for (size_t i = 0; i < pool->capacity; i++)
+    {
+        NativeDirFdSlot *old_slot = &pool->slots[i];
+        if (!old_slot->used)
+            continue;
+
+        size_t index = (size_t)native_dir_fd_hash(pool, old_slot->device,
+                                                   old_slot->inode) &
+                       (capacity - 1U);
+        while (slots[index].used)
+            index = (index + 1U) & (capacity - 1U);
+        slots[index] = *old_slot;
+    }
+
+    free(pool->slots);
+    pool->slots = slots;
+    pool->capacity = capacity;
+    return 0;
+}
+
+static int native_dir_fd_pool_locate(const NativeDirFdPool *pool,
+                                     dev_t device, ino_t inode,
+                                     size_t *out_index)
+{
+    if (pool == NULL || out_index == NULL)
+        return -1;
+    if (pool->capacity == 0)
+    {
+        *out_index = SIZE_MAX;
+        return 0;
+    }
+
+    size_t index = (size_t)native_dir_fd_hash(pool, device, inode) &
+                   (pool->capacity - 1U);
+    for (size_t probes = 0; probes < pool->capacity; probes++)
+    {
+        const NativeDirFdSlot *slot = &pool->slots[index];
+        if (!slot->used)
+        {
+            *out_index = index;
+            return 0;
+        }
+        if (slot->device == device && slot->inode == inode)
+        {
+            *out_index = index;
+            return 1;
+        }
+        index = (index + 1U) & (pool->capacity - 1U);
+    }
+
+    *out_index = SIZE_MAX;
+    return -1;
+}
+
+static int native_dir_fd_pool_acquire(NativeDirFdPool *pool, int parent_fd,
+                                      int *out_fd)
+{
+    if (pool == NULL || parent_fd < 0 || out_fd == NULL)
+        return -1;
+
+    struct stat dir_st;
+    if (fstat(parent_fd, &dir_st) != 0)
+        return -1;
+
+    if (pool->capacity == 0 &&
+        native_dir_fd_pool_rehash(pool, 16U) != 0)
+        return -1;
+
+    size_t index = SIZE_MAX;
+    int location = native_dir_fd_pool_locate(pool, dir_st.st_dev,
+                                             dir_st.st_ino, &index);
+    if (location < 0)
+        return -1;
+    if (location == 1)
+    {
+        *out_fd = pool->slots[index].fd;
+        return 0;
+    }
+
+    if (pool->count >= pool->capacity - pool->capacity / 3U)
+    {
+        if (pool->capacity > SIZE_MAX / 2U ||
+            native_dir_fd_pool_rehash(pool, pool->capacity * 2U) != 0)
+            return -1;
+        location = native_dir_fd_pool_locate(pool, dir_st.st_dev,
+                                             dir_st.st_ino, &index);
+        if (location != 0)
+            return -1;
+    }
+
+    int duplicate_fd = fcntl(parent_fd, F_DUPFD_CLOEXEC, 0);
+    if (duplicate_fd < 0)
+        return -1;
+
+    NativeDirFdSlot *slot = &pool->slots[index];
+    slot->device = dir_st.st_dev;
+    slot->inode = dir_st.st_ino;
+    slot->fd = duplicate_fd;
+    slot->used = 1;
+    pool->count++;
+    *out_fd = duplicate_fd;
+    return 0;
+}
+
 void *native_inode_map_create(void)
 {
     NativeInodeMap *map = calloc(1, sizeof(*map));
     if (map == NULL)
         return NULL;
     map->hash_salt = sidecar_process_salt();
+    map->dir_pool.hash_salt = sidecar_process_salt();
     if (native_inode_map_rehash(map, 16U) != 0)
     {
         free(map->slots);
@@ -182,9 +321,10 @@ void native_inode_map_free(void *opaque_map)
     NativeInodeMap *map = opaque_map;
     if (map == NULL)
         return;
-    for (size_t i = 0; i < map->capacity; i++)
-        if (map->slots[i].used)
-            close(map->slots[i].parent_fd);
+    for (size_t i = 0; i < map->dir_pool.capacity; i++)
+        if (map->dir_pool.slots[i].used)
+            close(map->dir_pool.slots[i].fd);
+    free(map->dir_pool.slots);
     free(map->slots);
     free(map);
 }
@@ -241,13 +381,14 @@ static int native_inode_map_insert(NativeInodeMap *map, dev_t device,
             return -1;
     }
 
-    int duplicate_fd = fcntl(parent_fd, F_DUPFD_CLOEXEC, 0);
-    if (duplicate_fd < 0)
+    int pooled_fd = -1;
+    if (native_dir_fd_pool_acquire(&map->dir_pool, parent_fd,
+                                   &pooled_fd) != 0)
         return -1;
     NativeInodeSlot *slot = &map->slots[index];
     slot->device = device;
     slot->inode = inode;
-    slot->parent_fd = duplicate_fd;
+    slot->parent_fd = pooled_fd;
     memcpy(slot->leaf, leaf, leaf_length + 1U);
     slot->used = 1;
     map->count++;
@@ -320,6 +461,14 @@ static void native_visited_count_probe(void)
 
 static void native_inode_map_count_probe(void)
 {
+}
+#endif
+
+#ifdef NATIVE_VISITED_TEST_HOOKS
+size_t native_inode_map_test_dir_fd_count(const void *opaque_map)
+{
+    const NativeInodeMap *map = opaque_map;
+    return map == NULL ? 0 : map->dir_pool.count;
 }
 #endif
 

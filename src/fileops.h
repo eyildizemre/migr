@@ -40,6 +40,7 @@ uint64_t native_visited_test_probe_count(void);
 void native_visited_test_reset_probe_count(void);
 uint64_t native_inode_map_test_probe_count(void);
 void native_inode_map_test_reset_probe_count(void);
+size_t native_inode_map_test_dir_fd_count(const void *map);
 #endif
 
 typedef struct {
