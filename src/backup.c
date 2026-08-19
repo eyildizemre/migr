@@ -1060,7 +1060,8 @@ int backup(const char *target, BackupMode mode, char **paths)
     // container without one is not a v1 container at all. An adopted one
     // already carries a manifest that was read back and matched during
     // adoption; rewriting it would truncate proven-good state for no gain.
-    if (!adopted && manifest_write_v1_at(container_fd, identity_manifest) != 0)
+    if (!adopted && repr == CLONE_NATIVE_TREE &&
+        manifest_write_v1_at(container_fd, identity_manifest) != 0)
     {
         printf("Error: Could not write manifest.txt into the backup container\n");
         had_error = 1;
