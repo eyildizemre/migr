@@ -1845,3 +1845,179 @@ Unlike the D14 test-only seam every portable-representation paragraph in
 this file and the README is gated behind, this phase's reconciliation is
 native production-path work: it runs on every real backup today, not only
 through a test-only entry point.
+
+---
+
+## D24 — 2026-08-19 — Production portable dispatch enablement
+
+**Status:** Decided (locked in planning; implementation follows in I.1a–I.5)
+
+**Decision:** D14's refusal of a portable verdict is lifted for production
+`backup()` and `restore()`. Once the activation commit (I.2, below) lands, a
+destination that `select_representation()` classifies as
+`CLONE_PORTABLE_SIDECAR` is captured and restored through the portable engine
+built across Phases B–H, instead of being refused. This entry locks the
+adapter contract that connects that already-built, already-tested engine to
+the production CLI; it introduces no new sidecar or manifest wire format, and
+does not reopen `select_representation()`'s own decision matrix (D14).
+
+### I-1 — Backup dispatches inside `backup()`
+
+The container reserve/adopt/finalize lifecycle stays representation-agnostic,
+exactly as D15 established it. The native/portable split is confined to
+manifest and payload-namespace ownership and to the capture engine invoked;
+there is no separate `backup_portable()` duplicating the shared lifecycle.
+
+### I-2 — Restore dispatches inside `restore()`
+
+When the manifest is valid and its representation is portable, native payload
+validation, native metadata inventory, native timestamp-anchor probing, and
+native confirmation do not run; the portable branch never re-enters the
+native preflight chain. Fd/cleanup code may be shared where genuinely common;
+the two preflight chains, being semantically distinct, are never interleaved.
+
+### I-3 — `packages.txt` is representation-independent
+
+Portable backup writes the package list into the same control slot native
+backup already uses. Portable restore applies packages only after file
+replay has completed fully successfully; a cancelled confirmation or a
+replay error never reaches the packages call.
+
+### I-4 — Representation and case behavior are measured, never predicted
+
+Both a live run and a dry-run run the real `fsprobe()`, and — on a portable
+verdict — the real destination-backed case-collision probe, against the
+actual destination. A resolvable case collision is recorded but not fatal; a
+violation counted in `PortablePrescanReport.unresolved_count` (an
+unrepresentable name, an oversized path, a root-namespace collision) is
+fatal. `total_count` alone never refuses a capture.
+
+### I-6 — Dry-run runs the real pre-mutation probe gates
+
+Dry-run creates no container, payload, or package list, but it runs the same
+temporary, self-cleaning filesystem round-trips a live run would, so its
+report is actually true rather than assumed: the full destination capability
+probe on backup; the privilege-relevant `O_TMPFILE` ownership probe on a
+native backup profile; the timestamp-anchor and metadata-ownership probes on
+native restore; the timestamp and ownership probes on portable restore; the
+destination-backed case/root-namespace probe on a portable backup. Dry-run
+never asks for confirmation. A probe refusal produces the same nonzero
+result a live run would produce for the same destination. This is a
+measurement of the current, real state only: it makes no promise about a
+later source TOCTOU, a later I/O error, or data that changes between the
+dry-run probe and a subsequent live capture.
+
+### Destination identity is fd-anchored, never re-resolved by path
+
+The capability probe, the prepared portable plan, and the container
+reservation/adoption claim all consume one destination-root file descriptor
+opened once, not a path string resolved independently by each step. A
+path-based `fsprobe(path, ...)` and path-based container reserve/adopt remain
+as compatibility wrappers around the fd-anchored primitives, but production
+`backup()` calls the fd-anchored form. This closes a real gap: today
+`fsprobe(target)`, `container_adopt(target)`, and `container_reserve(target)`
+each re-resolve `target` from its path independently, so a symlink swap
+between calls could let a destination the probe measured as native silently
+diverge from the destination the container is actually written into.
+
+### Portable capture prepares a complete, exact plan before any container reservation
+
+The mandatory pre-scan and the expected manifest (built once, from the
+portable capture request, through the one builder portable capture already
+uses) are produced together, against the destination or its nearest existing
+parent, before `container_reserve`/`container_adopt` runs. Fresh capture,
+resume comparison, and container adoption all consume that same prepared
+object; none of them constructs a second, independent copy of the expected
+manifest. This closes two related gaps: first, the manifest `backup()` itself
+has always built for resume comparison hard-codes `sidecar_version = 0`
+(correct for native, wrong for portable, since the portable engine's own
+manifest carries the current sidecar wire version), which would make a
+portable partial's identity never match on resume; second, running the
+portable engine's own deterministic pre-scan only after `container_reserve`
+has already claimed a `.partial` directory would leave a manifest-less,
+unadoptable partial behind on every deterministic refusal (an
+unrepresentable name, for instance), since a container is only resumable
+once its manifest has been written.
+
+### Portable restore reports one of four distinct outcomes
+
+Portable restore orchestration distinguishes completion, a dry-run preview, a
+user's cancellation, and a preflight/probe/replay error as four separate
+results — not, as today's direct API does, the same return value for a
+genuine success and a user declining the confirmation prompt. `restore()`
+owns interpreting that outcome, dispatching packages only on completion
+(previewing them only on dry-run), and printing the one final summary; the
+portable engine itself never prints a second "complete" line. Restore's
+destination timestamp policy is measured for real, by the same fd-anchored
+timestamp probe the engine's own tests already exercise, run by the
+orchestration itself after confirmation and before the first persistent
+mutation — production never accepts an injected or predicted timestamp
+policy, matching D14's standing prohibition on any override.
+
+### Commit discipline: one atomic activation, no partial public dispatch
+
+The adapter contracts above are built and proven in commits that change no
+CLI-visible behavior (the portable and native refusals stay in place while
+the underlying primitives are readied and independently tested). Production
+dispatch itself — backup, restore, dry-run, packages, and the minimal
+public-surface correction (`--help`, README, and the two source comments in
+`portable.h`/`portable_restore.h` that currently and correctly say production
+never calls these entry points) — opens together, in one commit. No
+committed state exists in which `migr backup` can write a portable container
+that `migr restore` cannot yet read back, or in which dry-run's preview and
+backup's live behavior disagree about representation.
+
+### Dry-run's persistent-effect claim is scoped honestly
+
+Dry-run's probes create and remove real, named scratch objects on the
+destination (or its parent, for a destination that does not yet exist);
+every one is removed on every success and failure path. What is guaranteed
+is that no persistent container, `.partial`, manifest, sidecar, payload, or
+package file is left behind — not that the destination filesystem is
+completely unaffected, since a probe's own create/remove pair can still
+change a parent directory's ctime. Documentation states the former, not the
+latter.
+
+**Why:** The portable engine has been built and tested end to end since
+Phase B, entirely behind D14's test-only seam; the sidecar branch's own
+stated purpose (D6) is not complete until a user can actually reach it.
+Locking the adapter contract before writing it prevents exactly the class of
+defect a live-code review of the naive integration surfaced: a
+resume-identity field silently left at its native default, a native-only
+preflight applied where it does not belong, a success path with no way to
+report what it did, and container/probe/plan identity resolved by path more
+than once. Requiring one atomic activation commit, after readiness work that
+changes nothing observable, is the same "an incomplete state must never look
+complete" discipline D15 already applies to the container itself, applied
+here to the commit history around it.
+
+**Rejected:** Separate `backup_portable()`/`restore_portable()` functions
+duplicating the container lifecycle, rejected as unnecessary copying once
+that lifecycle is confirmed representation-agnostic. Landing backup dispatch
+and restore dispatch as two separate, individually-green commits, rejected
+because the intermediate state is a green build that cannot read back what
+it just wrote. Treating `fsprobe(path)`/`container_adopt(path)`/
+`container_reserve(path)`'s independent path re-resolution as acceptable,
+rejected once it was shown to open a real TOCTOU window between what was
+measured and what is written. Continuing to build a second, independent
+expected-manifest copy in `backup()` itself, rejected in favor of one shared
+builder, once the existing `sidecar_version` default was shown to break
+portable resume identity silently. A blanket "dry-run never touches the
+destination" claim, rejected as stronger than what the implementation
+actually provides once dry-run began running real probes to keep its
+preview honest.
+
+**Relationship:** D24 lifts D14's production-disabled boundary for the
+`CLONE_PORTABLE_SIDECAR` verdict once the activation commit described here
+lands; D14's own text is unchanged, per this file's append-only rule, and
+its selector logic (`fsprobe`/`select_representation`) is not reopened by
+this entry. It reuses D15's `data/`-namespace and atomic-finalization
+container lifecycle without modification and depends on D16's
+root-addressing policy for the `MANUAL_NATIVE` refusal, which portable
+capture continues to enforce. It relies on D17's resume-identity comparison
+(extending its exactness to the sidecar-version field for a portable
+partial) and on D19–D23's already-locked portable capture, illegal-name,
+case-collision, hardlink, and native-reconciliation contracts, none of which
+this entry revisits. Native restore's own hardlink-identity duplication
+(D22 G-5) remains open and is not touched by this entry; closing it, if it
+happens, is separate work.
