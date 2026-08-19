@@ -50,6 +50,72 @@ static FsCapabilityProfile all_supported(void)
     return p;
 }
 
+static int directory_is_empty(const char *path)
+{
+    DIR *dir = opendir(path);
+    if (dir == NULL)
+        return 0;
+
+    int empty = 1;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL)
+    {
+        if (strcmp(entry->d_name, ".") != 0 &&
+            strcmp(entry->d_name, "..") != 0)
+        {
+            empty = 0;
+            break;
+        }
+    }
+    closedir(dir);
+    return empty;
+}
+
+static void test_fsprobe_fd_is_anchored(char *root)
+{
+    printf(BLUE "::" NC " fsprobe: fd primitive stays on the opened directory after a path swap\n");
+
+    FsCapabilityProfile profile;
+    check(fsprobe_fd(-1, &profile) == -1,
+          "fd-anchored probe rejects an invalid root fd");
+
+    int root_fd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    check(root_fd >= 0, "fixture: open the probe root before swapping its path");
+    if (root_fd < 0)
+        return;
+
+    char saved[sizeof "/tmp/fsprobe_root_XXXXXX.saved"];
+    if (snprintf(saved, sizeof(saved), "%s.saved", root) < 0 ||
+        rename(root, saved) != 0)
+    {
+        check(0, "fixture: move the originally opened directory aside");
+        close(root_fd);
+        return;
+    }
+
+    int swapped_fd = open(root, O_CREAT | O_WRONLY | O_EXCL | O_CLOEXEC, 0600);
+    check(swapped_fd >= 0, "fixture: replace the original path with a different object");
+
+    int rc = fsprobe_fd(root_fd, &profile);
+    check(rc == 0,
+          "fd-anchored probe succeeds on the originally opened directory");
+    check(fcntl(root_fd, F_GETFD) >= 0,
+          "fd-anchored probe leaves the borrowed root fd open");
+    check(directory_is_empty(saved),
+          "all probe artifacts were created and removed under the opened directory");
+
+    struct stat swapped_st;
+    check(lstat(root, &swapped_st) == 0 && S_ISREG(swapped_st.st_mode),
+          "the swapped-in path was not used as the probe anchor");
+
+    if (swapped_fd >= 0)
+        close(swapped_fd);
+    check(unlink(root) == 0, "fixture: remove the swapped-in object");
+    check(rmdir(saved) == 0, "fixture: remove the original probe root");
+    close(root_fd);
+    check(mkdir(root, 0700) == 0, "fixture: recreate the probe root for later checks");
+}
+
 int main(void)
 {
     printf(BLUE "::" NC " fsprobe (unit)\n");
@@ -144,6 +210,8 @@ int main(void)
         else
             printf("    (observed verdict: refuse)\n");
     }
+
+    test_fsprobe_fd_is_anchored(root);
 
     int root_fd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     check(root_fd >= 0, "timestamp probe root opens by fd");

@@ -13,7 +13,6 @@
 #include <time.h>
 
 #include "fsprobe.h"
-#include "utils.h" // path_join
 
 // Classify the errno of a *refused capability attempt* (used only via cap_refused, for
 // chmod/symlink/mkfifo/setxattr/link). The taxonomy is a first cut, good enough for A.2/A.3
@@ -48,192 +47,6 @@ static FsCapabilityResult cap_refused(int e) { FsCapabilityResult r = { classify
 // it never masquerades as a missing capability.
 static FsCapabilityResult cap_error(int e)   { FsCapabilityResult r = { FS_CAP_ERROR, e };       return r; }
 
-// Permission bits survive a chmod round-trip, for a file and a directory. A lossy
-// mount (e.g. vfat with fmask/dmask) accepts chmod but reports a fixed mode back.
-static FsCapabilityResult probe_mode(const char *dir)
-{
-    char file[PATH_MAX], sub[PATH_MAX];
-    if (path_join(file, sizeof(file), dir, "mode_file") != 0 ||
-        path_join(sub, sizeof(sub), dir, "mode_dir") != 0)
-        return cap_error(ENAMETOOLONG);
-
-    int fd = open(file, O_CREAT | O_WRONLY | O_EXCL, 0600);
-    if (fd < 0)
-        return cap_error(errno);      // creating the test file failed: operational
-    close(fd);
-
-    FsCapabilityResult r = cap_ok();
-    struct stat st;
-    if (chmod(file, 0642) != 0)
-        r = cap_refused(errno);       // the filesystem refused chmod: capability attempt
-    else if (lstat(file, &st) != 0)
-        r = cap_error(errno);         // inspecting the result failed: operational
-    else if ((st.st_mode & 0777) != 0642)
-        r = cap_mismatch();
-    unlink(file);
-    if (r.status != FS_CAP_SUPPORTED)
-        return r;
-
-    if (mkdir(sub, 0700) != 0)
-        return cap_error(errno);
-    if (chmod(sub, 0751) != 0)
-        r = cap_refused(errno);
-    else if (lstat(sub, &st) != 0)
-        r = cap_error(errno);
-    else if ((st.st_mode & 0777) != 0751)
-        r = cap_mismatch();
-    rmdir(sub);
-    return r;
-}
-
-// A symlink is created, typed as a link, and its target bytes read back exactly.
-static FsCapabilityResult probe_symlink(const char *dir)
-{
-    char link[PATH_MAX];
-    if (path_join(link, sizeof(link), dir, "symlink_probe") != 0)
-        return cap_error(ENAMETOOLONG);
-
-    const char *target = "target/need/not/exist";
-    if (symlink(target, link) != 0)
-        return cap_refused(errno);    // the filesystem refused symlink: capability attempt
-
-    FsCapabilityResult r = cap_ok();
-    struct stat st;
-    char buf[PATH_MAX];
-    ssize_t n;
-    if (lstat(link, &st) != 0)
-        r = cap_error(errno);         // inspecting the result failed: operational
-    else if (!S_ISLNK(st.st_mode))
-        r = cap_mismatch();           // created, but not a symlink: semantic unavailable
-    else if ((n = readlink(link, buf, sizeof(buf) - 1)) < 0)
-        r = cap_error(errno);
-    else
-    {
-        buf[n] = '\0';
-        if (strcmp(buf, target) != 0)
-            r = cap_mismatch();
-    }
-    unlink(link);
-    return r;
-}
-
-// A FIFO node is created and typed as a FIFO.
-static FsCapabilityResult probe_fifo(const char *dir)
-{
-    char fifo[PATH_MAX];
-    if (path_join(fifo, sizeof(fifo), dir, "fifo_probe") != 0)
-        return cap_error(ENAMETOOLONG);
-
-    if (mkfifo(fifo, 0644) != 0)
-        return cap_refused(errno);    // the filesystem refused mkfifo: capability attempt
-
-    FsCapabilityResult r = cap_ok();
-    struct stat st;
-    if (lstat(fifo, &st) != 0)
-        r = cap_error(errno);         // inspecting the result failed: operational
-    else if (!S_ISFIFO(st.st_mode))
-        r = cap_mismatch();           // created, but not a FIFO: semantic unavailable
-    unlink(fifo);
-    return r;
-}
-
-// "a" and "A" are distinct entries. On a case-insensitive filesystem the upper-case
-// name resolves to the file we just made, so a native clone of foo/FOO would collide.
-static FsCapabilityResult probe_case_sensitive(const char *dir)
-{
-    char lower[PATH_MAX], upper[PATH_MAX];
-    if (path_join(lower, sizeof(lower), dir, "case_probe_a") != 0 ||
-        path_join(upper, sizeof(upper), dir, "case_probe_A") != 0)
-        return cap_error(ENAMETOOLONG);
-
-    int fda = open(lower, O_CREAT | O_WRONLY | O_EXCL, 0600);
-    if (fda < 0)
-        return cap_error(errno);      // creating the base file failed: operational
-    close(fda);
-
-    // Creating the upper-case name with O_EXCL proves whether it is a distinct entry.
-    // EEXIST means it collided with the lower-case file -> case-insensitive, so a
-    // native clone of foo/FOO would lose one of them. Any other error is operational.
-    FsCapabilityResult r;
-    int fdb = open(upper, O_CREAT | O_WRONLY | O_EXCL, 0600);
-    if (fdb >= 0)
-    {
-        close(fdb);
-        unlink(upper);
-        r = cap_ok();
-    }
-    else if (errno == EEXIST)
-        r = cap_mismatch();
-    else
-        r = cap_error(errno);
-    unlink(lower);
-    return r;
-}
-
-// Two names share one inode after link(); a filesystem without hardlinks either
-// refuses link() outright (the FAT family) or, in principle, could silently fail to
-// share the inode. dev+ino equality is the same identity check backup.c's own native
-// hardlink capture already uses -- mirror it here rather than inventing a second
-// comparison.
-static FsCapabilityResult probe_hardlink(const char *dir)
-{
-    char original[PATH_MAX], linked[PATH_MAX];
-    if (path_join(original, sizeof(original), dir, "hardlink_probe_a") != 0 ||
-        path_join(linked, sizeof(linked), dir, "hardlink_probe_b") != 0)
-        return cap_error(ENAMETOOLONG);
-
-    int fd = open(original, O_CREAT | O_WRONLY | O_EXCL, 0600);
-    if (fd < 0)
-        return cap_error(errno);      // creating the test file failed: operational
-    close(fd);
-
-    FsCapabilityResult r = cap_ok();
-    if (link(original, linked) != 0)
-        r = cap_refused(errno);       // the filesystem refused link: capability attempt
-    else
-    {
-        struct stat st_a, st_b;
-        if (lstat(original, &st_a) != 0 || lstat(linked, &st_b) != 0)
-            r = cap_error(errno);     // inspecting the result failed: operational
-        else if (st_a.st_dev != st_b.st_dev || st_a.st_ino != st_b.st_ino)
-            r = cap_mismatch();       // two entries do not share one inode
-        unlink(linked);
-    }
-    unlink(original);
-    return r;
-}
-
-// A user.* xattr is set, read back byte-for-byte, and removed.
-static FsCapabilityResult probe_xattr(const char *dir)
-{
-    char file[PATH_MAX];
-    if (path_join(file, sizeof(file), dir, "xattr_probe") != 0)
-        return cap_error(ENAMETOOLONG);
-
-    int fd = open(file, O_CREAT | O_WRONLY | O_EXCL, 0600);
-    if (fd < 0)
-        return cap_error(errno);      // creating the test file failed: operational
-    close(fd);
-
-    const char *name = "user.migr_probe";
-    const char *value = "migr-probe-value";
-    size_t vlen = strlen(value);
-    char got[64];
-    ssize_t n;
-
-    FsCapabilityResult r = cap_ok();
-    if (setxattr(file, name, value, vlen, 0) != 0)
-        r = cap_refused(errno);       // the filesystem refused the xattr: capability attempt
-    else if ((n = getxattr(file, name, got, sizeof(got))) < 0)
-        r = cap_error(errno);         // set succeeded but read-back failed: operational
-    else if ((size_t)n != vlen || memcmp(got, value, vlen) != 0)
-        r = cap_mismatch();
-    else if (removexattr(file, name) != 0)
-        r = cap_error(errno);
-    unlink(file);
-    return r;
-}
-
 // A small corpus of names that lossy filesystems (exFAT/NTFS/FAT32) reject outright or
 // silently normalise. On a native filesystem every one round-trips byte-for-byte.
 static const char *const raw_name_corpus[] = {
@@ -243,21 +56,14 @@ static const char *const raw_name_corpus[] = {
     "trailing ",  // trailing space (often stripped)
 };
 
-static FsCapabilityResult probe_raw_names(const char *dir)
+static FsCapabilityResult probe_raw_names_fd(int dir_fd)
 {
     int count = (int)(sizeof(raw_name_corpus) / sizeof(raw_name_corpus[0]));
     FsCapabilityResult r = cap_ok();
 
     for (int i = 0; i < count && r.status == FS_CAP_SUPPORTED; i++)
     {
-        char path[PATH_MAX];
-        if (path_join(path, sizeof(path), dir, raw_name_corpus[i]) != 0)
-        {
-            r = cap_error(ENAMETOOLONG);
-            break;
-        }
-
-        int fd = open(path, O_CREAT | O_WRONLY | O_EXCL, 0600);
+        int fd = openat(dir_fd, raw_name_corpus[i], O_CREAT | O_WRONLY | O_EXCL, 0600);
         if (fd < 0)
         {
             // A name the filesystem cannot represent is unavailable; a genuine
@@ -275,13 +81,22 @@ static FsCapabilityResult probe_raw_names(const char *dir)
         // normalised form (dropped the trailing dot, say) fails this even though the
         // create "succeeded". Reading the directory is a supporting operation: a real
         // readdir failure (errno set once it returns NULL) is an error, not a verdict.
-        DIR *d = opendir(dir);
+        int scan_fd = fcntl(dir_fd, F_DUPFD_CLOEXEC, 0);
+        if (scan_fd < 0)
+        {
+            r = cap_error(errno);
+            unlinkat(dir_fd, raw_name_corpus[i], 0);
+            break;
+        }
+        DIR *d = fdopendir(scan_fd);
         if (d == NULL)
         {
             r = cap_error(errno);
-            unlink(path);
+            close(scan_fd);
+            unlinkat(dir_fd, raw_name_corpus[i], 0);
             break;
         }
+        rewinddir(d);
         int found = 0;
         errno = 0;
         struct dirent *e;
@@ -299,10 +114,167 @@ static FsCapabilityResult probe_raw_names(const char *dir)
         // On a normalising filesystem the lookup normalises the same way, so unlinking
         // by the original name removes the stored entry; anything it somehow leaves is
         // caught by the caller's final rmdir (-> a fatal, un-masked probe failure).
-        unlink(path);
+        unlinkat(dir_fd, raw_name_corpus[i], 0);
         if (!found)
             r = (readdir_errno != 0) ? cap_error(readdir_errno) : cap_mismatch();
     }
+    return r;
+}
+
+// Permission bits survive a chmod round-trip, for a file and a directory. A lossy
+// mount (e.g. vfat with fmask/dmask) accepts chmod but reports a fixed mode back.
+static FsCapabilityResult probe_mode_fd(int dir_fd)
+{
+    int fd = openat(dir_fd, "mode_file", O_CREAT | O_WRONLY | O_EXCL, 0600);
+    if (fd < 0)
+        return cap_error(errno);
+    close(fd);
+
+    FsCapabilityResult r = cap_ok();
+    struct stat st;
+    if (fchmodat(dir_fd, "mode_file", 0642, 0) != 0)
+        r = cap_refused(errno);
+    else if (fstatat(dir_fd, "mode_file", &st, AT_SYMLINK_NOFOLLOW) != 0)
+        r = cap_error(errno);
+    else if ((st.st_mode & 0777) != 0642)
+        r = cap_mismatch();
+    unlinkat(dir_fd, "mode_file", 0);
+    if (r.status != FS_CAP_SUPPORTED)
+        return r;
+
+    if (mkdirat(dir_fd, "mode_dir", 0700) != 0)
+        return cap_error(errno);
+    if (fchmodat(dir_fd, "mode_dir", 0751, 0) != 0)
+        r = cap_refused(errno);
+    else if (fstatat(dir_fd, "mode_dir", &st, AT_SYMLINK_NOFOLLOW) != 0)
+        r = cap_error(errno);
+    else if ((st.st_mode & 0777) != 0751)
+        r = cap_mismatch();
+    unlinkat(dir_fd, "mode_dir", AT_REMOVEDIR);
+    return r;
+}
+
+// A symlink is created, typed as a link, and its target bytes read back exactly.
+static FsCapabilityResult probe_symlink_fd(int dir_fd)
+{
+    const char *target = "target/need/not/exist";
+    if (symlinkat(target, dir_fd, "symlink_probe") != 0)
+        return cap_refused(errno);
+
+    FsCapabilityResult r = cap_ok();
+    struct stat st;
+    char buf[PATH_MAX];
+    ssize_t n;
+    if (fstatat(dir_fd, "symlink_probe", &st, AT_SYMLINK_NOFOLLOW) != 0)
+        r = cap_error(errno);
+    else if (!S_ISLNK(st.st_mode))
+        r = cap_mismatch();
+    else if ((n = readlinkat(dir_fd, "symlink_probe", buf, sizeof(buf) - 1)) < 0)
+        r = cap_error(errno);
+    else
+    {
+        buf[n] = '\0';
+        if (strcmp(buf, target) != 0)
+            r = cap_mismatch();
+    }
+    unlinkat(dir_fd, "symlink_probe", 0);
+    return r;
+}
+
+// A FIFO node is created and typed as a FIFO.
+static FsCapabilityResult probe_fifo_fd(int dir_fd)
+{
+    if (mkfifoat(dir_fd, "fifo_probe", 0644) != 0)
+        return cap_refused(errno);
+
+    FsCapabilityResult r = cap_ok();
+    struct stat st;
+    if (fstatat(dir_fd, "fifo_probe", &st, AT_SYMLINK_NOFOLLOW) != 0)
+        r = cap_error(errno);
+    else if (!S_ISFIFO(st.st_mode))
+        r = cap_mismatch();
+    unlinkat(dir_fd, "fifo_probe", 0);
+    return r;
+}
+
+// "a" and "A" are distinct entries. On a case-insensitive filesystem the upper-case
+// name resolves to the file we just made, so a native clone of foo/FOO would collide.
+static FsCapabilityResult probe_case_sensitive_fd(int dir_fd)
+{
+    int fda = openat(dir_fd, "case_probe_a", O_CREAT | O_WRONLY | O_EXCL, 0600);
+    if (fda < 0)
+        return cap_error(errno);
+    close(fda);
+
+    FsCapabilityResult r;
+    int fdb = openat(dir_fd, "case_probe_A", O_CREAT | O_WRONLY | O_EXCL, 0600);
+    if (fdb >= 0)
+    {
+        close(fdb);
+        unlinkat(dir_fd, "case_probe_A", 0);
+        r = cap_ok();
+    }
+    else if (errno == EEXIST)
+        r = cap_mismatch();
+    else
+        r = cap_error(errno);
+    unlinkat(dir_fd, "case_probe_a", 0);
+    return r;
+}
+
+// Two names share one inode after link(); a filesystem without hardlinks either
+// refuses link() outright (the FAT family) or, in principle, could silently fail to
+// share the inode. dev+ino equality is the same identity check backup.c's own native
+// hardlink capture already uses -- mirror it here rather than inventing a second
+// comparison.
+static FsCapabilityResult probe_hardlink_fd(int dir_fd)
+{
+    int fd = openat(dir_fd, "hardlink_probe_a", O_CREAT | O_WRONLY | O_EXCL, 0600);
+    if (fd < 0)
+        return cap_error(errno);
+    close(fd);
+
+    FsCapabilityResult r = cap_ok();
+    if (linkat(dir_fd, "hardlink_probe_a", dir_fd, "hardlink_probe_b", 0) != 0)
+        r = cap_refused(errno);
+    else
+    {
+        struct stat st_a, st_b;
+        if (fstatat(dir_fd, "hardlink_probe_a", &st_a, AT_SYMLINK_NOFOLLOW) != 0 ||
+            fstatat(dir_fd, "hardlink_probe_b", &st_b, AT_SYMLINK_NOFOLLOW) != 0)
+            r = cap_error(errno);
+        else if (st_a.st_dev != st_b.st_dev || st_a.st_ino != st_b.st_ino)
+            r = cap_mismatch();
+        unlinkat(dir_fd, "hardlink_probe_b", 0);
+    }
+    unlinkat(dir_fd, "hardlink_probe_a", 0);
+    return r;
+}
+
+// A user.* xattr is set, read back byte-for-byte, and removed.
+static FsCapabilityResult probe_xattr_fd(int dir_fd)
+{
+    int fd = openat(dir_fd, "xattr_probe", O_CREAT | O_WRONLY | O_EXCL, 0600);
+    if (fd < 0)
+        return cap_error(errno);
+
+    const char *name = "user.migr_probe";
+    const char *value = "migr-probe-value";
+    size_t vlen = strlen(value);
+    char got[64];
+    ssize_t n;
+
+    FsCapabilityResult r = cap_ok();
+    if (fsetxattr(fd, name, value, vlen, 0) != 0)
+        r = cap_refused(errno);
+    else if ((n = fgetxattr(fd, name, got, sizeof(got))) < 0)
+        r = cap_error(errno);
+    else if ((size_t)n != vlen || memcmp(got, value, vlen) != 0)
+        r = cap_mismatch();
+    else if (fremovexattr(fd, name) != 0)
+        r = cap_error(errno);
+    close(fd);
+    unlinkat(dir_fd, "xattr_probe", 0);
     return r;
 }
 
@@ -315,7 +287,7 @@ static FsCapabilityResult probe_raw_names(const char *dir)
 //
 // Return value distinguishes *why* the probe did not confirm support, which
 // the two callers below need for different reasons: fsprobe_timestamps_fd()
-// only needs a pass/fail signal, but probe_timestamps() must turn a genuine
+// only needs a pass/fail signal, but probe_timestamps_dirfd() must turn a genuine
 // syscall failure into FS_CAP_ERROR and a value mismatch into
 // FS_CAP_UNAVAILABLE, exactly as its own inline loop did before both probes
 // were unified onto this one fd-anchored primitive.
@@ -358,31 +330,28 @@ static int timestamp_roundtrip_fd(int fd, const struct timespec first[2],
     return 0;
 }
 
-static FsCapabilityResult probe_timestamps(const char *dir, int *nsec_exact)
+static FsCapabilityResult probe_timestamps_dirfd(int dir_fd, int *nsec_exact)
 {
-    char file[PATH_MAX], subdir[PATH_MAX];
-    if (path_join(file, sizeof(file), dir, "timestamp_file") != 0 ||
-        path_join(subdir, sizeof(subdir), dir, "timestamp_dir") != 0)
-        return cap_error(ENAMETOOLONG);
-
-    int file_fd = open(file, O_CREAT | O_WRONLY | O_EXCL | O_CLOEXEC, 0600);
+    int file_fd = openat(dir_fd, "timestamp_file",
+                         O_CREAT | O_WRONLY | O_EXCL | O_CLOEXEC, 0600);
     if (file_fd < 0)
         return cap_error(errno);
-    if (mkdir(subdir, 0700) != 0)
+    if (mkdirat(dir_fd, "timestamp_dir", 0700) != 0)
     {
         int saved_errno = errno;
         close(file_fd);
-        unlink(file);
+        unlinkat(dir_fd, "timestamp_file", 0);
         errno = saved_errno;
         return cap_error(saved_errno);
     }
-    int subdir_fd = open(subdir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int subdir_fd = openat(dir_fd, "timestamp_dir",
+                           O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (subdir_fd < 0)
     {
         int saved_errno = errno;
         close(file_fd);
-        unlink(file);
-        rmdir(subdir);
+        unlinkat(dir_fd, "timestamp_file", 0);
+        unlinkat(dir_fd, "timestamp_dir", AT_REMOVEDIR);
         errno = saved_errno;
         return cap_error(saved_errno);
     }
@@ -421,9 +390,11 @@ static FsCapabilityResult probe_timestamps(const char *dir, int *nsec_exact)
         result = cap_error(errno);
     if (close(subdir_fd) != 0 && result.status == FS_CAP_SUPPORTED)
         result = cap_error(errno);
-    if (unlink(file) != 0 && result.status == FS_CAP_SUPPORTED)
+    if (unlinkat(dir_fd, "timestamp_file", 0) != 0 &&
+        result.status == FS_CAP_SUPPORTED)
         result = cap_error(errno);
-    if (rmdir(subdir) != 0 && result.status == FS_CAP_SUPPORTED)
+    if (unlinkat(dir_fd, "timestamp_dir", AT_REMOVEDIR) != 0 &&
+        result.status == FS_CAP_SUPPORTED)
         result = cap_error(errno);
     errno = saved_errno;
     if (nsec_exact != NULL)
@@ -511,57 +482,89 @@ int fsprobe_timestamps_fd(int root_fd, int *nsec_exact)
     return 0;
 }
 
+int fsprobe_fd(int root_fd, FsCapabilityProfile *out)
+{
+    if (root_fd < 0 || out == NULL)
+        return -1;
+    memset(out, 0, sizeof(*out));
+
+    struct stat root_st;
+    if (fstat(root_fd, &root_st) != 0 || !S_ISDIR(root_st.st_mode))
+        return -1;
+
+    char probe_name[NAME_MAX + 1];
+    int probe_fd = -1;
+    int created = 0;
+    for (unsigned int suffix = 0; suffix < 1000; suffix++)
+    {
+        int n = suffix == 0
+            ? snprintf(probe_name, sizeof(probe_name), ".migr-probe-fd-%ld",
+                       (long)getpid())
+            : snprintf(probe_name, sizeof(probe_name), ".migr-probe-fd-%ld_%u",
+                       (long)getpid(), suffix);
+        if (n < 0 || (size_t)n >= sizeof(probe_name))
+            return -1;
+        if (mkdirat(root_fd, probe_name, 0700) == 0)
+        {
+            created = 1;
+            probe_fd = openat(root_fd, probe_name,
+                              O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            break;
+        }
+        if (errno != EEXIST)
+            return -1;
+    }
+    if (!created || probe_fd < 0)
+    {
+        if (created)
+            (void)unlinkat(root_fd, probe_name, AT_REMOVEDIR);
+        return -1;
+    }
+
+    int baseline_ok = 0;
+    int baseline_fd = openat(probe_fd, "baseline", O_CREAT | O_WRONLY | O_EXCL, 0600);
+    if (baseline_fd >= 0)
+    {
+        close(baseline_fd);
+        struct stat st;
+        if (fstatat(probe_fd, "baseline", &st, AT_SYMLINK_NOFOLLOW) == 0 &&
+            S_ISREG(st.st_mode))
+            baseline_ok = 1;
+        unlinkat(probe_fd, "baseline", 0);
+    }
+    if (!baseline_ok)
+    {
+        close(probe_fd);
+        unlinkat(root_fd, probe_name, AT_REMOVEDIR);
+        return -1;
+    }
+
+    out->capabilities[FS_CAP_MODE]           = probe_mode_fd(probe_fd);
+    out->capabilities[FS_CAP_SYMLINK]        = probe_symlink_fd(probe_fd);
+    out->capabilities[FS_CAP_FIFO]           = probe_fifo_fd(probe_fd);
+    out->capabilities[FS_CAP_RAW_NAMES]      = probe_raw_names_fd(probe_fd);
+    out->capabilities[FS_CAP_CASE_SENSITIVE] = probe_case_sensitive_fd(probe_fd);
+    out->capabilities[FS_CAP_XATTR]          = probe_xattr_fd(probe_fd);
+    out->capabilities[FS_CAP_TIMESTAMPS]    = probe_timestamps_dirfd(
+        probe_fd, &out->nsec_exact);
+    out->capabilities[FS_CAP_HARDLINK]      = probe_hardlink_fd(probe_fd);
+
+    int failed = close(probe_fd) != 0;
+    if (unlinkat(root_fd, probe_name, AT_REMOVEDIR) != 0)
+        failed = 1;
+    return failed ? -1 : 0;
+}
+
 int fsprobe(const char *existing_root, FsCapabilityProfile *out)
 {
     if (existing_root == NULL || out == NULL)
         return -1;
-    memset(out, 0, sizeof(*out));
-    // Private probe directory directly under the destination, so we measure the actual
-    // target filesystem rather than whatever backs /tmp.
-    char probe_dir[PATH_MAX];
-    if (path_join(probe_dir, sizeof(probe_dir), existing_root, ".migr-probe-XXXXXX") != 0)
+    int root_fd = open(existing_root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (root_fd < 0)
         return -1;
-    if (mkdtemp(probe_dir) == NULL)
-        return -1; // cannot create even a directory on the destination
-
-    // Baseline precondition: a plain file must create, stat, and delete. This is not a
-    // native-vs-portable capability — a destination that fails it is unusable for any
-    // backup, so it is a fatal -1, never a "go portable" signal.
-    int baseline_ok = 0;
-    char baseline[PATH_MAX];
-    if (path_join(baseline, sizeof(baseline), probe_dir, "baseline") == 0)
-    {
-        int fd = open(baseline, O_CREAT | O_WRONLY | O_EXCL, 0600);
-        if (fd >= 0)
-        {
-            close(fd);
-            struct stat st;
-            if (lstat(baseline, &st) == 0 && S_ISREG(st.st_mode))
-                baseline_ok = 1;
-            unlink(baseline);
-        }
-    }
-    if (!baseline_ok)
-    {
-        rmdir(probe_dir);
-        return -1;
-    }
-
-    out->capabilities[FS_CAP_MODE]           = probe_mode(probe_dir);
-    out->capabilities[FS_CAP_SYMLINK]        = probe_symlink(probe_dir);
-    out->capabilities[FS_CAP_FIFO]           = probe_fifo(probe_dir);
-    out->capabilities[FS_CAP_RAW_NAMES]      = probe_raw_names(probe_dir);
-    out->capabilities[FS_CAP_CASE_SENSITIVE] = probe_case_sensitive(probe_dir);
-    out->capabilities[FS_CAP_XATTR]          = probe_xattr(probe_dir);
-    out->capabilities[FS_CAP_TIMESTAMPS]    = probe_timestamps(probe_dir,
-                                                                 &out->nsec_exact);
-    out->capabilities[FS_CAP_HARDLINK]      = probe_hardlink(probe_dir);
-
-    // Every probe cleans up after itself; if anything lingered, the directory will not
-    // be empty and rmdir fails — treat that as an unreliable probe run.
-    if (rmdir(probe_dir) != 0)
-        return -1;
-    return 0;
+    int rc = fsprobe_fd(root_fd, out);
+    close(root_fd);
+    return rc;
 }
 
 int select_representation(const FsCapabilityProfile *profile, CloneRepresentation *out)

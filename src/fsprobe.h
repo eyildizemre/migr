@@ -57,6 +57,19 @@ typedef struct {
 int fsprobe(const char *existing_root, FsCapabilityProfile *out);
 
 /**
+ * @brief Run the full capability probe relative to an already-open directory.
+ *
+ * The fd is borrowed: it remains open and owned by the caller, while every
+ * scratch object and probe operation is anchored below that directory fd.
+ * This is the race-safe primitive used by production integration; callers
+ * that only have a path may use fsprobe(), which is a compatibility wrapper.
+ *
+ * @return 0 if the probe ran and cleaned up, -1 if root_fd is invalid, not a
+ *         directory, or the probe could not run reliably.
+ */
+int fsprobe_fd(int root_fd, FsCapabilityProfile *out);
+
+/**
  * @brief Measures timestamp fidelity under an already-open directory fd.
  *
  * The probe creates and removes a private child directory below root_fd and

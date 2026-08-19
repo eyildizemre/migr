@@ -84,6 +84,44 @@ typedef struct BackupContainer {
 } BackupContainer;
 
 /**
+ * @brief Claims a fresh container under an already-open destination root.
+ *
+ * dest_root_fd is borrowed and remains open and owned by the caller. The
+ * function duplicates it immediately; the returned handle owns its own
+ * destination and partial-directory fds and does not depend on the caller's
+ * fd after this call returns. All naming, claiming, locking, and cleanup
+ * semantics are identical to container_reserve().
+ *
+ * @param dest_root_fd Open directory fd for the destination root.
+ * @param timestamp Naming clock, interpreted in local time.
+ * @param out Caller-provided handle. The fd entry point does not initialize
+ *             it before use; callers should pass a zeroed handle, while the
+ *             path wrapper retains the historical initialization contract.
+ * @return CONTAINER_OK, CONTAINER_ERR_IO, or CONTAINER_ERR_INVALID.
+ */
+ContainerStatus container_reserve_fd(int dest_root_fd, time_t timestamp,
+                                      BackupContainer *out);
+
+/**
+ * @brief Adopts a matching partial under an already-open destination root.
+ *
+ * dest_root_fd is borrowed and duplicated immediately. The returned handle
+ * owns independent fds, including the locked partial candidate. All scan,
+ * identity, ambiguity, and fail-closed semantics are identical to
+ * container_adopt().
+ *
+ * @param dest_root_fd Open directory fd for the destination root.
+ * @param wanted_identity Identity that the candidate manifest must match.
+ * @param out Caller-provided handle; the path wrapper retains the historical
+ *             zeroing contract.
+ * @return CONTAINER_OK, CONTAINER_ERR_NO_MATCH, CONTAINER_ERR_AMBIGUOUS,
+ *         CONTAINER_ERR_IO, or CONTAINER_ERR_INVALID.
+ */
+ContainerStatus container_adopt_fd(int dest_root_fd,
+                                   const Manifest *wanted_identity,
+                                   BackupContainer *out);
+
+/**
  * @brief Claims a fresh, uniquely-named ".partial" container under dest_root.
  *
  * The base name is derived from timestamp via localtime_r() (production's own

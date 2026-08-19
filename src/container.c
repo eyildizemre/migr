@@ -145,23 +145,22 @@ static int abandon_own_claim(int dir_fd, int partial_fd, const char *partial_nam
     return rc;
 }
 
-ContainerStatus container_reserve(const char *dest_root, time_t timestamp, BackupContainer *out)
+ContainerStatus container_reserve_fd(int dest_root_fd, time_t timestamp,
+                                     BackupContainer *out)
 {
-    if (out == NULL)
+    if (out == NULL || dest_root_fd < 0)
         return CONTAINER_ERR_INVALID;
-    memset(out, 0, sizeof(*out));
-    out->dir_fd = -1;
-    out->partial_fd = -1;
-    if (dest_root == NULL)
-        return CONTAINER_ERR_INVALID;
+
+    int dir_fd = fcntl(dest_root_fd, F_DUPFD_CLOEXEC, 0);
+    if (dir_fd < 0)
+        return CONTAINER_ERR_IO;
 
     char base[CONTAINER_NAME_MAX];
     if (format_stamp(timestamp, base, sizeof(base)) != 0)
+    {
+        close(dir_fd);
         return CONTAINER_ERR_IO;
-
-    int dir_fd = open(dest_root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (dir_fd < 0)
-        return CONTAINER_ERR_IO;
+    }
 
     // suffix < INT_MAX (not <=) so suffix++ below never overflows a signed
     // int; this is a bound derived from the type, not a policy ceiling.
@@ -250,21 +249,39 @@ ContainerStatus container_reserve(const char *dest_root, time_t timestamp, Backu
     return CONTAINER_ERR_IO;
 }
 
-ContainerStatus container_adopt(const char *dest_root, const Manifest *wanted_identity, BackupContainer *out)
+ContainerStatus container_reserve(const char *dest_root, time_t timestamp,
+                                  BackupContainer *out)
 {
     if (out == NULL)
         return CONTAINER_ERR_INVALID;
     memset(out, 0, sizeof(*out));
     out->dir_fd = -1;
     out->partial_fd = -1;
-    if (dest_root == NULL || wanted_identity == NULL)
+    if (dest_root == NULL)
+        return CONTAINER_ERR_INVALID;
+
+    int dest_root_fd = open(dest_root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dest_root_fd < 0)
+        return CONTAINER_ERR_IO;
+    ContainerStatus status = container_reserve_fd(dest_root_fd, timestamp, out);
+    close(dest_root_fd);
+    return status;
+}
+
+ContainerStatus container_adopt_fd(int dest_root_fd,
+                                   const Manifest *wanted_identity,
+                                   BackupContainer *out)
+{
+    if (out == NULL || dest_root_fd < 0)
+        return CONTAINER_ERR_INVALID;
+    if (wanted_identity == NULL)
         return CONTAINER_ERR_INVALID;
     // An invocation that cannot establish its own identity can never resume a
     // partial (docs/DECISIONS.md D15) -- rejected before any scan is attempted.
     if (!wanted_identity->has_source_identity)
         return CONTAINER_ERR_NO_MATCH;
 
-    int root_fd = open(dest_root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int root_fd = fcntl(dest_root_fd, F_DUPFD_CLOEXEC, 0);
     if (root_fd < 0)
         return CONTAINER_ERR_IO;
 
@@ -412,6 +429,29 @@ ContainerStatus container_adopt(const char *dest_root, const Manifest *wanted_id
     out->suffix = best_suffix;
     out->state = CONTAINER_STATE_PARTIAL;
     return CONTAINER_OK;
+}
+
+ContainerStatus container_adopt(const char *dest_root,
+                                const Manifest *wanted_identity,
+                                BackupContainer *out)
+{
+    if (out == NULL)
+        return CONTAINER_ERR_INVALID;
+    memset(out, 0, sizeof(*out));
+    out->dir_fd = -1;
+    out->partial_fd = -1;
+    if (dest_root == NULL || wanted_identity == NULL)
+        return CONTAINER_ERR_INVALID;
+    if (!wanted_identity->has_source_identity)
+        return CONTAINER_ERR_NO_MATCH;
+
+    int dest_root_fd = open(dest_root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dest_root_fd < 0)
+        return CONTAINER_ERR_IO;
+    ContainerStatus status = container_adopt_fd(dest_root_fd,
+                                                wanted_identity, out);
+    close(dest_root_fd);
+    return status;
 }
 
 ContainerStatus container_finalize(BackupContainer *container)

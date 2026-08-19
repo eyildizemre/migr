@@ -54,16 +54,21 @@ static int remove_cb(const char *path, const struct stat *sb, int typeflag, stru
     return remove(path);
 }
 
+static void remove_fixture_tree(const char *path)
+{
+    if (nftw(path, remove_cb, 16, FTW_DEPTH | FTW_PHYS) != 0)
+    {
+        printf(RED "fixture: could not fully clean up a test tree" NC "\n");
+        exit(1);
+    }
+}
+
 static void clean_test_root(void)
 {
     // A failed cleanup is fixture-fatal, not silently ignored: a partially
     // removed test_root left behind by one test could otherwise let a later
     // test's fixture succeed (or fail) for the wrong reason.
-    if (nftw(test_root, remove_cb, 16, FTW_DEPTH | FTW_PHYS) != 0)
-    {
-        printf(RED "fixture: could not fully clean up the test root" NC "\n");
-        exit(1);
-    }
+    remove_fixture_tree(test_root);
 }
 
 // Recreates test_root as a fresh, empty directory. Fixture setup failure is
@@ -173,6 +178,62 @@ static void test_reserve_partial_collision_advances_suffix(void)
 
     container_close(&first);
     container_close(&second);
+    fresh_test_root();
+}
+
+static void test_reserve_fd_is_anchored(void)
+{
+    printf(BLUE "::" NC " container: reserve_fd stays on the opened destination after a path swap\n");
+    fresh_test_root();
+
+    int root_fd = open(test_root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    check(root_fd >= 0, "fixture: open the destination root before swapping its path");
+    if (root_fd < 0)
+        return;
+
+    char saved[PATH_MAX];
+    if (snprintf(saved, sizeof(saved), "%s.saved", test_root) < 0 ||
+        rename(test_root, saved) != 0)
+    {
+        check(0, "fixture: move the originally opened destination aside");
+        close(root_fd);
+        return;
+    }
+    check(mkdir(test_root, 0700) == 0,
+          "fixture: replace the destination path with a different directory");
+
+    BackupContainer reserved = {0};
+    ContainerStatus status = container_reserve_fd(root_fd, FIXED_TIME, &reserved);
+    check(status == CONTAINER_OK,
+          "reserve_fd succeeds against the originally opened destination");
+    check(fstat(root_fd, &(struct stat){0}) == 0,
+          "reserve_fd leaves the borrowed destination fd open");
+
+    if (status == CONTAINER_OK)
+    {
+        struct stat original_entry;
+        check(fstatat(root_fd, reserved.partial_name, &original_entry,
+                      AT_SYMLINK_NOFOLLOW) == 0 && S_ISDIR(original_entry.st_mode),
+              "reserve_fd claims its partial under the opened destination");
+
+        int swapped_fd = open(test_root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        check(swapped_fd >= 0, "fixture: open the swapped-in destination");
+        if (swapped_fd >= 0)
+        {
+            struct stat swapped_entry;
+            check(fstatat(swapped_fd, reserved.partial_name, &swapped_entry,
+                          AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT,
+                  "reserve_fd does not claim a partial under the swapped path");
+            close(swapped_fd);
+        }
+    }
+
+    container_close(&reserved);
+    close(root_fd);
+    remove_fixture_tree(test_root);
+    remove_fixture_tree(saved);
+    check(mkdir(test_root, 0700) == 0,
+          "fixture: recreate the destination root for later checks");
     fresh_test_root();
 }
 
@@ -435,6 +496,8 @@ static void test_null_arguments_are_rejected_safely(void)
           "reserve with a NULL out is rejected");
     check(container_reserve(NULL, FIXED_TIME, &c) == CONTAINER_ERR_INVALID,
           "reserve with a NULL dest_root is rejected");
+    check(container_reserve_fd(-1, FIXED_TIME, &c) == CONTAINER_ERR_INVALID,
+          "reserve_fd with an invalid dest_root_fd is rejected");
 
     Manifest wanted;
     make_reference_manifest(&wanted);
@@ -444,6 +507,8 @@ static void test_null_arguments_are_rejected_safely(void)
           "adopt with a NULL dest_root is rejected");
     check(container_adopt(test_root, NULL, &c) == CONTAINER_ERR_INVALID,
           "adopt with a NULL wanted_identity is rejected");
+    check(container_adopt_fd(-1, &wanted, &c) == CONTAINER_ERR_INVALID,
+          "adopt_fd with an invalid dest_root_fd is rejected");
 
     check(container_finalize(NULL) == CONTAINER_ERR_INVALID, "finalize(NULL) is rejected");
 
@@ -515,6 +580,124 @@ static void test_adopt_matches_and_retains_inode(void)
     }
 
     container_close(&adopted);
+    fresh_test_root();
+}
+
+static void test_adopt_fd_is_anchored(void)
+{
+    printf(BLUE "::" NC " container: adopt_fd stays on the opened destination after a path swap\n");
+    fresh_test_root();
+
+    Manifest manifest;
+    make_reference_manifest(&manifest);
+
+    BackupContainer reserved;
+    check(container_reserve(test_root, FIXED_TIME, &reserved) == CONTAINER_OK,
+          "fixture: reserve a partial for fd adoption");
+    char partial_name[CONTAINER_NAME_MAX] = {0};
+    snprintf(partial_name, sizeof(partial_name), "%s", reserved.partial_name);
+    char partial_path[PATH_MAX];
+    path_under_root(partial_path, sizeof(partial_path), reserved.partial_name);
+    check(manifest_write_v1(partial_path, &manifest) == 0,
+          "fixture: write the matching manifest");
+    container_close(&reserved);
+
+    int root_fd = open(test_root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    check(root_fd >= 0, "fixture: open the destination root before swapping its path");
+    if (root_fd < 0)
+    {
+        fresh_test_root();
+        return;
+    }
+
+    char saved[PATH_MAX];
+    if (snprintf(saved, sizeof(saved), "%s.saved", test_root) < 0 ||
+        rename(test_root, saved) != 0)
+    {
+        check(0, "fixture: move the originally opened destination aside");
+        close(root_fd);
+        fresh_test_root();
+        return;
+    }
+    check(mkdir(test_root, 0700) == 0,
+          "fixture: replace the destination path with a different directory");
+
+    BackupContainer adopted = {0};
+    ContainerStatus status = container_adopt_fd(root_fd, &manifest, &adopted);
+    check(status == CONTAINER_OK,
+          "adopt_fd finds the matching partial under the opened destination");
+    check(fstat(root_fd, &(struct stat){0}) == 0,
+          "adopt_fd leaves the borrowed destination fd open");
+
+    if (status == CONTAINER_OK)
+    {
+        check(strcmp(adopted.partial_name, partial_name) == 0,
+              "adopt_fd returns the expected partial name");
+        struct stat original_entry;
+        check(fstatat(root_fd, adopted.partial_name, &original_entry,
+                      AT_SYMLINK_NOFOLLOW) == 0 && S_ISDIR(original_entry.st_mode),
+              "adopt_fd opened the candidate under the opened destination");
+
+        int swapped_fd = open(test_root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        check(swapped_fd >= 0, "fixture: open the swapped-in destination");
+        if (swapped_fd >= 0)
+        {
+            struct stat swapped_entry;
+            check(fstatat(swapped_fd, adopted.partial_name, &swapped_entry,
+                          AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT,
+                  "adopt_fd does not scan the swapped path");
+            close(swapped_fd);
+        }
+    }
+
+    container_close(&adopted);
+    close(root_fd);
+    remove_fixture_tree(test_root);
+    remove_fixture_tree(saved);
+    check(mkdir(test_root, 0700) == 0,
+          "fixture: recreate the destination root for later checks");
+    fresh_test_root();
+}
+
+static void test_adopt_fd_failure_keeps_borrowed_fd(void)
+{
+    printf(BLUE "::" NC " container: adopt_fd keeps the borrowed fd open on an ambiguous failure\n");
+    fresh_test_root();
+
+    Manifest manifest;
+    make_reference_manifest(&manifest);
+
+    BackupContainer first;
+    check(container_reserve(test_root, FIXED_TIME, &first) == CONTAINER_OK,
+          "fixture: reserve the first matching partial");
+    char first_path[PATH_MAX];
+    path_under_root(first_path, sizeof(first_path), first.partial_name);
+    check(manifest_write_v1(first_path, &manifest) == 0,
+          "fixture: write the first matching manifest");
+    container_close(&first);
+
+    BackupContainer second;
+    check(container_reserve(test_root, FIXED_TIME, &second) == CONTAINER_OK,
+          "fixture: reserve the second matching partial");
+    char second_path[PATH_MAX];
+    path_under_root(second_path, sizeof(second_path), second.partial_name);
+    check(manifest_write_v1(second_path, &manifest) == 0,
+          "fixture: write the second matching manifest");
+    container_close(&second);
+
+    int root_fd = open(test_root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    check(root_fd >= 0, "fixture: open the destination root for the failing adopt");
+    if (root_fd >= 0)
+    {
+        BackupContainer adopted = {0};
+        check(container_adopt_fd(root_fd, &manifest, &adopted) == CONTAINER_ERR_AMBIGUOUS,
+              "adopt_fd refuses two matching partials without guessing");
+        check(fstat(root_fd, &(struct stat){0}) == 0,
+              "adopt_fd leaves the borrowed destination fd open after failure");
+        container_close(&adopted);
+        close(root_fd);
+    }
+
     fresh_test_root();
 }
 
@@ -1061,6 +1244,7 @@ int main(void)
 
     test_reserve_generates_expected_stamp();
     test_reserve_partial_collision_advances_suffix();
+    test_reserve_fd_is_anchored();
     test_reserve_final_collision_advances_suffix();
     test_concurrent_reserve_claims_distinct_partials();
 
@@ -1075,6 +1259,8 @@ int main(void)
 
     test_adopt_rejects_wanted_without_identity();
     test_adopt_matches_and_retains_inode();
+    test_adopt_fd_is_anchored();
+    test_adopt_fd_failure_keeps_borrowed_fd();
     test_adopt_skips_locked_partial();
     test_adopt_ambiguous_on_multiple_matches();
     test_adopt_rejects_identity_mismatches();
