@@ -14,6 +14,7 @@
 #include <unistd.h>
 
 #include "encoding.h"
+#include "fsprobe.h"
 #include "hash.h"
 #include "sidecar.h"
 #include "utils.h"
@@ -3007,27 +3008,30 @@ static void portable_restore_preview(
                    report->roots[index].live_count == 1 ? "y" : "ies");
 }
 
-int portable_restore_at(const PortableRestoreRequest *request,
-                        PortableRestoreReplayReport *report)
+static PortableRestoreOutcome portable_restore_orchestrate_impl(
+    const PortableRestoreRequest *request,
+    PortableRestoreReplayReport *report,
+    int measure_policy)
 {
     if (request == NULL || report == NULL || request->source_container_fd < 0 ||
         request->destination_home_fd < 0 || request->manifest == NULL)
     {
         errno = EINVAL;
-        return -1;
+        return PORTABLE_RESTORE_ERROR;
     }
 
     portable_restore_replay_report_init(report);
+    PortableRestoreRequest replay_request = *request;
     MetadataTimestampPolicy policy;
-    if (replay_timestamp_policy(request, &policy) != 0)
-        return -1;
+    if (!measure_policy && replay_timestamp_policy(request, &policy) != 0)
+        return PORTABLE_RESTORE_ERROR;
     PortableRestorePreflightReport preflight;
     portable_restore_preflight_report_init(&preflight);
     int result = portable_restore_preflight_at(request, &preflight);
     if (result != 0)
     {
         portable_restore_preflight_report_free(&preflight);
-        return -1;
+        return PORTABLE_RESTORE_ERROR;
     }
 
     if (dry_run)
@@ -3035,7 +3039,7 @@ int portable_restore_at(const PortableRestoreRequest *request,
         report->live_count = preflight.live_count;
         portable_restore_preview(&preflight);
         portable_restore_preflight_report_free(&preflight);
-        return 0;
+        return PORTABLE_RESTORE_DRY_RUN;
     }
 
     metadata_profiles_report(&preflight.profiles);
@@ -3043,7 +3047,25 @@ int portable_restore_at(const PortableRestoreRequest *request,
     {
         printf("Cancelled.\n");
         portable_restore_preflight_report_free(&preflight);
-        return 0;
+        return PORTABLE_RESTORE_CANCELLED;
+    }
+
+    if (measure_policy)
+    {
+        int nsec_exact = 0;
+        if (fsprobe_timestamps_fd(request->destination_home_fd,
+                                  &nsec_exact) != 0)
+        {
+            printf("Error: could not measure destination timestamp support; "
+                   "no destination was changed\n");
+            portable_restore_preflight_report_free(&preflight);
+            return PORTABLE_RESTORE_ERROR;
+        }
+        policy = (MetadataTimestampPolicy){
+            .nsec_exact = nsec_exact,
+            .configured = 1
+        };
+        replay_request.destination_timestamp_policy = policy;
     }
 
     if (metadata_profiles_probe(&preflight.profiles, policy) != 0)
@@ -3051,16 +3073,31 @@ int portable_restore_at(const PortableRestoreRequest *request,
         report->live_count = preflight.live_count;
         printf("Error: portable metadata probe failed; no destination was changed\n");
         portable_restore_preflight_report_free(&preflight);
-        return -1;
+        return PORTABLE_RESTORE_ERROR;
     }
 
-    result = portable_restore_replay_at(request, report);
+    result = portable_restore_replay_at(&replay_request, report);
     if (result != 0)
         printf("Portable restore stopped: %zu applied, %zu failed\n",
                report->applied_count, report->failed_count);
-    else
+    portable_restore_preflight_report_free(&preflight);
+    return result == 0 ? PORTABLE_RESTORE_COMPLETE : PORTABLE_RESTORE_ERROR;
+}
+
+PortableRestoreOutcome portable_restore_orchestrate_at(
+    const PortableRestoreRequest *request,
+    PortableRestoreReplayReport *report)
+{
+    return portable_restore_orchestrate_impl(request, report, 1);
+}
+
+int portable_restore_at(const PortableRestoreRequest *request,
+                        PortableRestoreReplayReport *report)
+{
+    PortableRestoreOutcome outcome =
+        portable_restore_orchestrate_impl(request, report, 0);
+    if (outcome == PORTABLE_RESTORE_COMPLETE)
         printf("Portable restore complete: %zu applied\n",
                report->applied_count);
-    portable_restore_preflight_report_free(&preflight);
-    return result;
+    return outcome == PORTABLE_RESTORE_ERROR ? -1 : 0;
 }

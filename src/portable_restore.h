@@ -16,6 +16,13 @@ typedef struct {
     MetadataTimestampPolicy destination_timestamp_policy;
 } PortableRestoreRequest;
 
+typedef enum {
+    PORTABLE_RESTORE_COMPLETE,
+    PORTABLE_RESTORE_DRY_RUN,
+    PORTABLE_RESTORE_CANCELLED,
+    PORTABLE_RESTORE_ERROR
+} PortableRestoreOutcome;
+
 typedef struct {
     char id[MANIFEST_ID_MAX];
     size_t live_count;
@@ -60,5 +67,16 @@ int portable_restore_replay_at(
 /* Confirmation-gated composition of preflight, probe, and replay. */
 int portable_restore_at(const PortableRestoreRequest *request,
                        PortableRestoreReplayReport *report);
+
+/**
+ * Composes preflight, confirmation, destination timestamp measurement, probe,
+ * and replay while reporting distinct completion outcomes. The destination
+ * timestamp policy is measured after confirmation and before replay; the
+ * caller-supplied policy is not used. This primitive does not print the final
+ * completion summary; its caller owns that output (docs/DECISIONS.md D24).
+ */
+PortableRestoreOutcome portable_restore_orchestrate_at(
+    const PortableRestoreRequest *request,
+    PortableRestoreReplayReport *report);
 
 #endif

@@ -20,6 +20,7 @@
 
 #include "manifest.h"
 #include "metadata.h"
+#include "fsprobe.h"
 #include "portable_restore.h"
 #include "sidecar.h"
 #include "utils.h"
@@ -200,6 +201,9 @@ static void probe_observer(void *context);
 static int run_orchestration(Fixture *fixture,
                              PortableRestoreReplayReport *report,
                              int nsec_exact, const char *answer);
+static PortableRestoreOutcome run_direct_orchestration(
+    Fixture *fixture, PortableRestoreReplayReport *report, int nsec_exact,
+    const char *answer);
 
 static void build_symlink_payload(Fixture *fixture)
 {
@@ -684,6 +688,24 @@ static void build_payload(Fixture *fixture, int nested)
     close(root_fd);
 }
 
+static int prepare_direct_basic_fixture(Fixture *fixture, uint32_t file_uid)
+{
+    build_payload(fixture, 0);
+    uint32_t uid = (uint32_t)geteuid();
+    uint32_t gid = (uint32_t)getegid();
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  uid, gid, 1700001000, 123456789, 1700001001, 987654321),
+        entry_for("ROOT", "file", "file", SIDECAR_KIND_REGULAR,
+                  strlen("portable payload"), 0600, file_uid, gid,
+                  1700001002, 333333333, 1700001003, 444444444)
+    };
+    if (write_sidecar(fixture, entries, 2) != 0)
+        return -1;
+    write_file_at(fixture->home_fd, "sentinel", "untouched");
+    return 0;
+}
+
 static void test_normal_orchestration(void)
 {
     printf(BLUE "::" NC " end-to-end portable restore orchestration\n");
@@ -1134,6 +1156,162 @@ static void test_coarse_timestamp_policy(void)
     fixture_close(&fixture);
 }
 
+static PortableRestoreOutcome run_direct_orchestration(
+    Fixture *fixture, PortableRestoreReplayReport *report, int nsec_exact,
+    const char *answer)
+{
+    Manifest manifest;
+    if (manifest_read_v1_at(fixture->container_fd, &manifest) !=
+            MANIFEST_STATUS_VALID)
+        return PORTABLE_RESTORE_ERROR;
+    PortableRestoreRequest request = request_for(fixture, &manifest,
+                                                  nsec_exact);
+    ConfirmationInput input = { .saved_stdin = -1 };
+    confirmation_begin(&input, answer);
+    PortableRestoreOutcome outcome =
+        portable_restore_orchestrate_at(&request, report);
+    confirmation_end(&input);
+    manifest_free(&manifest);
+    return outcome;
+}
+
+static void test_direct_complete_outcome(void)
+{
+    printf(BLUE "::" NC " direct portable restore complete outcome\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "direct-complete fixture is created");
+    if (opened != 0)
+        return;
+    check(prepare_direct_basic_fixture(&fixture, (uint32_t)geteuid()) == 0,
+          "direct-complete sidecar is committed");
+    PortableRestoreReplayReport report;
+    PortableRestoreOutcome outcome = run_direct_orchestration(
+        &fixture, &report, 0, "y\n");
+    check(outcome == PORTABLE_RESTORE_COMPLETE && report.live_count == 2 &&
+              report.applied_count == 2 && report.failed_count == 0,
+          "direct orchestration reports a complete restore distinctly");
+    char file[PATH_MAX];
+    path_join_fixture(file, sizeof(file), fixture.home, "/restored/file");
+    check(file_equals(file, "portable payload"),
+          "direct complete outcome leaves restored content");
+    fixture_close(&fixture);
+}
+
+static void test_direct_dry_run_outcome(void)
+{
+    printf(BLUE "::" NC " direct portable restore dry-run outcome\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "direct-dry-run fixture is created");
+    if (opened != 0)
+        return;
+    check(prepare_direct_basic_fixture(&fixture, (uint32_t)geteuid()) == 0,
+          "direct-dry-run sidecar is committed");
+    int previous_dry_run = dry_run;
+    dry_run = 1;
+    PortableRestoreReplayReport report;
+    PortableRestoreOutcome outcome = run_direct_orchestration(
+        &fixture, &report, 1, "y\n");
+    dry_run = previous_dry_run;
+    char target[PATH_MAX], sentinel[PATH_MAX];
+    path_join_fixture(target, sizeof(target), fixture.home, "/restored");
+    path_join_fixture(sentinel, sizeof(sentinel), fixture.home, "/sentinel");
+    check(outcome == PORTABLE_RESTORE_DRY_RUN && report.live_count == 2 &&
+              report.applied_count == 0 && report.failed_count == 0,
+          "direct orchestration reports a dry-run distinctly");
+    check(access(target, F_OK) != 0 && file_equals(sentinel, "untouched"),
+          "direct dry-run performs no destination mutation");
+    fixture_close(&fixture);
+}
+
+static void test_direct_cancelled_outcome(void)
+{
+    printf(BLUE "::" NC " direct portable restore cancelled outcome\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "direct-cancelled fixture is created");
+    if (opened != 0)
+        return;
+    check(prepare_direct_basic_fixture(&fixture, (uint32_t)geteuid()) == 0,
+          "direct-cancelled sidecar is committed");
+    PortableRestoreReplayReport report;
+    PortableRestoreOutcome outcome = run_direct_orchestration(
+        &fixture, &report, 1, "n\n");
+    char target[PATH_MAX], sentinel[PATH_MAX];
+    path_join_fixture(target, sizeof(target), fixture.home, "/restored");
+    path_join_fixture(sentinel, sizeof(sentinel), fixture.home, "/sentinel");
+    check(outcome == PORTABLE_RESTORE_CANCELLED && report.live_count == 0 &&
+              report.applied_count == 0 && report.failed_count == 0,
+          "direct orchestration reports cancellation distinctly");
+    check(access(target, F_OK) != 0 && file_equals(sentinel, "untouched"),
+          "cancelled direct restore performs no destination mutation");
+    fixture_close(&fixture);
+}
+
+static void test_direct_error_outcome(void)
+{
+    printf(BLUE "::" NC " direct portable restore error outcome\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "direct-error fixture is created");
+    if (opened != 0)
+        return;
+    check(prepare_direct_basic_fixture(&fixture, UINT32_MAX) == 0,
+          "direct-error sidecar is committed");
+    PortableRestoreReplayReport report;
+    PortableRestoreOutcome outcome = run_direct_orchestration(
+        &fixture, &report, 1, "y\n");
+    char target[PATH_MAX], sentinel[PATH_MAX];
+    path_join_fixture(target, sizeof(target), fixture.home, "/restored");
+    path_join_fixture(sentinel, sizeof(sentinel), fixture.home, "/sentinel");
+    check(outcome == PORTABLE_RESTORE_ERROR && report.live_count == 2 &&
+              report.applied_count == 0 && report.failed_count == 0,
+          "direct orchestration reports probe failure distinctly");
+    check(access(target, F_OK) != 0 && file_equals(sentinel, "untouched"),
+          "direct probe failure performs no destination mutation");
+    fixture_close(&fixture);
+}
+
+static void test_direct_measures_timestamp_policy(void)
+{
+    printf(BLUE "::" NC " direct portable restore timestamp measurement\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "direct-timestamp fixture is created");
+    if (opened != 0)
+        return;
+    check(prepare_direct_basic_fixture(&fixture, (uint32_t)geteuid()) == 0,
+          "direct-timestamp sidecar is committed");
+    int measured = 0;
+    check(fsprobe_timestamps_fd(fixture.home_fd, &measured) == 0 &&
+              measured == 1,
+          "host destination reports exact timestamp support");
+    if (measured != 1)
+    {
+        fixture_close(&fixture);
+        return;
+    }
+    PortableRestoreReplayReport report;
+    PortableRestoreOutcome outcome = run_direct_orchestration(
+        &fixture, &report, 0, "y\n");
+    char file[PATH_MAX];
+    path_join_fixture(file, sizeof(file), fixture.home, "/restored/file");
+    uint32_t uid = (uint32_t)geteuid();
+    uint32_t gid = (uint32_t)getegid();
+    check(outcome == PORTABLE_RESTORE_COMPLETE &&
+              metadata_exact(file, 0600, (uid_t)uid, (gid_t)gid,
+                             1700001002, 333333333,
+                             1700001003, 444444444),
+          "direct orchestration ignores an injected timestamp policy and uses its measurement");
+    fixture_close(&fixture);
+}
+
 int main(void)
 {
     test_normal_orchestration();
@@ -1146,6 +1324,11 @@ int main(void)
     test_probe_rejection();
     test_dry_run();
     test_coarse_timestamp_policy();
+    test_direct_complete_outcome();
+    test_direct_dry_run_outcome();
+    test_direct_cancelled_outcome();
+    test_direct_error_outcome();
+    test_direct_measures_timestamp_policy();
     printf("%s%s%s\n", failures == 0 ? GREEN : RED,
            failures == 0 ? "all portable restore orchestration tests passed" :
            "portable restore orchestration tests failed", NC);
