@@ -2021,3 +2021,271 @@ case-collision, hardlink, and native-reconciliation contracts, none of which
 this entry revisits. Native restore's own hardlink-identity duplication
 (D22 G-5) remains open and is not touched by this entry; closing it, if it
 happens, is separate work.
+
+## D25 — 2026-08-20 — Portable resume uses write-ahead ownership claims
+
+**Status:** Decided (implementation pending)
+
+**Decision:** Portable capture closes the interval between payload mutation and
+the sidecar's normal live-state commit with a standalone, write-ahead
+`CLAIM` record. A claim is durable ownership proof for one payload node; it is
+not a live restore entry, evidence that the payload is complete, permission to
+skip source or payload validation, preliminary directory metadata, or a
+replacement for the normal post-order directory entry. `ENTRY_COMMIT` remains
+the only operation that makes an `ENTRY` group live. Directory metadata and
+xattrs remain post-order, and this decision adds no new process-interruption
+or power-loss durability guarantee: the existing no-`fsync` boundary remains
+unchanged.
+
+### Wire record
+
+Sidecar version 3 retains the v2 grammar and adds exactly one standalone
+record; no parallel spelling or alias is supported:
+
+```text
+CLAIM:
+  tag, root_id, logical_path, physical_path, object_kind
+```
+
+The tag is `CLAIM\0`. Every field uses the existing NUL-framed string rules,
+field ceilings, allocation ceilings, and total-byte ceilings. `root_id` is
+non-empty; root logical and physical paths may be empty as they are elsewhere
+in the grammar. Valid claim kinds are the four portable payload-producing
+kinds: `regular`, `directory`, `symlink`, and `hardlink`. FIFO remains
+unsupported by portable capture and is not made claim-capable by this
+decision. Socket and device nodes publish no portable payload and receive no
+claim.
+
+`physical_path` already contains any D21 collision suffix; `CLAIM` does not
+duplicate `collision_suffix`. A complete claim becomes committed at the end of
+`object_kind` and advances `last_valid_boundary`. A claim cut short by EOF is
+a truncated tail. No payload mutation may follow a writer call that did not
+finish the claim. A malformed complete claim, an unknown tag or kind, or a
+claim interleaved inside a pending `ENTRY`/`XATTR`/`ENTRY_COMMIT` group is
+corruption.
+
+The append-only file retains historical consumed claims. “Zero outstanding
+claims” refers to replayed state, not to the absence of `CLAIM` bytes in the
+file.
+
+### Claim state machine
+
+The protocol specifies semantic transitions, not whether the implementation
+uses one map or separate live and claim maps:
+
+| Current semantic state | Record | Required result |
+| --- | --- | --- |
+| No live entry and no claim, or a tombstone with no claim | `CLAIM(C)` | `C` becomes the one outstanding claim for the key; an older tombstone may remain as history. |
+| Live entry exists | `CLAIM` | Invalid/corrupt. The writer must first perform D17's `DELETE`. |
+| A claim is already outstanding | another `CLAIM` | Invalid/corrupt, even if byte-identical. Resume reuses the matching claim. |
+| Matching claim `C` and a completed matching `ENTRY(E)` group | `ENTRY_COMMIT` | Consume `C`, replace prior tombstone state, and make `E` live. |
+| No claim, or a claim mismatching the pending entry | `ENTRY_COMMIT` | Invalid/corrupt; no live state is produced. |
+| Live entry, no claim | `DELETE(key)` | Existing D17 transition: the live entry becomes tombstoned. |
+| Outstanding claim | `DELETE(key)` | Cancel the claim without creating a live entry; any older tombstone remains. |
+| No live entry or claim | `DELETE(key)` | Existing idempotent no-op behaviour. |
+
+A claim and its consuming entry must match byte-for-byte on:
+
+```text
+root_id, logical_path, physical_path, object_kind
+```
+
+At most one outstanding claim may exist per logical key. Active physical
+ownership must also remain unambiguous: a claim cannot authorize a physical
+path currently owned by a different logical key. Claims consume the existing
+path, total-byte, allocation, and live-entry resource ceilings; outstanding
+claim cardinality is bounded by the existing live-entry ceiling.
+
+D17's reader tolerance for a duplicate committed entry without an intervening
+`DELETE` does not authorize a claimless v3 commit. Every v3
+`ENTRY_COMMIT`, including a same-key replacement, requires its own matching
+outstanding claim.
+
+### Claim cancellation and cleanup
+
+No `CLAIM_CANCEL` or `ABORT` record is introduced. `DELETE(root_id,
+logical_path)` is also the committed transition that cancels an outstanding
+claim when no `ENTRY_COMMIT` will follow, including when the source node
+disappears or changes kind, or when the current collision plan assigns a
+different physical path.
+
+Because a claim is ownership proof, cleanup follows this order:
+
+1. Remove the exact claimed payload node while the claim is still outstanding.
+2. Append `DELETE` to cancel the claim.
+3. If either step fails, return failure and leave the partial resumable.
+
+This order ensures that a successfully cancelled claim cannot leave its
+payload node unowned. If removal succeeds but interruption occurs before
+`DELETE`, the surviving claim safely authorizes an idempotent retry against an
+absent node.
+
+A directory claim owns the directory node, not arbitrary contents beneath it.
+Directory cleanup therefore reconciles known live and claimed descendants
+deepest-first and removes the directory non-recursively. An unknown or foreign
+child blocks cleanup; recursively deleting everything merely because the
+parent is claimed is forbidden by D21's ownership rule.
+
+### Capture ordering
+
+For every capture path that will mutate a payload, the required order is:
+
+1. Derive and validate the current source kind and collision-plan assignment.
+2. Reconcile any existing mismatching or stale claim.
+3. Before writing a new claim, establish that the destination is absent or is
+   already owned by the same logical node through a matching live entry,
+   tombstone, or exact outstanding claim.
+4. If replacing live state, commit D17's `DELETE` first.
+5. Append a new exact `CLAIM`, or reuse an already-outstanding exact claim.
+6. Only then perform the first mutation of the claimed payload path.
+7. Complete source-stability checks and payload work.
+8. Append the normal `ENTRY`/`XATTR`/`ENTRY_COMMIT` group; the commit consumes
+   the claim.
+
+Writing a claim never legitimizes a pre-existing foreign node. The foreign-node
+check precedes creation of a new claim. D17's old-path deletion remains valid:
+mutation that removes an old live physical path is authorized by its committed
+tombstone; the claim authorizes mutation of the new/current physical path.
+
+The node-specific consequences are:
+
+- **Directory:** the claim precedes `ensure_directory_leaf()`/`mkdirat()` and
+  remains outstanding throughout child traversal. The normal directory entry
+  remains post-order and consumes the claim.
+- **Regular file:** the claim precedes removal, creation, truncation, or write
+  of the destination regular file.
+- **Symlink:** the claim kind is `symlink`, although portable payload is an
+  ordinary placeholder; the claim precedes placeholder replacement.
+- **Hardlink:** the claim kind is `hardlink`; the claim precedes empty
+  placeholder replacement.
+- **Unchanged live entry:** an existing no-mutation fast path needs no new
+  claim.
+- **Socket/device and FIFO:** these publish no new portable payload entry and
+  gain no claim; FIFO remains fail-closed.
+
+### Resume and stale-claim reconciliation
+
+A claim is acceptable ownership proof only when it exactly matches the current
+`root_id`, `logical_path`, `physical_path`, and `object_kind`, and the current
+D21 collision plan still assigns that physical path to the same logical node.
+
+For an exact claim:
+
+- an absent payload node is valid and resume recreates it;
+- an existing payload node is considered owned and may be replaced or
+  completed;
+- payload content is not assumed complete and normal capture validation still
+  runs;
+- resume reuses the claim instead of appending a duplicate.
+
+A mismatching or stale claim is never transferred to another logical identity.
+The current plan remains authoritative; a claim does not pin or override an
+obsolete collision assignment. Its old physical node is cleaned using the
+claim as ownership proof, `DELETE` then cancels the claim, and only afterward
+may a new claim be written for the current assignment.
+
+Reconciliation includes outstanding claims, not merely the live entries
+currently traversed by the sidecar live-entry iterator. This is required for
+source deletion and collision renumbering when the new source walk will never
+visit the old claimed node.
+
+### Completion and restore gates
+
+A structurally valid log with outstanding claims is a valid resumable partial,
+not generic sidecar corruption. Therefore adoption exposes outstanding claims,
+and closing a failed capture is allowed to leave them in a resumable partial.
+Claims are excluded from live-entry iteration and from
+`sidecar_log_live_count()`.
+
+Successful capture requires exact payload inventory **and zero outstanding
+claims**. The zero-claim check is global, after all roots and their
+reconciliation have completed, and before the prepared fresh or resume entry
+point returns success or reports `live_count`. It is not enforced inside an
+individual root capture because a resumed multi-root container may still carry
+legitimate claims for roots not yet processed.
+
+Portable restore preflight refuses a sidecar with any outstanding claim before
+destination probing or mutation. `portable_restore_replay_at()` independently
+enforces the same condition before its capability probe or replay, because it
+is callable separately from orchestration. Consumed historical claims are
+ignored; only outstanding replay state is fatal for restore.
+
+### Version boundary
+
+D25 advances `SIDECAR_VERSION` from 2 to 3. The header writer, parser, state
+loader, manifest `sidecar_version`, capture path, and both restore paths move
+together. `MANIFEST_CURRENT_VERSION` does not change.
+
+There is no v2 compatibility layer: completed v2 containers are refused by
+the v3 reader, v2 partials are not resumed as v3, and no dual reader,
+migration path, or guessed recovery is introduced. Manifest resume identity
+already includes `sidecar_version`. This is an intentional pre-release format
+replacement: the branch has not merged to `main`, no release tag or real user
+base exists, and an unsafe v2 partial cannot supply the missing ownership
+proof.
+
+### Acceptance boundary
+
+Implementation is not complete until tests prove, at minimum:
+
+- claim codec round-trip, field ceilings, supported-kind validation, and
+  illegal ordering;
+- complete, mid-record, and truncated-claim tail behaviour;
+- adoption retaining an outstanding claim;
+- matching commit consumption;
+- claims with missing or mismatching entries being refused;
+- duplicate and conflicting claim refusal;
+- `DELETE` cancellation and restart-idempotent cleanup;
+- fresh directory, regular, symlink, and hardlink interruption recovery at
+  every applicable mutation boundary;
+- empty-directory and nested traversal recovery with multiple active ancestor
+  claims;
+- replacement with a committed predecessor;
+- source deletion, kind change, and collision renumbering with an outstanding
+  claim;
+- repeated SIGKILL/resume cycles;
+- capture success/finalization refusal while any claim remains;
+- portable restore preflight and standalone replay refusal without destination
+  mutation;
+- a genuinely foreign existing node without matching live, tombstone, or claim
+  proof remaining refused.
+
+Shared codec boundaries need not be multiplied mechanically when one state test
+proves the common primitive, but each node kind must directly prove that its
+first applicable payload mutation occurs only after a committed claim. The
+real-vfat SIGKILL/resume scenario remains part of the later VM gate.
+
+**Why:** D17's payload-first/live-last ordering is necessary to prevent
+incomplete bytes from becoming restore-visible metadata, but it leaves a
+window in which a newly created payload has no durable ownership proof. A
+positive write-ahead claim closes that ownership window without relaxing the
+foreign-node safety rule: the destination is still checked before a new claim
+is written, and a claim authorizes only its exact logical/physical identity.
+The normal post-order entry remains the completeness and restore boundary.
+
+**Rejected:** Directory-only tracking or an early normal `DIRECTORY` entry is
+rejected because it leaves regular, symlink, and hardlink gaps and conflates
+ownership with completeness. Treating every existing directory or payload
+node as safe is rejected because it permits foreign-node overwrite and
+collision-plan cross-contamination. Inferring ownership from descendants or
+from the current collision plan is rejected because it fails for empty or
+fresh nodes, and a desired mapping is not evidence of who created an existing
+node. Relying on collision relocation or final inventory alone is rejected
+because both occur too late to authorize the first mutation and currently
+begin from live state. Reusing normal `ENTRY_COMMIT` before payload completion
+is rejected because it reverses D17 and can expose incomplete bytes as live
+metadata. Extending v2 in place, temporary multi-version negotiation, and a
+test-only version path are rejected because they would make the on-disk
+boundary ambiguous. A new cancellation record is rejected because existing
+`DELETE` can cancel a claim safely. Power-loss durability via `fsync` remains
+outside D17 and is not introduced here.
+
+**Relationship:** D25 refines D17's process-interruption and commit protocol
+without changing its live-state, metadata, or no-`fsync` boundaries. It
+advances D21's v2 grammar to v3 while preserving collision suffixes and
+destination authority, including D21's refusal to overwrite unowned names.
+It covers D22's regular and hardlink placeholder model without changing
+restore ordering or sticky representatives. It completes D24's now-production
+portable path without changing representation selection or D15's
+representation-agnostic finalization lifecycle. It has no effect on native
+capture or native restore.
