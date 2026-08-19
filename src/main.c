@@ -36,6 +36,8 @@ static void action_lookup(const char *arg, Action *action)
 
 int main(int argc, char *argv[])
 {
+    raise_fd_limit();
+
     if (argc < 2) // No arguments provided; default to report action
     {
         return report();

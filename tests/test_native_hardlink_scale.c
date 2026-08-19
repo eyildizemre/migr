@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include "fileops.h"
+#include "utils.h"
 
 #define GREEN "\033[0;32m"
 #define RED   "\033[0;31m"
@@ -108,6 +109,7 @@ static int pair_name(char *buffer, size_t size, unsigned int index,
 
 int main(void)
 {
+    raise_fd_limit();
     printf(BLUE "::" NC " native hardlink inode-map scale\n");
     char fixture[] = "/tmp/migr_native_hardlink_scale_XXXXXX";
     if (mkdtemp(fixture) == NULL)

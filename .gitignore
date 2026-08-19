@@ -31,4 +31,5 @@ tests/test_portable_restore_invariant
 tests/test_portable_collision_scale
 tests/test_portable_hardlink_scale
 tests/test_portable_prepare
+tests/test_fd_limit
 docs/scratch/

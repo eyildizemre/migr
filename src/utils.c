@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <limits.h>
+#include <sys/resource.h>
 
 #include "utils.h"
 
@@ -24,6 +25,17 @@ int path_join_n(char *buf, size_t size, const char *dir,
 int path_join(char *buf, size_t size, const char *dir, const char *name)
 {
     return path_join_n(buf, size, dir, name, strlen(name));
+}
+
+void raise_fd_limit(void)
+{
+    struct rlimit limit;
+    if (getrlimit(RLIMIT_NOFILE, &limit) != 0)
+        return;
+    if (limit.rlim_cur >= limit.rlim_max)
+        return;
+    limit.rlim_cur = limit.rlim_max;
+    (void)setrlimit(RLIMIT_NOFILE, &limit);
 }
 
 void print_help(void)

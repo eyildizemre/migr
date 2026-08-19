@@ -28,6 +28,23 @@ int path_join_n(char *buf, size_t size, const char *dir,
                 const char *name, size_t name_len);
 
 /**
+ * @brief Raises the process's open-file soft limit to its hard limit.
+ *
+ * Best-effort and silent: native hardlink capture holds one fd per unique
+ * multiply-linked source inode open for the whole backup (src/fileops.c,
+ * native_inode_map_insert()), and a shell's inherited soft nofile limit is
+ * commonly far below what the same process's hard limit already permits --
+ * 1024 is the classic Linux default, while a modern systemd-managed
+ * session's actual ceiling is typically in the hundreds of thousands. This
+ * raises the soft limit to whatever the hard limit already allows, without
+ * requesting elevated privilege (POSIX permits any process to move its own
+ * soft limit anywhere up to its current hard limit). If the hard limit itself
+ * is low, or the call fails for any reason, this silently leaves the limit as
+ * it was -- never fatal, never printed.
+ */
+void raise_fd_limit(void);
+
+/**
  * @brief Prints usage information for all commands and options to stdout.
  */
 void print_help(void);
