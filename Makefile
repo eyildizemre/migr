@@ -116,11 +116,11 @@ backup_test.o: src/backup.c src/backup.h src/backup_plan.h src/fileops.h src/met
 $(TEST_BACKUP_SOURCE_READ): tests/test_backup_source_read.c backup_test.o backup_plan.o container.o fileops_test.o metadata.o portable.o sidecar.o sidecar_state.o hash.o fsprobe.o manifest.o encoding.o packages.o utils.o xdg.o detect.o
 	$(CC) $(CFLAGS) -DBACKUP_TEST_HOOKS -o $@ tests/test_backup_source_read.c backup_test.o backup_plan.o container.o fileops_test.o metadata.o portable.o sidecar.o sidecar_state.o hash.o fsprobe.o manifest.o encoding.o packages.o utils.o xdg.o detect.o
 
-$(TEST_RESTORE_DISPATCH): tests/test_restore_dispatch.c restore.o fileops.o metadata.o portable.o sidecar.o sidecar_state.o hash.o fsprobe.o manifest.o encoding.o container.o utils.o xdg.o detect.o
-	$(CC) $(CFLAGS) -o $@ tests/test_restore_dispatch.c restore.o fileops.o metadata.o portable.o sidecar.o sidecar_state.o hash.o fsprobe.o manifest.o encoding.o container.o utils.o xdg.o detect.o
+$(TEST_RESTORE_DISPATCH): tests/test_restore_dispatch.c restore.o portable_restore.o fileops.o metadata.o portable.o sidecar.o sidecar_state.o hash.o fsprobe.o manifest.o encoding.o container.o utils.o xdg.o detect.o
+	$(CC) $(CFLAGS) -o $@ tests/test_restore_dispatch.c restore.o portable_restore.o fileops.o metadata.o portable.o sidecar.o sidecar_state.o hash.o fsprobe.o manifest.o encoding.o container.o utils.o xdg.o detect.o
 
-$(TEST_RESTORE_ATIME): tests/test_restore_atime.c restore.o fileops.o metadata.o portable.o sidecar.o sidecar_state.o hash.o fsprobe.o manifest.o encoding.o container.o utils.o xdg.o detect.o
-	$(CC) $(CFLAGS) -o $@ tests/test_restore_atime.c restore.o fileops.o metadata.o portable.o sidecar.o sidecar_state.o hash.o fsprobe.o manifest.o encoding.o container.o utils.o xdg.o detect.o
+$(TEST_RESTORE_ATIME): tests/test_restore_atime.c restore.o portable_restore.o fileops.o metadata.o portable.o sidecar.o sidecar_state.o hash.o fsprobe.o manifest.o encoding.o container.o utils.o xdg.o detect.o
+	$(CC) $(CFLAGS) -o $@ tests/test_restore_atime.c restore.o portable_restore.o fileops.o metadata.o portable.o sidecar.o sidecar_state.o hash.o fsprobe.o manifest.o encoding.o container.o utils.o xdg.o detect.o
 
 $(TEST_BACKUP_PLAN): tests/test_backup_plan.c backup.o backup_plan.o container.o fileops.o metadata.o portable.o sidecar.o sidecar_state.o hash.o fsprobe.o manifest.o encoding.o packages.o utils.o xdg.o detect.o
 	$(CC) $(CFLAGS) -o $@ tests/test_backup_plan.c backup.o backup_plan.o container.o fileops.o metadata.o portable.o sidecar.o sidecar_state.o hash.o fsprobe.o manifest.o encoding.o packages.o utils.o xdg.o detect.o

@@ -971,22 +971,14 @@ test_probe_refusal() {
         exit 1
     fi
 
-    # Same read-only destination under --dry-run: no probe, no writes, clean exit.
-    local dr_out dr_rc
-    set +e
-    dr_out=$(../migr backup "$ro_dest" --dry-run 2>&1)
-    dr_rc=$?
-    set -e
-    if [ "$dr_rc" -ne 0 ]; then
-        echo -e "  ${RED}✗${NC} dry-run on read-only dest should succeed; exit=$dr_rc"
-        echo "  output: $dr_out"
-        exit 1
-    fi
+    # Same read-only destination under --dry-run: the probe now runs for
+    # real (I-6), so it must refuse identically to the live case above.
+    assert_fails_with "could not probe" ../migr backup "$ro_dest" --dry-run
     if compgen -G "$ro_dest/migr_backup_*" > /dev/null; then
         echo -e "  ${RED}✗${NC} dry-run wrote a backup dir into a read-only dest"
         exit 1
     fi
-    echo -e "  ${GREEN}✓${NC} dry-run on read-only dest refused nothing and wrote nothing"
+    echo -e "  ${GREEN}✓${NC} dry-run on read-only dest refuses exactly like a live run"
     chmod 755 "$ro_dest" # restore the write bit so teardown can remove it
 
     # A destination migr creates itself, then hits a probe refusal: the empty root

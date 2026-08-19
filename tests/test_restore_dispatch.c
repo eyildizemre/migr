@@ -394,8 +394,8 @@ static void test_dispatch_refuses_portable_v1(void)
     char output[8192];
     int rc = run_restore_capturing(source, output, sizeof(output));
     check(rc != 0, "portable v1 restore is refused while its replay path is absent");
-    check(strstr(output, "Portable backup restore is not implemented") != NULL,
-          "the refusal identifies the unsupported representation");
+    check(strstr(output, "Portable restore preflight refused") != NULL,
+          "the refusal identifies the portable preflight path");
     check(strstr(output, "[Roots]") == NULL,
           "portable payload never reaches the native root walker");
 

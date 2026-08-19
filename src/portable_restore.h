@@ -52,7 +52,8 @@ void portable_restore_preflight_report_init(
 void portable_restore_preflight_report_free(
     PortableRestorePreflightReport *report);
 
-/* Read-only seam (docs/DECISIONS.md D17); production restore() does not call this function. */
+/* Read-only seam (docs/DECISIONS.md D17); called by production restore()
+ * only indirectly, through portable_restore_orchestrate_at(). */
 int portable_restore_preflight_at(
     const PortableRestoreRequest *request,
     PortableRestorePreflightReport *report);

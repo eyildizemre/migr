@@ -15,6 +15,7 @@
 #include "fsprobe.h"
 #include "manifest.h"
 #include "metadata.h"
+#include "portable_restore.h"
 #include "utils.h"
 #include "xdg.h"
 
@@ -1221,22 +1222,6 @@ int restore(const char *source)
         close(source_root_fd);
         return 1;
     }
-    if (mst == MANIFEST_STATUS_VALID &&
-        m.representation != CLONE_NATIVE_TREE)
-    {
-        printf("Error: Portable backup restore is not implemented yet; refusing to interpret portable payload as native.\n");
-        manifest_free(&m);
-        close(source_root_fd);
-        return 1;
-    }
-    if (mst == MANIFEST_STATUS_VALID &&
-        validate_v1_payloads(source_root_fd, &m) != 0)
-    {
-        manifest_free(&m);
-        close(source_root_fd);
-        return 1;
-    }
-
     int home_fd = open(home, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (home_fd < 0)
     {
@@ -1246,6 +1231,65 @@ int restore(const char *source)
             printf("Error: Could not open home directory: %s\n", home);
         if (mst == MANIFEST_STATUS_VALID)
             manifest_free(&m);
+        close(source_root_fd);
+        return 1;
+    }
+
+    if (mst == MANIFEST_STATUS_VALID &&
+        m.representation == CLONE_PORTABLE_SIDECAR)
+    {
+        PortableRestoreRequest request = {
+            .source_container_fd = source_root_fd,
+            .manifest = &m,
+            .destination_home_fd = home_fd,
+            .destination_timestamp_policy = {0}
+        };
+        PortableRestoreReplayReport report;
+        PortableRestoreOutcome outcome =
+            portable_restore_orchestrate_at(&request, &report);
+
+        int had_portable_error = 0;
+        if (outcome == PORTABLE_RESTORE_COMPLETE)
+        {
+            // Packages are published only after a fully successful replay.
+            restore_packages(source_root_fd, home, &had_portable_error);
+        }
+
+        printf("\n===========================================================\n");
+        switch (outcome)
+        {
+            case PORTABLE_RESTORE_COMPLETE:
+                printf(had_portable_error
+                    ? "Restore finished with errors: %zu item(s) restored, packages step failed\n"
+                    : "Restore complete: %zu item(s) restored\n",
+                    report.applied_count);
+                break;
+            case PORTABLE_RESTORE_DRY_RUN:
+                printf("Dry run complete: %zu item(s) would be restored\n",
+                       report.live_count);
+                break;
+            case PORTABLE_RESTORE_CANCELLED:
+                printf("Cancelled.\n");
+                break;
+            case PORTABLE_RESTORE_ERROR:
+            default:
+                printf("Restore finished with errors: %zu applied, %zu failed\n",
+                       report.applied_count, report.failed_count);
+                break;
+        }
+        printf("===========================================================\n");
+
+        manifest_free(&m);
+        close(home_fd);
+        close(source_root_fd);
+        return (outcome == PORTABLE_RESTORE_ERROR || had_portable_error) ? 1 : 0;
+    }
+
+    if (mst == MANIFEST_STATUS_VALID &&
+        validate_v1_payloads(source_root_fd, &m) != 0)
+    {
+        manifest_free(&m);
+        close(home_fd);
         close(source_root_fd);
         return 1;
     }

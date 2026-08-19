@@ -138,10 +138,10 @@ symlinks. Otherwise migr refuses the entire invocation before creating anything,
 backup can never recurse into and consume its own output.
 
 Before a live backup creates a container, migr probes the destination filesystem.
-Portable capture is not implemented yet, so a destination that cannot faithfully hold
-the required Linux semantics is refused rather than used with silent metadata loss.
-External explicit roots also remain ineligible for future portable capture until they
-have a faithful restore-address policy.
+A destination that cannot faithfully hold the required Linux semantics uses a portable
+sidecar representation (a state log preserving the true metadata alongside a plain,
+percent-encoded payload) instead of being refused. External explicit roots remain
+ineligible for portable capture: they have no faithful restore-address policy (see below).
 
 ## Core Metadata Fidelity
 
@@ -164,18 +164,17 @@ not a silent degradation.
 Destinations that cannot faithfully hold these semantics are detected by an
 on-disk capability probe before anything is written: a filesystem that loses
 metadata (for example exFAT/NTFS/FAT32) is refused for capture, not silently
-degraded. Portable capture to such filesystems (with a sidecar state log preserving
-the true metadata) is implemented behind a test-only seam but is not yet wired into
-the public CLI; it will become available only after the remaining safety phases
-(see [docs/sidecar-plan.md](docs/sidecar-plan.md)). Until then the probe refusal is
-the production behaviour — a failed backup is safer than a silent metadata loss.
+degraded. Portable capture to such filesystems, with a sidecar state log
+preserving the true metadata, is dispatched automatically based on the same
+capability probe — no flag, no override (see
+[docs/DECISIONS.md](docs/DECISIONS.md) D14, D24).
 
-Portable capture and replay also handle symlinks behind the same D14 test-only
-seam: the payload contains an empty regular placeholder while the sidecar
+Portable capture and replay also handle symlinks: the payload contains an empty
+regular placeholder while the sidecar
 record carries the target and core metadata, so the target is never written into
 the payload. Symlink xattrs are collected and replayed through the no-follow
 `l*` family, with exact-set reconciliation and the same fail-closed rules as
-other object kinds. Production portable dispatch remains disabled at this stage.
+other object kinds.
 
 Portable payload names are percent-encoded on disk while the sidecar preserves
 the true logical name; restore always creates that logical name, never a decoded
@@ -183,8 +182,6 @@ or re-derived substitute. On a case-insensitive destination, sibling collisions
 are resolved deterministically with a `%7EN` suffix on the payload name; only
 unresolvable cases such as `NAME_MAX`/`PATH_MAX` overflow or a root-payload
 namespace collision refuse the entire invocation before anything is written.
-This remains behind the D14 test-only seam; production portable dispatch is
-still disabled.
 
 Hardlinked files keep their shared identity across both representations.
 Native capture links a later occurrence of an already-seen file to its first
@@ -194,9 +191,7 @@ documented limitation). Portable capture records the first-seen file as
 regular and every later occurrence as a hardlink record referencing it,
 including across different backup roots; restore replays the group with
 `link()`, and because the link shares the representative's inode, its
-extended attributes arrive automatically without a second write. This
-remains behind the D14 test-only seam; production portable dispatch is
-still disabled.
+extended attributes arrive automatically without a second write.
 
 Native backups also reconcile themselves on resume: after every root
 captures cleanly, migr scans the destination tree directly and removes any
@@ -239,7 +234,7 @@ recorded in [docs/DECISIONS.md](docs/DECISIONS.md).
 - [x] Localization (xdg-user-dirs support)
 - [x] Cross-locale restore mapping (manifest system)
 - [x] Resumable versioned backup containers
-- [ ] Backups to filesystems that cannot hold Linux metadata (exFAT/NTFS/FAT32)
+- [x] Backups to filesystems that cannot hold Linux metadata (exFAT/NTFS/FAT32)
 - [ ] VS Code extension list backup and restore
 - [ ] Logging
 - [ ] Network configuration backup

@@ -55,6 +55,10 @@ void print_help(void)
     printf("  <PATH...>             Paths listed after the destination are backed up\n");
     printf("                        exactly as given, with no assumptions\n");
     printf("\n");
+    printf("A destination that cannot hold Linux metadata natively (e.g.\n");
+    printf("exFAT/NTFS/FAT32) uses a portable sidecar representation instead\n");
+    printf("of being refused; restore reads either representation the same way.\n");
+    printf("\n");
     printf("Options:\n");
     printf("  -n, --dry-run         Preview actions without making changes\n");
     printf("  -v, --verbose         Verbose output\n");

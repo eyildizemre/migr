@@ -21,6 +21,7 @@
 #include "manifest.h"
 #include "metadata.h"
 #include "packages.h"
+#include "portable.h"
 #include "utils.h"
 
 #ifdef BACKUP_TEST_HOOKS
@@ -185,6 +186,57 @@ static int manifest_from_plan(const BackupPlan *plan, Manifest *out)
         out->has_source_identity = 1;
     }
 
+    return 0;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Plan to portable capture request (docs/DECISIONS.md D24).                 */
+/* ------------------------------------------------------------------------- */
+
+// Mechanical field-by-field conversion: PortableRootSpec covers exactly what
+// a BackupPlanRoot/ManifestRoot pair already carries. The returned entries
+// borrow their strings from plan and remain valid while plan is unchanged.
+static void portable_root_specs_from_plan(const BackupPlan *plan,
+                                          PortableRootSpec *roots_out)
+{
+    for (int i = 0; i < plan->root_count; i++)
+    {
+        const BackupPlanRoot *root = &plan->roots[i];
+        roots_out[i] = (PortableRootSpec){
+            .id = root->manifest_root.id,
+            .policy = root->manifest_root.policy,
+            .capture_path = root->capture_path,
+            .payload_path = root->manifest_root.payload_path,
+            .source_path = root->manifest_root.source_path,
+            .restore_path = root->manifest_root.restore_path,
+            .has_restore_path = root->manifest_root.has_restore_path
+        };
+    }
+}
+
+// The portable request mirrors manifest_from_plan()'s identity fields. All
+// strings are borrowed from plan or machine_id and must outlive the request.
+static int portable_capture_request_from_plan(
+    const BackupPlan *plan, const char *machine_id, int has_machine_id,
+    uid_t source_uid, int nsec_exact, int case_sensitive,
+    PortableRootSpec *roots_storage, PortableCaptureRequest *out)
+{
+    if (plan == NULL || out == NULL ||
+        (plan->root_count > 0 && roots_storage == NULL))
+        return -1;
+
+    if (plan->root_count > 0)
+        portable_root_specs_from_plan(plan, roots_storage);
+    *out = (PortableCaptureRequest){
+        .scope = plan->scope,
+        .has_source_identity = has_machine_id,
+        .machine_id = has_machine_id ? machine_id : NULL,
+        .source_uid = source_uid,
+        .roots = plan->root_count > 0 ? roots_storage : NULL,
+        .root_count = (size_t)plan->root_count,
+        .nsec_exact = nsec_exact,
+        .case_sensitive = case_sensitive
+    };
     return 0;
 }
 
@@ -619,11 +671,32 @@ int backup(const char *target, BackupMode mode, char **paths)
             return 1;
         }
 
+        CloneRepresentation advisory_repr = CLONE_NATIVE_TREE;
+        FsCapabilityProfile advisory_profile;
+        const char *advisory_refusal = NULL;
         MetadataProfiles advisory_profiles;
         metadata_profiles_init(&advisory_profiles);
         SourceReadRefusals advisory_refusals;
         source_read_refusals_init(&advisory_refusals);
         int advisory_fd = open(target, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (advisory_fd >= 0)
+        {
+            if (fsprobe_fd(advisory_fd, &advisory_profile) != 0)
+                advisory_refusal = "could not probe the destination filesystem at";
+            else if (select_representation(&advisory_profile, &advisory_repr) != 0)
+                advisory_refusal = "the destination filesystem is not usable for backup at";
+        }
+        if (advisory_refusal != NULL)
+        {
+            printf("Error: %s %s\n", advisory_refusal, target);
+            close(advisory_fd);
+            if (target_created)
+                rmdir(target);
+            manifest_free(&manifest);
+            backup_plan_free(&plan);
+            return 1;
+        }
+
         if (advisory_fd >= 0)
         {
             int advisory_failed = backup_metadata_preflight(
@@ -644,16 +717,88 @@ int backup(const char *target, BackupMode mode, char **paths)
                 printf("Warning: could not complete the read-only metadata preview; "
                        "the live backup will recheck it before writing.\n");
             else
+            {
                 metadata_profiles_report(&advisory_profiles);
-            close(advisory_fd);
+                // The ownership probe is privilege-relevant and native-only;
+                // portable capture has no analogous native ownership step.
+                if (advisory_repr == CLONE_NATIVE_TREE &&
+                    metadata_profiles_probe(
+                        &advisory_profiles,
+                        (MetadataTimestampPolicy){ .nsec_exact = 0,
+                                                    .configured = 1 }) != 0)
+                    printf("Warning: the ownership probe could not complete; "
+                           "the live backup will recheck it before writing.\n");
+            }
+        }
+
+        PortablePrescanReport advisory_prescan = {0};
+        int has_advisory_prescan = 0;
+        if (advisory_fd >= 0 && advisory_repr == CLONE_PORTABLE_SIDECAR)
+        {
+            PortableRootSpec *advisory_roots = plan.root_count > 0
+                ? calloc((size_t)plan.root_count, sizeof(*advisory_roots))
+                : NULL;
+            if (plan.root_count > 0 && advisory_roots == NULL)
+            {
+                printf("Error: out of memory building the portable capture preview\n");
+                close(advisory_fd);
+                metadata_profiles_free(&advisory_profiles);
+                manifest_free(&manifest);
+                backup_plan_free(&plan);
+                return 1;
+            }
+            char advisory_machine_id[MANIFEST_MACHINE_ID_MAX];
+            int advisory_has_machine_id = read_machine_id(
+                advisory_machine_id, sizeof(advisory_machine_id)) == 0;
+            PortableCaptureRequest advisory_request;
+            int request_result = portable_capture_request_from_plan(
+                &plan, advisory_machine_id, advisory_has_machine_id, getuid(),
+                advisory_profile.nsec_exact,
+                advisory_profile.capabilities[FS_CAP_CASE_SENSITIVE].status ==
+                    FS_CAP_SUPPORTED,
+                advisory_roots, &advisory_request);
+            PortablePreparedCapture advisory_prepared = {0};
+            int prepare_result = request_result == 0
+                ? portable_capture_prepare(advisory_fd, &advisory_request,
+                                            &advisory_prepared)
+                : -1;
+            free(advisory_roots);
+            if (prepare_result != 0)
+            {
+                portable_prepared_capture_free(&advisory_prepared);
+                printf("Error: portable pre-scan failed or found an unresolvable "
+                       "conflict at %s; nothing would be created\n", target);
+                close(advisory_fd);
+                metadata_profiles_free(&advisory_profiles);
+                manifest_free(&manifest);
+                backup_plan_free(&plan);
+                return 1;
+            }
+            advisory_prescan = advisory_prepared.report;
+            memset(&advisory_prepared.report, 0,
+                   sizeof(advisory_prepared.report));
+            has_advisory_prescan = 1;
+            portable_prepared_capture_free(&advisory_prepared);
         }
         metadata_profiles_free(&advisory_profiles);
+        if (advisory_fd >= 0)
+            close(advisory_fd);
 
         printf("Dry run mode enabled. No changes will be made.\n\n");
         printf("Would create a versioned backup container under: %s\n", target);
         printf("  Its migr_backup_<timestamp> name is chosen when the backup actually runs.\n");
 
         preview_roots(&plan, &count);
+
+        if (has_advisory_prescan)
+        {
+            printf("\nDestination cannot hold Linux metadata natively; a portable "
+                   "sidecar representation would be used.\n");
+            if (advisory_prescan.unresolved_count > 0)
+                printf("  %zu naming conflict(s) found; the live run would refuse.\n",
+                       advisory_prescan.unresolved_count);
+            portable_prescan_report_free(&advisory_prescan);
+        }
 
         printf("\n[Controls]\n");
         printf("  Would write manifest.txt\n");
@@ -688,20 +833,16 @@ int backup(const char *target, BackupMode mode, char **paths)
     }
 
     // Probe the destination and choose a representation before any container
-    // exists. Portable is refused (not built yet); an unreliable probe is
-    // fatal, never a silent fall-through. If we created the destination root
-    // this run and then refuse, roll it back so a rejected attempt leaves
-    // nothing behind.
+    // exists. An unreliable probe is fatal, never a silent fall-through. If we
+    // created the destination root this run and then refuse, roll it back so a
+    // rejected attempt leaves nothing behind.
     CloneRepresentation repr = CLONE_NATIVE_TREE;
     FsCapabilityProfile profile;
     const char *refusal = NULL;
-    if (fsprobe(target, &profile) != 0)
+    if (fsprobe_fd(target_fd, &profile) != 0)
         refusal = "could not probe the destination filesystem at";
     else if (select_representation(&profile, &repr) != 0)
         refusal = "the destination filesystem is not usable for backup at";
-    else if (repr != CLONE_NATIVE_TREE)
-        refusal = "portable representation is not implemented yet, so migr refuses "
-                  "rather than lose Linux file metadata at";
 
     if (refusal != NULL)
     {
@@ -717,92 +858,171 @@ int backup(const char *target, BackupMode mode, char **paths)
     // before the manifest is matched against an existing partial.
     manifest.representation = repr;
 
+    PortablePreparedCapture prepared = {0};
+    PortableRootSpec *portable_roots = NULL;
+    PortableCaptureRequest portable_request = {0};
+    char portable_machine_id[MANIFEST_MACHINE_ID_MAX];
+    if (repr == CLONE_PORTABLE_SIDECAR)
+    {
+        if (plan.root_count > 0)
+        {
+            portable_roots = calloc((size_t)plan.root_count,
+                                    sizeof(*portable_roots));
+            if (portable_roots == NULL)
+            {
+                printf("Error: out of memory building the portable capture request\n");
+                close(target_fd);
+                if (target_created)
+                    rmdir(target);
+                manifest_free(&manifest);
+                backup_plan_free(&plan);
+                return 1;
+            }
+        }
+        int has_machine_id = read_machine_id(portable_machine_id,
+                                             sizeof(portable_machine_id)) == 0;
+        if (portable_capture_request_from_plan(
+                &plan, portable_machine_id, has_machine_id, getuid(),
+                profile.nsec_exact,
+                profile.capabilities[FS_CAP_CASE_SENSITIVE].status ==
+                    FS_CAP_SUPPORTED,
+                portable_roots, &portable_request) != 0 ||
+            portable_capture_prepare(target_fd, &portable_request,
+                                     &prepared) != 0)
+        {
+            int has_manual_native = 0;
+            for (int i = 0; i < plan.root_count; i++)
+                if (plan.roots[i].manifest_root.policy ==
+                    ROOT_POLICY_MANUAL_NATIVE)
+                    has_manual_native = 1;
+            if (has_manual_native)
+                printf("Error: %s cannot hold Linux metadata natively, and portable "
+                       "capture cannot carry an external (manual-native) root's "
+                       "restore address; move or drop the external path(s) to "
+                       "back up here.\n", target);
+            else
+                printf("Error: portable pre-scan failed or found an unresolvable "
+                       "conflict at %s; no container was created\n", target);
+            portable_prepared_capture_free(&prepared);
+            free(portable_roots);
+            close(target_fd);
+            if (target_created)
+                rmdir(target);
+            manifest_free(&manifest);
+            backup_plan_free(&plan);
+            return 1;
+        }
+    }
+    const Manifest *identity_manifest = repr == CLONE_PORTABLE_SIDECAR
+        ? &prepared.manifest : &manifest;
+
     MetadataProfiles metadata_profiles;
     metadata_profiles_init(&metadata_profiles);
     SourceReadRefusals source_read_refusals;
     source_read_refusals_init(&source_read_refusals);
     BackupContainer container = {0};
     int adopted = 0;
-    ContainerStatus adopt_status = container_adopt(target, &manifest, &container);
+    ContainerStatus adopt_status = container_adopt_fd(target_fd, identity_manifest,
+                                                      &container);
     if (adopt_status == CONTAINER_OK)
     {
         adopted = 1;
         int adopted_data_fd = openat(container_root_fd(&container), "data",
                                      O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
                                      O_CLOEXEC);
-        int metadata_failed = adopted_data_fd < 0;
-        if (!metadata_failed)
-            metadata_failed = backup_metadata_preflight(
-                &plan, adopted_data_fd, adopted_data_fd,
-                &metadata_profiles, &source_read_refusals) != 0;
-        if (source_read_refusals.refusal_count > 0)
-            metadata_failed = 1;
-        if (!metadata_failed && source_read_refusals.refusal_count == 0)
+        int metadata_failed = 0;
+        if (repr == CLONE_NATIVE_TREE)
         {
-            metadata_profiles_report(&metadata_profiles);
-            metadata_failed = metadata_profiles_probe(
-                &metadata_profiles,
-                (MetadataTimestampPolicy){ .nsec_exact = 0, .configured = 1 }) != 0;
-        }
-        if (metadata_failed)
-        {
-            if (adopted_data_fd >= 0)
-                close(adopted_data_fd);
+            metadata_failed = adopted_data_fd < 0;
+            if (!metadata_failed)
+                metadata_failed = backup_metadata_preflight(
+                    &plan, adopted_data_fd, adopted_data_fd,
+                    &metadata_profiles, &source_read_refusals) != 0;
             if (source_read_refusals.refusal_count > 0)
+                metadata_failed = 1;
+            if (!metadata_failed && source_read_refusals.refusal_count == 0)
             {
-                source_read_refusals_report(&source_read_refusals);
-                printf("Error: native metadata preflight refused the source; "
-                       "no payload was changed\n");
+                metadata_profiles_report(&metadata_profiles);
+                metadata_failed = metadata_profiles_probe(
+                    &metadata_profiles,
+                    (MetadataTimestampPolicy){ .nsec_exact = 0,
+                                                .configured = 1 }) != 0;
             }
-            else
-                printf("Error: native metadata preflight failed; no payload was changed\n");
-            container_close(&container);
-            metadata_profiles_free(&metadata_profiles);
-            close(target_fd);
-            if (target_created) rmdir(target);
-            manifest_free(&manifest);
-            backup_plan_free(&plan);
-            return 1;
+            if (metadata_failed)
+            {
+                if (adopted_data_fd >= 0)
+                    close(adopted_data_fd);
+                if (source_read_refusals.refusal_count > 0)
+                {
+                    source_read_refusals_report(&source_read_refusals);
+                    printf("Error: native metadata preflight refused the source; "
+                           "no payload was changed\n");
+                }
+                else
+                    printf("Error: native metadata preflight failed; no payload was changed\n");
+                container_close(&container);
+                metadata_profiles_free(&metadata_profiles);
+                portable_prepared_capture_free(&prepared);
+                free(portable_roots);
+                close(target_fd);
+                if (target_created)
+                    rmdir(target);
+                manifest_free(&manifest);
+                backup_plan_free(&plan);
+                return 1;
+            }
         }
-        close(adopted_data_fd);
+        if (adopted_data_fd >= 0)
+            close(adopted_data_fd);
     }
     else if (adopt_status == CONTAINER_ERR_NO_MATCH)
     {
-        int metadata_failed = backup_metadata_preflight(
-            &plan, target_fd, -1, &metadata_profiles,
-            &source_read_refusals) != 0;
-        if (source_read_refusals.refusal_count > 0)
-            metadata_failed = 1;
-        if (!metadata_failed && source_read_refusals.refusal_count == 0)
+        int metadata_failed = 0;
+        if (repr == CLONE_NATIVE_TREE)
         {
-            metadata_profiles_report(&metadata_profiles);
-            metadata_failed = metadata_profiles_probe(
-                &metadata_profiles,
-                (MetadataTimestampPolicy){ .nsec_exact = 0, .configured = 1 }) != 0;
-        }
-        if (metadata_failed)
-        {
+            metadata_failed = backup_metadata_preflight(
+                &plan, target_fd, -1, &metadata_profiles,
+                &source_read_refusals) != 0;
             if (source_read_refusals.refusal_count > 0)
+                metadata_failed = 1;
+            if (!metadata_failed && source_read_refusals.refusal_count == 0)
             {
-                source_read_refusals_report(&source_read_refusals);
-                printf("Error: native metadata preflight refused the source; "
-                       "no container was created\n");
+                metadata_profiles_report(&metadata_profiles);
+                metadata_failed = metadata_profiles_probe(
+                    &metadata_profiles,
+                    (MetadataTimestampPolicy){ .nsec_exact = 0,
+                                                .configured = 1 }) != 0;
             }
-            else
-                printf("Error: native metadata preflight failed; no container was created\n");
-            metadata_profiles_free(&metadata_profiles);
-            close(target_fd);
-            if (target_created) rmdir(target);
-            manifest_free(&manifest);
-            backup_plan_free(&plan);
-            return 1;
+            if (metadata_failed)
+            {
+                if (source_read_refusals.refusal_count > 0)
+                {
+                    source_read_refusals_report(&source_read_refusals);
+                    printf("Error: native metadata preflight refused the source; "
+                           "no container was created\n");
+                }
+                else
+                    printf("Error: native metadata preflight failed; no container was created\n");
+                metadata_profiles_free(&metadata_profiles);
+                portable_prepared_capture_free(&prepared);
+                free(portable_roots);
+                close(target_fd);
+                if (target_created)
+                    rmdir(target);
+                manifest_free(&manifest);
+                backup_plan_free(&plan);
+                return 1;
+            }
         }
-        if (container_reserve(target, time(NULL), &container) != CONTAINER_OK)
+        if (container_reserve_fd(target_fd, time(NULL), &container) != CONTAINER_OK)
         {
             printf("Error: Could not create a backup container under %s\n", target);
             metadata_profiles_free(&metadata_profiles);
+            portable_prepared_capture_free(&prepared);
+            free(portable_roots);
             close(target_fd);
-            if (target_created) rmdir(target);
+            if (target_created)
+                rmdir(target);
             manifest_free(&manifest);
             backup_plan_free(&plan);
             return 1;
@@ -817,8 +1037,11 @@ int backup(const char *target, BackupMode mode, char **paths)
         else
             printf("Error: could not examine existing backups under %s\n", target);
         metadata_profiles_free(&metadata_profiles);
+        portable_prepared_capture_free(&prepared);
+        free(portable_roots);
         close(target_fd);
-        if (target_created) rmdir(target);
+        if (target_created)
+            rmdir(target);
         manifest_free(&manifest);
         backup_plan_free(&plan);
         return 1;
@@ -837,7 +1060,7 @@ int backup(const char *target, BackupMode mode, char **paths)
     // container without one is not a v1 container at all. An adopted one
     // already carries a manifest that was read back and matched during
     // adoption; rewriting it would truncate proven-good state for no gain.
-    if (!adopted && manifest_write_v1_at(container_fd, &manifest) != 0)
+    if (!adopted && manifest_write_v1_at(container_fd, identity_manifest) != 0)
     {
         printf("Error: Could not write manifest.txt into the backup container\n");
         had_error = 1;
@@ -861,31 +1084,52 @@ int backup(const char *target, BackupMode mode, char **paths)
         if (adopted)
             printf("Resuming an interrupted backup of the same job.\n");
 
-        CloneContext ctx = {
-            .operation = CLONE_BACKUP,
-            .representation = repr,
-            .timestamp_policy_configured = 1,
-            .nsec_exact = profile.nsec_exact,
-            .metadata_preflight_done = 1,
-            .inode_map = native_inode_map_create(),
-            .visited = native_visited_create()
-        };
-        if (ctx.inode_map == NULL || ctx.visited == NULL)
+        if (repr == CLONE_NATIVE_TREE)
         {
-            printf("Error: Could not initialize native hardlink/resume tracking\n");
-            native_inode_map_free(ctx.inode_map);
-            native_visited_free(ctx.visited);
-            had_error = 1;
+            CloneContext ctx = {
+                .operation = CLONE_BACKUP,
+                .representation = repr,
+                .timestamp_policy_configured = 1,
+                .nsec_exact = profile.nsec_exact,
+                .metadata_preflight_done = 1,
+                .inode_map = native_inode_map_create(),
+                .visited = native_visited_create()
+            };
+            if (ctx.inode_map == NULL || ctx.visited == NULL)
+            {
+                printf("Error: Could not initialize native hardlink/resume tracking\n");
+                native_inode_map_free(ctx.inode_map);
+                native_visited_free(ctx.visited);
+                had_error = 1;
+            }
+            else
+            {
+                capture_roots(&ctx, &plan, data_fd, &count, &had_error);
+                if (!had_error)
+                    reconcile_roots(ctx.visited, &plan, data_fd, &had_error);
+                native_inode_map_free(ctx.inode_map);
+                ctx.inode_map = NULL;
+                native_visited_free(ctx.visited);
+                ctx.visited = NULL;
+            }
         }
         else
         {
-            capture_roots(&ctx, &plan, data_fd, &count, &had_error);
-            if (!had_error)
-                reconcile_roots(ctx.visited, &plan, data_fd, &had_error);
-            native_inode_map_free(ctx.inode_map);
-            ctx.inode_map = NULL;
-            native_visited_free(ctx.visited);
-            ctx.visited = NULL;
+            size_t live_count = 0;
+            int capture_result = adopted
+                ? portable_capture_resume_prepared_at(
+                      container_fd, &portable_request, &prepared, &live_count)
+                : portable_capture_fresh_prepared_at(
+                      container_fd, &portable_request, &prepared, &live_count);
+            if (capture_result != 0)
+            {
+                printf("Error: portable capture failed\n");
+                had_error = 1;
+            }
+            else
+            {
+                count = (int)live_count;
+            }
         }
         close(data_fd);
 
@@ -942,6 +1186,8 @@ int backup(const char *target, BackupMode mode, char **paths)
         printf("===========================================================\n");
         container_close(&container);
         metadata_profiles_free(&metadata_profiles);
+        portable_prepared_capture_free(&prepared);
+        free(portable_roots);
         manifest_free(&manifest);
         backup_plan_free(&plan);
         return 1;
@@ -962,6 +1208,8 @@ int backup(const char *target, BackupMode mode, char **paths)
         printf("===========================================================\n");
         container_close(&container);
         metadata_profiles_free(&metadata_profiles);
+        portable_prepared_capture_free(&prepared);
+        free(portable_roots);
         manifest_free(&manifest);
         backup_plan_free(&plan);
         return 1;
@@ -973,6 +1221,8 @@ int backup(const char *target, BackupMode mode, char **paths)
 
     container_close(&container);
     metadata_profiles_free(&metadata_profiles);
+    portable_prepared_capture_free(&prepared);
+    free(portable_roots);
     manifest_free(&manifest);
     backup_plan_free(&plan);
     return 0;
