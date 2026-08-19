@@ -5149,6 +5149,19 @@ static int prescan_directory(int source_fd, const char *logical,
                 report->total_size += (uint64_t)child_stat.st_size;
             }
         }
+        else if (S_ISFIFO(child_stat.st_mode)) {
+            if (prescan_record_violation(
+                    report, root_id, child_logical,
+                    PORTABLE_PRESCAN_UNSUPPORTED_KIND, 0, 0) != 0) {
+                failed = 1;
+                break;
+            }
+        }
+        else if (S_ISSOCK(child_stat.st_mode) ||
+                 S_ISCHR(child_stat.st_mode) || S_ISBLK(child_stat.st_mode)) {
+            if (report->skipped_kind_count != SIZE_MAX)
+                report->skipped_kind_count++;
+        }
     }
     if (closedir(directory) != 0)
         failed = 1;
@@ -5346,6 +5359,16 @@ static int prescan_root(const PortableRootSpec *root,
     struct stat st;
     if (read_source_stat(-1, NULL, root->capture_path, &st) != 0)
         return -1;
+    if (S_ISFIFO(st.st_mode))
+        return prescan_record_violation(report, root->id, "",
+                                        PORTABLE_PRESCAN_UNSUPPORTED_KIND,
+                                        0, 0);
+    if (S_ISSOCK(st.st_mode) || S_ISCHR(st.st_mode) ||
+        S_ISBLK(st.st_mode)) {
+        if (report->skipped_kind_count != SIZE_MAX)
+            report->skipped_kind_count++;
+        return 0;
+    }
     if (!S_ISDIR(st.st_mode))
         return 0;
 
@@ -5466,6 +5489,38 @@ static int build_manifest(const PortableCaptureRequest *request,
 fail:
     manifest_free(manifest);
     return -1;
+}
+
+int portable_capture_prepare(int scratch_fd,
+                             const PortableCaptureRequest *request,
+                             PortablePreparedCapture *out)
+{
+    if (out == NULL)
+        return -1;
+    memset(out, 0, sizeof(*out));
+    if (scratch_fd < 0 || request == NULL ||
+        request->scope < MANIFEST_SCOPE_CRITICAL ||
+        request->scope > MANIFEST_SCOPE_EXPLICIT ||
+        request->root_count > MANIFEST_MAX_ROOTS ||
+        (request->root_count != 0 && request->roots == NULL))
+        return -1;
+
+    portable_prescan_report_init(&out->report);
+    if (prescan_request(scratch_fd, request, &out->report) != 0)
+        return -1;
+    if (build_manifest(request, &out->manifest) != 0)
+        return -1;
+    out->ready = 1;
+    return 0;
+}
+
+void portable_prepared_capture_free(PortablePreparedCapture *prepared)
+{
+    if (prepared == NULL)
+        return;
+    manifest_free(&prepared->manifest);
+    portable_prescan_report_free(&prepared->report);
+    memset(prepared, 0, sizeof(*prepared));
 }
 
 static int data_namespace_is_empty(int data_fd)
@@ -5597,40 +5652,27 @@ int portable_capture_root(PortableCaptureContext *context,
     return capture_plan_entries_seen(context, root);
 }
 
-int portable_capture_fresh_at(int container_fd,
-                              const PortableCaptureRequest *request,
-                              PortablePrescanReport *report)
+int portable_capture_fresh_prepared_at(
+    int container_fd, const PortableCaptureRequest *request,
+    const PortablePreparedCapture *prepared, size_t *live_count)
 {
     if (container_fd < 0 || request == NULL ||
         request->scope < MANIFEST_SCOPE_CRITICAL ||
         request->scope > MANIFEST_SCOPE_EXPLICIT ||
         request->root_count > MANIFEST_MAX_ROOTS ||
         (request->root_count != 0 && request->roots == NULL) ||
+        prepared == NULL || !prepared->ready ||
         fresh_namespace_is_empty(container_fd) != 0)
         return -1;
 
-    PortablePrescanReport local_report;
-    int owns_report = report == NULL;
-    PortablePrescanReport *active_report = report;
-    if (owns_report) {
-        portable_prescan_report_init(&local_report);
-        active_report = &local_report;
-    }
-    Manifest manifest = {0};
     SidecarLog sidecar = {0};
     PortableCaptureContext context = {0};
-    int manifest_ready = 0;
     int data_fd = -1;
     int sidecar_ready = 0;
     int context_ready = 0;
     int result = -1;
 
-    if (prescan_request(container_fd, request, active_report) != 0)
-        goto done;
-    if (build_manifest(request, &manifest) != 0)
-        goto done;
-    manifest_ready = 1;
-    if (manifest_write_v1_at(container_fd, &manifest) != 0)
+    if (manifest_write_v1_at(container_fd, &prepared->manifest) != 0)
         goto done;
     portable_test_interrupt_if(PORTABLE_TEST_AFTER_MANIFEST);
 
@@ -5653,7 +5695,7 @@ int portable_capture_fresh_at(int container_fd,
                                                request->case_sensitive) != 0;
     if (!failed) {
         context_ready = 1;
-        context.collision_plan = &active_report->collision_plan;
+        context.collision_plan = &prepared->report.collision_plan;
         if (portable_owned_paths_load(context.owned_paths, &sidecar) != 0 ||
             sticky_seed_inode_map(context.inode_map, request, &sidecar) != 0)
             failed = 1;
@@ -5662,6 +5704,8 @@ int portable_capture_fresh_at(int container_fd,
         if (portable_capture_root(&context, &request->roots[index]) != 0 ||
             reconcile_root(&context, &request->roots[index]) != 0)
             failed = 1;
+    if (!failed && live_count != NULL)
+        *live_count = sidecar_log_live_count(&sidecar);
     result = failed ? -1 : 0;
 
 done:
@@ -5671,10 +5715,38 @@ done:
         result = -1;
     if (data_fd >= 0 && close(data_fd) != 0)
         result = -1;
-    if (manifest_ready)
-        manifest_free(&manifest);
-    if (owns_report)
-        portable_prescan_report_free(&local_report);
+    return result;
+}
+
+int portable_capture_fresh_at(int container_fd,
+                              const PortableCaptureRequest *request,
+                              PortablePrescanReport *report)
+{
+    if (container_fd < 0 || request == NULL ||
+        request->scope < MANIFEST_SCOPE_CRITICAL ||
+        request->scope > MANIFEST_SCOPE_EXPLICIT ||
+        request->root_count > MANIFEST_MAX_ROOTS ||
+        (request->root_count != 0 && request->roots == NULL) ||
+        fresh_namespace_is_empty(container_fd) != 0)
+        return -1;
+
+    PortablePreparedCapture prepared;
+    if (portable_capture_prepare(container_fd, request, &prepared) != 0) {
+        if (report != NULL) {
+            *report = prepared.report;
+            memset(&prepared.report, 0, sizeof(prepared.report));
+        }
+        portable_prepared_capture_free(&prepared);
+        return -1;
+    }
+
+    int result = portable_capture_fresh_prepared_at(container_fd, request,
+                                                    &prepared, NULL);
+    if (report != NULL) {
+        *report = prepared.report;
+        memset(&prepared.report, 0, sizeof(prepared.report));
+    }
+    portable_prepared_capture_free(&prepared);
     return result;
 }
 
@@ -5707,25 +5779,18 @@ static int create_resume_data(int container_fd, int *out_fd)
     return state == 0 ? 0 : -1;
 }
 
-int portable_capture_resume_at(int container_fd,
-                               const PortableCaptureRequest *request,
-                               PortablePrescanReport *report)
+int portable_capture_resume_prepared_at(
+    int container_fd, const PortableCaptureRequest *request,
+    const PortablePreparedCapture *prepared, size_t *live_count)
 {
     if (container_fd < 0 || request == NULL ||
         request->scope < MANIFEST_SCOPE_CRITICAL ||
         request->scope > MANIFEST_SCOPE_EXPLICIT ||
         request->root_count > MANIFEST_MAX_ROOTS ||
-        (request->root_count != 0 && request->roots == NULL))
+        (request->root_count != 0 && request->roots == NULL) ||
+        prepared == NULL || !prepared->ready)
         return -1;
 
-    PortablePrescanReport local_report;
-    int owns_report = report == NULL;
-    PortablePrescanReport *active_report = report;
-    if (owns_report) {
-        portable_prescan_report_init(&local_report);
-        active_report = &local_report;
-    }
-    Manifest expected = {0};
     Manifest existing = {0};
     SidecarLog sidecar = {0};
     PortableCaptureContext context = {0};
@@ -5733,18 +5798,13 @@ int portable_capture_resume_at(int container_fd,
     int context_ready = 0;
     int result = -1;
 
-    if (prescan_request(container_fd, request, active_report) != 0)
-        goto done;
-    if (build_manifest(request, &expected) != 0)
-        goto done;
-
     ManifestStatus manifest_status = manifest_read_v1_at(container_fd,
                                                          &existing);
     if (manifest_status != MANIFEST_STATUS_VALID) {
         goto done;
     }
     ManifestIdentityComparison identity =
-        manifest_resume_identity_compare(&existing, &expected);
+        manifest_resume_identity_compare(&existing, &prepared->manifest);
     if (identity != MANIFEST_IDENTITY_EQUAL) {
         goto done;
     }
@@ -5779,7 +5839,7 @@ int portable_capture_resume_at(int container_fd,
     if (!failed) {
         context_ready = 1;
         context.resume_mode = 1;
-        context.collision_plan = &active_report->collision_plan;
+        context.collision_plan = &prepared->report.collision_plan;
         if (portable_owned_paths_load(context.owned_paths, &sidecar) != 0 ||
             sticky_seed_inode_map(context.inode_map, request, &sidecar) != 0)
             failed = 1;
@@ -5792,6 +5852,8 @@ int portable_capture_resume_at(int container_fd,
             }
         }
     }
+    if (!failed && live_count != NULL)
+        *live_count = sidecar_log_live_count(&sidecar);
     result = failed ? -1 : 0;
 
 done:
@@ -5802,8 +5864,36 @@ done:
     if (data_fd >= 0 && close(data_fd) != 0)
         result = -1;
     manifest_free(&existing);
-    manifest_free(&expected);
-    if (owns_report)
-        portable_prescan_report_free(&local_report);
+    return result;
+}
+
+int portable_capture_resume_at(int container_fd,
+                               const PortableCaptureRequest *request,
+                               PortablePrescanReport *report)
+{
+    if (container_fd < 0 || request == NULL ||
+        request->scope < MANIFEST_SCOPE_CRITICAL ||
+        request->scope > MANIFEST_SCOPE_EXPLICIT ||
+        request->root_count > MANIFEST_MAX_ROOTS ||
+        (request->root_count != 0 && request->roots == NULL))
+        return -1;
+
+    PortablePreparedCapture prepared;
+    if (portable_capture_prepare(container_fd, request, &prepared) != 0) {
+        if (report != NULL) {
+            *report = prepared.report;
+            memset(&prepared.report, 0, sizeof(prepared.report));
+        }
+        portable_prepared_capture_free(&prepared);
+        return -1;
+    }
+
+    int result = portable_capture_resume_prepared_at(container_fd, request,
+                                                     &prepared, NULL);
+    if (report != NULL) {
+        *report = prepared.report;
+        memset(&prepared.report, 0, sizeof(prepared.report));
+    }
+    portable_prepared_capture_free(&prepared);
     return result;
 }

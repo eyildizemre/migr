@@ -53,7 +53,8 @@ typedef struct {
 typedef enum {
     PORTABLE_PRESCAN_NAME_TOO_LONG,
     PORTABLE_PRESCAN_PATH_TOO_LONG,
-    PORTABLE_PRESCAN_CASE_COLLISION
+    PORTABLE_PRESCAN_CASE_COLLISION,
+    PORTABLE_PRESCAN_UNSUPPORTED_KIND
 } PortablePrescanViolationKind;
 
 typedef struct {
@@ -89,6 +90,7 @@ typedef struct {
     size_t example_count;
     size_t example_capacity;
     PortableCollisionPlan collision_plan;
+    size_t skipped_kind_count; /* Sockets/devices are capture warnings, not violations. */
     uint64_t total_size; /* Dense-copy bytes; hardlink groups count once. */
     void *inode_seen;    /* Opaque pre-scan inode set. */
 } PortablePrescanReport;
@@ -109,6 +111,32 @@ const PortableCollisionPlanEntry *portable_collision_plan_find(
 int portable_collision_plan_build(int container_fd,
                                   const PortableCaptureRequest *request,
                                   PortablePrescanReport *report);
+
+/**
+ * The pre-scan and expected manifest for one PortableCaptureRequest,
+ * computed once and consumed by the prepared capture entry points and later
+ * production container adoption (docs/DECISIONS.md D24).
+ */
+typedef struct {
+    Manifest manifest;
+    PortablePrescanReport report;
+    int ready;
+} PortablePreparedCapture;
+
+/**
+ * Runs the mandatory source pre-scan and builds the exact manifest a fresh or
+ * resumed capture will use, without creating or reserving a container.
+ * scratch_fd anchors the read-only case-collision probe and may be an
+ * existing destination parent rather than a claimed container.
+ * On a pre-scan or manifest-build refusal, ready remains zero while report
+ * retains diagnostics for the caller; both are owned by out until freed.
+ */
+int portable_capture_prepare(int scratch_fd,
+                             const PortableCaptureRequest *request,
+                             PortablePreparedCapture *out);
+
+/** Releases a prepared capture and is safe on zeroed or failed objects. */
+void portable_prepared_capture_free(PortablePreparedCapture *prepared);
 
 /**
  * State used by the direct portable capture seam. The data and sidecar
@@ -161,6 +189,16 @@ int portable_capture_fresh_at(int container_fd,
 int portable_capture_resume_at(int container_fd,
                                const PortableCaptureRequest *request,
                                PortablePrescanReport *report);
+
+/** Captures into a fresh container using a previously prepared plan. */
+int portable_capture_fresh_prepared_at(
+    int container_fd, const PortableCaptureRequest *request,
+    const PortablePreparedCapture *prepared, size_t *live_count);
+
+/** Resumes a container using a previously prepared plan. */
+int portable_capture_resume_prepared_at(
+    int container_fd, const PortableCaptureRequest *request,
+    const PortablePreparedCapture *prepared, size_t *live_count);
 
 typedef enum {
     PORTABLE_TEST_INTERRUPT_NONE = 0,
