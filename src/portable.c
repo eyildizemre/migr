@@ -49,6 +49,19 @@ typedef struct {
     int sorted;
 } PortableOwnedPaths;
 
+typedef struct {
+    char *root_id;
+    char *physical_path;
+    char *logical_path;
+} PortableClaimedPath;
+
+typedef struct {
+    PortableClaimedPath *items;
+    size_t count;
+    size_t capacity;
+    int sorted;
+} PortableClaimedPaths;
+
 #define VISITED_INITIAL_CAPACITY 16U
 #define PORTABLE_MAX_READBACK_NAMES SIDECAR_MAX_LIVE_ENTRIES
 
@@ -2071,6 +2084,19 @@ typedef struct {
     int failed;
 } StaleKeys;
 
+typedef struct {
+    char *logical;
+    char *physical;
+    SidecarObjectKind kind;
+} StaleClaim;
+
+typedef struct {
+    StaleClaim *items;
+    size_t count;
+    size_t capacity;
+    int failed;
+} StaleClaims;
+
 static void stale_keys_free(StaleKeys *keys)
 {
     if (keys == NULL)
@@ -2081,6 +2107,18 @@ static void stale_keys_free(StaleKeys *keys)
     }
     free(keys->items);
     memset(keys, 0, sizeof(*keys));
+}
+
+static void stale_claims_free(StaleClaims *claims)
+{
+    if (claims == NULL)
+        return;
+    for (size_t index = 0; index < claims->count; index++) {
+        free(claims->items[index].logical);
+        free(claims->items[index].physical);
+    }
+    free(claims->items);
+    memset(claims, 0, sizeof(*claims));
 }
 
 static int sidecar_bytes_to_text(SidecarBytes bytes, char **out)
@@ -2096,6 +2134,37 @@ static int sidecar_bytes_to_text(SidecarBytes bytes, char **out)
         memcpy(copy, bytes.data, bytes.length);
     copy[bytes.length] = '\0';
     *out = copy;
+    return 0;
+}
+
+static int stale_claims_append(StaleClaims *claims, SidecarBytes logical,
+                               SidecarBytes physical, SidecarObjectKind kind)
+{
+    if (claims == NULL || claims->count >= SIDECAR_MAX_LIVE_ENTRIES)
+        return -1;
+    if (claims->count == claims->capacity) {
+        size_t capacity = claims->capacity == 0 ? 16U : claims->capacity * 2U;
+        if (capacity > SIDECAR_MAX_LIVE_ENTRIES)
+            capacity = SIDECAR_MAX_LIVE_ENTRIES;
+        if (capacity < claims->capacity ||
+            capacity > SIZE_MAX / sizeof(*claims->items))
+            return -1;
+        StaleClaim *items = realloc(claims->items,
+                                    capacity * sizeof(*items));
+        if (items == NULL)
+            return -1;
+        claims->items = items;
+        claims->capacity = capacity;
+    }
+
+    StaleClaim item = { .kind = kind };
+    if (sidecar_bytes_to_text(logical, &item.logical) != 0 ||
+        sidecar_bytes_to_text(physical, &item.physical) != 0) {
+        free(item.logical);
+        free(item.physical);
+        return -1;
+    }
+    claims->items[claims->count++] = item;
     return 0;
 }
 
@@ -2307,6 +2376,124 @@ static const char *portable_owned_paths_owner(
                : NULL;
 }
 
+static void portable_claimed_paths_free(PortableClaimedPaths *paths)
+{
+    if (paths == NULL)
+        return;
+    for (size_t index = 0; index < paths->count; index++) {
+        free(paths->items[index].root_id);
+        free(paths->items[index].physical_path);
+        free(paths->items[index].logical_path);
+    }
+    free(paths->items);
+    memset(paths, 0, sizeof(*paths));
+}
+
+static int portable_claimed_paths_append(PortableClaimedPaths *paths,
+                                         const SidecarClaimView *view)
+{
+    if (paths == NULL || view == NULL || view->claim == NULL ||
+        paths->count >= SIDECAR_MAX_LIVE_ENTRIES)
+        return -1;
+    if (paths->count == paths->capacity) {
+        size_t capacity = paths->capacity == 0 ? 16U : paths->capacity * 2U;
+        if (capacity > SIDECAR_MAX_LIVE_ENTRIES)
+            capacity = SIDECAR_MAX_LIVE_ENTRIES;
+        if (capacity < paths->capacity ||
+            capacity > SIZE_MAX / sizeof(*paths->items))
+            return -1;
+        PortableClaimedPath *items = realloc(paths->items,
+                                             capacity * sizeof(*items));
+        if (items == NULL)
+            return -1;
+        paths->items = items;
+        paths->capacity = capacity;
+    }
+
+    PortableClaimedPath item = {0};
+    if (sidecar_bytes_to_text(view->claim->root_id, &item.root_id) != 0 ||
+        sidecar_bytes_to_text(view->claim->physical_path,
+                              &item.physical_path) != 0 ||
+        sidecar_bytes_to_text(view->claim->logical_path,
+                              &item.logical_path) != 0) {
+        free(item.root_id);
+        free(item.physical_path);
+        free(item.logical_path);
+        return -1;
+    }
+    paths->items[paths->count++] = item;
+    return 0;
+}
+
+static int portable_claimed_paths_callback(const SidecarClaimView *view,
+                                           void *argument)
+{
+    PortableClaimedPaths *paths = argument;
+    return portable_claimed_paths_append(paths, view) == 0 ? 0 : 1;
+}
+
+static int portable_claimed_path_compare(const void *left, const void *right)
+{
+    const PortableClaimedPath *left_path = left;
+    const PortableClaimedPath *right_path = right;
+    int result = strcmp(left_path->root_id, right_path->root_id);
+    if (result != 0)
+        return result;
+    return strcmp(left_path->physical_path, right_path->physical_path);
+}
+
+static int portable_claimed_paths_load(PortableClaimedPaths *paths,
+                                       SidecarLog *sidecar)
+{
+    if (paths == NULL || sidecar == NULL)
+        return -1;
+    SidecarStatus status = sidecar_log_claim_foreach(
+        sidecar, portable_claimed_paths_callback, paths);
+    if (status != SIDECAR_STATUS_OK)
+        return -1;
+    if (paths->count > 1U)
+        qsort(paths->items, paths->count, sizeof(*paths->items),
+              portable_claimed_path_compare);
+    for (size_t index = 1; index < paths->count; index++) {
+        PortableClaimedPath *previous = &paths->items[index - 1U];
+        PortableClaimedPath *current = &paths->items[index];
+        if (strcmp(previous->root_id, current->root_id) == 0 &&
+            strcmp(previous->physical_path, current->physical_path) == 0)
+            return -1;
+    }
+    paths->sorted = 1;
+    return 0;
+}
+
+static const PortableClaimedPath *portable_claimed_paths_owner(
+    const PortableClaimedPaths *paths, const char *root_id,
+    const char *physical_path)
+{
+    if (paths == NULL || !paths->sorted || root_id == NULL ||
+        physical_path == NULL)
+        return NULL;
+    size_t low = 0;
+    size_t high = paths->count;
+    while (low < high) {
+        size_t middle = low + (high - low) / 2U;
+        const PortableClaimedPath *item = &paths->items[middle];
+        int result = strcmp(item->root_id, root_id);
+        if (result == 0)
+            result = strcmp(item->physical_path, physical_path);
+        if (result < 0)
+            low = middle + 1U;
+        else
+            high = middle;
+    }
+    if (low == paths->count)
+        return NULL;
+    const PortableClaimedPath *item = &paths->items[low];
+    return strcmp(item->root_id, root_id) == 0 &&
+                   strcmp(item->physical_path, physical_path) == 0
+               ? item
+               : NULL;
+}
+
 static int relative_path_is_same_or_descendant(const char *path,
                                                const char *prefix)
 {
@@ -2398,6 +2585,44 @@ static int collect_stale_key(const SidecarLiveView *view, void *argument)
     return collection->stale->failed;
 }
 
+typedef struct {
+    PortableCaptureContext *context;
+    const char *root_id;
+    StaleClaims *stale;
+} StaleClaimCollection;
+
+static int collect_stale_claim(const SidecarClaimView *view, void *argument)
+{
+    StaleClaimCollection *collection = argument;
+    if (collection == NULL || collection->context == NULL ||
+        collection->root_id == NULL || collection->stale == NULL ||
+        view == NULL || view->claim == NULL)
+        return 1;
+    if (!sidecar_bytes_equal(
+            view->claim->root_id,
+            (SidecarBytes){ (const unsigned char *)collection->root_id,
+                            strlen(collection->root_id) }))
+        return 0;
+
+    char *logical = NULL;
+    if (sidecar_bytes_to_text(view->claim->logical_path, &logical) != 0) {
+        collection->stale->failed = 1;
+        return 1;
+    }
+    int present = visited_contains(collection->context->visited,
+                                   collection->root_id, logical);
+    free(logical);
+    if (present < 0) {
+        collection->stale->failed = 1;
+        return 1;
+    }
+    if (present == 0 && stale_claims_append(
+                           collection->stale, view->claim->logical_path,
+                           view->claim->physical_path, view->claim->kind) != 0)
+        collection->stale->failed = 1;
+    return collection->stale->failed;
+}
+
 static int key_is_live(PortableCaptureContext *context,
                        const char *root_id, const char *logical)
 {
@@ -2457,6 +2682,49 @@ static int capture_destination_is_safe(const PortableCaptureContext *context,
                            strlen(physical) })
                ? 0
                : -1;
+}
+
+/* During resume, an interrupted claim is also ownership proof for the
+ * payload that was created after the claim and before its ENTRY_COMMIT.
+ * Keep the existing owned-path and tombstone checks intact.  A same-key,
+ * same-physical claim remains ownership proof even when the source kind has
+ * changed; append_capture_claim() then reconciles that old kind before
+ * publishing the replacement claim. */
+static int capture_destination_is_safe_for_kind(
+    const PortableCaptureContext *context, const PortableRootSpec *root,
+    const char *logical, const char *physical, int parent_fd,
+    const char *leaf, SidecarObjectKind kind)
+{
+    if (context == NULL || root == NULL || logical == NULL ||
+        physical == NULL)
+        return -1;
+
+    int result = capture_destination_is_safe(context, root, logical, physical,
+                                             parent_fd, leaf);
+    if (result == 0 || !context->resume_mode)
+        return result;
+
+    SidecarBytes root_key = {
+        (const unsigned char *)root->id, strlen(root->id)
+    };
+    SidecarBytes logical_key = {
+        (const unsigned char *)logical, strlen(logical)
+    };
+    SidecarBytes physical_key = {
+        (const unsigned char *)physical, strlen(physical)
+    };
+    (void)kind;
+    SidecarClaimView claim_view = {0};
+    int found = sidecar_log_find_claim(context->sidecar, root_key,
+                                       logical_key, &claim_view);
+    if (found < 0)
+        return -1;
+    if (found == 1 && claim_view.claim != NULL &&
+        sidecar_bytes_equal(claim_view.claim->root_id, root_key) &&
+        sidecar_bytes_equal(claim_view.claim->logical_path, logical_key) &&
+        sidecar_bytes_equal(claim_view.claim->physical_path, physical_key))
+        return 0;
+    return result;
 }
 
 static int tombstone_if_live(PortableCaptureContext *context,
@@ -2604,6 +2872,48 @@ static int append_group(PortableCaptureContext *context,
     return status == SIDECAR_STATUS_OK ? 0 : -1;
 }
 
+static int reconcile_stale_claim(PortableCaptureContext *context,
+                                 const PortableRootSpec *root,
+                                 const char *logical,
+                                 const SidecarClaim *claim);
+
+static int append_capture_claim(PortableCaptureContext *context,
+                                const PortableRootSpec *root,
+                                const char *logical, const char *physical,
+                                SidecarObjectKind kind)
+{
+    if (context == NULL || root == NULL || root->id == NULL ||
+        logical == NULL || physical == NULL)
+        return -1;
+    SidecarClaim claim = {
+        .root_id = { (const unsigned char *)root->id, strlen(root->id) },
+        .logical_path = { (const unsigned char *)logical, strlen(logical) },
+        .physical_path = { (const unsigned char *)physical, strlen(physical) },
+        .kind = kind
+    };
+    SidecarClaimView existing = {0};
+    int found = sidecar_log_find_claim(context->sidecar, claim.root_id,
+                                       claim.logical_path, &existing);
+    if (found < 0)
+        return -1;
+    if (found == 1) {
+        if (existing.claim != NULL &&
+            sidecar_bytes_equal(existing.claim->root_id, claim.root_id) &&
+            sidecar_bytes_equal(existing.claim->logical_path,
+                                claim.logical_path) &&
+            sidecar_bytes_equal(existing.claim->physical_path,
+                                claim.physical_path) &&
+            existing.claim->kind == claim.kind)
+            return 0;
+        if (reconcile_stale_claim(context, root, logical, existing.claim) != 0)
+            return -1;
+    }
+    return sidecar_log_append_claim(context->sidecar, &claim) ==
+                   SIDECAR_STATUS_OK
+               ? 0
+               : -1;
+}
+
 static int remove_payload_relative(int data_fd, const char *payload_root,
                                    const char *physical)
 {
@@ -2675,7 +2985,7 @@ static int remove_owned_payload_relative(int data_fd, const char *payload_root,
                                          const char *physical)
 {
     if (data_fd < 0 || payload_root == NULL || physical == NULL ||
-        !safe_relative_path(physical))
+        (physical[0] != '\0' && !safe_relative_path(physical)))
         return -1;
 
     int root_parent = -1;
@@ -2683,6 +2993,25 @@ static int remove_owned_payload_relative(int data_fd, const char *payload_root,
     if (open_existing_payload_parent(data_fd, payload_root, &root_parent,
                                      root_leaf, sizeof(root_leaf)) != 0)
         return errno == ENOENT ? 0 : -1;
+
+    if (physical[0] == '\0') {
+        struct stat st;
+        int result = 0;
+        if (fstatat(root_parent, root_leaf, &st, AT_SYMLINK_NOFOLLOW) != 0)
+            result = errno == ENOENT ? 0 : -1;
+        else
+            result = unlinkat(root_parent, root_leaf,
+                              S_ISDIR(st.st_mode) ? AT_REMOVEDIR : 0) == 0
+                         ? 0
+                         : -1;
+        int saved = errno;
+        if (close(root_parent) != 0 && result == 0) {
+            result = -1;
+            saved = EIO;
+        }
+        errno = saved;
+        return result;
+    }
 
     int payload_fd = open_child_directory(root_parent, root_leaf);
     int saved = errno;
@@ -2727,6 +3056,356 @@ static int remove_owned_payload_relative(int data_fd, const char *payload_root,
     return result;
 }
 
+typedef struct {
+    const PortableOwnedPaths *owned;
+    const PortableClaimedPaths *claimed;
+} ClaimOwnershipPaths;
+
+static int open_claim_node(int data_fd, const char *payload_root,
+                           const char *physical, int *parent_out,
+                           char *leaf, size_t leaf_size, struct stat *out_stat)
+{
+    if (data_fd < 0 || payload_root == NULL || physical == NULL ||
+        parent_out == NULL || leaf == NULL || leaf_size == 0 ||
+        out_stat == NULL ||
+        (physical[0] != '\0' && !safe_relative_path(physical)))
+        return -1;
+
+    int root_parent = -1;
+    char root_leaf[NAME_MAX + 1U];
+    if (open_existing_payload_parent(data_fd, payload_root, &root_parent,
+                                     root_leaf, sizeof(root_leaf)) != 0)
+        return errno == ENOENT ? 1 : -1;
+
+    int parent_fd = root_parent;
+    if (physical[0] != '\0') {
+        int payload_fd = open_child_directory(root_parent, root_leaf);
+        int saved = errno;
+        if (close(root_parent) != 0) {
+            if (payload_fd >= 0)
+                close(payload_fd);
+            return -1;
+        }
+        if (payload_fd < 0) {
+            errno = saved;
+            return errno == ENOENT ? 1 : -1;
+        }
+        if (open_existing_payload_parent(payload_fd, physical, &parent_fd,
+                                         leaf, leaf_size) != 0) {
+            saved = errno;
+            close(payload_fd);
+            errno = saved;
+            return errno == ENOENT ? 1 : -1;
+        }
+        if (close(payload_fd) != 0) {
+            close(parent_fd);
+            return -1;
+        }
+    } else if (copy_text(leaf, leaf_size, root_leaf) != 0) {
+        close(parent_fd);
+        return -1;
+    }
+
+    if (fstatat(parent_fd, leaf, out_stat, AT_SYMLINK_NOFOLLOW) != 0) {
+        int saved = errno;
+        close(parent_fd);
+        errno = saved;
+        return errno == ENOENT ? 1 : -1;
+    }
+    *parent_out = parent_fd;
+    return 0;
+}
+
+static int reconcile_claim_owner(const ClaimOwnershipPaths *paths,
+                                 const char *root_id,
+                                 const char *physical,
+                                 const char **live_logical,
+                                 const PortableClaimedPath **claim)
+{
+    if (paths == NULL || root_id == NULL || physical == NULL ||
+        live_logical == NULL || claim == NULL)
+        return -1;
+    *live_logical = portable_owned_paths_owner(paths->owned, root_id,
+                                               physical);
+    *claim = portable_claimed_paths_owner(paths->claimed, root_id, physical);
+    if ((*live_logical != NULL) == (*claim != NULL))
+        return -1;
+    return 0;
+}
+
+static int reconcile_claim_validate_node(PortableCaptureContext *context,
+                                         const PortableRootSpec *root,
+                                         const char *physical,
+                                         const ClaimOwnershipPaths *paths)
+{
+    int parent_fd = -1;
+    char leaf[NAME_MAX + 1U];
+    struct stat st;
+    int present = open_claim_node(context->data_fd, root->payload_path,
+                                  physical, &parent_fd, leaf, sizeof(leaf),
+                                  &st);
+    if (present != 0)
+        return present < 0 ? -1 : 0;
+    if (!S_ISDIR(st.st_mode)) {
+        int result = close(parent_fd);
+        return result == 0 ? 0 : -1;
+    }
+
+    int directory_fd = open_child_directory(parent_fd, leaf);
+    int saved = errno;
+    if (close(parent_fd) != 0) {
+        if (directory_fd >= 0)
+            close(directory_fd);
+        return -1;
+    }
+    if (directory_fd < 0) {
+        errno = saved;
+        return -1;
+    }
+    int scan_fd = duplicate_fd(directory_fd);
+    DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
+    if (directory == NULL) {
+        if (scan_fd >= 0)
+            close(scan_fd);
+        close(directory_fd);
+        return -1;
+    }
+
+    int failed = 0;
+    for (;;) {
+        errno = 0;
+        struct dirent *entry = readdir(directory);
+        if (entry == NULL) {
+            if (errno != 0)
+                failed = 1;
+            break;
+        }
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0)
+            continue;
+
+        char child_physical[SIDECAR_MAX_PATH + 1U];
+        if (append_physical(child_physical, sizeof(child_physical), physical,
+                            entry->d_name) != 0) {
+            failed = 1;
+            break;
+        }
+        struct stat child_stat;
+        if (fstatat(directory_fd, entry->d_name, &child_stat,
+                    AT_SYMLINK_NOFOLLOW) != 0) {
+            failed = 1;
+            break;
+        }
+        const char *live_logical = NULL;
+        const PortableClaimedPath *claim = NULL;
+        if (reconcile_claim_owner(paths, root->id, child_physical,
+                                   &live_logical, &claim) != 0) {
+            failed = 1;
+            break;
+        }
+        const char *owner_logical = claim != NULL ? claim->logical_path
+                                                   : live_logical;
+        int visited = visited_contains(context->visited, root->id,
+                                       owner_logical);
+        if (visited != 0) {
+            failed = 1;
+            break;
+        }
+        if (S_ISDIR(child_stat.st_mode) &&
+            reconcile_claim_validate_node(context, root, child_physical,
+                                          paths) != 0) {
+            failed = 1;
+            break;
+        }
+    }
+    if (closedir(directory) != 0)
+        failed = 1;
+    if (close(directory_fd) != 0)
+        failed = 1;
+    return failed ? -1 : 0;
+}
+
+static int append_claim_delete(PortableCaptureContext *context,
+                               const PortableRootSpec *root,
+                               const char *logical)
+{
+    SidecarDelete deletion = {
+        .root_id = { (const unsigned char *)root->id, strlen(root->id) },
+        .logical_path = { (const unsigned char *)logical, strlen(logical) }
+    };
+    return sidecar_log_append_delete(context->sidecar, &deletion) ==
+                   SIDECAR_STATUS_OK
+               ? 0
+               : -1;
+}
+
+static int reconcile_mutate_known_node(PortableCaptureContext *context,
+                                       const PortableRootSpec *root,
+                                       const char *logical,
+                                       const char *physical,
+                                       int claim_owned,
+                                       const ClaimOwnershipPaths *paths)
+{
+    int parent_fd = -1;
+    char leaf[NAME_MAX + 1U];
+    struct stat st;
+    int present = open_claim_node(context->data_fd, root->payload_path,
+                                  physical, &parent_fd, leaf, sizeof(leaf),
+                                  &st);
+    if (present < 0)
+        return -1;
+    if (present == 1)
+        return claim_owned ? append_claim_delete(context, root, logical)
+                           : tombstone_if_live(context, root->id, logical);
+
+    if (S_ISDIR(st.st_mode)) {
+        int directory_fd = open_child_directory(parent_fd, leaf);
+        int saved = errno;
+        if (close(parent_fd) != 0) {
+            if (directory_fd >= 0)
+                close(directory_fd);
+            return -1;
+        }
+        if (directory_fd < 0) {
+            errno = saved;
+            return -1;
+        }
+        int scan_fd = duplicate_fd(directory_fd);
+        DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
+        if (directory == NULL) {
+            if (scan_fd >= 0)
+                close(scan_fd);
+            close(directory_fd);
+            return -1;
+        }
+
+        int failed = 0;
+        for (;;) {
+            errno = 0;
+            struct dirent *entry = readdir(directory);
+            if (entry == NULL) {
+                if (errno != 0)
+                    failed = 1;
+                break;
+            }
+            if (strcmp(entry->d_name, ".") == 0 ||
+                strcmp(entry->d_name, "..") == 0)
+                continue;
+
+            char child_physical[SIDECAR_MAX_PATH + 1U];
+            if (append_physical(child_physical, sizeof(child_physical),
+                                physical, entry->d_name) != 0) {
+                failed = 1;
+                break;
+            }
+            struct stat child_stat;
+            if (fstatat(directory_fd, entry->d_name, &child_stat,
+                        AT_SYMLINK_NOFOLLOW) != 0) {
+                if (errno == ENOENT)
+                    continue;
+                failed = 1;
+                break;
+            }
+            const char *live_logical = NULL;
+            const PortableClaimedPath *claim = NULL;
+            if (reconcile_claim_owner(paths, root->id, child_physical,
+                                       &live_logical, &claim) != 0) {
+                failed = 1;
+                break;
+            }
+            const char *owner_logical = claim != NULL ? claim->logical_path
+                                                       : live_logical;
+            if (visited_contains(context->visited, root->id,
+                                 owner_logical) != 0) {
+                failed = 1;
+                break;
+            }
+            if (reconcile_mutate_known_node(
+                    context, root, owner_logical, child_physical,
+                    claim != NULL, paths) != 0) {
+                failed = 1;
+                break;
+            }
+        }
+        if (closedir(directory) != 0)
+            failed = 1;
+        if (close(directory_fd) != 0)
+            failed = 1;
+        if (failed)
+            return -1;
+    } else if (close(parent_fd) != 0) {
+        return -1;
+    }
+
+    if (claim_owned) {
+        portable_test_interrupt_if(PORTABLE_TEST_BEFORE_STALE_UNLINK);
+        if (remove_owned_payload_relative(context->data_fd,
+                                          root->payload_path, physical) != 0)
+            return -1;
+        portable_test_interrupt_if(PORTABLE_TEST_AFTER_STALE_UNLINK);
+        return append_claim_delete(context, root, logical);
+    }
+    if (tombstone_if_live(context, root->id, logical) != 0)
+        return -1;
+    return remove_owned_payload_relative(context->data_fd, root->payload_path,
+                                         physical);
+}
+
+static int reconcile_stale_claim_with_paths(
+    PortableCaptureContext *context, const PortableRootSpec *root,
+    const char *logical, const char *physical, SidecarObjectKind kind,
+    const ClaimOwnershipPaths *paths)
+{
+    if (context == NULL || root == NULL || logical == NULL ||
+        physical == NULL || paths == NULL ||
+        (physical[0] == '\0' && logical[0] != '\0') ||
+        (kind != SIDECAR_KIND_REGULAR && kind != SIDECAR_KIND_DIRECTORY &&
+         kind != SIDECAR_KIND_SYMLINK && kind != SIDECAR_KIND_HARDLINK))
+        return -1;
+    if (reconcile_claim_validate_node(context, root, physical, paths) != 0)
+        return -1;
+    return reconcile_mutate_known_node(context, root, logical, physical, 1,
+                                       paths);
+}
+
+static int reconcile_stale_claim(PortableCaptureContext *context,
+                                 const PortableRootSpec *root,
+                                 const char *logical,
+                                 const SidecarClaim *claim)
+{
+    if (context == NULL || root == NULL || logical == NULL || claim == NULL ||
+        !sidecar_bytes_equal(
+            claim->root_id,
+            (SidecarBytes){ (const unsigned char *)root->id,
+                            strlen(root->id) }) ||
+        !sidecar_bytes_equal(
+            claim->logical_path,
+            (SidecarBytes){ (const unsigned char *)logical,
+                            strlen(logical) }))
+        return -1;
+
+    char *physical = NULL;
+    if (sidecar_bytes_to_text(claim->physical_path, &physical) != 0)
+        return -1;
+
+    PortableOwnedPaths owned = {0};
+    PortableClaimedPaths claimed = {0};
+    int result = -1;
+    if (portable_owned_paths_load(&owned, context->sidecar) == 0 &&
+        portable_claimed_paths_load(&claimed, context->sidecar) == 0) {
+        ClaimOwnershipPaths paths = {
+            .owned = &owned,
+            .claimed = &claimed
+        };
+        result = reconcile_stale_claim_with_paths(
+            context, root, logical, physical, claim->kind, &paths);
+    }
+    portable_claimed_paths_free(&claimed);
+    portable_owned_paths_free(&owned);
+    free(physical);
+    return result;
+}
+
 static int prepare_collision_relocations(PortableCaptureContext *context,
                                           const PortableRootSpec *root)
 {
@@ -2734,10 +3413,11 @@ static int prepare_collision_relocations(PortableCaptureContext *context,
         return -1;
     if (!context->resume_mode || context->collision_plan == NULL)
         return 0;
-    if (context->owned_paths == NULL)
+    if (context->owned_paths == NULL || context->claimed_paths == NULL)
         return -1;
 
     PortableOwnedPaths *owned = context->owned_paths;
+    PortableClaimedPaths *claimed = context->claimed_paths;
     const PortableCollisionPlan *plan = context->collision_plan;
     for (size_t plan_index = 0; plan_index < plan->count; plan_index++) {
         const PortableCollisionPlanEntry *planned = &plan->entries[plan_index];
@@ -2751,23 +3431,34 @@ static int prepare_collision_relocations(PortableCaptureContext *context,
             (const unsigned char *)planned->logical_path,
             strlen(planned->logical_path)
         };
-        SidecarLiveView previous;
+        SidecarLiveView previous = {0};
         int live = sidecar_log_find(context->sidecar, root_key, logical_key,
                                     &previous);
         if (live < 0)
             return -1;
-        if (!live)
+        SidecarClaimView previous_claim = {0};
+        int claim_found = sidecar_log_find_claim(context->sidecar, root_key,
+                                                 logical_key,
+                                                 &previous_claim);
+        if (claim_found < 0)
+            return -1;
+        if (live == 1 && claim_found == 1)
+            return -1;
+        if (!live && !claim_found)
             continue;
+
+        SidecarBytes old_physical_bytes = live == 1
+            ? previous.entry->physical_path
+            : previous_claim.claim->physical_path;
         if (sidecar_bytes_equal(
-                previous.entry->physical_path,
+                old_physical_bytes,
                 (SidecarBytes){
                     (const unsigned char *)planned->physical_path,
                     strlen(planned->physical_path) }))
             continue;
 
         char *old_physical = NULL;
-        if (sidecar_bytes_to_text(previous.entry->physical_path,
-                                  &old_physical) != 0 ||
+        if (sidecar_bytes_to_text(old_physical_bytes, &old_physical) != 0 ||
             old_physical[0] == '\0' ||
             !safe_relative_path(old_physical) ||
             !safe_relative_path(planned->physical_path)) {
@@ -2775,80 +3466,229 @@ static int prepare_collision_relocations(PortableCaptureContext *context,
             return -1;
         }
 
-        size_t candidate_count = 0;
-        for (size_t index = 0; index < owned->count; index++) {
-            relocation_scan_count();
-            PortableOwnedPath *candidate = &owned->items[index];
-            if (strcmp(candidate->root_id, root->id) != 0 ||
-                !relative_path_is_same_or_descendant(
-                    candidate->logical_path, planned->logical_path))
-                continue;
-            if (!relative_path_is_same_or_descendant(candidate->physical_path,
-                                                     old_physical) ||
-                !safe_relative_path(candidate->physical_path)) {
+        if (live == 1) {
+            size_t candidate_count = 0;
+            for (size_t index = 0; index < owned->count; index++) {
+                relocation_scan_count();
+                PortableOwnedPath *candidate = &owned->items[index];
+                if (strcmp(candidate->root_id, root->id) != 0 ||
+                    !relative_path_is_same_or_descendant(
+                        candidate->logical_path, planned->logical_path))
+                    continue;
+                if (!relative_path_is_same_or_descendant(
+                        candidate->physical_path, old_physical) ||
+                    !safe_relative_path(candidate->physical_path)) {
+                    free(old_physical);
+                    return -1;
+                }
+                candidate_count++;
+            }
+            if (candidate_count == 0) {
                 free(old_physical);
                 return -1;
             }
-            candidate_count++;
-        }
-        if (candidate_count == 0) {
-            free(old_physical);
-            return -1;
-        }
 
-        unsigned char *selected = calloc(owned->count, sizeof(*selected));
-        if (selected == NULL) {
-            free(old_physical);
-            return -1;
-        }
-        int failed = 0;
-        for (size_t index = 0; index < owned->count; index++) {
-            relocation_scan_count();
-            PortableOwnedPath *candidate = &owned->items[index];
-            if (strcmp(candidate->root_id, root->id) == 0 &&
-                relative_path_is_same_or_descendant(
-                    candidate->logical_path, planned->logical_path)) {
-                selected[index] = 1;
-                if (tombstone_if_live(context, root->id,
-                                      candidate->logical_path) != 0) {
+            unsigned char *selected = calloc(owned->count,
+                                             sizeof(*selected));
+            if (selected == NULL) {
+                free(old_physical);
+                return -1;
+            }
+            int failed = 0;
+            for (size_t index = 0; index < owned->count; index++) {
+                relocation_scan_count();
+                PortableOwnedPath *candidate = &owned->items[index];
+                if (strcmp(candidate->root_id, root->id) == 0 &&
+                    relative_path_is_same_or_descendant(
+                        candidate->logical_path, planned->logical_path)) {
+                    selected[index] = 1;
+                    if (tombstone_if_live(context, root->id,
+                                          candidate->logical_path) != 0) {
+                        failed = 1;
+                        break;
+                    }
+                }
+            }
+
+            for (size_t removed = 0; !failed && removed < candidate_count;
+                 removed++) {
+                size_t selected_index = SIZE_MAX;
+                size_t selected_depth = 0;
+                for (size_t index = 0; index < owned->count; index++) {
+                    relocation_scan_count();
+                    if (selected[index] != 1)
+                        continue;
+                    size_t depth = relative_path_depth(
+                        owned->items[index].physical_path);
+                    if (selected_index == SIZE_MAX || depth > selected_depth) {
+                        selected_index = index;
+                        selected_depth = depth;
+                    }
+                }
+                if (selected_index == SIZE_MAX) {
                     failed = 1;
                     break;
                 }
+                relocation_remove_count();
+                if (remove_owned_payload_relative(
+                        context->data_fd, root->payload_path,
+                        owned->items[selected_index].physical_path) != 0) {
+                    failed = 1;
+                    break;
+                }
+                selected[selected_index] = 2;
+            }
+            free(selected);
+            if (failed) {
+                free(old_physical);
+                return -1;
             }
         }
 
-        for (size_t removed = 0; !failed && removed < candidate_count;
-             removed++) {
-            size_t selected_index = SIZE_MAX;
-            size_t selected_depth = 0;
+        if (claim_found == 1) {
+            /* A directory CLAIM owns only its node; known live and claimed
+             * descendants must be removed deepest-first.  Unknown children
+             * make the non-recursive removal fail closed. */
+            size_t owned_candidate_count = 0;
+            size_t claimed_candidate_count = 0;
             for (size_t index = 0; index < owned->count; index++) {
                 relocation_scan_count();
-                if (selected[index] != 1)
+                PortableOwnedPath *candidate = &owned->items[index];
+                if (strcmp(candidate->root_id, root->id) != 0 ||
+                    !relative_path_is_same_or_descendant(
+                        candidate->logical_path, planned->logical_path))
                     continue;
-                size_t depth = relative_path_depth(
-                    owned->items[index].physical_path);
-                if (selected_index == SIZE_MAX || depth > selected_depth) {
-                    selected_index = index;
-                    selected_depth = depth;
+                if (!relative_path_is_same_or_descendant(
+                        candidate->physical_path, old_physical) ||
+                    !safe_relative_path(candidate->physical_path)) {
+                    free(old_physical);
+                    return -1;
+                }
+                owned_candidate_count++;
+            }
+            for (size_t index = 0; index < claimed->count; index++) {
+                relocation_scan_count();
+                PortableClaimedPath *candidate = &claimed->items[index];
+                if (strcmp(candidate->root_id, root->id) != 0 ||
+                    !relative_path_is_same_or_descendant(
+                        candidate->logical_path, planned->logical_path))
+                    continue;
+                if (!relative_path_is_same_or_descendant(
+                        candidate->physical_path, old_physical) ||
+                    !safe_relative_path(candidate->physical_path)) {
+                    free(old_physical);
+                    return -1;
+                }
+                claimed_candidate_count++;
+            }
+            if (claimed_candidate_count == 0) {
+                free(old_physical);
+                return -1;
+            }
+
+            unsigned char *selected_owned = owned->count == 0
+                ? NULL : calloc(owned->count, sizeof(*selected_owned));
+            unsigned char *selected_claimed = claimed->count == 0
+                ? NULL : calloc(claimed->count, sizeof(*selected_claimed));
+            if ((owned->count != 0 && selected_owned == NULL) ||
+                (claimed->count != 0 && selected_claimed == NULL)) {
+                free(selected_owned);
+                free(selected_claimed);
+                free(old_physical);
+                return -1;
+            }
+
+            int failed = 0;
+            for (size_t index = 0; index < owned->count; index++) {
+                relocation_scan_count();
+                PortableOwnedPath *candidate = &owned->items[index];
+                if (strcmp(candidate->root_id, root->id) == 0 &&
+                    relative_path_is_same_or_descendant(
+                        candidate->logical_path, planned->logical_path)) {
+                    selected_owned[index] = 1;
+                    if (tombstone_if_live(context, root->id,
+                                          candidate->logical_path) != 0) {
+                        failed = 1;
+                        break;
+                    }
                 }
             }
-            if (selected_index == SIZE_MAX) {
-                failed = 1;
-                break;
+            for (size_t index = 0; index < claimed->count; index++) {
+                if (failed)
+                    break;
+                relocation_scan_count();
+                PortableClaimedPath *candidate = &claimed->items[index];
+                if (strcmp(candidate->root_id, root->id) == 0 &&
+                    relative_path_is_same_or_descendant(
+                        candidate->logical_path, planned->logical_path))
+                    selected_claimed[index] = 1;
             }
-            relocation_remove_count();
-            if (remove_owned_payload_relative(
-                    context->data_fd, root->payload_path,
-                    owned->items[selected_index].physical_path) != 0) {
-                failed = 1;
-                break;
+
+            size_t remaining = owned_candidate_count + claimed_candidate_count;
+            for (size_t removed = 0; !failed && removed < remaining; removed++) {
+                int selected_is_owned = 0;
+                size_t selected_index = SIZE_MAX;
+                size_t selected_depth = 0;
+                for (size_t index = 0; index < owned->count; index++) {
+                    relocation_scan_count();
+                    if (selected_owned[index] != 1)
+                        continue;
+                    size_t depth = relative_path_depth(
+                        owned->items[index].physical_path);
+                    if (selected_index == SIZE_MAX || depth > selected_depth) {
+                        selected_index = index;
+                        selected_depth = depth;
+                        selected_is_owned = 1;
+                    }
+                }
+                for (size_t index = 0; index < claimed->count; index++) {
+                    relocation_scan_count();
+                    if (selected_claimed[index] != 1)
+                        continue;
+                    size_t depth = relative_path_depth(
+                        claimed->items[index].physical_path);
+                    if (selected_index == SIZE_MAX || depth > selected_depth) {
+                        selected_index = index;
+                        selected_depth = depth;
+                        selected_is_owned = 0;
+                    }
+                }
+                if (selected_index == SIZE_MAX) {
+                    failed = 1;
+                    break;
+                }
+                relocation_remove_count();
+                if (selected_is_owned) {
+                    if (remove_owned_payload_relative(
+                            context->data_fd, root->payload_path,
+                            owned->items[selected_index].physical_path) != 0) {
+                        failed = 1;
+                        break;
+                    }
+                    selected_owned[selected_index] = 2;
+                } else {
+                    PortableClaimedPath *candidate =
+                        &claimed->items[selected_index];
+                    if (remove_owned_payload_relative(
+                            context->data_fd, root->payload_path,
+                            candidate->physical_path) != 0 ||
+                        append_claim_delete(context, root,
+                                            candidate->logical_path) != 0) {
+                        failed = 1;
+                        break;
+                    }
+                    selected_claimed[selected_index] = 2;
+                }
             }
-            selected[selected_index] = 2;
+            free(selected_owned);
+            free(selected_claimed);
+            if (failed) {
+                free(old_physical);
+                return -1;
+            }
         }
-        free(selected);
+
         free(old_physical);
-        if (failed)
-            return -1;
     }
     return 0;
 }
@@ -3161,7 +4001,13 @@ static int reconcile_root(PortableCaptureContext *context,
                           const PortableRootSpec *root)
 {
     StaleKeys stale;
+    StaleClaims stale_claims;
+    PortableOwnedPaths owned;
+    PortableClaimedPaths claimed;
     memset(&stale, 0, sizeof(stale));
+    memset(&stale_claims, 0, sizeof(stale_claims));
+    memset(&owned, 0, sizeof(owned));
+    memset(&claimed, 0, sizeof(claimed));
     StaleCollection collection = {
         .context = context,
         .root_id = root->id,
@@ -3192,11 +4038,42 @@ static int reconcile_root(PortableCaptureContext *context,
     }
 
     stale_keys_free(&stale);
+    StaleClaimCollection claim_collection = {
+        .context = context,
+        .root_id = root->id,
+        .stale = &stale_claims
+    };
+    status = sidecar_log_claim_foreach(context->sidecar, collect_stale_claim,
+                                       &claim_collection);
+    if (status != SIDECAR_STATUS_OK || stale_claims.failed)
+        goto fail;
+    if (portable_owned_paths_load(&owned, context->sidecar) != 0 ||
+        portable_claimed_paths_load(&claimed, context->sidecar) != 0)
+        goto fail;
+
+    ClaimOwnershipPaths paths = {
+        .owned = &owned,
+        .claimed = &claimed
+    };
+    for (size_t index = 0; index < stale_claims.count; index++) {
+        StaleClaim *claim = &stale_claims.items[index];
+        if (reconcile_stale_claim_with_paths(
+                context, root, claim->logical, claim->physical, claim->kind,
+                &paths) != 0)
+            goto fail;
+    }
+
+    portable_claimed_paths_free(&claimed);
+    portable_owned_paths_free(&owned);
+    stale_claims_free(&stale_claims);
     portable_test_interrupt_if(PORTABLE_TEST_BEFORE_FINAL_INVENTORY);
     return reconcile_inventory(context, root);
 
 fail:
     stale_keys_free(&stale);
+    portable_claimed_paths_free(&claimed);
+    portable_owned_paths_free(&owned);
+    stale_claims_free(&stale_claims);
     return -1;
 }
 
@@ -3558,9 +4435,18 @@ static int capture_regular(PortableCaptureContext *context,
         }
         destination_leaf = root_leaf;
     }
-    if (capture_destination_is_safe(context, root, logical, physical,
-                                    parent_fd, destination_leaf) != 0 ||
+    if (capture_destination_is_safe_for_kind(
+            context, root, logical, physical, parent_fd, destination_leaf,
+            SIDECAR_KIND_REGULAR) != 0 ||
         replace_live_capture(context, root, logical, physical) != 0) {
+        if (destination_is_root)
+            close(parent_fd);
+        xattrs_free(xattrs);
+        close(source_fd);
+        return -1;
+    }
+    if (append_capture_claim(context, root, logical, physical,
+                             SIDECAR_KIND_REGULAR) != 0) {
         if (destination_is_root)
             close(parent_fd);
         xattrs_free(xattrs);
@@ -3763,8 +4649,9 @@ static int capture_symlink(PortableCaptureContext *context,
         }
         destination_leaf = root_leaf;
     }
-    if (capture_destination_is_safe(context, root, logical, physical,
-                                    parent_fd, destination_leaf) != 0 ||
+    if (capture_destination_is_safe_for_kind(
+            context, root, logical, physical, parent_fd, destination_leaf,
+            SIDECAR_KIND_SYMLINK) != 0 ||
         replace_live_capture(context, root, logical, physical) != 0) {
         if (destination_is_root)
             close(parent_fd);
@@ -3772,6 +4659,13 @@ static int capture_symlink(PortableCaptureContext *context,
         return -1;
     }
 
+    if (append_capture_claim(context, root, logical, physical,
+                             SIDECAR_KIND_SYMLINK) != 0) {
+        if (destination_is_root)
+            close(parent_fd);
+        xattrs_free(&xattrs);
+        return -1;
+    }
     if (tombstone_destination_children(context, root->id, logical, parent_fd,
                                        destination_leaf) != 0) {
         if (destination_is_root)
@@ -3873,9 +4767,17 @@ static int capture_hardlink(PortableCaptureContext *context,
         }
         destination_leaf = root_leaf;
     }
-    if (capture_destination_is_safe(context, root, logical, physical,
-                                    parent_fd, destination_leaf) != 0 ||
+    if (capture_destination_is_safe_for_kind(
+            context, root, logical, physical, parent_fd, destination_leaf,
+            SIDECAR_KIND_HARDLINK) != 0 ||
         replace_live_capture(context, root, logical, physical) != 0) {
+        if (destination_is_root)
+            close(parent_fd);
+        close(source_fd);
+        return -1;
+    }
+    if (append_capture_claim(context, root, logical, physical,
+                             SIDECAR_KIND_HARDLINK) != 0) {
         if (destination_is_root)
             close(parent_fd);
         close(source_fd);
@@ -4055,9 +4957,19 @@ static int capture_node(PortableCaptureContext *context,
         destination_leaf = root_leaf;
     }
 
-    if (capture_destination_is_safe(context, root, logical, physical,
-                                    parent_fd, destination_leaf) != 0 ||
+    if (capture_destination_is_safe_for_kind(
+            context, root, logical, physical, parent_fd, destination_leaf,
+            SIDECAR_KIND_DIRECTORY) != 0 ||
         replace_live_capture(context, root, logical, physical) != 0) {
+        if (is_root)
+            close(parent_fd);
+        xattrs_free(&xattrs);
+        close(source_fd);
+        return -1;
+    }
+
+    if (append_capture_claim(context, root, logical, physical,
+                             SIDECAR_KIND_DIRECTORY) != 0) {
         if (is_root)
             close(parent_fd);
         xattrs_free(&xattrs);
@@ -5602,8 +6514,15 @@ int portable_capture_context_init(PortableCaptureContext *context,
         free(visited);
         return -1;
     }
+    PortableClaimedPaths *claimed_paths = calloc(1, sizeof(*claimed_paths));
+    if (claimed_paths == NULL) {
+        free(owned_paths);
+        free(visited);
+        return -1;
+    }
     PortableInodeMap *inode_map = calloc(1, sizeof(*inode_map));
     if (inode_map == NULL) {
+        free(claimed_paths);
         free(owned_paths);
         free(visited);
         return -1;
@@ -5617,6 +6536,7 @@ int portable_capture_context_init(PortableCaptureContext *context,
     context->visited = visited;
     context->inode_map = inode_map;
     context->owned_paths = owned_paths;
+    context->claimed_paths = claimed_paths;
     return 0;
 }
 
@@ -5628,6 +6548,8 @@ void portable_capture_context_close(PortableCaptureContext *context)
     inode_map_free(context->inode_map);
     portable_owned_paths_free(context->owned_paths);
     free(context->owned_paths);
+    portable_claimed_paths_free(context->claimed_paths);
+    free(context->claimed_paths);
     memset(context, 0, sizeof(*context));
 }
 
@@ -5697,6 +6619,7 @@ int portable_capture_fresh_prepared_at(
         context_ready = 1;
         context.collision_plan = &prepared->report.collision_plan;
         if (portable_owned_paths_load(context.owned_paths, &sidecar) != 0 ||
+            portable_claimed_paths_load(context.claimed_paths, &sidecar) != 0 ||
             sticky_seed_inode_map(context.inode_map, request, &sidecar) != 0)
             failed = 1;
     }
@@ -5704,6 +6627,8 @@ int portable_capture_fresh_prepared_at(
         if (portable_capture_root(&context, &request->roots[index]) != 0 ||
             reconcile_root(&context, &request->roots[index]) != 0)
             failed = 1;
+    if (!failed && sidecar_log_claim_count(&sidecar) != 0)
+        failed = 1;
     if (!failed && live_count != NULL)
         *live_count = sidecar_log_live_count(&sidecar);
     result = failed ? -1 : 0;
@@ -5841,6 +6766,7 @@ int portable_capture_resume_prepared_at(
         context.resume_mode = 1;
         context.collision_plan = &prepared->report.collision_plan;
         if (portable_owned_paths_load(context.owned_paths, &sidecar) != 0 ||
+            portable_claimed_paths_load(context.claimed_paths, &sidecar) != 0 ||
             sticky_seed_inode_map(context.inode_map, request, &sidecar) != 0)
             failed = 1;
         for (size_t index = 0; !failed && index < request->root_count;
@@ -5852,6 +6778,8 @@ int portable_capture_resume_prepared_at(
             }
         }
     }
+    if (!failed && sidecar_log_claim_count(&sidecar) != 0)
+        failed = 1;
     if (!failed && live_count != NULL)
         *live_count = sidecar_log_live_count(&sidecar);
     result = failed ? -1 : 0;

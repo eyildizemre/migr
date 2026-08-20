@@ -1654,6 +1654,13 @@ int portable_restore_preflight_at(
         errno = EINVAL;
         goto fail;
     }
+    if (sidecar_log_claim_count(&sidecar) != 0)
+    {
+        sidecar_log_close(&sidecar);
+        close(data_fd);
+        report_violation(report, SIZE_MAX, "sidecar");
+        goto fail;
+    }
 
     if (parent_map_build(&collection.parent_map, &collection.memory,
                          &sidecar) != 0)
@@ -2934,6 +2941,15 @@ int portable_restore_replay_at(const PortableRestoreRequest *request,
     {
         close(collection.data_fd);
         collection.data_fd = -1;
+        goto fail;
+    }
+    if (sidecar_log_claim_count(&sidecar) != 0)
+    {
+        sidecar_log_close(&sidecar);
+        close(collection.data_fd);
+        collection.data_fd = -1;
+        replay_report_failure(report, request->manifest, SIZE_MAX,
+                              (SidecarBytes){0});
         goto fail;
     }
     collection.sidecar = &sidecar;

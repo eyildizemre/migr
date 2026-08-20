@@ -1435,12 +1435,28 @@ static void test_collision_resume_renumbering(const char *base)
         entry_from_stat("CASE", loser, winner, "", &loser_stat, 1,
                         &empty_xattrs, &predecessor, NULL, NULL, NULL) != 0)
         fixture_fatal("could not prepare collision predecessor");
+    SidecarClaim root_claim = {
+        .root_id = root_predecessor.root_id,
+        .logical_path = root_predecessor.logical_path,
+        .physical_path = root_predecessor.physical_path,
+        .kind = root_predecessor.kind
+    };
+    SidecarClaim predecessor_claim = {
+        .root_id = predecessor.root_id,
+        .logical_path = predecessor.logical_path,
+        .physical_path = predecessor.physical_path,
+        .kind = predecessor.kind
+    };
     SidecarLog predecessor_log = {0};
     if (sidecar_log_create_at(container_fd, &predecessor_log) !=
             SIDECAR_OPEN_FRESH ||
+        sidecar_log_append_claim(&predecessor_log, &root_claim) !=
+            SIDECAR_STATUS_OK ||
         sidecar_log_append_entry(&predecessor_log, &root_predecessor) !=
             SIDECAR_STATUS_OK ||
         sidecar_log_append_entry_commit(&predecessor_log) !=
+            SIDECAR_STATUS_OK ||
+        sidecar_log_append_claim(&predecessor_log, &predecessor_claim) !=
             SIDECAR_STATUS_OK ||
         sidecar_log_append_entry(&predecessor_log, &predecessor) !=
             SIDECAR_STATUS_OK ||
@@ -2409,6 +2425,142 @@ static int live_kind(SidecarLog *log, const char *root, const char *logical,
     return found == 1 && view.entry->kind == kind;
 }
 
+static int sidecar_bytes_equal_for_test(SidecarBytes left, SidecarBytes right)
+{
+    return left.length == right.length &&
+           (left.length == 0 ||
+            (left.data != NULL && right.data != NULL &&
+             memcmp(left.data, right.data, left.length) == 0));
+}
+
+#define TEST_MAX_PENDING_CLAIMS 64U
+
+typedef struct {
+    unsigned char root_id[SIDECAR_MAX_ROOT_ID];
+    unsigned char logical_path[SIDECAR_MAX_PATH];
+    unsigned char physical_path[SIDECAR_MAX_PATH];
+    size_t root_length;
+    size_t logical_length;
+    size_t physical_length;
+    SidecarObjectKind kind;
+} PendingClaimForTest;
+
+static int pending_claim_copy(PendingClaimForTest *destination,
+                              const SidecarClaim *source)
+{
+    if (destination == NULL || source == NULL ||
+        source->root_id.length > sizeof(destination->root_id) ||
+        source->logical_path.length > sizeof(destination->logical_path) ||
+        source->physical_path.length > sizeof(destination->physical_path))
+        return -1;
+    if (source->root_id.length != 0)
+        memcpy(destination->root_id, source->root_id.data,
+               source->root_id.length);
+    if (source->logical_path.length != 0)
+        memcpy(destination->logical_path, source->logical_path.data,
+               source->logical_path.length);
+    if (source->physical_path.length != 0)
+        memcpy(destination->physical_path, source->physical_path.data,
+               source->physical_path.length);
+    destination->root_length = source->root_id.length;
+    destination->logical_length = source->logical_path.length;
+    destination->physical_length = source->physical_path.length;
+    destination->kind = source->kind;
+    return 0;
+}
+
+static int pending_claim_matches_entry(const PendingClaimForTest *claim,
+                                       const SidecarEntry *entry)
+{
+    if (claim == NULL || entry == NULL)
+        return 0;
+    return sidecar_bytes_equal_for_test(
+               (SidecarBytes){ claim->root_id, claim->root_length },
+               entry->root_id) &&
+           sidecar_bytes_equal_for_test(
+               (SidecarBytes){ claim->logical_path, claim->logical_length },
+               entry->logical_path) &&
+           sidecar_bytes_equal_for_test(
+               (SidecarBytes){ claim->physical_path, claim->physical_length },
+               entry->physical_path) &&
+           claim->kind == entry->kind;
+}
+
+typedef struct {
+    int valid;
+    int claims;
+    int entries;
+    int commits;
+    int group_open;
+    size_t pending_count;
+    PendingClaimForTest pending[TEST_MAX_PENDING_CLAIMS];
+} ClaimOrder;
+
+static int claim_order_callback(const SidecarRecord *record, void *opaque)
+{
+    ClaimOrder *order = opaque;
+    if (record == NULL || order == NULL) {
+        if (order != NULL)
+            order->valid = 0;
+        return 0;
+    }
+    if (record->type == SIDECAR_RECORD_CLAIM) {
+        if (order->group_open ||
+            order->pending_count >= TEST_MAX_PENDING_CLAIMS ||
+            pending_claim_copy(&order->pending[order->pending_count],
+                               &record->value.claim) != 0)
+            order->valid = 0;
+        else
+            order->pending_count++;
+        order->claims++;
+    } else if (record->type == SIDECAR_RECORD_ENTRY) {
+        size_t pending_index = TEST_MAX_PENDING_CLAIMS;
+        for (size_t index = 0; index < order->pending_count; index++)
+            if (pending_claim_matches_entry(&order->pending[index],
+                                            &record->value.entry)) {
+                pending_index = index;
+                break;
+            }
+        if (pending_index == TEST_MAX_PENDING_CLAIMS)
+            order->valid = 0;
+        else {
+            order->pending_count--;
+            order->pending[pending_index] =
+                order->pending[order->pending_count];
+        }
+        if (order->group_open)
+            order->valid = 0;
+        order->group_open = 1;
+        order->entries++;
+    } else if (record->type == SIDECAR_RECORD_XATTR) {
+        if (!order->group_open)
+            order->valid = 0;
+    } else if (record->type == SIDECAR_RECORD_ENTRY_COMMIT) {
+        if (!order->group_open)
+            order->valid = 0;
+        order->group_open = 0;
+        order->commits++;
+    } else if (record->type == SIDECAR_RECORD_DELETE) {
+        if (order->group_open)
+            order->valid = 0;
+    }
+    return 0;
+}
+
+static int claim_order_complete(const ClaimOrder *order)
+{
+    return order != NULL && order->valid && order->pending_count == 0 &&
+           !order->group_open && order->claims == order->entries &&
+           order->entries == order->commits;
+}
+
+static int claim_absent(SidecarLog *log, const char *root,
+                        const char *logical)
+{
+    SidecarClaimView view;
+    return sidecar_log_find_claim(log, bytes(root), bytes(logical), &view) == 0;
+}
+
 typedef struct {
     int entries;
     int xattrs;
@@ -2422,11 +2574,13 @@ typedef struct {
     int symlink_xattr_count;
     int symlink_entry_xattr_count;
     int symlink_entry_open;
+    ClaimOrder claim_order;
 } FreshSidecarCheck;
 
 static int fresh_sidecar_callback(const SidecarRecord *record, void *opaque)
 {
     FreshSidecarCheck *check_state = opaque;
+    claim_order_callback(record, &check_state->claim_order);
     if (record->type == SIDECAR_RECORD_ENTRY) {
         const SidecarEntry *entry = &record->value.entry;
         check_state->entries++;
@@ -2499,11 +2653,13 @@ typedef struct {
     int new_commit_seen;
     int invalid_order;
     int target_entry_open;
+    ClaimOrder claim_order;
 } ReplacementOrder;
 
 static int replacement_callback(const SidecarRecord *record, void *opaque)
 {
     ReplacementOrder *order = opaque;
+    claim_order_callback(record, &order->claim_order);
     if (record->type == SIDECAR_RECORD_ENTRY_COMMIT) {
         if (order->target_entry_open && order->new_entry_seen)
             order->new_commit_seen = 1;
@@ -2666,7 +2822,10 @@ static void test_fresh_capture(const char *source, int container_fd,
 
     int slot_fd = openat(container_fd, SIDECAR_SLOT_NAME,
                          O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-    FreshSidecarCheck sidecar_check = { .valid = 1 };
+    FreshSidecarCheck sidecar_check = {
+        .valid = 1,
+        .claim_order = { .valid = 1 }
+    };
     SidecarParseResult parse_result;
     SidecarStatus parse_status = SIDECAR_STATUS_INVALID_ARGUMENT;
     if (slot_fd >= 0)
@@ -2676,6 +2835,8 @@ static void test_fresh_capture(const char *source, int container_fd,
           parse_status == SIDECAR_STATUS_OK &&
           sidecar_check.valid && sidecar_check.entries == 4 &&
           sidecar_check.commits == 4 && sidecar_check.symlink_seen &&
+          claim_order_complete(&sidecar_check.claim_order) &&
+          sidecar_check.claim_order.claims == 4 &&
           sidecar_check.symlink_target_ok &&
           !sidecar_check.symlink_regular_xattr_leaked &&
           (!symlink_xattr_expected ||
@@ -2684,6 +2845,16 @@ static void test_fresh_capture(const char *source, int container_fd,
           (!xattr_expected ||
            sidecar_check.expected_xattr_seen),
           "sidecar contains complete groups, symlink target, and xattrs");
+    SidecarLog state_log = {0};
+    int state_open = sidecar_log_adopt_at(container_fd, &state_log) ==
+                     SIDECAR_OPEN_RESUMABLE;
+    check(state_open && claim_absent(&state_log, "ROOT", "") &&
+              claim_absent(&state_log, "ROOT", "nested") &&
+              claim_absent(&state_log, "ROOT", "nested/file.txt") &&
+              claim_absent(&state_log, "ROOT", "nested/link"),
+          "fresh capture consumes every payload claim");
+    if (state_open)
+        sidecar_log_close(&state_log);
     if (slot_fd >= 0)
         close(slot_fd);
 }
@@ -2720,6 +2891,8 @@ static void test_portable_hardlinks(const char *base)
     write_file(first, "hardlink-content", 16);
     if (link(first, second) != 0)
         fixture_fatal("could not create hardlink pair");
+    if (chmod(first, 0640) != 0)
+        fixture_fatal("could not set hardlink fixture mode");
     write_file(single, "singleton", 9);
 
     int xattr_expected = 1;
@@ -2765,6 +2938,20 @@ static void test_portable_hardlinks(const char *base)
     check(open_status == SIDECAR_OPEN_RESUMABLE,
           "hardlink sidecar can be reopened");
     if (open_status == SIDECAR_OPEN_RESUMABLE) {
+        int slot_fd = openat(container_fd, SIDECAR_SLOT_NAME,
+                             O_RDONLY | O_CLOEXEC);
+        ClaimOrder order = { .valid = 1 };
+        SidecarParseResult parse_result;
+        SidecarStatus parse_status = SIDECAR_STATUS_INVALID_ARGUMENT;
+        if (slot_fd >= 0)
+            parse_status = sidecar_parse_fd(slot_fd, claim_order_callback,
+                                            &order, &parse_result);
+        check(slot_fd >= 0 && parse_status == SIDECAR_STATUS_OK &&
+                  claim_order_complete(&order) && order.claims == 4,
+              "fresh hardlink capture orders and consumes every claim");
+        if (slot_fd >= 0)
+            close(slot_fd);
+
         SidecarLiveView first_view = {0};
         SidecarLiveView second_view = {0};
         SidecarLiveView single_view = {0};
@@ -2840,6 +3027,11 @@ static void test_portable_hardlinks(const char *base)
                                &single_view) == 1 &&
                   single_view.entry->kind == SIDECAR_KIND_REGULAR,
               "a singly-linked file remains REGULAR");
+        check(claim_absent(&log, "HL", "") &&
+                  claim_absent(&log, "HL", "first") &&
+                  claim_absent(&log, "HL", "second") &&
+                  claim_absent(&log, "HL", "single"),
+              "fresh hardlink capture leaves no outstanding claims");
 
         struct stat representative_before = {0};
         int representative_stat_ok = representative_path_ok;
@@ -2867,6 +3059,11 @@ static void test_portable_hardlinks(const char *base)
                   ((resumed_first.entry->kind == SIDECAR_KIND_HARDLINK) !=
                    (resumed_second.entry->kind == SIDECAR_KIND_HARDLINK)),
               "resume preserves the hardlink classification");
+        check(claim_absent(&log, "HL", "") &&
+                  claim_absent(&log, "HL", "first") &&
+                  claim_absent(&log, "HL", "second") &&
+                  claim_absent(&log, "HL", "single"),
+              "unchanged hardlink resume writes no outstanding claims");
         if (representative_stat_ok) {
             join_path(payload, sizeof(payload), data_root, representative_path);
             struct stat representative_after = {0};
@@ -2879,6 +3076,52 @@ static void test_portable_hardlinks(const char *base)
                   "resume does not rewrite an unchanged representative payload");
         }
         sidecar_log_close(&log);
+
+        if (chmod(first, 0600) != 0)
+            fixture_fatal("could not change hardlink fixture mode");
+        portable_prescan_report_init(&prescan_report);
+        check(portable_capture_resume_at(container_fd, &request,
+                                          &prescan_report) == 0,
+              "changed hardlink metadata is recaptured with claims");
+        portable_prescan_report_free(&prescan_report);
+
+        open_status = sidecar_log_adopt_at(container_fd, &log);
+        SidecarLiveView changed_first = {0};
+        SidecarLiveView changed_second = {0};
+        int changed_pair = open_status == SIDECAR_OPEN_RESUMABLE &&
+                           sidecar_log_find(&log, bytes("HL"), bytes("first"),
+                                            &changed_first) == 1 &&
+                           sidecar_log_find(&log, bytes("HL"), bytes("second"),
+                                            &changed_second) == 1;
+        check(changed_pair &&
+                  (changed_first.entry->mode & 07777U) == 0600U &&
+                  (changed_second.entry->mode & 07777U) == 0600U &&
+                  ((changed_first.entry->kind == SIDECAR_KIND_HARDLINK) !=
+                   (changed_second.entry->kind == SIDECAR_KIND_HARDLINK)),
+              "hardlink replacement preserves the changed metadata and kinds");
+        check(open_status == SIDECAR_OPEN_RESUMABLE &&
+                  claim_absent(&log, "HL", "") &&
+                  claim_absent(&log, "HL", "first") &&
+                  claim_absent(&log, "HL", "second") &&
+                  claim_absent(&log, "HL", "single"),
+              "hardlink replacement consumes every claim");
+        if (open_status == SIDECAR_OPEN_RESUMABLE) {
+            int replacement_fd = openat(container_fd, SIDECAR_SLOT_NAME,
+                                         O_RDONLY | O_CLOEXEC);
+            ClaimOrder replacement_order = { .valid = 1 };
+            parse_status = SIDECAR_STATUS_INVALID_ARGUMENT;
+            if (replacement_fd >= 0)
+                parse_status = sidecar_parse_fd(
+                    replacement_fd, claim_order_callback, &replacement_order,
+                    &parse_result);
+            check(replacement_fd >= 0 && parse_status == SIDECAR_STATUS_OK &&
+                      claim_order_complete(&replacement_order) &&
+                      replacement_order.claims > 4,
+                  "hardlink replacement keeps CLAIM before each ENTRY");
+            if (replacement_fd >= 0)
+                close(replacement_fd);
+            sidecar_log_close(&log);
+        }
     }
     close(container_fd);
     remove_tree(source);
@@ -3002,11 +3245,32 @@ static void test_portable_hardlinks_sticky_seed(const char *base)
                         &empty_xattrs, &member_entry, NULL,
                         &hardlink_root_id, &hardlink_logical_path) != 0)
         fixture_fatal("could not prepare sticky-seed sidecar entries");
+    SidecarClaim root_claim = {
+        .root_id = root_entry.root_id,
+        .logical_path = root_entry.logical_path,
+        .physical_path = root_entry.physical_path,
+        .kind = root_entry.kind
+    };
+    SidecarClaim representative_claim = {
+        .root_id = representative_entry.root_id,
+        .logical_path = representative_entry.logical_path,
+        .physical_path = representative_entry.physical_path,
+        .kind = representative_entry.kind
+    };
+    SidecarClaim member_claim = {
+        .root_id = member_entry.root_id,
+        .logical_path = member_entry.logical_path,
+        .physical_path = member_entry.physical_path,
+        .kind = member_entry.kind
+    };
 
     SidecarLog log = {0};
     if (sidecar_log_create_at(container_fd, &log) != SIDECAR_OPEN_FRESH ||
+        sidecar_log_append_claim(&log, &root_claim) != SIDECAR_STATUS_OK ||
         sidecar_log_append_entry(&log, &root_entry) != SIDECAR_STATUS_OK ||
         sidecar_log_append_entry_commit(&log) != SIDECAR_STATUS_OK ||
+        sidecar_log_append_claim(&log, &representative_claim) !=
+            SIDECAR_STATUS_OK ||
         sidecar_log_append_entry(&log, &representative_entry) !=
             SIDECAR_STATUS_OK)
         fixture_fatal("could not write sticky-seed sidecar");
@@ -3016,6 +3280,7 @@ static void test_portable_hardlinks_sticky_seed(const char *base)
             SIDECAR_STATUS_OK)
             fixture_fatal("could not write sticky-seed xattrs");
     if (sidecar_log_append_entry_commit(&log) != SIDECAR_STATUS_OK ||
+        sidecar_log_append_claim(&log, &member_claim) != SIDECAR_STATUS_OK ||
         sidecar_log_append_entry(&log, &member_entry) != SIDECAR_STATUS_OK ||
         sidecar_log_append_entry_commit(&log) != SIDECAR_STATUS_OK ||
         sidecar_log_close(&log) != SIDECAR_STATUS_OK)
@@ -3255,13 +3520,14 @@ static void test_replacement_and_type_change(const char *source,
           "replacement leaves one live regular entry");
 
     int fd = openat(container_fd, SIDECAR_SLOT_NAME, O_RDONLY | O_CLOEXEC);
-    ReplacementOrder order = {0};
+    ReplacementOrder order = { .claim_order = { .valid = 1 } };
     SidecarParseResult result;
     check(fd >= 0 && sidecar_parse_fd(fd, replacement_callback, &order,
                                       &result) == SIDECAR_STATUS_OK &&
           order.delete_seen && order.new_entry_seen && order.new_commit_seen &&
-          !order.invalid_order,
-          "replacement log orders DELETE before the new ENTRY group");
+          !order.invalid_order && claim_order_complete(&order.claim_order) &&
+          order.claim_order.claims == 2,
+          "replacement log orders DELETE, CLAIM, and ENTRY group");
     if (fd >= 0)
         close(fd);
 
@@ -3314,6 +3580,28 @@ static void test_replacement_and_type_change(const char *source,
           "replacement sidecar records the symlink target");
     if (unlink(file) != 0)
         fixture_fatal("could not remove symlink replacement fixture");
+
+    fd = openat(container_fd, SIDECAR_SLOT_NAME, O_RDONLY | O_CLOEXEC);
+    ReplacementOrder all_order = { .claim_order = { .valid = 1 } };
+    SidecarStatus all_parse_status = SIDECAR_STATUS_INVALID_ARGUMENT;
+    if (fd >= 0)
+        all_parse_status = sidecar_parse_fd(
+            fd, replacement_callback, &all_order, &(SidecarParseResult){0});
+    check(fd >= 0 && all_parse_status == SIDECAR_STATUS_OK &&
+              claim_order_complete(&all_order.claim_order) &&
+              all_order.claim_order.claims == 6,
+          "all uninterrupted replacement groups consume ordered claims");
+    if (fd >= 0)
+        close(fd);
+
+    SidecarLog state_log = {0};
+    int state_open = sidecar_log_adopt_at(container_fd, &state_log) ==
+                     SIDECAR_OPEN_RESUMABLE;
+    check(state_open && claim_absent(&state_log, "FILE", "") &&
+              claim_absent(&state_log, "FILE", "child"),
+          "replacement captures leave no outstanding claims");
+    if (state_open)
+        sidecar_log_close(&state_log);
     close_live_capture(container_fd, &log, &context);
 }
 

@@ -5,7 +5,7 @@
 #include <stdint.h>
 
 #define SIDECAR_MAGIC "MIGR_SIDECAR"
-#define SIDECAR_VERSION 2
+#define SIDECAR_VERSION 3
 #define SIDECAR_SLOT_NAME "sidecar.migr"
 
 #define SIDECAR_MAX_ROOT_ID 64U
@@ -39,7 +39,8 @@ typedef enum {
     SIDECAR_RECORD_ENTRY = 0,
     SIDECAR_RECORD_XATTR,
     SIDECAR_RECORD_ENTRY_COMMIT,
-    SIDECAR_RECORD_DELETE
+    SIDECAR_RECORD_DELETE,
+    SIDECAR_RECORD_CLAIM
 } SidecarRecordType;
 
 typedef enum {
@@ -97,11 +98,19 @@ typedef struct {
 } SidecarDelete;
 
 typedef struct {
+    SidecarBytes root_id;
+    SidecarBytes logical_path;
+    SidecarBytes physical_path;
+    SidecarObjectKind kind;
+} SidecarClaim;
+
+typedef struct {
     SidecarRecordType type;
     union {
         SidecarEntry entry;
         SidecarXattr xattr;
         SidecarDelete deletion;
+        SidecarClaim claim;
     } value;
 } SidecarRecord;
 
@@ -128,8 +137,16 @@ typedef struct {
     uint64_t generation;
 } SidecarLiveView;
 
+typedef struct {
+    /* The pointer is borrowed until the next log mutation or close. */
+    const SidecarClaim *claim;
+    uint64_t generation;
+} SidecarClaimView;
+
 typedef int (*SidecarLiveCallback)(const SidecarLiveView *view,
                                    void *context);
+typedef int (*SidecarClaimCallback)(const SidecarClaimView *view,
+                                    void *context);
 
 /* Record fields passed to the callback are borrowed until it returns. */
 int sidecar_live_entry_count_allowed(uint64_t count);
@@ -145,6 +162,7 @@ int sidecar_write_entry(int fd, const SidecarEntry *entry);
 int sidecar_write_xattr(int fd, const SidecarXattr *xattr);
 int sidecar_write_entry_commit(int fd);
 int sidecar_write_delete(int fd, const SidecarDelete *deletion);
+int sidecar_write_claim(int fd, const SidecarClaim *claim);
 
 /*
  * Parses a regular sidecar fd without changing its offset or contents. The
@@ -170,14 +188,22 @@ SidecarStatus sidecar_log_append_xattr(SidecarLog *log,
 SidecarStatus sidecar_log_append_entry_commit(SidecarLog *log);
 SidecarStatus sidecar_log_append_delete(SidecarLog *log,
                                         const SidecarDelete *deletion);
+SidecarStatus sidecar_log_append_claim(SidecarLog *log,
+                                       const SidecarClaim *claim);
 
 size_t sidecar_log_live_count(const SidecarLog *log);
+size_t sidecar_log_claim_count(const SidecarLog *log);
 int sidecar_log_find(const SidecarLog *log, SidecarBytes root_id,
                      SidecarBytes logical_path, SidecarLiveView *out);
 SidecarStatus sidecar_log_foreach(SidecarLog *log, SidecarLiveCallback callback,
                                    void *context);
+SidecarStatus sidecar_log_claim_foreach(SidecarLog *log,
+                                        SidecarClaimCallback callback,
+                                        void *context);
 int sidecar_log_find_deleted(const SidecarLog *log, SidecarBytes root_id,
                              SidecarBytes logical_path, SidecarLiveView *out);
+int sidecar_log_find_claim(const SidecarLog *log, SidecarBytes root_id,
+                           SidecarBytes logical_path, SidecarClaimView *out);
 
 #ifdef SIDECAR_TEST_HOOKS
 typedef enum {
@@ -193,7 +219,10 @@ typedef enum {
     SIDECAR_TEST_MID_ENTRY_COMMIT,
     SIDECAR_TEST_BEFORE_DELETE,
     SIDECAR_TEST_AFTER_DELETE,
-    SIDECAR_TEST_MID_DELETE
+    SIDECAR_TEST_MID_DELETE,
+    SIDECAR_TEST_BEFORE_CLAIM,
+    SIDECAR_TEST_AFTER_CLAIM,
+    SIDECAR_TEST_MID_CLAIM
 } SidecarTestInterruptPoint;
 
 void sidecar_test_set_interrupt(SidecarTestInterruptPoint point);

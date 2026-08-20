@@ -1,4 +1,4 @@
-// Unit tests for the sidecar v2 state log (docs/DECISIONS.md D17/D21/D22): the
+// Unit tests for the sidecar v3 state log (docs/DECISIONS.md D17/D21/D22/D25): the
 // `(root_id, logical_path)`-keyed live-state map built on top of the sidecar
 // codec's record framing, with last-committed-wins semantics, DELETE
 // handling, the fd-anchored no-follow single-link slot, and adopt-time
@@ -47,6 +47,15 @@ static void check(int condition, const char *label)
         printf("  " RED "x" NC " %s\n", label);
         failures++;
     }
+}
+
+static int count_live_callback(const SidecarLiveView *view, void *context)
+{
+    size_t *count = context;
+    if (view == NULL || view->entry == NULL || count == NULL)
+        return -1;
+    (*count)++;
+    return 0;
 }
 
 static int write_all_test(int fd, const void *data, size_t length)
@@ -151,6 +160,17 @@ static SidecarEntry entry_for(const char *root, const char *logical,
     return entry;
 }
 
+static SidecarClaim claim_for(const char *root, const char *logical,
+                              const char *physical, SidecarObjectKind kind)
+{
+    return (SidecarClaim){
+        .root_id = { (const unsigned char *)root, strlen(root) },
+        .logical_path = { (const unsigned char *)logical, strlen(logical) },
+        .physical_path = { (const unsigned char *)physical, strlen(physical) },
+        .kind = kind
+    };
+}
+
 static SidecarXattr sample_xattr(void)
 {
     static const unsigned char value[] = { 0x00, 0x41, 0xff, 0x00 };
@@ -173,8 +193,11 @@ static void test_fresh_and_live_map(int container_fd)
           "fresh log owns a regular fd at the header boundary");
 
     SidecarEntry entry = entry_for("ROOT", "file", "payload/file", 17, 1);
+    SidecarClaim entry_claim = claim_for("ROOT", "file", "payload/file",
+                                        SIDECAR_KIND_REGULAR);
     SidecarXattr xattr = sample_xattr();
-    check(sidecar_log_append_entry(&log, &entry) == SIDECAR_STATUS_OK,
+    check(sidecar_log_append_claim(&log, &entry_claim) == SIDECAR_STATUS_OK &&
+              sidecar_log_append_entry(&log, &entry) == SIDECAR_STATUS_OK,
           "ENTRY opens a group");
     check(sidecar_log_append_xattr(&log, &xattr) == SIDECAR_STATUS_OK,
           "XATTR is appended to the open group");
@@ -196,7 +219,16 @@ static void test_fresh_and_live_map(int container_fd)
           "lookup returns copied entry, empty suffix, xattr, and generation");
 
     SidecarEntry replacement = entry_for("ROOT", "file", "payload/new", 23, 0);
-    check(sidecar_log_append_entry(&log, &replacement) == SIDECAR_STATUS_OK &&
+    SidecarDelete deletion = {
+        .root_id = { (const unsigned char *)"ROOT", 4 },
+        .logical_path = { (const unsigned char *)"file", 4 }
+    };
+    SidecarClaim replacement_claim = claim_for("ROOT", "file", "payload/new",
+                                               SIDECAR_KIND_REGULAR);
+    check(sidecar_log_append_delete(&log, &deletion) == SIDECAR_STATUS_OK &&
+          sidecar_log_append_claim(&log, &replacement_claim) ==
+              SIDECAR_STATUS_OK &&
+          sidecar_log_append_entry(&log, &replacement) == SIDECAR_STATUS_OK &&
           sidecar_log_append_entry_commit(&log) == SIDECAR_STATUS_OK,
           "a later committed group replaces the previous key");
     found = sidecar_log_find(&log,
@@ -204,13 +236,9 @@ static void test_fresh_and_live_map(int container_fd)
                              (SidecarBytes){ (const unsigned char *)"file", 4 },
                              &view);
     check(found == 1 && view.entry->size == 23 && view.xattr_count == 0 &&
-          view.generation == 2,
+          view.generation == 3,
           "last committed state removes old xattrs and wins");
 
-    SidecarDelete deletion = {
-        .root_id = { (const unsigned char *)"ROOT", 4 },
-        .logical_path = { (const unsigned char *)"file", 4 }
-    };
     check(sidecar_log_append_delete(&log, &deletion) == SIDECAR_STATUS_OK &&
           sidecar_log_live_count(&log) == 0,
           "DELETE removes the live key");
@@ -227,6 +255,197 @@ static void test_fresh_and_live_map(int container_fd)
           "adopted log closes cleanly");
 }
 
+static void test_claim_replay_and_transitions(int container_fd)
+{
+    printf(BLUE "::" NC " CLAIM replay, consumption, and cancellation\n");
+    check(reset_slot(container_fd) == 0, "claim slot starts absent");
+
+    SidecarClaim claim = claim_for("ROOT", "file", "payload/file",
+                                   SIDECAR_KIND_REGULAR);
+    SidecarEntry entry = entry_for("ROOT", "file", "payload/file", 17, 0);
+    SidecarLog log = {0};
+    check(sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH,
+          "claim fixture is created");
+    check(sidecar_log_append_claim(&log, &claim) == SIDECAR_STATUS_OK,
+          "CLAIM appends before an entry group");
+
+    SidecarClaimView claim_view;
+    int claim_found = sidecar_log_find_claim(
+        &log, claim.root_id, claim.logical_path, &claim_view);
+    check(claim_found == 1 && claim_view.claim != NULL &&
+              claim_view.claim->kind == SIDECAR_KIND_REGULAR &&
+              claim_view.claim->physical_path.length == 12 &&
+              memcmp(claim_view.claim->physical_path.data, "payload/file", 12) == 0 &&
+              sidecar_log_live_count(&log) == 0,
+          "outstanding CLAIM is queryable but not live state");
+    size_t live_seen = 0;
+    check(sidecar_log_foreach(&log, count_live_callback, &live_seen) ==
+              SIDECAR_STATUS_OK && live_seen == 0,
+          "outstanding CLAIM is excluded from live iteration");
+    check(sidecar_log_close(&log) == SIDECAR_STATUS_OK,
+          "claim fixture closes before adoption");
+
+    check(sidecar_log_adopt_at(container_fd, &log) == SIDECAR_OPEN_RESUMABLE,
+          "CLAIM-containing log is adoptable");
+    claim_found = sidecar_log_find_claim(
+        &log, claim.root_id, claim.logical_path, &claim_view);
+    check(claim_found == 1 && claim_view.claim != NULL,
+          "adoption rebuilds the outstanding CLAIM map");
+
+    check(sidecar_log_append_entry(&log, &entry) == SIDECAR_STATUS_OK &&
+              sidecar_log_append_entry_commit(&log) == SIDECAR_STATUS_OK,
+          "matching ENTRY_COMMIT appends successfully");
+    check(sidecar_log_find_claim(&log, claim.root_id, claim.logical_path,
+                                 &claim_view) == 0 &&
+              sidecar_log_live_count(&log) == 1,
+          "matching ENTRY_COMMIT consumes the exact CLAIM");
+
+    SidecarDelete deletion = {
+        .root_id = claim.root_id,
+        .logical_path = claim.logical_path
+    };
+    SidecarLiveView live_view;
+    check(sidecar_log_append_delete(&log, &deletion) == SIDECAR_STATUS_OK &&
+              sidecar_log_find(&log, deletion.root_id, deletion.logical_path,
+                               &live_view) == 0 &&
+              sidecar_log_find_deleted(&log, deletion.root_id,
+                                       deletion.logical_path, &live_view) == 1,
+          "DELETE leaves a tombstone after the committed entry");
+
+    SidecarClaim replacement = claim_for("ROOT", "file", "payload/new",
+                                         SIDECAR_KIND_REGULAR);
+    check(sidecar_log_append_claim(&log, &replacement) == SIDECAR_STATUS_OK &&
+              sidecar_log_find_deleted(&log, replacement.root_id,
+                                       replacement.logical_path, &live_view) == 1 &&
+              sidecar_log_find_claim(&log, replacement.root_id,
+                                     replacement.logical_path,
+                                     &claim_view) == 1,
+          "a tombstone and an outstanding CLAIM coexist for one key");
+    check(sidecar_log_close(&log) == SIDECAR_STATUS_OK,
+          "tombstone and claim fixture closes");
+
+    check(sidecar_log_adopt_at(container_fd, &log) == SIDECAR_OPEN_RESUMABLE &&
+              sidecar_log_find_deleted(&log, replacement.root_id,
+                                       replacement.logical_path, &live_view) == 1 &&
+              sidecar_log_find_claim(&log, replacement.root_id,
+                                     replacement.logical_path,
+                                     &claim_view) == 1,
+          "adoption preserves tombstone and CLAIM independently");
+    check(sidecar_log_append_delete(&log, &deletion) == SIDECAR_STATUS_OK &&
+              sidecar_log_find_claim(&log, replacement.root_id,
+                                     replacement.logical_path,
+                                     &claim_view) == 0 &&
+              sidecar_log_find_deleted(&log, replacement.root_id,
+                                       replacement.logical_path, &live_view) == 1,
+          "DELETE cancels the outstanding CLAIM and keeps its tombstone");
+    check(sidecar_log_close(&log) == SIDECAR_STATUS_OK,
+          "claim transition log closes");
+
+    check(reset_slot(container_fd) == 0 &&
+              sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH,
+          "claimless commit fixture is created");
+    check(sidecar_log_append_entry(&log, &entry) == SIDECAR_STATUS_OK &&
+              sidecar_log_append_entry_commit(&log) == SIDECAR_STATUS_CORRUPT,
+          "claimless ENTRY_COMMIT is refused by the live state map");
+    check(sidecar_log_live_count(&log) == 0,
+          "claimless ENTRY_COMMIT leaves live state unchanged");
+    check(sidecar_log_close(&log) == SIDECAR_STATUS_OK,
+          "claimless live fixture closes");
+
+    check(reset_slot(container_fd) == 0 &&
+              sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH,
+          "mismatching commit fixture is created");
+    SidecarEntry mismatching = entry_for("ROOT", "file", "payload/other",
+                                         17, 0);
+    check(sidecar_log_append_claim(&log, &claim) == SIDECAR_STATUS_OK &&
+              sidecar_log_append_entry(&log, &mismatching) == SIDECAR_STATUS_OK &&
+              sidecar_log_append_entry_commit(&log) == SIDECAR_STATUS_CORRUPT,
+          "mismatching ENTRY_COMMIT is refused by the live state map");
+    live_seen = 0;
+    check(sidecar_log_live_count(&log) == 0 &&
+              sidecar_log_foreach(&log, count_live_callback, &live_seen) ==
+                  SIDECAR_STATUS_OK && live_seen == 0 &&
+              sidecar_log_find_claim(&log, claim.root_id, claim.logical_path,
+                                     &claim_view) == 1,
+          "mismatching ENTRY_COMMIT leaves only the outstanding CLAIM");
+    check(sidecar_log_close(&log) == SIDECAR_STATUS_OK,
+          "mismatching live fixture closes");
+    check(sidecar_log_adopt_at(container_fd, &log) == SIDECAR_OPEN_RESUMABLE &&
+              sidecar_log_find_claim(&log, claim.root_id, claim.logical_path,
+                                     &claim_view) == 1,
+          "adoption preserves the claim after rejecting the mismatching tail");
+    check(sidecar_log_append_delete(&log, &deletion) == SIDECAR_STATUS_OK &&
+              sidecar_log_find_claim(&log, claim.root_id, claim.logical_path,
+                                     &claim_view) == 0,
+          "DELETE cancels the claim left by a mismatching commit");
+    check(sidecar_log_close(&log) == SIDECAR_STATUS_OK,
+          "mismatching commit fixture closes");
+
+    check(reset_slot(container_fd) == 0 &&
+              sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH &&
+              sidecar_log_close(&log) == SIDECAR_STATUS_OK,
+          "claimless adoption fixture is created");
+    int fd = slot_fd(container_fd, O_WRONLY | O_APPEND);
+    check(fd >= 0 && sidecar_write_entry(fd, &entry) == 0 &&
+              sidecar_write_entry_commit(fd) == 0,
+          "claimless ENTRY_COMMIT is written for adoption");
+    if (fd >= 0)
+        close(fd);
+    check(sidecar_log_adopt_at(container_fd, &log) == SIDECAR_OPEN_UNUSABLE,
+          "adoption rejects a claimless ENTRY_COMMIT");
+
+    check(reset_slot(container_fd) == 0 &&
+              sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH &&
+              sidecar_log_close(&log) == SIDECAR_STATUS_OK,
+          "mismatching adoption fixture is created");
+    fd = slot_fd(container_fd, O_WRONLY | O_APPEND);
+    check(fd >= 0 && sidecar_write_claim(fd, &claim) == 0 &&
+              sidecar_write_entry(fd, &mismatching) == 0 &&
+              sidecar_write_entry_commit(fd) == 0,
+          "mismatching ENTRY_COMMIT is written for adoption");
+    if (fd >= 0)
+        close(fd);
+    check(sidecar_log_adopt_at(container_fd, &log) == SIDECAR_OPEN_UNUSABLE,
+          "adoption rejects a mismatching ENTRY_COMMIT");
+
+    check(reset_slot(container_fd) == 0 &&
+              sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH &&
+              sidecar_log_append_claim(&log, &claim) == SIDECAR_STATUS_OK &&
+              sidecar_log_append_claim(&log, &claim) ==
+                  SIDECAR_STATUS_INVALID_ARGUMENT,
+          "public append rejects a duplicate outstanding CLAIM");
+    check(sidecar_log_close(&log) == SIDECAR_STATUS_OK,
+          "duplicate guard log closes");
+
+    check(reset_slot(container_fd) == 0 &&
+              sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH,
+          "raw duplicate fixture is created");
+    check(sidecar_log_close(&log) == SIDECAR_STATUS_OK, "raw fixture closes");
+    fd = slot_fd(container_fd, O_WRONLY | O_APPEND);
+    check(fd >= 0 && sidecar_write_claim(fd, &claim) == 0 &&
+              sidecar_write_claim(fd, &claim) == 0,
+          "identical duplicate CLAIM records are written");
+    if (fd >= 0)
+        close(fd);
+    check(sidecar_log_adopt_at(container_fd, &log) == SIDECAR_OPEN_UNUSABLE,
+          "identical duplicate CLAIMs are rejected at adoption");
+
+    check(reset_slot(container_fd) == 0 &&
+              sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH,
+          "raw conflict fixture is created");
+    check(sidecar_log_close(&log) == SIDECAR_STATUS_OK, "conflict fixture closes");
+    SidecarClaim conflict = claim_for("ROOT", "file", "payload/conflict",
+                                      SIDECAR_KIND_REGULAR);
+    fd = slot_fd(container_fd, O_WRONLY | O_APPEND);
+    check(fd >= 0 && sidecar_write_claim(fd, &claim) == 0 &&
+              sidecar_write_claim(fd, &conflict) == 0,
+          "conflicting CLAIM records are written");
+    if (fd >= 0)
+        close(fd);
+    check(sidecar_log_adopt_at(container_fd, &log) == SIDECAR_OPEN_UNUSABLE,
+          "conflicting CLAIMs are rejected at adoption");
+}
+
 static void test_sequence_and_hardlink_guards(int container_fd)
 {
     printf(BLUE "::" NC " append sequence and hardlink validation\n");
@@ -235,12 +454,15 @@ static void test_sequence_and_hardlink_guards(int container_fd)
     check(sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH,
           "guard fixture is created");
     SidecarEntry entry = entry_for("ROOT", "file", "payload/file", 1, 1);
+    SidecarClaim entry_claim = claim_for("ROOT", "file", "payload/file",
+                                         SIDECAR_KIND_REGULAR);
     SidecarXattr xattr = sample_xattr();
     check(sidecar_log_append_entry_commit(&log) == SIDECAR_STATUS_INVALID_ARGUMENT,
           "commit without an entry is refused");
     check(sidecar_log_append_xattr(&log, &xattr) == SIDECAR_STATUS_INVALID_ARGUMENT,
           "xattr without an entry is refused");
-    check(sidecar_log_append_entry(&log, &entry) == SIDECAR_STATUS_OK,
+    check(sidecar_log_append_claim(&log, &entry_claim) == SIDECAR_STATUS_OK &&
+              sidecar_log_append_entry(&log, &entry) == SIDECAR_STATUS_OK,
           "guard entry opens");
     check(sidecar_log_append_entry(&log, &entry) == SIDECAR_STATUS_INVALID_ARGUMENT,
           "a second entry cannot interrupt an open group");
@@ -259,7 +481,10 @@ static void test_sequence_and_hardlink_guards(int container_fd)
     symlink.symlink_target = (SidecarBytes){
         (const unsigned char *)"target", 6
     };
-    check(sidecar_log_append_entry(&log, &symlink) == SIDECAR_STATUS_OK,
+    SidecarClaim symlink_claim = claim_for("ROOT", "link", "payload/link",
+                                           SIDECAR_KIND_SYMLINK);
+    check(sidecar_log_append_claim(&log, &symlink_claim) == SIDECAR_STATUS_OK &&
+              sidecar_log_append_entry(&log, &symlink) == SIDECAR_STATUS_OK,
           "well-formed symlink entry opens a group");
     check(sidecar_log_append_entry_commit(&log) == SIDECAR_STATUS_OK,
           "symlink entry commits");
@@ -281,8 +506,11 @@ static void test_sequence_and_hardlink_guards(int container_fd)
     hardlink.kind = SIDECAR_KIND_HARDLINK;
     hardlink.hardlink_root_id = hardlink.root_id;
     hardlink.hardlink_logical_path = entry.logical_path;
-    check(sidecar_log_append_entry(&log, &hardlink) == SIDECAR_STATUS_OK &&
-          sidecar_log_append_entry_commit(&log) == SIDECAR_STATUS_OK,
+    SidecarClaim hardlink_claim = claim_for("ROOT", "copy", "payload/copy",
+                                            SIDECAR_KIND_HARDLINK);
+    check(sidecar_log_append_claim(&log, &hardlink_claim) == SIDECAR_STATUS_OK &&
+              sidecar_log_append_entry(&log, &hardlink) == SIDECAR_STATUS_OK &&
+              sidecar_log_append_entry_commit(&log) == SIDECAR_STATUS_OK,
           "well-formed hardlink entry opens and commits");
     check(sidecar_log_live_count(&log) == 3,
           "committed hardlink entry is live");
@@ -447,7 +675,10 @@ static void test_truncated_tail(int container_fd)
     check(sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH,
           "tail log is created");
     SidecarEntry entry = entry_for("ROOT", "file", "payload/file", 4, 0);
-    check(sidecar_log_append_entry(&log, &entry) == SIDECAR_STATUS_OK &&
+    SidecarClaim entry_claim = claim_for("ROOT", "file", "payload/file",
+                                         SIDECAR_KIND_REGULAR);
+    check(sidecar_log_append_claim(&log, &entry_claim) == SIDECAR_STATUS_OK &&
+              sidecar_log_append_entry(&log, &entry) == SIDECAR_STATUS_OK &&
           sidecar_log_append_entry_commit(&log) == SIDECAR_STATUS_OK,
           "tail log receives a committed prefix");
     uint64_t boundary = 0;
@@ -490,7 +721,11 @@ static void test_truncated_tail(int container_fd)
           slot_size(container_fd, &adopted_boundary) == 0 &&
           adopted_boundary == boundary,
           "uncommitted group is discarded at adoption");
-    check(sidecar_log_append_entry(&log, &uncommitted) == SIDECAR_STATUS_OK &&
+    SidecarClaim uncommitted_claim = claim_for("ROOT", "tail", "payload/tail",
+                                               SIDECAR_KIND_REGULAR);
+    check(sidecar_log_append_claim(&log, &uncommitted_claim) ==
+              SIDECAR_STATUS_OK &&
+              sidecar_log_append_entry(&log, &uncommitted) == SIDECAR_STATUS_OK &&
           sidecar_log_append_entry_commit(&log) == SIDECAR_STATUS_OK &&
           sidecar_log_live_count(&log) == 2,
           "adopted log accepts a new group after discarding the tail");
@@ -504,7 +739,7 @@ static void test_interior_corruption_and_hardlink(int container_fd)
     check(reset_slot(container_fd) == 0, "corruption slot is absent");
     int fd = openat(container_fd, SIDECAR_SLOT_NAME,
                     O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-    static const unsigned char corrupt[] = SIDECAR_MAGIC "\0" "2\0UNKNOWN\0";
+    static const unsigned char corrupt[] = SIDECAR_MAGIC "\0" "3\0UNKNOWN\0";
     check(fd >= 0 && write_all_test(fd, corrupt, sizeof(corrupt) - 1U) == 0,
           "interior corruption fixture is written");
     if (fd >= 0)
@@ -566,6 +801,7 @@ int main(void)
     }
 
     test_fresh_and_live_map(container_fd);
+    test_claim_replay_and_transitions(container_fd);
     test_sequence_and_hardlink_guards(container_fd);
     test_hardlink_adopt_validation(container_fd);
     test_missing_and_slot_types(container_fd);

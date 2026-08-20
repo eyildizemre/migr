@@ -263,6 +263,15 @@ static int append_entries(SidecarLog *log, const SidecarEntry *entries,
 {
     for (size_t index = 0; index < count; index++)
     {
+        SidecarClaim claim = {
+            .root_id = entries[index].root_id,
+            .logical_path = entries[index].logical_path,
+            .physical_path = entries[index].physical_path,
+            .kind = entries[index].kind
+        };
+        if (entries[index].kind != SIDECAR_KIND_FIFO &&
+            sidecar_log_append_claim(log, &claim) != SIDECAR_STATUS_OK)
+            return -1;
         if (sidecar_log_append_entry(log, &entries[index]) != SIDECAR_STATUS_OK)
             return -1;
         if (entries[index].xattr_count != 0)
@@ -290,6 +299,25 @@ static int write_sidecar(Fixture *fixture, const SidecarEntry *entries,
         sidecar_log_close(&log) != SIDECAR_STATUS_OK)
         return -1;
     return 0;
+}
+
+static int write_raw_entry_sidecar(Fixture *fixture,
+                                   const SidecarEntry *entry)
+{
+    SidecarLog log = {0};
+    if (entry == NULL || sidecar_log_create_at(fixture->container_fd, &log) !=
+            SIDECAR_OPEN_FRESH || sidecar_log_close(&log) !=
+            SIDECAR_STATUS_OK)
+        return -1;
+    int fd = openat(fixture->container_fd, SIDECAR_SLOT_NAME,
+                    O_WRONLY | O_APPEND | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    int result = sidecar_write_entry(fd, entry) == 0 &&
+                 sidecar_write_entry_commit(fd) == 0;
+    if (close(fd) != 0)
+        result = 0;
+    return result ? 0 : -1;
 }
 
 static int append_raw_sidecar(Fixture *fixture, const unsigned char *data,
@@ -418,6 +446,51 @@ static void test_valid_and_profiles(void)
     fixture_close(&fixture);
 }
 
+static void test_outstanding_claim_gate(void)
+{
+    printf(BLUE "::" NC " outstanding claims are rejected before preflight probing\n");
+    ManifestRoot root = root_for("ROOT", "ROOT", "restored");
+    Fixture fixture;
+    int opened = fixture_open(&fixture, "claim-gate", &root, 1);
+    check(opened == 0, "claim-gate preflight fixture is created");
+    if (opened != 0)
+        return;
+    make_root_payload(&fixture);
+    write_file_at(fixture.data_fd, "ROOT/file", "hello");
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0),
+        entry_for("ROOT", "file", "file", SIDECAR_KIND_REGULAR, 5)
+    };
+    check(write_sidecar(&fixture, entries, 2) == 0,
+          "claim-gate preflight sidecar has valid live entries");
+    SidecarClaim outstanding = {
+        .root_id = text_bytes("ROOT"),
+        .logical_path = text_bytes("blocked"),
+        .physical_path = text_bytes("blocked"),
+        .kind = SIDECAR_KIND_REGULAR
+    };
+    SidecarLog log = {0};
+    check(sidecar_log_adopt_at(fixture.container_fd, &log) ==
+              SIDECAR_OPEN_RESUMABLE &&
+              sidecar_log_append_claim(&log, &outstanding) ==
+                  SIDECAR_STATUS_OK &&
+              sidecar_log_close(&log) == SIDECAR_STATUS_OK,
+          "an outstanding claim is planted in the valid sidecar");
+
+    char sentinel[PATH_MAX];
+    fixture_path(sentinel, sizeof(sentinel), fixture.home, "/sentinel");
+    write_file_at(fixture.home_fd, "sentinel", "untouched");
+    metadata_test_reset_probe_count();
+    PortableRestorePreflightReport report;
+    int result = run_preflight(&fixture, &report);
+    check(result != 0 && report.violation_count != 0 &&
+              metadata_test_probe_count() == 0 &&
+              file_equals(sentinel, "untouched"),
+          "preflight rejects the claim before destination probing or mutation");
+    portable_restore_preflight_report_free(&report);
+    fixture_close(&fixture);
+}
+
 static void test_missing_payload(void)
 {
     printf(BLUE "::" NC " committed key without payload\n");
@@ -454,14 +527,38 @@ static void run_refusal_case(const char *label, ManifestRoot *root,
         return;
     if (prepare != NULL)
         prepare(&fixture);
-    int sidecar_result = write_sidecar(&fixture, entries, entry_count);
+    int fifo_fixture = entries != NULL && entry_count == 1 &&
+                       entries[0].kind == SIDECAR_KIND_FIFO;
+    /* D25 excludes FIFO from claim kinds, and the wire parser rejects a raw
+     * FIFO CLAIM as corruption.  No valid v3 wire sequence can therefore
+     * reach collect_entry with FIFO; this raw entry must be rejected by the
+     * strict claimless adoption gate before "unsupported-kind". */
+    int sidecar_result = fifo_fixture
+        ? write_raw_entry_sidecar(&fixture, &entries[0])
+        : write_sidecar(&fixture, entries, entry_count);
     check(sidecar_result == 0, "refusal sidecar is committed");
+    if (fifo_fixture)
+    {
+        SidecarLog adopted = {0};
+        SidecarOpenStatus status = sidecar_log_adopt_at(
+            fixture.container_fd, &adopted);
+        if (status == SIDECAR_OPEN_RESUMABLE)
+            (void)sidecar_log_close(&adopted);
+        check(status == SIDECAR_OPEN_UNUSABLE,
+              "FIFO entry is rejected at the strict claim adoption gate");
+    }
     write_file_at(fixture.home_fd, "sentinel", "untouched");
     char sentinel[PATH_MAX];
     fixture_path(sentinel, sizeof(sentinel), fixture.home, "/sentinel");
     PortableRestorePreflightReport report;
-    check(run_preflight(&fixture, &report) != 0,
-          label);
+    int preflight_result = run_preflight(&fixture, &report);
+    if (fifo_fixture)
+        check(preflight_result != 0 && report.violation_count == 1 &&
+                  report.profiles.example_count == 1 &&
+                  strcmp(report.profiles.examples[0], "preflight") == 0,
+              "FIFO unsupported-kind is documented as unreachable after D25");
+    else
+        check(preflight_result != 0, label);
     check(file_equals(sentinel, "untouched"),
           "refusal leaves the destination sentinel untouched");
     portable_restore_preflight_report_free(&report);
@@ -961,6 +1058,7 @@ static void test_raw_nul_and_root_gap(void)
 int main(void)
 {
     test_valid_and_profiles();
+    test_outstanding_claim_gate();
     test_missing_payload();
     test_xattr_entry_acceptance();
     test_path_and_mapping_refusals();

@@ -541,6 +541,14 @@ static int append_entries(SidecarLog *log, const SidecarEntry *entries,
 {
     for (size_t index = 0; index < count; index++)
     {
+        SidecarClaim claim = {
+            .root_id = entries[index].root_id,
+            .logical_path = entries[index].logical_path,
+            .physical_path = entries[index].physical_path,
+            .kind = entries[index].kind
+        };
+        if (sidecar_log_append_claim(log, &claim) != SIDECAR_STATUS_OK)
+            return -1;
         if (sidecar_log_append_entry(log, &entries[index]) !=
                 SIDECAR_STATUS_OK ||
             sidecar_log_append_entry_commit(log) != SIDECAR_STATUS_OK)

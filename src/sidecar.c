@@ -22,6 +22,7 @@ static const char tag_entry[] = "ENTRY";
 static const char tag_xattr[] = "XATTR";
 static const char tag_entry_commit[] = "ENTRY_COMMIT";
 static const char tag_delete[] = "DELETE";
+static const char tag_claim[] = "CLAIM";
 
 static const char kind_regular[] = "regular";
 static const char kind_directory[] = "directory";
@@ -309,6 +310,10 @@ static int append_buffer(int fd, const SidecarBuffer *buffer,
         before = SIDECAR_TEST_BEFORE_DELETE;
         after = SIDECAR_TEST_AFTER_DELETE;
         middle = SIDECAR_TEST_MID_DELETE;
+    } else if (record_type == SIDECAR_RECORD_CLAIM) {
+        before = SIDECAR_TEST_BEFORE_CLAIM;
+        after = SIDECAR_TEST_AFTER_CLAIM;
+        middle = SIDECAR_TEST_MID_CLAIM;
     }
     if (before != SIDECAR_TEST_INTERRUPT_NONE &&
         sidecar_test_interrupt_point == (sig_atomic_t)before)
@@ -418,6 +423,28 @@ static int validate_delete(const SidecarDelete *deletion)
     return 0;
 }
 
+static int claim_kind_valid(SidecarObjectKind kind)
+{
+    return kind == SIDECAR_KIND_REGULAR ||
+           kind == SIDECAR_KIND_DIRECTORY ||
+           kind == SIDECAR_KIND_SYMLINK ||
+           kind == SIDECAR_KIND_HARDLINK;
+}
+
+static int validate_claim(const SidecarClaim *claim)
+{
+    if (claim == NULL ||
+        validate_bytes(claim->root_id, SIDECAR_MAX_ROOT_ID, 1) != 0 ||
+        validate_bytes(claim->logical_path, SIDECAR_MAX_PATH, 0) != 0 ||
+        validate_bytes(claim->physical_path, SIDECAR_MAX_PATH, 0) != 0 ||
+        !claim_kind_valid(claim->kind))
+    {
+        set_invalid_error();
+        return -1;
+    }
+    return 0;
+}
+
 static int build_entry_buffer(const SidecarEntry *entry, SidecarBuffer *buffer)
 {
     if (validate_entry(entry) != 0)
@@ -466,6 +493,26 @@ static int build_xattr_buffer(const SidecarXattr *xattr, SidecarBuffer *buffer)
         buffer_append_field(buffer, xattr->name) != 0 ||
         buffer_append_uint(buffer, xattr->value.length) != 0 ||
         buffer_append(buffer, xattr->value.data, xattr->value.length) != 0)
+        return -1;
+    return 0;
+}
+
+static int build_claim_buffer(const SidecarClaim *claim, SidecarBuffer *buffer)
+{
+    if (validate_claim(claim) != 0)
+        return -1;
+    const char *kind = sidecar_object_kind_name(claim->kind);
+    if (kind == NULL)
+    {
+        set_invalid_error();
+        return -1;
+    }
+    if (buffer_append_tag(buffer, tag_claim) != 0 ||
+        buffer_append_field(buffer, claim->root_id) != 0 ||
+        buffer_append_field(buffer, claim->logical_path) != 0 ||
+        buffer_append_field(buffer, claim->physical_path) != 0 ||
+        buffer_append_field(buffer, (SidecarBytes){
+            (const unsigned char *)kind, strlen(kind) }) != 0)
         return -1;
     return 0;
 }
@@ -535,6 +582,16 @@ int sidecar_write_delete(int fd, const SidecarDelete *deletion)
         buffer_append_field(&buffer, deletion->root_id) == 0 &&
         buffer_append_field(&buffer, deletion->logical_path) == 0)
         result = append_buffer(fd, &buffer, SIDECAR_RECORD_DELETE);
+    buffer_free(&buffer);
+    return result;
+}
+
+int sidecar_write_claim(int fd, const SidecarClaim *claim)
+{
+    SidecarBuffer buffer = {0};
+    int result = -1;
+    if (build_claim_buffer(claim, &buffer) == 0)
+        result = append_buffer(fd, &buffer, SIDECAR_RECORD_CLAIM);
     buffer_free(&buffer);
     return result;
 }
@@ -1024,6 +1081,57 @@ static void free_delete(SidecarReader *reader, SidecarDelete *deletion)
     memset(deletion, 0, sizeof(*deletion));
 }
 
+static void free_claim(SidecarReader *reader, SidecarClaim *claim);
+
+static SidecarStatus parse_claim(SidecarReader *reader, SidecarClaim *claim)
+{
+    memset(claim, 0, sizeof(*claim));
+    SidecarStatus status = read_required_field(reader, SIDECAR_MAX_ROOT_ID,
+                                               &claim->root_id);
+    if (status != SIDECAR_STATUS_OK)
+        goto fail;
+    status = read_required_field(reader, SIDECAR_MAX_PATH,
+                                 &claim->logical_path);
+    if (status != SIDECAR_STATUS_OK)
+        goto fail;
+    status = read_required_field(reader, SIDECAR_MAX_PATH,
+                                 &claim->physical_path);
+    if (status != SIDECAR_STATUS_OK)
+        goto fail;
+
+    SidecarBytes kind_field;
+    status = read_required_field(reader, SIDECAR_KIND_MAX, &kind_field);
+    if (status != SIDECAR_STATUS_OK)
+        goto fail;
+    if (sidecar_object_kind_parse(kind_field, &claim->kind) != 0)
+    {
+        reader_free(reader, (void *)kind_field.data);
+        status = SIDECAR_STATUS_CORRUPT;
+        goto fail;
+    }
+    reader_free(reader, (void *)kind_field.data);
+    if (claim->root_id.length == 0 || !claim_kind_valid(claim->kind))
+    {
+        status = SIDECAR_STATUS_CORRUPT;
+        goto fail;
+    }
+    return SIDECAR_STATUS_OK;
+
+fail:
+    free_claim(reader, claim);
+    return status;
+}
+
+static void free_claim(SidecarReader *reader, SidecarClaim *claim)
+{
+    if (claim == NULL)
+        return;
+    reader_free(reader, (void *)claim->root_id.data);
+    reader_free(reader, (void *)claim->logical_path.data);
+    reader_free(reader, (void *)claim->physical_path.data);
+    memset(claim, 0, sizeof(*claim));
+}
+
 static SidecarStatus parse_unsigned(SidecarBytes field, uint64_t maximum,
                                     uint64_t *out);
 
@@ -1199,6 +1307,31 @@ static SidecarStatus parse_fd_internal(SidecarReader *reader,
                 break;
             }
             free_delete(reader, &deletion);
+            result->last_valid_boundary = reader->consumed;
+        }
+        else if (bytes_equal(tag, tag_claim))
+        {
+            reader_free(reader, (void *)tag.data);
+            if (has_pending)
+            {
+                status = SIDECAR_STATUS_CORRUPT;
+                break;
+            }
+            SidecarClaim claim;
+            status = parse_claim(reader, &claim);
+            if (status != SIDECAR_STATUS_OK)
+                break;
+            SidecarRecord record = {
+                .type = SIDECAR_RECORD_CLAIM,
+                .value.claim = claim
+            };
+            if (callback != NULL && callback(&record, context) != 0)
+            {
+                free_claim(reader, &claim);
+                status = SIDECAR_STATUS_CALLBACK;
+                break;
+            }
+            free_claim(reader, &claim);
             result->last_valid_boundary = reader->consumed;
         }
         else

@@ -1,5 +1,5 @@
-// Unit tests for the sidecar v2 codec (docs/DECISIONS.md D17/D21/D22): magic/version
-// header, ENTRY/XATTR/ENTRY_COMMIT/DELETE record framing, canonical numeric
+// Unit tests for the sidecar v3 codec (docs/DECISIONS.md D17/D21/D22/D25): magic/version
+// header, ENTRY/XATTR/ENTRY_COMMIT/DELETE/CLAIM record framing, canonical numeric
 // parsing, and every SIDECAR_MAX_* ceiling declared there. This is the codec
 // alone -- no live-state map, no resume, no adopt; that stateful layer is a
 // separate step built on top of this one.
@@ -168,6 +168,17 @@ static int append_commit(RawBuffer *buffer)
     return raw_tag(buffer, "ENTRY_COMMIT");
 }
 
+static int append_claim(RawBuffer *buffer, const char *root,
+                        const char *logical, const char *physical,
+                        const char *kind)
+{
+    return raw_tag(buffer, "CLAIM") == 0 &&
+           raw_text_field(buffer, root) == 0 &&
+           raw_text_field(buffer, logical) == 0 &&
+           raw_text_field(buffer, physical) == 0 &&
+           raw_text_field(buffer, kind) == 0 ? 0 : -1;
+}
+
 static int set_raw_file(int fd, const RawBuffer *buffer)
 {
     return reset_file(fd) == 0 &&
@@ -202,6 +213,7 @@ typedef struct {
     int xattrs;
     int commits;
     int deletes;
+    int claims;
     int valid;
 } RoundTripState;
 
@@ -241,6 +253,19 @@ static int roundtrip_callback(const SidecarRecord *record, void *context)
             memcmp(record->value.deletion.logical_path.data, "dir/file", 8) != 0)
             state->valid = 0;
     }
+    else if (record->type == SIDECAR_RECORD_CLAIM)
+    {
+        const SidecarClaim *claim = &record->value.claim;
+        state->claims++;
+        if (claim->root_id.length != 4 ||
+            memcmp(claim->root_id.data, "ROOT", 4) != 0 ||
+            claim->logical_path.length != 8 ||
+            memcmp(claim->logical_path.data, "dir/file", 8) != 0 ||
+            claim->physical_path.length != 12 ||
+            memcmp(claim->physical_path.data, "payload/file", 12) != 0 ||
+            claim->kind != SIDECAR_KIND_REGULAR)
+            state->valid = 0;
+    }
     return 0;
 }
 
@@ -252,7 +277,7 @@ static void test_header_and_roundtrip(int fd)
 
     unsigned char actual[32] = {0};
     ssize_t count = pread(fd, actual, sizeof(actual), 0);
-    const unsigned char expected[] = SIDECAR_MAGIC "\0" "2\0";
+    const unsigned char expected[] = SIDECAR_MAGIC "\0" "3\0";
     check(count == (ssize_t)sizeof(expected) - 1 &&
           memcmp(actual, expected, sizeof(expected) - 1U) == 0,
           "header bytes are byte-exact");
@@ -267,6 +292,13 @@ static void test_header_and_roundtrip(int fd)
         .root_id = { (const unsigned char *)"ROOT", 4 },
         .logical_path = { (const unsigned char *)"dir/file", 8 }
     };
+    SidecarClaim claim = {
+        .root_id = { (const unsigned char *)"ROOT", 4 },
+        .logical_path = { (const unsigned char *)"dir/file", 8 },
+        .physical_path = { (const unsigned char *)"payload/file", 12 },
+        .kind = SIDECAR_KIND_REGULAR
+    };
+    check(sidecar_write_claim(fd, &claim) == 0, "CLAIM writes");
     check(sidecar_write_entry(fd, &entry) == 0, "ENTRY writes");
     check(sidecar_write_xattr(fd, &xattr) == 0, "binary XATTR writes");
     check(sidecar_write_entry_commit(fd) == 0, "ENTRY_COMMIT writes");
@@ -277,10 +309,10 @@ static void test_header_and_roundtrip(int fd)
     SidecarStatus status = sidecar_parse_fd(fd, roundtrip_callback, &state, &result);
     check(status == SIDECAR_STATUS_OK, "complete log parses successfully");
     check(state.valid && state.entries == 1 && state.xattrs == 1 &&
-          state.commits == 1 && state.deletes == 1,
+          state.commits == 1 && state.deletes == 1 && state.claims == 1,
           "all records round-trip through the callback");
     check(result.last_valid_boundary == result.bytes_read &&
-          result.records_read == 4,
+          result.records_read == 5,
           "clean EOF boundary is the complete file");
     check(result.allocation_peak > 0 && result.allocation_peak <= SIDECAR_MAX_ALLOC_BUDGET,
           "parser allocation remains within the published budget");
@@ -368,6 +400,78 @@ done:
     free(path);
     free(name);
     free(value);
+}
+
+static void test_claim_writer_validation(int fd)
+{
+    printf(BLUE "::" NC " CLAIM writer validation and ceilings\n");
+    char *root = malloc(SIDECAR_MAX_ROOT_ID + 1U);
+    char *path = malloc(SIDECAR_MAX_PATH + 1U);
+    check(root != NULL && path != NULL, "claim ceiling fixtures allocate");
+    if (root == NULL || path == NULL)
+    {
+        free(root);
+        free(path);
+        return;
+    }
+    memset(root, 'r', SIDECAR_MAX_ROOT_ID + 1U);
+    memset(path, 'p', SIDECAR_MAX_PATH + 1U);
+
+    SidecarClaim claim = {
+        .root_id = { (const unsigned char *)root, SIDECAR_MAX_ROOT_ID },
+        .logical_path = { NULL, 0 },
+        .physical_path = { NULL, 0 },
+        .kind = SIDECAR_KIND_DIRECTORY
+    };
+    check(reset_file(fd) == 0 && sidecar_write_header(fd) == 0 &&
+          sidecar_write_claim(fd, &claim) == 0,
+          "claim root id at its ceiling is accepted");
+    claim.root_id.length++;
+    errno = 0;
+    check(sidecar_write_claim(fd, &claim) != 0 && errno == EINVAL,
+          "claim root id over ceiling is refused");
+
+    claim.root_id.length = SIDECAR_MAX_ROOT_ID;
+    claim.logical_path = (SidecarBytes){ (const unsigned char *)path,
+                                         SIDECAR_MAX_PATH };
+    check(reset_file(fd) == 0 && sidecar_write_header(fd) == 0 &&
+          sidecar_write_claim(fd, &claim) == 0,
+          "claim logical path at its ceiling is accepted");
+    claim.logical_path.length++;
+    errno = 0;
+    check(sidecar_write_claim(fd, &claim) != 0 && errno == EINVAL,
+          "claim logical path over ceiling is refused");
+
+    claim.logical_path.length = SIDECAR_MAX_PATH;
+    claim.physical_path = (SidecarBytes){ (const unsigned char *)path,
+                                          SIDECAR_MAX_PATH };
+    check(reset_file(fd) == 0 && sidecar_write_header(fd) == 0 &&
+          sidecar_write_claim(fd, &claim) == 0,
+          "claim physical path at its ceiling is accepted");
+    claim.physical_path.length++;
+    errno = 0;
+    check(sidecar_write_claim(fd, &claim) != 0 && errno == EINVAL,
+          "claim physical path over ceiling is refused");
+
+    claim.root_id = (SidecarBytes){ (const unsigned char *)"ROOT", 4 };
+    claim.logical_path = (SidecarBytes){ (const unsigned char *)"logical", 7 };
+    claim.physical_path = (SidecarBytes){ (const unsigned char *)"physical", 8 };
+    claim.kind = SIDECAR_KIND_FIFO;
+    errno = 0;
+    check(reset_file(fd) == 0 && sidecar_write_header(fd) == 0 &&
+          sidecar_write_claim(fd, &claim) != 0 && errno == EINVAL,
+          "FIFO claim kind is refused");
+
+    static const unsigned char nul_root[] = { 'R', 'O', 'O', '\0', 'T' };
+    claim.kind = SIDECAR_KIND_REGULAR;
+    claim.root_id = (SidecarBytes){ nul_root, sizeof(nul_root) };
+    errno = 0;
+    check(reset_file(fd) == 0 && sidecar_write_header(fd) == 0 &&
+          sidecar_write_claim(fd, &claim) != 0 && errno == EINVAL,
+          "NUL-containing claim fields are refused");
+
+    free(root);
+    free(path);
 }
 
 typedef struct {
@@ -649,7 +753,7 @@ static void test_tail_and_boundary(int fd)
 {
     printf(BLUE "::" NC " sidecar tail recovery and boundaries\n");
     RawBuffer buffer = {0};
-    check(append_header(&buffer, "2") == 0 &&
+    check(append_header(&buffer, "3") == 0 &&
           append_regular_entry(&buffer, "420", "0") == 0 &&
           append_commit(&buffer) == 0,
           "valid prefix fixture is built");
@@ -666,9 +770,30 @@ static void test_tail_and_boundary(int fd)
     check(result.last_valid_boundary == boundary,
           "tail recovery returns the last committed boundary");
 
+    check(set_raw_file(fd, &buffer) == 0, "claim tail prefix is restored");
+    static const unsigned char partial_claim[] = "CLAIM\0ROOT\0dir";
+    check(write_all_test(fd, partial_claim, sizeof(partial_claim) - 1U) == 0,
+          "partial CLAIM is appended");
+    status = sidecar_parse_fd(fd, NULL, NULL, &result);
+    check(status == SIDECAR_STATUS_TRUNCATED_TAIL &&
+              result.last_valid_boundary == boundary,
+          "incomplete CLAIM is a truncated tail at the prior boundary");
+
+    RawBuffer complete_claim = {0};
+    check(append_header(&complete_claim, "3") == 0 &&
+              append_claim(&complete_claim, "ROOT", "dir/file",
+                           "payload/file", "regular") == 0 &&
+              set_raw_file(fd, &complete_claim) == 0,
+          "complete CLAIM boundary fixture is written");
+    status = sidecar_parse_fd(fd, NULL, NULL, &result);
+    check(status == SIDECAR_STATUS_OK &&
+              result.last_valid_boundary == result.bytes_read,
+          "complete CLAIM advances the valid boundary");
+    raw_free(&complete_claim);
+
     check(set_raw_file(fd, &buffer) == 0, "prefix is restored");
     RawBuffer uncommitted = {0};
-    check(append_header(&uncommitted, "2") == 0 &&
+    check(append_header(&uncommitted, "3") == 0 &&
           append_regular_entry(&uncommitted, "420", "0") == 0 &&
           set_raw_file(fd, &uncommitted) == 0,
           "uncommitted group is written");
@@ -695,6 +820,17 @@ static void test_corruption_and_versions(int fd)
     check(status == SIDECAR_STATUS_UNKNOWN_VERSION,
           "unknown version is not treated as an empty sidecar");
 
+    raw_free(&buffer);
+    memset(&buffer, 0, sizeof(buffer));
+    check(append_header(&buffer, "2") == 0 &&
+              append_claim(&buffer, "ROOT", "dir/file", "payload/file",
+                           "regular") == 0 &&
+              set_raw_file(fd, &buffer) == 0,
+          "v2 CLAIM fixture is written");
+    status = sidecar_parse_fd(fd, NULL, NULL, &result);
+    check(status == SIDECAR_STATUS_UNKNOWN_VERSION,
+          "v2 CLAIM is refused at the v3 version boundary");
+
     check(reset_file(fd) == 0 &&
           write_all_test(fd, (const unsigned char *)"MIGR_SIDECAR\0", 13) == 0 &&
           write_all_test(fd, (const unsigned char *)"01\0", 3) == 0,
@@ -705,7 +841,7 @@ static void test_corruption_and_versions(int fd)
 
     raw_free(&buffer);
     memset(&buffer, 0, sizeof(buffer));
-    check(append_header(&buffer, "2") == 0 &&
+    check(append_header(&buffer, "3") == 0 &&
           append_regular_entry(&buffer, "0420", "0") == 0 &&
           append_commit(&buffer) == 0 && set_raw_file(fd, &buffer) == 0,
           "non-canonical numeric fixture is written");
@@ -715,12 +851,62 @@ static void test_corruption_and_versions(int fd)
 
     raw_free(&buffer);
     memset(&buffer, 0, sizeof(buffer));
-    check(append_header(&buffer, "2") == 0 && raw_tag(&buffer, "UNKNOWN") == 0 &&
+    check(append_header(&buffer, "3") == 0 && raw_tag(&buffer, "UNKNOWN") == 0 &&
           set_raw_file(fd, &buffer) == 0,
           "unknown tag fixture is written");
     status = sidecar_parse_fd(fd, NULL, NULL, &result);
     check(status == SIDECAR_STATUS_CORRUPT,
           "unknown record tag is interior corruption");
+    raw_free(&buffer);
+
+    memset(&buffer, 0, sizeof(buffer));
+    check(append_header(&buffer, "3") == 0 &&
+              append_claim(&buffer, "ROOT", "dir/file", "payload/file",
+                           "fifo") == 0 && set_raw_file(fd, &buffer) == 0,
+          "unsupported CLAIM kind fixture is written");
+    status = sidecar_parse_fd(fd, NULL, NULL, &result);
+    check(status == SIDECAR_STATUS_CORRUPT,
+          "FIFO CLAIM kind is corruption");
+
+    raw_free(&buffer);
+    memset(&buffer, 0, sizeof(buffer));
+    check(append_header(&buffer, "3") == 0 && raw_tag(&buffer, "ENTRY") == 0 &&
+              raw_text_field(&buffer, "ROOT") == 0 &&
+              raw_text_field(&buffer, "dir/file") == 0 &&
+              raw_text_field(&buffer, "payload/file") == 0 &&
+              raw_text_field(&buffer, "") == 0 &&
+              raw_text_field(&buffer, "regular") == 0 &&
+              raw_text_field(&buffer, "0") == 0 &&
+              raw_text_field(&buffer, "0") == 0 &&
+              raw_text_field(&buffer, "0") == 0 &&
+              raw_text_field(&buffer, "0") == 0 &&
+              raw_text_field(&buffer, "0") == 0 &&
+              raw_text_field(&buffer, "0") == 0 &&
+              raw_text_field(&buffer, "0") == 0 &&
+              raw_text_field(&buffer, "0") == 0 &&
+              raw_tag(&buffer, "CLAIM") == 0 &&
+              raw_text_field(&buffer, "ROOT") == 0 &&
+              raw_text_field(&buffer, "dir/file") == 0 &&
+              raw_text_field(&buffer, "payload/file") == 0 &&
+              raw_text_field(&buffer, "regular") == 0 &&
+              set_raw_file(fd, &buffer) == 0,
+          "CLAIM inside an open ENTRY group is written");
+    status = sidecar_parse_fd(fd, NULL, NULL, &result);
+    check(status == SIDECAR_STATUS_CORRUPT,
+          "CLAIM inside an open ENTRY group is corruption");
+
+    raw_free(&buffer);
+    memset(&buffer, 0, sizeof(buffer));
+    check(append_header(&buffer, "3") == 0 && raw_tag(&buffer, "CLAIM") == 0 &&
+              raw_text_field(&buffer, "ROOT") == 0 &&
+              raw_text_field(&buffer, "dir/file") == 0 &&
+              raw_text_field(&buffer, "regular") == 0 &&
+              raw_text_field(&buffer, "payload/file") == 0 &&
+              set_raw_file(fd, &buffer) == 0,
+          "out-of-order CLAIM fields are written");
+    status = sidecar_parse_fd(fd, NULL, NULL, &result);
+    check(status == SIDECAR_STATUS_CORRUPT,
+          "out-of-order CLAIM fields are corruption");
     raw_free(&buffer);
 }
 
@@ -739,7 +925,7 @@ static void test_symlink_kind_parsing(int fd)
 {
     printf(BLUE "::" NC " sidecar symlink grammar\n");
     RawBuffer buffer = {0};
-    check(append_header(&buffer, "2") == 0 && raw_tag(&buffer, "ENTRY") == 0 &&
+    check(append_header(&buffer, "3") == 0 && raw_tag(&buffer, "ENTRY") == 0 &&
           raw_text_field(&buffer, "ROOT") == 0 &&
           raw_text_field(&buffer, "link") == 0 &&
           raw_text_field(&buffer, "payload/link") == 0 &&
@@ -807,6 +993,7 @@ int main(void)
 
     test_header_and_roundtrip(fd);
     test_writer_validation(fd);
+    test_claim_writer_validation(fd);
     test_collision_suffix(fd);
     test_symlink_and_hardlink_writer(fd);
     test_tail_and_boundary(fd);

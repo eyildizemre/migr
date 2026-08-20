@@ -2024,7 +2024,24 @@ happens, is separate work.
 
 ## D25 — 2026-08-20 — Portable resume uses write-ahead ownership claims
 
-**Status:** Decided (implementation pending)
+**Status:** Implemented
+
+### As-built (2026-08-21)
+
+On the Fedora Linux 44 host, the complete suite passed with `make clean &&
+make test`, `make check-strict` (GCC and Clang), `make check-analyze`, and
+`make check-valgrind`. `make check-sanitize`, the sanitizer stage of `make
+check`, was also run; its first test stopped before any assertion because
+LeakSanitizer cannot run under this host's ptrace execution environment. An
+equivalent ASan/UBSan full-suite run with `detect_leaks=0` passed; that confirms sanitizer
+execution but does not provide leak validation. The 15-row D25 acceptance
+matrix is fully evidenced: codec and tail boundaries; replay/state transitions;
+per-kind fresh and SIGKILL recovery, including the nested three-CLAIM
+ancestor case; replacement, stale cleanup, collision and hardlink recovery;
+repeated interruption; zero-claim capture and restore gates; and foreign-node
+refusal. Production portable dispatch is already active on this branch through
+D24; D25 changes neither representation selection nor dispatch. The real-vfat
+SIGKILL/resume VM gate remains separate, deferred host/VM smoke-test work.
 
 **Decision:** Portable capture closes the interval between payload mutation and
 the sidecar's normal live-state commit with a standalone, write-ahead

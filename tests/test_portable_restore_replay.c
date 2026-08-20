@@ -257,6 +257,14 @@ static int append_entries(SidecarLog *log, const SidecarEntry *entries,
 {
     for (size_t index = 0; index < count; index++)
     {
+        SidecarClaim claim = {
+            .root_id = entries[index].root_id,
+            .logical_path = entries[index].logical_path,
+            .physical_path = entries[index].physical_path,
+            .kind = entries[index].kind
+        };
+        if (sidecar_log_append_claim(log, &claim) != SIDECAR_STATUS_OK)
+            return -1;
         if (sidecar_log_append_entry(log, &entries[index]) !=
                 SIDECAR_STATUS_OK ||
             (entries[index].xattr_count != 0 &&
@@ -843,6 +851,52 @@ static void test_normal_replay(void)
     fixture_close(&fixture);
 }
 
+static void test_outstanding_claim_gate(void)
+{
+    printf(BLUE "::" NC " outstanding claims are rejected before replay\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "claim-gate replay fixture is created");
+    if (opened != 0)
+        return;
+    make_dir_at(fixture.data_fd, "ROOT", 0700);
+    write_file_at(fixture.data_fd, "ROOT/file", "payload");
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000200, 1, 1700000201, 2),
+        entry_for("ROOT", "file", "file", SIDECAR_KIND_REGULAR, 7, 0600,
+                  1700000202, 3, 1700000203, 4)
+    };
+    check(write_sidecar(&fixture, entries, 2, NULL, NULL) == 0,
+          "claim-gate replay sidecar has valid live entries");
+    SidecarClaim outstanding = {
+        .root_id = text_bytes("ROOT"),
+        .logical_path = text_bytes("blocked"),
+        .physical_path = text_bytes("blocked"),
+        .kind = SIDECAR_KIND_REGULAR
+    };
+    SidecarLog log = {0};
+    check(sidecar_log_adopt_at(fixture.container_fd, &log) ==
+              SIDECAR_OPEN_RESUMABLE &&
+              sidecar_log_append_claim(&log, &outstanding) ==
+                  SIDECAR_STATUS_OK &&
+              sidecar_log_close(&log) == SIDECAR_STATUS_OK,
+          "an outstanding claim is planted in the valid sidecar");
+
+    write_file_at(fixture.home_fd, "sentinel", "untouched");
+    PortableRestoreReplayReport report;
+    int result = run_replay(&fixture, &report);
+    check(result != 0 && report.live_count == 0 &&
+              report.failed_count == 1,
+          "replay rejects the claim before collecting or mutating entries");
+    char sentinel[PATH_MAX];
+    path_join(sentinel, sizeof(sentinel), fixture.home, "/sentinel");
+    check(file_equals_noatime(sentinel, "untouched"),
+          "claim-gate replay leaves the destination untouched");
+    fixture_close(&fixture);
+}
+
 static void test_xattr_replay(void)
 {
     printf(BLUE "::" NC " replay applies the payload's exact xattr set\n");
@@ -1127,6 +1181,7 @@ int main(void)
     test_physical_logical_mismatch();
     test_collision_suffix_validation();
     test_normal_replay();
+    test_outstanding_claim_gate();
     test_xattr_replay();
     test_xattr_reconciliation();
     test_gate_refuses_trusted_before_mutation();

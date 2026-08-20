@@ -62,6 +62,30 @@ static void check(int condition, const char *label)
     }
 }
 
+typedef struct {
+    size_t count;
+    int valid;
+    uint64_t expected_generation;
+} ClaimForeachResult;
+
+static int claim_foreach_callback(const SidecarClaimView *view, void *argument)
+{
+    ClaimForeachResult *result = argument;
+    if (result == NULL || view == NULL || view->claim == NULL)
+        return 1;
+    result->count++;
+    if (view->claim->root_id.length != 4U ||
+        memcmp(view->claim->root_id.data, "ITER", 4) != 0 ||
+        view->claim->logical_path.length != 5U ||
+        memcmp(view->claim->logical_path.data, "claim", 5) != 0 ||
+        view->claim->physical_path.length != 13U ||
+        memcmp(view->claim->physical_path.data, "payload/claim", 13) != 0 ||
+        view->claim->kind != SIDECAR_KIND_REGULAR ||
+        view->generation != result->expected_generation)
+        result->valid = 0;
+    return 0;
+}
+
 static void skip_check(const char *label)
 {
     printf("  " YELLOW "-" NC " %s\n", label);
@@ -152,6 +176,15 @@ typedef struct {
     int container_fd;
 } Fixture;
 
+typedef struct {
+    char source[PATH_MAX];
+    char container[PATH_MAX];
+    char payload_claimed[PATH_MAX];
+    PortableRootSpec root;
+    PortableCaptureRequest request;
+    int container_fd;
+} ClaimDirectoryFixture;
+
 static int prepare_fixture(const char *base, const char *label,
                            Fixture *fixture)
 {
@@ -218,6 +251,156 @@ static void close_fixture(Fixture *fixture)
         close(fixture->container_fd);
         fixture->container_fd = -1;
     }
+}
+
+static int prepare_claim_directory_fixture(const char *base,
+                                           const char *label, int nested,
+                                           ClaimDirectoryFixture *fixture)
+{
+    if (base == NULL || label == NULL || fixture == NULL)
+        return -1;
+    memset(fixture, 0, sizeof(*fixture));
+    fixture->container_fd = -1;
+    int source_length = snprintf(fixture->source, sizeof(fixture->source),
+                                 "%s/%s-source", base, label);
+    int container_length = snprintf(fixture->container,
+                                    sizeof(fixture->container),
+                                    "%s/%s-container", base, label);
+    if (source_length < 0 || container_length < 0 ||
+        (size_t)source_length >= sizeof(fixture->source) ||
+        (size_t)container_length >= sizeof(fixture->container))
+        return -1;
+    make_directory(fixture->source);
+    make_directory(fixture->container);
+
+    char keep[PATH_MAX];
+    char claimed[PATH_MAX];
+    join_path(keep, sizeof(keep), fixture->source, "keep");
+    join_path(claimed, sizeof(claimed), fixture->source, "claimed");
+    write_file(keep, "keep");
+    make_directory(claimed);
+    if (nested) {
+        char child[PATH_MAX];
+        join_path(child, sizeof(child), claimed, "child");
+        write_file(child, "child");
+    }
+
+    fixture->root = (PortableRootSpec){
+        .id = "ROOT",
+        .policy = ROOT_POLICY_HOME_RELATIVE,
+        .capture_path = fixture->source,
+        .payload_path = "ROOT",
+        .source_path = fixture->source,
+        .restore_path = "fixture",
+        .has_restore_path = 1
+    };
+    fixture->request = (PortableCaptureRequest){
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .has_source_identity = 1,
+        .machine_id = "c7a1",
+        .source_uid = getuid(),
+        .roots = &fixture->root,
+        .root_count = 1,
+        .nsec_exact = 1
+    };
+    fixture->container_fd = open(fixture->container,
+                                 O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fixture->container_fd < 0)
+        return -1;
+    if (portable_capture_fresh_at(fixture->container_fd, &fixture->request,
+                                  NULL) != 0) {
+        close(fixture->container_fd);
+        fixture->container_fd = -1;
+        return -1;
+    }
+    join_path(fixture->payload_claimed, sizeof(fixture->payload_claimed),
+              fixture->container, "data/ROOT/claimed");
+    return 0;
+}
+
+static int convert_directory_to_claim(const ClaimDirectoryFixture *fixture)
+{
+    if (fixture == NULL || fixture->container_fd < 0)
+        return -1;
+    SidecarLog log = {0};
+    if (sidecar_log_adopt_at(fixture->container_fd, &log) !=
+        SIDECAR_OPEN_RESUMABLE)
+        return -1;
+    SidecarDelete deletion = {
+        .root_id = { (const unsigned char *)"ROOT", 4 },
+        .logical_path = { (const unsigned char *)"claimed", 7 }
+    };
+    SidecarClaim claim = {
+        .root_id = { (const unsigned char *)"ROOT", 4 },
+        .logical_path = { (const unsigned char *)"claimed", 7 },
+        .physical_path = { (const unsigned char *)"claimed", 7 },
+        .kind = SIDECAR_KIND_DIRECTORY
+    };
+    int result = sidecar_log_append_delete(&log, &deletion) ==
+                     SIDECAR_STATUS_OK &&
+                 sidecar_log_append_claim(&log, &claim) == SIDECAR_STATUS_OK;
+    if (sidecar_log_close(&log) != SIDECAR_STATUS_OK)
+        result = 0;
+    return result ? 0 : -1;
+}
+
+static int outstanding_claim_count(int container_fd)
+{
+    SidecarLog log = {0};
+    if (sidecar_log_adopt_at(container_fd, &log) != SIDECAR_OPEN_RESUMABLE)
+        return -1;
+    size_t count = sidecar_log_claim_count(&log);
+    if (sidecar_log_close(&log) != SIDECAR_STATUS_OK)
+        return -1;
+    return count > INT_MAX ? -1 : (int)count;
+}
+
+static void test_claim_foreach(const char *base)
+{
+    printf(BLUE "::" NC " outstanding CLAIM iteration\n");
+    Fixture fixture;
+    check(prepare_fixture(base, "claim-foreach", &fixture) == 0,
+          "claim foreach fixture is captured");
+    if (fixture.container_fd < 0)
+        return;
+
+    SidecarLog log = {0};
+    SidecarClaim first = {
+        .root_id = { (const unsigned char *)"ITER", 4 },
+        .logical_path = { (const unsigned char *)"gone", 4 },
+        .physical_path = { (const unsigned char *)"payload/gone", 12 },
+        .kind = SIDECAR_KIND_REGULAR
+    };
+    SidecarClaim second = {
+        .root_id = { (const unsigned char *)"ITER", 4 },
+        .logical_path = { (const unsigned char *)"claim", 5 },
+        .physical_path = { (const unsigned char *)"payload/claim", 13 },
+        .kind = SIDECAR_KIND_REGULAR
+    };
+    SidecarDelete cancel = {
+        .root_id = { (const unsigned char *)"ITER", 4 },
+        .logical_path = { (const unsigned char *)"gone", 4 }
+    };
+    ClaimForeachResult result = { .valid = 1 };
+    int setup = sidecar_log_adopt_at(fixture.container_fd, &log) ==
+                    SIDECAR_OPEN_RESUMABLE &&
+                sidecar_log_append_claim(&log, &first) == SIDECAR_STATUS_OK &&
+                sidecar_log_append_claim(&log, &second) == SIDECAR_STATUS_OK &&
+                sidecar_log_append_delete(&log, &cancel) == SIDECAR_STATUS_OK;
+    SidecarClaimView surviving = {0};
+    if (setup && sidecar_log_find_claim(
+                     &log,
+                     (SidecarBytes){ (const unsigned char *)"ITER", 4 },
+                     (SidecarBytes){ (const unsigned char *)"claim", 5 },
+                     &surviving) == 1)
+        result.expected_generation = surviving.generation;
+    int iterated = setup && result.expected_generation != 0U &&
+                   sidecar_log_claim_foreach(&log, claim_foreach_callback,
+                                             &result) == SIDECAR_STATUS_OK;
+    check(iterated && result.count == 1U && result.valid &&
+              sidecar_log_close(&log) == SIDECAR_STATUS_OK,
+          "claim iteration visits only the outstanding claim with its generation");
+    close_fixture(&fixture);
 }
 
 static int sidecar_state(const Fixture *fixture, const char *logical,
@@ -424,6 +607,103 @@ static void test_deleted_subtree(const char *base)
     close(container_fd);
 }
 
+static void remove_claimed_source(const ClaimDirectoryFixture *fixture,
+                                  int nested)
+{
+    char source_claimed[PATH_MAX];
+    join_path(source_claimed, sizeof(source_claimed), fixture->source,
+              "claimed");
+    if (nested) {
+        char source_child[PATH_MAX];
+        join_path(source_child, sizeof(source_child), source_claimed, "child");
+        if (unlink(source_child) != 0)
+            fixture_fatal("could not remove claimed source child");
+    }
+    if (rmdir(source_claimed) != 0)
+        fixture_fatal("could not remove claimed source directory");
+}
+
+static void test_stale_empty_claim(const char *base)
+{
+    printf(BLUE "::" NC " stale empty CLAIM reconciliation\n");
+    ClaimDirectoryFixture fixture;
+    check(prepare_claim_directory_fixture(base, "claim-empty", 0,
+                                          &fixture) == 0,
+          "empty claimed-directory fixture is captured");
+    if (fixture.container_fd < 0)
+        return;
+    check(convert_directory_to_claim(&fixture) == 0,
+          "empty directory becomes an outstanding CLAIM");
+    remove_claimed_source(&fixture, 0);
+    check(portable_capture_resume_at(fixture.container_fd,
+                                     &fixture.request, NULL) == 0,
+          "resume removes an unvisited empty claimed directory");
+    int live = -1;
+    int deleted = -1;
+    Fixture state = { .container_fd = fixture.container_fd };
+    check(path_missing(fixture.payload_claimed) &&
+              outstanding_claim_count(fixture.container_fd) == 0 &&
+              sidecar_state(&state, "claimed", &live, &deleted) == 0 &&
+              live == 0 && deleted == 1,
+          "empty CLAIM cleanup leaves zero outstanding claims and a DELETE");
+    close(fixture.container_fd);
+}
+
+static void test_stale_nested_claim(const char *base)
+{
+    printf(BLUE "::" NC " nested stale CLAIM reconciliation\n");
+    ClaimDirectoryFixture fixture;
+    check(prepare_claim_directory_fixture(base, "claim-nested", 1,
+                                          &fixture) == 0,
+          "nested claimed-directory fixture is captured");
+    if (fixture.container_fd < 0)
+        return;
+    check(convert_directory_to_claim(&fixture) == 0,
+          "nested directory becomes a CLAIM while its child stays LIVE");
+    remove_claimed_source(&fixture, 1);
+    check(portable_capture_resume_at(fixture.container_fd,
+                                     &fixture.request, NULL) == 0,
+          "resume cleans nested stale LIVE and CLAIM descendants deepest-first");
+    char payload_child[PATH_MAX];
+    join_path(payload_child, sizeof(payload_child), fixture.payload_claimed,
+              "child");
+    int live = -1;
+    int deleted = -1;
+    Fixture state = { .container_fd = fixture.container_fd };
+    check(path_missing(fixture.payload_claimed) && path_missing(payload_child) &&
+              outstanding_claim_count(fixture.container_fd) == 0 &&
+              sidecar_state(&state, "claimed", &live, &deleted) == 0 &&
+              live == 0 && deleted == 1 &&
+              sidecar_state(&state, "claimed/child", &live, &deleted) == 0 &&
+              live == 0 && deleted == 1,
+          "nested cleanup removes every payload and leaves no CLAIM");
+    close(fixture.container_fd);
+}
+
+static void test_foreign_child_blocks_claim_cleanup(const char *base)
+{
+    printf(BLUE "::" NC " foreign child blocks stale CLAIM cleanup\n");
+    ClaimDirectoryFixture fixture;
+    check(prepare_claim_directory_fixture(base, "claim-foreign", 0,
+                                          &fixture) == 0,
+          "foreign-child claimed-directory fixture is captured");
+    if (fixture.container_fd < 0)
+        return;
+    check(convert_directory_to_claim(&fixture) == 0,
+          "foreign-child directory becomes an outstanding CLAIM");
+    char foreign[PATH_MAX];
+    join_path(foreign, sizeof(foreign), fixture.payload_claimed, "foreign");
+    write_file(foreign, "foreign");
+    remove_claimed_source(&fixture, 0);
+    check(portable_capture_resume_at(fixture.container_fd,
+                                     &fixture.request, NULL) != 0,
+          "foreign child rejects stale CLAIM reconciliation");
+    check(path_exists(fixture.payload_claimed) && path_exists(foreign) &&
+              outstanding_claim_count(fixture.container_fd) == 1,
+          "foreign-child refusal leaves the whole payload and CLAIM intact");
+    close(fixture.container_fd);
+}
+
 static void test_cleanup_failure(const char *base)
 {
     printf(BLUE "::" NC " stale cleanup failure gate\n");
@@ -533,6 +813,10 @@ int main(void)
     test_deleted_file(base);
     test_deleted_symlink(base);
     test_deleted_subtree(base);
+    test_claim_foreach(base);
+    test_stale_empty_claim(base);
+    test_stale_nested_claim(base);
+    test_foreign_child_blocks_claim_cleanup(base);
     test_cleanup_failure(base);
     test_inventory_mismatch(base);
     test_interruption_boundaries(base);

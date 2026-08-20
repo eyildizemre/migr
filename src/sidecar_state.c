@@ -23,14 +23,29 @@ typedef struct {
     uint64_t generation;
 } StateEntry;
 
+typedef struct {
+    SidecarClaim claim;
+    uint64_t generation;
+} StateClaim;
+
 typedef enum {
     MAP_SLOT_EMPTY = 0,
     MAP_SLOT_LIVE,
     MAP_SLOT_TOMBSTONE
 } MapSlotState;
 
-typedef struct {
+typedef enum {
+    MAP_VALUE_ENTRY = 0,
+    MAP_VALUE_CLAIM
+} MapValueKind;
+
+typedef union {
     StateEntry entry;
+    StateClaim claim;
+} MapValue;
+
+typedef struct {
+    MapValue value;
     uint64_t hash;
     MapSlotState state;
 } MapSlot;
@@ -42,6 +57,7 @@ typedef struct {
     size_t capacity;
     uint64_t generation;
     uint64_t hash_salt;
+    MapValueKind value_kind;
 } StateMap;
 
 typedef struct {
@@ -55,6 +71,7 @@ typedef struct {
     int poisoned;
     StateMemory memory;
     StateMap map;
+    StateMap claim_map;
     PendingEntry pending;
 } SidecarLogImplementation;
 
@@ -206,6 +223,62 @@ static void clear_entry(StateMemory *memory, StateEntry *entry)
     memset(entry, 0, sizeof(*entry));
 }
 
+static void clear_claim(StateMemory *memory, StateClaim *claim)
+{
+    if (claim == NULL)
+        return;
+    state_free(memory, (void *)claim->claim.root_id.data,
+               claim->claim.root_id.length);
+    state_free(memory, (void *)claim->claim.logical_path.data,
+               claim->claim.logical_path.length);
+    state_free(memory, (void *)claim->claim.physical_path.data,
+               claim->claim.physical_path.length);
+    memset(claim, 0, sizeof(*claim));
+}
+
+static int claim_kind_valid(SidecarObjectKind kind)
+{
+    return kind == SIDECAR_KIND_REGULAR ||
+           kind == SIDECAR_KIND_DIRECTORY ||
+           kind == SIDECAR_KIND_SYMLINK ||
+           kind == SIDECAR_KIND_HARDLINK;
+}
+
+static SidecarStatus copy_claim(StateMemory *memory,
+                                const SidecarClaim *source,
+                                StateClaim *destination)
+{
+    if (source == NULL || destination == NULL ||
+        !bytes_valid(source->root_id, SIDECAR_MAX_ROOT_ID, 1) ||
+        !bytes_valid(source->logical_path, SIDECAR_MAX_PATH, 0) ||
+        !bytes_valid(source->physical_path, SIDECAR_MAX_PATH, 0) ||
+        !claim_kind_valid(source->kind))
+    {
+        set_invalid_error();
+        return SIDECAR_STATUS_INVALID_ARGUMENT;
+    }
+    memset(destination, 0, sizeof(*destination));
+    destination->claim.kind = source->kind;
+    SidecarStatus status = copy_bytes(memory, source->root_id,
+                                      SIDECAR_MAX_ROOT_ID, 1,
+                                      &destination->claim.root_id);
+    if (status != SIDECAR_STATUS_OK)
+        goto fail;
+    status = copy_bytes(memory, source->logical_path, SIDECAR_MAX_PATH, 0,
+                        &destination->claim.logical_path);
+    if (status != SIDECAR_STATUS_OK)
+        goto fail;
+    status = copy_bytes(memory, source->physical_path, SIDECAR_MAX_PATH, 0,
+                        &destination->claim.physical_path);
+    if (status != SIDECAR_STATUS_OK)
+        goto fail;
+    return SIDECAR_STATUS_OK;
+
+fail:
+    clear_claim(memory, destination);
+    return status;
+}
+
 static SidecarStatus copy_xattr(StateMemory *memory, const SidecarXattr *source,
                                 SidecarXattr *destination)
 {
@@ -354,20 +427,42 @@ fail:
     return status;
 }
 
-static int key_matches(const SidecarEntry *entry, SidecarBytes root_id,
-                       SidecarBytes logical_path)
+static int bytes_equal(SidecarBytes left, SidecarBytes right)
 {
-    return entry->root_id.length == root_id.length &&
-           entry->logical_path.length == logical_path.length &&
-           (root_id.length == 0 ||
-            memcmp(entry->root_id.data, root_id.data, root_id.length) == 0) &&
-           (logical_path.length == 0 ||
-            memcmp(entry->logical_path.data, logical_path.data,
-                   logical_path.length) == 0);
+    return left.length == right.length &&
+           (left.length == 0 ||
+            (left.data != NULL && right.data != NULL &&
+             memcmp(left.data, right.data, left.length) == 0));
+}
+
+static int key_matches(SidecarBytes entry_root, SidecarBytes entry_logical,
+                       SidecarBytes root_id, SidecarBytes logical_path)
+{
+    return bytes_equal(entry_root, root_id) &&
+           bytes_equal(entry_logical, logical_path);
+}
+
+static SidecarBytes map_slot_root_id(const StateMap *map,
+                                     const MapSlot *slot)
+{
+    return map->value_kind == MAP_VALUE_CLAIM
+        ? slot->value.claim.claim.root_id
+        : slot->value.entry.entry.root_id;
+}
+
+static SidecarBytes map_slot_logical_path(const StateMap *map,
+                                          const MapSlot *slot)
+{
+    return map->value_kind == MAP_VALUE_CLAIM
+        ? slot->value.claim.claim.logical_path
+        : slot->value.entry.entry.logical_path;
 }
 
 #define MAP_INDEX_NONE SIZE_MAX
 #define MAP_INITIAL_CAPACITY 16U
+
+static uint64_t map_hash(const StateMap *map, SidecarBytes root_id,
+                         SidecarBytes logical_path);
 
 #ifdef SIDECAR_STATE_TEST_HOOKS
 static uint64_t state_test_probe_count;
@@ -386,6 +481,29 @@ uint64_t sidecar_state_test_probe_count(void)
 void sidecar_state_test_reset_probe_count(void)
 {
     state_test_probe_count = 0;
+}
+
+size_t sidecar_state_test_entry_probe_index(const SidecarLog *log,
+                                            SidecarBytes root_id,
+                                            SidecarBytes logical_path)
+{
+    if (log == NULL || log->implementation == NULL)
+        return MAP_INDEX_NONE;
+    const SidecarLogImplementation *implementation = log->implementation;
+    const StateMap *map = &implementation->map;
+    if (map->capacity == 0)
+        return MAP_INDEX_NONE;
+    return (size_t)map_hash(map, root_id, logical_path) &
+           (map->capacity - 1U);
+}
+
+uint64_t sidecar_state_test_entry_used_count(const SidecarLog *log)
+{
+    if (log == NULL || log->implementation == NULL)
+        return 0;
+    const SidecarLogImplementation *implementation = log->implementation;
+    const StateMap *map = &implementation->map;
+    return (uint64_t)map->count + (uint64_t)map->tombstones;
 }
 #else
 static void count_probe(void)
@@ -470,15 +588,21 @@ static SidecarStatus map_rehash(StateMemory *memory, StateMap *map,
                                : SIDECAR_STATUS_LIMIT;
     memset(new_slots, 0, new_size);
 
+    size_t carried_tombstones = 0;
     for (size_t old_index = 0; old_index < map->capacity; old_index++)
     {
         MapSlot *old_slot = &map->slots[old_index];
-        if (old_slot->state == MAP_SLOT_EMPTY)
+        int carry = old_slot->state == MAP_SLOT_LIVE ||
+                    (old_slot->state == MAP_SLOT_TOMBSTONE &&
+                     map->value_kind == MAP_VALUE_ENTRY);
+        if (!carry)
             continue;
         size_t index = (size_t)old_slot->hash & (new_capacity - 1U);
         while (new_slots[index].state != MAP_SLOT_EMPTY)
             index = (index + 1U) & (new_capacity - 1U);
         new_slots[index] = *old_slot;
+        if (old_slot->state == MAP_SLOT_TOMBSTONE)
+            carried_tombstones++;
     }
 
     if (map->slots != NULL)
@@ -486,6 +610,7 @@ static SidecarStatus map_rehash(StateMemory *memory, StateMap *map,
                    map->capacity * sizeof(*map->slots));
     map->slots = new_slots;
     map->capacity = new_capacity;
+    map->tombstones = carried_tombstones;
     return SIDECAR_STATUS_OK;
 }
 
@@ -513,14 +638,17 @@ static int map_locate(const StateMap *map, SidecarBytes root_id,
         const MapSlot *slot = &map->slots[index];
         if (slot->state == MAP_SLOT_EMPTY)
         {
-            *out_index = first_tombstone == MAP_INDEX_NONE
+            *out_index = map->value_kind == MAP_VALUE_ENTRY ||
+                         first_tombstone == MAP_INDEX_NONE
                 ? index : first_tombstone;
             return 0;
         }
         if (slot->state == MAP_SLOT_TOMBSTONE)
         {
             if (slot->hash == hash &&
-                key_matches(&slot->entry.entry, root_id, logical_path))
+                key_matches(map_slot_root_id(map, slot),
+                            map_slot_logical_path(map, slot),
+                            root_id, logical_path))
             {
                 *out_index = index;
                 return 2;
@@ -529,7 +657,9 @@ static int map_locate(const StateMap *map, SidecarBytes root_id,
                 first_tombstone = index;
         }
         else if (slot->hash == hash &&
-                 key_matches(&slot->entry.entry, root_id, logical_path))
+                 key_matches(map_slot_root_id(map, slot),
+                             map_slot_logical_path(map, slot),
+                             root_id, logical_path))
         {
             *out_index = index;
             return 1;
@@ -537,6 +667,11 @@ static int map_locate(const StateMap *map, SidecarBytes root_id,
         index = (index + 1U) & (map->capacity - 1U);
     }
 
+    if (map->value_kind == MAP_VALUE_ENTRY)
+    {
+        *out_index = MAP_INDEX_NONE;
+        return -1;
+    }
     *out_index = first_tombstone;
     return first_tombstone == MAP_INDEX_NONE ? -1 : 0;
 }
@@ -561,7 +696,9 @@ static SidecarStatus map_prepare_insert(StateMemory *memory, StateMap *map)
         return SIDECAR_STATUS_OK;
 
     size_t new_capacity = map->capacity;
-    if (map->count + 1U > map->capacity / 2U)
+    int must_grow = map->value_kind == MAP_VALUE_ENTRY ||
+                    map->count + 1U > map->capacity / 2U;
+    if (must_grow)
     {
         if (new_capacity > map_max_capacity() / 2U)
         {
@@ -580,7 +717,12 @@ static void map_free(StateMemory *memory, StateMap *map)
     for (size_t index = 0; index < map->capacity; index++)
     {
         if (map->slots[index].state != MAP_SLOT_EMPTY)
-            clear_entry(memory, &map->slots[index].entry);
+        {
+            if (map->value_kind == MAP_VALUE_CLAIM)
+                clear_claim(memory, &map->slots[index].value.claim);
+            else
+                clear_entry(memory, &map->slots[index].value.entry);
+        }
     }
     if (map->slots != NULL)
         state_free(memory, map->slots,
@@ -612,7 +754,8 @@ static SidecarStatus map_prepare_commit(StateMemory *memory, StateMap *map,
             *existing_index = index;
         return SIDECAR_STATUS_OK;
     }
-    if (!sidecar_live_entry_count_allowed((uint64_t)map->count + 1U))
+    if (!sidecar_live_entry_count_allowed((uint64_t)map->count +
+                                          (uint64_t)map->tombstones + 1U))
     {
         errno = E2BIG;
         return SIDECAR_STATUS_LIMIT;
@@ -636,27 +779,108 @@ static SidecarStatus map_prepare_commit(StateMemory *memory, StateMap *map,
 #pragma GCC diagnostic pop
 #endif
 
+static SidecarStatus map_prepare_claim(StateMemory *memory, StateMap *map,
+                                       SidecarBytes root_id,
+                                       SidecarBytes logical_path,
+                                       size_t *claim_index)
+{
+    if (map == NULL || map->value_kind != MAP_VALUE_CLAIM ||
+        map->generation == UINT64_MAX)
+    {
+        errno = E2BIG;
+        return SIDECAR_STATUS_LIMIT;
+    }
+    uint64_t hash = map_hash(map, root_id, logical_path);
+    size_t index = MAP_INDEX_NONE;
+    int location = map_locate(map, root_id, logical_path, hash, &index);
+    if (location != 0)
+    {
+        set_invalid_error();
+        return SIDECAR_STATUS_INVALID_ARGUMENT;
+    }
+    if (!sidecar_live_entry_count_allowed((uint64_t)map->count + 1U))
+    {
+        errno = E2BIG;
+        return SIDECAR_STATUS_LIMIT;
+    }
+    SidecarStatus status = map_prepare_insert(memory, map);
+    if (status != SIDECAR_STATUS_OK)
+        return status;
+    location = map_locate(map, root_id, logical_path, hash, &index);
+    if (location != 0 || index == MAP_INDEX_NONE)
+    {
+        errno = E2BIG;
+        return SIDECAR_STATUS_LIMIT;
+    }
+    if (claim_index != NULL)
+        *claim_index = index;
+    return SIDECAR_STATUS_OK;
+}
+
+static void map_apply_claim(StateMemory *memory, StateMap *map,
+                            StateClaim *claim, size_t claim_index)
+{
+    map->generation++;
+    MapSlot *slot = &map->slots[claim_index];
+    if (slot->state == MAP_SLOT_TOMBSTONE)
+    {
+        clear_claim(memory, &slot->value.claim);
+        map->tombstones--;
+    }
+    map->count++;
+    slot->value.claim = *claim;
+    slot->hash = map_hash(map, slot->value.claim.claim.root_id,
+                          slot->value.claim.claim.logical_path);
+    slot->state = MAP_SLOT_LIVE;
+    slot->value.claim.generation = map->generation;
+    *claim = (StateClaim){0};
+}
+
+static SidecarStatus map_apply_remove(StateMemory *memory, StateMap *map,
+                                      size_t index)
+{
+    if (map == NULL || map->value_kind != MAP_VALUE_CLAIM)
+    {
+        set_invalid_error();
+        return SIDECAR_STATUS_INVALID_ARGUMENT;
+    }
+    if (index == MAP_INDEX_NONE || index >= map->capacity ||
+        map->slots[index].state != MAP_SLOT_LIVE)
+        return SIDECAR_STATUS_OK;
+    if (map->generation == UINT64_MAX)
+    {
+        errno = E2BIG;
+        return SIDECAR_STATUS_LIMIT;
+    }
+    clear_claim(memory, &map->slots[index].value.claim);
+    map->slots[index].state = MAP_SLOT_TOMBSTONE;
+    map->count--;
+    map->tombstones++;
+    map->generation++;
+    return SIDECAR_STATUS_OK;
+}
+
 static void map_apply_commit(StateMemory *memory, StateMap *map,
                              PendingEntry *pending, size_t existing_index)
 {
     map->generation++;
     MapSlot *slot = &map->slots[existing_index];
     if (slot->state == MAP_SLOT_LIVE)
-        clear_entry(memory, &slot->entry);
+        clear_entry(memory, &slot->value.entry);
     else
     {
         if (slot->state == MAP_SLOT_TOMBSTONE)
         {
-            clear_entry(memory, &slot->entry);
+            clear_entry(memory, &slot->value.entry);
             map->tombstones--;
         }
         map->count++;
     }
-    slot->entry = pending->entry;
-    slot->hash = map_hash(map, slot->entry.entry.root_id,
-                          slot->entry.entry.logical_path);
+    slot->value.entry = pending->entry;
+    slot->hash = map_hash(map, slot->value.entry.entry.root_id,
+                          slot->value.entry.entry.logical_path);
     slot->state = MAP_SLOT_LIVE;
-    slot->entry.generation = map->generation;
+    slot->value.entry.generation = map->generation;
     pending->entry = (StateEntry){0};
     pending->xattrs_seen = 0;
 }
@@ -681,6 +905,41 @@ static SidecarStatus map_apply_delete(StateMemory *memory, StateMap *map,
     slot->state = MAP_SLOT_TOMBSTONE;
     map->count--;
     map->tombstones++;
+    return SIDECAR_STATUS_OK;
+}
+
+static int claim_matches_entry(const StateClaim *claim,
+                               const SidecarEntry *entry)
+{
+    return claim != NULL && entry != NULL &&
+           bytes_equal(claim->claim.root_id, entry->root_id) &&
+           bytes_equal(claim->claim.logical_path, entry->logical_path) &&
+           bytes_equal(claim->claim.physical_path, entry->physical_path) &&
+           claim->claim.kind == entry->kind;
+}
+
+static SidecarStatus prepare_claim_consumption(const StateMap *claim_map,
+                                               const SidecarEntry *entry,
+                                               size_t *claim_index)
+{
+    if (claim_index == NULL || claim_map == NULL || entry == NULL)
+    {
+        set_invalid_error();
+        return SIDECAR_STATUS_INVALID_ARGUMENT;
+    }
+    *claim_index = MAP_INDEX_NONE;
+    size_t index = map_find(claim_map, entry->root_id,
+                            entry->logical_path);
+    if (index == MAP_INDEX_NONE)
+        return SIDECAR_STATUS_CORRUPT;
+    if (!claim_matches_entry(&claim_map->slots[index].value.claim, entry))
+        return SIDECAR_STATUS_CORRUPT;
+    if (claim_map->generation == UINT64_MAX)
+    {
+        errno = E2BIG;
+        return SIDECAR_STATUS_LIMIT;
+    }
+    *claim_index = index;
     return SIDECAR_STATUS_OK;
 }
 
@@ -738,6 +997,7 @@ static void free_log_implementation(SidecarLogImplementation *log)
         return;
     clear_entry(&log->memory, &log->pending.entry);
     map_free(&log->memory, &log->map);
+    map_free(&log->memory, &log->claim_map);
     free(log);
 }
 
@@ -785,24 +1045,73 @@ static int load_callback(const SidecarRecord *record, void *context)
     else if (record->type == SIDECAR_RECORD_ENTRY_COMMIT)
     {
         size_t existing_index = 0;
+        size_t claim_index = MAP_INDEX_NONE;
         if (log->pending.entry.entry.root_id.data == NULL ||
             log->pending.xattrs_seen != log->pending.entry.entry.xattr_count)
             status = SIDECAR_STATUS_CORRUPT;
-        else
+        else if ((status = prepare_claim_consumption(
+                      &log->claim_map, &log->pending.entry.entry,
+                      &claim_index)) == SIDECAR_STATUS_OK)
             status = map_prepare_commit(&log->memory, &log->map,
                                         &log->pending.entry, &existing_index);
         if (status == SIDECAR_STATUS_OK)
+        {
             map_apply_commit(&log->memory, &log->map, &log->pending,
                              existing_index);
+            if (claim_index != MAP_INDEX_NONE)
+                status = map_apply_remove(&log->memory, &log->claim_map,
+                                          claim_index);
+        }
     }
     else if (record->type == SIDECAR_RECORD_DELETE)
     {
+        size_t claim_index = MAP_INDEX_NONE;
         if (log->pending.entry.entry.root_id.data != NULL)
             status = SIDECAR_STATUS_CORRUPT;
         else
+        {
+            claim_index = map_find(&log->claim_map,
+                                   record->value.deletion.root_id,
+                                   record->value.deletion.logical_path);
+            if (claim_index != MAP_INDEX_NONE &&
+                log->claim_map.generation == UINT64_MAX)
+            {
+                errno = E2BIG;
+                status = SIDECAR_STATUS_LIMIT;
+            }
+            else
             status = map_apply_delete(&log->memory, &log->map,
                                       record->value.deletion.root_id,
                                       record->value.deletion.logical_path);
+            if (status == SIDECAR_STATUS_OK &&
+                claim_index != MAP_INDEX_NONE)
+                status = map_apply_remove(&log->memory, &log->claim_map,
+                                          claim_index);
+        }
+    }
+    else if (record->type == SIDECAR_RECORD_CLAIM)
+    {
+        size_t claim_index = MAP_INDEX_NONE;
+        if (log->pending.entry.entry.root_id.data != NULL ||
+            map_find(&log->map, record->value.claim.root_id,
+                     record->value.claim.logical_path) != MAP_INDEX_NONE ||
+            map_find(&log->claim_map, record->value.claim.root_id,
+                     record->value.claim.logical_path) != MAP_INDEX_NONE)
+            status = SIDECAR_STATUS_CORRUPT;
+        else
+        {
+            StateClaim claim = {0};
+            status = copy_claim(&log->memory, &record->value.claim, &claim);
+            if (status == SIDECAR_STATUS_OK)
+                status = map_prepare_claim(
+                    &log->memory, &log->claim_map, claim.claim.root_id,
+                    claim.claim.logical_path, &claim_index);
+            if (status == SIDECAR_STATUS_OK)
+                map_apply_claim(&log->memory, &log->claim_map, &claim,
+                                claim_index);
+            else
+                clear_claim(&log->memory, &claim);
+        }
     }
     else
         status = SIDECAR_STATUS_CORRUPT;
@@ -850,6 +1159,9 @@ static SidecarLogImplementation *allocate_log(int fd)
         return NULL;
     log->fd = fd;
     log->map.hash_salt = sidecar_process_salt();
+    log->map.value_kind = MAP_VALUE_ENTRY;
+    log->claim_map.hash_salt = log->map.hash_salt;
+    log->claim_map.value_kind = MAP_VALUE_CLAIM;
     return log;
 }
 
@@ -1098,9 +1410,15 @@ SidecarStatus sidecar_log_append_entry_commit(SidecarLog *log)
         return SIDECAR_STATUS_INVALID_ARGUMENT;
 
     size_t existing_index = 0;
-    status = map_prepare_commit(&implementation->memory, &implementation->map,
-                                &implementation->pending.entry,
-                                &existing_index);
+    size_t claim_index = MAP_INDEX_NONE;
+    status = prepare_claim_consumption(
+        &implementation->claim_map, &implementation->pending.entry.entry,
+        &claim_index);
+    if (status == SIDECAR_STATUS_OK)
+        status = map_prepare_commit(&implementation->memory,
+                                    &implementation->map,
+                                    &implementation->pending.entry,
+                                    &existing_index);
     if (status != SIDECAR_STATUS_OK)
         return status;
     if (sidecar_write_entry_commit(implementation->fd) != 0)
@@ -1111,6 +1429,16 @@ SidecarStatus sidecar_log_append_entry_commit(SidecarLog *log)
     }
     map_apply_commit(&implementation->memory, &implementation->map,
                      &implementation->pending, existing_index);
+    if (claim_index != MAP_INDEX_NONE)
+    {
+        status = map_apply_remove(&implementation->memory,
+                                  &implementation->claim_map, claim_index);
+        if (status != SIDECAR_STATUS_OK)
+        {
+            poison(implementation);
+            return status;
+        }
+    }
     if (update_boundary(implementation) != 0)
     {
         poison(implementation);
@@ -1132,7 +1460,12 @@ SidecarStatus sidecar_log_append_delete(SidecarLog *log,
         set_invalid_error();
         return SIDECAR_STATUS_INVALID_ARGUMENT;
     }
-    if (implementation->map.generation == UINT64_MAX)
+    size_t claim_index = map_find(&implementation->claim_map,
+                                  deletion->root_id,
+                                  deletion->logical_path);
+    if (implementation->map.generation == UINT64_MAX ||
+        (claim_index != MAP_INDEX_NONE &&
+         implementation->claim_map.generation == UINT64_MAX))
     {
         errno = E2BIG;
         return SIDECAR_STATUS_LIMIT;
@@ -1147,6 +1480,70 @@ SidecarStatus sidecar_log_append_delete(SidecarLog *log,
                               deletion->root_id, deletion->logical_path);
     if (status != SIDECAR_STATUS_OK)
         return status;
+    if (claim_index != MAP_INDEX_NONE)
+    {
+        status = map_apply_remove(&implementation->memory,
+                                  &implementation->claim_map, claim_index);
+        if (status != SIDECAR_STATUS_OK)
+        {
+            poison(implementation);
+            return status;
+        }
+    }
+    if (update_boundary(implementation) != 0)
+    {
+        poison(implementation);
+        return SIDECAR_STATUS_IO_ERROR;
+    }
+    return SIDECAR_STATUS_OK;
+}
+
+SidecarStatus sidecar_log_append_claim(SidecarLog *log,
+                                       const SidecarClaim *claim)
+{
+    SidecarLogImplementation *implementation = NULL;
+    SidecarStatus status = ready_log(log, &implementation);
+    if (status != SIDECAR_STATUS_OK)
+        return status;
+    if (claim == NULL || implementation->pending.entry.entry.root_id.data != NULL ||
+        !valid_key(claim->root_id, claim->logical_path) ||
+        !claim_kind_valid(claim->kind))
+    {
+        set_invalid_error();
+        return SIDECAR_STATUS_INVALID_ARGUMENT;
+    }
+    if (map_find(&implementation->map, claim->root_id,
+                 claim->logical_path) != MAP_INDEX_NONE ||
+        map_find(&implementation->claim_map, claim->root_id,
+                 claim->logical_path) != MAP_INDEX_NONE)
+    {
+        set_invalid_error();
+        return SIDECAR_STATUS_INVALID_ARGUMENT;
+    }
+
+    StateClaim copy = {0};
+    status = copy_claim(&implementation->memory, claim, &copy);
+    if (status != SIDECAR_STATUS_OK)
+        return status;
+    size_t claim_index = MAP_INDEX_NONE;
+    status = map_prepare_claim(&implementation->memory,
+                               &implementation->claim_map,
+                               copy.claim.root_id, copy.claim.logical_path,
+                               &claim_index);
+    if (status != SIDECAR_STATUS_OK)
+    {
+        clear_claim(&implementation->memory, &copy);
+        return status;
+    }
+    if (sidecar_write_claim(implementation->fd, claim) != 0)
+    {
+        status = status_from_errno();
+        clear_claim(&implementation->memory, &copy);
+        poison(implementation);
+        return status;
+    }
+    map_apply_claim(&implementation->memory, &implementation->claim_map,
+                    &copy, claim_index);
     if (update_boundary(implementation) != 0)
     {
         poison(implementation);
@@ -1161,6 +1558,14 @@ size_t sidecar_log_live_count(const SidecarLog *log)
         return 0;
     const SidecarLogImplementation *implementation = log->implementation;
     return implementation->map.count;
+}
+
+size_t sidecar_log_claim_count(const SidecarLog *log)
+{
+    if (log == NULL || log->implementation == NULL)
+        return 0;
+    const SidecarLogImplementation *implementation = log->implementation;
+    return implementation->claim_map.count;
 }
 
 int sidecar_log_find(const SidecarLog *log, SidecarBytes root_id,
@@ -1182,7 +1587,7 @@ int sidecar_log_find(const SidecarLog *log, SidecarBytes root_id,
     size_t index = map_find(&implementation->map, root_id, logical_path);
     if (index == MAP_INDEX_NONE)
         return 0;
-    const StateEntry *entry = &implementation->map.slots[index].entry;
+    const StateEntry *entry = &implementation->map.slots[index].value.entry;
     out->entry = &entry->entry;
     out->xattrs = entry->xattrs;
     out->xattr_count = entry->entry.xattr_count;
@@ -1206,10 +1611,36 @@ SidecarStatus sidecar_log_foreach(SidecarLog *log, SidecarLiveCallback callback,
         if (slot->state != MAP_SLOT_LIVE)
             continue;
         SidecarLiveView view = {
-            .entry = &slot->entry.entry,
-            .xattrs = slot->entry.xattrs,
-            .xattr_count = slot->entry.entry.xattr_count,
-            .generation = slot->entry.generation
+            .entry = &slot->value.entry.entry,
+            .xattrs = slot->value.entry.xattrs,
+            .xattr_count = slot->value.entry.entry.xattr_count,
+            .generation = slot->value.entry.generation
+        };
+        if (callback(&view, context) != 0)
+            return SIDECAR_STATUS_CALLBACK;
+    }
+    return SIDECAR_STATUS_OK;
+}
+
+SidecarStatus sidecar_log_claim_foreach(SidecarLog *log,
+                                        SidecarClaimCallback callback,
+                                        void *context)
+{
+    SidecarLogImplementation *implementation = NULL;
+    SidecarStatus status = ready_log(log, &implementation);
+    if (status != SIDECAR_STATUS_OK)
+        return status;
+    if (callback == NULL)
+        return SIDECAR_STATUS_INVALID_ARGUMENT;
+
+    for (size_t index = 0; index < implementation->claim_map.capacity; index++)
+    {
+        MapSlot *slot = &implementation->claim_map.slots[index];
+        if (slot->state != MAP_SLOT_LIVE)
+            continue;
+        SidecarClaimView view = {
+            .claim = &slot->value.claim.claim,
+            .generation = slot->value.claim.generation
         };
         if (callback(&view, context) != 0)
             return SIDECAR_STATUS_CALLBACK;
@@ -1239,10 +1670,37 @@ int sidecar_log_find_deleted(const SidecarLog *log, SidecarBytes root_id,
                                        logical_path), &index);
     if (location != 2 || index == MAP_INDEX_NONE)
         return 0;
-    const StateEntry *entry = &implementation->map.slots[index].entry;
+    const StateEntry *entry = &implementation->map.slots[index].value.entry;
     out->entry = &entry->entry;
     out->xattrs = entry->xattrs;
     out->xattr_count = entry->entry.xattr_count;
     out->generation = entry->generation;
+    return 1;
+}
+
+int sidecar_log_find_claim(const SidecarLog *log, SidecarBytes root_id,
+                           SidecarBytes logical_path, SidecarClaimView *out)
+{
+    if (out == NULL)
+    {
+        set_invalid_error();
+        return -1;
+    }
+    memset(out, 0, sizeof(*out));
+    if (log == NULL || log->implementation == NULL ||
+        !valid_key(root_id, logical_path))
+    {
+        set_invalid_error();
+        return -1;
+    }
+    const SidecarLogImplementation *implementation = log->implementation;
+    size_t index = map_find(&implementation->claim_map, root_id,
+                            logical_path);
+    if (index == MAP_INDEX_NONE)
+        return 0;
+    const StateClaim *claim =
+        &implementation->claim_map.slots[index].value.claim;
+    out->claim = &claim->claim;
+    out->generation = claim->generation;
     return 1;
 }

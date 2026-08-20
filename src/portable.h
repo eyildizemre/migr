@@ -152,6 +152,7 @@ typedef struct PortableCaptureContext {
     void *visited;
     void *inode_map;
     void *owned_paths;
+    void *claimed_paths;
 } PortableCaptureContext;
 
 /**
