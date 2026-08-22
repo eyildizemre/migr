@@ -224,6 +224,48 @@ static void report_source_safe_read_refusal(const char *label,
                report->applied_count, report->failed_count);
 }
 
+static void restore_security_skipped_add(size_t *total, size_t count)
+{
+    if (total == NULL || count == 0 || *total == SIZE_MAX)
+        return;
+    if (count > SIZE_MAX - *total)
+        *total = SIZE_MAX;
+    else
+        *total += count;
+}
+
+static void native_restore_security_dry_run_notice(size_t entries)
+{
+    if (entries != 0)
+        printf("Security notice: %zu item(s) carry security.* attributes; "
+               "whether they can be applied here is measured, not "
+               "predicted, and is only found out on a live run.\n",
+               entries);
+}
+
+static int native_restore_confirm(size_t security_xattr_entries)
+{
+    const char *ordinary_message =
+        "This will restore files to your home directory. Continue?";
+    if (security_xattr_entries == 0)
+        return confirm_action(ordinary_message);
+
+    char message[768];
+    int length = snprintf(
+        message, sizeof(message),
+        "This restore includes %zu item(s) carrying security.* attributes "
+        "(e.g. SELinux labels); if this destination or account cannot "
+        "apply one, that item's other content and metadata will still be "
+        "restored and only the attribute will be skipped. Continue?",
+        security_xattr_entries);
+    if (length < 0 || (size_t)length >= sizeof(message))
+        return confirm_action(
+            "This restore includes security.* attributes; an attribute "
+            "that cannot be applied will be skipped while the item's other "
+            "content and metadata are restored. Continue?");
+    return confirm_action(message);
+}
+
 // Restores one item whose source and destination relative addresses may
 // differ (e.g. a v1 root's "data/<payload>" source vs. its own restore
 // address), sharing the exact same status/preflight/apply behavior for
@@ -236,7 +278,8 @@ static int restore_item_at(const CloneContext *ctx,
                            int source_root_fd, const char *source_rel,
                            int dest_root_fd, const char *dest_rel,
                            const char *label, int source_required,
-                           const RestoreTimestampAnchors *timestamp_anchors)
+                           const RestoreTimestampAnchors *timestamp_anchors,
+                           size_t *skipped_security_xattrs)
 {
     RestoreSourceStatus status = restore_native_source_status_at(source_root_fd, source_rel);
     if (status == RESTORE_SOURCE_MISSING)
@@ -296,6 +339,9 @@ static int restore_item_at(const CloneContext *ctx,
     RestoreNativeReport report;
     RestoreNativeStatus native_status = restore_native_at_report(
         run_ctx, source_root_fd, source_rel, dest_root_fd, dest_rel, &report);
+    if (skipped_security_xattrs != NULL)
+        restore_security_skipped_add(skipped_security_xattrs,
+                                     report.skipped_security_xattr_count);
     if (native_status != RESTORE_NATIVE_OK)
     {
         if (native_status == RESTORE_NATIVE_SOURCE_SAFE_READ)
@@ -311,10 +357,12 @@ static int restore_item_at(const CloneContext *ctx,
 // both sides (legacy's Projects/dotfiles/browser-config items).
 static int restore_home_item(const CloneContext *ctx, int source_root_fd,
                              int home_fd, const char *rel_path,
-                             const RestoreTimestampAnchors *timestamp_anchors)
+                             const RestoreTimestampAnchors *timestamp_anchors,
+                             size_t *skipped_security_xattrs)
 {
     int rc = restore_item_at(ctx, source_root_fd, rel_path, home_fd, rel_path,
-                             rel_path, 0, timestamp_anchors);
+                             rel_path, 0, timestamp_anchors,
+                             skipped_security_xattrs);
     if (rc > 0 && dry_run)
         printf("  Would restore: %s\n", rel_path);
     return rc;
@@ -382,7 +430,8 @@ static int open_xdg_destination_anchor(const char *path, int *out_fd,
 // legacy layout and its all-or-nothing XDG destination resolution.
 static int restore_legacy(const char *source, int source_root_fd, const char *home, int home_fd,
                           const CloneContext *ctx, int *count, int *had_error,
-                          const RestoreTimestampAnchors *timestamp_anchors)
+                          const RestoreTimestampAnchors *timestamp_anchors,
+                          size_t *skipped_security_xattrs)
 {
     printf("[Main Directories]\n");
     char *xdg_dirs[XDG_RESTORE_COUNT];
@@ -437,7 +486,8 @@ static int restore_legacy(const char *source, int source_root_fd, const char *ho
 
             int rc = restore_item_at(ctx, source_root_fd, name, xdg_dest_fd,
                                      destination_rel, name, 0,
-                                     timestamp_anchors);
+                                     timestamp_anchors,
+                                     skipped_security_xattrs);
             if (rc > 0 && dry_run)
                 printf("  Would restore: %s -> %s/\n", name, xdg_dirs[i]);
             if (rc > 0)
@@ -456,7 +506,7 @@ static int restore_legacy(const char *source, int source_root_fd, const char *ho
 
     // Projects is not a standard XDG directory
     int rc = restore_home_item(ctx, source_root_fd, home_fd, "Projects",
-                               timestamp_anchors);
+                               timestamp_anchors, skipped_security_xattrs);
     if (rc > 0)
         (*count)++;
     else if (rc < 0)
@@ -467,7 +517,7 @@ static int restore_legacy(const char *source, int source_root_fd, const char *ho
     for (int i = 0; dotfiles[i] != NULL; i++)
     {
         rc = restore_home_item(ctx, source_root_fd, home_fd, dotfiles[i],
-                               timestamp_anchors);
+                               timestamp_anchors, skipped_security_xattrs);
         if (rc > 0)
             (*count)++;
         else if (rc < 0)
@@ -488,7 +538,7 @@ static int restore_legacy(const char *source, int source_root_fd, const char *ho
     for (int i = 0; browser_configs[i] != NULL; i++)
     {
         rc = restore_home_item(ctx, source_root_fd, home_fd, browser_configs[i],
-                               timestamp_anchors);
+                               timestamp_anchors, skipped_security_xattrs);
         if (rc > 0)
             (*count)++;
         else if (rc < 0)
@@ -763,7 +813,8 @@ static RestoreNativeStatus restore_v1_metadata_inventory(
 static void restore_v1(const char *source, int source_root_fd, const char *home, int home_fd,
                        const CloneContext *ctx, const Manifest *m, int *count,
                        int *had_error,
-                       const RestoreTimestampAnchors *timestamp_anchors)
+                       const RestoreTimestampAnchors *timestamp_anchors,
+                       size_t *skipped_security_xattrs)
 {
     printf("[Roots]\n");
 
@@ -789,7 +840,8 @@ static void restore_v1(const char *source, int source_root_fd, const char *home,
         {
             int rc = restore_item_at(ctx, source_root_fd, source_rel, home_fd,
                                      root->restore_path, root->id, 1,
-                                     timestamp_anchors);
+                                     timestamp_anchors,
+                                     skipped_security_xattrs);
             if (rc > 0 && dry_run)
             {
                 if (root->restore_path[0] != '\0')
@@ -842,7 +894,8 @@ static void restore_v1(const char *source, int source_root_fd, const char *home,
 
         int rc = restore_item_at(ctx, source_root_fd, source_rel, xdg_dest_fd,
                                  destination_rel, root->id, 1,
-                                 timestamp_anchors);
+                                 timestamp_anchors,
+                                 skipped_security_xattrs);
         if (rc > 0 && dry_run)
             printf("  Would restore: %s -> %s/\n", root->id, xdg_dirs[idx]);
         if (rc > 0)
@@ -1299,6 +1352,10 @@ int restore(const char *source)
                        report.applied_count, report.failed_count);
                 break;
         }
+        if (report.skipped_security_xattr_count != 0)
+            printf("Skipped %zu security.* attribute(s) that the destination "
+                   "could not apply.\n",
+                   report.skipped_security_xattr_count);
         printf("===========================================================\n");
 
         free_xdg_dirs(xdg_dirs);
@@ -1353,8 +1410,11 @@ int restore(const char *source)
     if (dry_run)
     {
         printf("Dry run mode enabled. No changes will be made.\n\n");
+        native_restore_security_dry_run_notice(
+            metadata_profiles.security_xattr_entry_count);
     }
-    else if (!confirm_action("This will restore files to your home directory. Continue?"))
+    else if (!native_restore_confirm(
+                 metadata_profiles.security_xattr_entry_count))
     {
         printf("Cancelled.\n");
         metadata_profiles_free(&metadata_profiles);
@@ -1370,6 +1430,7 @@ int restore(const char *source)
 
     int count = 0;
     int had_error = 0;
+    size_t skipped_security_xattrs = 0;
 
     if (!dry_run)
     {
@@ -1408,13 +1469,15 @@ int restore(const char *source)
     if (mst == MANIFEST_STATUS_VALID)
     {
         restore_v1(source, source_root_fd, home, home_fd, &ctx, &m, &count,
-                   &had_error, &timestamp_anchors);
+                   &had_error, &timestamp_anchors,
+                   &skipped_security_xattrs);
         manifest_free(&m);
     }
     else
     {
         if (restore_legacy(source, source_root_fd, home, home_fd, &ctx,
-                           &count, &had_error, &timestamp_anchors) != 0)
+                           &count, &had_error, &timestamp_anchors,
+                           &skipped_security_xattrs) != 0)
         {
             metadata_profiles_free(&metadata_profiles);
             restore_timestamp_anchors_free(&timestamp_anchors);
@@ -1436,6 +1499,9 @@ int restore(const char *source)
         printf("Restore finished with errors: %d items restored, some items failed\n", count);
     else
         printf("Restore complete: %d items restored\n", count);
+    if (skipped_security_xattrs != 0)
+        printf("Skipped %zu security.* attribute(s) that the destination "
+               "could not apply.\n", skipped_security_xattrs);
     printf("===========================================================\n");
 
     close(home_fd);

@@ -1255,6 +1255,61 @@ static void test_metadata_apply_xattrs_tolerates_foreign_security(void)
     remove_tree(base);
 }
 
+static void test_metadata_apply_xattrs_tolerates_security_set(void)
+{
+    const char *case_name = "xattr-security-set";
+    if (geteuid() == 0)
+    {
+        skip_case(case_name, "security.* set refusal needs a non-root process");
+        return;
+    }
+
+    char base[PATH_MAX];
+    if (!make_shm_root(base, sizeof(base)))
+    {
+        skip_case(case_name, "a private tmpfs fixture is unavailable");
+        return;
+    }
+
+    char path[PATH_MAX];
+    join_or_die(path, sizeof(path), base, "entry");
+    write_file(path, "security-set");
+    int fd = open(path, O_WRONLY);
+    if (fd < 0)
+        fatal("could not open the security-set fixture");
+
+    static const unsigned char security_name[] = "security.migr_test";
+    static const unsigned char security_value[] = "probe";
+    SidecarXattr xattr = {
+        .name = {
+            .data = security_name,
+            .length = sizeof(security_name) - 1U
+        },
+        .value = {
+            .data = security_value,
+            .length = sizeof(security_value) - 1U
+        }
+    };
+    size_t skipped_security = 0;
+    errno = 0;
+    int result = metadata_apply_xattrs_fd_report(fd, &xattr, 1,
+                                                  &skipped_security);
+    int saved_errno = errno;
+    close(fd);
+    if (result != 0 && (saved_errno == ENOTSUP || saved_errno == EOPNOTSUPP ||
+                        saved_errno == ENOSYS))
+    {
+        skip_case(case_name, "the fixture filesystem has no security.* support");
+        remove_tree(base);
+        return;
+    }
+    if (result != 0)
+        fatal("security.* set failed for an unexpected reason");
+    check_result(skipped_security >= 1, case_name,
+                 "an unprivileged security.* set refusal is tolerated and reported");
+    remove_tree(base);
+}
+
 static void test_metadata_xattr_gate_trusted_refusal(void)
 {
     const char *case_name = "xattr-trusted";
@@ -1424,6 +1479,7 @@ int main(void)
     test_metadata_xattr_capability_probe();
     test_metadata_xattr_gate_no_unrelated_namespace();
     test_metadata_apply_xattrs_tolerates_foreign_security();
+    test_metadata_apply_xattrs_tolerates_security_set();
     test_metadata_xattr_gate_trusted_refusal();
     test_metadata_apply_split_equivalence();
     test_foreign_ownership_gap();

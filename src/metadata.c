@@ -222,6 +222,12 @@ int metadata_profiles_add(MetadataProfiles *profiles, int anchor_fd,
     return 0;
 }
 
+void metadata_profiles_note_security_xattr(MetadataProfiles *profiles)
+{
+    if (profiles != NULL && profiles->security_xattr_entry_count != SIZE_MAX)
+        profiles->security_xattr_entry_count++;
+}
+
 static int set_probe_times(int fd, MetadataTimestampPolicy policy,
                            struct timespec out[2])
 {
@@ -744,8 +750,11 @@ static int metadata_xattr_input_contains(const SidecarXattr *xattrs,
 
 static int metadata_apply_xattrs_target(const MetadataXattrTarget *target,
                                         const SidecarXattr *xattrs,
-                                        size_t count)
+                                        size_t count,
+                                        size_t *skipped_security_count)
 {
+    if (skipped_security_count != NULL)
+        *skipped_security_count = 0;
     if (target == NULL ||
         metadata_xattr_input_valid(xattrs, count) != 0)
         return -1;
@@ -781,6 +790,10 @@ static int metadata_apply_xattrs_target(const MetadataXattrTarget *target,
                     (metadata_xattr_namespace(name) ==
                          METADATA_XATTR_NS_SECURITY &&
                      (errno == EACCES || errno == EPERM));
+                if (tolerated && errno != ENODATA &&
+                    skipped_security_count != NULL &&
+                    *skipped_security_count != SIZE_MAX)
+                    (*skipped_security_count)++;
                 if (!tolerated)
                 {
                     free(existing_names);
@@ -808,11 +821,20 @@ static int metadata_apply_xattrs_target(const MetadataXattrTarget *target,
                                                          current->value.data;
         int failed = metadata_xattr_set(target, name, value,
                                         current->value.length);
+        int tolerated = failed != 0 &&
+            metadata_xattr_namespace(name) == METADATA_XATTR_NS_SECURITY &&
+            (errno == EACCES || errno == EPERM);
+        if (tolerated && skipped_security_count != NULL &&
+            *skipped_security_count != SIZE_MAX)
+            (*skipped_security_count)++;
         free(name);
         if (failed != 0)
         {
-            free(existing_names);
-            return -1;
+            if (!tolerated)
+            {
+                free(existing_names);
+                return -1;
+            }
         }
     }
     free(existing_names);
@@ -841,12 +863,28 @@ int metadata_symlink_xattr_path(int dir_fd, const char *leaf,
 
 int metadata_apply_xattrs_fd(int fd, const SidecarXattr *xattrs, size_t count)
 {
+    return metadata_apply_xattrs_fd_report(fd, xattrs, count, NULL);
+}
+
+int metadata_apply_xattrs_fd_report(int fd, const SidecarXattr *xattrs,
+                                    size_t count,
+                                    size_t *skipped_security_count)
+{
     MetadataXattrTarget target = { .fd = fd, .path = NULL };
-    return metadata_apply_xattrs_target(&target, xattrs, count);
+    return metadata_apply_xattrs_target(&target, xattrs, count,
+                                        skipped_security_count);
 }
 
 int metadata_apply_xattrs_symlink_at(int dir_fd, const char *leaf,
                                      const SidecarXattr *xattrs, size_t count)
+{
+    return metadata_apply_xattrs_symlink_at_report(dir_fd, leaf, xattrs,
+                                                   count, NULL);
+}
+
+int metadata_apply_xattrs_symlink_at_report(
+    int dir_fd, const char *leaf, const SidecarXattr *xattrs, size_t count,
+    size_t *skipped_security_count)
 {
     char path[PATH_MAX];
     if (metadata_symlink_xattr_path(dir_fd, leaf, path, sizeof(path)) != 0)
@@ -858,7 +896,8 @@ int metadata_apply_xattrs_symlink_at(int dir_fd, const char *leaf,
         return -1;
 
     MetadataXattrTarget target = { .fd = -1, .path = path };
-    return metadata_apply_xattrs_target(&target, xattrs, count);
+    return metadata_apply_xattrs_target(&target, xattrs, count,
+                                        skipped_security_count);
 }
 
 typedef enum {

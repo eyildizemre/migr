@@ -1364,6 +1364,36 @@ are now replayed through the no-follow `l*` family under E-3's ordinary
 fail-closed rule; D18 C-8 and the Phase C/D as-built records remain unchanged
 as historical entries.
 
+### E-11 — `security.*` apply refusal is visible, measured, and non-fatal
+
+The first implementation of E-8's tolerance covered only stale
+`security.*` removal. The set loop still treated an unprivileged
+`EACCES`/`EPERM` from `fsetxattr` or `lsetxattr` as an entry-fatal error.
+That asymmetry was exposed by the real migration workflow this project must
+serve: a backup captured on Fedora with SELinux labels was carried on a
+physical exFAT USB device and restored unprivileged on Arch without SELinux.
+The first file's `security.selinux` write refused, and the restore stopped
+before applying any of the remaining files.
+
+The correction keeps E-1's capture fidelity and E-10's framework agnosticism,
+but makes this value-specific cross-policy limitation explicit to the user.
+The restore preflight counts entries carrying `security.*` values and folds a
+warning into the existing single confirmation prompt. The warning explains
+that an unappliable attribute will be skipped while that entry's other
+content and metadata continue to restore. There is no second confirmation
+gate and no silent tolerance: a second prompt could leave an operation
+waiting after the user believed it had started, while a silent skip would
+violate D8's visible-loss rule.
+
+After confirmation, only `security.*` set or removal failures with
+`EACCES`/`EPERM` are tolerated, exactly matching E-8's existing removal
+exception. Each tolerated attribute is counted at apply time and the final
+restore summary reports the actual count; the preflight and dry-run messages
+report presence only and do not predict which values the destination policy
+will accept. All other namespaces and errno values retain E-3's fail-closed
+behaviour. The rule is shared by native and portable restore because both
+paths use `metadata_apply_xattrs_target()`.
+
 ---
 
 ## D21 — 2026-08-08 — Portable case-collision resolution: deterministic suffix

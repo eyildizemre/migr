@@ -1328,6 +1328,19 @@ static int collect_entry(const SidecarLiveView *view, void *argument)
     destination->xattr_count = entry->xattr_count;
     entries->count++;
 
+    int carries_security_xattr = 0;
+    for (size_t xindex = 0; xindex < view->xattr_count; xindex++)
+        if ((metadata_xattr_namespace_bytes(
+                 view->xattrs[xindex].name.data,
+                 view->xattrs[xindex].name.length) &
+             METADATA_XATTR_NS_SECURITY) != 0)
+        {
+            carries_security_xattr = 1;
+            break;
+        }
+    if (carries_security_xattr)
+        metadata_profiles_note_security_xattr(&report->profiles);
+
     if (collect_metadata_profile(collection,
                                  &collection->manifest->roots[root_index],
                                  root_index, destination) != 0)
@@ -1936,6 +1949,18 @@ static void replay_report_failure(PortableRestoreReplayReport *report,
                       sizeof(report->failed_logical_path), logical);
 }
 
+static void replay_report_security_skipped(
+    PortableRestoreReplayReport *report, size_t count)
+{
+    if (report == NULL || count == 0 ||
+        report->skipped_security_xattr_count == SIZE_MAX)
+        return;
+    if (count > SIZE_MAX - report->skipped_security_xattr_count)
+        report->skipped_security_xattr_count = SIZE_MAX;
+    else
+        report->skipped_security_xattr_count += count;
+}
+
 static int replay_entries_reserve(ReplayCollection *collection, size_t extra)
 {
     if (collection == NULL || extra > SIDECAR_MAX_LIVE_ENTRIES -
@@ -2331,10 +2356,12 @@ static int replay_collect_entry(const SidecarLiveView *view, void *argument)
                         : NULL;
         if (kind_namespaces != NULL)
             for (size_t xindex = 0; xindex < view->xattr_count; xindex++)
-                *kind_namespaces |=
-                    metadata_xattr_namespace_bytes(
-                        view->xattrs[xindex].name.data,
-                        view->xattrs[xindex].name.length);
+            {
+                unsigned int namespaces = metadata_xattr_namespace_bytes(
+                    view->xattrs[xindex].name.data,
+                    view->xattrs[xindex].name.length);
+                *kind_namespaces |= namespaces;
+            }
     }
     replay->root_index = root_index;
     replay->depth = replay_path_depth(replay->destination);
@@ -2822,8 +2849,15 @@ static int replay_apply_regular(ReplayCollection *collection,
         result = metadata_apply_ownership_and_mode_fd(destination_fd,
                                                       &desired);
     if (result == 0)
-        result = metadata_apply_xattrs_fd(destination_fd, replay->xattrs,
-                                          replay->xattr_count);
+    {
+        size_t skipped_security = 0;
+        int xattr_result = metadata_apply_xattrs_fd_report(
+            destination_fd, replay->xattrs, replay->xattr_count,
+            &skipped_security);
+        replay_report_security_skipped(collection->report, skipped_security);
+        if (xattr_result != 0)
+            result = -1;
+    }
     if (result == 0)
         result = metadata_apply_times_fd(destination_fd, &desired,
                                          collection->timestamp_policy);
@@ -2890,9 +2924,15 @@ static int replay_apply_symlink(ReplayCollection *collection,
         result = metadata_apply_symlink_ownership_at(parent_fd, leaf,
                                                      &desired);
     if (result == 0)
-        result = metadata_apply_xattrs_symlink_at(parent_fd, leaf,
-                                                  replay->xattrs,
-                                                  replay->xattr_count);
+    {
+        size_t skipped_security = 0;
+        int xattr_result = metadata_apply_xattrs_symlink_at_report(
+            parent_fd, leaf, replay->xattrs, replay->xattr_count,
+            &skipped_security);
+        replay_report_security_skipped(collection->report, skipped_security);
+        if (xattr_result != 0)
+            result = -1;
+    }
     if (result == 0)
         result = metadata_apply_symlink_times_at(parent_fd, leaf, &desired,
                                                  collection->timestamp_policy);
@@ -3070,8 +3110,15 @@ static int replay_apply_directory_metadata(ReplayCollection *collection,
         result = metadata_apply_ownership_and_mode_fd(destination_fd,
                                                       &desired);
     if (result == 0)
-        result = metadata_apply_xattrs_fd(destination_fd, replay->xattrs,
-                                          replay->xattr_count);
+    {
+        size_t skipped_security = 0;
+        int xattr_result = metadata_apply_xattrs_fd_report(
+            destination_fd, replay->xattrs, replay->xattr_count,
+            &skipped_security);
+        replay_report_security_skipped(collection->report, skipped_security);
+        if (xattr_result != 0)
+            result = -1;
+    }
     if (result == 0)
         result = metadata_apply_times_fd(destination_fd, &desired,
                                          collection->timestamp_policy);
@@ -3310,12 +3357,40 @@ static void portable_restore_preview(
         return;
     printf("Portable restore dry run: %zu live entr%s would be applied\n",
            report->live_count, report->live_count == 1 ? "y" : "ies");
+    if (report->profiles.security_xattr_entry_count != 0)
+        printf("  %zu item(s) carry security.* attributes; whether they can "
+               "be applied here is measured, not predicted, and is only "
+               "found out on a live run\n",
+               report->profiles.security_xattr_entry_count);
     for (size_t index = 0; index < report->root_count; index++)
         if (report->roots[index].live_count != 0)
             printf("  root %s: %zu live entr%s\n",
                    report->roots[index].id,
                    report->roots[index].live_count,
                    report->roots[index].live_count == 1 ? "y" : "ies");
+}
+
+static int portable_restore_confirm(size_t security_xattr_entries)
+{
+    const char *ordinary_message =
+        "This will restore portable files to the destination. Continue?";
+    if (security_xattr_entries == 0)
+        return confirm_action(ordinary_message);
+
+    char message[768];
+    int length = snprintf(
+        message, sizeof(message),
+        "This restore includes %zu item(s) carrying security.* attributes "
+        "(e.g. SELinux labels); if this destination or account cannot "
+        "apply one, that item's other content and metadata will still be "
+        "restored and only the attribute will be skipped. Continue?",
+        security_xattr_entries);
+    if (length < 0 || (size_t)length >= sizeof(message))
+        return confirm_action(
+            "This restore includes security.* attributes; an attribute "
+            "that cannot be applied will be skipped while the item's other "
+            "content and metadata are restored. Continue?");
+    return confirm_action(message);
 }
 
 static PortableRestoreOutcome portable_restore_orchestrate_impl(
@@ -3353,7 +3428,8 @@ static PortableRestoreOutcome portable_restore_orchestrate_impl(
     }
 
     metadata_profiles_report(&preflight.profiles);
-    if (!confirm_action("This will restore portable files to the destination. Continue?"))
+    if (!portable_restore_confirm(
+            preflight.profiles.security_xattr_entry_count))
     {
         printf("Cancelled.\n");
         portable_restore_preflight_report_free(&preflight);
@@ -3407,7 +3483,13 @@ int portable_restore_at(const PortableRestoreRequest *request,
     PortableRestoreOutcome outcome =
         portable_restore_orchestrate_impl(request, report, 0);
     if (outcome == PORTABLE_RESTORE_COMPLETE)
+    {
         printf("Portable restore complete: %zu applied\n",
                report->applied_count);
+        if (report->skipped_security_xattr_count != 0)
+            printf("Portable restore skipped %zu security.* attribute(s) "
+                   "that the destination could not apply\n",
+                   report->skipped_security_xattr_count);
+    }
     return outcome == PORTABLE_RESTORE_ERROR ? -1 : 0;
 }

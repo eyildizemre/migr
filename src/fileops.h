@@ -162,6 +162,7 @@ typedef enum {
 typedef struct {
     size_t applied_count;
     size_t failed_count;
+    size_t skipped_security_xattr_count;
     char failed_logical_path[PATH_MAX];
 } RestoreNativeReport;
 

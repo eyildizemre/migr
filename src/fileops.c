@@ -1689,6 +1689,18 @@ static void restore_report_applied(RestoreNativeReport *report)
         report->applied_count++;
 }
 
+static void restore_report_security_skipped(RestoreNativeReport *report,
+                                            size_t count)
+{
+    if (report == NULL || count == 0 ||
+        report->skipped_security_xattr_count == SIZE_MAX)
+        return;
+    if (count > SIZE_MAX - report->skipped_security_xattr_count)
+        report->skipped_security_xattr_count = SIZE_MAX;
+    else
+        report->skipped_security_xattr_count += count;
+}
+
 // Validates a relative address before any traversal is attempted: a leading
 // '/', any ".." component, a bare ".", or an empty interior/trailing
 // component (e.g. "a//b" or "a/") are all refused outright -- never
@@ -2183,7 +2195,8 @@ static RestoreNativeStatus restore_entry_at(
             return -1;
         }
 
-        if (pass == RESTORE_VALIDATE && xattr_requirements != NULL)
+        if (pass == RESTORE_VALIDATE &&
+            (profiles != NULL || xattr_requirements != NULL))
         {
             char source_xattr_path[PATH_MAX];
             unsigned int namespaces = 0;
@@ -2196,7 +2209,11 @@ static RestoreNativeStatus restore_entry_at(
                 close(source_object_fd);
                 return -1;
             }
-            xattr_requirements->symlink_namespaces |= namespaces;
+            if (xattr_requirements != NULL)
+                xattr_requirements->symlink_namespaces |= namespaces;
+            if (profiles != NULL &&
+                (namespaces & METADATA_XATTR_NS_SECURITY) != 0)
+                metadata_profiles_note_security_xattr(profiles);
         }
 
         if (pass == RESTORE_VALIDATE && skip_symlink_target_read)
@@ -2247,10 +2264,16 @@ static RestoreNativeStatus restore_entry_at(
         }
         failed = metadata_apply_symlink_ownership_at(dest_parent_fd, dest_leaf,
                                                      &desired_st) != 0;
-        if (!failed &&
-            metadata_apply_xattrs_symlink_at(dest_parent_fd, dest_leaf,
-                                             xattrs.items, xattrs.count) != 0)
-            failed = 1;
+        if (!failed)
+        {
+            size_t skipped_security = 0;
+            int xattr_result = metadata_apply_xattrs_symlink_at_report(
+                dest_parent_fd, dest_leaf, xattrs.items, xattrs.count,
+                &skipped_security);
+            restore_report_security_skipped(restore_report, skipped_security);
+            if (xattr_result != 0)
+                failed = 1;
+        }
         if (!failed &&
             metadata_apply_symlink_times_at(
                 dest_parent_fd, dest_leaf, &desired_st,
@@ -2293,7 +2316,7 @@ static RestoreNativeStatus restore_entry_at(
         }
         if (pass == RESTORE_VALIDATE)
         {
-            if (xattr_requirements != NULL)
+            if (profiles != NULL || xattr_requirements != NULL)
             {
                 unsigned int namespaces = 0;
                 if (metadata_xattr_namespaces_fd(src_fd, &namespaces) != 0)
@@ -2301,7 +2324,11 @@ static RestoreNativeStatus restore_entry_at(
                     close(src_fd);
                     return RESTORE_NATIVE_ERROR;
                 }
-                xattr_requirements->regular_namespaces |= namespaces;
+                if (xattr_requirements != NULL)
+                    xattr_requirements->regular_namespaces |= namespaces;
+                if (profiles != NULL &&
+                    (namespaces & METADATA_XATTR_NS_SECURITY) != 0)
+                    metadata_profiles_note_security_xattr(profiles);
             }
             return close(src_fd) == 0 ? RESTORE_NATIVE_OK : RESTORE_NATIVE_ERROR;
         }
@@ -2333,9 +2360,16 @@ static RestoreNativeStatus restore_entry_at(
             if (!failed && (fstat(src_fd, &after) != 0 ||
                             !metadata_source_unchanged(&desired_st, &after)))
                 failed = 1;
-            if (!failed && metadata_apply_xattrs_fd(dst_fd, xattrs.items,
-                                                    xattrs.count) != 0)
-                failed = 1;
+            if (!failed)
+            {
+                size_t skipped_security = 0;
+                int xattr_result = metadata_apply_xattrs_fd_report(
+                    dst_fd, xattrs.items, xattrs.count, &skipped_security);
+                restore_report_security_skipped(restore_report,
+                                                skipped_security);
+                if (xattr_result != 0)
+                    failed = 1;
+            }
             if (!failed && metadata_apply_times_fd(dst_fd, &desired_st,
                                                    policy) != 0)
                 failed = 1;
@@ -2403,9 +2437,15 @@ static RestoreNativeStatus restore_entry_at(
                 !metadata_source_unchanged(&desired_st, &after))
                 failed = 1;
         }
-        if (!failed && metadata_apply_xattrs_fd(dst_fd, xattrs.items,
-                                                xattrs.count) != 0)
-            failed = 1;
+        if (!failed)
+        {
+            size_t skipped_security = 0;
+            int xattr_result = metadata_apply_xattrs_fd_report(
+                dst_fd, xattrs.items, xattrs.count, &skipped_security);
+            restore_report_security_skipped(restore_report, skipped_security);
+            if (xattr_result != 0)
+                failed = 1;
+        }
         if (!failed && metadata_apply_times_fd(dst_fd, &desired_st, policy) != 0)
             failed = 1;
         xattrs_free(&xattrs);
@@ -2448,7 +2488,8 @@ static RestoreNativeStatus restore_entry_at(
             return RESTORE_NATIVE_ERROR;
         }
 
-        if (pass == RESTORE_VALIDATE && xattr_requirements != NULL)
+        if (pass == RESTORE_VALIDATE &&
+            (profiles != NULL || xattr_requirements != NULL))
         {
             unsigned int namespaces = 0;
             if (metadata_xattr_namespaces_fd(source_dir_fd, &namespaces) != 0)
@@ -2456,7 +2497,11 @@ static RestoreNativeStatus restore_entry_at(
                 close(source_dir_fd);
                 return RESTORE_NATIVE_ERROR;
             }
-            xattr_requirements->directory_namespaces |= namespaces;
+            if (xattr_requirements != NULL)
+                xattr_requirements->directory_namespaces |= namespaces;
+            if (profiles != NULL &&
+                (namespaces & METADATA_XATTR_NS_SECURITY) != 0)
+                metadata_profiles_note_security_xattr(profiles);
         }
 
         int dest_dir_fd = open_destination_directory(pass, dest_parent_fd,
@@ -2531,9 +2576,17 @@ static RestoreNativeStatus restore_entry_at(
             if (!failed && (fstat(source_dir_fd, &after) != 0 ||
                             !metadata_source_unchanged(&desired_st, &after)))
                 failed = 1;
-            if (!failed && metadata_apply_xattrs_fd(dest_dir_fd, xattrs.items,
-                                                    xattrs.count) != 0)
-                failed = 1;
+            if (!failed)
+            {
+                size_t skipped_security = 0;
+                int xattr_result = metadata_apply_xattrs_fd_report(
+                    dest_dir_fd, xattrs.items, xattrs.count,
+                    &skipped_security);
+                restore_report_security_skipped(restore_report,
+                                                skipped_security);
+                if (xattr_result != 0)
+                    failed = 1;
+            }
             if (!failed &&
                 metadata_apply_times_fd(dest_dir_fd, &desired_st,
                                         metadata_policy_from_context(ctx)) != 0)

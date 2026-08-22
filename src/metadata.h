@@ -49,6 +49,7 @@ typedef struct MetadataProfiles {
     size_t count;
     size_t capacity;
     size_t affected_objects;
+    size_t security_xattr_entry_count;
     size_t example_count;
     char examples[METADATA_MAX_PREFLIGHT_EXAMPLES][PATH_MAX];
 } MetadataProfiles;
@@ -81,6 +82,7 @@ int metadata_profiles_add(MetadataProfiles *profiles, int anchor_fd,
 int metadata_profiles_probe(const MetadataProfiles *profiles,
                             MetadataTimestampPolicy policy);
 void metadata_profiles_report(const MetadataProfiles *profiles);
+void metadata_profiles_note_security_xattr(MetadataProfiles *profiles);
 int metadata_xattr_capability_probe(
     int anchor_fd, const MetadataXattrRequirements *required);
 int metadata_xattr_namespaces_fd(int fd, unsigned int *out);
@@ -138,9 +140,15 @@ int metadata_apply_symlink_times_at(int dir_fd, const char *leaf,
                                     MetadataTimestampPolicy policy);
 int metadata_apply_xattrs_fd(int fd, const SidecarXattr *xattrs,
                              size_t count);
+int metadata_apply_xattrs_fd_report(int fd, const SidecarXattr *xattrs,
+                                    size_t count,
+                                    size_t *skipped_security_count);
 int metadata_symlink_xattr_path(int dir_fd, const char *leaf,
                                 char *path, size_t path_size);
 int metadata_apply_xattrs_symlink_at(int dir_fd, const char *leaf,
                                      const SidecarXattr *xattrs, size_t count);
+int metadata_apply_xattrs_symlink_at_report(
+    int dir_fd, const char *leaf, const SidecarXattr *xattrs, size_t count,
+    size_t *skipped_security_count);
 
 #endif

@@ -28,6 +28,7 @@
 #define GREEN "\033[0;32m"
 #define RED   "\033[0;31m"
 #define BLUE  "\033[0;34m"
+#define YELLOW "\033[0;33m"
 #define NC    "\033[0m"
 
 static int failures;
@@ -570,6 +571,43 @@ static int write_sidecar(Fixture *fixture, const SidecarEntry *entries,
     return 0;
 }
 
+static int write_sidecar_with_xattr(Fixture *fixture,
+                                    const SidecarEntry *entries, size_t count,
+                                    size_t xattr_index,
+                                    const SidecarXattr *xattr)
+{
+    SidecarLog log = {0};
+    if (fixture == NULL || entries == NULL || xattr == NULL ||
+        xattr_index >= count ||
+        sidecar_log_create_at(fixture->container_fd, &log) !=
+            SIDECAR_OPEN_FRESH)
+        return -1;
+
+    int failed = 0;
+    for (size_t index = 0; index < count; index++)
+    {
+        SidecarClaim claim = {
+            .root_id = entries[index].root_id,
+            .logical_path = entries[index].logical_path,
+            .physical_path = entries[index].physical_path,
+            .kind = entries[index].kind
+        };
+        if (sidecar_log_append_claim(&log, &claim) != SIDECAR_STATUS_OK ||
+            sidecar_log_append_entry(&log, &entries[index]) !=
+                SIDECAR_STATUS_OK ||
+            (index == xattr_index &&
+             sidecar_log_append_xattr(&log, xattr) != SIDECAR_STATUS_OK) ||
+            sidecar_log_append_entry_commit(&log) != SIDECAR_STATUS_OK)
+        {
+            failed = 1;
+            break;
+        }
+    }
+    if (sidecar_log_close(&log) != SIDECAR_STATUS_OK)
+        failed = 1;
+    return failed ? -1 : 0;
+}
+
 static int open_fd_count(void)
 {
     DIR *directory = opendir("/proc/self/fd");
@@ -606,6 +644,11 @@ typedef struct {
     int saved_stdin;
 } ConfirmationInput;
 
+typedef struct {
+    int saved_stdout;
+    FILE *file;
+} OutputCapture;
+
 static void confirmation_begin(ConfirmationInput *input, const char *answer)
 {
     if (input == NULL || answer == NULL)
@@ -629,6 +672,39 @@ static void confirmation_end(ConfirmationInput *input)
         close(input->saved_stdin) != 0)
         fatal("could not restore confirmation input");
     input->saved_stdin = -1;
+}
+
+static void output_capture_begin(OutputCapture *capture)
+{
+    if (capture == NULL)
+        fatal("invalid output capture fixture");
+    fflush(stdout);
+    capture->file = tmpfile();
+    capture->saved_stdout = dup(STDOUT_FILENO);
+    if (capture->file == NULL || capture->saved_stdout < 0 ||
+        dup2(fileno(capture->file), STDOUT_FILENO) < 0)
+        fatal("could not redirect restore output");
+}
+
+static void output_capture_end(OutputCapture *capture, char *output,
+                               size_t output_size)
+{
+    if (capture == NULL || capture->file == NULL || output == NULL ||
+        output_size == 0)
+        fatal("invalid output capture state");
+    fflush(stdout);
+    if (dup2(capture->saved_stdout, STDOUT_FILENO) < 0 ||
+        close(capture->saved_stdout) != 0)
+        fatal("could not restore restore output");
+    capture->saved_stdout = -1;
+    rewind(capture->file);
+    size_t received = fread(output, 1, output_size - 1U, capture->file);
+    if (ferror(capture->file))
+        fatal("could not read captured restore output");
+    output[received] = '\0';
+    if (fclose(capture->file) != 0)
+        fatal("could not close captured restore output");
+    capture->file = NULL;
 }
 
 static void probe_observer(void *context)
@@ -780,6 +856,101 @@ static void test_normal_orchestration(void)
           "nested directory metadata is applied post-order");
     check(file_equals(sentinel, "untouched"),
           "unrelated destination content remains untouched");
+    fixture_close(&fixture);
+}
+
+static void test_security_xattr_tolerance_orchestration(void)
+{
+    printf(BLUE "::" NC " portable security.* xattr tolerance orchestration\n");
+    if (geteuid() == 0)
+    {
+        printf("  " YELLOW "-" NC
+               " security.* set-refusal orchestration skipped: root can "
+               "apply the fixture attribute\n");
+        return;
+    }
+
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "security.* tolerance fixture is created");
+    if (opened != 0)
+        return;
+
+    build_payload(&fixture, 0);
+    uint32_t uid = (uint32_t)geteuid();
+    uint32_t gid = (uint32_t)getegid();
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  uid, gid, 1700001100, 1, 1700001101, 2),
+        entry_for("ROOT", "file", "file", SIDECAR_KIND_REGULAR,
+                  strlen("portable payload"), 0600, uid, gid,
+                  1700001102, 3, 1700001103, 4)
+    };
+    static const unsigned char security_name[] = "security.migr_test";
+    static const unsigned char security_value[] = "probe";
+    SidecarXattr security_xattr = {
+        .name = {
+            .data = security_name,
+            .length = sizeof(security_name) - 1U
+        },
+        .value = {
+            .data = security_value,
+            .length = sizeof(security_value) - 1U
+        }
+    };
+    entries[1].xattr_count = 1;
+    check(write_sidecar_with_xattr(&fixture, entries, 2, 1,
+                                   &security_xattr) == 0,
+          "security.* tolerance sidecar is committed");
+
+    Manifest manifest;
+    int manifest_status = manifest_read_v1_at(fixture.container_fd,
+                                               &manifest);
+    PortableRestorePreflightReport preflight;
+    portable_restore_preflight_report_init(&preflight);
+    PortableRestoreRequest preflight_request = {
+        .source_container_fd = fixture.container_fd,
+        .manifest = &manifest,
+        .destination_home_fd = fixture.home_fd,
+        .destination_timestamp_policy = {
+            .nsec_exact = 1,
+            .configured = 1
+        }
+    };
+    int preflight_result = manifest_status == MANIFEST_STATUS_VALID
+        ? portable_restore_preflight_at(&preflight_request, &preflight) : -1;
+    check(preflight_result == 0 &&
+              preflight.profiles.security_xattr_entry_count == 1,
+          "preflight counts the entry carrying security.*");
+    portable_restore_preflight_report_free(&preflight);
+    if (manifest_status == MANIFEST_STATUS_VALID)
+        manifest_free(&manifest);
+
+    PortableRestoreReplayReport report;
+    char output[4096];
+    OutputCapture capture;
+    output_capture_begin(&capture);
+    int result = run_orchestration(&fixture, &report, 1, "y\n");
+    output_capture_end(&capture, output, sizeof(output));
+    check(result == 0 && report.live_count == 2 && report.applied_count == 2 &&
+              report.failed_count == 0 &&
+              report.skipped_security_xattr_count >= 1,
+          "security.* set refusal does not abort portable replay");
+    check(strstr(output, "carrying security.* attributes") != NULL &&
+              strstr(output, "only the attribute will be skipped") != NULL,
+          "the existing confirmation prompt includes the security warning");
+    char summary_marker[128];
+    int summary_length = snprintf(
+        summary_marker, sizeof(summary_marker), "Portable restore skipped %zu "
+        "security.* attribute", report.skipped_security_xattr_count);
+    check(summary_length >= 0 && (size_t)summary_length < sizeof(summary_marker) &&
+              strstr(output, summary_marker) != NULL,
+          "the final portable summary reports the tolerated attributes");
+    char file[PATH_MAX];
+    path_join_fixture(file, sizeof(file), fixture.home, "/restored/file");
+    check(file_equals(file, "portable payload"),
+          "portable replay preserves content when security.* is skipped");
     fixture_close(&fixture);
 }
 
@@ -1419,6 +1590,7 @@ static void test_direct_measures_timestamp_policy(void)
 int main(void)
 {
     test_normal_orchestration();
+    test_security_xattr_tolerance_orchestration();
     test_hardlink_orchestration();
     test_hardlink_cross_root();
     test_xdg_destination_orchestration();
