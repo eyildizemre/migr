@@ -554,6 +554,192 @@ static int v1_payload_rel(const ManifestRoot *root, char *out, size_t out_size)
     return n < 0 || (size_t)n >= out_size ? -1 : 0;
 }
 
+static int seed_native_restore_root(const CloneContext *ctx,
+                                    const RestoreTimestampAnchors *anchors,
+                                    const char *source,
+                                    const char *source_rel,
+                                    int destination_root_fd,
+                                    const char *destination_rel)
+{
+    CloneContext effective_ctx = *ctx;
+    int policy_anchor_fd = restore_destination_anchor_fd(destination_root_fd,
+                                                         destination_rel);
+    if (policy_anchor_fd < 0 ||
+        restore_timestamp_anchor_policy(anchors, policy_anchor_fd,
+                                        &effective_ctx.nsec_exact) != 0)
+    {
+        if (policy_anchor_fd >= 0)
+            close(policy_anchor_fd);
+        return -1;
+    }
+    effective_ctx.timestamp_policy_configured = 1;
+    if (close(policy_anchor_fd) != 0)
+        return -1;
+
+    char source_path[PATH_MAX];
+    if (source == NULL || source_rel == NULL || destination_rel == NULL)
+        return -1;
+    if (source_rel[0] == '\0')
+    {
+        int n = snprintf(source_path, sizeof(source_path), "%s", source);
+        if (n < 0 || (size_t)n >= sizeof(source_path))
+            return -1;
+    }
+    else if (path_join(source_path, sizeof(source_path), source,
+                       source_rel) != 0)
+        return -1;
+    return native_inode_map_seed_existing(&effective_ctx, source_path,
+                                          destination_root_fd,
+                                          destination_rel);
+}
+
+static int seed_native_restore_v1_hardlink_map(
+    const char *source, int source_root_fd, const char *home, int home_fd,
+    const Manifest *m, const CloneContext *ctx,
+    const RestoreTimestampAnchors *anchors)
+{
+    char *xdg_dirs[XDG_RESTORE_COUNT] = {0};
+    int xdg_ready = 0;
+    int failed = 0;
+
+    for (int i = 0; i < m->root_count; i++)
+    {
+        const ManifestRoot *root = &m->roots[i];
+        if (root->policy == ROOT_POLICY_MANUAL_NATIVE)
+            continue;
+
+        char source_rel[PATH_MAX + 8];
+        if (v1_payload_rel(root, source_rel, sizeof(source_rel)) != 0 ||
+            restore_native_source_status_at(source_root_fd, source_rel) !=
+                RESTORE_SOURCE_PRESENT)
+        {
+            failed = 1;
+            continue;
+        }
+
+        int destination_fd = home_fd;
+        int close_destination = 0;
+        char destination_rel[PATH_MAX + 8];
+        if (root->policy == ROOT_POLICY_HOME_RELATIVE)
+        {
+            int n = snprintf(destination_rel, sizeof(destination_rel), "%s",
+                             root->restore_path);
+            if (n < 0 || (size_t)n >= sizeof(destination_rel))
+            {
+                failed = 1;
+                continue;
+            }
+        }
+        else
+        {
+            if (!xdg_ready)
+            {
+                if (xdg_resolve(home, xdg_keys, xdg_fallbacks, xdg_dirs,
+                                XDG_RESTORE_COUNT) != 0)
+                {
+                    free_xdg_dirs(xdg_dirs);
+                    return -1;
+                }
+                xdg_ready = 1;
+            }
+            int index = xdg_key_index(root->id);
+            if (index < 0 ||
+                open_xdg_destination_anchor(xdg_dirs[index], &destination_fd,
+                                             destination_rel,
+                                             sizeof(destination_rel)) != 0)
+            {
+                failed = 1;
+                continue;
+            }
+            close_destination = 1;
+        }
+
+        if (seed_native_restore_root(ctx, anchors, source, source_rel,
+                                     destination_fd, destination_rel) != 0)
+            failed = 1;
+        if (close_destination && close(destination_fd) != 0)
+            failed = 1;
+    }
+
+    if (xdg_ready)
+        free_xdg_dirs(xdg_dirs);
+    return failed ? -1 : 0;
+}
+
+static int seed_native_restore_legacy_hardlink_map(
+    const char *source, int source_root_fd, const char *home, int home_fd,
+    const CloneContext *ctx, const RestoreTimestampAnchors *anchors)
+{
+    char *xdg_dirs[XDG_RESTORE_COUNT] = {0};
+    if (xdg_resolve(home, xdg_keys, xdg_fallbacks, xdg_dirs,
+                    XDG_RESTORE_COUNT) != 0)
+    {
+        free_xdg_dirs(xdg_dirs);
+        return -1;
+    }
+
+    char *manifest_names[XDG_RESTORE_COUNT] = {0};
+    (void)legacy_manifest_read(source, manifest_names, XDG_RESTORE_COUNT);
+    int failed = 0;
+    for (int i = 0; i < XDG_RESTORE_COUNT; i++)
+    {
+        const char *name = manifest_names[i];
+        if (name == NULL)
+        {
+            const char *slash = strrchr(xdg_dirs[i], '/');
+            name = slash == NULL ? xdg_dirs[i] : slash + 1;
+        }
+
+        RestoreSourceStatus status =
+            restore_native_source_status_at(source_root_fd, name);
+        if (status == RESTORE_SOURCE_MISSING)
+            continue;
+        if (status != RESTORE_SOURCE_PRESENT)
+        {
+            failed = 1;
+            continue;
+        }
+
+        int destination_fd;
+        char destination_rel[NAME_MAX + 1];
+        if (open_xdg_destination_anchor(xdg_dirs[i], &destination_fd,
+                                         destination_rel,
+                                         sizeof(destination_rel)) != 0)
+        {
+            failed = 1;
+            continue;
+        }
+        if (seed_native_restore_root(ctx, anchors, source, name,
+                                     destination_fd, destination_rel) != 0)
+            failed = 1;
+        if (close(destination_fd) != 0)
+            failed = 1;
+    }
+
+    const char *home_items[] = {
+        "Projects", ".ssh", ".gnupg", ".gitconfig", ".bashrc", ".profile",
+        ".mozilla", ".config/google-chrome", ".config/chromium",
+        ".config/BraveSoftware", ".config/vivaldi",
+        ".config/microsoft-edge", ".config/opera", NULL
+    };
+    for (int i = 0; home_items[i] != NULL; i++)
+    {
+        RestoreSourceStatus status =
+            restore_native_source_status_at(source_root_fd, home_items[i]);
+        if (status == RESTORE_SOURCE_MISSING)
+            continue;
+        if (status != RESTORE_SOURCE_PRESENT ||
+            seed_native_restore_root(ctx, anchors, source, home_items[i],
+                                     home_fd, home_items[i]) != 0)
+            failed = 1;
+    }
+
+    for (int i = 0; i < XDG_RESTORE_COUNT; i++)
+        free(manifest_names[i]);
+    free_xdg_dirs(xdg_dirs);
+    return failed ? -1 : 0;
+}
+
 // A versioned root table is an inventory, not a list of optional probes. A
 // finalized container missing any declared payload is corrupt and must be
 // refused before confirmation or destination mutation.
@@ -1464,6 +1650,39 @@ int restore(const char *source)
             return 1;
         }
         ctx.metadata_preflight_done = 1;
+        ctx.inode_map = native_inode_map_create();
+        if (ctx.inode_map == NULL)
+        {
+            printf("Error: Could not initialize native hardlink restore tracking\n");
+            metadata_profiles_free(&metadata_profiles);
+            restore_timestamp_anchors_free(&timestamp_anchors);
+            if (mst == MANIFEST_STATUS_VALID)
+                manifest_free(&m);
+            close(home_fd);
+            close(source_root_fd);
+            return 1;
+        }
+
+        int seed_status = mst == MANIFEST_STATUS_VALID
+            ? seed_native_restore_v1_hardlink_map(
+                  source, source_root_fd, home, home_fd, &m, &ctx,
+                  &timestamp_anchors)
+            : seed_native_restore_legacy_hardlink_map(
+                  source, source_root_fd, home, home_fd, &ctx,
+                  &timestamp_anchors);
+        if (seed_status != 0)
+        {
+            printf("Error: Could not seed native hardlink restore tracking\n");
+            native_inode_map_free(ctx.inode_map);
+            ctx.inode_map = NULL;
+            metadata_profiles_free(&metadata_profiles);
+            restore_timestamp_anchors_free(&timestamp_anchors);
+            if (mst == MANIFEST_STATUS_VALID)
+                manifest_free(&m);
+            close(home_fd);
+            close(source_root_fd);
+            return 1;
+        }
     }
 
     if (mst == MANIFEST_STATUS_VALID)
@@ -1479,6 +1698,8 @@ int restore(const char *source)
                            &count, &had_error, &timestamp_anchors,
                            &skipped_security_xattrs) != 0)
         {
+            native_inode_map_free(ctx.inode_map);
+            ctx.inode_map = NULL;
             metadata_profiles_free(&metadata_profiles);
             restore_timestamp_anchors_free(&timestamp_anchors);
             close(home_fd);
@@ -1486,6 +1707,9 @@ int restore(const char *source)
             return 1;
         }
     }
+
+    native_inode_map_free(ctx.inode_map);
+    ctx.inode_map = NULL;
 
     restore_packages(source_root_fd, home, &had_error);
 

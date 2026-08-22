@@ -347,6 +347,22 @@ static void capture_roots(const CloneContext *ctx, const BackupPlan *plan, int d
     }
 }
 
+// A partial native capture may already contain one member of a hardlink group.
+// Seed every existing, resume-matching destination before the live walk so the
+// current root/readdir order cannot replace that earlier representative.
+static int seed_native_hardlink_map(const CloneContext *ctx,
+                                    const BackupPlan *plan, int data_fd)
+{
+    for (int i = 0; i < plan->root_count; i++)
+    {
+        const BackupPlanRoot *root = &plan->roots[i];
+        if (native_inode_map_seed_existing(ctx, root->capture_path, data_fd,
+                                           root->manifest_root.payload_path) != 0)
+            return -1;
+    }
+    return 0;
+}
+
 static void reconcile_roots(const void *visited, const BackupPlan *plan,
                             int data_fd, int *had_error)
 {
@@ -1106,7 +1122,13 @@ int backup(const char *target, BackupMode mode, char **paths)
             }
             else
             {
-                capture_roots(&ctx, &plan, data_fd, &count, &had_error);
+                if (adopted && seed_native_hardlink_map(&ctx, &plan, data_fd) != 0)
+                {
+                    printf("Error: Could not seed native hardlink/resume tracking\n");
+                    had_error = 1;
+                }
+                if (!had_error)
+                    capture_roots(&ctx, &plan, data_fd, &count, &had_error);
                 if (!had_error)
                     reconcile_roots(ctx.visited, &plan, data_fd, &had_error);
                 native_inode_map_free(ctx.inode_map);

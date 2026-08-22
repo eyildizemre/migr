@@ -31,6 +31,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <sys/xattr.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -480,9 +481,9 @@ static void test_restores_nested_files_and_directories(void)
     remove_tree(dest_root);
 }
 
-static void test_duplicates_hardlinked_payload_files(void)
+static void test_relinks_hardlinked_payload_files(void)
 {
-    printf(BLUE "::" NC " restore_native_at: hardlinked payload files restore as distinct inodes\n");
+    printf(BLUE "::" NC " restore_native_at: hardlinked payload files relink to one destination inode\n");
 
     char source_root[PATH_MAX], dest_root[PATH_MAX];
     fresh_mkdtemp(source_root, sizeof(source_root), "restore_src");
@@ -497,6 +498,16 @@ static void test_duplicates_hardlinked_payload_files(void)
     write_file(source_first, "hardlink-content");
     check(link(source_first, source_second) == 0,
           "fixture: create two hardlinked payload files");
+    check(chmod(source_first, 0640) == 0,
+          "fixture: set representative mode on the source inode");
+
+    static const char xattr_name[] = "user.migr_native_restore";
+    static const char xattr_value[] = "hardlink-xattr";
+    int xattr_available =
+        setxattr(source_first, xattr_name, xattr_value,
+                 sizeof(xattr_value) - 1U, 0) == 0;
+    if (!xattr_available)
+        printf("  " BLUE "-" NC " user xattrs unavailable on this fixture filesystem\n");
 
     struct stat source_first_st;
     struct stat source_second_st;
@@ -510,8 +521,14 @@ static void test_duplicates_hardlinked_payload_files(void)
 
     int source_fd = open_dir_fd(source_root);
     int dest_fd = open_dir_fd(dest_root);
-    check(restore_native_at(&RESTORE_CTX, source_fd, "payload",
-                            dest_fd, "payload") == 0,
+    void *map = native_inode_map_create();
+    check(map != NULL, "native restore creates a hardlink map");
+    CloneContext hardlink_ctx = RESTORE_CTX;
+    hardlink_ctx.timestamp_policy_configured = 1;
+    hardlink_ctx.nsec_exact = 1;
+    hardlink_ctx.inode_map = map;
+    check(map != NULL && restore_native_at(&hardlink_ctx, source_fd, "payload",
+                                           dest_fd, "payload") == 0,
           "restoring a payload with hardlinked files succeeds");
 
     char dest_first[PATH_MAX], dest_second[PATH_MAX];
@@ -526,17 +543,98 @@ static void test_duplicates_hardlinked_payload_files(void)
     check(destination_files_ok,
           "both hardlinked payload paths restore as regular files");
 
+    check(destination_files_ok &&
+              native_hardlink_identity_matches(&dest_first_st, &dest_second_st) &&
+              dest_first_st.st_nlink == 2,
+          "native restore relinks both hardlink names to one destination inode");
+
+    check(destination_files_ok &&
+              (dest_first_st.st_mode & 07777) ==
+                  (source_first_st.st_mode & 07777) &&
+              (dest_second_st.st_mode & 07777) ==
+                  (source_second_st.st_mode & 07777) &&
+              dest_first_st.st_uid == source_first_st.st_uid &&
+              dest_second_st.st_uid == source_second_st.st_uid &&
+              dest_first_st.st_gid == source_first_st.st_gid &&
+              dest_second_st.st_gid == source_second_st.st_gid,
+          "native restore preserves mode and ownership through the shared inode");
+
     char first_content[64], second_content[64];
     read_file(dest_first, first_content, sizeof(first_content));
     read_file(dest_second, second_content, sizeof(second_content));
     check(destination_files_ok &&
               strcmp(first_content, "hardlink-content") == 0 &&
               strcmp(second_content, "hardlink-content") == 0,
-          "duplicated hardlink payload files preserve their content");
-    check(destination_files_ok &&
-              dest_first_st.st_ino != dest_second_st.st_ino,
-          "native restore deliberately duplicates the hardlink inode");
+          "relinked hardlink payload files preserve their content");
 
+    if (xattr_available)
+    {
+        char first_value[64] = {0};
+        char second_value[64] = {0};
+        ssize_t first_length = getxattr(dest_first, xattr_name,
+                                        first_value, sizeof(first_value));
+        ssize_t second_length = getxattr(dest_second, xattr_name,
+                                         second_value, sizeof(second_value));
+        check(first_length == (ssize_t)(sizeof(xattr_value) - 1U) &&
+                  second_length == first_length &&
+                  memcmp(first_value, xattr_value, (size_t)first_length) == 0 &&
+                  memcmp(second_value, xattr_value, (size_t)second_length) == 0,
+              "native restore carries the representative xattr to both hardlink names");
+    }
+
+    native_inode_map_free(map);
+    close(source_fd);
+    close(dest_fd);
+    remove_tree(source_root);
+    remove_tree(dest_root);
+}
+
+static void test_failed_hardlink_representative_is_not_recorded(void)
+{
+    printf(BLUE "::" NC " restore_native_at: a failed hardlink representative never poisons the inode map\n");
+
+    char source_root[PATH_MAX], dest_root[PATH_MAX];
+    fresh_mkdtemp(source_root, sizeof(source_root), "restore_src");
+    fresh_mkdtemp(dest_root, sizeof(dest_root), "restore_dst");
+
+    char source_first[PATH_MAX], source_second[PATH_MAX];
+    join_path(source_first, sizeof(source_first), source_root, "first");
+    join_path(source_second, sizeof(source_second), source_root, "second");
+    write_file(source_first, "failed-representative-content");
+    check(link(source_first, source_second) == 0,
+          "fixture: create the failed-representative hardlink pair");
+
+    char destination_first[PATH_MAX];
+    join_path(destination_first, sizeof(destination_first), dest_root, "first");
+    check(mkdir(destination_first, 0755) == 0,
+          "fixture: place a wrong-type destination at the representative address");
+
+    int source_fd = open_dir_fd(source_root);
+    int dest_fd = open_dir_fd(dest_root);
+    void *map = native_inode_map_create();
+    CloneContext hardlink_ctx = RESTORE_CTX;
+    hardlink_ctx.timestamp_policy_configured = 1;
+    hardlink_ctx.nsec_exact = 1;
+    hardlink_ctx.inode_map = map;
+
+    check(map != NULL && restore_native_at(&hardlink_ctx, source_fd, "first",
+                                           dest_fd, "first") != 0,
+          "a representative type failure is reported before map insertion");
+
+    char destination_second[PATH_MAX];
+    join_path(destination_second, sizeof(destination_second), dest_root, "second");
+    check(map != NULL && restore_native_at(&hardlink_ctx, source_fd, "second",
+                                           dest_fd, "second") == 0,
+          "the sibling can become a new representative after that failure");
+    struct stat second_st;
+    check(lstat(destination_second, &second_st) == 0 &&
+              S_ISREG(second_st.st_mode) && second_st.st_nlink == 1,
+          "a failed representative leaves the later sibling independent");
+    struct stat first_st;
+    check(lstat(destination_first, &first_st) == 0 && S_ISDIR(first_st.st_mode),
+          "the wrong-type representative destination remains untouched");
+
+    native_inode_map_free(map);
     close(source_fd);
     close(dest_fd);
     remove_tree(source_root);
@@ -945,7 +1043,8 @@ int main(void)
     test_rejects_lexically_invalid_relative_paths();
 
     test_restores_nested_files_and_directories();
-    test_duplicates_hardlinked_payload_files();
+    test_relinks_hardlinked_payload_files();
+    test_failed_hardlink_representative_is_not_recorded();
     test_restores_names_with_problem_bytes();
     test_regular_file_resume_and_overwrite();
     test_restores_fifo();

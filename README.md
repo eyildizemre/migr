@@ -191,9 +191,14 @@ namespace collision refuse the entire invocation before anything is written.
 
 Hardlinked files keep their shared identity across both representations.
 Native capture links a later occurrence of an already-seen file to its first
-copy instead of duplicating its bytes; native restore does not read the
-sidecar and cannot recreate the link, so it duplicates on restore (a
-documented limitation). Portable capture records the first-seen file as
+copy instead of duplicating its bytes; an adopted native resume seeds that
+representative from the existing payload before walking, so traversal order
+cannot flip the group. Native restore does not read the sidecar: it tracks
+source inode identity, seeds existing representatives before every native
+apply walk, and recreates later members with real links, while applying
+metadata and xattrs only to the representative. This keeps a hardlink group
+stable when restore is resumed in a new process.
+Portable capture records the first-seen file as
 regular and every later occurrence as a hardlink record referencing it,
 including across different backup roots; restore replays the group with
 `link()`, and because the link shares the representative's inode, its

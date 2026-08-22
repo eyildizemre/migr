@@ -395,6 +395,295 @@ static int native_inode_map_insert(NativeInodeMap *map, dev_t device,
     return 0;
 }
 
+static int native_seed_destination_matches(const CloneContext *ctx,
+                                           const struct stat *source,
+                                           const struct stat *destination)
+{
+    MetadataTimestampPolicy policy = metadata_policy_from_context(ctx);
+    return ctx != NULL && source != NULL && destination != NULL &&
+           S_ISREG(destination->st_mode) &&
+           destination->st_size == source->st_size &&
+           destination->st_mtim.tv_sec == source->st_mtim.tv_sec &&
+           (!policy.nsec_exact ||
+            destination->st_mtim.tv_nsec == source->st_mtim.tv_nsec);
+}
+
+// Restore roots may name a nested relative destination, or the destination
+// root itself (""), while native capture always supplies one leaf. Keep the
+// seed walk fd-anchored for both shapes and treat a missing intermediate as
+// an empty pre-existing subtree rather than creating anything here.
+static int native_seed_relative_path_is_safe(const char *rel)
+{
+    if (rel == NULL || rel[0] == '/')
+        return 0;
+    if (rel[0] == '\0')
+        return 1;
+
+    const char *start = rel;
+    for (const char *p = rel;; p++)
+    {
+        if (p[0] != '/' && p[0] != '\0')
+            continue;
+        size_t length = (size_t)(p - start);
+        if (length == 0 || length > NAME_MAX ||
+            (length == 1 && start[0] == '.') ||
+            (length == 2 && start[0] == '.' && start[1] == '.'))
+            return 0;
+        if (p[0] == '\0')
+            return 1;
+        start = p + 1;
+    }
+}
+
+static int native_seed_destination_parent(int destination_root_fd,
+                                          const char *destination_rel,
+                                          int *parent_fd_out,
+                                          char *leaf_out,
+                                          size_t leaf_size)
+{
+    if (destination_root_fd < 0 || destination_rel == NULL ||
+        parent_fd_out == NULL || leaf_out == NULL || leaf_size == 0 ||
+        !native_seed_relative_path_is_safe(destination_rel))
+        return -1;
+
+    *parent_fd_out = -1;
+    if (destination_rel[0] == '\0')
+        return 1;
+
+    int current_fd = fcntl(destination_root_fd, F_DUPFD_CLOEXEC, 0);
+    if (current_fd < 0)
+        return -1;
+
+    const char *component = destination_rel;
+    for (;;)
+    {
+        const char *slash = strchr(component, '/');
+        size_t length = slash == NULL ? strlen(component)
+                                      : (size_t)(slash - component);
+        if (slash == NULL)
+        {
+            if (length >= leaf_size)
+            {
+                close(current_fd);
+                return -1;
+            }
+            memcpy(leaf_out, component, length + 1U);
+            *parent_fd_out = current_fd;
+            return 0;
+        }
+
+        char child[NAME_MAX + 1U];
+        if (length >= sizeof(child))
+        {
+            close(current_fd);
+            return -1;
+        }
+        memcpy(child, component, length);
+        child[length] = '\0';
+        int next_fd = openat(current_fd, child,
+                             O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                                 O_CLOEXEC);
+        if (next_fd < 0)
+        {
+            int saved_errno = errno;
+            close(current_fd);
+            return saved_errno == ENOENT ? 1 : -1;
+        }
+        close(current_fd);
+        current_fd = next_fd;
+        component = slash + 1;
+    }
+}
+
+static int native_inode_map_seed_existing_at(
+    const CloneContext *ctx, const char *source_path, int destination_dir_fd,
+    const char *destination_leaf);
+
+static int native_inode_map_seed_existing_directory_at(
+    const CloneContext *ctx, const char *source_path, int source_fd,
+    int destination_fd)
+{
+    int scan_fd = fcntl(source_fd, F_DUPFD_CLOEXEC, 0);
+    DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
+    if (directory == NULL)
+    {
+        if (scan_fd >= 0)
+            close(scan_fd);
+        close(source_fd);
+        close(destination_fd);
+        return -1;
+    }
+
+    int failed = 0;
+    for (;;)
+    {
+        errno = 0;
+        struct dirent *entry = readdir(directory);
+        if (entry == NULL)
+        {
+            if (errno != 0)
+                failed = 1;
+            break;
+        }
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0)
+            continue;
+
+        char child_source[PATH_MAX];
+        if (path_join(child_source, sizeof(child_source), source_path,
+                      entry->d_name) != 0 ||
+            native_inode_map_seed_existing_at(ctx, child_source,
+                                               destination_fd,
+                                               entry->d_name) != 0)
+        {
+            failed = 1;
+            break;
+        }
+    }
+    if (closedir(directory) != 0)
+        failed = 1;
+    if (close(source_fd) != 0)
+        failed = 1;
+    if (close(destination_fd) != 0)
+        failed = 1;
+    return failed ? -1 : 0;
+}
+
+static int native_inode_map_seed_existing_at(
+    const CloneContext *ctx, const char *source_path, int destination_dir_fd,
+    const char *destination_leaf)
+{
+    struct stat source_st;
+    if (lstat(source_path, &source_st) != 0)
+        return -1;
+
+    struct stat destination_st;
+    if (fstatat(destination_dir_fd, destination_leaf, &destination_st,
+                AT_SYMLINK_NOFOLLOW) != 0)
+    {
+        return errno == ENOENT ? 0 : -1;
+    }
+
+    if (S_ISREG(source_st.st_mode))
+    {
+        if (source_st.st_nlink <= 1 ||
+            !native_seed_destination_matches(ctx, &source_st,
+                                              &destination_st))
+            return 0;
+
+        int source_fd = open(source_path,
+                             O_RDONLY | O_NOATIME | O_CLOEXEC | O_NOFOLLOW);
+        if (source_fd < 0)
+            return errno == EPERM ? 0 : -1;
+        struct stat opened;
+        int failed = fstat(source_fd, &opened) != 0 ||
+                     !metadata_source_unchanged(&source_st, &opened);
+        if (close(source_fd) != 0)
+            failed = 1;
+        if (failed)
+            return -1;
+        return native_inode_map_insert(ctx->inode_map, source_st.st_dev,
+                                       source_st.st_ino, destination_dir_fd,
+                                       destination_leaf);
+    }
+
+    if (!S_ISDIR(source_st.st_mode) || !S_ISDIR(destination_st.st_mode))
+        return 0;
+
+    int source_fd = open(source_path,
+                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                         O_NOATIME | O_CLOEXEC);
+    if (source_fd < 0)
+        return errno == EPERM ? 0 : -1;
+    struct stat opened;
+    int failed = fstat(source_fd, &opened) != 0 ||
+                 !metadata_source_unchanged(&source_st, &opened);
+    if (failed)
+    {
+        close(source_fd);
+        return -1;
+    }
+
+    int destination_fd = openat(destination_dir_fd, destination_leaf,
+                                O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                                O_CLOEXEC);
+    if (destination_fd < 0)
+    {
+        close(source_fd);
+        return -1;
+    }
+    return native_inode_map_seed_existing_directory_at(
+        ctx, source_path, source_fd, destination_fd);
+}
+
+static int native_inode_map_seed_existing_root_at(
+    const CloneContext *ctx, const char *source_path, int destination_root_fd)
+{
+    struct stat source_st;
+    if (lstat(source_path, &source_st) != 0)
+        return -1;
+
+    struct stat destination_st;
+    if (fstat(destination_root_fd, &destination_st) != 0)
+        return -1;
+    if (!S_ISDIR(destination_st.st_mode) || !S_ISDIR(source_st.st_mode))
+        return 0;
+
+    int source_fd = open(source_path,
+                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                         O_NOATIME | O_CLOEXEC);
+    if (source_fd < 0)
+        return errno == EPERM ? 0 : -1;
+    struct stat opened;
+    int failed = fstat(source_fd, &opened) != 0 ||
+                 !metadata_source_unchanged(&source_st, &opened);
+    if (failed)
+    {
+        close(source_fd);
+        return -1;
+    }
+
+    int destination_fd = fcntl(destination_root_fd, F_DUPFD_CLOEXEC, 0);
+    if (destination_fd < 0)
+    {
+        close(source_fd);
+        return -1;
+    }
+    return native_inode_map_seed_existing_directory_at(
+        ctx, source_path, source_fd, destination_fd);
+}
+
+int native_inode_map_seed_existing(const CloneContext *ctx,
+                                   const char *source_path,
+                                   int destination_root_fd,
+                                   const char *destination_rel)
+{
+    if (ctx == NULL ||
+        (ctx->operation != CLONE_BACKUP && ctx->operation != CLONE_RESTORE) ||
+        ctx->representation != CLONE_NATIVE_TREE ||
+        source_path == NULL || destination_root_fd < 0 ||
+        !native_seed_relative_path_is_safe(destination_rel))
+        return -1;
+    if (ctx->inode_map == NULL)
+        return 0;
+    if (destination_rel[0] == '\0')
+        return native_inode_map_seed_existing_root_at(
+            ctx, source_path, destination_root_fd);
+
+    int destination_parent_fd = -1;
+    char destination_leaf[NAME_MAX + 1U];
+    int resolved = native_seed_destination_parent(
+        destination_root_fd, destination_rel, &destination_parent_fd,
+        destination_leaf, sizeof(destination_leaf));
+    if (resolved != 0)
+        return resolved > 0 ? 0 : -1;
+    int result = native_inode_map_seed_existing_at(
+        ctx, source_path, destination_parent_fd, destination_leaf);
+    if (close(destination_parent_fd) != 0)
+        result = -1;
+    return result;
+}
+
 int native_hardlink_identity_matches(const struct stat *linked,
                                      const struct stat *reference)
 {
@@ -1637,6 +1926,21 @@ typedef enum {
 static RestoreNativeTestSourceReadMode source_read_test_mode;
 static size_t source_read_test_apply_successes;
 static size_t source_read_test_apply_failure_after = SIZE_MAX;
+static RestoreNativeTestApplyHook restore_test_apply_hook;
+static void *restore_test_apply_context;
+
+void restore_native_test_set_apply_hook(RestoreNativeTestApplyHook hook,
+                                        void *context)
+{
+    restore_test_apply_hook = hook;
+    restore_test_apply_context = context;
+}
+
+static void restore_native_test_after_apply(const char *logical_path)
+{
+    if (restore_test_apply_hook != NULL)
+        restore_test_apply_hook(logical_path, restore_test_apply_context);
+}
 
 void restore_native_test_set_source_read_mode(
     RestoreNativeTestSourceReadMode mode)
@@ -1667,6 +1971,13 @@ static int source_read_test_refused(RestorePass pass)
         return 1;
     source_read_test_apply_successes++;
     return 0;
+}
+#endif
+
+#ifndef FILEOPS_TEST_HOOKS
+static void restore_native_test_after_apply(const char *logical_path)
+{
+    (void)logical_path;
 }
 #endif
 
@@ -2109,6 +2420,68 @@ static void metadata_child_path(const char *parent, const char *leaf,
     (void)snprintf(out, PATH_MAX, ".../%s", leaf);
 }
 
+// A linked sibling receives no independent payload or metadata write: the
+// representative inode already carries the source object's complete state.
+// Existing independent content at the sibling address is a collision, not a
+// reason to unlink or replace it.
+static RestoreNativeStatus restore_linked_regular_at(
+    int source_fd, int destination_parent_fd, const char *destination_leaf,
+    int representative_parent_fd, const char *representative_leaf,
+    const struct stat *desired_st, const char *logical_path,
+    RestoreNativeReport *restore_report)
+{
+    int failed = 0;
+    struct stat source_after;
+    if (fstat(source_fd, &source_after) != 0 ||
+        !metadata_source_unchanged(desired_st, &source_after))
+        failed = 1;
+    if (close(source_fd) != 0)
+        failed = 1;
+
+    struct stat representative;
+    if (!failed &&
+        (fstatat(representative_parent_fd, representative_leaf,
+                 &representative, AT_SYMLINK_NOFOLLOW) != 0 ||
+         !S_ISREG(representative.st_mode)))
+        failed = 1;
+
+    if (!failed)
+    {
+        struct stat existing;
+        if (fstatat(destination_parent_fd, destination_leaf, &existing,
+                    AT_SYMLINK_NOFOLLOW) == 0)
+        {
+            if (!native_hardlink_identity_matches(&existing, &representative))
+                failed = 1;
+        }
+        else if (errno == ENOENT)
+        {
+            if (linkat(representative_parent_fd, representative_leaf,
+                       destination_parent_fd, destination_leaf, 0) != 0)
+                failed = 1;
+            else
+            {
+                struct stat linked;
+                if (fstatat(destination_parent_fd, destination_leaf, &linked,
+                            AT_SYMLINK_NOFOLLOW) != 0 ||
+                    !native_hardlink_identity_matches(&linked,
+                                                      &representative))
+                    failed = 1;
+            }
+        }
+        else
+            failed = 1;
+    }
+
+    if (failed)
+    {
+        restore_report_failure(restore_report, logical_path);
+        return RESTORE_NATIVE_ERROR;
+    }
+    restore_report_applied(restore_report);
+    return RESTORE_NATIVE_OK;
+}
+
 // The same recursive dispatcher serves mutation-free validation and the
 // actual restore. A negative destination parent means the corresponding
 // destination subtree does not exist during validation.
@@ -2333,6 +2706,27 @@ static RestoreNativeStatus restore_entry_at(
             return close(src_fd) == 0 ? RESTORE_NATIVE_OK : RESTORE_NATIVE_ERROR;
         }
 
+        if (ctx->inode_map != NULL && opened_source_st.st_nlink > 1)
+        {
+            int representative_parent_fd = -1;
+            char representative_leaf[NAME_MAX + 1U];
+            int found = native_inode_map_find(
+                ctx->inode_map, opened_source_st.st_dev,
+                opened_source_st.st_ino, &representative_parent_fd,
+                representative_leaf, sizeof(representative_leaf));
+            if (found < 0)
+            {
+                close(src_fd);
+                restore_report_failure(restore_report, logical_path);
+                return RESTORE_NATIVE_ERROR;
+            }
+            if (found > 0)
+                return restore_linked_regular_at(
+                    src_fd, dest_parent_fd, dest_leaf,
+                    representative_parent_fd, representative_leaf,
+                    &desired_st, logical_path, restore_report);
+        }
+
         struct stat opened_dest_st;
         int dest_created;
         int dst_fd = open_destination_regular(dest_parent_fd, dest_leaf,
@@ -2378,8 +2772,18 @@ static RestoreNativeStatus restore_entry_at(
                 failed = 1;
             if (close(dst_fd) != 0)
                 failed = 1;
+            if (!failed && ctx->inode_map != NULL &&
+                opened_source_st.st_nlink > 1 &&
+                native_inode_map_insert(ctx->inode_map,
+                                        opened_source_st.st_dev,
+                                        opened_source_st.st_ino,
+                                        dest_parent_fd, dest_leaf) != 0)
+                failed = 1;
             if (!failed && pass == RESTORE_APPLY)
+            {
                 restore_report_applied(restore_report);
+                restore_native_test_after_apply(logical_path);
+            }
             else if (failed && pass == RESTORE_APPLY)
                 restore_report_failure(restore_report, logical_path);
             return failed ? RESTORE_NATIVE_ERROR : RESTORE_NATIVE_OK;
@@ -2454,8 +2858,17 @@ static RestoreNativeStatus restore_entry_at(
             failed = 1;
         if (close(dst_fd) != 0)
             failed = 1;
+        if (!failed && ctx->inode_map != NULL &&
+            opened_source_st.st_nlink > 1 &&
+            native_inode_map_insert(ctx->inode_map, opened_source_st.st_dev,
+                                    opened_source_st.st_ino,
+                                    dest_parent_fd, dest_leaf) != 0)
+            failed = 1;
         if (!failed && pass == RESTORE_APPLY)
+        {
             restore_report_applied(restore_report);
+            restore_native_test_after_apply(logical_path);
+        }
         else if (failed && pass == RESTORE_APPLY)
             restore_report_failure(restore_report, logical_path);
         return failed ? RESTORE_NATIVE_ERROR : RESTORE_NATIVE_OK;

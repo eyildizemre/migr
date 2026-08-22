@@ -1,6 +1,6 @@
-// Unit tests for backup_capture_at(): the native capture walker, whose source
-// side is pathname-based and whose destination side is anchored to a directory
-// fd the caller owns (docs/DECISIONS.md D15).
+// Unit tests for the native capture and restore walkers. Capture's source side
+// is pathname-based while both walkers anchor their destination traversal to a
+// directory fd the caller owns (docs/DECISIONS.md D15).
 //
 // Two groups. The first is the special-file policy, which cannot be exercised
 // through the CLI: a socket must be created with bind(), a device node needs
@@ -29,17 +29,17 @@
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <signal.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "fileops.h"
 #include "utils.h"
 
-extern int native_hardlink_identity_matches(const struct stat *linked,
-                                            const struct stat *reference);
 extern int native_visited_contains(const void *set, const char *root_key,
                                    const char *rel_path);
 
@@ -277,6 +277,347 @@ static void test_native_hardlinks(void)
     check(!native_hardlink_identity_matches(&identity_a, &identity_b),
           "native hardlink identity rejects a device mismatch");
 
+    close(destination_fd);
+    remove_tree(root);
+}
+
+typedef struct {
+    char source_first[PATH_MAX];
+    char source_second[PATH_MAX];
+    char destination_first[PATH_MAX];
+    char destination_second[PATH_MAX];
+} NativeHardlinkInterrupt;
+
+static void kill_after_first_native_hardlink_member(const char *source_path,
+                                                    void *opaque)
+{
+    NativeHardlinkInterrupt *fixture = opaque;
+    int current = strcmp(source_path, fixture->source_first) == 0 ? 0 :
+                  strcmp(source_path, fixture->source_second) == 0 ? 1 : -1;
+    if (current < 0)
+        return;
+
+    struct stat first_st;
+    struct stat second_st;
+    int first_exists = lstat(fixture->destination_first, &first_st) == 0;
+    int second_exists = lstat(fixture->destination_second, &second_st) == 0;
+    if (first_exists == second_exists)
+        return;
+
+    if ((current == 0 && !first_exists) ||
+        (current == 1 && !second_exists))
+        (void)kill(getpid(), SIGKILL);
+}
+
+static void test_native_hardlink_interrupt_resume(void)
+{
+    printf(BLUE "::" NC " native hardlink capture interruption/resume (unit)\n");
+
+    char root[] = "/tmp/migr_native_hardlink_resume_XXXXXX";
+    if (mkdtemp(root) == NULL)
+        fatal("could not create native hardlink resume test root");
+
+    char source_first_root[PATH_MAX], source_second_root[PATH_MAX];
+    char destination[PATH_MAX], source_first[PATH_MAX], source_second[PATH_MAX];
+    char destination_first[PATH_MAX], destination_second[PATH_MAX];
+    if (path_join(source_first_root, sizeof(source_first_root), root,
+                  "source-first") != 0 ||
+        path_join(source_second_root, sizeof(source_second_root), root,
+                  "source-second") != 0 ||
+        path_join(destination, sizeof(destination), root, "destination") != 0 ||
+        mkdir(source_first_root, 0755) != 0 ||
+        mkdir(source_second_root, 0755) != 0 ||
+        mkdir(destination, 0755) != 0 ||
+        path_join(source_first, sizeof(source_first), source_first_root,
+                  "payload") != 0 ||
+        path_join(source_second, sizeof(source_second), source_second_root,
+                  "payload") != 0 ||
+        path_join(destination_first, sizeof(destination_first), destination,
+                  "root-a/payload") != 0 ||
+        path_join(destination_second, sizeof(destination_second), destination,
+                  "root-b/payload") != 0)
+        fatal("could not create native hardlink resume fixture");
+
+    write_file(source_first, "native-hardlink-resume-content");
+    if (link(source_first, source_second) != 0)
+        fatal("could not create native hardlink resume source pair");
+
+    NativeHardlinkInterrupt hook = {0};
+    if (snprintf(hook.source_first, sizeof(hook.source_first), "%s", source_first) < 0 ||
+        snprintf(hook.source_second, sizeof(hook.source_second), "%s", source_second) < 0 ||
+        snprintf(hook.destination_first, sizeof(hook.destination_first), "%s",
+                 destination_first) < 0 ||
+        snprintf(hook.destination_second, sizeof(hook.destination_second), "%s",
+                 destination_second) < 0)
+        fatal("could not initialize native hardlink resume hook");
+
+    pid_t child = fork();
+    if (child < 0)
+        fatal("could not fork native hardlink interruption child");
+    if (child == 0)
+    {
+        int destination_fd = open(destination, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (destination_fd < 0)
+            _exit(2);
+        void *map = native_inode_map_create();
+        if (map == NULL)
+        {
+            close(destination_fd);
+            _exit(2);
+        }
+        CloneContext context = {
+            .operation = CLONE_BACKUP,
+            .representation = CLONE_NATIVE_TREE,
+            .timestamp_policy_configured = 1,
+            .nsec_exact = 1,
+            .metadata_preflight_done = 1,
+            .inode_map = map
+        };
+        backup_test_set_capture_hook(kill_after_first_native_hardlink_member,
+                                     &hook);
+        int result = backup_capture_at(&context, source_first_root,
+                                       destination_fd, "root-a");
+        if (result == 0)
+            result = backup_capture_at(&context, source_second_root,
+                                       destination_fd, "root-b");
+        backup_test_set_capture_hook(NULL, NULL);
+        native_inode_map_free(map);
+        close(destination_fd);
+        _exit(result == 0 ? 0 : 1);
+    }
+
+    int child_status = 0;
+    if (waitpid(child, &child_status, 0) != child)
+        fatal("could not wait for native hardlink interruption child");
+    int interrupted = WIFSIGNALED(child_status) &&
+                      WTERMSIG(child_status) == SIGKILL;
+    check(interrupted,
+          "native hardlink capture is interrupted after one member");
+    if (!interrupted)
+    {
+        remove_tree(root);
+        return;
+    }
+
+    struct stat first_destination_st;
+    struct stat second_destination_st;
+    int first_destination_exists =
+        lstat(destination_first, &first_destination_st) == 0;
+    int second_destination_exists =
+        lstat(destination_second, &second_destination_st) == 0;
+    check(first_destination_exists != second_destination_exists,
+          "interruption leaves exactly one native hardlink destination member");
+    if (first_destination_exists == second_destination_exists)
+    {
+        remove_tree(root);
+        return;
+    }
+
+    int destination_fd = open(destination, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (destination_fd < 0)
+        fatal("could not reopen native hardlink resume destination");
+    void *map = native_inode_map_create();
+    if (map == NULL)
+        fatal("could not create native hardlink resume map");
+    CloneContext context = {
+        .operation = CLONE_BACKUP,
+        .representation = CLONE_NATIVE_TREE,
+        .timestamp_policy_configured = 1,
+        .nsec_exact = 1,
+        .metadata_preflight_done = 1,
+        .inode_map = map
+    };
+    check(native_inode_map_seed_existing(&context, source_first_root,
+                                         destination_fd, "root-a") == 0 &&
+              native_inode_map_seed_existing(&context, source_second_root,
+                                             destination_fd, "root-b") == 0,
+          "native hardlink resume seeds existing representatives before walking");
+    int resume_result = backup_capture_at(&context, source_second_root,
+                                          destination_fd, "root-b");
+    if (resume_result == 0)
+        resume_result = backup_capture_at(&context, source_first_root,
+                                          destination_fd, "root-a");
+    check(resume_result == 0,
+          "native hardlink capture resumes after root-order reversal");
+    int resumed_pair_ok = lstat(destination_first, &first_destination_st) == 0 &&
+                          lstat(destination_second, &second_destination_st) == 0 &&
+                          native_hardlink_identity_matches(&first_destination_st,
+                                                           &second_destination_st) &&
+                          first_destination_st.st_nlink == 2;
+    check(resumed_pair_ok,
+          "native hardlink interruption/resume preserves one destination inode");
+
+    native_inode_map_free(map);
+    close(destination_fd);
+    remove_tree(root);
+}
+
+typedef struct {
+    char destination_first[PATH_MAX];
+    char destination_second[PATH_MAX];
+} NativeRestoreHardlinkInterrupt;
+
+static void kill_after_first_native_restore_member(const char *logical_path,
+                                                   void *opaque)
+{
+    (void)logical_path;
+    NativeRestoreHardlinkInterrupt *fixture = opaque;
+    struct stat first_st;
+    struct stat second_st;
+    int first_exists = lstat(fixture->destination_first, &first_st) == 0;
+    int second_exists = lstat(fixture->destination_second, &second_st) == 0;
+    if (first_exists != second_exists)
+        (void)kill(getpid(), SIGKILL);
+}
+
+static void test_native_restore_hardlink_interrupt_resume(void)
+{
+    printf(BLUE "::" NC " native hardlink restore interruption/resume (unit)\n");
+
+    char root[] = "/tmp/migr_native_restore_hardlink_resume_XXXXXX";
+    if (mkdtemp(root) == NULL)
+        fatal("could not create native restore hardlink resume test root");
+
+    char source[PATH_MAX], destination[PATH_MAX];
+    char source_first_root[PATH_MAX], source_second_root[PATH_MAX];
+    char source_first[PATH_MAX], source_second[PATH_MAX];
+    char destination_first[PATH_MAX], destination_second[PATH_MAX];
+    if (path_join(source, sizeof(source), root, "source") != 0 ||
+        path_join(destination, sizeof(destination), root, "destination") != 0 ||
+        mkdir(source, 0755) != 0 || mkdir(destination, 0755) != 0 ||
+        path_join(source_first_root, sizeof(source_first_root), source,
+                  "root-a") != 0 ||
+        path_join(source_second_root, sizeof(source_second_root), source,
+                  "root-b") != 0 ||
+        mkdir(source_first_root, 0755) != 0 ||
+        mkdir(source_second_root, 0755) != 0 ||
+        path_join(source_first, sizeof(source_first), source_first_root,
+                  "payload") != 0 ||
+        path_join(source_second, sizeof(source_second), source_second_root,
+                  "payload") != 0 ||
+        path_join(destination_first, sizeof(destination_first), destination,
+                  "root-a/payload") != 0 ||
+        path_join(destination_second, sizeof(destination_second), destination,
+                  "root-b/payload") != 0)
+        fatal("could not create native restore hardlink resume fixture");
+
+    write_file(source_first, "native-restore-hardlink-resume-content");
+    if (link(source_first, source_second) != 0)
+        fatal("could not create native restore hardlink source pair");
+
+    NativeRestoreHardlinkInterrupt hook = {0};
+    if (snprintf(hook.destination_first, sizeof(hook.destination_first), "%s",
+                 destination_first) < 0 ||
+        snprintf(hook.destination_second, sizeof(hook.destination_second), "%s",
+                 destination_second) < 0)
+        fatal("could not initialize native restore hardlink resume hook");
+
+    pid_t child = fork();
+    if (child < 0)
+        fatal("could not fork native restore hardlink interruption child");
+    if (child == 0)
+    {
+        int source_fd = open(source, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        int destination_fd =
+            open(destination, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        void *map = native_inode_map_create();
+        if (source_fd < 0 || destination_fd < 0 || map == NULL)
+            _exit(2);
+
+        CloneContext context = {
+            .operation = CLONE_RESTORE,
+            .representation = CLONE_NATIVE_TREE,
+            .timestamp_policy_configured = 1,
+            .nsec_exact = 1,
+            .metadata_preflight_done = 1,
+            .inode_map = map
+        };
+        restore_native_test_set_apply_hook(
+            kill_after_first_native_restore_member, &hook);
+        int result = restore_native_at(&context, source_fd, "root-a",
+                                       destination_fd, "root-a");
+        restore_native_test_set_apply_hook(NULL, NULL);
+        native_inode_map_free(map);
+        close(source_fd);
+        close(destination_fd);
+        _exit(result == RESTORE_NATIVE_OK ? 0 : 1);
+    }
+
+    int child_status = 0;
+    if (waitpid(child, &child_status, 0) != child)
+        fatal("could not wait for native restore hardlink interruption child");
+    int interrupted = WIFSIGNALED(child_status) &&
+                      WTERMSIG(child_status) == SIGKILL;
+    check(interrupted,
+          "native hardlink restore is interrupted after one member");
+    if (!interrupted)
+    {
+        remove_tree(root);
+        return;
+    }
+
+    struct stat first_destination_st;
+    struct stat second_destination_st;
+    int first_destination_exists =
+        lstat(destination_first, &first_destination_st) == 0;
+    int second_destination_exists =
+        lstat(destination_second, &second_destination_st) == 0;
+    check(first_destination_exists != second_destination_exists,
+          "restore interruption leaves exactly one hardlink destination member");
+    if (first_destination_exists == second_destination_exists)
+    {
+        remove_tree(root);
+        return;
+    }
+
+    int source_fd = open(source, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int destination_fd = open(destination, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    void *map = native_inode_map_create();
+    if (source_fd < 0 || destination_fd < 0 || map == NULL)
+        fatal("could not reopen native restore hardlink resume fixture");
+    CloneContext context = {
+        .operation = CLONE_RESTORE,
+        .representation = CLONE_NATIVE_TREE,
+        .timestamp_policy_configured = 1,
+        .nsec_exact = 1,
+        .metadata_preflight_done = 1,
+        .inode_map = map
+    };
+    check(native_inode_map_seed_existing(&context, source_first_root,
+                                         destination_fd, "root-a") == 0 &&
+              native_inode_map_seed_existing(&context, source_second_root,
+                                             destination_fd, "root-b") == 0,
+          "native restore resume seeds existing representatives before walking");
+
+    RestoreNativeReport sibling_report;
+    RestoreNativeReport representative_report;
+    RestoreNativeStatus sibling_status = restore_native_at_report(
+        &context, source_fd, "root-b", destination_fd, "root-b",
+        &sibling_report);
+    RestoreNativeStatus representative_status = restore_native_at_report(
+        &context, source_fd, "root-a", destination_fd, "root-a",
+        &representative_report);
+    check(sibling_status == RESTORE_NATIVE_OK &&
+              sibling_report.failed_count == 0,
+          "native restore resumes the reversed sibling without failure");
+    check(representative_status == RESTORE_NATIVE_OK &&
+              representative_report.failed_count == 0,
+          "previously restored representative is not reported as failed");
+
+    int resumed_pair_ok = lstat(destination_first, &first_destination_st) == 0 &&
+                          lstat(destination_second, &second_destination_st) == 0 &&
+                          native_hardlink_identity_matches(&first_destination_st,
+                                                           &second_destination_st) &&
+                          first_destination_st.st_nlink == 2 &&
+                          file_contains(destination_first,
+                                        "native-restore-hardlink-resume-content") &&
+                          file_contains(destination_second,
+                                        "native-restore-hardlink-resume-content");
+    check(resumed_pair_ok,
+          "native restore interruption/resume preserves one destination inode");
+
+    native_inode_map_free(map);
+    close(source_fd);
     close(destination_fd);
     remove_tree(root);
 }
@@ -548,6 +889,8 @@ int main(void)
     printf(BLUE "::" NC " backup capture walker (unit)\n");
 
     test_native_hardlinks();
+    test_native_hardlink_interrupt_resume();
+    test_native_restore_hardlink_interrupt_resume();
     test_native_visited_paths();
     test_native_reconciliation();
 

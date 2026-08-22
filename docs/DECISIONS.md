@@ -2362,3 +2362,95 @@ restore ordering or sticky representatives. It completes D24's now-production
 portable path without changing representation selection or D15's
 representation-agnostic finalization lifecycle. It has no effect on native
 capture or native restore.
+
+---
+
+## D26 — 2026-08-22 — Native hardlink resume seeding and restore relinking
+
+**Status:** Implemented
+
+**Decision:** Native capture and restore both preserve hardlink identity without
+introducing a native sidecar or manifest extension. When resuming an adopted
+native partial, capture performs a read-only source/destination pre-seed of the
+existing resume-matching regular payloads into the existing `(st_dev, st_ino)`
+inode map before the live walk. Native `restore()` unconditionally performs
+the same read-only pre-seed for every automatically restored root, then owns
+one inode map for the whole apply phase; the first successfully applied member
+of a source inode group becomes its destination representative, and later
+members are created with `linkat()` to that representative.
+
+### Native capture resume
+
+The old native capture map was process-local and empty on every invocation. If
+the resumed walk visited a missing sibling before the member written by the
+interrupted run, it could select a new representative and then fail against
+the old independent destination file. Adopted native capture now walks the
+source and existing destination addresses without mutation before capturing.
+Every existing regular destination whose size and nsec-gated mtime prove the
+completed-work resume oracle seeds the source inode's representative. A seed
+failure aborts the resumed native capture before payload mutation; fresh
+capture remains unchanged, and no wire-format state is added.
+
+### Native restore resume
+
+A new restore process used to start with an empty inode map, so a hardlink
+group split by interruption could be visited in the opposite order on the
+next invocation: the new sibling became an independent representative and
+the already restored member then failed the identity check. Before any native
+apply walk, restore now scans the existing destination state for every
+auto-restored v1 or legacy root and seeds the same source-inode map. This is
+unconditional because restore has no reliable adopted-destination bit; the
+scan is read-only and uses the destination root's preflighted timestamp
+precision when deciding whether an existing regular payload proves completed
+work. Nested destination paths and an already existing destination root are
+resolved without creating or following intermediate symlinks. Dry-run and
+validation still leave the map unused and mutation-free.
+
+### Native restore apply contract
+
+Validation and metadata inventory never mutate the inode map. During apply,
+the first regular member is copied or resumed normally and enters the map only
+after its payload and metadata succeed. A later member with the same source
+inode is linked to that representative; it receives no second content,
+metadata, or xattr write because the shared inode already carries the
+representative's state. An existing destination at the sibling address is
+accepted only when it is already the same inode; an independent or wrong-type
+object is a failure, never an unlink-and-replace opportunity.
+
+If a representative fails, no map entry is installed. The current recursive
+walk stops its failed subtree; if a caller later retries another member with
+the same map, that member may become a new independent representative rather
+than linking to an unproven destination. This is fail-closed and prevents a
+failed or partial representative from poisoning subsequent links.
+
+This applies only to native payloads that still carry real shared inodes. A
+native payload whose hardlinks were already flattened by another tool remains
+indistinguishable from genuinely independent files and cannot be reconstructed
+without additional format metadata. Portable capture and restore remain on
+D22/D25's sidecar protocol.
+
+**Why:** Native capture already preserves the relationship with `link()` and
+the destination tree already supplies the only resume evidence needed; a
+read-only sticky seed closes the process-boundary/order gap without a new
+format. Native restore can use the source payload's inode identity directly,
+and its pre-seeded process-wide apply map makes the same guarantee hold across
+interrupted invocations while keeping representative-only metadata and xattrs
+safe.
+
+**Rejected:** Re-deriving hardlink groups from content, size, or timestamps is
+rejected because independent files can share those values. A native sidecar or
+manifest extension is rejected because native payload inode identity is already
+available and native restore does not need portable state. Mutating the map
+during validation is rejected because dry-run/preflight must remain
+mutation-free. Replacing an independent sibling destination is rejected as
+unsafe; it is reported as a collision instead.
+
+**Relationship:** D26 closes D22 G-5's native-restore duplication debt and
+extends D22 G-6's sticky-representative principle to the native destination
+tree. It preserves D15's fd-anchored native walkers, D17's source-stability
+checks, D23's nsec-gated native resume oracle, and D25's independent portable
+claim protocol. The host interruption, restore identity/metadata/xattr, and
+representative-failure tests cover the new invariants; the external VM gate
+must additionally run a real native capture interruption/resume and a real
+restore of a cross-root hardlink pair, checking `dev/ino/nlink`, mode,
+uid/gid, and xattrs on both names.

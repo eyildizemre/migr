@@ -4,6 +4,7 @@
 #include <limits.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 
 /**
@@ -23,13 +24,29 @@ typedef struct CloneContext {
     int timestamp_policy_configured;
     int nsec_exact;
     int metadata_preflight_done;
-    void *inode_map; /* NativeInodeMap, backup-only; NULL disables tracking. */
+    void *inode_map; /* NativeInodeMap; backup/restore tracking; NULL disables it. */
     void *visited; /* Native visited-path set, backup-only; NULL disables tracking. */
 } CloneContext;
 
-/* Opaque native-capture hardlink map ownership. */
+/* Opaque native hardlink map ownership. */
 void *native_inode_map_create(void);
 void native_inode_map_free(void *map);
+
+/**
+ * @brief Seeds native hardlink representatives from existing destination state.
+ *
+ * The source and destination trees are inspected without mutation. Existing
+ * regular payloads whose size and mtime prove completed work seed the map by
+ * source inode, so a resumed capture or restore may visit the sibling before
+ * the old representative without changing the selected destination inode.
+ * destination_rel may be a safe relative path or "" for the destination root.
+ */
+int native_inode_map_seed_existing(const CloneContext *ctx,
+                                   const char *source_path,
+                                   int destination_root_fd,
+                                   const char *destination_rel);
+int native_hardlink_identity_matches(const struct stat *linked,
+                                     const struct stat *reference);
 
 /* Opaque native-capture visited-path set ownership (docs/DECISIONS.md D23). */
 void *native_visited_create(void);
@@ -243,13 +260,12 @@ RestoreNativeStatus restore_native_metadata_inventory_at(
  * Before mutating the destination, this function runs the same recursive
  * checks exposed by restore_native_preflight_at().
  *
- * This function does not detect or recreate hardlinks: two payload paths
- * that share an inode in the source container are restored as two
- * independent regular files (identical content, distinct destination
- * inodes). This is deliberate (docs/DECISIONS.md D22 G-5) -- native
- * restore reads no sidecar and the manifest carries no hardlink record,
- * so hardlink identity is preserved only through native capture's link()
- * (fileops.c's capture_hardlink_at), not through restore.
+ * When ctx->inode_map is supplied, regular payload paths that share a source
+ * inode are restored as one destination inode: the first successfully applied
+ * member becomes the representative and later members are recreated with
+ * linkat(). Validation never mutates that map. A NULL map deliberately keeps
+ * the low-level core's tracking disabled; the real native restore() supplies
+ * one for the complete apply walk.
  *
  * @param ctx                Clone orientation; must be CLONE_RESTORE +
  *                            CLONE_NATIVE_TREE.
@@ -278,6 +294,12 @@ typedef enum {
     RESTORE_TEST_SOURCE_READ_VALIDATE = 1,
     RESTORE_TEST_SOURCE_READ_APPLY = 2
 } RestoreNativeTestSourceReadMode;
+
+typedef void (*RestoreNativeTestApplyHook)(const char *logical_path,
+                                           void *context);
+
+void restore_native_test_set_apply_hook(RestoreNativeTestApplyHook hook,
+                                        void *context);
 
 void restore_native_test_set_source_read_mode(
     RestoreNativeTestSourceReadMode mode);

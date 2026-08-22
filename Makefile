@@ -86,8 +86,8 @@ $(TEST_PATHJOIN): tests/test_pathjoin.c utils.o
 $(TEST_FD_LIMIT): tests/test_fd_limit.c utils.o
 	$(CC) $(CFLAGS) -o $@ tests/test_fd_limit.c utils.o
 
-$(TEST_SPECIAL_FILES): tests/test_special_files.c fileops.o metadata.o portable.o sidecar.o sidecar_state.o hash.o manifest.o encoding.o utils.o
-	$(CC) $(CFLAGS) -o $@ tests/test_special_files.c fileops.o metadata.o portable.o sidecar.o sidecar_state.o hash.o manifest.o encoding.o utils.o
+$(TEST_SPECIAL_FILES): tests/test_special_files.c fileops_test.o metadata.o portable.o sidecar.o sidecar_state.o hash.o manifest.o encoding.o utils.o
+	$(CC) $(CFLAGS) -DFILEOPS_TEST_HOOKS -DBACKUP_TEST_HOOKS -o $@ tests/test_special_files.c fileops_test.o metadata.o portable.o sidecar.o sidecar_state.o hash.o manifest.o encoding.o utils.o
 
 $(TEST_FSPROBE): tests/test_fsprobe.c fsprobe.o utils.o
 	$(CC) $(CFLAGS) -o $@ tests/test_fsprobe.c fsprobe.o utils.o
