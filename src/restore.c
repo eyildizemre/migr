@@ -1238,12 +1238,34 @@ int restore(const char *source)
     if (mst == MANIFEST_STATUS_VALID &&
         m.representation == CLONE_PORTABLE_SIDECAR)
     {
+        char *xdg_dirs[XDG_RESTORE_COUNT] = {0};
+        int has_xdg_root = 0;
+        for (int index = 0; index < m.root_count; index++)
+            if (m.roots[index].policy == ROOT_POLICY_XDG)
+            {
+                has_xdg_root = 1;
+                break;
+            }
+        if (has_xdg_root &&
+            xdg_resolve(home, xdg_keys, xdg_fallbacks, xdg_dirs,
+                        XDG_RESTORE_COUNT) != 0)
+        {
+            printf("Error: HOME path too long to resolve user directories\n");
+            free_xdg_dirs(xdg_dirs);
+            manifest_free(&m);
+            close(home_fd);
+            close(source_root_fd);
+            return 1;
+        }
+
         PortableRestoreRequest request = {
             .source_container_fd = source_root_fd,
             .manifest = &m,
             .destination_home_fd = home_fd,
             .destination_timestamp_policy = {0}
         };
+        for (int index = 0; index < XDG_RESTORE_COUNT; index++)
+            request.destination_xdg_dirs[index] = xdg_dirs[index];
         PortableRestoreReplayReport report;
         PortableRestoreOutcome outcome =
             portable_restore_orchestrate_at(&request, &report);
@@ -1279,6 +1301,7 @@ int restore(const char *source)
         }
         printf("===========================================================\n");
 
+        free_xdg_dirs(xdg_dirs);
         manifest_free(&m);
         close(home_fd);
         close(source_root_fd);

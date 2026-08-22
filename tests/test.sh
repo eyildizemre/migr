@@ -8,6 +8,9 @@ RED='\033[0;31m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
+PORTABLE_VFAT_MOUNT=""
+PORTABLE_VFAT_LOOP=""
+
 # Every backup whose scope exports a package list forks the distribution's real
 # listing command, and a single `dnf repoquery` costs more than the entire rest
 # of this suite. Only Phase 5 is about that command's own output; every other
@@ -54,6 +57,12 @@ setup() {
 }
 
 teardown() {
+    if [ -n "$PORTABLE_VFAT_MOUNT" ]; then
+        umount -l "$PORTABLE_VFAT_MOUNT" 2>/dev/null || true
+    fi
+    if [ -n "$PORTABLE_VFAT_LOOP" ]; then
+        losetup -d "$PORTABLE_VFAT_LOOP" 2>/dev/null || true
+    fi
     rm -rf "$TEST_DIR"
 }
 
@@ -1482,6 +1491,83 @@ test_container_production() {
     fi
 }
 
+test_portable_vfat_dispatch() {
+    echo -e "${BLUE}::${NC} Phase 15: real-vfat portable dispatch smoke"
+
+    if [ "$(id -u)" -ne 0 ]; then
+        echo -e "  ${BLUE}↷${NC} skipped: root is required for loop and mount setup."
+        return
+    fi
+
+    local tool
+    for tool in losetup mkfs.vfat mount; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            echo -e "  ${BLUE}↷${NC} skipped: '$tool' is not available."
+            return
+        fi
+    done
+
+    local image="$TEST_DIR/portable-vfat.img"
+    local mount_point="$TEST_DIR/portable-vfat"
+    local loop loop_output mkfs_output mount_output
+    local output actual_backup
+
+    if ! dd if=/dev/zero of="$image" bs=1M count=64 >/dev/null 2>&1; then
+        echo -e "  ${BLUE}↷${NC} skipped: could not create the VFAT image."
+        return
+    fi
+
+    if ! loop=$(losetup -f 2>&1); then
+        echo -e "  ${BLUE}↷${NC} skipped: could not find a free loop device."
+        echo "$loop"
+        return
+    fi
+    if ! loop_output=$(losetup "$loop" "$image" 2>&1); then
+        echo -e "  ${BLUE}↷${NC} skipped: could not attach the VFAT image."
+        echo "$loop_output"
+        return
+    fi
+    PORTABLE_VFAT_LOOP="$loop"
+
+    if ! mkfs_output=$(mkfs.vfat "$loop" 2>&1); then
+        echo -e "  ${BLUE}↷${NC} skipped: VFAT formatting is unavailable."
+        echo "$mkfs_output"
+        return
+    fi
+
+    mkdir -p "$mount_point"
+    if ! mount_output=$(mount -t vfat "$loop" "$mount_point" 2>&1); then
+        echo -e "  ${BLUE}↷${NC} skipped: VFAT mounting is unavailable."
+        echo "$mount_output"
+        return
+    fi
+    PORTABLE_VFAT_MOUNT="$mount_point"
+
+    rm -rf "$HOME"
+    mkdir -p "$HOME/Documents"
+    echo "vfat smoke" > "$HOME/Documents/note.txt"
+
+    output=$(../migr backup "$mount_point/dest" 2>&1)
+    assert_contains "$output" "Backup complete"
+
+    actual_backup=$(sole_final_container "$mount_point/dest")
+    # A sidecar proves that the production CLI selected the portable path.
+    assert_file_exists "$actual_backup/sidecar.migr"
+
+    rm -f "$actual_backup/packages.txt"
+    rm -rf "$HOME"
+    mkdir -p "$HOME"
+    output=$(printf 'y\n' | ../migr restore "$actual_backup" 2>&1)
+    assert_contains "$output" "Restore complete"
+    assert_file_exists "$HOME/Documents/note.txt"
+    if [ "$(cat "$HOME/Documents/note.txt")" = "vfat smoke" ]; then
+        echo -e "  ${GREEN}✓${NC} Restored VFAT fixture content matches byte-for-byte."
+    else
+        echo -e "  ${RED}✗${NC} Restored VFAT fixture content does not match."
+        exit 1
+    fi
+}
+
 # --- 4. RUN TESTS ---
 echo -e "${BLUE}migr integration tests${NC}"
 setup
@@ -1499,4 +1585,5 @@ test_restore_path_safety
 test_v1_restore_dispatch
 test_probe_refusal
 test_container_production
+test_portable_vfat_dispatch
 echo -e "${GREEN}all tests passed${NC}"

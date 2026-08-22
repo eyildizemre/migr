@@ -7,11 +7,15 @@
 
 #include "manifest.h"
 #include "metadata.h"
+#include "xdg.h"
 
 typedef struct {
     int source_container_fd;
     const Manifest *manifest;
     int destination_home_fd;
+    /* Restore-time XDG destinations, resolved for the current HOME. The
+     * request borrows these strings; they are never serialized in a manifest. */
+    const char *destination_xdg_dirs[XDG_KEY_COUNT];
     /* Measured policy for the destination filesystem. */
     MetadataTimestampPolicy destination_timestamp_policy;
 } PortableRestoreRequest;

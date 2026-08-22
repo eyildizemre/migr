@@ -172,6 +172,7 @@ typedef struct {
     char base[PATH_MAX];
     char container[PATH_MAX];
     char home[PATH_MAX];
+    char xdg_dirs[XDG_KEY_COUNT][PATH_MAX];
     int container_fd;
     int data_fd;
     int home_fd;
@@ -654,6 +655,10 @@ static PortableRestoreRequest request_for(Fixture *fixture,
             .configured = 1
         }
     };
+    for (int index = 0; index < XDG_KEY_COUNT; index++)
+        request.destination_xdg_dirs[index] =
+            fixture->xdg_dirs[index][0] == '\0'
+                ? NULL : fixture->xdg_dirs[index];
     return request;
 }
 
@@ -926,6 +931,97 @@ static void test_hardlink_cross_root(void)
               representative_st.st_ino == alias_st.st_ino &&
               file_equals(alias, "cross-root payload"),
           "cross-root hardlink shares the referenced inode");
+    fixture_close(&fixture);
+}
+
+static void test_xdg_destination_orchestration(void)
+{
+    printf(BLUE "::" NC " portable XDG destination orchestration\n");
+    ManifestRoot roots[2];
+    memset(roots, 0, sizeof(roots));
+    snprintf(roots[0].id, sizeof(roots[0].id), "XDG_DOCUMENTS_DIR");
+    roots[0].policy = ROOT_POLICY_XDG;
+    snprintf(roots[0].payload_path, sizeof(roots[0].payload_path),
+             "XDG_DOCUMENTS_DIR");
+    snprintf(roots[0].source_path, sizeof(roots[0].source_path),
+             "/source/XDG_DOCUMENTS_DIR");
+    snprintf(roots[1].id, sizeof(roots[1].id), "XDG_DOWNLOAD_DIR");
+    roots[1].policy = ROOT_POLICY_XDG;
+    snprintf(roots[1].payload_path, sizeof(roots[1].payload_path),
+             "XDG_DOWNLOAD_DIR");
+    snprintf(roots[1].source_path, sizeof(roots[1].source_path),
+             "/source/XDG_DOWNLOAD_DIR");
+
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &roots[0]);
+    check(opened == 0, "XDG destination fixture is created");
+    if (opened != 0)
+        return;
+
+    make_dir_at(fixture.home_fd, "Documents", 0700);
+    make_dir_at(fixture.home_fd, "Downloads", 0700);
+    path_join_fixture(fixture.xdg_dirs[0], sizeof(fixture.xdg_dirs[0]),
+                      fixture.home, "/Documents");
+    path_join_fixture(fixture.xdg_dirs[1], sizeof(fixture.xdg_dirs[1]),
+                      fixture.home, "/Downloads");
+
+    Manifest manifest_model = {
+        .version = MANIFEST_CURRENT_VERSION,
+        .representation = CLONE_PORTABLE_SIDECAR,
+        .scope = MANIFEST_SCOPE_CRITICAL,
+        .sidecar_version = SIDECAR_VERSION,
+        .root_count = 2,
+        .roots = roots
+    };
+    check(manifest_write_v1_at(fixture.container_fd, &manifest_model) == 0,
+          "XDG destination manifest is committed");
+
+    make_dir_at(fixture.data_fd, "XDG_DOCUMENTS_DIR", 0700);
+    make_dir_at(fixture.data_fd, "XDG_DOWNLOAD_DIR", 0700);
+    int documents_fd = openat(fixture.data_fd, "XDG_DOCUMENTS_DIR",
+                              O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int downloads_fd = openat(fixture.data_fd, "XDG_DOWNLOAD_DIR",
+                              O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (documents_fd < 0 || downloads_fd < 0)
+        fatal("could not open XDG payload roots");
+    write_file_at(documents_fd, "note.txt", "documents payload");
+    write_file_at(downloads_fd, "note.txt", "downloads payload");
+    if (close(documents_fd) != 0 || close(downloads_fd) != 0)
+        fatal("could not close XDG payload roots");
+
+    uint32_t uid = (uint32_t)geteuid();
+    uint32_t gid = (uint32_t)getegid();
+    SidecarEntry entries[] = {
+        entry_for("XDG_DOCUMENTS_DIR", "", "", SIDECAR_KIND_DIRECTORY,
+                  0, 0700, uid, gid, 1700001100, 1, 1700001101, 2),
+        entry_for("XDG_DOCUMENTS_DIR", "note.txt", "note.txt",
+                  SIDECAR_KIND_REGULAR, strlen("documents payload"), 0600,
+                  uid, gid, 1700001110, 3, 1700001111, 4),
+        entry_for("XDG_DOWNLOAD_DIR", "", "", SIDECAR_KIND_DIRECTORY,
+                  0, 0700, uid, gid, 1700001120, 5, 1700001121, 6),
+        entry_for("XDG_DOWNLOAD_DIR", "note.txt", "note.txt",
+                  SIDECAR_KIND_REGULAR, strlen("downloads payload"), 0600,
+                  uid, gid, 1700001130, 7, 1700001131, 8)
+    };
+    check(write_sidecar(&fixture, entries, 4) == 0,
+          "XDG destination sidecar is committed");
+
+    PortableRestoreReplayReport report;
+    int result = run_orchestration(&fixture, &report, 1, "y\n");
+    check(result == 0 && report.live_count == 4 &&
+              report.applied_count == 4 && report.failed_count == 0,
+          "portable XDG restore completes for both roots");
+
+    char documents_note[PATH_MAX], downloads_note[PATH_MAX], flattened[PATH_MAX];
+    path_join_fixture(documents_note, sizeof(documents_note), fixture.home,
+                      "/Documents/note.txt");
+    path_join_fixture(downloads_note, sizeof(downloads_note), fixture.home,
+                      "/Downloads/note.txt");
+    path_join_fixture(flattened, sizeof(flattened), fixture.home, "/note.txt");
+    check(file_equals(documents_note, "documents payload") &&
+              file_equals(downloads_note, "downloads payload") &&
+              access(flattened, F_OK) != 0,
+          "XDG roots restore under their resolved directories without flattening");
     fixture_close(&fixture);
 }
 
@@ -1325,6 +1421,7 @@ int main(void)
     test_normal_orchestration();
     test_hardlink_orchestration();
     test_hardlink_cross_root();
+    test_xdg_destination_orchestration();
     test_hardlink_reference_failures();
     test_symlink_orchestration();
     test_symlink_ownership_rejection();

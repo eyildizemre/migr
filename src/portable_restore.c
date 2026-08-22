@@ -73,6 +73,7 @@ typedef struct {
     size_t *root_order;
     PreflightEntries *entries;
     int destination_home_fd;
+    const char * const *destination_xdg_dirs;
     PreflightMemory memory;
 } Collection;
 
@@ -99,7 +100,8 @@ typedef struct {
     size_t root_index;
     size_t hardlink_ref_root_index;
     char destination[PATH_MAX];
-    char hardlink_ref_destination[PATH_MAX];
+    char destination_relative[PATH_MAX];
+    char hardlink_ref_relative[PATH_MAX];
     size_t depth;
 } ReplayEntry;
 
@@ -114,10 +116,14 @@ typedef struct {
     const SidecarLog *sidecar;
     int data_fd;
     int destination_home_fd;
+    const char * const *destination_xdg_dirs;
     MetadataTimestampPolicy timestamp_policy;
     PortableRestoreReplayReport *report;
     MetadataXattrRequirements xattr_requirements;
 } ReplayCollection;
+
+static int xdg_destination_valid(const char * const *xdg_dirs,
+                                 const ManifestRoot *root);
 
 static void *preflight_alloc(PreflightMemory *memory, size_t size)
 {
@@ -754,6 +760,8 @@ static int collection_validate_manifest(Collection *collection)
             !relative_path_valid(root->payload_path, 0) ||
             root->policy < ROOT_POLICY_XDG ||
             root->policy > ROOT_POLICY_MANUAL_NATIVE ||
+            (root->policy == ROOT_POLICY_XDG &&
+             !xdg_destination_valid(collection->destination_xdg_dirs, root)) ||
             (root->policy == ROOT_POLICY_HOME_RELATIVE &&
              (!root->has_restore_path ||
               !relative_path_valid(root->restore_path, 1))) ||
@@ -867,12 +875,50 @@ static void entries_free(PreflightMemory *memory, PreflightEntries *entries)
     memset(entries, 0, sizeof(*entries));
 }
 
+static int xdg_key_index(const char *id)
+{
+    if (id == NULL)
+        return -1;
+    for (int index = 0; index < XDG_KEY_COUNT; index++)
+        if (strcmp(id, xdg_keys[index]) == 0)
+            return index;
+    return -1;
+}
+
+static int xdg_destination_valid(const char * const *xdg_dirs,
+                                 const ManifestRoot *root)
+{
+    if (root == NULL || xdg_dirs == NULL)
+        return 0;
+    int index = xdg_key_index(root->id);
+    if (index < 0 || xdg_dirs[index] == NULL ||
+        xdg_dirs[index][0] != '/')
+        return 0;
+    return strnlen(xdg_dirs[index], PATH_MAX) < PATH_MAX;
+}
+
 static int destination_path_build(const ManifestRoot *root,
-                                  const char *logical, char *out,
-                                  size_t out_size)
+                                  const char *logical,
+                                  const char * const *xdg_dirs,
+                                  char *out, size_t out_size)
 {
     if (root == NULL || logical == NULL || out == NULL || out_size == 0)
         return -1;
+
+    if (root->policy == ROOT_POLICY_XDG)
+    {
+        if (!xdg_destination_valid(xdg_dirs, root))
+            return -1;
+        const char *xdg = xdg_dirs[xdg_key_index(root->id)];
+        if (logical[0] == '\0')
+        {
+            int length = snprintf(out, out_size, "%s", xdg);
+            return length >= 0 && (size_t)length < out_size ? 0 : -1;
+        }
+        int length = snprintf(out, out_size, "%s/%s", xdg, logical);
+        return length >= 0 && (size_t)length < out_size ? 0 : -1;
+    }
+
     const char *restore = root->restore_path;
     if (!root->has_restore_path)
         restore = "";
@@ -883,6 +929,22 @@ static int destination_path_build(const ManifestRoot *root,
         return snprintf(out, out_size, "%s", restore) >= 0 &&
                strlen(restore) < out_size ? 0 : -1;
     int length = snprintf(out, out_size, "%s/%s", restore, logical);
+    return length >= 0 && (size_t)length < out_size ? 0 : -1;
+}
+
+static int destination_relative_path_build(const char *prefix,
+                                           const char *logical,
+                                           char *out, size_t out_size)
+{
+    if (prefix == NULL || logical == NULL || out == NULL || out_size == 0)
+        return -1;
+    if (prefix[0] == '\0')
+        return snprintf(out, out_size, "%s", logical) >= 0 &&
+               strlen(logical) < out_size ? 0 : -1;
+    if (logical[0] == '\0')
+        return snprintf(out, out_size, "%s", prefix) >= 0 &&
+               strlen(prefix) < out_size ? 0 : -1;
+    int length = snprintf(out, out_size, "%s/%s", prefix, logical);
     return length >= 0 && (size_t)length < out_size ? 0 : -1;
 }
 
@@ -1007,6 +1069,110 @@ static int open_destination_profile_anchor(int home_fd, const char *relative,
     }
 }
 
+/* Match native restore's XDG anchor: an existing destination directory is
+ * the anchor itself; an absent final component is created later beneath its
+ * existing parent, after the confirmation/probe gate. */
+static int open_xdg_destination_anchor(const char *path, int *out_fd,
+                                       char *out_rel, size_t rel_size)
+{
+    if (path == NULL || out_fd == NULL || out_rel == NULL || rel_size == 0 ||
+        path[0] != '/' || strnlen(path, PATH_MAX) >= PATH_MAX)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    int fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd >= 0)
+    {
+        *out_fd = fd;
+        out_rel[0] = '\0';
+        return 0;
+    }
+    if (errno != ENOENT)
+        return -1;
+
+    char copy[PATH_MAX];
+    size_t length = strlen(path);
+    memcpy(copy, path, length + 1U);
+    while (length > 1U && copy[length - 1U] == '/')
+        copy[--length] = '\0';
+
+    char *slash = strrchr(copy, '/');
+    const char *leaf = slash == NULL ? copy : slash + 1U;
+    size_t leaf_length = strlen(leaf);
+    if (leaf_length == 0 || leaf_length >= rel_size)
+    {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(out_rel, leaf, leaf_length + 1U);
+
+    const char *parent;
+    if (slash == NULL)
+        parent = ".";
+    else if (slash == copy)
+    {
+        slash[1] = '\0';
+        parent = copy;
+    }
+    else
+    {
+        *slash = '\0';
+        parent = copy;
+    }
+
+    fd = open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    *out_fd = fd;
+    return 0;
+}
+
+static int open_xdg_profile_anchor(const Collection *collection,
+                                   const ManifestRoot *root,
+                                   const char *logical,
+                                   int *anchor_out,
+                                   struct stat *existing,
+                                   int *has_existing)
+{
+    if (collection == NULL || root == NULL || logical == NULL ||
+        anchor_out == NULL || existing == NULL || has_existing == NULL ||
+        !xdg_destination_valid(collection->destination_xdg_dirs, root))
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    int index = xdg_key_index(root->id);
+    int xdg_fd = -1;
+    char prefix[NAME_MAX + 1U];
+    char relative[PATH_MAX];
+    if (open_xdg_destination_anchor(
+            collection->destination_xdg_dirs[index], &xdg_fd,
+            prefix, sizeof(prefix)) != 0 ||
+        destination_relative_path_build(prefix, logical, relative,
+                                        sizeof(relative)) != 0)
+    {
+        if (xdg_fd >= 0)
+            close(xdg_fd);
+        return -1;
+    }
+
+    int result = open_destination_profile_anchor(
+        xdg_fd, relative, anchor_out, existing, has_existing);
+    int saved = errno;
+    if (close(xdg_fd) != 0 && result == 0)
+    {
+        close(*anchor_out);
+        *anchor_out = -1;
+        result = -1;
+        saved = EIO;
+    }
+    errno = saved;
+    return result;
+}
+
 static int collect_metadata_profile(const Collection *collection,
                                     const ManifestRoot *root,
                                     size_t root_index,
@@ -1040,18 +1206,29 @@ static int collect_metadata_profile(const Collection *collection,
     char destination[PATH_MAX];
     if (root->policy == ROOT_POLICY_HOME_RELATIVE)
     {
-        if (destination_path_build(root, entry->logical, destination,
+        if (destination_path_build(root, entry->logical,
+                                   collection->destination_xdg_dirs,
+                                   destination,
                                    sizeof(destination)) != 0 ||
             open_destination_profile_anchor(
                 collection->destination_home_fd, destination, &anchor,
                 &existing, &has_existing) != 0)
             return -1;
     }
+    else if (root->policy == ROOT_POLICY_XDG)
+    {
+        if (destination_path_build(root, entry->logical,
+                                   collection->destination_xdg_dirs,
+                                   destination, sizeof(destination)) != 0 ||
+            open_xdg_profile_anchor(collection, root, entry->logical,
+                                    &anchor, &existing, &has_existing) != 0)
+            return -1;
+    }
     else
     {
-        /* XDG target resolution belongs to restore orchestration. Until then,
-         * collect the profile against the supplied home anchor without
-         * guessing a destination object. */
+        /* MANUAL_NATIVE is rejected by manifest validation before entries
+         * reach this path. Keep the fallback fail-closed if that invariant
+         * changes. */
         anchor = duplicate_noatime_directory(
             collection->destination_home_fd);
         if (anchor < 0)
@@ -1624,7 +1801,8 @@ int portable_restore_preflight_at(
         .manifest = request->manifest,
         .report = report,
         .entries = &entries,
-        .destination_home_fd = request->destination_home_fd
+        .destination_home_fd = request->destination_home_fd,
+        .destination_xdg_dirs = request->destination_xdg_dirs
     };
     if (collection_validate_manifest(&collection) != 0)
         goto fail;
@@ -1806,7 +1984,8 @@ static void replay_collection_free(ReplayCollection *collection)
     root_map_free(&collection->root_map);
 }
 
-static int replay_manifest_valid(const Manifest *manifest)
+static int replay_manifest_valid(const Manifest *manifest,
+                                 const char * const *xdg_dirs)
 {
     if (manifest == NULL || manifest->version != MANIFEST_CURRENT_VERSION ||
         manifest->representation != CLONE_PORTABLE_SIDECAR ||
@@ -1831,6 +2010,8 @@ static int replay_manifest_valid(const Manifest *manifest)
             root->policy < ROOT_POLICY_XDG ||
             root->policy > ROOT_POLICY_MANUAL_NATIVE ||
             root->policy == ROOT_POLICY_MANUAL_NATIVE ||
+            (root->policy == ROOT_POLICY_XDG &&
+             !xdg_destination_valid(xdg_dirs, root)) ||
             (root->policy == ROOT_POLICY_HOME_RELATIVE &&
              (!root->has_restore_path ||
               !relative_path_valid(root->restore_path, 1))) ||
@@ -1992,6 +2173,7 @@ static int replay_collect_entry(const SidecarLiveView *view, void *argument)
 
     size_t hardlink_ref_root_index = SIZE_MAX;
     char hardlink_ref_destination[PATH_MAX] = {0};
+    char hardlink_ref_relative[PATH_MAX] = {0};
     if (entry->kind == SIDECAR_KIND_HARDLINK)
     {
         SidecarLiveView referenced;
@@ -2022,12 +2204,41 @@ static int replay_collect_entry(const SidecarLiveView *view, void *argument)
                           referenced.entry->logical_path);
         if (destination_path_build(
                 &collection->manifest->roots[hardlink_ref_root_index],
-                reference_logical, hardlink_ref_destination,
+                reference_logical, collection->destination_xdg_dirs,
+                hardlink_ref_destination,
                 sizeof(hardlink_ref_destination)) != 0)
         {
             replay_report_failure(collection->report, collection->manifest,
                                   root_index, entry->logical_path);
             return 1;
+        }
+        if (collection->manifest->roots[hardlink_ref_root_index].policy ==
+                ROOT_POLICY_XDG)
+        {
+            int length = snprintf(hardlink_ref_relative,
+                                  sizeof(hardlink_ref_relative), "%s",
+                                  reference_logical);
+            if (length < 0 || (size_t)length >= sizeof(hardlink_ref_relative))
+            {
+                replay_report_failure(collection->report,
+                                      collection->manifest, root_index,
+                                      entry->logical_path);
+                return 1;
+            }
+        }
+        else
+        {
+            int length = snprintf(hardlink_ref_relative,
+                                  sizeof(hardlink_ref_relative), "%s",
+                                  hardlink_ref_destination);
+            if (length < 0 ||
+                (size_t)length >= sizeof(hardlink_ref_relative))
+            {
+                replay_report_failure(collection->report,
+                                      collection->manifest, root_index,
+                                      entry->logical_path);
+                return 1;
+            }
         }
     }
 
@@ -2057,7 +2268,9 @@ static int replay_collect_entry(const SidecarLiveView *view, void *argument)
     }
     ReplayEntry *replay = &collection->items[collection->count];
     memset(replay, 0, sizeof(*replay));
-    if (destination_path_build(root, logical, replay->destination,
+    if (destination_path_build(root, logical,
+                               collection->destination_xdg_dirs,
+                               replay->destination,
                                sizeof(replay->destination)) != 0 ||
         (replay->destination[0] == '\0' &&
          entry->kind != SIDECAR_KIND_DIRECTORY))
@@ -2066,12 +2279,39 @@ static int replay_collect_entry(const SidecarLiveView *view, void *argument)
                               root_index, entry->logical_path);
         return 1;
     }
+    if (root->policy == ROOT_POLICY_XDG)
+    {
+        int length = snprintf(replay->destination_relative,
+                              sizeof(replay->destination_relative), "%s",
+                              logical);
+        if (length < 0 ||
+            (size_t)length >= sizeof(replay->destination_relative))
+        {
+            replay_report_failure(collection->report, collection->manifest,
+                                  root_index, entry->logical_path);
+            return 1;
+        }
+    }
+    else
+    {
+        int length = snprintf(replay->destination_relative,
+                              sizeof(replay->destination_relative), "%s",
+                              replay->destination);
+        if (length < 0 ||
+            (size_t)length >= sizeof(replay->destination_relative))
+        {
+            replay_report_failure(collection->report,
+                                  collection->manifest, root_index,
+                                  entry->logical_path);
+            return 1;
+        }
+    }
     replay->entry = entry;
     replay->xattrs = view->xattrs;
     replay->xattr_count = view->xattr_count;
     replay->hardlink_ref_root_index = hardlink_ref_root_index;
-    memcpy(replay->hardlink_ref_destination, hardlink_ref_destination,
-           sizeof(replay->hardlink_ref_destination));
+    memcpy(replay->hardlink_ref_relative, hardlink_ref_relative,
+           sizeof(replay->hardlink_ref_relative));
     /*
      * Accumulate the xattr namespace requirements for the pre-mutation
      * capability gate (D20 E-9). The sidecar's xattr names are not
@@ -2475,6 +2715,58 @@ static int replay_copy_regular(int source_fd, int destination_fd,
     return 0;
 }
 
+static int replay_destination_parent_for_root(
+    const ReplayCollection *collection, size_t root_index,
+    const char *relative, int *parent_out, char *leaf, size_t leaf_size)
+{
+    if (collection == NULL || collection->manifest == NULL ||
+        relative == NULL || parent_out == NULL || leaf == NULL ||
+        root_index >= (size_t)collection->manifest->root_count)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    const ManifestRoot *root = &collection->manifest->roots[root_index];
+    if (root->policy != ROOT_POLICY_XDG)
+        return replay_open_destination_parent(
+            collection->destination_home_fd, relative, parent_out, leaf,
+            leaf_size);
+
+    if (!xdg_destination_valid(collection->destination_xdg_dirs, root))
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    int index = xdg_key_index(root->id);
+    int xdg_fd = -1;
+    char prefix[NAME_MAX + 1U];
+    char destination[PATH_MAX];
+    if (open_xdg_destination_anchor(
+            collection->destination_xdg_dirs[index], &xdg_fd,
+            prefix, sizeof(prefix)) != 0 ||
+        destination_relative_path_build(prefix, relative, destination,
+                                        sizeof(destination)) != 0)
+    {
+        if (xdg_fd >= 0)
+            close(xdg_fd);
+        return -1;
+    }
+
+    int result = replay_open_destination_parent(
+        xdg_fd, destination, parent_out, leaf, leaf_size);
+    int saved = errno;
+    if (close(xdg_fd) != 0 && result == 0)
+    {
+        close(*parent_out);
+        *parent_out = -1;
+        result = -1;
+        saved = EIO;
+    }
+    errno = saved;
+    return result;
+}
+
 static int replay_destination_parent(const ReplayCollection *collection,
                                      const ReplayEntry *replay,
                                      int *parent_out, char *leaf,
@@ -2486,9 +2778,9 @@ static int replay_destination_parent(const ReplayCollection *collection,
         errno = EINVAL;
         return -1;
     }
-    return replay_open_destination_parent(collection->destination_home_fd,
-                                          replay->destination, parent_out,
-                                          leaf, leaf_size);
+    return replay_destination_parent_for_root(
+        collection, replay->root_index, replay->destination_relative,
+        parent_out, leaf, leaf_size);
 }
 
 static int replay_apply_regular(ReplayCollection *collection,
@@ -2631,8 +2923,8 @@ static int replay_apply_hardlink(ReplayCollection *collection,
         !replay_entry_valid(replay->entry) ||
         replay->hardlink_ref_root_index >=
             (size_t)collection->manifest->root_count ||
-        replay->hardlink_ref_destination[0] == '\0' ||
-        !relative_path_valid(replay->hardlink_ref_destination, 0))
+        replay->hardlink_ref_relative[0] == '\0' ||
+        !relative_path_valid(replay->hardlink_ref_relative, 0))
     {
         errno = EINVAL;
         return -1;
@@ -2645,9 +2937,9 @@ static int replay_apply_hardlink(ReplayCollection *collection,
     int result = replay_destination_parent(collection, replay, &parent_fd,
                                            leaf, sizeof(leaf));
     if (result == 0)
-        result = replay_open_destination_parent(
-            collection->destination_home_fd,
-            replay->hardlink_ref_destination, &ref_parent_fd, ref_leaf,
+        result = replay_destination_parent_for_root(
+            collection, replay->hardlink_ref_root_index,
+            replay->hardlink_ref_relative, &ref_parent_fd, ref_leaf,
             sizeof(ref_leaf));
 
     struct stat reference_before;
@@ -2903,7 +3195,8 @@ int portable_restore_replay_at(const PortableRestoreRequest *request,
     }
     MetadataTimestampPolicy timestamp_policy;
     if (replay_timestamp_policy(request, &timestamp_policy) != 0 ||
-        replay_manifest_valid(request->manifest) != 0)
+        replay_manifest_valid(request->manifest,
+                              request->destination_xdg_dirs) != 0)
     {
         replay_report_failure(report, request->manifest, SIZE_MAX,
                               (SidecarBytes){0});
@@ -2914,6 +3207,7 @@ int portable_restore_replay_at(const PortableRestoreRequest *request,
         .manifest = request->manifest,
         .data_fd = -1,
         .destination_home_fd = request->destination_home_fd,
+        .destination_xdg_dirs = request->destination_xdg_dirs,
         .timestamp_policy = timestamp_policy,
         .report = report
     };
