@@ -500,6 +500,16 @@ in G), so no single phase carries "make everything faithful at once."
   Arch/Ubuntu/Fedora VM-gate matrix passed on real ext4 and btrfs, including
   a live `SIGKILL` mid-resume whose next clean resume converged to the
   fully correct final state with no special recovery path.
+- **Integration — Production portable dispatch.** **Status: complete (2026-08-22).**
+  D24's I.1a–I.5 integration landed in the atomic activation commit `383d338`:
+  production backup, restore, dry-run, and package paths now use the measured
+  portable representation when selected. The Arch/Ubuntu/Fedora VM matrix
+  passed the production-CLI vfat, resume, collision, package, and SELinux
+  gates; a physical exFAT USB campaign also passed the cross-machine chain and
+  all three same-distro round trips with 23940/23940 items verified on every
+  leg. Post-activation testing found and fixed the XDG destination bug
+  (`f6bbbe7`), the non-fatal `security.*` restore policy (`e66eb4f`, D20 E-11),
+  and unnamed portable preflight anchor failures (`8e70c0d`).
 - **Deferred — sparse files** (D13).
 
 ---

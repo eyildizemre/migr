@@ -1880,7 +1880,33 @@ through a test-only entry point.
 
 ## D24 — 2026-08-19 — Production portable dispatch enablement
 
-**Status:** Decided (locked in planning; implementation follows in I.1a–I.5)
+**Status:** Implemented
+
+### As-built (2026-08-22)
+
+The atomic activation commit `383d338` opened production portable dispatch:
+`backup()` and `restore()` now route a `CLONE_PORTABLE_SIDECAR` verdict through
+the portable engines, live and dry-run paths use the real destination probes,
+and package handling stays in the shared control slot, with restore invoking it
+only after a complete file replay. At the current `8e70c0d` HEAD, `make clean
+&& make test`, `make check-strict` under GCC and Clang, `make check-analyze`,
+and `make check-valgrind` all pass; the root-gated real-vfat smoke was skipped
+here because loop/mount setup requires root, alongside the suite's expected
+privilege- and fixture-dependent skips.
+
+The Arch/Ubuntu/Fedora libvirt matrix exercised the production CLI against real
+loopback vfat for resume and SIGKILL recovery, dry-run/live parity for case
+collisions and unresolvable names, package install/restore, and a real Fedora
+SELinux label round-trip. A physical exFAT USB drive was then moved between the
+three running VMs: the cross-machine Arch → Ubuntu → Fedora → Arch chain and
+Fedora, Arch, and Ubuntu same-distro round trips each restored all 23940/23940
+items, with file counts and sizes checked after every leg.
+
+Three narrow bugs found during that live testing are fixed in the history:
+`f6bbbe7` resolves `ROOT_POLICY_XDG` destinations instead of flattening them
+into `$HOME`; `e66eb4f` makes cross-policy `security.*` apply refusals visible
+and non-fatal (D20 E-11); and `8e70c0d` names HOME-relative/XDG anchor failures
+with their offending logical path instead of using a generic preflight example.
 
 **Decision:** D14's refusal of a portable verdict is lifted for production
 `backup()` and `restore()`. Once the activation commit (I.2, below) lands, a

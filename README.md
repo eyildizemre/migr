@@ -56,6 +56,12 @@ restore <SOURCE>      Restore files and packages from a backup at SOURCE
 help                  Show help
 ```
 
+Restore is intended to run soon after a fresh distribution install. If the
+target has since accumulated its own files at the same paths, the result may
+be unexpected: a pre-existing destination symlink is refused cleanly and
+names the offending path, while a pre-existing regular file is replaced by
+the backup's version without a second prompt.
+
 ## Options
 
 ```
