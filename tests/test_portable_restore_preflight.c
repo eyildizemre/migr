@@ -406,6 +406,35 @@ static int run_preflight(Fixture *fixture, PortableRestorePreflightReport *repor
     return result;
 }
 
+static int run_preflight_capturing(Fixture *fixture,
+                                   PortableRestorePreflightReport *report,
+                                   char *output, size_t output_size)
+{
+    if (fixture == NULL || report == NULL || output == NULL ||
+        output_size == 0)
+        fatal("invalid preflight output capture fixture");
+
+    fflush(stdout);
+    FILE *file = tmpfile();
+    int saved_stdout = dup(STDOUT_FILENO);
+    if (file == NULL || saved_stdout < 0 ||
+        dup2(fileno(file), STDOUT_FILENO) < 0)
+        fatal("could not redirect preflight output");
+
+    int result = run_preflight(fixture, report);
+    fflush(stdout);
+    if (dup2(saved_stdout, STDOUT_FILENO) < 0 || close(saved_stdout) != 0)
+        fatal("could not restore preflight output");
+    rewind(file);
+    size_t received = fread(output, 1, output_size - 1U, file);
+    if (ferror(file))
+        fatal("could not read captured preflight output");
+    output[received] = '\0';
+    if (fclose(file) != 0)
+        fatal("could not close captured preflight output");
+    return result;
+}
+
 static void make_root_payload(Fixture *fixture)
 {
     if (mkdirat(fixture->data_fd, "ROOT", 0700) != 0)
@@ -512,6 +541,50 @@ static void test_missing_payload(void)
     check(run_preflight(&fixture, &report) != 0 &&
           file_equals(sentinel, "untouched"),
           "missing payload is refused");
+    portable_restore_preflight_report_free(&report);
+    fixture_close(&fixture);
+}
+
+static void test_destination_profile_refusal_is_named(void)
+{
+    printf(BLUE "::" NC " destination profile refusal is named\n");
+    ManifestRoot root = root_for("ROOT", "ROOT", "restored");
+    Fixture fixture;
+    int opened = fixture_open(&fixture, "destination-symlink", &root, 1);
+    check(opened == 0, "destination-symlink fixture is created");
+    if (opened != 0)
+        return;
+
+    make_root_payload(&fixture);
+    write_file_at(fixture.data_fd, "ROOT/file", "payload");
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0),
+        entry_for("ROOT", "file", "file", SIDECAR_KIND_REGULAR, 7)
+    };
+    entries[0].uid = (uint32_t)geteuid();
+    entries[0].gid = (uint32_t)getegid();
+    check(write_sidecar(&fixture, entries, 2) == 0,
+          "destination-symlink sidecar is committed");
+
+    char restored[PATH_MAX], target[PATH_MAX];
+    fixture_path(restored, sizeof(restored), fixture.home, "/restored");
+    fixture_path(target, sizeof(target), restored, "/file");
+    make_dir(restored);
+    check(symlink("outside", target) == 0,
+          "destination symlink is planted at the incoming target");
+
+    PortableRestorePreflightReport report;
+    char output[4096];
+    int result = run_preflight_capturing(&fixture, &report, output,
+                                         sizeof(output));
+    check(result != 0 && report.violation_count == 1 &&
+              report.root_count == 1 && report.roots != NULL &&
+              report.roots[0].violation_count == 1 &&
+              report.profiles.example_count == 1 &&
+              strcmp(report.profiles.examples[0], "file") == 0,
+          "destination anchor refusal names the offending entry and root");
+    check(strstr(output, "preflight example: file") != NULL,
+          "preflight output includes the offending logical path");
     portable_restore_preflight_report_free(&report);
     fixture_close(&fixture);
 }
@@ -1060,6 +1133,7 @@ int main(void)
     test_valid_and_profiles();
     test_outstanding_claim_gate();
     test_missing_payload();
+    test_destination_profile_refusal_is_named();
     test_xattr_entry_acceptance();
     test_path_and_mapping_refusals();
     test_collision_suffix_validation();

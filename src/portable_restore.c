@@ -1213,7 +1213,10 @@ static int collect_metadata_profile(const Collection *collection,
             open_destination_profile_anchor(
                 collection->destination_home_fd, destination, &anchor,
                 &existing, &has_existing) != 0)
+        {
+            report_violation(collection->report, root_index, entry->logical);
             return -1;
+        }
     }
     else if (root->policy == ROOT_POLICY_XDG)
     {
@@ -1222,7 +1225,10 @@ static int collect_metadata_profile(const Collection *collection,
                                    destination, sizeof(destination)) != 0 ||
             open_xdg_profile_anchor(collection, root, entry->logical,
                                     &anchor, &existing, &has_existing) != 0)
+        {
+            report_violation(collection->report, root_index, entry->logical);
             return -1;
+        }
     }
     else
     {
