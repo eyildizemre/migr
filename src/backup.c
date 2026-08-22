@@ -660,9 +660,10 @@ int backup(const char *target, BackupMode mode, char **paths)
 
     if (dry_run)
     {
-        // The destination is inspected exactly as a live run would inspect it,
-        // and nothing beyond that: no probe (it writes), no container, no
-        // manifest, no data/, no package export.
+        // The destination is inspected exactly as a live run would inspect
+        // it, including the real capability probe and portable pre-scan
+        // (D24 I-6) -- but nothing beyond that: no container, no manifest,
+        // no data/, no package export.
         int target_created = 0;
         if (ensure_target_root(target, &target_created) != 0)
         {
