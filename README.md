@@ -40,7 +40,7 @@ git config core.hooksPath hooks
 
 ```bash
 ./migr
-./migr report
+./migr report [--critical | --comprehensive] [-s]
 ./migr backup <PATH>
 ./migr packages <FILE>
 ./migr restore <SOURCE>
@@ -49,7 +49,7 @@ git config core.hooksPath hooks
 ## Commands
 
 ```
-report                Show backup analysis report (default when no command given)
+report [SCOPE]        Show backup analysis report (default when no command given)
 backup <PATH>         Create a resumable backup container under PATH
 packages <FILE>       Export installed packages to FILE
 restore <SOURCE>      Restore files and packages from a backup at SOURCE
@@ -68,13 +68,19 @@ the backup's version without a second prompt.
 -n, --dry-run         Preview actions without making changes
 -v, --verbose         Verbose output
 -h, --help            Show help
+-s, --summary         Print only the selected report scope total
 ```
 
-Backup scope (`backup` only, mutually exclusive):
+Scope (`backup`/`report`, mutually exclusive):
 
 ```
---critical            Back up Documents, Downloads, Pictures, and dotfiles (default)
---comprehensive       Back up everything except system files
+--critical            Use Documents, Downloads, Pictures, and dotfiles (backup default)
+--comprehensive       Use everything --critical covers, plus Desktop, Videos, and Music
+```
+
+Backup-only explicit paths:
+
+```
 <PATH...>             Paths listed after the destination are backed up exactly as
                       given, with no assumptions
 ```
@@ -217,7 +223,19 @@ a test-only entry point.
 
 ## Report
 
-Running `migr` or `migr report` scans your home directory and shows sizes for main directories, dotfiles, dev tools, and browsers — plus a critical backup size estimate.
+Running `migr` or `migr report` without a scope preserves the legacy analysis
+view: main directories, dotfiles, developer tools, browsers, and a critical
+backup estimate. Add `--critical` or `--comprehensive` to make the report use
+the same live root plan as backup, so its sections and total describe exactly
+what that scope would capture. With `-s`/`--summary`, only the selected scope's
+total is printed on one line for scripting; without an explicit scope, summary
+uses the critical scope.
+
+```bash
+./migr report --critical
+./migr report --comprehensive
+./migr report --critical --summary
+```
 
 ## Under the Hood
 

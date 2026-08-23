@@ -40,7 +40,7 @@ int main(int argc, char *argv[])
 
     if (argc < 2) // No arguments provided; default to report action
     {
-        return report();
+        return report(BACKUP_CRITICAL, 0, 0);
     }
 
     static struct option long_options[] = {
@@ -49,6 +49,7 @@ int main(int argc, char *argv[])
         {"help",           no_argument,       NULL, 'h'},
         {"critical",       no_argument,       NULL, 'c'},
         {"comprehensive",  no_argument,       NULL, 'C'},
+        {"summary",        no_argument,       NULL, 's'},
         {NULL,             0,                 NULL,  0 }
     };
 
@@ -76,12 +77,13 @@ int main(int argc, char *argv[])
     char **user_paths = no_paths;
     int opt;
     int mode_flag_given = 0;
+    int summary_flag = 0;
 
     // Parse options only. optind was set above to skip the command word, or left
     // at 1 when no command was given (e.g. `migr --help`). getopt_long permutes
     // argv as it scans, so once the loop ends every non-option argument sits
     // contiguously starting at argv[optind] — that is where positionals are read.
-    while ((opt = getopt_long(argc, argv, "nvh", long_options, NULL)) != -1)
+    while ((opt = getopt_long(argc, argv, "nvhs", long_options, NULL)) != -1)
     {
         switch (opt)
         {
@@ -105,6 +107,9 @@ int main(int argc, char *argv[])
             }
             mode = (opt == 'C') ? BACKUP_COMPREHENSIVE : BACKUP_CRITICAL;
             mode_flag_given = 1;
+            break;
+        case 's':
+            summary_flag = 1;
             break;
         case '?':
         default:
@@ -136,9 +141,15 @@ int main(int argc, char *argv[])
 
     // Cross-cutting checks: reject inputs the chosen command has no use for.
     // Required-argument checks stay with their command in the dispatch below.
-    if (mode_flag_given && action != ACTION_BACKUP)
+    if (mode_flag_given && action != ACTION_BACKUP &&
+        action != ACTION_REPORT && action != ACTION_NONE)
     {
-        printf("Error: --critical/--comprehensive apply only to 'backup'.\n");
+        printf("Error: --critical/--comprehensive apply only to 'backup' or 'report'.\n");
+        return 1;
+    }
+    if (summary_flag && action != ACTION_REPORT && action != ACTION_NONE)
+    {
+        printf("Error: --summary applies only to 'report'.\n");
         return 1;
     }
     if (path != NULL && (action == ACTION_REPORT || action == ACTION_NONE))
@@ -156,7 +167,7 @@ int main(int argc, char *argv[])
     {
         case ACTION_NONE:
         case ACTION_REPORT:
-            ret = report();
+            ret = report(mode, mode_flag_given || summary_flag, summary_flag);
             break;
         case ACTION_BACKUP:
             if (path == NULL)

@@ -85,6 +85,20 @@ assert_contains() {
     fi
 }
 
+assert_not_contains() {
+    local output="$1"
+    local unexpected="$2"
+
+    if [[ "$output" == *"$unexpected"* ]]; then
+        echo -e "  ${RED}✗${NC} Unexpected '$unexpected' found!"
+        echo "  Output:"
+        echo "$output"
+        exit 1
+    else
+        echo -e "  ${GREEN}✓${NC} '$unexpected' not found."
+    fi
+}
+
 assert_file_exists() {
     if [ -e "$1" ]; then
         echo -e "  ${GREEN}✓${NC} '$1' exists."
@@ -179,12 +193,78 @@ assert_no_partial() {
 test_report() {
     echo -e "${BLUE}::${NC} Phase 1: report"
 
-    local output
+    local output default_output bare_output critical_output comprehensive_output
+    local critical_summary implicit_summary comprehensive_summary without_profile
     output=$(../migr report)
 
     assert_contains "$output" ".bashrc"
     assert_contains "$output" ".ssh"
     assert_contains "$output" "Documents"
+
+    # The no-command and explicit report forms were both the legacy default
+    # before scoped reporting existed. Keep their complete output byte-identical.
+    default_output="$output"
+    bare_output=$(../migr)
+    if [ "$default_output" = "$bare_output" ]; then
+        echo -e "  ${GREEN}✓${NC} No-flag report output remains byte-for-byte stable."
+    else
+        echo -e "  ${RED}✗${NC} No-flag report output changed between default entry points."
+        exit 1
+    fi
+    assert_contains "$default_output" \
+        "(Documents, Downloads, Pictures, .ssh, .gnupg, .gitconfig, .bashrc)"
+
+    critical_output=$(../migr report --critical)
+    assert_contains "$critical_output" "DOTFILES & CONFIG"
+    assert_contains "$critical_output" ".profile"
+    assert_contains "$critical_output" "Firefox"
+    assert_not_contains "$critical_output" ".mozilla"
+    assert_not_contains "$critical_output" "google-chrome"
+    assert_contains "$critical_output" "CRITICAL BACKUP ESTIMATE"
+    if [[ "$critical_output" == *"DEV TOOLS (re-downloadable)"* ]]; then
+        echo -e "  ${RED}✗${NC} Critical scoped report included informational dev tools."
+        exit 1
+    else
+        echo -e "  ${GREEN}✓${NC} Critical scoped report follows the real backup plan."
+    fi
+
+    # Make the profile contribution large enough that the human formatter cannot
+    # round it away, then prove the live critical total changes when that root is
+    # absent. Restore the small fixture before the remaining phases.
+    printf '%4096s\n' '' > "$HOME/.profile"
+    critical_summary=$(../migr report --critical -s)
+    implicit_summary=$(../migr report --summary)
+    if [[ "$critical_summary" =~ ^[0-9]+(\.[0-9]+)?(B|K|M|G)$ ]] && \
+       [ "$critical_summary" = "$implicit_summary" ]; then
+        echo -e "  ${GREEN}✓${NC} Critical summary is exactly one line and is the default scoped summary."
+    else
+        echo -e "  ${RED}✗${NC} Critical summary format or implicit-scope default is wrong: '$critical_summary'"
+        exit 1
+    fi
+    mv "$HOME/.profile" "$HOME/.profile.report-test"
+    without_profile=$(../migr report --critical -s)
+    mv "$HOME/.profile.report-test" "$HOME/.profile"
+    if [ "$critical_summary" != "$without_profile" ]; then
+        echo -e "  ${GREEN}✓${NC} .profile contributes to the critical scoped total."
+    else
+        echo -e "  ${RED}✗${NC} .profile was not included in the critical scoped total."
+        exit 1
+    fi
+
+    comprehensive_output=$(../migr report --comprehensive)
+    assert_contains "$comprehensive_output" "COMPREHENSIVE BACKUP ESTIMATE"
+    assert_contains "$comprehensive_output" "Desktop"
+    assert_contains "$comprehensive_output" "Projects"
+    assert_contains "$comprehensive_output" "Firefox"
+    assert_not_contains "$comprehensive_output" ".mozilla"
+    assert_not_contains "$comprehensive_output" "google-chrome"
+    comprehensive_summary=$(../migr report --comprehensive --summary)
+    if [[ "$comprehensive_summary" =~ ^[0-9]+(\.[0-9]+)?(B|K|M|G)$ ]]; then
+        echo -e "  ${GREEN}✓${NC} Comprehensive summary is only the formatted total."
+    else
+        echo -e "  ${RED}✗${NC} Comprehensive summary contains extra output: '$comprehensive_summary'"
+        exit 1
+    fi
 }
 
 test_dry_run() {
@@ -599,6 +679,11 @@ test_errors() {
 
     # scope flags apply to backup only
     assert_exits_nonzero ../migr restore "$BACKUP_DIR" --comprehensive
+
+    # summary is a report-only presentation mode
+    assert_exits_nonzero ../migr backup "$BACKUP_DIR" --summary
+    assert_exits_nonzero ../migr restore "$BACKUP_DIR" --summary
+    assert_exits_nonzero ../migr packages /tmp/one --summary
 
     # commands that take exactly one positional reject extras
     assert_exits_nonzero ../migr restore "$BACKUP_DIR" /tmp/extra

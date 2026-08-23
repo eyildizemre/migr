@@ -43,15 +43,16 @@ void print_help(void)
     printf("Usage: ./migr <COMMAND> [ARGUMENTS] [OPTIONS]\n");
     printf("\n");
     printf("Commands:\n");
-    printf("  report                Show backup analysis report (default when no command given)\n");
+    printf("  report [SCOPE]        Show backup analysis report (default when no command given)\n");
     printf("  backup <PATH>         Create a resumable backup container under PATH\n");
     printf("  packages <FILE>       Export the installed package list to FILE\n");
     printf("  restore <SOURCE>      Restore files and packages from a backup at SOURCE\n");
     printf("  help                  Show this help\n");
     printf("\n");
-    printf("Backup scope (backup only, mutually exclusive):\n");
+    printf("Scope (backup/report, mutually exclusive):\n");
     printf("  --critical            Documents, Downloads, Pictures, and dotfiles (default)\n");
     printf("  --comprehensive       Everything --critical covers, plus Desktop, Videos, Music\n");
+    printf("Backup-only explicit paths:\n");
     printf("  <PATH...>             Paths listed after the destination are backed up\n");
     printf("                        exactly as given, with no assumptions\n");
     printf("\n");
@@ -63,11 +64,13 @@ void print_help(void)
     printf("  -n, --dry-run         Preview actions without making changes\n");
     printf("  -v, --verbose         Verbose output\n");
     printf("  -h, --help            Show this help\n");
+    printf("  -s, --summary         Print only the selected report scope total\n");
     printf("\n");
     printf("Examples:\n");
     printf("  ./migr backup /mnt/drive\n");
     printf("  ./migr backup /mnt/drive --comprehensive\n");
     printf("  ./migr backup /mnt/drive ~/Documents ~/Projects\n");
+    printf("  ./migr report --critical --summary\n");
     printf("  ./migr restore /mnt/drive/migr_backup_20260720_143012\n");
 }
 
