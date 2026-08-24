@@ -1287,6 +1287,7 @@ int backup(const char *target, BackupMode mode, char **paths)
 
         BackupCaptureReport capture_report;
         backup_capture_report_init(&capture_report);
+        capture_report.sync_interval_bytes = BACKUP_SYNC_INTERVAL_BYTES;
         BackupProgressDisplay progress_display = {
             .estimated_total_bytes = estimate_had_error ? 0 : estimated_size,
             .data_fd = data_fd

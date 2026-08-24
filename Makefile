@@ -29,6 +29,7 @@ VALGRIND_TESTS = \
 	tests/test_restore_native \
 	tests/test_restore_source_read \
 	tests/test_backup_source_read \
+	tests/test_backup_sync \
 	tests/test_restore_dispatch \
 	tests/test_metadata_contract
 
@@ -55,6 +56,7 @@ TEST_CONTAINER = tests/test_container
 TEST_RESTORE_NATIVE = tests/test_restore_native
 TEST_RESTORE_SOURCE_READ = tests/test_restore_source_read
 TEST_BACKUP_SOURCE_READ = tests/test_backup_source_read
+TEST_BACKUP_SYNC = tests/test_backup_sync
 TEST_RESTORE_DISPATCH = tests/test_restore_dispatch
 TEST_RESTORE_ATIME = tests/test_restore_atime
 TEST_BACKUP_PLAN = tests/test_backup_plan
@@ -115,6 +117,9 @@ backup_test.o: src/backup.c src/backup.h src/backup_plan.h src/fileops.h src/met
 
 $(TEST_BACKUP_SOURCE_READ): tests/test_backup_source_read.c backup_test.o backup_plan.o container.o fileops_test.o metadata.o portable.o sidecar.o sidecar_state.o hash.o fsprobe.o manifest.o encoding.o packages.o utils.o xdg.o detect.o
 	$(CC) $(CFLAGS) -DBACKUP_TEST_HOOKS -o $@ tests/test_backup_source_read.c backup_test.o backup_plan.o container.o fileops_test.o metadata.o portable.o sidecar.o sidecar_state.o hash.o fsprobe.o manifest.o encoding.o packages.o utils.o xdg.o detect.o
+
+$(TEST_BACKUP_SYNC): tests/test_backup_sync.c fileops_test.o portable_test.o metadata.o sidecar.o sidecar_state.o hash.o manifest.o encoding.o utils.o
+	$(CC) $(CFLAGS) -Wl,--wrap=syncfs -o $@ tests/test_backup_sync.c fileops_test.o portable_test.o metadata.o sidecar.o sidecar_state.o hash.o manifest.o encoding.o utils.o
 
 $(TEST_RESTORE_DISPATCH): tests/test_restore_dispatch.c restore.o portable_restore.o fileops.o metadata.o portable.o sidecar.o sidecar_state.o hash.o fsprobe.o manifest.o encoding.o container.o utils.o xdg.o detect.o
 	$(CC) $(CFLAGS) -o $@ tests/test_restore_dispatch.c restore.o portable_restore.o fileops.o metadata.o portable.o sidecar.o sidecar_state.o hash.o fsprobe.o manifest.o encoding.o container.o utils.o xdg.o detect.o
@@ -194,7 +199,7 @@ $(TEST_PORTABLE_RESTORE_ORCHESTRATE): tests/test_portable_restore_orchestrate.c 
 $(TEST_PORTABLE_RESTORE_INVARIANT): tests/test_portable_restore_invariant.c portable_restore_test.o fsprobe.o sidecar.o sidecar_state.o hash.o manifest.o encoding.o metadata.o utils.o xdg.o
 	$(CC) $(CFLAGS) -o $@ tests/test_portable_restore_invariant.c portable_restore_test.o fsprobe.o sidecar.o sidecar_state.o hash.o manifest.o encoding.o metadata.o utils.o xdg.o
 
-test: $(TARGET) $(TEST_DETECT) $(TEST_PATHJOIN) $(TEST_FD_LIMIT) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE) $(TEST_MANIFEST) $(TEST_ENCODING) $(TEST_CONTAINER) $(TEST_RESTORE_NATIVE) $(TEST_RESTORE_SOURCE_READ) $(TEST_BACKUP_SOURCE_READ) $(TEST_RESTORE_DISPATCH) $(TEST_RESTORE_ATIME) $(TEST_BACKUP_PLAN) $(TEST_METADATA_CONTRACT) $(TEST_SIDECAR) $(TEST_SIDECAR_STATE) $(TEST_SIDECAR_SCALE) $(TEST_PORTABLE_CAPTURE) $(TEST_PORTABLE_CAPTURE_SCALE) $(TEST_PORTABLE_PREPARE) $(TEST_NATIVE_RECONCILE_SCALE) $(TEST_NATIVE_HARDLINK_SCALE) $(TEST_PORTABLE_COLLISION_SCALE) $(TEST_PORTABLE_HARDLINK_SCALE) $(TEST_PORTABLE_RESUME) $(TEST_PORTABLE_RECONCILE) $(TEST_PORTABLE_RECONCILE_SCALE) $(TEST_PORTABLE_RESTORE_PREFLIGHT) $(TEST_PORTABLE_RESTORE_REPLAY) $(TEST_PORTABLE_RESTORE_ORCHESTRATE) $(TEST_PORTABLE_RESTORE_INVARIANT)
+test: $(TARGET) $(TEST_DETECT) $(TEST_PATHJOIN) $(TEST_FD_LIMIT) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE) $(TEST_MANIFEST) $(TEST_ENCODING) $(TEST_CONTAINER) $(TEST_RESTORE_NATIVE) $(TEST_RESTORE_SOURCE_READ) $(TEST_BACKUP_SOURCE_READ) $(TEST_BACKUP_SYNC) $(TEST_RESTORE_DISPATCH) $(TEST_RESTORE_ATIME) $(TEST_BACKUP_PLAN) $(TEST_METADATA_CONTRACT) $(TEST_SIDECAR) $(TEST_SIDECAR_STATE) $(TEST_SIDECAR_SCALE) $(TEST_PORTABLE_CAPTURE) $(TEST_PORTABLE_CAPTURE_SCALE) $(TEST_PORTABLE_PREPARE) $(TEST_NATIVE_RECONCILE_SCALE) $(TEST_NATIVE_HARDLINK_SCALE) $(TEST_PORTABLE_COLLISION_SCALE) $(TEST_PORTABLE_HARDLINK_SCALE) $(TEST_PORTABLE_RESUME) $(TEST_PORTABLE_RECONCILE) $(TEST_PORTABLE_RECONCILE_SCALE) $(TEST_PORTABLE_RESTORE_PREFLIGHT) $(TEST_PORTABLE_RESTORE_REPLAY) $(TEST_PORTABLE_RESTORE_ORCHESTRATE) $(TEST_PORTABLE_RESTORE_INVARIANT)
 	./$(TEST_DETECT)
 	./$(TEST_PATHJOIN)
 	./$(TEST_FD_LIMIT)
@@ -206,6 +211,7 @@ test: $(TARGET) $(TEST_DETECT) $(TEST_PATHJOIN) $(TEST_FD_LIMIT) $(TEST_SPECIAL_
 	./$(TEST_RESTORE_NATIVE)
 	./$(TEST_RESTORE_SOURCE_READ)
 	./$(TEST_BACKUP_SOURCE_READ)
+	./$(TEST_BACKUP_SYNC)
 	./$(TEST_RESTORE_DISPATCH)
 	./$(TEST_RESTORE_ATIME)
 	./$(TEST_METADATA_CONTRACT)
@@ -291,6 +297,6 @@ check:
 	$(MAKE) check-analyze
 
 clean:
-	rm -f $(OBJS) backup_test.o fileops_test.o sidecar.o sidecar_test.o sidecar_state.o sidecar_state_test.o portable.o portable_test.o portable_restore_test.o metadata_test.o $(TARGET) $(TEST_DETECT) $(TEST_PATHJOIN) $(TEST_FD_LIMIT) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE) $(TEST_MANIFEST) $(TEST_ENCODING) $(TEST_CONTAINER) $(TEST_RESTORE_NATIVE) $(TEST_RESTORE_SOURCE_READ) $(TEST_BACKUP_SOURCE_READ) $(TEST_RESTORE_DISPATCH) $(TEST_RESTORE_ATIME) $(TEST_BACKUP_PLAN) $(TEST_METADATA_CONTRACT) $(TEST_SIDECAR) $(TEST_SIDECAR_STATE) $(TEST_SIDECAR_SCALE) $(TEST_PORTABLE_CAPTURE) $(TEST_PORTABLE_CAPTURE_SCALE) $(TEST_PORTABLE_PREPARE) $(TEST_NATIVE_RECONCILE_SCALE) $(TEST_NATIVE_HARDLINK_SCALE) $(TEST_PORTABLE_COLLISION_SCALE) $(TEST_PORTABLE_HARDLINK_SCALE) $(TEST_PORTABLE_RESUME) $(TEST_PORTABLE_RECONCILE) $(TEST_PORTABLE_RECONCILE_SCALE) $(TEST_PORTABLE_RESTORE_PREFLIGHT) $(TEST_PORTABLE_RESTORE_REPLAY) $(TEST_PORTABLE_RESTORE_ORCHESTRATE) $(TEST_PORTABLE_RESTORE_INVARIANT)
+	rm -f $(OBJS) backup_test.o fileops_test.o sidecar.o sidecar_test.o sidecar_state.o sidecar_state_test.o portable.o portable_test.o portable_restore_test.o metadata_test.o $(TARGET) $(TEST_DETECT) $(TEST_PATHJOIN) $(TEST_FD_LIMIT) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE) $(TEST_MANIFEST) $(TEST_ENCODING) $(TEST_CONTAINER) $(TEST_RESTORE_NATIVE) $(TEST_RESTORE_SOURCE_READ) $(TEST_BACKUP_SOURCE_READ) $(TEST_BACKUP_SYNC) $(TEST_RESTORE_DISPATCH) $(TEST_RESTORE_ATIME) $(TEST_BACKUP_PLAN) $(TEST_METADATA_CONTRACT) $(TEST_SIDECAR) $(TEST_SIDECAR_STATE) $(TEST_SIDECAR_SCALE) $(TEST_PORTABLE_CAPTURE) $(TEST_PORTABLE_CAPTURE_SCALE) $(TEST_PORTABLE_PREPARE) $(TEST_NATIVE_RECONCILE_SCALE) $(TEST_NATIVE_HARDLINK_SCALE) $(TEST_PORTABLE_COLLISION_SCALE) $(TEST_PORTABLE_HARDLINK_SCALE) $(TEST_PORTABLE_RESUME) $(TEST_PORTABLE_RECONCILE) $(TEST_PORTABLE_RECONCILE_SCALE) $(TEST_PORTABLE_RESTORE_PREFLIGHT) $(TEST_PORTABLE_RESTORE_REPLAY) $(TEST_PORTABLE_RESTORE_ORCHESTRATE) $(TEST_PORTABLE_RESTORE_INVARIANT)
 
 .PHONY: clean test check-strict check-sanitize check-valgrind check-analyze check

@@ -2577,3 +2577,47 @@ durable publication sequence. It supersedes D25's earlier no-`fsync` boundary
 for the container-finalization step only; D25's claim/replay protocol and its
 interrupted-capture semantics remain unchanged. Restore finalization and
 periodic capture syncing are outside this decision.
+
+---
+
+## D30 — 2026-08-24 — Periodic capture sync smooths backup writeback
+
+**Status:** Implemented
+
+**Decision:** During every live native or portable backup, migr accumulates
+successful regular-file content bytes in the capture's shared
+`BackupCaptureReport`. Once the accumulated amount reaches 8 MiB, it calls
+`syncfs()` on the destination filesystem and resets the counter. The report
+defaults to an interval of zero for direct/test callers, while production
+live backup unconditionally enables `BACKUP_SYNC_INTERVAL_BYTES`; the setting
+does not depend on whether stdout is a terminal. A periodic `syncfs()` failure
+is an ordinary capture I/O failure and aborts the backup.
+
+**Why:** `syncfs()` covers dirty pages belonging to the whole destination
+filesystem, not only the file that happened to trigger the check. That matters
+for both a single large file and the common many-small-files workload: a
+per-file `fdatasync()` would not bound the accumulated dirty data across files.
+The 8 MiB interval is a fixed compromise between keeping each writeback stall
+small and avoiding enough sync calls to make their overhead significant on
+slow removable media. The byte counter persists across files and roots so the
+interval describes the whole capture rather than resetting at arbitrary file
+boundaries.
+
+The sync is unconditional because it changes backup behavior, not presentation.
+Piped, redirected, and unattended backups receive the same reduced in-flight
+loss window as interactive backups; `isatty()` remains appropriate only for
+D28's informational progress display. No user-facing "syncing" message or
+configuration flag is added.
+
+**Relationship to D29:** D29's final `syncfs()` and post-rename directory
+flush establish the durable publication boundary before `Backup complete` is
+printed. D30 only smooths writeback during capture and reduces the amount of
+data exposed to a mid-copy interruption; it does not make intermediate data
+durable at every instant and does not replace D29's finalization sequence.
+
+**Rejected:** Calling `fdatasync()` on each destination file is rejected
+because it does not cover dirty pages accumulated across previously completed
+files. Gating the sync on terminal output is rejected because the behavior is
+correctness/reliability-related rather than UI-related. A configurable
+interval is deferred until operational evidence shows that the fixed 8 MiB
+trade-off is wrong.

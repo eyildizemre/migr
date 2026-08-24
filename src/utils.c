@@ -99,6 +99,20 @@ int backup_progress_should_fire(struct timespec *last_fired, int unthrottled)
     return 1;
 }
 
+int backup_sync_due(off_t *bytes_since_sync, off_t chunk_size,
+                    off_t interval)
+{
+    if (bytes_since_sync == NULL || interval <= 0)
+        return 0;
+
+    *bytes_since_sync += chunk_size;
+    if (*bytes_since_sync < interval)
+        return 0;
+
+    *bytes_since_sync = 0;
+    return 1;
+}
+
 int path_join_n(char *buf, size_t size, const char *dir,
                 const char *name, size_t name_len)
 {

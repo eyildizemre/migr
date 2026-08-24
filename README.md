@@ -195,6 +195,11 @@ available space. Progress is installed only when stdout is an interactive
 terminal, so piped, redirected, and scripted backups keep the normal output
 unchanged.
 
+Live backups also periodically flush the destination filesystem during the
+copy. This smooths writeback and reduces, without eliminating, the amount of
+in-flight data exposed to a mid-copy interruption; the final flushes above
+still define the durable completion boundary.
+
 Before a live backup creates a container, migr probes the destination filesystem.
 A destination that cannot faithfully hold the required Linux semantics uses a portable
 sidecar representation (a state log preserving the true metadata alongside a plain,

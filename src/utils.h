@@ -26,6 +26,9 @@ void format_size(off_t bytes, char *buf, size_t len);
 /* Live backup progress is sampled at most twice per second in production. */
 #define BACKUP_PROGRESS_THROTTLE_MS 500
 
+/* Periodic mid-copy sync interval for live backups. */
+#define BACKUP_SYNC_INTERVAL_BYTES (8 * 1024 * 1024)
+
 /**
  * @brief Returns whether a progress callback may fire now.
  *
@@ -33,6 +36,15 @@ void format_size(off_t bytes, char *buf, size_t len);
  * unthrottled caller (the deterministic test seam) fires on every chunk.
  */
 int backup_progress_should_fire(struct timespec *last_fired, int unthrottled);
+
+/**
+ * @brief Accumulates copied bytes and reports when a sync interval is due.
+ *
+ * An interval less than or equal to zero disables the check. When the
+ * interval is reached, the accumulated counter is reset before returning 1.
+ */
+int backup_sync_due(off_t *bytes_since_sync, off_t chunk_size,
+                    off_t interval);
 
 /**
  * @brief Safely join a directory and name into "dir/name".

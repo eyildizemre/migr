@@ -1070,6 +1070,11 @@ static int copy_file_contents(int src_fd, int dest_fd,
                                             report->progress_unthrottled))
                 report->progress_cb(report->bytes_copied,
                                     report->progress_userdata);
+            if (report->sync_interval_bytes > 0 &&
+                backup_sync_due(&report->bytes_since_sync, bytes_read,
+                                report->sync_interval_bytes) &&
+                syncfs(dest_fd) != 0)
+                return -1;
         }
     }
     return bytes_read < 0 ? -1 : 0;

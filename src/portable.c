@@ -4173,6 +4173,11 @@ static int copy_regular(int source_fd, int destination_fd, off_t expected_size,
                                             report->progress_unthrottled))
                 report->progress_cb(report->bytes_copied,
                                     report->progress_userdata);
+            if (report->sync_interval_bytes > 0 &&
+                backup_sync_due(&report->bytes_since_sync, received,
+                                report->sync_interval_bytes) &&
+                syncfs(destination_fd) != 0)
+                return -1;
         }
     }
     return expected_size >= 0 && copied == (uint64_t)expected_size ? 0 : -1;
