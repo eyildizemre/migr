@@ -151,6 +151,28 @@ The backup destination must resolve outside every selected root, including throu
 symlinks. Otherwise migr refuses the entire invocation before creating anything, so a
 backup can never recurse into and consume its own output.
 
+Before reserving a container, backup estimates the selected source roots and
+compares that total with the destination's user-available free space. The same
+preflight runs for live and --dry-run invocations and for critical,
+comprehensive, and explicit-path backups. When the estimate fits, the two
+preflight lines are printed before the normal backup output:
+
+    Estimated backup size: 4.2G
+    Destination free space: 3.8G
+
+If the estimate is larger than the available space, the backup is refused
+before a container is created:
+
+    Estimated backup size: 4.2G
+    Destination free space: 3.8G
+    Error: not enough free space at /mnt/backup (need 0.4G more)
+
+The comparison is an exact estimate, not a promised reservation: filesystem
+metadata, sparse-file allocation, and hardlink deduplication can make actual
+consumption differ. If a source root cannot be measured for a reason other
+than disappearing during planning, migr warns and skips this advisory check
+rather than refusing a backup on an incomplete estimate.
+
 Before a live backup creates a container, migr probes the destination filesystem.
 A destination that cannot faithfully hold the required Linux semantics uses a portable
 sidecar representation (a state log preserving the true metadata alongside a plain,

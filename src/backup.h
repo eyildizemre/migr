@@ -1,6 +1,8 @@
 #ifndef BACKUP_H
 #define BACKUP_H
 
+#include <sys/types.h> /* off_t */
+
 typedef enum {
     BACKUP_CRITICAL,      /**< Documents, Downloads, Pictures, dotfiles, browser profiles, and packages. */
     BACKUP_COMPREHENSIVE, /**< Everything in BACKUP_CRITICAL plus Desktop, Videos, Music, and Projects. */
@@ -43,6 +45,12 @@ typedef void (*BackupTestInventoryHook)(const char *source_path,
 
 void backup_test_set_inventory_hook(BackupTestInventoryHook hook,
                                     void *context);
+
+typedef void (*BackupTestFreeSpaceHook)(off_t needed, off_t *free_bytes,
+                                        void *context);
+
+void backup_test_set_free_space_hook(BackupTestFreeSpaceHook hook,
+                                     void *context);
 #endif
 
 #endif

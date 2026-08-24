@@ -8,6 +8,26 @@
 int verbose = 0;
 int dry_run = 0;
 
+void format_size(off_t bytes, char *buf, size_t len)
+{
+    if (bytes >= 1073741824)
+    {
+        snprintf(buf, len, "%.1fG", bytes / 1073741824.0);
+    }
+    else if (bytes >= 1048576)
+    {
+        snprintf(buf, len, "%.1fM", bytes / 1048576.0);
+    }
+    else if (bytes >= 1024)
+    {
+        snprintf(buf, len, "%.1fK", bytes / 1024.0);
+    }
+    else
+    {
+        snprintf(buf, len, "%lldB", (long long)bytes);
+    }
+}
+
 int path_join_n(char *buf, size_t size, const char *dir,
                 const char *name, size_t name_len)
 {

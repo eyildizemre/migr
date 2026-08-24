@@ -2,6 +2,7 @@
 #define BACKUP_PLAN_H
 
 #include <limits.h> /* PATH_MAX */
+#include <sys/types.h> /* off_t */
 
 #include "backup.h"   /* BackupMode */
 #include "manifest.h" /* ManifestRoot, ManifestScope */
@@ -98,6 +99,17 @@ typedef struct {
  */
 int backup_plan_build(const char *home, BackupMode mode,
                       const char *const *explicit_paths, BackupPlan *out);
+
+/**
+ * @brief Estimates the source bytes represented by a built plan.
+ *
+ * This is read-only over the source side and never touches a destination.
+ * A root that disappears between planning and measurement is benign and
+ * contributes zero. Other measurement failures contribute zero for that root
+ * and set *had_error, matching report.c's scoped measurement posture.
+ */
+void backup_plan_estimate_size(const BackupPlan *plan, off_t *total,
+                               int *had_error);
 
 /**
  * @brief Whether writing a backup to destination would place it inside a tree

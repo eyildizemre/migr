@@ -2,9 +2,15 @@
 #define UTILS_H
 
 #include <stddef.h> /* size_t */
+#include <sys/types.h> /* off_t */
 
 extern int verbose; /**< Non-zero when -v is passed; enables per-file progress output. */
 extern int dry_run; /**< Non-zero when -n/--dry-run is passed; suppresses all writes. */
+
+/**
+ * @brief Formats a byte count with the same units used by report output.
+ */
+void format_size(off_t bytes, char *buf, size_t len);
 
 /**
  * @brief Safely join a directory and name into "dir/name".

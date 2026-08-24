@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <sys/types.h>
 #include <time.h>
 #include <stdint.h>
@@ -27,6 +28,8 @@
 #ifdef BACKUP_TEST_HOOKS
 static BackupTestInventoryHook backup_test_inventory_hook;
 static void *backup_test_inventory_context;
+static BackupTestFreeSpaceHook backup_test_free_space_hook;
+static void *backup_test_free_space_context;
 
 void backup_test_set_inventory_hook(BackupTestInventoryHook hook,
                                     void *context)
@@ -35,12 +38,58 @@ void backup_test_set_inventory_hook(BackupTestInventoryHook hook,
     backup_test_inventory_context = context;
 }
 
+void backup_test_set_free_space_hook(BackupTestFreeSpaceHook hook,
+                                     void *context)
+{
+    backup_test_free_space_hook = hook;
+    backup_test_free_space_context = context;
+}
+
 static void backup_test_before_source_open(const char *source_path)
 {
     if (backup_test_inventory_hook != NULL)
         backup_test_inventory_hook(source_path, backup_test_inventory_context);
 }
 #endif
+
+// Returns 1 when the destination has at least `needed` bytes available, 0
+// when it clearly does not, and -1 when the filesystem space cannot be read.
+// f_bavail is the space this unprivileged process can actually consume;
+// f_bfree also includes blocks reserved for root.
+static int destination_has_space(int dest_fd, off_t needed,
+                                 off_t *free_bytes)
+{
+    if (dest_fd < 0 || needed < 0 || free_bytes == NULL)
+        return -1;
+
+#ifdef BACKUP_TEST_HOOKS
+    if (backup_test_free_space_hook != NULL)
+    {
+        *free_bytes = 0;
+        backup_test_free_space_hook(needed, free_bytes,
+                                    backup_test_free_space_context);
+        if (*free_bytes < 0)
+            return -1;
+        return needed <= *free_bytes;
+    }
+#endif
+
+    struct statfs fs;
+    if (fstatfs(dest_fd, &fs) != 0)
+        return -1;
+
+    uintmax_t blocks = (uintmax_t)fs.f_bavail;
+    uintmax_t block_size = (uintmax_t)(fs.f_frsize != 0
+                                           ? fs.f_frsize : fs.f_bsize);
+    if (block_size == 0 || blocks > UINTMAX_MAX / block_size)
+        return -1;
+
+    uintmax_t available = blocks * block_size;
+    *free_bytes = available > (uintmax_t)INTMAX_MAX
+        ? (off_t)INTMAX_MAX
+        : (off_t)available;
+    return needed <= *free_bytes;
+}
 
 // Validate and, if needed, create the top-level backup destination.
 // Sets *created only when THIS call made the directory, so a later refusal can
@@ -672,6 +721,10 @@ int backup(const char *target, BackupMode mode, char **paths)
         return 1;
     }
 
+    off_t estimated_size = 0;
+    int estimate_had_error = 0;
+    backup_plan_estimate_size(&plan, &estimated_size, &estimate_had_error);
+
     int count = 0;
 
     if (dry_run)
@@ -698,6 +751,45 @@ int backup(const char *target, BackupMode mode, char **paths)
         int advisory_fd = open(target, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
         if (advisory_fd >= 0)
         {
+            if (estimate_had_error)
+                printf("Warning: could not fully estimate backup size; "
+                       "skipping the free-space preflight check.\n");
+            else
+            {
+                off_t free_bytes = 0;
+                int has_space = destination_has_space(
+                    advisory_fd, estimated_size, &free_bytes);
+                if (has_space < 0)
+                    printf("Warning: could not determine destination free space; "
+                           "skipping the free-space preflight check.\n");
+                else
+                {
+                    char estimated_text[32];
+                    char free_text[32];
+                    format_size(estimated_size, estimated_text,
+                                sizeof(estimated_text));
+                    format_size(free_bytes, free_text, sizeof(free_text));
+                    printf("Estimated backup size: %s\n", estimated_text);
+                    printf("Destination free space: %s\n", free_text);
+                    if (!has_space)
+                    {
+                        off_t shortfall = estimated_size - free_bytes;
+                        char shortfall_text[32];
+                        format_size(shortfall, shortfall_text,
+                                    sizeof(shortfall_text));
+                        printf("Error: not enough free space at %s (need %s "
+                               "more)\n", target, shortfall_text);
+                        close(advisory_fd);
+                        if (target_created)
+                            rmdir(target);
+                        metadata_profiles_free(&advisory_profiles);
+                        manifest_free(&manifest);
+                        backup_plan_free(&plan);
+                        return 1;
+                    }
+                }
+            }
+
             if (fsprobe_fd(advisory_fd, &advisory_profile) != 0)
                 advisory_refusal = "could not probe the destination filesystem at";
             else if (select_representation(&advisory_profile, &advisory_repr) != 0)
@@ -847,6 +939,44 @@ int backup(const char *target, BackupMode mode, char **paths)
         manifest_free(&manifest);
         backup_plan_free(&plan);
         return 1;
+    }
+
+    if (estimate_had_error)
+        printf("Warning: could not fully estimate backup size; "
+               "skipping the free-space preflight check.\n");
+    else
+    {
+        off_t free_bytes = 0;
+        int has_space = destination_has_space(target_fd, estimated_size,
+                                              &free_bytes);
+        if (has_space < 0)
+            printf("Warning: could not determine destination free space; "
+                   "skipping the free-space preflight check.\n");
+        else
+        {
+            char estimated_text[32];
+            char free_text[32];
+            format_size(estimated_size, estimated_text,
+                        sizeof(estimated_text));
+            format_size(free_bytes, free_text, sizeof(free_text));
+            printf("Estimated backup size: %s\n", estimated_text);
+            printf("Destination free space: %s\n", free_text);
+            if (!has_space)
+            {
+                off_t shortfall = estimated_size - free_bytes;
+                char shortfall_text[32];
+                format_size(shortfall, shortfall_text,
+                            sizeof(shortfall_text));
+                printf("Error: not enough free space at %s (need %s more)\n",
+                       target, shortfall_text);
+                close(target_fd);
+                if (target_created)
+                    rmdir(target);
+                manifest_free(&manifest);
+                backup_plan_free(&plan);
+                return 1;
+            }
+        }
     }
 
     // Probe the destination and choose a representation before any container

@@ -1132,6 +1132,169 @@ static int find_payload_dir(const char *target, char *out, size_t out_size)
     return found;
 }
 
+static int directory_empty(const char *path)
+{
+    DIR *d = opendir(path);
+    if (d == NULL)
+        return 0;
+
+    struct dirent *entry;
+    int empty = 1;
+    while ((entry = readdir(d)) != NULL)
+    {
+        if (strcmp(entry->d_name, ".") != 0 &&
+            strcmp(entry->d_name, "..") != 0)
+        {
+            empty = 0;
+            break;
+        }
+    }
+    closedir(d);
+    return empty;
+}
+
+static void force_no_free_space(off_t needed, off_t *free_bytes, void *context)
+{
+    (void)needed;
+    (void)context;
+    *free_bytes = 0;
+}
+
+static void test_plan_estimate_tolerates_missing_root(void)
+{
+    printf(BLUE "::" NC " model: size estimation tolerates a root that vanishes after planning\n");
+
+    char home[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_home");
+    mkdir_p(home);
+    setenv("HOME", home, 1);
+
+    char first[PATH_MAX], second[PATH_MAX];
+    join_path(first, sizeof(first), home, "first");
+    join_path(second, sizeof(second), home, "second");
+    write_file(first, "first payload");
+    write_file(second, "second payload");
+    char *paths[] = { first, second, NULL };
+
+    BackupPlan plan;
+    check(backup_plan_build(home, BACKUP_EXPLICIT_PATHS,
+                            (const char *const *)paths, &plan) == 0,
+          "the two-root estimate fixture builds");
+
+    struct stat first_st;
+    check(lstat(first, &first_st) == 0, "the surviving root can be measured");
+    check(unlink(second) == 0, "one planned root vanishes before estimation");
+
+    off_t total = -1;
+    int had_error = -1;
+    backup_plan_estimate_size(&plan, &total, &had_error);
+    check(had_error == 0, "a vanished root is not an estimation error");
+    check(total == first_st.st_size,
+          "a vanished root contributes zero to the estimated total");
+
+    backup_plan_free(&plan);
+    remove_tree(home);
+}
+
+static void test_destination_space_preflight(void)
+{
+    printf(BLUE "::" NC " production: destination free-space preflight covers refusal, rollback, and normal explicit backups\n");
+
+    char home[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_home");
+    mkdir_p(home);
+    setenv("HOME", home, 1);
+
+    char source[PATH_MAX];
+    join_path(source, sizeof(source), home, "source.txt");
+    write_file(source, "space-preflight payload");
+    char *paths[] = { source, NULL };
+
+    char target_parent[PATH_MAX];
+    fresh_mkdtemp(target_parent, sizeof(target_parent), "plan_target_parent");
+    char target[PATH_MAX];
+    join_path(target, sizeof(target), target_parent, "existing_target");
+    mkdir_p(target);
+
+    backup_test_set_free_space_hook(force_no_free_space, NULL);
+    char live_output[8192];
+    char dry_output[8192];
+    dry_run = 0;
+    int live_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS,
+                                       paths, live_output, sizeof(live_output));
+    dry_run = 1;
+    int dry_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS,
+                                      paths, dry_output, sizeof(dry_output));
+    struct stat source_st = {0};
+    int source_stat_ok = lstat(source, &source_st) == 0;
+    check(source_stat_ok,
+          "the refusal fixture source remains measurable");
+    char shortfall_text[32];
+    format_size(source_stat_ok ? source_st.st_size : 0,
+                shortfall_text, sizeof(shortfall_text));
+    check(live_rc == 1 && dry_rc == 1,
+          "insufficient space refuses both live and dry-run backups");
+    check(strcmp(live_output, dry_output) == 0,
+          "insufficient-space output is identical live and dry-run");
+    check(strstr(live_output, "Estimated backup size:") != NULL &&
+          strstr(live_output, "Destination free space:") != NULL &&
+          strstr(live_output, "Error: not enough free space at") != NULL &&
+          strstr(live_output, "(need ") != NULL &&
+          strstr(live_output, shortfall_text) != NULL &&
+          strstr(live_output, " more)") != NULL &&
+          strstr(live_output, ", have ") == NULL,
+          "the refusal reports the additional space required");
+    check(directory_empty(target),
+          "an existing destination receives no container, data, or manifest on refusal");
+
+    char created_target[PATH_MAX];
+    join_path(created_target, sizeof(created_target), target_parent,
+              "created_then_refused");
+    dry_run = 0;
+    char rollback_output[8192];
+    int rollback_rc = run_backup_capturing(created_target,
+                                           BACKUP_EXPLICIT_PATHS, paths,
+                                           rollback_output,
+                                           sizeof(rollback_output));
+    check(rollback_rc == 1 && !dir_exists(created_target),
+          "a newly created destination is rolled back on space refusal");
+
+    backup_test_set_free_space_hook(NULL, NULL);
+    char normal_dry_target[PATH_MAX];
+    fresh_mkdtemp(normal_dry_target, sizeof(normal_dry_target), "plan_space_dry");
+    dry_run = 1;
+    char normal_dry_output[8192];
+    int normal_dry_rc = run_backup_capturing(
+        normal_dry_target, BACKUP_EXPLICIT_PATHS, paths,
+        normal_dry_output, sizeof(normal_dry_output));
+    check(normal_dry_rc == 0 &&
+          strstr(normal_dry_output, "Estimated backup size:") != NULL &&
+          strstr(normal_dry_output, "Destination free space:") != NULL,
+          "a fitting dry-run prints both space summaries and succeeds");
+
+    char normal_live_target[PATH_MAX];
+    fresh_mkdtemp(normal_live_target, sizeof(normal_live_target), "plan_space_live");
+    dry_run = 0;
+    char normal_live_output[8192];
+    int normal_live_rc = run_backup_capturing(
+        normal_live_target, BACKUP_EXPLICIT_PATHS, paths,
+        normal_live_output, sizeof(normal_live_output));
+    char payload_dir[PATH_MAX];
+    check(normal_live_rc == 0 &&
+          strstr(normal_live_output, "Estimated backup size:") != NULL &&
+          strstr(normal_live_output, "Destination free space:") != NULL &&
+          find_payload_dir(normal_live_target, payload_dir,
+                           sizeof(payload_dir)),
+          "a fitting explicit backup prints both summaries and completes");
+
+    dry_run = 0;
+    backup_test_set_free_space_hook(NULL, NULL);
+    remove_tree(home);
+    remove_tree(target_parent);
+    remove_tree(normal_dry_target);
+    remove_tree(normal_live_target);
+}
+
 static void test_missing_explicit_path_rejects_before_target_creation(void)
 {
     printf(BLUE "::" NC " production: a missing explicit path refuses the whole backup before the destination exists\n");
@@ -1334,6 +1497,8 @@ int main(void)
     test_fifo_root_is_accepted();
     test_root_count_ceiling_is_enforced();
 
+    test_plan_estimate_tolerates_missing_root();
+    test_destination_space_preflight();
     test_missing_explicit_path_rejects_before_target_creation();
     test_overlap_rejected_before_destination_created_live_and_dry_run();
     test_dangling_explicit_leaf_symlink_is_captured_as_symlink();

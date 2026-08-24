@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 
 #include "backup_plan.h"
+#include "fileops.h"
 #include "utils.h" /* path_join, path_join_n */
 #include "xdg.h"
 
@@ -605,6 +606,45 @@ int backup_plan_build(const char *home, BackupMode mode,
     out->roots = rb.items;
     out->root_count = rb.count;
     return 0;
+}
+
+void backup_plan_estimate_size(const BackupPlan *plan, off_t *total,
+                               int *had_error)
+{
+    if (total == NULL || had_error == NULL)
+        return;
+
+    *total = 0;
+    *had_error = 0;
+    if (plan == NULL)
+    {
+        *had_error = 1;
+        return;
+    }
+
+    for (int i = 0; i < plan->root_count; i++)
+    {
+        const char *path = plan->roots[i].capture_path;
+        struct stat st;
+        if (lstat(path, &st) != 0)
+        {
+            if (errno == ENOENT || errno == ENOTDIR)
+                continue;
+            *had_error = 1;
+            continue;
+        }
+
+        off_t root_size = 0;
+        errno = 0;
+        if (get_dir_size(path, &root_size) != 0)
+        {
+            if (errno == ENOENT || errno == ENOTDIR)
+                continue;
+            *had_error = 1;
+            continue;
+        }
+        *total += root_size;
+    }
 }
 
 // The destination is resolved differently from a root, because it is used

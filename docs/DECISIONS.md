@@ -2454,3 +2454,47 @@ representative-failure tests cover the new invariants; the external VM gate
 must additionally run a real native capture interruption/resume and a real
 restore of a cross-root hardlink pair, checking `dev/ino/nlink`, mode,
 uid/gid, and xattrs on both names.
+
+---
+
+## D27 — 2026-08-24 — Destination free-space preflight
+
+**Status:** Implemented
+
+**Decision:** Before reserving a backup container, backup estimates the
+selected plan's source bytes and compares that estimate with the destination
+filesystem's user-available free space. The check runs for live and --dry-run
+invocations and is independent of backup mode, so critical, comprehensive, and
+explicit-path plans all use the same preflight. A fitting backup prints both
+the estimated size and available space; a plan that clearly does not fit is
+refused before a container, manifest, or payload is written. If the estimate
+cannot be completed because of a real source-side measurement error, the
+preflight is skipped with a warning and the backup proceeds.
+
+The comparison is exact: needed > available refuses, with no invented
+percentage margin. The estimate is inherently approximate because sparse-file
+allocation, filesystem metadata, xattr overhead, and source-side hardlink
+deduplication can differ from the sum of source logical sizes. A guessed
+margin would add an unexamined policy without making that approximation
+more truthful; tuning it remains a separate evidence-based change.
+
+The available-space calculation uses statfs.f_bavail, not statfs.f_bfree.
+f_bavail reflects blocks available to migr as an unprivileged process,
+whereas f_bfree also includes blocks reserved for root and can therefore
+overstate what this invocation can consume. The filesystem fragment size is
+preferred when reported; the block size is the fallback when the fragment size
+is zero.
+
+**Why:** The check is a cheap, destination-local guard against a clearly
+undersized target while preserving the existing fail-open posture for an
+incomplete advisory estimate: report.c already treats measurement failures
+as an incomplete report rather than converting them into a hard refusal.
+Running it in both live and dry-run paths follows D24's established rule that
+dry-run performs the same destination preflight checks needed for an honest
+preview.
+
+**Rejected:** A safety-margin percentage is rejected because it would be a
+guess layered on an already approximate estimate. f_bfree is rejected
+because root-reserved blocks are not available to the ordinary process.
+A bypass flag is not added; if operational evidence shows that users need one,
+it is a separate decision rather than an implicit escape from this guard.

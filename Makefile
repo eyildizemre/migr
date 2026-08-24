@@ -122,8 +122,8 @@ $(TEST_RESTORE_DISPATCH): tests/test_restore_dispatch.c restore.o portable_resto
 $(TEST_RESTORE_ATIME): tests/test_restore_atime.c restore.o portable_restore.o fileops.o metadata.o portable.o sidecar.o sidecar_state.o hash.o fsprobe.o manifest.o encoding.o container.o utils.o xdg.o detect.o
 	$(CC) $(CFLAGS) -o $@ tests/test_restore_atime.c restore.o portable_restore.o fileops.o metadata.o portable.o sidecar.o sidecar_state.o hash.o fsprobe.o manifest.o encoding.o container.o utils.o xdg.o detect.o
 
-$(TEST_BACKUP_PLAN): tests/test_backup_plan.c backup.o backup_plan.o container.o fileops.o metadata.o portable.o sidecar.o sidecar_state.o hash.o fsprobe.o manifest.o encoding.o packages.o utils.o xdg.o detect.o
-	$(CC) $(CFLAGS) -o $@ tests/test_backup_plan.c backup.o backup_plan.o container.o fileops.o metadata.o portable.o sidecar.o sidecar_state.o hash.o fsprobe.o manifest.o encoding.o packages.o utils.o xdg.o detect.o
+$(TEST_BACKUP_PLAN): tests/test_backup_plan.c backup_test.o backup_plan.o container.o fileops.o metadata.o portable.o sidecar.o sidecar_state.o hash.o fsprobe.o manifest.o encoding.o packages.o utils.o xdg.o detect.o
+	$(CC) $(CFLAGS) -DBACKUP_TEST_HOOKS -o $@ tests/test_backup_plan.c backup_test.o backup_plan.o container.o fileops.o metadata.o portable.o sidecar.o sidecar_state.o hash.o fsprobe.o manifest.o encoding.o packages.o utils.o xdg.o detect.o
 
 $(TEST_METADATA_CONTRACT): tests/test_metadata_contract.c fileops.o metadata.o portable.o sidecar.o sidecar_state.o hash.o manifest.o encoding.o utils.o
 	$(CC) $(CFLAGS) -o $@ tests/test_metadata_contract.c fileops.o metadata.o portable.o sidecar.o sidecar_state.o hash.o manifest.o encoding.o utils.o
