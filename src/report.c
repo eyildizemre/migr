@@ -505,8 +505,11 @@ static int report_scoped(const char *home, BackupMode mode, int summary,
     {
         printf("%s\n", total_size);
         if (had_error)
+        {
+            /* Keep summary stdout to one value; this stderr warning is intentionally plain. */
             fprintf(stderr, "Warning: some paths could not be measured; "
                             "this report is incomplete.\n");
+        }
     }
     else
     {
@@ -534,7 +537,7 @@ int report(BackupMode mode, int scope_requested, int summary,
     char *home = getenv("HOME");
     if (home == NULL)
     {
-        printf("Error: Could not get HOME directory.\n");
+        print_error("Error: Could not get HOME directory.\n");
         return 1;
     }
 

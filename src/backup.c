@@ -155,7 +155,7 @@ static int ensure_target_root(const char *path, int *created)
     {
         if (!S_ISDIR(st.st_mode))
         {
-            printf("Error: %s exists but is not a directory\n", path);
+            print_error("Error: %s exists but is not a directory\n", path);
             return 1;
         }
         return 0;
@@ -164,7 +164,7 @@ static int ensure_target_root(const char *path, int *created)
     {
         // A real access failure (e.g. EACCES) must not masquerade as "absent";
         // otherwise dry-run would promise to create something it cannot reach.
-        printf("Error: Could not access %s\n", path);
+        print_error("Error: Could not access %s\n", path);
         return 1;
     }
 
@@ -185,17 +185,17 @@ static int ensure_target_root(const char *path, int *created)
         // Accept it only if it is a directory, and never claim we made it.
         if (stat(path, &st) != 0)
         {
-            printf("Error: Could not access %s\n", path);
+            print_error("Error: Could not access %s\n", path);
             return 1;
         }
         if (!S_ISDIR(st.st_mode))
         {
-            printf("Error: %s exists but is not a directory\n", path);
+            print_error("Error: %s exists but is not a directory\n", path);
             return 1;
         }
         return 0;
     }
-    printf("Error: Could not create directory %s\n", path);
+    print_error("Error: Could not create directory %s\n", path);
     return 1;
 }
 
@@ -271,7 +271,7 @@ static int manifest_from_plan(const BackupPlan *plan, Manifest *out)
         out->roots = calloc((size_t)plan->root_count, sizeof(*out->roots));
         if (out->roots == NULL)
         {
-            printf("Error: out of memory building the backup manifest\n");
+            print_error("Error: out of memory building the backup manifest\n");
             return -1;
         }
         for (int i = 0; i < plan->root_count; i++)
@@ -430,14 +430,14 @@ static void capture_roots(const CloneContext *ctx, const BackupPlan *plan, int d
                         capture_report->failed_source_path[0] != '\0'
                             ? capture_report->failed_source_path
                             : root->capture_path;
-                    printf("Error: Could not safely read source for %s: the "
+                    print_error("Error: Could not safely read source for %s: the "
                            "kernel refused the O_NOATIME open; an "
                            "O_NOATIME-less retry was not attempted because "
                            "it could change atime (ownership or CAP_FOWNER "
                            "is required).\n", failed_source);
                 }
                 else
-                    printf("Error: Failed to capture %s\n", root->capture_path);
+                    print_error("Error: Failed to capture %s\n", root->capture_path);
                 *had_error = 1;
             }
             else
@@ -475,11 +475,13 @@ static void reconcile_roots(const void *visited, const BackupPlan *plan,
                 visited, root->manifest_root.payload_path, data_fd,
                 &report) != NATIVE_RECONCILE_OK)
         {
-            printf("Error: Could not reconcile stale entries under data/%s",
-                   root->manifest_root.payload_path);
             if (report.failed_relative_path[0] != '\0')
-                printf(" (%s)", report.failed_relative_path);
-            printf("\n");
+                print_error("Error: Could not reconcile stale entries under data/%s (%s)\n",
+                            root->manifest_root.payload_path,
+                            report.failed_relative_path);
+            else
+                print_error("Error: Could not reconcile stale entries under data/%s\n",
+                            root->manifest_root.payload_path);
             *had_error = 1;
         }
     }
@@ -581,7 +583,7 @@ static void source_read_refusals_report(const SourceReadRefusals *refusals)
     if (refusals == NULL || refusals->refusal_count == 0)
         return;
 
-    printf("Error: could not safely read %zu source object(s): the kernel "
+    print_error("Error: could not safely read %zu source object(s): the kernel "
            "refused the O_NOATIME open (ownership or CAP_FOWNER is "
            "required); no O_NOATIME-less retry was attempted.\n",
            refusals->refusal_count);
@@ -745,7 +747,7 @@ int backup(const char *target, BackupMode mode, char **paths)
     char *home = getenv("HOME");
     if (home == NULL)
     {
-        printf("Error: Could not get HOME directory.\n");
+        print_error("Error: Could not get HOME directory.\n");
         return 1;
     }
 
@@ -804,7 +806,7 @@ int backup(const char *target, BackupMode mode, char **paths)
         if (advisory_fd >= 0)
         {
             if (estimate_had_error)
-                printf("Warning: could not fully estimate backup size; "
+                print_warning("Warning: could not fully estimate backup size; "
                        "skipping the free-space preflight check.\n");
             else
             {
@@ -812,7 +814,7 @@ int backup(const char *target, BackupMode mode, char **paths)
                 int has_space = destination_has_space(
                     advisory_fd, estimated_size, &free_bytes);
                 if (has_space < 0)
-                    printf("Warning: could not determine destination free space; "
+                    print_warning("Warning: could not determine destination free space; "
                            "skipping the free-space preflight check.\n");
                 else
                 {
@@ -829,7 +831,7 @@ int backup(const char *target, BackupMode mode, char **paths)
                         char shortfall_text[32];
                         format_size(shortfall, shortfall_text,
                                     sizeof(shortfall_text));
-                        printf("Error: not enough free space at %s (need %s "
+                        print_error("Error: not enough free space at %s (need %s "
                                "more)\n", target, shortfall_text);
                         close(advisory_fd);
                         if (target_created)
@@ -849,7 +851,7 @@ int backup(const char *target, BackupMode mode, char **paths)
         }
         if (advisory_refusal != NULL)
         {
-            printf("Error: %s %s\n", advisory_refusal, target);
+            print_error("Error: %s %s\n", advisory_refusal, target);
             close(advisory_fd);
             if (target_created)
                 rmdir(target);
@@ -866,7 +868,7 @@ int backup(const char *target, BackupMode mode, char **paths)
             if (advisory_refusals.refusal_count > 0)
             {
                 source_read_refusals_report(&advisory_refusals);
-                printf("Error: native metadata preflight refused the source; "
+                print_error("Error: native metadata preflight refused the source; "
                        "no container was created\n");
                 close(advisory_fd);
                 metadata_profiles_free(&advisory_profiles);
@@ -875,7 +877,7 @@ int backup(const char *target, BackupMode mode, char **paths)
                 return 1;
             }
             if (advisory_failed)
-                printf("Warning: could not complete the read-only metadata preview; "
+                print_warning("Warning: could not complete the read-only metadata preview; "
                        "the live backup will recheck it before writing.\n");
             else
             {
@@ -887,7 +889,7 @@ int backup(const char *target, BackupMode mode, char **paths)
                         &advisory_profiles,
                         (MetadataTimestampPolicy){ .nsec_exact = 0,
                                                     .configured = 1 }) != 0)
-                    printf("Warning: the ownership probe could not complete; "
+                    print_warning("Warning: the ownership probe could not complete; "
                            "the live backup will recheck it before writing.\n");
             }
         }
@@ -901,7 +903,7 @@ int backup(const char *target, BackupMode mode, char **paths)
                 : NULL;
             if (plan.root_count > 0 && advisory_roots == NULL)
             {
-                printf("Error: out of memory building the portable capture preview\n");
+                print_error("Error: out of memory building the portable capture preview\n");
                 close(advisory_fd);
                 metadata_profiles_free(&advisory_profiles);
                 manifest_free(&manifest);
@@ -927,7 +929,7 @@ int backup(const char *target, BackupMode mode, char **paths)
             if (prepare_result != 0)
             {
                 portable_prepared_capture_free(&advisory_prepared);
-                printf("Error: portable pre-scan failed or found an unresolvable "
+                print_error("Error: portable pre-scan failed or found an unresolvable "
                        "conflict at %s; nothing would be created\n", target);
                 close(advisory_fd);
                 metadata_profiles_free(&advisory_profiles);
@@ -986,7 +988,7 @@ int backup(const char *target, BackupMode mode, char **paths)
     int target_fd = open(target, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (target_fd < 0)
     {
-        printf("Error: Could not open backup destination %s\n", target);
+        print_error("Error: Could not open backup destination %s\n", target);
         if (target_created) rmdir(target);
         manifest_free(&manifest);
         backup_plan_free(&plan);
@@ -994,7 +996,7 @@ int backup(const char *target, BackupMode mode, char **paths)
     }
 
     if (estimate_had_error)
-        printf("Warning: could not fully estimate backup size; "
+        print_warning("Warning: could not fully estimate backup size; "
                "skipping the free-space preflight check.\n");
     else
     {
@@ -1002,7 +1004,7 @@ int backup(const char *target, BackupMode mode, char **paths)
         int has_space = destination_has_space(target_fd, estimated_size,
                                               &free_bytes);
         if (has_space < 0)
-            printf("Warning: could not determine destination free space; "
+            print_warning("Warning: could not determine destination free space; "
                    "skipping the free-space preflight check.\n");
         else
         {
@@ -1019,7 +1021,7 @@ int backup(const char *target, BackupMode mode, char **paths)
                 char shortfall_text[32];
                 format_size(shortfall, shortfall_text,
                             sizeof(shortfall_text));
-                printf("Error: not enough free space at %s (need %s more)\n",
+                print_error("Error: not enough free space at %s (need %s more)\n",
                        target, shortfall_text);
                 close(target_fd);
                 if (target_created)
@@ -1045,7 +1047,7 @@ int backup(const char *target, BackupMode mode, char **paths)
 
     if (refusal != NULL)
     {
-        printf("Error: %s %s\n", refusal, target);
+        print_error("Error: %s %s\n", refusal, target);
         close(target_fd);
         if (target_created) rmdir(target);
         manifest_free(&manifest);
@@ -1069,7 +1071,7 @@ int backup(const char *target, BackupMode mode, char **paths)
                                     sizeof(*portable_roots));
             if (portable_roots == NULL)
             {
-                printf("Error: out of memory building the portable capture request\n");
+                print_error("Error: out of memory building the portable capture request\n");
                 close(target_fd);
                 if (target_created)
                     rmdir(target);
@@ -1095,12 +1097,12 @@ int backup(const char *target, BackupMode mode, char **paths)
                     ROOT_POLICY_MANUAL_NATIVE)
                     has_manual_native = 1;
             if (has_manual_native)
-                printf("Error: %s cannot hold Linux metadata natively, and portable "
+                print_error("Error: %s cannot hold Linux metadata natively, and portable "
                        "capture cannot carry an external (manual-native) root's "
                        "restore address; move or drop the external path(s) to "
                        "back up here.\n", target);
             else
-                printf("Error: portable pre-scan failed or found an unresolvable "
+                print_error("Error: portable pre-scan failed or found an unresolvable "
                        "conflict at %s; no container was created\n", target);
             portable_prepared_capture_free(&prepared);
             free(portable_roots);
@@ -1154,11 +1156,11 @@ int backup(const char *target, BackupMode mode, char **paths)
                 if (source_read_refusals.refusal_count > 0)
                 {
                     source_read_refusals_report(&source_read_refusals);
-                    printf("Error: native metadata preflight refused the source; "
+                    print_error("Error: native metadata preflight refused the source; "
                            "no payload was changed\n");
                 }
                 else
-                    printf("Error: native metadata preflight failed; no payload was changed\n");
+                    print_error("Error: native metadata preflight failed; no payload was changed\n");
                 container_close(&container);
                 metadata_profiles_free(&metadata_profiles);
                 portable_prepared_capture_free(&prepared);
@@ -1197,11 +1199,11 @@ int backup(const char *target, BackupMode mode, char **paths)
                 if (source_read_refusals.refusal_count > 0)
                 {
                     source_read_refusals_report(&source_read_refusals);
-                    printf("Error: native metadata preflight refused the source; "
+                    print_error("Error: native metadata preflight refused the source; "
                            "no container was created\n");
                 }
                 else
-                    printf("Error: native metadata preflight failed; no container was created\n");
+                    print_error("Error: native metadata preflight failed; no container was created\n");
                 metadata_profiles_free(&metadata_profiles);
                 portable_prepared_capture_free(&prepared);
                 free(portable_roots);
@@ -1215,7 +1217,7 @@ int backup(const char *target, BackupMode mode, char **paths)
         }
         if (container_reserve_fd(target_fd, time(NULL), &container) != CONTAINER_OK)
         {
-            printf("Error: Could not create a backup container under %s\n", target);
+            print_error("Error: Could not create a backup container under %s\n", target);
             metadata_profiles_free(&metadata_profiles);
             portable_prepared_capture_free(&prepared);
             free(portable_roots);
@@ -1230,11 +1232,11 @@ int backup(const char *target, BackupMode mode, char **paths)
     else
     {
         if (adopt_status == CONTAINER_ERR_AMBIGUOUS)
-            printf("Error: more than one interrupted backup under %s matches this job; "
+            print_error("Error: more than one interrupted backup under %s matches this job; "
                    "resuming would be a guess. Remove or move the ones you do not want.\n",
                    target);
         else
-            printf("Error: could not examine existing backups under %s\n", target);
+            print_error("Error: could not examine existing backups under %s\n", target);
         metadata_profiles_free(&metadata_profiles);
         portable_prepared_capture_free(&prepared);
         free(portable_roots);
@@ -1262,7 +1264,7 @@ int backup(const char *target, BackupMode mode, char **paths)
     if (!adopted && repr == CLONE_NATIVE_TREE &&
         manifest_write_v1_at(container_fd, identity_manifest) != 0)
     {
-        printf("Error: Could not write manifest.txt into the backup container\n");
+        print_error("Error: Could not write manifest.txt into the backup container\n");
         had_error = 1;
         resumable = 0;
     }
@@ -1273,7 +1275,7 @@ int backup(const char *target, BackupMode mode, char **paths)
         data_fd = open_data_dir(container_fd);
         if (data_fd < 0)
         {
-            printf("Error: Could not open the container's data/ directory\n");
+            print_error("Error: Could not open the container's data/ directory\n");
             had_error = 1;
         }
     }
@@ -1318,7 +1320,7 @@ int backup(const char *target, BackupMode mode, char **paths)
             };
             if (ctx.inode_map == NULL || ctx.visited == NULL)
             {
-                printf("Error: Could not initialize native hardlink/resume tracking\n");
+                print_error("Error: Could not initialize native hardlink/resume tracking\n");
                 native_inode_map_free(ctx.inode_map);
                 native_visited_free(ctx.visited);
                 had_error = 1;
@@ -1327,7 +1329,7 @@ int backup(const char *target, BackupMode mode, char **paths)
             {
                 if (adopted && seed_native_hardlink_map(&ctx, &plan, data_fd) != 0)
                 {
-                    printf("Error: Could not seed native hardlink/resume tracking\n");
+                    print_error("Error: Could not seed native hardlink/resume tracking\n");
                     had_error = 1;
                 }
                 if (!had_error)
@@ -1353,7 +1355,7 @@ int backup(const char *target, BackupMode mode, char **paths)
                       &capture_report);
             if (capture_result != 0)
             {
-                printf("Error: portable capture failed\n");
+                print_error("Error: portable capture failed\n");
                 had_error = 1;
             }
             else
@@ -1383,7 +1385,7 @@ int backup(const char *target, BackupMode mode, char **paths)
         {
             if (packages_clear_at(container_fd, "packages.txt") != 0)
             {
-                printf("Error: could not clear packages.txt from the backup container\n");
+                print_error("Error: could not clear packages.txt from the backup container\n");
                 had_error = 1;
             }
             else
@@ -1398,12 +1400,12 @@ int backup(const char *target, BackupMode mode, char **paths)
             int pkg = packages_at(container_fd, "packages.txt");
             if (pkg < 0)
             {
-                printf("Error: could not clear packages.txt from the backup container\n");
+                print_error("Error: could not clear packages.txt from the backup container\n");
                 had_error = 1;
             }
             else if (pkg > 0)
             {
-                printf("  Warning: no package list was written for this backup.\n");
+                print_warning("  Warning: no package list was written for this backup.\n");
             }
         }
     }
@@ -1436,11 +1438,11 @@ int backup(const char *target, BackupMode mode, char **paths)
     if (final_status != CONTAINER_OK)
     {
         if (final_status == CONTAINER_ERR_FINAL_EXISTS)
-            printf("Error: a completed backup already occupies this container's final name\n");
+            print_error("Error: a completed backup already occupies this container's final name\n");
         else if (final_status == CONTAINER_ERR_NOREPLACE)
-            printf("Error: %s does not support the atomic rename migr publishes backups with\n", target);
+            print_error("Error: %s does not support the atomic rename migr publishes backups with\n", target);
         else
-            printf("Error: Could not publish the completed backup container\n");
+            print_error("Error: Could not publish the completed backup container\n");
 
         printf("Incomplete backup kept for resume: %s/%s\n",
                target, container_current_name(&container));
@@ -1454,7 +1456,7 @@ int backup(const char *target, BackupMode mode, char **paths)
         return 1;
     }
 
-    printf("Backup complete: %d items copied\n", count);
+    print_success("Backup complete: %d items copied\n", count);
     printf("Location: %s/%s\n", target, container_current_name(&container));
     printf("===========================================================\n");
 

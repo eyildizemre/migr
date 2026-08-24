@@ -198,7 +198,30 @@ test_report() {
     local critical_verbose comprehensive_verbose legacy_verbose summary_verbose
     local depth_zero depth_two depth_root summary_depth
     local critical_root_count comprehensive_root_count legacy_root_count
+    local raw_status_calls captured_output
     output=$(../migr report)
+
+    raw_status_calls=$(grep -nE 'printf\("Error: |printf\("Warning: ' \
+        ../src/*.c || true)
+    if [ -n "$raw_status_calls" ]; then
+        echo -e "  ${RED}✗${NC} Raw Error/Warning printf call remains in src/"
+        echo "$raw_status_calls"
+        exit 1
+    else
+        echo -e "  ${GREEN}✓${NC} Error/Warning output uses the status helpers."
+    fi
+
+    if captured_output=$(HOME="$TEST_DIR/missing-home" \
+        ../migr report --critical 2>&1); then
+        echo -e "  ${RED}✗${NC} Missing HOME unexpectedly allowed report execution."
+        exit 1
+    elif [[ "$captured_output" == *$'\033['* ]]; then
+        echo -e "  ${RED}✗${NC} Captured status output contains ANSI escape codes."
+        echo "$captured_output"
+        exit 1
+    else
+        echo -e "  ${GREEN}✓${NC} Captured status output stays free of ANSI escape codes."
+    fi
 
     assert_contains "$output" ".bashrc"
     assert_contains "$output" ".ssh"

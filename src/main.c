@@ -5,6 +5,7 @@
 #include <getopt.h>
 #include <string.h>
 #include <stdint.h>
+#include <unistd.h>
 
 #include "backup.h"
 #include "packages.h"
@@ -63,13 +64,12 @@ static int parse_report_depth(const char *argument, ReportDepth *depth)
 int main(int argc, char *argv[])
 {
     raise_fd_limit();
+    color_enabled = isatty(fileno(stdout));
 
     ReportDepth depth = { REPORT_DEPTH_DEFAULT, 0 };
 
     if (argc < 2) // No arguments provided; default to report action
-    {
         return report(BACKUP_CRITICAL, 0, 0, depth);
-    }
 
     static struct option long_options[] = {
         {"dry-run",        no_argument,       NULL, 'n'},
@@ -132,7 +132,7 @@ int main(int argc, char *argv[])
             // overwrite the first. Reject instead of letting the last one win.
             if (mode_flag_given)
             {
-                printf("Error: --critical and --comprehensive are mutually exclusive.\n");
+                print_error("Error: --critical and --comprehensive are mutually exclusive.\n");
                 return 1;
             }
             mode = (opt == 'C') ? BACKUP_COMPREHENSIVE : BACKUP_CRITICAL;
@@ -144,7 +144,7 @@ int main(int argc, char *argv[])
         case 'd':
             if (parse_report_depth(optarg, &depth) != 0)
             {
-                printf("Error: --max-depth must be a non-negative integer.\n");
+                print_error("Error: --max-depth must be a non-negative integer.\n");
                 return 1;
             }
             max_depth_given = 1;
@@ -171,7 +171,7 @@ int main(int argc, char *argv[])
         {
             if (mode_flag_given)
             {
-                printf("Error: cannot combine --critical/--comprehensive with explicit paths.\n");
+                print_error("Error: cannot combine --critical/--comprehensive with explicit paths.\n");
                 return 1;
             }
             mode = BACKUP_EXPLICIT_PATHS;
@@ -183,22 +183,22 @@ int main(int argc, char *argv[])
     if (mode_flag_given && action != ACTION_BACKUP &&
         action != ACTION_REPORT && action != ACTION_NONE)
     {
-        printf("Error: --critical/--comprehensive apply only to 'backup' or 'report'.\n");
+        print_error("Error: --critical/--comprehensive apply only to 'backup' or 'report'.\n");
         return 1;
     }
     if (summary_flag && action != ACTION_REPORT && action != ACTION_NONE)
     {
-        printf("Error: --summary applies only to 'report'.\n");
+        print_error("Error: --summary applies only to 'report'.\n");
         return 1;
     }
     if (max_depth_given && action != ACTION_REPORT && action != ACTION_NONE)
     {
-        printf("Error: --max-depth applies only to 'report'.\n");
+        print_error("Error: --max-depth applies only to 'report'.\n");
         return 1;
     }
     if (path != NULL && (action == ACTION_REPORT || action == ACTION_NONE))
     {
-        printf("Error: 'report' takes no arguments.\n");
+        print_error("Error: 'report' takes no arguments.\n");
         return 1;
     }
 
@@ -232,7 +232,7 @@ int main(int argc, char *argv[])
             }
             if (user_paths[0] != NULL)
             {
-                printf("Error: packages does not accept additional paths.\n");
+                print_error("Error: packages does not accept additional paths.\n");
                 ret = 1;
                 break;
             }
@@ -247,7 +247,7 @@ int main(int argc, char *argv[])
             }
             if (user_paths[0] != NULL)
             {
-                printf("Error: restore does not accept additional paths.\n");
+                print_error("Error: restore does not accept additional paths.\n");
                 ret = 1;
                 break;
             }

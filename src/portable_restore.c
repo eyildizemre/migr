@@ -3472,7 +3472,7 @@ static PortableRestoreOutcome portable_restore_orchestrate_impl(
         if (fsprobe_timestamps_fd(request->destination_home_fd,
                                   &nsec_exact) != 0)
         {
-            printf("Error: could not measure destination timestamp support; "
+            print_error("Error: could not measure destination timestamp support; "
                    "no destination was changed\n");
             portable_restore_preflight_report_free(&preflight);
             return PORTABLE_RESTORE_ERROR;
@@ -3487,7 +3487,7 @@ static PortableRestoreOutcome portable_restore_orchestrate_impl(
     if (metadata_profiles_probe(&preflight.profiles, policy) != 0)
     {
         report->live_count = preflight.live_count;
-        printf("Error: portable metadata probe failed; no destination was changed\n");
+        print_error("Error: portable metadata probe failed; no destination was changed\n");
         portable_restore_preflight_report_free(&preflight);
         return PORTABLE_RESTORE_ERROR;
     }

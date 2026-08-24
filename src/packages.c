@@ -24,7 +24,7 @@ static char *collect_packages(int *count_out)
 
     if (cmd == NULL)
     {
-        printf("Error: Could not detect distribution.\n");
+        print_error("Error: Could not detect distribution.\n");
         return NULL;
     }
 
@@ -38,7 +38,7 @@ static char *collect_packages(int *count_out)
     char *buffer = malloc(buf_size);
     if (buffer == NULL)
     {
-        printf("Error: Could not allocate buffer.\n");
+        print_error("Error: Could not allocate buffer.\n");
         return NULL;
     }
 
@@ -46,7 +46,7 @@ static char *collect_packages(int *count_out)
 
     if (run_command_capture(cmd, buffer, buf_size) != 0)
     {
-        printf("Error: Could not run package command.\n");
+        print_error("Error: Could not run package command.\n");
         free(buffer);
         return NULL;
     }
@@ -83,7 +83,7 @@ int packages(const char *path)
     FILE *out = fopen(path, "w");
     if (out == NULL)
     {
-        printf("Error: Could not open %s for writing.\n", path);
+        print_error("Error: Could not open %s for writing.\n", path);
         free(buffer);
         return 1;
     }
@@ -93,7 +93,7 @@ int packages(const char *path)
 
     if (failed)
     {
-        printf("Error: Could not write %s.\n", path);
+        print_error("Error: Could not write %s.\n", path);
         return 1;
     }
 
@@ -166,7 +166,7 @@ int packages_at(int container_fd, const char *leaf)
         if (fd >= 0)
             close(fd);
         free(buffer);
-        printf("Error: Could not write %s.\n", leaf);
+        print_error("Error: Could not write %s.\n", leaf);
         return packages_clear_at(container_fd, leaf) == 0 ? 1 : -1;
     }
 
@@ -175,7 +175,7 @@ int packages_at(int container_fd, const char *leaf)
     {
         close(fd);
         free(buffer);
-        printf("Error: Could not write %s.\n", leaf);
+        print_error("Error: Could not write %s.\n", leaf);
         return packages_clear_at(container_fd, leaf) == 0 ? 1 : -1;
     }
 
@@ -184,7 +184,7 @@ int packages_at(int container_fd, const char *leaf)
 
     if (failed)
     {
-        printf("Error: Could not write %s.\n", leaf);
+        print_error("Error: Could not write %s.\n", leaf);
         return packages_clear_at(container_fd, leaf) == 0 ? 1 : -1;
     }
 

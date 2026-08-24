@@ -7,6 +7,16 @@
 
 extern int verbose; /**< Non-zero when -v is passed; enables per-file progress output. */
 extern int dry_run; /**< Non-zero when -n/--dry-run is passed; suppresses all writes. */
+extern int color_enabled; /**< Non-zero when status colors are enabled for stdout. */
+
+/** @brief Prints a complete error message, optionally in bold red. */
+void print_error(const char *fmt, ...);
+
+/** @brief Prints a complete warning message, optionally in bold yellow. */
+void print_warning(const char *fmt, ...);
+
+/** @brief Prints a complete success message, optionally in bold green. */
+void print_success(const char *fmt, ...);
 
 /**
  * @brief Formats a byte count with the same units used by report output.

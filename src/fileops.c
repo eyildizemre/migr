@@ -1498,14 +1498,14 @@ static BackupCaptureStatus capture_entry_at(const CloneContext *ctx,
         // Sockets and device nodes carry no copyable content: a socket is a
         // runtime IPC endpoint, a device node needs root to recreate. Skip
         // either with a warning rather than failing the enclosing directory.
-        printf("  Warning: skipping socket (runtime-only): %s\n", src);
+        print_warning("  Warning: skipping socket (runtime-only): %s\n", src);
         trackable = 0;
         status = BACKUP_CAPTURE_OK;
     }
     else if (S_ISCHR(st.st_mode) || S_ISBLK(st.st_mode))
     {
-        printf("  Warning: skipping %s device node: %s\n",
-               S_ISCHR(st.st_mode) ? "character" : "block", src);
+        print_warning("  Warning: skipping %s device node: %s\n",
+                      S_ISCHR(st.st_mode) ? "character" : "block", src);
         trackable = 0;
         status = BACKUP_CAPTURE_OK;
     }
@@ -3074,17 +3074,17 @@ static RestoreNativeStatus restore_entry_at(
     {
         close(source_object_fd);
         if (pass == RESTORE_APPLY)
-            printf("  Warning: skipping socket (runtime-only)%s%s\n",
-                   source_leaf[0] ? ": " : "", source_leaf);
+            print_warning("  Warning: skipping socket (runtime-only)%s%s\n",
+                          source_leaf[0] ? ": " : "", source_leaf);
         return RESTORE_NATIVE_OK;
     }
     if (S_ISCHR(source_st.st_mode) || S_ISBLK(source_st.st_mode))
     {
         close(source_object_fd);
         if (pass == RESTORE_APPLY)
-            printf("  Warning: skipping %s device node%s%s\n",
-                   S_ISCHR(source_st.st_mode) ? "character" : "block",
-                   source_leaf[0] ? ": " : "", source_leaf);
+            print_warning("  Warning: skipping %s device node%s%s\n",
+                          S_ISCHR(source_st.st_mode) ? "character" : "block",
+                          source_leaf[0] ? ": " : "", source_leaf);
         return RESTORE_NATIVE_OK;
     }
 

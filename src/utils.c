@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdarg.h>
 #include <string.h>
 #include <limits.h>
 #include <stdint.h>
@@ -9,6 +10,40 @@
 
 int verbose = 0;
 int dry_run = 0;
+int color_enabled = 0;
+
+static void print_status(const char *color, const char *fmt, va_list args)
+{
+    if (color_enabled)
+        fputs(color, stdout);
+    vprintf(fmt, args);
+    if (color_enabled)
+        fputs("\033[0m", stdout);
+}
+
+void print_error(const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    print_status("\033[1;31m", fmt, args);
+    va_end(args);
+}
+
+void print_warning(const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    print_status("\033[1;33m", fmt, args);
+    va_end(args);
+}
+
+void print_success(const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    print_status("\033[1;32m", fmt, args);
+    va_end(args);
+}
 
 void format_size(off_t bytes, char *buf, size_t len)
 {

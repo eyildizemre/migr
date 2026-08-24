@@ -37,7 +37,7 @@ static int append_root(RootBuilder *rb, const char *id, RootPolicy policy,
 {
     if (rb->count >= MANIFEST_MAX_ROOTS)
     {
-        printf("Error: too many backup roots (limit %d)\n", MANIFEST_MAX_ROOTS);
+        print_error("Error: too many backup roots (limit %d)\n", MANIFEST_MAX_ROOTS);
         return -1;
     }
     if (rb->count == rb->capacity)
@@ -48,7 +48,7 @@ static int append_root(RootBuilder *rb, const char *id, RootPolicy policy,
         BackupPlanRoot *n = realloc(rb->items, (size_t)new_cap * sizeof(*n));
         if (n == NULL)
         {
-            printf("Error: out of memory building backup plan\n");
+            print_error("Error: out of memory building backup plan\n");
             return -1;
         }
         rb->items = n;
@@ -60,7 +60,7 @@ static int append_root(RootBuilder *rb, const char *id, RootPolicy policy,
 
     if (strlen(capture_path) >= sizeof(r->capture_path))
     {
-        printf("Error: path too long: %s\n", capture_path);
+        print_error("Error: path too long: %s\n", capture_path);
         return -1;
     }
     strcpy(r->capture_path, capture_path);
@@ -68,7 +68,7 @@ static int append_root(RootBuilder *rb, const char *id, RootPolicy policy,
     ManifestRoot *mr = &r->manifest_root;
     if (strlen(id) >= sizeof(mr->id))
     {
-        printf("Error: root id too long: %s\n", id);
+        print_error("Error: root id too long: %s\n", id);
         return -1;
     }
     strcpy(mr->id, id);
@@ -76,14 +76,14 @@ static int append_root(RootBuilder *rb, const char *id, RootPolicy policy,
 
     if (strlen(payload_path) >= sizeof(mr->payload_path))
     {
-        printf("Error: payload path too long for %s\n", id);
+        print_error("Error: payload path too long for %s\n", id);
         return -1;
     }
     strcpy(mr->payload_path, payload_path);
 
     if (strlen(source_path) >= sizeof(mr->source_path))
     {
-        printf("Error: source path too long: %s\n", source_path);
+        print_error("Error: source path too long: %s\n", source_path);
         return -1;
     }
     strcpy(mr->source_path, source_path);
@@ -93,7 +93,7 @@ static int append_root(RootBuilder *rb, const char *id, RootPolicy policy,
     {
         if (strlen(restore_path) >= sizeof(mr->restore_path))
         {
-            printf("Error: restore path too long for %s\n", id);
+            print_error("Error: restore path too long for %s\n", id);
             return -1;
         }
         strcpy(mr->restore_path, restore_path);
@@ -315,7 +315,7 @@ static int build_builtin_roots(const char *home_real, BackupMode mode, RootBuild
     char *xdg_dirs[XDG_KEY_COUNT] = { NULL };
     if (xdg_resolve(home_real, xdg_keys, xdg_fallbacks, xdg_dirs, XDG_KEY_COUNT) != 0)
     {
-        printf("Error: HOME path too long to resolve user directories\n");
+        print_error("Error: HOME path too long to resolve user directories\n");
         for (int i = 0; i < XDG_KEY_COUNT; i++)
             free(xdg_dirs[i]);
         return -1;
@@ -333,7 +333,7 @@ static int build_builtin_roots(const char *home_real, BackupMode mode, RootBuild
             continue;
         if (rc < 0)
         {
-            printf("Error: could not resolve %s\n", xdg_dirs[i]);
+            print_error("Error: could not resolve %s\n", xdg_dirs[i]);
             failed = 1;
             break;
         }
@@ -361,7 +361,7 @@ static int build_builtin_roots(const char *home_real, BackupMode mode, RootBuild
         char raw[PATH_MAX];
         if (path_join(raw, sizeof(raw), home_real, e->home_rel) != 0)
         {
-            printf("Error: HOME path too long to build %s\n", e->id);
+            print_error("Error: HOME path too long to build %s\n", e->id);
             return -1;
         }
 
@@ -371,7 +371,7 @@ static int build_builtin_roots(const char *home_real, BackupMode mode, RootBuild
             continue;
         if (rc < 0)
         {
-            printf("Error: could not resolve %s\n", raw);
+            print_error("Error: could not resolve %s\n", raw);
             return -1;
         }
 
@@ -438,7 +438,7 @@ static int build_explicit_roots(const char *home_real, const char *const *explic
 {
     if (explicit_paths == NULL || explicit_paths[0] == NULL)
     {
-        printf("Error: explicit-paths mode requires at least one path argument.\n");
+        print_error("Error: explicit-paths mode requires at least one path argument.\n");
         return -1;
     }
 
@@ -449,7 +449,7 @@ static int build_explicit_roots(const char *home_real, const char *const *explic
     ExplicitTemp *tmp = malloc((size_t)n * sizeof(*tmp));
     if (tmp == NULL)
     {
-        printf("Error: out of memory building backup plan\n");
+        print_error("Error: out of memory building backup plan\n");
         return -1;
     }
 
@@ -458,7 +458,7 @@ static int build_explicit_roots(const char *home_real, const char *const *explic
         if (normalize_explicit_path(explicit_paths[i], tmp[i].capture_path,
                                     sizeof(tmp[i].capture_path)) != 0)
         {
-            printf("Error: could not resolve path: %s\n", explicit_paths[i]);
+            print_error("Error: could not resolve path: %s\n", explicit_paths[i]);
             free(tmp);
             return -1;
         }
@@ -473,7 +473,7 @@ static int build_explicit_roots(const char *home_real, const char *const *explic
         int idn = snprintf(id, sizeof(id), "EXPLICIT_%d", i);
         if (idn < 0 || (size_t)idn >= sizeof(id))
         {
-            printf("Error: too many explicit roots to name\n");
+            print_error("Error: too many explicit roots to name\n");
             failed = 1;
             break;
         }
@@ -526,12 +526,12 @@ static int validate_no_duplicates_or_overlap(const BackupPlanRoot *roots, int co
             const char *b = roots[j].capture_path;
             if (strcmp(a, b) == 0)
             {
-                printf("Error: duplicate backup root: %s\n", a);
+                print_error("Error: duplicate backup root: %s\n", a);
                 return -1;
             }
             if (is_ancestor(a, b) || is_ancestor(b, a))
             {
-                printf("Error: backup roots overlap: %s and %s\n", a, b);
+                print_error("Error: backup roots overlap: %s and %s\n", a, b);
                 return -1;
             }
         }
@@ -555,7 +555,7 @@ int backup_plan_build(const char *home, BackupMode mode,
 
     if (home == NULL || home[0] == '\0')
     {
-        printf("Error: HOME is not set\n");
+        print_error("Error: HOME is not set\n");
         return -1;
     }
 
@@ -568,15 +568,15 @@ int backup_plan_build(const char *home, BackupMode mode,
         // since both are the same underlying condition from the caller's
         // point of view.
         if (errno == ENAMETOOLONG)
-            printf("Error: HOME path too long to resolve user directories\n");
+            print_error("Error: HOME path too long to resolve user directories\n");
         else
-            printf("Error: Could not resolve HOME directory: %s\n", home);
+            print_error("Error: Could not resolve HOME directory: %s\n", home);
         return -1;
     }
     struct stat home_st;
     if (stat(home_real, &home_st) != 0 || !S_ISDIR(home_st.st_mode))
     {
-        printf("Error: HOME is not a directory: %s\n", home_real);
+        print_error("Error: HOME is not a directory: %s\n", home_real);
         return -1;
     }
 
@@ -689,10 +689,11 @@ int backup_plan_destination_conflicts(const BackupPlan *plan, const char *destin
         if (strcmp(root, dest_real) != 0 && !is_ancestor(root, dest_real))
             continue;
 
-        printf("Error: the backup destination is inside %s, which this backup would "
-               "capture.\n", root);
-        printf("  Writing a backup into a tree it is copying makes the copy consume "
-               "itself; choose a destination outside every selected root.\n");
+        print_error("Error: the backup destination is inside %s, which this backup would "
+                    "capture.\n"
+                    "  Writing a backup into a tree it is copying makes the copy consume "
+                    "itself; choose a destination outside every selected root.\n",
+                    root);
         return 1;
     }
     return 0;

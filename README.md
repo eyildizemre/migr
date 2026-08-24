@@ -73,6 +73,12 @@ the backup's version without a second prompt.
                        Report directory breakdown depth; implies --verbose
 ```
 
+Status colors are automatic: they are used when stdout is a real terminal and
+suppressed when output is piped, redirected, or captured. Errors are bold red,
+warnings are bold yellow, and successful `Backup complete`/`Restore complete`
+messages are bold green. `Dry run complete` remains uncolored because it reports
+a preview rather than a completed operation.
+
 Scope (`backup`/`report`, mutually exclusive):
 
 ```

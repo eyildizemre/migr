@@ -212,12 +212,12 @@ static int restore_timestamp_anchor_policy(const RestoreTimestampAnchors *anchor
 static void report_source_safe_read_refusal(const char *label,
                                             const RestoreNativeReport *report)
 {
-    printf("Error: Could not safely read source for %s: the kernel refused "
+    print_error("Error: Could not safely read source for %s: the kernel refused "
            "the O_NOATIME open; an O_NOATIME-less retry was not attempted "
            "because it could change atime (ownership or CAP_FOWNER is "
            "required).\n", label);
     if (report != NULL && report->failed_count != 0)
-        printf("Error: Native restore stopped at %s: %zu item(s) applied, "
+        print_error("Error: Native restore stopped at %s: %zu item(s) applied, "
                "%zu failed.\n",
                report->failed_logical_path[0] != '\0'
                    ? report->failed_logical_path : label,
@@ -286,14 +286,14 @@ static int restore_item_at(const CloneContext *ctx,
     {
         if (source_required)
         {
-            printf("Error: Manifest root %s is missing its declared payload\n", label);
+            print_error("Error: Manifest root %s is missing its declared payload\n", label);
             return -1;
         }
         return 0;
     }
     if (status == RESTORE_SOURCE_ERROR)
     {
-        printf("Error: Failed to inspect %s\n", label);
+        print_error("Error: Failed to inspect %s\n", label);
         return -1;
     }
 
@@ -301,7 +301,7 @@ static int restore_item_at(const CloneContext *ctx,
     int policy_anchor_fd = restore_destination_anchor_fd(dest_root_fd, dest_rel);
     if (policy_anchor_fd < 0)
     {
-        printf("Error: Failed to inspect restore destination for %s\n", label);
+        print_error("Error: Failed to inspect restore destination for %s\n", label);
         return -1;
     }
     if (timestamp_anchors != NULL &&
@@ -309,7 +309,7 @@ static int restore_item_at(const CloneContext *ctx,
                                         &effective_ctx.nsec_exact) != 0)
     {
         close(policy_anchor_fd);
-        printf("Error: Restore destination was not covered by timestamp preflight for %s\n",
+        print_error("Error: Restore destination was not covered by timestamp preflight for %s\n",
                label);
         return -1;
     }
@@ -327,7 +327,7 @@ static int restore_item_at(const CloneContext *ctx,
             if (native_status == RESTORE_NATIVE_SOURCE_SAFE_READ)
                 report_source_safe_read_refusal(label, NULL);
             else
-                printf("Error: Failed to restore %s\n", label);
+                print_error("Error: Failed to restore %s\n", label);
             return -1;
         }
         return 1;
@@ -347,7 +347,7 @@ static int restore_item_at(const CloneContext *ctx,
         if (native_status == RESTORE_NATIVE_SOURCE_SAFE_READ)
             report_source_safe_read_refusal(label, &report);
         else
-            printf("Error: Failed to restore %s\n", label);
+            print_error("Error: Failed to restore %s\n", label);
         return -1;
     }
     return 1;
@@ -437,7 +437,7 @@ static int restore_legacy(const char *source, int source_root_fd, const char *ho
     char *xdg_dirs[XDG_RESTORE_COUNT];
     if (xdg_resolve(home, xdg_keys, xdg_fallbacks, xdg_dirs, XDG_RESTORE_COUNT) != 0)
     {
-        printf("Error: HOME path too long to resolve user directories\n");
+        print_error("Error: HOME path too long to resolve user directories\n");
         free_xdg_dirs(xdg_dirs);
         *had_error = 1;
         return -1;
@@ -465,7 +465,7 @@ static int restore_legacy(const char *source, int source_root_fd, const char *ho
                 continue;
             if (source_status == RESTORE_SOURCE_ERROR)
             {
-                printf("Error: Failed to inspect %s\n", name);
+                print_error("Error: Failed to inspect %s\n", name);
                 *had_error = 1;
                 continue;
             }
@@ -479,7 +479,7 @@ static int restore_legacy(const char *source, int source_root_fd, const char *ho
             char destination_rel[NAME_MAX + 1];
             if (open_xdg_destination_anchor(xdg_dirs[i], &xdg_dest_fd, destination_rel, sizeof(destination_rel)) != 0)
             {
-                printf("Error: Failed to restore %s\n", name);
+                print_error("Error: Failed to restore %s\n", name);
                 *had_error = 1;
                 continue;
             }
@@ -753,7 +753,7 @@ static int validate_v1_payloads(int source_root_fd, const Manifest *m)
         char source_rel[PATH_MAX + 8];
         if (v1_payload_rel(root, source_rel, sizeof(source_rel)) != 0)
         {
-            printf("Error: Manifest root %s has an invalid payload address\n",
+            print_error("Error: Manifest root %s has an invalid payload address\n",
                    root->id);
             failed = 1;
             continue;
@@ -763,13 +763,13 @@ static int validate_v1_payloads(int source_root_fd, const Manifest *m)
             restore_native_source_status_at(source_root_fd, source_rel);
         if (status == RESTORE_SOURCE_MISSING)
         {
-            printf("Error: Manifest root %s is missing its declared payload\n",
+            print_error("Error: Manifest root %s is missing its declared payload\n",
                    root->id);
             failed = 1;
         }
         else if (status == RESTORE_SOURCE_ERROR)
         {
-            printf("Error: Could not safely inspect payload for manifest root %s\n",
+            print_error("Error: Could not safely inspect payload for manifest root %s\n",
                    root->id);
             failed = 1;
         }
@@ -789,20 +789,20 @@ static RestoreNativeStatus restore_metadata_item(
     if (status == RESTORE_SOURCE_MISSING)
     {
         if (required)
-            printf("Error: Manifest root %s is missing its declared payload\n",
+            print_error("Error: Manifest root %s is missing its declared payload\n",
                    label);
         return required ? RESTORE_NATIVE_ERROR : RESTORE_NATIVE_OK;
     }
     if (status == RESTORE_SOURCE_ERROR)
     {
-        printf("Error: Failed to inspect %s\n", label);
+        print_error("Error: Failed to inspect %s\n", label);
         return RESTORE_NATIVE_ERROR;
     }
     int metadata_anchor_fd = restore_destination_anchor_fd(destination_root_fd,
                                                            destination_rel);
     if (metadata_anchor_fd < 0)
     {
-        printf("Error: Failed to inspect restore destination for %s\n", label);
+        print_error("Error: Failed to inspect restore destination for %s\n", label);
         return RESTORE_NATIVE_ERROR;
     }
     int anchor_failed = restore_timestamp_anchor_add(timestamp_anchors,
@@ -811,7 +811,7 @@ static RestoreNativeStatus restore_metadata_item(
         anchor_failed = 1;
     if (anchor_failed)
     {
-        printf("Error: Failed to inspect restore destination for %s\n", label);
+        print_error("Error: Failed to inspect restore destination for %s\n", label);
         return RESTORE_NATIVE_ERROR;
     }
     return restore_native_metadata_inventory_at(ctx, source_root_fd, source_rel,
@@ -829,7 +829,7 @@ static RestoreNativeStatus restore_legacy_metadata_inventory(
                     XDG_RESTORE_COUNT) != 0)
     {
         free_xdg_dirs(xdg_dirs);
-        printf("Error: HOME path too long to resolve user directories\n");
+        print_error("Error: HOME path too long to resolve user directories\n");
         return -1;
     }
 
@@ -855,7 +855,7 @@ static RestoreNativeStatus restore_legacy_metadata_inventory(
             continue;
         if (source_status == RESTORE_SOURCE_ERROR)
         {
-            printf("Error: Failed to inspect %s\n", name);
+            print_error("Error: Failed to inspect %s\n", name);
             failed = 1;
             continue;
         }
@@ -866,7 +866,7 @@ static RestoreNativeStatus restore_legacy_metadata_inventory(
                                          destination_rel,
                                          sizeof(destination_rel)) != 0)
         {
-            printf("Error: Failed to resolve restore destination %s\n",
+            print_error("Error: Failed to resolve restore destination %s\n",
                    xdg_dirs[i]);
             failed = 1;
             continue;
@@ -929,7 +929,7 @@ static RestoreNativeStatus restore_v1_metadata_inventory(
         char source_rel[PATH_MAX + 8];
         if (v1_payload_rel(root, source_rel, sizeof(source_rel)) != 0)
         {
-            printf("Error: Manifest root %s has an invalid payload address\n",
+            print_error("Error: Manifest root %s has an invalid payload address\n",
                    root->id);
             failed = 1;
             continue;
@@ -955,7 +955,7 @@ static RestoreNativeStatus restore_v1_metadata_inventory(
                                 XDG_RESTORE_COUNT) != 0)
                 {
                     free_xdg_dirs(xdg_dirs);
-                    printf("Error: HOME path too long to resolve user directories\n");
+                    print_error("Error: HOME path too long to resolve user directories\n");
                     return -1;
                 }
                 xdg_ready = 1;
@@ -966,7 +966,7 @@ static RestoreNativeStatus restore_v1_metadata_inventory(
                                                         destination_rel,
                                                         sizeof(destination_rel)) != 0)
             {
-                printf("Error: Failed to resolve restore destination %s\n",
+                print_error("Error: Failed to resolve restore destination %s\n",
                        root->id);
                 failed = 1;
                 continue;
@@ -1017,7 +1017,7 @@ static void restore_v1(const char *source, int source_root_fd, const char *home,
         char source_rel[PATH_MAX + 8];
         if (v1_payload_rel(root, source_rel, sizeof(source_rel)) != 0)
         {
-            printf("Error: Failed to restore %s\n", root->id);
+            print_error("Error: Failed to restore %s\n", root->id);
             *had_error = 1;
             continue;
         }
@@ -1052,7 +1052,7 @@ static void restore_v1(const char *source, int source_root_fd, const char *home,
             {
                 free_xdg_dirs(xdg_dirs);
                 xdg_dirs_failed = 1;
-                printf("Error: HOME path too long to resolve user directories\n");
+                print_error("Error: HOME path too long to resolve user directories\n");
             }
         }
         if (xdg_dirs_failed)
@@ -1064,7 +1064,7 @@ static void restore_v1(const char *source, int source_root_fd, const char *home,
         int idx = xdg_key_index(root->id);
         if (idx < 0)
         {
-            printf("Error: Unrecognized XDG root id: %s\n", root->id);
+            print_error("Error: Unrecognized XDG root id: %s\n", root->id);
             *had_error = 1;
             continue;
         }
@@ -1073,7 +1073,7 @@ static void restore_v1(const char *source, int source_root_fd, const char *home,
         char destination_rel[NAME_MAX + 1];
         if (open_xdg_destination_anchor(xdg_dirs[idx], &xdg_dest_fd, destination_rel, sizeof(destination_rel)) != 0)
         {
-            printf("Error: Failed to restore %s\n", root->id);
+            print_error("Error: Failed to restore %s\n", root->id);
             *had_error = 1;
             continue;
         }
@@ -1112,7 +1112,7 @@ static void restore_v1(const char *source, int source_root_fd, const char *home,
             char source_rel[PATH_MAX + 8];
             if (v1_payload_rel(root, source_rel, sizeof(source_rel)) != 0)
             {
-                printf("Error: Manifest root %s has an invalid payload address\n",
+                print_error("Error: Manifest root %s has an invalid payload address\n",
                        root->id);
                 *had_error = 1;
                 continue;
@@ -1121,7 +1121,7 @@ static void restore_v1(const char *source, int source_root_fd, const char *home,
                 restore_native_source_status_at(source_root_fd, source_rel);
             if (status != RESTORE_SOURCE_PRESENT)
             {
-                printf("Error: Manifest root %s no longer has a readable payload\n",
+                print_error("Error: Manifest root %s no longer has a readable payload\n",
                        root->id);
                 *had_error = 1;
                 continue;
@@ -1149,7 +1149,7 @@ static void restore_packages(int source_root_fd, const char *home, int *had_erro
             printf("\nNote: packages.txt not found, skipping package restore.\n");
         else
         {
-            printf("Error: Could not read packages.txt\n");
+            print_error("Error: Could not read packages.txt\n");
             *had_error = 1;
         }
         return;
@@ -1159,14 +1159,14 @@ static void restore_packages(int source_root_fd, const char *home, int *had_erro
     if (fstat(fd, &st) != 0)
     {
         close(fd);
-        printf("Error: Could not inspect packages.txt\n");
+        print_error("Error: Could not inspect packages.txt\n");
         *had_error = 1;
         return;
     }
     if (!S_ISREG(st.st_mode))
     {
         close(fd);
-        printf("Warning: packages.txt is not a regular file, skipping package restore.\n");
+        print_warning("Warning: packages.txt is not a regular file, skipping package restore.\n");
         return;
     }
 
@@ -1174,7 +1174,7 @@ static void restore_packages(int source_root_fd, const char *home, int *had_erro
     if (pkg_file == NULL)
     {
         close(fd);
-        printf("Error: Could not read packages.txt\n");
+        print_error("Error: Could not read packages.txt\n");
         *had_error = 1;
         return;
     }
@@ -1185,7 +1185,7 @@ static void restore_packages(int source_root_fd, const char *home, int *had_erro
 
     if (distro == DISTRO_UNKNOWN)
     {
-        printf("Warning: Unrecognized distro, skipping package install.\n");
+        print_warning("Warning: Unrecognized distro, skipping package install.\n");
         fclose(pkg_file);
         return;
     }
@@ -1337,7 +1337,7 @@ static void restore_packages(int source_root_fd, const char *home, int *had_erro
                         if (!can_write_skip_log)
                         {
                             if (skipped == 0)
-                                printf("Error: Could not write skipped package log\n");
+                                print_error("Error: Could not write skipped package log\n");
                             *had_error = 1;
                         }
                         else if (skipped_f == NULL)
@@ -1345,7 +1345,7 @@ static void restore_packages(int source_root_fd, const char *home, int *had_erro
                             skipped_f = fopen(skipped_path, "w");
                             if (skipped_f == NULL)
                             {
-                                printf("Error: Could not write skipped package log\n");
+                                print_error("Error: Could not write skipped package log\n");
                                 can_write_skip_log = 0;
                                 *had_error = 1;
                             }
@@ -1384,14 +1384,14 @@ int restore(const char *source)
     char *home = getenv("HOME");
     if (home == NULL)
     {
-        printf("Error: Could not get HOME directory.\n");
+        print_error("Error: Could not get HOME directory.\n");
         return 1;
     }
 
     struct stat st;
     if (stat(source, &st) != 0 || !S_ISDIR(st.st_mode))
     {
-        printf("Error: Source directory not found: %s\n", source);
+        print_error("Error: Source directory not found: %s\n", source);
         return 1;
     }
 
@@ -1402,7 +1402,7 @@ int restore(const char *source)
     char source_copy[PATH_MAX];
     if ((size_t)snprintf(source_copy, sizeof(source_copy), "%s", source) >= sizeof(source_copy))
     {
-        printf("Error: Source path too long: %s\n", source);
+        print_error("Error: Source path too long: %s\n", source);
         return 1;
     }
     size_t source_len = strlen(source_copy);
@@ -1412,7 +1412,7 @@ int restore(const char *source)
     source_leaf = source_leaf ? source_leaf + 1 : source_copy;
     if (container_name_is_partial(source_leaf))
     {
-        printf("Error: %s is an in-progress or abandoned backup container, not a finished one.\n", source);
+        print_error("Error: %s is an in-progress or abandoned backup container, not a finished one.\n", source);
         return 1;
     }
     int source_is_versioned_final = container_name_is_final(source_leaf);
@@ -1420,7 +1420,7 @@ int restore(const char *source)
     int source_root_fd = open(source, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (source_root_fd < 0)
     {
-        printf("Error: Could not open source directory: %s\n", source);
+        print_error("Error: Could not open source directory: %s\n", source);
         return 1;
     }
 
@@ -1431,19 +1431,19 @@ int restore(const char *source)
     ManifestStatus mst = manifest_read_v1_at(source_root_fd, &m);
     if (mst == MANIFEST_STATUS_UNKNOWN_VERSION)
     {
-        printf("Error: manifest.txt records a format version this build does not understand; refusing to guess.\n");
+        print_error("Error: manifest.txt records a format version this build does not understand; refusing to guess.\n");
         close(source_root_fd);
         return 1;
     }
     if (mst == MANIFEST_STATUS_MALFORMED)
     {
-        printf("Error: manifest.txt is malformed; refusing to restore.\n");
+        print_error("Error: manifest.txt is malformed; refusing to restore.\n");
         close(source_root_fd);
         return 1;
     }
     if (mst == MANIFEST_STATUS_IO_ERROR)
     {
-        printf("Error: Could not read manifest.txt.\n");
+        print_error("Error: Could not read manifest.txt.\n");
         close(source_root_fd);
         return 1;
     }
@@ -1451,13 +1451,13 @@ int restore(const char *source)
 
     if (source_is_versioned_final && mst == MANIFEST_STATUS_MISSING)
     {
-        printf("Error: A finalized versioned container is missing manifest.txt; refusing to treat it as a legacy backup.\n");
+        print_error("Error: A finalized versioned container is missing manifest.txt; refusing to treat it as a legacy backup.\n");
         close(source_root_fd);
         return 1;
     }
     if (source_is_versioned_final && mst == MANIFEST_STATUS_LEGACY)
     {
-        printf("Error: A finalized versioned container carries a legacy manifest; refusing to guess its layout.\n");
+        print_error("Error: A finalized versioned container carries a legacy manifest; refusing to guess its layout.\n");
         close(source_root_fd);
         return 1;
     }
@@ -1465,9 +1465,9 @@ int restore(const char *source)
     if (home_fd < 0)
     {
         if (errno == ENAMETOOLONG)
-            printf("Error: HOME path too long to resolve user directories\n");
+            print_error("Error: HOME path too long to resolve user directories\n");
         else
-            printf("Error: Could not open home directory: %s\n", home);
+            print_error("Error: Could not open home directory: %s\n", home);
         if (mst == MANIFEST_STATUS_VALID)
             manifest_free(&m);
         close(source_root_fd);
@@ -1489,7 +1489,7 @@ int restore(const char *source)
             xdg_resolve(home, xdg_keys, xdg_fallbacks, xdg_dirs,
                         XDG_RESTORE_COUNT) != 0)
         {
-            printf("Error: HOME path too long to resolve user directories\n");
+            print_error("Error: HOME path too long to resolve user directories\n");
             free_xdg_dirs(xdg_dirs);
             manifest_free(&m);
             close(home_fd);
@@ -1520,10 +1520,12 @@ int restore(const char *source)
         switch (outcome)
         {
             case PORTABLE_RESTORE_COMPLETE:
-                printf(had_portable_error
-                    ? "Restore finished with errors: %zu item(s) restored, packages step failed\n"
-                    : "Restore complete: %zu item(s) restored\n",
-                    report.applied_count);
+                if (had_portable_error)
+                    printf("Restore finished with errors: %zu item(s) restored, packages step failed\n",
+                           report.applied_count);
+                else
+                    print_success("Restore complete: %zu item(s) restored\n",
+                                  report.applied_count);
                 break;
             case PORTABLE_RESTORE_DRY_RUN:
                 printf("Dry run complete: %zu item(s) would be restored\n",
@@ -1582,7 +1584,7 @@ int restore(const char *source)
         if (metadata_inventory_failed == RESTORE_NATIVE_SOURCE_SAFE_READ)
             report_source_safe_read_refusal("native restore payload", NULL);
         else
-            printf("Error: native metadata preflight failed; no destination was changed\n");
+            print_error("Error: native metadata preflight failed; no destination was changed\n");
         metadata_profiles_free(&metadata_profiles);
         restore_timestamp_anchors_free(&timestamp_anchors);
         if (mst == MANIFEST_STATUS_VALID)
@@ -1622,7 +1624,7 @@ int restore(const char *source)
     {
         if (restore_timestamp_anchor_probe(&timestamp_anchors) != 0)
         {
-            printf("Error: native timestamp preflight failed; no destination was changed\n");
+            print_error("Error: native timestamp preflight failed; no destination was changed\n");
             metadata_profiles_free(&metadata_profiles);
             restore_timestamp_anchors_free(&timestamp_anchors);
             if (mst == MANIFEST_STATUS_VALID)
@@ -1640,7 +1642,7 @@ int restore(const char *source)
                                         .configured = 1
                                     }) != 0)
         {
-            printf("Error: native metadata preflight failed; no destination was changed\n");
+            print_error("Error: native metadata preflight failed; no destination was changed\n");
             metadata_profiles_free(&metadata_profiles);
             restore_timestamp_anchors_free(&timestamp_anchors);
             if (mst == MANIFEST_STATUS_VALID)
@@ -1653,7 +1655,7 @@ int restore(const char *source)
         ctx.inode_map = native_inode_map_create();
         if (ctx.inode_map == NULL)
         {
-            printf("Error: Could not initialize native hardlink restore tracking\n");
+            print_error("Error: Could not initialize native hardlink restore tracking\n");
             metadata_profiles_free(&metadata_profiles);
             restore_timestamp_anchors_free(&timestamp_anchors);
             if (mst == MANIFEST_STATUS_VALID)
@@ -1672,7 +1674,7 @@ int restore(const char *source)
                   &timestamp_anchors);
         if (seed_status != 0)
         {
-            printf("Error: Could not seed native hardlink restore tracking\n");
+            print_error("Error: Could not seed native hardlink restore tracking\n");
             native_inode_map_free(ctx.inode_map);
             ctx.inode_map = NULL;
             metadata_profiles_free(&metadata_profiles);
@@ -1722,7 +1724,7 @@ int restore(const char *source)
     else if (had_error)
         printf("Restore finished with errors: %d items restored, some items failed\n", count);
     else
-        printf("Restore complete: %d items restored\n", count);
+        print_success("Restore complete: %d items restored\n", count);
     if (skipped_security_xattrs != 0)
         printf("Skipped %zu security.* attribute(s) that the destination "
                "could not apply.\n", skipped_security_xattrs);

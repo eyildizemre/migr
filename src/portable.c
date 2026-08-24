@@ -4562,7 +4562,7 @@ static int capture_special(PortableCaptureContext *context,
         close(parent_fd);
 
     const char *kind = S_ISSOCK(st->st_mode) ? "socket" : "device";
-    printf("Warning: skipping unsupported %s %s\n", kind,
+    print_warning("Warning: skipping unsupported %s %s\n", kind,
            logical[0] == '\0' ? root->capture_path : logical);
     return 0;
 }
