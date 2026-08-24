@@ -30,6 +30,8 @@ static BackupTestInventoryHook backup_test_inventory_hook;
 static void *backup_test_inventory_context;
 static BackupTestFreeSpaceHook backup_test_free_space_hook;
 static void *backup_test_free_space_context;
+static BackupTestProgressHook backup_test_progress_hook;
+static void *backup_test_progress_context;
 
 void backup_test_set_inventory_hook(BackupTestInventoryHook hook,
                                     void *context)
@@ -43,6 +45,13 @@ void backup_test_set_free_space_hook(BackupTestFreeSpaceHook hook,
 {
     backup_test_free_space_hook = hook;
     backup_test_free_space_context = context;
+}
+
+void backup_test_set_progress_hook(BackupTestProgressHook hook,
+                                   void *context)
+{
+    backup_test_progress_hook = hook;
+    backup_test_progress_context = context;
 }
 
 static void backup_test_before_source_open(const char *source_path)
@@ -89,6 +98,48 @@ static int destination_has_space(int dest_fd, off_t needed,
         ? (off_t)INTMAX_MAX
         : (off_t)available;
     return needed <= *free_bytes;
+}
+
+typedef struct {
+    off_t estimated_total_bytes;
+    int data_fd;
+    int printed_anything;
+} BackupProgressDisplay;
+
+static void backup_report_progress(off_t bytes_copied, void *userdata)
+{
+    BackupProgressDisplay *display = userdata;
+    if (display == NULL)
+        return;
+
+    char copied_text[32];
+    char estimated_text[32];
+    char free_text[32];
+    format_size(bytes_copied, copied_text, sizeof(copied_text));
+    if (display->estimated_total_bytes > 0)
+        format_size(display->estimated_total_bytes, estimated_text,
+                    sizeof(estimated_text));
+
+    off_t free_bytes = 0;
+    if (destination_has_space(display->data_fd, 0, &free_bytes) >= 0)
+        format_size(free_bytes, free_text, sizeof(free_text));
+    else
+        snprintf(free_text, sizeof(free_text), "unknown");
+
+    if (display->estimated_total_bytes > 0)
+        printf("\rProgress: %s/%s copied, %s free\033[K", copied_text,
+               estimated_text, free_text);
+    else
+        printf("\rProgress: %s copied, %s free\033[K", copied_text, free_text);
+
+#ifdef BACKUP_TEST_HOOKS
+    if (backup_test_progress_hook != NULL)
+        backup_test_progress_hook(bytes_copied,
+                                  display->estimated_total_bytes,
+                                  backup_test_progress_context);
+#endif
+    fflush(stdout);
+    display->printed_anything = 1;
 }
 
 // Validate and, if needed, create the top-level backup destination.
@@ -346,7 +397,8 @@ static void preview_roots(const BackupPlan *plan, int *count)
 }
 
 static void capture_roots(const CloneContext *ctx, const BackupPlan *plan, int data_fd,
-                          int *count, int *had_error)
+                          int *count, int *had_error,
+                          BackupCaptureReport *capture_report)
 {
     for (int s = 0; s < ROOT_SECTION_COUNT; s++)
     {
@@ -366,17 +418,17 @@ static void capture_roots(const CloneContext *ctx, const BackupPlan *plan, int d
                 printf("  Capturing: %s -> data/%s\n",
                        root->capture_path, root->manifest_root.payload_path);
 
-            BackupCaptureReport capture_report;
-            BackupCaptureStatus capture_status = backup_capture_at_report(
+            capture_report->failed_source_path[0] = '\0';
+            BackupCaptureStatus capture_status = backup_capture_at_report_continue(
                 ctx, root->capture_path, data_fd,
-                root->manifest_root.payload_path, &capture_report);
+                root->manifest_root.payload_path, capture_report);
             if (capture_status != BACKUP_CAPTURE_OK)
             {
                 if (capture_status == BACKUP_CAPTURE_SOURCE_SAFE_READ)
                 {
                     const char *failed_source =
-                        capture_report.failed_source_path[0] != '\0'
-                            ? capture_report.failed_source_path
+                        capture_report->failed_source_path[0] != '\0'
+                            ? capture_report->failed_source_path
                             : root->capture_path;
                     printf("Error: Could not safely read source for %s: the "
                            "kernel refused the O_NOATIME open; an "
@@ -1232,6 +1284,26 @@ int backup(const char *target, BackupMode mode, char **paths)
         if (adopted)
             printf("Resuming an interrupted backup of the same job.\n");
 
+        BackupCaptureReport capture_report;
+        backup_capture_report_init(&capture_report);
+        BackupProgressDisplay progress_display = {
+            .estimated_total_bytes = estimate_had_error ? 0 : estimated_size,
+            .data_fd = data_fd
+        };
+        int progress_installed = 0;
+        int progress_force = 0;
+#ifdef BACKUP_TEST_HOOKS
+        progress_force = backup_test_progress_hook != NULL;
+#endif
+        if (!estimate_had_error &&
+            (isatty(fileno(stdout)) || progress_force))
+        {
+            capture_report.progress_cb = backup_report_progress;
+            capture_report.progress_userdata = &progress_display;
+            capture_report.progress_unthrottled = progress_force;
+            progress_installed = 1;
+        }
+
         if (repr == CLONE_NATIVE_TREE)
         {
             CloneContext ctx = {
@@ -1240,6 +1312,7 @@ int backup(const char *target, BackupMode mode, char **paths)
                 .timestamp_policy_configured = 1,
                 .nsec_exact = profile.nsec_exact,
                 .metadata_preflight_done = 1,
+                .estimated_total_bytes = estimate_had_error ? 0 : estimated_size,
                 .inode_map = native_inode_map_create(),
                 .visited = native_visited_create()
             };
@@ -1258,7 +1331,8 @@ int backup(const char *target, BackupMode mode, char **paths)
                     had_error = 1;
                 }
                 if (!had_error)
-                    capture_roots(&ctx, &plan, data_fd, &count, &had_error);
+                    capture_roots(&ctx, &plan, data_fd, &count, &had_error,
+                                  &capture_report);
                 if (!had_error)
                     reconcile_roots(ctx.visited, &plan, data_fd, &had_error);
                 native_inode_map_free(ctx.inode_map);
@@ -1272,9 +1346,11 @@ int backup(const char *target, BackupMode mode, char **paths)
             size_t live_count = 0;
             int capture_result = adopted
                 ? portable_capture_resume_prepared_at(
-                      container_fd, &portable_request, &prepared, &live_count)
+                      container_fd, &portable_request, &prepared, &live_count,
+                      &capture_report)
                 : portable_capture_fresh_prepared_at(
-                      container_fd, &portable_request, &prepared, &live_count);
+                      container_fd, &portable_request, &prepared, &live_count,
+                      &capture_report);
             if (capture_result != 0)
             {
                 printf("Error: portable capture failed\n");
@@ -1284,6 +1360,14 @@ int backup(const char *target, BackupMode mode, char **paths)
             {
                 count = (int)live_count;
             }
+        }
+
+        if (progress_installed && progress_display.printed_anything)
+        {
+            capture_report.progress_cb(capture_report.bytes_copied,
+                                       capture_report.progress_userdata);
+            putchar('\n');
+            fflush(stdout);
         }
         close(data_fd);
 

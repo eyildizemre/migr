@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <sys/types.h>
 
+#include "fileops.h"
 #include "manifest.h"
 #include "sidecar.h"
 
@@ -145,6 +146,7 @@ void portable_prepared_capture_free(PortablePreparedCapture *prepared);
 typedef struct PortableCaptureContext {
     int data_fd;
     SidecarLog *sidecar;
+    BackupCaptureReport *progress_report; /* Borrowed; NULL disables counting callbacks. */
     int nsec_exact;
     int case_sensitive;
     int resume_mode;
@@ -194,12 +196,14 @@ int portable_capture_resume_at(int container_fd,
 /** Captures into a fresh container using a previously prepared plan. */
 int portable_capture_fresh_prepared_at(
     int container_fd, const PortableCaptureRequest *request,
-    const PortablePreparedCapture *prepared, size_t *live_count);
+    const PortablePreparedCapture *prepared, size_t *live_count,
+    BackupCaptureReport *progress_report);
 
 /** Resumes a container using a previously prepared plan. */
 int portable_capture_resume_prepared_at(
     int container_fd, const PortableCaptureRequest *request,
-    const PortablePreparedCapture *prepared, size_t *live_count);
+    const PortablePreparedCapture *prepared, size_t *live_count,
+    BackupCaptureReport *progress_report);
 
 typedef enum {
     PORTABLE_TEST_INTERRUPT_NONE = 0,

@@ -2,6 +2,7 @@
 #define UTILS_H
 
 #include <stddef.h> /* size_t */
+#include <time.h> /* struct timespec */
 #include <sys/types.h> /* off_t */
 
 extern int verbose; /**< Non-zero when -v is passed; enables per-file progress output. */
@@ -11,6 +12,17 @@ extern int dry_run; /**< Non-zero when -n/--dry-run is passed; suppresses all wr
  * @brief Formats a byte count with the same units used by report output.
  */
 void format_size(off_t bytes, char *buf, size_t len);
+
+/* Live backup progress is sampled at most twice per second in production. */
+#define BACKUP_PROGRESS_THROTTLE_MS 500
+
+/**
+ * @brief Returns whether a progress callback may fire now.
+ *
+ * The caller must invoke this only when a callback is installed. An
+ * unthrottled caller (the deterministic test seam) fires on every chunk.
+ */
+int backup_progress_should_fire(struct timespec *last_fired, int unthrottled);
 
 /**
  * @brief Safely join a directory and name into "dir/name".

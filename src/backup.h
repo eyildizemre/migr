@@ -51,6 +51,12 @@ typedef void (*BackupTestFreeSpaceHook)(off_t needed, off_t *free_bytes,
 
 void backup_test_set_free_space_hook(BackupTestFreeSpaceHook hook,
                                      void *context);
+
+typedef void (*BackupTestProgressHook)(off_t bytes_copied,
+                                       off_t estimated_total, void *context);
+
+void backup_test_set_progress_hook(BackupTestProgressHook hook,
+                                   void *context);
 #endif
 
 #endif

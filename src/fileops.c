@@ -1046,7 +1046,8 @@ static int capture_symlink_at(const char *src, int dest_dir_fd, const char *leaf
 // A write() that reports zero bytes for a non-zero request has made no
 // progress and never will on a retry, so it is treated as the failure it is
 // rather than spun on forever.
-static int copy_file_contents(int src_fd, int dest_fd)
+static int copy_file_contents(int src_fd, int dest_fd,
+                              BackupCaptureReport *report)
 {
     char buffer[8192];
     ssize_t bytes_read;
@@ -1060,6 +1061,15 @@ static int copy_file_contents(int src_fd, int dest_fd)
             if (res <= 0)
                 return -1;
             bytes_written += res;
+        }
+        if (report != NULL)
+        {
+            report->bytes_copied += bytes_read;
+            if (report->progress_cb != NULL &&
+                backup_progress_should_fire(&report->progress_last_fired,
+                                            report->progress_unthrottled))
+                report->progress_cb(report->bytes_copied,
+                                    report->progress_userdata);
         }
     }
     return bytes_read < 0 ? -1 : 0;
@@ -1248,7 +1258,7 @@ static BackupCaptureStatus capture_regular_at(
         return BACKUP_CAPTURE_ERROR;
     }
 
-    int failed = copy_file_contents(src_fd, dest_fd) != 0;
+    int failed = copy_file_contents(src_fd, dest_fd, report) != 0;
     PortableXattrs xattrs = {0};
     if (!failed &&
         metadata_apply_ownership_and_mode_fd(dest_fd, &source_snapshot) != 0)
@@ -1522,6 +1532,16 @@ BackupCaptureStatus backup_capture_at_report(
     BackupCaptureReport *report)
 {
     backup_capture_report_init(report);
+    return backup_capture_at_report_continue(ctx, source_path,
+                                             destination_root_fd,
+                                             destination_leaf, report);
+}
+
+BackupCaptureStatus backup_capture_at_report_continue(
+    const CloneContext *ctx, const char *source_path,
+    int destination_root_fd, const char *destination_leaf,
+    BackupCaptureReport *report)
+{
     // Fail closed on a mis-dispatched context rather than running a native clone blindly:
     // a wrong direction or an unimplemented representation must not silently produce a
     // native tree where a sidecar was required.

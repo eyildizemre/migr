@@ -4,6 +4,7 @@
 #include <limits.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 
@@ -24,6 +25,7 @@ typedef struct CloneContext {
     int timestamp_policy_configured;
     int nsec_exact;
     int metadata_preflight_done;
+    off_t estimated_total_bytes; /* 0/unset means no progress denominator. */
     void *inode_map; /* NativeInodeMap; backup/restore tracking; NULL disables it. */
     void *visited; /* Native visited-path set, backup-only; NULL disables tracking. */
 } CloneContext;
@@ -99,8 +101,23 @@ typedef enum {
     BACKUP_CAPTURE_SOURCE_SAFE_READ = -2
 } BackupCaptureStatus;
 
+typedef void (*BackupProgressCallback)(off_t bytes_copied, void *userdata);
+
+/**
+ * @brief State shared by one backup capture across all of its roots.
+ *
+ * bytes_copied and the progress fields describe successful regular-file
+ * content bytes only. Hardlinked siblings add no new bytes because they are
+ * linked to an existing representative, matching the source-size accounting
+ * used by backup_plan_estimate_size().
+ */
 typedef struct {
     char failed_source_path[PATH_MAX];
+    off_t bytes_copied;
+    BackupProgressCallback progress_cb;
+    void *progress_userdata;
+    struct timespec progress_last_fired;
+    int progress_unthrottled;
 } BackupCaptureReport;
 
 void backup_capture_report_init(BackupCaptureReport *report);
@@ -149,6 +166,17 @@ void backup_test_set_capture_hook(BackupTestCaptureHook hook, void *context);
  *         was refused.
  */
 BackupCaptureStatus backup_capture_at_report(
+    const CloneContext *ctx, const char *source_path,
+    int destination_root_fd, const char *destination_leaf,
+    BackupCaptureReport *report);
+
+/**
+ * @brief Captures one root while preserving an already initialized report.
+ *
+ * This is used when one backup walks several roots and needs the byte counter
+ * and throttle state to remain continuous. The caller owns initialization.
+ */
+BackupCaptureStatus backup_capture_at_report_continue(
     const CloneContext *ctx, const char *source_path,
     int destination_root_fd, const char *destination_leaf,
     BackupCaptureReport *report);

@@ -112,6 +112,31 @@ static void write_file(const char *path, const char *contents)
         fixture_fatal("could not close fixture file");
 }
 
+static void write_large_file(const char *path, size_t size)
+{
+    unsigned char buffer[8192];
+    for (size_t index = 0; index < sizeof(buffer); index++)
+        buffer[index] = (unsigned char)(index * 31U + 7U);
+
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0)
+        fixture_fatal("could not create large progress fixture");
+    size_t written_total = 0;
+    while (written_total < size) {
+        size_t request = size - written_total;
+        if (request > sizeof(buffer))
+            request = sizeof(buffer);
+        ssize_t written = write(fd, buffer, request);
+        if (written < 0 && errno == EINTR)
+            continue;
+        if (written <= 0)
+            fixture_fatal("could not write large progress fixture");
+        written_total += (size_t)written;
+    }
+    if (close(fd) != 0)
+        fixture_fatal("could not close large progress fixture");
+}
+
 static void make_base(char *base, size_t size)
 {
     const char template[] = "/tmp/migr_portable_prepare_XXXXXX";
@@ -206,6 +231,75 @@ static int sidecar_count(const char *container_path, size_t expected)
     return result;
 }
 
+typedef struct {
+    off_t previous;
+    size_t count;
+    int monotonic;
+} ProgressTrace;
+
+static void record_portable_progress(off_t bytes_copied, void *userdata)
+{
+    ProgressTrace *trace = userdata;
+    if (trace == NULL)
+        return;
+    if (trace->count != 0 && bytes_copied < trace->previous)
+        trace->monotonic = 0;
+    trace->previous = bytes_copied;
+    trace->count++;
+}
+
+static void test_prepared_capture_reports_progress(void)
+{
+    printf(BLUE "::" NC " portable capture reports chunk-level progress\n");
+    enum { PROGRESS_SIZE = 131072 };
+    char base[PATH_MAX];
+    char source[PATH_MAX];
+    char scratch[PATH_MAX];
+    char container[PATH_MAX];
+    char source_file[PATH_MAX];
+    make_base(base, sizeof(base));
+    join_path(source, sizeof(source), base, "source");
+    join_path(scratch, sizeof(scratch), base, "scratch");
+    join_path(container, sizeof(container), base, "container");
+    join_path(source_file, sizeof(source_file), source, "large.bin");
+    make_directory(source);
+    make_directory(scratch);
+    make_directory(container);
+    write_large_file(source_file, PROGRESS_SIZE);
+
+    PortableRootSpec root = root_spec("ROOT", source, "ROOT");
+    PortableCaptureRequest request = request_for(&root, 1, 1);
+    int scratch_fd = open_directory(scratch);
+    PortablePreparedCapture prepared = {0};
+    ProgressTrace trace = { .monotonic = 1 };
+    BackupCaptureReport progress_report = {
+        .progress_cb = record_portable_progress,
+        .progress_userdata = &trace,
+        .progress_unthrottled = 1
+    };
+    int prepare_result = portable_capture_prepare(scratch_fd, &request,
+                                                  &prepared);
+    int container_fd = open_directory(container);
+    size_t live_count = 0;
+    int capture_result = prepare_result == 0
+        ? portable_capture_fresh_prepared_at(
+              container_fd, &request, &prepared, &live_count,
+              &progress_report)
+        : -1;
+    check(capture_result == 0 && live_count != 0,
+          "prepared portable capture with a multi-chunk file succeeds");
+    check(progress_report.bytes_copied == PROGRESS_SIZE,
+          "portable byte accumulation reaches the source size");
+    check(trace.count >= 2 && trace.monotonic &&
+              trace.previous == PROGRESS_SIZE,
+          "portable progress callbacks are monotonic and end at the true total");
+
+    portable_prepared_capture_free(&prepared);
+    if (close(scratch_fd) != 0 || close(container_fd) != 0)
+        fixture_fatal("could not close portable progress fixture");
+    remove_tree(base);
+}
+
 static void test_prepare_uses_unclaimed_scratch(void)
 {
     printf(BLUE "::" NC " portable capture preparation boundary\n");
@@ -279,7 +373,7 @@ static void test_prepared_capture_does_not_prescan_again(void)
     uint64_t probes = portable_capture_test_case_fs_probe_count();
     size_t live_count = 0;
     int capture_result = portable_capture_fresh_prepared_at(
-        container_fd, &request, &prepared, &live_count);
+        container_fd, &request, &prepared, &live_count, NULL);
     check(probes != 0 &&
               portable_capture_test_case_fs_probe_count() == probes,
           "prepared capture does not run the pre-scan a second time");
@@ -325,7 +419,7 @@ static void test_resume_live_count(void)
     if (child == 0) {
         sidecar_test_set_interrupt(SIDECAR_TEST_AFTER_ENTRY_COMMIT);
         int result = portable_capture_fresh_prepared_at(
-            container_fd, &request, &prepared, NULL);
+            container_fd, &request, &prepared, NULL, NULL);
         _exit(result == 0 ? 0 : 3);
     }
     int status = 0;
@@ -341,7 +435,7 @@ static void test_resume_live_count(void)
     size_t live_count = 0;
     int resume_result = prepare_result == 0
         ? portable_capture_resume_prepared_at(container_fd, &request,
-                                              &resumed_plan, &live_count)
+                                              &resumed_plan, &live_count, NULL)
         : -1;
     check(resume_result == 0 && live_count == 2U,
           "prepared resume reports adopted plus newly committed entries");
@@ -510,18 +604,18 @@ static void test_prepared_at_rejects_invalid_prepared(void)
 
     size_t live_count = 0;
     check(portable_capture_fresh_prepared_at(container_fd, &request, NULL,
-                                             &live_count) == -1,
+                                             &live_count, NULL) == -1,
           "fresh_prepared_at with a NULL prepared object is rejected");
     check(portable_capture_resume_prepared_at(container_fd, &request, NULL,
-                                              &live_count) == -1,
+                                              &live_count, NULL) == -1,
           "resume_prepared_at with a NULL prepared object is rejected");
 
     PortablePreparedCapture not_ready = {0};
     check(portable_capture_fresh_prepared_at(container_fd, &request,
-                                             &not_ready, &live_count) == -1,
+                                             &not_ready, &live_count, NULL) == -1,
           "fresh_prepared_at with a zeroed (never-prepared) object is rejected");
     check(portable_capture_resume_prepared_at(container_fd, &request,
-                                              &not_ready, &live_count) == -1,
+                                              &not_ready, &live_count, NULL) == -1,
           "resume_prepared_at with a zeroed (never-prepared) object is rejected");
 
     check(directory_is_empty(container_fd) == 1,
@@ -535,7 +629,7 @@ static void test_prepared_at_rejects_invalid_prepared(void)
     if (prepare_result == 0 && prepared.ready == 1) {
         prepared.ready = 0;
         check(portable_capture_fresh_prepared_at(container_fd, &request,
-                                                 &prepared, &live_count) == -1,
+                                                 &prepared, &live_count, NULL) == -1,
               "fresh_prepared_at rejects a valid plan marked not-ready");
         check(directory_is_empty(container_fd) == 1,
               "a not-ready fresh plan causes no container mutation");
@@ -543,13 +637,13 @@ static void test_prepared_at_rejects_invalid_prepared(void)
         int resume_fd = open_directory(resume_container);
         prepared.ready = 1;
         int seed_result = portable_capture_fresh_prepared_at(
-            resume_fd, &request, &prepared, NULL);
+            resume_fd, &request, &prepared, NULL, NULL);
         check(seed_result == 0,
               "a valid prepared plan creates a resumable fixture");
         if (seed_result == 0) {
             prepared.ready = 0;
             check(portable_capture_resume_prepared_at(
-                      resume_fd, &request, &prepared, &live_count) == -1,
+                      resume_fd, &request, &prepared, &live_count, NULL) == -1,
                   "resume_prepared_at rejects a valid plan marked not-ready");
             check(sidecar_count(resume_container, 1U),
                   "a not-ready resume plan leaves the resumable state intact");
@@ -567,6 +661,7 @@ static void test_prepared_at_rejects_invalid_prepared(void)
 int main(void)
 {
     test_prepare_uses_unclaimed_scratch();
+    test_prepared_capture_reports_progress();
     test_prepared_capture_does_not_prescan_again();
     test_resume_live_count();
     test_fifo_is_rejected_before_mutation();

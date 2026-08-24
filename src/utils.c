@@ -1,7 +1,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <limits.h>
+#include <stdint.h>
 #include <sys/resource.h>
+#include <time.h>
 
 #include "utils.h"
 
@@ -26,6 +28,40 @@ void format_size(off_t bytes, char *buf, size_t len)
     {
         snprintf(buf, len, "%lldB", (long long)bytes);
     }
+}
+
+int backup_progress_should_fire(struct timespec *last_fired, int unthrottled)
+{
+    if (last_fired == NULL)
+        return 0;
+
+    if (unthrottled)
+        return 1;
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        return 0;
+    if (last_fired->tv_sec == 0 && last_fired->tv_nsec == 0)
+    {
+        *last_fired = now;
+        return 1;
+    }
+
+    int64_t seconds = (int64_t)now.tv_sec - (int64_t)last_fired->tv_sec;
+    int64_t nanoseconds = (int64_t)now.tv_nsec -
+                          (int64_t)last_fired->tv_nsec;
+    if (nanoseconds < 0)
+    {
+        seconds--;
+        nanoseconds += INT64_C(1000000000);
+    }
+    if (seconds < 0 ||
+        (seconds == 0 && nanoseconds <
+             (int64_t)BACKUP_PROGRESS_THROTTLE_MS * INT64_C(1000000)))
+        return 0;
+
+    *last_fired = now;
+    return 1;
 }
 
 int path_join_n(char *buf, size_t size, const char *dir,

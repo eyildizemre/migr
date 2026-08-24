@@ -4138,7 +4138,8 @@ static int open_source_node(int source_parent, const char *source_name,
     return open(root_path, flags);
 }
 
-static int copy_regular(int source_fd, int destination_fd, off_t expected_size)
+static int copy_regular(int source_fd, int destination_fd, off_t expected_size,
+                        BackupCaptureReport *report)
 {
     unsigned char buffer[65536];
     uint64_t copied = 0;
@@ -4152,7 +4153,6 @@ static int copy_regular(int source_fd, int destination_fd, off_t expected_size)
             break;
         if ((uint64_t)received > UINT64_MAX - copied)
             return -1;
-        copied += (uint64_t)received;
 
         size_t offset = 0;
         while (offset < (size_t)received) {
@@ -4163,6 +4163,16 @@ static int copy_regular(int source_fd, int destination_fd, off_t expected_size)
             if (written <= 0)
                 return -1;
             offset += (size_t)written;
+        }
+        copied += (uint64_t)received;
+        if (report != NULL)
+        {
+            report->bytes_copied += received;
+            if (report->progress_cb != NULL &&
+                backup_progress_should_fire(&report->progress_last_fired,
+                                            report->progress_unthrottled))
+                report->progress_cb(report->bytes_copied,
+                                    report->progress_userdata);
         }
     }
     return expected_size >= 0 && copied == (uint64_t)expected_size ? 0 : -1;
@@ -4475,7 +4485,8 @@ static int capture_regular(PortableCaptureContext *context,
     }
     portable_test_interrupt_if(PORTABLE_TEST_AFTER_PAYLOAD_REPLACE);
     portable_test_interrupt_if(PORTABLE_TEST_BEFORE_PAYLOAD_WRITE);
-    if (copy_regular(source_fd, destination_fd, before->st_size) != 0) {
+    if (copy_regular(source_fd, destination_fd, before->st_size,
+                     context->progress_report) != 0) {
         close(destination_fd);
         if (destination_is_root)
             close(parent_fd);
@@ -6578,7 +6589,8 @@ int portable_capture_root(PortableCaptureContext *context,
 
 int portable_capture_fresh_prepared_at(
     int container_fd, const PortableCaptureRequest *request,
-    const PortablePreparedCapture *prepared, size_t *live_count)
+    const PortablePreparedCapture *prepared, size_t *live_count,
+    BackupCaptureReport *progress_report)
 {
     if (container_fd < 0 || request == NULL ||
         request->scope < MANIFEST_SCOPE_CRITICAL ||
@@ -6619,6 +6631,7 @@ int portable_capture_fresh_prepared_at(
                                                request->case_sensitive) != 0;
     if (!failed) {
         context_ready = 1;
+        context.progress_report = progress_report;
         context.collision_plan = &prepared->report.collision_plan;
         if (portable_owned_paths_load(context.owned_paths, &sidecar) != 0 ||
             portable_claimed_paths_load(context.claimed_paths, &sidecar) != 0 ||
@@ -6674,7 +6687,7 @@ int portable_capture_fresh_at(int container_fd,
     }
 
     int result = portable_capture_fresh_prepared_at(container_fd, request,
-                                                    &prepared, NULL);
+                                                    &prepared, NULL, NULL);
     if (report != NULL) {
         *report = prepared.report;
         memset(&prepared.report, 0, sizeof(prepared.report));
@@ -6714,7 +6727,8 @@ static int create_resume_data(int container_fd, int *out_fd)
 
 int portable_capture_resume_prepared_at(
     int container_fd, const PortableCaptureRequest *request,
-    const PortablePreparedCapture *prepared, size_t *live_count)
+    const PortablePreparedCapture *prepared, size_t *live_count,
+    BackupCaptureReport *progress_report)
 {
     if (container_fd < 0 || request == NULL ||
         request->scope < MANIFEST_SCOPE_CRITICAL ||
@@ -6771,6 +6785,7 @@ int portable_capture_resume_prepared_at(
         failed = 1;
     if (!failed) {
         context_ready = 1;
+        context.progress_report = progress_report;
         context.resume_mode = 1;
         context.collision_plan = &prepared->report.collision_plan;
         if (portable_owned_paths_load(context.owned_paths, &sidecar) != 0 ||
@@ -6829,7 +6844,7 @@ int portable_capture_resume_at(int container_fd,
     }
 
     int result = portable_capture_resume_prepared_at(container_fd, request,
-                                                     &prepared, NULL);
+                                                     &prepared, NULL, NULL);
     if (report != NULL) {
         *report = prepared.report;
         memset(&prepared.report, 0, sizeof(prepared.report));

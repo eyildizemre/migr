@@ -173,6 +173,16 @@ consumption differ. If a source root cannot be measured for a reason other
 than disappearing during planning, migr warns and skips this advisory check
 rather than refusing a backup on an incomplete estimate.
 
+During a live backup, an interactive terminal also receives a single
+overwriting progress line while regular-file bytes are copied:
+
+    Progress: 13.4M/33.6M copied, 22.7G free
+
+The line is sampled during large-file copies and re-reads the destination's
+available space. Progress is installed only when stdout is an interactive
+terminal, so piped, redirected, and scripted backups keep the normal output
+unchanged.
+
 Before a live backup creates a container, migr probes the destination filesystem.
 A destination that cannot faithfully hold the required Linux semantics uses a portable
 sidecar representation (a state log preserving the true metadata alongside a plain,

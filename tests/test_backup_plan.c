@@ -27,6 +27,7 @@
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include "backup.h"
@@ -134,6 +135,41 @@ static void write_file(const char *path, const char *content)
     }
     fputs(content, f);
     fclose(f);
+}
+
+static void write_large_file(const char *path, size_t size)
+{
+    unsigned char buffer[8192];
+    for (size_t index = 0; index < sizeof(buffer); index++)
+        buffer[index] = (unsigned char)(index * 17U + 3U);
+
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0)
+    {
+        printf(RED "fixture: could not create large progress fixture" NC "\n");
+        exit(1);
+    }
+    size_t written_total = 0;
+    while (written_total < size)
+    {
+        size_t request = size - written_total;
+        if (request > sizeof(buffer))
+            request = sizeof(buffer);
+        ssize_t written = write(fd, buffer, request);
+        if (written < 0 && errno == EINTR)
+            continue;
+        if (written <= 0)
+        {
+            printf(RED "fixture: could not write large progress fixture" NC "\n");
+            exit(1);
+        }
+        written_total += (size_t)written;
+    }
+    if (close(fd) != 0)
+    {
+        printf(RED "fixture: could not close large progress fixture" NC "\n");
+        exit(1);
+    }
 }
 
 static const BackupPlanRoot *find_root(const BackupPlan *plan, const char *id)
@@ -1096,6 +1132,26 @@ static int run_backup_capturing(const char *target, BackupMode mode, char *const
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
+typedef struct {
+    off_t previous;
+    off_t estimated;
+    size_t count;
+    int monotonic;
+} BackupProgressTrace;
+
+static void record_backup_progress(off_t bytes_copied, off_t estimated_total,
+                                   void *context)
+{
+    BackupProgressTrace *trace = context;
+    if (trace == NULL)
+        return;
+    if (trace->count != 0 && bytes_copied < trace->previous)
+        trace->monotonic = 0;
+    trace->previous = bytes_copied;
+    trace->estimated = estimated_total;
+    trace->count++;
+}
+
 static int dir_exists(const char *path)
 {
     struct stat st;
@@ -1293,6 +1349,77 @@ static void test_destination_space_preflight(void)
     remove_tree(target_parent);
     remove_tree(normal_dry_target);
     remove_tree(normal_live_target);
+}
+
+static void test_live_progress(void)
+{
+    printf(BLUE "::" NC " production: live backup progress is chunked, final-flushed, and tty-gated\n");
+    enum { PROGRESS_SIZE = 1048576 };
+    char home[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "progress_home");
+    mkdir_p(home);
+    setenv("HOME", home, 1);
+
+    char source[PATH_MAX];
+    join_path(source, sizeof(source), home, "large.bin");
+    write_large_file(source, PROGRESS_SIZE);
+    char *paths[] = { source, NULL };
+
+    char target_parent[PATH_MAX];
+    fresh_mkdtemp(target_parent, sizeof(target_parent), "progress_target_parent");
+    char target[PATH_MAX];
+    join_path(target, sizeof(target), target_parent, "with_progress");
+
+    BackupProgressTrace *trace = mmap(NULL, sizeof(*trace),
+                                      PROT_READ | PROT_WRITE,
+                                      MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (trace == MAP_FAILED)
+    {
+        printf(RED "fixture: could not create shared progress trace" NC "\n");
+        exit(1);
+    }
+    *trace = (BackupProgressTrace){ .monotonic = 1 };
+    backup_test_set_progress_hook(record_backup_progress, trace);
+    dry_run = 0;
+    char output[16384];
+    int result = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                      output, sizeof(output));
+    backup_test_set_progress_hook(NULL, NULL);
+    check(result == 0, "a multi-chunk live backup succeeds with progress enabled");
+    check(trace->count >= 3 && trace->monotonic &&
+              trace->previous == PROGRESS_SIZE &&
+              trace->estimated == PROGRESS_SIZE,
+          "progress is monotonic and final-flushed at the estimated total");
+    check(strstr(output, "\rProgress:") != NULL &&
+              strstr(output, "\n\n[Packages]\n") != NULL,
+          "progress overwrites in place and ends before subsequent output");
+    const char *long_progress =
+        strstr(output, "\rProgress: 1000.0K/1.0M copied");
+    const char *short_progress =
+        strstr(output, "\rProgress: 1.0M/1.0M copied");
+    const char *line_clear = long_progress == NULL
+        ? NULL : strstr(long_progress, "\033[K");
+    check(long_progress != NULL && short_progress != NULL &&
+              short_progress > long_progress && line_clear != NULL &&
+              line_clear < short_progress,
+          "shrinking progress lines erase their stale tail");
+
+    char quiet_target[PATH_MAX];
+    join_path(quiet_target, sizeof(quiet_target), target_parent, "without_progress");
+    char quiet_output[8192];
+    result = run_backup_capturing(quiet_target, BACKUP_EXPLICIT_PATHS, paths,
+                                   quiet_output, sizeof(quiet_output));
+    check(result == 0 && strstr(quiet_output, "\rProgress:") == NULL,
+          "a captured non-tty backup installs no progress callback");
+
+    dry_run = 0;
+    if (munmap(trace, sizeof(*trace)) != 0)
+    {
+        printf(RED "fixture: could not release shared progress trace" NC "\n");
+        exit(1);
+    }
+    remove_tree(home);
+    remove_tree(target_parent);
 }
 
 static void test_missing_explicit_path_rejects_before_target_creation(void)
@@ -1499,6 +1626,7 @@ int main(void)
 
     test_plan_estimate_tolerates_missing_root();
     test_destination_space_preflight();
+    test_live_progress();
     test_missing_explicit_path_rejects_before_target_creation();
     test_overlap_rejected_before_destination_created_live_and_dry_run();
     test_dangling_explicit_leaf_symlink_is_captured_as_symlink();

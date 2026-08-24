@@ -2498,3 +2498,36 @@ guess layered on an already approximate estimate. f_bfree is rejected
 because root-reserved blocks are not available to the ordinary process.
 A bypass flag is not added; if operational evidence shows that users need one,
 it is a separate decision rather than an implicit escape from this guard.
+
+---
+
+## D28 — 2026-08-24 — Interactive backup progress is informational and backup-only
+
+**Status:** Implemented
+
+**Decision:** A live backup counts successful regular-file content bytes and,
+when stdout is an interactive terminal, periodically displays those bytes
+against the D27 estimate together with freshly measured destination free space.
+The callback is installed only behind the `isatty(stdout)` gate; it is not
+installed for redirected, piped, or scripted output. Progress is sampled at
+most every 500 ms and is driven from the byte-copy loops, so one large file
+cannot make the display appear stalled until the next file. The free-space
+re-read is informational only: a low observation does not create a second
+abort path, and an actual write failure remains the authoritative ENOSPC
+failure. This feature covers backup capture, not restore.
+
+**Why:** Installing the callback only for an interactive terminal keeps the
+existing machine-readable and test-captured output byte-stable while still
+making the user-facing terminal useful. Chunk-level sampling is the smallest
+granularity that gives honest movement for large files, and the 500 ms throttle
+prevents terminal I/O from becoming hot-loop overhead. Reusing D27's estimate
+keeps the denominator consistent with the preflight, while re-reading free
+space exposes concurrent destination consumption without pretending that an
+observation is a reservation.
+
+**Rejected:** Installing the callback unconditionally and merely suppressing
+its print calls is rejected because it would still add clock and callback
+machinery to redirected/test runs and could leak carriage-return fragments
+into captured output. A new free-space refusal based on periodic observations
+is rejected because only the real write result can authoritatively determine
+whether the copy fits. Restore progress is deferred as a separate feature.
