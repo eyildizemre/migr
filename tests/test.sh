@@ -399,6 +399,7 @@ test_backup() {
     # -v needed: without it, individual filenames are not printed
     output=$(../migr backup "$BACKUP_DIR" -v)
 
+    assert_contains "$output" "Finalizing (syncing to disk)..."
     assert_contains "$output" "Backup complete"
     assert_contains "$output" ".bashrc"
     assert_contains "$output" ".ssh"

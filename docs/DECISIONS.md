@@ -2531,3 +2531,49 @@ machinery to redirected/test runs and could leak carriage-return fragments
 into captured output. A new free-space refusal based on periodic observations
 is rejected because only the real write result can authoritatively determine
 whether the copy fits. Restore progress is deferred as a separate feature.
+
+---
+
+## D29 — 2026-08-24 — Finalized containers cross a durable publication boundary
+
+**Status:** Implemented
+
+**Decision:** `container_finalize()` flushes the destination filesystem with
+`syncfs(container->partial_fd)` before renaming a `.partial` container to its
+final name. The pre-rename flush is fail-closed: a failure returns
+`CONTAINER_ERR_IO`, does not attempt the rename, and leaves the partial and its
+handle in the existing valid `CONTAINER_STATE_PARTIAL` contract. After a
+successful `RENAME_NOREPLACE`, the handle becomes
+`CONTAINER_STATE_FINALIZED`, and `fsync(container->dir_fd)` flushes the
+destination directory so the publication rename itself reaches durable
+directory metadata. A failure of that post-rename directory flush does not
+turn the call into an error: the rename already succeeded and the payload was
+confirmed durable before publication, so reporting an incomplete backup would
+be false. At worst, a crash in that narrow window can make the durable payload
+reappear under its resumable `.partial` name.
+
+**Why:** The payload must be durable before a final-looking container is
+published; otherwise a crash after rename could expose a completed-looking
+backup with missing or truncated data. The rename then needs its own directory
+flush because file-data durability does not make directory-entry metadata
+durable. This gives users a meaningful boundary: after `Backup complete` is
+printed, the destination has passed both flushes, while an interrupted run
+before that point is still governed by the existing partial/resume protocol.
+
+This decision does not make copying periodically durable and does not reduce
+the in-flight loss window of a process interruption during capture. Periodic
+syncing is a separate follow-up; D29 guarantees durability at successful
+finalization, not at every intermediate point.
+
+**Rejected:** Flushing only after the rename is rejected because it can expose
+a final-named container before its payload is durable. Failing after a
+successful rename when the directory flush fails is rejected because it would
+misreport a real publication as incomplete and would not undo the already
+durable payload. A new status value is unnecessary for that narrow metadata
+durability edge.
+
+**Relationship:** D29 refines D15's atomic container publication with a
+durable publication sequence. It supersedes D25's earlier no-`fsync` boundary
+for the container-finalization step only; D25's claim/replay protocol and its
+interrupted-capture semantics remain unchanged. Restore finalization and
+periodic capture syncing are outside this decision.

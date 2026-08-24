@@ -459,6 +459,9 @@ ContainerStatus container_finalize(BackupContainer *container)
     if (container == NULL || container->state != CONTAINER_STATE_PARTIAL)
         return CONTAINER_ERR_INVALID;
 
+    if (syncfs(container->partial_fd) != 0)
+        return CONTAINER_ERR_IO;
+
     if (renameat2(container->dir_fd, container->partial_name,
                   container->dir_fd, container->final_name,
                   RENAME_NOREPLACE) != 0)
@@ -477,6 +480,14 @@ ContainerStatus container_finalize(BackupContainer *container)
     }
 
     container->state = CONTAINER_STATE_FINALIZED;
+
+    /*
+     * The payload was flushed before publication. A directory-fsync failure
+     * leaves only the rename's crash durability uncertain; the rename itself
+     * succeeded, so do not misreport the finalized container as a failure.
+     */
+    (void)fsync(container->dir_fd);
+
     return CONTAINER_OK;
 }
 

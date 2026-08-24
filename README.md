@@ -126,6 +126,12 @@ the same job can resume a matching usable partial. Restore refuses `.partial`
 containers. If multiple backups begin in the same second, `-1`, `-2`, and so on keep
 their names distinct without replacing an existing backup.
 
+Before publishing a container under its final name, migr flushes the destination
+filesystem and then flushes the destination directory after the atomic rename.
+Therefore a container that appears under its final name — and the accompanying
+`Backup complete` message — has passed the durable-finalization boundary. An
+interrupted backup before that point remains a `.partial` that can be resumed.
+
 The container root is reserved for migr-owned control files. Everything selected from
 the user's filesystem lives below `data/`:
 

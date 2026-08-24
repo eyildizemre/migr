@@ -1431,6 +1431,7 @@ int backup(const char *target, BackupMode mode, char **paths)
         return 1;
     }
 
+    printf("Finalizing (syncing to disk)...\n");
     ContainerStatus final_status = container_finalize(&container);
     if (final_status != CONTAINER_OK)
     {

@@ -377,17 +377,76 @@ static void test_finalize_success(void)
     BackupContainer c;
     check(container_reserve(test_root, FIXED_TIME, &c) == CONTAINER_OK, "fixture: reserve");
 
-    check(container_finalize(&c) == CONTAINER_OK, "finalize succeeds");
-    check(c.state == CONTAINER_STATE_FINALIZED, "the handle reports CONTAINER_STATE_FINALIZED");
-
     char partial_path[PATH_MAX], final_path[PATH_MAX];
     path_under_root(partial_path, sizeof(partial_path), c.partial_name);
     path_under_root(final_path, sizeof(final_path), c.final_name);
+
+    char payload_path[PATH_MAX];
+    if ((size_t)snprintf(payload_path, sizeof(payload_path), "%s/payload.txt",
+                         partial_path) >= sizeof(payload_path))
+    {
+        printf(RED "fixture: payload path too long" NC "\n");
+        exit(1);
+    }
+    write_raw(payload_path, "durable test payload\n");
+
+    check(container_finalize(&c) == CONTAINER_OK, "finalize succeeds");
+    check(c.state == CONTAINER_STATE_FINALIZED, "the handle reports CONTAINER_STATE_FINALIZED");
 
     struct stat st;
     check(stat(partial_path, &st) != 0 && errno == ENOENT, "the .partial name no longer exists");
     check(stat(final_path, &st) == 0 && S_ISDIR(st.st_mode), "the final name now exists");
 
+    char published_payload_path[PATH_MAX];
+    if ((size_t)snprintf(published_payload_path, sizeof(published_payload_path),
+                         "%s/payload.txt", final_path) >= sizeof(published_payload_path))
+    {
+        printf(RED "fixture: published payload path too long" NC "\n");
+        exit(1);
+    }
+    check(stat(published_payload_path, &st) == 0 && S_ISREG(st.st_mode),
+          "the finalized container retains its payload");
+
+    container_close(&c);
+    fresh_test_root();
+}
+
+static void test_finalize_sync_failure_leaves_partial(void)
+{
+    printf(BLUE "::" NC " container: a pre-rename sync failure leaves the partial untouched\n");
+    fresh_test_root();
+
+    BackupContainer c;
+    ContainerStatus reserve_status = container_reserve(test_root, FIXED_TIME, &c);
+    check(reserve_status == CONTAINER_OK, "fixture: reserve");
+    if (reserve_status != CONTAINER_OK)
+    {
+        fresh_test_root();
+        return;
+    }
+
+    char partial_path[PATH_MAX], final_path[PATH_MAX];
+    path_under_root(partial_path, sizeof(partial_path), c.partial_name);
+    path_under_root(final_path, sizeof(final_path), c.final_name);
+
+    int partial_fd = container_root_fd(&c);
+    int close_status = close(partial_fd);
+    ContainerStatus finalize_status = container_finalize(&c);
+
+    check(close_status == 0 && finalize_status == CONTAINER_ERR_IO,
+          "an invalid payload fd makes finalize fail closed before rename");
+    check(c.state == CONTAINER_STATE_PARTIAL,
+          "the handle remains PARTIAL after a pre-rename sync failure");
+
+    struct stat st;
+    check(stat(partial_path, &st) == 0 && S_ISDIR(st.st_mode),
+          "the partial name remains after a pre-rename sync failure");
+    check(stat(final_path, &st) != 0 && errno == ENOENT,
+          "the final name is not created after a pre-rename sync failure");
+
+    /* The fd was closed deliberately above; prevent container_close() from
+       treating its now-reusable number as still owned by the handle. */
+    c.partial_fd = -1;
     container_close(&c);
     fresh_test_root();
 }
@@ -1249,6 +1308,7 @@ int main(void)
     test_concurrent_reserve_claims_distinct_partials();
 
     test_finalize_success();
+    test_finalize_sync_failure_leaves_partial();
     test_finalize_refuses_existing_final();
     test_finalize_rejects_invalid_handle();
 
