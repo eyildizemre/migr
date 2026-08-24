@@ -366,10 +366,10 @@ static const struct {
     BackupRootGroup group;
     const char *heading;
 } root_sections[] = {
-    { BACKUP_ROOT_MAIN,     "[Main Directories]" },
-    { BACKUP_ROOT_DOTFILE,  "[Dotfiles]" },
-    { BACKUP_ROOT_BROWSER,  "[Browser Profiles]" },
-    { BACKUP_ROOT_EXPLICIT, "[Explicit Paths]" },
+    { BACKUP_ROOT_MAIN,     "Main Directories" },
+    { BACKUP_ROOT_DOTFILE,  "Dotfiles" },
+    { BACKUP_ROOT_BROWSER,  "Browser Profiles" },
+    { BACKUP_ROOT_EXPLICIT, "Explicit Paths" },
 };
 enum { ROOT_SECTION_COUNT = sizeof(root_sections) / sizeof(root_sections[0]) };
 
@@ -963,14 +963,13 @@ int backup(const char *target, BackupMode mode, char **paths)
             portable_prescan_report_free(&advisory_prescan);
         }
 
-        printf("\n[Controls]\n");
+        printf("\nControls\n");
         printf("  Would write manifest.txt\n");
         if (mode != BACKUP_EXPLICIT_PATHS)
             printf("  Would export package list to packages.txt\n");
 
-        printf("\n===========================================================\n");
+        printf("\n");
         printf("Dry run complete: %d items would be copied\n", count);
-        printf("===========================================================\n");
 
         manifest_free(&manifest);
         backup_plan_free(&plan);
@@ -1380,7 +1379,7 @@ int backup(const char *target, BackupMode mode, char **paths)
         // exports one, and demonstrably empty for a scope that does not.
         // Anything else -- a stale list inside an adopted container, or one
         // planted there -- would otherwise be published and later replayed.
-        printf("\n[Packages]\n");
+        printf("\nPackages\n");
         if (mode == BACKUP_EXPLICIT_PATHS)
         {
             if (packages_clear_at(container_fd, "packages.txt") != 0)
@@ -1410,7 +1409,7 @@ int backup(const char *target, BackupMode mode, char **paths)
         }
     }
 
-    printf("\n===========================================================\n");
+    printf("\n");
 
     if (had_error)
     {
@@ -1423,7 +1422,6 @@ int backup(const char *target, BackupMode mode, char **paths)
         else
             printf("Unusable container left behind; it cannot be resumed, remove it: %s/%s\n",
                    target, container_current_name(&container));
-        printf("===========================================================\n");
         container_close(&container);
         metadata_profiles_free(&metadata_profiles);
         portable_prepared_capture_free(&prepared);
@@ -1446,7 +1444,6 @@ int backup(const char *target, BackupMode mode, char **paths)
 
         printf("Incomplete backup kept for resume: %s/%s\n",
                target, container_current_name(&container));
-        printf("===========================================================\n");
         container_close(&container);
         metadata_profiles_free(&metadata_profiles);
         portable_prepared_capture_free(&prepared);
@@ -1458,7 +1455,6 @@ int backup(const char *target, BackupMode mode, char **paths)
 
     print_success("Backup complete: %d items copied\n", count);
     printf("Location: %s/%s\n", target, container_current_name(&container));
-    printf("===========================================================\n");
 
     container_close(&container);
     metadata_profiles_free(&metadata_profiles);

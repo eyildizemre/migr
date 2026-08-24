@@ -31,8 +31,14 @@ static int file_exists(const char *path)
 
 static void print_section(const char *title)
 {
-    printf("\n[%s]\n", title);
-    printf("-----------------------------------------------------------\n");
+    printf("\n%s\n", title);
+}
+
+static void print_report_header(const char *home)
+{
+    distro_t distro = detect_distro();
+    printf("Backup Analysis · %s\n", get_distro_name(distro));
+    printf("%s\n", home);
 }
 
 static void print_item(const char *name, const char *size)
@@ -237,15 +243,15 @@ static const char *scoped_group_title(BackupRootGroup group)
     switch (group)
     {
     case BACKUP_ROOT_MAIN:
-        return "MAIN DIRECTORIES";
+        return "Main Directories";
     case BACKUP_ROOT_DOTFILE:
-        return "DOTFILES & CONFIG";
+        return "Dotfiles & Config";
     case BACKUP_ROOT_BROWSER:
-        return "BROWSERS";
+        return "Browsers";
     case BACKUP_ROOT_EXPLICIT:
-        return "EXPLICIT PATHS";
+        return "Explicit Paths";
     }
-    return "OTHER";
+    return "Other";
 }
 
 static const char *scoped_root_name(const char *home,
@@ -437,14 +443,7 @@ static int report_scoped(const char *home, BackupMode mode, int summary,
     int printed_group[4] = { 0, 0, 0, 0 };
 
     if (!summary)
-    {
-        distro_t distro = detect_distro();
-        printf("===========================================================\n");
-        printf("              BACKUP ANALYSIS REPORT\n");
-        printf("===========================================================\n");
-        printf("Distro: %s\n", get_distro_name(distro));
-        printf("Home:   %s\n", home);
-    }
+        print_report_header(home);
 
     for (int i = 0; i < plan.root_count; i++)
     {
@@ -514,12 +513,10 @@ static int report_scoped(const char *home, BackupMode mode, int summary,
     else
     {
         const char *label = mode == BACKUP_COMPREHENSIVE
-                                ? "COMPREHENSIVE"
-                                : "CRITICAL";
-        printf("\n===========================================================\n");
-        printf("%s BACKUP ESTIMATE:\n", label);
-        printf("  %s\n", total_size);
-        printf("===========================================================\n");
+                                ? "Comprehensive estimate"
+                                : "Critical estimate";
+        printf("\n");
+        print_item(label, total_size);
         if (had_error)
         {
             printf("\nWarning: some paths could not be measured; "
@@ -544,12 +541,7 @@ int report(BackupMode mode, int scope_requested, int summary,
     if (scope_requested)
         return report_scoped(home, mode, summary, depth);
 
-    distro_t distro = detect_distro();
-    printf("===========================================================\n");
-    printf("              BACKUP ANALYSIS REPORT\n");
-    printf("===========================================================\n");
-    printf("Distro: %s\n", get_distro_name(distro));
-    printf("Home:   %s\n", home);
+    print_report_header(home);
 
     char path[PATH_MAX];
     int had_error = 0; // set if any path could not be built, so the estimate never lies
@@ -561,7 +553,7 @@ int report(BackupMode mode, int scope_requested, int summary,
     // main user directories
     const char *main_dirs[] = {"Documents", "Desktop", "Downloads", "Pictures", "Videos", "Music", "Projects", NULL};
 
-    print_section("MAIN DIRECTORIES");
+    print_section("Main Directories");
     for (int i = 0; main_dirs[i] != NULL; i++)
     {
         if (path_join(path, sizeof(path), home, main_dirs[i]) != 0)
@@ -586,7 +578,7 @@ int report(BackupMode mode, int scope_requested, int summary,
     // Dotfiles
     const char *dotfiles[] = {".ssh", ".gnupg", ".config", ".local/share", ".bashrc", ".profile", ".gitconfig", NULL};
 
-    print_section("DOTFILES & CONFIG");
+    print_section("Dotfiles & Config");
     for (int i = 0; dotfiles[i] != NULL; i++)
     {
         if (path_join(path, sizeof(path), home, dotfiles[i]) != 0)
@@ -611,7 +603,7 @@ int report(BackupMode mode, int scope_requested, int summary,
     // developer tools
     const char *dev_dirs[] = {".npm", ".cargo", ".rustup", ".pub-cache", ".gradle", ".nvm", NULL};
 
-    print_section("DEV TOOLS (re-downloadable)");
+    print_section("Dev Tools (re-downloadable)");
     for (int i = 0; dev_dirs[i] != NULL; i++)
     {
         if (path_join(path, sizeof(path), home, dev_dirs[i]) != 0)
@@ -635,7 +627,7 @@ int report(BackupMode mode, int scope_requested, int summary,
     const char *browsers[] = {".mozilla/firefox", ".config/google-chrome", ".config/chromium", ".config/BraveSoftware", NULL};
     const char *browser_names[] = {"Firefox", "Chrome", "Chromium", "Brave", NULL};
 
-    print_section("BROWSERS");
+    print_section("Browsers");
     for (int i = 0; browsers[i] != NULL; i++)
     {
         if (path_join(path, sizeof(path), home, browsers[i]) != 0)
@@ -711,11 +703,9 @@ int report(BackupMode mode, int scope_requested, int summary,
     char critical_size[32];
     format_size(critical_total, critical_size, sizeof(critical_size));
 
-    printf("\n===========================================================\n");
-    printf("CRITICAL BACKUP ESTIMATE:\n");
-    printf("  %s\n", critical_size);
+    printf("\n");
+    print_item("Critical estimate", critical_size);
     printf("  (Documents, Downloads, Pictures, .ssh, .gnupg, .gitconfig, .bashrc)\n");
-    printf("===========================================================\n");
 
     if (had_error)
     {

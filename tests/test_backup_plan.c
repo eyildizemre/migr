@@ -1391,7 +1391,7 @@ static void test_live_progress(void)
               trace->estimated == PROGRESS_SIZE,
           "progress is monotonic and final-flushed at the estimated total");
     check(strstr(output, "\rProgress:") != NULL &&
-              strstr(output, "\n\n[Packages]\n") != NULL,
+              strstr(output, "\n\nPackages\n") != NULL,
           "progress overwrites in place and ends before subsequent output");
     const char *long_progress =
         strstr(output, "\rProgress: 1000.0K/1.0M copied");

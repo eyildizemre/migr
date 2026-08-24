@@ -241,13 +241,13 @@ test_report() {
         "(Documents, Downloads, Pictures, .ssh, .gnupg, .gitconfig, .bashrc)"
 
     critical_output=$(../migr report --critical)
-    assert_contains "$critical_output" "DOTFILES & CONFIG"
+    assert_contains "$critical_output" "Dotfiles & Config"
     assert_contains "$critical_output" ".profile"
     assert_contains "$critical_output" "Firefox"
     assert_not_contains "$critical_output" ".mozilla"
     assert_not_contains "$critical_output" "google-chrome"
-    assert_contains "$critical_output" "CRITICAL BACKUP ESTIMATE"
-    if [[ "$critical_output" == *"DEV TOOLS (re-downloadable)"* ]]; then
+    assert_contains "$critical_output" "Critical estimate"
+    if [[ "$critical_output" == *"Dev Tools (re-downloadable)"* ]]; then
         echo -e "  ${RED}✗${NC} Critical scoped report included informational dev tools."
         exit 1
     else
@@ -356,7 +356,7 @@ test_report() {
     fi
 
     comprehensive_output=$(../migr report --comprehensive)
-    assert_contains "$comprehensive_output" "COMPREHENSIVE BACKUP ESTIMATE"
+    assert_contains "$comprehensive_output" "Comprehensive estimate"
     assert_contains "$comprehensive_output" "Desktop"
     assert_contains "$comprehensive_output" "Projects"
     assert_contains "$comprehensive_output" "Firefox"
@@ -1088,9 +1088,9 @@ EOF
 
     local dry_out
     dry_out=$(env HOME="$v1_home" ../migr restore "$v1_src" --dry-run)
-    assert_contains "$dry_out" "[Roots]"
+    assert_contains "$dry_out" "Roots"
     assert_contains "$dry_out" "Would restore: EXPLICIT_0 -> ~/Documents/project"
-    assert_contains "$dry_out" "[Manual Roots]"
+    assert_contains "$dry_out" "Manual Roots"
     assert_contains "$dry_out" "/mnt/external/project"
 
     local live_out
@@ -1678,7 +1678,7 @@ test_container_production() {
     local ext_home="$TEST_DIR/cp_ext_home" ext_restore_out
     mkdir -p "$ext_home"
     ext_restore_out=$(printf 'y\n' | env HOME="$ext_home" ../migr restore "$ext_actual" 2>&1)
-    assert_contains "$ext_restore_out" "[Manual Roots]"
+    assert_contains "$ext_restore_out" "Manual Roots"
     assert_contains "$ext_restore_out" "$ext_root"
     # the home-relative sibling root proves the restore itself ran
     if [ -f "$ext_home/Documents/note.txt" ] && [ ! -e "$ext_home/data.txt" ]; then

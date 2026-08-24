@@ -433,7 +433,7 @@ static int restore_legacy(const char *source, int source_root_fd, const char *ho
                           const RestoreTimestampAnchors *timestamp_anchors,
                           size_t *skipped_security_xattrs)
 {
-    printf("[Main Directories]\n");
+    printf("Main Directories\n");
     char *xdg_dirs[XDG_RESTORE_COUNT];
     if (xdg_resolve(home, xdg_keys, xdg_fallbacks, xdg_dirs, XDG_RESTORE_COUNT) != 0)
     {
@@ -513,7 +513,7 @@ static int restore_legacy(const char *source, int source_root_fd, const char *ho
         *had_error = 1;
 
     const char *dotfiles[] = {".ssh", ".gnupg", ".gitconfig", ".bashrc", ".profile", NULL};
-    printf("\n[Dotfiles]\n");
+    printf("\nDotfiles\n");
     for (int i = 0; dotfiles[i] != NULL; i++)
     {
         rc = restore_home_item(ctx, source_root_fd, home_fd, dotfiles[i],
@@ -534,7 +534,7 @@ static int restore_legacy(const char *source, int source_root_fd, const char *ho
         ".config/opera",
         NULL
     };
-    printf("\n[Browser Profiles]\n");
+    printf("\nBrowser Profiles\n");
     for (int i = 0; browser_configs[i] != NULL; i++)
     {
         rc = restore_home_item(ctx, source_root_fd, home_fd, browser_configs[i],
@@ -1002,7 +1002,7 @@ static void restore_v1(const char *source, int source_root_fd, const char *home,
                        const RestoreTimestampAnchors *timestamp_anchors,
                        size_t *skipped_security_xattrs)
 {
-    printf("[Roots]\n");
+    printf("Roots\n");
 
     char *xdg_dirs[XDG_RESTORE_COUNT];
     int xdg_dirs_ready = 0;
@@ -1101,7 +1101,7 @@ static void restore_v1(const char *source, int source_root_fd, const char *home,
 
     if (manual_count > 0)
     {
-        printf("\n[Manual Roots]\n");
+        printf("\nManual Roots\n");
         printf("  Not restored automatically; recover these from the backup directly.\n");
         for (int i = 0; i < m->root_count; i++)
         {
@@ -1179,7 +1179,7 @@ static void restore_packages(int source_root_fd, const char *home, int *had_erro
         return;
     }
 
-    printf("\n[Packages]\n");
+    printf("\nPackages\n");
 
     distro_t distro = detect_distro();
 
@@ -1516,7 +1516,7 @@ int restore(const char *source)
             restore_packages(source_root_fd, home, &had_portable_error);
         }
 
-        printf("\n===========================================================\n");
+        printf("\n");
         switch (outcome)
         {
             case PORTABLE_RESTORE_COMPLETE:
@@ -1544,8 +1544,6 @@ int restore(const char *source)
             printf("Skipped %zu security.* attribute(s) that the destination "
                    "could not apply.\n",
                    report.skipped_security_xattr_count);
-        printf("===========================================================\n");
-
         free_xdg_dirs(xdg_dirs);
         manifest_free(&m);
         close(home_fd);
@@ -1715,7 +1713,7 @@ int restore(const char *source)
 
     restore_packages(source_root_fd, home, &had_error);
 
-    printf("\n===========================================================\n");
+    printf("\n");
     if (dry_run && had_error)
         printf("Dry run finished with errors: %d items would be restored, some items failed validation\n",
                count);
@@ -1728,8 +1726,6 @@ int restore(const char *source)
     if (skipped_security_xattrs != 0)
         printf("Skipped %zu security.* attribute(s) that the destination "
                "could not apply.\n", skipped_security_xattrs);
-    printf("===========================================================\n");
-
     close(home_fd);
     close(source_root_fd);
     metadata_profiles_free(&metadata_profiles);

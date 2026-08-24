@@ -16,7 +16,7 @@
  * manifest_root.policy, which is the actual restore semantics
  * (docs/DECISIONS.md D16). BACKUP_ROOT_MAIN covers both true XDG roots and
  * the home-relative "Projects" root: both are listed under the same
- * "[Main Directories]" heading.
+ * "Main Directories" heading.
  */
 typedef enum {
     BACKUP_ROOT_MAIN,
