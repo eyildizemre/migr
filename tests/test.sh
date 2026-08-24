@@ -195,6 +195,9 @@ test_report() {
 
     local output default_output bare_output critical_output comprehensive_output
     local critical_summary implicit_summary comprehensive_summary without_profile
+    local critical_verbose comprehensive_verbose legacy_verbose summary_verbose
+    local depth_zero depth_two depth_root summary_depth
+    local critical_root_count comprehensive_root_count legacy_root_count
     output=$(../migr report)
 
     assert_contains "$output" ".bashrc"
@@ -228,6 +231,70 @@ test_report() {
         echo -e "  ${GREEN}✓${NC} Critical scoped report follows the real backup plan."
     fi
 
+    depth_root="$HOME/Documents/report-depth"
+    mkdir -p "$depth_root/level1/level2/leaf"
+    printf 'depth root\n' > "$depth_root/root.txt"
+    printf 'depth one\n' > "$depth_root/level1/file.txt"
+    printf 'depth two\n' > "$depth_root/level1/level2/file.txt"
+    printf 'depth leaf\n' > "$depth_root/level1/level2/leaf/file.txt"
+
+    critical_verbose=$(../migr report --critical -v)
+    assert_contains "$critical_verbose" "($HOME/Documents)"
+    assert_contains "$critical_verbose" "($depth_root)"
+    assert_not_contains "$critical_verbose" "($depth_root/level1)"
+    assert_not_contains "$critical_verbose" "($HOME/.ssh/config)"
+    assert_not_contains "$critical_verbose" "Measuring:"
+    critical_root_count=$(grep -F -c "($HOME/Documents)" <<<"$critical_verbose" || true)
+    if [ "$critical_root_count" -eq 1 ]; then
+        echo -e "  ${GREEN}✓${NC} Critical verbose keeps one enriched line per root."
+    else
+        echo -e "  ${RED}✗${NC} Critical verbose printed the Documents root $critical_root_count times."
+        exit 1
+    fi
+    comprehensive_verbose=$(../migr report --comprehensive -v)
+    assert_contains "$comprehensive_verbose" "($HOME/Documents)"
+    assert_contains "$comprehensive_verbose" "($depth_root)"
+    assert_not_contains "$comprehensive_verbose" "Measuring:"
+    comprehensive_root_count=$(grep -F -c "($HOME/Documents)" <<<"$comprehensive_verbose" || true)
+    if [ "$comprehensive_root_count" -eq 1 ]; then
+        echo -e "  ${GREEN}✓${NC} Comprehensive verbose keeps one enriched line per root."
+    else
+        echo -e "  ${RED}✗${NC} Comprehensive verbose printed the Documents root $comprehensive_root_count times."
+        exit 1
+    fi
+    legacy_verbose=$(../migr report -v)
+    assert_contains "$legacy_verbose" "($HOME/Documents)"
+    assert_contains "$legacy_verbose" "($depth_root)"
+    assert_not_contains "$legacy_verbose" "Measuring:"
+    legacy_root_count=$(grep -F -c "($HOME/Documents)" <<<"$legacy_verbose" || true)
+    if [ "$legacy_root_count" -eq 1 ]; then
+        echo -e "  ${GREEN}✓${NC} Legacy verbose keeps one enriched line per root."
+    else
+        echo -e "  ${RED}✗${NC} Legacy verbose printed the Documents root $legacy_root_count times."
+        exit 1
+    fi
+
+    depth_zero=$(../migr report --critical --max-depth=0)
+    assert_contains "$depth_zero" "($HOME/Documents)"
+    assert_not_contains "$depth_zero" "($depth_root)"
+    depth_two=$(../migr report --critical --max-depth=2)
+    assert_contains "$depth_two" "($depth_root)"
+    assert_contains "$depth_two" "($depth_root/level1)"
+    assert_not_contains "$depth_two" "($depth_root/level1/level2)"
+    assert_fails_with "Error: --max-depth must be a non-negative integer." \
+        ../migr report --critical --max-depth=garbage
+    assert_fails_with "Error: --max-depth must be a non-negative integer." \
+        ../migr report --critical --max-depth=-1
+    assert_fails_with "Error: --max-depth must be a non-negative integer." \
+        ../migr report --critical --max-depth=full
+    assert_fails_with "Error: --max-depth applies only to 'report'." \
+        ../migr backup "$BACKUP_DIR" --max-depth=1
+    assert_fails_with "Error: --max-depth applies only to 'report'." \
+        ../migr restore "$BACKUP_DIR" --max-depth=1
+    assert_fails_with "Error: --max-depth applies only to 'report'." \
+        ../migr packages "$TEST_DIR/packages.txt" --max-depth=1
+    rm -rf "$depth_root"
+
     # Make the profile contribution large enough that the human formatter cannot
     # round it away, then prove the live critical total changes when that root is
     # absent. Restore the small fixture before the remaining phases.
@@ -239,6 +306,20 @@ test_report() {
         echo -e "  ${GREEN}✓${NC} Critical summary is exactly one line and is the default scoped summary."
     else
         echo -e "  ${RED}✗${NC} Critical summary format or implicit-scope default is wrong: '$critical_summary'"
+        exit 1
+    fi
+    summary_verbose=$(../migr report --critical -s -v)
+    if [ "$summary_verbose" = "$critical_summary" ]; then
+        echo -e "  ${GREEN}✓${NC} Summary suppresses verbose detail."
+    else
+        echo -e "  ${RED}✗${NC} Summary and summary+verbose outputs differ."
+        exit 1
+    fi
+    summary_depth=$(../migr report --critical -s --max-depth=2)
+    if [ "$summary_depth" = "$critical_summary" ]; then
+        echo -e "  ${GREEN}✓${NC} Summary suppresses an explicit max-depth breakdown."
+    else
+        echo -e "  ${RED}✗${NC} Summary and summary+max-depth outputs differ."
         exit 1
     fi
     mv "$HOME/.profile" "$HOME/.profile.report-test"
@@ -270,7 +351,7 @@ test_report() {
 test_dry_run() {
     echo -e "${BLUE}::${NC} Phase 2: --dry-run"
 
-    local output
+    local output plain_output verbose_output
     output=$(../migr backup "$BACKUP_DIR" -n)
 
     assert_contains "$output" "Dry run"
@@ -299,6 +380,15 @@ test_dry_run() {
         exit 1
     else
         echo -e "  ${GREEN}✓${NC} No files written to disk."
+    fi
+
+    plain_output="$output"
+    verbose_output=$(../migr backup "$BACKUP_DIR" -n -v)
+    if [ "$plain_output" = "$verbose_output" ]; then
+        echo -e "  ${GREEN}✓${NC} Native dry-run is unchanged by verbose."
+    else
+        echo -e "  ${RED}✗${NC} Native dry-run changed under verbose."
+        exit 1
     fi
 }
 
@@ -1631,9 +1721,30 @@ test_portable_vfat_dispatch() {
     rm -rf "$HOME"
     mkdir -p "$HOME/Documents"
     echo "vfat smoke" > "$HOME/Documents/note.txt"
+    echo "second vfat file" > "$HOME/Documents/second.txt"
 
-    output=$(../migr backup "$mount_point/dest" 2>&1)
+    local portable_dry portable_dry_verbose
+    portable_dry=$(../migr backup "$mount_point/dry-run-dest" --dry-run 2>&1)
+    portable_dry_verbose=$(../migr backup "$mount_point/dry-run-dest" --dry-run -v 2>&1)
+    if [ "$portable_dry" = "$portable_dry_verbose" ]; then
+        echo -e "  ${GREEN}✓${NC} Portable dry-run is unchanged by verbose."
+    else
+        echo -e "  ${RED}✗${NC} Portable dry-run changed under verbose."
+        exit 1
+    fi
+
+    output=$(../migr backup "$mount_point/dest" -v 2>&1)
     assert_contains "$output" "Backup complete"
+
+    local capture_verbose_count
+    capture_verbose_count=$(grep -F -c "  Capturing: $HOME/Documents -> data/XDG_DOCUMENTS_DIR" <<<"$output" || true)
+    if [ "$capture_verbose_count" -eq 1 ]; then
+        echo -e "  ${GREEN}✓${NC} Portable capture reports the root once, not once per file."
+    else
+        echo -e "  ${RED}✗${NC} Portable capture reported the root $capture_verbose_count time(s)."
+        echo "$output"
+        exit 1
+    fi
 
     actual_backup=$(sole_final_container "$mount_point/dest")
     # A sidecar proves that the production CLI selected the portable path.
@@ -1642,8 +1753,17 @@ test_portable_vfat_dispatch() {
     rm -f "$actual_backup/packages.txt"
     rm -rf "$HOME"
     mkdir -p "$HOME"
-    output=$(printf 'y\n' | ../migr restore "$actual_backup" 2>&1)
+    output=$(printf 'y\n' | ../migr restore "$actual_backup" -v 2>&1)
     assert_contains "$output" "Restore complete"
+    local restore_verbose_count
+    restore_verbose_count=$(grep -F -c "  Restoring: XDG_DOCUMENTS_DIR" <<<"$output" || true)
+    if [ "$restore_verbose_count" -eq 1 ]; then
+        echo -e "  ${GREEN}✓${NC} Portable restore reports the root once, not once per file."
+    else
+        echo -e "  ${RED}✗${NC} Portable restore reported the root $restore_verbose_count time(s)."
+        echo "$output"
+        exit 1
+    fi
     assert_file_exists "$HOME/Documents/note.txt"
     if [ "$(cat "$HOME/Documents/note.txt")" = "vfat smoke" ]; then
         echo -e "  ${GREEN}✓${NC} Restored VFAT fixture content matches byte-for-byte."

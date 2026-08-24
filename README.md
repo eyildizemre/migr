@@ -40,7 +40,7 @@ git config core.hooksPath hooks
 
 ```bash
 ./migr
-./migr report [--critical | --comprehensive] [-s]
+./migr report [--critical | --comprehensive] [-s] [--max-depth=<N>]
 ./migr backup <PATH>
 ./migr packages <FILE>
 ./migr restore <SOURCE>
@@ -69,6 +69,8 @@ the backup's version without a second prompt.
 -v, --verbose         Verbose output
 -h, --help            Show help
 -s, --summary         Print only the selected report scope total
+    --max-depth=<N>
+                       Report directory breakdown depth; implies --verbose
 ```
 
 Scope (`backup`/`report`, mutually exclusive):
@@ -231,10 +233,26 @@ what that scope would capture. With `-s`/`--summary`, only the selected scope's
 total is printed on one line for scripting; without an explicit scope, summary
 uses the critical scope.
 
+With `-v`/`--verbose`, each item includes its full source path and directories
+below it are listed with their own recursive totals. Bare `-v` lists one level
+below each root. `--max-depth=N` limits the listed directory levels while still
+measuring every listed directory recursively. `--max-depth` implies `--verbose`,
+and `--max-depth=0` keeps only the root item. Summary mode always suppresses
+the breakdown.
+
 ```bash
 ./migr report --critical
 ./migr report --comprehensive
 ./migr report --critical --summary
+./migr report --critical --max-depth=2
+```
+
+A depth-limited report keeps the root's full total while adding directory
+subtotals:
+
+```text
+  Documents                            384B  (/home/eyildizemre/Documents)
+    Projects                            324B  (/home/eyildizemre/Documents/Projects)
 ```
 
 ## Under the Hood

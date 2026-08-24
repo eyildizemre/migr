@@ -19,6 +19,8 @@
 #include "sidecar.h"
 #include "utils.h"
 
+extern int verbose;
+
 typedef struct {
     uint64_t bytes;
 } PreflightMemory;
@@ -3144,6 +3146,21 @@ static int replay_apply_directory_metadata(ReplayCollection *collection,
     return result;
 }
 
+static void replay_print_verbose_root(const ReplayCollection *collection,
+                                      size_t root_index,
+                                      unsigned char *printed_roots)
+{
+    if (!verbose || collection == NULL || collection->manifest == NULL ||
+        printed_roots == NULL || root_index >= MANIFEST_MAX_ROOTS ||
+        root_index >= (size_t)collection->manifest->root_count ||
+        printed_roots[root_index])
+        return;
+
+    printf("  Restoring: %s\n",
+           collection->manifest->roots[root_index].id);
+    printed_roots[root_index] = 1;
+}
+
 static int replay_run(ReplayCollection *collection)
 {
     if (collection == NULL || collection->report == NULL)
@@ -3151,6 +3168,7 @@ static int replay_run(ReplayCollection *collection)
         errno = EINVAL;
         return -1;
     }
+    unsigned char printed_roots[MANIFEST_MAX_ROOTS] = { 0 };
     qsort(collection->items, collection->count, sizeof(*collection->items),
           replay_entry_compare);
 
@@ -3160,6 +3178,8 @@ static int replay_run(ReplayCollection *collection)
         int result;
         if (replay->entry->kind == SIDECAR_KIND_HARDLINK)
             continue;
+        replay_print_verbose_root(collection, replay->root_index,
+                                  printed_roots);
         if (replay->entry->kind == SIDECAR_KIND_SYMLINK)
             result = replay_apply_symlink(collection, replay);
         else if (replay->entry->kind == SIDECAR_KIND_DIRECTORY)
@@ -3186,6 +3206,8 @@ static int replay_run(ReplayCollection *collection)
         ReplayEntry *replay = &collection->items[index];
         if (replay->entry->kind != SIDECAR_KIND_HARDLINK)
             continue;
+        replay_print_verbose_root(collection, replay->root_index,
+                                  printed_roots);
         if (replay_apply_hardlink(collection, replay) != 0)
         {
             replay_report_failure(collection->report, collection->manifest,
@@ -3202,6 +3224,8 @@ static int replay_run(ReplayCollection *collection)
         ReplayEntry *replay = &collection->items[index - 1U];
         if (replay->entry->kind != SIDECAR_KIND_DIRECTORY)
             continue;
+        replay_print_verbose_root(collection, replay->root_index,
+                                  printed_roots);
         if (replay_apply_directory_metadata(collection, replay) != 0)
         {
             replay_report_failure(collection->report, collection->manifest,

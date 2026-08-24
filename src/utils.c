@@ -65,6 +65,8 @@ void print_help(void)
     printf("  -v, --verbose         Verbose output\n");
     printf("  -h, --help            Show this help\n");
     printf("  -s, --summary         Print only the selected report scope total\n");
+    printf("      --max-depth=<N>\n");
+    printf("                        Report directory breakdown depth (implies --verbose)\n");
     printf("\n");
     printf("Examples:\n");
     printf("  ./migr backup /mnt/drive\n");

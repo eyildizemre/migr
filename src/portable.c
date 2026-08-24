@@ -21,6 +21,8 @@
 #include "metadata.h"
 #include "utils.h"
 
+extern int verbose;
+
 typedef struct {
     char *root_id;
     char *logical_path;
@@ -6624,9 +6626,15 @@ int portable_capture_fresh_prepared_at(
             failed = 1;
     }
     for (size_t index = 0; !failed && index < request->root_count; index++)
+    {
+        if (verbose)
+            printf("  Capturing: %s -> data/%s\n",
+                   request->roots[index].capture_path,
+                   request->roots[index].payload_path);
         if (portable_capture_root(&context, &request->roots[index]) != 0 ||
             reconcile_root(&context, &request->roots[index]) != 0)
             failed = 1;
+    }
     if (!failed && sidecar_log_claim_count(&sidecar) != 0)
         failed = 1;
     if (!failed && live_count != NULL)
@@ -6771,6 +6779,10 @@ int portable_capture_resume_prepared_at(
             failed = 1;
         for (size_t index = 0; !failed && index < request->root_count;
              index++) {
+            if (verbose)
+                printf("  Capturing: %s -> data/%s\n",
+                       request->roots[index].capture_path,
+                       request->roots[index].payload_path);
             if (portable_capture_root(&context, &request->roots[index]) != 0 ||
                 reconcile_root(&context, &request->roots[index]) != 0) {
                 failed = 1;
