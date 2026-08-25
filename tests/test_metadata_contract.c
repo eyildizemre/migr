@@ -1031,6 +1031,88 @@ static void test_capture_recopies_without_nsec_exact(void)
     remove_tree(base);
 }
 
+static void test_native_seed_recopies_without_nsec_exact(void)
+{
+    const char *case_name = "coarse-seed";
+    char base[PATH_MAX], source_root[PATH_MAX], destination_root[PATH_MAX];
+    char source_first[PATH_MAX], source_second[PATH_MAX];
+    char destination_first[PATH_MAX], destination_second[PATH_MAX];
+    make_temp_root(base, sizeof(base));
+    join_or_die(source_root, sizeof(source_root), base, "source");
+    join_or_die(destination_root, sizeof(destination_root), base, "destination");
+    if (mkdir(source_root, 0700) != 0 || mkdir(destination_root, 0700) != 0)
+        fatal("could not create the coarse seed roots");
+    join_or_die(source_first, sizeof(source_first), source_root, "first");
+    join_or_die(source_second, sizeof(source_second), source_root, "second");
+    join_or_die(destination_first, sizeof(destination_first), destination_root,
+                "first");
+    join_or_die(destination_second, sizeof(destination_second), destination_root,
+                "second");
+    write_file(source_first, "0123456789abcdef");
+    if (link(source_first, source_second) != 0)
+        fatal("could not create the coarse seed source hardlink pair");
+    set_metadata(source_first, 0600, regular_times, 0);
+
+    write_file(destination_first, "fedcba9876543210");
+    const struct timespec coarse_destination_times[2] = {
+        { .tv_sec = regular_times[0].tv_sec, .tv_nsec = 0 },
+        { .tv_sec = regular_times[1].tv_sec, .tv_nsec = 0 }
+    };
+    set_metadata(destination_first, 0600, coarse_destination_times, 0);
+
+    int destination_fd = open_directory(destination_root);
+    void *map = native_inode_map_create();
+    if (map == NULL)
+    {
+        close(destination_fd);
+        fatal("could not create the coarse seed inode map");
+    }
+    const CloneContext coarse_ctx = {
+        .operation = CLONE_BACKUP,
+        .representation = CLONE_NATIVE_TREE,
+        .timestamp_policy_configured = 1,
+        .nsec_exact = 0,
+        .metadata_preflight_done = 1,
+        .inode_map = map
+    };
+
+    struct stat source_first_st;
+    struct stat source_second_st;
+    check_result(lstat(source_first, &source_first_st) == 0 &&
+                     lstat(source_second, &source_second_st) == 0 &&
+                     source_first_st.st_nlink == 2 &&
+                     source_first_st.st_dev == source_second_st.st_dev &&
+                     source_first_st.st_ino == source_second_st.st_ino,
+                 case_name, "coarse seed source pair shares one inode");
+    check_result(native_inode_map_seed_existing(&coarse_ctx, source_first,
+                                                destination_fd, "first") == 0,
+                 case_name,
+                 "coarse seed inspection completes without adopting the destination");
+    int first_result = backup_capture_at(&coarse_ctx, source_first,
+                                         destination_fd, "first");
+    int second_result = backup_capture_at(&coarse_ctx, source_second,
+                                          destination_fd, "second");
+    check_result(first_result == 0 && second_result == 0, case_name,
+                 "coarse seed capture processes both hardlink members");
+
+    struct stat destination_first_st;
+    struct stat destination_second_st;
+    int destination_pair_ok =
+        lstat(destination_first, &destination_first_st) == 0 &&
+        lstat(destination_second, &destination_second_st) == 0 &&
+        native_hardlink_identity_matches(&destination_first_st,
+                                         &destination_second_st) &&
+        destination_first_st.st_nlink == 2 &&
+        file_equals(destination_first, "0123456789abcdef") &&
+        file_equals(destination_second, "0123456789abcdef");
+    check_result(destination_pair_ok, case_name,
+                 "coarse seed recopy keeps the source content and hardlink identity");
+
+    native_inode_map_free(map);
+    close(destination_fd);
+    remove_tree(base);
+}
+
 static void test_metadata_helper_failure_paths(void)
 {
     const char *case_name = "helpers";
@@ -1475,6 +1557,7 @@ int main(void)
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
         run_matrix_case(&cases[i]);
     test_capture_recopies_without_nsec_exact();
+    test_native_seed_recopies_without_nsec_exact();
     test_metadata_helper_failure_paths();
     test_metadata_xattr_capability_probe();
     test_metadata_xattr_gate_no_unrelated_namespace();

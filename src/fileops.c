@@ -404,8 +404,8 @@ static int native_seed_destination_matches(const CloneContext *ctx,
            S_ISREG(destination->st_mode) &&
            destination->st_size == source->st_size &&
            destination->st_mtim.tv_sec == source->st_mtim.tv_sec &&
-           (!policy.nsec_exact ||
-            destination->st_mtim.tv_nsec == source->st_mtim.tv_nsec);
+           policy.nsec_exact &&
+           destination->st_mtim.tv_nsec == source->st_mtim.tv_nsec;
 }
 
 // Restore roots may name a nested relative destination, or the destination
