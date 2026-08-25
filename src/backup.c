@@ -30,6 +30,8 @@ static BackupTestInventoryHook backup_test_inventory_hook;
 static void *backup_test_inventory_context;
 static BackupTestFreeSpaceHook backup_test_free_space_hook;
 static void *backup_test_free_space_context;
+static BackupTestBlockSizeHook backup_test_block_size_hook;
+static void *backup_test_block_size_context;
 static BackupTestProgressHook backup_test_progress_hook;
 static void *backup_test_progress_context;
 
@@ -47,6 +49,13 @@ void backup_test_set_free_space_hook(BackupTestFreeSpaceHook hook,
     backup_test_free_space_context = context;
 }
 
+void backup_test_set_block_size_hook(BackupTestBlockSizeHook hook,
+                                     void *context)
+{
+    backup_test_block_size_hook = hook;
+    backup_test_block_size_context = context;
+}
+
 void backup_test_set_progress_hook(BackupTestProgressHook hook,
                                    void *context)
 {
@@ -60,6 +69,33 @@ static void backup_test_before_source_open(const char *source_path)
         backup_test_inventory_hook(source_path, backup_test_inventory_context);
 }
 #endif
+
+static int destination_block_size(int dest_fd, off_t *block_size)
+{
+    if (dest_fd < 0 || block_size == NULL)
+        return -1;
+
+#ifdef BACKUP_TEST_HOOKS
+    if (backup_test_block_size_hook != NULL)
+    {
+        *block_size = 0;
+        backup_test_block_size_hook(block_size,
+                                    backup_test_block_size_context);
+        return 0;
+    }
+#endif
+
+    struct statfs fs;
+    if (fstatfs(dest_fd, &fs) != 0)
+        return -1;
+
+    uintmax_t selected = (uintmax_t)(fs.f_frsize != 0
+                                         ? fs.f_frsize : fs.f_bsize);
+    if (selected == 0 || selected > (uintmax_t)INTMAX_MAX)
+        return -1;
+    *block_size = (off_t)selected;
+    return 0;
+}
 
 // Returns 1 when the destination has at least `needed` bytes available, 0
 // when it clearly does not, and -1 when the filesystem space cannot be read.
@@ -83,17 +119,20 @@ static int destination_has_space(int dest_fd, off_t needed,
     }
 #endif
 
+    off_t block_size = 0;
+    if (destination_block_size(dest_fd, &block_size) != 0 || block_size <= 0)
+        return -1;
+
     struct statfs fs;
     if (fstatfs(dest_fd, &fs) != 0)
         return -1;
 
     uintmax_t blocks = (uintmax_t)fs.f_bavail;
-    uintmax_t block_size = (uintmax_t)(fs.f_frsize != 0
-                                           ? fs.f_frsize : fs.f_bsize);
-    if (block_size == 0 || blocks > UINTMAX_MAX / block_size)
+    uintmax_t allocation_size = (uintmax_t)block_size;
+    if (blocks > UINTMAX_MAX / allocation_size)
         return -1;
 
-    uintmax_t available = blocks * block_size;
+    uintmax_t available = blocks * allocation_size;
     *free_bytes = available > (uintmax_t)INTMAX_MAX
         ? (off_t)INTMAX_MAX
         : (off_t)available;
@@ -777,7 +816,6 @@ int backup(const char *target, BackupMode mode, char **paths)
 
     off_t estimated_size = 0;
     int estimate_had_error = 0;
-    backup_plan_estimate_size(&plan, &estimated_size, &estimate_had_error);
 
     int count = 0;
 
@@ -805,6 +843,10 @@ int backup(const char *target, BackupMode mode, char **paths)
         int advisory_fd = open(target, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
         if (advisory_fd >= 0)
         {
+            off_t advisory_block_size = 0;
+            (void)destination_block_size(advisory_fd, &advisory_block_size);
+            backup_plan_estimate_size(&plan, advisory_block_size,
+                                      &estimated_size, &estimate_had_error);
             if (estimate_had_error)
                 print_warning("Warning: could not fully estimate backup size; "
                        "skipping the free-space preflight check.\n");
@@ -993,6 +1035,11 @@ int backup(const char *target, BackupMode mode, char **paths)
         backup_plan_free(&plan);
         return 1;
     }
+
+    off_t target_block_size = 0;
+    (void)destination_block_size(target_fd, &target_block_size);
+    backup_plan_estimate_size(&plan, target_block_size,
+                              &estimated_size, &estimate_had_error);
 
     if (estimate_had_error)
         print_warning("Warning: could not fully estimate backup size; "

@@ -1,13 +1,14 @@
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <errno.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <stdint.h>
 
 #include "backup_plan.h"
-#include "fileops.h"
 #include "utils.h" /* path_join, path_join_n */
 #include "xdg.h"
 
@@ -608,8 +609,183 @@ int backup_plan_build(const char *home, BackupMode mode,
     return 0;
 }
 
-void backup_plan_estimate_size(const BackupPlan *plan, off_t *total,
-                               int *had_error)
+typedef struct {
+    dev_t dev;
+    ino_t ino;
+} EstimateInode;
+
+typedef struct {
+    EstimateInode *items;
+    size_t count;
+    size_t capacity;
+} EstimateSeen;
+
+static int estimate_seen_contains(const EstimateSeen *seen, dev_t dev,
+                                  ino_t ino)
+{
+    for (size_t i = 0; i < seen->count; i++)
+    {
+        if (seen->items[i].dev == dev && seen->items[i].ino == ino)
+            return 1;
+    }
+    return 0;
+}
+
+static int estimate_seen_add(EstimateSeen *seen, dev_t dev, ino_t ino)
+{
+    if (seen->count == seen->capacity)
+    {
+        size_t new_capacity = seen->capacity == 0 ? 16 : seen->capacity * 2;
+        if (new_capacity < seen->capacity ||
+            new_capacity > SIZE_MAX / sizeof(*seen->items))
+        {
+            errno = EOVERFLOW;
+            return -1;
+        }
+
+        EstimateInode *items = realloc(seen->items,
+                                       new_capacity * sizeof(*items));
+        if (items == NULL)
+            return -1;
+        seen->items = items;
+        seen->capacity = new_capacity;
+    }
+
+    seen->items[seen->count++] = (EstimateInode){ .dev = dev, .ino = ino };
+    return 0;
+}
+
+static void estimate_seen_free(EstimateSeen *seen)
+{
+    if (seen == NULL)
+        return;
+    free(seen->items);
+    *seen = (EstimateSeen){0};
+}
+
+static int estimate_add_size(off_t *size, off_t contribution)
+{
+    if (size == NULL || *size < 0 || contribution < 0 ||
+        (uintmax_t)*size > (uintmax_t)INTMAX_MAX -
+                               (uintmax_t)contribution)
+    {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    *size += contribution;
+    return 0;
+}
+
+static int estimate_regular_size(const struct stat *st, off_t block_size,
+                                 off_t *size)
+{
+    if (st == NULL || size == NULL || st->st_size < 0)
+    {
+        errno = EOVERFLOW;
+        return -1;
+    }
+
+    *size = st->st_size;
+    if (block_size <= 1)
+        return 0;
+
+    off_t remainder = st->st_size % block_size;
+    if (remainder == 0)
+        return 0;
+
+    off_t increment = block_size - remainder;
+    if ((uintmax_t)st->st_size >
+        (uintmax_t)INTMAX_MAX - (uintmax_t)increment)
+    {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    *size = st->st_size + increment;
+    return 0;
+}
+
+static int estimate_walk_path(const char *path, off_t block_size,
+                              EstimateSeen *seen, off_t *size)
+{
+    struct stat st;
+    if (lstat(path, &st) != 0)
+        return -1;
+
+    if (S_ISREG(st.st_mode))
+    {
+        if (st.st_nlink > 1 &&
+            estimate_seen_contains(seen, st.st_dev, st.st_ino))
+            return 0;
+
+        off_t contribution = 0;
+        if (estimate_regular_size(&st, block_size, &contribution) != 0)
+            return -1;
+        if (st.st_nlink > 1 &&
+            estimate_seen_add(seen, st.st_dev, st.st_ino) != 0)
+            return -1;
+        return estimate_add_size(size, contribution);
+    }
+
+    if (S_ISLNK(st.st_mode))
+        return estimate_add_size(size, st.st_size);
+
+    if (S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode) ||
+        S_ISCHR(st.st_mode) || S_ISBLK(st.st_mode))
+        return 0;
+
+    if (!S_ISDIR(st.st_mode))
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (estimate_add_size(size, st.st_size) != 0)
+        return -1;
+
+    DIR *dir = opendir(path);
+    if (dir == NULL)
+        return -1;
+
+    int saved_errno = 0;
+    struct dirent *entry;
+    for (;;)
+    {
+        errno = 0;
+        entry = readdir(dir);
+        if (entry == NULL)
+        {
+            if (errno != 0)
+                saved_errno = errno;
+            break;
+        }
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0)
+            continue;
+
+        char child[PATH_MAX];
+        if (path_join(child, sizeof(child), path, entry->d_name) != 0)
+        {
+            saved_errno = ENAMETOOLONG;
+            break;
+        }
+        if (estimate_walk_path(child, block_size, seen, size) != 0)
+        {
+            saved_errno = errno != 0 ? errno : EIO;
+            break;
+        }
+    }
+    if (closedir(dir) != 0 && saved_errno == 0)
+        saved_errno = errno != 0 ? errno : EIO;
+    if (saved_errno != 0)
+    {
+        errno = saved_errno;
+        return -1;
+    }
+    return 0;
+}
+
+void backup_plan_estimate_size(const BackupPlan *plan, off_t block_size,
+                               off_t *total, int *had_error)
 {
     if (total == NULL || had_error == NULL)
         return;
@@ -622,29 +798,29 @@ void backup_plan_estimate_size(const BackupPlan *plan, off_t *total,
         return;
     }
 
+    EstimateSeen seen = {0};
     for (int i = 0; i < plan->root_count; i++)
     {
         const char *path = plan->roots[i].capture_path;
-        struct stat st;
-        if (lstat(path, &st) != 0)
-        {
-            if (errno == ENOENT || errno == ENOTDIR)
-                continue;
-            *had_error = 1;
-            continue;
-        }
-
         off_t root_size = 0;
+        size_t seen_before_root = seen.count;
         errno = 0;
-        if (get_dir_size(path, &root_size) != 0)
+        if (estimate_walk_path(path, block_size, &seen, &root_size) != 0)
         {
-            if (errno == ENOENT || errno == ENOTDIR)
+            int saved_errno = errno;
+            seen.count = seen_before_root;
+            if (saved_errno == ENOENT || saved_errno == ENOTDIR)
                 continue;
             *had_error = 1;
             continue;
         }
-        *total += root_size;
+        if (estimate_add_size(total, root_size) != 0)
+        {
+            seen.count = seen_before_root;
+            *had_error = 1;
+        }
     }
+    estimate_seen_free(&seen);
 }
 
 // The destination is resolved differently from a root, because it is used

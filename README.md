@@ -179,11 +179,13 @@ before a container is created:
     Destination free space: 3.8G
     Error: not enough free space at /mnt/backup (need 0.4G more)
 
-The comparison is an exact estimate, not a promised reservation: filesystem
-metadata, sparse-file allocation, and hardlink deduplication can make actual
-consumption differ. If a source root cannot be measured for a reason other
-than disappearing during planning, migr warns and skips this advisory check
-rather than refusing a backup on an incomplete estimate.
+Regular-file contributions use the destination filesystem's allocation unit,
+and hardlinked content is counted once across the selected roots. The
+comparison is still an exact estimate, not a promised reservation: filesystem
+metadata, sparse-file allocation, xattr overhead, and representation details
+can make actual consumption differ. If a source root cannot be measured for a
+reason other than disappearing during planning, migr warns and skips this
+advisory check rather than refusing a backup on an incomplete estimate.
 
 During a live backup, an interactive terminal also receives a single
 overwriting progress line while regular-file bytes are copied:

@@ -1216,6 +1216,17 @@ static void force_no_free_space(off_t needed, off_t *free_bytes, void *context)
     *free_bytes = 0;
 }
 
+static void set_test_block_size(off_t *block_size, void *context)
+{
+    *block_size = *(const off_t *)context;
+}
+
+static void provide_free_space(off_t needed, off_t *free_bytes, void *context)
+{
+    (void)context;
+    *free_bytes = needed + 1;
+}
+
 static void test_plan_estimate_tolerates_missing_root(void)
 {
     printf(BLUE "::" NC " model: size estimation tolerates a root that vanishes after planning\n");
@@ -1243,13 +1254,74 @@ static void test_plan_estimate_tolerates_missing_root(void)
 
     off_t total = -1;
     int had_error = -1;
-    backup_plan_estimate_size(&plan, &total, &had_error);
+    backup_plan_estimate_size(&plan, 0, &total, &had_error);
     check(had_error == 0, "a vanished root is not an estimation error");
     check(total == first_st.st_size,
           "a vanished root contributes zero to the estimated total");
 
     backup_plan_free(&plan);
     remove_tree(home);
+}
+
+static void test_allocation_aware_estimate(void)
+{
+    printf(BLUE "::" NC " model: size estimation rounds regular files and deduplicates hardlinks\n");
+
+    char home[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_home");
+    mkdir_p(home);
+    setenv("HOME", home, 1);
+
+    char first[PATH_MAX], second[PATH_MAX], hardlink_first[PATH_MAX];
+    char hardlink_second[PATH_MAX];
+    join_path(first, sizeof(first), home, "first");
+    join_path(second, sizeof(second), home, "second");
+    join_path(hardlink_first, sizeof(hardlink_first), home, "hard-a");
+    join_path(hardlink_second, sizeof(hardlink_second), home, "hard-b");
+    write_large_file(first, 3);
+    write_large_file(second, 5);
+    write_large_file(hardlink_first, 7);
+    check(link(hardlink_first, hardlink_second) == 0,
+          "fixture: create a hardlinked estimate pair");
+
+    char *paths[] = { first, second, hardlink_first, hardlink_second, NULL };
+    BackupPlan plan;
+    check(backup_plan_build(home, BACKUP_EXPLICIT_PATHS,
+                            (const char *const *)paths, &plan) == 0,
+          "the allocation estimate fixture builds");
+
+    off_t total = -1;
+    int had_error = -1;
+    backup_plan_estimate_size(&plan, 4, &total, &had_error);
+    check(had_error == 0 && total == 20,
+          "rounded regular files and the hardlinked pair contribute once");
+
+    backup_plan_estimate_size(&plan, 0, &total, &had_error);
+    check(had_error == 0 && total == 15,
+          "block size zero disables rounding but keeps hardlink deduplication");
+    backup_plan_estimate_size(&plan, 1, &total, &had_error);
+    check(had_error == 0 && total == 15,
+          "block size one disables rounding but keeps hardlink deduplication");
+    backup_plan_free(&plan);
+
+    off_t injected_block_size = 4;
+    backup_test_set_block_size_hook(set_test_block_size, &injected_block_size);
+    backup_test_set_free_space_hook(provide_free_space, NULL);
+    char target_parent[PATH_MAX];
+    fresh_mkdtemp(target_parent, sizeof(target_parent), "plan_target_parent");
+    char target[PATH_MAX];
+    join_path(target, sizeof(target), target_parent, "allocation-aware");
+    dry_run = 0;
+    char output[8192];
+    int result = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                      output, sizeof(output));
+    backup_test_set_block_size_hook(NULL, NULL);
+    backup_test_set_free_space_hook(NULL, NULL);
+    check(result == 0 && strstr(output, "Estimated backup size: 20B") != NULL,
+          "backup() uses the injected allocation block size in its estimate");
+
+    remove_tree(home);
+    remove_tree(target_parent);
 }
 
 static void test_destination_space_preflight(void)
@@ -1272,6 +1344,9 @@ static void test_destination_space_preflight(void)
     join_path(target, sizeof(target), target_parent, "existing_target");
     mkdir_p(target);
 
+    off_t no_rounding_block_size = 1;
+    backup_test_set_block_size_hook(set_test_block_size,
+                                    &no_rounding_block_size);
     backup_test_set_free_space_hook(force_no_free_space, NULL);
     char live_output[8192];
     char dry_output[8192];
@@ -1293,13 +1368,16 @@ static void test_destination_space_preflight(void)
     check(strcmp(live_output, dry_output) == 0,
           "insufficient-space output is identical live and dry-run");
     check(strstr(live_output, "Estimated backup size:") != NULL &&
-          strstr(live_output, "Destination free space:") != NULL &&
-          strstr(live_output, "Error: not enough free space at") != NULL &&
-          strstr(live_output, "(need ") != NULL &&
+          strstr(live_output, "Destination free space:") != NULL,
+          "the refusal keeps both absolute space summaries");
+    check(strstr(live_output, "Error: not enough free space at") != NULL,
+          "the refusal names the destination");
+    check(strstr(live_output, "(need ") != NULL &&
           strstr(live_output, shortfall_text) != NULL &&
-          strstr(live_output, " more)") != NULL &&
-          strstr(live_output, ", have ") == NULL,
+          strstr(live_output, " more)") != NULL,
           "the refusal reports the additional space required");
+    check(strstr(live_output, ", have ") == NULL,
+          "the refusal does not repeat the absolute free-space value");
     check(directory_empty(target),
           "an existing destination receives no container, data, or manifest on refusal");
 
@@ -1315,6 +1393,7 @@ static void test_destination_space_preflight(void)
     check(rollback_rc == 1 && !dir_exists(created_target),
           "a newly created destination is rolled back on space refusal");
 
+    backup_test_set_block_size_hook(NULL, NULL);
     backup_test_set_free_space_hook(NULL, NULL);
     char normal_dry_target[PATH_MAX];
     fresh_mkdtemp(normal_dry_target, sizeof(normal_dry_target), "plan_space_dry");
@@ -1625,6 +1704,7 @@ int main(void)
     test_root_count_ceiling_is_enforced();
 
     test_plan_estimate_tolerates_missing_root();
+    test_allocation_aware_estimate();
     test_destination_space_preflight();
     test_live_progress();
     test_missing_explicit_path_rejects_before_target_creation();

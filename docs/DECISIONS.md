@@ -2472,11 +2472,11 @@ cannot be completed because of a real source-side measurement error, the
 preflight is skipped with a warning and the backup proceeds.
 
 The comparison is exact: needed > available refuses, with no invented
-percentage margin. The estimate is inherently approximate because sparse-file
-allocation, filesystem metadata, xattr overhead, and source-side hardlink
-deduplication can differ from the sum of source logical sizes. A guessed
-margin would add an unexamined policy without making that approximation
-more truthful; tuning it remains a separate evidence-based change.
+percentage margin. The estimate remains approximate because sparse-file
+allocation, filesystem metadata, xattr overhead, and representation details
+can differ from the sum of source logical sizes. A guessed margin would add an
+unexamined policy without making that approximation more truthful; tuning it
+remains a separate evidence-based change.
 
 The available-space calculation uses statfs.f_bavail, not statfs.f_bfree.
 f_bavail reflects blocks available to migr as an unprivileged process,
@@ -2621,3 +2621,59 @@ files. Gating the sync on terminal output is rejected because the behavior is
 correctness/reliability-related rather than UI-related. A configurable
 interval is deferred until operational evidence shows that the fixed 8 MiB
 trade-off is wrong.
+
+---
+
+## D31 — 2026-08-25 — Destination-allocation-aware, hardlink-deduplicated estimate
+
+**Status:** Implemented
+
+**Decision:** `backup_plan_estimate_size()` accepts a caller-supplied
+destination allocation block size. Its backup-specific walker rounds each
+regular file upward to that unit and counts a `(st_dev, st_ino)` hardlink group
+once across the entire plan, including when the group crosses root boundaries.
+Values <= 1 disable only the rounding; hardlink deduplication remains active.
+The same estimate feeds D27's free-space preflight and D28's progress
+denominator, for native and portable capture alike.
+
+The block size is read by `backup()` from the destination fd with the existing
+`f_frsize`, then `f_bsize`, preference. The estimator itself remains entirely
+source-side and deterministic for its inputs; it never performs destination
+I/O. This adds one block-size `fstatfs()` beside the existing free-space
+preflight's own query, rather than coupling the planner to a destination fd.
+
+Only regular files receive allocation rounding. Symlinks and directories keep
+their existing raw `st_size` contribution, while FIFOs, sockets, and device
+nodes contribute zero. This is deliberate: regular-file allocation is the
+representation-independent correction evidenced on large-cluster removable
+media, whereas non-regular allocation can vary with the eventual native or
+portable representation and was not part of that evidence.
+
+**Why:** A live exFAT destination with 128 KiB clusters consumed materially
+more space than the raw source-byte counter suggested, consistent with
+per-file allocation rounding. A completed hardlink-heavy backup also reported
+more estimated bytes than it physically copied because `get_dir_size()` counted
+each linked name independently, while capture writes the shared content once.
+Both errors affect the destination fit check, and both are independent of the
+representation selected later in `backup()`.
+
+The estimate uses a new local walker rather than changing `get_dir_size()`.
+`get_dir_size()` remains the deliberately simple, raw, non-deduplicated walker
+used by report output; `report.c`'s separate `measure_report_tree()` is the
+established precedent for keeping a second walker when the accounting contract
+differs. The estimate's small linear `(dev, ino)` set is retained for the whole
+call, not reset per root, and entries from a root that fails measurement are
+rolled back so an incomplete root cannot suppress a later contribution.
+
+**Relationship to D27:** D31 refines only the per-file estimate formula. D27's
+exact `needed > available` comparison, no-margin policy, and fail-open behavior
+when source measurement is incomplete remain unchanged. D31 also makes D28's
+progress denominator match the improved preflight estimate; it does not change
+progress presentation or D30's periodic durability sync.
+
+**Rejected:** Retrofitting `get_dir_size()` is rejected because report's raw
+logical-size contract is unrelated to backup destination allocation. A
+representation-specific estimate is rejected because both allocation rounding
+and hardlink sharing are established before native/portable selection and are
+valid for either representation. Symlink/directory rounding is deferred until
+their actual destination allocation semantics justify it.
