@@ -1014,23 +1014,16 @@ static int load_callback(const SidecarRecord *record, void *context)
 
     if (record->type == SIDECAR_RECORD_ENTRY)
     {
-        if (log->pending.entry.entry.root_id.data != NULL)
-            status = SIDECAR_STATUS_CORRUPT;
-        else
-            status = copy_entry(&log->memory, &record->value.entry,
-                                &log->pending.entry);
+        status = copy_entry(&log->memory, &record->value.entry,
+                            &log->pending.entry);
         if (status == SIDECAR_STATUS_OK)
             log->pending.xattrs_seen = 0;
     }
     else if (record->type == SIDECAR_RECORD_XATTR)
     {
-        if (log->pending.entry.entry.root_id.data == NULL ||
-            log->pending.xattrs_seen >= log->pending.entry.entry.xattr_count)
-            status = SIDECAR_STATUS_CORRUPT;
-        else
-            status = copy_xattr(&log->memory, &record->value.xattr,
-                                &log->pending.entry.xattrs[
-                                    log->pending.xattrs_seen]);
+        status = copy_xattr(&log->memory, &record->value.xattr,
+                            &log->pending.entry.xattrs[
+                                log->pending.xattrs_seen]);
         if (status == SIDECAR_STATUS_OK)
             log->pending.xattrs_seen++;
     }
@@ -1038,12 +1031,9 @@ static int load_callback(const SidecarRecord *record, void *context)
     {
         size_t existing_index = 0;
         size_t claim_index = MAP_INDEX_NONE;
-        if (log->pending.entry.entry.root_id.data == NULL ||
-            log->pending.xattrs_seen != log->pending.entry.entry.xattr_count)
-            status = SIDECAR_STATUS_CORRUPT;
-        else if ((status = prepare_claim_consumption(
-                      &log->claim_map, &log->pending.entry.entry,
-                      &claim_index)) == SIDECAR_STATUS_OK)
+        if ((status = prepare_claim_consumption(
+                  &log->claim_map, &log->pending.entry.entry,
+                  &claim_index)) == SIDECAR_STATUS_OK)
             status = map_prepare_commit(&log->memory, &log->map,
                                         &log->pending.entry, &existing_index);
         if (status == SIDECAR_STATUS_OK)
@@ -1058,34 +1048,27 @@ static int load_callback(const SidecarRecord *record, void *context)
     else if (record->type == SIDECAR_RECORD_DELETE)
     {
         size_t claim_index = MAP_INDEX_NONE;
-        if (log->pending.entry.entry.root_id.data != NULL)
-            status = SIDECAR_STATUS_CORRUPT;
-        else
+        claim_index = map_find(&log->claim_map,
+                               record->value.deletion.root_id,
+                               record->value.deletion.logical_path);
+        if (claim_index != MAP_INDEX_NONE &&
+            log->claim_map.generation == UINT64_MAX)
         {
-            claim_index = map_find(&log->claim_map,
-                                   record->value.deletion.root_id,
-                                   record->value.deletion.logical_path);
-            if (claim_index != MAP_INDEX_NONE &&
-                log->claim_map.generation == UINT64_MAX)
-            {
-                errno = E2BIG;
-                status = SIDECAR_STATUS_LIMIT;
-            }
-            else
+            errno = E2BIG;
+            status = SIDECAR_STATUS_LIMIT;
+        }
+        else
             status = map_apply_delete(&log->memory, &log->map,
                                       record->value.deletion.root_id,
                                       record->value.deletion.logical_path);
-            if (status == SIDECAR_STATUS_OK &&
-                claim_index != MAP_INDEX_NONE)
-                status = map_apply_remove(&log->memory, &log->claim_map,
-                                          claim_index);
-        }
+        if (status == SIDECAR_STATUS_OK && claim_index != MAP_INDEX_NONE)
+            status = map_apply_remove(&log->memory, &log->claim_map,
+                                      claim_index);
     }
     else if (record->type == SIDECAR_RECORD_CLAIM)
     {
         size_t claim_index = MAP_INDEX_NONE;
-        if (log->pending.entry.entry.root_id.data != NULL ||
-            map_find(&log->map, record->value.claim.root_id,
+        if (map_find(&log->map, record->value.claim.root_id,
                      record->value.claim.logical_path) != MAP_INDEX_NONE ||
             map_find(&log->claim_map, record->value.claim.root_id,
                      record->value.claim.logical_path) != MAP_INDEX_NONE)

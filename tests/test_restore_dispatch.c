@@ -156,7 +156,7 @@ static void write_raw(const char *dir, const char *content)
     fclose(f);
 }
 
-// Forks so restore()'s stdout can be captured in isolation per call (dry_run
+// Forks so restore()'s output can be captured in isolation per call (dry_run
 // is already 1 for the whole process, inherited across the fork) without one
 // test's output or any accidental global mutation leaking into the next.
 static int run_restore_capturing(const char *source, char *output, size_t output_size)
@@ -176,10 +176,13 @@ static int run_restore_capturing(const char *source, char *output, size_t output
     if (pid == 0)
     {
         close(pipefd[0]);
-        dup2(pipefd[1], STDOUT_FILENO);
+        if (dup2(pipefd[1], STDOUT_FILENO) < 0 ||
+            dup2(pipefd[1], STDERR_FILENO) < 0)
+            _exit(2);
         close(pipefd[1]);
         int rc = restore(source);
         fflush(stdout);
+        fflush(stderr);
         _exit(rc == 0 ? 0 : 1);
     }
 

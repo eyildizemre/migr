@@ -16,10 +16,10 @@ int color_enabled = 0;
 static void print_status(const char *color, const char *fmt, va_list args)
 {
     if (color_enabled)
-        fputs(color, stdout);
-    vprintf(fmt, args);
+        fputs(color, stderr);
+    vfprintf(stderr, fmt, args);
     if (color_enabled)
-        fputs("\033[0m", stdout);
+        fputs("\033[0m", stderr);
 }
 
 void print_error(const char *fmt, ...)

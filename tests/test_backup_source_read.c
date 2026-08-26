@@ -180,7 +180,8 @@ static int run_backup_as(const char *target, const char *home,
     if (child == 0)
     {
         close(output_pipe[0]);
-        if (dup2(output_pipe[1], STDOUT_FILENO) < 0)
+        if (dup2(output_pipe[1], STDOUT_FILENO) < 0 ||
+            dup2(output_pipe[1], STDERR_FILENO) < 0)
             _exit(2);
         close(output_pipe[1]);
         if (!drop_identity(uid, gid) || setenv("HOME", home, 1) != 0 ||
@@ -190,6 +191,7 @@ static int run_backup_as(const char *target, const char *home,
         char *paths[] = { (char *)source, NULL };
         int result = backup(target, BACKUP_EXPLICIT_PATHS, paths);
         fflush(stdout);
+        fflush(stderr);
         _exit(result == 0 ? 0 : 1);
     }
 
@@ -255,7 +257,8 @@ static int run_backup_race(const char *target, const char *home,
         close(ready[0]);
         close(release[1]);
         close(output_pipe[0]);
-        if (dup2(output_pipe[1], STDOUT_FILENO) < 0)
+        if (dup2(output_pipe[1], STDOUT_FILENO) < 0 ||
+            dup2(output_pipe[1], STDERR_FILENO) < 0)
             _exit(2);
         close(output_pipe[1]);
         if (!drop_identity(uid, gid) || setenv("HOME", home, 1) != 0)
@@ -264,6 +267,7 @@ static int run_backup_race(const char *target, const char *home,
         char *paths[] = { (char *)source, NULL };
         int result = backup(target, BACKUP_EXPLICIT_PATHS, paths);
         fflush(stdout);
+        fflush(stderr);
         _exit(result == 0 ? 0 : 1);
     }
 
@@ -615,7 +619,8 @@ static int run_backup_capture_race(const char *target, const char *home,
         close(ready[0]);
         close(release[1]);
         close(output_pipe[0]);
-        if (dup2(output_pipe[1], STDOUT_FILENO) < 0)
+        if (dup2(output_pipe[1], STDOUT_FILENO) < 0 ||
+            dup2(output_pipe[1], STDERR_FILENO) < 0)
             _exit(2);
         close(output_pipe[1]);
         if (!drop_identity(uid, gid) || setenv("HOME", home, 1) != 0)
@@ -628,6 +633,7 @@ static int run_backup_capture_race(const char *target, const char *home,
         char *paths[] = { (char *)source, NULL };
         int result = backup(target, BACKUP_EXPLICIT_PATHS, paths);
         fflush(stdout);
+        fflush(stderr);
         _exit(result == 0 ? 0 : 1);
     }
 

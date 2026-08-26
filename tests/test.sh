@@ -375,7 +375,7 @@ test_dry_run() {
     echo -e "${BLUE}::${NC} Phase 2: --dry-run"
 
     local output plain_output verbose_output
-    output=$(../migr backup "$BACKUP_DIR" -n)
+    output=$(../migr backup "$BACKUP_DIR" -n 2>&1)
 
     assert_contains "$output" "Dry run"
 
@@ -406,7 +406,7 @@ test_dry_run() {
     fi
 
     plain_output="$output"
-    verbose_output=$(../migr backup "$BACKUP_DIR" -n -v)
+    verbose_output=$(../migr backup "$BACKUP_DIR" -n -v 2>&1)
     if [ "$plain_output" = "$verbose_output" ]; then
         echo -e "  ${GREEN}✓${NC} Native dry-run is unchanged by verbose."
     else
@@ -420,7 +420,7 @@ test_backup() {
 
     local output
     # -v needed: without it, individual filenames are not printed
-    output=$(../migr backup "$BACKUP_DIR" -v)
+    output=$(../migr backup "$BACKUP_DIR" -v 2>&1)
 
     assert_contains "$output" "Finalizing (syncing to disk)..."
     assert_contains "$output" "Backup complete"
@@ -524,7 +524,7 @@ test_restore() {
 
     local output
     # restore() calls confirm_action() — pipe "y" to mock user interaction
-    output=$(echo "y" | ../migr restore "$actual_backup")
+    output=$(echo "y" | ../migr restore "$actual_backup" 2>&1)
 
     assert_contains "$output" "Restore complete"
 
@@ -677,7 +677,7 @@ test_comprehensive() {
     echo "icon" > "$HOME/Desktop/browser.desktop"
 
     local output
-    output=$(../migr backup "$comp_backup" --comprehensive)
+    output=$(../migr backup "$comp_backup" --comprehensive 2>&1)
 
     assert_contains "$output" "Backup complete"
 
@@ -696,7 +696,7 @@ test_explicit_paths() {
     mkdir -p "$paths_backup"
 
     local output
-    output=$(../migr backup "$paths_backup" "$HOME/Documents")
+    output=$(../migr backup "$paths_backup" "$HOME/Documents" 2>&1)
 
     assert_contains "$output" "Backup complete"
 
@@ -741,7 +741,7 @@ test_explicit_paths() {
     echo A > "$HOME/dir_a/same.txt"
     echo B > "$HOME/dir_b/same.txt"
 
-    output=$(../migr backup "$trailing_backup" "$HOME/dir_a/same.txt" "$HOME/dir_b/")
+    output=$(../migr backup "$trailing_backup" "$HOME/dir_a/same.txt" "$HOME/dir_b/" 2>&1)
     assert_contains "$output" "Backup complete"
 
     local trailing_actual
@@ -759,7 +759,7 @@ test_explicit_paths() {
     # because a flat layout could not represent it, now two separate roots.
     local samename_backup="$TEST_DIR/backup_paths_samename"
     mkdir -p "$samename_backup"
-    output=$(../migr backup "$samename_backup" "$HOME/dir_a/same.txt" "$HOME/dir_b/same.txt")
+    output=$(../migr backup "$samename_backup" "$HOME/dir_a/same.txt" "$HOME/dir_b/same.txt" 2>&1)
     assert_contains "$output" "Backup complete"
 
     local samename_actual
@@ -1087,14 +1087,14 @@ ROOT ID=EXPLICIT_1 POLICY=MANUAL_NATIVE PAYLOAD=EXPLICIT_1 SOURCE=/mnt/external/
 EOF
 
     local dry_out
-    dry_out=$(env HOME="$v1_home" ../migr restore "$v1_src" --dry-run)
+    dry_out=$(env HOME="$v1_home" ../migr restore "$v1_src" --dry-run 2>&1)
     assert_contains "$dry_out" "Roots"
     assert_contains "$dry_out" "Would restore: EXPLICIT_0 -> ~/Documents/project"
     assert_contains "$dry_out" "Manual Roots"
     assert_contains "$dry_out" "/mnt/external/project"
 
     local live_out
-    live_out=$(printf 'y\n' | env HOME="$v1_home" ../migr restore "$v1_src")
+    live_out=$(printf 'y\n' | env HOME="$v1_home" ../migr restore "$v1_src" 2>&1)
     assert_contains "$live_out" "Restore complete"
     assert_file_exists "$v1_home/Documents/project/note.txt"
     if [ "$(cat "$v1_home/Documents/project/note.txt")" = "project-note" ]; then

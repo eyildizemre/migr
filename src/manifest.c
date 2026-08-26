@@ -19,6 +19,9 @@
 /* this reader exists so backups taken by earlier versions stay restorable.  */
 /* ========================================================================= */
 
+// Deliberately independent from xdg_keys[] in xdg.c, even though the two
+// currently match. This table is frozen to the key set legacy manifests were
+// written with; if the live XDG table changes, this one must not follow it.
 const char * const legacy_manifest_keys[LEGACY_MANIFEST_XDG_COUNT] = {
     "XDG_DOCUMENTS_DIR", "XDG_DOWNLOAD_DIR", "XDG_PICTURES_DIR",
     "XDG_DESKTOP_DIR",   "XDG_VIDEOS_DIR",   "XDG_MUSIC_DIR"

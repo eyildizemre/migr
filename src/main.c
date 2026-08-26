@@ -61,7 +61,7 @@ static int parse_report_depth(const char *argument, ReportDepth *depth)
 int main(int argc, char *argv[])
 {
     raise_fd_limit();
-    color_enabled = isatty(fileno(stdout));
+    color_enabled = isatty(fileno(stderr));
 
     ReportDepth depth = { REPORT_DEPTH_DEFAULT, 0 };
 
@@ -214,7 +214,7 @@ int main(int argc, char *argv[])
         case ACTION_BACKUP:
             if (path == NULL)
             {
-                printf("Usage: ./migr backup <PATH> [--critical | --comprehensive | <PATH...>]\n");
+                print_error("Usage: ./migr backup <PATH> [--critical | --comprehensive | <PATH...>]\n");
                 ret = 1;
                 break;
             }
@@ -223,7 +223,7 @@ int main(int argc, char *argv[])
         case ACTION_PACKAGES:
             if (path == NULL)
             {
-                printf("Usage: ./migr packages <FILE>\n");
+                print_error("Usage: ./migr packages <FILE>\n");
                 ret = 1;
                 break;
             }
@@ -238,7 +238,7 @@ int main(int argc, char *argv[])
         case ACTION_RESTORE:
             if (path == NULL)
             {
-                printf("Usage: ./migr restore <SOURCE>\n");
+                print_error("Usage: ./migr restore <SOURCE>\n");
                 ret = 1;
                 break;
             }

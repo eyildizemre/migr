@@ -1111,10 +1111,13 @@ static int run_backup_capturing(const char *target, BackupMode mode, char *const
     if (pid == 0)
     {
         close(pipefd[0]);
-        dup2(pipefd[1], STDOUT_FILENO);
+        if (dup2(pipefd[1], STDOUT_FILENO) < 0 ||
+            dup2(pipefd[1], STDERR_FILENO) < 0)
+            _exit(2);
         close(pipefd[1]);
         int rc = backup(target, mode, (char **)paths);
         fflush(stdout);
+        fflush(stderr);
         _exit(rc == 0 ? 0 : 1);
     }
 
@@ -1303,6 +1306,45 @@ static void test_allocation_aware_estimate(void)
     check(had_error == 0 && total == 15,
           "block size one disables rounding but keeps hardlink deduplication");
     backup_plan_free(&plan);
+
+    char dense_dir[PATH_MAX], dense_seed[PATH_MAX];
+    join_path(dense_dir, sizeof(dense_dir), home, "dense-hardlinks");
+    if (mkdir(dense_dir, 0755) != 0)
+    {
+        printf(RED "fixture: could not create %s" NC "\n", dense_dir);
+        exit(1);
+    }
+    join_path(dense_seed, sizeof(dense_seed), dense_dir, "seed");
+    write_large_file(dense_seed, 11);
+    enum { DENSE_HARDLINK_COUNT = 40 };
+    for (int index = 0; index < DENSE_HARDLINK_COUNT; index++)
+    {
+        char name[32], link_path[PATH_MAX];
+        snprintf(name, sizeof(name), "link-%02d", index);
+        join_path(link_path, sizeof(link_path), dense_dir, name);
+        if (link(dense_seed, link_path) != 0)
+        {
+            printf(RED "fixture: could not create dense hardlink %s" NC "\n",
+                   link_path);
+            exit(1);
+        }
+    }
+
+    char *dense_paths[] = { dense_dir, NULL };
+    BackupPlan dense_plan;
+    check(backup_plan_build(home, BACKUP_EXPLICIT_PATHS,
+                            (const char *const *)dense_paths,
+                            &dense_plan) == 0,
+          "the dense hardlink estimate fixture builds");
+    struct stat dense_dir_st, dense_seed_st;
+    check(lstat(dense_dir, &dense_dir_st) == 0 &&
+              lstat(dense_seed, &dense_seed_st) == 0,
+          "the dense hardlink fixture can be measured");
+    backup_plan_estimate_size(&dense_plan, 0, &total, &had_error);
+    check(had_error == 0 &&
+              total == dense_dir_st.st_size + dense_seed_st.st_size,
+          "the estimate hash set finds entries across a capacity rehash");
+    backup_plan_free(&dense_plan);
 
     off_t injected_block_size = 4;
     backup_test_set_block_size_hook(set_test_block_size, &injected_block_size);

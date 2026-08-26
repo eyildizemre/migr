@@ -9,6 +9,7 @@
 #include <stdint.h>
 
 #include "backup_plan.h"
+#include "hash.h"
 #include "utils.h" /* path_join, path_join_n */
 #include "xdg.h"
 
@@ -617,26 +618,136 @@ typedef struct {
 typedef struct {
     EstimateInode *items;
     size_t count;
+    size_t items_capacity;
+    size_t *slots;
     size_t capacity;
 } EstimateSeen;
+
+static uint64_t estimate_inode_hash(dev_t dev, ino_t ino)
+{
+    uint64_t hash = HASH_FNV1A_OFFSET_BASIS;
+    hash = hash_fnv1a_uint64(hash, (uint64_t)dev);
+    return hash_fnv1a_uint64(hash, (uint64_t)ino);
+}
+
+static int estimate_seen_rehash(EstimateSeen *seen, size_t new_capacity)
+{
+    if (seen == NULL || new_capacity < 16U ||
+        (new_capacity & (new_capacity - 1U)) != 0 ||
+        new_capacity > SIZE_MAX / sizeof(*seen->slots))
+        return -1;
+
+    size_t *slots = calloc(new_capacity, sizeof(*slots));
+    if (slots == NULL)
+        return -1;
+
+    for (size_t item_index = 0; item_index < seen->count; item_index++)
+    {
+        uint64_t hash = estimate_inode_hash(seen->items[item_index].dev,
+                                            seen->items[item_index].ino);
+        size_t index = (size_t)hash & (new_capacity - 1U);
+        while (slots[index] != 0)
+            index = (index + 1U) & (new_capacity - 1U);
+        slots[index] = item_index + 1U;
+    }
+
+    free(seen->slots);
+    seen->slots = slots;
+    seen->capacity = new_capacity;
+    return 0;
+}
+
+/* Returns 1 for a match, 0 for an insertion slot, or -1 if the table is full. */
+static int estimate_seen_locate(const EstimateSeen *seen, dev_t dev,
+                                ino_t ino, uint64_t hash, size_t *out_index)
+{
+    if (seen == NULL || out_index == NULL)
+        return -1;
+    if (seen->capacity == 0)
+    {
+        *out_index = SIZE_MAX;
+        return 0;
+    }
+
+    size_t first_stale = SIZE_MAX;
+    size_t index = (size_t)hash & (seen->capacity - 1U);
+    for (size_t probes = 0; probes < seen->capacity; probes++)
+    {
+        size_t value = seen->slots[index];
+        if (value == 0)
+        {
+            *out_index = first_stale == SIZE_MAX ? index : first_stale;
+            return 0;
+        }
+
+        size_t item_index = value - 1U;
+        if (item_index < seen->count)
+        {
+            const EstimateInode *item = &seen->items[item_index];
+            if (item->dev == dev && item->ino == ino)
+            {
+                *out_index = index;
+                return 1;
+            }
+        }
+        else if (first_stale == SIZE_MAX)
+            first_stale = index;
+
+        index = (index + 1U) & (seen->capacity - 1U);
+    }
+
+    *out_index = first_stale;
+    return first_stale == SIZE_MAX ? -1 : 0;
+}
 
 static int estimate_seen_contains(const EstimateSeen *seen, dev_t dev,
                                   ino_t ino)
 {
-    for (size_t i = 0; i < seen->count; i++)
-    {
-        if (seen->items[i].dev == dev && seen->items[i].ino == ino)
-            return 1;
-    }
-    return 0;
+    if (seen == NULL || seen->capacity == 0)
+        return 0;
+
+    size_t index = SIZE_MAX;
+    return estimate_seen_locate(seen, dev, ino,
+                                estimate_inode_hash(dev, ino), &index) == 1;
 }
 
 static int estimate_seen_add(EstimateSeen *seen, dev_t dev, ino_t ino)
 {
-    if (seen->count == seen->capacity)
+    if (seen == NULL)
+        return -1;
+
+    uint64_t hash = estimate_inode_hash(dev, ino);
+    if (seen->capacity == 0 &&
+        estimate_seen_rehash(seen, 16U) != 0)
+        return -1;
+
+    size_t index = SIZE_MAX;
+    int location = estimate_seen_locate(seen, dev, ino, hash, &index);
+    if (location == 1)
+        return 0;
+    if (location < 0)
+        return -1;
+
+    if (seen->count == SIZE_MAX)
     {
-        size_t new_capacity = seen->capacity == 0 ? 16 : seen->capacity * 2;
-        if (new_capacity < seen->capacity ||
+        errno = EOVERFLOW;
+        return -1;
+    }
+    if (seen->count + 1U > seen->capacity / 2U)
+    {
+        if (seen->capacity > SIZE_MAX / 2U ||
+            estimate_seen_rehash(seen, seen->capacity * 2U) != 0)
+            return -1;
+        location = estimate_seen_locate(seen, dev, ino, hash, &index);
+        if (location != 0)
+            return -1;
+    }
+
+    if (seen->count == seen->items_capacity)
+    {
+        size_t new_capacity = seen->items_capacity == 0
+            ? 16U : seen->items_capacity * 2U;
+        if (new_capacity < seen->items_capacity ||
             new_capacity > SIZE_MAX / sizeof(*seen->items))
         {
             errno = EOVERFLOW;
@@ -648,10 +759,12 @@ static int estimate_seen_add(EstimateSeen *seen, dev_t dev, ino_t ino)
         if (items == NULL)
             return -1;
         seen->items = items;
-        seen->capacity = new_capacity;
+        seen->items_capacity = new_capacity;
     }
 
-    seen->items[seen->count++] = (EstimateInode){ .dev = dev, .ino = ino };
+    seen->items[seen->count] = (EstimateInode){ .dev = dev, .ino = ino };
+    seen->slots[index] = seen->count + 1U;
+    seen->count++;
     return 0;
 }
 
@@ -660,6 +773,7 @@ static void estimate_seen_free(EstimateSeen *seen)
     if (seen == NULL)
         return;
     free(seen->items);
+    free(seen->slots);
     *seen = (EstimateSeen){0};
 }
 
