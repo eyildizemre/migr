@@ -2480,14 +2480,26 @@ static const PortableClaimedPath *portable_claimed_paths_owner(
                : NULL;
 }
 
-static int relative_path_is_same_or_descendant(const char *path,
-                                               const char *prefix)
+int relative_path_prefix_match(const char *prefix, const char *path,
+                               const char **relative_out)
 {
-    if (path == NULL || prefix == NULL)
+    if (prefix == NULL || path == NULL)
         return 0;
     size_t prefix_length = strlen(prefix);
-    return strncmp(path, prefix, prefix_length) == 0 &&
-           (path[prefix_length] == '\0' || path[prefix_length] == '/');
+    if (strcmp(prefix, path) == 0)
+    {
+        if (relative_out != NULL)
+            *relative_out = path + prefix_length;
+        return 1;
+    }
+    if (strncmp(prefix, path, prefix_length) == 0 &&
+        path[prefix_length] == '/')
+    {
+        if (relative_out != NULL)
+            *relative_out = path + prefix_length + 1U;
+        return 1;
+    }
+    return 0;
 }
 
 static int stale_keys_append(StaleKeys *keys, SidecarBytes logical,
@@ -3446,11 +3458,11 @@ static int prepare_collision_relocations(PortableCaptureContext *context,
                 relocation_scan_count();
                 PortableOwnedPath *candidate = &owned->items[index];
                 if (strcmp(candidate->root_id, root->id) != 0 ||
-                    !relative_path_is_same_or_descendant(
-                        candidate->logical_path, planned->logical_path))
+                    !relative_path_prefix_match(
+                        planned->logical_path, candidate->logical_path, NULL))
                     continue;
-                if (!relative_path_is_same_or_descendant(
-                        candidate->physical_path, old_physical) ||
+                if (!relative_path_prefix_match(
+                        old_physical, candidate->physical_path, NULL) ||
                     !safe_relative_path(candidate->physical_path)) {
                     free(old_physical);
                     return -1;
@@ -3473,8 +3485,8 @@ static int prepare_collision_relocations(PortableCaptureContext *context,
                 relocation_scan_count();
                 PortableOwnedPath *candidate = &owned->items[index];
                 if (strcmp(candidate->root_id, root->id) == 0 &&
-                    relative_path_is_same_or_descendant(
-                        candidate->logical_path, planned->logical_path)) {
+                    relative_path_prefix_match(
+                        planned->logical_path, candidate->logical_path, NULL)) {
                     selected[index] = 1;
                     if (tombstone_if_live(context, root->id,
                                           candidate->logical_path) != 0) {
@@ -3529,11 +3541,11 @@ static int prepare_collision_relocations(PortableCaptureContext *context,
                 relocation_scan_count();
                 PortableOwnedPath *candidate = &owned->items[index];
                 if (strcmp(candidate->root_id, root->id) != 0 ||
-                    !relative_path_is_same_or_descendant(
-                        candidate->logical_path, planned->logical_path))
+                    !relative_path_prefix_match(
+                        planned->logical_path, candidate->logical_path, NULL))
                     continue;
-                if (!relative_path_is_same_or_descendant(
-                        candidate->physical_path, old_physical) ||
+                if (!relative_path_prefix_match(
+                        old_physical, candidate->physical_path, NULL) ||
                     !safe_relative_path(candidate->physical_path)) {
                     free(old_physical);
                     return -1;
@@ -3544,11 +3556,11 @@ static int prepare_collision_relocations(PortableCaptureContext *context,
                 relocation_scan_count();
                 PortableClaimedPath *candidate = &claimed->items[index];
                 if (strcmp(candidate->root_id, root->id) != 0 ||
-                    !relative_path_is_same_or_descendant(
-                        candidate->logical_path, planned->logical_path))
+                    !relative_path_prefix_match(
+                        planned->logical_path, candidate->logical_path, NULL))
                     continue;
-                if (!relative_path_is_same_or_descendant(
-                        candidate->physical_path, old_physical) ||
+                if (!relative_path_prefix_match(
+                        old_physical, candidate->physical_path, NULL) ||
                     !safe_relative_path(candidate->physical_path)) {
                     free(old_physical);
                     return -1;
@@ -3577,8 +3589,8 @@ static int prepare_collision_relocations(PortableCaptureContext *context,
                 relocation_scan_count();
                 PortableOwnedPath *candidate = &owned->items[index];
                 if (strcmp(candidate->root_id, root->id) == 0 &&
-                    relative_path_is_same_or_descendant(
-                        candidate->logical_path, planned->logical_path)) {
+                    relative_path_prefix_match(
+                        planned->logical_path, candidate->logical_path, NULL)) {
                     selected_owned[index] = 1;
                     if (tombstone_if_live(context, root->id,
                                           candidate->logical_path) != 0) {
@@ -3593,8 +3605,8 @@ static int prepare_collision_relocations(PortableCaptureContext *context,
                 relocation_scan_count();
                 PortableClaimedPath *candidate = &claimed->items[index];
                 if (strcmp(candidate->root_id, root->id) == 0 &&
-                    relative_path_is_same_or_descendant(
-                        candidate->logical_path, planned->logical_path))
+                    relative_path_prefix_match(
+                        planned->logical_path, candidate->logical_path, NULL))
                     selected_claimed[index] = 1;
             }
 

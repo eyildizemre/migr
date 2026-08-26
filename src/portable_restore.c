@@ -1485,24 +1485,6 @@ static size_t root_order_lower_bound(const Collection *collection,
     return left;
 }
 
-static int root_path_prefix(const char *root_path, const char *path,
-                            const char **relative_out)
-{
-    size_t root_length = strlen(root_path);
-    if (strcmp(root_path, path) == 0)
-    {
-        *relative_out = path + root_length;
-        return 1;
-    }
-    if (strncmp(root_path, path, root_length) == 0 &&
-        path[root_length] == '/')
-    {
-        *relative_out = path + root_length + 1U;
-        return 1;
-    }
-    return 0;
-}
-
 static size_t root_for_payload_path(const Collection *collection,
                                     const char *path,
                                     const char **relative_out)
@@ -1516,7 +1498,7 @@ static size_t root_for_payload_path(const Collection *collection,
     {
         const ManifestRoot *root = &collection->manifest->roots[
             collection->root_order[position]];
-        root_path_prefix(root->payload_path, path, relative_out);
+        relative_path_prefix_match(root->payload_path, path, relative_out);
         return collection->root_order[position];
     }
     if (position == 0)
@@ -1524,7 +1506,7 @@ static size_t root_for_payload_path(const Collection *collection,
     position--;
     const ManifestRoot *root = &collection->manifest->roots[
         collection->root_order[position]];
-    if (root_path_prefix(root->payload_path, path, relative_out))
+    if (relative_path_prefix_match(root->payload_path, path, relative_out))
         return collection->root_order[position];
     return SIZE_MAX;
 }

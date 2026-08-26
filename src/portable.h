@@ -22,6 +22,10 @@ int collect_symlink_xattrs(const char *path, PortableXattrs *out);
 /** Reports whether the relative paths are equal or one contains the other. */
 int relative_paths_overlap(const char *left, const char *right);
 
+/** Reports whether path equals or descends from prefix; suffix output is optional. */
+int relative_path_prefix_match(const char *prefix, const char *path,
+                               const char **relative_out);
+
 /**
  * A source root and its container address for a portable capture.
  *
