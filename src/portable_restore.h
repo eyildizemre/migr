@@ -5,6 +5,7 @@
 #include <limits.h>
 #include <sys/types.h>
 
+#include "fileops.h"
 #include "manifest.h"
 #include "metadata.h"
 #include "xdg.h"
@@ -18,6 +19,8 @@ typedef struct {
     const char *destination_xdg_dirs[XDG_KEY_COUNT];
     /* Measured policy for the destination filesystem. */
     MetadataTimestampPolicy destination_timestamp_policy;
+    /* Borrowed byte/progress/sync state for a live replay; NULL disables it. */
+    BackupCaptureReport *capture_report;
 } PortableRestoreRequest;
 
 typedef enum {

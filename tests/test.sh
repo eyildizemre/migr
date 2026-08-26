@@ -1822,6 +1822,7 @@ test_portable_vfat_dispatch() {
     mkdir -p "$HOME"
     output=$(printf 'y\n' | ../migr restore "$actual_backup" -v 2>&1)
     assert_contains "$output" "Restore complete"
+    assert_not_contains "$output" "Restored:"
     local restore_verbose_count
     restore_verbose_count=$(grep -F -c "  Restoring: XDG_DOCUMENTS_DIR" <<<"$output" || true)
     if [ "$restore_verbose_count" -eq 1 ]; then
@@ -1836,6 +1837,30 @@ test_portable_vfat_dispatch() {
         echo -e "  ${GREEN}✓${NC} Restored VFAT fixture content matches byte-for-byte."
     else
         echo -e "  ${RED}✗${NC} Restored VFAT fixture content does not match."
+        exit 1
+    fi
+
+    if ! command -v socat >/dev/null 2>&1; then
+        echo -e "  ${BLUE}↷${NC} skipped: 'socat' is not available for the portable TTY check."
+        return
+    fi
+
+    local portable_progress_home="$TEST_DIR/portable_progress_home"
+    mkdir -p "$portable_progress_home"
+    local portable_pty_output portable_pty_rc
+    set +e
+    portable_pty_output=$(printf 'y\n' | socat - \
+        "EXEC:env HOME=$portable_progress_home ../migr restore $actual_backup -v,pty,setsid,ctty,echo=0" \
+        2>&1)
+    portable_pty_rc=$?
+    set -e
+    if [ "$portable_pty_rc" -eq 0 ] &&
+       [[ "$portable_pty_output" == *"Restored:"* ]] &&
+       [ -f "$portable_progress_home/Documents/note.txt" ]; then
+        echo -e "  ${GREEN}✓${NC} Portable restore shows progress on a real TTY."
+    else
+        echo -e "  ${RED}✗${NC} Portable restore did not produce TTY progress"
+        echo "  exit=$portable_pty_rc output: $portable_pty_output"
         exit 1
     fi
 }

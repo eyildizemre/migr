@@ -196,7 +196,7 @@ $(TEST_PORTABLE_RESTORE_PREFLIGHT): tests/test_portable_restore_preflight.c port
 	$(CC) $(CFLAGS) -DMETADATA_TEST_HOOKS -o $@ tests/test_portable_restore_preflight.c portable_restore_test.o fsprobe.o sidecar.o sidecar_state.o hash.o manifest.o encoding.o metadata_test.o utils.o xdg.o
 
 $(TEST_PORTABLE_RESTORE_REPLAY): tests/test_portable_restore_replay.c portable_restore_test.o fsprobe.o sidecar.o sidecar_state.o hash.o manifest.o encoding.o metadata.o utils.o xdg.o
-	$(CC) $(CFLAGS) -o $@ tests/test_portable_restore_replay.c portable_restore_test.o fsprobe.o sidecar.o sidecar_state.o hash.o manifest.o encoding.o metadata.o utils.o xdg.o
+	$(CC) $(CFLAGS) -Wl,--wrap=syncfs -o $@ tests/test_portable_restore_replay.c portable_restore_test.o fsprobe.o sidecar.o sidecar_state.o hash.o manifest.o encoding.o metadata.o utils.o xdg.o
 
 $(TEST_PORTABLE_RESTORE_ORCHESTRATE): tests/test_portable_restore_orchestrate.c portable_restore_test.o fsprobe.o sidecar.o sidecar_state.o hash.o manifest.o encoding.o metadata_test.o utils.o xdg.o
 	$(CC) $(CFLAGS) -DMETADATA_TEST_HOOKS -o $@ tests/test_portable_restore_orchestrate.c portable_restore_test.o fsprobe.o sidecar.o sidecar_state.o hash.o manifest.o encoding.o metadata_test.o utils.o xdg.o

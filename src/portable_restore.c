@@ -118,6 +118,7 @@ typedef struct {
     const char * const *destination_xdg_dirs;
     MetadataTimestampPolicy timestamp_policy;
     PortableRestoreReplayReport *report;
+    BackupCaptureReport *capture_report;
     MetadataXattrRequirements xattr_requirements;
 } ReplayCollection;
 
@@ -2666,7 +2667,8 @@ static int replay_open_destination_regular(int parent_fd, const char *leaf,
 }
 
 static int replay_copy_regular(int source_fd, int destination_fd,
-                               uint64_t expected_size)
+                               uint64_t expected_size,
+                               BackupCaptureReport *capture_report)
 {
     if (source_fd < 0 || destination_fd < 0)
     {
@@ -2702,6 +2704,21 @@ static int replay_copy_regular(int source_fd, int destination_fd,
             if (written <= 0)
                 return -1;
             offset += (size_t)written;
+        }
+        if (capture_report != NULL)
+        {
+            capture_report->bytes_copied += received;
+            if (capture_report->progress_cb != NULL &&
+                backup_progress_should_fire(
+                    &capture_report->progress_last_fired,
+                    capture_report->progress_unthrottled))
+                capture_report->progress_cb(capture_report->bytes_copied,
+                                            capture_report->progress_userdata);
+            if (capture_report->sync_interval_bytes > 0 &&
+                backup_sync_due(&capture_report->bytes_since_sync, received,
+                                capture_report->sync_interval_bytes) &&
+                syncfs(destination_fd) != 0)
+                return -1;
         }
     }
     if (copied != expected_size)
@@ -2804,7 +2821,8 @@ static int replay_apply_regular(ReplayCollection *collection,
         result = replay_open_destination_regular(parent_fd, leaf,
                                                  &destination_fd);
     if (result == 0)
-        result = replay_copy_regular(source_fd, destination_fd, entry->size);
+        result = replay_copy_regular(source_fd, destination_fd, entry->size,
+                                     collection->capture_report);
     if (result == 0)
     {
         struct stat source_after;
@@ -3248,7 +3266,8 @@ int portable_restore_replay_at(const PortableRestoreRequest *request,
         .destination_home_fd = request->destination_home_fd,
         .destination_xdg_dirs = request->destination_xdg_dirs,
         .timestamp_policy = timestamp_policy,
-        .report = report
+        .report = report,
+        .capture_report = request->capture_report
     };
     if (root_map_build(&collection.root_map, request->manifest) != 0)
         goto fail;

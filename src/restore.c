@@ -1527,6 +1527,16 @@ int restore(const char *source)
         };
         for (int index = 0; index < XDG_RESTORE_COUNT; index++)
             request.destination_xdg_dirs[index] = xdg_dirs[index];
+        BackupCaptureReport capture_report;
+        backup_capture_report_init(&capture_report);
+        capture_report.sync_interval_bytes = BACKUP_SYNC_INTERVAL_BYTES;
+        RestoreProgressDisplay progress_display = {0};
+        if (!dry_run && isatty(fileno(stdout)))
+        {
+            capture_report.progress_cb = restore_report_progress;
+            capture_report.progress_userdata = &progress_display;
+        }
+        request.capture_report = &capture_report;
         PortableRestoreReplayReport report;
         PortableRestoreOutcome outcome =
             portable_restore_orchestrate_at(&request, &report);
@@ -1538,6 +1548,13 @@ int restore(const char *source)
             restore_packages(source_root_fd, home, &had_portable_error);
         }
 
+        if (progress_display.printed_anything)
+        {
+            capture_report.progress_cb(capture_report.bytes_copied,
+                                       capture_report.progress_userdata);
+            putchar('\n');
+            fflush(stdout);
+        }
         printf("\n");
         switch (outcome)
         {

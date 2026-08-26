@@ -33,6 +33,21 @@ extern int replay_hardlink_identity_matches(const struct stat *linked,
 #define NC    "\033[0m"
 
 static int failures;
+static int sync_calls;
+static int sync_should_fail;
+
+extern int __real_syncfs(int fd);
+
+int __wrap_syncfs(int fd)
+{
+    sync_calls++;
+    if (sync_should_fail)
+    {
+        errno = EIO;
+        return -1;
+    }
+    return __real_syncfs(fd);
+}
 
 static void check(int condition, const char *label)
 {
@@ -386,7 +401,18 @@ static int run_preflight(Fixture *fixture)
     return result;
 }
 
+static int run_replay_with_capture(
+    Fixture *fixture, PortableRestoreReplayReport *report,
+    BackupCaptureReport *capture_report);
+
 static int run_replay(Fixture *fixture, PortableRestoreReplayReport *report)
+{
+    return run_replay_with_capture(fixture, report, NULL);
+}
+
+static int run_replay_with_capture(
+    Fixture *fixture, PortableRestoreReplayReport *report,
+    BackupCaptureReport *capture_report)
 {
     Manifest manifest;
     if (manifest_read_v1_at(fixture->container_fd, &manifest) !=
@@ -399,7 +425,8 @@ static int run_replay(Fixture *fixture, PortableRestoreReplayReport *report)
         .destination_timestamp_policy = {
             .nsec_exact = 1,
             .configured = 1
-        }
+        },
+        .capture_report = capture_report
     };
     portable_restore_replay_report_init(report);
     int result = portable_restore_replay_at(&request, report);
@@ -851,6 +878,91 @@ static void test_normal_replay(void)
     fixture_close(&fixture);
 }
 
+static void reset_sync(int should_fail)
+{
+    sync_calls = 0;
+    sync_should_fail = should_fail;
+}
+
+static void test_capture_report_sync_accumulates(void)
+{
+    printf(BLUE "::" NC " portable restore report accumulates bytes and syncs across files\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "portable sync fixture is created");
+    if (opened != 0)
+        return;
+
+    make_dir_at(fixture.data_fd, "ROOT", 0700);
+    char payload[81];
+    memset(payload, 'p', sizeof(payload) - 1U);
+    payload[sizeof(payload) - 1U] = '\0';
+    write_file_at(fixture.data_fd, "ROOT/one", payload);
+    write_file_at(fixture.data_fd, "ROOT/two", payload);
+    write_file_at(fixture.data_fd, "ROOT/three", payload);
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000500, 1, 1700000501, 2),
+        entry_for("ROOT", "one", "one", SIDECAR_KIND_REGULAR, 80, 0600,
+                  1700000502, 3, 1700000503, 4),
+        entry_for("ROOT", "two", "two", SIDECAR_KIND_REGULAR, 80, 0600,
+                  1700000504, 5, 1700000505, 6),
+        entry_for("ROOT", "three", "three", SIDECAR_KIND_REGULAR, 80, 0600,
+                  1700000506, 7, 1700000507, 8)
+    };
+    check(write_sidecar(&fixture, entries, 4, NULL, NULL) == 0,
+          "portable sync sidecar is committed");
+
+    BackupCaptureReport capture_report = {0};
+    capture_report.sync_interval_bytes = 200;
+    PortableRestoreReplayReport report;
+    reset_sync(0);
+    int result = run_replay_with_capture(&fixture, &report, &capture_report);
+    check(result == 0 && report.live_count == 4 &&
+              report.applied_count == 4 && report.failed_count == 0 &&
+              capture_report.bytes_copied == 240 &&
+              capture_report.bytes_since_sync == 0 && sync_calls == 1,
+          "portable restore report accumulates across smaller files and syncs once");
+    fixture_close(&fixture);
+}
+
+static void test_capture_report_sync_failure(void)
+{
+    printf(BLUE "::" NC " portable restore aborts when periodic sync fails\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "portable sync-failure fixture is created");
+    if (opened != 0)
+        return;
+
+    make_dir_at(fixture.data_fd, "ROOT", 0700);
+    char payload[81];
+    memset(payload, 'f', sizeof(payload) - 1U);
+    payload[sizeof(payload) - 1U] = '\0';
+    write_file_at(fixture.data_fd, "ROOT/file", payload);
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000510, 1, 1700000511, 2),
+        entry_for("ROOT", "file", "file", SIDECAR_KIND_REGULAR, 80, 0600,
+                  1700000512, 3, 1700000513, 4)
+    };
+    check(write_sidecar(&fixture, entries, 2, NULL, NULL) == 0,
+          "portable sync-failure sidecar is committed");
+
+    BackupCaptureReport capture_report = {0};
+    capture_report.sync_interval_bytes = 1;
+    PortableRestoreReplayReport report;
+    reset_sync(1);
+    int result = run_replay_with_capture(&fixture, &report, &capture_report);
+    check(result != 0 && sync_calls == 1 &&
+              capture_report.bytes_copied == 80 && report.failed_count != 0,
+          "a failed periodic sync aborts portable restore and records failure");
+    reset_sync(0);
+    fixture_close(&fixture);
+}
+
 static void test_outstanding_claim_gate(void)
 {
     printf(BLUE "::" NC " outstanding claims are rejected before replay\n");
@@ -1181,6 +1293,8 @@ int main(void)
     test_physical_logical_mismatch();
     test_collision_suffix_validation();
     test_normal_replay();
+    test_capture_report_sync_accumulates();
+    test_capture_report_sync_failure();
     test_outstanding_claim_gate();
     test_xattr_replay();
     test_xattr_reconciliation();
