@@ -2494,32 +2494,47 @@ static int replay_open_payload(int data_fd, const ManifestRoot *root,
     return 0;
 }
 
-static int replay_ensure_parent_directory(int parent_fd, const char *name,
-                                           int *out_fd)
+static int replay_open_destination_directory(int parent_fd, const char *leaf,
+                                              int *out_fd)
 {
-    if (parent_fd < 0 || name == NULL || !text_component_valid(
-            name, strlen(name)) || out_fd == NULL)
+    if (parent_fd < 0 || leaf == NULL || out_fd == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    if (leaf[0] == '\0')
+    {
+        *out_fd = dup_cloexec(parent_fd);
+        return *out_fd < 0 ? -1 : 0;
+    }
+    if (!text_component_valid(leaf, strlen(leaf)))
     {
         errno = EINVAL;
         return -1;
     }
     struct stat st;
-    if (fstatat(parent_fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0)
+    if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) == 0)
     {
         if (!S_ISDIR(st.st_mode))
         {
             errno = ENOTDIR;
             return -1;
         }
-        *out_fd = openat(parent_fd, name,
-                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-        return *out_fd < 0 ? -1 : 0;
     }
-    if (errno != ENOENT)
+    else if (errno == ENOENT)
+    {
+        if (mkdirat(parent_fd, leaf, 0700) != 0 && errno != EEXIST)
+            return -1;
+        if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) != 0 ||
+            !S_ISDIR(st.st_mode))
+        {
+            errno = ENOTDIR;
+            return -1;
+        }
+    }
+    else
         return -1;
-    if (mkdirat(parent_fd, name, 0700) != 0 && errno != EEXIST)
-        return -1;
-    *out_fd = openat(parent_fd, name,
+    *out_fd = openat(parent_fd, leaf,
                      O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     return *out_fd < 0 ? -1 : 0;
 }
@@ -2568,7 +2583,7 @@ static int replay_open_destination_parent(int home_fd, const char *path,
         }
 
         int next = -1;
-        if (replay_ensure_parent_directory(current, cursor, &next) != 0)
+        if (replay_open_destination_directory(current, cursor, &next) != 0)
         {
             int saved = errno;
             close(current);
@@ -2585,46 +2600,6 @@ static int replay_open_destination_parent(int home_fd, const char *path,
         current = next;
         cursor = slash + 1U;
     }
-}
-
-static int replay_open_destination_directory(int parent_fd, const char *leaf,
-                                              int *out_fd)
-{
-    if (parent_fd < 0 || leaf == NULL || out_fd == NULL)
-    {
-        errno = EINVAL;
-        return -1;
-    }
-    if (leaf[0] == '\0')
-    {
-        *out_fd = dup_cloexec(parent_fd);
-        return *out_fd < 0 ? -1 : 0;
-    }
-    struct stat st;
-    if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) == 0)
-    {
-        if (!S_ISDIR(st.st_mode))
-        {
-            errno = ENOTDIR;
-            return -1;
-        }
-    }
-    else if (errno == ENOENT)
-    {
-        if (mkdirat(parent_fd, leaf, 0700) != 0 && errno != EEXIST)
-            return -1;
-        if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) != 0 ||
-            !S_ISDIR(st.st_mode))
-        {
-            errno = ENOTDIR;
-            return -1;
-        }
-    }
-    else
-        return -1;
-    *out_fd = openat(parent_fd, leaf,
-                     O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-    return *out_fd < 0 ? -1 : 0;
 }
 
 static int replay_open_destination_regular(int parent_fd, const char *leaf,
