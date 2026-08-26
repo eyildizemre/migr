@@ -6118,7 +6118,7 @@ static int prescan_directory(int source_fd, const char *logical,
     return failed ? -1 : 0;
 }
 
-static int relative_paths_overlap(const char *left, const char *right)
+int relative_paths_overlap(const char *left, const char *right)
 {
     size_t left_length = strlen(left);
     size_t right_length = strlen(right);

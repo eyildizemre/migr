@@ -18,6 +18,7 @@
 #include "encoding.h"
 #include "fsprobe.h"
 #include "hash.h"
+#include "portable.h"
 #include "sidecar.h"
 #include "utils.h"
 
@@ -694,24 +695,6 @@ static int root_order_compare(const void *left, const void *right)
                   root_order_manifest->roots[b].payload_path);
 }
 
-static int payload_paths_disjoint(const Manifest *manifest, size_t left,
-                                  size_t right)
-{
-    const char *a = manifest->roots[left].payload_path;
-    const char *b = manifest->roots[right].payload_path;
-    size_t a_length = strlen(a);
-    size_t b_length = strlen(b);
-    if (a_length == b_length && strcmp(a, b) == 0)
-        return 0;
-    if (a_length < b_length && strncmp(a, b, a_length) == 0 &&
-        b[a_length] == '/')
-        return 0;
-    if (b_length < a_length && strncmp(b, a, b_length) == 0 &&
-        a[b_length] == '/')
-        return 0;
-    return 1;
-}
-
 static int collection_validate_manifest(Collection *collection)
 {
     const Manifest *manifest = collection->manifest;
@@ -780,9 +763,9 @@ static int collection_validate_manifest(Collection *collection)
               sizeof(*collection->root_order), root_order_compare);
         root_order_manifest = NULL;
         for (size_t index = 1; index < report->root_count; index++)
-            if (!payload_paths_disjoint(manifest,
-                                        collection->root_order[index - 1U],
-                                        collection->root_order[index]))
+            if (relative_paths_overlap(
+                    manifest->roots[collection->root_order[index - 1U]].payload_path,
+                    manifest->roots[collection->root_order[index]].payload_path))
                 report_violation(report,
                                  collection->root_order[index],
                                  manifest->roots[collection->root_order[index]].id);

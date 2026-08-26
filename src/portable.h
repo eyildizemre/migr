@@ -19,6 +19,9 @@ void xattrs_free(PortableXattrs *xattrs);
 int collect_xattrs(int fd, PortableXattrs *out);
 int collect_symlink_xattrs(const char *path, PortableXattrs *out);
 
+/** Reports whether the relative paths are equal or one contains the other. */
+int relative_paths_overlap(const char *left, const char *right);
+
 /**
  * A source root and its container address for a portable capture.
  *

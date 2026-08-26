@@ -1128,6 +1128,51 @@ static void test_raw_nul_and_root_gap(void)
     }
 }
 
+static void test_overlapping_manifest_roots(void)
+{
+    printf(BLUE "::" NC " overlapping manifest root payloads\n");
+    ManifestRoot roots[2] = {
+        root_for("PARENT", "shared", "restored-parent"),
+        root_for("CHILD", "shared/nested", "restored-child")
+    };
+    Fixture fixture;
+    int opened = fixture_open(&fixture, "root-overlap", roots, 2);
+    check(opened == 0, "root-overlap fixture is created");
+    if (opened != 0)
+        return;
+
+    if (mkdirat(fixture.data_fd, "shared", 0700) != 0)
+        fatal("could not create overlapping root payload");
+    int shared_fd = openat(fixture.data_fd, "shared",
+                           O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (shared_fd < 0 || mkdirat(shared_fd, "nested", 0700) != 0)
+    {
+        if (shared_fd >= 0)
+            close(shared_fd);
+        fatal("could not create nested overlapping root payload");
+    }
+    if (close(shared_fd) != 0)
+        fatal("could not close overlapping root payload");
+
+    SidecarEntry entries[] = {
+        entry_for("PARENT", "", "", SIDECAR_KIND_DIRECTORY, 0),
+        entry_for("CHILD", "", "", SIDECAR_KIND_DIRECTORY, 0)
+    };
+    check(write_sidecar(&fixture, entries, 2) == 0,
+          "root-overlap sidecar is committed");
+    write_file_at(fixture.home_fd, "sentinel", "untouched");
+    char sentinel[PATH_MAX];
+    fixture_path(sentinel, sizeof(sentinel), fixture.home, "/sentinel");
+    PortableRestorePreflightReport report;
+    int result = run_preflight(&fixture, &report);
+    check(result != 0 && report.violation_count == 1 &&
+              report.roots != NULL && report.roots[1].violation_count == 1 &&
+              file_equals(sentinel, "untouched"),
+          "overlapping manifest roots are refused before payload validation");
+    portable_restore_preflight_report_free(&report);
+    fixture_close(&fixture);
+}
+
 int main(void)
 {
     test_valid_and_profiles();
@@ -1140,6 +1185,7 @@ int main(void)
     test_symlink_refusals();
     test_malformed_sidecars();
     test_raw_nul_and_root_gap();
+    test_overlapping_manifest_roots();
     if (failures != 0)
     {
         printf(RED "%d portable restore preflight test(s) failed" NC "\n",
