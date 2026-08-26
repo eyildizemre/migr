@@ -266,6 +266,23 @@ static int native_restore_confirm(size_t security_xattr_entries)
     return confirm_action(message);
 }
 
+typedef struct {
+    int printed_anything;
+} RestoreProgressDisplay;
+
+static void restore_report_progress(off_t bytes_restored, void *userdata)
+{
+    RestoreProgressDisplay *display = userdata;
+    if (display == NULL)
+        return;
+
+    char restored_text[32];
+    format_size(bytes_restored, restored_text, sizeof(restored_text));
+    printf("\rRestored: %s so far\033[K", restored_text);
+    fflush(stdout);
+    display->printed_anything = 1;
+}
+
 // Restores one item whose source and destination relative addresses may
 // differ (e.g. a v1 root's "data/<payload>" source vs. its own restore
 // address), sharing the exact same status/preflight/apply behavior for
@@ -279,7 +296,8 @@ static int restore_item_at(const CloneContext *ctx,
                            int dest_root_fd, const char *dest_rel,
                            const char *label, int source_required,
                            const RestoreTimestampAnchors *timestamp_anchors,
-                           size_t *skipped_security_xattrs)
+                           size_t *skipped_security_xattrs,
+                           BackupCaptureReport *capture_report)
 {
     RestoreSourceStatus status = restore_native_source_status_at(source_root_fd, source_rel);
     if (status == RESTORE_SOURCE_MISSING)
@@ -338,7 +356,8 @@ static int restore_item_at(const CloneContext *ctx,
 
     RestoreNativeReport report;
     RestoreNativeStatus native_status = restore_native_at_report(
-        run_ctx, source_root_fd, source_rel, dest_root_fd, dest_rel, &report);
+        run_ctx, source_root_fd, source_rel, dest_root_fd, dest_rel, &report,
+        capture_report);
     if (skipped_security_xattrs != NULL)
         restore_security_skipped_add(skipped_security_xattrs,
                                      report.skipped_security_xattr_count);
@@ -358,11 +377,12 @@ static int restore_item_at(const CloneContext *ctx,
 static int restore_home_item(const CloneContext *ctx, int source_root_fd,
                              int home_fd, const char *rel_path,
                              const RestoreTimestampAnchors *timestamp_anchors,
-                             size_t *skipped_security_xattrs)
+                             size_t *skipped_security_xattrs,
+                             BackupCaptureReport *capture_report)
 {
     int rc = restore_item_at(ctx, source_root_fd, rel_path, home_fd, rel_path,
                              rel_path, 0, timestamp_anchors,
-                             skipped_security_xattrs);
+                             skipped_security_xattrs, capture_report);
     if (rc > 0 && dry_run)
         printf("  Would restore: %s\n", rel_path);
     return rc;
@@ -431,7 +451,8 @@ static int open_xdg_destination_anchor(const char *path, int *out_fd,
 static int restore_legacy(const char *source, int source_root_fd, const char *home, int home_fd,
                           const CloneContext *ctx, int *count, int *had_error,
                           const RestoreTimestampAnchors *timestamp_anchors,
-                          size_t *skipped_security_xattrs)
+                          size_t *skipped_security_xattrs,
+                          BackupCaptureReport *capture_report)
 {
     printf("Main Directories\n");
     char *xdg_dirs[XDG_RESTORE_COUNT];
@@ -485,7 +506,7 @@ static int restore_legacy(const char *source, int source_root_fd, const char *ho
         int rc = restore_item_at(ctx, source_root_fd, name, xdg_dest_fd,
                                  destination_rel, name, 0,
                                  timestamp_anchors,
-                                 skipped_security_xattrs);
+                                 skipped_security_xattrs, capture_report);
         if (rc > 0 && dry_run)
             printf("  Would restore: %s -> %s/\n", name, xdg_dirs[i]);
         if (rc > 0)
@@ -503,7 +524,8 @@ static int restore_legacy(const char *source, int source_root_fd, const char *ho
 
     // Projects is not a standard XDG directory
     int rc = restore_home_item(ctx, source_root_fd, home_fd, "Projects",
-                               timestamp_anchors, skipped_security_xattrs);
+                               timestamp_anchors, skipped_security_xattrs,
+                               capture_report);
     if (rc > 0)
         (*count)++;
     else if (rc < 0)
@@ -514,7 +536,8 @@ static int restore_legacy(const char *source, int source_root_fd, const char *ho
     for (int i = 0; dotfiles[i] != NULL; i++)
     {
         rc = restore_home_item(ctx, source_root_fd, home_fd, dotfiles[i],
-                               timestamp_anchors, skipped_security_xattrs);
+                               timestamp_anchors, skipped_security_xattrs,
+                               capture_report);
         if (rc > 0)
             (*count)++;
         else if (rc < 0)
@@ -535,7 +558,8 @@ static int restore_legacy(const char *source, int source_root_fd, const char *ho
     for (int i = 0; browser_configs[i] != NULL; i++)
     {
         rc = restore_home_item(ctx, source_root_fd, home_fd, browser_configs[i],
-                               timestamp_anchors, skipped_security_xattrs);
+                               timestamp_anchors, skipped_security_xattrs,
+                               capture_report);
         if (rc > 0)
             (*count)++;
         else if (rc < 0)
@@ -997,7 +1021,8 @@ static void restore_v1(const char *source, int source_root_fd, const char *home,
                        const CloneContext *ctx, const Manifest *m, int *count,
                        int *had_error,
                        const RestoreTimestampAnchors *timestamp_anchors,
-                       size_t *skipped_security_xattrs)
+                       size_t *skipped_security_xattrs,
+                       BackupCaptureReport *capture_report)
 {
     printf("Roots\n");
 
@@ -1024,7 +1049,7 @@ static void restore_v1(const char *source, int source_root_fd, const char *home,
             int rc = restore_item_at(ctx, source_root_fd, source_rel, home_fd,
                                      root->restore_path, root->id, 1,
                                      timestamp_anchors,
-                                     skipped_security_xattrs);
+                                     skipped_security_xattrs, capture_report);
             if (rc > 0 && dry_run)
             {
                 if (root->restore_path[0] != '\0')
@@ -1078,7 +1103,7 @@ static void restore_v1(const char *source, int source_root_fd, const char *home,
         int rc = restore_item_at(ctx, source_root_fd, source_rel, xdg_dest_fd,
                                  destination_rel, root->id, 1,
                                  timestamp_anchors,
-                                 skipped_security_xattrs);
+                                 skipped_security_xattrs, capture_report);
         if (rc > 0 && dry_run)
             printf("  Would restore: %s -> %s/\n", root->id, xdg_dirs[idx]);
         if (rc > 0)
@@ -1561,6 +1586,9 @@ int restore(const char *source)
         .operation = CLONE_RESTORE,
         .representation = CLONE_NATIVE_TREE
     };
+    BackupCaptureReport capture_report;
+    backup_capture_report_init(&capture_report);
+    capture_report.sync_interval_bytes = BACKUP_SYNC_INTERVAL_BYTES;
     MetadataProfiles metadata_profiles;
     metadata_profiles_init(&metadata_profiles);
     RestoreTimestampAnchors timestamp_anchors;
@@ -1682,18 +1710,25 @@ int restore(const char *source)
         }
     }
 
+    RestoreProgressDisplay progress_display = {0};
+    if (!dry_run && isatty(fileno(stdout)))
+    {
+        capture_report.progress_cb = restore_report_progress;
+        capture_report.progress_userdata = &progress_display;
+    }
+
     if (mst == MANIFEST_STATUS_VALID)
     {
         restore_v1(source, source_root_fd, home, home_fd, &ctx, &m, &count,
                    &had_error, &timestamp_anchors,
-                   &skipped_security_xattrs);
+                   &skipped_security_xattrs, &capture_report);
         manifest_free(&m);
     }
     else
     {
         if (restore_legacy(source, source_root_fd, home, home_fd, &ctx,
                            &count, &had_error, &timestamp_anchors,
-                           &skipped_security_xattrs) != 0)
+                           &skipped_security_xattrs, &capture_report) != 0)
         {
             native_inode_map_free(ctx.inode_map);
             ctx.inode_map = NULL;
@@ -1703,6 +1738,14 @@ int restore(const char *source)
             close(source_root_fd);
             return 1;
         }
+    }
+
+    if (progress_display.printed_anything)
+    {
+        capture_report.progress_cb(capture_report.bytes_copied,
+                                   capture_report.progress_userdata);
+        putchar('\n');
+        fflush(stdout);
     }
 
     native_inode_map_free(ctx.inode_map);

@@ -525,6 +525,7 @@ test_restore() {
     output=$(echo "y" | ../migr restore "$actual_backup" 2>&1)
 
     assert_contains "$output" "Restore complete"
+    assert_not_contains "$output" "Restored:"
 
     assert_file_exists "$HOME/Documents/note.txt"
     assert_file_exists "$HOME/.ssh/config"
@@ -1145,6 +1146,48 @@ EOF
     else
         echo -e "  ${RED}✗${NC} Symlinked packages.txt handling diverged"
         echo "  exit=$pkg_live_rc output: $pkg_live_out"
+        exit 1
+    fi
+}
+
+test_native_restore_progress() {
+    echo -e "${BLUE}::${NC} Phase 12a: native restore progress"
+
+    if ! command -v socat >/dev/null 2>&1; then
+        echo -e "  ${BLUE}↷${NC} skipped: 'socat' is not available for the TTY check."
+        return
+    fi
+
+    local progress_src="$TEST_DIR/native_progress_src"
+    local progress_home="$TEST_DIR/native_progress_home"
+    local redirected_home="$TEST_DIR/native_progress_redirected_home"
+    mkdir -p "$progress_src/Documents" "$progress_home" "$redirected_home"
+    printf 'native progress\n' > "$progress_src/Documents/progress.txt"
+
+    local pty_output pty_rc redirected_output
+    set +e
+    pty_output=$(printf 'y\n' | socat - \
+        "EXEC:env HOME=$progress_home ../migr restore $progress_src,pty,setsid,ctty,echo=0" \
+        2>&1)
+    pty_rc=$?
+    set -e
+    if [ "$pty_rc" -eq 0 ] && [[ "$pty_output" == *"Restored:"* ]] &&
+       [ -f "$progress_home/Documents/progress.txt" ]; then
+        echo -e "  ${GREEN}✓${NC} Native restore shows progress on a real TTY."
+    else
+        echo -e "  ${RED}✗${NC} Native restore did not produce TTY progress"
+        echo "  exit=$pty_rc output: $pty_output"
+        exit 1
+    fi
+
+    redirected_output=$(printf 'y\n' | env HOME="$redirected_home" \
+        ../migr restore "$progress_src" 2>&1)
+    if [[ "$redirected_output" != *"Restored:"* ]] &&
+       [ -f "$redirected_home/Documents/progress.txt" ]; then
+        echo -e "  ${GREEN}✓${NC} Native restore suppresses progress when stdout is redirected."
+    else
+        echo -e "  ${RED}✗${NC} Redirected native restore unexpectedly emitted progress"
+        echo "  output: $redirected_output"
         exit 1
     fi
 }
@@ -1812,6 +1855,7 @@ test_errors
 test_truncation
 test_restore_path_safety
 test_v1_restore_dispatch
+test_native_restore_progress
 test_probe_refusal
 test_container_production
 test_portable_vfat_dispatch

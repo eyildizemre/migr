@@ -144,7 +144,7 @@ static void test_apply_refusal(const char *source_root, int source_fd, int dest_
     restore_native_test_set_source_read_mode(RESTORE_TEST_SOURCE_READ_APPLY);
     RestoreNativeReport report;
     RestoreNativeStatus status = restore_native_at_report(
-        &RESTORE_CTX, source_fd, "entry", dest_fd, "entry", &report);
+        &RESTORE_CTX, source_fd, "entry", dest_fd, "entry", &report, NULL);
     restore_native_test_set_source_read_mode(RESTORE_TEST_SOURCE_READ_NONE);
 
     check(status == RESTORE_NATIVE_SOURCE_SAFE_READ,
@@ -270,7 +270,7 @@ static void test_apply_partial_refusal(const char *source_root,
     RestoreNativeReport report;
     RestoreNativeStatus status = restore_native_at_report(
         &RESTORE_CTX, source_fd, "partial-tree", dest_fd, "partial-tree",
-        &report);
+        &report, NULL);
     restore_native_test_set_source_read_mode(RESTORE_TEST_SOURCE_READ_NONE);
 
     check(status == RESTORE_NATIVE_SOURCE_SAFE_READ,

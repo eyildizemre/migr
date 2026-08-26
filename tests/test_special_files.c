@@ -590,10 +590,10 @@ static void test_native_restore_hardlink_interrupt_resume(void)
     RestoreNativeReport representative_report;
     RestoreNativeStatus sibling_status = restore_native_at_report(
         &context, source_fd, "root-b", destination_fd, "root-b",
-        &sibling_report);
+        &sibling_report, NULL);
     RestoreNativeStatus representative_status = restore_native_at_report(
         &context, source_fd, "root-a", destination_fd, "root-a",
-        &representative_report);
+        &representative_report, NULL);
     check(sibling_status == RESTORE_NATIVE_OK &&
               sibling_report.failed_count == 0,
           "native restore resumes the reversed sibling without failure");

@@ -2459,7 +2459,8 @@ static RestoreNativeStatus restore_entry_at(
     MetadataProfiles *profiles, MetadataXattrRequirements *xattr_requirements,
     int metadata_anchor_fd,
     int skip_symlink_target_read,
-    RestoreNativeReport *restore_report)
+    RestoreNativeReport *restore_report,
+    BackupCaptureReport *capture_report)
 {
     int source_is_root = source_leaf[0] == '\0';
     int dest_is_root = dest_leaf[0] == '\0';
@@ -2760,33 +2761,7 @@ static RestoreNativeStatus restore_entry_at(
             return -1;
         }
 
-        char buffer[8192];
-        int failed = 0;
-        for (;;)
-        {
-            ssize_t bytes_read = read(src_fd, buffer, sizeof(buffer));
-            if (bytes_read == 0)
-                break;
-            if (bytes_read < 0)
-            {
-                failed = 1;
-                break;
-            }
-
-            ssize_t written = 0;
-            while (written < bytes_read)
-            {
-                ssize_t res = write(dst_fd, buffer + written, bytes_read - written);
-                if (res <= 0)
-                {
-                    failed = 1;
-                    break;
-                }
-                written += res;
-            }
-            if (failed)
-                break;
-        }
+        int failed = copy_file_contents(src_fd, dst_fd, capture_report) != 0;
 
         PortableXattrs xattrs = {0};
         if (!failed &&
@@ -2925,7 +2900,7 @@ static RestoreNativeStatus restore_entry_at(
                 ctx, pass, source_dir_fd, entry->d_name, dest_dir_fd,
                 entry->d_name, child_logical_path, snapshots, profiles,
                 xattr_requirements, metadata_anchor_fd,
-                skip_symlink_target_read, restore_report);
+                skip_symlink_target_read, restore_report, capture_report);
             if (child_status != RESTORE_NATIVE_OK)
             {
                 failed = 1;
@@ -3131,7 +3106,7 @@ RestoreNativeStatus restore_native_preflight_at(
     int rc = restore_entry_at(ctx, RESTORE_VALIDATE, source_parent_fd,
                               source_leaf, dest_parent_fd, dest_leaf,
                               source_rel, &snapshots, &profiles,
-                              NULL, metadata_anchor_fd, 0, NULL);
+                              NULL, metadata_anchor_fd, 0, NULL, NULL);
     close(metadata_anchor_fd);
     close(source_parent_fd);
     if (dest_parent_fd >= 0)
@@ -3184,7 +3159,7 @@ RestoreNativeStatus restore_native_metadata_inventory_at(
     int rc = restore_entry_at(ctx, RESTORE_VALIDATE, source_parent_fd,
                               source_leaf, dest_parent_fd, dest_leaf,
                               source_rel, &snapshots, profiles,
-                              NULL, metadata_anchor_fd, 1, NULL);
+                              NULL, metadata_anchor_fd, 1, NULL, NULL);
     close(metadata_anchor_fd);
     close(source_parent_fd);
     if (dest_parent_fd >= 0)
@@ -3203,7 +3178,7 @@ static void restore_native_report_init(RestoreNativeReport *report)
 RestoreNativeStatus restore_native_at_report(
     const CloneContext *ctx, int source_root_fd, const char *source_rel,
     int destination_root_fd, const char *destination_rel,
-    RestoreNativeReport *report)
+    RestoreNativeReport *report, BackupCaptureReport *capture_report)
 {
     RestoreNativeReport local_report;
     if (report == NULL)
@@ -3254,7 +3229,7 @@ RestoreNativeStatus restore_native_at_report(
                               source_leaf, dest_parent_fd, dest_leaf,
                               source_rel, &snapshots, &profiles,
                               &xattr_requirements, metadata_anchor_fd, 0,
-                              report);
+                              report, NULL);
     if (rc == 0 && !ctx->metadata_preflight_done &&
         metadata_profiles_probe(&profiles,
                                 metadata_policy_from_context(ctx)) != 0)
@@ -3280,7 +3255,8 @@ RestoreNativeStatus restore_native_at_report(
         rc = restore_entry_at(ctx, RESTORE_APPLY, source_parent_fd,
                               source_leaf, dest_parent_fd, dest_leaf,
                               source_rel, &snapshots, NULL,
-                              NULL, destination_root_fd, 0, report);
+                              NULL, destination_root_fd, 0, report,
+                              capture_report);
     if (rc != RESTORE_NATIVE_OK && report->failed_count == 0)
         restore_report_failure(report, source_rel);
     close(source_parent_fd);
@@ -3297,7 +3273,7 @@ RestoreNativeStatus restore_native_at(
 {
     return restore_native_at_report(ctx, source_root_fd, source_rel,
                                     destination_root_fd, destination_rel,
-                                    NULL);
+                                    NULL, NULL);
 }
 
 int get_dir_size(const char *path, off_t *size)

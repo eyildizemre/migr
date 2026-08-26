@@ -105,7 +105,7 @@ typedef enum {
 typedef void (*BackupProgressCallback)(off_t bytes_copied, void *userdata);
 
 /**
- * @brief State shared by one backup capture across all of its roots.
+ * @brief State shared by one native capture or restore across its roots.
  *
  * bytes_copied and the progress fields describe successful regular-file
  * content bytes only. Hardlinked siblings add no new bytes because they are
@@ -305,6 +305,11 @@ RestoreNativeStatus restore_native_metadata_inventory_at(
  * @param destination_rel     Relative address of the destination object, or "".
  * @param report            Optional per-call replay result; it is reset before
  *                          use and records applied/failed entries.
+ * @param capture_report    Optional caller-owned byte/progress/sync state. The
+ *                          caller must initialize it with
+ *                          backup_capture_report_init() before the first call;
+ *                          it is not reset here, so one instance can span
+ *                          several sequential restore calls.
  * @return RESTORE_NATIVE_OK on success, RESTORE_NATIVE_ERROR on an ordinary
  *         failure, or RESTORE_NATIVE_SOURCE_SAFE_READ when a source open that
  *         requires O_NOATIME is refused. No O_NOATIME-less retry is attempted.
@@ -312,7 +317,7 @@ RestoreNativeStatus restore_native_metadata_inventory_at(
 RestoreNativeStatus restore_native_at_report(
     const CloneContext *ctx, int source_root_fd, const char *source_rel,
     int destination_root_fd, const char *destination_rel,
-    RestoreNativeReport *report);
+    RestoreNativeReport *report, BackupCaptureReport *capture_report);
 
 RestoreNativeStatus restore_native_at(
     const CloneContext *ctx, int source_root_fd, const char *source_rel,

@@ -1270,7 +1270,8 @@ static void test_metadata_xattr_gate_no_unrelated_namespace(void)
     int destination_fd = open_directory(destination_root);
     RestoreNativeReport report;
     RestoreNativeStatus result = restore_native_at_report(
-        &RESTORE_CTX, source_fd, "entry", destination_fd, "entry", &report);
+        &RESTORE_CTX, source_fd, "entry", destination_fd, "entry", &report,
+        NULL);
     check_result(result == RESTORE_NATIVE_OK, case_name,
                  (namespaces & METADATA_XATTR_NS_SECURITY) != 0
                      ? "security-only payload is not refused by the capability gate"
@@ -1459,7 +1460,8 @@ static void test_metadata_xattr_gate_trusted_refusal(void)
     int source_fd = open_directory(source_root);
     RestoreNativeReport report;
     RestoreNativeStatus result = restore_native_at_report(
-        &RESTORE_CTX, source_fd, "entry", destination_fd, "entry", &report);
+        &RESTORE_CTX, source_fd, "entry", destination_fd, "entry", &report,
+        NULL);
     check_result(result != RESTORE_NATIVE_OK, case_name,
                  "unsupported trusted namespace refuses restore");
     check_result(count_entries(destination_root) == before_entries, case_name,
