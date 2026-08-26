@@ -6,15 +6,12 @@
 #include <stdint.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <unistd.h>
 #include <limits.h>
 #include "backup_plan.h"
 #include "report.h"
 #include "detect.h"
 #include "fileops.h"
 #include "utils.h"
-
-extern int verbose;
 
 static int dir_exists(const char *path)
 {

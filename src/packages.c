@@ -12,8 +12,6 @@
 #include "fileops.h"
 #include "utils.h"
 
-extern int verbose;
-
 // Runs the distro's listing command and returns its whole output. Both public
 // entries share this, so the exported format can never differ depending on how
 // the destination was addressed.

@@ -21,8 +21,6 @@
 #include "metadata.h"
 #include "utils.h"
 
-extern int verbose;
-
 typedef struct {
     char *root_id;
     char *logical_path;
@@ -644,11 +642,6 @@ int append_physical(char *destination, size_t destination_size,
     return 0;
 }
 
-static int duplicate_fd(int fd)
-{
-    return fcntl(fd, F_DUPFD_CLOEXEC, 0);
-}
-
 static int open_child_directory(int parent_fd, const char *name)
 {
     return openat(parent_fd, name,
@@ -664,7 +657,7 @@ static int remove_directory_tree(int parent_fd, const char *name)
     if (directory_fd < 0)
         return -1;
 
-    int scan_fd = duplicate_fd(directory_fd);
+    int scan_fd = dup_cloexec(directory_fd);
     DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
     if (directory == NULL) {
         if (scan_fd >= 0)
@@ -719,7 +712,7 @@ static int open_payload_parent(int data_fd, const char *relative,
     size_t length = strlen(relative);
     char copy[PATH_MAX];
     memcpy(copy, relative, length + 1U);
-    int current = duplicate_fd(data_fd);
+    int current = dup_cloexec(data_fd);
     if (current < 0)
         return -1;
 
@@ -768,7 +761,7 @@ static int open_existing_payload_parent(int data_fd, const char *relative,
     size_t length = strlen(relative);
     char copy[PATH_MAX];
     memcpy(copy, relative, length + 1U);
-    int current = duplicate_fd(data_fd);
+    int current = dup_cloexec(data_fd);
     if (current < 0)
         return -1;
 
@@ -967,7 +960,7 @@ static int verify_pending_readback_names(int destination_fd,
     unsigned char *found = calloc(pending->count, sizeof(*found));
     if (found == NULL)
         return -1;
-    int scan_fd = duplicate_fd(destination_fd);
+    int scan_fd = dup_cloexec(destination_fd);
     DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
     if (directory == NULL) {
         if (scan_fd >= 0)
@@ -1488,15 +1481,6 @@ static int visited_reset(PortableVisited *visited)
     return 0;
 }
 
-static void visited_free(PortableVisited *visited)
-{
-    if (visited == NULL)
-        return;
-    visited_reset(visited);
-    free(visited->slots);
-    free(visited);
-}
-
 static void visited_dispose(PortableVisited *visited)
 {
     if (visited == NULL)
@@ -1504,6 +1488,14 @@ static void visited_dispose(PortableVisited *visited)
     visited_reset(visited);
     free(visited->slots);
     memset(visited, 0, sizeof(*visited));
+}
+
+static void visited_free(PortableVisited *visited)
+{
+    if (visited == NULL)
+        return;
+    visited_dispose(visited);
+    free(visited);
 }
 
 static int visited_add(PortableVisited *visited, const char *root_id,
@@ -2176,17 +2168,6 @@ typedef struct {
     int failed;
 } StickySeedState;
 
-static const PortableRootSpec *find_root_by_id(
-    const PortableCaptureRequest *request, const char *root_id)
-{
-    if (request == NULL || root_id == NULL)
-        return NULL;
-    for (size_t index = 0; index < request->root_count; index++)
-        if (strcmp(request->roots[index].id, root_id) == 0)
-            return &request->roots[index];
-    return NULL;
-}
-
 static int sticky_seed_callback(const SidecarLiveView *view, void *argument)
 {
     StickySeedState *state = argument;
@@ -2206,7 +2187,8 @@ static int sticky_seed_callback(const SidecarLiveView *view, void *argument)
         return 1;
     }
 
-    const PortableRootSpec *root = find_root_by_id(state->request, root_id);
+    const PortableRootSpec *root = portable_collision_plan_root(state->request,
+                                                                root_id);
     char source_path[PATH_MAX];
     int source_path_ready = 0;
     if (root != NULL) {
@@ -2506,17 +2488,6 @@ static int relative_path_is_same_or_descendant(const char *path,
            (path[prefix_length] == '\0' || path[prefix_length] == '/');
 }
 
-static size_t relative_path_depth(const char *path)
-{
-    if (path == NULL || path[0] == '\0')
-        return 0;
-    size_t depth = 1U;
-    for (const char *cursor = path; *cursor != '\0'; cursor++)
-        if (*cursor == '/')
-            depth++;
-    return depth;
-}
-
 static int stale_keys_append(StaleKeys *keys, SidecarBytes logical,
                              SidecarBytes physical)
 {
@@ -2692,10 +2663,10 @@ static int capture_destination_is_safe(const PortableCaptureContext *context,
  * same-physical claim remains ownership proof even when the source kind has
  * changed; append_capture_claim() then reconciles that old kind before
  * publishing the replacement claim. */
-static int capture_destination_is_safe_for_kind(
+static int capture_destination_is_safe_or_claimed(
     const PortableCaptureContext *context, const PortableRootSpec *root,
     const char *logical, const char *physical, int parent_fd,
-    const char *leaf, SidecarObjectKind kind)
+    const char *leaf)
 {
     if (context == NULL || root == NULL || logical == NULL ||
         physical == NULL)
@@ -2715,7 +2686,6 @@ static int capture_destination_is_safe_for_kind(
     SidecarBytes physical_key = {
         (const unsigned char *)physical, strlen(physical)
     };
-    (void)kind;
     SidecarClaimView claim_view = {0};
     int found = sidecar_log_find_claim(context->sidecar, root_key,
                                        logical_key, &claim_view);
@@ -2820,7 +2790,7 @@ static int tombstone_destination_children(PortableCaptureContext *context,
     int directory_fd = open_child_directory(parent_fd, leaf);
     if (directory_fd < 0)
         return -1;
-    int scan_fd = duplicate_fd(directory_fd);
+    int scan_fd = dup_cloexec(directory_fd);
     DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
     if (directory == NULL) {
         if (scan_fd >= 0)
@@ -3164,7 +3134,7 @@ static int reconcile_claim_validate_node(PortableCaptureContext *context,
         errno = saved;
         return -1;
     }
-    int scan_fd = duplicate_fd(directory_fd);
+    int scan_fd = dup_cloexec(directory_fd);
     DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
     if (directory == NULL) {
         if (scan_fd >= 0)
@@ -3272,7 +3242,7 @@ static int reconcile_mutate_known_node(PortableCaptureContext *context,
             errno = saved;
             return -1;
         }
-        int scan_fd = duplicate_fd(directory_fd);
+        int scan_fd = dup_cloexec(directory_fd);
         DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
         if (directory == NULL) {
             if (scan_fd >= 0)
@@ -3857,7 +3827,7 @@ static int inventory_scan_node(InventoryState *inventory,
     int directory_fd = open_child_directory(parent_fd, leaf);
     if (directory_fd < 0)
         return -1;
-    int scan_fd = duplicate_fd(directory_fd);
+    int scan_fd = dup_cloexec(directory_fd);
     DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
     if (directory == NULL) {
         if (scan_fd >= 0)
@@ -4276,7 +4246,7 @@ static int capture_directory(PortableCaptureContext *context,
                              const char *collision_suffix)
 {
     PendingReadbackNames pending = {0};
-    int scan_fd = duplicate_fd(source_fd);
+    int scan_fd = dup_cloexec(source_fd);
     DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
     if (directory == NULL) {
         if (scan_fd >= 0)
@@ -4452,9 +4422,8 @@ static int capture_regular(PortableCaptureContext *context,
         }
         destination_leaf = root_leaf;
     }
-    if (capture_destination_is_safe_for_kind(
-            context, root, logical, physical, parent_fd, destination_leaf,
-            SIDECAR_KIND_REGULAR) != 0 ||
+    if (capture_destination_is_safe_or_claimed(
+            context, root, logical, physical, parent_fd, destination_leaf) != 0 ||
         replace_live_capture(context, root, logical, physical) != 0) {
         if (destination_is_root)
             close(parent_fd);
@@ -4667,9 +4636,8 @@ static int capture_symlink(PortableCaptureContext *context,
         }
         destination_leaf = root_leaf;
     }
-    if (capture_destination_is_safe_for_kind(
-            context, root, logical, physical, parent_fd, destination_leaf,
-            SIDECAR_KIND_SYMLINK) != 0 ||
+    if (capture_destination_is_safe_or_claimed(
+            context, root, logical, physical, parent_fd, destination_leaf) != 0 ||
         replace_live_capture(context, root, logical, physical) != 0) {
         if (destination_is_root)
             close(parent_fd);
@@ -4785,9 +4753,8 @@ static int capture_hardlink(PortableCaptureContext *context,
         }
         destination_leaf = root_leaf;
     }
-    if (capture_destination_is_safe_for_kind(
-            context, root, logical, physical, parent_fd, destination_leaf,
-            SIDECAR_KIND_HARDLINK) != 0 ||
+    if (capture_destination_is_safe_or_claimed(
+            context, root, logical, physical, parent_fd, destination_leaf) != 0 ||
         replace_live_capture(context, root, logical, physical) != 0) {
         if (destination_is_root)
             close(parent_fd);
@@ -4975,9 +4942,8 @@ static int capture_node(PortableCaptureContext *context,
         destination_leaf = root_leaf;
     }
 
-    if (capture_destination_is_safe_for_kind(
-            context, root, logical, physical, parent_fd, destination_leaf,
-            SIDECAR_KIND_DIRECTORY) != 0 ||
+    if (capture_destination_is_safe_or_claimed(
+            context, root, logical, physical, parent_fd, destination_leaf) != 0 ||
         replace_live_capture(context, root, logical, physical) != 0) {
         if (is_root)
             close(parent_fd);
@@ -5293,8 +5259,6 @@ static int case_probe_cleanup(PortableCaseProbeState *state)
     return failed ? -1 : 0;
 }
 
-static int root_spec_valid(const PortableRootSpec *root);
-
 /* Read back one scratch-directory component exactly as the filesystem
  * reports it.  A successful mkdirat() that is only reachable through a
  * differently-spelled directory entry is not a trustworthy no-collision
@@ -5304,7 +5268,7 @@ static int root_probe_exact_name(int directory_fd, const char *name)
 {
     if (directory_fd < 0 || !safe_component(name))
         return -1;
-    int scan_fd = duplicate_fd(directory_fd);
+    int scan_fd = dup_cloexec(directory_fd);
     DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
     if (directory == NULL) {
         if (scan_fd >= 0)
@@ -5348,7 +5312,7 @@ static int root_probe_make_path(int root_fd, const char *relative)
     size_t length = strlen(relative);
     char copy[PATH_MAX];
     memcpy(copy, relative, length + 1U);
-    int current = duplicate_fd(root_fd);
+    int current = dup_cloexec(root_fd);
     if (current < 0)
         return -1;
 
@@ -5526,7 +5490,7 @@ static int case_probe_readback_matches(const PortableCaseFoldSet *expected,
 {
     if (expected == NULL || directory_fd < 0)
         return -1;
-    int scan_fd = duplicate_fd(directory_fd);
+    int scan_fd = dup_cloexec(directory_fd);
     DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
     if (directory == NULL) {
         if (scan_fd >= 0)
@@ -5891,7 +5855,7 @@ static int prescan_directory(int source_fd, const char *logical,
         probe_state == NULL)
         return -1;
 
-    int scan_fd = duplicate_fd(source_fd);
+    int scan_fd = dup_cloexec(source_fd);
     DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
     if (directory == NULL) {
         if (scan_fd >= 0)
@@ -6461,7 +6425,7 @@ static int data_namespace_is_empty(int data_fd)
     if (fstat(data_fd, &st) != 0 || !S_ISDIR(st.st_mode))
         return -1;
     int empty = 1;
-    int scan_fd = duplicate_fd(data_fd);
+    int scan_fd = dup_cloexec(data_fd);
     DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
     if (directory == NULL) {
         if (scan_fd >= 0)

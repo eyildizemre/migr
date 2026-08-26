@@ -112,9 +112,6 @@ const MetadataSnapshot *metadata_snapshot_find(const MetadataSnapshots *snapshot
                                                const struct stat *st);
 
 MetadataTimestampPolicy metadata_policy_from_context(const CloneContext *ctx);
-struct timespec metadata_canonical_time(struct timespec value,
-                                        MetadataTimestampPolicy policy);
-int metadata_snapshot_from_stat(const struct stat *st, MetadataSnapshot *out);
 int metadata_snapshot_to_stat(const MetadataSnapshot *snapshot,
                               struct stat *out);
 int metadata_snapshot_matches(const MetadataSnapshot *snapshot,

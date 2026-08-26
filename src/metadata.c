@@ -2,7 +2,6 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <grp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -325,7 +324,8 @@ void metadata_snapshots_free(MetadataSnapshots *snapshots)
     memset(snapshots, 0, sizeof(*snapshots));
 }
 
-int metadata_snapshot_from_stat(const struct stat *st, MetadataSnapshot *out)
+static int metadata_snapshot_from_stat(const struct stat *st,
+                                       MetadataSnapshot *out)
 {
     if (st == NULL || out == NULL)
         return -1;
@@ -412,8 +412,8 @@ MetadataTimestampPolicy metadata_policy_from_context(const CloneContext *ctx)
     return policy;
 }
 
-struct timespec metadata_canonical_time(struct timespec value,
-                                        MetadataTimestampPolicy policy)
+static struct timespec metadata_canonical_time(
+    struct timespec value, MetadataTimestampPolicy policy)
 {
     if (!policy.nsec_exact)
         value.tv_nsec = 0;

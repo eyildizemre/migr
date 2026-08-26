@@ -3,13 +3,10 @@
 #include "sidecar.h"
 
 #include <errno.h>
-#include <fcntl.h>
 #include <inttypes.h>
-#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <signal.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -30,7 +27,13 @@ static const char kind_fifo[] = "fifo";
 static const char kind_symlink[] = "symlink";
 static const char kind_hardlink[] = "hardlink";
 
+static const char *sidecar_object_kind_name(SidecarObjectKind kind);
+static int sidecar_object_kind_parse(SidecarBytes field,
+                                      SidecarObjectKind *out);
+
 #ifdef SIDECAR_TEST_HOOKS
+#include <signal.h>
+
 static volatile sig_atomic_t sidecar_test_interrupt_point =
     SIDECAR_TEST_INTERRUPT_NONE;
 
@@ -596,30 +599,12 @@ int sidecar_write_claim(int fd, const SidecarClaim *claim)
     return result;
 }
 
-const char *sidecar_status_string(SidecarStatus status)
-{
-    switch (status)
-    {
-        case SIDECAR_STATUS_OK: return "ok";
-        case SIDECAR_STATUS_TRUNCATED_TAIL: return "truncated tail";
-        case SIDECAR_STATUS_INVALID_ARGUMENT: return "invalid argument";
-        case SIDECAR_STATUS_IO_ERROR: return "I/O error";
-        case SIDECAR_STATUS_CORRUPT: return "corrupt";
-        case SIDECAR_STATUS_UNKNOWN_VERSION: return "unknown version";
-        case SIDECAR_STATUS_LIMIT: return "resource limit";
-        case SIDECAR_STATUS_ALLOCATION: return "allocation failure";
-        case SIDECAR_STATUS_UNSUPPORTED_KIND: return "unsupported object kind";
-        case SIDECAR_STATUS_CALLBACK: return "callback failure";
-    }
-    return "unknown status";
-}
-
 int sidecar_live_entry_count_allowed(uint64_t count)
 {
     return count <= SIDECAR_MAX_LIVE_ENTRIES;
 }
 
-const char *sidecar_object_kind_name(SidecarObjectKind kind)
+static const char *sidecar_object_kind_name(SidecarObjectKind kind)
 {
     switch (kind)
     {
@@ -632,7 +617,7 @@ const char *sidecar_object_kind_name(SidecarObjectKind kind)
     return NULL;
 }
 
-int sidecar_object_kind_parse(SidecarBytes field, SidecarObjectKind *out)
+static int sidecar_object_kind_parse(SidecarBytes field, SidecarObjectKind *out)
 {
     if (out == NULL || validate_bytes(field, SIDECAR_KIND_MAX, 1) != 0)
         return -1;
@@ -1132,9 +1117,6 @@ static void free_claim(SidecarReader *reader, SidecarClaim *claim)
     memset(claim, 0, sizeof(*claim));
 }
 
-static SidecarStatus parse_unsigned(SidecarBytes field, uint64_t maximum,
-                                    uint64_t *out);
-
 static SidecarStatus parse_header(SidecarReader *reader)
 {
     size_t magic_length = sizeof(sidecar_magic) - 1U;
@@ -1226,7 +1208,6 @@ static SidecarStatus parse_fd_internal(SidecarReader *reader,
                 break;
             has_pending = 1;
             xattrs_seen = 0;
-            result->entry_records++;
             SidecarRecord record = {
                 .type = SIDECAR_RECORD_ENTRY,
                 .value.entry = pending

@@ -13,8 +13,8 @@
  *
  * `operation` is the direction the tree flows — a backup captures the source, a restore
  * writes it back. `representation` is whether metadata a destination cannot hold natively
- * is instead carried in a sidecar; every clone is a CLONE_NATIVE_TREE for now,
- * CLONE_PORTABLE_SIDECAR is reserved for later phases.
+ * is instead carried in a sidecar. The native capture/restore entry points
+ * implement CLONE_NATIVE_TREE; CLONE_PORTABLE_SIDECAR is served by portable.c.
  */
 typedef enum { CLONE_BACKUP, CLONE_RESTORE } CloneOperation;
 typedef enum { CLONE_NATIVE_TREE, CLONE_PORTABLE_SIDECAR } CloneRepresentation;
@@ -25,7 +25,6 @@ typedef struct CloneContext {
     int timestamp_policy_configured;
     int nsec_exact;
     int metadata_preflight_done;
-    off_t estimated_total_bytes; /* 0/unset means no progress denominator. */
     void *inode_map; /* NativeInodeMap; backup/restore tracking; NULL disables it. */
     void *visited; /* Native visited-path set, backup-only; NULL disables tracking. */
 } CloneContext;
@@ -53,6 +52,8 @@ int native_hardlink_identity_matches(const struct stat *linked,
 /* Opaque native-capture visited-path set ownership (docs/DECISIONS.md D23). */
 void *native_visited_create(void);
 void native_visited_free(void *visited);
+int native_visited_contains(const void *visited, const char *root_key,
+                            const char *rel_path);
 
 #ifdef NATIVE_VISITED_TEST_HOOKS
 uint64_t native_visited_test_probe_count(void);
@@ -155,10 +156,9 @@ void backup_test_set_capture_hook(BackupTestCaptureHook hook, void *context);
  * symlink target, or any type mismatch -- is an error, never an overwrite.
  *
  * The context is validated, not merely carried: a NULL ctx, a mismatched operation, or
- * an unimplemented representation is refused rather than run, so a dispatch mistake
+ * an unsupported representation is refused rather than run, so a dispatch mistake
  * fails closed instead of writing a native tree to a destination that needed a
- * sidecar. Only CLONE_NATIVE_TREE is implemented currently; CLONE_PORTABLE_SIDECAR is
- * refused.
+ * sidecar.
  *
  * @param ctx                 Clone orientation and representation; must not be NULL.
  * @param source_path         Path to the source file, directory, or symlink.
@@ -214,8 +214,6 @@ typedef struct {
     size_t skipped_security_xattr_count;
     char failed_logical_path[PATH_MAX];
 } RestoreNativeReport;
-
-void restore_native_report_init(RestoreNativeReport *report);
 
 /**
  * @brief Checks whether a source object exists without following symlinks.

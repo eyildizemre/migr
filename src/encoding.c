@@ -1,4 +1,3 @@
-#define _GNU_SOURCE
 #include <assert.h>
 #include <ctype.h>
 #include <stddef.h>
@@ -8,12 +7,13 @@
 
 static int manifest_path_safe_char(unsigned char c)
 {
-    return isalnum(c) || c == '.' || c == '_' || c == '/' || c == '-';
+    return c < 0x80 &&
+           (isalnum(c) || c == '.' || c == '_' || c == '/' || c == '-');
 }
 
 // Bytewise percent-encode: every byte outside the safe set becomes "%XX"
-// (uppercase hex). Operates on raw is a NUL-terminated C string; paths never
-// contain an embedded NUL at the syscall level, so treating it as a string
+// (uppercase hex). Operates on a raw NUL-terminated C string; paths never
+// contain an embedded NUL at the syscall level, so treating them as strings
 // (rather than requiring an explicit length) is sufficient here.
 static int manifest_path_percent_encode(const char *raw, char *out,
                                         size_t out_size)
@@ -65,6 +65,7 @@ static int decode_percent_escape(const char *encoded, unsigned char *out)
         return -1;
 
     int byte = (hi << 4) | lo;
+    // A decoded NUL would truncate the path at the syscall boundary.
     if (byte == 0)
         return -1;
 
@@ -103,14 +104,6 @@ static int manifest_path_percent_decode(const char *encoded, char *out,
         {
             return -1; // raw byte our encoder would never emit unescaped
         }
-
-        // A decoded NUL would silently truncate every C-string operation
-        // downstream (strcmp/strlen/strcpy) at that point, hiding whatever
-        // followed it. manifest_path_percent_encode() never produces "%00" for
-        // a real path (paths cannot contain NUL at the syscall level), so this
-        // can only be corruption or tampering -- refuse it, don't truncate.
-        if (byte == 0)
-            return -1;
 
         if (o + 1 >= out_size)
             return -1;

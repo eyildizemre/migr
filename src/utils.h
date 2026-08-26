@@ -23,6 +23,9 @@ void print_success(const char *fmt, ...);
  */
 void format_size(off_t bytes, char *buf, size_t len);
 
+int dup_cloexec(int fd);
+size_t relative_path_depth(const char *path);
+
 /* Live backup progress is sampled at most twice per second in production. */
 #define BACKUP_PROGRESS_THROTTLE_MS 500
 

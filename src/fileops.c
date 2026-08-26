@@ -20,6 +20,17 @@
 #include "sidecar.h"
 #include "utils.h" // path_join
 
+typedef enum {
+    RESTORE_RESOLVE_ERROR = -1,
+    RESTORE_RESOLVE_MISSING = 0,
+    RESTORE_RESOLVE_OK = 1
+} RestoreResolveResult;
+
+static RestoreResolveResult resolve_parent(int root_fd, const char *rel,
+                                           int create_intermediates,
+                                           int *out_parent_fd,
+                                           char *out_leaf, size_t leaf_size);
+
 /* ========================================================================= */
 /* Native backup capture: pathname-based source, FD-anchored destination.   */
 /*                                                                          */
@@ -435,66 +446,6 @@ static int native_seed_relative_path_is_safe(const char *rel)
     }
 }
 
-static int native_seed_destination_parent(int destination_root_fd,
-                                          const char *destination_rel,
-                                          int *parent_fd_out,
-                                          char *leaf_out,
-                                          size_t leaf_size)
-{
-    if (destination_root_fd < 0 || destination_rel == NULL ||
-        parent_fd_out == NULL || leaf_out == NULL || leaf_size == 0 ||
-        !native_seed_relative_path_is_safe(destination_rel))
-        return -1;
-
-    *parent_fd_out = -1;
-    if (destination_rel[0] == '\0')
-        return 1;
-
-    int current_fd = fcntl(destination_root_fd, F_DUPFD_CLOEXEC, 0);
-    if (current_fd < 0)
-        return -1;
-
-    const char *component = destination_rel;
-    for (;;)
-    {
-        const char *slash = strchr(component, '/');
-        size_t length = slash == NULL ? strlen(component)
-                                      : (size_t)(slash - component);
-        if (slash == NULL)
-        {
-            if (length >= leaf_size)
-            {
-                close(current_fd);
-                return -1;
-            }
-            memcpy(leaf_out, component, length + 1U);
-            *parent_fd_out = current_fd;
-            return 0;
-        }
-
-        char child[NAME_MAX + 1U];
-        if (length >= sizeof(child))
-        {
-            close(current_fd);
-            return -1;
-        }
-        memcpy(child, component, length);
-        child[length] = '\0';
-        int next_fd = openat(current_fd, child,
-                             O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
-                                 O_CLOEXEC);
-        if (next_fd < 0)
-        {
-            int saved_errno = errno;
-            close(current_fd);
-            return saved_errno == ENOENT ? 1 : -1;
-        }
-        close(current_fd);
-        current_fd = next_fd;
-        component = slash + 1;
-    }
-}
-
 static int native_inode_map_seed_existing_at(
     const CloneContext *ctx, const char *source_path, int destination_dir_fd,
     const char *destination_leaf);
@@ -672,11 +623,11 @@ int native_inode_map_seed_existing(const CloneContext *ctx,
 
     int destination_parent_fd = -1;
     char destination_leaf[NAME_MAX + 1U];
-    int resolved = native_seed_destination_parent(
-        destination_root_fd, destination_rel, &destination_parent_fd,
+    RestoreResolveResult resolved = resolve_parent(
+        destination_root_fd, destination_rel, 0, &destination_parent_fd,
         destination_leaf, sizeof(destination_leaf));
-    if (resolved != 0)
-        return resolved > 0 ? 0 : -1;
+    if (resolved != RESTORE_RESOLVE_OK)
+        return resolved == RESTORE_RESOLVE_MISSING ? 0 : -1;
     int result = native_inode_map_seed_existing_at(
         ctx, source_path, destination_parent_fd, destination_leaf);
     if (close(destination_parent_fd) != 0)
@@ -1931,12 +1882,6 @@ NativeReconcileStatus native_reconcile_stale_at(const void *visited,
 #define RESTORE_LEAF_MAX (NAME_MAX + 1)
 
 typedef enum {
-    RESTORE_RESOLVE_ERROR = -1,
-    RESTORE_RESOLVE_MISSING = 0,
-    RESTORE_RESOLVE_OK = 1
-} RestoreResolveResult;
-
-typedef enum {
     RESTORE_VALIDATE,
     RESTORE_APPLY
 } RestorePass;
@@ -2072,11 +2017,6 @@ static int fd_is_directory(int fd)
 {
     struct stat st;
     return fstat(fd, &st) == 0 && S_ISDIR(st.st_mode);
-}
-
-static int same_object(const struct stat *left, const struct stat *right)
-{
-    return left->st_dev == right->st_dev && left->st_ino == right->st_ino;
 }
 
 static int copy_leaf_name(const char *rel, char *out_leaf, size_t leaf_size)
@@ -2301,7 +2241,7 @@ static SourceOpenStatus open_source_regular(
     if (fd < 0)
         return errno == EPERM ? SOURCE_OPEN_SAFE_READ : SOURCE_OPEN_ERROR;
     if (fstat(fd, opened_st) != 0 || !S_ISREG(opened_st->st_mode) ||
-        !same_object(object_st, opened_st))
+        !native_hardlink_identity_matches(object_st, opened_st))
     {
         close(fd);
         return SOURCE_OPEN_ERROR;
@@ -2366,7 +2306,7 @@ static SourceOpenStatus open_source_directory(
     if (fd < 0)
         return errno == EPERM ? SOURCE_OPEN_SAFE_READ : SOURCE_OPEN_ERROR;
     if (fstat(fd, opened_st) != 0 || !S_ISDIR(opened_st->st_mode) ||
-        !same_object(object_st, opened_st))
+        !native_hardlink_identity_matches(object_st, opened_st))
     {
         close(fd);
         return SOURCE_OPEN_ERROR;
@@ -3253,7 +3193,7 @@ RestoreNativeStatus restore_native_metadata_inventory_at(
     return rc;
 }
 
-void restore_native_report_init(RestoreNativeReport *report)
+static void restore_native_report_init(RestoreNativeReport *report)
 {
     if (report == NULL)
         return;

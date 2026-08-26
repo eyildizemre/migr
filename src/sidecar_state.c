@@ -5,7 +5,6 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -67,7 +66,6 @@ typedef struct {
 
 typedef struct {
     int fd;
-    uint64_t boundary;
     int poisoned;
     StateMemory memory;
     StateMap map;
@@ -949,12 +947,7 @@ static int valid_key(SidecarBytes root_id, SidecarBytes logical_path)
            bytes_valid(logical_path, SIDECAR_MAX_PATH, 0);
 }
 
-static int append_entry_supported(const SidecarEntry *entry)
-{
-    return entry != NULL;
-}
-
-static int update_boundary(SidecarLogImplementation *log)
+static int check_size_limit(SidecarLogImplementation *log)
 {
     struct stat st;
     if (fstat(log->fd, &st) != 0 || st.st_size < 0 ||
@@ -964,7 +957,6 @@ static int update_boundary(SidecarLogImplementation *log)
             errno = E2BIG;
         return -1;
     }
-    log->boundary = (uint64_t)st.st_size;
     return 0;
 }
 
@@ -1124,22 +1116,6 @@ static int load_callback(const SidecarRecord *record, void *context)
     return 0;
 }
 
-const char *sidecar_open_status_string(SidecarOpenStatus status)
-{
-    switch (status)
-    {
-        case SIDECAR_OPEN_FRESH: return "fresh";
-        case SIDECAR_OPEN_RESUMABLE: return "resumable";
-        case SIDECAR_OPEN_MISSING: return "missing";
-        case SIDECAR_OPEN_EXISTS: return "already exists";
-        case SIDECAR_OPEN_UNUSABLE: return "unusable";
-        case SIDECAR_OPEN_IO_ERROR: return "I/O error";
-        case SIDECAR_OPEN_ALLOCATION: return "allocation failure";
-        case SIDECAR_OPEN_INVALID_ARGUMENT: return "invalid argument";
-    }
-    return "unknown status";
-}
-
 static SidecarOpenStatus validate_slot_fd(int fd, struct stat *out)
 {
     struct stat st;
@@ -1200,7 +1176,7 @@ SidecarOpenStatus sidecar_log_create_at(int container_fd, SidecarLog *out)
         errno = saved;
         return SIDECAR_OPEN_ALLOCATION;
     }
-    if (sidecar_write_header(fd) != 0 || update_boundary(log) != 0)
+    if (sidecar_write_header(fd) != 0 || check_size_limit(log) != 0)
     {
         int saved = errno;
         unlink_owned_slot(container_fd, fd);
@@ -1289,8 +1265,7 @@ SidecarOpenStatus sidecar_log_adopt_at(int container_fd, SidecarLog *out)
         }
     }
 
-    log->boundary = result.last_valid_boundary;
-    if (parse_status == SIDECAR_STATUS_OK && update_boundary(log) != 0)
+    if (parse_status == SIDECAR_STATUS_OK && check_size_limit(log) != 0)
     {
         free_log_implementation(log);
         close(fd);
@@ -1342,12 +1317,6 @@ SidecarStatus sidecar_log_append_entry(SidecarLog *log,
     status = copy_entry(&implementation->memory, entry, &copy);
     if (status != SIDECAR_STATUS_OK)
         return status;
-    if (!append_entry_supported(entry))
-    {
-        clear_entry(&implementation->memory, &copy);
-        errno = EOPNOTSUPP;
-        return SIDECAR_STATUS_UNSUPPORTED_KIND;
-    }
     if (sidecar_write_entry(implementation->fd, entry) != 0)
     {
         status = status_from_errno();
@@ -1357,7 +1326,7 @@ SidecarStatus sidecar_log_append_entry(SidecarLog *log,
     }
     implementation->pending.entry = copy;
     implementation->pending.xattrs_seen = 0;
-    if (update_boundary(implementation) != 0)
+    if (check_size_limit(implementation) != 0)
     {
         poison(implementation);
         return SIDECAR_STATUS_IO_ERROR;
@@ -1390,7 +1359,7 @@ SidecarStatus sidecar_log_append_xattr(SidecarLog *log,
     }
     implementation->pending.entry.xattrs[
         implementation->pending.xattrs_seen++] = copy;
-    if (update_boundary(implementation) != 0)
+    if (check_size_limit(implementation) != 0)
     {
         poison(implementation);
         return SIDECAR_STATUS_IO_ERROR;
@@ -1439,7 +1408,7 @@ SidecarStatus sidecar_log_append_entry_commit(SidecarLog *log)
             return status;
         }
     }
-    if (update_boundary(implementation) != 0)
+    if (check_size_limit(implementation) != 0)
     {
         poison(implementation);
         return SIDECAR_STATUS_IO_ERROR;
@@ -1490,7 +1459,7 @@ SidecarStatus sidecar_log_append_delete(SidecarLog *log,
             return status;
         }
     }
-    if (update_boundary(implementation) != 0)
+    if (check_size_limit(implementation) != 0)
     {
         poison(implementation);
         return SIDECAR_STATUS_IO_ERROR;
@@ -1544,7 +1513,7 @@ SidecarStatus sidecar_log_append_claim(SidecarLog *log,
     }
     map_apply_claim(&implementation->memory, &implementation->claim_map,
                     &copy, claim_index);
-    if (update_boundary(implementation) != 0)
+    if (check_size_limit(implementation) != 0)
     {
         poison(implementation);
         return SIDECAR_STATUS_IO_ERROR;

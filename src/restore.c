@@ -442,67 +442,64 @@ static int restore_legacy(const char *source, int source_root_fd, const char *ho
         *had_error = 1;
         return -1;
     }
-    else
+    char *manifest_names[XDG_RESTORE_COUNT];
+    int has_manifest = (legacy_manifest_read(source, manifest_names, XDG_RESTORE_COUNT) == 0);
+
+    for (int i = 0; i < XDG_RESTORE_COUNT; i++)
     {
-        char *manifest_names[XDG_RESTORE_COUNT];
-        int has_manifest = (legacy_manifest_read(source, manifest_names, XDG_RESTORE_COUNT) == 0);
-
-        for (int i = 0; i < XDG_RESTORE_COUNT; i++)
+        // The manifest name locates the source-locale directory; xdg_dirs[i] is
+        // the destination-locale path. Fall back to its basename if absent.
+        const char *name;
+        if (has_manifest && manifest_names[i] != NULL)
+            name = manifest_names[i];
+        else
         {
-            // The manifest name locates the source-locale directory; xdg_dirs[i] is
-            // the destination-locale path. Fall back to its basename if absent.
-            const char *name;
-            if (has_manifest && manifest_names[i] != NULL)
-                name = manifest_names[i];
-            else
-            {
-                const char *p = strrchr(xdg_dirs[i], '/');
-                name = p ? p + 1 : xdg_dirs[i];
-            }
-
-            RestoreSourceStatus source_status = restore_native_source_status_at(source_root_fd, name);
-            if (source_status == RESTORE_SOURCE_MISSING)
-                continue;
-            if (source_status == RESTORE_SOURCE_ERROR)
-            {
-                print_error("Error: Failed to inspect %s\n", name);
-                *had_error = 1;
-                continue;
-            }
-
-            // xdg_dirs[i] may be any absolute path (see xdg_resolve()'s contract),
-            // not necessarily under home: open (creating if needed) its own
-            // directory fd and restore into it directly as the destination root
-            // itself ("", docs/DECISIONS.md D16), rather than assuming it is
-            // reachable via home_fd.
-            int xdg_dest_fd;
-            char destination_rel[NAME_MAX + 1];
-            if (open_xdg_destination_anchor(xdg_dirs[i], &xdg_dest_fd, destination_rel, sizeof(destination_rel)) != 0)
-            {
-                print_error("Error: Failed to restore %s\n", name);
-                *had_error = 1;
-                continue;
-            }
-
-            int rc = restore_item_at(ctx, source_root_fd, name, xdg_dest_fd,
-                                     destination_rel, name, 0,
-                                     timestamp_anchors,
-                                     skipped_security_xattrs);
-            if (rc > 0 && dry_run)
-                printf("  Would restore: %s -> %s/\n", name, xdg_dirs[i]);
-            if (rc > 0)
-                (*count)++;
-            else if (rc < 0)
-                *had_error = 1;
-
-            close(xdg_dest_fd);
+            const char *p = strrchr(xdg_dirs[i], '/');
+            name = p ? p + 1 : xdg_dirs[i];
         }
 
-        if (has_manifest)
-            for (int i = 0; i < XDG_RESTORE_COUNT; i++)
-                free(manifest_names[i]);
-        free_xdg_dirs(xdg_dirs);
+        RestoreSourceStatus source_status = restore_native_source_status_at(source_root_fd, name);
+        if (source_status == RESTORE_SOURCE_MISSING)
+            continue;
+        if (source_status == RESTORE_SOURCE_ERROR)
+        {
+            print_error("Error: Failed to inspect %s\n", name);
+            *had_error = 1;
+            continue;
+        }
+
+        // xdg_dirs[i] may be any absolute path (see xdg_resolve()'s contract),
+        // not necessarily under home: open (creating if needed) its own
+        // directory fd and restore into it directly as the destination root
+        // itself ("", docs/DECISIONS.md D16), rather than assuming it is
+        // reachable via home_fd.
+        int xdg_dest_fd;
+        char destination_rel[NAME_MAX + 1];
+        if (open_xdg_destination_anchor(xdg_dirs[i], &xdg_dest_fd, destination_rel, sizeof(destination_rel)) != 0)
+        {
+            print_error("Error: Failed to restore %s\n", name);
+            *had_error = 1;
+            continue;
+        }
+
+        int rc = restore_item_at(ctx, source_root_fd, name, xdg_dest_fd,
+                                 destination_rel, name, 0,
+                                 timestamp_anchors,
+                                 skipped_security_xattrs);
+        if (rc > 0 && dry_run)
+            printf("  Would restore: %s -> %s/\n", name, xdg_dirs[i]);
+        if (rc > 0)
+            (*count)++;
+        else if (rc < 0)
+            *had_error = 1;
+
+        close(xdg_dest_fd);
     }
+
+    if (has_manifest)
+        for (int i = 0; i < XDG_RESTORE_COUNT; i++)
+            free(manifest_names[i]);
+    free_xdg_dirs(xdg_dirs);
 
     // Projects is not a standard XDG directory
     int rc = restore_home_item(ctx, source_root_fd, home_fd, "Projects",
@@ -830,7 +827,7 @@ static RestoreNativeStatus restore_legacy_metadata_inventory(
     {
         free_xdg_dirs(xdg_dirs);
         print_error("Error: HOME path too long to resolve user directories\n");
-        return -1;
+        return RESTORE_NATIVE_ERROR;
     }
 
     char *manifest_names[XDG_RESTORE_COUNT] = {0};
@@ -956,7 +953,7 @@ static RestoreNativeStatus restore_v1_metadata_inventory(
                 {
                     free_xdg_dirs(xdg_dirs);
                     print_error("Error: HOME path too long to resolve user directories\n");
-                    return -1;
+                    return RESTORE_NATIVE_ERROR;
                 }
                 xdg_ready = 1;
             }
@@ -1568,18 +1565,18 @@ int restore(const char *source)
     metadata_profiles_init(&metadata_profiles);
     RestoreTimestampAnchors timestamp_anchors;
     restore_timestamp_anchors_init(&timestamp_anchors);
-    RestoreNativeStatus metadata_inventory_failed;
+    RestoreNativeStatus metadata_inventory_status;
     if (mst == MANIFEST_STATUS_VALID)
-        metadata_inventory_failed = restore_v1_metadata_inventory(
+        metadata_inventory_status = restore_v1_metadata_inventory(
             source_root_fd, home, home_fd, &m, &ctx, &metadata_profiles,
             &timestamp_anchors);
     else
-        metadata_inventory_failed = restore_legacy_metadata_inventory(
+        metadata_inventory_status = restore_legacy_metadata_inventory(
             source, source_root_fd, home, home_fd, &ctx, &metadata_profiles,
             &timestamp_anchors);
-    if (metadata_inventory_failed != 0)
+    if (metadata_inventory_status != RESTORE_NATIVE_OK)
     {
-        if (metadata_inventory_failed == RESTORE_NATIVE_SOURCE_SAFE_READ)
+        if (metadata_inventory_status == RESTORE_NATIVE_SOURCE_SAFE_READ)
             report_source_safe_read_refusal("native restore payload", NULL);
         else
             print_error("Error: native metadata preflight failed; no destination was changed\n");

@@ -19,8 +19,6 @@
 #include "sidecar.h"
 #include "utils.h"
 
-extern int verbose;
-
 typedef struct {
     uint64_t bytes;
 } PreflightMemory;
@@ -58,7 +56,6 @@ typedef struct {
     uint32_t uid;
     uint32_t gid;
     uint64_t size;
-    uint32_t xattr_count;
 } PreflightEntry;
 
 typedef struct PreflightEntries {
@@ -170,17 +167,6 @@ static void preflight_free(PreflightMemory *memory, void *pointer,
     if (memory != NULL && (uint64_t)size <= memory->bytes)
         memory->bytes -= (uint64_t)size;
     free(pointer);
-}
-
-static uint64_t fnv1a_text(const char *text)
-{
-    uint64_t hash = UINT64_C(1469598103934665603);
-    for (size_t index = 0; text[index] != '\0'; index++)
-    {
-        hash ^= (unsigned char)text[index];
-        hash *= UINT64_C(1099511628211);
-    }
-    return hash;
 }
 
 static uint64_t parent_map_hash(const ParentMap *map,
@@ -476,7 +462,9 @@ static int root_map_build(RootMap *map, const Manifest *manifest)
     for (int root_index = 0; root_index < manifest->root_count; root_index++)
     {
         const ManifestRoot *root = &manifest->roots[root_index];
-        size_t index = (size_t)fnv1a_text(root->id) & (capacity - 1U);
+        size_t index = (size_t)hash_fnv1a_bytes(
+            HASH_FNV1A_OFFSET_BASIS, (const unsigned char *)root->id,
+            strlen(root->id)) & (capacity - 1U);
         while (map->slots[index].used)
         {
             if (strcmp(manifest->roots[map->slots[index].index].id,
@@ -693,21 +681,14 @@ static int parent_map_build(ParentMap *map, PreflightMemory *memory,
     return 0;
 }
 
-static int root_order_compare(const void *left, const void *right,
-                              void *argument)
-{
-    const Manifest *manifest = argument;
-    size_t a = *(const size_t *)left;
-    size_t b = *(const size_t *)right;
-    return strcmp(manifest->roots[a].payload_path,
-                  manifest->roots[b].payload_path);
-}
-
 static const Manifest *root_order_manifest;
 
-static int root_order_compare_global(const void *left, const void *right)
+static int root_order_compare(const void *left, const void *right)
 {
-    return root_order_compare(left, right, (void *)root_order_manifest);
+    size_t a = *(const size_t *)left;
+    size_t b = *(const size_t *)right;
+    return strcmp(root_order_manifest->roots[a].payload_path,
+                  root_order_manifest->roots[b].payload_path);
 }
 
 static int payload_paths_disjoint(const Manifest *manifest, size_t left,
@@ -793,7 +774,7 @@ static int collection_validate_manifest(Collection *collection)
             collection->root_order[index] = index;
         root_order_manifest = manifest;
         qsort(collection->root_order, report->root_count,
-              sizeof(*collection->root_order), root_order_compare_global);
+              sizeof(*collection->root_order), root_order_compare);
         root_order_manifest = NULL;
         for (size_t index = 1; index < report->root_count; index++)
             if (!payload_paths_disjoint(manifest,
@@ -950,12 +931,6 @@ static int destination_relative_path_build(const char *prefix,
     return length >= 0 && (size_t)length < out_size ? 0 : -1;
 }
 
-static int duplicate_noatime_directory(int fd)
-{
-    int duplicate = fcntl(fd, F_DUPFD_CLOEXEC, 0);
-    return duplicate;
-}
-
 static int open_destination_profile_anchor(int home_fd, const char *relative,
                                            int *anchor_out,
                                            struct stat *existing,
@@ -970,7 +945,7 @@ static int open_destination_profile_anchor(int home_fd, const char *relative,
     }
     *anchor_out = -1;
     *has_existing = 0;
-    int current = duplicate_noatime_directory(home_fd);
+    int current = dup_cloexec(home_fd);
     if (current < 0)
         return -1;
     if (relative[0] == '\0')
@@ -1237,8 +1212,7 @@ static int collect_metadata_profile(const Collection *collection,
         /* MANUAL_NATIVE is rejected by manifest validation before entries
          * reach this path. Keep the fallback fail-closed if that invariant
          * changes. */
-        anchor = duplicate_noatime_directory(
-            collection->destination_home_fd);
+        anchor = dup_cloexec(collection->destination_home_fd);
         if (anchor < 0)
             return -1;
     }
@@ -1333,7 +1307,6 @@ static int collect_entry(const SidecarLiveView *view, void *argument)
     destination->uid = entry->uid;
     destination->gid = entry->gid;
     destination->size = entry->size;
-    destination->xattr_count = entry->xattr_count;
     entries->count++;
 
     int carries_security_xattr = 0;
@@ -1657,7 +1630,7 @@ static int scan_payload_node(PayloadInventory *inventory, int parent_fd,
 static int scan_payload_directory(PayloadInventory *inventory, int directory_fd,
                                    size_t path_length)
 {
-    int scan_fd = fcntl(directory_fd, F_DUPFD_CLOEXEC, 0);
+    int scan_fd = dup_cloexec(directory_fd);
     DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
     if (directory == NULL)
     {
@@ -2117,17 +2090,6 @@ int replay_stat_from_entry(const SidecarEntry *entry, struct stat *desired)
     return 0;
 }
 
-static size_t replay_path_depth(const char *path)
-{
-    if (path == NULL || path[0] == '\0')
-        return 0;
-    size_t depth = 1;
-    for (const char *cursor = path; *cursor != '\0'; cursor++)
-        if (*cursor == '/')
-            depth++;
-    return depth;
-}
-
 static int replay_entry_compare(const void *left, const void *right)
 {
     const ReplayEntry *a = left;
@@ -2372,7 +2334,7 @@ static int replay_collect_entry(const SidecarLiveView *view, void *argument)
             }
     }
     replay->root_index = root_index;
-    replay->depth = replay_path_depth(replay->destination);
+    replay->depth = relative_path_depth(replay->destination);
     collection->count++;
     if (collection->report->live_count != SIZE_MAX)
         collection->report->live_count++;
@@ -2422,7 +2384,7 @@ static int replay_open_existing_relative(int base_fd, const char *relative,
     char copy[PATH_MAX];
     size_t length = strlen(relative);
     memcpy(copy, relative, length + 1U);
-    int current = duplicate_noatime_directory(base_fd);
+    int current = dup_cloexec(base_fd);
     if (current < 0)
         return -1;
 
@@ -2560,7 +2522,7 @@ static int replay_open_destination_parent(int home_fd, const char *path,
         errno = EINVAL;
         return -1;
     }
-    int current = duplicate_noatime_directory(home_fd);
+    int current = dup_cloexec(home_fd);
     if (current < 0)
         return -1;
     if (path[0] == '\0')
@@ -2623,7 +2585,7 @@ static int replay_open_destination_directory(int parent_fd, const char *leaf,
     }
     if (leaf[0] == '\0')
     {
-        *out_fd = duplicate_noatime_directory(parent_fd);
+        *out_fd = dup_cloexec(parent_fd);
         return *out_fd < 0 ? -1 : 0;
     }
     struct stat st;
@@ -3099,7 +3061,7 @@ static int replay_apply_directory_metadata(ReplayCollection *collection,
     {
         struct stat existing;
         if (leaf[0] == '\0')
-            destination_fd = duplicate_noatime_directory(parent_fd);
+            destination_fd = dup_cloexec(parent_fd);
         else if (fstatat(parent_fd, leaf, &existing,
                          AT_SYMLINK_NOFOLLOW) == 0 &&
                  S_ISDIR(existing.st_mode))

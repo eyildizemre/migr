@@ -1,7 +1,6 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <getopt.h>
 #include <string.h>
 #include <stdint.h>
@@ -50,10 +49,8 @@ static int parse_report_depth(const char *argument, ReportDepth *depth)
     }
 
     errno = 0;
-    char *end = NULL;
-    uintmax_t value = strtoumax(argument, &end, 10);
-    if (errno == ERANGE || end == argument || *end != '\0' ||
-        value > SIZE_MAX)
+    uintmax_t value = strtoumax(argument, NULL, 10);
+    if (errno == ERANGE || value > SIZE_MAX)
         return -1;
 
     depth->kind = REPORT_DEPTH_LIMITED;

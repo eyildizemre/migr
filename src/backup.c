@@ -1187,7 +1187,7 @@ int backup(const char *target, BackupMode mode, char **paths)
                     &metadata_profiles, &source_read_refusals) != 0;
             if (source_read_refusals.refusal_count > 0)
                 metadata_failed = 1;
-            if (!metadata_failed && source_read_refusals.refusal_count == 0)
+            if (!metadata_failed)
             {
                 metadata_profiles_report(&metadata_profiles);
                 metadata_failed = metadata_profiles_probe(
@@ -1232,7 +1232,7 @@ int backup(const char *target, BackupMode mode, char **paths)
                 &source_read_refusals) != 0;
             if (source_read_refusals.refusal_count > 0)
                 metadata_failed = 1;
-            if (!metadata_failed && source_read_refusals.refusal_count == 0)
+            if (!metadata_failed)
             {
                 metadata_profiles_report(&metadata_profiles);
                 metadata_failed = metadata_profiles_probe(
@@ -1361,7 +1361,6 @@ int backup(const char *target, BackupMode mode, char **paths)
                 .timestamp_policy_configured = 1,
                 .nsec_exact = profile.nsec_exact,
                 .metadata_preflight_done = 1,
-                .estimated_total_bytes = estimate_had_error ? 0 : estimated_size,
                 .inode_map = native_inode_map_create(),
                 .visited = native_visited_create()
             };

@@ -120,7 +120,6 @@ typedef struct {
     uint64_t bytes_read;
     uint64_t last_valid_boundary;
     uint64_t records_read;
-    uint64_t entry_records;
     uint64_t allocation_peak;
 } SidecarParseResult;
 
@@ -153,10 +152,6 @@ int sidecar_live_entry_count_allowed(uint64_t count);
 
 uint64_t sidecar_process_salt(void);
 
-const char *sidecar_status_string(SidecarStatus status);
-const char *sidecar_object_kind_name(SidecarObjectKind kind);
-int sidecar_object_kind_parse(SidecarBytes field, SidecarObjectKind *out);
-
 int sidecar_write_header(int fd);
 int sidecar_write_entry(int fd, const SidecarEntry *entry);
 int sidecar_write_xattr(int fd, const SidecarXattr *xattr);
@@ -173,8 +168,6 @@ int sidecar_write_claim(int fd, const SidecarClaim *claim);
  */
 SidecarStatus sidecar_parse_fd(int fd, SidecarRecordCallback callback,
                                void *context, SidecarParseResult *result);
-
-const char *sidecar_open_status_string(SidecarOpenStatus status);
 
 /* The container directory fd is borrowed; the returned log owns its slot fd. */
 SidecarOpenStatus sidecar_log_create_at(int container_fd, SidecarLog *out);

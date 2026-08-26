@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdarg.h>
+#include <fcntl.h>
 #include <string.h>
 #include <limits.h>
 #include <stdint.h>
@@ -63,6 +64,22 @@ void format_size(off_t bytes, char *buf, size_t len)
     {
         snprintf(buf, len, "%lldB", (long long)bytes);
     }
+}
+
+int dup_cloexec(int fd)
+{
+    return fcntl(fd, F_DUPFD_CLOEXEC, 0);
+}
+
+size_t relative_path_depth(const char *path)
+{
+    if (path == NULL || path[0] == '\0')
+        return 0;
+    size_t depth = 1U;
+    for (const char *cursor = path; *cursor != '\0'; cursor++)
+        if (*cursor == '/')
+            depth++;
+    return depth;
 }
 
 int backup_progress_should_fire(struct timespec *last_fired, int unthrottled)
