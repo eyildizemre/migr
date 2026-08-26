@@ -364,7 +364,8 @@ static int validate_entry(const SidecarEntry *entry)
         set_invalid_error();
         return -1;
     }
-    if (entry->kind != SIDECAR_KIND_REGULAR && entry->size != 0)
+    if (entry->kind != SIDECAR_KIND_REGULAR &&
+        entry->kind != SIDECAR_KIND_DIRECTORY && entry->size != 0)
     {
         set_invalid_error();
         return -1;
@@ -949,7 +950,8 @@ static SidecarStatus parse_entry(SidecarReader *reader, SidecarEntry *entry)
         goto fail;
     entry->xattr_count = (uint32_t)number;
 
-    if (entry->kind != SIDECAR_KIND_REGULAR && entry->size != 0)
+    if (entry->kind != SIDECAR_KIND_REGULAR &&
+        entry->kind != SIDECAR_KIND_DIRECTORY && entry->size != 0)
     {
         status = SIDECAR_STATUS_CORRUPT;
         goto fail;

@@ -322,7 +322,8 @@ static SidecarStatus copy_entry(StateMemory *memory, const SidecarEntry *source,
         set_invalid_error();
         return SIDECAR_STATUS_INVALID_ARGUMENT;
     }
-    if (source->kind != SIDECAR_KIND_REGULAR && source->size != 0)
+    if (source->kind != SIDECAR_KIND_REGULAR &&
+        source->kind != SIDECAR_KIND_DIRECTORY && source->size != 0)
     {
         set_invalid_error();
         return SIDECAR_STATUS_INVALID_ARGUMENT;

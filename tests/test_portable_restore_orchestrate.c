@@ -254,10 +254,21 @@ static void test_symlink_orchestration(void)
         return;
 
     build_symlink_payload(&fixture);
+    struct stat root_st;
+    int root_stat_ok = fstatat(fixture.data_fd, "ROOT", &root_st,
+                               AT_SYMLINK_NOFOLLOW) == 0 &&
+                       S_ISDIR(root_st.st_mode) && root_st.st_size >= 0;
+    check(root_stat_ok, "symlink fixture records its source directory size");
+    if (!root_stat_ok)
+    {
+        fixture_close(&fixture);
+        return;
+    }
     uint32_t uid = (uint32_t)geteuid();
     uint32_t gid = (uint32_t)getegid();
     SidecarEntry entries[] = {
-        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY,
+                  (uint64_t)root_st.st_size, 0700,
                   uid, gid, 1700000400, 123, 1700000401, 456),
         entry_for("ROOT", "link", "link", SIDECAR_KIND_SYMLINK, 0, 0711,
                   uid, gid, 1700000410, 123456789, 1700000420, 987654321)
@@ -285,7 +296,7 @@ static void test_symlink_orchestration(void)
     check(preflight_result == 0 && preflight.live_count == 2 &&
               preflight.violation_count == 0 && preflight.root_count == 1 &&
               preflight.estimated_bytes ==
-                  (off_t)strlen("../sentinel_target") &&
+                  root_st.st_size + (off_t)strlen("../sentinel_target") &&
               preflight.roots != NULL && preflight.roots[0].live_count == 2,
           "symlink participates in the full preflight inventory");
     portable_restore_preflight_report_free(&preflight);
@@ -834,14 +845,30 @@ static void test_normal_orchestration(void)
     if (opened != 0)
         return;
     build_payload(&fixture, 1);
+    struct stat root_st, nested_st;
+    int directory_stats_ok =
+        fstatat(fixture.data_fd, "ROOT", &root_st,
+                AT_SYMLINK_NOFOLLOW) == 0 && S_ISDIR(root_st.st_mode) &&
+        root_st.st_size >= 0 &&
+        fstatat(fixture.data_fd, "ROOT/nested", &nested_st,
+                AT_SYMLINK_NOFOLLOW) == 0 && S_ISDIR(nested_st.st_mode) &&
+        nested_st.st_size >= 0;
+    check(directory_stats_ok,
+          "nested directory fixture records source directory sizes");
+    if (!directory_stats_ok)
+    {
+        fixture_close(&fixture);
+        return;
+    }
     uint32_t uid = (uint32_t)geteuid();
     uint32_t gid = (uint32_t)getegid();
     SidecarEntry entries[] = {
-        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY,
+                  (uint64_t)root_st.st_size, 0700,
                   uid, gid, 1700000000, 123456789, 1700000010, 987654321),
-        entry_for("ROOT", "nested", "nested", SIDECAR_KIND_DIRECTORY, 0,
-                  0700, uid, gid, 1700000020, 111111111, 1700000030,
-                  222222222),
+        entry_for("ROOT", "nested", "nested", SIDECAR_KIND_DIRECTORY,
+                  (uint64_t)nested_st.st_size, 0700, uid, gid, 1700000020,
+                  111111111, 1700000030, 222222222),
         entry_for("ROOT", "nested/file", "nested/file",
                   SIDECAR_KIND_REGULAR, strlen("portable payload"), 0640,
                   uid, gid, 1700000040, 333333333, 1700000050, 444444444)

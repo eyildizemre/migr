@@ -93,9 +93,9 @@ typedef struct MetadataProfiles MetadataProfiles;
  * @brief Native restore byte estimate accumulated during metadata inventory.
  *
  * The estimate counts regular-file content once per source inode across all
- * restore roots, plus symlink target bytes. A failed accounting operation is
- * recorded in had_error so the caller can keep D27's fail-open behaviour for
- * an unmeasurable estimate.
+ * restore roots, source directory sizes, and symlink target bytes. A failed
+ * accounting operation is recorded in had_error so the caller can keep D27's
+ * fail-open behaviour for an unmeasurable estimate.
  */
 typedef struct {
     off_t estimated_bytes;

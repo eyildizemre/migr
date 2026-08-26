@@ -1252,7 +1252,8 @@ int entry_from_stat(const char *root_id, const char *logical,
     out->mtime_nsec = nsec_exact ? (uint32_t)st->st_mtim.tv_nsec : 0;
     out->size = out->kind == SIDECAR_KIND_HARDLINK
                     ? 0U
-                    : (S_ISREG(st->st_mode) ? (uint64_t)st->st_size : 0U);
+                    : ((S_ISREG(st->st_mode) || S_ISDIR(st->st_mode))
+                           ? (uint64_t)st->st_size : 0U);
     out->xattr_count = out->kind == SIDECAR_KIND_HARDLINK
                            ? 0U
                            : (xattrs == NULL ? 0U : (uint32_t)xattrs->count);
@@ -1326,7 +1327,8 @@ int entries_equal(const SidecarEntry *current,
              current->atime_nsec == entry->atime_nsec)) &&
            current->mtime_sec == entry->mtime_sec &&
            current->mtime_nsec == entry->mtime_nsec &&
-           current->size == entry->size &&
+           (current->kind != SIDECAR_KIND_REGULAR ||
+            current->size == entry->size) &&
            sidecar_bytes_equal(current->symlink_target, entry->symlink_target) &&
            sidecar_bytes_equal(current->hardlink_root_id,
                                entry->hardlink_root_id) &&

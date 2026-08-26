@@ -2686,3 +2686,38 @@ representation-specific estimate is rejected because both allocation rounding
 and hardlink sharing are established before native/portable selection and are
 valid for either representation. Symlink/directory rounding is deferred until
 their actual destination allocation semantics justify it.
+
+---
+
+## D32 — 2026-08-26 — Sidecar directory sizes are estimate-only
+
+**Status:** Implemented
+
+**Decision:** Sidecar `ENTRY` records may carry the source directory's
+`st_size` in `size`. Native and portable restore free-space estimates include
+those directory values alongside regular-file bytes and symlink target lengths.
+The v1 wire encoding and directory restore semantics do not change; hardlinks
+and symlinks continue to carry zero in `size`.
+
+A recorded directory size is source-filesystem metadata, not portable directory
+content. Restore must never compare it with a destination directory's
+`st_size` during payload inventory or replay: directory layout and filesystem
+representation make that value inherently non-reproducible. It is used only
+to make the destination-space estimate consistent with backup's directory
+accounting. This extends D17's core `size` contract without requiring a
+`SIDECAR_VERSION` bump.
+
+**Why:** The backup estimate already includes directory `st_size`, and omitting
+it on restore makes the same captured tree use different space models in the
+two directions. Allowing the recorded value through the writer, parser, and
+state map preserves that accounting without turning a filesystem artifact into
+an integrity claim.
+
+**Rejected:** Comparing a restored directory's `st_size` with the recorded
+source value is rejected because a correct restore can legitimately produce a
+different directory representation. Directory sizes are not used as resume or
+payload-content keys; only the free-space estimate consumes them.
+
+**Relationship:** D32 extends D17's `size` rule for directory entries and
+refines D27's restore-side estimate parity. D17's directory metadata and
+post-order restore requirements remain unchanged.

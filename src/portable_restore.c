@@ -1295,12 +1295,14 @@ static int collect_entry(const SidecarLiveView *view, void *argument)
         report_violation(report, root_index, "unsupported-kind");
         return 0;
     }
-    if (entry->kind != SIDECAR_KIND_REGULAR && entry->size != 0)
+    if (entry->kind != SIDECAR_KIND_REGULAR &&
+        entry->kind != SIDECAR_KIND_DIRECTORY && entry->size != 0)
     {
         report_violation(report, root_index, "invalid-size");
         return 0;
     }
-    if (entry->kind == SIDECAR_KIND_REGULAR)
+    if (entry->kind == SIDECAR_KIND_REGULAR ||
+        entry->kind == SIDECAR_KIND_DIRECTORY)
         portable_restore_estimate_add(report, entry->size);
     else if (entry->kind == SIDECAR_KIND_SYMLINK)
         portable_restore_estimate_add(report, entry->symlink_target.length);
@@ -2060,7 +2062,8 @@ int replay_entry_valid(const SidecarEntry *entry)
          entry->kind != SIDECAR_KIND_DIRECTORY &&
          entry->kind != SIDECAR_KIND_SYMLINK &&
          entry->kind != SIDECAR_KIND_HARDLINK) ||
-        (entry->kind != SIDECAR_KIND_REGULAR && entry->size != 0))
+        (entry->kind != SIDECAR_KIND_REGULAR &&
+         entry->kind != SIDECAR_KIND_DIRECTORY && entry->size != 0))
         return 0;
     if (entry->kind != SIDECAR_KIND_SYMLINK)
         return 1;

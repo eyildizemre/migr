@@ -3067,6 +3067,7 @@ static RestoreNativeStatus restore_entry_at(
                 close(source_dir_fd);
             return RESTORE_NATIVE_ERROR;
         }
+        native_restore_estimate_add_bytes(estimate, opened_source_st.st_size);
 
         if (pass == RESTORE_VALIDATE &&
             (profiles != NULL || xattr_requirements != NULL))

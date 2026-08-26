@@ -597,20 +597,47 @@ static void test_v1_restore_space_preflight(void)
         return;
     }
 
+    char payload_root[PATH_MAX];
+    join_path(payload_root, sizeof(payload_root), source, "data/EXPLICIT_0");
+    struct stat payload_root_st;
+    int payload_root_ok = stat(payload_root, &payload_root_st) == 0 &&
+                          S_ISDIR(payload_root_st.st_mode) &&
+                          payload_root_st.st_size >= 0;
+    check(payload_root_ok, "fixture: inspect the native payload directory size");
+    if (!payload_root_ok)
+    {
+        remove_tree(source);
+        remove_tree(home);
+        return;
+    }
+    off_t expected_estimate = payload_root_st.st_size +
+                              (off_t)strlen("payload");
+    char expected_estimate_text[32];
+    format_size(expected_estimate, expected_estimate_text,
+                sizeof(expected_estimate_text));
+    char expected_estimate_line[64];
+    int expected_estimate_line_length = snprintf(
+        expected_estimate_line, sizeof(expected_estimate_line),
+        "Estimated restore size: %s", expected_estimate_text);
+    int expected_estimate_line_valid = expected_estimate_line_length >= 0 &&
+        (size_t)expected_estimate_line_length < sizeof(expected_estimate_line);
+
     char output[8192];
     int previous_dry_run = dry_run;
     dry_run = 1;
     int rc = run_restore_capturing(source, output, sizeof(output));
-    check(rc == 0 && strstr(output, "Estimated restore size: 7B") != NULL &&
-              strstr(output, "Estimated restore size: 14B") == NULL,
-          "native restore estimate counts a hardlink group only once");
+    check(rc == 0 && expected_estimate_line_valid &&
+              strstr(output, expected_estimate_line) != NULL &&
+              strstr(output, "Estimated restore size: 7B") == NULL,
+          "native restore estimate counts directory size and a hardlink group only once");
 
     off_t block_size = 1;
     backup_test_set_block_size_hook(set_test_block_size, &block_size);
     backup_test_set_free_space_hook(force_no_free_space, NULL);
 
     rc = run_restore_capturing(source, output, sizeof(output));
-    check(rc != 0 && strstr(output, "Estimated restore size: 7B") != NULL &&
+    check(rc != 0 && expected_estimate_line_valid &&
+              strstr(output, expected_estimate_line) != NULL &&
               strstr(output, "Destination free space: 0B") != NULL &&
               strstr(output, "Error: not enough free space at ") != NULL &&
               strstr(output, home) != NULL && strstr(output, "Continue?") == NULL,
@@ -618,7 +645,8 @@ static void test_v1_restore_space_preflight(void)
 
     dry_run = 0;
     rc = run_restore_capturing(source, output, sizeof(output));
-    check(rc != 0 && strstr(output, "Estimated restore size: 7B") != NULL &&
+    check(rc != 0 && expected_estimate_line_valid &&
+              strstr(output, expected_estimate_line) != NULL &&
               strstr(output, "Destination free space: 0B") != NULL &&
               strstr(output, "Error: not enough free space at ") != NULL &&
               strstr(output, home) != NULL && strstr(output, "Continue?") == NULL,
