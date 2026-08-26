@@ -1148,6 +1148,59 @@ EOF
         echo "  exit=$pkg_live_rc output: $pkg_live_out"
         exit 1
     fi
+
+    # A sparse native payload larger than the destination's current free space
+    # exercises the restore-side refusal without allocating the payload bytes.
+    local space_src="$TEST_DIR/v1_restore_space_src"
+    local space_home="$TEST_DIR/v1_restore_space_home"
+    mkdir -p "$space_src/data/EXPLICIT_0" "$space_home"
+    cat > "$space_src/manifest.txt" <<'EOF'
+MIGR_MANIFEST
+VERSION=1
+REPRESENTATION=native
+SCOPE=explicit
+SIDECAR_VERSION=0
+ROOT_COUNT=1
+ROOT ID=EXPLICIT_0 POLICY=HOME_RELATIVE PAYLOAD=EXPLICIT_0 SOURCE=Documents/space RESTORE=Documents/space
+EOF
+
+    local space_available
+    space_available=$(df -P -B1 "$space_home" | awk 'NR == 2 { print $4 }')
+    if ! [[ "$space_available" =~ ^[0-9]+$ ]] ||
+       [ "$space_available" -ge 9223372036854775806 ]; then
+        echo -e "  ${RED}✗${NC} Could not derive a safe destination free-space test size."
+        exit 1
+    fi
+    truncate -s "$((space_available + 1))" \
+        "$space_src/data/EXPLICIT_0/space.bin"
+
+    local space_dry_out space_dry_rc space_live_out space_live_rc
+    set +e
+    space_dry_out=$(env HOME="$space_home" ../migr restore \
+        "$space_src" --dry-run 2>&1)
+    space_dry_rc=$?
+    space_live_out=$(printf 'y\n' | env HOME="$space_home" ../migr \
+        restore "$space_src" 2>&1)
+    space_live_rc=$?
+    set -e
+    if [ "$space_dry_rc" -eq 0 ] || [ "$space_live_rc" -eq 0 ] ||
+       [ -e "$space_home/Documents/space" ]; then
+        echo -e "  ${RED}✗${NC} Restore free-space refusal did not stop before mutation."
+        echo "  dry exit=$space_dry_rc output: $space_dry_out"
+        echo "  live exit=$space_live_rc output: $space_live_out"
+        exit 1
+    fi
+    assert_contains "$space_dry_out" "Estimated restore size:"
+    assert_contains "$space_dry_out" "Destination free space:"
+    assert_contains "$space_dry_out" \
+        "Error: not enough free space at $space_home (need "
+    assert_not_contains "$space_dry_out" "Continue?"
+    assert_contains "$space_live_out" "Estimated restore size:"
+    assert_contains "$space_live_out" "Destination free space:"
+    assert_contains "$space_live_out" \
+        "Error: not enough free space at $space_home (need "
+    assert_not_contains "$space_live_out" "Continue?"
+    echo -e "  ${GREEN}✓${NC} Native restore refuses a sparse payload that exceeds destination space."
 }
 
 test_native_restore_progress() {

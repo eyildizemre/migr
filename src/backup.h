@@ -39,6 +39,10 @@ typedef enum {
  */
 int backup(const char *target, BackupMode mode, char **paths);
 
+/* Shared by backup and restore destination free-space preflights. */
+int destination_block_size(int dest_fd, off_t *block_size);
+int destination_has_space(int dest_fd, off_t needed, off_t *free_bytes);
+
 #ifdef BACKUP_TEST_HOOKS
 typedef void (*BackupTestInventoryHook)(const char *source_path,
                                         void *context);

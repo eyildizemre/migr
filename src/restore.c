@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include "restore.h"
+#include "backup.h"
 #include "container.h"
 #include "detect.h"
 #include "fileops.h"
@@ -241,6 +242,54 @@ static void native_restore_security_dry_run_notice(size_t entries)
                "whether they can be applied here is measured, not "
                "predicted, and is only found out on a live run.\n",
                entries);
+}
+
+static int native_restore_space_preflight(
+    int home_fd, const char *home, const NativeRestoreEstimate *estimate)
+{
+    if (estimate == NULL || estimate->had_error)
+    {
+        print_warning("Warning: could not fully estimate restore size; "
+                      "skipping the free-space preflight check.\n");
+        return 0;
+    }
+
+    off_t block_size = 0;
+    if (destination_block_size(home_fd, &block_size) != 0 || block_size <= 0)
+    {
+        print_warning("Warning: could not determine destination free space; "
+                      "skipping the free-space preflight check.\n");
+        return 0;
+    }
+
+    off_t free_bytes = 0;
+    int has_space = destination_has_space(home_fd, estimate->estimated_bytes,
+                                          &free_bytes);
+    if (has_space < 0)
+    {
+        print_warning("Warning: could not determine destination free space; "
+                      "skipping the free-space preflight check.\n");
+        return 0;
+    }
+
+    char estimated_text[32];
+    char free_text[32];
+    format_size(estimate->estimated_bytes, estimated_text,
+                sizeof(estimated_text));
+    format_size(free_bytes, free_text, sizeof(free_text));
+    printf("Estimated restore size: %s\n", estimated_text);
+    printf("Destination free space: %s\n", free_text);
+    if (!has_space)
+    {
+        off_t shortfall = estimate->estimated_bytes - free_bytes;
+        char shortfall_text[32];
+        format_size(shortfall, shortfall_text, sizeof(shortfall_text));
+        fflush(stdout);
+        print_error("Error: not enough free space at %s (need %s more)\n",
+                    home, shortfall_text);
+        return -1;
+    }
+    return 0;
 }
 
 static int native_restore_confirm(size_t security_xattr_entries)
@@ -803,7 +852,8 @@ static RestoreNativeStatus restore_metadata_item(
     const CloneContext *ctx, int source_root_fd, const char *source_rel,
     int destination_root_fd, const char *destination_rel, const char *label,
     int required, MetadataProfiles *profiles,
-    RestoreTimestampAnchors *timestamp_anchors)
+    RestoreTimestampAnchors *timestamp_anchors,
+    NativeRestoreEstimate *estimate)
 {
     RestoreSourceStatus status =
         restore_native_source_status_at(source_root_fd, source_rel);
@@ -837,13 +887,15 @@ static RestoreNativeStatus restore_metadata_item(
     }
     return restore_native_metadata_inventory_at(ctx, source_root_fd, source_rel,
                                                 destination_root_fd,
-                                                destination_rel, profiles);
+                                                destination_rel, profiles,
+                                                estimate);
 }
 
 static RestoreNativeStatus restore_legacy_metadata_inventory(
     const char *source, int source_root_fd, const char *home, int home_fd,
     const CloneContext *ctx, MetadataProfiles *profiles,
-    RestoreTimestampAnchors *timestamp_anchors)
+    RestoreTimestampAnchors *timestamp_anchors,
+    NativeRestoreEstimate *estimate)
 {
     char *xdg_dirs[XDG_RESTORE_COUNT] = {0};
     if (xdg_resolve(home, xdg_keys, xdg_fallbacks, xdg_dirs,
@@ -894,7 +946,7 @@ static RestoreNativeStatus restore_legacy_metadata_inventory(
         }
         RestoreNativeStatus item_status = restore_metadata_item(
             ctx, source_root_fd, name, destination_fd, destination_rel, name,
-            0, profiles, timestamp_anchors);
+            0, profiles, timestamp_anchors, estimate);
         if (item_status != RESTORE_NATIVE_OK)
         {
             failed = 1;
@@ -915,7 +967,7 @@ static RestoreNativeStatus restore_legacy_metadata_inventory(
     {
         RestoreNativeStatus item_status = restore_metadata_item(
             ctx, source_root_fd, home_items[i], home_fd, home_items[i],
-            home_items[i], 0, profiles, timestamp_anchors);
+            home_items[i], 0, profiles, timestamp_anchors, estimate);
         if (item_status != RESTORE_NATIVE_OK)
         {
             failed = 1;
@@ -934,7 +986,8 @@ static RestoreNativeStatus restore_legacy_metadata_inventory(
 static RestoreNativeStatus restore_v1_metadata_inventory(
     int source_root_fd, const char *home, int home_fd, const Manifest *m,
     const CloneContext *ctx, MetadataProfiles *profiles,
-    RestoreTimestampAnchors *timestamp_anchors)
+    RestoreTimestampAnchors *timestamp_anchors,
+    NativeRestoreEstimate *estimate)
 {
     char *xdg_dirs[XDG_RESTORE_COUNT] = {0};
     int xdg_ready = 0;
@@ -997,7 +1050,7 @@ static RestoreNativeStatus restore_v1_metadata_inventory(
 
         RestoreNativeStatus item_status = restore_metadata_item(
             ctx, source_root_fd, source_rel, destination_fd, destination_rel,
-            root->id, 1, profiles, timestamp_anchors);
+            root->id, 1, profiles, timestamp_anchors, estimate);
         if (item_status != RESTORE_NATIVE_OK)
         {
             failed = 1;
@@ -1523,6 +1576,7 @@ int restore(const char *source)
             .source_container_fd = source_root_fd,
             .manifest = &m,
             .destination_home_fd = home_fd,
+            .destination_home_path = home,
             .destination_timestamp_policy = {0}
         };
         for (int index = 0; index < XDG_RESTORE_COUNT; index++)
@@ -1606,6 +1660,8 @@ int restore(const char *source)
     BackupCaptureReport capture_report;
     backup_capture_report_init(&capture_report);
     capture_report.sync_interval_bytes = BACKUP_SYNC_INTERVAL_BYTES;
+    NativeRestoreEstimate restore_estimate;
+    native_restore_estimate_init(&restore_estimate);
     MetadataProfiles metadata_profiles;
     metadata_profiles_init(&metadata_profiles);
     RestoreTimestampAnchors timestamp_anchors;
@@ -1614,17 +1670,31 @@ int restore(const char *source)
     if (mst == MANIFEST_STATUS_VALID)
         metadata_inventory_status = restore_v1_metadata_inventory(
             source_root_fd, home, home_fd, &m, &ctx, &metadata_profiles,
-            &timestamp_anchors);
+            &timestamp_anchors, &restore_estimate);
     else
         metadata_inventory_status = restore_legacy_metadata_inventory(
             source, source_root_fd, home, home_fd, &ctx, &metadata_profiles,
-            &timestamp_anchors);
+            &timestamp_anchors, &restore_estimate);
     if (metadata_inventory_status != RESTORE_NATIVE_OK)
     {
         if (metadata_inventory_status == RESTORE_NATIVE_SOURCE_SAFE_READ)
             report_source_safe_read_refusal("native restore payload", NULL);
         else
             print_error("Error: native metadata preflight failed; no destination was changed\n");
+        native_restore_estimate_free(&restore_estimate);
+        metadata_profiles_free(&metadata_profiles);
+        restore_timestamp_anchors_free(&timestamp_anchors);
+        if (mst == MANIFEST_STATUS_VALID)
+            manifest_free(&m);
+        close(home_fd);
+        close(source_root_fd);
+        return 1;
+    }
+    int space_refused = native_restore_space_preflight(
+        home_fd, home, &restore_estimate) != 0;
+    native_restore_estimate_free(&restore_estimate);
+    if (space_refused)
+    {
         metadata_profiles_free(&metadata_profiles);
         restore_timestamp_anchors_free(&timestamp_anchors);
         if (mst == MANIFEST_STATUS_VALID)

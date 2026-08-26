@@ -18,6 +18,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "backup.h"
 #include "manifest.h"
 #include "metadata.h"
 #include "fsprobe.h"
@@ -42,6 +43,21 @@ static void check(int condition, const char *label)
         printf("  " RED "x" NC " %s\n", label);
         failures++;
     }
+}
+
+static void force_no_free_space(off_t needed, off_t *free_bytes,
+                                void *context)
+{
+    (void)needed;
+    (void)context;
+    if (free_bytes != NULL)
+        *free_bytes = 0;
+}
+
+static void set_test_block_size(off_t *block_size, void *context)
+{
+    if (block_size != NULL && context != NULL)
+        *block_size = *(const off_t *)context;
 }
 
 static void fatal(const char *message)
@@ -268,6 +284,8 @@ static void test_symlink_orchestration(void)
         ? portable_restore_preflight_at(&preflight_request, &preflight) : -1;
     check(preflight_result == 0 && preflight.live_count == 2 &&
               preflight.violation_count == 0 && preflight.root_count == 1 &&
+              preflight.estimated_bytes ==
+                  (off_t)strlen("../sentinel_target") &&
               preflight.roots != NULL && preflight.roots[0].live_count == 2,
           "symlink participates in the full preflight inventory");
     portable_restore_preflight_report_free(&preflight);
@@ -646,6 +664,7 @@ typedef struct {
 
 typedef struct {
     int saved_stdout;
+    int saved_stderr;
     FILE *file;
 } OutputCapture;
 
@@ -679,24 +698,33 @@ static void output_capture_begin(OutputCapture *capture)
     if (capture == NULL)
         fatal("invalid output capture fixture");
     fflush(stdout);
+    fflush(stderr);
     capture->file = tmpfile();
     capture->saved_stdout = dup(STDOUT_FILENO);
+    capture->saved_stderr = dup(STDERR_FILENO);
     if (capture->file == NULL || capture->saved_stdout < 0 ||
-        dup2(fileno(capture->file), STDOUT_FILENO) < 0)
+        capture->saved_stderr < 0 ||
+        dup2(fileno(capture->file), STDOUT_FILENO) < 0 ||
+        dup2(fileno(capture->file), STDERR_FILENO) < 0)
         fatal("could not redirect restore output");
 }
 
 static void output_capture_end(OutputCapture *capture, char *output,
                                size_t output_size)
 {
-    if (capture == NULL || capture->file == NULL || output == NULL ||
-        output_size == 0)
+    if (capture == NULL || capture->file == NULL ||
+        capture->saved_stdout < 0 || capture->saved_stderr < 0 ||
+        output == NULL || output_size == 0)
         fatal("invalid output capture state");
     fflush(stdout);
+    fflush(stderr);
     if (dup2(capture->saved_stdout, STDOUT_FILENO) < 0 ||
-        close(capture->saved_stdout) != 0)
+        dup2(capture->saved_stderr, STDERR_FILENO) < 0 ||
+        close(capture->saved_stdout) != 0 ||
+        close(capture->saved_stderr) != 0)
         fatal("could not restore restore output");
     capture->saved_stdout = -1;
+    capture->saved_stderr = -1;
     rewind(capture->file);
     size_t received = fread(output, 1, output_size - 1U, capture->file);
     if (ferror(capture->file))
@@ -726,6 +754,7 @@ static PortableRestoreRequest request_for(Fixture *fixture,
         .source_container_fd = fixture->container_fd,
         .manifest = manifest,
         .destination_home_fd = fixture->home_fd,
+        .destination_home_path = fixture->home,
         .destination_timestamp_policy = {
             .nsec_exact = nsec_exact,
             .configured = 1
@@ -1398,6 +1427,79 @@ static void test_dry_run(void)
     fixture_close(&fixture);
 }
 
+static void test_destination_space_preflight(void)
+{
+    printf(BLUE "::" NC " portable restore free-space preflight\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "space-preflight fixture is created");
+    if (opened != 0)
+        return;
+
+    build_payload(&fixture, 0);
+    uint32_t uid = (uint32_t)geteuid();
+    uint32_t gid = (uint32_t)getegid();
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  uid, gid, 1700000700, 1, 1700000701, 2),
+        entry_for("ROOT", "file", "file", SIDECAR_KIND_REGULAR,
+                  strlen("portable payload"), 0600, uid, gid,
+                  1700000702, 3, 1700000703, 4)
+    };
+    check(write_sidecar(&fixture, entries, 2) == 0,
+          "space-preflight sidecar is committed");
+
+    off_t block_size = 1;
+    backup_test_set_block_size_hook(set_test_block_size, &block_size);
+    backup_test_set_free_space_hook(force_no_free_space, NULL);
+    int previous_dry_run = dry_run;
+    char live_output[4096];
+    char dry_output[4096];
+    OutputCapture capture;
+
+    dry_run = 0;
+    PortableRestoreReplayReport live_report;
+    output_capture_begin(&capture);
+    int live_result = run_orchestration(&fixture, &live_report, 1, "y\n");
+    output_capture_end(&capture, live_output, sizeof(live_output));
+
+    dry_run = 1;
+    PortableRestoreReplayReport dry_report;
+    output_capture_begin(&capture);
+    int dry_result = run_orchestration(&fixture, &dry_report, 1, "y\n");
+    output_capture_end(&capture, dry_output, sizeof(dry_output));
+
+    char error_marker[PATH_MAX + 64];
+    int marker_length = snprintf(error_marker, sizeof(error_marker),
+                                 "Error: not enough free space at %s (need ",
+                                 fixture.home);
+    int marker_valid = marker_length >= 0 &&
+                       (size_t)marker_length < sizeof(error_marker);
+    check(marker_valid && live_result != 0 && live_report.live_count == 2 &&
+              strstr(live_output, "Estimated restore size: 16B") != NULL &&
+              strstr(live_output, "Destination free space: 0B") != NULL &&
+              strstr(live_output, error_marker) != NULL &&
+              strstr(live_output, "Continue?") == NULL,
+          "portable live restore refuses before confirmation when space is insufficient");
+    check(marker_valid && dry_result != 0 && dry_report.live_count == 2 &&
+              strstr(dry_output, "Estimated restore size: 16B") != NULL &&
+              strstr(dry_output, "Destination free space: 0B") != NULL &&
+              strstr(dry_output, error_marker) != NULL &&
+              strstr(dry_output, "Continue?") == NULL,
+          "portable dry-run refuses before preview when space is insufficient");
+
+    char restored[PATH_MAX];
+    path_join_fixture(restored, sizeof(restored), fixture.home, "/restored");
+    check(access(restored, F_OK) != 0,
+          "portable space refusal leaves the destination untouched");
+
+    dry_run = previous_dry_run;
+    backup_test_set_block_size_hook(NULL, NULL);
+    backup_test_set_free_space_hook(NULL, NULL);
+    fixture_close(&fixture);
+}
+
 static void test_coarse_timestamp_policy(void)
 {
     printf(BLUE "::" NC " coarse destination timestamp policy\n");
@@ -1600,6 +1702,7 @@ int main(void)
     test_symlink_destination_conflict();
     test_probe_rejection();
     test_dry_run();
+    test_destination_space_preflight();
     test_coarse_timestamp_policy();
     test_direct_complete_outcome();
     test_direct_dry_run_outcome();

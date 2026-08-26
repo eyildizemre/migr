@@ -4,16 +4,15 @@
 // malformed v1 manifest refuses the whole restore before any confirmation or
 // mutation; a ".partial" source is refused outright (docs/DECISIONS.md D15).
 //
-// Every case here runs with dry_run forced on for the whole binary (set once
+// Most cases here run with dry_run forced on for the whole binary (set once
 // in main(), inherited by every fork()ed restore() call below), so none of
 // this ever needs an interactive confirm_action() prompt or touches a real
-// destination -- it is exercising the DISPATCH decision and the v1 root-table
-// walker's addressing, not full live mutation (that is restore_native.c's
-// and test.sh's job). Happy-path v1 fixtures are written with the real
-// manifest_write_v1() so the fixture can never silently drift from what the
-// reader actually accepts; malformed/unknown-version fixtures are raw
-// strings, so a writer bug can never mask a reader bug -- see
-// tests/test_manifest.c for the same split.
+// destination. The space-refusal case also runs once with dry_run disabled:
+// it must prove that the free-space gate precedes confirmation. Happy-path v1
+// fixtures are written with the real manifest_write_v1() so the fixture can
+// never silently drift from what the reader actually accepts;
+// malformed/unknown-version fixtures are raw strings, so a writer bug can
+// never mask a reader bug -- see tests/test_manifest.c for the same split.
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -27,6 +26,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "backup.h"
 #include "manifest.h"
 #include "restore.h"
 #include "utils.h"
@@ -47,6 +47,21 @@ static void check(int cond, const char *label)
         printf("  " RED "x" NC " %s\n", label);
         failures++;
     }
+}
+
+static void force_no_free_space(off_t needed, off_t *free_bytes,
+                                void *context)
+{
+    (void)needed;
+    (void)context;
+    if (free_bytes != NULL)
+        *free_bytes = 0;
+}
+
+static void set_test_block_size(off_t *block_size, void *context)
+{
+    if (block_size != NULL && context != NULL)
+        *block_size = *(const off_t *)context;
 }
 
 static void fresh_mkdtemp(char *buf, size_t bufsize, const char *prefix)
@@ -547,6 +562,80 @@ static void test_v1_empty_restore_path_means_home_itself(void)
     remove_tree(home);
 }
 
+static void test_v1_restore_space_preflight(void)
+{
+    printf(BLUE "::" NC " native restore free-space preflight and hardlink estimate\n");
+
+    char source[PATH_MAX], home[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_home");
+    setenv("HOME", home, 1);
+
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "EXPLICIT_0");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "EXPLICIT_0");
+    strcpy(root.source_path, "Documents/hardlinks");
+    strcpy(root.restore_path, "Documents/hardlinks");
+    root.has_restore_path = 1;
+
+    Manifest manifest;
+    make_v1_manifest(&manifest, &root, 1);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write a valid v1 manifest for the space preflight");
+    write_payload_file(source, "data/EXPLICIT_0", "first", "payload");
+
+    char first[PATH_MAX], second[PATH_MAX];
+    join_path(first, sizeof(first), source, "data/EXPLICIT_0/first");
+    join_path(second, sizeof(second), source, "data/EXPLICIT_0/second");
+    if (link(first, second) != 0)
+    {
+        check(0, "fixture: create a hardlinked second payload member");
+        remove_tree(source);
+        remove_tree(home);
+        return;
+    }
+
+    char output[8192];
+    int previous_dry_run = dry_run;
+    dry_run = 1;
+    int rc = run_restore_capturing(source, output, sizeof(output));
+    check(rc == 0 && strstr(output, "Estimated restore size: 7B") != NULL &&
+              strstr(output, "Estimated restore size: 14B") == NULL,
+          "native restore estimate counts a hardlink group only once");
+
+    off_t block_size = 1;
+    backup_test_set_block_size_hook(set_test_block_size, &block_size);
+    backup_test_set_free_space_hook(force_no_free_space, NULL);
+
+    rc = run_restore_capturing(source, output, sizeof(output));
+    check(rc != 0 && strstr(output, "Estimated restore size: 7B") != NULL &&
+              strstr(output, "Destination free space: 0B") != NULL &&
+              strstr(output, "Error: not enough free space at ") != NULL &&
+              strstr(output, home) != NULL && strstr(output, "Continue?") == NULL,
+          "native dry-run refuses before confirmation when space is insufficient");
+
+    dry_run = 0;
+    rc = run_restore_capturing(source, output, sizeof(output));
+    check(rc != 0 && strstr(output, "Estimated restore size: 7B") != NULL &&
+              strstr(output, "Destination free space: 0B") != NULL &&
+              strstr(output, "Error: not enough free space at ") != NULL &&
+              strstr(output, home) != NULL && strstr(output, "Continue?") == NULL,
+          "native live restore refuses before confirmation when space is insufficient");
+    dry_run = previous_dry_run;
+
+    backup_test_set_block_size_hook(NULL, NULL);
+    backup_test_set_free_space_hook(NULL, NULL);
+    char restored[PATH_MAX];
+    join_path(restored, sizeof(restored), home, "Documents/hardlinks");
+    check(access(restored, F_OK) != 0,
+          "native space refusal leaves the destination untouched");
+
+    remove_tree(source);
+    remove_tree(home);
+}
+
 int main(void)
 {
     printf(BLUE "::" NC " restore dispatch (unit)\n");
@@ -564,6 +653,7 @@ int main(void)
 
     test_v1_restores_home_relative_and_xdg_reports_manual_native();
     test_v1_empty_restore_path_means_home_itself();
+    test_v1_restore_space_preflight();
 
     if (failures > 0)
     {

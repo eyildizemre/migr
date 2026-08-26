@@ -70,7 +70,7 @@ static void backup_test_before_source_open(const char *source_path)
 }
 #endif
 
-static int destination_block_size(int dest_fd, off_t *block_size)
+int destination_block_size(int dest_fd, off_t *block_size)
 {
     if (dest_fd < 0 || block_size == NULL)
         return -1;
@@ -101,8 +101,7 @@ static int destination_block_size(int dest_fd, off_t *block_size)
 // when it clearly does not, and -1 when the filesystem space cannot be read.
 // f_bavail is the space this unprivileged process can actually consume;
 // f_bfree also includes blocks reserved for root.
-static int destination_has_space(int dest_fd, off_t needed,
-                                 off_t *free_bytes)
+int destination_has_space(int dest_fd, off_t needed, off_t *free_bytes)
 {
     if (dest_fd < 0 || needed < 0 || free_bytes == NULL)
         return -1;

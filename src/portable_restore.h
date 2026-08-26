@@ -14,6 +14,9 @@ typedef struct {
     int source_container_fd;
     const Manifest *manifest;
     int destination_home_fd;
+    /* Borrowed display path for preflight diagnostics; the fd remains the
+     * authoritative filesystem target. */
+    const char *destination_home_path;
     /* Restore-time XDG destinations, resolved for the current HOME. The
      * request borrows these strings; they are never serialized in a manifest. */
     const char *destination_xdg_dirs[XDG_KEY_COUNT];
@@ -41,6 +44,7 @@ typedef struct {
     size_t mapped_root_count;
     size_t violation_count;
     size_t root_count;
+    off_t estimated_bytes;
     PortableRestoreRootReport *roots;
     MetadataProfiles profiles;
 } PortableRestorePreflightReport;

@@ -90,6 +90,23 @@ NativeReconcileStatus native_reconcile_stale_at(
 typedef struct MetadataProfiles MetadataProfiles;
 
 /**
+ * @brief Native restore byte estimate accumulated during metadata inventory.
+ *
+ * The estimate counts regular-file content once per source inode across all
+ * restore roots, plus symlink target bytes. A failed accounting operation is
+ * recorded in had_error so the caller can keep D27's fail-open behaviour for
+ * an unmeasurable estimate.
+ */
+typedef struct {
+    off_t estimated_bytes;
+    int had_error;
+    void *seen_inodes;
+} NativeRestoreEstimate;
+
+void native_restore_estimate_init(NativeRestoreEstimate *estimate);
+void native_restore_estimate_free(NativeRestoreEstimate *estimate);
+
+/**
  * @brief Result of a native backup capture.
  *
  * BACKUP_CAPTURE_SOURCE_SAFE_READ is distinct from an ordinary I/O failure: the
@@ -255,7 +272,7 @@ RestoreNativeStatus restore_native_preflight_at(
 RestoreNativeStatus restore_native_metadata_inventory_at(
     const CloneContext *ctx, int source_root_fd, const char *source_rel,
     int destination_root_fd, const char *destination_rel,
-    MetadataProfiles *profiles);
+    MetadataProfiles *profiles, NativeRestoreEstimate *estimate);
 
 /**
  * @brief FD-anchored native restore core (docs/DECISIONS.md D15 and D16).

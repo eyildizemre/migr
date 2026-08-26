@@ -2,6 +2,8 @@
 
 #include "portable_restore.h"
 
+#include "backup.h"
+
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -1234,6 +1236,21 @@ static int collect_metadata_profile(const Collection *collection,
     return result;
 }
 
+static void portable_restore_estimate_add(
+    PortableRestorePreflightReport *report, uint64_t bytes)
+{
+    if (report == NULL || report->estimated_bytes < 0)
+        return;
+    if (bytes > (uintmax_t)INTMAX_MAX ||
+        (uintmax_t)report->estimated_bytes >
+            (uintmax_t)INTMAX_MAX - (uintmax_t)bytes)
+    {
+        report->estimated_bytes = -1;
+        return;
+    }
+    report->estimated_bytes += (off_t)bytes;
+}
+
 static int collect_entry(const SidecarLiveView *view, void *argument)
 {
     Collection *collection = argument;
@@ -1283,6 +1300,10 @@ static int collect_entry(const SidecarLiveView *view, void *argument)
         report_violation(report, root_index, "invalid-size");
         return 0;
     }
+    if (entry->kind == SIDECAR_KIND_REGULAR)
+        portable_restore_estimate_add(report, entry->size);
+    else if (entry->kind == SIDECAR_KIND_SYMLINK)
+        portable_restore_estimate_add(report, entry->symlink_target.length);
 
     PreflightEntries *entries = collection->entries;
     if (entries == NULL)
@@ -3404,6 +3425,56 @@ static int portable_restore_confirm(size_t security_xattr_entries)
     return confirm_action(message);
 }
 
+static int portable_restore_space_preflight(
+    const PortableRestoreRequest *request, off_t estimated_bytes)
+{
+    if (estimated_bytes < 0)
+    {
+        print_warning("Warning: could not fully estimate restore size; "
+                      "skipping the free-space preflight check.\n");
+        return 0;
+    }
+
+    off_t block_size = 0;
+    if (destination_block_size(request->destination_home_fd, &block_size) != 0 ||
+        block_size <= 0)
+    {
+        print_warning("Warning: could not determine destination free space; "
+                      "skipping the free-space preflight check.\n");
+        return 0;
+    }
+
+    off_t free_bytes = 0;
+    int has_space = destination_has_space(request->destination_home_fd,
+                                          estimated_bytes, &free_bytes);
+    if (has_space < 0)
+    {
+        print_warning("Warning: could not determine destination free space; "
+                      "skipping the free-space preflight check.\n");
+        return 0;
+    }
+
+    char estimated_text[32];
+    char free_text[32];
+    format_size(estimated_bytes, estimated_text, sizeof(estimated_text));
+    format_size(free_bytes, free_text, sizeof(free_text));
+    printf("Estimated restore size: %s\n", estimated_text);
+    printf("Destination free space: %s\n", free_text);
+    if (!has_space)
+    {
+        off_t shortfall = estimated_bytes - free_bytes;
+        char shortfall_text[32];
+        format_size(shortfall, shortfall_text, sizeof(shortfall_text));
+        const char *home = request->destination_home_path != NULL
+            ? request->destination_home_path : "destination home";
+        fflush(stdout);
+        print_error("Error: not enough free space at %s (need %s more)\n",
+                    home, shortfall_text);
+        return -1;
+    }
+    return 0;
+}
+
 static PortableRestoreOutcome portable_restore_orchestrate_impl(
     const PortableRestoreRequest *request,
     PortableRestoreReplayReport *report,
@@ -3426,6 +3497,13 @@ static PortableRestoreOutcome portable_restore_orchestrate_impl(
     int result = portable_restore_preflight_at(request, &preflight);
     if (result != 0)
     {
+        portable_restore_preflight_report_free(&preflight);
+        return PORTABLE_RESTORE_ERROR;
+    }
+
+    if (portable_restore_space_preflight(request, preflight.estimated_bytes) != 0)
+    {
+        report->live_count = preflight.live_count;
         portable_restore_preflight_report_free(&preflight);
         return PORTABLE_RESTORE_ERROR;
     }

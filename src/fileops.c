@@ -406,6 +406,227 @@ static int native_inode_map_insert(NativeInodeMap *map, dev_t device,
     return 0;
 }
 
+typedef struct {
+    dev_t device;
+    ino_t inode;
+} NativeEstimateInode;
+
+typedef struct {
+    NativeEstimateInode *items;
+    size_t count;
+    size_t items_capacity;
+    size_t *slots;
+    size_t capacity;
+} NativeEstimateSeen;
+
+static uint64_t native_estimate_inode_hash(dev_t device, ino_t inode)
+{
+    uint64_t hash = HASH_FNV1A_OFFSET_BASIS;
+    hash = hash_fnv1a_uint64(hash, (uint64_t)device);
+    return hash_fnv1a_uint64(hash, (uint64_t)inode);
+}
+
+static int native_estimate_seen_rehash(NativeEstimateSeen *seen,
+                                       size_t capacity)
+{
+    if (seen == NULL || capacity < 16U ||
+        (capacity & (capacity - 1U)) != 0 ||
+        capacity > SIZE_MAX / sizeof(*seen->slots))
+        return -1;
+
+    size_t *slots = calloc(capacity, sizeof(*slots));
+    if (slots == NULL)
+        return -1;
+
+    for (size_t item_index = 0; item_index < seen->count; item_index++)
+    {
+        size_t index = (size_t)native_estimate_inode_hash(
+            seen->items[item_index].device, seen->items[item_index].inode) &
+                       (capacity - 1U);
+        while (slots[index] != 0)
+            index = (index + 1U) & (capacity - 1U);
+        slots[index] = item_index + 1U;
+    }
+
+    free(seen->slots);
+    seen->slots = slots;
+    seen->capacity = capacity;
+    return 0;
+}
+
+/* Returns 1 for a match, 0 for an insertion slot, or -1 if full. */
+static int native_estimate_seen_locate(const NativeEstimateSeen *seen,
+                                       dev_t device, ino_t inode,
+                                       size_t *out_index)
+{
+    if (seen == NULL || out_index == NULL)
+        return -1;
+    if (seen->capacity == 0)
+    {
+        *out_index = SIZE_MAX;
+        return 0;
+    }
+
+    size_t index = (size_t)native_estimate_inode_hash(device, inode) &
+                   (seen->capacity - 1U);
+    for (size_t probes = 0; probes < seen->capacity; probes++)
+    {
+        size_t value = seen->slots[index];
+        if (value == 0)
+        {
+            *out_index = index;
+            return 0;
+        }
+        size_t item_index = value - 1U;
+        if (item_index < seen->count &&
+            seen->items[item_index].device == device &&
+            seen->items[item_index].inode == inode)
+        {
+            *out_index = index;
+            return 1;
+        }
+        index = (index + 1U) & (seen->capacity - 1U);
+    }
+
+    *out_index = SIZE_MAX;
+    return -1;
+}
+
+static int native_estimate_seen_contains(const NativeEstimateSeen *seen,
+                                         dev_t device, ino_t inode)
+{
+    if (seen == NULL || seen->capacity == 0)
+        return 0;
+    size_t index = SIZE_MAX;
+    return native_estimate_seen_locate(seen, device, inode, &index) == 1;
+}
+
+static int native_estimate_seen_add(NativeEstimateSeen *seen, dev_t device,
+                                    ino_t inode)
+{
+    if (seen == NULL)
+        return -1;
+
+    if (seen->capacity == 0 && native_estimate_seen_rehash(seen, 16U) != 0)
+        return -1;
+
+    size_t index = SIZE_MAX;
+    int location = native_estimate_seen_locate(seen, device, inode, &index);
+    if (location == 1)
+        return 0;
+    if (location < 0)
+        return -1;
+
+    if (seen->count == SIZE_MAX)
+    {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    if (seen->count + 1U > seen->capacity / 2U)
+    {
+        if (seen->capacity > SIZE_MAX / 2U ||
+            native_estimate_seen_rehash(seen, seen->capacity * 2U) != 0)
+            return -1;
+        location = native_estimate_seen_locate(seen, device, inode, &index);
+        if (location != 0)
+            return -1;
+    }
+
+    if (seen->count == seen->items_capacity)
+    {
+        size_t new_capacity = seen->items_capacity == 0
+            ? 16U : seen->items_capacity * 2U;
+        if (new_capacity < seen->items_capacity ||
+            new_capacity > SIZE_MAX / sizeof(*seen->items))
+        {
+            errno = EOVERFLOW;
+            return -1;
+        }
+        NativeEstimateInode *items = realloc(
+            seen->items, new_capacity * sizeof(*items));
+        if (items == NULL)
+            return -1;
+        seen->items = items;
+        seen->items_capacity = new_capacity;
+    }
+
+    seen->items[seen->count] = (NativeEstimateInode){
+        .device = device, .inode = inode
+    };
+    seen->slots[index] = seen->count + 1U;
+    seen->count++;
+    return 0;
+}
+
+static void native_estimate_seen_free(NativeEstimateSeen *seen)
+{
+    if (seen == NULL)
+        return;
+    free(seen->items);
+    free(seen->slots);
+    free(seen);
+}
+
+void native_restore_estimate_init(NativeRestoreEstimate *estimate)
+{
+    if (estimate == NULL)
+        return;
+    memset(estimate, 0, sizeof(*estimate));
+}
+
+void native_restore_estimate_free(NativeRestoreEstimate *estimate)
+{
+    if (estimate == NULL)
+        return;
+    native_estimate_seen_free(estimate->seen_inodes);
+    memset(estimate, 0, sizeof(*estimate));
+}
+
+static void native_restore_estimate_add_bytes(NativeRestoreEstimate *estimate,
+                                              off_t bytes)
+{
+    if (estimate == NULL || estimate->had_error)
+        return;
+    if (bytes < 0 || estimate->estimated_bytes < 0 ||
+        (uintmax_t)estimate->estimated_bytes >
+            (uintmax_t)INTMAX_MAX - (uintmax_t)bytes)
+    {
+        estimate->had_error = 1;
+        return;
+    }
+    estimate->estimated_bytes += bytes;
+}
+
+static void native_restore_estimate_regular(NativeRestoreEstimate *estimate,
+                                            const struct stat *st)
+{
+    if (estimate == NULL || estimate->had_error || st == NULL)
+        return;
+
+    NativeEstimateSeen *seen = estimate->seen_inodes;
+    if (st->st_nlink > 1)
+    {
+        if (seen == NULL)
+        {
+            seen = calloc(1, sizeof(*seen));
+            if (seen == NULL)
+            {
+                estimate->had_error = 1;
+                return;
+            }
+            estimate->seen_inodes = seen;
+        }
+        if (native_estimate_seen_contains(seen, st->st_dev, st->st_ino))
+            return;
+        if (native_estimate_seen_add(seen, st->st_dev, st->st_ino) != 0)
+        {
+            estimate->had_error = 1;
+            return;
+        }
+    }
+    native_restore_estimate_add_bytes(estimate, st->st_size);
+}
+
 static int native_seed_destination_matches(const CloneContext *ctx,
                                            const struct stat *source,
                                            const struct stat *destination)
@@ -2456,7 +2677,8 @@ static RestoreNativeStatus restore_entry_at(
     const CloneContext *ctx, RestorePass pass, int source_parent_fd,
     const char *source_leaf, int dest_parent_fd, const char *dest_leaf,
     const char *logical_path, MetadataSnapshots *snapshots,
-    MetadataProfiles *profiles, MetadataXattrRequirements *xattr_requirements,
+    MetadataProfiles *profiles, NativeRestoreEstimate *estimate,
+    MetadataXattrRequirements *xattr_requirements,
     int metadata_anchor_fd,
     int skip_symlink_target_read,
     RestoreNativeReport *restore_report,
@@ -2557,6 +2779,7 @@ static RestoreNativeStatus restore_entry_at(
 
         if (pass == RESTORE_VALIDATE && skip_symlink_target_read)
         {
+            native_restore_estimate_add_bytes(estimate, desired_st.st_size);
             close(source_object_fd);
             return RESTORE_NATIVE_OK;
         }
@@ -2579,7 +2802,10 @@ static RestoreNativeStatus restore_entry_at(
         }
         close(source_object_fd);
         if (pass == RESTORE_VALIDATE)
+        {
+            native_restore_estimate_add_bytes(estimate, desired_st.st_size);
             return RESTORE_NATIVE_OK;
+        }
 
         target[len] = '\0';
         char source_xattr_path[PATH_MAX];
@@ -2669,6 +2895,7 @@ static RestoreNativeStatus restore_entry_at(
                     (namespaces & METADATA_XATTR_NS_SECURITY) != 0)
                     metadata_profiles_note_security_xattr(profiles);
             }
+            native_restore_estimate_regular(estimate, &opened_source_st);
             return close(src_fd) == 0 ? RESTORE_NATIVE_OK : RESTORE_NATIVE_ERROR;
         }
 
@@ -2899,7 +3126,7 @@ static RestoreNativeStatus restore_entry_at(
             RestoreNativeStatus child_status = restore_entry_at(
                 ctx, pass, source_dir_fd, entry->d_name, dest_dir_fd,
                 entry->d_name, child_logical_path, snapshots, profiles,
-                xattr_requirements, metadata_anchor_fd,
+                estimate, xattr_requirements, metadata_anchor_fd,
                 skip_symlink_target_read, restore_report, capture_report);
             if (child_status != RESTORE_NATIVE_OK)
             {
@@ -3106,7 +3333,7 @@ RestoreNativeStatus restore_native_preflight_at(
     int rc = restore_entry_at(ctx, RESTORE_VALIDATE, source_parent_fd,
                               source_leaf, dest_parent_fd, dest_leaf,
                               source_rel, &snapshots, &profiles,
-                              NULL, metadata_anchor_fd, 0, NULL, NULL);
+                              NULL, NULL, metadata_anchor_fd, 0, NULL, NULL);
     close(metadata_anchor_fd);
     close(source_parent_fd);
     if (dest_parent_fd >= 0)
@@ -3119,7 +3346,7 @@ RestoreNativeStatus restore_native_preflight_at(
 RestoreNativeStatus restore_native_metadata_inventory_at(
     const CloneContext *ctx, int source_root_fd, const char *source_rel,
     int destination_root_fd, const char *destination_rel,
-    MetadataProfiles *profiles)
+    MetadataProfiles *profiles, NativeRestoreEstimate *estimate)
 {
     if (profiles == NULL || !restore_arguments_valid(ctx, source_root_fd,
                                                      source_rel,
@@ -3159,7 +3386,8 @@ RestoreNativeStatus restore_native_metadata_inventory_at(
     int rc = restore_entry_at(ctx, RESTORE_VALIDATE, source_parent_fd,
                               source_leaf, dest_parent_fd, dest_leaf,
                               source_rel, &snapshots, profiles,
-                              NULL, metadata_anchor_fd, 1, NULL, NULL);
+                              estimate, NULL, metadata_anchor_fd, 1, NULL,
+                              NULL);
     close(metadata_anchor_fd);
     close(source_parent_fd);
     if (dest_parent_fd >= 0)
@@ -3228,8 +3456,8 @@ RestoreNativeStatus restore_native_at_report(
     int rc = restore_entry_at(ctx, RESTORE_VALIDATE, source_parent_fd,
                               source_leaf, dest_parent_fd, dest_leaf,
                               source_rel, &snapshots, &profiles,
-                              &xattr_requirements, metadata_anchor_fd, 0,
-                              report, NULL);
+                              NULL, &xattr_requirements, metadata_anchor_fd,
+                              0, report, NULL);
     if (rc == 0 && !ctx->metadata_preflight_done &&
         metadata_profiles_probe(&profiles,
                                 metadata_policy_from_context(ctx)) != 0)
@@ -3255,7 +3483,7 @@ RestoreNativeStatus restore_native_at_report(
         rc = restore_entry_at(ctx, RESTORE_APPLY, source_parent_fd,
                               source_leaf, dest_parent_fd, dest_leaf,
                               source_rel, &snapshots, NULL,
-                              NULL, destination_root_fd, 0, report,
+                              NULL, NULL, destination_root_fd, 0, report,
                               capture_report);
     if (rc != RESTORE_NATIVE_OK && report->failed_count == 0)
         restore_report_failure(report, source_rel);
