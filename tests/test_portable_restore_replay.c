@@ -544,6 +544,15 @@ static void test_symlink_collection_validation(void)
     };
     check(!replay_entry_valid(&oversized),
           "oversized symlink target is rejected");
+
+    SidecarEntry fifo = entry_for("ROOT", "fifo", "fifo",
+                                  SIDECAR_KIND_FIFO, 0, 0644,
+                                  1700000300, 11, 1700000301, 22);
+    struct stat fifo_desired;
+    errno = 0;
+    check(replay_stat_from_entry(&fifo, &fifo_desired) == -1 &&
+              errno == EINVAL,
+          "a FIFO entry is rejected, not silently treated as regular");
 }
 
 static void test_hardlink_identity_validation(void)

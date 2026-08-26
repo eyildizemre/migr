@@ -1153,6 +1153,32 @@ static int open_xdg_profile_anchor(const Collection *collection,
     return result;
 }
 
+static int sidecar_kind_to_type(SidecarObjectKind kind, mode_t *type)
+{
+    if (type == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    switch (kind)
+    {
+        case SIDECAR_KIND_REGULAR:
+        case SIDECAR_KIND_HARDLINK:
+            *type = S_IFREG;
+            return 0;
+        case SIDECAR_KIND_DIRECTORY:
+            *type = S_IFDIR;
+            return 0;
+        case SIDECAR_KIND_SYMLINK:
+            *type = S_IFLNK;
+            return 0;
+        case SIDECAR_KIND_FIFO:
+        default:
+            errno = EINVAL;
+            return -1;
+    }
+}
+
 static int collect_metadata_profile(const Collection *collection,
                                     const ManifestRoot *root,
                                     size_t root_index,
@@ -1172,11 +1198,9 @@ static int collect_metadata_profile(const Collection *collection,
         errno = E2BIG;
         return -1;
     }
-    mode_t type = S_IFREG;
-    if (entry->kind == SIDECAR_KIND_SYMLINK)
-        type = S_IFLNK;
-    else if (entry->kind == SIDECAR_KIND_DIRECTORY)
-        type = S_IFDIR;
+    mode_t type;
+    if (sidecar_kind_to_type(entry->kind, &type) != 0)
+        return -1;
     desired.st_mode = entry->mode | type;
 
     int anchor = -1;
@@ -2088,11 +2112,9 @@ int replay_stat_from_entry(const SidecarEntry *entry, struct stat *desired)
     }
 
     memset(desired, 0, sizeof(*desired));
-    mode_t type = S_IFREG;
-    if (entry->kind == SIDECAR_KIND_SYMLINK)
-        type = S_IFLNK;
-    else if (entry->kind == SIDECAR_KIND_DIRECTORY)
-        type = S_IFDIR;
+    mode_t type;
+    if (sidecar_kind_to_type(entry->kind, &type) != 0)
+        return -1;
     desired->st_mode = entry->mode | type;
     desired->st_uid = (uid_t)entry->uid;
     desired->st_gid = (gid_t)entry->gid;
