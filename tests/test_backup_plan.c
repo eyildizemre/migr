@@ -1230,6 +1230,13 @@ static void provide_free_space(off_t needed, off_t *free_bytes, void *context)
     *free_bytes = needed + 1;
 }
 
+static void provide_fixed_free_space(off_t needed, off_t *free_bytes,
+                                     void *context)
+{
+    (void)needed;
+    *free_bytes = *(const off_t *)context;
+}
+
 static void test_plan_estimate_tolerates_missing_root(void)
 {
     printf(BLUE "::" NC " model: size estimation tolerates a root that vanishes after planning\n");
@@ -1355,12 +1362,44 @@ static void test_allocation_aware_estimate(void)
     join_path(target, sizeof(target), target_parent, "allocation-aware");
     dry_run = 0;
     char output[8192];
+    backup_test_set_progress_hook(record_backup_progress, NULL);
     int result = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
                                       output, sizeof(output));
+    backup_test_set_progress_hook(NULL, NULL);
+    check(result == 0 && strstr(output, "Estimated backup size: 15B") != NULL &&
+              strstr(output, "Estimated backup size: 20B") == NULL,
+          "backup() displays the raw source estimate");
+    check(result == 0 && strstr(output, "\rProgress: 15B/15B copied") != NULL,
+          "live progress uses the raw source total");
+
+    dry_run = 1;
+    char dry_output[8192];
+    int dry_result = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS,
+                                          paths, dry_output,
+                                          sizeof(dry_output));
+    dry_run = 0;
+    check(dry_result == 0 &&
+              strstr(dry_output, "Estimated backup size: 15B") != NULL &&
+              strstr(dry_output, "Estimated backup size: 20B") == NULL,
+          "dry-run displays the raw source estimate");
+
+    off_t raw_free_bytes = 15;
+    backup_test_set_free_space_hook(provide_fixed_free_space,
+                                    &raw_free_bytes);
+    char fit_target[PATH_MAX];
+    join_path(fit_target, sizeof(fit_target), target_parent,
+              "rounded-fit-check");
+    char fit_output[8192];
+    int fit_result = run_backup_capturing(fit_target, BACKUP_EXPLICIT_PATHS,
+                                          paths, fit_output,
+                                          sizeof(fit_output));
     backup_test_set_block_size_hook(NULL, NULL);
     backup_test_set_free_space_hook(NULL, NULL);
-    check(result == 0 && strstr(output, "Estimated backup size: 20B") != NULL,
-          "backup() uses the injected allocation block size in its estimate");
+    check(fit_result == 1 &&
+              strstr(fit_output, "Estimated backup size: 15B") != NULL &&
+              strstr(fit_output, "Destination free space: 15B") != NULL &&
+              strstr(fit_output, "need 5B more") != NULL,
+          "the free-space fit check still uses the rounded estimate");
 
     remove_tree(home);
     remove_tree(target_parent);

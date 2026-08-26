@@ -815,6 +815,8 @@ int backup(const char *target, BackupMode mode, char **paths)
 
     off_t estimated_size = 0;
     int estimate_had_error = 0;
+    off_t raw_estimated_size = 0;
+    int raw_estimate_had_error = 0;
 
     int count = 0;
 
@@ -846,7 +848,9 @@ int backup(const char *target, BackupMode mode, char **paths)
             (void)destination_block_size(advisory_fd, &advisory_block_size);
             backup_plan_estimate_size(&plan, advisory_block_size,
                                       &estimated_size, &estimate_had_error);
-            if (estimate_had_error)
+            backup_plan_estimate_size(&plan, 1, &raw_estimated_size,
+                                      &raw_estimate_had_error);
+            if (estimate_had_error || raw_estimate_had_error)
                 print_warning("Warning: could not fully estimate backup size; "
                        "skipping the free-space preflight check.\n");
             else
@@ -861,7 +865,7 @@ int backup(const char *target, BackupMode mode, char **paths)
                 {
                     char estimated_text[32];
                     char free_text[32];
-                    format_size(estimated_size, estimated_text,
+                    format_size(raw_estimated_size, estimated_text,
                                 sizeof(estimated_text));
                     format_size(free_bytes, free_text, sizeof(free_text));
                     printf("Estimated backup size: %s\n", estimated_text);
@@ -1039,8 +1043,10 @@ int backup(const char *target, BackupMode mode, char **paths)
     (void)destination_block_size(target_fd, &target_block_size);
     backup_plan_estimate_size(&plan, target_block_size,
                               &estimated_size, &estimate_had_error);
+    backup_plan_estimate_size(&plan, 1, &raw_estimated_size,
+                              &raw_estimate_had_error);
 
-    if (estimate_had_error)
+    if (estimate_had_error || raw_estimate_had_error)
         print_warning("Warning: could not fully estimate backup size; "
                "skipping the free-space preflight check.\n");
     else
@@ -1055,7 +1061,7 @@ int backup(const char *target, BackupMode mode, char **paths)
         {
             char estimated_text[32];
             char free_text[32];
-            format_size(estimated_size, estimated_text,
+            format_size(raw_estimated_size, estimated_text,
                         sizeof(estimated_text));
             format_size(free_bytes, free_text, sizeof(free_text));
             printf("Estimated backup size: %s\n", estimated_text);
@@ -1335,7 +1341,8 @@ int backup(const char *target, BackupMode mode, char **paths)
         backup_capture_report_init(&capture_report);
         capture_report.sync_interval_bytes = BACKUP_SYNC_INTERVAL_BYTES;
         BackupProgressDisplay progress_display = {
-            .estimated_total_bytes = estimate_had_error ? 0 : estimated_size,
+            .estimated_total_bytes = estimate_had_error || raw_estimate_had_error
+                ? 0 : raw_estimated_size,
             .data_fd = data_fd
         };
         int progress_installed = 0;
@@ -1343,7 +1350,7 @@ int backup(const char *target, BackupMode mode, char **paths)
 #ifdef BACKUP_TEST_HOOKS
         progress_force = backup_test_progress_hook != NULL;
 #endif
-        if (!estimate_had_error &&
+        if (!estimate_had_error && !raw_estimate_had_error &&
             (isatty(fileno(stdout)) || progress_force))
         {
             capture_report.progress_cb = backup_report_progress;

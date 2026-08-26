@@ -2658,8 +2658,10 @@ destination allocation block size. Its backup-specific walker rounds each
 regular file upward to that unit and counts a `(st_dev, st_ino)` hardlink group
 once across the entire plan, including when the group crosses root boundaries.
 Values <= 1 disable only the rounding; hardlink deduplication remains active.
-The same estimate feeds D27's free-space preflight and D28's progress
-denominator, for native and portable capture alike.
+The rounded estimate feeds D27's free-space preflight for native and portable
+capture alike. D28's progress denominator uses a separate raw source-byte
+estimate so the display describes transferred source content rather than
+destination allocation.
 
 The block size is read by `backup()` from the destination fd with the existing
 `f_frsize`, then `f_bsize`, preference. The estimator itself remains entirely
@@ -2693,8 +2695,8 @@ rolled back so an incomplete root cannot suppress a later contribution.
 **Relationship to D27:** D31 refines only the per-file estimate formula. D27's
 exact `needed > available` comparison, no-margin policy, and fail-open behavior
 when source measurement is incomplete remain unchanged. D31 also makes D28's
-progress denominator match the improved preflight estimate; it does not change
-progress presentation or D30's periodic durability sync.
+progress denominator use raw source bytes; it does not change progress
+presentation or D30's periodic durability sync.
 
 **Rejected:** Retrofitting `get_dir_size()` is rejected because report's raw
 logical-size contract is unrelated to backup destination allocation. A
@@ -2702,6 +2704,15 @@ representation-specific estimate is rejected because both allocation rounding
 and hardlink sharing are established before native/portable selection and are
 valid for either representation. Symlink/directory rounding is deferred until
 their actual destination allocation semantics justify it.
+
+**Revision (2026-08-26):** Allocation rounding is retained only for the
+internal D27 free-space fit check. The user-facing `Estimated backup size`
+line and D28's live `Progress` total now use the raw source-byte total instead
+of destination-allocation-rounded bytes. This follows live testing on the same
+Ventoy exFAT destination with 128 KiB clusters: a roughly 100M source backup
+was displayed as 200.7M and a 646M source backup as 1.6G under the reverted
+rounded-progress approach, inflating the apparent source size by roughly
+2--2.5x.
 
 ---
 
