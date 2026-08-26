@@ -7,7 +7,6 @@
 #include <unistd.h>
 
 #include "backup.h"
-#include "packages.h"
 #include "report.h"
 #include "restore.h"
 #include "utils.h"
@@ -16,7 +15,6 @@ typedef enum {
     ACTION_NONE,
     ACTION_REPORT,
     ACTION_BACKUP,
-    ACTION_PACKAGES,
     ACTION_RESTORE,
     ACTION_HELP
 } Action;
@@ -27,8 +25,6 @@ static void action_lookup(const char *arg, Action *action)
         *action = ACTION_REPORT;
     else if (strcmp(arg, "backup") == 0)
         *action = ACTION_BACKUP;
-    else if (strcmp(arg, "packages") == 0)
-        *action = ACTION_PACKAGES;
     else if (strcmp(arg, "restore") == 0)
         *action = ACTION_RESTORE;
     else if (strcmp(arg, "help") == 0)
@@ -219,21 +215,6 @@ int main(int argc, char *argv[])
                 break;
             }
             ret = backup(path, mode, user_paths);
-            break;
-        case ACTION_PACKAGES:
-            if (path == NULL)
-            {
-                print_error("Usage: ./migr packages <FILE>\n");
-                ret = 1;
-                break;
-            }
-            if (user_paths[0] != NULL)
-            {
-                print_error("Error: packages does not accept additional paths.\n");
-                ret = 1;
-                break;
-            }
-            ret = packages(path);
             break;
         case ACTION_RESTORE:
             if (path == NULL)

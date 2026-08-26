@@ -71,34 +71,6 @@ static int write_package_list(FILE *f, const char *buffer)
     return failed;
 }
 
-int packages(const char *path)
-{
-    int count = 0;
-    char *buffer = collect_packages(&count);
-    if (buffer == NULL)
-        return 1;
-
-    FILE *out = fopen(path, "w");
-    if (out == NULL)
-    {
-        print_error("Error: Could not open %s for writing.\n", path);
-        free(buffer);
-        return 1;
-    }
-
-    int failed = write_package_list(out, buffer);
-    free(buffer);
-
-    if (failed)
-    {
-        print_error("Error: Could not write %s.\n", path);
-        return 1;
-    }
-
-    printf("Saved %d packages to %s\n", count, path);
-    return 0;
-}
-
 static int leaf_is_safe(const char *leaf)
 {
     return leaf != NULL && leaf[0] != '\0' && strchr(leaf, '/') == NULL &&

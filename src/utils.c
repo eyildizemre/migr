@@ -167,7 +167,6 @@ void print_help(void)
     printf("Commands:\n");
     printf("  report [SCOPE]        Show backup analysis report (default when no command given)\n");
     printf("  backup <PATH>         Create a resumable backup container under PATH\n");
-    printf("  packages <FILE>       Export the installed package list to FILE\n");
     printf("  restore <SOURCE>      Restore files and packages from a backup at SOURCE\n");
     printf("  help                  Show this help\n");
     printf("\n");

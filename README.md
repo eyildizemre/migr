@@ -42,7 +42,6 @@ git config core.hooksPath hooks
 ./migr
 ./migr report [--critical | --comprehensive] [-s] [--max-depth=<N>]
 ./migr backup <PATH>
-./migr packages <FILE>
 ./migr restore <SOURCE>
 ```
 
@@ -51,7 +50,6 @@ git config core.hooksPath hooks
 ```
 report [SCOPE]        Show backup analysis report (default when no command given)
 backup <PATH>         Create a resumable backup container under PATH
-packages <FILE>       Export installed packages to FILE
 restore <SOURCE>      Restore files and packages from a backup at SOURCE
 help                  Show help
 ```

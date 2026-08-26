@@ -315,6 +315,15 @@ workstation 432, fresh Ubuntu desktop 35, minimal Arch 12.
 **Consequence for D2:** batch installs now handle hundreds of names, not thousands;
 the single-transaction rationale carries the decision from here on.
 
+**Consequence (2026-08-26):** `migr` has no standalone `packages <FILE>` command;
+package export is reachable only through `backup`. The path-based and production
+entry points have different trust models: the former would open an arbitrary
+user-supplied path, while the latter writes `packages.txt` beneath an anchored
+container directory fd under the same single-component safety rules as the rest
+of the backup. A standalone export adds no user-facing role that backup does not
+already cover, so keeping only the production path removes a redundant,
+weaker-trust interface rather than preserving it as a compatibility alias.
+
 **Implementation records:**
 
 - dnf's queryformat requires the two-character escape `\n`; a literal newline byte

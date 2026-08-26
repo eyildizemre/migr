@@ -314,8 +314,6 @@ test_report() {
         ../migr backup "$BACKUP_DIR" --max-depth=1
     assert_fails_with "Error: --max-depth applies only to 'report'." \
         ../migr restore "$BACKUP_DIR" --max-depth=1
-    assert_fails_with "Error: --max-depth applies only to 'report'." \
-        ../migr packages "$TEST_DIR/packages.txt" --max-depth=1
     rm -rf "$depth_root"
 
     # Make the profile contribution large enough that the human formatter cannot
@@ -548,11 +546,16 @@ test_restore() {
 test_packages() {
     echo -e "${BLUE}::${NC} Phase 5: packages"
 
-    local pkg_file="$TEST_DIR/pkgs.txt"
+    local pkg_backup="$TEST_DIR/package-backup"
+    mkdir -p "$pkg_backup"
     # The one phase that runs the distribution's genuine listing command: every
     # assertion below is about what that command actually produces, so a stub
     # here would assert nothing at all.
-    PATH="$REAL_PATH" ../migr packages "$pkg_file"
+    PATH="$REAL_PATH" ../migr backup "$pkg_backup"
+
+    local actual_backup
+    actual_backup=$(sole_final_container "$pkg_backup")
+    local pkg_file="$actual_backup/packages.txt"
 
     assert_file_exists "$pkg_file"
 
@@ -779,7 +782,6 @@ test_errors() {
     # missing required arguments
     assert_exits_nonzero ../migr backup
     assert_exits_nonzero ../migr restore
-    assert_exits_nonzero ../migr packages
     assert_exits_nonzero ../migr restore /nonexistent/path
 
     # unrecognised command word
@@ -797,11 +799,9 @@ test_errors() {
     # summary is a report-only presentation mode
     assert_exits_nonzero ../migr backup "$BACKUP_DIR" --summary
     assert_exits_nonzero ../migr restore "$BACKUP_DIR" --summary
-    assert_exits_nonzero ../migr packages /tmp/one --summary
 
     # commands that take exactly one positional reject extras
     assert_exits_nonzero ../migr restore "$BACKUP_DIR" /tmp/extra
-    assert_exits_nonzero ../migr packages /tmp/one /tmp/two
 
     # report takes no arguments at all
     assert_exits_nonzero ../migr report /tmp/somewhere
