@@ -26,6 +26,10 @@ int relative_paths_overlap(const char *left, const char *right);
 int relative_path_prefix_match(const char *prefix, const char *path,
                                const char **relative_out);
 
+/** Copies a regular payload while updating optional progress and sync state. */
+int portable_copy_regular(int source_fd, int destination_fd,
+                          off_t expected_size, BackupCaptureReport *report);
+
 /**
  * A source root and its container address for a portable capture.
  *

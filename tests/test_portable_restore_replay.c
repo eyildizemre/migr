@@ -887,6 +887,48 @@ static void test_normal_replay(void)
     fixture_close(&fixture);
 }
 
+static void test_destination_truncation(void)
+{
+    printf(BLUE "::" NC " restore truncates a longer existing regular file\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "destination-truncation fixture is created");
+    if (opened != 0)
+        return;
+
+    make_dir_at(fixture.data_fd, "ROOT", 0700);
+    write_file_at(fixture.data_fd, "ROOT/file", "short");
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000600, 1, 1700000601, 2),
+        entry_for("ROOT", "file", "file", SIDECAR_KIND_REGULAR, 5, 0600,
+                  1700000602, 3, 1700000603, 4)
+    };
+    check(write_sidecar(&fixture, entries, 2, NULL, NULL) == 0,
+          "destination-truncation sidecar is committed");
+
+    make_dir_at(fixture.home_fd, "restored", 0700);
+    write_file_at(fixture.home_fd, "restored/file",
+                  "stale destination content");
+    check(run_preflight(&fixture) == 0,
+          "destination-truncation state passes preflight");
+
+    PortableRestoreReplayReport report;
+    check(run_replay(&fixture, &report) == 0 && report.failed_count == 0,
+          "restore overwrites the existing regular file");
+
+    char restored_file[PATH_MAX];
+    path_join(restored_file, sizeof(restored_file), fixture.home,
+              "/restored/file");
+    struct stat restored_stat;
+    check(fstatat(fixture.home_fd, "restored/file", &restored_stat,
+                  AT_SYMLINK_NOFOLLOW) == 0 && restored_stat.st_size == 5 &&
+              file_equals_noatime(restored_file, "short"),
+          "restored regular file has no stale trailing bytes");
+    fixture_close(&fixture);
+}
+
 static void reset_sync(int should_fail)
 {
     sync_calls = 0;
@@ -1302,6 +1344,7 @@ int main(void)
     test_physical_logical_mismatch();
     test_collision_suffix_validation();
     test_normal_replay();
+    test_destination_truncation();
     test_capture_report_sync_accumulates();
     test_capture_report_sync_failure();
     test_outstanding_claim_gate();

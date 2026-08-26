@@ -4122,9 +4122,17 @@ static int open_source_node(int source_parent, const char *source_name,
     return open(root_path, flags);
 }
 
-static int copy_regular(int source_fd, int destination_fd, off_t expected_size,
-                        BackupCaptureReport *report)
+int portable_copy_regular(int source_fd, int destination_fd, off_t expected_size,
+                          BackupCaptureReport *report)
 {
+    if (source_fd < 0 || destination_fd < 0)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    if (ftruncate(destination_fd, 0) != 0)
+        return -1;
+
     unsigned char buffer[65536];
     uint64_t copied = 0;
     for (;;) {
@@ -4136,7 +4144,10 @@ static int copy_regular(int source_fd, int destination_fd, off_t expected_size,
         if (received == 0)
             break;
         if ((uint64_t)received > UINT64_MAX - copied)
+        {
+            errno = EOVERFLOW;
             return -1;
+        }
 
         size_t offset = 0;
         while (offset < (size_t)received) {
@@ -4165,7 +4176,12 @@ static int copy_regular(int source_fd, int destination_fd, off_t expected_size,
                 return -1;
         }
     }
-    return expected_size >= 0 && copied == (uint64_t)expected_size ? 0 : -1;
+    if (expected_size < 0 || copied != (uint64_t)expected_size)
+    {
+        errno = EIO;
+        return -1;
+    }
+    return 0;
 }
 
 static int physical_path_parent_matches(const char *physical,
@@ -4477,8 +4493,8 @@ static int capture_regular(PortableCaptureContext *context,
     if (context->progress_report != NULL)
         snprintf(context->progress_report->current_path,
                  sizeof(context->progress_report->current_path), "%s", physical);
-    if (copy_regular(source_fd, destination_fd, before->st_size,
-                     context->progress_report) != 0) {
+    if (portable_copy_regular(source_fd, destination_fd, before->st_size,
+                              context->progress_report) != 0) {
         close(destination_fd);
         if (destination_is_root)
             close(parent_fd);

@@ -2677,70 +2677,6 @@ static int replay_open_destination_regular(int parent_fd, const char *leaf,
     return 0;
 }
 
-static int replay_copy_regular(int source_fd, int destination_fd,
-                               uint64_t expected_size,
-                               BackupCaptureReport *capture_report)
-{
-    if (source_fd < 0 || destination_fd < 0)
-    {
-        errno = EINVAL;
-        return -1;
-    }
-    if (ftruncate(destination_fd, 0) != 0)
-        return -1;
-    unsigned char buffer[65536];
-    uint64_t copied = 0;
-    for (;;)
-    {
-        ssize_t received = read(source_fd, buffer, sizeof(buffer));
-        if (received < 0 && errno == EINTR)
-            continue;
-        if (received < 0)
-            return -1;
-        if (received == 0)
-            break;
-        if ((uint64_t)received > UINT64_MAX - copied)
-        {
-            errno = EOVERFLOW;
-            return -1;
-        }
-        copied += (uint64_t)received;
-        size_t offset = 0;
-        while (offset < (size_t)received)
-        {
-            ssize_t written = write(destination_fd, buffer + offset,
-                                     (size_t)received - offset);
-            if (written < 0 && errno == EINTR)
-                continue;
-            if (written <= 0)
-                return -1;
-            offset += (size_t)written;
-        }
-        if (capture_report != NULL)
-        {
-            capture_report->bytes_copied += received;
-            if (capture_report->progress_cb != NULL &&
-                backup_progress_should_fire(
-                    &capture_report->progress_last_fired,
-                    capture_report->progress_unthrottled))
-                capture_report->progress_cb(capture_report->bytes_copied,
-                                            capture_report->current_path,
-                                            capture_report->progress_userdata);
-            if (capture_report->sync_interval_bytes > 0 &&
-                backup_sync_due(&capture_report->bytes_since_sync, received,
-                                capture_report->sync_interval_bytes) &&
-                syncfs(destination_fd) != 0)
-                return -1;
-        }
-    }
-    if (copied != expected_size)
-    {
-        errno = EIO;
-        return -1;
-    }
-    return 0;
-}
-
 static int replay_destination_parent_for_root(
     const ReplayCollection *collection, size_t root_index,
     const char *relative, int *parent_out, char *leaf, size_t leaf_size)
@@ -2815,6 +2751,11 @@ static int replay_apply_regular(ReplayCollection *collection,
     const ManifestRoot *root = &collection->manifest->roots[
         replay->root_index];
     const SidecarEntry *entry = replay->entry;
+    if (entry->size > (uint64_t)INTMAX_MAX)
+    {
+        errno = EOVERFLOW;
+        return -1;
+    }
     struct stat desired;
     if (replay_stat_from_entry(entry, &desired) != 0)
         return -1;
@@ -2837,8 +2778,9 @@ static int replay_apply_regular(ReplayCollection *collection,
                  sizeof(collection->capture_report->current_path), "%s",
                  replay->destination_relative);
     if (result == 0)
-        result = replay_copy_regular(source_fd, destination_fd, entry->size,
-                                     collection->capture_report);
+        result = portable_copy_regular(
+            source_fd, destination_fd, (off_t)entry->size,
+            collection->capture_report);
     if (result == 0)
     {
         struct stat source_after;
