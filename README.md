@@ -188,12 +188,13 @@ advisory check rather than refusing a backup on an incomplete estimate.
 During a live backup, an interactive terminal also receives a single
 overwriting progress line while regular-file bytes are copied:
 
-    Progress: 13.4M/33.6M copied, 22.7G free
+    Progress: 13.4M/33.6M copied, 22.7G free, elapsed 00:12, speed 1.1M/s, current: /home/eyildizemre/Documents/video.mp4
 
-The line is sampled during large-file copies and re-reads the destination's
-available space. Progress is installed only when stdout is an interactive
-terminal, so piped, redirected, and scripted backups keep the normal output
-unchanged.
+The line is sampled during large-file copies, identifies the file being copied,
+shows elapsed time and current speed, and re-reads the destination's available
+space. Progress is installed only when stdout is an interactive terminal, so
+piped, redirected, and scripted backups keep the normal output unchanged. It
+does not display an ETA.
 
 Live backups also periodically flush the destination filesystem during the
 copy. This smooths writeback and reduces, without eliminating, the amount of

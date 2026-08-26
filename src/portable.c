@@ -4144,6 +4144,7 @@ static int copy_regular(int source_fd, int destination_fd, off_t expected_size,
                 backup_progress_should_fire(&report->progress_last_fired,
                                             report->progress_unthrottled))
                 report->progress_cb(report->bytes_copied,
+                                    report->current_path,
                                     report->progress_userdata);
             if (report->sync_interval_bytes > 0 &&
                 backup_sync_due(&report->bytes_since_sync, received,
@@ -4461,6 +4462,9 @@ static int capture_regular(PortableCaptureContext *context,
     }
     portable_test_interrupt_if(PORTABLE_TEST_AFTER_PAYLOAD_REPLACE);
     portable_test_interrupt_if(PORTABLE_TEST_BEFORE_PAYLOAD_WRITE);
+    if (context->progress_report != NULL)
+        snprintf(context->progress_report->current_path,
+                 sizeof(context->progress_report->current_path), "%s", physical);
     if (copy_regular(source_fd, destination_fd, before->st_size,
                      context->progress_report) != 0) {
         close(destination_fd);

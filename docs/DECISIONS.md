@@ -2541,6 +2541,12 @@ into captured output. A new free-space refusal based on periodic observations
 is rejected because only the real write result can authoritatively determine
 whether the copy fits. Restore progress is deferred as a separate feature.
 
+**Revision (2026-08-26):** The interactive progress line also identifies the
+current file and reports elapsed time and current speed for the backup and the
+subsequently added restore paths. It deliberately omits an ETA: D30's periodic
+`syncfs()` may block for an unpredictable duration, so an ETA would not remain
+honest around those stalls.
+
 ---
 
 ## D29 — 2026-08-24 — Finalized containers cross a durable publication boundary

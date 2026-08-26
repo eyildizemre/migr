@@ -23,6 +23,20 @@ void print_success(const char *fmt, ...);
  */
 void format_size(off_t bytes, char *buf, size_t len);
 
+/**
+ * @brief Formats a non-negative duration as mm:ss or h:mm:ss.
+ */
+void format_duration(long seconds, char *buf, size_t len);
+
+/**
+ * @brief Returns non-negative elapsed seconds between two timestamps.
+ *
+ * The timestamps are expected to come from the same monotonic clock. A
+ * timestamp that precedes start is treated as zero elapsed time.
+ */
+double timespec_elapsed_seconds(const struct timespec *start,
+                                const struct timespec *end);
+
 int dup_cloexec(int fd);
 size_t relative_path_depth(const char *path);
 

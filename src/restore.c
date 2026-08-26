@@ -1,8 +1,10 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <limits.h>
@@ -317,18 +319,76 @@ static int native_restore_confirm(size_t security_xattr_entries)
 
 typedef struct {
     int printed_anything;
+    struct timespec started_at;
+    struct timespec last_sample_time;
+    off_t last_sample_bytes;
 } RestoreProgressDisplay;
 
-static void restore_report_progress(off_t bytes_restored, void *userdata)
+static off_t progress_speed(off_t bytes_restored, off_t last_sample_bytes,
+                            double sample_seconds)
+{
+    if (!isfinite(sample_seconds) || sample_seconds <= 0.0 ||
+        bytes_restored <= last_sample_bytes)
+        return 0;
+
+    off_t delta = bytes_restored - last_sample_bytes;
+    double speed = (double)delta / sample_seconds;
+    if (!isfinite(speed) || speed <= 0.0)
+        return 0;
+    if (speed >= (double)INTMAX_MAX)
+        return (off_t)INTMAX_MAX;
+    return (off_t)speed;
+}
+
+static long progress_elapsed_whole_seconds(double elapsed_seconds)
+{
+    if (!isfinite(elapsed_seconds) || elapsed_seconds <= 0.0)
+        return 0;
+    if (elapsed_seconds >= (double)LONG_MAX)
+        return LONG_MAX;
+    return (long)elapsed_seconds;
+}
+
+static void restore_report_progress(off_t bytes_restored,
+                                    const char *current_path,
+                                    void *userdata)
 {
     RestoreProgressDisplay *display = userdata;
     if (display == NULL)
         return;
 
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        return;
+    if (!display->printed_anything)
+    {
+        display->started_at = now;
+        display->last_sample_time = now;
+        display->last_sample_bytes = 0;
+    }
+
+    double elapsed_seconds = timespec_elapsed_seconds(&display->started_at,
+                                                      &now);
+    double sample_seconds = timespec_elapsed_seconds(
+        &display->last_sample_time, &now);
+    off_t speed_bytes = progress_speed(bytes_restored,
+                                       display->last_sample_bytes,
+                                       sample_seconds);
+
     char restored_text[32];
+    char elapsed_text[32];
+    char speed_text[32];
     format_size(bytes_restored, restored_text, sizeof(restored_text));
-    printf("\rRestored: %s so far\033[K", restored_text);
+    format_duration(progress_elapsed_whole_seconds(elapsed_seconds),
+                    elapsed_text, sizeof(elapsed_text));
+    format_size(speed_bytes, speed_text, sizeof(speed_text));
+    const char *path_text = current_path != NULL && current_path[0] != '\0'
+        ? current_path : "unknown";
+    printf("\rRestored: %s so far, elapsed %s, speed %s/s, current: %s\033[K",
+           restored_text, elapsed_text, speed_text, path_text);
     fflush(stdout);
+    display->last_sample_time = now;
+    display->last_sample_bytes = bytes_restored;
     display->printed_anything = 1;
 }
 
@@ -1605,6 +1665,7 @@ int restore(const char *source)
         if (progress_display.printed_anything)
         {
             capture_report.progress_cb(capture_report.bytes_copied,
+                                       capture_report.current_path,
                                        capture_report.progress_userdata);
             putchar('\n');
             fflush(stdout);
@@ -1830,6 +1891,7 @@ int restore(const char *source)
     if (progress_display.printed_anything)
     {
         capture_report.progress_cb(capture_report.bytes_copied,
+                                   capture_report.current_path,
                                    capture_report.progress_userdata);
         putchar('\n');
         fflush(stdout);

@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <dirent.h>
 #include <limits.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -142,17 +143,67 @@ typedef struct {
     off_t estimated_total_bytes;
     int data_fd;
     int printed_anything;
+    struct timespec started_at;
+    struct timespec last_sample_time;
+    off_t last_sample_bytes;
 } BackupProgressDisplay;
 
-static void backup_report_progress(off_t bytes_copied, void *userdata)
+static off_t progress_speed(off_t bytes_copied, off_t last_sample_bytes,
+                            double sample_seconds)
+{
+    if (!isfinite(sample_seconds) || sample_seconds <= 0.0 ||
+        bytes_copied <= last_sample_bytes)
+        return 0;
+
+    off_t delta = bytes_copied - last_sample_bytes;
+    double speed = (double)delta / sample_seconds;
+    if (!isfinite(speed) || speed <= 0.0)
+        return 0;
+    if (speed >= (double)INTMAX_MAX)
+        return (off_t)INTMAX_MAX;
+    return (off_t)speed;
+}
+
+static long progress_elapsed_whole_seconds(double elapsed_seconds)
+{
+    if (!isfinite(elapsed_seconds) || elapsed_seconds <= 0.0)
+        return 0;
+    if (elapsed_seconds >= (double)LONG_MAX)
+        return LONG_MAX;
+    return (long)elapsed_seconds;
+}
+
+static void backup_report_progress(off_t bytes_copied,
+                                   const char *current_path,
+                                   void *userdata)
 {
     BackupProgressDisplay *display = userdata;
     if (display == NULL)
         return;
 
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        return;
+    if (!display->printed_anything)
+    {
+        display->started_at = now;
+        display->last_sample_time = now;
+        display->last_sample_bytes = 0;
+    }
+
+    double elapsed_seconds = timespec_elapsed_seconds(&display->started_at,
+                                                      &now);
+    double sample_seconds = timespec_elapsed_seconds(
+        &display->last_sample_time, &now);
+    off_t speed_bytes = progress_speed(bytes_copied,
+                                       display->last_sample_bytes,
+                                       sample_seconds);
+
     char copied_text[32];
     char estimated_text[32];
     char free_text[32];
+    char elapsed_text[32];
+    char speed_text[32];
     format_size(bytes_copied, copied_text, sizeof(copied_text));
     if (display->estimated_total_bytes > 0)
         format_size(display->estimated_total_bytes, estimated_text,
@@ -163,20 +214,31 @@ static void backup_report_progress(off_t bytes_copied, void *userdata)
         format_size(free_bytes, free_text, sizeof(free_text));
     else
         snprintf(free_text, sizeof(free_text), "unknown");
+    format_duration(progress_elapsed_whole_seconds(elapsed_seconds),
+                    elapsed_text, sizeof(elapsed_text));
+    format_size(speed_bytes, speed_text, sizeof(speed_text));
+    const char *path_text = current_path != NULL && current_path[0] != '\0'
+        ? current_path : "unknown";
 
     if (display->estimated_total_bytes > 0)
-        printf("\rProgress: %s/%s copied, %s free\033[K", copied_text,
-               estimated_text, free_text);
+        printf("\rProgress: %s/%s copied, %s free, elapsed %s, speed %s/s, "
+               "current: %s\033[K", copied_text, estimated_text, free_text,
+               elapsed_text, speed_text, path_text);
     else
-        printf("\rProgress: %s copied, %s free\033[K", copied_text, free_text);
+        printf("\rProgress: %s copied, %s free, elapsed %s, speed %s/s, "
+               "current: %s\033[K", copied_text, free_text, elapsed_text,
+               speed_text, path_text);
 
 #ifdef BACKUP_TEST_HOOKS
     if (backup_test_progress_hook != NULL)
         backup_test_progress_hook(bytes_copied,
                                   display->estimated_total_bytes,
+                                  current_path,
                                   backup_test_progress_context);
 #endif
     fflush(stdout);
+    display->last_sample_time = now;
+    display->last_sample_bytes = bytes_copied;
     display->printed_anything = 1;
 }
 
@@ -870,6 +932,7 @@ int backup(const char *target, BackupMode mode, char **paths)
                     format_size(free_bytes, free_text, sizeof(free_text));
                     printf("Estimated backup size: %s\n", estimated_text);
                     printf("Destination free space: %s\n", free_text);
+                    printf("\n");
                     if (!has_space)
                     {
                         off_t shortfall = estimated_size - free_bytes;
@@ -1066,6 +1129,7 @@ int backup(const char *target, BackupMode mode, char **paths)
             format_size(free_bytes, free_text, sizeof(free_text));
             printf("Estimated backup size: %s\n", estimated_text);
             printf("Destination free space: %s\n", free_text);
+            printf("\n");
             if (!has_space)
             {
                 off_t shortfall = estimated_size - free_bytes;
@@ -1336,6 +1400,7 @@ int backup(const char *target, BackupMode mode, char **paths)
         printf("Backing up to: %s/%s\n", target, container_current_name(&container));
         if (adopted)
             printf("Resuming an interrupted backup of the same job.\n");
+        printf("\n");
 
         BackupCaptureReport capture_report;
         backup_capture_report_init(&capture_report);
@@ -1419,6 +1484,7 @@ int backup(const char *target, BackupMode mode, char **paths)
         if (progress_installed && progress_display.printed_anything)
         {
             capture_report.progress_cb(capture_report.bytes_copied,
+                                       capture_report.current_path,
                                        capture_report.progress_userdata);
             putchar('\n');
             fflush(stdout);
@@ -1432,7 +1498,6 @@ int backup(const char *target, BackupMode mode, char **paths)
         // exports one, and demonstrably empty for a scope that does not.
         // Anything else -- a stale list inside an adopted container, or one
         // planted there -- would otherwise be published and later replayed.
-        printf("\nPackages\n");
         if (mode == BACKUP_EXPLICIT_PATHS)
         {
             if (packages_clear_at(container_fd, "packages.txt") != 0)
@@ -1440,13 +1505,10 @@ int backup(const char *target, BackupMode mode, char **paths)
                 print_error("Error: could not clear packages.txt from the backup container\n");
                 had_error = 1;
             }
-            else
-            {
-                printf("  No package list: explicit paths are backed up exactly as given.\n");
-            }
         }
         else
         {
+            printf("\nPackages\n");
             // A missing package list is tolerable and has always been a
             // warning; a control slot that could not be made safe is not.
             int pkg = packages_at(container_fd, "packages.txt");

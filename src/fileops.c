@@ -1241,6 +1241,7 @@ static int copy_file_contents(int src_fd, int dest_fd,
                 backup_progress_should_fire(&report->progress_last_fired,
                                             report->progress_unthrottled))
                 report->progress_cb(report->bytes_copied,
+                                    report->current_path,
                                     report->progress_userdata);
             if (report->sync_interval_bytes > 0 &&
                 backup_sync_due(&report->bytes_since_sync, bytes_read,
@@ -1435,6 +1436,8 @@ static BackupCaptureStatus capture_regular_at(
         return BACKUP_CAPTURE_ERROR;
     }
 
+    if (report != NULL)
+        snprintf(report->current_path, sizeof(report->current_path), "%s", src);
     int failed = copy_file_contents(src_fd, dest_fd, report) != 0;
     PortableXattrs xattrs = {0};
     if (!failed &&
@@ -2988,6 +2991,9 @@ static RestoreNativeStatus restore_entry_at(
             return -1;
         }
 
+        if (capture_report != NULL)
+            snprintf(capture_report->current_path,
+                     sizeof(capture_report->current_path), "%s", logical_path);
         int failed = copy_file_contents(src_fd, dst_fd, capture_report) != 0;
 
         PortableXattrs xattrs = {0};

@@ -42,7 +42,12 @@ void print_success(const char *fmt, ...)
 {
     va_list args;
     va_start(args, fmt);
-    print_status("\033[1;32m", fmt, args);
+    if (color_enabled)
+        fputs("\033[1;32m", stderr);
+    fputs("  OK: ", stderr);
+    vfprintf(stderr, fmt, args);
+    if (color_enabled)
+        fputs("\033[0m", stderr);
     va_end(args);
 }
 
@@ -64,6 +69,45 @@ void format_size(off_t bytes, char *buf, size_t len)
     {
         snprintf(buf, len, "%lldB", (long long)bytes);
     }
+}
+
+void format_duration(long seconds, char *buf, size_t len)
+{
+    if (seconds < 0)
+        seconds = 0;
+
+    if (seconds >= 3600)
+    {
+        long hours = seconds / 3600;
+        long minutes = (seconds / 60) % 60;
+        long remainder = seconds % 60;
+        snprintf(buf, len, "%ld:%02ld:%02ld", hours, minutes, remainder);
+    }
+    else
+    {
+        long minutes = seconds / 60;
+        long remainder = seconds % 60;
+        snprintf(buf, len, "%02ld:%02ld", minutes, remainder);
+    }
+}
+
+double timespec_elapsed_seconds(const struct timespec *start,
+                                const struct timespec *end)
+{
+    if (start == NULL || end == NULL)
+        return 0.0;
+
+    int64_t seconds = (int64_t)end->tv_sec - (int64_t)start->tv_sec;
+    int64_t nanoseconds = (int64_t)end->tv_nsec -
+                          (int64_t)start->tv_nsec;
+    if (nanoseconds < 0)
+    {
+        seconds--;
+        nanoseconds += INT64_C(1000000000);
+    }
+    if (seconds < 0)
+        return 0.0;
+    return (double)seconds + (double)nanoseconds / 1000000000.0;
 }
 
 int dup_cloexec(int fd)

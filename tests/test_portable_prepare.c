@@ -237,8 +237,11 @@ typedef struct {
     int monotonic;
 } ProgressTrace;
 
-static void record_portable_progress(off_t bytes_copied, void *userdata)
+static void record_portable_progress(off_t bytes_copied,
+                                     const char *current_path,
+                                     void *userdata)
 {
+    (void)current_path;
     ProgressTrace *trace = userdata;
     if (trace == NULL)
         return;

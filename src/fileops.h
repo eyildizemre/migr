@@ -119,7 +119,9 @@ typedef enum {
     BACKUP_CAPTURE_SOURCE_SAFE_READ = -2
 } BackupCaptureStatus;
 
-typedef void (*BackupProgressCallback)(off_t bytes_copied, void *userdata);
+typedef void (*BackupProgressCallback)(off_t bytes_copied,
+                                       const char *current_path,
+                                       void *userdata);
 
 /**
  * @brief State shared by one native capture or restore across its roots.
@@ -134,6 +136,7 @@ typedef void (*BackupProgressCallback)(off_t bytes_copied, void *userdata);
 typedef struct {
     char failed_source_path[PATH_MAX];
     off_t bytes_copied;
+    char current_path[PATH_MAX];
     off_t bytes_since_sync;
     off_t sync_interval_bytes;
     BackupProgressCallback progress_cb;

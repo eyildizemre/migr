@@ -1225,6 +1225,9 @@ test_native_restore_progress() {
     pty_rc=$?
     set -e
     if [ "$pty_rc" -eq 0 ] && [[ "$pty_output" == *"Restored:"* ]] &&
+       [[ "$pty_output" == *"current: Documents/progress.txt"* ]] &&
+       [[ "$pty_output" == *"elapsed 00:"* ]] &&
+       [[ "$pty_output" == *"speed "* ]] &&
        [ -f "$progress_home/Documents/progress.txt" ]; then
         echo -e "  ${GREEN}✓${NC} Native restore shows progress on a real TTY."
     else
@@ -1909,6 +1912,9 @@ test_portable_vfat_dispatch() {
     set -e
     if [ "$portable_pty_rc" -eq 0 ] &&
        [[ "$portable_pty_output" == *"Restored:"* ]] &&
+       [[ "$portable_pty_output" == *"note.txt"* ]] &&
+       [[ "$portable_pty_output" == *"elapsed 00:"* ]] &&
+       [[ "$portable_pty_output" == *"speed "* ]] &&
        [ -f "$portable_progress_home/Documents/note.txt" ]; then
         echo -e "  ${GREEN}✓${NC} Portable restore shows progress on a real TTY."
     else

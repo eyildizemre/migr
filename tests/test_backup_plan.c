@@ -20,6 +20,7 @@
 #include <fcntl.h>
 #include <ftw.h>
 #include <limits.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1140,10 +1141,20 @@ typedef struct {
     off_t estimated;
     size_t count;
     int monotonic;
+    char expected_paths[2][PATH_MAX];
+    size_t expected_path_count;
+    unsigned int seen_paths;
+    int paths_valid;
+    struct timespec first_sample_time;
+    struct timespec last_sample_time;
+    off_t last_sample_bytes;
+    double previous_elapsed_seconds;
+    size_t timing_count;
+    int timing_valid;
 } BackupProgressTrace;
 
 static void record_backup_progress(off_t bytes_copied, off_t estimated_total,
-                                   void *context)
+                                   const char *current_path, void *context)
 {
     BackupProgressTrace *trace = context;
     if (trace == NULL)
@@ -1152,6 +1163,47 @@ static void record_backup_progress(off_t bytes_copied, off_t estimated_total,
         trace->monotonic = 0;
     trace->previous = bytes_copied;
     trace->estimated = estimated_total;
+
+    size_t matched_path = trace->expected_path_count;
+    for (size_t index = 0; index < trace->expected_path_count; index++)
+    {
+        if (current_path != NULL &&
+            strcmp(current_path, trace->expected_paths[index]) == 0)
+        {
+            matched_path = index;
+            break;
+        }
+    }
+    if (matched_path == trace->expected_path_count)
+        trace->paths_valid = 0;
+    else
+        trace->seen_paths |= 1U << matched_path;
+
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        trace->timing_valid = 0;
+    else
+    {
+        if (trace->timing_count == 0)
+            trace->first_sample_time = now;
+        double elapsed_seconds = timespec_elapsed_seconds(
+            &trace->first_sample_time, &now);
+        double sample_seconds = trace->timing_count == 0 ? 0.0
+            : timespec_elapsed_seconds(&trace->last_sample_time, &now);
+        off_t delta = bytes_copied > trace->last_sample_bytes
+            ? bytes_copied - trace->last_sample_bytes : 0;
+        double speed = sample_seconds > 0.0
+            ? (double)delta / sample_seconds : 0.0;
+        if (!isfinite(elapsed_seconds) || elapsed_seconds < 0.0 ||
+            (trace->timing_count != 0 &&
+             elapsed_seconds < trace->previous_elapsed_seconds) ||
+            !isfinite(speed) || speed < 0.0)
+            trace->timing_valid = 0;
+        trace->previous_elapsed_seconds = elapsed_seconds;
+        trace->last_sample_time = now;
+        trace->last_sample_bytes = bytes_copied;
+        trace->timing_count++;
+    }
     trace->count++;
 }
 
@@ -1511,6 +1563,25 @@ static void test_destination_space_preflight(void)
     remove_tree(normal_live_target);
 }
 
+static void test_format_duration(void)
+{
+    printf(BLUE "::" NC " utility: duration formatting for progress output\n");
+    char formatted[32];
+    format_duration(0, formatted, sizeof(formatted));
+    check(strcmp(formatted, "00:00") == 0, "zero seconds format as 00:00");
+    format_duration(59, formatted, sizeof(formatted));
+    check(strcmp(formatted, "00:59") == 0, "sub-minute durations keep mm:ss");
+    format_duration(60, formatted, sizeof(formatted));
+    check(strcmp(formatted, "01:00") == 0, "one minute formats as 01:00");
+    format_duration(3599, formatted, sizeof(formatted));
+    check(strcmp(formatted, "59:59") == 0, "under an hour formats as mm:ss");
+    format_duration(3600, formatted, sizeof(formatted));
+    check(strcmp(formatted, "1:00:00") == 0, "one hour formats as h:mm:ss");
+    format_duration(7322, formatted, sizeof(formatted));
+    check(strcmp(formatted, "2:02:02") == 0,
+          "multi-hour durations preserve minute and second padding");
+}
+
 static void test_live_progress(void)
 {
     printf(BLUE "::" NC " production: live backup progress is chunked, final-flushed, and tty-gated\n");
@@ -1520,10 +1591,14 @@ static void test_live_progress(void)
     mkdir_p(home);
     setenv("HOME", home, 1);
 
-    char source[PATH_MAX];
+    char source[PATH_MAX], second_source[PATH_MAX];
     join_path(source, sizeof(source), home, "large.bin");
+    join_path(second_source, sizeof(second_source), home, "small.bin");
     write_large_file(source, PROGRESS_SIZE);
-    char *paths[] = { source, NULL };
+    const char second_contents[] = "small progress\n";
+    write_file(second_source, second_contents);
+    char *paths[] = { source, second_source, NULL };
+    off_t expected_total = PROGRESS_SIZE + (off_t)strlen(second_contents);
 
     char target_parent[PATH_MAX];
     fresh_mkdtemp(target_parent, sizeof(target_parent), "progress_target_parent");
@@ -1538,7 +1613,16 @@ static void test_live_progress(void)
         printf(RED "fixture: could not create shared progress trace" NC "\n");
         exit(1);
     }
-    *trace = (BackupProgressTrace){ .monotonic = 1 };
+    *trace = (BackupProgressTrace){
+        .monotonic = 1,
+        .paths_valid = 1,
+        .timing_valid = 1
+    };
+    trace->expected_path_count = 2;
+    snprintf(trace->expected_paths[0], sizeof(trace->expected_paths[0]),
+             "%s", source);
+    snprintf(trace->expected_paths[1], sizeof(trace->expected_paths[1]),
+             "%s", second_source);
     backup_test_set_progress_hook(record_backup_progress, trace);
     dry_run = 0;
     char output[16384];
@@ -1547,12 +1631,22 @@ static void test_live_progress(void)
     backup_test_set_progress_hook(NULL, NULL);
     check(result == 0, "a multi-chunk live backup succeeds with progress enabled");
     check(trace->count >= 3 && trace->monotonic &&
-              trace->previous == PROGRESS_SIZE &&
-              trace->estimated == PROGRESS_SIZE,
+              trace->previous == expected_total &&
+              trace->estimated == expected_total && trace->paths_valid &&
+              trace->seen_paths == 3 && trace->timing_valid &&
+              trace->timing_count >= 3,
           "progress is monotonic and final-flushed at the estimated total");
     check(strstr(output, "\rProgress:") != NULL &&
-              strstr(output, "\n\nPackages\n") != NULL,
-          "progress overwrites in place and ends before subsequent output");
+              strstr(output, "\n\nFinalizing (syncing to disk)...") != NULL &&
+              strstr(output, "Packages") == NULL &&
+              strstr(output, "package list") == NULL,
+          "progress overwrites in place and explicit backups omit package output");
+    check(strstr(output, source) != NULL &&
+              strstr(output, second_source) != NULL,
+          "progress output identifies the current file");
+    check(strstr(output, "elapsed 00:") != NULL &&
+              strstr(output, "speed ") != NULL,
+          "progress output includes elapsed time and speed");
     const char *long_progress =
         strstr(output, "\rProgress: 1000.0K/1.0M copied");
     const char *short_progress =
@@ -1702,6 +1796,10 @@ static void test_dangling_builtin_dotfile_is_captured_not_silently_dropped(void)
     char output[8192];
     int rc = run_backup_capturing(target, BACKUP_CRITICAL, paths, output, sizeof(output));
     check(rc == 0, "backup succeeds");
+    check(strstr(output, "\nPackages\n") != NULL,
+          "a normal backup still prints the Packages section");
+    check(strstr(output, "  OK: Backup complete") != NULL,
+          "successful backup output carries the OK marker");
 
     char payload_dir[PATH_MAX];
     check(find_payload_dir(target, payload_dir, sizeof(payload_dir)),
@@ -1787,6 +1885,7 @@ int main(void)
     test_plan_estimate_tolerates_missing_root();
     test_allocation_aware_estimate();
     test_destination_space_preflight();
+    test_format_duration();
     test_live_progress();
     test_missing_explicit_path_rejects_before_target_creation();
     test_overlap_rejected_before_destination_created_live_and_dry_run();

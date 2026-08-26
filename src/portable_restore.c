@@ -2737,6 +2737,7 @@ static int replay_copy_regular(int source_fd, int destination_fd,
                     &capture_report->progress_last_fired,
                     capture_report->progress_unthrottled))
                 capture_report->progress_cb(capture_report->bytes_copied,
+                                            capture_report->current_path,
                                             capture_report->progress_userdata);
             if (capture_report->sync_interval_bytes > 0 &&
                 backup_sync_due(&capture_report->bytes_since_sync, received,
@@ -2844,6 +2845,10 @@ static int replay_apply_regular(ReplayCollection *collection,
     if (result == 0)
         result = replay_open_destination_regular(parent_fd, leaf,
                                                  &destination_fd);
+    if (result == 0 && collection->capture_report != NULL)
+        snprintf(collection->capture_report->current_path,
+                 sizeof(collection->capture_report->current_path), "%s",
+                 replay->destination_relative);
     if (result == 0)
         result = replay_copy_regular(source_fd, destination_fd, entry->size,
                                      collection->capture_report);
