@@ -30,7 +30,7 @@ size_t relative_path_depth(const char *path);
 #define BACKUP_PROGRESS_THROTTLE_MS 500
 
 /* Periodic mid-copy sync interval for live backups. */
-#define BACKUP_SYNC_INTERVAL_BYTES (8 * 1024 * 1024)
+#define BACKUP_SYNC_INTERVAL_BYTES (256 * 1024 * 1024)
 
 /**
  * @brief Returns whether a progress callback may fire now.

@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include "fileops.h"
+#include "utils.h"
 
 static int failures;
 static int sync_calls;
@@ -165,6 +166,9 @@ static void reset_sync(int should_fail)
 static void test_restore_sync_accumulates_across_files(void)
 {
     printf(":: native restore report accumulates bytes and syncs across files\n");
+    /* Direct/test reports stay at zero; production installs this shared default. */
+    check(BACKUP_SYNC_INTERVAL_BYTES == 256 * 1024 * 1024,
+          "production periodic sync interval is 256 MiB");
 
     char base[PATH_MAX], source[PATH_MAX], destination[PATH_MAX];
     char one[PATH_MAX], two[PATH_MAX], three[PATH_MAX];

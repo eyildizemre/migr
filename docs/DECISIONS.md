@@ -2628,8 +2628,24 @@ durable at every instant and does not replace D29's finalization sequence.
 because it does not cover dirty pages accumulated across previously completed
 files. Gating the sync on terminal output is rejected because the behavior is
 correctness/reliability-related rather than UI-related. A configurable
-interval is deferred until operational evidence shows that the fixed 8 MiB
-trade-off is wrong.
+interval remains deferred; the evidence here supports correcting the fixed
+default rather than exposing an operational setting.
+
+**Revision (2026-08-26):** Live testing on a real exFAT USB destination
+showed that the original 8 MiB interval was too aggressive for a
+metadata-heavy workload: more than 10,000 small files spent much of their
+time in exFAT directory and FAT metadata work, while an independent sequential
+write measured 45.3 MB/s, so the device's raw throughput was not the
+bottleneck. The interval was roughly two orders of magnitude below the
+system's typical dirty-page throttling scale
+(`vm.dirty_ratio`/`vm.dirty_background_ratio`, hundreds of MiB to a few GiB
+on the tested host) and caused `migr` to force writeback far more frequently
+than necessary. `BACKUP_SYNC_INTERVAL_BYTES` is therefore raised from 8 MiB
+to 256 MiB, moving the trigger closer to the kernel's natural scale while
+retaining periodic smoothing for large captures. This reduces how often
+`migr` enters a sync wait; it does not make an individual `syncfs()` wait
+shorter or interruptible, so a metadata-heavy filesystem can still leave the
+process in kernel-uninterruptible sleep during one sync.
 
 ---
 

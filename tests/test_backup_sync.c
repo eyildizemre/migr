@@ -17,6 +17,7 @@
 
 #include "fileops.h"
 #include "portable.h"
+#include "utils.h"
 
 static int failures;
 static int sync_calls;
@@ -212,6 +213,9 @@ static int capture_portable(const char *source, const char *scratch,
 static void test_native_sync(void)
 {
     printf(":: native periodic capture sync\n");
+    /* Direct/test reports stay at zero; production installs this shared default. */
+    check(BACKUP_SYNC_INTERVAL_BYTES == 256 * 1024 * 1024,
+          "production periodic sync interval is 256 MiB");
     char base[PATH_MAX];
     char source_dir[PATH_MAX];
     char destination_dir[PATH_MAX];
