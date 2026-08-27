@@ -12,6 +12,11 @@ extern int color_enabled; /**< Non-zero when status colors are enabled for stdou
 /** @brief Prints a complete error message, optionally in bold red. */
 void print_error(const char *fmt, ...);
 
+/**
+ * @brief Reports that a source object could not be safely read with O_NOATIME.
+ */
+void print_source_safe_read_refusal(const char *label);
+
 /** @brief Prints a complete warning message, optionally in bold yellow. */
 void print_warning(const char *fmt, ...);
 

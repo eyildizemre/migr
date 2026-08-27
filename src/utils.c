@@ -30,6 +30,14 @@ void print_error(const char *fmt, ...)
     va_end(args);
 }
 
+void print_source_safe_read_refusal(const char *label)
+{
+    print_error("Error: Could not safely read source for %s: the kernel "
+           "refused the O_NOATIME open; an O_NOATIME-less retry was not "
+           "attempted because it could change atime (ownership or "
+           "CAP_FOWNER is required).\n", label);
+}
+
 void print_warning(const char *fmt, ...)
 {
     va_list args;

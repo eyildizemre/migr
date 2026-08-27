@@ -579,11 +579,7 @@ static void capture_roots(const CloneContext *ctx, const BackupPlan *plan, int d
                         capture_report->failed_source_path[0] != '\0'
                             ? capture_report->failed_source_path
                             : root->capture_path;
-                    print_error("Error: Could not safely read source for %s: the "
-                           "kernel refused the O_NOATIME open; an "
-                           "O_NOATIME-less retry was not attempted because "
-                           "it could change atime (ownership or CAP_FOWNER "
-                           "is required).\n", failed_source);
+                    print_source_safe_read_refusal(failed_source);
                 }
                 else
                     print_error("Error: Failed to capture %s\n", root->capture_path);

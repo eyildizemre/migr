@@ -245,10 +245,7 @@ static int restore_timestamp_anchor_policy(const RestoreTimestampAnchors *anchor
 static void report_source_safe_read_refusal(const char *label,
                                             const RestoreNativeReport *report)
 {
-    print_error("Error: Could not safely read source for %s: the kernel refused "
-           "the O_NOATIME open; an O_NOATIME-less retry was not attempted "
-           "because it could change atime (ownership or CAP_FOWNER is "
-           "required).\n", label);
+    print_source_safe_read_refusal(label);
     if (report != NULL && report->failed_count != 0)
         print_error("Error: Native restore stopped at %s: %zu item(s) applied, "
                "%zu failed.\n",
