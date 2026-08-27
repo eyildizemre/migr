@@ -146,6 +146,8 @@ typedef struct {
 } BackupCaptureReport;
 
 void backup_capture_report_init(BackupCaptureReport *report);
+int backup_capture_report_tick(BackupCaptureReport *report,
+                               off_t chunk_size, int destination_fd);
 
 #ifdef BACKUP_TEST_HOOKS
 typedef void (*BackupTestCaptureHook)(const char *source_path,

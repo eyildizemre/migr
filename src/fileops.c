@@ -1234,21 +1234,8 @@ static int copy_file_contents(int src_fd, int dest_fd,
                 return -1;
             bytes_written += res;
         }
-        if (report != NULL)
-        {
-            report->bytes_copied += bytes_read;
-            if (report->progress_cb != NULL &&
-                backup_progress_should_fire(&report->progress_last_fired,
-                                            report->progress_unthrottled))
-                report->progress_cb(report->bytes_copied,
-                                    report->current_path,
-                                    report->progress_userdata);
-            if (report->sync_interval_bytes > 0 &&
-                backup_sync_due(&report->bytes_since_sync, bytes_read,
-                                report->sync_interval_bytes) &&
-                syncfs(dest_fd) != 0)
-                return -1;
-        }
+        if (backup_capture_report_tick(report, bytes_read, dest_fd) != 0)
+            return -1;
     }
     return bytes_read < 0 ? -1 : 0;
 }
@@ -1704,6 +1691,25 @@ void backup_capture_report_init(BackupCaptureReport *report)
     if (report == NULL)
         return;
     memset(report, 0, sizeof(*report));
+}
+
+int backup_capture_report_tick(BackupCaptureReport *report,
+                               off_t chunk_size, int destination_fd)
+{
+    if (report == NULL)
+        return 0;
+    report->bytes_copied += chunk_size;
+    if (report->progress_cb != NULL &&
+        backup_progress_should_fire(&report->progress_last_fired,
+                                    report->progress_unthrottled))
+        report->progress_cb(report->bytes_copied, report->current_path,
+                            report->progress_userdata);
+    if (report->sync_interval_bytes > 0 &&
+        backup_sync_due(&report->bytes_since_sync, chunk_size,
+                        report->sync_interval_bytes) &&
+        syncfs(destination_fd) != 0)
+        return -1;
+    return 0;
 }
 
 BackupCaptureStatus backup_capture_at_report(

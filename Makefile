@@ -150,17 +150,17 @@ sidecar_state_test.o: src/sidecar_state.c src/sidecar.h
 $(TEST_SIDECAR_SCALE): tests/test_sidecar_scale.c sidecar.o sidecar_state_test.o hash.o
 	$(CC) $(CFLAGS) -o $@ tests/test_sidecar_scale.c sidecar.o sidecar_state_test.o hash.o
 
-$(TEST_PORTABLE_CAPTURE): tests/test_portable_capture.c portable.o sidecar.o sidecar_state.o hash.o manifest.o encoding.o metadata.o utils.o
-	$(CC) $(CFLAGS) -o $@ tests/test_portable_capture.c portable.o sidecar.o sidecar_state.o hash.o manifest.o encoding.o metadata.o utils.o
+$(TEST_PORTABLE_CAPTURE): tests/test_portable_capture.c portable.o fileops.o sidecar.o sidecar_state.o hash.o manifest.o encoding.o metadata.o utils.o
+	$(CC) $(CFLAGS) -o $@ tests/test_portable_capture.c portable.o fileops.o sidecar.o sidecar_state.o hash.o manifest.o encoding.o metadata.o utils.o
 
 portable_test.o: src/portable.c src/portable.h src/sidecar.h
 	$(CC) $(CFLAGS) -DPORTABLE_CAPTURE_TEST_HOOKS -c src/portable.c -o $@
 
-$(TEST_PORTABLE_CAPTURE_SCALE): tests/test_portable_capture_scale.c portable_test.o sidecar.o sidecar_state.o hash.o manifest.o encoding.o metadata.o utils.o
-	$(CC) $(CFLAGS) -o $@ tests/test_portable_capture_scale.c portable_test.o sidecar.o sidecar_state.o hash.o manifest.o encoding.o metadata.o utils.o
+$(TEST_PORTABLE_CAPTURE_SCALE): tests/test_portable_capture_scale.c portable_test.o fileops.o sidecar.o sidecar_state.o hash.o manifest.o encoding.o metadata.o utils.o
+	$(CC) $(CFLAGS) -o $@ tests/test_portable_capture_scale.c portable_test.o fileops.o sidecar.o sidecar_state.o hash.o manifest.o encoding.o metadata.o utils.o
 
-$(TEST_PORTABLE_PREPARE): tests/test_portable_prepare.c portable_test.o sidecar_test.o sidecar_state_test.o hash.o manifest.o encoding.o metadata.o utils.o
-	$(CC) $(CFLAGS) -DPORTABLE_CAPTURE_TEST_HOOKS -DSIDECAR_TEST_HOOKS -o $@ tests/test_portable_prepare.c portable_test.o sidecar_test.o sidecar_state_test.o hash.o manifest.o encoding.o metadata.o utils.o
+$(TEST_PORTABLE_PREPARE): tests/test_portable_prepare.c portable_test.o fileops.o sidecar_test.o sidecar_state_test.o hash.o manifest.o encoding.o metadata.o utils.o
+	$(CC) $(CFLAGS) -DPORTABLE_CAPTURE_TEST_HOOKS -DSIDECAR_TEST_HOOKS -o $@ tests/test_portable_prepare.c portable_test.o fileops.o sidecar_test.o sidecar_state_test.o hash.o manifest.o encoding.o metadata.o utils.o
 
 $(TEST_NATIVE_RECONCILE_SCALE): tests/test_native_reconcile_scale.c fileops_test.o metadata.o portable.o sidecar.o sidecar_state.o hash.o manifest.o encoding.o utils.o
 	$(CC) $(CFLAGS) -DNATIVE_VISITED_TEST_HOOKS -o $@ tests/test_native_reconcile_scale.c fileops_test.o metadata.o portable.o sidecar.o sidecar_state.o hash.o manifest.o encoding.o utils.o
@@ -168,23 +168,23 @@ $(TEST_NATIVE_RECONCILE_SCALE): tests/test_native_reconcile_scale.c fileops_test
 $(TEST_NATIVE_HARDLINK_SCALE): tests/test_native_hardlink_scale.c fileops_test.o metadata.o portable.o sidecar.o sidecar_state.o hash.o manifest.o encoding.o utils.o
 	$(CC) $(CFLAGS) -DNATIVE_VISITED_TEST_HOOKS -o $@ tests/test_native_hardlink_scale.c fileops_test.o metadata.o portable.o sidecar.o sidecar_state.o hash.o manifest.o encoding.o utils.o
 
-$(TEST_PORTABLE_COLLISION_SCALE): tests/test_portable_collision_scale.c portable_test.o sidecar.o sidecar_state.o hash.o manifest.o encoding.o metadata.o utils.o
-	$(CC) $(CFLAGS) -DPORTABLE_CAPTURE_TEST_HOOKS -o $@ tests/test_portable_collision_scale.c portable_test.o sidecar.o sidecar_state.o hash.o manifest.o encoding.o metadata.o utils.o
+$(TEST_PORTABLE_COLLISION_SCALE): tests/test_portable_collision_scale.c portable_test.o fileops.o sidecar.o sidecar_state.o hash.o manifest.o encoding.o metadata.o utils.o
+	$(CC) $(CFLAGS) -DPORTABLE_CAPTURE_TEST_HOOKS -o $@ tests/test_portable_collision_scale.c portable_test.o fileops.o sidecar.o sidecar_state.o hash.o manifest.o encoding.o metadata.o utils.o
 
-$(TEST_PORTABLE_HARDLINK_SCALE): tests/test_portable_hardlink_scale.c portable_test.o sidecar.o sidecar_state_test.o hash.o manifest.o encoding.o metadata.o utils.o
-	$(CC) $(CFLAGS) -DPORTABLE_CAPTURE_TEST_HOOKS -o $@ tests/test_portable_hardlink_scale.c portable_test.o sidecar.o sidecar_state_test.o hash.o manifest.o encoding.o metadata.o utils.o
+$(TEST_PORTABLE_HARDLINK_SCALE): tests/test_portable_hardlink_scale.c portable_test.o fileops.o sidecar.o sidecar_state_test.o hash.o manifest.o encoding.o metadata.o utils.o
+	$(CC) $(CFLAGS) -DPORTABLE_CAPTURE_TEST_HOOKS -o $@ tests/test_portable_hardlink_scale.c portable_test.o fileops.o sidecar.o sidecar_state_test.o hash.o manifest.o encoding.o metadata.o utils.o
 
 sidecar_test.o: src/sidecar.c src/sidecar.h
 	$(CC) $(CFLAGS) -DSIDECAR_TEST_HOOKS -c src/sidecar.c -o $@
 
-$(TEST_PORTABLE_RESUME): tests/test_portable_resume.c portable_test.o sidecar_test.o sidecar_state_test.o hash.o manifest.o encoding.o metadata.o utils.o
-	$(CC) $(CFLAGS) -DPORTABLE_CAPTURE_TEST_HOOKS -DSIDECAR_TEST_HOOKS -o $@ tests/test_portable_resume.c portable_test.o sidecar_test.o sidecar_state_test.o hash.o manifest.o encoding.o metadata.o utils.o
+$(TEST_PORTABLE_RESUME): tests/test_portable_resume.c portable_test.o fileops.o sidecar_test.o sidecar_state_test.o hash.o manifest.o encoding.o metadata.o utils.o
+	$(CC) $(CFLAGS) -DPORTABLE_CAPTURE_TEST_HOOKS -DSIDECAR_TEST_HOOKS -o $@ tests/test_portable_resume.c portable_test.o fileops.o sidecar_test.o sidecar_state_test.o hash.o manifest.o encoding.o metadata.o utils.o
 
-$(TEST_PORTABLE_RECONCILE): tests/test_portable_reconcile.c portable_test.o sidecar.o sidecar_state.o hash.o manifest.o encoding.o metadata.o utils.o
-	$(CC) $(CFLAGS) -DPORTABLE_CAPTURE_TEST_HOOKS -o $@ tests/test_portable_reconcile.c portable_test.o sidecar.o sidecar_state.o hash.o manifest.o encoding.o metadata.o utils.o
+$(TEST_PORTABLE_RECONCILE): tests/test_portable_reconcile.c portable_test.o fileops.o sidecar.o sidecar_state.o hash.o manifest.o encoding.o metadata.o utils.o
+	$(CC) $(CFLAGS) -DPORTABLE_CAPTURE_TEST_HOOKS -o $@ tests/test_portable_reconcile.c portable_test.o fileops.o sidecar.o sidecar_state.o hash.o manifest.o encoding.o metadata.o utils.o
 
-$(TEST_PORTABLE_RECONCILE_SCALE): tests/test_portable_reconcile_scale.c portable_test.o sidecar.o sidecar_state_test.o hash.o manifest.o encoding.o metadata.o utils.o
-	$(CC) $(CFLAGS) -DPORTABLE_CAPTURE_TEST_HOOKS -o $@ tests/test_portable_reconcile_scale.c portable_test.o sidecar.o sidecar_state_test.o hash.o manifest.o encoding.o metadata.o utils.o
+$(TEST_PORTABLE_RECONCILE_SCALE): tests/test_portable_reconcile_scale.c portable_test.o fileops.o sidecar.o sidecar_state_test.o hash.o manifest.o encoding.o metadata.o utils.o
+	$(CC) $(CFLAGS) -DPORTABLE_CAPTURE_TEST_HOOKS -o $@ tests/test_portable_reconcile_scale.c portable_test.o fileops.o sidecar.o sidecar_state_test.o hash.o manifest.o encoding.o metadata.o utils.o
 
 portable_restore_test.o: src/portable_restore.c src/portable_restore.h src/backup.h src/fsprobe.h src/sidecar.h src/manifest.h src/metadata.h src/encoding.h src/xdg.h
 	$(CC) $(CFLAGS) -c src/portable_restore.c -o $@

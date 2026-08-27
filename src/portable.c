@@ -4262,21 +4262,8 @@ int portable_copy_regular(int source_fd, int destination_fd, off_t expected_size
             offset += (size_t)written;
         }
         copied += (uint64_t)received;
-        if (report != NULL)
-        {
-            report->bytes_copied += received;
-            if (report->progress_cb != NULL &&
-                backup_progress_should_fire(&report->progress_last_fired,
-                                            report->progress_unthrottled))
-                report->progress_cb(report->bytes_copied,
-                                    report->current_path,
-                                    report->progress_userdata);
-            if (report->sync_interval_bytes > 0 &&
-                backup_sync_due(&report->bytes_since_sync, received,
-                                report->sync_interval_bytes) &&
-                syncfs(destination_fd) != 0)
-                return -1;
-        }
+        if (backup_capture_report_tick(report, received, destination_fd) != 0)
+            return -1;
     }
     if (expected_size < 0 || copied != (uint64_t)expected_size)
     {
