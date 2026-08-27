@@ -916,6 +916,188 @@ static int backup_metadata_preflight(const BackupPlan *plan, int anchor_fd,
     return 0;
 }
 
+static int backup_dry_run(const char *target, BackupMode mode,
+                          BackupPlan *plan, Manifest *manifest)
+{
+    off_t estimated_size = 0;
+    int estimate_had_error = 0;
+    off_t raw_estimated_size = 0;
+    int raw_estimate_had_error = 0;
+    int count = 0;
+
+    // The destination is inspected exactly as a live run would inspect
+    // it, including the real capability probe and portable pre-scan
+    // (D24 I-6) -- but nothing beyond that: no container, no manifest,
+    // no data/, no package export.
+    int target_created = 0;
+    if (ensure_target_root(target, &target_created) != 0)
+    {
+        manifest_free(manifest);
+        backup_plan_free(plan);
+        return 1;
+    }
+
+    CloneRepresentation advisory_repr = CLONE_NATIVE_TREE;
+    FsCapabilityProfile advisory_profile;
+    MetadataProfiles advisory_profiles;
+    metadata_profiles_init(&advisory_profiles);
+    SourceReadRefusals advisory_refusals;
+    source_read_refusals_init(&advisory_refusals);
+    int advisory_fd = open(target, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int advisory_probe_failed = 0;
+    if (advisory_fd >= 0)
+    {
+        off_t advisory_block_size = 0;
+        (void)destination_block_size(advisory_fd, &advisory_block_size);
+        backup_plan_estimate_size(plan, advisory_block_size,
+                                  &estimated_size, &estimate_had_error);
+        backup_plan_estimate_size(plan, 1, &raw_estimated_size,
+                                  &raw_estimate_had_error);
+        if (backup_space_preflight(advisory_fd, estimated_size,
+                                   raw_estimated_size, estimate_had_error,
+                                   raw_estimate_had_error, target) != 0)
+        {
+            close(advisory_fd);
+            if (target_created)
+                rmdir(target);
+            metadata_profiles_free(&advisory_profiles);
+            manifest_free(manifest);
+            backup_plan_free(plan);
+            return 1;
+        }
+
+        advisory_probe_failed = backup_representation_preflight(
+            advisory_fd, target, &advisory_profile, &advisory_repr) != 0;
+    }
+    if (advisory_probe_failed)
+    {
+        close(advisory_fd);
+        if (target_created)
+            rmdir(target);
+        manifest_free(manifest);
+        backup_plan_free(plan);
+        return 1;
+    }
+
+    if (advisory_fd >= 0)
+    {
+        int advisory_failed = backup_metadata_preflight(
+            plan, advisory_fd, -1, &advisory_profiles,
+            &advisory_refusals) != 0;
+        if (advisory_refusals.refusal_count > 0)
+        {
+            source_read_refusals_report(&advisory_refusals);
+            print_error("Error: native metadata preflight refused the source; "
+                   "no container was created\n");
+            close(advisory_fd);
+            metadata_profiles_free(&advisory_profiles);
+            manifest_free(manifest);
+            backup_plan_free(plan);
+            return 1;
+        }
+        if (advisory_failed)
+            print_warning("Warning: could not complete the read-only metadata preview; "
+                   "the live backup will recheck it before writing.\n");
+        else
+        {
+            metadata_profiles_report(&advisory_profiles);
+            // The ownership probe is privilege-relevant and native-only;
+            // portable capture has no analogous native ownership step.
+            if (advisory_repr == CLONE_NATIVE_TREE &&
+                metadata_profiles_probe(
+                    &advisory_profiles,
+                    (MetadataTimestampPolicy){ .nsec_exact = 0,
+                                                .configured = 1 }) != 0)
+                print_warning("Warning: the ownership probe could not complete; "
+                       "the live backup will recheck it before writing.\n");
+        }
+    }
+
+    PortablePrescanReport advisory_prescan = {0};
+    int has_advisory_prescan = 0;
+    if (advisory_fd >= 0 && advisory_repr == CLONE_PORTABLE_SIDECAR)
+    {
+        PortableRootSpec *advisory_roots = plan->root_count > 0
+            ? calloc((size_t)plan->root_count, sizeof(*advisory_roots))
+            : NULL;
+        if (plan->root_count > 0 && advisory_roots == NULL)
+        {
+            print_error("Error: out of memory building the portable capture preview\n");
+            close(advisory_fd);
+            metadata_profiles_free(&advisory_profiles);
+            manifest_free(manifest);
+            backup_plan_free(plan);
+            return 1;
+        }
+        char advisory_machine_id[MANIFEST_MACHINE_ID_MAX];
+        int advisory_has_machine_id = read_machine_id(
+            advisory_machine_id, sizeof(advisory_machine_id)) == 0;
+        PortableCaptureRequest advisory_request;
+        int request_result = portable_capture_request_from_plan(
+            plan, advisory_machine_id, advisory_has_machine_id, getuid(),
+            advisory_profile.nsec_exact,
+            advisory_profile.capabilities[FS_CAP_CASE_SENSITIVE].status ==
+                FS_CAP_SUPPORTED,
+            advisory_roots, &advisory_request);
+        PortablePreparedCapture advisory_prepared = {0};
+        int prepare_result = request_result == 0
+            ? portable_capture_prepare(advisory_fd, &advisory_request,
+                                        &advisory_prepared)
+            : -1;
+        free(advisory_roots);
+        if (prepare_result != 0)
+        {
+            portable_prepared_capture_free(&advisory_prepared);
+            print_error("Error: portable pre-scan failed or found an unresolvable "
+                   "conflict at %s; nothing would be created\n", target);
+            close(advisory_fd);
+            metadata_profiles_free(&advisory_profiles);
+            manifest_free(manifest);
+            backup_plan_free(plan);
+            return 1;
+        }
+        advisory_prescan = advisory_prepared.report;
+        memset(&advisory_prepared.report, 0,
+               sizeof(advisory_prepared.report));
+        has_advisory_prescan = 1;
+        portable_prepared_capture_free(&advisory_prepared);
+    }
+    metadata_profiles_free(&advisory_profiles);
+    if (advisory_fd >= 0)
+        close(advisory_fd);
+
+    printf("Dry run mode enabled. No changes will be made.\n\n");
+    printf("Would create a versioned backup container under: %s\n", target);
+    printf("  Its migr_backup_<timestamp> name is chosen when the backup actually runs.\n");
+
+    preview_roots(plan, &count);
+
+    if (has_advisory_prescan)
+    {
+        printf("\nDestination cannot hold Linux metadata natively; a portable "
+               "sidecar representation would be used.\n");
+        if (advisory_prescan.unresolved_count > 0)
+            printf("  %zu naming conflict(s) found; the live run would refuse.\n",
+                   advisory_prescan.unresolved_count);
+        portable_prescan_report_free(&advisory_prescan);
+    }
+
+    printf("\nControls\n");
+    printf("  Would write manifest.txt\n");
+    if (mode != BACKUP_EXPLICIT_PATHS)
+        printf("  Would export package list to packages.txt\n");
+
+    printf("\n");
+    char item_phrase[64];
+    format_item_count_phrase(item_phrase, sizeof(item_phrase),
+                             (size_t)count, "would be copied");
+    printf("Dry run complete: %s\n", item_phrase);
+
+    manifest_free(manifest);
+    backup_plan_free(plan);
+    return 0;
+}
+
 /* ------------------------------------------------------------------------- */
 
 int backup(const char *target, BackupMode mode, char **paths)
@@ -959,179 +1141,7 @@ int backup(const char *target, BackupMode mode, char **paths)
     int count = 0;
 
     if (dry_run)
-    {
-        // The destination is inspected exactly as a live run would inspect
-        // it, including the real capability probe and portable pre-scan
-        // (D24 I-6) -- but nothing beyond that: no container, no manifest,
-        // no data/, no package export.
-        int target_created = 0;
-        if (ensure_target_root(target, &target_created) != 0)
-        {
-            manifest_free(&manifest);
-            backup_plan_free(&plan);
-            return 1;
-        }
-
-        CloneRepresentation advisory_repr = CLONE_NATIVE_TREE;
-        FsCapabilityProfile advisory_profile;
-        MetadataProfiles advisory_profiles;
-        metadata_profiles_init(&advisory_profiles);
-        SourceReadRefusals advisory_refusals;
-        source_read_refusals_init(&advisory_refusals);
-        int advisory_fd = open(target, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-        int advisory_probe_failed = 0;
-        if (advisory_fd >= 0)
-        {
-            off_t advisory_block_size = 0;
-            (void)destination_block_size(advisory_fd, &advisory_block_size);
-            backup_plan_estimate_size(&plan, advisory_block_size,
-                                      &estimated_size, &estimate_had_error);
-            backup_plan_estimate_size(&plan, 1, &raw_estimated_size,
-                                      &raw_estimate_had_error);
-            if (backup_space_preflight(advisory_fd, estimated_size,
-                                       raw_estimated_size, estimate_had_error,
-                                       raw_estimate_had_error, target) != 0)
-            {
-                close(advisory_fd);
-                if (target_created)
-                    rmdir(target);
-                metadata_profiles_free(&advisory_profiles);
-                manifest_free(&manifest);
-                backup_plan_free(&plan);
-                return 1;
-            }
-
-            advisory_probe_failed = backup_representation_preflight(
-                advisory_fd, target, &advisory_profile, &advisory_repr) != 0;
-        }
-        if (advisory_probe_failed)
-        {
-            close(advisory_fd);
-            if (target_created)
-                rmdir(target);
-            manifest_free(&manifest);
-            backup_plan_free(&plan);
-            return 1;
-        }
-
-        if (advisory_fd >= 0)
-        {
-            int advisory_failed = backup_metadata_preflight(
-                &plan, advisory_fd, -1, &advisory_profiles,
-                &advisory_refusals) != 0;
-            if (advisory_refusals.refusal_count > 0)
-            {
-                source_read_refusals_report(&advisory_refusals);
-                print_error("Error: native metadata preflight refused the source; "
-                       "no container was created\n");
-                close(advisory_fd);
-                metadata_profiles_free(&advisory_profiles);
-                manifest_free(&manifest);
-                backup_plan_free(&plan);
-                return 1;
-            }
-            if (advisory_failed)
-                print_warning("Warning: could not complete the read-only metadata preview; "
-                       "the live backup will recheck it before writing.\n");
-            else
-            {
-                metadata_profiles_report(&advisory_profiles);
-                // The ownership probe is privilege-relevant and native-only;
-                // portable capture has no analogous native ownership step.
-                if (advisory_repr == CLONE_NATIVE_TREE &&
-                    metadata_profiles_probe(
-                        &advisory_profiles,
-                        (MetadataTimestampPolicy){ .nsec_exact = 0,
-                                                    .configured = 1 }) != 0)
-                    print_warning("Warning: the ownership probe could not complete; "
-                           "the live backup will recheck it before writing.\n");
-            }
-        }
-
-        PortablePrescanReport advisory_prescan = {0};
-        int has_advisory_prescan = 0;
-        if (advisory_fd >= 0 && advisory_repr == CLONE_PORTABLE_SIDECAR)
-        {
-            PortableRootSpec *advisory_roots = plan.root_count > 0
-                ? calloc((size_t)plan.root_count, sizeof(*advisory_roots))
-                : NULL;
-            if (plan.root_count > 0 && advisory_roots == NULL)
-            {
-                print_error("Error: out of memory building the portable capture preview\n");
-                close(advisory_fd);
-                metadata_profiles_free(&advisory_profiles);
-                manifest_free(&manifest);
-                backup_plan_free(&plan);
-                return 1;
-            }
-            char advisory_machine_id[MANIFEST_MACHINE_ID_MAX];
-            int advisory_has_machine_id = read_machine_id(
-                advisory_machine_id, sizeof(advisory_machine_id)) == 0;
-            PortableCaptureRequest advisory_request;
-            int request_result = portable_capture_request_from_plan(
-                &plan, advisory_machine_id, advisory_has_machine_id, getuid(),
-                advisory_profile.nsec_exact,
-                advisory_profile.capabilities[FS_CAP_CASE_SENSITIVE].status ==
-                    FS_CAP_SUPPORTED,
-                advisory_roots, &advisory_request);
-            PortablePreparedCapture advisory_prepared = {0};
-            int prepare_result = request_result == 0
-                ? portable_capture_prepare(advisory_fd, &advisory_request,
-                                            &advisory_prepared)
-                : -1;
-            free(advisory_roots);
-            if (prepare_result != 0)
-            {
-                portable_prepared_capture_free(&advisory_prepared);
-                print_error("Error: portable pre-scan failed or found an unresolvable "
-                       "conflict at %s; nothing would be created\n", target);
-                close(advisory_fd);
-                metadata_profiles_free(&advisory_profiles);
-                manifest_free(&manifest);
-                backup_plan_free(&plan);
-                return 1;
-            }
-            advisory_prescan = advisory_prepared.report;
-            memset(&advisory_prepared.report, 0,
-                   sizeof(advisory_prepared.report));
-            has_advisory_prescan = 1;
-            portable_prepared_capture_free(&advisory_prepared);
-        }
-        metadata_profiles_free(&advisory_profiles);
-        if (advisory_fd >= 0)
-            close(advisory_fd);
-
-        printf("Dry run mode enabled. No changes will be made.\n\n");
-        printf("Would create a versioned backup container under: %s\n", target);
-        printf("  Its migr_backup_<timestamp> name is chosen when the backup actually runs.\n");
-
-        preview_roots(&plan, &count);
-
-        if (has_advisory_prescan)
-        {
-            printf("\nDestination cannot hold Linux metadata natively; a portable "
-                   "sidecar representation would be used.\n");
-            if (advisory_prescan.unresolved_count > 0)
-                printf("  %zu naming conflict(s) found; the live run would refuse.\n",
-                       advisory_prescan.unresolved_count);
-            portable_prescan_report_free(&advisory_prescan);
-        }
-
-        printf("\nControls\n");
-        printf("  Would write manifest.txt\n");
-        if (mode != BACKUP_EXPLICIT_PATHS)
-            printf("  Would export package list to packages.txt\n");
-
-        printf("\n");
-        char item_phrase[64];
-        format_item_count_phrase(item_phrase, sizeof(item_phrase),
-                                 (size_t)count, "would be copied");
-        printf("Dry run complete: %s\n", item_phrase);
-
-        manifest_free(&manifest);
-        backup_plan_free(&plan);
-        return 0;
-    }
+        return backup_dry_run(target, mode, &plan, &manifest);
 
     int target_created = 0;
     if (ensure_target_root(target, &target_created) != 0)
