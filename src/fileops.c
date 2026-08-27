@@ -1218,11 +1218,12 @@ static int capture_symlink_at(const char *src, int dest_dir_fd, const char *leaf
 // A write() that reports zero bytes for a non-zero request has made no
 // progress and never will on a retry, so it is treated as the failure it is
 // rather than spun on forever.
-static int copy_file_contents(int src_fd, int dest_fd,
+static int copy_file_contents(int src_fd, int dest_fd, off_t expected_size,
                               BackupCaptureReport *report)
 {
     char buffer[8192];
     ssize_t bytes_read;
+    off_t copied = 0;
     while ((bytes_read = read(src_fd, buffer, sizeof(buffer))) > 0)
     {
         ssize_t bytes_written = 0;
@@ -1234,10 +1235,18 @@ static int copy_file_contents(int src_fd, int dest_fd,
                 return -1;
             bytes_written += res;
         }
+        copied += bytes_read;
         if (backup_capture_report_tick(report, bytes_read, dest_fd) != 0)
             return -1;
     }
-    return bytes_read < 0 ? -1 : 0;
+    if (bytes_read < 0)
+        return -1;
+    if (expected_size < 0 || copied != expected_size)
+    {
+        errno = EIO;
+        return -1;
+    }
+    return 0;
 }
 
 static BackupCaptureStatus capture_hardlink_at(
@@ -1425,7 +1434,8 @@ static BackupCaptureStatus capture_regular_at(
 
     if (report != NULL)
         snprintf(report->current_path, sizeof(report->current_path), "%s", src);
-    int failed = copy_file_contents(src_fd, dest_fd, report) != 0;
+    int failed = copy_file_contents(src_fd, dest_fd, source_snapshot.st_size,
+                                    report) != 0;
     PortableXattrs xattrs = {0};
     if (!failed &&
         metadata_apply_ownership_and_mode_fd(dest_fd, &source_snapshot) != 0)
@@ -3000,7 +3010,8 @@ static RestoreNativeStatus restore_entry_at(
         if (capture_report != NULL)
             snprintf(capture_report->current_path,
                      sizeof(capture_report->current_path), "%s", logical_path);
-        int failed = copy_file_contents(src_fd, dst_fd, capture_report) != 0;
+        int failed = copy_file_contents(src_fd, dst_fd, desired_st.st_size,
+                                        capture_report) != 0;
 
         PortableXattrs xattrs = {0};
         if (!failed &&

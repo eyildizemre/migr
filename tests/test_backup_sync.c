@@ -16,14 +16,35 @@
 #include <unistd.h>
 
 #include "fileops.h"
+#include "metadata.h"
 #include "portable.h"
 #include "utils.h"
 
 static int failures;
 static int sync_calls;
 static int sync_should_fail;
+static int short_read_enabled;
+static int short_read_triggered;
 
 extern int __real_syncfs(int fd);
+extern ssize_t __real_read(int fd, void *buffer, size_t count);
+
+ssize_t __wrap_read(int fd, void *buffer, size_t count)
+{
+    (void)fd;
+    if (short_read_enabled && !short_read_triggered && count > 0)
+    {
+        short_read_triggered = 1;
+        return 0;
+    }
+    return __real_read(fd, buffer, count);
+}
+
+static void arm_short_read_for_source(const char *source_path, void *context)
+{
+    if (context != NULL && strcmp(source_path, context) == 0)
+        short_read_enabled = 1;
+}
 
 int __wrap_syncfs(int fd)
 {
@@ -276,6 +297,48 @@ static void test_native_sync(void)
     remove_tree(base);
 }
 
+static void test_native_short_copy_refuses(void)
+{
+    printf(":: native capture rejects a short source read\n");
+    char base[PATH_MAX];
+    char source_dir[PATH_MAX];
+    char destination_dir[PATH_MAX];
+    char source[PATH_MAX];
+    char destination[PATH_MAX];
+    make_base(base, sizeof(base));
+    join_path(source_dir, sizeof(source_dir), base, "source");
+    join_path(destination_dir, sizeof(destination_dir), base, "destination");
+    make_directory(source_dir);
+    make_directory(destination_dir);
+    join_path(source, sizeof(source), source_dir, "payload");
+    join_path(destination, sizeof(destination), destination_dir, "payload");
+    write_bytes(source, 80);
+
+    BackupCaptureReport report;
+    backup_capture_report_init(&report);
+    struct stat source_before;
+    if (stat(source, &source_before) != 0)
+        fixture_fatal("could not inspect the short-copy source");
+    short_read_triggered = 0;
+    short_read_enabled = 0;
+    backup_test_set_capture_hook(arm_short_read_for_source, source);
+    BackupCaptureStatus result = capture_native(source, destination_dir,
+                                                "payload", &report);
+    backup_test_set_capture_hook(NULL, NULL);
+    short_read_enabled = 0;
+
+    struct stat source_after;
+    struct stat destination_st;
+    check(short_read_triggered && result == BACKUP_CAPTURE_ERROR,
+          "a short read is rejected instead of reported as a successful capture");
+    check(report.bytes_copied == 0 && stat(source, &source_after) == 0 &&
+              metadata_source_unchanged(&source_before, &source_after) &&
+              lstat(destination, &destination_st) == 0 &&
+              destination_st.st_size == 0,
+          "the short-copy fixture leaves source metadata unchanged and copies no payload bytes");
+    remove_tree(base);
+}
+
 static void test_portable_sync(void)
 {
     printf(":: portable periodic capture sync\n");
@@ -369,6 +432,7 @@ static void test_portable_sync(void)
 int main(void)
 {
     test_native_sync();
+    test_native_short_copy_refuses();
     test_portable_sync();
     return failures == 0 ? 0 : 1;
 }
