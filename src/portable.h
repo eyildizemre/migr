@@ -26,6 +26,10 @@ int portable_component_valid(const char *component, size_t length);
 int portable_relative_bytes_valid(const char *data, size_t length,
                                   int allow_empty);
 
+/** Reports whether a payload path fits within a path-length capacity. */
+int portable_payload_path_fits(size_t root_length, size_t physical_length,
+                               size_t capacity);
+
 /** Reports whether the relative paths are equal or one contains the other. */
 int relative_paths_overlap(const char *left, const char *right);
 

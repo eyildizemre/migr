@@ -614,6 +614,13 @@ static int safe_relative_path(const char *path)
     return portable_relative_bytes_valid(path, length, 0);
 }
 
+int portable_payload_path_fits(size_t root_length, size_t physical_length,
+                               size_t capacity)
+{
+    return root_length != 0 && root_length < capacity &&
+           physical_length <= capacity - root_length - 1U;
+}
+
 static int append_logical(char *destination, size_t destination_size,
                           const char *parent, const char *name)
 {
@@ -4430,9 +4437,8 @@ static int capture_directory(PortableCaptureContext *context,
 
         size_t payload_root_length = strlen(root->payload_path);
         size_t physical_length = strlen(child_physical);
-        /* Keep this arithmetic in sync with replay_payload_path_build(). */
-        if (payload_root_length == 0 || payload_root_length >= PATH_MAX ||
-            physical_length > PATH_MAX - payload_root_length - 1U) {
+        if (!portable_payload_path_fits(payload_root_length, physical_length,
+                                        PATH_MAX)) {
             failed = 1;
             break;
         }
@@ -6010,10 +6016,8 @@ static int prescan_directory(int source_fd, const char *logical,
 
         size_t payload_root_length = strlen(payload_path);
         size_t physical_length = strlen(child_physical);
-        /* Keep this arithmetic in sync with replay_payload_path_build() and
-         * capture_directory(). */
-        if (payload_root_length == 0 || payload_root_length >= PATH_MAX ||
-            physical_length > PATH_MAX - payload_root_length - 1U) {
+        if (!portable_payload_path_fits(payload_root_length, physical_length,
+                                        PATH_MAX)) {
             if (payload_root_length > SIZE_MAX - 1U ||
                 physical_length > SIZE_MAX - payload_root_length - 1U)
                 failed = 1;

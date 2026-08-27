@@ -2327,8 +2327,7 @@ static int replay_payload_path_build(const ManifestRoot *root,
         return -1;
     }
     size_t root_length = strlen(root->payload_path);
-    if (root_length == 0 || root_length >= out_size ||
-        physical.length > out_size - root_length - 1U)
+    if (!portable_payload_path_fits(root_length, physical.length, out_size))
     {
         errno = E2BIG;
         return -1;
