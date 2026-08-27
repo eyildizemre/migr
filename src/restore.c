@@ -42,6 +42,36 @@ static void free_xdg_dirs(char **dirs)
         free(dirs[i]);
 }
 
+typedef enum {
+    LEGACY_HOME_ITEM_PROJECTS,
+    LEGACY_HOME_ITEM_DOTFILE,
+    LEGACY_HOME_ITEM_BROWSER
+} LegacyHomeItemKind;
+
+typedef struct {
+    const char *name;
+    LegacyHomeItemKind kind;
+} LegacyHomeItem;
+
+static const LegacyHomeItem LEGACY_HOME_ITEMS[] = {
+    { "Projects",               LEGACY_HOME_ITEM_PROJECTS },
+    { ".ssh",                   LEGACY_HOME_ITEM_DOTFILE },
+    { ".gnupg",                 LEGACY_HOME_ITEM_DOTFILE },
+    { ".gitconfig",             LEGACY_HOME_ITEM_DOTFILE },
+    { ".bashrc",                LEGACY_HOME_ITEM_DOTFILE },
+    { ".profile",               LEGACY_HOME_ITEM_DOTFILE },
+    { ".mozilla",               LEGACY_HOME_ITEM_BROWSER },
+    { ".config/google-chrome",  LEGACY_HOME_ITEM_BROWSER },
+    { ".config/chromium",       LEGACY_HOME_ITEM_BROWSER },
+    { ".config/BraveSoftware",  LEGACY_HOME_ITEM_BROWSER },
+    { ".config/vivaldi",        LEGACY_HOME_ITEM_BROWSER },
+    { ".config/microsoft-edge", LEGACY_HOME_ITEM_BROWSER },
+    { ".config/opera",          LEGACY_HOME_ITEM_BROWSER },
+};
+
+enum { LEGACY_HOME_ITEM_COUNT =
+    sizeof(LEGACY_HOME_ITEMS) / sizeof(LEGACY_HOME_ITEMS[0]) };
+
 typedef struct {
     dev_t device;
     ino_t inode;
@@ -631,20 +661,28 @@ static int restore_legacy(const char *source, int source_root_fd, const char *ho
             free(manifest_names[i]);
     free_xdg_dirs(xdg_dirs);
 
+    int rc;
     // Projects is not a standard XDG directory
-    int rc = restore_home_item(ctx, source_root_fd, home_fd, "Projects",
-                               timestamp_anchors, skipped_security_xattrs,
-                               capture_report);
-    if (rc > 0)
-        (*count)++;
-    else if (rc < 0)
-        *had_error = 1;
-
-    const char *dotfiles[] = {".ssh", ".gnupg", ".gitconfig", ".bashrc", ".profile", NULL};
-    printf("\nDotfiles\n");
-    for (int i = 0; dotfiles[i] != NULL; i++)
+    for (int i = 0; i < LEGACY_HOME_ITEM_COUNT; i++)
     {
-        rc = restore_home_item(ctx, source_root_fd, home_fd, dotfiles[i],
+        if (LEGACY_HOME_ITEMS[i].kind != LEGACY_HOME_ITEM_PROJECTS)
+            continue;
+        rc = restore_home_item(ctx, source_root_fd, home_fd,
+                               LEGACY_HOME_ITEMS[i].name, timestamp_anchors,
+                               skipped_security_xattrs, capture_report);
+        if (rc > 0)
+            (*count)++;
+        else if (rc < 0)
+            *had_error = 1;
+    }
+
+    printf("\nDotfiles\n");
+    for (int i = 0; i < LEGACY_HOME_ITEM_COUNT; i++)
+    {
+        if (LEGACY_HOME_ITEMS[i].kind != LEGACY_HOME_ITEM_DOTFILE)
+            continue;
+        rc = restore_home_item(ctx, source_root_fd, home_fd,
+                               LEGACY_HOME_ITEMS[i].name,
                                timestamp_anchors, skipped_security_xattrs,
                                capture_report);
         if (rc > 0)
@@ -653,20 +691,13 @@ static int restore_legacy(const char *source, int source_root_fd, const char *ho
             *had_error = 1;
     }
 
-    const char *browser_configs[] = {
-        ".mozilla",
-        ".config/google-chrome",
-        ".config/chromium",
-        ".config/BraveSoftware",
-        ".config/vivaldi",
-        ".config/microsoft-edge",
-        ".config/opera",
-        NULL
-    };
     printf("\nBrowser Profiles\n");
-    for (int i = 0; browser_configs[i] != NULL; i++)
+    for (int i = 0; i < LEGACY_HOME_ITEM_COUNT; i++)
     {
-        rc = restore_home_item(ctx, source_root_fd, home_fd, browser_configs[i],
+        if (LEGACY_HOME_ITEMS[i].kind != LEGACY_HOME_ITEM_BROWSER)
+            continue;
+        rc = restore_home_item(ctx, source_root_fd, home_fd,
+                               LEGACY_HOME_ITEMS[i].name,
                                timestamp_anchors, skipped_security_xattrs,
                                capture_report);
         if (rc > 0)
@@ -846,21 +877,16 @@ static int seed_native_restore_legacy_hardlink_map(
             failed = 1;
     }
 
-    const char *home_items[] = {
-        "Projects", ".ssh", ".gnupg", ".gitconfig", ".bashrc", ".profile",
-        ".mozilla", ".config/google-chrome", ".config/chromium",
-        ".config/BraveSoftware", ".config/vivaldi",
-        ".config/microsoft-edge", ".config/opera", NULL
-    };
-    for (int i = 0; home_items[i] != NULL; i++)
+    for (int i = 0; i < LEGACY_HOME_ITEM_COUNT; i++)
     {
+        const char *name = LEGACY_HOME_ITEMS[i].name;
         RestoreSourceStatus status =
-            restore_native_source_status_at(source_root_fd, home_items[i]);
+            restore_native_source_status_at(source_root_fd, name);
         if (status == RESTORE_SOURCE_MISSING)
             continue;
         if (status != RESTORE_SOURCE_PRESENT ||
-            seed_native_restore_root(ctx, anchors, source, home_items[i],
-                                     home_fd, home_items[i]) != 0)
+            seed_native_restore_root(ctx, anchors, source, name,
+                                     home_fd, name) != 0)
             failed = 1;
     }
 
@@ -1017,17 +1043,12 @@ static RestoreNativeStatus restore_legacy_metadata_inventory(
             failed = 1;
     }
 
-    const char *home_items[] = {
-        "Projects", ".ssh", ".gnupg", ".gitconfig", ".bashrc", ".profile",
-        ".mozilla", ".config/google-chrome", ".config/chromium",
-        ".config/BraveSoftware", ".config/vivaldi",
-        ".config/microsoft-edge", ".config/opera", NULL
-    };
-    for (int i = 0; home_items[i] != NULL; i++)
+    for (int i = 0; i < LEGACY_HOME_ITEM_COUNT; i++)
     {
+        const char *name = LEGACY_HOME_ITEMS[i].name;
         RestoreNativeStatus item_status = restore_metadata_item(
-            ctx, source_root_fd, home_items[i], home_fd, home_items[i],
-            home_items[i], 0, profiles, timestamp_anchors, estimate);
+            ctx, source_root_fd, name, home_fd, name, name, 0, profiles,
+            timestamp_anchors, estimate);
         if (item_status != RESTORE_NATIVE_OK)
         {
             failed = 1;
