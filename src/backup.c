@@ -188,6 +188,29 @@ static int backup_space_preflight(int dest_fd, off_t estimated_size,
     return 0;
 }
 
+/* Returns 0 to proceed (*out_profile and *out_repr are set), or -1 if the
+ * destination could not be probed or is not usable for backup (having already
+ * printed the refusal error). The caller is responsible for its own cleanup
+ * and return value in that case.
+ */
+static int backup_representation_preflight(int dest_fd, const char *target,
+                                           FsCapabilityProfile *out_profile,
+                                           CloneRepresentation *out_repr)
+{
+    const char *refusal = NULL;
+    if (fsprobe_fd(dest_fd, out_profile) != 0)
+        refusal = "could not probe the destination filesystem at";
+    else if (select_representation(out_profile, out_repr) != 0)
+        refusal = "the destination filesystem is not usable for backup at";
+
+    if (refusal != NULL)
+    {
+        print_error("Error: %s %s\n", refusal, target);
+        return -1;
+    }
+    return 0;
+}
+
 typedef struct {
     off_t estimated_total_bytes;
     int data_fd;
@@ -943,12 +966,12 @@ int backup(const char *target, BackupMode mode, char **paths)
 
         CloneRepresentation advisory_repr = CLONE_NATIVE_TREE;
         FsCapabilityProfile advisory_profile;
-        const char *advisory_refusal = NULL;
         MetadataProfiles advisory_profiles;
         metadata_profiles_init(&advisory_profiles);
         SourceReadRefusals advisory_refusals;
         source_read_refusals_init(&advisory_refusals);
         int advisory_fd = open(target, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        int advisory_probe_failed = 0;
         if (advisory_fd >= 0)
         {
             off_t advisory_block_size = 0;
@@ -970,14 +993,11 @@ int backup(const char *target, BackupMode mode, char **paths)
                 return 1;
             }
 
-            if (fsprobe_fd(advisory_fd, &advisory_profile) != 0)
-                advisory_refusal = "could not probe the destination filesystem at";
-            else if (select_representation(&advisory_profile, &advisory_repr) != 0)
-                advisory_refusal = "the destination filesystem is not usable for backup at";
+            advisory_probe_failed = backup_representation_preflight(
+                advisory_fd, target, &advisory_profile, &advisory_repr) != 0;
         }
-        if (advisory_refusal != NULL)
+        if (advisory_probe_failed)
         {
-            print_error("Error: %s %s\n", advisory_refusal, target);
             close(advisory_fd);
             if (target_created)
                 rmdir(target);
@@ -1145,15 +1165,8 @@ int backup(const char *target, BackupMode mode, char **paths)
     // rejected attempt leaves nothing behind.
     CloneRepresentation repr = CLONE_NATIVE_TREE;
     FsCapabilityProfile profile;
-    const char *refusal = NULL;
-    if (fsprobe_fd(target_fd, &profile) != 0)
-        refusal = "could not probe the destination filesystem at";
-    else if (select_representation(&profile, &repr) != 0)
-        refusal = "the destination filesystem is not usable for backup at";
-
-    if (refusal != NULL)
+    if (backup_representation_preflight(target_fd, target, &profile, &repr) != 0)
     {
-        print_error("Error: %s %s\n", refusal, target);
         close(target_fd);
         if (target_created) rmdir(target);
         manifest_free(&manifest);
