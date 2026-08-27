@@ -26,6 +26,15 @@ int relative_paths_overlap(const char *left, const char *right);
 int relative_path_prefix_match(const char *prefix, const char *path,
                                const char **relative_out);
 
+/**
+ * Opens or creates intermediate directories below base_fd and returns the
+ * parent fd plus the final path component. An empty relative path returns a
+ * duplicate of base_fd and an empty leaf.
+ */
+int portable_open_relative_parent(int base_fd, const char *relative,
+                                  int *parent_out, char *leaf,
+                                  size_t leaf_size);
+
 /** Copies a regular payload while updating optional progress and sync state. */
 int portable_copy_regular(int source_fd, int destination_fd,
                           off_t expected_size, BackupCaptureReport *report);

@@ -2539,69 +2539,6 @@ static int replay_open_destination_directory(int parent_fd, const char *leaf,
     return *out_fd < 0 ? -1 : 0;
 }
 
-static int replay_open_destination_parent(int home_fd, const char *path,
-                                           int *parent_out, char *leaf,
-                                           size_t leaf_size)
-{
-    if (home_fd < 0 || path == NULL || parent_out == NULL || leaf == NULL ||
-        leaf_size == 0 || !relative_path_valid(path, 1))
-    {
-        errno = EINVAL;
-        return -1;
-    }
-    int current = dup_cloexec(home_fd);
-    if (current < 0)
-        return -1;
-    if (path[0] == '\0')
-    {
-        leaf[0] = '\0';
-        *parent_out = current;
-        return 0;
-    }
-
-    char copy[PATH_MAX];
-    memcpy(copy, path, strlen(path) + 1U);
-    char *cursor = copy;
-    for (;;)
-    {
-        char *slash = strchr(cursor, '/');
-        if (slash != NULL)
-            *slash = '\0';
-        if (slash == NULL)
-        {
-            size_t length = strlen(cursor);
-            if (length == 0 || length >= leaf_size)
-            {
-                int saved = EINVAL;
-                close(current);
-                errno = saved;
-                return -1;
-            }
-            memcpy(leaf, cursor, length + 1U);
-            *parent_out = current;
-            return 0;
-        }
-
-        int next = -1;
-        if (replay_open_destination_directory(current, cursor, &next) != 0)
-        {
-            int saved = errno;
-            close(current);
-            errno = saved;
-            return -1;
-        }
-        if (close(current) != 0)
-        {
-            int saved = errno;
-            close(next);
-            errno = saved;
-            return -1;
-        }
-        current = next;
-        cursor = slash + 1U;
-    }
-}
-
 static int replay_open_destination_regular(int parent_fd, const char *leaf,
                                             int *out_fd)
 {
@@ -2666,7 +2603,7 @@ static int replay_destination_parent_for_root(
 
     const ManifestRoot *root = &collection->manifest->roots[root_index];
     if (root->policy != ROOT_POLICY_XDG)
-        return replay_open_destination_parent(
+        return portable_open_relative_parent(
             collection->destination_home_fd, relative, parent_out, leaf,
             leaf_size);
 
@@ -2690,7 +2627,7 @@ static int replay_destination_parent_for_root(
         return -1;
     }
 
-    int result = replay_open_destination_parent(
+    int result = portable_open_relative_parent(
         xdg_fd, destination, parent_out, leaf, leaf_size);
     int saved = errno;
     if (close(xdg_fd) != 0 && result == 0)

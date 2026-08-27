@@ -702,19 +702,31 @@ static int remove_leaf(int parent_fd, const char *name)
     return unlinkat(parent_fd, name, 0) == 0 ? 0 : -1;
 }
 
-static int open_payload_parent(int data_fd, const char *relative,
-                               int *parent_out, char *leaf, size_t leaf_size)
+int portable_open_relative_parent(int base_fd, const char *relative,
+                                  int *parent_out, char *leaf,
+                                  size_t leaf_size)
 {
-    if (data_fd < 0 || parent_out == NULL || leaf == NULL ||
-        !safe_relative_path(relative) || leaf_size == 0)
+    if (base_fd < 0 || relative == NULL || parent_out == NULL ||
+        leaf == NULL || leaf_size == 0 ||
+        (relative[0] != '\0' && !safe_relative_path(relative)))
+    {
+        errno = EINVAL;
         return -1;
+    }
+
+    int current = dup_cloexec(base_fd);
+    if (current < 0)
+        return -1;
+    if (relative[0] == '\0')
+    {
+        leaf[0] = '\0';
+        *parent_out = current;
+        return 0;
+    }
 
     size_t length = strlen(relative);
     char copy[PATH_MAX];
     memcpy(copy, relative, length + 1U);
-    int current = dup_cloexec(data_fd);
-    if (current < 0)
-        return -1;
 
     char *cursor = copy;
     for (;;) {
@@ -722,28 +734,58 @@ static int open_payload_parent(int data_fd, const char *relative,
         if (slash != NULL)
             *slash = '\0';
         if (slash == NULL) {
-            int result = copy_text(leaf, leaf_size, cursor);
-            if (result == 0) {
+            if (copy_text(leaf, leaf_size, cursor) == 0) {
                 *parent_out = current;
                 return 0;
             }
-            close(current);
+            int saved = EINVAL;
+            (void)close(current);
+            errno = saved;
+            return -1;
+        }
+
+        struct stat st;
+        if (fstatat(current, cursor, &st, AT_SYMLINK_NOFOLLOW) == 0) {
+            if (!S_ISDIR(st.st_mode)) {
+                int saved = ENOTDIR;
+                (void)close(current);
+                errno = saved;
+                return -1;
+            }
+        } else if (errno == ENOENT) {
+            if (mkdirat(current, cursor, 0700) != 0 && errno != EEXIST) {
+                int saved = errno;
+                (void)close(current);
+                errno = saved;
+                return -1;
+            }
+            if (fstatat(current, cursor, &st, AT_SYMLINK_NOFOLLOW) != 0 ||
+                !S_ISDIR(st.st_mode)) {
+                int saved = ENOTDIR;
+                (void)close(current);
+                errno = saved;
+                return -1;
+            }
+        } else {
+            int saved = errno;
+            (void)close(current);
+            errno = saved;
             return -1;
         }
 
         int next = open_child_directory(current, cursor);
-        if (next < 0 && errno == ENOENT) {
-            if (mkdirat(current, cursor, 0700) != 0 && errno != EEXIST) {
-                close(current);
-                return -1;
-            }
-            next = open_child_directory(current, cursor);
-        }
         if (next < 0) {
-            close(current);
+            int saved = errno;
+            (void)close(current);
+            errno = saved;
             return -1;
         }
-        close(current);
+        if (close(current) != 0) {
+            int saved = errno;
+            (void)close(next);
+            errno = saved;
+            return -1;
+        }
         current = next;
         cursor = slash + 1;
     }
@@ -4445,8 +4487,9 @@ static int capture_regular(PortableCaptureContext *context,
     int parent_fd = destination_parent;
     char root_leaf[NAME_MAX + 1U];
     if (destination_is_root) {
-        if (open_payload_parent(context->data_fd, root->payload_path,
-                                &parent_fd, root_leaf, sizeof(root_leaf)) != 0) {
+        if (portable_open_relative_parent(context->data_fd,
+                                          root->payload_path, &parent_fd,
+                                          root_leaf, sizeof(root_leaf)) != 0) {
             xattrs_free(xattrs);
             close(source_fd);
             return -1;
@@ -4543,8 +4586,9 @@ static int capture_special(PortableCaptureContext *context,
     int parent_fd = destination_parent;
     char root_leaf[NAME_MAX + 1U];
     if (destination_is_root) {
-        if (open_payload_parent(context->data_fd, root->payload_path,
-                                &parent_fd, root_leaf, sizeof(root_leaf)) != 0)
+        if (portable_open_relative_parent(context->data_fd,
+                                          root->payload_path, &parent_fd,
+                                          root_leaf, sizeof(root_leaf)) != 0)
             return -1;
         destination_leaf = root_leaf;
     }
@@ -4662,9 +4706,9 @@ static int capture_symlink(PortableCaptureContext *context,
     int parent_fd = destination_parent;
     char root_leaf[NAME_MAX + 1U];
     if (destination_is_root) {
-        if (open_payload_parent(context->data_fd, root->payload_path,
-                                &parent_fd, root_leaf,
-                                sizeof(root_leaf)) != 0) {
+        if (portable_open_relative_parent(context->data_fd,
+                                          root->payload_path, &parent_fd,
+                                          root_leaf, sizeof(root_leaf)) != 0) {
             xattrs_free(&xattrs);
             return -1;
         }
@@ -4779,9 +4823,9 @@ static int capture_hardlink(PortableCaptureContext *context,
     int parent_fd = destination_parent;
     char root_leaf[NAME_MAX + 1U];
     if (destination_is_root) {
-        if (open_payload_parent(context->data_fd, root->payload_path,
-                                &parent_fd, root_leaf,
-                                sizeof(root_leaf)) != 0) {
+        if (portable_open_relative_parent(context->data_fd,
+                                          root->payload_path, &parent_fd,
+                                          root_leaf, sizeof(root_leaf)) != 0) {
             close(source_fd);
             return -1;
         }
@@ -4967,8 +5011,9 @@ static int capture_node(PortableCaptureContext *context,
     int parent_fd = destination_parent;
     char root_leaf[NAME_MAX + 1U];
     if (is_root) {
-        if (open_payload_parent(context->data_fd, root->payload_path,
-                                &parent_fd, root_leaf, sizeof(root_leaf)) != 0) {
+        if (portable_open_relative_parent(context->data_fd,
+                                          root->payload_path, &parent_fd,
+                                          root_leaf, sizeof(root_leaf)) != 0) {
             xattrs_free(&xattrs);
             close(source_fd);
             return -1;
