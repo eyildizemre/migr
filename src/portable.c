@@ -2018,6 +2018,37 @@ static int case_fold_set_rehash(PortableCaseFoldSet *set,
     return 0;
 }
 
+/* Returns 1 for a matching slot, 0 for an empty insertion slot, -1 if full. */
+static int case_fold_set_locate(const PortableCaseFoldSet *set,
+                                const char *key, size_t key_length,
+                                uint64_t hash, size_t *out_index)
+{
+    if (set == NULL || out_index == NULL)
+        return -1;
+    if (set->capacity == 0) {
+        *out_index = SIZE_MAX;
+        return 0;
+    }
+
+    size_t index = (size_t)hash & (set->capacity - 1U);
+    for (size_t probes = 0; probes < set->capacity; probes++) {
+        const PortableCaseFoldSlot *slot = &set->slots[index];
+        if (slot->folded_key == NULL) {
+            *out_index = index;
+            return 0;
+        }
+        if (slot->hash == hash && slot->key_length == key_length &&
+            memcmp(slot->folded_key, key, key_length) == 0) {
+            *out_index = index;
+            return 1;
+        }
+        index = (index + 1U) & (set->capacity - 1U);
+    }
+
+    *out_index = SIZE_MAX;
+    return -1;
+}
+
 void ascii_fold_copy(char *destination, size_t destination_size,
                      const char *source)
 {
@@ -2058,24 +2089,17 @@ static int case_fold_set_find_or_insert_value(
     }
 
     uint64_t hash = case_fold_hash(set, folded_key, key_length);
-    size_t index = (size_t)hash & (set->capacity - 1U);
-    int empty_slot = 0;
-    for (size_t probes = 0; probes < set->capacity; probes++) {
-        PortableCaseFoldSlot *slot = &set->slots[index];
-        if (slot->folded_key == NULL) {
-            empty_slot = 1;
-            break;
-        }
-        if (slot->hash == hash && slot->key_length == key_length &&
-            memcmp(slot->folded_key, folded_key, key_length) == 0) {
-            *out_value_index = slot->value_index;
-            *out_logical_path = slot->logical_path;
-            return 1;
-        }
-        index = (index + 1U) & (set->capacity - 1U);
+    size_t index = SIZE_MAX;
+    int location = case_fold_set_locate(set, folded_key, key_length, hash,
+                                        &index);
+    if (location == 1) {
+        const PortableCaseFoldSlot *slot = &set->slots[index];
+        *out_value_index = slot->value_index;
+        *out_logical_path = slot->logical_path;
+        return 1;
     }
 
-    if (!empty_slot || set->count + 1U > set->capacity / 2U) {
+    if (location < 0 || set->count + 1U > set->capacity / 2U) {
         if (set->count >= SIDECAR_MAX_LIVE_ENTRIES ||
             set->capacity > visited_max_capacity() / 2U ||
             case_fold_set_rehash(set, set->capacity * 2U) != 0)
@@ -2129,17 +2153,9 @@ static int case_fold_set_contains(const PortableCaseFoldSet *set,
 
     size_t key_length = strlen(key);
     uint64_t hash = case_fold_hash(set, key, key_length);
-    size_t index = (size_t)hash & (set->capacity - 1U);
-    for (size_t probes = 0; probes < set->capacity; probes++) {
-        const PortableCaseFoldSlot *slot = &set->slots[index];
-        if (slot->folded_key == NULL)
-            return 0;
-        if (slot->hash == hash && slot->key_length == key_length &&
-            memcmp(slot->folded_key, key, key_length) == 0)
-            return 1;
-        index = (index + 1U) & (set->capacity - 1U);
-    }
-    return 0;
+    size_t index = SIZE_MAX;
+    int location = case_fold_set_locate(set, key, key_length, hash, &index);
+    return location == 1 ? 1 : 0;
 }
 
 void case_fold_set_free(PortableCaseFoldSet *set)
