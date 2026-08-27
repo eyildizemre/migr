@@ -1249,6 +1249,37 @@ static int copy_file_contents(int src_fd, int dest_fd, off_t expected_size,
     return 0;
 }
 
+static int apply_fd_metadata_tail(int destination_fd,
+                                  const struct stat *desired,
+                                  int source_fd,
+                                  MetadataTimestampPolicy policy,
+                                  size_t *out_skipped_security)
+{
+    PortableXattrs xattrs = {0};
+    int failed = metadata_apply_ownership_and_mode_fd(destination_fd,
+                                                       desired) != 0;
+    if (!failed && collect_xattrs(source_fd, &xattrs) != 0)
+        failed = 1;
+    struct stat after;
+    if (!failed && (fstat(source_fd, &after) != 0 ||
+                    !metadata_source_unchanged(desired, &after)))
+        failed = 1;
+    if (!failed)
+    {
+        size_t skipped_security = 0;
+        int xattr_result = metadata_apply_xattrs_fd_report(
+            destination_fd, xattrs.items, xattrs.count, &skipped_security);
+        if (out_skipped_security != NULL)
+            *out_skipped_security = skipped_security;
+        if (xattr_result != 0)
+            failed = 1;
+    }
+    if (!failed && metadata_apply_times_fd(destination_fd, desired, policy) != 0)
+        failed = 1;
+    xattrs_free(&xattrs);
+    return failed ? -1 : 0;
+}
+
 static BackupCaptureStatus capture_hardlink_at(
     int src_fd, int dest_dir_fd, const char *leaf,
     int representative_parent_fd, const char *representative_leaf,
@@ -1381,24 +1412,10 @@ static BackupCaptureStatus capture_regular_at(
             struct stat opened_dest;
             int failed = fstat(dest_fd, &opened_dest) != 0 ||
                          !S_ISREG(opened_dest.st_mode);
-            PortableXattrs xattrs = {0};
             if (!failed &&
-                metadata_apply_ownership_and_mode_fd(dest_fd,
-                                                     &source_snapshot) != 0)
+                apply_fd_metadata_tail(dest_fd, &source_snapshot, src_fd,
+                                       policy, NULL) != 0)
                 failed = 1;
-            if (!failed && collect_xattrs(src_fd, &xattrs) != 0)
-                failed = 1;
-            struct stat after;
-            if (!failed && (fstat(src_fd, &after) != 0 ||
-                            !metadata_source_unchanged(&source_snapshot, &after)))
-                failed = 1;
-            if (!failed && metadata_apply_xattrs_fd(dest_fd, xattrs.items,
-                                                    xattrs.count) != 0)
-                failed = 1;
-            if (!failed &&
-                metadata_apply_times_fd(dest_fd, &source_snapshot, policy) != 0)
-                failed = 1;
-            xattrs_free(&xattrs);
             if (close(dest_fd) != 0)
                 failed = 1;
             if (close(src_fd) != 0)
@@ -1436,22 +1453,10 @@ static BackupCaptureStatus capture_regular_at(
         snprintf(report->current_path, sizeof(report->current_path), "%s", src);
     int failed = copy_file_contents(src_fd, dest_fd, source_snapshot.st_size,
                                     report) != 0;
-    PortableXattrs xattrs = {0};
     if (!failed &&
-        metadata_apply_ownership_and_mode_fd(dest_fd, &source_snapshot) != 0)
+        apply_fd_metadata_tail(dest_fd, &source_snapshot, src_fd, policy,
+                               NULL) != 0)
         failed = 1;
-    if (!failed && collect_xattrs(src_fd, &xattrs) != 0)
-        failed = 1;
-    struct stat after;
-    if (!failed && (fstat(src_fd, &after) != 0 ||
-                    !metadata_source_unchanged(&source_snapshot, &after)))
-        failed = 1;
-    if (!failed && metadata_apply_xattrs_fd(dest_fd, xattrs.items,
-                                            xattrs.count) != 0)
-        failed = 1;
-    if (!failed && metadata_apply_times_fd(dest_fd, &source_snapshot, policy) != 0)
-        failed = 1;
-    xattrs_free(&xattrs);
 
     // A write deferred by the kernel (quota, ENOSPC, a network filesystem)
     // can surface only here, so a failed close means the payload is not
@@ -1582,25 +1587,10 @@ static BackupCaptureStatus capture_directory_at(
         if (result == BACKUP_CAPTURE_OK)
             result = BACKUP_CAPTURE_ERROR;
     }
-    PortableXattrs xattrs = {0};
     if (result == BACKUP_CAPTURE_OK &&
-        metadata_apply_ownership_and_mode_fd(child_fd, &source_snapshot) != 0)
+        apply_fd_metadata_tail(child_fd, &source_snapshot, source_fd,
+                               metadata_policy_from_context(ctx), NULL) != 0)
         result = BACKUP_CAPTURE_ERROR;
-    if (result == BACKUP_CAPTURE_OK && collect_xattrs(source_fd, &xattrs) != 0)
-        result = BACKUP_CAPTURE_ERROR;
-    struct stat after;
-    if (result == BACKUP_CAPTURE_OK &&
-        (fstat(source_fd, &after) != 0 ||
-         !metadata_source_unchanged(&source_snapshot, &after)))
-        result = BACKUP_CAPTURE_ERROR;
-    if (result == BACKUP_CAPTURE_OK &&
-        metadata_apply_xattrs_fd(child_fd, xattrs.items, xattrs.count) != 0)
-        result = BACKUP_CAPTURE_ERROR;
-    if (result == BACKUP_CAPTURE_OK &&
-        metadata_apply_times_fd(child_fd, &source_snapshot,
-                                metadata_policy_from_context(ctx)) != 0)
-        result = BACKUP_CAPTURE_ERROR;
-    xattrs_free(&xattrs);
     if (close(source_fd) != 0)
     {
         if (result == BACKUP_CAPTURE_OK)
@@ -2957,29 +2947,11 @@ static RestoreNativeStatus restore_entry_at(
             opened_dest_st.st_mtim.tv_nsec == desired_st.st_mtim.tv_nsec;
         if (content_skip)
         {
-            int failed = metadata_apply_ownership_and_mode_fd(dst_fd,
-                                                               &desired_st) != 0;
-            PortableXattrs xattrs = {0};
-            if (!failed && collect_xattrs(src_fd, &xattrs) != 0)
-                failed = 1;
-            struct stat after;
-            if (!failed && (fstat(src_fd, &after) != 0 ||
-                            !metadata_source_unchanged(&desired_st, &after)))
-                failed = 1;
-            if (!failed)
-            {
-                size_t skipped_security = 0;
-                int xattr_result = metadata_apply_xattrs_fd_report(
-                    dst_fd, xattrs.items, xattrs.count, &skipped_security);
-                restore_report_security_skipped(restore_report,
-                                                skipped_security);
-                if (xattr_result != 0)
-                    failed = 1;
-            }
-            if (!failed && metadata_apply_times_fd(dst_fd, &desired_st,
-                                                   policy) != 0)
-                failed = 1;
-            xattrs_free(&xattrs);
+            size_t skipped_security = 0;
+            int failed = apply_fd_metadata_tail(dst_fd, &desired_st, src_fd,
+                                                policy,
+                                                &skipped_security) != 0;
+            restore_report_security_skipped(restore_report, skipped_security);
             if (close(src_fd) != 0)
                 failed = 1;
             if (close(dst_fd) != 0)
@@ -3013,36 +2985,17 @@ static RestoreNativeStatus restore_entry_at(
         int failed = copy_file_contents(src_fd, dst_fd, desired_st.st_size,
                                         capture_report) != 0;
 
-        PortableXattrs xattrs = {0};
-        if (!failed &&
-            metadata_apply_ownership_and_mode_fd(dst_fd, &desired_st) != 0)
-            failed = 1;
         // collect_xattrs() reads the payload's *current* xattrs -- unlike
         // desired_st (a snapshot from an earlier pass), there is no
         // pre-recorded xattr set to fall back on, so this read must fall
         // inside the same before/after window the content copy above is
         // already verified against, not after it.
-        if (!failed && collect_xattrs(src_fd, &xattrs) != 0)
+        size_t skipped_security = 0;
+        if (!failed &&
+            apply_fd_metadata_tail(dst_fd, &desired_st, src_fd, policy,
+                                   &skipped_security) != 0)
             failed = 1;
-        if (!failed)
-        {
-            struct stat after;
-            if (fstat(src_fd, &after) != 0 ||
-                !metadata_source_unchanged(&desired_st, &after))
-                failed = 1;
-        }
-        if (!failed)
-        {
-            size_t skipped_security = 0;
-            int xattr_result = metadata_apply_xattrs_fd_report(
-                dst_fd, xattrs.items, xattrs.count, &skipped_security);
-            restore_report_security_skipped(restore_report, skipped_security);
-            if (xattr_result != 0)
-                failed = 1;
-        }
-        if (!failed && metadata_apply_times_fd(dst_fd, &desired_st, policy) != 0)
-            failed = 1;
-        xattrs_free(&xattrs);
+        restore_report_security_skipped(restore_report, skipped_security);
 
         if (close(src_fd) != 0)
             failed = 1;
@@ -3164,38 +3117,17 @@ static RestoreNativeStatus restore_entry_at(
 
         if (!failed && pass == RESTORE_APPLY)
         {
-            PortableXattrs xattrs = {0};
-            if (!failed &&
-                metadata_apply_ownership_and_mode_fd(dest_dir_fd,
-                                                      &desired_st) != 0)
-                failed = 1;
             // collect_xattrs() reads the payload's *current* xattrs -- unlike
             // desired_st (a snapshot from an earlier pass), there is no
             // pre-recorded xattr set to fall back on, so this read must fall
             // inside the same before/after window the subtree walk above is
             // already verified against, not after it.
-            if (!failed && collect_xattrs(source_dir_fd, &xattrs) != 0)
+            size_t skipped_security = 0;
+            if (apply_fd_metadata_tail(
+                    dest_dir_fd, &desired_st, source_dir_fd,
+                    metadata_policy_from_context(ctx), &skipped_security) != 0)
                 failed = 1;
-            struct stat after;
-            if (!failed && (fstat(source_dir_fd, &after) != 0 ||
-                            !metadata_source_unchanged(&desired_st, &after)))
-                failed = 1;
-            if (!failed)
-            {
-                size_t skipped_security = 0;
-                int xattr_result = metadata_apply_xattrs_fd_report(
-                    dest_dir_fd, xattrs.items, xattrs.count,
-                    &skipped_security);
-                restore_report_security_skipped(restore_report,
-                                                skipped_security);
-                if (xattr_result != 0)
-                    failed = 1;
-            }
-            if (!failed &&
-                metadata_apply_times_fd(dest_dir_fd, &desired_st,
-                                        metadata_policy_from_context(ctx)) != 0)
-                failed = 1;
-            xattrs_free(&xattrs);
+            restore_report_security_skipped(restore_report, skipped_security);
         }
 
         close(source_dir_fd);
