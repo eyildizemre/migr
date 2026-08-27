@@ -30,6 +30,10 @@ int portable_relative_bytes_valid(const char *data, size_t length,
 int portable_payload_path_fits(size_t root_length, size_t physical_length,
                                size_t capacity);
 
+/** Returns non-zero for a valid non-empty suffix and writes its numeric value. */
+int portable_collision_suffix_parse(const char *data, size_t length,
+                                    uint64_t *out_value);
+
 /** Reports whether the relative paths are equal or one contains the other. */
 int relative_paths_overlap(const char *left, const char *right);
 

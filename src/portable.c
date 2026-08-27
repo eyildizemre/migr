@@ -621,6 +621,29 @@ int portable_payload_path_fits(size_t root_length, size_t physical_length,
            physical_length <= capacity - root_length - 1U;
 }
 
+int portable_collision_suffix_parse(const char *data, size_t length,
+                                    uint64_t *out_value)
+{
+    if (data == NULL || out_value == NULL || length < 4U ||
+        length > SIDECAR_MAX_COLLISION_SUFFIX || data[0] != '%' ||
+        data[1] != '7' || data[2] != 'E' || data[3] < '1' ||
+        data[3] > '9')
+        return 0;
+
+    uint64_t value = (uint64_t)(data[3] - '0');
+    for (size_t index = 4U; index < length; index++)
+    {
+        if (data[index] < '0' || data[index] > '9' ||
+            value > (UINT64_MAX - (uint64_t)(data[index] - '0')) /
+                UINT64_C(10))
+            return 0;
+        value = value * UINT64_C(10) +
+                (uint64_t)(data[index] - '0');
+    }
+    *out_value = value;
+    return value != 0;
+}
+
 static int append_logical(char *destination, size_t destination_size,
                           const char *parent, const char *name)
 {
@@ -5534,10 +5557,15 @@ static int collision_suffix_format(uint64_t number, char *out,
         return 0;
     }
     int length = snprintf(out, out_size, "%%7E%" PRIu64, number);
-    return length < 0 || (size_t)length >= out_size ||
-                   (size_t)length > SIDECAR_MAX_COLLISION_SUFFIX
-               ? -1
-               : 0;
+    if (length < 0 || (size_t)length >= out_size ||
+        (size_t)length > SIDECAR_MAX_COLLISION_SUFFIX)
+        return -1;
+
+    uint64_t parsed = 0;
+    if (!portable_collision_suffix_parse(out, (size_t)length, &parsed) ||
+        parsed != number)
+        return -1;
+    return 0;
 }
 
 /* Returns 0 for a valid path, 1 for a NAME_MAX overflow, 2 for PATH_MAX. */

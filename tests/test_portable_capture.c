@@ -335,6 +335,21 @@ static void test_path_validation(void)
           "capture-side validation retains the visible NUL-terminated path");
 }
 
+static void test_collision_suffix_parser(void)
+{
+    printf(BLUE "::" NC " collision suffix parser contract\n");
+    uint64_t value = 0;
+    check(portable_collision_suffix_parse("%7E1", 4, &value) && value == 1,
+          "collision suffix parser returns the encoded number");
+    check(portable_collision_suffix_parse(
+              "%7E18446744073709551615", 23, &value) &&
+              value == UINT64_MAX,
+          "collision suffix parser accepts the uint64 ceiling");
+    check(!portable_collision_suffix_parse("%7E01", 5, &value) &&
+              !portable_collision_suffix_parse("%7e1", 4, &value),
+          "collision suffix parser rejects zero-padded and lower-case forms");
+}
+
 static void test_prescan_report(void)
 {
     printf(BLUE "::" NC " portable pre-scan report storage\n");
@@ -3735,6 +3750,7 @@ int main(void)
     test_entry_helpers(source_path);
     test_append_physical();
     test_path_validation();
+    test_collision_suffix_parser();
     test_prescan_report();
     test_case_fold_helpers();
     test_case_collision_prescan(root_path);

@@ -221,24 +221,9 @@ static int collision_suffix_valid(SidecarBytes suffix)
 {
     if (suffix.length == 0)
         return 1;
-    if (suffix.data == NULL || suffix.length < 4U ||
-        suffix.length > SIDECAR_MAX_COLLISION_SUFFIX ||
-        suffix.data[0] != '%' || suffix.data[1] != '7' ||
-        suffix.data[2] != 'E' || suffix.data[3] < '1' ||
-        suffix.data[3] > '9')
-        return 0;
-
-    uint64_t value = (uint64_t)(suffix.data[3] - '0');
-    for (size_t index = 4U; index < suffix.length; index++)
-    {
-        if (suffix.data[index] < '0' || suffix.data[index] > '9' ||
-            value > (UINT64_MAX - (uint64_t)(suffix.data[index] - '0')) /
-                UINT64_C(10))
-            return 0;
-        value = value * UINT64_C(10) +
-                (uint64_t)(suffix.data[index] - '0');
-    }
-    return value != 0;
+    uint64_t value = 0;
+    return portable_collision_suffix_parse((const char *)suffix.data,
+                                           suffix.length, &value);
 }
 
 static int physical_matches_logical_with_suffix(
