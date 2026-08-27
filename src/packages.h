@@ -49,4 +49,18 @@ int packages_at(int container_fd, const char *leaf);
  */
 int packages_clear_at(int container_fd, const char *leaf);
 
+/**
+ * @brief Installs packages listed in a restored packages.txt.
+ *
+ * Reads packages.txt from source_root_fd, detects the distro, and invokes the
+ * distro's package manager. A dry run only previews; a missing or non-regular
+ * packages.txt and an unrecognized distro are skipped without making the
+ * restore fatal, while failures to read or inspect the file set had_error.
+ *
+ * @param source_root_fd Directory fd the restored packages.txt is read from.
+ * @param home           Home directory path, used for the skipped-packages log.
+ * @param had_error      Set to 1 on a real failure; untouched otherwise.
+ */
+void restore_packages(int source_root_fd, const char *home, int *had_error);
+
 #endif
