@@ -24,6 +24,12 @@ void print_warning(const char *fmt, ...);
 void print_success(const char *fmt, ...);
 
 /**
+ * @brief Formats an item count and verb with singular/plural agreement.
+ */
+void format_item_count_phrase(char *buf, size_t buf_size, size_t count,
+                              const char *verb);
+
+/**
  * @brief Formats a byte count with the same units used by report output.
  */
 void format_size(off_t bytes, char *buf, size_t len);

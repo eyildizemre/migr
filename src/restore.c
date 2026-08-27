@@ -1692,17 +1692,26 @@ int restore(const char *source)
         switch (outcome)
         {
             case PORTABLE_RESTORE_COMPLETE:
+            {
+                char item_phrase[64];
+                format_item_count_phrase(item_phrase, sizeof(item_phrase),
+                                         report.applied_count, "restored");
                 if (had_portable_error)
-                    printf("Restore finished with errors: %zu item(s) restored, packages step failed\n",
-                           report.applied_count);
+                    printf("Restore finished with errors: %s, packages step failed\n",
+                           item_phrase);
                 else
-                    print_success("Restore complete: %zu item(s) restored\n",
-                                  report.applied_count);
+                    print_success("Restore complete: %s\n", item_phrase);
                 break;
+            }
             case PORTABLE_RESTORE_DRY_RUN:
-                printf("Dry run complete: %zu item(s) would be restored\n",
-                       report.live_count);
+            {
+                char item_phrase[64];
+                format_item_count_phrase(item_phrase, sizeof(item_phrase),
+                                         report.live_count,
+                                         "would be restored");
+                printf("Dry run complete: %s\n", item_phrase);
                 break;
+            }
             case PORTABLE_RESTORE_CANCELLED:
                 printf("Cancelled.\n");
                 break;
@@ -1921,15 +1930,19 @@ int restore(const char *source)
     restore_packages(source_root_fd, home, &had_error);
 
     printf("\n");
+    char item_phrase[64];
+    format_item_count_phrase(item_phrase, sizeof(item_phrase), (size_t)count,
+                             dry_run ? "would be restored" : "restored");
     if (dry_run && had_error)
-        printf("Dry run finished with errors: %d items would be restored, some items failed validation\n",
-               count);
+        printf("Dry run finished with errors: %s, some items failed validation\n",
+               item_phrase);
     else if (dry_run)
-        printf("Dry run complete: %d items would be restored\n", count);
+        printf("Dry run complete: %s\n", item_phrase);
     else if (had_error)
-        printf("Restore finished with errors: %d items restored, some items failed\n", count);
+        printf("Restore finished with errors: %s, some items failed\n",
+               item_phrase);
     else
-        print_success("Restore complete: %d items restored\n", count);
+        print_success("Restore complete: %s\n", item_phrase);
     if (skipped_security_xattrs != 0)
         printf("Skipped %zu security.* attribute(s) that the destination "
                "could not apply.\n", skipped_security_xattrs);

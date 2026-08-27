@@ -59,6 +59,13 @@ void print_success(const char *fmt, ...)
     va_end(args);
 }
 
+void format_item_count_phrase(char *buf, size_t buf_size, size_t count,
+                              const char *verb)
+{
+    snprintf(buf, buf_size, "%zu item%s %s", count,
+             count == 1 ? "" : "s", verb);
+}
+
 void format_size(off_t bytes, char *buf, size_t len)
 {
     if (bytes >= 1073741824)

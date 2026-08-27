@@ -1123,7 +1123,10 @@ int backup(const char *target, BackupMode mode, char **paths)
             printf("  Would export package list to packages.txt\n");
 
         printf("\n");
-        printf("Dry run complete: %d items would be copied\n", count);
+        char item_phrase[64];
+        format_item_count_phrase(item_phrase, sizeof(item_phrase),
+                                 (size_t)count, "would be copied");
+        printf("Dry run complete: %s\n", item_phrase);
 
         manifest_free(&manifest);
         backup_plan_free(&plan);
@@ -1542,7 +1545,11 @@ int backup(const char *target, BackupMode mode, char **paths)
     {
         // Nothing is published: an incomplete container must never look
         // complete.
-        printf("Backup finished with errors: %d items copied, some items failed\n", count);
+        char item_phrase[64];
+        format_item_count_phrase(item_phrase, sizeof(item_phrase),
+                                 (size_t)count, "copied");
+        printf("Backup finished with errors: %s, some items failed\n",
+               item_phrase);
         if (resumable)
             printf("Incomplete backup kept for resume: %s/%s\n",
                    target, container_current_name(&container));
@@ -1580,7 +1587,10 @@ int backup(const char *target, BackupMode mode, char **paths)
         return 1;
     }
 
-    print_success("Backup complete: %d items copied\n", count);
+    char item_phrase[64];
+    format_item_count_phrase(item_phrase, sizeof(item_phrase), (size_t)count,
+                             "copied");
+    print_success("Backup complete: %s\n", item_phrase);
     printf("Location: %s/%s\n", target, container_current_name(&container));
 
     container_close(&container);
