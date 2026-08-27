@@ -139,6 +139,14 @@ int destination_has_space(int dest_fd, off_t needed, off_t *free_bytes)
     return needed <= *free_bytes;
 }
 
+/* Reads only the destination's current free space -- the progress display's
+ * use case, which has no "needed" amount to compare against.
+ */
+static int destination_free_bytes(int dest_fd, off_t *free_bytes)
+{
+    return destination_has_space(dest_fd, 0, free_bytes) < 0 ? -1 : 0;
+}
+
 /* Returns 0 to proceed (space is adequate, or an earlier probe/estimate
  * step failed and already printed its own warning), or -1 if the
  * destination does not have enough free space (having already printed the
@@ -282,7 +290,7 @@ static void backup_report_progress(off_t bytes_copied,
                     sizeof(estimated_text));
 
     off_t free_bytes = 0;
-    if (destination_has_space(display->data_fd, 0, &free_bytes) >= 0)
+    if (destination_free_bytes(display->data_fd, &free_bytes) == 0)
         format_size(free_bytes, free_text, sizeof(free_text));
     else
         snprintf(free_text, sizeof(free_text), "unknown");
