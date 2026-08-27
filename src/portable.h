@@ -19,6 +19,13 @@ void xattrs_free(PortableXattrs *xattrs);
 int collect_xattrs(int fd, PortableXattrs *out);
 int collect_symlink_xattrs(const char *path, PortableXattrs *out);
 
+/** Validates one path component represented by an explicit byte length. */
+int portable_component_valid(const char *component, size_t length);
+
+/** Validates a relative path represented by an explicit byte length. */
+int portable_relative_bytes_valid(const char *data, size_t length,
+                                  int allow_empty);
+
 /** Reports whether the relative paths are equal or one contains the other. */
 int relative_paths_overlap(const char *left, const char *right);
 

@@ -321,6 +321,20 @@ static void test_append_physical(void)
           "physical path refuses a parent that does not fit");
 }
 
+static void test_path_validation(void)
+{
+    printf(BLUE "::" NC " portable path-component grammar\n");
+    char embedded_nul[] = { 'a', '\0', 'b' };
+    check(portable_component_valid(embedded_nul, sizeof(embedded_nul)) == 0 &&
+              portable_relative_bytes_valid(embedded_nul,
+                                             sizeof(embedded_nul), 0) == 0,
+          "length-based validation rejects embedded NUL bytes");
+    check(portable_component_valid(embedded_nul, strlen(embedded_nul)) == 1 &&
+              portable_relative_bytes_valid(embedded_nul,
+                                             strlen(embedded_nul), 0) == 1,
+          "capture-side validation retains the visible NUL-terminated path");
+}
+
 static void test_prescan_report(void)
 {
     printf(BLUE "::" NC " portable pre-scan report storage\n");
@@ -3720,6 +3734,7 @@ int main(void)
 
     test_entry_helpers(source_path);
     test_append_physical();
+    test_path_validation();
     test_prescan_report();
     test_case_fold_helpers();
     test_case_collision_prescan(root_path);

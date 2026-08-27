@@ -568,13 +568,42 @@ static int safe_id(const char *id)
     return 1;
 }
 
+int portable_component_valid(const char *component, size_t length)
+{
+    return component != NULL && length != 0 && length <= NAME_MAX &&
+           memchr(component, '/', length) == NULL &&
+           memchr(component, '\0', length) == NULL &&
+           !(length == 1 && component[0] == '.') &&
+           !(length == 2 && component[0] == '.' && component[1] == '.');
+}
+
+int portable_relative_bytes_valid(const char *data, size_t length,
+                                  int allow_empty)
+{
+    if (length >= PATH_MAX || (length != 0 && data == NULL))
+        return 0;
+    if (length == 0)
+        return allow_empty;
+    if (data[0] == '/' || data[length - 1U] == '/')
+        return 0;
+
+    size_t component_start = 0;
+    for (size_t index = 0; index <= length; index++)
+    {
+        if (index != length && data[index] != '/')
+            continue;
+        if (!portable_component_valid(data + component_start,
+                                      index - component_start))
+            return 0;
+        component_start = index + 1U;
+    }
+    return 1;
+}
+
 static int safe_component(const char *component)
 {
-    if (component == NULL || component[0] == '\0' ||
-        strcmp(component, ".") == 0 || strcmp(component, "..") == 0 ||
-        strchr(component, '/') != NULL || strlen(component) > NAME_MAX)
-        return 0;
-    return 1;
+    return component != NULL &&
+           portable_component_valid(component, strlen(component));
 }
 
 static int safe_relative_path(const char *path)
@@ -582,22 +611,7 @@ static int safe_relative_path(const char *path)
     if (path == NULL || path[0] == '\0' || path[0] == '/')
         return 0;
     size_t length = bounded_strlen(path, PATH_MAX);
-    if (length == 0 || length >= PATH_MAX || path[length - 1U] == '/')
-        return 0;
-
-    char copy[PATH_MAX];
-    memcpy(copy, path, length + 1U);
-    char *cursor = copy;
-    for (;;) {
-        char *slash = strchr(cursor, '/');
-        if (slash != NULL)
-            *slash = '\0';
-        if (!safe_component(cursor))
-            return 0;
-        if (slash == NULL)
-            return 1;
-        cursor = slash + 1;
-    }
+    return portable_relative_bytes_valid(path, length, 0);
 }
 
 static int append_logical(char *destination, size_t destination_size,

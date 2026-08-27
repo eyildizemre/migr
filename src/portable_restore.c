@@ -190,10 +190,7 @@ static int parent_map_find(const ParentMap *map, SidecarBytes root_id,
 
 static int text_component_valid(const char *component, size_t length)
 {
-    return component != NULL && length != 0 && length <= NAME_MAX &&
-           !(length == 1 && component[0] == '.') &&
-           !(length == 2 && component[0] == '.' && component[1] == '.') &&
-           memchr(component, '\0', length) == NULL;
+    return portable_component_valid(component, length);
 }
 
 static int relative_path_valid(const char *path, int allow_empty)
@@ -201,24 +198,7 @@ static int relative_path_valid(const char *path, int allow_empty)
     if (path == NULL)
         return 0;
     size_t length = strnlen(path, PATH_MAX + 1U);
-    if (length >= PATH_MAX)
-        return 0;
-    if (length == 0)
-        return allow_empty;
-    if (path[0] == '/' || path[length - 1U] == '/')
-        return 0;
-
-    size_t component_start = 0;
-    for (size_t index = 0; index <= length; index++)
-    {
-        if (index != length && path[index] != '/')
-            continue;
-        if (!text_component_valid(path + component_start,
-                                  index - component_start))
-            return 0;
-        component_start = index + 1U;
-    }
-    return 1;
+    return portable_relative_bytes_valid(path, length, allow_empty);
 }
 
 static int manifest_text_valid(const char *text, size_t capacity, int nonempty)
@@ -231,27 +211,10 @@ static int manifest_text_valid(const char *text, size_t capacity, int nonempty)
 
 static int sidecar_path_valid(SidecarBytes bytes, int allow_empty)
 {
-    if (bytes.length >= PATH_MAX ||
-        (bytes.length != 0 && bytes.data == NULL) ||
-        (bytes.length != 0 && memchr(bytes.data, '\0', bytes.length) != NULL))
+    if (bytes.length != 0 && bytes.data == NULL)
         return 0;
-    if (bytes.length == 0)
-        return allow_empty;
-    if (bytes.data[0] == '/' || bytes.data[bytes.length - 1U] == '/')
-        return 0;
-
-    size_t component_start = 0;
-    for (size_t index = 0; index <= bytes.length; index++)
-    {
-        if (index != bytes.length && bytes.data[index] != '/')
-            continue;
-        if (!text_component_valid(
-                (const char *)bytes.data + component_start,
-                index - component_start))
-            return 0;
-        component_start = index + 1U;
-    }
-    return 1;
+    return portable_relative_bytes_valid((const char *)bytes.data,
+                                          bytes.length, allow_empty);
 }
 
 static int collision_suffix_valid(SidecarBytes suffix)
