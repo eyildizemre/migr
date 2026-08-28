@@ -725,10 +725,6 @@ static SidecarStatus map_prepare_slot(StateMemory *memory, StateMap *map,
     return SIDECAR_STATUS_OK;
 }
 
-#if defined(__GNUC__) && !defined(__clang__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wanalyzer-malloc-leak"
-#endif
 static SidecarStatus map_prepare_commit(StateMemory *memory, StateMap *map,
                                         const StateEntry *pending,
                                         size_t *existing_index)
@@ -759,10 +755,6 @@ static SidecarStatus map_prepare_commit(StateMemory *memory, StateMap *map,
                             pending->entry.logical_path, hash,
                             existing_index);
 }
-#if defined(__GNUC__) && !defined(__clang__)
-#pragma GCC diagnostic pop
-#endif
-
 static SidecarStatus map_prepare_claim(StateMemory *memory, StateMap *map,
                                        SidecarBytes root_id,
                                        SidecarBytes logical_path,
