@@ -727,7 +727,8 @@ static SidecarStatus map_prepare_slot(StateMemory *memory, StateMap *map,
 
 static SidecarStatus map_prepare_commit(StateMemory *memory, StateMap *map,
                                         const StateEntry *pending,
-                                        size_t *existing_index)
+                                        size_t *existing_index,
+                                        uint64_t *out_hash)
 {
     if (map->generation == UINT64_MAX)
     {
@@ -736,6 +737,8 @@ static SidecarStatus map_prepare_commit(StateMemory *memory, StateMap *map,
     }
     uint64_t hash = map_hash(map, pending->entry.root_id,
                              pending->entry.logical_path);
+    if (out_hash != NULL)
+        *out_hash = hash;
     size_t index = MAP_INDEX_NONE;
     int location = map_locate(map, pending->entry.root_id,
                               pending->entry.logical_path, hash, &index);
@@ -758,7 +761,8 @@ static SidecarStatus map_prepare_commit(StateMemory *memory, StateMap *map,
 static SidecarStatus map_prepare_claim(StateMemory *memory, StateMap *map,
                                        SidecarBytes root_id,
                                        SidecarBytes logical_path,
-                                       size_t *claim_index)
+                                       size_t *claim_index,
+                                       uint64_t *out_hash)
 {
     if (map == NULL || map->value_kind != MAP_VALUE_CLAIM ||
         map->generation == UINT64_MAX)
@@ -767,6 +771,8 @@ static SidecarStatus map_prepare_claim(StateMemory *memory, StateMap *map,
         return SIDECAR_STATUS_LIMIT;
     }
     uint64_t hash = map_hash(map, root_id, logical_path);
+    if (out_hash != NULL)
+        *out_hash = hash;
     size_t index = MAP_INDEX_NONE;
     int location = map_locate(map, root_id, logical_path, hash, &index);
     if (location != 0)
@@ -784,7 +790,8 @@ static SidecarStatus map_prepare_claim(StateMemory *memory, StateMap *map,
 }
 
 static void map_apply_claim(StateMemory *memory, StateMap *map,
-                            StateClaim *claim, size_t claim_index)
+                            StateClaim *claim, size_t claim_index,
+                            uint64_t hash)
 {
     map->generation++;
     MapSlot *slot = &map->slots[claim_index];
@@ -795,8 +802,7 @@ static void map_apply_claim(StateMemory *memory, StateMap *map,
     }
     map->count++;
     slot->value.claim = *claim;
-    slot->hash = map_hash(map, slot->value.claim.claim.root_id,
-                          slot->value.claim.claim.logical_path);
+    slot->hash = hash;
     slot->state = MAP_SLOT_LIVE;
     slot->value.claim.generation = map->generation;
     *claim = (StateClaim){0};
@@ -827,7 +833,8 @@ static SidecarStatus map_apply_remove(StateMemory *memory, StateMap *map,
 }
 
 static void map_apply_commit(StateMemory *memory, StateMap *map,
-                             PendingEntry *pending, size_t existing_index)
+                             PendingEntry *pending, size_t existing_index,
+                             uint64_t hash)
 {
     map->generation++;
     MapSlot *slot = &map->slots[existing_index];
@@ -843,8 +850,7 @@ static void map_apply_commit(StateMemory *memory, StateMap *map,
         map->count++;
     }
     slot->value.entry = pending->entry;
-    slot->hash = map_hash(map, slot->value.entry.entry.root_id,
-                          slot->value.entry.entry.logical_path);
+    slot->hash = hash;
     slot->state = MAP_SLOT_LIVE;
     slot->value.entry.generation = map->generation;
     pending->entry = (StateEntry){0};
@@ -999,15 +1005,17 @@ static int load_callback(const SidecarRecord *record, void *context)
     {
         size_t existing_index = 0;
         size_t claim_index = MAP_INDEX_NONE;
+        uint64_t hash = 0;
         if ((status = prepare_claim_consumption(
                   &log->claim_map, &log->pending.entry.entry,
                   &claim_index)) == SIDECAR_STATUS_OK)
             status = map_prepare_commit(&log->memory, &log->map,
-                                        &log->pending.entry, &existing_index);
+                                        &log->pending.entry, &existing_index,
+                                        &hash);
         if (status == SIDECAR_STATUS_OK)
         {
             map_apply_commit(&log->memory, &log->map, &log->pending,
-                             existing_index);
+                             existing_index, hash);
             if (claim_index != MAP_INDEX_NONE)
                 status = map_apply_remove(&log->memory, &log->claim_map,
                                           claim_index);
@@ -1045,13 +1053,14 @@ static int load_callback(const SidecarRecord *record, void *context)
         {
             StateClaim claim = {0};
             status = copy_claim(&log->memory, &record->value.claim, &claim);
+            uint64_t hash = 0;
             if (status == SIDECAR_STATUS_OK)
                 status = map_prepare_claim(
                     &log->memory, &log->claim_map, claim.claim.root_id,
-                    claim.claim.logical_path, &claim_index);
+                    claim.claim.logical_path, &claim_index, &hash);
             if (status == SIDECAR_STATUS_OK)
                 map_apply_claim(&log->memory, &log->claim_map, &claim,
-                                claim_index);
+                                claim_index, hash);
             else
                 clear_claim(&log->memory, &claim);
         }
@@ -1340,6 +1349,7 @@ SidecarStatus sidecar_log_append_entry_commit(SidecarLog *log)
 
     size_t existing_index = 0;
     size_t claim_index = MAP_INDEX_NONE;
+    uint64_t hash = 0;
     status = prepare_claim_consumption(
         &implementation->claim_map, &implementation->pending.entry.entry,
         &claim_index);
@@ -1347,7 +1357,7 @@ SidecarStatus sidecar_log_append_entry_commit(SidecarLog *log)
         status = map_prepare_commit(&implementation->memory,
                                     &implementation->map,
                                     &implementation->pending.entry,
-                                    &existing_index);
+                                    &existing_index, &hash);
     if (status != SIDECAR_STATUS_OK)
         return status;
     if (sidecar_write_entry_commit(implementation->fd) != 0)
@@ -1357,7 +1367,7 @@ SidecarStatus sidecar_log_append_entry_commit(SidecarLog *log)
         return status;
     }
     map_apply_commit(&implementation->memory, &implementation->map,
-                     &implementation->pending, existing_index);
+                     &implementation->pending, existing_index, hash);
     if (claim_index != MAP_INDEX_NONE)
     {
         status = map_apply_remove(&implementation->memory,
@@ -1448,10 +1458,11 @@ SidecarStatus sidecar_log_append_claim(SidecarLog *log,
     if (status != SIDECAR_STATUS_OK)
         return status;
     size_t claim_index = MAP_INDEX_NONE;
+    uint64_t hash = 0;
     status = map_prepare_claim(&implementation->memory,
                                &implementation->claim_map,
                                copy.claim.root_id, copy.claim.logical_path,
-                               &claim_index);
+                               &claim_index, &hash);
     if (status != SIDECAR_STATUS_OK)
     {
         clear_claim(&implementation->memory, &copy);
@@ -1465,7 +1476,7 @@ SidecarStatus sidecar_log_append_claim(SidecarLog *log,
         return status;
     }
     map_apply_claim(&implementation->memory, &implementation->claim_map,
-                    &copy, claim_index);
+                    &copy, claim_index, hash);
     return finish_append(implementation);
 }
 
