@@ -606,6 +606,21 @@ static V1XdgDestStatus resolve_v1_xdg_root_destination(
     return V1_XDG_DEST_OK;
 }
 
+// Resolves the legacy source-side identifier for the i-th XDG slot: the
+// recorded legacy manifest name if present, else the destination-locale
+// directory's own basename. legacy_manifest_read() guarantees manifest_names
+// is all-NULL when it fails, so no separate "has manifest" flag is needed
+// here.
+static const char *legacy_xdg_source_name(
+    char *const manifest_names[XDG_RESTORE_COUNT],
+    char *const xdg_dirs[XDG_RESTORE_COUNT], int i)
+{
+    if (manifest_names[i] != NULL)
+        return manifest_names[i];
+    const char *slash = strrchr(xdg_dirs[i], '/');
+    return slash == NULL ? xdg_dirs[i] : slash + 1;
+}
+
 // Restores XDG main directories, Projects, dotfiles, and browser profiles
 // from an unversioned or manifest-absent backup. This path preserves the
 // legacy layout and its all-or-nothing XDG destination resolution.
@@ -625,20 +640,13 @@ static int restore_legacy(const char *source, int source_root_fd, const char *ho
         return -1;
     }
     char *manifest_names[XDG_RESTORE_COUNT];
-    int has_manifest = (legacy_manifest_read(source, manifest_names, XDG_RESTORE_COUNT) == 0);
+    (void)legacy_manifest_read(source, manifest_names, XDG_RESTORE_COUNT);
 
     for (int i = 0; i < XDG_RESTORE_COUNT; i++)
     {
         // The manifest name locates the source-locale directory; xdg_dirs[i] is
         // the destination-locale path. Fall back to its basename if absent.
-        const char *name;
-        if (has_manifest && manifest_names[i] != NULL)
-            name = manifest_names[i];
-        else
-        {
-            const char *p = strrchr(xdg_dirs[i], '/');
-            name = p ? p + 1 : xdg_dirs[i];
-        }
+        const char *name = legacy_xdg_source_name(manifest_names, xdg_dirs, i);
 
         RestoreSourceStatus source_status = restore_native_source_status_at(source_root_fd, name);
         if (source_status == RESTORE_SOURCE_MISSING)
@@ -678,9 +686,8 @@ static int restore_legacy(const char *source, int source_root_fd, const char *ho
         close(xdg_dest_fd);
     }
 
-    if (has_manifest)
-        for (int i = 0; i < XDG_RESTORE_COUNT; i++)
-            free(manifest_names[i]);
+    for (int i = 0; i < XDG_RESTORE_COUNT; i++)
+        free(manifest_names[i]);
     free_xdg_dirs(xdg_dirs);
 
     int rc;
@@ -864,12 +871,7 @@ static int seed_native_restore_legacy_hardlink_map(
     int failed = 0;
     for (int i = 0; i < XDG_RESTORE_COUNT; i++)
     {
-        const char *name = manifest_names[i];
-        if (name == NULL)
-        {
-            const char *slash = strrchr(xdg_dirs[i], '/');
-            name = slash == NULL ? xdg_dirs[i] : slash + 1;
-        }
+        const char *name = legacy_xdg_source_name(manifest_names, xdg_dirs, i);
 
         RestoreSourceStatus status =
             restore_native_source_status_at(source_root_fd, name);
@@ -1018,12 +1020,7 @@ static RestoreNativeStatus restore_legacy_metadata_inventory(
     RestoreNativeStatus result = RESTORE_NATIVE_OK;
     for (int i = 0; i < XDG_RESTORE_COUNT; i++)
     {
-        const char *name = manifest_names[i];
-        if (name == NULL)
-        {
-            const char *slash = strrchr(xdg_dirs[i], '/');
-            name = slash == NULL ? xdg_dirs[i] : slash + 1;
-        }
+        const char *name = legacy_xdg_source_name(manifest_names, xdg_dirs, i);
 
         /* Legacy XDG roots are optional. Inspect the source first so a
          * missing source does not make an otherwise irrelevant destination
