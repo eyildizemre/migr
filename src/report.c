@@ -270,30 +270,19 @@ static const char *scoped_root_name(const char *home,
             { ".config/opera",         "Opera" },
         };
         char home_real[PATH_MAX];
+        const char *restore_rel = NULL;
 
         /* backup_plan_build() canonicalizes HOME before building capture_path. */
-        if (realpath(home, home_real) != NULL)
+        if (realpath(home, home_real) != NULL &&
+            backup_plan_home_relative(home_real, root->capture_path,
+                                      &restore_rel))
         {
-            const char *relative = NULL;
-            size_t home_len = strlen(home_real);
-
-            if (strcmp(home_real, "/") == 0)
-                relative = root->capture_path + 1;
-            else if (strcmp(root->capture_path, home_real) == 0)
-                relative = root->capture_path + home_len;
-            else if (strncmp(root->capture_path, home_real, home_len) == 0 &&
-                     root->capture_path[home_len] == '/')
-                relative = root->capture_path + home_len + 1;
-
-            if (relative != NULL)
+            for (size_t i = 0;
+                 i < sizeof(browser_names) / sizeof(browser_names[0]);
+                 i++)
             {
-                for (size_t i = 0;
-                     i < sizeof(browser_names) / sizeof(browser_names[0]);
-                     i++)
-                {
-                    if (strcmp(relative, browser_names[i].home_relative) == 0)
-                        return browser_names[i].display_name;
-                }
+                if (strcmp(restore_rel, browser_names[i].home_relative) == 0)
+                    return browser_names[i].display_name;
             }
         }
     }

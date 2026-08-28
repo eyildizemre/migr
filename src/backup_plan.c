@@ -28,6 +28,18 @@ static int root_type_allowed(mode_t mode)
     return S_ISREG(mode) || S_ISDIR(mode) || S_ISLNK(mode) || S_ISFIFO(mode);
 }
 
+static int copy_field(char *dest, size_t dest_size, const char *src,
+                      const char *fmt, const char *fmt_arg)
+{
+    if (strlen(src) >= dest_size)
+    {
+        print_error(fmt, fmt_arg);
+        return -1;
+    }
+    strcpy(dest, src);
+    return 0;
+}
+
 // Appends one fully-formed root. source_path is always a real string;
 // restore_path may be NULL when has_restore_path is 0 (XDG and MANUAL_NATIVE
 // roots have no restore_path at all -- they are never "reusing" source_path
@@ -60,46 +72,29 @@ static int append_root(RootBuilder *rb, const char *id, RootPolicy policy,
     BackupPlanRoot *r = &rb->items[rb->count];
     memset(r, 0, sizeof(*r));
 
-    if (strlen(capture_path) >= sizeof(r->capture_path))
-    {
-        print_error("Error: path too long: %s\n", capture_path);
+    if (copy_field(r->capture_path, sizeof(r->capture_path), capture_path,
+                   "Error: path too long: %s\n", capture_path) != 0)
         return -1;
-    }
-    strcpy(r->capture_path, capture_path);
 
     ManifestRoot *mr = &r->manifest_root;
-    if (strlen(id) >= sizeof(mr->id))
-    {
-        print_error("Error: root id too long: %s\n", id);
+    if (copy_field(mr->id, sizeof(mr->id), id,
+                   "Error: root id too long: %s\n", id) != 0)
         return -1;
-    }
-    strcpy(mr->id, id);
     mr->policy = policy;
 
-    if (strlen(payload_path) >= sizeof(mr->payload_path))
-    {
-        print_error("Error: payload path too long for %s\n", id);
+    if (copy_field(mr->payload_path, sizeof(mr->payload_path), payload_path,
+                   "Error: payload path too long for %s\n", id) != 0)
         return -1;
-    }
-    strcpy(mr->payload_path, payload_path);
 
-    if (strlen(source_path) >= sizeof(mr->source_path))
-    {
-        print_error("Error: source path too long: %s\n", source_path);
+    if (copy_field(mr->source_path, sizeof(mr->source_path), source_path,
+                   "Error: source path too long: %s\n", source_path) != 0)
         return -1;
-    }
-    strcpy(mr->source_path, source_path);
 
     mr->has_restore_path = has_restore_path;
-    if (has_restore_path)
-    {
-        if (strlen(restore_path) >= sizeof(mr->restore_path))
-        {
-            print_error("Error: restore path too long for %s\n", id);
+    if (has_restore_path &&
+        copy_field(mr->restore_path, sizeof(mr->restore_path), restore_path,
+                   "Error: restore path too long for %s\n", id) != 0)
             return -1;
-        }
-        strcpy(mr->restore_path, restore_path);
-    }
 
     r->group = group;
     rb->count++;
@@ -389,15 +384,8 @@ static int build_builtin_roots(const char *home_real, BackupMode mode, RootBuild
 /* Explicit-path classification.                                             */
 /* ------------------------------------------------------------------------- */
 
-// Component-boundary HOME containment (docs/DECISIONS.md D16): a lexical
-// prefix like "$HOME2" must never count as "under HOME", so the byte right
-// after home_real in capture_path must be '/' exactly, or capture_path must
-// equal home_real (the root is HOME itself, restore_rel ""). home_real == "/"
-// is a special case: "/" already ends in the separator, so a descendant like
-// "/etc/hosts" has no second '/' to require, and the home-relative address
-// starts one byte earlier than the general case.
-static int is_home_relative(const char *home_real, const char *capture_path,
-                            const char **restore_rel)
+int backup_plan_home_relative(const char *home_real, const char *capture_path,
+                              const char **restore_rel)
 {
     static const char empty[] = "";
     if (strcmp(capture_path, home_real) == 0)
@@ -481,7 +469,8 @@ static int build_explicit_roots(const char *home_real, const char *const *explic
         }
 
         const char *restore_rel;
-        if (is_home_relative(home_real, tmp[i].capture_path, &restore_rel))
+        if (backup_plan_home_relative(home_real, tmp[i].capture_path,
+                                      &restore_rel))
         {
             if (append_root(rb, id, ROOT_POLICY_HOME_RELATIVE, id, restore_rel,
                             restore_rel, 1, tmp[i].capture_path, BACKUP_ROOT_EXPLICIT) != 0)

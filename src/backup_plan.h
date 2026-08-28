@@ -136,6 +136,28 @@ void backup_plan_estimate_size(const BackupPlan *plan, off_t block_size,
 int backup_plan_destination_conflicts(const BackupPlan *plan, const char *destination);
 
 /**
+ * @brief Whether capture_path is home_real itself or a proper descendant
+ * of it, at a component boundary (docs/DECISIONS.md D16).
+ *
+ * A lexical prefix like "$HOME2" must never count as "under HOME" -- the
+ * byte right after home_real in capture_path must be '/' exactly, or
+ * capture_path must equal home_real (the root is HOME itself,
+ * *restore_rel ""). home_real == "/" is a special case: "/" already ends
+ * in the separator, so a descendant like "/etc/hosts" has no second '/'
+ * to require, and the home-relative address starts one byte earlier than
+ * the general case.
+ *
+ * @param home_real    Canonical (realpath'd) HOME.
+ * @param capture_path A normalized capture address to test.
+ * @param restore_rel  Set, on a true result, to the home-relative suffix
+ *                     (an empty string when capture_path is exactly
+ *                     home_real). Untouched on a false result.
+ * @return 1 if capture_path is under home_real, 0 otherwise.
+ */
+int backup_plan_home_relative(const char *home_real, const char *capture_path,
+                              const char **restore_rel);
+
+/**
  * @brief Releases the heap-owned root array. Safe on NULL and on an
  * all-zero/never-built BackupPlan.
  */
