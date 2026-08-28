@@ -15,24 +15,24 @@
 #include "metadata.h"
 
 #ifdef METADATA_TEST_HOOKS
-static uint64_t metadata_probe_calls;
-static MetadataTestProbeHook metadata_probe_hook;
-static void *metadata_probe_hook_context;
+static uint64_t metadata_ownership_probe_calls;
+static MetadataTestProbeHook metadata_ownership_probe_hook;
+static void *metadata_ownership_probe_hook_context;
 
 uint64_t metadata_test_probe_count(void)
 {
-    return metadata_probe_calls;
+    return metadata_ownership_probe_calls;
 }
 
 void metadata_test_reset_probe_count(void)
 {
-    metadata_probe_calls = 0;
+    metadata_ownership_probe_calls = 0;
 }
 
 void metadata_test_set_probe_hook(MetadataTestProbeHook hook, void *context)
 {
-    metadata_probe_hook = hook;
-    metadata_probe_hook_context = context;
+    metadata_ownership_probe_hook = hook;
+    metadata_ownership_probe_hook_context = context;
 }
 #endif
 
@@ -117,6 +117,18 @@ static int profile_same(const MetadataProfile *profile,
             profile->initial_gid == existing->st_gid);
 }
 
+static void metadata_profiles_record_example(MetadataProfiles *profiles,
+                                              const char *path)
+{
+    if (path != NULL && profiles->example_count < METADATA_MAX_PREFLIGHT_EXAMPLES)
+    {
+        int n = snprintf(profiles->examples[profiles->example_count],
+                         sizeof(profiles->examples[0]), "%s", path);
+        if (n >= 0 && (size_t)n < sizeof(profiles->examples[0]))
+            profiles->example_count++;
+    }
+}
+
 void metadata_profiles_init(MetadataProfiles *profiles)
 {
     if (profiles == NULL)
@@ -163,13 +175,7 @@ int metadata_profiles_add(MetadataProfiles *profiles, int anchor_fd,
                          existing))
         {
             profiles->affected_objects++;
-            if (path != NULL && profiles->example_count < METADATA_MAX_PREFLIGHT_EXAMPLES)
-            {
-                int n = snprintf(profiles->examples[profiles->example_count],
-                                 sizeof(profiles->examples[0]), "%s", path);
-                if (n >= 0 && (size_t)n < sizeof(profiles->examples[0]))
-                    profiles->example_count++;
-            }
+            metadata_profiles_record_example(profiles, path);
             return 0;
         }
     }
@@ -211,13 +217,7 @@ int metadata_profiles_add(MetadataProfiles *profiles, int anchor_fd,
         return -1;
     profiles->count++;
     profiles->affected_objects++;
-    if (path != NULL && profiles->example_count < METADATA_MAX_PREFLIGHT_EXAMPLES)
-    {
-        int n = snprintf(profiles->examples[profiles->example_count],
-                         sizeof(profiles->examples[0]), "%s", path);
-        if (n >= 0 && (size_t)n < sizeof(profiles->examples[0]))
-            profiles->example_count++;
-    }
+    metadata_profiles_record_example(profiles, path);
     return 0;
 }
 
@@ -284,9 +284,9 @@ int metadata_profiles_probe(const MetadataProfiles *profiles,
                             MetadataTimestampPolicy policy)
 {
 #ifdef METADATA_TEST_HOOKS
-    metadata_probe_calls++;
-    if (metadata_probe_hook != NULL)
-        metadata_probe_hook(metadata_probe_hook_context);
+    metadata_ownership_probe_calls++;
+    if (metadata_ownership_probe_hook != NULL)
+        metadata_ownership_probe_hook(metadata_ownership_probe_hook_context);
 #endif
     if (profiles == NULL)
         return -1;
@@ -1005,21 +1005,21 @@ static int metadata_probe_attribute_target(const MetadataXattrTarget *target,
     return failed ? -1 : 0;
 }
 
-static int metadata_probe_attribute_fd(int fd,
-                                       const MetadataXattrProbeAttribute *attribute)
+static int metadata_probe_attribute_loop(const MetadataXattrTarget *target,
+                                         unsigned int namespaces)
 {
-    MetadataXattrTarget target = { .fd = fd, .path = NULL };
-    return metadata_probe_attribute_target(&target, attribute);
-}
-
-static int metadata_probe_attribute_symlink(int anchor_fd, const char *name,
-                                            const MetadataXattrProbeAttribute *attribute)
-{
-    char path[PATH_MAX];
-    if (metadata_symlink_xattr_path(anchor_fd, name, path, sizeof(path)) != 0)
-        return -1;
-    MetadataXattrTarget target = { .fd = -1, .path = path };
-    return metadata_probe_attribute_target(&target, attribute);
+    for (size_t i = 0;
+         i < sizeof(metadata_probe_attributes) /
+                 sizeof(metadata_probe_attributes[0]);
+         i++)
+    {
+        if ((namespaces & metadata_probe_attributes[i].namespace_bit) == 0)
+            continue;
+        if (metadata_probe_attribute_target(target,
+                                            &metadata_probe_attributes[i]) != 0)
+            return -1;
+    }
+    return 0;
 }
 
 static int metadata_probe_regular_xattrs(int anchor_fd,
@@ -1033,22 +1033,10 @@ static int metadata_probe_regular_xattrs(int anchor_fd,
     if (fd < 0)
         return -1;
 
-    int failed = 0;
-    int saved_errno = 0;
-    for (size_t i = 0;
-         i < sizeof(metadata_probe_attributes) /
-                 sizeof(metadata_probe_attributes[0]);
-         i++)
-    {
-        if ((namespaces & metadata_probe_attributes[i].namespace_bit) == 0)
-            continue;
-        if (metadata_probe_attribute_fd(fd, &metadata_probe_attributes[i]) != 0)
-        {
-            failed = 1;
-            saved_errno = errno;
-            break;
-        }
-    }
+    MetadataXattrTarget target = { .fd = fd, .path = NULL };
+    int failed = metadata_probe_attribute_loop(&target, namespaces) != 0;
+    int saved_errno = failed ? errno : 0;
+
     if (close(fd) != 0)
     {
         if (!failed)
@@ -1074,6 +1062,9 @@ static int metadata_probe_named_xattrs(int anchor_fd,
     int object_fd = -1;
     int failed = 0;
     int saved_errno = 0;
+    char symlink_path[PATH_MAX];
+    MetadataXattrTarget target = { .fd = -1, .path = NULL };
+
     if (kind == METADATA_XATTR_PROBE_DIRECTORY)
     {
         object_fd = openat(anchor_fd, name,
@@ -1083,29 +1074,25 @@ static int metadata_probe_named_xattrs(int anchor_fd,
             failed = 1;
             saved_errno = errno;
         }
+        target.fd = object_fd;
+        target.path = NULL;
+    }
+    else
+    {
+        if (metadata_symlink_xattr_path(anchor_fd, name, symlink_path,
+                                        sizeof(symlink_path)) != 0)
+        {
+            failed = 1;
+            saved_errno = errno;
+        }
+        target.fd = -1;
+        target.path = symlink_path;
     }
 
-    if (!failed)
+    if (!failed && metadata_probe_attribute_loop(&target, namespaces) != 0)
     {
-        for (size_t i = 0;
-             i < sizeof(metadata_probe_attributes) /
-                     sizeof(metadata_probe_attributes[0]);
-         i++)
-        {
-            if ((namespaces & metadata_probe_attributes[i].namespace_bit) == 0)
-                continue;
-            int result = kind == METADATA_XATTR_PROBE_DIRECTORY
-                ? metadata_probe_attribute_fd(object_fd,
-                                               &metadata_probe_attributes[i])
-                : metadata_probe_attribute_symlink(anchor_fd, name,
-                                                   &metadata_probe_attributes[i]);
-            if (result != 0)
-            {
-                failed = 1;
-                saved_errno = errno;
-                break;
-            }
-        }
+        failed = 1;
+        saved_errno = errno;
     }
 
     if (object_fd >= 0 && close(object_fd) != 0)
@@ -1169,58 +1156,46 @@ int metadata_xattr_capability_probe(
     return 0;
 }
 
+static int metadata_stat_fields_unchanged(const struct stat *before,
+                                          const struct stat *after,
+                                          int compare_atime)
+{
+    if (before == NULL || after == NULL)
+        return 0;
+    return before->st_dev == after->st_dev &&
+           before->st_ino == after->st_ino &&
+           (before->st_mode & (S_IFMT | 07777 | S_ISUID | S_ISGID | S_ISVTX)) ==
+           (after->st_mode & (S_IFMT | 07777 | S_ISUID | S_ISGID | S_ISVTX)) &&
+           before->st_size == after->st_size &&
+           before->st_uid == after->st_uid &&
+           before->st_gid == after->st_gid &&
+           (!compare_atime || same_timespec(before->st_atim, after->st_atim)) &&
+           same_timespec(before->st_mtim, after->st_mtim) &&
+           same_timespec(before->st_ctim, after->st_ctim);
+}
+
 int metadata_snapshot_matches(const MetadataSnapshot *snapshot,
                               const struct stat *st)
 {
     if (snapshot == NULL || st == NULL)
         return 0;
-    if (S_ISLNK(snapshot->type_and_mode))
-    {
-        struct stat saved;
-        if (metadata_snapshot_to_stat(snapshot, &saved) != 0)
-            return 0;
-        return metadata_symlink_unchanged(&saved, st);
-    }
-    return snapshot->device == st->st_dev &&
-           snapshot->inode == st->st_ino &&
-           snapshot->type_and_mode == st->st_mode &&
-           snapshot->size == st->st_size &&
-           snapshot->uid == st->st_uid &&
-           snapshot->gid == st->st_gid &&
-           same_timespec(snapshot->atime, st->st_atim) &&
-           same_timespec(snapshot->mtime, st->st_mtim) &&
-           same_timespec(snapshot->ctime, st->st_ctim);
+
+    struct stat saved;
+    if (metadata_snapshot_to_stat(snapshot, &saved) != 0)
+        return 0;
+    return S_ISLNK(snapshot->type_and_mode)
+        ? metadata_symlink_unchanged(&saved, st)
+        : metadata_source_unchanged(&saved, st);
 }
 
 int metadata_source_unchanged(const struct stat *before,
                               const struct stat *after)
 {
-    if (before == NULL || after == NULL)
-        return 0;
-    return before->st_dev == after->st_dev &&
-           before->st_ino == after->st_ino &&
-           (before->st_mode & (S_IFMT | 07777 | S_ISUID | S_ISGID | S_ISVTX)) ==
-           (after->st_mode & (S_IFMT | 07777 | S_ISUID | S_ISGID | S_ISVTX)) &&
-           before->st_size == after->st_size &&
-           before->st_uid == after->st_uid &&
-           before->st_gid == after->st_gid &&
-           same_timespec(before->st_atim, after->st_atim) &&
-           same_timespec(before->st_mtim, after->st_mtim) &&
-           same_timespec(before->st_ctim, after->st_ctim);
+    return metadata_stat_fields_unchanged(before, after, 1);
 }
 
 int metadata_symlink_unchanged(const struct stat *before,
                                const struct stat *after)
 {
-    if (before == NULL || after == NULL)
-        return 0;
-    return before->st_dev == after->st_dev &&
-           before->st_ino == after->st_ino &&
-           (before->st_mode & (S_IFMT | 07777 | S_ISUID | S_ISGID | S_ISVTX)) ==
-           (after->st_mode & (S_IFMT | 07777 | S_ISUID | S_ISGID | S_ISVTX)) &&
-           before->st_size == after->st_size &&
-           before->st_uid == after->st_uid &&
-           before->st_gid == after->st_gid &&
-           same_timespec(before->st_mtim, after->st_mtim) &&
-           same_timespec(before->st_ctim, after->st_ctim);
+    return metadata_stat_fields_unchanged(before, after, 0);
 }
