@@ -440,10 +440,8 @@ ContainerStatus container_adopt(const char *dest_root,
     memset(out, 0, sizeof(*out));
     out->dir_fd = -1;
     out->partial_fd = -1;
-    if (dest_root == NULL || wanted_identity == NULL)
+    if (dest_root == NULL)
         return CONTAINER_ERR_INVALID;
-    if (!wanted_identity->has_source_identity)
-        return CONTAINER_ERR_NO_MATCH;
 
     int dest_root_fd = open(dest_root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (dest_root_fd < 0)
