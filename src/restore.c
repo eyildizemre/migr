@@ -582,6 +582,30 @@ static int open_xdg_destination_anchor(const char *path, int *out_fd,
     return 0;
 }
 
+typedef enum {
+    V1_XDG_DEST_OK = 0,
+    V1_XDG_DEST_UNKNOWN_ID,
+    V1_XDG_DEST_ANCHOR_FAILED
+} V1XdgDestStatus;
+
+// Resolves the destination fd/relative-path for an XDG-policy v1 root,
+// given an already-ready xdg_dirs[]; callers own resolving it and their own
+// policy for what to do if that resolution itself fails.
+static V1XdgDestStatus resolve_v1_xdg_root_destination(
+    const ManifestRoot *root, char *const xdg_dirs[XDG_RESTORE_COUNT],
+    int *out_destination_fd, char *out_destination_rel,
+    size_t out_destination_rel_size)
+{
+    int idx = xdg_key_index(root->id);
+    if (idx < 0)
+        return V1_XDG_DEST_UNKNOWN_ID;
+    if (open_xdg_destination_anchor(xdg_dirs[idx], out_destination_fd,
+                                    out_destination_rel,
+                                    out_destination_rel_size) != 0)
+        return V1_XDG_DEST_ANCHOR_FAILED;
+    return V1_XDG_DEST_OK;
+}
+
 // Restores XDG main directories, Projects, dotfiles, and browser profiles
 // from an unversioned or manifest-absent backup. This path preserves the
 // legacy layout and its all-or-nothing XDG destination resolution.
@@ -801,11 +825,9 @@ static int seed_native_restore_v1_hardlink_map(
                 }
                 xdg_ready = 1;
             }
-            int index = xdg_key_index(root->id);
-            if (index < 0 ||
-                open_xdg_destination_anchor(xdg_dirs[index], &destination_fd,
-                                             destination_rel,
-                                             sizeof(destination_rel)) != 0)
+            if (resolve_v1_xdg_root_destination(
+                    root, xdg_dirs, &destination_fd, destination_rel,
+                    sizeof(destination_rel)) != V1_XDG_DEST_OK)
             {
                 failed = 1;
                 continue;
@@ -1113,11 +1135,9 @@ static RestoreNativeStatus restore_v1_metadata_inventory(
                 }
                 xdg_ready = 1;
             }
-            int idx = xdg_key_index(root->id);
-            if (idx < 0 || open_xdg_destination_anchor(xdg_dirs[idx],
-                                                        &destination_fd,
-                                                        destination_rel,
-                                                        sizeof(destination_rel)) != 0)
+            if (resolve_v1_xdg_root_destination(
+                    root, xdg_dirs, &destination_fd, destination_rel,
+                    sizeof(destination_rel)) != V1_XDG_DEST_OK)
             {
                 print_error("Error: Failed to resolve restore destination %s\n",
                        root->id);
@@ -1215,17 +1235,18 @@ static void restore_v1(const char *source, int source_root_fd, const char *home,
             continue;
         }
 
-        int idx = xdg_key_index(root->id);
-        if (idx < 0)
+        int xdg_dest_fd;
+        char destination_rel[NAME_MAX + 1];
+        V1XdgDestStatus dest_status = resolve_v1_xdg_root_destination(
+            root, xdg_dirs, &xdg_dest_fd, destination_rel,
+            sizeof(destination_rel));
+        if (dest_status == V1_XDG_DEST_UNKNOWN_ID)
         {
             print_error("Error: Unrecognized XDG root id: %s\n", root->id);
             *had_error = 1;
             continue;
         }
-
-        int xdg_dest_fd;
-        char destination_rel[NAME_MAX + 1];
-        if (open_xdg_destination_anchor(xdg_dirs[idx], &xdg_dest_fd, destination_rel, sizeof(destination_rel)) != 0)
+        if (dest_status != V1_XDG_DEST_OK)
         {
             print_error("Error: Failed to restore %s\n", root->id);
             *had_error = 1;
@@ -1237,7 +1258,8 @@ static void restore_v1(const char *source, int source_root_fd, const char *home,
                                  timestamp_anchors,
                                  skipped_security_xattrs, capture_report);
         if (rc > 0 && dry_run)
-            printf("  Would restore: %s -> %s/\n", root->id, xdg_dirs[idx]);
+            printf("  Would restore: %s -> %s/\n", root->id,
+                   xdg_dirs[xdg_key_index(root->id)]);
         if (rc > 0)
             (*count)++;
         else if (rc < 0)
