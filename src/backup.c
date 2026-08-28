@@ -1143,22 +1143,28 @@ int backup(const char *target, BackupMode mode, char **paths)
     if (dry_run)
         return backup_dry_run(target, mode, &plan, &manifest);
 
+    // Hoisted so both cleanup epilogues can release every resource
+    // unconditionally: each handle is inert until its corresponding operation
+    // populates it.
+    int target_fd = -1;
     int target_created = 0;
-    if (ensure_target_root(target, &target_created) != 0)
-    {
-        manifest_free(&manifest);
-        backup_plan_free(&plan);
-        return 1;
-    }
+    BackupContainer container = {0};
+    PortablePreparedCapture prepared = {0};
+    PortableRootSpec *portable_roots = NULL;
+    MetadataProfiles metadata_profiles;
+    metadata_profiles_init(&metadata_profiles);
+    SourceReadRefusals source_read_refusals;
+    source_read_refusals_init(&source_read_refusals);
+    int finish_result = 1;
 
-    int target_fd = open(target, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (ensure_target_root(target, &target_created) != 0)
+        goto fail_pre_container;
+
+    target_fd = open(target, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (target_fd < 0)
     {
         print_error("Error: Could not open backup destination %s\n", target);
-        if (target_created) rmdir(target);
-        manifest_free(&manifest);
-        backup_plan_free(&plan);
-        return 1;
+        goto fail_pre_container;
     }
 
     off_t target_block_size = 0;
@@ -1171,14 +1177,7 @@ int backup(const char *target, BackupMode mode, char **paths)
     if (backup_space_preflight(target_fd, estimated_size, raw_estimated_size,
                                estimate_had_error, raw_estimate_had_error,
                                target) != 0)
-    {
-        close(target_fd);
-        if (target_created)
-            rmdir(target);
-        manifest_free(&manifest);
-        backup_plan_free(&plan);
-        return 1;
-    }
+        goto fail_pre_container;
 
     // Probe the destination and choose a representation before any container
     // exists. An unreliable probe is fatal, never a silent fall-through. If we
@@ -1187,20 +1186,12 @@ int backup(const char *target, BackupMode mode, char **paths)
     CloneRepresentation repr = CLONE_NATIVE_TREE;
     FsCapabilityProfile profile;
     if (backup_representation_preflight(target_fd, target, &profile, &repr) != 0)
-    {
-        close(target_fd);
-        if (target_created) rmdir(target);
-        manifest_free(&manifest);
-        backup_plan_free(&plan);
-        return 1;
-    }
+        goto fail_pre_container;
 
     // The representation is part of the resume identity, so it must be settled
     // before the manifest is matched against an existing partial.
     manifest.representation = repr;
 
-    PortablePreparedCapture prepared = {0};
-    PortableRootSpec *portable_roots = NULL;
     PortableCaptureRequest portable_request = {0};
     char portable_machine_id[MANIFEST_MACHINE_ID_MAX];
     if (repr == CLONE_PORTABLE_SIDECAR)
@@ -1212,12 +1203,7 @@ int backup(const char *target, BackupMode mode, char **paths)
             if (portable_roots == NULL)
             {
                 print_error("Error: out of memory building the portable capture request\n");
-                close(target_fd);
-                if (target_created)
-                    rmdir(target);
-                manifest_free(&manifest);
-                backup_plan_free(&plan);
-                return 1;
+                goto fail_pre_container;
             }
         }
         int has_machine_id = read_machine_id(portable_machine_id,
@@ -1244,24 +1230,12 @@ int backup(const char *target, BackupMode mode, char **paths)
             else
                 print_error("Error: portable pre-scan failed or found an unresolvable "
                        "conflict at %s; no container was created\n", target);
-            portable_prepared_capture_free(&prepared);
-            free(portable_roots);
-            close(target_fd);
-            if (target_created)
-                rmdir(target);
-            manifest_free(&manifest);
-            backup_plan_free(&plan);
-            return 1;
+            goto fail_pre_container;
         }
     }
     const Manifest *identity_manifest = repr == CLONE_PORTABLE_SIDECAR
         ? &prepared.manifest : &manifest;
 
-    MetadataProfiles metadata_profiles;
-    metadata_profiles_init(&metadata_profiles);
-    SourceReadRefusals source_read_refusals;
-    source_read_refusals_init(&source_read_refusals);
-    BackupContainer container = {0};
     int adopted = 0;
     ContainerStatus adopt_status = container_adopt_fd(target_fd, identity_manifest,
                                                       &container);
@@ -1301,16 +1275,7 @@ int backup(const char *target, BackupMode mode, char **paths)
                 }
                 else
                     print_error("Error: native metadata preflight failed; no payload was changed\n");
-                container_close(&container);
-                metadata_profiles_free(&metadata_profiles);
-                portable_prepared_capture_free(&prepared);
-                free(portable_roots);
-                close(target_fd);
-                if (target_created)
-                    rmdir(target);
-                manifest_free(&manifest);
-                backup_plan_free(&plan);
-                return 1;
+                goto fail_pre_container;
             }
         }
         if (adopted_data_fd >= 0)
@@ -1344,29 +1309,13 @@ int backup(const char *target, BackupMode mode, char **paths)
                 }
                 else
                     print_error("Error: native metadata preflight failed; no container was created\n");
-                metadata_profiles_free(&metadata_profiles);
-                portable_prepared_capture_free(&prepared);
-                free(portable_roots);
-                close(target_fd);
-                if (target_created)
-                    rmdir(target);
-                manifest_free(&manifest);
-                backup_plan_free(&plan);
-                return 1;
+                goto fail_pre_container;
             }
         }
         if (container_reserve_fd(target_fd, time(NULL), &container) != CONTAINER_OK)
         {
             print_error("Error: Could not create a backup container under %s\n", target);
-            metadata_profiles_free(&metadata_profiles);
-            portable_prepared_capture_free(&prepared);
-            free(portable_roots);
-            close(target_fd);
-            if (target_created)
-                rmdir(target);
-            manifest_free(&manifest);
-            backup_plan_free(&plan);
-            return 1;
+            goto fail_pre_container;
         }
     }
     else
@@ -1377,17 +1326,10 @@ int backup(const char *target, BackupMode mode, char **paths)
                    target);
         else
             print_error("Error: could not examine existing backups under %s\n", target);
-        metadata_profiles_free(&metadata_profiles);
-        portable_prepared_capture_free(&prepared);
-        free(portable_roots);
-        close(target_fd);
-        if (target_created)
-            rmdir(target);
-        manifest_free(&manifest);
-        backup_plan_free(&plan);
-        return 1;
+        goto fail_pre_container;
     }
     close(target_fd);
+    target_fd = -1;
 
     int container_fd = container_root_fd(&container);
     int had_error = 0;
@@ -1566,13 +1508,8 @@ int backup(const char *target, BackupMode mode, char **paths)
         else
             printf("Unusable container left behind; it cannot be resumed, remove it: %s/%s\n",
                    target, container_current_name(&container));
-        container_close(&container);
-        metadata_profiles_free(&metadata_profiles);
-        portable_prepared_capture_free(&prepared);
-        free(portable_roots);
-        manifest_free(&manifest);
-        backup_plan_free(&plan);
-        return 1;
+        finish_result = 1;
+        goto finish;
     }
 
     printf("Finalizing (syncing to disk)...\n");
@@ -1588,13 +1525,8 @@ int backup(const char *target, BackupMode mode, char **paths)
 
         printf("Incomplete backup kept for resume: %s/%s\n",
                target, container_current_name(&container));
-        container_close(&container);
-        metadata_profiles_free(&metadata_profiles);
-        portable_prepared_capture_free(&prepared);
-        free(portable_roots);
-        manifest_free(&manifest);
-        backup_plan_free(&plan);
-        return 1;
+        finish_result = 1;
+        goto finish;
     }
 
     char item_phrase[64];
@@ -1602,12 +1534,27 @@ int backup(const char *target, BackupMode mode, char **paths)
                              "copied");
     print_success("Backup complete: %s\n", item_phrase);
     printf("Location: %s/%s\n", target, container_current_name(&container));
+    finish_result = 0;
 
+finish:
     container_close(&container);
     metadata_profiles_free(&metadata_profiles);
     portable_prepared_capture_free(&prepared);
     free(portable_roots);
     manifest_free(&manifest);
     backup_plan_free(&plan);
-    return 0;
+    return finish_result;
+
+fail_pre_container:
+    container_close(&container);
+    metadata_profiles_free(&metadata_profiles);
+    portable_prepared_capture_free(&prepared);
+    free(portable_roots);
+    if (target_fd >= 0)
+        close(target_fd);
+    if (target_created)
+        rmdir(target);
+    manifest_free(&manifest);
+    backup_plan_free(&plan);
+    return 1;
 }
