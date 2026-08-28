@@ -1107,38 +1107,41 @@ SidecarOpenStatus sidecar_log_create_at(int container_fd, SidecarLog *out)
         return SIDECAR_OPEN_IO_ERROR;
     }
 
+    SidecarLogImplementation *log = NULL;
+    SidecarOpenStatus status;
+
     struct stat st;
     SidecarOpenStatus slot_status = validate_slot_fd(fd, &st);
     if (slot_status != SIDECAR_OPEN_RESUMABLE)
     {
-        int saved = errno;
-        unlink_owned_slot(container_fd, fd);
-        close(fd);
-        errno = saved;
-        return slot_status;
+        status = slot_status;
+        goto fail;
     }
 
-    SidecarLogImplementation *log = allocate_log(fd);
+    log = allocate_log(fd);
     if (log == NULL)
     {
-        int saved = errno;
-        unlink_owned_slot(container_fd, fd);
-        close(fd);
-        errno = saved;
-        return SIDECAR_OPEN_ALLOCATION;
+        status = SIDECAR_OPEN_ALLOCATION;
+        goto fail;
     }
     if (sidecar_write_header(fd) != 0 || check_size_limit(log) != 0)
+    {
+        status = errno == ENOMEM ? SIDECAR_OPEN_ALLOCATION
+                                 : SIDECAR_OPEN_IO_ERROR;
+        goto fail;
+    }
+    out->implementation = log;
+    return SIDECAR_OPEN_FRESH;
+
+fail:
     {
         int saved = errno;
         unlink_owned_slot(container_fd, fd);
         free_log_implementation(log);
         close(fd);
         errno = saved;
-        return errno == ENOMEM ? SIDECAR_OPEN_ALLOCATION
-                               : SIDECAR_OPEN_IO_ERROR;
     }
-    out->implementation = log;
-    return SIDECAR_OPEN_FRESH;
+    return status;
 }
 
 SidecarOpenStatus sidecar_log_adopt_at(int container_fd, SidecarLog *out)
@@ -1156,21 +1159,22 @@ SidecarOpenStatus sidecar_log_adopt_at(int container_fd, SidecarLog *out)
                                           : SIDECAR_OPEN_IO_ERROR;
     }
 
+    SidecarLogImplementation *log = NULL;
+    SidecarOpenStatus status;
+
     struct stat initial_stat;
     SidecarOpenStatus slot_status = validate_slot_fd(fd, &initial_stat);
     if (slot_status != SIDECAR_OPEN_RESUMABLE)
     {
-        close(fd);
-        return slot_status;
+        status = slot_status;
+        goto fail;
     }
 
-    SidecarLogImplementation *log = allocate_log(fd);
+    log = allocate_log(fd);
     if (log == NULL)
     {
-        int saved = errno;
-        close(fd);
-        errno = saved;
-        return SIDECAR_OPEN_ALLOCATION;
+        status = SIDECAR_OPEN_ALLOCATION;
+        goto fail;
     }
 
     LoadContext load = { .log = log, .error = SIDECAR_STATUS_OK };
@@ -1180,18 +1184,14 @@ SidecarOpenStatus sidecar_log_adopt_at(int container_fd, SidecarLog *out)
     struct stat final_stat;
     if (fstat(fd, &final_stat) != 0 || final_stat.st_size != initial_stat.st_size)
     {
-        free_log_implementation(log);
-        close(fd);
-        return SIDECAR_OPEN_IO_ERROR;
+        status = SIDECAR_OPEN_IO_ERROR;
+        goto fail;
     }
     if (parse_status != SIDECAR_STATUS_OK &&
         parse_status != SIDECAR_STATUS_TRUNCATED_TAIL)
     {
-        SidecarOpenStatus failure = classify_parse_failure(parse_status,
-                                                            load.error);
-        free_log_implementation(log);
-        close(fd);
-        return failure;
+        status = classify_parse_failure(parse_status, load.error);
+        goto fail;
     }
 
     if (parse_status == SIDECAR_STATUS_TRUNCATED_TAIL)
@@ -1202,28 +1202,34 @@ SidecarOpenStatus sidecar_log_adopt_at(int container_fd, SidecarLog *out)
             truncate_offset < 0 ||
             (uint64_t)truncate_offset != result.last_valid_boundary)
         {
-            free_log_implementation(log);
-            close(fd);
-            return SIDECAR_OPEN_UNUSABLE;
+            status = SIDECAR_OPEN_UNUSABLE;
+            goto fail;
         }
         clear_entry(&log->memory, &log->pending.entry);
         log->pending.xattrs_seen = 0;
         if (ftruncate(fd, truncate_offset) != 0)
         {
-            free_log_implementation(log);
-            close(fd);
-            return SIDECAR_OPEN_IO_ERROR;
+            status = SIDECAR_OPEN_IO_ERROR;
+            goto fail;
         }
     }
 
     if (parse_status == SIDECAR_STATUS_OK && check_size_limit(log) != 0)
     {
-        free_log_implementation(log);
-        close(fd);
-        return SIDECAR_OPEN_IO_ERROR;
+        status = SIDECAR_OPEN_IO_ERROR;
+        goto fail;
     }
     out->implementation = log;
     return SIDECAR_OPEN_RESUMABLE;
+
+fail:
+    {
+        int saved = errno;
+        free_log_implementation(log);
+        close(fd);
+        errno = saved;
+    }
+    return status;
 }
 
 SidecarStatus sidecar_log_close(SidecarLog *log)
