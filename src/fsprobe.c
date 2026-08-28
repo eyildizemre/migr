@@ -329,6 +329,19 @@ static int timestamp_roundtrip_fd(int fd, const struct timespec first[2],
     return 0;
 }
 
+static void build_probe_timestamps(time_t now, struct timespec first[2],
+                                   struct timespec second[2])
+{
+    first[0].tv_sec = now + 31;
+    first[0].tv_nsec = 123456789;
+    first[1].tv_sec = now + 31;
+    first[1].tv_nsec = 987654321;
+    second[0].tv_sec = now + 33;
+    second[0].tv_nsec = 234567890;
+    second[1].tv_sec = now + 33;
+    second[1].tv_nsec = 876543210;
+}
+
 static FsCapabilityResult probe_timestamps_dirfd(int dir_fd, int *nsec_exact)
 {
     int file_fd = openat(dir_fd, "timestamp_file",
@@ -362,14 +375,9 @@ static FsCapabilityResult probe_timestamps_dirfd(int dir_fd, int *nsec_exact)
         result = cap_error(errno);
     else
     {
-        struct timespec first[2] = {
-            { .tv_sec = now + 31, .tv_nsec = 123456789 },
-            { .tv_sec = now + 31, .tv_nsec = 987654321 }
-        };
-        struct timespec second[2] = {
-            { .tv_sec = now + 33, .tv_nsec = 234567890 },
-            { .tv_sec = now + 33, .tv_nsec = 876543210 }
-        };
+        struct timespec first[2];
+        struct timespec second[2];
+        build_probe_timestamps(now, first, second);
 
         result = cap_ok();
         int fds[] = { file_fd, subdir_fd };
@@ -401,6 +409,27 @@ static FsCapabilityResult probe_timestamps_dirfd(int dir_fd, int *nsec_exact)
     return result;
 }
 
+static int create_unique_probe_dir(int root_fd, const char *prefix,
+                                   char *name_out, size_t name_out_size)
+{
+    for (unsigned int suffix = 0; suffix < 1000; suffix++)
+    {
+        int n = suffix == 0
+            ? snprintf(name_out, name_out_size, "%s%ld", prefix,
+                       (long)getpid())
+            : snprintf(name_out, name_out_size, "%s%ld_%u", prefix,
+                       (long)getpid(), suffix);
+        if (n < 0 || (size_t)n >= name_out_size)
+            return -1;
+        if (mkdirat(root_fd, name_out, 0700) == 0)
+            return 0;
+        if (errno != EEXIST)
+            return -1;
+    }
+    errno = EEXIST;
+    return -1;
+}
+
 int fsprobe_timestamps_fd(int root_fd, int *nsec_exact)
 {
     if (root_fd < 0 || nsec_exact == NULL)
@@ -411,34 +440,15 @@ int fsprobe_timestamps_fd(int root_fd, int *nsec_exact)
     struct timespec root_times[2] = { root_st.st_atim, root_st.st_mtim };
 
     char probe_name[NAME_MAX + 1];
-    int probe_fd = -1;
-    int created = 0;
-    for (unsigned int suffix = 0; suffix < 1000; suffix++)
+    if (create_unique_probe_dir(root_fd, ".migr_ts_", probe_name,
+                                sizeof(probe_name)) != 0)
+        return -1;
+    int probe_fd = openat(root_fd, probe_name,
+                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (probe_fd < 0)
     {
-        int n = suffix == 0
-            ? snprintf(probe_name, sizeof(probe_name), ".migr_ts_%ld",
-                       (long)getpid())
-            : snprintf(probe_name, sizeof(probe_name), ".migr_ts_%ld_%u",
-                       (long)getpid(), suffix);
-        if (n < 0 || (size_t)n >= sizeof(probe_name))
-            return -1;
-        if (mkdirat(root_fd, probe_name, 0700) == 0)
-        {
-            created = 1;
-            probe_fd = openat(root_fd, probe_name,
-                              O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-            break;
-        }
-        if (errno != EEXIST)
-            return -1;
-    }
-    if (!created || probe_fd < 0)
-    {
-        if (created)
-        {
-            (void)unlinkat(root_fd, probe_name, AT_REMOVEDIR);
-            (void)futimens(root_fd, root_times);
-        }
+        (void)unlinkat(root_fd, probe_name, AT_REMOVEDIR);
+        (void)futimens(root_fd, root_times);
         return -1;
     }
 
@@ -450,14 +460,9 @@ int fsprobe_timestamps_fd(int root_fd, int *nsec_exact)
     int exact = 1;
     if (!failed && now == (time_t)-1)
         failed = 1;
-    struct timespec first[2] = {
-        { .tv_sec = now + 31, .tv_nsec = 123456789 },
-        { .tv_sec = now + 31, .tv_nsec = 987654321 }
-    };
-    struct timespec second[2] = {
-        { .tv_sec = now + 33, .tv_nsec = 234567890 },
-        { .tv_sec = now + 33, .tv_nsec = 876543210 }
-    };
+    struct timespec first[2];
+    struct timespec second[2];
+    build_probe_timestamps(now, first, second);
     if (!failed && timestamp_roundtrip_fd(file_fd, first, second, &exact) != 0)
         failed = 1;
     if (!failed && timestamp_roundtrip_fd(probe_fd, first, second, &exact) != 0)
@@ -492,31 +497,14 @@ int fsprobe_fd(int root_fd, FsCapabilityProfile *out)
         return -1;
 
     char probe_name[NAME_MAX + 1];
-    int probe_fd = -1;
-    int created = 0;
-    for (unsigned int suffix = 0; suffix < 1000; suffix++)
+    if (create_unique_probe_dir(root_fd, ".migr-probe-fd-", probe_name,
+                                sizeof(probe_name)) != 0)
+        return -1;
+    int probe_fd = openat(root_fd, probe_name,
+                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (probe_fd < 0)
     {
-        int n = suffix == 0
-            ? snprintf(probe_name, sizeof(probe_name), ".migr-probe-fd-%ld",
-                       (long)getpid())
-            : snprintf(probe_name, sizeof(probe_name), ".migr-probe-fd-%ld_%u",
-                       (long)getpid(), suffix);
-        if (n < 0 || (size_t)n >= sizeof(probe_name))
-            return -1;
-        if (mkdirat(root_fd, probe_name, 0700) == 0)
-        {
-            created = 1;
-            probe_fd = openat(root_fd, probe_name,
-                              O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-            break;
-        }
-        if (errno != EEXIST)
-            return -1;
-    }
-    if (!created || probe_fd < 0)
-    {
-        if (created)
-            (void)unlinkat(root_fd, probe_name, AT_REMOVEDIR);
+        (void)unlinkat(root_fd, probe_name, AT_REMOVEDIR);
         return -1;
     }
 
