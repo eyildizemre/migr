@@ -234,14 +234,6 @@ static void clear_claim(StateMemory *memory, StateClaim *claim)
     memset(claim, 0, sizeof(*claim));
 }
 
-static int claim_kind_valid(SidecarObjectKind kind)
-{
-    return kind == SIDECAR_KIND_REGULAR ||
-           kind == SIDECAR_KIND_DIRECTORY ||
-           kind == SIDECAR_KIND_SYMLINK ||
-           kind == SIDECAR_KIND_HARDLINK;
-}
-
 static SidecarStatus copy_claim(StateMemory *memory,
                                 const SidecarClaim *source,
                                 StateClaim *destination)
@@ -250,7 +242,7 @@ static SidecarStatus copy_claim(StateMemory *memory,
         !bytes_valid(source->root_id, SIDECAR_MAX_ROOT_ID, 1) ||
         !bytes_valid(source->logical_path, SIDECAR_MAX_PATH, 0) ||
         !bytes_valid(source->physical_path, SIDECAR_MAX_PATH, 0) ||
-        !claim_kind_valid(source->kind))
+        !sidecar_claim_kind_valid(source->kind))
     {
         set_invalid_error();
         return SIDECAR_STATUS_INVALID_ARGUMENT;
@@ -1460,7 +1452,7 @@ SidecarStatus sidecar_log_append_claim(SidecarLog *log,
         return status;
     if (claim == NULL || implementation->pending.entry.entry.root_id.data != NULL ||
         !valid_key(claim->root_id, claim->logical_path) ||
-        !claim_kind_valid(claim->kind))
+        !sidecar_claim_kind_valid(claim->kind))
     {
         set_invalid_error();
         return SIDECAR_STATUS_INVALID_ARGUMENT;

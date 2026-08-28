@@ -158,6 +158,7 @@ int sidecar_write_xattr(int fd, const SidecarXattr *xattr);
 int sidecar_write_entry_commit(int fd);
 int sidecar_write_delete(int fd, const SidecarDelete *deletion);
 int sidecar_write_claim(int fd, const SidecarClaim *claim);
+int sidecar_claim_kind_valid(SidecarObjectKind kind);
 
 /*
  * Parses a regular sidecar fd without changing its offset or contents. The

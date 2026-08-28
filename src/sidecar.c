@@ -427,7 +427,7 @@ static int validate_delete(const SidecarDelete *deletion)
     return 0;
 }
 
-static int claim_kind_valid(SidecarObjectKind kind)
+int sidecar_claim_kind_valid(SidecarObjectKind kind)
 {
     return kind == SIDECAR_KIND_REGULAR ||
            kind == SIDECAR_KIND_DIRECTORY ||
@@ -441,7 +441,7 @@ static int validate_claim(const SidecarClaim *claim)
         validate_bytes(claim->root_id, SIDECAR_MAX_ROOT_ID, 1) != 0 ||
         validate_bytes(claim->logical_path, SIDECAR_MAX_PATH, 0) != 0 ||
         validate_bytes(claim->physical_path, SIDECAR_MAX_PATH, 0) != 0 ||
-        !claim_kind_valid(claim->kind))
+        !sidecar_claim_kind_valid(claim->kind))
     {
         set_invalid_error();
         return -1;
@@ -1097,7 +1097,8 @@ static SidecarStatus parse_claim(SidecarReader *reader, SidecarClaim *claim)
         goto fail;
     }
     reader_free(reader, (void *)kind_field.data);
-    if (claim->root_id.length == 0 || !claim_kind_valid(claim->kind))
+    if (claim->root_id.length == 0 ||
+        !sidecar_claim_kind_valid(claim->kind))
     {
         status = SIDECAR_STATUS_CORRUPT;
         goto fail;
