@@ -164,7 +164,8 @@ static int measure_report_tree(const char *path, size_t depth,
     }
 
     size_t entry_index = SIZE_MAX;
-    if (report_depth_includes(depth_limit, depth) &&
+    if (breakdown != NULL &&
+        report_depth_includes(depth_limit, depth) &&
         report_breakdown_add(breakdown, path, depth, &entry_index) != 0)
         return -1;
 
@@ -304,13 +305,16 @@ static const char *scoped_root_name(const char *home,
 }
 
 /*
- * A built-in root can disappear between plan construction and measurement.
- * That is the same benign absence the legacy loops tolerate; other failures
- * make the estimate incomplete. A directory child can disappear during the
- * recursive walk as well, so get_dir_size() is given the same treatment when
- * it reports ENOENT/ENOTDIR.
+ * Measures one root. A root that has disappeared since plan construction --
+ * or a directory child that disappears mid-walk -- is reported absent
+ * (*present = 0), not a hard error; that benign-absence tolerance is shared
+ * by every root category. breakdown may be NULL when the caller has no use
+ * for per-directory subtotals (measure_report_tree() tolerates that, see
+ * above).
  */
-static int measure_scoped_root(const char *path, off_t *bytes, int *present)
+static int measure_scoped_root(const char *path, ReportDepth depth_limit,
+                               ReportBreakdown *breakdown, off_t *bytes,
+                               int *present)
 {
     struct stat st;
     *bytes = 0;
@@ -324,37 +328,7 @@ static int measure_scoped_root(const char *path, off_t *bytes, int *present)
     }
 
     errno = 0;
-    if (get_dir_size(path, bytes) != 0)
-    {
-        if (errno == ENOENT || errno == ENOTDIR)
-        {
-            *bytes = 0;
-            return 0;
-        }
-        return -1;
-    }
-
-    *present = 1;
-    return 0;
-}
-
-static int measure_scoped_root_verbose(const char *path, ReportDepth depth,
-                                       off_t *bytes, int *present,
-                                       ReportBreakdown *breakdown)
-{
-    struct stat st;
-    *bytes = 0;
-    *present = 0;
-
-    if (lstat(path, &st) != 0)
-    {
-        if (errno == ENOENT || errno == ENOTDIR)
-            return 0;
-        return -1;
-    }
-
-    errno = 0;
-    if (measure_report_tree(path, 0, depth, breakdown, bytes) != 0)
+    if (measure_report_tree(path, 0, depth_limit, breakdown, bytes) != 0)
     {
         if (errno == ENOENT || errno == ENOTDIR)
         {
@@ -372,12 +346,7 @@ static int measure_and_print_item(const char *name, const char *path,
                                   ReportDepth depth, off_t *bytes)
 {
     ReportBreakdown breakdown = { NULL, 0, 0 };
-    int rc;
-
-    if (verbose)
-        rc = measure_report_tree(path, 0, depth, &breakdown, bytes);
-    else
-        rc = get_dir_size(path, bytes);
+    int rc = measure_report_tree(path, 0, depth, &breakdown, bytes);
     if (rc != 0)
     {
         report_breakdown_free(&breakdown);
@@ -428,6 +397,75 @@ static void legacy_cache_store(const char *name, off_t size,
     }
 }
 
+static void accumulate_critical_total(const char *home,
+                                      const char *const *names,
+                                      off_t *critical_total, int *had_error,
+                                      off_t *cached_sizes,
+                                      unsigned char *cached_valid)
+{
+    char path[PATH_MAX];
+    for (int i = 0; names[i] != NULL; i++)
+    {
+        if (path_join(path, sizeof(path), home, names[i]) != 0)
+        {
+            *had_error = 1;
+            continue;
+        }
+        if (file_exists(path))
+        {
+            int slot = legacy_critical_slot(names[i]);
+            if (slot >= 0 && cached_valid[slot])
+            {
+                *critical_total += cached_sizes[slot];
+            }
+            else
+            {
+                off_t temp_size = 0;
+                if (get_dir_size(path, &temp_size) == 0)
+                    *critical_total += temp_size;
+                else
+                    *had_error = 1;
+            }
+        }
+    }
+}
+
+typedef int (*ExistencePredicate)(const char *path);
+
+static void report_legacy_section(const char *title, const char *home,
+                                  const char *const *names,
+                                  const char *const *display_names,
+                                  ExistencePredicate exists,
+                                  ReportDepth depth, int *had_error,
+                                  off_t *cached_sizes,
+                                  unsigned char *cached_valid)
+{
+    char path[PATH_MAX];
+    print_section(title);
+    for (int i = 0; names[i] != NULL; i++)
+    {
+        if (path_join(path, sizeof(path), home, names[i]) != 0)
+        {
+            *had_error = 1;
+            continue;
+        }
+        if (exists(path))
+        {
+            const char *display = display_names != NULL ? display_names[i]
+                                                          : names[i];
+            off_t bytes_size = 0;
+            if (measure_and_print_item(display, path, depth, &bytes_size) != 0)
+            {
+                *had_error = 1;
+                continue;
+            }
+            if (cached_sizes != NULL)
+                legacy_cache_store(names[i], bytes_size, cached_sizes,
+                                   cached_valid);
+        }
+    }
+}
+
 static int report_scoped(const char *home, BackupMode mode, int summary,
                          ReportDepth depth)
 {
@@ -448,14 +486,10 @@ static int report_scoped(const char *home, BackupMode mode, int summary,
         off_t bytes = 0;
         int present = 0;
         ReportBreakdown breakdown = { NULL, 0, 0 };
-        int measure_rc;
-
-        if (!summary && verbose)
-            measure_rc = measure_scoped_root_verbose(
-                root->capture_path, depth, &bytes, &present, &breakdown);
-        else
-            measure_rc = measure_scoped_root(root->capture_path, &bytes,
-                                             &present);
+        int want_breakdown = !summary && verbose;
+        int measure_rc = measure_scoped_root(root->capture_path, depth,
+                                             want_breakdown ? &breakdown : NULL,
+                                             &bytes, &present);
 
         if (measure_rc != 0)
         {
@@ -540,7 +574,6 @@ int report(BackupMode mode, int scope_requested, int summary,
 
     print_report_header(home);
 
-    char path[PATH_MAX];
     int had_error = 0; // set if any path could not be built, so the estimate never lies
     const char *critical_dirs[] = {"Documents", "Downloads", "Pictures", NULL};
     const char *critical_dots[] = {".ssh", ".gnupg", ".gitconfig", ".bashrc", NULL};
@@ -550,152 +583,38 @@ int report(BackupMode mode, int scope_requested, int summary,
     // main user directories
     const char *main_dirs[] = {"Documents", "Desktop", "Downloads", "Pictures", "Videos", "Music", "Projects", NULL};
 
-    print_section("Main Directories");
-    for (int i = 0; main_dirs[i] != NULL; i++)
-    {
-        if (path_join(path, sizeof(path), home, main_dirs[i]) != 0)
-        {
-            had_error = 1;
-            continue;
-        }
-        if (dir_exists(path))
-        {
-            off_t bytes_size = 0;
-            if (measure_and_print_item(main_dirs[i], path, depth,
-                                       &bytes_size) != 0)
-            {
-                had_error = 1;
-                continue;
-            }
-            legacy_cache_store(main_dirs[i], bytes_size,
-                               cached_critical_sizes, cached_critical_valid);
-        }
-    }
-
     // Dotfiles
     const char *dotfiles[] = {".ssh", ".gnupg", ".config", ".local/share", ".bashrc", ".profile", ".gitconfig", NULL};
 
-    print_section("Dotfiles & Config");
-    for (int i = 0; dotfiles[i] != NULL; i++)
-    {
-        if (path_join(path, sizeof(path), home, dotfiles[i]) != 0)
-        {
-            had_error = 1;
-            continue;
-        }
-        if (file_exists(path))
-        {
-            off_t bytes_size = 0;
-            if (measure_and_print_item(dotfiles[i], path, depth,
-                                       &bytes_size) != 0)
-            {
-                had_error = 1;
-                continue;
-            }
-            legacy_cache_store(dotfiles[i], bytes_size,
-                               cached_critical_sizes, cached_critical_valid);
-        }
-    }
-
     // developer tools
     const char *dev_dirs[] = {".npm", ".cargo", ".rustup", ".pub-cache", ".gradle", ".nvm", NULL};
-
-    print_section("Dev Tools (re-downloadable)");
-    for (int i = 0; dev_dirs[i] != NULL; i++)
-    {
-        if (path_join(path, sizeof(path), home, dev_dirs[i]) != 0)
-        {
-            had_error = 1;
-            continue;
-        }
-        if (dir_exists(path))
-        {
-            off_t bytes_size = 0;
-            if (measure_and_print_item(dev_dirs[i], path, depth,
-                                       &bytes_size) != 0)
-            {
-                had_error = 1;
-                continue;
-            }
-        }
-    }
 
     // browsers
     const char *browsers[] = {".mozilla/firefox", ".config/google-chrome", ".config/chromium", ".config/BraveSoftware", NULL};
     const char *browser_names[] = {"Firefox", "Chrome", "Chromium", "Brave", NULL};
 
-    print_section("Browsers");
-    for (int i = 0; browsers[i] != NULL; i++)
-    {
-        if (path_join(path, sizeof(path), home, browsers[i]) != 0)
-        {
-            had_error = 1;
-            continue;
-        }
-        if (dir_exists(path))
-        {
-            off_t bytes_size = 0;
-            if (measure_and_print_item(browser_names[i], path, depth,
-                                       &bytes_size) != 0)
-            {
-                had_error = 1;
-                continue;
-            }
-        }
-    }
+    report_legacy_section("Main Directories", home, main_dirs, NULL,
+                          dir_exists, depth, &had_error,
+                          cached_critical_sizes, cached_critical_valid);
+
+    report_legacy_section("Dotfiles & Config", home, dotfiles, NULL,
+                          file_exists, depth, &had_error,
+                          cached_critical_sizes, cached_critical_valid);
+
+    report_legacy_section("Dev Tools (re-downloadable)", home, dev_dirs,
+                          NULL, dir_exists, depth, &had_error, NULL, NULL);
+
+    report_legacy_section("Browsers", home, browsers, browser_names,
+                          dir_exists, depth, &had_error, NULL, NULL);
 
     // most important paths for backup
     off_t critical_total = 0;
-
-    for (int i = 0; critical_dirs[i] != NULL; i++)
-    {
-        if (path_join(path, sizeof(path), home, critical_dirs[i]) != 0)
-        {
-            had_error = 1;
-            continue;
-        }
-        if (file_exists(path))
-        {
-            int slot = legacy_critical_slot(critical_dirs[i]);
-            if (verbose && slot >= 0 && cached_critical_valid[slot])
-            {
-                critical_total += cached_critical_sizes[slot];
-            }
-            else
-            {
-                off_t temp_size = 0;
-                if (get_dir_size(path, &temp_size) == 0)
-                    critical_total += temp_size;
-                else
-                    had_error = 1;
-            }
-        }
-    }
-
-    for (int i = 0; critical_dots[i] != NULL; i++)
-    {
-        if (path_join(path, sizeof(path), home, critical_dots[i]) != 0)
-        {
-            had_error = 1;
-            continue;
-        }
-        if (file_exists(path))
-        {
-            int slot = legacy_critical_slot(critical_dots[i]);
-            if (verbose && slot >= 0 && cached_critical_valid[slot])
-            {
-                critical_total += cached_critical_sizes[slot];
-            }
-            else
-            {
-                off_t temp_size = 0;
-                if (get_dir_size(path, &temp_size) == 0)
-                    critical_total += temp_size;
-                else
-                    had_error = 1;
-            }
-        }
-    }
+    accumulate_critical_total(home, critical_dirs, &critical_total,
+                              &had_error, cached_critical_sizes,
+                              cached_critical_valid);
+    accumulate_critical_total(home, critical_dots, &critical_total,
+                              &had_error, cached_critical_sizes,
+                              cached_critical_valid);
 
     char critical_size[32];
     format_size(critical_total, critical_size, sizeof(critical_size));
