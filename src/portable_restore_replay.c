@@ -1,13 +1,15 @@
 #define _GNU_SOURCE
 
-#include "portable_restore.h"
-
 #include "portable_restore_internal.h"
 #include "portable_restore_replay_internal.h"
-
+#include "portable_restore.h"
 #include "backup.h"
+#include "manifest.h"
+#include "metadata.h"
+#include "portable.h"
+#include "sidecar.h"
+#include "utils.h"
 
-#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -17,13 +19,6 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
-
-#include "encoding.h"
-#include "fsprobe.h"
-#include "hash.h"
-#include "portable.h"
-#include "sidecar.h"
-#include "utils.h"
 
 typedef struct {
     const SidecarEntry *entry;

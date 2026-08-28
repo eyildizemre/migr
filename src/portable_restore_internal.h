@@ -7,7 +7,8 @@
 #include "manifest.h"
 #include "sidecar.h"
 
-/* Shared between portable_restore.c and portable_restore_shared.c only. */
+/* Shared by portable_restore_replay.c, portable_restore_preflight.c, and
+ * portable_restore_shared.c. */
 
 typedef struct {
     uint64_t bytes;
@@ -37,12 +38,7 @@ typedef struct {
     uint64_t hash_salt;
 } ParentMap;
 
-/* portable_restore.c -- needed by portable_restore_shared.c. (none: every
- * symbol the shared spans call from outside themselves is either a
- * standard/library function or an already-public portable.c function,
- * verified by grep -- no reverse declarations needed for this step.) */
-
-/* portable_restore_shared.c -- needed by portable_restore.c. */
+/* The declarations below are provided by portable_restore_shared.c. */
 void *preflight_alloc(PreflightMemory *memory, size_t size);
 void *preflight_realloc(PreflightMemory *memory, void *pointer,
                         size_t old_size, size_t new_size);
