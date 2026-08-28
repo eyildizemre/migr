@@ -143,12 +143,15 @@ static int append_header(RawBuffer *buffer, const char *version)
            raw_text_field(buffer, version) == 0 ? 0 : -1;
 }
 
-static int append_regular_entry(RawBuffer *buffer, const char *mode,
-                                const char *xattr_count)
+static int append_regular_entry_with_logical(RawBuffer *buffer,
+                                             const void *logical,
+                                             size_t logical_length,
+                                             const char *mode,
+                                             const char *xattr_count)
 {
     return raw_tag(buffer, "ENTRY") == 0 &&
            raw_text_field(buffer, "ROOT") == 0 &&
-           raw_text_field(buffer, "dir/file") == 0 &&
+           raw_field(buffer, logical, logical_length) == 0 &&
            raw_text_field(buffer, "payload/file") == 0 &&
            raw_text_field(buffer, "") == 0 &&
            raw_text_field(buffer, "regular") == 0 &&
@@ -161,6 +164,15 @@ static int append_regular_entry(RawBuffer *buffer, const char *mode,
            raw_text_field(buffer, "123") == 0 &&
            raw_text_field(buffer, "0") == 0 &&
            raw_text_field(buffer, xattr_count) == 0 ? 0 : -1;
+}
+
+static int append_regular_entry(RawBuffer *buffer, const char *mode,
+                                const char *xattr_count)
+{
+    static const char logical[] = "dir/file";
+    return append_regular_entry_with_logical(buffer, logical,
+                                             sizeof(logical) - 1U, mode,
+                                             xattr_count);
 }
 
 static int append_commit(RawBuffer *buffer)
@@ -953,6 +965,39 @@ static void test_symlink_kind_parsing(int fd)
     raw_free(&buffer);
 }
 
+static void test_reader_path_ceiling(int fd)
+{
+    printf(BLUE "::" NC " sidecar reader path ceiling\n");
+    unsigned char *path = malloc(SIDECAR_MAX_PATH + 1U);
+    RawBuffer buffer = {0};
+    check(path != NULL, "reader path ceiling fixture allocates");
+    if (path == NULL)
+        return;
+    memset(path, 'p', SIDECAR_MAX_PATH + 1U);
+
+    check(append_header(&buffer, "3") == 0 &&
+          append_regular_entry_with_logical(&buffer, path, SIDECAR_MAX_PATH,
+                                            "0", "0") == 0 &&
+          append_commit(&buffer) == 0 && set_raw_file(fd, &buffer) == 0,
+          "raw entry at the path ceiling is written");
+    SidecarParseResult result;
+    check(sidecar_parse_fd(fd, NULL, NULL, &result) == SIDECAR_STATUS_OK,
+          "reader accepts a path at its ceiling");
+
+    raw_free(&buffer);
+    check(append_header(&buffer, "3") == 0 &&
+          append_regular_entry_with_logical(&buffer, path,
+                                            SIDECAR_MAX_PATH + 1U,
+                                            "0", "0") == 0 &&
+          append_commit(&buffer) == 0 && set_raw_file(fd, &buffer) == 0,
+          "raw entry over the path ceiling is written");
+    check(sidecar_parse_fd(fd, NULL, NULL, &result) == SIDECAR_STATUS_LIMIT,
+          "reader refuses a path over its ceiling");
+
+    raw_free(&buffer);
+    free(path);
+}
+
 static void test_total_limit(int fd)
 {
     printf(BLUE "::" NC " sidecar total-byte ceiling\n");
@@ -999,6 +1044,7 @@ int main(void)
     test_tail_and_boundary(fd);
     test_corruption_and_versions(fd);
     test_symlink_kind_parsing(fd);
+    test_reader_path_ceiling(fd);
     test_total_limit(fd);
     test_live_entry_ceiling();
 

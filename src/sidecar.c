@@ -692,39 +692,39 @@ static FieldStatus read_field(SidecarReader *reader, size_t maximum,
         return FIELD_IO;
     memset(out, 0, sizeof(*out));
 
-    unsigned char *data = reader_alloc(reader, maximum + 1U);
-    if (data == NULL)
-        return FIELD_ALLOCATION;
+    /* Every current caller's maximum is bounded by SIDECAR_MAX_PATH (the
+     * largest of the field ceilings this function is ever called with).
+     * Fail closed rather than silently doing something unbounded if that
+     * invariant is ever violated by a future caller -- deliberately not a
+     * variable-length array sized by the runtime `maximum` parameter. */
+    if (maximum > SIDECAR_MAX_PATH)
+        return FIELD_LIMIT;
 
+    unsigned char scratch[SIDECAR_MAX_PATH];
     size_t length = 0;
     for (;;)
     {
         unsigned char byte = 0;
         int result = reader_get(reader, &byte);
         if (result < 0)
-        {
-            reader_free(reader, data);
             return FIELD_IO;
-        }
         if (result == 0)
-        {
-            reader_free(reader, data);
             return length == 0 ? FIELD_EOF : FIELD_TAIL;
-        }
         if (byte == '\0')
-        {
-            data[length] = '\0';
-            out->data = data;
-            out->length = length;
-            return FIELD_OK;
-        }
+            break;
         if (length == maximum)
-        {
-            reader_free(reader, data);
             return FIELD_LIMIT;
-        }
-        data[length++] = byte;
+        scratch[length++] = byte;
     }
+
+    unsigned char *data = reader_alloc(reader, length + 1U);
+    if (data == NULL)
+        return FIELD_ALLOCATION;
+    memcpy(data, scratch, length);
+    data[length] = '\0';
+    out->data = data;
+    out->length = length;
+    return FIELD_OK;
 }
 
 static FieldStatus read_raw(SidecarReader *reader, uint64_t length,
