@@ -1491,8 +1491,14 @@ size_t sidecar_log_claim_count(const SidecarLog *log)
     return implementation->claim_map.count;
 }
 
-int sidecar_log_find(const SidecarLog *log, SidecarBytes root_id,
-                     SidecarBytes logical_path, SidecarLiveView *out)
+/* Shared by sidecar_log_find()/sidecar_log_find_deleted(): identical guard
+ * and SidecarLiveView fill, differing only in whether a live or a
+ * tombstoned (deleted) match is accepted. Reading a tombstoned slot's entry
+ * is safe -- map_apply_delete() defers freeing its owned bytes until the
+ * slot is eventually reused by map_apply_commit(). */
+static int find_live_entry(const SidecarLog *log, SidecarBytes root_id,
+                           SidecarBytes logical_path, int want_deleted,
+                           SidecarLiveView *out)
 {
     if (out == NULL)
     {
@@ -1507,15 +1513,34 @@ int sidecar_log_find(const SidecarLog *log, SidecarBytes root_id,
         return -1;
     }
     const SidecarLogImplementation *implementation = log->implementation;
-    size_t index = map_find(&implementation->map, root_id, logical_path);
-    if (index == MAP_INDEX_NONE)
-        return 0;
+    size_t index;
+    if (want_deleted)
+    {
+        index = MAP_INDEX_NONE;
+        int location = map_locate(&implementation->map, root_id, logical_path,
+                                  map_hash(&implementation->map, root_id,
+                                           logical_path), &index);
+        if (location != 2 || index == MAP_INDEX_NONE)
+            return 0;
+    }
+    else
+    {
+        index = map_find(&implementation->map, root_id, logical_path);
+        if (index == MAP_INDEX_NONE)
+            return 0;
+    }
     const StateEntry *entry = &implementation->map.slots[index].value.entry;
     out->entry = &entry->entry;
     out->xattrs = entry->xattrs;
     out->xattr_count = entry->entry.xattr_count;
     out->generation = entry->generation;
     return 1;
+}
+
+int sidecar_log_find(const SidecarLog *log, SidecarBytes root_id,
+                     SidecarBytes logical_path, SidecarLiveView *out)
+{
+    return find_live_entry(log, root_id, logical_path, 0, out);
 }
 
 SidecarStatus sidecar_log_foreach(SidecarLog *log, SidecarLiveCallback callback,
@@ -1574,31 +1599,7 @@ SidecarStatus sidecar_log_claim_foreach(SidecarLog *log,
 int sidecar_log_find_deleted(const SidecarLog *log, SidecarBytes root_id,
                              SidecarBytes logical_path, SidecarLiveView *out)
 {
-    if (out == NULL)
-    {
-        set_invalid_error();
-        return -1;
-    }
-    memset(out, 0, sizeof(*out));
-    if (log == NULL || log->implementation == NULL ||
-        !valid_key(root_id, logical_path))
-    {
-        set_invalid_error();
-        return -1;
-    }
-    const SidecarLogImplementation *implementation = log->implementation;
-    size_t index = MAP_INDEX_NONE;
-    int location = map_locate(&implementation->map, root_id, logical_path,
-                              map_hash(&implementation->map, root_id,
-                                       logical_path), &index);
-    if (location != 2 || index == MAP_INDEX_NONE)
-        return 0;
-    const StateEntry *entry = &implementation->map.slots[index].value.entry;
-    out->entry = &entry->entry;
-    out->xattrs = entry->xattrs;
-    out->xattr_count = entry->entry.xattr_count;
-    out->generation = entry->generation;
-    return 1;
+    return find_live_entry(log, root_id, logical_path, 1, out);
 }
 
 int sidecar_log_find_claim(const SidecarLog *log, SidecarBytes root_id,
