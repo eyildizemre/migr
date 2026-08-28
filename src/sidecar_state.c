@@ -1259,6 +1259,19 @@ static SidecarStatus ready_log(SidecarLog *log,
     return SIDECAR_STATUS_OK;
 }
 
+// Shared by all five sidecar_log_append_*() functions: the boundary check
+// and poison-or-OK tail that runs once a record's own write and map
+// mutation have already succeeded.
+static SidecarStatus finish_append(SidecarLogImplementation *implementation)
+{
+    if (check_size_limit(implementation) != 0)
+    {
+        poison(implementation);
+        return SIDECAR_STATUS_IO_ERROR;
+    }
+    return SIDECAR_STATUS_OK;
+}
+
 SidecarStatus sidecar_log_append_entry(SidecarLog *log,
                                        const SidecarEntry *entry)
 {
@@ -1283,12 +1296,7 @@ SidecarStatus sidecar_log_append_entry(SidecarLog *log,
     }
     implementation->pending.entry = copy;
     implementation->pending.xattrs_seen = 0;
-    if (check_size_limit(implementation) != 0)
-    {
-        poison(implementation);
-        return SIDECAR_STATUS_IO_ERROR;
-    }
-    return SIDECAR_STATUS_OK;
+    return finish_append(implementation);
 }
 
 SidecarStatus sidecar_log_append_xattr(SidecarLog *log,
@@ -1316,12 +1324,7 @@ SidecarStatus sidecar_log_append_xattr(SidecarLog *log,
     }
     implementation->pending.entry.xattrs[
         implementation->pending.xattrs_seen++] = copy;
-    if (check_size_limit(implementation) != 0)
-    {
-        poison(implementation);
-        return SIDECAR_STATUS_IO_ERROR;
-    }
-    return SIDECAR_STATUS_OK;
+    return finish_append(implementation);
 }
 
 SidecarStatus sidecar_log_append_entry_commit(SidecarLog *log)
@@ -1365,12 +1368,7 @@ SidecarStatus sidecar_log_append_entry_commit(SidecarLog *log)
             return status;
         }
     }
-    if (check_size_limit(implementation) != 0)
-    {
-        poison(implementation);
-        return SIDECAR_STATUS_IO_ERROR;
-    }
-    return SIDECAR_STATUS_OK;
+    return finish_append(implementation);
 }
 
 SidecarStatus sidecar_log_append_delete(SidecarLog *log,
@@ -1405,7 +1403,10 @@ SidecarStatus sidecar_log_append_delete(SidecarLog *log,
     status = map_apply_delete(&implementation->memory, &implementation->map,
                               deletion->root_id, deletion->logical_path);
     if (status != SIDECAR_STATUS_OK)
+    {
+        poison(implementation);
         return status;
+    }
     if (claim_index != MAP_INDEX_NONE)
     {
         status = map_apply_remove(&implementation->memory,
@@ -1416,12 +1417,7 @@ SidecarStatus sidecar_log_append_delete(SidecarLog *log,
             return status;
         }
     }
-    if (check_size_limit(implementation) != 0)
-    {
-        poison(implementation);
-        return SIDECAR_STATUS_IO_ERROR;
-    }
-    return SIDECAR_STATUS_OK;
+    return finish_append(implementation);
 }
 
 SidecarStatus sidecar_log_append_claim(SidecarLog *log,
@@ -1470,12 +1466,7 @@ SidecarStatus sidecar_log_append_claim(SidecarLog *log,
     }
     map_apply_claim(&implementation->memory, &implementation->claim_map,
                     &copy, claim_index);
-    if (check_size_limit(implementation) != 0)
-    {
-        poison(implementation);
-        return SIDECAR_STATUS_IO_ERROR;
-    }
-    return SIDECAR_STATUS_OK;
+    return finish_append(implementation);
 }
 
 size_t sidecar_log_live_count(const SidecarLog *log)
