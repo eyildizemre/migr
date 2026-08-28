@@ -992,37 +992,36 @@ fail:
     return status;
 }
 
+static void free_xattr(SidecarReader *reader, SidecarXattr *xattr);
+
 static SidecarStatus parse_xattr(SidecarReader *reader, SidecarXattr *xattr)
 {
     memset(xattr, 0, sizeof(*xattr));
     SidecarStatus status = read_required_field(reader, SIDECAR_MAX_XATTR_NAME,
                                                &xattr->name);
     if (status != SIDECAR_STATUS_OK)
-        return status;
+        goto fail;
     if (xattr->name.length == 0)
     {
-        reader_free(reader, (void *)xattr->name.data);
-        memset(xattr, 0, sizeof(*xattr));
-        return SIDECAR_STATUS_CORRUPT;
+        status = SIDECAR_STATUS_CORRUPT;
+        goto fail;
     }
 
     uint64_t length = 0;
     status = parse_uint_field(reader, SIDECAR_MAX_XATTR_VALUE, &length);
     if (status != SIDECAR_STATUS_OK)
-    {
-        reader_free(reader, (void *)xattr->name.data);
-        memset(xattr, 0, sizeof(*xattr));
-        return status;
-    }
+        goto fail;
     FieldStatus field_status = read_raw(reader, length, &xattr->value);
     if (field_status != FIELD_OK)
     {
-        reader_free(reader, (void *)xattr->name.data);
-        reader_free(reader, (void *)xattr->value.data);
-        memset(xattr, 0, sizeof(*xattr));
-        return field_status_to_parse(field_status);
+        status = field_status_to_parse(field_status);
+        goto fail;
     }
     return SIDECAR_STATUS_OK;
+
+fail:
+    free_xattr(reader, xattr);
+    return status;
 }
 
 static void free_xattr(SidecarReader *reader, SidecarXattr *xattr)
@@ -1034,29 +1033,29 @@ static void free_xattr(SidecarReader *reader, SidecarXattr *xattr)
     memset(xattr, 0, sizeof(*xattr));
 }
 
+static void free_delete(SidecarReader *reader, SidecarDelete *deletion);
+
 static SidecarStatus parse_delete(SidecarReader *reader, SidecarDelete *deletion)
 {
     memset(deletion, 0, sizeof(*deletion));
     SidecarStatus status = read_required_field(reader, SIDECAR_MAX_ROOT_ID,
                                                &deletion->root_id);
     if (status != SIDECAR_STATUS_OK)
-        return status;
+        goto fail;
     status = read_required_field(reader, SIDECAR_MAX_PATH,
                                  &deletion->logical_path);
     if (status != SIDECAR_STATUS_OK)
-    {
-        reader_free(reader, (void *)deletion->root_id.data);
-        memset(deletion, 0, sizeof(*deletion));
-        return status;
-    }
+        goto fail;
     if (deletion->root_id.length == 0)
     {
-        reader_free(reader, (void *)deletion->root_id.data);
-        reader_free(reader, (void *)deletion->logical_path.data);
-        memset(deletion, 0, sizeof(*deletion));
-        return SIDECAR_STATUS_CORRUPT;
+        status = SIDECAR_STATUS_CORRUPT;
+        goto fail;
     }
     return SIDECAR_STATUS_OK;
+
+fail:
+    free_delete(reader, deletion);
+    return status;
 }
 
 static void free_delete(SidecarReader *reader, SidecarDelete *deletion)
