@@ -1510,6 +1510,8 @@ int restore(const char *source)
     metadata_profiles_init(&metadata_profiles);
     RestoreTimestampAnchors timestamp_anchors;
     restore_timestamp_anchors_init(&timestamp_anchors);
+    int result = 1;
+
     RestoreNativeStatus metadata_inventory_status;
     if (mst == MANIFEST_STATUS_VALID)
         metadata_inventory_status = restore_v1_metadata_inventory(
@@ -1526,27 +1528,13 @@ int restore(const char *source)
         else
             print_error("Error: native metadata preflight failed; no destination was changed\n");
         native_restore_estimate_free(&restore_estimate);
-        metadata_profiles_free(&metadata_profiles);
-        restore_timestamp_anchors_free(&timestamp_anchors);
-        if (mst == MANIFEST_STATUS_VALID)
-            manifest_free(&m);
-        close(home_fd);
-        close(source_root_fd);
-        return 1;
+        goto cleanup;
     }
     int space_refused = native_restore_space_preflight(
         home_fd, home, &restore_estimate) != 0;
     native_restore_estimate_free(&restore_estimate);
     if (space_refused)
-    {
-        metadata_profiles_free(&metadata_profiles);
-        restore_timestamp_anchors_free(&timestamp_anchors);
-        if (mst == MANIFEST_STATUS_VALID)
-            manifest_free(&m);
-        close(home_fd);
-        close(source_root_fd);
-        return 1;
-    }
+        goto cleanup;
     metadata_profiles_report(&metadata_profiles);
 
     if (dry_run)
@@ -1559,13 +1547,8 @@ int restore(const char *source)
                  metadata_profiles.security_xattr_entry_count))
     {
         printf("Cancelled.\n");
-        metadata_profiles_free(&metadata_profiles);
-        restore_timestamp_anchors_free(&timestamp_anchors);
-        if (mst == MANIFEST_STATUS_VALID)
-            manifest_free(&m);
-        close(home_fd);
-        close(source_root_fd);
-        return 0;
+        result = 0;
+        goto cleanup;
     }
 
     printf("Restoring from: %s\n\n", source);
@@ -1579,13 +1562,7 @@ int restore(const char *source)
         if (restore_timestamp_anchor_probe(&timestamp_anchors) != 0)
         {
             print_error("Error: native timestamp preflight failed; no destination was changed\n");
-            metadata_profiles_free(&metadata_profiles);
-            restore_timestamp_anchors_free(&timestamp_anchors);
-            if (mst == MANIFEST_STATUS_VALID)
-                manifest_free(&m);
-            close(home_fd);
-            close(source_root_fd);
-            return 1;
+            goto cleanup;
         }
         // ctx's own timestamp_policy_configured/nsec_exact are never read for
         // an actual apply: restore_item_at() always builds its own
@@ -1597,26 +1574,14 @@ int restore(const char *source)
                                     }) != 0)
         {
             print_error("Error: native metadata preflight failed; no destination was changed\n");
-            metadata_profiles_free(&metadata_profiles);
-            restore_timestamp_anchors_free(&timestamp_anchors);
-            if (mst == MANIFEST_STATUS_VALID)
-                manifest_free(&m);
-            close(home_fd);
-            close(source_root_fd);
-            return 1;
+            goto cleanup;
         }
         ctx.metadata_preflight_done = 1;
         ctx.inode_map = native_inode_map_create();
         if (ctx.inode_map == NULL)
         {
             print_error("Error: Could not initialize native hardlink restore tracking\n");
-            metadata_profiles_free(&metadata_profiles);
-            restore_timestamp_anchors_free(&timestamp_anchors);
-            if (mst == MANIFEST_STATUS_VALID)
-                manifest_free(&m);
-            close(home_fd);
-            close(source_root_fd);
-            return 1;
+            goto cleanup;
         }
 
         int seed_status = mst == MANIFEST_STATUS_VALID
@@ -1629,15 +1594,7 @@ int restore(const char *source)
         if (seed_status != 0)
         {
             print_error("Error: Could not seed native hardlink restore tracking\n");
-            native_inode_map_free(ctx.inode_map);
-            ctx.inode_map = NULL;
-            metadata_profiles_free(&metadata_profiles);
-            restore_timestamp_anchors_free(&timestamp_anchors);
-            if (mst == MANIFEST_STATUS_VALID)
-                manifest_free(&m);
-            close(home_fd);
-            close(source_root_fd);
-            return 1;
+            goto cleanup;
         }
     }
 
@@ -1653,22 +1610,13 @@ int restore(const char *source)
         restore_v1(source, source_root_fd, home, home_fd, &ctx, &m, &count,
                    &had_error, &timestamp_anchors,
                    &skipped_security_xattrs, &capture_report);
-        manifest_free(&m);
     }
     else
     {
         if (restore_legacy(source, source_root_fd, home, home_fd, &ctx,
                            &count, &had_error, &timestamp_anchors,
                            &skipped_security_xattrs, &capture_report) != 0)
-        {
-            native_inode_map_free(ctx.inode_map);
-            ctx.inode_map = NULL;
-            metadata_profiles_free(&metadata_profiles);
-            restore_timestamp_anchors_free(&timestamp_anchors);
-            close(home_fd);
-            close(source_root_fd);
-            return 1;
-        }
+            goto cleanup;
     }
 
     if (progress_display.printed_anything)
@@ -1702,9 +1650,15 @@ int restore(const char *source)
     if (skipped_security_xattrs != 0)
         printf("Skipped %zu security.* attribute(s) that the destination "
                "could not apply.\n", skipped_security_xattrs);
-    close(home_fd);
-    close(source_root_fd);
+    result = had_error ? 1 : 0;
+
+cleanup:
+    native_inode_map_free(ctx.inode_map);
+    ctx.inode_map = NULL;
     metadata_profiles_free(&metadata_profiles);
     restore_timestamp_anchors_free(&timestamp_anchors);
-    return had_error ? 1 : 0;
+    manifest_free(&m);
+    close(home_fd);
+    close(source_root_fd);
+    return result;
 }
