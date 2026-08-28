@@ -137,34 +137,12 @@ static SidecarStatus status_from_errno(void)
 }
 
 static SidecarStatus copy_bytes(StateMemory *memory, SidecarBytes source,
-                                size_t maximum, int nonempty,
+                                size_t maximum, int nonempty, int allow_nul,
                                 SidecarBytes *destination)
 {
-    if (destination == NULL || !bytes_valid(source, maximum, nonempty))
-    {
-        set_invalid_error();
-        return SIDECAR_STATUS_INVALID_ARGUMENT;
-    }
-    destination->data = NULL;
-    destination->length = 0;
-    if (source.length == 0)
-        return SIDECAR_STATUS_OK;
-
-    unsigned char *data = state_alloc(memory, source.length);
-    if (data == NULL)
-        return errno == ENOMEM ? SIDECAR_STATUS_ALLOCATION
-                               : SIDECAR_STATUS_LIMIT;
-    memcpy(data, source.data, source.length);
-    destination->data = data;
-    destination->length = source.length;
-    return SIDECAR_STATUS_OK;
-}
-
-static SidecarStatus copy_raw_bytes(StateMemory *memory, SidecarBytes source,
-                                    size_t maximum, int nonempty,
-                                    SidecarBytes *destination)
-{
-    if (destination == NULL || !raw_bytes_valid(source, maximum, nonempty))
+    int valid = allow_nul ? raw_bytes_valid(source, maximum, nonempty)
+                          : bytes_valid(source, maximum, nonempty);
+    if (destination == NULL || !valid)
     {
         set_invalid_error();
         return SIDECAR_STATUS_INVALID_ARGUMENT;
@@ -250,15 +228,15 @@ static SidecarStatus copy_claim(StateMemory *memory,
     memset(destination, 0, sizeof(*destination));
     destination->claim.kind = source->kind;
     SidecarStatus status = copy_bytes(memory, source->root_id,
-                                      SIDECAR_MAX_ROOT_ID, 1,
+                                      SIDECAR_MAX_ROOT_ID, 1, 0,
                                       &destination->claim.root_id);
     if (status != SIDECAR_STATUS_OK)
         goto fail;
-    status = copy_bytes(memory, source->logical_path, SIDECAR_MAX_PATH, 0,
+    status = copy_bytes(memory, source->logical_path, SIDECAR_MAX_PATH, 0, 0,
                         &destination->claim.logical_path);
     if (status != SIDECAR_STATUS_OK)
         goto fail;
-    status = copy_bytes(memory, source->physical_path, SIDECAR_MAX_PATH, 0,
+    status = copy_bytes(memory, source->physical_path, SIDECAR_MAX_PATH, 0, 0,
                         &destination->claim.physical_path);
     if (status != SIDECAR_STATUS_OK)
         goto fail;
@@ -281,12 +259,12 @@ static SidecarStatus copy_xattr(StateMemory *memory, const SidecarXattr *source,
     }
     memset(destination, 0, sizeof(*destination));
     SidecarStatus status = copy_bytes(memory, source->name,
-                                      SIDECAR_MAX_XATTR_NAME, 1,
+                                      SIDECAR_MAX_XATTR_NAME, 1, 0,
                                       &destination->name);
     if (status != SIDECAR_STATUS_OK)
         return status;
-    status = copy_raw_bytes(memory, source->value, SIDECAR_MAX_XATTR_VALUE,
-                            0, &destination->value);
+    status = copy_bytes(memory, source->value, SIDECAR_MAX_XATTR_VALUE,
+                        0, 1, &destination->value);
     if (status != SIDECAR_STATUS_OK)
     {
         clear_xattr(memory, destination);
@@ -366,35 +344,35 @@ static SidecarStatus copy_entry(StateMemory *memory, const SidecarEntry *source,
     destination->xattrs = NULL;
 
     SidecarStatus status = copy_bytes(memory, source->root_id,
-                                      SIDECAR_MAX_ROOT_ID, 1,
+                                      SIDECAR_MAX_ROOT_ID, 1, 0,
                                       &destination->entry.root_id);
     if (status != SIDECAR_STATUS_OK)
         goto fail;
-    status = copy_bytes(memory, source->logical_path, SIDECAR_MAX_PATH, 0,
+    status = copy_bytes(memory, source->logical_path, SIDECAR_MAX_PATH, 0, 0,
                         &destination->entry.logical_path);
     if (status != SIDECAR_STATUS_OK)
         goto fail;
-    status = copy_bytes(memory, source->physical_path, SIDECAR_MAX_PATH, 0,
+    status = copy_bytes(memory, source->physical_path, SIDECAR_MAX_PATH, 0, 0,
                         &destination->entry.physical_path);
     if (status != SIDECAR_STATUS_OK)
         goto fail;
     status = copy_bytes(memory, source->collision_suffix,
-                        SIDECAR_MAX_COLLISION_SUFFIX, 0,
+                        SIDECAR_MAX_COLLISION_SUFFIX, 0, 0,
                         &destination->entry.collision_suffix);
     if (status != SIDECAR_STATUS_OK)
         goto fail;
     status = copy_bytes(memory, source->symlink_target,
-                        SIDECAR_MAX_SYMLINK_TARGET, 0,
+                        SIDECAR_MAX_SYMLINK_TARGET, 0, 0,
                         &destination->entry.symlink_target);
     if (status != SIDECAR_STATUS_OK)
         goto fail;
     status = copy_bytes(memory, source->hardlink_root_id,
-                        SIDECAR_MAX_ROOT_ID, 0,
+                        SIDECAR_MAX_ROOT_ID, 0, 0,
                         &destination->entry.hardlink_root_id);
     if (status != SIDECAR_STATUS_OK)
         goto fail;
     status = copy_bytes(memory, source->hardlink_logical_path,
-                        SIDECAR_MAX_PATH, 0,
+                        SIDECAR_MAX_PATH, 0, 0,
                         &destination->entry.hardlink_logical_path);
     if (status != SIDECAR_STATUS_OK)
         goto fail;
