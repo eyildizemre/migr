@@ -699,6 +699,32 @@ static void map_free(StateMemory *memory, StateMap *map)
     memset(map, 0, sizeof(*map));
 }
 
+/* Shared by map_prepare_commit()/map_prepare_claim() once each has decided
+ * its first map_locate() result means "insert a new slot": grows the map if
+ * needed, re-locates (capacity may have changed), and writes the resulting
+ * index. Callers pass the hash they already computed for their own initial
+ * map_locate() call.
+ */
+static SidecarStatus map_prepare_slot(StateMemory *memory, StateMap *map,
+                                      SidecarBytes root_id,
+                                      SidecarBytes logical_path,
+                                      uint64_t hash, size_t *out_index)
+{
+    SidecarStatus status = map_prepare_insert(memory, map);
+    if (status != SIDECAR_STATUS_OK)
+        return status;
+    size_t index = MAP_INDEX_NONE;
+    int location = map_locate(map, root_id, logical_path, hash, &index);
+    if (location != 0 || index == MAP_INDEX_NONE)
+    {
+        errno = E2BIG;
+        return SIDECAR_STATUS_LIMIT;
+    }
+    if (out_index != NULL)
+        *out_index = index;
+    return SIDECAR_STATUS_OK;
+}
+
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wanalyzer-malloc-leak"
@@ -729,20 +755,9 @@ static SidecarStatus map_prepare_commit(StateMemory *memory, StateMap *map,
         errno = E2BIG;
         return SIDECAR_STATUS_LIMIT;
     }
-    SidecarStatus status = map_prepare_insert(memory, map);
-    if (status != SIDECAR_STATUS_OK)
-        return status;
-
-    location = map_locate(map, pending->entry.root_id,
-                          pending->entry.logical_path, hash, &index);
-    if (location != 0 || index == MAP_INDEX_NONE)
-    {
-        errno = E2BIG;
-        return SIDECAR_STATUS_LIMIT;
-    }
-    if (existing_index != NULL)
-        *existing_index = index;
-    return SIDECAR_STATUS_OK;
+    return map_prepare_slot(memory, map, pending->entry.root_id,
+                            pending->entry.logical_path, hash,
+                            existing_index);
 }
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic pop
@@ -772,18 +787,8 @@ static SidecarStatus map_prepare_claim(StateMemory *memory, StateMap *map,
         errno = E2BIG;
         return SIDECAR_STATUS_LIMIT;
     }
-    SidecarStatus status = map_prepare_insert(memory, map);
-    if (status != SIDECAR_STATUS_OK)
-        return status;
-    location = map_locate(map, root_id, logical_path, hash, &index);
-    if (location != 0 || index == MAP_INDEX_NONE)
-    {
-        errno = E2BIG;
-        return SIDECAR_STATUS_LIMIT;
-    }
-    if (claim_index != NULL)
-        *claim_index = index;
-    return SIDECAR_STATUS_OK;
+    return map_prepare_slot(memory, map, root_id, logical_path, hash,
+                            claim_index);
 }
 
 static void map_apply_claim(StateMemory *memory, StateMap *map,
