@@ -2677,11 +2677,9 @@ static RestoreNativeStatus restore_linked_regular_at(
     return RESTORE_NATIVE_OK;
 }
 
-// The same recursive dispatcher serves mutation-free validation and the
-// actual restore. A negative destination parent means the corresponding
-// destination subtree does not exist during validation.
-// The explicit symlink-read flag keeps metadata inventory from perturbing
-// source atime; other validation and apply walks retain target checks (D17).
+// restore_entry_directory() recurses back into the full dispatcher for
+// each child, so it needs restore_entry_at() declared before its own
+// definition, ahead of restore_entry_at()'s own definition further down.
 static RestoreNativeStatus restore_entry_at(
     const CloneContext *ctx, RestorePass pass, int source_parent_fd,
     const char *source_leaf, int dest_parent_fd, const char *dest_leaf,
@@ -2691,74 +2689,18 @@ static RestoreNativeStatus restore_entry_at(
     int metadata_anchor_fd,
     int skip_symlink_target_read,
     RestoreNativeReport *restore_report,
-    BackupCaptureReport *capture_report)
+    BackupCaptureReport *capture_report);
+
+static RestoreNativeStatus restore_entry_symlink(
+    const CloneContext *ctx, RestorePass pass, int source_parent_fd,
+    const char *source_leaf, int dest_parent_fd, const char *dest_leaf,
+    const char *logical_path, MetadataProfiles *profiles,
+    NativeRestoreEstimate *estimate,
+    MetadataXattrRequirements *xattr_requirements,
+    int skip_symlink_target_read, RestoreNativeReport *restore_report,
+    int source_is_root, int dest_is_root, int dest_exists,
+    int source_object_fd, struct stat desired_st)
 {
-    int source_is_root = source_leaf[0] == '\0';
-    int dest_is_root = dest_leaf[0] == '\0';
-
-    struct stat source_st;
-    int source_object_fd = open_source_object(source_parent_fd, source_leaf,
-                                               &source_st);
-    if (source_object_fd < 0)
-        return -1;
-
-    struct stat dest_st;
-    int dest_exists;
-    if (destination_status(dest_parent_fd, dest_leaf, &dest_st,
-                           &dest_exists) != 0)
-    {
-        close(source_object_fd);
-        return -1;
-    }
-    if (dest_exists && S_ISLNK(dest_st.st_mode))
-    {
-        close(source_object_fd);
-        return -1;
-    }
-
-    struct stat desired_st = source_st;
-    if (pass == RESTORE_VALIDATE)
-    {
-        if (metadata_snapshot_record(snapshots, &source_st) != 0)
-        {
-            close(source_object_fd);
-            return -1;
-        }
-        // One profile anchor governs the whole restore root.  It is the
-        // actual destination root when that directory exists, otherwise the
-        // nearest existing parent chosen before the walk began.  Descending
-        // into payload directories must not turn each child directory into a
-        // new probe domain: ACLs and access policy may differ between roots,
-        // but the plan deliberately bounds profiles by restore roots.
-        int profile_failed = profiles != NULL && metadata_anchor_fd < 0;
-        if (!profile_failed && profiles != NULL &&
-            !S_ISSOCK(source_st.st_mode) &&
-            !S_ISCHR(source_st.st_mode) &&
-            !S_ISBLK(source_st.st_mode) &&
-            metadata_profiles_add(profiles, metadata_anchor_fd, &source_st,
-                                  dest_exists ? &dest_st : NULL,
-                                  logical_path) != 0)
-            profile_failed = 1;
-        if (profile_failed)
-        {
-            close(source_object_fd);
-            return -1;
-        }
-    }
-    else
-    {
-        const MetadataSnapshot *snapshot = metadata_snapshot_find(snapshots,
-                                                                   &source_st);
-        if (snapshot == NULL || !metadata_snapshot_matches(snapshot, &source_st) ||
-            metadata_snapshot_to_stat(snapshot, &desired_st) != 0)
-        {
-            close(source_object_fd);
-            return -1;
-        }
-    }
-
-    if (S_ISLNK(source_st.st_mode))
-    {
         if (source_is_root || dest_is_root || dest_exists)
         {
             close(source_object_fd);
@@ -2859,10 +2801,19 @@ static RestoreNativeStatus restore_entry_at(
         else
             restore_report_failure(restore_report, logical_path);
         return failed ? RESTORE_NATIVE_ERROR : RESTORE_NATIVE_OK;
-    }
+}
 
-    if (S_ISREG(source_st.st_mode))
-    {
+static RestoreNativeStatus restore_entry_regular(
+    const CloneContext *ctx, RestorePass pass, int source_parent_fd,
+    const char *source_leaf, int dest_parent_fd, const char *dest_leaf,
+    const char *logical_path, MetadataProfiles *profiles,
+    MetadataXattrRequirements *xattr_requirements,
+    NativeRestoreEstimate *estimate, RestoreNativeReport *restore_report,
+    BackupCaptureReport *capture_report,
+    int source_is_root, int dest_is_root, int dest_exists,
+    struct stat dest_st, struct stat source_st, struct stat desired_st,
+    int source_object_fd)
+{
         if (source_is_root || dest_is_root ||
             (dest_exists && !S_ISREG(dest_st.st_mode)))
         {
@@ -3015,10 +2966,19 @@ static RestoreNativeStatus restore_entry_at(
         else if (failed && pass == RESTORE_APPLY)
             restore_report_failure(restore_report, logical_path);
         return failed ? RESTORE_NATIVE_ERROR : RESTORE_NATIVE_OK;
-    }
+}
 
-    if (S_ISDIR(source_st.st_mode))
-    {
+static RestoreNativeStatus restore_entry_directory(
+    const CloneContext *ctx, RestorePass pass, int dest_parent_fd,
+    const char *dest_leaf, const char *logical_path,
+    MetadataSnapshots *snapshots, MetadataProfiles *profiles,
+    NativeRestoreEstimate *estimate,
+    MetadataXattrRequirements *xattr_requirements, int metadata_anchor_fd,
+    int skip_symlink_target_read, RestoreNativeReport *restore_report,
+    BackupCaptureReport *capture_report, int dest_exists,
+    struct stat dest_st, struct stat source_st, struct stat desired_st,
+    int source_object_fd)
+{
         if (dest_exists && !S_ISDIR(dest_st.st_mode))
         {
             close(source_object_fd);
@@ -3141,10 +3101,15 @@ static RestoreNativeStatus restore_entry_at(
         if (failed && subtree_status == RESTORE_NATIVE_OK)
             subtree_status = RESTORE_NATIVE_ERROR;
         return failed ? subtree_status : RESTORE_NATIVE_OK;
-    }
+}
 
-    if (S_ISFIFO(source_st.st_mode))
-    {
+static RestoreNativeStatus restore_entry_fifo(
+    const CloneContext *ctx, RestorePass pass, int dest_parent_fd,
+    const char *dest_leaf, const char *logical_path,
+    RestoreNativeReport *restore_report, int source_is_root,
+    int dest_is_root, int dest_exists, struct stat dest_st,
+    int source_object_fd, struct stat desired_st)
+{
         if (source_is_root || dest_is_root ||
             (dest_exists && !S_ISFIFO(dest_st.st_mode)))
         {
@@ -3171,25 +3136,149 @@ static RestoreNativeStatus restore_entry_at(
         else
             restore_report_failure(restore_report, logical_path);
         return failed ? RESTORE_NATIVE_ERROR : RESTORE_NATIVE_OK;
-    }
+}
 
-    if (S_ISSOCK(source_st.st_mode))
-    {
+static RestoreNativeStatus restore_entry_socket(
+    RestorePass pass, const char *source_leaf, int source_object_fd)
+{
         close(source_object_fd);
         if (pass == RESTORE_APPLY)
             print_warning("  Warning: skipping socket (runtime-only)%s%s\n",
                           source_leaf[0] ? ": " : "", source_leaf);
         return RESTORE_NATIVE_OK;
-    }
-    if (S_ISCHR(source_st.st_mode) || S_ISBLK(source_st.st_mode))
-    {
+}
+
+static RestoreNativeStatus restore_entry_device(
+    RestorePass pass, const char *source_leaf, int source_object_fd,
+    struct stat source_st)
+{
         close(source_object_fd);
         if (pass == RESTORE_APPLY)
             print_warning("  Warning: skipping %s device node%s%s\n",
                           S_ISCHR(source_st.st_mode) ? "character" : "block",
                           source_leaf[0] ? ": " : "", source_leaf);
         return RESTORE_NATIVE_OK;
+}
+
+// The same recursive dispatcher serves mutation-free validation and the
+// actual restore. A negative destination parent means the corresponding
+// destination subtree does not exist during validation.
+// The explicit symlink-read flag keeps metadata inventory from perturbing
+// source atime; other validation and apply walks retain target checks (D17).
+static RestoreNativeStatus restore_entry_at(
+    const CloneContext *ctx, RestorePass pass, int source_parent_fd,
+    const char *source_leaf, int dest_parent_fd, const char *dest_leaf,
+    const char *logical_path, MetadataSnapshots *snapshots,
+    MetadataProfiles *profiles, NativeRestoreEstimate *estimate,
+    MetadataXattrRequirements *xattr_requirements,
+    int metadata_anchor_fd,
+    int skip_symlink_target_read,
+    RestoreNativeReport *restore_report,
+    BackupCaptureReport *capture_report)
+{
+    int source_is_root = source_leaf[0] == '\0';
+    int dest_is_root = dest_leaf[0] == '\0';
+
+    struct stat source_st;
+    int source_object_fd = open_source_object(source_parent_fd, source_leaf,
+                                               &source_st);
+    if (source_object_fd < 0)
+        return -1;
+
+    struct stat dest_st;
+    int dest_exists;
+    if (destination_status(dest_parent_fd, dest_leaf, &dest_st,
+                           &dest_exists) != 0)
+    {
+        close(source_object_fd);
+        return -1;
     }
+    if (dest_exists && S_ISLNK(dest_st.st_mode))
+    {
+        close(source_object_fd);
+        return -1;
+    }
+
+    struct stat desired_st = source_st;
+    if (pass == RESTORE_VALIDATE)
+    {
+        if (metadata_snapshot_record(snapshots, &source_st) != 0)
+        {
+            close(source_object_fd);
+            return -1;
+        }
+        // One profile anchor governs the whole restore root.  It is the
+        // actual destination root when that directory exists, otherwise the
+        // nearest existing parent chosen before the walk began.  Descending
+        // into payload directories must not turn each child directory into a
+        // new probe domain: ACLs and access policy may differ between roots,
+        // but the plan deliberately bounds profiles by restore roots.
+        int profile_failed = profiles != NULL && metadata_anchor_fd < 0;
+        if (!profile_failed && profiles != NULL &&
+            !S_ISSOCK(source_st.st_mode) &&
+            !S_ISCHR(source_st.st_mode) &&
+            !S_ISBLK(source_st.st_mode) &&
+            metadata_profiles_add(profiles, metadata_anchor_fd, &source_st,
+                                  dest_exists ? &dest_st : NULL,
+                                  logical_path) != 0)
+            profile_failed = 1;
+        if (profile_failed)
+        {
+            close(source_object_fd);
+            return -1;
+        }
+    }
+    else
+    {
+        const MetadataSnapshot *snapshot = metadata_snapshot_find(snapshots,
+                                                                   &source_st);
+        if (snapshot == NULL || !metadata_snapshot_matches(snapshot, &source_st) ||
+            metadata_snapshot_to_stat(snapshot, &desired_st) != 0)
+        {
+            close(source_object_fd);
+            return -1;
+        }
+    }
+
+    if (S_ISLNK(source_st.st_mode))
+        return restore_entry_symlink(ctx, pass, source_parent_fd, source_leaf,
+                                     dest_parent_fd, dest_leaf, logical_path,
+                                     profiles, estimate, xattr_requirements,
+                                     skip_symlink_target_read, restore_report,
+                                     source_is_root, dest_is_root, dest_exists,
+                                     source_object_fd, desired_st);
+
+    if (S_ISREG(source_st.st_mode))
+        return restore_entry_regular(ctx, pass, source_parent_fd, source_leaf,
+                                     dest_parent_fd, dest_leaf, logical_path,
+                                     profiles, xattr_requirements, estimate,
+                                     restore_report, capture_report,
+                                     source_is_root, dest_is_root, dest_exists,
+                                     dest_st, source_st, desired_st,
+                                     source_object_fd);
+
+    if (S_ISDIR(source_st.st_mode))
+        return restore_entry_directory(ctx, pass, dest_parent_fd, dest_leaf,
+                                       logical_path, snapshots, profiles,
+                                       estimate, xattr_requirements,
+                                       metadata_anchor_fd,
+                                       skip_symlink_target_read,
+                                       restore_report, capture_report,
+                                       dest_exists, dest_st, source_st,
+                                       desired_st, source_object_fd);
+
+    if (S_ISFIFO(source_st.st_mode))
+        return restore_entry_fifo(ctx, pass, dest_parent_fd, dest_leaf,
+                                  logical_path, restore_report,
+                                  source_is_root, dest_is_root, dest_exists,
+                                  dest_st, source_object_fd, desired_st);
+
+    if (S_ISSOCK(source_st.st_mode))
+        return restore_entry_socket(pass, source_leaf, source_object_fd);
+
+    if (S_ISCHR(source_st.st_mode) || S_ISBLK(source_st.st_mode))
+        return restore_entry_device(pass, source_leaf, source_object_fd,
+                                    source_st);
 
     close(source_object_fd);
     return -1;
