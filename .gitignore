@@ -38,4 +38,5 @@ tests/test_report
 tests/test_packages
 tests/test_xdg
 tests/test_get_dir_size
+tests/test_run_command
 docs/scratch/

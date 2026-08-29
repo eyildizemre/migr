@@ -3584,6 +3584,11 @@ int run_command(char *const argv[])
 
 int run_command_capture(char *const argv[], char *output, size_t output_size)
 {
+    if (output == NULL || output_size == 0)
+    {
+        return -1; // nothing safe to write into
+    }
+
     int pipefd[2];
     if (pipe(pipefd) == -1)
     {
@@ -3601,10 +3606,14 @@ int run_command_capture(char *const argv[], char *output, size_t output_size)
     {
         // Child process
         close(pipefd[0]); // Close the read end of the pipe
-        
-        dup2(pipefd[1], STDOUT_FILENO); // Redirect stdout to the write end of the pipe
+
+        if (dup2(pipefd[1], STDOUT_FILENO) == -1)
+        {
+            perror("dup2");
+            _exit(1); // Redirect failed; do not exec with the wrong stdout
+        }
         close(pipefd[1]); // Close the original write end of the pipe
-        
+
         execvp(argv[0], argv); // Execute the command
 
         // If execvp returns, it means it failed
@@ -3626,8 +3635,11 @@ int run_command_capture(char *const argv[], char *output, size_t output_size)
 
         close(pipefd[0]); // Close the read end of the pipe
         int status;
-        waitpid(pid, &status, 0); // Wait for the child process to finish
-        
+        if (waitpid(pid, &status, 0) == -1)
+        {
+            return -1;
+        }
+
         if (WIFEXITED(status)) {
             return WEXITSTATUS(status); // Return the exit status of the child process
         }

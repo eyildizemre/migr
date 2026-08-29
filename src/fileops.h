@@ -396,11 +396,16 @@ int run_command(char *const argv[]);
  * Uses fork/execvp with an anonymous pipe redirecting the child's stdout.
  * The output buffer is always null-terminated. Output is silently truncated
  * if it exceeds output_size - 1 bytes.
+ * output must be non-NULL and output_size must be at least 1 (room for
+ * the null terminator even with zero bytes of captured output); both are
+ * rejected with -1 before anything is spawned. Child-side redirection or
+ * exec failures terminate the child with status 1.
  *
  * @param argv        NULL-terminated argument vector; argv[0] is the program to run.
- * @param output      Buffer to receive the captured stdout.
- * @param output_size Total size of the output buffer in bytes.
- * @return The child's exit status on success, -1 if pipe, fork, or waitpid fails.
+ * @param output      Buffer to receive the captured stdout; must be non-NULL.
+ * @param output_size Total size of the output buffer in bytes; must be at least 1.
+ * @return The child's exit status on success, -1 if the arguments are invalid
+ *         or pipe, fork, or waitpid fails.
  */
 int run_command_capture(char *const argv[], char *output, size_t output_size);
 
