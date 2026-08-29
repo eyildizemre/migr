@@ -1,6 +1,8 @@
 #ifndef PACKAGES_H
 #define PACKAGES_H
 
+#include <stdio.h>
+
 /**
  * @brief Exports the same package list into an open container directory.
  *
@@ -48,6 +50,43 @@ int packages_at(int container_fd, const char *leaf);
  *         -1 when something is still there.
  */
 int packages_clear_at(int container_fd, const char *leaf);
+
+/**
+ * @brief Reports whether a package name is safe to use as a package-manager
+ * argv element.
+ *
+ * Real backups only ever write plain names (docs/DECISIONS.md D12); a token
+ * beginning with '-' would otherwise be interpreted by apt-get/dnf/pacman as
+ * an option rather than a package name when it reaches the privileged install
+ * invocation. Exposed for direct testing.
+ *
+ * @param token NUL-terminated candidate package name; NULL is rejected.
+ * @return 1 if safe to use as an argv element, 0 otherwise.
+ */
+int package_token_is_safe(const char *token);
+
+/**
+ * @brief Reads and validates the package-name list from an open packages.txt
+ * stream.
+ *
+ * Every line's first whitespace-delimited token is checked with
+ * package_token_is_safe(); a rejected token is skipped the same way an
+ * old-format dpkg "pkg\tdeinstall" entry is already skipped. A stream error,
+ * failed growth allocation, or failed per-entry allocation sets *had_error.
+ * Successfully parsed entries before a failure are still returned.
+ *
+ * On return, *pkgs_out is either NULL when the initial array allocation failed
+ * or an array of *pkg_count_out heap-owned strings. The caller owns the
+ * strings and the array.
+ *
+ * @param pkg_file      Open, readable stream positioned at the file start.
+ * @param pkgs_out      Receives the parsed package-name array.
+ * @param pkg_count_out Receives the number of entries in *pkgs_out.
+ * @param had_error     Set to 1 on any read/allocation failure; untouched
+ *                      otherwise.
+ */
+void read_package_list(FILE *pkg_file, char ***pkgs_out, int *pkg_count_out,
+                       int *had_error);
 
 /**
  * @brief Installs packages listed in a restored packages.txt.

@@ -162,6 +162,75 @@ int packages_at(int container_fd, const char *leaf)
     return 0;
 }
 
+int package_token_is_safe(const char *token)
+{
+    return token != NULL && token[0] != '\0' && token[0] != '-';
+}
+
+void read_package_list(FILE *pkg_file, char ***pkgs_out, int *pkg_count_out,
+                       int *had_error)
+{
+    int pkg_cap = 256;
+    int pkg_count = 0;
+    char **pkgs = malloc((size_t)pkg_cap * sizeof(*pkgs));
+
+    if (pkgs == NULL)
+    {
+        *had_error = 1;
+        *pkgs_out = NULL;
+        *pkg_count_out = 0;
+        return;
+    }
+
+    char line[512];
+    char pkg_name[256];
+
+    while (fgets(line, sizeof(line), pkg_file) != NULL)
+    {
+        if (sscanf(line, "%255s", pkg_name) != 1)
+            continue;
+
+        // Preserve compatibility with old dpkg "pkg\tstatus" backups by
+        // skipping deinstall entries. Current backups contain plain names;
+        // see docs/DECISIONS.md D12.
+        char *tab = strchr(line, '\t');
+        if (tab != NULL && strncmp(tab + 1, "install", 7) != 0)
+            continue;
+
+        // Current backups never emit option-shaped names. Treat one as an
+        // invalid entry instead of allowing restored data to alter the
+        // privileged package-manager command line.
+        if (!package_token_is_safe(pkg_name))
+            continue;
+
+        if (pkg_count == pkg_cap)
+        {
+            pkg_cap *= 2;
+            char **tmp = realloc(pkgs, (size_t)pkg_cap * sizeof(*pkgs));
+            if (tmp == NULL)
+            {
+                *had_error = 1;
+                break;
+            }
+            pkgs = tmp;
+        }
+
+        pkgs[pkg_count] = strdup(pkg_name);
+        if (pkgs[pkg_count] == NULL)
+        {
+            *had_error = 1;
+            break;
+        }
+        pkg_count++;
+    }
+
+    if (ferror(pkg_file))
+        *had_error = 1;
+
+    *pkgs_out = pkgs;
+    *pkg_count_out = pkg_count;
+}
+
 // Reads and processes packages.txt from the container root (never inside
 // data/: it is a control artifact, not payload, in both legacy and v1
 // layouts). Opened by directory fd with O_NOFOLLOW + O_NONBLOCK -- the same
@@ -226,39 +295,9 @@ void restore_packages(int source_root_fd, const char *home, int *had_error)
 
     printf("Installing packages (this may take a while)...\n");
 
-    int pkg_cap = 256;
+    char **pkgs = NULL;
     int pkg_count = 0;
-    char **pkgs = malloc(pkg_cap * sizeof(char *));
-
-    if (pkgs != NULL)
-    {
-        char line[512];
-        char pkg_name[256];
-
-        while (fgets(line, sizeof(line), pkg_file) != NULL)
-        {
-            if (sscanf(line, "%255s", pkg_name) != 1)
-                continue;
-
-            // Preserve compatibility with old dpkg "pkg\tstatus" backups by
-            // skipping deinstall entries. Current backups contain plain names;
-            // see docs/DECISIONS.md D12.
-            char *tab = strchr(line, '\t');
-            if (tab != NULL && strncmp(tab + 1, "install", 7) != 0)
-                continue;
-
-            if (pkg_count == pkg_cap)
-            {
-                pkg_cap *= 2;
-                char **tmp = realloc(pkgs, pkg_cap * sizeof(char *));
-                if (tmp == NULL) break;
-                pkgs = tmp;
-            }
-            pkgs[pkg_count] = strdup(pkg_name);
-            if (pkgs[pkg_count] != NULL)
-                pkg_count++;
-        }
-    }
+    read_package_list(pkg_file, &pkgs, &pkg_count, had_error);
     fclose(pkg_file);
 
     char *batch_prefix[6];
