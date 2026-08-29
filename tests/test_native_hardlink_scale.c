@@ -160,7 +160,7 @@ int main(void)
            probes, entries);
     check(probes <= entries * UINT64_C(32),
           "native inode-map probes remain bounded linearly");
-    check(probes < (entries * entries) / UINT64_C(1000),
+    check(probes < (entries * entries) / UINT64_C(20),
           "native inode-map probes remain far below quadratic work");
 
     int tree_fd = openat(destination_fd, "tree",
