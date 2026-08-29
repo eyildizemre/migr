@@ -36,4 +36,5 @@ tests/test_fd_limit
 tests/test_backup_sync
 tests/test_report
 tests/test_packages
+tests/test_xdg
 docs/scratch/

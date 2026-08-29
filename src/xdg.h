@@ -22,6 +22,10 @@ extern const char * const xdg_fallbacks[XDG_KEY_COUNT];
  * the caller is responsible for freeing every entry (freeing is safe even on
  * failure, since unresolved entries are left NULL). If the config file is
  * missing or a key is absent, out[i] falls back to home/<fallbacks[i]>.
+ * A read or allocation failure while a present config file is being parsed is
+ * reported as failure (return -1) rather than silently treated as an absent key
+ * -- only a missing config file or a key that is genuinely never matched falls
+ * back to home/<fallbacks[i]>.
  *
  * Every produced path is absolute. A relative fallback is never stored: a bare
  * name would make the caller act on the current working directory instead of

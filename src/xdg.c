@@ -1,3 +1,4 @@
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include <limits.h>
@@ -25,8 +26,13 @@ int xdg_resolve(const char *home,
 
     char config[PATH_MAX];
     FILE *f = NULL;
+    int read_failed = 0;
     if (path_join(config, sizeof(config), home, ".config/user-dirs.dirs") == 0)
+    {
         f = fopen(config, "r");
+        if (f == NULL && errno != ENOENT)
+            read_failed = 1;
+    }
     if (f != NULL)
     {
         char line[PATH_MAX + 32];
@@ -68,12 +74,21 @@ int xdg_resolve(const char *home,
 
                 // On truncation leave out[i] NULL; the fallback loop below fills it.
                 if (rn >= 0 && (size_t)rn < sizeof(resolved))
+                {
                     out[i] = strdup(resolved);
+                    if (out[i] == NULL)
+                        read_failed = 1;
+                }
                 break;
             }
         }
+        if (ferror(f))
+            read_failed = 1;
         fclose(f);
     }
+
+    if (read_failed)
+        return -1;
 
     // Fill any key not found in the config with the English default. Every path
     // must stay absolute: a bare relative name would resolve against the caller's
