@@ -39,4 +39,5 @@ tests/test_packages
 tests/test_xdg
 tests/test_get_dir_size
 tests/test_run_command
+tests/test_metadata_snapshots
 docs/scratch/

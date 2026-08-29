@@ -58,6 +58,9 @@ typedef struct MetadataSnapshots {
     MetadataSnapshot *items;
     size_t count;
     size_t capacity;
+    void *dev_ino_index;    // private: MetadataSnapshotIndexSlot[], see metadata.c
+    size_t index_capacity;
+    uint64_t index_hash_salt;
 } MetadataSnapshots;
 
 enum {

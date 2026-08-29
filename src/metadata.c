@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include "fileops.h"
+#include "hash.h"
 #include "metadata.h"
 
 #ifdef METADATA_TEST_HOOKS
@@ -313,6 +314,7 @@ void metadata_snapshots_init(MetadataSnapshots *snapshots)
     if (snapshots == NULL)
         return;
     memset(snapshots, 0, sizeof(*snapshots));
+    snapshots->index_hash_salt = sidecar_process_salt();
 }
 
 void metadata_snapshots_free(MetadataSnapshots *snapshots)
@@ -320,6 +322,7 @@ void metadata_snapshots_free(MetadataSnapshots *snapshots)
     if (snapshots == NULL)
         return;
     free(snapshots->items);
+    free(snapshots->dev_ino_index);
     memset(snapshots, 0, sizeof(*snapshots));
 }
 
@@ -358,10 +361,115 @@ int metadata_snapshot_to_stat(const MetadataSnapshot *snapshot,
     return 0;
 }
 
-static int snapshot_same_object(const MetadataSnapshot *left,
-                                const struct stat *right)
+typedef struct {
+    dev_t device;
+    ino_t inode;
+    size_t item_index;
+    int used;
+} MetadataSnapshotIndexSlot;
+
+static uint64_t metadata_snapshot_index_hash(uint64_t salt, dev_t device,
+                                             ino_t inode)
 {
-    return left->device == right->st_dev && left->inode == right->st_ino;
+    uint64_t hash = HASH_FNV1A_OFFSET_BASIS ^ salt;
+    hash = hash_fnv1a_uint64(hash, (uint64_t)device);
+    return hash_fnv1a_uint64(hash, (uint64_t)inode);
+}
+
+// Returns 1 with *out_index set to the matching slot, 0 with *out_index set
+// to a usable empty slot (or SIZE_MAX if the index has no capacity yet), or
+// -1 if the table is full (should not happen given the 2/3 growth trigger
+// in metadata_snapshot_index_insert()).
+static int metadata_snapshot_index_locate(const MetadataSnapshots *snapshots,
+                                          dev_t device, ino_t inode,
+                                          size_t *out_index)
+{
+    const MetadataSnapshotIndexSlot *slots = snapshots->dev_ino_index;
+    if (slots == NULL || snapshots->index_capacity == 0)
+    {
+        *out_index = SIZE_MAX;
+        return 0;
+    }
+
+    size_t index = (size_t)metadata_snapshot_index_hash(
+                       snapshots->index_hash_salt, device, inode) &
+                   (snapshots->index_capacity - 1U);
+    for (size_t probes = 0; probes < snapshots->index_capacity; probes++)
+    {
+        const MetadataSnapshotIndexSlot *slot = &slots[index];
+        if (!slot->used)
+        {
+            *out_index = index;
+            return 0;
+        }
+        if (slot->device == device && slot->inode == inode)
+        {
+            *out_index = index;
+            return 1;
+        }
+        index = (index + 1U) & (snapshots->index_capacity - 1U);
+    }
+
+    *out_index = SIZE_MAX;
+    return -1;
+}
+
+static int metadata_snapshot_index_rehash(MetadataSnapshots *snapshots,
+                                          size_t capacity)
+{
+    if (capacity < 32U || (capacity & (capacity - 1U)) != 0 ||
+        capacity > SIZE_MAX / sizeof(MetadataSnapshotIndexSlot))
+        return -1;
+
+    MetadataSnapshotIndexSlot *slots = calloc(capacity, sizeof(*slots));
+    if (slots == NULL)
+        return -1;
+
+    MetadataSnapshotIndexSlot *old_slots = snapshots->dev_ino_index;
+    for (size_t i = 0; i < snapshots->index_capacity; i++)
+    {
+        if (!old_slots[i].used)
+            continue;
+        size_t index = (size_t)metadata_snapshot_index_hash(
+                           snapshots->index_hash_salt, old_slots[i].device,
+                           old_slots[i].inode) &
+                       (capacity - 1U);
+        while (slots[index].used)
+            index = (index + 1U) & (capacity - 1U);
+        slots[index] = old_slots[i];
+    }
+
+    free(old_slots);
+    snapshots->dev_ino_index = slots;
+    snapshots->index_capacity = capacity;
+    return 0;
+}
+
+static int metadata_snapshot_index_insert(MetadataSnapshots *snapshots,
+                                          dev_t device, ino_t inode,
+                                          size_t item_index)
+{
+    if (snapshots->index_capacity == 0 ||
+        snapshots->count >= snapshots->index_capacity -
+                                snapshots->index_capacity / 3U)
+    {
+        size_t next_capacity = snapshots->index_capacity == 0
+                                   ? 32U : snapshots->index_capacity * 2U;
+        if (metadata_snapshot_index_rehash(snapshots, next_capacity) != 0)
+            return -1;
+    }
+
+    size_t index = SIZE_MAX;
+    if (metadata_snapshot_index_locate(snapshots, device, inode, &index) != 0 ||
+        index == SIZE_MAX)
+        return -1;
+
+    MetadataSnapshotIndexSlot *slots = snapshots->dev_ino_index;
+    slots[index].device = device;
+    slots[index].inode = inode;
+    slots[index].item_index = item_index;
+    slots[index].used = 1;
+    return 0;
 }
 
 int metadata_snapshot_record(MetadataSnapshots *snapshots,
@@ -369,9 +477,14 @@ int metadata_snapshot_record(MetadataSnapshots *snapshots,
 {
     if (snapshots == NULL || st == NULL)
         return -1;
-    for (size_t i = 0; i < snapshots->count; i++)
-        if (snapshot_same_object(&snapshots->items[i], st))
-            return 0;
+
+    size_t existing_index = SIZE_MAX;
+    int found = metadata_snapshot_index_locate(snapshots, st->st_dev,
+                                               st->st_ino, &existing_index);
+    if (found < 0)
+        return -1;
+    if (found == 1)
+        return 0;
 
     if (snapshots->count == snapshots->capacity)
     {
@@ -385,6 +498,11 @@ int metadata_snapshot_record(MetadataSnapshots *snapshots,
     }
     if (metadata_snapshot_from_stat(st, &snapshots->items[snapshots->count]) != 0)
         return -1;
+
+    if (metadata_snapshot_index_insert(snapshots, st->st_dev, st->st_ino,
+                                       snapshots->count) != 0)
+        return -1;
+
     snapshots->count++;
     return 0;
 }
@@ -394,10 +512,14 @@ const MetadataSnapshot *metadata_snapshot_find(const MetadataSnapshots *snapshot
 {
     if (snapshots == NULL || st == NULL)
         return NULL;
-    for (size_t i = 0; i < snapshots->count; i++)
-        if (snapshot_same_object(&snapshots->items[i], st))
-            return &snapshots->items[i];
-    return NULL;
+
+    size_t index = SIZE_MAX;
+    if (metadata_snapshot_index_locate(snapshots, st->st_dev, st->st_ino,
+                                       &index) != 1)
+        return NULL;
+
+    const MetadataSnapshotIndexSlot *slots = snapshots->dev_ino_index;
+    return &snapshots->items[slots[index].item_index];
 }
 
 MetadataTimestampPolicy metadata_policy_from_context(const CloneContext *ctx)
