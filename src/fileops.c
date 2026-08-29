@@ -3502,8 +3502,20 @@ int get_dir_size(const char *path, off_t *size)
         }
 
         struct dirent *entry;
-        while ((entry = readdir(dir)) != NULL)
+        for (;;)
         {
+            errno = 0;
+            entry = readdir(dir);
+            if (entry == NULL)
+            {
+                if (errno != 0)
+                {
+                    closedir(dir);
+                    return -1;
+                }
+                break;
+            }
+
             if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
             {
                 continue;
@@ -3523,7 +3535,10 @@ int get_dir_size(const char *path, off_t *size)
             }
         }
 
-        closedir(dir);
+        if (closedir(dir) != 0)
+        {
+            return -1;
+        }
         return 0;
     }
 

@@ -37,4 +37,5 @@ tests/test_backup_sync
 tests/test_report
 tests/test_packages
 tests/test_xdg
+tests/test_get_dir_size
 docs/scratch/
