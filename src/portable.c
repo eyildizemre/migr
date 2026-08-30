@@ -1255,8 +1255,29 @@ static int capture_destination_is_safe(const PortableCaptureContext *context,
     if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) != 0)
         return errno == ENOENT ? 0 : -1;
 
-    if (!context->resume_mode)
-        return 0;
+    if (!context->resume_mode) {
+        if (context->sidecar == NULL)
+            return -1;
+        SidecarBytes root_key = {
+            (const unsigned char *)root->id, strlen(root->id)
+        };
+        SidecarBytes logical_key = {
+            (const unsigned char *)logical, strlen(logical)
+        };
+        SidecarLiveView live;
+        int live_found = sidecar_log_find(context->sidecar, root_key,
+                                          logical_key, &live);
+        if (live_found < 0)
+            return -1;
+        return live_found == 1 &&
+                       sidecar_bytes_equal(
+                           live.entry->physical_path,
+                           (SidecarBytes){
+                               (const unsigned char *)physical,
+                               strlen(physical) })
+                   ? 0
+                   : -1;
+    }
     if (context->owned_paths == NULL)
         return -1;
     const PortableOwnedPaths *owned = context->owned_paths;

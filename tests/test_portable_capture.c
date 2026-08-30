@@ -3836,6 +3836,43 @@ static void test_portable_special_file_non_ascii_name_in_directory(
     remove_tree(container_path);
 }
 
+static void test_fresh_stray_destination_is_refused(const char *base)
+{
+    printf(BLUE "::" NC " fresh capture refuses an unexplained pre-existing destination\n");
+    char source_path[PATH_MAX];
+    char container_path[PATH_MAX];
+    join_path(source_path, sizeof(source_path), base,
+              "stray-destination-source");
+    join_path(container_path, sizeof(container_path), base,
+              "stray-destination-container");
+    write_file(source_path, "real content", 12);
+
+    int container_fd = -1;
+    SidecarLog log = {0};
+    PortableCaptureContext context = {0};
+    check(create_live_capture(container_path, &container_fd, &log,
+                              &context) == 0,
+          "fresh sidecar context is ready for the stray-destination test");
+    if (container_fd < 0 || log.implementation == NULL)
+        return;
+
+    /* Simulate a latent collision-plan/case-fold bug: something already
+     * occupies the destination leaf before this root's first-ever
+     * capture, with no sidecar record explaining it. */
+    char stray_path[PATH_MAX];
+    join_path(stray_path, sizeof(stray_path), container_path, "data/ROOT");
+    write_file(stray_path, "STRAY FOREIGN DATA",
+               sizeof("STRAY FOREIGN DATA") - 1U);
+
+    PortableRootSpec root = root_spec("ROOT", source_path, "ROOT");
+    check(portable_capture_root(&context, &root) != 0,
+          "fresh capture refuses to overwrite an unexplained stray destination");
+    check(file_equals(stray_path, "STRAY FOREIGN DATA"),
+          "the foreign content survives untouched, not silently replaced");
+
+    close_live_capture(container_fd, &log, &context);
+}
+
 static void test_preflight_refusal(const char *source)
 {
     printf(BLUE "::" NC " fresh preflight boundaries\n");
@@ -3915,6 +3952,7 @@ int main(void)
     test_replacement_and_type_change(source_path, root_path);
     test_unsupported_types(source_path, root_path);
     test_portable_special_file_non_ascii_name_in_directory(root_path);
+    test_fresh_stray_destination_is_refused(root_path);
     test_preflight_refusal(source_path);
 
     close(container_fd);
