@@ -320,9 +320,9 @@ static int replay_collect_entry(const SidecarLiveView *view, void *argument)
     {
         SidecarLiveView referenced;
         if (collection->sidecar == NULL ||
-            !sidecar_log_find(collection->sidecar,
-                              entry->hardlink_root_id,
-                              entry->hardlink_logical_path, &referenced) ||
+            sidecar_log_find(collection->sidecar,
+                             entry->hardlink_root_id,
+                             entry->hardlink_logical_path, &referenced) <= 0 ||
             referenced.entry == NULL ||
             referenced.entry->kind != SIDECAR_KIND_REGULAR ||
             !sidecar_path_valid(referenced.entry->logical_path, 1) ||
