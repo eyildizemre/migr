@@ -30,8 +30,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <sys/xattr.h>
 #include <unistd.h>
@@ -2030,6 +2032,73 @@ static void test_fresh_regular_claim_resume(const char *base)
     close(container_fd);
 }
 
+static void test_special_kind_change_claim_resume(const char *base)
+{
+    printf(BLUE "::" NC " special-file kind-change CLAIM resume proof\n");
+    char source_dir[PATH_MAX];
+    char source_file[PATH_MAX];
+    char container_path[PATH_MAX];
+    char payload_path[PATH_MAX];
+    join_path(source_dir, sizeof(source_dir), base,
+              "special-kind-change-source");
+    join_path(container_path, sizeof(container_path), base,
+              "special-kind-change-container");
+    make_directory(source_dir);
+    join_path(source_file, sizeof(source_file), source_dir, "node");
+    write_file(source_file, "regular-before");
+
+    PortableRootSpec root = root_spec("SPECIAL", source_file, "SPECIAL");
+    PortableCaptureRequest request = request_for(&root, "f126");
+    int container_fd = create_container(container_path);
+    check(container_fd >= 0,
+          "special kind-change fixture has an empty container");
+    if (container_fd < 0)
+        return;
+
+    check(run_fresh_interrupt(container_fd, &request,
+                              PORTABLE_TEST_AFTER_PAYLOAD_REPLACE) == 0,
+          "regular capture is killed after payload creation before commit");
+    check(payload_regular_size(container_path, "data/SPECIAL", 0) &&
+              resume_claim_state(container_fd, 0, 1, 1),
+          "regular interruption leaves one exact outstanding CLAIM");
+
+    if (unlink(source_file) != 0)
+        fixture_fatal("could not replace regular source with socket");
+    int socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (socket_fd < 0)
+        fixture_fatal("could not create socket fixture");
+    struct sockaddr_un address;
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+    if (strlen(source_file) >= sizeof(address.sun_path))
+        fixture_fatal("socket fixture path is too long");
+    memcpy(address.sun_path, source_file, strlen(source_file) + 1U);
+    if (bind(socket_fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
+        if (errno == EPERM || errno == EACCES) {
+            skip_check("socket fixture unavailable in this sandbox");
+            close(socket_fd);
+            close(container_fd);
+            return;
+        }
+        fixture_fatal("could not bind socket fixture");
+    }
+
+    portable_capture_test_set_interrupt(PORTABLE_TEST_INTERRUPT_NONE);
+    sidecar_test_set_interrupt(SIDECAR_TEST_INTERRUPT_NONE);
+    check(portable_capture_resume_at(container_fd, &request, NULL) == 0,
+          "socket resume recognizes an outstanding claim across a kind change");
+    join_path(payload_path, sizeof(payload_path), container_path,
+              "data/SPECIAL");
+    struct stat st;
+    check(resume_claim_state(container_fd, 0, 0, 1) &&
+              lstat(payload_path, &st) != 0 && errno == ENOENT,
+          "socket skip consumes the claim and removes the stale payload");
+
+    close(socket_fd);
+    unlink(address.sun_path);
+    close(container_fd);
+}
+
 static void test_fresh_symlink_claim_resume(const char *base)
 {
     printf(BLUE "::" NC " fresh symlink CLAIM resume proof\n");
@@ -2767,6 +2836,7 @@ int main(void)
     test_claim_kind_changes(base);
     test_repeated_claim_kind_change_interrupt(base);
     test_fresh_regular_claim_resume(base);
+    test_special_kind_change_claim_resume(base);
     test_fresh_symlink_claim_resume(base);
     test_fresh_hardlink_claim_resume(base);
     test_fresh_directory_case(base, "fresh-directory-empty", 0);

@@ -2034,6 +2034,24 @@ static int capture_special(PortableCaptureContext *context,
     if (visited_add(context->visited, root->id, logical) != 0)
         return -1;
 
+    if (context->resume_mode) {
+        SidecarBytes root_key = {
+            (const unsigned char *)root->id, strlen(root->id)
+        };
+        SidecarBytes logical_key = {
+            (const unsigned char *)logical, strlen(logical)
+        };
+        SidecarClaimView existing = {0};
+        int found = sidecar_log_find_claim(context->sidecar, root_key,
+                                           logical_key, &existing);
+        if (found < 0 ||
+            (found == 1 &&
+             (existing.claim == NULL ||
+              reconcile_stale_claim(context, root, logical,
+                                    existing.claim) != 0)))
+            return -1;
+    }
+
     int parent_fd = destination_parent;
     char root_leaf[NAME_MAX + 1U];
     if (destination_is_root) {
