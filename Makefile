@@ -128,8 +128,11 @@ $(TEST_MANIFEST): tests/test_manifest.c manifest.o encoding.o utils.o
 $(TEST_ENCODING): tests/test_encoding.c encoding.o
 	$(CC) $(CFLAGS) -o $@ tests/test_encoding.c encoding.o
 
-$(TEST_CONTAINER): tests/test_container.c container.o manifest.o encoding.o utils.o
-	$(CC) $(CFLAGS) -o $@ tests/test_container.c container.o manifest.o encoding.o utils.o
+container_test.o: src/container.c src/container.h
+	$(CC) $(CFLAGS) -DCONTAINER_TEST_HOOKS -c src/container.c -o $@
+
+$(TEST_CONTAINER): tests/test_container.c container_test.o manifest.o encoding.o utils.o
+	$(CC) $(CFLAGS) -DCONTAINER_TEST_HOOKS -o $@ tests/test_container.c container_test.o manifest.o encoding.o utils.o
 
 $(TEST_RESTORE_NATIVE): tests/test_restore_native.c fileops.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o manifest.o encoding.o utils.o
 	$(CC) $(CFLAGS) -o $@ tests/test_restore_native.c fileops.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o manifest.o encoding.o utils.o
@@ -347,6 +350,6 @@ check:
 	$(MAKE) check-analyze
 
 clean:
-	rm -f $(OBJS) report_test.o backup_test.o fileops_test.o sidecar.o sidecar_test.o sidecar_state.o sidecar_state_map.o sidecar_state_test.o sidecar_state_map_test.o portable.o portable_reconcile.o portable_fsops.o portable_test.o portable_reconcile_test.o portable_hashset.o portable_prescan.o portable_restore_replay_test.o portable_restore_preflight.o portable_restore_shared.o portable_restore_orchestrate.o metadata_test.o metadata_xattr.o $(TARGET) $(TEST_DETECT) $(TEST_REPORT) $(TEST_PATHJOIN) $(TEST_FD_LIMIT) $(TEST_PACKAGES) $(TEST_XDG) $(TEST_GET_DIR_SIZE) $(TEST_RUN_COMMAND) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE) $(TEST_MANIFEST) $(TEST_ENCODING) $(TEST_CONTAINER) $(TEST_RESTORE_NATIVE) $(TEST_RESTORE_SYNC) $(TEST_RESTORE_SOURCE_READ) $(TEST_BACKUP_SOURCE_READ) $(TEST_BACKUP_SYNC) $(TEST_RESTORE_DISPATCH) $(TEST_RESTORE_ATIME) $(TEST_BACKUP_PLAN) $(TEST_METADATA_CONTRACT) $(TEST_METADATA_SNAPSHOTS) $(TEST_SIDECAR) $(TEST_SIDECAR_STATE) $(TEST_SIDECAR_SCALE) $(TEST_PORTABLE_CAPTURE) $(TEST_PORTABLE_CAPTURE_SCALE) $(TEST_PORTABLE_PREPARE) $(TEST_NATIVE_RECONCILE_SCALE) $(TEST_NATIVE_HARDLINK_SCALE) $(TEST_PORTABLE_COLLISION_SCALE) $(TEST_PORTABLE_HARDLINK_SCALE) $(TEST_PORTABLE_RESUME) $(TEST_PORTABLE_RECONCILE) $(TEST_PORTABLE_RECONCILE_SCALE) $(TEST_PORTABLE_RESTORE_PREFLIGHT) $(TEST_PORTABLE_RESTORE_REPLAY) $(TEST_PORTABLE_RESTORE_ORCHESTRATE) $(TEST_PORTABLE_RESTORE_INVARIANT)
+	rm -f $(OBJS) report_test.o backup_test.o container_test.o fileops_test.o sidecar.o sidecar_test.o sidecar_state.o sidecar_state_map.o sidecar_state_test.o sidecar_state_map_test.o portable.o portable_reconcile.o portable_fsops.o portable_test.o portable_reconcile_test.o portable_hashset.o portable_prescan.o portable_restore_replay_test.o portable_restore_preflight.o portable_restore_shared.o portable_restore_orchestrate.o metadata_test.o metadata_xattr.o $(TARGET) $(TEST_DETECT) $(TEST_REPORT) $(TEST_PATHJOIN) $(TEST_FD_LIMIT) $(TEST_PACKAGES) $(TEST_XDG) $(TEST_GET_DIR_SIZE) $(TEST_RUN_COMMAND) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE) $(TEST_MANIFEST) $(TEST_ENCODING) $(TEST_CONTAINER) $(TEST_RESTORE_NATIVE) $(TEST_RESTORE_SYNC) $(TEST_RESTORE_SOURCE_READ) $(TEST_BACKUP_SOURCE_READ) $(TEST_BACKUP_SYNC) $(TEST_RESTORE_DISPATCH) $(TEST_RESTORE_ATIME) $(TEST_BACKUP_PLAN) $(TEST_METADATA_CONTRACT) $(TEST_METADATA_SNAPSHOTS) $(TEST_SIDECAR) $(TEST_SIDECAR_STATE) $(TEST_SIDECAR_SCALE) $(TEST_PORTABLE_CAPTURE) $(TEST_PORTABLE_CAPTURE_SCALE) $(TEST_PORTABLE_PREPARE) $(TEST_NATIVE_RECONCILE_SCALE) $(TEST_NATIVE_HARDLINK_SCALE) $(TEST_PORTABLE_COLLISION_SCALE) $(TEST_PORTABLE_HARDLINK_SCALE) $(TEST_PORTABLE_RESUME) $(TEST_PORTABLE_RECONCILE) $(TEST_PORTABLE_RECONCILE_SCALE) $(TEST_PORTABLE_RESTORE_PREFLIGHT) $(TEST_PORTABLE_RESTORE_REPLAY) $(TEST_PORTABLE_RESTORE_ORCHESTRATE) $(TEST_PORTABLE_RESTORE_INVARIANT)
 
 .PHONY: clean test check-strict check-sanitize check-valgrind check-analyze check

@@ -267,4 +267,24 @@ int container_name_is_partial(const char *name);
  */
 int container_name_is_final(const char *name);
 
+#ifdef CONTAINER_TEST_HOOKS
+/**
+ * @brief Fires inside container_reserve_fd(), synchronously, immediately
+ * after mkdirat() creates a candidate partial and before it is opened or
+ * locked -- deterministically simulating a concurrent container_adopt_fd()
+ * scan that opens and flock()s the same just-created directory before
+ * container_reserve_fd() gets to it, without needing a real, timing-
+ * dependent race between two processes.
+ *
+ * @param dir_fd Destination root's directory fd (same one container_reserve_fd()
+ *               itself uses; the hook may openat() the candidate through it).
+ * @param partial_name The just-created partial's leaf name.
+ */
+typedef void (*ContainerTestReserveHook)(int dir_fd, const char *partial_name,
+                                         void *context);
+
+void container_test_set_reserve_hook(ContainerTestReserveHook hook,
+                                     void *context);
+#endif
+
 #endif

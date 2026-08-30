@@ -28,6 +28,33 @@
 #define CONTAINER_STAMP_LEN 15 /* "YYYYMMDD_HHMMSS" */
 #define CONTAINER_PARTIAL_SUFFIX ".partial"
 
+#ifdef CONTAINER_TEST_HOOKS
+static ContainerTestReserveHook container_test_reserve_hook;
+static void *container_test_reserve_hook_context;
+
+void container_test_set_reserve_hook(ContainerTestReserveHook hook,
+                                     void *context)
+{
+    container_test_reserve_hook = hook;
+    container_test_reserve_hook_context = context;
+}
+
+static void container_test_after_partial_mkdir(int dir_fd,
+                                               const char *partial_name)
+{
+    if (container_test_reserve_hook != NULL)
+        container_test_reserve_hook(dir_fd, partial_name,
+                                    container_test_reserve_hook_context);
+}
+#else
+static void container_test_after_partial_mkdir(int dir_fd,
+                                               const char *partial_name)
+{
+    (void)dir_fd;
+    (void)partial_name;
+}
+#endif
+
 static int all_digits(const char *s, size_t n)
 {
     for (size_t i = 0; i < n; i++)
@@ -192,6 +219,8 @@ ContainerStatus container_reserve_fd(int dest_root_fd, time_t timestamp,
             return CONTAINER_ERR_IO;
         }
 
+        container_test_after_partial_mkdir(dir_fd, partial_name);
+
         int partial_fd = openat(dir_fd, partial_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
         if (partial_fd < 0)
         {
@@ -204,6 +233,17 @@ ContainerStatus container_reserve_fd(int dest_root_fd, time_t timestamp,
 
         if (flock(partial_fd, LOCK_EX | LOCK_NB) != 0)
         {
+            if (errno == EWOULDBLOCK)
+            {
+                // A concurrent container_adopt_fd() scan can win this exact
+                // partial's lock between our mkdirat() above and here -- a
+                // legitimate race, not a fault of ours. It, not us, is
+                // responsible for what it's holding; leave the directory
+                // alone and try the next suffix, the same way an EEXIST
+                // from mkdirat() above is handled.
+                close(partial_fd);
+                continue;
+            }
             // Already failing for this reason regardless of the cleanup's
             // outcome (no lock was ever successfully held here either way).
             abandon_own_claim(dir_fd, partial_fd, partial_name);

@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h> /* flock */
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -362,6 +363,62 @@ static void test_concurrent_reserve_claims_distinct_partials(void)
         check(suffixes_distinct, "the two concurrent reservations claimed suffixes {0,1}, not the same one");
     }
 
+    fresh_test_root();
+}
+
+// Deterministically simulates a concurrent container_adopt_fd() scan
+// winning the flock() on a just-created partial before container_reserve_fd()
+// gets to it, via container_test_set_reserve_hook() (CONTAINER_TEST_HOOKS) --
+// fires synchronously inside container_reserve_fd() right after mkdirat(),
+// so this needs no real inter-process race or timing assumption.
+static int reserve_race_hook_fd = -1;
+static int reserve_race_hook_fired = 0;
+
+static void reserve_race_hook(int dir_fd, const char *partial_name,
+                              void *context)
+{
+    (void)context;
+    if (reserve_race_hook_fired)
+        return;
+    reserve_race_hook_fired = 1;
+    reserve_race_hook_fd = openat(dir_fd, partial_name,
+                                  O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (reserve_race_hook_fd >= 0)
+        (void)flock(reserve_race_hook_fd, LOCK_EX | LOCK_NB);
+}
+
+static void test_reserve_flock_race_advances_suffix(void)
+{
+    printf(BLUE "::" NC " container: losing the flock race to a concurrent adopt-scan advances the suffix instead of failing\n");
+    fresh_test_root();
+
+    reserve_race_hook_fd = -1;
+    reserve_race_hook_fired = 0;
+    container_test_set_reserve_hook(reserve_race_hook, NULL);
+
+    BackupContainer c;
+    ContainerStatus status = container_reserve(test_root, FIXED_TIME, &c);
+
+    container_test_set_reserve_hook(NULL, NULL);
+
+    check(status == CONTAINER_OK && c.suffix == 1,
+          "reserve retries the next suffix instead of failing when it loses the flock race");
+    check(reserve_race_hook_fd >= 0, "fixture: the simulated concurrent holder actually acquired the lock");
+
+    char contested_partial[CONTAINER_NAME_MAX + 16];
+    char expected_final[CONTAINER_NAME_MAX];
+    compute_expected_base(expected_final, sizeof(expected_final));
+    snprintf(contested_partial, sizeof(contested_partial), "%s.partial", expected_final);
+    char contested_path[PATH_MAX];
+    path_under_root(contested_path, sizeof(contested_path), contested_partial);
+    struct stat st;
+    check(stat(contested_path, &st) == 0 && S_ISDIR(st.st_mode),
+          "the contended suffix-0 partial is left on disk, not unlinked out from under its holder");
+
+    if (reserve_race_hook_fd >= 0)
+        close(reserve_race_hook_fd);
+    if (status == CONTAINER_OK)
+        container_close(&c);
     fresh_test_root();
 }
 
@@ -1306,6 +1363,7 @@ int main(void)
     test_reserve_fd_is_anchored();
     test_reserve_final_collision_advances_suffix();
     test_concurrent_reserve_claims_distinct_partials();
+    test_reserve_flock_race_advances_suffix();
 
     test_finalize_success();
     test_finalize_sync_failure_leaves_partial();
