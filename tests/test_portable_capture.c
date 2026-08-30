@@ -3758,6 +3758,84 @@ static void test_unsupported_types(const char *source, const char *base_path)
     close_live_capture(container_fd, &log, &context);
 }
 
+static void test_portable_special_file_non_ascii_name_in_directory(
+    const char *base_path)
+{
+    printf(BLUE "::" NC " non-ASCII special-file child policy\n");
+    char source_path[PATH_MAX];
+    char container_path[PATH_MAX];
+    join_path(source_path, sizeof(source_path), base_path,
+              "special-non-ascii-source");
+    join_path(container_path, sizeof(container_path), base_path,
+              "special-non-ascii-container");
+    make_directory(source_path);
+    make_directory(container_path);
+
+    static const char regular_name[] = "caf\xc3\xa9.txt";
+    static const char socket_name[] = "s\xc3\xb6" "ck.sock";
+    char regular_path[PATH_MAX];
+    char socket_path[PATH_MAX];
+    join_path(regular_path, sizeof(regular_path), source_path, regular_name);
+    join_path(socket_path, sizeof(socket_path), source_path, socket_name);
+    write_file(regular_path, "payload", sizeof("payload") - 1U);
+
+    int socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (socket_fd < 0)
+        fixture_fatal("could not create non-ASCII socket fixture");
+    struct sockaddr_un address;
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+    if (strlen(socket_path) >= sizeof(address.sun_path))
+        fixture_fatal("non-ASCII socket fixture path is too long");
+    memcpy(address.sun_path, socket_path, strlen(socket_path) + 1U);
+    if (bind(socket_fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
+        if (errno == EPERM || errno == EACCES) {
+            skip_check("socket fixture unavailable in this sandbox");
+            close(socket_fd);
+            unlink(address.sun_path);
+            remove_tree(source_path);
+            remove_tree(container_path);
+            return;
+        }
+        fixture_fatal("could not bind non-ASCII socket fixture");
+    }
+
+    int container_fd = open(container_path,
+                            O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open non-ASCII special-file container");
+    PortableRootSpec root = root_spec("SPECIAL", source_path, "SPECIAL");
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .roots = &root,
+        .root_count = 1,
+        .nsec_exact = 1
+    };
+    check(portable_capture_fresh_at(container_fd, &request, NULL) == 0,
+          "non-ASCII special-file child does not abort directory capture");
+
+    char payload_path[PATH_MAX];
+    join_path(payload_path, sizeof(payload_path), container_path,
+              "data/SPECIAL");
+    char regular_payload[PATH_MAX];
+    char socket_payload[PATH_MAX];
+    join_path(regular_payload, sizeof(regular_payload), payload_path,
+              regular_name);
+    join_path(socket_payload, sizeof(socket_payload), payload_path,
+              socket_name);
+    check(file_equals(regular_payload, "payload"),
+          "non-ASCII regular sibling remains in the captured payload");
+    struct stat st;
+    check(lstat(socket_payload, &st) != 0 && errno == ENOENT,
+          "non-ASCII socket child remains absent from the payload");
+
+    close(container_fd);
+    close(socket_fd);
+    unlink(address.sun_path);
+    remove_tree(source_path);
+    remove_tree(container_path);
+}
+
 static void test_preflight_refusal(const char *source)
 {
     printf(BLUE "::" NC " fresh preflight boundaries\n");
@@ -3836,6 +3914,7 @@ int main(void)
     test_capture_context_flags(root_path);
     test_replacement_and_type_change(source_path, root_path);
     test_unsupported_types(source_path, root_path);
+    test_portable_special_file_non_ascii_name_in_directory(root_path);
     test_preflight_refusal(source_path);
 
     close(container_fd);

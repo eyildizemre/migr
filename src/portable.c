@@ -464,6 +464,15 @@ static int pending_readback_names_add(PendingReadbackNames *pending,
     return 0;
 }
 
+static void pending_readback_names_remove_last(PendingReadbackNames *pending)
+{
+    if (pending == NULL || pending->count == 0)
+        return;
+    pending->count--;
+    free(pending->names[pending->count]);
+    pending->names[pending->count] = NULL;
+}
+
 static int encoded_name_has_raw_high_byte(const char *encoded)
 {
     if (encoded == NULL)
@@ -1759,7 +1768,8 @@ static int capture_node(PortableCaptureContext *context,
                         const char *logical, const char *physical,
                         int source_parent,
                         const char *source_name, const char *root_path,
-                        int destination_parent, const char *destination_leaf);
+                        int destination_parent, const char *destination_leaf,
+                        int *no_destination_object);
 
 static int capture_directory(PortableCaptureContext *context,
                              const PortableRootSpec *root,
@@ -1873,18 +1883,24 @@ static int capture_directory(PortableCaptureContext *context,
             break;
         }
 
-        if (encoded_name_has_raw_high_byte(child_leaf) &&
-            pending_readback_names_add(&pending, child_leaf) != 0) {
-            failed = 1;
-            break;
+        int added_pending = 0;
+        if (encoded_name_has_raw_high_byte(child_leaf)) {
+            if (pending_readback_names_add(&pending, child_leaf) != 0) {
+                failed = 1;
+                break;
+            }
+            added_pending = 1;
         }
 
+        int no_destination_object = 0;
         if (capture_node(context, root, child_logical, child_physical,
                          source_fd, entry->d_name, NULL, destination_fd,
-                         child_leaf) != 0) {
+                         child_leaf, &no_destination_object) != 0) {
             failed = 1;
             break;
         }
+        if (added_pending && no_destination_object)
+            pending_readback_names_remove_last(&pending);
     }
     if (closedir(directory) != 0)
         failed = 1;
@@ -2352,7 +2368,8 @@ static int capture_node(PortableCaptureContext *context,
                         const char *logical, const char *physical,
                         int source_parent,
                         const char *source_name, const char *root_path,
-                        int destination_parent, const char *destination_leaf)
+                        int destination_parent, const char *destination_leaf,
+                        int *no_destination_object)
 {
     struct stat before;
     if (read_source_stat(source_parent, source_name, root_path, &before) != 0)
@@ -2370,10 +2387,13 @@ static int capture_node(PortableCaptureContext *context,
 
     int is_root = source_parent < 0;
     if (S_ISSOCK(before.st_mode) || S_ISCHR(before.st_mode) ||
-        S_ISBLK(before.st_mode))
+        S_ISBLK(before.st_mode)) {
+        if (no_destination_object != NULL)
+            *no_destination_object = 1;
         return capture_special(context, root, logical, physical,
                                destination_parent, destination_leaf, is_root,
                                &before);
+    }
     if (S_ISFIFO(before.st_mode)) {
         errno = EOPNOTSUPP;
         return -1;
@@ -2778,7 +2798,7 @@ int portable_capture_root(PortableCaptureContext *context,
     if (prepare_collision_relocations(context, root) != 0)
         return -1;
     int result = capture_node(context, root, "", "", -1, NULL,
-                              root->capture_path, -1, NULL);
+                              root->capture_path, -1, NULL, NULL);
     if (result != 0)
         return result;
     return capture_plan_entries_seen(context, root);
