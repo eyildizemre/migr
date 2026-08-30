@@ -1128,6 +1128,34 @@ static void test_raw_nul_and_root_gap(void)
     }
 }
 
+static void test_file_ancestor_conflict_wedge(void)
+{
+    printf(BLUE "::" NC " lexical wedge ancestor conflict\n");
+    ManifestRoot root = root_for("ROOT", "ROOT", "restored");
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "dir", "dir", SIDECAR_KIND_REGULAR, 7),
+        entry_for("ROOT", "dir-x", "dir-x", SIDECAR_KIND_REGULAR, 7),
+        entry_for("ROOT", "dir/child", "dir/child", SIDECAR_KIND_REGULAR, 1)
+    };
+    Fixture fixture;
+    int opened = fixture_open(&fixture, "file-ancestor-wedge", &root, 1);
+    check(opened == 0, "file-ancestor-wedge fixture is created");
+    if (opened != 0)
+        return;
+    check(write_sidecar(&fixture, entries, 3) == 0,
+          "file-ancestor-wedge sidecar is committed");
+    write_file_at(fixture.home_fd, "sentinel", "untouched");
+    char sentinel[PATH_MAX];
+    fixture_path(sentinel, sizeof(sentinel), fixture.home, "/sentinel");
+    PortableRestorePreflightReport report;
+    int result = run_preflight(&fixture, &report);
+    check(result != 0 && report.violation_count == 2 &&
+              file_equals(sentinel, "untouched"),
+          "lexical wedge does not hide file ancestor conflict");
+    portable_restore_preflight_report_free(&report);
+    fixture_close(&fixture);
+}
+
 static void test_overlapping_manifest_roots(void)
 {
     printf(BLUE "::" NC " overlapping manifest root payloads\n");
@@ -1173,6 +1201,86 @@ static void test_overlapping_manifest_roots(void)
     fixture_close(&fixture);
 }
 
+static void test_overlapping_manifest_roots_wedge(void)
+{
+    printf(BLUE "::" NC " overlapping roots with lexical wedge\n");
+    ManifestRoot roots[3] = {
+        root_for("PARENT", "shared", "restored-parent"),
+        root_for("SIBLING", "shared!", "restored-sibling"),
+        root_for("CHILD", "shared/nested", "restored-child")
+    };
+    Fixture fixture;
+    int opened = fixture_open(&fixture, "root-overlap-wedge", roots, 3);
+    check(opened == 0, "root-overlap-wedge fixture is created");
+    if (opened != 0)
+        return;
+    if (mkdirat(fixture.data_fd, "shared", 0700) != 0)
+        fatal("could not create overlapping root payload");
+    int shared_fd = openat(fixture.data_fd, "shared",
+                           O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (shared_fd < 0 || mkdirat(shared_fd, "nested", 0700) != 0)
+        fatal("could not create nested overlapping root payload");
+    if (close(shared_fd) != 0)
+        fatal("could not close overlapping root payload");
+    if (mkdirat(fixture.data_fd, "shared!", 0700) != 0)
+        fatal("could not create wedge sibling root payload");
+    SidecarEntry entries[] = {
+        entry_for("PARENT", "", "", SIDECAR_KIND_DIRECTORY, 0),
+        entry_for("SIBLING", "", "", SIDECAR_KIND_DIRECTORY, 0),
+        entry_for("CHILD", "", "", SIDECAR_KIND_DIRECTORY, 0)
+    };
+    check(write_sidecar(&fixture, entries, 3) == 0,
+          "root-overlap-wedge sidecar is committed");
+    write_file_at(fixture.home_fd, "sentinel", "untouched");
+    char sentinel[PATH_MAX];
+    fixture_path(sentinel, sizeof(sentinel), fixture.home, "/sentinel");
+    PortableRestorePreflightReport report;
+    int result = run_preflight(&fixture, &report);
+    check(result != 0 && report.violation_count == 1 &&
+              report.roots != NULL && report.roots[2].violation_count == 1 &&
+              file_equals(sentinel, "untouched"),
+          "lexical wedge does not hide overlapping manifest roots");
+    portable_restore_preflight_report_free(&report);
+    fixture_close(&fixture);
+}
+
+static void test_root_lookup_wedge(void)
+{
+    printf(BLUE "::" NC " root lookup with lexical wedge\n");
+    ManifestRoot roots[2] = {
+        root_for("NESTED", "config/nested", "restored-nested"),
+        root_for("SIBLING", "config/nested!", "restored-sibling")
+    };
+    Fixture fixture;
+    int opened = fixture_open(&fixture, "root-lookup-wedge", roots, 2);
+    check(opened == 0, "root-lookup-wedge fixture is created");
+    if (opened != 0)
+        return;
+    if (mkdirat(fixture.data_fd, "config", 0700) != 0)
+        fatal("could not create wedge fixture parent directory");
+    int config_fd = openat(fixture.data_fd, "config",
+                           O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (config_fd < 0 || mkdirat(config_fd, "nested", 0700) != 0 ||
+        mkdirat(config_fd, "nested!", 0700) != 0)
+        fatal("could not create wedge fixture root payloads");
+    write_file_at(config_fd, "nested/x", "payload");
+    if (close(config_fd) != 0)
+        fatal("could not close wedge fixture parent directory");
+    SidecarEntry entries[] = {
+        entry_for("NESTED", "", "", SIDECAR_KIND_DIRECTORY, 0),
+        entry_for("NESTED", "x", "x", SIDECAR_KIND_REGULAR, 7),
+        entry_for("SIBLING", "", "", SIDECAR_KIND_DIRECTORY, 0)
+    };
+    check(write_sidecar(&fixture, entries, 3) == 0,
+          "root-lookup-wedge sidecar is committed");
+    PortableRestorePreflightReport report;
+    int result = run_preflight(&fixture, &report);
+    check(result == 0 && report.violation_count == 0,
+          "root lookup succeeds");
+    portable_restore_preflight_report_free(&report);
+    fixture_close(&fixture);
+}
+
 int main(void)
 {
     test_valid_and_profiles();
@@ -1185,7 +1293,10 @@ int main(void)
     test_symlink_refusals();
     test_malformed_sidecars();
     test_raw_nul_and_root_gap();
+    test_file_ancestor_conflict_wedge();
     test_overlapping_manifest_roots();
+    test_overlapping_manifest_roots_wedge();
+    test_root_lookup_wedge();
     if (failures != 0)
     {
         printf(RED "%d portable restore preflight test(s) failed" NC "\n",

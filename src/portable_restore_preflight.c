@@ -165,13 +165,15 @@ static int collection_validate_manifest(Collection *collection)
         qsort(collection->root_order, report->root_count,
               sizeof(*collection->root_order), root_order_compare);
         root_order_manifest = NULL;
-        for (size_t index = 1; index < report->root_count; index++)
-            if (relative_paths_overlap(
-                    manifest->roots[collection->root_order[index - 1U]].payload_path,
-                    manifest->roots[collection->root_order[index]].payload_path))
-                report_violation(report,
-                                 collection->root_order[index],
-                                 manifest->roots[collection->root_order[index]].id);
+        /* strcmp adjacency does not preserve path ancestry: a sibling whose
+         * next byte sorts before '/' can sit between an ancestor and child.
+         * Root counts are bounded, and capture validates the same relation
+         * pairwise, so validate every pair here as well. */
+        for (size_t left = 0; left < report->root_count; left++)
+            for (size_t right = left + 1U; right < report->root_count; right++)
+                if (relative_paths_overlap(manifest->roots[left].payload_path,
+                                           manifest->roots[right].payload_path))
+                    report_violation(report, right, manifest->roots[right].id);
     }
     return report->violation_count == 0 ? 0 : -1;
 }
@@ -607,15 +609,6 @@ static int collect_entry(const SidecarLiveView *view, void *argument)
     return 0;
 }
 
-static int path_is_ancestor(const char *parent, const char *child)
-{
-    size_t parent_length = strlen(parent);
-    size_t child_length = strlen(child);
-    return parent_length < child_length &&
-           strncmp(parent, child, parent_length) == 0 &&
-           child[parent_length] == '/';
-}
-
 static int logical_order_compare(const void *left, const void *right)
 {
     const PreflightEntry *a = *(const PreflightEntry *const *)left;
@@ -647,6 +640,58 @@ static void entry_orders_free(PreflightMemory *memory, EntryOrders *orders)
     preflight_free(memory, orders->physical,
                    orders->count * sizeof(*orders->physical));
     memset(orders, 0, sizeof(*orders));
+}
+
+static PreflightEntry *find_physical(const EntryOrders *orders,
+                                     size_t root_index, const char *physical);
+
+static PreflightEntry *find_logical(const EntryOrders *orders,
+                                    size_t root_index, const char *logical)
+{
+    size_t left = 0;
+    size_t right = orders->count;
+    while (left < right)
+    {
+        size_t middle = left + (right - left) / 2U;
+        PreflightEntry *entry = orders->logical[middle];
+        int comparison;
+        if (entry->root_index < root_index)
+            comparison = -1;
+        else if (entry->root_index > root_index)
+            comparison = 1;
+        else
+            comparison = strcmp(entry->logical, logical);
+        if (comparison < 0)
+            left = middle + 1U;
+        else
+            right = middle;
+    }
+    if (left == orders->count)
+        return NULL;
+    PreflightEntry *entry = orders->logical[left];
+    return entry->root_index == root_index &&
+           strcmp(entry->logical, logical) == 0 ? entry : NULL;
+}
+
+/* collect_entry() already requires every non-root entry's immediate logical
+ * parent to exist (D21). Exact parent lookup therefore catches every
+ * non-directory ancestor without relying on strcmp adjacency. */
+static int entry_ancestor_conflict(const EntryOrders *orders,
+                                   const PreflightEntry *entry, int physical)
+{
+    const char *path = physical ? entry->physical : entry->logical;
+    const char *slash = strrchr(path, '/');
+    if (slash == NULL || (size_t)(slash - path) >= PATH_MAX)
+        return 0;
+
+    char parent[PATH_MAX];
+    size_t parent_length = (size_t)(slash - path);
+    memcpy(parent, path, parent_length);
+    parent[parent_length] = '\0';
+    PreflightEntry *found = physical
+        ? find_physical(orders, entry->root_index, parent)
+        : find_logical(orders, entry->root_index, parent);
+    return found != NULL && found->kind != SIDECAR_KIND_DIRECTORY;
 }
 
 static int analyze_entries(PreflightMemory *memory,
@@ -682,20 +727,22 @@ static int analyze_entries(PreflightMemory *memory,
     {
         PreflightEntry *previous = orders->logical[index - 1U];
         PreflightEntry *current = orders->logical[index];
-        if (previous->root_index != current->root_index)
-            continue;
-        if (strcmp(previous->logical, current->logical) == 0 ||
-            (previous->kind != SIDECAR_KIND_DIRECTORY &&
-             path_is_ancestor(previous->logical, current->logical)))
+        if (previous->root_index == current->root_index &&
+            strcmp(previous->logical, current->logical) == 0)
+            report_violation(report, current->root_index, current->logical);
+    }
+    for (size_t index = 0; index < orders->count; index++)
+    {
+        PreflightEntry *current = orders->logical[index];
+        if (entry_ancestor_conflict(orders, current, 0))
             report_violation(report, current->root_index, current->logical);
     }
     for (size_t index = 1; index < orders->count; index++)
     {
         PreflightEntry *previous = orders->physical[index - 1U];
         PreflightEntry *current = orders->physical[index];
-        if (previous->root_index != current->root_index)
-            continue;
-        if (strcmp(previous->physical, current->physical) == 0)
+        if (previous->root_index == current->root_index &&
+            strcmp(previous->physical, current->physical) == 0)
         {
             /* Unreachable via collect_entry() as of D.4b: every entry that
              * reaches this array has already passed the physical/logical
@@ -707,8 +754,11 @@ static int analyze_entries(PreflightMemory *memory,
                 report_violation(report, current->root_index,
                                  current->logical);
         }
-        else if (previous->kind != SIDECAR_KIND_DIRECTORY &&
-                 path_is_ancestor(previous->physical, current->physical))
+    }
+    for (size_t index = 0; index < orders->count; index++)
+    {
+        PreflightEntry *current = orders->physical[index];
+        if (entry_ancestor_conflict(orders, current, 1))
             report_violation(report, current->root_index, current->logical);
     }
     return 0;
@@ -732,45 +782,67 @@ static size_t root_order_lower_bound(const Collection *collection,
     return left;
 }
 
+static size_t root_order_find_exact(const Collection *collection,
+                                    const char *path)
+{
+    size_t position = root_order_lower_bound(collection, path);
+    if (position == collection->report->root_count)
+        return SIZE_MAX;
+    size_t root_index = collection->root_order[position];
+    return strcmp(collection->manifest->roots[root_index].payload_path, path) == 0
+        ? root_index : SIZE_MAX;
+}
+
 static size_t root_for_payload_path(const Collection *collection,
                                     const char *path,
                                     const char **relative_out)
 {
     if (collection->report->root_count == 0)
         return SIZE_MAX;
-    size_t position = root_order_lower_bound(collection, path);
-    if (position < collection->report->root_count &&
-        strcmp(collection->manifest->roots[
-                   collection->root_order[position]].payload_path, path) == 0)
+    /* An owning root must be an exact slash-delimited prefix of path. Walk
+     * those prefixes directly instead of trusting a lexical predecessor. */
+    size_t length = strlen(path);
+    for (;;)
     {
-        const ManifestRoot *root = &collection->manifest->roots[
-            collection->root_order[position]];
-        relative_path_prefix_match(root->payload_path, path, relative_out);
-        return collection->root_order[position];
+        if (length >= PATH_MAX)
+            return SIZE_MAX;
+        char candidate[PATH_MAX];
+        memcpy(candidate, path, length);
+        candidate[length] = '\0';
+        size_t root_index = root_order_find_exact(collection, candidate);
+        if (root_index != SIZE_MAX)
+        {
+            const ManifestRoot *root = &collection->manifest->roots[root_index];
+            relative_path_prefix_match(root->payload_path, path, relative_out);
+            return root_index;
+        }
+        const char *slash = memrchr(path, '/', length);
+        if (slash == NULL)
+            return SIZE_MAX;
+        length = (size_t)(slash - path);
     }
-    if (position == 0)
-        return SIZE_MAX;
-    position--;
-    const ManifestRoot *root = &collection->manifest->roots[
-        collection->root_order[position]];
-    if (relative_path_prefix_match(root->payload_path, path, relative_out))
-        return collection->root_order[position];
-    return SIZE_MAX;
 }
 
 static int root_has_descendant(const Collection *collection, const char *path)
 {
     if (collection->report->root_count == 0)
         return 0;
-    size_t position = root_order_lower_bound(collection, path);
-    if (position == collection->report->root_count)
-        return 0;
-    const char *candidate = collection->manifest->roots[
-        collection->root_order[position]].payload_path;
     size_t length = strlen(path);
-    return (length == 0 ||
-            (strncmp(candidate, path, length) == 0 &&
-             candidate[length] == '/'));
+    if (length == 0)
+        return 1;
+    /* All strings sharing path as a byte prefix form one contiguous block in
+     * strcmp order; inspect that block until the prefix stops matching. */
+    size_t position = root_order_lower_bound(collection, path);
+    for (; position < collection->report->root_count; position++)
+    {
+        const char *candidate = collection->manifest->roots[
+            collection->root_order[position]].payload_path;
+        if (strncmp(candidate, path, length) != 0)
+            break;
+        if (candidate[length] == '/')
+            return 1;
+    }
+    return 0;
 }
 
 static PreflightEntry *find_physical(const EntryOrders *orders,
