@@ -467,8 +467,21 @@ static int case_probe_prepare(PortableCaseProbeState *state)
     if (state->scratch_fd >= 0)
         return 0;
     case_fs_probe_count();
-    if (mkdirat(state->container_fd, PORTABLE_CASE_PROBE_DIR, 0700) != 0)
-        return -1;
+    if (mkdirat(state->container_fd, PORTABLE_CASE_PROBE_DIR, 0700) != 0) {
+        /* A prior capture may have been killed after creating this scratch
+         * directory but before case_probe_cleanup() removed it.  Clear a
+         * stale leftover and retry once instead of treating it as fatal
+         * forever; remove_directory_tree() safely fails without touching
+         * anything if this isn't actually our own directory (e.g. an
+         * unrelated file occupies the name). */
+        if (errno != EEXIST ||
+            remove_directory_tree(state->container_fd,
+                                  PORTABLE_CASE_PROBE_DIR) != 0)
+            return -1;
+        case_fs_probe_count();
+        if (mkdirat(state->container_fd, PORTABLE_CASE_PROBE_DIR, 0700) != 0)
+            return -1;
+    }
     state->scratch_created = 1;
     case_fs_probe_count();
     state->scratch_fd = openat(state->container_fd, PORTABLE_CASE_PROBE_DIR,

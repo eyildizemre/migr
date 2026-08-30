@@ -1739,6 +1739,60 @@ static void test_case_probe(const char *base)
     remove_tree(container_path);
 }
 
+static void test_stale_case_probe_directory_recovers(const char *base)
+{
+    printf(BLUE "::" NC " stale case-probe scratch directory recovers after a crash\n");
+    static const char *const non_ascii[] = {
+        "caf\xc3\xa9", "caf\xc3\x89"
+    };
+    char source_path[PATH_MAX];
+    char container_path[PATH_MAX];
+    join_path(source_path, sizeof(source_path), base, "stale-probe-source");
+    join_path(container_path, sizeof(container_path), base,
+              "stale-probe-container");
+    make_directory(source_path);
+    make_directory(container_path);
+    for (size_t index = 0; index < sizeof(non_ascii) / sizeof(non_ascii[0]);
+         index++) {
+        char path[PATH_MAX];
+        join_path(path, sizeof(path), source_path, non_ascii[index]);
+        write_file(path, "x", 1);
+    }
+    int container_fd = open(container_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open stale-probe container");
+
+    /* Simulate a capture killed after case_probe_prepare() created the
+     * scratch directory but before case_probe_cleanup() removed it, with
+     * some leftover in-flight content still inside. */
+    if (mkdirat(container_fd, CASE_PROBE_DIR, 0700) != 0)
+        fixture_fatal("could not simulate stale case-probe scratch directory");
+    int stale_fd = openat(container_fd, CASE_PROBE_DIR,
+                          O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (stale_fd < 0 || mkdirat(stale_fd, "leftover-pair-0", 0700) != 0)
+        fixture_fatal("could not simulate stale case-probe leftover content");
+    close(stale_fd);
+
+    PortableRootSpec root = root_spec("CASE", source_path, "CASE");
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .roots = &root,
+        .root_count = 1,
+        .nsec_exact = 1,
+        .case_sensitive = 0
+    };
+    PortablePrescanReport report;
+    portable_prescan_report_init(&report);
+    check(portable_capture_fresh_at(container_fd, &request, &report) == 0,
+          "capture recovers from a stale case-probe scratch directory instead of failing forever");
+    check(missing_container_entry(container_fd, CASE_PROBE_DIR),
+          "the stale scratch directory is cleared, not left behind");
+    portable_prescan_report_free(&report);
+    close(container_fd);
+    remove_tree(source_path);
+    remove_tree(container_path);
+}
+
 static void test_entry_helpers(const char *source)
 {
     printf(BLUE "::" NC " portable entry helpers\n");
@@ -3937,6 +3991,7 @@ int main(void)
     test_collision_resume_renumbering(root_path);
     test_collision_foreign_resume(root_path);
     test_case_probe(root_path);
+    test_stale_case_probe_directory_recovers(root_path);
     test_encoded_payload_names(root_path);
     test_nested_encoded_directories(root_path);
     test_name_and_path_limits(root_path);
