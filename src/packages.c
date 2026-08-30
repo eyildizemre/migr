@@ -434,6 +434,11 @@ void restore_packages(int source_root_fd, const char *home, int *had_error)
                 }
             }
         }
+        else
+        {
+            print_error("Error: Could not allocate package install batch\n");
+            *had_error = 1;
+        }
     }
 
     if (pkgs != NULL)

@@ -105,7 +105,7 @@ $(TEST_FD_LIMIT): tests/test_fd_limit.c utils.o
 	$(CC) $(CFLAGS) -o $@ tests/test_fd_limit.c utils.o
 
 $(TEST_PACKAGES): tests/test_packages.c packages.o fileops.o detect.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o manifest.o encoding.o utils.o
-	$(CC) $(CFLAGS) -o $@ tests/test_packages.c packages.o fileops.o detect.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o manifest.o encoding.o utils.o
+	$(CC) $(CFLAGS) -Wl,--wrap=malloc -o $@ tests/test_packages.c packages.o fileops.o detect.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o manifest.o encoding.o utils.o
 
 $(TEST_XDG): tests/test_xdg.c xdg.o utils.o
 	$(CC) $(CFLAGS) -o $@ tests/test_xdg.c xdg.o utils.o
