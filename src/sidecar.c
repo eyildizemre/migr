@@ -386,7 +386,7 @@ static int validate_entry(const SidecarEntry *entry)
         if (entry->symlink_target.length != 0 ||
             entry->xattr_count != 0 ||
             validate_bytes(entry->hardlink_root_id, SIDECAR_MAX_ROOT_ID, 1) != 0 ||
-            validate_bytes(entry->hardlink_logical_path, SIDECAR_MAX_PATH, 1) != 0)
+            validate_bytes(entry->hardlink_logical_path, SIDECAR_MAX_PATH, 0) != 0)
         {
             set_invalid_error();
             return -1;
@@ -973,8 +973,7 @@ static SidecarStatus parse_entry(SidecarReader *reader, SidecarEntry *entry)
                                      &entry->hardlink_logical_path);
         if (status != SIDECAR_STATUS_OK)
             goto fail;
-        if (entry->hardlink_root_id.length == 0 ||
-            entry->hardlink_logical_path.length == 0)
+        if (entry->hardlink_root_id.length == 0)
         {
             status = SIDECAR_STATUS_CORRUPT;
             goto fail;

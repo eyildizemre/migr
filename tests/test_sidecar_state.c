@@ -523,16 +523,31 @@ static void test_sequence_and_hardlink_guards(int container_fd)
           memcmp(view.entry->hardlink_logical_path.data, "file", 4) == 0,
           "hardlink reference fields are copied into the state map");
 
+    SidecarEntry empty_logical = entry_for("ROOT", "copy2", "payload/copy2",
+                                           0, 0);
+    empty_logical.kind = SIDECAR_KIND_HARDLINK;
+    empty_logical.hardlink_root_id = empty_logical.root_id;
+    empty_logical.hardlink_logical_path = (SidecarBytes){ NULL, 0 };
+    SidecarClaim empty_logical_claim = claim_for(
+        "ROOT", "copy2", "payload/copy2", SIDECAR_KIND_HARDLINK);
+    check(sidecar_log_append_claim(&log, &empty_logical_claim) ==
+              SIDECAR_STATUS_OK &&
+              sidecar_log_append_entry(&log, &empty_logical) ==
+                  SIDECAR_STATUS_OK &&
+              sidecar_log_append_entry_commit(&log) == SIDECAR_STATUS_OK,
+          "hardlink entry with empty logical reference is accepted by the state map");
+    check(sidecar_log_find(&log, empty_logical.root_id,
+                           empty_logical.logical_path, &view) == 1 &&
+              view.entry != NULL &&
+              view.entry->kind == SIDECAR_KIND_HARDLINK &&
+              view.entry->hardlink_logical_path.length == 0,
+          "empty hardlink logical reference is stored correctly");
+
     SidecarEntry invalid = hardlink;
     invalid.hardlink_root_id = (SidecarBytes){ NULL, 0 };
     check(sidecar_log_append_entry(&log, &invalid) ==
               SIDECAR_STATUS_INVALID_ARGUMENT,
           "hardlink missing root reference is refused by the state map");
-    invalid = hardlink;
-    invalid.hardlink_logical_path = (SidecarBytes){ NULL, 0 };
-    check(sidecar_log_append_entry(&log, &invalid) ==
-              SIDECAR_STATUS_INVALID_ARGUMENT,
-          "hardlink missing logical reference is refused by the state map");
     invalid = hardlink;
     invalid.xattr_count = 1;
     check(sidecar_log_append_entry(&log, &invalid) ==
@@ -549,7 +564,7 @@ static void test_sequence_and_hardlink_guards(int container_fd)
           "guard log closes");
 
     check(sidecar_log_adopt_at(container_fd, &log) == SIDECAR_OPEN_RESUMABLE &&
-          sidecar_log_live_count(&log) == 3,
+          sidecar_log_live_count(&log) == 4,
           "adopted state retains symlink and hardlink entries");
     check(sidecar_log_find(&log, symlink.root_id, symlink.logical_path, &view) == 1 &&
           view.entry != NULL && view.entry->symlink_target.length == 6 &&
@@ -566,6 +581,12 @@ static void test_sequence_and_hardlink_guards(int container_fd)
           view.entry->hardlink_logical_path.length == 4 &&
           memcmp(view.entry->hardlink_logical_path.data, "file", 4) == 0,
           "adopted hardlink reference fields remain byte-exact");
+    check(sidecar_log_find(&log, empty_logical.root_id,
+                           empty_logical.logical_path, &view) == 1 &&
+              view.entry != NULL &&
+              view.entry->kind == SIDECAR_KIND_HARDLINK &&
+              view.entry->hardlink_logical_path.length == 0,
+          "adopted empty hardlink logical reference remains valid");
     check(sidecar_log_close(&log) == SIDECAR_STATUS_OK,
           "adopted guard log closes");
 }

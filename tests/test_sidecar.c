@@ -600,6 +600,7 @@ static int symlink_roundtrip_callback(const SidecarRecord *record,
 typedef struct {
     int entries;
     int valid;
+    int expect_empty_logical;
 } HardlinkRoundTripState;
 
 static int hardlink_roundtrip_callback(const SidecarRecord *record,
@@ -611,11 +612,16 @@ static int hardlink_roundtrip_callback(const SidecarRecord *record,
 
     const SidecarEntry *entry = &record->value.entry;
     state->entries++;
+    int logical_matches = state->expect_empty_logical
+                              ? entry->hardlink_logical_path.length == 0 &&
+                                    entry->hardlink_logical_path.data != NULL
+                              : entry->hardlink_logical_path.length == 8 &&
+                                    memcmp(entry->hardlink_logical_path.data,
+                                           "dir/file", 8) == 0;
     if (entry->kind != SIDECAR_KIND_HARDLINK || entry->size != 0 ||
         entry->xattr_count != 0 || entry->hardlink_root_id.length != 4 ||
         memcmp(entry->hardlink_root_id.data, "ROOT", 4) != 0 ||
-        entry->hardlink_logical_path.length != 8 ||
-        memcmp(entry->hardlink_logical_path.data, "dir/file", 8) != 0 ||
+        !logical_matches ||
         entry->symlink_target.length != 0)
         state->valid = 0;
     return 0;
@@ -706,10 +712,19 @@ static void test_symlink_and_hardlink_writer(int fd)
     entry.xattr_count = 0;
     entry.hardlink_root_id = entry.root_id;
     entry.hardlink_logical_path = (SidecarBytes){ NULL, 0 };
-    errno = 0;
     check(reset_file(fd) == 0 && sidecar_write_header(fd) == 0 &&
-          sidecar_write_entry(fd, &entry) != 0 && errno == EINVAL,
-          "hardlink missing logical reference is rejected");
+          sidecar_write_entry(fd, &entry) == 0 &&
+          sidecar_write_entry_commit(fd) == 0,
+          "hardlink entry with empty logical reference writes");
+
+    HardlinkRoundTripState empty_logical_state = {
+        .valid = 1,
+        .expect_empty_logical = 1
+    };
+    check(sidecar_parse_fd(fd, hardlink_roundtrip_callback,
+                           &empty_logical_state, &result) == SIDECAR_STATUS_OK &&
+              empty_logical_state.valid && empty_logical_state.entries == 1,
+          "hardlink entry with empty logical reference round-trips");
 
     entry.hardlink_logical_path = entry.logical_path;
     entry.xattr_count = 1;

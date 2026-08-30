@@ -745,7 +745,6 @@ int entry_from_stat(const char *root_id, const char *logical,
          hardlink_root_id->length > SIDECAR_MAX_ROOT_ID ||
          memchr(hardlink_root_id->data, '\0', hardlink_root_id->length) != NULL ||
          hardlink_logical_path->data == NULL ||
-         hardlink_logical_path->length == 0 ||
          hardlink_logical_path->length > SIDECAR_MAX_PATH ||
          memchr(hardlink_logical_path->data, '\0',
                 hardlink_logical_path->length) != NULL))

@@ -3450,6 +3450,65 @@ static void test_portable_hardlinks_cross_root(const char *base)
     remove_tree(container);
 }
 
+static void test_portable_hardlinks_cross_root_bare_file(const char *base)
+{
+    printf(BLUE "::" NC " portable hardlink groups across roots with a bare-file representative\n");
+    char source_a[PATH_MAX];
+    char source_b[PATH_MAX];
+    char container[PATH_MAX];
+    char file_b[PATH_MAX];
+    join_path(source_a, sizeof(source_a), base, "hardlink-cross-bare-a");
+    join_path(source_b, sizeof(source_b), base, "hardlink-cross-bare-b");
+    join_path(container, sizeof(container), base,
+              "hardlink-cross-bare-container");
+    join_path(file_b, sizeof(file_b), source_b, "alias");
+    make_directory(source_b);
+    make_directory(container);
+    write_file(source_a, "cross-root", 10);
+    if (link(source_a, file_b) != 0)
+        fixture_fatal("could not create bare-file cross-root hardlink");
+
+    int container_fd = open(container, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open bare-file cross-root hardlink container");
+    PortableRootSpec roots[] = {
+        root_spec("ROOT_A", source_a, "A"),
+        root_spec("ROOT_B", source_b, "B")
+    };
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .roots = roots,
+        .root_count = 2,
+        .nsec_exact = 1,
+        .case_sensitive = 1
+    };
+    check(portable_capture_fresh_at(container_fd, &request, NULL) == 0,
+          "cross-root hardlink capture succeeds when the representative is a bare-file root");
+
+    SidecarLog log = {0};
+    SidecarOpenStatus status = sidecar_log_adopt_at(container_fd, &log);
+    SidecarLiveView first = {0};
+    SidecarLiveView second = {0};
+    int found = status == SIDECAR_OPEN_RESUMABLE &&
+                sidecar_log_find(&log, bytes("ROOT_A"), bytes(""),
+                                 &first) == 1 &&
+                sidecar_log_find(&log, bytes("ROOT_B"), bytes("alias"),
+                                 &second) == 1;
+    check(found && first.entry->kind == SIDECAR_KIND_REGULAR &&
+              second.entry->kind == SIDECAR_KIND_HARDLINK,
+          "the second root records a cross-root HARDLINK");
+    check(found && sidecar_bytes_match_text(second.entry->hardlink_root_id,
+                                            "ROOT_A") &&
+              second.entry->hardlink_logical_path.length == 0,
+          "cross-root HARDLINK references the bare-file representative's empty logical path");
+    if (status == SIDECAR_OPEN_RESUMABLE)
+        sidecar_log_close(&log);
+    close(container_fd);
+    remove_tree(source_a);
+    remove_tree(source_b);
+    remove_tree(container);
+}
+
 static void test_portable_hardlinks_collision(const char *base)
 {
     printf(BLUE "::" NC " hardlinks under a suffixed collision parent\n");
@@ -3772,6 +3831,7 @@ int main(void)
     test_portable_hardlinks(root_path);
     test_portable_hardlinks_sticky_seed(root_path);
     test_portable_hardlinks_cross_root(root_path);
+    test_portable_hardlinks_cross_root_bare_file(root_path);
     test_portable_hardlinks_collision(root_path);
     test_capture_context_flags(root_path);
     test_replacement_and_type_change(source_path, root_path);
