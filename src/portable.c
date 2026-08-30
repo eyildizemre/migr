@@ -340,8 +340,12 @@ int safe_relative_path(const char *path)
 int portable_payload_path_fits(size_t root_length, size_t physical_length,
                                size_t capacity)
 {
-    return root_length != 0 && root_length < capacity &&
-           physical_length <= capacity - root_length - 1U;
+    if (root_length == 0 || root_length >= capacity)
+        return 0;
+    size_t remaining = capacity - root_length - 1U;
+    if (physical_length == 0)
+        return 1;
+    return remaining >= 1U && physical_length <= remaining - 1U;
 }
 
 int portable_collision_suffix_parse(const char *data, size_t length,

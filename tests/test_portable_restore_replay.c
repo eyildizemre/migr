@@ -17,6 +17,7 @@
 #include <unistd.h>
 
 #include "manifest.h"
+#include "portable.h"
 #include "portable_restore.h"
 #include "sidecar.h"
 
@@ -64,6 +65,22 @@ static void fatal(const char *message)
 {
     fprintf(stderr, "portable restore replay fixture failure: %s\n", message);
     exit(2);
+}
+
+static void test_payload_path_fits_boundary(void)
+{
+    check(portable_payload_path_fits(5U, 0U, 6U),
+          "payload root plus NUL exactly fits");
+    check(!portable_payload_path_fits(5U, 0U, 5U),
+          "payload root cannot consume the full capacity");
+    check(!portable_payload_path_fits(5U, 4U, 10U),
+          "payload path rejects the former off-by-one boundary");
+    check(portable_payload_path_fits(5U, 3U, 10U),
+          "payload path accepts an exact root slash physical NUL fit");
+    check(!portable_payload_path_fits(0U, 1U, 10U),
+          "payload path rejects an empty root");
+    check(!portable_payload_path_fits(10U, 0U, 10U),
+          "payload path rejects a root at capacity");
 }
 
 static int remove_callback(const char *path, const struct stat *st,
@@ -1339,6 +1356,7 @@ static void test_tombstone_skipped(void)
 
 int main(void)
 {
+    test_payload_path_fits_boundary();
     test_symlink_collection_validation();
     test_hardlink_identity_validation();
     test_physical_logical_mismatch();
