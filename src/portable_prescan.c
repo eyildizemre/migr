@@ -1544,7 +1544,11 @@ static int prescan_request_internal(int container_fd,
                                     PortablePrescanReport *report,
                                     int reject_violations)
 {
-    if (container_fd < 0 || request == NULL || report == NULL)
+    if (container_fd < 0 || request == NULL || report == NULL ||
+        request->scope < MANIFEST_SCOPE_CRITICAL ||
+        request->scope > MANIFEST_SCOPE_EXPLICIT ||
+        request->root_count > MANIFEST_MAX_ROOTS ||
+        (request->root_count != 0 && request->roots == NULL))
         return -1;
     PortableCaseProbeState probe_state = {
         .container_fd = container_fd,

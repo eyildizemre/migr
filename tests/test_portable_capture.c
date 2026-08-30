@@ -40,6 +40,8 @@
 
 #include "manifest.h"
 #include "portable.h"
+#include "portable_prescan_internal.h" /* Direct prescan_request() validation
+                                        * coverage uses this internal seam. */
 #include "sidecar.h"
 
 extern int entry_from_stat(const char *root_id, const char *logical,
@@ -1736,6 +1738,46 @@ static void test_case_probe(const char *base)
         fixture_fatal("could not remove probe failure marker");
     close(container_fd);
     remove_tree(source_path);
+    remove_tree(container_path);
+}
+
+static void test_prescan_request_validates_malformed_input(const char *base)
+{
+    printf(BLUE "::" NC " prescan request input validation\n");
+    char container_path[PATH_MAX];
+    join_path(container_path, sizeof(container_path), base,
+              "prescan-request-validation-container");
+    make_directory(container_path);
+    int container_fd = open(container_path,
+                            O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open prescan-request-validation container");
+
+    /* A count above one exercises the invalid non-NULL pointer produced by
+     * indexing past a NULL roots base, rather than only the index-zero case. */
+    PortableCaptureRequest null_roots = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .roots = NULL,
+        .root_count = 4
+    };
+    PortablePrescanReport report;
+    portable_prescan_report_init(&report);
+    check(prescan_request(container_fd, &null_roots, &report) != 0,
+          "prescan_request refuses a nonzero root count with no roots array");
+    portable_prescan_report_free(&report);
+
+    PortableRootSpec placeholder = {0};
+    PortableCaptureRequest bad_scope = {
+        .scope = (ManifestScope)99,
+        .roots = &placeholder,
+        .root_count = 0
+    };
+    portable_prescan_report_init(&report);
+    check(prescan_request(container_fd, &bad_scope, &report) != 0,
+          "prescan_request refuses a scope outside the manifest enum range");
+    portable_prescan_report_free(&report);
+
+    close(container_fd);
     remove_tree(container_path);
 }
 
@@ -3991,6 +4033,7 @@ int main(void)
     test_collision_resume_renumbering(root_path);
     test_collision_foreign_resume(root_path);
     test_case_probe(root_path);
+    test_prescan_request_validates_malformed_input(root_path);
     test_stale_case_probe_directory_recovers(root_path);
     test_encoded_payload_names(root_path);
     test_nested_encoded_directories(root_path);
