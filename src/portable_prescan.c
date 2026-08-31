@@ -871,7 +871,8 @@ static int case_probe_group(PortableCaseProbeState *state,
 
     PortableCollisionAssignment *assignments = calloc(
         group->count, sizeof(*assignments));
-    int failed = assignments == NULL;
+    int *excluded = calloc(group->count, sizeof(*excluded));
+    int failed = assignments == NULL || excluded == NULL;
     if (!failed) {
         for (size_t index = 0; index < group->count; index++) {
             assignments[index].encoded = group->encoded_names[index];
@@ -901,8 +902,8 @@ static int case_probe_group(PortableCaseProbeState *state,
                 (void)prescan_record_violation(
                     report, root_id, assignments[index].logical,
                     PORTABLE_PRESCAN_PATH_TOO_LONG, PATH_MAX, actual_path);
-            failed = 1;
-            break;
+            excluded[index] = 1;
+            continue;
         }
         if (case_probe_reserved_name_contains(reserved_names, payload_path,
                                               physical)) {
@@ -958,6 +959,8 @@ static int case_probe_group(PortableCaseProbeState *state,
     PortableCaseFoldSet reserved_leaves = {0};
     if (!failed && collision) {
         for (size_t index = 0; index < group->count && !failed; index++) {
+            if (excluded[index])
+                continue;
             uint64_t suffix_number = index == 0 ? 0 : 1;
             for (;;) {
                 if (collision_suffix_format(
@@ -985,7 +988,7 @@ static int case_probe_group(PortableCaseProbeState *state,
                             report, root_id, assignments[index].logical,
                             PORTABLE_PRESCAN_PATH_TOO_LONG, PATH_MAX,
                             actual_path);
-                    failed = 1;
+                    excluded[index] = 1;
                     break;
                 }
                 char reservation_key[SIDECAR_MAX_PATH + 1U];
@@ -1045,13 +1048,15 @@ static int case_probe_group(PortableCaseProbeState *state,
     if (!failed && collision) {
         size_t representative = SIZE_MAX;
         for (size_t index = 0; index < group->count; index++)
-            if (assignments[index].suffix[0] == '\0') {
+            if (!excluded[index] && assignments[index].suffix[0] == '\0') {
                 representative = index;
                 break;
             }
         if (representative == SIZE_MAX)
             representative = 0;
         for (size_t index = 0; index < group->count && !failed; index++) {
+            if (excluded[index])
+                continue;
             char leaf[SIDECAR_MAX_PATH + 1U];
             char physical[SIDECAR_MAX_PATH + 1U];
             size_t actual_name = 0;
@@ -1080,6 +1085,7 @@ static int case_probe_group(PortableCaseProbeState *state,
     case_fold_set_free(&names);
     case_fold_set_free(&reserved_leaves);
     free(assignments);
+    free(excluded);
     return failed ? -1 : 0;
 }
 

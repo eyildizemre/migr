@@ -1050,6 +1050,99 @@ static void test_mixed_prescan_violations(const char *base)
     remove_tree(container_path);
 }
 
+/* A collision suffix (e.g. "%7E1") can push an otherwise-fitting name past
+ * NAME_MAX even though the same name with no suffix fits comfortably -- a
+ * narrower case than test_name_and_path_limits' plain oversized name, only
+ * reachable once two names actually collide and one of them loses the
+ * tie-break. Per the documented best-effort contract, portable_collision_
+ * plan_build() must record the violation and keep planning everything
+ * else, not hard-abort the whole pre-scan (docs/DECISIONS.md D21, F-4/F-6).
+ */
+static void test_collision_plan_suffix_length_violation(const char *base)
+{
+    printf(BLUE "::" NC
+           " collision suffix pushes an otherwise-fitting name over NAME_MAX\n");
+
+    char winner[NAME_MAX + 1U];
+    char loser[NAME_MAX + 1U];
+    size_t fitting_length = (size_t)NAME_MAX - 2U;
+    memset(winner, 'a', fitting_length);
+    winner[0] = 'A';
+    winner[fitting_length] = '\0';
+    memset(loser, 'a', fitting_length);
+    loser[fitting_length] = '\0';
+
+    char source_path[PATH_MAX];
+    char container_path[PATH_MAX];
+    join_path(source_path, sizeof(source_path), base,
+              "collision-suffix-overflow-source");
+    join_path(container_path, sizeof(container_path), base,
+              "collision-suffix-overflow-container");
+    make_directory(source_path);
+    make_directory(container_path);
+    char path[PATH_MAX];
+    join_path(path, sizeof(path), source_path, winner);
+    write_file(path, "w", 1);
+    join_path(path, sizeof(path), source_path, loser);
+    write_file(path, "l", 1);
+
+    int container_fd = open(container_path,
+                             O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open collision-suffix-overflow container");
+    PortableRootSpec root = root_spec("CASE", source_path, "CASE");
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .roots = &root,
+        .root_count = 1,
+        .nsec_exact = 1,
+        .case_sensitive = 0
+    };
+    PortablePrescanReport report;
+    portable_prescan_report_init(&report);
+    int result = portable_collision_plan_build(container_fd, &request,
+                                                &report);
+
+    const PortableCollisionPlanEntry *kept =
+        portable_collision_plan_find(&report.collision_plan, "CASE", winner);
+    /* Directory traversal separately records the ASCII case-collision itself
+     * (already correct, pre-existing behavior) before case_probe_group() ever
+     * assigns suffixes; readdir order decides which of the two names that
+     * collision example names, so only its count is asserted here -- the
+     * point of this test is the NAME_TOO_LONG side, searched for below by
+     * kind rather than by a fixed index. */
+    check(result == 0 && report.total_count == 2 &&
+              report.collision_count == 1 && report.unresolved_count == 1 &&
+              report.collision_plan.count == 1 &&
+              collision_plan_entry_matches(kept, "CASE", winner, winner, ""),
+          "the plan is still built and the fitting sibling still gets its "
+          "unsuffixed slot, instead of the whole pre-scan aborting");
+    check(portable_collision_plan_find(&report.collision_plan, "CASE",
+                                       loser) == NULL,
+          "the sibling whose suffix would overflow NAME_MAX is left out of "
+          "the plan rather than crashing it");
+
+    const PortablePrescanViolation *overflow = NULL;
+    for (size_t index = 0; index < report.example_count; index++)
+        if (report.examples[index].kind == PORTABLE_PRESCAN_NAME_TOO_LONG)
+            overflow = &report.examples[index];
+    check(report.example_count == 2 && overflow != NULL &&
+              strcmp(overflow->root_id, "CASE") == 0 &&
+              strcmp(overflow->logical_path, loser) == 0 &&
+              overflow->limit == NAME_MAX &&
+              overflow->actual == fitting_length + 4U,
+          "the suffixed overflow is recorded with the exact NAME_MAX limit "
+          "and the suffixed length, not the plain one");
+    check(empty_capture_container(container_fd),
+          "plan-build pre-scan reporting the overflow does not mutate the "
+          "container");
+
+    portable_prescan_report_free(&report);
+    close(container_fd);
+    remove_tree(source_path);
+    remove_tree(container_path);
+}
+
 static void test_case_collision_report_cap(const char *base)
 {
     printf(BLUE "::" NC " bounded case-collision report\n");
@@ -4026,6 +4119,7 @@ int main(void)
     test_case_collision_prescan(root_path);
     test_collision_plan(root_path);
     test_mixed_prescan_violations(root_path);
+    test_collision_plan_suffix_length_violation(root_path);
     test_case_collision_report_cap(root_path);
     test_case_collision_directory_scope(root_path);
     test_capture_source_plan_mismatch(root_path);
