@@ -3722,6 +3722,16 @@ int run_command_capture(char *const argv[], char *output, size_t output_size)
         }
         output[total] = '\0'; // Null-terminate the output string
 
+        // The buffer may have filled while the child still had more to write.
+        // Closing the read end now would make its next write() raise SIGPIPE,
+        // killing it before it reaches its own normal exit -- keep draining
+        // (and discarding) the pipe until the child's write end genuinely
+        // closes, so truncation stays silent the way this function documents
+        // instead of also corrupting the reported exit status.
+        char discard[4096];
+        while (read(pipefd[0], discard, sizeof(discard)) > 0)
+            ;
+
         close(pipefd[0]); // Close the read end of the pipe
         int status;
         if (waitpid(pid, &status, 0) == -1)

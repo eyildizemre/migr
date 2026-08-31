@@ -58,6 +58,19 @@ int main(void)
               small[sizeof(small) - 1] == '\0',
           "captured output is truncated safely while preserving the child's exit code");
 
+    // "0123456789abcdef" (17 bytes) fits in a single write() well under the
+    // pipe's own kernel buffer (~64 KB), so it can't reproduce a child that's
+    // still writing when the capture buffer fills. seq's multi-megabyte
+    // output forces the child to block on write() past that point, which is
+    // what actually exercises the SIGPIPE race this test guards against.
+    char truncated[4096];
+    char *const seq_argv[] = { "seq", "1", "500000", NULL };
+    rc = run_command_capture(seq_argv, truncated, sizeof(truncated));
+    check(rc == 0 && strlen(truncated) == sizeof(truncated) - 1 &&
+              truncated[sizeof(truncated) - 1] == '\0',
+          "output far exceeding both the capture buffer and the pipe buffer "
+          "still reports the child's real exit code, not a SIGPIPE-death -1");
+
     check(run_command_capture(echo_argv, NULL, sizeof(output)) == -1,
           "a NULL output buffer is rejected before anything is spawned");
     check(run_command_capture(echo_argv, output, 0) == -1,
