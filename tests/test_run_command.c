@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -21,6 +22,25 @@ static void check(int condition, const char *label)
         printf("  " RED "x" NC " %s\n", label);
         failures++;
     }
+}
+
+// run_command_capture()'s own capture loop is the only read() this binary
+// calls once armed, so a one-shot fire-on-the-next-call trigger (no fd or
+// path match needed) is enough to simulate a signal landing mid-capture.
+static int eintr_enabled;
+static int eintr_triggered;
+
+extern ssize_t __real_read(int fd, void *buf, size_t count);
+
+ssize_t __wrap_read(int fd, void *buf, size_t count)
+{
+    if (eintr_enabled && !eintr_triggered && count > 0)
+    {
+        eintr_triggered = 1;
+        errno = EINTR;
+        return -1;
+    }
+    return __real_read(fd, buf, count);
 }
 
 int main(void)
@@ -70,6 +90,27 @@ int main(void)
               truncated[sizeof(truncated) - 1] == '\0',
           "output far exceeding both the capture buffer and the pipe buffer "
           "still reports the child's real exit code, not a SIGPIPE-death -1");
+
+    // A read() interrupted by EINTR must be retried, not treated as EOF --
+    // otherwise a signal arriving mid-capture (SIGCHLD from an unrelated
+    // fork, a progress handler, etc.) silently truncates the captured output
+    // with no error signaled. seq 1 3000's output (13893 bytes) is well
+    // under the 16384-byte capture buffer here, so without the fix -- the
+    // wrapper fires the EINTR on the very first read(), before any real data
+    // has arrived -- capture would stop with an empty buffer instead of the
+    // full output; this is a stronger discriminator than the earlier
+    // buffer-overflowing fixtures above, which would truncate to the same
+    // final size whether or not EINTR is retried.
+    char eintr_output[16384];
+    char *const seq_small_argv[] = { "seq", "1", "3000", NULL };
+    eintr_triggered = 0;
+    eintr_enabled = 1;
+    rc = run_command_capture(seq_small_argv, eintr_output, sizeof(eintr_output));
+    eintr_enabled = 0;
+    check(eintr_triggered && rc == 0 && strlen(eintr_output) == 13893 &&
+              strncmp(eintr_output, "1\n2\n3\n4\n5\n", 10) == 0 &&
+              strcmp(eintr_output + 13893 - 10, "2999\n3000\n") == 0,
+          "a read() interrupted mid-capture by EINTR is retried, not treated as EOF");
 
     check(run_command_capture(echo_argv, NULL, sizeof(output)) == -1,
           "a NULL output buffer is rejected before anything is spawned");

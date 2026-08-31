@@ -3738,9 +3738,14 @@ int run_command_capture(char *const argv[], char *output, size_t output_size)
         close(pipefd[1]); // Close the write end of the pipe
 
         size_t total = 0;
-        ssize_t bytes_read;
-        while ((bytes_read = read(pipefd[0], output + total, output_size - total - 1)) > 0)
+        for (;;)
         {
+            ssize_t bytes_read = read(pipefd[0], output + total,
+                                      output_size - total - 1);
+            if (bytes_read < 0 && errno == EINTR)
+                continue;
+            if (bytes_read <= 0)
+                break;
             total += bytes_read;
         }
         output[total] = '\0'; // Null-terminate the output string

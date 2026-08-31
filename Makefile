@@ -114,7 +114,7 @@ $(TEST_GET_DIR_SIZE): tests/test_get_dir_size.c fileops.o metadata.o metadata_xa
 	$(CC) $(CFLAGS) -o $@ tests/test_get_dir_size.c fileops.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o manifest.o encoding.o utils.o
 
 $(TEST_RUN_COMMAND): tests/test_run_command.c fileops.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o manifest.o encoding.o utils.o
-	$(CC) $(CFLAGS) -o $@ tests/test_run_command.c fileops.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o manifest.o encoding.o utils.o
+	$(CC) $(CFLAGS) -Wl,--wrap=read -o $@ tests/test_run_command.c fileops.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o manifest.o encoding.o utils.o
 
 $(TEST_SPECIAL_FILES): tests/test_special_files.c fileops_test.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o manifest.o encoding.o utils.o
 	$(CC) $(CFLAGS) -DFILEOPS_TEST_HOOKS -DBACKUP_TEST_HOOKS -Wl,--wrap=readlink -o $@ tests/test_special_files.c fileops_test.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o manifest.o encoding.o utils.o
