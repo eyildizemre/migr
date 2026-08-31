@@ -1450,14 +1450,24 @@ test_container_production() {
     fi
 
     # --- dry-run creates nothing at all, not even the destination root ---
+    # `cp_dry` (the parent) exists; `never_created` (the actual destination)
+    # does not -- the common first-time-use case (e.g. a subdirectory not yet
+    # made on a fresh mount). The preview must still reflect the real
+    # destination filesystem (falling back to the parent), not silently skip
+    # size/space/capability checks just because the leaf isn't there yet.
     local dry_dest="$TEST_DIR/cp_dry/never_created"
     mkdir -p "$TEST_DIR/cp_dry"
-    ../migr backup "$dry_dest" --critical --dry-run >/dev/null 2>&1
+    local dry_out
+    dry_out=$(../migr backup "$dry_dest" --critical --dry-run 2>&1)
     if [ -e "$dry_dest" ]; then
         echo -e "  ${RED}✗${NC} Dry run created the destination root"
         exit 1
     else
         echo -e "  ${GREEN}✓${NC} Dry run creates no target, container, data/ or control file."
+        assert_contains "$dry_out" "Estimated backup size:"
+        assert_contains "$dry_out" "Destination free space:"
+        assert_contains "$dry_out" \
+            "does not exist yet; the preview below reflects its parent directory's filesystem instead."
     fi
 
     # --- two consecutive backups produce two distinct finalized containers ---

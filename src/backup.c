@@ -899,6 +899,47 @@ static int backup_metadata_inventory(const char *source_path, int anchor_fd,
     return failed ? -1 : 0;
 }
 
+// backup_dry_run()'s advisory probes only need an fd on the filesystem
+// `target` would land on -- exactly what a live run's mkdir(target) requires
+// its parent to already provide. So when target doesn't exist yet (the
+// common first-time-use case), fall back to opening its parent instead of
+// leaving the whole preview silently skipped; *out_used_parent tells the
+// caller which one it got, for an accurate preview note.
+static int open_advisory_probe_fd(const char *target, int *out_used_parent)
+{
+    *out_used_parent = 0;
+    int fd = open(target, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd >= 0 || errno != ENOENT)
+        return fd;
+
+    char *copy = strdup(target);
+    if (copy == NULL)
+        return -1;
+    size_t len = strlen(copy);
+    while (len > 1 && copy[len - 1] == '/')
+        copy[--len] = '\0';
+    char *slash = strrchr(copy, '/');
+    const char *parent;
+    if (slash == NULL)
+        parent = ".";
+    else if (slash == copy)
+    {
+        slash[1] = '\0';
+        parent = copy;
+    }
+    else
+    {
+        *slash = '\0';
+        parent = copy;
+    }
+
+    fd = open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    free(copy);
+    if (fd >= 0)
+        *out_used_parent = 1;
+    return fd;
+}
+
 static int backup_metadata_preflight(const BackupPlan *plan, int anchor_fd,
                                      int destination_root_fd,
                                      MetadataProfiles *profiles,
@@ -943,7 +984,15 @@ static int backup_dry_run(const char *target, BackupMode mode,
     metadata_profiles_init(&advisory_profiles);
     SourceReadRefusals advisory_refusals;
     source_read_refusals_init(&advisory_refusals);
-    int advisory_fd = open(target, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int advisory_used_parent = 0;
+    int advisory_fd = open_advisory_probe_fd(target, &advisory_used_parent);
+    if (advisory_fd < 0)
+        print_warning("Warning: could not preview destination-dependent checks "
+               "(size estimate, free space, filesystem capabilities) for %s; "
+               "the live backup will check these before writing.\n", target);
+    else if (advisory_used_parent)
+        printf("Note: %s does not exist yet; the preview below reflects its "
+               "parent directory's filesystem instead.\n\n", target);
     int advisory_probe_failed = 0;
     if (advisory_fd >= 0)
     {
