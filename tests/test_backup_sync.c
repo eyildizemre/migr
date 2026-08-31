@@ -25,6 +25,8 @@ static int sync_calls;
 static int sync_should_fail;
 static int short_read_enabled;
 static int short_read_triggered;
+static int eintr_read_enabled;
+static int eintr_read_triggered;
 
 extern int __real_syncfs(int fd);
 extern ssize_t __real_read(int fd, void *buffer, size_t count);
@@ -37,6 +39,12 @@ ssize_t __wrap_read(int fd, void *buffer, size_t count)
         short_read_triggered = 1;
         return 0;
     }
+    if (eintr_read_enabled && !eintr_read_triggered && count > 0)
+    {
+        eintr_read_triggered = 1;
+        errno = EINTR;
+        return -1;
+    }
     return __real_read(fd, buffer, count);
 }
 
@@ -44,6 +52,12 @@ static void arm_short_read_for_source(const char *source_path, void *context)
 {
     if (context != NULL && strcmp(source_path, context) == 0)
         short_read_enabled = 1;
+}
+
+static void arm_eintr_read_for_source(const char *source_path, void *context)
+{
+    if (context != NULL && strcmp(source_path, context) == 0)
+        eintr_read_enabled = 1;
 }
 
 int __wrap_syncfs(int fd)
@@ -339,6 +353,42 @@ static void test_native_short_copy_refuses(void)
     remove_tree(base);
 }
 
+static void test_native_eintr_read_retries(void)
+{
+    printf(":: native capture retries a read() interrupted by EINTR\n");
+    char base[PATH_MAX];
+    char source_dir[PATH_MAX];
+    char destination_dir[PATH_MAX];
+    char source[PATH_MAX];
+    char destination[PATH_MAX];
+    make_base(base, sizeof(base));
+    join_path(source_dir, sizeof(source_dir), base, "source");
+    join_path(destination_dir, sizeof(destination_dir), base, "destination");
+    make_directory(source_dir);
+    make_directory(destination_dir);
+    join_path(source, sizeof(source), source_dir, "payload");
+    join_path(destination, sizeof(destination), destination_dir, "payload");
+    write_bytes(source, 20000);
+
+    BackupCaptureReport report;
+    backup_capture_report_init(&report);
+    eintr_read_triggered = 0;
+    eintr_read_enabled = 0;
+    backup_test_set_capture_hook(arm_eintr_read_for_source, source);
+    BackupCaptureStatus result = capture_native(source, destination_dir,
+                                                "payload", &report);
+    backup_test_set_capture_hook(NULL, NULL);
+    eintr_read_enabled = 0;
+
+    struct stat destination_st;
+    check(eintr_read_triggered && result == BACKUP_CAPTURE_OK,
+          "a read() interrupted by EINTR is retried instead of aborting the capture");
+    check(report.bytes_copied == 20000 && stat(destination, &destination_st) == 0 &&
+              destination_st.st_size == 20000,
+          "the interrupted copy still produces the complete payload");
+    remove_tree(base);
+}
+
 static void test_portable_sync(void)
 {
     printf(":: portable periodic capture sync\n");
@@ -433,6 +483,7 @@ int main(void)
 {
     test_native_sync();
     test_native_short_copy_refuses();
+    test_native_eintr_read_retries();
     test_portable_sync();
     return failures == 0 ? 0 : 1;
 }

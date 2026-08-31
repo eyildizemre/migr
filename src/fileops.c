@@ -1222,15 +1222,24 @@ static int copy_file_contents(int src_fd, int dest_fd, off_t expected_size,
                               BackupCaptureReport *report)
 {
     char buffer[8192];
-    ssize_t bytes_read;
     off_t copied = 0;
-    while ((bytes_read = read(src_fd, buffer, sizeof(buffer))) > 0)
+    for (;;)
     {
+        ssize_t bytes_read = read(src_fd, buffer, sizeof(buffer));
+        if (bytes_read < 0 && errno == EINTR)
+            continue;
+        if (bytes_read < 0)
+            return -1;
+        if (bytes_read == 0)
+            break;
+
         ssize_t bytes_written = 0;
         while (bytes_written < bytes_read)
         {
             ssize_t res = write(dest_fd, buffer + bytes_written,
                                 (size_t)(bytes_read - bytes_written));
+            if (res < 0 && errno == EINTR)
+                continue;
             if (res <= 0)
                 return -1;
             bytes_written += res;
@@ -1239,8 +1248,6 @@ static int copy_file_contents(int src_fd, int dest_fd, off_t expected_size,
         if (backup_capture_report_tick(report, bytes_read, dest_fd) != 0)
             return -1;
     }
-    if (bytes_read < 0)
-        return -1;
     if (expected_size < 0 || copied != expected_size)
     {
         errno = EIO;
