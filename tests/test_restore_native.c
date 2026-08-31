@@ -993,6 +993,54 @@ static void test_empty_relative_path_means_root_object_itself(void)
     remove_tree(dest_root);
 }
 
+// The recursive dispatcher has no other bound on payload nesting depth
+// (the payload is untrusted), so an adversarial or corrupted backup could
+// otherwise drive thousands of stack frames and crash the restoring process
+// instead of failing the one offending entry. "root" itself sits at depth 0,
+// so 513 nested single-letter directories below it puts the deepest one at
+// depth 513 -- the first value RESTORE_MAX_DEPTH (512) rejects. The 512 levels
+// above it are still fully walked first (proving this isn't refusing at the
+// root), and using the read-only preflight pass keeps the fixture fast and
+// never touches the destination.
+static void test_rejects_excessive_recursion_depth(void)
+{
+    printf(BLUE "::" NC " restore_native_preflight_at: nesting past the depth limit is refused, not crashed on\n");
+
+    char source_root[PATH_MAX], dest_root[PATH_MAX];
+    fresh_mkdtemp(source_root, sizeof(source_root), "restore_deep_src");
+    fresh_mkdtemp(dest_root, sizeof(dest_root), "restore_deep_dst");
+
+    char cursor[PATH_MAX];
+    int n = snprintf(cursor, sizeof(cursor), "%s/root", source_root);
+    if (n < 0 || (size_t)n >= sizeof(cursor) || mkdir(cursor, 0755) != 0)
+    {
+        printf(RED "fixture: could not create the deep-nesting root" NC "\n");
+        exit(1);
+    }
+    for (int i = 0; i < 513; i++)
+    {
+        size_t len = strlen(cursor);
+        int step = snprintf(cursor + len, sizeof(cursor) - len, "/a");
+        if (step < 0 || (size_t)step >= sizeof(cursor) - len || mkdir(cursor, 0755) != 0)
+        {
+            printf(RED "fixture: could not build the deep-nesting chain" NC "\n");
+            exit(1);
+        }
+    }
+
+    int source_fd = open_dir_fd(source_root);
+    int dest_fd = open_dir_fd(dest_root);
+
+    check(restore_native_preflight_at(&RESTORE_CTX, source_fd, "root",
+                                      dest_fd, "root") != 0,
+          "excessive payload nesting is refused instead of exhausting the stack");
+
+    close(source_fd);
+    close(dest_fd);
+    remove_tree(source_root);
+    remove_tree(dest_root);
+}
+
 /* ========================================================================= */
 /* CloneContext validation                                                  */
 /* ========================================================================= */
@@ -1053,6 +1101,7 @@ int main(void)
     test_skips_device_node_without_failing();
     test_preserves_caller_owned_root_fds();
     test_empty_relative_path_means_root_object_itself();
+    test_rejects_excessive_recursion_depth();
 
     test_rejects_invalid_context();
 

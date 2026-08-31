@@ -2687,6 +2687,17 @@ static RestoreNativeStatus restore_linked_regular_at(
 // restore_entry_directory() recurses back into the full dispatcher for
 // each child, so it needs restore_entry_at() declared before its own
 // definition, ahead of restore_entry_at()'s own definition further down.
+// restore_entry_at()/restore_entry_directory() mutually recurse once per
+// payload directory level, with no other bound (the payload is untrusted,
+// per this file's own header comment). depth is the nesting level of the
+// entry currently being restored (0 at each restore root); descending past
+// RESTORE_MAX_DEPTH fails that one entry closed rather than growing the
+// stack without limit -- comfortably above any real directory tree, and
+// comfortably below where a default 8MB thread stack would be exhausted by
+// several thousand levels of recursion, each frame carrying a PATH_MAX
+// buffer plus multiple struct stat locals.
+#define RESTORE_MAX_DEPTH 512
+
 static RestoreNativeStatus restore_entry_at(
     const CloneContext *ctx, RestorePass pass, int source_parent_fd,
     const char *source_leaf, int dest_parent_fd, const char *dest_leaf,
@@ -2696,7 +2707,7 @@ static RestoreNativeStatus restore_entry_at(
     int metadata_anchor_fd,
     int skip_symlink_target_read,
     RestoreNativeReport *restore_report,
-    BackupCaptureReport *capture_report);
+    BackupCaptureReport *capture_report, int depth);
 
 static RestoreNativeStatus restore_entry_symlink(
     const CloneContext *ctx, RestorePass pass, int source_parent_fd,
@@ -2984,7 +2995,7 @@ static RestoreNativeStatus restore_entry_directory(
     int skip_symlink_target_read, RestoreNativeReport *restore_report,
     BackupCaptureReport *capture_report, int dest_exists,
     struct stat dest_st, struct stat source_st, struct stat desired_st,
-    int source_object_fd)
+    int source_object_fd, int depth)
 {
         if (dest_exists && !S_ISDIR(dest_st.st_mode))
         {
@@ -3071,7 +3082,8 @@ static RestoreNativeStatus restore_entry_directory(
                 ctx, pass, source_dir_fd, entry->d_name, dest_dir_fd,
                 entry->d_name, child_logical_path, snapshots, profiles,
                 estimate, xattr_requirements, metadata_anchor_fd,
-                skip_symlink_target_read, restore_report, capture_report);
+                skip_symlink_target_read, restore_report, capture_report,
+                depth + 1);
             if (child_status != RESTORE_NATIVE_OK)
             {
                 failed = 1;
@@ -3181,8 +3193,11 @@ static RestoreNativeStatus restore_entry_at(
     int metadata_anchor_fd,
     int skip_symlink_target_read,
     RestoreNativeReport *restore_report,
-    BackupCaptureReport *capture_report)
+    BackupCaptureReport *capture_report, int depth)
 {
+    if (depth > RESTORE_MAX_DEPTH)
+        return -1;
+
     int source_is_root = source_leaf[0] == '\0';
     int dest_is_root = dest_leaf[0] == '\0';
 
@@ -3272,7 +3287,7 @@ static RestoreNativeStatus restore_entry_at(
                                        skip_symlink_target_read,
                                        restore_report, capture_report,
                                        dest_exists, dest_st, source_st,
-                                       desired_st, source_object_fd);
+                                       desired_st, source_object_fd, depth);
 
     if (S_ISFIFO(source_st.st_mode))
         return restore_entry_fifo(ctx, pass, dest_parent_fd, dest_leaf,
@@ -3385,7 +3400,8 @@ RestoreNativeStatus restore_native_preflight_at(
     int rc = restore_entry_at(ctx, RESTORE_VALIDATE, source_parent_fd,
                               source_leaf, dest_parent_fd, dest_leaf,
                               source_rel, &snapshots, &profiles,
-                              NULL, NULL, metadata_anchor_fd, 0, NULL, NULL);
+                              NULL, NULL, metadata_anchor_fd, 0, NULL, NULL,
+                              0);
     close(metadata_anchor_fd);
     close(source_parent_fd);
     if (dest_parent_fd >= 0)
@@ -3439,7 +3455,7 @@ RestoreNativeStatus restore_native_metadata_inventory_at(
                               source_leaf, dest_parent_fd, dest_leaf,
                               source_rel, &snapshots, profiles,
                               estimate, NULL, metadata_anchor_fd, 1, NULL,
-                              NULL);
+                              NULL, 0);
     close(metadata_anchor_fd);
     close(source_parent_fd);
     if (dest_parent_fd >= 0)
@@ -3509,7 +3525,7 @@ RestoreNativeStatus restore_native_at_report(
                               source_leaf, dest_parent_fd, dest_leaf,
                               source_rel, &snapshots, &profiles,
                               NULL, &xattr_requirements, metadata_anchor_fd,
-                              0, report, NULL);
+                              0, report, NULL, 0);
     if (rc == 0 && !ctx->metadata_preflight_done &&
         metadata_profiles_probe(&profiles,
                                 metadata_policy_from_context(ctx)) != 0)
@@ -3536,7 +3552,7 @@ RestoreNativeStatus restore_native_at_report(
                               source_leaf, dest_parent_fd, dest_leaf,
                               source_rel, &snapshots, NULL,
                               NULL, NULL, destination_root_fd, 0, report,
-                              capture_report);
+                              capture_report, 0);
     if (rc != RESTORE_NATIVE_OK && report->failed_count == 0)
         restore_report_failure(report, source_rel);
     close(source_parent_fd);
