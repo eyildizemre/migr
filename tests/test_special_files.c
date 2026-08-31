@@ -71,6 +71,31 @@ static void skip_check(const char *label)
     skips++;
 }
 
+// The kernel refuses to create a symlink whose target is >= PATH_MAX bytes
+// (do_symlinkat's own limit), so capture_symlink_at()'s truncation check can
+// never be exercised by a real on-disk fixture -- no local filesystem lets
+// you create the input that would trip it. This wrapper simulates what a
+// truncating readlink() would report (fully filling the caller's buffer,
+// exactly its own size) for one specific source path, chosen with strcmp so
+// every other readlink() call in the linked program -- there are several,
+// e.g. inside portable.c's own symlink handling -- passes through untouched.
+static const char *readlink_truncate_path;
+static int readlink_truncate_triggered;
+
+extern ssize_t __real_readlink(const char *path, char *buf, size_t bufsiz);
+
+ssize_t __wrap_readlink(const char *path, char *buf, size_t bufsiz)
+{
+    if (readlink_truncate_path != NULL && !readlink_truncate_triggered &&
+        strcmp(path, readlink_truncate_path) == 0)
+    {
+        readlink_truncate_triggered = 1;
+        memset(buf, 'a', bufsiz);
+        return (ssize_t)bufsiz;
+    }
+    return __real_readlink(path, buf, bufsiz);
+}
+
 static void write_file(const char *path, const char *content)
 {
     FILE *f = fopen(path, "w");
@@ -1091,6 +1116,13 @@ int main(void)
         fatal("could not create the differing symlink fixture");
     check(backup_capture_at(&ctx, src_symlink, dest_fd, "differing.link") != 0,
           "an existing symlink with a different target is refused, not replaced");
+
+    readlink_truncate_path = src_symlink;
+    readlink_truncate_triggered = 0;
+    check(backup_capture_at(&ctx, src_symlink, dest_fd, "truncated.link") != 0,
+          "a readlink() that fills the whole buffer is refused, not silently truncated");
+    check(readlink_truncate_triggered, "the truncation fixture actually fired");
+    readlink_truncate_path = NULL;
 
     char existing_dir_dest[PATH_MAX], existing_dir_child[PATH_MAX];
     if (path_join(existing_dir_dest, sizeof(existing_dir_dest), dest_dir, "existing_tree") != 0)

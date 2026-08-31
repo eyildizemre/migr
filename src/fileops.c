@@ -1170,8 +1170,8 @@ static int capture_symlink_at(const char *src, int dest_dir_fd, const char *leaf
                               MetadataTimestampPolicy policy)
 {
     char link_target[PATH_MAX];
-    ssize_t len = readlink(src, link_target, sizeof(link_target) - 1);
-    if (len < 0)
+    ssize_t len = readlink(src, link_target, sizeof(link_target));
+    if (len < 0 || (size_t)len >= sizeof(link_target))
         return -1;
     link_target[len] = '\0';
 
@@ -1186,8 +1186,8 @@ static int capture_symlink_at(const char *src, int dest_dir_fd, const char *leaf
             return -1;
 
         char existing[PATH_MAX];
-        ssize_t existing_len = readlinkat(dest_dir_fd, leaf, existing, sizeof(existing) - 1);
-        if (existing_len < 0)
+        ssize_t existing_len = readlinkat(dest_dir_fd, leaf, existing, sizeof(existing));
+        if (existing_len < 0 || (size_t)existing_len >= sizeof(existing))
             return -1;
         existing[existing_len] = '\0';
 
