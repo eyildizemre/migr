@@ -158,20 +158,16 @@ int visited_add(PortableVisited *visited, const char *root_id,
                                   logical_length, hash, &index);
     if (location == 1)
         return 1;
-    if (location < 0)
-        return -1;
-    if (visited->count >= SIDECAR_MAX_LIVE_ENTRIES)
-        return -1;
 
-    if (visited->count + 1U > visited->capacity / 2U)
+    if (location < 0 || visited->count + 1U > visited->capacity / 2U)
     {
-        if (visited->capacity > visited_max_capacity() / 2U ||
+        if (visited->count >= SIDECAR_MAX_LIVE_ENTRIES ||
+            visited->capacity > visited_max_capacity() / 2U ||
             visited_rehash(visited, visited->capacity * 2U) != 0)
             return -1;
-        location = visited_locate(visited, root_id, root_length, logical,
-                                  logical_length, hash, &index);
-        if (location != 0)
-            return -1;
+        index = (size_t)hash & (visited->capacity - 1U);
+        while (visited->slots[index].root_id != NULL)
+            index = (index + 1U) & (visited->capacity - 1U);
     }
 
     char *root_copy = malloc(root_length + 1U);
@@ -306,19 +302,16 @@ int prescan_inode_set_find_or_insert(PrescanInodeSet *set,
     int location = prescan_inode_set_locate(set, device, inode, hash, &index);
     if (location == 1)
         return 1;
-    if (location < 0)
-        return -1;
-    if (set->count >= SIDECAR_MAX_LIVE_ENTRIES)
-        return -1;
 
-    if (set->count + 1U > set->capacity / 2U)
+    if (location < 0 || set->count + 1U > set->capacity / 2U)
     {
-        if (set->capacity > visited_max_capacity() / 2U ||
+        if (set->count >= SIDECAR_MAX_LIVE_ENTRIES ||
+            set->capacity > visited_max_capacity() / 2U ||
             prescan_inode_set_rehash(set, set->capacity * 2U) != 0)
             return -1;
-        location = prescan_inode_set_locate(set, device, inode, hash, &index);
-        if (location != 0)
-            return -1;
+        index = (size_t)hash & (set->capacity - 1U);
+        while (set->slots[index].used)
+            index = (index + 1U) & (set->capacity - 1U);
     }
 
     set->slots[index] = (PrescanInodeSlot){
@@ -432,18 +425,15 @@ int inode_map_find_or_insert(PortableInodeMap *map, dev_t device,
         *out_slot = &map->slots[index];
         return 1;
     }
-    if (location < 0)
-        return -1;
-    if (map->count >= SIDECAR_MAX_LIVE_ENTRIES)
-        return -1;
 
-    if (map->count + 1U > map->capacity / 2U) {
-        if (map->capacity > visited_max_capacity() / 2U ||
+    if (location < 0 || map->count + 1U > map->capacity / 2U) {
+        if (map->count >= SIDECAR_MAX_LIVE_ENTRIES ||
+            map->capacity > visited_max_capacity() / 2U ||
             inode_map_rehash(map, map->capacity * 2U) != 0)
             return -1;
-        location = inode_map_locate(map, device, inode, hash, &index);
-        if (location != 0)
-            return -1;
+        index = (size_t)hash & (map->capacity - 1U);
+        while (map->slots[index].root_id != NULL)
+            index = (index + 1U) & (map->capacity - 1U);
     }
 
     char *root_copy = malloc(root_length + 1U);
