@@ -27,7 +27,9 @@ int xdg_resolve(const char *home,
     char config[PATH_MAX];
     FILE *f = NULL;
     int read_failed = 0;
-    if (path_join(config, sizeof(config), home, ".config/user-dirs.dirs") == 0)
+    if (path_join(config, sizeof(config), home, ".config/user-dirs.dirs") != 0)
+        read_failed = 1;
+    else
     {
         f = fopen(config, "r");
         if (f == NULL && errno != ENOENT)

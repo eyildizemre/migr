@@ -891,11 +891,20 @@ test_truncation() {
 
     # The fd-anchored restore core resolves destination_rel component by
     # component and never concatenates the full browser path. A deep but valid
-    # HOME must therefore work in both preview and live restore.
+    # HOME must therefore work in both preview and live restore. 4060 is
+    # deliberately chosen, not just "big": long enough that HOME + the
+    # deepest single destination path here (.config/google-chrome/Default/
+    # Preferences, 41 bytes) would overflow PATH_MAX if ever naively
+    # concatenated as one string (proving the fd-anchored walk doesn't do
+    # that), but short enough that HOME + "/.config/user-dirs.dirs" (23
+    # bytes) still fits -- xdg_resolve() now correctly refuses when that
+    # join alone would overflow (P0 #24), so this fixture must stay under that
+    # boundary (empirically confirmed at exactly 4073) to keep testing what it
+    # was written to test, not that separate, already-correct refusal.
     local deep_home="$TEST_DIR/deep_home" room part_len
     mkdir "$deep_home"
-    while [ ${#deep_home} -lt 4080 ]; do
-        room=$((4080 - ${#deep_home} - 1))
+    while [ ${#deep_home} -lt 4060 ]; do
+        room=$((4060 - ${#deep_home} - 1))
         [ "$room" -le 0 ] && break
         part_len=100
         [ "$room" -lt "$part_len" ] && part_len=$room

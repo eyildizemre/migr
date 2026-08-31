@@ -107,6 +107,30 @@ static void test_no_config_file(void)
     check(rmdir(home) == 0, "fixture: fallback-only home is removed");
 }
 
+static void test_config_path_overflow_is_reported(void)
+{
+    // A HOME long enough to overflow PATH_MAX when joined with
+    // ".config/user-dirs.dirs" (23 bytes including the path_join separator)
+    // but not when joined with the longest fallback name ("Documents"/
+    // "Downloads", 10 bytes including the separator) must not silently fall
+    // through to fallback-only success -- the caller has no way to tell the
+    // user's real config was never consulted. path_join() failing is a pure
+    // string-length check, so this synthetic home never needs to exist as a
+    // real directory.
+    char home[PATH_MAX];
+    size_t home_len = sizeof(home) - 16;
+    memset(home, 'a', home_len);
+    home[home_len] = '\0';
+
+    char *out[XDG_KEY_COUNT];
+    int rc = xdg_resolve(home, xdg_keys, xdg_fallbacks, out, XDG_KEY_COUNT);
+    check(rc == -1,
+          "a HOME too long for the config path but not the fallback is reported as failure");
+    check(dirs_all_null(out, XDG_KEY_COUNT),
+          "config path overflow is not converted into fallback paths");
+    free_dirs(out, XDG_KEY_COUNT);
+}
+
 static void test_config_open_failure_is_reported(void)
 {
     char home[PATH_MAX] = {0};
@@ -228,6 +252,7 @@ int main(void)
 {
     printf(BLUE "::" NC " xdg_resolve (unit)\n");
     test_no_config_file();
+    test_config_path_overflow_is_reported();
     test_config_open_failure_is_reported();
     test_config_resolves_home_relative_and_absolute();
     test_stream_read_failure_is_reported();
