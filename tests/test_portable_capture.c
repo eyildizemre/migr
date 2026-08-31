@@ -2563,6 +2563,75 @@ static void test_root_payload_namespace(const char *base)
     remove_tree(container_path);
 }
 
+/* root_probe_make_path() dup_cloexec()'s the root fd, then advances it one
+ * path component at a time, closing the previous "current" fd once the next
+ * one is open. If that close() ever fails, the fd slot is released anyway
+ * (Linux close() semantics) -- so the post-loop cleanup must not attempt a
+ * second close() on the same, already-released descriptor number. Reaching
+ * this code at all requires two non-ASCII root payload paths that skeleton-
+ * fold to the same name (destination-probed, not resolved by ASCII folding
+ * alone) with more than one path component, so the probe actually advances
+ * past its first directory. */
+static void test_root_probe_close_failure_does_not_double_close(
+    const char *base)
+{
+    printf(BLUE "::" NC
+           " root payload probe close failure does not double-close\n");
+
+    char source_a[PATH_MAX];
+    char source_b[PATH_MAX];
+    char container_path[PATH_MAX];
+    join_path(source_a, sizeof(source_a), base, "root-probe-close-a");
+    join_path(source_b, sizeof(source_b), base, "root-probe-close-b");
+    join_path(container_path, sizeof(container_path), base,
+              "root-probe-close-container");
+    make_directory(source_a);
+    make_directory(source_b);
+    make_directory(container_path);
+    char file_path[PATH_MAX];
+    join_path(file_path, sizeof(file_path), source_a, "a");
+    write_file(file_path, "a", 1);
+    join_path(file_path, sizeof(file_path), source_b, "b");
+    write_file(file_path, "b", 1);
+
+    static const char unicode_cafe[] = "dir/Caf\xc3\xa9";
+    static const char unicode_cafe_upper[] = "dir/CAF\xc3\x89";
+    PortableRootSpec roots[2] = {
+        root_spec("ROOT_A", source_a, unicode_cafe),
+        root_spec("ROOT_B", source_b, unicode_cafe_upper)
+    };
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .roots = roots,
+        .root_count = 2,
+        .nsec_exact = 1
+    };
+
+    int container_fd = open(container_path,
+                             O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open root-probe-close container");
+
+    portable_prescan_test_fail_root_probe_close_after(0);
+    PortablePrescanReport report;
+    portable_prescan_report_init(&report);
+    int result = portable_collision_plan_build(container_fd, &request,
+                                                &report);
+
+    check(result == -1,
+          "an injected close() failure inside the root-payload destination "
+          "probe is reported as a failure, not silently swallowed");
+    check(portable_prescan_test_root_probe_post_loop_close_count() == 0,
+          "the post-loop cleanup does not attempt a second close() on the "
+          "already-released probe directory fd");
+
+    portable_prescan_report_free(&report);
+    close(container_fd);
+    remove_tree(source_a);
+    remove_tree(source_b);
+    remove_tree(container_path);
+}
+
 static void test_prescan_multiple_roots(const char *base)
 {
     printf(BLUE "::" NC " pre-scan aggregates violations across roots\n");
@@ -4134,6 +4203,7 @@ int main(void)
     test_name_and_path_limits(root_path);
     test_prescan_multiple_roots(root_path);
     test_root_payload_namespace(root_path);
+    test_root_probe_close_failure_does_not_double_close(root_path);
     test_fresh_capture(source_path, container_fd, container_path);
     test_portable_hardlinks(root_path);
     test_portable_hardlinks_sticky_seed(root_path);

@@ -39,4 +39,9 @@ const PortableRootSpec *portable_collision_plan_root(
 void skeleton_copy(char *destination, size_t destination_size,
                    const char *source);
 
+#ifdef PORTABLE_PRESCAN_TEST_HOOKS
+void portable_prescan_test_fail_root_probe_close_after(size_t successful_closes);
+size_t portable_prescan_test_root_probe_post_loop_close_count(void);
+#endif
+
 #endif

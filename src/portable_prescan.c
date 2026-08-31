@@ -560,6 +560,32 @@ static int root_probe_exact_name(int directory_fd, const char *name)
     return failed ? -1 : found;
 }
 
+#ifdef PORTABLE_PRESCAN_TEST_HOOKS
+static size_t root_probe_test_close_successes;
+static size_t root_probe_test_close_fail_after = SIZE_MAX;
+static size_t root_probe_test_post_loop_close_count;
+
+void portable_prescan_test_fail_root_probe_close_after(size_t successful_closes)
+{
+    root_probe_test_close_fail_after = successful_closes;
+    root_probe_test_close_successes = 0;
+    root_probe_test_post_loop_close_count = 0;
+}
+
+size_t portable_prescan_test_root_probe_post_loop_close_count(void)
+{
+    return root_probe_test_post_loop_close_count;
+}
+
+static int root_probe_test_close_should_fail(void)
+{
+    if (root_probe_test_close_successes >= root_probe_test_close_fail_after)
+        return 1;
+    root_probe_test_close_successes++;
+    return 0;
+}
+#endif
+
 /* Creates a relative scratch path component by component.  Return values:
  * 0 means every component was created or already existed with the exact
  * spelling, 1 means the destination folded a component to another spelling,
@@ -607,9 +633,15 @@ static int root_probe_make_path(int root_fd, const char *relative)
             result = -1;
             break;
         }
-        if (close(current) != 0) {
+        int closed = close(current);
+#ifdef PORTABLE_PRESCAN_TEST_HOOKS
+        if (root_probe_test_close_should_fail())
+            closed = -1;
+#endif
+        if (closed != 0) {
             close(next);
             result = -1;
+            current = -1;
             break;
         }
         current = next;
@@ -617,8 +649,13 @@ static int root_probe_make_path(int root_fd, const char *relative)
             break;
         cursor = slash + 1;
     }
-    if (close(current) != 0 && result == 0)
-        result = -1;
+    if (current >= 0) {
+#ifdef PORTABLE_PRESCAN_TEST_HOOKS
+        root_probe_test_post_loop_close_count++;
+#endif
+        if (close(current) != 0 && result == 0)
+            result = -1;
+    }
     return result;
 }
 
