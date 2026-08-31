@@ -472,6 +472,23 @@ static void test_sequence_and_hardlink_guards(int container_fd)
           sidecar_log_append_entry_commit(&log) == SIDECAR_STATUS_OK,
           "a complete group can be committed after the guard failures");
 
+    SidecarEntry regular_with_hardlink_fields = entry_for(
+        "ROOT", "stray-hardlink", "payload/stray-hardlink", 0, 0);
+    regular_with_hardlink_fields.hardlink_root_id =
+        regular_with_hardlink_fields.root_id;
+    check(sidecar_log_append_entry(&log, &regular_with_hardlink_fields) ==
+              SIDECAR_STATUS_INVALID_ARGUMENT,
+          "regular entry carrying a stray hardlink reference is refused by the state map");
+    // The refusal above must come from copy_entry()'s own validation, before
+    // sidecar_write_entry() ever runs -- not from the writer's validate_entry()
+    // rejecting it after copy_entry() let it through, which would have
+    // unconditionally poisoned the log even though nothing was written. A
+    // trivial claim right after proves the log is still usable.
+    SidecarClaim not_poisoned_claim = claim_for(
+        "ROOT", "not-poisoned", "payload/not-poisoned", SIDECAR_KIND_REGULAR);
+    check(sidecar_log_append_claim(&log, &not_poisoned_claim) == SIDECAR_STATUS_OK,
+          "log is not poisoned by the refused entry -- nothing was written");
+
     SidecarEntry symlink = entry_for("ROOT", "link", "payload/link", 0, 0);
     static const unsigned char collision_suffix[] = "%7E1";
     symlink.kind = SIDECAR_KIND_SYMLINK;

@@ -258,6 +258,13 @@ static SidecarStatus copy_entry(StateMemory *memory, const SidecarEntry *source,
         set_invalid_error();
         return SIDECAR_STATUS_INVALID_ARGUMENT;
     }
+    if (source->kind != SIDECAR_KIND_HARDLINK &&
+        (source->hardlink_root_id.length != 0 ||
+         source->hardlink_logical_path.length != 0))
+    {
+        set_invalid_error();
+        return SIDECAR_STATUS_INVALID_ARGUMENT;
+    }
     if (source->kind != SIDECAR_KIND_SYMLINK &&
         source->symlink_target.length != 0)
     {
