@@ -144,7 +144,8 @@ int visited_add(PortableVisited *visited, const char *root_id,
         return -1;
     size_t root_length = strlen(root_id);
     size_t logical_length = strlen(logical);
-    if (root_length == SIZE_MAX || logical_length == SIZE_MAX)
+    if (root_length == SIZE_MAX || logical_length == SIZE_MAX ||
+        root_length > SIDECAR_MAX_ROOT_ID || logical_length > SIDECAR_MAX_PATH)
         return -1;
 
     uint64_t hash = visited_hash(visited, root_id, root_length, logical,

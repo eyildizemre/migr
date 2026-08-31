@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "portable_hashset_internal.h"
+#include "sidecar.h"
 
 #define GREEN "\033[0;32m"
 #define RED   "\033[0;31m"
@@ -101,6 +102,38 @@ static void test_visited_recovers_from_full_locate(void)
     visited_dispose(&visited);
 }
 
+static void test_visited_length_bound(void)
+{
+    char root_at_ceiling[SIDECAR_MAX_ROOT_ID + 1];
+    memset(root_at_ceiling, 'r', SIDECAR_MAX_ROOT_ID);
+    root_at_ceiling[SIDECAR_MAX_ROOT_ID] = '\0';
+
+    char root_over_ceiling[SIDECAR_MAX_ROOT_ID + 2];
+    memset(root_over_ceiling, 'r', SIDECAR_MAX_ROOT_ID + 1U);
+    root_over_ceiling[SIDECAR_MAX_ROOT_ID + 1U] = '\0';
+
+    char logical_at_ceiling[SIDECAR_MAX_PATH + 1];
+    memset(logical_at_ceiling, 'l', SIDECAR_MAX_PATH);
+    logical_at_ceiling[SIDECAR_MAX_PATH] = '\0';
+
+    char logical_over_ceiling[SIDECAR_MAX_PATH + 2];
+    memset(logical_over_ceiling, 'l', SIDECAR_MAX_PATH + 1U);
+    logical_over_ceiling[SIDECAR_MAX_PATH + 1U] = '\0';
+
+    PortableVisited visited = {0};
+    check(visited_add(&visited, root_at_ceiling, "ok") == 0,
+          "visited_add accepts a root_id exactly at SIDECAR_MAX_ROOT_ID");
+    check(visited_add(&visited, "root", logical_at_ceiling) == 0,
+          "visited_add accepts a logical path exactly at SIDECAR_MAX_PATH");
+    check(visited_add(&visited, root_over_ceiling, "ok") == -1,
+          "visited_add rejects a root_id one byte over SIDECAR_MAX_ROOT_ID, "
+          "matching inode_map_find_or_insert's identical bound");
+    check(visited_add(&visited, "root", logical_over_ceiling) == -1,
+          "visited_add rejects a logical path one byte over SIDECAR_MAX_PATH, "
+          "matching inode_map_find_or_insert's identical bound");
+    visited_dispose(&visited);
+}
+
 static void test_prescan_inode_set_basic_insert_and_duplicate(void)
 {
     PrescanInodeSet set = {0};
@@ -179,6 +212,7 @@ int main(void)
     printf(BLUE "::" NC " portable_hashset (unit)\n");
     test_visited_basic_insert_and_duplicate();
     test_visited_recovers_from_full_locate();
+    test_visited_length_bound();
     test_prescan_inode_set_basic_insert_and_duplicate();
     test_prescan_inode_set_recovers_from_full_locate();
     test_inode_map_basic_insert_and_duplicate();
