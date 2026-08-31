@@ -1203,6 +1203,51 @@ EOF
     echo -e "  ${GREEN}✓${NC} Native restore refuses a sparse payload that exceeds destination space."
 }
 
+test_xdg_nested_destination_recovery() {
+    echo -e "${BLUE}::${NC} Phase 12b: legacy XDG destination recovery"
+
+    # user-dirs.dirs can legitimately map an XDG directory to a nested custom
+    # path (a real xdg-user-dirs feature). On a fresh restore target, not just
+    # the leaf but its parent too may not exist yet --
+    # open_xdg_destination_anchor() must recover the same way the native
+    # restore engine's own resolve_parent(..., create_intermediates=1) already
+    # does, not refuse.
+    local xdg_src="$TEST_DIR/xdg_nested_src"
+    local xdg_home="$TEST_DIR/xdg_nested_home"
+    mkdir -p "$xdg_src/Documents" "$xdg_home/.config"
+    echo nested-doc > "$xdg_src/Documents/note.txt"
+    echo 'XDG_DOCUMENTS_DIR="$HOME/data/Documents"' > "$xdg_home/.config/user-dirs.dirs"
+
+    if [ -e "$xdg_home/data" ]; then
+        echo -e "  ${RED}✗${NC} fixture setup left \$HOME/data pre-existing"
+        exit 1
+    fi
+
+    # The recovery only creates the missing chain for a live restore -- a
+    # dry-run must never mutate the destination. (Dry-run itself still
+    # reports an error for this case rather than a clean preview; that's a
+    # separate, narrower gap, not something this recovery regresses -- it
+    # errored here before this fix too.)
+    env HOME="$xdg_home" ../migr restore "$xdg_src" --dry-run >/dev/null 2>&1 || true
+    if [ -e "$xdg_home/data" ]; then
+        echo -e "  ${RED}✗${NC} Dry-run created \$HOME/data while resolving the XDG destination"
+        exit 1
+    else
+        echo -e "  ${GREEN}✓${NC} Dry-run does not create the missing XDG destination chain."
+    fi
+
+    local xdg_out
+    xdg_out=$(printf 'y\n' | env HOME="$xdg_home" ../migr restore "$xdg_src" 2>&1)
+    assert_contains "$xdg_out" "Restore complete"
+    assert_file_exists "$xdg_home/data/Documents/note.txt"
+    if [ "$(cat "$xdg_home/data/Documents/note.txt")" = "nested-doc" ]; then
+        echo -e "  ${GREEN}✓${NC} A custom XDG mapping whose parent doesn't exist yet is created and restored into."
+    else
+        echo -e "  ${RED}✗${NC} Nested XDG destination content does not match"
+        exit 1
+    fi
+}
+
 test_native_restore_progress() {
     echo -e "${BLUE}::${NC} Phase 12a: native restore progress"
 
@@ -1949,6 +1994,7 @@ test_errors
 test_truncation
 test_restore_path_safety
 test_v1_restore_dispatch
+test_xdg_nested_destination_recovery
 test_native_restore_progress
 test_probe_refusal
 test_container_production

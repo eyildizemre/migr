@@ -528,6 +528,23 @@ static int restore_home_item(const CloneContext *ctx, int source_root_fd,
 // Existing XDG destinations are caller-selected trust roots and may themselves
 // be symlinks or live outside HOME. If only the final component is absent, its
 // parent becomes the trust root and the fd-anchored core creates the leaf.
+// If the parent is missing too, a live restore creates its missing path
+// components first. Dry-run leaves the path untouched.
+static int mkdir_parents(char *dir)
+{
+    char *scan = dir[0] == '/' ? dir + 1 : dir;
+    for (char *slash = strchr(scan, '/'); slash != NULL;
+        slash = strchr(slash + 1, '/'))
+    {
+        *slash = '\0';
+        int failed = mkdir(dir, 0700) != 0 && errno != EEXIST;
+        *slash = '/';
+        if (failed)
+            return -1;
+    }
+    return mkdir(dir, 0700) == 0 || errno == EEXIST ? 0 : -1;
+}
+
 static int open_xdg_destination_anchor(const char *path, int *out_fd,
                                        char *out_rel, size_t rel_size)
 {
@@ -559,9 +576,9 @@ static int open_xdg_destination_anchor(const char *path, int *out_fd,
     }
     memcpy(out_rel, leaf, leaf_len + 1);
 
-    const char *parent;
+    char *parent;
     if (slash == NULL)
-        parent = ".";
+        parent = NULL;
     else if (slash == copy)
     {
         slash[1] = '\0';
@@ -573,7 +590,11 @@ static int open_xdg_destination_anchor(const char *path, int *out_fd,
         parent = copy;
     }
 
-    fd = open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    const char *parent_path = parent == NULL ? "." : parent;
+    fd = open(parent_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0 && errno == ENOENT && parent != NULL && !dry_run &&
+        mkdir_parents(parent) == 0)
+        fd = open(parent_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     free(copy);
     if (fd < 0)
         return -1;
