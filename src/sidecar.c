@@ -973,7 +973,7 @@ static SidecarStatus parse_entry(SidecarReader *reader, SidecarEntry *entry)
                                      &entry->hardlink_logical_path);
         if (status != SIDECAR_STATUS_OK)
             goto fail;
-        if (entry->hardlink_root_id.length == 0)
+        if (entry->hardlink_root_id.length == 0 || entry->xattr_count != 0)
         {
             status = SIDECAR_STATUS_CORRUPT;
             goto fail;

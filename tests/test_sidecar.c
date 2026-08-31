@@ -934,6 +934,47 @@ static void test_corruption_and_versions(int fd)
     status = sidecar_parse_fd(fd, NULL, NULL, &result);
     check(status == SIDECAR_STATUS_CORRUPT,
           "out-of-order CLAIM fields are corruption");
+
+    // sidecar_write_entry()'s own validate_entry() refuses xattr_count != 0
+    // for a HARDLINK entry (see test_symlink_and_hardlink_writer's "hardlink
+    // xattrs are rejected"). This builds the equivalent bytes directly,
+    // bypassing the writer, to confirm the reader enforces the same rule
+    // independently rather than trusting a caller upstream to have used the
+    // writer -- e.g. sidecar_is_complete_readonly() calls sidecar_parse_fd()
+    // with a NULL callback purely to classify a log as complete, so it must
+    // not report OK for this on its own.
+    raw_free(&buffer);
+    memset(&buffer, 0, sizeof(buffer));
+    static const unsigned char hardlink_xattr_value[] = { 'v' };
+    check(append_header(&buffer, "3") == 0 &&
+              raw_tag(&buffer, "ENTRY") == 0 &&
+              raw_text_field(&buffer, "ROOT") == 0 &&
+              raw_text_field(&buffer, "dir/file") == 0 &&
+              raw_text_field(&buffer, "payload/file") == 0 &&
+              raw_text_field(&buffer, "") == 0 &&
+              raw_text_field(&buffer, "hardlink") == 0 &&
+              raw_text_field(&buffer, "0") == 0 &&
+              raw_text_field(&buffer, "0") == 0 &&
+              raw_text_field(&buffer, "0") == 0 &&
+              raw_text_field(&buffer, "0") == 0 &&
+              raw_text_field(&buffer, "0") == 0 &&
+              raw_text_field(&buffer, "0") == 0 &&
+              raw_text_field(&buffer, "0") == 0 &&
+              raw_text_field(&buffer, "0") == 0 &&
+              raw_text_field(&buffer, "1") == 0 &&
+              raw_text_field(&buffer, "ROOT") == 0 &&
+              raw_text_field(&buffer, "") == 0 &&
+              raw_tag(&buffer, "XATTR") == 0 &&
+              raw_text_field(&buffer, "user.state") == 0 &&
+              raw_text_field(&buffer, "1") == 0 &&
+              raw_append(&buffer, hardlink_xattr_value,
+                         sizeof(hardlink_xattr_value)) == 0 &&
+              append_commit(&buffer) == 0 && set_raw_file(fd, &buffer) == 0,
+          "HARDLINK entry declaring a nonzero xattr_count fixture is written");
+    status = sidecar_parse_fd(fd, NULL, NULL, &result);
+    check(status == SIDECAR_STATUS_CORRUPT,
+          "HARDLINK entry declaring xattrs is corruption, matching the write-side rule");
+
     raw_free(&buffer);
 }
 

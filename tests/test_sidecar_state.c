@@ -622,7 +622,7 @@ static void test_hardlink_adopt_validation(int container_fd)
 
     SidecarLog log = {0};
     check(sidecar_log_adopt_at(container_fd, &log) == SIDECAR_OPEN_UNUSABLE,
-          "adoption rejects hardlink xattrs through copy_entry");
+          "adoption rejects hardlink xattrs");
     check(reset_slot(container_fd) == 0,
           "malformed adopt fixture is removed");
 }
