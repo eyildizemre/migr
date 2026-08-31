@@ -52,6 +52,26 @@ static void write_raw(const char *path, const char *content)
     fclose(f);
 }
 
+// Like write_raw(), but writes an explicit byte range rather than a
+// NUL-terminated C string, so the fixture can carry a raw embedded NUL
+// byte -- something no strlen()/fputs()-based helper can represent.
+static void write_raw_bytes(const char *path, const char *prefix,
+                            const unsigned char *raw, size_t raw_len)
+{
+    FILE *f = fopen(path, "w");
+    if (f == NULL)
+    {
+        printf(RED "could not write fixture %s" NC "\n", path);
+        exit(1);
+    }
+    if (fputs(prefix, f) < 0 || fwrite(raw, 1, raw_len, f) != raw_len)
+    {
+        printf(RED "could not write fixture content %s" NC "\n", path);
+        exit(1);
+    }
+    fclose(f);
+}
+
 static void remove_manifest(const char *dir)
 {
     char path[512];
@@ -459,6 +479,38 @@ static void test_malformed_variants(void)
     }
 }
 
+// A raw NUL byte in the line itself, as opposed to a percent-escaped "%00"
+// in a value (test_malformed_variants already covers that -- it's
+// decode_percent_escape()'s rejection, a completely different layer that
+// runs after read_line() has already handed back a line). This exercises
+// read_line()'s own fgets()-level handling: strlen() stops at the embedded
+// NUL, and the fix must not let what's hidden past it be silently dropped.
+static void test_embedded_nul_in_line_is_refused(void)
+{
+    printf(BLUE "::" NC " versioned manifest: a raw embedded NUL byte in a line is refused, not silently truncated\n");
+    char path[512];
+    snprintf(path, sizeof(path), "%s/manifest.txt", test_dir);
+
+    // The embedded NUL sits well short of the bounded buffer's limit, with
+    // real content (and the line's genuine trailing newline) hidden past it
+    // -- proving this is caught even when the line is nowhere near "too long".
+    static const unsigned char line[] =
+        "ROOT ID=EXPLICIT_0 POLICY=MANUAL_NATIVE PAYLOAD=a SOURCE=a\0hidden-after-nul\n";
+    write_raw_bytes(path,
+        "MIGR_MANIFEST\n"
+        "VERSION=1\n"
+        "REPRESENTATION=native\n"
+        "SCOPE=critical\n"
+        "SIDECAR_VERSION=0\n"
+        "ROOT_COUNT=1\n",
+        line, sizeof(line) - 1);
+
+    Manifest m;
+    check(manifest_read_v1(test_dir, &m) == MANIFEST_STATUS_MALFORMED,
+          "an embedded NUL well short of the line-length bound is refused");
+    remove_manifest(test_dir);
+}
+
 static void test_decode_overflow_is_refused(void)
 {
     printf(BLUE "::" NC " versioned manifest: decoded path overflow is refused\n");
@@ -766,6 +818,7 @@ int main(void)
     test_legacy_detection();
     test_unknown_version();
     test_malformed_variants();
+    test_embedded_nul_in_line_is_refused();
     test_decode_overflow_is_refused();
     test_io_error();
     test_write_rejects_inconsistent_input();

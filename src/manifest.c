@@ -243,8 +243,17 @@ static int read_line(FILE *f, char *buf, size_t buf_size)
     if (fgets(buf, (int)buf_size, f) == NULL)
         return ferror(f) ? -2 : 0;
     size_t len = strlen(buf);
-    if (len == buf_size - 1 && buf[len - 1] != '\n' && !feof(f))
-        return -1; // line longer than our bound
+    int ends_with_newline = len > 0 && buf[len - 1] == '\n';
+    // fgets() stops for exactly one of three reasons: a newline was read,
+    // the buffer filled, or EOF was reached. If none of those explains why
+    // the string strlen() sees doesn't end in '\n', an embedded NUL byte
+    // cut strlen() short of fgets()'s real stopping point: the buffer was
+    // genuinely filled (this is also the too-long-line case -- an embedded
+    // NUL ahead of an oversized line would otherwise make len look short
+    // and let that check miss it). Reject rather than silently operate on
+    // a truncated line.
+    if (!ends_with_newline && !feof(f))
+        return -1;
     chomp(buf);
     return 1;
 }
