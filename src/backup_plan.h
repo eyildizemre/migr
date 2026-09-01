@@ -163,4 +163,16 @@ int backup_plan_home_relative(const char *home_real, const char *capture_path,
  */
 void backup_plan_free(BackupPlan *plan);
 
+#ifdef BACKUP_PLAN_TEST_HOOKS
+/*
+ * Fires once, inside estimate_walk_fd(), right after a directory has been
+ * opened (parent_fd, name) but before its own children are scanned -- lets
+ * a test rename that directory out from under its already-open fd, proving
+ * the walk stays anchored to the object it opened instead of re-resolving
+ * through whatever now occupies that name.
+ */
+typedef void (*BackupPlanTestDirOpenHook)(int parent_fd, const char *name);
+void backup_plan_test_set_dir_open_hook(BackupPlanTestDirOpenHook hook);
+#endif
+
 #endif

@@ -1,12 +1,14 @@
 #define _GNU_SOURCE
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <stdint.h>
+#include <unistd.h>
 
 #include "backup_plan.h"
 #include "hash.h"
@@ -807,11 +809,27 @@ static int estimate_regular_size(const struct stat *st, off_t block_size,
     return 0;
 }
 
-static int estimate_walk_path(const char *path, off_t block_size,
-                              EstimateSeen *seen, off_t *size)
+#ifdef BACKUP_PLAN_TEST_HOOKS
+static BackupPlanTestDirOpenHook estimate_walk_test_dir_open_hook;
+
+void backup_plan_test_set_dir_open_hook(BackupPlanTestDirOpenHook hook)
+{
+    estimate_walk_test_dir_open_hook = hook;
+}
+#endif
+
+/*
+ * parent_fd anchors name to the exact object a caller's own readdir()
+ * already listed -- AT_FDCWD is a valid parent_fd for an absolute or
+ * cwd-relative name (per openat()/fstatat(), a non-relative name ignores
+ * the dirfd entirely), so the top-level root call below reuses this same
+ * function instead of a separate path-based entry point.
+ */
+static int estimate_walk_fd(int parent_fd, const char *name, off_t block_size,
+                            EstimateSeen *seen, off_t *size)
 {
     struct stat st;
-    if (lstat(path, &st) != 0)
+    if (fstatat(parent_fd, name, &st, AT_SYMLINK_NOFOLLOW) != 0)
         return -1;
 
     if (S_ISREG(st.st_mode))
@@ -845,9 +863,32 @@ static int estimate_walk_path(const char *path, off_t block_size,
     if (estimate_add_size(size, st.st_size) != 0)
         return -1;
 
-    DIR *dir = opendir(path);
-    if (dir == NULL)
+    int dir_fd = openat(parent_fd, name,
+                        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (dir_fd < 0)
         return -1;
+
+#ifdef BACKUP_PLAN_TEST_HOOKS
+    /*
+     * Fires for every directory this walk opens, not just one -- unlike
+     * this codebase's usual self-clearing hooks, since a test targeting one
+     * specific directory by name needs to see every candidate to find it.
+     * The hook itself disarms via backup_plan_test_set_dir_open_hook(NULL)
+     * once it recognizes its target.
+     */
+    if (estimate_walk_test_dir_open_hook != NULL)
+        estimate_walk_test_dir_open_hook(parent_fd, name);
+#endif
+
+    int scan_fd = dup_cloexec(dir_fd);
+    DIR *dir = scan_fd < 0 ? NULL : fdopendir(scan_fd);
+    if (dir == NULL)
+    {
+        if (scan_fd >= 0)
+            close(scan_fd);
+        close(dir_fd);
+        return -1;
+    }
 
     int saved_errno = 0;
     struct dirent *entry;
@@ -865,19 +906,15 @@ static int estimate_walk_path(const char *path, off_t block_size,
             strcmp(entry->d_name, "..") == 0)
             continue;
 
-        char child[PATH_MAX];
-        if (path_join(child, sizeof(child), path, entry->d_name) != 0)
-        {
-            saved_errno = ENAMETOOLONG;
-            break;
-        }
-        if (estimate_walk_path(child, block_size, seen, size) != 0)
+        if (estimate_walk_fd(dir_fd, entry->d_name, block_size, seen, size) != 0)
         {
             saved_errno = errno != 0 ? errno : EIO;
             break;
         }
     }
     if (closedir(dir) != 0 && saved_errno == 0)
+        saved_errno = errno != 0 ? errno : EIO;
+    if (close(dir_fd) != 0 && saved_errno == 0)
         saved_errno = errno != 0 ? errno : EIO;
     if (saved_errno != 0)
     {
@@ -908,7 +945,7 @@ void backup_plan_estimate_size(const BackupPlan *plan, off_t block_size,
         off_t root_size = 0;
         size_t seen_before_root = seen.count;
         errno = 0;
-        if (estimate_walk_path(path, block_size, &seen, &root_size) != 0)
+        if (estimate_walk_fd(AT_FDCWD, path, block_size, &seen, &root_size) != 0)
         {
             int saved_errno = errno;
             seen.count = seen_before_root;

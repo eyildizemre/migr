@@ -1103,6 +1103,13 @@ static int run_backup_capturing(const char *target, BackupMode mode, char *const
         perror("pipe");
         exit(1);
     }
+    // Every check()/printf() so far in this process may still be sitting
+    // unflushed in stdio's buffer (fully buffered, since stdout/stderr
+    // aren't a tty here) -- fork() copies that buffer into the child, whose
+    // own fflush() below would otherwise duplicate all of it into the pipe
+    // this function is trying to capture as this one backup's own output.
+    fflush(stdout);
+    fflush(stderr);
     pid_t pid = fork();
     if (pid < 0)
     {
@@ -1324,6 +1331,75 @@ static void test_plan_estimate_tolerates_missing_root(void)
     backup_plan_free(&plan);
     remove_tree(home);
 }
+
+#ifdef BACKUP_PLAN_TEST_HOOKS
+static void rename_directory_out_from_under_its_open_fd(int parent_fd,
+                                                         const char *name)
+{
+    if (strcmp(name, "subdir") != 0)
+        return;
+    backup_plan_test_set_dir_open_hook(NULL);
+
+    if (renameat(parent_fd, name, parent_fd, "subdir-original") != 0)
+    {
+        printf(RED "fixture: could not stash the original directory during the race: %s" NC "\n",
+              strerror(errno));
+        exit(1);
+    }
+    if (mkdirat(parent_fd, name, 0700) != 0)
+    {
+        printf(RED "fixture: could not create the substitute directory during the race" NC "\n");
+        exit(1);
+    }
+}
+
+static void test_estimate_survives_ancestor_rename_mid_walk(void)
+{
+    printf(BLUE "::" NC " model: size estimation stays anchored to an already-opened "
+                "directory across a mid-walk ancestor rename\n");
+
+    char home[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_race_home");
+    mkdir_p(home);
+    setenv("HOME", home, 1);
+
+    char root[PATH_MAX], subdir[PATH_MAX], grandchild[PATH_MAX];
+    join_path(root, sizeof(root), home, "root");
+    join_path(subdir, sizeof(subdir), root, "subdir");
+    join_path(grandchild, sizeof(grandchild), subdir, "grandchild.txt");
+    mkdir_p(subdir);
+    write_file(grandchild, "grandchild payload");
+
+    struct stat root_st, subdir_st, grandchild_st;
+    check(lstat(root, &root_st) == 0 && lstat(subdir, &subdir_st) == 0 &&
+              lstat(grandchild, &grandchild_st) == 0,
+          "fixture: root/subdir/grandchild.txt is measurable before the race");
+    off_t expected_total =
+        root_st.st_size + subdir_st.st_size + grandchild_st.st_size;
+
+    char *paths[] = { root, NULL };
+    BackupPlan plan;
+    check(backup_plan_build(home, BACKUP_EXPLICIT_PATHS,
+                            (const char *const *)paths, &plan) == 0,
+          "the ancestor-rename estimate fixture builds");
+
+    backup_plan_test_set_dir_open_hook(
+        rename_directory_out_from_under_its_open_fd);
+
+    off_t total = -1;
+    int had_error = -1;
+    backup_plan_estimate_size(&plan, 0, &total, &had_error);
+
+    check(had_error == 0,
+          "a rename of an already-opened ancestor directory is not an estimation error");
+    check(total == expected_total,
+          "the estimate still reflects the original subtree, not whatever "
+          "now occupies the renamed directory's old name");
+
+    backup_plan_free(&plan);
+    remove_tree(home);
+}
+#endif
 
 static void test_allocation_aware_estimate(void)
 {
@@ -1883,6 +1959,9 @@ int main(void)
     test_root_count_ceiling_is_enforced();
 
     test_plan_estimate_tolerates_missing_root();
+#ifdef BACKUP_PLAN_TEST_HOOKS
+    test_estimate_survives_ancestor_rename_mid_walk();
+#endif
     test_allocation_aware_estimate();
     test_destination_space_preflight();
     test_format_duration();
