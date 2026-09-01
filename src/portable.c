@@ -504,13 +504,13 @@ static int verify_pending_readback_names(int destination_fd,
     }
     portable_readback_scan_count();
 
-    int failed = 0;
+    int scan_error = 0;
     for (;;) {
         errno = 0;
         struct dirent *entry = readdir(directory);
         if (entry == NULL) {
             if (errno != 0)
-                failed = 1;
+                scan_error = 1;
             break;
         }
         for (size_t index = 0; index < pending->count; index++) {
@@ -521,14 +521,15 @@ static int verify_pending_readback_names(int destination_fd,
             }
         }
     }
-    if (closedir(directory) != 0)
-        failed = 1;
+    int close_failed = closedir(directory) != 0;
+    int all_found = 1;
     for (size_t index = 0; index < pending->count; index++)
         if (!found[index]) {
-            failed = 1;
+            all_found = 0;
+            break;
         }
     free(found);
-    return failed ? -1 : 0;
+    return (!scan_error && !close_failed && all_found) ? 0 : -1;
 }
 
 int collect_xattrs(int fd, PortableXattrs *out)
@@ -1661,6 +1662,12 @@ static int source_symlink_target(int source_parent, const char *source_name,
     return (int)length;
 }
 
+/* Symlinks have no fd of their own for llistxattr/lgetxattr; Linux provides no
+ * *at()-style no-follow xattr syscall (docs/DECISIONS.md D18 C-8). This is the
+ * one place that must re-derive /proc/self/fd/<parent>/<name> instead of using
+ * the fd-relative (source_parent, source_name) addressing every other source
+ * operation uses. If how those arguments are formed ever changes, this
+ * reconstruction must change with it; nothing enforces that at compile time. */
 static int source_symlink_xattr_path(int source_parent,
                                      const char *source_name,
                                      const char *root_path, char *path,
@@ -3044,6 +3051,15 @@ int portable_capture_resume_prepared_at(
     }
     ManifestIdentityComparison identity =
         manifest_resume_identity_compare(&existing, &prepared->manifest);
+    if (identity == MANIFEST_IDENTITY_ERROR)
+    {
+        /* An allocation failure while comparing is an operational fault, not
+         * proof this container is a different job (docs/DECISIONS.md D15;
+         * manifest.h's MANIFEST_IDENTITY_ERROR contract). Both branches still
+         * refuse resume today; keeping them separate prevents this distinction
+         * from disappearing if a future change handles them differently. */
+        goto done;
+    }
     if (identity != MANIFEST_IDENTITY_EQUAL) {
         goto done;
     }
