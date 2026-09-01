@@ -7,7 +7,7 @@
 
 extern int verbose; /**< Non-zero when -v is passed; enables per-file progress output. */
 extern int dry_run; /**< Non-zero when -n/--dry-run is passed; suppresses all writes. */
-extern int color_enabled; /**< Non-zero when status colors are enabled for stdout. */
+extern int color_enabled; /**< Non-zero when status colors are enabled for stderr. */
 
 /** @brief Prints a complete error message, optionally in bold red. */
 void print_error(const char *fmt, ...);

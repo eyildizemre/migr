@@ -821,6 +821,12 @@ test_errors() {
     assert_exits_nonzero ../migr backup "$BACKUP_DIR" --summary
     assert_exits_nonzero ../migr restore "$BACKUP_DIR" --summary
 
+    # dry-run is a backup/restore-only presentation mode
+    assert_fails_with "Error: --dry-run applies only to 'backup' or 'restore'." \
+        ../migr report --dry-run
+    assert_fails_with "Error: --dry-run applies only to 'backup' or 'restore'." \
+        ../migr --dry-run
+
     # commands that take exactly one positional reject extras
     assert_exits_nonzero ../migr restore "$BACKUP_DIR" /tmp/extra
 

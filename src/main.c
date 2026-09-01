@@ -87,7 +87,7 @@ int main(int argc, char *argv[])
         action_lookup(argv[1], &action);
         if (action == ACTION_NONE)
         {
-            printf("Unknown command: %s\n", argv[1]);
+            print_error("Unknown command: %s\n", argv[1]);
             return 1;
         }
         optind = 2; // Start parsing after the first argument (the action)
@@ -145,7 +145,7 @@ int main(int argc, char *argv[])
             break;
         case '?':
         default:
-            printf("For help: ./migr --help\n");
+            print_error("For help: ./migr --help\n");
             return 1;
         }
     }
@@ -198,6 +198,11 @@ int main(int argc, char *argv[])
     if (max_depth_given && action != ACTION_REPORT && action != ACTION_NONE)
     {
         print_error("Error: --max-depth applies only to 'report'.\n");
+        return 1;
+    }
+    if (dry_run && action != ACTION_BACKUP && action != ACTION_RESTORE)
+    {
+        print_error("Error: --dry-run applies only to 'backup' or 'restore'.\n");
         return 1;
     }
     if (path != NULL && (action == ACTION_REPORT || action == ACTION_NONE))
