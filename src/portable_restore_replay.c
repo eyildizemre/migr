@@ -27,7 +27,6 @@ typedef struct {
     size_t root_index;
     size_t hardlink_ref_root_index;
     char destination[PATH_MAX];
-    char destination_relative[PATH_MAX];
     char hardlink_ref_relative[PATH_MAX];
     size_t depth;
 } ReplayEntry;
@@ -466,33 +465,6 @@ static int replay_collect_entry(const SidecarLiveView *view, void *argument)
                               root_index, entry->logical_path);
         return 1;
     }
-    if (root->policy == ROOT_POLICY_XDG)
-    {
-        int length = snprintf(replay->destination_relative,
-                              sizeof(replay->destination_relative), "%s",
-                              logical);
-        if (length < 0 ||
-            (size_t)length >= sizeof(replay->destination_relative))
-        {
-            replay_report_failure(collection->report, collection->manifest,
-                                  root_index, entry->logical_path);
-            return 1;
-        }
-    }
-    else
-    {
-        int length = snprintf(replay->destination_relative,
-                              sizeof(replay->destination_relative), "%s",
-                              replay->destination);
-        if (length < 0 ||
-            (size_t)length >= sizeof(replay->destination_relative))
-        {
-            replay_report_failure(collection->report,
-                                  collection->manifest, root_index,
-                                  entry->logical_path);
-            return 1;
-        }
-    }
     replay->entry = entry;
     replay->xattrs = view->xattrs;
     replay->xattr_count = view->xattr_count;
@@ -814,20 +786,51 @@ static int replay_destination_parent_for_root(
     return result;
 }
 
+// Recovers the relative-path value replay->destination_relative used to
+// cache: the XDG-relative logical path for an XDG root, or the resolved
+// destination itself otherwise. Computed on demand instead of stored --
+// both source values (entry->logical_path, replay->destination) are
+// already validated to fit at collect time, so this cannot fail in
+// practice, but the caller-supplied buffer is still bounds-checked.
+static int replay_destination_relative(const ManifestRoot *root,
+                                       const ReplayEntry *replay,
+                                       char *out, size_t out_size)
+{
+    if (root->policy == ROOT_POLICY_XDG)
+    {
+        char logical[PATH_MAX];
+        replay_copy_bytes(logical, sizeof(logical),
+                          replay->entry->logical_path);
+        int length = snprintf(out, out_size, "%s", logical);
+        return (length < 0 || (size_t)length >= out_size) ? -1 : 0;
+    }
+    int length = snprintf(out, out_size, "%s", replay->destination);
+    return (length < 0 || (size_t)length >= out_size) ? -1 : 0;
+}
+
 static int replay_destination_parent(const ReplayCollection *collection,
                                      const ReplayEntry *replay,
                                      int *parent_out, char *leaf,
                                      size_t leaf_size)
 {
-    if (collection == NULL || replay == NULL || parent_out == NULL ||
-        leaf == NULL)
+    if (collection == NULL || collection->manifest == NULL ||
+        replay == NULL || parent_out == NULL || leaf == NULL ||
+        replay->root_index >= (size_t)collection->manifest->root_count)
     {
         errno = EINVAL;
         return -1;
     }
-    return replay_destination_parent_for_root(
-        collection, replay->root_index, replay->destination_relative,
-        parent_out, leaf, leaf_size);
+    const ManifestRoot *root = &collection->manifest->roots[replay->root_index];
+    char relative[PATH_MAX];
+    if (replay_destination_relative(root, replay, relative,
+                                    sizeof(relative)) != 0)
+    {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return replay_destination_parent_for_root(collection, replay->root_index,
+                                              relative, parent_out, leaf,
+                                              leaf_size);
 }
 
 static int replay_apply_regular(ReplayCollection *collection,
@@ -859,9 +862,14 @@ static int replay_apply_regular(ReplayCollection *collection,
         result = replay_open_destination_regular(parent_fd, leaf,
                                                  &destination_fd);
     if (result == 0 && collection->capture_report != NULL)
-        snprintf(collection->capture_report->current_path,
-                 sizeof(collection->capture_report->current_path), "%s",
-                 replay->destination_relative);
+    {
+        char relative[PATH_MAX];
+        if (replay_destination_relative(root, replay, relative,
+                                        sizeof(relative)) == 0)
+            snprintf(collection->capture_report->current_path,
+                     sizeof(collection->capture_report->current_path), "%s",
+                     relative);
+    }
     if (result == 0)
         result = portable_copy_regular(
             source_fd, destination_fd, (off_t)entry->size,
