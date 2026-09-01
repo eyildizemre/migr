@@ -3,7 +3,7 @@
 
 #include <stddef.h>
 
-/* Shared between portable.c and portable_fsops.c only. */
+/* Shared between portable.c, portable_fsops.c, and portable_reconcile.c. */
 
 /* portable.c -- needed by portable_fsops.c. */
 size_t bounded_strlen(const char *value, size_t maximum);

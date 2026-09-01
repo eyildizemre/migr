@@ -60,8 +60,6 @@ int open_child_directory(int parent_fd, const char *name)
                   O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
 }
 
-int remove_leaf(int parent_fd, const char *name);
-
 int remove_directory_tree(int parent_fd, const char *name)
 {
     int directory_fd = openat(parent_fd, name,
@@ -241,7 +239,12 @@ int open_existing_payload_parent(int data_fd, const char *relative,
             errno = saved;
             return -1;
         }
-        close(current);
+        if (close(current) != 0) {
+            int saved = errno;
+            close(next);
+            errno = saved;
+            return -1;
+        }
         current = next;
         cursor = slash + 1;
     }
