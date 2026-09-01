@@ -15,6 +15,16 @@ typedef struct {
     const char *path;
 } MetadataXattrTarget;
 
+#ifdef METADATA_XATTR_TEST_HOOKS
+static MetadataXattrTestSymlinkRaceHook metadata_xattr_test_symlink_race_hook;
+
+void metadata_xattr_test_set_symlink_race_hook(
+    MetadataXattrTestSymlinkRaceHook hook)
+{
+    metadata_xattr_test_symlink_race_hook = hook;
+}
+#endif
+
 static int metadata_xattr_unsupported_errno(int value)
 {
     return value == ENOTSUP || value == EOPNOTSUPP || value == ENODATA;
@@ -381,9 +391,38 @@ int metadata_apply_xattrs_symlink_at_report(
         !S_ISLNK(st.st_mode))
         return -1;
 
+#ifdef METADATA_XATTR_TEST_HOOKS
+    if (metadata_xattr_test_symlink_race_hook != NULL)
+    {
+        MetadataXattrTestSymlinkRaceHook hook =
+            metadata_xattr_test_symlink_race_hook;
+        metadata_xattr_test_symlink_race_hook = NULL;
+        hook(dir_fd, leaf);
+    }
+#endif
+
     MetadataXattrTarget target = { .fd = -1, .path = path };
-    return metadata_apply_xattrs_target(&target, xattrs, count,
-                                        skipped_security_count);
+    int result = metadata_apply_xattrs_target(&target, xattrs, count,
+                                              skipped_security_count);
+    if (result != 0)
+        return result;
+
+    /*
+     * The xattr syscalls above re-resolved path (the /proc/self/fd magic
+     * symlink) fresh on every call instead of reusing the object st just
+     * verified -- a concurrent actor on a shared/network destination mount
+     * could have swapped leaf for a different object in that window. This
+     * can't prevent the swap (no fd-based no-follow xattr syscall exists
+     * here to anchor the whole sequence to one resolved object), but it
+     * detects it instead of silently succeeding against the wrong object.
+     */
+    struct stat post_st;
+    if (fstatat(dir_fd, leaf, &post_st, AT_SYMLINK_NOFOLLOW) != 0 ||
+        !S_ISLNK(post_st.st_mode) || post_st.st_dev != st.st_dev ||
+        post_st.st_ino != st.st_ino)
+        return -1;
+
+    return 0;
 }
 
 typedef enum {

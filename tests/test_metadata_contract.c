@@ -1543,6 +1543,57 @@ static void test_metadata_apply_split_equivalence(void)
     remove_tree(base);
 }
 
+#ifdef METADATA_XATTR_TEST_HOOKS
+static void swap_leaf_with_regular_file(int dir_fd, const char *leaf)
+{
+    if (unlinkat(dir_fd, leaf, 0) != 0)
+        fatal("could not unlink the symlink during the race simulation");
+    int fd = openat(dir_fd, leaf, O_CREAT | O_WRONLY | O_EXCL, 0600);
+    if (fd < 0)
+        fatal("could not create the race-replacement regular file");
+    if (write(fd, "not a symlink", 13) != 13)
+        fatal("could not write the race-replacement regular file");
+    close(fd);
+}
+
+/*
+ * An empty xattr set exercises metadata_apply_xattrs_symlink_at_report()'s
+ * pre-check/hook/post-check sequence without ever reaching a real xattr
+ * write syscall on the symlink -- l*xattr writes on a symlink itself are
+ * refused (EPERM) by ordinary Linux filesystems regardless of namespace
+ * (confirmed directly on this host: user./trusted./security. all refused
+ * via setfattr -h), so a real round-trip isn't available to test against
+ * here. The identity check this fix adds doesn't care whether any xattr
+ * was actually written -- only whether the leaf is still the object the
+ * pre-check verified -- so an empty set is a faithful, always-runnable
+ * exercise of exactly that logic.
+ */
+static void test_metadata_apply_xattrs_symlink_race(void)
+{
+    const char *case_name = "xattr-race";
+    char base[PATH_MAX], link_path[PATH_MAX];
+    make_temp_root(base, sizeof(base));
+    join_or_die(link_path, sizeof(link_path), base, "link");
+    if (symlink("original-target", link_path) != 0)
+        fatal("could not create the symlink race fixture");
+
+    int dir_fd = open_directory(base);
+
+    check_result(metadata_apply_xattrs_symlink_at_report(
+                     dir_fd, "link", NULL, 0, NULL) == 0,
+                 case_name, "applying an empty set to an untouched symlink succeeds");
+
+    metadata_xattr_test_set_symlink_race_hook(swap_leaf_with_regular_file);
+    check_result(metadata_apply_xattrs_symlink_at_report(
+                     dir_fd, "link", NULL, 0, NULL) != 0,
+                 case_name,
+                 "a leaf swapped mid-window is detected, not silently accepted");
+
+    close(dir_fd);
+    remove_tree(base);
+}
+#endif
+
 int main(void)
 {
     printf(BLUE "::" NC " native file-kind metadata contract (entry gate)\n");
@@ -1569,6 +1620,9 @@ int main(void)
     test_metadata_apply_split_equivalence();
     test_foreign_ownership_gap();
     test_native_xattrs_captured();
+#ifdef METADATA_XATTR_TEST_HOOKS
+    test_metadata_apply_xattrs_symlink_race();
+#endif
 
     if (failures != 0)
     {

@@ -151,4 +151,16 @@ int metadata_apply_xattrs_symlink_at_report(
     int dir_fd, const char *leaf, const SidecarXattr *xattrs, size_t count,
     size_t *skipped_security_count);
 
+#ifdef METADATA_XATTR_TEST_HOOKS
+/*
+ * Fires once, inside metadata_apply_xattrs_symlink_at_report(), between its
+ * pre-check fstatat() and the xattr syscalls -- lets a test replace dir_fd's
+ * leaf with a different object right in the TOCTOU window the syscalls'
+ * fresh /proc/self/fd re-resolution opens up.
+ */
+typedef void (*MetadataXattrTestSymlinkRaceHook)(int dir_fd, const char *leaf);
+void metadata_xattr_test_set_symlink_race_hook(
+    MetadataXattrTestSymlinkRaceHook hook);
+#endif
+
 #endif
