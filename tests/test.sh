@@ -140,6 +140,26 @@ assert_fails_with() {
     fi
 }
 
+# The success-path counterpart to assert_fails_with(): the command must exit
+# zero AND print the expected text -- used for -h/--help, which must win over
+# every other flag/action combination rather than being caught by a
+# cross-cutting scope check meant for ordinary arguments.
+assert_succeeds_with() {
+    local expected="$1"; shift
+    local out rc
+    set +e
+    out=$("$@" 2>&1)
+    rc=$?
+    set -e
+    if [ "$rc" -eq 0 ] && [[ "$out" == *"$expected"* ]]; then
+        echo -e "  ${GREEN}✓${NC} Succeeded with '$expected': $*"
+    else
+        echo -e "  ${RED}✗${NC} Expected zero exit and '$expected' from: $*"
+        echo "  exit=$rc  output: $out"
+        exit 1
+    fi
+}
+
 # The finalized and in-progress container grammars (docs/DECISIONS.md D15) are
 # matched separately and exactly. A glob that accepts either would let a test
 # treat a leftover ".partial" — the one thing a successful backup must never
@@ -816,6 +836,16 @@ test_errors() {
     mkdir -p "$HOME/dir_a/nested"
     assert_fails_with "overlap" ../migr backup "$BACKUP_DIR" "$HOME/dir_a" "$HOME/dir_a/nested"
     assert_fails_with "overlap" ../migr backup "$BACKUP_DIR" "$HOME/dir_a" "$HOME/dir_a/nested" --dry-run
+
+    # -h/--help must win over a scope-only flag that would otherwise be
+    # rejected as "applies only to backup/report" -- the user asked for help,
+    # not a scope validation error.
+    assert_succeeds_with "Usage:" ../migr backup --critical --help
+    assert_succeeds_with "Usage:" ../migr report --summary --help
+    assert_succeeds_with "Usage:" ../migr report --max-depth=2 --help
+    assert_succeeds_with "Usage:" ../migr help --critical
+    # ...but a genuine conflict detected before --help is even parsed still refuses.
+    assert_exits_nonzero ../migr backup --critical --comprehensive --help
 }
 
 test_truncation() {

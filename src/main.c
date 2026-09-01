@@ -150,6 +150,17 @@ int main(int argc, char *argv[])
         }
     }
 
+    // -h/--help (or the "help" command word) always shows help, regardless of
+    // what other flags were given alongside it -- checked before the
+    // cross-cutting scope checks below, which would otherwise read the
+    // now-overwritten action and reject an unrelated flag/action combination
+    // instead of ever reaching the ACTION_HELP dispatch.
+    if (action == ACTION_HELP)
+    {
+        print_help();
+        return 0;
+    }
+
     if (optind < argc)
     {
         // First positional is the destination (or source, for restore). Any further
@@ -232,7 +243,7 @@ int main(int argc, char *argv[])
             ret = restore(path);
             break;
         case ACTION_HELP:
-            print_help();
+            // Unreachable: handled immediately after the getopt loop, above.
             break;
     }
 
