@@ -811,6 +811,44 @@ static void test_stale_claim_directory_vanishes_before_mutation_descent(
     close(fixture.container_fd);
 }
 
+static void test_remove_payload_relative_close_failures(const char *base)
+{
+    printf(BLUE "::" NC " remove_payload_relative stays a no-op when an "
+                 "unrelated close() also fails\n");
+    char root[PATH_MAX];
+    join_path(root, sizeof(root), base, "remove-payload-relative");
+    make_directory(root);
+    char data[PATH_MAX];
+    join_path(data, sizeof(data), root, "data");
+    make_directory(data);
+    int data_fd = open(data, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (data_fd < 0)
+        fixture_fatal("could not open remove_payload_relative data fixture");
+
+    /* The payload root itself ("MISSING") doesn't exist -- the single-
+     * component path resolves trivially, but open_child_directory() fails
+     * with ENOENT -- and the subsequent close(root_parent) is forced to
+     * also fail with a genuine EBADF (closed one call early by the hook). */
+    portable_test_close_remove_payload_root_parent_early();
+    check(remove_payload_relative(data_fd, "MISSING", "leaf") == 0,
+          "an absent payload root is still a no-op when the root-parent "
+          "close also fails");
+
+    /* The payload root ("ROOT") exists, but the physical path's
+     * intermediate directory ("ROOT/subdir") doesn't -- and the subsequent
+     * close(payload_fd) is forced to also fail the same way. */
+    char payload_root[PATH_MAX];
+    join_path(payload_root, sizeof(payload_root), data, "ROOT");
+    make_directory(payload_root);
+    portable_test_close_remove_payload_payload_fd_early();
+    check(remove_payload_relative(data_fd, "ROOT", "subdir/leaf") == 0,
+          "an absent physical parent is still a no-op when the payload-fd "
+          "close also fails");
+
+    close(data_fd);
+    remove_tree(root);
+}
+
 static void test_cleanup_failure(const char *base)
 {
     printf(BLUE "::" NC " stale cleanup failure gate\n");
@@ -927,6 +965,7 @@ int main(void)
     test_stale_claim_child_vanishes_during_validation(base);
     test_stale_claim_directory_vanishes_before_validation_descent(base);
     test_stale_claim_directory_vanishes_before_mutation_descent(base);
+    test_remove_payload_relative_close_failures(base);
     test_cleanup_failure(base);
     test_inventory_mismatch(base);
     test_interruption_boundaries(base);
