@@ -4,13 +4,20 @@
 /**
  * @brief Restores files and packages from a backup directory to HOME.
  *
- * Prompts for user confirmation, then copies main directories, dotfiles, and
- * browser profiles from source back to their correct locations in HOME. Reads
- * manifest.txt to resolve cross-locale XDG directory names (e.g. "Belgeler"
- * on the source system maps to Documents on an English target system). Falls
- * back to the target system's basename if manifest.txt is absent. If
- * packages.txt is present, installs the listed packages via the distro's
- * package manager.
+ * Refuses a ".partial" (in-progress or abandoned) container, an unknown or
+ * malformed manifest.txt, or a finalized versioned container with a missing
+ * or legacy manifest before prompting or mutating the destination. A valid v1
+ * manifest selects between two independent representation-driven code paths:
+ * a native tree (fd-anchored, exact metadata) or a portable sidecar
+ * (percent-encoded names, xattrs sidecar, hardlink groups). Legacy or
+ * unversioned backups use the native path. A free-space preflight check can
+ * abort the restore before any confirmation prompt if the destination can't
+ * hold it. --dry-run previews the same plan and checks without prompting or
+ * mutating anything. manifest.txt (when present) resolves cross-locale XDG
+ * directory names (e.g. "Belgeler" on the source system maps to Documents
+ * on an English target system); its absence falls back to the target system's
+ * basename. If packages.txt is present, installs the listed packages via the
+ * distro's package manager.
  *
  * @param source Path to the dated backup directory (e.g. /mnt/drive/migr_backup_20260519).
  * @return 0 on success or user cancellation, 1 on error.

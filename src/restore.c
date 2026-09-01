@@ -470,7 +470,11 @@ static int restore_item_at(const CloneContext *ctx,
     }
     if (timestamp_anchors != NULL)
         effective_ctx.timestamp_policy_configured = 1;
-    close(policy_anchor_fd);
+    if (close(policy_anchor_fd) != 0)
+    {
+        print_error("Error: Failed to inspect restore destination for %s\n", label);
+        return -1;
+    }
     const CloneContext *run_ctx = &effective_ctx;
 
     if (dry_run)
@@ -703,7 +707,8 @@ static int restore_legacy(const char *source, int source_root_fd, const char *ho
         else if (rc < 0)
             *had_error = 1;
 
-        close(xdg_dest_fd);
+        if (close(xdg_dest_fd) != 0)
+            *had_error = 1;
     }
 
     for (int i = 0; i < XDG_RESTORE_COUNT; i++)
@@ -1132,8 +1137,9 @@ static RestoreNativeStatus restore_v1_metadata_inventory(
         char destination_rel[PATH_MAX + 8];
         if (root->policy == ROOT_POLICY_HOME_RELATIVE)
         {
-            if (snprintf(destination_rel, sizeof(destination_rel), "%s",
-                         root->restore_path) >= (int)sizeof(destination_rel))
+            int n = snprintf(destination_rel, sizeof(destination_rel), "%s",
+                             root->restore_path);
+            if (n < 0 || (size_t)n >= sizeof(destination_rel))
             {
                 failed = 1;
                 continue;
@@ -1281,7 +1287,8 @@ static void restore_v1(const char *source, int source_root_fd, const char *home,
             (*count)++;
         else if (rc < 0)
             *had_error = 1;
-        close(xdg_dest_fd);
+        if (close(xdg_dest_fd) != 0)
+            *had_error = 1;
     }
 
     if (xdg_dirs_ready)
