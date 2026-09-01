@@ -1097,8 +1097,19 @@ static int backup_dry_run(const char *target, BackupMode mode,
         if (prepare_result != 0)
         {
             portable_prepared_capture_free(&advisory_prepared);
-            print_error("Error: portable pre-scan failed or found an unresolvable "
-                   "conflict at %s; nothing would be created\n", target);
+            int has_manual_native = 0;
+            for (int i = 0; i < plan->root_count; i++)
+                if (plan->roots[i].manifest_root.policy ==
+                    ROOT_POLICY_MANUAL_NATIVE)
+                    has_manual_native = 1;
+            if (has_manual_native)
+                print_error("Error: %s cannot hold Linux metadata natively, and portable "
+                       "capture cannot carry an external (manual-native) root's "
+                       "restore address; move or drop the external path(s) to "
+                       "back up here.\n", target);
+            else
+                print_error("Error: portable pre-scan failed or found an unresolvable "
+                       "conflict at %s; nothing would be created\n", target);
             close(advisory_fd);
             metadata_profiles_free(&advisory_profiles);
             manifest_free(manifest);
