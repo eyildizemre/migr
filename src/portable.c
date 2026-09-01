@@ -483,6 +483,19 @@ static int encoded_name_has_raw_high_byte(const char *encoded)
     return 0;
 }
 
+typedef struct {
+    const char *name;
+    size_t original_index;
+} PendingReadbackNameRef;
+
+static int pending_readback_name_ref_compare(const void *left,
+                                             const void *right)
+{
+    const PendingReadbackNameRef *left_ref = left;
+    const PendingReadbackNameRef *right_ref = right;
+    return strcmp(left_ref->name, right_ref->name);
+}
+
 static int verify_pending_readback_names(int destination_fd,
                                          const PendingReadbackNames *pending)
 {
@@ -494,11 +507,25 @@ static int verify_pending_readback_names(int destination_fd,
     unsigned char *found = calloc(pending->count, sizeof(*found));
     if (found == NULL)
         return -1;
+    PendingReadbackNameRef *sorted =
+        malloc(pending->count * sizeof(*sorted));
+    if (sorted == NULL) {
+        free(found);
+        return -1;
+    }
+    for (size_t index = 0; index < pending->count; index++) {
+        sorted[index].name = pending->names[index];
+        sorted[index].original_index = index;
+    }
+    qsort(sorted, pending->count, sizeof(*sorted),
+          pending_readback_name_ref_compare);
+
     int scan_fd = dup_cloexec(destination_fd);
     DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
     if (directory == NULL) {
         if (scan_fd >= 0)
             close(scan_fd);
+        free(sorted);
         free(found);
         return -1;
     }
@@ -513,15 +540,21 @@ static int verify_pending_readback_names(int destination_fd,
                 scan_error = 1;
             break;
         }
-        for (size_t index = 0; index < pending->count; index++) {
-            if (!found[index] &&
-                strcmp(entry->d_name, pending->names[index]) == 0) {
-                found[index] = 1;
-                break;
-            }
+        size_t low = 0;
+        size_t high = pending->count;
+        while (low < high) {
+            size_t middle = low + (high - low) / 2U;
+            if (strcmp(sorted[middle].name, entry->d_name) < 0)
+                low = middle + 1U;
+            else
+                high = middle;
         }
+        if (low < pending->count &&
+            strcmp(sorted[low].name, entry->d_name) == 0)
+            found[sorted[low].original_index] = 1;
     }
     int close_failed = closedir(directory) != 0;
+    free(sorted);
     int all_found = 1;
     for (size_t index = 0; index < pending->count; index++)
         if (!found[index]) {
@@ -1873,6 +1906,7 @@ static int capture_directory(PortableCaptureContext *context,
         observed_skeletons.hash_salt = sidecar_process_salt();
     if (!context->case_sensitive)
         observed_ascii.hash_salt = sidecar_process_salt();
+    size_t payload_root_length = strlen(root->payload_path);
     for (;;) {
         errno = 0;
         struct dirent *entry = readdir(directory);
@@ -1957,7 +1991,6 @@ static int capture_directory(PortableCaptureContext *context,
             break;
         }
 
-        size_t payload_root_length = strlen(root->payload_path);
         size_t physical_length = strlen(child_physical);
         if (!portable_payload_path_fits(payload_root_length, physical_length,
                                         PATH_MAX)) {
