@@ -2722,6 +2722,7 @@ static RestoreNativeStatus restore_entry_symlink(
         if (source_is_root || dest_is_root || dest_exists)
         {
             close(source_object_fd);
+            restore_report_failure(restore_report, logical_path);
             return -1;
         }
 
@@ -2737,6 +2738,7 @@ static RestoreNativeStatus restore_entry_symlink(
                                                &namespaces) != 0)
             {
                 close(source_object_fd);
+                restore_report_failure(restore_report, logical_path);
                 return -1;
             }
             if (xattr_requirements != NULL)
@@ -2759,6 +2761,7 @@ static RestoreNativeStatus restore_entry_symlink(
         if (len < 0 || (size_t)len == sizeof(target) - 1)
         {
             close(source_object_fd);
+            restore_report_failure(restore_report, logical_path);
             return -1;
         }
         struct stat after;
@@ -2767,6 +2770,7 @@ static RestoreNativeStatus restore_entry_symlink(
             !metadata_symlink_unchanged(&desired_st, &after))
         {
             close(source_object_fd);
+            restore_report_failure(restore_report, logical_path);
             return -1;
         }
         close(source_object_fd);
@@ -2789,11 +2793,13 @@ static RestoreNativeStatus restore_entry_symlink(
         if (failed)
         {
             xattrs_free(&xattrs);
+            restore_report_failure(restore_report, logical_path);
             return RESTORE_NATIVE_ERROR;
         }
         if (symlinkat(target, dest_parent_fd, dest_leaf) != 0)
         {
             xattrs_free(&xattrs);
+            restore_report_failure(restore_report, logical_path);
             return -1;
         }
         failed = metadata_apply_symlink_ownership_at(dest_parent_fd, dest_leaf,
@@ -2836,6 +2842,7 @@ static RestoreNativeStatus restore_entry_regular(
             (dest_exists && !S_ISREG(dest_st.st_mode)))
         {
             close(source_object_fd);
+            restore_report_failure(restore_report, logical_path);
             return -1;
         }
 
@@ -2855,6 +2862,7 @@ static RestoreNativeStatus restore_entry_regular(
         {
             if (src_fd >= 0)
                 close(src_fd);
+            restore_report_failure(restore_report, logical_path);
             return RESTORE_NATIVE_ERROR;
         }
         if (pass == RESTORE_VALIDATE)
@@ -2865,6 +2873,7 @@ static RestoreNativeStatus restore_entry_regular(
                 if (metadata_xattr_namespaces_fd(src_fd, &namespaces) != 0)
                 {
                     close(src_fd);
+                    restore_report_failure(restore_report, logical_path);
                     return RESTORE_NATIVE_ERROR;
                 }
                 if (xattr_requirements != NULL)
@@ -2874,7 +2883,10 @@ static RestoreNativeStatus restore_entry_regular(
                     metadata_profiles_note_security_xattr(profiles);
             }
             native_restore_estimate_regular(estimate, &opened_source_st);
-            return close(src_fd) == 0 ? RESTORE_NATIVE_OK : RESTORE_NATIVE_ERROR;
+            if (close(src_fd) == 0)
+                return RESTORE_NATIVE_OK;
+            restore_report_failure(restore_report, logical_path);
+            return RESTORE_NATIVE_ERROR;
         }
 
         if (ctx->inode_map != NULL && opened_source_st.st_nlink > 1)
@@ -2906,6 +2918,7 @@ static RestoreNativeStatus restore_entry_regular(
         if (dst_fd < 0)
         {
             close(src_fd);
+            restore_report_failure(restore_report, logical_path);
             return -1;
         }
         MetadataTimestampPolicy policy = metadata_policy_from_context(ctx);
@@ -2945,6 +2958,7 @@ static RestoreNativeStatus restore_entry_regular(
         {
             close(src_fd);
             close(dst_fd);
+            restore_report_failure(restore_report, logical_path);
             return -1;
         }
 
@@ -3000,6 +3014,7 @@ static RestoreNativeStatus restore_entry_directory(
         if (dest_exists && !S_ISDIR(dest_st.st_mode))
         {
             close(source_object_fd);
+            restore_report_failure(restore_report, logical_path);
             return -1;
         }
 
@@ -3019,6 +3034,7 @@ static RestoreNativeStatus restore_entry_directory(
         {
             if (source_dir_fd >= 0)
                 close(source_dir_fd);
+            restore_report_failure(restore_report, logical_path);
             return RESTORE_NATIVE_ERROR;
         }
         native_restore_estimate_add_bytes(estimate, opened_source_st.st_size);
@@ -3030,6 +3046,7 @@ static RestoreNativeStatus restore_entry_directory(
             if (metadata_xattr_namespaces_fd(source_dir_fd, &namespaces) != 0)
             {
                 close(source_dir_fd);
+                restore_report_failure(restore_report, logical_path);
                 return RESTORE_NATIVE_ERROR;
             }
             if (xattr_requirements != NULL)
@@ -3044,6 +3061,7 @@ static RestoreNativeStatus restore_entry_directory(
         if (dest_dir_fd == -1)
         {
             close(source_dir_fd);
+            restore_report_failure(restore_report, logical_path);
             return -1;
         }
         if (dest_dir_fd == -2)
@@ -3058,6 +3076,7 @@ static RestoreNativeStatus restore_entry_directory(
             close(source_dir_fd);
             if (dest_dir_fd >= 0)
                 close(dest_dir_fd);
+            restore_report_failure(restore_report, logical_path);
             return -1;
         }
 
@@ -3133,6 +3152,7 @@ static RestoreNativeStatus restore_entry_fifo(
             (dest_exists && !S_ISFIFO(dest_st.st_mode)))
         {
             close(source_object_fd);
+            restore_report_failure(restore_report, logical_path);
             return -1;
         }
         close(source_object_fd);
@@ -3145,7 +3165,10 @@ static RestoreNativeStatus restore_entry_fifo(
                                             desired_st.st_mode & 07777,
                                             &opened_dest_st);
         if (dest_fd < 0)
+        {
+            restore_report_failure(restore_report, logical_path);
             return -1;
+        }
         int failed = metadata_apply_fd(dest_fd, &desired_st,
                                        metadata_policy_from_context(ctx)) != 0;
         if (close(dest_fd) != 0)
@@ -3196,7 +3219,10 @@ static RestoreNativeStatus restore_entry_at(
     BackupCaptureReport *capture_report, int depth)
 {
     if (depth > RESTORE_MAX_DEPTH)
+    {
+        restore_report_failure(restore_report, logical_path);
         return -1;
+    }
 
     int source_is_root = source_leaf[0] == '\0';
     int dest_is_root = dest_leaf[0] == '\0';
@@ -3205,7 +3231,10 @@ static RestoreNativeStatus restore_entry_at(
     int source_object_fd = open_source_object(source_parent_fd, source_leaf,
                                                &source_st);
     if (source_object_fd < 0)
+    {
+        restore_report_failure(restore_report, logical_path);
         return -1;
+    }
 
     struct stat dest_st;
     int dest_exists;
@@ -3213,11 +3242,13 @@ static RestoreNativeStatus restore_entry_at(
                            &dest_exists) != 0)
     {
         close(source_object_fd);
+        restore_report_failure(restore_report, logical_path);
         return -1;
     }
     if (dest_exists && S_ISLNK(dest_st.st_mode))
     {
         close(source_object_fd);
+        restore_report_failure(restore_report, logical_path);
         return -1;
     }
 
@@ -3227,6 +3258,7 @@ static RestoreNativeStatus restore_entry_at(
         if (metadata_snapshot_record(snapshots, &source_st) != 0)
         {
             close(source_object_fd);
+            restore_report_failure(restore_report, logical_path);
             return -1;
         }
         // One profile anchor governs the whole restore root.  It is the
@@ -3247,6 +3279,7 @@ static RestoreNativeStatus restore_entry_at(
         if (profile_failed)
         {
             close(source_object_fd);
+            restore_report_failure(restore_report, logical_path);
             return -1;
         }
     }
@@ -3258,6 +3291,7 @@ static RestoreNativeStatus restore_entry_at(
             metadata_snapshot_to_stat(snapshot, &desired_st) != 0)
         {
             close(source_object_fd);
+            restore_report_failure(restore_report, logical_path);
             return -1;
         }
     }
@@ -3303,6 +3337,7 @@ static RestoreNativeStatus restore_entry_at(
                                     source_st);
 
     close(source_object_fd);
+    restore_report_failure(restore_report, logical_path);
     return -1;
 }
 

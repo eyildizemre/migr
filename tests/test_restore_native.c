@@ -1041,6 +1041,63 @@ static void test_rejects_excessive_recursion_depth(void)
     remove_tree(dest_root);
 }
 
+// Regression test for the guard-clause failure branches that used to return
+// an error without ever calling restore_report_failure(): before that fix, a
+// deep nested entry hitting a guard clause bubbled up as an unreported
+// failure through every ancestor directory's aggregator (each one assuming
+// its child already reported), and restore_native_at_report()'s own backstop
+// then attributed the whole failure to the top-level source_rel ("root")
+// instead of the actual entry that failed. The depth-limit guard is a fully
+// deterministic way to trigger a guard-clause failure at a known, deeply
+// nested logical_path -- no race or readdir-order dependency required.
+static void test_reports_the_actual_nested_entry_that_exceeded_depth(void)
+{
+    printf(BLUE "::" NC " restore_native_at_report: a guard-clause failure deep in the tree is attributed to its own nested path, not the restore root\n");
+
+    char source_root[PATH_MAX], dest_root[PATH_MAX];
+    fresh_mkdtemp(source_root, sizeof(source_root), "restore_deep_report_src");
+    fresh_mkdtemp(dest_root, sizeof(dest_root), "restore_deep_report_dst");
+
+    char cursor[PATH_MAX];
+    int n = snprintf(cursor, sizeof(cursor), "%s/root", source_root);
+    if (n < 0 || (size_t)n >= sizeof(cursor) || mkdir(cursor, 0755) != 0)
+    {
+        printf(RED "fixture: could not create the deep-nesting root" NC "\n");
+        exit(1);
+    }
+    for (int i = 0; i < 513; i++)
+    {
+        size_t len = strlen(cursor);
+        int step = snprintf(cursor + len, sizeof(cursor) - len, "/a");
+        if (step < 0 || (size_t)step >= sizeof(cursor) - len || mkdir(cursor, 0755) != 0)
+        {
+            printf(RED "fixture: could not build the deep-nesting chain" NC "\n");
+            exit(1);
+        }
+    }
+
+    int source_fd = open_dir_fd(source_root);
+    int dest_fd = open_dir_fd(dest_root);
+
+    RestoreNativeReport report;
+    RestoreNativeStatus result = restore_native_at_report(
+        &RESTORE_CTX, source_fd, "root", dest_fd, "root", &report, NULL);
+
+    check(result != RESTORE_NATIVE_OK,
+          "excessive payload nesting is still refused with a real report attached");
+    check(report.failed_count == 1,
+          "exactly one failure is recorded, not one per ancestor directory");
+    check(strcmp(report.failed_logical_path, "root") != 0,
+          "the failure is not misattributed to the restore root itself");
+    check(strncmp(report.failed_logical_path, "root/a/a/a", 10) == 0,
+          "the failure is attributed to the actual deeply nested entry that hit the depth limit");
+
+    close(source_fd);
+    close(dest_fd);
+    remove_tree(source_root);
+    remove_tree(dest_root);
+}
+
 /* ========================================================================= */
 /* CloneContext validation                                                  */
 /* ========================================================================= */
@@ -1102,6 +1159,7 @@ int main(void)
     test_preserves_caller_owned_root_fds();
     test_empty_relative_path_means_root_object_itself();
     test_rejects_excessive_recursion_depth();
+    test_reports_the_actual_nested_entry_that_exceeded_depth();
 
     test_rejects_invalid_context();
 
