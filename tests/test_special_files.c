@@ -898,8 +898,8 @@ static void test_native_reconciliation(void)
               access(single, F_OK) == 0,
           "a non-directory root is left untouched");
     check(native_reconcile_stale_at(visited, "missing", destination_fd,
-                                    &report) == NATIVE_RECONCILE_ERROR,
-          "a missing root fails closed instead of being treated as empty");
+                                    &report) == NATIVE_RECONCILE_OK,
+          "a missing root is treated as an empty reconciliation target");
 
     native_visited_free(visited);
     close(destination_fd);

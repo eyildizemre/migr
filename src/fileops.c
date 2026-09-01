@@ -1062,8 +1062,6 @@ static int native_visited_add(void *opaque_set, const char *root_key,
 
     size_t root_key_length = strlen(root_key);
     size_t rel_path_length = strlen(rel_path);
-    if (root_key_length == SIZE_MAX || rel_path_length == SIZE_MAX)
-        return -1;
 
     uint64_t hash = native_visited_hash(set, root_key, root_key_length,
                                         rel_path, rel_path_length);
@@ -2014,7 +2012,7 @@ NativeReconcileStatus native_reconcile_stale_at(const void *visited,
 
     struct stat root_st;
     if (fstatat(data_fd, root_key, &root_st, AT_SYMLINK_NOFOLLOW) != 0)
-        return NATIVE_RECONCILE_ERROR;
+        return errno == ENOENT ? NATIVE_RECONCILE_OK : NATIVE_RECONCILE_ERROR;
     if (root_visited == 0)
     {
         if (native_remove_leaf(data_fd, root_key) == 0)
