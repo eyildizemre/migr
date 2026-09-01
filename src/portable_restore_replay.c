@@ -50,16 +50,22 @@ typedef struct {
     MetadataXattrRequirements xattr_requirements;
 } ReplayCollection;
 
-static void replay_copy_bytes(char *destination, size_t destination_size,
-                              SidecarBytes source)
+void replay_copy_bytes(char *destination, size_t destination_size,
+                       SidecarBytes source)
 {
     if (destination == NULL || destination_size == 0)
         return;
-    size_t length = source.length < destination_size - 1U
-        ? source.length : destination_size - 1U;
-    if (length != 0 && source.data != NULL)
-        memcpy(destination, source.data, length);
-    destination[length] = '\0';
+    if (source.length >= destination_size ||
+        (source.length != 0 && source.data == NULL) ||
+        (source.length != 0 &&
+         memchr(source.data, '\0', source.length) != NULL))
+    {
+        destination[0] = '\0';
+        return;
+    }
+    if (source.length != 0)
+        memcpy(destination, source.data, source.length);
+    destination[source.length] = '\0';
 }
 
 static void replay_report_failure(PortableRestoreReplayReport *report,

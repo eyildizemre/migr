@@ -27,6 +27,8 @@ extern int replay_stat_from_entry(const SidecarEntry *entry,
                                   struct stat *desired);
 extern int replay_hardlink_identity_matches(const struct stat *linked,
                                             const struct stat *reference);
+extern void replay_copy_bytes(char *destination, size_t destination_size,
+                              SidecarBytes source);
 
 #define GREEN "\033[0;32m"
 #define RED   "\033[0;31m"
@@ -1430,6 +1432,36 @@ static void test_hardlink_toctou_race(void)
     fixture_close(&fixture);
 }
 
+static void test_copy_bytes_rejects_corruption(void)
+{
+    printf(BLUE "::" NC " replay_copy_bytes rejects what it cannot "
+                 "faithfully represent\n");
+    char destination[8];
+
+    replay_copy_bytes(destination, sizeof(destination), text_bytes("short"));
+    check(strcmp(destination, "short") == 0,
+          "a source that fits is copied exactly");
+
+    replay_copy_bytes(destination, sizeof(destination),
+                      text_bytes("1234567"));
+    check(strcmp(destination, "1234567") == 0,
+          "a source that fits exactly at the boundary is copied exactly");
+
+    replay_copy_bytes(destination, sizeof(destination),
+                      text_bytes("exactly8"));
+    check(strcmp(destination, "") == 0,
+          "a source that doesn't fit is rejected, not truncated");
+
+    unsigned char embedded_nul[] = { 'a', 'b', '\0', 'c' };
+    SidecarBytes with_nul = { .data = embedded_nul,
+                              .length = sizeof(embedded_nul) };
+    strcpy(destination, "sentinl");
+    replay_copy_bytes(destination, sizeof(destination), with_nul);
+    check(strcmp(destination, "") == 0,
+          "a source with an embedded NUL is rejected, not silently "
+          "misrepresented as a shorter string");
+}
+
 int main(void)
 {
     test_payload_path_fits_boundary();
@@ -1449,6 +1481,7 @@ int main(void)
     test_payload_swap();
     test_tombstone_skipped();
     test_hardlink_toctou_race();
+    test_copy_bytes_rejects_corruption();
     printf("%s%s%s\n", failures == 0 ? GREEN : RED,
            failures == 0 ? "all portable restore replay tests passed" :
            "portable restore replay tests failed", NC);
