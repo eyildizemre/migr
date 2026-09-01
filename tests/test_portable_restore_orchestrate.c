@@ -1681,6 +1681,43 @@ static void test_direct_error_outcome(void)
     fixture_close(&fixture);
 }
 
+/* fsprobe_timestamps_fd() needs to create a scratch probe directory under
+ * the destination to measure timestamp-write support; removing write
+ * permission on the destination makes that probe fail cleanly without
+ * affecting the earlier preflight/space-preflight stages, which only need
+ * to read. This isolates the fsprobe_timestamps_fd() failure branch
+ * specifically (root_probe timestamp measurement), distinct from
+ * test_direct_error_outcome's metadata-probe failure (a bad file owner
+ * uid) a few lines later in the same function. */
+static void test_direct_timestamp_probe_failure(void)
+{
+    printf(BLUE "::" NC " direct portable restore timestamp probe failure\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "direct-timestamp-probe-failure fixture is created");
+    if (opened != 0)
+        return;
+    check(prepare_direct_basic_fixture(&fixture, (uint32_t)geteuid()) == 0,
+          "direct-timestamp-probe-failure sidecar is committed");
+    check(fchmod(fixture.home_fd, 0500) == 0,
+          "destination home is made read-only");
+    PortableRestoreReplayReport report;
+    PortableRestoreOutcome outcome = run_direct_orchestration(
+        &fixture, &report, 1, "y\n");
+    fchmod(fixture.home_fd, 0700);
+    char target[PATH_MAX], sentinel[PATH_MAX];
+    path_join_fixture(target, sizeof(target), fixture.home, "/restored");
+    path_join_fixture(sentinel, sizeof(sentinel), fixture.home, "/sentinel");
+    check(outcome == PORTABLE_RESTORE_ERROR && report.live_count == 2 &&
+              report.applied_count == 0 && report.failed_count == 0,
+          "direct orchestration reports the timestamp probe failure with "
+          "the live count already discovered by preflight, not zero");
+    check(access(target, F_OK) != 0 && file_equals(sentinel, "untouched"),
+          "direct timestamp probe failure performs no destination mutation");
+    fixture_close(&fixture);
+}
+
 static void test_direct_measures_timestamp_policy(void)
 {
     printf(BLUE "::" NC " direct portable restore timestamp measurement\n");
@@ -1735,6 +1772,7 @@ int main(void)
     test_direct_dry_run_outcome();
     test_direct_cancelled_outcome();
     test_direct_error_outcome();
+    test_direct_timestamp_probe_failure();
     test_direct_measures_timestamp_policy();
     printf("%s%s%s\n", failures == 0 ? GREEN : RED,
            failures == 0 ? "all portable restore orchestration tests passed" :

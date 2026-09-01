@@ -159,6 +159,7 @@ static PortableRestoreOutcome portable_restore_orchestrate_impl(
         if (fsprobe_timestamps_fd(request->destination_home_fd,
                                   &nsec_exact) != 0)
         {
+            report->live_count = preflight.live_count;
             print_error("Error: could not measure destination timestamp support; "
                    "no destination was changed\n");
             portable_restore_preflight_report_free(&preflight);
