@@ -374,6 +374,7 @@ uint64_t sidecar_process_salt(void)
 static int check_size_limit(SidecarLogImplementation *log)
 {
     struct stat st;
+    errno = 0;
     if (fstat(log->fd, &st) != 0 || st.st_size < 0 ||
         (uint64_t)st.st_size > SIDECAR_MAX_TOTAL_BYTES)
     {
