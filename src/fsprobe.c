@@ -14,7 +14,8 @@
 #include "fsprobe.h"
 
 // Classify the errno of a *refused capability attempt* (used only via cap_refused, for
-// chmod/symlink/mkfifo/setxattr/link). The taxonomy is a first cut, good enough for A.2/A.3
+// chmod/symlink/mkfifo/setxattr). link is deliberately not in this set — see
+// classify_link_errno below. The taxonomy is a first cut, good enough for A.2/A.3
 // (where any non-native verdict is refused anyway); the exact per-filesystem errno
 // behaviour is nailed down by the real exFAT/NTFS integration tests before portable mode
 // (Phase B) depends on the unavailable/error distinction.
@@ -37,11 +38,38 @@ static FsCapabilityStatus classify_errno(int e)
     return FS_CAP_ERROR; // ENOSPC, EIO, EROFS, or anything unexpected
 }
 
+// Classify the errno of a refused linkat() attempt. Kept separate from
+// classify_errno: per man 2 link, EPERM/EACCES from link can also mean
+// fs.protected_hardlinks, an immutable source, or a security policy vetoing
+// link specifically -- not "this filesystem doesn't support hardlinks".
+// hardlink_probe_a is a regular file probe_hardlink_fd just created, owns,
+// and holds open for writing in the same directory, which rules out every
+// one of those alternate causes but the last; a loop-mounted real vfat
+// filesystem was measured directly and confirmed to return EPERM for
+// genuine non-support (2026-09-01, Fedora VM). The one remaining
+// ambiguity -- an LSM/mount policy vetoing link() specifically, which is
+// indistinguishable from non-support at the errno level -- is accepted
+// here, same as classify_errno's own general caveat above.
+static FsCapabilityStatus classify_link_errno(int e)
+{
+    if (e == ENOTSUP
+#if defined(EOPNOTSUPP) && EOPNOTSUPP != ENOTSUP
+        || e == EOPNOTSUPP
+#endif
+        )
+        return FS_CAP_UNAVAILABLE;
+    if (e == EPERM || e == EACCES)
+        return FS_CAP_UNAVAILABLE;
+    return FS_CAP_ERROR;
+}
+
 static FsCapabilityResult cap_ok(void)       { FsCapabilityResult r = { FS_CAP_SUPPORTED, 0 };   return r; }
 static FsCapabilityResult cap_mismatch(void) { FsCapabilityResult r = { FS_CAP_UNAVAILABLE, 0 }; return r; }
 // A capability-attempt the filesystem refused (chmod/symlink/mkfifo/setxattr): an expected
 // refusal is unavailable, anything else a real error — classify_errno decides which.
 static FsCapabilityResult cap_refused(int e) { FsCapabilityResult r = { classify_errno(e), e };  return r; }
+// linkat()'s own refusal path — see classify_link_errno above for why it isn't cap_refused.
+static FsCapabilityResult cap_refused_link(int e) { FsCapabilityResult r = { classify_link_errno(e), e }; return r; }
 // A supporting operation failed (create, inspect, read a directory): always operational, so
 // it never masquerades as a missing capability.
 static FsCapabilityResult cap_error(int e)   { FsCapabilityResult r = { FS_CAP_ERROR, e };       return r; }
@@ -235,7 +263,7 @@ static FsCapabilityResult probe_hardlink_fd(int dir_fd)
 
     FsCapabilityResult r = cap_ok();
     if (linkat(dir_fd, "hardlink_probe_a", dir_fd, "hardlink_probe_b", 0) != 0)
-        r = cap_refused(errno);
+        r = cap_refused_link(errno);
     else
     {
         struct stat st_a, st_b;
