@@ -51,6 +51,8 @@ void relocation_scan_count(void);
 void relocation_remove_count(void);
 #ifdef PORTABLE_CAPTURE_TEST_HOOKS
 void portable_test_interrupt_if(PortableTestInterruptPoint point);
+void portable_reconcile_test_vanish_descend_at(size_t call_index);
+void portable_reconcile_test_vanish_child_named(const char *name);
 #else
 void portable_test_interrupt_if(int point);
 #endif

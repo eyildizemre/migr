@@ -41,6 +41,7 @@
 #include <unistd.h>
 
 #include "portable.h"
+#include "portable_reconcile_internal.h"
 #include "sidecar.h"
 
 #define GREEN "\033[0;32m"
@@ -704,6 +705,112 @@ static void test_foreign_child_blocks_claim_cleanup(const char *base)
     close(fixture.container_fd);
 }
 
+static void test_stale_claim_child_vanishes_during_validation(
+    const char *base)
+{
+    printf(BLUE "::" NC " a payload entry vanishing during validation's "
+                 "directory scan is tolerated, not a hard failure\n");
+    ClaimDirectoryFixture fixture;
+    check(prepare_claim_directory_fixture(base, "claim-vanish-child", 0,
+                                          &fixture) == 0,
+          "vanish-during-validation fixture is captured");
+    if (fixture.container_fd < 0)
+        return;
+    check(convert_directory_to_claim(&fixture) == 0,
+          "empty directory becomes an outstanding CLAIM");
+    remove_claimed_source(&fixture, 0);
+    /* Nothing in the sidecar log owns this entry; it stands in for a payload
+     * dirent that readdir() still sees but that vanishes (here, by our own
+     * hand, deterministically) before the loop's fstatat() reaches it --
+     * the same race a concurrent stale-cleanup pass could cause. */
+    char ghost[PATH_MAX];
+    join_path(ghost, sizeof(ghost), fixture.payload_claimed, "ghost");
+    write_file(ghost, "ghost");
+    portable_reconcile_test_vanish_child_named("ghost");
+    int result = portable_capture_resume_at(fixture.container_fd,
+                                            &fixture.request, NULL);
+    portable_reconcile_test_vanish_child_named(NULL);
+    check(result == 0,
+          "an entry vanishing between readdir and fstatat during "
+          "validation does not abort reconciliation");
+    int live = -1;
+    int deleted = -1;
+    Fixture state = { .container_fd = fixture.container_fd };
+    check(path_missing(fixture.payload_claimed) && path_missing(ghost) &&
+              outstanding_claim_count(fixture.container_fd) == 0 &&
+              sidecar_state(&state, "claimed", &live, &deleted) == 0 &&
+              live == 0 && deleted == 1,
+          "cleanup still completes fully despite the mid-scan disappearance");
+    close(fixture.container_fd);
+}
+
+static void test_stale_claim_directory_vanishes_before_validation_descent(
+    const char *base)
+{
+    printf(BLUE "::" NC " a claimed directory vanishing right before "
+                 "validation descends into it is tolerated\n");
+    ClaimDirectoryFixture fixture;
+    check(prepare_claim_directory_fixture(base, "claim-vanish-validate", 0,
+                                          &fixture) == 0,
+          "vanish-before-validation-descent fixture is captured");
+    if (fixture.container_fd < 0)
+        return;
+    check(convert_directory_to_claim(&fixture) == 0,
+          "empty directory becomes an outstanding CLAIM");
+    remove_claimed_source(&fixture, 0);
+    portable_reconcile_test_vanish_descend_at(1);
+    int result = portable_capture_resume_at(fixture.container_fd,
+                                            &fixture.request, NULL);
+    portable_reconcile_test_vanish_descend_at(0);
+    check(result == 0,
+          "the directory vanishing between open_claim_node's stat and "
+          "validation's own descent does not abort reconciliation");
+    int live = -1;
+    int deleted = -1;
+    Fixture state = { .container_fd = fixture.container_fd };
+    check(path_missing(fixture.payload_claimed) &&
+              outstanding_claim_count(fixture.container_fd) == 0 &&
+              sidecar_state(&state, "claimed", &live, &deleted) == 0 &&
+              live == 0 && deleted == 1,
+          "cleanup still completes fully despite the pre-descent disappearance");
+    close(fixture.container_fd);
+}
+
+static void test_stale_claim_directory_vanishes_before_mutation_descent(
+    const char *base)
+{
+    printf(BLUE "::" NC " a claimed directory vanishing right before "
+                 "mutation descends into it is tolerated\n");
+    ClaimDirectoryFixture fixture;
+    check(prepare_claim_directory_fixture(base, "claim-vanish-mutate", 0,
+                                          &fixture) == 0,
+          "vanish-before-mutation-descent fixture is captured");
+    if (fixture.container_fd < 0)
+        return;
+    check(convert_directory_to_claim(&fixture) == 0,
+          "empty directory becomes an outstanding CLAIM");
+    remove_claimed_source(&fixture, 0);
+    /* Call #1 is validation's own descent into the still-intact directory;
+     * call #2 is mutation's separate, later descent into the same node --
+     * that's the one this test needs to catch mid-air. */
+    portable_reconcile_test_vanish_descend_at(2);
+    int result = portable_capture_resume_at(fixture.container_fd,
+                                            &fixture.request, NULL);
+    portable_reconcile_test_vanish_descend_at(0);
+    check(result == 0,
+          "the directory vanishing between open_claim_node's stat and "
+          "mutation's own descent does not abort reconciliation");
+    int live = -1;
+    int deleted = -1;
+    Fixture state = { .container_fd = fixture.container_fd };
+    check(path_missing(fixture.payload_claimed) &&
+              outstanding_claim_count(fixture.container_fd) == 0 &&
+              sidecar_state(&state, "claimed", &live, &deleted) == 0 &&
+              live == 0 && deleted == 1,
+          "cleanup still completes fully despite the pre-descent disappearance");
+    close(fixture.container_fd);
+}
+
 static void test_cleanup_failure(const char *base)
 {
     printf(BLUE "::" NC " stale cleanup failure gate\n");
@@ -817,6 +924,9 @@ int main(void)
     test_stale_empty_claim(base);
     test_stale_nested_claim(base);
     test_foreign_child_blocks_claim_cleanup(base);
+    test_stale_claim_child_vanishes_during_validation(base);
+    test_stale_claim_directory_vanishes_before_validation_descent(base);
+    test_stale_claim_directory_vanishes_before_mutation_descent(base);
     test_cleanup_failure(base);
     test_inventory_mismatch(base);
     test_interruption_boundaries(base);

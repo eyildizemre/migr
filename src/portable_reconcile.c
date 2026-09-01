@@ -389,6 +389,50 @@ static int reconcile_claim_owner(const ClaimOwnershipPaths *paths,
     return 0;
 }
 
+#ifdef PORTABLE_CAPTURE_TEST_HOOKS
+/* Both reconcile_claim_validate_node() and reconcile_mutate_known_node()
+ * call open_child_directory(parent_fd, leaf) to descend into a node that
+ * open_claim_node() just confirmed is a directory. A test arms this to
+ * remove that directory out from under the Nth such call (1-based, across
+ * both functions combined), simulating the node vanishing in the window
+ * between the confirming stat and the descent. */
+static size_t reconcile_test_descend_call_count;
+static size_t reconcile_test_descend_vanish_at;
+
+void portable_reconcile_test_vanish_descend_at(size_t call_index)
+{
+    reconcile_test_descend_call_count = 0;
+    reconcile_test_descend_vanish_at = call_index;
+}
+
+static void reconcile_test_descend_hook(int parent_fd, const char *leaf)
+{
+    reconcile_test_descend_call_count++;
+    if (reconcile_test_descend_vanish_at != 0 &&
+        reconcile_test_descend_call_count == reconcile_test_descend_vanish_at)
+        unlinkat(parent_fd, leaf, AT_REMOVEDIR);
+}
+
+/* reconcile_claim_validate_node()'s directory-scan loop fstatat()s each
+ * child by name. A test arms this to remove one specific child, by name,
+ * immediately before that call, simulating the child vanishing between
+ * readdir() and fstatat(). */
+static const char *reconcile_test_vanish_child_name;
+
+void portable_reconcile_test_vanish_child_named(const char *name)
+{
+    reconcile_test_vanish_child_name = name;
+}
+
+static void reconcile_test_child_stat_hook(int directory_fd,
+                                           const char *name)
+{
+    if (reconcile_test_vanish_child_name != NULL &&
+        strcmp(name, reconcile_test_vanish_child_name) == 0)
+        unlinkat(directory_fd, name, 0);
+}
+#endif
+
 static int reconcile_claim_validate_node(PortableCaptureContext *context,
                                          const PortableRootSpec *root,
                                          const char *physical,
@@ -407,6 +451,9 @@ static int reconcile_claim_validate_node(PortableCaptureContext *context,
         return result == 0 ? 0 : -1;
     }
 
+#ifdef PORTABLE_CAPTURE_TEST_HOOKS
+    reconcile_test_descend_hook(parent_fd, leaf);
+#endif
     int directory_fd = open_child_directory(parent_fd, leaf);
     int saved = errno;
     if (close(parent_fd) != 0) {
@@ -416,7 +463,7 @@ static int reconcile_claim_validate_node(PortableCaptureContext *context,
     }
     if (directory_fd < 0) {
         errno = saved;
-        return -1;
+        return errno == ENOENT ? 0 : -1;
     }
     int scan_fd = dup_cloexec(directory_fd);
     DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
@@ -446,9 +493,14 @@ static int reconcile_claim_validate_node(PortableCaptureContext *context,
             failed = 1;
             break;
         }
+#ifdef PORTABLE_CAPTURE_TEST_HOOKS
+        reconcile_test_child_stat_hook(directory_fd, entry->d_name);
+#endif
         struct stat child_stat;
         if (fstatat(directory_fd, entry->d_name, &child_stat,
                     AT_SYMLINK_NOFOLLOW) != 0) {
+            if (errno == ENOENT)
+                continue;
             failed = 1;
             break;
         }
@@ -515,6 +567,9 @@ static int reconcile_mutate_known_node(PortableCaptureContext *context,
                            : tombstone_if_live(context, root->id, logical);
 
     if (S_ISDIR(st.st_mode)) {
+#ifdef PORTABLE_CAPTURE_TEST_HOOKS
+        reconcile_test_descend_hook(parent_fd, leaf);
+#endif
         int directory_fd = open_child_directory(parent_fd, leaf);
         int saved = errno;
         if (close(parent_fd) != 0) {
@@ -524,71 +579,74 @@ static int reconcile_mutate_known_node(PortableCaptureContext *context,
         }
         if (directory_fd < 0) {
             errno = saved;
-            return -1;
-        }
-        int scan_fd = dup_cloexec(directory_fd);
-        DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
-        if (directory == NULL) {
-            if (scan_fd >= 0)
-                close(scan_fd);
-            close(directory_fd);
-            return -1;
-        }
-
-        int failed = 0;
-        for (;;) {
-            errno = 0;
-            struct dirent *entry = readdir(directory);
-            if (entry == NULL) {
-                if (errno != 0)
-                    failed = 1;
-                break;
+            if (errno != ENOENT)
+                return -1;
+        } else {
+            int scan_fd = dup_cloexec(directory_fd);
+            DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
+            if (directory == NULL) {
+                if (scan_fd >= 0)
+                    close(scan_fd);
+                close(directory_fd);
+                return -1;
             }
-            if (strcmp(entry->d_name, ".") == 0 ||
-                strcmp(entry->d_name, "..") == 0)
-                continue;
 
-            char child_physical[SIDECAR_MAX_PATH + 1U];
-            if (append_physical(child_physical, sizeof(child_physical),
-                                physical, entry->d_name) != 0) {
-                failed = 1;
-                break;
-            }
-            struct stat child_stat;
-            if (fstatat(directory_fd, entry->d_name, &child_stat,
-                        AT_SYMLINK_NOFOLLOW) != 0) {
-                if (errno == ENOENT)
+            int failed = 0;
+            for (;;) {
+                errno = 0;
+                struct dirent *entry = readdir(directory);
+                if (entry == NULL) {
+                    if (errno != 0)
+                        failed = 1;
+                    break;
+                }
+                if (strcmp(entry->d_name, ".") == 0 ||
+                    strcmp(entry->d_name, "..") == 0)
                     continue;
-                failed = 1;
-                break;
+
+                char child_physical[SIDECAR_MAX_PATH + 1U];
+                if (append_physical(child_physical, sizeof(child_physical),
+                                    physical, entry->d_name) != 0) {
+                    failed = 1;
+                    break;
+                }
+                struct stat child_stat;
+                if (fstatat(directory_fd, entry->d_name, &child_stat,
+                            AT_SYMLINK_NOFOLLOW) != 0) {
+                    if (errno == ENOENT)
+                        continue;
+                    failed = 1;
+                    break;
+                }
+                const char *live_logical = NULL;
+                const PortableClaimedPath *claim = NULL;
+                if (reconcile_claim_owner(paths, root->id, child_physical,
+                                           &live_logical, &claim) != 0) {
+                    failed = 1;
+                    break;
+                }
+                const char *owner_logical = claim != NULL
+                                                 ? claim->logical_path
+                                                 : live_logical;
+                if (visited_contains(context->visited, root->id,
+                                     owner_logical) != 0) {
+                    failed = 1;
+                    break;
+                }
+                if (reconcile_mutate_known_node(
+                        context, root, owner_logical, child_physical,
+                        claim != NULL, paths) != 0) {
+                    failed = 1;
+                    break;
+                }
             }
-            const char *live_logical = NULL;
-            const PortableClaimedPath *claim = NULL;
-            if (reconcile_claim_owner(paths, root->id, child_physical,
-                                       &live_logical, &claim) != 0) {
+            if (closedir(directory) != 0)
                 failed = 1;
-                break;
-            }
-            const char *owner_logical = claim != NULL ? claim->logical_path
-                                                       : live_logical;
-            if (visited_contains(context->visited, root->id,
-                                 owner_logical) != 0) {
+            if (close(directory_fd) != 0)
                 failed = 1;
-                break;
-            }
-            if (reconcile_mutate_known_node(
-                    context, root, owner_logical, child_physical,
-                    claim != NULL, paths) != 0) {
-                failed = 1;
-                break;
-            }
+            if (failed)
+                return -1;
         }
-        if (closedir(directory) != 0)
-            failed = 1;
-        if (close(directory_fd) != 0)
-            failed = 1;
-        if (failed)
-            return -1;
     } else if (close(parent_fd) != 0) {
         return -1;
     }
