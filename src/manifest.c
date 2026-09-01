@@ -40,6 +40,7 @@ int legacy_manifest_read(const char *backup_dir, char **out, int n)
     if (f == NULL)
         return 1;
 
+    int allocation_failed = 0;
     char line[PATH_MAX + 32];
     while (fgets(line, sizeof(line), f) != NULL)
     {
@@ -79,12 +80,14 @@ int legacy_manifest_read(const char *backup_dir, char **out, int n)
 
             // Duplicate the string to heap and break inner loop
             out[i] = strdup(val);
+            if (out[i] == NULL)
+                allocation_failed = 1;
             break;
         }
     }
 
     fclose(f);
-    return 0;
+    return allocation_failed ? -1 : 0;
 }
 
 /* ========================================================================= */

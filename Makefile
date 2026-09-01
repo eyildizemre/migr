@@ -128,7 +128,7 @@ $(TEST_FSPROBE): tests/test_fsprobe.c fsprobe.o utils.o
 	$(CC) $(CFLAGS) -o $@ tests/test_fsprobe.c fsprobe.o utils.o
 
 $(TEST_MANIFEST): tests/test_manifest.c manifest.o encoding.o utils.o
-	$(CC) $(CFLAGS) -o $@ tests/test_manifest.c manifest.o encoding.o utils.o
+	$(CC) $(CFLAGS) -Wl,--wrap=strdup -o $@ tests/test_manifest.c manifest.o encoding.o utils.o
 
 $(TEST_ENCODING): tests/test_encoding.c encoding.o
 	$(CC) $(CFLAGS) -o $@ tests/test_encoding.c encoding.o

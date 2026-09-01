@@ -27,6 +27,27 @@
 
 static int failures = 0;
 
+// Matching by exact input string, self-clearing after one hit, so this can
+// share the test binary with every other test instead of needing its own.
+// strdup() is implemented inside glibc and doesn't route through a --wrap=malloc
+// interposition (it isn't a call this translation unit makes), so it needs its
+// own wrap directly, unlike tests/test_packages.c's --wrap=malloc fixture.
+static const char *wrap_strdup_target;
+static int wrap_strdup_fired;
+
+extern char *__real_strdup(const char *s);
+
+char *__wrap_strdup(const char *s)
+{
+    if (wrap_strdup_target != NULL && !wrap_strdup_fired &&
+        strcmp(s, wrap_strdup_target) == 0)
+    {
+        wrap_strdup_fired = 1;
+        return NULL;
+    }
+    return __real_strdup(s);
+}
+
 static void check(int cond, const char *label)
 {
     if (cond)
@@ -257,6 +278,45 @@ static void test_legacy_detection(void)
     write_raw(path, "");
     check(manifest_read_v1(test_dir, &m) == MANIFEST_STATUS_MALFORMED,
           "an empty existing manifest.txt is MALFORMED, not LEGACY");
+    remove_manifest(test_dir);
+}
+
+static void test_legacy_read_strdup_failure(void)
+{
+    printf(BLUE "::" NC " legacy manifest: strdup() failure during read\n");
+
+    // Matched against __wrap_strdup's argument by exact string content, so
+    // any value works -- kept descriptive for readability, not for size.
+    const char *distinctive_value = "the-value-strdup-will-fail-to-duplicate";
+    char legacy_path[512];
+    snprintf(legacy_path, sizeof(legacy_path), "%s/manifest.txt", test_dir);
+    FILE *f = fopen(legacy_path, "w");
+    check(f != NULL, "fixture: an unversioned manifest.txt can be written");
+    if (f != NULL)
+    {
+        fprintf(f, "%s=%s\n", legacy_manifest_keys[0], distinctive_value);
+        fclose(f);
+    }
+
+    wrap_strdup_target = distinctive_value;
+    wrap_strdup_fired = 0;
+
+    char *out[LEGACY_MANIFEST_XDG_COUNT];
+    int result = legacy_manifest_read(test_dir, out, LEGACY_MANIFEST_XDG_COUNT);
+
+    wrap_strdup_target = NULL;
+
+    check(wrap_strdup_fired,
+          "fixture: the simulated strdup() allocation failure actually fired");
+    check(result == -1,
+          "legacy_manifest_read reports the allocation failure distinctly, "
+          "not as 0 (success)");
+    check(out[0] == NULL,
+          "the key whose value could not be duplicated is still left NULL, "
+          "same safe fallback the caller already relies on");
+    for (int i = 0; i < LEGACY_MANIFEST_XDG_COUNT; i++)
+        free(out[i]);
+
     remove_manifest(test_dir);
 }
 
@@ -816,6 +876,7 @@ int main(void)
     test_full_roundtrip_with_problem_bytes();
     test_no_source_identity();
     test_legacy_detection();
+    test_legacy_read_strdup_failure();
     test_unknown_version();
     test_malformed_variants();
     test_embedded_nul_in_line_is_refused();

@@ -24,14 +24,20 @@ extern const char * const legacy_manifest_keys[LEGACY_MANIFEST_XDG_COUNT]; /**< 
  * @brief Parses manifest.txt from backup_dir and extracts XDG directory basenames.
  *
  * Each out[i] is set to a strdup'd value matching legacy_manifest_keys[i], or left
- * NULL if the key is absent from the file. The caller must free every
- * non-NULL entry. Returns 1 without modifying out[] if the file does not exist,
- * allowing the caller to fall back to the target system's basename.
+ * NULL if the key is absent from the file -- or if it was present but strdup()
+ * failed to duplicate its value, so a caller that only inspects out[] still sees
+ * the safe "fall back to the target's basename" behavior either way. The caller
+ * must free every non-NULL entry. Returns 1 without modifying out[] if the file
+ * does not exist, allowing the caller to fall back to the target system's basename.
  *
  * @param backup_dir Directory from which manifest.txt is read.
  * @param out        Caller-supplied array of n char* pointers; filled with malloc'd values.
  * @param n          Number of entries to look up.
- * @return 0 if manifest.txt was found and parsed, 1 if the file does not exist.
+ * @return 0 if manifest.txt was found and parsed with no allocation failure,
+ *         1 if the file does not exist, -1 if a key's value could not be
+ *         duplicated to the heap (out[] is still fully valid to use as-is;
+ *         -1 exists only so a caller that cares can distinguish this from a
+ *         genuinely absent key instead of the two being indistinguishable).
  */
 int legacy_manifest_read(const char *backup_dir, char **out, int n);
 
