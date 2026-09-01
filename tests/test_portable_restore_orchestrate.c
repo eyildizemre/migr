@@ -835,6 +835,33 @@ static int prepare_direct_basic_fixture(Fixture *fixture, uint32_t file_uid)
     return 0;
 }
 
+/* Every other exit path in portable_restore_orchestrate_impl() zero-
+ * initializes its out-param report before returning; the parameter-
+ * validation early return used to skip it, leaving the caller's report
+ * holding whatever was on the stack. Filling it with a non-zero sentinel
+ * before the call makes an accidental "still zero from declaration"
+ * pass impossible -- the report only reads as zeroed if the function
+ * actually wrote it. */
+static void test_invalid_request_still_zeroes_report(void)
+{
+    printf(BLUE "::" NC
+           " invalid request still zero-initializes the report\n");
+
+    PortableRestoreReplayReport report;
+    memset(&report, 0xAA, sizeof(report));
+
+    PortableRestoreRequest request = {0};
+    PortableRestoreOutcome outcome =
+        portable_restore_orchestrate_at(&request, &report);
+
+    PortableRestoreReplayReport zeroed = {0};
+    check(outcome == PORTABLE_RESTORE_ERROR,
+          "a request with a NULL manifest is refused");
+    check(memcmp(&report, &zeroed, sizeof(report)) == 0,
+          "the report is zero-initialized even on the parameter-validation "
+          "early return, not left holding stack garbage");
+}
+
 static void test_normal_orchestration(void)
 {
     printf(BLUE "::" NC " end-to-end portable restore orchestration\n");
@@ -1755,6 +1782,7 @@ static void test_direct_measures_timestamp_policy(void)
 
 int main(void)
 {
+    test_invalid_request_still_zeroes_report();
     test_normal_orchestration();
     test_security_xattr_tolerance_orchestration();
     test_hardlink_orchestration();

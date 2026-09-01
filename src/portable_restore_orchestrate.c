@@ -108,6 +108,7 @@ static PortableRestoreOutcome portable_restore_orchestrate_impl(
     PortableRestoreReplayReport *report,
     int measure_policy)
 {
+    portable_restore_replay_report_init(report);
     if (request == NULL || report == NULL || request->source_container_fd < 0 ||
         request->destination_home_fd < 0 || request->manifest == NULL)
     {
@@ -115,7 +116,6 @@ static PortableRestoreOutcome portable_restore_orchestrate_impl(
         return PORTABLE_RESTORE_ERROR;
     }
 
-    portable_restore_replay_report_init(report);
     PortableRestoreRequest replay_request = *request;
     MetadataTimestampPolicy policy;
     if (!measure_policy && replay_timestamp_policy(request, &policy) != 0)
