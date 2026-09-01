@@ -250,6 +250,7 @@ static const char *scoped_group_title(BackupRootGroup group)
     case BACKUP_ROOT_EXPLICIT:
         return "Explicit Paths";
     }
+    assert(0 && "scoped_group_title: unhandled BackupRootGroup value");
     return "Other";
 }
 
