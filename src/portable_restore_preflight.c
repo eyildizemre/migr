@@ -409,6 +409,10 @@ static int open_xdg_profile_anchor(const Collection *collection,
     return result;
 }
 
+/* Returns 0 on success, -1 for a per-entry violation (already recorded via
+ * report_violation(), safe for the caller to log and keep scanning past),
+ * or -2 for an internal/unexpected failure unrelated to this entry's data
+ * (no violation recorded; the caller should abort the scan). */
 static int collect_metadata_profile(const Collection *collection,
                                     const ManifestRoot *root,
                                     size_t root_index,
@@ -416,7 +420,7 @@ static int collect_metadata_profile(const Collection *collection,
 {
     if (collection == NULL || root == NULL || entry == NULL ||
         collection->report == NULL)
-        return -1;
+        return -2;
 
     struct stat desired;
     memset(&desired, 0, sizeof(desired));
@@ -426,11 +430,11 @@ static int collect_metadata_profile(const Collection *collection,
         (uintmax_t)desired.st_gid != entry->gid)
     {
         errno = E2BIG;
-        return -1;
+        return -2;
     }
     mode_t type;
     if (sidecar_kind_to_type(entry->kind, &type) != 0)
-        return -1;
+        return -2;
     desired.st_mode = entry->mode | type;
 
     int anchor = -1;
@@ -471,7 +475,7 @@ static int collect_metadata_profile(const Collection *collection,
          * changes. */
         anchor = dup_cloexec(collection->destination_home_fd);
         if (anchor < 0)
-            return -1;
+            return -2;
     }
 
     int result = metadata_profiles_add(&collection->report->profiles, anchor,
@@ -602,7 +606,7 @@ static int collect_entry(const SidecarLiveView *view, void *argument)
 
     if (collect_metadata_profile(collection,
                                  &collection->manifest->roots[root_index],
-                                 root_index, destination) != 0)
+                                 root_index, destination) < -1)
         return 1;
     return 0;
 }

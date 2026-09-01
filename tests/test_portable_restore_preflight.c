@@ -589,6 +589,51 @@ static void test_destination_profile_refusal_is_named(void)
     fixture_close(&fixture);
 }
 
+static void test_destination_profile_refusal_keeps_scanning(void)
+{
+    printf(BLUE "::" NC " destination anchor refusal keeps scanning past "
+                 "the first conflict\n");
+    ManifestRoot root = root_for("ROOT", "ROOT", "restored");
+    Fixture fixture;
+    int opened = fixture_open(&fixture, "destination-symlink-two", &root, 1);
+    check(opened == 0, "destination-symlink-two fixture is created");
+    if (opened != 0)
+        return;
+
+    make_root_payload(&fixture);
+    write_file_at(fixture.data_fd, "ROOT/one", "payload");
+    write_file_at(fixture.data_fd, "ROOT/two", "payload");
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0),
+        entry_for("ROOT", "one", "one", SIDECAR_KIND_REGULAR, 7),
+        entry_for("ROOT", "two", "two", SIDECAR_KIND_REGULAR, 7)
+    };
+    entries[0].uid = (uint32_t)geteuid();
+    entries[0].gid = (uint32_t)getegid();
+    check(write_sidecar(&fixture, entries, 3) == 0,
+          "destination-symlink-two sidecar is committed");
+
+    char restored[PATH_MAX], target_one[PATH_MAX], target_two[PATH_MAX];
+    fixture_path(restored, sizeof(restored), fixture.home, "/restored");
+    fixture_path(target_one, sizeof(target_one), restored, "/one");
+    fixture_path(target_two, sizeof(target_two), restored, "/two");
+    make_dir(restored);
+    check(symlink("outside", target_one) == 0 &&
+              symlink("outside", target_two) == 0,
+          "destination symlinks are planted at both incoming targets");
+
+    PortableRestorePreflightReport report;
+    int result = run_preflight(&fixture, &report);
+    check(result != 0 && report.violation_count == 2 &&
+              report.root_count == 1 && report.roots != NULL &&
+              report.roots[0].violation_count == 2 &&
+              report.profiles.example_count == 2,
+          "both destination anchor conflicts are recorded in one pass, "
+          "not just the first");
+    portable_restore_preflight_report_free(&report);
+    fixture_close(&fixture);
+}
+
 static void run_refusal_case(const char *label, ManifestRoot *root,
                              SidecarEntry *entries, size_t entry_count,
                              void (*prepare)(Fixture *fixture))
@@ -1287,6 +1332,7 @@ int main(void)
     test_outstanding_claim_gate();
     test_missing_payload();
     test_destination_profile_refusal_is_named();
+    test_destination_profile_refusal_keeps_scanning();
     test_xattr_entry_acceptance();
     test_path_and_mapping_refusals();
     test_collision_suffix_validation();
