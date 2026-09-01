@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include <assert.h>
 #include <dirent.h>
 #include <errno.h>
 #include <stdio.h>
@@ -430,6 +431,20 @@ static void report_legacy_section(const char *title, const char *home,
                                   unsigned char *cached_valid)
 {
     char path[PATH_MAX];
+    if (display_names != NULL)
+    {
+        /* names[] and display_names[] are indexed in lockstep below; a
+         * caller that grows one without the other reads display_names[]
+         * out of bounds instead of failing loudly. */
+        size_t names_length = 0;
+        while (names[names_length] != NULL)
+            names_length++;
+        size_t display_length = 0;
+        while (display_names[display_length] != NULL)
+            display_length++;
+        assert(names_length == display_length &&
+               "report_legacy_section: names/display_names length mismatch");
+    }
     print_section(title);
     for (int i = 0; names[i] != NULL; i++)
     {
@@ -581,6 +596,9 @@ int report(BackupMode mode, int scope_requested, int summary,
     // browsers
     const char *browsers[] = {".mozilla/firefox", ".config/google-chrome", ".config/chromium", ".config/BraveSoftware", NULL};
     const char *browser_names[] = {"Firefox", "Chrome", "Chromium", "Brave", NULL};
+    _Static_assert(sizeof(browsers) / sizeof(browsers[0]) ==
+                       sizeof(browser_names) / sizeof(browser_names[0]),
+                   "browsers[] and browser_names[] must stay the same length");
 
     report_legacy_section("Main Directories", home, main_dirs, NULL,
                           dir_exists, depth, &had_error,
