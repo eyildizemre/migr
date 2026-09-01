@@ -19,6 +19,7 @@
 #include "manifest.h"
 #include "portable.h"
 #include "portable_restore.h"
+#include "portable_restore_replay_internal.h"
 #include "sidecar.h"
 
 extern int replay_entry_valid(const SidecarEntry *entry);
@@ -1354,6 +1355,81 @@ static void test_tombstone_skipped(void)
     fixture_close(&fixture);
 }
 
+static Fixture *hardlink_race_fixture;
+
+static void swap_representative_hook(void)
+{
+    if (hardlink_race_fixture == NULL)
+        return;
+    int root_fd = openat(hardlink_race_fixture->home_fd, "restored",
+                         O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (root_fd < 0)
+        fatal("could not open restored root during hardlink race hook");
+    if (unlinkat(root_fd, "representative", 0) != 0)
+        fatal("could not remove representative during hardlink race hook");
+    write_file_at(root_fd, "representative", "swapped payload");
+    if (close(root_fd) != 0)
+        fatal("could not close restored root during hardlink race hook");
+}
+
+static void test_hardlink_toctou_race(void)
+{
+    printf(BLUE "::" NC " hardlink post-link identity check catches a "
+                 "reference swapped after the pre-link validation\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "hardlink race fixture is created");
+    if (opened != 0)
+        return;
+
+    make_dir_at(fixture.data_fd, "ROOT", 0700);
+    int root_fd = openat(fixture.data_fd, "ROOT",
+                         O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (root_fd < 0)
+        fatal("could not open hardlink race payload root");
+    write_file_at(root_fd, "representative", "hardlink payload");
+    write_file_at(root_fd, "alias", "");
+    if (close(root_fd) != 0)
+        fatal("could not close hardlink race payload root");
+
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000700, 1, 1700000701, 2),
+        entry_for("ROOT", "representative", "representative",
+                  SIDECAR_KIND_REGULAR, strlen("hardlink payload"), 0640,
+                  1700000710, 3, 1700000711, 4),
+        entry_for("ROOT", "alias", "alias", SIDECAR_KIND_HARDLINK, 0, 0640,
+                  1700000720, 5, 1700000721, 6)
+    };
+    entries[2].hardlink_root_id = text_bytes("ROOT");
+    entries[2].hardlink_logical_path = text_bytes("representative");
+    check(write_sidecar(&fixture, entries, 3, NULL, NULL) == 0,
+          "hardlink race sidecar is committed");
+    check(run_preflight(&fixture) == 0,
+          "hardlink race state passes preflight");
+
+    hardlink_race_fixture = &fixture;
+    portable_restore_replay_test_set_hardlink_race_hook(
+        swap_representative_hook);
+    PortableRestoreReplayReport report;
+    int result = run_replay(&fixture, &report);
+    portable_restore_replay_test_set_hardlink_race_hook(NULL);
+    hardlink_race_fixture = NULL;
+
+    check(result != 0 && report.applied_count == 1 &&
+              report.failed_count == 1,
+          "the reference swapped between validation and linkat is "
+          "detected instead of silently accepted");
+
+    char representative[PATH_MAX];
+    path_join(representative, sizeof(representative), fixture.home,
+              "/restored/representative");
+    check(file_equals_noatime(representative, "swapped payload"),
+          "the swap actually took effect between validation and linkat");
+    fixture_close(&fixture);
+}
+
 int main(void)
 {
     test_payload_path_fits_boundary();
@@ -1372,6 +1448,7 @@ int main(void)
     test_gate_allows_security_only();
     test_payload_swap();
     test_tombstone_skipped();
+    test_hardlink_toctou_race();
     printf("%s%s%s\n", failures == 0 ? GREEN : RED,
            failures == 0 ? "all portable restore replay tests passed" :
            "portable restore replay tests failed", NC);

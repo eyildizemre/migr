@@ -947,6 +947,15 @@ int replay_hardlink_identity_matches(const struct stat *linked,
            linked->st_ino == reference->st_ino;
 }
 
+#ifdef PORTABLE_RESTORE_REPLAY_TEST_HOOKS
+static void (*hardlink_race_hook)(void);
+
+void portable_restore_replay_test_set_hardlink_race_hook(void (*hook)(void))
+{
+    hardlink_race_hook = hook;
+}
+#endif
+
 static int replay_apply_hardlink(ReplayCollection *collection,
                                  ReplayEntry *replay)
 {
@@ -995,16 +1004,17 @@ static int replay_apply_hardlink(ReplayCollection *collection,
         else if (errno != ENOENT)
             result = -1;
     }
+#ifdef PORTABLE_RESTORE_REPLAY_TEST_HOOKS
+    if (result == 0 && hardlink_race_hook != NULL)
+        hardlink_race_hook();
+#endif
     if (result == 0 && linkat(ref_parent_fd, ref_leaf, parent_fd, leaf, 0) != 0)
         result = -1;
     if (result == 0)
     {
         struct stat linked;
-        struct stat reference_after;
         if (fstatat(parent_fd, leaf, &linked, AT_SYMLINK_NOFOLLOW) != 0 ||
-            fstatat(ref_parent_fd, ref_leaf, &reference_after,
-                    AT_SYMLINK_NOFOLLOW) != 0 ||
-            !replay_hardlink_identity_matches(&linked, &reference_after))
+            !replay_hardlink_identity_matches(&linked, &reference_before))
         {
             errno = EIO;
             result = -1;
