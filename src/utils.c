@@ -197,7 +197,14 @@ int path_join_n(char *buf, size_t size, const char *dir,
     // rely on that invariant holding forever.
     if (name_len > INT_MAX)
         return -1;
-    int n = snprintf(buf, size, "%s/%.*s", dir, (int)name_len, name);
+    // Avoid "//name" when dir is exactly "/" -- a cosmetic difference that
+    // would otherwise let two identical filesystem objects compare unequal
+    // as strings (see backup_plan.c's duplicate/overlap detection).
+    int n;
+    if (strcmp(dir, "/") == 0)
+        n = snprintf(buf, size, "/%.*s", (int)name_len, name);
+    else
+        n = snprintf(buf, size, "%s/%.*s", dir, (int)name_len, name);
     if (n < 0 || (size_t)n >= size)
         return -1;
     return 0;

@@ -146,22 +146,6 @@ enum { BUILTIN_HOME_CATALOG_COUNT =
 /* ancestor symlink, the other not) and dodge duplicate/overlap detection.   */
 /* ------------------------------------------------------------------------- */
 
-// Joins parent + "/" + leaf[0..leaf_len) without ever producing "//leaf" when
-// parent is exactly "/" -- a cosmetic difference that would otherwise make
-// two identical objects compare unequal as strings.
-static int join_leaf(char *out, size_t out_size, const char *parent,
-                     const char *leaf, size_t leaf_len)
-{
-    if (leaf_len > INT_MAX)
-        return -1;
-    int n;
-    if (strcmp(parent, "/") == 0)
-        n = snprintf(out, out_size, "/%.*s", (int)leaf_len, leaf);
-    else
-        n = snprintf(out, out_size, "%s/%.*s", parent, (int)leaf_len, leaf);
-    return (n < 0 || (size_t)n >= out_size) ? -1 : 0;
-}
-
 // Pure path algebra: only the parent directory is resolved through
 // realpath(); the final path component is never dereferenced. "/", ".", and
 // ".." are pure navigation, not object names, so a path whose final
@@ -247,7 +231,7 @@ static int resolve_leaf_preserving(const char *raw, char *capture_path, size_t c
     if (realpath(parent, parent_real) == NULL)
         return -1;
 
-    if (join_leaf(capture_path, capture_size, parent_real, leaf, leaf_len) != 0)
+    if (path_join_n(capture_path, capture_size, parent_real, leaf, leaf_len) != 0)
     {
         errno = ENAMETOOLONG;
         return -1;
@@ -979,6 +963,12 @@ static int resolve_destination(const char *destination, char *out, size_t out_si
     char resolved[PATH_MAX];
     if (realpath(destination, resolved) != NULL)
     {
+        // Unreachable with today's one caller, which always passes a
+        // PATH_MAX-sized out_size -- resolved can never exceed that. Kept
+        // as a real bound check, not dead code: resolved is always a full
+        // PATH_MAX buffer regardless of out_size, and strcpy() below has
+        // no bounds checking of its own, so this is what protects any
+        // future caller that passes a smaller out_size from an overflow.
         if (strlen(resolved) >= out_size)
             return -1;
         strcpy(out, resolved);

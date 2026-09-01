@@ -53,6 +53,8 @@ int main(void)
     ok("empty name", path_join(buf, sizeof(buf), "abc", ""), buf, "abc/");
     ok("nested name", path_join(buf, sizeof(buf), "/home/u", ".config/x"),
        buf, "/home/u/.config/x");
+    ok("root parent avoids double slash",
+       path_join(buf, sizeof(buf), "/", "leaf"), buf, "/leaf");
 
     // Boundary: "abc/de" is 6 chars and needs 7 bytes with the NUL.
     char small[7];
