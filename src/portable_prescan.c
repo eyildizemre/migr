@@ -7,6 +7,7 @@
 #include "sidecar.h"
 #include "utils.h"
 
+#include <assert.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -1141,8 +1142,10 @@ static int case_probe_reserve_singleton(PortableCaseProbeState *state,
     if (append_physical(physical, sizeof(physical), parent_physical,
                         group->encoded_names[0]) != 0)
         return -1;
-    if (!case_probe_source_name_contains(source_names, physical))
-        return -1;
+    assert(case_probe_source_name_contains(source_names, physical) &&
+           "case_probe_reserve_singleton: singleton's own physical name "
+           "missing from source_names (should already be reserved by "
+           "prescan_directory's unsuffixed-name pass)");
     return case_probe_reserve_name(reserved_names, payload_path,
                                    parent_physical, group->encoded_names[0],
                                    physical, sizeof(physical)) != 0
