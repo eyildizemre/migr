@@ -360,6 +360,7 @@ void restore_packages(int source_root_fd, const char *home, int *had_error)
                     path_join(skipped_path, sizeof(skipped_path), home,
                               "skipped-packages.txt") == 0;
                 FILE *skipped_f = NULL;
+                int skip_log_write_failed = 0;
 
                 for (int i = 0; i < pkg_count; i++)
                 {
@@ -418,7 +419,17 @@ void restore_packages(int source_root_fd, const char *home, int *had_error)
                             }
                         }
                         if (skipped_f != NULL)
-                            fprintf(skipped_f, "%s\n", pkgs[i]);
+                        {
+                            if (fprintf(skipped_f, "%s\n", pkgs[i]) < 0)
+                            {
+                                if (!skip_log_write_failed)
+                                {
+                                    print_error("Error: Could not write skipped package log\n");
+                                    skip_log_write_failed = 1;
+                                }
+                                *had_error = 1;
+                            }
+                        }
                         skipped++;
                     }
                     else
