@@ -27,6 +27,7 @@
 
 #define _GNU_SOURCE
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <ftw.h>
@@ -165,6 +166,19 @@ static int path_missing(const char *path)
 {
     struct stat st;
     return lstat(path, &st) != 0 && errno == ENOENT;
+}
+
+static int open_fd_count(void)
+{
+    DIR *directory = opendir("/proc/self/fd");
+    if (directory == NULL)
+        return -1;
+    int count = 0;
+    while (readdir(directory) != NULL)
+        count++;
+    if (closedir(directory) != 0)
+        return -1;
+    return count - 2;
 }
 
 typedef struct {
@@ -849,6 +863,58 @@ static void test_remove_payload_relative_close_failures(const char *base)
     remove_tree(root);
 }
 
+static void test_capture_directory_scan_failure_frees_resources(
+    const char *base)
+{
+    printf(BLUE "::" NC " capture_directory frees the destination and "
+                 "source fds when fdopendir() fails\n");
+    char source[PATH_MAX];
+    char container[PATH_MAX];
+    join_path(source, sizeof(source), base, "capture-directory-leak-source");
+    join_path(container, sizeof(container), base,
+              "capture-directory-leak-container");
+    make_directory(source);
+    make_directory(container);
+    char subdir[PATH_MAX];
+    join_path(subdir, sizeof(subdir), source, "subdir");
+    make_directory(subdir);
+
+    PortableRootSpec root = {
+        .id = "ROOT",
+        .policy = ROOT_POLICY_HOME_RELATIVE,
+        .capture_path = source,
+        .payload_path = "ROOT",
+        .source_path = source,
+        .restore_path = "fixture",
+        .has_restore_path = 1
+    };
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .has_source_identity = 1,
+        .machine_id = "d1e2",
+        .source_uid = getuid(),
+        .roots = &root,
+        .root_count = 1,
+        .nsec_exact = 1
+    };
+    int container_fd = open(container, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open capture-directory-leak container");
+
+    int before_fds = open_fd_count();
+    portable_test_close_capture_directory_scan_fd_early();
+    int result = portable_capture_fresh_at(container_fd, &request, NULL);
+    int after_fds = open_fd_count();
+    check(result != 0, "the forced fdopendir failure aborts the capture");
+    check(before_fds >= 0 && after_fds == before_fds,
+          "the failure closes the destination and source fds instead of "
+          "leaking them");
+
+    close(container_fd);
+    remove_tree(source);
+    remove_tree(container);
+}
+
 static void test_cleanup_failure(const char *base)
 {
     printf(BLUE "::" NC " stale cleanup failure gate\n");
@@ -966,6 +1032,7 @@ int main(void)
     test_stale_claim_directory_vanishes_before_validation_descent(base);
     test_stale_claim_directory_vanishes_before_mutation_descent(base);
     test_remove_payload_relative_close_failures(base);
+    test_capture_directory_scan_failure_frees_resources(base);
     test_cleanup_failure(base);
     test_inventory_mismatch(base);
     test_interruption_boundaries(base);

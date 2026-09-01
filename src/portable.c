@@ -1822,6 +1822,18 @@ static int capture_node(PortableCaptureContext *context,
                         int destination_parent, const char *destination_leaf,
                         int *no_destination_object);
 
+#ifdef PORTABLE_CAPTURE_TEST_HOOKS
+/* Forces capture_directory()'s fdopendir() to fail with a genuine EBADF, by
+ * closing its scan_fd one call early -- self-clearing so a test only needs
+ * to arm, not disarm. */
+static int capture_directory_test_close_scan_fd_early;
+
+void portable_test_close_capture_directory_scan_fd_early(void)
+{
+    capture_directory_test_close_scan_fd_early = 1;
+}
+#endif
+
 static int capture_directory(PortableCaptureContext *context,
                              const PortableRootSpec *root,
                              const char *logical, const char *physical,
@@ -1832,10 +1844,19 @@ static int capture_directory(PortableCaptureContext *context,
 {
     PendingReadbackNames pending = {0};
     int scan_fd = dup_cloexec(source_fd);
+#ifdef PORTABLE_CAPTURE_TEST_HOOKS
+    if (scan_fd >= 0 && capture_directory_test_close_scan_fd_early) {
+        capture_directory_test_close_scan_fd_early = 0;
+        close(scan_fd);
+    }
+#endif
     DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
     if (directory == NULL) {
         if (scan_fd >= 0)
             close(scan_fd);
+        xattrs_free(xattrs);
+        close(source_fd);
+        close(destination_fd);
         return -1;
     }
     int failed = 0;

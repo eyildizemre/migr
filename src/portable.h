@@ -279,6 +279,7 @@ void portable_capture_test_reset_relocation_scan_count(void);
 uint64_t portable_capture_test_relocation_remove_count(void);
 void portable_test_close_remove_payload_root_parent_early(void);
 void portable_test_close_remove_payload_payload_fd_early(void);
+void portable_test_close_capture_directory_scan_fd_early(void);
 #endif
 
 #endif
