@@ -148,11 +148,15 @@ int visited_add(PortableVisited *visited, const char *root_id,
         root_length > SIDECAR_MAX_ROOT_ID || logical_length > SIDECAR_MAX_PATH)
         return -1;
 
+    if (visited->capacity == 0) {
+        if (visited->hash_salt == 0)
+            visited->hash_salt = sidecar_process_salt();
+        if (visited_rehash(visited, VISITED_INITIAL_CAPACITY) != 0)
+            return -1;
+    }
+
     uint64_t hash = visited_hash(visited, root_id, root_length, logical,
                                  logical_length);
-    if (visited->capacity == 0 &&
-        visited_rehash(visited, VISITED_INITIAL_CAPACITY) != 0)
-        return -1;
 
     size_t index = SIZE_MAX;
     int location = visited_locate(visited, root_id, root_length, logical,
@@ -294,10 +298,14 @@ int prescan_inode_set_find_or_insert(PrescanInodeSet *set,
     if (set == NULL)
         return -1;
 
+    if (set->capacity == 0) {
+        if (set->hash_salt == 0)
+            set->hash_salt = sidecar_process_salt();
+        if (prescan_inode_set_rehash(set, VISITED_INITIAL_CAPACITY) != 0)
+            return -1;
+    }
+
     uint64_t hash = prescan_inode_hash(set, device, inode);
-    if (set->capacity == 0 &&
-        prescan_inode_set_rehash(set, VISITED_INITIAL_CAPACITY) != 0)
-        return -1;
 
     size_t index = SIZE_MAX;
     int location = prescan_inode_set_locate(set, device, inode, hash, &index);
@@ -415,10 +423,14 @@ int inode_map_find_or_insert(PortableInodeMap *map, dev_t device,
         root_length > SIDECAR_MAX_ROOT_ID || logical_length > SIDECAR_MAX_PATH)
         return -1;
 
+    if (map->capacity == 0) {
+        if (map->hash_salt == 0)
+            map->hash_salt = sidecar_process_salt();
+        if (inode_map_rehash(map, VISITED_INITIAL_CAPACITY) != 0)
+            return -1;
+    }
+
     uint64_t hash = inode_map_hash(map, device, inode);
-    if (map->capacity == 0 &&
-        inode_map_rehash(map, VISITED_INITIAL_CAPACITY) != 0)
-        return -1;
 
     size_t index = SIZE_MAX;
     int location = inode_map_locate(map, device, inode, hash, &index);
@@ -605,8 +617,6 @@ int case_fold_set_find_or_insert_value(
             index = (index + 1U) & (set->capacity - 1U);
     }
 
-    if (key_length > SIZE_MAX - 1U || logical_length > SIZE_MAX - 1U)
-        return -1;
     char *key_copy = malloc(key_length + 1U);
     if (key_copy == NULL)
         return -1;
