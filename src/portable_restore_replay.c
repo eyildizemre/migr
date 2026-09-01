@@ -258,6 +258,13 @@ static int replay_open_payload(int data_fd, const ManifestRoot *root,
                                const SidecarEntry *entry, int *out_fd,
                                struct stat *out_stat);
 
+/* Confirms the on-disk placeholder for a symlink or hardlink entry is
+ * exactly the convention both kinds share: an empty regular file
+ * (docs/DECISIONS.md D18, D22). Deliberately reused for SIDECAR_KIND_HARDLINK
+ * as well as SIDECAR_KIND_SYMLINK -- both replay their real content from
+ * elsewhere (the sidecar record's target string, or the referenced entry's
+ * own payload), so the payload node itself only ever needs to prove it
+ * was not tampered with. */
 static int replay_symlink_placeholder_valid(const ReplayCollection *collection,
                                             const ManifestRoot *root,
                                             const SidecarEntry *entry)
@@ -284,6 +291,28 @@ static int replay_symlink_placeholder_valid(const ReplayCollection *collection,
     }
     errno = saved;
     return result;
+}
+
+/* Maps a sidecar entry kind to the MetadataXattrRequirements field (metadata.h)
+ * its xattr namespaces accumulate into. SIDECAR_KIND_HARDLINK deliberately
+ * maps to NULL: a hardlink alias carries no independent xattrs of its own
+ * (docs/DECISIONS.md D22) -- its representative's REGULAR entry is what
+ * accumulates them. If MetadataXattrRequirements ever grows a fourth field,
+ * this is the other place that needs it. */
+static unsigned int *replay_xattr_requirements_field(
+    MetadataXattrRequirements *requirements, SidecarObjectKind kind)
+{
+    if (requirements == NULL)
+        return NULL;
+    switch (kind)
+    {
+    case SIDECAR_KIND_REGULAR:   return &requirements->regular_namespaces;
+    case SIDECAR_KIND_DIRECTORY: return &requirements->directory_namespaces;
+    case SIDECAR_KIND_SYMLINK:   return &requirements->symlink_namespaces;
+    case SIDECAR_KIND_FIFO:
+    case SIDECAR_KIND_HARDLINK:  return NULL;
+    }
+    return NULL;
 }
 
 static int replay_collect_entry(const SidecarLiveView *view, void *argument)
@@ -320,7 +349,6 @@ static int replay_collect_entry(const SidecarLiveView *view, void *argument)
     }
 
     size_t hardlink_ref_root_index = SIZE_MAX;
-    char hardlink_ref_destination[PATH_MAX] = {0};
     char hardlink_ref_relative[PATH_MAX] = {0};
     if (entry->kind == SIDECAR_KIND_HARDLINK)
     {
@@ -350,19 +378,18 @@ static int replay_collect_entry(const SidecarLiveView *view, void *argument)
         char reference_logical[PATH_MAX];
         replay_copy_bytes(reference_logical, sizeof(reference_logical),
                           referenced.entry->logical_path);
-        if (destination_path_build(
-                &collection->manifest->roots[hardlink_ref_root_index],
-                reference_logical, collection->destination_xdg_dirs,
-                hardlink_ref_destination,
-                sizeof(hardlink_ref_destination)) != 0)
+        const ManifestRoot *ref_root =
+            &collection->manifest->roots[hardlink_ref_root_index];
+        if (ref_root->policy == ROOT_POLICY_XDG)
         {
-            replay_report_failure(collection->report, collection->manifest,
-                                  root_index, entry->logical_path);
-            return 1;
-        }
-        if (collection->manifest->roots[hardlink_ref_root_index].policy ==
-                ROOT_POLICY_XDG)
-        {
+            if (!xdg_destination_valid(collection->destination_xdg_dirs,
+                                       ref_root))
+            {
+                replay_report_failure(collection->report,
+                                      collection->manifest, root_index,
+                                      entry->logical_path);
+                return 1;
+            }
             int length = snprintf(hardlink_ref_relative,
                                   sizeof(hardlink_ref_relative), "%s",
                                   reference_logical);
@@ -376,6 +403,18 @@ static int replay_collect_entry(const SidecarLiveView *view, void *argument)
         }
         else
         {
+            char hardlink_ref_destination[PATH_MAX];
+            if (destination_path_build(
+                    ref_root, reference_logical,
+                    collection->destination_xdg_dirs,
+                    hardlink_ref_destination,
+                    sizeof(hardlink_ref_destination)) != 0)
+            {
+                replay_report_failure(collection->report,
+                                      collection->manifest, root_index,
+                                      entry->logical_path);
+                return 1;
+            }
             int length = snprintf(hardlink_ref_relative,
                                   sizeof(hardlink_ref_relative), "%s",
                                   hardlink_ref_destination);
@@ -469,14 +508,8 @@ static int replay_collect_entry(const SidecarLiveView *view, void *argument)
      */
     if (view->xattr_count != 0)
     {
-        unsigned int *kind_namespaces =
-            entry->kind == SIDECAR_KIND_REGULAR
-                ? &collection->xattr_requirements.regular_namespaces
-                : entry->kind == SIDECAR_KIND_DIRECTORY
-                    ? &collection->xattr_requirements.directory_namespaces
-                    : entry->kind == SIDECAR_KIND_SYMLINK
-                        ? &collection->xattr_requirements.symlink_namespaces
-                        : NULL;
+        unsigned int *kind_namespaces = replay_xattr_requirements_field(
+            &collection->xattr_requirements, entry->kind);
         if (kind_namespaces != NULL)
             for (size_t xindex = 0; xindex < view->xattr_count; xindex++)
             {
@@ -1172,6 +1205,16 @@ static int replay_run(ReplayCollection *collection)
     qsort(collection->items, collection->count, sizeof(*collection->items),
           replay_entry_compare);
 
+    /* Three passes over the same sorted set, not one:
+     * 1. Every non-HARDLINK entry, in sorted (depth, destination) order.
+     * 2. HARDLINK entries only, in a second pass over the same set --
+     *    deferred because neither the sidecar's hash-bucket iteration order
+     *    nor this sort gives any representative-before-alias guarantee a
+     *    single combined pass could rely on (D22 As-built, Phase G).
+     * 3. Directory metadata, applied in reverse sorted order so every child
+     *    is already on disk before its parent's own metadata (mtime
+     *    especially) is set (D17, "directories: children first, then exact
+     *    post-order metadata"). */
     for (size_t index = 0; index < collection->count; index++)
     {
         ReplayEntry *replay = &collection->items[index];
@@ -1355,11 +1398,21 @@ int portable_restore_replay_at(const PortableRestoreRequest *request,
         result = -1;
     if (result == 0)
         result = replay_run(&collection);
+    int saved_errno = errno;
     if (sidecar_log_close(&sidecar) != SIDECAR_STATUS_OK)
+    {
+        if (result == 0)
+            saved_errno = errno == 0 ? EIO : errno;
         result = -1;
+    }
     if (close(collection.data_fd) != 0)
+    {
+        if (result == 0)
+            saved_errno = errno == 0 ? EIO : errno;
         result = -1;
+    }
     collection.data_fd = -1;
+    errno = saved_errno;
     if (result == 0)
     {
         replay_collection_free(&collection);

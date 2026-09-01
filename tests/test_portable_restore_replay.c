@@ -22,11 +22,6 @@
 #include "portable_restore_replay_internal.h"
 #include "sidecar.h"
 
-extern int replay_entry_valid(const SidecarEntry *entry);
-extern int replay_stat_from_entry(const SidecarEntry *entry,
-                                  struct stat *desired);
-extern int replay_hardlink_identity_matches(const struct stat *linked,
-                                            const struct stat *reference);
 extern void replay_copy_bytes(char *destination, size_t destination_size,
                               SidecarBytes source);
 

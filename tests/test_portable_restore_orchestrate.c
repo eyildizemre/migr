@@ -1188,6 +1188,104 @@ static void test_hardlink_cross_root(void)
     fixture_close(&fixture);
 }
 
+static void test_hardlink_cross_root_invalid_xdg_reference(void)
+{
+    printf(BLUE "::" NC
+           " portable hardlink rejects an invalid XDG reference root\n");
+    ManifestRoot roots[2];
+    memset(roots, 0, sizeof(roots));
+    snprintf(roots[0].id, sizeof(roots[0].id), "XDG_DOCUMENTS_DIR");
+    roots[0].policy = ROOT_POLICY_XDG;
+    snprintf(roots[0].payload_path, sizeof(roots[0].payload_path),
+             "XDG_DOCUMENTS_DIR");
+    snprintf(roots[0].source_path, sizeof(roots[0].source_path),
+             "/source/XDG_DOCUMENTS_DIR");
+    roots[1] = root_for();
+    snprintf(roots[1].id, sizeof(roots[1].id), "ROOT_B");
+    snprintf(roots[1].payload_path, sizeof(roots[1].payload_path),
+             "ROOT_B");
+    snprintf(roots[1].source_path, sizeof(roots[1].source_path),
+             "/source/ROOT_B");
+    snprintf(roots[1].restore_path, sizeof(roots[1].restore_path),
+             "restored-b");
+
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &roots[0]);
+    check(opened == 0, "invalid-XDG hardlink fixture is created");
+    if (opened != 0)
+        return;
+
+    Manifest manifest_model = {
+        .version = MANIFEST_CURRENT_VERSION,
+        .representation = CLONE_PORTABLE_SIDECAR,
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .sidecar_version = SIDECAR_VERSION,
+        .root_count = 2,
+        .roots = roots
+    };
+    check(manifest_write_v1_at(fixture.container_fd, &manifest_model) == 0,
+          "invalid-XDG hardlink manifest is committed");
+
+    make_dir_at(fixture.data_fd, "XDG_DOCUMENTS_DIR", 0700);
+    make_dir_at(fixture.data_fd, "ROOT_B", 0700);
+    int reference_fd = openat(fixture.data_fd, "XDG_DOCUMENTS_DIR",
+                              O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int alias_root_fd = openat(fixture.data_fd, "ROOT_B",
+                               O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (reference_fd < 0 || alias_root_fd < 0)
+        fatal("could not open invalid-XDG hardlink payload roots");
+    write_file_at(reference_fd, "representative", "cross-root payload");
+    write_file_at(alias_root_fd, "alias", "");
+    if (close(reference_fd) != 0 || close(alias_root_fd) != 0)
+        fatal("could not close invalid-XDG hardlink payload roots");
+
+    uint32_t uid = (uint32_t)geteuid();
+    uint32_t gid = (uint32_t)getegid();
+    SidecarEntry entries[] = {
+        entry_for("XDG_DOCUMENTS_DIR", "", "", SIDECAR_KIND_DIRECTORY, 0,
+                  0700, uid, gid, 1700000840, 1, 1700000841, 2),
+        entry_for("XDG_DOCUMENTS_DIR", "representative", "representative",
+                  SIDECAR_KIND_REGULAR, strlen("cross-root payload"), 0640,
+                  uid, gid, 1700000850, 3, 1700000851, 4),
+        entry_for("ROOT_B", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  uid, gid, 1700000860, 5, 1700000861, 6),
+        entry_for("ROOT_B", "alias", "alias", SIDECAR_KIND_HARDLINK, 0,
+                  0640, uid, gid, 1700000870, 7, 1700000871, 8)
+    };
+    entries[3].hardlink_root_id = text_bytes("XDG_DOCUMENTS_DIR");
+    entries[3].hardlink_logical_path = text_bytes("representative");
+    check(write_sidecar(&fixture, entries, 4) == 0,
+          "invalid-XDG hardlink sidecar is committed");
+
+    /* This exercises replay_manifest_valid()'s upfront XDG gate, not the
+     * hardlink-reference branch in replay_collect_entry(). Every possible
+     * hardlink reference root comes from manifest->roots[], so this gate
+     * already rejects this manifest before collection starts; no current test
+     * can distinguish the old and new replay_collect_entry() behavior here.
+     * The invariant covered is that an unresolved XDG root referenced only
+     * through a hardlink still gets a complete refusal without mutation. */
+    PortableRestoreRequest request = {
+        .source_container_fd = fixture.container_fd,
+        .manifest = &manifest_model,
+        .destination_home_fd = fixture.home_fd,
+        .destination_home_path = fixture.home,
+        .destination_timestamp_policy = {
+            .nsec_exact = 1,
+            .configured = 1
+        }
+    };
+    PortableRestoreReplayReport report;
+    portable_restore_replay_report_init(&report);
+    int result = portable_restore_replay_at(&request, &report);
+    char destination_root[PATH_MAX];
+    path_join_fixture(destination_root, sizeof(destination_root),
+                      fixture.home, "/restored-b");
+    check(result != 0 && report.failed_count != 0 &&
+              access(destination_root, F_OK) != 0,
+          "an unresolved XDG hardlink reference is refused before replay");
+    fixture_close(&fixture);
+}
+
 static void test_xdg_destination_orchestration(void)
 {
     printf(BLUE "::" NC " portable XDG destination orchestration\n");
@@ -1787,6 +1885,7 @@ int main(void)
     test_security_xattr_tolerance_orchestration();
     test_hardlink_orchestration();
     test_hardlink_cross_root();
+    test_hardlink_cross_root_invalid_xdg_reference();
     test_xdg_destination_orchestration();
     test_hardlink_reference_failures();
     test_symlink_orchestration();
