@@ -237,6 +237,15 @@ static int component_percent_encode(const char *raw, char *out,
     return 0;
 }
 
+// No production code currently calls this (encoding_percent_decode() with
+// ENCODING_MODE_COMPONENT) -- portable restore recovers original names from
+// the sidecar log's stored logical path rather than reversing the physical
+// encoding. This function is kept, and directly exercised by
+// tests/test_encoding.c's round-trip and injectivity tests, because it is the
+// verified inverse of component_percent_encode() (used in production by
+// portable.c/portable_prescan.c/portable_restore_shared.c) and documents the
+// encoding scheme's correctness contract (D19 N-1) even without a current
+// caller.
 static int component_percent_decode(const char *encoded, char *out,
                                      size_t out_size)
 {
