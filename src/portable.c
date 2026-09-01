@@ -1885,6 +1885,9 @@ static int capture_directory(PortableCaptureContext *context,
             break;
         }
 
+        /* NAME_MAX + 1 is the accept/reject boundary, not a diagnostic scratch
+         * size: docs/DECISIONS.md D19 N-2 requires refusing, not skipping, a
+         * component whose encoded form exceeds NAME_MAX. */
         char encoded_leaf[NAME_MAX + 1U];
         if (encoding_percent_encode(ENCODING_MODE_COMPONENT, entry->d_name,
                                     encoded_leaf, sizeof(encoded_leaf)) != 0) {
