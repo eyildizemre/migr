@@ -88,14 +88,13 @@ static void report_violation(PortableRestorePreflightReport *report,
     }
 }
 
-static const Manifest *root_order_manifest;
-
-static int root_order_compare(const void *left, const void *right)
+static int root_order_compare(const void *left, const void *right, void *arg)
 {
+    const Manifest *manifest = arg;
     size_t a = *(const size_t *)left;
     size_t b = *(const size_t *)right;
-    return strcmp(root_order_manifest->roots[a].payload_path,
-                  root_order_manifest->roots[b].payload_path);
+    return strcmp(manifest->roots[a].payload_path,
+                  manifest->roots[b].payload_path);
 }
 
 static int collection_validate_manifest(Collection *collection)
@@ -161,10 +160,9 @@ static int collection_validate_manifest(Collection *collection)
             return -1;
         for (size_t index = 0; index < report->root_count; index++)
             collection->root_order[index] = index;
-        root_order_manifest = manifest;
-        qsort(collection->root_order, report->root_count,
-              sizeof(*collection->root_order), root_order_compare);
-        root_order_manifest = NULL;
+        qsort_r(collection->root_order, report->root_count,
+                sizeof(*collection->root_order), root_order_compare,
+                (void *)manifest);
         /* strcmp adjacency does not preserve path ancestry: a sibling whose
          * next byte sorts before '/' can sit between an ancestor and child.
          * Root counts are bounded, and capture validates the same relation
