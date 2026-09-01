@@ -525,26 +525,18 @@ static int restore_home_item(const CloneContext *ctx, int source_root_fd,
     return rc;
 }
 
-// Existing XDG destinations are caller-selected trust roots and may themselves
-// be symlinks or live outside HOME. If only the final component is absent, its
-// parent becomes the trust root and the fd-anchored core creates the leaf.
-// If the parent is missing too, a live restore creates its missing path
-// components first. Dry-run leaves the path untouched.
-static int mkdir_parents(char *dir)
-{
-    char *scan = dir[0] == '/' ? dir + 1 : dir;
-    for (char *slash = strchr(scan, '/'); slash != NULL;
-        slash = strchr(slash + 1, '/'))
-    {
-        *slash = '\0';
-        int failed = mkdir(dir, 0700) != 0 && errno != EEXIST;
-        *slash = '/';
-        if (failed)
-            return -1;
-    }
-    return mkdir(dir, 0700) == 0 || errno == EEXIST ? 0 : -1;
-}
-
+// Existing XDG destinations are caller-selected trust roots and may
+// themselves be symlinks or live outside HOME. Walks up past however many
+// trailing path components are currently absent, returning the fd of the
+// nearest existing ancestor and the (possibly multi-component) relative
+// path from there down to path's own leaf -- the same "nearest existing
+// parent" contract resolve_parent(..., create_intermediates=0) already
+// gives the fd-anchored native restore engine for every other restore
+// root. Never creates anything itself: a live restore's own
+// create_intermediates=1 pass creates the missing chain, and dry-run's
+// create_intermediates=0 pass correctly treats an absent intermediate as a
+// benign preview case rather than a hard failure -- both already handled
+// by whatever this anchor and relative path are then handed to.
 static int open_xdg_destination_anchor(const char *path, int *out_fd,
                                        char *out_rel, size_t rel_size)
 {
@@ -558,49 +550,56 @@ static int open_xdg_destination_anchor(const char *path, int *out_fd,
     if (errno != ENOENT)
         return -1;
 
-    char *copy = strdup(path);
-    if (copy == NULL)
+    char copy[PATH_MAX];
+    if ((size_t)snprintf(copy, sizeof(copy), "%s", path) >= sizeof(copy))
         return -1;
 
     size_t len = strlen(copy);
     while (len > 1 && copy[len - 1] == '/')
         copy[--len] = '\0';
 
-    char *slash = strrchr(copy, '/');
-    const char *leaf = slash == NULL ? copy : slash + 1;
-    size_t leaf_len = strlen(leaf);
-    if (leaf_len == 0 || leaf_len >= rel_size)
+    out_rel[0] = '\0';
+    for (;;)
     {
-        free(copy);
-        return -1;
-    }
-    memcpy(out_rel, leaf, leaf_len + 1);
+        char *slash = strrchr(copy, '/');
+        const char *leaf = slash == NULL ? copy : slash + 1;
+        size_t leaf_len = strlen(leaf);
+        if (leaf_len == 0)
+            return -1;
 
-    char *parent;
-    if (slash == NULL)
-        parent = NULL;
-    else if (slash == copy)
-    {
-        slash[1] = '\0';
-        parent = copy;
-    }
-    else
-    {
-        *slash = '\0';
-        parent = copy;
-    }
+        size_t rel_len = strlen(out_rel);
+        size_t separator = rel_len > 0 ? 1 : 0;
+        if (leaf_len + separator + rel_len >= rel_size)
+            return -1;
+        memmove(out_rel + leaf_len + separator, out_rel, rel_len + 1);
+        memcpy(out_rel, leaf, leaf_len);
+        if (separator)
+            out_rel[leaf_len] = '/';
 
-    const char *parent_path = parent == NULL ? "." : parent;
-    fd = open(parent_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (fd < 0 && errno == ENOENT && parent != NULL && !dry_run &&
-        mkdir_parents(parent) == 0)
+        char *parent;
+        if (slash == NULL)
+            parent = NULL;
+        else if (slash == copy)
+        {
+            slash[1] = '\0';
+            parent = copy;
+        }
+        else
+        {
+            *slash = '\0';
+            parent = copy;
+        }
+
+        const char *parent_path = parent == NULL ? "." : parent;
         fd = open(parent_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    free(copy);
-    if (fd < 0)
-        return -1;
-
-    *out_fd = fd;
-    return 0;
+        if (fd >= 0)
+        {
+            *out_fd = fd;
+            return 0;
+        }
+        if (errno != ENOENT || parent == NULL)
+            return -1;
+    }
 }
 
 typedef enum {
@@ -685,7 +684,7 @@ static int restore_legacy(const char *source, int source_root_fd, const char *ho
         // itself ("", docs/DECISIONS.md D16), rather than assuming it is
         // reachable via home_fd.
         int xdg_dest_fd;
-        char destination_rel[NAME_MAX + 1];
+        char destination_rel[PATH_MAX];
         if (open_xdg_destination_anchor(xdg_dirs[i], &xdg_dest_fd, destination_rel, sizeof(destination_rel)) != 0)
         {
             print_error("Error: Failed to restore %s\n", name);
@@ -905,7 +904,7 @@ static int seed_native_restore_legacy_hardlink_map(
         }
 
         int destination_fd;
-        char destination_rel[NAME_MAX + 1];
+        char destination_rel[PATH_MAX];
         if (open_xdg_destination_anchor(xdg_dirs[i], &destination_fd,
                                          destination_rel,
                                          sizeof(destination_rel)) != 0)
@@ -1058,7 +1057,7 @@ static RestoreNativeStatus restore_legacy_metadata_inventory(
         }
 
         int destination_fd = -1;
-        char destination_rel[NAME_MAX + 1];
+        char destination_rel[PATH_MAX];
         if (open_xdg_destination_anchor(xdg_dirs[i], &destination_fd,
                                          destination_rel,
                                          sizeof(destination_rel)) != 0)
@@ -1254,7 +1253,7 @@ static void restore_v1(const char *source, int source_root_fd, const char *home,
         }
 
         int xdg_dest_fd;
-        char destination_rel[NAME_MAX + 1];
+        char destination_rel[PATH_MAX];
         V1XdgDestStatus dest_status = resolve_v1_xdg_root_destination(
             root, xdg_dirs, &xdg_dest_fd, destination_rel,
             sizeof(destination_rel));

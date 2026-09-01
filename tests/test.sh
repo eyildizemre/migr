@@ -1247,10 +1247,10 @@ test_xdg_nested_destination_recovery() {
 
     # user-dirs.dirs can legitimately map an XDG directory to a nested custom
     # path (a real xdg-user-dirs feature). On a fresh restore target, not just
-    # the leaf but its parent too may not exist yet --
-    # open_xdg_destination_anchor() must recover the same way the native
-    # restore engine's own resolve_parent(..., create_intermediates=1) already
-    # does, not refuse.
+    # the leaf but its parent too may not exist yet -- both a live restore
+    # and a dry-run preview of it must recover the same way the native
+    # restore engine's own resolve_parent(..., create_intermediates) already
+    # does for every other restore root, not refuse.
     local xdg_src="$TEST_DIR/xdg_nested_src"
     local xdg_home="$TEST_DIR/xdg_nested_home"
     mkdir -p "$xdg_src/Documents" "$xdg_home/.config"
@@ -1262,17 +1262,20 @@ test_xdg_nested_destination_recovery() {
         exit 1
     fi
 
-    # The recovery only creates the missing chain for a live restore -- a
-    # dry-run must never mutate the destination. (Dry-run itself still
-    # reports an error for this case rather than a clean preview; that's a
-    # separate, narrower gap, not something this recovery regresses -- it
-    # errored here before this fix too.)
-    env HOME="$xdg_home" ../migr restore "$xdg_src" --dry-run >/dev/null 2>&1 || true
+    # A dry-run against the same fixture must preview the restore cleanly
+    # (open_xdg_destination_anchor() walks up to the nearest existing
+    # ancestor and hands the fd-anchored core a multi-component relative
+    # path, exactly like every other restore root) -- not report a spurious
+    # failure for a destination that a live restore would actually create --
+    # while still never creating anything itself.
+    local xdg_dry_out
+    xdg_dry_out=$(env HOME="$xdg_home" ../migr restore "$xdg_src" --dry-run 2>&1)
+    assert_contains "$xdg_dry_out" "Would restore"
     if [ -e "$xdg_home/data" ]; then
         echo -e "  ${RED}✗${NC} Dry-run created \$HOME/data while resolving the XDG destination"
         exit 1
     else
-        echo -e "  ${GREEN}✓${NC} Dry-run does not create the missing XDG destination chain."
+        echo -e "  ${GREEN}✓${NC} Dry-run previews the recovery without creating the missing XDG destination chain."
     fi
 
     local xdg_out
