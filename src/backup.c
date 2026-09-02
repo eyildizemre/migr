@@ -958,7 +958,7 @@ static int backup_metadata_preflight(const BackupPlan *plan, int anchor_fd,
 }
 
 static int backup_dry_run(const char *target, BackupMode mode,
-                          BackupPlan *plan, Manifest *manifest)
+                          BackupPlan *plan)
 {
     off_t estimated_size = 0;
     int estimate_had_error = 0;
@@ -973,7 +973,6 @@ static int backup_dry_run(const char *target, BackupMode mode,
     int target_created = 0;
     if (ensure_target_root(target, &target_created) != 0)
     {
-        manifest_free(manifest);
         backup_plan_free(plan);
         return 1;
     }
@@ -1010,7 +1009,6 @@ static int backup_dry_run(const char *target, BackupMode mode,
             if (target_created)
                 rmdir(target);
             metadata_profiles_free(&advisory_profiles);
-            manifest_free(manifest);
             backup_plan_free(plan);
             return 1;
         }
@@ -1023,7 +1021,6 @@ static int backup_dry_run(const char *target, BackupMode mode,
         close(advisory_fd);
         if (target_created)
             rmdir(target);
-        manifest_free(manifest);
         backup_plan_free(plan);
         return 1;
     }
@@ -1040,7 +1037,6 @@ static int backup_dry_run(const char *target, BackupMode mode,
                    "no container was created\n");
             close(advisory_fd);
             metadata_profiles_free(&advisory_profiles);
-            manifest_free(manifest);
             backup_plan_free(plan);
             return 1;
         }
@@ -1074,7 +1070,6 @@ static int backup_dry_run(const char *target, BackupMode mode,
             print_error("Error: out of memory building the portable capture preview\n");
             close(advisory_fd);
             metadata_profiles_free(&advisory_profiles);
-            manifest_free(manifest);
             backup_plan_free(plan);
             return 1;
         }
@@ -1112,7 +1107,6 @@ static int backup_dry_run(const char *target, BackupMode mode,
                        "conflict at %s; nothing would be created\n", target);
             close(advisory_fd);
             metadata_profiles_free(&advisory_profiles);
-            manifest_free(manifest);
             backup_plan_free(plan);
             return 1;
         }
@@ -1153,7 +1147,6 @@ static int backup_dry_run(const char *target, BackupMode mode,
                              (size_t)count, "would be copied");
     printf("Dry run complete: %s\n", item_phrase);
 
-    manifest_free(manifest);
     backup_plan_free(plan);
     return 0;
 }
@@ -1186,13 +1179,6 @@ int backup(const char *target, BackupMode mode, char **paths)
         return 1;
     }
 
-    Manifest manifest;
-    if (manifest_from_plan(&plan, &manifest) != 0)
-    {
-        backup_plan_free(&plan);
-        return 1;
-    }
-
     off_t estimated_size = 0;
     int estimate_had_error = 0;
     off_t raw_estimated_size = 0;
@@ -1201,7 +1187,14 @@ int backup(const char *target, BackupMode mode, char **paths)
     int count = 0;
 
     if (dry_run)
-        return backup_dry_run(target, mode, &plan, &manifest);
+        return backup_dry_run(target, mode, &plan);
+
+    Manifest manifest;
+    if (manifest_from_plan(&plan, &manifest) != 0)
+    {
+        backup_plan_free(&plan);
+        return 1;
+    }
 
     // Hoisted so both cleanup epilogues can release every resource
     // unconditionally: each handle is inert until its corresponding operation
