@@ -674,11 +674,6 @@ SidecarOpenStatus sidecar_log_adopt_at(int container_fd, SidecarLog *out)
         }
     }
 
-    if (parse_status == SIDECAR_STATUS_OK && check_size_limit(log) != 0)
-    {
-        status = SIDECAR_OPEN_IO_ERROR;
-        goto fail;
-    }
     out->implementation = log;
     return SIDECAR_OPEN_RESUMABLE;
 
