@@ -31,10 +31,11 @@ typedef struct {
     size_t depth;
 } ReplayEntry;
 
-/* One most-recent parent captures the sibling locality of the
- * (depth, destination) replay order without retaining an fd per directory.
- * Cached parents stay valid because replay never removes or replaces a
- * destination directory. */
+/* One most-recent parent captures sibling locality without retaining an fd
+ * per directory. Destination and payload traversal keep separate slots so
+ * alternating source/destination opens cannot evict each other. Destination
+ * parents remain valid because replay never removes or replaces directories;
+ * payload parents are anchored below the read-only data_fd tree. */
 typedef struct {
     int fd;
     int base_fd;
@@ -56,6 +57,7 @@ typedef struct {
     int xdg_anchor_fd[XDG_KEY_COUNT];
     char xdg_anchor_prefix[XDG_KEY_COUNT][NAME_MAX + 1U];
     ReplayParentCache parent_cache;
+    ReplayParentCache payload_cache;
     MetadataTimestampPolicy timestamp_policy;
     PortableRestoreReplayReport *report;
     BackupCaptureReport *capture_report;
@@ -182,6 +184,11 @@ static void replay_collection_free(ReplayCollection *collection)
         (void)close(collection->parent_cache.fd);
         collection->parent_cache.fd = -1;
     }
+    if (collection->payload_cache.fd >= 0)
+    {
+        (void)close(collection->payload_cache.fd);
+        collection->payload_cache.fd = -1;
+    }
     preflight_free(&collection->memory, collection->items,
                    collection->capacity * sizeof(*collection->items));
     collection->items = NULL;
@@ -301,7 +308,8 @@ static int replay_entry_compare(const void *left, const void *right)
     return strcmp(a->destination, b->destination);
 }
 
-static int replay_open_payload(int data_fd, const ManifestRoot *root,
+static int replay_open_payload(ReplayCollection *collection,
+                               const ManifestRoot *root,
                                const SidecarEntry *entry, int *out_fd,
                                struct stat *out_stat);
 
@@ -312,7 +320,7 @@ static int replay_open_payload(int data_fd, const ManifestRoot *root,
  * elsewhere (the sidecar record's target string, or the referenced entry's
  * own payload), so the payload node itself only ever needs to prove it
  * was not tampered with. */
-static int replay_symlink_placeholder_valid(const ReplayCollection *collection,
+static int replay_symlink_placeholder_valid(ReplayCollection *collection,
                                             const ManifestRoot *root,
                                             const SidecarEntry *entry)
 {
@@ -323,7 +331,7 @@ static int replay_symlink_placeholder_valid(const ReplayCollection *collection,
     }
     int payload_fd = -1;
     struct stat payload_st;
-    if (replay_open_payload(collection->data_fd, root, entry, &payload_fd,
+    if (replay_open_payload(collection, root, entry, &payload_fd,
                             &payload_st) != 0)
         return -1;
     int result = S_ISREG(payload_st.st_mode) && payload_st.st_size == 0
@@ -533,17 +541,10 @@ static int replay_payload_path_build(const ManifestRoot *root,
     return 0;
 }
 
-static int replay_open_existing_relative(int base_fd, const char *relative,
-                                          int flags, int *out_fd,
-                                          struct stat *out_stat)
+static int replay_walk_payload_parent(int base_fd, const char *relative,
+                                      int *parent_out, char *leaf,
+                                      size_t leaf_size)
 {
-    if (base_fd < 0 || relative == NULL || out_fd == NULL ||
-        !relative_path_valid(relative, 0))
-    {
-        errno = EINVAL;
-        return -1;
-    }
-    *out_fd = -1;
     char copy[PATH_MAX];
     size_t length = strlen(relative);
     memcpy(copy, relative, length + 1U);
@@ -555,65 +556,141 @@ static int replay_open_existing_relative(int base_fd, const char *relative,
     for (;;)
     {
         char *slash = strchr(cursor, '/');
-        if (slash != NULL)
-            *slash = '\0';
-        if (slash != NULL)
+        if (slash == NULL)
         {
-            int next = openat(current, cursor,
-                              O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
-                                  O_NOATIME | O_CLOEXEC);
-            if (next < 0)
+            int written = snprintf(leaf, leaf_size, "%s", cursor);
+            if (written < 0 || (size_t)written >= leaf_size)
             {
-                int saved = errno;
                 close(current);
-                errno = saved;
+                errno = ENAMETOOLONG;
                 return -1;
             }
-            if (close(current) != 0)
-            {
-                int saved = errno;
-                close(next);
-                errno = saved;
-                return -1;
-            }
-            current = next;
-            cursor = slash + 1U;
-            continue;
+            *parent_out = current;
+            return 0;
         }
-
-        int fd = openat(current, cursor, flags | O_NOFOLLOW | O_CLOEXEC);
-        int saved = errno;
-        if (fd < 0)
+        *slash = '\0';
+        int next = openat(current, cursor,
+                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                              O_NOATIME | O_CLOEXEC);
+        if (next < 0)
         {
-            close(current);
-            errno = saved;
-            return -1;
-        }
-        if (out_stat != NULL && fstat(fd, out_stat) != 0)
-        {
-            saved = errno;
-            close(fd);
+            int saved = errno;
             close(current);
             errno = saved;
             return -1;
         }
         if (close(current) != 0)
         {
-            saved = errno;
-            close(fd);
+            int saved = errno;
+            close(next);
             errno = saved;
             return -1;
         }
-        *out_fd = fd;
-        return 0;
+        current = next;
+        cursor = slash + 1U;
     }
 }
 
-static int replay_open_payload(int data_fd, const ManifestRoot *root,
+static int replay_payload_parent_cached(ReplayCollection *collection,
+                                        int base_fd, const char *relative,
+                                        int *parent_out, char *leaf,
+                                        size_t leaf_size)
+{
+    const char *slash = strrchr(relative, '/');
+    ReplayParentCache *cache = &collection->payload_cache;
+    size_t prefix_length = 0;
+    if (slash != NULL)
+    {
+        prefix_length = (size_t)(slash - relative);
+        if (cache->fd >= 0 && cache->base_fd == base_fd &&
+            strncmp(cache->prefix, relative, prefix_length) == 0 &&
+            cache->prefix[prefix_length] == '\0')
+        {
+            int written = snprintf(leaf, leaf_size, "%s", slash + 1U);
+            if (written < 0 || (size_t)written >= leaf_size)
+            {
+                errno = ENAMETOOLONG;
+                return -1;
+            }
+            int fd = dup_cloexec(cache->fd);
+            if (fd < 0)
+                return -1;
+            *parent_out = fd;
+            return 0;
+        }
+    }
+
+    if (replay_walk_payload_parent(base_fd, relative, parent_out, leaf,
+                                   leaf_size) != 0)
+        return -1;
+    if (slash == NULL)
+        return 0;
+    int cached = dup_cloexec(*parent_out);
+    if (cached >= 0)
+    {
+        if (cache->fd >= 0)
+            (void)close(cache->fd);
+        cache->fd = cached;
+        cache->base_fd = base_fd;
+        memcpy(cache->prefix, relative, prefix_length);
+        cache->prefix[prefix_length] = '\0';
+    }
+    return 0;
+}
+
+static int replay_open_existing_relative(ReplayCollection *collection,
+                                         int base_fd, const char *relative,
+                                         int flags, int *out_fd,
+                                         struct stat *out_stat)
+{
+    if (collection == NULL || base_fd < 0 || relative == NULL ||
+        out_fd == NULL || !relative_path_valid(relative, 0))
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    *out_fd = -1;
+
+    int parent = -1;
+    char leaf[NAME_MAX + 1U];
+    if (replay_payload_parent_cached(collection, base_fd, relative, &parent,
+                                     leaf, sizeof(leaf)) != 0)
+        return -1;
+
+    int fd = openat(parent, leaf, flags | O_NOFOLLOW | O_CLOEXEC);
+    int saved = errno;
+    if (fd < 0)
+    {
+        close(parent);
+        errno = saved;
+        return -1;
+    }
+    if (out_stat != NULL && fstat(fd, out_stat) != 0)
+    {
+        saved = errno;
+        close(fd);
+        close(parent);
+        errno = saved;
+        return -1;
+    }
+    if (close(parent) != 0)
+    {
+        saved = errno;
+        close(fd);
+        errno = saved;
+        return -1;
+    }
+    *out_fd = fd;
+    return 0;
+}
+
+static int replay_open_payload(ReplayCollection *collection,
+                               const ManifestRoot *root,
                                const SidecarEntry *entry, int *out_fd,
                                struct stat *out_stat)
 {
-    if (data_fd < 0 || root == NULL || entry == NULL || out_fd == NULL)
+    if (collection == NULL || collection->data_fd < 0 || root == NULL ||
+        entry == NULL || out_fd == NULL)
     {
         errno = EINVAL;
         return -1;
@@ -627,7 +704,8 @@ static int replay_open_payload(int data_fd, const ManifestRoot *root,
         flags |= O_DIRECTORY;
     int fd = -1;
     struct stat st;
-    if (replay_open_existing_relative(data_fd, path, flags, &fd, &st) != 0)
+    if (replay_open_existing_relative(collection, collection->data_fd, path,
+                                      flags, &fd, &st) != 0)
         return -1;
     if ((entry->kind == SIDECAR_KIND_DIRECTORY && !S_ISDIR(st.st_mode)) ||
         (entry->kind == SIDECAR_KIND_REGULAR &&
@@ -954,7 +1032,7 @@ static int replay_apply_regular(ReplayCollection *collection,
 
     int source_fd = -1;
     struct stat source_before;
-    if (replay_open_payload(collection->data_fd, root, entry, &source_fd,
+    if (replay_open_payload(collection, root, entry, &source_fd,
                             &source_before) != 0)
         return -1;
     int parent_fd = -1;
@@ -1204,7 +1282,7 @@ static int replay_prepare_directory(ReplayCollection *collection,
     const SidecarEntry *entry = replay->entry;
     int source_fd = -1;
     struct stat source_st;
-    if (replay_open_payload(collection->data_fd, root, entry, &source_fd,
+    if (replay_open_payload(collection, root, entry, &source_fd,
                             &source_st) != 0)
         return -1;
 
@@ -1456,6 +1534,7 @@ int portable_restore_replay_at(const PortableRestoreRequest *request,
     for (int index = 0; index < XDG_KEY_COUNT; index++)
         collection.xdg_anchor_fd[index] = -1;
     collection.parent_cache.fd = -1;
+    collection.payload_cache.fd = -1;
     if (root_map_build(&collection.root_map, request->manifest) != 0)
         goto fail;
 

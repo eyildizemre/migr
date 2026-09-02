@@ -1558,6 +1558,85 @@ static void test_parent_cache_distinguishes_destination_bases(void)
     fixture_close(&fixture);
 }
 
+static void test_payload_parent_cache_preserves_directory_identity(void)
+{
+    printf(BLUE "::" NC " portable payload parent cache preserves directory identity\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "payload parent-cache fixture is created");
+    if (opened != 0)
+        return;
+
+    make_dir_at(fixture.data_fd, "ROOT", 0700);
+    int root_fd = openat(fixture.data_fd, "ROOT",
+                         O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (root_fd < 0)
+        fatal("could not open payload parent-cache root");
+    make_dir_at(root_fd, "dir-a", 0700);
+    make_dir_at(root_fd, "dir-b", 0700);
+    int dir_a_fd = openat(root_fd, "dir-a",
+                          O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int dir_b_fd = openat(root_fd, "dir-b",
+                          O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dir_a_fd < 0 || dir_b_fd < 0)
+        fatal("could not open payload parent-cache directories");
+    write_file_at(dir_a_fd, "other.txt", "alpha other payload");
+    write_file_at(dir_a_fd, "same.txt", "alpha payload");
+    write_file_at(dir_b_fd, "other.txt", "bravo other payload");
+    write_file_at(dir_b_fd, "same.txt", "bravo payload");
+    if (close(dir_a_fd) != 0 || close(dir_b_fd) != 0 || close(root_fd) != 0)
+        fatal("could not close payload parent-cache directories");
+
+    uint32_t uid = (uint32_t)geteuid();
+    uint32_t gid = (uint32_t)getegid();
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY,
+                  0, 0700, uid, gid, 1700001240, 1, 1700001241, 2),
+        entry_for("ROOT", "dir-a", "dir-a", SIDECAR_KIND_DIRECTORY,
+                  0, 0700, uid, gid, 1700001250, 3, 1700001251, 4),
+        entry_for("ROOT", "dir-b", "dir-b", SIDECAR_KIND_DIRECTORY,
+                  0, 0700, uid, gid, 1700001260, 5, 1700001261, 6),
+        entry_for("ROOT", "dir-a/other.txt", "dir-a/other.txt",
+                  SIDECAR_KIND_REGULAR, strlen("alpha other payload"), 0600,
+                  uid, gid, 1700001270, 7, 1700001271, 8),
+        entry_for("ROOT", "dir-a/same.txt", "dir-a/same.txt",
+                  SIDECAR_KIND_REGULAR, strlen("alpha payload"), 0600,
+                  uid, gid, 1700001280, 9, 1700001281, 10),
+        entry_for("ROOT", "dir-b/other.txt", "dir-b/other.txt",
+                  SIDECAR_KIND_REGULAR, strlen("bravo other payload"), 0600,
+                  uid, gid, 1700001290, 11, 1700001291, 12),
+        entry_for("ROOT", "dir-b/same.txt", "dir-b/same.txt",
+                  SIDECAR_KIND_REGULAR, strlen("bravo payload"), 0600,
+                  uid, gid, 1700001300, 13, 1700001301, 14)
+    };
+    check(write_sidecar(&fixture, entries, 7) == 0,
+          "payload parent-cache sidecar is committed");
+
+    PortableRestoreReplayReport report;
+    int result = run_orchestration(&fixture, &report, 1, "y\n");
+    check(result == 0 && report.live_count == 7 &&
+              report.applied_count == 7 && report.failed_count == 0,
+          "payload parent-cache restore completes");
+
+    char a_other[PATH_MAX], a_same[PATH_MAX];
+    char b_other[PATH_MAX], b_same[PATH_MAX];
+    path_join_fixture(a_other, sizeof(a_other), fixture.home,
+                      "/restored/dir-a/other.txt");
+    path_join_fixture(a_same, sizeof(a_same), fixture.home,
+                      "/restored/dir-a/same.txt");
+    path_join_fixture(b_other, sizeof(b_other), fixture.home,
+                      "/restored/dir-b/other.txt");
+    path_join_fixture(b_same, sizeof(b_same), fixture.home,
+                      "/restored/dir-b/same.txt");
+    check(file_equals(a_other, "alpha other payload") &&
+              file_equals(a_same, "alpha payload") &&
+              file_equals(b_other, "bravo other payload") &&
+              file_equals(b_same, "bravo payload"),
+          "cached payload parents preserve same-name contents by directory");
+    fixture_close(&fixture);
+}
+
 static void assert_hardlink_reference_refused(Fixture *fixture,
                                                const SidecarEntry *entries,
                                                size_t count,
@@ -2070,6 +2149,7 @@ int main(void)
     test_xdg_destination_orchestration();
     test_xdg_missing_destination_anchor_cache();
     test_parent_cache_distinguishes_destination_bases();
+    test_payload_parent_cache_preserves_directory_identity();
     test_hardlink_reference_failures();
     test_symlink_orchestration();
     test_symlink_ownership_rejection();
