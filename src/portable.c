@@ -385,23 +385,13 @@ void xattrs_free(PortableXattrs *xattrs)
 
 static int xattrs_reserve(PortableXattrs *xattrs, size_t extra)
 {
-    if (extra > SIDECAR_MAX_XATTRS_PER_ENTRY - xattrs->count)
-        return -1;
-    size_t needed = xattrs->count + extra;
-    if (needed <= xattrs->capacity)
-        return 0;
-    size_t capacity = xattrs->capacity == 0 ? 4U : xattrs->capacity * 2U;
-    if (capacity < needed)
-        capacity = needed;
-    if (capacity > SIDECAR_MAX_XATTRS_PER_ENTRY)
-        capacity = SIDECAR_MAX_XATTRS_PER_ENTRY;
-    SidecarXattr *items = realloc(xattrs->items, capacity * sizeof(*items));
+    SidecarXattr *items = array_reserve(xattrs->items, &xattrs->capacity,
+                                        xattrs->count, extra,
+                                        sizeof(*items), 4U,
+                                        SIDECAR_MAX_XATTRS_PER_ENTRY);
     if (items == NULL)
         return -1;
-    memset(items + xattrs->capacity, 0,
-           (capacity - xattrs->capacity) * sizeof(*items));
     xattrs->items = items;
-    xattrs->capacity = capacity;
     return 0;
 }
 
@@ -424,28 +414,14 @@ static void pending_readback_names_free(PendingReadbackNames *pending)
 static int pending_readback_names_reserve(PendingReadbackNames *pending,
                                           size_t extra)
 {
-    if (pending == NULL ||
-        extra > PORTABLE_MAX_READBACK_NAMES - pending->count)
+    if (pending == NULL)
         return -1;
-    size_t needed = pending->count + extra;
-    if (needed <= pending->capacity)
-        return 0;
-
-    size_t capacity = pending->capacity == 0 ? 16U : pending->capacity * 2U;
-    if (capacity < needed)
-        capacity = needed;
-    if (capacity > PORTABLE_MAX_READBACK_NAMES)
-        capacity = PORTABLE_MAX_READBACK_NAMES;
-    if (capacity > SIZE_MAX / sizeof(*pending->names))
-        return -1;
-
-    char **names = realloc(pending->names, capacity * sizeof(*names));
+    char **names = array_reserve(pending->names, &pending->capacity,
+                                 pending->count, extra, sizeof(*names), 16U,
+                                 PORTABLE_MAX_READBACK_NAMES);
     if (names == NULL)
         return -1;
-    memset(names + pending->capacity, 0,
-           (capacity - pending->capacity) * sizeof(*names));
     pending->names = names;
-    pending->capacity = capacity;
     return 0;
 }
 
@@ -1053,18 +1029,12 @@ static int portable_owned_paths_append(PortableOwnedPaths *paths,
         paths->count >= SIDECAR_MAX_LIVE_ENTRIES)
         return -1;
     if (paths->count == paths->capacity) {
-        size_t capacity = paths->capacity == 0 ? 16U : paths->capacity * 2U;
-        if (capacity > SIDECAR_MAX_LIVE_ENTRIES)
-            capacity = SIDECAR_MAX_LIVE_ENTRIES;
-        if (capacity < paths->capacity ||
-            capacity > SIZE_MAX / sizeof(*paths->items))
-            return -1;
-        PortableOwnedPath *items = realloc(paths->items,
-                                           capacity * sizeof(*items));
+        PortableOwnedPath *items = array_reserve(
+            paths->items, &paths->capacity, paths->count, 1U,
+            sizeof(*items), 16U, SIDECAR_MAX_LIVE_ENTRIES);
         if (items == NULL)
             return -1;
         paths->items = items;
-        paths->capacity = capacity;
     }
 
     PortableOwnedPath item = {0};
@@ -1171,18 +1141,12 @@ static int portable_claimed_paths_append(PortableClaimedPaths *paths,
         paths->count >= SIDECAR_MAX_LIVE_ENTRIES)
         return -1;
     if (paths->count == paths->capacity) {
-        size_t capacity = paths->capacity == 0 ? 16U : paths->capacity * 2U;
-        if (capacity > SIDECAR_MAX_LIVE_ENTRIES)
-            capacity = SIDECAR_MAX_LIVE_ENTRIES;
-        if (capacity < paths->capacity ||
-            capacity > SIZE_MAX / sizeof(*paths->items))
-            return -1;
-        PortableClaimedPath *items = realloc(paths->items,
-                                             capacity * sizeof(*items));
+        PortableClaimedPath *items = array_reserve(
+            paths->items, &paths->capacity, paths->count, 1U,
+            sizeof(*items), 16U, SIDECAR_MAX_LIVE_ENTRIES);
         if (items == NULL)
             return -1;
         paths->items = items;
-        paths->capacity = capacity;
     }
 
     PortableClaimedPath item = {0};

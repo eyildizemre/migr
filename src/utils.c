@@ -1,6 +1,8 @@
 #include <stdio.h>
 #include <stdarg.h>
+#include <errno.h>
 #include <fcntl.h>
+#include <stdlib.h>
 #include <string.h>
 #include <limits.h>
 #include <stdint.h>
@@ -128,6 +130,51 @@ double timespec_elapsed_seconds(const struct timespec *start,
 int dup_cloexec(int fd)
 {
     return fcntl(fd, F_DUPFD_CLOEXEC, 0);
+}
+
+void *array_reserve(void *items, size_t *capacity, size_t count,
+                    size_t extra, size_t element_size,
+                    size_t initial_capacity, size_t max_capacity)
+{
+    if (capacity == NULL || extra == 0 || element_size == 0 ||
+        initial_capacity == 0 || max_capacity == 0)
+    {
+        errno = EINVAL;
+        return NULL;
+    }
+    if (count > max_capacity || extra > max_capacity - count)
+    {
+        errno = E2BIG;
+        return NULL;
+    }
+
+    size_t needed = count + extra;
+    if (needed <= *capacity)
+        return items;
+
+    size_t next = *capacity == 0 ? initial_capacity : *capacity * 2U;
+    if (next < *capacity)
+        next = max_capacity;
+    if (next < needed)
+        next = needed;
+    if (next > max_capacity)
+        next = max_capacity;
+    if (next < needed || next > SIZE_MAX / element_size)
+    {
+        errno = E2BIG;
+        return NULL;
+    }
+
+    void *grown = realloc(items, next * element_size);
+    if (grown == NULL)
+    {
+        errno = ENOMEM;
+        return NULL;
+    }
+    memset((unsigned char *)grown + *capacity * element_size, 0,
+           (next - *capacity) * element_size);
+    *capacity = next;
+    return grown;
 }
 
 size_t relative_path_depth(const char *path)

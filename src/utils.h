@@ -51,6 +51,19 @@ double timespec_elapsed_seconds(const struct timespec *start,
 int dup_cloexec(int fd);
 size_t relative_path_depth(const char *path);
 
+/*
+ * Grows an array so it can hold at least count + extra elements, doubling
+ * from initial_capacity and refusing past max_capacity. Returns the
+ * (possibly reallocated) array and updates *capacity, or NULL with errno
+ * set on failure -- E2BIG when the request exceeds max_capacity or the
+ * size computation would overflow, ENOMEM when the reallocation fails,
+ * EINVAL on a bad argument. On failure *capacity and the caller's array
+ * are left untouched. Any newly added tail is zeroed.
+ */
+void *array_reserve(void *items, size_t *capacity, size_t count,
+                    size_t extra, size_t element_size,
+                    size_t initial_capacity, size_t max_capacity);
+
 /* Live backup progress is sampled at most twice per second in production. */
 #define BACKUP_PROGRESS_THROTTLE_MS 500
 
