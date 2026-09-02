@@ -124,6 +124,8 @@ int legacy_manifest_read(const char *backup_dir, char **out, int n)
 
 static const char MANIFEST_MAGIC[] = "MIGR_MANIFEST";
 
+static int root_ptr_id_cmp(const void *pa, const void *pb);
+
 static int is_id_safe_char(unsigned char c)
 {
     return isalnum(c) || c == '_' || c == '-';
@@ -516,8 +518,27 @@ static ManifestStatus manifest_parse_v1_body(FILE *f, Manifest *out)
     {
         if (read_required_line(f, line, sizeof(line), &fail_status) <= 0) goto fail;
         if (parse_root_line(line, &m.roots[i]) != 0) goto fail;
-        for (int j = 0; j < i; j++)
-            if (strcmp(m.roots[j].id, m.roots[i].id) == 0) goto fail; // duplicate id
+    }
+
+    if (m.root_count > 1)
+    {
+        // Detect duplicate root IDs via sort-then-adjacent-scan instead of an
+        // O(root_count^2) nested loop, matching manifest_resume_identity_compare()'s
+        // existing pattern: sort a fresh array of pointers by id, never
+        // mutating m.roots itself (position still matters elsewhere).
+        const ManifestRoot **sorted =
+            malloc((size_t)m.root_count * sizeof(*sorted));
+        if (sorted == NULL) { fail_status = MANIFEST_STATUS_IO_ERROR; goto fail; }
+        for (int i = 0; i < m.root_count; i++)
+            sorted[i] = &m.roots[i];
+        qsort(sorted, (size_t)m.root_count, sizeof(*sorted), root_ptr_id_cmp);
+        for (int i = 1; i < m.root_count; i++)
+            if (strcmp(sorted[i - 1]->id, sorted[i]->id) == 0)
+            {
+                free(sorted);
+                goto fail; // duplicate id
+            }
+        free(sorted);
     }
 
     // No trailing content beyond the declared roots.
