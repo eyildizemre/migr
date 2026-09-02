@@ -31,6 +31,16 @@ typedef struct {
     size_t depth;
 } ReplayEntry;
 
+/* One most-recent parent captures the sibling locality of the
+ * (depth, destination) replay order without retaining an fd per directory.
+ * Cached parents stay valid because replay never removes or replaces a
+ * destination directory. */
+typedef struct {
+    int fd;
+    int base_fd;
+    char prefix[PATH_MAX];
+} ReplayParentCache;
+
 typedef struct {
     ReplayEntry *items;
     size_t count;
@@ -45,6 +55,7 @@ typedef struct {
     const char * const *destination_xdg_dirs;
     int xdg_anchor_fd[XDG_KEY_COUNT];
     char xdg_anchor_prefix[XDG_KEY_COUNT][NAME_MAX + 1U];
+    ReplayParentCache parent_cache;
     MetadataTimestampPolicy timestamp_policy;
     PortableRestoreReplayReport *report;
     BackupCaptureReport *capture_report;
@@ -166,6 +177,11 @@ static void replay_collection_free(ReplayCollection *collection)
             close(collection->xdg_anchor_fd[index]);
             collection->xdg_anchor_fd[index] = -1;
         }
+    if (collection->parent_cache.fd >= 0)
+    {
+        (void)close(collection->parent_cache.fd);
+        collection->parent_cache.fd = -1;
+    }
     preflight_free(&collection->memory, collection->items,
                    collection->capacity * sizeof(*collection->items));
     collection->items = NULL;
@@ -724,6 +740,71 @@ static int replay_open_destination_regular(int parent_fd, const char *leaf,
     return 0;
 }
 
+static int replay_open_relative_parent_cached(ReplayCollection *collection,
+                                              int base_fd,
+                                              const char *relative,
+                                              int *parent_out, char *leaf,
+                                              size_t leaf_size)
+{
+    if (collection == NULL || relative == NULL || parent_out == NULL ||
+        leaf == NULL || leaf_size == 0)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (relative[0] == '\0')
+        return portable_open_relative_parent(base_fd, relative, parent_out,
+                                             leaf, leaf_size);
+    if (!relative_path_valid(relative, 0))
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    const char *slash = strrchr(relative, '/');
+    ReplayParentCache *cache = &collection->parent_cache;
+    size_t prefix_length = 0;
+    if (slash != NULL)
+    {
+        prefix_length = (size_t)(slash - relative);
+        if (cache->fd >= 0 && cache->base_fd == base_fd &&
+            strncmp(cache->prefix, relative, prefix_length) == 0 &&
+            cache->prefix[prefix_length] == '\0')
+        {
+            int length = snprintf(leaf, leaf_size, "%s", slash + 1U);
+            if (length < 0 || (size_t)length >= leaf_size)
+            {
+                errno = ENAMETOOLONG;
+                return -1;
+            }
+            int fd = dup_cloexec(cache->fd);
+            if (fd < 0)
+                return -1;
+            *parent_out = fd;
+            return 0;
+        }
+    }
+
+    if (portable_open_relative_parent(base_fd, relative, parent_out, leaf,
+                                      leaf_size) != 0)
+        return -1;
+
+    if (slash == NULL)
+        return 0;
+    int cached = dup_cloexec(*parent_out);
+    if (cached >= 0)
+    {
+        if (cache->fd >= 0)
+            (void)close(cache->fd);
+        cache->fd = cached;
+        cache->base_fd = base_fd;
+        memcpy(cache->prefix, relative, prefix_length);
+        cache->prefix[prefix_length] = '\0';
+    }
+    return 0;
+}
+
 static int replay_destination_parent_for_root(
     ReplayCollection *collection, size_t root_index,
     const char *relative, int *parent_out, char *leaf, size_t leaf_size)
@@ -738,9 +819,9 @@ static int replay_destination_parent_for_root(
 
     const ManifestRoot *root = &collection->manifest->roots[root_index];
     if (root->policy != ROOT_POLICY_XDG)
-        return portable_open_relative_parent(
-            collection->destination_home_fd, relative, parent_out, leaf,
-            leaf_size);
+        return replay_open_relative_parent_cached(
+            collection, collection->destination_home_fd, relative,
+            parent_out, leaf, leaf_size);
 
     if (!xdg_destination_valid(collection->destination_xdg_dirs, root))
     {
@@ -771,9 +852,9 @@ static int replay_destination_parent_for_root(
                                         sizeof(destination)) != 0)
         return -1;
 
-    return portable_open_relative_parent(
-        collection->xdg_anchor_fd[index], destination, parent_out, leaf,
-        leaf_size);
+    return replay_open_relative_parent_cached(
+        collection, collection->xdg_anchor_fd[index], destination,
+        parent_out, leaf, leaf_size);
 }
 
 // Recovers the relative-path value replay->destination_relative used to
@@ -1374,6 +1455,7 @@ int portable_restore_replay_at(const PortableRestoreRequest *request,
     };
     for (int index = 0; index < XDG_KEY_COUNT; index++)
         collection.xdg_anchor_fd[index] = -1;
+    collection.parent_cache.fd = -1;
     if (root_map_build(&collection.root_map, request->manifest) != 0)
         goto fail;
 

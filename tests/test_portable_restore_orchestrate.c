@@ -1438,6 +1438,126 @@ static void test_xdg_missing_destination_anchor_cache(void)
     fixture_close(&fixture);
 }
 
+static void test_parent_cache_distinguishes_destination_bases(void)
+{
+    printf(BLUE "::" NC " portable parent cache distinguishes destination bases\n");
+    ManifestRoot roots[2];
+    memset(roots, 0, sizeof(roots));
+    snprintf(roots[0].id, sizeof(roots[0].id), "XDG_DOCUMENTS_DIR");
+    roots[0].policy = ROOT_POLICY_XDG;
+    snprintf(roots[0].payload_path, sizeof(roots[0].payload_path),
+             "XDG_DOCUMENTS_DIR");
+    snprintf(roots[0].source_path, sizeof(roots[0].source_path),
+             "/source/XDG_DOCUMENTS_DIR");
+    roots[1] = root_for();
+    snprintf(roots[1].id, sizeof(roots[1].id), "ROOT_HOME");
+    snprintf(roots[1].payload_path, sizeof(roots[1].payload_path),
+             "ROOT_HOME");
+    snprintf(roots[1].source_path, sizeof(roots[1].source_path),
+             "/source/ROOT_HOME");
+    snprintf(roots[1].restore_path, sizeof(roots[1].restore_path), "shared");
+
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &roots[0]);
+    check(opened == 0, "mixed-base parent-cache fixture is created");
+    if (opened != 0)
+        return;
+
+    make_dir_at(fixture.home_fd, "Documents", 0700);
+    path_join_fixture(fixture.xdg_dirs[0], sizeof(fixture.xdg_dirs[0]),
+                      fixture.home, "/Documents");
+
+    Manifest manifest_model = {
+        .version = MANIFEST_CURRENT_VERSION,
+        .representation = CLONE_PORTABLE_SIDECAR,
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .sidecar_version = SIDECAR_VERSION,
+        .root_count = 2,
+        .roots = roots
+    };
+    check(manifest_write_v1_at(fixture.container_fd, &manifest_model) == 0,
+          "mixed-base parent-cache manifest is committed");
+
+    make_dir_at(fixture.data_fd, "XDG_DOCUMENTS_DIR", 0700);
+    make_dir_at(fixture.data_fd, "ROOT_HOME", 0700);
+    int xdg_root_fd = openat(fixture.data_fd, "XDG_DOCUMENTS_DIR",
+                             O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int home_root_fd = openat(fixture.data_fd, "ROOT_HOME",
+                              O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (xdg_root_fd < 0 || home_root_fd < 0)
+        fatal("could not open mixed-base payload roots");
+    make_dir_at(xdg_root_fd, "shared", 0700);
+    int xdg_shared_fd = openat(xdg_root_fd, "shared",
+                               O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (xdg_shared_fd < 0)
+        fatal("could not open mixed-base XDG payload parent");
+    write_file_at(xdg_shared_fd, "xdg-a.txt", "xdg a payload");
+    write_file_at(xdg_shared_fd, "xdg-c.txt", "xdg c payload");
+    write_file_at(home_root_fd, "home-b.txt", "home b payload");
+    write_file_at(home_root_fd, "home-d.txt", "home d payload");
+    if (close(xdg_shared_fd) != 0 || close(xdg_root_fd) != 0 ||
+        close(home_root_fd) != 0)
+        fatal("could not close mixed-base payload roots");
+
+    uint32_t uid = (uint32_t)geteuid();
+    uint32_t gid = (uint32_t)getegid();
+    SidecarEntry entries[] = {
+        entry_for("XDG_DOCUMENTS_DIR", "", "", SIDECAR_KIND_DIRECTORY,
+                  0, 0700, uid, gid, 1700001170, 1, 1700001171, 2),
+        entry_for("XDG_DOCUMENTS_DIR", "shared", "shared",
+                  SIDECAR_KIND_DIRECTORY, 0, 0700, uid, gid,
+                  1700001180, 3, 1700001181, 4),
+        entry_for("XDG_DOCUMENTS_DIR", "shared/xdg-a.txt",
+                  "shared/xdg-a.txt", SIDECAR_KIND_REGULAR,
+                  strlen("xdg a payload"), 0600, uid, gid,
+                  1700001190, 5, 1700001191, 6),
+        entry_for("XDG_DOCUMENTS_DIR", "shared/xdg-c.txt",
+                  "shared/xdg-c.txt", SIDECAR_KIND_REGULAR,
+                  strlen("xdg c payload"), 0600, uid, gid,
+                  1700001200, 7, 1700001201, 8),
+        entry_for("ROOT_HOME", "", "", SIDECAR_KIND_DIRECTORY,
+                  0, 0700, uid, gid, 1700001210, 9, 1700001211, 10),
+        entry_for("ROOT_HOME", "home-b.txt", "home-b.txt",
+                  SIDECAR_KIND_REGULAR, strlen("home b payload"), 0600,
+                  uid, gid, 1700001220, 11, 1700001221, 12),
+        entry_for("ROOT_HOME", "home-d.txt", "home-d.txt",
+                  SIDECAR_KIND_REGULAR, strlen("home d payload"), 0600,
+                  uid, gid, 1700001230, 13, 1700001231, 14)
+    };
+    check(write_sidecar(&fixture, entries, 7) == 0,
+          "mixed-base parent-cache sidecar is committed");
+
+    PortableRestoreReplayReport report;
+    int result = run_orchestration(&fixture, &report, 1, "y\n");
+    check(result == 0 && report.live_count == 7 &&
+              report.applied_count == 7 && report.failed_count == 0,
+          "mixed-base restore completes with one bounded parent cache");
+
+    char home_b[PATH_MAX], home_d[PATH_MAX];
+    char xdg_a[PATH_MAX], xdg_c[PATH_MAX];
+    char wrong_home_xdg_a[PATH_MAX], wrong_xdg_home_b[PATH_MAX];
+    path_join_fixture(home_b, sizeof(home_b), fixture.home,
+                      "/shared/home-b.txt");
+    path_join_fixture(home_d, sizeof(home_d), fixture.home,
+                      "/shared/home-d.txt");
+    path_join_fixture(xdg_a, sizeof(xdg_a), fixture.home,
+                      "/Documents/shared/xdg-a.txt");
+    path_join_fixture(xdg_c, sizeof(xdg_c), fixture.home,
+                      "/Documents/shared/xdg-c.txt");
+    path_join_fixture(wrong_home_xdg_a, sizeof(wrong_home_xdg_a), fixture.home,
+                      "/shared/xdg-a.txt");
+    path_join_fixture(wrong_xdg_home_b, sizeof(wrong_xdg_home_b), fixture.home,
+                      "/Documents/shared/home-b.txt");
+    check(file_equals(home_b, "home b payload") &&
+              file_equals(home_d, "home d payload") &&
+              file_equals(xdg_a, "xdg a payload") &&
+              file_equals(xdg_c, "xdg c payload") &&
+              access(wrong_home_xdg_a, F_OK) != 0 &&
+              access(wrong_xdg_home_b, F_OK) != 0,
+          "same parent prefix never crosses the HOME and XDG base descriptors");
+    fixture_close(&fixture);
+}
+
 static void assert_hardlink_reference_refused(Fixture *fixture,
                                                const SidecarEntry *entries,
                                                size_t count,
@@ -1949,6 +2069,7 @@ int main(void)
     test_hardlink_cross_root_invalid_xdg_reference();
     test_xdg_destination_orchestration();
     test_xdg_missing_destination_anchor_cache();
+    test_parent_cache_distinguishes_destination_bases();
     test_hardlink_reference_failures();
     test_symlink_orchestration();
     test_symlink_ownership_rejection();
