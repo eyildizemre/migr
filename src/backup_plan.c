@@ -22,7 +22,7 @@
 typedef struct {
     BackupPlanRoot *items;
     int count;
-    int capacity;
+    size_t capacity;
 } RootBuilder;
 
 static int root_type_allowed(mode_t mode)
@@ -56,19 +56,17 @@ static int append_root(RootBuilder *rb, const char *id, RootPolicy policy,
         print_error("Error: too many backup roots (limit %d)\n", MANIFEST_MAX_ROOTS);
         return -1;
     }
-    if (rb->count == rb->capacity)
+    if ((size_t)rb->count == rb->capacity)
     {
-        int new_cap = rb->capacity == 0 ? 16 : rb->capacity * 2;
-        if (new_cap > MANIFEST_MAX_ROOTS)
-            new_cap = MANIFEST_MAX_ROOTS;
-        BackupPlanRoot *n = realloc(rb->items, (size_t)new_cap * sizeof(*n));
+        BackupPlanRoot *n = array_reserve(
+            rb->items, &rb->capacity, (size_t)rb->count, 1U,
+            sizeof(*n), 16U, MANIFEST_MAX_ROOTS);
         if (n == NULL)
         {
             print_error("Error: out of memory building backup plan\n");
             return -1;
         }
         rb->items = n;
-        rb->capacity = new_cap;
     }
 
     BackupPlanRoot *r = &rb->items[rb->count];
@@ -720,21 +718,12 @@ static int estimate_seen_add(EstimateSeen *seen, dev_t dev, ino_t ino)
 
     if (seen->count == seen->items_capacity)
     {
-        size_t new_capacity = seen->items_capacity == 0
-            ? 16U : seen->items_capacity * 2U;
-        if (new_capacity < seen->items_capacity ||
-            new_capacity > SIZE_MAX / sizeof(*seen->items))
-        {
-            errno = EOVERFLOW;
-            return -1;
-        }
-
-        EstimateInode *items = realloc(seen->items,
-                                       new_capacity * sizeof(*items));
+        EstimateInode *items = array_reserve(
+            seen->items, &seen->items_capacity, seen->count, 1U,
+            sizeof(*items), 16U, SIZE_MAX / sizeof(*items));
         if (items == NULL)
             return -1;
         seen->items = items;
-        seen->items_capacity = new_capacity;
     }
 
     seen->items[seen->count] = (EstimateInode){ .dev = dev, .ino = ino };
