@@ -1195,6 +1195,67 @@ static void test_case_collision_report_cap(const char *base)
     remove_tree(container_path);
 }
 
+static void test_case_probe_group_growth(const char *base)
+{
+    printf(BLUE "::" NC " case-probe group beyond its initial capacity\n");
+    /* Nine names sharing one skeleton land in a single case-probe group,
+     * growing its parallel name/path arrays twice past the initial four. */
+    static const char *const names[] = {
+        "Note", "note", "NOTE", "nOte", "noTe",
+        "notE", "NOte", "NOTe", "nOTE"
+    };
+    const size_t name_count = sizeof(names) / sizeof(names[0]);
+    char source_path[PATH_MAX];
+    char container_path[PATH_MAX];
+    int container_fd;
+    PortablePrescanReport report;
+
+    int result = run_case_fixture(
+        base, "case-probe-group-growth", names, name_count, 0,
+        source_path, sizeof(source_path), container_path,
+        sizeof(container_path), &container_fd, &report);
+    check(result == 0 && report.collision_plan.count == name_count,
+          "a case-probe group growing past four retains every plan entry");
+
+    int logical_seen[sizeof(names) / sizeof(names[0])] = {0};
+    int logical_paths_valid = report.collision_plan.count == name_count;
+    int physical_paths_distinct = report.collision_plan.count == name_count;
+    for (size_t index = 0; index < report.collision_plan.count; index++) {
+        const PortableCollisionPlanEntry *entry =
+            &report.collision_plan.entries[index];
+        size_t name_index = 0;
+        while (name_index < name_count &&
+               strcmp(entry->logical_path, names[name_index]) != 0)
+            name_index++;
+        if (strcmp(entry->root_id, "CASE") != 0 ||
+            name_index == name_count || logical_seen[name_index])
+            logical_paths_valid = 0;
+        else
+            logical_seen[name_index] = 1;
+
+        if (entry->physical_path[0] == '\0')
+            physical_paths_distinct = 0;
+        for (size_t previous = 0; previous < index; previous++)
+            if (strcmp(entry->physical_path,
+                       report.collision_plan.entries[previous].physical_path) ==
+                0)
+                physical_paths_distinct = 0;
+    }
+    for (size_t index = 0; index < name_count; index++)
+        if (!logical_seen[index])
+            logical_paths_valid = 0;
+
+    check(logical_paths_valid,
+          "grown case-probe arrays preserve every logical path exactly once");
+    check(physical_paths_distinct,
+          "grown case-probe arrays assign distinct physical paths");
+
+    portable_prescan_report_free(&report);
+    close(container_fd);
+    remove_tree(source_path);
+    remove_tree(container_path);
+}
+
 static void test_case_collision_directory_scope(const char *base)
 {
     printf(BLUE "::" NC " directory-local case collisions\n");
@@ -4190,6 +4251,7 @@ int main(void)
     test_mixed_prescan_violations(root_path);
     test_collision_plan_suffix_length_violation(root_path);
     test_case_collision_report_cap(root_path);
+    test_case_probe_group_growth(root_path);
     test_case_collision_directory_scope(root_path);
     test_capture_source_plan_mismatch(root_path);
     test_collision_resume(root_path);
