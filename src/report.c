@@ -337,7 +337,8 @@ static int measure_and_print_item(const char *name, const char *path,
                                   ReportDepth depth, off_t *bytes)
 {
     ReportBreakdown breakdown = { NULL, 0, 0 };
-    int rc = measure_report_tree(path, 0, depth, &breakdown, bytes);
+    int rc = measure_report_tree(path, 0, depth, verbose ? &breakdown : NULL,
+                                 bytes);
     if (rc != 0)
     {
         report_breakdown_free(&breakdown);
