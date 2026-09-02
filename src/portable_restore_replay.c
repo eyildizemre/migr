@@ -26,8 +26,8 @@ typedef struct {
     size_t xattr_count;
     size_t root_index;
     size_t hardlink_ref_root_index;
+    const SidecarEntry *hardlink_ref_entry;
     char destination[PATH_MAX];
-    char hardlink_ref_relative[PATH_MAX];
     size_t depth;
 } ReplayEntry;
 
@@ -43,11 +43,18 @@ typedef struct {
     int data_fd;
     int destination_home_fd;
     const char * const *destination_xdg_dirs;
+    int xdg_anchor_fd[XDG_KEY_COUNT];
+    char xdg_anchor_prefix[XDG_KEY_COUNT][NAME_MAX + 1U];
     MetadataTimestampPolicy timestamp_policy;
     PortableRestoreReplayReport *report;
     BackupCaptureReport *capture_report;
     MetadataXattrRequirements xattr_requirements;
 } ReplayCollection;
+
+static int replay_hardlink_ref_relative(const ManifestRoot *ref_root,
+                                        const SidecarEntry *ref_entry,
+                                        const char * const *xdg_dirs,
+                                        char *out, size_t out_size);
 
 void replay_copy_bytes(char *destination, size_t destination_size,
                        SidecarBytes source)
@@ -130,10 +137,35 @@ static int replay_entries_reserve(ReplayCollection *collection, size_t extra)
     return 0;
 }
 
+static int replay_close_xdg_anchors(ReplayCollection *collection)
+{
+    int result = 0;
+    int saved = errno;
+    for (int index = 0; index < XDG_KEY_COUNT; index++)
+    {
+        if (collection->xdg_anchor_fd[index] < 0)
+            continue;
+        if (close(collection->xdg_anchor_fd[index]) != 0 && result == 0)
+        {
+            result = -1;
+            saved = errno == 0 ? EIO : errno;
+        }
+        collection->xdg_anchor_fd[index] = -1;
+    }
+    errno = saved;
+    return result;
+}
+
 static void replay_collection_free(ReplayCollection *collection)
 {
     if (collection == NULL)
         return;
+    for (int index = 0; index < XDG_KEY_COUNT; index++)
+        if (collection->xdg_anchor_fd[index] >= 0)
+        {
+            close(collection->xdg_anchor_fd[index]);
+            collection->xdg_anchor_fd[index] = -1;
+        }
     preflight_free(&collection->memory, collection->items,
                    collection->capacity * sizeof(*collection->items));
     collection->items = NULL;
@@ -348,7 +380,7 @@ static int replay_collect_entry(const SidecarLiveView *view, void *argument)
     }
 
     size_t hardlink_ref_root_index = SIZE_MAX;
-    char hardlink_ref_relative[PATH_MAX] = {0};
+    const SidecarEntry *hardlink_ref_entry = NULL;
     if (entry->kind == SIDECAR_KIND_HARDLINK)
     {
         SidecarLiveView referenced;
@@ -374,58 +406,17 @@ static int replay_collect_entry(const SidecarLiveView *view, void *argument)
                                   root_index, entry->logical_path);
             return 1;
         }
-        char reference_logical[PATH_MAX];
-        replay_copy_bytes(reference_logical, sizeof(reference_logical),
-                          referenced.entry->logical_path);
-        const ManifestRoot *ref_root =
-            &collection->manifest->roots[hardlink_ref_root_index];
-        if (ref_root->policy == ROOT_POLICY_XDG)
+        char reference_relative[PATH_MAX];
+        if (replay_hardlink_ref_relative(
+                &collection->manifest->roots[hardlink_ref_root_index],
+                referenced.entry, collection->destination_xdg_dirs,
+                reference_relative, sizeof(reference_relative)) != 0)
         {
-            if (!xdg_destination_valid(collection->destination_xdg_dirs,
-                                       ref_root))
-            {
-                replay_report_failure(collection->report,
-                                      collection->manifest, root_index,
-                                      entry->logical_path);
-                return 1;
-            }
-            int length = snprintf(hardlink_ref_relative,
-                                  sizeof(hardlink_ref_relative), "%s",
-                                  reference_logical);
-            if (length < 0 || (size_t)length >= sizeof(hardlink_ref_relative))
-            {
-                replay_report_failure(collection->report,
-                                      collection->manifest, root_index,
-                                      entry->logical_path);
-                return 1;
-            }
+            replay_report_failure(collection->report, collection->manifest,
+                                  root_index, entry->logical_path);
+            return 1;
         }
-        else
-        {
-            char hardlink_ref_destination[PATH_MAX];
-            if (destination_path_build(
-                    ref_root, reference_logical,
-                    collection->destination_xdg_dirs,
-                    hardlink_ref_destination,
-                    sizeof(hardlink_ref_destination)) != 0)
-            {
-                replay_report_failure(collection->report,
-                                      collection->manifest, root_index,
-                                      entry->logical_path);
-                return 1;
-            }
-            int length = snprintf(hardlink_ref_relative,
-                                  sizeof(hardlink_ref_relative), "%s",
-                                  hardlink_ref_destination);
-            if (length < 0 ||
-                (size_t)length >= sizeof(hardlink_ref_relative))
-            {
-                replay_report_failure(collection->report,
-                                      collection->manifest, root_index,
-                                      entry->logical_path);
-                return 1;
-            }
-        }
+        hardlink_ref_entry = referenced.entry;
     }
 
     char logical[PATH_MAX];
@@ -469,8 +460,7 @@ static int replay_collect_entry(const SidecarLiveView *view, void *argument)
     replay->xattrs = view->xattrs;
     replay->xattr_count = view->xattr_count;
     replay->hardlink_ref_root_index = hardlink_ref_root_index;
-    memcpy(replay->hardlink_ref_relative, hardlink_ref_relative,
-           sizeof(replay->hardlink_ref_relative));
+    replay->hardlink_ref_entry = hardlink_ref_entry;
     /*
      * Accumulate the xattr namespace requirements for the pre-mutation
      * capability gate (D20 E-9). The sidecar's xattr names are not
@@ -735,7 +725,7 @@ static int replay_open_destination_regular(int parent_fd, const char *leaf,
 }
 
 static int replay_destination_parent_for_root(
-    const ReplayCollection *collection, size_t root_index,
+    ReplayCollection *collection, size_t root_index,
     const char *relative, int *parent_out, char *leaf, size_t leaf_size)
 {
     if (collection == NULL || collection->manifest == NULL ||
@@ -758,32 +748,32 @@ static int replay_destination_parent_for_root(
         return -1;
     }
     int index = xdg_key_index(root->id);
-    int xdg_fd = -1;
-    char prefix[NAME_MAX + 1U];
-    char destination[PATH_MAX];
-    if (open_xdg_destination_anchor(
-            collection->destination_xdg_dirs[index], &xdg_fd,
-            prefix, sizeof(prefix)) != 0 ||
-        destination_relative_path_build(prefix, relative, destination,
-                                        sizeof(destination)) != 0)
+    if (index < 0 || index >= XDG_KEY_COUNT)
     {
-        if (xdg_fd >= 0)
-            close(xdg_fd);
+        errno = EINVAL;
         return -1;
     }
-
-    int result = portable_open_relative_parent(
-        xdg_fd, destination, parent_out, leaf, leaf_size);
-    int saved = errno;
-    if (close(xdg_fd) != 0 && result == 0)
+    if (collection->xdg_anchor_fd[index] < 0)
     {
-        close(*parent_out);
-        *parent_out = -1;
-        result = -1;
-        saved = EIO;
+        int xdg_fd = -1;
+        char prefix[NAME_MAX + 1U];
+        if (open_xdg_destination_anchor(
+                collection->destination_xdg_dirs[index], &xdg_fd,
+                prefix, sizeof(prefix)) != 0)
+            return -1;
+        collection->xdg_anchor_fd[index] = xdg_fd;
+        memcpy(collection->xdg_anchor_prefix[index], prefix, sizeof(prefix));
     }
-    errno = saved;
-    return result;
+
+    char destination[PATH_MAX];
+    if (destination_relative_path_build(collection->xdg_anchor_prefix[index],
+                                        relative, destination,
+                                        sizeof(destination)) != 0)
+        return -1;
+
+    return portable_open_relative_parent(
+        collection->xdg_anchor_fd[index], destination, parent_out, leaf,
+        leaf_size);
 }
 
 // Recovers the relative-path value replay->destination_relative used to
@@ -808,7 +798,40 @@ static int replay_destination_relative(const ManifestRoot *root,
     return (length < 0 || (size_t)length >= out_size) ? -1 : 0;
 }
 
-static int replay_destination_parent(const ReplayCollection *collection,
+/* Rebuilds the validated hardlink reference path from the borrowed sidecar
+ * entry instead of retaining another PATH_MAX buffer in every ReplayEntry. */
+static int replay_hardlink_ref_relative(const ManifestRoot *ref_root,
+                                        const SidecarEntry *ref_entry,
+                                        const char * const *xdg_dirs,
+                                        char *out, size_t out_size)
+{
+    if (ref_root == NULL || ref_entry == NULL || out == NULL || out_size == 0)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    char reference_logical[PATH_MAX];
+    replay_copy_bytes(reference_logical, sizeof(reference_logical),
+                      ref_entry->logical_path);
+    if (ref_root->policy == ROOT_POLICY_XDG)
+    {
+        if (!xdg_destination_valid(xdg_dirs, ref_root))
+        {
+            errno = EINVAL;
+            return -1;
+        }
+        int length = snprintf(out, out_size, "%s", reference_logical);
+        return (length < 0 || (size_t)length >= out_size) ? -1 : 0;
+    }
+    char destination[PATH_MAX];
+    if (destination_path_build(ref_root, reference_logical, xdg_dirs,
+                               destination, sizeof(destination)) != 0)
+        return -1;
+    int length = snprintf(out, out_size, "%s", destination);
+    return (length < 0 || (size_t)length >= out_size) ? -1 : 0;
+}
+
+static int replay_destination_parent(ReplayCollection *collection,
                                      const ReplayEntry *replay,
                                      int *parent_out, char *leaf,
                                      size_t leaf_size)
@@ -1011,8 +1034,18 @@ static int replay_apply_hardlink(ReplayCollection *collection,
         !replay_entry_valid(replay->entry) ||
         replay->hardlink_ref_root_index >=
             (size_t)collection->manifest->root_count ||
-        replay->hardlink_ref_relative[0] == '\0' ||
-        !relative_path_valid(replay->hardlink_ref_relative, 0))
+        replay->hardlink_ref_entry == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    char ref_relative[PATH_MAX];
+    if (replay_hardlink_ref_relative(
+            &collection->manifest->roots[replay->hardlink_ref_root_index],
+            replay->hardlink_ref_entry, collection->destination_xdg_dirs,
+            ref_relative, sizeof(ref_relative)) != 0 ||
+        ref_relative[0] == '\0' || !relative_path_valid(ref_relative, 0))
     {
         errno = EINVAL;
         return -1;
@@ -1027,8 +1060,7 @@ static int replay_apply_hardlink(ReplayCollection *collection,
     if (result == 0)
         result = replay_destination_parent_for_root(
             collection, replay->hardlink_ref_root_index,
-            replay->hardlink_ref_relative, &ref_parent_fd, ref_leaf,
-            sizeof(ref_leaf));
+            ref_relative, &ref_parent_fd, ref_leaf, sizeof(ref_leaf));
 
     struct stat reference_before;
     if (result == 0 &&
@@ -1340,6 +1372,8 @@ int portable_restore_replay_at(const PortableRestoreRequest *request,
         .report = report,
         .capture_report = request->capture_report
     };
+    for (int index = 0; index < XDG_KEY_COUNT; index++)
+        collection.xdg_anchor_fd[index] = -1;
     if (root_map_build(&collection.root_map, request->manifest) != 0)
         goto fail;
 
@@ -1420,6 +1454,12 @@ int portable_restore_replay_at(const PortableRestoreRequest *request,
         result = -1;
     }
     collection.data_fd = -1;
+    if (replay_close_xdg_anchors(&collection) != 0)
+    {
+        if (result == 0)
+            saved_errno = errno == 0 ? EIO : errno;
+        result = -1;
+    }
     errno = saved_errno;
     if (result == 0)
     {

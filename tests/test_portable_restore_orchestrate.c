@@ -1377,6 +1377,67 @@ static void test_xdg_destination_orchestration(void)
     fixture_close(&fixture);
 }
 
+static void test_xdg_missing_destination_anchor_cache(void)
+{
+    printf(BLUE "::" NC " portable XDG missing-destination anchor cache\n");
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    snprintf(root.id, sizeof(root.id), "XDG_DOCUMENTS_DIR");
+    root.policy = ROOT_POLICY_XDG;
+    snprintf(root.payload_path, sizeof(root.payload_path), "XDG_DOCUMENTS_DIR");
+    snprintf(root.source_path, sizeof(root.source_path),
+             "/source/XDG_DOCUMENTS_DIR");
+
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "missing-XDG destination fixture is created");
+    if (opened != 0)
+        return;
+    path_join_fixture(fixture.xdg_dirs[0], sizeof(fixture.xdg_dirs[0]),
+                      fixture.home, "/MissingDocuments");
+
+    make_dir_at(fixture.data_fd, "XDG_DOCUMENTS_DIR", 0700);
+    int root_fd = openat(fixture.data_fd, "XDG_DOCUMENTS_DIR",
+                         O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (root_fd < 0)
+        fatal("could not open missing-XDG payload root");
+    write_file_at(root_fd, "first.txt", "first payload");
+    write_file_at(root_fd, "second.txt", "second payload");
+    if (close(root_fd) != 0)
+        fatal("could not close missing-XDG payload root");
+
+    uint32_t uid = (uint32_t)geteuid();
+    uint32_t gid = (uint32_t)getegid();
+    SidecarEntry entries[] = {
+        entry_for("XDG_DOCUMENTS_DIR", "", "", SIDECAR_KIND_DIRECTORY,
+                  0, 0700, uid, gid, 1700001140, 1, 1700001141, 2),
+        entry_for("XDG_DOCUMENTS_DIR", "first.txt", "first.txt",
+                  SIDECAR_KIND_REGULAR, strlen("first payload"), 0600,
+                  uid, gid, 1700001150, 3, 1700001151, 4),
+        entry_for("XDG_DOCUMENTS_DIR", "second.txt", "second.txt",
+                  SIDECAR_KIND_REGULAR, strlen("second payload"), 0600,
+                  uid, gid, 1700001160, 5, 1700001161, 6)
+    };
+    check(write_sidecar(&fixture, entries, 3) == 0,
+          "missing-XDG destination sidecar is committed");
+
+    PortableRestoreReplayReport report;
+    int result = run_orchestration(&fixture, &report, 1, "y\n");
+    check(result == 0 && report.live_count == 3 &&
+              report.applied_count == 3 && report.failed_count == 0,
+          "portable XDG restore creates and reuses a missing destination");
+
+    char first[PATH_MAX], second[PATH_MAX];
+    path_join_fixture(first, sizeof(first), fixture.home,
+                      "/MissingDocuments/first.txt");
+    path_join_fixture(second, sizeof(second), fixture.home,
+                      "/MissingDocuments/second.txt");
+    check(file_equals(first, "first payload") &&
+              file_equals(second, "second payload"),
+          "cached parent anchor restores every entry to the new XDG directory");
+    fixture_close(&fixture);
+}
+
 static void assert_hardlink_reference_refused(Fixture *fixture,
                                                const SidecarEntry *entries,
                                                size_t count,
@@ -1887,6 +1948,7 @@ int main(void)
     test_hardlink_cross_root();
     test_hardlink_cross_root_invalid_xdg_reference();
     test_xdg_destination_orchestration();
+    test_xdg_missing_destination_anchor_cache();
     test_hardlink_reference_failures();
     test_symlink_orchestration();
     test_symlink_ownership_rejection();
