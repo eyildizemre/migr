@@ -72,18 +72,12 @@ static int stale_claims_append(StaleClaims *claims, SidecarBytes logical,
     if (claims == NULL || claims->count >= SIDECAR_MAX_LIVE_ENTRIES)
         return -1;
     if (claims->count == claims->capacity) {
-        size_t capacity = claims->capacity == 0 ? 16U : claims->capacity * 2U;
-        if (capacity > SIDECAR_MAX_LIVE_ENTRIES)
-            capacity = SIDECAR_MAX_LIVE_ENTRIES;
-        if (capacity < claims->capacity ||
-            capacity > SIZE_MAX / sizeof(*claims->items))
-            return -1;
-        StaleClaim *items = realloc(claims->items,
-                                    capacity * sizeof(*items));
+        StaleClaim *items = array_reserve(
+            claims->items, &claims->capacity, claims->count, 1U,
+            sizeof(*items), 16U, SIDECAR_MAX_LIVE_ENTRIES);
         if (items == NULL)
             return -1;
         claims->items = items;
-        claims->capacity = capacity;
     }
 
     StaleClaim item = { .kind = kind };
@@ -134,16 +128,12 @@ static int stale_keys_append(StaleKeys *keys, SidecarBytes logical,
     if (keys->count >= SIDECAR_MAX_LIVE_ENTRIES)
         return -1;
     if (keys->count == keys->capacity) {
-        size_t capacity = keys->capacity == 0 ? 16U : keys->capacity * 2U;
-        if (capacity > SIDECAR_MAX_LIVE_ENTRIES)
-            capacity = SIDECAR_MAX_LIVE_ENTRIES;
-        if (capacity < keys->capacity || capacity > SIZE_MAX / sizeof(*keys->items))
-            return -1;
-        StaleKey *items = realloc(keys->items, capacity * sizeof(*items));
+        StaleKey *items = array_reserve(
+            keys->items, &keys->capacity, keys->count, 1U,
+            sizeof(*items), 16U, SIDECAR_MAX_LIVE_ENTRIES);
         if (items == NULL)
             return -1;
         keys->items = items;
-        keys->capacity = capacity;
     }
 
     StaleKey item = {0};
@@ -1031,17 +1021,12 @@ static int inventory_orphans_append(InventoryOrphans *orphans,
     if (orphans->count >= SIDECAR_MAX_LIVE_ENTRIES)
         return -1;
     if (orphans->count == orphans->capacity) {
-        size_t capacity = orphans->capacity == 0 ? 16U : orphans->capacity * 2U;
-        if (capacity > SIDECAR_MAX_LIVE_ENTRIES)
-            capacity = SIDECAR_MAX_LIVE_ENTRIES;
-        if (capacity < orphans->capacity ||
-            capacity > SIZE_MAX / sizeof(*orphans->items))
-            return -1;
-        char **items = realloc(orphans->items, capacity * sizeof(*items));
+        char **items = array_reserve(
+            orphans->items, &orphans->capacity, orphans->count, 1U,
+            sizeof(*items), 16U, SIDECAR_MAX_LIVE_ENTRIES);
         if (items == NULL)
             return -1;
         orphans->items = items;
-        orphans->capacity = capacity;
     }
     char *copy = strdup(relative);
     if (copy == NULL)
