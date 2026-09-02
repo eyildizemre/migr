@@ -1163,6 +1163,97 @@ static void test_metadata_helper_failure_paths(void)
     remove_tree(base);
 }
 
+static gid_t find_unowned_gid(void)
+{
+    int count = getgroups(0, NULL);
+    if (count < 0)
+        fatal("could not read the supplementary group count");
+
+    gid_t *groups = NULL;
+    if (count > 0)
+    {
+        groups = malloc((size_t)count * sizeof(*groups));
+        if (groups == NULL)
+            fatal("could not allocate the supplementary group fixture");
+        int actual = getgroups(count, groups);
+        if (actual < 0)
+        {
+            free(groups);
+            fatal("could not read the supplementary group fixture");
+        }
+        count = actual;
+    }
+
+    size_t candidate_count = (size_t)count + 2U;
+    gid_t effective = getegid();
+    for (size_t candidate = 0; candidate < candidate_count; candidate++)
+    {
+        gid_t value = (gid_t)candidate;
+        if ((size_t)value != candidate || value == effective)
+            continue;
+        int present = 0;
+        for (int i = 0; i < count; i++)
+            if (groups[i] == value)
+            {
+                present = 1;
+                break;
+            }
+        if (!present)
+        {
+            free(groups);
+            return value;
+        }
+    }
+
+    free(groups);
+    fatal("could not find a gid outside the process group set");
+    return (gid_t)0;
+}
+
+static void test_metadata_profiles_group_cache(void)
+{
+    const char *case_name = "group-cache";
+    char base[PATH_MAX];
+    make_temp_root(base, sizeof(base));
+    int root_fd = open_directory(base);
+
+    struct stat desired;
+    if (fstat(root_fd, &desired) != 0)
+        fatal("could not inspect the group-cache fixture root");
+    desired.st_uid = geteuid();
+    desired.st_gid = find_unowned_gid();
+    desired.st_mode = S_IFREG | 0600;
+
+    MetadataProfiles profiles;
+    metadata_profiles_init(&profiles);
+    int first = metadata_profiles_add(&profiles, root_fd, &desired, NULL,
+                                      "first");
+    gid_t *cached_groups = profiles.cached_groups;
+    int cached_group_count = profiles.cached_group_count;
+    check_result(first == 0 && profiles.count == 1 &&
+                     profiles.affected_objects == 1 &&
+                     profiles.cached_groups_loaded,
+                 case_name,
+                 "first non-primary gid is classified privilege-relevant");
+
+    int second = metadata_profiles_add(&profiles, root_fd, &desired, NULL,
+                                       "second");
+    check_result(second == 0 && profiles.count == 1 &&
+                     profiles.affected_objects == 2,
+                 case_name,
+                 "cached lookup preserves the privilege classification");
+    check_result(profiles.cached_groups_loaded &&
+                     profiles.cached_groups == cached_groups &&
+                     profiles.cached_group_count == cached_group_count,
+                 case_name,
+                 "repeat lookup reuses the loaded supplementary groups");
+
+    metadata_profiles_free(&profiles);
+    check_result(close(root_fd) == 0, case_name,
+                 "fixture fd closes cleanly");
+    remove_tree(base);
+}
+
 static int xattr_probe_fixture_unavailable(int value)
 {
     return value == EINVAL || value == ENOTSUP || value == EOPNOTSUPP ||
@@ -1612,6 +1703,7 @@ int main(void)
     test_capture_recopies_without_nsec_exact();
     test_native_seed_recopies_without_nsec_exact();
     test_metadata_helper_failure_paths();
+    test_metadata_profiles_group_cache();
     test_metadata_xattr_capability_probe();
     test_metadata_xattr_gate_no_unrelated_namespace();
     test_metadata_apply_xattrs_tolerates_foreign_security();

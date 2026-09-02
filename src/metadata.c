@@ -41,45 +41,57 @@ static int same_timespec(struct timespec left, struct timespec right)
     return left.tv_sec == right.tv_sec && left.tv_nsec == right.tv_nsec;
 }
 
-static int gid_is_allowed(gid_t desired)
+/* The process never changes its credentials, so supplementary groups are
+ * stable for an operation and only need to be read once per profile set. */
+static int metadata_credentials_load(MetadataProfiles *profiles)
 {
-    if (desired == getegid())
-        return 1;
+    if (profiles->cached_groups_loaded)
+        return 0;
 
     int count = getgroups(0, NULL);
     if (count < 0)
-        return 0;
+        return -1;
 
     gid_t *groups = NULL;
     if (count > 0)
     {
         groups = malloc((size_t)count * sizeof(*groups));
         if (groups == NULL)
-            return 0;
+            return -1;
         int actual = getgroups(count, groups);
         if (actual < 0)
         {
             free(groups);
-            return 0;
+            return -1;
         }
         count = actual;
     }
 
-    int allowed = 0;
-    for (int i = 0; i < count; i++)
-        if (groups[i] == desired)
-        {
-            allowed = 1;
-            break;
-        }
-    free(groups);
-    return allowed;
+    profiles->cached_groups = groups;
+    profiles->cached_group_count = count;
+    profiles->cached_groups_loaded = 1;
+    return 0;
 }
 
-static int owner_is_foreign(const struct stat *st)
+static int gid_is_allowed(MetadataProfiles *profiles, gid_t desired)
+{
+    if (desired == getegid())
+        return 1;
+
+    if (metadata_credentials_load(profiles) != 0)
+        return 0;
+
+    for (int i = 0; i < profiles->cached_group_count; i++)
+        if (profiles->cached_groups[i] == desired)
+            return 1;
+    return 0;
+}
+
+static int owner_is_foreign(MetadataProfiles *profiles, const struct stat *st)
 {
     return st != NULL &&
-           (st->st_uid != geteuid() || !gid_is_allowed(st->st_gid));
+           (st->st_uid != geteuid() ||
+            !gid_is_allowed(profiles, st->st_gid));
 }
 
 static int mount_identity_for_fd(int fd, uint64_t *out)
@@ -143,6 +155,7 @@ void metadata_profiles_free(MetadataProfiles *profiles)
     for (size_t i = 0; i < profiles->count; i++)
         close(profiles->items[i].anchor_fd);
     free(profiles->items);
+    free(profiles->cached_groups);
     memset(profiles, 0, sizeof(*profiles));
 }
 
@@ -155,9 +168,9 @@ int metadata_profiles_add(MetadataProfiles *profiles, int anchor_fd,
         return -1;
 
     int privilege_relevant = desired->st_uid != geteuid() ||
-                             !gid_is_allowed(desired->st_gid) ||
+                             !gid_is_allowed(profiles, desired->st_gid) ||
                              (desired->st_mode & (S_ISUID | S_ISGID)) != 0 ||
-                             owner_is_foreign(existing);
+                             owner_is_foreign(profiles, existing);
     if (!privilege_relevant)
         return 0;
 

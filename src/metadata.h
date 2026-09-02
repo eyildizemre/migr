@@ -46,6 +46,9 @@ typedef struct {
 
 typedef struct MetadataProfiles {
     MetadataProfile *items;
+    gid_t *cached_groups;
+    int cached_group_count;
+    int cached_groups_loaded;
     size_t count;
     size_t capacity;
     size_t affected_objects;
