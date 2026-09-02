@@ -618,7 +618,7 @@ typedef enum {
 static V1XdgDestStatus resolve_v1_xdg_root_destination(
     const ManifestRoot *root, char *const xdg_dirs[XDG_RESTORE_COUNT],
     int *out_destination_fd, char *out_destination_rel,
-    size_t out_destination_rel_size)
+    size_t out_destination_rel_size, const char **out_xdg_dir)
 {
     int idx = xdg_key_index(root->id);
     if (idx < 0)
@@ -627,6 +627,8 @@ static V1XdgDestStatus resolve_v1_xdg_root_destination(
                                     out_destination_rel,
                                     out_destination_rel_size) != 0)
         return V1_XDG_DEST_ANCHOR_FAILED;
+    if (out_xdg_dir != NULL)
+        *out_xdg_dir = xdg_dirs[idx];
     return V1_XDG_DEST_OK;
 }
 
@@ -859,7 +861,7 @@ static int seed_native_restore_v1_hardlink_map(
             }
             if (resolve_v1_xdg_root_destination(
                     root, xdg_dirs, &destination_fd, destination_rel,
-                    sizeof(destination_rel)) != V1_XDG_DEST_OK)
+                    sizeof(destination_rel), NULL) != V1_XDG_DEST_OK)
             {
                 failed = 1;
                 continue;
@@ -1160,7 +1162,7 @@ static RestoreNativeStatus restore_v1_metadata_inventory(
             }
             if (resolve_v1_xdg_root_destination(
                     root, xdg_dirs, &destination_fd, destination_rel,
-                    sizeof(destination_rel)) != V1_XDG_DEST_OK)
+                    sizeof(destination_rel), NULL) != V1_XDG_DEST_OK)
             {
                 print_error("Error: Failed to resolve restore destination %s\n",
                        root->id);
@@ -1260,9 +1262,10 @@ static void restore_v1(const char *source, int source_root_fd, const char *home,
 
         int xdg_dest_fd;
         char destination_rel[PATH_MAX];
+        const char *resolved_xdg_dir = NULL;
         V1XdgDestStatus dest_status = resolve_v1_xdg_root_destination(
             root, xdg_dirs, &xdg_dest_fd, destination_rel,
-            sizeof(destination_rel));
+            sizeof(destination_rel), &resolved_xdg_dir);
         if (dest_status == V1_XDG_DEST_UNKNOWN_ID)
         {
             print_error("Error: Unrecognized XDG root id: %s\n", root->id);
@@ -1282,7 +1285,7 @@ static void restore_v1(const char *source, int source_root_fd, const char *home,
                                  skipped_security_xattrs, capture_report);
         if (rc > 0 && dry_run)
             printf("  Would restore: %s -> %s/\n", root->id,
-                   xdg_dirs[xdg_key_index(root->id)]);
+                   resolved_xdg_dir);
         if (rc > 0)
             (*count)++;
         else if (rc < 0)
