@@ -1407,10 +1407,19 @@ int tombstone_if_live(PortableCaptureContext *context,
     return result;
 }
 
+/* A live view borrows sidecar storage and remains valid only until the next
+ * log mutation or close. */
+typedef struct {
+    int resolved;
+    int live;
+    SidecarLiveView view;
+} CapturePreviousEntry;
+
 static int replace_live_capture(PortableCaptureContext *context,
                                 const PortableRootSpec *root,
                                 const char *logical,
-                                const char *physical)
+                                const char *physical,
+                                const CapturePreviousEntry *previous_hint)
 {
     if (context == NULL || root == NULL || logical == NULL ||
         root->payload_path == NULL)
@@ -1423,8 +1432,15 @@ static int replace_live_capture(PortableCaptureContext *context,
         (const unsigned char *)logical, strlen(logical)
     };
     SidecarLiveView previous;
-    int live = sidecar_log_find(context->sidecar, root_key, logical_key,
+    int live;
+    if (previous_hint != NULL && previous_hint->resolved) {
+        live = previous_hint->live;
+        if (live == 1)
+            previous = previous_hint->view;
+    } else {
+        live = sidecar_log_find(context->sidecar, root_key, logical_key,
                                 &previous);
+    }
     if (live < 0)
         return -1;
     if (!live)
@@ -2063,7 +2079,8 @@ static int capture_regular(PortableCaptureContext *context,
                            int destination_parent,
                            const char *destination_leaf,
                            int destination_is_root,
-                           PortableXattrs *xattrs)
+                           PortableXattrs *xattrs,
+                           const CapturePreviousEntry *previous_hint)
 {
     int parent_fd = destination_parent;
     char root_leaf[NAME_MAX + 1U];
@@ -2079,7 +2096,8 @@ static int capture_regular(PortableCaptureContext *context,
     }
     if (capture_destination_is_safe_or_claimed(
             context, root, logical, physical, parent_fd, destination_leaf) != 0 ||
-        replace_live_capture(context, root, logical, physical) != 0) {
+        replace_live_capture(context, root, logical, physical,
+                             previous_hint) != 0) {
         if (destination_is_root)
             close(parent_fd);
         xattrs_free(xattrs);
@@ -2193,7 +2211,7 @@ static int capture_special(PortableCaptureContext *context,
     }
     if (capture_destination_is_safe(context, root, logical, physical,
                                     parent_fd, destination_leaf) != 0 ||
-        replace_live_capture(context, root, logical, physical) != 0) {
+        replace_live_capture(context, root, logical, physical, NULL) != 0) {
         if (destination_is_root)
             close(parent_fd);
         return -1;
@@ -2315,7 +2333,7 @@ static int capture_symlink(PortableCaptureContext *context,
     }
     if (capture_destination_is_safe_or_claimed(
             context, root, logical, physical, parent_fd, destination_leaf) != 0 ||
-        replace_live_capture(context, root, logical, physical) != 0) {
+        replace_live_capture(context, root, logical, physical, NULL) != 0) {
         if (destination_is_root)
             close(parent_fd);
         xattrs_free(&xattrs);
@@ -2432,7 +2450,7 @@ static int capture_hardlink(PortableCaptureContext *context,
     }
     if (capture_destination_is_safe_or_claimed(
             context, root, logical, physical, parent_fd, destination_leaf) != 0 ||
-        replace_live_capture(context, root, logical, physical) != 0) {
+        replace_live_capture(context, root, logical, physical, NULL) != 0) {
         if (destination_is_root)
             close(parent_fd);
         close(source_fd);
@@ -2565,6 +2583,7 @@ static int capture_node(PortableCaptureContext *context,
         return -1;
     }
 
+    CapturePreviousEntry previous_hint = {0};
     if (S_ISREG(before.st_mode) && context->resume_mode) {
         SidecarBytes root_key = {
             (const unsigned char *)root->id, strlen(root->id)
@@ -2580,6 +2599,10 @@ static int capture_node(PortableCaptureContext *context,
             close(source_fd);
             return -1;
         }
+        previous_hint.resolved = 1;
+        previous_hint.live = live;
+        if (live == 1)
+            previous_hint.view = previous;
         if (live == 1) {
             SidecarEntry current;
             int matches = entry_from_stat(root->id, logical, physical,
@@ -2609,7 +2632,7 @@ static int capture_node(PortableCaptureContext *context,
                                collision_suffix, source_fd,
                                &before,
                                destination_parent, destination_leaf, is_root,
-                               &xattrs);
+                               &xattrs, &previous_hint);
 
     int parent_fd = destination_parent;
     char root_leaf[NAME_MAX + 1U];
@@ -2626,7 +2649,7 @@ static int capture_node(PortableCaptureContext *context,
 
     if (capture_destination_is_safe_or_claimed(
             context, root, logical, physical, parent_fd, destination_leaf) != 0 ||
-        replace_live_capture(context, root, logical, physical) != 0) {
+        replace_live_capture(context, root, logical, physical, NULL) != 0) {
         if (is_root)
             close(parent_fd);
         xattrs_free(&xattrs);
