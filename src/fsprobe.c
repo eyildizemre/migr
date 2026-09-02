@@ -88,6 +88,17 @@ static FsCapabilityResult probe_raw_names_fd(int dir_fd)
     int count = (int)(sizeof(raw_name_corpus) / sizeof(raw_name_corpus[0]));
     FsCapabilityResult r = cap_ok();
 
+    int scan_fd = fcntl(dir_fd, F_DUPFD_CLOEXEC, 0);
+    if (scan_fd < 0)
+        return cap_error(errno);
+    DIR *d = fdopendir(scan_fd);
+    if (d == NULL)
+    {
+        FsCapabilityResult err = cap_error(errno);
+        close(scan_fd);
+        return err;
+    }
+
     for (int i = 0; i < count && r.status == FS_CAP_SUPPORTED; i++)
     {
         int fd = openat(dir_fd, raw_name_corpus[i], O_CREAT | O_WRONLY | O_EXCL, 0600);
@@ -108,21 +119,6 @@ static FsCapabilityResult probe_raw_names_fd(int dir_fd)
         // normalised form (dropped the trailing dot, say) fails this even though the
         // create "succeeded". Reading the directory is a supporting operation: a real
         // readdir failure (errno set once it returns NULL) is an error, not a verdict.
-        int scan_fd = fcntl(dir_fd, F_DUPFD_CLOEXEC, 0);
-        if (scan_fd < 0)
-        {
-            r = cap_error(errno);
-            unlinkat(dir_fd, raw_name_corpus[i], 0);
-            break;
-        }
-        DIR *d = fdopendir(scan_fd);
-        if (d == NULL)
-        {
-            r = cap_error(errno);
-            close(scan_fd);
-            unlinkat(dir_fd, raw_name_corpus[i], 0);
-            break;
-        }
         rewinddir(d);
         int found = 0;
         errno = 0;
@@ -136,7 +132,6 @@ static FsCapabilityResult probe_raw_names_fd(int dir_fd)
             }
         }
         int readdir_errno = found ? 0 : errno;
-        closedir(d);
 
         // On a normalising filesystem the lookup normalises the same way, so unlinking
         // by the original name removes the stored entry; anything it somehow leaves is
@@ -145,6 +140,7 @@ static FsCapabilityResult probe_raw_names_fd(int dir_fd)
         if (!found)
             r = (readdir_errno != 0) ? cap_error(readdir_errno) : cap_mismatch();
     }
+    closedir(d);
     return r;
 }
 
