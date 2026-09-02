@@ -164,18 +164,12 @@ static int portable_collision_plan_add(PortableCollisionPlan *plan,
         return -1;
 
     if (plan->count == plan->capacity) {
-        size_t capacity = plan->capacity == 0 ? 8U : plan->capacity * 2U;
-        if (capacity < plan->capacity ||
-            capacity > SIDECAR_MAX_LIVE_ENTRIES)
-            capacity = SIDECAR_MAX_LIVE_ENTRIES;
-        if (capacity > SIZE_MAX / sizeof(*plan->entries))
-            return -1;
-        PortableCollisionPlanEntry *entries = realloc(
-            plan->entries, capacity * sizeof(*entries));
+        PortableCollisionPlanEntry *entries = array_reserve(
+            plan->entries, &plan->capacity, plan->count, 1U,
+            sizeof(*entries), 8U, SIDECAR_MAX_LIVE_ENTRIES);
         if (entries == NULL)
             return -1;
         plan->entries = entries;
-        plan->capacity = capacity;
     }
 
     PortableCollisionPlanEntry *entry = &plan->entries[plan->count];
@@ -232,16 +226,13 @@ int prescan_report_add(PortablePrescanReport *report,
         return 0;
 
     if (report->example_count == report->example_capacity) {
-        size_t capacity = report->example_capacity == 0
-            ? 8U : report->example_capacity * 2U;
-        if (capacity > PORTABLE_PRESCAN_MAX_EXAMPLES)
-            capacity = PORTABLE_PRESCAN_MAX_EXAMPLES;
-        PortablePrescanViolation *examples = realloc(
-            report->examples, capacity * sizeof(*examples));
+        PortablePrescanViolation *examples = array_reserve(
+            report->examples, &report->example_capacity,
+            report->example_count, 1U, sizeof(*examples), 8U,
+            PORTABLE_PRESCAN_MAX_EXAMPLES);
         if (examples == NULL)
             return -1;
         report->examples = examples;
-        report->example_capacity = capacity;
     }
     report->examples[report->example_count++] = *violation;
     return 0;
@@ -391,26 +382,24 @@ static int case_probe_group_append(PortableCaseProbeGroup *group,
         group->count >= SIDECAR_MAX_LIVE_ENTRIES)
         return -1;
     if (group->count == group->capacity) {
-        size_t capacity = group->capacity == 0 ? 4U : group->capacity * 2U;
-        if (capacity < group->capacity ||
-            capacity > SIDECAR_MAX_LIVE_ENTRIES)
-            capacity = SIDECAR_MAX_LIVE_ENTRIES;
-        if (capacity > SIZE_MAX / sizeof(*group->encoded_names) ||
-            capacity > SIZE_MAX / sizeof(*group->logical_paths))
-            return -1;
-        char **encoded_names = realloc(group->encoded_names,
-                                       capacity * sizeof(*encoded_names));
+        size_t capacity = group->capacity;
+        char **encoded_names = array_reserve(
+            group->encoded_names, &capacity, group->count, 1U,
+            sizeof(*encoded_names), 4U, SIDECAR_MAX_LIVE_ENTRIES);
         if (encoded_names == NULL)
             return -1;
-        char **logical_paths = realloc(group->logical_paths,
-                                       capacity * sizeof(*logical_paths));
-        if (logical_paths == NULL) {
-            group->encoded_names = encoded_names;
-            return -1;
-        }
         group->encoded_names = encoded_names;
+
+        /* Both arrays share one recorded capacity, so only commit it after
+         * both allocations reach the same size. */
+        size_t logical_capacity = group->capacity;
+        char **logical_paths = array_reserve(
+            group->logical_paths, &logical_capacity, group->count, 1U,
+            sizeof(*logical_paths), 4U, SIDECAR_MAX_LIVE_ENTRIES);
+        if (logical_paths == NULL)
+            return -1;
         group->logical_paths = logical_paths;
-        group->capacity = capacity;
+        group->capacity = logical_capacity;
     }
 
     char *encoded_copy = portable_text_duplicate(encoded);
@@ -435,20 +424,12 @@ static int case_probe_groups_add(PortableCaseProbeGroups *groups,
         groups->count >= SIDECAR_MAX_LIVE_ENTRIES)
         return -1;
     if (groups->count == groups->capacity) {
-        size_t capacity = groups->capacity == 0 ? 8U : groups->capacity * 2U;
-        if (capacity < groups->capacity ||
-            capacity > SIDECAR_MAX_LIVE_ENTRIES)
-            capacity = SIDECAR_MAX_LIVE_ENTRIES;
-        if (capacity > SIZE_MAX / sizeof(*groups->items))
-            return -1;
-        PortableCaseProbeGroup *items = realloc(
-            groups->items, capacity * sizeof(*items));
+        PortableCaseProbeGroup *items = array_reserve(
+            groups->items, &groups->capacity, groups->count, 1U,
+            sizeof(*items), 8U, SIDECAR_MAX_LIVE_ENTRIES);
         if (items == NULL)
             return -1;
-        memset(items + groups->capacity, 0,
-               (capacity - groups->capacity) * sizeof(*items));
         groups->items = items;
-        groups->capacity = capacity;
     }
 
     size_t index = groups->count++;
