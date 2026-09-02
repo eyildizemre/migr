@@ -13,6 +13,7 @@
 #include "fileops.h"
 #include "hash.h"
 #include "metadata.h"
+#include "utils.h"
 
 #ifdef METADATA_TEST_HOOKS
 static uint64_t metadata_ownership_probe_calls;
@@ -200,15 +201,12 @@ int metadata_profiles_add(MetadataProfiles *profiles, int anchor_fd,
     }
     if (profiles->count == profiles->capacity)
     {
-        size_t capacity = profiles->capacity == 0 ? 16 : profiles->capacity * 2;
-        if (capacity > METADATA_MAX_PROFILES)
-            capacity = METADATA_MAX_PROFILES;
-        MetadataProfile *items = realloc(profiles->items,
-                                         capacity * sizeof(*items));
+        MetadataProfile *items = array_reserve(
+            profiles->items, &profiles->capacity, profiles->count, 1U,
+            sizeof(*items), 16U, METADATA_MAX_PROFILES);
         if (items == NULL)
             return -1;
         profiles->items = items;
-        profiles->capacity = capacity;
     }
 
     MetadataProfile *profile = &profiles->items[profiles->count];
@@ -501,13 +499,12 @@ int metadata_snapshot_record(MetadataSnapshots *snapshots,
 
     if (snapshots->count == snapshots->capacity)
     {
-        size_t capacity = snapshots->capacity == 0 ? 32 : snapshots->capacity * 2;
-        MetadataSnapshot *items = realloc(snapshots->items,
-                                          capacity * sizeof(*items));
+        MetadataSnapshot *items = array_reserve(
+            snapshots->items, &snapshots->capacity, snapshots->count, 1U,
+            sizeof(*items), 32U, SIZE_MAX / sizeof(*items));
         if (items == NULL)
             return -1;
         snapshots->items = items;
-        snapshots->capacity = capacity;
     }
     if (metadata_snapshot_from_stat(st, &snapshots->items[snapshots->count]) != 0)
         return -1;

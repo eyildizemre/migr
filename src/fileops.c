@@ -534,20 +534,12 @@ static int native_estimate_seen_add(NativeEstimateSeen *seen, dev_t device,
 
     if (seen->count == seen->items_capacity)
     {
-        size_t new_capacity = seen->items_capacity == 0
-            ? 16U : seen->items_capacity * 2U;
-        if (new_capacity < seen->items_capacity ||
-            new_capacity > SIZE_MAX / sizeof(*seen->items))
-        {
-            errno = EOVERFLOW;
-            return -1;
-        }
-        NativeEstimateInode *items = realloc(
-            seen->items, new_capacity * sizeof(*items));
+        NativeEstimateInode *items = array_reserve(
+            seen->items, &seen->items_capacity, seen->count, 1U,
+            sizeof(*items), 16U, SIZE_MAX / sizeof(*items));
         if (items == NULL)
             return -1;
         seen->items = items;
-        seen->items_capacity = new_capacity;
     }
 
     seen->items[seen->count] = (NativeEstimateInode){
@@ -1789,15 +1781,12 @@ static int native_stale_list_append(NativeStaleList *list,
         return -1;
     if (list->count == list->capacity)
     {
-        size_t capacity = list->capacity == 0 ? 16U : list->capacity * 2U;
-        if (capacity < list->capacity ||
-            capacity > SIZE_MAX / sizeof(*list->items))
-            return -1;
-        char **items = realloc(list->items, capacity * sizeof(*items));
+        char **items = array_reserve(
+            list->items, &list->capacity, list->count, 1U,
+            sizeof(*items), 16U, SIZE_MAX / sizeof(*items));
         if (items == NULL)
             return -1;
         list->items = items;
-        list->capacity = capacity;
     }
     char *copy = strdup(rel_path);
     if (copy == NULL)
