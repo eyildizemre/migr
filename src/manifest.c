@@ -317,6 +317,32 @@ static int read_required_line(FILE *f, char *buf, size_t buf_size, ManifestStatu
     return rc;
 }
 
+// Reads the next line and splits it as "KEY=value", leaving *value_out
+// pointing into buf. Returns 0 on success, -1 on EOF, an oversized line,
+// a stream fault (which promotes *fail_status) or a line with no '='.
+static int read_kv_line(FILE *f, char *buf, size_t buf_size,
+                        char **value_out, size_t *key_len,
+                        ManifestStatus *fail_status)
+{
+    if (read_required_line(f, buf, buf_size, fail_status) <= 0)
+        return -1;
+    char *value = split_kv(buf, key_len);
+    if (value == NULL)
+        return -1;
+    *value_out = value;
+    return 0;
+}
+
+// As read_kv_line(), and additionally requires the key to be exactly `key`.
+static int read_kv_field(FILE *f, char *buf, size_t buf_size,
+                         const char *key, char **value_out,
+                         size_t *key_len, ManifestStatus *fail_status)
+{
+    if (read_kv_line(f, buf, buf_size, value_out, key_len, fail_status) != 0)
+        return -1;
+    return line_key_is(buf, key, *key_len) ? 0 : -1;
+}
+
 // Parses one "ROOT ID=... POLICY=... PAYLOAD=... SOURCE=... [RESTORE=...]"
 // line into root. line is mutated (tokenized in place via strtok_r).
 static int parse_root_line(char *line, ManifestRoot *root)
@@ -461,45 +487,45 @@ static ManifestStatus manifest_parse_v1_body(FILE *f, Manifest *out)
     size_t key_len = 0;
     char *value = NULL;
     uintmax_t n = 0;
-    if (read_required_line(f, line, sizeof(line), &fail_status) <= 0) goto fail;
-    if ((value = split_kv(line, &key_len)) == NULL || !line_key_is(line, "VERSION", key_len)) goto fail;
+    if (read_kv_field(f, line, sizeof(line), "VERSION", &value, &key_len,
+                      &fail_status) != 0) goto fail;
     if (parse_uint_field(value, INT_MAX, &n) != 0) goto fail;
     if (n != MANIFEST_CURRENT_VERSION) { fail_status = MANIFEST_STATUS_UNKNOWN_VERSION; goto fail; }
     m.version = (int)n;
 
     // REPRESENTATION=native|portable
-    if (read_required_line(f, line, sizeof(line), &fail_status) <= 0) goto fail;
-    if ((value = split_kv(line, &key_len)) == NULL || !line_key_is(line, "REPRESENTATION", key_len)) goto fail;
+    if (read_kv_field(f, line, sizeof(line), "REPRESENTATION", &value, &key_len,
+                      &fail_status) != 0) goto fail;
     if (representation_from_string(value, &m.representation) != 0) goto fail;
 
     // SCOPE=critical|comprehensive|explicit
-    if (read_required_line(f, line, sizeof(line), &fail_status) <= 0) goto fail;
-    if ((value = split_kv(line, &key_len)) == NULL || !line_key_is(line, "SCOPE", key_len)) goto fail;
+    if (read_kv_field(f, line, sizeof(line), "SCOPE", &value, &key_len,
+                      &fail_status) != 0) goto fail;
     if (scope_from_string(value, &m.scope) != 0) goto fail;
 
     // SIDECAR_VERSION=<uint>
-    if (read_required_line(f, line, sizeof(line), &fail_status) <= 0) goto fail;
-    if ((value = split_kv(line, &key_len)) == NULL || !line_key_is(line, "SIDECAR_VERSION", key_len)) goto fail;
+    if (read_kv_field(f, line, sizeof(line), "SIDECAR_VERSION", &value, &key_len,
+                      &fail_status) != 0) goto fail;
     if (parse_uint_field(value, INT_MAX, &n) != 0) goto fail;
     m.sidecar_version = (int)n;
 
     // Optional MACHINE_ID=<hex> / SOURCE_UID=<uint> pair — both or neither.
-    if (read_required_line(f, line, sizeof(line), &fail_status) <= 0) goto fail;
-    if ((value = split_kv(line, &key_len)) == NULL) goto fail;
+    if (read_kv_line(f, line, sizeof(line), &value, &key_len,
+                     &fail_status) != 0) goto fail;
     if (line_key_is(line, "MACHINE_ID", key_len))
     {
         if (!machine_id_is_valid(value)) goto fail;
         strncpy(m.machine_id, value, MANIFEST_MACHINE_ID_MAX - 1);
         m.machine_id[MANIFEST_MACHINE_ID_MAX - 1] = '\0';
 
-        if (read_required_line(f, line, sizeof(line), &fail_status) <= 0) goto fail;
-        if ((value = split_kv(line, &key_len)) == NULL || !line_key_is(line, "SOURCE_UID", key_len)) goto fail;
+        if (read_kv_field(f, line, sizeof(line), "SOURCE_UID", &value, &key_len,
+                          &fail_status) != 0) goto fail;
         if (parse_uint_field(value, MANIFEST_UID_MAX, &n) != 0) goto fail;
         m.source_uid = (uid_t)n;
         m.has_source_identity = 1;
 
-        if (read_required_line(f, line, sizeof(line), &fail_status) <= 0) goto fail;
-        if ((value = split_kv(line, &key_len)) == NULL) goto fail;
+        if (read_kv_line(f, line, sizeof(line), &value, &key_len,
+                         &fail_status) != 0) goto fail;
     }
     // 'value'/'line' now holds whatever line follows the optional identity pair.
 
