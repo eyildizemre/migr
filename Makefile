@@ -6,14 +6,24 @@ CHECK_SANITIZE_FLAGS = $(CHECK_STRICT_FLAGS) -fsanitize=address,undefined -fno-o
 ANALYZER_CC = gcc
 ANALYZER_FLAGS = $(CFLAGS) -Wpedantic -Werror -fanalyzer
 
-# Valgrind covers the stateful sidecar/portable/restore paths and file-operation
-# walkers. Most scale tests, simple parsers, and the package-manager integration
-# are excluded because they add little memory coverage at disproportionate cost;
-# the native visited-set and native hardlink inode-map scale tests are included
-# because their large allocation volumes are memory-safety subjects in their
-# respective decisions.
+# Valgrind covers the non-scale test suite plus the native visited-set and native
+# hardlink inode-map scale tests, whose large allocation volumes are themselves
+# memory-safety subjects. Five larger scale binaries remain excluded because of
+# their disproportionate runtime. test_backup_plan is also excluded pending a
+# fixture fix for its uninitialized payload_dir in the dangling-dotfile test.
 VALGRIND_TESTS = \
+	tests/test_detect \
 	tests/test_report \
+	tests/test_pathjoin \
+	tests/test_fd_limit \
+	tests/test_packages \
+	tests/test_xdg \
+	tests/test_get_dir_size \
+	tests/test_run_command \
+	tests/test_fsprobe \
+	tests/test_manifest \
+	tests/test_encoding \
+	tests/test_container \
 	tests/test_sidecar \
 	tests/test_sidecar_state \
 	tests/test_portable_hashset \
@@ -34,6 +44,7 @@ VALGRIND_TESTS = \
 	tests/test_backup_source_read \
 	tests/test_backup_sync \
 	tests/test_restore_dispatch \
+	tests/test_restore_atime \
 	tests/test_metadata_contract \
 	tests/test_metadata_snapshots
 
@@ -333,9 +344,8 @@ check-sanitize:
 	UBSAN_OPTIONS=halt_on_error=1 \
 	$(MAKE) CFLAGS="$(CHECK_SANITIZE_FLAGS)" test
 
-# The host Phase B Valgrind gate runs the memory-sensitive core only. The scale
-# binaries, simple parsers, and package-manager integration are excluded: they
-# are covered by make test and make the leak gate disproportionately slow.
+# The host Phase B Valgrind gate runs VALGRIND_TESTS with strict compilation.
+# Its deliberate exclusions are documented with the list above.
 check-valgrind:
 	@set -e; \
 	trap '$(MAKE) clean >/dev/null' EXIT; \

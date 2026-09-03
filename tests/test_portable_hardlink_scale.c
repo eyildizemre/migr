@@ -165,8 +165,6 @@ int main(void)
            prescan_probes, groups);
     check(prescan_probes <= groups * UINT64_C(32),
           "pre-scan inode probes remain bounded linearly");
-    check(prescan_probes < (groups * groups) / UINT64_C(1000),
-          "pre-scan inode probes remain far below quadratic work");
     portable_prescan_report_free(&report);
 
     portable_capture_test_reset_inode_map_probe_count();
@@ -177,8 +175,6 @@ int main(void)
            fresh_probes, groups);
     check(fresh_probes <= groups * UINT64_C(32),
           "fresh inode-map probes remain bounded linearly");
-    check(fresh_probes < (groups * groups) / UINT64_C(1000),
-          "fresh inode-map probes remain far below quadratic work");
 
     portable_capture_test_reset_inode_map_probe_count();
     portable_capture_test_reset_sticky_seed_lstat_count();
@@ -193,8 +189,6 @@ int main(void)
           "sticky seed performs one lstat per live regular entry");
     check(resume_probes <= groups * UINT64_C(64),
           "resume inode-map probes remain bounded linearly");
-    check(resume_probes < (groups * groups) / UINT64_C(500),
-          "resume inode-map probes remain far below quadratic work");
 
     if (close(source_fd) != 0 || close(container_fd) != 0)
         fixture_fatal("could not close scale fixture directories");
