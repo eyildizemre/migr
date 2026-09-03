@@ -43,6 +43,13 @@ int backup(const char *target, BackupMode mode, char **paths);
 int destination_block_size(int dest_fd, off_t *block_size);
 int destination_has_space(int dest_fd, off_t needed, off_t *free_bytes);
 
+/* Prints the restore size/free-space summary. Returns -1 only when the
+ * destination is definitively too small; probe/estimate failures warn and
+ * allow the caller to proceed without a space check.
+ */
+int restore_space_preflight(int destination_fd, const char *home,
+                            off_t estimated_bytes, int estimate_had_error);
+
 #ifdef BACKUP_TEST_HOOKS
 typedef void (*BackupTestInventoryHook)(const char *source_path,
                                         void *context);

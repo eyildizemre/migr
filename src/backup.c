@@ -147,6 +147,54 @@ static int destination_free_bytes(int dest_fd, off_t *free_bytes)
     return destination_has_space(dest_fd, 0, free_bytes) < 0 ? -1 : 0;
 }
 
+int restore_space_preflight(int destination_fd, const char *home,
+                            off_t estimated_bytes, int estimate_had_error)
+{
+    if (estimate_had_error)
+    {
+        print_warning("Warning: could not fully estimate restore size; "
+                      "skipping the free-space preflight check.\n");
+        return 0;
+    }
+
+    off_t block_size = 0;
+    if (destination_block_size(destination_fd, &block_size) != 0 ||
+        block_size <= 0)
+    {
+        print_warning("Warning: could not determine destination free space; "
+                      "skipping the free-space preflight check.\n");
+        return 0;
+    }
+
+    off_t free_bytes = 0;
+    int has_space = destination_has_space(destination_fd, estimated_bytes,
+                                          &free_bytes);
+    if (has_space < 0)
+    {
+        print_warning("Warning: could not determine destination free space; "
+                      "skipping the free-space preflight check.\n");
+        return 0;
+    }
+
+    char estimated_text[32];
+    char free_text[32];
+    format_size(estimated_bytes, estimated_text, sizeof(estimated_text));
+    format_size(free_bytes, free_text, sizeof(free_text));
+    printf("Estimated restore size: %s\n", estimated_text);
+    printf("Destination free space: %s\n", free_text);
+    if (!has_space)
+    {
+        off_t shortfall = estimated_bytes - free_bytes;
+        char shortfall_text[32];
+        format_size(shortfall, shortfall_text, sizeof(shortfall_text));
+        fflush(stdout);
+        print_error("Error: not enough free space at %s (need %s more)\n",
+                    home, shortfall_text);
+        return -1;
+    }
+    return 0;
+}
+
 /* Returns 0 to proceed (space is adequate, or an earlier probe/estimate
  * step failed and already printed its own warning), or -1 if the
  * destination does not have enough free space (having already printed the

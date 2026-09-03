@@ -273,54 +273,6 @@ static void native_restore_security_dry_run_notice(size_t entries)
                entries);
 }
 
-static int native_restore_space_preflight(
-    int home_fd, const char *home, const NativeRestoreEstimate *estimate)
-{
-    if (estimate == NULL || estimate->had_error)
-    {
-        print_warning("Warning: could not fully estimate restore size; "
-                      "skipping the free-space preflight check.\n");
-        return 0;
-    }
-
-    off_t block_size = 0;
-    if (destination_block_size(home_fd, &block_size) != 0 || block_size <= 0)
-    {
-        print_warning("Warning: could not determine destination free space; "
-                      "skipping the free-space preflight check.\n");
-        return 0;
-    }
-
-    off_t free_bytes = 0;
-    int has_space = destination_has_space(home_fd, estimate->estimated_bytes,
-                                          &free_bytes);
-    if (has_space < 0)
-    {
-        print_warning("Warning: could not determine destination free space; "
-                      "skipping the free-space preflight check.\n");
-        return 0;
-    }
-
-    char estimated_text[32];
-    char free_text[32];
-    format_size(estimate->estimated_bytes, estimated_text,
-                sizeof(estimated_text));
-    format_size(free_bytes, free_text, sizeof(free_text));
-    printf("Estimated restore size: %s\n", estimated_text);
-    printf("Destination free space: %s\n", free_text);
-    if (!has_space)
-    {
-        off_t shortfall = estimate->estimated_bytes - free_bytes;
-        char shortfall_text[32];
-        format_size(shortfall, shortfall_text, sizeof(shortfall_text));
-        fflush(stdout);
-        print_error("Error: not enough free space at %s (need %s more)\n",
-                    home, shortfall_text);
-        return -1;
-    }
-    return 0;
-}
-
 static int native_restore_confirm(size_t security_xattr_entries)
 {
     const char *ordinary_message =
@@ -1591,8 +1543,9 @@ int restore(const char *source)
         native_restore_estimate_free(&restore_estimate);
         goto cleanup;
     }
-    int space_refused = native_restore_space_preflight(
-        home_fd, home, &restore_estimate) != 0;
+    int space_refused = restore_space_preflight(
+        home_fd, home, restore_estimate.estimated_bytes,
+        restore_estimate.had_error) != 0;
     native_restore_estimate_free(&restore_estimate);
     if (space_refused)
         goto cleanup;
