@@ -188,13 +188,12 @@ static int restore_timestamp_anchor_add(RestoreTimestampAnchors *anchors,
 
     if (anchors->count == anchors->capacity)
     {
-        size_t capacity = anchors->capacity == 0 ? 8 : anchors->capacity * 2;
-        RestoreTimestampAnchor *items = realloc(anchors->items,
-                                                capacity * sizeof(*items));
+        RestoreTimestampAnchor *items = array_reserve(
+            anchors->items, &anchors->capacity, anchors->count, 1U,
+            sizeof(*items), 8U, SIZE_MAX / sizeof(*items));
         if (items == NULL)
             return -1;
         anchors->items = items;
-        anchors->capacity = capacity;
     }
 
     int copy = fcntl(fd, F_DUPFD_CLOEXEC, 0);

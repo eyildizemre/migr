@@ -87,25 +87,13 @@ static int report_breakdown_add(ReportBreakdown *breakdown,
 {
     if (breakdown->count == breakdown->capacity)
     {
-        size_t new_capacity = breakdown->capacity == 0
-                                  ? 16
-                                  : breakdown->capacity * 2;
-        if (new_capacity < breakdown->capacity ||
-            new_capacity > SIZE_MAX / sizeof(*breakdown->entries))
-        {
-            errno = ENOMEM;
-            return -1;
-        }
-
-        ReportBreakdownEntry *new_entries = realloc(
-            breakdown->entries, new_capacity * sizeof(*new_entries));
+        ReportBreakdownEntry *new_entries = array_reserve(
+            breakdown->entries, &breakdown->capacity, breakdown->count, 1U,
+            sizeof(*new_entries), 16U,
+            SIZE_MAX / sizeof(*new_entries));
         if (new_entries == NULL)
-        {
-            errno = ENOMEM;
             return -1;
-        }
         breakdown->entries = new_entries;
-        breakdown->capacity = new_capacity;
     }
 
     ReportBreakdownEntry *entry = &breakdown->entries[breakdown->count];

@@ -170,9 +170,9 @@ int package_token_is_safe(const char *token)
 void read_package_list(FILE *pkg_file, char ***pkgs_out, int *pkg_count_out,
                        int *had_error)
 {
-    int pkg_cap = 256;
+    size_t pkg_cap = 256;
     int pkg_count = 0;
-    char **pkgs = malloc((size_t)pkg_cap * sizeof(*pkgs));
+    char **pkgs = malloc(pkg_cap * sizeof(*pkgs));
 
     if (pkgs == NULL)
     {
@@ -203,10 +203,11 @@ void read_package_list(FILE *pkg_file, char ***pkgs_out, int *pkg_count_out,
         if (!package_token_is_safe(pkg_name))
             continue;
 
-        if (pkg_count == pkg_cap)
+        if ((size_t)pkg_count == pkg_cap)
         {
-            pkg_cap *= 2;
-            char **tmp = realloc(pkgs, (size_t)pkg_cap * sizeof(*pkgs));
+            char **tmp = array_reserve(
+                pkgs, &pkg_cap, (size_t)pkg_count, 1U, sizeof(*pkgs),
+                256U, SIZE_MAX / sizeof(*pkgs));
             if (tmp == NULL)
             {
                 *had_error = 1;
