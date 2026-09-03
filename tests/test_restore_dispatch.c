@@ -512,9 +512,16 @@ static void test_v1_restores_home_relative_and_xdg_reports_manual_native(void)
     check(strstr(output, "Roots") != NULL, "the v1 section header appears");
     check(strstr(output, "Main Directories") == NULL, "the legacy path is never attempted");
 
-    check(strstr(output, "Would restore: EXPLICIT_0 -> ~/Documents/project") != NULL,
+    check(strstr(output, "Would restore: EXPLICIT_0 -> ~/Documents/project\n") != NULL,
           "the HOME_RELATIVE root is previewed at its recorded restore address");
-    check(strstr(output, "Would restore: XDG_DOCUMENTS_DIR ->") != NULL,
+
+    char expected_xdg_preview[PATH_MAX + 64];
+    int expected_xdg_preview_length = snprintf(
+        expected_xdg_preview, sizeof(expected_xdg_preview),
+        "Would restore: XDG_DOCUMENTS_DIR -> %s/Documents/\n", home);
+    check(expected_xdg_preview_length > 0 &&
+              (size_t)expected_xdg_preview_length < sizeof(expected_xdg_preview) &&
+              strstr(output, expected_xdg_preview) != NULL,
           "the XDG root is previewed against the target locale's resolved directory");
 
     check(strstr(output, "Manual Roots") != NULL, "the manual-roots section appears");

@@ -636,6 +636,7 @@ typedef struct {
     char **xdg_dirs;
     int home_fd;
     int xdg_ready;
+    V1XdgDestStatus xdg_status;
 } V1DestinationResolver;
 
 // Resolves one v1 manifest root to a destination fd and relative path. XDG
@@ -651,6 +652,7 @@ static int v1_resolve_root_destination(V1DestinationResolver *r,
 {
     *out_fd = r->home_fd;
     *out_close_destination = 0;
+    r->xdg_status = V1_XDG_DEST_OK;
     if (out_xdg_dir != NULL)
         *out_xdg_dir = NULL;
 
@@ -671,9 +673,9 @@ static int v1_resolve_root_destination(V1DestinationResolver *r,
         r->xdg_ready = 1;
     }
 
-    if (resolve_v1_xdg_root_destination(root, r->xdg_dirs, out_fd, out_rel,
-                                        out_rel_size, out_xdg_dir) !=
-        V1_XDG_DEST_OK)
+    r->xdg_status = resolve_v1_xdg_root_destination(
+        root, r->xdg_dirs, out_fd, out_rel, out_rel_size, out_xdg_dir);
+    if (r->xdg_status != V1_XDG_DEST_OK)
         return 0;
 
     *out_close_destination = 1;
@@ -1220,8 +1222,12 @@ static void restore_v1(const char *source, int source_root_fd, const char *home,
 {
     printf("Roots\n");
 
-    char *xdg_dirs[XDG_RESTORE_COUNT];
-    int xdg_dirs_ready = 0;
+    char *xdg_dirs[XDG_RESTORE_COUNT] = {0};
+    V1DestinationResolver resolver = {
+        .home = home,
+        .xdg_dirs = xdg_dirs,
+        .home_fd = home_fd,
+    };
     int xdg_dirs_failed = 0;
 
     for (int i = 0; i < m->root_count; i++)
@@ -1238,80 +1244,69 @@ static void restore_v1(const char *source, int source_root_fd, const char *home,
             continue;
         }
 
-        if (root->policy == ROOT_POLICY_HOME_RELATIVE)
-        {
-            int rc = restore_item_at(ctx, source_root_fd, source_rel, home_fd,
-                                     root->restore_path, root->id, 1,
-                                     timestamp_anchors,
-                                     skipped_security_xattrs, capture_report);
-            if (rc > 0 && dry_run)
-            {
-                if (root->restore_path[0] != '\0')
-                    printf("  Would restore: %s -> ~/%s\n", root->id, root->restore_path);
-                else
-                    printf("  Would restore: %s -> ~\n", root->id);
-            }
-            if (rc > 0)
-                (*count)++;
-            else if (rc < 0)
-                *had_error = 1;
-            continue;
-        }
-
-        // ROOT_POLICY_XDG: resolved lazily, once, only if a manifest actually
-        // has an XDG-policy root -- an EXPLICIT-scope backup may have none.
-        if (!xdg_dirs_ready && !xdg_dirs_failed)
-        {
-            if (xdg_resolve(home, xdg_keys, xdg_fallbacks, xdg_dirs, XDG_RESTORE_COUNT) == 0)
-                xdg_dirs_ready = 1;
-            else
-            {
-                free_xdg_dirs(xdg_dirs);
-                xdg_dirs_failed = 1;
-                print_error("Error: HOME path too long to resolve user directories\n");
-            }
-        }
-        if (xdg_dirs_failed)
+        // A failed XDG table resolution frees xdg_dirs inside the resolver.
+        // Later HOME_RELATIVE roots remain independently restorable, but no
+        // later XDG root may retry resolution against that freed table.
+        if (root->policy == ROOT_POLICY_XDG && xdg_dirs_failed)
         {
             *had_error = 1;
             continue;
         }
 
-        int xdg_dest_fd;
-        char destination_rel[PATH_MAX];
         const char *resolved_xdg_dir = NULL;
-        V1XdgDestStatus dest_status = resolve_v1_xdg_root_destination(
-            root, xdg_dirs, &xdg_dest_fd, destination_rel,
-            sizeof(destination_rel), &resolved_xdg_dir);
-        if (dest_status == V1_XDG_DEST_UNKNOWN_ID)
+        int destination_fd = home_fd;
+        int close_destination = 0;
+        char destination_rel[PATH_MAX + 8];
+        int resolve_status = v1_resolve_root_destination(
+            &resolver, root, &destination_fd, destination_rel,
+            sizeof(destination_rel), &close_destination, &resolved_xdg_dir);
+        if (resolve_status < 0)
         {
-            print_error("Error: Unrecognized XDG root id: %s\n", root->id);
+            print_error("Error: HOME path too long to resolve user directories\n");
             *had_error = 1;
+            xdg_dirs_failed = 1;
             continue;
         }
-        if (dest_status != V1_XDG_DEST_OK)
+        if (resolve_status == 0)
         {
-            print_error("Error: Failed to restore %s\n", root->id);
+            if (root->policy != ROOT_POLICY_HOME_RELATIVE &&
+                resolver.xdg_status == V1_XDG_DEST_UNKNOWN_ID)
+                print_error("Error: Unrecognized XDG root id: %s\n", root->id);
+            else
+                print_error("Error: Failed to restore %s\n", root->id);
             *had_error = 1;
             continue;
         }
 
-        int rc = restore_item_at(ctx, source_root_fd, source_rel, xdg_dest_fd,
+        int rc = restore_item_at(ctx, source_root_fd, source_rel, destination_fd,
                                  destination_rel, root->id, 1,
                                  timestamp_anchors,
                                  skipped_security_xattrs, capture_report);
         if (rc > 0 && dry_run)
-            printf("  Would restore: %s -> %s/\n", root->id,
-                   resolved_xdg_dir);
+        {
+            if (root->policy == ROOT_POLICY_HOME_RELATIVE)
+            {
+                if (root->restore_path[0] != '\0')
+                    printf("  Would restore: %s -> ~/%s\n", root->id,
+                           root->restore_path);
+                else
+                    printf("  Would restore: %s -> ~\n", root->id);
+            }
+            else
+            {
+                printf("  Would restore: %s -> %s/\n", root->id,
+                       resolved_xdg_dir);
+            }
+        }
         if (rc > 0)
             (*count)++;
         else if (rc < 0)
             *had_error = 1;
-        if (close(xdg_dest_fd) != 0)
+        if (close_destination && close(destination_fd) != 0)
             *had_error = 1;
     }
 
-    if (xdg_dirs_ready)
+    if (resolver.xdg_ready)
         free_xdg_dirs(xdg_dirs);
 
     int manual_count = 0;
