@@ -631,6 +631,55 @@ static V1XdgDestStatus resolve_v1_xdg_root_destination(
     return V1_XDG_DEST_OK;
 }
 
+typedef struct {
+    const char *home;
+    char **xdg_dirs;
+    int home_fd;
+    int xdg_ready;
+} V1DestinationResolver;
+
+// Resolves one v1 manifest root to a destination fd and relative path. XDG
+// destinations are resolved lazily so a phase pays that cost at most once.
+// Returns 1 on success, 0 for a per-root resolution failure, and -1 when XDG
+// resolution fails for the whole phase.
+static int v1_resolve_root_destination(V1DestinationResolver *r,
+                                       const ManifestRoot *root,
+                                       int *out_fd, char *out_rel,
+                                       size_t out_rel_size,
+                                       int *out_close_destination,
+                                       const char **out_xdg_dir)
+{
+    *out_fd = r->home_fd;
+    *out_close_destination = 0;
+    if (out_xdg_dir != NULL)
+        *out_xdg_dir = NULL;
+
+    if (root->policy == ROOT_POLICY_HOME_RELATIVE)
+    {
+        int n = snprintf(out_rel, out_rel_size, "%s", root->restore_path);
+        return n < 0 || (size_t)n >= out_rel_size ? 0 : 1;
+    }
+
+    if (!r->xdg_ready)
+    {
+        if (xdg_resolve(r->home, xdg_keys, xdg_fallbacks, r->xdg_dirs,
+                        XDG_RESTORE_COUNT) != 0)
+        {
+            free_xdg_dirs(r->xdg_dirs);
+            return -1;
+        }
+        r->xdg_ready = 1;
+    }
+
+    if (resolve_v1_xdg_root_destination(root, r->xdg_dirs, out_fd, out_rel,
+                                        out_rel_size, out_xdg_dir) !=
+        V1_XDG_DEST_OK)
+        return 0;
+
+    *out_close_destination = 1;
+    return 1;
+}
+
 // Resolves the legacy source-side identifier for the i-th XDG slot: the
 // recorded legacy manifest name if present, else the destination-locale
 // directory's own basename. legacy_manifest_read() guarantees manifest_names
@@ -815,7 +864,11 @@ static int seed_native_restore_v1_hardlink_map(
     const RestoreTimestampAnchors *anchors)
 {
     char *xdg_dirs[XDG_RESTORE_COUNT] = {0};
-    int xdg_ready = 0;
+    V1DestinationResolver resolver = {
+        .home = home,
+        .xdg_dirs = xdg_dirs,
+        .home_fd = home_fd,
+    };
     int failed = 0;
 
     for (int i = 0; i < m->root_count; i++)
@@ -836,36 +889,15 @@ static int seed_native_restore_v1_hardlink_map(
         int destination_fd = home_fd;
         int close_destination = 0;
         char destination_rel[PATH_MAX + 8];
-        if (root->policy == ROOT_POLICY_HOME_RELATIVE)
+        int resolve_status = v1_resolve_root_destination(
+            &resolver, root, &destination_fd, destination_rel,
+            sizeof(destination_rel), &close_destination, NULL);
+        if (resolve_status < 0)
+            return -1;
+        if (resolve_status == 0)
         {
-            int n = snprintf(destination_rel, sizeof(destination_rel), "%s",
-                             root->restore_path);
-            if (n < 0 || (size_t)n >= sizeof(destination_rel))
-            {
-                failed = 1;
-                continue;
-            }
-        }
-        else
-        {
-            if (!xdg_ready)
-            {
-                if (xdg_resolve(home, xdg_keys, xdg_fallbacks, xdg_dirs,
-                                XDG_RESTORE_COUNT) != 0)
-                {
-                    free_xdg_dirs(xdg_dirs);
-                    return -1;
-                }
-                xdg_ready = 1;
-            }
-            if (resolve_v1_xdg_root_destination(
-                    root, xdg_dirs, &destination_fd, destination_rel,
-                    sizeof(destination_rel), NULL) != V1_XDG_DEST_OK)
-            {
-                failed = 1;
-                continue;
-            }
-            close_destination = 1;
+            failed = 1;
+            continue;
         }
 
         if (seed_native_restore_root(ctx, anchors, source, source_rel,
@@ -875,7 +907,7 @@ static int seed_native_restore_v1_hardlink_map(
             failed = 1;
     }
 
-    if (xdg_ready)
+    if (resolver.xdg_ready)
         free_xdg_dirs(xdg_dirs);
     return failed ? -1 : 0;
 }
@@ -1114,7 +1146,11 @@ static RestoreNativeStatus restore_v1_metadata_inventory(
     NativeRestoreEstimate *estimate)
 {
     char *xdg_dirs[XDG_RESTORE_COUNT] = {0};
-    int xdg_ready = 0;
+    V1DestinationResolver resolver = {
+        .home = home,
+        .xdg_dirs = xdg_dirs,
+        .home_fd = home_fd,
+    };
     int failed = 0;
     RestoreNativeStatus result = RESTORE_NATIVE_OK;
 
@@ -1136,39 +1172,21 @@ static RestoreNativeStatus restore_v1_metadata_inventory(
         int destination_fd = home_fd;
         int close_destination = 0;
         char destination_rel[PATH_MAX + 8];
-        if (root->policy == ROOT_POLICY_HOME_RELATIVE)
+        int resolve_status = v1_resolve_root_destination(
+            &resolver, root, &destination_fd, destination_rel,
+            sizeof(destination_rel), &close_destination, NULL);
+        if (resolve_status < 0)
         {
-            int n = snprintf(destination_rel, sizeof(destination_rel), "%s",
-                             root->restore_path);
-            if (n < 0 || (size_t)n >= sizeof(destination_rel))
-            {
-                failed = 1;
-                continue;
-            }
+            print_error("Error: HOME path too long to resolve user directories\n");
+            return RESTORE_NATIVE_ERROR;
         }
-        else
+        if (resolve_status == 0)
         {
-            if (!xdg_ready)
-            {
-                if (xdg_resolve(home, xdg_keys, xdg_fallbacks, xdg_dirs,
-                                XDG_RESTORE_COUNT) != 0)
-                {
-                    free_xdg_dirs(xdg_dirs);
-                    print_error("Error: HOME path too long to resolve user directories\n");
-                    return RESTORE_NATIVE_ERROR;
-                }
-                xdg_ready = 1;
-            }
-            if (resolve_v1_xdg_root_destination(
-                    root, xdg_dirs, &destination_fd, destination_rel,
-                    sizeof(destination_rel), NULL) != V1_XDG_DEST_OK)
-            {
+            if (root->policy != ROOT_POLICY_HOME_RELATIVE)
                 print_error("Error: Failed to resolve restore destination %s\n",
-                       root->id);
-                failed = 1;
-                continue;
-            }
-            close_destination = 1;
+                            root->id);
+            failed = 1;
+            continue;
         }
 
         RestoreNativeStatus item_status = restore_metadata_item(
@@ -1184,7 +1202,7 @@ static RestoreNativeStatus restore_v1_metadata_inventory(
             failed = 1;
     }
 
-    if (xdg_ready)
+    if (resolver.xdg_ready)
         free_xdg_dirs(xdg_dirs);
     return result != RESTORE_NATIVE_OK
         ? result : (failed ? RESTORE_NATIVE_ERROR : RESTORE_NATIVE_OK);
