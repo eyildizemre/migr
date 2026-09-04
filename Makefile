@@ -49,15 +49,23 @@ VALGRIND_TESTS = \
 	tests/test_metadata_snapshots
 
 TARGET = migr
+STATIC_TARGET = migr-static
 VPATH = src
 SRCS = main.c detect.c report.c backup.c backup_plan.c packages.c restore.c utils.c fileops.c fsprobe.c xdg.c manifest.c encoding.c container.c metadata.c metadata_xattr.c portable_hashset.c portable_prescan.c portable_fsops.c portable.c portable_reconcile.c portable_restore_replay.c portable_restore_shared.c portable_restore_orchestrate.c portable_restore_preflight.c sidecar.c sidecar_state.c sidecar_state_map.c hash.c
 OBJS = $(SRCS:.c=.o)
+STATIC_OBJS = $(SRCS:.c=_static.o)
 ANALYZER_SRCS = $(wildcard src/*.c)
 
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS)
 
+$(STATIC_TARGET): $(STATIC_OBJS)
+	$(CC) $(CFLAGS) -static -o $(STATIC_TARGET) $(STATIC_OBJS)
+
 %.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+%_static.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 TEST_DETECT = tests/test_detect
@@ -375,6 +383,6 @@ check:
 	$(MAKE) check-analyze
 
 clean:
-	rm -f $(OBJS) report_test.o backup_test.o container_test.o fileops_test.o sidecar.o sidecar_test.o sidecar_state.o sidecar_state_map.o sidecar_state_test.o sidecar_state_map_test.o portable.o portable_reconcile.o portable_fsops.o portable_test.o portable_reconcile_test.o portable_hashset.o portable_prescan.o portable_prescan_test.o portable_restore_replay_test.o portable_restore_preflight.o portable_restore_shared.o portable_restore_orchestrate.o metadata_test.o metadata_xattr.o metadata_xattr_test.o backup_plan_test.o $(TARGET) $(TEST_DETECT) $(TEST_REPORT) $(TEST_PATHJOIN) $(TEST_FD_LIMIT) $(TEST_PACKAGES) $(TEST_XDG) $(TEST_GET_DIR_SIZE) $(TEST_RUN_COMMAND) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE) $(TEST_MANIFEST) $(TEST_ENCODING) $(TEST_CONTAINER) $(TEST_RESTORE_NATIVE) $(TEST_RESTORE_SYNC) $(TEST_RESTORE_SOURCE_READ) $(TEST_BACKUP_SOURCE_READ) $(TEST_BACKUP_SYNC) $(TEST_RESTORE_DISPATCH) $(TEST_RESTORE_ATIME) $(TEST_BACKUP_PLAN) $(TEST_METADATA_CONTRACT) $(TEST_METADATA_SNAPSHOTS) $(TEST_SIDECAR) $(TEST_SIDECAR_STATE) $(TEST_SIDECAR_SCALE) $(TEST_PORTABLE_HASHSET) $(TEST_PORTABLE_CAPTURE) $(TEST_PORTABLE_CAPTURE_SCALE) $(TEST_PORTABLE_PREPARE) $(TEST_NATIVE_RECONCILE_SCALE) $(TEST_NATIVE_HARDLINK_SCALE) $(TEST_PORTABLE_COLLISION_SCALE) $(TEST_PORTABLE_HARDLINK_SCALE) $(TEST_PORTABLE_RESUME) $(TEST_PORTABLE_RECONCILE) $(TEST_PORTABLE_RECONCILE_SCALE) $(TEST_PORTABLE_RESTORE_PREFLIGHT) $(TEST_PORTABLE_RESTORE_REPLAY) $(TEST_PORTABLE_RESTORE_ORCHESTRATE) $(TEST_PORTABLE_RESTORE_INVARIANT)
+	rm -f $(OBJS) $(STATIC_OBJS) report_test.o backup_test.o container_test.o fileops_test.o sidecar.o sidecar_test.o sidecar_state.o sidecar_state_map.o sidecar_state_test.o sidecar_state_map_test.o portable.o portable_reconcile.o portable_fsops.o portable_test.o portable_reconcile_test.o portable_hashset.o portable_prescan.o portable_prescan_test.o portable_restore_replay_test.o portable_restore_preflight.o portable_restore_shared.o portable_restore_orchestrate.o metadata_test.o metadata_xattr.o metadata_xattr_test.o backup_plan_test.o $(TARGET) $(STATIC_TARGET) $(TEST_DETECT) $(TEST_REPORT) $(TEST_PATHJOIN) $(TEST_FD_LIMIT) $(TEST_PACKAGES) $(TEST_XDG) $(TEST_GET_DIR_SIZE) $(TEST_RUN_COMMAND) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE) $(TEST_MANIFEST) $(TEST_ENCODING) $(TEST_CONTAINER) $(TEST_RESTORE_NATIVE) $(TEST_RESTORE_SYNC) $(TEST_RESTORE_SOURCE_READ) $(TEST_BACKUP_SOURCE_READ) $(TEST_BACKUP_SYNC) $(TEST_RESTORE_DISPATCH) $(TEST_RESTORE_ATIME) $(TEST_BACKUP_PLAN) $(TEST_METADATA_CONTRACT) $(TEST_METADATA_SNAPSHOTS) $(TEST_SIDECAR) $(TEST_SIDECAR_STATE) $(TEST_SIDECAR_SCALE) $(TEST_PORTABLE_HASHSET) $(TEST_PORTABLE_CAPTURE) $(TEST_PORTABLE_CAPTURE_SCALE) $(TEST_PORTABLE_PREPARE) $(TEST_NATIVE_RECONCILE_SCALE) $(TEST_NATIVE_HARDLINK_SCALE) $(TEST_PORTABLE_COLLISION_SCALE) $(TEST_PORTABLE_HARDLINK_SCALE) $(TEST_PORTABLE_RESUME) $(TEST_PORTABLE_RECONCILE) $(TEST_PORTABLE_RECONCILE_SCALE) $(TEST_PORTABLE_RESTORE_PREFLIGHT) $(TEST_PORTABLE_RESTORE_REPLAY) $(TEST_PORTABLE_RESTORE_ORCHESTRATE) $(TEST_PORTABLE_RESTORE_INVARIANT)
 
 .PHONY: clean test check-strict check-sanitize check-valgrind check-analyze check
