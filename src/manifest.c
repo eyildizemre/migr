@@ -288,6 +288,15 @@ static int machine_id_is_valid(const char *s)
     return 1;
 }
 
+static int arch_is_valid(const char *s)
+{
+    return s != NULL &&
+           (strcmp(s, "x86_64") == 0 ||
+            strcmp(s, "aarch64") == 0 ||
+            strcmp(s, "i386") == 0 ||
+            strcmp(s, "riscv64") == 0);
+}
+
 // Matches "KEY=value": on success returns a pointer to value within line
 // (line is mutated: the '=' becomes NUL) and stores the key length via
 // key_len, so the caller can compare against several expected keys.
@@ -529,6 +538,17 @@ static ManifestStatus manifest_parse_v1_body(FILE *f, Manifest *out)
     }
     // 'value'/'line' now holds whatever line follows the optional identity pair.
 
+    // Optional ARCH=<name>, present only when the backup carries migr itself.
+    if (line_key_is(line, "ARCH", key_len))
+    {
+        if (!arch_is_valid(value)) goto fail;
+        strncpy(m.arch, value, sizeof(m.arch) - 1);
+        m.arch[sizeof(m.arch) - 1] = '\0';
+        m.has_self_binary = 1;
+        if (read_kv_line(f, line, sizeof(line), &value, &key_len,
+                         &fail_status) != 0) goto fail;
+    }
+
     // ROOT_COUNT=<uint>
     if (!line_key_is(line, "ROOT_COUNT", key_len)) goto fail;
     if (parse_uint_field(value, MANIFEST_MAX_ROOTS, &n) != 0) goto fail;
@@ -698,6 +718,10 @@ ManifestIdentityComparison manifest_resume_identity_compare(const Manifest *a, c
         return MANIFEST_IDENTITY_DIFFERENT;
     if (a->source_uid != b->source_uid)
         return MANIFEST_IDENTITY_DIFFERENT;
+    if (a->has_self_binary != b->has_self_binary)
+        return MANIFEST_IDENTITY_DIFFERENT;
+    if (a->has_self_binary && strcmp(a->arch, b->arch) != 0)
+        return MANIFEST_IDENTITY_DIFFERENT;
     if (a->root_count != b->root_count)
         return MANIFEST_IDENTITY_DIFFERENT;
     if (a->root_count == 0)
@@ -770,6 +794,9 @@ static int manifest_model_is_invalid(const Manifest *m)
     // source_uid is a uid_t: any value it can hold is in range for the type;
     // nothing further to validate there.
 
+    if (m->has_self_binary && !arch_is_valid(m->arch))
+        return 1;
+
     if (m->root_count < 0 || m->root_count > MANIFEST_MAX_ROOTS)
         return 1;
     if (m->root_count > 0 && m->roots == NULL)
@@ -836,6 +863,10 @@ static int manifest_serialize(FILE *f, const Manifest *m)
         if (fprintf(f, "MACHINE_ID=%s\n", m->machine_id) < 0) failed = 1;
         if (!failed && fprintf(f, "SOURCE_UID=%lu\n", (unsigned long)m->source_uid) < 0) failed = 1;
     }
+
+    if (!failed && m->has_self_binary &&
+        fprintf(f, "ARCH=%s\n", m->arch) < 0)
+        failed = 1;
 
     if (!failed && fprintf(f, "ROOT_COUNT=%d\n", m->root_count) < 0) failed = 1;
 

@@ -1,5 +1,6 @@
 *.o
 migr
+migr-static
 tests/test_detect
 tests/test_pathjoin
 tests/test_special_files

@@ -30,6 +30,16 @@ normally; only the package list is skipped.
 make
 ```
 
+To create the standalone binary used by `backup --include-self`, also build:
+
+```bash
+make migr-static
+```
+
+`migr-static` must sit beside the running `migr` executable when the backup
+starts. The backup command validates that it is a static ELF binary before
+copying it.
+
 To activate the pre-commit hook (runs build + tests when C/shell/Makefile changes are staged), run this once after cloning:
 
 ```bash
@@ -69,6 +79,8 @@ the backup's version without a second prompt.
 -s, --summary         Print only the selected report scope total
     --max-depth=<N>
                        Report directory breakdown depth; implies --verbose
+    --include-self     Include a validated static migr binary in the backup
+                       (requires building migr-static)
 ```
 
 Status colors are automatic: they are used when stdout is a real terminal and
@@ -95,6 +107,7 @@ Backup-only explicit paths:
 ./migr backup /mnt/drive
 ./migr backup /mnt/drive --comprehensive
 ./migr backup /mnt/drive ~/Documents ~/Projects
+./migr backup /mnt/drive --include-self
 ```
 
 ## Key Features
@@ -143,13 +156,22 @@ the user's filesystem lives below `data/`:
 migr_backup_YYYYMMDD_HHMMSS[-N]/
 ├── manifest.txt
 ├── packages.txt        # present when this scope exports a package list
+├── migr                # present with --include-self
 └── data/
     └── <logical roots>
 ```
 
 `manifest.txt` records the version, representation, scope, root table, and stable source
-identity when one is available. Older unversioned and manifest-less backups remain
-readable through an isolated legacy restore path.
+identity when one is available. With `--include-self`, it also records the bundled
+binary's architecture, for example `ARCH=x86_64`. Older unversioned and manifest-less
+backups remain readable through an isolated legacy restore path.
+
+`--include-self` copies the validated `migr-static` binary into the container root as
+`migr`, so the backup carries a standalone migr executable with it. Native Linux
+filesystems preserve its executable bit. Portable filesystems such as exFAT, NTFS,
+and FAT32 may not, so on the target Linux system enter the backup directory and run
+`chmod +x migr` before executing it. The recorded `ARCH` value lets you check that
+the bundled binary matches the target machine's architecture.
 
 Explicit paths keep accepting valid sources both inside and outside `$HOME`. A root
 proven to be inside the source home is restored automatically to the same relative
@@ -335,7 +357,7 @@ recorded in [docs/DECISIONS.md](docs/DECISIONS.md).
 - [ ] VS Code extension list backup and restore
 - [ ] Logging
 - [ ] Network configuration backup
-- [ ] Self-contained backup (embed static binary)
+- [x] Self-contained backup (`--include-self` static binary)
 - [ ] Provide pre-built .deb, .rpm, and AUR packages
 
 ## License

@@ -301,6 +301,8 @@ void print_help(void)
     printf("  -s, --summary         Print only the selected report scope total\n");
     printf("      --max-depth=<N>\n");
     printf("                        Report directory breakdown depth (implies --verbose)\n");
+    printf("      --include-self    Include a validated static migr binary in the backup\n");
+    printf("                        (requires building migr-static)\n");
     printf("\n");
     printf("Examples:\n");
     printf("  ./migr backup /mnt/drive\n");

@@ -27,17 +27,20 @@ typedef enum {
  * without one is not a backup migr can restore.
  *
  * When an earlier run of the same job (docs/DECISIONS.md D15: representation,
- * scope, root table, machine id and uid) left exactly one unfinished container
- * behind, this resumes into it instead of starting a second one.
+ * scope, root table, machine id and uid, plus any bundled migr architecture)
+ * left exactly one unfinished container behind, this resumes into it instead
+ * of starting a second one.
  *
  * @param target Destination directory; the dated backup subdirectory is created inside it.
  * @param mode   Selects which files are included (BACKUP_CRITICAL, BACKUP_COMPREHENSIVE, or BACKUP_EXPLICIT_PATHS).
  * @param paths  NULL-terminated array of paths (absolute, or relative to the
  *               current working directory); required when mode is
  *               BACKUP_EXPLICIT_PATHS, ignored otherwise.
+ * @param include_self Non-zero to require and copy the validated static migr
+ *                     binary into the container root (docs/DECISIONS.md D9).
  * @return 0 on success, 1 on error.
  */
-int backup(const char *target, BackupMode mode, char **paths);
+int backup(const char *target, BackupMode mode, char **paths, int include_self);
 
 /* Shared by backup and restore destination free-space preflights. */
 int destination_block_size(int dest_fd, off_t *block_size);

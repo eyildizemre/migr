@@ -827,6 +827,14 @@ test_errors() {
     assert_fails_with "Error: --dry-run applies only to 'backup' or 'restore'." \
         ../migr --dry-run
 
+    # include-self is meaningful only for backup, and help documents the
+    # static-binary prerequisite before a real backup can refuse it.
+    assert_fails_with "Error: --include-self applies only to 'backup'." \
+        ../migr report --include-self
+    assert_fails_with "Error: --include-self applies only to 'backup'." \
+        ../migr restore "$BACKUP_DIR" --include-self
+    assert_succeeds_with "--include-self" ../migr --help
+
     # commands that take exactly one positional reject extras
     assert_exits_nonzero ../migr restore "$BACKUP_DIR" /tmp/extra
 
@@ -849,6 +857,7 @@ test_errors() {
     assert_succeeds_with "Usage:" ../migr backup --critical --help
     assert_succeeds_with "Usage:" ../migr report --summary --help
     assert_succeeds_with "Usage:" ../migr report --max-depth=2 --help
+    assert_succeeds_with "Usage:" ../migr restore --include-self --help
     assert_succeeds_with "Usage:" ../migr help --critical
     # ...but a genuine conflict detected before --help is even parsed still refuses.
     assert_exits_nonzero ../migr backup --critical --comprehensive --help

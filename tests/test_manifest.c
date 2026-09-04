@@ -119,6 +119,8 @@ static void test_full_roundtrip_with_problem_bytes(void)
     m.has_source_identity = 1;
     strcpy(m.machine_id, "deadbeefcafef00d0123456789abcdef");
     m.source_uid = 1000;
+    m.has_self_binary = 1;
+    strcpy(m.arch, "x86_64");
 
     ManifestRoot roots[2];
     memset(roots, 0, sizeof(roots));
@@ -157,6 +159,9 @@ static void test_full_roundtrip_with_problem_bytes(void)
         check(read.has_source_identity == 1, "source identity presence round-trips");
         check(strcmp(read.machine_id, m.machine_id) == 0, "machine_id round-trips");
         check(read.source_uid == 1000, "source_uid round-trips");
+        check(read.has_self_binary == 1, "self-binary presence round-trips");
+        check(strcmp(read.arch, "x86_64") == 0,
+              "ARCH round-trips after source identity");
         check(read.root_count == 2, "root_count round-trips");
 
         if (read.root_count == 2)
@@ -204,11 +209,47 @@ static void test_no_source_identity(void)
     ManifestStatus st = manifest_read_v1(test_dir, &read);
     check(st == MANIFEST_STATUS_VALID, "reads back as VALID");
     check(read.has_source_identity == 0, "absent identity round-trips as absent");
+    check(read.has_self_binary == 0,
+          "a manifest without ARCH remains valid and has no self binary");
     check(read.representation == CLONE_PORTABLE_SIDECAR, "portable representation round-trips");
     check(read.sidecar_version == 1, "non-zero sidecar_version round-trips");
     check(read.root_count == 0 && read.roots == NULL, "zero roots leaves roots NULL");
     manifest_free(&read);
     manifest_free(&read); // second call on an already-freed Manifest must not crash
+
+    remove_manifest(test_dir);
+}
+
+static void test_self_arch_without_source_identity(void)
+{
+    printf(BLUE "::" NC " versioned manifest: ARCH without source identity\n");
+
+    Manifest m;
+    memset(&m, 0, sizeof(m));
+    m.version = MANIFEST_CURRENT_VERSION;
+    m.representation = CLONE_NATIVE_TREE;
+    m.scope = MANIFEST_SCOPE_EXPLICIT;
+    m.sidecar_version = 0;
+    m.has_self_binary = 1;
+    strcpy(m.arch, "aarch64");
+
+    check(manifest_write_v1(test_dir, &m) == 0,
+          "a manifest can write ARCH without the optional source identity pair");
+
+    Manifest read;
+    ManifestStatus st = manifest_read_v1(test_dir, &read);
+    check(st == MANIFEST_STATUS_VALID,
+          "ARCH directly before ROOT_COUNT parses as VALID");
+    if (st == MANIFEST_STATUS_VALID)
+    {
+        check(read.has_source_identity == 0,
+              "ARCH does not imply source identity");
+        check(read.has_self_binary == 1 && strcmp(read.arch, "aarch64") == 0,
+              "ARCH round-trips without source identity");
+        check(read.root_count == 0,
+              "ROOT_COUNT remains aligned after optional ARCH lookahead");
+        manifest_free(&read);
+    }
 
     remove_manifest(test_dir);
 }
@@ -434,6 +475,25 @@ static void test_malformed_variants(void)
         Manifest m;
         check(manifest_read_v1(test_dir, &m) == MANIFEST_STATUS_MALFORMED,
               "MACHINE_ID without a paired SOURCE_UID");
+        remove_manifest(test_dir);
+    }
+
+    // ARCH is optional, but when present it must be one of the architectures
+    // the bundled-binary probe can report.
+    {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/manifest.txt", test_dir);
+        write_raw(path,
+            "MIGR_MANIFEST\n"
+            "VERSION=1\n"
+            "REPRESENTATION=native\n"
+            "SCOPE=critical\n"
+            "SIDECAR_VERSION=0\n"
+            "ARCH=mips64\n"
+            "ROOT_COUNT=0\n");
+        Manifest m;
+        check(manifest_read_v1(test_dir, &m) == MANIFEST_STATUS_MALFORMED,
+              "an unsupported ARCH value is malformed, not silently skipped");
         remove_manifest(test_dir);
     }
 
@@ -728,6 +788,21 @@ static void test_write_rejects_inconsistent_input(void)
         remove_manifest(test_dir);
     }
 
+    // A caller cannot claim to carry a self binary with an architecture the
+    // reader would later reject.
+    {
+        Manifest bad_arch;
+        memset(&bad_arch, 0, sizeof(bad_arch));
+        bad_arch.version = MANIFEST_CURRENT_VERSION;
+        bad_arch.representation = CLONE_NATIVE_TREE;
+        bad_arch.scope = MANIFEST_SCOPE_CRITICAL;
+        bad_arch.has_self_binary = 1;
+        strcpy(bad_arch.arch, "mips64");
+        check(manifest_write_v1(test_dir, &bad_arch) != 0,
+              "an unsupported self-binary architecture is refused by the writer");
+        remove_manifest(test_dir);
+    }
+
     // The strongest form of "validate before touching the file": a valid,
     // pre-existing manifest.txt must survive byte-for-byte when a later
     // write attempt with an invalid model is refused -- fopen(..., "w")
@@ -796,6 +871,33 @@ static void fill_reference_manifest(Manifest *m, ManifestRoot *roots)
 
     m->root_count = 2;
     m->roots = roots;
+}
+
+static void test_resume_identity_includes_self_binary(void)
+{
+    printf(BLUE "::" NC " versioned manifest: resume identity includes bundled migr\n");
+
+    Manifest a, b;
+    ManifestRoot a_roots[2], b_roots[2];
+    fill_reference_manifest(&a, a_roots);
+    fill_reference_manifest(&b, b_roots);
+
+    check(manifest_resume_identity_compare(&a, &b) == MANIFEST_IDENTITY_EQUAL,
+          "otherwise identical manifests have equal resume identity");
+
+    a.has_self_binary = 1;
+    strcpy(a.arch, "x86_64");
+    check(manifest_resume_identity_compare(&a, &b) == MANIFEST_IDENTITY_DIFFERENT,
+          "a partial without a bundled migr cannot resume an include-self backup");
+
+    b.has_self_binary = 1;
+    strcpy(b.arch, "aarch64");
+    check(manifest_resume_identity_compare(&a, &b) == MANIFEST_IDENTITY_DIFFERENT,
+          "a bundled migr with a different architecture changes resume identity");
+
+    strcpy(b.arch, "x86_64");
+    check(manifest_resume_identity_compare(&a, &b) == MANIFEST_IDENTITY_EQUAL,
+          "matching bundled-migr state preserves resume identity");
 }
 
 static void test_fd_writer(void)
@@ -875,6 +977,7 @@ int main(void)
     test_missing();
     test_full_roundtrip_with_problem_bytes();
     test_no_source_identity();
+    test_self_arch_without_source_identity();
     test_legacy_detection();
     test_legacy_read_strdup_failure();
     test_unknown_version();
@@ -883,6 +986,7 @@ int main(void)
     test_decode_overflow_is_refused();
     test_io_error();
     test_write_rejects_inconsistent_input();
+    test_resume_identity_includes_self_binary();
     test_fd_writer();
 
     rmdir(test_dir);

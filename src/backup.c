@@ -24,6 +24,7 @@
 #include "metadata.h"
 #include "packages.h"
 #include "portable.h"
+#include "selfcopy.h"
 #include "utils.h"
 
 #ifdef BACKUP_TEST_HOOKS
@@ -262,6 +263,126 @@ static int backup_representation_preflight(int dest_fd, const char *target,
     if (refusal != NULL)
     {
         print_error("Error: %s %s\n", refusal, target);
+        return -1;
+    }
+    return 0;
+}
+
+static int probe_self_binary(int *out_fd, char *arch, size_t arch_size)
+{
+    MigrStaticStatus status = migr_static_probe(out_fd, arch, arch_size);
+    switch (status)
+    {
+        case MIGR_STATIC_OK:
+            return 0;
+        case MIGR_STATIC_NOT_FOUND:
+            print_error("Error: --include-self could not find migr-static beside "
+                        "the running executable; build it with 'make migr-static'.\n");
+            break;
+        case MIGR_STATIC_NOT_ELF:
+            print_error("Error: migr-static beside the running executable is not "
+                        "a usable 64-bit little-endian ELF binary.\n");
+            break;
+        case MIGR_STATIC_NOT_STATIC:
+            print_error("Error: migr-static was found but is dynamically linked; "
+                        "it would not be portable to another system.\n");
+            break;
+        case MIGR_STATIC_UNKNOWN_ARCH:
+            print_error("Error: migr-static has an unsupported architecture and "
+                        "cannot be included in the backup.\n");
+            break;
+        case MIGR_STATIC_IO_ERROR:
+            print_error("Error: could not inspect migr-static for --include-self: %s\n",
+                        strerror(errno));
+            break;
+    }
+    return -1;
+}
+
+static void manifest_set_self_binary(Manifest *manifest, const char *arch)
+{
+    manifest->has_self_binary = 1;
+    memcpy(manifest->arch, arch, strlen(arch) + 1);
+}
+
+static int self_binary_clear_at(int container_fd)
+{
+    if (unlinkat(container_fd, "migr", 0) == 0 || errno == ENOENT)
+        return 0;
+    if ((errno == EISDIR || errno == EPERM) &&
+        unlinkat(container_fd, "migr", AT_REMOVEDIR) == 0)
+        return 0;
+    return -1;
+}
+
+static int copy_self_binary_at(int container_fd, int source_fd,
+                               CloneRepresentation repr)
+{
+    if (container_fd < 0 || source_fd < 0)
+        return -1;
+    if (self_binary_clear_at(container_fd) != 0)
+        return -1;
+    if (lseek(source_fd, 0, SEEK_SET) != 0)
+        return -1;
+
+    int dest_fd = openat(container_fd, "migr",
+                         O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                         0755);
+    if (dest_fd < 0)
+        return -1;
+
+    int failed = 0;
+    struct stat st;
+    if (fstat(dest_fd, &st) != 0 || !S_ISREG(st.st_mode))
+        failed = 1;
+
+    unsigned char buffer[64 * 1024];
+    while (!failed)
+    {
+        ssize_t n = read(source_fd, buffer, sizeof(buffer));
+        if (n < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            failed = 1;
+            break;
+        }
+        if (n == 0)
+            break;
+
+        size_t written = 0;
+        while (written < (size_t)n)
+        {
+            ssize_t w = write(dest_fd, buffer + written,
+                              (size_t)n - written);
+            if (w < 0)
+            {
+                if (errno == EINTR)
+                    continue;
+                failed = 1;
+                break;
+            }
+            if (w == 0)
+            {
+                errno = EIO;
+                failed = 1;
+                break;
+            }
+            written += (size_t)w;
+        }
+    }
+
+    if (!failed && fchmod(dest_fd, 0755) != 0 &&
+        repr == CLONE_NATIVE_TREE)
+        failed = 1;
+    if (close(dest_fd) != 0)
+        failed = 1;
+
+    if (failed)
+    {
+        int saved_errno = errno;
+        (void)self_binary_clear_at(container_fd);
+        errno = saved_errno;
         return -1;
     }
     return 0;
@@ -1006,7 +1127,8 @@ static int backup_metadata_preflight(const BackupPlan *plan, int anchor_fd,
 }
 
 static int backup_dry_run(const char *target, BackupMode mode,
-                          BackupPlan *plan)
+                          BackupPlan *plan, int include_self,
+                          const char *self_arch)
 {
     off_t estimated_size = 0;
     int estimate_had_error = 0;
@@ -1188,6 +1310,9 @@ static int backup_dry_run(const char *target, BackupMode mode,
     printf("  Would write manifest.txt\n");
     if (mode != BACKUP_EXPLICIT_PATHS)
         printf("  Would export package list to packages.txt\n");
+    if (include_self)
+        printf("  Would copy migr-static (%s) to the container root as migr\n",
+               self_arch);
 
     printf("\n");
     char item_phrase[64];
@@ -1201,7 +1326,7 @@ static int backup_dry_run(const char *target, BackupMode mode,
 
 /* ------------------------------------------------------------------------- */
 
-int backup(const char *target, BackupMode mode, char **paths)
+int backup(const char *target, BackupMode mode, char **paths, int include_self)
 {
     char *home = getenv("HOME");
     if (home == NULL)
@@ -1227,6 +1352,15 @@ int backup(const char *target, BackupMode mode, char **paths)
         return 1;
     }
 
+    int self_fd = -1;
+    char self_arch[MIGR_ARCH_MAX] = {0};
+    if (include_self &&
+        probe_self_binary(&self_fd, self_arch, sizeof(self_arch)) != 0)
+    {
+        backup_plan_free(&plan);
+        return 1;
+    }
+
     off_t estimated_size = 0;
     int estimate_had_error = 0;
     off_t raw_estimated_size = 0;
@@ -1235,14 +1369,22 @@ int backup(const char *target, BackupMode mode, char **paths)
     int count = 0;
 
     if (dry_run)
-        return backup_dry_run(target, mode, &plan);
+    {
+        if (self_fd >= 0)
+            close(self_fd);
+        return backup_dry_run(target, mode, &plan, include_self, self_arch);
+    }
 
     Manifest manifest;
     if (manifest_from_plan(&plan, &manifest) != 0)
     {
+        if (self_fd >= 0)
+            close(self_fd);
         backup_plan_free(&plan);
         return 1;
     }
+    if (include_self)
+        manifest_set_self_binary(&manifest, self_arch);
 
     // Hoisted so both cleanup epilogues can release every resource
     // unconditionally: each handle is inert until its corresponding operation
@@ -1333,6 +1475,8 @@ int backup(const char *target, BackupMode mode, char **paths)
                        "conflict at %s; no container was created\n", target);
             goto fail_pre_container;
         }
+        if (include_self)
+            manifest_set_self_binary(&prepared.manifest, self_arch);
     }
     const Manifest *identity_manifest = repr == CLONE_PORTABLE_SIDECAR
         ? &prepared.manifest : &manifest;
@@ -1590,6 +1734,30 @@ int backup(const char *target, BackupMode mode, char **paths)
                 print_warning("  Warning: no package list was written for this backup.\n");
             }
         }
+
+        if (!had_error)
+        {
+            if (include_self)
+            {
+                if (copy_self_binary_at(container_fd, self_fd, repr) != 0)
+                {
+                    print_error("Error: could not copy the bundled migr binary into "
+                                "the backup container: %s\n", strerror(errno));
+                    had_error = 1;
+                }
+                else
+                {
+                    close(self_fd);
+                    self_fd = -1;
+                }
+            }
+            else if (self_binary_clear_at(container_fd) != 0)
+            {
+                print_error("Error: could not clear a stale bundled migr binary "
+                            "from the backup container\n");
+                had_error = 1;
+            }
+        }
     }
 
     printf("\n");
@@ -1635,9 +1803,18 @@ int backup(const char *target, BackupMode mode, char **paths)
                              "copied");
     print_success("Backup complete: %s\n", item_phrase);
     printf("Location: %s/%s\n", target, container_current_name(&container));
+    if (include_self && repr == CLONE_PORTABLE_SIDECAR)
+    {
+        printf("\nThis backup includes a copy of migr (%s). The destination "
+               "filesystem cannot preserve its executable bit.\n"
+               "On the new system, enter the backup directory and run:\n\n"
+               "  chmod +x migr\n", self_arch);
+    }
     finish_result = 0;
 
 finish:
+    if (self_fd >= 0)
+        close(self_fd);
     container_close(&container);
     metadata_profiles_free(&metadata_profiles);
     portable_prepared_capture_free(&prepared);
@@ -1647,6 +1824,8 @@ finish:
     return finish_result;
 
 fail_pre_container:
+    if (self_fd >= 0)
+        close(self_fd);
     container_close(&container);
     metadata_profiles_free(&metadata_profiles);
     portable_prepared_capture_free(&prepared);

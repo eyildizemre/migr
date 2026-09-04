@@ -5,6 +5,7 @@
 #include <sys/types.h> /* uid_t */
 
 #include "fileops.h" /* CloneRepresentation */
+#include "selfcopy.h" /* MIGR_ARCH_MAX */
 
 /**
  * @brief Legacy manifest: an unversioned "KEY=value" file recording only XDG
@@ -120,12 +121,13 @@ typedef struct {
 
 /**
  * @brief The versioned manifest: format identity, representation/scope, optional
- * resume identity, and the full root table.
+ * source identity and bundled-binary architecture, and the full root table.
  *
  * roots is a heap array owned by this struct; manifest_free() releases it.
  * has_source_identity is set only when both machine_id and source_uid are
  * available (docs/DECISIONS.md D15) — one without the other is not adopted as
- * a partial identity.
+ * a partial identity. has_self_binary means arch describes the static migr
+ * stored at the container root (docs/DECISIONS.md D9).
  */
 typedef struct {
     int version;
@@ -135,6 +137,8 @@ typedef struct {
     int has_source_identity;
     char machine_id[MANIFEST_MACHINE_ID_MAX];
     uid_t source_uid;
+    int has_self_binary;
+    char arch[MIGR_ARCH_MAX];
     int root_count;
     ManifestRoot *roots;
 } Manifest;
@@ -208,12 +212,13 @@ typedef enum {
  * @brief Compares two manifests' full resume identity (docs/DECISIONS.md D15).
  *
  * Two manifests are the same resumable job only if version, representation,
- * scope, sidecar_version, and source identity (machine_id + source_uid, both
- * present on both sides) all match exactly, and their root tables carry the
- * same set of roots -- compared by identity fields (id, policy, payload_path,
- * source_path, and restore_path/has_restore_path), independent of on-disk or
- * in-memory order. A timestamp or scope label alone is never sufficient
- * (docs/DECISIONS.md D15); this is the one function that decides the question.
+ * scope, sidecar_version, source identity (machine_id + source_uid, both
+ * present on both sides), and bundled-binary presence/architecture all match
+ * exactly, and their root tables carry the same set of roots -- compared by
+ * identity fields (id, policy, payload_path, source_path, and
+ * restore_path/has_restore_path), independent of on-disk or in-memory order.
+ * A timestamp or scope label alone is never sufficient (docs/DECISIONS.md D15);
+ * this is the one function that decides the question.
  *
  * @return MANIFEST_IDENTITY_EQUAL or MANIFEST_IDENTITY_DIFFERENT for any
  *         well-formed comparison (including when either side lacks a source

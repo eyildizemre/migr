@@ -72,6 +72,7 @@ int main(int argc, char *argv[])
         {"comprehensive",  no_argument,       NULL, 'C'},
         {"summary",        no_argument,       NULL, 's'},
         {"max-depth",      required_argument, NULL, 'd'},
+        {"include-self",   no_argument,       NULL, 'I'},
         {NULL,             0,                 NULL,  0 }
     };
 
@@ -101,6 +102,7 @@ int main(int argc, char *argv[])
     int mode_flag_given = 0;
     int summary_flag = 0;
     int max_depth_given = 0;
+    int include_self = 0;
 
     // Parse options only. optind was set above to skip the command word, or left
     // at 1 when no command was given (e.g. `migr --help`). getopt_long permutes
@@ -142,6 +144,9 @@ int main(int argc, char *argv[])
             }
             max_depth_given = 1;
             verbose = 1;
+            break;
+        case 'I':
+            include_self = 1;
             break;
         case '?':
         default:
@@ -205,6 +210,11 @@ int main(int argc, char *argv[])
         print_error("Error: --dry-run applies only to 'backup' or 'restore'.\n");
         return 1;
     }
+    if (include_self && action != ACTION_BACKUP)
+    {
+        print_error("Error: --include-self applies only to 'backup'.\n");
+        return 1;
+    }
     if (path != NULL && (action == ACTION_REPORT || action == ACTION_NONE))
     {
         print_error("Error: 'report' takes no arguments.\n");
@@ -230,7 +240,7 @@ int main(int argc, char *argv[])
                 ret = 1;
                 break;
             }
-            ret = backup(path, mode, user_paths);
+            ret = backup(path, mode, user_paths, include_self);
             break;
         case ACTION_RESTORE:
             if (path == NULL)

@@ -16,6 +16,7 @@
 
 #define _GNU_SOURCE
 #include <dirent.h>
+#include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <ftw.h>
@@ -1094,8 +1095,9 @@ static void test_root_count_ceiling_is_enforced(void)
 /* Production integration (backup())                                        */
 /* ========================================================================= */
 
-static int run_backup_capturing(const char *target, BackupMode mode, char *const *paths,
-                                char *output, size_t output_size)
+static int run_backup_capturing_with_self(const char *target, BackupMode mode,
+                                          char *const *paths, int include_self,
+                                          char *output, size_t output_size)
 {
     int pipefd[2];
     if (pipe(pipefd) != 0)
@@ -1123,7 +1125,7 @@ static int run_backup_capturing(const char *target, BackupMode mode, char *const
             dup2(pipefd[1], STDERR_FILENO) < 0)
             _exit(2);
         close(pipefd[1]);
-        int rc = backup(target, mode, (char **)paths);
+        int rc = backup(target, mode, (char **)paths, include_self);
         fflush(stdout);
         fflush(stderr);
         _exit(rc == 0 ? 0 : 1);
@@ -1141,6 +1143,14 @@ static int run_backup_capturing(const char *target, BackupMode mode, char *const
     int status = 0;
     waitpid(pid, &status, 0);
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+static int run_backup_capturing(const char *target, BackupMode mode,
+                                char *const *paths, char *output,
+                                size_t output_size)
+{
+    return run_backup_capturing_with_self(target, mode, paths, 0,
+                                          output, output_size);
 }
 
 typedef struct {
@@ -1224,7 +1234,7 @@ static int dir_exists(const char *path)
 // path, which is where every planned root's payload lands. A leftover
 // ".partial" is deliberately not accepted: a successful backup never leaves
 // one, so treating it as the result would mask exactly that failure.
-static int find_payload_dir(const char *target, char *out, size_t out_size)
+static int find_container_dir(const char *target, char *out, size_t out_size)
 {
     DIR *d = opendir(target);
     if (d == NULL)
@@ -1240,14 +1250,21 @@ static int find_payload_dir(const char *target, char *out, size_t out_size)
         if (len >= 8 && strcmp(e->d_name + len - 8, ".partial") == 0)
             continue;
 
-        char container[PATH_MAX];
-        join_path(container, sizeof(container), target, e->d_name);
-        join_path(out, out_size, container, "data");
+        join_path(out, out_size, target, e->d_name);
         found = 1;
         break;
     }
     closedir(d);
     return found;
+}
+
+static int find_payload_dir(const char *target, char *out, size_t out_size)
+{
+    char container[PATH_MAX];
+    if (!find_container_dir(target, container, sizeof(container)))
+        return 0;
+    join_path(out, out_size, container, "data");
+    return 1;
 }
 
 static int directory_empty(const char *path)
@@ -1269,6 +1286,108 @@ static int directory_empty(const char *path)
     }
     closedir(d);
     return empty;
+}
+
+static void write_exact_at(int fd, const void *buf, size_t size, off_t offset)
+{
+    const unsigned char *bytes = buf;
+    size_t done = 0;
+    while (done < size)
+    {
+        ssize_t n = pwrite(fd, bytes + done, size - done,
+                           offset + (off_t)done);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+        {
+            printf(RED "fixture: could not write static ELF sibling" NC "\n");
+            exit(1);
+        }
+        done += (size_t)n;
+    }
+}
+
+static void make_static_sibling_fixture(void)
+{
+    const char *path = "tests/migr-static";
+    if (unlink(path) != 0 && errno != ENOENT)
+    {
+        printf(RED "fixture: could not remove stale tests/migr-static" NC "\n");
+        exit(1);
+    }
+
+    int fd = open(path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0700);
+    if (fd < 0)
+    {
+        printf(RED "fixture: could not create tests/migr-static" NC "\n");
+        exit(1);
+    }
+
+    Elf64_Ehdr ehdr;
+    memset(&ehdr, 0, sizeof(ehdr));
+    memcpy(ehdr.e_ident, ELFMAG, SELFMAG);
+    ehdr.e_ident[EI_CLASS] = ELFCLASS64;
+    ehdr.e_ident[EI_DATA] = ELFDATA2LSB;
+    ehdr.e_ident[EI_VERSION] = EV_CURRENT;
+    ehdr.e_type = ET_EXEC;
+    ehdr.e_machine = EM_X86_64;
+    ehdr.e_version = EV_CURRENT;
+    ehdr.e_ehsize = sizeof(ehdr);
+    ehdr.e_phoff = sizeof(ehdr);
+    ehdr.e_phentsize = sizeof(Elf64_Phdr);
+    ehdr.e_phnum = 1;
+
+    Elf64_Phdr phdr;
+    memset(&phdr, 0, sizeof(phdr));
+    phdr.p_type = PT_LOAD;
+
+    write_exact_at(fd, &ehdr, sizeof(ehdr), 0);
+    write_exact_at(fd, &phdr, sizeof(phdr), (off_t)ehdr.e_phoff);
+    if (close(fd) != 0)
+    {
+        printf(RED "fixture: could not close tests/migr-static" NC "\n");
+        exit(1);
+    }
+}
+
+static int files_are_equal(const char *a_path, const char *b_path)
+{
+    int a = open(a_path, O_RDONLY | O_CLOEXEC);
+    int b = open(b_path, O_RDONLY | O_CLOEXEC);
+    if (a < 0 || b < 0)
+    {
+        if (a >= 0) close(a);
+        if (b >= 0) close(b);
+        return 0;
+    }
+
+    unsigned char a_buf[4096], b_buf[4096];
+    int equal = 1;
+    for (;;)
+    {
+        ssize_t an;
+        do { an = read(a, a_buf, sizeof(a_buf)); } while (an < 0 && errno == EINTR);
+        ssize_t bn;
+        do { bn = read(b, b_buf, sizeof(b_buf)); } while (bn < 0 && errno == EINTR);
+        if (an < 0 || bn < 0 || an != bn)
+        {
+            equal = 0;
+            break;
+        }
+        if (an == 0)
+            break;
+        if (memcmp(a_buf, b_buf, (size_t)an) != 0)
+        {
+            equal = 0;
+            break;
+        }
+    }
+
+    int a_close = close(a);
+    int b_close = close(b);
+    if (a_close != 0 || b_close != 0)
+        equal = 0;
+    return equal;
 }
 
 static void force_no_free_space(off_t needed, off_t *free_bytes, void *context)
@@ -1639,6 +1758,97 @@ static void test_destination_space_preflight(void)
     remove_tree(normal_live_target);
 }
 
+static void test_include_self_backup(void)
+{
+    printf(BLUE "::" NC " production: --include-self validates, copies, records, and dry-runs\n");
+
+    if (unlink("tests/migr-static") != 0 && errno != ENOENT)
+    {
+        printf(RED "fixture: could not remove tests/migr-static" NC "\n");
+        exit(1);
+    }
+
+    char home[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_self_home");
+    setenv("HOME", home, 1);
+    char source[PATH_MAX];
+    join_path(source, sizeof(source), home, "source.txt");
+    write_file(source, "self-copy payload");
+    char *paths[] = { source, NULL };
+
+    char target_parent[PATH_MAX];
+    fresh_mkdtemp(target_parent, sizeof(target_parent), "plan_self_target_parent");
+    char missing_target[PATH_MAX];
+    join_path(missing_target, sizeof(missing_target), target_parent, "missing-static");
+    dry_run = 0;
+    char missing_output[8192];
+    int missing_rc = run_backup_capturing_with_self(
+        missing_target, BACKUP_EXPLICIT_PATHS, paths, 1,
+        missing_output, sizeof(missing_output));
+    check(missing_rc == 1 && !dir_exists(missing_target),
+          "an absent migr-static fails before creating a destination container");
+    check(strstr(missing_output, "make migr-static") != NULL,
+          "the missing-static refusal tells the user how to build it");
+
+    make_static_sibling_fixture();
+
+    char live_target[PATH_MAX];
+    fresh_mkdtemp(live_target, sizeof(live_target), "plan_self_live");
+    char live_output[8192];
+    int live_rc = run_backup_capturing_with_self(
+        live_target, BACKUP_EXPLICIT_PATHS, paths, 1,
+        live_output, sizeof(live_output));
+    char container[PATH_MAX];
+    int have_container = find_container_dir(live_target, container,
+                                             sizeof(container));
+    check(live_rc == 0 && have_container,
+          "a valid static sibling produces a finalized include-self backup");
+
+    if (have_container)
+    {
+        char copied[PATH_MAX];
+        join_path(copied, sizeof(copied), container, "migr");
+        check(files_are_equal("tests/migr-static", copied),
+              "the container-root migr is byte-identical to the validated source binary");
+
+        Manifest manifest;
+        ManifestStatus status = manifest_read_v1(container, &manifest);
+        check(status == MANIFEST_STATUS_VALID,
+              "the include-self backup manifest remains valid");
+        if (status == MANIFEST_STATUS_VALID)
+        {
+            check(manifest.has_self_binary == 1 &&
+                      strcmp(manifest.arch, "x86_64") == 0,
+                  "the manifest records the copied binary architecture");
+            manifest_free(&manifest);
+        }
+    }
+
+    char dry_target[PATH_MAX];
+    fresh_mkdtemp(dry_target, sizeof(dry_target), "plan_self_dry");
+    dry_run = 1;
+    char dry_output[8192];
+    int dry_rc = run_backup_capturing_with_self(
+        dry_target, BACKUP_EXPLICIT_PATHS, paths, 1,
+        dry_output, sizeof(dry_output));
+    dry_run = 0;
+    check(dry_rc == 0 && directory_empty(dry_target),
+          "an include-self dry run writes nothing to the destination");
+    check(strstr(dry_output,
+                 "Would copy migr-static (x86_64) to the container root as migr") != NULL,
+          "the dry run reports the binary and architecture it would copy");
+
+    if (unlink("tests/migr-static") != 0 && errno != ENOENT)
+    {
+        printf(RED "fixture: could not remove tests/migr-static" NC "\n");
+        exit(1);
+    }
+    remove_tree(home);
+    remove_tree(target_parent);
+    remove_tree(live_target);
+    remove_tree(dry_target);
+}
+
 static void test_format_duration(void)
 {
     printf(BLUE "::" NC " utility: duration formatting for progress output\n");
@@ -1964,6 +2174,7 @@ int main(void)
 #endif
     test_allocation_aware_estimate();
     test_destination_space_preflight();
+    test_include_self_backup();
     test_format_duration();
     test_live_progress();
     test_missing_explicit_path_rejects_before_target_creation();
