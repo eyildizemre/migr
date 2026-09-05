@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
@@ -19,9 +20,30 @@
 #include "manifest.h"
 #include "metadata.h"
 #include "packages.h"
+#include "portable.h"
 #include "portable_restore.h"
 #include "utils.h"
 #include "xdg.h"
+
+#define NETWORK_CONFIG_DEST_DIR "/etc/NetworkManager/system-connections"
+
+#ifdef RESTORE_TEST_HOOKS
+static const char *restore_test_network_config_dest_dir;
+static RestoreTestNetworkReloadHook restore_test_network_reload_hook;
+static void *restore_test_network_reload_context;
+
+void restore_test_set_network_config_dest_dir(const char *dest_dir)
+{
+    restore_test_network_config_dest_dir = dest_dir;
+}
+
+void restore_test_set_network_reload_hook(RestoreTestNetworkReloadHook hook,
+                                          void *context)
+{
+    restore_test_network_reload_hook = hook;
+    restore_test_network_reload_context = context;
+}
+#endif
 
 // The canonical XDG key/fallback table (xdg.h) is shared by both restore
 // paths: legacy records them as "KEY=value" lines in an unversioned
@@ -41,6 +63,328 @@ static void free_xdg_dirs(char **dirs)
 {
     for (int i = 0; i < XDG_RESTORE_COUNT; i++)
         free(dirs[i]);
+}
+
+static const char *network_config_dest_dir(void)
+{
+#ifdef RESTORE_TEST_HOOKS
+    if (restore_test_network_config_dest_dir != NULL)
+        return restore_test_network_config_dest_dir;
+#endif
+    return NETWORK_CONFIG_DEST_DIR;
+}
+
+static int run_network_config_reload(void)
+{
+    char *const reload_argv[] = {
+        "sudo", "nmcli", "connection", "reload", NULL
+    };
+#ifdef RESTORE_TEST_HOOKS
+    if (restore_test_network_reload_hook != NULL)
+        return restore_test_network_reload_hook(
+            reload_argv, restore_test_network_reload_context);
+#endif
+    return run_command(reload_argv);
+}
+
+static int network_config_regular_count(DIR *dir, size_t *count)
+{
+    *count = 0;
+    int failed = 0;
+    struct dirent *entry;
+    for (;;)
+    {
+        errno = 0;
+        entry = readdir(dir);
+        if (entry == NULL)
+        {
+            if (errno != 0)
+            {
+                print_error("Error: Could not enumerate network/ in the backup\n");
+                failed = 1;
+            }
+            break;
+        }
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0)
+            continue;
+
+        struct stat st;
+        if (fstatat(dirfd(dir), entry->d_name, &st,
+                    AT_SYMLINK_NOFOLLOW) != 0)
+        {
+            print_error("Error: Could not inspect network/%s in the backup: %s\n",
+                        entry->d_name, strerror(errno));
+            failed = 1;
+            continue;
+        }
+        if (S_ISREG(st.st_mode))
+            (*count)++;
+    }
+    rewinddir(dir);
+    return failed ? -1 : 0;
+}
+
+static void report_network_config_unapplied(const char *dest_dir, int reason)
+{
+    printf("\nNetwork configuration\n");
+    printf("  Note: could not write saved network connections to %s (%s).\n"
+           "  The saved files are still in the backup's network/ directory. "
+           "To apply them manually, run as root:\n\n"
+           "    cp <backup>/network/* %s/\n"
+           "    chmod 600 %s/*\n"
+           "    nmcli connection reload\n",
+           dest_dir, strerror(reason), dest_dir, dest_dir);
+}
+
+// Returns 1 when a regular file was restored, 0 when the source entry was
+// deliberately skipped, and -1 on a per-file failure.
+static int restore_network_config_file_at(int network_fd, int dest_dir_fd,
+                                          const char *name)
+{
+    struct stat entry_st;
+    if (fstatat(network_fd, name, &entry_st, AT_SYMLINK_NOFOLLOW) != 0)
+        return -1;
+    if (!S_ISREG(entry_st.st_mode))
+        return 0;
+
+    int source_fd = openat(network_fd, name,
+                           O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
+    if (source_fd < 0)
+        return -1;
+
+    struct stat source_st;
+    if (fstat(source_fd, &source_st) != 0)
+    {
+        int saved_errno = errno;
+        close(source_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    if (!S_ISREG(source_st.st_mode))
+    {
+        close(source_fd);
+        return 0;
+    }
+
+    struct stat existing_st;
+    if (fstatat(dest_dir_fd, name, &existing_st, AT_SYMLINK_NOFOLLOW) == 0)
+    {
+        if (!S_ISREG(existing_st.st_mode))
+        {
+            close(source_fd);
+            errno = EEXIST;
+            return -1;
+        }
+    }
+    else if (errno != ENOENT)
+    {
+        int saved_errno = errno;
+        close(source_fd);
+        errno = saved_errno;
+        return -1;
+    }
+
+    mode_t source_mode = source_st.st_mode & 0777;
+    int dest_fd = openat(dest_dir_fd, name,
+                         O_WRONLY | O_CREAT | O_TRUNC | O_NONBLOCK |
+                         O_NOFOLLOW | O_CLOEXEC,
+                         source_mode);
+    if (dest_fd < 0)
+    {
+        int saved_errno = errno;
+        close(source_fd);
+        errno = saved_errno;
+        return -1;
+    }
+
+    struct stat dest_st;
+    int failed = 0;
+    int saved_errno = 0;
+    if (fstat(dest_fd, &dest_st) != 0)
+    {
+        saved_errno = errno;
+        failed = 1;
+    }
+    else if (!S_ISREG(dest_st.st_mode))
+    {
+        saved_errno = EINVAL;
+        failed = 1;
+    }
+    if (!failed &&
+        portable_copy_regular(source_fd, dest_fd, source_st.st_size, NULL) != 0)
+    {
+        saved_errno = errno;
+        failed = 1;
+    }
+    if (!failed && fchmod(dest_fd, source_mode) != 0)
+    {
+        saved_errno = errno;
+        failed = 1;
+    }
+    if (close(dest_fd) != 0 && !failed)
+    {
+        saved_errno = errno;
+        failed = 1;
+    }
+    if (close(source_fd) != 0 && !failed)
+    {
+        saved_errno = errno;
+        failed = 1;
+    }
+
+    if (failed)
+    {
+        errno = saved_errno != 0 ? saved_errno : EIO;
+        return -1;
+    }
+    return 1;
+}
+
+static void restore_network_config(int source_root_fd, int *had_error)
+{
+    int network_fd = openat(source_root_fd, "network",
+                            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (network_fd < 0)
+    {
+        if (errno == ENOENT)
+            print_error("Error: manifest declares network configuration, "
+                        "but network/ is missing from the backup\n");
+        else
+            print_error("Error: Could not read network/ in the backup: %s\n",
+                        strerror(errno));
+        *had_error = 1;
+        return;
+    }
+
+    DIR *dir = fdopendir(network_fd);
+    if (dir == NULL)
+    {
+        int saved_errno = errno;
+        close(network_fd);
+        print_error("Error: Could not enumerate network/ in the backup: %s\n",
+                    strerror(saved_errno));
+        *had_error = 1;
+        return;
+    }
+
+    size_t regular_count = 0;
+    if (network_config_regular_count(dir, &regular_count) != 0)
+    {
+        *had_error = 1;
+        if (closedir(dir) != 0)
+            *had_error = 1;
+        return;
+    }
+    if (regular_count == 0)
+    {
+        if (closedir(dir) != 0)
+            *had_error = 1;
+        return;
+    }
+
+    const char *dest_dir = network_config_dest_dir();
+    if (dry_run)
+    {
+        printf("\nNetwork configuration\n");
+        printf("  Would restore %zu network connection file%s to %s/\n",
+               regular_count, regular_count == 1 ? "" : "s", dest_dir);
+        if (closedir(dir) != 0)
+            *had_error = 1;
+        return;
+    }
+
+    int dest_created = 0;
+    if (mkdir(dest_dir, 0700) == 0)
+        dest_created = 1;
+    else if (errno != EEXIST)
+    {
+        int saved_errno = errno;
+        report_network_config_unapplied(dest_dir, saved_errno);
+        closedir(dir);
+        return;
+    }
+
+    int dest_dir_fd = open(dest_dir,
+                           O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (dest_dir_fd < 0)
+    {
+        int saved_errno = errno;
+        if (dest_created)
+            (void)rmdir(dest_dir);
+        report_network_config_unapplied(dest_dir, saved_errno);
+        closedir(dir);
+        return;
+    }
+    if (faccessat(dest_dir_fd, ".", W_OK | X_OK, AT_EACCESS) != 0)
+    {
+        int saved_errno = errno;
+        close(dest_dir_fd);
+        if (dest_created)
+            (void)rmdir(dest_dir);
+        report_network_config_unapplied(dest_dir, saved_errno);
+        closedir(dir);
+        return;
+    }
+
+    printf("\nNetwork configuration\n");
+    size_t restored = 0;
+    struct dirent *entry;
+    for (;;)
+    {
+        errno = 0;
+        entry = readdir(dir);
+        if (entry == NULL)
+        {
+            if (errno != 0)
+            {
+                print_error("Error: Could not enumerate network/ in the backup\n");
+                *had_error = 1;
+            }
+            break;
+        }
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0)
+            continue;
+
+        int file_result = restore_network_config_file_at(
+            dirfd(dir), dest_dir_fd, entry->d_name);
+        if (file_result < 0)
+        {
+            int saved_errno = errno;
+            print_error("Error: Could not restore network/%s: %s\n",
+                        entry->d_name, strerror(saved_errno));
+            *had_error = 1;
+            continue;
+        }
+        if (file_result > 0)
+            restored++;
+    }
+
+    if (close(dest_dir_fd) != 0)
+    {
+        print_error("Error: Could not close network configuration destination: %s\n",
+                    strerror(errno));
+        *had_error = 1;
+    }
+    if (closedir(dir) != 0)
+    {
+        print_error("Error: Could not close network/ in the backup: %s\n",
+                    strerror(errno));
+        *had_error = 1;
+    }
+
+    if (restored == 0)
+        return;
+
+    printf("  Restored %zu network connection file%s\n",
+           restored, restored == 1 ? "" : "s");
+    if (run_network_config_reload() != 0)
+    {
+        print_warning("Warning: restored network connection files, but "
+                      "'nmcli connection reload' did not succeed. Run it "
+                      "yourself, or restart NetworkManager, to apply them.\n");
+    }
 }
 
 typedef enum {
@@ -1447,7 +1791,12 @@ int restore(const char *source)
         {
             // Packages are published only after a fully successful replay.
             restore_packages(source_root_fd, home, &had_portable_error);
+            if (m.has_network_config)
+                restore_network_config(source_root_fd, &had_portable_error);
         }
+        else if (outcome == PORTABLE_RESTORE_DRY_RUN &&
+                 m.has_network_config)
+            restore_network_config(source_root_fd, &had_portable_error);
 
         if (progress_display.printed_anything)
         {
@@ -1466,7 +1815,7 @@ int restore(const char *source)
                 format_item_count_phrase(item_phrase, sizeof(item_phrase),
                                          report.applied_count, "restored");
                 if (had_portable_error)
-                    printf("Restore finished with errors: %s, packages step failed\n",
+                    printf("Restore finished with errors: %s, an optional restore step failed\n",
                            item_phrase);
                 else
                     print_success("Restore complete: %s\n", item_phrase);
@@ -1478,7 +1827,11 @@ int restore(const char *source)
                 format_item_count_phrase(item_phrase, sizeof(item_phrase),
                                          report.live_count,
                                          "would be restored");
-                printf("Dry run complete: %s\n", item_phrase);
+                if (had_portable_error)
+                    printf("Dry run finished with errors: %s, an optional restore step failed\n",
+                           item_phrase);
+                else
+                    printf("Dry run complete: %s\n", item_phrase);
                 break;
             }
             case PORTABLE_RESTORE_CANCELLED:
@@ -1646,6 +1999,8 @@ int restore(const char *source)
     ctx.inode_map = NULL;
 
     restore_packages(source_root_fd, home, &had_error);
+    if (mst == MANIFEST_STATUS_VALID && m.has_network_config)
+        restore_network_config(source_root_fd, &had_error);
 
     printf("\n");
     char item_phrase[64];
