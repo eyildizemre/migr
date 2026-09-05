@@ -46,6 +46,13 @@ static const RestoreNetworkConfigBackend RESTORE_NETWORK_CONFIG_BACKENDS[] = {
       NETWORK_CONFIG_APPLY_MANUAL, "sudo netplan apply" },
     { "systemd-networkd", "systemd-networkd", "/etc/systemd/network",
       NETWORK_CONFIG_APPLY_MANUAL, "sudo networkctl reload" },
+    { "wpa_supplicant", "wpa_supplicant", "/etc/wpa_supplicant",
+      NETWORK_CONFIG_APPLY_MANUAL,
+      "sudo systemctl restart wpa_supplicant@<interface> "
+      "(replace <interface> with your interface name)" },
+    { "netctl", "netctl", "/etc/netctl",
+      NETWORK_CONFIG_APPLY_MANUAL,
+      "sudo netctl restart <profile> (replace <profile> with your profile name)" },
 };
 
 #define NETWORK_CONFIG_BACKEND_COUNT \

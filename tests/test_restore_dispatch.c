@@ -15,6 +15,7 @@
 // never mask a reader bug -- see tests/test_manifest.c for the same split.
 
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <ftw.h>
@@ -187,6 +188,8 @@ static int run_restore_capturing_with_input(const char *source,
         perror("pipe");
         exit(1);
     }
+    fflush(stdout);
+    fflush(stderr);
     pid_t pid = fork();
     if (pid < 0)
     {
@@ -1140,27 +1143,35 @@ static void test_network_config_restore_requires_declared_directory(void)
     remove_tree(home);
 }
 
-static void test_network_config_backends(unsigned int mask, int blocked_netplan,
-                                         int broken_netplan, int preview)
+static void test_network_config_backends(unsigned int mask, int blocked_index,
+                                         int broken_index, int preview)
 {
     printf(BLUE "::" NC " network config: backend isolation (%u, %d, %d, %d)\n",
-           mask, blocked_netplan, broken_netplan, preview);
-    const char *names[] = { "NetworkManager", "netplan", "systemd-networkd" };
-    const char *subdirs[] = { "networkmanager", "netplan", "systemd-networkd" };
-    const char *files[] = { "wifi.nmconnection", "01-network.yaml", "10-wired.network" };
+           mask, blocked_index, broken_index, preview);
+    const char *names[] = { "NetworkManager", "netplan", "systemd-networkd",
+                            "wpa_supplicant", "netctl" };
+    const char *subdirs[] = { "networkmanager", "netplan", "systemd-networkd",
+                            "wpa_supplicant", "netctl" };
+    const char *files[] = { "wifi.nmconnection", "01-network.yaml", "10-wired.network",
+                            "wpa_supplicant-wlan0.conf", "home-wifi" };
     const char *contents[] = { "[connection]\nid=wifi\n", "network: {version: 2}\n",
-                               "[Match]\nName=eth0\n" };
+                               "[Match]\nName=eth0\n", "network={psk=\"fixture\"}\n",
+                               "Key=fixture\n" };
+    const size_t backend_count = sizeof(names) / sizeof(names[0]);
+    const char *hints[] = { NULL, "sudo netplan apply", "sudo networkctl reload",
+                           "sudo systemctl restart wpa_supplicant@<interface>",
+                           "sudo netctl restart <profile>" };
     char source[PATH_MAX], home[PATH_MAX], target[PATH_MAX];
     fresh_mkdtemp(source, sizeof(source), "backends_src");
     fresh_mkdtemp(home, sizeof(home), "backends_home");
     fresh_mkdtemp(target, sizeof(target), "backends_dest");
     setenv("HOME", home, 1);
     write_network_manifest(source);
-    char network[PATH_MAX], dest[3][PATH_MAX], marker[PATH_MAX];
+    char network[PATH_MAX], dest[sizeof(names) / sizeof(names[0])][PATH_MAX], marker[PATH_MAX];
     join_path(network, sizeof(network), source, "network");
     mkdir_p(network);
     join_path(marker, sizeof(marker), target, "reload.marker");
-    for (size_t i = 0; i < 3; i++)
+    for (size_t i = 0; i < backend_count; i++)
     {
         char backend[PATH_MAX], file[PATH_MAX];
         join_path(backend, sizeof(backend), network, subdirs[i]);
@@ -1168,7 +1179,7 @@ static void test_network_config_backends(unsigned int mask, int blocked_netplan,
         restore_test_set_network_config_dest_dir(names[i], dest[i]);
         if (!(mask & (1u << i)))
             continue;
-        if (i == 1 && broken_netplan)
+        if ((int)i == broken_index)
         {
             write_file_mode(backend, "not a directory", 0600);
             continue;
@@ -1176,7 +1187,7 @@ static void test_network_config_backends(unsigned int mask, int blocked_netplan,
         mkdir_p(backend);
         join_path(file, sizeof(file), backend, files[i]);
         write_file_mode(file, contents[i], 0600);
-        if (i == 1 && blocked_netplan)
+        if ((int)i == blocked_index)
         {
             mkdir_p(dest[i]);
             if (chmod(dest[i], 0500) != 0)
@@ -1190,46 +1201,57 @@ static void test_network_config_backends(unsigned int mask, int blocked_netplan,
     int rc = run_restore_capturing_with_input(source, "y\n", output, sizeof(output));
     dry_run = previous_dry_run;
     restore_test_set_network_reload_hook(NULL, NULL);
-    for (size_t i = 0; i < 3; i++)
+    for (size_t i = 0; i < backend_count; i++)
         restore_test_set_network_config_dest_dir(names[i], NULL);
-    check((rc != 0) == (mask == 0 || broken_netplan),
+    check((rc != 0) == (mask == 0 || broken_index >= 0),
           "only missing backends or corrupt sources fail restore");
-    for (size_t i = 0; i < 3; i++)
+    for (size_t i = 0; i < backend_count; i++)
     {
         char file[PATH_MAX];
         join_path(file, sizeof(file), dest[i], files[i]);
         int expected = (mask & (1u << i)) && !preview &&
-                       !(i == 1 && (blocked_netplan || broken_netplan));
+                       (int)i != blocked_index && (int)i != broken_index;
         check(expected ? file_matches(file, contents[i], 0600) : access(file, F_OK) != 0,
               "each backend restores only its own saved bytes and mode");
     }
-    if ((mask & 1u) && !preview)
+    if ((mask & 1u) && !preview && blocked_index != 0 && broken_index != 0)
         check(file_content_is(marker, "sudo\nnmcli\nconnection\nreload\n"),
               "only NetworkManager invokes the reload hook, exactly once");
     else
         check(access(marker, F_OK) != 0, "no automatic reload without live NetworkManager files");
-    if (!preview && (mask & 2u) && !broken_netplan)
-        check(strstr(output, "sudo netplan apply") != NULL &&
-              strstr(output, "interrupt network connectivity") != NULL,
-              "netplan explains manual apply and interruption risk");
-    if (!preview && (mask & 4u))
-        check(strstr(output, "sudo networkctl reload") != NULL &&
-              strstr(output, "interrupt network connectivity") != NULL,
-              "networkd explains manual reload and interruption risk");
-    if (blocked_netplan)
+    for (size_t i = 1; i < backend_count; i++)
     {
+        int should_hint = !preview && (mask & (1u << i)) && (int)i != broken_index;
+        check((strstr(output, hints[i]) != NULL) == should_hint,
+              "each manual backend emits its own hint only when applicable");
+        if (should_hint)
+            check(strstr(output, "interrupt network connectivity") != NULL,
+                  "manual apply explains the interruption risk");
+        if (should_hint && i >= 3)
+            check(strstr(output, i == 3 ? "replace <interface>" : "replace <profile>") != NULL,
+                  "manual restart identifies the value the user must substitute");
+    }
+    if (blocked_index >= 0)
+    {
+        char saved_path[128];
+        snprintf(saved_path, sizeof(saved_path), "network/%s/", subdirs[blocked_index]);
         check(strstr(output, "Note: could not write") != NULL &&
-              strstr(output, "network/netplan/") != NULL,
+              strstr(output, saved_path) != NULL,
               "unwritable backend identifies the saved source in an informational note");
-        if (chmod(dest[1], 0700) != 0)
+        if (chmod(dest[blocked_index], 0700) != 0)
             exit(1);
     }
-    if (broken_netplan)
-        check(strstr(output, "Could not read network/netplan/") != NULL,
-              "a corrupt backend source is identified while later backends succeed");
-    if (broken_netplan && mask == (1u << 1))
-        check(strstr(output, "none of the known backend directories were present") == NULL,
-              "a corrupt sole backend is not also reported as entirely missing");
+    if (broken_index >= 0)
+    {
+        char diagnostic[128];
+        snprintf(diagnostic, sizeof(diagnostic), "Could not read network/%s/",
+                 subdirs[broken_index]);
+        check(strstr(output, diagnostic) != NULL,
+              "a corrupt backend source is identified while healthy backends succeed");
+        if (mask == (1u << broken_index))
+            check(strstr(output, "none of the known backend directories were present") == NULL,
+                  "a corrupt sole backend is not also reported as entirely missing");
+    }
     if (mask == 0)
         check(strstr(output, "none of the known backend directories were present") != NULL &&
               strstr(output, "network/ is missing") == NULL,
@@ -1241,6 +1263,77 @@ static void test_network_config_backends(unsigned int mask, int blocked_netplan,
     remove_tree(source);
     remove_tree(home);
     remove_tree(target);
+}
+
+static void test_network_config_roundtrip(const char *backend_name,
+                                           const char *filename,
+                                           const char *hint)
+{
+    printf(BLUE "::" NC " network config: %s backup-to-restore round trip\n", backend_name);
+    const char *names[] = { "NetworkManager", "netplan", "systemd-networkd",
+                            "wpa_supplicant", "netctl" };
+    char home[PATH_MAX], target[PATH_MAX], restored_home[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "network_roundtrip_home");
+    fresh_mkdtemp(target, sizeof(target), "network_roundtrip_backup");
+    fresh_mkdtemp(restored_home, sizeof(restored_home), "network_roundtrip_restore");
+    char source_dir[PATH_MAX], source_file[PATH_MAX], payload[PATH_MAX], missing[PATH_MAX];
+    join_path(source_dir, sizeof(source_dir), home, "network-source");
+    mkdir_p(source_dir);
+    join_path(source_file, sizeof(source_file), source_dir, filename);
+    write_file_mode(source_file, "fixture network configuration\n", 0600);
+    join_path(payload, sizeof(payload), home, "payload");
+    write_file_mode(payload, "fixture payload\n", 0600);
+    join_path(missing, sizeof(missing), home, "absent-backend");
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+        backup_test_set_network_config_source_dir(
+            names[i], strcmp(names[i], backend_name) == 0 ? source_dir : missing);
+    setenv("HOME", home, 1);
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    char *paths[] = { payload, NULL };
+    int backup_rc = backup(target, BACKUP_EXPLICIT_PATHS, paths, 0, 1);
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+        backup_test_set_network_config_source_dir(names[i], NULL);
+
+    char container[PATH_MAX] = "";
+    DIR *dir = opendir(target);
+    if (dir == NULL)
+        exit(1);
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL)
+        if (strncmp(entry->d_name, "migr_backup_", 12) == 0 &&
+            strstr(entry->d_name, ".partial") == NULL)
+            join_path(container, sizeof(container), target, entry->d_name);
+    if (closedir(dir) != 0)
+        exit(1);
+    check(backup_rc == 0 && container[0] != '\0',
+          "production backup publishes a container for the sole backend");
+    if (backup_rc == 0 && container[0] != '\0')
+    {
+        char dest[PATH_MAX], restored[PATH_MAX], marker[PATH_MAX];
+        join_path(dest, sizeof(dest), restored_home, "network-destination");
+        join_path(restored, sizeof(restored), dest, filename);
+        join_path(marker, sizeof(marker), restored_home, "reload.marker");
+        setenv("HOME", restored_home, 1);
+        for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+            restore_test_set_network_config_dest_dir(names[i], dest);
+        restore_test_set_network_reload_hook(record_network_reload, marker);
+        char output[16384];
+        int rc = run_restore_capturing_with_input(container, "y\n", output, sizeof(output));
+        restore_test_set_network_reload_hook(NULL, NULL);
+        for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+            restore_test_set_network_config_dest_dir(names[i], NULL);
+        check(rc == 0 && file_matches(restored, "fixture network configuration\n", 0600),
+              "restore consumes the actual backup layout and preserves network bytes and mode");
+        check(strstr(output, hint) != NULL &&
+              strstr(output, "interrupt network connectivity") != NULL &&
+              access(marker, F_OK) != 0,
+              "the round trip provides manual apply guidance without invoking automatic reload");
+    }
+    dry_run = previous_dry_run;
+    remove_tree(home);
+    remove_tree(target);
+    remove_tree(restored_home);
 }
 
 int main(void)
@@ -1261,14 +1354,25 @@ int main(void)
     test_v1_restores_home_relative_and_xdg_reports_manual_native();
     test_v1_empty_restore_path_means_home_itself();
     test_v1_restore_space_preflight();
-    test_network_config_backends(2, 0, 0, 0);
-    test_network_config_backends(4, 0, 0, 0);
-    test_network_config_backends(7, 0, 0, 0);
-    test_network_config_backends(7, 1, 0, 0);
-    test_network_config_backends(7, 0, 1, 0);
-    test_network_config_backends(7, 0, 0, 1);
-    test_network_config_backends(0, 0, 0, 0);
-    test_network_config_backends(2, 0, 1, 0);
+    test_network_config_backends(2, -1, -1, 0);
+    test_network_config_backends(4, -1, -1, 0);
+    test_network_config_backends(7, -1, -1, 0);
+    test_network_config_backends(7, 1, -1, 0);
+    test_network_config_backends(7, -1, 1, 0);
+    test_network_config_backends(7, -1, -1, 1);
+    test_network_config_backends(0, -1, -1, 0);
+    test_network_config_backends(2, -1, 1, 0);
+    test_network_config_backends(8, -1, -1, 0);
+    test_network_config_backends(16, -1, -1, 0);
+    test_network_config_backends(8, -1, 3, 0);
+    test_network_config_backends(16, -1, 4, 0);
+    test_network_config_backends(31, -1, -1, 0);
+    test_network_config_backends(31, -1, -1, 1);
+    test_network_config_backends(31, 3, -1, 0);
+    test_network_config_backends(31, 4, -1, 0);
+    test_network_config_roundtrip("wpa_supplicant", "wpa_supplicant-wlan0.conf",
+                                  "sudo systemctl restart wpa_supplicant@<interface>");
+    test_network_config_roundtrip("netctl", "home-wifi", "sudo netctl restart <profile>");
     test_network_config_restore_success();
     test_network_config_restore_dry_run();
     test_network_config_reload_failure_is_best_effort();

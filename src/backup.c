@@ -32,13 +32,16 @@ typedef struct {
     const char *source_dir;
     const char *container_subdir;
     int may_contain_secrets;
+    const char *filename_suffix;
 } NetworkConfigBackend;
 
 static const NetworkConfigBackend NETWORK_CONFIG_BACKENDS[] = {
     { "NetworkManager", "/etc/NetworkManager/system-connections",
-      "networkmanager", 1 },
-    { "netplan", "/etc/netplan", "netplan", 1 },
-    { "systemd-networkd", "/etc/systemd/network", "systemd-networkd", 0 },
+      "networkmanager", 1, NULL },
+    { "netplan", "/etc/netplan", "netplan", 1, NULL },
+    { "systemd-networkd", "/etc/systemd/network", "systemd-networkd", 0, NULL },
+    { "wpa_supplicant", "/etc/wpa_supplicant", "wpa_supplicant", 1, ".conf" },
+    { "netctl", "/etc/netctl", "netctl", 1, NULL },
 };
 
 #define NETWORK_CONFIG_BACKEND_COUNT \
@@ -605,7 +608,7 @@ static int network_config_clear_at(int container_fd)
 }
 
 static int copy_network_config_file_at(int source_dir_fd, int network_fd,
-                                       const char *name,
+                                       const char *name, const char *filename_suffix,
                                        CloneRepresentation repr)
 {
     struct stat entry_st;
@@ -622,6 +625,19 @@ static int copy_network_config_file_at(int source_dir_fd, int network_fd,
         printf("  Note: skipping non-regular network configuration entry: %s\n",
                name);
         return 0;
+    }
+
+    if (filename_suffix != NULL)
+    {
+        size_t name_len = strlen(name);
+        size_t suffix_len = strlen(filename_suffix);
+        if (name_len < suffix_len ||
+            strcmp(name + name_len - suffix_len, filename_suffix) != 0)
+        {
+            printf("  Note: skipping non-configuration file in network configuration: %s\n",
+                   name);
+            return 0;
+        }
     }
 
     int source_fd = openat(source_dir_fd, name,
@@ -793,7 +809,8 @@ static int copy_network_config_backend_at(
             continue;
 
         if (copy_network_config_file_at(dirfd(dir), backend_fd,
-                                        entry->d_name, repr) != 0)
+                                        entry->d_name, backend->filename_suffix,
+                                        repr) != 0)
         {
             saved_errno = errno;
             print_error("Error: --include-network-config: could not copy %s/%s: %s\n",
@@ -920,7 +937,9 @@ static int network_config_mask_may_contain_secrets(unsigned int mask)
 static void print_network_config_none_found(void)
 {
     printf("  Note: --include-network-config found no network configuration "
-           "to back up (checked NetworkManager, netplan, systemd-networkd).\n");
+           "to back up (checked ");
+    print_network_config_backend_names((1u << NETWORK_CONFIG_BACKEND_COUNT) - 1u);
+    printf(").\n");
 }
 
 static void print_network_config_dry_run(unsigned int present_mask)

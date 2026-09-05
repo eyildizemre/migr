@@ -1893,6 +1893,9 @@ static void test_include_network_config_backup(void)
     join_path(missing_networkd, sizeof(missing_networkd), home,
               "missing-systemd-networkd");
 
+    backup_test_set_network_config_source_dir("wpa_supplicant", missing_nm);
+    backup_test_set_network_config_source_dir("netctl", missing_nm);
+
     char network_source[PATH_MAX];
     fresh_mkdtemp(network_source, sizeof(network_source), "plan_network_source");
     char wifi[PATH_MAX], vpn[PATH_MAX], link[PATH_MAX], fifo[PATH_MAX];
@@ -2056,7 +2059,7 @@ static void test_include_network_config_backup(void)
     }
     check(strstr(missing_output, "found no network configuration") != NULL &&
               strstr(missing_output,
-                     "NetworkManager, netplan, systemd-networkd") != NULL,
+                     "NetworkManager, netplan, systemd-networkd, wpa_supplicant and netctl") != NULL,
           "all-ENOENT completion reports that no supported backend was found");
 
     if (geteuid() != 0)
@@ -2257,6 +2260,126 @@ static void test_include_network_config_backup(void)
                  "Captured NetworkManager, netplan and systemd-networkd") != NULL,
           "completion enumerates every backend that was captured");
 
+    char wpa_source[PATH_MAX], netctl_source[PATH_MAX];
+    join_path(wpa_source, sizeof(wpa_source), home, "wpa_supplicant");
+    join_path(netctl_source, sizeof(netctl_source), home, "netctl");
+    mkdir_p(wpa_source);
+    mkdir_p(netctl_source);
+    char wpa_conf[PATH_MAX], wpa_iface_conf[PATH_MAX], netctl_profile[PATH_MAX];
+    join_path(wpa_conf, sizeof(wpa_conf), wpa_source, "wpa_supplicant.conf");
+    join_path(wpa_iface_conf, sizeof(wpa_iface_conf), wpa_source, "wpa_supplicant-wlan0.conf");
+    join_path(netctl_profile, sizeof(netctl_profile), netctl_source, "home-wifi");
+    write_file(wpa_conf, "network={psk=\"fixture-secret\"}\n");
+    write_file(wpa_iface_conf, "network={ssid=\"fixture\"}\n");
+    write_file(netctl_profile, "Interface=wlan0\nKey=fixture-secret\n");
+    const char *excluded[] = { "functions.sh", "a", "old.conf.bak" };
+    for (size_t i = 0; i < sizeof(excluded) / sizeof(excluded[0]); i++)
+    {
+        char helper[PATH_MAX];
+        join_path(helper, sizeof(helper), wpa_source, excluded[i]);
+        write_file(helper, "package helper");
+        if (chmod(helper, 0000) != 0)
+            exit(1);
+    }
+    char hooks[PATH_MAX], hook_file[PATH_MAX];
+    join_path(hooks, sizeof(hooks), netctl_source, "hooks");
+    mkdir_p(hooks);
+    join_path(hook_file, sizeof(hook_file), hooks, "helper");
+    write_file(hook_file, "hook body");
+
+    const char *backend_names[] = { "NetworkManager", "netplan", "systemd-networkd",
+                                    "wpa_supplicant", "netctl" };
+    const char *backend_subdirs[] = { "networkmanager", "netplan", "systemd-networkd",
+                                      "wpa_supplicant", "netctl" };
+    const char *backend_sources[] = { network_source, netplan_source, networkd_source,
+                                      wpa_source, netctl_source };
+    const char *backend_files[] = { "home.nmconnection", "00-installer-config.yaml",
+                                    "20-wired.network", "wpa_supplicant.conf", "home-wifi" };
+    const size_t backend_count = sizeof(backend_names) / sizeof(backend_names[0]);
+    for (size_t scenario = 3; scenario <= backend_count; scenario++)
+    {
+        for (size_t i = 0; i < backend_count; i++)
+            backup_test_set_network_config_source_dir(
+                backend_names[i], scenario == backend_count || scenario == i ?
+                backend_sources[i] : missing_nm);
+        char target[PATH_MAX], output[8192], captured[PATH_MAX];
+        fresh_mkdtemp(target, sizeof(target), "plan_network_extended");
+        int rc = run_backup_capturing_with_options(
+            target, BACKUP_EXPLICIT_PATHS, paths, 0, 1, output, sizeof(output));
+        int have_captured = find_container_dir(target, captured, sizeof(captured));
+        check(rc == 0 && have_captured, "new backends produce a finalized backup");
+        if (have_captured)
+        {
+            char network[PATH_MAX];
+            join_path(network, sizeof(network), captured, "network");
+            for (size_t i = 0; i < backend_count; i++)
+            {
+                char dir[PATH_MAX], copied[PATH_MAX], original[PATH_MAX];
+                join_path(dir, sizeof(dir), network, backend_subdirs[i]);
+                join_path(copied, sizeof(copied), dir, backend_files[i]);
+                join_path(original, sizeof(original), backend_sources[i], backend_files[i]);
+                if (scenario == backend_count || scenario == i)
+                    check(dir_exists(dir) && files_are_equal(original, copied),
+                          "each present backend gets its own directory and exact saved bytes");
+                else
+                    check(access(dir, F_OK) != 0,
+                          "absent backends do not acquire a captured directory");
+            }
+            if (scenario == 3 || scenario == backend_count)
+            {
+                char dir[PATH_MAX], copied[PATH_MAX];
+                join_path(dir, sizeof(dir), network, "wpa_supplicant");
+                join_path(copied, sizeof(copied), dir, "wpa_supplicant-wlan0.conf");
+                check(files_are_equal(wpa_iface_conf, copied),
+                      "interface-specific wpa_supplicant configuration is captured");
+                for (size_t i = 0; i < sizeof(excluded) / sizeof(excluded[0]); i++)
+                {
+                    join_path(copied, sizeof(copied), dir, excluded[i]);
+                    check(access(copied, F_OK) != 0,
+                          "non-conf files, including short names and backup suffixes, are excluded");
+                }
+                check(strstr(output, "skipping non-configuration file") != NULL,
+                      "wpa_supplicant reports excluded package helper files");
+            }
+            if (scenario == 4 || scenario == backend_count)
+            {
+                char copied_hooks[PATH_MAX];
+                join_path(copied_hooks, sizeof(copied_hooks), network, "netctl/hooks");
+                check(access(copied_hooks, F_OK) != 0 &&
+                      strstr(output, "skipping non-regular network configuration entry: hooks") != NULL,
+                      "netctl hooks are skipped as a directory rather than captured recursively");
+            }
+            Manifest manifest;
+            ManifestStatus status = manifest_read_v1(captured, &manifest);
+            check(status == MANIFEST_STATUS_VALID && manifest.has_network_config == 1,
+                  "new backend captures record NETWORK_CONFIG=1");
+            if (status == MANIFEST_STATUS_VALID)
+                manifest_free(&manifest);
+        }
+        check(strstr(output, "WiFi passwords") != NULL && strstr(output, "plain text") != NULL,
+              "both new backends warn that saved files may contain plaintext secrets");
+        if (scenario == backend_count)
+            check(strstr(output, "Captured NetworkManager, netplan, systemd-networkd, "
+                                "wpa_supplicant and netctl under ") != NULL,
+                  "five-backend completion uses commas and a final conjunction");
+        else
+        {
+            char expected[128];
+            snprintf(expected, sizeof(expected), "Captured %s under ", backend_names[scenario]);
+            check(strstr(output, expected) != NULL, "single-backend completion names only that backend");
+        }
+        remove_tree(target);
+    }
+    for (size_t i = 0; i < sizeof(excluded) / sizeof(excluded[0]); i++)
+    {
+        char helper[PATH_MAX];
+        join_path(helper, sizeof(helper), wpa_source, excluded[i]);
+        if (chmod(helper, 0600) != 0)
+            exit(1);
+    }
+    backup_test_set_network_config_source_dir("wpa_supplicant", missing_nm);
+    backup_test_set_network_config_source_dir("netctl", missing_nm);
+
     backup_test_set_network_config_source_dir("NetworkManager", network_source);
     backup_test_set_network_config_source_dir("netplan", missing_netplan);
     backup_test_set_network_config_source_dir("systemd-networkd",
@@ -2278,6 +2401,8 @@ static void test_include_network_config_backup(void)
     backup_test_set_network_config_source_dir("NetworkManager", NULL);
     backup_test_set_network_config_source_dir("netplan", NULL);
     backup_test_set_network_config_source_dir("systemd-networkd", NULL);
+    backup_test_set_network_config_source_dir("wpa_supplicant", NULL);
+    backup_test_set_network_config_source_dir("netctl", NULL);
     if (geteuid() != 0)
         chmod(denied_dir, 0700);
     remove_tree(home);
