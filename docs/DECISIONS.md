@@ -216,7 +216,7 @@ gives full fidelity with no encoding and no sidecar.
 
 ## D9 — 2026-07-19 — `--include-self` ships a separate static binary
 
-**Status:** Decided — not yet implemented
+**Status:** Implemented
 
 **Decision:** Packaging produces two binaries: the dynamically-linked
 `/usr/bin/migr` for daily use, and a static build shipped inside the same package
@@ -238,8 +238,15 @@ cost of shipping both is a few hundred kilobytes.
 - Static glibc breaks NSS functions (`getpwnam`, `getpwuid`). Not currently an
   issue — only `getenv("HOME")` is used. An NSS fallback would require building the
   static binary with musl instead.
-- The exec bit is lost on FAT/NTFS destinations, so restore instructions must
-  include `chmod +x migr`. Not fixable from inside the tool.
+- FAT32 destinations record no Unix permission bits; they synthesise a mode from
+  mount options. NTFS permission handling depends on the driver and mount options.
+  Measured on Arch, Ubuntu 26.04 and Fedora 44 (2026-09-05, FAT32 loopback): a
+  default mount reports 0755 and the copy runs in place, while `fmask=0177` or
+  `noexec` leaves it unrunnable and `chmod +x` there returns success without
+  changing anything. Restore instructions must therefore say to copy the binary
+  to a filesystem that supports Unix permissions and permits execution before
+  making it executable; `chmod +x migr` in place on those vfat mounts is either
+  unnecessary or silently useless. Not fixable from inside the tool.
 - The manifest must record the architecture, so an x86_64 binary restored on ARM
   fails with an explanation rather than `cannot execute binary file`.
 

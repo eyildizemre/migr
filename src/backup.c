@@ -1806,9 +1806,10 @@ int backup(const char *target, BackupMode mode, char **paths, int include_self)
     if (include_self && repr == CLONE_PORTABLE_SIDECAR)
     {
         printf("\nThis backup includes a copy of migr (%s). The destination "
-               "filesystem cannot preserve its executable bit.\n"
-               "On the new system, enter the backup directory and run:\n\n"
-               "  chmod +x migr\n", self_arch);
+               "filesystem does not record permissions.\n"
+               "The copy may not run directly from the drive. On the new "
+               "system, enter the backup directory and run:\n\n"
+               "  cp migr ~/migr && chmod +x ~/migr\n", self_arch);
     }
     finish_result = 0;
 

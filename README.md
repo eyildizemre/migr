@@ -168,9 +168,13 @@ backups remain readable through an isolated legacy restore path.
 
 `--include-self` copies the validated `migr-static` binary into the container root as
 `migr`, so the backup carries a standalone migr executable with it. Native Linux
-filesystems preserve its executable bit. Portable filesystems such as exFAT, NTFS,
-and FAT32 may not, so on the target Linux system enter the backup directory and run
-`chmod +x migr` before executing it. The recorded `ARCH` value lets you check that
+filesystems preserve its executable bit. FAT32 and exFAT derive Unix permission
+bits from mount options; NTFS behaviour depends on the driver and mount options.
+The copy may or may not be runnable in place, and on mounts with fixed permission
+bits, `chmod +x` can report success without making it executable. If the copy will
+not run from the drive, enter the backup directory on the target system and copy
+it to a filesystem that supports Unix permissions and permits execution first:
+`cp migr ~/migr && chmod +x ~/migr`. The recorded `ARCH` value lets you check that
 the bundled binary matches the target machine's architecture.
 
 Explicit paths keep accepting valid sources both inside and outside `$HOME`. A root
