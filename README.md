@@ -322,13 +322,13 @@ a test-only entry point.
 
 ## Report
 
-Running `migr` or `migr report` without a scope preserves the legacy analysis
-view: main directories, dotfiles, developer tools, browsers, and a critical
-backup estimate. Add `--critical` or `--comprehensive` to make the report use
-the same live root plan as backup, so its sections and total describe exactly
-what that scope would capture. With `-s`/`--summary`, only the selected scope's
-total is printed on one line for scripting; without an explicit scope, summary
-uses the critical scope.
+Running `migr` or `migr report` reports the critical backup scope. Every report
+uses the same live root plan as backup; `--critical` selects the default explicitly,
+and `--comprehensive` selects the wider scope. Sections show only roots included
+in that scope, including browser profiles and `.profile` in critical backups.
+Totals measure logical source sizes, not destination allocation or container
+metadata overhead. With `-s`/`--summary`, only the selected scope's total is printed
+on one line for scripting.
 
 With `-v`/`--verbose`, each item includes its full source path and directories
 below it are listed with their own recursive totals. Bare `-v` lists one level

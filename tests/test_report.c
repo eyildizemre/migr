@@ -142,7 +142,7 @@ static void test_plain_report_detects_readdir_failure(void)
         if (dup2(fileno(sink), STDOUT_FILENO) >= 0)
         {
             ReportDepth depth = { REPORT_DEPTH_DEFAULT, 0 };
-            report_result = report(BACKUP_CRITICAL, 0, 0, depth);
+            report_result = report(BACKUP_CRITICAL, 0, depth);
             fflush(stdout);
             dup2(saved_stdout, STDOUT_FILENO);
             if (fseek(sink, 0, SEEK_SET) == 0)

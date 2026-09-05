@@ -215,10 +215,10 @@ test_report() {
 
     local output default_output bare_output critical_output comprehensive_output
     local critical_summary implicit_summary comprehensive_summary without_profile
-    local critical_verbose comprehensive_verbose legacy_verbose summary_verbose
+    local critical_verbose comprehensive_verbose default_verbose summary_verbose
     local depth_zero depth_two depth_root summary_depth
-    local critical_root_count comprehensive_root_count legacy_root_count
-    local raw_status_calls captured_output
+    local critical_root_count comprehensive_root_count default_root_count
+    local raw_status_calls captured_output default_total without_browser
     output=$(../migr report)
 
     raw_status_calls=$(grep -nE 'printf\("Error: |printf\("Warning: ' \
@@ -247,8 +247,7 @@ test_report() {
     assert_contains "$output" ".ssh"
     assert_contains "$output" "Documents"
 
-    # The no-command and explicit report forms were both the legacy default
-    # before scoped reporting existed. Keep their complete output byte-identical.
+    # Default entry points must select the same roots and presentation as critical.
     default_output="$output"
     bare_output=$(../migr)
     if [ "$default_output" = "$bare_output" ]; then
@@ -257,10 +256,14 @@ test_report() {
         echo -e "  ${RED}✗${NC} No-flag report output changed between default entry points."
         exit 1
     fi
-    assert_contains "$default_output" \
-        "(Documents, Downloads, Pictures, .ssh, .gnupg, .gitconfig, .bashrc)"
 
     critical_output=$(../migr report --critical)
+    if [ "$default_output" != "$critical_output" ]; then
+        echo -e "  ${RED}✗${NC} Default report differs from explicit critical report."
+        exit 1
+    fi
+    assert_not_contains "$default_output" "Projects"
+    assert_not_contains "$default_output" "Desktop"
     assert_contains "$critical_output" "Dotfiles & Config"
     assert_contains "$critical_output" ".profile"
     assert_contains "$critical_output" "Firefox"
@@ -305,15 +308,19 @@ test_report() {
         echo -e "  ${RED}✗${NC} Comprehensive verbose printed the Documents root $comprehensive_root_count times."
         exit 1
     fi
-    legacy_verbose=$(../migr report -v)
-    assert_contains "$legacy_verbose" "($HOME/Documents)"
-    assert_contains "$legacy_verbose" "($depth_root)"
-    assert_not_contains "$legacy_verbose" "Measuring:"
-    legacy_root_count=$(grep -F -c "($HOME/Documents)" <<<"$legacy_verbose" || true)
-    if [ "$legacy_root_count" -eq 1 ]; then
-        echo -e "  ${GREEN}✓${NC} Legacy verbose keeps one enriched line per root."
+    default_verbose=$(../migr report -v)
+    if [ "$default_verbose" != "$critical_verbose" ]; then
+        echo -e "  ${RED}✗${NC} Default verbose report differs from explicit critical report."
+        exit 1
+    fi
+    assert_contains "$default_verbose" "($HOME/Documents)"
+    assert_contains "$default_verbose" "($depth_root)"
+    assert_not_contains "$default_verbose" "Measuring:"
+    default_root_count=$(grep -F -c "($HOME/Documents)" <<<"$default_verbose" || true)
+    if [ "$default_root_count" -eq 1 ]; then
+        echo -e "  ${GREEN}✓${NC} Default verbose keeps one enriched line per root."
     else
-        echo -e "  ${RED}✗${NC} Legacy verbose printed the Documents root $legacy_root_count times."
+        echo -e "  ${RED}✗${NC} Default verbose printed the Documents root $default_root_count times."
         exit 1
     fi
 
@@ -342,6 +349,11 @@ test_report() {
     printf '%4096s\n' '' > "$HOME/.profile"
     critical_summary=$(../migr report --critical -s)
     implicit_summary=$(../migr report --summary)
+    default_total=$(../migr | awk '/Critical estimate/ {print $NF}')
+    if [ "$default_total" != "$critical_summary" ]; then
+        echo -e "  ${RED}✗${NC} Default estimate disagrees with the critical summary."
+        exit 1
+    fi
     if [[ "$critical_summary" =~ ^[0-9]+(\.[0-9]+)?(B|K|M|G)$ ]] && \
        [ "$critical_summary" = "$implicit_summary" ]; then
         echo -e "  ${GREEN}✓${NC} Critical summary is exactly one line and is the default scoped summary."
@@ -365,6 +377,11 @@ test_report() {
     fi
     mv "$HOME/.profile" "$HOME/.profile.report-test"
     without_profile=$(../migr report --critical -s)
+    default_total=$(../migr report | awk '/Critical estimate/ {print $NF}')
+    if [ "$default_total" != "$without_profile" ]; then
+        echo -e "  ${RED}✗${NC} Default report disagrees after removing .profile."
+        exit 1
+    fi
     mv "$HOME/.profile.report-test" "$HOME/.profile"
     if [ "$critical_summary" != "$without_profile" ]; then
         echo -e "  ${GREEN}✓${NC} .profile contributes to the critical scoped total."
@@ -372,6 +389,20 @@ test_report() {
         echo -e "  ${RED}✗${NC} .profile was not included in the critical scoped total."
         exit 1
     fi
+
+    # Use a visible size delta to verify browser contents affect the estimate,
+    # rather than merely checking that a browser heading is printed.
+    printf '%65536s' '' > "$HOME/.mozilla/firefox/profile/report-size.bin"
+    critical_summary=$(../migr report --critical -s)
+    default_total=$(../migr | awk '/Critical estimate/ {print $NF}')
+    rm "$HOME/.mozilla/firefox/profile/report-size.bin"
+    without_browser=$(../migr report --summary)
+    if [ "$default_total" != "$critical_summary" ] || \
+       [ "$without_browser" = "$critical_summary" ]; then
+        echo -e "  ${RED}✗${NC} Browser contents are missing from the default critical estimate."
+        exit 1
+    fi
+    echo -e "  ${GREEN}✓${NC} Browser contents contribute to default and explicit critical totals."
 
     comprehensive_output=$(../migr report --comprehensive)
     assert_contains "$comprehensive_output" "Comprehensive estimate"
@@ -893,7 +924,7 @@ test_truncation() {
         env HOME="$longhome" ../migr restore "$TEST_DIR/dummy_src" --dry-run
 
     # Gap 3: report must not present a silent 0B estimate as success.
-    assert_fails_with "report is incomplete" \
+    assert_fails_with "HOME path too long" \
         env HOME="$longhome" ../migr report
 
     # Gap 2: an unusable destination must be refused in dry-run exactly as it is

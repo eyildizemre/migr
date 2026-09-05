@@ -11,21 +11,7 @@
 #include "backup_plan.h"
 #include "report.h"
 #include "detect.h"
-#include "fileops.h"
 #include "utils.h"
-
-static int dir_exists(const char *path)
-{
-    struct stat st;
-    return (stat(path, &st) == 0 && S_ISDIR(st.st_mode));
-}
-
-static int file_exists(const char *path)
-{
-    struct stat st;
-    return (stat(path, &st) == 0);
-}
-
 
 static void print_section(const char *title)
 {
@@ -321,145 +307,6 @@ static int measure_scoped_root(const char *path, ReportDepth depth_limit,
     return 0;
 }
 
-static int measure_and_print_item(const char *name, const char *path,
-                                  ReportDepth depth, off_t *bytes)
-{
-    ReportBreakdown breakdown = { NULL, 0, 0 };
-    int rc = measure_report_tree(path, 0, depth, verbose ? &breakdown : NULL,
-                                 bytes);
-    if (rc != 0)
-    {
-        report_breakdown_free(&breakdown);
-        return -1;
-    }
-
-    char size[32];
-    format_size(*bytes, size, sizeof(size));
-    if (verbose)
-    {
-        print_item_with_path(name, size, path, 0);
-        print_report_breakdown(&breakdown);
-    }
-    else
-    {
-        print_item(name, size);
-    }
-    report_breakdown_free(&breakdown);
-    return 0;
-}
-
-enum { LEGACY_CRITICAL_COUNT = 7 };
-
-static int legacy_critical_slot(const char *name)
-{
-    static const char *critical_names[LEGACY_CRITICAL_COUNT] = {
-        "Documents", "Downloads", "Pictures", ".ssh", ".gnupg",
-        ".gitconfig", ".bashrc"
-    };
-
-    for (int i = 0; i < LEGACY_CRITICAL_COUNT; i++)
-    {
-        if (strcmp(name, critical_names[i]) == 0)
-            return i;
-    }
-    return -1;
-}
-
-static void legacy_cache_store(const char *name, off_t size,
-                               off_t *cached_sizes,
-                               unsigned char *cached_valid)
-{
-    int slot = legacy_critical_slot(name);
-    if (slot >= 0)
-    {
-        cached_sizes[slot] = size;
-        cached_valid[slot] = 1;
-    }
-}
-
-static void accumulate_critical_total(const char *home,
-                                      const char *const *names,
-                                      off_t *critical_total, int *had_error,
-                                      off_t *cached_sizes,
-                                      unsigned char *cached_valid)
-{
-    char path[PATH_MAX];
-    for (int i = 0; names[i] != NULL; i++)
-    {
-        if (path_join(path, sizeof(path), home, names[i]) != 0)
-        {
-            *had_error = 1;
-            continue;
-        }
-        if (file_exists(path))
-        {
-            int slot = legacy_critical_slot(names[i]);
-            if (slot >= 0 && cached_valid[slot])
-            {
-                *critical_total += cached_sizes[slot];
-            }
-            else
-            {
-                off_t temp_size = 0;
-                if (get_dir_size(path, &temp_size) == 0)
-                    *critical_total += temp_size;
-                else
-                    *had_error = 1;
-            }
-        }
-    }
-}
-
-typedef int (*ExistencePredicate)(const char *path);
-
-static void report_legacy_section(const char *title, const char *home,
-                                  const char *const *names,
-                                  const char *const *display_names,
-                                  ExistencePredicate exists,
-                                  ReportDepth depth, int *had_error,
-                                  off_t *cached_sizes,
-                                  unsigned char *cached_valid)
-{
-    char path[PATH_MAX];
-    if (display_names != NULL)
-    {
-        /* names[] and display_names[] are indexed in lockstep below; a
-         * caller that grows one without the other reads display_names[]
-         * out of bounds instead of failing loudly. */
-        size_t names_length = 0;
-        while (names[names_length] != NULL)
-            names_length++;
-        size_t display_length = 0;
-        while (display_names[display_length] != NULL)
-            display_length++;
-        assert(names_length == display_length &&
-               "report_legacy_section: names/display_names length mismatch");
-    }
-    print_section(title);
-    for (int i = 0; names[i] != NULL; i++)
-    {
-        if (path_join(path, sizeof(path), home, names[i]) != 0)
-        {
-            *had_error = 1;
-            continue;
-        }
-        if (exists(path))
-        {
-            const char *display = display_names != NULL ? display_names[i]
-                                                          : names[i];
-            off_t bytes_size = 0;
-            if (measure_and_print_item(display, path, depth, &bytes_size) != 0)
-            {
-                *had_error = 1;
-                continue;
-            }
-            if (cached_sizes != NULL)
-                legacy_cache_store(names[i], bytes_size, cached_sizes,
-                                   cached_valid);
-        }
-    }
-}
-
 static int report_scoped(const char *home, BackupMode mode, int summary,
                          ReportDepth depth)
 {
@@ -553,78 +400,14 @@ static int report_scoped(const char *home, BackupMode mode, int summary,
     return had_error ? 1 : 0;
 }
 
-int report(BackupMode mode, int scope_requested, int summary,
-           ReportDepth depth)
+int report(BackupMode mode, int summary, ReportDepth depth)
 {
-    char *home = getenv("HOME");
+    const char *home = getenv("HOME");
     if (home == NULL)
     {
         print_error("Error: Could not get HOME directory.\n");
         return 1;
     }
 
-    if (scope_requested)
-        return report_scoped(home, mode, summary, depth);
-
-    print_report_header(home);
-
-    int had_error = 0; // set if any path could not be built, so the estimate never lies
-    const char *critical_dirs[] = {"Documents", "Downloads", "Pictures", NULL};
-    const char *critical_dots[] = {".ssh", ".gnupg", ".gitconfig", ".bashrc", NULL};
-    off_t cached_critical_sizes[LEGACY_CRITICAL_COUNT] = { 0 };
-    unsigned char cached_critical_valid[LEGACY_CRITICAL_COUNT] = { 0 };
-
-    // main user directories
-    const char *main_dirs[] = {"Documents", "Desktop", "Downloads", "Pictures", "Videos", "Music", "Projects", NULL};
-
-    // Dotfiles
-    const char *dotfiles[] = {".ssh", ".gnupg", ".config", ".local/share", ".bashrc", ".profile", ".gitconfig", NULL};
-
-    // developer tools
-    const char *dev_dirs[] = {".npm", ".cargo", ".rustup", ".pub-cache", ".gradle", ".nvm", NULL};
-
-    // browsers
-    const char *browsers[] = {".mozilla/firefox", ".config/google-chrome", ".config/chromium", ".config/BraveSoftware", NULL};
-    const char *browser_names[] = {"Firefox", "Chrome", "Chromium", "Brave", NULL};
-    _Static_assert(sizeof(browsers) / sizeof(browsers[0]) ==
-                       sizeof(browser_names) / sizeof(browser_names[0]),
-                   "browsers[] and browser_names[] must stay the same length");
-
-    report_legacy_section("Main Directories", home, main_dirs, NULL,
-                          dir_exists, depth, &had_error,
-                          cached_critical_sizes, cached_critical_valid);
-
-    report_legacy_section("Dotfiles & Config", home, dotfiles, NULL,
-                          file_exists, depth, &had_error,
-                          cached_critical_sizes, cached_critical_valid);
-
-    report_legacy_section("Dev Tools (re-downloadable)", home, dev_dirs,
-                          NULL, dir_exists, depth, &had_error, NULL, NULL);
-
-    report_legacy_section("Browsers", home, browsers, browser_names,
-                          dir_exists, depth, &had_error, NULL, NULL);
-
-    // most important paths for backup
-    off_t critical_total = 0;
-    accumulate_critical_total(home, critical_dirs, &critical_total,
-                              &had_error, cached_critical_sizes,
-                              cached_critical_valid);
-    accumulate_critical_total(home, critical_dots, &critical_total,
-                              &had_error, cached_critical_sizes,
-                              cached_critical_valid);
-
-    char critical_size[32];
-    format_size(critical_total, critical_size, sizeof(critical_size));
-
-    printf("\n");
-    print_item("Critical estimate", critical_size);
-    printf("  (Documents, Downloads, Pictures, .ssh, .gnupg, .gitconfig, .bashrc)\n");
-
-    if (had_error)
-    {
-        printf("\nWarning: some paths could not be measured; "
-               "this report is incomplete.\n");
-        return 1;
-    }
-    return 0;
+    return report_scoped(home, mode, summary, depth);
 }

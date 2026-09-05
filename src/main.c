@@ -62,7 +62,7 @@ int main(int argc, char *argv[])
     ReportDepth depth = { REPORT_DEPTH_DEFAULT, 0 };
 
     if (argc < 2) // No arguments provided; default to report action
-        return report(BACKUP_CRITICAL, 0, 0, depth);
+        return report(BACKUP_CRITICAL, 0, depth);
 
     static struct option long_options[] = {
         {"dry-run",        no_argument,       NULL, 'n'},
@@ -240,8 +240,7 @@ int main(int argc, char *argv[])
     {
         case ACTION_NONE:
         case ACTION_REPORT:
-            ret = report(mode, mode_flag_given || summary_flag || max_depth_given,
-                         summary_flag, depth);
+            ret = report(mode, summary_flag, depth);
             break;
         case ACTION_BACKUP:
             if (path == NULL)
