@@ -549,6 +549,15 @@ static ManifestStatus manifest_parse_v1_body(FILE *f, Manifest *out)
                          &fail_status) != 0) goto fail;
     }
 
+    // Optional NETWORK_CONFIG=1, independent of whether ARCH is present.
+    if (line_key_is(line, "NETWORK_CONFIG", key_len))
+    {
+        if (strcmp(value, "1") != 0) goto fail;
+        m.has_network_config = 1;
+        if (read_kv_line(f, line, sizeof(line), &value, &key_len,
+                         &fail_status) != 0) goto fail;
+    }
+
     // ROOT_COUNT=<uint>
     if (!line_key_is(line, "ROOT_COUNT", key_len)) goto fail;
     if (parse_uint_field(value, MANIFEST_MAX_ROOTS, &n) != 0) goto fail;
@@ -722,6 +731,8 @@ ManifestIdentityComparison manifest_resume_identity_compare(const Manifest *a, c
         return MANIFEST_IDENTITY_DIFFERENT;
     if (a->has_self_binary && strcmp(a->arch, b->arch) != 0)
         return MANIFEST_IDENTITY_DIFFERENT;
+    if (a->has_network_config != b->has_network_config)
+        return MANIFEST_IDENTITY_DIFFERENT;
     if (a->root_count != b->root_count)
         return MANIFEST_IDENTITY_DIFFERENT;
     if (a->root_count == 0)
@@ -866,6 +877,10 @@ static int manifest_serialize(FILE *f, const Manifest *m)
 
     if (!failed && m->has_self_binary &&
         fprintf(f, "ARCH=%s\n", m->arch) < 0)
+        failed = 1;
+
+    if (!failed && m->has_network_config &&
+        fprintf(f, "NETWORK_CONFIG=1\n") < 0)
         failed = 1;
 
     if (!failed && fprintf(f, "ROOT_COUNT=%d\n", m->root_count) < 0) failed = 1;

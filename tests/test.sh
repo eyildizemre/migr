@@ -835,6 +835,13 @@ test_errors() {
         ../migr restore "$BACKUP_DIR" --include-self
     assert_succeeds_with "--include-self" ../migr --help
 
+    # include-network-config is meaningful only for backup.
+    assert_fails_with "Error: --include-network-config applies only to 'backup'." \
+        ../migr report --include-network-config
+    assert_fails_with "Error: --include-network-config applies only to 'backup'." \
+        ../migr restore "$BACKUP_DIR" --include-network-config
+    assert_succeeds_with "--include-network-config" ../migr --help
+
     # commands that take exactly one positional reject extras
     assert_exits_nonzero ../migr restore "$BACKUP_DIR" /tmp/extra
 
@@ -858,6 +865,7 @@ test_errors() {
     assert_succeeds_with "Usage:" ../migr report --summary --help
     assert_succeeds_with "Usage:" ../migr report --max-depth=2 --help
     assert_succeeds_with "Usage:" ../migr restore --include-self --help
+    assert_succeeds_with "Usage:" ../migr restore --include-network-config --help
     assert_succeeds_with "Usage:" ../migr help --critical
     # ...but a genuine conflict detected before --help is even parsed still refuses.
     assert_exits_nonzero ../migr backup --critical --comprehensive --help

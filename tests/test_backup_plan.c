@@ -1095,9 +1095,10 @@ static void test_root_count_ceiling_is_enforced(void)
 /* Production integration (backup())                                        */
 /* ========================================================================= */
 
-static int run_backup_capturing_with_self(const char *target, BackupMode mode,
-                                          char *const *paths, int include_self,
-                                          char *output, size_t output_size)
+static int run_backup_capturing_with_options(const char *target, BackupMode mode,
+                                             char *const *paths, int include_self,
+                                             int include_network_config,
+                                             char *output, size_t output_size)
 {
     int pipefd[2];
     if (pipe(pipefd) != 0)
@@ -1125,7 +1126,8 @@ static int run_backup_capturing_with_self(const char *target, BackupMode mode,
             dup2(pipefd[1], STDERR_FILENO) < 0)
             _exit(2);
         close(pipefd[1]);
-        int rc = backup(target, mode, (char **)paths, include_self);
+        int rc = backup(target, mode, (char **)paths, include_self,
+                        include_network_config);
         fflush(stdout);
         fflush(stderr);
         _exit(rc == 0 ? 0 : 1);
@@ -1149,8 +1151,8 @@ static int run_backup_capturing(const char *target, BackupMode mode,
                                 char *const *paths, char *output,
                                 size_t output_size)
 {
-    return run_backup_capturing_with_self(target, mode, paths, 0,
-                                          output, output_size);
+    return run_backup_capturing_with_options(target, mode, paths, 0, 0,
+                                             output, output_size);
 }
 
 typedef struct {
@@ -1248,6 +1250,30 @@ static int find_container_dir(const char *target, char *out, size_t out_size)
         if (strncmp(e->d_name, "migr_backup_", 12) != 0)
             continue;
         if (len >= 8 && strcmp(e->d_name + len - 8, ".partial") == 0)
+            continue;
+
+        join_path(out, out_size, target, e->d_name);
+        found = 1;
+        break;
+    }
+    closedir(d);
+    return found;
+}
+
+static int find_partial_container_dir(const char *target, char *out,
+                                      size_t out_size)
+{
+    DIR *d = opendir(target);
+    if (d == NULL)
+        return 0;
+
+    struct dirent *e;
+    int found = 0;
+    while ((e = readdir(d)) != NULL)
+    {
+        size_t len = strlen(e->d_name);
+        if (strncmp(e->d_name, "migr_backup_", 12) != 0 ||
+            len < 8 || strcmp(e->d_name + len - 8, ".partial") != 0)
             continue;
 
         join_path(out, out_size, target, e->d_name);
@@ -1782,8 +1808,8 @@ static void test_include_self_backup(void)
     join_path(missing_target, sizeof(missing_target), target_parent, "missing-static");
     dry_run = 0;
     char missing_output[8192];
-    int missing_rc = run_backup_capturing_with_self(
-        missing_target, BACKUP_EXPLICIT_PATHS, paths, 1,
+    int missing_rc = run_backup_capturing_with_options(
+        missing_target, BACKUP_EXPLICIT_PATHS, paths, 1, 0,
         missing_output, sizeof(missing_output));
     check(missing_rc == 1 && !dir_exists(missing_target),
           "an absent migr-static fails before creating a destination container");
@@ -1795,8 +1821,8 @@ static void test_include_self_backup(void)
     char live_target[PATH_MAX];
     fresh_mkdtemp(live_target, sizeof(live_target), "plan_self_live");
     char live_output[8192];
-    int live_rc = run_backup_capturing_with_self(
-        live_target, BACKUP_EXPLICIT_PATHS, paths, 1,
+    int live_rc = run_backup_capturing_with_options(
+        live_target, BACKUP_EXPLICIT_PATHS, paths, 1, 0,
         live_output, sizeof(live_output));
     char container[PATH_MAX];
     int have_container = find_container_dir(live_target, container,
@@ -1828,8 +1854,8 @@ static void test_include_self_backup(void)
     fresh_mkdtemp(dry_target, sizeof(dry_target), "plan_self_dry");
     dry_run = 1;
     char dry_output[8192];
-    int dry_rc = run_backup_capturing_with_self(
-        dry_target, BACKUP_EXPLICIT_PATHS, paths, 1,
+    int dry_rc = run_backup_capturing_with_options(
+        dry_target, BACKUP_EXPLICIT_PATHS, paths, 1, 0,
         dry_output, sizeof(dry_output));
     dry_run = 0;
     check(dry_rc == 0 && directory_empty(dry_target),
@@ -1846,6 +1872,243 @@ static void test_include_self_backup(void)
     remove_tree(home);
     remove_tree(target_parent);
     remove_tree(live_target);
+    remove_tree(dry_target);
+}
+
+static void test_include_network_config_backup(void)
+{
+    printf(BLUE "::" NC " production: --include-network-config validates, copies, records, and warns\n");
+
+    char home[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_network_home");
+    setenv("HOME", home, 1);
+    char source[PATH_MAX];
+    join_path(source, sizeof(source), home, "source.txt");
+    write_file(source, "network-copy payload");
+    char *paths[] = { source, NULL };
+
+    char network_source[PATH_MAX];
+    fresh_mkdtemp(network_source, sizeof(network_source), "plan_network_source");
+    char wifi[PATH_MAX], vpn[PATH_MAX], link[PATH_MAX], fifo[PATH_MAX];
+    char denied_dir[PATH_MAX];
+    join_path(wifi, sizeof(wifi), network_source, "home.nmconnection");
+    join_path(vpn, sizeof(vpn), network_source, "work-vpn.nmconnection");
+    join_path(link, sizeof(link), network_source, "linked.nmconnection");
+    join_path(fifo, sizeof(fifo), network_source, "runtime.lock");
+    join_path(denied_dir, sizeof(denied_dir), network_source, "private-state");
+    write_file(wifi, "[wifi-security]\npsk=not-a-real-password\n");
+    write_file(vpn, "[vpn]\nservice-type=fixture\n");
+    if (chmod(wifi, 0600) != 0 || chmod(vpn, 0640) != 0 ||
+        symlink("home.nmconnection", link) != 0 || mkfifo(fifo, 0600) != 0 ||
+        mkdir(denied_dir, 0700) != 0 ||
+        (geteuid() != 0 && chmod(denied_dir, 0000) != 0))
+    {
+        printf(RED "fixture: could not prepare network configuration source" NC "\n");
+        exit(1);
+    }
+    backup_test_set_network_config_source_dir(network_source);
+
+    char live_target[PATH_MAX];
+    fresh_mkdtemp(live_target, sizeof(live_target), "plan_network_live");
+    dry_run = 0;
+    char live_output[8192];
+    int live_rc = run_backup_capturing_with_options(
+        live_target, BACKUP_EXPLICIT_PATHS, paths, 0, 1,
+        live_output, sizeof(live_output));
+
+    char container[PATH_MAX];
+    int have_container = find_container_dir(live_target, container,
+                                             sizeof(container));
+    check(live_rc == 0 && have_container,
+          "a readable synthetic NetworkManager directory produces a finalized backup");
+
+    if (have_container)
+    {
+        char network_dir[PATH_MAX], copied_wifi[PATH_MAX], copied_vpn[PATH_MAX];
+        char skipped_link[PATH_MAX], skipped_fifo[PATH_MAX], skipped_denied_dir[PATH_MAX];
+        join_path(network_dir, sizeof(network_dir), container, "network");
+        join_path(copied_wifi, sizeof(copied_wifi), network_dir,
+                  "home.nmconnection");
+        join_path(copied_vpn, sizeof(copied_vpn), network_dir,
+                  "work-vpn.nmconnection");
+        join_path(skipped_link, sizeof(skipped_link), network_dir,
+                  "linked.nmconnection");
+        join_path(skipped_fifo, sizeof(skipped_fifo), network_dir,
+                  "runtime.lock");
+        join_path(skipped_denied_dir, sizeof(skipped_denied_dir), network_dir,
+                  "private-state");
+
+        check(files_are_equal(wifi, copied_wifi) &&
+                  files_are_equal(vpn, copied_vpn),
+              "regular connection files are copied byte-for-byte under network/");
+
+        struct stat source_st, copied_st;
+        int source_mode_ok = stat(wifi, &source_st) == 0;
+        int copied_mode_ok = stat(copied_wifi, &copied_st) == 0;
+        check(source_mode_ok && copied_mode_ok &&
+                  (source_st.st_mode & 0777) == (copied_st.st_mode & 0777),
+              "connection-file mode bits are preserved on a native destination");
+
+        struct stat skipped_st;
+        check(lstat(skipped_link, &skipped_st) != 0 && errno == ENOENT,
+              "a symlinked connection entry is not followed or copied");
+        check(lstat(skipped_fifo, &skipped_st) != 0 && errno == ENOENT,
+              "a non-regular connection entry is skipped");
+        check(lstat(skipped_denied_dir, &skipped_st) != 0 && errno == ENOENT,
+              "an unreadable non-regular entry is classified and skipped");
+
+        Manifest manifest;
+        ManifestStatus status = manifest_read_v1(container, &manifest);
+        check(status == MANIFEST_STATUS_VALID,
+              "the network-config backup manifest remains valid");
+        if (status == MANIFEST_STATUS_VALID)
+        {
+            check(manifest.has_network_config == 1,
+                  "the manifest records NETWORK_CONFIG=1");
+            manifest_free(&manifest);
+        }
+    }
+
+    check(strstr(live_output, "WiFi passwords") != NULL &&
+              strstr(live_output, "plain text") != NULL &&
+              strstr(live_output, "/network/") != NULL,
+          "completion warns about plaintext WiFi passwords and names network/");
+    check(strstr(live_output, "skipping symbolic link") != NULL &&
+              strstr(live_output, "skipping non-regular") != NULL,
+          "odd source entries are reported and skipped");
+
+    char empty_source[PATH_MAX];
+    fresh_mkdtemp(empty_source, sizeof(empty_source), "plan_network_empty_source");
+    backup_test_set_network_config_source_dir(empty_source);
+    char empty_target[PATH_MAX];
+    fresh_mkdtemp(empty_target, sizeof(empty_target), "plan_network_empty_target");
+    char empty_output[8192];
+    int empty_rc = run_backup_capturing_with_options(
+        empty_target, BACKUP_EXPLICIT_PATHS, paths, 0, 1,
+        empty_output, sizeof(empty_output));
+    char empty_container[PATH_MAX], empty_network[PATH_MAX];
+    int have_empty_container = find_container_dir(
+        empty_target, empty_container, sizeof(empty_container));
+    if (have_empty_container)
+        join_path(empty_network, sizeof(empty_network), empty_container, "network");
+    check(empty_rc == 0 && have_empty_container && dir_exists(empty_network) &&
+              directory_empty(empty_network),
+          "an empty readable source creates an empty network/ and still succeeds");
+    if (have_empty_container)
+    {
+        Manifest manifest;
+        ManifestStatus status = manifest_read_v1(empty_container, &manifest);
+        check(status == MANIFEST_STATUS_VALID &&
+                  manifest.has_network_config == 1,
+              "an empty network/ is still recorded as NETWORK_CONFIG=1");
+        if (status == MANIFEST_STATUS_VALID)
+            manifest_free(&manifest);
+    }
+
+    char missing_source[PATH_MAX];
+    join_path(missing_source, sizeof(missing_source), network_source, "missing");
+    backup_test_set_network_config_source_dir(missing_source);
+    char missing_target[PATH_MAX];
+    fresh_mkdtemp(missing_target, sizeof(missing_target), "plan_network_missing");
+    char missing_output[8192];
+    int missing_rc = run_backup_capturing_with_options(
+        missing_target, BACKUP_EXPLICIT_PATHS, paths, 0, 1,
+        missing_output, sizeof(missing_output));
+    check(missing_rc == 1 && directory_empty(missing_target),
+          "a missing NetworkManager directory refuses before reserving a container");
+    check(strstr(missing_output, "does not exist on this system") != NULL,
+          "the missing-directory refusal is distinct from a permission failure");
+
+    if (geteuid() != 0)
+    {
+        char denied_source[PATH_MAX];
+        fresh_mkdtemp(denied_source, sizeof(denied_source), "plan_network_denied");
+        if (chmod(denied_source, 0000) != 0)
+        {
+            printf(RED "fixture: could not restrict network source" NC "\n");
+            exit(1);
+        }
+        backup_test_set_network_config_source_dir(denied_source);
+        char denied_target[PATH_MAX];
+        fresh_mkdtemp(denied_target, sizeof(denied_target), "plan_network_denied_target");
+        char denied_output[8192];
+        int denied_rc = run_backup_capturing_with_options(
+            denied_target, BACKUP_EXPLICIT_PATHS, paths, 0, 1,
+            denied_output, sizeof(denied_output));
+        check(denied_rc == 1 && directory_empty(denied_target),
+              "an unreadable NetworkManager directory refuses before a container");
+        check(strstr(denied_output, "Root privileges are required") != NULL,
+              "the permission refusal names the required privilege");
+        chmod(denied_source, 0700);
+        remove_tree(denied_source);
+        remove_tree(denied_target);
+    }
+
+    if (geteuid() != 0)
+    {
+        char failing_source[PATH_MAX];
+        fresh_mkdtemp(failing_source, sizeof(failing_source),
+                      "plan_network_copy_failure_source");
+        char unreadable[PATH_MAX];
+        join_path(unreadable, sizeof(unreadable), failing_source,
+                  "unreadable.nmconnection");
+        write_file(unreadable, "[connection]\nid=fixture\n");
+        if (chmod(unreadable, 0000) != 0)
+        {
+            printf(RED "fixture: could not restrict network file" NC "\n");
+            exit(1);
+        }
+
+        backup_test_set_network_config_source_dir(failing_source);
+        char failing_target[PATH_MAX];
+        fresh_mkdtemp(failing_target, sizeof(failing_target),
+                      "plan_network_copy_failure_target");
+        char failing_output[8192];
+        int failing_rc = run_backup_capturing_with_options(
+            failing_target, BACKUP_EXPLICIT_PATHS, paths, 0, 1,
+            failing_output, sizeof(failing_output));
+
+        char partial[PATH_MAX], partial_network[PATH_MAX];
+        int have_partial = find_partial_container_dir(
+            failing_target, partial, sizeof(partial));
+        if (have_partial)
+            join_path(partial_network, sizeof(partial_network), partial, "network");
+        struct stat network_st;
+        check(failing_rc == 1 && have_partial &&
+                  lstat(partial_network, &network_st) != 0 && errno == ENOENT,
+              "a per-file copy failure removes network/ from the resumable partial");
+        check(strstr(failing_output, "unreadable.nmconnection") != NULL,
+              "a per-file copy failure names the connection file that failed");
+
+        chmod(unreadable, 0600);
+        remove_tree(failing_source);
+        remove_tree(failing_target);
+    }
+
+    backup_test_set_network_config_source_dir(network_source);
+    char dry_target[PATH_MAX];
+    fresh_mkdtemp(dry_target, sizeof(dry_target), "plan_network_dry");
+    dry_run = 1;
+    char dry_output[8192];
+    int dry_rc = run_backup_capturing_with_options(
+        dry_target, BACKUP_EXPLICIT_PATHS, paths, 0, 1,
+        dry_output, sizeof(dry_output));
+    dry_run = 0;
+    check(dry_rc == 0 && directory_empty(dry_target),
+          "an include-network-config dry run writes nothing");
+    check(strstr(dry_output,
+                 "Would copy NetworkManager connection files to network/") != NULL,
+          "the dry run reports the network configuration copy");
+
+    backup_test_set_network_config_source_dir(NULL);
+    if (geteuid() != 0)
+        chmod(denied_dir, 0700);
+    remove_tree(home);
+    remove_tree(network_source);
+    remove_tree(live_target);
+    remove_tree(empty_source);
+    remove_tree(empty_target);
+    remove_tree(missing_target);
     remove_tree(dry_target);
 }
 
@@ -2175,6 +2438,7 @@ int main(void)
     test_allocation_aware_estimate();
     test_destination_space_preflight();
     test_include_self_backup();
+    test_include_network_config_backup();
     test_format_duration();
     test_live_progress();
     test_missing_explicit_path_rejects_before_target_creation();

@@ -27,6 +27,8 @@
 #include "selfcopy.h"
 #include "utils.h"
 
+#define NETWORK_CONFIG_SOURCE_DIR "/etc/NetworkManager/system-connections"
+
 #ifdef BACKUP_TEST_HOOKS
 static BackupTestInventoryHook backup_test_inventory_hook;
 static void *backup_test_inventory_context;
@@ -36,6 +38,7 @@ static BackupTestBlockSizeHook backup_test_block_size_hook;
 static void *backup_test_block_size_context;
 static BackupTestProgressHook backup_test_progress_hook;
 static void *backup_test_progress_context;
+static const char *backup_test_network_config_source_dir;
 
 void backup_test_set_inventory_hook(BackupTestInventoryHook hook,
                                     void *context)
@@ -63,6 +66,11 @@ void backup_test_set_progress_hook(BackupTestProgressHook hook,
 {
     backup_test_progress_hook = hook;
     backup_test_progress_context = context;
+}
+
+void backup_test_set_network_config_source_dir(const char *source_dir)
+{
+    backup_test_network_config_source_dir = source_dir;
 }
 
 static void backup_test_before_source_open(const char *source_path)
@@ -305,6 +313,35 @@ static void manifest_set_self_binary(Manifest *manifest, const char *arch)
     memcpy(manifest->arch, arch, strlen(arch) + 1);
 }
 
+static const char *network_config_source_dir(void)
+{
+#ifdef BACKUP_TEST_HOOKS
+    if (backup_test_network_config_source_dir != NULL)
+        return backup_test_network_config_source_dir;
+#endif
+    return NETWORK_CONFIG_SOURCE_DIR;
+}
+
+static int check_network_config_readable(void)
+{
+    const char *source_dir = network_config_source_dir();
+    if (access(source_dir, R_OK | X_OK) == 0)
+        return 0;
+
+    if (errno == ENOENT)
+    {
+        print_error("Error: --include-network-config: %s does not exist on this system.\n",
+                    source_dir);
+    }
+    else
+    {
+        print_error("Error: --include-network-config: cannot read %s (%s). "
+                    "Root privileges are required to back up network configuration.\n",
+                    source_dir, strerror(errno));
+    }
+    return -1;
+}
+
 static int self_binary_clear_at(int container_fd)
 {
     if (unlinkat(container_fd, "migr", 0) == 0 || errno == ENOENT)
@@ -382,6 +419,294 @@ static int copy_self_binary_at(int container_fd, int source_fd,
     {
         int saved_errno = errno;
         (void)self_binary_clear_at(container_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    return 0;
+}
+
+static int network_config_clear_at(int container_fd)
+{
+    struct stat st;
+    if (fstatat(container_fd, "network", &st, AT_SYMLINK_NOFOLLOW) != 0)
+        return errno == ENOENT ? 0 : -1;
+
+    if (!S_ISDIR(st.st_mode))
+        return unlinkat(container_fd, "network", 0);
+
+    int network_fd = openat(container_fd, "network",
+                            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (network_fd < 0)
+        return -1;
+
+    int scan_fd = fcntl(network_fd, F_DUPFD_CLOEXEC, 0);
+    DIR *dir = scan_fd < 0 ? NULL : fdopendir(scan_fd);
+    if (dir == NULL)
+    {
+        if (scan_fd >= 0)
+            close(scan_fd);
+        close(network_fd);
+        return -1;
+    }
+
+    int failed = 0;
+    struct dirent *entry;
+    for (;;)
+    {
+        errno = 0;
+        entry = readdir(dir);
+        if (entry == NULL)
+        {
+            if (errno != 0)
+                failed = 1;
+            break;
+        }
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0)
+            continue;
+
+        if (unlinkat(network_fd, entry->d_name, 0) == 0)
+            continue;
+        if ((errno == EISDIR || errno == EPERM) &&
+            unlinkat(network_fd, entry->d_name, AT_REMOVEDIR) == 0)
+            continue;
+        failed = 1;
+        break;
+    }
+
+    if (closedir(dir) != 0)
+        failed = 1;
+    if (close(network_fd) != 0)
+        failed = 1;
+    if (failed)
+        return -1;
+
+    if (unlinkat(container_fd, "network", AT_REMOVEDIR) == 0 || errno == ENOENT)
+        return 0;
+    return -1;
+}
+
+static int copy_network_config_file_at(int source_dir_fd, int network_fd,
+                                       const char *name,
+                                       CloneRepresentation repr)
+{
+    struct stat entry_st;
+    if (fstatat(source_dir_fd, name, &entry_st, AT_SYMLINK_NOFOLLOW) != 0)
+        return -1;
+    if (S_ISLNK(entry_st.st_mode))
+    {
+        printf("  Note: skipping symbolic link in network configuration: %s\n",
+               name);
+        return 0;
+    }
+    if (!S_ISREG(entry_st.st_mode))
+    {
+        printf("  Note: skipping non-regular network configuration entry: %s\n",
+               name);
+        return 0;
+    }
+
+    int source_fd = openat(source_dir_fd, name,
+                           O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
+    if (source_fd < 0)
+    {
+        if (errno == ELOOP)
+        {
+            printf("  Note: skipping symbolic link in network configuration: %s\n",
+                   name);
+            return 0;
+        }
+        return -1;
+    }
+
+    struct stat source_st;
+    if (fstat(source_fd, &source_st) != 0)
+    {
+        int saved_errno = errno;
+        close(source_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    if (!S_ISREG(source_st.st_mode))
+    {
+        printf("  Note: skipping non-regular network configuration entry: %s\n",
+               name);
+        close(source_fd);
+        return 0;
+    }
+
+    int dest_fd = openat(network_fd, name,
+                         O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                         0600);
+    if (dest_fd < 0)
+    {
+        int saved_errno = errno;
+        close(source_fd);
+        errno = saved_errno;
+        return -1;
+    }
+
+    int failed = 0;
+    int saved_errno = 0;
+    unsigned char buffer[64 * 1024];
+    while (!failed)
+    {
+        ssize_t n = read(source_fd, buffer, sizeof(buffer));
+        if (n < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            saved_errno = errno;
+            failed = 1;
+            break;
+        }
+        if (n == 0)
+            break;
+
+        size_t written = 0;
+        while (written < (size_t)n)
+        {
+            ssize_t w = write(dest_fd, buffer + written, (size_t)n - written);
+            if (w < 0)
+            {
+                if (errno == EINTR)
+                    continue;
+                saved_errno = errno;
+                failed = 1;
+                break;
+            }
+            if (w == 0)
+            {
+                saved_errno = EIO;
+                failed = 1;
+                break;
+            }
+            written += (size_t)w;
+        }
+    }
+
+    mode_t source_mode = source_st.st_mode & 0777;
+    if (!failed && fchmod(dest_fd, source_mode) != 0 &&
+        repr == CLONE_NATIVE_TREE)
+    {
+        saved_errno = errno;
+        failed = 1;
+    }
+    if (close(dest_fd) != 0 && !failed)
+    {
+        saved_errno = errno;
+        failed = 1;
+    }
+    if (close(source_fd) != 0 && !failed)
+    {
+        saved_errno = errno;
+        failed = 1;
+    }
+
+    if (failed)
+    {
+        if (saved_errno == 0)
+            saved_errno = EIO;
+        (void)unlinkat(network_fd, name, 0);
+        errno = saved_errno;
+        return -1;
+    }
+
+    return 0;
+}
+
+static int copy_network_config_at(int container_fd, CloneRepresentation repr)
+{
+    const char *source_dir = network_config_source_dir();
+    int source_fd = open(source_dir,
+                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (source_fd < 0)
+        return -1;
+
+    if (network_config_clear_at(container_fd) != 0)
+    {
+        int saved_errno = errno;
+        close(source_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    if (mkdirat(container_fd, "network", 0700) != 0 && errno != EEXIST)
+    {
+        int saved_errno = errno;
+        close(source_fd);
+        errno = saved_errno;
+        return -1;
+    }
+
+    int network_fd = openat(container_fd, "network",
+                            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (network_fd < 0)
+    {
+        int saved_errno = errno;
+        close(source_fd);
+        (void)network_config_clear_at(container_fd);
+        errno = saved_errno;
+        return -1;
+    }
+
+    DIR *dir = fdopendir(source_fd);
+    if (dir == NULL)
+    {
+        int saved_errno = errno;
+        close(source_fd);
+        close(network_fd);
+        (void)network_config_clear_at(container_fd);
+        errno = saved_errno;
+        return -1;
+    }
+
+    int failed = 0;
+    int saved_errno = 0;
+    struct dirent *entry;
+    for (;;)
+    {
+        errno = 0;
+        entry = readdir(dir);
+        if (entry == NULL)
+        {
+            if (errno != 0)
+            {
+                saved_errno = errno;
+                failed = 1;
+            }
+            break;
+        }
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0)
+            continue;
+
+        if (copy_network_config_file_at(dirfd(dir), network_fd,
+                                        entry->d_name, repr) != 0)
+        {
+            saved_errno = errno;
+            print_error("Error: --include-network-config: could not copy %s/%s: %s\n",
+                        source_dir, entry->d_name, strerror(saved_errno));
+            failed = 1;
+            break;
+        }
+    }
+
+    if (closedir(dir) != 0 && !failed)
+    {
+        saved_errno = errno;
+        failed = 1;
+    }
+    if (close(network_fd) != 0 && !failed)
+    {
+        saved_errno = errno;
+        failed = 1;
+    }
+
+    if (failed)
+    {
+        if (saved_errno == 0)
+            saved_errno = EIO;
+        (void)network_config_clear_at(container_fd);
         errno = saved_errno;
         return -1;
     }
@@ -1128,7 +1453,7 @@ static int backup_metadata_preflight(const BackupPlan *plan, int anchor_fd,
 
 static int backup_dry_run(const char *target, BackupMode mode,
                           BackupPlan *plan, int include_self,
-                          const char *self_arch)
+                          const char *self_arch, int include_network_config)
 {
     off_t estimated_size = 0;
     int estimate_had_error = 0;
@@ -1313,6 +1638,8 @@ static int backup_dry_run(const char *target, BackupMode mode,
     if (include_self)
         printf("  Would copy migr-static (%s) to the container root as migr\n",
                self_arch);
+    if (include_network_config)
+        printf("  Would copy NetworkManager connection files to network/\n");
 
     printf("\n");
     char item_phrase[64];
@@ -1326,7 +1653,8 @@ static int backup_dry_run(const char *target, BackupMode mode,
 
 /* ------------------------------------------------------------------------- */
 
-int backup(const char *target, BackupMode mode, char **paths, int include_self)
+int backup(const char *target, BackupMode mode, char **paths, int include_self,
+           int include_network_config)
 {
     char *home = getenv("HOME");
     if (home == NULL)
@@ -1360,6 +1688,13 @@ int backup(const char *target, BackupMode mode, char **paths, int include_self)
         backup_plan_free(&plan);
         return 1;
     }
+    if (include_network_config && check_network_config_readable() != 0)
+    {
+        if (self_fd >= 0)
+            close(self_fd);
+        backup_plan_free(&plan);
+        return 1;
+    }
 
     off_t estimated_size = 0;
     int estimate_had_error = 0;
@@ -1372,7 +1707,8 @@ int backup(const char *target, BackupMode mode, char **paths, int include_self)
     {
         if (self_fd >= 0)
             close(self_fd);
-        return backup_dry_run(target, mode, &plan, include_self, self_arch);
+        return backup_dry_run(target, mode, &plan, include_self, self_arch,
+                              include_network_config);
     }
 
     Manifest manifest;
@@ -1385,6 +1721,8 @@ int backup(const char *target, BackupMode mode, char **paths, int include_self)
     }
     if (include_self)
         manifest_set_self_binary(&manifest, self_arch);
+    if (include_network_config)
+        manifest.has_network_config = 1;
 
     // Hoisted so both cleanup epilogues can release every resource
     // unconditionally: each handle is inert until its corresponding operation
@@ -1477,6 +1815,8 @@ int backup(const char *target, BackupMode mode, char **paths, int include_self)
         }
         if (include_self)
             manifest_set_self_binary(&prepared.manifest, self_arch);
+        if (include_network_config)
+            prepared.manifest.has_network_config = 1;
     }
     const Manifest *identity_manifest = repr == CLONE_PORTABLE_SIDECAR
         ? &prepared.manifest : &manifest;
@@ -1758,6 +2098,25 @@ int backup(const char *target, BackupMode mode, char **paths, int include_self)
                 had_error = 1;
             }
         }
+
+        if (!had_error)
+        {
+            if (include_network_config)
+            {
+                if (copy_network_config_at(container_fd, repr) != 0)
+                {
+                    print_error("Error: could not copy NetworkManager connection files "
+                                "into the backup container: %s\n", strerror(errno));
+                    had_error = 1;
+                }
+            }
+            else if (network_config_clear_at(container_fd) != 0)
+            {
+                print_error("Error: could not clear stale network configuration "
+                            "from the backup container\n");
+                had_error = 1;
+            }
+        }
     }
 
     printf("\n");
@@ -1810,6 +2169,13 @@ int backup(const char *target, BackupMode mode, char **paths, int include_self)
                "The copy may not run directly from the drive. On the new "
                "system, enter the backup directory and run:\n\n"
                "  cp migr ~/migr && chmod +x ~/migr\n", self_arch);
+    }
+    if (include_network_config)
+    {
+        printf("\nThis backup includes your saved network connections, including "
+               "any WiFi passwords, stored as plain text in %s/%s/network/. "
+               "Anyone with access to this backup can read them.\n",
+               target, container_current_name(&container));
     }
     finish_result = 0;
 

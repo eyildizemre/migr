@@ -162,6 +162,8 @@ static void test_full_roundtrip_with_problem_bytes(void)
         check(read.has_self_binary == 1, "self-binary presence round-trips");
         check(strcmp(read.arch, "x86_64") == 0,
               "ARCH round-trips after source identity");
+        check(read.has_network_config == 0,
+              "an absent NETWORK_CONFIG field remains absent");
         check(read.root_count == 2, "root_count round-trips");
 
         if (read.root_count == 2)
@@ -248,6 +250,39 @@ static void test_self_arch_without_source_identity(void)
               "ARCH round-trips without source identity");
         check(read.root_count == 0,
               "ROOT_COUNT remains aligned after optional ARCH lookahead");
+        manifest_free(&read);
+    }
+
+    remove_manifest(test_dir);
+}
+
+static void test_network_config_without_self_arch(void)
+{
+    printf(BLUE "::" NC " versioned manifest: NETWORK_CONFIG without ARCH\n");
+
+    Manifest m;
+    memset(&m, 0, sizeof(m));
+    m.version = MANIFEST_CURRENT_VERSION;
+    m.representation = CLONE_NATIVE_TREE;
+    m.scope = MANIFEST_SCOPE_EXPLICIT;
+    m.sidecar_version = 0;
+    m.has_network_config = 1;
+
+    check(manifest_write_v1(test_dir, &m) == 0,
+          "a manifest can write NETWORK_CONFIG without ARCH");
+
+    Manifest read;
+    ManifestStatus st = manifest_read_v1(test_dir, &read);
+    check(st == MANIFEST_STATUS_VALID,
+          "NETWORK_CONFIG directly before ROOT_COUNT parses as VALID");
+    if (st == MANIFEST_STATUS_VALID)
+    {
+        check(read.has_self_binary == 0,
+              "NETWORK_CONFIG does not imply a bundled migr binary");
+        check(read.has_network_config == 1,
+              "NETWORK_CONFIG=1 round-trips without ARCH");
+        check(read.root_count == 0,
+              "ROOT_COUNT remains aligned after optional NETWORK_CONFIG lookahead");
         manifest_free(&read);
     }
 
@@ -494,6 +529,24 @@ static void test_malformed_variants(void)
         Manifest m;
         check(manifest_read_v1(test_dir, &m) == MANIFEST_STATUS_MALFORMED,
               "an unsupported ARCH value is malformed, not silently skipped");
+        remove_manifest(test_dir);
+    }
+
+    // NETWORK_CONFIG is presence-only; any value other than 1 is malformed.
+    {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/manifest.txt", test_dir);
+        write_raw(path,
+            "MIGR_MANIFEST\n"
+            "VERSION=1\n"
+            "REPRESENTATION=native\n"
+            "SCOPE=critical\n"
+            "SIDECAR_VERSION=0\n"
+            "NETWORK_CONFIG=0\n"
+            "ROOT_COUNT=0\n");
+        Manifest m;
+        check(manifest_read_v1(test_dir, &m) == MANIFEST_STATUS_MALFORMED,
+              "NETWORK_CONFIG accepts only the additive value 1");
         remove_manifest(test_dir);
     }
 
@@ -900,6 +953,24 @@ static void test_resume_identity_includes_self_binary(void)
           "matching bundled-migr state preserves resume identity");
 }
 
+static void test_resume_identity_includes_network_config(void)
+{
+    printf(BLUE "::" NC " versioned manifest: resume identity includes network config\n");
+
+    Manifest a, b;
+    ManifestRoot a_roots[2], b_roots[2];
+    fill_reference_manifest(&a, a_roots);
+    fill_reference_manifest(&b, b_roots);
+
+    a.has_network_config = 1;
+    check(manifest_resume_identity_compare(&a, &b) == MANIFEST_IDENTITY_DIFFERENT,
+          "a plain partial cannot resume an include-network-config backup");
+
+    b.has_network_config = 1;
+    check(manifest_resume_identity_compare(&a, &b) == MANIFEST_IDENTITY_EQUAL,
+          "matching network-config state preserves resume identity");
+}
+
 static void test_fd_writer(void)
 {
     printf(BLUE "::" NC " versioned manifest: fd-relative writer\n");
@@ -978,6 +1049,7 @@ int main(void)
     test_full_roundtrip_with_problem_bytes();
     test_no_source_identity();
     test_self_arch_without_source_identity();
+    test_network_config_without_self_arch();
     test_legacy_detection();
     test_legacy_read_strdup_failure();
     test_unknown_version();
@@ -987,6 +1059,7 @@ int main(void)
     test_io_error();
     test_write_rejects_inconsistent_input();
     test_resume_identity_includes_self_binary();
+    test_resume_identity_includes_network_config();
     test_fd_writer();
 
     rmdir(test_dir);

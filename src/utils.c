@@ -303,6 +303,8 @@ void print_help(void)
     printf("                        Report directory breakdown depth (implies --verbose)\n");
     printf("      --include-self    Include a validated static migr binary in the backup\n");
     printf("                        (requires building migr-static)\n");
+    printf("      --include-network-config\n");
+    printf("                        Back up NetworkManager connection files\n");
     printf("\n");
     printf("Examples:\n");
     printf("  ./migr backup /mnt/drive\n");

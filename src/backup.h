@@ -27,9 +27,9 @@ typedef enum {
  * without one is not a backup migr can restore.
  *
  * When an earlier run of the same job (docs/DECISIONS.md D15: representation,
- * scope, root table, machine id and uid, plus any bundled migr architecture)
- * left exactly one unfinished container behind, this resumes into it instead
- * of starting a second one.
+ * scope, root table, machine id and uid, plus optional bundled migr and network
+ * configuration state) left exactly one unfinished container behind, this
+ * resumes into it instead of starting a second one.
  *
  * @param target Destination directory; the dated backup subdirectory is created inside it.
  * @param mode   Selects which files are included (BACKUP_CRITICAL, BACKUP_COMPREHENSIVE, or BACKUP_EXPLICIT_PATHS).
@@ -38,9 +38,12 @@ typedef enum {
  *               BACKUP_EXPLICIT_PATHS, ignored otherwise.
  * @param include_self Non-zero to require and copy the validated static migr
  *                     binary into the container root (docs/DECISIONS.md D9).
+ * @param include_network_config Non-zero to require and copy NetworkManager
+ *                               connection files into container-root network/.
  * @return 0 on success, 1 on error.
  */
-int backup(const char *target, BackupMode mode, char **paths, int include_self);
+int backup(const char *target, BackupMode mode, char **paths, int include_self,
+           int include_network_config);
 
 /* Shared by backup and restore destination free-space preflights. */
 int destination_block_size(int dest_fd, off_t *block_size);
@@ -78,6 +81,8 @@ typedef void (*BackupTestProgressHook)(off_t bytes_copied,
 
 void backup_test_set_progress_hook(BackupTestProgressHook hook,
                                    void *context);
+
+void backup_test_set_network_config_source_dir(const char *source_dir);
 #endif
 
 #endif

@@ -73,6 +73,7 @@ int main(int argc, char *argv[])
         {"summary",        no_argument,       NULL, 's'},
         {"max-depth",      required_argument, NULL, 'd'},
         {"include-self",   no_argument,       NULL, 'I'},
+        {"include-network-config", no_argument, NULL, 'N'},
         {NULL,             0,                 NULL,  0 }
     };
 
@@ -103,6 +104,7 @@ int main(int argc, char *argv[])
     int summary_flag = 0;
     int max_depth_given = 0;
     int include_self = 0;
+    int include_network_config = 0;
 
     // Parse options only. optind was set above to skip the command word, or left
     // at 1 when no command was given (e.g. `migr --help`). getopt_long permutes
@@ -147,6 +149,9 @@ int main(int argc, char *argv[])
             break;
         case 'I':
             include_self = 1;
+            break;
+        case 'N':
+            include_network_config = 1;
             break;
         case '?':
         default:
@@ -215,6 +220,11 @@ int main(int argc, char *argv[])
         print_error("Error: --include-self applies only to 'backup'.\n");
         return 1;
     }
+    if (include_network_config && action != ACTION_BACKUP)
+    {
+        print_error("Error: --include-network-config applies only to 'backup'.\n");
+        return 1;
+    }
     if (path != NULL && (action == ACTION_REPORT || action == ACTION_NONE))
     {
         print_error("Error: 'report' takes no arguments.\n");
@@ -240,7 +250,8 @@ int main(int argc, char *argv[])
                 ret = 1;
                 break;
             }
-            ret = backup(path, mode, user_paths, include_self);
+            ret = backup(path, mode, user_paths, include_self,
+                         include_network_config);
             break;
         case ACTION_RESTORE:
             if (path == NULL)

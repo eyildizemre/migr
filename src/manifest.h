@@ -121,13 +121,15 @@ typedef struct {
 
 /**
  * @brief The versioned manifest: format identity, representation/scope, optional
- * source identity and bundled-binary architecture, and the full root table.
+ * source identity, bundled-binary architecture, optional network configuration,
+ * and the full root table.
  *
  * roots is a heap array owned by this struct; manifest_free() releases it.
  * has_source_identity is set only when both machine_id and source_uid are
  * available (docs/DECISIONS.md D15) — one without the other is not adopted as
  * a partial identity. has_self_binary means arch describes the static migr
- * stored at the container root (docs/DECISIONS.md D9).
+ * stored at the container root (docs/DECISIONS.md D9). has_network_config
+ * means container-root network/ contains the requested NetworkManager files.
  */
 typedef struct {
     int version;
@@ -139,6 +141,7 @@ typedef struct {
     uid_t source_uid;
     int has_self_binary;
     char arch[MIGR_ARCH_MAX];
+    int has_network_config;
     int root_count;
     ManifestRoot *roots;
 } Manifest;

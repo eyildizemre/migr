@@ -189,7 +189,7 @@ static int run_backup_as(const char *target, const char *home,
             _exit(CHILD_SKIP);
         dry_run = 0;
         char *paths[] = { (char *)source, NULL };
-        int result = backup(target, BACKUP_EXPLICIT_PATHS, paths, 0);
+        int result = backup(target, BACKUP_EXPLICIT_PATHS, paths, 0, 0);
         fflush(stdout);
         fflush(stderr);
         _exit(result == 0 ? 0 : 1);
@@ -265,7 +265,7 @@ static int run_backup_race(const char *target, const char *home,
             _exit(CHILD_SKIP);
         dry_run = 0;
         char *paths[] = { (char *)source, NULL };
-        int result = backup(target, BACKUP_EXPLICIT_PATHS, paths, 0);
+        int result = backup(target, BACKUP_EXPLICIT_PATHS, paths, 0, 0);
         fflush(stdout);
         fflush(stderr);
         _exit(result == 0 ? 0 : 1);
@@ -631,7 +631,7 @@ static int run_backup_capture_race(const char *target, const char *home,
         }
         dry_run = 0;
         char *paths[] = { (char *)source, NULL };
-        int result = backup(target, BACKUP_EXPLICIT_PATHS, paths, 0);
+        int result = backup(target, BACKUP_EXPLICIT_PATHS, paths, 0, 0);
         fflush(stdout);
         fflush(stderr);
         _exit(result == 0 ? 0 : 1);
