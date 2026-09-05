@@ -2761,3 +2761,73 @@ payload-content keys; only the free-space estimate consumes them.
 **Relationship:** D32 extends D17's `size` rule for directory entries and
 refines D27's restore-side estimate parity. D17's directory metadata and
 post-order restore requirements remain unchanged.
+
+
+---
+
+## D33 — 2026-09-05 — Capture network backends independently; apply disruptive changes manually
+
+**Status:** Implemented
+
+**Decision:** `--include-network-config` checks five backends independently
+through a backend table: NetworkManager, netplan, systemd-networkd,
+wpa_supplicant, and netctl. Each available backend contributes regular files
+from its system configuration directory to its own subdirectory of container-root
+`network/`. Missing backends are skipped. A readable empty directory still counts
+as captured; `NETWORK_CONFIG=1` records that at least one backend was processed,
+not that it contained files. If every backend is absent, backup succeeds with a
+note and leaves the manifest flag unset. Restore discovers the captured backends
+from their subdirectories and attempts each independently.
+
+**Why absence is normal but unreadability fails:** Systems use different network
+managers; requiring every supported directory would reject ordinary installations.
+The original NetworkManager-only presence check refused an Ubuntu Server backup
+because that netplan-based system had no NetworkManager directory. Commit
+`fd8aaa2` corrected this: `ENOENT` means the backend is absent, while other access
+errors refuse backup. Insufficient permissions are a fixable problem requiring
+root access, not evidence that there is nothing to save. Copy failures also fail
+the backup rather than publishing incomplete network configuration.
+
+**Why only NetworkManager reloads automatically:** `nmcli connection reload`
+re-reads saved profiles without activating them, so restore invokes it best-effort
+once files have been restored. Failure warns without failing the restore. Applying
+netplan or restarting an interface's wpa_supplicant instance or netctl profile can
+drop the connection carrying the restore session. Reconfiguring networkd links can
+also interrupt connectivity. Those four backends receive files and manual apply
+instructions instead of an automatic command. Networkd's hint uses
+`sudo networkctl reload`, avoiding a full service restart. The wpa_supplicant and
+netctl hints require the user to substitute the target interface or profile.
+
+**Why only wpa_supplicant filters filenames:** Package-provided helper scripts can
+share `/etc/wpa_supplicant/` with configuration. Only names ending in `.conf` are
+captured there, including interface-specific configuration names; other regular
+files are skipped before being opened. This avoids carrying package helpers across
+systems or replacing the target's versions during restore. The other four backend
+directories conventionally hold profiles directly, so all their regular files are
+accepted without a suffix restriction. Symlinks and non-regular entries are skipped
+for every backend; netctl's `hooks/` and `interfaces/` directories are not traversed.
+
+**Known caveats:**
+
+- The container subdirectory names `networkmanager`, `netplan`,
+  `systemd-networkd`, `wpa_supplicant`, and `netctl` form a string contract between
+  the independent tables in `src/backup.c` and `src/restore.c`. No compiler check
+  ties them together; a spelling mismatch can leave captured files undiscovered
+  during restore. Keep both tables and backup-to-restore tests aligned.
+- NetworkManager, netplan, wpa_supplicant, and netctl configuration can contain
+  plaintext WiFi passwords or PSKs. Networkd handles WiFi authentication through
+  separate tools, but its `.netdev` files can hold WireGuard private keys, so
+  it is also treated as a secret-capable backend: the plaintext-secret warning
+  fires for a networkd-only backup too, worded generically ("secrets such as
+  WiFi passwords, PSKs, or VPN keys") rather than naming WiFi specifically.
+  See [systemd.netdev](https://www.freedesktop.org/software/systemd/man/systemd.netdev.html).
+- A destination that cannot be created or written during restore produces a note
+  and manual recovery instructions; it does not fail the overall restore. Source
+  corruption and per-file copy errors do fail restore, while other backends are
+  still attempted. Captured profiles may need adjustment for the target system.
+- Coverage is deliberately limited. `iwd` (`/var/lib/iwd/*.psk`) and Debian's
+  legacy `ifupdown` (`/etc/network/interfaces`) were considered and remain deferred.
+- `/etc/resolv.conf` and `/etc/hosts` are outside this flag's scope. Resolver
+  settings are commonly managed by the target's network stack; static host
+  mappings are separate system policy, not saved connection profiles. Custom
+  entries may need manual migration: DHCP does not recreate `/etc/hosts`.

@@ -304,7 +304,9 @@ void print_help(void)
     printf("      --include-self    Include a validated static migr binary in the backup\n");
     printf("                        (requires building migr-static)\n");
     printf("      --include-network-config\n");
-    printf("                        Back up NetworkManager connection files\n");
+    printf("                        Back up NetworkManager, netplan,\n");
+    printf("                        systemd-networkd, wpa_supplicant, and\n");
+    printf("                        netctl configuration found on this system\n");
     printf("\n");
     printf("Examples:\n");
     printf("  ./migr backup /mnt/drive\n");

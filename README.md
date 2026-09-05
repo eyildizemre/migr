@@ -81,6 +81,10 @@ the backup's version without a second prompt.
                        Report directory breakdown depth; implies --verbose
     --include-self     Include a validated static migr binary in the backup
                        (requires building migr-static)
+    --include-network-config
+                       Back up NetworkManager, netplan, systemd-networkd,
+                       wpa_supplicant, and netctl configuration found on
+                       this system
 ```
 
 Status colors are automatic: they are used when stdout is a real terminal and
@@ -108,6 +112,7 @@ Backup-only explicit paths:
 ./migr backup /mnt/drive --comprehensive
 ./migr backup /mnt/drive ~/Documents ~/Projects
 ./migr backup /mnt/drive --include-self
+./migr backup /mnt/drive --include-network-config
 ```
 
 ## Key Features
@@ -149,22 +154,25 @@ Therefore a container that appears under its final name — and the accompanying
 `Backup complete` message — has passed the durable-finalization boundary. An
 interrupted backup before that point remains a `.partial` that can be resumed.
 
-The container root is reserved for migr-owned control files. Everything selected from
-the user's filesystem lives below `data/`:
+The container root holds migr-owned control files and optional bundled content.
+The selected payload roots live below `data/`:
 
 ```
 migr_backup_YYYYMMDD_HHMMSS[-N]/
 ├── manifest.txt
 ├── packages.txt        # present when this scope exports a package list
 ├── migr                # present with --include-self
+├── network/            # with --include-network-config when a backend is found
 └── data/
     └── <logical roots>
 ```
 
 `manifest.txt` records the version, representation, scope, root table, and stable source
 identity when one is available. With `--include-self`, it also records the bundled
-binary's architecture, for example `ARCH=x86_64`. Older unversioned and manifest-less
-backups remain readable through an isolated legacy restore path.
+binary's architecture, for example `ARCH=x86_64`. With `--include-network-config`, it
+records `NETWORK_CONFIG=1` when at least one supported backend was found, even if
+its directory was empty. Older unversioned and manifest-less backups remain readable
+through an isolated legacy restore path.
 
 `--include-self` copies the validated `migr-static` binary into the container root as
 `migr`, so the backup carries a standalone migr executable with it. Native Linux
@@ -176,6 +184,19 @@ not run from the drive, enter the backup directory on the target system and copy
 it to a filesystem that supports Unix permissions and permits execution first:
 `cp migr ~/migr && chmod +x ~/migr`. The recorded `ARCH` value lets you check that
 the bundled binary matches the target machine's architecture.
+
+`--include-network-config` independently captures NetworkManager, netplan,
+systemd-networkd, wpa_supplicant, and netctl into backend directories under `network/`.
+Absent backends are silently skipped; an unreadable backend fails the backup
+(use root privileges where required). If none are found, backup succeeds with a
+note. NetworkManager, netplan, wpa_supplicant, and netctl files can expose WiFi
+passwords or PSKs in plain text. Networkd delegates WiFi authentication to other
+tools, but its files can contain other secrets, such as WireGuard private keys.
+Restore reloads NetworkManager profiles automatically with `nmcli connection reload`
+(best-effort; it only re-reads profiles). The other four backends are written but
+never auto-applied: applying them can interrupt connectivity, including an SSH
+session running restore. The output gives the manual command to use when ready;
+interface or profile placeholders must be replaced for the target system.
 
 Explicit paths keep accepting valid sources both inside and outside `$HOME`. A root
 proven to be inside the source home is restored automatically to the same relative
@@ -360,7 +381,7 @@ recorded in [docs/DECISIONS.md](docs/DECISIONS.md).
 - [x] Backups to filesystems that cannot hold Linux metadata (exFAT/NTFS/FAT32)
 - [ ] VS Code extension list backup and restore
 - [ ] Logging
-- [ ] Network configuration backup
+- [x] Network configuration backup
 - [x] Self-contained backup (`--include-self` static binary)
 - [ ] Provide pre-built .deb, .rpm, and AUR packages
 

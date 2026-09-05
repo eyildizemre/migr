@@ -2226,9 +2226,10 @@ static void test_include_network_config_backup(void)
             manifest_free(&manifest);
     }
     check(strstr(networkd_output, "Captured systemd-networkd") != NULL &&
-              strstr(networkd_output, "WiFi passwords") == NULL &&
-              strstr(networkd_output, "plain text") == NULL,
-          "systemd-networkd-only completion has no plaintext-secret warning");
+              strstr(networkd_output, "WiFi passwords") != NULL &&
+              strstr(networkd_output, "VPN keys") != NULL,
+          "systemd-networkd-only completion warns about plaintext secrets "
+          "(networkd .netdev files can hold a WireGuard private key)");
 
     backup_test_set_network_config_source_dir("NetworkManager", network_source);
     backup_test_set_network_config_source_dir("netplan", netplan_source);

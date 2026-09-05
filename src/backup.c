@@ -39,7 +39,7 @@ static const NetworkConfigBackend NETWORK_CONFIG_BACKENDS[] = {
     { "NetworkManager", "/etc/NetworkManager/system-connections",
       "networkmanager", 1, NULL },
     { "netplan", "/etc/netplan", "netplan", 1, NULL },
-    { "systemd-networkd", "/etc/systemd/network", "systemd-networkd", 0, NULL },
+    { "systemd-networkd", "/etc/systemd/network", "systemd-networkd", 1, NULL },
     { "wpa_supplicant", "/etc/wpa_supplicant", "wpa_supplicant", 1, ".conf" },
     { "netctl", "/etc/netctl", "netctl", 1, NULL },
 };
@@ -955,8 +955,8 @@ static void print_network_config_dry_run(unsigned int present_mask)
     printf(" under network/.\n");
     if (network_config_mask_may_contain_secrets(present_mask))
     {
-        printf("  Note: these files may include WiFi passwords stored as "
-               "plain text.\n");
+        printf("  Note: these files may include secrets such as WiFi "
+               "passwords, PSKs, or VPN keys, stored as plain text.\n");
     }
 }
 
@@ -977,8 +977,9 @@ static void print_network_config_completion(unsigned int processed_mask,
     printf(" under %s/%s/network/.\n", target, container_name);
     if (network_config_mask_may_contain_secrets(processed_mask))
     {
-        printf("  This may include WiFi passwords stored as plain text. "
-               "Anyone with access to this backup can read them.\n");
+        printf("  This may include secrets such as WiFi passwords, PSKs, "
+               "or VPN keys, stored as plain text. Anyone with access to "
+               "this backup can read them.\n");
     }
 }
 
