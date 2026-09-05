@@ -2831,3 +2831,269 @@ for every backend; netctl's `hooks/` and `interfaces/` directories are not trave
   settings are commonly managed by the target's network stack; static host
   mappings are separate system policy, not saved connection profiles. Custom
   entries may need manual migration: DHCP does not recreate `/etc/hosts`.
+
+---
+
+## D34 — 2026-09-05 — Persistent scope configuration compiles to one selection and restore map
+
+**Status:** Decided — not implemented
+
+**Decision:** `migr conf` edits persistent filesystem selection rules for critical
+and comprehensive backups. Include entries are requests for coverage, not physical
+backup roots. Compile their union, minus the active scope's exclusions, into one
+immutable plan shared by reporting, estimation, preflight, native/portable capture,
+and resume. Preserve XDG restore addresses when a broader include covers an XDG
+root. Ordinary repeated or containing includes are supported, not user errors.
+
+### Interface and configuration lifecycle
+
+The file is `$XDG_CONFIG_HOME/migr/migr.conf` when XDG_CONFIG_HOME is nonempty and
+absolute, otherwise `$HOME/.config/migr/migr.conf`. Only this user file is read;
+there is no CWD search, system-file merging, or per-run `--conf` option. HOME and
+config lookup use the invocation's environment consistently. In particular, do not
+select another user's config from SUDO_USER while backup still selects the current
+HOME. Changed HOME/config variables under sudo select a different context.
+
+`migr conf` takes no positional arguments or backup/report options. On first use it
+creates private missing directories (0700) and publishes a complete template file
+(0600) without replacement. Existing contents, permissions and comments are not
+rewritten. Concurrent initial creation must not expose an incomplete template.
+Regular files reached through symlinks are supported; open the resolved existing
+file in the editor. A dangling link or non-regular target is an error, not an
+invitation to replace it. Backup/report never create the file.
+
+Choose the first nonempty EDITOR, VISUAL, or fallback `vi`. Tokenize whitespace,
+single/double quotes and backslash quoting into bounded argv without shell
+expansion, append the absolute file path as one argument, and run via fork/exec
+with inherited terminal streams. No `sh -c`, pipelines, substitutions or command
+chaining; metacharacters are never executed by a shell. Malformed quoting fails.
+Do not silently substitute another editor after the chosen one fails. Editors
+that detach require a wait option. After successful editor exit, parse the saved
+file and report syntax errors with file/line; leave invalid edits available for
+repair. Existing invalid syntax must not prevent opening the editor.
+
+Missing config means empty rules. Other read failures and invalid syntax fail
+commands that consume it before target mutation. Read a bounded snapshot once per
+invocation; never re-read it during traversal. Detect observable concurrent
+in-place modification rather than combining snapshots. An atomic replacement can
+yield the complete old or new file. Restore, help and explicit-path backup do not
+consume scope config; conf can reopen invalid files and validate after editing.
+
+### Grammar and selection semantics
+
+The generated template contains only comments and these empty sections:
+
+```ini
+# Includes in critical also apply to comprehensive; do not repeat them.
+# Excludes apply only to their own scope. Repeat them to exclude from both.
+# Excludes win over includes. Paths are HOME-relative unless absolute.
+[critical]
+    [include]
+
+    [exclude]
+
+[comprehensive]
+    [include]
+
+    [exclude]
+```
+
+This is a small two-level grammar, not general INI. Indentation is presentation;
+section names select state. Each top-level section occurs at most once; each child
+occurs at most once within its parent. Missing sections and an empty file mean
+empty rules. Unknown/repeated headers or values outside include/exclude fail.
+Accept LF/CRLF, blank lines, and full-line `#` comments; no inline comments.
+
+One path per line: bare values trim outer whitespace but preserve interior spaces.
+A value beginning with a double quote must be a complete quoted value, with no
+trailing non-whitespace. Quoted values accept only `\\`, `\"`, `\n`, `\r`, `\t`,
+and `\xHH` escapes; bare backslashes are literal. Quote leading whitespace, `#`,
+and header-shaped filenames. Reject NUL, invalid escapes and truncated input.
+Limits are 1 MiB per file, 4096 rules total, and PATH_MAX-1 decoded bytes per path;
+enforce bounds before allocation or truncation. Existing manifest root limits
+still apply to the compiled plan, not to directory-entry counts.
+
+Let Bc/Bf be the built-in critical/comprehensive selections, Ic/If the configured
+includes, and Ec/Ef the exclusions. The selected source pathname sets are:
+
+- Critical: `(Bc union Ic) minus Ec`.
+- Comprehensive: `(Bf union Ic union If) minus Ef`.
+
+Excludes do not inherit. They apply to every selected occurrence of the path,
+regardless of which include selected it. A directory exclusion prunes the entire
+subtree, and an include cannot reopen a descendant. Rule order and duplicates have
+no effect. Paths, not inode identity or file content, determine exclusion; another
+included name for the same inode remains selected. Globs, regex, shell expansion,
+and nested config-file inclusion are outside this grammar.
+
+Relative paths and `~/...` are relative to HOME, not CWD or config location.
+Absolute paths are accepted. Normalize components using D16's leaf-preserving
+source addressing: final symlinks are selected objects, not traversed targets.
+Match only complete pathname components, never lexical prefixes. Resolve retained
+ancestors without opening intentionally excluded descendants. Missing exclusions
+remain valid rules. A missing or inaccessible include surviving exclusion fails;
+missing optional built-ins remain skippable. Invalid paths cannot be hidden by
+exclusion. Preserve D16's MANUAL_NATIVE external-root policy and portable refusal
+for surviving manual-only regions; config does not authorize arbitrary automatic
+system-file restore. Preserve the conservative backup-destination containment gate.
+
+Package export and the self/network flags remain independent. Payload exclusions
+do not cancel separately requested network capture. Explicit-path backups keep
+their current selection/validation contract. Restore never applies current config
+and never interprets exclusions as requests to delete existing target files.
+
+### Source ownership: a forest of roots with delegated subtrees
+
+Retain disjoint physical payload directories `data/<root-id>`. Allow *source*
+roots to nest when they have different restore mappings. A parent walk skips the
+entire source subtree assigned to a child root, including the child directory's
+own metadata; the child owns that subtree's root entry. Derive these internal
+boundaries from the nearest containing source root, not from user excludes and
+not by expanding every filesystem entry into a manifest root.
+
+Compilation proceeds as follows:
+
+1. Resolve the active built-in and configured candidates, apply whole-root
+   exclusions, collapse identical selections, and sort canonically. Retained XDG
+   boundaries come from the active built-in scope, not from guessing that every
+   directory named Documents has XDG meaning. A redundant configured descendant
+   inherits its selected ancestor's mapping and adds no root.
+2. For a selected source address, prefer its active XDG mapping over a broader
+   HOME_RELATIVE or MANUAL_NATIVE mapping. Deeper active XDG roots override
+   enclosing roots in their own subtrees. If multiple XDG keys resolve to the same
+   source address, select the first in the fixed `xdg_keys` order and report that
+   aliasing in preview; do not copy the same source tree to multiple destinations.
+   An XDG directory resolving to source HOME itself uses HOME-relative mapping,
+   avoiding relocation of all HOME contents into one target user directory.
+3. Collapse containing roots with equivalent restore mappings, including a broad
+   `.config` include and its HOME_RELATIVE browser roots. Retain boundaries where
+   the mapping differs. Canonicalize redundant requests before assigning ids.
+4. Keep surviving built-in ids. Give remaining configured roots `CONFIG_n` ids in
+   normalized absolute source-path order and use those ids for their payload
+   directories. Canonical sorting and alias choice must not depend on config order
+   or directory enumeration. A redundant include must not rename existing roots.
+5. For each root, derive its immediate child-root source boundaries and compile
+   applicable user excludes into root-relative matching rules. A source entry is
+   captured only by its deepest owning root and only if not user-excluded. A
+   global exclusion covering a delegated child removes that child as well; an
+   internal boundary never discards its child's selected data.
+
+Directory entries retained as ancestors of a delegated region belong to the
+parent; the delegated root directory belongs to the child. The physical parent
+payload contains no placeholder at the delegation boundary. All source scans,
+size calculations, hardlink seeding and reconciliation obey the same ownership
+forest. Validate the forest and physical payload disjointness before walking.
+The current source-prefix overlap validator cannot remain an unconditional
+rejection for these compiled scopes; positional explicit validation is unchanged.
+
+### Target mapping, collisions and directory metadata
+
+Resolve each automatic root to the target HOME-relative or XDG address and append
+its root-relative logical paths. Resolve target XDG once per restore. Source
+ownership decides what exists in the backup; target mapping must never prune an
+ordinary retained sibling merely because it lies under another root's target.
+
+Preflight the combined mapped entry set before mutation on both representations.
+Reject two distinct source entries mapping to the same destination, including two
+directories with competing metadata, and reject non-directory ancestors, symlink
+redirects and destination-filesystem name collisions. Nested destination roots
+alone are not errors: a mapped child may be created below a retained parent
+*directory* without colliding with an entry at the child's exact path. Existing
+target directories keep the ordinary restore merge behavior; collisions between
+two planned source entries are not resolved by last-writer-wins.
+
+Restore creates necessary structural parents, places regular/special entries and
+hardlink aliases under existing safety contracts, then applies captured directory
+metadata globally in descending destination depth across roots. Structural parents
+without a captured source directory have no invented source metadata. Native
+per-root completion must not finalize HOME metadata before a later XDG child
+modifies it; extend the native replay orchestration accordingly. Portable's global
+three-pass replay is a useful existing seam, but its combined destination checks
+must also enforce this contract. Cross-root hardlinks retain existing fidelity and
+cross-filesystem behavior, never becoming selection deduplication keys.
+
+### Persistence and compatibility
+
+Use manifest **format VERSION=2** for plans carrying nonempty exclusions or source
+delegation boundaries. This is a storage compatibility boundary, not a staged
+feature release. Older binaries reject VERSION=2 through unknown-version handling.
+New readers retain legacy and VERSION=1 support. Ordinary unfiltered, source-disjoint
+plans continue to write VERSION=1; no config and an empty config remain identical,
+including adoption of existing compatible unfiltered partials.
+
+VERSION=2 retains the existing header and ROOT grammar and adds:
+
+- Required `SOURCE_HOME=<path>` immediately before ROOT_COUNT: canonical absolute
+  source HOME, encoded with ENCODING_MODE_MANIFEST_PATH. It anchors HOME_RELATIVE
+  SOURCE fields when reconstructing the source forest without the source machine.
+- Required `EXCLUDE_COUNT=<decimal>` immediately after the ROOT lines, followed by
+  exactly that many `EXCLUDE PATH=<path>` lines and EOF. Paths are normalized
+  absolute source addresses, encoded with the same manifest path codec, sorted in
+  byte order and reduced by ancestor coverage. Empty paths, NUL, noncanonical
+  components, duplicates, unknown fields and trailing records fail closed.
+
+Counts are bounded by 4096 roots and 4096 excludes; decoded fields retain their
+existing PATH_MAX bounds and encoded lines must be bounded by the codec's worst
+case expansion. Check aggregate allocation arithmetic. Serialization is canonical.
+Exclusions whose paths are currently absent remain persisted. The roots express
+the canonical selected coverage and mappings; do not persist redundant original
+include lines, comments, inactive scopes or editor/config paths. Child boundaries
+are derived from root source containment, avoiding a second, contradictory list.
+Validate source addresses, deterministic ownership and payload-directory separation
+when reading; entries found inside a parent's delegated or excluded region make a
+finalized backup inconsistent, not silently ignorable. Sidecar entry formats and
+CLAIM/tombstone durability ordering remain unchanged; the manifest changes which
+root is allowed to own an entry, not its metadata encoding.
+
+Resume equality includes the canonical active exclusions, source forest and
+restore mappings, in addition to D15's existing identity fields. Compare policy
+before the zero-root fast path. Changed active policy starts a fresh job and leaves
+the old partial intact; never clean an old partial into compliance with new rules.
+Equivalent duplicates/reorderings and redundant includes preserve identity.
+Critical includes affect comprehensive identity; critical exclusions do not.
+Comprehensive-only edits do not affect critical identity. Internal traversal
+boundaries participate through the canonical root map. Restore requires neither
+the original config file nor source HOME to exist; SOURCE_HOME is an address
+anchor for validation, not a path to open on the target.
+
+### Report, implementation boundaries and acceptance examples
+
+All report invocations use BackupPlan, with bare migr/report selecting critical,
+independent of whether config exists. Remove legacy report membership/total arrays
+and the scope_requested branch. Do not add Dev Tools or other catalog entries to
+preserve obsolete presentation. Browser and `.profile` membership remain unchanged;
+shell-startup/catalog completeness is a separate decision. Selected pathname sets
+agree across report and backup, while logical size versus allocation rounding and
+source-directory st_size retain their existing accounting contracts.
+
+| Selection and layout | Required outcome |
+| --- | --- |
+| Built-in Chrome plus Chrome include repeated twice | One selected tree, unchanged root identity and resume eligibility. |
+| `.config` include plus built-in browser roots | Entire retained `.config` tree once, including future application directories. |
+| HOME include; source Documents is `HOME/Belgeler`, target Documents is `HOME/Documents` | HOME payload omits Belgeler; XDG payload owns it. Restore puts its content in Documents and ordinary siblings under HOME. |
+| Above, with a distinct selected source `HOME/Documents` directory | Restore refuses the competing destination directory before mutation; it does not discard either source selection during backup. |
+| Source XDG roots nested; target XDG roots disjoint or nested | Deeper source region owns its entries; all mapped entries undergo combined collision checks and global directory metadata ordering. |
+| Same XDG source address under multiple keys | Fixed key precedence, one capture, alias reported; no duplicate restore. |
+| Critical-only exclusion of `Downloads/ISO` | Critical omits that subtree from traversal/space need; comprehensive can still include it. No ISO-specific code. |
+| Exclusion added after interruption, root list unchanged | Old partial is not adopted; new policy creates a new job. |
+| Restore with missing or conflicting local migr.conf | Restore follows the backup's map and leaves unrelated target files alone. |
+
+Before production CLI wiring, tests must cover parser/editor failures, absent and
+empty config parity, byte-safe paths, excluded unreadable entries, native/portable
+selected-set parity, hardlinks across ownership boundaries, destination collisions,
+post-order metadata across roots, format compatibility, and interrupted capture.
+Use isolated configuration/editor fixtures and real removable-filesystem gates.
+No ordinary include containment is left as a reduced-feature overlap refusal.
+
+**Rejected:** copy-time "already seen" skipping cannot repair a duplicated
+manifest or an earlier inflated estimate. A root for every directory entry makes
+root count/identity depend on incidental contents. Flattening everything into
+HOME loses locale mappings; keeping overlapping unfiltered roots duplicates data.
+Treating a user exclusion as a root-local workaround silently loses selected data.
+Keeping legacy report until config becomes nonempty preserves an incorrect total
+and makes presentation depend on configuration presence.
+
+**Relationship:** Extends D15/D16's configured-scope addressing while retaining
+explicit-path policy; preserves D17/D22 metadata/hardlink guarantees and D25's
+ownership/durability ordering. Report unification and later code must implement
+this decided contract before the feature is marked implemented.
