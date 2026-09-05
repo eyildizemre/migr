@@ -25,16 +25,49 @@
 #include "utils.h"
 #include "xdg.h"
 
-#define NETWORK_CONFIG_DEST_DIR "/etc/NetworkManager/system-connections"
+typedef enum {
+    NETWORK_CONFIG_APPLY_RELOAD,
+    NETWORK_CONFIG_APPLY_MANUAL,
+} NetworkConfigApplyMode;
+
+typedef struct {
+    const char *name;
+    const char *container_subdir;
+    const char *dest_dir;
+    NetworkConfigApplyMode apply_mode;
+    const char *manual_apply_hint;
+} RestoreNetworkConfigBackend;
+
+static const RestoreNetworkConfigBackend RESTORE_NETWORK_CONFIG_BACKENDS[] = {
+    { "NetworkManager", "networkmanager",
+      "/etc/NetworkManager/system-connections",
+      NETWORK_CONFIG_APPLY_RELOAD, NULL },
+    { "netplan", "netplan", "/etc/netplan",
+      NETWORK_CONFIG_APPLY_MANUAL, "sudo netplan apply" },
+    { "systemd-networkd", "systemd-networkd", "/etc/systemd/network",
+      NETWORK_CONFIG_APPLY_MANUAL, "sudo networkctl reload" },
+};
+
+#define NETWORK_CONFIG_BACKEND_COUNT \
+    (sizeof(RESTORE_NETWORK_CONFIG_BACKENDS) / \
+     sizeof(RESTORE_NETWORK_CONFIG_BACKENDS[0]))
 
 #ifdef RESTORE_TEST_HOOKS
-static const char *restore_test_network_config_dest_dir;
+static const char *restore_test_network_config_dest_dirs[NETWORK_CONFIG_BACKEND_COUNT];
 static RestoreTestNetworkReloadHook restore_test_network_reload_hook;
 static void *restore_test_network_reload_context;
 
-void restore_test_set_network_config_dest_dir(const char *dest_dir)
+void restore_test_set_network_config_dest_dir(const char *backend_name,
+                                              const char *dest_dir)
 {
-    restore_test_network_config_dest_dir = dest_dir;
+    for (size_t i = 0; i < NETWORK_CONFIG_BACKEND_COUNT; i++)
+    {
+        if (strcmp(RESTORE_NETWORK_CONFIG_BACKENDS[i].name, backend_name) == 0)
+        {
+            restore_test_network_config_dest_dirs[i] = dest_dir;
+            return;
+        }
+    }
 }
 
 void restore_test_set_network_reload_hook(RestoreTestNetworkReloadHook hook,
@@ -65,13 +98,13 @@ static void free_xdg_dirs(char **dirs)
         free(dirs[i]);
 }
 
-static const char *network_config_dest_dir(void)
+static const char *network_config_dest_dir(size_t backend_index)
 {
 #ifdef RESTORE_TEST_HOOKS
-    if (restore_test_network_config_dest_dir != NULL)
-        return restore_test_network_config_dest_dir;
+    if (restore_test_network_config_dest_dirs[backend_index] != NULL)
+        return restore_test_network_config_dest_dirs[backend_index];
 #endif
-    return NETWORK_CONFIG_DEST_DIR;
+    return RESTORE_NETWORK_CONFIG_BACKENDS[backend_index].dest_dir;
 }
 
 static int run_network_config_reload(void)
@@ -125,16 +158,23 @@ static int network_config_regular_count(DIR *dir, size_t *count)
     return failed ? -1 : 0;
 }
 
-static void report_network_config_unapplied(const char *dest_dir, int reason)
+static void report_network_config_unapplied(
+    const RestoreNetworkConfigBackend *backend, const char *dest_dir, int reason)
 {
-    printf("\nNetwork configuration\n");
+    printf("\nNetwork configuration (%s)\n", backend->name);
     printf("  Note: could not write saved network connections to %s (%s).\n"
-           "  The saved files are still in the backup's network/ directory. "
-           "To apply them manually, run as root:\n\n"
-           "    cp <backup>/network/* %s/\n"
-           "    chmod 600 %s/*\n"
-           "    nmcli connection reload\n",
-           dest_dir, strerror(reason), dest_dir, dest_dir);
+           "  The saved files are still in the backup's network/%s/ directory. "
+           "To copy them manually, run as root:\n\n"
+           "    cp <backup>/network/%s/* %s/\n"
+           "    chmod 600 %s/*\n",
+           dest_dir, strerror(reason), backend->container_subdir,
+           backend->container_subdir, dest_dir, dest_dir);
+    if (backend->apply_mode == NETWORK_CONFIG_APPLY_RELOAD)
+        printf("    nmcli connection reload\n");
+    else
+        printf("  When ready, run `%s`. This can briefly interrupt network "
+               "connectivity, so migr does not run it automatically.\n",
+               backend->manual_apply_hint);
 }
 
 // Returns 1 when a regular file was restored, 0 when the source entry was
@@ -257,133 +297,174 @@ static void restore_network_config(int source_root_fd, int *had_error)
         return;
     }
 
-    DIR *dir = fdopendir(network_fd);
-    if (dir == NULL)
+    int found_backend = 0;
+    for (size_t i = 0; i < NETWORK_CONFIG_BACKEND_COUNT; i++)
     {
-        int saved_errno = errno;
-        close(network_fd);
-        print_error("Error: Could not enumerate network/ in the backup: %s\n",
-                    strerror(saved_errno));
-        *had_error = 1;
-        return;
-    }
-
-    size_t regular_count = 0;
-    if (network_config_regular_count(dir, &regular_count) != 0)
-    {
-        *had_error = 1;
-        if (closedir(dir) != 0)
-            *had_error = 1;
-        return;
-    }
-    if (regular_count == 0)
-    {
-        if (closedir(dir) != 0)
-            *had_error = 1;
-        return;
-    }
-
-    const char *dest_dir = network_config_dest_dir();
-    if (dry_run)
-    {
-        printf("\nNetwork configuration\n");
-        printf("  Would restore %zu network connection file%s to %s/\n",
-               regular_count, regular_count == 1 ? "" : "s", dest_dir);
-        if (closedir(dir) != 0)
-            *had_error = 1;
-        return;
-    }
-
-    int dest_created = 0;
-    if (mkdir(dest_dir, 0700) == 0)
-        dest_created = 1;
-    else if (errno != EEXIST)
-    {
-        int saved_errno = errno;
-        report_network_config_unapplied(dest_dir, saved_errno);
-        closedir(dir);
-        return;
-    }
-
-    int dest_dir_fd = open(dest_dir,
-                           O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-    if (dest_dir_fd < 0)
-    {
-        int saved_errno = errno;
-        if (dest_created)
-            (void)rmdir(dest_dir);
-        report_network_config_unapplied(dest_dir, saved_errno);
-        closedir(dir);
-        return;
-    }
-    if (faccessat(dest_dir_fd, ".", W_OK | X_OK, AT_EACCESS) != 0)
-    {
-        int saved_errno = errno;
-        close(dest_dir_fd);
-        if (dest_created)
-            (void)rmdir(dest_dir);
-        report_network_config_unapplied(dest_dir, saved_errno);
-        closedir(dir);
-        return;
-    }
-
-    printf("\nNetwork configuration\n");
-    size_t restored = 0;
-    struct dirent *entry;
-    for (;;)
-    {
-        errno = 0;
-        entry = readdir(dir);
-        if (entry == NULL)
+        const RestoreNetworkConfigBackend *backend =
+            &RESTORE_NETWORK_CONFIG_BACKENDS[i];
+        int backend_fd = openat(network_fd, backend->container_subdir,
+                                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (backend_fd < 0)
         {
-            if (errno != 0)
+            if (errno != ENOENT)
             {
-                print_error("Error: Could not enumerate network/ in the backup\n");
+                found_backend = 1;
+                print_error("Error: Could not read network/%s/ in the backup: %s\n",
+                            backend->container_subdir, strerror(errno));
                 *had_error = 1;
             }
-            break;
-        }
-        if (strcmp(entry->d_name, ".") == 0 ||
-            strcmp(entry->d_name, "..") == 0)
             continue;
+        }
+        found_backend = 1;
 
-        int file_result = restore_network_config_file_at(
-            dirfd(dir), dest_dir_fd, entry->d_name);
-        if (file_result < 0)
+        DIR *dir = fdopendir(backend_fd);
+        if (dir == NULL)
         {
             int saved_errno = errno;
-            print_error("Error: Could not restore network/%s: %s\n",
-                        entry->d_name, strerror(saved_errno));
+            close(backend_fd);
+            print_error("Error: Could not enumerate network/ in the backup: %s\n",
+                        strerror(saved_errno));
             *had_error = 1;
             continue;
         }
-        if (file_result > 0)
-            restored++;
-    }
 
-    if (close(dest_dir_fd) != 0)
+        size_t regular_count = 0;
+        if (network_config_regular_count(dir, &regular_count) != 0)
+        {
+            *had_error = 1;
+            if (closedir(dir) != 0)
+                *had_error = 1;
+            continue;
+        }
+        if (regular_count == 0)
+        {
+            if (closedir(dir) != 0)
+                *had_error = 1;
+            continue;
+        }
+
+        const char *dest_dir = network_config_dest_dir(i);
+        if (dry_run)
+        {
+            printf("\nNetwork configuration (%s)\n", backend->name);
+            printf("  Would restore %zu network connection file%s to %s/\n",
+                   regular_count, regular_count == 1 ? "" : "s", dest_dir);
+            if (closedir(dir) != 0)
+                *had_error = 1;
+            continue;
+        }
+
+        int dest_created = 0;
+        if (mkdir(dest_dir, 0700) == 0)
+            dest_created = 1;
+        else if (errno != EEXIST)
+        {
+            int saved_errno = errno;
+            report_network_config_unapplied(backend, dest_dir, saved_errno);
+            closedir(dir);
+            continue;
+        }
+
+        int dest_dir_fd = open(dest_dir,
+                               O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (dest_dir_fd < 0)
+        {
+            int saved_errno = errno;
+            if (dest_created)
+                (void)rmdir(dest_dir);
+            report_network_config_unapplied(backend, dest_dir, saved_errno);
+            closedir(dir);
+            continue;
+        }
+        if (faccessat(dest_dir_fd, ".", W_OK | X_OK, AT_EACCESS) != 0)
+        {
+            int saved_errno = errno;
+            close(dest_dir_fd);
+            if (dest_created)
+                (void)rmdir(dest_dir);
+            report_network_config_unapplied(backend, dest_dir, saved_errno);
+            closedir(dir);
+            continue;
+        }
+
+        printf("\nNetwork configuration (%s)\n", backend->name);
+        size_t restored = 0;
+        struct dirent *entry;
+        for (;;)
+        {
+            errno = 0;
+            entry = readdir(dir);
+            if (entry == NULL)
+            {
+                if (errno != 0)
+                {
+                    print_error("Error: Could not enumerate network/ in the backup\n");
+                    *had_error = 1;
+                }
+                break;
+            }
+            if (strcmp(entry->d_name, ".") == 0 ||
+                strcmp(entry->d_name, "..") == 0)
+                continue;
+
+            int file_result = restore_network_config_file_at(
+                dirfd(dir), dest_dir_fd, entry->d_name);
+            if (file_result < 0)
+            {
+                int saved_errno = errno;
+                print_error("Error: Could not restore network/%s/%s: %s\n",
+                            backend->container_subdir, entry->d_name, strerror(saved_errno));
+                *had_error = 1;
+                continue;
+            }
+            if (file_result > 0)
+                restored++;
+        }
+
+        if (close(dest_dir_fd) != 0)
+        {
+            print_error("Error: Could not close network configuration destination: %s\n",
+                        strerror(errno));
+            *had_error = 1;
+        }
+        if (closedir(dir) != 0)
+        {
+            print_error("Error: Could not close network/ in the backup: %s\n",
+                        strerror(errno));
+            *had_error = 1;
+        }
+
+        if (restored == 0)
+            continue;
+
+        if (backend->apply_mode == NETWORK_CONFIG_APPLY_RELOAD)
+            printf("  Restored %zu network connection file%s\n",
+                   restored, restored == 1 ? "" : "s");
+        if (backend->apply_mode == NETWORK_CONFIG_APPLY_MANUAL)
+        {
+            printf("  Restored %zu %s file(s) to %s/. Run `%s` yourself when "
+                   "ready. This can briefly interrupt network connectivity, "
+                   "so migr does not run it automatically.\n",
+                   restored, backend->name, dest_dir, backend->manual_apply_hint);
+        }
+        else if (run_network_config_reload() != 0)
+        {
+            print_warning("Warning: restored network connection files, but "
+                          "'nmcli connection reload' did not succeed. Run it "
+                          "yourself, or restart NetworkManager, to apply them.\n");
+        }
+    }
+    if (!found_backend)
     {
-        print_error("Error: Could not close network configuration destination: %s\n",
-                    strerror(errno));
+        print_error("Error: manifest declares network configuration, but none "
+                    "of the known backend directories were present in network/\n");
         *had_error = 1;
     }
-    if (closedir(dir) != 0)
+    if (close(network_fd) != 0)
     {
         print_error("Error: Could not close network/ in the backup: %s\n",
                     strerror(errno));
         *had_error = 1;
-    }
-
-    if (restored == 0)
-        return;
-
-    printf("  Restored %zu network connection file%s\n",
-           restored, restored == 1 ? "" : "s");
-    if (run_network_config_reload() != 0)
-    {
-        print_warning("Warning: restored network connection files, but "
-                      "'nmcli connection reload' did not succeed. Run it "
-                      "yourself, or restart NetworkManager, to apply them.\n");
     }
 }
 

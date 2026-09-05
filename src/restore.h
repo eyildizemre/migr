@@ -4,7 +4,8 @@
 #ifdef RESTORE_TEST_HOOKS
 typedef int (*RestoreTestNetworkReloadHook)(char *const argv[], void *context);
 
-void restore_test_set_network_config_dest_dir(const char *dest_dir);
+void restore_test_set_network_config_dest_dir(const char *backend_name,
+                                              const char *dest_dir);
 void restore_test_set_network_reload_hook(RestoreTestNetworkReloadHook hook,
                                           void *context);
 #endif
@@ -26,8 +27,9 @@ void restore_test_set_network_reload_hook(RestoreTestNetworkReloadHook hook,
  * on an English target system); its absence falls back to the target system's
  * basename. If packages.txt is present, installs the listed packages via the
  * distro's package manager. A v1 manifest that records network configuration
- * also restores container-root network/ into NetworkManager's system
- * connections directory after the main payload succeeds.
+ * also restores container-root network/ backend directories after the main
+ * payload succeeds. NetworkManager profiles are reloaded best-effort; netplan
+ * and systemd-networkd configuration is written with manual apply instructions.
  *
  * @param source Path to the dated backup directory (e.g. /mnt/drive/migr_backup_20260519).
  * @return 0 on success or user cancellation, 1 on error.

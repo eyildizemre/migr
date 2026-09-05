@@ -478,7 +478,7 @@ static int file_content_is(const char *path, const char *content)
 static int record_network_reload(char *const argv[], void *context)
 {
     const char *marker_path = context;
-    FILE *f = fopen(marker_path, "w");
+    FILE *f = fopen(marker_path, "a");
     if (f == NULL)
         return -1;
     for (size_t i = 0; argv[i] != NULL; i++)
@@ -809,7 +809,7 @@ static void test_network_config_restore_success(void)
     write_network_manifest(source);
 
     char network_dir[PATH_MAX];
-    join_path(network_dir, sizeof(network_dir), source, "network");
+    join_path(network_dir, sizeof(network_dir), source, "network/networkmanager");
     mkdir_p(network_dir);
     char office_source[PATH_MAX], wifi_source[PATH_MAX];
     join_path(office_source, sizeof(office_source), network_dir,
@@ -841,7 +841,7 @@ static void test_network_config_restore_success(void)
     char reload_marker[PATH_MAX];
     join_path(reload_marker, sizeof(reload_marker), dest_parent,
               "reload.marker");
-    restore_test_set_network_config_dest_dir(dest_dir);
+    restore_test_set_network_config_dest_dir("NetworkManager", dest_dir);
     restore_test_set_network_reload_hook(record_network_reload, reload_marker);
 
     int previous_dry_run = dry_run;
@@ -851,7 +851,7 @@ static void test_network_config_restore_success(void)
                                               sizeof(output));
     dry_run = previous_dry_run;
     restore_test_set_network_reload_hook(NULL, NULL);
-    restore_test_set_network_config_dest_dir(NULL);
+    restore_test_set_network_config_dest_dir("NetworkManager", NULL);
 
     check(rc == 0, "live restore succeeds when the network destination is writable");
     check(file_matches(office_dest, "[connection]\nid=office\n", 0600),
@@ -886,7 +886,7 @@ static void test_network_config_restore_dry_run(void)
     write_network_manifest(source);
 
     char network_dir[PATH_MAX], saved_file[PATH_MAX];
-    join_path(network_dir, sizeof(network_dir), source, "network");
+    join_path(network_dir, sizeof(network_dir), source, "network/networkmanager");
     mkdir_p(network_dir);
     join_path(saved_file, sizeof(saved_file), network_dir, "wifi.nmconnection");
     write_file_mode(saved_file, "wifi", 0600);
@@ -895,7 +895,7 @@ static void test_network_config_restore_dry_run(void)
     join_path(dest_dir, sizeof(dest_dir), dest_parent, "system-connections");
     join_path(reload_marker, sizeof(reload_marker), dest_parent,
               "reload.marker");
-    restore_test_set_network_config_dest_dir(dest_dir);
+    restore_test_set_network_config_dest_dir("NetworkManager", dest_dir);
     restore_test_set_network_reload_hook(record_network_reload, reload_marker);
 
     int previous_dry_run = dry_run;
@@ -904,7 +904,7 @@ static void test_network_config_restore_dry_run(void)
     int rc = run_restore_capturing(source, output, sizeof(output));
     dry_run = previous_dry_run;
     restore_test_set_network_reload_hook(NULL, NULL);
-    restore_test_set_network_config_dest_dir(NULL);
+    restore_test_set_network_config_dest_dir("NetworkManager", NULL);
 
     check(rc == 0, "network dry-run succeeds");
     check(strstr(output, "Would restore 1 network connection file to") != NULL &&
@@ -932,7 +932,7 @@ static void test_network_config_reload_failure_is_best_effort(void)
     write_network_manifest(source);
 
     char network_dir[PATH_MAX], saved_file[PATH_MAX];
-    join_path(network_dir, sizeof(network_dir), source, "network");
+    join_path(network_dir, sizeof(network_dir), source, "network/networkmanager");
     mkdir_p(network_dir);
     join_path(saved_file, sizeof(saved_file), network_dir, "wifi.nmconnection");
     write_file_mode(saved_file, "wifi", 0600);
@@ -941,7 +941,7 @@ static void test_network_config_reload_failure_is_best_effort(void)
     join_path(dest_dir, sizeof(dest_dir), dest_parent, "system-connections");
     join_path(reload_marker, sizeof(reload_marker), dest_parent,
               "reload.marker");
-    restore_test_set_network_config_dest_dir(dest_dir);
+    restore_test_set_network_config_dest_dir("NetworkManager", dest_dir);
     restore_test_set_network_reload_hook(record_failed_network_reload,
                                          reload_marker);
 
@@ -952,7 +952,7 @@ static void test_network_config_reload_failure_is_best_effort(void)
                                               sizeof(output));
     dry_run = previous_dry_run;
     restore_test_set_network_reload_hook(NULL, NULL);
-    restore_test_set_network_config_dest_dir(NULL);
+    restore_test_set_network_config_dest_dir("NetworkManager", NULL);
 
     check(rc == 0, "reload failure does not mark an otherwise successful restore failed");
     check(strstr(output,
@@ -979,7 +979,7 @@ static void test_network_config_restore_continues_after_file_error(void)
     write_network_manifest(source);
 
     char network_dir[PATH_MAX];
-    join_path(network_dir, sizeof(network_dir), source, "network");
+    join_path(network_dir, sizeof(network_dir), source, "network/networkmanager");
     mkdir_p(network_dir);
     char bad_source[PATH_MAX], good_source[PATH_MAX];
     join_path(bad_source, sizeof(bad_source), network_dir, "bad.nmconnection");
@@ -997,7 +997,7 @@ static void test_network_config_restore_continues_after_file_error(void)
     join_path(good_dest, sizeof(good_dest), dest_dir, "good.nmconnection");
     join_path(reload_marker, sizeof(reload_marker), dest_parent,
               "reload.marker");
-    restore_test_set_network_config_dest_dir(dest_dir);
+    restore_test_set_network_config_dest_dir("NetworkManager", dest_dir);
     restore_test_set_network_reload_hook(record_network_reload, reload_marker);
 
     int previous_dry_run = dry_run;
@@ -1007,10 +1007,10 @@ static void test_network_config_restore_continues_after_file_error(void)
                                               sizeof(output));
     dry_run = previous_dry_run;
     restore_test_set_network_reload_hook(NULL, NULL);
-    restore_test_set_network_config_dest_dir(NULL);
+    restore_test_set_network_config_dest_dir("NetworkManager", NULL);
 
     check(rc != 0, "an unexpected per-file failure marks the overall restore failed");
-    check(strstr(output, "Could not restore network/bad.nmconnection") != NULL,
+    check(strstr(output, "Could not restore network/networkmanager/bad.nmconnection") != NULL,
           "the failed connection file is identified");
     check(file_matches(good_dest, "good", 0600),
           "later regular connection files are still restored");
@@ -1035,13 +1035,13 @@ static void test_network_config_restore_empty(void)
     write_network_manifest(source);
 
     char network_dir[PATH_MAX];
-    join_path(network_dir, sizeof(network_dir), source, "network");
+    join_path(network_dir, sizeof(network_dir), source, "network/networkmanager");
     mkdir_p(network_dir);
     char dest_dir[PATH_MAX], reload_marker[PATH_MAX];
     join_path(dest_dir, sizeof(dest_dir), dest_parent, "system-connections");
     join_path(reload_marker, sizeof(reload_marker), dest_parent,
               "reload.marker");
-    restore_test_set_network_config_dest_dir(dest_dir);
+    restore_test_set_network_config_dest_dir("NetworkManager", dest_dir);
     restore_test_set_network_reload_hook(record_network_reload, reload_marker);
 
     int previous_dry_run = dry_run;
@@ -1051,7 +1051,7 @@ static void test_network_config_restore_empty(void)
                                               sizeof(output));
     dry_run = previous_dry_run;
     restore_test_set_network_reload_hook(NULL, NULL);
-    restore_test_set_network_config_dest_dir(NULL);
+    restore_test_set_network_config_dest_dir("NetworkManager", NULL);
 
     check(rc == 0, "an empty saved network directory does not fail restore");
     check(strstr(output, "Network configuration") == NULL,
@@ -1078,7 +1078,7 @@ static void test_network_config_restore_unapplied_note(void)
     write_network_manifest(source);
 
     char network_dir[PATH_MAX], saved_file[PATH_MAX];
-    join_path(network_dir, sizeof(network_dir), source, "network");
+    join_path(network_dir, sizeof(network_dir), source, "network/networkmanager");
     mkdir_p(network_dir);
     join_path(saved_file, sizeof(saved_file), network_dir, "wifi.nmconnection");
     write_file_mode(saved_file, "wifi", 0600);
@@ -1089,7 +1089,7 @@ static void test_network_config_restore_unapplied_note(void)
     join_path(dest_dir, sizeof(dest_dir), blocker, "system-connections");
     join_path(reload_marker, sizeof(reload_marker), dest_parent,
               "reload.marker");
-    restore_test_set_network_config_dest_dir(dest_dir);
+    restore_test_set_network_config_dest_dir("NetworkManager", dest_dir);
     restore_test_set_network_reload_hook(record_network_reload, reload_marker);
 
     int previous_dry_run = dry_run;
@@ -1099,12 +1099,12 @@ static void test_network_config_restore_unapplied_note(void)
                                               sizeof(output));
     dry_run = previous_dry_run;
     restore_test_set_network_reload_hook(NULL, NULL);
-    restore_test_set_network_config_dest_dir(NULL);
+    restore_test_set_network_config_dest_dir("NetworkManager", NULL);
 
     check(rc == 0,
           "an unavailable network destination does not mark the overall restore failed");
     check(strstr(output, "Note: could not write saved network connections") != NULL &&
-              strstr(output, "saved files are still in the backup's network/ directory") != NULL,
+              strstr(output, "saved files are still in the backup's network/networkmanager/ directory") != NULL,
           "the note explains that the saved connections remain in the backup");
     check(access(reload_marker, F_OK) != 0,
           "an unapplied network restore does not invoke reload");
@@ -1140,6 +1140,109 @@ static void test_network_config_restore_requires_declared_directory(void)
     remove_tree(home);
 }
 
+static void test_network_config_backends(unsigned int mask, int blocked_netplan,
+                                         int broken_netplan, int preview)
+{
+    printf(BLUE "::" NC " network config: backend isolation (%u, %d, %d, %d)\n",
+           mask, blocked_netplan, broken_netplan, preview);
+    const char *names[] = { "NetworkManager", "netplan", "systemd-networkd" };
+    const char *subdirs[] = { "networkmanager", "netplan", "systemd-networkd" };
+    const char *files[] = { "wifi.nmconnection", "01-network.yaml", "10-wired.network" };
+    const char *contents[] = { "[connection]\nid=wifi\n", "network: {version: 2}\n",
+                               "[Match]\nName=eth0\n" };
+    char source[PATH_MAX], home[PATH_MAX], target[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "backends_src");
+    fresh_mkdtemp(home, sizeof(home), "backends_home");
+    fresh_mkdtemp(target, sizeof(target), "backends_dest");
+    setenv("HOME", home, 1);
+    write_network_manifest(source);
+    char network[PATH_MAX], dest[3][PATH_MAX], marker[PATH_MAX];
+    join_path(network, sizeof(network), source, "network");
+    mkdir_p(network);
+    join_path(marker, sizeof(marker), target, "reload.marker");
+    for (size_t i = 0; i < 3; i++)
+    {
+        char backend[PATH_MAX], file[PATH_MAX];
+        join_path(backend, sizeof(backend), network, subdirs[i]);
+        join_path(dest[i], sizeof(dest[i]), target, subdirs[i]);
+        restore_test_set_network_config_dest_dir(names[i], dest[i]);
+        if (!(mask & (1u << i)))
+            continue;
+        if (i == 1 && broken_netplan)
+        {
+            write_file_mode(backend, "not a directory", 0600);
+            continue;
+        }
+        mkdir_p(backend);
+        join_path(file, sizeof(file), backend, files[i]);
+        write_file_mode(file, contents[i], 0600);
+        if (i == 1 && blocked_netplan)
+        {
+            mkdir_p(dest[i]);
+            if (chmod(dest[i], 0500) != 0)
+                exit(1);
+        }
+    }
+    restore_test_set_network_reload_hook(record_network_reload, marker);
+    int previous_dry_run = dry_run;
+    dry_run = preview;
+    char output[16384];
+    int rc = run_restore_capturing_with_input(source, "y\n", output, sizeof(output));
+    dry_run = previous_dry_run;
+    restore_test_set_network_reload_hook(NULL, NULL);
+    for (size_t i = 0; i < 3; i++)
+        restore_test_set_network_config_dest_dir(names[i], NULL);
+    check((rc != 0) == (mask == 0 || broken_netplan),
+          "only missing backends or corrupt sources fail restore");
+    for (size_t i = 0; i < 3; i++)
+    {
+        char file[PATH_MAX];
+        join_path(file, sizeof(file), dest[i], files[i]);
+        int expected = (mask & (1u << i)) && !preview &&
+                       !(i == 1 && (blocked_netplan || broken_netplan));
+        check(expected ? file_matches(file, contents[i], 0600) : access(file, F_OK) != 0,
+              "each backend restores only its own saved bytes and mode");
+    }
+    if ((mask & 1u) && !preview)
+        check(file_content_is(marker, "sudo\nnmcli\nconnection\nreload\n"),
+              "only NetworkManager invokes the reload hook, exactly once");
+    else
+        check(access(marker, F_OK) != 0, "no automatic reload without live NetworkManager files");
+    if (!preview && (mask & 2u) && !broken_netplan)
+        check(strstr(output, "sudo netplan apply") != NULL &&
+              strstr(output, "interrupt network connectivity") != NULL,
+              "netplan explains manual apply and interruption risk");
+    if (!preview && (mask & 4u))
+        check(strstr(output, "sudo networkctl reload") != NULL &&
+              strstr(output, "interrupt network connectivity") != NULL,
+              "networkd explains manual reload and interruption risk");
+    if (blocked_netplan)
+    {
+        check(strstr(output, "Note: could not write") != NULL &&
+              strstr(output, "network/netplan/") != NULL,
+              "unwritable backend identifies the saved source in an informational note");
+        if (chmod(dest[1], 0700) != 0)
+            exit(1);
+    }
+    if (broken_netplan)
+        check(strstr(output, "Could not read network/netplan/") != NULL,
+              "a corrupt backend source is identified while later backends succeed");
+    if (broken_netplan && mask == (1u << 1))
+        check(strstr(output, "none of the known backend directories were present") == NULL,
+              "a corrupt sole backend is not also reported as entirely missing");
+    if (mask == 0)
+        check(strstr(output, "none of the known backend directories were present") != NULL &&
+              strstr(output, "network/ is missing") == NULL,
+              "missing backend directories are distinct from a missing network directory");
+    if (preview)
+        check(strstr(output, "sudo netplan apply") == NULL &&
+              strstr(output, "sudo networkctl reload") == NULL,
+              "dry-run emits no live apply instructions");
+    remove_tree(source);
+    remove_tree(home);
+    remove_tree(target);
+}
+
 int main(void)
 {
     printf(BLUE "::" NC " restore dispatch (unit)\n");
@@ -1158,6 +1261,14 @@ int main(void)
     test_v1_restores_home_relative_and_xdg_reports_manual_native();
     test_v1_empty_restore_path_means_home_itself();
     test_v1_restore_space_preflight();
+    test_network_config_backends(2, 0, 0, 0);
+    test_network_config_backends(4, 0, 0, 0);
+    test_network_config_backends(7, 0, 0, 0);
+    test_network_config_backends(7, 1, 0, 0);
+    test_network_config_backends(7, 0, 1, 0);
+    test_network_config_backends(7, 0, 0, 1);
+    test_network_config_backends(0, 0, 0, 0);
+    test_network_config_backends(2, 0, 1, 0);
     test_network_config_restore_success();
     test_network_config_restore_dry_run();
     test_network_config_reload_failure_is_best_effort();
