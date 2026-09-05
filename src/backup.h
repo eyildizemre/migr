@@ -38,8 +38,8 @@ typedef enum {
  *               BACKUP_EXPLICIT_PATHS, ignored otherwise.
  * @param include_self Non-zero to require and copy the validated static migr
  *                     binary into the container root (docs/DECISIONS.md D9).
- * @param include_network_config Non-zero to require and copy NetworkManager
- *                               connection files into container-root network/.
+ * @param include_network_config Non-zero to capture supported system network
+ *                               configuration under container-root network/.
  * @return 0 on success, 1 on error.
  */
 int backup(const char *target, BackupMode mode, char **paths, int include_self,
@@ -82,7 +82,8 @@ typedef void (*BackupTestProgressHook)(off_t bytes_copied,
 void backup_test_set_progress_hook(BackupTestProgressHook hook,
                                    void *context);
 
-void backup_test_set_network_config_source_dir(const char *source_dir);
+void backup_test_set_network_config_source_dir(const char *backend_name,
+                                               const char *source_dir);
 #endif
 
 #endif

@@ -1877,7 +1877,7 @@ static void test_include_self_backup(void)
 
 static void test_include_network_config_backup(void)
 {
-    printf(BLUE "::" NC " production: --include-network-config validates, copies, records, and warns\n");
+    printf(BLUE "::" NC " production: --include-network-config handles multiple network backends\n");
 
     char home[PATH_MAX];
     fresh_mkdtemp(home, sizeof(home), "plan_network_home");
@@ -1886,6 +1886,12 @@ static void test_include_network_config_backup(void)
     join_path(source, sizeof(source), home, "source.txt");
     write_file(source, "network-copy payload");
     char *paths[] = { source, NULL };
+
+    char missing_nm[PATH_MAX], missing_netplan[PATH_MAX], missing_networkd[PATH_MAX];
+    join_path(missing_nm, sizeof(missing_nm), home, "missing-networkmanager");
+    join_path(missing_netplan, sizeof(missing_netplan), home, "missing-netplan");
+    join_path(missing_networkd, sizeof(missing_networkd), home,
+              "missing-systemd-networkd");
 
     char network_source[PATH_MAX];
     fresh_mkdtemp(network_source, sizeof(network_source), "plan_network_source");
@@ -1906,7 +1912,10 @@ static void test_include_network_config_backup(void)
         printf(RED "fixture: could not prepare network configuration source" NC "\n");
         exit(1);
     }
-    backup_test_set_network_config_source_dir(network_source);
+    backup_test_set_network_config_source_dir("NetworkManager", network_source);
+    backup_test_set_network_config_source_dir("netplan", missing_netplan);
+    backup_test_set_network_config_source_dir("systemd-networkd",
+                                              missing_networkd);
 
     char live_target[PATH_MAX];
     fresh_mkdtemp(live_target, sizeof(live_target), "plan_network_live");
@@ -1924,23 +1933,25 @@ static void test_include_network_config_backup(void)
 
     if (have_container)
     {
-        char network_dir[PATH_MAX], copied_wifi[PATH_MAX], copied_vpn[PATH_MAX];
+        char network_dir[PATH_MAX], nm_dir[PATH_MAX];
+        char copied_wifi[PATH_MAX], copied_vpn[PATH_MAX];
         char skipped_link[PATH_MAX], skipped_fifo[PATH_MAX], skipped_denied_dir[PATH_MAX];
         join_path(network_dir, sizeof(network_dir), container, "network");
-        join_path(copied_wifi, sizeof(copied_wifi), network_dir,
+        join_path(nm_dir, sizeof(nm_dir), network_dir, "networkmanager");
+        join_path(copied_wifi, sizeof(copied_wifi), nm_dir,
                   "home.nmconnection");
-        join_path(copied_vpn, sizeof(copied_vpn), network_dir,
+        join_path(copied_vpn, sizeof(copied_vpn), nm_dir,
                   "work-vpn.nmconnection");
-        join_path(skipped_link, sizeof(skipped_link), network_dir,
+        join_path(skipped_link, sizeof(skipped_link), nm_dir,
                   "linked.nmconnection");
-        join_path(skipped_fifo, sizeof(skipped_fifo), network_dir,
+        join_path(skipped_fifo, sizeof(skipped_fifo), nm_dir,
                   "runtime.lock");
-        join_path(skipped_denied_dir, sizeof(skipped_denied_dir), network_dir,
+        join_path(skipped_denied_dir, sizeof(skipped_denied_dir), nm_dir,
                   "private-state");
 
         check(files_are_equal(wifi, copied_wifi) &&
                   files_are_equal(vpn, copied_vpn),
-              "regular connection files are copied byte-for-byte under network/");
+              "NetworkManager files are copied byte-for-byte under network/networkmanager/");
 
         struct stat source_st, copied_st;
         int source_mode_ok = stat(wifi, &source_st) == 0;
@@ -1971,53 +1982,82 @@ static void test_include_network_config_backup(void)
 
     check(strstr(live_output, "WiFi passwords") != NULL &&
               strstr(live_output, "plain text") != NULL &&
+              strstr(live_output, "Captured NetworkManager") != NULL &&
               strstr(live_output, "/network/") != NULL,
-          "completion warns about plaintext WiFi passwords and names network/");
+          "NetworkManager completion names the backend and warns about plaintext secrets");
     check(strstr(live_output, "skipping symbolic link") != NULL &&
               strstr(live_output, "skipping non-regular") != NULL,
           "odd source entries are reported and skipped");
 
     char empty_source[PATH_MAX];
     fresh_mkdtemp(empty_source, sizeof(empty_source), "plan_network_empty_source");
-    backup_test_set_network_config_source_dir(empty_source);
+    backup_test_set_network_config_source_dir("NetworkManager", empty_source);
+    backup_test_set_network_config_source_dir("netplan", missing_netplan);
+    backup_test_set_network_config_source_dir("systemd-networkd",
+                                              missing_networkd);
     char empty_target[PATH_MAX];
     fresh_mkdtemp(empty_target, sizeof(empty_target), "plan_network_empty_target");
     char empty_output[8192];
     int empty_rc = run_backup_capturing_with_options(
         empty_target, BACKUP_EXPLICIT_PATHS, paths, 0, 1,
         empty_output, sizeof(empty_output));
-    char empty_container[PATH_MAX], empty_network[PATH_MAX];
+    char empty_container[PATH_MAX], empty_network[PATH_MAX], empty_nm[PATH_MAX];
     int have_empty_container = find_container_dir(
         empty_target, empty_container, sizeof(empty_container));
     if (have_empty_container)
+    {
         join_path(empty_network, sizeof(empty_network), empty_container, "network");
+        join_path(empty_nm, sizeof(empty_nm), empty_network, "networkmanager");
+    }
     check(empty_rc == 0 && have_empty_container && dir_exists(empty_network) &&
-              directory_empty(empty_network),
-          "an empty readable source creates an empty network/ and still succeeds");
+              dir_exists(empty_nm) && directory_empty(empty_nm),
+          "an empty readable backend creates its empty subdirectory and still succeeds");
     if (have_empty_container)
     {
         Manifest manifest;
         ManifestStatus status = manifest_read_v1(empty_container, &manifest);
         check(status == MANIFEST_STATUS_VALID &&
                   manifest.has_network_config == 1,
-              "an empty network/ is still recorded as NETWORK_CONFIG=1");
+              "an empty readable backend is still recorded as NETWORK_CONFIG=1");
         if (status == MANIFEST_STATUS_VALID)
             manifest_free(&manifest);
     }
 
-    char missing_source[PATH_MAX];
-    join_path(missing_source, sizeof(missing_source), network_source, "missing");
-    backup_test_set_network_config_source_dir(missing_source);
+    backup_test_set_network_config_source_dir("NetworkManager", missing_nm);
+    backup_test_set_network_config_source_dir("netplan", missing_netplan);
+    backup_test_set_network_config_source_dir("systemd-networkd",
+                                              missing_networkd);
     char missing_target[PATH_MAX];
     fresh_mkdtemp(missing_target, sizeof(missing_target), "plan_network_missing");
     char missing_output[8192];
     int missing_rc = run_backup_capturing_with_options(
         missing_target, BACKUP_EXPLICIT_PATHS, paths, 0, 1,
         missing_output, sizeof(missing_output));
-    check(missing_rc == 1 && directory_empty(missing_target),
-          "a missing NetworkManager directory refuses before reserving a container");
-    check(strstr(missing_output, "does not exist on this system") != NULL,
-          "the missing-directory refusal is distinct from a permission failure");
+    char missing_container[PATH_MAX], missing_network[PATH_MAX];
+    int have_missing_container = find_container_dir(
+        missing_target, missing_container, sizeof(missing_container));
+    if (have_missing_container)
+        join_path(missing_network, sizeof(missing_network), missing_container,
+                  "network");
+    struct stat missing_network_st;
+    check(missing_rc == 0 && have_missing_container &&
+              lstat(missing_network, &missing_network_st) != 0 &&
+              errno == ENOENT,
+          "all-ENOENT backends still produce a successful backup with no network/");
+    if (have_missing_container)
+    {
+        Manifest manifest;
+        ManifestStatus status = manifest_read_v1(missing_container, &manifest);
+        check(status == MANIFEST_STATUS_VALID &&
+                  manifest.has_network_config == 0,
+              "all-ENOENT backends leave NETWORK_CONFIG unset");
+        if (status == MANIFEST_STATUS_VALID)
+            manifest_free(&manifest);
+    }
+    check(strstr(missing_output, "found no network configuration") != NULL &&
+              strstr(missing_output,
+                     "NetworkManager, netplan, systemd-networkd") != NULL,
+          "all-ENOENT completion reports that no supported backend was found");
 
     if (geteuid() != 0)
     {
@@ -2028,7 +2068,10 @@ static void test_include_network_config_backup(void)
             printf(RED "fixture: could not restrict network source" NC "\n");
             exit(1);
         }
-        backup_test_set_network_config_source_dir(denied_source);
+        backup_test_set_network_config_source_dir("NetworkManager", denied_source);
+        backup_test_set_network_config_source_dir("netplan", missing_netplan);
+        backup_test_set_network_config_source_dir("systemd-networkd",
+                                                  missing_networkd);
         char denied_target[PATH_MAX];
         fresh_mkdtemp(denied_target, sizeof(denied_target), "plan_network_denied_target");
         char denied_output[8192];
@@ -2036,9 +2079,10 @@ static void test_include_network_config_backup(void)
             denied_target, BACKUP_EXPLICIT_PATHS, paths, 0, 1,
             denied_output, sizeof(denied_output));
         check(denied_rc == 1 && directory_empty(denied_target),
-              "an unreadable NetworkManager directory refuses before a container");
-        check(strstr(denied_output, "Root privileges are required") != NULL,
-              "the permission refusal names the required privilege");
+              "an unreadable backend still refuses when the other backends are absent");
+        check(strstr(denied_output, "NetworkManager") != NULL &&
+                  strstr(denied_output, "Root privileges are required") != NULL,
+              "the permission refusal names the backend and required privilege");
         chmod(denied_source, 0700);
         remove_tree(denied_source);
         remove_tree(denied_target);
@@ -2059,7 +2103,10 @@ static void test_include_network_config_backup(void)
             exit(1);
         }
 
-        backup_test_set_network_config_source_dir(failing_source);
+        backup_test_set_network_config_source_dir("NetworkManager", failing_source);
+        backup_test_set_network_config_source_dir("netplan", missing_netplan);
+        backup_test_set_network_config_source_dir("systemd-networkd",
+                                                  missing_networkd);
         char failing_target[PATH_MAX];
         fresh_mkdtemp(failing_target, sizeof(failing_target),
                       "plan_network_copy_failure_target");
@@ -2085,7 +2132,135 @@ static void test_include_network_config_backup(void)
         remove_tree(failing_target);
     }
 
-    backup_test_set_network_config_source_dir(network_source);
+    char netplan_source[PATH_MAX];
+    fresh_mkdtemp(netplan_source, sizeof(netplan_source),
+                  "plan_network_netplan_source");
+    char netplan_yaml[PATH_MAX];
+    join_path(netplan_yaml, sizeof(netplan_yaml), netplan_source,
+              "00-installer-config.yaml");
+    write_file(netplan_yaml,
+               "network:\n  wifis:\n    wlan0:\n      password: fixture-secret\n");
+    backup_test_set_network_config_source_dir("NetworkManager", missing_nm);
+    backup_test_set_network_config_source_dir("netplan", netplan_source);
+    backup_test_set_network_config_source_dir("systemd-networkd",
+                                              missing_networkd);
+    char netplan_target[PATH_MAX];
+    fresh_mkdtemp(netplan_target, sizeof(netplan_target),
+                  "plan_network_netplan_target");
+    char netplan_output[8192];
+    int netplan_rc = run_backup_capturing_with_options(
+        netplan_target, BACKUP_EXPLICIT_PATHS, paths, 0, 1,
+        netplan_output, sizeof(netplan_output));
+    char netplan_container[PATH_MAX], copied_netplan[PATH_MAX];
+    int have_netplan_container = find_container_dir(
+        netplan_target, netplan_container, sizeof(netplan_container));
+    if (have_netplan_container)
+    {
+        char netplan_dir[PATH_MAX];
+        join_path(netplan_dir, sizeof(netplan_dir), netplan_container,
+                  "network/netplan");
+        join_path(copied_netplan, sizeof(copied_netplan), netplan_dir,
+                  "00-installer-config.yaml");
+    }
+    check(netplan_rc == 0 && have_netplan_container &&
+              files_are_equal(netplan_yaml, copied_netplan),
+          "a netplan-only source is captured under network/netplan/");
+    if (have_netplan_container)
+    {
+        Manifest manifest;
+        ManifestStatus status = manifest_read_v1(netplan_container, &manifest);
+        check(status == MANIFEST_STATUS_VALID &&
+                  manifest.has_network_config == 1,
+              "a netplan-only backup records NETWORK_CONFIG=1");
+        if (status == MANIFEST_STATUS_VALID)
+            manifest_free(&manifest);
+    }
+    check(strstr(netplan_output, "Captured netplan") != NULL &&
+              strstr(netplan_output, "WiFi passwords") != NULL &&
+              strstr(netplan_output, "plain text") != NULL,
+          "netplan completion names netplan and warns about plaintext secrets");
+
+    char networkd_source[PATH_MAX];
+    fresh_mkdtemp(networkd_source, sizeof(networkd_source),
+                  "plan_network_networkd_source");
+    char networkd_file[PATH_MAX];
+    join_path(networkd_file, sizeof(networkd_file), networkd_source,
+              "20-wired.network");
+    write_file(networkd_file, "[Match]\nName=en*\n[Network]\nDHCP=yes\n");
+    backup_test_set_network_config_source_dir("NetworkManager", missing_nm);
+    backup_test_set_network_config_source_dir("netplan", missing_netplan);
+    backup_test_set_network_config_source_dir("systemd-networkd",
+                                              networkd_source);
+    char networkd_target[PATH_MAX];
+    fresh_mkdtemp(networkd_target, sizeof(networkd_target),
+                  "plan_network_networkd_target");
+    char networkd_output[8192];
+    int networkd_rc = run_backup_capturing_with_options(
+        networkd_target, BACKUP_EXPLICIT_PATHS, paths, 0, 1,
+        networkd_output, sizeof(networkd_output));
+    char networkd_container[PATH_MAX], copied_networkd[PATH_MAX];
+    int have_networkd_container = find_container_dir(
+        networkd_target, networkd_container, sizeof(networkd_container));
+    if (have_networkd_container)
+    {
+        char networkd_dir[PATH_MAX];
+        join_path(networkd_dir, sizeof(networkd_dir), networkd_container,
+                  "network/systemd-networkd");
+        join_path(copied_networkd, sizeof(copied_networkd), networkd_dir,
+                  "20-wired.network");
+    }
+    check(networkd_rc == 0 && have_networkd_container &&
+              files_are_equal(networkd_file, copied_networkd),
+          "a systemd-networkd-only source is captured under network/systemd-networkd/");
+    if (have_networkd_container)
+    {
+        Manifest manifest;
+        ManifestStatus status = manifest_read_v1(networkd_container, &manifest);
+        check(status == MANIFEST_STATUS_VALID &&
+                  manifest.has_network_config == 1,
+              "a systemd-networkd-only backup records NETWORK_CONFIG=1");
+        if (status == MANIFEST_STATUS_VALID)
+            manifest_free(&manifest);
+    }
+    check(strstr(networkd_output, "Captured systemd-networkd") != NULL &&
+              strstr(networkd_output, "WiFi passwords") == NULL &&
+              strstr(networkd_output, "plain text") == NULL,
+          "systemd-networkd-only completion has no plaintext-secret warning");
+
+    backup_test_set_network_config_source_dir("NetworkManager", network_source);
+    backup_test_set_network_config_source_dir("netplan", netplan_source);
+    backup_test_set_network_config_source_dir("systemd-networkd",
+                                              networkd_source);
+    char all_target[PATH_MAX];
+    fresh_mkdtemp(all_target, sizeof(all_target), "plan_network_all_target");
+    char all_output[8192];
+    int all_rc = run_backup_capturing_with_options(
+        all_target, BACKUP_EXPLICIT_PATHS, paths, 0, 1,
+        all_output, sizeof(all_output));
+    char all_container[PATH_MAX], all_nm[PATH_MAX], all_netplan[PATH_MAX];
+    char all_networkd[PATH_MAX];
+    int have_all_container = find_container_dir(
+        all_target, all_container, sizeof(all_container));
+    if (have_all_container)
+    {
+        join_path(all_nm, sizeof(all_nm), all_container,
+                  "network/networkmanager");
+        join_path(all_netplan, sizeof(all_netplan), all_container,
+                  "network/netplan");
+        join_path(all_networkd, sizeof(all_networkd), all_container,
+                  "network/systemd-networkd");
+    }
+    check(all_rc == 0 && have_all_container && dir_exists(all_nm) &&
+              dir_exists(all_netplan) && dir_exists(all_networkd),
+          "all three present backends produce all three network subdirectories");
+    check(strstr(all_output,
+                 "Captured NetworkManager, netplan and systemd-networkd") != NULL,
+          "completion enumerates every backend that was captured");
+
+    backup_test_set_network_config_source_dir("NetworkManager", network_source);
+    backup_test_set_network_config_source_dir("netplan", missing_netplan);
+    backup_test_set_network_config_source_dir("systemd-networkd",
+                                              missing_networkd);
     char dry_target[PATH_MAX];
     fresh_mkdtemp(dry_target, sizeof(dry_target), "plan_network_dry");
     dry_run = 1;
@@ -2097,10 +2272,12 @@ static void test_include_network_config_backup(void)
     check(dry_rc == 0 && directory_empty(dry_target),
           "an include-network-config dry run writes nothing");
     check(strstr(dry_output,
-                 "Would copy NetworkManager connection files to network/") != NULL,
-          "the dry run reports the network configuration copy");
+                 "Would capture network configuration from NetworkManager under network/") != NULL,
+          "the dry run previews the backend that would be captured");
 
-    backup_test_set_network_config_source_dir(NULL);
+    backup_test_set_network_config_source_dir("NetworkManager", NULL);
+    backup_test_set_network_config_source_dir("netplan", NULL);
+    backup_test_set_network_config_source_dir("systemd-networkd", NULL);
     if (geteuid() != 0)
         chmod(denied_dir, 0700);
     remove_tree(home);
@@ -2109,6 +2286,11 @@ static void test_include_network_config_backup(void)
     remove_tree(empty_source);
     remove_tree(empty_target);
     remove_tree(missing_target);
+    remove_tree(netplan_source);
+    remove_tree(netplan_target);
+    remove_tree(networkd_source);
+    remove_tree(networkd_target);
+    remove_tree(all_target);
     remove_tree(dry_target);
 }
 
