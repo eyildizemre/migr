@@ -63,6 +63,51 @@ void preflight_free(PreflightMemory *memory, void *pointer,
     free(pointer);
 }
 
+void *preflight_array_reserve(
+    PreflightMemory *memory, void *items, size_t *capacity, size_t count,
+    size_t extra, size_t element_size, size_t initial_capacity,
+    size_t max_capacity, int clear_new)
+{
+    if (memory == NULL || capacity == NULL || extra == 0 || element_size == 0 ||
+        initial_capacity == 0 || max_capacity == 0)
+    {
+        errno = EINVAL;
+        return NULL;
+    }
+    if (count > max_capacity || extra > max_capacity - count)
+    {
+        errno = E2BIG;
+        return NULL;
+    }
+
+    size_t needed = count + extra;
+    if (needed <= *capacity)
+        return items;
+
+    size_t next = *capacity == 0 ? initial_capacity : *capacity * 2U;
+    if (next < *capacity)
+        next = max_capacity;
+    if (next < needed)
+        next = needed;
+    if (next > max_capacity)
+        next = max_capacity;
+    if (next < needed || next > SIZE_MAX / element_size)
+    {
+        errno = E2BIG;
+        return NULL;
+    }
+
+    size_t old_size = *capacity * element_size;
+    size_t new_size = next * element_size;
+    void *grown = preflight_realloc(memory, items, old_size, new_size);
+    if (grown == NULL)
+        return NULL;
+    if (clear_new)
+        memset((unsigned char *)grown + old_size, 0, new_size - old_size);
+    *capacity = next;
+    return grown;
+}
+
 static uint64_t parent_map_hash(const ParentMap *map,
                                 SidecarBytes root_id,
                                 SidecarBytes logical_path)
@@ -674,14 +719,61 @@ int open_xdg_destination_anchor(const char *path, int *out_fd,
     }
 }
 
-#define DESTINATION_IDENTITY_MAX_NODES \
+int destination_identity_route(
+    const Manifest *manifest, size_t root_index, const char *logical,
+    int destination_home_fd, const char * const *destination_xdg_dirs,
+    int *xdg_anchor_fd, char (*xdg_anchor_prefix)[PATH_MAX], int *anchor_out,
+    char *relative, size_t relative_size)
+{
+    if (manifest == NULL || logical == NULL || destination_home_fd < 0 ||
+        destination_xdg_dirs == NULL || xdg_anchor_fd == NULL ||
+        xdg_anchor_prefix == NULL || anchor_out == NULL || relative == NULL ||
+        relative_size == 0 || root_index >= (size_t)manifest->root_count)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    const ManifestRoot *root = &manifest->roots[root_index];
+    if (root->policy == ROOT_POLICY_HOME_RELATIVE)
+    {
+        if (destination_path_build(root, logical, destination_xdg_dirs,
+                                   relative, relative_size) != 0)
+            return -1;
+        *anchor_out = destination_home_fd;
+        return 0;
+    }
+    if (root->policy != ROOT_POLICY_XDG ||
+        !xdg_destination_valid(destination_xdg_dirs, root))
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    int index = xdg_key_index(root->id);
+    if (index < 0 || index >= XDG_KEY_COUNT)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    if (xdg_anchor_fd[index] < 0 &&
+        open_xdg_destination_anchor(destination_xdg_dirs[index],
+                                    &xdg_anchor_fd[index],
+                                    xdg_anchor_prefix[index], PATH_MAX) != 0)
+        return -1;
+    if (destination_relative_path_build(xdg_anchor_prefix[index], logical,
+                                        relative, relative_size) != 0)
+        return -1;
+    *anchor_out = xdg_anchor_fd[index];
+    return 0;
+}
+
+#define DESTINATION_IDENTITY_PORTABLE_MAX_NODES \
     (2U * SIDECAR_MAX_LIVE_ENTRIES + MANIFEST_MAX_ROOTS)
-#define DESTINATION_IDENTITY_MAX_NAMESPACE \
+#define DESTINATION_IDENTITY_PORTABLE_MAX_NAMESPACE \
     (4U * SIDECAR_MAX_LIVE_ENTRIES + 2U * MANIFEST_MAX_ROOTS)
 
 typedef struct {
-    dev_t dev;
-    ino_t ino;
     size_t metadata_owner;
     size_t topo_order;
     uint64_t mount_id;
@@ -691,11 +783,12 @@ typedef struct {
 } DestinationIdentityNode;
 
 typedef struct {
-    dev_t dev;
-    ino_t ino;
-    size_t node;
+    uint64_t key_a;
+    uint64_t key_b;
+    size_t value;
+    uint64_t hash;
     int used;
-} DestinationIdentitySlot;
+} DestinationFixedSlot;
 
 typedef struct {
     size_t parent;
@@ -706,19 +799,6 @@ typedef struct {
     uint64_t hash;
     int used;
 } DestinationNamespaceSlot;
-
-typedef struct {
-    size_t node;
-    uint64_t mount_id;
-    int known;
-} DestinationMountView;
-
-typedef struct {
-    size_t parent;
-    size_t child;
-    uint64_t hash;
-    int used;
-} DestinationTopologySlot;
 
 static uint64_t destination_identity_hash(dev_t dev, ino_t ino)
 {
@@ -757,83 +837,55 @@ static void destination_mount_view_read(int fd, uint64_t *mount_id, int *known)
 #endif
 }
 
-void destination_identity_graph_init(DestinationIdentityGraph *graph)
+static size_t destination_budget_capacity(size_t element_size)
+{
+    uint64_t capacity = SIDECAR_MAX_ALLOC_BUDGET / (uint64_t)element_size;
+    return capacity > (uint64_t)SIZE_MAX ? SIZE_MAX : (size_t)capacity;
+}
+
+void destination_identity_graph_init(DestinationIdentityGraph *graph,
+                                     DestinationIdentityBounds bounds)
 {
     if (graph == NULL)
         return;
     memset(graph, 0, sizeof(*graph));
+    if (bounds == DESTINATION_IDENTITY_NATIVE_BOUNDS)
+    {
+        /* Native payloads have no sidecar entry-count ceiling. Bound their
+         * graph by the allocator's byte budget and the actual element sizes
+         * instead of importing the portable format's live-entry limit. */
+        graph->node_limit = destination_budget_capacity(
+            sizeof(DestinationIdentityNode));
+        graph->namespace_limit = destination_budget_capacity(
+            sizeof(DestinationNamespaceSlot) + 2U);
+    }
+    else
+    {
+        graph->node_limit = DESTINATION_IDENTITY_PORTABLE_MAX_NODES;
+        graph->namespace_limit = DESTINATION_IDENTITY_PORTABLE_MAX_NAMESPACE;
+    }
     graph->hash_salt = sidecar_process_salt();
 }
 
 static int destination_nodes_reserve(DestinationIdentityGraph *graph,
                                      size_t extra)
 {
-    if (graph == NULL || extra > DESTINATION_IDENTITY_MAX_NODES -
-                                  graph->node_count)
+    if (graph == NULL)
     {
-        errno = E2BIG;
+        errno = EINVAL;
         return -1;
     }
-    size_t needed = graph->node_count + extra;
-    if (needed <= graph->node_capacity)
-        return 0;
-    size_t capacity = graph->node_capacity == 0 ? 32U :
-                      graph->node_capacity * 2U;
-    if (capacity < needed)
-        capacity = needed;
-    if (capacity > DESTINATION_IDENTITY_MAX_NODES ||
-        capacity > SIZE_MAX / sizeof(DestinationIdentityNode))
-    {
-        errno = E2BIG;
-        return -1;
-    }
-    size_t old_size = graph->node_capacity * sizeof(DestinationIdentityNode);
-    size_t new_size = capacity * sizeof(DestinationIdentityNode);
-    DestinationIdentityNode *nodes = preflight_realloc(
-        &graph->memory, graph->nodes, old_size, new_size);
+    DestinationIdentityNode *nodes = preflight_array_reserve(
+        &graph->memory, graph->nodes, &graph->node_capacity,
+        graph->node_count, extra, sizeof(*nodes), 32U, graph->node_limit, 0);
     if (nodes == NULL)
         return -1;
-    memset(nodes + graph->node_capacity, 0,
-           (capacity - graph->node_capacity) * sizeof(*nodes));
     graph->nodes = nodes;
-    graph->node_capacity = capacity;
     return 0;
 }
 
-static int destination_views_reserve(DestinationIdentityGraph *graph,
-                                     size_t extra)
-{
-    if (extra > DESTINATION_IDENTITY_MAX_NAMESPACE - graph->mount_view_count)
-    {
-        errno = E2BIG;
-        return -1;
-    }
-    size_t needed = graph->mount_view_count + extra;
-    if (needed <= graph->mount_view_capacity)
-        return 0;
-    size_t capacity = graph->mount_view_capacity == 0 ? 16U :
-                      graph->mount_view_capacity * 2U;
-    if (capacity < needed)
-        capacity = needed;
-    if (capacity > DESTINATION_IDENTITY_MAX_NAMESPACE ||
-        capacity > SIZE_MAX / sizeof(DestinationMountView))
-    {
-        errno = E2BIG;
-        return -1;
-    }
-    size_t old_size = graph->mount_view_capacity * sizeof(DestinationMountView);
-    size_t new_size = capacity * sizeof(DestinationMountView);
-    DestinationMountView *views = preflight_realloc(
-        &graph->memory, graph->mount_views, old_size, new_size);
-    if (views == NULL)
-        return -1;
-    graph->mount_views = views;
-    graph->mount_view_capacity = capacity;
-    return 0;
-}
-
-static int destination_note_mount_view(DestinationIdentityGraph *graph,
-                                       size_t node_index, int fd)
+static void destination_note_mount_view(DestinationIdentityGraph *graph,
+                                        size_t node_index, int fd)
 {
     DestinationIdentityNode *nodes = graph->nodes;
     DestinationIdentityNode *node = &nodes[node_index];
@@ -841,133 +893,133 @@ static int destination_note_mount_view(DestinationIdentityGraph *graph,
     int known;
     destination_mount_view_read(fd, &mount_id, &known);
     if (!known)
-    {
-        if (node->unknown_mount_view)
-            return 0;
         node->unknown_mount_view = 1;
-    }
     else if (!node->mount_id_known)
     {
         node->mount_id = mount_id;
         node->mount_id_known = 1;
-        return 0;
     }
-    else if (node->mount_id == mount_id)
-        return 0;
-
-    if (destination_views_reserve(graph, 1U) != 0)
-        return -1;
-    DestinationMountView *views = graph->mount_views;
-    views[graph->mount_view_count++] = (DestinationMountView){
-        .node = node_index,
-        .mount_id = mount_id,
-        .known = known
-    };
-    return 0;
+    else if (node->mount_id != mount_id)
+        node->unknown_mount_view = 1;
 }
 
-static int destination_identity_rehash(DestinationIdentityGraph *graph,
-                                       size_t capacity)
+static int destination_fixed_rehash(DestinationIdentityGraph *graph,
+                                    void **table, size_t *table_capacity,
+                                    size_t capacity)
 {
     if (capacity < 32U || (capacity & (capacity - 1U)) != 0 ||
-        capacity > SIZE_MAX / sizeof(DestinationIdentitySlot))
+        capacity > SIZE_MAX / sizeof(DestinationFixedSlot))
     {
         errno = E2BIG;
         return -1;
     }
-    size_t new_size = capacity * sizeof(DestinationIdentitySlot);
-    DestinationIdentitySlot *slots =
+    size_t new_size = capacity * sizeof(DestinationFixedSlot);
+    DestinationFixedSlot *slots =
         preflight_alloc(&graph->memory, new_size);
     if (slots == NULL)
         return -1;
     memset(slots, 0, new_size);
 
-    DestinationIdentitySlot *old = graph->identity_slots;
-    size_t old_capacity = graph->identity_capacity;
-    for (size_t i = 0; i < old_capacity; i++)
-        if (old[i].used)
+    DestinationFixedSlot *old = *table;
+    size_t old_capacity = *table_capacity;
+    for (size_t index = 0; index < old_capacity; index++)
+        if (old[index].used)
         {
-            uint64_t hash = destination_identity_hash(old[i].dev, old[i].ino);
-            size_t index = (size_t)hash & (capacity - 1U);
-            while (slots[index].used)
-                index = (index + 1U) & (capacity - 1U);
-            slots[index] = old[i];
+            size_t position =
+                (size_t)old[index].hash & (capacity - 1U);
+            while (slots[position].used)
+                position = (position + 1U) & (capacity - 1U);
+            slots[position] = old[index];
         }
 
     preflight_free(&graph->memory, old,
-                   old_capacity * sizeof(DestinationIdentitySlot));
-    graph->identity_slots = slots;
-    graph->identity_capacity = capacity;
+                   old_capacity * sizeof(DestinationFixedSlot));
+    *table = slots;
+    *table_capacity = capacity;
     return 0;
 }
 
-static int destination_identity_ensure(DestinationIdentityGraph *graph)
+static int destination_fixed_ensure(DestinationIdentityGraph *graph,
+                                    void **table, size_t *capacity,
+                                    size_t count)
 {
-    if (graph->identity_capacity == 0)
-        return destination_identity_rehash(graph, 32U);
-    if (graph->node_count * 2U < graph->identity_capacity)
+    if (*capacity == 0)
+        return destination_fixed_rehash(graph, table, capacity, 32U);
+    if (count < *capacity / 2U)
         return 0;
-    if (graph->identity_capacity > SIZE_MAX / 2U)
+    if (*capacity > SIZE_MAX / 2U)
     {
         errno = E2BIG;
         return -1;
     }
-    return destination_identity_rehash(graph, graph->identity_capacity * 2U);
+    return destination_fixed_rehash(graph, table, capacity, *capacity * 2U);
 }
 
 static int destination_existing_node(DestinationIdentityGraph *graph,
-                                     int fd, size_t *node_out)
+                                     int fd, const struct stat *known_stat,
+                                     size_t *node_out)
 {
-    struct stat st;
-    if (fstat(fd, &st) != 0 || !S_ISDIR(st.st_mode))
+    struct stat read_stat;
+    if (known_stat == NULL)
     {
-        if (errno == 0)
-            errno = ENOTDIR;
+        errno = 0;
+        if (fstat(fd, &read_stat) != 0)
+            return -1;
+        known_stat = &read_stat;
+    }
+    if (!S_ISDIR(known_stat->st_mode))
+    {
+        errno = ENOTDIR;
         return -1;
     }
-    if (destination_identity_ensure(graph) != 0)
-        return -1;
 
-    DestinationIdentitySlot *slots = graph->identity_slots;
-    uint64_t hash = destination_identity_hash(st.st_dev, st.st_ino);
-    size_t index = (size_t)hash & (graph->identity_capacity - 1U);
-    for (size_t probes = 0; probes < graph->identity_capacity; probes++)
+    uint64_t hash = destination_identity_hash(known_stat->st_dev,
+                                              known_stat->st_ino);
+    DestinationFixedSlot *slots = graph->identity_slots;
+    if (graph->identity_capacity != 0)
     {
-        DestinationIdentitySlot *slot = &slots[index];
-        if (!slot->used)
-            break;
-        if (slot->dev == st.st_dev && slot->ino == st.st_ino)
+        size_t index = (size_t)hash & (graph->identity_capacity - 1U);
+        for (size_t probes = 0; probes < graph->identity_capacity; probes++)
         {
-            if (destination_note_mount_view(graph, slot->node, fd) != 0)
-                return -1;
-            *node_out = slot->node;
-            return 0;
+            DestinationFixedSlot *slot = &slots[index];
+            if (!slot->used)
+                break;
+            if (slot->hash == hash &&
+                slot->key_a == (uint64_t)known_stat->st_dev &&
+                slot->key_b == (uint64_t)known_stat->st_ino)
+            {
+                destination_note_mount_view(graph, slot->value, fd);
+                *node_out = slot->value;
+                return 1;
+            }
+            index = (index + 1U) & (graph->identity_capacity - 1U);
         }
-        index = (index + 1U) & (graph->identity_capacity - 1U);
     }
 
+    if (destination_fixed_ensure(graph, &graph->identity_slots,
+                                 &graph->identity_capacity,
+                                 graph->node_count) != 0)
+        return -1;
     if (destination_nodes_reserve(graph, 1U) != 0)
         return -1;
     size_t node_index = graph->node_count++;
     DestinationIdentityNode *nodes = graph->nodes;
     nodes[node_index] = (DestinationIdentityNode){
-        .dev = st.st_dev,
-        .ino = st.st_ino,
         .metadata_owner = SIZE_MAX,
         .topo_order = SIZE_MAX,
         .existing = 1
     };
-    if (destination_note_mount_view(graph, node_index, fd) != 0)
-        return -1;
+    destination_note_mount_view(graph, node_index, fd);
 
     slots = graph->identity_slots;
-    index = (size_t)hash & (graph->identity_capacity - 1U);
+    size_t index = (size_t)hash & (graph->identity_capacity - 1U);
     while (slots[index].used)
         index = (index + 1U) & (graph->identity_capacity - 1U);
-    slots[index] = (DestinationIdentitySlot){
-        .dev = st.st_dev,
-        .ino = st.st_ino,
-        .node = node_index,
+    slots[index] = (DestinationFixedSlot){
+        .key_a = (uint64_t)known_stat->st_dev,
+        .key_b = (uint64_t)known_stat->st_ino,
+        .value = node_index,
+        .hash = hash,
         .used = 1
     };
     *node_out = node_index;
@@ -1025,10 +1077,29 @@ static int destination_namespace_ensure(DestinationIdentityGraph *graph)
 
 static DestinationNamespaceSlot *destination_namespace_slot(
     DestinationIdentityGraph *graph, size_t parent, const char *component,
-    size_t length, int create)
+    size_t length)
 {
-    if (length == 0 || length > NAME_MAX ||
-        graph->namespace_count >= DESTINATION_IDENTITY_MAX_NAMESPACE)
+    if (length == 0 || length > NAME_MAX)
+    {
+        errno = E2BIG;
+        return NULL;
+    }
+
+    uint64_t hash = destination_namespace_hash(graph, parent, component, length);
+    DestinationNamespaceSlot *slots = graph->namespace_slots;
+    if (graph->namespace_capacity != 0)
+    {
+        size_t index = (size_t)hash & (graph->namespace_capacity - 1U);
+        while (slots[index].used)
+        {
+            if (slots[index].hash == hash && slots[index].parent == parent &&
+                slots[index].component_length == length &&
+                memcmp(slots[index].component, component, length) == 0)
+                return &slots[index];
+            index = (index + 1U) & (graph->namespace_capacity - 1U);
+        }
+    }
+    if (graph->namespace_count >= graph->namespace_limit)
     {
         errno = E2BIG;
         return NULL;
@@ -1036,62 +1107,36 @@ static DestinationNamespaceSlot *destination_namespace_slot(
     if (destination_namespace_ensure(graph) != 0)
         return NULL;
 
-    uint64_t hash = destination_namespace_hash(graph, parent, component, length);
-    DestinationNamespaceSlot *slots = graph->namespace_slots;
+    slots = graph->namespace_slots;
     size_t index = (size_t)hash & (graph->namespace_capacity - 1U);
-    for (size_t probes = 0; probes < graph->namespace_capacity; probes++)
-    {
-        DestinationNamespaceSlot *slot = &slots[index];
-        if (!slot->used)
-        {
-            if (!create)
-                return NULL;
-            char *copy = preflight_alloc(&graph->memory, length + 1U);
-            if (copy == NULL)
-                return NULL;
-            memcpy(copy, component, length);
-            copy[length] = '\0';
-            *slot = (DestinationNamespaceSlot){
-                .parent = parent,
-                .child = SIZE_MAX,
-                .non_directory_owner = SIZE_MAX,
-                .component = copy,
-                .component_length = length,
-                .hash = hash,
-                .used = 1
-            };
-            graph->namespace_count++;
-            return slot;
-        }
-        if (slot->hash == hash && slot->parent == parent &&
-            slot->component_length == length &&
-            memcmp(slot->component, component, length) == 0)
-            return slot;
+    while (slots[index].used)
         index = (index + 1U) & (graph->namespace_capacity - 1U);
-    }
-    errno = E2BIG;
-    return NULL;
+    char *copy = preflight_alloc(&graph->memory, length + 1U);
+    if (copy == NULL)
+        return NULL;
+    memcpy(copy, component, length);
+    copy[length] = '\0';
+    slots[index] = (DestinationNamespaceSlot){
+        .parent = parent,
+        .child = SIZE_MAX,
+        .non_directory_owner = SIZE_MAX,
+        .component = copy,
+        .component_length = length,
+        .hash = hash,
+        .used = 1
+    };
+    graph->namespace_count++;
+    return &slots[index];
 }
 
 static int destination_planned_node(DestinationIdentityGraph *graph,
                                     DestinationNamespaceSlot *slot,
                                     size_t *node_out)
 {
-    DestinationIdentityNode *nodes = graph->nodes;
-    if (slot->child != SIZE_MAX)
-    {
-        if (slot->child >= graph->node_count || nodes[slot->child].existing)
-        {
-            errno = ESTALE;
-            return -1;
-        }
-        *node_out = slot->child;
-        return 0;
-    }
     if (destination_nodes_reserve(graph, 1U) != 0)
         return -1;
     size_t index = graph->node_count++;
-    nodes = graph->nodes;
+    DestinationIdentityNode *nodes = graph->nodes;
     nodes[index] = (DestinationIdentityNode){
         .metadata_owner = SIZE_MAX,
         .topo_order = SIZE_MAX
@@ -1112,84 +1157,42 @@ static uint64_t destination_topology_hash(const DestinationIdentityGraph *graph,
     return hash_fnv1a_uint64(hash, (uint64_t)child);
 }
 
-static int destination_topology_rehash(DestinationIdentityGraph *graph,
-                                       size_t capacity)
-{
-    if (capacity < 32U || (capacity & (capacity - 1U)) != 0 ||
-        capacity > SIZE_MAX / sizeof(DestinationTopologySlot))
-    {
-        errno = E2BIG;
-        return -1;
-    }
-    size_t new_size = capacity * sizeof(DestinationTopologySlot);
-    DestinationTopologySlot *slots =
-        preflight_alloc(&graph->memory, new_size);
-    if (slots == NULL)
-        return -1;
-    memset(slots, 0, new_size);
-
-    DestinationTopologySlot *old = graph->topology_slots;
-    size_t old_capacity = graph->topology_capacity;
-    for (size_t index = 0; index < old_capacity; index++)
-        if (old[index].used)
-        {
-            size_t position =
-                (size_t)old[index].hash & (capacity - 1U);
-            while (slots[position].used)
-                position = (position + 1U) & (capacity - 1U);
-            slots[position] = old[index];
-        }
-
-    preflight_free(&graph->memory, old,
-                   old_capacity * sizeof(DestinationTopologySlot));
-    graph->topology_slots = slots;
-    graph->topology_capacity = capacity;
-    return 0;
-}
-
 static int destination_topology_add(DestinationIdentityGraph *graph,
                                     size_t parent, size_t child)
 {
     if (parent == child)
         return 0;
-    if (graph->topology_count >= DESTINATION_IDENTITY_MAX_NAMESPACE)
+    if (graph->topology_count >= graph->namespace_limit)
     {
         errno = E2BIG;
         return -1;
     }
-    if (graph->topology_capacity == 0)
-    {
-        if (destination_topology_rehash(graph, 32U) != 0)
-            return -1;
-    }
-    else if (graph->topology_count * 2U >= graph->topology_capacity)
-    {
-        if (graph->topology_capacity > SIZE_MAX / 2U ||
-            destination_topology_rehash(
-                graph, graph->topology_capacity * 2U) != 0)
-            return -1;
-    }
+    if (destination_fixed_ensure(graph, &graph->topology_slots,
+                                 &graph->topology_capacity,
+                                 graph->topology_count) != 0)
+        return -1;
 
     uint64_t hash = destination_topology_hash(graph, parent, child);
-    DestinationTopologySlot *slots = graph->topology_slots;
+    DestinationFixedSlot *slots = graph->topology_slots;
     size_t position =
         (size_t)hash & (graph->topology_capacity - 1U);
     for (size_t probes = 0; probes < graph->topology_capacity; probes++)
     {
-        DestinationTopologySlot *slot = &slots[position];
+        DestinationFixedSlot *slot = &slots[position];
         if (!slot->used)
         {
-            *slot = (DestinationTopologySlot){
-                .parent = parent,
-                .child = child,
+            *slot = (DestinationFixedSlot){
+                .key_a = (uint64_t)parent,
+                .key_b = (uint64_t)child,
+                .value = SIZE_MAX,
                 .hash = hash,
                 .used = 1
             };
             graph->topology_count++;
             return 0;
         }
-        if (slot->hash == hash && slot->parent == parent &&
-            slot->child == child)
+        if (slot->hash == hash && slot->key_a == (uint64_t)parent &&
+            slot->key_b == (uint64_t)child)
             return 0;
         position = (position + 1U) & (graph->topology_capacity - 1U);
     }
@@ -1211,7 +1214,7 @@ DestinationIdentityStatus destination_identity_graph_register_anchor(
         return destination_graph_path_error(errno);
 
     size_t child;
-    if (destination_existing_node(graph, current_fd, &child) != 0)
+    if (destination_existing_node(graph, current_fd, NULL, &child) < 0)
     {
         int saved = errno;
         close(current_fd);
@@ -1231,7 +1234,9 @@ DestinationIdentityStatus destination_identity_graph_register_anchor(
         }
 
         size_t parent;
-        if (destination_existing_node(graph, parent_fd, &parent) != 0)
+        int parent_known = destination_existing_node(
+            graph, parent_fd, NULL, &parent);
+        if (parent_known < 0)
         {
             int saved = errno;
             close(parent_fd);
@@ -1253,6 +1258,18 @@ DestinationIdentityStatus destination_identity_graph_register_anchor(
             close(parent_fd);
             close(current_fd);
             return destination_graph_path_error(saved);
+        }
+
+        /* A bind-mounted child can already be interned through another
+         * parent; only a known parent proves the remaining chain is present. */
+        if (parent_known)
+        {
+            int failed = close(parent_fd) != 0;
+            if (close(current_fd) != 0)
+                failed = 1;
+            if (failed)
+                return destination_graph_path_error(errno);
+            return DESTINATION_IDENTITY_OK;
         }
 
         if (close(current_fd) != 0)
@@ -1277,12 +1294,15 @@ static DestinationIdentityStatus destination_graph_path_error(int saved)
 DestinationIdentityStatus destination_identity_graph_add(
     DestinationIdentityGraph *graph, int anchor_fd, const char *relative,
     DestinationIdentityClaim claim, size_t owner,
-    DestinationIdentityPlacement *placement)
+    DestinationIdentityPlacement *placement,
+    size_t *conflicting_owner)
 {
+    if (conflicting_owner != NULL)
+        *conflicting_owner = SIZE_MAX;
     if (graph == NULL || anchor_fd < 0 || relative == NULL ||
-        placement == NULL || graph->finalized ||
-        (claim != DESTINATION_IDENTITY_STRUCTURAL &&
-         claim != DESTINATION_IDENTITY_DIRECTORY &&
+        placement == NULL || conflicting_owner == NULL || graph->finalized ||
+        owner == SIZE_MAX ||
+        (claim != DESTINATION_IDENTITY_DIRECTORY &&
          claim != DESTINATION_IDENTITY_NON_DIRECTORY))
     {
         errno = EINVAL;
@@ -1301,7 +1321,8 @@ DestinationIdentityStatus destination_identity_graph_add(
         return destination_graph_path_error(errno);
 
     size_t current_node;
-    if (destination_existing_node(graph, current_fd, &current_node) != 0)
+    if (destination_existing_node(graph, current_fd, NULL,
+                                  &current_node) < 0)
     {
         int saved = errno;
         close(current_fd);
@@ -1322,6 +1343,7 @@ DestinationIdentityStatus destination_identity_graph_add(
             if (nodes[current_node].metadata_owner != SIZE_MAX &&
                 nodes[current_node].metadata_owner != owner)
             {
+                *conflicting_owner = nodes[current_node].metadata_owner;
                 close(current_fd);
                 errno = EEXIST;
                 return DESTINATION_IDENTITY_COLLISION;
@@ -1353,19 +1375,44 @@ DestinationIdentityStatus destination_identity_graph_add(
             return DESTINATION_IDENTITY_PATH_ERROR;
         }
 
-        int needs_directory = !final ||
-            claim != DESTINATION_IDENTITY_NON_DIRECTORY;
-        DestinationNamespaceSlot *slot = NULL;
+        int needs_directory = !final || claim == DESTINATION_IDENTITY_DIRECTORY;
+        DestinationNamespaceSlot *slot = destination_namespace_slot(
+            graph, current_node, cursor, component_length);
+        if (slot == NULL)
+        {
+            int saved = errno;
+            if (current_fd >= 0)
+                close(current_fd);
+            return destination_graph_path_error(saved);
+        }
+        if (slot->non_directory_owner != SIZE_MAX)
+        {
+            *conflicting_owner = slot->non_directory_owner;
+            if (current_fd >= 0)
+                close(current_fd);
+            errno = EEXIST;
+            return DESTINATION_IDENTITY_COLLISION;
+        }
 
         if (!needs_directory)
         {
-            slot = destination_namespace_slot(graph, current_node, cursor,
-                                              component_length, 1);
-            if (slot == NULL)
+            if (slot->child != SIZE_MAX)
             {
-                int saved = errno;
-                close(current_fd);
-                return destination_graph_path_error(saved);
+                DestinationIdentityNode *nodes = graph->nodes;
+                if (slot->child >= graph->node_count)
+                {
+                    if (current_fd >= 0)
+                        close(current_fd);
+                    errno = ESTALE;
+                    return DESTINATION_IDENTITY_PATH_ERROR;
+                }
+                if (nodes[slot->child].metadata_owner != SIZE_MAX)
+                    *conflicting_owner =
+                        nodes[slot->child].metadata_owner;
+                if (current_fd >= 0)
+                    close(current_fd);
+                errno = EEXIST;
+                return DESTINATION_IDENTITY_COLLISION;
             }
             if (current_fd >= 0)
             {
@@ -1388,14 +1435,6 @@ DestinationIdentityStatus destination_identity_graph_add(
                     return destination_graph_path_error(saved);
                 }
             }
-            if (slot->child != SIZE_MAX ||
-                slot->non_directory_owner != SIZE_MAX)
-            {
-                if (current_fd >= 0)
-                    close(current_fd);
-                errno = EEXIST;
-                return DESTINATION_IDENTITY_COLLISION;
-            }
             slot->non_directory_owner = owner;
             placement->node = current_node;
             placement->is_directory = 0;
@@ -1404,26 +1443,34 @@ DestinationIdentityStatus destination_identity_graph_add(
             return DESTINATION_IDENTITY_OK;
         }
 
-        slot = destination_namespace_slot(graph, current_node, cursor,
-                                          component_length, 1);
-        if (slot == NULL)
-        {
-            int saved = errno;
-            if (current_fd >= 0)
-                close(current_fd);
-            return destination_graph_path_error(saved);
-        }
-        if (slot->non_directory_owner != SIZE_MAX)
-        {
-            if (current_fd >= 0)
-                close(current_fd);
-            errno = EEXIST;
-            return DESTINATION_IDENTITY_COLLISION;
-        }
-
         size_t child_node;
         int next_fd = -1;
-        if (current_fd >= 0)
+        if (slot->child != SIZE_MAX)
+        {
+            DestinationIdentityNode *nodes = graph->nodes;
+            if (slot->child >= graph->node_count ||
+                (current_fd < 0 && nodes[slot->child].existing))
+            {
+                if (current_fd >= 0)
+                    close(current_fd);
+                errno = ESTALE;
+                return DESTINATION_IDENTITY_PATH_ERROR;
+            }
+            child_node = slot->child;
+            if (current_fd >= 0 && nodes[child_node].existing && !final)
+            {
+                next_fd = openat(current_fd, cursor,
+                                 O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                                     O_NOATIME | O_CLOEXEC);
+                if (next_fd < 0)
+                {
+                    int saved = errno;
+                    close(current_fd);
+                    return destination_graph_path_error(saved);
+                }
+            }
+        }
+        else if (current_fd >= 0)
         {
             struct stat st;
             errno = 0;
@@ -1439,21 +1486,14 @@ DestinationIdentityStatus destination_identity_graph_add(
                                  O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
                                      O_NOATIME | O_CLOEXEC);
                 if (next_fd < 0 ||
-                    destination_existing_node(graph, next_fd,
-                                              &child_node) != 0)
+                    destination_existing_node(graph, next_fd, &st,
+                                              &child_node) < 0)
                 {
                     int saved = errno;
                     if (next_fd >= 0)
                         close(next_fd);
                     close(current_fd);
                     return destination_graph_path_error(saved);
-                }
-                if (slot->child != SIZE_MAX && slot->child != child_node)
-                {
-                    close(next_fd);
-                    close(current_fd);
-                    errno = ESTALE;
-                    return DESTINATION_IDENTITY_PATH_ERROR;
                 }
                 slot->child = child_node;
             }
@@ -1494,6 +1534,8 @@ DestinationIdentityStatus destination_identity_graph_add(
                 if (nodes[current_node].metadata_owner != SIZE_MAX &&
                     nodes[current_node].metadata_owner != owner)
                 {
+                    *conflicting_owner =
+                        nodes[current_node].metadata_owner;
                     if (current_fd >= 0)
                         close(current_fd);
                     errno = EEXIST;
@@ -1511,9 +1553,162 @@ DestinationIdentityStatus destination_identity_graph_add(
     }
 }
 
-DestinationIdentityStatus destination_identity_graph_finalize(
-    DestinationIdentityGraph *graph)
+static int destination_identity_logical_copy(
+    const DestinationIdentityEntryView *view, char logical[PATH_MAX])
 {
+    if (view == NULL || view->logical_length >= PATH_MAX ||
+        (view->logical_length != 0 && view->logical == NULL) ||
+        (view->logical_length != 0 &&
+         memchr(view->logical, '\0', view->logical_length) != NULL))
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    if (view->logical_length != 0)
+        memcpy(logical, view->logical, view->logical_length);
+    logical[view->logical_length] = '\0';
+    return 0;
+}
+
+int destination_identity_graph_add_entries(
+    DestinationIdentityGraph *graph, const Manifest *manifest,
+    size_t entry_count, int destination_home_fd,
+    const char *destination_home_path,
+    const char * const *destination_xdg_dirs, int *xdg_anchor_fd,
+    char (*xdg_anchor_prefix)[PATH_MAX], DestinationIdentityEntryReader reader,
+    DestinationIdentityFailureReporter report_failure, void *context,
+    DestinationIdentityCollisionPolicy collision_policy)
+{
+    if (graph == NULL || manifest == NULL || destination_home_fd < 0 ||
+        destination_xdg_dirs == NULL || xdg_anchor_fd == NULL ||
+        xdg_anchor_prefix == NULL || reader == NULL || report_failure == NULL ||
+        context == NULL || graph->finalized ||
+        (collision_policy != DESTINATION_IDENTITY_AGGREGATE_COLLISIONS &&
+         collision_policy != DESTINATION_IDENTITY_STOP_ON_COLLISION))
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    unsigned char registered_xdg[XDG_KEY_COUNT] = {0};
+    for (size_t index = 0; index < entry_count; index++)
+    {
+        DestinationIdentityEntryView view;
+        char logical[PATH_MAX];
+        reader(context, index, &view);
+        if (view.root_index >= (size_t)manifest->root_count ||
+            destination_identity_logical_copy(&view, logical) != 0)
+        {
+            print_error("Error: Could not read portable restore destination entry %zu\n",
+                        index);
+            report_failure(context, index);
+            return -1;
+        }
+
+        int anchor = -1;
+        char relative[PATH_MAX];
+        if (destination_identity_route(
+                manifest, view.root_index, logical, destination_home_fd,
+                destination_xdg_dirs, xdg_anchor_fd, xdg_anchor_prefix,
+                &anchor, relative, sizeof(relative)) != 0)
+        {
+            print_error("Error: Could not resolve portable restore destination for manifest root %s entry %s\n",
+                        manifest->roots[view.root_index].id,
+                        logical[0] == '\0' ? "." : logical);
+            report_failure(context, index);
+            return -1;
+        }
+
+        const ManifestRoot *root = &manifest->roots[view.root_index];
+        if (root->policy == ROOT_POLICY_XDG)
+        {
+            int key = xdg_key_index(root->id);
+            if (key < 0 || key >= XDG_KEY_COUNT)
+            {
+                print_error("Error: Could not identify XDG restore destination for manifest root %s\n",
+                            root->id);
+                report_failure(context, index);
+                return -1;
+            }
+            if (!registered_xdg[key])
+            {
+                DestinationIdentityStatus anchor_status =
+                    destination_identity_graph_register_anchor(graph, anchor);
+                if (anchor_status != DESTINATION_IDENTITY_OK)
+                {
+                    if (anchor_status == DESTINATION_IDENTITY_RESOURCE_ERROR &&
+                        errno == E2BIG)
+                        print_error("Error: Portable restore destination identity budget exceeded while registering XDG ancestry for manifest root %s\n",
+                                    root->id);
+                    else
+                        print_error("Error: Could not inspect XDG destination ancestry for manifest root %s\n",
+                                    root->id);
+                    report_failure(context, index);
+                    return -1;
+                }
+                registered_xdg[key] = 1;
+            }
+        }
+
+        DestinationIdentityPlacement discard;
+        size_t conflicting_owner;
+        DestinationIdentityStatus status = destination_identity_graph_add(
+            graph, anchor, relative, view.claim, index,
+            view.placement == NULL ? &discard : view.placement,
+            &conflicting_owner);
+        if (status == DESTINATION_IDENTITY_COLLISION)
+        {
+            char destination[PATH_MAX];
+            if (destination_absolute_path_build(
+                    root, logical, destination_xdg_dirs,
+                    destination_home_path, destination,
+                    sizeof(destination)) != 0)
+                snprintf(destination, sizeof(destination), "%s", relative);
+
+            DestinationIdentityEntryView previous;
+            char previous_logical[PATH_MAX];
+            if (conflicting_owner < entry_count)
+                reader(context, conflicting_owner, &previous);
+            if (conflicting_owner < entry_count &&
+                previous.root_index < (size_t)manifest->root_count &&
+                destination_identity_logical_copy(
+                    &previous, previous_logical) == 0)
+                print_error("Error: Manifest root %s entry %s and manifest root %s entry %s map to the same restore destination: %s\n",
+                            manifest->roots[previous.root_index].id,
+                            previous_logical[0] == '\0' ? "." :
+                                previous_logical,
+                            root->id, logical[0] == '\0' ? "." : logical,
+                            destination);
+            else
+                print_error("Error: Manifest root %s entry %s conflicts with an existing directory at restore destination: %s\n",
+                            root->id, logical[0] == '\0' ? "." : logical,
+                            destination);
+            report_failure(context, index);
+            if (collision_policy == DESTINATION_IDENTITY_STOP_ON_COLLISION)
+                return -1;
+            continue;
+        }
+        if (status != DESTINATION_IDENTITY_OK)
+        {
+            if (status == DESTINATION_IDENTITY_RESOURCE_ERROR &&
+                errno == E2BIG)
+                print_error("Error: Portable restore destination identity budget exceeded while mapping manifest root %s entry %s\n",
+                            root->id, logical[0] == '\0' ? "." : logical);
+            else
+                print_error("Error: Could not inspect mapped restore destination for manifest root %s entry %s\n",
+                            root->id, logical[0] == '\0' ? "." : logical);
+            report_failure(context, index);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+DestinationIdentityStatus destination_identity_graph_finalize(
+    DestinationIdentityGraph *graph, int *nested_claims_out)
+{
+    if (nested_claims_out != NULL)
+        *nested_claims_out = 0;
     if (graph == NULL || graph->finalized)
     {
         errno = EINVAL;
@@ -1547,21 +1742,27 @@ DestinationIdentityStatus destination_identity_graph_finalize(
     size_t *indegree = preflight_alloc(&graph->memory, node_bytes);
     size_t *first = preflight_alloc(&graph->memory, node_bytes);
     size_t *queue = preflight_alloc(&graph->memory, node_bytes);
+    unsigned char *claimed_ancestor = nested_claims_out == NULL ? NULL :
+        preflight_alloc(&graph->memory, graph->node_count);
     size_t *next = edge_capacity == 0 ? NULL :
                    preflight_alloc(&graph->memory, edge_bytes);
     size_t *child = edge_capacity == 0 ? NULL :
                     preflight_alloc(&graph->memory, edge_bytes);
     if (indegree == NULL || first == NULL || queue == NULL ||
+        (nested_claims_out != NULL && claimed_ancestor == NULL) ||
         (edge_capacity != 0 && (next == NULL || child == NULL)))
     {
         preflight_free(&graph->memory, indegree, node_bytes);
         preflight_free(&graph->memory, first, node_bytes);
         preflight_free(&graph->memory, queue, node_bytes);
+        preflight_free(&graph->memory, claimed_ancestor, graph->node_count);
         preflight_free(&graph->memory, next, edge_bytes);
         preflight_free(&graph->memory, child, edge_bytes);
         return DESTINATION_IDENTITY_RESOURCE_ERROR;
     }
     memset(indegree, 0, node_bytes);
+    if (claimed_ancestor != NULL)
+        memset(claimed_ancestor, 0, graph->node_count);
     for (size_t i = 0; i < graph->node_count; i++)
         first[i] = SIZE_MAX;
 
@@ -1583,21 +1784,23 @@ DestinationIdentityStatus destination_identity_graph_finalize(
             first[slots[i].parent] = edge_count++;
         }
 
-    DestinationTopologySlot *topology = graph->topology_slots;
+    DestinationFixedSlot *topology = graph->topology_slots;
     for (size_t i = 0; i < graph->topology_capacity; i++)
         if (topology[i].used)
         {
-            if (topology[i].parent >= graph->node_count ||
-                topology[i].child >= graph->node_count ||
-                indegree[topology[i].child] == SIZE_MAX)
+            size_t parent = (size_t)topology[i].key_a;
+            size_t destination = (size_t)topology[i].key_b;
+            if (parent >= graph->node_count ||
+                destination >= graph->node_count ||
+                indegree[destination] == SIZE_MAX)
             {
                 errno = E2BIG;
                 goto resource_fail;
             }
-            indegree[topology[i].child]++;
-            child[edge_count] = topology[i].child;
-            next[edge_count] = first[topology[i].parent];
-            first[topology[i].parent] = edge_count++;
+            indegree[destination]++;
+            child[edge_count] = destination;
+            next[edge_count] = first[parent];
+            first[parent] = edge_count++;
         }
 
     size_t head = 0;
@@ -1608,13 +1811,23 @@ DestinationIdentityStatus destination_identity_graph_finalize(
 
     DestinationIdentityNode *nodes = graph->nodes;
     size_t ordered = 0;
+    int nested_claims = 0;
     while (head < tail)
     {
         size_t node = queue[head++];
         nodes[node].topo_order = ordered++;
+        int carries_claim = claimed_ancestor != NULL &&
+            (claimed_ancestor[node] ||
+             nodes[node].metadata_owner != SIZE_MAX);
         for (size_t edge = first[node]; edge != SIZE_MAX; edge = next[edge])
         {
             size_t destination = child[edge];
+            if (carries_claim)
+            {
+                if (nodes[destination].metadata_owner != SIZE_MAX)
+                    nested_claims = 1;
+                claimed_ancestor[destination] = 1;
+            }
             if (indegree[destination] == 0)
             {
                 errno = EINVAL;
@@ -1625,10 +1838,25 @@ DestinationIdentityStatus destination_identity_graph_finalize(
                 queue[tail++] = destination;
         }
     }
+    if (claimed_ancestor != NULL)
+        for (size_t i = 0; i < graph->namespace_capacity; i++)
+            if (slots[i].used && slots[i].non_directory_owner != SIZE_MAX)
+            {
+                if (slots[i].parent >= graph->node_count)
+                {
+                    errno = EINVAL;
+                    goto resource_fail;
+                }
+                size_t parent = slots[i].parent;
+                if (claimed_ancestor[parent] ||
+                    nodes[parent].metadata_owner != SIZE_MAX)
+                    nested_claims = 1;
+            }
 
     preflight_free(&graph->memory, indegree, node_bytes);
     preflight_free(&graph->memory, first, node_bytes);
     preflight_free(&graph->memory, queue, node_bytes);
+    preflight_free(&graph->memory, claimed_ancestor, graph->node_count);
     preflight_free(&graph->memory, next, edge_bytes);
     preflight_free(&graph->memory, child, edge_bytes);
     if (ordered != graph->node_count)
@@ -1637,15 +1865,29 @@ DestinationIdentityStatus destination_identity_graph_finalize(
         return DESTINATION_IDENTITY_CYCLE;
     }
     graph->finalized = 1;
+    if (nested_claims_out != NULL)
+        *nested_claims_out = nested_claims;
     return DESTINATION_IDENTITY_OK;
 
 resource_fail:
     preflight_free(&graph->memory, indegree, node_bytes);
     preflight_free(&graph->memory, first, node_bytes);
     preflight_free(&graph->memory, queue, node_bytes);
+    preflight_free(&graph->memory, claimed_ancestor, graph->node_count);
     preflight_free(&graph->memory, next, edge_bytes);
     preflight_free(&graph->memory, child, edge_bytes);
     return DESTINATION_IDENTITY_RESOURCE_ERROR;
+}
+
+int destination_identity_graph_resume(DestinationIdentityGraph *graph)
+{
+    if (graph == NULL || !graph->finalized)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    graph->finalized = 0;
+    return 0;
 }
 
 int destination_identity_graph_order(
@@ -1681,13 +1923,11 @@ void destination_identity_graph_free(DestinationIdentityGraph *graph)
     preflight_free(&graph->memory, graph->nodes,
                    graph->node_capacity * sizeof(DestinationIdentityNode));
     preflight_free(&graph->memory, graph->identity_slots,
-                   graph->identity_capacity * sizeof(DestinationIdentitySlot));
+                   graph->identity_capacity * sizeof(DestinationFixedSlot));
     preflight_free(&graph->memory, graph->namespace_slots,
                    graph->namespace_capacity * sizeof(DestinationNamespaceSlot));
-    preflight_free(&graph->memory, graph->mount_views,
-                   graph->mount_view_capacity * sizeof(DestinationMountView));
     preflight_free(&graph->memory, graph->topology_slots,
-                   graph->topology_capacity * sizeof(DestinationTopologySlot));
+                   graph->topology_capacity * sizeof(DestinationFixedSlot));
     memset(graph, 0, sizeof(*graph));
 }
 

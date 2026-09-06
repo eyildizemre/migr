@@ -119,36 +119,18 @@ static void replay_report_security_skipped(
 
 static int replay_entries_reserve(ReplayCollection *collection, size_t extra)
 {
-    if (collection == NULL || extra > SIDECAR_MAX_LIVE_ENTRIES -
-                                   collection->count)
+    if (collection == NULL)
     {
-        errno = E2BIG;
+        errno = EINVAL;
         return -1;
     }
-    size_t needed = collection->count + extra;
-    if (needed <= collection->capacity)
-        return 0;
-    size_t capacity = collection->capacity == 0 ? 16U :
-        collection->capacity * 2U;
-    if (capacity < needed)
-        capacity = needed;
-    if (capacity > SIDECAR_MAX_LIVE_ENTRIES ||
-        capacity > SIZE_MAX / sizeof(*collection->items))
-    {
-        errno = E2BIG;
-        return -1;
-    }
-    size_t old_size = collection->capacity * sizeof(*collection->items);
-    size_t new_size = capacity * sizeof(*collection->items);
-    ReplayEntry *items = preflight_realloc(&collection->memory,
-                                           collection->items,
-                                           old_size, new_size);
+    ReplayEntry *items = preflight_array_reserve(
+        &collection->memory, collection->items, &collection->capacity,
+        collection->count, extra, sizeof(*items), 16U,
+        SIDECAR_MAX_LIVE_ENTRIES, 1);
     if (items == NULL)
         return -1;
-    memset(items + collection->capacity, 0,
-           (capacity - collection->capacity) * sizeof(*items));
     collection->items = items;
-    collection->capacity = capacity;
     return 0;
 }
 
@@ -542,176 +524,68 @@ static int replay_collect_entry(const SidecarLiveView *view, void *argument)
     return 0;
 }
 
-static int replay_identity_route(ReplayCollection *collection,
-                                 const ReplayEntry *replay,
-                                 int *anchor_out,
-                                 char *relative,
-                                 size_t relative_size)
+static void replay_identity_entry(void *context, size_t index,
+                                  DestinationIdentityEntryView *view)
 {
-    if (collection == NULL || replay == NULL || anchor_out == NULL ||
-        relative == NULL || relative_size == 0 ||
-        replay->root_index >= (size_t)collection->manifest->root_count)
-    {
-        errno = EINVAL;
-        return -1;
-    }
+    ReplayCollection *collection = context;
+    ReplayEntry *entry = &collection->items[index];
+    view->root_index = entry->root_index;
+    view->logical = entry->entry->logical_path.data;
+    view->logical_length = entry->entry->logical_path.length;
+    view->claim = entry->entry->kind == SIDECAR_KIND_DIRECTORY
+        ? DESTINATION_IDENTITY_DIRECTORY
+        : DESTINATION_IDENTITY_NON_DIRECTORY;
+    view->placement = &entry->identity_placement;
+}
 
-    const ManifestRoot *root =
-        &collection->manifest->roots[replay->root_index];
-    char logical[PATH_MAX];
-    replay_copy_bytes(logical, sizeof(logical), replay->entry->logical_path);
-    if (replay->entry->logical_path.length >= sizeof(logical))
-    {
-        errno = ENAMETOOLONG;
-        return -1;
-    }
-
-    if (root->policy == ROOT_POLICY_HOME_RELATIVE)
-    {
-        if (destination_path_build(root, logical,
-                                   collection->destination_xdg_dirs,
-                                   relative, relative_size) != 0)
-            return -1;
-        *anchor_out = collection->destination_home_fd;
-        return 0;
-    }
-    if (root->policy != ROOT_POLICY_XDG ||
-        !xdg_destination_valid(collection->destination_xdg_dirs, root))
-    {
-        errno = EINVAL;
-        return -1;
-    }
-
-    int index = xdg_key_index(root->id);
-    if (index < 0 || index >= XDG_KEY_COUNT)
-    {
-        errno = EINVAL;
-        return -1;
-    }
-    if (collection->xdg_anchor_fd[index] < 0)
-    {
-        if (open_xdg_destination_anchor(
-                collection->destination_xdg_dirs[index],
-                &collection->xdg_anchor_fd[index],
-                collection->xdg_anchor_prefix[index],
-                sizeof(collection->xdg_anchor_prefix[index])) != 0)
-            return -1;
-    }
-    if (destination_relative_path_build(
-            collection->xdg_anchor_prefix[index], logical, relative,
-            relative_size) != 0)
-        return -1;
-    *anchor_out = collection->xdg_anchor_fd[index];
-    return 0;
+static void replay_identity_failure(void *context, size_t index)
+{
+    ReplayCollection *collection = context;
+    ReplayEntry *entry = &collection->items[index];
+    replay_report_failure(collection->report, collection->manifest,
+                          entry->root_index, entry->entry->logical_path);
 }
 
 static int replay_selection_destinations_valid(ReplayCollection *collection)
 {
     DestinationIdentityGraph graph;
-    destination_identity_graph_init(&graph);
+    destination_identity_graph_init(&graph, DESTINATION_IDENTITY_PORTABLE_BOUNDS);
     DestinationIdentityStatus anchor_status =
         destination_identity_graph_register_anchor(
             &graph, collection->destination_home_fd);
     if (anchor_status != DESTINATION_IDENTITY_OK)
     {
-        print_error("Error: Could not inspect destination HOME ancestry for portable restore\n");
+        if (anchor_status == DESTINATION_IDENTITY_RESOURCE_ERROR &&
+            errno == E2BIG)
+            print_error("Error: Portable restore destination identity budget exceeded while registering destination HOME ancestry\n");
+        else
+            print_error("Error: Could not inspect destination HOME ancestry for portable restore\n");
         replay_report_failure(collection->report, collection->manifest,
                               SIZE_MAX, (SidecarBytes){0});
         destination_identity_graph_free(&graph);
         return -1;
     }
-    unsigned char registered_xdg[XDG_KEY_COUNT] = {0};
-
-    for (size_t index = 0; index < collection->count; index++)
+    if (destination_identity_graph_add_entries(
+            &graph, collection->manifest, collection->count,
+            collection->destination_home_fd,
+            collection->destination_home_path,
+            collection->destination_xdg_dirs, collection->xdg_anchor_fd,
+            collection->xdg_anchor_prefix, replay_identity_entry,
+            replay_identity_failure, collection,
+            DESTINATION_IDENTITY_STOP_ON_COLLISION) != 0)
     {
-        ReplayEntry *entry = &collection->items[index];
-        int anchor = -1;
-        char relative[PATH_MAX];
-        if (replay_identity_route(collection, entry, &anchor, relative,
-                                  sizeof(relative)) != 0)
-        {
-            print_error("Error: Could not resolve portable restore destination for manifest root %s entry %.*s\n",
-                        collection->manifest->roots[entry->root_index].id,
-                        (int)entry->entry->logical_path.length,
-                        entry->entry->logical_path.data);
-            replay_report_failure(collection->report, collection->manifest,
-                                  entry->root_index,
-                                  entry->entry->logical_path);
-            destination_identity_graph_free(&graph);
-            return -1;
-        }
-
-        const ManifestRoot *root =
-            &collection->manifest->roots[entry->root_index];
-        if (root->policy == ROOT_POLICY_XDG)
-        {
-            int key = xdg_key_index(root->id);
-            if (key < 0 || key >= XDG_KEY_COUNT)
-            {
-                replay_report_failure(collection->report,
-                                      collection->manifest,
-                                      entry->root_index,
-                                      entry->entry->logical_path);
-                destination_identity_graph_free(&graph);
-                return -1;
-            }
-            if (!registered_xdg[key])
-            {
-                anchor_status = destination_identity_graph_register_anchor(
-                    &graph, anchor);
-                if (anchor_status != DESTINATION_IDENTITY_OK)
-                {
-                    print_error("Error: Could not inspect XDG destination ancestry for manifest root %s\n",
-                                root->id);
-                    replay_report_failure(collection->report,
-                                          collection->manifest,
-                                          entry->root_index,
-                                          entry->entry->logical_path);
-                    destination_identity_graph_free(&graph);
-                    return -1;
-                }
-                registered_xdg[key] = 1;
-            }
-        }
-
-        DestinationIdentityClaim claim =
-            entry->entry->kind == SIDECAR_KIND_DIRECTORY
-                ? DESTINATION_IDENTITY_DIRECTORY
-                : DESTINATION_IDENTITY_NON_DIRECTORY;
-        DestinationIdentityStatus status = destination_identity_graph_add(
-            &graph, anchor, relative, claim, index,
-            &entry->identity_placement);
-        if (status == DESTINATION_IDENTITY_COLLISION)
-        {
-            print_error("Error: Manifest root %s entry %.*s conflicts with another mapped restore destination\n",
-                        collection->manifest->roots[entry->root_index].id,
-                        (int)entry->entry->logical_path.length,
-                        entry->entry->logical_path.data);
-            replay_report_failure(collection->report, collection->manifest,
-                                  entry->root_index,
-                                  entry->entry->logical_path);
-            destination_identity_graph_free(&graph);
-            return -1;
-        }
-        if (status != DESTINATION_IDENTITY_OK)
-        {
-            print_error("Error: Could not inspect mapped restore destination for manifest root %s entry %.*s\n",
-                        collection->manifest->roots[entry->root_index].id,
-                        (int)entry->entry->logical_path.length,
-                        entry->entry->logical_path.data);
-            replay_report_failure(collection->report, collection->manifest,
-                                  entry->root_index,
-                                  entry->entry->logical_path);
-            destination_identity_graph_free(&graph);
-            return -1;
-        }
+        destination_identity_graph_free(&graph);
+        return -1;
     }
 
     DestinationIdentityStatus status =
-        destination_identity_graph_finalize(&graph);
+        destination_identity_graph_finalize(&graph, NULL);
     if (status != DESTINATION_IDENTITY_OK)
     {
-        print_error("Error: Could not order the portable restore destination namespace\n");
+        if (status == DESTINATION_IDENTITY_RESOURCE_ERROR && errno == E2BIG)
+            print_error("Error: Portable restore destination identity budget exceeded while ordering the destination namespace\n");
+        else
+            print_error("Error: Could not order the portable restore destination namespace\n");
         replay_report_failure(collection->report, collection->manifest,
                               SIZE_MAX, (SidecarBytes){0});
         destination_identity_graph_free(&graph);

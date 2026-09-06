@@ -139,6 +139,34 @@ static void mkdir_p(const char *path)
     }
 }
 
+static void make_deep_payload_directory(const char *source,
+                                        const char *payload, size_t levels)
+{
+    char data[PATH_MAX];
+    join_path(data, sizeof(data), source, "data");
+    mkdir_p(data);
+
+    int data_fd = open(data, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (data_fd < 0 || mkdirat(data_fd, payload, 0755) != 0)
+        exit(1);
+    int current = openat(data_fd, payload,
+                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (current < 0 || close(data_fd) != 0)
+        exit(1);
+    for (size_t level = 0; level < levels; level++)
+    {
+        if (mkdirat(current, "d", 0755) != 0)
+            exit(1);
+        int next = openat(current, "d",
+                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (next < 0 || close(current) != 0)
+            exit(1);
+        current = next;
+    }
+    if (close(current) != 0)
+        exit(1);
+}
+
 // Creates dir/rel (rel may have one level, e.g. "data/EXPLICIT_0") and writes
 // content into dir/rel/name.
 static void write_payload_file(const char *dir, const char *rel, const char *name, const char *content)
@@ -842,6 +870,46 @@ static void test_v2_selection_restore_refusals(void)
     remove_tree(home);
 }
 
+static void test_v2_payload_depth_is_bounded(void)
+{
+    printf(BLUE "::" NC " restore dispatch: VERSION=2 payload depth is bounded\n");
+
+    char source[PATH_MAX], home[PATH_MAX], output[16384];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_v2_depth_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_v2_depth_home");
+    setenv("HOME", home, 1);
+
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "CONFIG_0");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "CONFIG_0");
+    strcpy(root.source_path, "/source/home/deep");
+    strcpy(root.restore_path, "deep");
+    root.has_restore_path = 1;
+
+    Manifest manifest;
+    memset(&manifest, 0, sizeof(manifest));
+    manifest.version = MANIFEST_SELECTION_VERSION;
+    manifest.representation = CLONE_NATIVE_TREE;
+    manifest.scope = MANIFEST_SCOPE_CRITICAL;
+    strcpy(manifest.source_home, "/source/home");
+    manifest.root_count = 1;
+    manifest.roots = &root;
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the deep VERSION=2 manifest");
+    make_deep_payload_directory(source, root.payload_path, 513U);
+    remove_fixture_packages(source);
+
+    int rc = run_restore_capturing(source, output, sizeof(output));
+    check(rc != 0 && strstr(output, "maximum directory depth") != NULL &&
+              strstr(output, root.id) != NULL,
+          "an over-deep payload is refused cleanly with its manifest root named");
+
+    remove_tree(source);
+    remove_tree(home);
+}
+
 static void test_v2_home_relative_restore_destination_too_long(void)
 {
     printf(BLUE "::" NC " restore dispatch: VERSION=2 HOME_RELATIVE restore destination overflow names its root\n");
@@ -1027,8 +1095,52 @@ static void test_versioned_restore_refuses_destination_alias_collisions(void)
                                                sizeof(output));
     dry_run = previous_dry_run;
     check(rc != 0 && strstr(output, "competing entries for restore destination") != NULL &&
+              strstr(output, "XDG_DOCUMENTS_DIR") != NULL &&
+              strstr(output, "XDG_DOWNLOAD_DIR") != NULL &&
+              strstr(output, alias) != NULL &&
               file_content_is(sentinel, "ORIGINAL"),
-          "VERSION=1 Shared/Alias duplicate files refuse before the existing file changes");
+          "VERSION=1 Shared/Alias duplicate files name both roots and the destination before refusing");
+    remove_tree(source);
+    remove_tree(home);
+
+    fresh_mkdtemp(source, sizeof(source), "dispatch_identity_nested_file_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_identity_nested_file_home");
+    setenv("HOME", home, 1);
+    memset(roots, 0, sizeof(roots));
+    strcpy(roots[0].id, "PARENT");
+    roots[0].policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(roots[0].payload_path, "PARENT");
+    strcpy(roots[0].source_path, "Parent");
+    strcpy(roots[0].restore_path, "Parent");
+    roots[0].has_restore_path = 1;
+    strcpy(roots[1].id, "CHILD");
+    roots[1].policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(roots[1].payload_path, "CHILD");
+    strcpy(roots[1].source_path, "Parent/child");
+    strcpy(roots[1].restore_path, "Parent/child");
+    roots[1].has_restore_path = 1;
+    make_v1_manifest(&manifest, roots, 2);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the nested non-directory root manifest");
+    write_payload_file(source, "data/PARENT", "child", "PARENT");
+    char child_payload[PATH_MAX];
+    join_path(child_payload, sizeof(child_payload), source, "data/CHILD");
+    write_file_mode(child_payload, "CHILD", 0600);
+    join_path(shared, sizeof(shared), home, "Parent");
+    mkdir_p(shared);
+    join_path(sentinel, sizeof(sentinel), shared, "child");
+    write_file_mode(sentinel, "ORIGINAL", 0600);
+    remove_fixture_packages(source);
+
+    dry_run = 0;
+    rc = run_restore_capturing_with_input(source, "y\n", output,
+                                          sizeof(output));
+    dry_run = previous_dry_run;
+    check(rc != 0 && strstr(output, "PARENT") != NULL &&
+              strstr(output, "CHILD") != NULL &&
+              strstr(output, sentinel) != NULL &&
+              file_content_is(sentinel, "ORIGINAL"),
+          "a file root nested below a directory root triggers the entry walk and refuses before mutation");
     remove_tree(source);
     remove_tree(home);
 
@@ -1988,6 +2100,7 @@ int main(void)
     test_v1_restores_home_relative_and_xdg_reports_manual_native();
     test_v1_empty_restore_path_means_home_itself();
     test_v2_selection_restore_refusals();
+    test_v2_payload_depth_is_bounded();
     test_v2_home_relative_restore_destination_too_long();
     test_versioned_restore_freezes_xdg_target_map();
     test_versioned_restore_refuses_destination_alias_collisions();
