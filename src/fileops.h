@@ -19,6 +19,8 @@
 typedef enum { CLONE_BACKUP, CLONE_RESTORE } CloneOperation;
 typedef enum { CLONE_NATIVE_TREE, CLONE_PORTABLE_SIDECAR } CloneRepresentation;
 
+struct SelectionRoot;
+
 typedef struct CloneContext {
     CloneOperation operation;
     CloneRepresentation representation;
@@ -27,6 +29,7 @@ typedef struct CloneContext {
     int metadata_preflight_done;
     void *inode_map; /* NativeInodeMap; backup/restore tracking; NULL disables it. */
     void *visited; /* Native visited-path set, backup-only; NULL disables tracking. */
+    const struct SelectionRoot *selection; /* Borrowed, native backup-only. */
 } CloneContext;
 
 /* Opaque native hardlink map ownership. */

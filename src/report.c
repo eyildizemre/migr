@@ -10,6 +10,7 @@
 #include <limits.h>
 #include "backup_plan.h"
 #include "report.h"
+#include "selection.h"
 #include "detect.h"
 #include "utils.h"
 
@@ -113,8 +114,14 @@ static int report_depth_includes(ReportDepth depth, size_t level)
  */
 static int measure_report_tree(const char *path, size_t depth,
                                ReportDepth depth_limit,
-                               ReportBreakdown *breakdown, off_t *size)
+                               ReportBreakdown *breakdown, off_t *size,
+                               const SelectionRoot *selection)
 {
+    if (selection)
+    {
+        int owned = selection_source_owns(selection, path);
+        if (owned <= 0) { *size = 0; return owned; }
+    }
     struct stat st;
     if (lstat(path, &st) != 0)
         return -1;
@@ -180,7 +187,7 @@ static int measure_report_tree(const char *path, size_t depth,
         size_t child_depth = depth == SIZE_MAX ? SIZE_MAX : depth + 1;
         off_t child_size = 0;
         if (measure_report_tree(child_path, child_depth, depth_limit,
-                                breakdown, &child_size) != 0)
+                                breakdown, &child_size, selection) != 0)
         {
             int saved_errno = errno;
             closedir(dir);
@@ -279,7 +286,7 @@ static const char *scoped_root_name(const char *home,
  */
 static int measure_scoped_root(const char *path, ReportDepth depth_limit,
                                ReportBreakdown *breakdown, off_t *bytes,
-                               int *present)
+                               int *present, const SelectionRoot *selection)
 {
     struct stat st;
     *bytes = 0;
@@ -293,7 +300,7 @@ static int measure_scoped_root(const char *path, ReportDepth depth_limit,
     }
 
     errno = 0;
-    if (measure_report_tree(path, 0, depth_limit, breakdown, bytes) != 0)
+    if (measure_report_tree(path, 0, depth_limit, breakdown, bytes, selection) != 0)
     {
         if (errno == ENOENT || errno == ENOTDIR)
         {
@@ -307,12 +314,10 @@ static int measure_scoped_root(const char *path, ReportDepth depth_limit,
     return 0;
 }
 
-static int report_scoped(const char *home, BackupMode mode, int summary,
-                         ReportDepth depth)
+static int report_plan(const char *home, const BackupPlan *plan,
+                        const SelectionPlan *selection, int summary, ReportDepth depth)
 {
-    BackupPlan plan;
-    if (backup_plan_build(home, mode, NULL, &plan) != 0)
-        return 1;
+    ManifestScope scope = selection ? selection->scope : plan->scope;
 
     off_t total = 0;
     int had_error = 0;
@@ -321,16 +326,18 @@ static int report_scoped(const char *home, BackupMode mode, int summary,
     if (!summary)
         print_report_header(home);
 
-    for (int i = 0; i < plan.root_count; i++)
+    size_t count = selection ? selection->root_count : (size_t)plan->root_count;
+    for (size_t i = 0; i < count; i++)
     {
-        const BackupPlanRoot *root = &plan.roots[i];
+        const SelectionRoot *filter = selection ? &selection->roots[i] : NULL;
+        const BackupPlanRoot *root = filter ? &filter->root : &plan->roots[i];
         off_t bytes = 0;
         int present = 0;
         ReportBreakdown breakdown = { NULL, 0, 0 };
         int want_breakdown = !summary && verbose;
         int measure_rc = measure_scoped_root(root->capture_path, depth,
                                              want_breakdown ? &breakdown : NULL,
-                                             &bytes, &present);
+                                             &bytes, &present, filter);
 
         if (measure_rc != 0)
         {
@@ -384,7 +391,7 @@ static int report_scoped(const char *home, BackupMode mode, int summary,
     }
     else
     {
-        const char *label = mode == BACKUP_COMPREHENSIVE
+        const char *label = scope == MANIFEST_SCOPE_COMPREHENSIVE
                                 ? "Comprehensive estimate"
                                 : "Critical estimate";
         printf("\n");
@@ -396,7 +403,6 @@ static int report_scoped(const char *home, BackupMode mode, int summary,
         }
     }
 
-    backup_plan_free(&plan);
     return had_error ? 1 : 0;
 }
 
@@ -409,5 +415,15 @@ int report(BackupMode mode, int summary, ReportDepth depth)
         return 1;
     }
 
-    return report_scoped(home, mode, summary, depth);
+    BackupPlan plan;
+    if (backup_plan_build(home, mode, NULL, &plan) != 0) return 1;
+    int rc = report_plan(home, &plan, NULL, summary, depth);
+    backup_plan_free(&plan);
+    return rc;
+}
+
+int report_selection(const struct SelectionPlan *plan, int summary, ReportDepth depth)
+{
+    if (selection_plan_validate(plan) < 0) return 1;
+    return report_plan(plan->home, NULL, plan, summary, depth);
 }

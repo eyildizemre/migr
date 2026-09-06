@@ -827,8 +827,14 @@ void backup_plan_test_set_dir_open_hook(BackupPlanTestDirOpenHook hook)
  * function instead of a separate path-based entry point.
  */
 static int estimate_walk_fd(int parent_fd, const char *name, off_t block_size,
-                            EstimateSeen *seen, off_t *size)
+                            EstimateSeen *seen, off_t *size,
+                            const SelectionRoot *selection, char *relative)
 {
+    if (selection)
+    {
+        int owned = selection_root_owns(selection, relative);
+        if (owned <= 0) return owned;
+    }
     struct stat st;
     if (fstatat(parent_fd, name, &st, AT_SYMLINK_NOFOLLOW) != 0)
         return -1;
@@ -907,7 +913,18 @@ static int estimate_walk_fd(int parent_fd, const char *name, off_t block_size,
             strcmp(entry->d_name, "..") == 0)
             continue;
 
-        if (estimate_walk_fd(dir_fd, entry->d_name, block_size, seen, size) != 0)
+        size_t old_length = selection ? strlen(relative) : 0;
+        if (selection)
+        {
+            size_t prefix = old_length + (old_length != 0);
+            size_t name_length = strlen(entry->d_name);
+            if (prefix + name_length >= PATH_MAX) { saved_errno = ENAMETOOLONG; break; }
+            if (old_length) relative[old_length] = '/';
+            memcpy(relative + prefix, entry->d_name, name_length + 1);
+        }
+        int rc = estimate_walk_fd(dir_fd, entry->d_name, block_size, seen, size, selection, relative);
+        if (selection) relative[old_length] = 0;
+        if (rc != 0)
         {
             saved_errno = errno != 0 ? errno : EIO;
             break;
@@ -925,28 +942,31 @@ static int estimate_walk_fd(int parent_fd, const char *name, off_t block_size,
     return 0;
 }
 
-void backup_plan_estimate_size(const BackupPlan *plan, off_t block_size,
-                               off_t *total, int *had_error)
+static void estimate_plan(const BackupPlan *plan, const SelectionPlan *selection,
+                           off_t block_size, off_t *total, int *had_error)
 {
     if (total == NULL || had_error == NULL)
         return;
 
     *total = 0;
     *had_error = 0;
-    if (plan == NULL)
+    if (plan == NULL && selection == NULL)
     {
         *had_error = 1;
         return;
     }
 
     EstimateSeen seen = {0};
-    for (int i = 0; i < plan->root_count; i++)
+    size_t count = selection ? selection->root_count : (size_t)plan->root_count;
+    for (size_t i = 0; i < count; i++)
     {
-        const char *path = plan->roots[i].capture_path;
+        const SelectionRoot *filter = selection ? &selection->roots[i] : NULL;
+        const char *path = filter ? filter->root.capture_path : plan->roots[i].capture_path;
+        char relative[PATH_MAX] = "";
         off_t root_size = 0;
         size_t seen_before_root = seen.count;
         errno = 0;
-        if (estimate_walk_fd(AT_FDCWD, path, block_size, &seen, &root_size) != 0)
+        if (estimate_walk_fd(AT_FDCWD, path, block_size, &seen, &root_size, filter, relative) != 0)
         {
             int saved_errno = errno;
             seen.count = seen_before_root;
@@ -1220,4 +1240,18 @@ fail:
     free(rb.items);
     selection_plan_free(&plan);
     return -1;
+}
+
+void backup_plan_estimate_size(const BackupPlan *plan, off_t block_size,
+                               off_t *total, int *had_error)
+{
+    estimate_plan(plan, NULL, block_size, total, had_error);
+}
+
+void selection_plan_estimate_size(const SelectionPlan *plan, off_t block_size,
+                                  off_t *total, int *had_error)
+{
+    if (!total || !had_error) return;
+    if (selection_plan_validate(plan) < 0) { *total = 0; *had_error = 1; return; }
+    estimate_plan(NULL, plan, block_size, total, had_error);
 }

@@ -29,5 +29,8 @@ typedef struct {
  * @return 0 on success, 1 if planning or measurement fails or HOME is unset.
  */
 int report(BackupMode mode, int summary, ReportDepth depth);
+struct SelectionPlan;
+/* Reports an already-compiled policy without reading configuration again. */
+int report_selection(const struct SelectionPlan *plan, int summary, ReportDepth depth);
 
 #endif

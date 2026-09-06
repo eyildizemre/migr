@@ -10,7 +10,7 @@ typedef struct {
     size_t count;
 } SelectionPaths;
 
-typedef struct {
+typedef struct SelectionRoot {
     BackupPlanRoot root;
     int parent; /* -1 for a top-level owner; otherwise an earlier root index. */
     uint32_t xdg_aliases; /* Bits in xdg_keys order, including the chosen key. */
@@ -21,7 +21,7 @@ typedef struct {
 /* D34's compiled source ownership forest. This is deliberately distinct from
  * BackupPlan: unfiltered walkers cannot safely consume delegated/excluded roots.
  * No config file lookup, capture or manifest mutation occurs during compilation. */
-typedef struct {
+typedef struct SelectionPlan {
     char home[PATH_MAX];
     ManifestScope scope;
     SelectionRoot *roots;
@@ -40,6 +40,20 @@ int selection_plan_validate(const SelectionPlan *plan);
 /* Pure component matching; rel must be canonical, with "" denoting the root.
  * Return 1 for owned entries, 0 for pruned entries, -1 for invalid input. */
 int selection_root_owns(const SelectionRoot *root, const char *rel);
+/* Absolute source-address counterpart; no filesystem resolution. */
+int selection_source_owns(const SelectionRoot *root, const char *source);
+void selection_plan_estimate_size(const SelectionPlan *plan, off_t block_size,
+                                  off_t *total, int *had_error);
+/* Inventory is read-only; the caller probes the aggregated profiles before
+ * setting metadata_preflight_done and capturing an identically adopted policy. */
+int backup_selection_inventory(const SelectionPlan *plan, int anchor_fd,
+                                int data_fd, MetadataProfiles *profiles);
+/* Owns fresh cross-root hardlink/visited maps. Reconciles only after every root
+ * succeeds. report, if supplied, must be initialized by the caller; progress
+ * and sync settings are retained across roots. data_fd must belong to a fresh or identity-matched native container. */
+BackupCaptureStatus backup_selection_capture(const CloneContext *ctx,
+                                             const SelectionPlan *plan,
+                                             int data_fd, BackupCaptureReport *report);
 /* Preserve the conservative destination containment gate, even in exclusions. */
 int selection_destination_conflicts(const SelectionPlan *plan, const char *destination);
 

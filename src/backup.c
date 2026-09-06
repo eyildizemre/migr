@@ -17,6 +17,7 @@
 
 #include "backup.h"
 #include "backup_plan.h"
+#include "selection.h"
 #include "container.h"
 #include "fileops.h"
 #include "fsprobe.h"
@@ -1541,8 +1542,14 @@ static int backup_metadata_inventory(const char *source_path, int anchor_fd,
                                      int destination_root_fd,
                                      const char *destination_rel,
                                      MetadataProfiles *profiles,
-                                     SourceReadRefusals *refusals)
+                                     SourceReadRefusals *refusals,
+                                     const SelectionRoot *selection)
 {
+    if (selection)
+    {
+        int owned = selection_source_owns(selection, source_path);
+        if (owned <= 0) return owned;
+    }
     struct stat source_st;
     if (lstat(source_path, &source_st) != 0)
         return -1;
@@ -1647,7 +1654,7 @@ static int backup_metadata_inventory(const char *source_path, int anchor_fd,
                       destination_rel, entry->d_name) != 0 ||
             backup_metadata_inventory(child_source, anchor_fd,
                                       destination_root_fd, child_destination,
-                                      profiles, refusals) != 0)
+                                      profiles, refusals, selection) != 0)
         {
             failed = 1;
             break;
@@ -1715,7 +1722,7 @@ static int backup_metadata_preflight(const BackupPlan *plan, int anchor_fd,
         if (backup_metadata_inventory(root->capture_path, anchor_fd,
                                       destination_root_fd,
                                       root->manifest_root.payload_path,
-                                      profiles, refusals) != 0)
+                                      profiles, refusals, NULL) != 0)
             return -1;
     }
     return 0;
@@ -2477,4 +2484,65 @@ fail_pre_container:
     manifest_free(&manifest);
     backup_plan_free(&plan);
     return 1;
+}
+
+int backup_selection_inventory(const SelectionPlan *plan, int anchor_fd,
+                                int data_fd, MetadataProfiles *profiles)
+{
+    if (selection_plan_validate(plan) < 0 || anchor_fd < 0 || !profiles) return -1;
+    SourceReadRefusals refusals = {0};
+    for (size_t i = 0; i < plan->root_count; i++)
+    {
+        const SelectionRoot *root = &plan->roots[i];
+        if (backup_metadata_inventory(root->root.capture_path, anchor_fd, data_fd,
+                                      root->root.manifest_root.payload_path,
+                                      profiles, &refusals, root) < 0) return -1;
+    }
+    if (refusals.refusal_count)
+    {
+        source_read_refusals_report(&refusals);
+        return -1;
+    }
+    return 0;
+}
+
+BackupCaptureStatus backup_selection_capture(const CloneContext *ctx,
+                                             const SelectionPlan *plan,
+                                             int data_fd, BackupCaptureReport *report)
+{
+    if (!ctx || ctx->operation != CLONE_BACKUP || ctx->representation != CLONE_NATIVE_TREE ||
+        !ctx->metadata_preflight_done || data_fd < 0 || selection_plan_validate(plan) < 0)
+        return BACKUP_CAPTURE_ERROR;
+    CloneContext run = *ctx;
+    run.inode_map = native_inode_map_create();
+    run.visited = native_visited_create();
+    BackupCaptureStatus status = BACKUP_CAPTURE_ERROR;
+    if (!run.inode_map || !run.visited) goto done;
+    for (size_t i = 0; i < plan->root_count; i++)
+    {
+        run.selection = &plan->roots[i];
+        const BackupPlanRoot *root = &run.selection->root;
+        if (native_inode_map_seed_existing(&run, root->capture_path, data_fd,
+                                           root->manifest_root.payload_path) < 0) goto done;
+    }
+    for (size_t i = 0; i < plan->root_count; i++)
+    {
+        run.selection = &plan->roots[i];
+        const BackupPlanRoot *root = &run.selection->root;
+        status = backup_capture_at_report_continue(&run, root->capture_path, data_fd,
+                                                   root->manifest_root.payload_path, report);
+        if (status != BACKUP_CAPTURE_OK) goto done;
+    }
+    status = BACKUP_CAPTURE_OK;
+    for (size_t i = 0; i < plan->root_count; i++)
+    {
+        NativeReconcileReport reconciliation;
+        if (native_reconcile_stale_at(run.visited, plan->roots[i].root.manifest_root.payload_path,
+                                      data_fd, &reconciliation) != NATIVE_RECONCILE_OK)
+        { status = BACKUP_CAPTURE_ERROR; break; }
+    }
+done:
+    native_inode_map_free(run.inode_map);
+    native_visited_free(run.visited);
+    return status;
 }

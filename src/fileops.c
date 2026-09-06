@@ -13,7 +13,8 @@
 #include <errno.h>
 #include <stdint.h>
 
-#include "fileops.h" // CloneContext
+#include "fileops.h"
+#include "selection.h"
 #include "hash.h"
 #include "metadata.h"
 #include "portable.h"
@@ -717,6 +718,11 @@ static int native_inode_map_seed_existing_at(
     const CloneContext *ctx, const char *source_path, int destination_dir_fd,
     const char *destination_leaf)
 {
+    if (ctx->selection)
+    {
+        int owned = selection_source_owns(ctx->selection, source_path);
+        if (owned <= 0) return owned;
+    }
     struct stat source_st;
     if (lstat(source_path, &source_st) != 0)
         return -1;
@@ -783,6 +789,11 @@ static int native_inode_map_seed_existing_at(
 static int native_inode_map_seed_existing_root_at(
     const CloneContext *ctx, const char *source_path, int destination_root_fd)
 {
+    if (ctx->selection)
+    {
+        int owned = selection_source_owns(ctx->selection, source_path);
+        if (owned <= 0) return owned;
+    }
     struct stat source_st;
     if (lstat(source_path, &source_st) != 0)
         return -1;
@@ -828,6 +839,7 @@ int native_inode_map_seed_existing(const CloneContext *ctx,
         source_path == NULL || destination_root_fd < 0 ||
         !native_seed_relative_path_is_safe(destination_rel))
         return -1;
+    if (ctx->selection && ctx->operation != CLONE_BACKUP) return -1;
     if (ctx->inode_map == NULL)
         return 0;
     if (destination_rel[0] == '\0')
@@ -1641,6 +1653,11 @@ static BackupCaptureStatus capture_entry_at(const CloneContext *ctx,
                                             const char *rel_path,
                                             BackupCaptureReport *report)
 {
+    if (ctx->selection)
+    {
+        int owned = selection_source_owns(ctx->selection, src);
+        if (owned <= 0) return owned == 0 ? BACKUP_CAPTURE_OK : BACKUP_CAPTURE_ERROR;
+    }
     struct stat st;
     if (lstat(src, &st) != 0)
         return BACKUP_CAPTURE_ERROR;
@@ -1853,6 +1870,9 @@ static int native_reconcile_scan_node(const void *visited,
         }
     }
     if (closedir(dir) != 0)
+        failed = 1;
+    struct timespec times[2] = {st.st_atim, st.st_mtim};
+    if (futimens(child_fd, times) != 0)
         failed = 1;
     if (close(child_fd) != 0)
         failed = 1;
@@ -2069,7 +2089,17 @@ NativeReconcileStatus native_reconcile_stale_at(const void *visited,
                 root_fd, stale.items[index], &parent_fd, leaf, sizeof(leaf));
             int remove_result;
             if (open_result == 0)
-                remove_result = native_remove_leaf(parent_fd, leaf);
+            {
+                struct stat parent_st;
+                remove_result = fstat(parent_fd, &parent_st);
+                if (remove_result == 0)
+                {
+                    remove_result = native_remove_leaf(parent_fd, leaf);
+                    struct timespec times[2] = {parent_st.st_atim, parent_st.st_mtim};
+                    if (futimens(parent_fd, times) != 0)
+                        remove_result = -1;
+                }
+            }
             else
                 remove_result = errno == ENOENT ? 0 : -1;
             if (open_result != 0 || remove_result != 0)
@@ -2086,6 +2116,9 @@ NativeReconcileStatus native_reconcile_stale_at(const void *visited,
     }
 
     native_stale_list_free(&stale);
+    struct timespec times[2] = {root_st.st_atim, root_st.st_mtim};
+    if (futimens(root_fd, times) != 0)
+        result = NATIVE_RECONCILE_ERROR;
     if (close(root_fd) != 0)
         result = NATIVE_RECONCILE_ERROR;
     return result;

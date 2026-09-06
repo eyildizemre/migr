@@ -6,13 +6,6 @@
 #include <string.h>
 #include <sys/stat.h>
 
-int selection_path_covers(const char *parent, const char *path)
-{
-    size_t n = strlen(parent);
-    return !strcmp(parent, path) || (n == 1 && parent[0] == '/' && path[0] == '/') ||
-           (n && !strncmp(parent, path, n) && path[n] == '/');
-}
-
 int selection_paths_add(SelectionPaths *paths, const char *path)
 {
     if (paths->count >= CONFIG_MAX_RULES) return -1;
@@ -120,20 +113,6 @@ int selection_normalize(const char *home, const char *raw,
         part = next;
     }
     return pruned ? 1 : 0;
-}
-
-int selection_root_owns(const SelectionRoot *root, const char *rel)
-{
-    if (!root || !rel || *rel == '/' || strlen(rel) >= PATH_MAX) return -1;
-    for (const char *p = rel; *p; )
-    {
-        size_t n = strcspn(p, "/");
-        if (!n || (n == 1 && p[0] == '.') || (n == 2 && !memcmp(p, "..", 2))) return -1;
-        p += n;
-        if (*p && !*++p) return -1;
-    }
-    if (excluded_path(&root->excluded, rel) || excluded_path(&root->delegated, rel)) return 0;
-    return 1;
 }
 
 void selection_plan_free(SelectionPlan *plan)
