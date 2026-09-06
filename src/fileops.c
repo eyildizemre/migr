@@ -3703,7 +3703,12 @@ int run_command(char *const argv[])
         int status;
 
         // Wait for the child process to finish so it won't become a zombie process
-        if (waitpid(pid, &status, 0) == -1)
+        pid_t waited;
+        do
+        {
+            waited = waitpid(pid, &status, 0);
+        } while (waited < 0 && errno == EINTR);
+        if (waited == -1)
         {
             return -1;
         }
