@@ -172,6 +172,17 @@ static void write_raw(const char *dir, const char *content)
     fclose(f);
 }
 
+static void remove_fixture_packages(const char *source)
+{
+    char path[PATH_MAX];
+    join_path(path, sizeof(path), source, "packages.txt");
+    if (unlink(path) != 0 && errno != ENOENT)
+    {
+        printf(RED "fixture: could not remove %s" NC "\n", path);
+        exit(1);
+    }
+}
+
 // Forks so restore()'s output can be captured in isolation per call without
 // one test's output or any accidental global mutation leaking into the next.
 // input may be NULL; live happy-path tests pass "y\n" through stdin so they
@@ -823,6 +834,128 @@ static void test_v2_home_relative_restore_destination_too_long(void)
           "restore refuses when a HOME_RELATIVE restore destination cannot be joined onto $HOME");
     check(strstr(output, "Error: Restore destination for manifest root CONFIG_0 is too long") != NULL,
           "the overflow names the offending manifest root instead of failing silently (P4)");
+
+    remove_tree(source);
+    remove_tree(home);
+}
+
+static void test_versioned_restore_freezes_xdg_target_map(void)
+{
+    printf(BLUE "::" NC " restore dispatch: versioned restore freezes XDG target addresses for the invocation\n");
+
+    char source[PATH_MAX], home[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_frozen_map_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_frozen_map_home");
+    setenv("HOME", home, 1);
+
+    ManifestRoot roots[2];
+    Manifest manifest;
+    make_v2_selection_manifest(&manifest, roots);
+    strcpy(roots[0].source_path, ".config");
+    strcpy(roots[0].restore_path, ".config");
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the VERSION=2 frozen-map manifest");
+
+    write_payload_file(
+        source, "data/CONFIG_0", "user-dirs.dirs",
+        "XDG_DOCUMENTS_DIR=\"$HOME/Belgeler\"\n");
+    write_payload_file(source, "data/XDG_DOCUMENTS_DIR", "doc", "SAVED-DATA");
+
+    char source_doc[PATH_MAX], source_link[PATH_MAX], source_xdg[PATH_MAX];
+    join_path(source_xdg, sizeof(source_xdg), source,
+              "data/XDG_DOCUMENTS_DIR");
+    join_path(source_doc, sizeof(source_doc), source_xdg, "doc");
+    join_path(source_link, sizeof(source_link), source_xdg, "doc-link");
+    check(link(source_doc, source_link) == 0,
+          "fixture: add a hardlink inside the mapped XDG root");
+    struct timespec xdg_times[2] = {
+        { .tv_sec = 1700000900, .tv_nsec = 123456789 },
+        { .tv_sec = 1700000901, .tv_nsec = 234567890 }
+    };
+    check(chmod(source_xdg, 0750) == 0 &&
+              utimensat(AT_FDCWD, source_xdg, xdg_times, 0) == 0,
+          "fixture: set mapped XDG root metadata");
+
+    write_payload_file(
+        home, ".config", "user-dirs.dirs",
+        "XDG_DOCUMENTS_DIR=\"$HOME/Documents\"\n");
+    remove_fixture_packages(source);
+
+    char dry_output[16384];
+    int previous_dry_run = dry_run;
+    dry_run = 1;
+    int dry_rc = run_restore_capturing(source, dry_output, sizeof(dry_output));
+    char expected_preview[PATH_MAX + 80];
+    int preview_len = snprintf(
+        expected_preview, sizeof(expected_preview),
+        "Would restore: XDG_DOCUMENTS_DIR -> %s/Documents/\n", home);
+    check(dry_rc == 0 && preview_len > 0 &&
+              (size_t)preview_len < sizeof(expected_preview) &&
+              strstr(dry_output, expected_preview) != NULL,
+          "dry-run maps Documents using the target configuration present at invocation start");
+
+    dry_run = 0;
+    char live_output[16384];
+    int live_rc = run_restore_capturing_with_input(
+        source, "y\n", live_output, sizeof(live_output));
+    dry_run = previous_dry_run;
+
+    char documents[PATH_MAX], document[PATH_MAX], document_link[PATH_MAX];
+    char belgeler[PATH_MAX];
+    join_path(documents, sizeof(documents), home, "Documents");
+    join_path(document, sizeof(document), documents, "doc");
+    join_path(document_link, sizeof(document_link), documents, "doc-link");
+    join_path(belgeler, sizeof(belgeler), home, "Belgeler");
+
+    struct stat documents_st, document_st, document_link_st;
+    int mapped_metadata_ok =
+        stat(documents, &documents_st) == 0 &&
+        stat(document, &document_st) == 0 &&
+        stat(document_link, &document_link_st) == 0;
+    check(live_rc == 0 && file_content_is(document, "SAVED-DATA") &&
+              access(belgeler, F_OK) != 0,
+          "live restore uses the same Documents address after restoring user-dirs.dirs");
+    check(mapped_metadata_ok &&
+              document_st.st_dev == document_link_st.st_dev &&
+              document_st.st_ino == document_link_st.st_ino &&
+              (documents_st.st_mode & 07777) == 0750 &&
+              documents_st.st_mtim.tv_sec == xdg_times[1].tv_sec,
+          "hardlink seeding and directory metadata use the frozen mapped destination");
+
+    remove_tree(source);
+    remove_tree(home);
+
+    fresh_mkdtemp(source, sizeof(source), "dispatch_frozen_conflict_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_frozen_conflict_home");
+    setenv("HOME", home, 1);
+    make_v2_selection_manifest(&manifest, roots);
+    strcpy(roots[0].source_path, ".config");
+    strcpy(roots[0].restore_path, ".config");
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the VERSION=2 conflicting-retarget manifest");
+    write_payload_file(
+        source, "data/CONFIG_0", "user-dirs.dirs",
+        "XDG_DOCUMENTS_DIR=\"$HOME/.config\"\n");
+    write_payload_file(
+        source, "data/XDG_DOCUMENTS_DIR", "doc", "CONFLICT-SAFE");
+    write_payload_file(
+        home, ".config", "user-dirs.dirs",
+        "XDG_DOCUMENTS_DIR=\"$HOME/Documents\"\n");
+    remove_fixture_packages(source);
+
+    previous_dry_run = dry_run;
+    dry_run = 0;
+    live_rc = run_restore_capturing_with_input(
+        source, "y\n", live_output, sizeof(live_output));
+    dry_run = previous_dry_run;
+
+    char conflicting_entry[PATH_MAX];
+    join_path(documents, sizeof(documents), home, "Documents");
+    join_path(document, sizeof(document), documents, "doc");
+    join_path(conflicting_entry, sizeof(conflicting_entry), home, ".config/doc");
+    check(live_rc == 0 && file_content_is(document, "CONFLICT-SAFE") &&
+              access(conflicting_entry, F_OK) != 0,
+          "restored XDG configuration cannot redirect a later root into the CONFIG_0 destination");
 
     remove_tree(source);
     remove_tree(home);
@@ -1540,6 +1673,7 @@ int main(void)
     test_v1_empty_restore_path_means_home_itself();
     test_v2_selection_restore_refusals();
     test_v2_home_relative_restore_destination_too_long();
+    test_versioned_restore_freezes_xdg_target_map();
     test_v2_selection_restore_nested_metadata_order();
     test_v1_restore_space_preflight();
     test_network_config_backends(2, -1, -1, 0);

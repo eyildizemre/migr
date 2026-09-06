@@ -2993,6 +2993,18 @@ its root-relative logical paths. Resolve target XDG once per restore. Source
 ownership decides what exists in the backup; target mapping must never prune an
 ordinary retained sibling merely because it lies under another root's target.
 
+**Target addressing is resolved once per invocation.** The restore resolves
+the target HOME and XDG trust roots before any destination is inspected, holds
+them as anchors for the whole run, and derives every mapped destination from
+that held map. No phase re-reads user directory configuration after mutation
+begins: restoring a source `.config` must never retarget the run that is
+restoring it. Collision validation, metadata and space inventory, timestamp
+probing, hardlink seeding, dry-run preview and replay all consume the same map,
+so the addresses that were checked are the addresses that are written. This is
+a property of restore addressing in general, not of configured selections: it
+applies to every versioned manifest, and the map is not permitted to differ
+between representations.
+
 Preflight the combined mapped entry set before mutation on both representations.
 Reject two distinct source entries mapping to the same destination, including two
 directories with competing metadata, and reject non-directory ancestors, symlink
