@@ -67,7 +67,9 @@ int xdg_resolve(const char *home,
 
                 char resolved[PATH_MAX];
                 int rn;
-                if (strncmp(val, "$HOME/", 6) == 0)
+                if (strcmp(val, "$HOME") == 0)
+                    rn = snprintf(resolved, sizeof(resolved), "%s", home);
+                else if (strncmp(val, "$HOME/", 6) == 0)
                     rn = snprintf(resolved, sizeof(resolved), "%s/%s", home, val + 6);
                 else if (val[0] == '/')
                     rn = snprintf(resolved, sizeof(resolved), "%s", val);

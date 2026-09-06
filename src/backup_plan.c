@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include "backup_plan.h"
+#include "selection.h"
 #include "hash.h"
 #include "utils.h" /* path_join, path_join_n */
 #include "xdg.h"
@@ -23,6 +24,7 @@ typedef struct {
     BackupPlanRoot *items;
     int count;
     size_t capacity;
+    int limit;
 } RootBuilder;
 
 static int root_type_allowed(mode_t mode)
@@ -51,7 +53,8 @@ static int append_root(RootBuilder *rb, const char *id, RootPolicy policy,
                        const char *restore_path, int has_restore_path,
                        const char *capture_path, BackupRootGroup group)
 {
-    if (rb->count >= MANIFEST_MAX_ROOTS)
+    int limit = rb->limit ? rb->limit : MANIFEST_MAX_ROOTS;
+    if (rb->count >= limit)
     {
         print_error("Error: too many backup roots (limit %d)\n", MANIFEST_MAX_ROOTS);
         return -1;
@@ -60,7 +63,7 @@ static int append_root(RootBuilder *rb, const char *id, RootPolicy policy,
     {
         BackupPlanRoot *n = array_reserve(
             rb->items, &rb->capacity, (size_t)rb->count, 1U,
-            sizeof(*n), 16U, MANIFEST_MAX_ROOTS);
+            sizeof(*n), 16U, (size_t)limit);
         if (n == NULL)
         {
             print_error("Error: out of memory building backup plan\n");
@@ -286,7 +289,30 @@ static int resolve_builtin_candidate(const char *raw, char *capture_path, size_t
 // explicit. XDG's source_path is the same normalized capture address (not
 // the raw xdg_resolve() output); a HOME_RELATIVE built-in's source_path
 // stays its fixed home-relative address, unaffected by this normalization.
-static int build_builtin_roots(const char *home_real, BackupMode mode, RootBuilder *rb)
+static int selection_root_readable(const char *path, mode_t mode)
+{
+    if (!S_ISREG(mode) && !S_ISDIR(mode)) return 1;
+    int flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK;
+    if (S_ISDIR(mode)) flags |= O_DIRECTORY;
+    int fd = open(path, flags);
+    if (fd < 0) return 0;
+    return close(fd) == 0;
+}
+
+static int resolve_selection_candidate(const char *home, const char *raw,
+                                        const SelectionPaths *excludes,
+                                        char capture_path[PATH_MAX])
+{
+    int rc = selection_normalize(home, raw, excludes, 0, capture_path);
+    if (rc != 0) return rc == 1 || errno == ENOENT || errno == ENOTDIR ? 0 : -1;
+    struct stat st;
+    if (lstat(capture_path, &st) < 0)
+        return errno == ENOENT || errno == ENOTDIR ? 0 : -1;
+    return root_type_allowed(st.st_mode) && selection_root_readable(capture_path, st.st_mode) ? 1 : -1;
+}
+
+static int build_builtin_roots(const char *home_real, BackupMode mode, RootBuilder *rb,
+                               const SelectionPaths *excludes)
 {
     int comprehensive = (mode == BACKUP_COMPREHENSIVE);
 
@@ -309,7 +335,8 @@ static int build_builtin_roots(const char *home_real, BackupMode mode, RootBuild
             continue;
 
         char capture_path[PATH_MAX];
-        int rc = resolve_builtin_candidate(xdg_dirs[i], capture_path, sizeof(capture_path));
+        int rc = excludes ? resolve_selection_candidate(home_real, xdg_dirs[i], excludes, capture_path)
+                          : resolve_builtin_candidate(xdg_dirs[i], capture_path, sizeof(capture_path));
         if (rc == 0)
             continue;
         if (rc < 0)
@@ -347,7 +374,8 @@ static int build_builtin_roots(const char *home_real, BackupMode mode, RootBuild
         }
 
         char capture_path[PATH_MAX];
-        int rc = resolve_builtin_candidate(raw, capture_path, sizeof(capture_path));
+        int rc = excludes ? resolve_selection_candidate(home_real, raw, excludes, capture_path)
+                          : resolve_builtin_candidate(raw, capture_path, sizeof(capture_path));
         if (rc == 0)
             continue;
         if (rc < 0)
@@ -566,7 +594,7 @@ int backup_plan_build(const char *home, BackupMode mode,
     {
         out->scope = (mode == BACKUP_COMPREHENSIVE) ? MANIFEST_SCOPE_COMPREHENSIVE
                                                     : MANIFEST_SCOPE_CRITICAL;
-        rc = build_builtin_roots(home_real, mode, &rb);
+        rc = build_builtin_roots(home_real, mode, &rb, NULL);
     }
 
     if (rc == 0)
@@ -1001,4 +1029,195 @@ void backup_plan_free(BackupPlan *plan)
     free(plan->roots);
     plan->roots = NULL;
     plan->root_count = 0;
+}
+
+/* Configured selection compilation (docs/DECISIONS.md D34). */
+static int selection_xdg_rank(const BackupPlanRoot *root)
+{
+    for (int i = 0; i < XDG_KEY_COUNT; i++)
+        if (!strcmp(root->manifest_root.id, xdg_keys[i])) return i;
+    return XDG_KEY_COUNT;
+}
+
+static int selection_candidate_cmp(const void *a, const void *b)
+{
+    const BackupPlanRoot *ra = a, *rb = b;
+    int cmp = strcmp(ra->capture_path, rb->capture_path);
+    if (cmp) return cmp;
+    int xa = selection_xdg_rank(ra), xb = selection_xdg_rank(rb);
+    if (xa != xb) return xa < xb ? -1 : 1;
+    /* Empty ids denote configured requests; existing identities win ties. */
+    if (!!ra->manifest_root.id[0] != !!rb->manifest_root.id[0])
+        return ra->manifest_root.id[0] ? -1 : 1;
+    return strcmp(ra->manifest_root.id, rb->manifest_root.id);
+}
+
+static const char *selection_relative(const char *parent, const char *path)
+{
+    return path + strlen(parent) + (strcmp(parent, "/") != 0);
+}
+
+static void selection_set_mapping(const char *home, BackupPlanRoot *root)
+{
+    ManifestRoot *mr = &root->manifest_root;
+    if (mr->id[0] && !(mr->policy == ROOT_POLICY_XDG && !strcmp(root->capture_path, home)))
+        return;
+    const char *relative;
+    if (backup_plan_home_relative(home, root->capture_path, &relative))
+    {
+        mr->policy = ROOT_POLICY_HOME_RELATIVE;
+        mr->has_restore_path = 1;
+        strcpy(mr->source_path, relative);
+        strcpy(mr->restore_path, relative);
+    }
+    else
+    {
+        mr->policy = ROOT_POLICY_MANUAL_NATIVE;
+        mr->has_restore_path = 0;
+        strcpy(mr->source_path, root->capture_path);
+        mr->restore_path[0] = 0;
+    }
+}
+
+static int selection_mapping_inherited(const BackupPlanRoot *parent,
+                                       const BackupPlanRoot *child)
+{
+    if (!child->manifest_root.id[0]) return 1;
+    const ManifestRoot *a = &parent->manifest_root, *b = &child->manifest_root;
+    if (a->policy != b->policy || b->policy == ROOT_POLICY_XDG) return 0;
+    if (b->policy == ROOT_POLICY_MANUAL_NATIVE) return 1;
+    char mapped[PATH_MAX];
+    const char *relative = selection_relative(parent->capture_path, child->capture_path);
+    if (!a->restore_path[0]) return !strcmp(relative, b->restore_path);
+    return path_join(mapped, sizeof(mapped), a->restore_path, relative) == 0 &&
+           !strcmp(mapped, b->restore_path);
+}
+
+static int selection_active(const ConfigRule *rule, BackupMode mode)
+{
+    return rule->scope == CONFIG_CRITICAL || mode == BACKUP_COMPREHENSIVE;
+}
+
+int selection_plan_build(const char *home, BackupMode mode,
+                         const Config *config, SelectionPlan *out)
+{
+    if (!out) return -1;
+    *out = (SelectionPlan){0};
+    SelectionPlan plan = {0};
+    RootBuilder rb = {.limit = CONFIG_MAX_RULES + BUILTIN_HOME_CATALOG_COUNT + XDG_KEY_COUNT};
+    const char *error = "invalid HOME, scope or config";
+    struct stat st;
+    if (!home || !realpath(home, plan.home) || stat(plan.home, &st) < 0 || !S_ISDIR(st.st_mode) ||
+        (mode != BACKUP_CRITICAL && mode != BACKUP_COMPREHENSIVE) ||
+        (config && (config->count > CONFIG_MAX_RULES || (config->count && !config->rules)))) goto fail;
+    plan.scope = mode == BACKUP_CRITICAL ? MANIFEST_SCOPE_CRITICAL : MANIFEST_SCOPE_COMPREHENSIVE;
+    size_t count = config ? config->count : 0;
+    error = "invalid config rule";
+    unsigned char pending[CONFIG_MAX_RULES] = {0};
+    size_t remaining = 0;
+    for (size_t i = 0; i < count; i++)
+    {
+        const ConfigRule *rule = &config->rules[i];
+        if ((rule->scope != CONFIG_CRITICAL && rule->scope != CONFIG_COMPREHENSIVE) ||
+            (rule->action != CONFIG_INCLUDE && rule->action != CONFIG_EXCLUDE) ||
+            !rule->path || !*rule->path) goto fail;
+        if (rule->action == CONFIG_EXCLUDE &&
+            rule->scope == (mode == BACKUP_CRITICAL ? CONFIG_CRITICAL : CONFIG_COMPREHENSIVE))
+        {
+            pending[i] = 1;
+            remaining++;
+        }
+    }
+    /* A broader exclusion may make an inaccessible descendant irrelevant.
+     * Retry unresolved rules after learning boundaries, independent of order. */
+    while (remaining)
+    {
+        size_t before = remaining;
+        for (size_t i = 0; i < count; i++)
+        {
+            if (!pending[i]) continue;
+            char normalized[PATH_MAX];
+            int rc = selection_normalize(plan.home, config->rules[i].path, &plan.excludes, 1, normalized);
+            if (rc < 0) continue;
+            if (!rc && selection_paths_add(&plan.excludes, normalized) < 0) goto fail;
+            pending[i] = 0;
+            remaining--;
+        }
+        if (remaining == before) goto fail;
+    }
+    selection_paths_reduce(&plan.excludes);
+    error = "could not resolve built-in selection";
+    if (build_builtin_roots(plan.home, mode, &rb, &plan.excludes) < 0) goto fail;
+    error = "could not resolve included path";
+    for (size_t i = 0; i < count; i++)
+    {
+        const ConfigRule *rule = &config->rules[i];
+        if (rule->action != CONFIG_INCLUDE || !selection_active(rule, mode)) continue;
+        char normalized[PATH_MAX];
+        int rc = selection_normalize(plan.home, rule->path, &plan.excludes, 0, normalized);
+        if (rc < 0) goto fail;
+        if (rc == 1) continue;
+        if (lstat(normalized, &st) < 0 || !root_type_allowed(st.st_mode) ||
+            !selection_root_readable(normalized, st.st_mode)) goto fail;
+        if (append_root(&rb, "", ROOT_POLICY_MANUAL_NATIVE, "", normalized, NULL, 0,
+                        normalized, BACKUP_ROOT_EXPLICIT) < 0) goto fail;
+    }
+    for (int i = 0; i < rb.count; i++) selection_set_mapping(plan.home, &rb.items[i]);
+    if (rb.count > 1) qsort(rb.items, (size_t)rb.count, sizeof(*rb.items), selection_candidate_cmp);
+    error = "out of memory compiling source ownership";
+    if (rb.count)
+    {
+        plan.roots = calloc((size_t)rb.count, sizeof(*plan.roots));
+        if (!plan.roots) goto fail;
+    }
+    size_t configured = 0;
+    for (int i = 0; i < rb.count; i++)
+    {
+        BackupPlanRoot *candidate = &rb.items[i];
+        uint32_t aliases = 0;
+        int rank = selection_xdg_rank(candidate);
+        if (rank < XDG_KEY_COUNT) aliases |= UINT32_C(1) << rank;
+        while (i + 1 < rb.count && !strcmp(candidate->capture_path, rb.items[i + 1].capture_path))
+        {
+            rank = selection_xdg_rank(&rb.items[++i]);
+            if (rank < XDG_KEY_COUNT) aliases |= UINT32_C(1) << rank;
+        }
+        int parent = -1;
+        for (size_t j = 0; j < plan.root_count; j++)
+            if (is_ancestor(plan.roots[j].root.capture_path, candidate->capture_path)) parent = (int)j;
+        /* Configured descendants inherit their owner; built-in restore mappings
+         * survive when the ancestor would place their data elsewhere. */
+        if (parent >= 0 && selection_mapping_inherited(&plan.roots[parent].root, candidate)) continue;
+        SelectionRoot *root = &plan.roots[plan.root_count++];
+        root->root = *candidate;
+        root->parent = parent;
+        root->xdg_aliases = aliases;
+        if (!root->root.manifest_root.id[0])
+        {
+            snprintf(root->root.manifest_root.id, sizeof(root->root.manifest_root.id),
+                     "CONFIG_%zu", configured++);
+            strcpy(root->root.manifest_root.payload_path, root->root.manifest_root.id);
+        }
+        if (parent >= 0 && selection_paths_add(&plan.roots[parent].delegated,
+            selection_relative(plan.roots[parent].root.capture_path, candidate->capture_path)) < 0) goto fail;
+    }
+    if (plan.root_count > MANIFEST_MAX_ROOTS) { error = "too many compiled roots"; goto fail; }
+    for (size_t i = 0; i < plan.excludes.count; i++)
+    {
+        int owner = -1;
+        for (size_t j = 0; j < plan.root_count; j++)
+            if (is_ancestor(plan.roots[j].root.capture_path, plan.excludes.paths[i])) owner = (int)j;
+        if (owner >= 0 && selection_paths_add(&plan.roots[owner].excluded,
+            selection_relative(plan.roots[owner].root.capture_path, plan.excludes.paths[i])) < 0) goto fail;
+    }
+    error = "invalid compiled source ownership";
+    if (selection_plan_validate(&plan) < 0) goto fail;
+    free(rb.items);
+    *out = plan;
+    return 0;
+fail:
+    print_error("Error: %s\n", error);
+    free(rb.items);
+    selection_plan_free(&plan);
+    return -1;
 }
