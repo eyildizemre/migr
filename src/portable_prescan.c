@@ -4,6 +4,7 @@
 #include "portable_hashset_internal.h"
 #include "portable.h"
 #include "encoding.h"
+#include "selection.h"
 #include "sidecar.h"
 #include "utils.h"
 
@@ -1139,7 +1140,8 @@ static int prescan_directory(int source_fd, const char *logical,
                              const char *payload_path,
                              PortablePrescanReport *report,
                              int case_sensitive,
-                             PortableCaseProbeState *probe_state)
+                             PortableCaseProbeState *probe_state,
+                             const SelectionRoot *selection)
 {
     if (source_fd < 0 || logical == NULL || physical == NULL ||
         root_id == NULL || payload_path == NULL || report == NULL ||
@@ -1178,6 +1180,15 @@ static int prescan_directory(int source_fd, const char *logical,
                            entry->d_name) != 0) {
             failed = 1;
             break;
+        }
+        if (selection != NULL) {
+            int owned = selection_root_owns(selection, child_logical);
+            if (owned < 0) {
+                failed = 1;
+                break;
+            }
+            if (owned == 0)
+                continue;
         }
 
         char scratch[3U * NAME_MAX + 4U];
@@ -1291,7 +1302,7 @@ static int prescan_directory(int source_fd, const char *logical,
             }
             int child_result = prescan_directory(
                 child_fd, child_logical, child_physical, root_id,
-                payload_path, report, case_sensitive, probe_state);
+                payload_path, report, case_sensitive, probe_state, selection);
             if (close(child_fd) != 0)
                 child_result = -1;
             if (child_result != 0) {
@@ -1560,7 +1571,7 @@ static int prescan_root(const PortableRootSpec *root,
         return -1;
     int result = prescan_directory(root_fd, "", "", root->id,
                                    root->payload_path, report, case_sensitive,
-                                   probe_state);
+                                   probe_state, root->selection);
     if (close(root_fd) != 0)
         result = -1;
     return result;

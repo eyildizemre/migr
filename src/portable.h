@@ -9,6 +9,9 @@
 #include "manifest.h"
 #include "sidecar.h"
 
+struct SelectionPlan;
+struct SelectionRoot;
+
 typedef struct {
     SidecarXattr *items;
     size_t count;
@@ -69,6 +72,7 @@ typedef struct {
     const char *source_path;
     const char *restore_path;
     int has_restore_path;
+    const struct SelectionRoot *selection; /* Borrowed compiled ownership, optional. */
 } PortableRootSpec;
 
 /**
@@ -82,9 +86,17 @@ typedef struct {
     uid_t source_uid;
     const PortableRootSpec *roots;
     size_t root_count;
+    const struct SelectionPlan *selection_plan; /* Borrowed, optional. */
     int nsec_exact;
     int case_sensitive;
 } PortableCaptureRequest;
+
+/* Binds a compiled D34 selection to an existing request. The caller owns roots
+ * and keeps both roots and plan alive for the request's lifetime. Existing
+ * source-identity and filesystem-capability fields in request are preserved. */
+int portable_capture_request_set_selection(
+    PortableCaptureRequest *request, const struct SelectionPlan *plan,
+    PortableRootSpec *roots, size_t root_capacity);
 
 typedef enum {
     PORTABLE_PRESCAN_NAME_TOO_LONG,

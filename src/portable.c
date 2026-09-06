@@ -22,6 +22,7 @@
 
 #include "encoding.h"
 #include "metadata.h"
+#include "selection.h"
 #include "utils.h"
 
 #define PORTABLE_MAX_READBACK_NAMES SIDECAR_MAX_LIVE_ENTRIES
@@ -956,6 +957,20 @@ static int sticky_seed_callback(const SidecarLiveView *view, void *argument)
 
     const PortableRootSpec *root = portable_collision_plan_root(state->request,
                                                                 root_id);
+    if (root != NULL && root->selection != NULL) {
+        int owned = selection_root_owns(root->selection, logical);
+        if (owned < 0) {
+            state->failed = 1;
+            free(root_id);
+            free(logical);
+            return 1;
+        }
+        if (owned == 0) {
+            free(root_id);
+            free(logical);
+            return 0;
+        }
+    }
     char source_path[PATH_MAX];
     int source_path_ready = 0;
     if (root != NULL) {
@@ -1905,6 +1920,15 @@ static int capture_directory(PortableCaptureContext *context,
             failed = 1;
             break;
         }
+        if (root->selection != NULL) {
+            int owned = selection_root_owns(root->selection, child_logical);
+            if (owned < 0) {
+                failed = 1;
+                break;
+            }
+            if (owned == 0)
+                continue;
+        }
 
         /* NAME_MAX + 1 is the accept/reject boundary, not a diagnostic scratch
          * size: docs/DECISIONS.md D19 N-2 requires refusing, not skipping, a
@@ -2468,6 +2492,11 @@ static int capture_node(PortableCaptureContext *context,
                         int destination_parent, const char *destination_leaf,
                         int *no_destination_object)
 {
+    if (root->selection != NULL) {
+        int owned = selection_root_owns(root->selection, logical);
+        if (owned <= 0)
+            return owned == 0 ? 0 : -1;
+    }
     struct stat before;
     if (read_source_stat(source_parent, source_name, root_path, &before) != 0)
         return -1;
@@ -2671,15 +2700,194 @@ int root_spec_valid(const PortableRootSpec *root)
     if (root->has_restore_path && root->restore_path[0] != '\0' &&
         !safe_relative_path(root->restore_path))
         return 0;
+    if (root->selection != NULL) {
+        const BackupPlanRoot *selected = &root->selection->root;
+        const ManifestRoot *mapped = &selected->manifest_root;
+        if (strcmp(root->id, mapped->id) != 0 ||
+            root->policy != mapped->policy ||
+            strcmp(root->capture_path, selected->capture_path) != 0 ||
+            strcmp(root->payload_path, mapped->payload_path) != 0 ||
+            strcmp(root->source_path, mapped->source_path) != 0 ||
+            root->has_restore_path != mapped->has_restore_path ||
+            (root->has_restore_path &&
+             strcmp(root->restore_path, mapped->restore_path) != 0))
+            return 0;
+    }
     return strlen(root->capture_path) < PATH_MAX &&
            strlen(root->source_path) < PATH_MAX &&
            (!root->has_restore_path || strlen(root->restore_path) < PATH_MAX);
+}
+
+int portable_capture_request_set_selection(
+    PortableCaptureRequest *request, const SelectionPlan *plan,
+    PortableRootSpec *roots, size_t root_capacity)
+{
+    if (request == NULL || plan == NULL || plan->home[0] != '/' ||
+        (plan->scope != MANIFEST_SCOPE_CRITICAL &&
+         plan->scope != MANIFEST_SCOPE_COMPREHENSIVE) ||
+        plan->root_count > MANIFEST_MAX_ROOTS ||
+        (plan->root_count != 0 && plan->roots == NULL) ||
+        root_capacity < plan->root_count ||
+        (plan->root_count != 0 && roots == NULL))
+        return -1;
+    for (size_t index = 0; index < plan->root_count; index++) {
+        const SelectionRoot *selection = &plan->roots[index];
+        const BackupPlanRoot *root = &selection->root;
+        const ManifestRoot *mapped = &root->manifest_root;
+        roots[index] = (PortableRootSpec){
+            .id = mapped->id,
+            .policy = mapped->policy,
+            .capture_path = root->capture_path,
+            .payload_path = mapped->payload_path,
+            .source_path = mapped->source_path,
+            .restore_path = mapped->restore_path,
+            .has_restore_path = mapped->has_restore_path,
+            .selection = selection
+        };
+    }
+    request->scope = plan->scope;
+    request->roots = roots;
+    request->root_count = plan->root_count;
+    request->selection_plan = plan;
+    return 0;
+}
+
+static int request_selection_valid(const PortableCaptureRequest *request)
+{
+    if (request == NULL)
+        return 0;
+    if (request->selection_plan == NULL) {
+        for (size_t index = 0; index < request->root_count; index++)
+            if (request->roots[index].selection != NULL)
+                return 0;
+        return 1;
+    }
+    const SelectionPlan *plan = request->selection_plan;
+    if (plan == NULL || plan->home[0] != '/' ||
+        (plan->scope != MANIFEST_SCOPE_CRITICAL &&
+         plan->scope != MANIFEST_SCOPE_COMPREHENSIVE) ||
+        plan->root_count > MANIFEST_MAX_ROOTS ||
+        (plan->root_count != 0 && plan->roots == NULL) ||
+        request->scope != plan->scope ||
+        request->root_count != plan->root_count ||
+        (request->root_count != 0 && request->roots == NULL))
+        return 0;
+    for (size_t index = 0; index < request->root_count; index++)
+        if (request->roots[index].selection != &plan->roots[index] ||
+            !root_spec_valid(&request->roots[index]))
+            return 0;
+    return 1;
+}
+
+static int selection_source_relative(const SelectionPlan *plan,
+                                     const SelectionRoot *root,
+                                     const char **relative)
+{
+    if (plan == NULL || root == NULL || relative == NULL)
+        return 0;
+    const char *home = plan->home;
+    const char *path = root->root.capture_path;
+    size_t home_length = strlen(home);
+    if (strcmp(home, path) == 0) {
+        *relative = "";
+        return 1;
+    }
+    if (strncmp(home, path, home_length) != 0 ||
+        path[home_length] != '/')
+        return 0;
+    *relative = path + home_length + 1U;
+    return 1;
+}
+
+static int build_selection_manifest(const SelectionPlan *plan,
+                                    Manifest *manifest)
+{
+    if (plan == NULL || manifest == NULL)
+        return -1;
+    memset(manifest, 0, sizeof(*manifest));
+    manifest->version = MANIFEST_CURRENT_VERSION;
+    manifest->scope = plan->scope;
+    manifest->root_count = (int)plan->root_count;
+    for (size_t index = 0; index < plan->root_count; index++)
+        if (plan->roots[index].parent >= 0)
+            manifest->version = MANIFEST_SELECTION_VERSION;
+    if (plan->excludes.count != 0)
+        manifest->version = MANIFEST_SELECTION_VERSION;
+
+    if (plan->root_count != 0) {
+        manifest->roots = calloc(plan->root_count, sizeof(*manifest->roots));
+        if (manifest->roots == NULL)
+            goto fail;
+    }
+    if (manifest->version == MANIFEST_SELECTION_VERSION) {
+        if (copy_text(manifest->source_home, sizeof(manifest->source_home),
+                      plan->home) != 0 ||
+            plan->excludes.count > MANIFEST_MAX_EXCLUDES)
+            goto fail;
+        manifest->exclude_count = plan->excludes.count;
+        if (manifest->exclude_count != 0) {
+            manifest->excludes = calloc(manifest->exclude_count,
+                                        sizeof(*manifest->excludes));
+            if (manifest->excludes == NULL)
+                goto fail;
+        }
+        for (size_t index = 0; index < manifest->exclude_count; index++) {
+            manifest->excludes[index] = strdup(plan->excludes.paths[index]);
+            if (manifest->excludes[index] == NULL)
+                goto fail;
+        }
+    }
+    for (size_t index = 0; index < plan->root_count; index++) {
+        const SelectionRoot *selected = &plan->roots[index];
+        manifest->roots[index] = selected->root.manifest_root;
+        if (manifest->version == MANIFEST_SELECTION_VERSION) {
+            const char *source = selected->root.capture_path;
+            const char *relative = NULL;
+            if (manifest->roots[index].policy == ROOT_POLICY_HOME_RELATIVE &&
+                selection_source_relative(plan, selected, &relative))
+                source = relative;
+            if (copy_text(manifest->roots[index].source_path,
+                          sizeof(manifest->roots[index].source_path),
+                          source) != 0)
+                goto fail;
+        }
+    }
+    if (!manifest_selection_valid(manifest))
+        goto fail;
+    return 0;
+
+fail:
+    manifest_free(manifest);
+    return -1;
 }
 
 
 static int build_manifest(const PortableCaptureRequest *request,
                           Manifest *manifest)
 {
+    if (!request_selection_valid(request))
+        return -1;
+    if (request->selection_plan != NULL) {
+        if (build_selection_manifest(request->selection_plan, manifest) != 0)
+            return -1;
+        manifest->representation = CLONE_PORTABLE_SIDECAR;
+        manifest->sidecar_version = SIDECAR_VERSION;
+        manifest->has_source_identity = request->has_source_identity != 0;
+        if (manifest->has_source_identity) {
+            if (request->machine_id == NULL ||
+                copy_text(manifest->machine_id, sizeof(manifest->machine_id),
+                          request->machine_id) != 0) {
+                manifest_free(manifest);
+                return -1;
+            }
+            manifest->source_uid = request->source_uid;
+        }
+        if (!manifest_selection_valid(manifest)) {
+            manifest_free(manifest);
+            return -1;
+        }
+        return 0;
+    }
     memset(manifest, 0, sizeof(*manifest));
     manifest->version = MANIFEST_CURRENT_VERSION;
     manifest->representation = CLONE_PORTABLE_SIDECAR;
@@ -2746,7 +2954,8 @@ int portable_capture_prepare(int scratch_fd,
         request->scope < MANIFEST_SCOPE_CRITICAL ||
         request->scope > MANIFEST_SCOPE_EXPLICIT ||
         request->root_count > MANIFEST_MAX_ROOTS ||
-        (request->root_count != 0 && request->roots == NULL))
+        (request->root_count != 0 && request->roots == NULL) ||
+        !request_selection_valid(request))
         return -1;
 
     portable_prescan_report_init(&out->report);
@@ -2916,6 +3125,7 @@ int portable_capture_fresh_prepared_at(
         request->scope > MANIFEST_SCOPE_EXPLICIT ||
         request->root_count > MANIFEST_MAX_ROOTS ||
         (request->root_count != 0 && request->roots == NULL) ||
+        !request_selection_valid(request) ||
         prepared == NULL || !prepared->ready ||
         fresh_namespace_is_empty(container_fd) != 0)
         return -1;
@@ -2992,6 +3202,7 @@ int portable_capture_fresh_at(int container_fd,
         request->scope > MANIFEST_SCOPE_EXPLICIT ||
         request->root_count > MANIFEST_MAX_ROOTS ||
         (request->root_count != 0 && request->roots == NULL) ||
+        !request_selection_valid(request) ||
         fresh_namespace_is_empty(container_fd) != 0)
         return -1;
 
@@ -3054,6 +3265,7 @@ int portable_capture_resume_prepared_at(
         request->scope > MANIFEST_SCOPE_EXPLICIT ||
         request->root_count > MANIFEST_MAX_ROOTS ||
         (request->root_count != 0 && request->roots == NULL) ||
+        !request_selection_valid(request) ||
         prepared == NULL || !prepared->ready)
         return -1;
 
@@ -3158,7 +3370,8 @@ int portable_capture_resume_at(int container_fd,
         request->scope < MANIFEST_SCOPE_CRITICAL ||
         request->scope > MANIFEST_SCOPE_EXPLICIT ||
         request->root_count > MANIFEST_MAX_ROOTS ||
-        (request->root_count != 0 && request->roots == NULL))
+        (request->root_count != 0 && request->roots == NULL) ||
+        !request_selection_valid(request))
         return -1;
 
     PortablePreparedCapture prepared;

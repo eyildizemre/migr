@@ -46,5 +46,6 @@ tests/test_portable_hashset
 tests/test_selfcopy
 tests/test_selection
 tests/test_manifest_selection
-/tests/test_native_selection
+tests/test_native_selection
+tests/test_portable_selection
 docs/scratch/
