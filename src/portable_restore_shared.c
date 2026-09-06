@@ -1705,10 +1705,8 @@ int destination_identity_graph_add_entries(
 }
 
 DestinationIdentityStatus destination_identity_graph_finalize(
-    DestinationIdentityGraph *graph, int *nested_claims_out)
+    DestinationIdentityGraph *graph)
 {
-    if (nested_claims_out != NULL)
-        *nested_claims_out = 0;
     if (graph == NULL || graph->finalized)
     {
         errno = EINVAL;
@@ -1742,27 +1740,21 @@ DestinationIdentityStatus destination_identity_graph_finalize(
     size_t *indegree = preflight_alloc(&graph->memory, node_bytes);
     size_t *first = preflight_alloc(&graph->memory, node_bytes);
     size_t *queue = preflight_alloc(&graph->memory, node_bytes);
-    unsigned char *claimed_ancestor = nested_claims_out == NULL ? NULL :
-        preflight_alloc(&graph->memory, graph->node_count);
     size_t *next = edge_capacity == 0 ? NULL :
                    preflight_alloc(&graph->memory, edge_bytes);
     size_t *child = edge_capacity == 0 ? NULL :
                     preflight_alloc(&graph->memory, edge_bytes);
     if (indegree == NULL || first == NULL || queue == NULL ||
-        (nested_claims_out != NULL && claimed_ancestor == NULL) ||
         (edge_capacity != 0 && (next == NULL || child == NULL)))
     {
         preflight_free(&graph->memory, indegree, node_bytes);
         preflight_free(&graph->memory, first, node_bytes);
         preflight_free(&graph->memory, queue, node_bytes);
-        preflight_free(&graph->memory, claimed_ancestor, graph->node_count);
         preflight_free(&graph->memory, next, edge_bytes);
         preflight_free(&graph->memory, child, edge_bytes);
         return DESTINATION_IDENTITY_RESOURCE_ERROR;
     }
     memset(indegree, 0, node_bytes);
-    if (claimed_ancestor != NULL)
-        memset(claimed_ancestor, 0, graph->node_count);
     for (size_t i = 0; i < graph->node_count; i++)
         first[i] = SIZE_MAX;
 
@@ -1811,23 +1803,13 @@ DestinationIdentityStatus destination_identity_graph_finalize(
 
     DestinationIdentityNode *nodes = graph->nodes;
     size_t ordered = 0;
-    int nested_claims = 0;
     while (head < tail)
     {
         size_t node = queue[head++];
         nodes[node].topo_order = ordered++;
-        int carries_claim = claimed_ancestor != NULL &&
-            (claimed_ancestor[node] ||
-             nodes[node].metadata_owner != SIZE_MAX);
         for (size_t edge = first[node]; edge != SIZE_MAX; edge = next[edge])
         {
             size_t destination = child[edge];
-            if (carries_claim)
-            {
-                if (nodes[destination].metadata_owner != SIZE_MAX)
-                    nested_claims = 1;
-                claimed_ancestor[destination] = 1;
-            }
             if (indegree[destination] == 0)
             {
                 errno = EINVAL;
@@ -1838,25 +1820,10 @@ DestinationIdentityStatus destination_identity_graph_finalize(
                 queue[tail++] = destination;
         }
     }
-    if (claimed_ancestor != NULL)
-        for (size_t i = 0; i < graph->namespace_capacity; i++)
-            if (slots[i].used && slots[i].non_directory_owner != SIZE_MAX)
-            {
-                if (slots[i].parent >= graph->node_count)
-                {
-                    errno = EINVAL;
-                    goto resource_fail;
-                }
-                size_t parent = slots[i].parent;
-                if (claimed_ancestor[parent] ||
-                    nodes[parent].metadata_owner != SIZE_MAX)
-                    nested_claims = 1;
-            }
 
     preflight_free(&graph->memory, indegree, node_bytes);
     preflight_free(&graph->memory, first, node_bytes);
     preflight_free(&graph->memory, queue, node_bytes);
-    preflight_free(&graph->memory, claimed_ancestor, graph->node_count);
     preflight_free(&graph->memory, next, edge_bytes);
     preflight_free(&graph->memory, child, edge_bytes);
     if (ordered != graph->node_count)
@@ -1865,29 +1832,15 @@ DestinationIdentityStatus destination_identity_graph_finalize(
         return DESTINATION_IDENTITY_CYCLE;
     }
     graph->finalized = 1;
-    if (nested_claims_out != NULL)
-        *nested_claims_out = nested_claims;
     return DESTINATION_IDENTITY_OK;
 
 resource_fail:
     preflight_free(&graph->memory, indegree, node_bytes);
     preflight_free(&graph->memory, first, node_bytes);
     preflight_free(&graph->memory, queue, node_bytes);
-    preflight_free(&graph->memory, claimed_ancestor, graph->node_count);
     preflight_free(&graph->memory, next, edge_bytes);
     preflight_free(&graph->memory, child, edge_bytes);
     return DESTINATION_IDENTITY_RESOURCE_ERROR;
-}
-
-int destination_identity_graph_resume(DestinationIdentityGraph *graph)
-{
-    if (graph == NULL || !graph->finalized)
-    {
-        errno = EINVAL;
-        return -1;
-    }
-    graph->finalized = 0;
-    return 0;
 }
 
 int destination_identity_graph_order(

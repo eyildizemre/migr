@@ -579,7 +579,7 @@ static int replay_selection_destinations_valid(ReplayCollection *collection)
     }
 
     DestinationIdentityStatus status =
-        destination_identity_graph_finalize(&graph, NULL);
+        destination_identity_graph_finalize(&graph);
     if (status != DESTINATION_IDENTITY_OK)
     {
         if (status == DESTINATION_IDENTITY_RESOURCE_ERROR && errno == E2BIG)

@@ -778,7 +778,7 @@ static int validate_destination_identity(Collection *collection)
     }
 
     DestinationIdentityStatus status =
-        destination_identity_graph_finalize(&graph, NULL);
+        destination_identity_graph_finalize(&graph);
     if (status != DESTINATION_IDENTITY_OK)
     {
         if (status == DESTINATION_IDENTITY_RESOURCE_ERROR && errno == E2BIG)

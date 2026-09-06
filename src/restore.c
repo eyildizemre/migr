@@ -1622,12 +1622,10 @@ static int restore_target_identity_register_anchors(
     return 0;
 }
 
-static int restore_target_identity_finalize(RestoreTargetMap *map,
-                                            int *nested_claims_out)
+static int restore_target_identity_finalize(RestoreTargetMap *map)
 {
     DestinationIdentityStatus status =
-        destination_identity_graph_finalize(&map->identity_graph,
-                                            nested_claims_out);
+        destination_identity_graph_finalize(&map->identity_graph);
     if (status == DESTINATION_IDENTITY_OK)
         return 0;
     if (status == DESTINATION_IDENTITY_CYCLE)
@@ -1641,11 +1639,11 @@ static int restore_target_identity_finalize(RestoreTargetMap *map,
 
 static int restore_target_identity_root_preflight(
     int data_fd, const Manifest *manifest, RestoreTargetMap *map,
-    SelectionRestoreOrder *items, int *needs_payload_walk,
-    size_t *next_owner_out)
+    SelectionRestoreOrder *items)
 {
     size_t next_owner = 0;
-    *needs_payload_walk = 0;
+    int validate_ownership =
+        manifest->version == MANIFEST_SELECTION_VERSION;
     for (size_t index = 0; index < map->count; index++)
     {
         const ManifestRoot *root = &manifest->roots[index];
@@ -1660,7 +1658,7 @@ static int restore_target_identity_root_preflight(
                         root->id);
             return -1;
         }
-        if (!items[index].automatic)
+        if (!items[index].automatic && !validate_ownership)
             continue;
 
         struct stat st;
@@ -1672,74 +1670,39 @@ static int restore_target_identity_root_preflight(
                         root->id);
             return -1;
         }
-        size_t owner;
-        if (restore_target_owner_next(&next_owner, index, &owner) != 0)
+        if (items[index].automatic)
         {
-            if (root_fd >= 0)
-                close(root_fd);
-            errno = E2BIG;
-            print_error("Error: Too many destination entries while mapping manifest root %s\n",
-                        root->id);
-            return -1;
+            size_t owner;
+            if (restore_target_owner_next(&next_owner, index, &owner) != 0)
+            {
+                if (root_fd >= 0)
+                    close(root_fd);
+                errno = E2BIG;
+                print_error("Error: Too many destination entries while mapping manifest root %s\n",
+                            root->id);
+                return -1;
+            }
+
+            DestinationIdentityPlacement placement;
+            if (restore_target_identity_add(map, manifest, index, "", &st,
+                                            owner, &placement) != 0)
+            {
+                if (root_fd >= 0)
+                    close(root_fd);
+                return -1;
+            }
+            map->roots[index].placement = placement;
+            map->roots[index].has_placement = 1;
         }
 
-        DestinationIdentityPlacement placement;
-        if (restore_target_identity_add(map, manifest, index, "", &st,
-                                        owner, &placement) != 0)
-        {
-            if (root_fd >= 0)
-                close(root_fd);
-            return -1;
-        }
-        map->roots[index].placement = placement;
-        map->roots[index].has_placement = 1;
-        if (root_fd >= 0 && close(root_fd) != 0)
-        {
-            print_error("Error: Could not close payload inventory for manifest root %s\n",
-                        root->id);
-            return -1;
-        }
-    }
-
-    int nested;
-    if (restore_target_identity_finalize(map, &nested) != 0)
-        return -1;
-    if (nested)
-        *needs_payload_walk = 1;
-    *next_owner_out = next_owner;
-    return 0;
-}
-
-static int restore_payload_inventory_scan(
-    int data_fd, const Manifest *manifest, RestoreTargetMap *map,
-    int map_identity, size_t *next_owner)
-{
-    int validate_ownership =
-        manifest->version == MANIFEST_SELECTION_VERSION;
-    for (size_t index = 0; index < map->count; index++)
-    {
-        const ManifestRoot *root = &manifest->roots[index];
-        int map_root = map_identity &&
-            root->policy != ROOT_POLICY_MANUAL_NATIVE;
-        if (!validate_ownership && !map_root)
-            continue;
-
-        struct stat st;
-        int root_fd = -1;
-        if (selection_payload_open_at(data_fd, root->payload_path, &st,
-                                      &root_fd) != 0)
-        {
-            print_error("Error: Could not safely inspect payload for manifest root %s\n",
-                        root->id);
-            return -1;
-        }
-        if (S_ISDIR(st.st_mode) &&
+        if (root_fd >= 0 &&
             restore_payload_inventory_walk(
                 map, manifest, index, root_fd, "", validate_ownership,
-                map_root, next_owner, 0U) != 0)
+                items[index].automatic, &next_owner, 0U) != 0)
             return -1;
     }
-    return 0;
+
+    return restore_target_identity_finalize(map);
 }
 
 static int restore_target_identity_build(
@@ -1755,26 +1718,10 @@ static int restore_target_identity_build(
         return -1;
     }
 
-    int needs_payload_walk = 0;
-    size_t next_owner = 0;
     int failed = restore_target_identity_register_anchors(
                      map, home_fd, manifest) != 0 ||
         restore_target_identity_root_preflight(
-            data_fd, manifest, map, items, &needs_payload_walk,
-            &next_owner) != 0;
-
-    if (!failed && needs_payload_walk)
-    {
-        if (destination_identity_graph_resume(&map->identity_graph) != 0 ||
-            restore_payload_inventory_scan(data_fd, manifest, map, 1,
-                                           &next_owner) != 0 ||
-            restore_target_identity_finalize(map, NULL) != 0)
-            failed = 1;
-    }
-    else if (!failed && manifest->version == MANIFEST_SELECTION_VERSION &&
-             restore_payload_inventory_scan(data_fd, manifest, map, 0,
-                                            &next_owner) != 0)
-        failed = 1;
+            data_fd, manifest, map, items) != 0;
 
     if (close(data_fd) != 0 && !failed)
     {

@@ -20,9 +20,11 @@
 #include <fcntl.h>
 #include <ftw.h>
 #include <limits.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -35,9 +37,15 @@
 #define GREEN "\033[0;32m"
 #define RED   "\033[0;31m"
 #define BLUE  "\033[0;34m"
+#define YELLOW "\033[0;33m"
 #define NC    "\033[0m"
 
+enum { CHILD_SKIP = 77 };
+
 static int failures = 0;
+static int skips = 0;
+
+static int file_content_is(const char *path, const char *content);
 
 static void check(int cond, const char *label)
 {
@@ -48,6 +56,12 @@ static void check(int cond, const char *label)
         printf("  " RED "x" NC " %s\n", label);
         failures++;
     }
+}
+
+static void skip_case(const char *label, const char *reason)
+{
+    printf("  " YELLOW "-" NC " %s skipped: %s\n", label, reason);
+    skips++;
 }
 
 static void force_no_free_space(off_t needed, off_t *free_bytes,
@@ -283,6 +297,127 @@ static int run_restore_capturing(const char *source, char *output,
                                  size_t output_size)
 {
     return run_restore_capturing_with_input(source, NULL, output, output_size);
+}
+
+static int write_proc_file(const char *path, const char *content)
+{
+    int fd = open(path, O_WRONLY | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    size_t length = strlen(content);
+    ssize_t written = write(fd, content, length);
+    int saved_errno = errno;
+    int close_rc = close(fd);
+    if (written < 0)
+        errno = saved_errno;
+    return written == (ssize_t)length && close_rc == 0 ? 0 : -1;
+}
+
+static int setup_bind_mount_namespace(void)
+{
+    uid_t host_uid = getuid();
+    gid_t host_gid = getgid();
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0)
+        return -1;
+
+    char mapping[64];
+    int length = snprintf(mapping, sizeof(mapping), "0 %lu 1\n",
+                          (unsigned long)host_uid);
+    if (length < 0 || (size_t)length >= sizeof(mapping) ||
+        write_proc_file("/proc/self/uid_map", mapping) != 0 ||
+        write_proc_file("/proc/self/setgroups", "deny\n") != 0)
+        return -1;
+
+    length = snprintf(mapping, sizeof(mapping), "0 %lu 1\n",
+                      (unsigned long)host_gid);
+    if (length < 0 || (size_t)length >= sizeof(mapping) ||
+        write_proc_file("/proc/self/gid_map", mapping) != 0)
+        return -1;
+
+    return mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+}
+
+static int run_bind_mount_restore(const char *source, const char *home,
+                                  const char *documents_shared,
+                                  const char *downloads_shared,
+                                  char *output, size_t output_size)
+{
+    int output_pipe[2];
+    int input_pipe[2];
+    if (pipe(output_pipe) != 0 || pipe(input_pipe) != 0)
+    {
+        perror("pipe");
+        exit(1);
+    }
+    fflush(stdout);
+    fflush(stderr);
+    pid_t pid = fork();
+    if (pid < 0)
+    {
+        perror("fork");
+        exit(1);
+    }
+    if (pid == 0)
+    {
+        close(output_pipe[0]);
+        close(input_pipe[1]);
+        if (dup2(output_pipe[1], STDOUT_FILENO) < 0 ||
+            dup2(output_pipe[1], STDERR_FILENO) < 0 ||
+            dup2(input_pipe[0], STDIN_FILENO) < 0)
+            _exit(2);
+        close(output_pipe[1]);
+        close(input_pipe[0]);
+
+        if (setup_bind_mount_namespace() != 0 ||
+            mount(downloads_shared, documents_shared, NULL, MS_BIND, NULL) != 0)
+            _exit(CHILD_SKIP);
+
+        struct stat documents_st, downloads_st;
+        if (stat(documents_shared, &documents_st) != 0 ||
+            stat(downloads_shared, &downloads_st) != 0 ||
+            documents_st.st_dev != downloads_st.st_dev ||
+            documents_st.st_ino != downloads_st.st_ino)
+            _exit(CHILD_SKIP);
+
+        if (setenv("HOME", home, 1) != 0)
+            _exit(2);
+        dry_run = 0;
+        int restore_rc = restore(source);
+        char documents_file[PATH_MAX], downloads_file[PATH_MAX];
+        join_path(documents_file, sizeof(documents_file), documents_shared,
+                  "file");
+        join_path(downloads_file, sizeof(downloads_file), downloads_shared,
+                  "file");
+        int intact = file_content_is(documents_file, "ORIGINAL") &&
+                     file_content_is(downloads_file, "ORIGINAL");
+        fflush(stdout);
+        fflush(stderr);
+        _exit(restore_rc != 0 && intact ? 0 : 1);
+    }
+
+    close(output_pipe[1]);
+    close(input_pipe[0]);
+    const char input[] = "y\n";
+    if (write(input_pipe[1], input, sizeof(input) - 1U) !=
+        (ssize_t)(sizeof(input) - 1U))
+    {
+        perror("write");
+        exit(1);
+    }
+    close(input_pipe[1]);
+
+    size_t total = 0;
+    ssize_t n;
+    while (total < output_size - 1U &&
+           (n = read(output_pipe[0], output + total,
+                     output_size - 1U - total)) > 0)
+        total += (size_t)n;
+    output[total] = '\0';
+    close(output_pipe[0]);
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
 /* ========================================================================= */
@@ -602,6 +737,128 @@ static void make_v1_alias_manifest(Manifest *manifest,
     strcpy(roots[1].source_path, "Downloads");
 
     make_v1_manifest(manifest, roots, 2);
+}
+
+static void test_versioned_restore_rejects_non_directory_payload_paths(void)
+{
+    printf(BLUE "::" NC " restore dispatch: disjoint roots inspect every payload entry\n");
+
+    const char *variants[] = { "regular file", "symlink" };
+    for (size_t variant = 0; variant < sizeof(variants) / sizeof(variants[0]);
+         variant++)
+    {
+        char source[PATH_MAX], home[PATH_MAX], documents[PATH_MAX];
+        char downloads[PATH_MAX], blocked[PATH_MAX], sentinel[PATH_MAX];
+        char output[16384];
+        ManifestRoot roots[2];
+        Manifest manifest;
+        int previous_dry_run = dry_run;
+
+        fresh_mkdtemp(source, sizeof(source), "dispatch_identity_entry_src");
+        fresh_mkdtemp(home, sizeof(home), "dispatch_identity_entry_home");
+        setenv("HOME", home, 1);
+        write_user_dirs(home, "Documents", "Downloads");
+        join_path(documents, sizeof(documents), home, "Documents");
+        join_path(downloads, sizeof(downloads), home, "Downloads");
+        mkdir_p(documents);
+        mkdir_p(downloads);
+        make_v1_alias_manifest(&manifest, roots);
+        check(manifest_write_v1(source, &manifest) == 0,
+              "fixture: write the disjoint-root payload-entry manifest");
+        write_payload_file(source, "data/XDG_DOCUMENTS_DIR/shared",
+                           "file", "DOCS");
+        write_payload_file(source, "data/XDG_DOWNLOAD_DIR", "file",
+                           "DOWNLOADS");
+
+        join_path(blocked, sizeof(blocked), documents, "shared");
+        if (variant == 0)
+        {
+            strcpy(sentinel, blocked);
+            write_file_mode(blocked, "ORIGINAL", 0600);
+        }
+        else
+        {
+            join_path(sentinel, sizeof(sentinel), documents,
+                      "symlink-target");
+            write_file_mode(sentinel, "ORIGINAL", 0600);
+            if (symlink("symlink-target", blocked) != 0)
+                exit(1);
+        }
+        remove_fixture_packages(source);
+
+        dry_run = 0;
+        int rc = run_restore_capturing_with_input(
+            source, "y\n", output, sizeof(output));
+        dry_run = previous_dry_run;
+
+        struct stat blocked_st;
+        int blocked_intact = lstat(blocked, &blocked_st) == 0 &&
+            ((variant == 0 && S_ISREG(blocked_st.st_mode) &&
+              file_content_is(blocked, "ORIGINAL")) ||
+             (variant == 1 && S_ISLNK(blocked_st.st_mode) &&
+              file_content_is(sentinel, "ORIGINAL")));
+        check(rc != 0 &&
+                  strstr(output,
+                         "manifest root XDG_DOCUMENTS_DIR entry shared") != NULL &&
+                  blocked_intact,
+              variants[variant]);
+
+        remove_tree(source);
+        remove_tree(home);
+    }
+}
+
+static void test_versioned_restore_refuses_bind_mount_aliases(void)
+{
+    printf(BLUE "::" NC " restore dispatch: disjoint roots inspect bind-mounted aliases\n");
+
+    char source[PATH_MAX], home[PATH_MAX], documents_shared[PATH_MAX];
+    char downloads_shared[PATH_MAX], documents_file[PATH_MAX];
+    char downloads_file[PATH_MAX], output[16384];
+    ManifestRoot roots[2];
+    Manifest manifest;
+
+    fresh_mkdtemp(source, sizeof(source), "dispatch_identity_bind_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_identity_bind_home");
+    setenv("HOME", home, 1);
+    write_user_dirs(home, "Documents", "Downloads");
+    join_path(documents_shared, sizeof(documents_shared), home,
+              "Documents/shared");
+    join_path(downloads_shared, sizeof(downloads_shared), home,
+              "Downloads/shared");
+    mkdir_p(documents_shared);
+    mkdir_p(downloads_shared);
+    join_path(documents_file, sizeof(documents_file), documents_shared, "file");
+    join_path(downloads_file, sizeof(downloads_file), downloads_shared, "file");
+    write_file_mode(documents_file, "ORIGINAL", 0600);
+    write_file_mode(downloads_file, "ORIGINAL", 0600);
+    make_v1_alias_manifest(&manifest, roots);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the bind-alias payload-entry manifest");
+    write_payload_file(source, "data/XDG_DOCUMENTS_DIR/shared", "file",
+                       "DOCS");
+    write_payload_file(source, "data/XDG_DOWNLOAD_DIR/shared", "file",
+                       "DOWNLOADS");
+    remove_fixture_packages(source);
+
+    int rc = run_bind_mount_restore(source, home, documents_shared,
+                                    downloads_shared, output, sizeof(output));
+    if (rc == CHILD_SKIP)
+    {
+        skip_case("bind-mounted destination aliases",
+                  "user and mount namespaces are unavailable");
+    }
+    else
+    {
+        check(rc == 0 &&
+                  strstr(output, "XDG_DOCUMENTS_DIR") != NULL &&
+                  strstr(output, "XDG_DOWNLOAD_DIR") != NULL &&
+                  strstr(output, downloads_shared) != NULL,
+              "bind-mounted aliases name both roots and the unchanged destination");
+    }
+
+    remove_tree(source);
+    remove_tree(home);
 }
 
 static int record_network_reload(char *const argv[], void *context)
@@ -2103,6 +2360,8 @@ int main(void)
     test_v2_payload_depth_is_bounded();
     test_v2_home_relative_restore_destination_too_long();
     test_versioned_restore_freezes_xdg_target_map();
+    test_versioned_restore_rejects_non_directory_payload_paths();
+    test_versioned_restore_refuses_bind_mount_aliases();
     test_versioned_restore_refuses_destination_alias_collisions();
     test_versioned_restore_identity_order_and_cross_root_hardlinks();
     test_v2_selection_restore_nested_metadata_order();

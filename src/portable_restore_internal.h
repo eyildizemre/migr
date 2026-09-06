@@ -159,8 +159,7 @@ DestinationIdentityStatus destination_identity_graph_add(
     DestinationIdentityPlacement *placement,
     size_t *conflicting_owner);
 DestinationIdentityStatus destination_identity_graph_finalize(
-    DestinationIdentityGraph *graph, int *nested_claims_out);
-int destination_identity_graph_resume(DestinationIdentityGraph *graph);
+    DestinationIdentityGraph *graph);
 int destination_identity_graph_add_entries(
     DestinationIdentityGraph *graph, const Manifest *manifest,
     size_t entry_count, int destination_home_fd,
