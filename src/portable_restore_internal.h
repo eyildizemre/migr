@@ -38,24 +38,44 @@ typedef struct {
     uint64_t hash_salt;
 } ParentMap;
 
-/*
- * A destination-sorted view over one restore attempt's entries, so the D34
- * destination ancestor-conflict walk (below) can be shared even though
- * preflight addresses entries through a sorted PreflightEntry* array and
- * replay addresses them through an in-place-sorted ReplayEntry array.
- * `entries`/`count` describe the already-destination-sorted sequence;
- * `get_destination`/`is_directory` read index `i` out of it however the
- * caller's own entry type requires. Sharing this view rather than the
- * entries themselves keeps preflight's and replay's destination checks two
- * independent enforcement points (docs/DECISIONS.md D34) -- only the lookup
- * and ancestor walk underneath them is common.
- */
 typedef struct {
-    const void *entries;
-    size_t count;
-    const char *(*get_destination)(const void *entries, size_t index);
-    int (*is_directory)(const void *entries, size_t index);
-} DestinationView;
+    void *nodes;
+    size_t node_count;
+    size_t node_capacity;
+    void *identity_slots;
+    size_t identity_capacity;
+    void *namespace_slots;
+    size_t namespace_count;
+    size_t namespace_capacity;
+    void *mount_views;
+    size_t mount_view_count;
+    size_t mount_view_capacity;
+    void *topology_slots;
+    size_t topology_count;
+    size_t topology_capacity;
+    PreflightMemory memory;
+    uint64_t hash_salt;
+    int finalized;
+} DestinationIdentityGraph;
+
+typedef enum {
+    DESTINATION_IDENTITY_STRUCTURAL = 0,
+    DESTINATION_IDENTITY_DIRECTORY,
+    DESTINATION_IDENTITY_NON_DIRECTORY
+} DestinationIdentityClaim;
+
+typedef enum {
+    DESTINATION_IDENTITY_OK = 0,
+    DESTINATION_IDENTITY_COLLISION,
+    DESTINATION_IDENTITY_PATH_ERROR,
+    DESTINATION_IDENTITY_RESOURCE_ERROR,
+    DESTINATION_IDENTITY_CYCLE
+} DestinationIdentityStatus;
+
+typedef struct {
+    size_t node;
+    int is_directory;
+} DestinationIdentityPlacement;
 
 /* The declarations below are provided by portable_restore_shared.c. */
 void *preflight_alloc(PreflightMemory *memory, size_t size);
@@ -93,20 +113,18 @@ int open_xdg_destination_anchor(const char *path, int *out_fd,
 int sidecar_kind_to_type(SidecarObjectKind kind, mode_t *type);
 int sidecar_is_complete_readonly(int container_fd);
 
-/*
- * Whether some proper ancestor of `path` -- walked component boundary by
- * component boundary, matched against `view` by exact string, never
- * touching the filesystem -- is present with a kind other than directory.
- * `view->entries` must already be sorted ascending by `get_destination`.
- *
- * Returns 1 if such an ancestor exists (a real conflict), 0 if none does, or
- * -1 if `path` is too long to walk at all. The three are deliberately
- * distinct: preflight treats both nonzero results as one violation, while
- * replay's too-long case is an internal bailout that skips its usual
- * per-entry failure report -- each caller maps the result to its own
- * diagnostic instead of this function picking one for both.
- */
-int destination_view_ancestor_conflict(const DestinationView *view,
-                                       const char *path);
+void destination_identity_graph_init(DestinationIdentityGraph *graph);
+void destination_identity_graph_free(DestinationIdentityGraph *graph);
+DestinationIdentityStatus destination_identity_graph_register_anchor(
+    DestinationIdentityGraph *graph, int anchor_fd);
+DestinationIdentityStatus destination_identity_graph_add(
+    DestinationIdentityGraph *graph, int anchor_fd, const char *relative,
+    DestinationIdentityClaim claim, size_t owner,
+    DestinationIdentityPlacement *placement);
+DestinationIdentityStatus destination_identity_graph_finalize(
+    DestinationIdentityGraph *graph);
+int destination_identity_graph_order(
+    const DestinationIdentityGraph *graph,
+    const DestinationIdentityPlacement *placement, size_t *order_out);
 
 #endif

@@ -28,8 +28,8 @@ typedef struct {
     size_t hardlink_ref_root_index;
     const SidecarEntry *hardlink_ref_entry;
     char destination[PATH_MAX];
-    char *absolute_destination;
-    size_t depth;
+    DestinationIdentityPlacement identity_placement;
+    size_t destination_order;
 } ReplayEntry;
 
 /* One most-recent parent captures sibling locality without retaining an fd
@@ -57,7 +57,7 @@ typedef struct {
     const char *destination_home_path;
     const char * const *destination_xdg_dirs;
     int xdg_anchor_fd[XDG_KEY_COUNT];
-    char xdg_anchor_prefix[XDG_KEY_COUNT][NAME_MAX + 1U];
+    char xdg_anchor_prefix[XDG_KEY_COUNT][PATH_MAX];
     ReplayParentCache parent_cache;
     ReplayParentCache payload_cache;
     MetadataTimestampPolicy timestamp_policy;
@@ -191,13 +191,6 @@ static void replay_collection_free(ReplayCollection *collection)
         (void)close(collection->payload_cache.fd);
         collection->payload_cache.fd = -1;
     }
-    for (size_t index = 0; index < collection->count; index++)
-        preflight_free(&collection->memory,
-                       collection->items[index].absolute_destination,
-                       collection->items[index].absolute_destination == NULL
-                           ? 0
-                           : strlen(collection->items[index]
-                                        .absolute_destination) + 1U);
     preflight_free(&collection->memory, collection->items,
                    collection->capacity * sizeof(*collection->items));
     collection->items = NULL;
@@ -317,9 +310,9 @@ static int replay_entry_compare(const void *left, const void *right)
 {
     const ReplayEntry *a = left;
     const ReplayEntry *b = right;
-    if (a->depth < b->depth)
+    if (a->destination_order < b->destination_order)
         return -1;
-    if (a->depth > b->depth)
+    if (a->destination_order > b->destination_order)
         return 1;
     return strcmp(a->destination, b->destination);
 }
@@ -543,102 +536,207 @@ static int replay_collect_entry(const SidecarLiveView *view, void *argument)
             }
     }
     replay->root_index = root_index;
-    if (collection->manifest->version == MANIFEST_SELECTION_VERSION)
-    {
-        char absolute_destination[PATH_MAX];
-        if (destination_absolute_path_build(
-                root, logical, collection->destination_xdg_dirs,
-                collection->destination_home_path, absolute_destination,
-                sizeof(absolute_destination)) != 0)
-        {
-            replay_report_failure(collection->report, collection->manifest,
-                                  root_index, entry->logical_path);
-            return 1;
-        }
-        size_t absolute_size = strlen(absolute_destination) + 1U;
-        replay->absolute_destination =
-            preflight_alloc(&collection->memory, absolute_size);
-        if (replay->absolute_destination == NULL)
-        {
-            replay_report_failure(collection->report, collection->manifest,
-                                  root_index, entry->logical_path);
-            return 1;
-        }
-        memcpy(replay->absolute_destination, absolute_destination,
-               absolute_size);
-        replay->depth = relative_path_depth(absolute_destination);
-    }
-    else
-        replay->depth = relative_path_depth(replay->destination);
     collection->count++;
     if (collection->report->live_count != SIZE_MAX)
         collection->report->live_count++;
     return 0;
 }
 
-static int replay_absolute_compare(const void *left, const void *right)
+static int replay_identity_route(ReplayCollection *collection,
+                                 const ReplayEntry *replay,
+                                 int *anchor_out,
+                                 char *relative,
+                                 size_t relative_size)
 {
-    const ReplayEntry *a = left;
-    const ReplayEntry *b = right;
-    return strcmp(a->absolute_destination, b->absolute_destination);
-}
+    if (collection == NULL || replay == NULL || anchor_out == NULL ||
+        relative == NULL || relative_size == 0 ||
+        replay->root_index >= (size_t)collection->manifest->root_count)
+    {
+        errno = EINVAL;
+        return -1;
+    }
 
-/* Accessors adapting collection->items (in-place sorted by
- * replay_absolute_compare) to the shared D34 ancestor-conflict walk in
- * portable_restore_shared.c. */
-static const char *replay_destination_view_get(const void *entries,
-                                               size_t index)
-{
-    const ReplayEntry *items = entries;
-    return items[index].absolute_destination;
-}
+    const ManifestRoot *root =
+        &collection->manifest->roots[replay->root_index];
+    char logical[PATH_MAX];
+    replay_copy_bytes(logical, sizeof(logical), replay->entry->logical_path);
+    if (replay->entry->logical_path.length >= sizeof(logical))
+    {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
 
-static int replay_destination_view_is_directory(const void *entries,
-                                                 size_t index)
-{
-    const ReplayEntry *items = entries;
-    return items[index].entry->kind == SIDECAR_KIND_DIRECTORY;
+    if (root->policy == ROOT_POLICY_HOME_RELATIVE)
+    {
+        if (destination_path_build(root, logical,
+                                   collection->destination_xdg_dirs,
+                                   relative, relative_size) != 0)
+            return -1;
+        *anchor_out = collection->destination_home_fd;
+        return 0;
+    }
+    if (root->policy != ROOT_POLICY_XDG ||
+        !xdg_destination_valid(collection->destination_xdg_dirs, root))
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    int index = xdg_key_index(root->id);
+    if (index < 0 || index >= XDG_KEY_COUNT)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    if (collection->xdg_anchor_fd[index] < 0)
+    {
+        if (open_xdg_destination_anchor(
+                collection->destination_xdg_dirs[index],
+                &collection->xdg_anchor_fd[index],
+                collection->xdg_anchor_prefix[index],
+                sizeof(collection->xdg_anchor_prefix[index])) != 0)
+            return -1;
+    }
+    if (destination_relative_path_build(
+            collection->xdg_anchor_prefix[index], logical, relative,
+            relative_size) != 0)
+        return -1;
+    *anchor_out = collection->xdg_anchor_fd[index];
+    return 0;
 }
 
 static int replay_selection_destinations_valid(ReplayCollection *collection)
 {
-    if (collection->manifest->version != MANIFEST_SELECTION_VERSION ||
-        collection->count == 0)
-        return 0;
+    DestinationIdentityGraph graph;
+    destination_identity_graph_init(&graph);
+    DestinationIdentityStatus anchor_status =
+        destination_identity_graph_register_anchor(
+            &graph, collection->destination_home_fd);
+    if (anchor_status != DESTINATION_IDENTITY_OK)
+    {
+        print_error("Error: Could not inspect destination HOME ancestry for portable restore\n");
+        replay_report_failure(collection->report, collection->manifest,
+                              SIZE_MAX, (SidecarBytes){0});
+        destination_identity_graph_free(&graph);
+        return -1;
+    }
+    unsigned char registered_xdg[XDG_KEY_COUNT] = {0};
 
-    qsort(collection->items, collection->count, sizeof(*collection->items),
-          replay_absolute_compare);
-    for (size_t index = 1; index < collection->count; index++)
-        if (!strcmp(collection->items[index - 1U].absolute_destination,
-                    collection->items[index].absolute_destination))
-        {
-            replay_report_failure(collection->report, collection->manifest,
-                                  collection->items[index].root_index,
-                                  collection->items[index].entry->logical_path);
-            return -1;
-        }
-
-    DestinationView view = {
-        .entries = collection->items,
-        .count = collection->count,
-        .get_destination = replay_destination_view_get,
-        .is_directory = replay_destination_view_is_directory,
-    };
     for (size_t index = 0; index < collection->count; index++)
     {
         ReplayEntry *entry = &collection->items[index];
-        int conflict = destination_view_ancestor_conflict(
-            &view, entry->absolute_destination);
-        if (conflict < 0)
-            return -1;
-        if (conflict > 0)
+        int anchor = -1;
+        char relative[PATH_MAX];
+        if (replay_identity_route(collection, entry, &anchor, relative,
+                                  sizeof(relative)) != 0)
         {
+            print_error("Error: Could not resolve portable restore destination for manifest root %s entry %.*s\n",
+                        collection->manifest->roots[entry->root_index].id,
+                        (int)entry->entry->logical_path.length,
+                        entry->entry->logical_path.data);
             replay_report_failure(collection->report, collection->manifest,
                                   entry->root_index,
                                   entry->entry->logical_path);
+            destination_identity_graph_free(&graph);
+            return -1;
+        }
+
+        const ManifestRoot *root =
+            &collection->manifest->roots[entry->root_index];
+        if (root->policy == ROOT_POLICY_XDG)
+        {
+            int key = xdg_key_index(root->id);
+            if (key < 0 || key >= XDG_KEY_COUNT)
+            {
+                replay_report_failure(collection->report,
+                                      collection->manifest,
+                                      entry->root_index,
+                                      entry->entry->logical_path);
+                destination_identity_graph_free(&graph);
+                return -1;
+            }
+            if (!registered_xdg[key])
+            {
+                anchor_status = destination_identity_graph_register_anchor(
+                    &graph, anchor);
+                if (anchor_status != DESTINATION_IDENTITY_OK)
+                {
+                    print_error("Error: Could not inspect XDG destination ancestry for manifest root %s\n",
+                                root->id);
+                    replay_report_failure(collection->report,
+                                          collection->manifest,
+                                          entry->root_index,
+                                          entry->entry->logical_path);
+                    destination_identity_graph_free(&graph);
+                    return -1;
+                }
+                registered_xdg[key] = 1;
+            }
+        }
+
+        DestinationIdentityClaim claim =
+            entry->entry->kind == SIDECAR_KIND_DIRECTORY
+                ? DESTINATION_IDENTITY_DIRECTORY
+                : DESTINATION_IDENTITY_NON_DIRECTORY;
+        DestinationIdentityStatus status = destination_identity_graph_add(
+            &graph, anchor, relative, claim, index,
+            &entry->identity_placement);
+        if (status == DESTINATION_IDENTITY_COLLISION)
+        {
+            print_error("Error: Manifest root %s entry %.*s conflicts with another mapped restore destination\n",
+                        collection->manifest->roots[entry->root_index].id,
+                        (int)entry->entry->logical_path.length,
+                        entry->entry->logical_path.data);
+            replay_report_failure(collection->report, collection->manifest,
+                                  entry->root_index,
+                                  entry->entry->logical_path);
+            destination_identity_graph_free(&graph);
+            return -1;
+        }
+        if (status != DESTINATION_IDENTITY_OK)
+        {
+            print_error("Error: Could not inspect mapped restore destination for manifest root %s entry %.*s\n",
+                        collection->manifest->roots[entry->root_index].id,
+                        (int)entry->entry->logical_path.length,
+                        entry->entry->logical_path.data);
+            replay_report_failure(collection->report, collection->manifest,
+                                  entry->root_index,
+                                  entry->entry->logical_path);
+            destination_identity_graph_free(&graph);
             return -1;
         }
     }
+
+    DestinationIdentityStatus status =
+        destination_identity_graph_finalize(&graph);
+    if (status != DESTINATION_IDENTITY_OK)
+    {
+        print_error("Error: Could not order the portable restore destination namespace\n");
+        replay_report_failure(collection->report, collection->manifest,
+                              SIZE_MAX, (SidecarBytes){0});
+        destination_identity_graph_free(&graph);
+        return -1;
+    }
+
+    for (size_t index = 0; index < collection->count; index++)
+        if (destination_identity_graph_order(
+                &graph, &collection->items[index].identity_placement,
+                &collection->items[index].destination_order) != 0)
+        {
+            print_error("Error: Could not order portable restore destination for manifest root %s entry %.*s\n",
+                        collection->manifest->roots[
+                            collection->items[index].root_index].id,
+                        (int)collection->items[index].entry->logical_path.length,
+                        collection->items[index].entry->logical_path.data);
+            replay_report_failure(
+                collection->report, collection->manifest,
+                collection->items[index].root_index,
+                collection->items[index].entry->logical_path);
+            destination_identity_graph_free(&graph);
+            return -1;
+        }
+
+    destination_identity_graph_free(&graph);
     return 0;
 }
 
@@ -1534,7 +1632,7 @@ static int replay_run(ReplayCollection *collection)
           replay_entry_compare);
 
     /* Three passes over the same sorted set, not one:
-     * 1. Every non-HARDLINK entry, in sorted (depth, destination) order.
+     * 1. Every non-HARDLINK entry, in resolved namespace order.
      * 2. HARDLINK entries only, in a second pass over the same set --
      *    deferred because neither the sidecar's hash-bucket iteration order
      *    nor this sort gives any representative-before-alias guarantee a

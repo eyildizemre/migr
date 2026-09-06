@@ -285,6 +285,20 @@ static int write_v2_nested_manifest(Fixture *fixture, ManifestRoot roots[2])
     return manifest_write_v1_at(fixture->container_fd, &manifest);
 }
 
+static int write_v1_identity_manifest(Fixture *fixture, ManifestRoot *roots,
+                                      int root_count)
+{
+    Manifest manifest = {
+        .version = MANIFEST_CURRENT_VERSION,
+        .representation = CLONE_PORTABLE_SIDECAR,
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .sidecar_version = SIDECAR_VERSION,
+        .root_count = root_count,
+        .roots = roots
+    };
+    return manifest_write_v1_at(fixture->container_fd, &manifest);
+}
+
 static int append_entries(SidecarLog *log, const SidecarEntry *entries,
                           size_t count)
 {
@@ -416,7 +430,9 @@ static int append_raw_suffix_entry(Fixture *fixture,
     return 0;
 }
 
-static int run_preflight(Fixture *fixture, PortableRestorePreflightReport *report)
+static int run_preflight_with_xdg(
+    Fixture *fixture, PortableRestorePreflightReport *report,
+    const char * const *destination_xdg_dirs)
 {
     Manifest manifest;
     if (manifest_read_v1_at(fixture->container_fd, &manifest) !=
@@ -428,10 +444,19 @@ static int run_preflight(Fixture *fixture, PortableRestorePreflightReport *repor
         .destination_home_fd = fixture->home_fd,
         .destination_home_path = fixture->home
     };
+    for (int index = 0; index < XDG_KEY_COUNT; index++)
+        request.destination_xdg_dirs[index] =
+            destination_xdg_dirs == NULL ? NULL : destination_xdg_dirs[index];
     portable_restore_preflight_report_init(report);
     int result = portable_restore_preflight_at(&request, report);
     manifest_free(&manifest);
     return result;
+}
+
+static int run_preflight(Fixture *fixture,
+                         PortableRestorePreflightReport *report)
+{
+    return run_preflight_with_xdg(fixture, report, NULL);
 }
 
 static int run_preflight_capturing(Fixture *fixture,
@@ -1423,6 +1448,206 @@ static void test_v2_selection_ownership_and_destination_collisions(void)
     fixture_close(&fixture);
 }
 
+static void test_resolved_destination_identity_collisions(void)
+{
+    printf(BLUE "::" NC " resolved destination identity collisions\n");
+
+    ManifestRoot bootstrap = root_for("ROOT", "ROOT", "restored");
+    ManifestRoot roots[2];
+    Fixture fixture;
+    PortableRestorePreflightReport report;
+    const char *xdg_dirs[XDG_KEY_COUNT] = {0};
+
+    int opened = fixture_open(&fixture, "identity-alias-files", &bootstrap, 1);
+    check(opened == 0, "identity alias-file fixture is created");
+    if (opened != 0)
+        return;
+    memset(roots, 0, sizeof(roots));
+    strcpy(roots[0].id, "XDG_DOCUMENTS_DIR");
+    roots[0].policy = ROOT_POLICY_XDG;
+    strcpy(roots[0].payload_path, "XDG_DOCUMENTS_DIR");
+    strcpy(roots[0].source_path, "/source/Documents");
+    strcpy(roots[1].id, "XDG_DOWNLOAD_DIR");
+    roots[1].policy = ROOT_POLICY_XDG;
+    strcpy(roots[1].payload_path, "XDG_DOWNLOAD_DIR");
+    strcpy(roots[1].source_path, "/source/Downloads");
+    check(write_v1_identity_manifest(&fixture, roots, 2) == 0,
+          "VERSION=1 portable alias-file manifest is written");
+    if (mkdirat(fixture.data_fd, "XDG_DOCUMENTS_DIR", 0700) != 0 ||
+        mkdirat(fixture.data_fd, "XDG_DOWNLOAD_DIR", 0700) != 0)
+        fatal("could not create alias-file payload roots");
+    int docs_fd = openat(fixture.data_fd, "XDG_DOCUMENTS_DIR",
+                         O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int downloads_fd = openat(fixture.data_fd, "XDG_DOWNLOAD_DIR",
+                              O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (docs_fd < 0 || downloads_fd < 0)
+        fatal("could not open alias-file payload roots");
+    write_file_at(docs_fd, "file", "DOCS");
+    write_file_at(downloads_fd, "file", "DOWNLOADS");
+    if (close(docs_fd) != 0 || close(downloads_fd) != 0)
+        fatal("could not close alias-file payload roots");
+    SidecarEntry alias_entries[] = {
+        entry_for("XDG_DOCUMENTS_DIR", "", "", SIDECAR_KIND_DIRECTORY, 0),
+        entry_for("XDG_DOCUMENTS_DIR", "file", "file", SIDECAR_KIND_REGULAR, 4),
+        entry_for("XDG_DOWNLOAD_DIR", "", "", SIDECAR_KIND_DIRECTORY, 0),
+        entry_for("XDG_DOWNLOAD_DIR", "file", "file", SIDECAR_KIND_REGULAR, 9)
+    };
+    check(write_sidecar(&fixture, alias_entries, 4) == 0,
+          "VERSION=1 portable alias-file sidecar is committed");
+    if (mkdirat(fixture.home_fd, "Shared", 0700) != 0 ||
+        symlinkat("Shared", fixture.home_fd, "Alias") != 0)
+        fatal("could not create Shared/Alias destination");
+    int shared_fd = openat(fixture.home_fd, "Shared",
+                           O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (shared_fd < 0)
+        fatal("could not open Shared destination");
+    write_file_at(shared_fd, "file", "ORIGINAL");
+    if (close(shared_fd) != 0)
+        fatal("could not close Shared destination");
+    char shared[PATH_MAX], alias[PATH_MAX], sentinel[PATH_MAX];
+    fixture_path(shared, sizeof(shared), fixture.home, "/Shared");
+    fixture_path(alias, sizeof(alias), fixture.home, "/Alias");
+    fixture_path(sentinel, sizeof(sentinel), shared, "/file");
+    xdg_dirs[0] = shared;
+    xdg_dirs[1] = alias;
+    int result = run_preflight_with_xdg(&fixture, &report, xdg_dirs);
+    check(result != 0 && report.violation_count > 0 &&
+              file_equals(sentinel, "ORIGINAL"),
+          "Shared/Alias duplicate files refuse while the existing sentinel remains intact");
+    portable_restore_preflight_report_free(&report);
+    fixture_close(&fixture);
+
+    memset(xdg_dirs, 0, sizeof(xdg_dirs));
+    opened = fixture_open(&fixture, "identity-alias-dirs", &bootstrap, 1);
+    check(opened == 0, "identity empty-directory fixture is created");
+    if (opened != 0)
+        return;
+    check(write_v1_identity_manifest(&fixture, roots, 2) == 0,
+          "VERSION=1 portable empty-directory alias manifest is written");
+    if (mkdirat(fixture.data_fd, "XDG_DOCUMENTS_DIR", 0700) != 0 ||
+        mkdirat(fixture.data_fd, "XDG_DOWNLOAD_DIR", 0700) != 0 ||
+        mkdirat(fixture.home_fd, "Shared", 0700) != 0 ||
+        symlinkat("Shared", fixture.home_fd, "Alias") != 0)
+        fatal("could not create empty-directory alias fixture");
+    SidecarEntry directory_entries[] = {
+        entry_for("XDG_DOCUMENTS_DIR", "", "", SIDECAR_KIND_DIRECTORY, 0),
+        entry_for("XDG_DOWNLOAD_DIR", "", "", SIDECAR_KIND_DIRECTORY, 0)
+    };
+    check(write_sidecar(&fixture, directory_entries, 2) == 0,
+          "empty-directory alias sidecar is committed");
+    shared_fd = openat(fixture.home_fd, "Shared",
+                       O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (shared_fd < 0)
+        fatal("could not open empty-directory Shared target");
+    write_file_at(shared_fd, "sentinel", "ORIGINAL");
+    if (close(shared_fd) != 0)
+        fatal("could not close empty-directory Shared target");
+    fixture_path(shared, sizeof(shared), fixture.home, "/Shared");
+    fixture_path(alias, sizeof(alias), fixture.home, "/Alias");
+    fixture_path(sentinel, sizeof(sentinel), shared, "/sentinel");
+    xdg_dirs[0] = shared;
+    xdg_dirs[1] = alias;
+    result = run_preflight_with_xdg(&fixture, &report, xdg_dirs);
+    check(result != 0 && report.violation_count > 0 &&
+              file_equals(sentinel, "ORIGINAL"),
+          "distinct empty source directories cannot own one aliased destination directory");
+    portable_restore_preflight_report_free(&report);
+    fixture_close(&fixture);
+
+    memset(xdg_dirs, 0, sizeof(xdg_dirs));
+    opened = fixture_open(&fixture, "identity-missing-suffix", &bootstrap, 1);
+    check(opened == 0, "identity missing-suffix fixture is created");
+    if (opened != 0)
+        return;
+    roots[0] = root_for("HOME", "HOME", "a/new");
+    memset(&roots[1], 0, sizeof(roots[1]));
+    strcpy(roots[1].id, "XDG_DOCUMENTS_DIR");
+    roots[1].policy = ROOT_POLICY_XDG;
+    strcpy(roots[1].payload_path, "XDG_DOCUMENTS_DIR");
+    strcpy(roots[1].source_path, "/source/Documents");
+    check(write_v1_identity_manifest(&fixture, roots, 2) == 0,
+          "converging missing-suffix manifest is written");
+    if (mkdirat(fixture.data_fd, "HOME", 0700) != 0 ||
+        mkdirat(fixture.data_fd, "XDG_DOCUMENTS_DIR", 0700) != 0 ||
+        mkdirat(fixture.home_fd, "a", 0700) != 0)
+        fatal("could not create missing-suffix roots");
+    docs_fd = openat(fixture.data_fd, "XDG_DOCUMENTS_DIR",
+                     O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (docs_fd < 0 || mkdirat(docs_fd, "new", 0700) != 0)
+        fatal("could not create missing-suffix child");
+    if (close(docs_fd) != 0)
+        fatal("could not close missing-suffix payload root");
+    SidecarEntry suffix_entries[] = {
+        entry_for("HOME", "", "", SIDECAR_KIND_DIRECTORY, 0),
+        entry_for("XDG_DOCUMENTS_DIR", "", "", SIDECAR_KIND_DIRECTORY, 0),
+        entry_for("XDG_DOCUMENTS_DIR", "new", "new", SIDECAR_KIND_DIRECTORY, 0)
+    };
+    check(write_sidecar(&fixture, suffix_entries, 3) == 0,
+          "converging missing-suffix sidecar is committed");
+    char a_path[PATH_MAX], missing[PATH_MAX];
+    fixture_path(a_path, sizeof(a_path), fixture.home, "/a");
+    fixture_path(missing, sizeof(missing), a_path, "/new");
+    write_file_at(fixture.home_fd, "sentinel", "ORIGINAL");
+    char home_sentinel[PATH_MAX];
+    fixture_path(home_sentinel, sizeof(home_sentinel), fixture.home,
+                 "/sentinel");
+    xdg_dirs[0] = a_path;
+    result = run_preflight_with_xdg(&fixture, &report, xdg_dirs);
+    check(result != 0 && report.violation_count > 0 &&
+              access(missing, F_OK) != 0 &&
+              file_equals(home_sentinel, "ORIGINAL"),
+          "different existing ancestors converge on one planned node without creating it");
+    portable_restore_preflight_report_free(&report);
+    fixture_close(&fixture);
+
+    memset(xdg_dirs, 0, sizeof(xdg_dirs));
+    opened = fixture_open(&fixture, "identity-home-xdg", &bootstrap, 1);
+    check(opened == 0, "identity HOME/XDG alias fixture is created");
+    if (opened != 0)
+        return;
+    roots[0] = root_for("HOME", "HOME", "Shared/home-child");
+    memset(&roots[1], 0, sizeof(roots[1]));
+    strcpy(roots[1].id, "XDG_DOCUMENTS_DIR");
+    roots[1].policy = ROOT_POLICY_XDG;
+    strcpy(roots[1].payload_path, "XDG_DOCUMENTS_DIR");
+    strcpy(roots[1].source_path, "/source/Documents");
+    check(write_v1_identity_manifest(&fixture, roots, 2) == 0,
+          "HOME/XDG alias convergence manifest is written");
+    if (mkdirat(fixture.data_fd, "HOME", 0700) != 0 ||
+        mkdirat(fixture.data_fd, "XDG_DOCUMENTS_DIR", 0700) != 0 ||
+        mkdirat(fixture.home_fd, "Shared", 0700) != 0 ||
+        symlinkat("Shared", fixture.home_fd, "Alias") != 0)
+        fatal("could not create HOME/XDG alias roots");
+    docs_fd = openat(fixture.data_fd, "XDG_DOCUMENTS_DIR",
+                     O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (docs_fd < 0 || mkdirat(docs_fd, "home-child", 0700) != 0)
+        fatal("could not create HOME/XDG alias child");
+    if (close(docs_fd) != 0)
+        fatal("could not close HOME/XDG alias payload root");
+    SidecarEntry home_xdg_entries[] = {
+        entry_for("HOME", "", "", SIDECAR_KIND_DIRECTORY, 0),
+        entry_for("XDG_DOCUMENTS_DIR", "", "", SIDECAR_KIND_DIRECTORY, 0),
+        entry_for("XDG_DOCUMENTS_DIR", "home-child", "home-child",
+                  SIDECAR_KIND_DIRECTORY, 0)
+    };
+    check(write_sidecar(&fixture, home_xdg_entries, 3) == 0,
+          "HOME/XDG alias convergence sidecar is committed");
+    fixture_path(shared, sizeof(shared), fixture.home, "/Shared");
+    fixture_path(alias, sizeof(alias), fixture.home, "/Alias");
+    fixture_path(missing, sizeof(missing), shared, "/home-child");
+    write_file_at(fixture.home_fd, "sentinel", "ORIGINAL");
+    fixture_path(home_sentinel, sizeof(home_sentinel), fixture.home,
+                 "/sentinel");
+    xdg_dirs[0] = alias;
+    result = run_preflight_with_xdg(&fixture, &report, xdg_dirs);
+    check(result != 0 && report.violation_count > 0 &&
+              access(missing, F_OK) != 0 &&
+              file_equals(home_sentinel, "ORIGINAL"),
+          "HOME-relative and XDG entries converging through an alias refuse before mutation");
+    portable_restore_preflight_report_free(&report);
+    fixture_close(&fixture);
+}
+
 int main(void)
 {
     test_valid_and_profiles();
@@ -1441,6 +1666,7 @@ int main(void)
     test_overlapping_manifest_roots_wedge();
     test_root_lookup_wedge();
     test_v2_selection_ownership_and_destination_collisions();
+    test_resolved_destination_identity_collisions();
     if (failures != 0)
     {
         printf(RED "%d portable restore preflight test(s) failed" NC "\n",

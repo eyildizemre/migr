@@ -23,7 +23,6 @@ typedef struct {
     size_t root_index;
     char *logical;
     char *physical;
-    char *destination;
     SidecarObjectKind kind;
     uint32_t mode;
     uint32_t uid;
@@ -47,13 +46,14 @@ typedef struct {
     int destination_home_fd;
     const char *destination_home_path;
     const char * const *destination_xdg_dirs;
+    int xdg_anchor_fd[XDG_KEY_COUNT];
+    char xdg_anchor_prefix[XDG_KEY_COUNT][PATH_MAX];
     PreflightMemory memory;
 } Collection;
 
 typedef struct {
     PreflightEntry **logical;
     PreflightEntry **physical;
-    PreflightEntry **destination;
     size_t count;
 } EntryOrders;
 
@@ -252,9 +252,6 @@ static void entries_free(PreflightMemory *memory, PreflightEntries *entries)
         preflight_free(memory, entries->items[index].physical,
                        entries->items[index].physical == NULL ? 0
                            : strlen(entries->items[index].physical) + 1U);
-        preflight_free(memory, entries->items[index].destination,
-                       entries->items[index].destination == NULL ? 0
-                           : strlen(entries->items[index].destination) + 1U);
     }
     preflight_free(memory, entries->items,
                    entries->capacity * sizeof(*entries->items));
@@ -376,18 +373,33 @@ static int open_destination_profile_anchor(int home_fd, const char *relative,
     }
 }
 
-/* Match native restore's XDG anchor: an existing destination directory is
- * the anchor itself; an absent final component is created later beneath its
- * existing parent, after the confirmation/probe gate. */
-static int open_xdg_profile_anchor(const Collection *collection,
-                                   const ManifestRoot *root,
-                                   const char *logical,
-                                   int *anchor_out,
-                                   struct stat *existing,
-                                   int *has_existing)
+static int collection_destination_route(Collection *collection,
+                                        size_t root_index,
+                                        const char *logical,
+                                        int *anchor_out,
+                                        char *relative,
+                                        size_t relative_size)
 {
-    if (collection == NULL || root == NULL || logical == NULL ||
-        anchor_out == NULL || existing == NULL || has_existing == NULL ||
+    if (collection == NULL || collection->manifest == NULL ||
+        logical == NULL || anchor_out == NULL || relative == NULL ||
+        relative_size == 0 ||
+        root_index >= (size_t)collection->manifest->root_count)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    const ManifestRoot *root = &collection->manifest->roots[root_index];
+    if (root->policy == ROOT_POLICY_HOME_RELATIVE)
+    {
+        if (destination_path_build(root, logical,
+                                   collection->destination_xdg_dirs,
+                                   relative, relative_size) != 0)
+            return -1;
+        *anchor_out = collection->destination_home_fd;
+        return 0;
+    }
+    if (root->policy != ROOT_POLICY_XDG ||
         !xdg_destination_valid(collection->destination_xdg_dirs, root))
     {
         errno = EINVAL;
@@ -395,39 +407,33 @@ static int open_xdg_profile_anchor(const Collection *collection,
     }
 
     int index = xdg_key_index(root->id);
-    int xdg_fd = -1;
-    char prefix[NAME_MAX + 1U];
-    char relative[PATH_MAX];
-    if (open_xdg_destination_anchor(
-            collection->destination_xdg_dirs[index], &xdg_fd,
-            prefix, sizeof(prefix)) != 0 ||
-        destination_relative_path_build(prefix, logical, relative,
-                                        sizeof(relative)) != 0)
+    if (index < 0 || index >= XDG_KEY_COUNT)
     {
-        if (xdg_fd >= 0)
-            close(xdg_fd);
+        errno = EINVAL;
         return -1;
     }
-
-    int result = open_destination_profile_anchor(
-        xdg_fd, relative, anchor_out, existing, has_existing);
-    int saved = errno;
-    if (close(xdg_fd) != 0 && result == 0)
+    if (collection->xdg_anchor_fd[index] < 0)
     {
-        close(*anchor_out);
-        *anchor_out = -1;
-        result = -1;
-        saved = EIO;
+        if (open_xdg_destination_anchor(
+                collection->destination_xdg_dirs[index],
+                &collection->xdg_anchor_fd[index],
+                collection->xdg_anchor_prefix[index],
+                sizeof(collection->xdg_anchor_prefix[index])) != 0)
+            return -1;
     }
-    errno = saved;
-    return result;
+    if (destination_relative_path_build(
+            collection->xdg_anchor_prefix[index], logical, relative,
+            relative_size) != 0)
+        return -1;
+    *anchor_out = collection->xdg_anchor_fd[index];
+    return 0;
 }
 
 /* Returns 0 on success, -1 for a per-entry violation (already recorded via
  * report_violation(), safe for the caller to log and keep scanning past),
  * or -2 for an internal/unexpected failure unrelated to this entry's data
  * (no violation recorded; the caller should abort the scan). */
-static int collect_metadata_profile(const Collection *collection,
+static int collect_metadata_profile(Collection *collection,
                                     const ManifestRoot *root,
                                     size_t root_index,
                                     const PreflightEntry *entry)
@@ -451,45 +457,25 @@ static int collect_metadata_profile(const Collection *collection,
         return -2;
     desired.st_mode = entry->mode | type;
 
+    int route_anchor = -1;
+    char relative[PATH_MAX];
+    if (collection_destination_route(collection, root_index, entry->logical,
+                                     &route_anchor, relative,
+                                     sizeof(relative)) != 0)
+    {
+        report_violation(collection->report, root_index, entry->logical);
+        return -1;
+    }
+
     int anchor = -1;
     struct stat existing;
     memset(&existing, 0, sizeof(existing));
     int has_existing = 0;
-    char destination[PATH_MAX];
-    if (root->policy == ROOT_POLICY_HOME_RELATIVE)
+    if (open_destination_profile_anchor(route_anchor, relative, &anchor,
+                                        &existing, &has_existing) != 0)
     {
-        if (destination_path_build(root, entry->logical,
-                                   collection->destination_xdg_dirs,
-                                   destination,
-                                   sizeof(destination)) != 0 ||
-            open_destination_profile_anchor(
-                collection->destination_home_fd, destination, &anchor,
-                &existing, &has_existing) != 0)
-        {
-            report_violation(collection->report, root_index, entry->logical);
-            return -1;
-        }
-    }
-    else if (root->policy == ROOT_POLICY_XDG)
-    {
-        if (destination_path_build(root, entry->logical,
-                                   collection->destination_xdg_dirs,
-                                   destination, sizeof(destination)) != 0 ||
-            open_xdg_profile_anchor(collection, root, entry->logical,
-                                    &anchor, &existing, &has_existing) != 0)
-        {
-            report_violation(collection->report, root_index, entry->logical);
-            return -1;
-        }
-    }
-    else
-    {
-        /* MANUAL_NATIVE is rejected by manifest validation before entries
-         * reach this path. Keep the fallback fail-closed if that invariant
-         * changes. */
-        anchor = dup_cloexec(collection->destination_home_fd);
-        if (anchor < 0)
-            return -2;
+        report_violation(collection->report, root_index, entry->logical);
+        return -1;
     }
 
     int result = metadata_profiles_add(&collection->report->profiles, anchor,
@@ -618,37 +604,6 @@ static int collect_entry(const SidecarLiveView *view, void *argument)
     destination->uid = entry->uid;
     destination->gid = entry->gid;
     destination->size = entry->size;
-    if (collection->manifest->version == MANIFEST_SELECTION_VERSION)
-    {
-        char mapped[PATH_MAX];
-        if (destination_absolute_path_build(
-                &collection->manifest->roots[root_index], logical,
-                collection->destination_xdg_dirs,
-                collection->destination_home_path, mapped,
-                sizeof(mapped)) != 0)
-        {
-            report_violation(report, root_index, logical);
-            preflight_free(&collection->memory, destination->logical,
-                           strlen(destination->logical) + 1U);
-            preflight_free(&collection->memory, destination->physical,
-                           strlen(destination->physical) + 1U);
-            memset(destination, 0, sizeof(*destination));
-            return 0;
-        }
-        size_t mapped_size = strlen(mapped) + 1U;
-        destination->destination = preflight_alloc(&collection->memory,
-                                                   mapped_size);
-        if (destination->destination == NULL)
-        {
-            preflight_free(&collection->memory, destination->logical,
-                           strlen(destination->logical) + 1U);
-            preflight_free(&collection->memory, destination->physical,
-                           strlen(destination->physical) + 1U);
-            memset(destination, 0, sizeof(*destination));
-            return 1;
-        }
-        memcpy(destination->destination, mapped, mapped_size);
-    }
     entries->count++;
 
     int carries_security_xattr = 0;
@@ -693,13 +648,6 @@ static int physical_order_compare(const void *left, const void *right)
     return strcmp(a->physical, b->physical);
 }
 
-static int destination_order_compare(const void *left, const void *right)
-{
-    const PreflightEntry *a = *(const PreflightEntry *const *)left;
-    const PreflightEntry *b = *(const PreflightEntry *const *)right;
-    return strcmp(a->destination, b->destination);
-}
-
 static void entry_orders_free(PreflightMemory *memory, EntryOrders *orders)
 {
     if (orders == NULL)
@@ -708,8 +656,6 @@ static void entry_orders_free(PreflightMemory *memory, EntryOrders *orders)
                    orders->count * sizeof(*orders->logical));
     preflight_free(memory, orders->physical,
                    orders->count * sizeof(*orders->physical));
-    preflight_free(memory, orders->destination,
-                   orders->count * sizeof(*orders->destination));
     memset(orders, 0, sizeof(*orders));
 }
 
@@ -765,22 +711,6 @@ static int entry_ancestor_conflict(const EntryOrders *orders,
     return found != NULL && found->kind != SIDECAR_KIND_DIRECTORY;
 }
 
-/* Accessors adapting orders->destination (a sorted PreflightEntry* array)
- * to the shared D34 ancestor-conflict walk in portable_restore_shared.c. */
-static const char *preflight_destination_view_get(const void *entries,
-                                                   size_t index)
-{
-    const PreflightEntry *const *items = entries;
-    return items[index]->destination;
-}
-
-static int preflight_destination_view_is_directory(const void *entries,
-                                                    size_t index)
-{
-    const PreflightEntry *const *items = entries;
-    return items[index]->kind == SIDECAR_KIND_DIRECTORY;
-}
-
 static int analyze_entries(PreflightMemory *memory,
                            PreflightEntries *entries,
                            EntryOrders *orders,
@@ -797,27 +727,18 @@ static int analyze_entries(PreflightMemory *memory,
     size_t size = entries->count * sizeof(*orders->logical);
     orders->logical = preflight_alloc(memory, size);
     orders->physical = preflight_alloc(memory, size);
-    int has_destinations = entries->items[0].destination != NULL;
-    if (has_destinations)
-        orders->destination = preflight_alloc(memory, size);
-    if (orders->logical == NULL || orders->physical == NULL ||
-        (has_destinations && orders->destination == NULL))
+    if (orders->logical == NULL || orders->physical == NULL)
         return -1;
     orders->count = entries->count;
     for (size_t index = 0; index < entries->count; index++)
     {
         orders->logical[index] = &entries->items[index];
         orders->physical[index] = &entries->items[index];
-        if (has_destinations)
-            orders->destination[index] = &entries->items[index];
     }
     qsort(orders->logical, orders->count, sizeof(*orders->logical),
           logical_order_compare);
     qsort(orders->physical, orders->count, sizeof(*orders->physical),
           physical_order_compare);
-    if (has_destinations)
-        qsort(orders->destination, orders->count,
-              sizeof(*orders->destination), destination_order_compare);
 
     for (size_t index = 1; index < orders->count; index++)
     {
@@ -825,12 +746,6 @@ static int analyze_entries(PreflightMemory *memory,
         PreflightEntry *current = orders->logical[index];
         if (previous->root_index == current->root_index &&
             strcmp(previous->logical, current->logical) == 0)
-            report_violation(report, current->root_index, current->logical);
-    }
-    for (size_t index = 0; index < orders->count; index++)
-    {
-        PreflightEntry *current = orders->logical[index];
-        if (entry_ancestor_conflict(orders, current, 0))
             report_violation(report, current->root_index, current->logical);
     }
     for (size_t index = 1; index < orders->count; index++)
@@ -857,32 +772,117 @@ static int analyze_entries(PreflightMemory *memory,
         if (entry_ancestor_conflict(orders, current, 1))
             report_violation(report, current->root_index, current->logical);
     }
-    if (has_destinations)
-    {
-        for (size_t index = 1; index < orders->count; index++)
-        {
-            PreflightEntry *previous = orders->destination[index - 1U];
-            PreflightEntry *current = orders->destination[index];
-            if (strcmp(previous->destination, current->destination) == 0)
-                report_violation(report, current->root_index,
-                                 current->logical);
-        }
-        DestinationView view = {
-            .entries = orders->destination,
-            .count = orders->count,
-            .get_destination = preflight_destination_view_get,
-            .is_directory = preflight_destination_view_is_directory,
-        };
-        for (size_t index = 0; index < orders->count; index++)
-        {
-            PreflightEntry *current = orders->destination[index];
-            if (destination_view_ancestor_conflict(&view, current->destination))
-                report_violation(report, current->root_index,
-                                 current->logical);
-        }
-    }
+
     return 0;
 }
+
+static int validate_destination_identity(Collection *collection)
+{
+    DestinationIdentityGraph graph;
+    destination_identity_graph_init(&graph);
+    DestinationIdentityStatus anchor_status =
+        destination_identity_graph_register_anchor(
+            &graph, collection->destination_home_fd);
+    if (anchor_status != DESTINATION_IDENTITY_OK)
+    {
+        print_error("Error: Could not inspect destination HOME ancestry for portable restore\n");
+        report_violation(collection->report, SIZE_MAX, "destination HOME");
+        destination_identity_graph_free(&graph);
+        return -1;
+    }
+    unsigned char registered_xdg[XDG_KEY_COUNT] = {0};
+
+    for (size_t index = 0; index < collection->entries->count; index++)
+    {
+        PreflightEntry *entry = &collection->entries->items[index];
+        int anchor = -1;
+        char relative[PATH_MAX];
+        if (collection_destination_route(collection, entry->root_index,
+                                         entry->logical, &anchor, relative,
+                                         sizeof(relative)) != 0)
+        {
+            print_error("Error: Could not resolve portable restore destination for manifest root %s entry %s\n",
+                        collection->manifest->roots[entry->root_index].id,
+                        entry->logical);
+            report_violation(collection->report, entry->root_index,
+                             entry->logical);
+            destination_identity_graph_free(&graph);
+            return -1;
+        }
+
+        const ManifestRoot *root =
+            &collection->manifest->roots[entry->root_index];
+        if (root->policy == ROOT_POLICY_XDG)
+        {
+            int key = xdg_key_index(root->id);
+            if (key < 0 || key >= XDG_KEY_COUNT)
+            {
+                print_error("Error: Could not identify XDG restore destination for manifest root %s\n",
+                            root->id);
+                report_violation(collection->report, entry->root_index,
+                                 entry->logical);
+                destination_identity_graph_free(&graph);
+                return -1;
+            }
+            if (!registered_xdg[key])
+            {
+                anchor_status = destination_identity_graph_register_anchor(
+                    &graph, anchor);
+                if (anchor_status != DESTINATION_IDENTITY_OK)
+                {
+                    print_error("Error: Could not inspect XDG destination ancestry for manifest root %s\n",
+                                root->id);
+                    report_violation(collection->report, entry->root_index,
+                                     entry->logical);
+                    destination_identity_graph_free(&graph);
+                    return -1;
+                }
+                registered_xdg[key] = 1;
+            }
+        }
+
+        DestinationIdentityPlacement placement;
+        DestinationIdentityClaim claim =
+            entry->kind == SIDECAR_KIND_DIRECTORY
+                ? DESTINATION_IDENTITY_DIRECTORY
+                : DESTINATION_IDENTITY_NON_DIRECTORY;
+        DestinationIdentityStatus status = destination_identity_graph_add(
+            &graph, anchor, relative, claim, index, &placement);
+        if (status == DESTINATION_IDENTITY_COLLISION)
+        {
+            print_error("Error: Manifest root %s entry %s conflicts with another mapped restore destination\n",
+                        collection->manifest->roots[entry->root_index].id,
+                        entry->logical);
+            report_violation(collection->report, entry->root_index,
+                             entry->logical);
+            continue;
+        }
+        if (status != DESTINATION_IDENTITY_OK)
+        {
+            print_error("Error: Could not inspect mapped restore destination for manifest root %s entry %s\n",
+                        collection->manifest->roots[entry->root_index].id,
+                        entry->logical);
+            report_violation(collection->report, entry->root_index,
+                             entry->logical);
+            destination_identity_graph_free(&graph);
+            return -1;
+        }
+    }
+
+    DestinationIdentityStatus status =
+        destination_identity_graph_finalize(&graph);
+    if (status != DESTINATION_IDENTITY_OK)
+    {
+        print_error("Error: Could not order the portable restore destination namespace\n");
+        report_violation(collection->report, SIZE_MAX,
+                         "destination namespace");
+        destination_identity_graph_free(&graph);
+        return -1;
+    }
+    destination_identity_graph_free(&graph);
+    return collection->report->violation_count == 0 ? 0 : -1;
+}
+
 
 static size_t root_order_lower_bound(const Collection *collection,
                                      const char *path)
@@ -1172,6 +1172,12 @@ static void collection_free(Collection *collection, PreflightEntries *entries,
 {
     if (collection == NULL)
         return;
+    for (int index = 0; index < XDG_KEY_COUNT; index++)
+        if (collection->xdg_anchor_fd[index] >= 0)
+        {
+            (void)close(collection->xdg_anchor_fd[index]);
+            collection->xdg_anchor_fd[index] = -1;
+        }
     entry_orders_free(&collection->memory, orders);
     entries_free(&collection->memory, entries);
     preflight_free(&collection->memory, collection->root_order,
@@ -1231,6 +1237,8 @@ int portable_restore_preflight_at(
         .destination_home_path = request->destination_home_path,
         .destination_xdg_dirs = request->destination_xdg_dirs
     };
+    for (int index = 0; index < XDG_KEY_COUNT; index++)
+        collection.xdg_anchor_fd[index] = -1;
     if (collection_validate_manifest(&collection) != 0)
         goto fail;
 
@@ -1289,7 +1297,8 @@ int portable_restore_preflight_at(
         }
         else
             report->mapped_root_count++;
-    if (analyze_entries(&collection.memory, &entries, &orders, report) != 0)
+    if (analyze_entries(&collection.memory, &entries, &orders, report) != 0 ||
+        validate_destination_identity(&collection) != 0)
     {
         sidecar_log_close(&sidecar);
         close(data_fd);

@@ -22,6 +22,7 @@
 #include "packages.h"
 #include "portable.h"
 #include "portable_restore.h"
+#include "portable_restore_internal.h"
 #include "utils.h"
 #include "xdg.h"
 
@@ -90,14 +91,6 @@ void restore_test_set_network_reload_hook(RestoreTestNetworkReloadHook hook,
 // manifest.txt; a v1 manifest records them as root-table entries whose id is
 // one of these same keys (docs/DECISIONS.md D16).
 #define XDG_RESTORE_COUNT XDG_KEY_COUNT
-
-static int xdg_key_index(const char *id)
-{
-    for (int i = 0; i < XDG_RESTORE_COUNT; i++)
-        if (strcmp(id, xdg_keys[i]) == 0)
-            return i;
-    return -1;
-}
 
 static void free_xdg_dirs(char **dirs)
 {
@@ -912,83 +905,6 @@ static int restore_home_item(const CloneContext *ctx, int source_root_fd,
     return rc;
 }
 
-// Existing XDG destinations are caller-selected trust roots and may
-// themselves be symlinks or live outside HOME. Walks up past however many
-// trailing path components are currently absent, returning the fd of the
-// nearest existing ancestor and the (possibly multi-component) relative
-// path from there down to path's own leaf -- the same "nearest existing
-// parent" contract resolve_parent(..., create_intermediates=0) already
-// gives the fd-anchored native restore engine for every other restore
-// root. Never creates anything itself: a live restore's own
-// create_intermediates=1 pass creates the missing chain, and dry-run's
-// create_intermediates=0 pass correctly treats an absent intermediate as a
-// benign preview case rather than a hard failure -- both already handled
-// by whatever this anchor and relative path are then handed to.
-static int open_xdg_destination_anchor(const char *path, int *out_fd,
-                                       char *out_rel, size_t rel_size)
-{
-    int fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (fd >= 0)
-    {
-        *out_fd = fd;
-        out_rel[0] = '\0';
-        return 0;
-    }
-    if (errno != ENOENT)
-        return -1;
-
-    char copy[PATH_MAX];
-    if ((size_t)snprintf(copy, sizeof(copy), "%s", path) >= sizeof(copy))
-        return -1;
-
-    size_t len = strlen(copy);
-    while (len > 1 && copy[len - 1] == '/')
-        copy[--len] = '\0';
-
-    out_rel[0] = '\0';
-    for (;;)
-    {
-        char *slash = strrchr(copy, '/');
-        const char *leaf = slash == NULL ? copy : slash + 1;
-        size_t leaf_len = strlen(leaf);
-        if (leaf_len == 0)
-            return -1;
-
-        size_t rel_len = strlen(out_rel);
-        size_t separator = rel_len > 0 ? 1 : 0;
-        if (leaf_len + separator + rel_len >= rel_size)
-            return -1;
-        memmove(out_rel + leaf_len + separator, out_rel, rel_len + 1);
-        memcpy(out_rel, leaf, leaf_len);
-        if (separator)
-            out_rel[leaf_len] = '/';
-
-        char *parent;
-        if (slash == NULL)
-            parent = NULL;
-        else if (slash == copy)
-        {
-            slash[1] = '\0';
-            parent = copy;
-        }
-        else
-        {
-            *slash = '\0';
-            parent = copy;
-        }
-
-        const char *parent_path = parent == NULL ? "." : parent;
-        fd = open(parent_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-        if (fd >= 0)
-        {
-            *out_fd = fd;
-            return 0;
-        }
-        if (errno != ENOENT || parent == NULL)
-            return -1;
-    }
-}
-
 // Versioned restore phases consume the same invocation-stable anchor/relative
 // pair. HOME roots borrow home_fd, whose lifetime encloses the map; XDG roots
 // own their held anchor. absolute remains the lexical address used by VERSION=2
@@ -998,12 +914,15 @@ typedef struct {
     char relative[PATH_MAX];
     int anchor_fd;
     int owns_anchor;
+    DestinationIdentityPlacement placement;
+    int has_placement;
 } RestoreTargetRoot;
 
 typedef struct {
     RestoreTargetRoot *roots;
     int *order;
     size_t count;
+    DestinationIdentityGraph identity_graph;
 } RestoreTargetMap;
 
 // Resolves the legacy source-side identifier for the i-th XDG slot: the
@@ -1489,25 +1408,19 @@ static int validate_selection_payload_ownership(int source_root_fd,
 
 typedef struct {
     int index;
-    size_t depth;
+    size_t order;
+    int automatic;
 } SelectionRestoreOrder;
-
-static size_t absolute_path_depth(const char *path)
-{
-    size_t depth = 0;
-    for (const char *p = path; *p != '\0'; p++)
-        if (*p == '/' && p[1] != '\0')
-            depth++;
-    return depth;
-}
 
 static int restore_order_compare(const void *left, const void *right)
 {
     const SelectionRestoreOrder *a = left;
     const SelectionRestoreOrder *b = right;
-    if (a->depth > b->depth)
+    if (a->automatic != b->automatic)
+        return a->automatic ? -1 : 1;
+    if (a->order > b->order)
         return -1;
-    if (a->depth < b->depth)
+    if (a->order < b->order)
         return 1;
     return a->index < b->index ? -1 : a->index > b->index;
 }
@@ -1515,6 +1428,7 @@ static int restore_order_compare(const void *left, const void *right)
 static void restore_target_map_init(RestoreTargetMap *map)
 {
     memset(map, 0, sizeof(*map));
+    destination_identity_graph_init(&map->identity_graph);
 }
 
 static int restore_target_map_free(RestoreTargetMap *map)
@@ -1532,10 +1446,308 @@ static int restore_target_map_free(RestoreTargetMap *map)
                 failed = 1;
             }
         }
+    destination_identity_graph_free(&map->identity_graph);
     free(map->roots);
     free(map->order);
     restore_target_map_init(map);
     return failed ? -1 : 0;
+}
+
+static int restore_target_identity_add(
+    RestoreTargetMap *map, const Manifest *manifest, size_t root_index,
+    const char *logical, const struct stat *source_st, size_t owner,
+    DestinationIdentityPlacement *placement)
+{
+    if (map == NULL || manifest == NULL || logical == NULL ||
+        source_st == NULL || placement == NULL ||
+        root_index >= (size_t)manifest->root_count ||
+        root_index >= map->count)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    const ManifestRoot *root = &manifest->roots[root_index];
+    const RestoreTargetRoot *target = &map->roots[root_index];
+    char relative[PATH_MAX];
+    if (destination_relative_path_build(target->relative, logical, relative,
+                                        sizeof(relative)) != 0)
+    {
+        print_error("Error: Restore destination for manifest root %s entry %s is too long\n",
+                    root->id, logical[0] == '\0' ? "." : logical);
+        return -1;
+    }
+
+    DestinationIdentityClaim claim = S_ISDIR(source_st->st_mode)
+        ? DESTINATION_IDENTITY_DIRECTORY
+        : DESTINATION_IDENTITY_NON_DIRECTORY;
+    DestinationIdentityStatus status = destination_identity_graph_add(
+        &map->identity_graph, target->anchor_fd, relative, claim, owner,
+        placement);
+    if (status == DESTINATION_IDENTITY_OK)
+        return 0;
+
+    const char *entry_name = logical[0] == '\0' ? "." : logical;
+    if (status == DESTINATION_IDENTITY_COLLISION)
+        print_error("Error: Manifest root %s entry %s has competing entries for restore destination %s\n",
+                    root->id, entry_name, target->absolute);
+    else if (status == DESTINATION_IDENTITY_RESOURCE_ERROR)
+        print_error("Error: Could not allocate destination identity state for manifest root %s entry %s\n",
+                    root->id, entry_name);
+    else
+        print_error("Error: Could not safely inspect restore destination for manifest root %s entry %s\n",
+                    root->id, entry_name);
+    return -1;
+}
+
+static int restore_target_identity_walk(
+    RestoreTargetMap *map, const Manifest *manifest, size_t root_index,
+    int directory_fd, const char *logical, size_t *next_owner)
+{
+    DIR *directory = fdopendir(directory_fd);
+    if (directory == NULL)
+    {
+        int saved = errno;
+        close(directory_fd);
+        errno = saved;
+        print_error("Error: Could not inspect payload entries for manifest root %s at %s\n",
+                    manifest->roots[root_index].id,
+                    logical[0] == '\0' ? "." : logical);
+        return -1;
+    }
+
+    int failed = 0;
+    for (;;)
+    {
+        errno = 0;
+        struct dirent *entry = readdir(directory);
+        if (entry == NULL)
+        {
+            if (errno != 0)
+            {
+                print_error("Error: Could not enumerate payload entries for manifest root %s at %s\n",
+                            manifest->roots[root_index].id,
+                            logical[0] == '\0' ? "." : logical);
+                failed = 1;
+            }
+            break;
+        }
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
+            continue;
+
+        char child[PATH_MAX];
+        if ((logical[0] == '\0' &&
+             (size_t)snprintf(child, sizeof(child), "%s", entry->d_name) >=
+                 sizeof(child)) ||
+            (logical[0] != '\0' &&
+             path_join(child, sizeof(child), logical, entry->d_name) != 0))
+        {
+            print_error("Error: Payload entry path is too long for manifest root %s: %s\n",
+                        manifest->roots[root_index].id, entry->d_name);
+            failed = 1;
+            break;
+        }
+
+        struct stat st;
+        if (fstatat(dirfd(directory), entry->d_name, &st,
+                    AT_SYMLINK_NOFOLLOW) != 0)
+        {
+            print_error("Error: Could not safely inspect payload entry for manifest root %s: %s\n",
+                        manifest->roots[root_index].id, child);
+            failed = 1;
+            break;
+        }
+        if (*next_owner == SIZE_MAX)
+        {
+            errno = E2BIG;
+            print_error("Error: Too many destination entries while mapping manifest root %s: %s\n",
+                        manifest->roots[root_index].id, child);
+            failed = 1;
+            break;
+        }
+
+        DestinationIdentityPlacement placement;
+        size_t owner = (*next_owner)++;
+        if (restore_target_identity_add(map, manifest, root_index, child, &st,
+                                        owner, &placement) != 0)
+        {
+            failed = 1;
+            break;
+        }
+
+        if (!S_ISDIR(st.st_mode))
+            continue;
+        int child_fd = openat(dirfd(directory), entry->d_name,
+                              O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                                  O_NOATIME | O_CLOEXEC);
+        if (child_fd < 0)
+        {
+            print_error("Error: Could not safely open payload directory for manifest root %s: %s\n",
+                        manifest->roots[root_index].id, child);
+            failed = 1;
+            break;
+        }
+        if (restore_target_identity_walk(map, manifest, root_index, child_fd,
+                                         child, next_owner) != 0)
+        {
+            failed = 1;
+            break;
+        }
+    }
+
+    if (closedir(directory) != 0 && !failed)
+    {
+        print_error("Error: Could not close payload inventory for manifest root %s at %s\n",
+                    manifest->roots[root_index].id,
+                    logical[0] == '\0' ? "." : logical);
+        failed = 1;
+    }
+    return failed ? -1 : 0;
+}
+
+static int restore_target_identity_build(
+    int source_root_fd, int home_fd, const Manifest *manifest, RestoreTargetMap *map,
+    SelectionRestoreOrder *items)
+{
+    int data_fd = openat(source_root_fd, "data",
+                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NOATIME |
+                             O_CLOEXEC);
+    if (data_fd < 0)
+    {
+        print_error("Error: Could not open versioned restore payload inventory\n");
+        return -1;
+    }
+
+    DestinationIdentityStatus anchor_status =
+        destination_identity_graph_register_anchor(&map->identity_graph,
+                                                   home_fd);
+    if (anchor_status != DESTINATION_IDENTITY_OK)
+    {
+        print_error("Error: Could not inspect destination HOME ancestry for versioned restore\n");
+        close(data_fd);
+        return -1;
+    }
+
+    unsigned char registered_xdg[XDG_RESTORE_COUNT] = {0};
+    for (size_t index = 0; index < map->count; index++)
+        if (manifest->roots[index].policy == ROOT_POLICY_XDG)
+        {
+            int key = xdg_key_index(manifest->roots[index].id);
+            if (key < 0 || key >= XDG_RESTORE_COUNT)
+            {
+                print_error("Error: Could not identify XDG restore destination for manifest root %s\n",
+                            manifest->roots[index].id);
+                close(data_fd);
+                return -1;
+            }
+            if (!registered_xdg[key])
+            {
+                anchor_status = destination_identity_graph_register_anchor(
+                    &map->identity_graph, map->roots[index].anchor_fd);
+                if (anchor_status != DESTINATION_IDENTITY_OK)
+                {
+                    print_error("Error: Could not inspect XDG destination ancestry for manifest root %s\n",
+                                manifest->roots[index].id);
+                    close(data_fd);
+                    return -1;
+                }
+                registered_xdg[key] = 1;
+            }
+        }
+
+    size_t next_owner = 0;
+    int failed = 0;
+    for (size_t index = 0; index < map->count; index++)
+    {
+        const ManifestRoot *root = &manifest->roots[index];
+        items[index] = (SelectionRestoreOrder){
+            .index = (int)index,
+            .automatic = root->policy != ROOT_POLICY_MANUAL_NATIVE
+        };
+        if (root->policy == ROOT_POLICY_MANUAL_NATIVE)
+            continue;
+
+        struct stat st;
+        int root_fd = -1;
+        if (selection_payload_open_at(data_fd, root->payload_path, &st,
+                                      &root_fd) != 0)
+        {
+            print_error("Error: Could not safely inspect payload for manifest root %s\n",
+                        root->id);
+            failed = 1;
+            break;
+        }
+        if (next_owner == SIZE_MAX)
+        {
+            if (root_fd >= 0)
+                close(root_fd);
+            errno = E2BIG;
+            print_error("Error: Too many destination entries while mapping manifest root %s\n",
+                        root->id);
+            failed = 1;
+            break;
+        }
+
+        DestinationIdentityPlacement placement;
+        size_t owner = next_owner++;
+        if (restore_target_identity_add(map, manifest, index, "", &st, owner,
+                                        &placement) != 0)
+        {
+            if (root_fd >= 0)
+                close(root_fd);
+            failed = 1;
+            break;
+        }
+        map->roots[index].placement = placement;
+        map->roots[index].has_placement = 1;
+
+        if (S_ISDIR(st.st_mode) &&
+            restore_target_identity_walk(map, manifest, index, root_fd, "",
+                                         &next_owner) != 0)
+        {
+            failed = 1;
+            break;
+        }
+    }
+
+    if (close(data_fd) != 0 && !failed)
+    {
+        print_error("Error: Could not close versioned restore payload inventory\n");
+        failed = 1;
+    }
+    if (failed)
+        return -1;
+
+    DestinationIdentityStatus status =
+        destination_identity_graph_finalize(&map->identity_graph);
+    if (status != DESTINATION_IDENTITY_OK)
+    {
+        if (status == DESTINATION_IDENTITY_CYCLE)
+            print_error("Error: Restore destination namespace contains a cyclic mapping\n");
+        else
+            print_error("Error: Could not finalize the restore destination identity map\n");
+        return -1;
+    }
+
+    for (size_t index = 0; index < map->count; index++)
+    {
+        if (!items[index].automatic)
+            continue;
+        if (!map->roots[index].has_placement ||
+            destination_identity_graph_order(
+                &map->identity_graph, &map->roots[index].placement,
+                &items[index].order) != 0)
+        {
+            print_error("Error: Could not order restore destination for manifest root %s\n",
+                        manifest->roots[index].id);
+            return -1;
+        }
+    }
+
+    qsort(items, map->count, sizeof(*items), restore_order_compare);
+    for (size_t index = 0; index < map->count; index++)
+        map->order[index] = items[index].index;
+    return 0;
 }
 
 static int restore_target_map_build(int source_root_fd, const char *home,
@@ -1547,17 +1759,13 @@ static int restore_target_map_build(int source_root_fd, const char *home,
     size_t count = (size_t)manifest->root_count;
     RestoreTargetRoot *roots =
         count == 0 ? NULL : calloc(count, sizeof(*roots));
-    int *order = count == 0 || manifest->version != MANIFEST_SELECTION_VERSION
-        ? NULL : calloc(count, sizeof(*order));
+    int *order = count == 0 ? NULL : calloc(count, sizeof(*order));
     SelectionRestoreOrder *items =
-        count == 0 || manifest->version != MANIFEST_SELECTION_VERSION
-        ? NULL : calloc(count, sizeof(*items));
+        count == 0 ? NULL : calloc(count, sizeof(*items));
     if (roots != NULL)
         for (size_t index = 0; index < count; index++)
             roots[index].anchor_fd = -1;
-    if (count != 0 && (!roots ||
-        (manifest->version == MANIFEST_SELECTION_VERSION &&
-         (!order || !items))))
+    if (count != 0 && (!roots || !order || !items))
     {
         print_error("Error: out of memory building the restore destination map\n");
         free(items);
@@ -1575,11 +1783,7 @@ static int restore_target_map_build(int source_root_fd, const char *home,
     {
         const ManifestRoot *root = &manifest->roots[index];
         if (root->policy == ROOT_POLICY_MANUAL_NATIVE)
-        {
-            if (items != NULL)
-                items[index] = (SelectionRestoreOrder){(int)index, 0};
             continue;
-        }
         if (root->policy == ROOT_POLICY_HOME_RELATIVE)
         {
             roots[index].anchor_fd = home_fd;
@@ -1589,7 +1793,7 @@ static int restore_target_map_build(int source_root_fd, const char *home,
             {
                 print_error("Error: Restore destination for manifest root %s is too long\n",
                             root->id);
-                goto fail_xdg;
+                goto fail;
             }
             if (root->restore_path[0] == '\0')
             {
@@ -1598,7 +1802,7 @@ static int restore_target_map_build(int source_root_fd, const char *home,
                 {
                     print_error("Error: Restore destination for manifest root %s is too long\n",
                                 root->id);
-                    goto fail_xdg;
+                    goto fail;
                 }
             }
             else if (path_join(roots[index].absolute, PATH_MAX, home,
@@ -1606,7 +1810,7 @@ static int restore_target_map_build(int source_root_fd, const char *home,
             {
                 print_error("Error: Restore destination for manifest root %s is too long\n",
                             root->id);
-                goto fail_xdg;
+                goto fail;
             }
         }
         else
@@ -1617,7 +1821,7 @@ static int restore_target_map_build(int source_root_fd, const char *home,
                                 XDG_RESTORE_COUNT) != 0)
                 {
                     print_error("Error: HOME path too long to resolve user directories\n");
-                    goto fail_xdg;
+                    goto fail;
                 }
                 xdg_ready = 1;
             }
@@ -1625,7 +1829,7 @@ static int restore_target_map_build(int source_root_fd, const char *home,
             if (key < 0)
             {
                 print_error("Error: Unrecognized XDG root id: %s\n", root->id);
-                goto fail_xdg;
+                goto fail;
             }
             if (xdg_dirs[key] == NULL ||
                 snprintf(roots[index].absolute, PATH_MAX, "%s",
@@ -1633,7 +1837,7 @@ static int restore_target_map_build(int source_root_fd, const char *home,
             {
                 print_error("Error: XDG restore destination for %s is too long\n",
                             root->id);
-                goto fail_xdg;
+                goto fail;
             }
             if (open_xdg_destination_anchor(
                     xdg_dirs[key], &roots[index].anchor_fd,
@@ -1641,101 +1845,22 @@ static int restore_target_map_build(int source_root_fd, const char *home,
             {
                 print_error("Error: Failed to anchor XDG restore destination for %s\n",
                             root->id);
-                goto fail_xdg;
+                goto fail;
             }
             roots[index].owns_anchor = 1;
         }
-        if (items != NULL)
-            items[index] = (SelectionRestoreOrder){
-                .index = (int)index,
-                .depth = absolute_path_depth(roots[index].absolute)
-            };
     }
 
-    if (manifest->version != MANIFEST_SELECTION_VERSION)
-        goto success;
+    if (count != 0 &&
+        restore_target_identity_build(source_root_fd, home_fd, manifest, out,
+                                      items) != 0)
+        goto fail;
 
-    for (size_t left = 0; left < count; left++)
-    {
-        if (manifest->roots[left].policy == ROOT_POLICY_MANUAL_NATIVE)
-            continue;
-        for (size_t right = left + 1U; right < count; right++)
-        {
-            if (manifest->roots[right].policy == ROOT_POLICY_MANUAL_NATIVE)
-                continue;
-            if (!strcmp(roots[left].absolute, roots[right].absolute))
-            {
-                print_error("Error: Manifest roots %s and %s map to the same restore destination: %s\n",
-                            manifest->roots[left].id,
-                            manifest->roots[right].id, roots[left].absolute);
-                goto fail_xdg;
-            }
-
-            size_t parent = SIZE_MAX;
-            size_t child = SIZE_MAX;
-            if (path_covers(roots[left].absolute, roots[right].absolute))
-            {
-                parent = left;
-                child = right;
-            }
-            else if (path_covers(roots[right].absolute,
-                                 roots[left].absolute))
-            {
-                parent = right;
-                child = left;
-            }
-            if (parent == SIZE_MAX)
-                continue;
-
-            const char *relative = roots[child].absolute +
-                                   strlen(roots[parent].absolute);
-            if (strcmp(roots[parent].absolute, "/") != 0)
-                relative++;
-            else if (*relative == '/')
-                relative++;
-
-            char source_rel[PATH_MAX + 8];
-            char entry_rel[PATH_MAX + 8];
-            if (v1_payload_rel(&manifest->roots[parent], source_rel,
-                               sizeof(source_rel)) != 0 ||
-                path_join(entry_rel, sizeof(entry_rel), source_rel,
-                          relative) != 0)
-            {
-                print_error("Error: Manifest roots %s and %s: restore destination path %s is too long to probe for collisions\n",
-                            manifest->roots[parent].id,
-                            manifest->roots[child].id,
-                            roots[child].absolute);
-                goto fail_xdg;
-            }
-            RestoreSourceStatus status =
-                restore_native_source_status_at(source_root_fd, entry_rel);
-            if (status == RESTORE_SOURCE_PRESENT)
-            {
-                print_error("Error: Manifest roots %s and %s contain competing entries for restore destination %s\n",
-                            manifest->roots[parent].id,
-                            manifest->roots[child].id,
-                            roots[child].absolute);
-                goto fail_xdg;
-            }
-            if (status != RESTORE_SOURCE_MISSING)
-            {
-                print_error("Error: Could not safely inspect payload for manifest root %s while checking for competing entries with %s\n",
-                            manifest->roots[parent].id,
-                            manifest->roots[child].id);
-                goto fail_xdg;
-            }
-        }
-    }
-
-    qsort(items, count, sizeof(*items), restore_order_compare);
-    for (size_t index = 0; index < count; index++)
-        order[index] = items[index].index;
-success:
     free(items);
     free_xdg_dirs(xdg_dirs);
     return 0;
 
-fail_xdg:
+fail:
     free_xdg_dirs(xdg_dirs);
     free(items);
     restore_target_map_free(out);

@@ -543,6 +543,39 @@ static int file_content_is(const char *path, const char *content)
            memcmp(buf, content, (size_t)n) == 0;
 }
 
+static void write_user_dirs(const char *home, const char *documents,
+                            const char *downloads)
+{
+    char content[PATH_MAX * 2U];
+    int length = snprintf(content, sizeof(content),
+                          "XDG_DOCUMENTS_DIR=\"$HOME/%s\"\n"
+                          "XDG_DOWNLOAD_DIR=\"$HOME/%s\"\n",
+                          documents, downloads);
+    if (length < 0 || (size_t)length >= sizeof(content))
+    {
+        printf(RED "fixture: user-dirs.dirs content is too long" NC "\n");
+        exit(1);
+    }
+    write_payload_file(home, ".config", "user-dirs.dirs", content);
+}
+
+static void make_v1_alias_manifest(Manifest *manifest,
+                                   ManifestRoot roots[2])
+{
+    memset(roots, 0, 2U * sizeof(*roots));
+    strcpy(roots[0].id, "XDG_DOCUMENTS_DIR");
+    roots[0].policy = ROOT_POLICY_XDG;
+    strcpy(roots[0].payload_path, "XDG_DOCUMENTS_DIR");
+    strcpy(roots[0].source_path, "Documents");
+
+    strcpy(roots[1].id, "XDG_DOWNLOAD_DIR");
+    roots[1].policy = ROOT_POLICY_XDG;
+    strcpy(roots[1].payload_path, "XDG_DOWNLOAD_DIR");
+    strcpy(roots[1].source_path, "Downloads");
+
+    make_v1_manifest(manifest, roots, 2);
+}
+
 static int record_network_reload(char *const argv[], void *context)
 {
     const char *marker_path = context;
@@ -956,6 +989,289 @@ static void test_versioned_restore_freezes_xdg_target_map(void)
     check(live_rc == 0 && file_content_is(document, "CONFLICT-SAFE") &&
               access(conflicting_entry, F_OK) != 0,
           "restored XDG configuration cannot redirect a later root into the CONFIG_0 destination");
+
+    remove_tree(source);
+    remove_tree(home);
+}
+
+static void test_versioned_restore_refuses_destination_alias_collisions(void)
+{
+    printf(BLUE "::" NC " restore dispatch: versioned destinations collide by resolved identity\n");
+
+    char source[PATH_MAX], home[PATH_MAX], shared[PATH_MAX], alias[PATH_MAX];
+    char sentinel[PATH_MAX], output[16384];
+    ManifestRoot roots[2];
+    Manifest manifest;
+    int previous_dry_run = dry_run;
+
+    fresh_mkdtemp(source, sizeof(source), "dispatch_identity_files_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_identity_files_home");
+    setenv("HOME", home, 1);
+    join_path(shared, sizeof(shared), home, "Shared");
+    mkdir_p(shared);
+    join_path(alias, sizeof(alias), home, "Alias");
+    if (symlink("Shared", alias) != 0)
+        exit(1);
+    write_user_dirs(home, "Shared", "Alias");
+    make_v1_alias_manifest(&manifest, roots);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the VERSION=1 Shared/Alias collision manifest");
+    write_payload_file(source, "data/XDG_DOCUMENTS_DIR", "file", "DOCS");
+    write_payload_file(source, "data/XDG_DOWNLOAD_DIR", "file", "DOWNLOADS");
+    join_path(sentinel, sizeof(sentinel), shared, "file");
+    write_file_mode(sentinel, "ORIGINAL", 0600);
+    remove_fixture_packages(source);
+
+    dry_run = 0;
+    int rc = run_restore_capturing_with_input(source, "y\n", output,
+                                               sizeof(output));
+    dry_run = previous_dry_run;
+    check(rc != 0 && strstr(output, "competing entries for restore destination") != NULL &&
+              file_content_is(sentinel, "ORIGINAL"),
+          "VERSION=1 Shared/Alias duplicate files refuse before the existing file changes");
+    remove_tree(source);
+    remove_tree(home);
+
+    fresh_mkdtemp(source, sizeof(source), "dispatch_identity_dirs_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_identity_dirs_home");
+    setenv("HOME", home, 1);
+    join_path(shared, sizeof(shared), home, "Shared");
+    mkdir_p(shared);
+    if (chmod(shared, 0701) != 0)
+        exit(1);
+    join_path(alias, sizeof(alias), home, "Alias");
+    if (symlink("Shared", alias) != 0)
+        exit(1);
+    write_user_dirs(home, "Shared", "Alias");
+    make_v1_alias_manifest(&manifest, roots);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the VERSION=1 duplicate-directory alias manifest");
+    char docs_payload[PATH_MAX], downloads_payload[PATH_MAX];
+    join_path(docs_payload, sizeof(docs_payload), source,
+              "data/XDG_DOCUMENTS_DIR");
+    join_path(downloads_payload, sizeof(downloads_payload), source,
+              "data/XDG_DOWNLOAD_DIR");
+    mkdir_p(docs_payload);
+    mkdir_p(downloads_payload);
+    if (chmod(docs_payload, 0750) != 0 || chmod(downloads_payload, 0755) != 0)
+        exit(1);
+    join_path(sentinel, sizeof(sentinel), shared, "sentinel");
+    write_file_mode(sentinel, "ORIGINAL", 0600);
+    remove_fixture_packages(source);
+
+    dry_run = 0;
+    rc = run_restore_capturing_with_input(source, "y\n", output,
+                                          sizeof(output));
+    dry_run = previous_dry_run;
+    struct stat shared_st;
+    int shared_ok = stat(shared, &shared_st) == 0;
+    check(rc != 0 && strstr(output, "competing entries for restore destination") != NULL &&
+              file_content_is(sentinel, "ORIGINAL") && shared_ok &&
+              (shared_st.st_mode & 07777) == 0701,
+          "distinct empty source directories cannot both own metadata for one aliased target");
+    remove_tree(source);
+    remove_tree(home);
+
+    fresh_mkdtemp(source, sizeof(source), "dispatch_identity_suffix_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_identity_suffix_home");
+    setenv("HOME", home, 1);
+    char existing[PATH_MAX], missing[PATH_MAX];
+    join_path(existing, sizeof(existing), home, "a");
+    mkdir_p(existing);
+    write_user_dirs(home, "a", "Downloads");
+    memset(roots, 0, sizeof(roots));
+    strcpy(roots[0].id, "EXPLICIT_0");
+    roots[0].policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(roots[0].payload_path, "EXPLICIT_0");
+    strcpy(roots[0].source_path, "source-new");
+    strcpy(roots[0].restore_path, "a/new");
+    roots[0].has_restore_path = 1;
+    strcpy(roots[1].id, "XDG_DOCUMENTS_DIR");
+    roots[1].policy = ROOT_POLICY_XDG;
+    strcpy(roots[1].payload_path, "XDG_DOCUMENTS_DIR");
+    strcpy(roots[1].source_path, "Documents");
+    make_v1_manifest(&manifest, roots, 2);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the converging missing-suffix manifest");
+    char explicit_payload[PATH_MAX], xdg_payload[PATH_MAX], xdg_new[PATH_MAX];
+    join_path(explicit_payload, sizeof(explicit_payload), source,
+              "data/EXPLICIT_0");
+    join_path(xdg_payload, sizeof(xdg_payload), source,
+              "data/XDG_DOCUMENTS_DIR");
+    join_path(xdg_new, sizeof(xdg_new), xdg_payload, "new");
+    mkdir_p(explicit_payload);
+    mkdir_p(xdg_new);
+    join_path(sentinel, sizeof(sentinel), existing, "sentinel");
+    write_file_mode(sentinel, "ORIGINAL", 0600);
+    join_path(missing, sizeof(missing), existing, "new");
+    remove_fixture_packages(source);
+
+    dry_run = 0;
+    rc = run_restore_capturing_with_input(source, "y\n", output,
+                                          sizeof(output));
+    dry_run = previous_dry_run;
+    check(rc != 0 && strstr(output, "competing entries for restore destination") != NULL &&
+              access(missing, F_OK) != 0 && file_content_is(sentinel, "ORIGINAL"),
+          "routes from different existing ancestors converge in memory before a missing suffix is created");
+    remove_tree(source);
+    remove_tree(home);
+
+    fresh_mkdtemp(source, sizeof(source), "dispatch_identity_home_xdg_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_identity_home_xdg_home");
+    setenv("HOME", home, 1);
+    join_path(shared, sizeof(shared), home, "Shared");
+    mkdir_p(shared);
+    join_path(alias, sizeof(alias), home, "Alias");
+    if (symlink("Shared", alias) != 0)
+        exit(1);
+    write_user_dirs(home, "Alias", "Downloads");
+    memset(roots, 0, sizeof(roots));
+    strcpy(roots[0].id, "EXPLICIT_0");
+    roots[0].policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(roots[0].payload_path, "EXPLICIT_0");
+    strcpy(roots[0].source_path, "home-child");
+    strcpy(roots[0].restore_path, "Shared/home-child");
+    roots[0].has_restore_path = 1;
+    strcpy(roots[1].id, "XDG_DOCUMENTS_DIR");
+    roots[1].policy = ROOT_POLICY_XDG;
+    strcpy(roots[1].payload_path, "XDG_DOCUMENTS_DIR");
+    strcpy(roots[1].source_path, "Documents");
+    make_v1_manifest(&manifest, roots, 2);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the HOME/XDG alias convergence manifest");
+    join_path(explicit_payload, sizeof(explicit_payload), source,
+              "data/EXPLICIT_0");
+    join_path(xdg_payload, sizeof(xdg_payload), source,
+              "data/XDG_DOCUMENTS_DIR");
+    join_path(xdg_new, sizeof(xdg_new), xdg_payload, "home-child");
+    mkdir_p(explicit_payload);
+    mkdir_p(xdg_new);
+    join_path(sentinel, sizeof(sentinel), shared, "sentinel");
+    write_file_mode(sentinel, "ORIGINAL", 0600);
+    join_path(missing, sizeof(missing), shared, "home-child");
+    remove_fixture_packages(source);
+
+    dry_run = 0;
+    rc = run_restore_capturing_with_input(source, "y\n", output,
+                                          sizeof(output));
+    dry_run = previous_dry_run;
+    check(rc != 0 && strstr(output, "competing entries for restore destination") != NULL &&
+              access(missing, F_OK) != 0 && file_content_is(sentinel, "ORIGINAL"),
+          "HOME-relative and XDG routes converging through an alias refuse before mutation");
+    remove_tree(source);
+    remove_tree(home);
+}
+
+static void test_versioned_restore_identity_order_and_cross_root_hardlinks(void)
+{
+    printf(BLUE "::" NC " restore dispatch: resolved namespace order preserves legitimate nested aliases\n");
+
+    char source[PATH_MAX], home[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_identity_success_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_identity_success_home");
+    setenv("HOME", home, 1);
+
+    char outer[PATH_MAX], middle[PATH_MAX], leaf[PATH_MAX];
+    char docs_alias[PATH_MAX], downloads_alias[PATH_MAX];
+    join_path(outer, sizeof(outer), home, "Outer");
+    join_path(middle, sizeof(middle), outer, "Middle");
+    join_path(leaf, sizeof(leaf), middle, "Leaf");
+    mkdir_p(leaf);
+    join_path(docs_alias, sizeof(docs_alias), home, "d");
+    join_path(downloads_alias, sizeof(downloads_alias), home,
+              "a-very-long-download-alias");
+    if (symlink("Outer/Middle", docs_alias) != 0 ||
+        symlink("Outer/Middle/Leaf", downloads_alias) != 0)
+        exit(1);
+    write_user_dirs(home, "d", "a-very-long-download-alias");
+
+    ManifestRoot roots[3];
+    memset(roots, 0, sizeof(roots));
+    strcpy(roots[0].id, "EXPLICIT_0");
+    roots[0].policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(roots[0].payload_path, "EXPLICIT_0");
+    strcpy(roots[0].source_path, "Outer");
+    strcpy(roots[0].restore_path, "Outer");
+    roots[0].has_restore_path = 1;
+    strcpy(roots[1].id, "XDG_DOCUMENTS_DIR");
+    roots[1].policy = ROOT_POLICY_XDG;
+    strcpy(roots[1].payload_path, "XDG_DOCUMENTS_DIR");
+    strcpy(roots[1].source_path, "Documents");
+    strcpy(roots[2].id, "XDG_DOWNLOAD_DIR");
+    roots[2].policy = ROOT_POLICY_XDG;
+    strcpy(roots[2].payload_path, "XDG_DOWNLOAD_DIR");
+    strcpy(roots[2].source_path, "Downloads");
+    Manifest manifest;
+    make_v1_manifest(&manifest, roots, 3);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the three-level nested alias manifest");
+
+    write_payload_file(source, "data/EXPLICIT_0", "outer.txt", "LINKED");
+    write_payload_file(source, "data/XDG_DOCUMENTS_DIR", "middle.txt", "MIDDLE");
+    char outer_payload[PATH_MAX], middle_payload[PATH_MAX], leaf_payload[PATH_MAX];
+    char outer_file[PATH_MAX], leaf_file[PATH_MAX];
+    join_path(outer_payload, sizeof(outer_payload), source, "data/EXPLICIT_0");
+    join_path(middle_payload, sizeof(middle_payload), source,
+              "data/XDG_DOCUMENTS_DIR");
+    join_path(leaf_payload, sizeof(leaf_payload), source,
+              "data/XDG_DOWNLOAD_DIR");
+    mkdir_p(leaf_payload);
+    join_path(outer_file, sizeof(outer_file), outer_payload, "outer.txt");
+    join_path(leaf_file, sizeof(leaf_file), leaf_payload, "leaf-link.txt");
+    check(link(outer_file, leaf_file) == 0,
+          "fixture: hardlink one payload across manifest roots");
+
+    struct timespec outer_times[2] = {
+        { .tv_sec = 1700001200, .tv_nsec = 100000001 },
+        { .tv_sec = 1700001201, .tv_nsec = 100000002 }
+    };
+    struct timespec middle_times[2] = {
+        { .tv_sec = 1700001210, .tv_nsec = 200000001 },
+        { .tv_sec = 1700001211, .tv_nsec = 200000002 }
+    };
+    struct timespec leaf_times[2] = {
+        { .tv_sec = 1700001220, .tv_nsec = 300000001 },
+        { .tv_sec = 1700001221, .tv_nsec = 300000002 }
+    };
+    check(chmod(outer_payload, 0711) == 0 &&
+              chmod(middle_payload, 0722) == 0 &&
+              chmod(leaf_payload, 0733) == 0 &&
+              utimensat(AT_FDCWD, outer_payload, outer_times, 0) == 0 &&
+              utimensat(AT_FDCWD, middle_payload, middle_times, 0) == 0 &&
+              utimensat(AT_FDCWD, leaf_payload, leaf_times, 0) == 0,
+          "fixture: set distinct metadata on the three physical levels");
+    remove_fixture_packages(source);
+
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    char output[16384];
+    int rc = run_restore_capturing_with_input(source, "y\n", output,
+                                               sizeof(output));
+    dry_run = previous_dry_run;
+
+    char restored_outer_file[PATH_MAX], restored_leaf_file[PATH_MAX];
+    join_path(restored_outer_file, sizeof(restored_outer_file), outer,
+              "outer.txt");
+    join_path(restored_leaf_file, sizeof(restored_leaf_file), leaf,
+              "leaf-link.txt");
+    struct stat outer_st, middle_st, leaf_st, first_st, second_st;
+    int metadata_ok = stat(outer, &outer_st) == 0 &&
+                      stat(middle, &middle_st) == 0 &&
+                      stat(leaf, &leaf_st) == 0;
+    int hardlink_ok = stat(restored_outer_file, &first_st) == 0 &&
+                      stat(restored_leaf_file, &second_st) == 0 &&
+                      first_st.st_dev == second_st.st_dev &&
+                      first_st.st_ino == second_st.st_ino;
+    check(rc == 0 && file_content_is(restored_outer_file, "LINKED") &&
+              file_content_is(restored_leaf_file, "LINKED") && hardlink_ok,
+          "non-conflicting nested alias targets restore with cross-root hardlink identity intact");
+    check(metadata_ok && (outer_st.st_mode & 07777) == 0711 &&
+              (middle_st.st_mode & 07777) == 0722 &&
+              (leaf_st.st_mode & 07777) == 0733 &&
+              outer_st.st_mtim.tv_sec == outer_times[1].tv_sec &&
+              middle_st.st_mtim.tv_sec == middle_times[1].tv_sec &&
+              leaf_st.st_mtim.tv_sec == leaf_times[1].tv_sec,
+          "directory metadata follows physical child-before-parent order despite alias spelling lengths");
 
     remove_tree(source);
     remove_tree(home);
@@ -1674,6 +1990,8 @@ int main(void)
     test_v2_selection_restore_refusals();
     test_v2_home_relative_restore_destination_too_long();
     test_versioned_restore_freezes_xdg_target_map();
+    test_versioned_restore_refuses_destination_alias_collisions();
+    test_versioned_restore_identity_order_and_cross_root_hardlinks();
     test_v2_selection_restore_nested_metadata_order();
     test_v1_restore_space_preflight();
     test_network_config_backends(2, -1, -1, 0);

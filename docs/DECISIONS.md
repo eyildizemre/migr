@@ -3005,6 +3005,18 @@ a property of restore addressing in general, not of configured selections: it
 applies to every versioned manifest, and the map is not permitted to differ
 between representations.
 
+**Competing mapped entries are detected by resolved destination identity.**
+Existing destination directories are interned by object identity
+`(st_dev, st_ino)` observed through the actual traversal route; planned
+directories are interned by their resolved parent node plus filename component.
+Entry placement is therefore a claim on a resolved parent plus component, and
+different path spelling — including symlinked trust roots and aliases — does
+not make two destinations distinct. This rule applies to every versioned
+manifest and to both native and portable representations. Filename components
+are compared byte-for-byte for now; destination-filesystem filename equivalence
+(including case folding and Unicode normalization) remains an open capability
+boundary and is not treated as solved by the identity model.
+
 Preflight the combined mapped entry set before mutation on both representations.
 Reject two distinct source entries mapping to the same destination, including two
 directories with competing metadata, and reject non-directory ancestors, symlink

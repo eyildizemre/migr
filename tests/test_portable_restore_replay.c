@@ -255,6 +255,20 @@ static int write_v2_nested_manifest(Fixture *fixture, ManifestRoot roots[2])
     return manifest_write_v1_at(fixture->container_fd, &manifest);
 }
 
+static int write_v1_identity_manifest(Fixture *fixture, ManifestRoot *roots,
+                                      int root_count)
+{
+    Manifest manifest = {
+        .version = MANIFEST_CURRENT_VERSION,
+        .representation = CLONE_PORTABLE_SIDECAR,
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .sidecar_version = SIDECAR_VERSION,
+        .root_count = root_count,
+        .roots = roots
+    };
+    return manifest_write_v1_at(fixture->container_fd, &manifest);
+}
+
 static int fixture_open(Fixture *fixture, ManifestRoot *root)
 {
     memset(fixture, 0, sizeof(*fixture));
@@ -420,7 +434,8 @@ static int append_raw_suffix_entry(Fixture *fixture,
     return 0;
 }
 
-static int run_preflight(Fixture *fixture)
+static int run_preflight_with_xdg(
+    Fixture *fixture, const char * const *destination_xdg_dirs)
 {
     Manifest manifest;
     if (manifest_read_v1_at(fixture->container_fd, &manifest) !=
@@ -438,15 +453,27 @@ static int run_preflight(Fixture *fixture)
             .configured = 1
         }
     };
+    for (int index = 0; index < XDG_KEY_COUNT; index++)
+        request.destination_xdg_dirs[index] =
+            destination_xdg_dirs == NULL ? NULL : destination_xdg_dirs[index];
     int result = portable_restore_preflight_at(&request, &report);
     portable_restore_preflight_report_free(&report);
     manifest_free(&manifest);
     return result;
 }
 
+static int run_preflight(Fixture *fixture)
+{
+    return run_preflight_with_xdg(fixture, NULL);
+}
+
 static int run_replay_with_capture(
     Fixture *fixture, PortableRestoreReplayReport *report,
     BackupCaptureReport *capture_report);
+
+static int run_replay_with_xdg(
+    Fixture *fixture, PortableRestoreReplayReport *report,
+    const char * const *destination_xdg_dirs);
 
 static int run_replay(Fixture *fixture, PortableRestoreReplayReport *report)
 {
@@ -472,6 +499,33 @@ static int run_replay_with_capture(
         },
         .capture_report = capture_report
     };
+    portable_restore_replay_report_init(report);
+    int result = portable_restore_replay_at(&request, report);
+    manifest_free(&manifest);
+    return result;
+}
+
+static int run_replay_with_xdg(
+    Fixture *fixture, PortableRestoreReplayReport *report,
+    const char * const *destination_xdg_dirs)
+{
+    Manifest manifest;
+    if (manifest_read_v1_at(fixture->container_fd, &manifest) !=
+            MANIFEST_STATUS_VALID)
+        return -1;
+    PortableRestoreRequest request = {
+        .source_container_fd = fixture->container_fd,
+        .manifest = &manifest,
+        .destination_home_fd = fixture->home_fd,
+        .destination_home_path = fixture->home,
+        .destination_timestamp_policy = {
+            .nsec_exact = 1,
+            .configured = 1
+        }
+    };
+    for (int index = 0; index < XDG_KEY_COUNT; index++)
+        request.destination_xdg_dirs[index] =
+            destination_xdg_dirs == NULL ? NULL : destination_xdg_dirs[index];
     portable_restore_replay_report_init(report);
     int result = portable_restore_replay_at(&request, report);
     manifest_free(&manifest);
@@ -1456,6 +1510,203 @@ static void test_hardlink_toctou_race(void)
     fixture_close(&fixture);
 }
 
+static void test_resolved_destination_identity_replay(void)
+{
+    printf(BLUE "::" NC " portable replay enforces resolved destination identity\n");
+
+    ManifestRoot bootstrap = root_for();
+    ManifestRoot roots[3];
+    Fixture fixture;
+    const char *xdg_dirs[XDG_KEY_COUNT] = {0};
+
+    int opened = fixture_open(&fixture, &bootstrap);
+    check(opened == 0, "direct replay alias-collision fixture is created");
+    if (opened != 0)
+        return;
+
+    memset(roots, 0, 2U * sizeof(*roots));
+    strcpy(roots[0].id, "XDG_DOCUMENTS_DIR");
+    roots[0].policy = ROOT_POLICY_XDG;
+    strcpy(roots[0].payload_path, "XDG_DOCUMENTS_DIR");
+    strcpy(roots[0].source_path, "/source/Documents");
+    strcpy(roots[1].id, "XDG_DOWNLOAD_DIR");
+    roots[1].policy = ROOT_POLICY_XDG;
+    strcpy(roots[1].payload_path, "XDG_DOWNLOAD_DIR");
+    strcpy(roots[1].source_path, "/source/Downloads");
+    check(write_v1_identity_manifest(&fixture, roots, 2) == 0,
+          "direct replay VERSION=1 alias manifest is written");
+
+    make_dir_at(fixture.data_fd, "XDG_DOCUMENTS_DIR", 0700);
+    make_dir_at(fixture.data_fd, "XDG_DOWNLOAD_DIR", 0700);
+    int docs_fd = openat(fixture.data_fd, "XDG_DOCUMENTS_DIR",
+                         O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int downloads_fd = openat(fixture.data_fd, "XDG_DOWNLOAD_DIR",
+                              O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (docs_fd < 0 || downloads_fd < 0)
+        fatal("could not open direct replay alias payload roots");
+    write_file_at(docs_fd, "file", "DOCS");
+    write_file_at(downloads_fd, "file", "DOWNLOADS");
+    if (close(docs_fd) != 0 || close(downloads_fd) != 0)
+        fatal("could not close direct replay alias payload roots");
+
+    SidecarEntry collision_entries[] = {
+        entry_for("XDG_DOCUMENTS_DIR", "", "", SIDECAR_KIND_DIRECTORY, 0,
+                  0750, 1700001100, 1, 1700001101, 2),
+        entry_for("XDG_DOCUMENTS_DIR", "file", "file",
+                  SIDECAR_KIND_REGULAR, 4, 0640,
+                  1700001102, 3, 1700001103, 4),
+        entry_for("XDG_DOWNLOAD_DIR", "", "", SIDECAR_KIND_DIRECTORY, 0,
+                  0755, 1700001110, 5, 1700001111, 6),
+        entry_for("XDG_DOWNLOAD_DIR", "file", "file",
+                  SIDECAR_KIND_REGULAR, 9, 0600,
+                  1700001112, 7, 1700001113, 8)
+    };
+    check(write_sidecar(&fixture, collision_entries, 4, NULL, NULL) == 0,
+          "direct replay alias sidecar is committed");
+    make_dir_at(fixture.home_fd, "Shared", 0700);
+    if (symlinkat("Shared", fixture.home_fd, "Alias") != 0)
+        fatal("could not create direct replay alias");
+    int shared_fd = openat(fixture.home_fd, "Shared",
+                           O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (shared_fd < 0)
+        fatal("could not open direct replay Shared target");
+    write_file_at(shared_fd, "file", "ORIGINAL");
+    if (close(shared_fd) != 0)
+        fatal("could not close direct replay Shared target");
+
+    char shared[PATH_MAX], alias[PATH_MAX], sentinel[PATH_MAX];
+    path_join(shared, sizeof(shared), fixture.home, "/Shared");
+    path_join(alias, sizeof(alias), fixture.home, "/Alias");
+    path_join(sentinel, sizeof(sentinel), shared, "/file");
+    xdg_dirs[0] = shared;
+    xdg_dirs[1] = alias;
+    PortableRestoreReplayReport report;
+    int result = run_replay_with_xdg(&fixture, &report, xdg_dirs);
+    check(result != 0 && report.applied_count == 0 &&
+              file_equals_noatime(sentinel, "ORIGINAL"),
+          "direct replay refuses aliased duplicate files before any target content changes");
+    fixture_close(&fixture);
+
+    memset(xdg_dirs, 0, sizeof(xdg_dirs));
+    opened = fixture_open(&fixture, &bootstrap);
+    check(opened == 0, "nested alias replay fixture is created");
+    if (opened != 0)
+        return;
+
+    memset(roots, 0, sizeof(roots));
+    strcpy(roots[0].id, "HOME");
+    roots[0].policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(roots[0].payload_path, "HOME");
+    strcpy(roots[0].source_path, "/source/Outer");
+    strcpy(roots[0].restore_path, "Outer");
+    roots[0].has_restore_path = 1;
+    strcpy(roots[1].id, "XDG_DOCUMENTS_DIR");
+    roots[1].policy = ROOT_POLICY_XDG;
+    strcpy(roots[1].payload_path, "XDG_DOCUMENTS_DIR");
+    strcpy(roots[1].source_path, "/source/Documents");
+    strcpy(roots[2].id, "XDG_DOWNLOAD_DIR");
+    roots[2].policy = ROOT_POLICY_XDG;
+    strcpy(roots[2].payload_path, "XDG_DOWNLOAD_DIR");
+    strcpy(roots[2].source_path, "/source/Downloads");
+    check(write_v1_identity_manifest(&fixture, roots, 3) == 0,
+          "nested alias VERSION=1 manifest is written");
+
+    make_dir_at(fixture.data_fd, "HOME", 0700);
+    make_dir_at(fixture.data_fd, "XDG_DOCUMENTS_DIR", 0700);
+    make_dir_at(fixture.data_fd, "XDG_DOWNLOAD_DIR", 0700);
+    int home_payload_fd = openat(fixture.data_fd, "HOME",
+                                 O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    docs_fd = openat(fixture.data_fd, "XDG_DOCUMENTS_DIR",
+                     O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    downloads_fd = openat(fixture.data_fd, "XDG_DOWNLOAD_DIR",
+                          O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (home_payload_fd < 0 || docs_fd < 0 || downloads_fd < 0)
+        fatal("could not open nested alias payload roots");
+    write_file_at(home_payload_fd, "outer.txt", "LINKED");
+    write_file_at(docs_fd, "middle.txt", "MIDDLE");
+    write_file_at(downloads_fd, "leaf-link.txt", "");
+    if (close(home_payload_fd) != 0 || close(docs_fd) != 0 ||
+        close(downloads_fd) != 0)
+        fatal("could not close nested alias payload roots");
+
+    SidecarEntry success_entries[] = {
+        entry_for("HOME", "", "", SIDECAR_KIND_DIRECTORY, 0, 0711,
+                  1700001200, 1, 1700001201, 2),
+        entry_for("HOME", "outer.txt", "outer.txt", SIDECAR_KIND_REGULAR,
+                  6, 0640, 1700001202, 3, 1700001203, 4),
+        entry_for("XDG_DOCUMENTS_DIR", "", "", SIDECAR_KIND_DIRECTORY, 0,
+                  0722, 1700001210, 5, 1700001211, 6),
+        entry_for("XDG_DOCUMENTS_DIR", "middle.txt", "middle.txt",
+                  SIDECAR_KIND_REGULAR, 6, 0600,
+                  1700001212, 7, 1700001213, 8),
+        entry_for("XDG_DOWNLOAD_DIR", "", "", SIDECAR_KIND_DIRECTORY, 0,
+                  0733, 1700001220, 9, 1700001221, 10),
+        entry_for("XDG_DOWNLOAD_DIR", "leaf-link.txt", "leaf-link.txt",
+                  SIDECAR_KIND_HARDLINK, 0, 0640,
+                  1700001222, 11, 1700001223, 12)
+    };
+    success_entries[5].hardlink_root_id = text_bytes("HOME");
+    success_entries[5].hardlink_logical_path = text_bytes("outer.txt");
+    check(write_sidecar(&fixture, success_entries, 6, NULL, NULL) == 0,
+          "nested alias sidecar with a cross-root hardlink is committed");
+
+    make_dir_at(fixture.home_fd, "Outer", 0700);
+    int outer_fd = openat(fixture.home_fd, "Outer",
+                          O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (outer_fd < 0)
+        fatal("could not open nested alias Outer target");
+    make_dir_at(outer_fd, "Middle", 0700);
+    int middle_fd = openat(outer_fd, "Middle",
+                           O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (middle_fd < 0)
+        fatal("could not open nested alias Middle target");
+    make_dir_at(middle_fd, "Leaf", 0700);
+    if (close(middle_fd) != 0 || close(outer_fd) != 0)
+        fatal("could not close nested alias target directories");
+    if (symlinkat("Outer/Middle", fixture.home_fd, "d") != 0 ||
+        symlinkat("Outer/Middle/Leaf", fixture.home_fd,
+                  "a-very-long-download-alias") != 0)
+        fatal("could not create nested alias trust roots");
+
+    char outer[PATH_MAX], middle[PATH_MAX], leaf[PATH_MAX];
+    char documents_alias[PATH_MAX], downloads_alias[PATH_MAX];
+    char outer_file[PATH_MAX], leaf_file[PATH_MAX];
+    path_join(outer, sizeof(outer), fixture.home, "/Outer");
+    path_join(middle, sizeof(middle), outer, "/Middle");
+    path_join(leaf, sizeof(leaf), middle, "/Leaf");
+    path_join(documents_alias, sizeof(documents_alias), fixture.home, "/d");
+    path_join(downloads_alias, sizeof(downloads_alias), fixture.home,
+              "/a-very-long-download-alias");
+    path_join(outer_file, sizeof(outer_file), outer, "/outer.txt");
+    path_join(leaf_file, sizeof(leaf_file), leaf, "/leaf-link.txt");
+    xdg_dirs[0] = documents_alias;
+    xdg_dirs[1] = downloads_alias;
+
+    check(run_preflight_with_xdg(&fixture, xdg_dirs) == 0,
+          "non-conflicting nested aliases pass portable preflight");
+    result = run_replay_with_xdg(&fixture, &report, xdg_dirs);
+    struct stat outer_st, middle_st, leaf_st, first_st, second_st;
+    int metadata_ok = stat(outer, &outer_st) == 0 &&
+                      stat(middle, &middle_st) == 0 &&
+                      stat(leaf, &leaf_st) == 0;
+    int hardlink_ok = stat(outer_file, &first_st) == 0 &&
+                      stat(leaf_file, &second_st) == 0 &&
+                      first_st.st_dev == second_st.st_dev &&
+                      first_st.st_ino == second_st.st_ino;
+    check(result == 0 && report.failed_count == 0 && hardlink_ok &&
+              file_equals_noatime(outer_file, "LINKED") &&
+              file_equals_noatime(leaf_file, "LINKED"),
+          "nested alias replay preserves cross-root hardlink identity");
+    check(metadata_ok && (outer_st.st_mode & 07777) == 0711 &&
+              (middle_st.st_mode & 07777) == 0722 &&
+              (leaf_st.st_mode & 07777) == 0733 &&
+              outer_st.st_mtim.tv_sec == 1700001201 &&
+              middle_st.st_mtim.tv_sec == 1700001211 &&
+              leaf_st.st_mtim.tv_sec == 1700001221,
+          "nested alias replay finalizes directory metadata by resolved namespace depth");
+    fixture_close(&fixture);
+}
+
 static void test_v2_nested_root_replay_order(void)
 {
     printf(BLUE "::" NC " VERSION=2 replay uses combined destination order across roots\n");
@@ -1568,6 +1819,7 @@ int main(void)
     test_payload_swap();
     test_tombstone_skipped();
     test_hardlink_toctou_race();
+    test_resolved_destination_identity_replay();
     test_v2_nested_root_replay_order();
     test_copy_bytes_rejects_corruption();
     printf("%s%s%s\n", failures == 0 ? GREEN : RED,
