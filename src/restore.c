@@ -1801,6 +1801,13 @@ int restore(const char *source)
         close(source_root_fd);
         return 1;
     }
+    if (mst == MANIFEST_STATUS_VALID && m.version == MANIFEST_SELECTION_VERSION)
+    {
+        print_error("Error: this build cannot replay filtered backup selections; refusing to restore.\n");
+        manifest_free(&m);
+        close(source_root_fd);
+        return 1;
+    }
     // mst is now MISSING, LEGACY, or VALID.
 
     if (source_is_versioned_final && mst == MANIFEST_STATUS_MISSING)

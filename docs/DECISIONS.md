@@ -3026,6 +3026,10 @@ VERSION=2 retains the existing header and ROOT grammar and adds:
 - Required `SOURCE_HOME=<path>` immediately before ROOT_COUNT: canonical absolute
   source HOME, encoded with ENCODING_MODE_MANIFEST_PATH. It anchors HOME_RELATIVE
   SOURCE fields when reconstructing the source forest without the source machine.
+  When a HOME_RELATIVE built-in reaches an external source through an ancestor
+  symlink, VERSION=2 records that canonical absolute SOURCE and retains its
+  independent HOME-relative RESTORE. The original symlink is not needed to
+  reconstruct ownership on the target.
 - Required `EXCLUDE_COUNT=<decimal>` immediately after the ROOT lines, followed by
   exactly that many `EXCLUDE PATH=<path>` lines and EOF. Paths are normalized
   absolute source addresses, encoded with the same manifest path codec, sorted in

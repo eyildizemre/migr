@@ -32,6 +32,9 @@ typedef struct {
 int selection_plan_build(const char *home, BackupMode mode,
                          const Config *config, SelectionPlan *out);
 void selection_plan_free(SelectionPlan *plan);
+/* Owns a copied root/policy table. Uses VERSION=1 for unfiltered disjoint plans.
+ * Caller supplies source identity and representation/sidecar/optional flags. */
+int selection_plan_manifest(const SelectionPlan *plan, Manifest *out);
 /* Read-only structural validation of source ownership and payload separation. */
 int selection_plan_validate(const SelectionPlan *plan);
 /* Pure component matching; rel must be canonical, with "" denoting the root.

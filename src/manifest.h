@@ -46,7 +46,9 @@ int legacy_manifest_read(const char *backup_dir, char **out, int n);
 /* Versioned manifest (docs/DECISIONS.md D15, D16).                          */
 /* ------------------------------------------------------------------------- */
 
-#define MANIFEST_CURRENT_VERSION 1
+#define MANIFEST_CURRENT_VERSION 1 /* Default for unfiltered, disjoint plans. */
+#define MANIFEST_SELECTION_VERSION 2
+#define MANIFEST_MAX_EXCLUDES 4096
 #define MANIFEST_MAX_ROOTS       4096  /**< Resource-exhaustion ceiling, not an expected count. */
 #define MANIFEST_ID_MAX          64
 #define MANIFEST_MACHINE_ID_MAX  128
@@ -69,7 +71,7 @@ typedef enum {
                                            corrupted/truncated attempt at the versioned magic), is
                                            MALFORMED instead: silently guessing "probably legacy" could
                                            route real corruption through the legacy fallback path. */
-    MANIFEST_STATUS_VALID,           /**< Magic + MANIFEST_CURRENT_VERSION, parsed successfully; *out is populated. */
+    MANIFEST_STATUS_VALID,           /**< Magic + a supported version, parsed successfully; *out is populated. */
     MANIFEST_STATUS_UNKNOWN_VERSION, /**< Magic present, VERSION is well-formed but not one this build understands. */
     MANIFEST_STATUS_MALFORMED,       /**< Magic present, current version, but the content violates the grammar. */
     MANIFEST_STATUS_IO_ERROR         /**< open/read/allocation failure unrelated to file content. */
@@ -144,10 +146,14 @@ typedef struct {
     int has_network_config;
     int root_count;
     ManifestRoot *roots;
+    char source_home[PATH_MAX]; /* VERSION=2 source address anchor, never opened. */
+    size_t exclude_count;
+    char **excludes; /* Owned canonical absolute paths, VERSION=2 only. */
 } Manifest;
 
 /**
- * @brief Reads and classifies backup_dir/manifest.txt.
+ * @brief Reads and classifies backup_dir/manifest.txt (VERSION=1 or VERSION=2).
+ * The _v1 API names are retained for existing callers.
  *
  * Distinguishes every failure class explicitly (see ManifestStatus) rather than
  * collapsing them into a single boolean, so a corrupt or unsupported-version
@@ -270,5 +276,11 @@ int manifest_write_v1(const char *backup_dir, const Manifest *m);
  * @brief Releases the heap-owned root array. Safe on NULL and on an all-zero Manifest.
  */
 void manifest_free(Manifest *m);
+/* Filesystem-independent VERSION=2 source addressing and entry ownership.
+ * On a validated manifest, an entry is owned (1), excluded/delegated (0), or invalid (-1).
+ * Callers must reject unowned entries found in finalized payloads. */
+int manifest_root_source_path(const Manifest *m, int root_index, char out[PATH_MAX]);
+int manifest_entry_owned(const Manifest *m, int root_index, const char *relative);
+int manifest_selection_valid(const Manifest *m);
 
 #endif

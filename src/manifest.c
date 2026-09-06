@@ -499,7 +499,7 @@ static ManifestStatus manifest_parse_v1_body(FILE *f, Manifest *out)
     if (read_kv_field(f, line, sizeof(line), "VERSION", &value, &key_len,
                       &fail_status) != 0) goto fail;
     if (parse_uint_field(value, INT_MAX, &n) != 0) goto fail;
-    if (n != MANIFEST_CURRENT_VERSION) { fail_status = MANIFEST_STATUS_UNKNOWN_VERSION; goto fail; }
+    if (n != MANIFEST_CURRENT_VERSION && n != MANIFEST_SELECTION_VERSION) { fail_status = MANIFEST_STATUS_UNKNOWN_VERSION; goto fail; }
     m.version = (int)n;
 
     // REPRESENTATION=native|portable
@@ -558,6 +558,14 @@ static ManifestStatus manifest_parse_v1_body(FILE *f, Manifest *out)
                          &fail_status) != 0) goto fail;
     }
 
+    if (m.version == MANIFEST_SELECTION_VERSION)
+    {
+        if (!line_key_is(line, "SOURCE_HOME", key_len) ||
+            encoding_percent_decode(ENCODING_MODE_MANIFEST_PATH, value,
+                                    m.source_home, sizeof(m.source_home)) != 0) goto fail;
+        if (read_kv_line(f, line, sizeof(line), &value, &key_len, &fail_status) != 0) goto fail;
+    }
+
     // ROOT_COUNT=<uint>
     if (!line_key_is(line, "ROOT_COUNT", key_len)) goto fail;
     if (parse_uint_field(value, MANIFEST_MAX_ROOTS, &n) != 0) goto fail;
@@ -596,6 +604,30 @@ static ManifestStatus manifest_parse_v1_body(FILE *f, Manifest *out)
         free(sorted);
     }
 
+    if (m.version == MANIFEST_SELECTION_VERSION)
+    {
+        if (read_kv_field(f, line, sizeof(line), "EXCLUDE_COUNT", &value, &key_len,
+                          &fail_status) != 0 ||
+            parse_uint_field(value, MANIFEST_MAX_EXCLUDES, &n) != 0) goto fail;
+        m.exclude_count = (size_t)n;
+        if (m.exclude_count)
+        {
+            m.excludes = calloc(m.exclude_count, sizeof(*m.excludes));
+            if (!m.excludes) { fail_status = MANIFEST_STATUS_IO_ERROR; goto fail; }
+        }
+        for (size_t i = 0; i < m.exclude_count; i++)
+        {
+            char decoded[PATH_MAX];
+            if (read_required_line(f, line, sizeof(line), &fail_status) <= 0 ||
+                strncmp(line, "EXCLUDE PATH=", 13) ||
+                encoding_percent_decode(ENCODING_MODE_MANIFEST_PATH, line + 13,
+                                        decoded, sizeof(decoded)) != 0) goto fail;
+            m.excludes[i] = strdup(decoded);
+            if (!m.excludes[i]) { fail_status = MANIFEST_STATUS_IO_ERROR; goto fail; }
+        }
+        if (!manifest_selection_valid(&m)) goto fail;
+    }
+
     // No trailing content beyond the declared roots.
     {
         int trailing_rc = read_line(f, line, sizeof(line));
@@ -609,7 +641,7 @@ static ManifestStatus manifest_parse_v1_body(FILE *f, Manifest *out)
 
 fail:
     fclose(f);
-    free(m.roots);
+    manifest_free(&m);
     memset(out, 0, sizeof(*out));
     return fail_status;
 }
@@ -713,6 +745,8 @@ ManifestIdentityComparison manifest_resume_identity_compare(const Manifest *a, c
 {
     if (a == NULL || b == NULL)
         return MANIFEST_IDENTITY_DIFFERENT;
+    if (!manifest_selection_valid(a) || !manifest_selection_valid(b))
+        return MANIFEST_IDENTITY_DIFFERENT;
     if (a->version != b->version)
         return MANIFEST_IDENTITY_DIFFERENT;
     if (a->representation != b->representation)
@@ -733,6 +767,13 @@ ManifestIdentityComparison manifest_resume_identity_compare(const Manifest *a, c
         return MANIFEST_IDENTITY_DIFFERENT;
     if (a->has_network_config != b->has_network_config)
         return MANIFEST_IDENTITY_DIFFERENT;
+    if (strcmp(a->source_home, b->source_home) || a->exclude_count != b->exclude_count)
+        return MANIFEST_IDENTITY_DIFFERENT;
+    if (a->exclude_count && (!a->excludes || !b->excludes))
+        return MANIFEST_IDENTITY_DIFFERENT;
+    for (size_t i = 0; i < a->exclude_count; i++)
+        if (!a->excludes[i] || !b->excludes[i] || strcmp(a->excludes[i], b->excludes[i]))
+            return MANIFEST_IDENTITY_DIFFERENT;
     if (a->root_count != b->root_count)
         return MANIFEST_IDENTITY_DIFFERENT;
     if (a->root_count == 0)
@@ -789,8 +830,9 @@ static int manifest_model_is_invalid(const Manifest *m)
     if (m == NULL)
         return 1;
 
-    if (m->version != MANIFEST_CURRENT_VERSION)
+    if (m->version != MANIFEST_CURRENT_VERSION && m->version != MANIFEST_SELECTION_VERSION)
         return 1;
+    if (!manifest_selection_valid(m)) return 1;
 
     const char *repr_str = representation_to_string(m->representation);
     const char *scope_str = scope_to_string(m->scope);
@@ -883,6 +925,13 @@ static int manifest_serialize(FILE *f, const Manifest *m)
         fprintf(f, "NETWORK_CONFIG=1\n") < 0)
         failed = 1;
 
+    if (!failed && m->version == MANIFEST_SELECTION_VERSION)
+    {
+        char home[MANIFEST_ENC_MAX];
+        if (encoding_percent_encode(ENCODING_MODE_MANIFEST_PATH, m->source_home,
+                                    home, sizeof(home)) != 0 ||
+            fprintf(f, "SOURCE_HOME=%s\n", home) < 0) failed = 1;
+    }
     if (!failed && fprintf(f, "ROOT_COUNT=%d\n", m->root_count) < 0) failed = 1;
 
     char enc_payload[MANIFEST_ENC_MAX];
@@ -922,6 +971,17 @@ static int manifest_serialize(FILE *f, const Manifest *m)
         }
     }
 
+    if (!failed && m->version == MANIFEST_SELECTION_VERSION)
+    {
+        if (fprintf(f, "EXCLUDE_COUNT=%zu\n", m->exclude_count) < 0) failed = 1;
+        for (size_t i = 0; !failed && i < m->exclude_count; i++)
+        {
+            char encoded[MANIFEST_ENC_MAX];
+            if (encoding_percent_encode(ENCODING_MODE_MANIFEST_PATH, m->excludes[i],
+                                        encoded, sizeof(encoded)) != 0 ||
+                fprintf(f, "EXCLUDE PATH=%s\n", encoded) < 0) failed = 1;
+        }
+    }
     if (!failed && fflush(f) != 0) failed = 1;
     return failed ? 1 : 0;
 }
@@ -971,7 +1031,110 @@ void manifest_free(Manifest *m)
 {
     if (m == NULL)
         return;
+    if (m->excludes)
+        for (size_t i = 0; i < m->exclude_count; i++) free(m->excludes[i]);
+    free(m->excludes);
+    m->excludes = NULL;
+    m->exclude_count = 0;
+    m->source_home[0] = 0;
     free(m->roots);
     m->roots = NULL;
     m->root_count = 0;
+}
+
+static int canonical_path(const char *path, int absolute, int empty_ok)
+{
+    if (!path || strnlen(path, PATH_MAX) == PATH_MAX || (!*path && !empty_ok)) return 0;
+    if (absolute && *path++ != '/') return 0;
+    if (!absolute && *path == '/') return 0;
+    while (*path)
+    {
+        size_t n = strcspn(path, "/");
+        if (!n || n > NAME_MAX || (n == 1 && path[0] == '.') ||
+            (n == 2 && !memcmp(path, "..", 2))) return 0;
+        path += n;
+        if (*path && !*++path) return 0;
+    }
+    return 1;
+}
+
+static int source_covers(const char *parent, const char *path)
+{
+    size_t n = strlen(parent);
+    return !strcmp(parent, path) || (!strcmp(parent, "/") && path[0] == '/') ||
+           (n && !strncmp(parent, path, n) && path[n] == '/');
+}
+
+int manifest_root_source_path(const Manifest *m, int root_index, char out[PATH_MAX])
+{
+    if (!m || m->version != MANIFEST_SELECTION_VERSION || root_index < 0 ||
+        root_index >= m->root_count || !m->roots ||
+        !canonical_path(m->source_home, 1, 0)) return -1;
+    const ManifestRoot *root = &m->roots[root_index];
+    if (root->source_path[0] == '/')
+    {
+        if (!canonical_path(root->source_path, 1, 0)) return -1;
+        strcpy(out, root->source_path);
+        return 0;
+    }
+    if (root->policy != ROOT_POLICY_HOME_RELATIVE || !canonical_path(root->source_path, 0, 1)) return -1;
+    if (!root->source_path[0]) { strcpy(out, m->source_home); return 0; }
+    return path_join(out, PATH_MAX, m->source_home, root->source_path);
+}
+
+int manifest_selection_valid(const Manifest *m)
+{
+    if (!m) return 0;
+    if (m->version == MANIFEST_CURRENT_VERSION)
+        return !m->source_home[0] && !m->exclude_count && !m->excludes;
+    if (m->version != MANIFEST_SELECTION_VERSION || !canonical_path(m->source_home, 1, 0) ||
+        m->scope == MANIFEST_SCOPE_EXPLICIT || m->root_count < 0 || m->root_count > MANIFEST_MAX_ROOTS ||
+        (m->root_count && !m->roots) || m->exclude_count > MANIFEST_MAX_EXCLUDES ||
+        (m->exclude_count && !m->excludes)) return 0;
+    for (size_t i = 0; i < m->exclude_count; i++)
+    {
+        if (!canonical_path(m->excludes[i], 1, 0) ||
+            (i && strcmp(m->excludes[i - 1], m->excludes[i]) >= 0)) return 0;
+        for (size_t j = 0; j < i; j++)
+            if (source_covers(m->excludes[j], m->excludes[i])) return 0;
+    }
+    char previous[PATH_MAX] = "";
+    for (int i = 0; i < m->root_count; i++)
+    {
+        const ManifestRoot *root = &m->roots[i];
+        char source[PATH_MAX];
+        if (manifest_root_source_path(m, i, source) < 0 ||
+            (i && strcmp(previous, source) >= 0) ||
+            !canonical_path(root->payload_path, 0, 0) ||
+            (root->policy == ROOT_POLICY_HOME_RELATIVE &&
+             (!root->has_restore_path || !canonical_path(root->restore_path, 0, 1)))) return 0;
+        for (size_t j = 0; j < m->exclude_count; j++)
+            if (source_covers(m->excludes[j], source)) return 0;
+        for (int j = 0; j < i; j++)
+            if (source_covers(m->roots[j].payload_path, root->payload_path) ||
+                source_covers(root->payload_path, m->roots[j].payload_path)) return 0;
+        strcpy(previous, source);
+    }
+    return 1;
+}
+
+int manifest_entry_owned(const Manifest *m, int root_index, const char *relative)
+{
+    if (!m || root_index < 0 || root_index >= m->root_count ||
+        !canonical_path(relative, 0, 1)) return -1;
+    if (m->version == MANIFEST_CURRENT_VERSION) return 1;
+    char root[PATH_MAX], entry[PATH_MAX];
+    if (manifest_root_source_path(m, root_index, root) < 0) return -1;
+    if (!*relative) strcpy(entry, root);
+    else if (path_join(entry, sizeof(entry), root, relative) < 0) return -1;
+    for (size_t i = 0; i < m->exclude_count; i++)
+        if (source_covers(m->excludes[i], entry)) return 0;
+    for (int i = 0; i < m->root_count; i++)
+    {
+        char child[PATH_MAX];
+        if (i == root_index) continue;
+        if (manifest_root_source_path(m, i, child) < 0) return -1;
+        if (source_covers(root, child) && source_covers(child, entry)) return 0;
+    }
+    return 1;
 }

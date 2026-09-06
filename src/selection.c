@@ -242,3 +242,56 @@ int selection_plan_validate(const SelectionPlan *plan)
     }
     return 0;
 }
+
+int selection_plan_manifest(const SelectionPlan *plan, Manifest *out)
+{
+    if (!out) return -1;
+    *out = (Manifest){0};
+    if (selection_plan_validate(plan) < 0) return -1;
+    Manifest m = {0};
+    m.version = MANIFEST_CURRENT_VERSION;
+    m.scope = plan->scope;
+    m.representation = CLONE_NATIVE_TREE;
+    for (size_t i = 0; i < plan->root_count; i++)
+        if (plan->roots[i].parent >= 0) m.version = MANIFEST_SELECTION_VERSION;
+    if (plan->excludes.count) m.version = MANIFEST_SELECTION_VERSION;
+    m.root_count = (int)plan->root_count;
+    if (m.root_count)
+    {
+        m.roots = calloc(plan->root_count, sizeof(*m.roots));
+        if (!m.roots) goto fail;
+    }
+    if (m.version == MANIFEST_SELECTION_VERSION)
+    {
+        strcpy(m.source_home, plan->home);
+        m.exclude_count = plan->excludes.count;
+        if (m.exclude_count)
+        {
+            m.excludes = calloc(m.exclude_count, sizeof(*m.excludes));
+            if (!m.excludes) goto fail;
+        }
+        for (size_t i = 0; i < m.exclude_count; i++)
+        {
+            m.excludes[i] = strdup(plan->excludes.paths[i]);
+            if (!m.excludes[i]) goto fail;
+        }
+    }
+    for (size_t i = 0; i < plan->root_count; i++)
+    {
+        m.roots[i] = plan->roots[i].root.manifest_root;
+        if (m.version == MANIFEST_SELECTION_VERSION)
+        {
+            const char *source = plan->roots[i].root.capture_path;
+            const char *relative;
+            if (m.roots[i].policy == ROOT_POLICY_HOME_RELATIVE &&
+                backup_plan_home_relative(plan->home, source, &relative)) source = relative;
+            strcpy(m.roots[i].source_path, source);
+        }
+    }
+    if (!manifest_selection_valid(&m)) goto fail;
+    *out = m;
+    return 0;
+fail:
+    manifest_free(&m);
+    return -1;
+}
