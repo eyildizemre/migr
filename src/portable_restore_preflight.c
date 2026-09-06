@@ -23,6 +23,7 @@ typedef struct {
     size_t root_index;
     char *logical;
     char *physical;
+    char *destination;
     SidecarObjectKind kind;
     uint32_t mode;
     uint32_t uid;
@@ -44,6 +45,7 @@ typedef struct {
     size_t *root_order;
     PreflightEntries *entries;
     int destination_home_fd;
+    const char *destination_home_path;
     const char * const *destination_xdg_dirs;
     PreflightMemory memory;
 } Collection;
@@ -51,6 +53,7 @@ typedef struct {
 typedef struct {
     PreflightEntry **logical;
     PreflightEntry **physical;
+    PreflightEntry **destination;
     size_t count;
 } EntryOrders;
 
@@ -101,13 +104,21 @@ static int collection_validate_manifest(Collection *collection)
 {
     const Manifest *manifest = collection->manifest;
     PortableRestorePreflightReport *report = collection->report;
-    if (manifest == NULL || manifest->version != MANIFEST_CURRENT_VERSION ||
+    if (manifest == NULL || !manifest_selection_valid(manifest) ||
         manifest->representation != CLONE_PORTABLE_SIDECAR ||
         manifest->sidecar_version != SIDECAR_VERSION ||
         manifest->root_count < 0 || manifest->root_count > MANIFEST_MAX_ROOTS ||
         (manifest->root_count != 0 && manifest->roots == NULL))
     {
         report_violation(report, SIZE_MAX, "manifest");
+        errno = EINVAL;
+        return -1;
+    }
+    if (manifest->version == MANIFEST_SELECTION_VERSION &&
+        (collection->destination_home_path == NULL ||
+         collection->destination_home_path[0] != '/'))
+    {
+        report_violation(report, SIZE_MAX, "destination-home");
         errno = EINVAL;
         return -1;
     }
@@ -241,6 +252,9 @@ static void entries_free(PreflightMemory *memory, PreflightEntries *entries)
         preflight_free(memory, entries->items[index].physical,
                        entries->items[index].physical == NULL ? 0
                            : strlen(entries->items[index].physical) + 1U);
+        preflight_free(memory, entries->items[index].destination,
+                       entries->items[index].destination == NULL ? 0
+                           : strlen(entries->items[index].destination) + 1U);
     }
     preflight_free(memory, entries->items,
                    entries->capacity * sizeof(*entries->items));
@@ -538,6 +552,21 @@ static int collect_entry(const SidecarLiveView *view, void *argument)
             return 1;
         return 0;
     }
+    char logical[PATH_MAX];
+    if (entry->logical_path.length >= sizeof(logical))
+    {
+        report_violation(report, root_index, "invalid-path");
+        return 0;
+    }
+    if (entry->logical_path.length != 0)
+        memcpy(logical, entry->logical_path.data, entry->logical_path.length);
+    logical[entry->logical_path.length] = '\0';
+    if (manifest_entry_owned(collection->manifest, (int)root_index,
+                             logical) != 1)
+    {
+        report_violation(report, root_index, logical);
+        return 0;
+    }
     if (!entry_physical_matches_parent(
             &collection->manifest->roots[root_index],
             &collection->parent_map, entry))
@@ -589,6 +618,37 @@ static int collect_entry(const SidecarLiveView *view, void *argument)
     destination->uid = entry->uid;
     destination->gid = entry->gid;
     destination->size = entry->size;
+    if (collection->manifest->version == MANIFEST_SELECTION_VERSION)
+    {
+        char mapped[PATH_MAX];
+        if (destination_absolute_path_build(
+                &collection->manifest->roots[root_index], logical,
+                collection->destination_xdg_dirs,
+                collection->destination_home_path, mapped,
+                sizeof(mapped)) != 0)
+        {
+            report_violation(report, root_index, logical);
+            preflight_free(&collection->memory, destination->logical,
+                           strlen(destination->logical) + 1U);
+            preflight_free(&collection->memory, destination->physical,
+                           strlen(destination->physical) + 1U);
+            memset(destination, 0, sizeof(*destination));
+            return 0;
+        }
+        size_t mapped_size = strlen(mapped) + 1U;
+        destination->destination = preflight_alloc(&collection->memory,
+                                                   mapped_size);
+        if (destination->destination == NULL)
+        {
+            preflight_free(&collection->memory, destination->logical,
+                           strlen(destination->logical) + 1U);
+            preflight_free(&collection->memory, destination->physical,
+                           strlen(destination->physical) + 1U);
+            memset(destination, 0, sizeof(*destination));
+            return 1;
+        }
+        memcpy(destination->destination, mapped, mapped_size);
+    }
     entries->count++;
 
     int carries_security_xattr = 0;
@@ -633,6 +693,13 @@ static int physical_order_compare(const void *left, const void *right)
     return strcmp(a->physical, b->physical);
 }
 
+static int destination_order_compare(const void *left, const void *right)
+{
+    const PreflightEntry *a = *(const PreflightEntry *const *)left;
+    const PreflightEntry *b = *(const PreflightEntry *const *)right;
+    return strcmp(a->destination, b->destination);
+}
+
 static void entry_orders_free(PreflightMemory *memory, EntryOrders *orders)
 {
     if (orders == NULL)
@@ -641,6 +708,8 @@ static void entry_orders_free(PreflightMemory *memory, EntryOrders *orders)
                    orders->count * sizeof(*orders->logical));
     preflight_free(memory, orders->physical,
                    orders->count * sizeof(*orders->physical));
+    preflight_free(memory, orders->destination,
+                   orders->count * sizeof(*orders->destination));
     memset(orders, 0, sizeof(*orders));
 }
 
@@ -696,6 +765,22 @@ static int entry_ancestor_conflict(const EntryOrders *orders,
     return found != NULL && found->kind != SIDECAR_KIND_DIRECTORY;
 }
 
+/* Accessors adapting orders->destination (a sorted PreflightEntry* array)
+ * to the shared D34 ancestor-conflict walk in portable_restore_shared.c. */
+static const char *preflight_destination_view_get(const void *entries,
+                                                   size_t index)
+{
+    const PreflightEntry *const *items = entries;
+    return items[index]->destination;
+}
+
+static int preflight_destination_view_is_directory(const void *entries,
+                                                    size_t index)
+{
+    const PreflightEntry *const *items = entries;
+    return items[index]->kind == SIDECAR_KIND_DIRECTORY;
+}
+
 static int analyze_entries(PreflightMemory *memory,
                            PreflightEntries *entries,
                            EntryOrders *orders,
@@ -712,18 +797,27 @@ static int analyze_entries(PreflightMemory *memory,
     size_t size = entries->count * sizeof(*orders->logical);
     orders->logical = preflight_alloc(memory, size);
     orders->physical = preflight_alloc(memory, size);
-    if (orders->logical == NULL || orders->physical == NULL)
+    int has_destinations = entries->items[0].destination != NULL;
+    if (has_destinations)
+        orders->destination = preflight_alloc(memory, size);
+    if (orders->logical == NULL || orders->physical == NULL ||
+        (has_destinations && orders->destination == NULL))
         return -1;
     orders->count = entries->count;
     for (size_t index = 0; index < entries->count; index++)
     {
         orders->logical[index] = &entries->items[index];
         orders->physical[index] = &entries->items[index];
+        if (has_destinations)
+            orders->destination[index] = &entries->items[index];
     }
     qsort(orders->logical, orders->count, sizeof(*orders->logical),
           logical_order_compare);
     qsort(orders->physical, orders->count, sizeof(*orders->physical),
           physical_order_compare);
+    if (has_destinations)
+        qsort(orders->destination, orders->count,
+              sizeof(*orders->destination), destination_order_compare);
 
     for (size_t index = 1; index < orders->count; index++)
     {
@@ -762,6 +856,30 @@ static int analyze_entries(PreflightMemory *memory,
         PreflightEntry *current = orders->physical[index];
         if (entry_ancestor_conflict(orders, current, 1))
             report_violation(report, current->root_index, current->logical);
+    }
+    if (has_destinations)
+    {
+        for (size_t index = 1; index < orders->count; index++)
+        {
+            PreflightEntry *previous = orders->destination[index - 1U];
+            PreflightEntry *current = orders->destination[index];
+            if (strcmp(previous->destination, current->destination) == 0)
+                report_violation(report, current->root_index,
+                                 current->logical);
+        }
+        DestinationView view = {
+            .entries = orders->destination,
+            .count = orders->count,
+            .get_destination = preflight_destination_view_get,
+            .is_directory = preflight_destination_view_is_directory,
+        };
+        for (size_t index = 0; index < orders->count; index++)
+        {
+            PreflightEntry *current = orders->destination[index];
+            if (destination_view_ancestor_conflict(&view, current->destination))
+                report_violation(report, current->root_index,
+                                 current->logical);
+        }
     }
     return 0;
 }
@@ -1110,6 +1228,7 @@ int portable_restore_preflight_at(
         .report = report,
         .entries = &entries,
         .destination_home_fd = request->destination_home_fd,
+        .destination_home_path = request->destination_home_path,
         .destination_xdg_dirs = request->destination_xdg_dirs
     };
     if (collection_validate_manifest(&collection) != 0)

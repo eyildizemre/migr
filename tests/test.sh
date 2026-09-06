@@ -464,6 +464,99 @@ test_dry_run() {
     fi
 }
 
+test_conf_public_wiring() {
+    echo -e "${BLUE}::${NC} Phase 2b: conf public command and automatic loading"
+
+    local config_dir="$HOME/.config/migr"
+    local config_file="$config_dir/migr.conf"
+    if [ -e "$config_file" ] || [ -e "$config_dir" ]; then
+        echo -e "  ${RED}✗${NC} Scoped report/dry-run created configuration as a side effect."
+        exit 1
+    fi
+    echo -e "  ${GREEN}✓${NC} Scoped report and backup preview leave missing configuration absent."
+
+    EDITOR=true VISUAL= ../migr conf
+    assert_file_exists "$config_file"
+    if [ "$(stat -c '%a' "$config_dir")" = "700" ] &&
+       [ "$(stat -c '%a' "$config_file")" = "600" ] &&
+       grep -q '^\[critical\]$' "$config_file" &&
+       grep -q '^\[comprehensive\]$' "$config_file"; then
+        echo -e "  ${GREEN}✓${NC} First conf creates the private empty template."
+    else
+        echo -e "  ${RED}✗${NC} First conf did not create the expected private template."
+        exit 1
+    fi
+
+    assert_fails_with "Error: 'conf' takes no arguments." ../migr conf extra
+    assert_fails_with "Error: 'conf' does not accept backup/report options." ../migr conf -v
+    assert_succeeds_with "Commands:" ../migr conf --help
+
+    cat > "$config_file" <<'EOF'
+[critical]
+    [exclude]
+Downloads
+EOF
+    local report_output dry_output
+    report_output=$(../migr report --critical -v)
+    assert_contains "$report_output" "Scope config: $config_file (1 active rule)"
+    assert_not_contains "$report_output" "($HOME/Downloads)"
+    dry_output=$(../migr backup "$BACKUP_DIR" --dry-run 2>&1)
+    assert_contains "$dry_output" "Scope config: $config_file (1 active rule)"
+    assert_contains "$dry_output" "Selection policy"
+    assert_contains "$dry_output" "Excludes: $HOME/Downloads"
+
+    cat > "$config_file" <<'EOF'
+[critical]
+broken-value
+EOF
+    assert_fails_with "path outside include/exclude section" ../migr
+    assert_fails_with "path outside include/exclude section" ../migr report --comprehensive
+
+    local blocked_dest="$TEST_DIR/conf-blocked-dest"
+    assert_fails_with "path outside include/exclude section" ../migr backup "$blocked_dest"
+    if [ -e "$blocked_dest" ]; then
+        echo -e "  ${RED}✗${NC} Malformed config reached destination mutation."
+        exit 1
+    fi
+    echo -e "  ${GREEN}✓${NC} Malformed config fails scoped backup before destination creation."
+
+    local explicit_source="$TEST_DIR/conf-explicit-source"
+    local explicit_dest="$TEST_DIR/conf-explicit-dest"
+    mkdir -p "$explicit_source" "$explicit_dest"
+    printf 'config bypass\n' > "$explicit_source/file.txt"
+    ../migr backup "$explicit_dest" "$explicit_source" >/dev/null
+    local explicit_container
+    explicit_container=$(sole_final_container "$explicit_dest")
+    assert_succeeds_with "Dry run mode enabled" ../migr restore "$explicit_container" --dry-run
+    assert_succeeds_with "Commands:" ../migr --help
+
+    set +e
+    EDITOR=true VISUAL= ../migr conf >/dev/null 2>&1
+    local invalid_conf_rc=$?
+    set -e
+    if [ "$invalid_conf_rc" -ne 0 ]; then
+        echo -e "  ${GREEN}✓${NC} conf opens an existing invalid file and validates it after the editor exits."
+    else
+        echo -e "  ${RED}✗${NC} conf accepted invalid syntax after editing."
+        exit 1
+    fi
+
+    cat > "$config_file" <<'EOF'
+# Includes in critical also apply to comprehensive; do not repeat them.
+# Excludes apply only to their own scope. Repeat them to exclude from both.
+# Excludes win over includes. Paths are HOME-relative unless absolute.
+[critical]
+    [include]
+
+    [exclude]
+
+[comprehensive]
+    [include]
+
+    [exclude]
+EOF
+}
+
 test_backup() {
     echo -e "${BLUE}::${NC} Phase 3: backup"
 
@@ -2080,6 +2173,7 @@ echo -e "${BLUE}migr integration tests${NC}"
 setup
 test_report
 test_dry_run
+test_conf_public_wiring
 test_backup
 test_restore
 test_packages

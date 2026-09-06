@@ -53,6 +53,7 @@ git config core.hooksPath hooks
 ./migr report [--critical | --comprehensive] [-s] [--max-depth=<N>]
 ./migr backup <PATH>
 ./migr restore <SOURCE>
+./migr conf
 ```
 
 ## Commands
@@ -61,8 +62,24 @@ git config core.hooksPath hooks
 report [SCOPE]        Show backup analysis report (default when no command given)
 backup <PATH>         Create a resumable backup container under PATH
 restore <SOURCE>      Restore files and packages from a backup at SOURCE
+conf                  Edit persistent critical/comprehensive selection rules
 help                  Show help
 ```
+
+`migr conf` opens the persistent scope configuration in the first nonempty
+`EDITOR` or `VISUAL` (falling back to `vi`). The file is
+`$XDG_CONFIG_HOME/migr/migr.conf` when `XDG_CONFIG_HOME` is an absolute path;
+otherwise it is `$HOME/.config/migr/migr.conf`. On first use, `conf` creates a
+commented empty template. Ordinary `report` and scoped `backup` commands never
+create the file: a missing or empty config simply keeps the built-in selection.
+
+The config has `critical` and `comprehensive` include/exclude sections. Critical
+includes also apply to comprehensive; excludes apply only to their own scope,
+and an exclusion wins over an include. Paths are relative to `$HOME` unless
+absolute. Scoped report, size estimation, preflight, capture, and resume all use
+the same compiled selection. Explicit-path backups ignore this config, and
+restore follows the selection recorded in the backup manifest rather than the
+target machine's current config.
 
 Restore is intended to run soon after a fresh distribution install. If the
 target has since accumulated its own files at the same paths, the result may
@@ -128,6 +145,12 @@ Backup-only explicit paths:
 
 **Explicit paths:** Exactly what you specify — no assumptions made.
 
+The critical and comprehensive sets can be extended or pruned with `migr conf`.
+Configured exclusions prune whole subtrees from report, estimation, preflight,
+and capture; configured includes retain their restore mapping when they overlap
+localized XDG directories. Dry-run shows the active selection policy before any
+backup is created.
+
 **Dotfiles (all scopes except explicit paths):** .ssh, .gnupg, .gitconfig, .bashrc, .profile
 
 **Browser Profiles (all scopes except explicit paths):** Firefox, Chrome, Chromium, Brave, Vivaldi, Edge, Opera — only the profiles present on the system are copied.
@@ -168,7 +191,11 @@ migr_backup_YYYYMMDD_HHMMSS[-N]/
 ```
 
 `manifest.txt` records the version, representation, scope, root table, and stable source
-identity when one is available. With `--include-self`, it also records the bundled
+identity when one is available. Backups with filtered or delegated selections use
+manifest VERSION=2 to persist the source-home address and active exclusions, so
+restore can reconstruct the same ownership and destination map without reading
+the current `migr.conf`. Unfiltered source-disjoint backups remain VERSION=1 for
+compatibility. With `--include-self`, the manifest also records the bundled
 binary's architecture, for example `ARCH=x86_64`. With `--include-network-config`, it
 records `NETWORK_CONFIG=1` when at least one supported backend was found, even if
 its directory was empty. Older unversioned and manifest-less backups remain readable

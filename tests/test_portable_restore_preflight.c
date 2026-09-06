@@ -258,6 +258,33 @@ static void fixture_close(Fixture *fixture)
     remove_tree(fixture->base);
 }
 
+static int write_v2_nested_manifest(Fixture *fixture, ManifestRoot roots[2])
+{
+    memset(roots, 0, 2U * sizeof(*roots));
+    strcpy(roots[0].id, "HOME");
+    roots[0].policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(roots[0].payload_path, "HOME");
+    roots[0].has_restore_path = 1;
+
+    strcpy(roots[1].id, "CHILD");
+    roots[1].policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(roots[1].payload_path, "CHILD");
+    strcpy(roots[1].source_path, "/source/home/Child");
+    roots[1].has_restore_path = 1;
+    strcpy(roots[1].restore_path, "Documents");
+
+    Manifest manifest = {
+        .version = MANIFEST_SELECTION_VERSION,
+        .representation = CLONE_PORTABLE_SIDECAR,
+        .scope = MANIFEST_SCOPE_CRITICAL,
+        .sidecar_version = SIDECAR_VERSION,
+        .root_count = 2,
+        .roots = roots
+    };
+    strcpy(manifest.source_home, "/source/home");
+    return manifest_write_v1_at(fixture->container_fd, &manifest);
+}
+
 static int append_entries(SidecarLog *log, const SidecarEntry *entries,
                           size_t count)
 {
@@ -398,7 +425,8 @@ static int run_preflight(Fixture *fixture, PortableRestorePreflightReport *repor
     PortableRestoreRequest request = {
         .source_container_fd = fixture->container_fd,
         .manifest = &manifest,
-        .destination_home_fd = fixture->home_fd
+        .destination_home_fd = fixture->home_fd,
+        .destination_home_path = fixture->home
     };
     portable_restore_preflight_report_init(report);
     int result = portable_restore_preflight_at(&request, report);
@@ -1326,6 +1354,75 @@ static void test_root_lookup_wedge(void)
     fixture_close(&fixture);
 }
 
+static void test_v2_selection_ownership_and_destination_collisions(void)
+{
+    printf(BLUE "::" NC " VERSION=2 ownership and combined destination mapping\n");
+
+    ManifestRoot bootstrap = root_for("ROOT", "ROOT", "restored");
+    ManifestRoot roots[2];
+    Fixture fixture;
+    int opened = fixture_open(&fixture, "v2-ownership", &bootstrap, 1);
+    check(opened == 0, "VERSION=2 ownership fixture is created");
+    if (opened != 0)
+        return;
+    check(write_v2_nested_manifest(&fixture, roots) == 0,
+          "VERSION=2 ownership manifest is written");
+    if (mkdirat(fixture.data_fd, "HOME", 0700) != 0 ||
+        mkdirat(fixture.data_fd, "CHILD", 0700) != 0)
+        fatal("could not create VERSION=2 payload roots");
+    int home_payload_fd = openat(fixture.data_fd, "HOME",
+                                 O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (home_payload_fd < 0 || mkdirat(home_payload_fd, "Child", 0700) != 0)
+        fatal("could not create delegated wrong-root payload");
+    if (close(home_payload_fd) != 0)
+        fatal("could not close VERSION=2 HOME payload");
+    SidecarEntry ownership_entries[] = {
+        entry_for("HOME", "", "", SIDECAR_KIND_DIRECTORY, 0),
+        entry_for("HOME", "Child", "Child", SIDECAR_KIND_DIRECTORY, 0),
+        entry_for("CHILD", "", "", SIDECAR_KIND_DIRECTORY, 0)
+    };
+    check(write_sidecar(&fixture, ownership_entries, 3) == 0,
+          "VERSION=2 ownership sidecar is committed");
+    PortableRestorePreflightReport report;
+    int result = run_preflight(&fixture, &report);
+    check(result != 0 && report.violation_count > 0,
+          "a delegated source entry in the parent root is refused");
+    portable_restore_preflight_report_free(&report);
+    fixture_close(&fixture);
+
+    opened = fixture_open(&fixture, "v2-destination", &bootstrap, 1);
+    check(opened == 0, "VERSION=2 destination-collision fixture is created");
+    if (opened != 0)
+        return;
+    check(write_v2_nested_manifest(&fixture, roots) == 0,
+          "VERSION=2 destination-collision manifest is written");
+    if (mkdirat(fixture.data_fd, "HOME", 0700) != 0 ||
+        mkdirat(fixture.data_fd, "CHILD", 0700) != 0)
+        fatal("could not create VERSION=2 collision roots");
+    home_payload_fd = openat(fixture.data_fd, "HOME",
+                             O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (home_payload_fd < 0 || mkdirat(home_payload_fd, "Documents", 0700) != 0)
+        fatal("could not create VERSION=2 collision payload");
+    if (close(home_payload_fd) != 0)
+        fatal("could not close VERSION=2 collision payload");
+    SidecarEntry collision_entries[] = {
+        entry_for("HOME", "", "", SIDECAR_KIND_DIRECTORY, 0),
+        entry_for("HOME", "Documents", "Documents", SIDECAR_KIND_DIRECTORY, 0),
+        entry_for("CHILD", "", "", SIDECAR_KIND_DIRECTORY, 0)
+    };
+    check(write_sidecar(&fixture, collision_entries, 3) == 0,
+          "VERSION=2 destination-collision sidecar is committed");
+    write_file_at(fixture.home_fd, "sentinel", "untouched");
+    result = run_preflight(&fixture, &report);
+    char sentinel[PATH_MAX];
+    fixture_path(sentinel, sizeof(sentinel), fixture.home, "/sentinel");
+    check(result != 0 && report.violation_count > 0 &&
+              file_equals(sentinel, "untouched"),
+          "two selected entries mapping to one destination are refused without mutation");
+    portable_restore_preflight_report_free(&report);
+    fixture_close(&fixture);
+}
+
 int main(void)
 {
     test_valid_and_profiles();
@@ -1343,6 +1440,7 @@ int main(void)
     test_overlapping_manifest_roots();
     test_overlapping_manifest_roots_wedge();
     test_root_lookup_wedge();
+    test_v2_selection_ownership_and_destination_collisions();
     if (failures != 0)
     {
         printf(RED "%d portable restore preflight test(s) failed" NC "\n",

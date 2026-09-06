@@ -308,7 +308,15 @@ static int resolve_selection_candidate(const char *home, const char *raw,
     struct stat st;
     if (lstat(capture_path, &st) < 0)
         return errno == ENOENT || errno == ENOTDIR ? 0 : -1;
-    return root_type_allowed(st.st_mode) && selection_root_readable(capture_path, st.st_mode) ? 1 : -1;
+    // Only built-in roots resolve here (see build_builtin_roots below); a
+    // built-in that exists but cannot be opened is still carried into the
+    // plan (docs/DECISIONS.md D34: missing optional built-ins are skippable,
+    // but D34 says nothing about an inaccessible one) and is left for the
+    // metadata preflight, which already reports the specific object that
+    // could not be read. Configured includes apply selection_root_readable()
+    // themselves in selection_plan_build(), where an unreadable include must
+    // fail the build.
+    return root_type_allowed(st.st_mode) ? 1 : -1;
 }
 
 static int build_builtin_roots(const char *home_real, BackupMode mode, RootBuilder *rb,
@@ -509,14 +517,16 @@ static int build_explicit_roots(const char *home_real, const char *const *explic
 // the ancestor of everything else; a leaf-symlink root's own capture_path
 // (never resolved to its target) is what participates here, so a symlink
 // never manufactures a false overlap with whatever it points at.
+//
+// This is path_covers() minus equality: for a == "/", path_covers(a, b) is
+// true whenever b is absolute, and excluding b == "/" is exactly excluding
+// a == b. For a != "/", path_covers(a, b) with a == b takes the equality
+// branch, and with a != b takes the prefix branch, which already demands
+// b[strlen(a)] == '/' -- the same condition this function checks directly.
+// So strcmp(a, b) != 0 is the only extra test equality-exclusion needs.
 static int is_ancestor(const char *a, const char *b)
 {
-    if (strcmp(a, "/") == 0)
-        return strcmp(b, "/") != 0;
-    size_t alen = strlen(a);
-    if (strncmp(b, a, alen) != 0)
-        return 0;
-    return b[alen] == '/';
+    return path_covers(a, b) && strcmp(a, b) != 0;
 }
 
 static int validate_no_duplicates_or_overlap(const BackupPlanRoot *roots, int count)

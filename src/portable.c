@@ -2776,91 +2776,16 @@ static int request_selection_valid(const PortableCaptureRequest *request)
         if (request->roots[index].selection != &plan->roots[index] ||
             !root_spec_valid(&request->roots[index]))
             return 0;
+    /* Shallow bounds/identity checks above are not a substitute for the deep
+     * structural checks (parent indices, delegated/excluded consistency,
+     * root ordering, payload-path disjointness) that native entry points
+     * require via selection_plan_validate(). Every portable entry point
+     * routes through this function, so this is the single place to close
+     * that gap rather than adding the call at each call site. */
+    if (selection_plan_validate(plan) < 0)
+        return 0;
     return 1;
 }
-
-static int selection_source_relative(const SelectionPlan *plan,
-                                     const SelectionRoot *root,
-                                     const char **relative)
-{
-    if (plan == NULL || root == NULL || relative == NULL)
-        return 0;
-    const char *home = plan->home;
-    const char *path = root->root.capture_path;
-    size_t home_length = strlen(home);
-    if (strcmp(home, path) == 0) {
-        *relative = "";
-        return 1;
-    }
-    if (strncmp(home, path, home_length) != 0 ||
-        path[home_length] != '/')
-        return 0;
-    *relative = path + home_length + 1U;
-    return 1;
-}
-
-static int build_selection_manifest(const SelectionPlan *plan,
-                                    Manifest *manifest)
-{
-    if (plan == NULL || manifest == NULL)
-        return -1;
-    memset(manifest, 0, sizeof(*manifest));
-    manifest->version = MANIFEST_CURRENT_VERSION;
-    manifest->scope = plan->scope;
-    manifest->root_count = (int)plan->root_count;
-    for (size_t index = 0; index < plan->root_count; index++)
-        if (plan->roots[index].parent >= 0)
-            manifest->version = MANIFEST_SELECTION_VERSION;
-    if (plan->excludes.count != 0)
-        manifest->version = MANIFEST_SELECTION_VERSION;
-
-    if (plan->root_count != 0) {
-        manifest->roots = calloc(plan->root_count, sizeof(*manifest->roots));
-        if (manifest->roots == NULL)
-            goto fail;
-    }
-    if (manifest->version == MANIFEST_SELECTION_VERSION) {
-        if (copy_text(manifest->source_home, sizeof(manifest->source_home),
-                      plan->home) != 0 ||
-            plan->excludes.count > MANIFEST_MAX_EXCLUDES)
-            goto fail;
-        manifest->exclude_count = plan->excludes.count;
-        if (manifest->exclude_count != 0) {
-            manifest->excludes = calloc(manifest->exclude_count,
-                                        sizeof(*manifest->excludes));
-            if (manifest->excludes == NULL)
-                goto fail;
-        }
-        for (size_t index = 0; index < manifest->exclude_count; index++) {
-            manifest->excludes[index] = strdup(plan->excludes.paths[index]);
-            if (manifest->excludes[index] == NULL)
-                goto fail;
-        }
-    }
-    for (size_t index = 0; index < plan->root_count; index++) {
-        const SelectionRoot *selected = &plan->roots[index];
-        manifest->roots[index] = selected->root.manifest_root;
-        if (manifest->version == MANIFEST_SELECTION_VERSION) {
-            const char *source = selected->root.capture_path;
-            const char *relative = NULL;
-            if (manifest->roots[index].policy == ROOT_POLICY_HOME_RELATIVE &&
-                selection_source_relative(plan, selected, &relative))
-                source = relative;
-            if (copy_text(manifest->roots[index].source_path,
-                          sizeof(manifest->roots[index].source_path),
-                          source) != 0)
-                goto fail;
-        }
-    }
-    if (!manifest_selection_valid(manifest))
-        goto fail;
-    return 0;
-
-fail:
-    manifest_free(manifest);
-    return -1;
-}
-
 
 static int build_manifest(const PortableCaptureRequest *request,
                           Manifest *manifest)
@@ -2868,7 +2793,7 @@ static int build_manifest(const PortableCaptureRequest *request,
     if (!request_selection_valid(request))
         return -1;
     if (request->selection_plan != NULL) {
-        if (build_selection_manifest(request->selection_plan, manifest) != 0)
+        if (selection_plan_manifest(request->selection_plan, manifest) != 0)
             return -1;
         manifest->representation = CLONE_PORTABLE_SIDECAR;
         manifest->sidecar_version = SIDECAR_VERSION;

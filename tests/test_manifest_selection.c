@@ -158,23 +158,6 @@ int main(void)
     CHECK(manifest_read_v1("backup", &intact) == MANIFEST_STATUS_VALID);
     CHECK(manifest_resume_identity_compare(&m, &intact) == MANIFEST_IDENTITY_EQUAL);
     manifest_free(&intact);
-    FILE *diagnostic = tmpfile();
-    int saved_stderr = dup(STDERR_FILENO);
-    CHECK(diagnostic != NULL && saved_stderr >= 0);
-    if (!diagnostic || saved_stderr < 0) exit(1);
-    CHECK(fflush(stderr) == 0);
-    CHECK(dup2(fileno(diagnostic), STDERR_FILENO) >= 0);
-    dry_run = 1;
-    CHECK(restore("backup") != 0);
-    dry_run = 0;
-    CHECK(fflush(stderr) == 0);
-    CHECK(dup2(saved_stderr, STDERR_FILENO) >= 0);
-    CHECK(close(saved_stderr) == 0);
-    CHECK(fseek(diagnostic, 0, SEEK_SET) == 0);
-    char message[1024] = {0};
-    CHECK(fread(message, 1, sizeof(message) - 1, diagnostic) > 0);
-    CHECK(strstr(message, "cannot replay filtered backup selections") != NULL);
-    CHECK(fclose(diagnostic) == 0);
     /* Policy comparison precedes the zero-root fast path. */
     manifest_free(&m); manifest_free(&same); manifest_free(&changed);
     CHECK(mkdir("home", 0700) == 0);

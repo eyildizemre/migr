@@ -28,6 +28,7 @@ typedef struct {
     size_t hardlink_ref_root_index;
     const SidecarEntry *hardlink_ref_entry;
     char destination[PATH_MAX];
+    char *absolute_destination;
     size_t depth;
 } ReplayEntry;
 
@@ -53,6 +54,7 @@ typedef struct {
     const SidecarLog *sidecar;
     int data_fd;
     int destination_home_fd;
+    const char *destination_home_path;
     const char * const *destination_xdg_dirs;
     int xdg_anchor_fd[XDG_KEY_COUNT];
     char xdg_anchor_prefix[XDG_KEY_COUNT][NAME_MAX + 1U];
@@ -189,6 +191,13 @@ static void replay_collection_free(ReplayCollection *collection)
         (void)close(collection->payload_cache.fd);
         collection->payload_cache.fd = -1;
     }
+    for (size_t index = 0; index < collection->count; index++)
+        preflight_free(&collection->memory,
+                       collection->items[index].absolute_destination,
+                       collection->items[index].absolute_destination == NULL
+                           ? 0
+                           : strlen(collection->items[index]
+                                        .absolute_destination) + 1U);
     preflight_free(&collection->memory, collection->items,
                    collection->capacity * sizeof(*collection->items));
     collection->items = NULL;
@@ -199,13 +208,20 @@ static void replay_collection_free(ReplayCollection *collection)
 }
 
 static int replay_manifest_valid(const Manifest *manifest,
-                                 const char * const *xdg_dirs)
+                                 const char * const *xdg_dirs,
+                                 const char *destination_home)
 {
-    if (manifest == NULL || manifest->version != MANIFEST_CURRENT_VERSION ||
+    if (manifest == NULL || !manifest_selection_valid(manifest) ||
         manifest->representation != CLONE_PORTABLE_SIDECAR ||
         manifest->sidecar_version != SIDECAR_VERSION ||
         manifest->root_count < 0 || manifest->root_count > MANIFEST_MAX_ROOTS ||
         (manifest->root_count != 0 && manifest->roots == NULL))
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    if (manifest->version == MANIFEST_SELECTION_VERSION &&
+        (destination_home == NULL || destination_home[0] != '/'))
     {
         errno = EINVAL;
         return -1;
@@ -393,6 +409,17 @@ static int replay_collect_entry(const SidecarLiveView *view, void *argument)
         return 1;
     }
 
+    char logical[PATH_MAX];
+    replay_copy_bytes(logical, sizeof(logical), entry->logical_path);
+    if (entry->logical_path.length >= sizeof(logical) ||
+        manifest_entry_owned(collection->manifest, (int)root_index,
+                             logical) != 1)
+    {
+        replay_report_failure(collection->report, collection->manifest,
+                              root_index, entry->logical_path);
+        return 1;
+    }
+
     const ManifestRoot *root = &collection->manifest->roots[root_index];
     if ((entry->kind == SIDECAR_KIND_SYMLINK ||
          entry->kind == SIDECAR_KIND_HARDLINK) &&
@@ -430,6 +457,19 @@ static int replay_collect_entry(const SidecarLiveView *view, void *argument)
                                   root_index, entry->logical_path);
             return 1;
         }
+        char reference_logical[PATH_MAX];
+        replay_copy_bytes(reference_logical, sizeof(reference_logical),
+                          referenced.entry->logical_path);
+        if (referenced.entry->logical_path.length >=
+                sizeof(reference_logical) ||
+            manifest_entry_owned(collection->manifest,
+                                 (int)hardlink_ref_root_index,
+                                 reference_logical) != 1)
+        {
+            replay_report_failure(collection->report, collection->manifest,
+                                  root_index, entry->logical_path);
+            return 1;
+        }
         char reference_relative[PATH_MAX];
         if (replay_hardlink_ref_relative(
                 &collection->manifest->roots[hardlink_ref_root_index],
@@ -443,10 +483,7 @@ static int replay_collect_entry(const SidecarLiveView *view, void *argument)
         hardlink_ref_entry = referenced.entry;
     }
 
-    char logical[PATH_MAX];
-    replay_copy_bytes(logical, sizeof(logical), entry->logical_path);
-    if (entry->logical_path.length >= sizeof(logical) ||
-        entry->physical_path.length >= PATH_MAX)
+    if (entry->physical_path.length >= PATH_MAX)
     {
         replay_report_failure(collection->report, collection->manifest,
                               root_index, entry->logical_path);
@@ -506,10 +543,102 @@ static int replay_collect_entry(const SidecarLiveView *view, void *argument)
             }
     }
     replay->root_index = root_index;
-    replay->depth = relative_path_depth(replay->destination);
+    if (collection->manifest->version == MANIFEST_SELECTION_VERSION)
+    {
+        char absolute_destination[PATH_MAX];
+        if (destination_absolute_path_build(
+                root, logical, collection->destination_xdg_dirs,
+                collection->destination_home_path, absolute_destination,
+                sizeof(absolute_destination)) != 0)
+        {
+            replay_report_failure(collection->report, collection->manifest,
+                                  root_index, entry->logical_path);
+            return 1;
+        }
+        size_t absolute_size = strlen(absolute_destination) + 1U;
+        replay->absolute_destination =
+            preflight_alloc(&collection->memory, absolute_size);
+        if (replay->absolute_destination == NULL)
+        {
+            replay_report_failure(collection->report, collection->manifest,
+                                  root_index, entry->logical_path);
+            return 1;
+        }
+        memcpy(replay->absolute_destination, absolute_destination,
+               absolute_size);
+        replay->depth = relative_path_depth(absolute_destination);
+    }
+    else
+        replay->depth = relative_path_depth(replay->destination);
     collection->count++;
     if (collection->report->live_count != SIZE_MAX)
         collection->report->live_count++;
+    return 0;
+}
+
+static int replay_absolute_compare(const void *left, const void *right)
+{
+    const ReplayEntry *a = left;
+    const ReplayEntry *b = right;
+    return strcmp(a->absolute_destination, b->absolute_destination);
+}
+
+/* Accessors adapting collection->items (in-place sorted by
+ * replay_absolute_compare) to the shared D34 ancestor-conflict walk in
+ * portable_restore_shared.c. */
+static const char *replay_destination_view_get(const void *entries,
+                                               size_t index)
+{
+    const ReplayEntry *items = entries;
+    return items[index].absolute_destination;
+}
+
+static int replay_destination_view_is_directory(const void *entries,
+                                                 size_t index)
+{
+    const ReplayEntry *items = entries;
+    return items[index].entry->kind == SIDECAR_KIND_DIRECTORY;
+}
+
+static int replay_selection_destinations_valid(ReplayCollection *collection)
+{
+    if (collection->manifest->version != MANIFEST_SELECTION_VERSION ||
+        collection->count == 0)
+        return 0;
+
+    qsort(collection->items, collection->count, sizeof(*collection->items),
+          replay_absolute_compare);
+    for (size_t index = 1; index < collection->count; index++)
+        if (!strcmp(collection->items[index - 1U].absolute_destination,
+                    collection->items[index].absolute_destination))
+        {
+            replay_report_failure(collection->report, collection->manifest,
+                                  collection->items[index].root_index,
+                                  collection->items[index].entry->logical_path);
+            return -1;
+        }
+
+    DestinationView view = {
+        .entries = collection->items,
+        .count = collection->count,
+        .get_destination = replay_destination_view_get,
+        .is_directory = replay_destination_view_is_directory,
+    };
+    for (size_t index = 0; index < collection->count; index++)
+    {
+        ReplayEntry *entry = &collection->items[index];
+        int conflict = destination_view_ancestor_conflict(
+            &view, entry->absolute_destination);
+        if (conflict < 0)
+            return -1;
+        if (conflict > 0)
+        {
+            replay_report_failure(collection->report, collection->manifest,
+                                  entry->root_index,
+                                  entry->entry->logical_path);
+            return -1;
+        }
+    }
     return 0;
 }
 
@@ -1515,7 +1644,8 @@ int portable_restore_replay_at(const PortableRestoreRequest *request,
     MetadataTimestampPolicy timestamp_policy;
     if (replay_timestamp_policy(request, &timestamp_policy) != 0 ||
         replay_manifest_valid(request->manifest,
-                              request->destination_xdg_dirs) != 0)
+                              request->destination_xdg_dirs,
+                              request->destination_home_path) != 0)
     {
         replay_report_failure(report, request->manifest, SIZE_MAX,
                               (SidecarBytes){0});
@@ -1526,6 +1656,7 @@ int portable_restore_replay_at(const PortableRestoreRequest *request,
         .manifest = request->manifest,
         .data_fd = -1,
         .destination_home_fd = request->destination_home_fd,
+        .destination_home_path = request->destination_home_path,
         .destination_xdg_dirs = request->destination_xdg_dirs,
         .timestamp_policy = timestamp_policy,
         .report = report,
@@ -1587,6 +1718,8 @@ int portable_restore_replay_at(const PortableRestoreRequest *request,
      * reports a sidecar-log condition, so neither has an honest
      * SidecarStatus to return. */
     int result = status == SIDECAR_STATUS_OK ? 0 : -1;
+    if (result == 0 && replay_selection_destinations_valid(&collection) != 0)
+        result = -1;
     /*
      * Pre-mutation xattr capability gate (D20 E-9). A single probe at the
      * destination home cannot observe a subtree on a different mount with

@@ -414,6 +414,60 @@ static void make_v1_manifest(Manifest *m, ManifestRoot *roots, int root_count)
     m->roots = roots;
 }
 
+static void make_v2_selection_manifest(Manifest *m, ManifestRoot roots[2])
+{
+    memset(m, 0, sizeof(*m));
+    memset(roots, 0, 2U * sizeof(*roots));
+
+    strcpy(roots[0].id, "CONFIG_0");
+    roots[0].policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(roots[0].payload_path, "CONFIG_0");
+    roots[0].has_restore_path = 1;
+
+    strcpy(roots[1].id, "XDG_DOCUMENTS_DIR");
+    roots[1].policy = ROOT_POLICY_XDG;
+    strcpy(roots[1].payload_path, "XDG_DOCUMENTS_DIR");
+    strcpy(roots[1].source_path, "/source/home/Belgeler");
+
+    m->version = MANIFEST_SELECTION_VERSION;
+    m->representation = CLONE_NATIVE_TREE;
+    m->scope = MANIFEST_SCOPE_CRITICAL;
+    strcpy(m->source_home, "/source/home");
+    m->root_count = 2;
+    m->roots = roots;
+}
+
+// Fills a restore_path[PATH_MAX] buffer with NAME_MAX-bounded components
+// (never ".", "..", or over NAME_MAX -- the same shape canonical_path() in
+// manifest.c requires of the real writer) packed as tightly as that
+// validation allows, so the string itself stays under PATH_MAX while still
+// being one join onto any real $HOME away from overflowing it.
+static void build_long_restore_path(char *out, size_t out_size)
+{
+    char segment[NAME_MAX + 1];
+    memset(segment, 'a', NAME_MAX);
+    segment[NAME_MAX] = '\0';
+
+    size_t pos = 0;
+    size_t limit = out_size - 2; // canonical_path rejects a string of exactly PATH_MAX
+    while (pos + 1 + NAME_MAX <= limit)
+    {
+        if (pos)
+            out[pos++] = '/';
+        memcpy(out + pos, segment, NAME_MAX);
+        pos += NAME_MAX;
+    }
+    size_t remaining = limit - pos;
+    if (remaining > 1)
+    {
+        out[pos++] = '/';
+        remaining--;
+        memcpy(out + pos, segment, remaining);
+        pos += remaining;
+    }
+    out[pos] = '\0';
+}
+
 static void write_file_mode(const char *path, const char *content, mode_t mode)
 {
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode);
@@ -693,6 +747,137 @@ static void test_v1_empty_restore_path_means_home_itself(void)
     check(rc == 0, "restore succeeds");
     check(strstr(output, "Would restore: EXPLICIT_0 -> ~\n") != NULL,
           "an empty restore_path previews as the home directory itself, not a trailing-slash address");
+
+    remove_tree(source);
+    remove_tree(home);
+}
+
+static void test_v2_selection_restore_refusals(void)
+{
+    printf(BLUE "::" NC " restore dispatch: VERSION=2 ownership and target-map refusals\n");
+
+    char source[PATH_MAX], home[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_v2_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_v2_home");
+    setenv("HOME", home, 1);
+
+    ManifestRoot roots[2];
+    Manifest manifest;
+    make_v2_selection_manifest(&manifest, roots);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write a valid VERSION=2 selection manifest");
+    write_payload_file(source, "data/CONFIG_0", "Belgeler", "wrong owner");
+    write_payload_file(source, "data/XDG_DOCUMENTS_DIR", "doc.txt", "selected child");
+
+    char output[8192];
+    int rc = run_restore_capturing(source, output, sizeof(output));
+    check(rc != 0 && strstr(output, "outside its recorded selection") != NULL,
+          "a delegated child planted in the parent payload is refused before replay");
+    remove_tree(source);
+
+    fresh_mkdtemp(source, sizeof(source), "dispatch_v2_collision");
+    make_v2_selection_manifest(&manifest, roots);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the VERSION=2 target-collision manifest");
+    write_payload_file(source, "data/CONFIG_0/Documents", "parent.txt", "parent mapping");
+    write_payload_file(source, "data/XDG_DOCUMENTS_DIR", "child.txt", "xdg mapping");
+
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    rc = run_restore_capturing(source, output, sizeof(output));
+    dry_run = previous_dry_run;
+    check(rc != 0 && strstr(output, "competing entries for restore destination") != NULL,
+          "distinct selected entries mapping to one target are refused before confirmation");
+
+    char documents[PATH_MAX];
+    join_path(documents, sizeof(documents), home, "Documents");
+    check(access(documents, F_OK) != 0,
+          "VERSION=2 target collision leaves the destination untouched");
+
+    remove_tree(source);
+    remove_tree(home);
+}
+
+static void test_v2_home_relative_restore_destination_too_long(void)
+{
+    printf(BLUE "::" NC " restore dispatch: VERSION=2 HOME_RELATIVE restore destination overflow names its root\n");
+
+    char source[PATH_MAX], home[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_v2_long_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_v2_long_home");
+    setenv("HOME", home, 1);
+
+    ManifestRoot roots[2];
+    Manifest manifest;
+    make_v2_selection_manifest(&manifest, roots);
+    build_long_restore_path(roots[0].restore_path, sizeof(roots[0].restore_path));
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write a VERSION=2 manifest whose HOME_RELATIVE root has a restore_path too long to join onto HOME");
+
+    write_payload_file(source, "data/CONFIG_0", "inside.txt", "home-relative-content");
+    write_payload_file(source, "data/XDG_DOCUMENTS_DIR", "doc.txt", "selected child");
+
+    char output[8192];
+    int rc = run_restore_capturing(source, output, sizeof(output));
+    check(rc != 0,
+          "restore refuses when a HOME_RELATIVE restore destination cannot be joined onto $HOME");
+    check(strstr(output, "Error: Restore destination for manifest root CONFIG_0 is too long") != NULL,
+          "the overflow names the offending manifest root instead of failing silently (P4)");
+
+    remove_tree(source);
+    remove_tree(home);
+}
+
+static void test_v2_selection_restore_nested_metadata_order(void)
+{
+    printf(BLUE "::" NC " restore dispatch: VERSION=2 nested-root directory metadata order\n");
+
+    char source[PATH_MAX], home[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_v2_metadata");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_v2_metadata_home");
+    setenv("HOME", home, 1);
+
+    ManifestRoot roots[2];
+    Manifest manifest;
+    make_v2_selection_manifest(&manifest, roots);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the nested VERSION=2 selection manifest");
+    write_payload_file(source, "data/CONFIG_0", "ordinary.txt", "home sibling");
+    write_payload_file(source, "data/XDG_DOCUMENTS_DIR", "doc.txt", "localized document");
+
+    char parent_payload[PATH_MAX], child_payload[PATH_MAX];
+    join_path(parent_payload, sizeof(parent_payload), source, "data/CONFIG_0");
+    join_path(child_payload, sizeof(child_payload), source, "data/XDG_DOCUMENTS_DIR");
+    check(chmod(parent_payload, 0711) == 0 && chmod(child_payload, 0750) == 0,
+          "fixture: set distinct root directory modes");
+    struct timespec parent_times[2] = {
+        { .tv_sec = 1700000800, .tv_nsec = 123456789 },
+        { .tv_sec = 1700000801, .tv_nsec = 234567890 }
+    };
+    struct timespec child_times[2] = {
+        { .tv_sec = 1700000810, .tv_nsec = 345678901 },
+        { .tv_sec = 1700000811, .tv_nsec = 456789012 }
+    };
+    check(utimensat(AT_FDCWD, parent_payload, parent_times, 0) == 0 &&
+              utimensat(AT_FDCWD, child_payload, child_times, 0) == 0,
+          "fixture: set distinct root directory timestamps");
+
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    char output[8192];
+    int rc = run_restore_capturing_with_input(source, "y\n", output, sizeof(output));
+    dry_run = previous_dry_run;
+
+    char documents[PATH_MAX];
+    join_path(documents, sizeof(documents), home, "Documents");
+    struct stat home_st, documents_st;
+    int metadata_ok = stat(home, &home_st) == 0 && stat(documents, &documents_st) == 0;
+    check(rc == 0 && metadata_ok &&
+              (home_st.st_mode & 07777) == 0711 &&
+              (documents_st.st_mode & 07777) == 0750 &&
+              home_st.st_mtim.tv_sec == parent_times[1].tv_sec &&
+              documents_st.st_mtim.tv_sec == child_times[1].tv_sec,
+          "child replay cannot perturb final HOME or child directory metadata");
 
     remove_tree(source);
     remove_tree(home);
@@ -1353,6 +1538,9 @@ int main(void)
 
     test_v1_restores_home_relative_and_xdg_reports_manual_native();
     test_v1_empty_restore_path_means_home_itself();
+    test_v2_selection_restore_refusals();
+    test_v2_home_relative_restore_destination_too_long();
+    test_v2_selection_restore_nested_metadata_order();
     test_v1_restore_space_preflight();
     test_network_config_backends(2, -1, -1, 0);
     test_network_config_backends(4, -1, -1, 0);

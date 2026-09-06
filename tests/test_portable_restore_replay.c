@@ -228,6 +228,33 @@ static void fixture_close(Fixture *fixture)
     remove_tree(fixture->base);
 }
 
+static int write_v2_nested_manifest(Fixture *fixture, ManifestRoot roots[2])
+{
+    memset(roots, 0, 2U * sizeof(*roots));
+    strcpy(roots[0].id, "HOME");
+    roots[0].policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(roots[0].payload_path, "HOME");
+    roots[0].has_restore_path = 1;
+
+    strcpy(roots[1].id, "CHILD");
+    roots[1].policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(roots[1].payload_path, "CHILD");
+    strcpy(roots[1].source_path, "/source/home/Child");
+    roots[1].has_restore_path = 1;
+    strcpy(roots[1].restore_path, "Documents");
+
+    Manifest manifest = {
+        .version = MANIFEST_SELECTION_VERSION,
+        .representation = CLONE_PORTABLE_SIDECAR,
+        .scope = MANIFEST_SCOPE_CRITICAL,
+        .sidecar_version = SIDECAR_VERSION,
+        .root_count = 2,
+        .roots = roots
+    };
+    strcpy(manifest.source_home, "/source/home");
+    return manifest_write_v1_at(fixture->container_fd, &manifest);
+}
+
 static int fixture_open(Fixture *fixture, ManifestRoot *root)
 {
     memset(fixture, 0, sizeof(*fixture));
@@ -405,6 +432,7 @@ static int run_preflight(Fixture *fixture)
         .source_container_fd = fixture->container_fd,
         .manifest = &manifest,
         .destination_home_fd = fixture->home_fd,
+        .destination_home_path = fixture->home,
         .destination_timestamp_policy = {
             .nsec_exact = 1,
             .configured = 1
@@ -437,6 +465,7 @@ static int run_replay_with_capture(
         .source_container_fd = fixture->container_fd,
         .manifest = &manifest,
         .destination_home_fd = fixture->home_fd,
+        .destination_home_path = fixture->home,
         .destination_timestamp_policy = {
             .nsec_exact = 1,
             .configured = 1
@@ -1427,6 +1456,69 @@ static void test_hardlink_toctou_race(void)
     fixture_close(&fixture);
 }
 
+static void test_v2_nested_root_replay_order(void)
+{
+    printf(BLUE "::" NC " VERSION=2 replay uses combined destination order across roots\n");
+
+    ManifestRoot bootstrap = root_for();
+    ManifestRoot roots[2];
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &bootstrap);
+    check(opened == 0, "VERSION=2 replay fixture is created");
+    if (opened != 0)
+        return;
+    check(write_v2_nested_manifest(&fixture, roots) == 0,
+          "VERSION=2 replay manifest is written");
+
+    make_dir_at(fixture.data_fd, "HOME", 0700);
+    make_dir_at(fixture.data_fd, "CHILD", 0700);
+    int home_payload_fd = openat(fixture.data_fd, "HOME",
+                                 O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int child_payload_fd = openat(fixture.data_fd, "CHILD",
+                                  O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (home_payload_fd < 0 || child_payload_fd < 0)
+        fatal("could not open VERSION=2 replay payload roots");
+    write_file_at(home_payload_fd, "home.txt", "home");
+    write_file_at(child_payload_fd, "child.txt", "child");
+    if (close(home_payload_fd) != 0 || close(child_payload_fd) != 0)
+        fatal("could not close VERSION=2 replay payload roots");
+
+    SidecarEntry entries[] = {
+        entry_for("HOME", "", "", SIDECAR_KIND_DIRECTORY, 0, 0711,
+                  1700000900, 1, 1700000901, 2),
+        entry_for("HOME", "home.txt", "home.txt", SIDECAR_KIND_REGULAR, 4, 0640,
+                  1700000902, 3, 1700000903, 4),
+        entry_for("CHILD", "", "", SIDECAR_KIND_DIRECTORY, 0, 0750,
+                  1700000910, 5, 1700000911, 6),
+        entry_for("CHILD", "child.txt", "child.txt", SIDECAR_KIND_REGULAR, 5, 0600,
+                  1700000912, 7, 1700000913, 8)
+    };
+    check(write_sidecar(&fixture, entries, 4, NULL, NULL) == 0,
+          "VERSION=2 replay sidecar is committed");
+    check(run_preflight(&fixture) == 0,
+          "VERSION=2 nested roots pass portable preflight");
+
+    PortableRestoreReplayReport report;
+    int result = run_replay(&fixture, &report);
+    char home_file[PATH_MAX], child_file[PATH_MAX], documents[PATH_MAX];
+    path_join(home_file, sizeof(home_file), fixture.home, "/home.txt");
+    path_join(child_file, sizeof(child_file), fixture.home, "/Documents/child.txt");
+    path_join(documents, sizeof(documents), fixture.home, "/Documents");
+    struct stat home_st, documents_st;
+    int metadata_ok = stat(fixture.home, &home_st) == 0 &&
+                      stat(documents, &documents_st) == 0;
+    check(result == 0 && report.failed_count == 0 &&
+              file_equals_noatime(home_file, "home") &&
+              file_equals_noatime(child_file, "child"),
+          "VERSION=2 replay maps both roots to their recorded target destinations");
+    check(metadata_ok && (home_st.st_mode & 07777) == 0711 &&
+              (documents_st.st_mode & 07777) == 0750 &&
+              home_st.st_mtim.tv_sec == 1700000901 &&
+              documents_st.st_mtim.tv_sec == 1700000911,
+          "directory metadata is finalized deepest-first across VERSION=2 roots");
+    fixture_close(&fixture);
+}
+
 static void test_copy_bytes_rejects_corruption(void)
 {
     printf(BLUE "::" NC " replay_copy_bytes rejects what it cannot "
@@ -1476,6 +1568,7 @@ int main(void)
     test_payload_swap();
     test_tombstone_skipped();
     test_hardlink_toctou_race();
+    test_v2_nested_root_replay_order();
     test_copy_bytes_rejects_corruption();
     printf("%s%s%s\n", failures == 0 ? GREEN : RED,
            failures == 0 ? "all portable restore replay tests passed" :

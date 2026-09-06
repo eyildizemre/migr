@@ -109,6 +109,22 @@ int path_join_n(char *buf, size_t size, const char *dir,
                 const char *name, size_t name_len);
 
 /**
+ * @brief Whether `parent` contains `path` at a path-component boundary,
+ * inclusive of equality.
+ *
+ * A pure string comparison over already-canonical absolute paths: no
+ * component is validated and nothing is resolved through the filesystem, so
+ * a leaf symlink's own path participates here rather than whatever it
+ * points at. "/" is treated as the ancestor of every other absolute path,
+ * which a naive prefix comparison gets wrong.
+ *
+ * Shared by selection matching (backup-time ownership), manifest replay
+ * validation, and restore-time destination overlap checks -- all three need
+ * exactly this rule and must not drift from each other.
+ */
+int path_covers(const char *parent, const char *path);
+
+/**
  * @brief Raises the process's open-file soft limit to its hard limit.
  *
  * Best-effort and silent: native hardlink capture holds one fd per unique

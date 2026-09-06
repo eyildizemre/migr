@@ -6,6 +6,7 @@
 #include "hash.h"
 #include "manifest.h"
 #include "sidecar.h"
+#include "utils.h"
 #include "xdg.h"
 
 #include <errno.h>
@@ -555,6 +556,32 @@ int destination_path_build(const ManifestRoot *root,
     return length >= 0 && (size_t)length < out_size ? 0 : -1;
 }
 
+int destination_absolute_path_build(
+    const ManifestRoot *root, const char *logical,
+    const char * const *xdg_dirs, const char *destination_home,
+    char *out, size_t out_size)
+{
+    if (destination_home == NULL || destination_home[0] != '/' ||
+        strnlen(destination_home, PATH_MAX) >= PATH_MAX)
+        return -1;
+
+    char mapped[PATH_MAX];
+    if (destination_path_build(root, logical, xdg_dirs, mapped,
+                               sizeof(mapped)) != 0)
+        return -1;
+    if (mapped[0] == '/')
+    {
+        int length = snprintf(out, out_size, "%s", mapped);
+        return length >= 0 && (size_t)length < out_size ? 0 : -1;
+    }
+    if (mapped[0] == '\0')
+    {
+        int length = snprintf(out, out_size, "%s", destination_home);
+        return length >= 0 && (size_t)length < out_size ? 0 : -1;
+    }
+    return path_join(out, out_size, destination_home, mapped);
+}
+
 int destination_relative_path_build(const char *prefix,
                                            const char *logical,
                                            char *out, size_t out_size)
@@ -672,4 +699,51 @@ int sidecar_is_complete_readonly(int container_fd)
     }
     errno = saved;
     return status == SIDECAR_STATUS_OK ? 0 : -1;
+}
+
+/* Binary search `view` for the index whose destination exactly equals
+ * `path`, or SIZE_MAX if absent. `view->entries` must already be sorted
+ * ascending by `get_destination`. */
+static size_t destination_view_find(const DestinationView *view,
+                                    const char *path)
+{
+    size_t left = 0;
+    size_t right = view->count;
+    while (left < right)
+    {
+        size_t middle = left + (right - left) / 2U;
+        int comparison = strcmp(
+            view->get_destination(view->entries, middle), path);
+        if (comparison < 0)
+            left = middle + 1U;
+        else
+            right = middle;
+    }
+    if (left == view->count ||
+        strcmp(view->get_destination(view->entries, left), path) != 0)
+        return SIZE_MAX;
+    return left;
+}
+
+int destination_view_ancestor_conflict(const DestinationView *view,
+                                       const char *path)
+{
+    if (view->count == 0 || path == NULL)
+        return 0;
+    char parent[PATH_MAX];
+    size_t length = strlen(path);
+    if (length >= sizeof(parent))
+        return -1;
+    memcpy(parent, path, length + 1U);
+    for (char *slash = parent + 1; (slash = strchr(slash, '/')) != NULL;
+         slash++)
+    {
+        char saved = *slash;
+        *slash = '\0';
+        size_t found = destination_view_find(view, parent);
+        *slash = saved;
+        if (found != SIZE_MAX && !view->is_directory(view->entries, found))
+            return 1;
+    }
+    return 0;
 }

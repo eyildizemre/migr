@@ -125,7 +125,31 @@ int main(void)
     CHECK(build(home, BACKUP_CRITICAL, "[critical]\n[include]\nmissing/../Documents\n", &a) < 0);
     CHECK(chmod("Downloads", 0000) == 0);
     if (geteuid() != 0)
+    {
         CHECK(build(home, BACKUP_CRITICAL, "[critical]\n[include]\nDownloads\n", &a) < 0);
+        /* D34: an unreadable *built-in* root is not the same as a missing
+         * one, but it must still be skippable at plan-build time -- only a
+         * configured include that survives to be unreadable fails the
+         * build. With no config at all, selection_plan_build() must succeed
+         * and carry the unreadable built-in through exactly as the legacy
+         * backup_plan_build() planner does, leaving the metadata preflight
+         * to report it later. */
+        SelectionPlan unreadable_builtin = {0};
+        CHECK(build(home, BACKUP_CRITICAL, "", &unreadable_builtin) == 0);
+        BackupPlan legacy_unreadable = {0};
+        CHECK(backup_plan_build(home, BACKUP_CRITICAL, NULL, &legacy_unreadable) == 0);
+        CHECK((size_t)legacy_unreadable.root_count == unreadable_builtin.root_count);
+        for (int i = 0; i < legacy_unreadable.root_count; i++)
+        {
+            int found = 0;
+            for (size_t j = 0; j < unreadable_builtin.root_count; j++)
+                if (!memcmp(&legacy_unreadable.roots[i], &unreadable_builtin.roots[j].root,
+                            sizeof(BackupPlanRoot))) found = 1;
+            CHECK(found);
+        }
+        backup_plan_free(&legacy_unreadable);
+        selection_plan_free(&unreadable_builtin);
+    }
     CHECK(build(home, BACKUP_CRITICAL, "[critical]\n[include]\nDownloads/private/deep\n[exclude]\nDownloads/private\nDownloads\n", &a) == 0);
     CHECK(find_root(&a, "Downloads") < 0 && a.excludes.count == 1);
     selection_plan_free(&a);

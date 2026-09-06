@@ -9,6 +9,8 @@ typedef enum {
     BACKUP_EXPLICIT_PATHS          /**< Only the caller-supplied paths; no dotfiles and no package list. */
 } BackupMode;
 
+struct SelectionPlan;
+
 /**
  * @brief Backs up files from HOME into a versioned container inside target.
  *
@@ -44,6 +46,11 @@ typedef enum {
  */
 int backup(const char *target, BackupMode mode, char **paths, int include_self,
            int include_network_config);
+/* Runs the same production lifecycle for an already compiled scoped selection.
+ * The caller retains ownership of plan for the whole call. */
+int backup_selection(const char *target, BackupMode mode,
+                     const struct SelectionPlan *plan, int include_self,
+                     int include_network_config);
 
 /* Shared by backup and restore destination free-space preflights. */
 int destination_block_size(int dest_fd, off_t *block_size);

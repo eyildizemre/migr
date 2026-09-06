@@ -1400,6 +1400,387 @@ static int validate_v1_payloads(int source_root_fd, const Manifest *m)
     return failed ? -1 : 0;
 }
 
+static int selection_payload_walk(const Manifest *manifest, int root_index,
+                                  int directory_fd, const char *relative)
+{
+    DIR *directory = fdopendir(directory_fd);
+    if (directory == NULL)
+    {
+        close(directory_fd);
+        return -1;
+    }
+
+    int failed = 0;
+    errno = 0;
+    for (;;)
+    {
+        struct dirent *entry = readdir(directory);
+        if (entry == NULL)
+            break;
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
+            continue;
+
+        char child[PATH_MAX];
+        if ((relative[0] == '\0' &&
+             snprintf(child, sizeof(child), "%s", entry->d_name) >=
+                 (int)sizeof(child)) ||
+            (relative[0] != '\0' &&
+             path_join(child, sizeof(child), relative, entry->d_name) != 0) ||
+            manifest_entry_owned(manifest, root_index, child) != 1)
+        {
+            print_error("Error: Manifest root %s contains an entry outside its recorded selection: %s\n",
+                        manifest->roots[root_index].id, entry->d_name);
+            failed = 1;
+            break;
+        }
+
+        struct stat st;
+        if (fstatat(dirfd(directory), entry->d_name, &st,
+                    AT_SYMLINK_NOFOLLOW) != 0)
+        {
+            failed = 1;
+            break;
+        }
+        if (!S_ISDIR(st.st_mode))
+            continue;
+
+        int child_fd = openat(dirfd(directory), entry->d_name,
+                              O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                                  O_NOATIME | O_CLOEXEC);
+        if (child_fd < 0 ||
+            selection_payload_walk(manifest, root_index, child_fd, child) != 0)
+        {
+            failed = 1;
+            break;
+        }
+        errno = 0;
+    }
+    if (!failed && errno != 0)
+        failed = 1;
+    if (closedir(directory) != 0)
+        failed = 1;
+    return failed ? -1 : 0;
+}
+
+static int selection_payload_open_at(int data_fd, const char *payload_path,
+                                     struct stat *out, int *directory_fd)
+{
+    if (data_fd < 0 || payload_path == NULL || payload_path[0] == '\0' ||
+        out == NULL || directory_fd == NULL ||
+        strnlen(payload_path, PATH_MAX) >= PATH_MAX)
+        return -1;
+
+    *directory_fd = -1;
+    char copy[PATH_MAX];
+    memcpy(copy, payload_path, strlen(payload_path) + 1U);
+    int parent_fd = dup_cloexec(data_fd);
+    if (parent_fd < 0)
+        return -1;
+
+    char *component = copy;
+    for (;;)
+    {
+        char *slash = strchr(component, '/');
+        if (slash != NULL)
+            *slash = '\0';
+        if (component[0] == '\0' || !strcmp(component, ".") ||
+            !strcmp(component, "..") || strlen(component) > NAME_MAX)
+        {
+            close(parent_fd);
+            return -1;
+        }
+
+        if (slash == NULL)
+            break;
+        int next_fd = openat(parent_fd, component,
+                             O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                                 O_NOATIME | O_CLOEXEC);
+        if (next_fd < 0)
+        {
+            close(parent_fd);
+            return -1;
+        }
+        close(parent_fd);
+        parent_fd = next_fd;
+        component = slash + 1;
+    }
+
+    int object_fd = openat(parent_fd, component,
+                           O_PATH | O_NOFOLLOW | O_CLOEXEC);
+    if (object_fd < 0 || fstat(object_fd, out) != 0)
+    {
+        if (object_fd >= 0)
+            close(object_fd);
+        close(parent_fd);
+        return -1;
+    }
+    close(object_fd);
+
+    if (S_ISDIR(out->st_mode))
+        *directory_fd = openat(parent_fd, component,
+                               O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                                   O_NOATIME | O_CLOEXEC);
+    close(parent_fd);
+    return S_ISDIR(out->st_mode) && *directory_fd < 0 ? -1 : 0;
+}
+
+static int validate_selection_payload_ownership(int source_root_fd,
+                                                const Manifest *manifest)
+{
+    if (manifest->version != MANIFEST_SELECTION_VERSION)
+        return 0;
+
+    int data_fd = openat(source_root_fd, "data",
+                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NOATIME |
+                             O_CLOEXEC);
+    if (data_fd < 0)
+        return -1;
+
+    int failed = 0;
+    for (int index = 0; index < manifest->root_count; index++)
+    {
+        const ManifestRoot *root = &manifest->roots[index];
+        if (manifest_entry_owned(manifest, index, "") != 1)
+        {
+            failed = 1;
+            break;
+        }
+
+        struct stat st;
+        int root_fd = -1;
+        if (selection_payload_open_at(data_fd, root->payload_path, &st,
+                                      &root_fd) != 0)
+        {
+            failed = 1;
+            break;
+        }
+        if (!S_ISDIR(st.st_mode))
+            continue;
+        if (selection_payload_walk(manifest, index, root_fd, "") != 0)
+        {
+            failed = 1;
+            break;
+        }
+    }
+    if (close(data_fd) != 0)
+        failed = 1;
+    if (failed)
+        print_error("Error: VERSION=2 payload does not match its recorded selection; refusing to restore.\n");
+    return failed ? -1 : 0;
+}
+
+typedef struct {
+    char (*destinations)[PATH_MAX];
+    int *order;
+    size_t count;
+} SelectionRestoreMap;
+
+typedef struct {
+    int index;
+    size_t depth;
+} SelectionRestoreOrder;
+
+static size_t absolute_path_depth(const char *path)
+{
+    size_t depth = 0;
+    for (const char *p = path; *p != '\0'; p++)
+        if (*p == '/' && p[1] != '\0')
+            depth++;
+    return depth;
+}
+
+static int restore_order_compare(const void *left, const void *right)
+{
+    const SelectionRestoreOrder *a = left;
+    const SelectionRestoreOrder *b = right;
+    if (a->depth > b->depth)
+        return -1;
+    if (a->depth < b->depth)
+        return 1;
+    return a->index < b->index ? -1 : a->index > b->index;
+}
+
+static void selection_restore_map_free(SelectionRestoreMap *map)
+{
+    if (map == NULL)
+        return;
+    free(map->destinations);
+    free(map->order);
+    *map = (SelectionRestoreMap){0};
+}
+
+static int selection_restore_map_build(int source_root_fd, const char *home,
+                                       const Manifest *manifest,
+                                       SelectionRestoreMap *out)
+{
+    *out = (SelectionRestoreMap){0};
+    if (manifest->version != MANIFEST_SELECTION_VERSION)
+        return 0;
+
+    size_t count = (size_t)manifest->root_count;
+    char (*destinations)[PATH_MAX] =
+        count == 0 ? NULL : calloc(count, sizeof(*destinations));
+    int *order = count == 0 ? NULL : calloc(count, sizeof(*order));
+    SelectionRestoreOrder *items =
+        count == 0 ? NULL : calloc(count, sizeof(*items));
+    if (count != 0 && (!destinations || !order || !items))
+    {
+        print_error("Error: out of memory building the restore destination map\n");
+        goto fail;
+    }
+
+    char *xdg_dirs[XDG_RESTORE_COUNT] = {0};
+    int xdg_ready = 0;
+    for (size_t index = 0; index < count; index++)
+    {
+        const ManifestRoot *root = &manifest->roots[index];
+        if (root->policy == ROOT_POLICY_MANUAL_NATIVE)
+        {
+            items[index] = (SelectionRestoreOrder){(int)index, 0};
+            continue;
+        }
+        if (root->policy == ROOT_POLICY_HOME_RELATIVE)
+        {
+            if (root->restore_path[0] == '\0')
+            {
+                if (snprintf(destinations[index], PATH_MAX, "%s", home) >=
+                    PATH_MAX)
+                {
+                    print_error("Error: Restore destination for manifest root %s is too long\n",
+                                root->id);
+                    goto fail_xdg;
+                }
+            }
+            else if (path_join(destinations[index], PATH_MAX, home,
+                               root->restore_path) != 0)
+            {
+                print_error("Error: Restore destination for manifest root %s is too long\n",
+                            root->id);
+                goto fail_xdg;
+            }
+        }
+        else
+        {
+            if (!xdg_ready)
+            {
+                if (xdg_resolve(home, xdg_keys, xdg_fallbacks, xdg_dirs,
+                                XDG_RESTORE_COUNT) != 0)
+                {
+                    print_error("Error: HOME path too long to resolve user directories\n");
+                    goto fail_xdg;
+                }
+                xdg_ready = 1;
+            }
+            int key = xdg_key_index(root->id);
+            if (key < 0)
+            {
+                print_error("Error: Unrecognized XDG root id: %s\n", root->id);
+                goto fail_xdg;
+            }
+            if (xdg_dirs[key] == NULL ||
+                snprintf(destinations[index], PATH_MAX, "%s",
+                         xdg_dirs[key]) >= PATH_MAX)
+            {
+                print_error("Error: XDG restore destination for %s is too long\n",
+                            root->id);
+                goto fail_xdg;
+            }
+        }
+        items[index] = (SelectionRestoreOrder){
+            .index = (int)index,
+            .depth = absolute_path_depth(destinations[index])
+        };
+    }
+
+    for (size_t left = 0; left < count; left++)
+    {
+        if (manifest->roots[left].policy == ROOT_POLICY_MANUAL_NATIVE)
+            continue;
+        for (size_t right = left + 1U; right < count; right++)
+        {
+            if (manifest->roots[right].policy == ROOT_POLICY_MANUAL_NATIVE)
+                continue;
+            if (!strcmp(destinations[left], destinations[right]))
+            {
+                print_error("Error: Manifest roots %s and %s map to the same restore destination: %s\n",
+                            manifest->roots[left].id,
+                            manifest->roots[right].id, destinations[left]);
+                goto fail_xdg;
+            }
+
+            size_t parent = SIZE_MAX;
+            size_t child = SIZE_MAX;
+            if (path_covers(destinations[left], destinations[right]))
+            {
+                parent = left;
+                child = right;
+            }
+            else if (path_covers(destinations[right],
+                                 destinations[left]))
+            {
+                parent = right;
+                child = left;
+            }
+            if (parent == SIZE_MAX)
+                continue;
+
+            const char *relative = destinations[child] +
+                                   strlen(destinations[parent]);
+            if (strcmp(destinations[parent], "/") != 0)
+                relative++;
+            else if (*relative == '/')
+                relative++;
+
+            char source_rel[PATH_MAX + 8];
+            char entry_rel[PATH_MAX + 8];
+            if (v1_payload_rel(&manifest->roots[parent], source_rel,
+                               sizeof(source_rel)) != 0 ||
+                path_join(entry_rel, sizeof(entry_rel), source_rel,
+                          relative) != 0)
+            {
+                print_error("Error: Manifest roots %s and %s: restore destination path %s is too long to probe for collisions\n",
+                            manifest->roots[parent].id,
+                            manifest->roots[child].id, destinations[child]);
+                goto fail_xdg;
+            }
+            RestoreSourceStatus status =
+                restore_native_source_status_at(source_root_fd, entry_rel);
+            if (status == RESTORE_SOURCE_PRESENT)
+            {
+                print_error("Error: Manifest roots %s and %s contain competing entries for restore destination %s\n",
+                            manifest->roots[parent].id,
+                            manifest->roots[child].id, destinations[child]);
+                goto fail_xdg;
+            }
+            if (status != RESTORE_SOURCE_MISSING)
+            {
+                print_error("Error: Could not safely inspect payload for manifest root %s while checking for competing entries with %s\n",
+                            manifest->roots[parent].id,
+                            manifest->roots[child].id);
+                goto fail_xdg;
+            }
+        }
+    }
+
+    qsort(items, count, sizeof(*items), restore_order_compare);
+    for (size_t index = 0; index < count; index++)
+        order[index] = items[index].index;
+    free(items);
+    free_xdg_dirs(xdg_dirs);
+    out->destinations = destinations;
+    out->order = order;
+    out->count = count;
+    return 0;
+
+fail_xdg:
+    free_xdg_dirs(xdg_dirs);
+fail:
+    free(items);
+    free(destinations);
+    free(order);
+    return -1;
+}
+
 static RestoreNativeStatus restore_metadata_item(
     const CloneContext *ctx, int source_root_fd, const char *source_rel,
     int destination_root_fd, const char *destination_rel, const char *label,
@@ -1602,7 +1983,8 @@ static void restore_v1(const char *source, int source_root_fd, const char *home,
                        int *had_error,
                        const RestoreTimestampAnchors *timestamp_anchors,
                        size_t *skipped_security_xattrs,
-                       BackupCaptureReport *capture_report)
+                       BackupCaptureReport *capture_report,
+                       const int *root_order)
 {
     printf("Roots\n");
 
@@ -1616,7 +1998,8 @@ static void restore_v1(const char *source, int source_root_fd, const char *home,
 
     for (int i = 0; i < m->root_count; i++)
     {
-        const ManifestRoot *root = &m->roots[i];
+        int root_index = root_order == NULL ? i : root_order[i];
+        const ManifestRoot *root = &m->roots[root_index];
         if (root->policy == ROOT_POLICY_MANUAL_NATIVE)
             continue; // reported separately below; never auto-restored
 
@@ -1801,13 +2184,6 @@ int restore(const char *source)
         close(source_root_fd);
         return 1;
     }
-    if (mst == MANIFEST_STATUS_VALID && m.version == MANIFEST_SELECTION_VERSION)
-    {
-        print_error("Error: this build cannot replay filtered backup selections; refusing to restore.\n");
-        manifest_free(&m);
-        close(source_root_fd);
-        return 1;
-    }
     // mst is now MISSING, LEGACY, or VALID.
 
     if (source_is_versioned_final && mst == MANIFEST_STATUS_MISSING)
@@ -1958,6 +2334,20 @@ int restore(const char *source)
         return 1;
     }
 
+    SelectionRestoreMap selection_restore_map = {0};
+    if (mst == MANIFEST_STATUS_VALID &&
+        m.version == MANIFEST_SELECTION_VERSION &&
+        (validate_selection_payload_ownership(source_root_fd, &m) != 0 ||
+         selection_restore_map_build(source_root_fd, home, &m,
+                                     &selection_restore_map) != 0))
+    {
+        selection_restore_map_free(&selection_restore_map);
+        manifest_free(&m);
+        close(home_fd);
+        close(source_root_fd);
+        return 1;
+    }
+
     CloneContext ctx = {
         .operation = CLONE_RESTORE,
         .representation = CLONE_NATIVE_TREE
@@ -2071,7 +2461,8 @@ int restore(const char *source)
     {
         restore_v1(source, source_root_fd, home, home_fd, &ctx, &m, &count,
                    &had_error, &timestamp_anchors,
-                   &skipped_security_xattrs, &capture_report);
+                   &skipped_security_xattrs, &capture_report,
+                   selection_restore_map.order);
     }
     else
     {
@@ -2121,6 +2512,7 @@ cleanup:
     ctx.inode_map = NULL;
     metadata_profiles_free(&metadata_profiles);
     restore_timestamp_anchors_free(&timestamp_anchors);
+    selection_restore_map_free(&selection_restore_map);
     manifest_free(&m);
     close(home_fd);
     close(source_root_fd);

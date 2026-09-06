@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include <assert.h>
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -27,6 +28,7 @@
 #include "portable.h"
 #include "selfcopy.h"
 #include "utils.h"
+#include "xdg.h"
 
 typedef struct {
     const char *name;
@@ -1196,6 +1198,20 @@ static int read_machine_id(char *out, size_t out_size)
 /* Plan to manifest.                                                          */
 /* ------------------------------------------------------------------------- */
 
+// selection_plan_manifest() has no machine/uid of its own to stamp, so both
+// the unfiltered and the selection-derived manifest paths need this same
+// stamp applied after the fact; kept in one place instead of two copies.
+static void manifest_set_source_identity(Manifest *out)
+{
+    char machine_id[MANIFEST_MACHINE_ID_MAX];
+    if (read_machine_id(machine_id, sizeof(machine_id)) == 0)
+    {
+        memcpy(out->machine_id, machine_id, strlen(machine_id) + 1);
+        out->source_uid = getuid();
+        out->has_source_identity = 1;
+    }
+}
+
 // The manifest is production's resume identity, not a byproduct of it: this is
 // the model container_adopt() matches against and the model that is written
 // into the container. The root table is copied entry by entry into its own
@@ -1223,15 +1239,44 @@ static int manifest_from_plan(const BackupPlan *plan, Manifest *out)
             out->roots[i] = plan->roots[i].manifest_root;
     }
 
-    char machine_id[MANIFEST_MACHINE_ID_MAX];
-    if (read_machine_id(machine_id, sizeof(machine_id)) == 0)
-    {
-        memcpy(out->machine_id, machine_id, strlen(machine_id) + 1);
-        out->source_uid = getuid();
-        out->has_source_identity = 1;
-    }
+    manifest_set_source_identity(out);
 
     return 0;
+}
+
+static int backup_plan_from_selection(const SelectionPlan *selection,
+                                      BackupPlan *out)
+{
+    *out = (BackupPlan){0};
+    if (selection_plan_validate(selection) < 0 ||
+        selection->root_count > (size_t)INT_MAX)
+        return -1;
+
+    out->scope = selection->scope;
+    out->root_count = (int)selection->root_count;
+    if (selection->root_count == 0)
+        return 0;
+
+    out->roots = calloc(selection->root_count, sizeof(*out->roots));
+    if (out->roots == NULL)
+    {
+        print_error("Error: out of memory building the backup execution plan\n");
+        return -1;
+    }
+    for (size_t i = 0; i < selection->root_count; i++)
+        out->roots[i] = selection->roots[i].root;
+    return 0;
+}
+
+static void backup_execution_estimate(const BackupPlan *plan,
+                                      const SelectionPlan *selection,
+                                      off_t block_size, off_t *total,
+                                      int *had_error)
+{
+    if (selection != NULL)
+        selection_plan_estimate_size(selection, block_size, total, had_error);
+    else
+        backup_plan_estimate_size(plan, block_size, total, had_error);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1282,6 +1327,23 @@ static int portable_capture_request_from_plan(
         .nsec_exact = nsec_exact,
         .case_sensitive = case_sensitive
     };
+    return 0;
+}
+
+static int portable_capture_request_for_execution(
+    const BackupPlan *plan, const SelectionPlan *selection,
+    const char *machine_id, int has_machine_id, uid_t source_uid,
+    int nsec_exact, int case_sensitive, PortableRootSpec *roots_storage,
+    PortableCaptureRequest *out)
+{
+    if (portable_capture_request_from_plan(
+            plan, machine_id, has_machine_id, source_uid, nsec_exact,
+            case_sensitive, roots_storage, out) != 0)
+        return -1;
+    if (selection != NULL &&
+        portable_capture_request_set_selection(
+            out, selection, roots_storage, selection->root_count) != 0)
+        return -1;
     return 0;
 }
 
@@ -1341,10 +1403,21 @@ static void preview_roots(const BackupPlan *plan, int *count)
     }
 }
 
-static void capture_roots(const CloneContext *ctx, const BackupPlan *plan, int data_fd,
+// selection is the optional compiled plan (docs/DECISIONS.md D34) backing
+// *plan's roots one-for-one by index (backup_plan_from_selection() builds
+// plan that way); NULL means an unfiltered explicit-path backup, which needs
+// no per-entry filter. Each root gets its own CloneContext copy so the
+// borrowed SelectionRoot pointer never leaks across roots, while inode_map
+// and visited stay the single shared instances the caller created.
+static void capture_roots(const CloneContext *ctx, const BackupPlan *plan,
+                          const SelectionPlan *selection, int data_fd,
                           int *count, int *had_error,
                           BackupCaptureReport *capture_report)
 {
+    // A mismatched pair would index selection->roots past its end with no
+    // error, silently capturing a root under the wrong filter -- this is a
+    // caller bug, not something to recover from at runtime.
+    assert(!selection || (size_t)plan->root_count == selection->root_count);
     for (int s = 0; s < ROOT_SECTION_COUNT; s++)
     {
         int printed_heading = 0;
@@ -1363,9 +1436,12 @@ static void capture_roots(const CloneContext *ctx, const BackupPlan *plan, int d
                 printf("  Capturing: %s -> data/%s\n",
                        root->capture_path, root->manifest_root.payload_path);
 
+            CloneContext root_ctx = *ctx;
+            root_ctx.selection = selection ? &selection->roots[(size_t)i] : NULL;
+
             capture_report->failed_source_path[0] = '\0';
             BackupCaptureStatus capture_status = backup_capture_at_report_continue(
-                ctx, root->capture_path, data_fd,
+                &root_ctx, root->capture_path, data_fd,
                 root->manifest_root.payload_path, capture_report);
             if (capture_status != BACKUP_CAPTURE_OK)
             {
@@ -1392,13 +1468,20 @@ static void capture_roots(const CloneContext *ctx, const BackupPlan *plan, int d
 // A partial native capture may already contain one member of a hardlink group.
 // Seed every existing, resume-matching destination before the live walk so the
 // current root/readdir order cannot replace that earlier representative.
-static int seed_native_hardlink_map(const CloneContext *ctx,
-                                    const BackupPlan *plan, int data_fd)
+// selection follows the same index-aligned, optional convention as
+// capture_roots() above.
+static int seed_native_hardlink_map(const CloneContext *ctx, const BackupPlan *plan,
+                                    const SelectionPlan *selection, int data_fd)
 {
+    // See capture_roots(): the same one-for-one index alignment with
+    // selection->roots is assumed here and must hold, not just be documented.
+    assert(!selection || (size_t)plan->root_count == selection->root_count);
     for (int i = 0; i < plan->root_count; i++)
     {
         const BackupPlanRoot *root = &plan->roots[i];
-        if (native_inode_map_seed_existing(ctx, root->capture_path, data_fd,
+        CloneContext root_ctx = *ctx;
+        root_ctx.selection = selection ? &selection->roots[(size_t)i] : NULL;
+        if (native_inode_map_seed_existing(&root_ctx, root->capture_path, data_fd,
                                            root->manifest_root.payload_path) != 0)
             return -1;
     }
@@ -1711,25 +1794,43 @@ static int open_advisory_probe_fd(const char *target, int *out_used_parent)
     return fd;
 }
 
-static int backup_metadata_preflight(const BackupPlan *plan, int anchor_fd,
-                                     int destination_root_fd,
+// selection follows the same index-aligned, optional convention as
+// capture_roots() and seed_native_hardlink_map(): it never reports refusals
+// itself, only accumulates them, so both plan types feed the identical
+// hard/soft refusal logic in backup_dry_run() and backup_run() (D1).
+static int backup_metadata_preflight(const BackupPlan *plan, const SelectionPlan *selection,
+                                     int anchor_fd, int destination_root_fd,
                                      MetadataProfiles *profiles,
                                      SourceReadRefusals *refusals)
 {
+    // See capture_roots(): the same one-for-one index alignment with
+    // selection->roots is assumed here and must hold, not just be documented.
+    assert(!selection || (size_t)plan->root_count == selection->root_count);
     for (int i = 0; i < plan->root_count; i++)
     {
         const BackupPlanRoot *root = &plan->roots[i];
+        const SelectionRoot *sel_root = selection ? &selection->roots[(size_t)i] : NULL;
         if (backup_metadata_inventory(root->capture_path, anchor_fd,
                                       destination_root_fd,
                                       root->manifest_root.payload_path,
-                                      profiles, refusals, NULL) != 0)
+                                      profiles, refusals, sel_root) != 0)
             return -1;
     }
     return 0;
 }
 
+static int backup_execution_metadata_preflight(
+    const BackupPlan *plan, const SelectionPlan *selection, int anchor_fd,
+    int destination_root_fd, MetadataProfiles *profiles,
+    SourceReadRefusals *refusals)
+{
+    return backup_metadata_preflight(plan, selection, anchor_fd, destination_root_fd,
+                                     profiles, refusals);
+}
+
 static int backup_dry_run(const char *target, BackupMode mode,
-                          BackupPlan *plan, int include_self,
+                          BackupPlan *plan, const SelectionPlan *selection,
+                          int include_self,
                           const char *self_arch, int include_network_config,
                           unsigned int network_config_present_mask)
 {
@@ -1770,9 +1871,9 @@ static int backup_dry_run(const char *target, BackupMode mode,
     {
         off_t advisory_block_size = 0;
         (void)destination_block_size(advisory_fd, &advisory_block_size);
-        backup_plan_estimate_size(plan, advisory_block_size,
+        backup_execution_estimate(plan, selection, advisory_block_size,
                                   &estimated_size, &estimate_had_error);
-        backup_plan_estimate_size(plan, 1, &raw_estimated_size,
+        backup_execution_estimate(plan, selection, 1, &raw_estimated_size,
                                   &raw_estimate_had_error);
         if (backup_space_preflight(advisory_fd, estimated_size,
                                    raw_estimated_size, estimate_had_error,
@@ -1800,8 +1901,8 @@ static int backup_dry_run(const char *target, BackupMode mode,
 
     if (advisory_fd >= 0)
     {
-        int advisory_failed = backup_metadata_preflight(
-            plan, advisory_fd, -1, &advisory_profiles,
+        int advisory_failed = backup_execution_metadata_preflight(
+            plan, selection, advisory_fd, -1, &advisory_profiles,
             &advisory_refusals) != 0;
         if (advisory_refusals.refusal_count > 0)
         {
@@ -1850,8 +1951,8 @@ static int backup_dry_run(const char *target, BackupMode mode,
         int advisory_has_machine_id = read_machine_id(
             advisory_machine_id, sizeof(advisory_machine_id)) == 0;
         PortableCaptureRequest advisory_request;
-        int request_result = portable_capture_request_from_plan(
-            plan, advisory_machine_id, advisory_has_machine_id, getuid(),
+        int request_result = portable_capture_request_for_execution(
+            plan, selection, advisory_machine_id, advisory_has_machine_id, getuid(),
             advisory_profile.nsec_exact,
             advisory_profile.capabilities[FS_CAP_CASE_SENSITIVE].status ==
                 FS_CAP_SUPPORTED,
@@ -1899,6 +2000,27 @@ static int backup_dry_run(const char *target, BackupMode mode,
 
     preview_roots(plan, &count);
 
+    if (selection != NULL)
+    {
+        printf("\nSelection policy\n");
+        if (selection->excludes.count == 0)
+            printf("  No active exclusions for this scope.\n");
+        else
+            for (size_t i = 0; i < selection->excludes.count; i++)
+                printf("  Excludes: %s\n", selection->excludes.paths[i]);
+        for (size_t i = 0; i < selection->root_count; i++)
+        {
+            uint32_t aliases = selection->roots[i].xdg_aliases;
+            if (aliases == 0 || (aliases & (aliases - 1U)) == 0)
+                continue;
+            printf("  XDG aliases for %s:", selection->roots[i].root.capture_path);
+            for (int key = 0; key < XDG_KEY_COUNT; key++)
+                if ((aliases & (UINT32_C(1) << key)) != 0)
+                    printf(" %s", xdg_keys[key]);
+            printf("\n");
+        }
+    }
+
     if (has_advisory_prescan)
     {
         printf("\nDestination cannot hold Linux metadata natively; a portable "
@@ -1931,28 +2053,17 @@ static int backup_dry_run(const char *target, BackupMode mode,
 
 /* ------------------------------------------------------------------------- */
 
-int backup(const char *target, BackupMode mode, char **paths, int include_self,
-           int include_network_config)
+static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
+                      const SelectionPlan *selection, int include_self,
+                      int include_network_config)
 {
-    char *home = getenv("HOME");
-    if (home == NULL)
-    {
-        print_error("Error: Could not get HOME directory.\n");
-        return 1;
-    }
-
-    // The plan is built before anything about the destination is even looked
-    // at: it is read-only over the source side (never touches target, never
-    // reads dry_run), so a rejected plan -- live or --dry-run alike -- never
-    // creates or mutates anything (docs/DECISIONS.md D16).
-    BackupPlan plan;
-    if (backup_plan_build(home, mode, (const char *const *)paths, &plan) != 0)
-        return 1;
-
     // Asked before the destination is created, probed or previewed, so a
     // destination inside a selected root is refused identically in a live run
     // and a dry run, with nothing written either way.
-    if (backup_plan_destination_conflicts(&plan, target))
+    int destination_conflicts = selection != NULL
+        ? selection_destination_conflicts(selection, target)
+        : backup_plan_destination_conflicts(&plan, target);
+    if (destination_conflicts)
     {
         backup_plan_free(&plan);
         return 1;
@@ -1987,19 +2098,24 @@ int backup(const char *target, BackupMode mode, char **paths, int include_self,
     {
         if (self_fd >= 0)
             close(self_fd);
-        return backup_dry_run(target, mode, &plan, include_self, self_arch,
+        return backup_dry_run(target, mode, &plan, selection, include_self, self_arch,
                               include_network_config,
                               network_config_present_mask);
     }
 
-    Manifest manifest;
-    if (manifest_from_plan(&plan, &manifest) != 0)
+    Manifest manifest = {0};
+    int manifest_result = selection != NULL
+        ? selection_plan_manifest(selection, &manifest)
+        : manifest_from_plan(&plan, &manifest);
+    if (manifest_result != 0)
     {
         if (self_fd >= 0)
             close(self_fd);
         backup_plan_free(&plan);
         return 1;
     }
+    if (selection != NULL)
+        manifest_set_source_identity(&manifest);
     if (include_self)
         manifest_set_self_binary(&manifest, self_arch);
     if (include_network_config && network_config_present_mask != 0)
@@ -2031,9 +2147,9 @@ int backup(const char *target, BackupMode mode, char **paths, int include_self,
 
     off_t target_block_size = 0;
     (void)destination_block_size(target_fd, &target_block_size);
-    backup_plan_estimate_size(&plan, target_block_size,
+    backup_execution_estimate(&plan, selection, target_block_size,
                               &estimated_size, &estimate_had_error);
-    backup_plan_estimate_size(&plan, 1, &raw_estimated_size,
+    backup_execution_estimate(&plan, selection, 1, &raw_estimated_size,
                               &raw_estimate_had_error);
 
     if (backup_space_preflight(target_fd, estimated_size, raw_estimated_size,
@@ -2070,8 +2186,8 @@ int backup(const char *target, BackupMode mode, char **paths, int include_self,
         }
         int has_machine_id = read_machine_id(portable_machine_id,
                                              sizeof(portable_machine_id)) == 0;
-        if (portable_capture_request_from_plan(
-                &plan, portable_machine_id, has_machine_id, getuid(),
+        if (portable_capture_request_for_execution(
+                &plan, selection, portable_machine_id, has_machine_id, getuid(),
                 profile.nsec_exact,
                 profile.capabilities[FS_CAP_CASE_SENSITIVE].status ==
                     FS_CAP_SUPPORTED,
@@ -2116,8 +2232,8 @@ int backup(const char *target, BackupMode mode, char **paths, int include_self,
         {
             metadata_failed = adopted_data_fd < 0;
             if (!metadata_failed)
-                metadata_failed = backup_metadata_preflight(
-                    &plan, adopted_data_fd, adopted_data_fd,
+                metadata_failed = backup_execution_metadata_preflight(
+                    &plan, selection, adopted_data_fd, adopted_data_fd,
                     &metadata_profiles, &source_read_refusals) != 0;
             if (source_read_refusals.refusal_count > 0)
                 metadata_failed = 1;
@@ -2152,8 +2268,8 @@ int backup(const char *target, BackupMode mode, char **paths, int include_self,
         int metadata_failed = 0;
         if (repr == CLONE_NATIVE_TREE)
         {
-            metadata_failed = backup_metadata_preflight(
-                &plan, target_fd, -1, &metadata_profiles,
+            metadata_failed = backup_execution_metadata_preflight(
+                &plan, selection, target_fd, -1, &metadata_profiles,
                 &source_read_refusals) != 0;
             if (source_read_refusals.refusal_count > 0)
                 metadata_failed = 1;
@@ -2265,10 +2381,10 @@ int backup(const char *target, BackupMode mode, char **paths, int include_self,
                 .representation = repr,
                 .timestamp_policy_configured = 1,
                 .nsec_exact = profile.nsec_exact,
-                .metadata_preflight_done = 1,
-                .inode_map = native_inode_map_create(),
-                .visited = native_visited_create()
+                .metadata_preflight_done = 1
             };
+            ctx.inode_map = native_inode_map_create();
+            ctx.visited = native_visited_create();
             if (ctx.inode_map == NULL || ctx.visited == NULL)
             {
                 print_error("Error: Could not initialize native hardlink/resume tracking\n");
@@ -2278,13 +2394,13 @@ int backup(const char *target, BackupMode mode, char **paths, int include_self,
             }
             else
             {
-                if (adopted && seed_native_hardlink_map(&ctx, &plan, data_fd) != 0)
+                if (adopted && seed_native_hardlink_map(&ctx, &plan, selection, data_fd) != 0)
                 {
                     print_error("Error: Could not seed native hardlink/resume tracking\n");
                     had_error = 1;
                 }
                 if (!had_error)
-                    capture_roots(&ctx, &plan, data_fd, &count, &had_error,
+                    capture_roots(&ctx, &plan, selection, data_fd, &count, &had_error,
                                   &capture_report);
                 if (!had_error)
                     reconcile_roots(ctx.visited, &plan, data_fd, &had_error);
@@ -2486,26 +2602,79 @@ fail_pre_container:
     return 1;
 }
 
+int backup(const char *target, BackupMode mode, char **paths, int include_self,
+           int include_network_config)
+{
+    const char *home = getenv("HOME");
+    if (home == NULL)
+    {
+        print_error("Error: Could not get HOME directory.\n");
+        return 1;
+    }
+
+    BackupPlan plan;
+    if (backup_plan_build(home, mode, (const char *const *)paths, &plan) != 0)
+        return 1;
+    return backup_run(target, mode, plan, NULL, include_self,
+                      include_network_config);
+}
+
+int backup_selection(const char *target, BackupMode mode,
+                     const SelectionPlan *selection, int include_self,
+                     int include_network_config)
+{
+    ManifestScope expected = mode == BACKUP_CRITICAL
+        ? MANIFEST_SCOPE_CRITICAL : MANIFEST_SCOPE_COMPREHENSIVE;
+    if (selection == NULL || mode == BACKUP_EXPLICIT_PATHS ||
+        selection->scope != expected)
+    {
+        print_error("Error: invalid scoped backup selection\n");
+        return 1;
+    }
+
+    BackupPlan plan;
+    if (backup_plan_from_selection(selection, &plan) != 0)
+        return 1;
+    return backup_run(target, mode, plan, selection, include_self,
+                      include_network_config);
+}
+
+// Thin wrapper kept for tests/test_native_selection.c and
+// tests/test_portable_selection.c: production (backup_run()) calls
+// backup_metadata_preflight() directly with both the BackupPlan and the
+// SelectionPlan it was derived from, since it already holds both. This
+// entry point only has the SelectionPlan, so it derives the matching
+// BackupPlan first -- backup_plan_from_selection() copies each root
+// index-for-index, which is exactly the alignment backup_metadata_preflight()
+// requires between plan and selection.
 int backup_selection_inventory(const SelectionPlan *plan, int anchor_fd,
                                 int data_fd, MetadataProfiles *profiles)
 {
     if (selection_plan_validate(plan) < 0 || anchor_fd < 0 || !profiles) return -1;
+
+    BackupPlan backup_plan;
+    if (backup_plan_from_selection(plan, &backup_plan) != 0) return -1;
+
     SourceReadRefusals refusals = {0};
-    for (size_t i = 0; i < plan->root_count; i++)
-    {
-        const SelectionRoot *root = &plan->roots[i];
-        if (backup_metadata_inventory(root->root.capture_path, anchor_fd, data_fd,
-                                      root->root.manifest_root.payload_path,
-                                      profiles, &refusals, root) < 0) return -1;
-    }
-    if (refusals.refusal_count)
+    int result = backup_metadata_preflight(&backup_plan, plan, anchor_fd, data_fd,
+                                           profiles, &refusals);
+    backup_plan_free(&backup_plan);
+    if (result == 0 && refusals.refusal_count > 0)
     {
         source_read_refusals_report(&refusals);
         return -1;
     }
-    return 0;
+    return result;
 }
 
+// Thin wrapper kept for the same two test entry points; see
+// backup_selection_inventory() above for why it derives its own BackupPlan.
+// Unlike backup_run(), which only seeds the hardlink map for an adopted
+// (resumed) container, this entry point has no adopted/fresh distinction in
+// its contract and always seeds -- harmless, since seeding a missing
+// destination is a no-op, and required by callers (including
+// tests/test_native_selection.c) that drive repeated captures into the same
+// data_fd without going through backup_run()'s resume detection.
 BackupCaptureStatus backup_selection_capture(const CloneContext *ctx,
                                              const SelectionPlan *plan,
                                              int data_fd, BackupCaptureReport *report)
@@ -2513,36 +2682,29 @@ BackupCaptureStatus backup_selection_capture(const CloneContext *ctx,
     if (!ctx || ctx->operation != CLONE_BACKUP || ctx->representation != CLONE_NATIVE_TREE ||
         !ctx->metadata_preflight_done || data_fd < 0 || selection_plan_validate(plan) < 0)
         return BACKUP_CAPTURE_ERROR;
+
+    BackupPlan backup_plan;
+    if (backup_plan_from_selection(plan, &backup_plan) != 0)
+        return BACKUP_CAPTURE_ERROR;
+
     CloneContext run = *ctx;
     run.inode_map = native_inode_map_create();
     run.visited = native_visited_create();
     BackupCaptureStatus status = BACKUP_CAPTURE_ERROR;
-    if (!run.inode_map || !run.visited) goto done;
-    for (size_t i = 0; i < plan->root_count; i++)
+    if (run.inode_map && run.visited)
     {
-        run.selection = &plan->roots[i];
-        const BackupPlanRoot *root = &run.selection->root;
-        if (native_inode_map_seed_existing(&run, root->capture_path, data_fd,
-                                           root->manifest_root.payload_path) < 0) goto done;
+        int had_error = 0;
+        int count = 0;
+        if (seed_native_hardlink_map(&run, &backup_plan, plan, data_fd) != 0)
+            had_error = 1;
+        if (!had_error)
+            capture_roots(&run, &backup_plan, plan, data_fd, &count, &had_error, report);
+        if (!had_error)
+            reconcile_roots(run.visited, &backup_plan, data_fd, &had_error);
+        status = had_error ? BACKUP_CAPTURE_ERROR : BACKUP_CAPTURE_OK;
     }
-    for (size_t i = 0; i < plan->root_count; i++)
-    {
-        run.selection = &plan->roots[i];
-        const BackupPlanRoot *root = &run.selection->root;
-        status = backup_capture_at_report_continue(&run, root->capture_path, data_fd,
-                                                   root->manifest_root.payload_path, report);
-        if (status != BACKUP_CAPTURE_OK) goto done;
-    }
-    status = BACKUP_CAPTURE_OK;
-    for (size_t i = 0; i < plan->root_count; i++)
-    {
-        NativeReconcileReport reconciliation;
-        if (native_reconcile_stale_at(run.visited, plan->roots[i].root.manifest_root.payload_path,
-                                      data_fd, &reconciliation) != NATIVE_RECONCILE_OK)
-        { status = BACKUP_CAPTURE_ERROR; break; }
-    }
-done:
     native_inode_map_free(run.inode_map);
     native_visited_free(run.visited);
+    backup_plan_free(&backup_plan);
     return status;
 }

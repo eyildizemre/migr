@@ -18,6 +18,20 @@ static void remove_child_before_open(const char *path, void *context)
     if (unlink("Documents/alias") == 0 && rmdir("Documents") == 0)
         failure_triggered = 1;
 }
+// D2/D3 fixture: generalizes the trick above to an arbitrary root path,
+// so a root that is neither first nor last in a plan can be made to fail
+// its own directory open (ENOENT, an ordinary BACKUP_CAPTURE_ERROR) right
+// as capture_roots() reaches it.
+static void remove_root_before_open(const char *path, void *context)
+{
+    const char *target = context;
+    if (strcmp(path, target) != 0) return;
+    char child[PATH_MAX];
+    if ((size_t)snprintf(child, sizeof(child), "%s/note", target) >= sizeof(child))
+        return;
+    if (unlink(child) == 0 && rmdir(target) == 0)
+        failure_triggered = 1;
+}
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL %d: %s\n", __LINE__, #x); failures++; } } while (0)
 #define REQUIRE(x) do { if (!(x)) { perror(#x); exit(1); } } while (0)
 
@@ -193,6 +207,93 @@ int main(void)
     REQUIRE(chmod("omit", 0700) == 0);
     selection_plan_free(&plan);
     free(home);
+
+    /* D2: a mid-plan capture failure must not block roots that come after
+     * it -- capture_roots() now continues through every root instead of the
+     * old backup_selection_capture() copy's goto-on-first-failure. D3: the
+     * failing root's own diagnostic must come from the shared per-root
+     * printing in capture_roots(), not the old blanket "Error: selected
+     * native capture failed" the caller used to print for every capture
+     * failure regardless of cause or root. Both need a root that is neither
+     * first nor last, so a fresh two-XDG-root home is built (Documents and
+     * Downloads are both always-included critical-scope XDG roots) rather
+     * than reusing the two-root `plan` above. */
+    REQUIRE(mkdir("../home2", 0700) == 0);
+    REQUIRE(mkdir("../data2", 0700) == 0);
+    int data2 = open("../data2", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    REQUIRE(data2 >= 0);
+    REQUIRE(chdir("../home2") == 0);
+    char *home2 = getcwd(NULL, 0);
+    REQUIRE(home2 != NULL);
+    REQUIRE(mkdir("Documents", 0700) == 0);
+    REQUIRE(mkdir("Downloads", 0700) == 0);
+    file("Documents/note", "documents content\n");
+    file("Downloads/note", "downloads content\n");
+    Config config2 = {0};
+    const char *text2 = "[critical]\n[include]\n~/\n[exclude]\n";
+    REQUIRE(config_parse(text2, strlen(text2), "fixture2", &config2) == 0);
+    SelectionPlan plan2 = {0};
+    REQUIRE(selection_plan_build(home2, BACKUP_CRITICAL, &config2, &plan2) == 0);
+    config_free(&config2);
+    REQUIRE(plan2.root_count == 3);
+    char docs2[PATH_MAX], downloads2[PATH_MAX];
+    REQUIRE(path_join(docs2, sizeof(docs2), home2, "Documents") == 0);
+    REQUIRE(path_join(downloads2, sizeof(downloads2), home2, "Downloads") == 0);
+    size_t docs2_index = root_index(&plan2, docs2);
+    size_t downloads2_index = root_index(&plan2, downloads2);
+
+    /* Whichever of the two sorts first in the plan's own root order is made
+     * to fail, so the other one -- necessarily attempted after it within
+     * their shared group -- proves a root past a failure is still captured. */
+    int downloads_is_later = downloads2_index > docs2_index;
+    char *fail_path = downloads_is_later ? docs2 : downloads2;
+    size_t later_index = downloads_is_later ? downloads2_index : docs2_index;
+
+    CloneContext ctx2 = {.operation=CLONE_BACKUP, .representation=CLONE_NATIVE_TREE,
+                        .metadata_preflight_done=1, .timestamp_policy_configured=1,
+                        .nsec_exact=1};
+    BackupCaptureReport report2;
+    backup_capture_report_init(&report2);
+
+    REQUIRE(fflush(stderr) == 0);
+    int saved_stderr = dup(STDERR_FILENO);
+    FILE *captured = tmpfile();
+    REQUIRE(saved_stderr >= 0 && captured != NULL);
+    REQUIRE(dup2(fileno(captured), STDERR_FILENO) >= 0);
+
+    failure_triggered = 0;
+    backup_test_set_capture_hook(remove_root_before_open, fail_path);
+    BackupCaptureStatus status2 = backup_selection_capture(&ctx2, &plan2, data2, &report2);
+    backup_test_set_capture_hook(NULL, NULL);
+
+    REQUIRE(fflush(stderr) == 0);
+    REQUIRE(dup2(saved_stderr, STDERR_FILENO) >= 0);
+    REQUIRE(close(saved_stderr) == 0);
+    REQUIRE(fseek(captured, 0, SEEK_END) == 0);
+    long captured_length = ftell(captured);
+    REQUIRE(captured_length >= 0);
+    rewind(captured);
+    char *captured_text = calloc((size_t)captured_length + 1, 1);
+    REQUIRE(captured_text != NULL);
+    REQUIRE(fread(captured_text, 1, (size_t)captured_length, captured) == (size_t)captured_length);
+    REQUIRE(fclose(captured) == 0);
+
+    CHECK(status2 != BACKUP_CAPTURE_OK);
+    CHECK(failure_triggered);
+    CHECK(strstr(captured_text, "Error: Failed to capture") != NULL);
+    CHECK(strstr(captured_text, fail_path) != NULL);
+    CHECK(strstr(captured_text, "selected native capture failed") == NULL);
+    free(captured_text);
+
+    char later_payload[PATH_MAX];
+    struct stat later_st;
+    payload(later_payload, &plan2, later_index, "note");
+    CHECK(fstatat(data2, later_payload, &later_st, 0) == 0);
+
+    selection_plan_free(&plan2);
+    free(home2);
+    REQUIRE(close(data2) == 0);
+
     REQUIRE(close(data) == 0 && chdir("/") == 0);
     REQUIRE(nftw(temp, remove_entry, 32, FTW_DEPTH | FTW_PHYS) == 0);
     printf("native selection: %d failures\n", failures);

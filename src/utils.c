@@ -262,6 +262,13 @@ int path_join(char *buf, size_t size, const char *dir, const char *name)
     return path_join_n(buf, size, dir, name, strlen(name));
 }
 
+int path_covers(const char *parent, const char *path)
+{
+    size_t n = strlen(parent);
+    return !strcmp(parent, path) || (n == 1 && parent[0] == '/' && path[0] == '/') ||
+           (n && !strncmp(parent, path, n) && path[n] == '/');
+}
+
 void raise_fd_limit(void)
 {
     struct rlimit limit;
@@ -281,6 +288,7 @@ void print_help(void)
     printf("  report [SCOPE]        Show backup analysis report (default when no command given)\n");
     printf("  backup <PATH>         Create a resumable backup container under PATH\n");
     printf("  restore <SOURCE>      Restore files and packages from a backup at SOURCE\n");
+    printf("  conf                  Edit persistent critical/comprehensive selection rules\n");
     printf("  help                  Show this help\n");
     printf("\n");
     printf("Scope (backup/report, mutually exclusive):\n");
@@ -289,6 +297,10 @@ void print_help(void)
     printf("Backup-only explicit paths:\n");
     printf("  <PATH...>             Paths listed after the destination are backed up\n");
     printf("                        exactly as given, with no assumptions\n");
+    printf("\n");
+    printf("Scoped report/backup commands automatically read migr.conf from the\n");
+    printf("user config directory. Missing or empty config keeps the built-in scope.\n");
+    printf("Explicit-path backup and restore do not read the current config.\n");
     printf("\n");
     printf("A destination that cannot hold Linux metadata natively (e.g.\n");
     printf("exFAT/NTFS/FAT32) uses a portable sidecar representation instead\n");
@@ -313,6 +325,7 @@ void print_help(void)
     printf("  ./migr backup /mnt/drive --comprehensive\n");
     printf("  ./migr backup /mnt/drive ~/Documents ~/Projects\n");
     printf("  ./migr report --critical --summary\n");
+    printf("  ./migr conf\n");
     printf("  ./migr restore /mnt/drive/migr_backup_20260720_143012\n");
 }
 

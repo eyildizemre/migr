@@ -2836,7 +2836,7 @@ for every backend; netctl's `hooks/` and `interfaces/` directories are not trave
 
 ## D34 — 2026-09-05 — Persistent scope configuration compiles to one selection and restore map
 
-**Status:** Decided — not implemented
+**Status:** Implemented
 
 **Decision:** `migr conf` edits persistent filesystem selection rules for critical
 and comprehensive backups. Include entries are requests for coverage, not physical

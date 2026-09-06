@@ -12,7 +12,7 @@
 
 #include "encoding.h"
 #include "manifest.h"
-#include "utils.h" // path_join
+#include "utils.h" // path_join, path_covers
 
 /* ========================================================================= */
 /* Legacy manifest — read-only. Production writes versioned manifests only;  */
@@ -1058,13 +1058,6 @@ static int canonical_path(const char *path, int absolute, int empty_ok)
     return 1;
 }
 
-static int source_covers(const char *parent, const char *path)
-{
-    size_t n = strlen(parent);
-    return !strcmp(parent, path) || (!strcmp(parent, "/") && path[0] == '/') ||
-           (n && !strncmp(parent, path, n) && path[n] == '/');
-}
-
 int manifest_root_source_path(const Manifest *m, int root_index, char out[PATH_MAX])
 {
     if (!m || m->version != MANIFEST_SELECTION_VERSION || root_index < 0 ||
@@ -1096,7 +1089,7 @@ int manifest_selection_valid(const Manifest *m)
         if (!canonical_path(m->excludes[i], 1, 0) ||
             (i && strcmp(m->excludes[i - 1], m->excludes[i]) >= 0)) return 0;
         for (size_t j = 0; j < i; j++)
-            if (source_covers(m->excludes[j], m->excludes[i])) return 0;
+            if (path_covers(m->excludes[j], m->excludes[i])) return 0;
     }
     char previous[PATH_MAX] = "";
     for (int i = 0; i < m->root_count; i++)
@@ -1109,10 +1102,10 @@ int manifest_selection_valid(const Manifest *m)
             (root->policy == ROOT_POLICY_HOME_RELATIVE &&
              (!root->has_restore_path || !canonical_path(root->restore_path, 0, 1)))) return 0;
         for (size_t j = 0; j < m->exclude_count; j++)
-            if (source_covers(m->excludes[j], source)) return 0;
+            if (path_covers(m->excludes[j], source)) return 0;
         for (int j = 0; j < i; j++)
-            if (source_covers(m->roots[j].payload_path, root->payload_path) ||
-                source_covers(root->payload_path, m->roots[j].payload_path)) return 0;
+            if (path_covers(m->roots[j].payload_path, root->payload_path) ||
+                path_covers(root->payload_path, m->roots[j].payload_path)) return 0;
         strcpy(previous, source);
     }
     return 1;
@@ -1128,13 +1121,13 @@ int manifest_entry_owned(const Manifest *m, int root_index, const char *relative
     if (!*relative) strcpy(entry, root);
     else if (path_join(entry, sizeof(entry), root, relative) < 0) return -1;
     for (size_t i = 0; i < m->exclude_count; i++)
-        if (source_covers(m->excludes[i], entry)) return 0;
+        if (path_covers(m->excludes[i], entry)) return 0;
     for (int i = 0; i < m->root_count; i++)
     {
         char child[PATH_MAX];
         if (i == root_index) continue;
         if (manifest_root_source_path(m, i, child) < 0) return -1;
-        if (source_covers(root, child) && source_covers(child, entry)) return 0;
+        if (path_covers(root, child) && path_covers(child, entry)) return 0;
     }
     return 1;
 }

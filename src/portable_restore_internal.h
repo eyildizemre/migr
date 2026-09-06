@@ -38,6 +38,25 @@ typedef struct {
     uint64_t hash_salt;
 } ParentMap;
 
+/*
+ * A destination-sorted view over one restore attempt's entries, so the D34
+ * destination ancestor-conflict walk (below) can be shared even though
+ * preflight addresses entries through a sorted PreflightEntry* array and
+ * replay addresses them through an in-place-sorted ReplayEntry array.
+ * `entries`/`count` describe the already-destination-sorted sequence;
+ * `get_destination`/`is_directory` read index `i` out of it however the
+ * caller's own entry type requires. Sharing this view rather than the
+ * entries themselves keeps preflight's and replay's destination checks two
+ * independent enforcement points (docs/DECISIONS.md D34) -- only the lookup
+ * and ancestor walk underneath them is common.
+ */
+typedef struct {
+    const void *entries;
+    size_t count;
+    const char *(*get_destination)(const void *entries, size_t index);
+    int (*is_directory)(const void *entries, size_t index);
+} DestinationView;
+
 /* The declarations below are provided by portable_restore_shared.c. */
 void *preflight_alloc(PreflightMemory *memory, size_t size);
 void *preflight_realloc(PreflightMemory *memory, void *pointer,
@@ -63,11 +82,31 @@ int xdg_destination_valid(const char * const *xdg_dirs,
 int destination_path_build(const ManifestRoot *root, const char *logical,
                            const char * const *xdg_dirs,
                            char *out, size_t out_size);
+int destination_absolute_path_build(
+    const ManifestRoot *root, const char *logical,
+    const char * const *xdg_dirs, const char *destination_home,
+    char *out, size_t out_size);
 int destination_relative_path_build(const char *prefix, const char *logical,
                                     char *out, size_t out_size);
 int open_xdg_destination_anchor(const char *path, int *out_fd,
                                 char *out_rel, size_t rel_size);
 int sidecar_kind_to_type(SidecarObjectKind kind, mode_t *type);
 int sidecar_is_complete_readonly(int container_fd);
+
+/*
+ * Whether some proper ancestor of `path` -- walked component boundary by
+ * component boundary, matched against `view` by exact string, never
+ * touching the filesystem -- is present with a kind other than directory.
+ * `view->entries` must already be sorted ascending by `get_destination`.
+ *
+ * Returns 1 if such an ancestor exists (a real conflict), 0 if none does, or
+ * -1 if `path` is too long to walk at all. The three are deliberately
+ * distinct: preflight treats both nonzero results as one violation, while
+ * replay's too-long case is an internal bailout that skips its usual
+ * per-entry failure report -- each caller maps the result to its own
+ * diagnostic instead of this function picking one for both.
+ */
+int destination_view_ancestor_conflict(const DestinationView *view,
+                                       const char *path);
 
 #endif
