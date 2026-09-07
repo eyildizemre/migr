@@ -381,7 +381,6 @@ int progress_ticker_stop(ProgressTicker *ticker)
         return -1;
     }
 
-    int thread_error = 0;
     if (ticker->running)
     {
         rc = pthread_join(ticker->thread, NULL);
@@ -391,7 +390,6 @@ int progress_ticker_stop(ProgressTicker *ticker)
             return -1;
         }
         ticker->running = 0;
-        thread_error = ticker->thread_error;
     }
 
     rc = pthread_mutex_destroy(&ticker->lock);
@@ -401,11 +399,6 @@ int progress_ticker_stop(ProgressTicker *ticker)
         return -1;
     }
     memset(ticker, 0, sizeof(*ticker));
-    if (thread_error != 0)
-    {
-        errno = thread_error;
-        return -1;
-    }
     return 0;
 }
 

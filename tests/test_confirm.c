@@ -1,3 +1,4 @@
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -6,6 +7,16 @@
 #include "utils.h"
 
 static int failures = 0;
+
+static void progress_ticker_noop_redraw(
+    const ProgressTickerSnapshot *snapshot,
+    const struct timespec *now,
+    void *context)
+{
+    (void)snapshot;
+    (void)now;
+    (void)context;
+}
 
 static void check(int condition, const char *label)
 {
@@ -80,9 +91,48 @@ static int run_confirm(const char *input, int default_yes,
     return result;
 }
 
+static void test_progress_ticker_stop_ignores_resolved_thread_error(void)
+{
+    ProgressTicker ticker;
+    const struct timespec snapshot_at = {0};
+
+    int rc = progress_ticker_start(&ticker, progress_ticker_noop_redraw, NULL);
+    check(rc == 0, "progress ticker starts for stop regression");
+    if (rc != 0)
+        return;
+
+    check(ticker.initialized && ticker.running,
+          "progress ticker reports a live worker after start");
+    check(progress_ticker_snapshot(&ticker, 1, 1, 0, 0,
+                                   "fixture", &snapshot_at) == 0,
+          "progress ticker accepts a synchronized snapshot");
+
+    rc = pthread_mutex_lock(&ticker.lock);
+    check(rc == 0, "progress ticker state can be locked for fault injection");
+    if (rc == 0)
+    {
+        ticker.thread_error = EIO;
+        rc = pthread_mutex_unlock(&ticker.lock);
+        check(rc == 0,
+              "progress ticker state unlocks after fault injection");
+    }
+
+    rc = progress_ticker_stop(&ticker);
+    check(rc == 0,
+          "resolved ticker thread error does not fail stop after join");
+    if (rc == 0)
+    {
+        ProgressTicker cleared = {0};
+        check(memcmp(&ticker, &cleared, sizeof(ticker)) == 0,
+              "successful ticker stop clears ticker state");
+    }
+}
+
 int main(void)
 {
     char output[256];
+
+    test_progress_ticker_stop_ignores_resolved_thread_error();
 
     check(run_confirm("\n", 1, output, sizeof(output)) == 1,
           "bare Enter accepts the default-yes prompt");
@@ -111,7 +161,7 @@ int main(void)
 
     if (failures != 0)
     {
-        printf("%d confirm helper test(s) failed\n", failures);
+        printf("%d utility helper test(s) failed\n", failures);
         return 1;
     }
     return 0;
