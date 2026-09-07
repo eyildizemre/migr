@@ -2454,6 +2454,7 @@ static void test_network_config_restore_requires_declared_directory(void)
 static void test_network_config_backends(unsigned int mask, int blocked_index,
                                          int broken_index, int preview)
 {
+    const int running_as_root = geteuid() == 0;
     printf(BLUE "::" NC " network config: backend isolation (%u, %d, %d, %d)\n",
            mask, blocked_index, broken_index, preview);
     const char *names[] = { "NetworkManager", "netplan", "systemd-networkd",
@@ -2518,7 +2519,8 @@ static void test_network_config_backends(unsigned int mask, int blocked_index,
         char file[PATH_MAX];
         join_path(file, sizeof(file), dest[i], files[i]);
         int expected = (mask & (1u << i)) && !preview &&
-                       (int)i != blocked_index && (int)i != broken_index;
+                       ((int)i != blocked_index || running_as_root) &&
+                       (int)i != broken_index;
         check(expected ? file_matches(file, contents[i], 0600) : access(file, F_OK) != 0,
               "each backend restores only its own saved bytes and mode");
     }
@@ -2541,11 +2543,17 @@ static void test_network_config_backends(unsigned int mask, int blocked_index,
     }
     if (blocked_index >= 0)
     {
-        char saved_path[128];
-        snprintf(saved_path, sizeof(saved_path), "network/%s/", subdirs[blocked_index]);
-        check(strstr(output, "Note: could not write") != NULL &&
-              strstr(output, saved_path) != NULL,
-              "unwritable backend identifies the saved source in an informational note");
+        if (running_as_root)
+            printf("  " YELLOW "-" NC
+                   " unwritable-backend diagnostic skipped: root can write the fixture directory\n");
+        else
+        {
+            char saved_path[128];
+            snprintf(saved_path, sizeof(saved_path), "network/%s/", subdirs[blocked_index]);
+            check(strstr(output, "Note: could not write") != NULL &&
+                  strstr(output, saved_path) != NULL,
+                  "unwritable backend identifies the saved source in an informational note");
+        }
         if (chmod(dest[blocked_index], 0700) != 0)
             exit(1);
     }
