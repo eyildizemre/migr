@@ -3013,9 +3013,18 @@ Entry placement is therefore a claim on a resolved parent plus component, and
 different path spelling — including symlinked trust roots and aliases — does
 not make two destinations distinct. This rule applies to every versioned
 manifest and to both native and portable representations. Filename components
-are compared byte-for-byte for now; destination-filesystem filename equivalence
-(including case folding and Unicode normalization) remains an open capability
-boundary and is not treated as solved by the identity model.
+are compared byte-for-byte within a destination namespace node. Mount-view
+identity is tracked per node for diagnosis, but it must never be used to declare
+two equal-inode destinations disjoint: a route's fd, permissions or mount
+options must not be substituted for another route's. This rule applies to every
+versioned manifest and to both native and portable representations. When two
+distinct namespace slots could be equivalent under a directory's non-byte
+lookup semantics and at least one is not resolved to an existing on-disk
+object, the nearest existing ancestor is queried for a kernel-reported
+byte-exact property. A directory proven byte-exact keeps the byte comparison;
+a directory reported non-byte-exact, or one whose capability cannot be
+established, causes that destination to be refused rather than guessed. No
+Unicode or locale-aware equivalence engine is implied by this boundary.
 
 Preflight the combined mapped entry set before mutation on both representations.
 Reject two distinct source entries mapping to the same destination, including two

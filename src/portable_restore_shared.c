@@ -12,9 +12,11 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <linux/fs.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -794,9 +796,12 @@ typedef struct {
     size_t parent;
     size_t child;
     size_t non_directory_owner;
+    size_t owner;
     char *component;
     size_t component_length;
     uint64_t hash;
+    int resolved;
+    int existing_on_disk;
     int used;
 } DestinationNamespaceSlot;
 
@@ -1120,9 +1125,12 @@ static DestinationNamespaceSlot *destination_namespace_slot(
         .parent = parent,
         .child = SIZE_MAX,
         .non_directory_owner = SIZE_MAX,
+        .owner = SIZE_MAX,
         .component = copy,
         .component_length = length,
         .hash = hash,
+        .resolved = 0,
+        .existing_on_disk = 0,
         .used = 1
     };
     graph->namespace_count++;
@@ -1146,6 +1154,100 @@ static int destination_planned_node(DestinationIdentityGraph *graph,
     return 0;
 }
 
+static int destination_ascii_case_equal(unsigned char first,
+                                        unsigned char second)
+{
+    if (first == second)
+        return 1;
+    if (first >= 'A' && first <= 'Z')
+        first = (unsigned char)(first + ('a' - 'A'));
+    if (second >= 'A' && second <= 'Z')
+        second = (unsigned char)(second + ('a' - 'A'));
+    return first == second &&
+           ((first >= 'a' && first <= 'z') ||
+            (second >= 'a' && second <= 'z'));
+}
+
+/* This is only a conservative trigger. It never decides that two names are
+ * equal: the directory's kernel-reported lookup capability makes that
+ * decision boundary explicit below. Keeping the trigger ASCII-only avoids
+ * pretending that this restore path implements Unicode collation. */
+static int destination_names_may_casefold(const char *first, size_t first_length,
+                                          const char *second,
+                                          size_t second_length)
+{
+    if (first == NULL || second == NULL || first_length != second_length)
+        return 0;
+
+    int differs = 0;
+    for (size_t index = 0; index < first_length; index++)
+    {
+        unsigned char first_byte = (unsigned char)first[index];
+        unsigned char second_byte = (unsigned char)second[index];
+        if (first_byte == second_byte)
+            continue;
+        if (!destination_ascii_case_equal(first_byte, second_byte))
+            return 0;
+        differs = 1;
+    }
+    return differs;
+}
+
+static DestinationNamespaceSlot *destination_name_conflict_slot(
+    const DestinationIdentityGraph *graph, size_t parent,
+    const DestinationNamespaceSlot *current)
+{
+    DestinationNamespaceSlot *slots = graph->namespace_slots;
+    for (size_t index = 0; index < graph->namespace_capacity; index++)
+    {
+        DestinationNamespaceSlot *candidate = &slots[index];
+        if (!candidate->used || candidate == current ||
+            candidate->parent != parent || !candidate->resolved ||
+            (candidate->existing_on_disk && current->existing_on_disk) ||
+            !destination_names_may_casefold(
+                candidate->component, candidate->component_length,
+                current->component, current->component_length))
+            continue;
+        return candidate;
+    }
+    return NULL;
+}
+
+static DestinationIdentityStatus destination_name_equivalence_check(
+    const DestinationIdentityGraph *graph, size_t parent,
+    const DestinationNamespaceSlot *current, int nearest_existing_fd,
+    DestinationIdentityNameConflict *conflict)
+{
+    DestinationNamespaceSlot *candidate =
+        destination_name_conflict_slot(graph, parent, current);
+    if (candidate == NULL)
+        return DESTINATION_IDENTITY_OK;
+
+    *conflict = (DestinationIdentityNameConflict){
+        .owner = candidate->owner,
+        .prior_component = candidate->component,
+        .prior_component_length = candidate->component_length,
+        .current_component = current->component,
+        .current_component_length = current->component_length,
+        .failure = DESTINATION_NAME_FAILURE_UNKNOWN
+    };
+
+    if (nearest_existing_fd < 0)
+    {
+        errno = EIO;
+        return DESTINATION_IDENTITY_NAME_EQUIVALENCE_ERROR;
+    }
+
+    unsigned long flags = 0;
+    if (ioctl(nearest_existing_fd, FS_IOC_GETFLAGS, &flags) != 0)
+        return DESTINATION_IDENTITY_NAME_EQUIVALENCE_ERROR;
+    if ((flags & (unsigned long)FS_CASEFOLD_FL) == 0)
+        return DESTINATION_IDENTITY_OK;
+
+    conflict->failure = DESTINATION_NAME_FAILURE_CASEFOLD;
+    errno = EOPNOTSUPP;
+    return DESTINATION_IDENTITY_NAME_EQUIVALENCE_ERROR;
+}
 
 static DestinationIdentityStatus destination_graph_path_error(int saved);
 
@@ -1291,16 +1393,46 @@ static DestinationIdentityStatus destination_graph_path_error(int saved)
         : DESTINATION_IDENTITY_PATH_ERROR;
 }
 
+static int destination_route_fds_close(int *current_fd,
+                                       int *nearest_existing_fd)
+{
+    int saved = 0;
+    if (current_fd != NULL && *current_fd >= 0)
+    {
+        if (close(*current_fd) != 0 && saved == 0)
+            saved = errno;
+        *current_fd = -1;
+    }
+    if (nearest_existing_fd != NULL && *nearest_existing_fd >= 0)
+    {
+        if (close(*nearest_existing_fd) != 0 && saved == 0)
+            saved = errno;
+        *nearest_existing_fd = -1;
+    }
+    if (saved != 0)
+    {
+        errno = saved;
+        return -1;
+    }
+    return 0;
+}
+
 DestinationIdentityStatus destination_identity_graph_add(
     DestinationIdentityGraph *graph, int anchor_fd, const char *relative,
     DestinationIdentityClaim claim, size_t owner,
     DestinationIdentityPlacement *placement,
-    size_t *conflicting_owner)
+    size_t *conflicting_owner,
+    DestinationIdentityNameConflict *name_conflict)
 {
     if (conflicting_owner != NULL)
         *conflicting_owner = SIZE_MAX;
+    if (name_conflict != NULL)
+        *name_conflict = (DestinationIdentityNameConflict){
+            .owner = SIZE_MAX
+        };
     if (graph == NULL || anchor_fd < 0 || relative == NULL ||
-        placement == NULL || conflicting_owner == NULL || graph->finalized ||
+        placement == NULL || conflicting_owner == NULL ||
+        name_conflict == NULL || graph->finalized ||
         owner == SIZE_MAX ||
         (claim != DESTINATION_IDENTITY_DIRECTORY &&
          claim != DESTINATION_IDENTITY_NON_DIRECTORY))
@@ -1319,6 +1451,7 @@ DestinationIdentityStatus destination_identity_graph_add(
     int current_fd = dup_cloexec(anchor_fd);
     if (current_fd < 0)
         return destination_graph_path_error(errno);
+    int nearest_existing_fd = -1;
 
     size_t current_node;
     if (destination_existing_node(graph, current_fd, NULL,
@@ -1370,7 +1503,10 @@ DestinationIdentityStatus destination_identity_graph_add(
         if (component_length == 0 || component_length > NAME_MAX ||
             !strcmp(cursor, ".") || !strcmp(cursor, ".."))
         {
-            close(current_fd);
+            if (current_fd >= 0)
+                close(current_fd);
+            if (nearest_existing_fd >= 0)
+                close(nearest_existing_fd);
             errno = EINVAL;
             return DESTINATION_IDENTITY_PATH_ERROR;
         }
@@ -1383,13 +1519,19 @@ DestinationIdentityStatus destination_identity_graph_add(
             int saved = errno;
             if (current_fd >= 0)
                 close(current_fd);
+            if (nearest_existing_fd >= 0)
+                close(nearest_existing_fd);
             return destination_graph_path_error(saved);
         }
+        if (slot->owner == SIZE_MAX)
+            slot->owner = owner;
         if (slot->non_directory_owner != SIZE_MAX)
         {
             *conflicting_owner = slot->non_directory_owner;
             if (current_fd >= 0)
                 close(current_fd);
+            if (nearest_existing_fd >= 0)
+                close(nearest_existing_fd);
             errno = EEXIST;
             return DESTINATION_IDENTITY_COLLISION;
         }
@@ -1403,6 +1545,8 @@ DestinationIdentityStatus destination_identity_graph_add(
                 {
                     if (current_fd >= 0)
                         close(current_fd);
+                    if (nearest_existing_fd >= 0)
+                        close(nearest_existing_fd);
                     errno = ESTALE;
                     return DESTINATION_IDENTITY_PATH_ERROR;
                 }
@@ -1411,9 +1555,12 @@ DestinationIdentityStatus destination_identity_graph_add(
                         nodes[slot->child].metadata_owner;
                 if (current_fd >= 0)
                     close(current_fd);
+                if (nearest_existing_fd >= 0)
+                    close(nearest_existing_fd);
                 errno = EEXIST;
                 return DESTINATION_IDENTITY_COLLISION;
             }
+            int existing_on_disk = 0;
             if (current_fd >= 0)
             {
                 struct stat st;
@@ -1424,21 +1571,43 @@ DestinationIdentityStatus destination_identity_graph_add(
                     if (S_ISDIR(st.st_mode))
                     {
                         close(current_fd);
+                        if (nearest_existing_fd >= 0)
+                            close(nearest_existing_fd);
                         errno = EISDIR;
                         return DESTINATION_IDENTITY_COLLISION;
                     }
+                    existing_on_disk = 1;
                 }
                 else if (errno != ENOENT)
                 {
                     int saved = errno;
                     close(current_fd);
+                    if (nearest_existing_fd >= 0)
+                        close(nearest_existing_fd);
                     return destination_graph_path_error(saved);
                 }
+            }
+            slot->resolved = 1;
+            slot->existing_on_disk = existing_on_disk;
+            DestinationIdentityStatus name_status =
+                destination_name_equivalence_check(
+                    graph, current_node, slot,
+                    current_fd >= 0 ? current_fd : nearest_existing_fd,
+                    name_conflict);
+            if (name_status != DESTINATION_IDENTITY_OK)
+            {
+                *conflicting_owner = name_conflict->owner;
+                if (current_fd >= 0)
+                    close(current_fd);
+                if (nearest_existing_fd >= 0)
+                    close(nearest_existing_fd);
+                return name_status;
             }
             slot->non_directory_owner = owner;
             placement->node = current_node;
             placement->is_directory = 0;
-            if (current_fd >= 0 && close(current_fd) != 0)
+            if (destination_route_fds_close(&current_fd,
+                                            &nearest_existing_fd) != 0)
                 return destination_graph_path_error(errno);
             return DESTINATION_IDENTITY_OK;
         }
@@ -1453,6 +1622,8 @@ DestinationIdentityStatus destination_identity_graph_add(
             {
                 if (current_fd >= 0)
                     close(current_fd);
+                if (nearest_existing_fd >= 0)
+                    close(nearest_existing_fd);
                 errno = ESTALE;
                 return DESTINATION_IDENTITY_PATH_ERROR;
             }
@@ -1466,8 +1637,14 @@ DestinationIdentityStatus destination_identity_graph_add(
                 {
                     int saved = errno;
                     close(current_fd);
+                    if (nearest_existing_fd >= 0)
+                        close(nearest_existing_fd);
                     return destination_graph_path_error(saved);
                 }
+                /* The node may already be interned through another route.
+                 * Record this route's view, while keeping its fd for the
+                 * descendant traversal below. */
+                destination_note_mount_view(graph, child_node, next_fd);
             }
         }
         else if (current_fd >= 0)
@@ -1479,6 +1656,8 @@ DestinationIdentityStatus destination_identity_graph_add(
                 if (!S_ISDIR(st.st_mode))
                 {
                     close(current_fd);
+                    if (nearest_existing_fd >= 0)
+                        close(nearest_existing_fd);
                     errno = ENOTDIR;
                     return DESTINATION_IDENTITY_PATH_ERROR;
                 }
@@ -1493,9 +1672,13 @@ DestinationIdentityStatus destination_identity_graph_add(
                     if (next_fd >= 0)
                         close(next_fd);
                     close(current_fd);
+                    if (nearest_existing_fd >= 0)
+                        close(nearest_existing_fd);
                     return destination_graph_path_error(saved);
                 }
                 slot->child = child_node;
+                slot->resolved = 1;
+                slot->existing_on_disk = 1;
             }
             else if (errno == ENOENT)
             {
@@ -1503,24 +1686,62 @@ DestinationIdentityStatus destination_identity_graph_add(
                 {
                     int saved = errno;
                     close(current_fd);
+                    if (nearest_existing_fd >= 0)
+                        close(nearest_existing_fd);
                     return destination_graph_path_error(saved);
                 }
+                slot->resolved = 1;
+                slot->existing_on_disk = 0;
             }
             else
             {
                 int saved = errno;
                 close(current_fd);
+                if (nearest_existing_fd >= 0)
+                    close(nearest_existing_fd);
                 return destination_graph_path_error(saved);
             }
         }
         else if (destination_planned_node(graph, slot, &child_node) != 0)
-            return destination_graph_path_error(errno);
+        {
+            int saved = errno;
+            if (nearest_existing_fd >= 0)
+                close(nearest_existing_fd);
+            return destination_graph_path_error(saved);
+        }
+        else
+        {
+            slot->resolved = 1;
+            slot->existing_on_disk = 0;
+        }
 
-        if (current_fd >= 0 && close(current_fd) != 0)
+        DestinationIdentityStatus name_status =
+            destination_name_equivalence_check(
+                graph, current_node, slot,
+                current_fd >= 0 ? current_fd : nearest_existing_fd,
+                name_conflict);
+        if (name_status != DESTINATION_IDENTITY_OK)
+        {
+            *conflicting_owner = name_conflict->owner;
+            if (current_fd >= 0)
+                close(current_fd);
+            if (nearest_existing_fd >= 0)
+                close(nearest_existing_fd);
+            return name_status;
+        }
+
+        if (current_fd >= 0 && next_fd < 0)
+        {
+            nearest_existing_fd = current_fd;
+            current_fd = -1;
+        }
+        else if (current_fd >= 0 && close(current_fd) != 0)
         {
             int saved = errno;
             if (next_fd >= 0)
                 close(next_fd);
+            if (nearest_existing_fd >= 0)
+                close(nearest_existing_fd);
             return destination_graph_path_error(saved);
         }
         current_fd = next_fd;
@@ -1538,6 +1759,8 @@ DestinationIdentityStatus destination_identity_graph_add(
                         nodes[current_node].metadata_owner;
                     if (current_fd >= 0)
                         close(current_fd);
+                    if (nearest_existing_fd >= 0)
+                        close(nearest_existing_fd);
                     errno = EEXIST;
                     return DESTINATION_IDENTITY_COLLISION;
                 }
@@ -1545,7 +1768,8 @@ DestinationIdentityStatus destination_identity_graph_add(
             }
             placement->node = current_node;
             placement->is_directory = 1;
-            if (current_fd >= 0 && close(current_fd) != 0)
+            if (destination_route_fds_close(&current_fd,
+                                            &nearest_existing_fd) != 0)
                 return destination_graph_path_error(errno);
             return DESTINATION_IDENTITY_OK;
         }
@@ -1652,10 +1876,11 @@ int destination_identity_graph_add_entries(
 
         DestinationIdentityPlacement discard;
         size_t conflicting_owner;
+        DestinationIdentityNameConflict name_conflict;
         DestinationIdentityStatus status = destination_identity_graph_add(
             graph, anchor, relative, view.claim, index,
             view.placement == NULL ? &discard : view.placement,
-            &conflicting_owner);
+            &conflicting_owner, &name_conflict);
         if (status == DESTINATION_IDENTITY_COLLISION)
         {
             char destination[PATH_MAX];
@@ -1683,6 +1908,50 @@ int destination_identity_graph_add_entries(
                 print_error("Error: Manifest root %s entry %s conflicts with an existing directory at restore destination: %s\n",
                             root->id, logical[0] == '\0' ? "." : logical,
                             destination);
+            report_failure(context, index);
+            if (collision_policy == DESTINATION_IDENTITY_STOP_ON_COLLISION)
+                return -1;
+            continue;
+        }
+        if (status == DESTINATION_IDENTITY_NAME_EQUIVALENCE_ERROR)
+        {
+            const char *reason =
+                name_conflict.failure == DESTINATION_NAME_FAILURE_CASEFOLD
+                    ? "casefold name lookup"
+                    : "name lookup capability is unknown";
+            char destination[PATH_MAX];
+            if (destination_absolute_path_build(
+                    root, logical, destination_xdg_dirs,
+                    destination_home_path, destination,
+                    sizeof(destination)) != 0)
+                snprintf(destination, sizeof(destination), "%s", relative);
+
+            DestinationIdentityEntryView previous;
+            char previous_logical[PATH_MAX];
+            if (name_conflict.owner < entry_count)
+                reader(context, name_conflict.owner, &previous);
+            if (name_conflict.owner < entry_count &&
+                previous.root_index < (size_t)manifest->root_count &&
+                destination_identity_logical_copy(
+                    &previous, previous_logical) == 0)
+                print_error("Error: Manifest root %s entry %s and manifest root %s entry %s have potentially equivalent destination names %.*s and %.*s under %s; refusing because %s\n",
+                            manifest->roots[previous.root_index].id,
+                            previous_logical[0] == '\0' ? "." :
+                                previous_logical,
+                            root->id, logical[0] == '\0' ? "." : logical,
+                            (int)name_conflict.prior_component_length,
+                            name_conflict.prior_component,
+                            (int)name_conflict.current_component_length,
+                            name_conflict.current_component,
+                            destination, reason);
+            else
+                print_error("Error: Manifest root %s entry %s has potentially equivalent destination names %.*s and %.*s under %s; refusing because %s\n",
+                            root->id, logical[0] == '\0' ? "." : logical,
+                            (int)name_conflict.prior_component_length,
+                            name_conflict.prior_component,
+                            (int)name_conflict.current_component_length,
+                            name_conflict.current_component,
+                            destination, reason);
             report_failure(context, index);
             if (collision_policy == DESTINATION_IDENTITY_STOP_ON_COLLISION)
                 return -1;

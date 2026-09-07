@@ -9,15 +9,19 @@
 #include <fcntl.h>
 #include <ftw.h>
 #include <limits.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <sys/xattr.h>
 #include <unistd.h>
 
 #include "manifest.h"
 #include "portable.h"
+#include "portable_restore_internal.h"
 #include "portable_restore.h"
 #include "portable_restore_replay_internal.h"
 #include "sidecar.h"
@@ -32,8 +36,11 @@ extern void replay_copy_bytes(char *destination, size_t destination_size,
 #define NC    "\033[0m"
 
 static int failures;
+static int skips;
 static int sync_calls;
 static int sync_should_fail;
+
+enum { CHILD_SKIP = 77 };
 
 extern int __real_syncfs(int fd);
 
@@ -57,6 +64,12 @@ static void check(int condition, const char *label)
         printf("  " RED "x" NC " %s\n", label);
         failures++;
     }
+}
+
+static void skip_case(const char *label, const char *reason)
+{
+    printf("  " YELLOW "-" NC " %s skipped: %s\n", label, reason);
+    skips++;
 }
 
 static void fatal(const char *message)
@@ -112,6 +125,57 @@ static void remove_tree(const char *path)
     if (nftw(path, chmod_directory_callback, 16, FTW_PHYS) != 0 ||
         nftw(path, remove_callback, 16, FTW_DEPTH | FTW_PHYS) != 0)
         fatal("could not remove fixture tree");
+}
+
+static int write_proc_file(const char *path, const char *content)
+{
+    int fd = open(path, O_WRONLY | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    size_t length = strlen(content);
+    ssize_t written = write(fd, content, length);
+    int saved_errno = errno;
+    int close_rc = close(fd);
+    if (written < 0)
+        errno = saved_errno;
+    return written == (ssize_t)length && close_rc == 0 ? 0 : -1;
+}
+
+static int setup_bind_mount_namespace(void)
+{
+    uid_t host_uid = getuid();
+    gid_t host_gid = getgid();
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0)
+        return -1;
+
+    char mapping[64];
+    int length = snprintf(mapping, sizeof(mapping), "0 %lu 1\n",
+                          (unsigned long)host_uid);
+    if (length < 0 || (size_t)length >= sizeof(mapping) ||
+        write_proc_file("/proc/self/uid_map", mapping) != 0 ||
+        write_proc_file("/proc/self/setgroups", "deny\n") != 0)
+        return -1;
+
+    length = snprintf(mapping, sizeof(mapping), "0 %lu 1\n",
+                      (unsigned long)host_gid);
+    if (length < 0 || (size_t)length >= sizeof(mapping) ||
+        write_proc_file("/proc/self/gid_map", mapping) != 0)
+        return -1;
+
+    return mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+}
+
+static int path_mount_id(const char *path, unsigned int *mount_id)
+{
+    if (path == NULL || mount_id == NULL)
+        return -1;
+    struct statx state;
+    memset(&state, 0, sizeof(state));
+    if (statx(AT_FDCWD, path, AT_STATX_DONT_SYNC, STATX_MNT_ID, &state) != 0 ||
+        (state.stx_mask & STATX_MNT_ID) == 0)
+        return -1;
+    *mount_id = state.stx_mnt_id;
+    return 0;
 }
 
 static void path_join(char *out, size_t out_size, const char *base,
@@ -530,6 +594,115 @@ static int run_replay_with_xdg(
     int result = portable_restore_replay_at(&request, report);
     manifest_free(&manifest);
     return result;
+}
+
+static int run_portable_mount_case(
+    Fixture *fixture, const char *documents_root, const char *downloads_root,
+    const char *documents_shared, const char *downloads_shared,
+    const char *sentinel)
+{
+    pid_t pid = fork();
+    if (pid < 0)
+        fatal("could not fork portable mount-view fixture");
+    if (pid == 0)
+    {
+        if (setup_bind_mount_namespace() != 0 ||
+            mount(downloads_shared, documents_shared, NULL, MS_BIND, NULL) != 0)
+            _exit(CHILD_SKIP);
+
+        struct stat documents_st, downloads_st;
+        unsigned int documents_mount_id, downloads_mount_id;
+        if (stat(documents_shared, &documents_st) != 0 ||
+            stat(downloads_shared, &downloads_st) != 0 ||
+            documents_st.st_dev != downloads_st.st_dev ||
+            documents_st.st_ino != downloads_st.st_ino ||
+            path_mount_id(documents_shared, &documents_mount_id) != 0 ||
+            path_mount_id(downloads_shared, &downloads_mount_id) != 0 ||
+            documents_mount_id == downloads_mount_id)
+            _exit(CHILD_SKIP);
+
+        const char *xdg_dirs[XDG_KEY_COUNT] = {0};
+        xdg_dirs[0] = documents_root;
+        xdg_dirs[1] = downloads_root;
+        int result = run_preflight_with_xdg(
+            fixture, (const char * const *)xdg_dirs);
+        _exit(result != 0 && file_equals_noatime(sentinel, "ORIGINAL")
+                  ? 0 : 1);
+    }
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0)
+        fatal("could not wait for portable mount-view fixture");
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+/* Keep this at the identity-graph boundary: a full restore with two directory
+ * metadata owners would correctly stop earlier on R2a's alias collision. */
+static int run_nested_mount_view_graph_case(
+    const char *documents_root, const char *downloads_root,
+    const char *documents_shared, const char *downloads_shared,
+    const char *alternate)
+{
+    pid_t pid = fork();
+    if (pid < 0)
+        fatal("could not fork portable nested mount-view fixture");
+    if (pid == 0)
+    {
+        if (setup_bind_mount_namespace() != 0 ||
+            mount(downloads_shared, documents_shared, NULL, MS_BIND, NULL) != 0)
+            _exit(CHILD_SKIP);
+
+        struct stat documents_st, downloads_st;
+        unsigned int documents_mount_id, downloads_mount_id;
+        if (stat(documents_shared, &documents_st) != 0 ||
+            stat(downloads_shared, &downloads_st) != 0 ||
+            documents_st.st_dev != downloads_st.st_dev ||
+            documents_st.st_ino != downloads_st.st_ino ||
+            path_mount_id(documents_shared, &documents_mount_id) != 0 ||
+            path_mount_id(downloads_shared, &downloads_mount_id) != 0 ||
+            documents_mount_id == downloads_mount_id)
+            _exit(CHILD_SKIP);
+
+        char documents_desc[PATH_MAX];
+        path_join(documents_desc, sizeof(documents_desc),
+                  documents_shared, "/desc");
+        if (mount(alternate, documents_desc, NULL, MS_BIND, NULL) != 0)
+            _exit(CHILD_SKIP);
+
+        int documents_fd = open_dir(documents_root);
+        int downloads_fd = open_dir(downloads_root);
+        if (documents_fd < 0 || downloads_fd < 0)
+            _exit(1);
+
+        DestinationIdentityGraph graph;
+        destination_identity_graph_init(
+            &graph, DESTINATION_IDENTITY_PORTABLE_BOUNDS);
+        DestinationIdentityPlacement placement;
+        size_t conflicting_owner;
+        DestinationIdentityNameConflict name_conflict;
+        errno = 0;
+        DestinationIdentityStatus first = destination_identity_graph_add(
+            &graph, downloads_fd, "shared/desc/docs-file",
+            DESTINATION_IDENTITY_NON_DIRECTORY, 1, &placement,
+            &conflicting_owner, &name_conflict);
+        errno = 0;
+        DestinationIdentityStatus second = destination_identity_graph_add(
+            &graph, documents_fd, "shared/desc/downloads-file",
+            DESTINATION_IDENTITY_NON_DIRECTORY, 2, &placement,
+            &conflicting_owner, &name_conflict);
+        int second_errno = errno;
+        destination_identity_graph_free(&graph);
+        close(documents_fd);
+        close(downloads_fd);
+        _exit(first == DESTINATION_IDENTITY_OK &&
+              second == DESTINATION_IDENTITY_COLLISION &&
+              second_errno == EISDIR ? 0 : 1);
+    }
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0)
+        fatal("could not wait for portable nested mount-view fixture");
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
 static void test_symlink_collection_validation(void)
@@ -1707,6 +1880,200 @@ static void test_resolved_destination_identity_replay(void)
     fixture_close(&fixture);
 }
 
+static void test_ascii_case_distinct_names(void)
+{
+    printf(BLUE "::" NC " portable replay: byte-sensitive directories keep ASCII-case-distinct names\n");
+
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "ASCII-case fixture is created");
+    if (opened != 0)
+        return;
+
+    make_dir_at(fixture.data_fd, "ROOT", 0700);
+    int root_fd = openat(fixture.data_fd, "ROOT",
+                         O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (root_fd < 0)
+        fatal("could not open ASCII-case payload root");
+    write_file_at(root_fd, "Documents", "UPPER");
+    write_file_at(root_fd, "documents", "LOWER");
+    if (close(root_fd) != 0)
+        fatal("could not close ASCII-case payload root");
+
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0,
+                  0755, 10, 1, 20, 2),
+        entry_for("ROOT", "Documents", "Documents", SIDECAR_KIND_REGULAR, 5,
+                  0600, 11, 1, 21, 2),
+        entry_for("ROOT", "documents", "documents", SIDECAR_KIND_REGULAR, 5,
+                  0600, 12, 1, 22, 2)
+    };
+    check(write_sidecar(&fixture, entries, 3, NULL, NULL) == 0,
+          "ASCII-case sidecar is committed");
+
+    check(run_preflight(&fixture) == 0,
+          "ordinary byte-sensitive directory passes portable preflight");
+
+    PortableRestoreReplayReport report;
+    int result = run_replay(&fixture, &report);
+    char upper[PATH_MAX], lower[PATH_MAX];
+    path_join(upper, sizeof(upper), fixture.home, "/restored/Documents");
+    path_join(lower, sizeof(lower), fixture.home, "/restored/documents");
+    check(result == 0 && report.failed_count == 0 &&
+              file_equals_noatime(upper, "UPPER") &&
+              file_equals_noatime(lower, "LOWER"),
+          "ordinary byte-sensitive directory restores both ASCII-case-distinct entries");
+    fixture_close(&fixture);
+}
+
+static void test_portable_identity_graph_keeps_nested_mount_views_route_specific(void)
+{
+    printf(BLUE "::" NC " portable restore identity graph: nested bind-mounted descendants keep route-specific views\n");
+
+    Fixture fixture;
+    ManifestRoot root = root_for();
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "nested mount-view fixture is created");
+    if (opened != 0)
+        return;
+
+    make_dir_at(fixture.home_fd, "Documents", 0700);
+    make_dir_at(fixture.home_fd, "Downloads", 0700);
+    make_dir_at(fixture.home_fd, "alternate", 0700);
+    char documents_root[PATH_MAX], downloads_root[PATH_MAX];
+    char documents_shared[PATH_MAX], downloads_shared[PATH_MAX];
+    char documents_desc[PATH_MAX], downloads_desc[PATH_MAX], alternate[PATH_MAX];
+    path_join(documents_root, sizeof(documents_root), fixture.home,
+              "/Documents");
+    path_join(downloads_root, sizeof(downloads_root), fixture.home,
+              "/Downloads");
+    path_join(documents_shared, sizeof(documents_shared), fixture.home,
+              "/Documents/shared");
+    path_join(downloads_shared, sizeof(downloads_shared), fixture.home,
+              "/Downloads/shared");
+    path_join(documents_desc, sizeof(documents_desc), documents_shared, "/desc");
+    path_join(downloads_desc, sizeof(downloads_desc), downloads_shared, "/desc");
+    path_join(alternate, sizeof(alternate), fixture.home, "/alternate");
+    if (mkdir(documents_shared, 0700) != 0 || mkdir(downloads_shared, 0700) != 0 ||
+        mkdir(documents_desc, 0700) != 0 || mkdir(downloads_desc, 0700) != 0)
+        fatal("could not create nested mount-view destinations");
+
+    char alternate_file[PATH_MAX];
+    path_join(alternate_file, sizeof(alternate_file), alternate,
+              "/downloads-file");
+    if (mkdir(alternate_file, 0700) != 0)
+        fatal("could not create alternate nested mount-view descendant");
+
+    int result = run_nested_mount_view_graph_case(
+        documents_root, downloads_root, documents_shared, downloads_shared,
+        alternate);
+    if (result == CHILD_SKIP)
+        skip_case("portable nested bind-mounted descendant views",
+                  "user namespace, bind mounts, or distinct mount ids are unavailable");
+    else
+        check(result == 0,
+              "portable replay resolves descendants through the current route");
+    fixture_close(&fixture);
+}
+
+static void test_differing_mount_ids_do_not_hide_portable_collisions(void)
+{
+    printf(BLUE "::" NC " portable replay: differing mount ids do not make aliases disjoint\n");
+
+    ManifestRoot bootstrap = root_for();
+    ManifestRoot roots[2];
+    memset(roots, 0, sizeof(roots));
+    strcpy(roots[0].id, "XDG_DOCUMENTS_DIR");
+    roots[0].policy = ROOT_POLICY_XDG;
+    strcpy(roots[0].payload_path, "XDG_DOCUMENTS_DIR");
+    strcpy(roots[0].source_path, "/source/Documents");
+    strcpy(roots[1].id, "XDG_DOWNLOAD_DIR");
+    roots[1].policy = ROOT_POLICY_XDG;
+    strcpy(roots[1].payload_path, "XDG_DOWNLOAD_DIR");
+    strcpy(roots[1].source_path, "/source/Downloads");
+
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &bootstrap);
+    check(opened == 0, "differing-mount-id fixture is created");
+    if (opened != 0)
+        return;
+    check(write_v1_identity_manifest(&fixture, roots, 2) == 0,
+          "differing-mount-id manifest is written");
+    make_dir_at(fixture.data_fd, "XDG_DOCUMENTS_DIR", 0700);
+    make_dir_at(fixture.data_fd, "XDG_DOWNLOAD_DIR", 0700);
+    int documents_payload = openat(fixture.data_fd, "XDG_DOCUMENTS_DIR",
+                                   O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int downloads_payload = openat(fixture.data_fd, "XDG_DOWNLOAD_DIR",
+                                   O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (documents_payload < 0 || downloads_payload < 0)
+        fatal("could not open differing-mount-id payload roots");
+    make_dir_at(documents_payload, "shared", 0700);
+    make_dir_at(downloads_payload, "shared", 0700);
+    int documents_shared_payload = openat(
+        documents_payload, "shared", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int downloads_shared_payload = openat(
+        downloads_payload, "shared", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (documents_shared_payload < 0 || downloads_shared_payload < 0)
+        fatal("could not open differing-mount-id shared payloads");
+    write_file_at(documents_shared_payload, "file", "DOCS");
+    write_file_at(downloads_shared_payload, "file", "DOWNLOADS");
+    if (close(documents_shared_payload) != 0 ||
+        close(downloads_shared_payload) != 0 || close(documents_payload) != 0 ||
+        close(downloads_payload) != 0)
+        fatal("could not close differing-mount-id payloads");
+
+    make_dir_at(fixture.home_fd, "Documents", 0700);
+    make_dir_at(fixture.home_fd, "Downloads", 0700);
+    char documents_root[PATH_MAX], downloads_root[PATH_MAX];
+    char documents_shared[PATH_MAX], downloads_shared[PATH_MAX];
+    char sentinel[PATH_MAX];
+    path_join(documents_root, sizeof(documents_root), fixture.home,
+              "/Documents");
+    path_join(downloads_root, sizeof(downloads_root), fixture.home,
+              "/Downloads");
+    path_join(documents_shared, sizeof(documents_shared), fixture.home,
+              "/Documents/shared");
+    path_join(downloads_shared, sizeof(downloads_shared), fixture.home,
+              "/Downloads/shared");
+    if (mkdir(documents_shared, 0700) != 0 || mkdir(downloads_shared, 0700) != 0)
+        fatal("could not create differing-mount-id destinations");
+    path_join(sentinel, sizeof(sentinel), downloads_shared, "/file");
+    int sentinel_fd = open(sentinel, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+                           0600);
+    if (sentinel_fd < 0 || write(sentinel_fd, "ORIGINAL", 8) != 8 ||
+        close(sentinel_fd) != 0)
+        fatal("could not create differing-mount-id sentinel");
+
+    SidecarEntry entries[] = {
+        entry_for("XDG_DOCUMENTS_DIR", "", "", SIDECAR_KIND_DIRECTORY, 0,
+                  0755, 10, 1, 20, 2),
+        entry_for("XDG_DOCUMENTS_DIR", "shared", "shared",
+                  SIDECAR_KIND_DIRECTORY, 0, 0755, 11, 1, 21, 2),
+        entry_for("XDG_DOCUMENTS_DIR", "shared/file", "shared/file",
+                  SIDECAR_KIND_REGULAR, 4, 0600, 12, 1, 22, 2),
+        entry_for("XDG_DOWNLOAD_DIR", "", "", SIDECAR_KIND_DIRECTORY, 0,
+                  0755, 13, 1, 23, 2),
+        entry_for("XDG_DOWNLOAD_DIR", "shared", "shared",
+                  SIDECAR_KIND_DIRECTORY, 0, 0755, 14, 1, 24, 2),
+        entry_for("XDG_DOWNLOAD_DIR", "shared/file", "shared/file",
+                  SIDECAR_KIND_REGULAR, 8, 0600, 15, 1, 25, 2)
+    };
+    check(write_sidecar(&fixture, entries, 6, NULL, NULL) == 0,
+          "differing-mount-id sidecar is committed");
+
+    int result = run_portable_mount_case(
+        &fixture, documents_root, downloads_root, documents_shared,
+        downloads_shared, sentinel);
+    if (result == CHILD_SKIP)
+        skip_case("portable differing-mount-id alias collision",
+                  "user namespace, bind mounts, or distinct mount ids are unavailable");
+    else
+        check(result == 0 && file_equals_noatime(sentinel, "ORIGINAL"),
+              "portable preflight refuses the collision before mutation");
+    fixture_close(&fixture);
+}
+
 static void test_v2_nested_root_replay_order(void)
 {
     printf(BLUE "::" NC " VERSION=2 replay uses combined destination order across roots\n");
@@ -1820,8 +2187,14 @@ int main(void)
     test_tombstone_skipped();
     test_hardlink_toctou_race();
     test_resolved_destination_identity_replay();
+    test_ascii_case_distinct_names();
+    test_portable_identity_graph_keeps_nested_mount_views_route_specific();
+    test_differing_mount_ids_do_not_hide_portable_collisions();
     test_v2_nested_root_replay_order();
     test_copy_bytes_rejects_corruption();
+    if (skips != 0)
+        printf(YELLOW "%d portable restore replay test(s) skipped" NC "\n",
+               skips);
     printf("%s%s%s\n", failures == 0 ? GREEN : RED,
            failures == 0 ? "all portable restore replay tests passed" :
            "portable restore replay tests failed", NC);

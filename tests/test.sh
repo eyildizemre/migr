@@ -10,6 +10,8 @@ NC='\033[0m'
 
 PORTABLE_VFAT_MOUNT=""
 PORTABLE_VFAT_LOOP=""
+CASEFOLD_MOUNT=""
+CASEFOLD_LOOP=""
 
 # Every backup whose scope exports a package list forks the distribution's real
 # listing command, and a single `dnf repoquery` costs more than the entire rest
@@ -62,6 +64,12 @@ teardown() {
     fi
     if [ -n "$PORTABLE_VFAT_LOOP" ]; then
         losetup -d "$PORTABLE_VFAT_LOOP" 2>/dev/null || true
+    fi
+    if [ -n "$CASEFOLD_MOUNT" ]; then
+        umount -l "$CASEFOLD_MOUNT" 2>/dev/null || true
+    fi
+    if [ -n "$CASEFOLD_LOOP" ]; then
+        losetup -d "$CASEFOLD_LOOP" 2>/dev/null || true
     fi
     rm -rf "$TEST_DIR"
 }
@@ -2077,7 +2085,10 @@ test_portable_vfat_dispatch() {
         return
     fi
 
-    mkdir -p "$mount_point"
+    if ! mkdir -p "$mount_point"; then
+        echo -e "  ${BLUE}↷${NC} skipped: could not create the casefold mountpoint."
+        return
+    fi
     if ! mount_output=$(mount -t vfat "$loop" "$mount_point" 2>&1); then
         echo -e "  ${BLUE}↷${NC} skipped: VFAT mounting is unavailable."
         echo "$mount_output"
@@ -2168,6 +2179,130 @@ test_portable_vfat_dispatch() {
     fi
 }
 
+test_casefold_name_equivalence() {
+    echo -e "${BLUE}::${NC} Phase 16: per-directory casefold name-equivalence refusal"
+
+    if [ "$(id -u)" -ne 0 ]; then
+        echo -e "  ${BLUE}↷${NC} skipped: root is required for ext4 loop and mount setup."
+        return
+    fi
+
+    local tool
+    for tool in losetup mkfs.ext4 mount chattr; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            echo -e "  ${BLUE}↷${NC} skipped: '$tool' is not available."
+            return
+        fi
+    done
+
+    local image="$TEST_DIR/casefold.img"
+    local mount_point="$TEST_DIR/casefold"
+    local loop loop_output mkfs_output mount_output chattr_output
+    if ! dd if=/dev/zero of="$image" bs=1M count=64 status=none; then
+        echo -e "  ${BLUE}↷${NC} skipped: could not create the ext4 casefold image."
+        return
+    fi
+
+    if ! loop=$(losetup -f 2>&1); then
+        echo -e "  ${BLUE}↷${NC} skipped: could not find a free loop device."
+        echo "$loop"
+        return
+    fi
+    if ! loop_output=$(losetup "$loop" "$image" 2>&1); then
+        echo -e "  ${BLUE}↷${NC} skipped: could not attach the ext4 casefold image."
+        echo "$loop_output"
+        return
+    fi
+    CASEFOLD_LOOP="$loop"
+
+    if ! mkfs_output=$(mkfs.ext4 -q -O casefold "$loop" 2>&1); then
+        echo -e "  ${BLUE}↷${NC} skipped: ext4 casefold formatting is unavailable."
+        echo "$mkfs_output"
+        return
+    fi
+
+    mkdir -p "$mount_point"
+    if ! mount_output=$(mount -t ext4 "$loop" "$mount_point" 2>&1); then
+        echo -e "  ${BLUE}↷${NC} skipped: ext4 casefold mounting is unavailable."
+        echo "$mount_output"
+        return
+    fi
+    CASEFOLD_MOUNT="$mount_point"
+
+    local source="$TEST_DIR/casefold_source"
+    local casefold_home="$mount_point/casefold-home"
+    local byte_home="$mount_point/byte-home"
+    if ! mkdir -p "$source/data/CASEFOLD_TEST" "$casefold_home" "$byte_home"; then
+        echo -e "  ${BLUE}↷${NC} skipped: could not create the casefold test directories."
+        return
+    fi
+    if ! chattr_output=$(chattr +F "$casefold_home" 2>&1); then
+        echo -e "  ${BLUE}↷${NC} skipped: could not enable the casefold flag on the test directory."
+        echo "$chattr_output"
+        return
+    fi
+
+    printf 'upper\n' > "$source/data/CASEFOLD_TEST/Documents"
+    printf 'lower\n' > "$source/data/CASEFOLD_TEST/documents"
+    cat > "$source/manifest.txt" <<'EOF'
+MIGR_MANIFEST
+VERSION=1
+REPRESENTATION=native
+SCOPE=explicit
+SIDECAR_VERSION=0
+ROOT_COUNT=1
+ROOT ID=CASEFOLD_TEST POLICY=HOME_RELATIVE PAYLOAD=CASEFOLD_TEST SOURCE=casefold RESTORE=target
+EOF
+
+    local casefold_out casefold_rc
+    set +e
+    casefold_out=$(printf 'y\n' | env HOME="$casefold_home" \
+        ../migr restore "$source" 2>&1)
+    casefold_rc=$?
+    set -e
+    if [ "$casefold_rc" -ne 0 ] &&
+       [[ "$casefold_out" == *"CASEFOLD_TEST"* ]] &&
+       [[ "$casefold_out" == *"Documents"* ]] &&
+       [[ "$casefold_out" == *"documents"* ]] &&
+       [[ "$casefold_out" == *"$casefold_home/target"* ]] &&
+       [[ "$casefold_out" == *"casefold name lookup"* ]] &&
+       [ ! -e "$casefold_home/target" ]; then
+        echo -e "  ${GREEN}✓${NC} Casefold directory refuses ambiguous names before mutation."
+    else
+        echo -e "  ${RED}✗${NC} Casefold refusal did not name the roots, pair, destination, and reason"
+        echo "  exit=$casefold_rc output: $casefold_out"
+        exit 1
+    fi
+
+    local byte_out byte_rc
+    set +e
+    byte_out=$(printf 'y\n' | env HOME="$byte_home" \
+        ../migr restore "$source" 2>&1)
+    byte_rc=$?
+    set -e
+    if [ "$byte_rc" -eq 0 ] &&
+       [[ "$byte_out" == *"Restore complete"* ]] &&
+       [ "$(cat "$byte_home/target/Documents")" = "upper" ] &&
+       [ "$(cat "$byte_home/target/documents")" = "lower" ]; then
+        echo -e "  ${GREEN}✓${NC} Non-casefold sibling on the same filesystem restores both names."
+    else
+        echo -e "  ${RED}✗${NC} Non-casefold sibling control did not restore normally"
+        echo "  exit=$byte_rc output: $byte_out"
+        exit 1
+    fi
+
+    if ! umount "$mount_point" 2>/dev/null; then
+        echo -e "  ${RED}✗${NC} Could not unmount the casefold test image."
+        exit 1
+    fi
+    CASEFOLD_MOUNT=""
+    if ! losetup -d "$loop" 2>/dev/null; then
+        echo -e "  ${RED}✗${NC} Could not detach the casefold test loop device."
+        exit 1
+    fi
+    CASEFOLD_LOOP=""
+}
+
 # --- 4. RUN TESTS ---
 echo -e "${BLUE}migr integration tests${NC}"
 setup
@@ -2189,4 +2324,5 @@ test_native_restore_progress
 test_probe_refusal
 test_container_production
 test_portable_vfat_dispatch
+test_casefold_name_equivalence
 echo -e "${GREEN}all tests passed${NC}"

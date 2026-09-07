@@ -32,6 +32,7 @@
 #include "backup.h"
 #include "manifest.h"
 #include "restore.h"
+#include "portable_restore_internal.h"
 #include "utils.h"
 
 #define GREEN "\033[0;32m"
@@ -417,6 +418,182 @@ static int run_bind_mount_restore(const char *source, const char *home,
 
     int status = 0;
     waitpid(pid, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+static int path_mount_id(const char *path, unsigned int *mount_id)
+{
+    if (path == NULL || mount_id == NULL)
+        return -1;
+    struct statx state;
+    memset(&state, 0, sizeof(state));
+    if (statx(AT_FDCWD, path, AT_STATX_DONT_SYNC, STATX_MNT_ID, &state) != 0 ||
+        (state.stx_mask & STATX_MNT_ID) == 0)
+        return -1;
+    *mount_id = state.stx_mnt_id;
+    return 0;
+}
+
+static int run_mount_view_restore_case(
+    const char *source, const char *home, const char *documents_shared,
+    const char *downloads_shared, char *output, size_t output_size)
+{
+    int output_pipe[2];
+    int input_pipe[2];
+    if (pipe(output_pipe) != 0 || pipe(input_pipe) != 0)
+    {
+        perror("pipe");
+        exit(1);
+    }
+    fflush(stdout);
+    fflush(stderr);
+    pid_t pid = fork();
+    if (pid < 0)
+    {
+        perror("fork");
+        exit(1);
+    }
+    if (pid == 0)
+    {
+        close(output_pipe[0]);
+        close(input_pipe[1]);
+        if (dup2(output_pipe[1], STDOUT_FILENO) < 0 ||
+            dup2(output_pipe[1], STDERR_FILENO) < 0 ||
+            dup2(input_pipe[0], STDIN_FILENO) < 0)
+            _exit(2);
+        close(output_pipe[1]);
+        close(input_pipe[0]);
+
+        if (setup_bind_mount_namespace() != 0 ||
+            mount(downloads_shared, documents_shared, NULL, MS_BIND, NULL) != 0)
+            _exit(CHILD_SKIP);
+
+        struct stat documents_st, downloads_st;
+        unsigned int documents_mount_id, downloads_mount_id;
+        if (stat(documents_shared, &documents_st) != 0 ||
+            stat(downloads_shared, &downloads_st) != 0 ||
+            documents_st.st_dev != downloads_st.st_dev ||
+            documents_st.st_ino != downloads_st.st_ino ||
+            path_mount_id(documents_shared, &documents_mount_id) != 0 ||
+            path_mount_id(downloads_shared, &downloads_mount_id) != 0 ||
+            documents_mount_id == downloads_mount_id)
+            _exit(CHILD_SKIP);
+
+        if (setenv("HOME", home, 1) != 0)
+            _exit(2);
+        dry_run = 0;
+        int restore_rc = restore(source);
+        char documents_file[PATH_MAX], downloads_file[PATH_MAX];
+        join_path(documents_file, sizeof(documents_file), documents_shared,
+                  "file");
+        join_path(downloads_file, sizeof(downloads_file), downloads_shared,
+                  "file");
+        int intact = file_content_is(documents_file, "ORIGINAL") &&
+                     file_content_is(downloads_file, "ORIGINAL");
+        fflush(stdout);
+        fflush(stderr);
+        _exit(restore_rc != 0 && intact ? 0 : 1);
+    }
+
+    close(output_pipe[1]);
+    close(input_pipe[0]);
+    const char input[] = "y\n";
+    if (write(input_pipe[1], input, sizeof(input) - 1U) !=
+        (ssize_t)(sizeof(input) - 1U))
+    {
+        perror("write");
+        exit(1);
+    }
+    close(input_pipe[1]);
+
+    size_t total = 0;
+    ssize_t n;
+    while (total < output_size - 1U &&
+           (n = read(output_pipe[0], output + total,
+                     output_size - 1U - total)) > 0)
+        total += (size_t)n;
+    output[total] = '\0';
+    close(output_pipe[0]);
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+/* Keep this at the identity-graph boundary: a full restore with two directory
+ * metadata owners would correctly stop earlier on R2a's alias collision. */
+static int run_nested_mount_view_graph_case(
+    const char *documents_root, const char *downloads_root,
+    const char *documents_shared, const char *downloads_shared,
+    const char *alternate)
+{
+    pid_t pid = fork();
+    if (pid < 0)
+    {
+        perror("fork");
+        exit(1);
+    }
+    if (pid == 0)
+    {
+        if (setup_bind_mount_namespace() != 0 ||
+            mount(downloads_shared, documents_shared, NULL, MS_BIND, NULL) != 0)
+            _exit(CHILD_SKIP);
+
+        struct stat documents_st, downloads_st;
+        unsigned int documents_mount_id, downloads_mount_id;
+        if (stat(documents_shared, &documents_st) != 0 ||
+            stat(downloads_shared, &downloads_st) != 0 ||
+            documents_st.st_dev != downloads_st.st_dev ||
+            documents_st.st_ino != downloads_st.st_ino ||
+            path_mount_id(documents_shared, &documents_mount_id) != 0 ||
+            path_mount_id(downloads_shared, &downloads_mount_id) != 0 ||
+            documents_mount_id == downloads_mount_id)
+            _exit(CHILD_SKIP);
+
+        char documents_desc[PATH_MAX];
+        join_path(documents_desc, sizeof(documents_desc),
+                  documents_shared, "desc");
+        if (mount(alternate, documents_desc, NULL, MS_BIND, NULL) != 0)
+            _exit(CHILD_SKIP);
+
+        int documents_fd = open(documents_root,
+                                O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        int downloads_fd = open(downloads_root,
+                                O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (documents_fd < 0 || downloads_fd < 0)
+            _exit(1);
+
+        DestinationIdentityGraph graph;
+        destination_identity_graph_init(
+            &graph, DESTINATION_IDENTITY_NATIVE_BOUNDS);
+        DestinationIdentityPlacement placement;
+        size_t conflicting_owner;
+        DestinationIdentityNameConflict name_conflict;
+        errno = 0;
+        DestinationIdentityStatus first = destination_identity_graph_add(
+            &graph, downloads_fd, "shared/desc/docs-file",
+            DESTINATION_IDENTITY_NON_DIRECTORY, 1, &placement,
+            &conflicting_owner, &name_conflict);
+        errno = 0;
+        DestinationIdentityStatus second = destination_identity_graph_add(
+            &graph, documents_fd, "shared/desc/downloads-file",
+            DESTINATION_IDENTITY_NON_DIRECTORY, 2, &placement,
+            &conflicting_owner, &name_conflict);
+        int second_errno = errno;
+        destination_identity_graph_free(&graph);
+        close(documents_fd);
+        close(downloads_fd);
+        _exit(first == DESTINATION_IDENTITY_OK &&
+              second == DESTINATION_IDENTITY_COLLISION &&
+              second_errno == EISDIR ? 0 : 1);
+    }
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0)
+    {
+        perror("waitpid");
+        exit(1);
+    }
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
@@ -856,6 +1033,134 @@ static void test_versioned_restore_refuses_bind_mount_aliases(void)
                   strstr(output, downloads_shared) != NULL,
               "bind-mounted aliases name both roots and the unchanged destination");
     }
+
+    remove_tree(source);
+    remove_tree(home);
+}
+
+static void test_versioned_restore_allows_ascii_case_distinct_names(void)
+{
+    printf(BLUE "::" NC " restore dispatch: byte-sensitive directories keep ASCII-case-distinct names\n");
+
+    char source[PATH_MAX], home[PATH_MAX], upper[PATH_MAX], lower[PATH_MAX];
+    char output[16384];
+    ManifestRoot root;
+    Manifest manifest;
+    int previous_dry_run = dry_run;
+
+    fresh_mkdtemp(source, sizeof(source), "dispatch_name_case_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_name_case_home");
+    setenv("HOME", home, 1);
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "CASE");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "CASE");
+    strcpy(root.source_path, "Case");
+    strcpy(root.restore_path, "target");
+    root.has_restore_path = 1;
+    make_v1_manifest(&manifest, &root, 1);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the ASCII-case restore manifest");
+    write_payload_file(source, "data/CASE", "Documents", "UPPER");
+    write_payload_file(source, "data/CASE", "documents", "LOWER");
+    remove_fixture_packages(source);
+
+    dry_run = 0;
+    int rc = run_restore_capturing_with_input(source, "y\n", output,
+                                               sizeof(output));
+    dry_run = previous_dry_run;
+    join_path(upper, sizeof(upper), home, "target/Documents");
+    join_path(lower, sizeof(lower), home, "target/documents");
+    check(rc == 0 && file_content_is(upper, "UPPER") &&
+              file_content_is(lower, "LOWER"),
+          "ordinary byte-sensitive directories restore ASCII-case-distinct entries");
+
+    remove_tree(source);
+    remove_tree(home);
+}
+
+static void test_native_identity_graph_keeps_nested_mount_views_route_specific(void)
+{
+    printf(BLUE "::" NC " native restore identity graph: nested bind-mounted descendants keep route-specific views\n");
+
+    char home[PATH_MAX], documents_root[PATH_MAX];
+    char downloads_root[PATH_MAX], documents_shared[PATH_MAX];
+    char downloads_shared[PATH_MAX], alternate[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "dispatch_mount_nested_home");
+    write_user_dirs(home, "Documents", "Downloads");
+    join_path(documents_root, sizeof(documents_root), home, "Documents");
+    join_path(downloads_root, sizeof(downloads_root), home, "Downloads");
+    join_path(documents_shared, sizeof(documents_shared), documents_root,
+              "shared");
+    join_path(downloads_shared, sizeof(downloads_shared), downloads_root,
+              "shared");
+    join_path(alternate, sizeof(alternate), home, "alternate");
+    mkdir_p(documents_shared);
+    mkdir_p(downloads_shared);
+    char documents_desc[PATH_MAX], downloads_desc[PATH_MAX];
+    join_path(documents_desc, sizeof(documents_desc), documents_shared, "desc");
+    join_path(downloads_desc, sizeof(downloads_desc), downloads_shared, "desc");
+    mkdir_p(documents_desc);
+    mkdir_p(downloads_desc);
+    mkdir_p(alternate);
+    char alternate_file[PATH_MAX];
+    join_path(alternate_file, sizeof(alternate_file), alternate,
+              "downloads-file");
+    mkdir_p(alternate_file);
+
+    int rc = run_nested_mount_view_graph_case(
+        documents_root, downloads_root, documents_shared, downloads_shared,
+        alternate);
+    if (rc == CHILD_SKIP)
+        skip_case("nested bind-mounted descendant views",
+                  "user namespace, bind mounts, or distinct mount ids are unavailable");
+    else
+        check(rc == 0,
+              "equal root identity does not substitute another route's descendant fd");
+
+    remove_tree(home);
+}
+
+static void test_versioned_restore_refuses_differing_mount_id_aliases(void)
+{
+    printf(BLUE "::" NC " restore dispatch: differing mount ids do not make aliases disjoint\n");
+
+    char source[PATH_MAX], home[PATH_MAX], documents_shared[PATH_MAX];
+    char downloads_shared[PATH_MAX], sentinel[PATH_MAX], output[16384];
+    ManifestRoot roots[2];
+    Manifest manifest;
+
+    fresh_mkdtemp(source, sizeof(source), "dispatch_mount_id_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_mount_id_home");
+    setenv("HOME", home, 1);
+    write_user_dirs(home, "Documents", "Downloads");
+    join_path(documents_shared, sizeof(documents_shared), home,
+              "Documents/shared");
+    join_path(downloads_shared, sizeof(downloads_shared), home,
+              "Downloads/shared");
+    mkdir_p(documents_shared);
+    mkdir_p(downloads_shared);
+    join_path(sentinel, sizeof(sentinel), downloads_shared, "file");
+    write_file_mode(sentinel, "ORIGINAL", 0600);
+    make_v1_alias_manifest(&manifest, roots);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the differing-mount-id collision manifest");
+    write_payload_file(source, "data/XDG_DOCUMENTS_DIR/shared", "file", "DOCS");
+    write_payload_file(source, "data/XDG_DOWNLOAD_DIR/shared", "file", "DOWNLOADS");
+    remove_fixture_packages(source);
+
+    int rc = run_mount_view_restore_case(
+        source, home, documents_shared, downloads_shared,
+        output, sizeof(output));
+    if (rc == CHILD_SKIP)
+        skip_case("differing-mount-id alias collision",
+                  "user namespace, bind mounts, or distinct mount ids are unavailable");
+    else
+        check(rc == 0 && strstr(output, "XDG_DOCUMENTS_DIR") != NULL &&
+                  strstr(output, "XDG_DOWNLOAD_DIR") != NULL &&
+                  strstr(output, "competing entries for restore destination") != NULL &&
+                  file_content_is(sentinel, "ORIGINAL"),
+              "equal inode identity still refuses a collision before mutation");
 
     remove_tree(source);
     remove_tree(home);
@@ -2362,6 +2667,9 @@ int main(void)
     test_versioned_restore_freezes_xdg_target_map();
     test_versioned_restore_rejects_non_directory_payload_paths();
     test_versioned_restore_refuses_bind_mount_aliases();
+    test_versioned_restore_allows_ascii_case_distinct_names();
+    test_native_identity_graph_keeps_nested_mount_views_route_specific();
+    test_versioned_restore_refuses_differing_mount_id_aliases();
     test_versioned_restore_refuses_destination_alias_collisions();
     test_versioned_restore_identity_order_and_cross_root_hardlinks();
     test_v2_selection_restore_nested_metadata_order();

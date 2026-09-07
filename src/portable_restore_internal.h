@@ -73,13 +73,28 @@ typedef enum {
     DESTINATION_IDENTITY_COLLISION,
     DESTINATION_IDENTITY_PATH_ERROR,
     DESTINATION_IDENTITY_RESOURCE_ERROR,
-    DESTINATION_IDENTITY_CYCLE
+    DESTINATION_IDENTITY_CYCLE,
+    DESTINATION_IDENTITY_NAME_EQUIVALENCE_ERROR
 } DestinationIdentityStatus;
 
 typedef struct {
     size_t node;
     int is_directory;
 } DestinationIdentityPlacement;
+
+typedef enum {
+    DESTINATION_NAME_FAILURE_CASEFOLD = 0,
+    DESTINATION_NAME_FAILURE_UNKNOWN
+} DestinationIdentityNameFailure;
+
+typedef struct {
+    size_t owner;
+    const char *prior_component;
+    size_t prior_component_length;
+    const char *current_component;
+    size_t current_component_length;
+    DestinationIdentityNameFailure failure;
+} DestinationIdentityNameConflict;
 
 typedef struct {
     size_t root_index;
@@ -157,7 +172,8 @@ DestinationIdentityStatus destination_identity_graph_add(
     DestinationIdentityGraph *graph, int anchor_fd, const char *relative,
     DestinationIdentityClaim claim, size_t owner,
     DestinationIdentityPlacement *placement,
-    size_t *conflicting_owner);
+    size_t *conflicting_owner,
+    DestinationIdentityNameConflict *name_conflict);
 DestinationIdentityStatus destination_identity_graph_finalize(
     DestinationIdentityGraph *graph);
 int destination_identity_graph_add_entries(

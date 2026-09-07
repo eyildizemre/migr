@@ -1380,9 +1380,10 @@ static int restore_target_identity_add(
         ? DESTINATION_IDENTITY_DIRECTORY
         : DESTINATION_IDENTITY_NON_DIRECTORY;
     size_t conflicting_owner;
+    DestinationIdentityNameConflict name_conflict;
     DestinationIdentityStatus status = destination_identity_graph_add(
         &map->identity_graph, target->route.anchor_fd, relative, claim,
-        owner, placement, &conflicting_owner);
+        owner, placement, &conflicting_owner, &name_conflict);
     if (status == DESTINATION_IDENTITY_OK)
         return 0;
 
@@ -1397,7 +1398,9 @@ static int restore_target_identity_add(
              path_join(destination, sizeof(destination), target->absolute,
                        logical) != 0))
             snprintf(destination, sizeof(destination), "%s", relative);
-        size_t conflicting_root = conflicting_owner % MANIFEST_MAX_ROOTS;
+        size_t conflicting_root = SIZE_MAX;
+        if (conflicting_owner != SIZE_MAX)
+            conflicting_root = conflicting_owner % MANIFEST_MAX_ROOTS;
         if (conflicting_owner != SIZE_MAX &&
             conflicting_root < (size_t)manifest->root_count)
             print_error("Error: Manifest root %s entry %s and manifest root %s have competing entries for restore destination %s\n",
@@ -1407,6 +1410,42 @@ static int restore_target_identity_add(
         else
             print_error("Error: Manifest root %s entry %s conflicts with an existing directory at restore destination %s\n",
                         root->id, entry_name, destination);
+    }
+    else if (status == DESTINATION_IDENTITY_NAME_EQUIVALENCE_ERROR)
+    {
+        const char *reason =
+            name_conflict.failure == DESTINATION_NAME_FAILURE_CASEFOLD
+                ? "casefold name lookup"
+                : "name lookup capability is unknown";
+        char destination[PATH_MAX];
+        if ((logical[0] == '\0' &&
+             snprintf(destination, sizeof(destination), "%s",
+                      target->absolute) >= (int)sizeof(destination)) ||
+            (logical[0] != '\0' &&
+             path_join(destination, sizeof(destination), target->absolute,
+                       logical) != 0))
+            snprintf(destination, sizeof(destination), "%s", relative);
+        size_t conflicting_root = SIZE_MAX;
+        if (conflicting_owner != SIZE_MAX)
+            conflicting_root = conflicting_owner % MANIFEST_MAX_ROOTS;
+        if (conflicting_owner != SIZE_MAX &&
+            conflicting_root < (size_t)manifest->root_count)
+            print_error("Error: Manifest root %s entry %s and manifest root %s have potentially equivalent destination names %.*s and %.*s under %s; refusing because %s\n",
+                        root->id, entry_name,
+                        manifest->roots[conflicting_root].id,
+                        (int)name_conflict.current_component_length,
+                        name_conflict.current_component,
+                        (int)name_conflict.prior_component_length,
+                        name_conflict.prior_component,
+                        destination, reason);
+        else
+            print_error("Error: Manifest root %s entry %s has potentially equivalent destination names %.*s and %.*s under %s; refusing because %s\n",
+                        root->id, entry_name,
+                        (int)name_conflict.current_component_length,
+                        name_conflict.current_component,
+                        (int)name_conflict.prior_component_length,
+                        name_conflict.prior_component,
+                        destination, reason);
     }
     else if (status == DESTINATION_IDENTITY_RESOURCE_ERROR)
     {
