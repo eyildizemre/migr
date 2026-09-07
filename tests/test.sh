@@ -506,12 +506,39 @@ Downloads
 EOF
     local report_output dry_output
     report_output=$(../migr report --critical -v)
-    assert_contains "$report_output" "Scope config: $config_file (1 active rule)"
+    assert_contains "$report_output" "Scope config: $config_file (1 configured rule)"
     assert_not_contains "$report_output" "($HOME/Downloads)"
     dry_output=$(../migr backup "$BACKUP_DIR" --dry-run 2>&1)
-    assert_contains "$dry_output" "Scope config: $config_file (1 active rule)"
+    assert_contains "$dry_output" "Scope config: $config_file (1 configured rule)"
     assert_contains "$dry_output" "Selection policy"
     assert_contains "$dry_output" "Excludes: $HOME/Downloads"
+
+    cat > "$config_file" <<'EOF'
+[critical]
+
+[comprehensive]
+    [exclude]
+Documents
+EOF
+    report_output=$(../migr report --critical -v)
+    assert_contains "$report_output" "Scope config: $config_file (1 configured rule)"
+    assert_contains "$report_output" "($HOME/Documents)"
+    dry_output=$(../migr backup "$BACKUP_DIR" --dry-run 2>&1)
+    assert_contains "$dry_output" "Scope config: $config_file (1 configured rule)"
+    assert_contains "$dry_output" "No active exclusions for this scope."
+    assert_not_contains "$dry_output" "Excludes: $HOME/Documents"
+
+    mkdir -p "$HOME/ConfiguredOnly"
+    cat > "$config_file" <<'EOF'
+[critical]
+    [include]
+ConfiguredOnly
+
+[comprehensive]
+EOF
+    report_output=$(../migr report --comprehensive -v)
+    assert_contains "$report_output" "Scope config: $config_file (1 configured rule)"
+    assert_contains "$report_output" "($HOME/ConfiguredOnly)"
 
     cat > "$config_file" <<'EOF'
 [critical]

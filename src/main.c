@@ -63,7 +63,7 @@ static int load_selection(BackupMode mode, SelectionPlan *selection,
         goto done;
 
     if (show_diagnostic)
-        printf("Scope config: %s (%zu active rule%s)\n\n", path,
+        printf("Scope config: %s (%zu configured rule%s)\n\n", path,
                config.count, config.count == 1 ? "" : "s");
     if (selection_plan_build(home, mode, &config, selection) != 0)
         goto done;
