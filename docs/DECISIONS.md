@@ -3134,3 +3134,34 @@ and makes presentation depend on configuration presence.
 explicit-path policy; preserves D17/D22 metadata/hardlink guarantees and D25's
 ownership/durability ordering. Report unification and later code must implement
 this decided contract before the feature is marked implemented.
+
+---
+
+## D35 — 2026-09-07 — Scoped backup requires consent for shell history
+
+**Status:** Implemented
+
+**Decision:** Critical and comprehensive backups include `.bash_history` and
+`.zsh_history` when the compiled selection owns those existing paths, but a live
+backup must obtain explicit confirmation before capturing them. The prompt uses
+`[Y/n]`: an interactive blank or whitespace-only line accepts the default, while
+true EOF always declines regardless of the displayed default. Dry-run prints a
+notice and never prompts. Explicit-path backup remains literal under D16 and does
+not apply this gate even when the user explicitly names a history file.
+
+The gate is intentionally limited to shell history. Existing `.ssh`, `.gnupg`,
+and browser-profile roots are outside it: those are stores designed by their
+owning tools to contain sensitive material and have their own permission or
+encryption-at-rest models. Shell history is instead an incidental plaintext log
+that can acquire a password or token simply because it was typed at a prompt.
+
+**Why:** A warning that proceeds automatically cannot protect a user from
+silently copying accidentally recorded credentials to an untrusted backup
+destination. Default-yes keeps the ordinary interactive path lightweight, while
+EOF-as-decline makes unattended, closed-stdin, and empty-pipe invocations fail
+closed. Checking compiled source ownership also covers a history file selected
+through a broader configured root instead of relying on a particular manifest id.
+
+**Rejected:** warning without confirmation; treating EOF as the displayed
+default; gating every secret-capable root; detecting only the dedicated history
+root ids; applying scoped assumptions to explicitly named paths.

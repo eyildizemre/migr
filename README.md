@@ -156,7 +156,13 @@ locations above; custom `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, and
 `XDG_STATE_HOME` locations are not resolved yet. zsh startup files are likewise
 read from HOME and do not follow `ZDOTDIR` yet.
 
-**Dotfiles (all scopes except explicit paths):** .ssh, .gnupg, .gitconfig, .bashrc, .bash_profile, .bash_login, .bash_logout, .bash_aliases, .profile, .zshenv, .zprofile, .zshrc, .zlogin, .zlogout, .inputrc, .tmux.conf, .screenrc
+**Dotfiles (all scopes except explicit paths):** .ssh, .gnupg, .gitconfig, .bashrc, .bash_history, .bash_profile, .bash_login, .bash_logout, .bash_aliases, .profile, .zshenv, .zsh_history, .zprofile, .zshrc, .zlogin, .zlogout, .inputrc, .tmux.conf, .screenrc
+
+Scoped backups ask before capturing `.bash_history` or `.zsh_history`, because
+those plaintext logs can contain secrets typed at a shell prompt. The prompt
+defaults to yes for an interactive Enter, but unavailable input (EOF) always
+declines; dry-run reports the history files without prompting. Explicit-path
+backups remain literal requests and do not add this consent gate.
 
 **Browser Profiles (all scopes except explicit paths):** Firefox is retained as a separate browser-profile root; Chromium-family profiles under `~/.config` are covered by the persistent config root.
 

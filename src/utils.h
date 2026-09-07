@@ -157,4 +157,15 @@ void print_help(void);
  */
 int confirm_action(const char *message);
 
+/**
+ * @brief Prompts with a default-yes choice while still declining on true EOF.
+ *
+ * Displays message followed by " [Y/n]: ". A successful blank or
+ * whitespace-only line accepts the displayed default; EOF means no input was
+ * available and is always treated as a negative response.
+ *
+ * @return 1 for the default or an explicit y/Y response, 0 otherwise.
+ */
+int confirm_action_default_yes(const char *message);
+
 #endif

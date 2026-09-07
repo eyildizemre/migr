@@ -1403,6 +1403,108 @@ static void preview_roots(const BackupPlan *plan, int *count)
     }
 }
 
+typedef struct {
+    unsigned int mask;
+    size_t count;
+} ShellHistorySelection;
+
+enum {
+    SHELL_HISTORY_BASH = 1U << 0,
+    SHELL_HISTORY_ZSH  = 1U << 1,
+};
+
+static int backup_shell_history_selection(const SelectionPlan *selection,
+                                          ShellHistorySelection *owned)
+{
+    static const struct {
+        const char *name;
+        unsigned int bit;
+    } candidates[] = {
+        { ".bash_history", SHELL_HISTORY_BASH },
+        { ".zsh_history",  SHELL_HISTORY_ZSH },
+    };
+
+    if (owned == NULL)
+        return -1;
+    *owned = (ShellHistorySelection){0};
+    if (selection == NULL)
+        return 0;
+
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++)
+    {
+        char candidate[PATH_MAX];
+        if (path_join(candidate, sizeof(candidate), selection->home,
+                      candidates[i].name) != 0)
+        {
+            print_error("Error: shell history path is too long to inspect safely\n");
+            return -1;
+        }
+
+        struct stat st;
+        if (lstat(candidate, &st) != 0)
+        {
+            if (errno == ENOENT || errno == ENOTDIR)
+                continue;
+            print_error("Error: could not inspect %s before backup: %s\n",
+                        candidate, strerror(errno));
+            return -1;
+        }
+
+        for (size_t root = 0; root < selection->root_count; root++)
+        {
+            if (selection_source_owns(&selection->roots[root], candidate) == 1)
+            {
+                owned->mask |= candidates[i].bit;
+                owned->count++;
+                break;
+            }
+        }
+    }
+    return 0;
+}
+
+static const char *backup_shell_history_names(const ShellHistorySelection *owned)
+{
+    if (owned->mask == (SHELL_HISTORY_BASH | SHELL_HISTORY_ZSH))
+        return ".bash_history, .zsh_history";
+    if (owned->mask == SHELL_HISTORY_BASH)
+        return ".bash_history";
+    if (owned->mask == SHELL_HISTORY_ZSH)
+        return ".zsh_history";
+    return "";
+}
+
+static void backup_shell_history_dry_run_notice(
+    const ShellHistorySelection *owned)
+{
+    if (owned->count == 0)
+        return;
+    printf("Security notice: this backup would include %zu item(s) that can "
+           "carry secrets typed at a shell prompt (%s). Make sure the "
+           "destination is trustworthy before a live run.\n",
+           owned->count, backup_shell_history_names(owned));
+}
+
+static int backup_shell_history_confirm(const ShellHistorySelection *owned)
+{
+    if (owned->count == 0)
+        return 1;
+
+    char message[512];
+    int length = snprintf(
+        message, sizeof(message),
+        "This backup includes %zu item(s) that can carry secrets typed at a "
+        "shell prompt (%s). Make sure the destination is trustworthy before "
+        "continuing. Continue?",
+        owned->count, backup_shell_history_names(owned));
+    if (length < 0 || (size_t)length >= sizeof(message))
+    {
+        print_error("Error: could not build the shell history consent prompt\n");
+        return -1;
+    }
+    return confirm_action_default_yes(message) ? 1 : 0;
+}
+
 // selection is the optional compiled plan (docs/DECISIONS.md D34) backing
 // *plan's roots one-for-one by index (backup_plan_from_selection() builds
 // plan that way); NULL means an unfiltered explicit-path backup, which needs
@@ -1839,6 +1941,12 @@ static int backup_dry_run(const char *target, BackupMode mode,
     off_t raw_estimated_size = 0;
     int raw_estimate_had_error = 0;
     int count = 0;
+    ShellHistorySelection shell_history = {0};
+    if (backup_shell_history_selection(selection, &shell_history) != 0)
+    {
+        backup_plan_free(plan);
+        return 1;
+    }
 
     // The destination is inspected exactly as a live run would inspect
     // it, including the real capability probe and portable pre-scan
@@ -2021,6 +2129,8 @@ static int backup_dry_run(const char *target, BackupMode mode,
         }
     }
 
+    backup_shell_history_dry_run_notice(&shell_history);
+
     if (has_advisory_prescan)
     {
         printf("\nDestination cannot hold Linux metadata natively; a portable "
@@ -2156,6 +2266,18 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
                                estimate_had_error, raw_estimate_had_error,
                                target) != 0)
         goto fail_pre_container;
+
+    ShellHistorySelection shell_history = {0};
+    if (backup_shell_history_selection(selection, &shell_history) != 0)
+        goto fail_pre_container;
+    int consent = backup_shell_history_confirm(&shell_history);
+    if (consent < 0)
+        goto fail_pre_container;
+    if (consent == 0)
+    {
+        printf("Backup cancelled; no container was created.\n");
+        goto cancel_pre_container;
+    }
 
     // Probe the destination and choose a representation before any container
     // exists. An unreliable probe is fatal, never a silent fall-through. If we
@@ -2586,6 +2708,8 @@ finish:
     backup_plan_free(&plan);
     return finish_result;
 
+cancel_pre_container:
+    finish_result = 0;
 fail_pre_container:
     if (self_fd >= 0)
         close(self_fd);
@@ -2599,7 +2723,7 @@ fail_pre_container:
         rmdir(target);
     manifest_free(&manifest);
     backup_plan_free(&plan);
-    return 1;
+    return finish_result;
 }
 
 int backup(const char *target, BackupMode mode, char **paths, int include_self,

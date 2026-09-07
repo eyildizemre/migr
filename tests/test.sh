@@ -716,6 +716,40 @@ test_backup() {
     fi
 }
 
+test_shell_history_consent() {
+    echo -e "${BLUE}::${NC} Phase 3b: shell-history backup consent"
+
+    local history_root="$TEST_DIR/history-consent"
+    local history_home="$history_root/home"
+    local decline_target="$history_root/decline"
+    local accept_target="$history_root/accept"
+    mkdir -p "$history_home" "$decline_target" "$accept_target"
+    printf 'accidental-token\n' > "$history_home/.bash_history"
+    printf 'another-secret\n' > "$history_home/.zsh_history"
+
+    local output
+    output=$(printf 'n\n' | env HOME="$history_home" \
+        ../migr backup "$decline_target" --critical 2>&1)
+    assert_contains "$output" ".bash_history, .zsh_history"
+    assert_contains "$output" "[Y/n]"
+    assert_contains "$output" "Backup cancelled; no container was created."
+    if find "$decline_target" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+        echo -e "  ${RED}✗${NC} Declined history backup created a container."
+        exit 1
+    else
+        echo -e "  ${GREEN}✓${NC} Declined history backup creates no container."
+    fi
+
+    output=$(printf 'y\n' | env HOME="$history_home" \
+        ../migr backup "$accept_target" --critical 2>&1)
+    assert_contains "$output" ".bash_history, .zsh_history"
+    assert_contains "$output" "Backup complete"
+    local actual_backup
+    actual_backup=$(sole_final_container "$accept_target")
+    assert_file_exists "$actual_backup/data/BUILTIN_DOT_BASH_HISTORY"
+    assert_file_exists "$actual_backup/data/BUILTIN_DOT_ZSH_HISTORY"
+}
+
 test_restore() {
     echo -e "${BLUE}::${NC} Phase 4: restore"
 
@@ -2377,6 +2411,7 @@ test_report
 test_dry_run
 test_conf_public_wiring
 test_backup
+test_shell_history_consent
 test_restore
 test_packages
 test_error_propagation

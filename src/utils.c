@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdarg.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
@@ -329,15 +330,37 @@ void print_help(void)
     printf("  ./migr restore /mnt/drive/migr_backup_20260720_143012\n");
 }
 
-int confirm_action(const char *message)
+static int confirm_action_with_default(const char *message, int default_yes)
 {
-    printf("%s [y/N]: ", message);
+    printf("%s %s: ", message, default_yes ? "[Y/n]" : "[y/N]");
     
     char response[16];
     if (fgets(response, sizeof(response), stdin) == NULL)
     {
         return 0;
     }
-    
+
+    int only_whitespace = 1;
+    for (size_t i = 0; response[i] != '\0'; i++)
+    {
+        if (!isspace((unsigned char)response[i]))
+        {
+            only_whitespace = 0;
+            break;
+        }
+    }
+    if (only_whitespace)
+        return default_yes;
+
     return (response[0] == 'y' || response[0] == 'Y');
+}
+
+int confirm_action(const char *message)
+{
+    return confirm_action_with_default(message, 0);
+}
+
+int confirm_action_default_yes(const char *message)
+{
+    return confirm_action_with_default(message, 1);
 }

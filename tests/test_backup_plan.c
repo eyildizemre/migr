@@ -10,9 +10,9 @@
 //
 // The "production" section below calls backup() itself (declared in
 // backup.h) through a fork()+pipe helper mirroring
-// tests/test_restore_dispatch.c's run_restore_capturing(). Unlike restore(),
-// backup() never calls confirm_action(), so dry_run is toggled per test
-// rather than forced globally for the whole binary.
+// tests/test_restore_dispatch.c's run_restore_capturing(). Scoped backup only
+// prompts when its compiled selection owns a shell-history path, so dry_run
+// remains a per-test choice for the ordinary fixtures used here.
 
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -317,6 +317,10 @@ static void test_missing_optional_builtin_is_skipped_not_fatal(void)
     check(find_root(&plan, "BUILTIN_BROWSER_MOZILLA") == NULL, "an absent browser profile is simply left out");
     check(find_root(&plan, "BUILTIN_LOCAL_STATE") == NULL,
           "an absent persistent-state root is simply left out");
+    check(find_root(&plan, "BUILTIN_DOT_BASH_HISTORY") == NULL,
+          "an absent .bash_history is simply left out");
+    check(find_root(&plan, "BUILTIN_DOT_ZSH_HISTORY") == NULL,
+          "an absent .zsh_history is simply left out");
 
     backup_plan_free(&plan);
     remove_tree(home);
@@ -1232,6 +1236,72 @@ static int run_backup_capturing(const char *target, BackupMode mode,
 {
     return run_backup_capturing_with_options(target, mode, paths, 0, 0,
                                              output, output_size);
+}
+
+static int run_scoped_backup_capturing_input(const char *target, BackupMode mode,
+                                             const Config *config, const char *input,
+                                             char *output, size_t output_size)
+{
+    int input_pipe[2];
+    int output_pipe[2];
+    if (pipe(input_pipe) != 0 || pipe(output_pipe) != 0)
+    {
+        perror("pipe");
+        exit(1);
+    }
+    if (input != NULL)
+    {
+        size_t length = strlen(input);
+        if (write(input_pipe[1], input, length) != (ssize_t)length)
+        {
+            perror("write");
+            exit(1);
+        }
+    }
+    close(input_pipe[1]);
+
+    fflush(stdout);
+    fflush(stderr);
+    pid_t pid = fork();
+    if (pid < 0)
+    {
+        perror("fork");
+        exit(1);
+    }
+    if (pid == 0)
+    {
+        close(output_pipe[0]);
+        if (dup2(input_pipe[0], STDIN_FILENO) < 0 ||
+            dup2(output_pipe[1], STDOUT_FILENO) < 0 ||
+            dup2(output_pipe[1], STDERR_FILENO) < 0)
+            _exit(2);
+        close(input_pipe[0]);
+        close(output_pipe[1]);
+
+        SelectionPlan selection = {0};
+        const char *home = getenv("HOME");
+        int rc = home == NULL || selection_plan_build(home, mode, config, &selection) != 0
+            ? 1 : backup_selection(target, mode, &selection, 0, 0);
+        selection_plan_free(&selection);
+        fflush(stdout);
+        fflush(stderr);
+        _exit(rc == 0 ? 0 : 1);
+    }
+
+    close(input_pipe[0]);
+    close(output_pipe[1]);
+    size_t total = 0;
+    ssize_t n;
+    while (total < output_size - 1 &&
+           (n = read(output_pipe[0], output + total,
+                     output_size - 1 - total)) > 0)
+        total += (size_t)n;
+    output[total] = '\0';
+    close(output_pipe[0]);
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
 typedef struct {
@@ -2750,6 +2820,148 @@ static void test_dangling_builtin_dotfile_is_captured_not_silently_dropped(void)
     remove_tree(target);
 }
 
+static void test_shell_history_consent_gate(void)
+{
+    printf(BLUE "::" NC " production: scoped shell-history capture requires explicit consent\n");
+
+    char home[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "history_home");
+    setenv("HOME", home, 1);
+    char bash_history[PATH_MAX];
+    char zsh_history[PATH_MAX];
+    join_path(bash_history, sizeof(bash_history), home, ".bash_history");
+    join_path(zsh_history, sizeof(zsh_history), home, ".zsh_history");
+    write_file(bash_history, "token typed by accident\n");
+    write_file(zsh_history, "another secret-shaped line\n");
+
+    BackupPlan catalog_plan;
+    check(backup_plan_build(home, BACKUP_CRITICAL, NULL, &catalog_plan) == 0,
+          "history fixture builds a critical catalog plan");
+    check(find_root(&catalog_plan, "BUILTIN_DOT_BASH_HISTORY") != NULL,
+          ".bash_history is a critical built-in when present");
+    check(find_root(&catalog_plan, "BUILTIN_DOT_ZSH_HISTORY") != NULL,
+          ".zsh_history is a critical built-in when present");
+    backup_plan_free(&catalog_plan);
+
+    Config empty_config = {0};
+    char output[16384];
+    char target[PATH_MAX];
+
+    fresh_mkdtemp(target, sizeof(target), "history_target");
+    dry_run = 0;
+    int rc = run_scoped_backup_capturing_input(
+        target, BACKUP_CRITICAL, &empty_config, "n\n", output, sizeof(output));
+    check(rc == 0, "declining shell-history capture is a successful cancellation");
+    check(strstr(output, ".bash_history, .zsh_history") != NULL &&
+          strstr(output, "[Y/n]") != NULL,
+          "the consent prompt names both selected history files and shows default yes");
+    check(directory_empty(target), "decline leaves no backup container behind");
+    remove_tree(target);
+
+    fresh_mkdtemp(target, sizeof(target), "history_target");
+    rc = run_scoped_backup_capturing_input(
+        target, BACKUP_CRITICAL, &empty_config, NULL, output, sizeof(output));
+    check(rc == 0 && strstr(output, "Backup cancelled") != NULL,
+          "true EOF declines the default-yes backup prompt");
+    check(directory_empty(target), "EOF cancellation leaves no backup container behind");
+    remove_tree(target);
+
+    fresh_mkdtemp(target, sizeof(target), "history_target");
+    rc = run_scoped_backup_capturing_input(
+        target, BACKUP_CRITICAL, &empty_config, "y\n", output, sizeof(output));
+    check(rc == 0, "explicit y accepts shell-history capture");
+    char payload[PATH_MAX];
+    check(find_payload_dir(target, payload, sizeof(payload)),
+          "accepted shell-history backup publishes a container");
+    char copied[PATH_MAX];
+    join_path(copied, sizeof(copied), payload, "BUILTIN_DOT_BASH_HISTORY");
+    check(access(copied, F_OK) == 0, "accepted backup captures .bash_history");
+    join_path(copied, sizeof(copied), payload, "BUILTIN_DOT_ZSH_HISTORY");
+    check(access(copied, F_OK) == 0, "accepted backup captures .zsh_history");
+    remove_tree(target);
+
+    fresh_mkdtemp(target, sizeof(target), "history_target");
+    rc = run_scoped_backup_capturing_input(
+        target, BACKUP_CRITICAL, &empty_config, "\n", output, sizeof(output));
+    check(rc == 0 && find_payload_dir(target, payload, sizeof(payload)),
+          "bare Enter accepts the displayed default and runs the backup");
+    remove_tree(target);
+
+    check(unlink(zsh_history) == 0, "fixture removes only .zsh_history");
+    fresh_mkdtemp(target, sizeof(target), "history_target");
+    rc = run_scoped_backup_capturing_input(
+        target, BACKUP_CRITICAL, &empty_config, "n\n", output, sizeof(output));
+    check(rc == 0 && strstr(output, ".bash_history") != NULL &&
+          strstr(output, ".zsh_history") == NULL,
+          "single-file prompt names only the history file that is selected");
+    remove_tree(target);
+
+    check(unlink(bash_history) == 0, "fixture removes .bash_history too");
+    fresh_mkdtemp(target, sizeof(target), "history_target");
+    rc = run_scoped_backup_capturing_input(
+        target, BACKUP_CRITICAL, &empty_config, NULL, output, sizeof(output));
+    check(rc == 0 && strstr(output, "[Y/n]") == NULL,
+          "a scoped backup with no history files never prompts");
+    remove_tree(target);
+
+    write_file(bash_history, "bash\n");
+    write_file(zsh_history, "zsh\n");
+    fresh_mkdtemp(target, sizeof(target), "history_target");
+    dry_run = 1;
+    rc = run_scoped_backup_capturing_input(
+        target, BACKUP_CRITICAL, &empty_config, NULL, output, sizeof(output));
+    check(rc == 0 && strstr(output, "Security notice:") != NULL &&
+          strstr(output, ".bash_history, .zsh_history") != NULL,
+          "dry-run reports the selected secret-capable history files");
+    check(strstr(output, "[Y/n]") == NULL,
+          "dry-run does not prompt even with closed stdin");
+    dry_run = 0;
+    remove_tree(target);
+
+    ConfigRule broad_rule = {
+        .scope = CONFIG_CRITICAL,
+        .action = CONFIG_INCLUDE,
+        .path = home,
+        .line = 1,
+    };
+    Config broad_config = { .rules = &broad_rule, .count = 1 };
+    SelectionPlan broad_selection = {0};
+    check(selection_plan_build(home, BACKUP_CRITICAL, &broad_config,
+                               &broad_selection) == 0,
+          "broad HOME include compiles for the ownership regression");
+    int broader_owner = 0;
+    for (size_t i = 0; i < broad_selection.root_count; i++)
+    {
+        const char *id = broad_selection.roots[i].root.manifest_root.id;
+        if (strcmp(id, "BUILTIN_DOT_BASH_HISTORY") != 0 &&
+            selection_source_owns(&broad_selection.roots[i], bash_history) == 1)
+            broader_owner = 1;
+    }
+    check(broader_owner, "a broader compiled root owns .bash_history in the fixture");
+    selection_plan_free(&broad_selection);
+    fresh_mkdtemp(target, sizeof(target), "history_target");
+    rc = run_scoped_backup_capturing_input(
+        target, BACKUP_CRITICAL, &broad_config, "n\n", output, sizeof(output));
+    check(rc == 0 && strstr(output, ".bash_history") != NULL,
+          "the consent gate fires when a broader compiled root owns history");
+    check(directory_empty(target), "broad-root decline still creates no container");
+    remove_tree(target);
+
+    fresh_mkdtemp(target, sizeof(target), "history_target");
+    char *explicit_paths[] = { bash_history, NULL };
+    rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, explicit_paths,
+                              output, sizeof(output));
+    check(rc == 0 && strstr(output, "[Y/n]") == NULL,
+          "explicit-path history backup is not gated");
+    check(find_payload_dir(target, payload, sizeof(payload)),
+          "explicit history backup publishes a container");
+    join_path(copied, sizeof(copied), payload, "EXPLICIT_0");
+    check(access(copied, F_OK) == 0, "explicit history path is captured");
+    remove_tree(target);
+
+    remove_tree(home);
+}
+
 static void test_unusable_target_does_not_leak_the_plan(void)
 {
     printf(BLUE "::" NC " production: a destination that cannot even be inspected does not leak the plan\n");
@@ -2833,6 +3045,7 @@ int main(void)
     test_overlap_rejected_before_destination_created_live_and_dry_run();
     test_dangling_explicit_leaf_symlink_is_captured_as_symlink();
     test_dangling_builtin_dotfile_is_captured_not_silently_dropped();
+    test_shell_history_consent_gate();
     test_unusable_target_does_not_leak_the_plan();
 
     if (failures > 0)
