@@ -3165,3 +3165,37 @@ through a broader configured root instead of relying on a particular manifest id
 **Rejected:** warning without confirmation; treating EOF as the displayed
 default; gating every secret-capable root; detecting only the dedicated history
 root ids; applying scoped assumptions to explicitly named paths.
+
+---
+
+## D36 — 2026-09-07 — Progress elapsed time stays live across copy stalls
+
+**Status:** Implemented
+
+**Decision:** Interactive backup and restore progress keep their synchronous,
+copy-driven updates, but each installed progress display also owns one
+display-only ticker thread. Real updates publish a mutex-guarded snapshot of
+the copied byte count, current path, speed sample, and any display-only backup
+free-space value. If no real update arrives for `PROGRESS_STALL_MS`, the ticker
+redraws from that snapshot using the current monotonic time so elapsed time
+continues to advance while every copy-derived value remains unchanged. The
+ticker never reads mutable copy-engine state and is stopped and joined before
+the final forced redraw or before its owning restore frame can return.
+
+This is not the broader copy-engine multithreading or parallelization change.
+No read, write, traversal, metadata, sidecar, or reconciliation work moves to a
+background thread here; that transition still requires its own thread-safety
+audit. The only concurrent work introduced by this decision is terminal
+redrawing from an immutable snapshot.
+
+**Why:** Chunk-driven progress freezes completely when a read or write blocks,
+including the elapsed field that should tell the user the process is still
+alive. A delayed ticker makes that stall visible without inventing byte
+progress or contaminating the speed window with idle time. Keeping all
+filesystem queries on the synchronous path also prevents a stalled destination
+from blocking the display thread on the same I/O path it is meant to report.
+
+**Rejected:** moving copy work to worker threads; reading `BackupCaptureReport`
+directly from the ticker; updating the speed sample from timer redraws; polling
+the destination filesystem from the ticker; leaving a detached or cancelable
+thread alive past backup/restore return.

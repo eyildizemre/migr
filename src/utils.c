@@ -223,6 +223,192 @@ int backup_progress_should_fire(struct timespec *last_fired, int unthrottled)
     return 1;
 }
 
+static void *progress_ticker_thread(void *arg)
+{
+    ProgressTicker *ticker = arg;
+    const struct timespec interval = {
+        .tv_sec = PROGRESS_TICK_INTERVAL_MS / 1000,
+        .tv_nsec = (PROGRESS_TICK_INTERVAL_MS % 1000) * 1000000L
+    };
+
+    for (;;)
+    {
+        struct timespec remaining = interval;
+        while (nanosleep(&remaining, &remaining) != 0)
+        {
+            if (errno == EINTR)
+                continue;
+            ticker->thread_error = errno;
+            return NULL;
+        }
+
+        int rc = pthread_mutex_lock(&ticker->lock);
+        if (rc != 0)
+        {
+            ticker->thread_error = rc;
+            return NULL;
+        }
+        if (ticker->stop_requested)
+        {
+            rc = pthread_mutex_unlock(&ticker->lock);
+            if (rc != 0)
+                ticker->thread_error = rc;
+            return NULL;
+        }
+
+        struct timespec now;
+        if (ticker->has_snapshot)
+        {
+            if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+            {
+                ticker->thread_error = errno;
+                (void)pthread_mutex_unlock(&ticker->lock);
+                return NULL;
+            }
+            if (timespec_elapsed_seconds(&ticker->snapshot.at, &now) * 1000.0 >=
+                (double)PROGRESS_STALL_MS)
+                ticker->redraw_cb(&ticker->snapshot, &now,
+                                  ticker->redraw_context);
+        }
+        rc = pthread_mutex_unlock(&ticker->lock);
+        if (rc != 0)
+        {
+            ticker->thread_error = rc;
+            return NULL;
+        }
+    }
+}
+
+int progress_ticker_start(ProgressTicker *ticker,
+                          ProgressTickerRedraw redraw_cb,
+                          void *redraw_context)
+{
+    if (ticker == NULL || redraw_cb == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    memset(ticker, 0, sizeof(*ticker));
+    int rc = pthread_mutex_init(&ticker->lock, NULL);
+    if (rc != 0)
+    {
+        errno = rc;
+        return -1;
+    }
+    ticker->initialized = 1;
+    ticker->redraw_cb = redraw_cb;
+    ticker->redraw_context = redraw_context;
+
+    rc = pthread_create(&ticker->thread, NULL, progress_ticker_thread, ticker);
+    if (rc != 0)
+    {
+        (void)pthread_mutex_destroy(&ticker->lock);
+        memset(ticker, 0, sizeof(*ticker));
+        errno = rc;
+        return -1;
+    }
+    ticker->running = 1;
+    return 0;
+}
+
+int progress_ticker_snapshot(ProgressTicker *ticker, off_t bytes,
+                             off_t speed_bytes, off_t free_bytes,
+                             int free_bytes_known, const char *current_path,
+                             const struct timespec *snapshot_at)
+{
+    if (ticker == NULL || snapshot_at == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    if (!ticker->running)
+        return 0;
+
+    size_t path_length = current_path == NULL
+        ? 0U : strnlen(current_path, sizeof(ticker->snapshot.path));
+    if (path_length >= sizeof(ticker->snapshot.path))
+    {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    int rc = pthread_mutex_lock(&ticker->lock);
+    if (rc != 0)
+    {
+        errno = rc;
+        return -1;
+    }
+    ticker->snapshot.bytes = bytes;
+    ticker->snapshot.speed_bytes = speed_bytes;
+    ticker->snapshot.free_bytes = free_bytes;
+    ticker->snapshot.free_bytes_known = free_bytes_known;
+    if (path_length != 0)
+        memcpy(ticker->snapshot.path, current_path, path_length);
+    ticker->snapshot.path[path_length] = '\0';
+    ticker->snapshot.at = *snapshot_at;
+    ticker->has_snapshot = 1;
+    rc = pthread_mutex_unlock(&ticker->lock);
+    if (rc != 0)
+    {
+        errno = rc;
+        return -1;
+    }
+    return 0;
+}
+
+int progress_ticker_stop(ProgressTicker *ticker)
+{
+    if (ticker == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    if (!ticker->initialized)
+        return 0;
+
+    int rc = pthread_mutex_lock(&ticker->lock);
+    if (rc != 0)
+    {
+        errno = rc;
+        return -1;
+    }
+    ticker->stop_requested = 1;
+    rc = pthread_mutex_unlock(&ticker->lock);
+    if (rc != 0)
+    {
+        errno = rc;
+        return -1;
+    }
+
+    int thread_error = 0;
+    if (ticker->running)
+    {
+        rc = pthread_join(ticker->thread, NULL);
+        if (rc != 0)
+        {
+            errno = rc;
+            return -1;
+        }
+        ticker->running = 0;
+        thread_error = ticker->thread_error;
+    }
+
+    rc = pthread_mutex_destroy(&ticker->lock);
+    if (rc != 0)
+    {
+        errno = rc;
+        return -1;
+    }
+    memset(ticker, 0, sizeof(*ticker));
+    if (thread_error != 0)
+    {
+        errno = thread_error;
+        return -1;
+    }
+    return 0;
+}
+
 int backup_sync_due(off_t *bytes_since_sync, off_t chunk_size,
                     off_t interval)
 {

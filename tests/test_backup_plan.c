@@ -1375,6 +1375,121 @@ static void record_backup_progress(off_t bytes_copied, off_t estimated_total,
     trace->count++;
 }
 
+static int proc_thread_count(void)
+{
+    DIR *dir = opendir("/proc/self/task");
+    if (dir == NULL)
+        return -1;
+
+    int count = 0;
+    errno = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL)
+        if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0)
+            count++;
+    int saved_errno = errno;
+    if (closedir(dir) != 0 || saved_errno != 0)
+        return -1;
+    return count;
+}
+
+typedef struct {
+    const char *path;
+} ProgressStall;
+
+static void stall_before_capture(const char *source_path, void *context)
+{
+    ProgressStall *stall = context;
+    if (stall == NULL || source_path == NULL ||
+        strcmp(source_path, stall->path) != 0)
+        return;
+
+    const long stall_ms = PROGRESS_STALL_MS + 1750L;
+    struct timespec remaining = {
+        .tv_sec = stall_ms / 1000L,
+        .tv_nsec = (stall_ms % 1000L) * 1000000L
+    };
+    while (nanosleep(&remaining, &remaining) != 0 && errno == EINTR)
+        ;
+}
+
+static int stalled_progress_advanced_elapsed_without_bytes(
+    const char *output, const char *snapshotted_path)
+{
+    const char prefix[] = "\rProgress: ";
+    const char *cursor = output;
+    char stable_bytes[32] = "";
+    char first_elapsed[32] = "";
+
+    while ((cursor = strstr(cursor, prefix)) != NULL)
+    {
+        const char *line_end = strstr(cursor, "\033[K");
+        if (line_end == NULL)
+            break;
+        const char *current = strstr(cursor, "current: ");
+        const char *slash = strchr(cursor + sizeof(prefix) - 1U, '/');
+        const char *elapsed = strstr(cursor, "elapsed ");
+        if (current == NULL || current >= line_end || slash == NULL ||
+            slash >= line_end || elapsed == NULL || elapsed >= line_end)
+        {
+            cursor = line_end + 3;
+            continue;
+        }
+
+        current += strlen("current: ");
+        size_t current_len = (size_t)(line_end - current);
+        if (strlen(snapshotted_path) != current_len ||
+            memcmp(current, snapshotted_path, current_len) != 0)
+        {
+            cursor = line_end + 3;
+            continue;
+        }
+
+        const char *bytes_start = cursor + sizeof(prefix) - 1U;
+        size_t bytes_len = (size_t)(slash - bytes_start);
+        elapsed += strlen("elapsed ");
+        const char *elapsed_end = strchr(elapsed, ',');
+        if (bytes_len == 0 || bytes_len >= sizeof(stable_bytes) ||
+            elapsed_end == NULL || elapsed_end >= line_end)
+        {
+            cursor = line_end + 3;
+            continue;
+        }
+        size_t elapsed_len = (size_t)(elapsed_end - elapsed);
+        if (elapsed_len == 0 || elapsed_len >= sizeof(first_elapsed))
+        {
+            cursor = line_end + 3;
+            continue;
+        }
+
+        char elapsed_text[32];
+        memcpy(elapsed_text, elapsed, elapsed_len);
+        elapsed_text[elapsed_len] = '\0';
+        if (strcmp(elapsed_text, "00:00") == 0)
+        {
+            cursor = line_end + 3;
+            continue;
+        }
+
+        if (stable_bytes[0] == '\0')
+        {
+            memcpy(stable_bytes, bytes_start, bytes_len);
+            stable_bytes[bytes_len] = '\0';
+        }
+        else if (strlen(stable_bytes) != bytes_len ||
+                 memcmp(stable_bytes, bytes_start, bytes_len) != 0)
+            return 0;
+
+        if (first_elapsed[0] == '\0')
+            memcpy(first_elapsed, elapsed_text, elapsed_len + 1U);
+        else if (strcmp(first_elapsed, elapsed_text) != 0)
+            return 1;
+
+        cursor = line_end + 3;
+    }
+    return 0;
+}
+
 static int dir_exists(const char *path)
 {
     struct stat st;
@@ -2672,6 +2787,18 @@ static void test_live_progress(void)
     check(result == 0 && strstr(quiet_output, "\rProgress:") == NULL,
           "a captured non-tty backup installs no progress callback");
 
+    char joined_target[PATH_MAX];
+    join_path(joined_target, sizeof(joined_target), target_parent,
+              "joined_progress");
+    char *joined_paths[] = { second_source, NULL };
+    backup_test_set_progress_hook(record_backup_progress, NULL);
+    int threads_before = proc_thread_count();
+    result = backup(joined_target, BACKUP_EXPLICIT_PATHS, joined_paths, 0, 0);
+    int threads_after = proc_thread_count();
+    backup_test_set_progress_hook(NULL, NULL);
+    check(result == 0 && threads_before > 0 && threads_after == threads_before,
+          "a live backup joins its progress ticker before returning");
+
     dry_run = 0;
     if (munmap(trace, sizeof(*trace)) != 0)
     {
@@ -2680,6 +2807,40 @@ static void test_live_progress(void)
     }
     remove_tree(home);
     remove_tree(target_parent);
+}
+
+static void test_stalled_progress_ticker(void)
+{
+    printf(BLUE "::" NC " production: stalled copy keeps elapsed progress live\n");
+    char home[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "progress_stall_home");
+    setenv("HOME", home, 1);
+
+    char first[PATH_MAX], stalled[PATH_MAX];
+    join_path(first, sizeof(first), home, "a-first.bin");
+    join_path(stalled, sizeof(stalled), home, "z-stalled.bin");
+    write_large_file(first, 65536);
+    write_large_file(stalled, 65536);
+    char *paths[] = { first, stalled, NULL };
+
+    char target[PATH_MAX];
+    fresh_mkdtemp(target, sizeof(target), "progress_stall_target");
+    ProgressStall stall = { .path = stalled };
+    backup_test_set_capture_hook(stall_before_capture, &stall);
+    backup_test_set_progress_hook(record_backup_progress, NULL);
+    dry_run = 0;
+    char output[32768];
+    int result = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                      output, sizeof(output));
+    backup_test_set_progress_hook(NULL, NULL);
+    backup_test_set_capture_hook(NULL, NULL);
+
+    check(result == 0, "the injected single-path copy stall still completes");
+    check(stalled_progress_advanced_elapsed_without_bytes(output, first),
+          "ticker advances elapsed at least twice while copied bytes stay fixed");
+
+    remove_tree(home);
+    remove_tree(target);
 }
 
 static void test_missing_explicit_path_rejects_before_target_creation(void)
@@ -3041,6 +3202,7 @@ int main(void)
     test_include_network_config_backup();
     test_format_duration();
     test_live_progress();
+    test_stalled_progress_ticker();
     test_missing_explicit_path_rejects_before_target_creation();
     test_overlap_rejected_before_destination_created_live_and_dry_run();
     test_dangling_explicit_leaf_symlink_is_captured_as_symlink();

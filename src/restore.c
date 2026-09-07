@@ -64,6 +64,7 @@ static const RestoreNetworkConfigBackend RESTORE_NETWORK_CONFIG_BACKENDS[] = {
 static const char *restore_test_network_config_dest_dirs[NETWORK_CONFIG_BACKEND_COUNT];
 static RestoreTestNetworkReloadHook restore_test_network_reload_hook;
 static void *restore_test_network_reload_context;
+static int restore_test_progress_force;
 
 void restore_test_set_network_config_dest_dir(const char *backend_name,
                                               const char *dest_dir)
@@ -83,6 +84,11 @@ void restore_test_set_network_reload_hook(RestoreTestNetworkReloadHook hook,
 {
     restore_test_network_reload_hook = hook;
     restore_test_network_reload_context = context;
+}
+
+void restore_test_set_progress_force(int force)
+{
+    restore_test_progress_force = force != 0;
 }
 #endif
 
@@ -750,6 +756,7 @@ typedef struct {
     struct timespec started_at;
     struct timespec last_sample_time;
     off_t last_sample_bytes;
+    ProgressTicker ticker;
 } RestoreProgressDisplay;
 
 static off_t progress_speed(off_t bytes_restored, off_t last_sample_bytes,
@@ -777,6 +784,58 @@ static long progress_elapsed_whole_seconds(double elapsed_seconds)
     return (long)elapsed_seconds;
 }
 
+static void restore_render_progress(RestoreProgressDisplay *display,
+                                    off_t bytes_restored,
+                                    off_t speed_bytes,
+                                    const char *current_path,
+                                    const struct timespec *now)
+{
+    double elapsed_seconds = timespec_elapsed_seconds(&display->started_at,
+                                                      now);
+    char restored_text[32];
+    char elapsed_text[32];
+    char speed_text[32];
+    format_size(bytes_restored, restored_text, sizeof(restored_text));
+    format_duration(progress_elapsed_whole_seconds(elapsed_seconds),
+                    elapsed_text, sizeof(elapsed_text));
+    format_size(speed_bytes, speed_text, sizeof(speed_text));
+    const char *path_text = current_path != NULL && current_path[0] != '\0'
+        ? current_path : "unknown";
+    printf("\rRestored: %s so far, elapsed %s, speed %s/s, current: %s\033[K",
+           restored_text, elapsed_text, speed_text, path_text);
+    fflush(stdout);
+}
+
+static void restore_ticker_redraw(const ProgressTickerSnapshot *snapshot,
+                                  const struct timespec *now, void *context)
+{
+    RestoreProgressDisplay *display = context;
+    restore_render_progress(display, snapshot->bytes, snapshot->speed_bytes,
+                            snapshot->path, now);
+}
+
+static void restore_progress_stop_ticker(RestoreProgressDisplay *display)
+{
+    if (progress_ticker_stop(&display->ticker) == 0)
+        return;
+
+    print_error("Error: Could not stop the progress display thread: %s\n",
+                strerror(errno));
+    // Returning would let a live thread retain pointers into this stack frame.
+    abort();
+}
+
+static int restore_progress_should_install(void)
+{
+    if (dry_run)
+        return 0;
+#ifdef RESTORE_TEST_HOOKS
+    if (restore_test_progress_force)
+        return 1;
+#endif
+    return isatty(fileno(stdout));
+}
+
 static void restore_report_progress(off_t bytes_restored,
                                     const char *current_path,
                                     void *userdata)
@@ -795,26 +854,23 @@ static void restore_report_progress(off_t bytes_restored,
         display->last_sample_bytes = 0;
     }
 
-    double elapsed_seconds = timespec_elapsed_seconds(&display->started_at,
-                                                      &now);
     double sample_seconds = timespec_elapsed_seconds(
         &display->last_sample_time, &now);
     off_t speed_bytes = progress_speed(bytes_restored,
                                        display->last_sample_bytes,
                                        sample_seconds);
 
-    char restored_text[32];
-    char elapsed_text[32];
-    char speed_text[32];
-    format_size(bytes_restored, restored_text, sizeof(restored_text));
-    format_duration(progress_elapsed_whole_seconds(elapsed_seconds),
-                    elapsed_text, sizeof(elapsed_text));
-    format_size(speed_bytes, speed_text, sizeof(speed_text));
-    const char *path_text = current_path != NULL && current_path[0] != '\0'
-        ? current_path : "unknown";
-    printf("\rRestored: %s so far, elapsed %s, speed %s/s, current: %s\033[K",
-           restored_text, elapsed_text, speed_text, path_text);
-    fflush(stdout);
+    if (progress_ticker_snapshot(&display->ticker, bytes_restored, speed_bytes,
+                                 0, 0, current_path, &now) != 0)
+    {
+        int saved_errno = errno;
+        restore_progress_stop_ticker(display);
+        print_warning("  Warning: progress stall redraw disabled after a "
+                      "snapshot failure: %s\n", strerror(saved_errno));
+    }
+
+    restore_render_progress(display, bytes_restored, speed_bytes,
+                            current_path, &now);
     display->last_sample_time = now;
     display->last_sample_bytes = bytes_restored;
     display->printed_anything = 1;
@@ -2329,10 +2385,17 @@ int restore(const char *source)
         backup_capture_report_init(&capture_report);
         capture_report.sync_interval_bytes = BACKUP_SYNC_INTERVAL_BYTES;
         RestoreProgressDisplay progress_display = {0};
-        if (!dry_run && isatty(fileno(stdout)))
+        int progress_installed = 0;
+        if (restore_progress_should_install())
         {
             capture_report.progress_cb = restore_report_progress;
             capture_report.progress_userdata = &progress_display;
+            if (progress_ticker_start(&progress_display.ticker,
+                                      restore_ticker_redraw,
+                                      &progress_display) != 0)
+                print_warning("  Warning: progress stall redraw is unavailable: %s\n",
+                              strerror(errno));
+            progress_installed = 1;
         }
         request.capture_report = &capture_report;
         PortableRestoreReplayReport report;
@@ -2351,6 +2414,8 @@ int restore(const char *source)
                  m.has_network_config)
             restore_network_config(source_root_fd, &had_portable_error);
 
+        if (progress_installed)
+            restore_progress_stop_ticker(&progress_display);
         if (progress_display.printed_anything)
         {
             capture_report.progress_cb(capture_report.bytes_copied,
@@ -2441,6 +2506,8 @@ int restore(const char *source)
     metadata_profiles_init(&metadata_profiles);
     RestoreTimestampAnchors timestamp_anchors;
     restore_timestamp_anchors_init(&timestamp_anchors);
+    RestoreProgressDisplay progress_display = {0};
+    int progress_installed = 0;
     int result = 1;
 
     RestoreNativeStatus metadata_inventory_status;
@@ -2530,11 +2597,16 @@ int restore(const char *source)
         }
     }
 
-    RestoreProgressDisplay progress_display = {0};
-    if (!dry_run && isatty(fileno(stdout)))
+    if (restore_progress_should_install())
     {
         capture_report.progress_cb = restore_report_progress;
         capture_report.progress_userdata = &progress_display;
+        if (progress_ticker_start(&progress_display.ticker,
+                                  restore_ticker_redraw,
+                                  &progress_display) != 0)
+            print_warning("  Warning: progress stall redraw is unavailable: %s\n",
+                          strerror(errno));
+        progress_installed = 1;
     }
 
     if (mst == MANIFEST_STATUS_VALID)
@@ -2552,6 +2624,11 @@ int restore(const char *source)
             goto cleanup;
     }
 
+    if (progress_installed)
+    {
+        restore_progress_stop_ticker(&progress_display);
+        progress_installed = 0;
+    }
     if (progress_display.printed_anything)
     {
         capture_report.progress_cb(capture_report.bytes_copied,
@@ -2588,6 +2665,8 @@ int restore(const char *source)
     result = had_error ? 1 : 0;
 
 cleanup:
+    if (progress_installed)
+        restore_progress_stop_ticker(&progress_display);
     native_inode_map_free(ctx.inode_map);
     ctx.inode_map = NULL;
     metadata_profiles_free(&metadata_profiles);

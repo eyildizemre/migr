@@ -1,6 +1,8 @@
 #ifndef UTILS_H
 #define UTILS_H
 
+#include <limits.h> /* PATH_MAX */
+#include <pthread.h> /* pthread_mutex_t, pthread_t */
 #include <stddef.h> /* size_t */
 #include <time.h> /* struct timespec */
 #include <sys/types.h> /* off_t */
@@ -66,6 +68,60 @@ void *array_reserve(void *items, size_t *capacity, size_t count,
 
 /* Live backup progress is sampled at most twice per second in production. */
 #define BACKUP_PROGRESS_THROTTLE_MS 500
+
+/* A display-only ticker wakes four times per second, but only redraws after
+ * three ordinary progress-throttle windows have passed without real I/O. */
+#define PROGRESS_TICK_INTERVAL_MS 250
+#define PROGRESS_STALL_MS 1500
+
+typedef struct {
+    off_t bytes;
+    off_t speed_bytes;
+    off_t free_bytes;
+    int free_bytes_known;
+    char path[PATH_MAX];
+    struct timespec at;
+} ProgressTickerSnapshot;
+
+typedef void (*ProgressTickerRedraw)(const ProgressTickerSnapshot *snapshot,
+                                     const struct timespec *now,
+                                     void *context);
+
+typedef struct {
+    pthread_mutex_t lock;
+    pthread_t thread;
+    ProgressTickerSnapshot snapshot;
+    ProgressTickerRedraw redraw_cb;
+    void *redraw_context;
+    int thread_error;
+    int stop_requested;
+    int has_snapshot;
+    int initialized;
+    int running;
+} ProgressTicker;
+
+/**
+ * @brief Starts a display-only stall ticker.
+ *
+ * The ticker never reads copy-engine state. It redraws only from snapshots
+ * supplied by progress_ticker_snapshot().
+ */
+int progress_ticker_start(ProgressTicker *ticker,
+                          ProgressTickerRedraw redraw_cb,
+                          void *redraw_context);
+
+/**
+ * @brief Replaces the ticker's last synchronized progress snapshot.
+ */
+int progress_ticker_snapshot(ProgressTicker *ticker, off_t bytes,
+                             off_t speed_bytes, off_t free_bytes,
+                             int free_bytes_known, const char *current_path,
+                             const struct timespec *snapshot_at);
+
+/**
+ * @brief Stops and joins the ticker before its owner goes out of scope.
+ */
+int progress_ticker_stop(ProgressTicker *ticker);
 
 /* Periodic mid-copy sync interval for live backups. */
 #define BACKUP_SYNC_INTERVAL_BYTES (256 * 1024 * 1024)

@@ -993,6 +993,7 @@ typedef struct {
     struct timespec started_at;
     struct timespec last_sample_time;
     off_t last_sample_bytes;
+    ProgressTicker ticker;
 } BackupProgressDisplay;
 
 static off_t progress_speed(off_t bytes_copied, off_t last_sample_bytes,
@@ -1020,6 +1021,67 @@ static long progress_elapsed_whole_seconds(double elapsed_seconds)
     return (long)elapsed_seconds;
 }
 
+static void backup_render_progress(BackupProgressDisplay *display,
+                                   off_t bytes_copied,
+                                   off_t speed_bytes,
+                                   off_t free_bytes,
+                                   int free_bytes_known,
+                                   const char *current_path,
+                                   const struct timespec *now)
+{
+    double elapsed_seconds = timespec_elapsed_seconds(&display->started_at,
+                                                      now);
+    char copied_text[32];
+    char estimated_text[32];
+    char free_text[32];
+    char elapsed_text[32];
+    char speed_text[32];
+    format_size(bytes_copied, copied_text, sizeof(copied_text));
+    if (display->estimated_total_bytes > 0)
+        format_size(display->estimated_total_bytes, estimated_text,
+                    sizeof(estimated_text));
+
+    if (free_bytes_known)
+        format_size(free_bytes, free_text, sizeof(free_text));
+    else
+        snprintf(free_text, sizeof(free_text), "unknown");
+    format_duration(progress_elapsed_whole_seconds(elapsed_seconds),
+                    elapsed_text, sizeof(elapsed_text));
+    format_size(speed_bytes, speed_text, sizeof(speed_text));
+    const char *path_text = current_path != NULL && current_path[0] != '\0'
+        ? current_path : "unknown";
+
+    if (display->estimated_total_bytes > 0)
+        printf("\rProgress: %s/%s copied, %s free, elapsed %s, speed %s/s, "
+               "current: %s\033[K", copied_text, estimated_text, free_text,
+               elapsed_text, speed_text, path_text);
+    else
+        printf("\rProgress: %s copied, %s free, elapsed %s, speed %s/s, "
+               "current: %s\033[K", copied_text, free_text, elapsed_text,
+               speed_text, path_text);
+    fflush(stdout);
+}
+
+static void backup_ticker_redraw(const ProgressTickerSnapshot *snapshot,
+                                 const struct timespec *now, void *context)
+{
+    BackupProgressDisplay *display = context;
+    backup_render_progress(display, snapshot->bytes, snapshot->speed_bytes,
+                           snapshot->free_bytes, snapshot->free_bytes_known,
+                           snapshot->path, now);
+}
+
+static void backup_progress_stop_ticker(BackupProgressDisplay *display)
+{
+    if (progress_ticker_stop(&display->ticker) == 0)
+        return;
+
+    print_error("Error: Could not stop the progress display thread: %s\n",
+                strerror(errno));
+    // Returning would let a live thread retain pointers into this stack frame.
+    abort();
+}
+
 static void backup_report_progress(off_t bytes_copied,
                                    const char *current_path,
                                    void *userdata)
@@ -1038,43 +1100,28 @@ static void backup_report_progress(off_t bytes_copied,
         display->last_sample_bytes = 0;
     }
 
-    double elapsed_seconds = timespec_elapsed_seconds(&display->started_at,
-                                                      &now);
     double sample_seconds = timespec_elapsed_seconds(
         &display->last_sample_time, &now);
     off_t speed_bytes = progress_speed(bytes_copied,
                                        display->last_sample_bytes,
                                        sample_seconds);
 
-    char copied_text[32];
-    char estimated_text[32];
-    char free_text[32];
-    char elapsed_text[32];
-    char speed_text[32];
-    format_size(bytes_copied, copied_text, sizeof(copied_text));
-    if (display->estimated_total_bytes > 0)
-        format_size(display->estimated_total_bytes, estimated_text,
-                    sizeof(estimated_text));
-
     off_t free_bytes = 0;
-    if (destination_free_bytes(display->data_fd, &free_bytes) == 0)
-        format_size(free_bytes, free_text, sizeof(free_text));
-    else
-        snprintf(free_text, sizeof(free_text), "unknown");
-    format_duration(progress_elapsed_whole_seconds(elapsed_seconds),
-                    elapsed_text, sizeof(elapsed_text));
-    format_size(speed_bytes, speed_text, sizeof(speed_text));
-    const char *path_text = current_path != NULL && current_path[0] != '\0'
-        ? current_path : "unknown";
+    int free_bytes_known =
+        destination_free_bytes(display->data_fd, &free_bytes) == 0;
 
-    if (display->estimated_total_bytes > 0)
-        printf("\rProgress: %s/%s copied, %s free, elapsed %s, speed %s/s, "
-               "current: %s\033[K", copied_text, estimated_text, free_text,
-               elapsed_text, speed_text, path_text);
-    else
-        printf("\rProgress: %s copied, %s free, elapsed %s, speed %s/s, "
-               "current: %s\033[K", copied_text, free_text, elapsed_text,
-               speed_text, path_text);
+    if (progress_ticker_snapshot(&display->ticker, bytes_copied, speed_bytes,
+                                 free_bytes, free_bytes_known, current_path,
+                                 &now) != 0)
+    {
+        int saved_errno = errno;
+        backup_progress_stop_ticker(display);
+        print_warning("  Warning: progress stall redraw disabled after a "
+                      "snapshot failure: %s\n", strerror(saved_errno));
+    }
+
+    backup_render_progress(display, bytes_copied, speed_bytes, free_bytes,
+                           free_bytes_known, current_path, &now);
 
 #ifdef BACKUP_TEST_HOOKS
     if (backup_test_progress_hook != NULL)
@@ -1083,7 +1130,6 @@ static void backup_report_progress(off_t bytes_copied,
                                   current_path,
                                   backup_test_progress_context);
 #endif
-    fflush(stdout);
     display->last_sample_time = now;
     display->last_sample_bytes = bytes_copied;
     display->printed_anything = 1;
@@ -2493,6 +2539,11 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
             capture_report.progress_cb = backup_report_progress;
             capture_report.progress_userdata = &progress_display;
             capture_report.progress_unthrottled = progress_force;
+            if (progress_ticker_start(&progress_display.ticker,
+                                      backup_ticker_redraw,
+                                      &progress_display) != 0)
+                print_warning("  Warning: progress stall redraw is unavailable: %s\n",
+                              strerror(errno));
             progress_installed = 1;
         }
 
@@ -2553,6 +2604,8 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
             }
         }
 
+        if (progress_installed)
+            backup_progress_stop_ticker(&progress_display);
         if (progress_installed && progress_display.printed_anything)
         {
             capture_report.progress_cb(capture_report.bytes_copied,

@@ -35,6 +35,10 @@
 #include "portable_restore_internal.h"
 #include "utils.h"
 
+#ifdef RESTORE_TEST_HOOKS
+void restore_test_set_progress_force(int force);
+#endif
+
 #define GREEN "\033[0;32m"
 #define RED   "\033[0;31m"
 #define BLUE  "\033[0;34m"
@@ -57,6 +61,24 @@ static void check(int cond, const char *label)
         printf("  " RED "x" NC " %s\n", label);
         failures++;
     }
+}
+
+static int proc_thread_count(void)
+{
+    DIR *dir = opendir("/proc/self/task");
+    if (dir == NULL)
+        return -1;
+
+    int count = 0;
+    errno = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL)
+        if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0)
+            count++;
+    int saved_errno = errno;
+    if (closedir(dir) != 0 || saved_errno != 0)
+        return -1;
+    return count;
 }
 
 static void skip_case(const char *label, const char *reason)
@@ -298,6 +320,85 @@ static int run_restore_capturing(const char *source, char *output,
                                  size_t output_size)
 {
     return run_restore_capturing_with_input(source, NULL, output, output_size);
+}
+
+static int run_restore_forced_progress_in_process(const char *source,
+                                                  const char *input,
+                                                  char *output,
+                                                  size_t output_size,
+                                                  int *threads_before,
+                                                  int *threads_after)
+{
+    int input_pipe[2];
+    FILE *capture = tmpfile();
+    if (capture == NULL || pipe(input_pipe) != 0)
+    {
+        perror("progress fixture");
+        exit(1);
+    }
+
+    int saved_stdin = dup(STDIN_FILENO);
+    int saved_stdout = dup(STDOUT_FILENO);
+    int saved_stderr = dup(STDERR_FILENO);
+    if (saved_stdin < 0 || saved_stdout < 0 || saved_stderr < 0)
+    {
+        perror("dup");
+        exit(1);
+    }
+
+    if (input != NULL)
+    {
+        size_t input_len = strlen(input);
+        ssize_t written = write(input_pipe[1], input, input_len);
+        if (written < 0 || (size_t)written != input_len)
+        {
+            perror("write");
+            exit(1);
+        }
+    }
+    if (close(input_pipe[1]) != 0)
+        exit(1);
+
+    fflush(stdout);
+    fflush(stderr);
+    if (dup2(input_pipe[0], STDIN_FILENO) < 0 ||
+        dup2(fileno(capture), STDOUT_FILENO) < 0 ||
+        dup2(fileno(capture), STDERR_FILENO) < 0)
+    {
+        perror("dup2");
+        exit(1);
+    }
+    if (close(input_pipe[0]) != 0)
+        exit(1);
+
+    restore_test_set_progress_force(1);
+    *threads_before = proc_thread_count();
+    int rc = restore(source);
+    *threads_after = proc_thread_count();
+    restore_test_set_progress_force(0);
+
+    fflush(stdout);
+    fflush(stderr);
+    if (dup2(saved_stdin, STDIN_FILENO) < 0 ||
+        dup2(saved_stdout, STDOUT_FILENO) < 0 ||
+        dup2(saved_stderr, STDERR_FILENO) < 0)
+    {
+        perror("dup2 restore");
+        exit(1);
+    }
+    if (close(saved_stdin) != 0 || close(saved_stdout) != 0 ||
+        close(saved_stderr) != 0)
+        exit(1);
+
+    if (fseek(capture, 0, SEEK_SET) != 0)
+        exit(1);
+    size_t total = fread(output, 1, output_size - 1U, capture);
+    if (ferror(capture))
+        exit(1);
+    output[total] = '\0';
+    if (fclose(capture) != 0)
+        exit(1);
+    return rc;
 }
 
 static int write_proc_file(const char *path, const char *content)
@@ -1074,6 +1175,53 @@ static void test_versioned_restore_allows_ascii_case_distinct_names(void)
     check(rc == 0 && file_content_is(upper, "UPPER") &&
               file_content_is(lower, "LOWER"),
           "ordinary byte-sensitive directories restore ASCII-case-distinct entries");
+
+    remove_tree(source);
+    remove_tree(home);
+}
+
+static void test_live_restore_joins_progress_ticker(void)
+{
+    printf(BLUE "::" NC " restore dispatch: live progress ticker is joined before return\n");
+
+    char source[PATH_MAX], home[PATH_MAX], restored[PATH_MAX];
+    char output[16384];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_progress_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_progress_home");
+    setenv("HOME", home, 1);
+
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "PROGRESS");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "PROGRESS");
+    strcpy(root.source_path, "progress-source");
+    strcpy(root.restore_path, "progress-dest");
+    root.has_restore_path = 1;
+
+    Manifest manifest;
+    make_v1_manifest(&manifest, &root, 1);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the live-progress restore manifest");
+    write_payload_file(source, "data/PROGRESS", "payload.txt", "progress payload");
+    remove_fixture_packages(source);
+
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    int threads_before = -1;
+    int threads_after = -1;
+    int rc = run_restore_forced_progress_in_process(
+        source, "y\n", output, sizeof(output), &threads_before, &threads_after);
+    dry_run = previous_dry_run;
+
+    join_path(restored, sizeof(restored), home,
+              "progress-dest/payload.txt");
+    check(rc == 0 && file_content_is(restored, "progress payload"),
+          "forced live progress leaves the restore result intact");
+    check(strstr(output, "\rRestored:") != NULL,
+          "the restore-only progress force installs the real display path");
+    check(threads_before > 0 && threads_after == threads_before,
+          "a live restore joins its progress ticker before returning");
 
     remove_tree(source);
     remove_tree(home);
@@ -2676,6 +2824,7 @@ int main(void)
     test_versioned_restore_rejects_non_directory_payload_paths();
     test_versioned_restore_refuses_bind_mount_aliases();
     test_versioned_restore_allows_ascii_case_distinct_names();
+    test_live_restore_joins_progress_ticker();
     test_native_identity_graph_keeps_nested_mount_views_route_specific();
     test_versioned_restore_refuses_differing_mount_id_aliases();
     test_versioned_restore_refuses_destination_alias_collisions();
