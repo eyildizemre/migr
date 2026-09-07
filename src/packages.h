@@ -33,6 +33,25 @@
 int packages_at(int container_fd, const char *leaf);
 
 /**
+ * @brief Safely writes a text control artifact beneath an open container fd.
+ *
+ * Uses the same clear-before-create and clear-on-failure contract documented
+ * for packages_at(), without attaching package-specific collection or output.
+ * A NULL buffer means there is nothing to write and still clears any stale
+ * object occupying the slot; an empty non-NULL buffer is written as an empty
+ * file.
+ *
+ * @param container_fd Directory fd of the container; not closed here.
+ * @param leaf         File name to create beneath it; a single component.
+ * @param buffer       Complete NUL-terminated contents, or NULL for no content.
+ * @return 0 when the buffer was written; 1 when the slot was left empty after
+ *         no content or a recoverable write failure; -1 when the slot could
+ *         not be made safe and the container must not be finalized.
+ */
+int write_container_text_file_at(int container_fd, const char *leaf,
+                                 const char *buffer);
+
+/**
  * @brief Ensures no object occupies a control-artifact slot in a container.
  *
  * Used where a package list must not be present at all -- an explicit-paths

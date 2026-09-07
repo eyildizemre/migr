@@ -3199,3 +3199,28 @@ from blocking the display thread on the same I/O path it is meant to report.
 directly from the ticker; updating the speed sample from timer redraws; polling
 the destination filesystem from the ticker; leaving a detached or cancelable
 thread alive past backup/restore return.
+
+---
+
+## D37 — 2026-09-07 — VS Code extension snapshots are capture-only
+
+**Status:** Implemented
+
+**Decision:** Critical and comprehensive backups best-effort capture
+`code --list-extensions --show-versions` as `vs-code-extensions.txt` at the
+container root. The snapshot is unconditional when `code` can produce usable
+output, like `packages.txt`; an unavailable command or empty result leaves the
+slot absent, and explicit-path backups clear it under D16. Extension ids and
+versions are not secret-bearing, so this control artifact has no consent gate.
+Restore never reads the file, installs VS Code, or installs extensions from it.
+
+**Why:** Restore is intended to run immediately after a distribution hop, when
+VS Code itself, its extension host, marketplace authentication and profile state
+may not yet be installed or settled. Automatically installing extensions at
+that point would couple migr to an external application whose own setup may
+still be incomplete. A plain snapshot preserves the useful inventory while
+letting the user replay it once VS Code is ready.
+
+**Rejected:** installing VS Code during restore; automatically replaying the
+extension list during restore; adding a dedicated include flag; prompting for
+consent before recording extension ids.

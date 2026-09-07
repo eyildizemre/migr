@@ -714,6 +714,22 @@ test_backup() {
     else
         echo -e "  ${GREEN}✓${NC} Controls stay at the container root, out of data/."
     fi
+
+    local no_code_target="$TEST_DIR/no-code-backup"
+    mkdir -p "$no_code_target"
+    local no_code_output
+    no_code_output=$(PATH="$STUB_DIR" ../migr backup "$no_code_target" --critical 2>&1)
+    assert_contains "$no_code_output" "Backup complete"
+    assert_contains "$no_code_output" \
+        "Note: no VS Code extension list was captured for this backup."
+    local no_code_backup
+    no_code_backup=$(sole_final_container "$no_code_target")
+    if [ -e "$no_code_backup/vs-code-extensions.txt" ]; then
+        echo -e "  ${RED}✗${NC} VS Code extension snapshot exists even though code was unavailable"
+        exit 1
+    else
+        echo -e "  ${GREEN}✓${NC} Missing code leaves no VS Code extension snapshot and does not fail backup."
+    fi
 }
 
 test_shell_history_consent() {

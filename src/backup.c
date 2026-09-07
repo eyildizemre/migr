@@ -2209,6 +2209,34 @@ static int backup_dry_run(const char *target, BackupMode mode,
 
 /* ------------------------------------------------------------------------- */
 
+static char *collect_vscode_extensions(void)
+{
+    static char *const vscode_extensions_cmd[] = {
+        "code", "--list-extensions", "--show-versions", NULL
+    };
+
+    size_t buf_size = 5 * 1024 * 1024;
+    char *buffer = malloc(buf_size);
+    if (buffer == NULL)
+        return NULL;
+
+    buffer[0] = '\0';
+    if (run_command_capture(vscode_extensions_cmd, buffer, buf_size) != 0)
+    {
+        free(buffer);
+        return NULL;
+    }
+
+    for (const unsigned char *p = (const unsigned char *)buffer; *p; p++)
+    {
+        if (!isspace(*p))
+            return buffer;
+    }
+
+    free(buffer);
+    return NULL;
+}
+
 static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
                       const SelectionPlan *selection, int include_self,
                       int include_network_config)
@@ -2645,6 +2673,42 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
             else if (pkg > 0)
             {
                 print_warning("  Warning: no package list was written for this backup.\n");
+            }
+        }
+
+        // The VS Code snapshot follows the same scoped-vs-explicit ownership
+        // rule for container controls: explicit backups make no inventory
+        // assumptions, and an adopted partial must not publish a stale list.
+        if (mode == BACKUP_EXPLICIT_PATHS)
+        {
+            if (packages_clear_at(container_fd, "vs-code-extensions.txt") != 0)
+            {
+                print_error("Error: could not clear vs-code-extensions.txt from "
+                            "the backup container\n");
+                had_error = 1;
+            }
+        }
+        else
+        {
+            printf("\nVS Code Extensions\n");
+            char *extensions = collect_vscode_extensions();
+            int vscode = write_container_text_file_at(
+                container_fd, "vs-code-extensions.txt", extensions);
+            free(extensions);
+
+            if (vscode < 0)
+            {
+                print_error("Error: could not safely update vs-code-extensions.txt "
+                            "in the backup container\n");
+                had_error = 1;
+            }
+            else if (vscode > 0)
+            {
+                printf("  Note: no VS Code extension list was captured for this backup.\n");
+            }
+            else
+            {
+                printf("Saved VS Code extension list to vs-code-extensions.txt\n");
             }
         }
 

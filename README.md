@@ -168,6 +168,8 @@ backups remain literal requests and do not add this consent gate.
 
 **Packages (all scopes except explicit paths):** The list of packages you explicitly installed — not the thousands of dependencies pulled in alongside them — saved as packages.txt and reinstalled on restore. Anything the new distribution cannot resolve is written to `skipped-packages.txt` rather than silently dropped.
 
+**VS Code extensions (all scopes except explicit paths):** When `code` is available and lists extensions, migr saves `code --list-extensions --show-versions` to `vs-code-extensions.txt` as a best-effort snapshot. Restore does not install VS Code or extensions from this file. Once VS Code is set up on the new system, each saved line can be passed to `code --install-extension` directly, or replayed with a simple shell loop.
+
 ## Backup Containers
 
 A successful live backup is published as:
@@ -195,6 +197,7 @@ The selected payload roots live below `data/`:
 migr_backup_YYYYMMDD_HHMMSS[-N]/
 ├── manifest.txt
 ├── packages.txt        # present when this scope exports a package list
+├── vs-code-extensions.txt # present when code lists installed extensions
 ├── migr                # present with --include-self
 ├── network/            # with --include-network-config when a backend is found
 └── data/
@@ -418,7 +421,7 @@ recorded in [docs/DECISIONS.md](docs/DECISIONS.md).
 - [x] Cross-locale restore mapping (manifest system)
 - [x] Resumable versioned backup containers
 - [x] Backups to filesystems that cannot hold Linux metadata (exFAT/NTFS/FAT32)
-- [ ] VS Code extension list backup and restore
+- [x] VS Code extension list snapshot on backup (capture-only)
 - [ ] Logging
 - [x] Network configuration backup
 - [x] Self-contained backup (`--include-self` static binary)

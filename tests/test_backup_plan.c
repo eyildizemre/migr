@@ -1680,6 +1680,178 @@ static int files_are_equal(const char *a_path, const char *b_path)
     return equal;
 }
 
+static char *prepend_test_path(const char *prefix)
+{
+    const char *current = getenv("PATH");
+    char *saved = strdup(current != NULL ? current : "");
+    if (saved == NULL)
+    {
+        printf(RED "fixture: could not save PATH" NC "\n");
+        exit(1);
+    }
+
+    size_t needed = strlen(prefix) + strlen(saved) + 2U;
+    char *updated = malloc(needed);
+    if (updated == NULL)
+    {
+        free(saved);
+        printf(RED "fixture: could not build PATH" NC "\n");
+        exit(1);
+    }
+    if (saved[0] != '\0')
+        snprintf(updated, needed, "%s:%s", prefix, saved);
+    else
+        snprintf(updated, needed, "%s", prefix);
+    if (setenv("PATH", updated, 1) != 0)
+    {
+        free(updated);
+        free(saved);
+        printf(RED "fixture: could not update PATH" NC "\n");
+        exit(1);
+    }
+    free(updated);
+    return saved;
+}
+
+static void restore_test_path(char *saved)
+{
+    if (setenv("PATH", saved, 1) != 0)
+    {
+        free(saved);
+        printf(RED "fixture: could not restore PATH" NC "\n");
+        exit(1);
+    }
+    free(saved);
+}
+
+typedef struct {
+    const char *path;
+    int removed;
+} RemoveBeforeCapture;
+
+static void remove_before_capture(const char *source_path, void *context)
+{
+    RemoveBeforeCapture *fixture = context;
+    if (fixture == NULL || source_path == NULL ||
+        fixture->removed || strcmp(source_path, fixture->path) != 0)
+        return;
+
+    if (unlink(source_path) != 0)
+    {
+        printf(RED "fixture: could not remove source before capture" NC "\n");
+        exit(1);
+    }
+    fixture->removed = 1;
+}
+
+static void test_vscode_extension_snapshot(void)
+{
+    printf(BLUE "::" NC " production: scoped backups snapshot VS Code extensions and explicit resumes clear stale snapshots\n");
+
+    char home[PATH_MAX], stub_dir[PATH_MAX], target[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "vscode_home");
+    fresh_mkdtemp(stub_dir, sizeof(stub_dir), "vscode_stub");
+    setenv("HOME", home, 1);
+
+    char profile[PATH_MAX];
+    join_path(profile, sizeof(profile), home, ".profile");
+    write_file(profile, "export PATH\n");
+
+    char code_stub[PATH_MAX];
+    join_path(code_stub, sizeof(code_stub), stub_dir, "code");
+    write_file(code_stub,
+               "#!/bin/sh\n"
+               "printf '%s\\n' 'publisher.alpha@1.2.3' 'publisher.beta@4.5.6'\n");
+    if (chmod(code_stub, 0700) != 0)
+    {
+        printf(RED "fixture: could not make fake code executable" NC "\n");
+        exit(1);
+    }
+
+    char expected[PATH_MAX];
+    join_path(expected, sizeof(expected), stub_dir, "expected.txt");
+    write_file(expected, "publisher.alpha@1.2.3\npublisher.beta@4.5.6\n");
+
+    char *saved_path = prepend_test_path(stub_dir);
+    char *no_paths[] = { NULL };
+    char output[32768], container[PATH_MAX], snapshot[PATH_MAX];
+
+    fresh_mkdtemp(target, sizeof(target), "vscode_success_target");
+    int rc = run_backup_capturing(target, BACKUP_CRITICAL, no_paths,
+                                  output, sizeof(output));
+    int have_container = find_container_dir(target, container, sizeof(container));
+    if (have_container)
+        join_path(snapshot, sizeof(snapshot), container, "vs-code-extensions.txt");
+    check(rc == 0 && have_container && files_are_equal(expected, snapshot),
+          "a scoped backup writes the exact deterministic extension snapshot");
+    check(strstr(output,
+                 "Saved VS Code extension list to vs-code-extensions.txt") != NULL,
+          "a successful extension snapshot is reported");
+    remove_tree(target);
+
+    write_file(code_stub, "#!/bin/sh\nexit 7\n");
+    if (chmod(code_stub, 0700) != 0)
+    {
+        printf(RED "fixture: could not update fake code executable" NC "\n");
+        exit(1);
+    }
+
+    fresh_mkdtemp(target, sizeof(target), "vscode_failure_target");
+    rc = run_backup_capturing(target, BACKUP_CRITICAL, no_paths,
+                              output, sizeof(output));
+    have_container = find_container_dir(target, container, sizeof(container));
+    if (have_container)
+        join_path(snapshot, sizeof(snapshot), container, "vs-code-extensions.txt");
+    check(rc == 0 && have_container && access(snapshot, F_OK) != 0,
+          "an unavailable or failing code command leaves no snapshot without failing backup");
+    check(strstr(output,
+                 "Note: no VS Code extension list was captured for this backup.") != NULL,
+          "a skipped extension snapshot is reported as a note");
+    remove_tree(target);
+    restore_test_path(saved_path);
+
+    char explicit_source[PATH_MAX];
+    join_path(explicit_source, sizeof(explicit_source), home, "explicit.txt");
+    write_file(explicit_source, "resume payload\n");
+    char *explicit_paths[] = { explicit_source, NULL };
+
+    fresh_mkdtemp(target, sizeof(target), "vscode_explicit_target");
+    // Resume identity includes scope, so a scoped partial cannot be adopted by
+    // an explicit invocation. Plant the stale control into a matching explicit
+    // partial instead, which exercises the same post-adoption clearing path.
+    RemoveBeforeCapture remove_fixture = { .path = explicit_source };
+    backup_test_set_capture_hook(remove_before_capture, &remove_fixture);
+    rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, explicit_paths,
+                              output, sizeof(output));
+    backup_test_set_capture_hook(NULL, NULL);
+
+    char partial[PATH_MAX];
+    int have_partial = find_partial_container_dir(target, partial, sizeof(partial));
+    check(rc != 0 && have_partial && access(explicit_source, F_OK) != 0,
+          "fixture leaves a resumable explicit partial before stale-control cleanup");
+    if (have_partial)
+    {
+        join_path(snapshot, sizeof(snapshot), partial, "vs-code-extensions.txt");
+        write_file(snapshot, "stale@9.9.9\n");
+    }
+    write_file(explicit_source, "resume payload\n");
+
+    rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, explicit_paths,
+                              output, sizeof(output));
+    have_container = find_container_dir(target, container, sizeof(container));
+    if (have_container)
+        join_path(snapshot, sizeof(snapshot), container, "vs-code-extensions.txt");
+    check(rc == 0 && have_container &&
+              strstr(output, "Resuming an interrupted backup of the same job.") != NULL,
+          "the second explicit run adopts and completes the matching partial");
+    check(have_container && access(snapshot, F_OK) != 0,
+          "an adopted explicit backup clears a stale VS Code extension snapshot");
+
+    remove_tree(target);
+    remove_tree(home);
+    remove_tree(stub_dir);
+}
+
 static void force_no_free_space(off_t needed, off_t *free_bytes, void *context)
 {
     (void)needed;
@@ -3200,6 +3372,7 @@ int main(void)
     test_destination_space_preflight();
     test_include_self_backup();
     test_include_network_config_backup();
+    test_vscode_extension_snapshot();
     test_format_duration();
     test_live_progress();
     test_stalled_progress_ticker();

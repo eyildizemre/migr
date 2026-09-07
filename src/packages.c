@@ -61,8 +61,9 @@ static char *collect_packages(int *count_out)
 }
 
 // Writes and closes f, checking every step. A short write or a failed close
-// would otherwise leave a package list that looks complete but is truncated.
-static int write_package_list(FILE *f, const char *buffer)
+// would otherwise leave a text control artifact that looks complete but is
+// truncated.
+static int write_text_buffer(FILE *f, const char *buffer)
 {
     int failed = 0;
     if (fputs(buffer, f) < 0) failed = 1;
@@ -96,6 +97,54 @@ int packages_clear_at(int container_fd, const char *leaf)
     return -1;
 }
 
+int write_container_text_file_at(int container_fd, const char *leaf,
+                                 const char *buffer)
+{
+    if (container_fd < 0 || !leaf_is_safe(leaf))
+        return -1;
+
+    if (buffer == NULL)
+        return packages_clear_at(container_fd, leaf) == 0 ? 1 : -1;
+
+    // Whatever already occupies this slot is never opened, let alone written
+    // into. Reusing it would mean opening an object of unknown type and
+    // provenance: a FIFO blocks the whole backup on a reader that will never
+    // come, and a hardlink to a file outside the container would have that
+    // file truncated and overwritten. Removing the name first makes both
+    // harmless, and O_EXCL then guarantees the fd refers to an inode this call
+    // alone created, with nothing substitutable in between.
+    if (packages_clear_at(container_fd, leaf) != 0)
+        return -1;
+
+    int fd = openat(container_fd, leaf,
+                    O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC,
+                    0644);
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode))
+    {
+        if (fd >= 0)
+            close(fd);
+        print_error("Error: Could not write %s.\n", leaf);
+        return packages_clear_at(container_fd, leaf) == 0 ? 1 : -1;
+    }
+
+    FILE *out = fdopen(fd, "w");
+    if (out == NULL)
+    {
+        close(fd);
+        print_error("Error: Could not write %s.\n", leaf);
+        return packages_clear_at(container_fd, leaf) == 0 ? 1 : -1;
+    }
+
+    if (write_text_buffer(out, buffer) != 0)
+    {
+        print_error("Error: Could not write %s.\n", leaf);
+        return packages_clear_at(container_fd, leaf) == 0 ? 1 : -1;
+    }
+
+    return 0;
+}
+
 int packages_at(int container_fd, const char *leaf)
 {
     if (container_fd < 0 || !leaf_is_safe(leaf))
@@ -112,54 +161,12 @@ int packages_at(int container_fd, const char *leaf)
         return packages_clear_at(container_fd, leaf) == 0 ? 1 : -1;
     }
 
-    // Whatever already occupies this slot is never opened, let alone written
-    // into. Reusing it would mean opening an object of unknown type and
-    // provenance: a FIFO blocks the whole backup on a reader that will never
-    // come, and a hardlink to a file outside the container would have that
-    // file truncated and overwritten with the package list. Removing the name
-    // first is what makes both harmless -- unlinking one hardlink leaves the
-    // other name's data untouched -- and O_EXCL then guarantees the fd refers
-    // to an inode this call alone created, with nothing substitutable in
-    // between.
-    if (packages_clear_at(container_fd, leaf) != 0)
-    {
-        free(buffer);
-        return -1;
-    }
-
-    int fd = openat(container_fd, leaf,
-                    O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC,
-                    0644);
-    struct stat st;
-    if (fd < 0 || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode))
-    {
-        if (fd >= 0)
-            close(fd);
-        free(buffer);
-        print_error("Error: Could not write %s.\n", leaf);
-        return packages_clear_at(container_fd, leaf) == 0 ? 1 : -1;
-    }
-
-    FILE *out = fdopen(fd, "w");
-    if (out == NULL)
-    {
-        close(fd);
-        free(buffer);
-        print_error("Error: Could not write %s.\n", leaf);
-        return packages_clear_at(container_fd, leaf) == 0 ? 1 : -1;
-    }
-
-    int failed = write_package_list(out, buffer);
+    int write_result = write_container_text_file_at(container_fd, leaf, buffer);
     free(buffer);
 
-    if (failed)
-    {
-        print_error("Error: Could not write %s.\n", leaf);
-        return packages_clear_at(container_fd, leaf) == 0 ? 1 : -1;
-    }
-
-    printf("Saved %d packages to %s\n", count, leaf);
-    return 0;
+    if (write_result == 0)
+        printf("Saved %d packages to %s\n", count, leaf);
+    return write_result;
 }
 
 int package_token_is_safe(const char *token)

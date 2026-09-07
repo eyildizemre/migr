@@ -74,6 +74,89 @@ static void free_package_list(char **pkgs, int pkg_count)
     free(pkgs);
 }
 
+static int file_equals_text(const char *path, const char *expected)
+{
+    FILE *f = fopen(path, "rb");
+    if (f == NULL)
+        return 0;
+
+    size_t expected_len = strlen(expected);
+    char buffer[256];
+    if (expected_len >= sizeof(buffer))
+    {
+        fclose(f);
+        return 0;
+    }
+
+    size_t n = fread(buffer, 1, sizeof(buffer), f);
+    int ok = !ferror(f) && n == expected_len &&
+             memcmp(buffer, expected, expected_len) == 0;
+    fclose(f);
+    return ok;
+}
+
+static void test_write_container_text_file_at(void)
+{
+    printf(BLUE "::" NC " write_container_text_file_at (unit)\n");
+
+    char dir_path[] = "/tmp/migr_container_text_XXXXXX";
+    char *dir = mkdtemp(dir_path);
+    check(dir != NULL, "fixture: text-artifact container directory is created");
+    if (dir == NULL)
+        return;
+
+    int dir_fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    check(dir_fd >= 0, "fixture: text-artifact container directory opens");
+    if (dir_fd < 0)
+    {
+        rmdir(dir);
+        return;
+    }
+
+    const char *snapshot = "alpha@1.0\nbeta@2.0\n";
+    int rc = write_container_text_file_at(dir_fd, "snapshot.txt", snapshot);
+    char snapshot_path[PATH_MAX];
+    snprintf(snapshot_path, sizeof(snapshot_path), "%s/snapshot.txt", dir);
+    check(rc == 0 && file_equals_text(snapshot_path, snapshot),
+          "a complete text artifact is created with exact contents");
+
+    rc = write_container_text_file_at(dir_fd, "snapshot.txt", NULL);
+    check(rc == 1 && access(snapshot_path, F_OK) != 0,
+          "no content clears a stale artifact and reports the tolerable empty state");
+
+    char outside_path[PATH_MAX], hostile_path[PATH_MAX];
+    snprintf(outside_path, sizeof(outside_path), "%s/outside.txt", dir);
+    snprintf(hostile_path, sizeof(hostile_path), "%s/hostile.txt", dir);
+    FILE *outside = fopen(outside_path, "wb");
+    check(outside != NULL, "fixture: hardlink target file is created");
+    if (outside == NULL)
+    {
+        close(dir_fd);
+        rmdir(dir);
+        return;
+    }
+    fputs("outside-data\n", outside);
+    fclose(outside);
+
+    check(link(outside_path, hostile_path) == 0,
+          "fixture: hostile control slot is a hardlink");
+    rc = write_container_text_file_at(dir_fd, "hostile.txt", "replacement\n");
+
+    struct stat outside_st, hostile_st;
+    int separate_inodes = stat(outside_path, &outside_st) == 0 &&
+                          stat(hostile_path, &hostile_st) == 0 &&
+                          outside_st.st_ino != hostile_st.st_ino;
+    check(rc == 0 && separate_inodes &&
+              file_equals_text(outside_path, "outside-data\n") &&
+              file_equals_text(hostile_path, "replacement\n"),
+          "a hostile hardlink is removed, not followed or overwritten");
+
+    unlink(hostile_path);
+    unlink(outside_path);
+    close(dir_fd);
+    rmdir(dir);
+}
+
 static void test_normal_list(void)
 {
     FILE *stream = fixture_stream("vim\nfirefox\ngit\n");
@@ -287,6 +370,8 @@ static void test_restore_packages_batch_alloc_failure_is_reported(void)
 
 int main(void)
 {
+    test_write_container_text_file_at();
+
     printf(BLUE "::" NC " package_token_is_safe (unit)\n");
     check(package_token_is_safe("vim") == 1, "a plain package name is safe");
     check(package_token_is_safe("lib32-glibc") == 1,
