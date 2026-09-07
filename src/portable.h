@@ -167,6 +167,7 @@ int portable_collision_plan_build(int container_fd,
  */
 typedef struct {
     Manifest manifest;
+    Manifest request_identity; /* Owned selection identity before annotations. */
     PortablePrescanReport report;
     int ready;
 } PortablePreparedCapture;

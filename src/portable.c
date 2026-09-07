@@ -2868,6 +2868,99 @@ fail:
     return -1;
 }
 
+/* Keep the request identity independent from the manifest that the caller may
+ * annotate with bundled self/network metadata before publication. */
+static int manifest_clone(const Manifest *source, Manifest *destination)
+{
+    if (source == NULL || destination == NULL ||
+        !manifest_selection_valid(source))
+        return -1;
+
+    *destination = *source;
+    destination->roots = NULL;
+    destination->excludes = NULL;
+
+    if (source->root_count > 0) {
+        size_t root_count = (size_t)source->root_count;
+        if (root_count > SIZE_MAX / sizeof(*destination->roots))
+            goto fail;
+        destination->roots = calloc(root_count, sizeof(*destination->roots));
+        if (destination->roots == NULL)
+            goto fail;
+        memcpy(destination->roots, source->roots,
+               root_count * sizeof(*destination->roots));
+    }
+
+    if (source->exclude_count > 0) {
+        if (source->exclude_count > SIZE_MAX / sizeof(*destination->excludes))
+            goto fail;
+        destination->excludes = calloc(source->exclude_count,
+                                       sizeof(*destination->excludes));
+        if (destination->excludes == NULL)
+            goto fail;
+        for (size_t index = 0; index < source->exclude_count; index++) {
+            destination->excludes[index] = strdup(source->excludes[index]);
+            if (destination->excludes[index] == NULL)
+                goto fail;
+        }
+    }
+    return 0;
+
+fail:
+    manifest_free(destination);
+    return -1;
+}
+
+typedef enum {
+    PORTABLE_PREPARED_REQUEST_MATCH,
+    PORTABLE_PREPARED_REQUEST_MISMATCH,
+    PORTABLE_PREPARED_REQUEST_ERROR
+} PortablePreparedRequestStatus;
+
+static ManifestIdentityComparison portable_request_identity_compare(
+    const Manifest *prepared_identity, const Manifest *candidate)
+{
+    if (prepared_identity == NULL || candidate == NULL ||
+        prepared_identity->has_source_identity != candidate->has_source_identity)
+        return MANIFEST_IDENTITY_DIFFERENT;
+
+    if (prepared_identity->has_source_identity)
+        return manifest_resume_identity_compare(prepared_identity, candidate);
+
+    /* D15 deliberately treats a missing source identity as non-adoptable. For
+     * this in-memory binding, two requests that both omit the optional
+     * identity are equivalent; normalize only that field before reusing the
+     * full comparator. A present/absent transition remains a mismatch. */
+    Manifest normalized_prepared = *prepared_identity;
+    Manifest normalized_candidate = *candidate;
+    normalized_prepared.has_source_identity = 1;
+    normalized_candidate.has_source_identity = 1;
+    strcpy(normalized_prepared.machine_id, "0");
+    strcpy(normalized_candidate.machine_id, "0");
+    normalized_prepared.source_uid = 0;
+    normalized_candidate.source_uid = 0;
+    return manifest_resume_identity_compare(&normalized_prepared,
+                                            &normalized_candidate);
+}
+
+static PortablePreparedRequestStatus portable_prepared_request_status(
+    const PortableCaptureRequest *request,
+    const PortablePreparedCapture *prepared)
+{
+    Manifest candidate = {0};
+    if (build_manifest(request, &candidate) != 0)
+        return PORTABLE_PREPARED_REQUEST_ERROR;
+
+    ManifestIdentityComparison identity = portable_request_identity_compare(
+        &prepared->request_identity, &candidate);
+    manifest_free(&candidate);
+    if (identity == MANIFEST_IDENTITY_ERROR)
+        return PORTABLE_PREPARED_REQUEST_ERROR;
+    return identity == MANIFEST_IDENTITY_EQUAL
+        ? PORTABLE_PREPARED_REQUEST_MATCH
+        : PORTABLE_PREPARED_REQUEST_MISMATCH;
+}
+
 int portable_capture_prepare(int scratch_fd,
                              const PortableCaptureRequest *request,
                              PortablePreparedCapture *out)
@@ -2888,6 +2981,8 @@ int portable_capture_prepare(int scratch_fd,
         return -1;
     if (build_manifest(request, &out->manifest) != 0)
         return -1;
+    if (manifest_clone(&out->manifest, &out->request_identity) != 0)
+        return -1;
     out->ready = 1;
     return 0;
 }
@@ -2897,6 +2992,7 @@ void portable_prepared_capture_free(PortablePreparedCapture *prepared)
     if (prepared == NULL)
         return;
     manifest_free(&prepared->manifest);
+    manifest_free(&prepared->request_identity);
     portable_prescan_report_free(&prepared->report);
     memset(prepared, 0, sizeof(*prepared));
 }
@@ -3051,8 +3147,15 @@ int portable_capture_fresh_prepared_at(
         request->root_count > MANIFEST_MAX_ROOTS ||
         (request->root_count != 0 && request->roots == NULL) ||
         !request_selection_valid(request) ||
-        prepared == NULL || !prepared->ready ||
-        fresh_namespace_is_empty(container_fd) != 0)
+        prepared == NULL || !prepared->ready)
+        return -1;
+
+    PortablePreparedRequestStatus request_status =
+        portable_prepared_request_status(request, prepared);
+    if (request_status == PORTABLE_PREPARED_REQUEST_ERROR ||
+        request_status == PORTABLE_PREPARED_REQUEST_MISMATCH)
+        return -1;
+    if (fresh_namespace_is_empty(container_fd) != 0)
         return -1;
 
     SidecarLog sidecar = {0};
@@ -3192,6 +3295,12 @@ int portable_capture_resume_prepared_at(
         (request->root_count != 0 && request->roots == NULL) ||
         !request_selection_valid(request) ||
         prepared == NULL || !prepared->ready)
+        return -1;
+
+    PortablePreparedRequestStatus request_status =
+        portable_prepared_request_status(request, prepared);
+    if (request_status == PORTABLE_PREPARED_REQUEST_ERROR ||
+        request_status == PORTABLE_PREPARED_REQUEST_MISMATCH)
         return -1;
 
     Manifest existing = {0};
