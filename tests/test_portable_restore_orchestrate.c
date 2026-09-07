@@ -2077,6 +2077,14 @@ static void test_direct_error_outcome(void)
 static void test_direct_timestamp_probe_failure(void)
 {
     printf(BLUE "::" NC " direct portable restore timestamp probe failure\n");
+    if (geteuid() == 0)
+    {
+        printf("  " YELLOW "-" NC
+               " timestamp-probe-failure orchestration skipped: root can "
+               "write the read-only fixture directory\n");
+        return;
+    }
+
     ManifestRoot root = root_for();
     Fixture fixture;
     int opened = fixture_open(&fixture, &root);
