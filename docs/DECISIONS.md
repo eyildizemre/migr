@@ -128,7 +128,7 @@ evaluate for the transfer layer.
 
 ## D6 — 2026-07-19 — Backups are plain file trees; a sidecar carries what the filesystem cannot
 
-**Status:** Decided — not yet implemented
+**Status:** Implemented
 
 **Decision:** The primary on-disk representation of a backup is a plain file tree.
 On destination filesystems that cannot represent Linux file semantics

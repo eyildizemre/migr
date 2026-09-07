@@ -92,16 +92,16 @@ the backup's version without a second prompt.
 ```
 -n, --dry-run         Preview actions without making changes
 -v, --verbose         Verbose output
--h, --help            Show help
+-h, --help            Show this help
 -s, --summary         Print only the selected report scope total
     --max-depth=<N>
-                       Report directory breakdown depth; implies --verbose
-    --include-self     Include a validated static migr binary in the backup
-                       (requires building migr-static)
+                      Report directory breakdown depth (implies --verbose)
+    --include-self    Include a validated static migr binary in the backup
+                      (requires building migr-static)
     --include-network-config
-                       Back up NetworkManager, netplan, systemd-networkd,
-                       wpa_supplicant, and netctl configuration found on
-                       this system
+                      Back up NetworkManager, netplan,
+                      systemd-networkd, wpa_supplicant, and
+                      netctl configuration found on this system
 ```
 
 Status colors are automatic: they are used when stdout is a real terminal and
