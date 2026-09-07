@@ -56,6 +56,60 @@ git config core.hooksPath hooks
 ./migr conf
 ```
 
+## Example
+
+```bash
+migr report --critical -v
+```
+
+```text
+Scope config: /home/eyildizemre/.config/migr/migr.conf (0 configured rules)
+
+Backup Analysis · Fedora/RHEL
+/home/eyildizemre
+
+Dotfiles & Config
+  .bash_history                         26B  (/home/eyildizemre/.bash_history)
+  .bashrc                               37B  (/home/eyildizemre/.bashrc)
+
+Main Directories
+  Documents                          300.2K  (/home/eyildizemre/Documents)
+    Projects                           300.1K  (/home/eyildizemre/Documents/Projects)
+  Pictures                           128.1K  (/home/eyildizemre/Pictures)
+
+  Critical estimate                  428.3K
+```
+
+Running the backup shows the same scope, asks before capturing shell history
+(see [Dotfiles](#what-gets-backed-up) below), and reports what it actually
+wrote once it finishes:
+
+```bash
+migr backup /media/usb --critical
+```
+
+```text
+Estimated backup size: 428.3K
+Destination free space: 15.2G
+
+This backup includes 1 item(s) that can carry secrets typed at a shell prompt (.bash_history). Make sure the destination is trustworthy before continuing. Continue? [Y/n]: y
+Backing up to: /media/usb/migr_backup_20260907_151730.partial
+
+Main Directories
+
+Dotfiles
+
+Packages
+Saved 454 packages to packages.txt
+
+VS Code Extensions
+  Note: no VS Code extension list was captured for this backup.
+
+Finalizing (syncing to disk)...
+  OK: Backup complete: 4 items copied
+Location: /media/usb/migr_backup_20260907_151730
+```
+
 ## Commands
 
 ```
