@@ -173,11 +173,26 @@ int main(void)
     CHECK(mkdir("external/google-chrome", 0700) == 0);
     CHECK(symlink("../external", "home/.config") == 0);
     CHECK(compile(home, BACKUP_CRITICAL, "[critical]\n[include]\n../external\n", &m) == 0);
-    CHECK(m.version == 2 && m.root_count == 2);
-    if (m.root_count == 2)
+    CHECK(m.version == 2 && m.root_count == 3);
+    if (m.root_count == 3)
     {
-        CHECK(m.roots[1].policy == ROOT_POLICY_HOME_RELATIVE && m.roots[1].source_path[0] == '/');
-        CHECK(!strcmp(m.roots[1].restore_path, ".config/google-chrome"));
+        const ManifestRoot *config_root = NULL;
+        const ManifestRoot *chrome_root = NULL;
+        for (int i = 0; i < m.root_count; i++)
+        {
+            if (!strcmp(m.roots[i].id, "BUILTIN_DOT_CONFIG"))
+                config_root = &m.roots[i];
+            if (!strcmp(m.roots[i].id, "BUILTIN_BROWSER_GOOGLE_CHROME"))
+                chrome_root = &m.roots[i];
+        }
+        CHECK(config_root != NULL);
+        CHECK(config_root != NULL && config_root->policy == ROOT_POLICY_HOME_RELATIVE);
+        CHECK(config_root != NULL && !strcmp(config_root->source_path, ".config"));
+        CHECK(config_root != NULL && !strcmp(config_root->restore_path, ".config"));
+        CHECK(chrome_root != NULL && chrome_root->policy == ROOT_POLICY_HOME_RELATIVE &&
+              chrome_root->source_path[0] == '/');
+        CHECK(chrome_root != NULL &&
+              !strcmp(chrome_root->restore_path, ".config/google-chrome"));
     }
     CHECK(manifest_write_v1("backup", &m) == 0);
     CHECK(manifest_read_v1("backup", &same) == MANIFEST_STATUS_VALID);

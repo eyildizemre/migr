@@ -117,12 +117,27 @@ typedef struct {
 } BuiltinHomeEntry;
 
 static const BuiltinHomeEntry builtin_home_catalog[] = {
-    { "BUILTIN_PROJECTS",              "Projects",              BACKUP_ROOT_MAIN,    1 },
     { "BUILTIN_DOT_SSH",                ".ssh",                 BACKUP_ROOT_DOTFILE, 0 },
     { "BUILTIN_DOT_GNUPG",              ".gnupg",               BACKUP_ROOT_DOTFILE, 0 },
     { "BUILTIN_DOT_GITCONFIG",          ".gitconfig",           BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_DOT_CONFIG",             ".config",              BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_LOCAL_SHARE",            ".local/share",         BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_LOCAL_STATE",            ".local/state",         BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_LOCAL_BIN",              ".local/bin",           BACKUP_ROOT_DOTFILE, 0 },
     { "BUILTIN_DOT_BASHRC",             ".bashrc",              BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_DOT_BASH_PROFILE",        ".bash_profile",        BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_DOT_BASH_LOGIN",          ".bash_login",          BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_DOT_BASH_LOGOUT",         ".bash_logout",         BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_DOT_BASH_ALIASES",        ".bash_aliases",        BACKUP_ROOT_DOTFILE, 0 },
     { "BUILTIN_DOT_PROFILE",            ".profile",             BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_DOT_ZSHENV",              ".zshenv",              BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_DOT_ZPROFILE",            ".zprofile",            BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_DOT_ZSHRC",               ".zshrc",               BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_DOT_ZLOGIN",              ".zlogin",              BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_DOT_ZLOGOUT",             ".zlogout",             BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_DOT_INPUTRC",              ".inputrc",             BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_DOT_TMUX_CONF",            ".tmux.conf",           BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_DOT_SCREENRC",             ".screenrc",            BACKUP_ROOT_DOTFILE, 0 },
     { "BUILTIN_BROWSER_MOZILLA",        ".mozilla",             BACKUP_ROOT_BROWSER, 0 },
     { "BUILTIN_BROWSER_GOOGLE_CHROME",  ".config/google-chrome", BACKUP_ROOT_BROWSER, 0 },
     { "BUILTIN_BROWSER_CHROMIUM",       ".config/chromium",      BACKUP_ROOT_BROWSER, 0 },
@@ -325,7 +340,7 @@ static int build_builtin_roots(const char *home_real, BackupMode mode, RootBuild
     int comprehensive = (mode == BACKUP_COMPREHENSIVE);
 
     // indices: 0=Documents 1=Downloads 2=Pictures 3=Desktop 4=Videos 5=Music.
-    // The first three are always included; the rest only for --comprehensive
+    // The first four are always included; the rest only for --comprehensive
     // -- the same split backup.c used before this module existed.
     char *xdg_dirs[XDG_KEY_COUNT] = { NULL };
     if (xdg_resolve(home_real, xdg_keys, xdg_fallbacks, xdg_dirs, XDG_KEY_COUNT) != 0)
@@ -339,7 +354,7 @@ static int build_builtin_roots(const char *home_real, BackupMode mode, RootBuild
     int failed = 0;
     for (int i = 0; i < XDG_KEY_COUNT && !failed; i++)
     {
-        if (!comprehensive && i >= 3)
+        if (!comprehensive && i >= 4)
             continue;
 
         char capture_path[PATH_MAX];
@@ -529,6 +544,51 @@ static int is_ancestor(const char *a, const char *b)
     return path_covers(a, b) && strcmp(a, b) != 0;
 }
 
+static const char *root_relative(const char *parent, const char *path)
+{
+    return path + strlen(parent) + (strcmp(parent, "/") != 0);
+}
+
+static int root_mapping_inherited(const BackupPlanRoot *parent,
+                                  const BackupPlanRoot *child)
+{
+    if (!child->manifest_root.id[0]) return 1;
+    const ManifestRoot *a = &parent->manifest_root, *b = &child->manifest_root;
+    if (a->policy != b->policy || b->policy == ROOT_POLICY_XDG) return 0;
+    if (b->policy == ROOT_POLICY_MANUAL_NATIVE) return 1;
+    char mapped[PATH_MAX];
+    const char *relative = root_relative(parent->capture_path, child->capture_path);
+    if (!a->restore_path[0]) return !strcmp(relative, b->restore_path);
+    return path_join(mapped, sizeof(mapped), a->restore_path, relative) == 0 &&
+           !strcmp(mapped, b->restore_path);
+}
+
+static void collapse_inherited_descendants(RootBuilder *rb)
+{
+    for (int i = 0; i < rb->count; i++)
+    {
+        int inherited = 0;
+        for (int j = 0; j < rb->count; j++)
+        {
+            if (i == j || !is_ancestor(rb->items[j].capture_path,
+                                       rb->items[i].capture_path))
+                continue;
+            if (root_mapping_inherited(&rb->items[j], &rb->items[i]))
+            {
+                inherited = 1;
+                break;
+            }
+        }
+        if (inherited)
+        {
+            for (int j = i + 1; j < rb->count; j++)
+                rb->items[j - 1] = rb->items[j];
+            rb->count--;
+            i--;
+        }
+    }
+}
+
 static int validate_no_duplicates_or_overlap(const BackupPlanRoot *roots, int count)
 {
     for (int i = 0; i < count; i++)
@@ -605,6 +665,8 @@ int backup_plan_build(const char *home, BackupMode mode,
         out->scope = (mode == BACKUP_COMPREHENSIVE) ? MANIFEST_SCOPE_COMPREHENSIVE
                                                     : MANIFEST_SCOPE_CRITICAL;
         rc = build_builtin_roots(home_real, mode, &rb, NULL);
+        if (rc == 0)
+            collapse_inherited_descendants(&rb);
     }
 
     if (rc == 0)
@@ -1082,11 +1144,6 @@ static int selection_candidate_cmp(const void *a, const void *b)
     return strcmp(ra->manifest_root.id, rb->manifest_root.id);
 }
 
-static const char *selection_relative(const char *parent, const char *path)
-{
-    return path + strlen(parent) + (strcmp(parent, "/") != 0);
-}
-
 static void selection_set_mapping(const char *home, BackupPlanRoot *root)
 {
     ManifestRoot *mr = &root->manifest_root;
@@ -1107,20 +1164,6 @@ static void selection_set_mapping(const char *home, BackupPlanRoot *root)
         strcpy(mr->source_path, root->capture_path);
         mr->restore_path[0] = 0;
     }
-}
-
-static int selection_mapping_inherited(const BackupPlanRoot *parent,
-                                       const BackupPlanRoot *child)
-{
-    if (!child->manifest_root.id[0]) return 1;
-    const ManifestRoot *a = &parent->manifest_root, *b = &child->manifest_root;
-    if (a->policy != b->policy || b->policy == ROOT_POLICY_XDG) return 0;
-    if (b->policy == ROOT_POLICY_MANUAL_NATIVE) return 1;
-    char mapped[PATH_MAX];
-    const char *relative = selection_relative(parent->capture_path, child->capture_path);
-    if (!a->restore_path[0]) return !strcmp(relative, b->restore_path);
-    return path_join(mapped, sizeof(mapped), a->restore_path, relative) == 0 &&
-           !strcmp(mapped, b->restore_path);
 }
 
 static int selection_active(const ConfigRule *rule, BackupMode mode)
@@ -1217,7 +1260,7 @@ int selection_plan_build(const char *home, BackupMode mode,
             if (is_ancestor(plan.roots[j].root.capture_path, candidate->capture_path)) parent = (int)j;
         /* Configured descendants inherit their owner; built-in restore mappings
          * survive when the ancestor would place their data elsewhere. */
-        if (parent >= 0 && selection_mapping_inherited(&plan.roots[parent].root, candidate)) continue;
+        if (parent >= 0 && root_mapping_inherited(&plan.roots[parent].root, candidate)) continue;
         SelectionRoot *root = &plan.roots[plan.root_count++];
         root->root = *candidate;
         root->parent = parent;
@@ -1229,7 +1272,7 @@ int selection_plan_build(const char *home, BackupMode mode,
             strcpy(root->root.manifest_root.payload_path, root->root.manifest_root.id);
         }
         if (parent >= 0 && selection_paths_add(&plan.roots[parent].delegated,
-            selection_relative(plan.roots[parent].root.capture_path, candidate->capture_path)) < 0) goto fail;
+            root_relative(plan.roots[parent].root.capture_path, candidate->capture_path)) < 0) goto fail;
     }
     if (plan.root_count > MANIFEST_MAX_ROOTS) { error = "too many compiled roots"; goto fail; }
     for (size_t i = 0; i < plan.excludes.count; i++)
@@ -1238,7 +1281,7 @@ int selection_plan_build(const char *home, BackupMode mode,
         for (size_t j = 0; j < plan.root_count; j++)
             if (is_ancestor(plan.roots[j].root.capture_path, plan.excludes.paths[i])) owner = (int)j;
         if (owner >= 0 && selection_paths_add(&plan.roots[owner].excluded,
-            selection_relative(plan.roots[owner].root.capture_path, plan.excludes.paths[i])) < 0) goto fail;
+            root_relative(plan.roots[owner].root.capture_path, plan.excludes.paths[i])) < 0) goto fail;
     }
     error = "invalid compiled source ownership";
     if (selection_plan_validate(&plan) < 0) goto fail;

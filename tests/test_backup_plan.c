@@ -1,7 +1,7 @@
 // Unit tests for the deterministic backup root planner (docs/DECISIONS.md
 // D16): backup_plan_build()/backup_plan_free(), declared in
 // backup_plan.h. Covers the built-in catalog (XDG main directories,
-// dotfiles, browser profiles, comprehensive-only Projects), explicit-path
+// dotfiles, browser profiles, and comprehensive-only media), explicit-path
 // normalization and classification (HOME containment at component
 // boundaries, leaf-symlink vs. ancestor-symlink handling, and "/" edge
 // cases), whole-set duplicate/overlap validation and
@@ -35,6 +35,7 @@
 #include "backup.h"
 #include "backup_plan.h"
 #include "manifest.h"
+#include "selection.h"
 #include "utils.h"
 
 #define GREEN "\033[0;32m"
@@ -187,7 +188,8 @@ static void make_full_home(const char *home)
     mkdir_p(home);
     const char *dirs[] = {
         "Documents", "Downloads", "Pictures", "Desktop", "Videos", "Music",
-        "Projects", ".ssh", ".gnupg", ".mozilla",
+        "Projects", ".ssh", ".gnupg", ".mozilla", ".config",
+        ".local/share", ".local/state", ".local/bin",
         ".config/google-chrome", ".config/chromium", ".config/BraveSoftware",
         ".config/vivaldi", ".config/microsoft-edge", ".config/opera",
         NULL
@@ -198,7 +200,11 @@ static void make_full_home(const char *home)
         join_path(p, sizeof(p), home, dirs[i]);
         mkdir_p(p);
     }
-    const char *files[] = { ".gitconfig", ".bashrc", ".profile", NULL };
+    const char *files[] = {
+        ".gitconfig", ".bashrc", ".bash_profile", ".bash_login", ".bash_logout",
+        ".bash_aliases", ".profile", ".zshenv", ".zprofile", ".zshrc", ".zlogin",
+        ".zlogout", ".inputrc", ".tmux.conf", ".screenrc", NULL
+    };
     for (int i = 0; files[i] != NULL; i++)
     {
         char p[PATH_MAX];
@@ -213,7 +219,7 @@ static void make_full_home(const char *home)
 
 static void test_critical_root_set(void)
 {
-    printf(BLUE "::" NC " model: --critical plans Documents/Downloads/Pictures, dotfiles, and browsers\n");
+    printf(BLUE "::" NC " model: --critical plans personal content and persistent user state\n");
 
     char home[PATH_MAX];
     fresh_mkdtemp(home, sizeof(home), "plan_home");
@@ -225,7 +231,7 @@ static void test_critical_root_set(void)
     check(find_root(&plan, "XDG_DOCUMENTS_DIR") != NULL, "Documents is planned");
     check(find_root(&plan, "XDG_DOWNLOAD_DIR") != NULL, "Downloads is planned");
     check(find_root(&plan, "XDG_PICTURES_DIR") != NULL, "Pictures is planned");
-    check(find_root(&plan, "XDG_DESKTOP_DIR") == NULL, "Desktop is NOT planned under --critical");
+    check(find_root(&plan, "XDG_DESKTOP_DIR") != NULL, "Desktop is planned under --critical");
     check(find_root(&plan, "XDG_VIDEOS_DIR") == NULL, "Videos is NOT planned under --critical");
     check(find_root(&plan, "XDG_MUSIC_DIR") == NULL, "Music is NOT planned under --critical");
     check(find_root(&plan, "BUILTIN_PROJECTS") == NULL, "Projects is NOT planned under --critical");
@@ -234,7 +240,36 @@ static void test_critical_root_set(void)
     check(find_root(&plan, "BUILTIN_DOT_GITCONFIG") != NULL, ".gitconfig is planned under --critical");
     check(find_root(&plan, "BUILTIN_DOT_BASHRC") != NULL, ".bashrc is planned under --critical");
     check(find_root(&plan, "BUILTIN_DOT_PROFILE") != NULL, ".profile is planned under --critical");
+    const struct {
+        const char *id;
+        const char *path;
+    } persistent[] = {
+        { "BUILTIN_DOT_CONFIG", ".config" },
+        { "BUILTIN_LOCAL_SHARE", ".local/share" },
+        { "BUILTIN_LOCAL_STATE", ".local/state" },
+        { "BUILTIN_LOCAL_BIN", ".local/bin" },
+        { "BUILTIN_DOT_BASH_PROFILE", ".bash_profile" },
+        { "BUILTIN_DOT_BASH_LOGIN", ".bash_login" },
+        { "BUILTIN_DOT_BASH_LOGOUT", ".bash_logout" },
+        { "BUILTIN_DOT_BASH_ALIASES", ".bash_aliases" },
+        { "BUILTIN_DOT_ZSHENV", ".zshenv" },
+        { "BUILTIN_DOT_ZPROFILE", ".zprofile" },
+        { "BUILTIN_DOT_ZSHRC", ".zshrc" },
+        { "BUILTIN_DOT_ZLOGIN", ".zlogin" },
+        { "BUILTIN_DOT_ZLOGOUT", ".zlogout" },
+        { "BUILTIN_DOT_INPUTRC", ".inputrc" },
+        { "BUILTIN_DOT_TMUX_CONF", ".tmux.conf" },
+        { "BUILTIN_DOT_SCREENRC", ".screenrc" },
+    };
+    for (size_t i = 0; i < sizeof(persistent) / sizeof(persistent[0]); i++)
+    {
+        char label[128];
+        snprintf(label, sizeof(label), "%s is planned under --critical", persistent[i].path);
+        check(find_root(&plan, persistent[i].id) != NULL, label);
+    }
     check(find_root(&plan, "BUILTIN_BROWSER_MOZILLA") != NULL, "browser profiles are planned under --critical");
+    check(find_root(&plan, "BUILTIN_BROWSER_GOOGLE_CHROME") == NULL,
+          "the .config root absorbs the Chrome descendant in the legacy plan");
     check(plan.scope == MANIFEST_SCOPE_CRITICAL, "scope is MANIFEST_SCOPE_CRITICAL");
 
     backup_plan_free(&plan);
@@ -243,7 +278,7 @@ static void test_critical_root_set(void)
 
 static void test_comprehensive_adds_extra_roots(void)
 {
-    printf(BLUE "::" NC " model: --comprehensive adds Desktop/Videos/Music/Projects\n");
+    printf(BLUE "::" NC " model: --comprehensive adds Videos/Music only\n");
 
     char home[PATH_MAX];
     fresh_mkdtemp(home, sizeof(home), "plan_home");
@@ -255,7 +290,7 @@ static void test_comprehensive_adds_extra_roots(void)
     check(find_root(&plan, "XDG_DESKTOP_DIR") != NULL, "Desktop is planned under --comprehensive");
     check(find_root(&plan, "XDG_VIDEOS_DIR") != NULL, "Videos is planned under --comprehensive");
     check(find_root(&plan, "XDG_MUSIC_DIR") != NULL, "Music is planned under --comprehensive");
-    check(find_root(&plan, "BUILTIN_PROJECTS") != NULL, "Projects is planned under --comprehensive");
+    check(find_root(&plan, "BUILTIN_PROJECTS") == NULL, "Projects is NOT planned under --comprehensive");
     check(plan.scope == MANIFEST_SCOPE_COMPREHENSIVE, "scope is MANIFEST_SCOPE_COMPREHENSIVE");
 
     backup_plan_free(&plan);
@@ -280,7 +315,8 @@ static void test_missing_optional_builtin_is_skipped_not_fatal(void)
     check(find_root(&plan, "XDG_DOWNLOAD_DIR") == NULL, "an absent built-in is simply left out");
     check(find_root(&plan, "BUILTIN_DOT_SSH") == NULL, "an absent dotfile is simply left out");
     check(find_root(&plan, "BUILTIN_BROWSER_MOZILLA") == NULL, "an absent browser profile is simply left out");
-    check(find_root(&plan, "BUILTIN_PROJECTS") == NULL, "an absent Projects is simply left out");
+    check(find_root(&plan, "BUILTIN_LOCAL_STATE") == NULL,
+          "an absent persistent-state root is simply left out");
 
     backup_plan_free(&plan);
     remove_tree(home);
@@ -336,8 +372,51 @@ static void test_fixed_builtin_fields(void)
         check(r->manifest_root.has_restore_path == 1, "has_restore_path is set");
         check(r->group == BACKUP_ROOT_DOTFILE, "presentation group is DOTFILE");
     }
+    r = find_root(&plan, "BUILTIN_LOCAL_SHARE");
+    check(r != NULL, ".local/share is planned");
+    if (r != NULL)
+    {
+        check(r->manifest_root.policy == ROOT_POLICY_HOME_RELATIVE,
+              ".local/share policy is HOME_RELATIVE");
+        check(strcmp(r->manifest_root.payload_path, "BUILTIN_LOCAL_SHARE") == 0,
+              ".local/share payload_path uses its fixed id");
+        check(strcmp(r->manifest_root.restore_path, ".local/share") == 0,
+              ".local/share restore_path is home-relative");
+        check(r->group == BACKUP_ROOT_DOTFILE,
+              ".local/share uses the Dotfiles & Config presentation group");
+    }
 
     backup_plan_free(&plan);
+    remove_tree(home);
+}
+
+static void test_builtin_config_collapses_browser_descendant(void)
+{
+    printf(BLUE "::" NC " selection: built-in .config owns Chromium-family descendants once\n");
+
+    char home[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_home");
+    make_full_home(home);
+
+    SelectionPlan plan = {0};
+    check(selection_plan_build(home, BACKUP_CRITICAL, NULL, &plan) == 0,
+          "selection plan builds with .config and Chrome present");
+
+    int config_seen = 0;
+    int chrome_seen = 0;
+    for (size_t i = 0; i < plan.root_count; i++)
+    {
+        const char *id = plan.roots[i].root.manifest_root.id;
+        if (strcmp(id, "BUILTIN_DOT_CONFIG") == 0)
+            config_seen++;
+        if (strcmp(id, "BUILTIN_BROWSER_GOOGLE_CHROME") == 0)
+            chrome_seen++;
+    }
+    check(config_seen == 1, "the built-in .config root appears exactly once");
+    check(chrome_seen == 0, "Chrome is not emitted as a duplicate descendant root");
+    check(selection_plan_validate(&plan) == 0, "the collapsed ownership plan validates");
+
+    selection_plan_free(&plan);
     remove_tree(home);
 }
 
@@ -2712,6 +2791,7 @@ int main(void)
     test_missing_optional_builtin_is_skipped_not_fatal();
     test_localized_xdg_uses_canonical_id();
     test_fixed_builtin_fields();
+    test_builtin_config_collapses_browser_descendant();
     test_zero_root_builtin_plan_is_safe();
     test_builtin_ancestor_symlink_alias_is_detected_as_duplicate();
     test_backup_plan_free_null_and_zero_init();

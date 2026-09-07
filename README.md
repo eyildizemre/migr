@@ -113,8 +113,8 @@ a preview rather than a completed operation.
 Scope (`backup`/`report`, mutually exclusive):
 
 ```
---critical            Use Documents, Downloads, Pictures, and dotfiles (backup default)
---comprehensive       Use everything --critical covers, plus Desktop, Videos, and Music
+--critical            Use personal content plus persistent user state (backup default)
+--comprehensive       Use everything --critical covers, plus Videos and Music
 ```
 
 Backup-only explicit paths:
@@ -139,9 +139,9 @@ Backup-only explicit paths:
 
 ## What Gets Backed Up
 
-**`--critical` (default):** Documents, Downloads, Pictures — the irreplaceable files most likely to exist nowhere else.
+**`--critical` (default):** Documents, Downloads, Pictures, Desktop, persistent user config/state under `~/.config`, `~/.local/share`, `~/.local/state`, user-local executables under `~/.local/bin`, and common shell/terminal dotfiles.
 
-**`--comprehensive`:** Everything `--critical` covers, plus Desktop, Videos, and Music.
+**`--comprehensive`:** Everything `--critical` covers, plus Videos and Music.
 
 **Explicit paths:** Exactly what you specify — no assumptions made.
 
@@ -151,9 +151,14 @@ and capture; configured includes retain their restore mapping when they overlap
 localized XDG directories. Dry-run shows the active selection policy before any
 backup is created.
 
-**Dotfiles (all scopes except explicit paths):** .ssh, .gnupg, .gitconfig, .bashrc, .profile
+The built-in persistent roots currently use the conventional HOME-relative XDG
+locations above; custom `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, and
+`XDG_STATE_HOME` locations are not resolved yet. zsh startup files are likewise
+read from HOME and do not follow `ZDOTDIR` yet.
 
-**Browser Profiles (all scopes except explicit paths):** Firefox, Chrome, Chromium, Brave, Vivaldi, Edge, Opera — only the profiles present on the system are copied.
+**Dotfiles (all scopes except explicit paths):** .ssh, .gnupg, .gitconfig, .bashrc, .bash_profile, .bash_login, .bash_logout, .bash_aliases, .profile, .zshenv, .zprofile, .zshrc, .zlogin, .zlogout, .inputrc, .tmux.conf, .screenrc
+
+**Browser Profiles (all scopes except explicit paths):** Firefox is retained as a separate browser-profile root; Chromium-family profiles under `~/.config` are covered by the persistent config root.
 
 **Packages (all scopes except explicit paths):** The list of packages you explicitly installed — not the thousands of dependencies pulled in alongside them — saved as packages.txt and reinstalled on restore. Anything the new distribution cannot resolve is written to `skipped-packages.txt` rather than silently dropped.
 
@@ -352,7 +357,8 @@ a test-only entry point.
 Running `migr` or `migr report` reports the critical backup scope. Every report
 uses the same live root plan as backup; `--critical` selects the default explicitly,
 and `--comprehensive` selects the wider scope. Sections show only roots included
-in that scope, including browser profiles and `.profile` in critical backups.
+in that scope, including Desktop, persistent config/state, browser data, and
+shell/terminal configuration in critical backups.
 Totals measure logical source sizes, not destination allocation or container
 metadata overhead. With `-s`/`--summary`, only the selected scope's total is printed
 on one line for scripting.

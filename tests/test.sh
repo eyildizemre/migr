@@ -36,19 +36,35 @@ setup() {
     mkdir -p "$HOME/Desktop"
     mkdir -p "$HOME/Downloads"
     mkdir -p "$HOME/Pictures"
+    mkdir -p "$HOME/Videos"
+    mkdir -p "$HOME/Music"
     mkdir -p "$HOME/Projects"
     mkdir -p "$HOME/.ssh"
     mkdir -p "$HOME/.gnupg"
     mkdir -p "$HOME/.mozilla/firefox/profile"
     mkdir -p "$HOME/.config/google-chrome/Default"
+    mkdir -p "$HOME/.local/share"
+    mkdir -p "$HOME/.local/state"
+    mkdir -p "$HOME/.local/bin"
     mkdir -p "$BACKUP_DIR"
 
     echo "test doc"  > "$HOME/Documents/note.txt"
+    echo "desktop"   > "$HOME/Desktop/keep.txt"
+    echo "video"     > "$HOME/Videos/clip.txt"
+    echo "music"     > "$HOME/Music/song.txt"
     mkfifo "$HOME/Documents/events.fifo"
     echo "secret"    > "$HOME/.ssh/config"
     echo "gituser"   > "$HOME/.gitconfig"
     echo "alias ll='ls -la'" > "$HOME/.bashrc"
+    echo "export BASH_PROFILE_MARKER=1" > "$HOME/.bash_profile"
     echo "export PATH"       > "$HOME/.profile"
+    echo "export ZSH_MARKER=1" > "$HOME/.zshrc"
+    echo "set -g mouse on" > "$HOME/.tmux.conf"
+    echo "config marker" > "$HOME/.config/some-marker-file"
+    echo "data marker" > "$HOME/.local/share/some-marker-file"
+    echo "state marker" > "$HOME/.local/state/some-marker-file"
+    echo '#!/bin/sh' > "$HOME/.local/bin/some-marker-tool"
+    chmod 755 "$HOME/.local/bin/some-marker-tool"
     ln -s "$HOME/Documents/note.txt" "$HOME/Documents/shortcut"
     # 0600 file + an absolute symlink to it: backing up the symlink must not
     # chmod the target. Regression fixture for the symlink source-mutation bug.
@@ -271,7 +287,7 @@ test_report() {
         exit 1
     fi
     assert_not_contains "$default_output" "Projects"
-    assert_not_contains "$default_output" "Desktop"
+    assert_contains "$default_output" "Desktop"
     assert_contains "$critical_output" "Dotfiles & Config"
     assert_contains "$critical_output" ".profile"
     assert_contains "$critical_output" "Firefox"
@@ -415,7 +431,9 @@ test_report() {
     comprehensive_output=$(../migr report --comprehensive)
     assert_contains "$comprehensive_output" "Comprehensive estimate"
     assert_contains "$comprehensive_output" "Desktop"
-    assert_contains "$comprehensive_output" "Projects"
+    assert_contains "$comprehensive_output" "Videos"
+    assert_contains "$comprehensive_output" "Music"
+    assert_not_contains "$comprehensive_output" "Projects"
     assert_contains "$comprehensive_output" "Firefox"
     assert_not_contains "$comprehensive_output" ".mozilla"
     assert_not_contains "$comprehensive_output" "google-chrome"
@@ -612,8 +630,16 @@ test_backup() {
 
     # Every captured object is addressed by its manifest root id under data/.
     assert_file_exists "$actual_backup/data/XDG_DOCUMENTS_DIR/note.txt"
+    assert_file_exists "$actual_backup/data/XDG_DESKTOP_DIR/keep.txt"
     assert_file_exists "$actual_backup/data/BUILTIN_DOT_SSH/config"
     assert_file_exists "$actual_backup/data/BUILTIN_DOT_BASHRC"
+    assert_file_exists "$actual_backup/data/BUILTIN_DOT_BASH_PROFILE"
+    assert_file_exists "$actual_backup/data/BUILTIN_DOT_ZSHRC"
+    assert_file_exists "$actual_backup/data/BUILTIN_DOT_TMUX_CONF"
+    assert_file_exists "$actual_backup/data/BUILTIN_DOT_CONFIG/some-marker-file"
+    assert_file_exists "$actual_backup/data/BUILTIN_LOCAL_SHARE/some-marker-file"
+    assert_file_exists "$actual_backup/data/BUILTIN_LOCAL_STATE/some-marker-file"
+    assert_file_exists "$actual_backup/data/BUILTIN_LOCAL_BIN/some-marker-tool"
 
     if [ -p "$actual_backup/data/XDG_DOCUMENTS_DIR/events.fifo" ]; then
         echo -e "  ${GREEN}✓${NC} FIFO preserved as a FIFO."
@@ -651,17 +677,22 @@ test_backup() {
         exit 1
     fi
 
-    # each browser profile is its own root, so its nested source structure is
-    # preserved beneath that root rather than rebuilt from the home-relative path
+    # Firefox remains independent, while Chromium-family data is owned by the
+    # broader persistent .config root and must not be duplicated.
     assert_file_exists "$actual_backup/data/BUILTIN_BROWSER_MOZILLA/firefox/profile/places.sqlite"
-    assert_file_exists "$actual_backup/data/BUILTIN_BROWSER_GOOGLE_CHROME/Default/Preferences"
-
-    # Desktop must not appear in a critical backup
-    if [ -e "$actual_backup/data/XDG_DESKTOP_DIR" ]; then
-        echo -e "  ${RED}✗${NC} Desktop should not be in a critical backup"
+    assert_file_exists "$actual_backup/data/BUILTIN_DOT_CONFIG/google-chrome/Default/Preferences"
+    if [ -e "$actual_backup/data/BUILTIN_BROWSER_GOOGLE_CHROME" ]; then
+        echo -e "  ${RED}✗${NC} Chrome was copied a second time as a separate root"
         exit 1
     else
-        echo -e "  ${GREEN}✓${NC} Desktop correctly excluded from critical backup."
+        echo -e "  ${GREEN}✓${NC} Chrome is captured once through the .config owner."
+    fi
+
+    if [ -e "$actual_backup/data/BUILTIN_PROJECTS" ]; then
+        echo -e "  ${RED}✗${NC} Projects should not be a built-in backup root"
+        exit 1
+    else
+        echo -e "  ${GREEN}✓${NC} Projects is absent from the built-in critical payload."
     fi
 
     # manifest.txt is the versioned format, and it is a control artifact: it and
@@ -707,8 +738,13 @@ test_restore() {
     assert_not_contains "$output" "Restored:"
 
     assert_file_exists "$HOME/Documents/note.txt"
+    assert_file_exists "$HOME/Desktop/keep.txt"
     assert_file_exists "$HOME/.ssh/config"
     assert_file_exists "$HOME/.bashrc"
+    assert_file_exists "$HOME/.config/some-marker-file"
+    assert_file_exists "$HOME/.local/share/some-marker-file"
+    assert_file_exists "$HOME/.local/state/some-marker-file"
+    assert_file_exists "$HOME/.local/bin/some-marker-tool"
 
     if [ -p "$HOME/Documents/events.fifo" ]; then
         echo -e "  ${GREEN}✓${NC} FIFO restored as a FIFO."
@@ -855,9 +891,11 @@ test_comprehensive() {
     local comp_backup="$TEST_DIR/backup_comprehensive"
     mkdir -p "$comp_backup"
 
-    # Desktop was not restored by the critical backup in Phase 4, so recreate it
-    mkdir -p "$HOME/Desktop"
-    echo "icon" > "$HOME/Desktop/browser.desktop"
+    # Videos and Music are comprehensive-only, so recreate them after the
+    # critical restore and use them to prove the wider scope ran.
+    mkdir -p "$HOME/Videos" "$HOME/Music"
+    echo "video" > "$HOME/Videos/clip.txt"
+    echo "music" > "$HOME/Music/song.txt"
 
     local output
     output=$(../migr backup "$comp_backup" --comprehensive 2>&1)
@@ -867,8 +905,10 @@ test_comprehensive() {
     local actual_backup
     actual_backup=$(sole_final_container "$comp_backup")
 
-    # Desktop is in comprehensive but NOT critical — its presence proves the right mode ran
+    # Desktop is already critical; Videos and Music distinguish comprehensive.
     assert_file_exists "$actual_backup/data/XDG_DESKTOP_DIR"
+    assert_file_exists "$actual_backup/data/XDG_VIDEOS_DIR/clip.txt"
+    assert_file_exists "$actual_backup/data/XDG_MUSIC_DIR/song.txt"
     assert_file_exists "$actual_backup/data/XDG_DOCUMENTS_DIR"
 }
 

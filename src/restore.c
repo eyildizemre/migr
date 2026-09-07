@@ -662,6 +662,30 @@ static int restore_timestamp_anchor_policy(const RestoreTimestampAnchors *anchor
             return 0;
         }
     }
+
+    /* A sibling root may create an intermediate directory that did not exist
+     * during preflight. Its inode is necessarily new, but timestamp precision
+     * is a filesystem property, so the already-probed policy remains valid on
+     * the same st_dev. A different filesystem still fails closed. */
+    int found_device = 0;
+    int device_nsec_exact = 0;
+    for (size_t i = 0; i < anchors->count; i++)
+    {
+        if (anchors->items[i].device != st.st_dev)
+            continue;
+        if (!found_device)
+        {
+            found_device = 1;
+            device_nsec_exact = anchors->items[i].nsec_exact;
+        }
+        else if (device_nsec_exact != anchors->items[i].nsec_exact)
+            return -1;
+    }
+    if (found_device)
+    {
+        *nsec_exact = device_nsec_exact;
+        return 0;
+    }
     return -1;
 }
 

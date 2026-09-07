@@ -292,8 +292,8 @@ void print_help(void)
     printf("  help                  Show this help\n");
     printf("\n");
     printf("Scope (backup/report, mutually exclusive):\n");
-    printf("  --critical            Documents, Downloads, Pictures, and dotfiles (default)\n");
-    printf("  --comprehensive       Everything --critical covers, plus Desktop, Videos, Music\n");
+    printf("  --critical            Personal content plus persistent user state (default)\n");
+    printf("  --comprehensive       Everything --critical covers, plus Videos and Music\n");
     printf("Backup-only explicit paths:\n");
     printf("  <PATH...>             Paths listed after the destination are backed up\n");
     printf("                        exactly as given, with no assumptions\n");
