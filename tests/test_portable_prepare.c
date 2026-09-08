@@ -517,6 +517,51 @@ static void test_fifo_is_rejected_before_mutation(void)
     remove_tree(base);
 }
 
+static void test_operational_failure_reports_path(void)
+{
+    printf(BLUE "::" NC " portable preparation operational failure diagnostics\n");
+    if (geteuid() == 0) {
+        skip_check("unreadable-subdirectory preparation fixture skipped: root bypasses DAC");
+        return;
+    }
+
+    char base[PATH_MAX];
+    char source[PATH_MAX];
+    char scratch[PATH_MAX];
+    char blocked[PATH_MAX];
+    make_base(base, sizeof(base));
+    join_path(source, sizeof(source), base, "source");
+    join_path(scratch, sizeof(scratch), base, "scratch");
+    join_path(blocked, sizeof(blocked), source, "blocked");
+    make_directory(source);
+    make_directory(scratch);
+    make_directory(blocked);
+    if (chmod(blocked, 0000) != 0)
+        fixture_fatal("could not restrict portable pre-scan fixture");
+
+    PortableRootSpec root = root_spec("ROOT", source, "ROOT");
+    PortableCaptureRequest request = request_for(&root, 1, 1);
+    int scratch_fd = open_directory(scratch);
+    PortablePreparedCapture prepared = {0};
+    int result = portable_capture_prepare(scratch_fd, &request, &prepared);
+    check(result != 0 && prepared.ready == 0,
+          "an unreadable subtree refuses portable preparation");
+    check(prepared.report.operational_failure == 1 &&
+              strcmp(prepared.report.operational_failure_path, "blocked") == 0 &&
+              (prepared.report.operational_failure_errno == EACCES ||
+               prepared.report.operational_failure_errno == EPERM),
+          "the first operational pre-scan failure retains its path and errno");
+    check(directory_is_empty(scratch_fd) == 1,
+          "an operational pre-scan refusal leaves scratch untouched");
+
+    if (chmod(blocked, 0700) != 0)
+        fixture_fatal("could not restore portable pre-scan fixture permissions");
+    portable_prepared_capture_free(&prepared);
+    if (close(scratch_fd) != 0)
+        fixture_fatal("could not close operational-failure scratch directory");
+    remove_tree(base);
+}
+
 static int create_socket_fixture(const char *path)
 {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -668,6 +713,7 @@ int main(void)
     test_prepared_capture_does_not_prescan_again();
     test_resume_live_count();
     test_fifo_is_rejected_before_mutation();
+    test_operational_failure_reports_path();
     test_socket_is_informational();
     test_prepared_at_rejects_invalid_prepared();
     printf("portable prepare tests: %d failure(s), %d skipped\n",

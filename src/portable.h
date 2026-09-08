@@ -109,6 +109,7 @@ typedef struct {
     char root_id[MANIFEST_ID_MAX];
     char logical_path[SIDECAR_MAX_PATH + 1U];
     PortablePrescanViolationKind kind;
+    int resolved;
     size_t limit;
     size_t actual;
     char collides_with_logical_path[SIDECAR_MAX_PATH + 1U];
@@ -139,6 +140,9 @@ typedef struct {
     size_t example_capacity;
     PortableCollisionPlan collision_plan;
     size_t skipped_kind_count; /* Sockets/devices are capture warnings, not violations. */
+    int operational_failure;
+    int operational_failure_errno;
+    char operational_failure_path[SIDECAR_MAX_PATH + 1U];
     uint64_t total_size; /* Dense-copy bytes; hardlink groups count once. */
     void *inode_seen;    /* Opaque pre-scan inode set. */
 } PortablePrescanReport;

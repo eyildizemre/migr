@@ -2582,17 +2582,11 @@ static void test_include_network_config_backup(void)
             failing_target, BACKUP_EXPLICIT_PATHS, paths, 0, 1,
             failing_output, sizeof(failing_output));
 
-        char partial[PATH_MAX], partial_network[PATH_MAX];
-        int have_partial = find_partial_container_dir(
-            failing_target, partial, sizeof(partial));
-        if (have_partial)
-            join_path(partial_network, sizeof(partial_network), partial, "network");
-        struct stat network_st;
-        check(failing_rc == 1 && have_partial &&
-                  lstat(partial_network, &network_st) != 0 && errno == ENOENT,
-              "a per-file copy failure removes network/ from the resumable partial");
-        check(strstr(failing_output, "unreadable.nmconnection") != NULL,
-              "a per-file copy failure names the connection file that failed");
+        check(failing_rc == 1 && directory_empty(failing_target),
+              "an unreadable network configuration file refuses before container creation");
+        check(strstr(failing_output, "unreadable.nmconnection") != NULL &&
+                  strstr(failing_output, "same migr command with sudo") != NULL,
+              "a per-file permission refusal names the connection file and gives the sudo retry");
 
         chmod(unreadable, 0600);
         remove_tree(failing_source);
@@ -2882,6 +2876,108 @@ static void test_include_network_config_backup(void)
     remove_tree(networkd_target);
     remove_tree(all_target);
     remove_tree(dry_target);
+}
+
+static void test_portable_prescan_failure_diagnostics(void)
+{
+    printf(BLUE "::" NC " production: portable pre-scan failures name their cause\n");
+
+    char home[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_portable_diag_home");
+    setenv("HOME", home, 1);
+    char source[PATH_MAX];
+    join_path(source, sizeof(source), home, "source");
+    mkdir_p(source);
+
+    char fifo[PATH_MAX];
+    join_path(fifo, sizeof(fifo), source, "blocked-fifo");
+    if (mkfifo(fifo, 0600) != 0)
+    {
+        printf(RED "fixture: could not create portable diagnostic FIFO" NC "\n");
+        exit(1);
+    }
+    char upper[PATH_MAX];
+    char lower[PATH_MAX];
+    join_path(upper, sizeof(upper), source, "Foo");
+    join_path(lower, sizeof(lower), source, "foo");
+    write_file(upper, "upper\n");
+    write_file(lower, "lower\n");
+
+    char *paths[] = { source, NULL };
+    char target[PATH_MAX];
+    fresh_mkdtemp(target, sizeof(target), "plan_portable_diag_target");
+    char output[8192];
+    backup_test_force_portable_representation(1);
+    backup_test_force_case_insensitive_destination(1);
+    int rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                  output, sizeof(output));
+    backup_test_force_case_insensitive_destination(0);
+    backup_test_force_portable_representation(0);
+    check(rc == 1 && directory_empty(target),
+          "an unresolved portable pre-scan violation refuses before container creation");
+    check(strstr(output, "unresolved issue") != NULL &&
+              strstr(output, "blocked-fifo") != NULL &&
+              strstr(output, "unsupported file kind") != NULL &&
+              strstr(output, "collides with") == NULL,
+          "the portable refusal reports only the unresolved path, not a resolved case collision");
+    remove_tree(target);
+
+    fresh_mkdtemp(target, sizeof(target), "plan_portable_diag_target");
+    dry_run = 1;
+    backup_test_force_portable_representation(1);
+    backup_test_force_case_insensitive_destination(1);
+    rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                              output, sizeof(output));
+    backup_test_force_case_insensitive_destination(0);
+    backup_test_force_portable_representation(0);
+    dry_run = 0;
+    check(rc == 1 && directory_empty(target),
+          "a dry-run portable pre-scan violation refuses without creating a container");
+    check(strstr(output, "nothing would be created") != NULL &&
+              strstr(output, "blocked-fifo") != NULL &&
+              strstr(output, "unsupported file kind") != NULL &&
+              strstr(output, "collides with") == NULL,
+          "the dry-run portable refusal reports the unresolved path before freeing its report");
+    remove_tree(target);
+
+    if (unlink(fifo) != 0)
+    {
+        printf(RED "fixture: could not remove portable diagnostic FIFO" NC "\n");
+        exit(1);
+    }
+
+    if (geteuid() != 0)
+    {
+        char blocked[PATH_MAX];
+        join_path(blocked, sizeof(blocked), source, "blocked-directory");
+        mkdir_p(blocked);
+        if (chmod(blocked, 0000) != 0)
+        {
+            printf(RED "fixture: could not restrict portable diagnostic directory" NC "\n");
+            exit(1);
+        }
+
+        fresh_mkdtemp(target, sizeof(target), "plan_portable_diag_target");
+        backup_test_force_portable_representation(1);
+        rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                  output, sizeof(output));
+        backup_test_force_portable_representation(0);
+        check(rc == 1 && directory_empty(target),
+              "an operational portable pre-scan failure refuses before container creation");
+        check(strstr(output, "could not scan blocked-directory") != NULL &&
+                  (strstr(output, "Permission denied") != NULL ||
+                   strstr(output, "Operation not permitted") != NULL),
+              "the portable refusal reports the unreadable path and operating-system error");
+
+        if (chmod(blocked, 0700) != 0)
+        {
+            printf(RED "fixture: could not restore portable diagnostic directory permissions" NC "\n");
+            exit(1);
+        }
+        remove_tree(target);
+    }
+
+    remove_tree(home);
 }
 
 static void test_format_duration(void)
@@ -3400,6 +3496,7 @@ int main(void)
     test_destination_space_preflight();
     test_include_self_backup();
     test_include_network_config_backup();
+    test_portable_prescan_failure_diagnostics();
     test_vscode_extension_snapshot();
     test_format_duration();
     test_live_progress();

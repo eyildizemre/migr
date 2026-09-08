@@ -91,6 +91,9 @@ void backup_test_set_progress_hook(BackupTestProgressHook hook,
 
 void backup_test_set_network_config_source_dir(const char *backend_name,
                                                const char *source_dir);
+
+void backup_test_force_portable_representation(int enabled);
+void backup_test_force_case_insensitive_destination(int enabled);
 #endif
 
 #endif

@@ -521,7 +521,9 @@ static int empty_capture_container(int container_fd)
 static int collision_pair_matches(const PortablePrescanViolation *violation,
                                   const char *first, const char *second)
 {
-    if (violation == NULL || violation->kind != PORTABLE_PRESCAN_CASE_COLLISION)
+    if (violation == NULL ||
+        violation->kind != PORTABLE_PRESCAN_CASE_COLLISION ||
+        !violation->resolved)
         return 0;
     return (strcmp(violation->logical_path, first) == 0 &&
             strcmp(violation->collides_with_logical_path, second) == 0) ||
@@ -544,6 +546,7 @@ static int collision_example_matches_names(
 {
     if (violation == NULL || names == NULL ||
         violation->kind != PORTABLE_PRESCAN_CASE_COLLISION ||
+        !violation->resolved ||
         strcmp(violation->root_id, "CASE") != 0 ||
         !case_name_member(violation->logical_path, names, name_count) ||
         !case_name_member(violation->collides_with_logical_path, names,
@@ -2444,6 +2447,7 @@ static int root_payload_violation_matches(
 {
     return violation != NULL &&
            violation->kind == PORTABLE_PRESCAN_CASE_COLLISION &&
+           !violation->resolved &&
            strcmp(violation->root_id, root_id) == 0 &&
            strcmp(violation->logical_path, payload_path) == 0 &&
            strcmp(violation->collides_with_logical_path,

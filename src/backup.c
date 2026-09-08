@@ -61,6 +61,8 @@ static BackupTestProgressHook backup_test_progress_hook;
 static void *backup_test_progress_context;
 static const char *backup_test_network_config_source_dirs[
     NETWORK_CONFIG_BACKEND_COUNT];
+static int backup_test_portable_representation_forced;
+static int backup_test_case_insensitive_destination_forced;
 
 void backup_test_set_inventory_hook(BackupTestInventoryHook hook,
                                     void *context)
@@ -101,6 +103,16 @@ void backup_test_set_network_config_source_dir(const char *backend_name,
             return;
         }
     }
+}
+
+void backup_test_force_portable_representation(int enabled)
+{
+    backup_test_portable_representation_forced = enabled != 0;
+}
+
+void backup_test_force_case_insensitive_destination(int enabled)
+{
+    backup_test_case_insensitive_destination_forced = enabled != 0;
 }
 
 static void backup_test_before_source_open(const char *source_path)
@@ -303,6 +315,13 @@ static int backup_representation_preflight(int dest_fd, const char *target,
         print_error("Error: %s %s\n", refusal, target);
         return -1;
     }
+#ifdef BACKUP_TEST_HOOKS
+    if (backup_test_portable_representation_forced)
+        *out_repr = CLONE_PORTABLE_SIDECAR;
+    if (backup_test_case_insensitive_destination_forced)
+        out_profile->capabilities[FS_CAP_CASE_SENSITIVE] =
+            (FsCapabilityResult){ .status = FS_CAP_UNAVAILABLE };
+#endif
     return 0;
 }
 
@@ -352,39 +371,234 @@ static const char *network_config_source_dir(size_t backend_index)
     return NETWORK_CONFIG_BACKENDS[backend_index].source_dir;
 }
 
+static int network_config_name_matches_suffix(const char *name,
+                                              const char *filename_suffix)
+{
+    if (filename_suffix == NULL)
+        return 1;
+    size_t name_len = strlen(name);
+    size_t suffix_len = strlen(filename_suffix);
+    return name_len >= suffix_len &&
+           strcmp(name + name_len - suffix_len, filename_suffix) == 0;
+}
+
+static int network_config_preflight_error(size_t backend_index,
+                                          const char *source_dir,
+                                          const char *entry_name, int err)
+{
+    const char *backend_name = NETWORK_CONFIG_BACKENDS[backend_index].name;
+    if (err == EACCES || err == EPERM)
+    {
+        if (entry_name != NULL)
+            print_error("Error: --include-network-config: cannot read %s configuration file at %s/%s (%s). "
+                        "Rerun the same migr command with sudo.\n",
+                        backend_name, source_dir, entry_name, strerror(err));
+        else
+            print_error("Error: --include-network-config: cannot read %s backend at %s (%s). "
+                        "Rerun the same migr command with sudo.\n",
+                        backend_name, source_dir, strerror(err));
+    }
+    else
+    {
+        if (entry_name != NULL)
+            print_error("Error: --include-network-config: cannot read %s configuration file at %s/%s (%s).\n",
+                        backend_name, source_dir, entry_name, strerror(err));
+        else
+            print_error("Error: --include-network-config: cannot read %s backend at %s (%s).\n",
+                        backend_name, source_dir, strerror(err));
+    }
+    errno = err;
+    return -1;
+}
+
 static int check_network_config_readable(unsigned int *present_mask)
 {
     *present_mask = 0;
     for (size_t i = 0; i < NETWORK_CONFIG_BACKEND_COUNT; i++)
     {
         const char *source_dir = network_config_source_dir(i);
-        if (access(source_dir, R_OK | X_OK) == 0)
+        int source_fd = open(source_dir,
+                             O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (source_fd < 0)
         {
-            *present_mask |= 1u << i;
-            continue;
+            int saved_errno = errno;
+            if (saved_errno == ENOENT)
+                continue;
+            return network_config_preflight_error(i, source_dir, NULL,
+                                                  saved_errno);
         }
 
-        int saved_errno = errno;
-        if (saved_errno == ENOENT)
-            continue;
+        DIR *directory = fdopendir(source_fd);
+        if (directory == NULL)
+        {
+            int saved_errno = errno;
+            close(source_fd);
+            return network_config_preflight_error(i, source_dir, NULL,
+                                                  saved_errno);
+        }
 
-        if (saved_errno == EACCES || saved_errno == EPERM)
+        for (;;)
         {
-            print_error("Error: --include-network-config: cannot read %s backend at %s (%s). "
-                        "Rerun the same migr command with sudo.\n",
-                        NETWORK_CONFIG_BACKENDS[i].name, source_dir,
-                        strerror(saved_errno));
+            errno = 0;
+            struct dirent *entry = readdir(directory);
+            if (entry == NULL)
+            {
+                int saved_errno = errno;
+                if (saved_errno != 0)
+                {
+                    (void)closedir(directory);
+                    return network_config_preflight_error(
+                        i, source_dir, NULL, saved_errno);
+                }
+                break;
+            }
+            if (strcmp(entry->d_name, ".") == 0 ||
+                strcmp(entry->d_name, "..") == 0)
+                continue;
+
+            struct stat entry_st;
+            if (fstatat(dirfd(directory), entry->d_name, &entry_st,
+                        AT_SYMLINK_NOFOLLOW) != 0)
+            {
+                int saved_errno = errno;
+                network_config_preflight_error(i, source_dir, entry->d_name,
+                                               saved_errno);
+                (void)closedir(directory);
+                errno = saved_errno;
+                return -1;
+            }
+            if (!S_ISREG(entry_st.st_mode) ||
+                !network_config_name_matches_suffix(
+                    entry->d_name,
+                    NETWORK_CONFIG_BACKENDS[i].filename_suffix))
+                continue;
+
+            int candidate_fd = openat(
+                dirfd(directory), entry->d_name,
+                O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
+            if (candidate_fd < 0)
+            {
+                int saved_errno = errno;
+                if (saved_errno == ELOOP)
+                    continue;
+                network_config_preflight_error(i, source_dir, entry->d_name,
+                                               saved_errno);
+                (void)closedir(directory);
+                errno = saved_errno;
+                return -1;
+            }
+
+            struct stat candidate_st;
+            if (fstat(candidate_fd, &candidate_st) != 0)
+            {
+                int saved_errno = errno;
+                close(candidate_fd);
+                network_config_preflight_error(i, source_dir, entry->d_name,
+                                               saved_errno);
+                (void)closedir(directory);
+                errno = saved_errno;
+                return -1;
+            }
+            if (close(candidate_fd) != 0)
+            {
+                int saved_errno = errno;
+                network_config_preflight_error(i, source_dir, entry->d_name,
+                                               saved_errno);
+                (void)closedir(directory);
+                errno = saved_errno;
+                return -1;
+            }
+
+            /* The entry may have changed between fstatat() and openat().
+             * The copy path performs the same regular-file check again. */
+            if (!S_ISREG(candidate_st.st_mode))
+                continue;
         }
-        else
+
+        if (closedir(directory) != 0)
         {
-            print_error("Error: --include-network-config: cannot read %s backend at %s (%s).\n",
-                        NETWORK_CONFIG_BACKENDS[i].name, source_dir,
-                        strerror(saved_errno));
+            int saved_errno = errno;
+            return network_config_preflight_error(i, source_dir, NULL,
+                                                  saved_errno);
         }
-        errno = saved_errno;
-        return -1;
+        *present_mask |= 1u << i;
     }
     return 0;
+}
+
+static int portable_prescan_example_is_unresolved(
+    const PortablePrescanViolation *violation)
+{
+    return !violation->resolved;
+}
+
+static void print_portable_prescan_failure(const PortablePrescanReport *report,
+                                           const char *target, int preview)
+{
+    const char *outcome = preview
+        ? "nothing would be created"
+        : "no container was created";
+
+    if (report != NULL && report->operational_failure)
+    {
+        const char *path = report->operational_failure_path[0] != '\0'
+            ? report->operational_failure_path : "(selected root)";
+        print_error("Error: could not scan %s while preparing the portable capture at %s (%s); %s\n",
+                    path, target,
+                    strerror(report->operational_failure_errno), outcome);
+        return;
+    }
+
+    if (report != NULL && report->unresolved_count > 0)
+    {
+        print_error("Error: portable pre-scan found %zu unresolved issue(s) at %s; %s:\n",
+                    report->unresolved_count, target, outcome);
+        enum { DISPLAY_LIMIT = 10 };
+        size_t shown = 0;
+        for (size_t i = 0;
+             i < report->example_count && shown < DISPLAY_LIMIT; i++)
+        {
+            const PortablePrescanViolation *violation = &report->examples[i];
+            if (!portable_prescan_example_is_unresolved(violation))
+                continue;
+
+            const char *path = violation->logical_path[0] != '\0'
+                ? violation->logical_path : "(selected root)";
+            switch (violation->kind)
+            {
+                case PORTABLE_PRESCAN_NAME_TOO_LONG:
+                    print_error("  - name too long at %s (%zu bytes; limit %zu)\n",
+                                path, violation->actual, violation->limit);
+                    break;
+                case PORTABLE_PRESCAN_PATH_TOO_LONG:
+                    print_error("  - path too long at %s (%zu bytes; limit %zu)\n",
+                                path, violation->actual, violation->limit);
+                    break;
+                case PORTABLE_PRESCAN_CASE_COLLISION:
+                {
+                    const char *other =
+                        violation->collides_with_logical_path[0] != '\0'
+                            ? violation->collides_with_logical_path
+                            : "(selected root)";
+                    print_error("  - %s collides with %s on this case-insensitive destination\n",
+                                path, other);
+                    break;
+                }
+                case PORTABLE_PRESCAN_UNSUPPORTED_KIND:
+                    print_error("  - unsupported file kind for portable capture at %s\n",
+                                path);
+                    break;
+            }
+            shown++;
+        }
+        if (report->unresolved_count > shown)
+            print_error("  ... %zu more unresolved issue(s) not shown\n",
+                        report->unresolved_count - shown);
+        return;
+    }
+
+    print_error("Error: portable pre-scan failed or found an unresolvable conflict at %s; %s\n",
+                target, outcome);
 }
 
 static int self_binary_clear_at(int container_fd)
@@ -639,17 +853,11 @@ static int copy_network_config_file_at(int source_dir_fd, int network_fd,
         return 0;
     }
 
-    if (filename_suffix != NULL)
+    if (!network_config_name_matches_suffix(name, filename_suffix))
     {
-        size_t name_len = strlen(name);
-        size_t suffix_len = strlen(filename_suffix);
-        if (name_len < suffix_len ||
-            strcmp(name + name_len - suffix_len, filename_suffix) != 0)
-        {
-            printf("  Note: skipping non-configuration file in network configuration: %s\n",
-                   name);
-            return 0;
-        }
+        printf("  Note: skipping non-configuration file in network configuration: %s\n",
+               name);
+        return 0;
     }
 
     int source_fd = openat(source_dir_fd, name,
@@ -2128,7 +2336,6 @@ static int backup_dry_run(const char *target, BackupMode mode,
         free(advisory_roots);
         if (prepare_result != 0)
         {
-            portable_prepared_capture_free(&advisory_prepared);
             int has_manual_native = 0;
             for (int i = 0; i < plan->root_count; i++)
                 if (plan->roots[i].manifest_root.policy ==
@@ -2140,8 +2347,9 @@ static int backup_dry_run(const char *target, BackupMode mode,
                        "restore address; move or drop the external path(s) to "
                        "back up here.\n", target);
             else
-                print_error("Error: portable pre-scan failed or found an unresolvable "
-                       "conflict at %s; nothing would be created\n", target);
+                print_portable_prescan_failure(&advisory_prepared.report,
+                                               target, 1);
+            portable_prepared_capture_free(&advisory_prepared);
             close(advisory_fd);
             metadata_profiles_free(&advisory_profiles);
             backup_plan_free(plan);
@@ -2411,8 +2619,7 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
                        "restore address; move or drop the external path(s) to "
                        "back up here.\n", target);
             else
-                print_error("Error: portable pre-scan failed or found an unresolvable "
-                       "conflict at %s; no container was created\n", target);
+                print_portable_prescan_failure(&prepared.report, target, 0);
             goto fail_pre_container;
         }
         if (include_self)
