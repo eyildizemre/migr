@@ -5,6 +5,7 @@
 #include "portable_fsops_internal.h"
 #include "portable_hashset_internal.h"
 #include "portable_prescan_internal.h"
+#include "portable_name.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -733,26 +734,8 @@ static int time_to_i64(time_t value, int64_t *out)
     return 0;
 }
 
-static int physical_leaf_from_joined(const char *logical, const char *physical,
-                                     SidecarBytes *out)
-{
-    if (logical == NULL || physical == NULL || out == NULL)
-        return -1;
-    *out = (SidecarBytes){0};
-    if (logical[0] == '\0')
-        return physical[0] == '\0' ? 0 : -1;
-    if (physical[0] == '\0')
-        return -1;
-    const char *slash = strrchr(physical, '/');
-    const char *leaf = slash == NULL ? physical : slash + 1;
-    if (!safe_component(leaf))
-        return -1;
-    *out = (SidecarBytes){ (const unsigned char *)leaf, strlen(leaf) };
-    return 0;
-}
-
 int entry_from_stat(const char *root_id, const char *logical,
-                    const char *physical, const char *collision_suffix,
+                    const char *physical_leaf, const char *collision_suffix,
                     const struct stat *st, int nsec_exact,
                     PortableXattrs *xattrs, SidecarEntry *out,
                     const SidecarBytes *symlink_target,
@@ -763,7 +746,7 @@ int entry_from_stat(const char *root_id, const char *logical,
     int64_t mtime_sec;
     int hardlink_requested = hardlink_root_id != NULL ||
                              hardlink_logical_path != NULL;
-    if (root_id == NULL || logical == NULL || physical == NULL ||
+    if (root_id == NULL || logical == NULL || physical_leaf == NULL ||
         collision_suffix == NULL ||
         st == NULL || out == NULL ||
         (st->st_mode & 07777) > SIDECAR_MAX_MODE || st->st_uid > UINT32_MAX ||
@@ -789,13 +772,16 @@ int entry_from_stat(const char *root_id, const char *logical,
         return -1;
 
     memset(out, 0, sizeof(*out));
+    if ((logical[0] == '\0' && physical_leaf[0] != '\0') ||
+        (logical[0] != '\0' && !safe_component(physical_leaf)))
+        return -1;
+
     out->root_id = (SidecarBytes){ (const unsigned char *)root_id,
                                    strlen(root_id) };
     out->logical_path = (SidecarBytes){ (const unsigned char *)logical,
                                         strlen(logical) };
-    if (physical_leaf_from_joined(logical, physical,
-                                  &out->physical_leaf) != 0)
-        return -1;
+    out->physical_leaf = (SidecarBytes){
+        (const unsigned char *)physical_leaf, strlen(physical_leaf) };
     out->collision_suffix = (SidecarBytes){
         (const unsigned char *)collision_suffix, strlen(collision_suffix) };
     if (hardlink_requested)
@@ -1548,19 +1534,20 @@ static int append_group(PortableCaptureContext *context,
 
 static int append_capture_claim(PortableCaptureContext *context,
                                 const PortableRootSpec *root,
-                                const char *logical, const char *physical,
+                                const char *logical,
+                                const char *physical_leaf,
                                 SidecarObjectKind kind)
 {
     if (context == NULL || root == NULL || root->id == NULL ||
-        logical == NULL || physical == NULL)
-        return -1;
-    SidecarBytes physical_leaf = {0};
-    if (physical_leaf_from_joined(logical, physical, &physical_leaf) != 0)
+        logical == NULL || physical_leaf == NULL ||
+        ((logical[0] == '\0' && physical_leaf[0] != '\0') ||
+         (logical[0] != '\0' && !safe_component(physical_leaf))))
         return -1;
     SidecarClaim claim = {
         .root_id = { (const unsigned char *)root->id, strlen(root->id) },
         .logical_path = { (const unsigned char *)logical, strlen(logical) },
-        .physical_leaf = physical_leaf,
+        .physical_leaf = {
+            (const unsigned char *)physical_leaf, strlen(physical_leaf) },
         .kind = kind
     };
     SidecarClaimView existing = {0};
@@ -1794,59 +1781,46 @@ int portable_copy_regular(int source_fd, int destination_fd, off_t expected_size
     return 0;
 }
 
-static int physical_path_parent_matches(const char *physical,
-                                        const char *parent)
-{
-    if (physical == NULL || parent == NULL)
-        return 0;
-    const char *slash = strrchr(physical, '/');
-    if (slash == NULL)
-        return parent[0] == '\0';
-    size_t parent_length = (size_t)(slash - physical);
-    return strlen(parent) == parent_length &&
-           memcmp(physical, parent, parent_length) == 0;
-}
+typedef struct {
+    char physical_leaf[SIDECAR_MAX_PHYSICAL_LEAF + 1U];
+    char collision_suffix[SIDECAR_MAX_COLLISION_SUFFIX + 1U];
+    char unsuffixed_candidate[SIDECAR_MAX_PHYSICAL_LEAF + 1U];
+} PortableCaptureAssignment;
 
-static int physical_path_leaf(const char *physical, char *leaf,
-                              size_t leaf_size)
+static int capture_assignment_resolve(
+    const PortableCaptureContext *context, const PortableRootSpec *root,
+    const char *logical, const char *raw_component,
+    PortableCaptureAssignment *out)
 {
-    if (physical == NULL || leaf == NULL || leaf_size == 0 ||
-        physical[0] == '\0')
+    if (context == NULL || root == NULL || root->id == NULL ||
+        logical == NULL || logical[0] == '\0' || raw_component == NULL ||
+        out == NULL)
         return -1;
-    const char *slash = strrchr(physical, '/');
-    const char *name = slash == NULL ? physical : slash + 1;
-    if (!safe_component(name))
-        return -1;
-    return copy_text(leaf, leaf_size, name);
-}
+    memset(out, 0, sizeof(*out));
 
-static int capture_plan_child(const PortableCaptureContext *context,
-                              const PortableRootSpec *root,
-                              const char *logical, const char *parent_physical,
-                              const char *encoded_leaf,
-                              char *physical, size_t physical_size,
-                              char *leaf, size_t leaf_size)
-{
-    if (context == NULL || root == NULL || logical == NULL ||
-        parent_physical == NULL || encoded_leaf == NULL || physical == NULL ||
-        leaf == NULL)
+    PortablePhysicalName unsuffixed;
+    if (portable_physical_name_map(raw_component, 0, &unsuffixed) != 0 ||
+        copy_text(out->unsuffixed_candidate,
+                  sizeof(out->unsuffixed_candidate),
+                  unsuffixed.physical_leaf) != 0)
         return -1;
 
     const PortableCollisionPlanEntry *planned =
         portable_collision_plan_find(context->collision_plan, root->id,
                                      logical);
-    if (planned == NULL) {
-        if (append_physical(physical, physical_size, parent_physical,
-                            encoded_leaf) != 0 ||
-            copy_text(leaf, leaf_size, encoded_leaf) != 0)
+    if (planned != NULL) {
+        if (!safe_component(planned->physical_leaf) ||
+            copy_text(out->physical_leaf, sizeof(out->physical_leaf),
+                      planned->physical_leaf) != 0 ||
+            copy_text(out->collision_suffix, sizeof(out->collision_suffix),
+                      planned->collision_suffix) != 0)
             return -1;
         return 0;
     }
 
-    if (!physical_path_parent_matches(planned->physical_path,
-                                      parent_physical) ||
-        copy_text(physical, physical_size, planned->physical_path) != 0 ||
-        physical_path_leaf(planned->physical_path, leaf, leaf_size) != 0)
+    if (unsuffixed.shortened || unsuffixed.collision_suffix[0] != '\0' ||
+        copy_text(out->physical_leaf, sizeof(out->physical_leaf),
+                  unsuffixed.physical_leaf) != 0)
         return -1;
     return 0;
 }
@@ -1873,7 +1847,9 @@ static int capture_plan_entries_seen(const PortableCaptureContext *context,
 
 static int capture_node(PortableCaptureContext *context,
                         const PortableRootSpec *root,
-                        const char *logical, const char *physical,
+                        const char *logical, const char *physical_leaf,
+                        const char *collision_suffix,
+                        const char *physical,
                         int source_parent,
                         const char *source_name, const char *root_path,
                         int destination_parent, const char *destination_leaf,
@@ -1893,7 +1869,8 @@ void portable_test_close_capture_directory_scan_fd_early(void)
 
 static int capture_directory(PortableCaptureContext *context,
                              const PortableRootSpec *root,
-                             const char *logical, const char *physical,
+                             const char *logical, const char *physical_leaf,
+                             const char *physical,
                              int source_fd,
                              const struct stat *before, int destination_fd,
                              PortableXattrs *xattrs,
@@ -1952,12 +1929,9 @@ static int capture_directory(PortableCaptureContext *context,
                 continue;
         }
 
-        /* NAME_MAX + 1 is the accept/reject boundary, not a diagnostic scratch
-         * size: docs/DECISIONS.md D19 N-2 requires refusing, not skipping, a
-         * component whose encoded form exceeds NAME_MAX. */
-        char encoded_leaf[NAME_MAX + 1U];
-        if (encoding_percent_encode(ENCODING_MODE_COMPONENT, entry->d_name,
-                                    encoded_leaf, sizeof(encoded_leaf)) != 0) {
+        PortableCaptureAssignment assignment;
+        if (capture_assignment_resolve(context, root, child_logical,
+                                       entry->d_name, &assignment) != 0) {
             failed = 1;
             break;
         }
@@ -1965,9 +1939,10 @@ static int capture_directory(PortableCaptureContext *context,
         if (!context->case_sensitive) {
             char skeleton[NAME_MAX + 1U];
             char ascii_skeleton[NAME_MAX + 1U];
-            skeleton_copy(skeleton, sizeof(skeleton), encoded_leaf);
+            skeleton_copy(skeleton, sizeof(skeleton),
+                          assignment.unsuffixed_candidate);
             ascii_fold_copy(ascii_skeleton, sizeof(ascii_skeleton),
-                            encoded_leaf);
+                            assignment.unsuffixed_candidate);
             char *existing_logical = NULL;
             int duplicate = case_fold_set_find_or_insert(
                 &observed_skeletons, skeleton, child_logical,
@@ -2008,11 +1983,8 @@ static int capture_directory(PortableCaptureContext *context,
         }
 
         char child_physical[SIDECAR_MAX_PATH + 1U];
-        char child_leaf[NAME_MAX + 1U];
-        if (capture_plan_child(context, root, child_logical, physical,
-                               encoded_leaf, child_physical,
-                               sizeof(child_physical), child_leaf,
-                               sizeof(child_leaf)) != 0) {
+        if (append_physical(child_physical, sizeof(child_physical), physical,
+                            assignment.physical_leaf) != 0) {
             failed = 1;
             break;
         }
@@ -2025,8 +1997,9 @@ static int capture_directory(PortableCaptureContext *context,
         }
 
         int added_pending = 0;
-        if (encoded_name_has_raw_high_byte(child_leaf)) {
-            if (pending_readback_names_add(&pending, child_leaf) != 0) {
+        if (encoded_name_has_raw_high_byte(assignment.physical_leaf)) {
+            if (pending_readback_names_add(&pending,
+                                           assignment.physical_leaf) != 0) {
                 failed = 1;
                 break;
             }
@@ -2034,9 +2007,12 @@ static int capture_directory(PortableCaptureContext *context,
         }
 
         int no_destination_object = 0;
-        if (capture_node(context, root, child_logical, child_physical,
+        if (capture_node(context, root, child_logical,
+                         assignment.physical_leaf,
+                         assignment.collision_suffix, child_physical,
                          source_fd, entry->d_name, NULL, destination_fd,
-                         child_leaf, &no_destination_object) != 0) {
+                         assignment.physical_leaf,
+                         &no_destination_object) != 0) {
             failed = 1;
             break;
         }
@@ -2066,7 +2042,8 @@ static int capture_directory(PortableCaptureContext *context,
     }
 
     SidecarEntry sidecar_entry;
-    if (entry_from_stat(root->id, logical, physical, collision_suffix, before,
+    if (entry_from_stat(root->id, logical, physical_leaf, collision_suffix,
+                        before,
                         context->nsec_exact,
                         xattrs, &sidecar_entry, NULL, NULL, NULL) != 0 ||
         append_group(context, &sidecar_entry, xattrs) != 0) {
@@ -2082,7 +2059,8 @@ static int capture_directory(PortableCaptureContext *context,
 
 static int capture_regular(PortableCaptureContext *context,
                            const PortableRootSpec *root,
-                           const char *logical, const char *physical,
+                           const char *logical, const char *physical_leaf,
+                           const char *physical,
                            const char *collision_suffix,
                            int source_fd,
                            const struct stat *before,
@@ -2114,7 +2092,7 @@ static int capture_regular(PortableCaptureContext *context,
         close(source_fd);
         return -1;
     }
-    if (append_capture_claim(context, root, logical, physical,
+    if (append_capture_claim(context, root, logical, physical_leaf,
                              SIDECAR_KIND_REGULAR) != 0) {
         if (destination_is_root)
             close(parent_fd);
@@ -2173,7 +2151,8 @@ static int capture_regular(PortableCaptureContext *context,
     }
 
     SidecarEntry sidecar_entry;
-    failed = entry_from_stat(root->id, logical, physical, collision_suffix,
+    failed = entry_from_stat(root->id, logical, physical_leaf,
+                             collision_suffix,
                              before,
                              context->nsec_exact,
                              xattrs, &sidecar_entry, NULL, NULL, NULL) != 0 ||
@@ -2248,7 +2227,8 @@ static int capture_special(PortableCaptureContext *context,
 
 static int capture_symlink(PortableCaptureContext *context,
                            const PortableRootSpec *root,
-                           const char *logical, const char *physical,
+                           const char *logical, const char *physical_leaf,
+                           const char *physical,
                            const char *collision_suffix,
                            int source_parent,
                            const char *source_name, const char *root_path,
@@ -2294,7 +2274,8 @@ static int capture_symlink(PortableCaptureContext *context,
         (const unsigned char *)target, (size_t)target_length
     };
     SidecarEntry entry;
-    if (entry_from_stat(root->id, logical, physical, collision_suffix, before,
+    if (entry_from_stat(root->id, logical, physical_leaf, collision_suffix,
+                        before,
                         context->nsec_exact,
                         &xattrs, &entry, &target_bytes, NULL, NULL) != 0) {
         xattrs_free(&xattrs);
@@ -2350,7 +2331,7 @@ static int capture_symlink(PortableCaptureContext *context,
         return -1;
     }
 
-    if (append_capture_claim(context, root, logical, physical,
+    if (append_capture_claim(context, root, logical, physical_leaf,
                              SIDECAR_KIND_SYMLINK) != 0) {
         if (destination_is_root)
             close(parent_fd);
@@ -2390,7 +2371,8 @@ static int capture_symlink(PortableCaptureContext *context,
 
 static int capture_hardlink(PortableCaptureContext *context,
                             const PortableRootSpec *root,
-                            const char *logical, const char *physical,
+                            const char *logical, const char *physical_leaf,
+                            const char *physical,
                             const char *collision_suffix,
                             int source_fd, const struct stat *before,
                             int destination_parent,
@@ -2399,7 +2381,8 @@ static int capture_hardlink(PortableCaptureContext *context,
                             const PortableInodeSlot *representative)
 {
     if (context == NULL || root == NULL || logical == NULL ||
-        physical == NULL || collision_suffix == NULL || source_fd < 0 ||
+        physical_leaf == NULL || physical == NULL || collision_suffix == NULL ||
+        source_fd < 0 ||
         before == NULL || representative == NULL)
         return -1;
 
@@ -2413,7 +2396,8 @@ static int capture_hardlink(PortableCaptureContext *context,
     };
     SidecarEntry entry;
     PortableXattrs empty_xattrs = {0};
-    if (entry_from_stat(root->id, logical, physical, collision_suffix, before,
+    if (entry_from_stat(root->id, logical, physical_leaf, collision_suffix,
+                        before,
                         context->nsec_exact, &empty_xattrs, &entry, NULL,
                         &hardlink_root_id, &hardlink_logical_path) != 0) {
         close(source_fd);
@@ -2466,7 +2450,7 @@ static int capture_hardlink(PortableCaptureContext *context,
         close(source_fd);
         return -1;
     }
-    if (append_capture_claim(context, root, logical, physical,
+    if (append_capture_claim(context, root, logical, physical_leaf,
                              SIDECAR_KIND_HARDLINK) != 0) {
         if (destination_is_root)
             close(parent_fd);
@@ -2508,7 +2492,9 @@ static int capture_hardlink(PortableCaptureContext *context,
 
 static int capture_node(PortableCaptureContext *context,
                         const PortableRootSpec *root,
-                        const char *logical, const char *physical,
+                        const char *logical, const char *physical_leaf,
+                        const char *collision_suffix,
+                        const char *physical,
                         int source_parent,
                         const char *source_name, const char *root_path,
                         int destination_parent, const char *destination_leaf,
@@ -2523,15 +2509,22 @@ static int capture_node(PortableCaptureContext *context,
     if (read_source_stat(source_parent, source_name, root_path, &before) != 0)
         return -1;
 
-    const char *collision_suffix = "";
+    if (logical == NULL || physical_leaf == NULL || collision_suffix == NULL ||
+        physical == NULL ||
+        ((logical[0] == '\0' &&
+          (physical_leaf[0] != '\0' || collision_suffix[0] != '\0')) ||
+         (logical[0] != '\0' && !safe_component(physical_leaf))))
+        return -1;
+
     const PortableCollisionPlanEntry *planned =
         portable_collision_plan_find(context->collision_plan, root->id,
                                      logical);
     if (planned != NULL) {
-        if (strcmp(planned->physical_path, physical) != 0)
+        if (strcmp(planned->physical_leaf, physical_leaf) != 0 ||
+            strcmp(planned->collision_suffix, collision_suffix) != 0)
             return -1;
-        collision_suffix = planned->collision_suffix;
-    }
+    } else if (collision_suffix[0] != '\0')
+        return -1;
 
     int is_root = source_parent < 0;
     if (S_ISSOCK(before.st_mode) || S_ISCHR(before.st_mode) ||
@@ -2547,7 +2540,7 @@ static int capture_node(PortableCaptureContext *context,
         return -1;
     }
     if (S_ISLNK(before.st_mode))
-        return capture_symlink(context, root, logical, physical,
+        return capture_symlink(context, root, logical, physical_leaf, physical,
                                collision_suffix, source_parent,
                                source_name, root_path, destination_parent,
                                destination_leaf, is_root, &before);
@@ -2585,7 +2578,8 @@ static int capture_node(PortableCaptureContext *context,
                                  strcmp(representative->root_id, root->id) == 0 &&
                                  strcmp(representative->logical_path, logical) == 0;
         if (inode_state == 1 && !same_logical_entry) {
-            return capture_hardlink(context, root, logical, physical,
+            return capture_hardlink(context, root, logical, physical_leaf,
+                                    physical,
                                     collision_suffix, source_fd, &before,
                                     destination_parent, destination_leaf,
                                     is_root, representative);
@@ -2620,7 +2614,7 @@ static int capture_node(PortableCaptureContext *context,
             previous_hint.view = previous;
         if (live == 1) {
             SidecarEntry current;
-            int matches = entry_from_stat(root->id, logical, physical,
+            int matches = entry_from_stat(root->id, logical, physical_leaf,
                                           collision_suffix, &before,
                                           context->nsec_exact, &xattrs,
                                           &current, NULL, NULL, NULL) == 0 &&
@@ -2643,7 +2637,7 @@ static int capture_node(PortableCaptureContext *context,
     }
 
     if (S_ISREG(before.st_mode))
-        return capture_regular(context, root, logical, physical,
+        return capture_regular(context, root, logical, physical_leaf, physical,
                                collision_suffix, source_fd,
                                &before,
                                destination_parent, destination_leaf, is_root,
@@ -2672,7 +2666,7 @@ static int capture_node(PortableCaptureContext *context,
         return -1;
     }
 
-    if (append_capture_claim(context, root, logical, physical,
+    if (append_capture_claim(context, root, logical, physical_leaf,
                              SIDECAR_KIND_DIRECTORY) != 0) {
         if (is_root)
             close(parent_fd);
@@ -2689,8 +2683,9 @@ static int capture_node(PortableCaptureContext *context,
         close(source_fd);
         return -1;
     }
-    if (capture_directory(context, root, logical, physical, source_fd, &before,
-                          destination_fd, &xattrs, collision_suffix) != 0) {
+    if (capture_directory(context, root, logical, physical_leaf, physical,
+                          source_fd, &before, destination_fd, &xattrs,
+                          collision_suffix) != 0) {
         if (is_root)
             close(parent_fd);
         return -1;
@@ -3151,7 +3146,7 @@ int portable_capture_root(PortableCaptureContext *context,
         return -1;
     if (prepare_collision_relocations(context, root) != 0)
         return -1;
-    int result = capture_node(context, root, "", "", -1, NULL,
+    int result = capture_node(context, root, "", "", "", "", -1, NULL,
                               root->capture_path, -1, NULL, NULL);
     if (result != 0)
         return result;

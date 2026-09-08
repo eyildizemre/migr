@@ -1757,10 +1757,7 @@ static int prescan_request_internal(int container_fd,
     if (!failed)
         prescan_report_refresh_unresolved(report);
     compatibility_paths_free(&compatibility_paths);
-    return failed ||
-                   (reject_violations &&
-                    (report->unresolved_count != 0 ||
-                     report->shortening_count != 0))
+    return failed || (reject_violations && report->unresolved_count != 0)
                ? -1
                : 0;
 }

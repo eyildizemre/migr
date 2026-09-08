@@ -78,6 +78,7 @@ selection.o selection_static.o: src/selection.h src/config.h src/backup_plan.h
 backup_plan.o backup_plan_static.o backup_plan_test.o: src/selection.h
 
 selection_match.o selection_match_static.o fileops.o fileops_static.o fileops_test.o backup.o backup_static.o backup_test.o report.o report_test.o report_static.o portable.o portable_static.o portable_test.o portable_prescan.o portable_prescan_static.o portable_prescan_test.o: src/selection.h
+portable.o portable_static.o portable_test.o: src/portable_name.h
 portable_prescan.o portable_prescan_static.o portable_prescan_test.o: src/portable_name.h
 backup.o backup_static.o backup_test.o fileops.o fileops_static.o fileops_test.o portable.o portable_static.o portable_test.o portable_fsops.o portable_fsops_static.o portable_prescan.o portable_prescan_static.o portable_prescan_test.o portable_reconcile.o portable_reconcile_static.o portable_reconcile_test.o portable_restore_preflight.o portable_restore_preflight_static.o portable_restore_replay.o portable_restore_replay_static.o portable_restore_replay_test.o portable_restore_shared.o portable_restore_shared_static.o restore.o restore_static.o restore_test.o: src/portable.h
 fileops.o fileops_static.o backup.o backup_static.o restore.o restore_static.o metadata.o metadata_static.o: src/fileops.h

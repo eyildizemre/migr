@@ -46,7 +46,7 @@
 #include "sidecar.h"
 
 extern int entry_from_stat(const char *root_id, const char *logical,
-                           const char *physical,
+                           const char *physical_leaf,
                            const char *collision_suffix,
                            const struct stat *st, int nsec_exact,
                            PortableXattrs *xattrs, SidecarEntry *out,
@@ -305,6 +305,19 @@ static int live_entry_paths(SidecarLog *log, const char *root,
     return found == 1 &&
            sidecar_bytes_match_text(view.entry->logical_path, logical) &&
            sidecar_bytes_match_text(view.entry->physical_path, physical);
+}
+
+static int live_entry_identity(SidecarLog *log, const char *root,
+                               const char *logical, const char *physical_leaf,
+                               const char *collision_suffix)
+{
+    SidecarLiveView view;
+    int found = sidecar_log_find(log, bytes(root), bytes(logical), &view);
+    return found == 1 &&
+           sidecar_bytes_match_text(view.entry->logical_path, logical) &&
+           sidecar_bytes_match_text(view.entry->physical_leaf, physical_leaf) &&
+           sidecar_bytes_match_text(view.entry->collision_suffix,
+                                    collision_suffix);
 }
 
 static void test_append_physical(void)
@@ -1114,10 +1127,26 @@ static void test_mixed_prescan_violations(const char *base)
         .case_sensitive = 0
     };
     portable_prescan_report_init(&report);
-    check(portable_capture_fresh_at(container_fd, &request, &report) != 0 &&
-              report.shortening_count == 1 && report.unresolved_count == 0 &&
-              empty_capture_container(container_fd),
-          "live shortened capture remains gated until the Phase-4 consumer migration");
+    int capture_result = portable_capture_fresh_at(container_fd, &request,
+                                                   &report);
+    char case_payload[PATH_MAX];
+    char shortened_payload[PATH_MAX];
+    join_path(case_payload, sizeof(case_payload), container_path, "data/CASE");
+    join_path(shortened_payload, sizeof(shortened_payload), case_payload,
+              shortened.physical_leaf);
+    SidecarLog live_log = {0};
+    int adopted = sidecar_log_adopt_at(container_fd, &live_log) ==
+                  SIDECAR_OPEN_RESUMABLE;
+    check(capture_result == 0 && report.shortening_count == 1 &&
+              report.unresolved_count == 0 &&
+              file_equals(shortened_payload, "x") && adopted &&
+              live_entry_identity(&live_log, "CASE", oversized_name,
+                                  shortened.physical_leaf, "") &&
+              sidecar_log_claim_count(&live_log) == 0,
+          "case collision and shortening execute together under canonical leaves");
+    if (live_log.implementation != NULL &&
+        sidecar_log_close(&live_log) != SIDECAR_STATUS_OK)
+        fixture_fatal("could not close mixed-shortening sidecar");
     portable_prescan_report_free(&report);
     close(container_fd);
     remove_tree(source_path);
@@ -1210,6 +1239,31 @@ static void test_collision_plan_suffix_length_violation(const char *base)
           "plan-build pre-scan reporting the overflow does not mutate the "
           "container");
 
+    portable_prescan_report_free(&report);
+    portable_prescan_report_init(&report);
+    int capture_result = portable_capture_fresh_at(container_fd, &request,
+                                                   &report);
+    char payload_root[PATH_MAX];
+    char winner_payload[PATH_MAX];
+    char loser_payload[PATH_MAX];
+    join_path(payload_root, sizeof(payload_root), container_path, "data/CASE");
+    join_path(winner_payload, sizeof(winner_payload), payload_root, winner);
+    join_path(loser_payload, sizeof(loser_payload), payload_root,
+              expected_shortened.physical_leaf);
+    SidecarLog live_log = {0};
+    int adopted = sidecar_log_adopt_at(container_fd, &live_log) ==
+                  SIDECAR_OPEN_RESUMABLE;
+    check(capture_result == 0 && report.unresolved_count == 0 &&
+              report.shortening_count == 1 && file_equals(winner_payload, "w") &&
+              file_equals(loser_payload, "l") && adopted &&
+              live_entry_identity(&live_log, "CASE", winner, winner, "") &&
+              live_entry_identity(&live_log, "CASE", loser,
+                                  expected_shortened.physical_leaf, "%7E1") &&
+              sidecar_log_claim_count(&live_log) == 0,
+          "suffix-induced shortening executes the canonical live assignment");
+    if (live_log.implementation != NULL &&
+        sidecar_log_close(&live_log) != SIDECAR_STATUS_OK)
+        fixture_fatal("could not close suffix-shortening sidecar");
     portable_prescan_report_free(&report);
     close(container_fd);
     remove_tree(source_path);
@@ -1314,6 +1368,117 @@ static void test_shortened_candidate_collision_determinism(const char *base)
         remove_tree(source_path);
         remove_tree(container_path);
     }
+}
+
+static void test_prepared_shortening_plan_authority(const char *base)
+{
+    printf(BLUE "::" NC " prepared shortening plan remains authoritative\n");
+    const uint64_t fingerprint = UINT64_C(0x0123456789ABCDEF);
+    char first[NAME_MAX + 1U];
+    char second[NAME_MAX + 1U];
+    make_forced_shortening_name(first, 'a');
+    make_forced_shortening_name(second, 'b');
+
+    char source_path[PATH_MAX];
+    char container_path[PATH_MAX];
+    join_path(source_path, sizeof(source_path), base,
+              "prepared-shortening-source");
+    join_path(container_path, sizeof(container_path), base,
+              "prepared-shortening-container");
+    make_directory(source_path);
+    make_directory(container_path);
+    char source_file[PATH_MAX];
+    join_path(source_file, sizeof(source_file), source_path, first);
+    write_file(source_file, "a", 1);
+    join_path(source_file, sizeof(source_file), source_path, second);
+    write_file(source_file, "b", 1);
+
+    int container_fd = open(container_path,
+                            O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open prepared shortening container");
+    PortableRootSpec root = root_spec("CASE", source_path, "CASE");
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .roots = &root,
+        .root_count = 1,
+        .nsec_exact = 1,
+        .case_sensitive = 1
+    };
+    PortablePreparedCapture prepared = {0};
+    portable_prescan_test_force_name_fingerprint(fingerprint);
+    int prepare_result = portable_capture_prepare(container_fd, &request,
+                                                  &prepared);
+    portable_prescan_test_clear_name_fingerprint();
+
+    char first_leaf[SIDECAR_MAX_PHYSICAL_LEAF + 1U] = {0};
+    char first_suffix[SIDECAR_MAX_COLLISION_SUFFIX + 1U] = {0};
+    char second_leaf[SIDECAR_MAX_PHYSICAL_LEAF + 1U] = {0};
+    char second_suffix[SIDECAR_MAX_COLLISION_SUFFIX + 1U] = {0};
+    const PortableCollisionPlanEntry *first_entry = prepare_result == 0
+        ? portable_collision_plan_find(&prepared.report.collision_plan,
+                                       "CASE", first)
+        : NULL;
+    const PortableCollisionPlanEntry *second_entry = prepare_result == 0
+        ? portable_collision_plan_find(&prepared.report.collision_plan,
+                                       "CASE", second)
+        : NULL;
+    if (first_entry != NULL && second_entry != NULL) {
+        snprintf(first_leaf, sizeof(first_leaf), "%s",
+                 first_entry->physical_leaf);
+        snprintf(first_suffix, sizeof(first_suffix), "%s",
+                 first_entry->collision_suffix);
+        snprintf(second_leaf, sizeof(second_leaf), "%s",
+                 second_entry->physical_leaf);
+        snprintf(second_suffix, sizeof(second_suffix), "%s",
+                 second_entry->collision_suffix);
+    }
+
+    PortablePhysicalName production_first;
+    PortablePhysicalName production_second;
+    int production_mapped =
+        portable_physical_name_map(first, 0, &production_first) == 0 &&
+        portable_physical_name_map(second, 1, &production_second) == 0;
+    int override_matters = first_entry != NULL && second_entry != NULL &&
+        production_mapped &&
+        (strcmp(first_leaf, production_first.physical_leaf) != 0 ||
+         strcmp(second_leaf, production_second.physical_leaf) != 0);
+    check(prepare_result == 0 && prepared.ready &&
+              prepared.report.shortening_count == 2 &&
+              prepared.report.unresolved_count == 0 &&
+              first_entry != NULL && second_entry != NULL && override_matters,
+          "prepared plan freezes the injected physical assignments");
+
+    size_t live_count = 0;
+    int capture_result = prepare_result == 0
+        ? portable_capture_fresh_prepared_at(container_fd, &request, &prepared,
+                                             &live_count, NULL)
+        : -1;
+    char payload_root[PATH_MAX];
+    char first_payload[PATH_MAX];
+    char second_payload[PATH_MAX];
+    join_path(payload_root, sizeof(payload_root), container_path, "data/CASE");
+    join_path(first_payload, sizeof(first_payload), payload_root, first_leaf);
+    join_path(second_payload, sizeof(second_payload), payload_root, second_leaf);
+    SidecarLog live_log = {0};
+    int adopted = sidecar_log_adopt_at(container_fd, &live_log) ==
+                  SIDECAR_OPEN_RESUMABLE;
+    check(capture_result == 0 && live_count == 3 &&
+              file_equals(first_payload, "a") &&
+              file_equals(second_payload, "b") && adopted &&
+              live_entry_identity(&live_log, "CASE", first, first_leaf,
+                                  first_suffix) &&
+              live_entry_identity(&live_log, "CASE", second, second_leaf,
+                                  second_suffix) &&
+              sidecar_log_claim_count(&live_log) == 0,
+          "capture consumes the frozen leaves after the fingerprint override is cleared");
+    if (live_log.implementation != NULL &&
+        sidecar_log_close(&live_log) != SIDECAR_STATUS_OK)
+        fixture_fatal("could not close prepared-shortening sidecar");
+    portable_prepared_capture_free(&prepared);
+    close(container_fd);
+    remove_tree(source_path);
+    remove_tree(container_path);
 }
 
 static void test_raw_component_unsigned_tiebreak(const char *base)
@@ -1503,6 +1668,39 @@ static void test_shortened_ancestor_keeps_descendant_identity(const char *base)
               strcmp(lower_entry->physical_path, expected_lower_path) == 0,
           "only the compatibility path inherits the shortened ancestor spelling");
 
+    portable_prescan_report_free(&report);
+    portable_prescan_report_init(&report);
+    int capture_result = portable_capture_fresh_at(container_fd, &request,
+                                                   &report);
+    int data_fd = openat(container_fd, "data/CASE",
+                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    int parent_fd = data_fd < 0
+        ? -1
+        : openat(data_fd, mapped_parent.physical_leaf,
+                 O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    struct stat st;
+    int children_present = parent_fd >= 0 &&
+        fstatat(parent_fd, "A", &st, AT_SYMLINK_NOFOLLOW) == 0 &&
+        fstatat(parent_fd, "a%7E1", &st, AT_SYMLINK_NOFOLLOW) == 0;
+    SidecarLog live_log = {0};
+    int adopted = sidecar_log_adopt_at(container_fd, &live_log) ==
+                  SIDECAR_OPEN_RESUMABLE;
+    check(capture_result == 0 && report.unresolved_count == 0 &&
+              children_present && adopted &&
+              live_entry_identity(&live_log, "CASE", parent,
+                                  mapped_parent.physical_leaf, "") &&
+              live_entry_identity(&live_log, "CASE", upper_logical, "A", "") &&
+              live_entry_identity(&live_log, "CASE", lower_logical,
+                                  "a%7E1", "%7E1") &&
+              sidecar_log_claim_count(&live_log) == 0,
+          "shortened ancestor capture addresses descendants relative to its canonical leaf");
+    if (parent_fd >= 0)
+        close(parent_fd);
+    if (data_fd >= 0)
+        close(data_fd);
+    if (live_log.implementation != NULL &&
+        sidecar_log_close(&live_log) != SIDECAR_STATUS_OK)
+        fixture_fatal("could not close shortened-ancestor sidecar");
     portable_prescan_report_free(&report);
     close(container_fd);
     remove_tree(source_path);
@@ -1814,6 +2012,48 @@ static void test_capture_source_plan_mismatch(const char *base)
         write_file(added, "x", 1);
         check(portable_capture_root(&context, &root) != 0,
               "a new case twin absent from the plan aborts capture");
+    }
+    portable_prescan_report_free(&report);
+    close_live_capture(container_fd, &log, &context);
+    remove_tree(source_path);
+    remove_tree(container_path);
+
+    join_path(source_path, sizeof(source_path), base,
+              "shortening-mismatch-add");
+    join_path(container_path, sizeof(container_path), base,
+              "shortening-mismatch-add-container");
+    static const char *const ordinary[] = { "plain" };
+    prepared = prepare_collision_plan_capture(
+        source_path, container_path, ordinary,
+        sizeof(ordinary) / sizeof(ordinary[0]), &container_fd, &log,
+        &context, &root, &report);
+    check(prepared == 0 && report.collision_plan.count == 0,
+          "an ordinary source has no shortening assignment before mutation");
+    if (prepared == 0) {
+        char added_name[NAME_MAX + 1U];
+        memset(added_name, ':', 100U);
+        added_name[100] = '\0';
+        PortablePhysicalName mapped;
+        int mapped_ok = portable_physical_name_map(added_name, 0, &mapped) == 0 &&
+                        mapped.shortened;
+        char added[PATH_MAX];
+        join_path(added, sizeof(added), source_path, added_name);
+        write_file(added, "x", 1);
+        int capture_result = portable_capture_root(&context, &root);
+        int root_fd = openat(context.data_fd, "CASE",
+                             O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        int shortened_absent = 0;
+        if (root_fd < 0) {
+            shortened_absent = errno == ENOENT;
+        } else {
+            struct stat st;
+            shortened_absent = fstatat(root_fd, mapped.physical_leaf, &st,
+                                       AT_SYMLINK_NOFOLLOW) != 0 &&
+                               errno == ENOENT;
+            close(root_fd);
+        }
+        check(mapped_ok && capture_result != 0 && shortened_absent,
+              "a newly-shortened source child absent from the frozen plan aborts without fallback");
     }
     portable_prescan_report_free(&report);
     close_live_capture(container_fd, &log, &context);
@@ -2804,10 +3044,26 @@ static void test_name_and_path_limits(const char *base)
     portable_prescan_report_free(&report);
 
     portable_prescan_report_init(&report);
-    check(portable_capture_fresh_at(container_fd, &request, &report) != 0 &&
-              report.shortening_count == 1 && report.unresolved_count == 0 &&
-              empty_capture_container(container_fd),
-          "live NAME_MAX shortening remains gated before Phase-4 capture changes");
+    int capture_result = portable_capture_fresh_at(container_fd, &request,
+                                                   &report);
+    char payload_root[PATH_MAX];
+    char shortened_payload[PATH_MAX];
+    join_path(payload_root, sizeof(payload_root), container_path, "data/NAMES");
+    join_path(shortened_payload, sizeof(shortened_payload), payload_root,
+              shortened.physical_leaf);
+    SidecarLog live_log = {0};
+    int adopted = sidecar_log_adopt_at(container_fd, &live_log) ==
+                  SIDECAR_OPEN_RESUMABLE;
+    check(capture_result == 0 && report.shortening_count == 1 &&
+              report.unresolved_count == 0 &&
+              file_equals(shortened_payload, "x") && adopted &&
+              live_entry_identity(&live_log, "NAMES", oversized_name,
+                                  shortened.physical_leaf, "") &&
+              sidecar_log_claim_count(&live_log) == 0,
+          "live NAME_MAX shortening captures under the canonical physical leaf");
+    if (live_log.implementation != NULL &&
+        sidecar_log_close(&live_log) != SIDECAR_STATUS_OK)
+        fixture_fatal("could not close NAME_MAX sidecar");
     portable_prescan_report_free(&report);
     close(container_fd);
     remove_tree(source_path);
@@ -4704,6 +4960,7 @@ int main(void)
     test_mixed_prescan_violations(root_path);
     test_collision_plan_suffix_length_violation(root_path);
     test_shortened_candidate_collision_determinism(root_path);
+    test_prepared_shortening_plan_authority(root_path);
     test_raw_component_unsigned_tiebreak(root_path);
     test_shortened_suffix_reserves_natural_candidate(root_path);
     test_shortened_ancestor_keeps_descendant_identity(root_path);

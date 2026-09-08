@@ -40,13 +40,14 @@
 
 #include "manifest.h"
 #include "portable.h"
+#include "portable_name.h"
 #include "sidecar.h"
 
 extern int entries_equal(const SidecarEntry *current,
                          const SidecarLiveView *previous,
                          const PortableXattrs *xattrs);
 extern int entry_from_stat(const char *root_id, const char *logical,
-                           const char *physical,
+                           const char *physical_leaf,
                            const char *collision_suffix,
                            const struct stat *st, int nsec_exact,
                            PortableXattrs *xattrs, SidecarEntry *out,
@@ -177,6 +178,40 @@ static int symlink_equals(const char *path, const char *expected)
            memcmp(target, expected, expected_length) == 0;
 }
 
+static int directory_entry_count(const char *path, size_t *count)
+{
+    if (path == NULL || count == NULL)
+        return -1;
+    DIR *directory = opendir(path);
+    if (directory == NULL)
+        return -1;
+    size_t entries = 0;
+    int failed = 0;
+    for (;;) {
+        errno = 0;
+        struct dirent *entry = readdir(directory);
+        if (entry == NULL) {
+            if (errno != 0)
+                failed = 1;
+            break;
+        }
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0)
+            continue;
+        if (entries == SIZE_MAX) {
+            failed = 1;
+            break;
+        }
+        entries++;
+    }
+    if (closedir(directory) != 0)
+        failed = 1;
+    if (failed)
+        return -1;
+    *count = entries;
+    return 0;
+}
+
 static PortableRootSpec root_spec(const char *id, const char *source,
                                   const char *payload)
 {
@@ -236,6 +271,13 @@ static int run_fresh_sidecar_interrupt(
 static int fresh_capture(const char *container_path,
                          const PortableCaptureRequest *request,
                          int *container_fd);
+static int live_leaf_matches(int container_fd, const char *root,
+                             const char *logical, const char *physical_leaf,
+                             const char *collision_suffix,
+                             SidecarObjectKind kind);
+static int claim_leaf_matches(int container_fd, const char *root,
+                              const char *logical, const char *physical_leaf,
+                              SidecarObjectKind kind);
 
 static void test_collision_suffix_resume_key(void)
 {
@@ -939,6 +981,66 @@ static void test_encoded_resume(const char *base)
     check(lstat(payload_path, &payload_after) == 0 &&
               payload_after.st_ino == payload_before.st_ino,
           "unchanged encoded payload is skipped in place");
+    close(container_fd);
+}
+
+static void test_shortened_resume_identity(const char *base)
+{
+    printf(BLUE "::" NC " resume skip for a shortened payload leaf\n");
+    char source_path[PATH_MAX];
+    char container_path[PATH_MAX];
+    join_path(source_path, sizeof(source_path), base,
+              "shortened-resume-source");
+    join_path(container_path, sizeof(container_path), base,
+              "shortened-resume-container");
+    make_directory(source_path);
+
+    char long_name[NAME_MAX + 1U];
+    memset(long_name, ':', 100U);
+    long_name[100] = '\0';
+    PortablePhysicalName mapped;
+    if (portable_physical_name_map(long_name, 0, &mapped) != 0 ||
+        !mapped.shortened)
+        fixture_fatal("could not map shortened resume fixture");
+    char source_file[PATH_MAX];
+    join_path(source_file, sizeof(source_file), source_path, long_name);
+    write_file(source_file, "shortened");
+
+    PortableRootSpec root = root_spec("SHORT", source_path, "SHORT");
+    PortableCaptureRequest request = request_for(&root, "a15");
+    int container_fd = -1;
+    check(fresh_capture(container_path, &request, &container_fd) == 0,
+          "shortened-name fixture is captured before resume");
+    if (container_fd < 0)
+        return;
+
+    char payload_root[PATH_MAX];
+    char payload_path[PATH_MAX];
+    join_path(payload_root, sizeof(payload_root), container_path, "data/SHORT");
+    join_path(payload_path, sizeof(payload_path), payload_root,
+              mapped.physical_leaf);
+    struct stat before;
+    check(lstat(payload_path, &before) == 0 &&
+              file_equals(payload_path, "shortened") &&
+              live_leaf_matches(container_fd, "SHORT", long_name,
+                                mapped.physical_leaf, "",
+                                SIDECAR_KIND_REGULAR) &&
+              resume_claim_state(container_fd, 2, 0, 2),
+          "fresh shortened entry records its canonical leaf with no outstanding claim");
+
+    check(portable_capture_resume_at(container_fd, &request, NULL) == 0,
+          "resume accepts an unchanged shortened source");
+    struct stat after;
+    size_t payload_entries = 0;
+    check(lstat(payload_path, &after) == 0 &&
+              after.st_ino == before.st_ino &&
+              directory_entry_count(payload_root, &payload_entries) == 0 &&
+              payload_entries == 1 &&
+              live_leaf_matches(container_fd, "SHORT", long_name,
+                                mapped.physical_leaf, "",
+                                SIDECAR_KIND_REGULAR) &&
+              resume_claim_state(container_fd, 2, 0, 3),
+          "unchanged shortened payload and leaf identity stay in place");
     close(container_fd);
 }
 
@@ -1708,6 +1810,45 @@ static int resume_bytes_match_text(SidecarBytes value, const char *text)
     return resume_bytes_equal(value, resume_bytes(text));
 }
 
+static int live_leaf_matches(int container_fd, const char *root,
+                             const char *logical, const char *physical_leaf,
+                             const char *collision_suffix,
+                             SidecarObjectKind kind)
+{
+    SidecarLog log = {0};
+    if (sidecar_log_adopt_at(container_fd, &log) != SIDECAR_OPEN_RESUMABLE)
+        return 0;
+    SidecarLiveView view = {0};
+    int result = sidecar_log_find(&log, resume_bytes(root),
+                                  resume_bytes(logical), &view) == 1 &&
+                 view.entry != NULL && view.entry->kind == kind &&
+                 resume_bytes_match_text(view.entry->physical_leaf,
+                                         physical_leaf) &&
+                 resume_bytes_match_text(view.entry->collision_suffix,
+                                         collision_suffix);
+    if (sidecar_log_close(&log) != SIDECAR_STATUS_OK)
+        result = 0;
+    return result;
+}
+
+static int claim_leaf_matches(int container_fd, const char *root,
+                              const char *logical, const char *physical_leaf,
+                              SidecarObjectKind kind)
+{
+    SidecarLog log = {0};
+    if (sidecar_log_adopt_at(container_fd, &log) != SIDECAR_OPEN_RESUMABLE)
+        return 0;
+    SidecarClaimView view = {0};
+    int result = sidecar_log_find_claim(&log, resume_bytes(root),
+                                        resume_bytes(logical), &view) == 1 &&
+                 view.claim != NULL && view.claim->kind == kind &&
+                 resume_bytes_match_text(view.claim->physical_leaf,
+                                         physical_leaf);
+    if (sidecar_log_close(&log) != SIDECAR_STATUS_OK)
+        result = 0;
+    return result;
+}
+
 static int hardlink_sigkill_recovered(const SigkillFixture *fixture)
 {
     char source_first[PATH_MAX];
@@ -2032,6 +2173,65 @@ static void test_fresh_regular_claim_resume(const char *base)
     close(container_fd);
 }
 
+static void test_shortened_regular_claim_resume(const char *base)
+{
+    printf(BLUE "::" NC " shortened regular CLAIM resume proof\n");
+    char source_path[PATH_MAX];
+    char container_path[PATH_MAX];
+    join_path(source_path, sizeof(source_path), base,
+              "shortened-claim-source");
+    join_path(container_path, sizeof(container_path), base,
+              "shortened-claim-container");
+    make_directory(source_path);
+
+    char long_name[NAME_MAX + 1U];
+    memset(long_name, ':', 100U);
+    long_name[100] = '\0';
+    PortablePhysicalName mapped;
+    if (portable_physical_name_map(long_name, 0, &mapped) != 0 ||
+        !mapped.shortened)
+        fixture_fatal("could not map shortened CLAIM fixture");
+    char source_file[PATH_MAX];
+    join_path(source_file, sizeof(source_file), source_path, long_name);
+    write_file(source_file, "shortened-claim");
+
+    PortableRootSpec root = root_spec("SHORT_REG", source_path, "SHORT_REG");
+    PortableCaptureRequest request = request_for(&root, "f1235");
+    int container_fd = create_container(container_path);
+    check(container_fd >= 0,
+          "shortened regular fixture has an empty container");
+    if (container_fd < 0)
+        return;
+
+    check(run_fresh_interrupt(container_fd, &request,
+                              PORTABLE_TEST_AFTER_PAYLOAD_REPLACE) == 0,
+          "shortened regular capture is killed after its claimed payload is created");
+    char payload_root[PATH_MAX];
+    char payload_path[PATH_MAX];
+    join_path(payload_root, sizeof(payload_root), container_path,
+              "data/SHORT_REG");
+    join_path(payload_path, sizeof(payload_path), payload_root,
+              mapped.physical_leaf);
+    check(payload_regular_size(payload_root, mapped.physical_leaf, 0) &&
+              claim_leaf_matches(container_fd, "SHORT_REG", long_name,
+                                 mapped.physical_leaf,
+                                 SIDECAR_KIND_REGULAR) &&
+              resume_claim_state(container_fd, 0, 2, 2),
+          "interrupted shortened regular records the exact planned leaf in its CLAIM");
+
+    portable_capture_test_set_interrupt(PORTABLE_TEST_INTERRUPT_NONE);
+    sidecar_test_set_interrupt(SIDECAR_TEST_INTERRUPT_NONE);
+    check(portable_capture_resume_at(container_fd, &request, NULL) == 0,
+          "shortened regular capture resumes from its matching CLAIM");
+    check(file_equals(payload_path, "shortened-claim") &&
+              live_leaf_matches(container_fd, "SHORT_REG", long_name,
+                                mapped.physical_leaf, "",
+                                SIDECAR_KIND_REGULAR) &&
+              resume_claim_state(container_fd, 2, 0, 2),
+          "shortened regular resume commits under the same leaf and consumes the CLAIM once");
+    close(container_fd);
+}
+
 static void test_special_kind_change_claim_resume(const char *base)
 {
     printf(BLUE "::" NC " special-file kind-change CLAIM resume proof\n");
@@ -2329,6 +2529,90 @@ static void test_fresh_directory_case(const char *base, const char *label,
               resume_claim_state(container_fd, nested ? 3 : 1, 0,
                                  expected_claims),
           recovery_label);
+    close(container_fd);
+}
+
+static void test_shortened_directory_claim_resume(const char *base)
+{
+    printf(BLUE "::" NC " shortened directory ancestry CLAIM resume proof\n");
+    char source_path[PATH_MAX];
+    char container_path[PATH_MAX];
+    join_path(source_path, sizeof(source_path), base,
+              "shortened-directory-source");
+    join_path(container_path, sizeof(container_path), base,
+              "shortened-directory-container");
+    make_directory(source_path);
+
+    char long_name[NAME_MAX + 1U];
+    memset(long_name, ':', 100U);
+    long_name[100] = '\0';
+    PortablePhysicalName mapped;
+    if (portable_physical_name_map(long_name, 0, &mapped) != 0 ||
+        !mapped.shortened)
+        fixture_fatal("could not map shortened directory fixture");
+    char long_dir[PATH_MAX];
+    char source_file[PATH_MAX];
+    join_path(long_dir, sizeof(long_dir), source_path, long_name);
+    make_directory(long_dir);
+    join_path(source_file, sizeof(source_file), long_dir, "file");
+    write_file(source_file, "nested-shortened");
+
+    PortableRootSpec root = root_spec("SHORT_DIR", source_path, "SHORT_DIR");
+    PortableCaptureRequest request = request_for(&root, "f1265");
+    int container_fd = create_container(container_path);
+    check(container_fd >= 0,
+          "shortened directory fixture has an empty container");
+    if (container_fd < 0)
+        return;
+
+    check(run_fresh_sidecar_interrupt(container_fd, &request,
+                                      PORTABLE_TEST_INTERRUPT_NONE,
+                                      SIDECAR_TEST_BEFORE_ENTRY) == 0,
+          "shortened directory capture is killed with its ancestry CLAIM chain durable");
+    check(claim_leaf_matches(container_fd, "SHORT_DIR", long_name,
+                             mapped.physical_leaf, SIDECAR_KIND_DIRECTORY) &&
+              resume_claim_state(container_fd, 0, 3, 3),
+          "interrupted shortened directory CLAIM keeps its canonical physical leaf");
+
+    portable_capture_test_set_interrupt(PORTABLE_TEST_INTERRUPT_NONE);
+    sidecar_test_set_interrupt(SIDECAR_TEST_INTERRUPT_NONE);
+    check(portable_capture_resume_at(container_fd, &request, NULL) == 0,
+          "shortened directory ancestry resumes from its CLAIM chain");
+
+    int data_fd = openat(container_fd, "data/SHORT_DIR",
+                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    int directory_fd = data_fd < 0
+        ? -1
+        : openat(data_fd, mapped.physical_leaf,
+                 O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    int file_fd = directory_fd < 0
+        ? -1
+        : openat(directory_fd, "file", O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    char buffer[32] = {0};
+    ssize_t received = file_fd < 0 ? -1 : read(file_fd, buffer,
+                                               sizeof(buffer) - 1U);
+    int payload_ok = received == (ssize_t)strlen("nested-shortened") &&
+                     memcmp(buffer, "nested-shortened",
+                            strlen("nested-shortened")) == 0;
+    if (file_fd >= 0)
+        close(file_fd);
+    if (directory_fd >= 0)
+        close(directory_fd);
+    if (data_fd >= 0)
+        close(data_fd);
+
+    char child_logical[SIDECAR_MAX_PATH + 1U];
+    int child_length = snprintf(child_logical, sizeof(child_logical),
+                                "%s/file", long_name);
+    check(payload_ok && child_length >= 0 &&
+              (size_t)child_length < sizeof(child_logical) &&
+              live_leaf_matches(container_fd, "SHORT_DIR", long_name,
+                                mapped.physical_leaf, "",
+                                SIDECAR_KIND_DIRECTORY) &&
+              live_leaf_matches(container_fd, "SHORT_DIR", child_logical,
+                                "file", "", SIDECAR_KIND_REGULAR) &&
+              resume_claim_state(container_fd, 3, 0, 3),
+          "shortened directory resume reopens the parent by leaf and addresses the child relative to it");
     close(container_fd);
 }
 
@@ -2863,6 +3147,7 @@ int main(void)
     test_resume_skips_and_replaces(base);
     test_resume_xattr_equivalence(base);
     test_encoded_resume(base);
+    test_shortened_resume_identity(base);
     test_symlink_resume(base);
     test_missing_sidecar(base);
     test_nonempty_without_sidecar(base);
@@ -2872,11 +3157,13 @@ int main(void)
     test_claim_kind_changes(base);
     test_repeated_claim_kind_change_interrupt(base);
     test_fresh_regular_claim_resume(base);
+    test_shortened_regular_claim_resume(base);
     test_special_kind_change_claim_resume(base);
     test_fresh_symlink_claim_resume(base);
     test_fresh_hardlink_claim_resume(base);
     test_fresh_directory_case(base, "fresh-directory-empty", 0);
     test_fresh_directory_case(base, "fresh-directory-nested", 1);
+    test_shortened_directory_claim_resume(base);
     test_repeated_fresh_claim_resume(base);
     test_foreign_destination_claim_refusal(base);
     test_sigkill_boundaries(base);
