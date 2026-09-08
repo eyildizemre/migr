@@ -33,6 +33,7 @@ VALGRIND_TESTS = \
 	tests/test_fsprobe \
 	tests/test_manifest \
 	tests/test_encoding \
+	tests/test_portable_name \
 	tests/test_container \
 	tests/test_selfcopy \
 	tests/test_sidecar \
@@ -62,7 +63,7 @@ VALGRIND_TESTS = \
 TARGET = migr
 STATIC_TARGET = migr-static
 VPATH = src
-SRCS = selection_match.c selection.c config.c main.c detect.c report.c backup.c backup_plan.c packages.c restore.c utils.c selfcopy.c fileops.c fsprobe.c xdg.c manifest.c encoding.c container.c metadata.c metadata_xattr.c portable_hashset.c portable_prescan.c portable_fsops.c portable.c portable_reconcile.c portable_restore_replay.c portable_restore_shared.c portable_restore_orchestrate.c portable_restore_preflight.c sidecar.c sidecar_state.c sidecar_state_map.c hash.c
+SRCS = selection_match.c selection.c config.c main.c detect.c report.c backup.c backup_plan.c packages.c restore.c utils.c selfcopy.c fileops.c fsprobe.c xdg.c manifest.c encoding.c portable_name.c container.c metadata.c metadata_xattr.c portable_hashset.c portable_prescan.c portable_fsops.c portable.c portable_reconcile.c portable_restore_replay.c portable_restore_shared.c portable_restore_orchestrate.c portable_restore_preflight.c sidecar.c sidecar_state.c sidecar_state_map.c hash.c
 OBJS = $(SRCS:.c=.o)
 STATIC_OBJS = $(SRCS:.c=_static.o)
 ANALYZER_SRCS = $(wildcard src/*.c)
@@ -105,6 +106,7 @@ TEST_SPECIAL_FILES = tests/test_special_files
 TEST_FSPROBE = tests/test_fsprobe
 TEST_MANIFEST = tests/test_manifest
 TEST_ENCODING = tests/test_encoding
+TEST_PORTABLE_NAME = tests/test_portable_name
 TEST_CONTAINER = tests/test_container
 TEST_SELFCOPY = tests/test_selfcopy
 TEST_RESTORE_NATIVE = tests/test_restore_native
@@ -198,6 +200,14 @@ $(TEST_MANIFEST): tests/test_manifest.c manifest.o encoding.o utils.o
 
 $(TEST_ENCODING): tests/test_encoding.c encoding.o
 	$(CC) $(CFLAGS) -o $@ tests/test_encoding.c encoding.o
+
+portable_name.o portable_name_static.o portable_name_test.o: src/portable_name.h src/encoding.h src/hash.h src/sidecar.h
+
+portable_name_test.o: src/portable_name.c src/portable_name.h src/encoding.h src/hash.h src/sidecar.h
+	$(CC) $(CFLAGS) -DPORTABLE_NAME_TEST_HOOKS -c src/portable_name.c -o $@
+
+$(TEST_PORTABLE_NAME): tests/test_portable_name.c portable_name_test.o encoding.o hash.o
+	$(CC) $(CFLAGS) -DPORTABLE_NAME_TEST_HOOKS -o $@ tests/test_portable_name.c portable_name_test.o encoding.o hash.o
 
 container_test.o: src/container.c src/container.h
 	$(CC) $(CFLAGS) -DCONTAINER_TEST_HOOKS -c src/container.c -o $@
@@ -331,7 +341,7 @@ $(TEST_PORTABLE_RESTORE_ORCHESTRATE): tests/test_portable_restore_orchestrate.c 
 $(TEST_PORTABLE_RESTORE_INVARIANT): tests/test_portable_restore_invariant.c portable_restore_replay_test.o portable_restore_preflight.o portable_restore_orchestrate.o portable_restore_shared.o fsprobe.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o manifest.o encoding.o metadata.o metadata_xattr.o utils.o xdg.o backup.o selfcopy.o backup_plan.o selection.o container.o fileops.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_hashset.o packages.o detect.o selection_match.o
 	$(CC) $(CFLAGS) -o $@ tests/test_portable_restore_invariant.c portable_restore_replay_test.o portable_restore_preflight.o portable_restore_orchestrate.o portable_restore_shared.o fsprobe.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o manifest.o encoding.o metadata.o metadata_xattr.o utils.o xdg.o backup.o selfcopy.o backup_plan.o selection.o container.o fileops.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_hashset.o packages.o detect.o selection_match.o
 
-test: $(TEST_NATIVE_SELECTION) $(TEST_MANIFEST_SELECTION) $(TEST_PORTABLE_SELECTION) $(TEST_SELECTION) $(TEST_CONFIG) $(TARGET) $(TEST_DETECT) $(TEST_REPORT) $(TEST_PATHJOIN) $(TEST_FD_LIMIT) $(TEST_CONFIRM) $(TEST_PACKAGES) $(TEST_XDG) $(TEST_GET_DIR_SIZE) $(TEST_RUN_COMMAND) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE) $(TEST_MANIFEST) $(TEST_ENCODING) $(TEST_CONTAINER) $(TEST_SELFCOPY) $(TEST_RESTORE_NATIVE) $(TEST_RESTORE_SYNC) $(TEST_RESTORE_SOURCE_READ) $(TEST_BACKUP_SOURCE_READ) $(TEST_BACKUP_SYNC) $(TEST_RESTORE_DISPATCH) $(TEST_RESTORE_ATIME) $(TEST_BACKUP_PLAN) $(TEST_METADATA_CONTRACT) $(TEST_METADATA_SNAPSHOTS) $(TEST_SIDECAR) $(TEST_SIDECAR_STATE) $(TEST_SIDECAR_SCALE) $(TEST_PORTABLE_HASHSET) $(TEST_PORTABLE_CAPTURE) $(TEST_PORTABLE_CAPTURE_SCALE) $(TEST_PORTABLE_PREPARE) $(TEST_NATIVE_RECONCILE_SCALE) $(TEST_NATIVE_HARDLINK_SCALE) $(TEST_PORTABLE_COLLISION_SCALE) $(TEST_PORTABLE_HARDLINK_SCALE) $(TEST_PORTABLE_RESUME) $(TEST_PORTABLE_RECONCILE) $(TEST_PORTABLE_RECONCILE_SCALE) $(TEST_PORTABLE_RESTORE_PREFLIGHT) $(TEST_PORTABLE_RESTORE_REPLAY) $(TEST_PORTABLE_RESTORE_ORCHESTRATE) $(TEST_PORTABLE_RESTORE_INVARIANT)
+test: $(TEST_NATIVE_SELECTION) $(TEST_MANIFEST_SELECTION) $(TEST_PORTABLE_SELECTION) $(TEST_SELECTION) $(TEST_CONFIG) $(TARGET) $(TEST_DETECT) $(TEST_REPORT) $(TEST_PATHJOIN) $(TEST_FD_LIMIT) $(TEST_CONFIRM) $(TEST_PACKAGES) $(TEST_XDG) $(TEST_GET_DIR_SIZE) $(TEST_RUN_COMMAND) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE) $(TEST_MANIFEST) $(TEST_ENCODING) $(TEST_PORTABLE_NAME) $(TEST_CONTAINER) $(TEST_SELFCOPY) $(TEST_RESTORE_NATIVE) $(TEST_RESTORE_SYNC) $(TEST_RESTORE_SOURCE_READ) $(TEST_BACKUP_SOURCE_READ) $(TEST_BACKUP_SYNC) $(TEST_RESTORE_DISPATCH) $(TEST_RESTORE_ATIME) $(TEST_BACKUP_PLAN) $(TEST_METADATA_CONTRACT) $(TEST_METADATA_SNAPSHOTS) $(TEST_SIDECAR) $(TEST_SIDECAR_STATE) $(TEST_SIDECAR_SCALE) $(TEST_PORTABLE_HASHSET) $(TEST_PORTABLE_CAPTURE) $(TEST_PORTABLE_CAPTURE_SCALE) $(TEST_PORTABLE_PREPARE) $(TEST_NATIVE_RECONCILE_SCALE) $(TEST_NATIVE_HARDLINK_SCALE) $(TEST_PORTABLE_COLLISION_SCALE) $(TEST_PORTABLE_HARDLINK_SCALE) $(TEST_PORTABLE_RESUME) $(TEST_PORTABLE_RECONCILE) $(TEST_PORTABLE_RECONCILE_SCALE) $(TEST_PORTABLE_RESTORE_PREFLIGHT) $(TEST_PORTABLE_RESTORE_REPLAY) $(TEST_PORTABLE_RESTORE_ORCHESTRATE) $(TEST_PORTABLE_RESTORE_INVARIANT)
 	./$(TEST_DETECT)
 	./$(TEST_MANIFEST_SELECTION)
 	./$(TEST_NATIVE_SELECTION)
@@ -350,6 +360,7 @@ test: $(TEST_NATIVE_SELECTION) $(TEST_MANIFEST_SELECTION) $(TEST_PORTABLE_SELECT
 	./$(TEST_FSPROBE)
 	./$(TEST_MANIFEST)
 	./$(TEST_ENCODING)
+	./$(TEST_PORTABLE_NAME)
 	./$(TEST_CONTAINER)
 	./$(TEST_SELFCOPY)
 	./$(TEST_RESTORE_NATIVE)
@@ -443,6 +454,6 @@ check:
 	$(MAKE) check-analyze
 
 clean:
-	rm -f ./*.o $(TARGET) $(STATIC_TARGET) $(TEST_NATIVE_SELECTION) $(TEST_MANIFEST_SELECTION) $(TEST_PORTABLE_SELECTION) $(TEST_SELECTION) $(TEST_CONFIG) $(TEST_DETECT) $(TEST_REPORT) $(TEST_PATHJOIN) $(TEST_FD_LIMIT) $(TEST_CONFIRM) $(TEST_PACKAGES) $(TEST_XDG) $(TEST_GET_DIR_SIZE) $(TEST_RUN_COMMAND) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE) $(TEST_MANIFEST) $(TEST_ENCODING) $(TEST_CONTAINER) $(TEST_SELFCOPY) $(TEST_RESTORE_NATIVE) $(TEST_RESTORE_SYNC) $(TEST_RESTORE_SOURCE_READ) $(TEST_BACKUP_SOURCE_READ) $(TEST_BACKUP_SYNC) $(TEST_RESTORE_DISPATCH) $(TEST_RESTORE_ATIME) $(TEST_BACKUP_PLAN) $(TEST_METADATA_CONTRACT) $(TEST_METADATA_SNAPSHOTS) $(TEST_SIDECAR) $(TEST_SIDECAR_STATE) $(TEST_SIDECAR_SCALE) $(TEST_PORTABLE_HASHSET) $(TEST_PORTABLE_CAPTURE) $(TEST_PORTABLE_CAPTURE_SCALE) $(TEST_PORTABLE_PREPARE) $(TEST_NATIVE_RECONCILE_SCALE) $(TEST_NATIVE_HARDLINK_SCALE) $(TEST_PORTABLE_COLLISION_SCALE) $(TEST_PORTABLE_HARDLINK_SCALE) $(TEST_PORTABLE_RESUME) $(TEST_PORTABLE_RECONCILE) $(TEST_PORTABLE_RECONCILE_SCALE) $(TEST_PORTABLE_RESTORE_PREFLIGHT) $(TEST_PORTABLE_RESTORE_REPLAY) $(TEST_PORTABLE_RESTORE_ORCHESTRATE) $(TEST_PORTABLE_RESTORE_INVARIANT)
+	rm -f ./*.o $(TARGET) $(STATIC_TARGET) $(TEST_NATIVE_SELECTION) $(TEST_MANIFEST_SELECTION) $(TEST_PORTABLE_SELECTION) $(TEST_SELECTION) $(TEST_CONFIG) $(TEST_DETECT) $(TEST_REPORT) $(TEST_PATHJOIN) $(TEST_FD_LIMIT) $(TEST_CONFIRM) $(TEST_PACKAGES) $(TEST_XDG) $(TEST_GET_DIR_SIZE) $(TEST_RUN_COMMAND) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE) $(TEST_MANIFEST) $(TEST_ENCODING) $(TEST_PORTABLE_NAME) $(TEST_CONTAINER) $(TEST_SELFCOPY) $(TEST_RESTORE_NATIVE) $(TEST_RESTORE_SYNC) $(TEST_RESTORE_SOURCE_READ) $(TEST_BACKUP_SOURCE_READ) $(TEST_BACKUP_SYNC) $(TEST_RESTORE_DISPATCH) $(TEST_RESTORE_ATIME) $(TEST_BACKUP_PLAN) $(TEST_METADATA_CONTRACT) $(TEST_METADATA_SNAPSHOTS) $(TEST_SIDECAR) $(TEST_SIDECAR_STATE) $(TEST_SIDECAR_SCALE) $(TEST_PORTABLE_HASHSET) $(TEST_PORTABLE_CAPTURE) $(TEST_PORTABLE_CAPTURE_SCALE) $(TEST_PORTABLE_PREPARE) $(TEST_NATIVE_RECONCILE_SCALE) $(TEST_NATIVE_HARDLINK_SCALE) $(TEST_PORTABLE_COLLISION_SCALE) $(TEST_PORTABLE_HARDLINK_SCALE) $(TEST_PORTABLE_RESUME) $(TEST_PORTABLE_RECONCILE) $(TEST_PORTABLE_RECONCILE_SCALE) $(TEST_PORTABLE_RESTORE_PREFLIGHT) $(TEST_PORTABLE_RESTORE_REPLAY) $(TEST_PORTABLE_RESTORE_ORCHESTRATE) $(TEST_PORTABLE_RESTORE_INVARIANT)
 
 .PHONY: clean test check-strict check-sanitize check-valgrind check-analyze check
