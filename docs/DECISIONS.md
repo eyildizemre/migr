@@ -3293,3 +3293,275 @@ the static binary.
 - This decision does not introduce privilege separation or partial elevation
   inside a running `migr` process; it only defines the identity and privilege
   semantics of an elevated invocation.
+
+---
+
+## D39 — 2026-09-08 — Portable representation shortens physical leaves losslessly and addresses them parent-relatively
+
+**Status:** Decided — not yet implemented
+
+**Decision:** Portable capture must not require a user to rename source entries
+merely because migr's encoded payload representation exceeds a destination naming
+limit. The logical path remains the source and restore identity. Physical payload
+names are an internal, lossless representation and may be shortened automatically
+when necessary. Restore always reconstructs the exact logical name from
+authenticated sidecar state; no source entry that migr can otherwise represent may
+be silently skipped.
+
+This decision treats the two existing refusal classes differently. `NAME_MAX` is a
+real per-component filesystem limit and is handled by deterministic physical-leaf
+shortening. Cumulative encoded `PATH_MAX` is a limit of the current whole-physical-
+path addressing model and is removed from portable representation by moving that
+model to parent-relative physical leaves. This does not expand migr's logical-path
+model: a source logical path that migr cannot represent under its existing bounded
+logical identity rules remains unsupported.
+
+### R-1 — Canonical physical-leaf mapping
+
+For each non-root logical component, capture first applies D19's existing
+`ENCODING_MODE_COMPONENT` percent-encoding. The final physical leaf is then a pure
+function of the original logical component bytes, the requested D21 collision
+suffix, and this versioned mapping rule:
+
+1. If `encoded_length + suffix_length <= NAME_MAX`, the physical leaf is the
+   existing `encoded + suffix` form unchanged.
+2. Otherwise, compute 64-bit FNV-1a over the original logical component bytes,
+   starting from the repository's `HASH_FNV1A_OFFSET_BASIS`. Render the result as
+   exactly 16 uppercase hexadecimal digits.
+3. Form a shortening marker as `%7EH` followed by those 16 digits. `%7E` keeps the
+   marker inside D19's portable encoded alphabet; `H` distinguishes the shortening
+   marker from D21's decimal collision suffix form.
+4. Retain the longest prefix of the encoded component for which
+   `prefix + shortening_marker + collision_suffix` fits `NAME_MAX`, then append the
+   marker and suffix. Prefix selection operates on encoder output units: it may not
+   split a `%XX` escape or a literal well-formed UTF-8 code point.
+
+The fingerprint is not an ownership or uniqueness proof. An ordinary encoded name,
+another shortened name, or a deliberately colliding fingerprint may produce the
+same unsuffixed candidate. D21's collision planner remains the only authority that
+assigns unique physical sibling names.
+
+The shortening function never uses process salt, random input, wall-clock state,
+filesystem enumeration order, inode numbers, or destination-specific hidden state.
+Given the same logical component and collision suffix under sidecar v4 semantics,
+it produces the same physical leaf on every invocation.
+
+### R-2 — Collision planning and suffix budgeting
+
+All sibling candidates, shortened or not, participate in one collision namespace.
+The deterministic allocation order is unsigned byte-wise order of the unsuffixed
+physical candidate, with unsigned byte-wise logical-component bytes as the
+tie-breaker. The tie-breaker is mandatory because two different logical names may
+intentionally be forced to the same shortened candidate in tests; `readdir()` order
+must never decide which sibling receives a preferred name.
+
+Destination measurement and reservation remain authoritative under D21. The
+allocator first tries the empty suffix and then canonical `%7E<N>` suffixes as
+before. For every suffix candidate, R-1 recomputes the leaf with that suffix already
+included in the byte budget. A suffix-induced `NAME_MAX` overflow therefore
+shortens the base further instead of failing solely because the suffix grew.
+
+Pre-scan remains mandatory. A `NAME_MAX` expansion that R-1 maps safely is a
+resolved representation transformation, not an unresolved violation. Resolved
+shortenings are counted separately from fatal pre-scan failures and do not require
+interactive confirmation. Exact user-facing summary wording is presentation, not
+wire semantics.
+
+### R-3 — Parent-relative physical identity
+
+Portable state must no longer persist or require a complete joined physical path
+for each entry. Below each manifest root's existing `payload_path` namespace, one
+entry's physical address is its immediate physical leaf under the physical parent
+corresponding to its immediate logical parent.
+
+For logical path `a/b/c`, the physical node for `c` is reached by resolving the
+logical parent chain (`a`, then `a/b`) and opening each recorded physical leaf
+relative to the already-open parent directory fd. Filesystem access remains
+fd-anchored and component-by-component. Correctness code must not reconstruct a
+complete physical pathname merely to open, reserve, compare, deduplicate, reconcile,
+or authenticate a payload node.
+
+The same rule applies to prescan and collision planning. A physical reservation is
+identified by its planned parent identity plus physical leaf, not by a concatenated
+physical-path string. Directory shortening or collision suffixing therefore changes
+that directory's leaf assignment without requiring every descendant to carry a
+rewritten copy of the ancestor's physical path.
+
+The manifest-root payload namespace remains governed by D21 F-5 and is outside this
+leaf-shortening rule. D39 changes entry addressing below that anchor; it does not add
+root payload suffix allocation.
+
+### R-4 — Sidecar v4 wire boundary
+
+D39 advances `SIDECAR_VERSION` from 3 to 4. `MANIFEST_CURRENT_VERSION` does not
+change; the manifest's existing `sidecar_version` field records the new value.
+
+Version 4 replaces the v3 whole-path field with an immediate physical-leaf field.
+The fixed record order becomes:
+
+```text
+ENTRY:
+  tag, root_id, logical_path, physical_leaf, collision_suffix, object_kind,
+  mode, uid, gid,
+  atime_sec, atime_nsec, mtime_sec, mtime_nsec,
+  size, xattr_count, kind-specific fields
+
+CLAIM:
+  tag, root_id, logical_path, physical_leaf, object_kind
+```
+
+`XATTR`, `ENTRY_COMMIT`, and `DELETE` retain their existing grammar and ordering.
+Hardlink identity remains `(hardlink_root_id, hardlink_logical_path)` and therefore
+does not acquire a physical-path field.
+
+`physical_leaf` is the actual on-disk payload component and includes any D21
+collision suffix. `ENTRY.collision_suffix` remains a mandatory fixed-position field,
+including the empty value, so restore can authenticate R-1. `CLAIM` does not
+duplicate `collision_suffix`: as in v3, ownership proof records the exact physical
+node while the consuming entry carries the suffix needed for semantic validation.
+A claim and its consuming entry must match byte-for-byte on `root_id`,
+`logical_path`, `physical_leaf`, and `object_kind`.
+
+The root entry keeps the existing empty-address convention: an empty logical path
+has an empty physical leaf and empty collision suffix because its payload anchor is
+the manifest root. Every non-root payload-producing entry or claim has a non-empty
+physical leaf no longer than the portable component ceiling (`NAME_MAX`, 255 bytes
+in the current contract). `SIDECAR_MAX_PATH` continues to bound logical paths and
+other logical path fields; it no longer describes a persisted physical path.
+
+No explicit parent id or parent physical field is added to the wire. The immediate
+logical parent is derived from `(root_id, logical_path)`. For every non-root live
+entry or outstanding claim, replayed/adopted state must provide an unambiguous
+address-bearing chain of logical ancestors back to the manifest root. Missing,
+ambiguous, or structurally incompatible parent state is corruption and fails closed.
+Cleanup and reconciliation must process state in an order that never commits removal
+of an ancestor's address while a surviving descendant still depends on it.
+
+There is no v3 compatibility layer. A v4 reader refuses completed v3 portable
+sidecars, and v3 partials are not adopted or resumed as v4. This is an intentional
+pre-release format replacement, matching the earlier v1 -> v2 -> v3 transitions.
+
+### R-5 — Restore authentication and untrusted state
+
+Version 4 restore does not trust `physical_leaf` merely because it is syntactically
+valid. For each non-root entry it:
+
+1. derives the logical leaf and immediate logical parent;
+2. validates the recorded collision suffix under D21's canonical suffix grammar;
+3. recomputes R-1 from the logical leaf and that suffix and requires byte-for-byte
+   equality with `physical_leaf`;
+4. resolves the physical parent through the validated logical-parent chain;
+5. rejects duplicate physical leaves under one physical parent and physical
+   ancestor/type conflicts before mutation.
+
+The parent-chain invariant replaces D21 F-3's whole-string prefix equality. The
+physical duplicate check remains defense-in-depth even though valid assignments are
+expected to be unique: percent-encoding alone is injective, but R-1 shortening is
+deliberately not. Uniqueness now follows from authenticated deterministic mapping
+plus the collision planner's sibling allocation contract, not from encoder
+injectivity by itself.
+
+Replay and preflight independently enforce the v4 mapping before destination
+mutation, preserving the existing separate-gate model. Destination names always
+come from the logical path; no decoder or physical-to-logical guess is introduced.
+
+### R-6 — Resume, claims, and reconciliation
+
+D25's write-ahead ownership model remains unchanged in purpose and durability
+ordering. The owned physical object is now identified parent-relatively by the
+claim's logical ancestry plus `physical_leaf`.
+
+Each invocation still recomputes the complete deterministic collision plan from the
+current source set. A changed shortened assignment, collision suffix, or ancestor
+leaf assignment is an explicit replacement, not an unchanged-entry skip. Outstanding
+claims never pin an obsolete plan. Stale live entries and claims are cleaned using
+their old validated parent/leaf chain, and stale physical nodes may not survive a
+successful finalization.
+
+The existing claim ordering remains mandatory: ownership is durably claimed before
+payload mutation; a completed matching `ENTRY` consumes the claim; cleanup removes
+the exact claimed payload node before `DELETE` cancels the claim. Successful capture
+still requires exact payload inventory and zero outstanding claims. Restore still
+refuses any outstanding claim.
+
+### R-7 — `PATH_MAX` boundary after v4
+
+For a logical source path that migr's existing logical-path model accepts, portable
+capture and restore must not fail merely because joining its encoded/shortened
+physical components beneath the payload root would reach `PATH_MAX`. No correctness
+or ownership operation may require such a joined string.
+
+This does not promise arbitrary source logical paths beyond migr's current bounded
+identity model. Logical paths, source addressing, restore addressing, manifest
+fields, symlink targets, diagnostics, and unrelated native paths retain their
+existing limits unless another decision changes them. D39 removes only the
+encoding-induced cumulative **physical payload path** wall described by D19 N-8.
+
+### Acceptance boundary
+
+Implementation is not complete until focused and integration tests prove, at
+minimum:
+
+- an ordinary encoded name that already fits remains byte-for-byte unchanged;
+- punctuation-heavy names whose encoded form exceeds `NAME_MAX` shorten and restore
+  to the exact original logical name;
+- shortening never cuts a UTF-8 code point or `%XX` escape;
+- candidate generation is identical across invocations and reversed/different
+  source enumeration order;
+- an injected identical fingerprint for different logical names remains lossless
+  through deterministic collision allocation;
+- ordinary case collision and shortening can coexist in one sibling set;
+- collision-suffix growth rebudgets the shortened base without overflowing
+  `NAME_MAX`;
+- a supported logical path whose cumulative physical representation would exceed
+  `PATH_MAX` captures, resumes, reconciles, and restores through parent-relative
+  addressing;
+- shortening or renumbering an ancestor cannot orphan, duplicate, or misaddress its
+  descendants;
+- interruption at D25 claim/mutation/commit boundaries remains recoverable when
+  shortened names and changed ancestor assignments are involved;
+- malformed v4 physical leaves, suffixes, missing parent chains, duplicate sibling
+  physical leaves, and physical ancestor/type conflicts are refused before restore
+  mutation;
+- v3 sidecars and v3 partials are explicitly refused by the v4-only portable
+  reader/resume path;
+- the existing plain browsable payload-tree property remains true.
+
+Before D39 is marked Implemented, the full host gate and the existing Arch/Ubuntu/Fedora VM matrix must pass.
+
+**Why:** D19's fail-closed refusal prevents silent data loss, but requiring manual
+renames turns a representation detail into user work and does not scale to real
+homes containing many long names. D21 already established the more useful
+principle: physical payload spelling may differ from logical identity when the
+mapping is deterministic, authenticated, reversible through sidecar state, and
+collision-safe. Extending that principle to overlong encoded names preserves D19's
+safety goal without sacrificing usability.
+
+Treating cumulative physical `PATH_MAX` as another leaf-shortening problem would
+solve the wrong layer. The low-level filesystem walkers are already largely
+fd-relative, while prescan, state, reconciliation, and restore still carry joined
+physical paths for algorithmic identity. Parent-relative sidecar and planning state
+removes that artificial whole-string dependency coherently instead of distributing
+path-budget heuristics across ancestors.
+
+**Rejected:** silently skipping unrepresentable entries; asking the user to rename
+or approve each physical shortening; truncation without a retained fingerprint;
+using the fingerprint as the sole uniqueness guarantee; salted, random, time-based,
+inode-based, or enumeration-order-dependent physical names; shortening arbitrary
+ancestors until a joined path happens to fit; retaining complete physical paths in
+v4 sidecar state while only changing the syscall helper; trusting a recorded
+physical leaf without recomputation; introducing a v3 compatibility shim during the
+pre-release format replacement; expanding this change into arbitrary over-`PATH_MAX`
+logical-source support.
+
+**Relationship:** Supersedes D19 N-2's default `NAME_MAX` refusal, N-3/N-4's
+whole-physical-path representation/binding, and N-8's encoded cumulative `PATH_MAX`
+refusal for logical paths already supported by migr. It preserves D19's encoding
+safe set, mandatory pre-scan, written-name verification, and fail-closed principle.
+It supersedes D21 F-2c/F-3/F-4/F-6 where they require a full `physical_path` or make
+suffix-induced overflow fatal, while preserving D21's canonical suffix grammar,
+deterministic complete-set planning, destination authority, resume replacement
+semantics, and source-change refusal. It advances D25's v3 claim field from
+`physical_path` to v4 `physical_leaf` without weakening write-ahead ownership or
+cleanup ordering. D17/D21/D25 remain the historical grammar records for sidecar
+versions 1, 2, and 3 respectively.
