@@ -143,20 +143,24 @@ static void service_tests(void)
     CHECK(setenv("HOME", home, 1) == 0);
     unsetenv("XDG_CONFIG_HOME");
     char *path = NULL;
-    CHECK(config_path(&path) == 0);
+    CHECK(config_path(home, &path) == 0);
     Config c = {0};
     CHECK(config_load(path, &c) == 0 && c.count == 0);
     CHECK(access(path, F_OK) < 0 && errno == ENOENT);
     char *fallback = strdup(path);
     free(path); path = NULL;
+    CHECK(setenv("HOME", "/tmp/ambient-home-must-not-select-config", 1) == 0);
+    CHECK(config_path(home, &path) == 0 && strcmp(path, fallback) == 0);
+    free(path); path = NULL;
+    CHECK(setenv("HOME", home, 1) == 0);
     setenv("XDG_CONFIG_HOME", "relative", 1);
-    CHECK(config_path(&path) == 0 && strcmp(path, fallback) == 0);
+    CHECK(config_path(home, &path) == 0 && strcmp(path, fallback) == 0);
     free(path); path = NULL;
     setenv("XDG_CONFIG_HOME", "", 1);
-    CHECK(config_path(&path) == 0 && strcmp(path, fallback) == 0);
+    CHECK(config_path(home, &path) == 0 && strcmp(path, fallback) == 0);
     free(path); path = NULL;
     setenv("XDG_CONFIG_HOME", home, 1);
-    CHECK(config_path(&path) == 0 && strcmp(path, fallback) != 0);
+    CHECK(config_path(home, &path) == 0 && strcmp(path, fallback) != 0);
     free(fallback);
     /* The test executable acts as an editor; inherited stdio needs no terminal. */
     char self[PATH_MAX];

@@ -368,10 +368,19 @@ static int check_network_config_readable(unsigned int *present_mask)
         if (saved_errno == ENOENT)
             continue;
 
-        print_error("Error: --include-network-config: cannot read %s backend at %s (%s). "
-                    "Root privileges are required to back up network configuration.\n",
-                    NETWORK_CONFIG_BACKENDS[i].name, source_dir,
-                    strerror(saved_errno));
+        if (saved_errno == EACCES || saved_errno == EPERM)
+        {
+            print_error("Error: --include-network-config: cannot read %s backend at %s (%s). "
+                        "Rerun the same migr command with sudo.\n",
+                        NETWORK_CONFIG_BACKENDS[i].name, source_dir,
+                        strerror(saved_errno));
+        }
+        else
+        {
+            print_error("Error: --include-network-config: cannot read %s backend at %s (%s).\n",
+                        NETWORK_CONFIG_BACKENDS[i].name, source_dir,
+                        strerror(saved_errno));
+        }
         errno = saved_errno;
         return -1;
     }
@@ -2846,12 +2855,9 @@ fail_pre_container:
 int backup(const char *target, BackupMode mode, char **paths, int include_self,
            int include_network_config)
 {
-    const char *home = getenv("HOME");
-    if (home == NULL)
-    {
-        print_error("Error: Could not get HOME directory.\n");
+    char home[PATH_MAX];
+    if (resolve_target_home(home) != 0)
         return 1;
-    }
 
     BackupPlan plan;
     if (backup_plan_build(home, mode, (const char *const *)paths, &plan) != 0)

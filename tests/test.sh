@@ -3,6 +3,9 @@
 # Halt on any error, fail on undefined variables, and catch pipeline failures
 set -euo pipefail
 
+# This suite owns its fixture HOME even when invoked through sudo.
+unset SUDO_UID
+
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 BLUE='\033[0;34m'
@@ -1268,15 +1271,11 @@ test_truncation() {
         exit 1
     fi
 
-    # A HOME whose canonical (realpath) form is short and valid, but whose raw
-    # lexical form is far past PATH_MAX (many "/a/.." segments that cancel out
-    # under resolution), must succeed exactly as the short canonical form
-    # would. Regression for backup.c resolving the legacy manifest's XDG
-    # basenames against the raw environment value instead of the same
-    # canonicalized HOME the planner already validated: that raw value could
-    # overflow PATH_MAX on its own even when the canonical form does not,
-    # failing only after the dated backup directory (and packages.txt) had
-    # already been created.
+    # Target-HOME resolution now has a fixed PATH_MAX output contract. Even if
+    # a lexically oversized HOME would canonicalize to a short path, it cannot
+    # be represented by that resolver and must fail before backup creates a
+    # container. This keeps the earlier no-partial-publication guarantee while
+    # enforcing the user-context boundary at one entry point.
     local canon_base="$TEST_DIR/canon_home" canon_raw
     local canon_state="$canon_base/.local/state"
     local canon_cache="$canon_base/.cache"
@@ -1288,29 +1287,24 @@ test_truncation() {
         canon_raw="$canon_raw/a/.."
     done
 
-    local canon_backup="$TEST_DIR/canon_backup"
+    local canon_backup="$TEST_DIR/canon_backup" canon_out canon_rc
     mkdir -p "$canon_backup"
-    local canon_out
-    # Keep the package manager's own state/cache/config paths canonical so this
-    # fixture measures migr's HOME normalization rather than an external tool's
-    # handling of the deliberately pathological lexical spelling.
+    set +e
     canon_out=$(env HOME="$canon_raw" \
                     XDG_STATE_HOME="$canon_state" \
                     XDG_CACHE_HOME="$canon_cache" \
                     XDG_CONFIG_HOME="$canon_config" \
                     ../migr backup "$canon_backup" --critical 2>&1)
-    assert_contains "$canon_out" "Backup complete"
+    canon_rc=$?
+    set -e
 
-    local canon_actual
-    canon_actual=$(sole_final_container "$canon_backup")
-    if [ -n "$canon_actual" ] &&
-       [ -f "$canon_actual/packages.txt" ] &&
-       grep -q "^ROOT ID=XDG_DOCUMENTS_DIR " "$canon_actual/manifest.txt" 2>/dev/null &&
-       [[ "$canon_out" != *"Error:"* ]]; then
-        echo -e "  ${GREEN}✓${NC} A canonically-short-but-lexically-long HOME backs up cleanly, packages and manifest included."
+    if [ "$canon_rc" -ne 0 ] &&
+       [[ "$canon_out" == *"HOME path too long"* ]] &&
+       ! find "$canon_backup" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+        echo -e "  ${GREEN}✓${NC} A lexically oversized HOME is refused before backup creates a container."
     else
-        echo -e "  ${RED}✗${NC} Expected a full backup+manifest even though raw \$HOME was lexically past PATH_MAX"
-        echo "  output: $canon_out"
+        echo -e "  ${RED}✗${NC} Expected oversized HOME to fail before container creation"
+        echo "  exit=$canon_rc output: $canon_out"
         exit 1
     fi
 }

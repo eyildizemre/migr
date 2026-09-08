@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "config.h"
 #include "fileops.h"
+#include "utils.h"
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -145,13 +146,13 @@ int config_parse(const char *data, size_t length, const char *source, Config *ou
     return 0;
 }
 
-int config_path(char **out)
+int config_path(const char *home, char **out)
 {
     const char *base = getenv("XDG_CONFIG_HOME");
     const char *suffix = "/migr/migr.conf";
     if (!base || base[0] != '/')
     {
-        base = getenv("HOME");
+        base = home;
         suffix = "/.config/migr/migr.conf";
     }
     if (!base || base[0] != '/' || strlen(base) + strlen(suffix) >= PATH_MAX)
@@ -337,8 +338,11 @@ static int editor_argv(char *text, char **argv, size_t capacity, const char *pat
 
 int config_edit(void)
 {
+    char home[PATH_MAX];
+    if (resolve_target_home(home) != 0) return -1;
+
     char *path = NULL;
-    if (config_path(&path) < 0) return -1;
+    if (config_path(home, &path) < 0) return -1;
     int result = -1;
     char resolved[PATH_MAX];
     struct stat st;

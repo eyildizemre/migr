@@ -16,6 +16,200 @@ int verbose = 0;
 int dry_run = 0;
 int color_enabled = 0;
 
+static int parse_uid_decimal(const char *text, uid_t *out)
+{
+    if (text == NULL || text[0] == '\0')
+        return -1;
+
+    uintmax_t value = 0;
+    for (const unsigned char *p = (const unsigned char *)text;
+         *p != '\0'; p++)
+    {
+        if (*p < '0' || *p > '9')
+            return -1;
+        unsigned int digit = (unsigned int)(*p - '0');
+        if (value > (UINTMAX_MAX - digit) / 10U)
+            return -1;
+        value = value * 10U + digit;
+    }
+
+    uid_t uid = (uid_t)value;
+    if ((uintmax_t)uid != value || uid == (uid_t)-1)
+        return -1;
+    *out = uid;
+    return 0;
+}
+
+static int resolve_sudo_home(uid_t target_uid, const char *passwd_path,
+                             char out[PATH_MAX])
+{
+    FILE *passwd = fopen(passwd_path, "r");
+    if (passwd == NULL)
+    {
+        print_error("Error: Could not read local passwd database: %s\n",
+                    strerror(errno));
+        return -1;
+    }
+
+    char *line = NULL;
+    size_t capacity = 0;
+    size_t matches = 0;
+    int matching_record_malformed = 0;
+    int matching_home_invalid = 0;
+    char resolved[PATH_MAX] = {0};
+    int read_error = 0;
+    int read_errno = 0;
+
+    for (;;)
+    {
+        errno = 0;
+        ssize_t length = getline(&line, &capacity, passwd);
+        if (length < 0)
+        {
+            if (!feof(passwd))
+            {
+                read_error = 1;
+                read_errno = errno != 0 ? errno : EIO;
+            }
+            break;
+        }
+        if (length > 0 && line[length - 1] == '\n')
+            line[--length] = '\0';
+
+        char *fields[7] = { line, NULL, NULL, NULL, NULL, NULL, NULL };
+        size_t colon_count = 0;
+        for (char *p = line; *p != '\0'; p++)
+        {
+            if (*p != ':')
+                continue;
+            *p = '\0';
+            if (colon_count < 6U)
+                fields[colon_count + 1U] = p + 1;
+            colon_count++;
+        }
+
+        if (colon_count < 2U)
+            continue;
+
+        uid_t record_uid;
+        if (parse_uid_decimal(fields[2], &record_uid) != 0 ||
+            record_uid != target_uid)
+            continue;
+
+        matches++;
+        if (colon_count != 6U)
+        {
+            matching_record_malformed = 1;
+            continue;
+        }
+
+        const char *home = fields[5];
+        if (home == NULL || home[0] != '/' ||
+            strnlen(home, PATH_MAX) >= PATH_MAX)
+        {
+            matching_home_invalid = 1;
+            continue;
+        }
+        memcpy(resolved, home, strlen(home) + 1U);
+    }
+
+    free(line);
+    if (fclose(passwd) != 0 && !read_error)
+    {
+        read_error = 1;
+        read_errno = errno != 0 ? errno : EIO;
+    }
+
+    if (read_error)
+    {
+        print_error("Error: Could not read local passwd database: %s\n",
+                    strerror(read_errno));
+        return -1;
+    }
+    if (matches == 0U)
+    {
+        print_error("Error: SUDO_UID does not match a local /etc/passwd entry.\n");
+        return -1;
+    }
+    if (matches > 1U)
+    {
+        print_error("Error: SUDO_UID matches multiple local /etc/passwd entries.\n");
+        return -1;
+    }
+    if (matching_record_malformed)
+    {
+        print_error("Error: Local passwd entry for SUDO_UID is malformed.\n");
+        return -1;
+    }
+    if (matching_home_invalid)
+    {
+        print_error("Error: Local passwd entry for SUDO_UID has an invalid home directory.\n");
+        return -1;
+    }
+
+    memcpy(out, resolved, strlen(resolved) + 1U);
+    return 0;
+}
+
+static int resolve_target_home_impl(const char *home_env,
+                                    const char *sudo_uid_env,
+                                    const char *passwd_path,
+                                    char out[PATH_MAX])
+{
+    if (out == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    out[0] = '\0';
+
+    if (sudo_uid_env == NULL)
+    {
+        if (home_env == NULL || home_env[0] == '\0')
+        {
+            print_error("Error: HOME is not set or is empty for this invocation.\n");
+            return -1;
+        }
+        size_t length = strnlen(home_env, PATH_MAX);
+        if (length >= PATH_MAX)
+        {
+            print_error("Error: HOME path too long to resolve user directories.\n");
+            return -1;
+        }
+        memcpy(out, home_env, length + 1U);
+        return 0;
+    }
+
+    uid_t target_uid;
+    if (parse_uid_decimal(sudo_uid_env, &target_uid) != 0)
+    {
+        print_error("Error: SUDO_UID is invalid; expected an unsigned local UID.\n");
+        return -1;
+    }
+    if (passwd_path == NULL || passwd_path[0] == '\0')
+    {
+        print_error("Error: Could not read local passwd database: invalid path.\n");
+        return -1;
+    }
+    return resolve_sudo_home(target_uid, passwd_path, out);
+}
+
+int resolve_target_home(char out[PATH_MAX])
+{
+    return resolve_target_home_impl(getenv("HOME"), getenv("SUDO_UID"),
+                                    "/etc/passwd", out);
+}
+
+#ifdef USER_CONTEXT_TEST_HOOKS
+int resolve_target_home_for_test(const char *home_env,
+                                 const char *sudo_uid_env,
+                                 const char *passwd_path,
+                                 char out[PATH_MAX])
+{
+    return resolve_target_home_impl(home_env, sudo_uid_env, passwd_path, out);
+}
+#endif
+
 static void print_status(const char *color, const char *fmt, va_list args)
 {
     if (color_enabled)

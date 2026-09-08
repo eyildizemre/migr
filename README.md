@@ -123,9 +123,13 @@ help                  Show help
 `migr conf` opens the persistent scope configuration in the first nonempty
 `EDITOR` or `VISUAL` (falling back to `vi`). The file is
 `$XDG_CONFIG_HOME/migr/migr.conf` when `XDG_CONFIG_HOME` is an absolute path;
-otherwise it is `$HOME/.config/migr/migr.conf`. On first use, `conf` creates a
-commented empty template. Ordinary `report` and scoped `backup` commands never
-create the file: a missing or empty config simply keeps the built-in selection.
+otherwise it is `<resolved-home>/.config/migr/migr.conf`. Under `sudo`, migr
+retains the sudo-invoking user's HOME context instead of
+silently switching to `/root`. An absolute `XDG_CONFIG_HOME` is still honored
+only when it is present in the effective sudo environment. On first use, `conf`
+creates a commented empty template. Ordinary `report` and scoped `backup`
+commands never create the file: a missing or empty config simply keeps the
+built-in selection.
 
 The config has `critical` and `comprehensive` include/exclude sections. Critical
 includes also apply to comprehensive; excludes apply only to their own scope,
@@ -283,10 +287,12 @@ the bundled binary matches the target machine's architecture.
 `--include-network-config` independently captures NetworkManager, netplan,
 systemd-networkd, wpa_supplicant, and netctl into backend directories under `network/`.
 Absent backends are silently skipped; an unreadable backend fails the backup
-(use root privileges where required). If none are found, backup succeeds with a
-note. NetworkManager, netplan, wpa_supplicant, and netctl files can expose WiFi
-passwords or PSKs in plain text. Networkd delegates WiFi authentication to other
-tools, but its files can contain other secrets, such as WireGuard private keys.
+(run normally, then rerun the same migr command with `sudo` if permissions refuse
+access). Ordinary backup and restore do not require root merely because migr
+supports this option. If none are found, backup succeeds with a note.
+NetworkManager, netplan, wpa_supplicant, and netctl files can expose WiFi passwords
+or PSKs in plain text. Networkd delegates WiFi authentication to other tools, but
+its files can contain other secrets, such as WireGuard private keys.
 Restore reloads NetworkManager profiles automatically with `nmcli connection reload`
 (best-effort; it only re-reads profiles). The other four backends are written but
 never auto-applied: applying them can interrupt connectivity, including an SSH

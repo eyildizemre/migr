@@ -235,9 +235,10 @@ cost of shipping both is a few hundred kilobytes.
 
 **Known caveats:**
 
-- Static glibc breaks NSS functions (`getpwnam`, `getpwuid`). Not currently an
-  issue — only `getenv("HOME")` is used. An NSS fallback would require building the
-  static binary with musl instead.
+- Static glibc breaks NSS functions (`getpwnam`, `getpwuid`). D38 therefore
+  resolves elevated local-user homes by parsing `/etc/passwd` directly, keeping
+  the dynamic and static binaries on the same NSS-independent path. Identities
+  available only through NSS backends remain unsupported by that mechanism.
 - FAT32 destinations record no Unix permission bits; they synthesise a mode from
   mount options. NTFS permission handling depends on the driver and mount options.
   Measured on Arch, Ubuntu 26.04 and Fedora 44 (2026-09-05, FAT32 loopback): a
@@ -2853,6 +2854,8 @@ there is no CWD search, system-file merging, or per-run `--conf` option. HOME an
 config lookup use the invocation's environment consistently. In particular, do not
 select another user's config from SUDO_USER while backup still selects the current
 HOME. Changed HOME/config variables under sudo select a different context.
+D38 supersedes this last elevated-context rule for invocations carrying
+`SUDO_UID`.
 
 `migr conf` takes no positional arguments or backup/report options. On first use it
 creates private missing directories (0700) and publishes a complete template file
@@ -3229,7 +3232,7 @@ consent before recording extension ids.
 
 ## D38 — 2026-09-08 — Elevated runs retain the invoking user's context
 
-**Status:** Decided — not yet implemented
+**Status:** Implemented
 
 **Decision:** `migr` remains a single-user migration tool. An ordinary invocation
 targets the current user's environment. When `migr` is run through `sudo`, it

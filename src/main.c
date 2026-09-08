@@ -42,24 +42,14 @@ static void action_lookup(const char *arg, Action *action)
 static int load_selection(BackupMode mode, SelectionPlan *selection,
                           int show_diagnostic)
 {
-    const char *home = getenv("HOME");
-    if (home == NULL)
-    {
-        print_error("Error: Could not get HOME directory.\n");
+    char home[PATH_MAX];
+    if (resolve_target_home(home) != 0)
         return -1;
-    }
-    const char *config_home = getenv("XDG_CONFIG_HOME");
-    if ((config_home == NULL || config_home[0] != '/') &&
-        strnlen(home, PATH_MAX) >= PATH_MAX)
-    {
-        print_error("Error: HOME path too long to resolve user directories\n");
-        return -1;
-    }
 
     char *path = NULL;
     Config config = {0};
     int result = -1;
-    if (config_path(&path) != 0 || config_load(path, &config) != 0)
+    if (config_path(home, &path) != 0 || config_load(path, &config) != 0)
         goto done;
 
     if (show_diagnostic)

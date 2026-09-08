@@ -2256,12 +2256,9 @@ static void restore_v1(const char *source, int source_root_fd,
 
 int restore(const char *source)
 {
-    char *home = getenv("HOME");
-    if (home == NULL)
-    {
-        print_error("Error: Could not get HOME directory.\n");
+    char home[PATH_MAX];
+    if (resolve_target_home(home) != 0)
         return 1;
-    }
 
     struct stat st;
     if (stat(source, &st) != 0 || !S_ISDIR(st.st_mode))

@@ -11,6 +11,22 @@ extern int verbose; /**< Non-zero when -v is passed; enables per-file progress o
 extern int dry_run; /**< Non-zero when -n/--dry-run is passed; suppresses all writes. */
 extern int color_enabled; /**< Non-zero when status colors are enabled for stderr. */
 
+/**
+ * @brief Resolves the HOME of the user whose data this invocation targets.
+ *
+ * Ordinary runs use HOME. When SUDO_UID is present, the invoking user's local
+ * passwd entry is resolved directly so sudo cannot silently redirect the
+ * migration to root's home (docs/DECISIONS.md D38).
+ */
+int resolve_target_home(char out[PATH_MAX]);
+
+#ifdef USER_CONTEXT_TEST_HOOKS
+int resolve_target_home_for_test(const char *home_env,
+                                 const char *sudo_uid_env,
+                                 const char *passwd_path,
+                                 char out[PATH_MAX]);
+#endif
+
 /** @brief Prints a complete error message, optionally in bold red. */
 void print_error(const char *fmt, ...);
 

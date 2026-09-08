@@ -26,8 +26,8 @@ typedef struct {
 int config_parse(const char *data, size_t length, const char *source, Config *out);
 int config_load(const char *path, Config *out);
 void config_free(Config *config);
-/* Allocates an absolute path using the invocation's HOME/XDG environment. */
-int config_path(char **out);
+/* Allocates an absolute path using XDG_CONFIG_HOME or the supplied target HOME. */
+int config_path(const char *home, char **out);
 /* Creates only a missing template, runs the chosen editor, then validates. */
 int config_edit(void);
 

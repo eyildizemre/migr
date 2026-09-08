@@ -1,6 +1,10 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -g -I src -pthread
 
+# Test fixtures set HOME explicitly; a sudo-inherited caller UID must not
+# redirect them into the invoking user's real account.
+unexport SUDO_UID
+
 CHECK_STRICT_FLAGS = $(CFLAGS) -Wpedantic -Werror
 CHECK_SANITIZE_FLAGS = $(CHECK_STRICT_FLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer
 ANALYZER_CC = gcc
@@ -162,8 +166,11 @@ $(TEST_PATHJOIN): tests/test_pathjoin.c utils.o
 $(TEST_FD_LIMIT): tests/test_fd_limit.c utils.o
 	$(CC) $(CFLAGS) -o $@ tests/test_fd_limit.c utils.o
 
-$(TEST_CONFIRM): tests/test_confirm.c utils.o
-	$(CC) $(CFLAGS) -o $@ tests/test_confirm.c utils.o
+utils_test.o: src/utils.c src/utils.h
+	$(CC) $(CFLAGS) -DUSER_CONTEXT_TEST_HOOKS -c src/utils.c -o $@
+
+$(TEST_CONFIRM): tests/test_confirm.c utils_test.o
+	$(CC) $(CFLAGS) -DUSER_CONTEXT_TEST_HOOKS -o $@ tests/test_confirm.c utils_test.o
 
 $(TEST_PACKAGES): tests/test_packages.c packages.o fileops.o detect.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o manifest.o encoding.o utils.o selection_match.o selection.o backup_plan.o xdg.o
 	$(CC) $(CFLAGS) -Wl,--wrap=malloc -o $@ tests/test_packages.c packages.o fileops.o detect.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o manifest.o encoding.o utils.o selection_match.o selection.o backup_plan.o xdg.o

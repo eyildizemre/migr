@@ -408,12 +408,9 @@ static int report_plan(const char *home, const BackupPlan *plan,
 
 int report(BackupMode mode, int summary, ReportDepth depth)
 {
-    const char *home = getenv("HOME");
-    if (home == NULL)
-    {
-        print_error("Error: Could not get HOME directory.\n");
+    char home[PATH_MAX];
+    if (resolve_target_home(home) != 0)
         return 1;
-    }
 
     BackupPlan plan;
     if (backup_plan_build(home, mode, NULL, &plan) != 0) return 1;

@@ -2520,12 +2520,40 @@ static void test_include_network_config_backup(void)
         check(denied_rc == 1 && directory_empty(denied_target),
               "an unreadable backend still refuses when the other backends are absent");
         check(strstr(denied_output, "NetworkManager") != NULL &&
-                  strstr(denied_output, "Root privileges are required") != NULL,
-              "the permission refusal names the backend and required privilege");
+                  strstr(denied_output, "same migr command with sudo") != NULL,
+              "the permission refusal names the backend and gives the sudo retry");
         chmod(denied_source, 0700);
         remove_tree(denied_source);
         remove_tree(denied_target);
     }
+
+    char not_directory[PATH_MAX], not_directory_source[PATH_MAX];
+    join_path(not_directory, sizeof(not_directory), home,
+              "network-backend-not-directory");
+    write_file(not_directory, "not a directory\n");
+    join_path(not_directory_source, sizeof(not_directory_source),
+              not_directory, "backend");
+    backup_test_set_network_config_source_dir("NetworkManager",
+                                              not_directory_source);
+    backup_test_set_network_config_source_dir("netplan", missing_netplan);
+    backup_test_set_network_config_source_dir("systemd-networkd",
+                                              missing_networkd);
+    char operational_target[PATH_MAX];
+    fresh_mkdtemp(operational_target, sizeof(operational_target),
+                  "plan_network_operational_target");
+    char operational_output[8192];
+    int operational_rc = run_backup_capturing_with_options(
+        operational_target, BACKUP_EXPLICIT_PATHS, paths, 0, 1,
+        operational_output, sizeof(operational_output));
+    check(operational_rc == 1 && directory_empty(operational_target),
+          "a non-permission backend probe failure still refuses before capture");
+    check(strstr(operational_output, "NetworkManager") != NULL &&
+              strstr(operational_output, "cannot read") != NULL &&
+              strstr(operational_output, "sudo") == NULL &&
+              strstr(operational_output, "Root privileges") == NULL,
+          "a non-permission backend failure does not claim sudo is the remedy");
+    unlink(not_directory);
+    remove_tree(operational_target);
 
     if (geteuid() != 0)
     {

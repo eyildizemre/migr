@@ -1,4 +1,6 @@
 #include <errno.h>
+#include <fcntl.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -91,6 +93,235 @@ static int run_confirm(const char *input, int default_yes,
     return result;
 }
 
+#ifdef USER_CONTEXT_TEST_HOOKS
+static void write_fixture(const char *path, const char *contents)
+{
+    int fd = open(path, O_WRONLY | O_TRUNC);
+    if (fd < 0)
+    {
+        perror("open passwd fixture");
+        exit(1);
+    }
+    size_t length = strlen(contents);
+    if (write(fd, contents, length) != (ssize_t)length)
+    {
+        perror("write passwd fixture");
+        close(fd);
+        exit(1);
+    }
+    if (close(fd) != 0)
+    {
+        perror("close passwd fixture");
+        exit(1);
+    }
+}
+
+static int run_target_home(const char *home_env, const char *sudo_uid_env,
+                           const char *passwd_path, char home[PATH_MAX],
+                           char *diagnostic, size_t diagnostic_size)
+{
+    int output_pipe[2];
+    if (pipe(output_pipe) != 0)
+    {
+        perror("pipe");
+        exit(1);
+    }
+
+    fflush(stderr);
+    int saved_stderr = dup(STDERR_FILENO);
+    if (saved_stderr < 0 ||
+        dup2(output_pipe[1], STDERR_FILENO) < 0)
+    {
+        perror("dup2 stderr");
+        exit(1);
+    }
+    close(output_pipe[1]);
+
+    int result = resolve_target_home_for_test(home_env, sudo_uid_env,
+                                              passwd_path, home);
+    fflush(stderr);
+
+    if (dup2(saved_stderr, STDERR_FILENO) < 0)
+    {
+        perror("dup2 stderr restore");
+        exit(1);
+    }
+    close(saved_stderr);
+
+    size_t total = 0;
+    ssize_t n;
+    while (total + 1 < diagnostic_size &&
+           (n = read(output_pipe[0], diagnostic + total,
+                     diagnostic_size - 1 - total)) > 0)
+        total += (size_t)n;
+    diagnostic[total] = '\0';
+    close(output_pipe[0]);
+    return result;
+}
+
+static void test_target_home_resolution(void)
+{
+    char passwd_path[] = "/tmp/migr-passwd-XXXXXX";
+    int passwd_fd = mkstemp(passwd_path);
+    if (passwd_fd < 0)
+    {
+        perror("mkstemp passwd fixture");
+        exit(1);
+    }
+    close(passwd_fd);
+
+    char home[PATH_MAX];
+    char diagnostic[512];
+
+    check(run_target_home("/home/ordinary", NULL, passwd_path, home,
+                          diagnostic, sizeof(diagnostic)) == 0 &&
+              strcmp(home, "/home/ordinary") == 0,
+          "ordinary invocation returns HOME unchanged");
+
+    check(run_target_home(NULL, NULL, passwd_path, home,
+                          diagnostic, sizeof(diagnostic)) < 0 &&
+              strstr(diagnostic, "HOME is not set or is empty") != NULL,
+          "ordinary invocation rejects a missing HOME");
+    check(run_target_home("", NULL, passwd_path, home,
+                          diagnostic, sizeof(diagnostic)) < 0 &&
+              strstr(diagnostic, "HOME is not set or is empty") != NULL,
+          "ordinary invocation rejects an empty HOME");
+
+    char oversized_home[PATH_MAX + 1];
+    memset(oversized_home, 'h', PATH_MAX);
+    oversized_home[PATH_MAX] = '\0';
+    check(run_target_home(oversized_home, NULL, passwd_path, home,
+                          diagnostic, sizeof(diagnostic)) < 0 &&
+              strstr(diagnostic, "HOME path too long") != NULL,
+          "ordinary invocation rejects HOME that cannot fit PATH_MAX");
+
+    write_fixture(passwd_path,
+                  "user:x:1000:1000::/home/invoker:/bin/sh\n");
+    check(run_target_home("/root", "1000", passwd_path, home,
+                          diagnostic, sizeof(diagnostic)) == 0 &&
+              strcmp(home, "/home/invoker") == 0,
+          "SUDO_UID ignores elevated HOME and selects the invoking user's home");
+    check(run_target_home(NULL, "1000", passwd_path, home,
+                          diagnostic, sizeof(diagnostic)) == 0 &&
+              strcmp(home, "/home/invoker") == 0,
+          "SUDO_UID resolution does not require ambient HOME");
+
+    write_fixture(passwd_path,
+                  "user:x:001000:1000::/home/leading-zero:/bin/sh\n");
+    check(run_target_home("/root", "01000", passwd_path, home,
+                          diagnostic, sizeof(diagnostic)) == 0 &&
+              strcmp(home, "/home/leading-zero") == 0,
+          "SUDO_UID and passwd UID use the same decimal parser");
+
+    const char *invalid_uids[] = {
+        "", "+1000", "-1", " 1000", "1000 ", "1000x", "not-a-uid",
+        "184467440737095516160", NULL
+    };
+    for (size_t i = 0; invalid_uids[i] != NULL; i++)
+    {
+        char label[128];
+        snprintf(label, sizeof(label),
+                 "malformed SUDO_UID case %zu fails without HOME fallback", i + 1);
+        check(run_target_home("/root", invalid_uids[i], passwd_path, home,
+                              diagnostic, sizeof(diagnostic)) < 0 &&
+                  home[0] == '\0' &&
+                  strstr(diagnostic, "SUDO_UID is invalid") != NULL,
+              label);
+    }
+
+    char rejected_uid[64];
+    snprintf(rejected_uid, sizeof(rejected_uid), "%ju",
+             (uintmax_t)(uid_t)-1);
+    check(run_target_home("/root", rejected_uid, passwd_path, home,
+                          diagnostic, sizeof(diagnostic)) < 0 &&
+              strstr(diagnostic, "SUDO_UID is invalid") != NULL,
+          "the reserved uid_t -1 value is rejected");
+
+    write_fixture(passwd_path,
+                  "other:x:2000:2000::/home/other:/bin/sh\n");
+    check(run_target_home("/root", "1000", passwd_path, home,
+                          diagnostic, sizeof(diagnostic)) < 0 &&
+              strstr(diagnostic, "does not match a local") != NULL,
+          "missing local passwd UID fails closed");
+
+    write_fixture(passwd_path,
+                  "first:x:1000:1000::/home/first:/bin/sh\n"
+                  "second:x:1000:1000::/home/second:/bin/sh\n");
+    check(run_target_home("/root", "1000", passwd_path, home,
+                          diagnostic, sizeof(diagnostic)) < 0 &&
+              strstr(diagnostic, "multiple local") != NULL,
+          "duplicate local passwd UID is rejected as ambiguous");
+
+    write_fixture(passwd_path, "user:x:1000\n");
+    check(run_target_home("/root", "1000", passwd_path, home,
+                          diagnostic, sizeof(diagnostic)) < 0 &&
+              strstr(diagnostic, "malformed") != NULL,
+          "matching malformed passwd record fails closed");
+
+    write_fixture(passwd_path,
+                  "user:x:1000:1000:::/bin/sh\n");
+    check(run_target_home("/root", "1000", passwd_path, home,
+                          diagnostic, sizeof(diagnostic)) < 0 &&
+              strstr(diagnostic, "invalid home") != NULL,
+          "matching passwd record with empty home is rejected");
+
+    write_fixture(passwd_path,
+                  "user:x:1000:1000::home/relative:/bin/sh\n");
+    check(run_target_home("/root", "1000", passwd_path, home,
+                          diagnostic, sizeof(diagnostic)) < 0 &&
+              strstr(diagnostic, "invalid home") != NULL,
+          "matching passwd record with relative home is rejected");
+
+    char *long_home = malloc(PATH_MAX + 1U);
+    if (long_home == NULL)
+    {
+        perror("malloc long home");
+        exit(1);
+    }
+    long_home[0] = '/';
+    memset(long_home + 1, 'a', PATH_MAX - 1U);
+    long_home[PATH_MAX] = '\0';
+    size_t record_size = strlen(long_home) + 64U;
+    char *record = malloc(record_size);
+    if (record == NULL)
+    {
+        perror("malloc passwd record");
+        exit(1);
+    }
+    snprintf(record, record_size, "user:x:1000:1000::%s:/bin/sh\n",
+             long_home);
+    write_fixture(passwd_path, record);
+    check(run_target_home("/root", "1000", passwd_path, home,
+                          diagnostic, sizeof(diagnostic)) < 0 &&
+              strstr(diagnostic, "invalid home") != NULL,
+          "matching passwd record with PATH_MAX-overflowing home is rejected");
+    free(record);
+    free(long_home);
+
+    write_fixture(passwd_path,
+                  "user:x:1000:1000::/home/Target User:/bin/sh\n");
+    check(run_target_home("/root", "1000", passwd_path, home,
+                          diagnostic, sizeof(diagnostic)) == 0 &&
+              strcmp(home, "/home/Target User") == 0,
+          "valid passwd home containing spaces is preserved exactly");
+
+    write_fixture(passwd_path,
+                  "not even a passwd record\n"
+                  "other:x:not-numeric:2000::/home/other:/bin/sh\n"
+                  "user:x:1000:1000::/home/invoker:/bin/sh\n");
+    check(run_target_home("/root", "1000", passwd_path, home,
+                          diagnostic, sizeof(diagnostic)) == 0 &&
+              strcmp(home, "/home/invoker") == 0,
+          "unrelated malformed passwd records do not manufacture a match");
+
+    unlink(passwd_path);
+    check(run_target_home("/root", "1000", passwd_path, home,
+                          diagnostic, sizeof(diagnostic)) < 0 &&
+              strstr(diagnostic, "Could not read local passwd database") != NULL,
+          "missing passwd database fails closed");
+}
+#endif
+
 static void test_progress_ticker_stop_ignores_resolved_thread_error(void)
 {
     ProgressTicker ticker;
@@ -132,6 +363,9 @@ int main(void)
 {
     char output[256];
 
+#ifdef USER_CONTEXT_TEST_HOOKS
+    test_target_home_resolution();
+#endif
     test_progress_ticker_stop_ignores_resolved_thread_error();
 
     check(run_confirm("\n", 1, output, sizeof(output)) == 1,
