@@ -244,7 +244,7 @@ static void test_collision_suffix_resume_key(void)
     SidecarEntry previous = {0};
     current.root_id = previous.root_id = resume_bytes("ROOT");
     current.logical_path = previous.logical_path = resume_bytes("file");
-    current.physical_path = previous.physical_path = resume_bytes("file");
+    current.physical_leaf = previous.physical_leaf = resume_bytes("file");
     SidecarLiveView view = {
         .entry = &previous,
         .xattrs = NULL,
@@ -320,7 +320,7 @@ static int run_case_alias_claim_fixture(const char *base, const char *label,
     SidecarClaim claim = {
         .root_id = deletion.root_id,
         .logical_path = deletion.logical_path,
-        .physical_path = resume_bytes("Foo"),
+        .physical_leaf = resume_bytes("Foo"),
         .kind = SIDECAR_KIND_REGULAR
     };
     int planted = sidecar_log_adopt_at(container_fd, &log) ==
@@ -455,7 +455,7 @@ static int run_hardlink_representative_transition(
         SidecarClaim claim = {
             .root_id = deletion.root_id,
             .logical_path = deletion.logical_path,
-            .physical_path = resume_bytes(representative),
+            .physical_leaf = resume_bytes(representative),
             .kind = SIDECAR_KIND_REGULAR
         };
         prepared = sidecar_log_append_delete(&log, &deletion) ==
@@ -1261,9 +1261,9 @@ static void test_zero_claim_gate(const char *base)
          * candidate for this walk; the global zero-claim gate must still
          * reject the otherwise resumable container. */
         .root_id = resume_bytes("OTHER"),
-        .logical_path = resume_bytes("blocked"),
-        .physical_path = resume_bytes("blocked"),
-        .kind = SIDECAR_KIND_REGULAR
+        .logical_path = resume_bytes(""),
+        .physical_leaf = resume_bytes(""),
+        .kind = SIDECAR_KIND_DIRECTORY
     };
     SidecarLog log = {0};
     check(sidecar_log_adopt_at(container_fd, &log) == SIDECAR_OPEN_RESUMABLE &&
@@ -1606,19 +1606,19 @@ static int prepare_hardlink_sigkill(const char *base, const char *label,
     SidecarClaim root_claim = {
         .root_id = root_entry.root_id,
         .logical_path = root_entry.logical_path,
-        .physical_path = root_entry.physical_path,
+        .physical_leaf = root_entry.physical_leaf,
         .kind = root_entry.kind
     };
     SidecarClaim representative_claim = {
         .root_id = representative_entry.root_id,
         .logical_path = representative_entry.logical_path,
-        .physical_path = representative_entry.physical_path,
+        .physical_leaf = representative_entry.physical_leaf,
         .kind = representative_entry.kind
     };
     SidecarClaim member_claim = {
         .root_id = member_entry.root_id,
         .logical_path = member_entry.logical_path,
-        .physical_path = member_entry.physical_path,
+        .physical_leaf = member_entry.physical_leaf,
         .kind = member_entry.kind
     };
 
@@ -1874,7 +1874,7 @@ static int plant_type_change_claim(const ClaimKindChangeFixture *fixture,
     SidecarClaim claim = {
         .root_id = root,
         .logical_path = logical,
-        .physical_path = logical,
+        .physical_leaf = logical,
         .kind = old_kind
     };
     int result = sidecar_log_append_delete(&log, &deletion) ==
@@ -2373,6 +2373,8 @@ static void test_repeated_fresh_claim_resume(const char *base)
 }
 
 static int prepare_foreign_destination(const char *base, const char *label,
+                                       char *source_root_path,
+                                       size_t source_root_path_size,
                                        char *source_file,
                                        size_t source_file_size,
                                        char *container_path,
@@ -2385,10 +2387,15 @@ static int prepare_foreign_destination(const char *base, const char *label,
     if (sigkill_fixture_paths(base, label, source_path, sizeof(source_path),
                               container_path, container_path_size) != 0)
         return -1;
+    int source_root_length = snprintf(source_root_path, source_root_path_size,
+                                      "%s", source_path);
+    if (source_root_length < 0 ||
+        (size_t)source_root_length >= source_root_path_size)
+        return -1;
     make_directory(source_path);
     join_path(source_file, source_file_size, source_path, "file");
     write_file(source_file, "source-content");
-    *root = root_spec("FOREIGN", source_file, "FOREIGN");
+    *root = root_spec("FOREIGN", source_root_path, "FOREIGN");
     *request = request_for(root, "f128");
 
     int container_fd = create_container(container_path);
@@ -2401,9 +2408,12 @@ static int prepare_foreign_destination(const char *base, const char *label,
     }
     if (mkdirat(container_fd, "data", 0700) != 0)
         fixture_fatal("could not create foreign data directory");
-    char foreign_payload[PATH_MAX];
-    join_path(foreign_payload, sizeof(foreign_payload), container_path,
+    char foreign_root[PATH_MAX];
+    join_path(foreign_root, sizeof(foreign_root), container_path,
               "data/FOREIGN");
+    make_directory(foreign_root);
+    char foreign_payload[PATH_MAX];
+    join_path(foreign_payload, sizeof(foreign_payload), foreign_root, "file");
     write_file(foreign_payload, "foreign-payload");
 
     SidecarLog log = {0};
@@ -2411,11 +2421,34 @@ static int prepare_foreign_destination(const char *base, const char *label,
         close(container_fd);
         return -1;
     }
+    struct stat root_stat;
+    PortableXattrs no_xattrs = {0};
+    SidecarEntry root_entry = {0};
+    if (stat(source_path, &root_stat) != 0 ||
+        entry_from_stat("FOREIGN", "", "", "", &root_stat, 1,
+                        &no_xattrs, &root_entry, NULL, NULL, NULL) != 0) {
+        (void)sidecar_log_close(&log);
+        close(container_fd);
+        return -1;
+    }
+    SidecarClaim root_claim = {
+        .root_id = root_entry.root_id,
+        .logical_path = root_entry.logical_path,
+        .physical_leaf = root_entry.physical_leaf,
+        .kind = root_entry.kind
+    };
+    if (sidecar_log_append_claim(&log, &root_claim) != SIDECAR_STATUS_OK ||
+        sidecar_log_append_entry(&log, &root_entry) != SIDECAR_STATUS_OK ||
+        sidecar_log_append_entry_commit(&log) != SIDECAR_STATUS_OK) {
+        (void)sidecar_log_close(&log);
+        close(container_fd);
+        return -1;
+    }
     if (mismatching_claim) {
         SidecarClaim claim = {
             .root_id = resume_bytes("FOREIGN"),
-            .logical_path = resume_bytes(""),
-            .physical_path = resume_bytes("wrong-physical"),
+            .logical_path = resume_bytes("file"),
+            .physical_leaf = resume_bytes("wrong-physical"),
             .kind = SIDECAR_KIND_REGULAR
         };
         if (sidecar_log_append_claim(&log, &claim) != SIDECAR_STATUS_OK) {
@@ -2434,13 +2467,15 @@ static int prepare_foreign_destination(const char *base, const char *label,
 static void test_foreign_destination_claim_refusal(const char *base)
 {
     printf(BLUE "::" NC " foreign destination and mismatching CLAIM refusal\n");
+    char source_root[PATH_MAX];
     char source_file[PATH_MAX];
     char container_path[PATH_MAX];
     PortableRootSpec root;
     PortableCaptureRequest request;
     int container_fd = prepare_foreign_destination(
-        base, "fresh-foreign-no-claim", source_file, sizeof(source_file),
-        container_path, sizeof(container_path), &root, &request, 0);
+        base, "fresh-foreign-no-claim", source_root, sizeof(source_root),
+        source_file, sizeof(source_file), container_path, sizeof(container_path),
+        &root, &request, 0);
     check(container_fd >= 0,
           "foreign-node fixture has a valid sidecar and no CLAIM");
     if (container_fd >= 0) {
@@ -2448,16 +2483,17 @@ static void test_foreign_destination_claim_refusal(const char *base)
               "a foreign destination is rejected without a CLAIM");
         char payload_path[PATH_MAX];
         join_path(payload_path, sizeof(payload_path), container_path,
-                  "data/FOREIGN");
+                  "data/FOREIGN/file");
         check(file_equals(payload_path, "foreign-payload") &&
-                  resume_claim_state(container_fd, 0, 0, 0),
+                  resume_claim_state(container_fd, 0, 1, 2),
               "no-claim refusal leaves the foreign payload untouched");
         close(container_fd);
     }
 
     container_fd = prepare_foreign_destination(
-        base, "fresh-foreign-mismatch", source_file, sizeof(source_file),
-        container_path, sizeof(container_path), &root, &request, 1);
+        base, "fresh-foreign-mismatch", source_root, sizeof(source_root),
+        source_file, sizeof(source_file), container_path, sizeof(container_path),
+        &root, &request, 1);
     check(container_fd >= 0,
           "mismatching-CLAIM fixture has a valid outstanding claim");
     if (container_fd >= 0) {
@@ -2465,9 +2501,9 @@ static void test_foreign_destination_claim_refusal(const char *base)
               "a mismatching CLAIM does not authorize a foreign destination");
         char payload_path[PATH_MAX];
         join_path(payload_path, sizeof(payload_path), container_path,
-                  "data/FOREIGN");
+                  "data/FOREIGN/file");
         check(file_equals(payload_path, "foreign-payload") &&
-                  resume_claim_state(container_fd, 0, 1, 1),
+                  resume_claim_state(container_fd, 0, 2, 3),
               "mismatching-CLAIM refusal leaves payload and CLAIM intact");
         close(container_fd);
     }

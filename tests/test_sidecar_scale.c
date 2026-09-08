@@ -1,4 +1,4 @@
-// Scale test for the sidecar v1 live-state map (docs/DECISIONS.md D17): proof
+// Scale test for the sidecar v4 live-state map (docs/DECISIONS.md D17/D39): proof
 // that the salted open-addressing hash table replacing the old linear scan is
 // genuinely sub-quadratic, not just correct at small counts the way
 // tests/test_sidecar_state.c's fixtures are.
@@ -67,8 +67,11 @@ static SidecarEntry make_entry(const char *root, const char *logical,
                                     strlen(root) };
     entry.logical_path = (SidecarBytes){ (const unsigned char *)logical,
                                          strlen(logical) };
-    entry.physical_path = (SidecarBytes){ (const unsigned char *)physical,
-                                          strlen(physical) };
+    const char *slash = strrchr(physical, '/');
+    const char *leaf = logical[0] == '\0' ? "" :
+                       (slash == NULL ? physical : slash + 1);
+    entry.physical_leaf = (SidecarBytes){ (const unsigned char *)leaf,
+                                          strlen(leaf) };
     entry.kind = SIDECAR_KIND_REGULAR;
     entry.mode = 0644;
     entry.uid = 1000;
@@ -109,7 +112,8 @@ static int deleted_view_matches(const SidecarLiveView *view,
 {
     SidecarXattr expected = scale_xattr();
     return view != NULL && view->entry != NULL &&
-           bytes_match_text(view->entry->physical_path, "payload/deleted") &&
+           bytes_match_text(view->entry->physical_leaf, "deleted") &&
+           bytes_match_text(view->entry->physical_path, "deleted") &&
            view->entry->size == expected_size && view->xattr_count == 1 &&
            view->xattrs != NULL &&
            bytes_match_text(view->xattrs[0].name, "user.scale") &&
@@ -127,6 +131,17 @@ static int reset_slot(int container_fd)
     return 0;
 }
 
+static int append_root_claim(SidecarLog *log, const char *root)
+{
+    SidecarClaim claim = {
+        .root_id = { (const unsigned char *)root, strlen(root) },
+        .logical_path = { NULL, 0 },
+        .physical_leaf = { NULL, 0 },
+        .kind = SIDECAR_KIND_DIRECTORY
+    };
+    return sidecar_log_append_claim(log, &claim) == SIDECAR_STATUS_OK ? 0 : -1;
+}
+
 static int append_claimed_entry(SidecarLog *log, const SidecarEntry *entry)
 {
     if (log == NULL || entry == NULL || entry->xattr_count > 1)
@@ -134,7 +149,7 @@ static int append_claimed_entry(SidecarLog *log, const SidecarEntry *entry)
     SidecarClaim claim = {
         .root_id = entry->root_id,
         .logical_path = entry->logical_path,
-        .physical_path = entry->physical_path,
+        .physical_leaf = entry->physical_leaf,
         .kind = entry->kind
     };
     if (sidecar_log_append_claim(log, &claim) != SIDECAR_STATUS_OK ||
@@ -154,8 +169,7 @@ static int generated_key(const char *prefix, unsigned int index,
                          char *logical, size_t logical_size,
                          char *physical, size_t physical_size)
 {
-    int root_length = snprintf(root, root_size, "scale-%s-root-%05u",
-                               prefix, index);
+    int root_length = snprintf(root, root_size, "scale-%s-root", prefix);
     int logical_length = snprintf(logical, logical_size,
                                   "scale-%s-path-%05u", prefix, index);
     int physical_length = snprintf(physical, physical_size,
@@ -213,8 +227,10 @@ static void test_tombstone_collision_persistence(int container_fd)
     check(reset_slot(container_fd) == 0, "collision fixture slot resets");
 
     SidecarLog log = {0};
-    check(sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH,
-          "collision fixture creates a fresh sidecar");
+    check(sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH &&
+              append_root_claim(&log, "TROOT") == 0 &&
+              append_root_claim(&log, "scale-collision-root") == 0,
+          "collision fixture creates the required v4 ancestry roots");
     SidecarEntry deleted = make_entry_with_xattr(
         "TROOT", "deleted", "payload/deleted", 17);
     check(append_claimed_entry(&log, &deleted) == 0,
@@ -261,8 +277,10 @@ static void test_tombstone_rehash_persistence(int container_fd)
     check(reset_slot(container_fd) == 0, "rehash fixture slot resets");
 
     SidecarLog log = {0};
-    check(sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH,
-          "rehash fixture creates a fresh sidecar");
+    check(sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH &&
+              append_root_claim(&log, "RROOT") == 0 &&
+              append_root_claim(&log, "scale-rehash-root") == 0,
+          "rehash fixture creates the required v4 ancestry roots");
     SidecarEntry deleted = make_entry_with_xattr(
         "RROOT", "deleted", "payload/deleted", 23);
     check(append_claimed_entry(&log, &deleted) == 0,
@@ -306,8 +324,10 @@ static void test_resurrection_and_used_count(int container_fd)
     check(reset_slot(container_fd) == 0, "resurrection fixture slot resets");
 
     SidecarLog log = {0};
-    check(sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH,
-          "resurrection fixture creates a fresh sidecar");
+    check(sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH &&
+              append_root_claim(&log, "UROOT") == 0 &&
+              append_root_claim(&log, "scale-resurrection-new-root") == 0,
+          "resurrection fixture creates the required v4 ancestry roots");
     SidecarEntry original = make_entry(
         "UROOT", "file", "payload/original", 31);
     check(append_claimed_entry(&log, &original) == 0,
@@ -332,8 +352,8 @@ static void test_resurrection_and_used_count(int container_fd)
               used_after_resurrection == used_before_resurrection &&
               sidecar_log_find(&log, replacement.root_id,
                                replacement.logical_path, &view) == 1 &&
-              bytes_match_text(view.entry->physical_path,
-                               "payload/resurrected") &&
+              bytes_match_text(view.entry->physical_leaf, "resurrected") &&
+              bytes_match_text(view.entry->physical_path, "resurrected") &&
               sidecar_log_find_deleted(&log, replacement.root_id,
                                        replacement.logical_path, &view) == 0,
           "resurrection restores live state without growing used count");
@@ -356,8 +376,9 @@ static void test_probe_churn(int container_fd)
     check(reset_slot(container_fd) == 0, "churn fixture slot resets");
 
     SidecarLog log = {0};
-    check(sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH,
-          "churn fixture creates a fresh sidecar");
+    check(sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH &&
+              append_root_claim(&log, "scale-churn-root") == 0,
+          "churn fixture creates the required v4 ancestry root");
     sidecar_state_test_reset_probe_count();
     int churn_ok = 1;
     for (unsigned int index = 0;
@@ -408,6 +429,37 @@ static void test_live_entry_ceiling(void)
           "live-entry count over its ceiling is refused");
 }
 
+static void test_state_map_key_contract(int container_fd)
+{
+    printf(BLUE "::" NC " state-map key remains root plus logical path\n");
+    check(reset_slot(container_fd) == 0, "map-key fixture slot resets");
+
+    SidecarLog log = {0};
+    check(sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH &&
+              append_root_claim(&log, "ROOT-A") == 0 &&
+              append_root_claim(&log, "ROOT-B") == 0,
+          "map-key fixture creates two independent ancestry roots");
+    SidecarEntry left = make_entry("ROOT-A", "same", "left", 11);
+    SidecarEntry right = make_entry("ROOT-B", "same", "right", 22);
+    check(append_claimed_entry(&log, &left) == 0 &&
+              append_claimed_entry(&log, &right) == 0 &&
+              sidecar_log_live_count(&log) == 2,
+          "identical logical paths under different roots remain distinct keys");
+
+    SidecarLiveView view = {0};
+    check(sidecar_log_find(&log, left.root_id, left.logical_path, &view) == 1 &&
+              view.entry != NULL && view.entry->size == 11 &&
+              bytes_match_text(view.entry->physical_leaf, "left"),
+          "first root/logical key retains its own leaf value");
+    check(sidecar_log_find(&log, right.root_id, right.logical_path, &view) == 1 &&
+              view.entry != NULL && view.entry->size == 22 &&
+              bytes_match_text(view.entry->physical_leaf, "right"),
+          "second root/logical key retains its independent leaf value");
+    check(sidecar_log_close(&log) == SIDECAR_STATUS_OK,
+          "map-key fixture closes");
+    check(reset_slot(container_fd) == 0, "map-key fixture is removed");
+}
+
 int main(void)
 {
     printf(BLUE "::" NC " salted live-state hash scale\n");
@@ -427,6 +479,7 @@ int main(void)
     }
 
     test_live_entry_ceiling();
+    test_state_map_key_contract(container_fd);
     test_tombstone_collision_persistence(container_fd);
     test_tombstone_rehash_persistence(container_fd);
     test_resurrection_and_used_count(container_fd);
@@ -435,22 +488,20 @@ int main(void)
     check(reset_slot(container_fd) == 0,
           "large fixture starts with an absent sidecar");
     SidecarLog log = {0};
-    check(sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH,
-          "large fixture creates a fresh sidecar");
+    check(sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH &&
+              append_root_claim(&log, "scale-root") == 0,
+          "large fixture creates a fresh sidecar with its v4 ancestry root");
 
     for (unsigned int index = 0; index < SCALE_ENTRY_COUNT && !failures;
          index++)
     {
-        char root[32];
         char logical[48];
         char physical[64];
-        int root_length = snprintf(root, sizeof(root), "root-%05u", index);
         int logical_length = snprintf(logical, sizeof(logical),
                                       "path-%05u", index);
         int physical_length = snprintf(physical, sizeof(physical),
                                        "payload/path-%05u", index);
-        if (root_length < 0 || logical_length < 0 || physical_length < 0 ||
-            (size_t)root_length >= sizeof(root) ||
+        if (logical_length < 0 || physical_length < 0 ||
             (size_t)logical_length >= sizeof(logical) ||
             (size_t)physical_length >= sizeof(physical))
         {
@@ -458,11 +509,11 @@ int main(void)
             break;
         }
 
-        SidecarEntry entry = make_entry(root, logical, physical, index);
+        SidecarEntry entry = make_entry("scale-root", logical, physical, index);
         SidecarClaim claim = {
             .root_id = entry.root_id,
             .logical_path = entry.logical_path,
-            .physical_path = entry.physical_path,
+            .physical_leaf = entry.physical_leaf,
             .kind = entry.kind
         };
         if (sidecar_log_append_claim(&log, &claim) != SIDECAR_STATUS_OK ||
@@ -481,13 +532,10 @@ int main(void)
     for (unsigned int index = SCALE_ENTRY_COUNT; index > 0; index--)
     {
         unsigned int expected = index - 1U;
-        char root[32];
         char logical[48];
-        int root_length = snprintf(root, sizeof(root), "root-%05u", expected);
         int logical_length = snprintf(logical, sizeof(logical),
                                       "path-%05u", expected);
-        if (root_length < 0 || logical_length < 0 ||
-            (size_t)root_length >= sizeof(root) ||
+        if (logical_length < 0 ||
             (size_t)logical_length >= sizeof(logical))
         {
             all_found = 0;
@@ -496,7 +544,7 @@ int main(void)
         SidecarLiveView view;
         int found = sidecar_log_find(
             &log,
-            (SidecarBytes){ (const unsigned char *)root, strlen(root) },
+            (SidecarBytes){ (const unsigned char *)"scale-root", 10 },
             (SidecarBytes){ (const unsigned char *)logical, strlen(logical) },
             &view);
         if (found != 1 || view.entry == NULL || view.entry->size != expected)
@@ -524,13 +572,13 @@ int main(void)
     SidecarLiveView edge_view;
     check(sidecar_log_find(
               &adopted,
-              (SidecarBytes){ (const unsigned char *)"root-00000", 10 },
+              (SidecarBytes){ (const unsigned char *)"scale-root", 10 },
               (SidecarBytes){ (const unsigned char *)"path-00000", 10 },
               &edge_view) == 1 && edge_view.entry->size == 0,
           "adopted map retains its first key");
     check(sidecar_log_find(
               &adopted,
-              (SidecarBytes){ (const unsigned char *)"root-49999", 10 },
+              (SidecarBytes){ (const unsigned char *)"scale-root", 10 },
               (SidecarBytes){ (const unsigned char *)"path-49999", 10 },
               &edge_view) == 1 && edge_view.entry->size == 49999,
           "adopted map retains its last key");

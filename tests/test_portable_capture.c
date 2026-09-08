@@ -1626,13 +1626,13 @@ static void test_collision_resume_renumbering(const char *base)
     SidecarClaim root_claim = {
         .root_id = root_predecessor.root_id,
         .logical_path = root_predecessor.logical_path,
-        .physical_path = root_predecessor.physical_path,
+        .physical_leaf = root_predecessor.physical_leaf,
         .kind = root_predecessor.kind
     };
     SidecarClaim predecessor_claim = {
         .root_id = predecessor.root_id,
         .logical_path = predecessor.logical_path,
-        .physical_path = predecessor.physical_path,
+        .physical_leaf = predecessor.physical_leaf,
         .kind = predecessor.kind
     };
     SidecarLog predecessor_log = {0};
@@ -2073,10 +2073,10 @@ static void test_entry_helpers(const char *source)
     entry = previous;
     check(entries_equal(&entry, &view, &empty_xattrs) != 0,
           "entries_equal accepts identical symlink targets");
-    entry.physical_path = bytes("different-physical");
+    entry.physical_leaf = bytes("different-physical");
     check(entries_equal(&entry, &view, &empty_xattrs) == 0,
-          "entries_equal rejects different physical paths");
-    entry.physical_path = previous.physical_path;
+          "entries_equal rejects different physical leaves");
+    entry.physical_leaf = previous.physical_leaf;
     entry.symlink_target = bytes("other-target");
     check(entries_equal(&entry, &view, &empty_xattrs) == 0,
           "entries_equal rejects different symlink targets");
@@ -2790,10 +2790,10 @@ static int sidecar_bytes_equal_for_test(SidecarBytes left, SidecarBytes right)
 typedef struct {
     unsigned char root_id[SIDECAR_MAX_ROOT_ID];
     unsigned char logical_path[SIDECAR_MAX_PATH];
-    unsigned char physical_path[SIDECAR_MAX_PATH];
+    unsigned char physical_leaf[SIDECAR_MAX_PHYSICAL_LEAF];
     size_t root_length;
     size_t logical_length;
-    size_t physical_length;
+    size_t physical_leaf_length;
     SidecarObjectKind kind;
 } PendingClaimForTest;
 
@@ -2803,7 +2803,7 @@ static int pending_claim_copy(PendingClaimForTest *destination,
     if (destination == NULL || source == NULL ||
         source->root_id.length > sizeof(destination->root_id) ||
         source->logical_path.length > sizeof(destination->logical_path) ||
-        source->physical_path.length > sizeof(destination->physical_path))
+        source->physical_leaf.length > sizeof(destination->physical_leaf))
         return -1;
     if (source->root_id.length != 0)
         memcpy(destination->root_id, source->root_id.data,
@@ -2811,12 +2811,12 @@ static int pending_claim_copy(PendingClaimForTest *destination,
     if (source->logical_path.length != 0)
         memcpy(destination->logical_path, source->logical_path.data,
                source->logical_path.length);
-    if (source->physical_path.length != 0)
-        memcpy(destination->physical_path, source->physical_path.data,
-               source->physical_path.length);
+    if (source->physical_leaf.length != 0)
+        memcpy(destination->physical_leaf, source->physical_leaf.data,
+               source->physical_leaf.length);
     destination->root_length = source->root_id.length;
     destination->logical_length = source->logical_path.length;
-    destination->physical_length = source->physical_path.length;
+    destination->physical_leaf_length = source->physical_leaf.length;
     destination->kind = source->kind;
     return 0;
 }
@@ -2833,8 +2833,9 @@ static int pending_claim_matches_entry(const PendingClaimForTest *claim,
                (SidecarBytes){ claim->logical_path, claim->logical_length },
                entry->logical_path) &&
            sidecar_bytes_equal_for_test(
-               (SidecarBytes){ claim->physical_path, claim->physical_length },
-               entry->physical_path) &&
+               (SidecarBytes){ claim->physical_leaf,
+                               claim->physical_leaf_length },
+               entry->physical_leaf) &&
            claim->kind == entry->kind;
 }
 
@@ -3600,19 +3601,19 @@ static void test_portable_hardlinks_sticky_seed(const char *base)
     SidecarClaim root_claim = {
         .root_id = root_entry.root_id,
         .logical_path = root_entry.logical_path,
-        .physical_path = root_entry.physical_path,
+        .physical_leaf = root_entry.physical_leaf,
         .kind = root_entry.kind
     };
     SidecarClaim representative_claim = {
         .root_id = representative_entry.root_id,
         .logical_path = representative_entry.logical_path,
-        .physical_path = representative_entry.physical_path,
+        .physical_leaf = representative_entry.physical_leaf,
         .kind = representative_entry.kind
     };
     SidecarClaim member_claim = {
         .root_id = member_entry.root_id,
         .logical_path = member_entry.logical_path,
-        .physical_path = member_entry.physical_path,
+        .physical_leaf = member_entry.physical_leaf,
         .kind = member_entry.kind
     };
 

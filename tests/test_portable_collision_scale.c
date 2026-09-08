@@ -277,7 +277,7 @@ static void rewrite_owned_predecessor(int container_fd, int source_fd)
     SidecarClaim claim = {
         .root_id = predecessor.root_id,
         .logical_path = predecessor.logical_path,
-        .physical_path = predecessor.physical_path,
+        .physical_leaf = predecessor.physical_leaf,
         .kind = predecessor.kind
     };
     if (sidecar_log_append_delete(&log, &deletion) != SIDECAR_STATUS_OK ||
@@ -317,7 +317,7 @@ static void rewrite_claimed_predecessor(int container_fd)
     SidecarClaim claim = {
         .root_id = { (const unsigned char *)"ROOT", 4 },
         .logical_path = { (const unsigned char *)"foo", 3 },
-        .physical_path = { (const unsigned char *)"Foo", 3 },
+        .physical_leaf = { (const unsigned char *)"Foo", 3 },
         .kind = SIDECAR_KIND_REGULAR
     };
     if (sidecar_log_append_delete(&log, &deletion) != SIDECAR_STATUS_OK ||
@@ -349,7 +349,7 @@ static void rewrite_live_predecessor(int container_fd, int source_fd,
     SidecarClaim claim = {
         .root_id = predecessor.root_id,
         .logical_path = predecessor.logical_path,
-        .physical_path = predecessor.physical_path,
+        .physical_leaf = predecessor.physical_leaf,
         .kind = predecessor.kind
     };
     SidecarStatus delete_status = sidecar_log_append_delete(&log, &deletion);
@@ -612,7 +612,7 @@ static void test_claim_directory_collision(const char *fixture)
     SidecarClaim claim = {
         .root_id = deletion.root_id,
         .logical_path = deletion.logical_path,
-        .physical_path = { (const unsigned char *)"dir", 3 },
+        .physical_leaf = { (const unsigned char *)"dir", 3 },
         .kind = SIDECAR_KIND_DIRECTORY
     };
     if (sidecar_log_adopt_at(container_fd, &log) != SIDECAR_OPEN_RESUMABLE ||
@@ -803,7 +803,7 @@ static void convert_deep_directory_to_claim(int container_fd,
     SidecarClaim directory_claim = {
         .root_id = directory_delete.root_id,
         .logical_path = directory_delete.logical_path,
-        .physical_path = { (const unsigned char *)"claimed", 7 },
+        .physical_leaf = { (const unsigned char *)"claimed", 7 },
         .kind = SIDECAR_KIND_DIRECTORY
     };
     if (sidecar_log_append_delete(&log, &directory_delete) !=
@@ -822,10 +822,12 @@ static void convert_deep_directory_to_claim(int container_fd,
             .logical_path = { (const unsigned char *)logical,
                               (size_t)length }
         };
+        const char *leaf = strrchr(logical, '/');
+        leaf = leaf == NULL ? logical : leaf + 1;
         SidecarClaim claim = {
             .root_id = deletion.root_id,
             .logical_path = deletion.logical_path,
-            .physical_path = deletion.logical_path,
+            .physical_leaf = { (const unsigned char *)leaf, strlen(leaf) },
             .kind = SIDECAR_KIND_REGULAR
         };
         if (sidecar_log_append_delete(&log, &deletion) != SIDECAR_STATUS_OK ||

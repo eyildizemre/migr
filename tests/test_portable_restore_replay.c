@@ -244,7 +244,10 @@ static SidecarEntry entry_for(const char *root, const char *logical,
     memset(&entry, 0, sizeof(entry));
     entry.root_id = text_bytes(root);
     entry.logical_path = text_bytes(logical);
-    entry.physical_path = text_bytes(physical);
+    const char *slash = strrchr(physical, '/');
+    const char *leaf = logical[0] == '\0' ? "" :
+                       (slash == NULL ? physical : slash + 1);
+    entry.physical_leaf = text_bytes(leaf);
     entry.kind = kind;
     entry.mode = mode;
     entry.uid = (uint32_t)geteuid();
@@ -395,7 +398,7 @@ static int append_entries(SidecarLog *log, const SidecarEntry *entries,
         SidecarClaim claim = {
             .root_id = entries[index].root_id,
             .logical_path = entries[index].logical_path,
-            .physical_path = entries[index].physical_path,
+            .physical_leaf = entries[index].physical_leaf,
             .kind = entries[index].kind
         };
         if (sidecar_log_append_claim(log, &claim) != SIDECAR_STATUS_OK)
@@ -427,6 +430,29 @@ static int write_sidecar(Fixture *fixture, const SidecarEntry *entries,
         sidecar_log_close(&log) != SIDECAR_STATUS_OK)
         return -1;
     return 0;
+}
+
+static int write_raw_entries_sidecar(Fixture *fixture,
+                                     const SidecarEntry *entries,
+                                     size_t count)
+{
+    SidecarLog log = {0};
+    if ((entries == NULL && count != 0) ||
+        sidecar_log_create_at(fixture->container_fd, &log) !=
+            SIDECAR_OPEN_FRESH ||
+        sidecar_log_close(&log) != SIDECAR_STATUS_OK)
+        return -1;
+    int fd = openat(fixture->container_fd, SIDECAR_SLOT_NAME,
+                    O_WRONLY | O_APPEND | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    int result = 1;
+    for (size_t index = 0; index < count && result; index++)
+        result = sidecar_write_entry(fd, &entries[index]) == 0 &&
+                 sidecar_write_entry_commit(fd) == 0;
+    if (close(fd) != 0)
+        result = 0;
+    return result ? 0 : -1;
 }
 
 static int append_raw_sidecar(Fixture *fixture, const unsigned char *data,
@@ -462,19 +488,23 @@ static int raw_text_field(unsigned char *buffer, size_t capacity,
                      (const unsigned char *)text, strlen(text));
 }
 
-static int append_raw_suffix_entry(Fixture *fixture,
-                                   const unsigned char *suffix,
-                                   size_t suffix_length)
+static int append_raw_suffix_entry_fields(Fixture *fixture,
+                                          const char *logical,
+                                          const char *physical_leaf,
+                                          const unsigned char *suffix,
+                                          size_t suffix_length,
+                                          const char *kind,
+                                          const char *mode)
 {
     unsigned char raw[512];
     size_t length = 0;
     if (raw_text_field(raw, sizeof(raw), &length, "ENTRY") != 0 ||
         raw_text_field(raw, sizeof(raw), &length, "ROOT") != 0 ||
-        raw_text_field(raw, sizeof(raw), &length, "file") != 0 ||
-        raw_text_field(raw, sizeof(raw), &length, "file") != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, logical) != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, physical_leaf) != 0 ||
         raw_field(raw, sizeof(raw), &length, suffix, suffix_length) != 0 ||
-        raw_text_field(raw, sizeof(raw), &length, "regular") != 0 ||
-        raw_text_field(raw, sizeof(raw), &length, "600") != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, kind) != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, mode) != 0 ||
         raw_text_field(raw, sizeof(raw), &length, "0") != 0 ||
         raw_text_field(raw, sizeof(raw), &length, "0") != 0 ||
         raw_text_field(raw, sizeof(raw), &length, "0") != 0 ||
@@ -496,6 +526,14 @@ static int append_raw_suffix_entry(Fixture *fixture,
         append_raw_sidecar(fixture, commit, sizeof(commit)) != 0)
         return -1;
     return 0;
+}
+
+static int append_raw_suffix_entry(Fixture *fixture,
+                                   const unsigned char *suffix,
+                                   size_t suffix_length)
+{
+    return append_raw_suffix_entry_fields(fixture, "file", "file", suffix,
+                                          suffix_length, "regular", "600");
 }
 
 static int run_preflight_with_xdg(
@@ -735,14 +773,20 @@ static void test_symlink_collection_validation(void)
     {
         make_dir_at(fixture.data_fd, "ROOT", 0700);
         write_file_at(fixture.data_fd, "ROOT/link", "");
-        write_file_at(fixture.home_fd, "restored", "sentinel");
-        check(write_sidecar(&fixture, &entry, 1, NULL, NULL) == 0,
+        make_dir_at(fixture.home_fd, "restored", 0700);
+        write_file_at(fixture.home_fd, "restored/link", "sentinel");
+        SidecarEntry entries[] = {
+            entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                      1700000200, 0, 1700000201, 0),
+            entry
+        };
+        check(write_sidecar(&fixture, entries, 2, NULL, NULL) == 0,
               "well-formed symlink sidecar is committed");
         PortableRestoreReplayReport report;
         int result = run_replay(&fixture, &report);
         char restored[PATH_MAX];
-        path_join(restored, sizeof(restored), fixture.home, "/restored");
-        check(result != 0 && report.live_count == 1 &&
+        path_join(restored, sizeof(restored), fixture.home, "/restored/link");
+        check(result != 0 && report.live_count == 2 &&
                   report.failed_count == 1 &&
                   strcmp(report.failed_logical_path, "link") == 0,
               "collection accepts the symlink before destination validation fails");
@@ -757,12 +801,21 @@ static void test_symlink_collection_validation(void)
     if (opened == 0)
     {
         make_dir_at(missing.data_fd, "ROOT", 0700);
-        check(write_sidecar(&missing, &entry, 1, NULL, NULL) == 0,
+        write_file_at(missing.home_fd, "sentinel", "untouched");
+        SidecarEntry entries[] = {
+            entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                      1700000200, 0, 1700000201, 0),
+            entry
+        };
+        check(write_sidecar(&missing, entries, 2, NULL, NULL) == 0,
               "missing-placeholder sidecar is committed");
         PortableRestoreReplayReport report;
         int result = run_replay(&missing, &report);
-        check(result != 0 && report.live_count == 0 &&
-                  report.failed_count == 1,
+        char sentinel[PATH_MAX];
+        path_join(sentinel, sizeof(sentinel), missing.home, "/sentinel");
+        check(result != 0 && report.failed_count == 1 &&
+                  strcmp(report.failed_logical_path, "link") == 0 &&
+                  file_equals_noatime(sentinel, "untouched"),
               "missing symlink placeholder is rejected during collection");
         fixture_close(&missing);
     }
@@ -773,6 +826,7 @@ static void test_symlink_collection_validation(void)
     if (opened == 0)
     {
         make_dir_at(redirected.data_fd, "ROOT", 0700);
+        write_file_at(redirected.home_fd, "sentinel", "untouched");
         char outside[PATH_MAX], payload_link[PATH_MAX];
         path_join(outside, sizeof(outside), redirected.base, "/outside");
         if (mkdir(outside, 0700) != 0)
@@ -781,12 +835,20 @@ static void test_symlink_collection_validation(void)
                   "/container/data/ROOT/link");
         check(symlink(outside, payload_link) == 0,
               "payload placeholder symlink is planted");
-        check(write_sidecar(&redirected, &entry, 1, NULL, NULL) == 0,
+        SidecarEntry entries[] = {
+            entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                      1700000200, 0, 1700000201, 0),
+            entry
+        };
+        check(write_sidecar(&redirected, entries, 2, NULL, NULL) == 0,
               "payload-redirect sidecar is committed");
         PortableRestoreReplayReport report;
         int result = run_replay(&redirected, &report);
-        check(result != 0 && report.live_count == 0 &&
-                  report.failed_count == 1,
+        char sentinel[PATH_MAX];
+        path_join(sentinel, sizeof(sentinel), redirected.home, "/sentinel");
+        check(result != 0 && report.failed_count == 1 &&
+                  strcmp(report.failed_logical_path, "link") == 0 &&
+                  file_equals_noatime(sentinel, "untouched"),
               "payload placeholder redirect is rejected during collection");
         fixture_close(&redirected);
     }
@@ -875,10 +937,14 @@ static void test_physical_logical_mismatch(void)
     make_dir_at(fixture.data_fd, "ROOT", 0700);
     write_file_at(fixture.data_fd, "ROOT/something-else.txt", "payload");
     write_file_at(fixture.home_fd, "sentinel", "untouched");
-    SidecarEntry mismatch = entry_for(
-        "ROOT", "innocuous.txt", "something-else.txt",
-        SIDECAR_KIND_REGULAR, 7, 0644, 1700000000, 0, 1700000000, 0);
-    check(write_sidecar(&fixture, &mismatch, 1, NULL, NULL) == 0,
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000000, 0, 1700000000, 0),
+        entry_for("ROOT", "innocuous.txt", "something-else.txt",
+                  SIDECAR_KIND_REGULAR, 7, 0644,
+                  1700000000, 0, 1700000000, 0)
+    };
+    check(write_sidecar(&fixture, entries, 2, NULL, NULL) == 0,
           "physical-mismatch sidecar is committed");
 
     PortableRestoreReplayReport report;
@@ -909,11 +975,14 @@ static void run_replay_suffix_refusal(const char *label, const char *suffix,
     if (payload_length < 0 || (size_t)payload_length >= sizeof(payload_path))
         fatal("suffix fixture payload path is too long");
     write_file_at(fixture.data_fd, payload_path, "payload");
-    SidecarEntry entry = entry_for("ROOT", "file", physical,
-                                   SIDECAR_KIND_REGULAR, 0, 0600,
-                                   1700000000, 0, 1700000001, 0);
-    entry.collision_suffix = text_bytes(suffix);
-    check(write_sidecar(&fixture, &entry, 1, NULL, NULL) == 0,
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000000, 0, 1700000001, 0),
+        entry_for("ROOT", "file", physical, SIDECAR_KIND_REGULAR, 0, 0600,
+                  1700000000, 0, 1700000001, 0)
+    };
+    entries[1].collision_suffix = text_bytes(suffix);
+    check(write_sidecar(&fixture, entries, 2, NULL, NULL) == 0,
           "suffix-refusal replay sidecar is committed");
     PortableRestoreReplayReport report;
     int result = run_replay(&fixture, &report);
@@ -1030,7 +1099,7 @@ static void test_collision_suffix_validation(void)
         SidecarEntry child = entry_for("ROOT", "dir/file", "dir/file",
                                        SIDECAR_KIND_REGULAR, 0, 0600,
                                        1700000010, 0, 1700000011, 0);
-        check(write_sidecar(&missing, &child, 1, NULL, NULL) == 0,
+        check(write_raw_entries_sidecar(&missing, &child, 1) == 0,
               "missing-parent replay sidecar is committed");
         PortableRestoreReplayReport report;
         check(run_replay(&missing, &report) != 0 &&
@@ -1052,20 +1121,22 @@ static void test_collision_suffix_validation(void)
         make_dir_at(payload_root, "dir%7E1", 0700);
         close(payload_root);
         SidecarEntry entries[] = {
+            entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                      1700000010, 0, 1700000011, 0),
             entry_for("ROOT", "dir", "dir%7E1",
                       SIDECAR_KIND_DIRECTORY, 0, 0700,
                       1700000012, 0, 1700000013, 0),
-            entry_for("ROOT", "dir/file", "other/file",
+            entry_for("ROOT", "dir/file", "dir%7E1/other",
                       SIDECAR_KIND_REGULAR, 0, 0600,
                       1700000014, 0, 1700000015, 0)
         };
-        entries[0].collision_suffix = text_bytes("%7E1");
-        check(write_sidecar(&mismatch, entries, 2, NULL, NULL) == 0,
+        entries[1].collision_suffix = text_bytes("%7E1");
+        check(write_sidecar(&mismatch, entries, 3, NULL, NULL) == 0,
               "parent-mismatch replay sidecar is committed");
         PortableRestoreReplayReport report;
         check(run_replay(&mismatch, &report) != 0 &&
                   report.failed_count == 1,
-              "parent physical-prefix mismatch is refused during replay");
+              "child physical mismatch beneath a suffixed parent is refused during replay");
         fixture_close(&mismatch);
     }
 
@@ -1075,11 +1146,10 @@ static void test_collision_suffix_validation(void)
     if (opened == 0)
     {
         make_dir_at(root_suffix.data_fd, "ROOT", 0700);
-        SidecarEntry entry = entry_for("ROOT", "", "",
-                                       SIDECAR_KIND_DIRECTORY, 0, 0700,
-                                       1700000016, 0, 1700000017, 0);
-        entry.collision_suffix = text_bytes("%7E1");
-        check(write_sidecar(&root_suffix, &entry, 1, NULL, NULL) == 0,
+        static const unsigned char root_suffix_bytes[] = "%7E1";
+        check(append_raw_suffix_entry_fields(
+                  &root_suffix, "", "", root_suffix_bytes,
+                  sizeof(root_suffix_bytes) - 1U, "directory", "700") == 0,
               "root-suffix replay sidecar is committed");
         PortableRestoreReplayReport report;
         check(run_replay(&root_suffix, &report) != 0 &&
@@ -1307,7 +1377,7 @@ static void test_outstanding_claim_gate(void)
     SidecarClaim outstanding = {
         .root_id = text_bytes("ROOT"),
         .logical_path = text_bytes("blocked"),
-        .physical_path = text_bytes("blocked"),
+        .physical_leaf = text_bytes("blocked"),
         .kind = SIDECAR_KIND_REGULAR
     };
     SidecarLog log = {0};

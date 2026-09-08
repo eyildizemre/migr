@@ -1,4 +1,4 @@
-// Unit tests for the sidecar v3 codec (docs/DECISIONS.md D17/D21/D22/D25): magic/version
+// Unit tests for the sidecar v4 codec (docs/DECISIONS.md D17/D21/D22/D25/D39): magic/version
 // header, ENTRY/XATTR/ENTRY_COMMIT/DELETE/CLAIM record framing, canonical numeric
 // parsing, and every SIDECAR_MAX_* ceiling declared there. This is the codec
 // alone -- no live-state map, no resume, no adopt; that stateful layer is a
@@ -143,16 +143,18 @@ static int append_header(RawBuffer *buffer, const char *version)
            raw_text_field(buffer, version) == 0 ? 0 : -1;
 }
 
-static int append_regular_entry_with_logical(RawBuffer *buffer,
-                                             const void *logical,
-                                             size_t logical_length,
-                                             const char *mode,
-                                             const char *xattr_count)
+static int append_regular_entry_with_fields(RawBuffer *buffer,
+                                            const void *logical,
+                                            size_t logical_length,
+                                            const void *physical_leaf,
+                                            size_t physical_leaf_length,
+                                            const char *mode,
+                                            const char *xattr_count)
 {
     return raw_tag(buffer, "ENTRY") == 0 &&
            raw_text_field(buffer, "ROOT") == 0 &&
            raw_field(buffer, logical, logical_length) == 0 &&
-           raw_text_field(buffer, "payload/file") == 0 &&
+           raw_field(buffer, physical_leaf, physical_leaf_length) == 0 &&
            raw_text_field(buffer, "") == 0 &&
            raw_text_field(buffer, "regular") == 0 &&
            raw_text_field(buffer, mode) == 0 &&
@@ -170,9 +172,10 @@ static int append_regular_entry(RawBuffer *buffer, const char *mode,
                                 const char *xattr_count)
 {
     static const char logical[] = "dir/file";
-    return append_regular_entry_with_logical(buffer, logical,
-                                             sizeof(logical) - 1U, mode,
-                                             xattr_count);
+    static const char physical_leaf[] = "file";
+    return append_regular_entry_with_fields(
+        buffer, logical, sizeof(logical) - 1U, physical_leaf,
+        sizeof(physical_leaf) - 1U, mode, xattr_count);
 }
 
 static int append_commit(RawBuffer *buffer)
@@ -181,13 +184,13 @@ static int append_commit(RawBuffer *buffer)
 }
 
 static int append_claim(RawBuffer *buffer, const char *root,
-                        const char *logical, const char *physical,
+                        const char *logical, const char *physical_leaf,
                         const char *kind)
 {
     return raw_tag(buffer, "CLAIM") == 0 &&
            raw_text_field(buffer, root) == 0 &&
            raw_text_field(buffer, logical) == 0 &&
-           raw_text_field(buffer, physical) == 0 &&
+           raw_text_field(buffer, physical_leaf) == 0 &&
            raw_text_field(buffer, kind) == 0 ? 0 : -1;
 }
 
@@ -201,12 +204,13 @@ static SidecarEntry sample_entry(void)
 {
     static const unsigned char root[] = "ROOT";
     static const unsigned char logical[] = "dir/file";
-    static const unsigned char physical[] = "payload/file";
+    static const unsigned char physical_leaf[] = "file";
     SidecarEntry entry;
     memset(&entry, 0, sizeof(entry));
     entry.root_id = (SidecarBytes){ root, sizeof(root) - 1U };
     entry.logical_path = (SidecarBytes){ logical, sizeof(logical) - 1U };
-    entry.physical_path = (SidecarBytes){ physical, sizeof(physical) - 1U };
+    entry.physical_leaf = (SidecarBytes){ physical_leaf,
+                                         sizeof(physical_leaf) - 1U };
     entry.kind = SIDECAR_KIND_REGULAR;
     entry.mode = 0644;
     entry.uid = 1000;
@@ -240,7 +244,10 @@ static int roundtrip_callback(const SidecarRecord *record, void *context)
             entry->uid != 1000 || entry->gid != 1000 || entry->size != 321 ||
             entry->atime_sec != -7 || entry->mtime_nsec != 456789 ||
             entry->root_id.length != 4 ||
-            memcmp(entry->root_id.data, "ROOT", 4) != 0)
+            memcmp(entry->root_id.data, "ROOT", 4) != 0 ||
+            entry->physical_leaf.length != 4 ||
+            memcmp(entry->physical_leaf.data, "file", 4) != 0 ||
+            entry->physical_path.length != 0)
             state->valid = 0;
     }
     else if (record->type == SIDECAR_RECORD_XATTR)
@@ -273,8 +280,9 @@ static int roundtrip_callback(const SidecarRecord *record, void *context)
             memcmp(claim->root_id.data, "ROOT", 4) != 0 ||
             claim->logical_path.length != 8 ||
             memcmp(claim->logical_path.data, "dir/file", 8) != 0 ||
-            claim->physical_path.length != 12 ||
-            memcmp(claim->physical_path.data, "payload/file", 12) != 0 ||
+            claim->physical_leaf.length != 4 ||
+            memcmp(claim->physical_leaf.data, "file", 4) != 0 ||
+            claim->physical_path.length != 0 ||
             claim->kind != SIDECAR_KIND_REGULAR)
             state->valid = 0;
     }
@@ -289,7 +297,7 @@ static void test_header_and_roundtrip(int fd)
 
     unsigned char actual[32] = {0};
     ssize_t count = pread(fd, actual, sizeof(actual), 0);
-    const unsigned char expected[] = SIDECAR_MAGIC "\0" "3\0";
+    const unsigned char expected[] = SIDECAR_MAGIC "\0" "4\0";
     check(count == (ssize_t)sizeof(expected) - 1 &&
           memcmp(actual, expected, sizeof(expected) - 1U) == 0,
           "header bytes are byte-exact");
@@ -307,7 +315,7 @@ static void test_header_and_roundtrip(int fd)
     SidecarClaim claim = {
         .root_id = { (const unsigned char *)"ROOT", 4 },
         .logical_path = { (const unsigned char *)"dir/file", 8 },
-        .physical_path = { (const unsigned char *)"payload/file", 12 },
+        .physical_leaf = { (const unsigned char *)"file", 4 },
         .kind = SIDECAR_KIND_REGULAR
     };
     check(sidecar_write_claim(fd, &claim) == 0, "CLAIM writes");
@@ -338,14 +346,18 @@ static void test_writer_validation(int fd)
 
     char *root = malloc(SIDECAR_MAX_ROOT_ID + 1U);
     char *path = malloc(SIDECAR_MAX_PATH + 1U);
+    char *leaf = malloc(SIDECAR_MAX_PHYSICAL_LEAF + 1U);
     char *name = malloc(SIDECAR_MAX_XATTR_NAME + 1U);
     unsigned char *value = malloc(SIDECAR_MAX_XATTR_VALUE + 1U);
-    check(root != NULL && path != NULL && name != NULL && value != NULL,
+    check(root != NULL && path != NULL && leaf != NULL && name != NULL &&
+              value != NULL,
           "ceiling fixtures allocate");
-    if (root == NULL || path == NULL || name == NULL || value == NULL)
+    if (root == NULL || path == NULL || leaf == NULL || name == NULL ||
+        value == NULL)
         goto done;
     memset(root, 'r', SIDECAR_MAX_ROOT_ID + 1U);
     memset(path, 'p', SIDECAR_MAX_PATH + 1U);
+    memset(leaf, 'l', SIDECAR_MAX_PHYSICAL_LEAF + 1U);
     memset(name, 'n', SIDECAR_MAX_XATTR_NAME + 1U);
     memset(value, 0xa5, SIDECAR_MAX_XATTR_VALUE + 1U);
 
@@ -366,6 +378,17 @@ static void test_writer_validation(int fd)
     entry.logical_path.length++;
     check(sidecar_write_entry(fd, &entry) != 0, "path over ceiling is refused");
     entry.logical_path.length = SIDECAR_MAX_PATH;
+
+    entry.physical_leaf = (SidecarBytes){ (unsigned char *)leaf,
+                                          SIDECAR_MAX_PHYSICAL_LEAF };
+    check(reset_file(fd) == 0 && sidecar_write_header(fd) == 0 &&
+          sidecar_write_entry(fd, &entry) == 0,
+          "physical leaf at its ceiling is accepted");
+    entry.physical_leaf.length++;
+    errno = 0;
+    check(sidecar_write_entry(fd, &entry) != 0 && errno == EINVAL,
+          "physical leaf over its ceiling is refused");
+    entry.physical_leaf = (SidecarBytes){ (const unsigned char *)"file", 4 };
 
     SidecarXattr xattr = {
         .name = { (unsigned char *)name, SIDECAR_MAX_XATTR_NAME },
@@ -410,6 +433,7 @@ static void test_writer_validation(int fd)
 done:
     free(root);
     free(path);
+    free(leaf);
     free(name);
     free(value);
 }
@@ -419,20 +443,24 @@ static void test_claim_writer_validation(int fd)
     printf(BLUE "::" NC " CLAIM writer validation and ceilings\n");
     char *root = malloc(SIDECAR_MAX_ROOT_ID + 1U);
     char *path = malloc(SIDECAR_MAX_PATH + 1U);
-    check(root != NULL && path != NULL, "claim ceiling fixtures allocate");
-    if (root == NULL || path == NULL)
+    char *leaf = malloc(SIDECAR_MAX_PHYSICAL_LEAF + 1U);
+    check(root != NULL && path != NULL && leaf != NULL,
+          "claim ceiling fixtures allocate");
+    if (root == NULL || path == NULL || leaf == NULL)
     {
         free(root);
         free(path);
+        free(leaf);
         return;
     }
     memset(root, 'r', SIDECAR_MAX_ROOT_ID + 1U);
     memset(path, 'p', SIDECAR_MAX_PATH + 1U);
+    memset(leaf, 'l', SIDECAR_MAX_PHYSICAL_LEAF + 1U);
 
     SidecarClaim claim = {
         .root_id = { (const unsigned char *)root, SIDECAR_MAX_ROOT_ID },
         .logical_path = { NULL, 0 },
-        .physical_path = { NULL, 0 },
+        .physical_leaf = { NULL, 0 },
         .kind = SIDECAR_KIND_DIRECTORY
     };
     check(reset_file(fd) == 0 && sidecar_write_header(fd) == 0 &&
@@ -446,6 +474,7 @@ static void test_claim_writer_validation(int fd)
     claim.root_id.length = SIDECAR_MAX_ROOT_ID;
     claim.logical_path = (SidecarBytes){ (const unsigned char *)path,
                                          SIDECAR_MAX_PATH };
+    claim.physical_leaf = (SidecarBytes){ (const unsigned char *)"leaf", 4 };
     check(reset_file(fd) == 0 && sidecar_write_header(fd) == 0 &&
           sidecar_write_claim(fd, &claim) == 0,
           "claim logical path at its ceiling is accepted");
@@ -455,19 +484,19 @@ static void test_claim_writer_validation(int fd)
           "claim logical path over ceiling is refused");
 
     claim.logical_path.length = SIDECAR_MAX_PATH;
-    claim.physical_path = (SidecarBytes){ (const unsigned char *)path,
-                                          SIDECAR_MAX_PATH };
+    claim.physical_leaf = (SidecarBytes){ (const unsigned char *)leaf,
+                                          SIDECAR_MAX_PHYSICAL_LEAF };
     check(reset_file(fd) == 0 && sidecar_write_header(fd) == 0 &&
           sidecar_write_claim(fd, &claim) == 0,
-          "claim physical path at its ceiling is accepted");
-    claim.physical_path.length++;
+          "claim physical leaf at its ceiling is accepted");
+    claim.physical_leaf.length++;
     errno = 0;
     check(sidecar_write_claim(fd, &claim) != 0 && errno == EINVAL,
-          "claim physical path over ceiling is refused");
+          "claim physical leaf over ceiling is refused");
 
     claim.root_id = (SidecarBytes){ (const unsigned char *)"ROOT", 4 };
     claim.logical_path = (SidecarBytes){ (const unsigned char *)"logical", 7 };
-    claim.physical_path = (SidecarBytes){ (const unsigned char *)"physical", 8 };
+    claim.physical_leaf = (SidecarBytes){ (const unsigned char *)"physical", 8 };
     claim.kind = SIDECAR_KIND_FIFO;
     errno = 0;
     check(reset_file(fd) == 0 && sidecar_write_header(fd) == 0 &&
@@ -484,6 +513,119 @@ static void test_claim_writer_validation(int fd)
 
     free(root);
     free(path);
+    free(leaf);
+}
+
+static int parse_regular_leaf_fixture(int fd, const void *leaf,
+                                      size_t leaf_length,
+                                      SidecarStatus *status)
+{
+    if (leaf == NULL || status == NULL)
+        return -1;
+    static const unsigned char logical[] = "dir/file";
+    RawBuffer buffer = {0};
+    int built = append_header(&buffer, "4") == 0 &&
+                append_regular_entry_with_fields(
+                    &buffer, logical, sizeof(logical) - 1U, leaf,
+                    leaf_length, "0", "0") == 0 &&
+                append_commit(&buffer) == 0 && set_raw_file(fd, &buffer) == 0;
+    if (built)
+    {
+        SidecarParseResult result;
+        *status = sidecar_parse_fd(fd, NULL, NULL, &result);
+    }
+    raw_free(&buffer);
+    return built ? 0 : -1;
+}
+
+static void test_physical_leaf_contract(int fd)
+{
+    printf(BLUE "::" NC " sidecar v4 physical-leaf contract\n");
+
+    SidecarEntry root_entry = sample_entry();
+    root_entry.logical_path = (SidecarBytes){ NULL, 0 };
+    root_entry.physical_leaf = (SidecarBytes){ NULL, 0 };
+    root_entry.kind = SIDECAR_KIND_DIRECTORY;
+    root_entry.size = 0;
+    root_entry.xattr_count = 0;
+    check(reset_file(fd) == 0 && sidecar_write_header(fd) == 0 &&
+              sidecar_write_entry(fd, &root_entry) == 0,
+          "root ENTRY accepts an empty logical path and physical leaf");
+
+    SidecarClaim root_claim = {
+        .root_id = { (const unsigned char *)"ROOT", 4 },
+        .logical_path = { NULL, 0 },
+        .physical_leaf = { NULL, 0 },
+        .kind = SIDECAR_KIND_DIRECTORY
+    };
+    check(reset_file(fd) == 0 && sidecar_write_header(fd) == 0 &&
+              sidecar_write_claim(fd, &root_claim) == 0,
+          "root CLAIM accepts an empty logical path and physical leaf");
+
+    SidecarEntry entry = sample_entry();
+    entry.physical_leaf = (SidecarBytes){ NULL, 0 };
+    errno = 0;
+    check(sidecar_write_entry(fd, &entry) != 0 && errno == EINVAL,
+          "non-root ENTRY refuses an empty physical leaf");
+
+    SidecarClaim claim = {
+        .root_id = { (const unsigned char *)"ROOT", 4 },
+        .logical_path = { (const unsigned char *)"dir/file", 8 },
+        .physical_leaf = { NULL, 0 },
+        .kind = SIDECAR_KIND_REGULAR
+    };
+    errno = 0;
+    check(sidecar_write_claim(fd, &claim) != 0 && errno == EINVAL,
+          "non-root CLAIM refuses an empty physical leaf");
+
+    entry = sample_entry();
+    entry.physical_path = (SidecarBytes){ (const unsigned char *)"stale", 5 };
+    errno = 0;
+    check(sidecar_write_entry(fd, &entry) != 0 && errno == EINVAL,
+          "ENTRY writer refuses a caller-supplied runtime physical path");
+    claim.physical_leaf = (SidecarBytes){ (const unsigned char *)"file", 4 };
+    claim.physical_path = (SidecarBytes){ (const unsigned char *)"stale", 5 };
+    errno = 0;
+    check(sidecar_write_claim(fd, &claim) != 0 && errno == EINVAL,
+          "CLAIM writer refuses a caller-supplied runtime physical path");
+
+    unsigned char *leaf = malloc(SIDECAR_MAX_PHYSICAL_LEAF + 1U);
+    check(leaf != NULL, "reader physical-leaf ceiling fixture allocates");
+    if (leaf == NULL)
+        return;
+    memset(leaf, 'l', SIDECAR_MAX_PHYSICAL_LEAF + 1U);
+    SidecarStatus status = SIDECAR_STATUS_OK;
+    check(parse_regular_leaf_fixture(fd, leaf, SIDECAR_MAX_PHYSICAL_LEAF,
+                                     &status) == 0 &&
+              status == SIDECAR_STATUS_OK,
+          "reader accepts a physical leaf at the component ceiling");
+    check(parse_regular_leaf_fixture(fd, leaf,
+                                     SIDECAR_MAX_PHYSICAL_LEAF + 1U,
+                                     &status) == 0 &&
+              status == SIDECAR_STATUS_LIMIT,
+          "reader classifies an over-ceiling physical leaf as a limit violation");
+
+    static const unsigned char slash_leaf[] = "payload/file";
+    check(parse_regular_leaf_fixture(fd, slash_leaf,
+                                     sizeof(slash_leaf) - 1U, &status) == 0 &&
+              status == SIDECAR_STATUS_CORRUPT,
+          "v3-style joined physical path is corruption in the v4 leaf field");
+    static const unsigned char dot_leaf[] = ".";
+    check(parse_regular_leaf_fixture(fd, dot_leaf, sizeof(dot_leaf) - 1U,
+                                     &status) == 0 &&
+              status == SIDECAR_STATUS_CORRUPT,
+          "dot physical leaf is semantic corruption");
+    static const unsigned char dotdot_leaf[] = "..";
+    check(parse_regular_leaf_fixture(fd, dotdot_leaf,
+                                     sizeof(dotdot_leaf) - 1U, &status) == 0 &&
+              status == SIDECAR_STATUS_CORRUPT,
+          "dot-dot physical leaf is semantic corruption");
+    static const unsigned char nul_leaf[] = { 'a', '\0', 'b' };
+    check(parse_regular_leaf_fixture(fd, nul_leaf, sizeof(nul_leaf),
+                                     &status) == 0 &&
+              status == SIDECAR_STATUS_CORRUPT,
+          "NUL-containing physical leaf is semantic corruption");
+    free(leaf);
 }
 
 typedef struct {
@@ -780,7 +922,7 @@ static void test_tail_and_boundary(int fd)
 {
     printf(BLUE "::" NC " sidecar tail recovery and boundaries\n");
     RawBuffer buffer = {0};
-    check(append_header(&buffer, "3") == 0 &&
+    check(append_header(&buffer, "4") == 0 &&
           append_regular_entry(&buffer, "420", "0") == 0 &&
           append_commit(&buffer) == 0,
           "valid prefix fixture is built");
@@ -807,9 +949,9 @@ static void test_tail_and_boundary(int fd)
           "incomplete CLAIM is a truncated tail at the prior boundary");
 
     RawBuffer complete_claim = {0};
-    check(append_header(&complete_claim, "3") == 0 &&
+    check(append_header(&complete_claim, "4") == 0 &&
               append_claim(&complete_claim, "ROOT", "dir/file",
-                           "payload/file", "regular") == 0 &&
+                           "file", "regular") == 0 &&
               set_raw_file(fd, &complete_claim) == 0,
           "complete CLAIM boundary fixture is written");
     status = sidecar_parse_fd(fd, NULL, NULL, &result);
@@ -820,7 +962,7 @@ static void test_tail_and_boundary(int fd)
 
     check(set_raw_file(fd, &buffer) == 0, "prefix is restored");
     RawBuffer uncommitted = {0};
-    check(append_header(&uncommitted, "3") == 0 &&
+    check(append_header(&uncommitted, "4") == 0 &&
           append_regular_entry(&uncommitted, "420", "0") == 0 &&
           set_raw_file(fd, &uncommitted) == 0,
           "uncommitted group is written");
@@ -850,13 +992,21 @@ static void test_corruption_and_versions(int fd)
     raw_free(&buffer);
     memset(&buffer, 0, sizeof(buffer));
     check(append_header(&buffer, "2") == 0 &&
-              append_claim(&buffer, "ROOT", "dir/file", "payload/file",
+              append_claim(&buffer, "ROOT", "dir/file", "file",
                            "regular") == 0 &&
               set_raw_file(fd, &buffer) == 0,
           "v2 CLAIM fixture is written");
     status = sidecar_parse_fd(fd, NULL, NULL, &result);
     check(status == SIDECAR_STATUS_UNKNOWN_VERSION,
-          "v2 CLAIM is refused at the v3 version boundary");
+          "v2 CLAIM is refused at the v4 version boundary");
+
+    raw_free(&buffer);
+    memset(&buffer, 0, sizeof(buffer));
+    check(append_header(&buffer, "3") == 0 && set_raw_file(fd, &buffer) == 0,
+          "v3 header fixture is written");
+    status = sidecar_parse_fd(fd, NULL, NULL, &result);
+    check(status == SIDECAR_STATUS_UNKNOWN_VERSION,
+          "v3 sidecar is refused at the v4 version boundary");
 
     check(reset_file(fd) == 0 &&
           write_all_test(fd, (const unsigned char *)"MIGR_SIDECAR\0", 13) == 0 &&
@@ -868,7 +1018,7 @@ static void test_corruption_and_versions(int fd)
 
     raw_free(&buffer);
     memset(&buffer, 0, sizeof(buffer));
-    check(append_header(&buffer, "3") == 0 &&
+    check(append_header(&buffer, "4") == 0 &&
           append_regular_entry(&buffer, "0420", "0") == 0 &&
           append_commit(&buffer) == 0 && set_raw_file(fd, &buffer) == 0,
           "non-canonical numeric fixture is written");
@@ -878,7 +1028,7 @@ static void test_corruption_and_versions(int fd)
 
     raw_free(&buffer);
     memset(&buffer, 0, sizeof(buffer));
-    check(append_header(&buffer, "3") == 0 && raw_tag(&buffer, "UNKNOWN") == 0 &&
+    check(append_header(&buffer, "4") == 0 && raw_tag(&buffer, "UNKNOWN") == 0 &&
           set_raw_file(fd, &buffer) == 0,
           "unknown tag fixture is written");
     status = sidecar_parse_fd(fd, NULL, NULL, &result);
@@ -887,8 +1037,8 @@ static void test_corruption_and_versions(int fd)
     raw_free(&buffer);
 
     memset(&buffer, 0, sizeof(buffer));
-    check(append_header(&buffer, "3") == 0 &&
-              append_claim(&buffer, "ROOT", "dir/file", "payload/file",
+    check(append_header(&buffer, "4") == 0 &&
+              append_claim(&buffer, "ROOT", "dir/file", "file",
                            "fifo") == 0 && set_raw_file(fd, &buffer) == 0,
           "unsupported CLAIM kind fixture is written");
     status = sidecar_parse_fd(fd, NULL, NULL, &result);
@@ -897,10 +1047,10 @@ static void test_corruption_and_versions(int fd)
 
     raw_free(&buffer);
     memset(&buffer, 0, sizeof(buffer));
-    check(append_header(&buffer, "3") == 0 && raw_tag(&buffer, "ENTRY") == 0 &&
+    check(append_header(&buffer, "4") == 0 && raw_tag(&buffer, "ENTRY") == 0 &&
               raw_text_field(&buffer, "ROOT") == 0 &&
               raw_text_field(&buffer, "dir/file") == 0 &&
-              raw_text_field(&buffer, "payload/file") == 0 &&
+              raw_text_field(&buffer, "file") == 0 &&
               raw_text_field(&buffer, "") == 0 &&
               raw_text_field(&buffer, "regular") == 0 &&
               raw_text_field(&buffer, "0") == 0 &&
@@ -914,7 +1064,7 @@ static void test_corruption_and_versions(int fd)
               raw_tag(&buffer, "CLAIM") == 0 &&
               raw_text_field(&buffer, "ROOT") == 0 &&
               raw_text_field(&buffer, "dir/file") == 0 &&
-              raw_text_field(&buffer, "payload/file") == 0 &&
+              raw_text_field(&buffer, "file") == 0 &&
               raw_text_field(&buffer, "regular") == 0 &&
               set_raw_file(fd, &buffer) == 0,
           "CLAIM inside an open ENTRY group is written");
@@ -924,7 +1074,7 @@ static void test_corruption_and_versions(int fd)
 
     raw_free(&buffer);
     memset(&buffer, 0, sizeof(buffer));
-    check(append_header(&buffer, "3") == 0 && raw_tag(&buffer, "CLAIM") == 0 &&
+    check(append_header(&buffer, "4") == 0 && raw_tag(&buffer, "CLAIM") == 0 &&
               raw_text_field(&buffer, "ROOT") == 0 &&
               raw_text_field(&buffer, "dir/file") == 0 &&
               raw_text_field(&buffer, "regular") == 0 &&
@@ -946,11 +1096,11 @@ static void test_corruption_and_versions(int fd)
     raw_free(&buffer);
     memset(&buffer, 0, sizeof(buffer));
     static const unsigned char hardlink_xattr_value[] = { 'v' };
-    check(append_header(&buffer, "3") == 0 &&
+    check(append_header(&buffer, "4") == 0 &&
               raw_tag(&buffer, "ENTRY") == 0 &&
               raw_text_field(&buffer, "ROOT") == 0 &&
               raw_text_field(&buffer, "dir/file") == 0 &&
-              raw_text_field(&buffer, "payload/file") == 0 &&
+              raw_text_field(&buffer, "file") == 0 &&
               raw_text_field(&buffer, "") == 0 &&
               raw_text_field(&buffer, "hardlink") == 0 &&
               raw_text_field(&buffer, "0") == 0 &&
@@ -993,10 +1143,10 @@ static void test_symlink_kind_parsing(int fd)
 {
     printf(BLUE "::" NC " sidecar symlink grammar\n");
     RawBuffer buffer = {0};
-    check(append_header(&buffer, "3") == 0 && raw_tag(&buffer, "ENTRY") == 0 &&
+    check(append_header(&buffer, "4") == 0 && raw_tag(&buffer, "ENTRY") == 0 &&
           raw_text_field(&buffer, "ROOT") == 0 &&
           raw_text_field(&buffer, "link") == 0 &&
-          raw_text_field(&buffer, "payload/link") == 0 &&
+          raw_text_field(&buffer, "link") == 0 &&
           raw_text_field(&buffer, "") == 0 &&
           raw_text_field(&buffer, "symlink") == 0 &&
           raw_text_field(&buffer, "0") == 0 &&
@@ -1030,10 +1180,12 @@ static void test_reader_path_ceiling(int fd)
     if (path == NULL)
         return;
     memset(path, 'p', SIDECAR_MAX_PATH + 1U);
+    static const unsigned char leaf[] = "file";
 
-    check(append_header(&buffer, "3") == 0 &&
-          append_regular_entry_with_logical(&buffer, path, SIDECAR_MAX_PATH,
-                                            "0", "0") == 0 &&
+    check(append_header(&buffer, "4") == 0 &&
+          append_regular_entry_with_fields(
+              &buffer, path, SIDECAR_MAX_PATH, leaf, sizeof(leaf) - 1U,
+              "0", "0") == 0 &&
           append_commit(&buffer) == 0 && set_raw_file(fd, &buffer) == 0,
           "raw entry at the path ceiling is written");
     SidecarParseResult result;
@@ -1041,10 +1193,10 @@ static void test_reader_path_ceiling(int fd)
           "reader accepts a path at its ceiling");
 
     raw_free(&buffer);
-    check(append_header(&buffer, "3") == 0 &&
-          append_regular_entry_with_logical(&buffer, path,
-                                            SIDECAR_MAX_PATH + 1U,
-                                            "0", "0") == 0 &&
+    check(append_header(&buffer, "4") == 0 &&
+          append_regular_entry_with_fields(
+              &buffer, path, SIDECAR_MAX_PATH + 1U, leaf,
+              sizeof(leaf) - 1U, "0", "0") == 0 &&
           append_commit(&buffer) == 0 && set_raw_file(fd, &buffer) == 0,
           "raw entry over the path ceiling is written");
     check(sidecar_parse_fd(fd, NULL, NULL, &result) == SIDECAR_STATUS_LIMIT,
@@ -1095,6 +1247,7 @@ int main(void)
     test_header_and_roundtrip(fd);
     test_writer_validation(fd);
     test_claim_writer_validation(fd);
+    test_physical_leaf_contract(fd);
     test_collision_suffix(fd);
     test_symlink_and_hardlink_writer(fd);
     test_tail_and_boundary(fd);

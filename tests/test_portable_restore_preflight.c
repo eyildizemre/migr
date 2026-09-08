@@ -155,7 +155,10 @@ static SidecarEntry entry_for(const char *root, const char *logical,
     memset(&entry, 0, sizeof(entry));
     entry.root_id = text_bytes(root);
     entry.logical_path = text_bytes(logical);
-    entry.physical_path = text_bytes(physical);
+    const char *slash = strrchr(physical, '/');
+    const char *leaf = logical[0] == '\0' ? "" :
+                       (slash == NULL ? physical : slash + 1);
+    entry.physical_leaf = text_bytes(leaf);
     entry.kind = kind;
     entry.mode = kind == SIDECAR_KIND_DIRECTORY ? 0755U : 04755U;
     entry.uid = (uint32_t)(geteuid() == 0 ? 65534U : 0U);
@@ -307,7 +310,7 @@ static int append_entries(SidecarLog *log, const SidecarEntry *entries,
         SidecarClaim claim = {
             .root_id = entries[index].root_id,
             .logical_path = entries[index].logical_path,
-            .physical_path = entries[index].physical_path,
+            .physical_leaf = entries[index].physical_leaf,
             .kind = entries[index].kind
         };
         if (entries[index].kind != SIDECAR_KIND_FIFO &&
@@ -342,11 +345,13 @@ static int write_sidecar(Fixture *fixture, const SidecarEntry *entries,
     return 0;
 }
 
-static int write_raw_entry_sidecar(Fixture *fixture,
-                                   const SidecarEntry *entry)
+static int write_raw_entries_sidecar(Fixture *fixture,
+                                     const SidecarEntry *entries,
+                                     size_t count)
 {
     SidecarLog log = {0};
-    if (entry == NULL || sidecar_log_create_at(fixture->container_fd, &log) !=
+    if ((entries == NULL && count != 0) ||
+        sidecar_log_create_at(fixture->container_fd, &log) !=
             SIDECAR_OPEN_FRESH || sidecar_log_close(&log) !=
             SIDECAR_STATUS_OK)
         return -1;
@@ -354,11 +359,19 @@ static int write_raw_entry_sidecar(Fixture *fixture,
                     O_WRONLY | O_APPEND | O_CLOEXEC);
     if (fd < 0)
         return -1;
-    int result = sidecar_write_entry(fd, entry) == 0 &&
+    int result = 1;
+    for (size_t index = 0; index < count && result; index++)
+        result = sidecar_write_entry(fd, &entries[index]) == 0 &&
                  sidecar_write_entry_commit(fd) == 0;
     if (close(fd) != 0)
         result = 0;
     return result ? 0 : -1;
+}
+
+static int write_raw_entry_sidecar(Fixture *fixture,
+                                   const SidecarEntry *entry)
+{
+    return write_raw_entries_sidecar(fixture, entry, entry == NULL ? 0U : 1U);
 }
 
 static int append_raw_sidecar(Fixture *fixture, const unsigned char *data,
@@ -394,19 +407,23 @@ static int raw_text_field(unsigned char *buffer, size_t capacity,
                      (const unsigned char *)text, strlen(text));
 }
 
-static int append_raw_suffix_entry(Fixture *fixture,
-                                   const unsigned char *suffix,
-                                   size_t suffix_length)
+static int append_raw_suffix_entry_fields(Fixture *fixture,
+                                          const char *logical,
+                                          const char *physical_leaf,
+                                          const unsigned char *suffix,
+                                          size_t suffix_length,
+                                          const char *kind,
+                                          const char *mode)
 {
     unsigned char raw[512];
     size_t length = 0;
     if (raw_text_field(raw, sizeof(raw), &length, "ENTRY") != 0 ||
         raw_text_field(raw, sizeof(raw), &length, "ROOT") != 0 ||
-        raw_text_field(raw, sizeof(raw), &length, "file") != 0 ||
-        raw_text_field(raw, sizeof(raw), &length, "file") != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, logical) != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, physical_leaf) != 0 ||
         raw_field(raw, sizeof(raw), &length, suffix, suffix_length) != 0 ||
-        raw_text_field(raw, sizeof(raw), &length, "regular") != 0 ||
-        raw_text_field(raw, sizeof(raw), &length, "600") != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, kind) != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, mode) != 0 ||
         raw_text_field(raw, sizeof(raw), &length, "0") != 0 ||
         raw_text_field(raw, sizeof(raw), &length, "0") != 0 ||
         raw_text_field(raw, sizeof(raw), &length, "0") != 0 ||
@@ -428,6 +445,14 @@ static int append_raw_suffix_entry(Fixture *fixture,
         append_raw_sidecar(fixture, commit, sizeof(commit)) != 0)
         return -1;
     return 0;
+}
+
+static int append_raw_suffix_entry(Fixture *fixture,
+                                   const unsigned char *suffix,
+                                   size_t suffix_length)
+{
+    return append_raw_suffix_entry_fields(fixture, "file", "file", suffix,
+                                          suffix_length, "regular", "600");
 }
 
 static int run_preflight_with_xdg(
@@ -548,7 +573,7 @@ static void test_outstanding_claim_gate(void)
     SidecarClaim outstanding = {
         .root_id = text_bytes("ROOT"),
         .logical_path = text_bytes("blocked"),
-        .physical_path = text_bytes("blocked"),
+        .physical_leaf = text_bytes("blocked"),
         .kind = SIDECAR_KIND_REGULAR
     };
     SidecarLog log = {0};
@@ -583,9 +608,11 @@ static void test_missing_payload(void)
     if (opened != 0)
         return;
     make_root_payload(&fixture);
-    SidecarEntry entry = entry_for("ROOT", "missing", "missing",
-                                   SIDECAR_KIND_REGULAR, 3);
-    check(write_sidecar(&fixture, &entry, 1) == 0,
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0),
+        entry_for("ROOT", "missing", "missing", SIDECAR_KIND_REGULAR, 3)
+    };
+    check(write_sidecar(&fixture, entries, 2) == 0,
           "missing-payload state is committed");
     char sentinel[PATH_MAX];
     fixture_path(sentinel, sizeof(sentinel), fixture.home, "/sentinel");
@@ -689,7 +716,8 @@ static void test_destination_profile_refusal_keeps_scanning(void)
 
 static void run_refusal_case(const char *label, ManifestRoot *root,
                              SidecarEntry *entries, size_t entry_count,
-                             void (*prepare)(Fixture *fixture))
+                             void (*prepare)(Fixture *fixture),
+                             int raw_state)
 {
     Fixture fixture;
     int opened = fixture_open(&fixture, label, root, 1);
@@ -701,11 +729,11 @@ static void run_refusal_case(const char *label, ManifestRoot *root,
     int fifo_fixture = entries != NULL && entry_count == 1 &&
                        entries[0].kind == SIDECAR_KIND_FIFO;
     /* D25 excludes FIFO from claim kinds, and the wire parser rejects a raw
-     * FIFO CLAIM as corruption.  No valid v3 wire sequence can therefore
+     * FIFO CLAIM as corruption.  No valid v4 wire sequence can therefore
      * reach collect_entry with FIFO; this raw entry must be rejected by the
      * strict claimless adoption gate before "unsupported-kind". */
-    int sidecar_result = fifo_fixture
-        ? write_raw_entry_sidecar(&fixture, &entries[0])
+    int sidecar_result = fifo_fixture || raw_state
+        ? write_raw_entries_sidecar(&fixture, entries, entry_count)
         : write_sidecar(&fixture, entries, entry_count);
     check(sidecar_result == 0, "refusal sidecar is committed");
     if (fifo_fixture)
@@ -750,46 +778,62 @@ static void test_path_and_mapping_refusals(void)
 {
     printf(BLUE "::" NC " lexical, mapping, and type refusals\n");
     ManifestRoot root = root_for("ROOT", "ROOT", "restored");
-    SidecarEntry absolute = entry_for("ROOT", "/absolute", "x",
-                                      SIDECAR_KIND_REGULAR, 0);
-    run_refusal_case("absolute", &root, &absolute, 1, prepare_root_dir);
-    SidecarEntry parent = entry_for("ROOT", "a/../b", "x",
-                                    SIDECAR_KIND_REGULAR, 0);
-    run_refusal_case("dotdot", &root, &parent, 1, prepare_root_dir);
-    SidecarEntry empty = entry_for("ROOT", "a//b", "x",
-                                   SIDECAR_KIND_REGULAR, 0);
-    run_refusal_case("empty-component", &root, &empty, 1, prepare_root_dir);
+    SidecarEntry absolute[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0),
+        entry_for("ROOT", "/absolute", "x", SIDECAR_KIND_REGULAR, 0)
+    };
+    run_refusal_case("absolute", &root, absolute, 2, prepare_root_dir, 0);
+    SidecarEntry parent[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0),
+        entry_for("ROOT", "a", "a", SIDECAR_KIND_DIRECTORY, 0),
+        entry_for("ROOT", "a/..", "a/dotdot", SIDECAR_KIND_DIRECTORY, 0),
+        entry_for("ROOT", "a/../b", "a/dotdot/b", SIDECAR_KIND_REGULAR, 0)
+    };
+    run_refusal_case("dotdot", &root, parent, 4, prepare_root_dir, 0);
+    SidecarEntry empty[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0),
+        entry_for("ROOT", "a", "a", SIDECAR_KIND_DIRECTORY, 0),
+        entry_for("ROOT", "a/", "a/gap", SIDECAR_KIND_DIRECTORY, 0),
+        entry_for("ROOT", "a//b", "a/gap/b", SIDECAR_KIND_REGULAR, 0)
+    };
+    run_refusal_case("empty-component", &root, empty, 4,
+                     prepare_root_dir, 0);
 
     /* Both aliases are now rejected by the physical/logical invariant before
      * duplicate-path analysis; retain the two-entry shape as an early refusal. */
     SidecarEntry duplicate[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0),
         entry_for("ROOT", "a", "shared", SIDECAR_KIND_REGULAR, 3),
         entry_for("ROOT", "b", "shared", SIDECAR_KIND_REGULAR, 3)
     };
-    run_refusal_case("physical-mismatch-before-duplicate", &root, duplicate, 2,
-                     prepare_root_dir);
+    run_refusal_case("physical-mismatch-before-duplicate", &root, duplicate, 3,
+                     prepare_root_dir, 0);
 
     SidecarEntry ancestor[] = {
         entry_for("ROOT", "dir", "dir", SIDECAR_KIND_REGULAR, 7),
         entry_for("ROOT", "dir/child", "dir/child", SIDECAR_KIND_REGULAR, 1)
     };
     run_refusal_case("file-ancestor", &root, ancestor, 2,
-                     prepare_root_file);
+                     prepare_root_file, 1);
 
-    SidecarEntry external = entry_for("OTHER", "file", "file",
-                                      SIDECAR_KIND_REGULAR, 0);
-    run_refusal_case("external-root", &root, &external, 1,
-                     prepare_root_dir);
+    SidecarEntry external[] = {
+        entry_for("OTHER", "", "", SIDECAR_KIND_DIRECTORY, 0),
+        entry_for("OTHER", "file", "file", SIDECAR_KIND_REGULAR, 0)
+    };
+    run_refusal_case("external-root", &root, external, 2,
+                     prepare_root_dir, 0);
 
     SidecarEntry fifo = entry_for("ROOT", "fifo", "fifo", SIDECAR_KIND_FIFO, 0);
     run_refusal_case("unsupported-kind", &root, &fifo, 1,
-                     prepare_root_dir);
+                     prepare_root_dir, 1);
 
-    SidecarEntry mismatch = entry_for("ROOT", "innocuous.txt",
-                                      "something-else.txt",
-                                      SIDECAR_KIND_REGULAR, 7);
-    run_refusal_case("physical-mismatch", &root, &mismatch, 1,
-                     prepare_root_dir);
+    SidecarEntry mismatch[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0),
+        entry_for("ROOT", "innocuous.txt", "something-else.txt",
+                  SIDECAR_KIND_REGULAR, 7)
+    };
+    run_refusal_case("physical-mismatch", &root, mismatch, 2,
+                     prepare_root_dir, 0);
 }
 
 static void run_suffix_refusal_case(const char *label, const char *suffix,
@@ -808,10 +852,12 @@ static void run_suffix_refusal_case(const char *label, const char *suffix,
     if (payload_length < 0 || (size_t)payload_length >= sizeof(payload_path))
         fatal("suffix fixture payload path is too long");
     write_file_at(fixture.data_fd, payload_path, "payload");
-    SidecarEntry entry = entry_for("ROOT", "file", physical,
-                                   SIDECAR_KIND_REGULAR, 0);
-    entry.collision_suffix = text_bytes(suffix);
-    check(write_sidecar(&fixture, &entry, 1) == 0,
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0),
+        entry_for("ROOT", "file", physical, SIDECAR_KIND_REGULAR, 0)
+    };
+    entries[1].collision_suffix = text_bytes(suffix);
+    check(write_sidecar(&fixture, entries, 2) == 0,
           "suffix-refusal sidecar is committed");
     write_file_at(fixture.home_fd, "sentinel", "untouched");
     char sentinel[PATH_MAX];
@@ -919,7 +965,7 @@ static void test_collision_suffix_validation(void)
         make_root_payload(&missing);
         SidecarEntry child = entry_for("ROOT", "dir/file", "dir/file",
                                        SIDECAR_KIND_REGULAR, 0);
-        check(write_sidecar(&missing, &child, 1) == 0,
+        check(write_raw_entry_sidecar(&missing, &child) == 0,
               "missing-parent sidecar is committed");
         PortableRestorePreflightReport report;
         check(run_preflight(&missing, &report) != 0,
@@ -942,17 +988,18 @@ static void test_collision_suffix_validation(void)
             fatal("could not create parent-mismatch payload directory");
         close(payload_root);
         SidecarEntry entries[] = {
+            entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0),
             entry_for("ROOT", "dir", "dir%7E1",
                       SIDECAR_KIND_DIRECTORY, 0),
-            entry_for("ROOT", "dir/file", "other/file",
+            entry_for("ROOT", "dir/file", "dir%7E1/other",
                       SIDECAR_KIND_REGULAR, 0)
         };
-        entries[0].collision_suffix = text_bytes("%7E1");
-        check(write_sidecar(&mismatch, entries, 2) == 0,
+        entries[1].collision_suffix = text_bytes("%7E1");
+        check(write_sidecar(&mismatch, entries, 3) == 0,
               "parent-mismatch sidecar is committed");
         PortableRestorePreflightReport report;
         check(run_preflight(&mismatch, &report) != 0,
-              "parent physical-prefix mismatch is refused");
+              "child physical mismatch beneath a suffixed parent is refused");
         portable_restore_preflight_report_free(&report);
         fixture_close(&mismatch);
     }
@@ -963,10 +1010,10 @@ static void test_collision_suffix_validation(void)
     if (opened == 0)
     {
         make_root_payload(&root_suffix);
-        SidecarEntry entry = entry_for("ROOT", "", "",
-                                       SIDECAR_KIND_DIRECTORY, 0);
-        entry.collision_suffix = text_bytes("%7E1");
-        check(write_sidecar(&root_suffix, &entry, 1) == 0,
+        static const unsigned char root_suffix_bytes[] = "%7E1";
+        check(append_raw_suffix_entry_fields(
+                  &root_suffix, "", "", root_suffix_bytes,
+                  sizeof(root_suffix_bytes) - 1U, "directory", "755") == 0,
               "root-suffix sidecar is committed");
         PortableRestorePreflightReport report;
         check(run_preflight(&root_suffix, &report) != 0,
@@ -1052,7 +1099,11 @@ static void test_symlink_refusals(void)
                      "/data/ROOT/link");
         check(symlink(outside, link_path) == 0,
               "final payload symlink is planted");
-        check(write_sidecar(&final_fixture, &root_entry, 1) == 0,
+        SidecarEntry entries[] = {
+            entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0),
+            root_entry
+        };
+        check(write_sidecar(&final_fixture, entries, 2) == 0,
               "final-symlink sidecar is committed");
         char sentinel[PATH_MAX];
         fixture_path(sentinel, sizeof(sentinel), final_fixture.home,
@@ -1231,16 +1282,19 @@ static void test_file_ancestor_conflict_wedge(void)
     printf(BLUE "::" NC " lexical wedge ancestor conflict\n");
     ManifestRoot root = root_for("ROOT", "ROOT", "restored");
     SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0),
         entry_for("ROOT", "dir", "dir", SIDECAR_KIND_REGULAR, 7),
+        entry_for("ROOT", "parent", "dir", SIDECAR_KIND_DIRECTORY, 0),
         entry_for("ROOT", "dir-x", "dir-x", SIDECAR_KIND_REGULAR, 7),
-        entry_for("ROOT", "dir/child", "dir/child", SIDECAR_KIND_REGULAR, 1)
+        entry_for("ROOT", "parent/child", "dir/child",
+                  SIDECAR_KIND_REGULAR, 1)
     };
     Fixture fixture;
     int opened = fixture_open(&fixture, "file-ancestor-wedge", &root, 1);
     check(opened == 0, "file-ancestor-wedge fixture is created");
     if (opened != 0)
         return;
-    check(write_sidecar(&fixture, entries, 3) == 0,
+    check(write_sidecar(&fixture, entries, 5) == 0,
           "file-ancestor-wedge sidecar is committed");
     write_file_at(fixture.home_fd, "sentinel", "untouched");
     char sentinel[PATH_MAX];

@@ -459,7 +459,7 @@ static int claim_matches_entry(const StateClaim *claim,
     return claim != NULL && entry != NULL &&
            bytes_equal(claim->claim.root_id, entry->root_id) &&
            bytes_equal(claim->claim.logical_path, entry->logical_path) &&
-           bytes_equal(claim->claim.physical_path, entry->physical_path) &&
+           bytes_equal(claim->claim.physical_leaf, entry->physical_leaf) &&
            claim->claim.kind == entry->kind;
 }
 

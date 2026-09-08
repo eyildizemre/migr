@@ -1,4 +1,4 @@
-// Unit tests for the sidecar v3 state log (docs/DECISIONS.md D17/D21/D22/D25): the
+// Unit tests for the sidecar v4 state log (docs/DECISIONS.md D17/D21/D22/D25/D39): the
 // `(root_id, logical_path)`-keyed live-state map built on top of the sidecar
 // codec's record framing, with last-committed-wins semantics, DELETE
 // handling, the fd-anchored no-follow single-link slot, and adopt-time
@@ -58,6 +58,14 @@ static int count_live_callback(const SidecarLiveView *view, void *context)
     return 0;
 }
 
+static int bytes_match_text(SidecarBytes bytes, const char *text)
+{
+    size_t length = text == NULL ? 0U : strlen(text);
+    return text != NULL && bytes.length == length &&
+           (length == 0 || (bytes.data != NULL &&
+                            memcmp(bytes.data, text, length) == 0));
+}
+
 static int write_all_test(int fd, const void *data, size_t length)
 {
     const unsigned char *bytes = data;
@@ -89,10 +97,15 @@ static int write_raw_text_field(int fd, const char *text)
 static int write_raw_hardlink_with_xattr(int fd)
 {
     static const unsigned char value[] = { 0x00, 0x41, 0xff, 0x00 };
-    return write_raw_text_field(fd, "ENTRY") == 0 &&
+    return write_raw_text_field(fd, "CLAIM") == 0 &&
+           write_raw_text_field(fd, "ROOT") == 0 &&
+           write_raw_text_field(fd, "") == 0 &&
+           write_raw_text_field(fd, "") == 0 &&
+           write_raw_text_field(fd, "directory") == 0 &&
+           write_raw_text_field(fd, "ENTRY") == 0 &&
            write_raw_text_field(fd, "ROOT") == 0 &&
            write_raw_text_field(fd, "copy") == 0 &&
-           write_raw_text_field(fd, "payload/copy") == 0 &&
+           write_raw_text_field(fd, "copy") == 0 &&
            write_raw_text_field(fd, "") == 0 &&
            write_raw_text_field(fd, "hardlink") == 0 &&
            write_raw_text_field(fd, "416") == 0 &&
@@ -145,8 +158,11 @@ static SidecarEntry entry_for(const char *root, const char *logical,
     entry.root_id = (SidecarBytes){ (const unsigned char *)root, strlen(root) };
     entry.logical_path = (SidecarBytes){ (const unsigned char *)logical,
                                          strlen(logical) };
-    entry.physical_path = (SidecarBytes){ (const unsigned char *)physical,
-                                          strlen(physical) };
+    const char *slash = strrchr(physical, '/');
+    const char *leaf = logical[0] == '\0' ? "" :
+                       (slash == NULL ? physical : slash + 1);
+    entry.physical_leaf = (SidecarBytes){ (const unsigned char *)leaf,
+                                          strlen(leaf) };
     entry.kind = SIDECAR_KIND_REGULAR;
     entry.mode = 0640;
     entry.uid = 1000;
@@ -163,12 +179,21 @@ static SidecarEntry entry_for(const char *root, const char *logical,
 static SidecarClaim claim_for(const char *root, const char *logical,
                               const char *physical, SidecarObjectKind kind)
 {
+    const char *slash = strrchr(physical, '/');
+    const char *leaf = logical[0] == '\0' ? "" :
+                       (slash == NULL ? physical : slash + 1);
     return (SidecarClaim){
         .root_id = { (const unsigned char *)root, strlen(root) },
         .logical_path = { (const unsigned char *)logical, strlen(logical) },
-        .physical_path = { (const unsigned char *)physical, strlen(physical) },
+        .physical_leaf = { (const unsigned char *)leaf, strlen(leaf) },
         .kind = kind
     };
+}
+
+static int append_root_claim(SidecarLog *log, const char *root)
+{
+    SidecarClaim claim = claim_for(root, "", "", SIDECAR_KIND_DIRECTORY);
+    return sidecar_log_append_claim(log, &claim) == SIDECAR_STATUS_OK ? 0 : -1;
 }
 
 static SidecarXattr sample_xattr(void)
@@ -186,8 +211,9 @@ static void test_fresh_and_live_map(int container_fd)
     check(reset_slot(container_fd) == 0, "slot starts absent");
 
     SidecarLog log = {0};
-    check(sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH,
-          "fresh slot is created atomically");
+    check(sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH &&
+              append_root_claim(&log, "ROOT") == 0,
+          "fresh slot is created with a root ancestry claim");
     uint64_t header_size = 0;
     check(slot_size(container_fd, &header_size) == 0 && header_size > 0,
           "fresh log owns a regular fd at the header boundary");
@@ -264,8 +290,9 @@ static void test_claim_replay_and_transitions(int container_fd)
                                    SIDECAR_KIND_REGULAR);
     SidecarEntry entry = entry_for("ROOT", "file", "payload/file", 17, 0);
     SidecarLog log = {0};
-    check(sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH,
-          "claim fixture is created");
+    check(sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH &&
+              append_root_claim(&log, "ROOT") == 0,
+          "claim fixture is created with a root ancestry claim");
     check(sidecar_log_append_claim(&log, &claim) == SIDECAR_STATUS_OK,
           "CLAIM appends before an entry group");
 
@@ -274,8 +301,10 @@ static void test_claim_replay_and_transitions(int container_fd)
         &log, claim.root_id, claim.logical_path, &claim_view);
     check(claim_found == 1 && claim_view.claim != NULL &&
               claim_view.claim->kind == SIDECAR_KIND_REGULAR &&
-              claim_view.claim->physical_path.length == 12 &&
-              memcmp(claim_view.claim->physical_path.data, "payload/file", 12) == 0 &&
+              claim_view.claim->physical_leaf.length == 4 &&
+              memcmp(claim_view.claim->physical_leaf.data, "file", 4) == 0 &&
+              claim_view.claim->physical_path.length == 4 &&
+              memcmp(claim_view.claim->physical_path.data, "file", 4) == 0 &&
               sidecar_log_live_count(&log) == 0,
           "outstanding CLAIM is queryable but not live state");
     size_t live_seen = 0;
@@ -342,7 +371,8 @@ static void test_claim_replay_and_transitions(int container_fd)
           "claim transition log closes");
 
     check(reset_slot(container_fd) == 0 &&
-              sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH,
+              sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH &&
+              append_root_claim(&log, "ROOT") == 0,
           "claimless commit fixture is created");
     check(sidecar_log_append_entry(&log, &entry) == SIDECAR_STATUS_OK &&
               sidecar_log_append_entry_commit(&log) == SIDECAR_STATUS_CORRUPT,
@@ -353,7 +383,8 @@ static void test_claim_replay_and_transitions(int container_fd)
           "claimless live fixture closes");
 
     check(reset_slot(container_fd) == 0 &&
-              sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH,
+              sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH &&
+              append_root_claim(&log, "ROOT") == 0,
           "mismatching commit fixture is created");
     SidecarEntry mismatching = entry_for("ROOT", "file", "payload/other",
                                          17, 0);
@@ -383,6 +414,7 @@ static void test_claim_replay_and_transitions(int container_fd)
 
     check(reset_slot(container_fd) == 0 &&
               sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH &&
+              append_root_claim(&log, "ROOT") == 0 &&
               sidecar_log_close(&log) == SIDECAR_STATUS_OK,
           "claimless adoption fixture is created");
     int fd = slot_fd(container_fd, O_WRONLY | O_APPEND);
@@ -396,6 +428,7 @@ static void test_claim_replay_and_transitions(int container_fd)
 
     check(reset_slot(container_fd) == 0 &&
               sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH &&
+              append_root_claim(&log, "ROOT") == 0 &&
               sidecar_log_close(&log) == SIDECAR_STATUS_OK,
           "mismatching adoption fixture is created");
     fd = slot_fd(container_fd, O_WRONLY | O_APPEND);
@@ -410,6 +443,7 @@ static void test_claim_replay_and_transitions(int container_fd)
 
     check(reset_slot(container_fd) == 0 &&
               sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH &&
+              append_root_claim(&log, "ROOT") == 0 &&
               sidecar_log_append_claim(&log, &claim) == SIDECAR_STATUS_OK &&
               sidecar_log_append_claim(&log, &claim) ==
                   SIDECAR_STATUS_INVALID_ARGUMENT,
@@ -418,7 +452,8 @@ static void test_claim_replay_and_transitions(int container_fd)
           "duplicate guard log closes");
 
     check(reset_slot(container_fd) == 0 &&
-              sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH,
+              sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH &&
+              append_root_claim(&log, "ROOT") == 0,
           "raw duplicate fixture is created");
     check(sidecar_log_close(&log) == SIDECAR_STATUS_OK, "raw fixture closes");
     fd = slot_fd(container_fd, O_WRONLY | O_APPEND);
@@ -431,7 +466,8 @@ static void test_claim_replay_and_transitions(int container_fd)
           "identical duplicate CLAIMs are rejected at adoption");
 
     check(reset_slot(container_fd) == 0 &&
-              sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH,
+              sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH &&
+              append_root_claim(&log, "ROOT") == 0,
           "raw conflict fixture is created");
     check(sidecar_log_close(&log) == SIDECAR_STATUS_OK, "conflict fixture closes");
     SidecarClaim conflict = claim_for("ROOT", "file", "payload/conflict",
@@ -446,13 +482,272 @@ static void test_claim_replay_and_transitions(int container_fd)
           "conflicting CLAIMs are rejected at adoption");
 }
 
+static void test_v4_parent_chain_and_leaf_identity(int container_fd)
+{
+    printf(BLUE "::" NC " v4 parent chain and physical-leaf identity\n");
+    check(reset_slot(container_fd) == 0, "v4 parent-chain slot starts absent");
+
+    SidecarLog log = {0};
+    check(sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH,
+          "v4 parent-chain log is created");
+
+    SidecarClaim root_claim = claim_for("ROOT", "", "",
+                                        SIDECAR_KIND_DIRECTORY);
+    SidecarEntry root_entry = entry_for("ROOT", "", "", 0, 0);
+    root_entry.kind = SIDECAR_KIND_DIRECTORY;
+    check(sidecar_log_append_claim(&log, &root_claim) == SIDECAR_STATUS_OK &&
+              sidecar_log_append_entry(&log, &root_entry) == SIDECAR_STATUS_OK &&
+              sidecar_log_append_entry_commit(&log) == SIDECAR_STATUS_OK,
+          "root CLAIM and directory ENTRY establish the ancestry anchor");
+
+    char directory_leaf[] = "directory";
+    SidecarClaim directory_claim = claim_for(
+        "ROOT", "dir", directory_leaf, SIDECAR_KIND_DIRECTORY);
+    check(sidecar_log_append_claim(&log, &directory_claim) == SIDECAR_STATUS_OK,
+          "directory CLAIM is accepted below the live root");
+    directory_leaf[0] = 'X';
+    SidecarClaimView claim_view;
+    check(sidecar_log_find_claim(&log, directory_claim.root_id,
+                                 directory_claim.logical_path,
+                                 &claim_view) == 1 &&
+              claim_view.claim != NULL &&
+              bytes_match_text(claim_view.claim->physical_leaf, "directory") &&
+              bytes_match_text(claim_view.claim->physical_path, "directory"),
+          "CLAIM owns its leaf and derives its joined compatibility path");
+
+    SidecarEntry directory_entry = entry_for(
+        "ROOT", "dir", "directory", 0, 0);
+    directory_entry.kind = SIDECAR_KIND_DIRECTORY;
+    check(sidecar_log_append_entry(&log, &directory_entry) ==
+              SIDECAR_STATUS_OK &&
+              sidecar_log_append_entry_commit(&log) == SIDECAR_STATUS_OK,
+          "directory ENTRY consumes the matching directory CLAIM");
+
+    SidecarClaim file_claim = claim_for(
+        "ROOT", "dir/file", "file", SIDECAR_KIND_REGULAR);
+    check(sidecar_log_append_claim(&log, &file_claim) == SIDECAR_STATUS_OK,
+          "file CLAIM is accepted below the live directory");
+    check(sidecar_log_find_claim(&log, file_claim.root_id,
+                                 file_claim.logical_path,
+                                 &claim_view) == 1 &&
+              claim_view.claim != NULL &&
+              bytes_match_text(claim_view.claim->physical_leaf, "file") &&
+              bytes_match_text(claim_view.claim->physical_path,
+                               "directory/file"),
+          "nested CLAIM derives its path from canonical ancestor state");
+
+    char file_leaf[] = "file";
+    SidecarEntry file_entry = entry_for(
+        "ROOT", "dir/file", file_leaf, 17, 0);
+    check(sidecar_log_append_entry(&log, &file_entry) == SIDECAR_STATUS_OK &&
+              sidecar_log_append_entry_commit(&log) == SIDECAR_STATUS_OK,
+          "file ENTRY commits against the matching leaf identity");
+    file_leaf[0] = 'X';
+
+    SidecarLiveView live_view;
+    check(sidecar_log_find(&log, file_entry.root_id, file_entry.logical_path,
+                           &live_view) == 1 &&
+              live_view.entry != NULL &&
+              bytes_match_text(live_view.entry->physical_leaf, "file") &&
+              bytes_match_text(live_view.entry->physical_path,
+                               "directory/file"),
+          "live ENTRY owns its leaf and derived path independently of caller memory");
+    check(sidecar_log_close(&log) == SIDECAR_STATUS_OK,
+          "v4 parent-chain log closes before adoption");
+
+    check(sidecar_log_adopt_at(container_fd, &log) == SIDECAR_OPEN_RESUMABLE &&
+              sidecar_log_find(&log, file_entry.root_id,
+                               file_entry.logical_path, &live_view) == 1 &&
+              live_view.entry != NULL &&
+              bytes_match_text(live_view.entry->physical_leaf, "file") &&
+              bytes_match_text(live_view.entry->physical_path,
+                               "directory/file"),
+          "adoption rebuilds the nested v4 leaf identity and compatibility path");
+    check(sidecar_log_close(&log) == SIDECAR_STATUS_OK,
+          "adopted v4 parent-chain log closes");
+
+    check(reset_slot(container_fd) == 0 &&
+              sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH,
+          "root leaf guard fixture is created");
+    SidecarClaim invalid_root_claim = claim_for(
+        "ROOT", "", "root", SIDECAR_KIND_DIRECTORY);
+    invalid_root_claim.physical_leaf = (SidecarBytes){
+        (const unsigned char *)"root", 4
+    };
+    check(sidecar_log_append_claim(&log, &invalid_root_claim) ==
+              SIDECAR_STATUS_INVALID_ARGUMENT,
+          "state API rejects a root CLAIM carrying a physical leaf");
+    check(append_root_claim(&log, "ROOT") == 0,
+          "valid root CLAIM still succeeds after the rejected input");
+    SidecarEntry invalid_root_entry = root_entry;
+    invalid_root_entry.physical_leaf = (SidecarBytes){
+        (const unsigned char *)"root", 4
+    };
+    check(sidecar_log_append_entry(&log, &invalid_root_entry) ==
+              SIDECAR_STATUS_INVALID_ARGUMENT,
+          "state API rejects a root ENTRY carrying a physical leaf");
+    check(sidecar_log_close(&log) == SIDECAR_STATUS_OK,
+          "root leaf guard fixture closes");
+}
+
+static void test_v4_parent_state_guards(int container_fd)
+{
+    printf(BLUE "::" NC " v4 parent-state guards and outstanding ancestry\n");
+    SidecarLog log = {0};
+
+    check(reset_slot(container_fd) == 0 &&
+              sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH,
+          "orphan parent fixture is created");
+    SidecarClaim orphan = claim_for("ROOT", "orphan", "orphan",
+                                    SIDECAR_KIND_REGULAR);
+    check(sidecar_log_append_claim(&log, &orphan) ==
+              SIDECAR_STATUS_INVALID_ARGUMENT,
+          "non-root state without an address-bearing parent fails closed");
+    check(sidecar_log_close(&log) == SIDECAR_STATUS_OK,
+          "orphan parent fixture closes");
+
+    check(reset_slot(container_fd) == 0 &&
+              sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH &&
+              append_root_claim(&log, "ROOT") == 0,
+          "non-directory parent fixture is created");
+    SidecarClaim regular_parent = claim_for(
+        "ROOT", "parent", "parent", SIDECAR_KIND_REGULAR);
+    SidecarClaim child = claim_for(
+        "ROOT", "parent/child", "child", SIDECAR_KIND_REGULAR);
+    check(sidecar_log_append_claim(&log, &regular_parent) ==
+              SIDECAR_STATUS_OK &&
+              sidecar_log_append_claim(&log, &child) ==
+                  SIDECAR_STATUS_INVALID_ARGUMENT,
+          "a non-directory parent cannot anchor child physical addressing");
+    check(sidecar_log_close(&log) == SIDECAR_STATUS_OK,
+          "non-directory parent fixture closes");
+
+    check(reset_slot(container_fd) == 0 &&
+              sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH &&
+              append_root_claim(&log, "ROOT") == 0,
+          "outstanding parent-chain fixture is created");
+    SidecarClaim one = claim_for("ROOT", "one", "one",
+                                 SIDECAR_KIND_DIRECTORY);
+    SidecarClaim two = claim_for("ROOT", "one/two", "two",
+                                 SIDECAR_KIND_DIRECTORY);
+    check(sidecar_log_append_claim(&log, &one) == SIDECAR_STATUS_OK &&
+              sidecar_log_append_claim(&log, &two) == SIDECAR_STATUS_OK &&
+              sidecar_log_claim_count(&log) == 3,
+          "outstanding directory CLAIM can parent a second outstanding CLAIM");
+    SidecarClaimView view;
+    check(sidecar_log_find_claim(&log, two.root_id, two.logical_path, &view) == 1 &&
+              view.claim != NULL &&
+              bytes_match_text(view.claim->physical_path, "one/two"),
+          "outstanding parent chain derives the nested compatibility path");
+    check(sidecar_log_close(&log) == SIDECAR_STATUS_OK,
+          "outstanding parent-chain fixture closes before adoption");
+    check(sidecar_log_adopt_at(container_fd, &log) == SIDECAR_OPEN_RESUMABLE &&
+              sidecar_log_claim_count(&log) == 3 &&
+              sidecar_log_find_claim(&log, two.root_id, two.logical_path,
+                                     &view) == 1 &&
+              view.claim != NULL &&
+              bytes_match_text(view.claim->physical_leaf, "two") &&
+              bytes_match_text(view.claim->physical_path, "one/two"),
+          "adoption preserves the three-level outstanding CLAIM chain");
+    check(sidecar_log_close(&log) == SIDECAR_STATUS_OK,
+          "adopted outstanding parent-chain fixture closes");
+}
+
+static void test_v4_cumulative_physical_path_limit(int container_fd)
+{
+    printf(BLUE "::" NC " v4 canonical state outlives joined-path cache limit\n");
+    check(reset_slot(container_fd) == 0, "long physical ancestry slot starts absent");
+
+    SidecarLog log = {0};
+    check(sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH &&
+              append_root_claim(&log, "ROOT") == 0,
+          "long physical ancestry starts with a root CLAIM");
+
+    char logical[SIDECAR_MAX_PATH + 1U] = {0};
+    char leaf[SIDECAR_MAX_PHYSICAL_LEAF + 1U];
+    memset(leaf, 'a', SIDECAR_MAX_PHYSICAL_LEAF);
+    leaf[SIDECAR_MAX_PHYSICAL_LEAF] = '\0';
+
+    SidecarClaim deepest = {0};
+    int appended = 1;
+    for (unsigned int depth = 0; depth < 17U; depth++)
+    {
+        char component[8];
+        int component_length = snprintf(component, sizeof(component), "n%02u",
+                                        depth);
+        size_t logical_length = strlen(logical);
+        size_t needed = (logical_length == 0 ? 0U : 1U) +
+                        (component_length > 0 ? (size_t)component_length : 0U);
+        if (component_length <= 0 ||
+            (size_t)component_length >= sizeof(component) ||
+            needed > SIDECAR_MAX_PATH - logical_length)
+        {
+            appended = 0;
+            break;
+        }
+        if (logical_length != 0)
+            logical[logical_length++] = '/';
+        memcpy(logical + logical_length, component, (size_t)component_length + 1U);
+        leaf[0] = (char)('a' + (depth % 26U));
+        deepest = claim_for("ROOT", logical, leaf, SIDECAR_KIND_DIRECTORY);
+        if (sidecar_log_append_claim(&log, &deepest) != SIDECAR_STATUS_OK)
+        {
+            appended = 0;
+            break;
+        }
+    }
+    check(appended && sidecar_log_claim_count(&log) == 18,
+          "seventeen component-bounded descendants enter canonical state");
+
+    SidecarClaimView view;
+    check(appended &&
+              sidecar_log_find_claim(&log, deepest.root_id,
+                                     deepest.logical_path, &view) == 1 &&
+              view.claim != NULL &&
+              view.claim->physical_leaf.length == SIDECAR_MAX_PHYSICAL_LEAF &&
+              view.claim->physical_path.length == 0,
+          "joined path beyond SIDECAR_MAX_PATH leaves only the canonical leaf");
+    check(sidecar_log_close(&log) == SIDECAR_STATUS_OK,
+          "long physical ancestry closes before adoption");
+
+    check(sidecar_log_adopt_at(container_fd, &log) == SIDECAR_OPEN_RESUMABLE &&
+              sidecar_log_claim_count(&log) == 18 &&
+              sidecar_log_find_claim(&log, deepest.root_id,
+                                     deepest.logical_path, &view) == 1 &&
+              view.claim != NULL &&
+              view.claim->physical_leaf.length == SIDECAR_MAX_PHYSICAL_LEAF &&
+              view.claim->physical_path.length == 0,
+          "adoption accepts canonical v4 ancestry beyond the old joined-path limit");
+    check(sidecar_log_close(&log) == SIDECAR_STATUS_OK,
+          "adopted long physical ancestry closes");
+}
+
+static void test_v3_adoption_refusal(int container_fd)
+{
+    printf(BLUE "::" NC " v3 sidecar refusal at the v4 state boundary\n");
+    check(reset_slot(container_fd) == 0, "v3 refusal slot starts absent");
+    int fd = openat(container_fd, SIDECAR_SLOT_NAME,
+                    O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    check(fd >= 0 &&
+              write_raw_text_field(fd, SIDECAR_MAGIC) == 0 &&
+              write_raw_text_field(fd, "3") == 0,
+          "canonical v3 header fixture is written");
+    if (fd >= 0)
+        close(fd);
+
+    SidecarLog log = {0};
+    check(sidecar_log_adopt_at(container_fd, &log) == SIDECAR_OPEN_UNUSABLE,
+          "v3 state is unusable at the v4 adoption boundary");
+}
+
 static void test_sequence_and_hardlink_guards(int container_fd)
 {
     printf(BLUE "::" NC " append sequence and hardlink validation\n");
     check(reset_slot(container_fd) == 0, "old slot is removed");
     SidecarLog log = {0};
-    check(sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH,
-          "guard fixture is created");
+    check(sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH &&
+              append_root_claim(&log, "ROOT") == 0,
+          "guard fixture is created with a root ancestry claim");
     SidecarEntry entry = entry_for("ROOT", "file", "payload/file", 1, 1);
     SidecarClaim entry_claim = claim_for("ROOT", "file", "payload/file",
                                          SIDECAR_KIND_REGULAR);
@@ -710,8 +1005,9 @@ static void test_truncated_tail(int container_fd)
     printf(BLUE "::" NC " adoption truncates only an EOF tail\n");
     check(reset_slot(container_fd) == 0, "tail slot is absent");
     SidecarLog log = {0};
-    check(sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH,
-          "tail log is created");
+    check(sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH &&
+              append_root_claim(&log, "ROOT") == 0,
+          "tail log is created with a root ancestry claim");
     SidecarEntry entry = entry_for("ROOT", "file", "payload/file", 4, 0);
     SidecarClaim entry_claim = claim_for("ROOT", "file", "payload/file",
                                          SIDECAR_KIND_REGULAR);
@@ -777,7 +1073,7 @@ static void test_interior_corruption_and_hardlink(int container_fd)
     check(reset_slot(container_fd) == 0, "corruption slot is absent");
     int fd = openat(container_fd, SIDECAR_SLOT_NAME,
                     O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-    static const unsigned char corrupt[] = SIDECAR_MAGIC "\0" "3\0UNKNOWN\0";
+    static const unsigned char corrupt[] = SIDECAR_MAGIC "\0" "4\0UNKNOWN\0";
     check(fd >= 0 && write_all_test(fd, corrupt, sizeof(corrupt) - 1U) == 0,
           "interior corruption fixture is written");
     if (fd >= 0)
@@ -840,6 +1136,10 @@ int main(void)
 
     test_fresh_and_live_map(container_fd);
     test_claim_replay_and_transitions(container_fd);
+    test_v4_parent_chain_and_leaf_identity(container_fd);
+    test_v4_parent_state_guards(container_fd);
+    test_v4_cumulative_physical_path_limit(container_fd);
+    test_v3_adoption_refusal(container_fd);
     test_sequence_and_hardlink_guards(container_fd);
     test_hardlink_adopt_validation(container_fd);
     test_missing_and_slot_types(container_fd);

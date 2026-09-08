@@ -5,11 +5,12 @@
 #include <stdint.h>
 
 #define SIDECAR_MAGIC "MIGR_SIDECAR"
-#define SIDECAR_VERSION 3
+#define SIDECAR_VERSION 4
 #define SIDECAR_SLOT_NAME "sidecar.migr"
 
 #define SIDECAR_MAX_ROOT_ID 64U
 #define SIDECAR_MAX_PATH 4096U
+#define SIDECAR_MAX_PHYSICAL_LEAF 255U
 #define SIDECAR_MAX_COLLISION_SUFFIX 32U
 #define SIDECAR_MAX_SYMLINK_TARGET 4096U
 #define SIDECAR_MAX_XATTR_NAME 255U
@@ -70,7 +71,8 @@ typedef enum {
 typedef struct {
     SidecarBytes root_id;
     SidecarBytes logical_path;
-    SidecarBytes physical_path;
+    SidecarBytes physical_leaf;
+    SidecarBytes physical_path; /* Derived runtime-only compatibility cache. */
     SidecarBytes collision_suffix;
     SidecarObjectKind kind;
     uint32_t mode;
@@ -100,7 +102,8 @@ typedef struct {
 typedef struct {
     SidecarBytes root_id;
     SidecarBytes logical_path;
-    SidecarBytes physical_path;
+    SidecarBytes physical_leaf;
+    SidecarBytes physical_path; /* Derived runtime-only compatibility cache. */
     SidecarObjectKind kind;
 } SidecarClaim;
 
@@ -159,6 +162,8 @@ int sidecar_write_entry_commit(int fd);
 int sidecar_write_delete(int fd, const SidecarDelete *deletion);
 int sidecar_write_claim(int fd, const SidecarClaim *claim);
 int sidecar_claim_kind_valid(SidecarObjectKind kind);
+int sidecar_physical_leaf_valid(SidecarBytes logical_path,
+                                SidecarBytes physical_leaf);
 
 /*
  * Parses a regular sidecar fd without changing its offset or contents. The

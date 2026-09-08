@@ -77,11 +77,11 @@ static int claim_foreach_callback(const SidecarClaimView *view, void *argument)
         return 1;
     result->count++;
     if (view->claim->root_id.length != 4U ||
-        memcmp(view->claim->root_id.data, "ITER", 4) != 0 ||
+        memcmp(view->claim->root_id.data, "ROOT", 4) != 0 ||
         view->claim->logical_path.length != 5U ||
         memcmp(view->claim->logical_path.data, "claim", 5) != 0 ||
-        view->claim->physical_path.length != 13U ||
-        memcmp(view->claim->physical_path.data, "payload/claim", 13) != 0 ||
+        view->claim->physical_path.length != 5U ||
+        memcmp(view->claim->physical_path.data, "claim", 5) != 0 ||
         view->claim->kind != SIDECAR_KIND_REGULAR ||
         view->generation != result->expected_generation)
         result->valid = 0;
@@ -348,7 +348,7 @@ static int convert_directory_to_claim(const ClaimDirectoryFixture *fixture)
     SidecarClaim claim = {
         .root_id = { (const unsigned char *)"ROOT", 4 },
         .logical_path = { (const unsigned char *)"claimed", 7 },
-        .physical_path = { (const unsigned char *)"claimed", 7 },
+        .physical_leaf = { (const unsigned char *)"claimed", 7 },
         .kind = SIDECAR_KIND_DIRECTORY
     };
     int result = sidecar_log_append_delete(&log, &deletion) ==
@@ -381,20 +381,20 @@ static void test_claim_foreach(const char *base)
 
     SidecarLog log = {0};
     SidecarClaim first = {
-        .root_id = { (const unsigned char *)"ITER", 4 },
-        .logical_path = { (const unsigned char *)"gone", 4 },
-        .physical_path = { (const unsigned char *)"payload/gone", 12 },
+        .root_id = { (const unsigned char *)"ROOT", 4 },
+        .logical_path = { (const unsigned char *)"drop", 4 },
+        .physical_leaf = { (const unsigned char *)"drop", 4 },
         .kind = SIDECAR_KIND_REGULAR
     };
     SidecarClaim second = {
-        .root_id = { (const unsigned char *)"ITER", 4 },
+        .root_id = { (const unsigned char *)"ROOT", 4 },
         .logical_path = { (const unsigned char *)"claim", 5 },
-        .physical_path = { (const unsigned char *)"payload/claim", 13 },
+        .physical_leaf = { (const unsigned char *)"claim", 5 },
         .kind = SIDECAR_KIND_REGULAR
     };
     SidecarDelete cancel = {
-        .root_id = { (const unsigned char *)"ITER", 4 },
-        .logical_path = { (const unsigned char *)"gone", 4 }
+        .root_id = { (const unsigned char *)"ROOT", 4 },
+        .logical_path = { (const unsigned char *)"drop", 4 }
     };
     ClaimForeachResult result = { .valid = 1 };
     int setup = sidecar_log_adopt_at(fixture.container_fd, &log) ==
@@ -405,7 +405,7 @@ static void test_claim_foreach(const char *base)
     SidecarClaimView surviving = {0};
     if (setup && sidecar_log_find_claim(
                      &log,
-                     (SidecarBytes){ (const unsigned char *)"ITER", 4 },
+                     (SidecarBytes){ (const unsigned char *)"ROOT", 4 },
                      (SidecarBytes){ (const unsigned char *)"claim", 5 },
                      &surviving) == 1)
         result.expected_generation = surviving.generation;

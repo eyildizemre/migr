@@ -95,6 +95,120 @@ static SidecarStatus copy_bytes(StateMemory *memory, SidecarBytes source,
     return SIDECAR_STATUS_OK;
 }
 
+static SidecarStatus structural_failure(SidecarStatus status)
+{
+    if (status == SIDECAR_STATUS_INVALID_ARGUMENT)
+        set_invalid_error();
+    return status;
+}
+
+static SidecarStatus logical_parent(SidecarBytes logical_path,
+                                    SidecarBytes *parent,
+                                    SidecarStatus failure_status)
+{
+    if (parent == NULL || logical_path.length == 0 ||
+        !bytes_valid(logical_path, SIDECAR_MAX_PATH, 0))
+        return structural_failure(failure_status);
+
+    size_t length = logical_path.length;
+    while (length > 0 && logical_path.data[length - 1U] != '/')
+        length--;
+    parent->data = logical_path.data;
+    parent->length = length == 0 ? 0 : length - 1U;
+    return SIDECAR_STATUS_OK;
+}
+
+static SidecarStatus parent_address(const SidecarLogImplementation *log,
+                                    SidecarBytes root_id,
+                                    SidecarBytes logical_path,
+                                    SidecarBytes *parent_logical,
+                                    SidecarBytes *parent_physical,
+                                    SidecarStatus failure_status)
+{
+    if (log == NULL || parent_logical == NULL || parent_physical == NULL)
+        return structural_failure(failure_status);
+
+    SidecarStatus status = logical_parent(logical_path, parent_logical,
+                                          failure_status);
+    if (status != SIDECAR_STATUS_OK)
+        return status;
+
+    size_t entry_index = map_find(&log->map, root_id, *parent_logical);
+    size_t claim_index = map_find(&log->claim_map, root_id, *parent_logical);
+    if ((entry_index == MAP_INDEX_NONE) == (claim_index == MAP_INDEX_NONE))
+        return structural_failure(failure_status);
+
+    SidecarObjectKind kind;
+    if (entry_index != MAP_INDEX_NONE)
+    {
+        const StateEntry *parent = &log->map.slots[entry_index].value.entry;
+        kind = parent->entry.kind;
+        *parent_physical = parent->entry.physical_path;
+    }
+    else
+    {
+        const StateClaim *parent =
+            &log->claim_map.slots[claim_index].value.claim;
+        kind = parent->claim.kind;
+        *parent_physical = parent->claim.physical_path;
+    }
+    if (kind != SIDECAR_KIND_DIRECTORY)
+        return structural_failure(failure_status);
+    return SIDECAR_STATUS_OK;
+}
+
+static SidecarStatus derive_physical_path(SidecarLogImplementation *log,
+                                          SidecarBytes root_id,
+                                          SidecarBytes logical_path,
+                                          SidecarBytes physical_leaf,
+                                          SidecarBytes *destination,
+                                          SidecarStatus failure_status)
+{
+    if (log == NULL || destination == NULL || destination->length != 0 ||
+        !sidecar_physical_leaf_valid(logical_path, physical_leaf))
+        return structural_failure(failure_status);
+    destination->data = NULL;
+    if (logical_path.length == 0)
+        return SIDECAR_STATUS_OK;
+
+    SidecarBytes parent_logical = {0};
+    SidecarBytes parent_physical = {0};
+    SidecarStatus status = parent_address(log, root_id, logical_path,
+                                          &parent_logical, &parent_physical,
+                                          failure_status);
+    if (status != SIDECAR_STATUS_OK)
+        return status;
+
+    /* An empty cache on a non-root parent means the joined compatibility
+     * spelling exceeded its bounded representation earlier in the chain. */
+    if (parent_logical.length != 0 && parent_physical.length == 0)
+        return SIDECAR_STATUS_OK;
+
+    size_t separator = parent_physical.length == 0 ? 0U : 1U;
+    if (parent_physical.length > SIDECAR_MAX_PATH ||
+        separator > SIDECAR_MAX_PATH - parent_physical.length ||
+        physical_leaf.length >
+            SIDECAR_MAX_PATH - parent_physical.length - separator)
+        return SIDECAR_STATUS_OK;
+
+    size_t length = parent_physical.length + separator + physical_leaf.length;
+    unsigned char *data = state_alloc(&log->memory, length);
+    if (data == NULL)
+        return errno == ENOMEM ? SIDECAR_STATUS_ALLOCATION
+                               : SIDECAR_STATUS_LIMIT;
+    size_t offset = 0;
+    if (parent_physical.length != 0)
+    {
+        memcpy(data, parent_physical.data, parent_physical.length);
+        offset = parent_physical.length;
+        data[offset++] = '/';
+    }
+    memcpy(data + offset, physical_leaf.data, physical_leaf.length);
+    destination->data = data;
+    destination->length = length;
+    return SIDECAR_STATUS_OK;
+}
+
 static void clear_xattr(StateMemory *memory, SidecarXattr *xattr)
 {
     if (xattr == NULL)
@@ -112,6 +226,8 @@ void clear_entry(StateMemory *memory, StateEntry *entry)
                entry->entry.root_id.length);
     state_free(memory, (void *)entry->entry.logical_path.data,
                entry->entry.logical_path.length);
+    state_free(memory, (void *)entry->entry.physical_leaf.data,
+               entry->entry.physical_leaf.length);
     state_free(memory, (void *)entry->entry.physical_path.data,
                entry->entry.physical_path.length);
     state_free(memory, (void *)entry->entry.collision_suffix.data,
@@ -140,6 +256,8 @@ void clear_claim(StateMemory *memory, StateClaim *claim)
                claim->claim.root_id.length);
     state_free(memory, (void *)claim->claim.logical_path.data,
                claim->claim.logical_path.length);
+    state_free(memory, (void *)claim->claim.physical_leaf.data,
+               claim->claim.physical_leaf.length);
     state_free(memory, (void *)claim->claim.physical_path.data,
                claim->claim.physical_path.length);
     memset(claim, 0, sizeof(*claim));
@@ -152,7 +270,9 @@ static SidecarStatus copy_claim(StateMemory *memory,
     if (source == NULL || destination == NULL ||
         !bytes_valid(source->root_id, SIDECAR_MAX_ROOT_ID, 1) ||
         !bytes_valid(source->logical_path, SIDECAR_MAX_PATH, 0) ||
-        !bytes_valid(source->physical_path, SIDECAR_MAX_PATH, 0) ||
+        !sidecar_physical_leaf_valid(source->logical_path,
+                                     source->physical_leaf) ||
+        source->physical_path.length != 0 ||
         !sidecar_claim_kind_valid(source->kind))
     {
         set_invalid_error();
@@ -169,8 +289,9 @@ static SidecarStatus copy_claim(StateMemory *memory,
                         &destination->claim.logical_path);
     if (status != SIDECAR_STATUS_OK)
         goto fail;
-    status = copy_bytes(memory, source->physical_path, SIDECAR_MAX_PATH, 0, 0,
-                        &destination->claim.physical_path);
+    status = copy_bytes(memory, source->physical_leaf,
+                        SIDECAR_MAX_PHYSICAL_LEAF, 0, 0,
+                        &destination->claim.physical_leaf);
     if (status != SIDECAR_STATUS_OK)
         goto fail;
     return SIDECAR_STATUS_OK;
@@ -212,9 +333,13 @@ static SidecarStatus copy_entry(StateMemory *memory, const SidecarEntry *source,
     if (source == NULL || destination == NULL ||
         !bytes_valid(source->root_id, SIDECAR_MAX_ROOT_ID, 1) ||
         !bytes_valid(source->logical_path, SIDECAR_MAX_PATH, 0) ||
-        !bytes_valid(source->physical_path, SIDECAR_MAX_PATH, 0) ||
+        !sidecar_physical_leaf_valid(source->logical_path,
+                                     source->physical_leaf) ||
+        source->physical_path.length != 0 ||
         !bytes_valid(source->collision_suffix,
                      SIDECAR_MAX_COLLISION_SUFFIX, 0) ||
+        (source->logical_path.length == 0 &&
+         source->collision_suffix.length != 0) ||
         source->atime_nsec > SIDECAR_MAX_NSEC ||
         source->mtime_nsec > SIDECAR_MAX_NSEC ||
         source->mode > SIDECAR_MAX_MODE ||
@@ -275,6 +400,7 @@ static SidecarStatus copy_entry(StateMemory *memory, const SidecarEntry *source,
     destination->entry = *source;
     destination->entry.root_id.data = NULL;
     destination->entry.logical_path.data = NULL;
+    destination->entry.physical_leaf.data = NULL;
     destination->entry.physical_path.data = NULL;
     destination->entry.collision_suffix.data = NULL;
     destination->entry.symlink_target.data = NULL;
@@ -291,8 +417,9 @@ static SidecarStatus copy_entry(StateMemory *memory, const SidecarEntry *source,
                         &destination->entry.logical_path);
     if (status != SIDECAR_STATUS_OK)
         goto fail;
-    status = copy_bytes(memory, source->physical_path, SIDECAR_MAX_PATH, 0, 0,
-                        &destination->entry.physical_path);
+    status = copy_bytes(memory, source->physical_leaf,
+                        SIDECAR_MAX_PHYSICAL_LEAF, 0, 0,
+                        &destination->entry.physical_leaf);
     if (status != SIDECAR_STATUS_OK)
         goto fail;
     status = copy_bytes(memory, source->collision_suffix,
@@ -442,6 +569,13 @@ static int load_callback(const SidecarRecord *record, void *context)
         status = copy_entry(&log->memory, &record->value.entry,
                             &log->pending.entry);
         if (status == SIDECAR_STATUS_OK)
+            status = derive_physical_path(
+                log, log->pending.entry.entry.root_id,
+                log->pending.entry.entry.logical_path,
+                log->pending.entry.entry.physical_leaf,
+                &log->pending.entry.entry.physical_path,
+                SIDECAR_STATUS_CORRUPT);
+        if (status == SIDECAR_STATUS_OK)
             log->pending.xattrs_seen = 0;
     }
     else if (record->type == SIDECAR_RECORD_XATTR)
@@ -504,6 +638,11 @@ static int load_callback(const SidecarRecord *record, void *context)
         {
             StateClaim claim = {0};
             status = copy_claim(&log->memory, &record->value.claim, &claim);
+            if (status == SIDECAR_STATUS_OK)
+                status = derive_physical_path(
+                    log, claim.claim.root_id, claim.claim.logical_path,
+                    claim.claim.physical_leaf, &claim.claim.physical_path,
+                    SIDECAR_STATUS_CORRUPT);
             uint64_t hash = 0;
             if (status == SIDECAR_STATUS_OK)
                 status = map_prepare_claim(
@@ -742,6 +881,16 @@ SidecarStatus sidecar_log_append_entry(SidecarLog *log,
     status = copy_entry(&implementation->memory, entry, &copy);
     if (status != SIDECAR_STATUS_OK)
         return status;
+    status = derive_physical_path(implementation, copy.entry.root_id,
+                                  copy.entry.logical_path,
+                                  copy.entry.physical_leaf,
+                                  &copy.entry.physical_path,
+                                  SIDECAR_STATUS_INVALID_ARGUMENT);
+    if (status != SIDECAR_STATUS_OK)
+    {
+        clear_entry(&implementation->memory, &copy);
+        return status;
+    }
     if (sidecar_write_entry(implementation->fd, entry) != 0)
     {
         status = status_from_errno();
@@ -903,6 +1052,16 @@ SidecarStatus sidecar_log_append_claim(SidecarLog *log,
     status = copy_claim(&implementation->memory, claim, &copy);
     if (status != SIDECAR_STATUS_OK)
         return status;
+    status = derive_physical_path(implementation, copy.claim.root_id,
+                                  copy.claim.logical_path,
+                                  copy.claim.physical_leaf,
+                                  &copy.claim.physical_path,
+                                  SIDECAR_STATUS_INVALID_ARGUMENT);
+    if (status != SIDECAR_STATUS_OK)
+    {
+        clear_claim(&implementation->memory, &copy);
+        return status;
+    }
     size_t claim_index = MAP_INDEX_NONE;
     uint64_t hash = 0;
     status = map_prepare_claim(&implementation->memory,

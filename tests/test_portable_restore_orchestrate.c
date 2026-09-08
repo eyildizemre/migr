@@ -472,7 +472,10 @@ static SidecarEntry entry_for(const char *root, const char *logical,
     memset(&entry, 0, sizeof(entry));
     entry.root_id = text_bytes(root);
     entry.logical_path = text_bytes(logical);
-    entry.physical_path = text_bytes(physical);
+    const char *slash = strrchr(physical, '/');
+    const char *leaf = logical[0] == '\0' ? "" :
+                       (slash == NULL ? physical : slash + 1);
+    entry.physical_leaf = text_bytes(leaf);
     entry.kind = kind;
     entry.mode = mode;
     entry.uid = uid;
@@ -575,7 +578,7 @@ static int append_entries(SidecarLog *log, const SidecarEntry *entries,
         SidecarClaim claim = {
             .root_id = entries[index].root_id,
             .logical_path = entries[index].logical_path,
-            .physical_path = entries[index].physical_path,
+            .physical_leaf = entries[index].physical_leaf,
             .kind = entries[index].kind
         };
         if (sidecar_log_append_claim(log, &claim) != SIDECAR_STATUS_OK)
@@ -618,7 +621,7 @@ static int write_sidecar_with_xattr(Fixture *fixture,
         SidecarClaim claim = {
             .root_id = entries[index].root_id,
             .logical_path = entries[index].logical_path,
-            .physical_path = entries[index].physical_path,
+            .physical_leaf = entries[index].physical_leaf,
             .kind = entries[index].kind
         };
         if (sidecar_log_append_claim(&log, &claim) != SIDECAR_STATUS_OK ||

@@ -102,6 +102,24 @@ static int validate_bytes(SidecarBytes bytes, size_t maximum, int nonempty)
     return 0;
 }
 
+int sidecar_physical_leaf_valid(SidecarBytes logical_path,
+                                SidecarBytes physical_leaf)
+{
+    if (logical_path.length == 0)
+        return physical_leaf.length == 0;
+    if (physical_leaf.length == 0 ||
+        physical_leaf.length > SIDECAR_MAX_PHYSICAL_LEAF ||
+        physical_leaf.data == NULL || bytes_have_nul(physical_leaf) ||
+        memchr(physical_leaf.data, '/', physical_leaf.length) != NULL)
+        return 0;
+    if (physical_leaf.length == 1 && physical_leaf.data[0] == '.')
+        return 0;
+    if (physical_leaf.length == 2 && physical_leaf.data[0] == '.' &&
+        physical_leaf.data[1] == '.')
+        return 0;
+    return 1;
+}
+
 static void set_size_error(void)
 {
     errno = E2BIG;
@@ -346,9 +364,13 @@ static int validate_entry(const SidecarEntry *entry)
     if (entry == NULL ||
         validate_bytes(entry->root_id, SIDECAR_MAX_ROOT_ID, 1) != 0 ||
         validate_bytes(entry->logical_path, SIDECAR_MAX_PATH, 0) != 0 ||
-        validate_bytes(entry->physical_path, SIDECAR_MAX_PATH, 0) != 0 ||
+        !sidecar_physical_leaf_valid(entry->logical_path,
+                                     entry->physical_leaf) ||
+        entry->physical_path.length != 0 ||
         validate_bytes(entry->collision_suffix,
                        SIDECAR_MAX_COLLISION_SUFFIX, 0) != 0 ||
+        (entry->logical_path.length == 0 &&
+         entry->collision_suffix.length != 0) ||
         entry->atime_nsec > SIDECAR_MAX_NSEC ||
         entry->mtime_nsec > SIDECAR_MAX_NSEC ||
         entry->mode > SIDECAR_MAX_MODE ||
@@ -440,7 +462,9 @@ static int validate_claim(const SidecarClaim *claim)
     if (claim == NULL ||
         validate_bytes(claim->root_id, SIDECAR_MAX_ROOT_ID, 1) != 0 ||
         validate_bytes(claim->logical_path, SIDECAR_MAX_PATH, 0) != 0 ||
-        validate_bytes(claim->physical_path, SIDECAR_MAX_PATH, 0) != 0 ||
+        !sidecar_physical_leaf_valid(claim->logical_path,
+                                     claim->physical_leaf) ||
+        claim->physical_path.length != 0 ||
         !sidecar_claim_kind_valid(claim->kind))
     {
         set_invalid_error();
@@ -463,7 +487,7 @@ static int build_entry_buffer(const SidecarEntry *entry, SidecarBuffer *buffer)
     if (buffer_append_tag(buffer, tag_entry) != 0 ||
         buffer_append_field(buffer, entry->root_id) != 0 ||
         buffer_append_field(buffer, entry->logical_path) != 0 ||
-        buffer_append_field(buffer, entry->physical_path) != 0 ||
+        buffer_append_field(buffer, entry->physical_leaf) != 0 ||
         buffer_append_field(buffer, entry->collision_suffix) != 0 ||
         buffer_append_field(buffer, (SidecarBytes){
             (const unsigned char *)kind, strlen(kind) }) != 0 ||
@@ -514,7 +538,7 @@ static int build_claim_buffer(const SidecarClaim *claim, SidecarBuffer *buffer)
     if (buffer_append_tag(buffer, tag_claim) != 0 ||
         buffer_append_field(buffer, claim->root_id) != 0 ||
         buffer_append_field(buffer, claim->logical_path) != 0 ||
-        buffer_append_field(buffer, claim->physical_path) != 0 ||
+        buffer_append_field(buffer, claim->physical_leaf) != 0 ||
         buffer_append_field(buffer, (SidecarBytes){
             (const unsigned char *)kind, strlen(kind) }) != 0)
         return -1;
@@ -877,6 +901,7 @@ static void free_entry(SidecarReader *reader, SidecarEntry *entry)
         return;
     reader_free(reader, (void *)entry->root_id.data);
     reader_free(reader, (void *)entry->logical_path.data);
+    reader_free(reader, (void *)entry->physical_leaf.data);
     reader_free(reader, (void *)entry->physical_path.data);
     reader_free(reader, (void *)entry->collision_suffix.data);
     reader_free(reader, (void *)entry->symlink_target.data);
@@ -895,13 +920,22 @@ static SidecarStatus parse_entry(SidecarReader *reader, SidecarEntry *entry)
     status = read_required_field(reader, SIDECAR_MAX_PATH, &entry->logical_path);
     if (status != SIDECAR_STATUS_OK)
         goto fail;
-    status = read_required_field(reader, SIDECAR_MAX_PATH, &entry->physical_path);
+    status = read_required_field(reader, SIDECAR_MAX_PHYSICAL_LEAF,
+                                 &entry->physical_leaf);
     if (status != SIDECAR_STATUS_OK)
         goto fail;
     status = read_required_field(reader, SIDECAR_MAX_COLLISION_SUFFIX,
                                  &entry->collision_suffix);
     if (status != SIDECAR_STATUS_OK)
         goto fail;
+    if (!sidecar_physical_leaf_valid(entry->logical_path,
+                                     entry->physical_leaf) ||
+        (entry->logical_path.length == 0 &&
+         entry->collision_suffix.length != 0))
+    {
+        status = SIDECAR_STATUS_CORRUPT;
+        goto fail;
+    }
 
     SidecarBytes kind_field;
     status = read_required_field(reader, SIDECAR_KIND_MAX, &kind_field);
@@ -1079,10 +1113,16 @@ static SidecarStatus parse_claim(SidecarReader *reader, SidecarClaim *claim)
                                  &claim->logical_path);
     if (status != SIDECAR_STATUS_OK)
         goto fail;
-    status = read_required_field(reader, SIDECAR_MAX_PATH,
-                                 &claim->physical_path);
+    status = read_required_field(reader, SIDECAR_MAX_PHYSICAL_LEAF,
+                                 &claim->physical_leaf);
     if (status != SIDECAR_STATUS_OK)
         goto fail;
+    if (!sidecar_physical_leaf_valid(claim->logical_path,
+                                     claim->physical_leaf))
+    {
+        status = SIDECAR_STATUS_CORRUPT;
+        goto fail;
+    }
 
     SidecarBytes kind_field;
     status = read_required_field(reader, SIDECAR_KIND_MAX, &kind_field);
@@ -1114,6 +1154,7 @@ static void free_claim(SidecarReader *reader, SidecarClaim *claim)
         return;
     reader_free(reader, (void *)claim->root_id.data);
     reader_free(reader, (void *)claim->logical_path.data);
+    reader_free(reader, (void *)claim->physical_leaf.data);
     reader_free(reader, (void *)claim->physical_path.data);
     memset(claim, 0, sizeof(*claim));
 }

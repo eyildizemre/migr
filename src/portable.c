@@ -733,6 +733,24 @@ static int time_to_i64(time_t value, int64_t *out)
     return 0;
 }
 
+static int physical_leaf_from_joined(const char *logical, const char *physical,
+                                     SidecarBytes *out)
+{
+    if (logical == NULL || physical == NULL || out == NULL)
+        return -1;
+    *out = (SidecarBytes){0};
+    if (logical[0] == '\0')
+        return physical[0] == '\0' ? 0 : -1;
+    if (physical[0] == '\0')
+        return -1;
+    const char *slash = strrchr(physical, '/');
+    const char *leaf = slash == NULL ? physical : slash + 1;
+    if (!safe_component(leaf))
+        return -1;
+    *out = (SidecarBytes){ (const unsigned char *)leaf, strlen(leaf) };
+    return 0;
+}
+
 int entry_from_stat(const char *root_id, const char *logical,
                     const char *physical, const char *collision_suffix,
                     const struct stat *st, int nsec_exact,
@@ -775,8 +793,9 @@ int entry_from_stat(const char *root_id, const char *logical,
                                    strlen(root_id) };
     out->logical_path = (SidecarBytes){ (const unsigned char *)logical,
                                         strlen(logical) };
-    out->physical_path = (SidecarBytes){ (const unsigned char *)physical,
-                                         strlen(physical) };
+    if (physical_leaf_from_joined(logical, physical,
+                                  &out->physical_leaf) != 0)
+        return -1;
     out->collision_suffix = (SidecarBytes){
         (const unsigned char *)collision_suffix, strlen(collision_suffix) };
     if (hardlink_requested)
@@ -861,7 +880,7 @@ int entries_equal(const SidecarEntry *current,
      * promise source-symlink atime preservation, so atime is not a resume key. */
     return sidecar_bytes_equal(current->root_id, entry->root_id) &&
            sidecar_bytes_equal(current->logical_path, entry->logical_path) &&
-           sidecar_bytes_equal(current->physical_path, entry->physical_path) &&
+           sidecar_bytes_equal(current->physical_leaf, entry->physical_leaf) &&
            sidecar_bytes_equal(current->collision_suffix,
                                entry->collision_suffix) &&
            current->kind == entry->kind && current->mode == entry->mode &&
@@ -1535,10 +1554,13 @@ static int append_capture_claim(PortableCaptureContext *context,
     if (context == NULL || root == NULL || root->id == NULL ||
         logical == NULL || physical == NULL)
         return -1;
+    SidecarBytes physical_leaf = {0};
+    if (physical_leaf_from_joined(logical, physical, &physical_leaf) != 0)
+        return -1;
     SidecarClaim claim = {
         .root_id = { (const unsigned char *)root->id, strlen(root->id) },
         .logical_path = { (const unsigned char *)logical, strlen(logical) },
-        .physical_path = { (const unsigned char *)physical, strlen(physical) },
+        .physical_leaf = physical_leaf,
         .kind = kind
     };
     SidecarClaimView existing = {0};
@@ -1551,8 +1573,8 @@ static int append_capture_claim(PortableCaptureContext *context,
             sidecar_bytes_equal(existing.claim->root_id, claim.root_id) &&
             sidecar_bytes_equal(existing.claim->logical_path,
                                 claim.logical_path) &&
-            sidecar_bytes_equal(existing.claim->physical_path,
-                                claim.physical_path) &&
+            sidecar_bytes_equal(existing.claim->physical_leaf,
+                                claim.physical_leaf) &&
             existing.claim->kind == claim.kind)
             return 0;
         if (reconcile_stale_claim(context, root, logical, existing.claim) != 0)
