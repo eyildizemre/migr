@@ -42,6 +42,8 @@ void skeleton_copy(char *destination, size_t destination_size,
 #ifdef PORTABLE_PRESCAN_TEST_HOOKS
 void portable_prescan_test_fail_root_probe_close_after(size_t successful_closes);
 size_t portable_prescan_test_root_probe_post_loop_close_count(void);
+void portable_prescan_test_force_name_fingerprint(uint64_t fingerprint);
+void portable_prescan_test_clear_name_fingerprint(void);
 #endif
 
 #endif

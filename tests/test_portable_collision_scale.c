@@ -31,6 +31,7 @@
 
 #define COLLISION_PAIR_COUNT 2000U
 #define COLLISION_ENTRY_COUNT (COLLISION_PAIR_COUNT * 2U)
+#define DISTINCT_ENTRY_COUNT 4000U
 #define RELOCATION_UNRELATED_COUNT 5000U
 #define RELOCATION_NESTED_DESCENDANT_COUNT 2000U
 #define RELOCATION_NESTED_UNRELATED_COUNT 1000U
@@ -231,6 +232,55 @@ static void test_collision_plan_scale(const char *fixture)
           "collision-plan filesystem probes remain bounded linearly");
     check(probes < (entries * entries) / UINT64_C(1000),
           "collision-plan filesystem probes remain far below quadratic work");
+
+    portable_prescan_report_free(&report);
+    close(source_fd);
+    close(container_fd);
+    remove_tree(source_path);
+    remove_tree(container_path);
+}
+
+static void test_case_sensitive_distinct_plan_scale(const char *fixture)
+{
+    char source_path[PATH_MAX];
+    char container_path[PATH_MAX];
+    make_path(source_path, sizeof(source_path), fixture,
+              "distinct-plan-source");
+    make_path(container_path, sizeof(container_path), fixture,
+              "distinct-plan-container");
+    if (mkdir(source_path, 0700) != 0 || mkdir(container_path, 0700) != 0)
+        fixture_fatal("could not create distinct-plan fixtures");
+
+    int source_fd = open(source_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int container_fd = open(container_path,
+                             O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (source_fd < 0 || container_fd < 0)
+        fixture_fatal("could not open distinct-plan fixtures");
+
+    for (unsigned int index = 0; index < DISTINCT_ENTRY_COUNT; index++) {
+        char name[32];
+        int length = snprintf(name, sizeof(name), "entry-%05u", index);
+        if (length < 0 || (size_t)length >= sizeof(name) ||
+            write_file_at(source_fd, name, "x", 1) != 0)
+            fixture_fatal("could not create distinct-plan entry");
+    }
+
+    PortableRootSpec root = root_spec(source_path);
+    PortableCaptureRequest request = capture_request(&root);
+    request.case_sensitive = 1;
+    PortablePrescanReport report;
+    portable_prescan_report_init(&report);
+    portable_capture_test_reset_case_fs_probe_count();
+    int result = portable_collision_plan_build(container_fd, &request, &report);
+    uint64_t probes = portable_capture_test_case_fs_probe_count();
+
+    printf("  distinct_entries=%u fs_probes=%" PRIu64 "\n",
+           DISTINCT_ENTRY_COUNT, probes);
+    check(result == 0 && report.total_count == 0 &&
+              report.collision_plan.count == 0,
+          "large case-sensitive distinct sibling set keeps the plan sparse");
+    check(probes == 0,
+          "case-sensitive distinct sibling planning performs no filesystem collision probes");
 
     portable_prescan_report_free(&report);
     close(source_fd);
@@ -1041,6 +1091,7 @@ int main(void)
         fixture_fatal("could not create fixture root");
 
     test_collision_plan_scale(fixture);
+    test_case_sensitive_distinct_plan_scale(fixture);
     test_relocation_scale(fixture);
     test_claim_relocation_scale(fixture);
     test_claim_directory_collision(fixture);

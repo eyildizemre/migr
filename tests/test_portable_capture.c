@@ -40,6 +40,7 @@
 
 #include "manifest.h"
 #include "portable.h"
+#include "portable_name.h"
 #include "portable_prescan_internal.h" /* Direct prescan_request() validation
                                         * coverage uses this internal seam. */
 #include "sidecar.h"
@@ -602,6 +603,45 @@ static int run_case_fixture(const char *base, const char *label,
     return portable_capture_fresh_at(*container_fd, &request, report);
 }
 
+static int run_case_plan_fixture(const char *base, const char *label,
+                                 const char *const *names, size_t name_count,
+                                 int case_sensitive, char *source_path,
+                                 size_t source_size, char *container_path,
+                                 size_t container_size, int *container_fd,
+                                 PortablePrescanReport *report)
+{
+    join_path(source_path, source_size, base, label);
+    char container_label[PATH_MAX];
+    int label_length = snprintf(container_label, sizeof(container_label),
+                                "%s-container", label);
+    if (label_length < 0 || (size_t)label_length >= sizeof(container_label))
+        fixture_fatal("case-plan fixture label is too long");
+    join_path(container_path, container_size, base, container_label);
+    make_directory(source_path);
+    make_directory(container_path);
+
+    for (size_t index = 0; index < name_count; index++) {
+        char path[PATH_MAX];
+        join_path(path, sizeof(path), source_path, names[index]);
+        write_file(path, "x", 1);
+    }
+
+    *container_fd = open(container_path,
+                         O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (*container_fd < 0)
+        fixture_fatal("could not open case-plan container");
+    PortableRootSpec root = root_spec("CASE", source_path, "CASE");
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .roots = &root,
+        .root_count = 1,
+        .nsec_exact = 1,
+        .case_sensitive = case_sensitive
+    };
+    portable_prescan_report_init(report);
+    return portable_collision_plan_build(*container_fd, &request, report);
+}
+
 static void test_case_collision_prescan(const char *base)
 {
     printf(BLUE "::" NC " ASCII case-collision pre-scan\n");
@@ -656,7 +696,9 @@ static void test_case_collision_prescan(const char *base)
                               container_path, sizeof(container_path),
                               &container_fd, &report);
     struct stat st;
-    check(result == 0 && report.total_count == 0,
+    check(result == 0 && report.total_count == 0 &&
+              report.shortening_count == 0 &&
+              report.collision_plan.count == 0,
           "case-sensitive pre-scan permits distinct ASCII siblings");
     check(fstatat(container_fd, "data/CASE/Foo", &st,
                   AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(st.st_mode) &&
@@ -736,8 +778,11 @@ static int collision_plan_entry_matches(
     const PortableCollisionPlanEntry *entry, const char *root_id,
     const char *logical, const char *physical, const char *suffix)
 {
+    const char *slash = physical == NULL ? NULL : strrchr(physical, '/');
+    const char *leaf = slash == NULL ? physical : slash + 1;
     return entry != NULL && strcmp(entry->root_id, root_id) == 0 &&
            strcmp(entry->logical_path, logical) == 0 &&
+           leaf != NULL && strcmp(entry->physical_leaf, leaf) == 0 &&
            strcmp(entry->physical_path, physical) == 0 &&
            strcmp(entry->collision_suffix, suffix) == 0;
 }
@@ -839,11 +884,15 @@ static void test_collision_plan(const char *base)
     const PortableCollisionPlanEntry *unicode_lower =
         portable_collision_plan_find(&report.collision_plan, "CASE",
                                      "caf\xc3\xa9");
+    int unicode_first_suffix =
+        collision_plan_entry_matches(unicode_lower, "CASE", "caf\xc3\xa9",
+                                     "caf\xc3\xa9%7E1", "%7E1");
+    int unicode_second_suffix =
+        collision_plan_entry_matches(unicode_lower, "CASE", "caf\xc3\xa9",
+                                     "caf\xc3\xa9%7E2", "%7E2");
     check(result == 0 && report.collision_plan.count == 2 &&
-              collision_plan_entry_matches(unicode_lower, "CASE",
-                                            "caf\xc3\xa9",
-                                            "caf\xc3\xa9%7E2", "%7E2"),
-          "the collision plan reserves Unicode-equivalent source names before choosing a suffix");
+              (unicode_first_suffix || unicode_second_suffix),
+          "non-ASCII suffix reservation follows destination-backed equivalence");
     portable_prescan_report_free(&report);
     close(container_fd);
     remove_tree(source_path);
@@ -1000,8 +1049,6 @@ static void test_collision_plan(const char *base)
     remove_tree(container_path);
 }
 
-/* Mixed pre-scan baseline: resolved case collisions are no longer fatal, while
- * NAME_MAX and PATH_MAX violations remain fatal (docs/DECISIONS.md D21, F-4/F-6). */
 static void test_mixed_prescan_violations(const char *base)
 {
     printf(BLUE "::" NC " mixed pre-scan violation fate\n");
@@ -1018,49 +1065,65 @@ static void test_mixed_prescan_violations(const char *base)
     char container_path[PATH_MAX];
     int container_fd;
     PortablePrescanReport report;
-    int result = run_case_fixture(
+    int result = run_case_plan_fixture(
         base, "case-mixed-violations", names, sizeof(names) / sizeof(names[0]),
         0, source_path, sizeof(source_path), container_path,
         sizeof(container_path), &container_fd, &report);
 
-    int name_violation = 0;
+    int name_shortening = 0;
     int collision_violation = 0;
     for (size_t index = 0; index < report.example_count; index++) {
         const PortablePrescanViolation *violation = &report.examples[index];
         if (violation->kind == PORTABLE_PRESCAN_NAME_TOO_LONG &&
+            violation->resolved &&
             strcmp(violation->root_id, "CASE") == 0 &&
             strcmp(violation->logical_path, oversized_name) == 0 &&
             violation->limit == NAME_MAX &&
             violation->actual == oversized_length * 3U)
-            name_violation = 1;
+            name_shortening = 1;
         if (collision_example_matches_names(
                 violation, collision_names,
                 sizeof(collision_names) / sizeof(collision_names[0])) &&
             violation->limit == 0 && violation->actual == 0)
             collision_violation = 1;
     }
-    check(result != 0 && report.total_count == 2 &&
-              report.collision_count == 1 && report.unresolved_count == 1 &&
-              report.example_count == 2,
-          "a resolved collision is non-fatal, but the NAME_MAX violation remains fatal");
-    check(name_violation && collision_violation,
-          "mixed violations retain exact NAME_MAX and collision fields");
-    check(empty_capture_container(container_fd),
-          "mixed violation refusal leaves the container untouched");
+    PortablePhysicalName shortened;
+    int mapped = portable_physical_name_map(oversized_name, 0, &shortened) == 0;
+    check(result == 0 && report.total_count == 2 &&
+              report.collision_count == 1 && report.shortening_count == 1 &&
+              report.unresolved_count == 0 && report.example_count == 2,
+          "case collision and NAME_MAX shortening are both resolved");
+    check(name_shortening && collision_violation,
+          "mixed resolved diagnostics retain exact NAME_MAX and collision fields");
+    const PortableCollisionPlanEntry *planned =
+        portable_collision_plan_find(&report.collision_plan, "CASE",
+                                     oversized_name);
+    check(mapped && shortened.shortened && planned != NULL &&
+              strcmp(planned->physical_leaf, shortened.physical_leaf) == 0 &&
+              strcmp(planned->physical_path, shortened.physical_leaf) == 0 &&
+              empty_capture_container(container_fd),
+          "mixed resolved shortening is represented in the canonical plan without mutation");
+    portable_prescan_report_free(&report);
+
+    PortableRootSpec root = root_spec("CASE", source_path, "CASE");
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .roots = &root,
+        .root_count = 1,
+        .nsec_exact = 1,
+        .case_sensitive = 0
+    };
+    portable_prescan_report_init(&report);
+    check(portable_capture_fresh_at(container_fd, &request, &report) != 0 &&
+              report.shortening_count == 1 && report.unresolved_count == 0 &&
+              empty_capture_container(container_fd),
+          "live shortened capture remains gated until the Phase-4 consumer migration");
     portable_prescan_report_free(&report);
     close(container_fd);
     remove_tree(source_path);
     remove_tree(container_path);
 }
 
-/* A collision suffix (e.g. "%7E1") can push an otherwise-fitting name past
- * NAME_MAX even though the same name with no suffix fits comfortably -- a
- * narrower case than test_name_and_path_limits' plain oversized name, only
- * reachable once two names actually collide and one of them loses the
- * tie-break. Per the documented best-effort contract, portable_collision_
- * plan_build() must record the violation and keep planning everything
- * else, not hard-abort the whole pre-scan (docs/DECISIONS.md D21, F-4/F-6).
- */
 static void test_collision_plan_suffix_length_violation(const char *base)
 {
     printf(BLUE "::" NC
@@ -1108,37 +1171,384 @@ static void test_collision_plan_suffix_length_violation(const char *base)
 
     const PortableCollisionPlanEntry *kept =
         portable_collision_plan_find(&report.collision_plan, "CASE", winner);
-    /* Directory traversal separately records the ASCII case-collision itself
-     * (already correct, pre-existing behavior) before case_probe_group() ever
-     * assigns suffixes; readdir order decides which of the two names that
-     * collision example names, so only its count is asserted here -- the
-     * point of this test is the NAME_TOO_LONG side, searched for below by
-     * kind rather than by a fixed index. */
+    const PortableCollisionPlanEntry *shortened =
+        portable_collision_plan_find(&report.collision_plan, "CASE", loser);
+    PortablePhysicalName expected_shortened;
+    int mapped = portable_physical_name_map(loser, 1,
+                                            &expected_shortened) == 0;
     check(result == 0 && report.total_count == 2 &&
-              report.collision_count == 1 && report.unresolved_count == 1 &&
-              report.collision_plan.count == 1 &&
+              report.collision_count == 1 && report.shortening_count == 1 &&
+              report.unresolved_count == 0 &&
+              report.collision_plan.count == 2 &&
               collision_plan_entry_matches(kept, "CASE", winner, winner, ""),
-          "the plan is still built and the fitting sibling still gets its "
-          "unsuffixed slot, instead of the whole pre-scan aborting");
-    check(portable_collision_plan_find(&report.collision_plan, "CASE",
-                                       loser) == NULL,
-          "the sibling whose suffix would overflow NAME_MAX is left out of "
-          "the plan rather than crashing it");
+          "the fitting sibling keeps the deterministic unsuffixed slot");
+    check(mapped && expected_shortened.shortened && shortened != NULL &&
+              strcmp(shortened->physical_leaf,
+                     expected_shortened.physical_leaf) == 0 &&
+              strcmp(shortened->physical_path,
+                     expected_shortened.physical_leaf) == 0 &&
+              strcmp(shortened->collision_suffix, "%7E1") == 0 &&
+              strlen(shortened->physical_leaf) <= NAME_MAX,
+          "suffix growth is rebudgeted through the canonical mapper");
 
+    const PortablePrescanViolation *case_collision = NULL;
     const PortablePrescanViolation *overflow = NULL;
     for (size_t index = 0; index < report.example_count; index++)
-        if (report.examples[index].kind == PORTABLE_PRESCAN_NAME_TOO_LONG)
+        if (report.examples[index].kind == PORTABLE_PRESCAN_CASE_COLLISION)
+            case_collision = &report.examples[index];
+        else if (report.examples[index].kind == PORTABLE_PRESCAN_NAME_TOO_LONG)
             overflow = &report.examples[index];
-    check(report.example_count == 2 && overflow != NULL &&
+    check(report.example_count == 2 && case_collision != NULL &&
+              collision_pair_matches(case_collision, winner, loser) &&
+              overflow != NULL && overflow->resolved &&
               strcmp(overflow->root_id, "CASE") == 0 &&
               strcmp(overflow->logical_path, loser) == 0 &&
               overflow->limit == NAME_MAX &&
               overflow->actual == fitting_length + 4U,
-          "the suffixed overflow is recorded with the exact NAME_MAX limit "
-          "and the suffixed length, not the plain one");
+          "case collision and shortening remain distinct resolved diagnostics");
     check(empty_capture_container(container_fd),
           "plan-build pre-scan reporting the overflow does not mutate the "
           "container");
+
+    portable_prescan_report_free(&report);
+    close(container_fd);
+    remove_tree(source_path);
+    remove_tree(container_path);
+}
+
+static void make_forced_shortening_name(char out[NAME_MAX + 1U],
+                                        unsigned char tail)
+{
+    const size_t prefix_length = 100U;
+    memset(out, ':', prefix_length);
+    out[prefix_length] = (char)tail;
+    out[prefix_length + 1U] = '\0';
+}
+
+static void test_shortened_candidate_collision_determinism(const char *base)
+{
+    printf(BLUE "::" NC
+           " forced shortened-candidate collision stays deterministic\n");
+    const uint64_t fingerprint = UINT64_C(0x0123456789ABCDEF);
+    char first[NAME_MAX + 1U];
+    char second[NAME_MAX + 1U];
+    make_forced_shortening_name(first, 'a');
+    make_forced_shortening_name(second, 'b');
+
+    PortablePhysicalName expected_first;
+    PortablePhysicalName expected_second;
+    if (portable_physical_name_map_with_fingerprint_for_test(
+            first, 0, fingerprint, &expected_first) != 0 ||
+        portable_physical_name_map_with_fingerprint_for_test(
+            second, 1, fingerprint, &expected_second) != 0)
+        fixture_fatal("could not build forced shortening expectations");
+
+    char first_leaf[NAME_MAX + 1U];
+    char first_suffix[SIDECAR_MAX_COLLISION_SUFFIX + 1U];
+    char second_leaf[NAME_MAX + 1U];
+    char second_suffix[SIDECAR_MAX_COLLISION_SUFFIX + 1U];
+    static const int orders[2][2] = { { 0, 1 }, { 1, 0 } };
+    const char *all_names[2] = { first, second };
+
+    for (size_t run = 0; run < 2U; run++) {
+        const char *names[2] = {
+            all_names[orders[run][0]], all_names[orders[run][1]]
+        };
+        char source_path[PATH_MAX];
+        char container_path[PATH_MAX];
+        char label[64];
+        int label_length = snprintf(label, sizeof(label),
+                                    "forced-shortening-collision-%zu", run);
+        if (label_length < 0 || (size_t)label_length >= sizeof(label))
+            fixture_fatal("could not build forced collision label");
+        int container_fd;
+        PortablePrescanReport report;
+
+        portable_prescan_test_force_name_fingerprint(fingerprint);
+        int result = run_case_plan_fixture(
+            base, label, names, 2U, 1, source_path, sizeof(source_path),
+            container_path, sizeof(container_path), &container_fd, &report);
+        portable_prescan_test_clear_name_fingerprint();
+
+        const PortableCollisionPlanEntry *first_entry =
+            portable_collision_plan_find(&report.collision_plan, "CASE", first);
+        const PortableCollisionPlanEntry *second_entry =
+            portable_collision_plan_find(&report.collision_plan, "CASE", second);
+        check(result == 0 && report.total_count == 2 &&
+                  report.collision_count == 0 &&
+                  report.shortening_count == 2 &&
+                  report.unresolved_count == 0 &&
+                  report.collision_plan.count == 2 && first_entry != NULL &&
+                  second_entry != NULL &&
+                  strcmp(first_entry->physical_leaf,
+                         expected_first.physical_leaf) == 0 &&
+                  strcmp(first_entry->collision_suffix, "") == 0 &&
+                  strcmp(second_entry->physical_leaf,
+                         expected_second.physical_leaf) == 0 &&
+                  strcmp(second_entry->collision_suffix, "%7E1") == 0 &&
+                  strcmp(first_entry->physical_leaf,
+                         second_entry->physical_leaf) != 0 &&
+                  empty_capture_container(container_fd),
+              "planner resolves an exact shortened collision without relying on the fingerprint");
+
+        if (run == 0 && first_entry != NULL && second_entry != NULL) {
+            snprintf(first_leaf, sizeof(first_leaf), "%s",
+                     first_entry->physical_leaf);
+            snprintf(first_suffix, sizeof(first_suffix), "%s",
+                     first_entry->collision_suffix);
+            snprintf(second_leaf, sizeof(second_leaf), "%s",
+                     second_entry->physical_leaf);
+            snprintf(second_suffix, sizeof(second_suffix), "%s",
+                     second_entry->collision_suffix);
+        } else if (run == 1) {
+            check(first_entry != NULL && second_entry != NULL &&
+                      strcmp(first_entry->physical_leaf, first_leaf) == 0 &&
+                      strcmp(first_entry->collision_suffix, first_suffix) == 0 &&
+                      strcmp(second_entry->physical_leaf, second_leaf) == 0 &&
+                      strcmp(second_entry->collision_suffix, second_suffix) == 0,
+                  "reversing source creation order leaves canonical assignments unchanged");
+        }
+
+        portable_prescan_report_free(&report);
+        close(container_fd);
+        remove_tree(source_path);
+        remove_tree(container_path);
+    }
+}
+
+static void test_raw_component_unsigned_tiebreak(const char *base)
+{
+    printf(BLUE "::" NC " raw component unsigned-byte collision tiebreak\n");
+    const uint64_t fingerprint = UINT64_C(0xA5A5A5A5A5A5A5A5);
+    char lower_byte[NAME_MAX + 1U];
+    char higher_byte[NAME_MAX + 1U];
+    make_forced_shortening_name(lower_byte, 0x80U);
+    make_forced_shortening_name(higher_byte, 0xFFU);
+    const char *names[] = { higher_byte, lower_byte };
+    char source_path[PATH_MAX];
+    char container_path[PATH_MAX];
+    int container_fd;
+    PortablePrescanReport report;
+
+    portable_prescan_test_force_name_fingerprint(fingerprint);
+    int result = run_case_plan_fixture(
+        base, "raw-unsigned-tiebreak", names,
+        sizeof(names) / sizeof(names[0]), 1, source_path, sizeof(source_path),
+        container_path, sizeof(container_path), &container_fd, &report);
+    portable_prescan_test_clear_name_fingerprint();
+
+    PortablePhysicalName expected_low;
+    PortablePhysicalName expected_high;
+    int mapped = portable_physical_name_map_with_fingerprint_for_test(
+                     lower_byte, 0, fingerprint, &expected_low) == 0 &&
+                 portable_physical_name_map_with_fingerprint_for_test(
+                     higher_byte, 1, fingerprint, &expected_high) == 0;
+    const PortableCollisionPlanEntry *low_entry =
+        portable_collision_plan_find(&report.collision_plan, "CASE", lower_byte);
+    const PortableCollisionPlanEntry *high_entry =
+        portable_collision_plan_find(&report.collision_plan, "CASE", higher_byte);
+    check(result == 0 && mapped && low_entry != NULL && high_entry != NULL &&
+              strcmp(low_entry->physical_leaf, expected_low.physical_leaf) == 0 &&
+              strcmp(low_entry->collision_suffix, "") == 0 &&
+              strcmp(high_entry->physical_leaf,
+                     expected_high.physical_leaf) == 0 &&
+              strcmp(high_entry->collision_suffix, "%7E1") == 0,
+          "tied candidates are ordered by unsigned raw logical-component bytes");
+
+    portable_prescan_report_free(&report);
+    close(container_fd);
+    remove_tree(source_path);
+    remove_tree(container_path);
+}
+
+static void test_shortened_suffix_reserves_natural_candidate(const char *base)
+{
+    printf(BLUE "::" NC
+           " shortened suffix allocation preserves natural sibling names\n");
+    const uint64_t fingerprint = UINT64_C(0x0123456789ABCDEF);
+    char winner[NAME_MAX + 1U];
+    char loser[NAME_MAX + 1U];
+    make_forced_shortening_name(winner, 'a');
+    make_forced_shortening_name(loser, 'b');
+
+    char natural_alias[NAME_MAX + 1U];
+    memset(natural_alias, ':', 77U);
+    snprintf(natural_alias + 77U, sizeof(natural_alias) - 77U,
+             "~H0123456789ABCDEF~1");
+    const char *names[] = { loser, natural_alias, winner };
+
+    PortablePhysicalName suffix_one;
+    PortablePhysicalName suffix_two;
+    PortablePhysicalName alias_name;
+    if (portable_physical_name_map_with_fingerprint_for_test(
+            loser, 1, fingerprint, &suffix_one) != 0 ||
+        portable_physical_name_map_with_fingerprint_for_test(
+            loser, 2, fingerprint, &suffix_two) != 0 ||
+        portable_physical_name_map_with_fingerprint_for_test(
+            natural_alias, 0, fingerprint, &alias_name) != 0)
+        fixture_fatal("could not build shortened reservation expectations");
+    if (strcmp(suffix_one.physical_leaf, alias_name.physical_leaf) != 0)
+        fixture_fatal("shortened reservation fixture does not alias suffix one");
+
+    char source_path[PATH_MAX];
+    char container_path[PATH_MAX];
+    int container_fd;
+    PortablePrescanReport report;
+    portable_prescan_test_force_name_fingerprint(fingerprint);
+    int result = run_case_plan_fixture(
+        base, "shortened-natural-reservation", names,
+        sizeof(names) / sizeof(names[0]), 1, source_path, sizeof(source_path),
+        container_path, sizeof(container_path), &container_fd, &report);
+    portable_prescan_test_clear_name_fingerprint();
+
+    const PortableCollisionPlanEntry *loser_entry =
+        portable_collision_plan_find(&report.collision_plan, "CASE", loser);
+    const PortableCollisionPlanEntry *alias_entry =
+        portable_collision_plan_find(&report.collision_plan, "CASE",
+                                     natural_alias);
+    check(result == 0 && loser_entry != NULL && alias_entry == NULL &&
+              strcmp(loser_entry->collision_suffix, "%7E2") == 0 &&
+              strcmp(loser_entry->physical_leaf,
+                     suffix_two.physical_leaf) == 0 &&
+              strcmp(loser_entry->physical_leaf,
+                     alias_name.physical_leaf) != 0,
+          "generated shortened suffix skips a natural unsuffixed sibling reservation");
+
+    portable_prescan_report_free(&report);
+    close(container_fd);
+    remove_tree(source_path);
+    remove_tree(container_path);
+}
+
+static void test_shortened_ancestor_keeps_descendant_identity(const char *base)
+{
+    printf(BLUE "::" NC
+           " shortened ancestor leaves descendant canonical identity stable\n");
+    char source_path[PATH_MAX];
+    char container_path[PATH_MAX];
+    join_path(source_path, sizeof(source_path), base,
+              "shortened-ancestor-source");
+    join_path(container_path, sizeof(container_path), base,
+              "shortened-ancestor-container");
+    make_directory(source_path);
+    make_directory(container_path);
+
+    char parent[NAME_MAX + 1U];
+    memset(parent, ':', 100U);
+    parent[100] = '\0';
+    char parent_path[PATH_MAX];
+    join_path(parent_path, sizeof(parent_path), source_path, parent);
+    make_directory(parent_path);
+    char child_path[PATH_MAX];
+    join_path(child_path, sizeof(child_path), parent_path, "A");
+    write_file(child_path, "a", 1);
+    join_path(child_path, sizeof(child_path), parent_path, "a");
+    write_file(child_path, "b", 1);
+
+    int container_fd = open(container_path,
+                             O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open shortened ancestor container");
+    PortableRootSpec root = root_spec("CASE", source_path, "CASE");
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .roots = &root,
+        .root_count = 1,
+        .nsec_exact = 1,
+        .case_sensitive = 0
+    };
+    PortablePrescanReport report;
+    portable_prescan_report_init(&report);
+    int result = portable_collision_plan_build(container_fd, &request, &report);
+
+    char upper_logical[SIDECAR_MAX_PATH + 1U];
+    char lower_logical[SIDECAR_MAX_PATH + 1U];
+    snprintf(upper_logical, sizeof(upper_logical), "%s/A", parent);
+    snprintf(lower_logical, sizeof(lower_logical), "%s/a", parent);
+    const PortableCollisionPlanEntry *parent_entry =
+        portable_collision_plan_find(&report.collision_plan, "CASE", parent);
+    const PortableCollisionPlanEntry *upper_entry =
+        portable_collision_plan_find(&report.collision_plan, "CASE",
+                                     upper_logical);
+    const PortableCollisionPlanEntry *lower_entry =
+        portable_collision_plan_find(&report.collision_plan, "CASE",
+                                     lower_logical);
+    PortablePhysicalName mapped_parent;
+    int parent_mapped = portable_physical_name_map(parent, 0,
+                                                   &mapped_parent) == 0;
+    char expected_upper_path[SIDECAR_MAX_PATH + 1U];
+    char expected_lower_path[SIDECAR_MAX_PATH + 1U];
+    int upper_length = parent_mapped
+        ? snprintf(expected_upper_path, sizeof(expected_upper_path), "%s/A",
+                   mapped_parent.physical_leaf)
+        : -1;
+    int lower_length = parent_mapped
+        ? snprintf(expected_lower_path, sizeof(expected_lower_path),
+                   "%s/a%%7E1", mapped_parent.physical_leaf)
+        : -1;
+    check(result == 0 && parent_mapped && mapped_parent.shortened &&
+              report.collision_count == 1 && report.shortening_count == 1 &&
+              report.unresolved_count == 0 && parent_entry != NULL &&
+              upper_entry != NULL && lower_entry != NULL &&
+              strcmp(parent_entry->physical_leaf,
+                     mapped_parent.physical_leaf) == 0 &&
+              strcmp(upper_entry->physical_leaf, "A") == 0 &&
+              strcmp(upper_entry->collision_suffix, "") == 0 &&
+              strcmp(lower_entry->physical_leaf, "a%7E1") == 0 &&
+              strcmp(lower_entry->collision_suffix, "%7E1") == 0 &&
+              upper_length >= 0 && lower_length >= 0 &&
+              (size_t)upper_length < sizeof(expected_upper_path) &&
+              (size_t)lower_length < sizeof(expected_lower_path) &&
+              strcmp(upper_entry->physical_path, expected_upper_path) == 0 &&
+              strcmp(lower_entry->physical_path, expected_lower_path) == 0,
+          "only the compatibility path inherits the shortened ancestor spelling");
+
+    portable_prescan_report_free(&report);
+    close(container_fd);
+    remove_tree(source_path);
+    remove_tree(container_path);
+}
+
+static void test_shortening_report_cap(const char *base)
+{
+    printf(BLUE "::" NC " bounded shortening report\n");
+    enum {
+        SHORTENING_COUNT = PORTABLE_PRESCAN_MAX_EXAMPLES + 8U
+    };
+    char storage[SHORTENING_COUNT][NAME_MAX + 1U];
+    const char *names[SHORTENING_COUNT];
+    for (size_t index = 0; index < SHORTENING_COUNT; index++) {
+        memset(storage[index], ':', 90U);
+        int length = snprintf(storage[index] + 90U,
+                              sizeof(storage[index]) - 90U, "%03zu", index);
+        if (length < 0 ||
+            (size_t)length >= sizeof(storage[index]) - 90U)
+            fixture_fatal("could not build shortening report fixture");
+        names[index] = storage[index];
+    }
+
+    char source_path[PATH_MAX];
+    char container_path[PATH_MAX];
+    int container_fd;
+    PortablePrescanReport report;
+    int result = run_case_plan_fixture(
+        base, "shortening-report-cap", names, SHORTENING_COUNT, 1,
+        source_path, sizeof(source_path), container_path,
+        sizeof(container_path), &container_fd, &report);
+    int examples_are_shortenings =
+        report.example_count == PORTABLE_PRESCAN_MAX_EXAMPLES;
+    for (size_t index = 0;
+         index < report.example_count && examples_are_shortenings; index++)
+        examples_are_shortenings =
+            report.examples[index].kind == PORTABLE_PRESCAN_NAME_TOO_LONG &&
+            report.examples[index].resolved;
+    check(result == 0 && report.total_count == SHORTENING_COUNT &&
+              report.shortening_count == SHORTENING_COUNT &&
+              report.unresolved_count == 0 &&
+              report.example_count == PORTABLE_PRESCAN_MAX_EXAMPLES &&
+              report.collision_plan.count == SHORTENING_COUNT &&
+              examples_are_shortenings && empty_capture_container(container_fd),
+          "shortening counts remain exact after diagnostic examples reach the cap");
 
     portable_prescan_report_free(&report);
     close(container_fd);
@@ -2368,24 +2778,36 @@ static void test_name_and_path_limits(const char *base)
     };
     PortablePrescanReport report;
     portable_prescan_report_init(&report);
-    check(portable_capture_fresh_at(container_fd, &request, &report) != 0 &&
-              report.total_count == 1 && report.example_count == 1 &&
+    int name_result = portable_collision_plan_build(container_fd, &request,
+                                                    &report);
+    PortablePhysicalName shortened;
+    int mapped = portable_physical_name_map(oversized_name, 0, &shortened) == 0;
+    const PortableCollisionPlanEntry *planned =
+        portable_collision_plan_find(&report.collision_plan, "NAMES",
+                                     oversized_name);
+    check(name_result == 0 && report.total_count == 1 &&
+              report.shortening_count == 1 && report.unresolved_count == 0 &&
+              report.example_count == 1 && report.examples[0].resolved &&
               report.examples[0].kind == PORTABLE_PRESCAN_NAME_TOO_LONG &&
               strcmp(report.examples[0].root_id, "NAMES") == 0 &&
               strcmp(report.examples[0].logical_path, oversized_name) == 0 &&
               report.examples[0].limit == NAME_MAX &&
               report.examples[0].actual == oversized_length * 3U,
-          "NAME_MAX violation is reported before capture");
+          "encoded NAME_MAX expansion is reported as a resolved shortening");
     struct stat st;
-    check(fstatat(container_fd, "manifest.txt", &st,
-                  AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT &&
-              fstatat(container_fd, "data", &st,
-                      AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT &&
-              fstatat(container_fd, SIDECAR_SLOT_NAME, &st,
-                      AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT,
-          "NAME_MAX refusal leaves the container namespace untouched");
-    check(portable_capture_fresh_at(container_fd, &request, NULL) != 0,
-          "NAME_MAX refusal does not depend on a report consumer");
+    check(mapped && shortened.shortened && planned != NULL &&
+              strcmp(planned->physical_leaf, shortened.physical_leaf) == 0 &&
+              strcmp(planned->physical_path, shortened.physical_leaf) == 0 &&
+              strcmp(planned->collision_suffix, "") == 0 &&
+              empty_capture_container(container_fd),
+          "shortened NAME_MAX entry is planned under the canonical leaf without mutation");
+    portable_prescan_report_free(&report);
+
+    portable_prescan_report_init(&report);
+    check(portable_capture_fresh_at(container_fd, &request, &report) != 0 &&
+              report.shortening_count == 1 && report.unresolved_count == 0 &&
+              empty_capture_container(container_fd),
+          "live NAME_MAX shortening remains gated before Phase-4 capture changes");
     portable_prescan_report_free(&report);
     close(container_fd);
     remove_tree(source_path);
@@ -2419,14 +2841,30 @@ static void test_name_and_path_limits(const char *base)
     root = root_spec("PATH", source_path, long_payload);
     request.roots = &root;
     portable_prescan_report_init(&report);
+    int path_plan_result = portable_collision_plan_build(container_fd, &request,
+                                                         &report);
+    check(path_plan_result == 0 && report.total_count == 1 &&
+              report.example_count == 1 && report.shortening_count == 0 &&
+              report.unresolved_count == 1 &&
+              report.examples[0].kind == PORTABLE_PRESCAN_PATH_TOO_LONG &&
+              strcmp(report.examples[0].root_id, "PATH") == 0 &&
+              strcmp(report.examples[0].logical_path, "child") == 0 &&
+              report.examples[0].limit == PATH_MAX &&
+              report.examples[0].actual == PATH_MAX + 5U &&
+              empty_capture_container(container_fd),
+          "canonical child mapping succeeds before the compatibility PATH_MAX handoff refuses it");
+    portable_prescan_report_free(&report);
+
+    portable_prescan_report_init(&report);
     check(portable_capture_fresh_at(container_fd, &request, &report) != 0 &&
               report.total_count == 1 && report.example_count == 1 &&
+              report.shortening_count == 0 &&
               report.examples[0].kind == PORTABLE_PRESCAN_PATH_TOO_LONG &&
               strcmp(report.examples[0].root_id, "PATH") == 0 &&
               strcmp(report.examples[0].logical_path, "child") == 0 &&
               report.examples[0].limit == PATH_MAX &&
               report.examples[0].actual == PATH_MAX + 5U,
-          "PATH_MAX violation is reported before capture");
+          "PATH_MAX remains an explicit compatibility-handoff refusal");
     check(fstatat(container_fd, "manifest.txt", &st,
                   AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT &&
               fstatat(container_fd, "data", &st,
@@ -2699,7 +3137,7 @@ static void test_root_probe_close_failure_does_not_double_close(
 
 static void test_prescan_multiple_roots(const char *base)
 {
-    printf(BLUE "::" NC " pre-scan aggregates violations across roots\n");
+    printf(BLUE "::" NC " pre-scan aggregates shortenings across roots\n");
     char source_a[PATH_MAX];
     char source_b[PATH_MAX];
     char container_path[PATH_MAX];
@@ -2737,14 +3175,17 @@ static void test_prescan_multiple_roots(const char *base)
     };
     PortablePrescanReport report;
     portable_prescan_report_init(&report);
-    check(portable_capture_fresh_at(container_fd, &request, &report) != 0 &&
-              report.total_count == 2 && report.example_count == 2,
-          "pre-scan reports every violation across multiple roots");
+    int result = portable_collision_plan_build(container_fd, &request, &report);
+    check(result == 0 && report.total_count == 2 &&
+              report.shortening_count == 2 && report.unresolved_count == 0 &&
+              report.example_count == 2 && report.collision_plan.count == 2,
+          "pre-scan resolves every NAME_MAX expansion across multiple roots");
     int root_a_seen = 0;
     int root_b_seen = 0;
     for (size_t index = 0; index < report.example_count; index++) {
         const PortablePrescanViolation *violation = &report.examples[index];
         if (violation->kind == PORTABLE_PRESCAN_NAME_TOO_LONG &&
+            violation->resolved &&
             strcmp(violation->logical_path, oversized_name) == 0) {
             if (strcmp(violation->root_id, "ROOT_A") == 0)
                 root_a_seen = 1;
@@ -2753,15 +3194,22 @@ static void test_prescan_multiple_roots(const char *base)
         }
     }
     check(root_a_seen && root_b_seen,
-          "pre-scan examples retain each violating root identity");
-    struct stat st;
-    check(fstatat(container_fd, "manifest.txt", &st,
-                  AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT &&
-              fstatat(container_fd, "data", &st,
-                      AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT &&
-              fstatat(container_fd, SIDECAR_SLOT_NAME, &st,
-                      AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT,
-          "multi-root refusal leaves the container untouched");
+          "resolved shortening examples retain each root identity");
+    PortablePhysicalName expected;
+    int mapped = portable_physical_name_map(oversized_name, 0, &expected) == 0;
+    const PortableCollisionPlanEntry *planned_a =
+        portable_collision_plan_find(&report.collision_plan, "ROOT_A",
+                                     oversized_name);
+    const PortableCollisionPlanEntry *planned_b =
+        portable_collision_plan_find(&report.collision_plan, "ROOT_B",
+                                     oversized_name);
+    check(mapped && expected.shortened && planned_a != NULL && planned_b != NULL &&
+              strcmp(planned_a->physical_leaf, expected.physical_leaf) == 0 &&
+              strcmp(planned_b->physical_leaf, expected.physical_leaf) == 0 &&
+              strcmp(planned_a->physical_path, expected.physical_leaf) == 0 &&
+              strcmp(planned_b->physical_path, expected.physical_leaf) == 0 &&
+              empty_capture_container(container_fd),
+          "multi-root shortening plans stay root-specific without mutation");
     portable_prescan_report_free(&report);
     close(container_fd);
     remove_tree(source_a);
@@ -4255,7 +4703,12 @@ int main(void)
     test_collision_plan(root_path);
     test_mixed_prescan_violations(root_path);
     test_collision_plan_suffix_length_violation(root_path);
+    test_shortened_candidate_collision_determinism(root_path);
+    test_raw_component_unsigned_tiebreak(root_path);
+    test_shortened_suffix_reserves_natural_candidate(root_path);
+    test_shortened_ancestor_keeps_descendant_identity(root_path);
     test_case_collision_report_cap(root_path);
+    test_shortening_report_cap(root_path);
     test_case_probe_group_growth(root_path);
     test_case_collision_directory_scope(root_path);
     test_capture_source_plan_mismatch(root_path);

@@ -120,8 +120,11 @@ typedef struct {
 typedef struct {
     char root_id[MANIFEST_ID_MAX];
     char logical_path[SIDECAR_MAX_PATH + 1U];
-    char physical_path[SIDECAR_MAX_PATH + 1U];
+    char physical_leaf[SIDECAR_MAX_PHYSICAL_LEAF + 1U];
     char collision_suffix[SIDECAR_MAX_COLLISION_SUFFIX + 1U];
+    /* Derived only after the canonical leaf plan is frozen. Phase-4 capture
+     * consumers still read this joined-path compatibility cache. */
+    char physical_path[SIDECAR_MAX_PATH + 1U];
 } PortableCollisionPlanEntry;
 
 typedef struct {
@@ -134,6 +137,7 @@ typedef struct {
 typedef struct {
     size_t total_count;
     size_t collision_count;
+    size_t shortening_count;
     size_t unresolved_count;
     PortablePrescanViolation *examples;
     size_t example_count;
@@ -156,10 +160,10 @@ const PortableCollisionPlanEntry *portable_collision_plan_find(
     const PortableCollisionPlan *plan, const char *root_id,
     const char *logical_path);
 
-/* Runs the read-only pre-scan and fills the collision plan without applying
- * the capture gate. total_count remains the diagnostic count of every
- * violation; unresolved_count is the fatal subset after planned collisions
- * are accounted for (docs/DECISIONS.md D21, F-4/F-6). */
+/* Runs the read-only pre-scan and fills the canonical collision/shortening
+ * plan without applying the capture gate. Resolved case collisions and D39
+ * physical-name shortenings remain diagnostics but are excluded from
+ * unresolved_count. */
 int portable_collision_plan_build(int container_fd,
                                   const PortableCaptureRequest *request,
                                   PortablePrescanReport *report);

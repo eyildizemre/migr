@@ -4,6 +4,7 @@
 #include "portable_hashset_internal.h"
 #include "portable.h"
 #include "encoding.h"
+#include "portable_name.h"
 #include "selection.h"
 #include "sidecar.h"
 #include "utils.h"
@@ -85,95 +86,14 @@ const PortableRootSpec *portable_collision_plan_root(
     return NULL;
 }
 
-static int portable_collision_plan_rewrite_parents(
-    PortablePrescanReport *report, const PortableCaptureRequest *request)
-{
-    if (report == NULL || request == NULL)
-        return -1;
-    PortableCollisionPlan *plan = &report->collision_plan;
-    if (!plan->sorted)
-        portable_collision_plan_sort(plan);
-
-    /* Recursion discovers child groups before its parent receives a suffix.
-     * Rebind descendants to the nearest planned ancestor after the complete
-     * deterministic plan is sorted (docs/DECISIONS.md D21, F-3). */
-    for (size_t index = 0; index < plan->count; index++) {
-        PortableCollisionPlanEntry *entry = &plan->entries[index];
-        const char *slash = strrchr(entry->logical_path, '/');
-        if (slash == NULL)
-            continue;
-
-        char parent_logical[SIDECAR_MAX_PATH + 1U];
-        size_t parent_length = (size_t)(slash - entry->logical_path);
-        const PortableCollisionPlanEntry *parent = NULL;
-        while (parent_length != 0) {
-            if (parent_length > SIDECAR_MAX_PATH)
-                return -1;
-            memcpy(parent_logical, entry->logical_path, parent_length);
-            parent_logical[parent_length] = '\0';
-            parent = portable_collision_plan_find(
-                plan, entry->root_id, parent_logical);
-            if (parent != NULL)
-                break;
-            const char *previous_slash = strrchr(parent_logical, '/');
-            parent_length = previous_slash == NULL
-                ? 0U
-                : (size_t)(previous_slash - parent_logical);
-        }
-        if (parent == NULL)
-            continue;
-
-        size_t ancestor_depth = 1U;
-        for (const char *cursor = parent_logical; *cursor != '\0'; cursor++)
-            if (*cursor == '/')
-                ancestor_depth++;
-        const char *leaf = entry->physical_path;
-        for (size_t component = 0; component < ancestor_depth; component++) {
-            const char *component_slash = strchr(leaf, '/');
-            if (component_slash == NULL)
-                return -1;
-            leaf = component_slash + 1;
-        }
-        if (*leaf == '\0')
-            return -1;
-
-        char rewritten[SIDECAR_MAX_PATH + 1U];
-        if (append_physical(rewritten, sizeof(rewritten), parent->physical_path,
-                            leaf) != 0)
-            return -1;
-        const PortableRootSpec *root =
-            portable_collision_plan_root(request, entry->root_id);
-        if (root == NULL)
-            return -1;
-        size_t payload_length = strlen(root->payload_path);
-        size_t physical_length = strlen(rewritten);
-        if (payload_length > SIZE_MAX - 1U ||
-            physical_length > SIZE_MAX - payload_length - 1U)
-            return -1;
-        size_t actual_path = payload_length + 1U + physical_length;
-        if (actual_path >= PATH_MAX) {
-            if (prescan_record_violation(
-                    report, entry->root_id, entry->logical_path,
-                    PORTABLE_PRESCAN_PATH_TOO_LONG, PATH_MAX,
-                    actual_path) != 0)
-                return -1;
-            return -1;
-        }
-        if (copy_text(entry->physical_path, sizeof(entry->physical_path),
-                      rewritten) != 0)
-            return -1;
-    }
-    return 0;
-}
-
 static int portable_collision_plan_add(PortableCollisionPlan *plan,
                                        const char *root_id,
                                        const char *logical_path,
-                                       const char *physical_path,
+                                       const char *physical_leaf,
                                        const char *collision_suffix)
 {
     if (plan == NULL || root_id == NULL || logical_path == NULL ||
-        physical_path == NULL || collision_suffix == NULL ||
+        physical_leaf == NULL || collision_suffix == NULL ||
         plan->count >= SIDECAR_MAX_LIVE_ENTRIES)
         return -1;
 
@@ -191,8 +111,8 @@ static int portable_collision_plan_add(PortableCollisionPlan *plan,
     if (copy_text(entry->root_id, sizeof(entry->root_id), root_id) != 0 ||
         copy_text(entry->logical_path, sizeof(entry->logical_path),
                   logical_path) != 0 ||
-        copy_text(entry->physical_path, sizeof(entry->physical_path),
-                  physical_path) != 0 ||
+        copy_text(entry->physical_leaf, sizeof(entry->physical_leaf),
+                  physical_leaf) != 0 ||
         copy_text(entry->collision_suffix, sizeof(entry->collision_suffix),
                   collision_suffix) != 0)
         return -1;
@@ -254,9 +174,16 @@ int prescan_report_add(PortablePrescanReport *report,
 
 static void prescan_report_refresh_unresolved(PortablePrescanReport *report)
 {
-    if (report == NULL || report->total_count < report->collision_count)
+    if (report == NULL)
         return;
-    report->unresolved_count = report->total_count - report->collision_count;
+    if (report->collision_count > report->total_count ||
+        report->shortening_count >
+            report->total_count - report->collision_count) {
+        report->unresolved_count = report->total_count;
+        return;
+    }
+    report->unresolved_count = report->total_count - report->collision_count -
+                               report->shortening_count;
 }
 
 static int prescan_record_violation(PortablePrescanReport *report,
@@ -300,6 +227,70 @@ static int prescan_record_case_collision(PortablePrescanReport *report,
     return prescan_report_add(report, &violation);
 }
 
+static int prescan_record_shortening(PortablePrescanReport *report,
+                                     const char *root_id,
+                                     const char *logical_path,
+                                     const char *logical_component,
+                                     const char *collision_suffix)
+{
+    if (report == NULL || logical_component == NULL || collision_suffix == NULL)
+        return -1;
+
+    char encoded[3U * NAME_MAX + 4U];
+    if (encoding_percent_encode(ENCODING_MODE_COMPONENT, logical_component,
+                                encoded, sizeof(encoded)) != 0)
+        return -1;
+    size_t encoded_length = strlen(encoded);
+    size_t suffix_length = strlen(collision_suffix);
+    if (encoded_length > SIZE_MAX - suffix_length)
+        return -1;
+
+    PortablePrescanViolation violation = {
+        .kind = PORTABLE_PRESCAN_NAME_TOO_LONG,
+        .resolved = 1,
+        .limit = NAME_MAX,
+        .actual = encoded_length + suffix_length
+    };
+    if (copy_text(violation.root_id, sizeof(violation.root_id), root_id) != 0 ||
+        copy_text(violation.logical_path, sizeof(violation.logical_path),
+                  logical_path) != 0 ||
+        prescan_report_add(report, &violation) != 0)
+        return -1;
+    if (report->shortening_count != SIZE_MAX)
+        report->shortening_count++;
+    return 0;
+}
+
+#ifdef PORTABLE_PRESCAN_TEST_HOOKS
+static int name_fingerprint_override_active;
+static uint64_t name_fingerprint_override;
+
+void portable_prescan_test_force_name_fingerprint(uint64_t fingerprint)
+{
+    name_fingerprint_override = fingerprint;
+    name_fingerprint_override_active = 1;
+}
+
+void portable_prescan_test_clear_name_fingerprint(void)
+{
+    name_fingerprint_override = 0;
+    name_fingerprint_override_active = 0;
+}
+#endif
+
+static int prescan_map_physical_name(const char *logical_component,
+                                     uint64_t collision_number,
+                                     PortablePhysicalName *out)
+{
+#if defined(PORTABLE_PRESCAN_TEST_HOOKS) && defined(PORTABLE_NAME_TEST_HOOKS)
+    if (name_fingerprint_override_active)
+        return portable_physical_name_map_with_fingerprint_for_test(
+            logical_component, collision_number, name_fingerprint_override,
+            out);
+#endif
+    return portable_physical_name_map(logical_component, collision_number, out);
+}
+
 #define PORTABLE_CASE_PROBE_DIR ".migr-case-probe"
 #define PORTABLE_SKELETON_PLACEHOLDER '\001'
 
@@ -333,11 +324,20 @@ void skeleton_copy(char *destination, size_t destination_size,
 }
 
 typedef struct {
-    char **encoded_names;
-    char **logical_paths;
+    char *logical_component;
+    char *logical_path;
+    PortablePhysicalName unsuffixed;
+} PortableSiblingCandidate;
+
+typedef struct {
+    PortableSiblingCandidate *items;
     size_t count;
     size_t capacity;
     int ascii_collision;
+    int collision;
+    size_t natural_probe_successes;
+    size_t assigned_count;
+    const char *representative_logical_path;
 } PortableCaseProbeGroup;
 
 typedef struct {
@@ -371,11 +371,10 @@ static void case_probe_group_free(PortableCaseProbeGroup *group)
     if (group == NULL)
         return;
     for (size_t index = 0; index < group->count; index++) {
-        free(group->encoded_names[index]);
-        free(group->logical_paths[index]);
+        free(group->items[index].logical_component);
+        free(group->items[index].logical_path);
     }
-    free(group->encoded_names);
-    free(group->logical_paths);
+    free(group->items);
     memset(group, 0, sizeof(*group));
 }
 
@@ -390,52 +389,48 @@ static void case_probe_groups_free(PortableCaseProbeGroups *groups)
 }
 
 static int case_probe_group_append(PortableCaseProbeGroup *group,
-                                  const char *encoded,
-                                  const char *logical)
+                                   const char *logical_component,
+                                   const char *logical_path,
+                                   const PortablePhysicalName *unsuffixed)
 {
-    if (group == NULL || encoded == NULL || logical == NULL ||
+    if (group == NULL || logical_component == NULL || logical_path == NULL ||
+        unsuffixed == NULL ||
         group->count >= SIDECAR_MAX_LIVE_ENTRIES)
         return -1;
     if (group->count == group->capacity) {
-        size_t capacity = group->capacity;
-        char **encoded_names = array_reserve(
-            group->encoded_names, &capacity, group->count, 1U,
-            sizeof(*encoded_names), 4U, SIDECAR_MAX_LIVE_ENTRIES);
-        if (encoded_names == NULL)
+        PortableSiblingCandidate *items = array_reserve(
+            group->items, &group->capacity, group->count, 1U,
+            sizeof(*items), 4U, SIDECAR_MAX_LIVE_ENTRIES);
+        if (items == NULL)
             return -1;
-        group->encoded_names = encoded_names;
-
-        /* Both arrays share one recorded capacity, so only commit it after
-         * both allocations reach the same size. */
-        size_t logical_capacity = group->capacity;
-        char **logical_paths = array_reserve(
-            group->logical_paths, &logical_capacity, group->count, 1U,
-            sizeof(*logical_paths), 4U, SIDECAR_MAX_LIVE_ENTRIES);
-        if (logical_paths == NULL)
-            return -1;
-        group->logical_paths = logical_paths;
-        group->capacity = logical_capacity;
+        group->items = items;
     }
 
-    char *encoded_copy = portable_text_duplicate(encoded);
-    if (encoded_copy == NULL)
+    char *component_copy = portable_text_duplicate(logical_component);
+    if (component_copy == NULL)
         return -1;
-    char *logical_copy = portable_text_duplicate(logical);
+    char *logical_copy = portable_text_duplicate(logical_path);
     if (logical_copy == NULL) {
-        free(encoded_copy);
+        free(component_copy);
         return -1;
     }
-    group->encoded_names[group->count] = encoded_copy;
-    group->logical_paths[group->count] = logical_copy;
+    group->items[group->count] = (PortableSiblingCandidate){
+        .logical_component = component_copy,
+        .logical_path = logical_copy,
+        .unsuffixed = *unsuffixed
+    };
     group->count++;
     return 0;
 }
 
 static int case_probe_groups_add(PortableCaseProbeGroups *groups,
-                                 const char *encoded, const char *logical,
+                                 const char *logical_component,
+                                 const char *logical_path,
+                                 const PortablePhysicalName *unsuffixed,
                                  size_t *out_index)
 {
-    if (groups == NULL || out_index == NULL ||
+    if (groups == NULL || logical_component == NULL || logical_path == NULL ||
+        unsuffixed == NULL || out_index == NULL ||
         groups->count >= SIDECAR_MAX_LIVE_ENTRIES)
         return -1;
     if (groups->count == groups->capacity) {
@@ -448,7 +443,8 @@ static int case_probe_groups_add(PortableCaseProbeGroups *groups,
     }
 
     size_t index = groups->count++;
-    if (case_probe_group_append(&groups->items[index], encoded, logical) != 0) {
+    if (case_probe_group_append(&groups->items[index], logical_component,
+                                logical_path, unsuffixed) != 0) {
         groups->count--;
         case_probe_group_free(&groups->items[index]);
         return -1;
@@ -702,84 +698,75 @@ static int root_payload_path_has_non_ascii(const char *path)
 }
 
 typedef struct {
-    const char *encoded;
-    const char *logical;
-    char suffix[SIDECAR_MAX_COLLISION_SUFFIX + 1U];
+    const PortableSiblingCandidate *candidate;
+    PortableCaseProbeGroup *group;
+    PortablePhysicalName final_name;
 } PortableCollisionAssignment;
+
+static int unsigned_text_compare(const char *left, const char *right)
+{
+    if (left == NULL || right == NULL)
+        return left == right ? 0 : left == NULL ? -1 : 1;
+    size_t index = 0;
+    for (;;) {
+        unsigned char left_byte = (unsigned char)left[index];
+        unsigned char right_byte = (unsigned char)right[index];
+        if (left_byte != right_byte)
+            return left_byte < right_byte ? -1 : 1;
+        if (left_byte == '\0')
+            return 0;
+        index++;
+    }
+}
 
 static int portable_collision_assignment_compare(const void *left,
                                                  const void *right)
 {
     const PortableCollisionAssignment *left_entry = left;
     const PortableCollisionAssignment *right_entry = right;
-    int encoded_result = strcmp(left_entry->encoded, right_entry->encoded);
-    if (encoded_result != 0)
-        return encoded_result;
-    return strcmp(left_entry->logical, right_entry->logical);
+    int candidate_result = unsigned_text_compare(
+        left_entry->candidate->unsuffixed.physical_leaf,
+        right_entry->candidate->unsuffixed.physical_leaf);
+    if (candidate_result != 0)
+        return candidate_result;
+    return unsigned_text_compare(left_entry->candidate->logical_component,
+                                 right_entry->candidate->logical_component);
 }
 
-static int collision_suffix_format(uint64_t number, char *out,
-                                   size_t out_size)
+static int portable_collision_assignments_build(
+    PortableCaseProbeGroups *groups, PortableCollisionAssignment **out,
+    size_t *out_count)
 {
-    if (out == NULL || out_size == 0)
+    if (groups == NULL || out == NULL || out_count == NULL)
         return -1;
-    if (number == 0) {
-        out[0] = '\0';
-        return 0;
+
+    size_t count = 0;
+    for (size_t group_index = 0; group_index < groups->count; group_index++) {
+        if (groups->items[group_index].count >
+            SIDECAR_MAX_LIVE_ENTRIES - count)
+            return -1;
+        count += groups->items[group_index].count;
     }
-    int length = snprintf(out, out_size, "%%7E%" PRIu64, number);
-    if (length < 0 || (size_t)length >= out_size ||
-        (size_t)length > SIDECAR_MAX_COLLISION_SUFFIX)
+
+    PortableCollisionAssignment *assignments =
+        count == 0 ? NULL : calloc(count, sizeof(*assignments));
+    if (count != 0 && assignments == NULL)
         return -1;
 
-    uint64_t parsed = 0;
-    if (!portable_collision_suffix_parse(out, (size_t)length, &parsed) ||
-        parsed != number)
-        return -1;
-    return 0;
-}
-
-/* Returns 0 for a valid path, 1 for a NAME_MAX overflow, 2 for PATH_MAX. */
-static int collision_paths_build(const char *parent_physical,
-                                 const char *payload_path,
-                                 const char *encoded, const char *suffix,
-                                 char *leaf, size_t leaf_size,
-                                 char *physical, size_t physical_size,
-                                 size_t *actual_name, size_t *actual_path)
-{
-    if (parent_physical == NULL || payload_path == NULL || encoded == NULL ||
-        suffix == NULL || leaf == NULL || physical == NULL ||
-        actual_name == NULL || actual_path == NULL)
-        return -1;
-    size_t encoded_length = strlen(encoded);
-    size_t suffix_length = strlen(suffix);
-    if (encoded_length > SIZE_MAX - suffix_length)
-        return -1;
-    *actual_name = encoded_length + suffix_length;
-    if (*actual_name > NAME_MAX || *actual_name >= leaf_size)
-        return 1;
-
-    size_t parent_length = bounded_strlen(parent_physical, physical_size);
-    if (parent_length >= physical_size)
-        return -1;
-    size_t separator_length = parent_length == 0 ? 0U : 1U;
-    if (parent_length > SIZE_MAX - separator_length ||
-        parent_length + separator_length >
-            SIZE_MAX - *actual_name)
-        return -1;
-    size_t physical_length = parent_length + separator_length + *actual_name;
-    size_t payload_length = strlen(payload_path);
-    if (payload_length > SIZE_MAX - 1U ||
-        physical_length > SIZE_MAX - payload_length - 1U)
-        return -1;
-    *actual_path = payload_length + 1U + physical_length;
-    if (physical_length >= physical_size || *actual_path >= PATH_MAX)
-        return 2;
-
-    memcpy(leaf, encoded, encoded_length);
-    memcpy(leaf + encoded_length, suffix, suffix_length + 1U);
-    if (append_physical(physical, physical_size, parent_physical, leaf) != 0)
-        return -1;
+    size_t assignment_index = 0;
+    for (size_t group_index = 0; group_index < groups->count; group_index++) {
+        PortableCaseProbeGroup *group = &groups->items[group_index];
+        for (size_t index = 0; index < group->count; index++) {
+            assignments[assignment_index].candidate = &group->items[index];
+            assignments[assignment_index].group = group;
+            assignment_index++;
+        }
+    }
+    if (count > 1U)
+        qsort(assignments, count, sizeof(*assignments),
+              portable_collision_assignment_compare);
+    *out = assignments;
+    *out_count = count;
     return 0;
 }
 
@@ -822,51 +809,36 @@ static int case_probe_readback_matches(const PortableCaseFoldSet *expected,
 }
 
 static int case_probe_reserved_name_contains(
-    const PortableCaseFoldSet *reserved_names, const char *payload_path,
-    const char *physical)
+    const PortableCaseFoldSet *reserved_names, const char *leaf,
+    int case_sensitive)
 {
-    if (reserved_names == NULL || payload_path == NULL || physical == NULL)
+    if (reserved_names == NULL || leaf == NULL)
         return 0;
-    char full_path[SIDECAR_MAX_PATH + 1U];
-    if (append_physical(full_path, sizeof(full_path), payload_path,
-                        physical) != 0)
-        return 0;
-    char reservation_key[SIDECAR_MAX_PATH + 1U];
-    ascii_fold_copy(reservation_key, sizeof(reservation_key), full_path);
+    char reservation_key[SIDECAR_MAX_PHYSICAL_LEAF + 1U];
+    if (case_sensitive) {
+        if (copy_text(reservation_key, sizeof(reservation_key), leaf) != 0)
+            return 0;
+    } else {
+        ascii_fold_copy(reservation_key, sizeof(reservation_key), leaf);
+    }
     return case_fold_set_contains(reserved_names, reservation_key);
 }
 
-static int case_probe_source_name_contains(
-    const PortableCaseFoldSet *source_names, const char *physical)
-{
-    if (source_names == NULL || physical == NULL)
-        return 0;
-    char reservation_key[SIDECAR_MAX_PATH + 1U];
-    skeleton_copy(reservation_key, sizeof(reservation_key), physical);
-    return case_fold_set_contains(source_names, reservation_key);
-}
-
 static int case_probe_reserve_name(PortableCaseFoldSet *reserved_names,
-                                   const char *payload_path,
-                                   const char *parent_physical,
-                                   const char *leaf, char *physical,
-                                   size_t physical_size)
+                                   const char *leaf, int case_sensitive)
 {
-    if (reserved_names == NULL || payload_path == NULL ||
-        parent_physical == NULL ||
-        leaf == NULL || physical == NULL ||
-        append_physical(physical, physical_size, parent_physical, leaf) != 0)
+    if (reserved_names == NULL || leaf == NULL)
         return -1;
-    char full_path[SIDECAR_MAX_PATH + 1U];
-    if (append_physical(full_path, sizeof(full_path), payload_path,
-                        physical) != 0)
-        return -1;
-
-    char reservation_key[SIDECAR_MAX_PATH + 1U];
-    ascii_fold_copy(reservation_key, sizeof(reservation_key), full_path);
+    char reservation_key[SIDECAR_MAX_PHYSICAL_LEAF + 1U];
+    if (case_sensitive) {
+        if (copy_text(reservation_key, sizeof(reservation_key), leaf) != 0)
+            return -1;
+    } else {
+        ascii_fold_copy(reservation_key, sizeof(reservation_key), leaf);
+    }
     char *existing = NULL;
     int result = case_fold_set_find_or_insert(reserved_names,
-                                              reservation_key, physical,
+                                              reservation_key, leaf,
                                               &existing);
     return result < 0 ? -1 : result == 1 ? 1 : 0;
 }
@@ -887,279 +859,304 @@ static int case_probe_group_names_free(PortableCaseProbeState *state,
     return failed ? -1 : 0;
 }
 
-static int case_probe_group(PortableCaseProbeState *state,
-                            const PortableCaseProbeGroup *group,
-                            const char *root_id,
-                            const char *parent_physical,
-                            const char *payload_path,
-                            const PortableCaseFoldSet *source_names,
-                            PortableCaseFoldSet *reserved_names,
-                            PortablePrescanReport *report)
+static int sibling_source_names_build(
+    const PortableCollisionAssignment *assignments, size_t assignment_count,
+    int case_sensitive, PortableCaseFoldSet *source_names)
 {
-    if (state == NULL || group == NULL || root_id == NULL ||
-        parent_physical == NULL || payload_path == NULL || source_names == NULL ||
-        reserved_names == NULL || report == NULL || group->count < 2U ||
-        case_probe_prepare(state) != 0)
+    if ((assignments == NULL && assignment_count != 0) || source_names == NULL)
         return -1;
-    case_probe_count();
 
-    PortableCollisionAssignment *assignments = calloc(
-        group->count, sizeof(*assignments));
-    int *excluded = calloc(group->count, sizeof(*excluded));
-    int failed = assignments == NULL || excluded == NULL;
-    if (!failed) {
-        for (size_t index = 0; index < group->count; index++) {
-            assignments[index].encoded = group->encoded_names[index];
-            assignments[index].logical = group->logical_paths[index];
+    for (size_t index = 0; index < assignment_count; index++) {
+        const char *leaf =
+            assignments[index].candidate->unsuffixed.physical_leaf;
+        char key[SIDECAR_MAX_PHYSICAL_LEAF + 1U];
+        if (case_sensitive) {
+            if (copy_text(key, sizeof(key), leaf) != 0)
+                return -1;
+        } else {
+            ascii_fold_copy(key, sizeof(key), leaf);
         }
-        qsort(assignments, group->count, sizeof(*assignments),
-              portable_collision_assignment_compare);
+        char *existing = NULL;
+        if (case_fold_set_find_or_insert(source_names, key, leaf,
+                                         &existing) < 0)
+            return -1;
     }
+    return 0;
+}
 
-    PortableCaseFoldSet initial_names = {0};
-    int collision = group->ascii_collision;
-    for (size_t index = 0; index < group->count && !failed; index++) {
-        char leaf[SIDECAR_MAX_PATH + 1U];
-        char physical[SIDECAR_MAX_PATH + 1U];
-        size_t actual_name = 0;
-        size_t actual_path = 0;
-        int path_status = collision_paths_build(
-            parent_physical, payload_path, assignments[index].encoded, "",
-            leaf, sizeof(leaf), physical, sizeof(physical), &actual_name,
-            &actual_path);
-        if (path_status != 0) {
-            if (path_status == 1)
-                (void)prescan_record_violation(
-                    report, root_id, assignments[index].logical,
-                    PORTABLE_PRESCAN_NAME_TOO_LONG, NAME_MAX, actual_name);
-            else if (path_status == 2)
-                (void)prescan_record_violation(
-                    report, root_id, assignments[index].logical,
-                    PORTABLE_PRESCAN_PATH_TOO_LONG, PATH_MAX, actual_path);
-            excluded[index] = 1;
-            continue;
-        }
-        if (case_probe_reserved_name_contains(reserved_names, payload_path,
-                                              physical)) {
-            collision = 1;
-            continue;
-        }
+static int sibling_natural_names_probe(
+    PortableCaseProbeState *state, PortableCollisionAssignment *assignments,
+    size_t assignment_count, PortableCaseProbeGroups *groups,
+    PortableCaseFoldSet *scratch_names)
+{
+    if (state == NULL || (assignments == NULL && assignment_count != 0) ||
+        groups == NULL || scratch_names == NULL)
+        return -1;
 
+    int needs_probe = 0;
+    for (size_t index = 0; index < groups->count; index++) {
+        PortableCaseProbeGroup *group = &groups->items[index];
+        group->collision = group->ascii_collision;
+        group->natural_probe_successes = 0;
+        group->assigned_count = 0;
+        group->representative_logical_path = NULL;
+        if (group->count > 1U) {
+            needs_probe = 1;
+            case_probe_count();
+        }
+    }
+    if (!needs_probe)
+        return 0;
+    if (case_probe_prepare(state) != 0)
+        return -1;
+
+    for (size_t index = 0; index < assignment_count; index++) {
+        PortableCollisionAssignment *assignment = &assignments[index];
+        const char *leaf = assignment->candidate->unsuffixed.physical_leaf;
         case_fs_probe_count();
         int fd = openat(state->scratch_fd, leaf,
-                        O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                        O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW |
+                            O_CLOEXEC,
                         0600);
         if (fd >= 0) {
-            if (close(fd) != 0) {
-                failed = 1;
-                break;
-            }
+            if (close(fd) != 0)
+                return -1;
+            assignment->group->natural_probe_successes++;
             char *existing = NULL;
-            if (case_fold_set_find_or_insert(&initial_names, leaf, leaf,
-                                             &existing) < 0) {
-                failed = 1;
-                break;
-            }
-        } else if (errno == EEXIST) {
-            collision = 1;
-        } else {
+            if (case_fold_set_find_or_insert(scratch_names, leaf, leaf,
+                                             &existing) < 0)
+                return -1;
+            continue;
+        }
+        if (errno != EEXIST ||
+            assignment->group->natural_probe_successes == 0)
+            return -1;
+        assignment->group->collision = 1;
+    }
+
+    return case_probe_readback_matches(scratch_names, state->scratch_fd);
+}
+
+static int prescan_store_final_name(PortablePrescanReport *report,
+                                    const char *root_id,
+                                    const PortableSiblingCandidate *candidate,
+                                    const PortablePhysicalName *final_name,
+                                    int force_plan_entry)
+{
+    if (report == NULL || root_id == NULL || candidate == NULL ||
+        final_name == NULL)
+        return -1;
+    if (force_plan_entry || final_name->shortened) {
+        if (portable_collision_plan_add(
+                &report->collision_plan, root_id, candidate->logical_path,
+                final_name->physical_leaf,
+                final_name->collision_suffix) != 0)
+            return -1;
+    }
+    if (final_name->shortened &&
+        prescan_record_shortening(report, root_id, candidate->logical_path,
+                                  candidate->logical_component,
+                                  final_name->collision_suffix) != 0)
+        return -1;
+    return 0;
+}
+
+static int sibling_namespace_plan(
+    PortableCaseProbeState *state, PortableCollisionAssignment *assignments,
+    size_t assignment_count, const char *root_id, int case_sensitive,
+    const PortableCaseFoldSet *source_names,
+    PortableCaseFoldSet *reserved_names, PortableCaseFoldSet *scratch_names,
+    PortablePrescanReport *report)
+{
+    if (state == NULL || (assignments == NULL && assignment_count != 0) ||
+        root_id == NULL || source_names == NULL || reserved_names == NULL ||
+        scratch_names == NULL || report == NULL)
+        return -1;
+
+    int failed = 0;
+    for (size_t index = 0; index < assignment_count && !failed; index++) {
+        PortableCollisionAssignment *assignment = &assignments[index];
+        PortableCaseProbeGroup *group = assignment->group;
+        if (group == NULL || group->count == 0) {
             failed = 1;
             break;
         }
-    }
 
-    if (!failed && case_probe_readback_matches(&initial_names,
-                                                state->scratch_fd) != 0)
-        failed = 1;
-    if (!failed && initial_names.count != group->count)
-        collision = 1;
+        if (!case_sensitive && group->count == 1U)
+            group->collision = 0;
+        if (case_sensitive)
+            group->collision = group->count > 1U;
 
-    if (!failed && !collision) {
-        for (size_t index = 0; index < group->count && !failed; index++) {
-            char physical[SIDECAR_MAX_PATH + 1U];
-            if (case_probe_reserve_name(reserved_names, payload_path,
-                                        parent_physical,
-                                        assignments[index].encoded, physical,
-                                        sizeof(physical)) != 0)
-                failed = 1;
-        }
-    }
-
-    if (case_probe_group_names_free(state, &initial_names) != 0)
-        failed = 1;
-    case_fold_set_free(&initial_names);
-
-    PortableCaseFoldSet names = {0};
-    PortableCaseFoldSet reserved_leaves = {0};
-    if (!failed && collision) {
-        for (size_t index = 0; index < group->count && !failed; index++) {
-            if (excluded[index])
-                continue;
-            uint64_t suffix_number = index == 0 ? 0 : 1;
+        if (!group->collision) {
+            assignment->final_name = assignment->candidate->unsuffixed;
+        } else if (group->assigned_count == 0) {
+            assignment->final_name = assignment->candidate->unsuffixed;
+            group->representative_logical_path =
+                assignment->candidate->logical_path;
+        } else {
+            uint64_t collision_number = 1;
             for (;;) {
-                if (collision_suffix_format(
-                        suffix_number, assignments[index].suffix,
-                        sizeof(assignments[index].suffix)) != 0) {
+                PortablePhysicalName mapped;
+                if (prescan_map_physical_name(
+                        assignment->candidate->logical_component,
+                        collision_number, &mapped) != 0) {
                     failed = 1;
                     break;
-                }
-                char leaf[SIDECAR_MAX_PATH + 1U];
-                char physical[SIDECAR_MAX_PATH + 1U];
-                size_t actual_name = 0;
-                size_t actual_path = 0;
-                int path_status = collision_paths_build(
-                    parent_physical, payload_path, assignments[index].encoded,
-                    assignments[index].suffix, leaf, sizeof(leaf), physical,
-                    sizeof(physical), &actual_name, &actual_path);
-                if (path_status != 0) {
-                    if (path_status == 1)
-                        (void)prescan_record_violation(
-                            report, root_id, assignments[index].logical,
-                            PORTABLE_PRESCAN_NAME_TOO_LONG, NAME_MAX,
-                            actual_name);
-                    else if (path_status == 2)
-                        (void)prescan_record_violation(
-                            report, root_id, assignments[index].logical,
-                            PORTABLE_PRESCAN_PATH_TOO_LONG, PATH_MAX,
-                            actual_path);
-                    excluded[index] = 1;
-                    break;
-                }
-                char reservation_key[SIDECAR_MAX_PATH + 1U];
-                skeleton_copy(reservation_key, sizeof(reservation_key), leaf);
-                if (case_fold_set_contains(&reserved_leaves,
-                                           reservation_key) ||
-                    (assignments[index].suffix[0] != '\0' &&
-                     case_probe_source_name_contains(source_names, physical)) ||
-                     case_probe_reserved_name_contains(reserved_names,
-                                                       payload_path,
-                                                       physical)) {
-                    if (suffix_number == UINT64_MAX) {
-                        failed = 1;
-                        break;
-                    }
-                    suffix_number++;
-                    continue;
                 }
 
-                case_fs_probe_count();
-                int fd = openat(state->scratch_fd, leaf,
-                                O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW |
-                                    O_CLOEXEC,
-                                0600);
-                if (fd >= 0) {
-                    if (close(fd) != 0) {
+                int unavailable =
+                    case_probe_reserved_name_contains(
+                        source_names, mapped.physical_leaf, case_sensitive) ||
+                    case_probe_reserved_name_contains(
+                        reserved_names, mapped.physical_leaf, case_sensitive);
+
+                if (!unavailable && !case_sensitive) {
+                    if (state->scratch_fd < 0) {
                         failed = 1;
                         break;
                     }
-                    char *existing = NULL;
-                    if (case_fold_set_find_or_insert(
-                            &reserved_leaves, reservation_key, reservation_key,
-                            &existing) < 0 ||
-                        case_fold_set_find_or_insert(&names, leaf, leaf,
-                                                     &existing) < 0 ||
-                        case_probe_reserve_name(reserved_names, payload_path,
-                                                parent_physical, leaf, physical,
-                                                sizeof(physical)) != 0) {
-                        failed = 1;
+                    case_fs_probe_count();
+                    int fd = openat(state->scratch_fd, mapped.physical_leaf,
+                                    O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW |
+                                        O_CLOEXEC,
+                                    0600);
+                    if (fd >= 0) {
+                        if (close(fd) != 0) {
+                            failed = 1;
+                            break;
+                        }
+                        char *existing = NULL;
+                        if (case_fold_set_find_or_insert(
+                                scratch_names, mapped.physical_leaf,
+                                mapped.physical_leaf, &existing) < 0) {
+                            failed = 1;
+                            break;
+                        }
+                        assignment->final_name = mapped;
                         break;
                     }
+                    if (errno != EEXIST)
+                        failed = 1;
+                    else
+                        unavailable = 1;
+                } else if (!unavailable) {
+                    assignment->final_name = mapped;
                     break;
                 }
-                if (errno != EEXIST || suffix_number == UINT64_MAX) {
+
+                if (failed)
+                    break;
+                if (!unavailable) {
                     failed = 1;
                     break;
                 }
-                suffix_number++;
+                if (collision_number == UINT64_MAX) {
+                    failed = 1;
+                    break;
+                }
+                collision_number++;
             }
         }
+        if (failed)
+            break;
 
-        if (!failed && case_probe_readback_matches(&names,
-                                                    state->scratch_fd) != 0)
+        if (case_probe_reserve_name(
+                reserved_names, assignment->final_name.physical_leaf,
+                case_sensitive) != 0 ||
+            prescan_store_final_name(
+                report, root_id, assignment->candidate,
+                &assignment->final_name, group->collision) != 0) {
             failed = 1;
+            break;
+        }
+        group->assigned_count++;
     }
 
-    if (!failed && collision) {
-        size_t representative = SIZE_MAX;
-        for (size_t index = 0; index < group->count; index++)
-            if (!excluded[index] && assignments[index].suffix[0] == '\0') {
-                representative = index;
-                break;
-            }
-        if (representative == SIZE_MAX)
-            representative = 0;
-        for (size_t index = 0; index < group->count && !failed; index++) {
-            if (excluded[index])
+    if (!failed && !case_sensitive && state->scratch_fd >= 0 &&
+        case_probe_readback_matches(scratch_names, state->scratch_fd) != 0)
+        failed = 1;
+
+    if (!failed && !case_sensitive) {
+        for (size_t index = 0; index < assignment_count; index++) {
+            PortableCollisionAssignment *assignment = &assignments[index];
+            PortableCaseProbeGroup *group = assignment->group;
+            if (!group->collision || group->ascii_collision ||
+                assignment->candidate->logical_path ==
+                    group->representative_logical_path)
                 continue;
-            char leaf[SIDECAR_MAX_PATH + 1U];
-            char physical[SIDECAR_MAX_PATH + 1U];
-            size_t actual_name = 0;
-            size_t actual_path = 0;
-            int path_status = collision_paths_build(
-                parent_physical, payload_path, assignments[index].encoded,
-                assignments[index].suffix, leaf, sizeof(leaf), physical,
-                sizeof(physical), &actual_name, &actual_path);
-            if (path_status != 0 || portable_collision_plan_add(
-                                        &report->collision_plan, root_id,
-                                        assignments[index].logical, physical,
-                                        assignments[index].suffix) != 0) {
+            if (group->representative_logical_path == NULL ||
+                prescan_record_case_collision(
+                    report, root_id, assignment->candidate->logical_path,
+                    group->representative_logical_path) != 0) {
                 failed = 1;
                 break;
             }
-            if (index != representative && !group->ascii_collision &&
-                prescan_record_case_collision(
-                    report, root_id, assignments[index].logical,
-                    assignments[representative].logical) != 0)
-                failed = 1;
         }
     }
 
-    if (case_probe_group_names_free(state, &names) != 0)
-        failed = 1;
-    case_fold_set_free(&names);
-    case_fold_set_free(&reserved_leaves);
-    free(assignments);
-    free(excluded);
     return failed ? -1 : 0;
 }
 
-static int case_probe_reserve_singleton(PortableCaseProbeState *state,
-                                        const PortableCaseProbeGroup *group,
-                                        const char *parent_physical,
-                                        const char *payload_path,
-                                        const PortableCaseFoldSet *source_names,
-                                        PortableCaseFoldSet *reserved_names)
+typedef struct {
+    char root_id[MANIFEST_ID_MAX];
+    char *logical_path;
+} PortableCompatibilityPath;
+
+typedef struct {
+    PortableCompatibilityPath *items;
+    size_t count;
+    size_t capacity;
+} PortableCompatibilityPaths;
+
+static void compatibility_paths_free(PortableCompatibilityPaths *paths)
 {
-    if (state == NULL || group == NULL || parent_physical == NULL ||
-        payload_path == NULL || source_names == NULL || reserved_names == NULL ||
-        group->count != 1U)
+    if (paths == NULL)
+        return;
+    for (size_t index = 0; index < paths->count; index++)
+        free(paths->items[index].logical_path);
+    free(paths->items);
+    memset(paths, 0, sizeof(*paths));
+}
+
+static int compatibility_paths_add(PortableCompatibilityPaths *paths,
+                                   const char *root_id,
+                                   const char *logical_path)
+{
+    if (paths == NULL || root_id == NULL || logical_path == NULL ||
+        paths->count >= SIDECAR_MAX_LIVE_ENTRIES)
         return -1;
-    char physical[SIDECAR_MAX_PATH + 1U];
-    if (append_physical(physical, sizeof(physical), parent_physical,
-                        group->encoded_names[0]) != 0)
+    if (paths->count == paths->capacity) {
+        PortableCompatibilityPath *items = array_reserve(
+            paths->items, &paths->capacity, paths->count, 1U,
+            sizeof(*items), 64U, SIDECAR_MAX_LIVE_ENTRIES);
+        if (items == NULL)
+            return -1;
+        paths->items = items;
+    }
+
+    PortableCompatibilityPath *item = &paths->items[paths->count];
+    memset(item, 0, sizeof(*item));
+    item->logical_path = portable_text_duplicate(logical_path);
+    if (item->logical_path == NULL ||
+        copy_text(item->root_id, sizeof(item->root_id), root_id) != 0) {
+        free(item->logical_path);
+        memset(item, 0, sizeof(*item));
         return -1;
-    assert(case_probe_source_name_contains(source_names, physical) &&
-           "case_probe_reserve_singleton: singleton's own physical name "
-           "missing from source_names (should already be reserved by "
-           "prescan_directory's unsuffixed-name pass)");
-    return case_probe_reserve_name(reserved_names, payload_path,
-                                   parent_physical, group->encoded_names[0],
-                                   physical, sizeof(physical)) != 0
-               ? -1
-               : 0;
+    }
+    paths->count++;
+    return 0;
 }
 
 static int prescan_directory(int source_fd, const char *logical,
-                             const char *physical, const char *root_id,
-                             const char *payload_path,
+                             const char *root_id,
                              PortablePrescanReport *report,
                              int case_sensitive,
                              PortableCaseProbeState *probe_state,
-                             const SelectionRoot *selection)
+                             const SelectionRoot *selection,
+                             PortableCompatibilityPaths *compatibility_paths)
 {
-    if (source_fd < 0 || logical == NULL || physical == NULL ||
-        root_id == NULL || payload_path == NULL || report == NULL ||
-        probe_state == NULL)
+    if (source_fd < 0 || logical == NULL || root_id == NULL || report == NULL ||
+        probe_state == NULL || compatibility_paths == NULL)
         return -1;
 
     int scan_fd = dup_cloexec(source_fd);
@@ -1174,12 +1171,10 @@ static int prescan_directory(int source_fd, const char *logical,
     }
 
     PortableCaseFoldSet siblings = {0};
-    PortableCaseFoldSet skeletons = {0};
+    PortableCaseFoldSet group_keys = {0};
     PortableCaseProbeGroups groups = {0};
-    if (!case_sensitive)
-        siblings.hash_salt = sidecar_process_salt();
-
     int failed = 0;
+
     for (;;) {
         errno = 0;
         struct dirent *entry = readdir(directory);
@@ -1213,85 +1208,72 @@ static int prescan_directory(int source_fd, const char *logical,
                 continue;
         }
 
-        char scratch[3U * NAME_MAX + 4U];
-        if (encoding_percent_encode(ENCODING_MODE_COMPONENT, entry->d_name,
-                                    scratch, sizeof(scratch)) != 0) {
-            failed = 1;
-            break;
-        }
-
-        size_t encoded_length = strlen(scratch);
-        if (encoded_length > NAME_MAX) {
+        size_t raw_length = strlen(entry->d_name);
+        if (raw_length > NAME_MAX) {
             if (prescan_record_violation(
                     report, root_id, child_logical,
                     PORTABLE_PRESCAN_NAME_TOO_LONG, NAME_MAX,
-                    encoded_length) != 0)
+                    raw_length) != 0)
                 failed = 1;
             if (failed)
                 break;
             continue;
         }
 
-        char child_physical[SIDECAR_MAX_PATH + 1U];
-        if (append_physical(child_physical, sizeof(child_physical), physical,
-                            scratch) != 0) {
+        PortablePhysicalName unsuffixed;
+        if (prescan_map_physical_name(entry->d_name, 0, &unsuffixed) != 0 ||
+            compatibility_paths_add(compatibility_paths, root_id,
+                                    child_logical) != 0) {
             failed = 1;
             break;
         }
 
-        size_t payload_root_length = strlen(payload_path);
-        size_t physical_length = strlen(child_physical);
-        if (!portable_payload_path_fits(payload_root_length, physical_length,
-                                        PATH_MAX)) {
-            if (payload_root_length > SIZE_MAX - 1U ||
-                physical_length > SIZE_MAX - payload_root_length - 1U)
+        char group_key[SIDECAR_MAX_PHYSICAL_LEAF + 1U];
+        if (case_sensitive) {
+            if (copy_text(group_key, sizeof(group_key),
+                          unsuffixed.physical_leaf) != 0) {
                 failed = 1;
-            else if (prescan_record_violation(
-                         report, root_id, child_logical,
-                         PORTABLE_PRESCAN_PATH_TOO_LONG, PATH_MAX,
-                         payload_root_length + 1U + physical_length) != 0)
-                failed = 1;
-            if (failed)
                 break;
-            continue;
+            }
+        } else {
+            skeleton_copy(group_key, sizeof(group_key),
+                          unsuffixed.physical_leaf);
         }
 
-        size_t skeleton_group_index = SIZE_MAX;
-        if (!case_sensitive) {
-            char skeleton[NAME_MAX + 1U];
-            skeleton_copy(skeleton, sizeof(skeleton), scratch);
-            size_t new_group_index = groups.count;
-            if (case_probe_groups_add(&groups, scratch, child_logical,
-                                      &new_group_index) != 0) {
-                failed = 1;
-                break;
-            }
-            size_t existing_group_index = SIZE_MAX;
-            char *existing_skeleton_path = NULL;
-            int skeleton_found = case_fold_set_find_or_insert_value(
-                &skeletons, skeleton, child_logical, new_group_index,
-                &existing_group_index, &existing_skeleton_path);
-            if (skeleton_found < 0) {
-                failed = 1;
-                break;
-            }
-            if (skeleton_found == 0) {
-                skeleton_group_index = new_group_index;
-            } else {
-                case_probe_group_free(&groups.items[new_group_index]);
-                groups.count--;
-                skeleton_group_index = existing_group_index;
-                if (skeleton_group_index >= groups.count ||
-                    case_probe_group_append(
-                        &groups.items[skeleton_group_index], scratch,
-                        child_logical) != 0) {
-                    failed = 1;
-                    break;
-                }
-            }
+        size_t new_group_index = groups.count;
+        if (case_probe_groups_add(&groups, entry->d_name, child_logical,
+                                  &unsuffixed, &new_group_index) != 0) {
+            failed = 1;
+            break;
+        }
+        size_t existing_group_index = SIZE_MAX;
+        char *existing_group_logical = NULL;
+        int group_found = case_fold_set_find_or_insert_value(
+            &group_keys, group_key, child_logical, new_group_index,
+            &existing_group_index, &existing_group_logical);
+        if (group_found < 0) {
+            failed = 1;
+            break;
+        }
 
-            char folded[NAME_MAX + 1U];
-            ascii_fold_copy(folded, sizeof(folded), scratch);
+        size_t group_index = new_group_index;
+        if (group_found == 1) {
+            case_probe_group_free(&groups.items[new_group_index]);
+            groups.count--;
+            group_index = existing_group_index;
+            if (group_index >= groups.count ||
+                case_probe_group_append(&groups.items[group_index],
+                                        entry->d_name, child_logical,
+                                        &unsuffixed) != 0) {
+                failed = 1;
+                break;
+            }
+        }
+
+        if (!case_sensitive) {
+            char folded[SIDECAR_MAX_PHYSICAL_LEAF + 1U];
+            ascii_fold_copy(folded, sizeof(folded),
+                            unsuffixed.physical_leaf);
             char *existing_logical = NULL;
             int found = case_fold_set_find_or_insert(
                 &siblings, folded, child_logical, &existing_logical);
@@ -1300,7 +1282,7 @@ static int prescan_directory(int source_fd, const char *logical,
                 break;
             }
             if (found == 1) {
-                groups.items[skeleton_group_index].ascii_collision = 1;
+                groups.items[group_index].ascii_collision = 1;
                 if (prescan_record_case_collision(
                         report, root_id, child_logical,
                         existing_logical) != 0) {
@@ -1331,8 +1313,8 @@ static int prescan_directory(int source_fd, const char *logical,
                 break;
             }
             int child_result = prescan_directory(
-                child_fd, child_logical, child_physical, root_id,
-                payload_path, report, case_sensitive, probe_state, selection);
+                child_fd, child_logical, root_id, report, case_sensitive,
+                probe_state, selection, compatibility_paths);
             if (close(child_fd) != 0)
                 child_result = -1;
             if (child_result != 0) {
@@ -1387,6 +1369,7 @@ static int prescan_directory(int source_fd, const char *logical,
                 report->skipped_kind_count++;
         }
     }
+
     if (closedir(directory) != 0) {
         int saved_errno = errno;
         prescan_record_operational_failure(report, logical, saved_errno);
@@ -1394,54 +1377,40 @@ static int prescan_directory(int source_fd, const char *logical,
         failed = 1;
     }
 
+    PortableCollisionAssignment *assignments = NULL;
+    size_t assignment_count = 0;
     PortableCaseFoldSet source_names = {0};
     PortableCaseFoldSet reserved_names = {0};
-    if (!failed) {
-        /* Reserve every unsuffixed source name before allocating suffixes so
-         * a generated %7EN cannot depend on group/readdir order (D21 F-1/F-2d). */
-        for (size_t group_index = 0;
-             group_index < groups.count && !failed; group_index++) {
-            PortableCaseProbeGroup *group = &groups.items[group_index];
-            for (size_t index = 0; index < group->count; index++) {
-                char source_physical[SIDECAR_MAX_PATH + 1U];
-                if (append_physical(source_physical, sizeof(source_physical),
-                                    physical,
-                                    group->encoded_names[index]) != 0) {
-                    failed = 1;
-                    break;
-                }
-                char source_key[SIDECAR_MAX_PATH + 1U];
-                skeleton_copy(source_key, sizeof(source_key), source_physical);
-                char *existing = NULL;
-                if (case_fold_set_find_or_insert(
-                        &source_names, source_key, source_physical,
-                        &existing) < 0) {
-                    failed = 1;
-                    break;
-                }
-            }
-        }
-    }
-    if (!failed && !case_sensitive) {
-        for (size_t index = 0; index < groups.count; index++) {
-            PortableCaseProbeGroup *group = &groups.items[index];
-            int group_result = group->count == 1U
-                ? case_probe_reserve_singleton(probe_state, group, physical,
-                                               payload_path,
-                                               &source_names, &reserved_names)
-                : case_probe_group(probe_state, group, root_id, physical,
-                                   payload_path, &source_names, &reserved_names,
-                                   report);
-            if (group_result != 0) {
-                failed = 1;
-                break;
-            }
-        }
-    }
+    PortableCaseFoldSet scratch_names = {0};
+    if (!failed &&
+        (portable_collision_assignments_build(
+             &groups, &assignments, &assignment_count) != 0 ||
+         sibling_source_names_build(assignments, assignment_count,
+                                    case_sensitive, &source_names) != 0))
+        failed = 1;
+
+    if (!failed && !case_sensitive &&
+        sibling_natural_names_probe(probe_state, assignments,
+                                    assignment_count, &groups,
+                                    &scratch_names) != 0)
+        failed = 1;
+
+    if (!failed &&
+        sibling_namespace_plan(probe_state, assignments, assignment_count,
+                               root_id, case_sensitive, &source_names,
+                               &reserved_names, &scratch_names, report) != 0)
+        failed = 1;
+
+    if (!case_sensitive && scratch_names.count != 0 &&
+        case_probe_group_names_free(probe_state, &scratch_names) != 0)
+        failed = 1;
+
     case_fold_set_free(&siblings);
-    case_fold_set_free(&skeletons);
+    case_fold_set_free(&group_keys);
     case_fold_set_free(&source_names);
     case_fold_set_free(&reserved_names);
+    case_fold_set_free(&scratch_names);
+    free(assignments);
     case_probe_groups_free(&groups);
     return failed ? -1 : 0;
 }
@@ -1579,9 +1548,11 @@ static int prescan_root_payload_namespace(
 
 static int prescan_root(const PortableRootSpec *root,
                         PortablePrescanReport *report, int case_sensitive,
-                        PortableCaseProbeState *probe_state)
+                        PortableCaseProbeState *probe_state,
+                        PortableCompatibilityPaths *compatibility_paths)
 {
-    if (!root_spec_valid(root) || report == NULL || probe_state == NULL)
+    if (!root_spec_valid(root) || report == NULL || probe_state == NULL ||
+        compatibility_paths == NULL)
         return -1;
 
     struct stat st;
@@ -1613,12 +1584,144 @@ static int prescan_root(const PortableRootSpec *root,
         errno = saved_errno;
         return -1;
     }
-    int result = prescan_directory(root_fd, "", "", root->id,
-                                   root->payload_path, report, case_sensitive,
-                                   probe_state, root->selection);
+    int result = prescan_directory(root_fd, "", root->id, report,
+                                   case_sensitive, probe_state,
+                                   root->selection, compatibility_paths);
     if (close(root_fd) != 0)
         result = -1;
     return result;
+}
+
+static int compatibility_path_build(
+    const PortableCollisionPlan *plan, const char *root_id,
+    const char *logical_path, char physical[SIDECAR_MAX_PATH + 1U],
+    size_t *physical_length_out)
+{
+    if (plan == NULL || root_id == NULL || logical_path == NULL ||
+        logical_path[0] == '\0' || physical == NULL ||
+        physical_length_out == NULL || !plan->sorted)
+        return -1;
+
+    char logical_prefix[SIDECAR_MAX_PATH + 1U] = {0};
+    char joined[SIDECAR_MAX_PATH + 1U] = {0};
+    int joined_available = 1;
+    size_t physical_length = 0;
+    const char *cursor = logical_path;
+
+    while (*cursor != '\0') {
+        const char *slash = strchr(cursor, '/');
+        size_t component_length = slash == NULL
+            ? strlen(cursor)
+            : (size_t)(slash - cursor);
+        if (component_length == 0 || component_length > NAME_MAX)
+            return -1;
+
+        char component[NAME_MAX + 1U];
+        memcpy(component, cursor, component_length);
+        component[component_length] = '\0';
+
+        char next_prefix[SIDECAR_MAX_PATH + 1U];
+        if (append_logical(next_prefix, sizeof(next_prefix), logical_prefix,
+                           component) != 0)
+            return -1;
+
+        const PortableCollisionPlanEntry *planned =
+            portable_collision_plan_find(plan, root_id, next_prefix);
+        PortablePhysicalName ordinary;
+        const char *leaf = NULL;
+        if (planned != NULL) {
+            if (planned->physical_leaf[0] == '\0')
+                return -1;
+            leaf = planned->physical_leaf;
+        } else {
+            if (prescan_map_physical_name(component, 0, &ordinary) != 0 ||
+                ordinary.shortened)
+                return -1;
+            leaf = ordinary.physical_leaf;
+        }
+
+        size_t leaf_length = strlen(leaf);
+        size_t separator_length = physical_length == 0 ? 0U : 1U;
+        if (physical_length > SIZE_MAX - separator_length ||
+            physical_length + separator_length > SIZE_MAX - leaf_length)
+            return -1;
+        physical_length += separator_length + leaf_length;
+
+        if (joined_available) {
+            char next_joined[SIDECAR_MAX_PATH + 1U];
+            if (append_physical(next_joined, sizeof(next_joined), joined,
+                                leaf) != 0) {
+                joined_available = 0;
+                joined[0] = '\0';
+            } else if (copy_text(joined, sizeof(joined), next_joined) != 0) {
+                return -1;
+            }
+        }
+
+        if (copy_text(logical_prefix, sizeof(logical_prefix), next_prefix) != 0)
+            return -1;
+        if (slash == NULL)
+            break;
+        cursor = slash + 1;
+    }
+
+    if (joined_available && copy_text(physical, SIDECAR_MAX_PATH + 1U,
+                                      joined) != 0)
+        return -1;
+    if (!joined_available)
+        physical[0] = '\0';
+    *physical_length_out = physical_length;
+    return 0;
+}
+
+static int compatibility_paths_derive(
+    PortablePrescanReport *report, const PortableCaptureRequest *request,
+    const PortableCompatibilityPaths *paths)
+{
+    if (report == NULL || request == NULL || paths == NULL ||
+        !report->collision_plan.sorted)
+        return -1;
+
+    for (size_t index = 0; index < paths->count; index++) {
+        const PortableCompatibilityPath *item = &paths->items[index];
+        const PortableRootSpec *root =
+            portable_collision_plan_root(request, item->root_id);
+        if (root == NULL)
+            return -1;
+
+        char physical[SIDECAR_MAX_PATH + 1U];
+        size_t physical_length = 0;
+        if (compatibility_path_build(&report->collision_plan, item->root_id,
+                                     item->logical_path, physical,
+                                     &physical_length) != 0)
+            return -1;
+
+        const PortableCollisionPlanEntry *planned =
+            portable_collision_plan_find(&report->collision_plan,
+                                         item->root_id,
+                                         item->logical_path);
+        if (planned != NULL && physical[0] != '\0') {
+            size_t plan_index = (size_t)(planned - report->collision_plan.entries);
+            if (plan_index >= report->collision_plan.count ||
+                copy_text(report->collision_plan.entries[plan_index].physical_path,
+                          sizeof(report->collision_plan.entries[plan_index].physical_path),
+                          physical) != 0)
+                return -1;
+        }
+
+        size_t payload_length = strlen(root->payload_path);
+        if (payload_length > SIZE_MAX - 1U ||
+            physical_length > SIZE_MAX - payload_length - 1U)
+            return -1;
+        size_t actual_path = payload_length + 1U + physical_length;
+        if (!portable_payload_path_fits(payload_length, physical_length,
+                                        PATH_MAX) &&
+            prescan_record_violation(
+                report, item->root_id, item->logical_path,
+                PORTABLE_PRESCAN_PATH_TOO_LONG, PATH_MAX, actual_path) != 0)
+            return -1;
+    }
+    return 0;
 }
 
 static int prescan_request_internal(int container_fd,
@@ -1636,21 +1739,28 @@ static int prescan_request_internal(int container_fd,
         .container_fd = container_fd,
         .scratch_fd = -1
     };
+    PortableCompatibilityPaths compatibility_paths = {0};
     int failed = 0;
     for (size_t index = 0; index < request->root_count; index++)
         if (prescan_root(&request->roots[index], report,
-                         request->case_sensitive, &probe_state) != 0)
+                         request->case_sensitive, &probe_state,
+                         &compatibility_paths) != 0)
             failed = 1;
     if (prescan_root_payload_namespace(request, report, &probe_state) != 0)
         failed = 1;
     if (case_probe_cleanup(&probe_state) != 0)
         failed = 1;
     portable_collision_plan_sort(&report->collision_plan);
-    if (!failed && portable_collision_plan_rewrite_parents(report, request) != 0)
+    if (!failed && compatibility_paths_derive(report, request,
+                                              &compatibility_paths) != 0)
         failed = 1;
     if (!failed)
         prescan_report_refresh_unresolved(report);
-    return failed || (reject_violations && report->unresolved_count != 0)
+    compatibility_paths_free(&compatibility_paths);
+    return failed ||
+                   (reject_violations &&
+                    (report->unresolved_count != 0 ||
+                     report->shortening_count != 0))
                ? -1
                : 0;
 }
