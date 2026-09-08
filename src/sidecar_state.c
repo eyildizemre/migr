@@ -1180,6 +1180,34 @@ SidecarStatus sidecar_log_foreach(SidecarLog *log, SidecarLiveCallback callback,
     return SIDECAR_STATUS_OK;
 }
 
+SidecarStatus sidecar_log_deleted_foreach(SidecarLog *log,
+                                          SidecarLiveCallback callback,
+                                          void *context)
+{
+    SidecarLogImplementation *implementation = NULL;
+    SidecarStatus status = ready_log(log, &implementation);
+    if (status != SIDECAR_STATUS_OK)
+        return status;
+    if (callback == NULL)
+        return SIDECAR_STATUS_INVALID_ARGUMENT;
+
+    for (size_t index = 0; index < implementation->map.capacity; index++)
+    {
+        MapSlot *slot = &implementation->map.slots[index];
+        if (slot->state != MAP_SLOT_TOMBSTONE)
+            continue;
+        SidecarLiveView view = {
+            .entry = &slot->value.entry.entry,
+            .xattrs = slot->value.entry.xattrs,
+            .xattr_count = slot->value.entry.entry.xattr_count,
+            .generation = slot->value.entry.generation
+        };
+        if (callback(&view, context) != 0)
+            return SIDECAR_STATUS_CALLBACK;
+    }
+    return SIDECAR_STATUS_OK;
+}
+
 SidecarStatus sidecar_log_claim_foreach(SidecarLog *log,
                                         SidecarClaimCallback callback,
                                         void *context)

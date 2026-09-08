@@ -58,6 +58,29 @@ static int count_live_callback(const SidecarLiveView *view, void *context)
     return 0;
 }
 
+typedef struct {
+    size_t count;
+    int matched;
+    int stop;
+} DeletedForeachProbe;
+
+static int bytes_match_text(SidecarBytes bytes, const char *text);
+
+static int deleted_foreach_probe_callback(const SidecarLiveView *view,
+                                          void *context)
+{
+    DeletedForeachProbe *probe = context;
+    if (view == NULL || view->entry == NULL || probe == NULL)
+        return 1;
+    probe->count++;
+    if (bytes_match_text(view->entry->root_id, "ROOT") &&
+        bytes_match_text(view->entry->logical_path, "file") &&
+        bytes_match_text(view->entry->physical_leaf, "leaf-old") &&
+        view->entry->kind == SIDECAR_KIND_REGULAR)
+        probe->matched = 1;
+    return probe->stop ? 1 : 0;
+}
+
 static int bytes_match_text(SidecarBytes bytes, const char *text)
 {
     size_t length = text == NULL ? 0U : strlen(text);
@@ -480,6 +503,81 @@ static void test_claim_replay_and_transitions(int container_fd)
         close(fd);
     check(sidecar_log_adopt_at(container_fd, &log) == SIDECAR_OPEN_UNUSABLE,
           "conflicting CLAIMs are rejected at adoption");
+}
+
+static void test_deleted_foreach(int container_fd)
+{
+    printf(BLUE "::" NC " current tombstone iteration\n");
+    check(reset_slot(container_fd) == 0,
+          "deleted-foreach slot starts absent");
+
+    SidecarLog log = {0};
+    SidecarClaim first_claim = claim_for("ROOT", "file", "leaf-old",
+                                         SIDECAR_KIND_REGULAR);
+    SidecarEntry first = entry_for("ROOT", "file", "leaf-old", 1, 0);
+    check(sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH &&
+              append_root_claim(&log, "ROOT") == 0 &&
+              sidecar_log_append_claim(&log, &first_claim) ==
+                  SIDECAR_STATUS_OK &&
+              sidecar_log_append_entry(&log, &first) == SIDECAR_STATUS_OK &&
+              sidecar_log_append_entry_commit(&log) == SIDECAR_STATUS_OK,
+          "deleted-foreach fixture publishes one live entry");
+
+    size_t live_count = 0;
+    DeletedForeachProbe deleted = {0};
+    check(sidecar_log_foreach(&log, count_live_callback, &live_count) ==
+                  SIDECAR_STATUS_OK &&
+              live_count == 1 &&
+              sidecar_log_deleted_foreach(&log,
+                                          deleted_foreach_probe_callback,
+                                          &deleted) == SIDECAR_STATUS_OK &&
+              deleted.count == 0,
+          "live state is excluded from current-tombstone iteration");
+
+    SidecarDelete deletion = {
+        .root_id = first.root_id,
+        .logical_path = first.logical_path
+    };
+    check(sidecar_log_append_delete(&log, &deletion) == SIDECAR_STATUS_OK,
+          "DELETE creates current tombstone state");
+    deleted = (DeletedForeachProbe){0};
+    live_count = 0;
+    check(sidecar_log_foreach(&log, count_live_callback, &live_count) ==
+                  SIDECAR_STATUS_OK &&
+              live_count == 0 &&
+              sidecar_log_deleted_foreach(&log,
+                                          deleted_foreach_probe_callback,
+                                          &deleted) == SIDECAR_STATUS_OK &&
+              deleted.count == 1 && deleted.matched,
+          "deleted iteration exposes the current tombstone with borrowed v4 identity");
+
+    deleted = (DeletedForeachProbe){ .stop = 1 };
+    check(sidecar_log_deleted_foreach(&log, deleted_foreach_probe_callback,
+                                      &deleted) == SIDECAR_STATUS_CALLBACK &&
+              deleted.count == 1 && deleted.matched,
+          "deleted iteration propagates callback refusal");
+
+    SidecarClaim replacement_claim = claim_for(
+        "ROOT", "file", "leaf-new", SIDECAR_KIND_REGULAR);
+    SidecarEntry replacement = entry_for("ROOT", "file", "leaf-new", 2, 0);
+    check(sidecar_log_append_claim(&log, &replacement_claim) ==
+                  SIDECAR_STATUS_OK &&
+              sidecar_log_append_entry(&log, &replacement) ==
+                  SIDECAR_STATUS_OK &&
+              sidecar_log_append_entry_commit(&log) == SIDECAR_STATUS_OK,
+          "a replacement entry supersedes the tombstoned key");
+    deleted = (DeletedForeachProbe){0};
+    live_count = 0;
+    check(sidecar_log_deleted_foreach(&log,
+                                      deleted_foreach_probe_callback,
+                                      &deleted) == SIDECAR_STATUS_OK &&
+              deleted.count == 0 &&
+              sidecar_log_foreach(&log, count_live_callback, &live_count) ==
+                  SIDECAR_STATUS_OK &&
+              live_count == 1,
+          "replacement removes the old key from current-tombstone iteration");
+    check(sidecar_log_close(&log) == SIDECAR_STATUS_OK,
+          "deleted-foreach fixture closes cleanly");
 }
 
 static void test_v4_parent_chain_and_leaf_identity(int container_fd)
@@ -1136,6 +1234,7 @@ int main(void)
 
     test_fresh_and_live_map(container_fd);
     test_claim_replay_and_transitions(container_fd);
+    test_deleted_foreach(container_fd);
     test_v4_parent_chain_and_leaf_identity(container_fd);
     test_v4_parent_state_guards(container_fd);
     test_v4_cumulative_physical_path_limit(container_fd);

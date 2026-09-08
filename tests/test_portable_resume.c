@@ -1831,6 +1831,25 @@ static int live_leaf_matches(int container_fd, const char *root,
     return result;
 }
 
+static int deleted_leaf_matches(int container_fd, const char *root,
+                                const char *logical,
+                                const char *physical_leaf,
+                                SidecarObjectKind kind)
+{
+    SidecarLog log = {0};
+    if (sidecar_log_adopt_at(container_fd, &log) != SIDECAR_OPEN_RESUMABLE)
+        return 0;
+    SidecarLiveView view = {0};
+    int result = sidecar_log_find_deleted(&log, resume_bytes(root),
+                                          resume_bytes(logical), &view) == 1 &&
+                 view.entry != NULL && view.entry->kind == kind &&
+                 resume_bytes_match_text(view.entry->physical_leaf,
+                                         physical_leaf);
+    if (sidecar_log_close(&log) != SIDECAR_STATUS_OK)
+        result = 0;
+    return result;
+}
+
 static int claim_leaf_matches(int container_fd, const char *root,
                               const char *logical, const char *physical_leaf,
                               SidecarObjectKind kind)
@@ -1917,6 +1936,97 @@ static int hardlink_sigkill_recovered(const SigkillFixture *fixture)
     if (sidecar_log_close(&log) != SIDECAR_STATUS_OK)
         result = 0;
     return result;
+}
+
+static void test_collision_relocation_interruptions(const char *base)
+{
+    printf(BLUE "::" NC " collision relocation interruption boundaries\n");
+    static const struct {
+        const char *label;
+        PortableTestInterruptPoint point;
+        int tombstoned;
+        int old_payload_present;
+    } cases[] = {
+        { "before-delete", PORTABLE_TEST_BEFORE_REPLACEMENT_DELETE, 0, 1 },
+        { "after-delete", PORTABLE_TEST_AFTER_REPLACEMENT_DELETE, 1, 1 },
+        { "after-unlink", PORTABLE_TEST_AFTER_STALE_UNLINK, 1, 0 }
+    };
+
+    for (size_t index = 0; index < sizeof(cases) / sizeof(cases[0]); index++) {
+        char source_path[PATH_MAX];
+        char container_path[PATH_MAX];
+        int source_length = snprintf(source_path, sizeof(source_path),
+                                     "%s/relocation-%s-source", base,
+                                     cases[index].label);
+        int container_length = snprintf(container_path, sizeof(container_path),
+                                        "%s/relocation-%s-container", base,
+                                        cases[index].label);
+        if (source_length < 0 || container_length < 0 ||
+            (size_t)source_length >= sizeof(source_path) ||
+            (size_t)container_length >= sizeof(container_path))
+            fixture_fatal("relocation interruption path is too long");
+        make_directory(source_path);
+        char lower_source[PATH_MAX];
+        char upper_source[PATH_MAX];
+        join_path(lower_source, sizeof(lower_source), source_path, "foo");
+        join_path(upper_source, sizeof(upper_source), source_path, "Foo");
+        write_file(lower_source, "lower");
+
+        PortableRootSpec root = root_spec("RELOC", source_path, "RELOC");
+        PortableCaptureRequest request = request_for(&root, "d8b4");
+        request.case_sensitive = 1;
+        int container_fd = -1;
+        check(fresh_capture(container_path, &request, &container_fd) == 0,
+              "relocation interruption fixture has an unsuffixed predecessor");
+        if (container_fd < 0) {
+            remove_tree(source_path);
+            remove_tree(container_path);
+            continue;
+        }
+
+        write_file(upper_source, "upper");
+        request.case_sensitive = 0;
+        check(run_resume_interrupt(container_fd, &request, cases[index].point,
+                                   SIDECAR_TEST_INTERRUPT_NONE) == 0,
+              cases[index].label);
+        portable_capture_test_set_interrupt(PORTABLE_TEST_INTERRUPT_NONE);
+        sidecar_test_set_interrupt(SIDECAR_TEST_INTERRUPT_NONE);
+
+        struct stat st;
+        int old_present = fstatat(container_fd, "data/RELOC/foo", &st,
+                                  AT_SYMLINK_NOFOLLOW) == 0 &&
+                          S_ISREG(st.st_mode);
+        int state_ok = cases[index].tombstoned
+            ? deleted_leaf_matches(container_fd, "RELOC", "foo", "foo",
+                                   SIDECAR_KIND_REGULAR)
+            : live_leaf_matches(container_fd, "RELOC", "foo", "foo", "",
+                                SIDECAR_KIND_REGULAR);
+        check(state_ok && old_present == cases[index].old_payload_present,
+              "interrupted relocation leaves the expected durable owner and old payload state");
+
+        int resumed = portable_capture_resume_at(container_fd, &request, NULL);
+        int old_absent = fstatat(container_fd, "data/RELOC/foo", &st,
+                                 AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT;
+        int winner_present = fstatat(container_fd, "data/RELOC/Foo", &st,
+                                     AT_SYMLINK_NOFOLLOW) == 0 &&
+                             S_ISREG(st.st_mode);
+        int loser_present = fstatat(container_fd, "data/RELOC/foo%7E1", &st,
+                                    AT_SYMLINK_NOFOLLOW) == 0 &&
+                            S_ISREG(st.st_mode);
+        SidecarLog log = {0};
+        int adopted = sidecar_log_adopt_at(container_fd, &log) ==
+                      SIDECAR_OPEN_RESUMABLE;
+        int no_claims = adopted && sidecar_log_claim_count(&log) == 0;
+        if (adopted && sidecar_log_close(&log) != SIDECAR_STATUS_OK)
+            no_claims = 0;
+        check(resumed == 0 && old_absent && winner_present && loser_present &&
+                  live_leaf_matches(container_fd, "RELOC", "foo", "foo%7E1",
+                                    "%7E1", SIDECAR_KIND_REGULAR) && no_claims,
+              "resume recovers the interrupted relocation through exact tombstone and leaf ownership");
+        close(container_fd);
+        remove_tree(source_path);
+        remove_tree(container_path);
+    }
 }
 
 static int payload_regular_size(const char *container_path,
@@ -3166,6 +3276,7 @@ int main(void)
     test_shortened_directory_claim_resume(base);
     test_repeated_fresh_claim_resume(base);
     test_foreign_destination_claim_refusal(base);
+    test_collision_relocation_interruptions(base);
     test_sigkill_boundaries(base);
     test_stale_xattr_interruption(base);
     test_symlink_sigkill_boundaries(base);

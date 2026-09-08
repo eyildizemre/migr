@@ -196,6 +196,9 @@ int sidecar_log_find(const SidecarLog *log, SidecarBytes root_id,
                      SidecarBytes logical_path, SidecarLiveView *out);
 SidecarStatus sidecar_log_foreach(SidecarLog *log, SidecarLiveCallback callback,
                                    void *context);
+SidecarStatus sidecar_log_deleted_foreach(SidecarLog *log,
+                                          SidecarLiveCallback callback,
+                                          void *context);
 SidecarStatus sidecar_log_claim_foreach(SidecarLog *log,
                                         SidecarClaimCallback callback,
                                         void *context);

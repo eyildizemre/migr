@@ -40,6 +40,9 @@ void portable_prescan_report_free(PortablePrescanReport *report)
         return;
     free(report->examples);
     portable_collision_plan_free(&report->collision_plan);
+    for (size_t index = 0; index < report->current_source.count; index++)
+        free(report->current_source.entries[index].logical_path);
+    free(report->current_source.entries);
     if (report->inode_seen != NULL)
     {
         prescan_inode_set_free(report->inode_seen);
@@ -1029,198 +1032,478 @@ static int sticky_seed_inode_map(PortableInodeMap *inode_map,
     return status == SIDECAR_STATUS_OK && state.failed == 0 ? 0 : -1;
 }
 
-void portable_owned_paths_free(PortableOwnedPaths *paths)
+void portable_physical_owners_free(PortablePhysicalOwners *owners)
 {
-    if (paths == NULL)
+    if (owners == NULL)
         return;
-    for (size_t index = 0; index < paths->count; index++) {
-        free(paths->items[index].root_id);
-        free(paths->items[index].physical_path);
-        free(paths->items[index].logical_path);
+    for (size_t index = 0; index < owners->count; index++) {
+        PortablePhysicalOwner *item = &owners->items[index];
+        free(item->root_id);
+        free(item->logical_parent);
+        free(item->physical_leaf);
+        free(item->logical_path);
     }
-    free(paths->items);
-    memset(paths, 0, sizeof(*paths));
+    free(owners->items);
+    memset(owners, 0, sizeof(*owners));
 }
 
-static int portable_owned_paths_append(PortableOwnedPaths *paths,
-                                       const SidecarLiveView *view)
+static int logical_parent_dup(const char *logical, char **out)
 {
-    if (paths == NULL || view == NULL || view->entry == NULL ||
-        paths->count >= SIDECAR_MAX_LIVE_ENTRIES)
+    if (logical == NULL || out == NULL)
         return -1;
-    if (paths->count == paths->capacity) {
-        PortableOwnedPath *items = array_reserve(
-            paths->items, &paths->capacity, paths->count, 1U,
+    *out = NULL;
+    const char *slash = strrchr(logical, '/');
+    size_t length = slash == NULL ? 0U : (size_t)(slash - logical);
+    char *parent = malloc(length + 1U);
+    if (parent == NULL)
+        return -1;
+    if (length != 0)
+        memcpy(parent, logical, length);
+    parent[length] = '\0';
+    *out = parent;
+    return 0;
+}
+
+static int portable_physical_owner_append(
+    PortablePhysicalOwners *owners, SidecarBytes root_id,
+    SidecarBytes logical_path, SidecarBytes physical_leaf,
+    SidecarObjectKind kind, PortableOwnerState state)
+{
+    if (owners == NULL || root_id.data == NULL || root_id.length == 0 ||
+        (logical_path.length != 0 && logical_path.data == NULL) ||
+        (physical_leaf.length != 0 && physical_leaf.data == NULL) ||
+        owners->count >= SIDECAR_MAX_LIVE_ENTRIES)
+        return -1;
+    if (logical_path.length == 0) {
+        if (physical_leaf.length != 0)
+            return -1;
+    } else if (physical_leaf.length == 0 ||
+               physical_leaf.length > SIDECAR_MAX_PHYSICAL_LEAF)
+        return -1;
+
+    if (owners->count == owners->capacity) {
+        PortablePhysicalOwner *items = array_reserve(
+            owners->items, &owners->capacity, owners->count, 1U,
             sizeof(*items), 16U, SIDECAR_MAX_LIVE_ENTRIES);
         if (items == NULL)
             return -1;
-        paths->items = items;
+        owners->items = items;
     }
 
-    PortableOwnedPath item = {0};
-    if (sidecar_bytes_to_text(view->entry->root_id, &item.root_id) != 0 ||
-        sidecar_bytes_to_text(view->entry->physical_path,
-                              &item.physical_path) != 0 ||
-        sidecar_bytes_to_text(view->entry->logical_path,
-                              &item.logical_path) != 0) {
+    PortablePhysicalOwner item = { .kind = kind, .state = state };
+    if (sidecar_bytes_to_text(root_id, &item.root_id) != 0 ||
+        sidecar_bytes_to_text(logical_path, &item.logical_path) != 0 ||
+        sidecar_bytes_to_text(physical_leaf, &item.physical_leaf) != 0 ||
+        logical_parent_dup(item.logical_path, &item.logical_parent) != 0 ||
+        (item.logical_path[0] != '\0' &&
+         !safe_component(item.physical_leaf))) {
         free(item.root_id);
-        free(item.physical_path);
+        free(item.logical_parent);
+        free(item.physical_leaf);
         free(item.logical_path);
         return -1;
     }
-    paths->items[paths->count++] = item;
+    owners->items[owners->count++] = item;
+    owners->sorted = 0;
     return 0;
 }
 
-static int portable_owned_paths_callback(const SidecarLiveView *view,
+static int portable_active_live_callback(const SidecarLiveView *view,
                                          void *argument)
 {
-    PortableOwnedPaths *paths = argument;
-    return portable_owned_paths_append(paths, view) == 0 ? 0 : 1;
+    PortablePhysicalOwners *owners = argument;
+    if (view == NULL || view->entry == NULL)
+        return 1;
+    return portable_physical_owner_append(
+               owners, view->entry->root_id, view->entry->logical_path,
+               view->entry->physical_leaf, view->entry->kind,
+               PORTABLE_OWNER_LIVE) == 0
+               ? 0
+               : 1;
 }
 
-static int portable_owned_path_compare(const void *left, const void *right)
+static int portable_active_claim_callback(const SidecarClaimView *view,
+                                          void *argument)
 {
-    const PortableOwnedPath *left_path = left;
-    const PortableOwnedPath *right_path = right;
-    int result = strcmp(left_path->root_id, right_path->root_id);
-    if (result != 0)
-        return result;
-    return strcmp(left_path->physical_path, right_path->physical_path);
+    PortablePhysicalOwners *owners = argument;
+    if (view == NULL || view->claim == NULL)
+        return 1;
+    return portable_physical_owner_append(
+               owners, view->claim->root_id, view->claim->logical_path,
+               view->claim->physical_leaf, view->claim->kind,
+               PORTABLE_OWNER_CLAIM) == 0
+               ? 0
+               : 1;
 }
 
-int portable_owned_paths_load(PortableOwnedPaths *paths,
-                                     SidecarLog *sidecar)
+static int portable_tombstone_callback(const SidecarLiveView *view,
+                                       void *argument)
 {
-    if (paths == NULL || sidecar == NULL)
+    PortablePhysicalOwners *owners = argument;
+    if (view == NULL || view->entry == NULL)
+        return 1;
+    return portable_physical_owner_append(
+               owners, view->entry->root_id, view->entry->logical_path,
+               view->entry->physical_leaf, view->entry->kind,
+               PORTABLE_OWNER_TOMBSTONE) == 0
+               ? 0
+               : 1;
+}
+
+static int portable_physical_owner_compare(const void *left,
+                                           const void *right)
+{
+    const PortablePhysicalOwner *a = left;
+    const PortablePhysicalOwner *b = right;
+    int result = strcmp(a->root_id, b->root_id);
+    if (result == 0)
+        result = strcmp(a->logical_parent, b->logical_parent);
+    if (result == 0)
+        result = strcmp(a->physical_leaf, b->physical_leaf);
+    if (result == 0)
+        result = strcmp(a->logical_path, b->logical_path);
+    if (result == 0)
+        result = (int)a->state - (int)b->state;
+    return result;
+}
+
+static int portable_physical_owners_sort(PortablePhysicalOwners *owners,
+                                         int reject_ambiguous)
+{
+    if (owners == NULL)
         return -1;
-    SidecarStatus status = sidecar_log_foreach(
-        sidecar, portable_owned_paths_callback, paths);
-    if (status != SIDECAR_STATUS_OK)
-        return -1;
-    if (paths->count > 1U)
-        qsort(paths->items, paths->count, sizeof(*paths->items),
-              portable_owned_path_compare);
-    for (size_t index = 1; index < paths->count; index++) {
-        PortableOwnedPath *previous = &paths->items[index - 1U];
-        PortableOwnedPath *current = &paths->items[index];
-        if (strcmp(previous->root_id, current->root_id) == 0 &&
-            strcmp(previous->physical_path, current->physical_path) == 0)
-            return -1;
+    if (owners->count > 1U)
+        qsort(owners->items, owners->count, sizeof(*owners->items),
+              portable_physical_owner_compare);
+    if (reject_ambiguous) {
+        for (size_t index = 1; index < owners->count; index++) {
+            PortablePhysicalOwner *previous = &owners->items[index - 1U];
+            PortablePhysicalOwner *current = &owners->items[index];
+            if (strcmp(previous->root_id, current->root_id) == 0 &&
+                strcmp(previous->logical_parent, current->logical_parent) == 0 &&
+                strcmp(previous->physical_leaf, current->physical_leaf) == 0)
+                return -1;
+        }
     }
-    paths->sorted = 1;
+    owners->sorted = 1;
+    owners->allow_ambiguous = !reject_ambiguous;
     return 0;
 }
 
-const char *portable_owned_paths_owner(
-    const PortableOwnedPaths *paths, const char *root_id,
-    const char *physical_path)
+int portable_active_owners_load(PortablePhysicalOwners *owners,
+                                SidecarLog *sidecar)
 {
-    if (paths == NULL || !paths->sorted || root_id == NULL ||
-        physical_path == NULL)
-        return NULL;
+    if (owners == NULL || sidecar == NULL)
+        return -1;
+    portable_physical_owners_free(owners);
+    SidecarStatus live_status = sidecar_log_foreach(
+        sidecar, portable_active_live_callback, owners);
+    SidecarStatus claim_status = live_status == SIDECAR_STATUS_OK
+        ? sidecar_log_claim_foreach(sidecar, portable_active_claim_callback,
+                                    owners)
+        : live_status;
+    if (live_status != SIDECAR_STATUS_OK || claim_status != SIDECAR_STATUS_OK ||
+        portable_physical_owners_sort(owners, 1) != 0) {
+        portable_physical_owners_free(owners);
+        return -1;
+    }
+    return 0;
+}
+
+int portable_tombstone_owners_load(PortablePhysicalOwners *owners,
+                                   SidecarLog *sidecar)
+{
+    if (owners == NULL || sidecar == NULL)
+        return -1;
+    portable_physical_owners_free(owners);
+    SidecarStatus status = sidecar_log_deleted_foreach(
+        sidecar, portable_tombstone_callback, owners);
+    if (status != SIDECAR_STATUS_OK ||
+        portable_physical_owners_sort(owners, 0) != 0) {
+        portable_physical_owners_free(owners);
+        return -1;
+    }
+    return 0;
+}
+
+static int portable_owner_key_compare(const PortablePhysicalOwner *item,
+                                      const char *root_id,
+                                      const char *logical_parent,
+                                      const char *physical_leaf)
+{
+    int result = strcmp(item->root_id, root_id);
+    if (result == 0)
+        result = strcmp(item->logical_parent, logical_parent);
+    if (result == 0)
+        result = strcmp(item->physical_leaf, physical_leaf);
+    return result;
+}
+
+int portable_physical_owners_find(const PortablePhysicalOwners *owners,
+                                  const char *root_id,
+                                  const char *logical_parent,
+                                  const char *physical_leaf,
+                                  const PortablePhysicalOwner **out)
+{
+    if (out != NULL)
+        *out = NULL;
+    if (owners == NULL || !owners->sorted || root_id == NULL ||
+        logical_parent == NULL || physical_leaf == NULL || out == NULL)
+        return -1;
+
     size_t low = 0;
-    size_t high = paths->count;
+    size_t high = owners->count;
     while (low < high) {
         size_t middle = low + (high - low) / 2U;
-        const PortableOwnedPath *item = &paths->items[middle];
-        int result = strcmp(item->root_id, root_id);
-        if (result == 0)
-            result = strcmp(item->physical_path, physical_path);
+        int result = portable_owner_key_compare(&owners->items[middle],
+                                                root_id, logical_parent,
+                                                physical_leaf);
         if (result < 0)
             low = middle + 1U;
         else
             high = middle;
     }
-    if (low == paths->count)
-        return NULL;
-    const PortableOwnedPath *item = &paths->items[low];
-    return strcmp(item->root_id, root_id) == 0 &&
-                   strcmp(item->physical_path, physical_path) == 0
-               ? item->logical_path
-               : NULL;
+    if (low == owners->count ||
+        portable_owner_key_compare(&owners->items[low], root_id,
+                                   logical_parent, physical_leaf) != 0)
+        return 0;
+    if (low + 1U < owners->count &&
+        portable_owner_key_compare(&owners->items[low + 1U], root_id,
+                                   logical_parent, physical_leaf) == 0)
+        return -1;
+    *out = &owners->items[low];
+    return 1;
 }
 
-void portable_claimed_paths_free(PortableClaimedPaths *paths)
+int portable_capture_owners_reload(PortableCaptureContext *context)
 {
-    if (paths == NULL)
-        return;
-    for (size_t index = 0; index < paths->count; index++) {
-        free(paths->items[index].root_id);
-        free(paths->items[index].physical_path);
-        free(paths->items[index].logical_path);
-    }
-    free(paths->items);
-    memset(paths, 0, sizeof(*paths));
+    if (context == NULL || context->sidecar == NULL ||
+        context->active_owners == NULL || context->tombstone_owners == NULL)
+        return -1;
+    PortablePhysicalOwners *active = context->active_owners;
+    PortablePhysicalOwners *tombstones = context->tombstone_owners;
+    return portable_active_owners_load(active, context->sidecar) == 0 &&
+                   portable_tombstone_owners_load(tombstones,
+                                                  context->sidecar) == 0
+               ? 0
+               : -1;
 }
 
-static int portable_claimed_paths_append(PortableClaimedPaths *paths,
-                                         const SidecarClaimView *view)
+static int logical_parent_copy(char *out, size_t out_size,
+                               const char *logical)
 {
-    if (paths == NULL || view == NULL || view->claim == NULL ||
-        paths->count >= SIDECAR_MAX_LIVE_ENTRIES)
+    if (out == NULL || out_size == 0 || logical == NULL)
         return -1;
-    if (paths->count == paths->capacity) {
-        PortableClaimedPath *items = array_reserve(
-            paths->items, &paths->capacity, paths->count, 1U,
-            sizeof(*items), 16U, SIDECAR_MAX_LIVE_ENTRIES);
-        if (items == NULL)
-            return -1;
-        paths->items = items;
-    }
-
-    PortableClaimedPath item = {0};
-    if (sidecar_bytes_to_text(view->claim->root_id, &item.root_id) != 0 ||
-        sidecar_bytes_to_text(view->claim->physical_path,
-                              &item.physical_path) != 0 ||
-        sidecar_bytes_to_text(view->claim->logical_path,
-                              &item.logical_path) != 0) {
-        free(item.root_id);
-        free(item.physical_path);
-        free(item.logical_path);
+    const char *slash = strrchr(logical, '/');
+    size_t length = slash == NULL ? 0U : (size_t)(slash - logical);
+    if (length >= out_size)
         return -1;
-    }
-    paths->items[paths->count++] = item;
+    if (length != 0)
+        memcpy(out, logical, length);
+    out[length] = '\0';
     return 0;
 }
 
-static int portable_claimed_paths_callback(const SidecarClaimView *view,
-                                           void *argument)
+int portable_current_assignment(
+    const PortableCaptureContext *context, const PortableRootSpec *root,
+    const char *logical,
+    char physical_leaf[SIDECAR_MAX_PHYSICAL_LEAF + 1U],
+    char collision_suffix[SIDECAR_MAX_COLLISION_SUFFIX + 1U])
 {
-    PortableClaimedPaths *paths = argument;
-    return portable_claimed_paths_append(paths, view) == 0 ? 0 : 1;
-}
-
-static int portable_claimed_path_compare(const void *left, const void *right)
-{
-    const PortableClaimedPath *left_path = left;
-    const PortableClaimedPath *right_path = right;
-    int result = strcmp(left_path->root_id, right_path->root_id);
-    if (result != 0)
-        return result;
-    return strcmp(left_path->physical_path, right_path->physical_path);
-}
-
-int portable_claimed_paths_load(PortableClaimedPaths *paths,
-                                       SidecarLog *sidecar)
-{
-    if (paths == NULL || sidecar == NULL)
+    if (context == NULL || root == NULL || logical == NULL ||
+        physical_leaf == NULL || collision_suffix == NULL ||
+        context->current_source == NULL || context->collision_plan == NULL)
         return -1;
-    SidecarStatus status = sidecar_log_claim_foreach(
-        sidecar, portable_claimed_paths_callback, paths);
-    if (status != SIDECAR_STATUS_OK)
+    physical_leaf[0] = '\0';
+    collision_suffix[0] = '\0';
+
+    int present = portable_current_source_contains(context->current_source,
+                                                   root->id, logical);
+    if (present != 1)
         return -1;
-    if (paths->count > 1U)
-        qsort(paths->items, paths->count, sizeof(*paths->items),
-              portable_claimed_path_compare);
-    for (size_t index = 1; index < paths->count; index++) {
-        PortableClaimedPath *previous = &paths->items[index - 1U];
-        PortableClaimedPath *current = &paths->items[index];
-        if (strcmp(previous->root_id, current->root_id) == 0 &&
-            strcmp(previous->physical_path, current->physical_path) == 0)
+    if (logical[0] == '\0')
+        return 0;
+
+    const PortableCollisionPlanEntry *planned =
+        portable_collision_plan_find(context->collision_plan, root->id,
+                                     logical);
+    if (planned != NULL) {
+        if (!safe_component(planned->physical_leaf) ||
+            copy_text(physical_leaf, SIDECAR_MAX_PHYSICAL_LEAF + 1U,
+                      planned->physical_leaf) != 0 ||
+            copy_text(collision_suffix,
+                      SIDECAR_MAX_COLLISION_SUFFIX + 1U,
+                      planned->collision_suffix) != 0)
             return -1;
+        return 0;
     }
-    paths->sorted = 1;
+
+    const char *raw_component = strrchr(logical, '/');
+    raw_component = raw_component == NULL ? logical : raw_component + 1U;
+    PortablePhysicalName mapped;
+    if (portable_physical_name_map(raw_component, 0, &mapped) != 0 ||
+        mapped.shortened || mapped.collision_suffix[0] != '\0' ||
+        !safe_component(mapped.physical_leaf) ||
+        copy_text(physical_leaf, SIDECAR_MAX_PHYSICAL_LEAF + 1U,
+                  mapped.physical_leaf) != 0)
+        return -1;
+    return 0;
+}
+
+static int recorded_state_copy(
+    PortableCaptureContext *context, const char *root_id,
+    const char *logical, int allow_tombstone,
+    char physical_leaf[SIDECAR_MAX_PHYSICAL_LEAF + 1U],
+    SidecarObjectKind *kind_out, PortableOwnerState *state_out)
+{
+    if (context == NULL || context->sidecar == NULL || root_id == NULL ||
+        logical == NULL || physical_leaf == NULL || kind_out == NULL ||
+        state_out == NULL)
+        return -1;
+    SidecarBytes root_key = {
+        (const unsigned char *)root_id, strlen(root_id)
+    };
+    SidecarBytes logical_key = {
+        (const unsigned char *)logical, strlen(logical)
+    };
+    SidecarLiveView live = {0};
+    SidecarClaimView claim = {0};
+    int live_found = sidecar_log_find(context->sidecar, root_key,
+                                      logical_key, &live);
+    int claim_found = sidecar_log_find_claim(context->sidecar, root_key,
+                                             logical_key, &claim);
+    if (live_found < 0 || claim_found < 0 ||
+        (live_found == 1 && claim_found == 1))
+        return -1;
+
+    SidecarBytes leaf = {0};
+    if (live_found == 1) {
+        leaf = live.entry->physical_leaf;
+        *kind_out = live.entry->kind;
+        *state_out = PORTABLE_OWNER_LIVE;
+    } else if (claim_found == 1) {
+        leaf = claim.claim->physical_leaf;
+        *kind_out = claim.claim->kind;
+        *state_out = PORTABLE_OWNER_CLAIM;
+    } else if (allow_tombstone) {
+        SidecarLiveView deleted = {0};
+        int deleted_found = sidecar_log_find_deleted(
+            context->sidecar, root_key, logical_key, &deleted);
+        if (deleted_found != 1)
+            return -1;
+        leaf = deleted.entry->physical_leaf;
+        *kind_out = deleted.entry->kind;
+        *state_out = PORTABLE_OWNER_TOMBSTONE;
+    } else {
+        return -1;
+    }
+
+    if ((logical[0] == '\0' && leaf.length != 0) ||
+        (logical[0] != '\0' &&
+         (leaf.length == 0 || leaf.length > SIDECAR_MAX_PHYSICAL_LEAF)))
+        return -1;
+    if (leaf.length >= SIDECAR_MAX_PHYSICAL_LEAF + 1U)
+        return -1;
+    if (leaf.length != 0)
+        memcpy(physical_leaf, leaf.data, leaf.length);
+    physical_leaf[leaf.length] = '\0';
+    if (logical[0] != '\0' && !safe_component(physical_leaf))
+        return -1;
+    return 0;
+}
+
+int portable_recorded_parent_open(
+    PortableCaptureContext *context, const PortableRootSpec *root,
+    const char *logical, int allow_tombstone, int *parent_out,
+    char leaf[SIDECAR_MAX_PHYSICAL_LEAF + 1U],
+    SidecarObjectKind *kind_out, PortableOwnerState *state_out)
+{
+    if (context == NULL || root == NULL || logical == NULL ||
+        parent_out == NULL || leaf == NULL || kind_out == NULL ||
+        state_out == NULL)
+        return -1;
+    *parent_out = -1;
+    leaf[0] = '\0';
+
+    char target_leaf[SIDECAR_MAX_PHYSICAL_LEAF + 1U];
+    if (recorded_state_copy(context, root->id, logical, allow_tombstone,
+                            target_leaf, kind_out, state_out) != 0)
+        return -1;
+
+    int root_parent = -1;
+    char root_leaf[NAME_MAX + 1U];
+    if (open_existing_payload_parent(context->data_fd, root->payload_path,
+                                     &root_parent, root_leaf,
+                                     sizeof(root_leaf)) != 0)
+        return -1;
+    if (logical[0] == '\0') {
+        if (copy_text(leaf, SIDECAR_MAX_PHYSICAL_LEAF + 1U,
+                      root_leaf) != 0) {
+            close(root_parent);
+            return -1;
+        }
+        *parent_out = root_parent;
+        return 0;
+    }
+
+    int current_fd = open_child_directory(root_parent, root_leaf);
+    int saved = errno;
+    if (close(root_parent) != 0 && current_fd >= 0) {
+        close(current_fd);
+        return -1;
+    }
+    if (current_fd < 0) {
+        errno = saved;
+        return -1;
+    }
+
+    const char *last_slash = strrchr(logical, '/');
+    if (last_slash != NULL) {
+        size_t parent_length = (size_t)(last_slash - logical);
+        size_t prefix_end = 0;
+        while (prefix_end < parent_length) {
+            while (prefix_end < parent_length && logical[prefix_end] != '/')
+                prefix_end++;
+            char prefix[SIDECAR_MAX_PATH + 1U];
+            if (prefix_end >= sizeof(prefix)) {
+                close(current_fd);
+                return -1;
+            }
+            memcpy(prefix, logical, prefix_end);
+            prefix[prefix_end] = '\0';
+
+            char ancestor_leaf[SIDECAR_MAX_PHYSICAL_LEAF + 1U];
+            SidecarObjectKind ancestor_kind;
+            PortableOwnerState ancestor_state;
+            if (recorded_state_copy(context, root->id, prefix, 0,
+                                    ancestor_leaf, &ancestor_kind,
+                                    &ancestor_state) != 0 ||
+                ancestor_kind != SIDECAR_KIND_DIRECTORY) {
+                close(current_fd);
+                return -1;
+            }
+            int child_fd = open_child_directory(current_fd, ancestor_leaf);
+            saved = errno;
+            if (close(current_fd) != 0 && child_fd >= 0) {
+                close(child_fd);
+                return -1;
+            }
+            if (child_fd < 0) {
+                errno = saved;
+                return -1;
+            }
+            current_fd = child_fd;
+            if (prefix_end < parent_length)
+                prefix_end++;
+        }
+    }
+
+    if (copy_text(leaf, SIDECAR_MAX_PHYSICAL_LEAF + 1U,
+                  target_leaf) != 0) {
+        close(current_fd);
+        return -1;
+    }
+    *parent_out = current_fd;
     return 0;
 }
 
@@ -1260,73 +1543,197 @@ static int key_is_live(PortableCaptureContext *context,
 int remove_payload_relative(int data_fd, const char *payload_root,
                                    const char *physical);
 
+static int owner_parent_matches(const PortablePhysicalOwner *owner,
+                                const char *root_id,
+                                const char *logical_parent)
+{
+    return owner != NULL && strcmp(owner->root_id, root_id) == 0 &&
+           strcmp(owner->logical_parent, logical_parent) == 0;
+}
+
+int portable_physical_owner_for_node(
+    const PortableCaptureContext *context,
+    const PortablePhysicalOwners *owners, const char *root_id,
+    const char *logical_parent, int parent_fd, const char *requested_leaf,
+    const struct stat *requested_stat, const PortablePhysicalOwner **out)
+{
+    if (out != NULL)
+        *out = NULL;
+    if (context == NULL || owners == NULL || root_id == NULL ||
+        logical_parent == NULL || parent_fd < 0 ||
+        !safe_component(requested_leaf) || requested_stat == NULL ||
+        out == NULL)
+        return -1;
+
+    const PortablePhysicalOwner *exact = NULL;
+    int found = portable_physical_owners_find(
+        owners, root_id, logical_parent, requested_leaf, &exact);
+    if (found < 0)
+        return found;
+    if (found == 1) {
+        *out = exact;
+        return 1;
+    }
+    if (context->case_sensitive)
+        return 0;
+
+    size_t low = 0;
+    size_t high = owners->count;
+    while (low < high) {
+        size_t middle = low + (high - low) / 2U;
+        PortablePhysicalOwner *candidate = &owners->items[middle];
+        int result = strcmp(candidate->root_id, root_id);
+        if (result == 0)
+            result = strcmp(candidate->logical_parent, logical_parent);
+        if (result < 0)
+            low = middle + 1U;
+        else
+            high = middle;
+    }
+
+    const PortablePhysicalOwner *identity_owner = NULL;
+    for (size_t index = low; index < owners->count; index++) {
+        const PortablePhysicalOwner *candidate = &owners->items[index];
+        if (!owner_parent_matches(candidate, root_id, logical_parent))
+            break;
+        struct stat candidate_stat;
+        if (fstatat(parent_fd, candidate->physical_leaf, &candidate_stat,
+                    AT_SYMLINK_NOFOLLOW) != 0) {
+            if (errno == ENOENT)
+                continue;
+            return -1;
+        }
+        if (candidate_stat.st_dev != requested_stat->st_dev ||
+            candidate_stat.st_ino != requested_stat->st_ino)
+            continue;
+        if (identity_owner != NULL &&
+            strcmp(identity_owner->logical_path,
+                   candidate->logical_path) != 0)
+            return -1;
+        identity_owner = candidate;
+    }
+    if (identity_owner == NULL)
+        return 0;
+    *out = identity_owner;
+    return 1;
+}
+
+static int portable_recorded_address_matches_current_internal(
+    PortableCaptureContext *context, const PortableRootSpec *root,
+    const char *logical, int allow_target_tombstone)
+{
+    if (context == NULL || root == NULL || logical == NULL)
+        return -1;
+    if (logical[0] == '\0')
+        return portable_current_source_contains(context->current_source,
+                                                root->id, logical) == 1
+                   ? 1
+                   : -1;
+
+    char prefix[SIDECAR_MAX_PATH + 1U];
+    size_t logical_length = strlen(logical);
+    size_t end = 0;
+    while (end < logical_length) {
+        while (end < logical_length && logical[end] != '/')
+            end++;
+        if (end >= sizeof(prefix))
+            return -1;
+        memcpy(prefix, logical, end);
+        prefix[end] = '\0';
+
+        char old_leaf[SIDECAR_MAX_PHYSICAL_LEAF + 1U];
+        char current_leaf[SIDECAR_MAX_PHYSICAL_LEAF + 1U];
+        char current_suffix[SIDECAR_MAX_COLLISION_SUFFIX + 1U];
+        SidecarObjectKind old_kind;
+        PortableOwnerState old_state;
+        int is_target = end == logical_length;
+        if (recorded_state_copy(context, root->id, prefix,
+                                allow_target_tombstone && is_target, old_leaf,
+                                &old_kind, &old_state) != 0 ||
+            portable_current_assignment(context, root, prefix, current_leaf,
+                                        current_suffix) != 0)
+            return -1;
+        if (strcmp(old_leaf, current_leaf) != 0)
+            return 0;
+        if (end < logical_length)
+            end++;
+    }
+    return 1;
+}
+
+int portable_recorded_address_matches_current(
+    PortableCaptureContext *context, const PortableRootSpec *root,
+    const char *logical)
+{
+    return portable_recorded_address_matches_current_internal(
+        context, root, logical, 0);
+}
+
+int portable_tombstoned_address_matches_current(
+    PortableCaptureContext *context, const PortableRootSpec *root,
+    const char *logical)
+{
+    return portable_recorded_address_matches_current_internal(
+        context, root, logical, 1);
+}
+
 static int capture_destination_is_safe(const PortableCaptureContext *context,
                                        const PortableRootSpec *root,
                                        const char *logical,
-                                       const char *physical,
                                        int parent_fd, const char *leaf)
 {
     if (context == NULL || root == NULL || logical == NULL ||
-        physical == NULL || parent_fd < 0 || !safe_component(leaf))
+        parent_fd < 0 || !safe_component(leaf) ||
+        context->active_owners == NULL || context->tombstone_owners == NULL)
         return -1;
     struct stat st;
     if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) != 0)
         return errno == ENOENT ? 0 : -1;
 
-    if (!context->resume_mode) {
-        if (context->sidecar == NULL)
-            return -1;
+    if (logical[0] == '\0') {
         SidecarBytes root_key = {
             (const unsigned char *)root->id, strlen(root->id)
         };
         SidecarBytes logical_key = {
             (const unsigned char *)logical, strlen(logical)
         };
-        SidecarLiveView live;
+        SidecarLiveView live = {0};
+        SidecarClaimView claim = {0};
         int live_found = sidecar_log_find(context->sidecar, root_key,
                                           logical_key, &live);
-        if (live_found < 0)
+        int claim_found = sidecar_log_find_claim(context->sidecar, root_key,
+                                                 logical_key, &claim);
+        if (live_found < 0 || claim_found < 0 ||
+            (live_found == 1 && claim_found == 1))
             return -1;
-        return live_found == 1 &&
-                       sidecar_bytes_equal(
-                           live.entry->physical_path,
-                           (SidecarBytes){
-                               (const unsigned char *)physical,
-                               strlen(physical) })
-                   ? 0
-                   : -1;
+        if (live_found == 1 || claim_found == 1)
+            return 0;
+        SidecarLiveView deleted = {0};
+        int deleted_found = sidecar_log_find_deleted(
+            context->sidecar, root_key, logical_key, &deleted);
+        return deleted_found == 1 ? 0 : -1;
     }
-    if (context->owned_paths == NULL)
-        return -1;
-    const PortableOwnedPaths *owned = context->owned_paths;
-    const char *owner = portable_owned_paths_owner(owned, root->id,
-                                                   physical);
-    if (owner != NULL && strcmp(owner, logical) == 0)
-        return 0;
 
-    /* A resume may have been interrupted after its DELETE record was
-     * committed but before the replacement payload was published.  The
-     * matching tombstone is still this container's ownership proof for the
-     * old physical name; a missing or mismatching tombstone remains foreign. */
-    SidecarLiveView deleted;
-    SidecarBytes root_key = {
-        (const unsigned char *)root->id, strlen(root->id)
-    };
-    SidecarBytes logical_key = {
-        (const unsigned char *)logical, strlen(logical)
-    };
-    int found = sidecar_log_find_deleted(context->sidecar, root_key,
-                                         logical_key, &deleted);
-    if (found < 0)
+    char logical_parent[SIDECAR_MAX_PATH + 1U];
+    if (logical_parent_copy(logical_parent, sizeof(logical_parent), logical) != 0)
         return -1;
-    return found == 1 &&
-                   sidecar_bytes_equal(
-                       deleted.entry->physical_path,
-                       (SidecarBytes){
-                           (const unsigned char *)physical,
-                           strlen(physical) })
-               ? 0
-               : -1;
+    const PortablePhysicalOwner *owner = NULL;
+    int owner_found = portable_physical_owner_for_node(
+        context, context->active_owners, root->id, logical_parent, parent_fd,
+        leaf, &st, &owner);
+    if (owner_found < 0)
+        return -1;
+    if (owner_found == 1)
+        return strcmp(owner->logical_path, logical) == 0 ? 0 : -1;
+
+    owner_found = portable_physical_owner_for_node(
+        context, context->tombstone_owners, root->id, logical_parent,
+        parent_fd, leaf, &st, &owner);
+    if (owner_found < 0)
+        return -1;
+    if (owner_found == 1 && strcmp(owner->logical_path, logical) == 0)
+        return 0;
+    return -1;
 }
 
 /* During resume, an interrupted claim is also ownership proof for the
@@ -1337,38 +1744,12 @@ static int capture_destination_is_safe(const PortableCaptureContext *context,
  * publishing the replacement claim. */
 static int capture_destination_is_safe_or_claimed(
     const PortableCaptureContext *context, const PortableRootSpec *root,
-    const char *logical, const char *physical, int parent_fd,
-    const char *leaf)
+    const char *logical, int parent_fd, const char *leaf)
 {
-    if (context == NULL || root == NULL || logical == NULL ||
-        physical == NULL)
+    if (context == NULL || root == NULL || logical == NULL)
         return -1;
-
-    int result = capture_destination_is_safe(context, root, logical, physical,
-                                             parent_fd, leaf);
-    if (result == 0 || !context->resume_mode)
-        return result;
-
-    SidecarBytes root_key = {
-        (const unsigned char *)root->id, strlen(root->id)
-    };
-    SidecarBytes logical_key = {
-        (const unsigned char *)logical, strlen(logical)
-    };
-    SidecarBytes physical_key = {
-        (const unsigned char *)physical, strlen(physical)
-    };
-    SidecarClaimView claim_view = {0};
-    int found = sidecar_log_find_claim(context->sidecar, root_key,
-                                       logical_key, &claim_view);
-    if (found < 0)
-        return -1;
-    if (found == 1 && claim_view.claim != NULL &&
-        sidecar_bytes_equal(claim_view.claim->root_id, root_key) &&
-        sidecar_bytes_equal(claim_view.claim->logical_path, logical_key) &&
-        sidecar_bytes_equal(claim_view.claim->physical_path, physical_key))
-        return 0;
-    return result;
+    return capture_destination_is_safe(context, root, logical, parent_fd,
+                                       leaf);
 }
 
 int tombstone_if_live(PortableCaptureContext *context,
@@ -1402,7 +1783,6 @@ typedef struct {
 static int replace_live_capture(PortableCaptureContext *context,
                                 const PortableRootSpec *root,
                                 const char *logical,
-                                const char *physical,
                                 const CapturePreviousEntry *previous_hint)
 {
     if (context == NULL || root == NULL || logical == NULL ||
@@ -1430,14 +1810,19 @@ static int replace_live_capture(PortableCaptureContext *context,
     if (!live)
         return 0;
 
-    int remove_old = physical != NULL &&
-        !sidecar_bytes_equal(previous.entry->physical_path,
-                             (SidecarBytes){
-                                 (const unsigned char *)physical,
-                                 strlen(physical) });
-    char *old_physical = NULL;
+    int address_match = portable_recorded_address_matches_current(
+        context, root, logical);
+    if (address_match < 0)
+        return -1;
+    int remove_old = address_match == 0;
+
+    int old_parent = -1;
+    char old_leaf[SIDECAR_MAX_PHYSICAL_LEAF + 1U];
+    SidecarObjectKind old_kind;
+    PortableOwnerState old_state;
     if (remove_old &&
-        sidecar_bytes_to_text(previous.entry->physical_path, &old_physical) != 0)
+        portable_recorded_parent_open(context, root, logical, 0, &old_parent,
+                                      old_leaf, &old_kind, &old_state) != 0)
         return -1;
 
     SidecarDelete deletion = {
@@ -1447,16 +1832,20 @@ static int replace_live_capture(PortableCaptureContext *context,
     portable_test_interrupt_if(PORTABLE_TEST_BEFORE_REPLACEMENT_DELETE);
     if (sidecar_log_append_delete(context->sidecar, &deletion) !=
         SIDECAR_STATUS_OK) {
-        free(old_physical);
+        if (old_parent >= 0)
+            close(old_parent);
         return -1;
     }
     portable_test_interrupt_if(PORTABLE_TEST_AFTER_REPLACEMENT_DELETE);
 
     if (remove_old) {
-        int result = remove_payload_relative(context->data_fd,
-                                             root->payload_path,
-                                             old_physical);
-        free(old_physical);
+        int result = remove_leaf(old_parent, old_leaf);
+        int saved = errno;
+        if (close(old_parent) != 0 && result == 0) {
+            result = -1;
+            saved = EIO;
+        }
+        errno = saved;
         if (result != 0)
             return -1;
     }
@@ -1464,57 +1853,13 @@ static int replace_live_capture(PortableCaptureContext *context,
 }
 
 static int tombstone_destination_children(PortableCaptureContext *context,
-                                          const char *root_id,
+                                          const PortableRootSpec *root,
                                           const char *logical,
                                           int parent_fd,
                                           const char *leaf)
 {
-    struct stat st;
-    if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) != 0)
-        return errno == ENOENT ? 0 : -1;
-    if (!S_ISDIR(st.st_mode))
-        return 0;
-
-    int directory_fd = open_child_directory(parent_fd, leaf);
-    if (directory_fd < 0)
-        return -1;
-    int scan_fd = dup_cloexec(directory_fd);
-    DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
-    if (directory == NULL) {
-        if (scan_fd >= 0)
-            close(scan_fd);
-        close(directory_fd);
-        return -1;
-    }
-
-    int failed = 0;
-    for (;;) {
-        errno = 0;
-        struct dirent *entry = readdir(directory);
-        if (entry == NULL) {
-            if (errno != 0)
-                failed = 1;
-            break;
-        }
-        if (strcmp(entry->d_name, ".") == 0 ||
-            strcmp(entry->d_name, "..") == 0)
-            continue;
-
-        char child_logical[SIDECAR_MAX_PATH + 1U];
-        if (append_logical(child_logical, sizeof(child_logical), logical,
-                           entry->d_name) != 0 ||
-            tombstone_if_live(context, root_id, child_logical) != 0 ||
-            tombstone_destination_children(context, root_id, child_logical,
-                                           directory_fd, entry->d_name) != 0) {
-            failed = 1;
-            break;
-        }
-    }
-    if (closedir(directory) != 0)
-        failed = 1;
-    if (close(directory_fd) != 0)
-        failed = 1;
-    return failed ? -1 : 0;
+    return reconcile_destination_children(context, root, logical, parent_fd,
+                                          leaf);
 }
 
 static int append_group(PortableCaptureContext *context,
@@ -1825,16 +2170,16 @@ static int capture_assignment_resolve(
     return 0;
 }
 
-static int capture_plan_entries_seen(const PortableCaptureContext *context,
-                                    const PortableRootSpec *root)
+static int capture_current_source_seen(const PortableCaptureContext *context,
+                                       const PortableRootSpec *root)
 {
-    if (context == NULL || root == NULL)
+    if (context == NULL || root == NULL || context->current_source == NULL)
         return -1;
-    const PortableCollisionPlan *plan = context->collision_plan;
-    if (plan == NULL)
-        return 0;
-    for (size_t index = 0; index < plan->count; index++) {
-        const PortableCollisionPlanEntry *entry = &plan->entries[index];
+    const PortableCurrentSourceSet *set = context->current_source;
+    if (!set->sorted)
+        return -1;
+    for (size_t index = 0; index < set->count; index++) {
+        const PortableCurrentSourceEntry *entry = &set->entries[index];
         if (strcmp(entry->root_id, root->id) != 0)
             continue;
         int present = visited_contains(context->visited, root->id,
@@ -1845,11 +2190,112 @@ static int capture_plan_entries_seen(const PortableCaptureContext *context,
     return 0;
 }
 
+static int source_kind_is_address_bearing(mode_t mode)
+{
+    return S_ISDIR(mode) || S_ISREG(mode) || S_ISLNK(mode);
+}
+
+static int prepared_source_member_stat(int root_fd, const char *logical,
+                                       struct stat *out)
+{
+    if (root_fd < 0 || logical == NULL || logical[0] == '\0' || out == NULL ||
+        !safe_relative_path(logical))
+        return -1;
+
+    size_t length = strlen(logical);
+    if (length > SIDECAR_MAX_PATH)
+        return -1;
+    char copy[SIDECAR_MAX_PATH + 1U];
+    memcpy(copy, logical, length + 1U);
+
+    int current = dup_cloexec(root_fd);
+    if (current < 0)
+        return -1;
+    char *cursor = copy;
+    for (;;) {
+        char *slash = strchr(cursor, '/');
+        if (slash == NULL)
+            break;
+        *slash = '\0';
+        int next = open_child_directory(current, cursor);
+        int saved = errno;
+        if (close(current) != 0 && next >= 0) {
+            close(next);
+            errno = EIO;
+            return -1;
+        }
+        if (next < 0) {
+            errno = saved;
+            return -1;
+        }
+        current = next;
+        cursor = slash + 1U;
+    }
+
+    int result = fstatat(current, cursor, out, AT_SYMLINK_NOFOLLOW);
+    int saved = errno;
+    if (close(current) != 0 && result == 0) {
+        errno = EIO;
+        return -1;
+    }
+    errno = saved;
+    return result;
+}
+
+static int prepared_source_validate_root(
+    const PortableCaptureContext *context, const PortableRootSpec *root)
+{
+    if (context == NULL || root == NULL || root->id == NULL ||
+        root->capture_path == NULL || context->current_source == NULL ||
+        !context->current_source->sorted)
+        return -1;
+
+    int root_member = portable_current_source_contains(
+        context->current_source, root->id, "");
+    if (root_member < 0)
+        return -1;
+
+    struct stat root_stat;
+    if (lstat(root->capture_path, &root_stat) != 0)
+        return -1;
+    int root_address_bearing = source_kind_is_address_bearing(root_stat.st_mode);
+    if ((root_address_bearing && root_member != 1) ||
+        (!root_address_bearing && root_member == 1))
+        return -1;
+
+    int root_fd = -1;
+    if (S_ISDIR(root_stat.st_mode)) {
+        root_fd = open(root->capture_path,
+                       O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (root_fd < 0)
+            return -1;
+    }
+
+    int failed = 0;
+    for (size_t index = 0; index < context->current_source->count; index++) {
+        const PortableCurrentSourceEntry *entry =
+            &context->current_source->entries[index];
+        if (strcmp(entry->root_id, root->id) != 0 ||
+            entry->logical_path[0] == '\0')
+            continue;
+        struct stat member_stat;
+        if (root_fd < 0 ||
+            prepared_source_member_stat(root_fd, entry->logical_path,
+                                        &member_stat) != 0 ||
+            !source_kind_is_address_bearing(member_stat.st_mode)) {
+            failed = 1;
+            break;
+        }
+    }
+    if (root_fd >= 0 && close(root_fd) != 0)
+        failed = 1;
+    return failed ? -1 : 0;
+}
+
 static int capture_node(PortableCaptureContext *context,
                         const PortableRootSpec *root,
                         const char *logical, const char *physical_leaf,
                         const char *collision_suffix,
-                        const char *physical,
                         int source_parent,
                         const char *source_name, const char *root_path,
                         int destination_parent, const char *destination_leaf,
@@ -1870,7 +2316,6 @@ void portable_test_close_capture_directory_scan_fd_early(void)
 static int capture_directory(PortableCaptureContext *context,
                              const PortableRootSpec *root,
                              const char *logical, const char *physical_leaf,
-                             const char *physical,
                              int source_fd,
                              const struct stat *before, int destination_fd,
                              PortableXattrs *xattrs,
@@ -1900,7 +2345,6 @@ static int capture_directory(PortableCaptureContext *context,
         observed_skeletons.hash_salt = sidecar_process_salt();
     if (!context->case_sensitive)
         observed_ascii.hash_salt = sidecar_process_salt();
-    size_t payload_root_length = strlen(root->payload_path);
     for (;;) {
         errno = 0;
         struct dirent *entry = readdir(directory);
@@ -1982,20 +2426,6 @@ static int capture_directory(PortableCaptureContext *context,
             }
         }
 
-        char child_physical[SIDECAR_MAX_PATH + 1U];
-        if (append_physical(child_physical, sizeof(child_physical), physical,
-                            assignment.physical_leaf) != 0) {
-            failed = 1;
-            break;
-        }
-
-        size_t physical_length = strlen(child_physical);
-        if (!portable_payload_path_fits(payload_root_length, physical_length,
-                                        PATH_MAX)) {
-            failed = 1;
-            break;
-        }
-
         int added_pending = 0;
         if (encoded_name_has_raw_high_byte(assignment.physical_leaf)) {
             if (pending_readback_names_add(&pending,
@@ -2009,7 +2439,7 @@ static int capture_directory(PortableCaptureContext *context,
         int no_destination_object = 0;
         if (capture_node(context, root, child_logical,
                          assignment.physical_leaf,
-                         assignment.collision_suffix, child_physical,
+                         assignment.collision_suffix,
                          source_fd, entry->d_name, NULL, destination_fd,
                          assignment.physical_leaf,
                          &no_destination_object) != 0) {
@@ -2060,7 +2490,6 @@ static int capture_directory(PortableCaptureContext *context,
 static int capture_regular(PortableCaptureContext *context,
                            const PortableRootSpec *root,
                            const char *logical, const char *physical_leaf,
-                           const char *physical,
                            const char *collision_suffix,
                            int source_fd,
                            const struct stat *before,
@@ -2083,8 +2512,8 @@ static int capture_regular(PortableCaptureContext *context,
         destination_leaf = root_leaf;
     }
     if (capture_destination_is_safe_or_claimed(
-            context, root, logical, physical, parent_fd, destination_leaf) != 0 ||
-        replace_live_capture(context, root, logical, physical,
+            context, root, logical, parent_fd, destination_leaf) != 0 ||
+        replace_live_capture(context, root, logical,
                              previous_hint) != 0) {
         if (destination_is_root)
             close(parent_fd);
@@ -2100,7 +2529,7 @@ static int capture_regular(PortableCaptureContext *context,
         close(source_fd);
         return -1;
     }
-    if (tombstone_destination_children(context, root->id, logical, parent_fd,
+    if (tombstone_destination_children(context, root, logical, parent_fd,
                                        destination_leaf) != 0) {
         if (destination_is_root)
             close(parent_fd);
@@ -2122,7 +2551,8 @@ static int capture_regular(PortableCaptureContext *context,
     portable_test_interrupt_if(PORTABLE_TEST_BEFORE_PAYLOAD_WRITE);
     if (context->progress_report != NULL)
         snprintf(context->progress_report->current_path,
-                 sizeof(context->progress_report->current_path), "%s", physical);
+                 sizeof(context->progress_report->current_path), "%s",
+                 logical[0] == '\0' ? root->capture_path : logical);
     if (portable_copy_regular(source_fd, destination_fd, before->st_size,
                               context->progress_report) != 0) {
         close(destination_fd);
@@ -2163,7 +2593,7 @@ static int capture_regular(PortableCaptureContext *context,
 
 static int capture_special(PortableCaptureContext *context,
                            const PortableRootSpec *root,
-                           const char *logical, const char *physical,
+                           const char *logical,
                            int destination_parent,
                            const char *destination_leaf,
                            int destination_is_root, const struct stat *st)
@@ -2198,14 +2628,14 @@ static int capture_special(PortableCaptureContext *context,
             return -1;
         destination_leaf = root_leaf;
     }
-    if (capture_destination_is_safe(context, root, logical, physical,
+    if (capture_destination_is_safe(context, root, logical,
                                     parent_fd, destination_leaf) != 0 ||
-        replace_live_capture(context, root, logical, physical, NULL) != 0) {
+        reconcile_stale_live(context, root, logical) != 0) {
         if (destination_is_root)
             close(parent_fd);
         return -1;
     }
-    if (tombstone_destination_children(context, root->id, logical, parent_fd,
+    if (tombstone_destination_children(context, root, logical, parent_fd,
                                        destination_leaf) != 0) {
         if (destination_is_root)
             close(parent_fd);
@@ -2228,7 +2658,6 @@ static int capture_special(PortableCaptureContext *context,
 static int capture_symlink(PortableCaptureContext *context,
                            const PortableRootSpec *root,
                            const char *logical, const char *physical_leaf,
-                           const char *physical,
                            const char *collision_suffix,
                            int source_parent,
                            const char *source_name, const char *root_path,
@@ -2323,8 +2752,8 @@ static int capture_symlink(PortableCaptureContext *context,
         destination_leaf = root_leaf;
     }
     if (capture_destination_is_safe_or_claimed(
-            context, root, logical, physical, parent_fd, destination_leaf) != 0 ||
-        replace_live_capture(context, root, logical, physical, NULL) != 0) {
+            context, root, logical, parent_fd, destination_leaf) != 0 ||
+        replace_live_capture(context, root, logical, NULL) != 0) {
         if (destination_is_root)
             close(parent_fd);
         xattrs_free(&xattrs);
@@ -2338,7 +2767,7 @@ static int capture_symlink(PortableCaptureContext *context,
         xattrs_free(&xattrs);
         return -1;
     }
-    if (tombstone_destination_children(context, root->id, logical, parent_fd,
+    if (tombstone_destination_children(context, root, logical, parent_fd,
                                        destination_leaf) != 0) {
         if (destination_is_root)
             close(parent_fd);
@@ -2372,7 +2801,6 @@ static int capture_symlink(PortableCaptureContext *context,
 static int capture_hardlink(PortableCaptureContext *context,
                             const PortableRootSpec *root,
                             const char *logical, const char *physical_leaf,
-                            const char *physical,
                             const char *collision_suffix,
                             int source_fd, const struct stat *before,
                             int destination_parent,
@@ -2381,7 +2809,7 @@ static int capture_hardlink(PortableCaptureContext *context,
                             const PortableInodeSlot *representative)
 {
     if (context == NULL || root == NULL || logical == NULL ||
-        physical_leaf == NULL || physical == NULL || collision_suffix == NULL ||
+        physical_leaf == NULL || collision_suffix == NULL ||
         source_fd < 0 ||
         before == NULL || representative == NULL)
         return -1;
@@ -2443,8 +2871,8 @@ static int capture_hardlink(PortableCaptureContext *context,
         destination_leaf = root_leaf;
     }
     if (capture_destination_is_safe_or_claimed(
-            context, root, logical, physical, parent_fd, destination_leaf) != 0 ||
-        replace_live_capture(context, root, logical, physical, NULL) != 0) {
+            context, root, logical, parent_fd, destination_leaf) != 0 ||
+        replace_live_capture(context, root, logical, NULL) != 0) {
         if (destination_is_root)
             close(parent_fd);
         close(source_fd);
@@ -2457,7 +2885,7 @@ static int capture_hardlink(PortableCaptureContext *context,
         close(source_fd);
         return -1;
     }
-    if (tombstone_destination_children(context, root->id, logical, parent_fd,
+    if (tombstone_destination_children(context, root, logical, parent_fd,
                                        destination_leaf) != 0) {
         if (destination_is_root)
             close(parent_fd);
@@ -2494,7 +2922,6 @@ static int capture_node(PortableCaptureContext *context,
                         const PortableRootSpec *root,
                         const char *logical, const char *physical_leaf,
                         const char *collision_suffix,
-                        const char *physical,
                         int source_parent,
                         const char *source_name, const char *root_path,
                         int destination_parent, const char *destination_leaf,
@@ -2510,10 +2937,21 @@ static int capture_node(PortableCaptureContext *context,
         return -1;
 
     if (logical == NULL || physical_leaf == NULL || collision_suffix == NULL ||
-        physical == NULL ||
         ((logical[0] == '\0' &&
           (physical_leaf[0] != '\0' || collision_suffix[0] != '\0')) ||
          (logical[0] != '\0' && !safe_component(physical_leaf))))
+        return -1;
+
+    if (context->current_source == NULL)
+        return -1;
+    int prepared_member = portable_current_source_contains(
+        context->current_source, root->id, logical);
+    if (prepared_member < 0)
+        return -1;
+    int address_bearing = S_ISDIR(before.st_mode) || S_ISREG(before.st_mode) ||
+                          S_ISLNK(before.st_mode);
+    if ((address_bearing && prepared_member != 1) ||
+        (!address_bearing && prepared_member == 1))
         return -1;
 
     const PortableCollisionPlanEntry *planned =
@@ -2531,7 +2969,7 @@ static int capture_node(PortableCaptureContext *context,
         S_ISBLK(before.st_mode)) {
         if (no_destination_object != NULL)
             *no_destination_object = 1;
-        return capture_special(context, root, logical, physical,
+        return capture_special(context, root, logical,
                                destination_parent, destination_leaf, is_root,
                                &before);
     }
@@ -2540,7 +2978,7 @@ static int capture_node(PortableCaptureContext *context,
         return -1;
     }
     if (S_ISLNK(before.st_mode))
-        return capture_symlink(context, root, logical, physical_leaf, physical,
+        return capture_symlink(context, root, logical, physical_leaf,
                                collision_suffix, source_parent,
                                source_name, root_path, destination_parent,
                                destination_leaf, is_root, &before);
@@ -2579,7 +3017,6 @@ static int capture_node(PortableCaptureContext *context,
                                  strcmp(representative->logical_path, logical) == 0;
         if (inode_state == 1 && !same_logical_entry) {
             return capture_hardlink(context, root, logical, physical_leaf,
-                                    physical,
                                     collision_suffix, source_fd, &before,
                                     destination_parent, destination_leaf,
                                     is_root, representative);
@@ -2637,7 +3074,7 @@ static int capture_node(PortableCaptureContext *context,
     }
 
     if (S_ISREG(before.st_mode))
-        return capture_regular(context, root, logical, physical_leaf, physical,
+        return capture_regular(context, root, logical, physical_leaf,
                                collision_suffix, source_fd,
                                &before,
                                destination_parent, destination_leaf, is_root,
@@ -2657,8 +3094,8 @@ static int capture_node(PortableCaptureContext *context,
     }
 
     if (capture_destination_is_safe_or_claimed(
-            context, root, logical, physical, parent_fd, destination_leaf) != 0 ||
-        replace_live_capture(context, root, logical, physical, NULL) != 0) {
+            context, root, logical, parent_fd, destination_leaf) != 0 ||
+        replace_live_capture(context, root, logical, NULL) != 0) {
         if (is_root)
             close(parent_fd);
         xattrs_free(&xattrs);
@@ -2683,7 +3120,7 @@ static int capture_node(PortableCaptureContext *context,
         close(source_fd);
         return -1;
     }
-    if (capture_directory(context, root, logical, physical_leaf, physical,
+    if (capture_directory(context, root, logical, physical_leaf,
                           source_fd, &before, destination_fd, &xattrs,
                           collision_suffix) != 0) {
         if (is_root)
@@ -3088,21 +3525,22 @@ int portable_capture_context_init(PortableCaptureContext *context,
     PortableVisited *visited = calloc(1, sizeof(*visited));
     if (visited == NULL)
         return -1;
-    PortableOwnedPaths *owned_paths = calloc(1, sizeof(*owned_paths));
-    if (owned_paths == NULL) {
+    PortablePhysicalOwners *active_owners = calloc(1, sizeof(*active_owners));
+    if (active_owners == NULL) {
         free(visited);
         return -1;
     }
-    PortableClaimedPaths *claimed_paths = calloc(1, sizeof(*claimed_paths));
-    if (claimed_paths == NULL) {
-        free(owned_paths);
+    PortablePhysicalOwners *tombstone_owners = calloc(1,
+                                                       sizeof(*tombstone_owners));
+    if (tombstone_owners == NULL) {
+        free(active_owners);
         free(visited);
         return -1;
     }
     PortableInodeMap *inode_map = calloc(1, sizeof(*inode_map));
     if (inode_map == NULL) {
-        free(claimed_paths);
-        free(owned_paths);
+        free(tombstone_owners);
+        free(active_owners);
         free(visited);
         return -1;
     }
@@ -3114,8 +3552,8 @@ int portable_capture_context_init(PortableCaptureContext *context,
     inode_map->hash_salt = sidecar_process_salt();
     context->visited = visited;
     context->inode_map = inode_map;
-    context->owned_paths = owned_paths;
-    context->claimed_paths = claimed_paths;
+    context->active_owners = active_owners;
+    context->tombstone_owners = tombstone_owners;
     return 0;
 }
 
@@ -3125,10 +3563,10 @@ void portable_capture_context_close(PortableCaptureContext *context)
         return;
     visited_free(context->visited);
     inode_map_free(context->inode_map);
-    portable_owned_paths_free(context->owned_paths);
-    free(context->owned_paths);
-    portable_claimed_paths_free(context->claimed_paths);
-    free(context->claimed_paths);
+    portable_physical_owners_free(context->active_owners);
+    free(context->active_owners);
+    portable_physical_owners_free(context->tombstone_owners);
+    free(context->tombstone_owners);
     memset(context, 0, sizeof(*context));
 }
 
@@ -3144,13 +3582,17 @@ int portable_capture_root(PortableCaptureContext *context,
     PortableVisited *visited = context->visited;
     if (visited_reset(visited) != 0)
         return -1;
+    if (prepared_source_validate_root(context, root) != 0)
+        return -1;
     if (prepare_collision_relocations(context, root) != 0)
         return -1;
-    int result = capture_node(context, root, "", "", "", "", -1, NULL,
+    if (portable_capture_owners_reload(context) != 0)
+        return -1;
+    int result = capture_node(context, root, "", "", "", -1, NULL,
                               root->capture_path, -1, NULL, NULL);
     if (result != 0)
         return result;
-    return capture_plan_entries_seen(context, root);
+    return capture_current_source_seen(context, root);
 }
 
 int portable_capture_fresh_prepared_at(
@@ -3207,8 +3649,8 @@ int portable_capture_fresh_prepared_at(
         context_ready = 1;
         context.progress_report = progress_report;
         context.collision_plan = &prepared->report.collision_plan;
-        if (portable_owned_paths_load(context.owned_paths, &sidecar) != 0 ||
-            portable_claimed_paths_load(context.claimed_paths, &sidecar) != 0 ||
+        context.current_source = &prepared->report.current_source;
+        if (portable_capture_owners_reload(&context) != 0 ||
             sticky_seed_inode_map(context.inode_map, request, &sidecar) != 0)
             failed = 1;
     }
@@ -3379,8 +3821,8 @@ int portable_capture_resume_prepared_at(
         context.progress_report = progress_report;
         context.resume_mode = 1;
         context.collision_plan = &prepared->report.collision_plan;
-        if (portable_owned_paths_load(context.owned_paths, &sidecar) != 0 ||
-            portable_claimed_paths_load(context.claimed_paths, &sidecar) != 0 ||
+        context.current_source = &prepared->report.current_source;
+        if (portable_capture_owners_reload(&context) != 0 ||
             sticky_seed_inode_map(context.inode_map, request, &sidecar) != 0)
             failed = 1;
         for (size_t index = 0; !failed && index < request->root_count;

@@ -122,9 +122,6 @@ typedef struct {
     char logical_path[SIDECAR_MAX_PATH + 1U];
     char physical_leaf[SIDECAR_MAX_PHYSICAL_LEAF + 1U];
     char collision_suffix[SIDECAR_MAX_COLLISION_SUFFIX + 1U];
-    /* Derived only after the canonical leaf plan is frozen. Phase-4 capture
-     * consumers still read this joined-path compatibility cache. */
-    char physical_path[SIDECAR_MAX_PATH + 1U];
 } PortableCollisionPlanEntry;
 
 typedef struct {
@@ -135,6 +132,18 @@ typedef struct {
 } PortableCollisionPlan;
 
 typedef struct {
+    char root_id[MANIFEST_ID_MAX];
+    char *logical_path;
+} PortableCurrentSourceEntry;
+
+typedef struct {
+    PortableCurrentSourceEntry *entries;
+    size_t count;
+    size_t capacity;
+    int sorted;
+} PortableCurrentSourceSet;
+
+typedef struct {
     size_t total_count;
     size_t collision_count;
     size_t shortening_count;
@@ -143,6 +152,7 @@ typedef struct {
     size_t example_count;
     size_t example_capacity;
     PortableCollisionPlan collision_plan;
+    PortableCurrentSourceSet current_source;
     size_t skipped_kind_count; /* Sockets/devices are capture warnings, not violations. */
     int operational_failure;
     int operational_failure_errno;
@@ -159,6 +169,9 @@ void portable_collision_plan_free(PortableCollisionPlan *plan);
 const PortableCollisionPlanEntry *portable_collision_plan_find(
     const PortableCollisionPlan *plan, const char *root_id,
     const char *logical_path);
+int portable_current_source_contains(const PortableCurrentSourceSet *set,
+                                     const char *root_id,
+                                     const char *logical_path);
 
 /* Runs the read-only pre-scan and fills the canonical collision/shortening
  * plan without applying the capture gate. Resolved case collisions and D39
@@ -207,10 +220,11 @@ typedef struct PortableCaptureContext {
     int case_sensitive;
     int resume_mode;
     const PortableCollisionPlan *collision_plan;
+    const PortableCurrentSourceSet *current_source;
     void *visited;
     void *inode_map;
-    void *owned_paths;
-    void *claimed_paths;
+    void *active_owners;
+    void *tombstone_owners;
 } PortableCaptureContext;
 
 /**

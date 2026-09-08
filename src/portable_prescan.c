@@ -149,6 +149,91 @@ const PortableCollisionPlanEntry *portable_collision_plan_find(
     return NULL;
 }
 
+static char *portable_text_duplicate(const char *text);
+
+static int portable_current_source_compare(const void *left, const void *right)
+{
+    const PortableCurrentSourceEntry *left_entry = left;
+    const PortableCurrentSourceEntry *right_entry = right;
+    int root_result = strcmp(left_entry->root_id, right_entry->root_id);
+    if (root_result != 0)
+        return root_result;
+    return strcmp(left_entry->logical_path, right_entry->logical_path);
+}
+
+static int portable_current_source_add(PortableCurrentSourceSet *set,
+                                       const char *root_id,
+                                       const char *logical_path)
+{
+    if (set == NULL || root_id == NULL || logical_path == NULL ||
+        set->count >= SIDECAR_MAX_LIVE_ENTRIES)
+        return -1;
+    if (set->count == set->capacity) {
+        PortableCurrentSourceEntry *entries = array_reserve(
+            set->entries, &set->capacity, set->count, 1U,
+            sizeof(*entries), 64U, SIDECAR_MAX_LIVE_ENTRIES);
+        if (entries == NULL)
+            return -1;
+        set->entries = entries;
+    }
+    PortableCurrentSourceEntry *entry = &set->entries[set->count];
+    memset(entry, 0, sizeof(*entry));
+    entry->logical_path = portable_text_duplicate(logical_path);
+    if (entry->logical_path == NULL ||
+        copy_text(entry->root_id, sizeof(entry->root_id), root_id) != 0) {
+        free(entry->logical_path);
+        memset(entry, 0, sizeof(*entry));
+        return -1;
+    }
+    set->count++;
+    set->sorted = 0;
+    return 0;
+}
+
+static int portable_current_source_sort(PortableCurrentSourceSet *set)
+{
+    if (set == NULL)
+        return -1;
+    if (set->count > 1U)
+        qsort(set->entries, set->count, sizeof(*set->entries),
+              portable_current_source_compare);
+    for (size_t index = 1; index < set->count; index++) {
+        if (portable_current_source_compare(&set->entries[index - 1U],
+                                            &set->entries[index]) == 0)
+            return -1;
+    }
+    set->sorted = 1;
+    return 0;
+}
+
+int portable_current_source_contains(const PortableCurrentSourceSet *set,
+                                     const char *root_id,
+                                     const char *logical_path)
+{
+    if (set == NULL || !set->sorted || root_id == NULL ||
+        logical_path == NULL)
+        return -1;
+    size_t low = 0;
+    size_t high = set->count;
+    while (low < high) {
+        size_t middle = low + (high - low) / 2U;
+        const PortableCurrentSourceEntry *entry = &set->entries[middle];
+        int result = strcmp(entry->root_id, root_id);
+        if (result == 0)
+            result = strcmp(entry->logical_path, logical_path);
+        if (result < 0)
+            low = middle + 1U;
+        else
+            high = middle;
+    }
+    if (low == set->count)
+        return 0;
+    return strcmp(set->entries[low].root_id, root_id) == 0 &&
+                   strcmp(set->entries[low].logical_path, logical_path) == 0
+               ? 1
+               : 0;
+}
+
 int prescan_report_add(PortablePrescanReport *report,
                        const PortablePrescanViolation *violation)
 {
@@ -1097,66 +1182,16 @@ static int sibling_namespace_plan(
     return failed ? -1 : 0;
 }
 
-typedef struct {
-    char root_id[MANIFEST_ID_MAX];
-    char *logical_path;
-} PortableCompatibilityPath;
-
-typedef struct {
-    PortableCompatibilityPath *items;
-    size_t count;
-    size_t capacity;
-} PortableCompatibilityPaths;
-
-static void compatibility_paths_free(PortableCompatibilityPaths *paths)
-{
-    if (paths == NULL)
-        return;
-    for (size_t index = 0; index < paths->count; index++)
-        free(paths->items[index].logical_path);
-    free(paths->items);
-    memset(paths, 0, sizeof(*paths));
-}
-
-static int compatibility_paths_add(PortableCompatibilityPaths *paths,
-                                   const char *root_id,
-                                   const char *logical_path)
-{
-    if (paths == NULL || root_id == NULL || logical_path == NULL ||
-        paths->count >= SIDECAR_MAX_LIVE_ENTRIES)
-        return -1;
-    if (paths->count == paths->capacity) {
-        PortableCompatibilityPath *items = array_reserve(
-            paths->items, &paths->capacity, paths->count, 1U,
-            sizeof(*items), 64U, SIDECAR_MAX_LIVE_ENTRIES);
-        if (items == NULL)
-            return -1;
-        paths->items = items;
-    }
-
-    PortableCompatibilityPath *item = &paths->items[paths->count];
-    memset(item, 0, sizeof(*item));
-    item->logical_path = portable_text_duplicate(logical_path);
-    if (item->logical_path == NULL ||
-        copy_text(item->root_id, sizeof(item->root_id), root_id) != 0) {
-        free(item->logical_path);
-        memset(item, 0, sizeof(*item));
-        return -1;
-    }
-    paths->count++;
-    return 0;
-}
-
 static int prescan_directory(int source_fd, const char *logical,
                              const char *root_id,
                              PortablePrescanReport *report,
                              int case_sensitive,
                              PortableCaseProbeState *probe_state,
                              const SelectionRoot *selection,
-                             PortableCompatibilityPaths *compatibility_paths)
+                             PortableCurrentSourceSet *current_source)
 {
     if (source_fd < 0 || logical == NULL || root_id == NULL || report == NULL ||
-        probe_state == NULL || compatibility_paths == NULL)
+        probe_state == NULL || current_source == NULL)
         return -1;
 
     int scan_fd = dup_cloexec(source_fd);
@@ -1221,9 +1256,7 @@ static int prescan_directory(int source_fd, const char *logical,
         }
 
         PortablePhysicalName unsuffixed;
-        if (prescan_map_physical_name(entry->d_name, 0, &unsuffixed) != 0 ||
-            compatibility_paths_add(compatibility_paths, root_id,
-                                    child_logical) != 0) {
+        if (prescan_map_physical_name(entry->d_name, 0, &unsuffixed) != 0) {
             failed = 1;
             break;
         }
@@ -1301,6 +1334,13 @@ static int prescan_directory(int source_fd, const char *logical,
             failed = 1;
             break;
         }
+        if ((S_ISDIR(child_stat.st_mode) || S_ISREG(child_stat.st_mode) ||
+             S_ISLNK(child_stat.st_mode)) &&
+            portable_current_source_add(current_source, root_id,
+                                        child_logical) != 0) {
+            failed = 1;
+            break;
+        }
         if (S_ISDIR(child_stat.st_mode)) {
             int child_fd = open_source_node(source_fd, entry->d_name, NULL,
                                             &child_stat);
@@ -1314,7 +1354,7 @@ static int prescan_directory(int source_fd, const char *logical,
             }
             int child_result = prescan_directory(
                 child_fd, child_logical, root_id, report, case_sensitive,
-                probe_state, selection, compatibility_paths);
+                probe_state, selection, current_source);
             if (close(child_fd) != 0)
                 child_result = -1;
             if (child_result != 0) {
@@ -1549,10 +1589,10 @@ static int prescan_root_payload_namespace(
 static int prescan_root(const PortableRootSpec *root,
                         PortablePrescanReport *report, int case_sensitive,
                         PortableCaseProbeState *probe_state,
-                        PortableCompatibilityPaths *compatibility_paths)
+                        PortableCurrentSourceSet *current_source)
 {
     if (!root_spec_valid(root) || report == NULL || probe_state == NULL ||
-        compatibility_paths == NULL)
+        current_source == NULL)
         return -1;
 
     struct stat st;
@@ -1573,6 +1613,9 @@ static int prescan_root(const PortableRootSpec *root,
             report->skipped_kind_count++;
         return 0;
     }
+    if ((S_ISDIR(st.st_mode) || S_ISREG(st.st_mode) || S_ISLNK(st.st_mode)) &&
+        portable_current_source_add(current_source, root->id, "") != 0)
+        return -1;
     if (!S_ISDIR(st.st_mode))
         return 0;
 
@@ -1586,142 +1629,10 @@ static int prescan_root(const PortableRootSpec *root,
     }
     int result = prescan_directory(root_fd, "", root->id, report,
                                    case_sensitive, probe_state,
-                                   root->selection, compatibility_paths);
+                                   root->selection, current_source);
     if (close(root_fd) != 0)
         result = -1;
     return result;
-}
-
-static int compatibility_path_build(
-    const PortableCollisionPlan *plan, const char *root_id,
-    const char *logical_path, char physical[SIDECAR_MAX_PATH + 1U],
-    size_t *physical_length_out)
-{
-    if (plan == NULL || root_id == NULL || logical_path == NULL ||
-        logical_path[0] == '\0' || physical == NULL ||
-        physical_length_out == NULL || !plan->sorted)
-        return -1;
-
-    char logical_prefix[SIDECAR_MAX_PATH + 1U] = {0};
-    char joined[SIDECAR_MAX_PATH + 1U] = {0};
-    int joined_available = 1;
-    size_t physical_length = 0;
-    const char *cursor = logical_path;
-
-    while (*cursor != '\0') {
-        const char *slash = strchr(cursor, '/');
-        size_t component_length = slash == NULL
-            ? strlen(cursor)
-            : (size_t)(slash - cursor);
-        if (component_length == 0 || component_length > NAME_MAX)
-            return -1;
-
-        char component[NAME_MAX + 1U];
-        memcpy(component, cursor, component_length);
-        component[component_length] = '\0';
-
-        char next_prefix[SIDECAR_MAX_PATH + 1U];
-        if (append_logical(next_prefix, sizeof(next_prefix), logical_prefix,
-                           component) != 0)
-            return -1;
-
-        const PortableCollisionPlanEntry *planned =
-            portable_collision_plan_find(plan, root_id, next_prefix);
-        PortablePhysicalName ordinary;
-        const char *leaf = NULL;
-        if (planned != NULL) {
-            if (planned->physical_leaf[0] == '\0')
-                return -1;
-            leaf = planned->physical_leaf;
-        } else {
-            if (prescan_map_physical_name(component, 0, &ordinary) != 0 ||
-                ordinary.shortened)
-                return -1;
-            leaf = ordinary.physical_leaf;
-        }
-
-        size_t leaf_length = strlen(leaf);
-        size_t separator_length = physical_length == 0 ? 0U : 1U;
-        if (physical_length > SIZE_MAX - separator_length ||
-            physical_length + separator_length > SIZE_MAX - leaf_length)
-            return -1;
-        physical_length += separator_length + leaf_length;
-
-        if (joined_available) {
-            char next_joined[SIDECAR_MAX_PATH + 1U];
-            if (append_physical(next_joined, sizeof(next_joined), joined,
-                                leaf) != 0) {
-                joined_available = 0;
-                joined[0] = '\0';
-            } else if (copy_text(joined, sizeof(joined), next_joined) != 0) {
-                return -1;
-            }
-        }
-
-        if (copy_text(logical_prefix, sizeof(logical_prefix), next_prefix) != 0)
-            return -1;
-        if (slash == NULL)
-            break;
-        cursor = slash + 1;
-    }
-
-    if (joined_available && copy_text(physical, SIDECAR_MAX_PATH + 1U,
-                                      joined) != 0)
-        return -1;
-    if (!joined_available)
-        physical[0] = '\0';
-    *physical_length_out = physical_length;
-    return 0;
-}
-
-static int compatibility_paths_derive(
-    PortablePrescanReport *report, const PortableCaptureRequest *request,
-    const PortableCompatibilityPaths *paths)
-{
-    if (report == NULL || request == NULL || paths == NULL ||
-        !report->collision_plan.sorted)
-        return -1;
-
-    for (size_t index = 0; index < paths->count; index++) {
-        const PortableCompatibilityPath *item = &paths->items[index];
-        const PortableRootSpec *root =
-            portable_collision_plan_root(request, item->root_id);
-        if (root == NULL)
-            return -1;
-
-        char physical[SIDECAR_MAX_PATH + 1U];
-        size_t physical_length = 0;
-        if (compatibility_path_build(&report->collision_plan, item->root_id,
-                                     item->logical_path, physical,
-                                     &physical_length) != 0)
-            return -1;
-
-        const PortableCollisionPlanEntry *planned =
-            portable_collision_plan_find(&report->collision_plan,
-                                         item->root_id,
-                                         item->logical_path);
-        if (planned != NULL && physical[0] != '\0') {
-            size_t plan_index = (size_t)(planned - report->collision_plan.entries);
-            if (plan_index >= report->collision_plan.count ||
-                copy_text(report->collision_plan.entries[plan_index].physical_path,
-                          sizeof(report->collision_plan.entries[plan_index].physical_path),
-                          physical) != 0)
-                return -1;
-        }
-
-        size_t payload_length = strlen(root->payload_path);
-        if (payload_length > SIZE_MAX - 1U ||
-            physical_length > SIZE_MAX - payload_length - 1U)
-            return -1;
-        size_t actual_path = payload_length + 1U + physical_length;
-        if (!portable_payload_path_fits(payload_length, physical_length,
-                                        PATH_MAX) &&
-            prescan_record_violation(
-                report, item->root_id, item->logical_path,
-                PORTABLE_PRESCAN_PATH_TOO_LONG, PATH_MAX, actual_path) != 0)
-            return -1;
-    }
-    return 0;
 }
 
 static int prescan_request_internal(int container_fd,
@@ -1739,24 +1650,33 @@ static int prescan_request_internal(int container_fd,
         .container_fd = container_fd,
         .scratch_fd = -1
     };
-    PortableCompatibilityPaths compatibility_paths = {0};
     int failed = 0;
     for (size_t index = 0; index < request->root_count; index++)
         if (prescan_root(&request->roots[index], report,
                          request->case_sensitive, &probe_state,
-                         &compatibility_paths) != 0)
+                         &report->current_source) != 0)
             failed = 1;
     if (prescan_root_payload_namespace(request, report, &probe_state) != 0)
         failed = 1;
     if (case_probe_cleanup(&probe_state) != 0)
         failed = 1;
     portable_collision_plan_sort(&report->collision_plan);
-    if (!failed && compatibility_paths_derive(report, request,
-                                              &compatibility_paths) != 0)
+    if (!failed && portable_current_source_sort(&report->current_source) != 0)
         failed = 1;
+    if (!failed) {
+        for (size_t index = 0; index < report->collision_plan.count; index++) {
+            const PortableCollisionPlanEntry *entry =
+                &report->collision_plan.entries[index];
+            if (portable_current_source_contains(&report->current_source,
+                                                 entry->root_id,
+                                                 entry->logical_path) != 1) {
+                failed = 1;
+                break;
+            }
+        }
+    }
     if (!failed)
         prescan_report_refresh_unresolved(report);
-    compatibility_paths_free(&compatibility_paths);
     return failed || (reject_violations && report->unresolved_count != 0)
                ? -1
                : 0;

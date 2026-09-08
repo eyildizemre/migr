@@ -19,11 +19,10 @@
 // Each interrupted state must remain deterministically resumable, and the
 // resumed reconciliation must complete to the expected payload inventory.
 //
-// The inventory consistency walk runs a full sidecar_foreach live-pass plus
-// an fd-anchored payload scan, so these tests also exercise the
-// sidecar_log_foreach() / sidecar_log_find_deleted() state-log entry points
-// added for this step against real fixtures, not just unit-level synthetic
-// keys.
+// The inventory consistency walk resolves physical children through the
+// parent-relative live/tombstone ownership indexes while keeping logical
+// identity in sidecar state, so collision-suffixed payload names are covered
+// without treating their on-disk spelling as a logical path.
 
 #define _GNU_SOURCE
 
@@ -451,22 +450,33 @@ static int child_killed(int status)
     return WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL;
 }
 
-static int run_resume_interrupt(const Fixture *fixture,
-                                PortableTestInterruptPoint point)
+static int run_request_interrupt(int container_fd,
+                                 const PortableCaptureRequest *request,
+                                 PortableTestInterruptPoint point)
 {
+    if (container_fd < 0 || request == NULL)
+        return -1;
     pid_t child = fork();
     if (child < 0)
         return -1;
     if (child == 0) {
         portable_capture_test_set_interrupt(point);
-        int result = portable_capture_resume_at(fixture->container_fd,
-                                                &fixture->request, NULL);
+        int result = portable_capture_resume_at(container_fd, request, NULL);
         _exit(result == 0 ? 0 : 1);
     }
     int status = 0;
     if (waitpid(child, &status, 0) != child)
         return -1;
     return child_killed(status) ? 0 : -1;
+}
+
+static int run_resume_interrupt(const Fixture *fixture,
+                                PortableTestInterruptPoint point)
+{
+    if (fixture == NULL)
+        return -1;
+    return run_request_interrupt(fixture->container_fd, &fixture->request,
+                                 point);
 }
 
 static void reset_interrupts(void)
@@ -622,6 +632,79 @@ static void test_deleted_subtree(const char *base)
     close(container_fd);
 }
 
+static void test_stale_subtree_child_before_parent(const char *base)
+{
+    printf(BLUE "::" NC " stale subtree deletes descendants before ancestors\n");
+    char source[PATH_MAX];
+    char container[PATH_MAX];
+    join_path(source, sizeof(source), base, "stale-order-source");
+    join_path(container, sizeof(container), base, "stale-order-container");
+    make_directory(source);
+    make_directory(container);
+
+    char tree[PATH_MAX];
+    char child[PATH_MAX];
+    join_path(tree, sizeof(tree), source, "tree");
+    join_path(child, sizeof(child), tree, "child");
+    make_directory(tree);
+    write_file(child, "child");
+
+    PortableRootSpec root = {
+        .id = "ROOT",
+        .policy = ROOT_POLICY_HOME_RELATIVE,
+        .capture_path = source,
+        .payload_path = "ROOT",
+        .source_path = source,
+        .restore_path = "fixture",
+        .has_restore_path = 1
+    };
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .has_source_identity = 1,
+        .machine_id = "d390",
+        .source_uid = getuid(),
+        .roots = &root,
+        .root_count = 1,
+        .nsec_exact = 1,
+        .case_sensitive = 1
+    };
+    int container_fd = open(container, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open stale-order container");
+    check(portable_capture_fresh_at(container_fd, &request, NULL) == 0,
+          "stale-order fixture is captured");
+    if (unlink(child) != 0 || rmdir(tree) != 0)
+        fixture_fatal("could not remove stale-order source subtree");
+
+    check(run_request_interrupt(container_fd, &request,
+                                PORTABLE_TEST_AFTER_STALE_DELETE) == 0,
+          "resume is interrupted immediately after the first stale DELETE");
+    reset_interrupts();
+
+    Fixture state = { .container_fd = container_fd };
+    int tree_live = -1;
+    int tree_deleted = -1;
+    int child_live = -1;
+    int child_deleted = -1;
+    check(sidecar_state(&state, "tree/child", &child_live, &child_deleted) == 0 &&
+              child_live == 0 && child_deleted == 1 &&
+              sidecar_state(&state, "tree", &tree_live, &tree_deleted) == 0 &&
+              tree_live == 1 && tree_deleted == 0,
+          "the first stale DELETE tombstones the deepest child while its parent stays live");
+
+    char payload_tree[PATH_MAX];
+    char payload_child[PATH_MAX];
+    join_path(payload_tree, sizeof(payload_tree), container, "data/ROOT/tree");
+    join_path(payload_child, sizeof(payload_child), payload_tree, "child");
+    check(path_exists(payload_tree) && path_exists(payload_child),
+          "the interrupted DELETE keeps the old parent chain and child payload reachable");
+    check(portable_capture_resume_at(container_fd, &request, NULL) == 0,
+          "the next resume completes child-before-parent stale cleanup");
+    check(path_missing(payload_tree),
+          "resumed stale cleanup removes the complete old subtree");
+    close(container_fd);
+}
+
 static void remove_claimed_source(const ClaimDirectoryFixture *fixture,
                                   int nested)
 {
@@ -717,6 +800,87 @@ static void test_foreign_child_blocks_claim_cleanup(const char *base)
               outstanding_claim_count(fixture.container_fd) == 1,
           "foreign-child refusal leaves the whole payload and CLAIM intact");
     close(fixture.container_fd);
+}
+
+static void test_collision_claim_foreign_child(const char *base)
+{
+    printf(BLUE "::" NC " collision-suffixed CLAIM ownership stays exact\n");
+    char source[PATH_MAX];
+    char container[PATH_MAX];
+    join_path(source, sizeof(source), base, "claim-collision-source");
+    join_path(container, sizeof(container), base, "claim-collision-container");
+    make_directory(source);
+    make_directory(container);
+
+    char claimed[PATH_MAX];
+    char upper[PATH_MAX];
+    char lower[PATH_MAX];
+    join_path(claimed, sizeof(claimed), source, "claimed");
+    join_path(upper, sizeof(upper), claimed, "Child");
+    join_path(lower, sizeof(lower), claimed, "child");
+    make_directory(claimed);
+    write_file(upper, "upper");
+    write_file(lower, "lower");
+
+    PortableRootSpec root = {
+        .id = "ROOT",
+        .policy = ROOT_POLICY_HOME_RELATIVE,
+        .capture_path = source,
+        .payload_path = "ROOT",
+        .source_path = source,
+        .restore_path = "fixture",
+        .has_restore_path = 1
+    };
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .has_source_identity = 1,
+        .machine_id = "d391",
+        .source_uid = getuid(),
+        .roots = &root,
+        .root_count = 1,
+        .nsec_exact = 1,
+        .case_sensitive = 0
+    };
+    int container_fd = open(container, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open collision-CLAIM container");
+    check(portable_capture_fresh_at(container_fd, &request, NULL) == 0,
+          "case-colliding children are captured before CLAIM conversion");
+
+    char payload_claimed[PATH_MAX];
+    char payload_upper[PATH_MAX];
+    char payload_lower[PATH_MAX];
+    join_path(payload_claimed, sizeof(payload_claimed), container,
+              "data/ROOT/claimed");
+    join_path(payload_upper, sizeof(payload_upper), payload_claimed, "Child");
+    join_path(payload_lower, sizeof(payload_lower), payload_claimed,
+              "child%7E1");
+    check(path_exists(payload_upper) && path_exists(payload_lower),
+          "the fixture contains an owned collision-suffixed physical child");
+
+    ClaimDirectoryFixture claim_fixture = { .container_fd = container_fd };
+    check(convert_directory_to_claim(&claim_fixture) == 0,
+          "the collision-bearing directory becomes an outstanding CLAIM");
+    if (unlink(upper) != 0 || unlink(lower) != 0 || rmdir(claimed) != 0)
+        fixture_fatal("could not remove collision-CLAIM source subtree");
+
+    char foreign[PATH_MAX];
+    join_path(foreign, sizeof(foreign), payload_claimed, "foreign");
+    write_file(foreign, "foreign");
+    check(portable_capture_resume_at(container_fd, &request, NULL) != 0,
+          "a foreign child blocks cleanup even beside collision-suffixed owned children");
+    check(path_exists(payload_claimed) && path_exists(payload_upper) &&
+              path_exists(payload_lower) && path_exists(foreign) &&
+              outstanding_claim_count(container_fd) == 1,
+          "foreign-child refusal leaves the CLAIM and every owned payload untouched");
+
+    if (unlink(foreign) != 0)
+        fixture_fatal("could not remove collision-CLAIM foreign child");
+    check(portable_capture_resume_at(container_fd, &request, NULL) == 0 &&
+              path_missing(payload_claimed) &&
+              outstanding_claim_count(container_fd) == 0,
+          "without the foreign child, parent-relative ownership cleans the suffixed CLAIM subtree");
+    close(container_fd);
 }
 
 static void test_stale_claim_child_vanishes_during_validation(
@@ -965,6 +1129,214 @@ static void test_inventory_mismatch(const char *base)
     close_fixture(&fixture);
 }
 
+static void test_collision_inventory_and_foreign_child(const char *base)
+{
+    printf(BLUE "::" NC " final inventory resolves collision-suffixed children\n");
+    char source[PATH_MAX];
+    char container[PATH_MAX];
+    join_path(source, sizeof(source), base, "inventory-collision-source");
+    join_path(container, sizeof(container), base, "inventory-collision-container");
+    make_directory(source);
+    make_directory(container);
+
+    char parent[PATH_MAX];
+    char upper[PATH_MAX];
+    char lower[PATH_MAX];
+    join_path(parent, sizeof(parent), source, "parent");
+    join_path(upper, sizeof(upper), parent, "Child");
+    join_path(lower, sizeof(lower), parent, "child");
+    make_directory(parent);
+    write_file(upper, "upper");
+    write_file(lower, "lower");
+
+    PortableRootSpec root = {
+        .id = "ROOT",
+        .policy = ROOT_POLICY_HOME_RELATIVE,
+        .capture_path = source,
+        .payload_path = "ROOT",
+        .source_path = source,
+        .restore_path = "fixture",
+        .has_restore_path = 1
+    };
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .has_source_identity = 1,
+        .machine_id = "d392",
+        .source_uid = getuid(),
+        .roots = &root,
+        .root_count = 1,
+        .nsec_exact = 1,
+        .case_sensitive = 0
+    };
+    int container_fd = open(container, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open collision-inventory container");
+    check(portable_capture_fresh_at(container_fd, &request, NULL) == 0 &&
+              portable_capture_resume_at(container_fd, &request, NULL) == 0,
+          "final inventory accepts a live child whose physical leaf is collision-suffixed");
+
+    char payload_parent[PATH_MAX];
+    char payload_suffixed[PATH_MAX];
+    char foreign[PATH_MAX];
+    join_path(payload_parent, sizeof(payload_parent), container,
+              "data/ROOT/parent");
+    join_path(payload_suffixed, sizeof(payload_suffixed), payload_parent,
+              "child%7E1");
+    join_path(foreign, sizeof(foreign), payload_parent, "foreign");
+    check(path_exists(payload_suffixed),
+          "inventory fixture actually uses a physical spelling different from its logical child");
+    write_file(foreign, "foreign");
+    check(portable_capture_resume_at(container_fd, &request, NULL) != 0,
+          "an extra foreign physical child still blocks final inventory");
+    check(path_exists(foreign),
+          "final inventory refuses rather than deleting the foreign child");
+    close(container_fd);
+}
+
+static void test_tombstone_parent_scope(const char *base)
+{
+    printf(BLUE "::" NC " tombstone ownership is scoped to its logical parent\n");
+    char source[PATH_MAX];
+    char container[PATH_MAX];
+    join_path(source, sizeof(source), base, "tombstone-parent-source");
+    join_path(container, sizeof(container), base, "tombstone-parent-container");
+    make_directory(source);
+    make_directory(container);
+
+    char parent_a[PATH_MAX];
+    char parent_b[PATH_MAX];
+    char source_leaf[PATH_MAX];
+    join_path(parent_a, sizeof(parent_a), source, "a");
+    join_path(parent_b, sizeof(parent_b), source, "b");
+    join_path(source_leaf, sizeof(source_leaf), parent_a, "L");
+    make_directory(parent_a);
+    make_directory(parent_b);
+    write_file(source_leaf, "owned");
+
+    PortableRootSpec root = {
+        .id = "ROOT",
+        .policy = ROOT_POLICY_HOME_RELATIVE,
+        .capture_path = source,
+        .payload_path = "ROOT",
+        .source_path = source,
+        .restore_path = "fixture",
+        .has_restore_path = 1
+    };
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .has_source_identity = 1,
+        .machine_id = "d393",
+        .source_uid = getuid(),
+        .roots = &root,
+        .root_count = 1,
+        .nsec_exact = 1,
+        .case_sensitive = 1
+    };
+    int container_fd = open(container, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open tombstone-parent container");
+    check(portable_capture_fresh_at(container_fd, &request, NULL) == 0,
+          "tombstone-parent fixture is captured");
+    if (unlink(source_leaf) != 0)
+        fixture_fatal("could not remove parent-A source leaf");
+    check(portable_capture_resume_at(container_fd, &request, NULL) == 0,
+          "parent-A deletion leaves recoverable tombstone provenance");
+
+    Fixture state = { .container_fd = container_fd };
+    int live = -1;
+    int deleted = -1;
+    check(sidecar_state(&state, "a/L", &live, &deleted) == 0 &&
+              live == 0 && deleted == 1,
+          "the current tombstone records the child under logical parent A");
+
+    char foreign[PATH_MAX];
+    join_path(foreign, sizeof(foreign), container, "data/ROOT/b/L");
+    write_file(foreign, "foreign");
+    check(portable_capture_resume_at(container_fd, &request, NULL) != 0,
+          "parent-A tombstone cannot authorize the same physical leaf under parent B");
+    check(path_exists(foreign),
+          "parent-scoped tombstone refusal leaves the foreign parent-B node untouched");
+    if (unlink(foreign) != 0)
+        fixture_fatal("could not remove parent-B foreign node");
+    check(portable_capture_resume_at(container_fd, &request, NULL) == 0,
+          "resume finalizes once the unrelated parent-B node is removed");
+    close(container_fd);
+}
+
+static void test_ambiguous_tombstone_owner_lookup(const char *base)
+{
+    printf(BLUE "::" NC " ambiguous tombstone ownership is not deletion authority\n");
+    Fixture fixture;
+    check(prepare_fixture(base, "tombstone-ambiguity", &fixture) == 0,
+          "tombstone-ambiguity fixture is captured");
+    if (fixture.container_fd < 0)
+        return;
+
+    SidecarLog log = {0};
+    SidecarClaim first_claim = {
+        .root_id = { (const unsigned char *)"ROOT", 4 },
+        .logical_path = { (const unsigned char *)"first", 5 },
+        .physical_leaf = { (const unsigned char *)"L", 1 },
+        .kind = SIDECAR_KIND_REGULAR
+    };
+    SidecarClaim second_claim = {
+        .root_id = { (const unsigned char *)"ROOT", 4 },
+        .logical_path = { (const unsigned char *)"second", 6 },
+        .physical_leaf = { (const unsigned char *)"L", 1 },
+        .kind = SIDECAR_KIND_REGULAR
+    };
+    SidecarEntry first_entry = {
+        .root_id = { (const unsigned char *)"ROOT", 4 },
+        .logical_path = { (const unsigned char *)"first", 5 },
+        .physical_leaf = { (const unsigned char *)"L", 1 },
+        .kind = SIDECAR_KIND_REGULAR,
+        .mode = 0644
+    };
+    SidecarEntry second_entry = first_entry;
+    second_entry.logical_path =
+        (SidecarBytes){ (const unsigned char *)"second", 6 };
+    SidecarDelete first_delete = {
+        .root_id = { (const unsigned char *)"ROOT", 4 },
+        .logical_path = { (const unsigned char *)"first", 5 }
+    };
+    SidecarDelete second_delete = {
+        .root_id = { (const unsigned char *)"ROOT", 4 },
+        .logical_path = { (const unsigned char *)"second", 6 }
+    };
+
+    int setup = sidecar_log_adopt_at(fixture.container_fd, &log) ==
+                    SIDECAR_OPEN_RESUMABLE &&
+                sidecar_log_append_claim(&log, &first_claim) ==
+                    SIDECAR_STATUS_OK &&
+                sidecar_log_append_entry(&log, &first_entry) ==
+                    SIDECAR_STATUS_OK &&
+                sidecar_log_append_entry_commit(&log) == SIDECAR_STATUS_OK &&
+                sidecar_log_append_claim(&log, &second_claim) ==
+                    SIDECAR_STATUS_OK &&
+                sidecar_log_append_entry(&log, &second_entry) ==
+                    SIDECAR_STATUS_OK &&
+                sidecar_log_append_entry_commit(&log) == SIDECAR_STATUS_OK &&
+                sidecar_log_append_delete(&log, &first_delete) ==
+                    SIDECAR_STATUS_OK &&
+                sidecar_log_append_delete(&log, &second_delete) ==
+                    SIDECAR_STATUS_OK;
+    check(setup,
+          "two logical tombstones can retain the same parent-relative physical leaf");
+
+    PortablePhysicalOwners owners = {0};
+    const PortablePhysicalOwner *owner = (const PortablePhysicalOwner *)1;
+    int loaded = setup && portable_tombstone_owners_load(&owners, &log) == 0;
+    int found = loaded ? portable_physical_owners_find(
+                             &owners, "ROOT", "", "L", &owner)
+                       : 1;
+    check(loaded && owners.count == 2U && found == -1 && owner == NULL,
+          "ambiguous tombstone parent/leaf lookup fails closed instead of authorizing deletion");
+    portable_physical_owners_free(&owners);
+    check(sidecar_log_close(&log) == SIDECAR_STATUS_OK,
+          "tombstone-ambiguity sidecar closes cleanly");
+    close_fixture(&fixture);
+}
+
 static void test_interrupt_boundary(const char *base,
                                     const char *label,
                                     PortableTestInterruptPoint point,
@@ -1024,10 +1396,12 @@ int main(void)
     test_deleted_file(base);
     test_deleted_symlink(base);
     test_deleted_subtree(base);
+    test_stale_subtree_child_before_parent(base);
     test_claim_foreach(base);
     test_stale_empty_claim(base);
     test_stale_nested_claim(base);
     test_foreign_child_blocks_claim_cleanup(base);
+    test_collision_claim_foreign_child(base);
     test_stale_claim_child_vanishes_during_validation(base);
     test_stale_claim_directory_vanishes_before_validation_descent(base);
     test_stale_claim_directory_vanishes_before_mutation_descent(base);
@@ -1035,6 +1409,9 @@ int main(void)
     test_capture_directory_scan_failure_frees_resources(base);
     test_cleanup_failure(base);
     test_inventory_mismatch(base);
+    test_collision_inventory_and_foreign_child(base);
+    test_tombstone_parent_scope(base);
+    test_ambiguous_tombstone_owner_lookup(base);
     test_interruption_boundaries(base);
 
     remove_tree(base);

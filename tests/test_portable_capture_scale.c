@@ -237,6 +237,20 @@ int main(void)
         fixture_fatal("could not initialize portable capture");
 
     PortableRootSpec root = root_spec(source_path);
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .roots = &root,
+        .root_count = 1,
+        .nsec_exact = 1,
+        .case_sensitive = 1
+    };
+    PortablePrescanReport initial_report;
+    portable_prescan_report_init(&initial_report);
+    if (portable_collision_plan_build(container_fd, &request,
+                                      &initial_report) != 0)
+        fixture_fatal("could not prepare initial scale capture membership");
+    context.collision_plan = &initial_report.collision_plan;
+    context.current_source = &initial_report.current_source;
     portable_capture_test_reset_probe_count();
     portable_capture_test_reset_readback_scan_count();
     check(portable_capture_root(&context, &root) == 0,
@@ -260,6 +274,15 @@ int main(void)
         if (make_named_fixture_file(source_fd, utf8_names[index]) != 0)
             fixture_fatal("could not create UTF-8 scale fixture file");
 
+    PortablePrescanReport expanded_report;
+    portable_prescan_report_init(&expanded_report);
+    if (portable_collision_plan_build(container_fd, &request,
+                                      &expanded_report) != 0)
+        fixture_fatal("could not refresh expanded scale capture membership");
+    context.collision_plan = &expanded_report.collision_plan;
+    context.current_source = &expanded_report.current_source;
+    portable_prescan_report_free(&initial_report);
+
     portable_capture_test_reset_readback_scan_count();
     check(portable_capture_root(&context, &root) == 0,
           "mixed ASCII and UTF-8 fixture captures successfully");
@@ -269,6 +292,7 @@ int main(void)
     test_case_probe_hooks(fixture);
 
     portable_capture_context_close(&context);
+    portable_prescan_report_free(&expanded_report);
     check(sidecar_log_close(&sidecar) == SIDECAR_STATUS_OK,
           "scale sidecar closes cleanly");
     close(data_fd);

@@ -40,9 +40,11 @@
 
 #include "manifest.h"
 #include "portable.h"
+#include "portable_hashset_internal.h"
 #include "portable_name.h"
 #include "portable_prescan_internal.h" /* Direct prescan_request() validation
                                         * coverage uses this internal seam. */
+#include "selection.h"
 #include "sidecar.h"
 
 extern int entry_from_stat(const char *root_id, const char *logical,
@@ -57,28 +59,11 @@ extern int append_physical(char *destination, size_t destination_size,
                            const char *parent, const char *encoded_leaf);
 extern int prescan_report_add(PortablePrescanReport *report,
                               const PortablePrescanViolation *violation);
-typedef struct {
-    char *folded_key;
-    char *logical_path;
-    size_t key_length;
-    uint64_t hash;
-    size_t value_index;
-} PortableCaseFoldSlot;
-typedef struct {
-    PortableCaseFoldSlot *slots;
-    size_t count;
-    size_t capacity;
-    uint64_t hash_salt;
-} PortableCaseFoldSet;
-extern void ascii_fold_copy(char *destination, size_t destination_size,
-                            const char *source);
+extern int reconcile_stale_live(PortableCaptureContext *context,
+                                const PortableRootSpec *root,
+                                const char *logical);
 extern void skeleton_copy(char *destination, size_t destination_size,
                           const char *source);
-extern int case_fold_set_find_or_insert(PortableCaseFoldSet *set,
-                                        const char *folded_key,
-                                        const char *logical_path,
-                                        char **out_logical_path);
-extern void case_fold_set_free(PortableCaseFoldSet *set);
 extern int entries_equal(const SidecarEntry *current,
                          const SidecarLiveView *previous,
                          const PortableXattrs *xattrs);
@@ -137,59 +122,92 @@ static void remove_tree(const char *path)
         fixture_fatal("could not walk fixture tree");
 }
 
-static int remove_fd_entry(int parent_fd, const char *name);
+static int remove_fd_entry(int *parent_fd, const char *name);
 
-static int remove_fd_children(int directory_fd)
+static int remove_fd_children(int *directory_fd)
 {
-    int scan_fd = fcntl(directory_fd, F_DUPFD_CLOEXEC, 0);
-    DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
-    if (directory == NULL) {
-        if (scan_fd >= 0)
-            close(scan_fd);
-        return -1;
-    }
-
-    int failed = 0;
     for (;;) {
+        int scan_fd = openat(*directory_fd, ".",
+                             O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
+        if (directory == NULL) {
+            if (scan_fd >= 0)
+                close(scan_fd);
+            return -1;
+        }
+
+        char child[NAME_MAX + 1U];
+        int found = 0;
+        int failed = 0;
         errno = 0;
-        struct dirent *entry = readdir(directory);
-        if (entry == NULL) {
-            if (errno != 0)
+        for (;;) {
+            struct dirent *entry = readdir(directory);
+            if (entry == NULL) {
+                if (errno != 0)
+                    failed = 1;
+                break;
+            }
+            if (strcmp(entry->d_name, ".") == 0 ||
+                strcmp(entry->d_name, "..") == 0)
+                continue;
+            size_t length = strlen(entry->d_name);
+            if (length == 0 || length > NAME_MAX) {
                 failed = 1;
+                break;
+            }
+            memcpy(child, entry->d_name, length + 1U);
+            found = 1;
             break;
         }
-        if (strcmp(entry->d_name, ".") == 0 ||
-            strcmp(entry->d_name, "..") == 0)
-            continue;
-        if (remove_fd_entry(directory_fd, entry->d_name) != 0) {
+        if (closedir(directory) != 0)
             failed = 1;
-            break;
-        }
+        if (failed)
+            return -1;
+        if (!found)
+            return 0;
+        if (remove_fd_entry(directory_fd, child) != 0)
+            return -1;
     }
-    if (closedir(directory) != 0)
-        failed = 1;
-    return failed ? -1 : 0;
 }
 
-static int remove_fd_entry(int parent_fd, const char *name)
+static int remove_fd_entry(int *parent_fd, const char *name)
 {
     struct stat st;
-    if (fstatat(parent_fd, name, &st, AT_SYMLINK_NOFOLLOW) != 0)
+    if (fstatat(*parent_fd, name, &st, AT_SYMLINK_NOFOLLOW) != 0)
         return errno == ENOENT ? 0 : -1;
     if (!S_ISDIR(st.st_mode))
-        return unlinkat(parent_fd, name, 0) == 0 ? 0 : -1;
+        return unlinkat(*parent_fd, name, 0) == 0 ? 0 : -1;
 
-    int directory_fd = openat(parent_fd, name,
+    int directory_fd = openat(*parent_fd, name,
                               O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
                                   O_CLOEXEC);
     if (directory_fd < 0)
         return -1;
-    int failed = remove_fd_children(directory_fd);
-    if (close(directory_fd) != 0)
-        failed = -1;
-    if (failed != 0)
+
+    if (close(*parent_fd) != 0) {
+        close(directory_fd);
         return -1;
-    return unlinkat(parent_fd, name, AT_REMOVEDIR) == 0 ? 0 : -1;
+    }
+    *parent_fd = -1;
+
+    if (remove_fd_children(&directory_fd) != 0) {
+        close(directory_fd);
+        return -1;
+    }
+
+    int reopened_parent = openat(directory_fd, "..",
+                                 O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (reopened_parent < 0) {
+        close(directory_fd);
+        return -1;
+    }
+    if (close(directory_fd) != 0 ||
+        unlinkat(reopened_parent, name, AT_REMOVEDIR) != 0) {
+        close(reopened_parent);
+        return -1;
+    }
+    *parent_fd = reopened_parent;
+    return 0;
 }
 
 static void remove_tree_fd(const char *path)
@@ -200,7 +218,7 @@ static void remove_tree_fd(const char *path)
             return;
         fixture_fatal("could not open fixture tree for fd cleanup");
     }
-    if (remove_fd_children(directory_fd) != 0 || close(directory_fd) != 0 ||
+    if (remove_fd_children(&directory_fd) != 0 || close(directory_fd) != 0 ||
         rmdir(path) != 0)
         fixture_fatal("could not remove fixture tree by descriptor");
 }
@@ -796,7 +814,6 @@ static int collision_plan_entry_matches(
     return entry != NULL && strcmp(entry->root_id, root_id) == 0 &&
            strcmp(entry->logical_path, logical) == 0 &&
            leaf != NULL && strcmp(entry->physical_leaf, leaf) == 0 &&
-           strcmp(entry->physical_path, physical) == 0 &&
            strcmp(entry->collision_suffix, suffix) == 0;
 }
 
@@ -1113,7 +1130,6 @@ static void test_mixed_prescan_violations(const char *base)
                                      oversized_name);
     check(mapped && shortened.shortened && planned != NULL &&
               strcmp(planned->physical_leaf, shortened.physical_leaf) == 0 &&
-              strcmp(planned->physical_path, shortened.physical_leaf) == 0 &&
               empty_capture_container(container_fd),
           "mixed resolved shortening is represented in the canonical plan without mutation");
     portable_prescan_report_free(&report);
@@ -1214,8 +1230,6 @@ static void test_collision_plan_suffix_length_violation(const char *base)
     check(mapped && expected_shortened.shortened && shortened != NULL &&
               strcmp(shortened->physical_leaf,
                      expected_shortened.physical_leaf) == 0 &&
-              strcmp(shortened->physical_path,
-                     expected_shortened.physical_leaf) == 0 &&
               strcmp(shortened->collision_suffix, "%7E1") == 0 &&
               strlen(shortened->physical_leaf) <= NAME_MAX,
           "suffix growth is rebudgeted through the canonical mapper");
@@ -1301,6 +1315,9 @@ static void test_shortened_candidate_collision_determinism(const char *base)
     char first_suffix[SIDECAR_MAX_COLLISION_SUFFIX + 1U];
     char second_leaf[NAME_MAX + 1U];
     char second_suffix[SIDECAR_MAX_COLLISION_SUFFIX + 1U];
+    char source_roots[3][MANIFEST_ID_MAX] = {{0}};
+    char source_paths[3][SIDECAR_MAX_PATH + 1U] = {{0}};
+    size_t source_count = 0;
     static const int orders[2][2] = { { 0, 1 }, { 1, 0 } };
     const char *all_names[2] = { first, second };
 
@@ -1345,6 +1362,32 @@ static void test_shortened_candidate_collision_determinism(const char *base)
                   empty_capture_container(container_fd),
               "planner resolves an exact shortened collision without relying on the fingerprint");
 
+        int source_members_match = report.current_source.sorted &&
+                                   report.current_source.count == 3U;
+        if (run == 0 && source_members_match) {
+            source_count = report.current_source.count;
+            for (size_t index = 0; index < source_count; index++) {
+                if (snprintf(source_roots[index], sizeof(source_roots[index]),
+                             "%s", report.current_source.entries[index].root_id) < 0 ||
+                    snprintf(source_paths[index], sizeof(source_paths[index]),
+                             "%s",
+                             report.current_source.entries[index].logical_path) < 0)
+                    fixture_fatal("could not snapshot current-source ordering");
+            }
+        } else if (run == 1 && source_members_match) {
+            for (size_t index = 0; index < source_count; index++)
+                if (strcmp(source_roots[index],
+                           report.current_source.entries[index].root_id) != 0 ||
+                    strcmp(source_paths[index],
+                           report.current_source.entries[index].logical_path) != 0) {
+                    source_members_match = 0;
+                    break;
+                }
+        }
+        if (run == 1)
+            check(source_members_match && source_count == 3U,
+                  "reversing source creation order leaves prepared membership byte-for-byte stable");
+
         if (run == 0 && first_entry != NULL && second_entry != NULL) {
             snprintf(first_leaf, sizeof(first_leaf), "%s",
                      first_entry->physical_leaf);
@@ -1368,6 +1411,120 @@ static void test_shortened_candidate_collision_determinism(const char *base)
         remove_tree(source_path);
         remove_tree(container_path);
     }
+}
+
+static void test_current_source_membership(const char *base)
+{
+    printf(BLUE "::" NC " prepared current-source membership\n");
+    char source_path[PATH_MAX];
+    char container_path[PATH_MAX];
+    join_path(source_path, sizeof(source_path), base,
+              "current-source-membership-source");
+    join_path(container_path, sizeof(container_path), base,
+              "current-source-membership-container");
+    make_directory(source_path);
+    make_directory(container_path);
+
+    char plain_path[PATH_MAX];
+    char excluded_path[PATH_MAX];
+    char socket_path[PATH_MAX];
+    join_path(plain_path, sizeof(plain_path), source_path, "plain");
+    join_path(excluded_path, sizeof(excluded_path), source_path, "excluded");
+    join_path(socket_path, sizeof(socket_path), source_path, "skipped.sock");
+    write_file(plain_path, "plain", 5);
+    write_file(excluded_path, "excluded", 8);
+
+    char shortened_name[NAME_MAX + 1U];
+    memset(shortened_name, ':', 100U);
+    shortened_name[100] = '\0';
+    char shortened_path[PATH_MAX];
+    join_path(shortened_path, sizeof(shortened_path), source_path,
+              shortened_name);
+    write_file(shortened_path, "short", 5);
+
+    int socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un address;
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+    if (socket_fd < 0 || strlen(socket_path) >= sizeof(address.sun_path))
+        fixture_fatal("could not prepare current-source socket fixture");
+    memcpy(address.sun_path, socket_path, strlen(socket_path) + 1U);
+    int socket_bound = 1;
+    if (bind(socket_fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
+        if (errno != EPERM && errno != EACCES)
+            fixture_fatal("could not bind current-source socket fixture");
+        skip_check("current-source socket membership fixture unavailable in this sandbox");
+        close(socket_fd);
+        socket_fd = -1;
+        unlink(address.sun_path);
+        socket_bound = 0;
+    }
+
+    char *excluded[] = { "excluded" };
+    SelectionRoot selection = {0};
+    selection.excluded.paths = excluded;
+    selection.excluded.count = 1U;
+
+    PortableRootSpec root = root_spec("MEMBERS", source_path, "MEMBERS");
+    if (snprintf(selection.root.capture_path,
+                 sizeof(selection.root.capture_path), "%s", source_path) < 0 ||
+        snprintf(selection.root.manifest_root.id,
+                 sizeof(selection.root.manifest_root.id), "%s", root.id) < 0 ||
+        snprintf(selection.root.manifest_root.payload_path,
+                 sizeof(selection.root.manifest_root.payload_path), "%s",
+                 root.payload_path) < 0 ||
+        snprintf(selection.root.manifest_root.source_path,
+                 sizeof(selection.root.manifest_root.source_path), "%s",
+                 root.source_path) < 0 ||
+        snprintf(selection.root.manifest_root.restore_path,
+                 sizeof(selection.root.manifest_root.restore_path), "%s",
+                 root.restore_path) < 0)
+        fixture_fatal("could not bind current-source selection fixture");
+    selection.root.manifest_root.policy = root.policy;
+    selection.root.manifest_root.has_restore_path = root.has_restore_path;
+    root.selection = &selection;
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .roots = &root,
+        .root_count = 1,
+        .nsec_exact = 1,
+        .case_sensitive = 1
+    };
+    int container_fd = open(container_path,
+                            O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open current-source membership container");
+    PortablePrescanReport report;
+    portable_prescan_report_init(&report);
+    int result = portable_collision_plan_build(container_fd, &request, &report);
+    check(result == 0 && report.current_source.sorted &&
+              portable_current_source_contains(&report.current_source,
+                                               "MEMBERS", "") == 1 &&
+              portable_current_source_contains(&report.current_source,
+                                               "MEMBERS", "plain") == 1 &&
+              portable_current_source_contains(&report.current_source,
+                                               "MEMBERS", shortened_name) == 1,
+          "selected address-bearing objects populate prepared membership");
+    check(portable_collision_plan_find(&report.collision_plan,
+                                       "MEMBERS", "plain") == NULL &&
+              portable_collision_plan_find(&report.collision_plan,
+                                            "MEMBERS",
+                                            shortened_name) != NULL,
+          "prepared membership is independent of sparse collision planning");
+    check(portable_current_source_contains(&report.current_source,
+                                           "MEMBERS", "excluded") == 0,
+          "excluded children stay outside prepared membership");
+    if (socket_bound)
+        check(portable_current_source_contains(&report.current_source,
+                                               "MEMBERS", "skipped.sock") == 0,
+              "skipped-special children stay outside prepared membership");
+
+    portable_prescan_report_free(&report);
+    close(container_fd);
+    if (socket_fd >= 0)
+        close(socket_fd);
+    remove_tree(source_path);
+    remove_tree(container_path);
 }
 
 static void test_prepared_shortening_plan_authority(const char *base)
@@ -1641,16 +1798,6 @@ static void test_shortened_ancestor_keeps_descendant_identity(const char *base)
     PortablePhysicalName mapped_parent;
     int parent_mapped = portable_physical_name_map(parent, 0,
                                                    &mapped_parent) == 0;
-    char expected_upper_path[SIDECAR_MAX_PATH + 1U];
-    char expected_lower_path[SIDECAR_MAX_PATH + 1U];
-    int upper_length = parent_mapped
-        ? snprintf(expected_upper_path, sizeof(expected_upper_path), "%s/A",
-                   mapped_parent.physical_leaf)
-        : -1;
-    int lower_length = parent_mapped
-        ? snprintf(expected_lower_path, sizeof(expected_lower_path),
-                   "%s/a%%7E1", mapped_parent.physical_leaf)
-        : -1;
     check(result == 0 && parent_mapped && mapped_parent.shortened &&
               report.collision_count == 1 && report.shortening_count == 1 &&
               report.unresolved_count == 0 && parent_entry != NULL &&
@@ -1660,13 +1807,8 @@ static void test_shortened_ancestor_keeps_descendant_identity(const char *base)
               strcmp(upper_entry->physical_leaf, "A") == 0 &&
               strcmp(upper_entry->collision_suffix, "") == 0 &&
               strcmp(lower_entry->physical_leaf, "a%7E1") == 0 &&
-              strcmp(lower_entry->collision_suffix, "%7E1") == 0 &&
-              upper_length >= 0 && lower_length >= 0 &&
-              (size_t)upper_length < sizeof(expected_upper_path) &&
-              (size_t)lower_length < sizeof(expected_lower_path) &&
-              strcmp(upper_entry->physical_path, expected_upper_path) == 0 &&
-              strcmp(lower_entry->physical_path, expected_lower_path) == 0,
-          "only the compatibility path inherits the shortened ancestor spelling");
+              strcmp(lower_entry->collision_suffix, "%7E1") == 0,
+          "descendant canonical leaves stay independent of the shortened ancestor spelling");
 
     portable_prescan_report_free(&report);
     portable_prescan_report_init(&report);
@@ -1830,7 +1972,7 @@ static void test_case_probe_group_growth(const char *base)
 
     int logical_seen[sizeof(names) / sizeof(names[0])] = {0};
     int logical_paths_valid = report.collision_plan.count == name_count;
-    int physical_paths_distinct = report.collision_plan.count == name_count;
+    int physical_leaves_distinct = report.collision_plan.count == name_count;
     for (size_t index = 0; index < report.collision_plan.count; index++) {
         const PortableCollisionPlanEntry *entry =
             &report.collision_plan.entries[index];
@@ -1844,13 +1986,13 @@ static void test_case_probe_group_growth(const char *base)
         else
             logical_seen[name_index] = 1;
 
-        if (entry->physical_path[0] == '\0')
-            physical_paths_distinct = 0;
+        if (entry->physical_leaf[0] == '\0')
+            physical_leaves_distinct = 0;
         for (size_t previous = 0; previous < index; previous++)
-            if (strcmp(entry->physical_path,
-                       report.collision_plan.entries[previous].physical_path) ==
+            if (strcmp(entry->physical_leaf,
+                       report.collision_plan.entries[previous].physical_leaf) ==
                 0)
-                physical_paths_distinct = 0;
+                physical_leaves_distinct = 0;
     }
     for (size_t index = 0; index < name_count; index++)
         if (!logical_seen[index])
@@ -1858,8 +2000,8 @@ static void test_case_probe_group_growth(const char *base)
 
     check(logical_paths_valid,
           "grown case-probe arrays preserve every logical path exactly once");
-    check(physical_paths_distinct,
-          "grown case-probe arrays assign distinct physical paths");
+    check(physical_leaves_distinct,
+          "grown case-probe arrays assign distinct physical leaves");
 
     portable_prescan_report_free(&report);
     close(container_fd);
@@ -1959,7 +2101,35 @@ static int prepare_collision_plan_capture(const char *source_path,
         return -1;
     context->case_sensitive = 0;
     context->collision_plan = &report->collision_plan;
+    context->current_source = &report->current_source;
     return 0;
+}
+
+static int capture_root_with_current_prescan(int container_fd,
+                                             PortableCaptureContext *context,
+                                             const PortableRootSpec *root)
+{
+    if (container_fd < 0 || context == NULL || root == NULL)
+        return -1;
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .roots = root,
+        .root_count = 1,
+        .nsec_exact = context->nsec_exact,
+        .case_sensitive = context->case_sensitive
+    };
+    PortablePrescanReport report;
+    portable_prescan_report_init(&report);
+    int result = portable_collision_plan_build(container_fd, &request, &report);
+    if (result == 0) {
+        context->collision_plan = &report.collision_plan;
+        context->current_source = &report.current_source;
+        result = portable_capture_root(context, root);
+        context->collision_plan = NULL;
+        context->current_source = NULL;
+    }
+    portable_prescan_report_free(&report);
+    return result;
 }
 
 static void test_capture_source_plan_mismatch(const char *base)
@@ -1989,6 +2159,35 @@ static void test_capture_source_plan_mismatch(const char *base)
             fixture_fatal("could not remove the planned collision member");
         check(portable_capture_root(&context, &root) != 0,
               "a planned collision member disappearing aborts capture");
+    }
+    portable_prescan_report_free(&report);
+    close_live_capture(container_fd, &log, &context);
+    remove_tree(source_path);
+    remove_tree(container_path);
+
+    join_path(source_path, sizeof(source_path), base,
+              "ordinary-mismatch-add");
+    join_path(container_path, sizeof(container_path), base,
+              "ordinary-mismatch-add-container");
+    static const char *const one_ordinary[] = { "plain" };
+    prepared = prepare_collision_plan_capture(
+        source_path, container_path, one_ordinary,
+        sizeof(one_ordinary) / sizeof(one_ordinary[0]), &container_fd, &log,
+        &context, &root, &report);
+    check(prepared == 0 && report.collision_plan.count == 0 &&
+              portable_current_source_contains(&report.current_source,
+                                               "CASE", "plain") == 1,
+          "an ordinary source is frozen in prepared membership without a plan entry");
+    if (prepared == 0) {
+        char added[PATH_MAX];
+        join_path(added, sizeof(added), source_path, "late");
+        write_file(added, "x", 1);
+        int capture_result = portable_capture_root(&context, &root);
+        struct stat st;
+        int late_absent = fstatat(context.data_fd, "CASE/late", &st,
+                                  AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT;
+        check(capture_result != 0 && late_absent,
+              "a new ordinary source child absent from prepared membership is rejected before that payload is created");
     }
     portable_prescan_report_free(&report);
     close_live_capture(container_fd, &log, &context);
@@ -2057,6 +2256,398 @@ static void test_capture_source_plan_mismatch(const char *base)
     }
     portable_prescan_report_free(&report);
     close_live_capture(container_fd, &log, &context);
+    remove_tree(source_path);
+    remove_tree(container_path);
+}
+
+static void test_prepared_missing_member_precedes_relocation(const char *base)
+{
+    printf(BLUE "::" NC
+           " prepared-source drift is checked before relocation mutation\n");
+    char source_path[PATH_MAX];
+    char container_path[PATH_MAX];
+    join_path(source_path, sizeof(source_path), base,
+              "prepared-drift-relocation-source");
+    join_path(container_path, sizeof(container_path), base,
+              "prepared-drift-relocation-container");
+    make_directory(source_path);
+    make_directory(container_path);
+
+    char upper[PATH_MAX];
+    char lower[PATH_MAX];
+    char plain[PATH_MAX];
+    join_path(upper, sizeof(upper), source_path, "Foo");
+    join_path(lower, sizeof(lower), source_path, "foo");
+    join_path(plain, sizeof(plain), source_path, "plain");
+    write_file(upper, "upper", 5);
+    write_file(lower, "lower", 5);
+    write_file(plain, "plain", 5);
+
+    int container_fd = open(container_path,
+                            O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open prepared-drift container");
+    PortableRootSpec root = root_spec("CASE", source_path, "CASE");
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .roots = &root,
+        .root_count = 1,
+        .nsec_exact = 1,
+        .case_sensitive = 1,
+        .has_source_identity = 1,
+        .machine_id = "0123456789abcdef",
+        .source_uid = getuid()
+    };
+    check(portable_capture_fresh_at(container_fd, &request, NULL) == 0,
+          "prepared-drift predecessor is captured before the plan changes");
+
+    request.case_sensitive = 0;
+    PortablePreparedCapture prepared;
+    int prepared_ok = portable_capture_prepare(container_fd, &request,
+                                                &prepared) == 0;
+    check(prepared_ok &&
+              portable_current_source_contains(&prepared.report.current_source,
+                                               "CASE", "plain") == 1 &&
+              portable_collision_plan_find(&prepared.report.collision_plan,
+                                            "CASE", "foo") != NULL,
+          "prepared resume freezes both ordinary membership and relocation state");
+    if (prepared_ok && unlink(plain) != 0)
+        fixture_fatal("could not remove prepared ordinary member");
+
+    int resume_result = prepared_ok
+        ? portable_capture_resume_prepared_at(container_fd, &request, &prepared,
+                                              NULL, NULL)
+        : -1;
+    struct stat st;
+    int old_lower = fstatat(container_fd, "data/CASE/foo", &st,
+                            AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(st.st_mode);
+    int relocated_absent = fstatat(container_fd, "data/CASE/foo%7E1", &st,
+                                   AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT;
+    int old_plain = fstatat(container_fd, "data/CASE/plain", &st,
+                            AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(st.st_mode);
+    SidecarLog log = {0};
+    int adopted = sidecar_log_adopt_at(container_fd, &log) ==
+                  SIDECAR_OPEN_RESUMABLE;
+    check(resume_result != 0 && old_lower && relocated_absent && old_plain &&
+              adopted && live_entry_identity(&log, "CASE", "foo", "foo", "") &&
+              live_entry_identity(&log, "CASE", "plain", "plain", ""),
+          "a missing prepared member aborts before relocation or stale cleanup mutates old state");
+    if (adopted && sidecar_log_close(&log) != SIDECAR_STATUS_OK)
+        fixture_fatal("could not close prepared-drift sidecar");
+    if (prepared_ok)
+        portable_prepared_capture_free(&prepared);
+    close(container_fd);
+    remove_tree(source_path);
+    remove_tree(container_path);
+}
+
+static void test_collision_resume_unplanning(const char *base)
+{
+    printf(BLUE "::" NC " resume returns a survivor to an unplanned leaf\n");
+    char source_path[PATH_MAX];
+    char container_path[PATH_MAX];
+    join_path(source_path, sizeof(source_path), base,
+              "collision-unplanning-source");
+    join_path(container_path, sizeof(container_path), base,
+              "collision-unplanning-container");
+    make_directory(source_path);
+    make_directory(container_path);
+
+    char upper[PATH_MAX];
+    char lower[PATH_MAX];
+    join_path(upper, sizeof(upper), source_path, "Foo");
+    join_path(lower, sizeof(lower), source_path, "foo");
+    write_file(upper, "upper", 5);
+    write_file(lower, "lower", 5);
+
+    int container_fd = open(container_path,
+                            O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open collision-unplanning container");
+    PortableRootSpec root = root_spec("CASE", source_path, "CASE");
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .roots = &root,
+        .root_count = 1,
+        .nsec_exact = 1,
+        .case_sensitive = 0,
+        .has_source_identity = 1,
+        .machine_id = "0123456789abcdef",
+        .source_uid = getuid()
+    };
+    PortablePrescanReport report;
+    portable_prescan_report_init(&report);
+    check(portable_capture_fresh_at(container_fd, &request, &report) == 0 &&
+              portable_collision_plan_find(&report.collision_plan,
+                                            "CASE", "foo") != NULL,
+          "collision survivor begins with a planned suffixed assignment");
+    portable_prescan_report_free(&report);
+    if (unlink(upper) != 0)
+        fixture_fatal("could not remove collision winner");
+
+    portable_prescan_report_init(&report);
+    int resumed = portable_capture_resume_at(container_fd, &request, &report);
+    struct stat st;
+    int ordinary_present = fstatat(container_fd, "data/CASE/foo", &st,
+                                   AT_SYMLINK_NOFOLLOW) == 0 &&
+                           S_ISREG(st.st_mode);
+    int old_suffix_absent = fstatat(container_fd, "data/CASE/foo%7E1", &st,
+                                    AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT;
+    SidecarLog log = {0};
+    int adopted = sidecar_log_adopt_at(container_fd, &log) ==
+                  SIDECAR_OPEN_RESUMABLE;
+    check(resumed == 0 &&
+              portable_current_source_contains(&report.current_source,
+                                               "CASE", "foo") == 1 &&
+              portable_collision_plan_find(&report.collision_plan,
+                                            "CASE", "foo") == NULL &&
+              ordinary_present && old_suffix_absent && adopted &&
+              live_entry_identity(&log, "CASE", "foo", "foo", ""),
+          "current membership keeps a planned-to-unplanned survivor live and relocates it back to its natural leaf");
+    if (adopted && sidecar_log_close(&log) != SIDECAR_STATUS_OK)
+        fixture_fatal("could not close collision-unplanning sidecar");
+    portable_prescan_report_free(&report);
+    close(container_fd);
+    remove_tree(source_path);
+    remove_tree(container_path);
+}
+
+static void test_suffix_induced_shortening_relocation(const char *base)
+{
+    printf(BLUE "::" NC " collision suffix growth relocates through shortening\n");
+    char source_path[PATH_MAX];
+    char container_path[PATH_MAX];
+    join_path(source_path, sizeof(source_path), base,
+              "suffix-shortening-relocation-source");
+    join_path(container_path, sizeof(container_path), base,
+              "suffix-shortening-relocation-container");
+    make_directory(source_path);
+    make_directory(container_path);
+
+    char upper[NAME_MAX + 1U];
+    char lower[NAME_MAX + 1U];
+    memset(upper, 'A', 252U);
+    memset(lower, 'a', 252U);
+    upper[252] = '\0';
+    lower[252] = '\0';
+    PortablePhysicalName unsuffixed;
+    PortablePhysicalName suffixed;
+    if (portable_physical_name_map(lower, 0, &unsuffixed) != 0 ||
+        portable_physical_name_map(lower, 1, &suffixed) != 0 ||
+        unsuffixed.shortened || !suffixed.shortened ||
+        strcmp(suffixed.collision_suffix, "%7E1") != 0)
+        fixture_fatal("could not prepare suffix-induced shortening mapping");
+
+    char lower_source[PATH_MAX];
+    char upper_source[PATH_MAX];
+    join_path(lower_source, sizeof(lower_source), source_path, lower);
+    join_path(upper_source, sizeof(upper_source), source_path, upper);
+    write_file(lower_source, "lower", 5);
+
+    int container_fd = open(container_path,
+                            O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open suffix-shortening relocation container");
+    PortableRootSpec root = root_spec("CASE", source_path, "CASE");
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .roots = &root,
+        .root_count = 1,
+        .nsec_exact = 1,
+        .case_sensitive = 1,
+        .has_source_identity = 1,
+        .machine_id = "0123456789abcdef",
+        .source_uid = getuid()
+    };
+    check(portable_capture_fresh_at(container_fd, &request, NULL) == 0,
+          "long predecessor is captured unsuffixed before the collision exists");
+    write_file(upper_source, "upper", 5);
+    request.case_sensitive = 0;
+
+    PortablePrescanReport report;
+    portable_prescan_report_init(&report);
+    int resumed = portable_capture_resume_at(container_fd, &request, &report);
+    const PortableCollisionPlanEntry *lower_plan =
+        portable_collision_plan_find(&report.collision_plan, "CASE", lower);
+    int root_fd = openat(container_fd, "data/CASE",
+                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    struct stat st;
+    int old_absent = root_fd >= 0 &&
+        fstatat(root_fd, unsuffixed.physical_leaf, &st,
+                AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT;
+    int new_present = root_fd >= 0 &&
+        fstatat(root_fd, suffixed.physical_leaf, &st,
+                AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(st.st_mode);
+    if (root_fd >= 0)
+        close(root_fd);
+    SidecarLog log = {0};
+    int adopted = sidecar_log_adopt_at(container_fd, &log) ==
+                  SIDECAR_OPEN_RESUMABLE;
+    check(resumed == 0 && lower_plan != NULL &&
+              strcmp(lower_plan->physical_leaf, suffixed.physical_leaf) == 0 &&
+              strcmp(lower_plan->collision_suffix, "%7E1") == 0 &&
+              old_absent && new_present && adopted &&
+              live_entry_identity(&log, "CASE", lower,
+                                  suffixed.physical_leaf, "%7E1"),
+          "suffix growth remaps, removes, and records the relocated shortened leaf exactly");
+    if (adopted && sidecar_log_close(&log) != SIDECAR_STATUS_OK)
+        fixture_fatal("could not close suffix-shortening relocation sidecar");
+    portable_prescan_report_free(&report);
+    close(container_fd);
+    remove_tree(source_path);
+    remove_tree(container_path);
+}
+
+static void test_ancestor_relocation_keeps_descendant_leaf(const char *base)
+{
+    printf(BLUE "::" NC
+           " ancestor relocation preserves descendant canonical leaf\n");
+    char source_path[PATH_MAX];
+    char container_path[PATH_MAX];
+    join_path(source_path, sizeof(source_path), base,
+              "ancestor-relocation-source");
+    join_path(container_path, sizeof(container_path), base,
+              "ancestor-relocation-container");
+    make_directory(source_path);
+    make_directory(container_path);
+
+    char lower_dir[PATH_MAX];
+    char lower_child[PATH_MAX];
+    char upper_dir[PATH_MAX];
+    join_path(lower_dir, sizeof(lower_dir), source_path, "dir");
+    join_path(lower_child, sizeof(lower_child), lower_dir, "child");
+    join_path(upper_dir, sizeof(upper_dir), source_path, "Dir");
+    make_directory(lower_dir);
+    write_file(lower_child, "child", 5);
+
+    int container_fd = open(container_path,
+                            O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open ancestor relocation container");
+    PortableRootSpec root = root_spec("CASE", source_path, "CASE");
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .roots = &root,
+        .root_count = 1,
+        .nsec_exact = 1,
+        .case_sensitive = 1,
+        .has_source_identity = 1,
+        .machine_id = "0123456789abcdef",
+        .source_uid = getuid()
+    };
+    check(portable_capture_fresh_at(container_fd, &request, NULL) == 0,
+          "nested predecessor is captured before its parent address changes");
+    make_directory(upper_dir);
+    request.case_sensitive = 0;
+    PortablePrescanReport report;
+    portable_prescan_report_init(&report);
+    int resumed = portable_capture_resume_at(container_fd, &request, &report);
+
+    int root_fd = openat(container_fd, "data/CASE",
+                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    struct stat st;
+    int old_parent_absent = root_fd >= 0 &&
+        fstatat(root_fd, "dir", &st, AT_SYMLINK_NOFOLLOW) != 0 &&
+        errno == ENOENT;
+    int moved_parent_fd = root_fd < 0 ? -1 : openat(
+        root_fd, "dir%7E1", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    int child_present = moved_parent_fd >= 0 &&
+        fstatat(moved_parent_fd, "child", &st, AT_SYMLINK_NOFOLLOW) == 0 &&
+        S_ISREG(st.st_mode);
+    if (moved_parent_fd >= 0)
+        close(moved_parent_fd);
+    if (root_fd >= 0)
+        close(root_fd);
+    SidecarLog log = {0};
+    int adopted = sidecar_log_adopt_at(container_fd, &log) ==
+                  SIDECAR_OPEN_RESUMABLE;
+    check(resumed == 0 && old_parent_absent && child_present && adopted &&
+              live_entry_identity(&log, "CASE", "dir", "dir%7E1", "%7E1") &&
+              live_entry_identity(&log, "CASE", "dir/child", "child", ""),
+          "ancestor address change cleans the old subtree while the descendant keeps its own leaf identity");
+    if (adopted && sidecar_log_close(&log) != SIDECAR_STATUS_OK)
+        fixture_fatal("could not close ancestor relocation sidecar");
+    portable_prescan_report_free(&report);
+    close(container_fd);
+    remove_tree(source_path);
+    remove_tree(container_path);
+}
+
+static void test_shortened_stale_source(const char *base)
+{
+    printf(BLUE "::" NC " absent shortened source is stale, not unplanned\n");
+    char source_path[PATH_MAX];
+    char container_path[PATH_MAX];
+    join_path(source_path, sizeof(source_path), base,
+              "shortened-stale-source");
+    join_path(container_path, sizeof(container_path), base,
+              "shortened-stale-container");
+    make_directory(source_path);
+    make_directory(container_path);
+
+    char logical[NAME_MAX + 1U];
+    memset(logical, ':', 100U);
+    logical[100] = '\0';
+    PortablePhysicalName mapped;
+    if (portable_physical_name_map(logical, 0, &mapped) != 0 ||
+        !mapped.shortened)
+        fixture_fatal("could not map shortened stale fixture");
+    char source_file[PATH_MAX];
+    join_path(source_file, sizeof(source_file), source_path, logical);
+    write_file(source_file, "stale", 5);
+
+    int container_fd = open(container_path,
+                            O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open shortened-stale container");
+    PortableRootSpec root = root_spec("SHORT", source_path, "SHORT");
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .roots = &root,
+        .root_count = 1,
+        .nsec_exact = 1,
+        .case_sensitive = 1,
+        .has_source_identity = 1,
+        .machine_id = "0123456789abcdef",
+        .source_uid = getuid()
+    };
+    check(portable_capture_fresh_at(container_fd, &request, NULL) == 0,
+          "shortened stale fixture is captured");
+    if (unlink(source_file) != 0)
+        fixture_fatal("could not remove shortened stale source");
+
+    PortablePrescanReport report;
+    portable_prescan_report_init(&report);
+    int resumed = portable_capture_resume_at(container_fd, &request, &report);
+    int member_absent = portable_current_source_contains(
+        &report.current_source, "SHORT", logical) == 0;
+    int plan_absent = portable_collision_plan_find(&report.collision_plan,
+                                                   "SHORT", logical) == NULL;
+    int root_fd = openat(container_fd, "data/SHORT",
+                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    struct stat st;
+    int payload_absent = root_fd >= 0 &&
+        fstatat(root_fd, mapped.physical_leaf, &st, AT_SYMLINK_NOFOLLOW) != 0 &&
+        errno == ENOENT;
+    if (root_fd >= 0)
+        close(root_fd);
+    SidecarLog log = {0};
+    SidecarLiveView deleted = {0};
+    int adopted = sidecar_log_adopt_at(container_fd, &log) ==
+                  SIDECAR_OPEN_RESUMABLE;
+    int live_absent = adopted &&
+        sidecar_log_find(&log, bytes("SHORT"), bytes(logical),
+                         &(SidecarLiveView){0}) == 0;
+    int tombstoned = adopted &&
+        sidecar_log_find_deleted(&log, bytes("SHORT"), bytes(logical),
+                                 &deleted) == 1;
+    check(resumed == 0 && member_absent && plan_absent && payload_absent &&
+              live_absent && tombstoned,
+          "an absent old shortened key is reconciled as stale without manufacturing a current unplanned assignment");
+    if (adopted && sidecar_log_close(&log) != SIDECAR_STATUS_OK)
+        fixture_fatal("could not close shortened-stale sidecar");
+    portable_prescan_report_free(&report);
+    close(container_fd);
     remove_tree(source_path);
     remove_tree(container_path);
 }
@@ -3037,7 +3628,6 @@ static void test_name_and_path_limits(const char *base)
     struct stat st;
     check(mapped && shortened.shortened && planned != NULL &&
               strcmp(planned->physical_leaf, shortened.physical_leaf) == 0 &&
-              strcmp(planned->physical_path, shortened.physical_leaf) == 0 &&
               strcmp(planned->collision_suffix, "") == 0 &&
               empty_capture_container(container_fd),
           "shortened NAME_MAX entry is planned under the canonical leaf without mutation");
@@ -3099,35 +3689,57 @@ static void test_name_and_path_limits(const char *base)
     portable_prescan_report_init(&report);
     int path_plan_result = portable_collision_plan_build(container_fd, &request,
                                                          &report);
-    check(path_plan_result == 0 && report.total_count == 1 &&
-              report.example_count == 1 && report.shortening_count == 0 &&
-              report.unresolved_count == 1 &&
-              report.examples[0].kind == PORTABLE_PRESCAN_PATH_TOO_LONG &&
-              strcmp(report.examples[0].root_id, "PATH") == 0 &&
-              strcmp(report.examples[0].logical_path, "child") == 0 &&
-              report.examples[0].limit == PATH_MAX &&
-              report.examples[0].actual == PATH_MAX + 5U &&
+    int path_limit_reported = 0;
+    for (size_t index = 0; index < report.example_count; index++)
+        if (report.examples[index].kind == PORTABLE_PRESCAN_PATH_TOO_LONG)
+            path_limit_reported = 1;
+    check(path_plan_result == 0 && report.unresolved_count == 0 &&
+              report.shortening_count == 0 && !path_limit_reported &&
               empty_capture_container(container_fd),
-          "canonical child mapping succeeds before the compatibility PATH_MAX handoff refuses it");
+          "cumulative physical depth is no longer a prescan PATH_MAX refusal");
     portable_prescan_report_free(&report);
 
     portable_prescan_report_init(&report);
-    check(portable_capture_fresh_at(container_fd, &request, &report) != 0 &&
-              report.total_count == 1 && report.example_count == 1 &&
-              report.shortening_count == 0 &&
-              report.examples[0].kind == PORTABLE_PRESCAN_PATH_TOO_LONG &&
-              strcmp(report.examples[0].root_id, "PATH") == 0 &&
-              strcmp(report.examples[0].logical_path, "child") == 0 &&
-              report.examples[0].limit == PATH_MAX &&
-              report.examples[0].actual == PATH_MAX + 5U,
-          "PATH_MAX remains an explicit compatibility-handoff refusal");
-    check(fstatat(container_fd, "manifest.txt", &st,
-                  AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT &&
-              fstatat(container_fd, "data", &st,
-                      AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT &&
-              fstatat(container_fd, SIDECAR_SLOT_NAME, &st,
-                      AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT,
-          "PATH_MAX refusal leaves the container namespace untouched");
+    int deep_capture = portable_capture_fresh_at(container_fd, &request, &report);
+    path_limit_reported = 0;
+    for (size_t index = 0; index < report.example_count; index++)
+        if (report.examples[index].kind == PORTABLE_PRESCAN_PATH_TOO_LONG)
+            path_limit_reported = 1;
+
+    int data_fd = openat(container_fd, "data",
+                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    int root_parent = -1;
+    char root_leaf[NAME_MAX + 1U];
+    int root_fd = -1;
+    int child_present = 0;
+    if (data_fd >= 0 &&
+        portable_open_relative_parent(data_fd, long_payload, &root_parent,
+                                      root_leaf, sizeof(root_leaf)) == 0) {
+        root_fd = openat(root_parent, root_leaf,
+                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        child_present = root_fd >= 0 &&
+                        fstatat(root_fd, "child", &st,
+                                AT_SYMLINK_NOFOLLOW) == 0 &&
+                        S_ISREG(st.st_mode);
+    }
+    if (root_fd >= 0)
+        close(root_fd);
+    if (root_parent >= 0)
+        close(root_parent);
+    if (data_fd >= 0)
+        close(data_fd);
+
+    live_log = (SidecarLog){0};
+    adopted = sidecar_log_adopt_at(container_fd, &live_log) ==
+              SIDECAR_OPEN_RESUMABLE;
+    check(deep_capture == 0 && report.unresolved_count == 0 &&
+              !path_limit_reported && child_present && adopted &&
+              live_entry_identity(&live_log, "PATH", "child", "child", "") &&
+              sidecar_log_claim_count(&live_log) == 0,
+          "fd-relative capture succeeds beyond cumulative physical PATH_MAX");
+    if (live_log.implementation != NULL &&
+        sidecar_log_close(&live_log) != SIDECAR_STATUS_OK)
+        fixture_fatal("could not close deep-path sidecar");
     portable_prescan_report_free(&report);
     close(container_fd);
     free(long_payload);
@@ -3462,10 +4074,13 @@ static void test_prescan_multiple_roots(const char *base)
     check(mapped && expected.shortened && planned_a != NULL && planned_b != NULL &&
               strcmp(planned_a->physical_leaf, expected.physical_leaf) == 0 &&
               strcmp(planned_b->physical_leaf, expected.physical_leaf) == 0 &&
-              strcmp(planned_a->physical_path, expected.physical_leaf) == 0 &&
-              strcmp(planned_b->physical_path, expected.physical_leaf) == 0 &&
               empty_capture_container(container_fd),
           "multi-root shortening plans stay root-specific without mutation");
+    check(portable_current_source_contains(&report.current_source,
+                                           "ROOT_A", oversized_name) == 1 &&
+              portable_current_source_contains(&report.current_source,
+                                               "ROOT_B", oversized_name) == 1,
+          "identical logical paths remain distinct prepared members across roots");
     portable_prescan_report_free(&report);
     close(container_fd);
     remove_tree(source_a);
@@ -4621,11 +5236,11 @@ static void test_replacement_and_type_change(const char *source,
     join_path(file, sizeof(file), source, "replace-me");
     write_file(file, "first", 5);
     PortableRootSpec root = root_spec("FILE", file, "FILE");
-    check(portable_capture_root(&context, &root) == 0,
+    check(capture_root_with_current_prescan(container_fd, &context, &root) == 0,
           "a new regular root can be appended to the live sidecar");
 
     write_file(file, "second", 6);
-    check(portable_capture_root(&context, &root) == 0,
+    check(capture_root_with_current_prescan(container_fd, &context, &root) == 0,
           "replacement captures the changed regular payload");
     char payload[PATH_MAX];
     join_path(payload, sizeof(payload), replacement_container, "data/FILE");
@@ -4653,7 +5268,7 @@ static void test_replacement_and_type_change(const char *source,
     char child[PATH_MAX];
     join_path(child, sizeof(child), file, "child");
     write_file(child, "child", 5);
-    check(portable_capture_root(&context, &root) == 0,
+    check(capture_root_with_current_prescan(container_fd, &context, &root) == 0,
           "regular-to-directory replacement succeeds");
     struct stat st;
     check(lstat(payload, &st) == 0 && S_ISDIR(st.st_mode),
@@ -4665,7 +5280,7 @@ static void test_replacement_and_type_change(const char *source,
     if (unlink(child) != 0 || rmdir(file) != 0)
         fixture_fatal("could not replace directory source with regular file");
     write_file(file, "final", 5);
-    check(portable_capture_root(&context, &root) == 0,
+    check(capture_root_with_current_prescan(container_fd, &context, &root) == 0,
           "directory-to-regular replacement succeeds");
     join_path(payload, sizeof(payload), replacement_container, "data/FILE");
     check(lstat(payload, &st) == 0 && S_ISREG(st.st_mode),
@@ -4678,7 +5293,7 @@ static void test_replacement_and_type_change(const char *source,
 
     if (unlink(file) != 0 || symlink("replacement-target", file) != 0)
         fixture_fatal("could not replace regular source with symlink");
-    check(portable_capture_root(&context, &root) == 0,
+    check(capture_root_with_current_prescan(container_fd, &context, &root) == 0,
           "regular-to-symlink replacement succeeds");
     join_path(payload, sizeof(payload), replacement_container, "data/FILE");
     check(lstat(payload, &st) == 0 && S_ISREG(st.st_mode) &&
@@ -4739,7 +5354,8 @@ static void test_unsupported_types(const char *source, const char *base_path)
     join_path(path, sizeof(path), source, "socket");
     write_file(path, "regular", 7);
     PortableRootSpec socket_root = root_spec("SOCKET", path, "SOCKET");
-    check(portable_capture_root(&context, &socket_root) == 0,
+    check(capture_root_with_current_prescan(container_fd, &context,
+                                            &socket_root) == 0,
           "regular special-file fixture is captured before replacement");
 
     if (unlink(path) != 0)
@@ -4764,7 +5380,8 @@ static void test_unsupported_types(const char *source, const char *base_path)
         fixture_fatal("could not bind socket fixture");
     }
 
-    check(portable_capture_root(&context, &socket_root) == 0,
+    check(capture_root_with_current_prescan(container_fd, &context,
+                                            &socket_root) == 0,
           "socket is warning-and-skip, not a blocking read");
     check(sidecar_log_find(&log, bytes("SOCKET"), bytes(""),
                            &(SidecarLiveView){0}) == 0,
@@ -4780,10 +5397,62 @@ static void test_unsupported_types(const char *source, const char *base_path)
     if (mkfifo(path, 0600) != 0)
         fixture_fatal("could not create FIFO fixture");
     PortableRootSpec fifo_root = root_spec("FIFO", path, "FIFO");
-    check(portable_capture_root(&context, &fifo_root) != 0,
+    check(capture_root_with_current_prescan(container_fd, &context,
+                                            &fifo_root) != 0,
           "FIFO is fail-closed without opening or blocking");
     unlink(path);
     close_live_capture(container_fd, &log, &context);
+}
+
+static void test_stale_live_root_reconciliation(const char *base_path)
+{
+    printf(BLUE "::" NC " stale live root reconciliation\n");
+
+    char source[PATH_MAX];
+    char child[PATH_MAX];
+    char container[PATH_MAX];
+    join_path(source, sizeof(source), base_path, "stale-live-source");
+    join_path(child, sizeof(child), source, "child");
+    join_path(container, sizeof(container), base_path,
+              "stale-live-container");
+    make_directory(source);
+    write_file(child, "child", 5);
+
+    int container_fd = -1;
+    SidecarLog log = {0};
+    PortableCaptureContext context = {0};
+    check(create_live_capture(container, &container_fd, &log, &context) == 0,
+          "stale-live fixture opens a fresh capture context");
+    if (container_fd < 0 || log.implementation == NULL)
+        goto cleanup_source;
+
+    PortableRootSpec root = root_spec("STALELIVE", source, "STALELIVE");
+    check(capture_root_with_current_prescan(container_fd, &context, &root) == 0,
+          "stale-live fixture captures a directory root and child");
+    int reset = visited_reset(context.visited);
+    int marked = reset == 0 ? visited_add(context.visited, root.id, "") : -1;
+    check(reset == 0 && marked == 0,
+          "stale-live fixture matches a fresh capture traversal state");
+    check(reset == 0 && marked == 0 &&
+              reconcile_stale_live(&context, &root, "") == 0,
+          "stale live root reconciliation removes the recorded subtree");
+    check(sidecar_log_find(&log, bytes("STALELIVE"), bytes(""),
+                           &(SidecarLiveView){0}) == 0 &&
+              sidecar_log_find(&log, bytes("STALELIVE"), bytes("child"),
+                               &(SidecarLiveView){0}) == 0,
+          "stale root reconciliation tombstones the root and descendant state");
+
+    char payload[PATH_MAX];
+    join_path(payload, sizeof(payload), container, "data/STALELIVE");
+    struct stat st;
+    check(lstat(payload, &st) != 0 && errno == ENOENT,
+          "stale root reconciliation removes the recorded payload subtree");
+
+    close_live_capture(container_fd, &log, &context);
+    remove_tree(container);
+
+cleanup_source:
+    remove_tree(source);
 }
 
 static void test_portable_special_file_non_ascii_name_in_directory(
@@ -4893,7 +5562,7 @@ static void test_fresh_stray_destination_is_refused(const char *base)
                sizeof("STRAY FOREIGN DATA") - 1U);
 
     PortableRootSpec root = root_spec("ROOT", source_path, "ROOT");
-    check(portable_capture_root(&context, &root) != 0,
+    check(capture_root_with_current_prescan(container_fd, &context, &root) != 0,
           "fresh capture refuses to overwrite an unexplained stray destination");
     check(file_equals(stray_path, "STRAY FOREIGN DATA"),
           "the foreign content survives untouched, not silently replaced");
@@ -4960,6 +5629,7 @@ int main(void)
     test_mixed_prescan_violations(root_path);
     test_collision_plan_suffix_length_violation(root_path);
     test_shortened_candidate_collision_determinism(root_path);
+    test_current_source_membership(root_path);
     test_prepared_shortening_plan_authority(root_path);
     test_raw_component_unsigned_tiebreak(root_path);
     test_shortened_suffix_reserves_natural_candidate(root_path);
@@ -4969,8 +5639,13 @@ int main(void)
     test_case_probe_group_growth(root_path);
     test_case_collision_directory_scope(root_path);
     test_capture_source_plan_mismatch(root_path);
+    test_prepared_missing_member_precedes_relocation(root_path);
     test_collision_resume(root_path);
+    test_collision_resume_unplanning(root_path);
+    test_suffix_induced_shortening_relocation(root_path);
+    test_ancestor_relocation_keeps_descendant_leaf(root_path);
     test_collision_resume_renumbering(root_path);
+    test_shortened_stale_source(root_path);
     test_collision_foreign_resume(root_path);
     test_case_probe(root_path);
     test_prescan_request_validates_malformed_input(root_path);
@@ -4989,6 +5664,7 @@ int main(void)
     test_portable_hardlinks_collision(root_path);
     test_capture_context_flags(root_path);
     test_replacement_and_type_change(source_path, root_path);
+    test_stale_live_root_reconciliation(root_path);
     test_unsupported_types(source_path, root_path);
     test_portable_special_file_non_ascii_name_in_directory(root_path);
     test_fresh_stray_destination_is_refused(root_path);
