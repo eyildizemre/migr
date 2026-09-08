@@ -3224,3 +3224,69 @@ letting the user replay it once VS Code is ready.
 **Rejected:** installing VS Code during restore; automatically replaying the
 extension list during restore; adding a dedicated include flag; prompting for
 consent before recording extension ids.
+
+---
+
+## D38 — 2026-09-08 — Elevated runs retain the invoking user's context
+
+**Status:** Decided — not yet implemented
+
+**Decision:** `migr` remains a single-user migration tool. An ordinary invocation
+targets the current user's environment. When `migr` is run through `sudo`, it
+targets the user who invoked `sudo`, not root, and never broadens itself to other
+accounts on the system.
+
+Privilege is requested only when an operation actually needs it. Ordinary backup
+and restore remain usable without root privileges. Operations that require access
+to privileged system state, such as `--include-network-config`, must fail before
+publishing a backup when the required files cannot be read and instruct the user
+to rerun the same command through `sudo`. `report` and `conf` do not require root.
+
+Under `sudo`, the target home directory must not be taken from the ambient `HOME`
+variable, because sudo policy may replace it with `/root`. The invoking identity is
+taken from `SUDO_UID`, and its home directory is resolved directly from
+`/etc/passwd`.
+
+The resolver must not use `getpwuid()` or `getpwnam()`. The bundled `migr-static`
+binary is linked with static glibc, and NSS-backed account lookup is not reliable in
+that environment. Parsing `/etc/passwd` directly gives the dynamic and static
+binaries one deterministic, NSS-independent path for ordinary local accounts.
+
+If `SUDO_UID` does not resolve to exactly one valid local passwd entry with an
+absolute home directory, `migr` must fail closed with a clear diagnostic. It must
+never fall back silently to `/root`, the elevated process's `HOME`, or another
+user's account.
+
+`XDG_CONFIG_HOME` remains environment-controlled. If it is present and absolute
+in the effective invocation environment, `migr` uses it as before. If it is absent,
+configuration falls back beneath the resolved target home at
+`$HOME/.config/migr/migr.conf`. Users who intentionally use a custom
+`XDG_CONFIG_HOME` and invoke `migr` through `sudo` are responsible for preserving
+that variable through sudo policy.
+
+There is no automatic enumeration of `/home`, no all-users mode, and no `--user`
+selection interface. Supporting another account, multiple accounts, or NSS-only
+identities would require a separate decision rather than expanding this behavior
+implicitly.
+
+**Why:** A privileged backup currently risks selecting `/root` when sudo rewrites
+`HOME`, producing a valid but silently incomplete backup of the wrong user. The
+privilege boundary and the user-selection boundary are separate concerns: root
+access may be needed to read system configuration, but that must not change whose
+personal data `migr` is backing up.
+
+This decision supersedes the elevated-context part of D34 that allowed changed
+`HOME` and configuration variables under sudo to select a different user context.
+It also resolves the D9 caveat by keeping account resolution out of libc NSS for
+the static binary.
+
+**Known caveats:**
+
+- Direct `/etc/passwd` lookup intentionally supports local passwd entries only.
+  Accounts provided exclusively through LDAP, SSSD, or another NSS backend are not
+  resolved by this mechanism and must be refused rather than guessed.
+- Preserving a custom `XDG_CONFIG_HOME` across sudo remains subject to the host's
+  sudo environment policy.
+- This decision does not introduce privilege separation or partial elevation
+  inside a running `migr` process; it only defines the identity and privilege
+  semantics of an elevated invocation.
