@@ -5201,16 +5201,14 @@ static void test_portable_hardlinks_collision(const char *base)
                                  &target_view) == 1 &&
                 sidecar_log_find(&log, bytes("CASE"), bytes("foo/alias"),
                                  &alias_view) == 1;
-    char target_leaf[NAME_MAX + 1U];
-    char alias_leaf[NAME_MAX + 1U];
     int leaves_ok = found &&
                     sidecar_bytes_match_text(parent_view.entry->physical_leaf,
-                                             "foo%7E1") &&
-                    sidecar_view_physical_leaf(&target_view, target_leaf,
-                                               sizeof(target_leaf)) == 0 &&
-                    sidecar_view_physical_leaf(&alias_view, alias_leaf,
-                                               sizeof(alias_leaf)) == 0;
-    check(leaves_ok && target_leaf[0] != '\0' && alias_leaf[0] != '\0',
+                                             "foo%7E1");
+    check(leaves_ok &&
+              sidecar_bytes_match_text(target_view.entry->physical_leaf,
+                                       "target") &&
+              sidecar_bytes_match_text(alias_view.entry->physical_leaf,
+                                       "alias"),
           "hardlink children retain leaf identity below the collided parent");
     check(found && ((target_view.entry->kind == SIDECAR_KIND_HARDLINK) !=
                    (alias_view.entry->kind == SIDECAR_KIND_HARDLINK)),
