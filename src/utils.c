@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <sys/resource.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "utils.h"
 
@@ -154,6 +155,7 @@ static int resolve_sudo_home(uid_t target_uid, const char *passwd_path,
 static int resolve_target_home_impl(const char *home_env,
                                     const char *sudo_uid_env,
                                     const char *passwd_path,
+                                    int running_as_root,
                                     char out[PATH_MAX])
 {
     if (out == NULL)
@@ -163,7 +165,7 @@ static int resolve_target_home_impl(const char *home_env,
     }
     out[0] = '\0';
 
-    if (sudo_uid_env == NULL)
+    if (!running_as_root || sudo_uid_env == NULL)
     {
         if (home_env == NULL || home_env[0] == '\0')
         {
@@ -197,16 +199,18 @@ static int resolve_target_home_impl(const char *home_env,
 int resolve_target_home(char out[PATH_MAX])
 {
     return resolve_target_home_impl(getenv("HOME"), getenv("SUDO_UID"),
-                                    "/etc/passwd", out);
+                                    "/etc/passwd", geteuid() == 0, out);
 }
 
 #ifdef USER_CONTEXT_TEST_HOOKS
 int resolve_target_home_for_test(const char *home_env,
                                  const char *sudo_uid_env,
                                  const char *passwd_path,
+                                 int running_as_root,
                                  char out[PATH_MAX])
 {
-    return resolve_target_home_impl(home_env, sudo_uid_env, passwd_path, out);
+    return resolve_target_home_impl(home_env, sudo_uid_env, passwd_path,
+                                    running_as_root, out);
 }
 #endif
 

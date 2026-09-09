@@ -14,9 +14,10 @@ extern int color_enabled; /**< Non-zero when status colors are enabled for stder
 /**
  * @brief Resolves the HOME of the user whose data this invocation targets.
  *
- * Ordinary runs use HOME. When SUDO_UID is present, the invoking user's local
- * passwd entry is resolved directly so sudo cannot silently redirect the
- * migration to root's home (docs/DECISIONS.md D38).
+ * Ordinary runs use HOME. When the process runs as root and SUDO_UID is
+ * present, the invoking user's local passwd entry is resolved directly so
+ * sudo cannot silently redirect the migration to root's home
+ * (docs/DECISIONS.md D38).
  */
 int resolve_target_home(char out[PATH_MAX]);
 
@@ -24,6 +25,7 @@ int resolve_target_home(char out[PATH_MAX]);
 int resolve_target_home_for_test(const char *home_env,
                                  const char *sudo_uid_env,
                                  const char *passwd_path,
+                                 int running_as_root,
                                  char out[PATH_MAX]);
 #endif
 

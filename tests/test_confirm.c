@@ -117,7 +117,8 @@ static void write_fixture(const char *path, const char *contents)
 }
 
 static int run_target_home(const char *home_env, const char *sudo_uid_env,
-                           const char *passwd_path, char home[PATH_MAX],
+                           const char *passwd_path, int running_as_root,
+                           char home[PATH_MAX],
                            char *diagnostic, size_t diagnostic_size)
 {
     int output_pipe[2];
@@ -138,7 +139,8 @@ static int run_target_home(const char *home_env, const char *sudo_uid_env,
     close(output_pipe[1]);
 
     int result = resolve_target_home_for_test(home_env, sudo_uid_env,
-                                              passwd_path, home);
+                                              passwd_path, running_as_root,
+                                              home);
     fflush(stderr);
 
     if (dup2(saved_stderr, STDERR_FILENO) < 0)
@@ -173,16 +175,16 @@ static void test_target_home_resolution(void)
     char home[PATH_MAX];
     char diagnostic[512];
 
-    check(run_target_home("/home/ordinary", NULL, passwd_path, home,
+    check(run_target_home("/home/ordinary", NULL, passwd_path, 0, home,
                           diagnostic, sizeof(diagnostic)) == 0 &&
               strcmp(home, "/home/ordinary") == 0,
           "ordinary invocation returns HOME unchanged");
 
-    check(run_target_home(NULL, NULL, passwd_path, home,
+    check(run_target_home(NULL, NULL, passwd_path, 0, home,
                           diagnostic, sizeof(diagnostic)) < 0 &&
               strstr(diagnostic, "HOME is not set or is empty") != NULL,
           "ordinary invocation rejects a missing HOME");
-    check(run_target_home("", NULL, passwd_path, home,
+    check(run_target_home("", NULL, passwd_path, 0, home,
                           diagnostic, sizeof(diagnostic)) < 0 &&
               strstr(diagnostic, "HOME is not set or is empty") != NULL,
           "ordinary invocation rejects an empty HOME");
@@ -190,25 +192,29 @@ static void test_target_home_resolution(void)
     char oversized_home[PATH_MAX + 1];
     memset(oversized_home, 'h', PATH_MAX);
     oversized_home[PATH_MAX] = '\0';
-    check(run_target_home(oversized_home, NULL, passwd_path, home,
+    check(run_target_home(oversized_home, NULL, passwd_path, 0, home,
                           diagnostic, sizeof(diagnostic)) < 0 &&
               strstr(diagnostic, "HOME path too long") != NULL,
           "ordinary invocation rejects HOME that cannot fit PATH_MAX");
 
     write_fixture(passwd_path,
                   "user:x:1000:1000::/home/invoker:/bin/sh\n");
-    check(run_target_home("/root", "1000", passwd_path, home,
+    check(run_target_home("/home/explicit", "1000", passwd_path, 0, home,
+                          diagnostic, sizeof(diagnostic)) == 0 &&
+              strcmp(home, "/home/explicit") == 0,
+          "non-root invocation ignores inherited SUDO_UID and keeps HOME");
+    check(run_target_home("/root", "1000", passwd_path, 1, home,
                           diagnostic, sizeof(diagnostic)) == 0 &&
               strcmp(home, "/home/invoker") == 0,
           "SUDO_UID ignores elevated HOME and selects the invoking user's home");
-    check(run_target_home(NULL, "1000", passwd_path, home,
+    check(run_target_home(NULL, "1000", passwd_path, 1, home,
                           diagnostic, sizeof(diagnostic)) == 0 &&
               strcmp(home, "/home/invoker") == 0,
           "SUDO_UID resolution does not require ambient HOME");
 
     write_fixture(passwd_path,
                   "user:x:001000:1000::/home/leading-zero:/bin/sh\n");
-    check(run_target_home("/root", "01000", passwd_path, home,
+    check(run_target_home("/root", "01000", passwd_path, 1, home,
                           diagnostic, sizeof(diagnostic)) == 0 &&
               strcmp(home, "/home/leading-zero") == 0,
           "SUDO_UID and passwd UID use the same decimal parser");
@@ -222,7 +228,7 @@ static void test_target_home_resolution(void)
         char label[128];
         snprintf(label, sizeof(label),
                  "malformed SUDO_UID case %zu fails without HOME fallback", i + 1);
-        check(run_target_home("/root", invalid_uids[i], passwd_path, home,
+        check(run_target_home("/root", invalid_uids[i], passwd_path, 1, home,
                               diagnostic, sizeof(diagnostic)) < 0 &&
                   home[0] == '\0' &&
                   strstr(diagnostic, "SUDO_UID is invalid") != NULL,
@@ -232,14 +238,14 @@ static void test_target_home_resolution(void)
     char rejected_uid[64];
     snprintf(rejected_uid, sizeof(rejected_uid), "%ju",
              (uintmax_t)(uid_t)-1);
-    check(run_target_home("/root", rejected_uid, passwd_path, home,
+    check(run_target_home("/root", rejected_uid, passwd_path, 1, home,
                           diagnostic, sizeof(diagnostic)) < 0 &&
               strstr(diagnostic, "SUDO_UID is invalid") != NULL,
           "the reserved uid_t -1 value is rejected");
 
     write_fixture(passwd_path,
                   "other:x:2000:2000::/home/other:/bin/sh\n");
-    check(run_target_home("/root", "1000", passwd_path, home,
+    check(run_target_home("/root", "1000", passwd_path, 1, home,
                           diagnostic, sizeof(diagnostic)) < 0 &&
               strstr(diagnostic, "does not match a local") != NULL,
           "missing local passwd UID fails closed");
@@ -247,27 +253,27 @@ static void test_target_home_resolution(void)
     write_fixture(passwd_path,
                   "first:x:1000:1000::/home/first:/bin/sh\n"
                   "second:x:1000:1000::/home/second:/bin/sh\n");
-    check(run_target_home("/root", "1000", passwd_path, home,
+    check(run_target_home("/root", "1000", passwd_path, 1, home,
                           diagnostic, sizeof(diagnostic)) < 0 &&
               strstr(diagnostic, "multiple local") != NULL,
           "duplicate local passwd UID is rejected as ambiguous");
 
     write_fixture(passwd_path, "user:x:1000\n");
-    check(run_target_home("/root", "1000", passwd_path, home,
+    check(run_target_home("/root", "1000", passwd_path, 1, home,
                           diagnostic, sizeof(diagnostic)) < 0 &&
               strstr(diagnostic, "malformed") != NULL,
           "matching malformed passwd record fails closed");
 
     write_fixture(passwd_path,
                   "user:x:1000:1000:::/bin/sh\n");
-    check(run_target_home("/root", "1000", passwd_path, home,
+    check(run_target_home("/root", "1000", passwd_path, 1, home,
                           diagnostic, sizeof(diagnostic)) < 0 &&
               strstr(diagnostic, "invalid home") != NULL,
           "matching passwd record with empty home is rejected");
 
     write_fixture(passwd_path,
                   "user:x:1000:1000::home/relative:/bin/sh\n");
-    check(run_target_home("/root", "1000", passwd_path, home,
+    check(run_target_home("/root", "1000", passwd_path, 1, home,
                           diagnostic, sizeof(diagnostic)) < 0 &&
               strstr(diagnostic, "invalid home") != NULL,
           "matching passwd record with relative home is rejected");
@@ -291,7 +297,7 @@ static void test_target_home_resolution(void)
     snprintf(record, record_size, "user:x:1000:1000::%s:/bin/sh\n",
              long_home);
     write_fixture(passwd_path, record);
-    check(run_target_home("/root", "1000", passwd_path, home,
+    check(run_target_home("/root", "1000", passwd_path, 1, home,
                           diagnostic, sizeof(diagnostic)) < 0 &&
               strstr(diagnostic, "invalid home") != NULL,
           "matching passwd record with PATH_MAX-overflowing home is rejected");
@@ -300,7 +306,7 @@ static void test_target_home_resolution(void)
 
     write_fixture(passwd_path,
                   "user:x:1000:1000::/home/Target User:/bin/sh\n");
-    check(run_target_home("/root", "1000", passwd_path, home,
+    check(run_target_home("/root", "1000", passwd_path, 1, home,
                           diagnostic, sizeof(diagnostic)) == 0 &&
               strcmp(home, "/home/Target User") == 0,
           "valid passwd home containing spaces is preserved exactly");
@@ -309,13 +315,13 @@ static void test_target_home_resolution(void)
                   "not even a passwd record\n"
                   "other:x:not-numeric:2000::/home/other:/bin/sh\n"
                   "user:x:1000:1000::/home/invoker:/bin/sh\n");
-    check(run_target_home("/root", "1000", passwd_path, home,
+    check(run_target_home("/root", "1000", passwd_path, 1, home,
                           diagnostic, sizeof(diagnostic)) == 0 &&
               strcmp(home, "/home/invoker") == 0,
           "unrelated malformed passwd records do not manufacture a match");
 
     unlink(passwd_path);
-    check(run_target_home("/root", "1000", passwd_path, home,
+    check(run_target_home("/root", "1000", passwd_path, 1, home,
                           diagnostic, sizeof(diagnostic)) < 0 &&
               strstr(diagnostic, "Could not read local passwd database") != NULL,
           "missing passwd database fails closed");
