@@ -389,12 +389,12 @@ static int run_case_alias_claim_fixture(const char *base, const char *label,
                      sidecar_log_claim_count(&log) == 0 &&
                      foo.entry->kind == SIDECAR_KIND_REGULAR &&
                      Foo.entry->kind == SIDECAR_KIND_REGULAR;
-        if (result && foo.entry->physical_path.length >= foo_physical_size)
+        if (result && foo.entry->physical_leaf.length >= foo_physical_size)
             result = 0;
         if (result) {
-            memcpy(foo_physical, foo.entry->physical_path.data,
-                   foo.entry->physical_path.length);
-            foo_physical[foo.entry->physical_path.length] = '\0';
+            memcpy(foo_physical, foo.entry->physical_leaf.data,
+                   foo.entry->physical_leaf.length);
+            foo_physical[foo.entry->physical_leaf.length] = '\0';
         }
         if (log.implementation != NULL &&
             sidecar_log_close(&log) != SIDECAR_STATUS_OK)
@@ -551,7 +551,7 @@ static int run_hardlink_representative_transition(
                      sidecar_log_claim_count(&log) == 0 &&
                      member_view.entry->kind == SIDECAR_KIND_REGULAR &&
                      alias_view.entry->kind == SIDECAR_KIND_REGULAR &&
-                     copy_resume_bytes(member_view.entry->physical_path,
+                     copy_resume_bytes(member_view.entry->physical_leaf,
                                        member_physical,
                                        member_physical_size) == 0;
         if (log.implementation != NULL &&

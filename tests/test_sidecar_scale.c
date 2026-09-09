@@ -113,7 +113,6 @@ static int deleted_view_matches(const SidecarLiveView *view,
     SidecarXattr expected = scale_xattr();
     return view != NULL && view->entry != NULL &&
            bytes_match_text(view->entry->physical_leaf, "deleted") &&
-           bytes_match_text(view->entry->physical_path, "deleted") &&
            view->entry->size == expected_size && view->xattr_count == 1 &&
            view->xattrs != NULL &&
            bytes_match_text(view->xattrs[0].name, "user.scale") &&
@@ -353,7 +352,6 @@ static void test_resurrection_and_used_count(int container_fd)
               sidecar_log_find(&log, replacement.root_id,
                                replacement.logical_path, &view) == 1 &&
               bytes_match_text(view.entry->physical_leaf, "resurrected") &&
-              bytes_match_text(view.entry->physical_path, "resurrected") &&
               sidecar_log_find_deleted(&log, replacement.root_id,
                                        replacement.logical_path, &view) == 0,
           "resurrection restores live state without growing used count");

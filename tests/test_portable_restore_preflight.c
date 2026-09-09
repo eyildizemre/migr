@@ -520,22 +520,6 @@ static void make_root_payload(Fixture *fixture)
         fatal("could not create root payload");
 }
 
-static int live_entry_has_empty_physical_cache(Fixture *fixture,
-                                               const char *logical)
-{
-    SidecarLog log = {0};
-    SidecarLiveView view = {0};
-    int result = sidecar_log_adopt_at(fixture->container_fd, &log) ==
-                     SIDECAR_OPEN_RESUMABLE &&
-                 sidecar_log_find(&log, text_bytes("ROOT"),
-                                  text_bytes(logical), &view) == 1 &&
-                 view.entry != NULL && view.entry->physical_path.length == 0;
-    if (log.implementation != NULL &&
-        sidecar_log_close(&log) != SIDECAR_STATUS_OK)
-        fatal("could not close adopted sidecar");
-    return result;
-}
-
 static void test_valid_and_profiles(void)
 {
     printf(BLUE "::" NC " valid preflight and ownership collection\n");
@@ -782,9 +766,6 @@ static void test_deep_physical_path_preflight(void)
           "deep fixture remains within the logical path ceiling");
     check(write_sidecar(&fixture, entries, DEPTH + 1U) == 0,
           "deep physical-path sidecar is committed");
-    check(live_entry_has_empty_physical_cache(&fixture,
-                                               logical[DEPTH - 1U]),
-          "deep live entry has no joined compatibility cache");
     write_file_at(fixture.home_fd, "sentinel", "untouched");
     char sentinel[PATH_MAX];
     fixture_path(sentinel, sizeof(sentinel), fixture.home, "/sentinel");

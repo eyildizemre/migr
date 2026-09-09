@@ -326,8 +326,6 @@ static void test_claim_replay_and_transitions(int container_fd)
               claim_view.claim->kind == SIDECAR_KIND_REGULAR &&
               claim_view.claim->physical_leaf.length == 4 &&
               memcmp(claim_view.claim->physical_leaf.data, "file", 4) == 0 &&
-              claim_view.claim->physical_path.length == 4 &&
-              memcmp(claim_view.claim->physical_path.data, "file", 4) == 0 &&
               sidecar_log_live_count(&log) == 0,
           "outstanding CLAIM is queryable but not live state");
     size_t live_seen = 0;
@@ -609,9 +607,8 @@ static void test_v4_parent_chain_and_leaf_identity(int container_fd)
                                  directory_claim.logical_path,
                                  &claim_view) == 1 &&
               claim_view.claim != NULL &&
-              bytes_match_text(claim_view.claim->physical_leaf, "directory") &&
-              bytes_match_text(claim_view.claim->physical_path, "directory"),
-          "CLAIM owns its leaf and derives its joined compatibility path");
+              bytes_match_text(claim_view.claim->physical_leaf, "directory"),
+          "CLAIM owns its physical leaf independently of caller memory");
 
     SidecarEntry directory_entry = entry_for(
         "ROOT", "dir", "directory", 0, 0);
@@ -629,10 +626,8 @@ static void test_v4_parent_chain_and_leaf_identity(int container_fd)
                                  file_claim.logical_path,
                                  &claim_view) == 1 &&
               claim_view.claim != NULL &&
-              bytes_match_text(claim_view.claim->physical_leaf, "file") &&
-              bytes_match_text(claim_view.claim->physical_path,
-                               "directory/file"),
-          "nested CLAIM derives its path from canonical ancestor state");
+              bytes_match_text(claim_view.claim->physical_leaf, "file"),
+          "nested CLAIM remains addressable through canonical parent state");
 
     char file_leaf[] = "file";
     SidecarEntry file_entry = entry_for(
@@ -646,10 +641,8 @@ static void test_v4_parent_chain_and_leaf_identity(int container_fd)
     check(sidecar_log_find(&log, file_entry.root_id, file_entry.logical_path,
                            &live_view) == 1 &&
               live_view.entry != NULL &&
-              bytes_match_text(live_view.entry->physical_leaf, "file") &&
-              bytes_match_text(live_view.entry->physical_path,
-                               "directory/file"),
-          "live ENTRY owns its leaf and derived path independently of caller memory");
+              bytes_match_text(live_view.entry->physical_leaf, "file"),
+          "live ENTRY owns its physical leaf independently of caller memory");
     check(sidecar_log_close(&log) == SIDECAR_STATUS_OK,
           "v4 parent-chain log closes before adoption");
 
@@ -657,10 +650,8 @@ static void test_v4_parent_chain_and_leaf_identity(int container_fd)
               sidecar_log_find(&log, file_entry.root_id,
                                file_entry.logical_path, &live_view) == 1 &&
               live_view.entry != NULL &&
-              bytes_match_text(live_view.entry->physical_leaf, "file") &&
-              bytes_match_text(live_view.entry->physical_path,
-                               "directory/file"),
-          "adoption rebuilds the nested v4 leaf identity and compatibility path");
+              bytes_match_text(live_view.entry->physical_leaf, "file"),
+          "adoption rebuilds the nested v4 leaf identity");
     check(sidecar_log_close(&log) == SIDECAR_STATUS_OK,
           "adopted v4 parent-chain log closes");
 
@@ -735,8 +726,8 @@ static void test_v4_parent_state_guards(int container_fd)
     SidecarClaimView view;
     check(sidecar_log_find_claim(&log, two.root_id, two.logical_path, &view) == 1 &&
               view.claim != NULL &&
-              bytes_match_text(view.claim->physical_path, "one/two"),
-          "outstanding parent chain derives the nested compatibility path");
+              bytes_match_text(view.claim->physical_leaf, "two"),
+          "outstanding parent chain retains the nested canonical leaf");
     check(sidecar_log_close(&log) == SIDECAR_STATUS_OK,
           "outstanding parent-chain fixture closes before adoption");
     check(sidecar_log_adopt_at(container_fd, &log) == SIDECAR_OPEN_RESUMABLE &&
@@ -744,8 +735,7 @@ static void test_v4_parent_state_guards(int container_fd)
               sidecar_log_find_claim(&log, two.root_id, two.logical_path,
                                      &view) == 1 &&
               view.claim != NULL &&
-              bytes_match_text(view.claim->physical_leaf, "two") &&
-              bytes_match_text(view.claim->physical_path, "one/two"),
+              bytes_match_text(view.claim->physical_leaf, "two"),
           "adoption preserves the three-level outstanding CLAIM chain");
     check(sidecar_log_close(&log) == SIDECAR_STATUS_OK,
           "adopted outstanding parent-chain fixture closes");
@@ -802,9 +792,8 @@ static void test_v4_cumulative_physical_path_limit(int container_fd)
               sidecar_log_find_claim(&log, deepest.root_id,
                                      deepest.logical_path, &view) == 1 &&
               view.claim != NULL &&
-              view.claim->physical_leaf.length == SIDECAR_MAX_PHYSICAL_LEAF &&
-              view.claim->physical_path.length == 0,
-          "joined path beyond SIDECAR_MAX_PATH leaves only the canonical leaf");
+              view.claim->physical_leaf.length == SIDECAR_MAX_PHYSICAL_LEAF,
+          "joined depth beyond SIDECAR_MAX_PATH remains valid canonical state");
     check(sidecar_log_close(&log) == SIDECAR_STATUS_OK,
           "long physical ancestry closes before adoption");
 
@@ -813,8 +802,7 @@ static void test_v4_cumulative_physical_path_limit(int container_fd)
               sidecar_log_find_claim(&log, deepest.root_id,
                                      deepest.logical_path, &view) == 1 &&
               view.claim != NULL &&
-              view.claim->physical_leaf.length == SIDECAR_MAX_PHYSICAL_LEAF &&
-              view.claim->physical_path.length == 0,
+              view.claim->physical_leaf.length == SIDECAR_MAX_PHYSICAL_LEAF,
           "adoption accepts canonical v4 ancestry beyond the old joined-path limit");
     check(sidecar_log_close(&log) == SIDECAR_STATUS_OK,
           "adopted long physical ancestry closes");

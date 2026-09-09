@@ -366,7 +366,6 @@ static int validate_entry(const SidecarEntry *entry)
         validate_bytes(entry->logical_path, SIDECAR_MAX_PATH, 0) != 0 ||
         !sidecar_physical_leaf_valid(entry->logical_path,
                                      entry->physical_leaf) ||
-        entry->physical_path.length != 0 ||
         validate_bytes(entry->collision_suffix,
                        SIDECAR_MAX_COLLISION_SUFFIX, 0) != 0 ||
         (entry->logical_path.length == 0 &&
@@ -464,7 +463,6 @@ static int validate_claim(const SidecarClaim *claim)
         validate_bytes(claim->logical_path, SIDECAR_MAX_PATH, 0) != 0 ||
         !sidecar_physical_leaf_valid(claim->logical_path,
                                      claim->physical_leaf) ||
-        claim->physical_path.length != 0 ||
         !sidecar_claim_kind_valid(claim->kind))
     {
         set_invalid_error();
@@ -902,7 +900,6 @@ static void free_entry(SidecarReader *reader, SidecarEntry *entry)
     reader_free(reader, (void *)entry->root_id.data);
     reader_free(reader, (void *)entry->logical_path.data);
     reader_free(reader, (void *)entry->physical_leaf.data);
-    reader_free(reader, (void *)entry->physical_path.data);
     reader_free(reader, (void *)entry->collision_suffix.data);
     reader_free(reader, (void *)entry->symlink_target.data);
     reader_free(reader, (void *)entry->hardlink_root_id.data);
@@ -1155,7 +1152,6 @@ static void free_claim(SidecarReader *reader, SidecarClaim *claim)
     reader_free(reader, (void *)claim->root_id.data);
     reader_free(reader, (void *)claim->logical_path.data);
     reader_free(reader, (void *)claim->physical_leaf.data);
-    reader_free(reader, (void *)claim->physical_path.data);
     memset(claim, 0, sizeof(*claim));
 }
 

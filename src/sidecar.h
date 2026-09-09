@@ -72,7 +72,6 @@ typedef struct {
     SidecarBytes root_id;
     SidecarBytes logical_path;
     SidecarBytes physical_leaf;
-    SidecarBytes physical_path; /* Derived runtime-only compatibility cache. */
     SidecarBytes collision_suffix;
     SidecarObjectKind kind;
     uint32_t mode;
@@ -103,7 +102,6 @@ typedef struct {
     SidecarBytes root_id;
     SidecarBytes logical_path;
     SidecarBytes physical_leaf;
-    SidecarBytes physical_path; /* Derived runtime-only compatibility cache. */
     SidecarObjectKind kind;
 } SidecarClaim;
 

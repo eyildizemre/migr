@@ -246,8 +246,7 @@ static int roundtrip_callback(const SidecarRecord *record, void *context)
             entry->root_id.length != 4 ||
             memcmp(entry->root_id.data, "ROOT", 4) != 0 ||
             entry->physical_leaf.length != 4 ||
-            memcmp(entry->physical_leaf.data, "file", 4) != 0 ||
-            entry->physical_path.length != 0)
+            memcmp(entry->physical_leaf.data, "file", 4) != 0)
             state->valid = 0;
     }
     else if (record->type == SIDECAR_RECORD_XATTR)
@@ -282,7 +281,6 @@ static int roundtrip_callback(const SidecarRecord *record, void *context)
             memcmp(claim->logical_path.data, "dir/file", 8) != 0 ||
             claim->physical_leaf.length != 4 ||
             memcmp(claim->physical_leaf.data, "file", 4) != 0 ||
-            claim->physical_path.length != 0 ||
             claim->kind != SIDECAR_KIND_REGULAR)
             state->valid = 0;
     }
@@ -577,17 +575,6 @@ static void test_physical_leaf_contract(int fd)
     errno = 0;
     check(sidecar_write_claim(fd, &claim) != 0 && errno == EINVAL,
           "non-root CLAIM refuses an empty physical leaf");
-
-    entry = sample_entry();
-    entry.physical_path = (SidecarBytes){ (const unsigned char *)"stale", 5 };
-    errno = 0;
-    check(sidecar_write_entry(fd, &entry) != 0 && errno == EINVAL,
-          "ENTRY writer refuses a caller-supplied runtime physical path");
-    claim.physical_leaf = (SidecarBytes){ (const unsigned char *)"file", 4 };
-    claim.physical_path = (SidecarBytes){ (const unsigned char *)"stale", 5 };
-    errno = 0;
-    check(sidecar_write_claim(fd, &claim) != 0 && errno == EINVAL,
-          "CLAIM writer refuses a caller-supplied runtime physical path");
 
     unsigned char *leaf = malloc(SIDECAR_MAX_PHYSICAL_LEAF + 1U);
     check(leaf != NULL, "reader physical-leaf ceiling fixture allocates");

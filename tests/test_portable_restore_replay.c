@@ -79,22 +79,6 @@ static void fatal(const char *message)
     exit(2);
 }
 
-static void test_payload_path_fits_boundary(void)
-{
-    check(portable_payload_path_fits(5U, 0U, 6U),
-          "payload root plus NUL exactly fits");
-    check(!portable_payload_path_fits(5U, 0U, 5U),
-          "payload root cannot consume the full capacity");
-    check(!portable_payload_path_fits(5U, 4U, 10U),
-          "payload path rejects the former off-by-one boundary");
-    check(portable_payload_path_fits(5U, 3U, 10U),
-          "payload path accepts an exact root slash physical NUL fit");
-    check(!portable_payload_path_fits(0U, 1U, 10U),
-          "payload path rejects an empty root");
-    check(!portable_payload_path_fits(10U, 0U, 10U),
-          "payload path rejects a root at capacity");
-}
-
 static int remove_callback(const char *path, const struct stat *st,
                            int type, struct FTW *state)
 {
@@ -126,6 +110,40 @@ static void remove_tree(const char *path)
     if (nftw(path, chmod_directory_callback, 16, FTW_PHYS) != 0 ||
         nftw(path, remove_callback, 16, FTW_DEPTH | FTW_PHYS) != 0)
         fatal("could not remove fixture tree");
+}
+
+static void remove_deep_chain_at(int anchor_fd, const char *root_leaf,
+                                 const char *component, size_t depth,
+                                 const char *file_leaf, int *fds,
+                                 size_t fd_count)
+{
+    if (depth == 0 || fd_count < depth + 1U)
+        fatal("invalid deep fixture cleanup shape");
+
+    fds[0] = openat(anchor_fd, root_leaf,
+                    O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fds[0] < 0)
+        fatal("could not open deep fixture cleanup root");
+    for (size_t index = 0; index < depth; index++)
+    {
+        fds[index + 1U] = openat(fds[index], component,
+                                 O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                                     O_CLOEXEC);
+        if (fds[index + 1U] < 0)
+            fatal("could not descend through deep fixture cleanup chain");
+    }
+
+    if (unlinkat(fds[depth], file_leaf, 0) != 0)
+        fatal("could not remove deep fixture payload file");
+    for (size_t index = depth; index > 0; index--)
+    {
+        if (close(fds[index]) != 0 ||
+            unlinkat(fds[index - 1U], component, AT_REMOVEDIR) != 0)
+            fatal("could not remove deep fixture directory");
+    }
+    if (close(fds[0]) != 0 ||
+        unlinkat(anchor_fd, root_leaf, AT_REMOVEDIR) != 0)
+        fatal("could not remove deep fixture cleanup root");
 }
 
 static int write_proc_file(const char *path, const char *content)
@@ -431,22 +449,6 @@ static int write_sidecar(Fixture *fixture, const SidecarEntry *entries,
         sidecar_log_close(&log) != SIDECAR_STATUS_OK)
         return -1;
     return 0;
-}
-
-static int live_entry_has_empty_physical_cache(Fixture *fixture,
-                                               const char *logical)
-{
-    SidecarLog log = {0};
-    SidecarLiveView view = {0};
-    int result = sidecar_log_adopt_at(fixture->container_fd, &log) ==
-                     SIDECAR_OPEN_RESUMABLE &&
-                 sidecar_log_find(&log, text_bytes("ROOT"),
-                                  text_bytes(logical), &view) == 1 &&
-                 view.entry != NULL && view.entry->physical_path.length == 0;
-    if (log.implementation != NULL &&
-        sidecar_log_close(&log) != SIDECAR_STATUS_OK)
-        fatal("could not close adopted sidecar");
-    return result;
 }
 
 static int write_raw_entries_sidecar(Fixture *fixture,
@@ -1106,9 +1108,9 @@ static void test_shortened_leaf_replay(void)
     }
 }
 
-static void test_deep_cache_unavailable_replay(void)
+static void test_deep_parent_relative_replay(void)
 {
-    printf(BLUE "::" NC " deep compatibility-cache replay refusal\n");
+    printf(BLUE "::" NC " deep parent-relative payload replay\n");
     enum { DEPTH = 17, COMPONENT_LENGTH = 100 };
     char component[COMPONENT_LENGTH + 1U];
     memset(component, '!', COMPONENT_LENGTH);
@@ -1123,11 +1125,16 @@ static void test_deep_cache_unavailable_replay(void)
     ManifestRoot root = root_for();
     Fixture fixture;
     int opened = fixture_open(&fixture, &root);
-    check(opened == 0, "deep cache-unavailable replay fixture is created");
+    check(opened == 0, "deep parent-relative replay fixture is created");
     if (opened != 0)
         return;
     make_dir_at(fixture.data_fd, "ROOT", 0700);
-    SidecarEntry entries[DEPTH + 1U];
+    int payload_parent = openat(fixture.data_fd, "ROOT",
+                                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (payload_parent < 0)
+        fatal("could not open deep replay payload root");
+
+    SidecarEntry entries[DEPTH + 2U];
     entries[0] = entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
                            1700000000, 0, 1700000001, 0);
     char logical[DEPTH][SIDECAR_MAX_PATH + 1U];
@@ -1148,25 +1155,58 @@ static void test_deep_cache_unavailable_replay(void)
             SIDECAR_KIND_DIRECTORY, 0, 0700,
             1700000002 + (int64_t)index * 2, 0,
             1700000003 + (int64_t)index * 2, 0);
+        if (mkdirat(payload_parent, mapped.physical_leaf, 0700) != 0)
+            fatal("could not create deep replay payload directory");
+        int next = openat(payload_parent, mapped.physical_leaf,
+                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (next < 0 || close(payload_parent) != 0)
+            fatal("could not descend through deep replay payload");
+        payload_parent = next;
     }
     check(logical_length < SIDECAR_MAX_PATH,
           "deep replay fixture remains within the logical path ceiling");
-    check(write_sidecar(&fixture, entries, DEPTH + 1U, NULL, NULL) == 0,
-          "deep cache-unavailable replay sidecar is committed");
-    check(live_entry_has_empty_physical_cache(&fixture,
-                                               logical[DEPTH - 1U]),
-          "deep replay state has an unavailable non-root compatibility cache");
+    static const char payload_text[] = "deep-payload";
+    write_file_at(payload_parent, "payload.txt", payload_text);
+    if (close(payload_parent) != 0)
+        fatal("could not close deep replay payload parent");
+
+    char file_logical[SIDECAR_MAX_PATH + 1U];
+    int file_logical_length = snprintf(file_logical, sizeof(file_logical),
+                                       "%s/payload.txt", logical[DEPTH - 1U]);
+    if (file_logical_length < 0 ||
+        (size_t)file_logical_length >= sizeof(file_logical))
+        fatal("deep replay file logical path is too long");
+    entries[DEPTH + 1U] = entry_for(
+        "ROOT", file_logical, "payload.txt", SIDECAR_KIND_REGULAR,
+        sizeof(payload_text) - 1U, 0600,
+        1700000100, 0, 1700000101, 0);
+    check(write_sidecar(&fixture, entries, DEPTH + 2U, NULL, NULL) == 0,
+          "deep parent-relative replay sidecar is committed");
     write_file_at(fixture.home_fd, "sentinel", "untouched");
     PortableRestoreReplayReport report;
     int result = run_replay(&fixture, &report);
     char sentinel[PATH_MAX];
     path_join(sentinel, sizeof(sentinel), fixture.home, "/sentinel");
     char restored[PATH_MAX];
-    path_join(restored, sizeof(restored), fixture.home, "/restored");
-    check(result != 0 && report.failed_count == 1 &&
-              file_equals_noatime(sentinel, "untouched") &&
-              access(restored, F_OK) != 0,
-          "deep unavailable cache is refused before any replay mutation");
+    int restored_length = snprintf(restored, sizeof(restored), "%s/restored/%s",
+                                   fixture.home, file_logical);
+    check(restored_length > 0 && (size_t)restored_length < sizeof(restored) &&
+              result == 0 && report.failed_count == 0 &&
+              report.live_count == DEPTH + 2U &&
+              report.applied_count == DEPTH + 2U &&
+              file_equals_noatime(restored, payload_text) &&
+              file_equals_noatime(sentinel, "untouched"),
+          "deep physical ancestry replays exact bytes under the logical path");
+
+    /* The source physical chain intentionally exceeds PATH_MAX, so clean both
+     * deep chains by descriptor before the fixture's path-based teardown. */
+    int cleanup_fds[DEPTH + 1U];
+    remove_deep_chain_at(fixture.data_fd, "ROOT", mapped.physical_leaf, DEPTH,
+                         "payload.txt", cleanup_fds,
+                         sizeof(cleanup_fds) / sizeof(cleanup_fds[0]));
+    remove_deep_chain_at(fixture.home_fd, "restored", component, DEPTH,
+                         "payload.txt", cleanup_fds,
+                         sizeof(cleanup_fds) / sizeof(cleanup_fds[0]));
     fixture_close(&fixture);
 }
 
@@ -2450,12 +2490,11 @@ static void test_copy_bytes_rejects_corruption(void)
 
 int main(void)
 {
-    test_payload_path_fits_boundary();
     test_symlink_collection_validation();
     test_hardlink_identity_validation();
     test_physical_logical_mismatch();
     test_shortened_leaf_replay();
-    test_deep_cache_unavailable_replay();
+    test_deep_parent_relative_replay();
     test_collision_suffix_validation();
     test_normal_replay();
     test_destination_truncation();

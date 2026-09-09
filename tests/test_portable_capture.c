@@ -315,14 +315,14 @@ static int sidecar_bytes_match_text(SidecarBytes value, const char *text)
            (length == 0 || memcmp(value.data, text, length) == 0);
 }
 
-static int live_entry_paths(SidecarLog *log, const char *root,
-                            const char *logical, const char *physical)
+static int live_entry_leaf(SidecarLog *log, const char *root,
+                           const char *logical, const char *physical_leaf)
 {
     SidecarLiveView view;
     int found = sidecar_log_find(log, bytes(root), bytes(logical), &view);
     return found == 1 &&
            sidecar_bytes_match_text(view.entry->logical_path, logical) &&
-           sidecar_bytes_match_text(view.entry->physical_path, physical);
+           sidecar_bytes_match_text(view.entry->physical_leaf, physical_leaf);
 }
 
 static int live_entry_identity(SidecarLog *log, const char *root,
@@ -2713,11 +2713,11 @@ static void test_collision_resume(const char *base)
     int found = opened &&
         sidecar_log_find(&log, bytes("CASE"), bytes("Foo"), &upper_view) == 1 &&
         sidecar_log_find(&log, bytes("CASE"), bytes("foo"), &lower_view) == 1;
-    check(found && sidecar_bytes_match_text(upper_view.entry->physical_path,
+    check(found && sidecar_bytes_match_text(upper_view.entry->physical_leaf,
                                             "Foo") &&
               sidecar_bytes_match_text(upper_view.entry->collision_suffix,
                                        "") &&
-              sidecar_bytes_match_text(lower_view.entry->physical_path,
+              sidecar_bytes_match_text(lower_view.entry->physical_leaf,
                                        "foo%7E1") &&
               sidecar_bytes_match_text(lower_view.entry->collision_suffix,
                                        "%7E1"),
@@ -2939,9 +2939,9 @@ static void test_collision_resume_renumbering(const char *base)
     int found = opened &&
         sidecar_log_find(&log, bytes("CASE"), bytes(winner), &upper_view) == 1 &&
         sidecar_log_find(&log, bytes("CASE"), bytes(loser), &lower_view) == 1;
-    check(found && sidecar_bytes_match_text(upper_view.entry->physical_path,
+    check(found && sidecar_bytes_match_text(upper_view.entry->physical_leaf,
                                             winner) &&
-              sidecar_bytes_match_text(lower_view.entry->physical_path,
+              sidecar_bytes_match_text(lower_view.entry->physical_leaf,
                                        expected_loser),
           "resume records both the winner and the renumbered physical path");
     if (opened)
@@ -3479,11 +3479,11 @@ static void test_encoded_payload_names(const char *base)
     if (adopted) {
         for (size_t index = 0; index < sizeof(names) / sizeof(names[0]);
              index++)
-            check(live_entry_paths(&log, "NAMES", names[index].logical,
-                                   names[index].physical),
-                  "sidecar preserves logical and physical name paths");
-        check(live_entry_paths(&log, "NAMES", invalid_name, invalid_physical),
-              "sidecar preserves an invalid-byte logical name separately");
+            check(live_entry_leaf(&log, "NAMES", names[index].logical,
+                                  names[index].physical),
+                  "sidecar preserves each logical name and physical leaf");
+        check(live_entry_leaf(&log, "NAMES", invalid_name, invalid_physical),
+              "sidecar preserves an invalid-byte logical name and physical leaf");
         check(sidecar_log_close(&log) == SIDECAR_STATUS_OK,
               "encoded-name sidecar closes cleanly");
     }
@@ -3554,19 +3554,19 @@ static void test_nested_encoded_directories(const char *base)
                   SIDECAR_OPEN_RESUMABLE;
     check(adopted, "nested encoded sidecar can be reopened");
     if (adopted) {
-        check(live_entry_paths(&log, "NESTED", "weird?dir",
-                               "weird%3Fdir"),
-              "first directory keeps logical and physical paths");
-        check(live_entry_paths(&log, "NESTED", "weird?dir/inner.txt",
-                               "weird%3Fdir/inner.txt"),
-              "first nested file keeps logical and physical paths");
-        check(live_entry_paths(&log, "NESTED", "weird?dir/また:dir",
-                               "weird%3Fdir/また%3Adir"),
-              "second directory keeps logical and physical paths");
-        check(live_entry_paths(&log, "NESTED",
-                               "weird?dir/また:dir/deep.txt",
-                               "weird%3Fdir/また%3Adir/deep.txt"),
-              "second nested file keeps logical and physical paths");
+        check(live_entry_leaf(&log, "NESTED", "weird?dir",
+                              "weird%3Fdir"),
+              "first directory keeps its logical path and physical leaf");
+        check(live_entry_leaf(&log, "NESTED", "weird?dir/inner.txt",
+                              "inner.txt"),
+              "first nested file keeps its immediate physical leaf");
+        check(live_entry_leaf(&log, "NESTED", "weird?dir/また:dir",
+                              "また%3Adir"),
+              "second directory keeps its immediate physical leaf");
+        check(live_entry_leaf(&log, "NESTED",
+                              "weird?dir/また:dir/deep.txt",
+                              "deep.txt"),
+              "second nested file keeps its immediate physical leaf");
         check(sidecar_log_close(&log) == SIDECAR_STATUS_OK,
               "nested encoded sidecar closes cleanly");
     }
@@ -4531,17 +4531,17 @@ static void test_fresh_capture(const char *source, int container_fd,
         close(slot_fd);
 }
 
-static int sidecar_view_physical_path(const SidecarLiveView *view,
-                                      char *path, size_t path_size)
+static int sidecar_view_physical_leaf(const SidecarLiveView *view,
+                                      char *leaf, size_t leaf_size)
 {
-    if (view == NULL || view->entry == NULL || path == NULL || path_size == 0 ||
-        view->entry->physical_path.length >= path_size ||
-        (view->entry->physical_path.length != 0 &&
-         view->entry->physical_path.data == NULL))
+    if (view == NULL || view->entry == NULL || leaf == NULL || leaf_size == 0 ||
+        view->entry->physical_leaf.length >= leaf_size ||
+        (view->entry->physical_leaf.length != 0 &&
+         view->entry->physical_leaf.data == NULL))
         return -1;
-    memcpy(path, view->entry->physical_path.data,
-           view->entry->physical_path.length);
-    path[view->entry->physical_path.length] = '\0';
+    memcpy(leaf, view->entry->physical_leaf.data,
+           view->entry->physical_leaf.length);
+    leaf[view->entry->physical_leaf.length] = '\0';
     return 0;
 }
 
@@ -4670,24 +4670,24 @@ static void test_portable_hardlinks(const char *base)
                                   representative->xattr_count >= 1),
               "only the representative carries the shared xattr");
 
-        char representative_path[PATH_MAX];
-        char hardlink_path[PATH_MAX];
-        int representative_path_ok =
-            sidecar_view_physical_path(representative, representative_path,
-                                       sizeof(representative_path)) == 0;
-        int hardlink_path_ok =
-            sidecar_view_physical_path(hardlink, hardlink_path,
-                                       sizeof(hardlink_path)) == 0;
+        char representative_leaf[NAME_MAX + 1U];
+        char hardlink_leaf[NAME_MAX + 1U];
+        int representative_leaf_ok =
+            sidecar_view_physical_leaf(representative, representative_leaf,
+                                       sizeof(representative_leaf)) == 0;
+        int hardlink_leaf_ok =
+            sidecar_view_physical_leaf(hardlink, hardlink_leaf,
+                                       sizeof(hardlink_leaf)) == 0;
         char data_root[PATH_MAX];
         join_path(data_root, sizeof(data_root), container, "data/HL");
         char payload[PATH_MAX];
         struct stat hardlink_stat = {0};
         int representative_payload = 0;
         int hardlink_payload = 0;
-        if (representative_path_ok && hardlink_path_ok) {
-            join_path(payload, sizeof(payload), data_root, representative_path);
+        if (representative_leaf_ok && hardlink_leaf_ok) {
+            join_path(payload, sizeof(payload), data_root, representative_leaf);
             representative_payload = file_equals(payload, "hardlink-content");
-            join_path(payload, sizeof(payload), data_root, hardlink_path);
+            join_path(payload, sizeof(payload), data_root, hardlink_leaf);
             hardlink_payload = lstat(payload, &hardlink_stat) == 0 &&
                                S_ISREG(hardlink_stat.st_mode) &&
                                hardlink_stat.st_size == 0;
@@ -4706,9 +4706,9 @@ static void test_portable_hardlinks(const char *base)
               "fresh hardlink capture leaves no outstanding claims");
 
         struct stat representative_before = {0};
-        int representative_stat_ok = representative_path_ok;
+        int representative_stat_ok = representative_leaf_ok;
         if (representative_stat_ok) {
-            join_path(payload, sizeof(payload), data_root, representative_path);
+            join_path(payload, sizeof(payload), data_root, representative_leaf);
             representative_stat_ok = stat(payload, &representative_before) == 0;
         }
         sidecar_log_close(&log);
@@ -4737,7 +4737,7 @@ static void test_portable_hardlinks(const char *base)
                   claim_absent(&log, "HL", "single"),
               "unchanged hardlink resume writes no outstanding claims");
         if (representative_stat_ok) {
-            join_path(payload, sizeof(payload), data_root, representative_path);
+            join_path(payload, sizeof(payload), data_root, representative_leaf);
             struct stat representative_after = {0};
             check(stat(payload, &representative_after) == 0 &&
                       representative_after.st_ino == representative_before.st_ino &&
@@ -5193,21 +5193,25 @@ static void test_portable_hardlinks_collision(const char *base)
     SidecarOpenStatus status = sidecar_log_adopt_at(container_fd, &log);
     SidecarLiveView target_view = {0};
     SidecarLiveView alias_view = {0};
+    SidecarLiveView parent_view = {0};
     int found = status == SIDECAR_OPEN_RESUMABLE &&
+                sidecar_log_find(&log, bytes("CASE"), bytes("foo"),
+                                 &parent_view) == 1 &&
                 sidecar_log_find(&log, bytes("CASE"), bytes("foo/target"),
                                  &target_view) == 1 &&
                 sidecar_log_find(&log, bytes("CASE"), bytes("foo/alias"),
                                  &alias_view) == 1;
-    char target_physical[PATH_MAX];
-    char alias_physical[PATH_MAX];
-    int paths_ok = found &&
-                   sidecar_view_physical_path(&target_view, target_physical,
-                                              sizeof(target_physical)) == 0 &&
-                   sidecar_view_physical_path(&alias_view, alias_physical,
-                                              sizeof(alias_physical)) == 0;
-    check(paths_ok && strncmp(target_physical, "foo%7E1/", 8) == 0 &&
-              strncmp(alias_physical, "foo%7E1/", 8) == 0,
-          "hardlink payload paths inherit the collision suffix");
+    char target_leaf[NAME_MAX + 1U];
+    char alias_leaf[NAME_MAX + 1U];
+    int leaves_ok = found &&
+                    sidecar_bytes_match_text(parent_view.entry->physical_leaf,
+                                             "foo%7E1") &&
+                    sidecar_view_physical_leaf(&target_view, target_leaf,
+                                               sizeof(target_leaf)) == 0 &&
+                    sidecar_view_physical_leaf(&alias_view, alias_leaf,
+                                               sizeof(alias_leaf)) == 0;
+    check(leaves_ok && target_leaf[0] != '\0' && alias_leaf[0] != '\0',
+          "hardlink children retain leaf identity below the collided parent");
     check(found && ((target_view.entry->kind == SIDECAR_KIND_HARDLINK) !=
                    (alias_view.entry->kind == SIDECAR_KIND_HARDLINK)),
           "collision planning does not duplicate the hardlink group");

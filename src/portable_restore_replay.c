@@ -7,6 +7,7 @@
 #include "manifest.h"
 #include "metadata.h"
 #include "portable.h"
+#include "portable_fsops_internal.h"
 #include "sidecar.h"
 #include "utils.h"
 
@@ -32,16 +33,20 @@ typedef struct {
     size_t destination_order;
 } ReplayEntry;
 
-/* One most-recent parent captures sibling locality without retaining an fd
- * per directory. Destination and payload traversal keep separate slots so
- * alternating source/destination opens cannot evict each other. Destination
- * parents remain valid because replay never removes or replaces directories;
- * payload parents are anchored below the read-only data_fd tree. */
+/* One most-recent destination parent captures sibling locality without
+ * retaining an fd per directory. */
 typedef struct {
     int fd;
     int base_fd;
     char prefix[PATH_MAX];
 } ReplayParentCache;
+
+/* Payload locality is keyed by authenticated logical-parent identity rather
+ * than by any reconstructed physical pathname. */
+typedef struct {
+    int fd;
+    size_t parent_address_index;
+} ReplayPayloadParentCache;
 
 typedef struct {
     ReplayEntry *items;
@@ -59,7 +64,7 @@ typedef struct {
     int xdg_anchor_fd[XDG_KEY_COUNT];
     char xdg_anchor_prefix[XDG_KEY_COUNT][PATH_MAX];
     ReplayParentCache parent_cache;
-    ReplayParentCache payload_cache;
+    ReplayPayloadParentCache payload_cache;
     MetadataTimestampPolicy timestamp_policy;
     PortableRestoreReplayReport *report;
     BackupCaptureReport *capture_report;
@@ -396,16 +401,6 @@ static int replay_collect_entry(const SidecarLiveView *view, void *argument)
         return 1;
     }
 
-    /* Canonical v4 leaf authentication is independent of payload traversal,
-     * which still consumes the bounded joined-path compatibility cache. An
-     * unavailable non-root cache must never alias the root payload anchor. */
-    if (entry->logical_path.length != 0 && entry->physical_path.length == 0)
-    {
-        replay_report_failure(collection->report, collection->manifest,
-                              root_index, entry->logical_path);
-        return 1;
-    }
-
     const ManifestRoot *root = &collection->manifest->roots[root_index];
     if ((entry->kind == SIDECAR_KIND_SYMLINK ||
          entry->kind == SIDECAR_KIND_HARDLINK) &&
@@ -467,13 +462,6 @@ static int replay_collect_entry(const SidecarLiveView *view, void *argument)
             return 1;
         }
         hardlink_ref_entry = referenced.entry;
-    }
-
-    if (entry->physical_path.length >= PATH_MAX)
-    {
-        replay_report_failure(collection->report, collection->manifest,
-                              root_index, entry->logical_path);
-        return 1;
     }
 
     struct stat desired;
@@ -625,138 +613,29 @@ static int replay_selection_destinations_valid(ReplayCollection *collection)
     return 0;
 }
 
-static int replay_payload_path_build(const ManifestRoot *root,
-                                     SidecarBytes physical,
-                                     char *out, size_t out_size)
+static int replay_physical_leaf_text(const SidecarEntry *entry,
+                                     char out[NAME_MAX + 1U])
 {
-    if (root == NULL || out == NULL || out_size == 0 ||
-        !sidecar_path_valid(physical, 1))
+    if (entry == NULL || out == NULL || entry->physical_leaf.length == 0 ||
+        entry->physical_leaf.length > NAME_MAX ||
+        entry->physical_leaf.data == NULL ||
+        !portable_component_valid((const char *)entry->physical_leaf.data,
+                                  entry->physical_leaf.length))
     {
         errno = EINVAL;
         return -1;
     }
-    size_t root_length = strlen(root->payload_path);
-    if (!portable_payload_path_fits(root_length, physical.length, out_size))
-    {
-        errno = E2BIG;
-        return -1;
-    }
-    memcpy(out, root->payload_path, root_length);
-    if (physical.length == 0)
-    {
-        out[root_length] = '\0';
-        return 0;
-    }
-    out[root_length] = '/';
-    memcpy(out + root_length + 1U, physical.data, physical.length);
-    out[root_length + 1U + physical.length] = '\0';
+    memcpy(out, entry->physical_leaf.data, entry->physical_leaf.length);
+    out[entry->physical_leaf.length] = '\0';
     return 0;
 }
 
-static int replay_walk_payload_parent(int base_fd, const char *relative,
-                                      int *parent_out, char *leaf,
-                                      size_t leaf_size)
+static int replay_open_root_payload(const ReplayCollection *collection,
+                                    const ManifestRoot *root, int flags,
+                                    int *out_fd, struct stat *out_stat)
 {
-    char copy[PATH_MAX];
-    size_t length = strlen(relative);
-    memcpy(copy, relative, length + 1U);
-    int current = dup_cloexec(base_fd);
-    if (current < 0)
-        return -1;
-
-    char *cursor = copy;
-    for (;;)
-    {
-        char *slash = strchr(cursor, '/');
-        if (slash == NULL)
-        {
-            int written = snprintf(leaf, leaf_size, "%s", cursor);
-            if (written < 0 || (size_t)written >= leaf_size)
-            {
-                close(current);
-                errno = ENAMETOOLONG;
-                return -1;
-            }
-            *parent_out = current;
-            return 0;
-        }
-        *slash = '\0';
-        int next = openat(current, cursor,
-                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
-                              O_NOATIME | O_CLOEXEC);
-        if (next < 0)
-        {
-            int saved = errno;
-            close(current);
-            errno = saved;
-            return -1;
-        }
-        if (close(current) != 0)
-        {
-            int saved = errno;
-            close(next);
-            errno = saved;
-            return -1;
-        }
-        current = next;
-        cursor = slash + 1U;
-    }
-}
-
-static int replay_payload_parent_cached(ReplayCollection *collection,
-                                        int base_fd, const char *relative,
-                                        int *parent_out, char *leaf,
-                                        size_t leaf_size)
-{
-    const char *slash = strrchr(relative, '/');
-    ReplayParentCache *cache = &collection->payload_cache;
-    size_t prefix_length = 0;
-    if (slash != NULL)
-    {
-        prefix_length = (size_t)(slash - relative);
-        if (cache->fd >= 0 && cache->base_fd == base_fd &&
-            strncmp(cache->prefix, relative, prefix_length) == 0 &&
-            cache->prefix[prefix_length] == '\0')
-        {
-            int written = snprintf(leaf, leaf_size, "%s", slash + 1U);
-            if (written < 0 || (size_t)written >= leaf_size)
-            {
-                errno = ENAMETOOLONG;
-                return -1;
-            }
-            int fd = dup_cloexec(cache->fd);
-            if (fd < 0)
-                return -1;
-            *parent_out = fd;
-            return 0;
-        }
-    }
-
-    if (replay_walk_payload_parent(base_fd, relative, parent_out, leaf,
-                                   leaf_size) != 0)
-        return -1;
-    if (slash == NULL)
-        return 0;
-    int cached = dup_cloexec(*parent_out);
-    if (cached >= 0)
-    {
-        if (cache->fd >= 0)
-            (void)close(cache->fd);
-        cache->fd = cached;
-        cache->base_fd = base_fd;
-        memcpy(cache->prefix, relative, prefix_length);
-        cache->prefix[prefix_length] = '\0';
-    }
-    return 0;
-}
-
-static int replay_open_existing_relative(ReplayCollection *collection,
-                                         int base_fd, const char *relative,
-                                         int flags, int *out_fd,
-                                         struct stat *out_stat)
-{
-    if (collection == NULL || base_fd < 0 || relative == NULL ||
-        out_fd == NULL || !relative_path_valid(relative, 0))
+    if (collection == NULL || collection->data_fd < 0 || root == NULL ||
+        out_fd == NULL)
     {
         errno = EINVAL;
         return -1;
@@ -765,8 +644,8 @@ static int replay_open_existing_relative(ReplayCollection *collection,
 
     int parent = -1;
     char leaf[NAME_MAX + 1U];
-    if (replay_payload_parent_cached(collection, base_fd, relative, &parent,
-                                     leaf, sizeof(leaf)) != 0)
+    if (open_existing_payload_parent(collection->data_fd, root->payload_path,
+                                     &parent, leaf, sizeof(leaf)) != 0)
         return -1;
 
     int fd = openat(parent, leaf, flags | O_NOFOLLOW | O_CLOEXEC);
@@ -796,6 +675,143 @@ static int replay_open_existing_relative(ReplayCollection *collection,
     return 0;
 }
 
+static int replay_open_payload_parent_address(ReplayCollection *collection,
+                                              const ManifestRoot *root,
+                                              size_t parent_address_index,
+                                              int *parent_out)
+{
+    if (collection == NULL || root == NULL || parent_out == NULL ||
+        parent_address_index >= collection->address_index.count)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    *parent_out = -1;
+
+    const RestoreAddressEntry *parent_address =
+        &collection->address_index.entries[parent_address_index];
+    const SidecarEntry *parent_entry = parent_address->entry;
+    if (parent_entry == NULL || parent_entry->kind != SIDECAR_KIND_DIRECTORY)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    int current = -1;
+    if (replay_open_root_payload(collection, root,
+                                 O_RDONLY | O_DIRECTORY | O_NOATIME,
+                                 &current, NULL) != 0)
+        return -1;
+    if (parent_entry->logical_path.length == 0)
+    {
+        *parent_out = current;
+        return 0;
+    }
+
+    SidecarBytes root_id = parent_entry->root_id;
+    SidecarBytes logical = parent_entry->logical_path;
+    for (size_t length = 0; length <= logical.length; length++)
+    {
+        if (length != logical.length && logical.data[length] != '/')
+            continue;
+        SidecarBytes prefix = { .data = logical.data, .length = length };
+        size_t address_index = SIZE_MAX;
+        int found = restore_address_index_find_logical(
+            &collection->address_index, root_id, prefix, &address_index);
+        if (found != 1 || address_index >= collection->address_index.count)
+        {
+            int saved = found < 0 ? errno : EINVAL;
+            close(current);
+            errno = saved;
+            return -1;
+        }
+        const SidecarEntry *ancestor =
+            collection->address_index.entries[address_index].entry;
+        char leaf[NAME_MAX + 1U];
+        if (ancestor == NULL || ancestor->kind != SIDECAR_KIND_DIRECTORY ||
+            replay_physical_leaf_text(ancestor, leaf) != 0)
+        {
+            int saved = errno == 0 ? EINVAL : errno;
+            close(current);
+            errno = saved;
+            return -1;
+        }
+        int next = openat(current, leaf,
+                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                              O_NOATIME | O_CLOEXEC);
+        if (next < 0)
+        {
+            int saved = errno;
+            close(current);
+            errno = saved;
+            return -1;
+        }
+        if (close(current) != 0)
+        {
+            int saved = errno;
+            close(next);
+            errno = saved;
+            return -1;
+        }
+        current = next;
+    }
+    *parent_out = current;
+    return 0;
+}
+
+static int replay_open_payload_parent_cached(ReplayCollection *collection,
+                                             const ManifestRoot *root,
+                                             size_t entry_address_index,
+                                             int *parent_out)
+{
+    if (collection == NULL || root == NULL || parent_out == NULL ||
+        entry_address_index >= collection->address_index.count)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    const RestoreAddressEntry *address =
+        &collection->address_index.entries[entry_address_index];
+    const SidecarEntry *entry = address->entry;
+    if (entry == NULL || entry->logical_path.length == 0)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    size_t parent_address_index = SIZE_MAX;
+    int found = restore_address_index_find_logical(
+        &collection->address_index, entry->root_id, address->logical_parent,
+        &parent_address_index);
+    if (found != 1 || parent_address_index >= collection->address_index.count)
+    {
+        errno = found < 0 ? errno : EINVAL;
+        return -1;
+    }
+
+    ReplayPayloadParentCache *cache = &collection->payload_cache;
+    if (cache->fd >= 0 &&
+        cache->parent_address_index == parent_address_index)
+    {
+        *parent_out = dup_cloexec(cache->fd);
+        return *parent_out < 0 ? -1 : 0;
+    }
+
+    if (replay_open_payload_parent_address(collection, root,
+                                           parent_address_index,
+                                           parent_out) != 0)
+        return -1;
+    int cached = dup_cloexec(*parent_out);
+    if (cached >= 0)
+    {
+        if (cache->fd >= 0)
+            (void)close(cache->fd);
+        cache->fd = cached;
+        cache->parent_address_index = parent_address_index;
+    }
+    return 0;
+}
+
 static int replay_open_payload(ReplayCollection *collection,
                                const ManifestRoot *root,
                                const SidecarEntry *entry, int *out_fd,
@@ -807,18 +823,62 @@ static int replay_open_payload(ReplayCollection *collection,
         errno = EINVAL;
         return -1;
     }
-    char path[PATH_MAX];
-    if (replay_payload_path_build(root, entry->physical_path, path,
-                                  sizeof(path)) != 0)
+    size_t entry_address_index = SIZE_MAX;
+    size_t root_index = root_map_find(&collection->root_map,
+                                      collection->manifest, entry->root_id);
+    if (root_index == SIZE_MAX ||
+        &collection->manifest->roots[root_index] != root ||
+        restore_address_index_entry_valid(&collection->address_index, entry,
+                                          &entry_address_index) != 1)
+    {
+        errno = EINVAL;
         return -1;
+    }
     int flags = O_RDONLY | O_NOATIME;
     if (entry->kind == SIDECAR_KIND_DIRECTORY)
         flags |= O_DIRECTORY;
     int fd = -1;
     struct stat st;
-    if (replay_open_existing_relative(collection, collection->data_fd, path,
-                                      flags, &fd, &st) != 0)
-        return -1;
+    if (entry->logical_path.length == 0)
+    {
+        if (replay_open_root_payload(collection, root, flags, &fd, &st) != 0)
+            return -1;
+    }
+    else
+    {
+        int parent = -1;
+        char leaf[NAME_MAX + 1U];
+        if (replay_open_payload_parent_cached(collection, root,
+                                              entry_address_index,
+                                              &parent) != 0 ||
+            replay_physical_leaf_text(entry, leaf) != 0)
+        {
+            int saved = errno;
+            if (parent >= 0)
+                close(parent);
+            errno = saved;
+            return -1;
+        }
+        fd = openat(parent, leaf, flags | O_NOFOLLOW | O_CLOEXEC);
+        int saved = errno;
+        if (fd >= 0 && fstat(fd, &st) != 0)
+        {
+            saved = errno;
+            close(fd);
+            fd = -1;
+        }
+        if (close(parent) != 0 && fd >= 0)
+        {
+            saved = errno;
+            close(fd);
+            fd = -1;
+        }
+        if (fd < 0)
+        {
+            errno = saved;
+            return -1;
+        }
+    }
     if ((entry->kind == SIDECAR_KIND_DIRECTORY && !S_ISDIR(st.st_mode)) ||
         (entry->kind == SIDECAR_KIND_REGULAR &&
          (!S_ISREG(st.st_mode) || st.st_size < 0 ||

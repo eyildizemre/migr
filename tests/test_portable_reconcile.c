@@ -79,8 +79,8 @@ static int claim_foreach_callback(const SidecarClaimView *view, void *argument)
         memcmp(view->claim->root_id.data, "ROOT", 4) != 0 ||
         view->claim->logical_path.length != 5U ||
         memcmp(view->claim->logical_path.data, "claim", 5) != 0 ||
-        view->claim->physical_path.length != 5U ||
-        memcmp(view->claim->physical_path.data, "claim", 5) != 0 ||
+        view->claim->physical_leaf.length != 5U ||
+        memcmp(view->claim->physical_leaf.data, "claim", 5) != 0 ||
         view->claim->kind != SIDECAR_KIND_REGULAR ||
         view->generation != result->expected_generation)
         result->valid = 0;
