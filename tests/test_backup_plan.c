@@ -1413,8 +1413,26 @@ static void stall_before_capture(const char *source_path, void *context)
         ;
 }
 
-static int stalled_progress_advanced_elapsed_without_bytes(
-    const char *output, const char *snapshotted_path)
+static int progress_output_lines_fit(const char *output, size_t max_length)
+{
+    const char prefix[] = "\rProgress: ";
+    const char *cursor = output;
+    int found = 0;
+
+    while ((cursor = strstr(cursor, prefix)) != NULL)
+    {
+        const char *line_end = strstr(cursor, "\033[K");
+        if (line_end == NULL)
+            return 0;
+        if ((size_t)(line_end - (cursor + 1)) > max_length)
+            return 0;
+        found = 1;
+        cursor = line_end + 3;
+    }
+    return found;
+}
+
+static int stalled_progress_advanced_elapsed_without_bytes(const char *output)
 {
     const char prefix[] = "\rProgress: ";
     const char *cursor = output;
@@ -1426,20 +1444,10 @@ static int stalled_progress_advanced_elapsed_without_bytes(
         const char *line_end = strstr(cursor, "\033[K");
         if (line_end == NULL)
             break;
-        const char *current = strstr(cursor, "current: ");
         const char *slash = strchr(cursor + sizeof(prefix) - 1U, '/');
         const char *elapsed = strstr(cursor, "elapsed ");
-        if (current == NULL || current >= line_end || slash == NULL ||
-            slash >= line_end || elapsed == NULL || elapsed >= line_end)
-        {
-            cursor = line_end + 3;
-            continue;
-        }
-
-        current += strlen("current: ");
-        size_t current_len = (size_t)(line_end - current);
-        if (strlen(snapshotted_path) != current_len ||
-            memcmp(current, snapshotted_path, current_len) != 0)
+        if (slash == NULL || slash >= line_end ||
+            elapsed == NULL || elapsed >= line_end)
         {
             cursor = line_end + 3;
             continue;
@@ -3058,9 +3066,8 @@ static void test_live_progress(void)
               strstr(output, "Packages") == NULL &&
               strstr(output, "package list") == NULL,
           "progress overwrites in place and explicit backups omit package output");
-    check(strstr(output, source) != NULL &&
-              strstr(output, second_source) != NULL,
-          "progress output identifies the current file");
+    check(progress_output_lines_fit(output, 79U),
+          "forced non-tty progress redraws fit the 80-column fallback row");
     check(strstr(output, "elapsed 00:") != NULL &&
               strstr(output, "speed ") != NULL,
           "progress output includes elapsed time and speed");
@@ -3132,7 +3139,7 @@ static void test_stalled_progress_ticker(void)
     backup_test_set_capture_hook(NULL, NULL);
 
     check(result == 0, "the injected single-path copy stall still completes");
-    check(stalled_progress_advanced_elapsed_without_bytes(output, first),
+    check(stalled_progress_advanced_elapsed_without_bytes(output),
           "ticker advances elapsed at least twice while copied bytes stay fixed");
 
     remove_tree(home);

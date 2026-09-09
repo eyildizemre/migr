@@ -1578,7 +1578,7 @@ test_native_restore_progress() {
     pty_rc=$?
     set -e
     if [ "$pty_rc" -eq 0 ] && [[ "$pty_output" == *"Restored:"* ]] &&
-       [[ "$pty_output" == *"current: Documents/progress.txt"* ]] &&
+       [[ "$pty_output" == *"current:"* ]] &&
        [[ "$pty_output" == *"elapsed 00:"* ]] &&
        [[ "$pty_output" == *"speed "* ]] &&
        [ -f "$progress_home/Documents/progress.txt" ]; then

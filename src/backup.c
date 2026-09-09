@@ -1268,14 +1268,19 @@ static void backup_render_progress(BackupProgressDisplay *display,
     const char *path_text = current_path != NULL && current_path[0] != '\0'
         ? current_path : "unknown";
 
+    char line[PATH_MAX + 256U];
     if (display->estimated_total_bytes > 0)
-        printf("\rProgress: %s/%s copied, %s free, elapsed %s, speed %s/s, "
-               "current: %s\033[K", copied_text, estimated_text, free_text,
-               elapsed_text, speed_text, path_text);
+        snprintf(line, sizeof(line),
+                 "Progress: %s/%s copied, %s free, elapsed %s, speed %s/s, "
+                 "current: %s", copied_text, estimated_text, free_text,
+                 elapsed_text, speed_text, path_text);
     else
-        printf("\rProgress: %s copied, %s free, elapsed %s, speed %s/s, "
-               "current: %s\033[K", copied_text, free_text, elapsed_text,
-               speed_text, path_text);
+        snprintf(line, sizeof(line),
+                 "Progress: %s copied, %s free, elapsed %s, speed %s/s, "
+                 "current: %s", copied_text, free_text, elapsed_text,
+                 speed_text, path_text);
+    progress_line_fit(line, sizeof(line));
+    printf("\r%s\033[K", line);
     fflush(stdout);
 }
 

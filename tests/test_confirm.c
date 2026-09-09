@@ -365,6 +365,55 @@ static void test_progress_ticker_stop_ignores_resolved_thread_error(void)
     }
 }
 
+static void fill_progress_line(char *line, size_t capacity, size_t length)
+{
+    if (length >= capacity)
+    {
+        fprintf(stderr, "progress-line fixture exceeds its buffer\n");
+        exit(1);
+    }
+    memset(line, 'x', length);
+    line[length] = '\0';
+}
+
+static void test_progress_line_fit_fallback(void)
+{
+    char short_line[96];
+    char boundary_line[96];
+    char over_line[96];
+    fill_progress_line(short_line, sizeof(short_line), 24U);
+    fill_progress_line(boundary_line, sizeof(boundary_line), 79U);
+    fill_progress_line(over_line, sizeof(over_line), 80U);
+
+    int pipefd[2];
+    int saved_stdout = dup(STDOUT_FILENO);
+    if (pipe(pipefd) != 0 || saved_stdout < 0 ||
+        dup2(pipefd[1], STDOUT_FILENO) < 0)
+    {
+        perror("progress-line stdout fixture");
+        exit(1);
+    }
+    close(pipefd[0]);
+    close(pipefd[1]);
+
+    progress_line_fit(short_line, sizeof(short_line));
+    progress_line_fit(boundary_line, sizeof(boundary_line));
+    progress_line_fit(over_line, sizeof(over_line));
+
+    if (dup2(saved_stdout, STDOUT_FILENO) < 0 || close(saved_stdout) != 0)
+    {
+        perror("progress-line stdout restore");
+        exit(1);
+    }
+
+    check(strlen(short_line) == 24U,
+          "progress line below the fallback width is unchanged");
+    check(strlen(boundary_line) == 79U,
+          "progress line at columns minus one is unchanged");
+    check(strlen(over_line) == 79U,
+          "progress line beyond the fallback width is clamped to columns minus one");
+}
+
 int main(void)
 {
     char output[256];
@@ -373,6 +422,7 @@ int main(void)
     test_target_home_resolution();
 #endif
     test_progress_ticker_stop_ignores_resolved_thread_error();
+    test_progress_line_fit_fallback();
 
     check(run_confirm("\n", 1, output, sizeof(output)) == 1,
           "bare Enter accepts the default-yes prompt");

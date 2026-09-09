@@ -7,6 +7,7 @@
 #include <string.h>
 #include <limits.h>
 #include <stdint.h>
+#include <sys/ioctl.h>
 #include <sys/resource.h>
 #include <time.h>
 #include <unistd.h>
@@ -305,6 +306,28 @@ void format_duration(long seconds, char *buf, size_t len)
         long remainder = seconds % 60;
         snprintf(buf, len, "%02ld:%02ld", minutes, remainder);
     }
+}
+
+void progress_line_fit(char *line, size_t line_capacity)
+{
+    if (line == NULL || line_capacity == 0U)
+        return;
+
+    size_t length = strnlen(line, line_capacity);
+    if (length == line_capacity)
+    {
+        line[line_capacity - 1U] = '\0';
+        length = line_capacity - 1U;
+    }
+
+    struct winsize ws;
+    size_t columns = 80U;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0U)
+        columns = (size_t)ws.ws_col;
+
+    size_t max_length = columns > 1U ? columns - 1U : 1U;
+    if (max_length < line_capacity && length > max_length)
+        line[max_length] = '\0';
 }
 
 double timespec_elapsed_seconds(const struct timespec *start,

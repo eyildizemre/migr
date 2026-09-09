@@ -801,8 +801,12 @@ static void restore_render_progress(RestoreProgressDisplay *display,
     format_size(speed_bytes, speed_text, sizeof(speed_text));
     const char *path_text = current_path != NULL && current_path[0] != '\0'
         ? current_path : "unknown";
-    printf("\rRestored: %s so far, elapsed %s, speed %s/s, current: %s\033[K",
-           restored_text, elapsed_text, speed_text, path_text);
+    char line[PATH_MAX + 256U];
+    snprintf(line, sizeof(line),
+             "Restored: %s so far, elapsed %s, speed %s/s, current: %s",
+             restored_text, elapsed_text, speed_text, path_text);
+    progress_line_fit(line, sizeof(line));
+    printf("\r%s\033[K", line);
     fflush(stdout);
 }
 

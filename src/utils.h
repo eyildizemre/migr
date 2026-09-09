@@ -60,6 +60,15 @@ void format_size(off_t bytes, char *buf, size_t len);
 void format_duration(long seconds, char *buf, size_t len);
 
 /**
+ * @brief Clamps a progress line so carriage-return redraws stay on one row.
+ *
+ * The current stdout terminal width is used when available; otherwise an
+ * 80-column fallback is used. One column is intentionally left unused so a
+ * redraw never relies on terminal-specific last-column wrapping behavior.
+ */
+void progress_line_fit(char *line, size_t line_capacity);
+
+/**
  * @brief Returns non-negative elapsed seconds between two timestamps.
  *
  * The timestamps are expected to come from the same monotonic clock. A
