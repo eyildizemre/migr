@@ -296,7 +296,11 @@ typedef enum {
  * setter below is part of the D14 seam.
  */
 #ifdef PORTABLE_CAPTURE_TEST_HOOKS
+typedef void (*PortableCaptureTestHook)(void *userdata);
+
 void portable_capture_test_set_interrupt(PortableTestInterruptPoint point);
+void portable_capture_test_set_after_payload_write_hook(
+    PortableCaptureTestHook hook, void *userdata);
 uint64_t portable_capture_test_case_fs_probe_count(void);
 void portable_capture_test_reset_case_fs_probe_count(void);
 uint64_t portable_capture_test_inode_map_probe_count(void);

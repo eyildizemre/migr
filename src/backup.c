@@ -601,6 +601,41 @@ static void print_portable_prescan_failure(const PortablePrescanReport *report,
                 target, outcome);
 }
 
+static void print_portable_capture_failure(const BackupCaptureReport *report)
+{
+    const char *path = report != NULL && report->failed_source_path[0] != '\0'
+        ? report->failed_source_path : NULL;
+
+    if (report != NULL &&
+        report->failure_kind == BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED)
+    {
+        if (path != NULL)
+            print_error("Error: portable capture stopped because the source changed after pre-scan at %s. Rerun the backup.\n",
+                        path);
+        else
+            print_error("Error: portable capture stopped because the source changed after pre-scan. Rerun the backup.\n");
+        return;
+    }
+
+    if (report != NULL &&
+        report->failure_kind == BACKUP_CAPTURE_FAILURE_OPERATIONAL)
+    {
+        int err = report->failure_errno != 0 ? report->failure_errno : EIO;
+        if (path != NULL)
+            print_error("Error: portable capture failed while processing %s (%s)\n",
+                        path, strerror(err));
+        else
+            print_error("Error: portable capture failed (%s)\n", strerror(err));
+        return;
+    }
+
+    if (path != NULL)
+        print_error("Error: portable capture state could not be updated safely while processing %s\n",
+                    path);
+    else
+        print_error("Error: portable capture state could not be initialized or updated safely\n");
+}
+
 static int self_binary_clear_at(int container_fd)
 {
     if (unlinkat(container_fd, "migr", 0) == 0 || errno == ENOENT)
@@ -2842,14 +2877,11 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
                 : portable_capture_fresh_prepared_at(
                       container_fd, &portable_request, &prepared, &live_count,
                       &capture_report);
+            count = (int)live_count;
             if (capture_result != 0)
             {
-                print_error("Error: portable capture failed\n");
+                print_portable_capture_failure(&capture_report);
                 had_error = 1;
-            }
-            else
-            {
-                count = (int)live_count;
             }
         }
 
@@ -2987,7 +3019,9 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
         // complete.
         char item_phrase[64];
         format_item_count_phrase(item_phrase, sizeof(item_phrase),
-                                 (size_t)count, "copied");
+                                 (size_t)count,
+                                 repr == CLONE_PORTABLE_SIDECAR
+                                     ? "committed" : "copied");
         printf("Backup finished with errors: %s, some items failed\n",
                item_phrase);
         if (resumable)

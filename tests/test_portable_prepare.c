@@ -251,6 +251,12 @@ static void record_portable_progress(off_t bytes_copied,
     trace->count++;
 }
 
+static void rewrite_source_after_payload_write(void *userdata)
+{
+    const char *path = userdata;
+    write_file(path, "changed-after-payload-copy");
+}
+
 static void test_prepared_capture_reports_progress(void)
 {
     printf(BLUE "::" NC " portable capture reports chunk-level progress\n");
@@ -300,6 +306,165 @@ static void test_prepared_capture_reports_progress(void)
     portable_prepared_capture_free(&prepared);
     if (close(scratch_fd) != 0 || close(container_fd) != 0)
         fixture_fatal("could not close portable progress fixture");
+    remove_tree(base);
+}
+
+static void test_prepared_capture_reports_failure_reason(void)
+{
+    printf(BLUE "::" NC " portable capture failure diagnostics\n");
+    char base[PATH_MAX];
+    char source[PATH_MAX];
+    char scratch[PATH_MAX];
+    char container[PATH_MAX];
+    char source_file[PATH_MAX];
+    make_base(base, sizeof(base));
+    join_path(source, sizeof(source), base, "source");
+    join_path(scratch, sizeof(scratch), base, "scratch");
+    join_path(container, sizeof(container), base, "container");
+    join_path(source_file, sizeof(source_file), source, "file");
+    make_directory(source);
+    make_directory(scratch);
+    make_directory(container);
+    write_file(source_file, "diagnostic");
+
+    PortableRootSpec root = root_spec("ROOT", source, "ROOT");
+    PortableCaptureRequest request = request_for(&root, 1, 1);
+    int scratch_fd = open_directory(scratch);
+    int container_fd = open_directory(container);
+    PortablePreparedCapture prepared = {0};
+    int prepare_result = portable_capture_prepare(scratch_fd, &request,
+                                                  &prepared);
+    BackupCaptureReport capture_report;
+    backup_capture_report_init(&capture_report);
+    portable_test_close_capture_directory_scan_fd_early();
+    int capture_result = prepare_result == 0
+        ? portable_capture_fresh_prepared_at(
+              container_fd, &request, &prepared, NULL, &capture_report)
+        : -1;
+    check(capture_result != 0 &&
+              capture_report.failure_kind ==
+                  BACKUP_CAPTURE_FAILURE_OPERATIONAL &&
+              capture_report.failure_errno == EBADF &&
+              strcmp(capture_report.failed_source_path, source) == 0,
+          "an errno-bearing capture failure reports its source and errno");
+
+    portable_prepared_capture_free(&prepared);
+    if (close(scratch_fd) != 0 || close(container_fd) != 0)
+        fixture_fatal("could not close operational-failure fixture");
+    remove_tree(base);
+
+    make_base(base, sizeof(base));
+    join_path(source, sizeof(source), base, "source");
+    join_path(scratch, sizeof(scratch), base, "scratch");
+    join_path(container, sizeof(container), base, "container");
+    join_path(source_file, sizeof(source_file), source, "file");
+    make_directory(source);
+    make_directory(scratch);
+    make_directory(container);
+    write_file(source_file, "planned");
+
+    root = root_spec("ROOT", source, "ROOT");
+    request = request_for(&root, 1, 1);
+    scratch_fd = open_directory(scratch);
+    container_fd = open_directory(container);
+    memset(&prepared, 0, sizeof(prepared));
+    prepare_result = portable_capture_prepare(scratch_fd, &request, &prepared);
+    if (prepare_result == 0 && unlink(source_file) != 0)
+        fixture_fatal("could not remove the prepared source member");
+    backup_capture_report_init(&capture_report);
+    capture_result = prepare_result == 0
+        ? portable_capture_fresh_prepared_at(
+              container_fd, &request, &prepared, NULL, &capture_report)
+        : -1;
+    check(capture_result != 0 &&
+              capture_report.failure_kind ==
+                  BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED &&
+              capture_report.failure_errno == 0 &&
+              strcmp(capture_report.failed_source_path, "file") == 0,
+          "a source-plan drift reports the changed logical path explicitly");
+
+    portable_prepared_capture_free(&prepared);
+    if (close(scratch_fd) != 0 || close(container_fd) != 0)
+        fixture_fatal("could not close source-change fixture");
+    remove_tree(base);
+
+    make_base(base, sizeof(base));
+    join_path(source, sizeof(source), base, "source");
+    join_path(scratch, sizeof(scratch), base, "scratch");
+    join_path(container, sizeof(container), base, "container");
+    join_path(source_file, sizeof(source_file), source, "file");
+    make_directory(source);
+    make_directory(scratch);
+    make_directory(container);
+    write_file(source_file, "stable-before-copy");
+
+    root = root_spec("ROOT", source, "ROOT");
+    request = request_for(&root, 1, 1);
+    scratch_fd = open_directory(scratch);
+    container_fd = open_directory(container);
+    memset(&prepared, 0, sizeof(prepared));
+    prepare_result = portable_capture_prepare(scratch_fd, &request, &prepared);
+    backup_capture_report_init(&capture_report);
+    portable_capture_test_set_after_payload_write_hook(
+        rewrite_source_after_payload_write, source_file);
+    capture_result = prepare_result == 0
+        ? portable_capture_fresh_prepared_at(
+              container_fd, &request, &prepared, NULL, &capture_report)
+        : -1;
+    portable_capture_test_set_after_payload_write_hook(NULL, NULL);
+    check(capture_result != 0 &&
+              capture_report.failure_kind ==
+                  BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED &&
+              capture_report.failure_errno == 0 &&
+              strcmp(capture_report.failed_source_path, "file") == 0,
+          "a source mutated during payload capture reports the changed path");
+
+    portable_prepared_capture_free(&prepared);
+    if (close(scratch_fd) != 0 || close(container_fd) != 0)
+        fixture_fatal("could not close mid-copy source-change fixture");
+    remove_tree(base);
+
+    make_base(base, sizeof(base));
+    join_path(source, sizeof(source), base, "source-file");
+    join_path(container, sizeof(container), base, "container");
+    make_directory(container);
+    write_file(source, "committed");
+
+    root = root_spec("ROOT", source, "ROOT");
+    request = request_for(&root, 1, 1);
+    container_fd = open_directory(container);
+    memset(&prepared, 0, sizeof(prepared));
+    prepare_result = portable_capture_prepare(container_fd, &request, &prepared);
+    size_t live_count = 0;
+    int seed_result = prepare_result == 0
+        ? portable_capture_fresh_prepared_at(
+              container_fd, &request, &prepared, &live_count, NULL)
+        : -1;
+    check(seed_result == 0 && live_count == 1U,
+          "a committed entry is available before the failing resume");
+    portable_prepared_capture_free(&prepared);
+
+    PortablePreparedCapture resume_plan = {0};
+    prepare_result = portable_capture_prepare(container_fd, &request,
+                                              &resume_plan);
+    if (prepare_result == 0 && unlink(source) != 0)
+        fixture_fatal("could not remove the prepared resume source");
+    backup_capture_report_init(&capture_report);
+    live_count = SIZE_MAX;
+    int resume_result = prepare_result == 0
+        ? portable_capture_resume_prepared_at(
+              container_fd, &request, &resume_plan, &live_count,
+              &capture_report)
+        : -1;
+    check(resume_result != 0 && live_count == 1U &&
+              capture_report.failure_kind ==
+                  BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED &&
+              strcmp(capture_report.failed_source_path, source) == 0,
+          "a failed resume still reports the committed live-entry count");
+
+    portable_prepared_capture_free(&resume_plan);
+    if (close(container_fd) != 0)
+        fixture_fatal("could not close failed-resume fixture");
     remove_tree(base);
 }
 
@@ -710,6 +875,7 @@ int main(void)
 {
     test_prepare_uses_unclaimed_scratch();
     test_prepared_capture_reports_progress();
+    test_prepared_capture_reports_failure_reason();
     test_prepared_capture_does_not_prescan_again();
     test_resume_live_count();
     test_fifo_is_rejected_before_mutation();

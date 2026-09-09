@@ -245,10 +245,29 @@ static void portable_readback_scan_count(void)
 #ifdef PORTABLE_CAPTURE_TEST_HOOKS
 static volatile sig_atomic_t portable_test_interrupt_point =
     PORTABLE_TEST_INTERRUPT_NONE;
+static PortableCaptureTestHook portable_test_after_payload_write_hook;
+static void *portable_test_after_payload_write_context;
 
 void portable_capture_test_set_interrupt(PortableTestInterruptPoint point)
 {
     portable_test_interrupt_point = point;
+}
+
+void portable_capture_test_set_after_payload_write_hook(
+    PortableCaptureTestHook hook, void *userdata)
+{
+    portable_test_after_payload_write_hook = hook;
+    portable_test_after_payload_write_context = userdata;
+}
+
+static void portable_test_after_payload_write(void)
+{
+    PortableCaptureTestHook hook = portable_test_after_payload_write_hook;
+    void *userdata = portable_test_after_payload_write_context;
+    portable_test_after_payload_write_hook = NULL;
+    portable_test_after_payload_write_context = NULL;
+    if (hook != NULL)
+        hook(userdata);
 }
 
 void portable_test_interrupt_if(PortableTestInterruptPoint point)
@@ -260,6 +279,10 @@ void portable_test_interrupt_if(PortableTestInterruptPoint point)
 void portable_test_interrupt_if(int point)
 {
     (void)point;
+}
+
+static void portable_test_after_payload_write(void)
+{
 }
 #endif
 
@@ -2159,22 +2182,76 @@ static int capture_assignment_resolve(
     return 0;
 }
 
+static void portable_capture_failure_reset(BackupCaptureReport *report)
+{
+    if (report == NULL)
+        return;
+    report->failed_source_path[0] = '\0';
+    report->failure_kind = BACKUP_CAPTURE_FAILURE_NONE;
+    report->failure_errno = 0;
+}
+
+static void portable_capture_failure_record(
+    BackupCaptureReport *report, BackupCaptureFailureKind kind, int err,
+    const PortableRootSpec *root, const char *logical)
+{
+    if (report == NULL || report->failure_kind != BACKUP_CAPTURE_FAILURE_NONE ||
+        kind == BACKUP_CAPTURE_FAILURE_NONE)
+        return;
+
+    report->failure_kind = kind;
+    report->failure_errno = kind == BACKUP_CAPTURE_FAILURE_OPERATIONAL
+        ? (err != 0 ? err : EIO)
+        : 0;
+
+    const char *path = NULL;
+    if (logical != NULL && logical[0] != '\0')
+        path = logical;
+    else if (root != NULL)
+        path = root->capture_path;
+    if (path != NULL)
+        (void)snprintf(report->failed_source_path,
+                       sizeof(report->failed_source_path), "%s", path);
+}
+
+static void portable_capture_context_failure_record(
+    const PortableCaptureContext *context, BackupCaptureFailureKind kind,
+    int err, const PortableRootSpec *root, const char *logical)
+{
+    if (context == NULL)
+        return;
+    portable_capture_failure_record(context->progress_report, kind, err, root,
+                                    logical);
+}
+
 static int capture_current_source_seen(const PortableCaptureContext *context,
                                        const PortableRootSpec *root)
 {
-    if (context == NULL || root == NULL || context->current_source == NULL)
+    if (context == NULL || root == NULL || context->current_source == NULL) {
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, NULL);
         return -1;
+    }
     const PortableCurrentSourceSet *set = context->current_source;
-    if (!set->sorted)
+    if (!set->sorted) {
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, NULL);
         return -1;
+    }
     for (size_t index = 0; index < set->count; index++) {
         const PortableCurrentSourceEntry *entry = &set->entries[index];
         if (strcmp(entry->root_id, root->id) != 0)
             continue;
         int present = visited_contains(context->visited, root->id,
                                        entry->logical_path);
-        if (present != 1)
+        if (present != 1) {
+            portable_capture_context_failure_record(
+                context,
+                present == 0 ? BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED
+                             : BACKUP_CAPTURE_FAILURE_INTERNAL,
+                0, root, entry->logical_path);
             return -1;
+        }
     }
     return 0;
 }
@@ -2182,6 +2259,13 @@ static int capture_current_source_seen(const PortableCaptureContext *context,
 static int source_kind_is_address_bearing(mode_t mode)
 {
     return S_ISDIR(mode) || S_ISREG(mode) || S_ISLNK(mode);
+}
+
+static BackupCaptureFailureKind source_lookup_failure_kind(int err)
+{
+    return err == ENOENT || err == ENOTDIR || err == ELOOP
+        ? BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED
+        : BACKUP_CAPTURE_FAILURE_OPERATIONAL;
 }
 
 static int prepared_source_member_stat(int root_fd, const char *logical,
@@ -2232,32 +2316,51 @@ static int prepared_source_member_stat(int root_fd, const char *logical,
 }
 
 static int prepared_source_validate_root(
-    const PortableCaptureContext *context, const PortableRootSpec *root)
+    PortableCaptureContext *context, const PortableRootSpec *root)
 {
     if (context == NULL || root == NULL || root->id == NULL ||
         root->capture_path == NULL || context->current_source == NULL ||
-        !context->current_source->sorted)
+        !context->current_source->sorted) {
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, NULL);
         return -1;
+    }
 
     int root_member = portable_current_source_contains(
         context->current_source, root->id, "");
-    if (root_member < 0)
+    if (root_member < 0) {
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, NULL);
         return -1;
+    }
 
     struct stat root_stat;
-    if (lstat(root->capture_path, &root_stat) != 0)
+    if (lstat(root->capture_path, &root_stat) != 0) {
+        int saved_errno = errno;
+        portable_capture_context_failure_record(
+            context, source_lookup_failure_kind(saved_errno), saved_errno,
+            root, NULL);
         return -1;
+    }
     int root_address_bearing = source_kind_is_address_bearing(root_stat.st_mode);
     if ((root_address_bearing && root_member != 1) ||
-        (!root_address_bearing && root_member == 1))
+        (!root_address_bearing && root_member == 1)) {
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED, 0, root, NULL);
         return -1;
+    }
 
     int root_fd = -1;
     if (S_ISDIR(root_stat.st_mode)) {
         root_fd = open(root->capture_path,
                        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-        if (root_fd < 0)
+        if (root_fd < 0) {
+            int saved_errno = errno;
+            portable_capture_context_failure_record(
+                context, source_lookup_failure_kind(saved_errno), saved_errno,
+                root, NULL);
             return -1;
+        }
     }
 
     int failed = 0;
@@ -2268,16 +2371,37 @@ static int prepared_source_validate_root(
             entry->logical_path[0] == '\0')
             continue;
         struct stat member_stat;
-        if (root_fd < 0 ||
-            prepared_source_member_stat(root_fd, entry->logical_path,
-                                        &member_stat) != 0 ||
-            !source_kind_is_address_bearing(member_stat.st_mode)) {
+        if (root_fd < 0) {
+            portable_capture_context_failure_record(
+                context, BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED, 0, root,
+                entry->logical_path);
+            failed = 1;
+            break;
+        }
+        if (prepared_source_member_stat(root_fd, entry->logical_path,
+                                        &member_stat) != 0) {
+            int saved_errno = errno;
+            portable_capture_context_failure_record(
+                context, source_lookup_failure_kind(saved_errno), saved_errno,
+                root, entry->logical_path);
+            failed = 1;
+            break;
+        }
+        if (!source_kind_is_address_bearing(member_stat.st_mode)) {
+            portable_capture_context_failure_record(
+                context, BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED, 0, root,
+                entry->logical_path);
             failed = 1;
             break;
         }
     }
-    if (root_fd >= 0 && close(root_fd) != 0)
+    if (root_fd >= 0 && close(root_fd) != 0) {
+        int saved_errno = errno;
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
+            NULL);
         failed = 1;
+    }
     return failed ? -1 : 0;
 }
 
@@ -2320,6 +2444,10 @@ static int capture_directory(PortableCaptureContext *context,
 #endif
     DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
     if (directory == NULL) {
+        int saved_errno = errno;
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
+            logical);
         if (scan_fd >= 0)
             close(scan_fd);
         xattrs_free(xattrs);
@@ -2338,8 +2466,12 @@ static int capture_directory(PortableCaptureContext *context,
         errno = 0;
         struct dirent *entry = readdir(directory);
         if (entry == NULL) {
-            if (errno != 0)
+            if (errno != 0) {
+                portable_capture_context_failure_record(
+                    context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, errno, root,
+                    logical);
                 failed = 1;
+            }
             break;
         }
         if (strcmp(entry->d_name, ".") == 0 ||
@@ -2349,12 +2481,18 @@ static int capture_directory(PortableCaptureContext *context,
         char child_logical[SIDECAR_MAX_PATH + 1U];
         if (append_logical(child_logical, sizeof(child_logical), logical,
                            entry->d_name) != 0) {
+            portable_capture_context_failure_record(
+                context, BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED, 0, root,
+                logical);
             failed = 1;
             break;
         }
         if (root->selection != NULL) {
             int owned = selection_root_owns(root->selection, child_logical);
             if (owned < 0) {
+                portable_capture_context_failure_record(
+                    context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root,
+                    child_logical);
                 failed = 1;
                 break;
             }
@@ -2365,6 +2503,9 @@ static int capture_directory(PortableCaptureContext *context,
         PortableCaptureAssignment assignment;
         if (capture_assignment_resolve(context, root, child_logical,
                                        entry->d_name, &assignment) != 0) {
+            portable_capture_context_failure_record(
+                context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root,
+                child_logical);
             failed = 1;
             break;
         }
@@ -2410,6 +2551,9 @@ static int capture_directory(PortableCaptureContext *context,
                 (duplicate == 1 &&
                  (current_plan != NULL || existing_plan != NULL) &&
                  (current_plan == NULL || existing_plan == NULL))) {
+                portable_capture_context_failure_record(
+                    context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root,
+                    child_logical);
                 failed = 1;
                 break;
             }
@@ -2419,6 +2563,9 @@ static int capture_directory(PortableCaptureContext *context,
         if (encoded_name_has_raw_high_byte(assignment.physical_leaf)) {
             if (pending_readback_names_add(&pending,
                                            assignment.physical_leaf) != 0) {
+                portable_capture_context_failure_record(
+                    context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root,
+                    child_logical);
                 failed = 1;
                 break;
             }
@@ -2438,21 +2585,44 @@ static int capture_directory(PortableCaptureContext *context,
         if (added_pending && no_destination_object)
             pending_readback_names_remove_last(&pending);
     }
-    if (closedir(directory) != 0)
+    if (closedir(directory) != 0) {
+        int saved_errno = errno;
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
+            logical);
         failed = 1;
+    }
 
     case_fold_set_free(&observed_skeletons);
     case_fold_set_free(&observed_ascii);
 
     struct stat after;
-    if (!failed && (fstat(source_fd, &after) != 0 ||
-                    !metadata_source_unchanged(before, &after)))
+    if (!failed && fstat(source_fd, &after) != 0) {
+        int saved_errno = errno;
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
+            logical);
         failed = 1;
+    } else if (!failed && !metadata_source_unchanged(before, &after)) {
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED, 0, root, logical);
+        failed = 1;
+    }
 
-    if (!failed && verify_pending_readback_names(destination_fd, &pending) != 0)
+    if (!failed && verify_pending_readback_names(destination_fd, &pending) != 0) {
+        int saved_errno = errno;
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
+            logical);
         failed = 1;
-    if (close(source_fd) != 0)
+    }
+    if (close(source_fd) != 0) {
+        int saved_errno = errno;
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
+            logical);
         failed = 1;
+    }
     if (failed) {
         pending_readback_names_free(&pending);
         xattrs_free(xattrs);
@@ -2466,6 +2636,8 @@ static int capture_directory(PortableCaptureContext *context,
                         context->nsec_exact,
                         xattrs, &sidecar_entry, NULL, NULL, NULL) != 0 ||
         append_group(context, &sidecar_entry, xattrs) != 0) {
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, logical);
         pending_readback_names_free(&pending);
         xattrs_free(xattrs);
         close(destination_fd);
@@ -2473,7 +2645,14 @@ static int capture_directory(PortableCaptureContext *context,
     }
     pending_readback_names_free(&pending);
     xattrs_free(xattrs);
-    return close(destination_fd) == 0 ? 0 : -1;
+    if (close(destination_fd) != 0) {
+        int saved_errno = errno;
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
+            logical);
+        return -1;
+    }
+    return 0;
 }
 
 static int capture_regular(PortableCaptureContext *context,
@@ -2494,6 +2673,10 @@ static int capture_regular(PortableCaptureContext *context,
         if (portable_open_relative_parent(context->data_fd,
                                           root->payload_path, &parent_fd,
                                           root_leaf, sizeof(root_leaf)) != 0) {
+            int saved_errno = errno;
+            portable_capture_context_failure_record(
+                context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
+                root, logical);
             xattrs_free(xattrs);
             close(source_fd);
             return -1;
@@ -2530,6 +2713,10 @@ static int capture_regular(PortableCaptureContext *context,
     int destination_fd;
     portable_test_interrupt_if(PORTABLE_TEST_BEFORE_PAYLOAD_REPLACE);
     if (ensure_regular_leaf(parent_fd, destination_leaf, &destination_fd) != 0) {
+        int saved_errno = errno;
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
+            logical);
         if (destination_is_root)
             close(parent_fd);
         xattrs_free(xattrs);
@@ -2544,6 +2731,10 @@ static int capture_regular(PortableCaptureContext *context,
                  logical[0] == '\0' ? root->capture_path : logical);
     if (portable_copy_regular(source_fd, destination_fd, before->st_size,
                               context->progress_report) != 0) {
+        int saved_errno = errno;
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
+            logical);
         close(destination_fd);
         if (destination_is_root)
             close(parent_fd);
@@ -2552,16 +2743,37 @@ static int capture_regular(PortableCaptureContext *context,
         return -1;
     }
     portable_test_interrupt_if(PORTABLE_TEST_AFTER_PAYLOAD_WRITE);
+    portable_test_after_payload_write();
 
     struct stat after;
-    int failed = fstat(source_fd, &after) != 0 ||
-                 !metadata_source_unchanged(before, &after);
+    int failed = 0;
+    if (fstat(source_fd, &after) != 0) {
+        int saved_errno = errno;
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
+            logical);
+        failed = 1;
+    } else if (!metadata_source_unchanged(before, &after)) {
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED, 0, root, logical);
+        failed = 1;
+    }
     portable_test_interrupt_if(PORTABLE_TEST_BEFORE_PAYLOAD_CLOSE);
-    if (close(destination_fd) != 0)
+    if (close(destination_fd) != 0) {
+        int saved_errno = errno;
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
+            logical);
         failed = 1;
+    }
     portable_test_interrupt_if(PORTABLE_TEST_AFTER_PAYLOAD_CLOSE);
-    if (close(source_fd) != 0)
+    if (close(source_fd) != 0) {
+        int saved_errno = errno;
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
+            logical);
         failed = 1;
+    }
     if (destination_is_root)
         close(parent_fd);
     if (failed) {
@@ -2613,8 +2825,13 @@ static int capture_special(PortableCaptureContext *context,
     if (destination_is_root) {
         if (portable_open_relative_parent(context->data_fd,
                                           root->payload_path, &parent_fd,
-                                          root_leaf, sizeof(root_leaf)) != 0)
+                                          root_leaf, sizeof(root_leaf)) != 0) {
+            int saved_errno = errno;
+            portable_capture_context_failure_record(
+                context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
+                root, logical);
             return -1;
+        }
         destination_leaf = root_leaf;
     }
     if (capture_destination_is_safe(context, root, logical,
@@ -2631,6 +2848,10 @@ static int capture_special(PortableCaptureContext *context,
         return -1;
     }
     if (remove_leaf(parent_fd, destination_leaf) != 0) {
+        int saved_errno = errno;
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
+            logical);
         if (destination_is_root)
             close(parent_fd);
         return -1;
@@ -2659,16 +2880,29 @@ static int capture_symlink(PortableCaptureContext *context,
     int target_length = source_symlink_target(source_parent, source_name,
                                               root_path, target,
                                               sizeof(target));
-    if (target_length < 0)
+    if (target_length < 0) {
+        int saved_errno = errno;
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
+            logical);
         return -1;
+    }
 
     char source_path[PATH_MAX];
     if (source_symlink_xattr_path(source_parent, source_name, root_path,
-                                  source_path, sizeof(source_path)) != 0)
+                                  source_path, sizeof(source_path)) != 0) {
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, logical);
         return -1;
+    }
     PortableXattrs xattrs;
-    if (collect_symlink_xattrs(source_path, &xattrs) != 0)
+    if (collect_symlink_xattrs(source_path, &xattrs) != 0) {
+        int saved_errno = errno;
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
+            logical);
         return -1;
+    }
 
     // The final consistency check runs after every path-based read (target,
     // then xattrs) rather than right after the target read: symlinks have no
@@ -2677,8 +2911,17 @@ static int capture_symlink(PortableCaptureContext *context,
     // inode the way capture_regular's single fd does. One check positioned
     // last covers the read window for both.
     struct stat after;
-    if (read_source_stat(source_parent, source_name, root_path, &after) != 0 ||
-        !metadata_symlink_unchanged(before, &after)) {
+    if (read_source_stat(source_parent, source_name, root_path, &after) != 0) {
+        int saved_errno = errno;
+        portable_capture_context_failure_record(
+            context, source_lookup_failure_kind(saved_errno), saved_errno,
+            root, logical);
+        xattrs_free(&xattrs);
+        return -1;
+    }
+    if (!metadata_symlink_unchanged(before, &after)) {
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED, 0, root, logical);
         xattrs_free(&xattrs);
         return -1;
     }
@@ -2735,6 +2978,10 @@ static int capture_symlink(PortableCaptureContext *context,
         if (portable_open_relative_parent(context->data_fd,
                                           root->payload_path, &parent_fd,
                                           root_leaf, sizeof(root_leaf)) != 0) {
+            int saved_errno = errno;
+            portable_capture_context_failure_record(
+                context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
+                root, logical);
             xattrs_free(&xattrs);
             return -1;
         }
@@ -2768,6 +3015,10 @@ static int capture_symlink(PortableCaptureContext *context,
     portable_test_interrupt_if(PORTABLE_TEST_BEFORE_PAYLOAD_REPLACE);
     if (ensure_regular_leaf(parent_fd, destination_leaf,
                             &destination_fd) != 0) {
+        int saved_errno = errno;
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
+            logical);
         if (destination_is_root)
             close(parent_fd);
         xattrs_free(&xattrs);
@@ -2854,6 +3105,10 @@ static int capture_hardlink(PortableCaptureContext *context,
         if (portable_open_relative_parent(context->data_fd,
                                           root->payload_path, &parent_fd,
                                           root_leaf, sizeof(root_leaf)) != 0) {
+            int saved_errno = errno;
+            portable_capture_context_failure_record(
+                context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
+                root, logical);
             close(source_fd);
             return -1;
         }
@@ -2885,6 +3140,10 @@ static int capture_hardlink(PortableCaptureContext *context,
     int destination_fd;
     portable_test_interrupt_if(PORTABLE_TEST_BEFORE_PAYLOAD_REPLACE);
     if (ensure_regular_leaf(parent_fd, destination_leaf, &destination_fd) != 0) {
+        int saved_errno = errno;
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
+            logical);
         if (destination_is_root)
             close(parent_fd);
         close(source_fd);
@@ -2893,14 +3152,39 @@ static int capture_hardlink(PortableCaptureContext *context,
     portable_test_interrupt_if(PORTABLE_TEST_AFTER_PAYLOAD_REPLACE);
 
     struct stat after;
-    int failed = fstat(source_fd, &after) != 0 ||
-                 !metadata_source_unchanged(before, &after);
-    if (close(destination_fd) != 0)
+    int failed = 0;
+    if (fstat(source_fd, &after) != 0) {
+        int saved_errno = errno;
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
+            logical);
         failed = 1;
-    if (destination_is_root && close(parent_fd) != 0)
+    } else if (!metadata_source_unchanged(before, &after)) {
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED, 0, root, logical);
         failed = 1;
-    if (close(source_fd) != 0)
+    }
+    if (close(destination_fd) != 0) {
+        int saved_errno = errno;
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
+            logical);
         failed = 1;
+    }
+    if (destination_is_root && close(parent_fd) != 0) {
+        int saved_errno = errno;
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
+            logical);
+        failed = 1;
+    }
+    if (close(source_fd) != 0) {
+        int saved_errno = errno;
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
+            logical);
+        failed = 1;
+    }
     if (failed)
         return -1;
 
@@ -2918,40 +3202,68 @@ static int capture_node(PortableCaptureContext *context,
 {
     if (root->selection != NULL) {
         int owned = selection_root_owns(root->selection, logical);
-        if (owned <= 0)
-            return owned == 0 ? 0 : -1;
+        if (owned < 0) {
+            portable_capture_context_failure_record(
+                context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, logical);
+            return -1;
+        }
+        if (owned == 0)
+            return 0;
     }
     struct stat before;
-    if (read_source_stat(source_parent, source_name, root_path, &before) != 0)
+    if (read_source_stat(source_parent, source_name, root_path, &before) != 0) {
+        int saved_errno = errno;
+        portable_capture_context_failure_record(
+            context, source_lookup_failure_kind(saved_errno), saved_errno,
+            root, logical);
         return -1;
+    }
 
     if (logical == NULL || physical_leaf == NULL || collision_suffix == NULL ||
         ((logical[0] == '\0' &&
           (physical_leaf[0] != '\0' || collision_suffix[0] != '\0')) ||
-         (logical[0] != '\0' && !safe_component(physical_leaf))))
+         (logical[0] != '\0' && !safe_component(physical_leaf)))) {
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, logical);
         return -1;
+    }
 
-    if (context->current_source == NULL)
+    if (context->current_source == NULL) {
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, logical);
         return -1;
+    }
     int prepared_member = portable_current_source_contains(
         context->current_source, root->id, logical);
-    if (prepared_member < 0)
+    if (prepared_member < 0) {
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, logical);
         return -1;
+    }
     int address_bearing = S_ISDIR(before.st_mode) || S_ISREG(before.st_mode) ||
                           S_ISLNK(before.st_mode);
     if ((address_bearing && prepared_member != 1) ||
-        (!address_bearing && prepared_member == 1))
+        (!address_bearing && prepared_member == 1)) {
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED, 0, root, logical);
         return -1;
+    }
 
     const PortableCollisionPlanEntry *planned =
         portable_collision_plan_find(context->collision_plan, root->id,
                                      logical);
     if (planned != NULL) {
         if (strcmp(planned->physical_leaf, physical_leaf) != 0 ||
-            strcmp(planned->collision_suffix, collision_suffix) != 0)
+            strcmp(planned->collision_suffix, collision_suffix) != 0) {
+            portable_capture_context_failure_record(
+                context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, logical);
             return -1;
-    } else if (collision_suffix[0] != '\0')
+        }
+    } else if (collision_suffix[0] != '\0') {
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, logical);
         return -1;
+    }
 
     int is_root = source_parent < 0;
     if (S_ISSOCK(before.st_mode) || S_ISCHR(before.st_mode) ||
@@ -2964,25 +3276,51 @@ static int capture_node(PortableCaptureContext *context,
     }
     if (S_ISFIFO(before.st_mode)) {
         errno = EOPNOTSUPP;
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, EOPNOTSUPP, root,
+            logical);
         return -1;
     }
-    if (S_ISLNK(before.st_mode))
-        return capture_symlink(context, root, logical, physical_leaf,
-                               collision_suffix, source_parent,
-                               source_name, root_path, destination_parent,
-                               destination_leaf, is_root, &before);
+    if (S_ISLNK(before.st_mode)) {
+        int result = capture_symlink(context, root, logical, physical_leaf,
+                                     collision_suffix, source_parent,
+                                     source_name, root_path,
+                                     destination_parent, destination_leaf,
+                                     is_root, &before);
+        if (result != 0)
+            portable_capture_context_failure_record(
+                context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, logical);
+        return result;
+    }
     if (!S_ISREG(before.st_mode) && !S_ISDIR(before.st_mode)) {
         errno = EOPNOTSUPP;
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, EOPNOTSUPP, root,
+            logical);
         return -1;
     }
 
     int source_fd = open_source_node(source_parent, source_name, root_path,
                                      &before);
-    if (source_fd < 0)
+    if (source_fd < 0) {
+        int saved_errno = errno;
+        portable_capture_context_failure_record(
+            context, source_lookup_failure_kind(saved_errno), saved_errno,
+            root, logical);
         return -1;
+    }
     struct stat opened;
-    if (fstat(source_fd, &opened) != 0 ||
-        !metadata_source_unchanged(&before, &opened)) {
+    if (fstat(source_fd, &opened) != 0) {
+        int saved_errno = errno;
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
+            logical);
+        close(source_fd);
+        return -1;
+    }
+    if (!metadata_source_unchanged(&before, &opened)) {
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED, 0, root, logical);
         close(source_fd);
         return -1;
     }
@@ -3005,15 +3343,24 @@ static int capture_node(PortableCaptureContext *context,
                                  strcmp(representative->root_id, root->id) == 0 &&
                                  strcmp(representative->logical_path, logical) == 0;
         if (inode_state == 1 && !same_logical_entry) {
-            return capture_hardlink(context, root, logical, physical_leaf,
-                                    collision_suffix, source_fd, &before,
-                                    destination_parent, destination_leaf,
-                                    is_root, representative);
+            int result = capture_hardlink(
+                context, root, logical, physical_leaf, collision_suffix,
+                source_fd, &before, destination_parent, destination_leaf,
+                is_root, representative);
+            if (result != 0)
+                portable_capture_context_failure_record(
+                    context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root,
+                    logical);
+            return result;
         }
     }
 
     PortableXattrs xattrs;
     if (collect_xattrs(source_fd, &xattrs) != 0) {
+        int saved_errno = errno;
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
+            logical);
         close(source_fd);
         return -1;
     }
@@ -3062,12 +3409,16 @@ static int capture_node(PortableCaptureContext *context,
         }
     }
 
-    if (S_ISREG(before.st_mode))
-        return capture_regular(context, root, logical, physical_leaf,
-                               collision_suffix, source_fd,
-                               &before,
-                               destination_parent, destination_leaf, is_root,
-                               &xattrs, &previous_hint);
+    if (S_ISREG(before.st_mode)) {
+        int result = capture_regular(context, root, logical, physical_leaf,
+                                     collision_suffix, source_fd, &before,
+                                     destination_parent, destination_leaf,
+                                     is_root, &xattrs, &previous_hint);
+        if (result != 0)
+            portable_capture_context_failure_record(
+                context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, logical);
+        return result;
+    }
 
     int parent_fd = destination_parent;
     char root_leaf[NAME_MAX + 1U];
@@ -3075,6 +3426,10 @@ static int capture_node(PortableCaptureContext *context,
         if (portable_open_relative_parent(context->data_fd,
                                           root->payload_path, &parent_fd,
                                           root_leaf, sizeof(root_leaf)) != 0) {
+            int saved_errno = errno;
+            portable_capture_context_failure_record(
+                context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
+                root, logical);
             xattrs_free(&xattrs);
             close(source_fd);
             return -1;
@@ -3103,6 +3458,10 @@ static int capture_node(PortableCaptureContext *context,
 
     int destination_fd;
     if (ensure_directory_leaf(parent_fd, destination_leaf, &destination_fd) != 0) {
+        int saved_errno = errno;
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
+            logical);
         if (is_root)
             close(parent_fd);
         xattrs_free(&xattrs);
@@ -3114,6 +3473,8 @@ static int capture_node(PortableCaptureContext *context,
                           collision_suffix) != 0) {
         if (is_root)
             close(parent_fd);
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, logical);
         return -1;
     }
     if (is_root)
@@ -3565,18 +3926,30 @@ int portable_capture_root(PortableCaptureContext *context,
     if (context == NULL || context->visited == NULL ||
         context->inode_map == NULL ||
         context->data_fd < 0 || context->sidecar == NULL ||
-        !root_spec_valid(root))
+        !root_spec_valid(root)) {
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, NULL);
         return -1;
+    }
     /* visited is root-local; inode_map spans every root in this context. */
     PortableVisited *visited = context->visited;
-    if (visited_reset(visited) != 0)
+    if (visited_reset(visited) != 0) {
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, NULL);
         return -1;
+    }
     if (prepared_source_validate_root(context, root) != 0)
         return -1;
-    if (prepare_collision_relocations(context, root) != 0)
+    if (prepare_collision_relocations(context, root) != 0) {
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, NULL);
         return -1;
-    if (portable_capture_owners_reload(context) != 0)
+    }
+    if (portable_capture_owners_reload(context) != 0) {
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, NULL);
         return -1;
+    }
     int result = capture_node(context, root, "", "", "", -1, NULL,
                               root->capture_path, -1, NULL, NULL);
     if (result != 0)
@@ -3589,22 +3962,34 @@ int portable_capture_fresh_prepared_at(
     const PortablePreparedCapture *prepared, size_t *live_count,
     BackupCaptureReport *progress_report)
 {
+    portable_capture_failure_reset(progress_report);
+    if (live_count != NULL)
+        *live_count = 0;
     if (container_fd < 0 || request == NULL ||
         request->scope < MANIFEST_SCOPE_CRITICAL ||
         request->scope > MANIFEST_SCOPE_EXPLICIT ||
         request->root_count > MANIFEST_MAX_ROOTS ||
         (request->root_count != 0 && request->roots == NULL) ||
         !request_selection_valid(request) ||
-        prepared == NULL || !prepared->ready)
+        prepared == NULL || !prepared->ready) {
+        portable_capture_failure_record(
+            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL, NULL);
         return -1;
+    }
 
     PortablePreparedRequestStatus request_status =
         portable_prepared_request_status(request, prepared);
     if (request_status == PORTABLE_PREPARED_REQUEST_ERROR ||
-        request_status == PORTABLE_PREPARED_REQUEST_MISMATCH)
+        request_status == PORTABLE_PREPARED_REQUEST_MISMATCH) {
+        portable_capture_failure_record(
+            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL, NULL);
         return -1;
-    if (fresh_namespace_is_empty(container_fd) != 0)
+    }
+    if (fresh_namespace_is_empty(container_fd) != 0) {
+        portable_capture_failure_record(
+            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL, NULL);
         return -1;
+    }
 
     SidecarLog sidecar = {0};
     PortableCaptureContext context = {0};
@@ -3613,20 +3998,35 @@ int portable_capture_fresh_prepared_at(
     int context_ready = 0;
     int result = -1;
 
-    if (manifest_write_v1_at(container_fd, &prepared->manifest) != 0)
+    if (manifest_write_v1_at(container_fd, &prepared->manifest) != 0) {
+        int saved_errno = errno;
+        portable_capture_failure_record(
+            progress_report, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
+            NULL, NULL);
         goto done;
+    }
     portable_test_interrupt_if(PORTABLE_TEST_AFTER_MANIFEST);
 
     if (mkdirat(container_fd, "data", 0700) != 0 && errno != EEXIST) {
+        int saved_errno = errno;
+        portable_capture_failure_record(
+            progress_report, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
+            NULL, NULL);
         goto done;
     }
     data_fd = openat(container_fd, "data",
                      O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (data_fd < 0) {
+        int saved_errno = errno;
+        portable_capture_failure_record(
+            progress_report, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
+            NULL, NULL);
         goto done;
     }
 
     if (sidecar_log_create_at(container_fd, &sidecar) != SIDECAR_OPEN_FRESH) {
+        portable_capture_failure_record(
+            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL, NULL);
         goto done;
     }
     sidecar_ready = 1;
@@ -3634,14 +4034,20 @@ int portable_capture_fresh_prepared_at(
     int failed = portable_capture_context_init(&context, data_fd, &sidecar,
                                                request->nsec_exact,
                                                request->case_sensitive) != 0;
+    if (failed)
+        portable_capture_failure_record(
+            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL, NULL);
     if (!failed) {
         context_ready = 1;
         context.progress_report = progress_report;
         context.collision_plan = &prepared->report.collision_plan;
         context.current_source = &prepared->report.current_source;
         if (portable_capture_owners_reload(&context) != 0 ||
-            sticky_seed_inode_map(context.inode_map, request, &sidecar) != 0)
+            sticky_seed_inode_map(context.inode_map, request, &sidecar) != 0) {
+            portable_capture_context_failure_record(
+                &context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL, NULL);
             failed = 1;
+        }
     }
     for (size_t index = 0; !failed && index < request->root_count; index++)
     {
@@ -3649,23 +4055,45 @@ int portable_capture_fresh_prepared_at(
             printf("  Capturing: %s -> data/%s\n",
                    request->roots[index].capture_path,
                    request->roots[index].payload_path);
-        if (portable_capture_root(&context, &request->roots[index]) != 0 ||
-            reconcile_root(&context, &request->roots[index]) != 0)
+        if (portable_capture_root(&context, &request->roots[index]) != 0) {
             failed = 1;
+            break;
+        }
+        if (reconcile_root(&context, &request->roots[index]) != 0) {
+            portable_capture_context_failure_record(
+                &context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+                &request->roots[index], NULL);
+            failed = 1;
+            break;
+        }
     }
-    if (!failed && sidecar_log_claim_count(&sidecar) != 0)
+    if (!failed && sidecar_log_claim_count(&sidecar) != 0) {
+        portable_capture_failure_record(
+            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL, NULL);
         failed = 1;
-    if (!failed && live_count != NULL)
-        *live_count = sidecar_log_live_count(&sidecar);
+    }
     result = failed ? -1 : 0;
 
 done:
+    if (sidecar_ready && live_count != NULL)
+        *live_count = sidecar_log_live_count(&sidecar);
     if (context_ready)
         portable_capture_context_close(&context);
-    if (sidecar_ready && sidecar_log_close(&sidecar) != SIDECAR_STATUS_OK)
+    if (sidecar_ready && sidecar_log_close(&sidecar) != SIDECAR_STATUS_OK) {
+        portable_capture_failure_record(
+            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL, NULL);
         result = -1;
-    if (data_fd >= 0 && close(data_fd) != 0)
+    }
+    if (data_fd >= 0 && close(data_fd) != 0) {
+        int saved_errno = errno;
+        portable_capture_failure_record(
+            progress_report, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
+            NULL, NULL);
         result = -1;
+    }
+    if (result != 0)
+        portable_capture_failure_record(
+            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL, NULL);
     return result;
 }
 
@@ -3736,20 +4164,29 @@ int portable_capture_resume_prepared_at(
     const PortablePreparedCapture *prepared, size_t *live_count,
     BackupCaptureReport *progress_report)
 {
+    portable_capture_failure_reset(progress_report);
+    if (live_count != NULL)
+        *live_count = 0;
     if (container_fd < 0 || request == NULL ||
         request->scope < MANIFEST_SCOPE_CRITICAL ||
         request->scope > MANIFEST_SCOPE_EXPLICIT ||
         request->root_count > MANIFEST_MAX_ROOTS ||
         (request->root_count != 0 && request->roots == NULL) ||
         !request_selection_valid(request) ||
-        prepared == NULL || !prepared->ready)
+        prepared == NULL || !prepared->ready) {
+        portable_capture_failure_record(
+            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL, NULL);
         return -1;
+    }
 
     PortablePreparedRequestStatus request_status =
         portable_prepared_request_status(request, prepared);
     if (request_status == PORTABLE_PREPARED_REQUEST_ERROR ||
-        request_status == PORTABLE_PREPARED_REQUEST_MISMATCH)
+        request_status == PORTABLE_PREPARED_REQUEST_MISMATCH) {
+        portable_capture_failure_record(
+            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL, NULL);
         return -1;
+    }
 
     Manifest existing = {0};
     SidecarLog sidecar = {0};
@@ -3761,6 +4198,8 @@ int portable_capture_resume_prepared_at(
     ManifestStatus manifest_status = manifest_read_v1_at(container_fd,
                                                          &existing);
     if (manifest_status != MANIFEST_STATUS_VALID) {
+        portable_capture_failure_record(
+            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL, NULL);
         goto done;
     }
     ManifestIdentityComparison identity =
@@ -3772,15 +4211,24 @@ int portable_capture_resume_prepared_at(
          * manifest.h's MANIFEST_IDENTITY_ERROR contract). Both branches still
          * refuse resume today; keeping them separate prevents this distinction
          * from disappearing if a future change handles them differently. */
+        portable_capture_failure_record(
+            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL, NULL);
         goto done;
     }
     if (identity != MANIFEST_IDENTITY_EQUAL) {
+        portable_capture_failure_record(
+            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL, NULL);
         goto done;
     }
 
     int data_state = open_existing_data(container_fd, &data_fd);
-    if (data_state < 0)
+    if (data_state < 0) {
+        int saved_errno = errno;
+        portable_capture_failure_record(
+            progress_report, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
+            NULL, NULL);
         goto done;
+    }
     int data_missing = data_state == 1;
 
     SidecarOpenStatus sidecar_status = sidecar_log_adopt_at(container_fd,
@@ -3788,23 +4236,41 @@ int portable_capture_resume_prepared_at(
     int failed = 0;
     if (sidecar_status == SIDECAR_OPEN_MISSING) {
         if (data_missing) {
-            if (create_resume_data(container_fd, &data_fd) != 0)
+            if (create_resume_data(container_fd, &data_fd) != 0) {
+                int saved_errno = errno;
+                portable_capture_failure_record(
+                    progress_report, BACKUP_CAPTURE_FAILURE_OPERATIONAL,
+                    saved_errno, NULL, NULL);
                 failed = 1;
+            }
         }
-        if (!failed && data_namespace_is_empty(data_fd) != 0)
+        if (!failed && data_namespace_is_empty(data_fd) != 0) {
+            portable_capture_failure_record(
+                progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL,
+                NULL);
             failed = 1;
+        }
         if (!failed &&
             sidecar_log_create_at(container_fd, &sidecar) !=
-                SIDECAR_OPEN_FRESH)
+                SIDECAR_OPEN_FRESH) {
+            portable_capture_failure_record(
+                progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL,
+                NULL);
             failed = 1;
+        }
     } else if (sidecar_status != SIDECAR_OPEN_RESUMABLE || data_missing) {
+        portable_capture_failure_record(
+            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL, NULL);
         failed = 1;
     }
 
     if (!failed && portable_capture_context_init(&context, data_fd, &sidecar,
                                                 request->nsec_exact,
-                                                request->case_sensitive) != 0)
+                                                request->case_sensitive) != 0) {
+        portable_capture_failure_record(
+            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL, NULL);
         failed = 1;
+    }
     if (!failed) {
         context_ready = 1;
         context.progress_report = progress_report;
@@ -3812,35 +4278,58 @@ int portable_capture_resume_prepared_at(
         context.collision_plan = &prepared->report.collision_plan;
         context.current_source = &prepared->report.current_source;
         if (portable_capture_owners_reload(&context) != 0 ||
-            sticky_seed_inode_map(context.inode_map, request, &sidecar) != 0)
+            sticky_seed_inode_map(context.inode_map, request, &sidecar) != 0) {
+            portable_capture_context_failure_record(
+                &context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL, NULL);
             failed = 1;
+        }
         for (size_t index = 0; !failed && index < request->root_count;
              index++) {
             if (verbose)
                 printf("  Capturing: %s -> data/%s\n",
                        request->roots[index].capture_path,
                        request->roots[index].payload_path);
-            if (portable_capture_root(&context, &request->roots[index]) != 0 ||
-                reconcile_root(&context, &request->roots[index]) != 0) {
+            if (portable_capture_root(&context, &request->roots[index]) != 0) {
+                failed = 1;
+                break;
+            }
+            if (reconcile_root(&context, &request->roots[index]) != 0) {
+                portable_capture_context_failure_record(
+                    &context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+                    &request->roots[index], NULL);
                 failed = 1;
                 break;
             }
         }
     }
-    if (!failed && sidecar_log_claim_count(&sidecar) != 0)
+    if (!failed && sidecar_log_claim_count(&sidecar) != 0) {
+        portable_capture_failure_record(
+            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL, NULL);
         failed = 1;
-    if (!failed && live_count != NULL)
-        *live_count = sidecar_log_live_count(&sidecar);
+    }
     result = failed ? -1 : 0;
 
 done:
+    if (sidecar.implementation != NULL && live_count != NULL)
+        *live_count = sidecar_log_live_count(&sidecar);
     if (context_ready)
         portable_capture_context_close(&context);
-    if (sidecar_log_close(&sidecar) != SIDECAR_STATUS_OK)
+    if (sidecar_log_close(&sidecar) != SIDECAR_STATUS_OK) {
+        portable_capture_failure_record(
+            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL, NULL);
         result = -1;
-    if (data_fd >= 0 && close(data_fd) != 0)
+    }
+    if (data_fd >= 0 && close(data_fd) != 0) {
+        int saved_errno = errno;
+        portable_capture_failure_record(
+            progress_report, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
+            NULL, NULL);
         result = -1;
+    }
     manifest_free(&existing);
+    if (result != 0)
+        portable_capture_failure_record(
+            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL, NULL);
     return result;
 }
 

@@ -126,6 +126,16 @@ typedef void (*BackupProgressCallback)(off_t bytes_copied,
                                        const char *current_path,
                                        void *userdata);
 
+/* First portable-capture failure retained for the caller. Source-change
+ * failures are semantic D17/D21 refusals and therefore carry no errno;
+ * operational failures preserve the syscall error that caused the stop. */
+typedef enum {
+    BACKUP_CAPTURE_FAILURE_NONE = 0,
+    BACKUP_CAPTURE_FAILURE_OPERATIONAL,
+    BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED,
+    BACKUP_CAPTURE_FAILURE_INTERNAL
+} BackupCaptureFailureKind;
+
 /**
  * @brief State shared by one native capture or restore across its roots.
  *
@@ -135,9 +145,13 @@ typedef void (*BackupProgressCallback)(off_t bytes_copied,
  * used by backup_plan_estimate_size().
  * bytes_since_sync accumulates the same content bytes until the configured
  * periodic-sync interval is reached; an interval of zero disables syncing.
+ * The failure fields are populated by portable capture; native capture keeps
+ * using failed_source_path for its source-safe-read refusal contract.
  */
 typedef struct {
     char failed_source_path[PATH_MAX];
+    BackupCaptureFailureKind failure_kind;
+    int failure_errno;
     off_t bytes_copied;
     char current_path[PATH_MAX];
     off_t bytes_since_sync;
