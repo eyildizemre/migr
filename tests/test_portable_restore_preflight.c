@@ -554,6 +554,48 @@ static void test_valid_and_profiles(void)
     fixture_close(&fixture);
 }
 
+static void test_payload_inventory_progress(void)
+{
+    printf(BLUE "::" NC " payload inventory reports live verification progress\n");
+    ManifestRoot root = root_for("ROOT", "ROOT", "restored");
+    Fixture fixture;
+    int opened = fixture_open(&fixture, "payload-progress", &root, 1);
+    check(opened == 0, "payload-progress fixture is created");
+    if (opened != 0)
+        return;
+    make_root_payload(&fixture);
+    write_file_at(fixture.data_fd, "ROOT/file", "hello");
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0),
+        entry_for("ROOT", "file", "file", SIDECAR_KIND_REGULAR, 5)
+    };
+    check(write_sidecar(&fixture, entries, 2) == 0,
+          "payload-progress sidecar is committed");
+
+    PortableRestorePreflightReport report;
+    char output[1024];
+    portable_restore_preflight_test_set_progress_enabled(1);
+    int result = run_preflight_capturing(&fixture, &report, output,
+                                         sizeof(output));
+    portable_restore_preflight_test_set_progress_enabled(0);
+    const char *collection_start = strstr(
+        output, "Verifying backup contents: entries 0/2 checked");
+    const char *collection_done = strstr(
+        output, "Verifying backup contents: entries 2/2 checked");
+    const char *payload_start = strstr(
+        output, "Verifying backup contents: payload 0/2 checked");
+    const char *payload_done = strstr(
+        output, "Verifying backup contents: payload 2/2 checked");
+    check(result == 0 && collection_start != NULL && collection_done != NULL &&
+              payload_start != NULL && payload_done != NULL &&
+              collection_start < collection_done &&
+              collection_done < payload_start && payload_start < payload_done,
+          "preflight progress covers collection before switching to payload totals");
+
+    portable_restore_preflight_report_free(&report);
+    fixture_close(&fixture);
+}
+
 static void test_outstanding_claim_gate(void)
 {
     printf(BLUE "::" NC " outstanding claims are rejected before preflight probing\n");
@@ -1885,6 +1927,7 @@ static void test_resolved_destination_identity_collisions(void)
 int main(void)
 {
     test_valid_and_profiles();
+    test_payload_inventory_progress();
     test_outstanding_claim_gate();
     test_missing_payload();
     test_shortened_leaf_preflight();

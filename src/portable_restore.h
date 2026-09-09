@@ -70,6 +70,10 @@ int portable_restore_preflight_at(
     const PortableRestoreRequest *request,
     PortableRestorePreflightReport *report);
 
+#ifdef PORTABLE_RESTORE_PREFLIGHT_TEST_HOOKS
+void portable_restore_preflight_test_set_progress_enabled(int enabled);
+#endif
+
 void portable_restore_replay_report_init(PortableRestoreReplayReport *report);
 
 /* Applies live sidecar entries with fd-anchored revalidation and metadata. */

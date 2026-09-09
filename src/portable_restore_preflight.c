@@ -36,6 +36,8 @@ typedef struct PreflightEntries {
     size_t capacity;
 } PreflightEntries;
 
+typedef struct RestorePreflightProgress RestorePreflightProgress;
+
 typedef struct {
     const Manifest *manifest;
     PortableRestorePreflightReport *report;
@@ -49,6 +51,7 @@ typedef struct {
     int xdg_anchor_fd[XDG_KEY_COUNT];
     char xdg_anchor_prefix[XDG_KEY_COUNT][PATH_MAX];
     PreflightMemory memory;
+    RestorePreflightProgress *progress;
 } Collection;
 
 typedef struct {
@@ -56,8 +59,232 @@ typedef struct {
     const Collection *collection;
     unsigned char *seen;
     char root_namespace_path[PATH_MAX];
+    RestorePreflightProgress *progress;
+    size_t checked_count;
     int failed;
 } PayloadInventory;
+
+struct RestorePreflightProgress {
+    size_t total_count;
+    struct timespec started_at;
+    struct timespec last_real_redraw;
+    ProgressTicker ticker;
+    int active;
+    int ticker_started;
+};
+
+#ifdef PORTABLE_RESTORE_PREFLIGHT_TEST_HOOKS
+static int portable_restore_preflight_test_progress_enabled;
+
+void portable_restore_preflight_test_set_progress_enabled(int enabled)
+{
+    portable_restore_preflight_test_progress_enabled = enabled != 0;
+}
+#endif
+
+static int preflight_progress_should_install(void)
+{
+#ifdef PORTABLE_RESTORE_PREFLIGHT_TEST_HOOKS
+    return portable_restore_preflight_test_progress_enabled;
+#else
+    return isatty(fileno(stdout));
+#endif
+}
+
+static int preflight_progress_should_fire(RestorePreflightProgress *display,
+                                          int force)
+{
+    if (display == NULL)
+        return 0;
+#ifdef PORTABLE_RESTORE_PREFLIGHT_TEST_HOOKS
+    if (portable_restore_preflight_test_progress_enabled)
+        force = 1;
+#endif
+    return backup_progress_should_fire(&display->last_real_redraw, force);
+}
+
+static long preflight_progress_elapsed_seconds(const struct timespec *started_at,
+                                               const struct timespec *now)
+{
+    double elapsed = timespec_elapsed_seconds(started_at, now);
+    if (elapsed <= 0.0)
+        return 0;
+    if (elapsed >= (double)LONG_MAX)
+        return LONG_MAX;
+    return (long)elapsed;
+}
+
+static void preflight_progress_render(const RestorePreflightProgress *display,
+                                      size_t checked_count,
+                                      const char *phase,
+                                      const struct timespec *now)
+{
+    if (display == NULL || phase == NULL || phase[0] == '\0' || now == NULL)
+        return;
+
+    char elapsed_text[32];
+    format_duration(preflight_progress_elapsed_seconds(&display->started_at, now),
+                    elapsed_text, sizeof(elapsed_text));
+    char line[192];
+    (void)snprintf(
+        line, sizeof(line),
+        "Verifying backup contents: %s %zu/%zu checked, elapsed %s",
+        phase, checked_count, display->total_count, elapsed_text);
+    progress_line_fit(line, sizeof(line));
+    printf("\r%s\033[K", line);
+    fflush(stdout);
+}
+
+static void preflight_progress_ticker_redraw(
+    const ProgressTickerSnapshot *snapshot, const struct timespec *now,
+    void *context)
+{
+    RestorePreflightProgress *display = context;
+    if (snapshot == NULL || snapshot->bytes < 0 || snapshot->path[0] == '\0')
+        return;
+    preflight_progress_render(display, (size_t)snapshot->bytes, snapshot->path,
+                              now);
+}
+
+static void preflight_progress_stop_ticker(RestorePreflightProgress *display)
+{
+    if (display == NULL || !display->ticker_started)
+        return;
+    if (progress_ticker_stop(&display->ticker) == 0)
+    {
+        display->ticker_started = 0;
+        return;
+    }
+
+    print_error("Error: Could not stop the restore preflight progress thread: %s\n",
+                strerror(errno));
+    /* Returning would leave a live thread retaining a pointer to this stack
+     * display after portable_restore_preflight_at() returns. */
+    abort();
+}
+
+static int preflight_progress_size_to_off_t(size_t value, off_t *out)
+{
+    if (out == NULL)
+        return -1;
+    off_t converted = (off_t)value;
+    if (converted < 0 || (size_t)converted != value)
+        return -1;
+    *out = converted;
+    return 0;
+}
+
+static int preflight_progress_snapshot(RestorePreflightProgress *display,
+                                       size_t checked_count,
+                                       const char *phase,
+                                       const struct timespec *now)
+{
+    if (display == NULL || phase == NULL || now == NULL ||
+        !display->ticker_started)
+        return 0;
+
+    off_t checked_as_off_t = 0;
+    if (preflight_progress_size_to_off_t(checked_count, &checked_as_off_t) != 0)
+    {
+        preflight_progress_stop_ticker(display);
+        return 0;
+    }
+    return progress_ticker_snapshot(&display->ticker, checked_as_off_t, 0, 0, 0,
+                                    phase, now);
+}
+
+static void preflight_progress_disable_ticker(RestorePreflightProgress *display,
+                                              int saved_errno)
+{
+    preflight_progress_stop_ticker(display);
+    putchar('\n');
+    print_warning("  Warning: restore preflight stall redraw was disabled: %s\n",
+                  strerror(saved_errno));
+}
+
+static void preflight_progress_start(RestorePreflightProgress *display,
+                                     size_t total_count, const char *phase)
+{
+    if (display == NULL || phase == NULL || phase[0] == '\0')
+        return;
+    memset(display, 0, sizeof(*display));
+    if (!preflight_progress_should_install())
+        return;
+
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+    {
+        printf("Verifying backup contents before restoring...\n");
+        fflush(stdout);
+        return;
+    }
+
+    display->total_count = total_count;
+    display->started_at = now;
+    display->last_real_redraw = now;
+    display->active = 1;
+
+    if (progress_ticker_start(&display->ticker, preflight_progress_ticker_redraw,
+                              display) == 0)
+        display->ticker_started = 1;
+    else
+        print_warning("  Warning: restore preflight stall redraw is unavailable: %s\n",
+                      strerror(errno));
+
+    preflight_progress_render(display, 0, phase, &now);
+    if (preflight_progress_snapshot(display, 0, phase, &now) != 0)
+    {
+        int saved_errno = errno;
+        preflight_progress_disable_ticker(display, saved_errno);
+        preflight_progress_render(display, 0, phase, &now);
+    }
+}
+
+static void preflight_progress_note(RestorePreflightProgress *display,
+                                    size_t checked_count, const char *phase,
+                                    int force)
+{
+    if (display == NULL || phase == NULL || !display->active)
+        return;
+    if (!preflight_progress_should_fire(display, force))
+        return;
+
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        return;
+    display->last_real_redraw = now;
+    if (preflight_progress_snapshot(display, checked_count, phase, &now) != 0)
+    {
+        int saved_errno = errno;
+        preflight_progress_disable_ticker(display, saved_errno);
+    }
+    preflight_progress_render(display, checked_count, phase, &now);
+}
+
+static void preflight_progress_finish(RestorePreflightProgress *display,
+                                      size_t checked_count, const char *phase)
+{
+    if (display == NULL || phase == NULL || !display->active)
+        return;
+    preflight_progress_stop_ticker(display);
+
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) == 0)
+        preflight_progress_render(display, checked_count, phase, &now);
+    putchar('\n');
+    fflush(stdout);
+    display->active = 0;
+}
+
+static void preflight_progress_cancel(RestorePreflightProgress *display)
+{
+    if (display == NULL || !display->active)
+        return;
+    preflight_progress_stop_ticker(display);
+    putchar('\n');
+    fflush(stdout);
+    display->active = 0;
+}
 
 static void report_violation(PortableRestorePreflightReport *report,
                              size_t root_index, const char *logical)
@@ -445,6 +672,14 @@ static void portable_restore_estimate_add(
     report->estimated_bytes += (off_t)bytes;
 }
 
+static int collect_entry_finish(Collection *collection, int result)
+{
+    if (collection != NULL && collection->report != NULL)
+        preflight_progress_note(collection->progress,
+                                collection->report->live_count, "entries", 0);
+    return result;
+}
+
 static int collect_entry(const SidecarLiveView *view, void *argument)
 {
     Collection *collection = argument;
@@ -460,7 +695,7 @@ static int collect_entry(const SidecarLiveView *view, void *argument)
     if (root_index == SIZE_MAX)
     {
         report_violation(report, SIZE_MAX, "external-root");
-        return 0;
+        return collect_entry_finish(collection, 0);
     }
     if (report->roots[root_index].live_count != SIZE_MAX)
         report->roots[root_index].live_count++;
@@ -470,8 +705,8 @@ static int collect_entry(const SidecarLiveView *view, void *argument)
     {
         report_violation(report, root_index, "invalid-path");
         if (logical_valid < 0)
-            return 1;
-        return 0;
+            return collect_entry_finish(collection, 1);
+        return collect_entry_finish(collection, 0);
     }
     size_t address_index = SIZE_MAX;
     int address_valid = restore_address_index_entry_valid(
@@ -479,13 +714,13 @@ static int collect_entry(const SidecarLiveView *view, void *argument)
     if (address_valid != 1)
     {
         report_violation(report, root_index, "physical-mismatch");
-        return address_valid < 0 ? 1 : 0;
+        return collect_entry_finish(collection, address_valid < 0 ? 1 : 0);
     }
     char logical[PATH_MAX];
     if (entry->logical_path.length >= sizeof(logical))
     {
         report_violation(report, root_index, "invalid-path");
-        return 0;
+        return collect_entry_finish(collection, 0);
     }
     if (entry->logical_path.length != 0)
         memcpy(logical, entry->logical_path.data, entry->logical_path.length);
@@ -494,7 +729,7 @@ static int collect_entry(const SidecarLiveView *view, void *argument)
                              logical) != 1)
     {
         report_violation(report, root_index, logical);
-        return 0;
+        return collect_entry_finish(collection, 0);
     }
     if (entry->kind != SIDECAR_KIND_REGULAR &&
         entry->kind != SIDECAR_KIND_DIRECTORY &&
@@ -502,13 +737,13 @@ static int collect_entry(const SidecarLiveView *view, void *argument)
         entry->kind != SIDECAR_KIND_HARDLINK)
     {
         report_violation(report, root_index, "unsupported-kind");
-        return 0;
+        return collect_entry_finish(collection, 0);
     }
     if (entry->kind != SIDECAR_KIND_REGULAR &&
         entry->kind != SIDECAR_KIND_DIRECTORY && entry->size != 0)
     {
         report_violation(report, root_index, "invalid-size");
-        return 0;
+        return collect_entry_finish(collection, 0);
     }
     if (entry->kind == SIDECAR_KIND_REGULAR ||
         entry->kind == SIDECAR_KIND_DIRECTORY)
@@ -518,9 +753,9 @@ static int collect_entry(const SidecarLiveView *view, void *argument)
 
     PreflightEntries *entries = collection->entries;
     if (entries == NULL)
-        return 1;
+        return collect_entry_finish(collection, 1);
     if (entries_reserve(&collection->memory, entries, 1) != 0)
-        return 1;
+        return collect_entry_finish(collection, 1);
     PreflightEntry *destination = &entries->items[entries->count];
     memset(destination, 0, sizeof(*destination));
     if (copy_sidecar_path(&collection->memory, entry->logical_path,
@@ -530,7 +765,7 @@ static int collect_entry(const SidecarLiveView *view, void *argument)
                        destination->logical == NULL ? 0
                            : strlen(destination->logical) + 1U);
         destination->logical = NULL;
-        return 1;
+        return collect_entry_finish(collection, 1);
     }
     destination->root_index = root_index;
     destination->address_index = address_index;
@@ -557,8 +792,8 @@ static int collect_entry(const SidecarLiveView *view, void *argument)
     if (collect_metadata_profile(collection,
                                  &collection->manifest->roots[root_index],
                                  root_index, destination) < -1)
-        return 1;
-    return 0;
+        return collect_entry_finish(collection, 1);
+    return collect_entry_finish(collection, 0);
 }
 
 static void collection_identity_entry(void *context, size_t index,
@@ -739,6 +974,10 @@ static int mark_payload_entry(PayloadInventory *inventory, size_t root_index,
         return -1;
     }
     inventory->seen[address_index] = 1;
+    if (inventory->checked_count != SIZE_MAX)
+        inventory->checked_count++;
+    preflight_progress_note(inventory->progress, inventory->checked_count,
+                            "payload", 0);
     return 0;
 }
 
@@ -1061,13 +1300,15 @@ int portable_restore_preflight_at(
     }
 
     PreflightEntries entries = {0};
+    RestorePreflightProgress progress = {0};
     Collection collection = {
         .manifest = request->manifest,
         .report = report,
         .entries = &entries,
         .destination_home_fd = request->destination_home_fd,
         .destination_home_path = request->destination_home_path,
-        .destination_xdg_dirs = request->destination_xdg_dirs
+        .destination_xdg_dirs = request->destination_xdg_dirs,
+        .progress = &progress
     };
     for (int index = 0; index < XDG_KEY_COUNT; index++)
         collection.xdg_anchor_fd[index] = -1;
@@ -1107,6 +1348,8 @@ int portable_restore_preflight_at(
         goto fail;
     }
 
+    size_t sidecar_live_count = sidecar_log_live_count(&sidecar);
+    preflight_progress_start(&progress, sidecar_live_count, "entries");
     if (restore_address_index_build(&collection.address_index,
                                     &collection.memory, &sidecar, NULL) != 0)
     {
@@ -1152,12 +1395,15 @@ int portable_restore_preflight_at(
         close(data_fd);
         goto fail;
     }
+    preflight_progress_note(&progress, 0, "payload", 1);
     PayloadInventory inventory = {
         .data_fd = data_fd,
         .collection = &collection,
-        .seen = seen
+        .seen = seen,
+        .progress = &progress
     };
     int result = scan_payload_inventory(&inventory);
+    preflight_progress_finish(&progress, inventory.checked_count, "payload");
     free(seen);
     if (sidecar_log_close(&sidecar) != SIDECAR_STATUS_OK)
         result = -1;
@@ -1169,6 +1415,7 @@ int portable_restore_preflight_at(
     return report->violation_count == 0 ? 0 : (report_print(report), -1);
 
 fail:
+    preflight_progress_cancel(&progress);
     collection_free(&collection, &entries);
     if (report->violation_count == 0)
         report_violation(report, SIZE_MAX, "preflight");
