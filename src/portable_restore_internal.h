@@ -26,18 +26,26 @@ typedef struct {
 } RootMap;
 
 typedef struct {
-    SidecarBytes root_id;
-    SidecarBytes logical_path;
-    SidecarBytes physical_path;
-    int used;
-} ParentMapSlot;
+    /* Borrowed from the immutable SidecarLog used to build the index. */
+    const SidecarEntry *entry;
+    SidecarBytes logical_parent;
+} RestoreAddressEntry;
 
 typedef struct {
-    ParentMapSlot *slots;
+    size_t entry_index;
+    int used;
+} RestoreAddressSlot;
+
+typedef struct {
+    RestoreAddressEntry *entries;
     size_t count;
     size_t capacity;
+    RestoreAddressSlot *logical_slots;
+    size_t logical_capacity;
+    RestoreAddressSlot *physical_slots;
+    size_t physical_capacity;
     uint64_t hash_salt;
-} ParentMap;
+} RestoreAddressIndex;
 
 typedef struct {
     void *nodes;
@@ -127,16 +135,28 @@ int text_component_valid(const char *component, size_t length);
 int relative_path_valid(const char *path, int allow_empty);
 int manifest_text_valid(const char *text, size_t capacity, int nonempty);
 int sidecar_path_valid(SidecarBytes bytes, int allow_empty);
-int entry_physical_matches_parent(const ManifestRoot *root,
-                                  const ParentMap *parent_map,
-                                  const SidecarEntry *entry);
+int restore_entry_physical_leaf_authentic(const SidecarEntry *entry);
+int restore_address_index_build(RestoreAddressIndex *index,
+                                PreflightMemory *memory, SidecarLog *sidecar,
+                                const SidecarEntry **failure_entry_out);
+void restore_address_index_free(PreflightMemory *memory,
+                                RestoreAddressIndex *index);
+int restore_address_index_find_logical(const RestoreAddressIndex *index,
+                                       SidecarBytes root_id,
+                                       SidecarBytes logical_path,
+                                       size_t *entry_index_out);
+int restore_address_index_find_physical(const RestoreAddressIndex *index,
+                                        SidecarBytes root_id,
+                                        SidecarBytes logical_parent,
+                                        SidecarBytes physical_leaf,
+                                        size_t *entry_index_out);
+int restore_address_index_entry_valid(const RestoreAddressIndex *index,
+                                      const SidecarEntry *entry,
+                                      size_t *entry_index_out);
 int root_map_build(RootMap *map, const Manifest *manifest);
 void root_map_free(RootMap *map);
 size_t root_map_find(const RootMap *map, const Manifest *manifest,
                      SidecarBytes id);
-void parent_map_free(PreflightMemory *memory, ParentMap *map);
-int parent_map_build(ParentMap *map, PreflightMemory *memory,
-                     SidecarLog *sidecar);
 int xdg_key_index(const char *id);
 int xdg_destination_valid(const char * const *xdg_dirs,
                           const ManifestRoot *root);
@@ -187,5 +207,13 @@ int destination_identity_graph_add_entries(
 int destination_identity_graph_order(
     const DestinationIdentityGraph *graph,
     const DestinationIdentityPlacement *placement, size_t *order_out);
+
+#ifdef PORTABLE_RESTORE_ADDRESS_TEST_HOOKS
+int restore_address_index_build_from_entries_for_test(
+    RestoreAddressIndex *index, PreflightMemory *memory,
+    const SidecarEntry *entries, size_t count);
+void restore_address_test_force_name_fingerprint(uint64_t fingerprint);
+void restore_address_test_clear_name_fingerprint(void);
+#endif
 
 #endif

@@ -1,13 +1,16 @@
-// Unit tests for the portable restore path invariant (docs/DECISIONS.md D19).
+// Focused invariants for D39 portable restore leaf authentication/addressing.
 
 #define _GNU_SOURCE
 
+#include <errno.h>
+#include <limits.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
+#include "portable_name.h"
+#include "portable_restore_internal.h"
 #include "sidecar.h"
-
-extern int physical_matches_logical(SidecarBytes logical,
-                                     SidecarBytes physical);
 
 #define GREEN "\033[0;32m"
 #define RED   "\033[0;31m"
@@ -20,173 +23,301 @@ static void check(int condition, const char *label)
 {
     if (condition)
         printf("  " GREEN "v" NC " %s\n", label);
-    else {
+    else
+    {
         printf("  " RED "x" NC " %s\n", label);
         failures++;
     }
 }
 
-static void test_exact_ascii(void)
+static SidecarBytes text_bytes(const char *text)
 {
-    printf(BLUE "::" NC " physical/logical invariant: exact ASCII path\n");
-
-    const unsigned char logical_data[] = "Documents/file.txt";
-    const unsigned char physical_data[] = "Documents/file.txt";
-    SidecarBytes logical = {
-        .data = logical_data,
-        .length = sizeof(logical_data) - 1U
+    return (SidecarBytes){
+        .data = (const unsigned char *)text,
+        .length = strlen(text)
     };
-    SidecarBytes physical = {
-        .data = physical_data,
-        .length = sizeof(physical_data) - 1U
-    };
-    check(physical_matches_logical(logical, physical) == 1,
-          "ASCII logical and physical paths match");
 }
 
-static void test_trailing_dot_encoding(void)
+static SidecarEntry entry_for(const char *logical, const char *physical_leaf,
+                              const char *suffix, SidecarObjectKind kind)
 {
-    const unsigned char logical_data[] = "notes.";
-    const unsigned char physical_data[] = "notes%2E";
-    SidecarBytes logical = {
-        .data = logical_data,
-        .length = sizeof(logical_data) - 1U
-    };
-    SidecarBytes physical = {
-        .data = physical_data,
-        .length = sizeof(physical_data) - 1U
-    };
-    check(physical_matches_logical(logical, physical) == 1,
-          "trailing dot uses its component encoding");
+    SidecarEntry entry;
+    memset(&entry, 0, sizeof(entry));
+    entry.root_id = text_bytes("ROOT");
+    entry.logical_path = text_bytes(logical);
+    entry.physical_leaf = text_bytes(physical_leaf);
+    entry.collision_suffix = text_bytes(suffix);
+    entry.kind = kind;
+    return entry;
 }
 
-static void test_illegal_byte_encoding(void)
+static void test_ordinary_leaf_authentication(void)
 {
-    const unsigned char logical_data[] = "migr:probe";
-    const unsigned char physical_data[] = "migr%3Aprobe";
-    SidecarBytes logical = {
-        .data = logical_data,
-        .length = sizeof(logical_data) - 1U
+    printf(BLUE "::" NC " canonical physical-leaf authentication\n");
+
+    SidecarEntry ascii = entry_for("file.txt", "file.txt", "",
+                                   SIDECAR_KIND_REGULAR);
+    SidecarEntry punctuation = entry_for("a b:c", "a%20b%3Ac", "",
+                                         SIDECAR_KIND_REGULAR);
+    SidecarEntry trailing_dot = entry_for("notes.", "notes%2E", "",
+                                          SIDECAR_KIND_REGULAR);
+    SidecarEntry utf8 = entry_for("caf\xC3\xA9", "caf\xC3\xA9", "",
+                                  SIDECAR_KIND_REGULAR);
+    SidecarEntry suffixed = entry_for("file", "file%7E1", "%7E1",
+                                      SIDECAR_KIND_REGULAR);
+
+    check(restore_entry_physical_leaf_authentic(&ascii),
+          "safe ASCII leaf authenticates");
+    check(restore_entry_physical_leaf_authentic(&punctuation),
+          "punctuation and spaces authenticate through component encoding");
+    check(restore_entry_physical_leaf_authentic(&trailing_dot),
+          "trailing dot authenticates through its canonical escape");
+    check(restore_entry_physical_leaf_authentic(&utf8),
+          "valid UTF-8 remains literal in the canonical leaf");
+    check(restore_entry_physical_leaf_authentic(&suffixed),
+          "canonical collision suffix authenticates through the mapper");
+
+    SidecarEntry tampered = ascii;
+    tampered.physical_leaf = text_bytes("file.txT");
+    check(!restore_entry_physical_leaf_authentic(&tampered),
+          "one-byte physical-leaf tampering is rejected");
+
+    static const unsigned char invalid_utf8_logical[] = { 0xFF };
+    SidecarEntry invalid_utf8 = entry_for("x", "%FF", "",
+                                          SIDECAR_KIND_REGULAR);
+    invalid_utf8.logical_path = (SidecarBytes){
+        .data = invalid_utf8_logical,
+        .length = sizeof(invalid_utf8_logical)
     };
-    SidecarBytes physical = {
-        .data = physical_data,
-        .length = sizeof(physical_data) - 1U
-    };
-    check(physical_matches_logical(logical, physical) == 1,
-          "illegal component byte uses percent encoding");
+    check(restore_entry_physical_leaf_authentic(&invalid_utf8),
+          "invalid nonzero UTF-8 byte authenticates through %XX encoding");
 }
 
-static void test_non_ascii_passthrough(void)
+static void build_repeated_escape_leaf(char out[NAME_MAX + 1U],
+                                       const char *fingerprint)
 {
-    const unsigned char logical_data[] = "caf\xC3\xA9";
-    const unsigned char physical_data[] = "caf\xC3\xA9";
-    SidecarBytes logical = {
-        .data = logical_data,
-        .length = sizeof(logical_data) - 1U
-    };
-    SidecarBytes physical = {
-        .data = physical_data,
-        .length = sizeof(physical_data) - 1U
-    };
-    check(physical_matches_logical(logical, physical) == 1,
-          "valid non-ASCII UTF-8 bytes remain unescaped");
+    size_t offset = 0;
+    for (size_t index = 0; index < 78U; index++)
+    {
+        memcpy(out + offset, "%21", 3U);
+        offset += 3U;
+    }
+    int written = snprintf(out + offset, NAME_MAX + 1U - offset,
+                           "%%7EH%s", fingerprint);
+    if (written != 20)
+        out[0] = '\0';
 }
 
-static void test_deliberate_mismatch(void)
+static void test_shortened_leaf_authentication(void)
 {
-    const unsigned char logical_data[] = "innocuous.txt";
-    const unsigned char physical_data[] = "something-else.txt";
-    SidecarBytes logical = {
-        .data = logical_data,
-        .length = sizeof(logical_data) - 1U
-    };
-    SidecarBytes physical = {
-        .data = physical_data,
-        .length = sizeof(physical_data) - 1U
-    };
-    check(physical_matches_logical(logical, physical) == 0,
-          "different physical name is rejected");
+    printf(BLUE "::" NC " shortened physical-leaf authentication\n");
+
+    char logical[NAME_MAX + 1U];
+    memset(logical, '!', NAME_MAX);
+    logical[NAME_MAX] = '\0';
+    char expected[NAME_MAX + 1U];
+    build_repeated_escape_leaf(expected, "1B70C7FC136F8DD0");
+    SidecarEntry entry = entry_for(logical, expected, "",
+                                   SIDECAR_KIND_REGULAR);
+    check(strlen(expected) == 254U &&
+              restore_entry_physical_leaf_authentic(&entry),
+          "hard-coded shortening vector authenticates exactly");
+
+    char bad[NAME_MAX + 1U];
+    memcpy(bad, expected, sizeof(bad));
+    char *fingerprint = strstr(bad, "%7EH");
+    if (fingerprint != NULL)
+        fingerprint[4] = fingerprint[4] == '1' ? '2' : '1';
+    entry.physical_leaf = text_bytes(bad);
+    check(!restore_entry_physical_leaf_authentic(&entry),
+          "tampered shortening fingerprint is rejected");
+
+    PortablePhysicalName mapped;
+    check(portable_physical_name_map(logical, 1U, &mapped) == 0 &&
+              mapped.shortened && strcmp(mapped.collision_suffix, "%7E1") == 0,
+          "mapper produces a suffix-bearing shortened vector");
+    entry.physical_leaf = text_bytes(mapped.physical_leaf);
+    entry.collision_suffix = text_bytes(mapped.collision_suffix);
+    check(restore_entry_physical_leaf_authentic(&entry),
+          "suffix-bearing shortened leaf authenticates with mapper rebudgeting");
 }
 
-static void test_component_count(void)
+static void test_root_and_suffix_semantics(void)
 {
-    const unsigned char logical_data[] = "a/b";
-    const unsigned char short_physical_data[] = "a";
-    const unsigned char short_logical_data[] = "a";
-    const unsigned char physical_data[] = "a/b";
-    SidecarBytes logical = {
-        .data = logical_data,
-        .length = sizeof(logical_data) - 1U
+    printf(BLUE "::" NC " root and collision-suffix semantics\n");
+
+    SidecarEntry root = entry_for("", "", "", SIDECAR_KIND_REGULAR);
+    check(restore_entry_physical_leaf_authentic(&root),
+          "root mapping permits a non-directory kind with empty leaf/suffix");
+    root.physical_leaf = text_bytes("root");
+    check(!restore_entry_physical_leaf_authentic(&root),
+          "root with a physical leaf is rejected");
+    root.physical_leaf = text_bytes("");
+    root.collision_suffix = text_bytes("%7E1");
+    check(!restore_entry_physical_leaf_authentic(&root),
+          "root with a collision suffix is rejected");
+
+    static const char *invalid_suffixes[] = {
+        "%7E0", "%7E01", "%7E+1", "%7E 1", "%7e1", "%7E",
+        "%7E18446744073709551616"
     };
-    SidecarBytes short_physical = {
-        .data = short_physical_data,
-        .length = sizeof(short_physical_data) - 1U
-    };
-    SidecarBytes short_logical = {
-        .data = short_logical_data,
-        .length = sizeof(short_logical_data) - 1U
-    };
-    SidecarBytes physical = {
-        .data = physical_data,
-        .length = sizeof(physical_data) - 1U
-    };
-    check(physical_matches_logical(logical, short_physical) == 0,
-          "missing physical component is rejected");
-    check(physical_matches_logical(short_logical, physical) == 0,
-          "extra physical component is rejected");
+    for (size_t index = 0;
+         index < sizeof(invalid_suffixes) / sizeof(invalid_suffixes[0]);
+         index++)
+    {
+        SidecarEntry suffix_entry = entry_for(
+            "file", "file", invalid_suffixes[index], SIDECAR_KIND_REGULAR);
+        check(!restore_entry_physical_leaf_authentic(&suffix_entry),
+              "non-canonical collision suffix is rejected");
+    }
+
+    PortablePhysicalName large;
+    check(portable_physical_name_map("file", UINT64_MAX, &large) == 0,
+          "maximum uint64 collision suffix is representable");
+    SidecarEntry entry = entry_for("file", large.physical_leaf,
+                                   large.collision_suffix,
+                                   SIDECAR_KIND_REGULAR);
+    check(restore_entry_physical_leaf_authentic(&entry),
+          "large canonical collision suffix authenticates");
 }
 
-static void test_root_entry(void)
+static int build_index(const SidecarEntry *entries, size_t count,
+                       RestoreAddressIndex *index, PreflightMemory *memory)
 {
-    SidecarBytes logical = { .data = NULL, .length = 0 };
-    SidecarBytes physical = { .data = NULL, .length = 0 };
-    check(physical_matches_logical(logical, physical) == 1,
-          "empty root paths match");
+    memset(index, 0, sizeof(*index));
+    memset(memory, 0, sizeof(*memory));
+    return restore_address_index_build_from_entries_for_test(
+        index, memory, entries, count);
 }
 
-static void test_nested_path(void)
+static void test_parent_topology_and_order(void)
 {
-    const unsigned char logical_data[] = "a/b/c.txt";
-    const unsigned char physical_data[] = "a/b/c.txt";
-    SidecarBytes logical = {
-        .data = logical_data,
-        .length = sizeof(logical_data) - 1U
+    printf(BLUE "::" NC " logical-parent topology is iteration-independent\n");
+
+    SidecarEntry missing[] = {
+        entry_for("dir/file", "file", "", SIDECAR_KIND_REGULAR)
     };
-    SidecarBytes physical = {
-        .data = physical_data,
-        .length = sizeof(physical_data) - 1U
+    RestoreAddressIndex index;
+    PreflightMemory memory;
+    check(build_index(missing, 1U, &index, &memory) != 0 && memory.bytes == 0,
+          "non-root entry without its logical parent is rejected and cleaned up");
+
+    SidecarEntry file_parent[] = {
+        entry_for("", "", "", SIDECAR_KIND_DIRECTORY),
+        entry_for("dir", "dir", "", SIDECAR_KIND_REGULAR),
+        entry_for("dir/file", "file", "", SIDECAR_KIND_REGULAR)
     };
-    check(physical_matches_logical(logical, physical) == 1,
-          "nested components are compared independently");
+    check(build_index(file_parent, 3U, &index, &memory) != 0 &&
+              memory.bytes == 0,
+          "child beneath a non-directory logical parent is rejected");
+
+    SidecarEntry reversed[] = {
+        entry_for("dir/file", "file", "", SIDECAR_KIND_REGULAR),
+        entry_for("dir", "dir", "", SIDECAR_KIND_DIRECTORY),
+        entry_for("", "", "", SIDECAR_KIND_DIRECTORY)
+    };
+    int built = build_index(reversed, 3U, &index, &memory);
+    size_t child = SIZE_MAX;
+    int found = built == 0 ? restore_address_index_find_logical(
+        &index, text_bytes("ROOT"), text_bytes("dir/file"), &child) : -1;
+    check(built == 0 && found == 1 && child < index.count,
+          "root-directory-child chain succeeds even when vector order is reversed");
+    if (built == 0)
+        restore_address_index_free(&memory, &index);
+    check(memory.bytes == 0, "successful index teardown releases its full budget");
 }
 
-static void test_per_component_encoding(void)
+static void make_long_collision_names(char first[NAME_MAX + 1U],
+                                      char second[NAME_MAX + 1U])
 {
-    const unsigned char logical_data[] = "migr:probe/file.txt";
-    const unsigned char physical_data[] = "migr%3Aprobe/file.txt";
-    SidecarBytes logical = {
-        .data = logical_data,
-        .length = sizeof(logical_data) - 1U
+    memset(first, '!', NAME_MAX);
+    memset(second, '!', NAME_MAX);
+    first[NAME_MAX] = '\0';
+    second[NAME_MAX] = '\0';
+    second[NAME_MAX - 1U] = '#';
+}
+
+static void test_physical_sibling_uniqueness(void)
+{
+    printf(BLUE "::" NC " physical sibling ownership is parent-local\n");
+
+    char first[NAME_MAX + 1U], second[NAME_MAX + 1U];
+    make_long_collision_names(first, second);
+    const uint64_t fingerprint = UINT64_C(0x0123456789ABCDEF);
+    PortablePhysicalName first_mapped, second_mapped;
+    check(portable_physical_name_map_with_fingerprint_for_test(
+              first, 0, fingerprint, &first_mapped) == 0 &&
+              portable_physical_name_map_with_fingerprint_for_test(
+                  second, 0, fingerprint, &second_mapped) == 0 &&
+              strcmp(first_mapped.physical_leaf,
+                     second_mapped.physical_leaf) == 0,
+          "forced fingerprint creates two individually canonical equal candidates");
+
+    char first_under_a[PATH_MAX], second_under_a[PATH_MAX];
+    char first_under_b[PATH_MAX];
+    snprintf(first_under_a, sizeof(first_under_a), "A/%s", first);
+    snprintf(second_under_a, sizeof(second_under_a), "A/%s", second);
+    snprintf(first_under_b, sizeof(first_under_b), "B/%s", first);
+
+    SidecarEntry same_parent[] = {
+        entry_for("", "", "", SIDECAR_KIND_DIRECTORY),
+        entry_for("A", "A", "", SIDECAR_KIND_DIRECTORY),
+        entry_for(first_under_a, first_mapped.physical_leaf, "",
+                  SIDECAR_KIND_REGULAR),
+        entry_for(second_under_a, second_mapped.physical_leaf, "",
+                  SIDECAR_KIND_REGULAR)
     };
-    SidecarBytes physical = {
-        .data = physical_data,
-        .length = sizeof(physical_data) - 1U
+    restore_address_test_force_name_fingerprint(fingerprint);
+    RestoreAddressIndex index;
+    PreflightMemory memory;
+    check(build_index(same_parent, 4U, &index, &memory) != 0 &&
+              memory.bytes == 0,
+          "equal canonical physical leaves under one parent are rejected");
+
+    SidecarEntry same_parent_reversed[] = {
+        same_parent[3], same_parent[2], same_parent[1], same_parent[0]
     };
-    check(physical_matches_logical(logical, physical) == 1,
-          "encoding is applied per component, not to the joined path");
+    check(build_index(same_parent_reversed, 4U, &index, &memory) != 0 &&
+              memory.bytes == 0,
+          "sibling ambiguity remains rejected when vector order is reversed");
+
+    SidecarEntry different_parents[] = {
+        entry_for(first_under_a, first_mapped.physical_leaf, "",
+                  SIDECAR_KIND_REGULAR),
+        entry_for(first_under_b, first_mapped.physical_leaf, "",
+                  SIDECAR_KIND_REGULAR),
+        entry_for("B", "B", "", SIDECAR_KIND_DIRECTORY),
+        entry_for("A", "A", "", SIDECAR_KIND_DIRECTORY),
+        entry_for("", "", "", SIDECAR_KIND_DIRECTORY)
+    };
+    int built = build_index(different_parents, 5U, &index, &memory);
+    check(built == 0,
+          "the same physical leaf may be reused beneath different logical parents");
+    if (built == 0)
+        restore_address_index_free(&memory, &index);
+    check(memory.bytes == 0, "parent-local uniqueness test releases index storage");
+    restore_address_test_clear_name_fingerprint();
+}
+
+static void test_invalid_vector_input(void)
+{
+    RestoreAddressIndex index = {0};
+    PreflightMemory memory = {0};
+    errno = 0;
+    check(restore_address_index_build_from_entries_for_test(
+              &index, &memory, NULL, 1U) != 0 && errno == EINVAL &&
+              memory.bytes == 0,
+          "invalid vector input fails without allocating index state");
 }
 
 int main(void)
 {
-    test_exact_ascii();
-    test_trailing_dot_encoding();
-    test_illegal_byte_encoding();
-    test_non_ascii_passthrough();
-    test_deliberate_mismatch();
-    test_component_count();
-    test_root_entry();
-    test_nested_path();
-    test_per_component_encoding();
+    test_ordinary_leaf_authentication();
+    test_shortened_leaf_authentication();
+    test_root_and_suffix_semantics();
+    test_parent_topology_and_order();
+    test_physical_sibling_uniqueness();
+    test_invalid_vector_input();
 
     if (failures != 0)
         printf(RED "portable restore invariant failed: %d assertion(s)\n" NC,

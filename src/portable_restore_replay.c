@@ -50,7 +50,7 @@ typedef struct {
     PreflightMemory memory;
     const Manifest *manifest;
     RootMap root_map;
-    ParentMap parent_map; /* Parent-prefix validation consumes this (D21). */
+    RestoreAddressIndex address_index;
     const SidecarLog *sidecar;
     int data_fd;
     int destination_home_fd;
@@ -178,7 +178,8 @@ static void replay_collection_free(ReplayCollection *collection)
     collection->items = NULL;
     collection->count = 0;
     collection->capacity = 0;
-    parent_map_free(&collection->memory, &collection->parent_map);
+    restore_address_index_free(&collection->memory,
+                               &collection->address_index);
     root_map_free(&collection->root_map);
 }
 
@@ -371,24 +372,34 @@ static int replay_collect_entry(const SidecarLiveView *view, void *argument)
     size_t root_index = root_map_find(&collection->root_map,
                                       collection->manifest,
                                       entry->root_id);
+    size_t address_index = SIZE_MAX;
     if (root_index == SIZE_MAX ||
         !sidecar_path_valid(entry->logical_path, 1) ||
-        !sidecar_path_valid(entry->physical_path, 1) ||
         !replay_entry_valid(entry) ||
-        !entry_physical_matches_parent(
-            &collection->manifest->roots[root_index],
-            &collection->parent_map, entry))
+        restore_address_index_entry_valid(&collection->address_index, entry,
+                                          &address_index) != 1)
     {
         replay_report_failure(collection->report, collection->manifest,
                               root_index, entry->logical_path);
         return 1;
     }
+    (void)address_index;
 
     char logical[PATH_MAX];
     replay_copy_bytes(logical, sizeof(logical), entry->logical_path);
     if (entry->logical_path.length >= sizeof(logical) ||
         manifest_entry_owned(collection->manifest, (int)root_index,
                              logical) != 1)
+    {
+        replay_report_failure(collection->report, collection->manifest,
+                              root_index, entry->logical_path);
+        return 1;
+    }
+
+    /* Canonical v4 leaf authentication is independent of payload traversal,
+     * which still consumes the bounded joined-path compatibility cache. An
+     * unavailable non-root cache must never alias the root payload anchor. */
+    if (entry->logical_path.length != 0 && entry->physical_path.length == 0)
     {
         replay_report_failure(collection->report, collection->manifest,
                               root_index, entry->logical_path);
@@ -1674,9 +1685,19 @@ int portable_restore_replay_at(const PortableRestoreRequest *request,
         goto fail;
     }
     collection.sidecar = &sidecar;
-    if (parent_map_build(&collection.parent_map, &collection.memory,
-                         &sidecar) != 0)
+    const SidecarEntry *address_failure_entry = NULL;
+    if (restore_address_index_build(&collection.address_index,
+                                    &collection.memory, &sidecar,
+                                    &address_failure_entry) != 0)
     {
+        if (address_failure_entry != NULL)
+        {
+            size_t root_index = root_map_find(&collection.root_map,
+                                              request->manifest,
+                                              address_failure_entry->root_id);
+            replay_report_failure(report, request->manifest, root_index,
+                                  address_failure_entry->logical_path);
+        }
         sidecar_log_close(&sidecar);
         close(collection.data_fd);
         collection.data_fd = -1;

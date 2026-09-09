@@ -2,7 +2,7 @@
 
 #include "portable_restore_internal.h"
 #include "portable.h"
-#include "encoding.h"
+#include "portable_name.h"
 #include "hash.h"
 #include "manifest.h"
 #include "sidecar.h"
@@ -110,21 +110,6 @@ void *preflight_array_reserve(
     return grown;
 }
 
-static uint64_t parent_map_hash(const ParentMap *map,
-                                SidecarBytes root_id,
-                                SidecarBytes logical_path)
-{
-    uint64_t hash = HASH_FNV1A_OFFSET_BASIS ^ map->hash_salt;
-    hash = hash_fnv1a_uint64(hash, (uint64_t)root_id.length);
-    hash = hash_fnv1a_bytes(hash, root_id.data, root_id.length);
-    hash = hash_fnv1a_uint64(hash, (uint64_t)logical_path.length);
-    return hash_fnv1a_bytes(hash, logical_path.data, logical_path.length);
-}
-
-static int parent_map_find(const ParentMap *map, SidecarBytes root_id,
-                           SidecarBytes logical_path,
-                           SidecarBytes *physical_out);
-
 int text_component_valid(const char *component, size_t length)
 {
     return portable_component_valid(component, length);
@@ -154,142 +139,107 @@ int sidecar_path_valid(SidecarBytes bytes, int allow_empty)
                                           bytes.length, allow_empty);
 }
 
-static int collision_suffix_valid(SidecarBytes suffix)
+static int sidecar_bytes_equal(SidecarBytes left, SidecarBytes right)
 {
-    if (suffix.length == 0)
-        return 1;
-    uint64_t value = 0;
-    return portable_collision_suffix_parse((const char *)suffix.data,
-                                           suffix.length, &value);
+    return left.length == right.length &&
+           (left.length == 0 ||
+            memcmp(left.data, right.data, left.length) == 0);
 }
 
-static int physical_matches_logical_with_suffix(
-    SidecarBytes logical, SidecarBytes physical, SidecarBytes suffix)
+static int logical_parent_and_leaf(SidecarBytes logical,
+                                   SidecarBytes *parent_out,
+                                   SidecarBytes *leaf_out)
 {
-    size_t logical_index = 0;
-    size_t physical_index = 0;
-
-    for (;;) {
-        if (logical_index == logical.length ||
-            physical_index == physical.length)
-            return logical_index == logical.length &&
-                   physical_index == physical.length;
-
-        size_t logical_start = logical_index;
-        while (logical_index < logical.length &&
-               logical.data[logical_index] != '/')
-            logical_index++;
-        size_t logical_component_length = logical_index - logical_start;
-
-        size_t physical_start = physical_index;
-        while (physical_index < physical.length &&
-               physical.data[physical_index] != '/')
-            physical_index++;
-        size_t physical_component_length = physical_index - physical_start;
-
-        if (logical_component_length == 0 ||
-            logical_component_length > NAME_MAX ||
-            physical_component_length == 0 ||
-            physical_component_length > NAME_MAX)
-            return 0;
-
-        char raw[NAME_MAX + 1U];
-        memcpy(raw, logical.data + logical_start, logical_component_length);
-        raw[logical_component_length] = '\0';
-
-        char encoded[NAME_MAX + 1U];
-        if (encoding_percent_encode(ENCODING_MODE_COMPONENT, raw, encoded,
-                                    sizeof(encoded)) != 0)
-            return 0;
-
-        size_t encoded_length = strlen(encoded);
-        int last_component = logical_index == logical.length;
-        if (last_component && suffix.length > NAME_MAX - encoded_length)
-            return 0;
-        size_t expected_length = encoded_length +
-                                 (last_component ? suffix.length : 0U);
-        if (physical_component_length != expected_length ||
-            memcmp(physical.data + physical_start, encoded,
-                   encoded_length) != 0 ||
-            (last_component && suffix.length != 0 &&
-             memcmp(physical.data + physical_start + encoded_length,
-                    suffix.data, suffix.length) != 0))
-            return 0;
-
-        if (logical_index < logical.length)
-            logical_index++;
-        if (physical_index < physical.length)
-            physical_index++;
-    }
-}
-
-/*
- * True only when physical is the per-component
- * ENCODING_MODE_COMPONENT encoding of logical, joined with '/'.
- * Callers validate both paths with sidecar_path_valid() first.
- * docs/DECISIONS.md D21 (F-2b/F-3) defines the suffix-aware leaf form and
- * the parent-prefix relationship used by the restore gates below.
- */
-int physical_matches_logical(SidecarBytes logical, SidecarBytes physical)
-{
-    return physical_matches_logical_with_suffix(logical, physical,
-                                                 (SidecarBytes){0});
-}
-
-int entry_physical_matches_parent(const ManifestRoot *root,
-                                         const ParentMap *parent_map,
-                                         const SidecarEntry *entry)
-{
-    if (root == NULL || parent_map == NULL || entry == NULL ||
-        !collision_suffix_valid(entry->collision_suffix) ||
-        !sidecar_path_valid(entry->logical_path, 1) ||
-        !sidecar_path_valid(entry->physical_path, 1) ||
-        root->payload_path[0] == '\0')
+    if (parent_out == NULL || leaf_out == NULL ||
+        !sidecar_path_valid(logical, 1))
         return 0;
+    *parent_out = (SidecarBytes){0};
+    *leaf_out = (SidecarBytes){0};
+    if (logical.length == 0)
+        return 1;
 
-    if (entry->logical_path.length == 0)
-        return entry->collision_suffix.length == 0 &&
-               entry->physical_path.length == 0;
-
-    size_t logical_leaf_start = 0;
-    for (size_t index = entry->logical_path.length; index > 0; index--)
-        if (entry->logical_path.data[index - 1U] == '/')
+    size_t leaf_start = 0;
+    for (size_t index = logical.length; index > 0; index--)
+        if (logical.data[index - 1U] == '/')
         {
-            logical_leaf_start = index;
+            leaf_start = index;
             break;
         }
+    parent_out->data = logical.data;
+    parent_out->length = leaf_start == 0 ? 0 : leaf_start - 1U;
+    leaf_out->data = logical.data + leaf_start;
+    leaf_out->length = logical.length - leaf_start;
+    return leaf_out->length != 0 && leaf_out->length <= NAME_MAX;
+}
 
-    SidecarBytes logical_parent = {
-        .data = entry->logical_path.data,
-        .length = logical_leaf_start == 0 ? 0 : logical_leaf_start - 1U
+#ifdef PORTABLE_RESTORE_ADDRESS_TEST_HOOKS
+static int restore_address_forced_fingerprint;
+static uint64_t restore_address_fingerprint;
+
+void restore_address_test_force_name_fingerprint(uint64_t fingerprint)
+{
+    restore_address_forced_fingerprint = 1;
+    restore_address_fingerprint = fingerprint;
+}
+
+void restore_address_test_clear_name_fingerprint(void)
+{
+    restore_address_forced_fingerprint = 0;
+    restore_address_fingerprint = 0;
+}
+#endif
+
+static int restore_name_map(const char *logical_leaf, uint64_t collision_number,
+                            PortablePhysicalName *mapped)
+{
+#ifdef PORTABLE_RESTORE_ADDRESS_TEST_HOOKS
+    if (restore_address_forced_fingerprint)
+        return portable_physical_name_map_with_fingerprint_for_test(
+            logical_leaf, collision_number, restore_address_fingerprint, mapped);
+#endif
+    return portable_physical_name_map(logical_leaf, collision_number, mapped);
+}
+
+int restore_entry_physical_leaf_authentic(const SidecarEntry *entry)
+{
+    if (entry == NULL || !sidecar_path_valid(entry->logical_path, 1) ||
+        !sidecar_physical_leaf_valid(entry->logical_path,
+                                     entry->physical_leaf))
+        return 0;
+    if (entry->logical_path.length == 0)
+        return entry->collision_suffix.length == 0;
+
+    SidecarBytes logical_parent = {0};
+    SidecarBytes logical_leaf = {0};
+    if (!logical_parent_and_leaf(entry->logical_path, &logical_parent,
+                                 &logical_leaf))
+        return 0;
+    (void)logical_parent;
+
+    uint64_t collision_number = 0;
+    if (entry->collision_suffix.length != 0 &&
+        !portable_collision_suffix_parse(
+            (const char *)entry->collision_suffix.data,
+            entry->collision_suffix.length, &collision_number))
+        return 0;
+
+    char logical_leaf_text[NAME_MAX + 1U];
+    memcpy(logical_leaf_text, logical_leaf.data, logical_leaf.length);
+    logical_leaf_text[logical_leaf.length] = '\0';
+    PortablePhysicalName mapped;
+    if (restore_name_map(logical_leaf_text, collision_number, &mapped) != 0)
+        return 0;
+
+    SidecarBytes mapped_leaf = {
+        .data = (const unsigned char *)mapped.physical_leaf,
+        .length = strlen(mapped.physical_leaf)
     };
-    SidecarBytes logical_leaf = {
-        .data = entry->logical_path.data + logical_leaf_start,
-        .length = entry->logical_path.length - logical_leaf_start
+    SidecarBytes mapped_suffix = {
+        .data = (const unsigned char *)mapped.collision_suffix,
+        .length = strlen(mapped.collision_suffix)
     };
-    SidecarBytes physical_leaf = entry->physical_path;
-
-    if (logical_parent.length != 0)
-    {
-        SidecarBytes parent_physical = {0};
-        int found = parent_map_find(parent_map, entry->root_id,
-                                    logical_parent, &parent_physical);
-        if (found != 1 || parent_physical.length == 0 ||
-            parent_physical.data == NULL ||
-            parent_physical.length >= entry->physical_path.length ||
-            entry->physical_path.data == NULL ||
-            memcmp(entry->physical_path.data, parent_physical.data,
-                   parent_physical.length) != 0 ||
-            entry->physical_path.data[parent_physical.length] != '/')
-            return 0;
-        physical_leaf.data = entry->physical_path.data +
-                             parent_physical.length + 1U;
-        physical_leaf.length = entry->physical_path.length -
-                               parent_physical.length - 1U;
-    }
-
-    return physical_matches_logical_with_suffix(logical_leaf, physical_leaf,
-                                                 entry->collision_suffix);
+    return sidecar_bytes_equal(mapped_leaf, entry->physical_leaf) &&
+           sidecar_bytes_equal(mapped_suffix, entry->collision_suffix);
 }
 
 static int root_id_equal(const ManifestRoot *root, SidecarBytes id)
@@ -376,61 +326,39 @@ size_t root_map_find(const RootMap *map, const Manifest *manifest,
     return SIZE_MAX;
 }
 
-static int parent_map_key_valid(SidecarBytes root_id,
-                                SidecarBytes logical_path)
+static int restore_root_id_valid(SidecarBytes root_id)
 {
-    return root_id.length <= SIDECAR_MAX_ROOT_ID && root_id.length != 0 &&
-           root_id.data != NULL && logical_path.length <= SIDECAR_MAX_PATH &&
-           (logical_path.length == 0 || logical_path.data != NULL);
+    return root_id.length != 0 && root_id.length <= SIDECAR_MAX_ROOT_ID &&
+           root_id.data != NULL &&
+           memchr(root_id.data, '\0', root_id.length) == NULL;
 }
 
-static int parent_map_find(const ParentMap *map, SidecarBytes root_id,
-                           SidecarBytes logical_path,
-                           SidecarBytes *physical_out)
+static uint64_t restore_address_logical_hash(const RestoreAddressIndex *index,
+                                             SidecarBytes root_id,
+                                             SidecarBytes logical_path)
 {
-    if (physical_out == NULL || !parent_map_key_valid(root_id, logical_path))
-    {
-        errno = EINVAL;
-        return -1;
-    }
-    *physical_out = (SidecarBytes){0};
-    if (map == NULL || map->capacity == 0 || map->slots == NULL)
-        return 0;
-
-    size_t index = (size_t)parent_map_hash(map, root_id, logical_path) &
-                   (map->capacity - 1U);
-    for (size_t probes = 0; probes < map->capacity; probes++)
-    {
-        const ParentMapSlot *slot = &map->slots[index];
-        if (!slot->used)
-            return 0;
-        if (slot->root_id.length == root_id.length &&
-            slot->logical_path.length == logical_path.length &&
-            (root_id.length == 0 ||
-             memcmp(slot->root_id.data, root_id.data, root_id.length) == 0) &&
-            (logical_path.length == 0 ||
-             memcmp(slot->logical_path.data, logical_path.data,
-                    logical_path.length) == 0))
-        {
-            *physical_out = slot->physical_path;
-            return 1;
-        }
-        index = (index + 1U) & (map->capacity - 1U);
-    }
-    return 0;
+    uint64_t hash = HASH_FNV1A_OFFSET_BASIS ^ index->hash_salt;
+    hash = hash_fnv1a_uint64(hash, (uint64_t)root_id.length);
+    hash = hash_fnv1a_bytes(hash, root_id.data, root_id.length);
+    hash = hash_fnv1a_uint64(hash, (uint64_t)logical_path.length);
+    return hash_fnv1a_bytes(hash, logical_path.data, logical_path.length);
 }
 
-static int parent_map_init(ParentMap *map, PreflightMemory *memory,
-                           size_t expected)
+static uint64_t restore_address_physical_hash(const RestoreAddressIndex *index,
+                                              SidecarBytes root_id,
+                                              SidecarBytes logical_parent,
+                                              SidecarBytes physical_leaf)
 {
-    if (map == NULL || memory == NULL || expected > SIDECAR_MAX_LIVE_ENTRIES)
-    {
-        errno = E2BIG;
-        return -1;
-    }
-    memset(map, 0, sizeof(*map));
-    map->hash_salt = sidecar_process_salt();
-    if (expected > SIZE_MAX / 2U)
+    uint64_t hash = restore_address_logical_hash(index, root_id,
+                                                 logical_parent);
+    hash = hash_fnv1a_uint64(hash, (uint64_t)physical_leaf.length);
+    return hash_fnv1a_bytes(hash, physical_leaf.data, physical_leaf.length);
+}
+
+static int restore_address_capacity(size_t expected, size_t *out)
+{
+    if (out == NULL || expected > SIDECAR_MAX_LIVE_ENTRIES ||
+        expected > SIZE_MAX / 2U)
     {
         errno = E2BIG;
         return -1;
@@ -446,105 +374,367 @@ static int parent_map_init(ParentMap *map, PreflightMemory *memory,
         }
         capacity *= 2U;
     }
-    if (capacity > SIZE_MAX / sizeof(*map->slots))
+    *out = capacity;
+    return 0;
+}
+
+static int restore_address_index_init(RestoreAddressIndex *index,
+                                      PreflightMemory *memory,
+                                      size_t expected)
+{
+    if (index == NULL || memory == NULL || expected > SIDECAR_MAX_LIVE_ENTRIES)
+    {
+        errno = expected > SIDECAR_MAX_LIVE_ENTRIES ? E2BIG : EINVAL;
+        return -1;
+    }
+    memset(index, 0, sizeof(*index));
+    index->hash_salt = sidecar_process_salt();
+    if (expected == 0)
+        return 0;
+    if (expected > SIZE_MAX / sizeof(*index->entries))
     {
         errno = E2BIG;
         return -1;
     }
-    size_t size = capacity * sizeof(*map->slots);
-    map->slots = preflight_alloc(memory, size);
-    if (map->slots == NULL)
+    index->entries = preflight_alloc(memory,
+                                     expected * sizeof(*index->entries));
+    if (index->entries == NULL)
         return -1;
-    memset(map->slots, 0, size);
-    map->capacity = capacity;
+    memset(index->entries, 0, expected * sizeof(*index->entries));
+    index->capacity = expected;
+
+    size_t table_capacity = 0;
+    if (restore_address_capacity(expected, &table_capacity) != 0 ||
+        table_capacity > SIZE_MAX / sizeof(*index->logical_slots))
+    {
+        errno = E2BIG;
+        restore_address_index_free(memory, index);
+        return -1;
+    }
+    size_t table_size = table_capacity * sizeof(*index->logical_slots);
+    index->logical_capacity = table_capacity;
+    index->physical_capacity = table_capacity;
+    index->logical_slots = preflight_alloc(memory, table_size);
+    index->physical_slots = preflight_alloc(memory, table_size);
+    if (index->logical_slots == NULL || index->physical_slots == NULL)
+    {
+        int saved = errno;
+        restore_address_index_free(memory, index);
+        errno = saved;
+        return -1;
+    }
+    memset(index->logical_slots, 0, table_size);
+    memset(index->physical_slots, 0, table_size);
     return 0;
 }
 
-void parent_map_free(PreflightMemory *memory, ParentMap *map)
+void restore_address_index_free(PreflightMemory *memory,
+                                RestoreAddressIndex *index)
 {
-    if (map == NULL)
+    if (index == NULL)
         return;
-    preflight_free(memory, map->slots,
-                   map->capacity * sizeof(*map->slots));
-    memset(map, 0, sizeof(*map));
+    preflight_free(memory, index->entries,
+                   index->capacity * sizeof(*index->entries));
+    preflight_free(memory, index->logical_slots,
+                   index->logical_capacity * sizeof(*index->logical_slots));
+    preflight_free(memory, index->physical_slots,
+                   index->physical_capacity * sizeof(*index->physical_slots));
+    memset(index, 0, sizeof(*index));
 }
 
-static int parent_map_insert(ParentMap *map, SidecarBytes root_id,
-                             SidecarBytes logical_path,
-                             SidecarBytes physical_path)
+int restore_address_index_find_logical(const RestoreAddressIndex *index,
+                                       SidecarBytes root_id,
+                                       SidecarBytes logical_path,
+                                       size_t *entry_index_out)
 {
-    SidecarBytes existing = {0};
-    int found = parent_map_find(map, root_id, logical_path, &existing);
+    if (entry_index_out == NULL || !restore_root_id_valid(root_id) ||
+        !sidecar_path_valid(logical_path, 1))
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    *entry_index_out = SIZE_MAX;
+    if (index == NULL || index->logical_capacity == 0 ||
+        index->logical_slots == NULL)
+        return 0;
+
+    size_t slot_index = (size_t)restore_address_logical_hash(
+        index, root_id, logical_path) & (index->logical_capacity - 1U);
+    for (size_t probes = 0; probes < index->logical_capacity; probes++)
+    {
+        const RestoreAddressSlot *slot = &index->logical_slots[slot_index];
+        if (!slot->used)
+            return 0;
+        if (slot->entry_index >= index->count)
+        {
+            errno = EINVAL;
+            return -1;
+        }
+        const SidecarEntry *entry = index->entries[slot->entry_index].entry;
+        if (entry != NULL && sidecar_bytes_equal(entry->root_id, root_id) &&
+            sidecar_bytes_equal(entry->logical_path, logical_path))
+        {
+            *entry_index_out = slot->entry_index;
+            return 1;
+        }
+        slot_index = (slot_index + 1U) & (index->logical_capacity - 1U);
+    }
+    return 0;
+}
+
+int restore_address_index_find_physical(const RestoreAddressIndex *index,
+                                        SidecarBytes root_id,
+                                        SidecarBytes logical_parent,
+                                        SidecarBytes physical_leaf,
+                                        size_t *entry_index_out)
+{
+    if (entry_index_out == NULL || !restore_root_id_valid(root_id) ||
+        !sidecar_path_valid(logical_parent, 1) ||
+        physical_leaf.length == 0 ||
+        physical_leaf.length > SIDECAR_MAX_PHYSICAL_LEAF ||
+        physical_leaf.data == NULL ||
+        !portable_component_valid((const char *)physical_leaf.data,
+                                  physical_leaf.length))
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    *entry_index_out = SIZE_MAX;
+    if (index == NULL || index->physical_capacity == 0 ||
+        index->physical_slots == NULL)
+        return 0;
+
+    size_t slot_index = (size_t)restore_address_physical_hash(
+        index, root_id, logical_parent, physical_leaf) &
+        (index->physical_capacity - 1U);
+    for (size_t probes = 0; probes < index->physical_capacity; probes++)
+    {
+        const RestoreAddressSlot *slot = &index->physical_slots[slot_index];
+        if (!slot->used)
+            return 0;
+        if (slot->entry_index >= index->count)
+        {
+            errno = EINVAL;
+            return -1;
+        }
+        const RestoreAddressEntry *address = &index->entries[slot->entry_index];
+        const SidecarEntry *entry = address->entry;
+        if (entry != NULL && sidecar_bytes_equal(entry->root_id, root_id) &&
+            sidecar_bytes_equal(address->logical_parent, logical_parent) &&
+            sidecar_bytes_equal(entry->physical_leaf, physical_leaf))
+        {
+            *entry_index_out = slot->entry_index;
+            return 1;
+        }
+        slot_index = (slot_index + 1U) & (index->physical_capacity - 1U);
+    }
+    return 0;
+}
+
+static int restore_address_insert_logical(RestoreAddressIndex *index,
+                                          size_t entry_index)
+{
+    const SidecarEntry *entry = index->entries[entry_index].entry;
+    size_t existing = SIZE_MAX;
+    int found = restore_address_index_find_logical(
+        index, entry->root_id, entry->logical_path, &existing);
     if (found != 0)
     {
         errno = found < 0 ? errno : EINVAL;
         return -1;
     }
-    if (!parent_map_key_valid(root_id, logical_path) ||
-        physical_path.length > SIDECAR_MAX_PATH ||
-        (physical_path.length != 0 && physical_path.data == NULL) ||
-        map == NULL || map->slots == NULL || map->capacity == 0 ||
-        map->count >= map->capacity)
+    size_t slot_index = (size_t)restore_address_logical_hash(
+        index, entry->root_id, entry->logical_path) &
+        (index->logical_capacity - 1U);
+    for (size_t probes = 0; probes < index->logical_capacity; probes++)
     {
-        errno = E2BIG;
-        return -1;
-    }
-
-    size_t index = (size_t)parent_map_hash(map, root_id, logical_path) &
-                   (map->capacity - 1U);
-    for (size_t probes = 0; probes < map->capacity; probes++)
-    {
-        ParentMapSlot *slot = &map->slots[index];
+        RestoreAddressSlot *slot = &index->logical_slots[slot_index];
         if (!slot->used)
         {
-            slot->root_id = root_id;
-            slot->logical_path = logical_path;
-            slot->physical_path = physical_path;
             slot->used = 1;
-            map->count++;
+            slot->entry_index = entry_index;
             return 0;
         }
-        index = (index + 1U) & (map->capacity - 1U);
+        slot_index = (slot_index + 1U) & (index->logical_capacity - 1U);
     }
     errno = E2BIG;
     return -1;
 }
 
-static int parent_map_collect(const SidecarLiveView *view, void *argument)
+static int restore_address_insert_physical(RestoreAddressIndex *index,
+                                           size_t entry_index)
 {
-    ParentMap *map = argument;
-    if (map == NULL || view == NULL || view->entry == NULL)
+    const RestoreAddressEntry *address = &index->entries[entry_index];
+    const SidecarEntry *entry = address->entry;
+    size_t existing = SIZE_MAX;
+    int found = restore_address_index_find_physical(
+        index, entry->root_id, address->logical_parent,
+        entry->physical_leaf, &existing);
+    if (found != 0)
+    {
+        errno = found < 0 ? errno : EINVAL;
+        return -1;
+    }
+    size_t slot_index = (size_t)restore_address_physical_hash(
+        index, entry->root_id, address->logical_parent,
+        entry->physical_leaf) & (index->physical_capacity - 1U);
+    for (size_t probes = 0; probes < index->physical_capacity; probes++)
+    {
+        RestoreAddressSlot *slot = &index->physical_slots[slot_index];
+        if (!slot->used)
+        {
+            slot->used = 1;
+            slot->entry_index = entry_index;
+            return 0;
+        }
+        slot_index = (slot_index + 1U) & (index->physical_capacity - 1U);
+    }
+    errno = E2BIG;
+    return -1;
+}
+
+static int restore_address_index_finalize(
+    RestoreAddressIndex *index, const SidecarEntry **failure_entry_out)
+{
+    if (failure_entry_out != NULL)
+        *failure_entry_out = NULL;
+    if (index == NULL || index->count > index->capacity)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    for (size_t entry_index = 0; entry_index < index->count; entry_index++)
+    {
+        RestoreAddressEntry *address = &index->entries[entry_index];
+        const SidecarEntry *entry = address->entry;
+        SidecarBytes logical_leaf = {0};
+        if (entry == NULL || !restore_root_id_valid(entry->root_id) ||
+            !logical_parent_and_leaf(entry->logical_path,
+                                     &address->logical_parent,
+                                     &logical_leaf) ||
+            !restore_entry_physical_leaf_authentic(entry) ||
+            restore_address_insert_logical(index, entry_index) != 0)
+        {
+            if (failure_entry_out != NULL)
+                *failure_entry_out = entry;
+            errno = errno == 0 ? EINVAL : errno;
+            return -1;
+        }
+    }
+
+    for (size_t entry_index = 0; entry_index < index->count; entry_index++)
+    {
+        RestoreAddressEntry *address = &index->entries[entry_index];
+        const SidecarEntry *entry = address->entry;
+        if (entry->logical_path.length == 0)
+            continue;
+        size_t parent_index = SIZE_MAX;
+        int found = restore_address_index_find_logical(
+            index, entry->root_id, address->logical_parent, &parent_index);
+        if (found != 1 || parent_index >= index->count ||
+            index->entries[parent_index].entry == NULL ||
+            index->entries[parent_index].entry->kind != SIDECAR_KIND_DIRECTORY ||
+            restore_address_insert_physical(index, entry_index) != 0)
+        {
+            if (failure_entry_out != NULL)
+                *failure_entry_out = entry;
+            errno = found < 0 ? errno : EINVAL;
+            return -1;
+        }
+    }
+    return 0;
+}
+
+int restore_address_index_entry_valid(const RestoreAddressIndex *index,
+                                      const SidecarEntry *entry,
+                                      size_t *entry_index_out)
+{
+    if (entry == NULL || entry_index_out == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    *entry_index_out = SIZE_MAX;
+    size_t entry_index = SIZE_MAX;
+    int found = restore_address_index_find_logical(
+        index, entry->root_id, entry->logical_path, &entry_index);
+    if (found != 1)
+        return found;
+    if (entry_index >= index->count || index->entries[entry_index].entry != entry)
+        return 0;
+    *entry_index_out = entry_index;
+    return 1;
+}
+
+typedef struct {
+    RestoreAddressIndex *index;
+} RestoreAddressCollect;
+
+static int restore_address_collect(const SidecarLiveView *view, void *argument)
+{
+    RestoreAddressCollect *collect = argument;
+    if (collect == NULL || collect->index == NULL || view == NULL ||
+        view->entry == NULL || collect->index->count >= collect->index->capacity)
     {
         errno = EINVAL;
         return 1;
     }
-    return parent_map_insert(map, view->entry->root_id,
-                             view->entry->logical_path,
-                             view->entry->physical_path) == 0 ? 0 : 1;
+    collect->index->entries[collect->index->count++].entry = view->entry;
+    return 0;
 }
 
-int parent_map_build(ParentMap *map, PreflightMemory *memory,
-                            SidecarLog *sidecar)
+int restore_address_index_build(RestoreAddressIndex *index,
+                                PreflightMemory *memory, SidecarLog *sidecar,
+                                const SidecarEntry **failure_entry_out)
 {
-    if (map == NULL || memory == NULL || sidecar == NULL)
+    if (failure_entry_out != NULL)
+        *failure_entry_out = NULL;
+    if (index == NULL || memory == NULL || sidecar == NULL)
     {
         errno = EINVAL;
         return -1;
     }
     size_t live_count = sidecar_log_live_count(sidecar);
-    if (parent_map_init(map, memory, live_count) != 0)
+    if (restore_address_index_init(index, memory, live_count) != 0)
         return -1;
-    SidecarStatus status = sidecar_log_foreach(sidecar, parent_map_collect,
-                                               map);
-    if (status != SIDECAR_STATUS_OK)
+    RestoreAddressCollect collect = { .index = index };
+    SidecarStatus status = sidecar_log_foreach(sidecar, restore_address_collect,
+                                               &collect);
+    if (status != SIDECAR_STATUS_OK || index->count != live_count ||
+        restore_address_index_finalize(index, failure_entry_out) != 0)
     {
         int saved = errno;
-        parent_map_free(memory, map);
+        restore_address_index_free(memory, index);
         errno = saved == 0 ? EIO : saved;
         return -1;
     }
     return 0;
 }
+
+#ifdef PORTABLE_RESTORE_ADDRESS_TEST_HOOKS
+int restore_address_index_build_from_entries_for_test(
+    RestoreAddressIndex *index, PreflightMemory *memory,
+    const SidecarEntry *entries, size_t count)
+{
+    if (index == NULL || memory == NULL || (entries == NULL && count != 0))
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    if (restore_address_index_init(index, memory, count) != 0)
+        return -1;
+    for (size_t entry_index = 0; entry_index < count; entry_index++)
+        index->entries[index->count++].entry = &entries[entry_index];
+    if (restore_address_index_finalize(index, NULL) != 0)
+    {
+        int saved = errno;
+        restore_address_index_free(memory, index);
+        errno = saved;
+        return -1;
+    }
+    return 0;
+}
+#endif
 
 int xdg_key_index(const char *id)
 {

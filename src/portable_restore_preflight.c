@@ -21,8 +21,8 @@
 
 typedef struct {
     size_t root_index;
+    size_t address_index;
     char *logical;
-    char *physical;
     SidecarObjectKind kind;
     uint32_t mode;
     uint32_t uid;
@@ -40,7 +40,7 @@ typedef struct {
     const Manifest *manifest;
     PortableRestorePreflightReport *report;
     RootMap root_map;
-    ParentMap parent_map; /* Parent-prefix validation consumes this (D21). */
+    RestoreAddressIndex address_index;
     size_t *root_order;
     PreflightEntries *entries;
     int destination_home_fd;
@@ -52,18 +52,10 @@ typedef struct {
 } Collection;
 
 typedef struct {
-    PreflightEntry **logical;
-    PreflightEntry **physical;
-    size_t count;
-} EntryOrders;
-
-typedef struct {
     int data_fd;
     const Collection *collection;
-    const PreflightEntries *entries;
-    const EntryOrders *orders;
     unsigned char *seen;
-    char path[PATH_MAX];
+    char root_namespace_path[PATH_MAX];
     int failed;
 } PayloadInventory;
 
@@ -233,9 +225,6 @@ static void entries_free(PreflightMemory *memory, PreflightEntries *entries)
         preflight_free(memory, entries->items[index].logical,
                        entries->items[index].logical == NULL ? 0
                            : strlen(entries->items[index].logical) + 1U);
-        preflight_free(memory, entries->items[index].physical,
-                       entries->items[index].physical == NULL ? 0
-                           : strlen(entries->items[index].physical) + 1U);
     }
     preflight_free(memory, entries->items,
                    entries->capacity * sizeof(*entries->items));
@@ -477,13 +466,20 @@ static int collect_entry(const SidecarLiveView *view, void *argument)
         report->roots[root_index].live_count++;
 
     int logical_valid = sidecar_path_valid(entry->logical_path, 1);
-    int physical_valid = sidecar_path_valid(entry->physical_path, 1);
-    if (logical_valid <= 0 || physical_valid <= 0)
+    if (logical_valid <= 0)
     {
         report_violation(report, root_index, "invalid-path");
-        if (logical_valid < 0 || physical_valid < 0)
+        if (logical_valid < 0)
             return 1;
         return 0;
+    }
+    size_t address_index = SIZE_MAX;
+    int address_valid = restore_address_index_entry_valid(
+        &collection->address_index, entry, &address_index);
+    if (address_valid != 1)
+    {
+        report_violation(report, root_index, "physical-mismatch");
+        return address_valid < 0 ? 1 : 0;
     }
     char logical[PATH_MAX];
     if (entry->logical_path.length >= sizeof(logical))
@@ -498,13 +494,6 @@ static int collect_entry(const SidecarLiveView *view, void *argument)
                              logical) != 1)
     {
         report_violation(report, root_index, logical);
-        return 0;
-    }
-    if (!entry_physical_matches_parent(
-            &collection->manifest->roots[root_index],
-            &collection->parent_map, entry))
-    {
-        report_violation(report, root_index, "physical-mismatch");
         return 0;
     }
     if (entry->kind != SIDECAR_KIND_REGULAR &&
@@ -535,9 +524,7 @@ static int collect_entry(const SidecarLiveView *view, void *argument)
     PreflightEntry *destination = &entries->items[entries->count];
     memset(destination, 0, sizeof(*destination));
     if (copy_sidecar_path(&collection->memory, entry->logical_path,
-                          &destination->logical) != 0 ||
-        copy_sidecar_path(&collection->memory, entry->physical_path,
-                          &destination->physical) != 0)
+                          &destination->logical) != 0)
     {
         preflight_free(&collection->memory, destination->logical,
                        destination->logical == NULL ? 0
@@ -546,6 +533,7 @@ static int collect_entry(const SidecarLiveView *view, void *argument)
         return 1;
     }
     destination->root_index = root_index;
+    destination->address_index = address_index;
     destination->kind = entry->kind;
     destination->mode = entry->mode;
     destination->uid = entry->uid;
@@ -570,158 +558,6 @@ static int collect_entry(const SidecarLiveView *view, void *argument)
                                  &collection->manifest->roots[root_index],
                                  root_index, destination) < -1)
         return 1;
-    return 0;
-}
-
-static int logical_order_compare(const void *left, const void *right)
-{
-    const PreflightEntry *a = *(const PreflightEntry *const *)left;
-    const PreflightEntry *b = *(const PreflightEntry *const *)right;
-    if (a->root_index < b->root_index)
-        return -1;
-    if (a->root_index > b->root_index)
-        return 1;
-    return strcmp(a->logical, b->logical);
-}
-
-static int physical_order_compare(const void *left, const void *right)
-{
-    const PreflightEntry *a = *(const PreflightEntry *const *)left;
-    const PreflightEntry *b = *(const PreflightEntry *const *)right;
-    if (a->root_index < b->root_index)
-        return -1;
-    if (a->root_index > b->root_index)
-        return 1;
-    return strcmp(a->physical, b->physical);
-}
-
-static void entry_orders_free(PreflightMemory *memory, EntryOrders *orders)
-{
-    if (orders == NULL)
-        return;
-    preflight_free(memory, orders->logical,
-                   orders->count * sizeof(*orders->logical));
-    preflight_free(memory, orders->physical,
-                   orders->count * sizeof(*orders->physical));
-    memset(orders, 0, sizeof(*orders));
-}
-
-static PreflightEntry *find_physical(const EntryOrders *orders,
-                                     size_t root_index, const char *physical);
-
-static PreflightEntry *find_logical(const EntryOrders *orders,
-                                    size_t root_index, const char *logical)
-{
-    size_t left = 0;
-    size_t right = orders->count;
-    while (left < right)
-    {
-        size_t middle = left + (right - left) / 2U;
-        PreflightEntry *entry = orders->logical[middle];
-        int comparison;
-        if (entry->root_index < root_index)
-            comparison = -1;
-        else if (entry->root_index > root_index)
-            comparison = 1;
-        else
-            comparison = strcmp(entry->logical, logical);
-        if (comparison < 0)
-            left = middle + 1U;
-        else
-            right = middle;
-    }
-    if (left == orders->count)
-        return NULL;
-    PreflightEntry *entry = orders->logical[left];
-    return entry->root_index == root_index &&
-           strcmp(entry->logical, logical) == 0 ? entry : NULL;
-}
-
-/* collect_entry() already requires every non-root entry's immediate logical
- * parent to exist (D21). Exact parent lookup therefore catches every
- * non-directory ancestor without relying on strcmp adjacency. */
-static int entry_ancestor_conflict(const EntryOrders *orders,
-                                   const PreflightEntry *entry, int physical)
-{
-    const char *path = physical ? entry->physical : entry->logical;
-    const char *slash = strrchr(path, '/');
-    if (slash == NULL || (size_t)(slash - path) >= PATH_MAX)
-        return 0;
-
-    char parent[PATH_MAX];
-    size_t parent_length = (size_t)(slash - path);
-    memcpy(parent, path, parent_length);
-    parent[parent_length] = '\0';
-    PreflightEntry *found = physical
-        ? find_physical(orders, entry->root_index, parent)
-        : find_logical(orders, entry->root_index, parent);
-    return found != NULL && found->kind != SIDECAR_KIND_DIRECTORY;
-}
-
-static int analyze_entries(PreflightMemory *memory,
-                           PreflightEntries *entries,
-                           EntryOrders *orders,
-                           PortableRestorePreflightReport *report)
-{
-    memset(orders, 0, sizeof(*orders));
-    if (entries->count == 0)
-        return 0;
-    if (entries->count > SIZE_MAX / sizeof(*orders->logical))
-    {
-        errno = E2BIG;
-        return -1;
-    }
-    size_t size = entries->count * sizeof(*orders->logical);
-    orders->logical = preflight_alloc(memory, size);
-    orders->physical = preflight_alloc(memory, size);
-    if (orders->logical == NULL || orders->physical == NULL)
-        return -1;
-    orders->count = entries->count;
-    for (size_t index = 0; index < entries->count; index++)
-    {
-        orders->logical[index] = &entries->items[index];
-        orders->physical[index] = &entries->items[index];
-    }
-    qsort(orders->logical, orders->count, sizeof(*orders->logical),
-          logical_order_compare);
-    qsort(orders->physical, orders->count, sizeof(*orders->physical),
-          physical_order_compare);
-
-    for (size_t index = 1; index < orders->count; index++)
-    {
-        PreflightEntry *previous = orders->logical[index - 1U];
-        PreflightEntry *current = orders->logical[index];
-        if (previous->root_index == current->root_index &&
-            strcmp(previous->logical, current->logical) == 0)
-            report_violation(report, current->root_index, current->logical);
-    }
-    for (size_t index = 1; index < orders->count; index++)
-    {
-        PreflightEntry *previous = orders->physical[index - 1U];
-        PreflightEntry *current = orders->physical[index];
-        if (previous->root_index == current->root_index &&
-            strcmp(previous->physical, current->physical) == 0)
-        {
-            /* Unreachable via collect_entry() as of D.4b: every entry that
-             * reaches this array has already passed the physical/logical
-             * validator, and component_percent_encode() is injective, so two
-             * different logical paths can no longer produce the same physical
-             * path. entry_physical_matches_parent() also preserves the logical
-             * parent chain in the physical namespace, which is why the physical
-             * ancestor pass below subsumes a second logical ancestor pass.
-             * Kept as defense-in-depth in case either guarantee changes. */
-            if (strcmp(previous->logical, current->logical) != 0)
-                report_violation(report, current->root_index,
-                                 current->logical);
-        }
-    }
-    for (size_t index = 0; index < orders->count; index++)
-    {
-        PreflightEntry *current = orders->physical[index];
-        if (entry_ancestor_conflict(orders, current, 1))
-            report_violation(report, current->root_index, current->logical);
-    }
-
     return 0;
 }
 
@@ -824,36 +660,6 @@ static size_t root_order_find_exact(const Collection *collection,
         ? root_index : SIZE_MAX;
 }
 
-static size_t root_for_payload_path(const Collection *collection,
-                                    const char *path,
-                                    const char **relative_out)
-{
-    if (collection->report->root_count == 0)
-        return SIZE_MAX;
-    /* An owning root must be an exact slash-delimited prefix of path. Walk
-     * those prefixes directly instead of trusting a lexical predecessor. */
-    size_t length = strlen(path);
-    for (;;)
-    {
-        if (length >= PATH_MAX)
-            return SIZE_MAX;
-        char candidate[PATH_MAX];
-        memcpy(candidate, path, length);
-        candidate[length] = '\0';
-        size_t root_index = root_order_find_exact(collection, candidate);
-        if (root_index != SIZE_MAX)
-        {
-            const ManifestRoot *root = &collection->manifest->roots[root_index];
-            relative_path_prefix_match(root->payload_path, path, relative_out);
-            return root_index;
-        }
-        const char *slash = memrchr(path, '/', length);
-        if (slash == NULL)
-            return SIZE_MAX;
-        length = (size_t)(slash - path);
-    }
-}
-
 static int root_has_descendant(const Collection *collection, const char *path)
 {
     if (collection->report->root_count == 0)
@@ -876,48 +682,52 @@ static int root_has_descendant(const Collection *collection, const char *path)
     return 0;
 }
 
-static PreflightEntry *find_physical(const EntryOrders *orders,
-                                     size_t root_index, const char *physical)
+static SidecarBytes manifest_root_id_bytes(const ManifestRoot *root)
 {
-    size_t left = 0;
-    size_t right = orders->count;
-    while (left < right)
-    {
-        size_t middle = left + (right - left) / 2U;
-        PreflightEntry *entry = orders->physical[middle];
-        int comparison;
-        if (entry->root_index < root_index)
-            comparison = -1;
-        else if (entry->root_index > root_index)
-            comparison = 1;
-        else
-            comparison = strcmp(entry->physical, physical);
-        if (comparison < 0)
-            left = middle + 1U;
-        else
-            right = middle;
-    }
-    if (left == orders->count)
-        return NULL;
-    PreflightEntry *entry = orders->physical[left];
-    return entry->root_index == root_index &&
-           strcmp(entry->physical, physical) == 0 ? entry : NULL;
+    return (SidecarBytes){
+        .data = (const unsigned char *)root->id,
+        .length = strlen(root->id)
+    };
 }
 
-static int mark_payload_node(PayloadInventory *inventory, size_t root_index,
-                             const char *physical, const struct stat *st)
+static void report_address_entry_violation(PayloadInventory *inventory,
+                                           size_t root_index,
+                                           const SidecarEntry *entry)
 {
-    PreflightEntry *entry = find_physical(inventory->orders, root_index,
-                                          physical);
-    if (entry == NULL)
+    if (entry == NULL || entry->logical_path.length >= PATH_MAX)
     {
-        report_violation(inventory->collection->report, root_index, physical);
+        report_violation(inventory->collection->report, root_index,
+                         "payload-address");
+        return;
+    }
+    char logical[PATH_MAX];
+    if (entry->logical_path.length != 0)
+        memcpy(logical, entry->logical_path.data, entry->logical_path.length);
+    logical[entry->logical_path.length] = '\0';
+    report_violation(inventory->collection->report, root_index, logical);
+}
+
+static int mark_payload_entry(PayloadInventory *inventory, size_t root_index,
+                              size_t address_index, const struct stat *st)
+{
+    const RestoreAddressIndex *addresses = &inventory->collection->address_index;
+    if (address_index >= addresses->count || st == NULL ||
+        addresses->entries[address_index].entry == NULL)
+    {
+        report_violation(inventory->collection->report, root_index,
+                         "payload-address");
         return -1;
     }
-    size_t entry_index = (size_t)(entry - inventory->entries->items);
-    if (inventory->seen[entry_index] != 0)
+    const SidecarEntry *entry = addresses->entries[address_index].entry;
+    if (inventory->seen[address_index] != 0)
     {
-        report_violation(inventory->collection->report, root_index, physical);
+        report_address_entry_violation(inventory, root_index, entry);
+        return -1;
+    }
+    if (S_ISLNK(st->st_mode) ||
+        (!S_ISREG(st->st_mode) && !S_ISDIR(st->st_mode)))
+    {
+        report_address_entry_violation(inventory, root_index, entry);
         return -1;
     }
     int is_directory = S_ISDIR(st->st_mode);
@@ -925,61 +735,53 @@ static int mark_payload_node(PayloadInventory *inventory, size_t root_index,
         (entry->kind == SIDECAR_KIND_REGULAR &&
          (st->st_size < 0 || (uintmax_t)st->st_size != entry->size)))
     {
-        report_violation(inventory->collection->report, root_index, physical);
+        report_address_entry_violation(inventory, root_index, entry);
         return -1;
     }
-    inventory->seen[entry_index] = 1;
+    inventory->seen[address_index] = 1;
     return 0;
 }
 
-static int scan_payload_directory(PayloadInventory *inventory, int directory_fd,
-                                   size_t path_length);
+static int scan_root_payload_directory(PayloadInventory *inventory,
+                                       int directory_fd, size_t root_index,
+                                       SidecarBytes logical_parent);
 
-static int scan_payload_node(PayloadInventory *inventory, int parent_fd,
-                             const char *name, size_t path_length)
+static int scan_root_payload_node(PayloadInventory *inventory, int parent_fd,
+                                  size_t root_index,
+                                  SidecarBytes logical_parent,
+                                  const char *physical_leaf)
 {
-    struct stat st;
-    if (fstatat(parent_fd, name, &st, AT_SYMLINK_NOFOLLOW) != 0)
+    const ManifestRoot *root = &inventory->collection->manifest->roots[root_index];
+    SidecarBytes leaf = {
+        .data = (const unsigned char *)physical_leaf,
+        .length = strlen(physical_leaf)
+    };
+    size_t address_index = SIZE_MAX;
+    int found = restore_address_index_find_physical(
+        &inventory->collection->address_index, manifest_root_id_bytes(root),
+        logical_parent, leaf, &address_index);
+    if (found != 1)
+    {
+        report_violation(inventory->collection->report, root_index,
+                         physical_leaf);
         return -1;
-    const char *physical = NULL;
-    size_t root_index = root_for_payload_path(inventory->collection,
-                                               inventory->path, &physical);
-    if (root_index == SIZE_MAX)
-    {
-        if (!root_has_descendant(inventory->collection, inventory->path))
-        {
-            report_violation(inventory->collection->report, SIZE_MAX,
-                             inventory->path);
-            return -1;
-        }
-        if (!S_ISDIR(st.st_mode))
-        {
-            report_violation(inventory->collection->report, SIZE_MAX,
-                             inventory->path);
-            return -1;
-        }
     }
-    else
-    {
-        if (S_ISLNK(st.st_mode) ||
-            (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode)))
-        {
-            report_violation(inventory->collection->report, root_index,
-                             physical);
-            return -1;
-        }
-        if (mark_payload_node(inventory, root_index, physical, &st) != 0)
-            return -1;
-    }
-    if (!S_ISDIR(st.st_mode))
+    struct stat st;
+    if (fstatat(parent_fd, physical_leaf, &st, AT_SYMLINK_NOFOLLOW) != 0 ||
+        mark_payload_entry(inventory, root_index, address_index, &st) != 0)
+        return -1;
+    const SidecarEntry *entry = inventory->collection->address_index
+                                    .entries[address_index].entry;
+    if (entry->kind != SIDECAR_KIND_DIRECTORY)
         return 0;
 
-    int child_fd = openat(parent_fd, name,
+    int child_fd = openat(parent_fd, physical_leaf,
                           O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
                               O_NOATIME | O_CLOEXEC);
     if (child_fd < 0)
         return -1;
-    int result = scan_payload_directory(inventory, child_fd, path_length);
+    int result = scan_root_payload_directory(inventory, child_fd, root_index,
+                                             entry->logical_path);
     int saved = errno;
     if (close(child_fd) != 0 && result == 0)
     {
@@ -990,8 +792,126 @@ static int scan_payload_node(PayloadInventory *inventory, int parent_fd,
     return result;
 }
 
-static int scan_payload_directory(PayloadInventory *inventory, int directory_fd,
-                                   size_t path_length)
+static int scan_root_payload_directory(PayloadInventory *inventory,
+                                       int directory_fd, size_t root_index,
+                                       SidecarBytes logical_parent)
+{
+    int scan_fd = dup_cloexec(directory_fd);
+    DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
+    if (directory == NULL)
+    {
+        if (scan_fd >= 0)
+            close(scan_fd);
+        return -1;
+    }
+    int result = 0;
+    for (;;)
+    {
+        errno = 0;
+        struct dirent *entry = readdir(directory);
+        if (entry == NULL)
+        {
+            if (errno != 0)
+                result = -1;
+            break;
+        }
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0)
+            continue;
+        size_t name_length = strlen(entry->d_name);
+        if (!text_component_valid(entry->d_name, name_length))
+        {
+            result = -1;
+            break;
+        }
+        if (scan_root_payload_node(inventory, directory_fd, root_index,
+                                   logical_parent, entry->d_name) != 0)
+        {
+            result = -1;
+            break;
+        }
+    }
+    if (closedir(directory) != 0)
+        result = -1;
+    return result;
+}
+
+static int scan_root_anchor(PayloadInventory *inventory, int parent_fd,
+                            const char *name, size_t root_index,
+                            const struct stat *st)
+{
+    const ManifestRoot *root = &inventory->collection->manifest->roots[root_index];
+    size_t address_index = SIZE_MAX;
+    int found = restore_address_index_find_logical(
+        &inventory->collection->address_index, manifest_root_id_bytes(root),
+        (SidecarBytes){0}, &address_index);
+    if (found != 1 ||
+        mark_payload_entry(inventory, root_index, address_index, st) != 0)
+        return -1;
+    const SidecarEntry *entry = inventory->collection->address_index
+                                    .entries[address_index].entry;
+    if (entry->kind != SIDECAR_KIND_DIRECTORY)
+        return 0;
+    int child_fd = openat(parent_fd, name,
+                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                              O_NOATIME | O_CLOEXEC);
+    if (child_fd < 0)
+        return -1;
+    int result = scan_root_payload_directory(inventory, child_fd, root_index,
+                                             entry->logical_path);
+    int saved = errno;
+    if (close(child_fd) != 0 && result == 0)
+    {
+        result = -1;
+        saved = EIO;
+    }
+    errno = saved;
+    return result;
+}
+
+static int scan_root_namespace_directory(PayloadInventory *inventory,
+                                         int directory_fd,
+                                         size_t path_length);
+
+static int scan_root_namespace_node(PayloadInventory *inventory, int parent_fd,
+                                    const char *name, size_t path_length)
+{
+    struct stat st;
+    if (fstatat(parent_fd, name, &st, AT_SYMLINK_NOFOLLOW) != 0)
+        return -1;
+    size_t root_index = root_order_find_exact(
+        inventory->collection, inventory->root_namespace_path);
+    if (root_index != SIZE_MAX)
+        return scan_root_anchor(inventory, parent_fd, name, root_index, &st);
+
+    if (!root_has_descendant(inventory->collection,
+                             inventory->root_namespace_path) ||
+        !S_ISDIR(st.st_mode))
+    {
+        report_violation(inventory->collection->report, SIZE_MAX,
+                         inventory->root_namespace_path);
+        return -1;
+    }
+    int child_fd = openat(parent_fd, name,
+                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                              O_NOATIME | O_CLOEXEC);
+    if (child_fd < 0)
+        return -1;
+    int result = scan_root_namespace_directory(inventory, child_fd,
+                                               path_length);
+    int saved = errno;
+    if (close(child_fd) != 0 && result == 0)
+    {
+        result = -1;
+        saved = EIO;
+    }
+    errno = saved;
+    return result;
+}
+
+static int scan_root_namespace_directory(PayloadInventory *inventory,
+                                         int directory_fd,
+                                         size_t path_length)
 {
     int scan_fd = dup_cloexec(directory_fd);
     DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
@@ -1024,16 +944,16 @@ static int scan_payload_directory(PayloadInventory *inventory, int directory_fd,
         }
         size_t child_length = path_length;
         if (child_length != 0)
-            inventory->path[child_length++] = '/';
-        memcpy(inventory->path + child_length, entry->d_name,
+            inventory->root_namespace_path[child_length++] = '/';
+        memcpy(inventory->root_namespace_path + child_length, entry->d_name,
                name_length + 1U);
-        if (scan_payload_node(inventory, directory_fd, entry->d_name,
-                              child_length + name_length) != 0)
+        if (scan_root_namespace_node(inventory, directory_fd, entry->d_name,
+                                     child_length + name_length) != 0)
         {
             result = -1;
             break;
         }
-        inventory->path[path_length] = '\0';
+        inventory->root_namespace_path[path_length] = '\0';
     }
     if (closedir(directory) != 0)
         result = -1;
@@ -1044,14 +964,17 @@ static int scan_payload_inventory(PayloadInventory *inventory)
 {
     if (inventory == NULL || inventory->data_fd < 0)
         return -1;
-    if (scan_payload_directory(inventory, inventory->data_fd, 0) != 0)
+    if (scan_root_namespace_directory(inventory, inventory->data_fd, 0) != 0)
         return -1;
-    for (size_t index = 0; index < inventory->entries->count; index++)
+    const RestoreAddressIndex *addresses = &inventory->collection->address_index;
+    for (size_t index = 0; index < addresses->count; index++)
         if (inventory->seen[index] == 0)
         {
-            report_violation(inventory->collection->report,
-                             inventory->entries->items[index].root_index,
-                             inventory->entries->items[index].physical);
+            const SidecarEntry *entry = addresses->entries[index].entry;
+            size_t root_index = root_map_find(
+                &inventory->collection->root_map,
+                inventory->collection->manifest, entry->root_id);
+            report_address_entry_violation(inventory, root_index, entry);
             inventory->failed = 1;
         }
     return inventory->failed ? -1 : 0;
@@ -1078,8 +1001,7 @@ static void report_print(const PortableRestorePreflightReport *report)
         printf("  ... additional examples omitted\n");
 }
 
-static void collection_free(Collection *collection, PreflightEntries *entries,
-                            EntryOrders *orders)
+static void collection_free(Collection *collection, PreflightEntries *entries)
 {
     if (collection == NULL)
         return;
@@ -1089,13 +1011,13 @@ static void collection_free(Collection *collection, PreflightEntries *entries,
             (void)close(collection->xdg_anchor_fd[index]);
             collection->xdg_anchor_fd[index] = -1;
         }
-    entry_orders_free(&collection->memory, orders);
     entries_free(&collection->memory, entries);
     preflight_free(&collection->memory, collection->root_order,
                    collection->report == NULL ? 0
                        : collection->report->root_count * sizeof(size_t));
     collection->root_order = NULL;
-    parent_map_free(&collection->memory, &collection->parent_map);
+    restore_address_index_free(&collection->memory,
+                               &collection->address_index);
     root_map_free(&collection->root_map);
 }
 
@@ -1139,7 +1061,6 @@ int portable_restore_preflight_at(
     }
 
     PreflightEntries entries = {0};
-    EntryOrders orders = {0};
     Collection collection = {
         .manifest = request->manifest,
         .report = report,
@@ -1186,9 +1107,10 @@ int portable_restore_preflight_at(
         goto fail;
     }
 
-    if (parent_map_build(&collection.parent_map, &collection.memory,
-                         &sidecar) != 0)
+    if (restore_address_index_build(&collection.address_index,
+                                    &collection.memory, &sidecar, NULL) != 0)
     {
+        report_violation(report, SIZE_MAX, "sidecar-address");
         sidecar_log_close(&sidecar);
         close(data_fd);
         goto fail;
@@ -1208,8 +1130,7 @@ int portable_restore_preflight_at(
         }
         else
             report->mapped_root_count++;
-    if (analyze_entries(&collection.memory, &entries, &orders, report) != 0 ||
-        validate_destination_identity(&collection) != 0)
+    if (validate_destination_identity(&collection) != 0)
     {
         sidecar_log_close(&sidecar);
         close(data_fd);
@@ -1222,7 +1143,9 @@ int portable_restore_preflight_at(
         goto fail;
     }
 
-    unsigned char *seen = calloc(entries.count == 0 ? 1 : entries.count, 1);
+    unsigned char *seen = calloc(collection.address_index.count == 0
+                                     ? 1 : collection.address_index.count,
+                                 1);
     if (seen == NULL)
     {
         sidecar_log_close(&sidecar);
@@ -1232,8 +1155,6 @@ int portable_restore_preflight_at(
     PayloadInventory inventory = {
         .data_fd = data_fd,
         .collection = &collection,
-        .entries = &entries,
-        .orders = &orders,
         .seen = seen
     };
     int result = scan_payload_inventory(&inventory);
@@ -1244,11 +1165,11 @@ int portable_restore_preflight_at(
         result = -1;
     if (result != 0)
         goto fail;
-    collection_free(&collection, &entries, &orders);
+    collection_free(&collection, &entries);
     return report->violation_count == 0 ? 0 : (report_print(report), -1);
 
 fail:
-    collection_free(&collection, &entries, &orders);
+    collection_free(&collection, &entries);
     if (report->violation_count == 0)
         report_violation(report, SIZE_MAX, "preflight");
     report_print(report);

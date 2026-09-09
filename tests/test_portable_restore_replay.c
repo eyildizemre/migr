@@ -21,6 +21,7 @@
 
 #include "manifest.h"
 #include "portable.h"
+#include "portable_name.h"
 #include "portable_restore_internal.h"
 #include "portable_restore.h"
 #include "portable_restore_replay_internal.h"
@@ -430,6 +431,22 @@ static int write_sidecar(Fixture *fixture, const SidecarEntry *entries,
         sidecar_log_close(&log) != SIDECAR_STATUS_OK)
         return -1;
     return 0;
+}
+
+static int live_entry_has_empty_physical_cache(Fixture *fixture,
+                                               const char *logical)
+{
+    SidecarLog log = {0};
+    SidecarLiveView view = {0};
+    int result = sidecar_log_adopt_at(fixture->container_fd, &log) ==
+                     SIDECAR_OPEN_RESUMABLE &&
+                 sidecar_log_find(&log, text_bytes("ROOT"),
+                                  text_bytes(logical), &view) == 1 &&
+                 view.entry != NULL && view.entry->physical_path.length == 0;
+    if (log.implementation != NULL &&
+        sidecar_log_close(&log) != SIDECAR_STATUS_OK)
+        fatal("could not close adopted sidecar");
+    return result;
 }
 
 static int write_raw_entries_sidecar(Fixture *fixture,
@@ -956,6 +973,200 @@ static void test_physical_logical_mismatch(void)
     path_join(sentinel, sizeof(sentinel), fixture.home, "/sentinel");
     check(file_equals_noatime(sentinel, "untouched"),
           "physical-mismatch refusal leaves the destination untouched");
+    fixture_close(&fixture);
+}
+
+static void test_shortened_leaf_replay(void)
+{
+    printf(BLUE "::" NC " canonical shortened physical leaf replay\n");
+    char logical[NAME_MAX + 1U];
+    memset(logical, '!', NAME_MAX);
+    logical[NAME_MAX] = '\0';
+    PortablePhysicalName mapped;
+    check(portable_physical_name_map(logical, 0, &mapped) == 0 &&
+              mapped.shortened,
+          "replay fixture maps an overlong encoded component canonically");
+
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "shortened replay fixture is created");
+    if (opened == 0)
+    {
+        make_dir_at(fixture.data_fd, "ROOT", 0700);
+        int payload_root = openat(fixture.data_fd, "ROOT",
+                                  O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (payload_root < 0)
+            fatal("could not open shortened replay payload root");
+        write_file_at(payload_root, mapped.physical_leaf, "payload");
+        if (close(payload_root) != 0)
+            fatal("could not close shortened replay payload root");
+        SidecarEntry entries[] = {
+            entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                      1700000000, 0, 1700000001, 0),
+            entry_for("ROOT", logical, mapped.physical_leaf,
+                      SIDECAR_KIND_REGULAR, 7, 0600,
+                      1700000002, 0, 1700000003, 0)
+        };
+        check(write_sidecar(&fixture, entries, 2, NULL, NULL) == 0,
+              "shortened replay sidecar is committed");
+        PortableRestoreReplayReport report;
+        int result = run_replay(&fixture, &report);
+        char logical_suffix[NAME_MAX + sizeof("/restored/")];
+        int n = snprintf(logical_suffix, sizeof(logical_suffix),
+                         "/restored/%s", logical);
+        if (n < 0 || (size_t)n >= sizeof(logical_suffix))
+            fatal("shortened logical destination path is too long");
+        char restored[PATH_MAX];
+        path_join(restored, sizeof(restored), fixture.home, logical_suffix);
+        check(result == 0 && report.live_count == 2 &&
+                  report.applied_count == 2 && report.failed_count == 0 &&
+                  file_equals_noatime(restored, "payload"),
+              "canonical shortened leaf replays under the original logical name");
+        char physical_suffix[NAME_MAX + sizeof("/restored/")];
+        n = snprintf(physical_suffix, sizeof(physical_suffix),
+                     "/restored/%s", mapped.physical_leaf);
+        if (n < 0 || (size_t)n >= sizeof(physical_suffix))
+            fatal("shortened physical destination path is too long");
+        char leaked[PATH_MAX];
+        path_join(leaked, sizeof(leaked), fixture.home, physical_suffix);
+        check(access(leaked, F_OK) != 0,
+              "shortening marker is never exposed as the destination name");
+        fixture_close(&fixture);
+    }
+
+    PortablePhysicalName suffixed;
+    check(portable_physical_name_map(logical, 1, &suffixed) == 0 &&
+              suffixed.shortened &&
+              strcmp(suffixed.collision_suffix, "%7E1") == 0,
+          "suffix-bearing shortened replay mapping is canonical");
+    Fixture suffix_fixture;
+    opened = fixture_open(&suffix_fixture, &root);
+    check(opened == 0, "suffix-shortened replay fixture is created");
+    if (opened == 0)
+    {
+        make_dir_at(suffix_fixture.data_fd, "ROOT", 0700);
+        int payload_root = openat(suffix_fixture.data_fd, "ROOT",
+                                  O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (payload_root < 0)
+            fatal("could not open suffix-shortened payload root");
+        write_file_at(payload_root, suffixed.physical_leaf, "payload");
+        if (close(payload_root) != 0)
+            fatal("could not close suffix-shortened payload root");
+        SidecarEntry entries[] = {
+            entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                      1700000000, 0, 1700000001, 0),
+            entry_for("ROOT", logical, suffixed.physical_leaf,
+                      SIDECAR_KIND_REGULAR, 7, 0600,
+                      1700000002, 0, 1700000003, 0)
+        };
+        entries[1].collision_suffix = text_bytes(suffixed.collision_suffix);
+        check(write_sidecar(&suffix_fixture, entries, 2, NULL, NULL) == 0,
+              "suffix-shortened replay sidecar is committed");
+        PortableRestoreReplayReport report;
+        check(run_replay(&suffix_fixture, &report) == 0 &&
+                  report.failed_count == 0,
+              "suffix-bearing shortened leaf authenticates during direct replay");
+        fixture_close(&suffix_fixture);
+    }
+
+    char tampered[NAME_MAX + 1U];
+    snprintf(tampered, sizeof(tampered), "%s", mapped.physical_leaf);
+    tampered[0] = tampered[0] == 'X' ? 'Y' : 'X';
+    Fixture corrupt;
+    opened = fixture_open(&corrupt, &root);
+    check(opened == 0, "tampered shortened replay fixture is created");
+    if (opened == 0)
+    {
+        make_dir_at(corrupt.data_fd, "ROOT", 0700);
+        int payload_root = openat(corrupt.data_fd, "ROOT",
+                                  O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (payload_root < 0)
+            fatal("could not open tampered shortened payload root");
+        write_file_at(payload_root, tampered, "payload");
+        if (close(payload_root) != 0)
+            fatal("could not close tampered shortened payload root");
+        write_file_at(corrupt.home_fd, "sentinel", "untouched");
+        SidecarEntry entries[] = {
+            entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                      1700000000, 0, 1700000001, 0),
+            entry_for("ROOT", logical, tampered, SIDECAR_KIND_REGULAR, 7, 0600,
+                      1700000002, 0, 1700000003, 0)
+        };
+        check(write_sidecar(&corrupt, entries, 2, NULL, NULL) == 0,
+              "tampered shortened replay sidecar is committed");
+        PortableRestoreReplayReport report;
+        int result = run_replay(&corrupt, &report);
+        char sentinel[PATH_MAX];
+        path_join(sentinel, sizeof(sentinel), corrupt.home, "/sentinel");
+        check(result != 0 && report.failed_count == 1 &&
+                  file_equals_noatime(sentinel, "untouched"),
+              "tampered shortened leaf is refused before destination mutation");
+        fixture_close(&corrupt);
+    }
+}
+
+static void test_deep_cache_unavailable_replay(void)
+{
+    printf(BLUE "::" NC " deep compatibility-cache replay refusal\n");
+    enum { DEPTH = 17, COMPONENT_LENGTH = 100 };
+    char component[COMPONENT_LENGTH + 1U];
+    memset(component, '!', COMPONENT_LENGTH);
+    component[COMPONENT_LENGTH] = '\0';
+    PortablePhysicalName mapped;
+    check(portable_physical_name_map(component, 0, &mapped) == 0 &&
+              mapped.shortened &&
+              DEPTH * strlen(mapped.physical_leaf) + (DEPTH - 1U) >
+                  SIDECAR_MAX_PATH,
+          "deep replay fixture crosses the joined compatibility-cache ceiling");
+
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "deep cache-unavailable replay fixture is created");
+    if (opened != 0)
+        return;
+    make_dir_at(fixture.data_fd, "ROOT", 0700);
+    SidecarEntry entries[DEPTH + 1U];
+    entries[0] = entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                           1700000000, 0, 1700000001, 0);
+    char logical[DEPTH][SIDECAR_MAX_PATH + 1U];
+    size_t logical_length = 0;
+    for (size_t index = 0; index < DEPTH; index++)
+    {
+        size_t parent_length = logical_length;
+        if (index != 0)
+        {
+            memcpy(logical[index], logical[index - 1], parent_length);
+            logical[index][parent_length++] = '/';
+        }
+        memcpy(logical[index] + parent_length, component, COMPONENT_LENGTH);
+        logical_length = parent_length + COMPONENT_LENGTH;
+        logical[index][logical_length] = '\0';
+        entries[index + 1U] = entry_for(
+            "ROOT", logical[index], mapped.physical_leaf,
+            SIDECAR_KIND_DIRECTORY, 0, 0700,
+            1700000002 + (int64_t)index * 2, 0,
+            1700000003 + (int64_t)index * 2, 0);
+    }
+    check(logical_length < SIDECAR_MAX_PATH,
+          "deep replay fixture remains within the logical path ceiling");
+    check(write_sidecar(&fixture, entries, DEPTH + 1U, NULL, NULL) == 0,
+          "deep cache-unavailable replay sidecar is committed");
+    check(live_entry_has_empty_physical_cache(&fixture,
+                                               logical[DEPTH - 1U]),
+          "deep replay state has an unavailable non-root compatibility cache");
+    write_file_at(fixture.home_fd, "sentinel", "untouched");
+    PortableRestoreReplayReport report;
+    int result = run_replay(&fixture, &report);
+    char sentinel[PATH_MAX];
+    path_join(sentinel, sizeof(sentinel), fixture.home, "/sentinel");
+    char restored[PATH_MAX];
+    path_join(restored, sizeof(restored), fixture.home, "/restored");
+    check(result != 0 && report.failed_count == 1 &&
+              file_equals_noatime(sentinel, "untouched") &&
+              access(restored, F_OK) != 0,
+          "deep unavailable cache is refused before any replay mutation");
     fixture_close(&fixture);
 }
 
@@ -2243,6 +2454,8 @@ int main(void)
     test_symlink_collection_validation();
     test_hardlink_identity_validation();
     test_physical_logical_mismatch();
+    test_shortened_leaf_replay();
+    test_deep_cache_unavailable_replay();
     test_collision_suffix_validation();
     test_normal_replay();
     test_destination_truncation();

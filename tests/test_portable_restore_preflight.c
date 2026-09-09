@@ -37,6 +37,7 @@
 
 #include "manifest.h"
 #include "metadata.h"
+#include "portable_name.h"
 #include "portable_restore.h"
 #include "sidecar.h"
 
@@ -519,6 +520,22 @@ static void make_root_payload(Fixture *fixture)
         fatal("could not create root payload");
 }
 
+static int live_entry_has_empty_physical_cache(Fixture *fixture,
+                                               const char *logical)
+{
+    SidecarLog log = {0};
+    SidecarLiveView view = {0};
+    int result = sidecar_log_adopt_at(fixture->container_fd, &log) ==
+                     SIDECAR_OPEN_RESUMABLE &&
+                 sidecar_log_find(&log, text_bytes("ROOT"),
+                                  text_bytes(logical), &view) == 1 &&
+                 view.entry != NULL && view.entry->physical_path.length == 0;
+    if (log.implementation != NULL &&
+        sidecar_log_close(&log) != SIDECAR_STATUS_OK)
+        fatal("could not close adopted sidecar");
+    return result;
+}
+
 static void test_valid_and_profiles(void)
 {
     printf(BLUE "::" NC " valid preflight and ownership collection\n");
@@ -622,6 +639,172 @@ static void test_missing_payload(void)
           file_equals(sentinel, "untouched"),
           "missing payload is refused");
     portable_restore_preflight_report_free(&report);
+    fixture_close(&fixture);
+}
+
+static void test_shortened_leaf_preflight(void)
+{
+    printf(BLUE "::" NC " canonical shortened physical leaf preflight\n");
+    char logical[NAME_MAX + 1U];
+    memset(logical, '!', NAME_MAX);
+    logical[NAME_MAX] = '\0';
+    PortablePhysicalName mapped;
+    check(portable_physical_name_map(logical, 0, &mapped) == 0 &&
+              mapped.shortened,
+          "overlong encoded component maps to a shortened physical leaf");
+
+    ManifestRoot root = root_for("ROOT", "ROOT", "restored");
+    Fixture fixture;
+    int opened = fixture_open(&fixture, "shortened", &root, 1);
+    check(opened == 0, "shortened-leaf fixture is created");
+    if (opened == 0)
+    {
+        make_root_payload(&fixture);
+        int payload_root = openat(fixture.data_fd, "ROOT",
+                                  O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (payload_root < 0)
+            fatal("could not open shortened payload root");
+        write_file_at(payload_root, mapped.physical_leaf, "shortened");
+        if (close(payload_root) != 0)
+            fatal("could not close shortened payload root");
+        SidecarEntry entries[] = {
+            entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0),
+            entry_for("ROOT", logical, mapped.physical_leaf,
+                      SIDECAR_KIND_REGULAR, 9)
+        };
+        check(write_sidecar(&fixture, entries, 2) == 0,
+              "shortened-leaf sidecar is committed");
+        write_file_at(fixture.home_fd, "sentinel", "untouched");
+        char sentinel[PATH_MAX];
+        fixture_path(sentinel, sizeof(sentinel), fixture.home, "/sentinel");
+        PortableRestorePreflightReport report;
+        int result = run_preflight(&fixture, &report);
+        check(result == 0 && report.live_count == 2 &&
+                  report.mapped_root_count == 1 &&
+                  report.violation_count == 0 &&
+                  file_equals(sentinel, "untouched"),
+              "canonical shortened leaf is inventoried without destination mutation");
+        portable_restore_preflight_report_free(&report);
+        fixture_close(&fixture);
+    }
+
+    char tampered[NAME_MAX + 1U];
+    snprintf(tampered, sizeof(tampered), "%s", mapped.physical_leaf);
+    tampered[0] = tampered[0] == 'X' ? 'Y' : 'X';
+    Fixture corrupt;
+    opened = fixture_open(&corrupt, "shortened-tampered", &root, 1);
+    check(opened == 0, "tampered-shortened fixture is created");
+    if (opened == 0)
+    {
+        make_root_payload(&corrupt);
+        int payload_root = openat(corrupt.data_fd, "ROOT",
+                                  O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (payload_root < 0)
+            fatal("could not open tampered-shortened payload root");
+        write_file_at(payload_root, tampered, "shortened");
+        if (close(payload_root) != 0)
+            fatal("could not close tampered-shortened payload root");
+        SidecarEntry entries[] = {
+            entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0),
+            entry_for("ROOT", logical, tampered, SIDECAR_KIND_REGULAR, 9)
+        };
+        check(write_sidecar(&corrupt, entries, 2) == 0,
+              "tampered-shortened sidecar is committed");
+        write_file_at(corrupt.home_fd, "sentinel", "untouched");
+        char sentinel[PATH_MAX];
+        fixture_path(sentinel, sizeof(sentinel), corrupt.home, "/sentinel");
+        PortableRestorePreflightReport report;
+        check(run_preflight(&corrupt, &report) != 0 &&
+                  file_equals(sentinel, "untouched"),
+              "non-canonical shortened leaf is refused before payload acceptance");
+        portable_restore_preflight_report_free(&report);
+        fixture_close(&corrupt);
+    }
+}
+
+static void test_deep_physical_path_preflight(void)
+{
+    printf(BLUE "::" NC " fd-relative payload depth beyond physical PATH_MAX\n");
+    enum { DEPTH = 17, COMPONENT_LENGTH = 100 };
+    char component[COMPONENT_LENGTH + 1U];
+    memset(component, '!', COMPONENT_LENGTH);
+    component[COMPONENT_LENGTH] = '\0';
+    PortablePhysicalName mapped;
+    check(portable_physical_name_map(component, 0, &mapped) == 0 &&
+              mapped.shortened &&
+              DEPTH * strlen(mapped.physical_leaf) + (DEPTH - 1U) >
+                  SIDECAR_MAX_PATH,
+          "deep fixture exceeds the old cumulative physical path envelope");
+
+    ManifestRoot root = root_for("ROOT", "ROOT", "restored");
+    Fixture fixture;
+    int opened = fixture_open(&fixture, "deep-physical", &root, 1);
+    check(opened == 0, "deep physical-path fixture is created");
+    if (opened != 0)
+        return;
+    make_root_payload(&fixture);
+    int directory_fds[DEPTH + 1U];
+    for (size_t index = 0; index < DEPTH + 1U; index++)
+        directory_fds[index] = -1;
+    directory_fds[0] = openat(fixture.data_fd, "ROOT",
+                               O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (directory_fds[0] < 0)
+        fatal("could not open deep payload root");
+
+    SidecarEntry entries[DEPTH + 1U];
+    entries[0] = entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0);
+    char logical[DEPTH][SIDECAR_MAX_PATH + 1U];
+    size_t logical_length = 0;
+    for (size_t index = 0; index < DEPTH; index++)
+    {
+        size_t parent_length = logical_length;
+        if (index != 0)
+        {
+            memcpy(logical[index], logical[index - 1], parent_length);
+            logical[index][parent_length++] = '/';
+        }
+        memcpy(logical[index] + parent_length, component, COMPONENT_LENGTH);
+        logical_length = parent_length + COMPONENT_LENGTH;
+        logical[index][logical_length] = '\0';
+        entries[index + 1U] = entry_for(
+            "ROOT", logical[index], mapped.physical_leaf,
+            SIDECAR_KIND_DIRECTORY, 0);
+
+        if (mkdirat(directory_fds[index], mapped.physical_leaf, 0700) != 0)
+            fatal("could not create deep physical payload component");
+        directory_fds[index + 1U] = openat(
+            directory_fds[index], mapped.physical_leaf,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (directory_fds[index + 1U] < 0)
+            fatal("could not descend through deep physical payload");
+    }
+    check(logical_length < SIDECAR_MAX_PATH,
+          "deep fixture remains within the logical path ceiling");
+    check(write_sidecar(&fixture, entries, DEPTH + 1U) == 0,
+          "deep physical-path sidecar is committed");
+    check(live_entry_has_empty_physical_cache(&fixture,
+                                               logical[DEPTH - 1U]),
+          "deep live entry has no joined compatibility cache");
+    write_file_at(fixture.home_fd, "sentinel", "untouched");
+    char sentinel[PATH_MAX];
+    fixture_path(sentinel, sizeof(sentinel), fixture.home, "/sentinel");
+    PortableRestorePreflightReport report;
+    int result = run_preflight(&fixture, &report);
+    check(result == 0 && report.live_count == DEPTH + 1U &&
+              report.violation_count == 0 &&
+              file_equals(sentinel, "untouched"),
+          "preflight inventories a valid over-PATH_MAX physical chain fd-relatively");
+    portable_restore_preflight_report_free(&report);
+    for (size_t index = DEPTH; index != 0; index--)
+    {
+        if (close(directory_fds[index]) != 0 ||
+            unlinkat(directory_fds[index - 1U], mapped.physical_leaf,
+                     AT_REMOVEDIR) != 0)
+            fatal("could not remove deep physical payload component");
+        directory_fds[index] = -1;
+    }
+    if (close(directory_fds[0]) != 0)
+        fatal("could not close deep payload root");
     fixture_close(&fixture);
 }
 
@@ -934,6 +1117,22 @@ static void test_collision_suffix_validation(void)
         check(result == 0 && report.live_count == 4 &&
                   report.violation_count == 0,
               "suffixed ancestor and suffixed leaf pass preflight");
+        portable_restore_preflight_report_free(&report);
+
+        payload_root = openat(fixture.data_fd, "ROOT",
+                              O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (payload_root < 0)
+            fatal("could not reopen suffixed payload root");
+        suffixed_dir = openat(payload_root, "dir%7E1",
+                              O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (suffixed_dir < 0)
+            fatal("could not reopen suffixed payload directory");
+        write_file_at(suffixed_dir, "foreign", "unknown");
+        if (close(suffixed_dir) != 0 || close(payload_root) != 0)
+            fatal("could not close suffixed payload directories");
+        result = run_preflight(&fixture, &report);
+        check(result != 0,
+              "unknown sibling beneath a suffixed parent is refused locally");
         portable_restore_preflight_report_free(&report);
         fixture_close(&fixture);
     }
@@ -1284,9 +1483,9 @@ static void test_file_ancestor_conflict_wedge(void)
     SidecarEntry entries[] = {
         entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0),
         entry_for("ROOT", "dir", "dir", SIDECAR_KIND_REGULAR, 7),
-        entry_for("ROOT", "parent", "dir", SIDECAR_KIND_DIRECTORY, 0),
+        entry_for("ROOT", "parent", "parent", SIDECAR_KIND_REGULAR, 7),
         entry_for("ROOT", "dir-x", "dir-x", SIDECAR_KIND_REGULAR, 7),
-        entry_for("ROOT", "parent/child", "dir/child",
+        entry_for("ROOT", "parent/child", "parent/child",
                   SIDECAR_KIND_REGULAR, 1)
     };
     Fixture fixture;
@@ -1294,16 +1493,16 @@ static void test_file_ancestor_conflict_wedge(void)
     check(opened == 0, "file-ancestor-wedge fixture is created");
     if (opened != 0)
         return;
-    check(write_sidecar(&fixture, entries, 5) == 0,
+    check(write_raw_entries_sidecar(&fixture, entries, 5) == 0,
           "file-ancestor-wedge sidecar is committed");
     write_file_at(fixture.home_fd, "sentinel", "untouched");
     char sentinel[PATH_MAX];
     fixture_path(sentinel, sizeof(sentinel), fixture.home, "/sentinel");
     PortableRestorePreflightReport report;
     int result = run_preflight(&fixture, &report);
-    check(result != 0 && report.violation_count == 2 &&
+    check(result != 0 && report.violation_count == 1 &&
               file_equals(sentinel, "untouched"),
-          "lexical wedge does not hide file ancestor conflict");
+          "lexical wedge does not hide a non-directory logical parent");
     portable_restore_preflight_report_free(&report);
     fixture_close(&fixture);
 }
@@ -1707,6 +1906,8 @@ int main(void)
     test_valid_and_profiles();
     test_outstanding_claim_gate();
     test_missing_payload();
+    test_shortened_leaf_preflight();
+    test_deep_physical_path_preflight();
     test_destination_profile_refusal_is_named();
     test_destination_profile_refusal_keeps_scanning();
     test_xattr_entry_acceptance();
