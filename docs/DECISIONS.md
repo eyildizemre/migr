@@ -3697,3 +3697,48 @@ fail-closed rules, and D41 defines why the expected bytes for its two transforme
 files are the rewritten output. Package and network publication remains downstream
 of a fully successful portable replay, so a failed verification cannot be followed
 by those optional restore steps.
+
+---
+
+## D43 — 2026-09-11 — Portable payload preflight overlaps regular-file metadata I/O
+
+**Status:** Implemented
+
+**Decision:** Portable restore preflight may use a bounded worker pool while
+inventorying a sufficiently large payload. The workers perform only the
+`fstatat(..., AT_SYMLINK_NOFOLLOW)` calls for already-resolved non-directory
+payload leaves. Directory enumeration, address-index lookup, directory traversal,
+and all semantic validation remain on the coordinator thread.
+
+Work is issued in bounded sibling batches. A batch is fully complete before its
+results are consumed, before traversal descends through a directory, and before a
+parent descriptor can leave scope. The coordinator consumes results in enumeration
+order and remains the sole writer of `seen[]`, checked-count/progress state, and
+preflight diagnostics. The final missing-entry sweep runs only after the payload
+walk has returned and every worker has been joined.
+
+On the first validation or I/O failure observed by the coordinator, no new work is
+dispatched. Operations already issued in the current bounded batch are allowed to
+finish, after which the existing fail-closed result is returned. Failure to create
+the pool before scanning starts falls back to the existing serial walk because
+concurrency is only a performance optimization. Once worker threads exist, their
+lifetime is joined before the pool's stack storage or any parent descriptor can be
+released.
+
+Production uses at most eight workers and skips pool creation for payload indexes
+smaller than 32 entries. The root-namespace walk and destination-identity graph
+remain serial; neither is part of this concurrency boundary.
+
+**Why:** Large portable backups can require hundreds of thousands of independent
+metadata syscalls against removable or virtualized storage, where per-operation
+latency dominates. Overlapping the common regular-file `fstatat()` calls reduces
+that latency cost without turning validation state, report aggregation, progress,
+or recursive directory ownership into shared mutable worker state. Keeping those
+invariants single-writer also preserves the serial path's deterministic validation
+order.
+
+**Rejected:** thread-per-entry fan-out; concurrent mutation of `seen[]`, reports,
+or progress counters; parallel recursive directory traversal; and parallel
+destination-identity graph construction. Those designs widen the synchronization
+and descriptor-lifetime surface substantially beyond the I/O operation that
+motivates this change.

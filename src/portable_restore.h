@@ -126,6 +126,13 @@ int portable_restore_preflight_at(
 void portable_restore_preflight_test_set_progress_enabled(int enabled);
 void portable_restore_preflight_test_reset_profile_root_walk_count(void);
 size_t portable_restore_preflight_test_profile_root_walk_count(void);
+void portable_restore_preflight_test_configure_payload_pool(
+    size_t worker_count, unsigned int worker_delay_ms,
+    const char *delayed_payload_leaf,
+    const char *duplicate_payload_leaf);
+void portable_restore_preflight_test_reset_payload_pool(void);
+size_t portable_restore_preflight_test_payload_peak_workers(void);
+size_t portable_restore_preflight_test_payload_checked_count(void);
 #endif
 
 void portable_restore_replay_report_init(PortableRestoreReplayReport *report);
