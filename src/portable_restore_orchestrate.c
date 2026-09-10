@@ -138,8 +138,21 @@ static PortableRestoreOutcome portable_restore_orchestrate_impl(
 
     result = portable_restore_replay_at(&replay_request, report);
     if (result != 0)
-        printf("Portable restore stopped: %zu applied, %zu failed\n",
-               report->applied_count, report->failed_count);
+    {
+        if (report->failed_root_id[0] != '\0')
+            printf("Portable restore stopped at %s:%s: %zu applied, %zu failed\n",
+                   report->failed_root_id,
+                   report->failed_logical_path[0] != '\0'
+                       ? report->failed_logical_path : ".",
+                   report->applied_count, report->failed_count);
+        else if (report->failed_logical_path[0] != '\0')
+            printf("Portable restore stopped at %s: %zu applied, %zu failed\n",
+                   report->failed_logical_path,
+                   report->applied_count, report->failed_count);
+        else
+            printf("Portable restore stopped: %zu applied, %zu failed\n",
+                   report->applied_count, report->failed_count);
+    }
     portable_restore_preflight_report_free(&preflight);
     return result == 0 ? PORTABLE_RESTORE_COMPLETE : PORTABLE_RESTORE_ERROR;
 }

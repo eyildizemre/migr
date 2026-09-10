@@ -33,6 +33,7 @@
 #include "manifest.h"
 #include "restore.h"
 #include "portable_restore_internal.h"
+#include "sidecar.h"
 #include "utils.h"
 
 #ifdef RESTORE_TEST_HOOKS
@@ -51,6 +52,7 @@ static int failures = 0;
 static int skips = 0;
 
 static int file_content_is(const char *path, const char *content);
+static void write_file_mode(const char *path, const char *content, mode_t mode);
 
 static void check(int cond, const char *label)
 {
@@ -864,6 +866,140 @@ static void make_v1_manifest(Manifest *m, ManifestRoot *roots, int root_count)
     m->has_source_identity = 0;
     m->root_count = root_count;
     m->roots = roots;
+}
+
+static SidecarBytes sidecar_text(const char *text)
+{
+    return (SidecarBytes){
+        .data = (const unsigned char *)text,
+        .length = strlen(text)
+    };
+}
+
+static int append_committed_sidecar_entry(SidecarLog *log,
+                                          const SidecarEntry *entry)
+{
+    SidecarClaim claim = {
+        .root_id = entry->root_id,
+        .logical_path = entry->logical_path,
+        .physical_leaf = entry->physical_leaf,
+        .kind = entry->kind
+    };
+    return sidecar_log_append_claim(log, &claim) == SIDECAR_STATUS_OK &&
+           sidecar_log_append_entry(log, entry) == SIDECAR_STATUS_OK &&
+           sidecar_log_append_entry_commit(log) == SIDECAR_STATUS_OK
+        ? 0 : -1;
+}
+
+static void test_portable_replay_failure_names_entry(void)
+{
+    printf(BLUE "::" NC " portable replay failure identifies its entry\n");
+
+    char source[PATH_MAX], home[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_portable_failure_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_portable_failure_home");
+    setenv("HOME", home, 1);
+
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "ROOT");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "ROOT");
+    strcpy(root.source_path, "/source/ROOT");
+    strcpy(root.restore_path, "restored");
+    root.has_restore_path = 1;
+
+    Manifest manifest;
+    make_v1_manifest(&manifest, &root, 1);
+    manifest.representation = CLONE_PORTABLE_SIDECAR;
+    manifest.sidecar_version = SIDECAR_VERSION;
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write portable manifest for replay failure reporting");
+    write_payload_file(source, "data/ROOT", "link", "");
+
+    char payload_root[PATH_MAX];
+    join_path(payload_root, sizeof(payload_root), source, "data/ROOT");
+    struct stat root_st;
+    if (stat(payload_root, &root_st) != 0)
+    {
+        check(0, "fixture: inspect portable payload root");
+        remove_tree(source);
+        remove_tree(home);
+        return;
+    }
+
+    uint32_t uid = (uint32_t)geteuid();
+    uint32_t gid = (uint32_t)getegid();
+    SidecarEntry root_entry = {
+        .root_id = sidecar_text("ROOT"),
+        .logical_path = sidecar_text(""),
+        .physical_leaf = sidecar_text(""),
+        .kind = SIDECAR_KIND_DIRECTORY,
+        .mode = 0700,
+        .uid = uid,
+        .gid = gid,
+        .atime_sec = 1700000600,
+        .mtime_sec = 1700000601,
+        .size = (uint64_t)root_st.st_size
+    };
+    SidecarEntry link_entry = {
+        .root_id = sidecar_text("ROOT"),
+        .logical_path = sidecar_text("link"),
+        .physical_leaf = sidecar_text("link"),
+        .kind = SIDECAR_KIND_SYMLINK,
+        .mode = 0777,
+        .uid = uid,
+        .gid = gid,
+        .atime_sec = 1700000610,
+        .mtime_sec = 1700000611,
+        .symlink_target = sidecar_text("target")
+    };
+
+    int container_fd = open(source, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    SidecarLog sidecar = {0};
+    int sidecar_created = container_fd >= 0 &&
+        sidecar_log_create_at(container_fd, &sidecar) == SIDECAR_OPEN_FRESH;
+    int sidecar_ok = sidecar_created &&
+        append_committed_sidecar_entry(&sidecar, &root_entry) == 0 &&
+        append_committed_sidecar_entry(&sidecar, &link_entry) == 0;
+    if (sidecar_created && sidecar_log_close(&sidecar) != SIDECAR_STATUS_OK)
+        sidecar_ok = 0;
+    if (container_fd >= 0 && close(container_fd) != 0)
+        sidecar_ok = 0;
+    check(sidecar_ok, "fixture: commit portable sidecar for replay failure");
+    if (!sidecar_ok)
+    {
+        remove_tree(source);
+        remove_tree(home);
+        return;
+    }
+
+    char restored[PATH_MAX], existing[PATH_MAX];
+    join_path(restored, sizeof(restored), home, "restored");
+    mkdir_p(restored);
+    join_path(existing, sizeof(existing), restored, "link");
+    write_file_mode(existing, "existing", 0600);
+    remove_fixture_packages(source);
+
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    char output[16384];
+    int rc = run_restore_capturing_with_input(source, "y\n", output,
+                                               sizeof(output));
+    dry_run = previous_dry_run;
+
+    check(rc != 0 &&
+              strstr(output,
+                     "Portable restore stopped at ROOT:link: 0 applied, 1 failed") != NULL,
+          "portable replay summary identifies the failing root and logical path");
+    check(strstr(output,
+                 "Restore finished with errors at ROOT:link: 0 applied, 1 failed") != NULL,
+          "restore final summary preserves the failing root and logical path");
+    check(file_content_is(existing, "existing"),
+          "reported replay conflict leaves the existing destination untouched");
+
+    remove_tree(source);
+    remove_tree(home);
 }
 
 static void make_v2_selection_manifest(Manifest *m, ManifestRoot roots[2])
@@ -2813,6 +2949,7 @@ int main(void)
     test_dispatch_refuses_partial_source();
     test_dispatch_requires_v1_manifest_for_final_container_name();
     test_dispatch_refuses_portable_v1();
+    test_portable_replay_failure_names_entry();
     test_v1_refuses_missing_declared_payloads();
 
     test_v1_restores_home_relative_and_xdg_reports_manual_native();

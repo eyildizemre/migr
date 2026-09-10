@@ -2458,8 +2458,19 @@ int restore(const char *source)
                 break;
             case PORTABLE_RESTORE_ERROR:
             default:
-                printf("Restore finished with errors: %zu applied, %zu failed\n",
-                       report.applied_count, report.failed_count);
+                if (report.failed_root_id[0] != '\0')
+                    printf("Restore finished with errors at %s:%s: %zu applied, %zu failed\n",
+                           report.failed_root_id,
+                           report.failed_logical_path[0] != '\0'
+                               ? report.failed_logical_path : ".",
+                           report.applied_count, report.failed_count);
+                else if (report.failed_logical_path[0] != '\0')
+                    printf("Restore finished with errors at %s: %zu applied, %zu failed\n",
+                           report.failed_logical_path,
+                           report.applied_count, report.failed_count);
+                else
+                    printf("Restore finished with errors: %zu applied, %zu failed\n",
+                           report.applied_count, report.failed_count);
                 break;
         }
         if (report.skipped_security_xattr_count != 0)
