@@ -1033,6 +1033,12 @@ static void collection_identity_failure(void *context, size_t index)
     report_violation(collection->report, entry->root_index, entry->logical);
 }
 
+static void collection_identity_progress(void *context, size_t checked_count)
+{
+    Collection *collection = context;
+    preflight_progress_note(collection->progress, checked_count, "identity", 0);
+}
+
 static int validate_destination_identity(Collection *collection)
 {
     DestinationIdentityGraph graph;
@@ -1057,7 +1063,8 @@ static int validate_destination_identity(Collection *collection)
             collection->destination_home_path,
             collection->destination_xdg_dirs, collection->xdg_anchor_fd,
             collection->xdg_anchor_prefix, collection_identity_entry,
-            collection_identity_failure, collection,
+            collection_identity_failure, collection_identity_progress,
+            collection,
             DESTINATION_IDENTITY_AGGREGATE_COLLISIONS) != 0)
     {
         destination_identity_graph_free(&graph);
@@ -1604,6 +1611,7 @@ int portable_restore_preflight_at(
         }
         else
             report->mapped_root_count++;
+    preflight_progress_note(&progress, 0, "identity", 1);
     if (validate_destination_identity(&collection) != 0)
     {
         sidecar_log_close(&sidecar);

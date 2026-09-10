@@ -570,7 +570,7 @@ static int replay_selection_destinations_valid(ReplayCollection *collection)
             collection->destination_home_path,
             collection->destination_xdg_dirs, collection->xdg_anchor_fd,
             collection->xdg_anchor_prefix, replay_identity_entry,
-            replay_identity_failure, collection,
+            replay_identity_failure, NULL, collection,
             DESTINATION_IDENTITY_STOP_ON_COLLISION) != 0)
     {
         destination_identity_graph_free(&graph);

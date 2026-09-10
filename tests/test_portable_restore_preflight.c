@@ -688,15 +688,21 @@ static void test_payload_inventory_progress(void)
         output, "Verifying backup contents: entries 0/2 checked");
     const char *collection_done = strstr(
         output, "Verifying backup contents: entries 2/2 checked");
+    const char *identity_start = strstr(
+        output, "Verifying backup contents: identity 0/2 checked");
+    const char *identity_done = strstr(
+        output, "Verifying backup contents: identity 2/2 checked");
     const char *payload_start = strstr(
         output, "Verifying backup contents: payload 0/2 checked");
     const char *payload_done = strstr(
         output, "Verifying backup contents: payload 2/2 checked");
     check(result == 0 && collection_start != NULL && collection_done != NULL &&
+              identity_start != NULL && identity_done != NULL &&
               payload_start != NULL && payload_done != NULL &&
               collection_start < collection_done &&
-              collection_done < payload_start && payload_start < payload_done,
-          "preflight progress covers collection before switching to payload totals");
+              collection_done < identity_start && identity_start < identity_done &&
+              identity_done < payload_start && payload_start < payload_done,
+          "preflight progress covers collection, identity validation, and payload scanning in order");
 
     portable_restore_preflight_report_free(&report);
     fixture_close(&fixture);

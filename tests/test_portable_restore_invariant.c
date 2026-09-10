@@ -3,10 +3,13 @@
 #define _GNU_SOURCE
 
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "portable_name.h"
 #include "portable_restore_internal.h"
@@ -310,6 +313,124 @@ static void test_invalid_vector_input(void)
           "invalid vector input fails without allocating index state");
 }
 
+static DestinationIdentityStatus add_destination_name(
+    DestinationIdentityGraph *graph, int anchor_fd, const char *name,
+    size_t owner, DestinationIdentityNameConflict *name_conflict)
+{
+    DestinationIdentityPlacement placement;
+    size_t conflicting_owner;
+    return destination_identity_graph_add(
+        graph, anchor_fd, name, DESTINATION_IDENTITY_NON_DIRECTORY, owner,
+        &placement, &conflicting_owner, name_conflict);
+}
+
+static void test_destination_casefold_index(void)
+{
+    printf(BLUE "::" NC " destination casefold lookup is folded-name indexed\n");
+
+    char directory[] = "/tmp/migr_restore_identity_index_XXXXXX";
+    char *created = mkdtemp(directory);
+    check(created != NULL, "casefold-index fixture directory is created");
+    if (created == NULL)
+        return;
+
+    int anchor_fd = open(created, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    check(anchor_fd >= 0, "casefold-index fixture directory opens as an anchor");
+    if (anchor_fd < 0)
+    {
+        rmdir(created);
+        return;
+    }
+
+    DestinationIdentityGraph graph;
+    destination_identity_graph_init(&graph, DESTINATION_IDENTITY_PORTABLE_BOUNDS);
+    DestinationIdentityStatus registered =
+        destination_identity_graph_register_anchor(&graph, anchor_fd);
+    check(registered == DESTINATION_IDENTITY_OK,
+          "casefold-index graph registers its destination ancestry");
+    if (registered != DESTINATION_IDENTITY_OK)
+    {
+        destination_identity_graph_free(&graph);
+        close(anchor_fd);
+        rmdir(created);
+        return;
+    }
+
+    enum { UNIQUE_NAMES = 4096 };
+    destination_identity_test_reset_name_probe_count();
+    int unique_ok = 1;
+    for (size_t index = 0; index < UNIQUE_NAMES; index++)
+    {
+        char name[32];
+        int written = snprintf(name, sizeof(name), "item-%04zu", index);
+        DestinationIdentityNameConflict conflict;
+        if (written <= 0 || (size_t)written >= sizeof(name) ||
+            add_destination_name(&graph, anchor_fd, name, index + 1U,
+                                 &conflict) != DESTINATION_IDENTITY_OK)
+        {
+            unique_ok = 0;
+            break;
+        }
+    }
+
+    DestinationIdentityNameConflict conflict;
+    int first_ok = add_destination_name(
+        &graph, anchor_fd, "FoldTarget", UNIQUE_NAMES + 1U, &conflict) ==
+        DESTINATION_IDENTITY_OK;
+    destination_identity_test_force_casefold(1);
+    DestinationIdentityStatus folded_status = add_destination_name(
+        &graph, anchor_fd, "foldtarget", UNIQUE_NAMES + 2U, &conflict);
+    destination_identity_test_force_casefold(0);
+    size_t probes = destination_identity_test_name_probe_count();
+
+    check(unique_ok && first_ok &&
+              folded_status == DESTINATION_IDENTITY_NAME_EQUIVALENCE_ERROR &&
+              conflict.failure == DESTINATION_NAME_FAILURE_CASEFOLD &&
+              conflict.prior_component != NULL &&
+              conflict.prior_component_length == strlen("FoldTarget") &&
+              memcmp(conflict.prior_component, "FoldTarget",
+                     conflict.prior_component_length) == 0,
+          "folded-name index still identifies the real ASCII-case sibling conflict");
+    check(probes <= UNIQUE_NAMES + 4U,
+          "casefold conflict lookup examines only folded-name bucket members");
+
+    int upper_fd = openat(anchor_fd, "Existing", O_WRONLY | O_CREAT | O_EXCL |
+                                              O_CLOEXEC,
+                          0600);
+    int lower_fd = openat(anchor_fd, "existing", O_WRONLY | O_CREAT | O_EXCL |
+                                              O_CLOEXEC,
+                          0600);
+    int existing_fixture_ok = upper_fd >= 0 && lower_fd >= 0;
+    if (upper_fd >= 0)
+        close(upper_fd);
+    if (lower_fd >= 0)
+        close(lower_fd);
+
+    DestinationIdentityStatus upper_status = DESTINATION_IDENTITY_PATH_ERROR;
+    DestinationIdentityStatus lower_status = DESTINATION_IDENTITY_PATH_ERROR;
+    if (existing_fixture_ok)
+    {
+        destination_identity_test_force_casefold(1);
+        upper_status = add_destination_name(
+            &graph, anchor_fd, "Existing", UNIQUE_NAMES + 3U, &conflict);
+        lower_status = add_destination_name(
+            &graph, anchor_fd, "existing", UNIQUE_NAMES + 4U, &conflict);
+        destination_identity_test_force_casefold(0);
+    }
+    check(existing_fixture_ok && upper_status == DESTINATION_IDENTITY_OK &&
+              lower_status == DESTINATION_IDENTITY_OK,
+          "two already-existing case variants retain the existing pair-skip semantics");
+
+    destination_identity_test_force_casefold(0);
+    destination_identity_graph_free(&graph);
+    if (upper_fd >= 0)
+        unlinkat(anchor_fd, "Existing", 0);
+    if (lower_fd >= 0)
+        unlinkat(anchor_fd, "existing", 0);
+    check(close(anchor_fd) == 0, "casefold-index anchor closes cleanly");
+    check(rmdir(created) == 0, "casefold-index fixture directory is removed");
+}
+
 int main(void)
 {
     test_ordinary_leaf_authentication();
@@ -318,6 +439,7 @@ int main(void)
     test_parent_topology_and_order();
     test_physical_sibling_uniqueness();
     test_invalid_vector_input();
+    test_destination_casefold_index();
 
     if (failures != 0)
         printf(RED "portable restore invariant failed: %d assertion(s)\n" NC,

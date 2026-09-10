@@ -58,6 +58,12 @@ typedef struct {
     size_t namespace_count;
     size_t namespace_capacity;
     size_t namespace_limit;
+    void *name_slots;
+    size_t name_count;
+    size_t name_capacity;
+    void *name_members;
+    size_t name_member_count;
+    size_t name_member_capacity;
     void *topology_slots;
     size_t topology_count;
     size_t topology_capacity;
@@ -116,6 +122,8 @@ typedef void (*DestinationIdentityEntryReader)(
     void *context, size_t index, DestinationIdentityEntryView *view);
 typedef void (*DestinationIdentityFailureReporter)(void *context,
                                                    size_t index);
+typedef void (*DestinationIdentityProgressReporter)(void *context,
+                                                    size_t checked_count);
 
 typedef enum {
     DESTINATION_IDENTITY_AGGREGATE_COLLISIONS = 0,
@@ -202,7 +210,8 @@ int destination_identity_graph_add_entries(
     const char *destination_home_path,
     const char * const *destination_xdg_dirs, int *xdg_anchor_fd,
     char (*xdg_anchor_prefix)[PATH_MAX], DestinationIdentityEntryReader reader,
-    DestinationIdentityFailureReporter report_failure, void *context,
+    DestinationIdentityFailureReporter report_failure,
+    DestinationIdentityProgressReporter report_progress, void *context,
     DestinationIdentityCollisionPolicy collision_policy);
 int destination_identity_graph_order(
     const DestinationIdentityGraph *graph,
@@ -214,6 +223,9 @@ int restore_address_index_build_from_entries_for_test(
     const SidecarEntry *entries, size_t count);
 void restore_address_test_force_name_fingerprint(uint64_t fingerprint);
 void restore_address_test_clear_name_fingerprint(void);
+void destination_identity_test_reset_name_probe_count(void);
+size_t destination_identity_test_name_probe_count(void);
+void destination_identity_test_force_casefold(int enabled);
 #endif
 
 #endif

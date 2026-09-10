@@ -990,10 +990,49 @@ typedef struct {
     char *component;
     size_t component_length;
     uint64_t hash;
+    size_t name_member;
     int resolved;
     int existing_on_disk;
     int used;
 } DestinationNamespaceSlot;
+
+/* Candidate lookup is keyed by the parent plus ASCII-folded component. The
+ * chained members preserve all exact spellings in a folded class; the
+ * filesystem capability check below remains the authority on equivalence. */
+typedef struct {
+    size_t parent;
+    size_t head_member;
+    const char *component;
+    size_t component_length;
+    uint64_t hash;
+    int used;
+} DestinationNameSlot;
+
+typedef struct {
+    const char *component;
+    size_t component_length;
+    size_t next;
+} DestinationNameMember;
+
+#ifdef PORTABLE_RESTORE_ADDRESS_TEST_HOOKS
+static size_t destination_identity_test_name_probe_counter;
+static int destination_identity_test_casefold_forced;
+
+void destination_identity_test_reset_name_probe_count(void)
+{
+    destination_identity_test_name_probe_counter = 0;
+}
+
+size_t destination_identity_test_name_probe_count(void)
+{
+    return destination_identity_test_name_probe_counter;
+}
+
+void destination_identity_test_force_casefold(int enabled)
+{
+    destination_identity_test_casefold_forced = enabled != 0;
+}
+#endif
 
 static uint64_t destination_identity_hash(dev_t dev, ino_t ino)
 {
@@ -1012,6 +1051,44 @@ static uint64_t destination_namespace_hash(const DestinationIdentityGraph *graph
     hash = hash_fnv1a_uint64(hash, (uint64_t)length);
     return hash_fnv1a_bytes(hash, (const unsigned char *)component, length);
 }
+
+static unsigned char destination_ascii_fold(unsigned char value)
+{
+    if (value >= 'A' && value <= 'Z')
+        return (unsigned char)(value + ('a' - 'A'));
+    return value;
+}
+
+static uint64_t destination_name_hash(const DestinationIdentityGraph *graph,
+                                      size_t parent, const char *component,
+                                      size_t length)
+{
+    uint64_t hash = HASH_FNV1A_OFFSET_BASIS ^ graph->hash_salt;
+    hash = hash_fnv1a_uint64(hash, (uint64_t)parent);
+    hash = hash_fnv1a_uint64(hash, (uint64_t)length);
+    for (size_t index = 0; index < length; index++)
+    {
+        unsigned char folded = destination_ascii_fold(
+            (unsigned char)component[index]);
+        hash = hash_fnv1a_bytes(hash, &folded, 1U);
+    }
+    return hash;
+}
+
+static int destination_names_fold_equal(const char *first, size_t first_length,
+                                        const char *second,
+                                        size_t second_length)
+{
+    if (first == NULL || second == NULL || first_length != second_length)
+        return 0;
+    for (size_t index = 0; index < first_length; index++)
+        if (destination_ascii_fold((unsigned char)first[index]) !=
+            destination_ascii_fold((unsigned char)second[index]))
+            return 0;
+    return 1;
+}
+
+static DestinationIdentityStatus destination_graph_path_error(int saved);
 
 static void destination_mount_view_read(int fd, uint64_t *mount_id, int *known)
 {
@@ -1221,6 +1298,140 @@ static int destination_existing_node(DestinationIdentityGraph *graph,
     return 0;
 }
 
+static int destination_name_rehash(DestinationIdentityGraph *graph,
+                                   size_t capacity)
+{
+    if (capacity < 32U || (capacity & (capacity - 1U)) != 0 ||
+        capacity > SIZE_MAX / sizeof(DestinationNameSlot))
+    {
+        errno = E2BIG;
+        return -1;
+    }
+
+    size_t new_size = capacity * sizeof(DestinationNameSlot);
+    DestinationNameSlot *slots = preflight_alloc(&graph->memory, new_size);
+    if (slots == NULL)
+        return -1;
+    memset(slots, 0, new_size);
+
+    DestinationNameSlot *old = graph->name_slots;
+    size_t old_capacity = graph->name_capacity;
+    for (size_t index = 0; index < old_capacity; index++)
+        if (old[index].used)
+        {
+            size_t position =
+                (size_t)old[index].hash & (capacity - 1U);
+            while (slots[position].used)
+                position = (position + 1U) & (capacity - 1U);
+            slots[position] = old[index];
+        }
+
+    preflight_free(&graph->memory, old,
+                   old_capacity * sizeof(DestinationNameSlot));
+    graph->name_slots = slots;
+    graph->name_capacity = capacity;
+    return 0;
+}
+
+static int destination_name_ensure(DestinationIdentityGraph *graph)
+{
+    if (graph->name_capacity == 0)
+        return destination_name_rehash(graph, 32U);
+    if (graph->name_count * 2U < graph->name_capacity)
+        return 0;
+    if (graph->name_capacity > SIZE_MAX / 2U)
+    {
+        errno = E2BIG;
+        return -1;
+    }
+    return destination_name_rehash(graph, graph->name_capacity * 2U);
+}
+
+static DestinationNameSlot *destination_name_slot_find(
+    const DestinationIdentityGraph *graph, size_t parent,
+    const char *component, size_t length, uint64_t hash)
+{
+    DestinationNameSlot *slots = graph->name_slots;
+    if (graph->name_capacity == 0)
+        return NULL;
+
+    size_t index = (size_t)hash & (graph->name_capacity - 1U);
+    while (slots[index].used)
+    {
+        if (slots[index].hash == hash && slots[index].parent == parent &&
+            slots[index].component_length == length &&
+            destination_names_fold_equal(
+                slots[index].component, slots[index].component_length,
+                component, length))
+            return &slots[index];
+        index = (index + 1U) & (graph->name_capacity - 1U);
+    }
+    return NULL;
+}
+
+static int destination_name_index_add(DestinationIdentityGraph *graph,
+                                      size_t parent, const char *component,
+                                      size_t length, size_t *member_out)
+{
+    if (graph == NULL || component == NULL || member_out == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    if (graph->name_member_count >= graph->namespace_limit)
+    {
+        errno = E2BIG;
+        return -1;
+    }
+
+    uint64_t hash = destination_name_hash(graph, parent, component, length);
+    DestinationNameSlot *name_slot = destination_name_slot_find(
+        graph, parent, component, length, hash);
+    if (name_slot == NULL)
+    {
+        if (destination_name_ensure(graph) != 0)
+            return -1;
+        name_slot = destination_name_slot_find(
+            graph, parent, component, length, hash);
+    }
+
+    DestinationNameMember *members = preflight_array_reserve(
+        &graph->memory, graph->name_members, &graph->name_member_capacity,
+        graph->name_member_count, 1U, sizeof(*members), 32U,
+        graph->namespace_limit, 0);
+    if (members == NULL)
+        return -1;
+    graph->name_members = members;
+
+    if (name_slot == NULL)
+    {
+        DestinationNameSlot *slots = graph->name_slots;
+        size_t index = (size_t)hash & (graph->name_capacity - 1U);
+        while (slots[index].used)
+            index = (index + 1U) & (graph->name_capacity - 1U);
+        slots[index] = (DestinationNameSlot){
+            .parent = parent,
+            .head_member = SIZE_MAX,
+            .component = component,
+            .component_length = length,
+            .hash = hash,
+            .used = 1
+        };
+        name_slot = &slots[index];
+        graph->name_count++;
+    }
+
+    size_t member_index = graph->name_member_count++;
+    members[member_index] = (DestinationNameMember){
+        .component = component,
+        .component_length = length,
+        .next = name_slot->head_member
+    };
+    name_slot->head_member = member_index;
+    *member_out = member_index;
+    return 0;
+}
+
 static int destination_namespace_rehash(DestinationIdentityGraph *graph,
                                         size_t capacity)
 {
@@ -1270,6 +1481,27 @@ static int destination_namespace_ensure(DestinationIdentityGraph *graph)
                                         graph->namespace_capacity * 2U);
 }
 
+static DestinationNamespaceSlot *destination_namespace_find(
+    const DestinationIdentityGraph *graph, size_t parent,
+    const char *component, size_t length)
+{
+    if (graph == NULL || component == NULL || graph->namespace_capacity == 0)
+        return NULL;
+
+    uint64_t hash = destination_namespace_hash(graph, parent, component, length);
+    DestinationNamespaceSlot *slots = graph->namespace_slots;
+    size_t index = (size_t)hash & (graph->namespace_capacity - 1U);
+    while (slots[index].used)
+    {
+        if (slots[index].hash == hash && slots[index].parent == parent &&
+            slots[index].component_length == length &&
+            memcmp(slots[index].component, component, length) == 0)
+            return &slots[index];
+        index = (index + 1U) & (graph->namespace_capacity - 1U);
+    }
+    return NULL;
+}
+
 static DestinationNamespaceSlot *destination_namespace_slot(
     DestinationIdentityGraph *graph, size_t parent, const char *component,
     size_t length)
@@ -1280,20 +1512,10 @@ static DestinationNamespaceSlot *destination_namespace_slot(
         return NULL;
     }
 
-    uint64_t hash = destination_namespace_hash(graph, parent, component, length);
-    DestinationNamespaceSlot *slots = graph->namespace_slots;
-    if (graph->namespace_capacity != 0)
-    {
-        size_t index = (size_t)hash & (graph->namespace_capacity - 1U);
-        while (slots[index].used)
-        {
-            if (slots[index].hash == hash && slots[index].parent == parent &&
-                slots[index].component_length == length &&
-                memcmp(slots[index].component, component, length) == 0)
-                return &slots[index];
-            index = (index + 1U) & (graph->namespace_capacity - 1U);
-        }
-    }
+    DestinationNamespaceSlot *found = destination_namespace_find(
+        graph, parent, component, length);
+    if (found != NULL)
+        return found;
     if (graph->namespace_count >= graph->namespace_limit)
     {
         errno = E2BIG;
@@ -1302,7 +1524,8 @@ static DestinationNamespaceSlot *destination_namespace_slot(
     if (destination_namespace_ensure(graph) != 0)
         return NULL;
 
-    slots = graph->namespace_slots;
+    uint64_t hash = destination_namespace_hash(graph, parent, component, length);
+    DestinationNamespaceSlot *slots = graph->namespace_slots;
     size_t index = (size_t)hash & (graph->namespace_capacity - 1U);
     while (slots[index].used)
         index = (index + 1U) & (graph->namespace_capacity - 1U);
@@ -1311,6 +1534,16 @@ static DestinationNamespaceSlot *destination_namespace_slot(
         return NULL;
     memcpy(copy, component, length);
     copy[length] = '\0';
+
+    size_t name_member = SIZE_MAX;
+    if (destination_name_index_add(graph, parent, copy, length,
+                                   &name_member) != 0)
+    {
+        int saved = errno;
+        preflight_free(&graph->memory, copy, length + 1U);
+        errno = saved;
+        return NULL;
+    }
     slots[index] = (DestinationNamespaceSlot){
         .parent = parent,
         .child = SIZE_MAX,
@@ -1319,6 +1552,7 @@ static DestinationNamespaceSlot *destination_namespace_slot(
         .component = copy,
         .component_length = length,
         .hash = hash,
+        .name_member = name_member,
         .resolved = 0,
         .existing_on_disk = 0,
         .used = 1
@@ -1344,20 +1578,6 @@ static int destination_planned_node(DestinationIdentityGraph *graph,
     return 0;
 }
 
-static int destination_ascii_case_equal(unsigned char first,
-                                        unsigned char second)
-{
-    if (first == second)
-        return 1;
-    if (first >= 'A' && first <= 'Z')
-        first = (unsigned char)(first + ('a' - 'A'));
-    if (second >= 'A' && second <= 'Z')
-        second = (unsigned char)(second + ('a' - 'A'));
-    return first == second &&
-           ((first >= 'a' && first <= 'z') ||
-            (second >= 'a' && second <= 'z'));
-}
-
 /* This is only a conservative trigger. It never decides that two names are
  * equal: the directory's kernel-reported lookup capability makes that
  * decision boundary explicit below. Keeping the trigger ASCII-only avoids
@@ -1368,39 +1588,68 @@ static int destination_names_may_casefold(const char *first, size_t first_length
 {
     if (first == NULL || second == NULL || first_length != second_length)
         return 0;
-
-    int differs = 0;
-    for (size_t index = 0; index < first_length; index++)
-    {
-        unsigned char first_byte = (unsigned char)first[index];
-        unsigned char second_byte = (unsigned char)second[index];
-        if (first_byte == second_byte)
-            continue;
-        if (!destination_ascii_case_equal(first_byte, second_byte))
-            return 0;
-        differs = 1;
-    }
-    return differs;
+    return memcmp(first, second, first_length) != 0 &&
+           destination_names_fold_equal(first, first_length,
+                                        second, second_length);
 }
 
-static DestinationNamespaceSlot *destination_name_conflict_slot(
+static int destination_name_conflict_slot(
     const DestinationIdentityGraph *graph, size_t parent,
-    const DestinationNamespaceSlot *current)
+    const DestinationNamespaceSlot *current,
+    DestinationNamespaceSlot **conflict_out)
 {
-    DestinationNamespaceSlot *slots = graph->namespace_slots;
-    for (size_t index = 0; index < graph->namespace_capacity; index++)
+    if (graph == NULL || current == NULL || conflict_out == NULL ||
+        current->name_member == SIZE_MAX)
     {
-        DestinationNamespaceSlot *candidate = &slots[index];
-        if (!candidate->used || candidate == current ||
-            candidate->parent != parent || !candidate->resolved ||
+        errno = EINVAL;
+        return -1;
+    }
+    *conflict_out = NULL;
+
+    uint64_t hash = destination_name_hash(
+        graph, parent, current->component, current->component_length);
+    DestinationNameSlot *name_slot = destination_name_slot_find(
+        graph, parent, current->component, current->component_length, hash);
+    if (name_slot == NULL)
+    {
+        errno = ESTALE;
+        return -1;
+    }
+
+    DestinationNameMember *members = graph->name_members;
+    for (size_t member_index = name_slot->head_member;
+         member_index != SIZE_MAX;
+         member_index = members[member_index].next)
+    {
+        if (member_index >= graph->name_member_count)
+        {
+            errno = ESTALE;
+            return -1;
+        }
+#ifdef PORTABLE_RESTORE_ADDRESS_TEST_HOOKS
+        if (destination_identity_test_name_probe_counter != SIZE_MAX)
+            destination_identity_test_name_probe_counter++;
+#endif
+        if (member_index == current->name_member)
+            continue;
+        DestinationNameMember *member = &members[member_index];
+        DestinationNamespaceSlot *candidate = destination_namespace_find(
+            graph, parent, member->component, member->component_length);
+        if (candidate == NULL)
+        {
+            errno = ESTALE;
+            return -1;
+        }
+        if (candidate == current || !candidate->resolved ||
             (candidate->existing_on_disk && current->existing_on_disk) ||
             !destination_names_may_casefold(
                 candidate->component, candidate->component_length,
                 current->component, current->component_length))
             continue;
-        return candidate;
+        *conflict_out = candidate;
+        return 0;
     }
-    return NULL;
+    return 0;
 }
 
 static DestinationIdentityStatus destination_name_equivalence_check(
@@ -1408,8 +1657,10 @@ static DestinationIdentityStatus destination_name_equivalence_check(
     const DestinationNamespaceSlot *current, int nearest_existing_fd,
     DestinationIdentityNameConflict *conflict)
 {
-    DestinationNamespaceSlot *candidate =
-        destination_name_conflict_slot(graph, parent, current);
+    DestinationNamespaceSlot *candidate = NULL;
+    if (destination_name_conflict_slot(graph, parent, current,
+                                       &candidate) != 0)
+        return destination_graph_path_error(errno);
     if (candidate == NULL)
         return DESTINATION_IDENTITY_OK;
 
@@ -1421,6 +1672,15 @@ static DestinationIdentityStatus destination_name_equivalence_check(
         .current_component_length = current->component_length,
         .failure = DESTINATION_NAME_FAILURE_UNKNOWN
     };
+
+#ifdef PORTABLE_RESTORE_ADDRESS_TEST_HOOKS
+    if (destination_identity_test_casefold_forced)
+    {
+        conflict->failure = DESTINATION_NAME_FAILURE_CASEFOLD;
+        errno = EOPNOTSUPP;
+        return DESTINATION_IDENTITY_NAME_EQUIVALENCE_ERROR;
+    }
+#endif
 
     if (nearest_existing_fd < 0)
     {
@@ -1438,8 +1698,6 @@ static DestinationIdentityStatus destination_name_equivalence_check(
     errno = EOPNOTSUPP;
     return DESTINATION_IDENTITY_NAME_EQUIVALENCE_ERROR;
 }
-
-static DestinationIdentityStatus destination_graph_path_error(int saved);
 
 static uint64_t destination_topology_hash(const DestinationIdentityGraph *graph,
                                           size_t parent, size_t child)
@@ -1990,7 +2248,8 @@ int destination_identity_graph_add_entries(
     const char *destination_home_path,
     const char * const *destination_xdg_dirs, int *xdg_anchor_fd,
     char (*xdg_anchor_prefix)[PATH_MAX], DestinationIdentityEntryReader reader,
-    DestinationIdentityFailureReporter report_failure, void *context,
+    DestinationIdentityFailureReporter report_failure,
+    DestinationIdentityProgressReporter report_progress, void *context,
     DestinationIdentityCollisionPolicy collision_policy)
 {
     if (graph == NULL || manifest == NULL || destination_home_fd < 0 ||
@@ -2101,6 +2360,8 @@ int destination_identity_graph_add_entries(
             report_failure(context, index);
             if (collision_policy == DESTINATION_IDENTITY_STOP_ON_COLLISION)
                 return -1;
+            if (report_progress != NULL)
+                report_progress(context, index + 1U);
             continue;
         }
         if (status == DESTINATION_IDENTITY_NAME_EQUIVALENCE_ERROR)
@@ -2145,6 +2406,8 @@ int destination_identity_graph_add_entries(
             report_failure(context, index);
             if (collision_policy == DESTINATION_IDENTITY_STOP_ON_COLLISION)
                 return -1;
+            if (report_progress != NULL)
+                report_progress(context, index + 1U);
             continue;
         }
         if (status != DESTINATION_IDENTITY_OK)
@@ -2159,6 +2422,8 @@ int destination_identity_graph_add_entries(
             report_failure(context, index);
             return -1;
         }
+        if (report_progress != NULL)
+            report_progress(context, index + 1U);
     }
     return 0;
 }
@@ -2338,6 +2603,10 @@ void destination_identity_graph_free(DestinationIdentityGraph *graph)
                    graph->identity_capacity * sizeof(DestinationFixedSlot));
     preflight_free(&graph->memory, graph->namespace_slots,
                    graph->namespace_capacity * sizeof(DestinationNamespaceSlot));
+    preflight_free(&graph->memory, graph->name_slots,
+                   graph->name_capacity * sizeof(DestinationNameSlot));
+    preflight_free(&graph->memory, graph->name_members,
+                   graph->name_member_capacity * sizeof(DestinationNameMember));
     preflight_free(&graph->memory, graph->topology_slots,
                    graph->topology_capacity * sizeof(DestinationFixedSlot));
     memset(graph, 0, sizeof(*graph));
