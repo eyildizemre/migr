@@ -23,6 +23,7 @@
 #include "portable.h"
 #include "portable_restore.h"
 #include "portable_restore_internal.h"
+#include "portable_restore_replay_internal.h"
 #include "utils.h"
 #include "xdg.h"
 
@@ -2458,20 +2459,27 @@ int restore(const char *source)
                 break;
             case PORTABLE_RESTORE_ERROR:
             default:
+            {
+                char reason[256];
+                char detail[sizeof(reason) + 4U] = "";
+                if (replay_failure_reason_format(&report, reason,
+                                                 sizeof(reason)) == 1)
+                    (void)snprintf(detail, sizeof(detail), " (%s)", reason);
                 if (report.failed_root_id[0] != '\0')
-                    printf("Restore finished with errors at %s:%s: %zu applied, %zu failed\n",
+                    printf("Restore finished with errors at %s:%s: %zu applied, %zu failed%s\n",
                            report.failed_root_id,
                            report.failed_logical_path[0] != '\0'
                                ? report.failed_logical_path : ".",
-                           report.applied_count, report.failed_count);
+                           report.applied_count, report.failed_count, detail);
                 else if (report.failed_logical_path[0] != '\0')
-                    printf("Restore finished with errors at %s: %zu applied, %zu failed\n",
+                    printf("Restore finished with errors at %s: %zu applied, %zu failed%s\n",
                            report.failed_logical_path,
-                           report.applied_count, report.failed_count);
+                           report.applied_count, report.failed_count, detail);
                 else
-                    printf("Restore finished with errors: %zu applied, %zu failed\n",
-                           report.applied_count, report.failed_count);
+                    printf("Restore finished with errors: %zu applied, %zu failed%s\n",
+                           report.applied_count, report.failed_count, detail);
                 break;
+            }
         }
         if (report.skipped_security_xattr_count != 0)
             printf("Skipped %zu security.* attribute(s) that the destination "

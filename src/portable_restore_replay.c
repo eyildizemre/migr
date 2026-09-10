@@ -71,6 +71,11 @@ typedef struct {
     MetadataXattrRequirements xattr_requirements;
 } ReplayCollection;
 
+typedef struct {
+    PortableRestoreReplayFailureStep step;
+    int err;
+} ReplayApplyFailure;
+
 static int replay_hardlink_ref_relative(const ManifestRoot *ref_root,
                                         const SidecarEntry *ref_entry,
                                         const char * const *xdg_dirs,
@@ -108,6 +113,114 @@ static void replay_report_failure(PortableRestoreReplayReport *report,
                  manifest->roots[root_index].id);
     replay_copy_bytes(report->failed_logical_path,
                       sizeof(report->failed_logical_path), logical);
+}
+
+static void replay_apply_failure_record(
+    ReplayApplyFailure *failure, PortableRestoreReplayFailureStep step, int err)
+{
+    if (failure == NULL || failure->step != PORTABLE_RESTORE_REPLAY_FAILURE_NONE ||
+        step == PORTABLE_RESTORE_REPLAY_FAILURE_NONE)
+        return;
+    failure->step = step;
+    failure->err = err != 0 ? err : EIO;
+}
+
+static void replay_report_apply_failure(
+    PortableRestoreReplayReport *report, const Manifest *manifest,
+    size_t root_index, const SidecarEntry *entry,
+    const ReplayApplyFailure *failure)
+{
+    if (entry == NULL)
+    {
+        replay_report_failure(report, manifest, root_index, (SidecarBytes){0});
+        return;
+    }
+    replay_report_failure(report, manifest, root_index, entry->logical_path);
+    if (report == NULL || failure == NULL ||
+        failure->step == PORTABLE_RESTORE_REPLAY_FAILURE_NONE)
+        return;
+    report->failed_kind = entry->kind;
+    report->failed_kind_valid = 1;
+    report->failure_step = failure->step;
+    report->failure_errno = failure->err;
+}
+
+const char *replay_failure_kind_text(SidecarObjectKind kind)
+{
+    switch (kind)
+    {
+        case SIDECAR_KIND_REGULAR: return "regular file";
+        case SIDECAR_KIND_DIRECTORY: return "directory";
+        case SIDECAR_KIND_FIFO: return "FIFO";
+        case SIDECAR_KIND_SYMLINK: return "symlink";
+        case SIDECAR_KIND_HARDLINK: return "hardlink";
+    }
+    return NULL;
+}
+
+const char *replay_failure_step_text(PortableRestoreReplayFailureStep step)
+{
+    switch (step)
+    {
+        case PORTABLE_RESTORE_REPLAY_FAILURE_VALIDATE_ENTRY:
+            return "validate entry metadata";
+        case PORTABLE_RESTORE_REPLAY_FAILURE_OPEN_PAYLOAD:
+            return "open backup payload";
+        case PORTABLE_RESTORE_REPLAY_FAILURE_RESOLVE_DESTINATION_PARENT:
+            return "resolve destination parent";
+        case PORTABLE_RESTORE_REPLAY_FAILURE_CHECK_DESTINATION:
+            return "check destination";
+        case PORTABLE_RESTORE_REPLAY_FAILURE_OPEN_DESTINATION:
+            return "open destination";
+        case PORTABLE_RESTORE_REPLAY_FAILURE_COPY_CONTENT:
+            return "copy content";
+        case PORTABLE_RESTORE_REPLAY_FAILURE_VERIFY_PAYLOAD:
+            return "verify backup payload";
+        case PORTABLE_RESTORE_REPLAY_FAILURE_APPLY_OWNERSHIP_MODE:
+            return "apply ownership/mode";
+        case PORTABLE_RESTORE_REPLAY_FAILURE_APPLY_XATTRS:
+            return "apply xattrs";
+        case PORTABLE_RESTORE_REPLAY_FAILURE_APPLY_TIMES:
+            return "apply timestamps";
+        case PORTABLE_RESTORE_REPLAY_FAILURE_CREATE_SYMLINK:
+            return "create symlink";
+        case PORTABLE_RESTORE_REPLAY_FAILURE_RESOLVE_HARDLINK_REFERENCE:
+            return "resolve hardlink reference";
+        case PORTABLE_RESTORE_REPLAY_FAILURE_CREATE_HARDLINK:
+            return "create hardlink";
+        case PORTABLE_RESTORE_REPLAY_FAILURE_VERIFY_HARDLINK:
+            return "verify hardlink";
+        case PORTABLE_RESTORE_REPLAY_FAILURE_CLOSE_DESCRIPTOR:
+            return "close descriptor";
+        case PORTABLE_RESTORE_REPLAY_FAILURE_NONE:
+            break;
+    }
+    return NULL;
+}
+
+int replay_failure_reason_format(const PortableRestoreReplayReport *report,
+                                 char *out, size_t out_size)
+{
+    if (out == NULL || out_size == 0)
+        return -1;
+    out[0] = '\0';
+    if (report == NULL || !report->failed_kind_valid ||
+        report->failure_step == PORTABLE_RESTORE_REPLAY_FAILURE_NONE ||
+        report->failure_errno == 0)
+        return 0;
+
+    const char *kind = replay_failure_kind_text(report->failed_kind);
+    const char *step = replay_failure_step_text(report->failure_step);
+    if (kind == NULL || step == NULL)
+        return 0;
+    int length = snprintf(out, out_size, "%s, %s: %s", kind, step,
+                          strerror(report->failure_errno));
+    if (length < 0 || (size_t)length >= out_size)
+    {
+        out[0] = '\0';
+        return -1;
+    }
+    return 1;
 }
 
 static void replay_report_security_skipped(
@@ -1188,33 +1301,57 @@ static int replay_destination_parent(ReplayCollection *collection,
 }
 
 static int replay_apply_regular(ReplayCollection *collection,
-                                ReplayEntry *replay)
+                                ReplayEntry *replay,
+                                ReplayApplyFailure *failure)
 {
+    if (failure != NULL)
+        *failure = (ReplayApplyFailure){0};
     const ManifestRoot *root = &collection->manifest->roots[
         replay->root_index];
     const SidecarEntry *entry = replay->entry;
     if (entry->size > (uint64_t)INTMAX_MAX)
     {
         errno = EOVERFLOW;
+        replay_apply_failure_record(
+            failure, PORTABLE_RESTORE_REPLAY_FAILURE_VALIDATE_ENTRY, errno);
         return -1;
     }
     struct stat desired;
     if (replay_stat_from_entry(entry, &desired) != 0)
+    {
+        replay_apply_failure_record(
+            failure, PORTABLE_RESTORE_REPLAY_FAILURE_VALIDATE_ENTRY, errno);
         return -1;
+    }
 
     int source_fd = -1;
     struct stat source_before;
     if (replay_open_payload(collection, root, entry, &source_fd,
                             &source_before) != 0)
+    {
+        replay_apply_failure_record(
+            failure, PORTABLE_RESTORE_REPLAY_FAILURE_OPEN_PAYLOAD, errno);
         return -1;
+    }
     int parent_fd = -1;
     char leaf[NAME_MAX + 1U];
     int destination_fd = -1;
     int result = replay_destination_parent(collection, replay, &parent_fd,
                                            leaf, sizeof(leaf));
+    if (result != 0)
+        replay_apply_failure_record(
+            failure,
+            PORTABLE_RESTORE_REPLAY_FAILURE_RESOLVE_DESTINATION_PARENT,
+            errno);
     if (result == 0)
+    {
         result = replay_open_destination_regular(parent_fd, leaf,
                                                  &destination_fd);
+        if (result != 0)
+            replay_apply_failure_record(
+                failure, PORTABLE_RESTORE_REPLAY_FAILURE_OPEN_DESTINATION,
+                errno);
+    }
     if (result == 0 && collection->capture_report != NULL)
     {
         char relative[PATH_MAX];
@@ -1225,9 +1362,14 @@ static int replay_apply_regular(ReplayCollection *collection,
                      relative);
     }
     if (result == 0)
+    {
         result = portable_copy_regular(
             source_fd, destination_fd, (off_t)entry->size,
             collection->capture_report);
+        if (result != 0)
+            replay_apply_failure_record(
+                failure, PORTABLE_RESTORE_REPLAY_FAILURE_COPY_CONTENT, errno);
+    }
     if (result == 0)
     {
         struct stat source_after;
@@ -1236,11 +1378,21 @@ static int replay_apply_regular(ReplayCollection *collection,
         {
             errno = EIO;
             result = -1;
+            replay_apply_failure_record(
+                failure, PORTABLE_RESTORE_REPLAY_FAILURE_VERIFY_PAYLOAD,
+                errno);
         }
     }
     if (result == 0)
+    {
         result = metadata_apply_ownership_and_mode_fd(destination_fd,
                                                       &desired);
+        if (result != 0)
+            replay_apply_failure_record(
+                failure,
+                PORTABLE_RESTORE_REPLAY_FAILURE_APPLY_OWNERSHIP_MODE,
+                errno);
+    }
     if (result == 0)
     {
         size_t skipped_security = 0;
@@ -1249,47 +1401,72 @@ static int replay_apply_regular(ReplayCollection *collection,
             &skipped_security);
         replay_report_security_skipped(collection->report, skipped_security);
         if (xattr_result != 0)
+        {
             result = -1;
+            replay_apply_failure_record(
+                failure, PORTABLE_RESTORE_REPLAY_FAILURE_APPLY_XATTRS,
+                errno);
+        }
     }
     if (result == 0)
+    {
         result = metadata_apply_times_fd(destination_fd, &desired,
                                          collection->timestamp_policy);
+        if (result != 0)
+            replay_apply_failure_record(
+                failure, PORTABLE_RESTORE_REPLAY_FAILURE_APPLY_TIMES, errno);
+    }
 
     int saved = errno;
     if (destination_fd >= 0 && close(destination_fd) != 0 && result == 0)
     {
         result = -1;
         saved = EIO;
+        replay_apply_failure_record(
+            failure, PORTABLE_RESTORE_REPLAY_FAILURE_CLOSE_DESCRIPTOR, saved);
     }
     if (parent_fd >= 0 && close(parent_fd) != 0 && result == 0)
     {
         result = -1;
         saved = EIO;
+        replay_apply_failure_record(
+            failure, PORTABLE_RESTORE_REPLAY_FAILURE_CLOSE_DESCRIPTOR, saved);
     }
     if (close(source_fd) != 0 && result == 0)
     {
         result = -1;
         saved = EIO;
+        replay_apply_failure_record(
+            failure, PORTABLE_RESTORE_REPLAY_FAILURE_CLOSE_DESCRIPTOR, saved);
     }
     errno = saved;
     return result;
 }
 
 static int replay_apply_symlink(ReplayCollection *collection,
-                                ReplayEntry *replay)
+                                ReplayEntry *replay,
+                                ReplayApplyFailure *failure)
 {
+    if (failure != NULL)
+        *failure = (ReplayApplyFailure){0};
     if (collection == NULL || replay == NULL || replay->entry == NULL ||
         replay->entry->kind != SIDECAR_KIND_SYMLINK ||
         !replay_entry_valid(replay->entry))
     {
         errno = EINVAL;
+        replay_apply_failure_record(
+            failure, PORTABLE_RESTORE_REPLAY_FAILURE_VALIDATE_ENTRY, errno);
         return -1;
     }
 
     const SidecarEntry *entry = replay->entry;
     struct stat desired;
     if (replay_stat_from_entry(entry, &desired) != 0)
+    {
+        replay_apply_failure_record(
+            failure, PORTABLE_RESTORE_REPLAY_FAILURE_VALIDATE_ENTRY, errno);
         return -1;
+    }
 
     size_t target_length = entry->symlink_target.length;
     char target[SIDECAR_MAX_SYMLINK_TARGET + 1U];
@@ -1300,6 +1477,11 @@ static int replay_apply_symlink(ReplayCollection *collection,
     char leaf[NAME_MAX + 1U];
     int result = replay_destination_parent(collection, replay, &parent_fd,
                                            leaf, sizeof(leaf));
+    if (result != 0)
+        replay_apply_failure_record(
+            failure,
+            PORTABLE_RESTORE_REPLAY_FAILURE_RESOLVE_DESTINATION_PARENT,
+            errno);
     if (result == 0)
     {
         struct stat existing;
@@ -1307,15 +1489,34 @@ static int replay_apply_symlink(ReplayCollection *collection,
         {
             errno = EEXIST;
             result = -1;
+            replay_apply_failure_record(
+                failure, PORTABLE_RESTORE_REPLAY_FAILURE_CHECK_DESTINATION,
+                errno);
         }
         else if (errno != ENOENT)
+        {
             result = -1;
+            replay_apply_failure_record(
+                failure, PORTABLE_RESTORE_REPLAY_FAILURE_CHECK_DESTINATION,
+                errno);
+        }
     }
     if (result == 0 && symlinkat(target, parent_fd, leaf) != 0)
+    {
         result = -1;
+        replay_apply_failure_record(
+            failure, PORTABLE_RESTORE_REPLAY_FAILURE_CREATE_SYMLINK, errno);
+    }
     if (result == 0)
+    {
         result = metadata_apply_symlink_ownership_at(parent_fd, leaf,
                                                      &desired);
+        if (result != 0)
+            replay_apply_failure_record(
+                failure,
+                PORTABLE_RESTORE_REPLAY_FAILURE_APPLY_OWNERSHIP_MODE,
+                errno);
+    }
     if (result == 0)
     {
         size_t skipped_security = 0;
@@ -1324,17 +1525,29 @@ static int replay_apply_symlink(ReplayCollection *collection,
             &skipped_security);
         replay_report_security_skipped(collection->report, skipped_security);
         if (xattr_result != 0)
+        {
             result = -1;
+            replay_apply_failure_record(
+                failure, PORTABLE_RESTORE_REPLAY_FAILURE_APPLY_XATTRS,
+                errno);
+        }
     }
     if (result == 0)
+    {
         result = metadata_apply_symlink_times_at(parent_fd, leaf, &desired,
                                                  collection->timestamp_policy);
+        if (result != 0)
+            replay_apply_failure_record(
+                failure, PORTABLE_RESTORE_REPLAY_FAILURE_APPLY_TIMES, errno);
+    }
 
     int saved = errno;
     if (parent_fd >= 0 && close(parent_fd) != 0 && result == 0)
     {
         result = -1;
         saved = EIO;
+        replay_apply_failure_record(
+            failure, PORTABLE_RESTORE_REPLAY_FAILURE_CLOSE_DESCRIPTOR, saved);
     }
     errno = saved;
     return result;
@@ -1358,8 +1571,11 @@ void portable_restore_replay_test_set_hardlink_race_hook(void (*hook)(void))
 #endif
 
 static int replay_apply_hardlink(ReplayCollection *collection,
-                                 ReplayEntry *replay)
+                                 ReplayEntry *replay,
+                                 ReplayApplyFailure *failure)
 {
+    if (failure != NULL)
+        *failure = (ReplayApplyFailure){0};
     if (collection == NULL || replay == NULL || replay->entry == NULL ||
         replay->entry->kind != SIDECAR_KIND_HARDLINK ||
         !replay_entry_valid(replay->entry) ||
@@ -1368,6 +1584,8 @@ static int replay_apply_hardlink(ReplayCollection *collection,
         replay->hardlink_ref_entry == NULL)
     {
         errno = EINVAL;
+        replay_apply_failure_record(
+            failure, PORTABLE_RESTORE_REPLAY_FAILURE_VALIDATE_ENTRY, errno);
         return -1;
     }
 
@@ -1379,6 +1597,8 @@ static int replay_apply_hardlink(ReplayCollection *collection,
         ref_relative[0] == '\0' || !relative_path_valid(ref_relative, 0))
     {
         errno = EINVAL;
+        replay_apply_failure_record(
+            failure, PORTABLE_RESTORE_REPLAY_FAILURE_VALIDATE_ENTRY, errno);
         return -1;
     }
 
@@ -1388,10 +1608,22 @@ static int replay_apply_hardlink(ReplayCollection *collection,
     char ref_leaf[NAME_MAX + 1U];
     int result = replay_destination_parent(collection, replay, &parent_fd,
                                            leaf, sizeof(leaf));
+    if (result != 0)
+        replay_apply_failure_record(
+            failure,
+            PORTABLE_RESTORE_REPLAY_FAILURE_RESOLVE_DESTINATION_PARENT,
+            errno);
     if (result == 0)
+    {
         result = replay_destination_parent_for_root(
             collection, replay->hardlink_ref_root_index,
             ref_relative, &ref_parent_fd, ref_leaf, sizeof(ref_leaf));
+        if (result != 0)
+            replay_apply_failure_record(
+                failure,
+                PORTABLE_RESTORE_REPLAY_FAILURE_RESOLVE_HARDLINK_REFERENCE,
+                errno);
+    }
 
     struct stat reference_before;
     if (result == 0 &&
@@ -1402,6 +1634,10 @@ static int replay_apply_hardlink(ReplayCollection *collection,
     {
         errno = EIO;
         result = -1;
+        replay_apply_failure_record(
+            failure,
+            PORTABLE_RESTORE_REPLAY_FAILURE_RESOLVE_HARDLINK_REFERENCE,
+            errno);
     }
     if (result == 0)
     {
@@ -1410,16 +1646,28 @@ static int replay_apply_hardlink(ReplayCollection *collection,
         {
             errno = EEXIST;
             result = -1;
+            replay_apply_failure_record(
+                failure, PORTABLE_RESTORE_REPLAY_FAILURE_CHECK_DESTINATION,
+                errno);
         }
         else if (errno != ENOENT)
+        {
             result = -1;
+            replay_apply_failure_record(
+                failure, PORTABLE_RESTORE_REPLAY_FAILURE_CHECK_DESTINATION,
+                errno);
+        }
     }
 #ifdef PORTABLE_RESTORE_REPLAY_TEST_HOOKS
     if (result == 0 && hardlink_race_hook != NULL)
         hardlink_race_hook();
 #endif
     if (result == 0 && linkat(ref_parent_fd, ref_leaf, parent_fd, leaf, 0) != 0)
+    {
         result = -1;
+        replay_apply_failure_record(
+            failure, PORTABLE_RESTORE_REPLAY_FAILURE_CREATE_HARDLINK, errno);
+    }
     if (result == 0)
     {
         struct stat linked;
@@ -1428,6 +1676,9 @@ static int replay_apply_hardlink(ReplayCollection *collection,
         {
             errno = EIO;
             result = -1;
+            replay_apply_failure_record(
+                failure, PORTABLE_RESTORE_REPLAY_FAILURE_VERIFY_HARDLINK,
+                errno);
         }
     }
 
@@ -1436,19 +1687,26 @@ static int replay_apply_hardlink(ReplayCollection *collection,
     {
         result = -1;
         saved = EIO;
+        replay_apply_failure_record(
+            failure, PORTABLE_RESTORE_REPLAY_FAILURE_CLOSE_DESCRIPTOR, saved);
     }
     if (parent_fd >= 0 && close(parent_fd) != 0 && result == 0)
     {
         result = -1;
         saved = EIO;
+        replay_apply_failure_record(
+            failure, PORTABLE_RESTORE_REPLAY_FAILURE_CLOSE_DESCRIPTOR, saved);
     }
     errno = saved;
     return result;
 }
 
 static int replay_prepare_directory(ReplayCollection *collection,
-                                     ReplayEntry *replay)
+                                     ReplayEntry *replay,
+                                     ReplayApplyFailure *failure)
 {
+    if (failure != NULL)
+        *failure = (ReplayApplyFailure){0};
     const ManifestRoot *root = &collection->manifest->roots[
         replay->root_index];
     const SidecarEntry *entry = replay->entry;
@@ -1456,49 +1714,82 @@ static int replay_prepare_directory(ReplayCollection *collection,
     struct stat source_st;
     if (replay_open_payload(collection, root, entry, &source_fd,
                             &source_st) != 0)
+    {
+        replay_apply_failure_record(
+            failure, PORTABLE_RESTORE_REPLAY_FAILURE_OPEN_PAYLOAD, errno);
         return -1;
+    }
 
     int parent_fd = -1;
     int destination_fd = -1;
     char leaf[NAME_MAX + 1U];
     int result = replay_destination_parent(collection, replay, &parent_fd,
                                            leaf, sizeof(leaf));
+    if (result != 0)
+        replay_apply_failure_record(
+            failure,
+            PORTABLE_RESTORE_REPLAY_FAILURE_RESOLVE_DESTINATION_PARENT,
+            errno);
     if (result == 0)
+    {
         result = replay_open_destination_directory(parent_fd, leaf,
                                                    &destination_fd);
+        if (result != 0)
+            replay_apply_failure_record(
+                failure, PORTABLE_RESTORE_REPLAY_FAILURE_OPEN_DESTINATION,
+                errno);
+    }
 
     int saved = errno;
     if (destination_fd >= 0 && close(destination_fd) != 0 && result == 0)
     {
         result = -1;
         saved = EIO;
+        replay_apply_failure_record(
+            failure, PORTABLE_RESTORE_REPLAY_FAILURE_CLOSE_DESCRIPTOR, saved);
     }
     if (parent_fd >= 0 && close(parent_fd) != 0 && result == 0)
     {
         result = -1;
         saved = EIO;
+        replay_apply_failure_record(
+            failure, PORTABLE_RESTORE_REPLAY_FAILURE_CLOSE_DESCRIPTOR, saved);
     }
     if (close(source_fd) != 0 && result == 0)
     {
         result = -1;
         saved = EIO;
+        replay_apply_failure_record(
+            failure, PORTABLE_RESTORE_REPLAY_FAILURE_CLOSE_DESCRIPTOR, saved);
     }
     errno = saved;
     return result;
 }
 
 static int replay_apply_directory_metadata(ReplayCollection *collection,
-                                            ReplayEntry *replay)
+                                            ReplayEntry *replay,
+                                            ReplayApplyFailure *failure)
 {
+    if (failure != NULL)
+        *failure = (ReplayApplyFailure){0};
     const SidecarEntry *entry = replay->entry;
     struct stat desired;
     if (replay_stat_from_entry(entry, &desired) != 0)
+    {
+        replay_apply_failure_record(
+            failure, PORTABLE_RESTORE_REPLAY_FAILURE_VALIDATE_ENTRY, errno);
         return -1;
+    }
     int parent_fd = -1;
     int destination_fd = -1;
     char leaf[NAME_MAX + 1U];
     int result = replay_destination_parent(collection, replay, &parent_fd,
                                            leaf, sizeof(leaf));
+    if (result != 0)
+        replay_apply_failure_record(
+            failure,
+            PORTABLE_RESTORE_REPLAY_FAILURE_RESOLVE_DESTINATION_PARENT,
+            errno);
     if (result == 0)
     {
         struct stat existing;
@@ -1517,10 +1808,21 @@ static int replay_apply_directory_metadata(ReplayCollection *collection,
         }
         if (destination_fd < 0 && result == 0)
             result = -1;
+        if (result != 0)
+            replay_apply_failure_record(
+                failure, PORTABLE_RESTORE_REPLAY_FAILURE_OPEN_DESTINATION,
+                errno);
     }
     if (result == 0)
+    {
         result = metadata_apply_ownership_and_mode_fd(destination_fd,
                                                       &desired);
+        if (result != 0)
+            replay_apply_failure_record(
+                failure,
+                PORTABLE_RESTORE_REPLAY_FAILURE_APPLY_OWNERSHIP_MODE,
+                errno);
+    }
     if (result == 0)
     {
         size_t skipped_security = 0;
@@ -1529,22 +1831,36 @@ static int replay_apply_directory_metadata(ReplayCollection *collection,
             &skipped_security);
         replay_report_security_skipped(collection->report, skipped_security);
         if (xattr_result != 0)
+        {
             result = -1;
+            replay_apply_failure_record(
+                failure, PORTABLE_RESTORE_REPLAY_FAILURE_APPLY_XATTRS,
+                errno);
+        }
     }
     if (result == 0)
+    {
         result = metadata_apply_times_fd(destination_fd, &desired,
                                          collection->timestamp_policy);
+        if (result != 0)
+            replay_apply_failure_record(
+                failure, PORTABLE_RESTORE_REPLAY_FAILURE_APPLY_TIMES, errno);
+    }
 
     int saved = errno;
     if (destination_fd >= 0 && close(destination_fd) != 0 && result == 0)
     {
         result = -1;
         saved = EIO;
+        replay_apply_failure_record(
+            failure, PORTABLE_RESTORE_REPLAY_FAILURE_CLOSE_DESCRIPTOR, saved);
     }
     if (parent_fd >= 0 && close(parent_fd) != 0 && result == 0)
     {
         result = -1;
         saved = EIO;
+        replay_apply_failure_record(
+            failure, PORTABLE_RESTORE_REPLAY_FAILURE_CLOSE_DESCRIPTOR, saved);
     }
     errno = saved;
     return result;
@@ -1589,22 +1905,23 @@ static int replay_run(ReplayCollection *collection)
     for (size_t index = 0; index < collection->count; index++)
     {
         ReplayEntry *replay = &collection->items[index];
+        ReplayApplyFailure failure = {0};
         int result;
         if (replay->entry->kind == SIDECAR_KIND_HARDLINK)
             continue;
         replay_print_verbose_root(collection, replay->root_index,
                                   printed_roots);
         if (replay->entry->kind == SIDECAR_KIND_SYMLINK)
-            result = replay_apply_symlink(collection, replay);
+            result = replay_apply_symlink(collection, replay, &failure);
         else if (replay->entry->kind == SIDECAR_KIND_DIRECTORY)
-            result = replay_prepare_directory(collection, replay);
+            result = replay_prepare_directory(collection, replay, &failure);
         else
-            result = replay_apply_regular(collection, replay);
+            result = replay_apply_regular(collection, replay, &failure);
         if (result != 0)
         {
-            replay_report_failure(collection->report, collection->manifest,
-                                  replay->root_index,
-                                  replay->entry->logical_path);
+            replay_report_apply_failure(
+                collection->report, collection->manifest, replay->root_index,
+                replay->entry, &failure);
             return -1;
         }
         if (replay->entry->kind == SIDECAR_KIND_REGULAR ||
@@ -1622,11 +1939,12 @@ static int replay_run(ReplayCollection *collection)
             continue;
         replay_print_verbose_root(collection, replay->root_index,
                                   printed_roots);
-        if (replay_apply_hardlink(collection, replay) != 0)
+        ReplayApplyFailure failure = {0};
+        if (replay_apply_hardlink(collection, replay, &failure) != 0)
         {
-            replay_report_failure(collection->report, collection->manifest,
-                                  replay->root_index,
-                                  replay->entry->logical_path);
+            replay_report_apply_failure(
+                collection->report, collection->manifest, replay->root_index,
+                replay->entry, &failure);
             return -1;
         }
         if (collection->report->applied_count != SIZE_MAX)
@@ -1640,11 +1958,12 @@ static int replay_run(ReplayCollection *collection)
             continue;
         replay_print_verbose_root(collection, replay->root_index,
                                   printed_roots);
-        if (replay_apply_directory_metadata(collection, replay) != 0)
+        ReplayApplyFailure failure = {0};
+        if (replay_apply_directory_metadata(collection, replay, &failure) != 0)
         {
-            replay_report_failure(collection->report, collection->manifest,
-                                  replay->root_index,
-                                  replay->entry->logical_path);
+            replay_report_apply_failure(
+                collection->report, collection->manifest, replay->root_index,
+                replay->entry, &failure);
             return -1;
         }
         if (collection->report->applied_count != SIZE_MAX)

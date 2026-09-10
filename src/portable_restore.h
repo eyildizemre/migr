@@ -8,6 +8,7 @@
 #include "fileops.h"
 #include "manifest.h"
 #include "metadata.h"
+#include "sidecar.h"
 #include "xdg.h"
 
 typedef struct {
@@ -49,11 +50,34 @@ typedef struct {
     MetadataProfiles profiles;
 } PortableRestorePreflightReport;
 
+typedef enum {
+    PORTABLE_RESTORE_REPLAY_FAILURE_NONE = 0,
+    PORTABLE_RESTORE_REPLAY_FAILURE_VALIDATE_ENTRY,
+    PORTABLE_RESTORE_REPLAY_FAILURE_OPEN_PAYLOAD,
+    PORTABLE_RESTORE_REPLAY_FAILURE_RESOLVE_DESTINATION_PARENT,
+    PORTABLE_RESTORE_REPLAY_FAILURE_CHECK_DESTINATION,
+    PORTABLE_RESTORE_REPLAY_FAILURE_OPEN_DESTINATION,
+    PORTABLE_RESTORE_REPLAY_FAILURE_COPY_CONTENT,
+    PORTABLE_RESTORE_REPLAY_FAILURE_VERIFY_PAYLOAD,
+    PORTABLE_RESTORE_REPLAY_FAILURE_APPLY_OWNERSHIP_MODE,
+    PORTABLE_RESTORE_REPLAY_FAILURE_APPLY_XATTRS,
+    PORTABLE_RESTORE_REPLAY_FAILURE_APPLY_TIMES,
+    PORTABLE_RESTORE_REPLAY_FAILURE_CREATE_SYMLINK,
+    PORTABLE_RESTORE_REPLAY_FAILURE_RESOLVE_HARDLINK_REFERENCE,
+    PORTABLE_RESTORE_REPLAY_FAILURE_CREATE_HARDLINK,
+    PORTABLE_RESTORE_REPLAY_FAILURE_VERIFY_HARDLINK,
+    PORTABLE_RESTORE_REPLAY_FAILURE_CLOSE_DESCRIPTOR
+} PortableRestoreReplayFailureStep;
+
 typedef struct {
     size_t live_count;
     size_t applied_count;
     size_t failed_count;
     size_t skipped_security_xattr_count;
+    SidecarObjectKind failed_kind;
+    int failed_kind_valid;
+    PortableRestoreReplayFailureStep failure_step;
+    int failure_errno;
     char failed_root_id[MANIFEST_ID_MAX];
     char failed_logical_path[PATH_MAX];
 } PortableRestoreReplayReport;

@@ -988,13 +988,21 @@ static void test_portable_replay_failure_names_entry(void)
                                                sizeof(output));
     dry_run = previous_dry_run;
 
+    char replay_summary[512];
+    char final_summary[512];
+    snprintf(replay_summary, sizeof(replay_summary),
+             "Portable restore stopped at ROOT:link: 0 applied, 1 failed "
+             "(symlink, check destination: %s)",
+             strerror(EEXIST));
+    snprintf(final_summary, sizeof(final_summary),
+             "Restore finished with errors at ROOT:link: 0 applied, 1 failed "
+             "(symlink, check destination: %s)",
+             strerror(EEXIST));
     check(rc != 0 &&
-              strstr(output,
-                     "Portable restore stopped at ROOT:link: 0 applied, 1 failed") != NULL,
-          "portable replay summary identifies the failing root and logical path");
-    check(strstr(output,
-                 "Restore finished with errors at ROOT:link: 0 applied, 1 failed") != NULL,
-          "restore final summary preserves the failing root and logical path");
+              strstr(output, replay_summary) != NULL,
+          "portable replay summary identifies the failing entry and cause");
+    check(strstr(output, final_summary) != NULL,
+          "restore final summary preserves the failing entry and cause");
     check(file_content_is(existing, "existing"),
           "reported replay conflict leaves the existing destination untouched");
 

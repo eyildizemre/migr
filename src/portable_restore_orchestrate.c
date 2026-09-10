@@ -139,19 +139,23 @@ static PortableRestoreOutcome portable_restore_orchestrate_impl(
     result = portable_restore_replay_at(&replay_request, report);
     if (result != 0)
     {
+        char reason[256];
+        char detail[sizeof(reason) + 4U] = "";
+        if (replay_failure_reason_format(report, reason, sizeof(reason)) == 1)
+            (void)snprintf(detail, sizeof(detail), " (%s)", reason);
         if (report->failed_root_id[0] != '\0')
-            printf("Portable restore stopped at %s:%s: %zu applied, %zu failed\n",
+            printf("Portable restore stopped at %s:%s: %zu applied, %zu failed%s\n",
                    report->failed_root_id,
                    report->failed_logical_path[0] != '\0'
                        ? report->failed_logical_path : ".",
-                   report->applied_count, report->failed_count);
+                   report->applied_count, report->failed_count, detail);
         else if (report->failed_logical_path[0] != '\0')
-            printf("Portable restore stopped at %s: %zu applied, %zu failed\n",
+            printf("Portable restore stopped at %s: %zu applied, %zu failed%s\n",
                    report->failed_logical_path,
-                   report->applied_count, report->failed_count);
+                   report->applied_count, report->failed_count, detail);
         else
-            printf("Portable restore stopped: %zu applied, %zu failed\n",
-                   report->applied_count, report->failed_count);
+            printf("Portable restore stopped: %zu applied, %zu failed%s\n",
+                   report->applied_count, report->failed_count, detail);
     }
     portable_restore_preflight_report_free(&preflight);
     return result == 0 ? PORTABLE_RESTORE_COMPLETE : PORTABLE_RESTORE_ERROR;

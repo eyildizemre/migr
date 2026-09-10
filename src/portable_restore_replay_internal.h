@@ -16,6 +16,10 @@ int replay_entry_valid(const SidecarEntry *entry);
 int replay_stat_from_entry(const SidecarEntry *entry, struct stat *desired);
 int replay_hardlink_identity_matches(const struct stat *linked,
                                      const struct stat *reference);
+const char *replay_failure_kind_text(SidecarObjectKind kind);
+const char *replay_failure_step_text(PortableRestoreReplayFailureStep step);
+int replay_failure_reason_format(const PortableRestoreReplayReport *report,
+                                 char *out, size_t out_size);
 
 #ifdef PORTABLE_RESTORE_REPLAY_TEST_HOOKS
 /* Fires inside replay_apply_hardlink(), after the pre-link reference

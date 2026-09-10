@@ -807,7 +807,12 @@ static void test_symlink_collection_validation(void)
         path_join(restored, sizeof(restored), fixture.home, "/restored/link");
         check(result != 0 && report.live_count == 2 &&
                   report.failed_count == 1 &&
-                  strcmp(report.failed_logical_path, "link") == 0,
+                  strcmp(report.failed_logical_path, "link") == 0 &&
+                  report.failed_kind_valid &&
+                  report.failed_kind == SIDECAR_KIND_SYMLINK &&
+                  report.failure_step ==
+                      PORTABLE_RESTORE_REPLAY_FAILURE_CHECK_DESTINATION &&
+                  report.failure_errno == EEXIST,
               "collection accepts the symlink before destination validation fails");
         check(file_equals_noatime(restored, "sentinel"),
               "collection failure leaves the destination untouched");
@@ -834,6 +839,9 @@ static void test_symlink_collection_validation(void)
         path_join(sentinel, sizeof(sentinel), missing.home, "/sentinel");
         check(result != 0 && report.failed_count == 1 &&
                   strcmp(report.failed_logical_path, "link") == 0 &&
+                  !report.failed_kind_valid &&
+                  report.failure_step == PORTABLE_RESTORE_REPLAY_FAILURE_NONE &&
+                  report.failure_errno == 0 &&
                   file_equals_noatime(sentinel, "untouched"),
               "missing symlink placeholder is rejected during collection");
         fixture_close(&missing);
@@ -1600,8 +1608,20 @@ static void test_capture_report_sync_failure(void)
     reset_sync(1);
     int result = run_replay_with_capture(&fixture, &report, &capture_report);
     check(result != 0 && sync_calls == 1 &&
-              capture_report.bytes_copied == 80 && report.failed_count != 0,
+              capture_report.bytes_copied == 80 && report.failed_count != 0 &&
+              report.failed_kind_valid &&
+              report.failed_kind == SIDECAR_KIND_REGULAR &&
+              report.failure_step ==
+                  PORTABLE_RESTORE_REPLAY_FAILURE_COPY_CONTENT &&
+              report.failure_errno == EIO,
           "a failed periodic sync aborts portable restore and records failure");
+    char reason[256];
+    int reason_result = replay_failure_reason_format(&report, reason,
+                                                     sizeof(reason));
+    check(reason_result == 1 && strstr(reason, "regular file") != NULL &&
+              strstr(reason, "copy content") != NULL &&
+              strstr(reason, strerror(EIO)) != NULL,
+          "portable restore failure reason formats kind, step, and errno");
     reset_sync(0);
     fixture_close(&fixture);
 }
@@ -1877,7 +1897,12 @@ static void test_payload_swap(void)
     int result = run_replay(&fixture, &report);
     check(result != 0 && report.live_count == 3 &&
               report.applied_count == 1 && report.failed_count == 1 &&
-              strcmp(report.failed_logical_path, "file") == 0,
+              strcmp(report.failed_logical_path, "file") == 0 &&
+              report.failed_kind_valid &&
+              report.failed_kind == SIDECAR_KIND_REGULAR &&
+              report.failure_step ==
+                  PORTABLE_RESTORE_REPLAY_FAILURE_OPEN_PAYLOAD &&
+              report.failure_errno == EIO,
           "payload replacement is caught after reporting prior progress");
     char restored_first[PATH_MAX], restored_file[PATH_MAX], sentinel[PATH_MAX];
     path_join(restored_first, sizeof(restored_first), fixture.home,
@@ -1992,7 +2017,11 @@ static void test_hardlink_toctou_race(void)
     hardlink_race_fixture = NULL;
 
     check(result != 0 && report.applied_count == 1 &&
-              report.failed_count == 1,
+              report.failed_count == 1 && report.failed_kind_valid &&
+              report.failed_kind == SIDECAR_KIND_HARDLINK &&
+              report.failure_step ==
+                  PORTABLE_RESTORE_REPLAY_FAILURE_VERIFY_HARDLINK &&
+              report.failure_errno == EIO,
           "the reference swapped between validation and linkat is "
           "detected instead of silently accepted");
 

@@ -443,7 +443,12 @@ static void test_symlink_destination_conflict(void)
     int result = run_orchestration(&fixture, &report, 1, "y\n");
     check(result != 0 && report.live_count == 2 &&
               report.applied_count == 0 && report.failed_count == 1 &&
-              strcmp(report.failed_logical_path, "link") == 0,
+              strcmp(report.failed_logical_path, "link") == 0 &&
+              report.failed_kind_valid &&
+              report.failed_kind == SIDECAR_KIND_SYMLINK &&
+              report.failure_step ==
+                  PORTABLE_RESTORE_REPLAY_FAILURE_CHECK_DESTINATION &&
+              report.failure_errno == EEXIST,
           "existing destination leaf is rejected as a replay conflict");
     char existing[PATH_MAX];
     path_join_fixture(existing, sizeof(existing), fixture.home,
