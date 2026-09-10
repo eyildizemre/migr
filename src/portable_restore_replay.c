@@ -28,10 +28,17 @@ typedef struct {
     size_t root_index;
     size_t hardlink_ref_root_index;
     const SidecarEntry *hardlink_ref_entry;
-    char destination[PATH_MAX];
     DestinationIdentityPlacement identity_placement;
     size_t destination_order;
 } ReplayEntry;
+
+/* ReplayEntry and RestoreAddressIndex share the same bounded allocation
+ * budget. Keep per-entry replay state compact enough that the maximum live
+ * entry count cannot consume more than half of that budget by itself. */
+_Static_assert((uint64_t)sizeof(ReplayEntry) <=
+                   SIDECAR_MAX_ALLOC_BUDGET /
+                       (UINT64_C(2) * SIDECAR_MAX_LIVE_ENTRIES),
+               "ReplayEntry exceeds its shared preflight-memory envelope");
 
 /* One most-recent destination parent captures sibling locality without
  * retaining an fd per directory. */
@@ -115,6 +122,25 @@ static void replay_report_failure(PortableRestoreReplayReport *report,
                       sizeof(report->failed_logical_path), logical);
 }
 
+static void replay_report_step_failure(
+    PortableRestoreReplayReport *report, const Manifest *manifest,
+    size_t root_index, const SidecarEntry *entry,
+    PortableRestoreReplayFailureStep step, int err)
+{
+    replay_report_failure(report, manifest, root_index,
+                          entry == NULL ? (SidecarBytes){0} :
+                                          entry->logical_path);
+    if (report == NULL || step == PORTABLE_RESTORE_REPLAY_FAILURE_NONE)
+        return;
+    if (entry != NULL && replay_failure_kind_text(entry->kind) != NULL)
+    {
+        report->failed_kind = entry->kind;
+        report->failed_kind_valid = 1;
+    }
+    report->failure_step = step;
+    report->failure_errno = err;
+}
+
 static void replay_apply_failure_record(
     ReplayApplyFailure *failure, PortableRestoreReplayFailureStep step, int err)
 {
@@ -130,19 +156,10 @@ static void replay_report_apply_failure(
     size_t root_index, const SidecarEntry *entry,
     const ReplayApplyFailure *failure)
 {
-    if (entry == NULL)
-    {
-        replay_report_failure(report, manifest, root_index, (SidecarBytes){0});
-        return;
-    }
-    replay_report_failure(report, manifest, root_index, entry->logical_path);
-    if (report == NULL || failure == NULL ||
-        failure->step == PORTABLE_RESTORE_REPLAY_FAILURE_NONE)
-        return;
-    report->failed_kind = entry->kind;
-    report->failed_kind_valid = 1;
-    report->failure_step = failure->step;
-    report->failure_errno = failure->err;
+    replay_report_step_failure(
+        report, manifest, root_index, entry,
+        failure == NULL ? PORTABLE_RESTORE_REPLAY_FAILURE_NONE : failure->step,
+        failure == NULL ? 0 : failure->err);
 }
 
 const char *replay_failure_kind_text(SidecarObjectKind kind)
@@ -162,8 +179,42 @@ const char *replay_failure_step_text(PortableRestoreReplayFailureStep step)
 {
     switch (step)
     {
+        case PORTABLE_RESTORE_REPLAY_FAILURE_FIND_ROOT:
+            return "find manifest root";
+        case PORTABLE_RESTORE_REPLAY_FAILURE_VALIDATE_SIDECAR_PATH:
+            return "validate sidecar path";
         case PORTABLE_RESTORE_REPLAY_FAILURE_VALIDATE_ENTRY:
             return "validate entry metadata";
+        case PORTABLE_RESTORE_REPLAY_FAILURE_VALIDATE_ADDRESS_INDEX:
+            return "validate restore address index";
+        case PORTABLE_RESTORE_REPLAY_FAILURE_VALIDATE_MANIFEST_OWNERSHIP:
+            return "validate manifest ownership";
+        case PORTABLE_RESTORE_REPLAY_FAILURE_VERIFY_PLACEHOLDER:
+            return "verify placeholder payload";
+        case PORTABLE_RESTORE_REPLAY_FAILURE_RESOLVE_HARDLINK_ENTRY:
+            return "resolve hardlink entry";
+        case PORTABLE_RESTORE_REPLAY_FAILURE_FIND_HARDLINK_ROOT:
+            return "find hardlink reference root";
+        case PORTABLE_RESTORE_REPLAY_FAILURE_VALIDATE_HARDLINK_OWNERSHIP:
+            return "validate hardlink reference ownership";
+        case PORTABLE_RESTORE_REPLAY_FAILURE_BUILD_HARDLINK_DESTINATION:
+            return "build hardlink reference destination";
+        case PORTABLE_RESTORE_REPLAY_FAILURE_BUILD_ENTRY_STAT:
+            return "build entry metadata";
+        case PORTABLE_RESTORE_REPLAY_FAILURE_RESERVE_ENTRY:
+            return "reserve replay entry";
+        case PORTABLE_RESTORE_REPLAY_FAILURE_BUILD_DESTINATION_PATH:
+            return "build destination path";
+        case PORTABLE_RESTORE_REPLAY_FAILURE_BUILD_ADDRESS_INDEX:
+            return "build restore address index";
+        case PORTABLE_RESTORE_REPLAY_FAILURE_REGISTER_DESTINATION_ANCHOR:
+            return "register destination anchor";
+        case PORTABLE_RESTORE_REPLAY_FAILURE_MAP_DESTINATION_IDENTITY:
+            return "map destination identity";
+        case PORTABLE_RESTORE_REPLAY_FAILURE_FINALIZE_DESTINATION_IDENTITY:
+            return "finalize destination identity";
+        case PORTABLE_RESTORE_REPLAY_FAILURE_ORDER_DESTINATION_IDENTITY:
+            return "order destination identity";
         case PORTABLE_RESTORE_REPLAY_FAILURE_OPEN_PAYLOAD:
             return "open backup payload";
         case PORTABLE_RESTORE_REPLAY_FAILURE_RESOLVE_DESTINATION_PARENT:
@@ -204,17 +255,26 @@ int replay_failure_reason_format(const PortableRestoreReplayReport *report,
     if (out == NULL || out_size == 0)
         return -1;
     out[0] = '\0';
-    if (report == NULL || !report->failed_kind_valid ||
-        report->failure_step == PORTABLE_RESTORE_REPLAY_FAILURE_NONE ||
-        report->failure_errno == 0)
+    if (report == NULL ||
+        report->failure_step == PORTABLE_RESTORE_REPLAY_FAILURE_NONE)
         return 0;
 
-    const char *kind = replay_failure_kind_text(report->failed_kind);
     const char *step = replay_failure_step_text(report->failure_step);
-    if (kind == NULL || step == NULL)
+    const char *kind = report->failed_kind_valid
+        ? replay_failure_kind_text(report->failed_kind) : NULL;
+    if (step == NULL || (report->failed_kind_valid && kind == NULL))
         return 0;
-    int length = snprintf(out, out_size, "%s, %s: %s", kind, step,
+    int length;
+    if (kind != NULL && report->failure_errno != 0)
+        length = snprintf(out, out_size, "%s, %s: %s", kind, step,
                           strerror(report->failure_errno));
+    else if (kind != NULL)
+        length = snprintf(out, out_size, "%s, %s", kind, step);
+    else if (report->failure_errno != 0)
+        length = snprintf(out, out_size, "%s: %s", step,
+                          strerror(report->failure_errno));
+    else
+        length = snprintf(out, out_size, "%s", step);
     if (length < 0 || (size_t)length >= out_size)
     {
         out[0] = '\0';
@@ -407,6 +467,31 @@ int replay_stat_from_entry(const SidecarEntry *entry, struct stat *desired)
     return 0;
 }
 
+static int replay_bytes_compare(SidecarBytes left, SidecarBytes right)
+{
+    size_t common = left.length < right.length ? left.length : right.length;
+    int compare = common == 0 ? 0 : memcmp(left.data, right.data, common);
+    if (compare != 0)
+        return compare;
+    if (left.length < right.length)
+        return -1;
+    if (left.length > right.length)
+        return 1;
+    return 0;
+}
+
+static SidecarBytes replay_logical_leaf(SidecarBytes logical)
+{
+    size_t start = 0;
+    for (size_t i = 0; i < logical.length; i++)
+        if (logical.data[i] == '/')
+            start = i + 1U;
+    return (SidecarBytes){
+        .data = logical.length == 0 ? NULL : logical.data + start,
+        .length = logical.length - start
+    };
+}
+
 static int replay_entry_compare(const void *left, const void *right)
 {
     const ReplayEntry *a = left;
@@ -415,7 +500,17 @@ static int replay_entry_compare(const void *left, const void *right)
         return -1;
     if (a->destination_order > b->destination_order)
         return 1;
-    return strcmp(a->destination, b->destination);
+
+    SidecarBytes a_logical = a->entry->logical_path;
+    SidecarBytes b_logical = b->entry->logical_path;
+    int compare = replay_bytes_compare(replay_logical_leaf(a_logical),
+                                       replay_logical_leaf(b_logical));
+    if (compare != 0)
+        return compare;
+    compare = replay_bytes_compare(a->entry->root_id, b->entry->root_id);
+    if (compare != 0)
+        return compare;
+    return replay_bytes_compare(a_logical, b_logical);
 }
 
 static int replay_open_payload(ReplayCollection *collection,
@@ -490,27 +585,51 @@ static int replay_collect_entry(const SidecarLiveView *view, void *argument)
     size_t root_index = root_map_find(&collection->root_map,
                                       collection->manifest,
                                       entry->root_id);
-    size_t address_index = SIZE_MAX;
-    if (root_index == SIZE_MAX ||
-        !sidecar_path_valid(entry->logical_path, 1) ||
-        !replay_entry_valid(entry) ||
-        restore_address_index_entry_valid(&collection->address_index, entry,
-                                          &address_index) != 1)
+    if (root_index == SIZE_MAX)
     {
-        replay_report_failure(collection->report, collection->manifest,
-                              root_index, entry->logical_path);
+        replay_report_step_failure(
+            collection->report, collection->manifest, root_index, entry,
+            PORTABLE_RESTORE_REPLAY_FAILURE_FIND_ROOT, 0);
+        return 1;
+    }
+    if (!sidecar_path_valid(entry->logical_path, 1))
+    {
+        replay_report_step_failure(
+            collection->report, collection->manifest, root_index, entry,
+            PORTABLE_RESTORE_REPLAY_FAILURE_VALIDATE_SIDECAR_PATH, 0);
+        return 1;
+    }
+    if (!replay_entry_valid(entry))
+    {
+        replay_report_step_failure(
+            collection->report, collection->manifest, root_index, entry,
+            PORTABLE_RESTORE_REPLAY_FAILURE_VALIDATE_ENTRY, 0);
+        return 1;
+    }
+    size_t address_index = SIZE_MAX;
+    errno = 0;
+    int address_valid = restore_address_index_entry_valid(
+        &collection->address_index, entry, &address_index);
+    if (address_valid != 1)
+    {
+        int saved = address_valid < 0 ? errno : 0;
+        replay_report_step_failure(
+            collection->report, collection->manifest, root_index, entry,
+            PORTABLE_RESTORE_REPLAY_FAILURE_VALIDATE_ADDRESS_INDEX, saved);
         return 1;
     }
     (void)address_index;
 
     char logical[PATH_MAX];
     replay_copy_bytes(logical, sizeof(logical), entry->logical_path);
-    if (entry->logical_path.length >= sizeof(logical) ||
-        manifest_entry_owned(collection->manifest, (int)root_index,
-                             logical) != 1)
+    int owned = entry->logical_path.length < sizeof(logical)
+        ? manifest_entry_owned(collection->manifest, (int)root_index, logical)
+        : -1;
+    if (owned != 1)
     {
-        replay_report_failure(collection->report, collection->manifest,
-                              root_index, entry->logical_path);
+        replay_report_step_failure(
+            collection->report, collection->manifest, root_index, entry,
+            PORTABLE_RESTORE_REPLAY_FAILURE_VALIDATE_MANIFEST_OWNERSHIP, 0);
         return 1;
     }
 
@@ -519,8 +638,10 @@ static int replay_collect_entry(const SidecarLiveView *view, void *argument)
          entry->kind == SIDECAR_KIND_HARDLINK) &&
         replay_symlink_placeholder_valid(collection, root, entry) != 0)
     {
-        replay_report_failure(collection->report, collection->manifest,
-                              root_index, entry->logical_path);
+        int saved = errno;
+        replay_report_step_failure(
+            collection->report, collection->manifest, root_index, entry,
+            PORTABLE_RESTORE_REPLAY_FAILURE_VERIFY_PLACEHOLDER, saved);
         return 1;
     }
 
@@ -528,18 +649,22 @@ static int replay_collect_entry(const SidecarLiveView *view, void *argument)
     const SidecarEntry *hardlink_ref_entry = NULL;
     if (entry->kind == SIDECAR_KIND_HARDLINK)
     {
-        SidecarLiveView referenced;
-        if (collection->sidecar == NULL ||
+        SidecarLiveView referenced = {0};
+        errno = 0;
+        int referenced_found = collection->sidecar == NULL ? -1 :
             sidecar_log_find(collection->sidecar,
                              entry->hardlink_root_id,
-                             entry->hardlink_logical_path, &referenced) <= 0 ||
+                             entry->hardlink_logical_path, &referenced);
+        if (referenced_found <= 0 ||
             referenced.entry == NULL ||
             referenced.entry->kind != SIDECAR_KIND_REGULAR ||
             !sidecar_path_valid(referenced.entry->logical_path, 1) ||
             referenced.entry->logical_path.length >= PATH_MAX)
         {
-            replay_report_failure(collection->report, collection->manifest,
-                                  root_index, entry->logical_path);
+            replay_report_step_failure(
+                collection->report, collection->manifest, root_index, entry,
+                PORTABLE_RESTORE_REPLAY_FAILURE_RESOLVE_HARDLINK_ENTRY,
+                referenced_found < 0 ? errno : 0);
             return 1;
         }
         hardlink_ref_root_index = root_map_find(&collection->root_map,
@@ -547,8 +672,9 @@ static int replay_collect_entry(const SidecarLiveView *view, void *argument)
                                                 entry->hardlink_root_id);
         if (hardlink_ref_root_index == SIZE_MAX)
         {
-            replay_report_failure(collection->report, collection->manifest,
-                                  root_index, entry->logical_path);
+            replay_report_step_failure(
+                collection->report, collection->manifest, root_index, entry,
+                PORTABLE_RESTORE_REPLAY_FAILURE_FIND_HARDLINK_ROOT, 0);
             return 1;
         }
         char reference_logical[PATH_MAX];
@@ -560,18 +686,24 @@ static int replay_collect_entry(const SidecarLiveView *view, void *argument)
                                  (int)hardlink_ref_root_index,
                                  reference_logical) != 1)
         {
-            replay_report_failure(collection->report, collection->manifest,
-                                  root_index, entry->logical_path);
+            replay_report_step_failure(
+                collection->report, collection->manifest, root_index, entry,
+                PORTABLE_RESTORE_REPLAY_FAILURE_VALIDATE_HARDLINK_OWNERSHIP,
+                0);
             return 1;
         }
         char reference_relative[PATH_MAX];
+        errno = 0;
         if (replay_hardlink_ref_relative(
                 &collection->manifest->roots[hardlink_ref_root_index],
                 referenced.entry, collection->destination_xdg_dirs,
                 reference_relative, sizeof(reference_relative)) != 0)
         {
-            replay_report_failure(collection->report, collection->manifest,
-                                  root_index, entry->logical_path);
+            int saved = errno;
+            replay_report_step_failure(
+                collection->report, collection->manifest, root_index, entry,
+                PORTABLE_RESTORE_REPLAY_FAILURE_BUILD_HARDLINK_DESTINATION,
+                saved);
             return 1;
         }
         hardlink_ref_entry = referenced.entry;
@@ -580,28 +712,35 @@ static int replay_collect_entry(const SidecarLiveView *view, void *argument)
     struct stat desired;
     if (replay_stat_from_entry(entry, &desired) != 0)
     {
-        replay_report_failure(collection->report, collection->manifest,
-                              root_index, entry->logical_path);
+        int saved = errno;
+        replay_report_step_failure(
+            collection->report, collection->manifest, root_index, entry,
+            PORTABLE_RESTORE_REPLAY_FAILURE_BUILD_ENTRY_STAT, saved);
         return 1;
     }
 
     if (replay_entries_reserve(collection, 1) != 0)
     {
-        replay_report_failure(collection->report, collection->manifest,
-                              root_index, entry->logical_path);
+        int saved = errno;
+        replay_report_step_failure(
+            collection->report, collection->manifest, root_index, entry,
+            PORTABLE_RESTORE_REPLAY_FAILURE_RESERVE_ENTRY, saved);
         return 1;
     }
     ReplayEntry *replay = &collection->items[collection->count];
     memset(replay, 0, sizeof(*replay));
+    char destination[PATH_MAX];
+    errno = 0;
     if (destination_path_build(root, logical,
                                collection->destination_xdg_dirs,
-                               replay->destination,
-                               sizeof(replay->destination)) != 0 ||
-        (replay->destination[0] == '\0' &&
+                               destination, sizeof(destination)) != 0 ||
+        (destination[0] == '\0' &&
          entry->kind != SIDECAR_KIND_DIRECTORY))
     {
-        replay_report_failure(collection->report, collection->manifest,
-                              root_index, entry->logical_path);
+        int saved = errno != 0 ? errno : ENAMETOOLONG;
+        replay_report_step_failure(
+            collection->report, collection->manifest, root_index, entry,
+            PORTABLE_RESTORE_REPLAY_FAILURE_BUILD_DESTINATION_PATH, saved);
         return 1;
     }
     replay->entry = entry;
@@ -654,8 +793,11 @@ static void replay_identity_failure(void *context, size_t index)
 {
     ReplayCollection *collection = context;
     ReplayEntry *entry = &collection->items[index];
-    replay_report_failure(collection->report, collection->manifest,
-                          entry->root_index, entry->entry->logical_path);
+    int saved = errno;
+    replay_report_step_failure(
+        collection->report, collection->manifest, entry->root_index,
+        entry->entry, PORTABLE_RESTORE_REPLAY_FAILURE_MAP_DESTINATION_IDENTITY,
+        saved);
 }
 
 static int replay_selection_destinations_valid(ReplayCollection *collection)
@@ -667,13 +809,16 @@ static int replay_selection_destinations_valid(ReplayCollection *collection)
             &graph, collection->destination_home_fd);
     if (anchor_status != DESTINATION_IDENTITY_OK)
     {
+        int saved = errno;
         if (anchor_status == DESTINATION_IDENTITY_RESOURCE_ERROR &&
             errno == E2BIG)
             print_error("Error: Portable restore destination identity budget exceeded while registering destination HOME ancestry\n");
         else
             print_error("Error: Could not inspect destination HOME ancestry for portable restore\n");
-        replay_report_failure(collection->report, collection->manifest,
-                              SIZE_MAX, (SidecarBytes){0});
+        replay_report_step_failure(
+            collection->report, collection->manifest, SIZE_MAX, NULL,
+            PORTABLE_RESTORE_REPLAY_FAILURE_REGISTER_DESTINATION_ANCHOR,
+            saved);
         destination_identity_graph_free(&graph);
         return -1;
     }
@@ -694,12 +839,15 @@ static int replay_selection_destinations_valid(ReplayCollection *collection)
         destination_identity_graph_finalize(&graph);
     if (status != DESTINATION_IDENTITY_OK)
     {
+        int saved = errno;
         if (status == DESTINATION_IDENTITY_RESOURCE_ERROR && errno == E2BIG)
             print_error("Error: Portable restore destination identity budget exceeded while ordering the destination namespace\n");
         else
             print_error("Error: Could not order the portable restore destination namespace\n");
-        replay_report_failure(collection->report, collection->manifest,
-                              SIZE_MAX, (SidecarBytes){0});
+        replay_report_step_failure(
+            collection->report, collection->manifest, SIZE_MAX, NULL,
+            PORTABLE_RESTORE_REPLAY_FAILURE_FINALIZE_DESTINATION_IDENTITY,
+            saved);
         destination_identity_graph_free(&graph);
         return -1;
     }
@@ -709,15 +857,18 @@ static int replay_selection_destinations_valid(ReplayCollection *collection)
                 &graph, &collection->items[index].identity_placement,
                 &collection->items[index].destination_order) != 0)
         {
+            int saved = errno;
             print_error("Error: Could not order portable restore destination for manifest root %s entry %.*s\n",
                         collection->manifest->roots[
                             collection->items[index].root_index].id,
                         (int)collection->items[index].entry->logical_path.length,
                         collection->items[index].entry->logical_path.data);
-            replay_report_failure(
+            replay_report_step_failure(
                 collection->report, collection->manifest,
                 collection->items[index].root_index,
-                collection->items[index].entry->logical_path);
+                collection->items[index].entry,
+                PORTABLE_RESTORE_REPLAY_FAILURE_ORDER_DESTINATION_IDENTITY,
+                saved);
             destination_identity_graph_free(&graph);
             return -1;
         }
@@ -1220,26 +1371,37 @@ static int replay_destination_parent_for_root(
         parent_out, leaf, leaf_size);
 }
 
-// Recovers the relative-path value replay->destination_relative used to
-// cache: the XDG-relative logical path for an XDG root, or the resolved
-// destination itself otherwise. Computed on demand instead of stored --
-// both source values (entry->logical_path, replay->destination) are
-// already validated to fit at collect time, so this cannot fail in
-// practice, but the caller-supplied buffer is still bounds-checked.
-static int replay_destination_relative(const ManifestRoot *root,
+/* Rebuilds the relative destination path from the borrowed sidecar entry.
+ * Collection already validates the same mapping, so replay does not retain a
+ * PATH_MAX-sized copy for every live entry. */
+static int replay_destination_relative(const ReplayCollection *collection,
                                        const ReplayEntry *replay,
                                        char *out, size_t out_size)
 {
+    if (collection == NULL || collection->manifest == NULL || replay == NULL ||
+        replay->entry == NULL ||
+        replay->root_index >= (size_t)collection->manifest->root_count ||
+        out == NULL || out_size == 0)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    const ManifestRoot *root = &collection->manifest->roots[replay->root_index];
+    char logical[PATH_MAX];
+    replay_copy_bytes(logical, sizeof(logical), replay->entry->logical_path);
+    if (replay->entry->logical_path.length >= sizeof(logical))
+    {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
     if (root->policy == ROOT_POLICY_XDG)
     {
-        char logical[PATH_MAX];
-        replay_copy_bytes(logical, sizeof(logical),
-                          replay->entry->logical_path);
         int length = snprintf(out, out_size, "%s", logical);
         return (length < 0 || (size_t)length >= out_size) ? -1 : 0;
     }
-    int length = snprintf(out, out_size, "%s", replay->destination);
-    return (length < 0 || (size_t)length >= out_size) ? -1 : 0;
+    return destination_path_build(root, logical,
+                                  collection->destination_xdg_dirs,
+                                  out, out_size);
 }
 
 /* Rebuilds the validated hardlink reference path from the borrowed sidecar
@@ -1287,9 +1449,8 @@ static int replay_destination_parent(ReplayCollection *collection,
         errno = EINVAL;
         return -1;
     }
-    const ManifestRoot *root = &collection->manifest->roots[replay->root_index];
     char relative[PATH_MAX];
-    if (replay_destination_relative(root, replay, relative,
+    if (replay_destination_relative(collection, replay, relative,
                                     sizeof(relative)) != 0)
     {
         errno = ENAMETOOLONG;
@@ -1355,7 +1516,7 @@ static int replay_apply_regular(ReplayCollection *collection,
     if (result == 0 && collection->capture_report != NULL)
     {
         char relative[PATH_MAX];
-        if (replay_destination_relative(root, replay, relative,
+        if (replay_destination_relative(collection, replay, relative,
                                         sizeof(relative)) == 0)
             snprintf(collection->capture_report->current_path,
                      sizeof(collection->capture_report->current_path), "%s",
@@ -2065,18 +2226,20 @@ int portable_restore_replay_at(const PortableRestoreRequest *request,
     }
     collection.sidecar = &sidecar;
     const SidecarEntry *address_failure_entry = NULL;
+    errno = 0;
     if (restore_address_index_build(&collection.address_index,
                                     &collection.memory, &sidecar,
                                     &address_failure_entry) != 0)
     {
+        int saved = errno;
+        size_t root_index = SIZE_MAX;
         if (address_failure_entry != NULL)
-        {
-            size_t root_index = root_map_find(&collection.root_map,
-                                              request->manifest,
-                                              address_failure_entry->root_id);
-            replay_report_failure(report, request->manifest, root_index,
-                                  address_failure_entry->logical_path);
-        }
+            root_index = root_map_find(&collection.root_map,
+                                       request->manifest,
+                                       address_failure_entry->root_id);
+        replay_report_step_failure(
+            report, request->manifest, root_index, address_failure_entry,
+            PORTABLE_RESTORE_REPLAY_FAILURE_BUILD_ADDRESS_INDEX, saved);
         sidecar_log_close(&sidecar);
         close(collection.data_fd);
         collection.data_fd = -1;

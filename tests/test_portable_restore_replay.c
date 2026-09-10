@@ -839,9 +839,11 @@ static void test_symlink_collection_validation(void)
         path_join(sentinel, sizeof(sentinel), missing.home, "/sentinel");
         check(result != 0 && report.failed_count == 1 &&
                   strcmp(report.failed_logical_path, "link") == 0 &&
-                  !report.failed_kind_valid &&
-                  report.failure_step == PORTABLE_RESTORE_REPLAY_FAILURE_NONE &&
-                  report.failure_errno == 0 &&
+                  report.failed_kind_valid &&
+                  report.failed_kind == SIDECAR_KIND_SYMLINK &&
+                  report.failure_step ==
+                      PORTABLE_RESTORE_REPLAY_FAILURE_VERIFY_PLACEHOLDER &&
+                  report.failure_errno == ENOENT &&
                   file_equals_noatime(sentinel, "untouched"),
               "missing symlink placeholder is rejected during collection");
         fixture_close(&missing);
@@ -875,6 +877,11 @@ static void test_symlink_collection_validation(void)
         path_join(sentinel, sizeof(sentinel), redirected.home, "/sentinel");
         check(result != 0 && report.failed_count == 1 &&
                   strcmp(report.failed_logical_path, "link") == 0 &&
+                  report.failed_kind_valid &&
+                  report.failed_kind == SIDECAR_KIND_SYMLINK &&
+                  report.failure_step ==
+                      PORTABLE_RESTORE_REPLAY_FAILURE_VERIFY_PLACEHOLDER &&
+                  report.failure_errno != 0 &&
                   file_equals_noatime(sentinel, "untouched"),
               "payload placeholder redirect is rejected during collection");
         fixture_close(&redirected);
@@ -2517,6 +2524,23 @@ static void test_copy_bytes_rejects_corruption(void)
           "misrepresented as a shorter string");
 }
 
+static void test_collection_failure_reason_without_errno(void)
+{
+    printf(BLUE "::" NC " collection failure reasons do not invent errno\n");
+    PortableRestoreReplayReport report;
+    portable_restore_replay_report_init(&report);
+    report.failed_kind = SIDECAR_KIND_REGULAR;
+    report.failed_kind_valid = 1;
+    report.failure_step = PORTABLE_RESTORE_REPLAY_FAILURE_VALIDATE_ADDRESS_INDEX;
+    report.failure_errno = 0;
+
+    char reason[256];
+    int result = replay_failure_reason_format(&report, reason, sizeof(reason));
+    check(result == 1 &&
+              strcmp(reason, "regular file, validate restore address index") == 0,
+          "logical collection failures name their check without a fabricated errno");
+}
+
 int main(void)
 {
     test_symlink_collection_validation();
@@ -2543,6 +2567,7 @@ int main(void)
     test_differing_mount_ids_do_not_hide_portable_collisions();
     test_v2_nested_root_replay_order();
     test_copy_bytes_rejects_corruption();
+    test_collection_failure_reason_without_errno();
     if (skips != 0)
         printf(YELLOW "%d portable restore replay test(s) skipped" NC "\n",
                skips);
