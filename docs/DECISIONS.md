@@ -3600,3 +3600,40 @@ the same bounded recovery policy.
 one install process per package. D2's single full-batch first attempt, D1's skipped
 package reporting, D12's explicit-package export, and all distro-specific install
 options remain in force.
+
+---
+
+## D41 — 2026-09-10 — Rewrite source HOME in two known desktop-state files
+
+**Status:** Implemented
+
+**Decision:** A VERSION=2 portable restore whose recorded `SOURCE_HOME` differs
+from the destination HOME rewrites that exact source-home prefix in only these two
+regular files when they are present in the restored selection:
+
+- `~/.config/gtk-3.0/bookmarks`
+- `~/.local/share/recently-used.xbel`
+
+The file is identified from its manifest source root plus sidecar logical path, so
+the rule is independent of how the source tree happened to be split into roots.
+Only a literal `file://` URI whose path starts with `SOURCE_HOME` is eligible. The
+next byte must be `/`, a URI/token terminator used by these two formats, or
+end-of-file; a longer pathname component that merely shares the prefix and
+unrelated text containing the old HOME are left unchanged. Replacement is
+streamed with a bounded cross-read tail. Metadata replay is unchanged, and restore
+progress continues to account for source payload bytes.
+
+VERSION=1 manifests, equal source/destination HOME paths, every other regular file,
+and all non-regular entries retain byte-for-byte replay.
+
+**Why:** GTK bookmarks and the freedesktop recent-files store embed absolute
+`file://` paths as desktop-level state. Restoring them verbatim after a username
+change leaves links pointing at the old, nonexistent home. These two formats need
+only a bounded literal path-prefix substitution; general rewriting of arbitrary
+application configuration would require format-specific knowledge and has no safe
+generic rule.
+
+**Rejected:** scanning arbitrary restored files for HOME-looking strings; guessing
+a source HOME for older manifests; rewriting non-URI text in these files; XML
+parsing for the XBEL file; loading the whole file into memory merely to perform a
+prefix substitution.

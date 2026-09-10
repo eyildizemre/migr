@@ -1461,6 +1461,263 @@ static int replay_destination_parent(ReplayCollection *collection,
                                               leaf_size);
 }
 
+static int replay_regular_rewrites_home(const ReplayCollection *collection,
+                                        const ReplayEntry *replay)
+{
+    if (collection == NULL || collection->manifest == NULL || replay == NULL ||
+        replay->entry == NULL ||
+        replay->root_index >= (size_t)collection->manifest->root_count ||
+        collection->manifest->version != MANIFEST_SELECTION_VERSION ||
+        collection->manifest->source_home[0] == '\0' ||
+        collection->destination_home_path == NULL ||
+        strcmp(collection->manifest->source_home,
+               collection->destination_home_path) == 0)
+        return 0;
+
+    char logical[PATH_MAX];
+    replay_copy_bytes(logical, sizeof(logical), replay->entry->logical_path);
+    if (replay->entry->logical_path.length >= sizeof(logical))
+        return 0;
+
+    char source_root[PATH_MAX];
+    if (manifest_root_source_path(collection->manifest,
+                                  (int)replay->root_index,
+                                  source_root) != 0)
+        return 0;
+
+    char source_path[PATH_MAX];
+    if (logical[0] == '\0')
+        memcpy(source_path, source_root, strlen(source_root) + 1U);
+    else if (path_join(source_path, sizeof(source_path), source_root,
+                       logical) != 0)
+        return 0;
+
+    static const char *const known_home_relative_paths[] = {
+        ".config/gtk-3.0/bookmarks",
+        ".local/share/recently-used.xbel"
+    };
+    for (size_t index = 0;
+         index < sizeof(known_home_relative_paths) /
+                     sizeof(known_home_relative_paths[0]);
+         index++)
+    {
+        char known_path[PATH_MAX];
+        if (path_join(known_path, sizeof(known_path),
+                      collection->manifest->source_home,
+                      known_home_relative_paths[index]) == 0 &&
+            strcmp(source_path, known_path) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static int replay_write_all(int fd, const unsigned char *data, size_t length)
+{
+    size_t offset = 0;
+    while (offset < length)
+    {
+        ssize_t written = write(fd, data + offset, length - offset);
+        if (written < 0 && errno == EINTR)
+            continue;
+        if (written <= 0)
+        {
+            if (written == 0)
+                errno = EIO;
+            return -1;
+        }
+        offset += (size_t)written;
+    }
+    return 0;
+}
+
+static size_t replay_bytes_find(const unsigned char *haystack,
+                                size_t haystack_length,
+                                const unsigned char *needle,
+                                size_t needle_length)
+{
+    if (needle_length == 0 || haystack_length < needle_length)
+        return SIZE_MAX;
+    size_t limit = haystack_length - needle_length;
+    for (size_t index = 0; index <= limit; index++)
+        if (haystack[index] == needle[0] &&
+            memcmp(haystack + index, needle, needle_length) == 0)
+            return index;
+    return SIZE_MAX;
+}
+
+/* Flushes every replacement whose trailing path-component boundary is already
+ * known. On non-final chunks, at most one source-home length remains buffered
+ * so a match and its following boundary may straddle the next read. */
+static int replay_home_uri_boundary(unsigned char byte)
+{
+    return byte == '/' || byte == ' ' || byte == '\t' || byte == '\r' ||
+           byte == '\n' || byte == '"' || byte == '\'';
+}
+
+static int replay_home_rewrite_flush(int destination_fd,
+                                     const unsigned char *buffer,
+                                     size_t length,
+                                     const unsigned char *source_uri,
+                                     size_t source_uri_length,
+                                     const unsigned char *destination_uri,
+                                     size_t destination_uri_length,
+                                     int final, size_t *consumed_out)
+{
+    if (destination_fd < 0 || buffer == NULL || source_uri == NULL ||
+        source_uri_length == 0 || destination_uri == NULL ||
+        consumed_out == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    size_t safe_start = final ? length :
+        (length > source_uri_length ? length - source_uri_length : 0U);
+    size_t cursor = 0;
+    while (cursor < length)
+    {
+        size_t relative = replay_bytes_find(
+            buffer + cursor, length - cursor,
+            source_uri, source_uri_length);
+        if (relative == SIZE_MAX)
+            break;
+        size_t match = cursor + relative;
+        if (!final && match >= safe_start)
+            break;
+
+        size_t after = match + source_uri_length;
+        int component_boundary =
+            after < length ? replay_home_uri_boundary(buffer[after]) : final;
+        if (component_boundary)
+        {
+            if (replay_write_all(destination_fd, buffer + cursor,
+                                 match - cursor) != 0 ||
+                replay_write_all(destination_fd, destination_uri,
+                                 destination_uri_length) != 0)
+                return -1;
+            cursor = after;
+        }
+        else
+        {
+            /* Emit one byte, not the whole rejected candidate: a canonical
+             * path can contain a later suffix that is also its own prefix. */
+            if (replay_write_all(destination_fd, buffer + cursor,
+                                 match + 1U - cursor) != 0)
+                return -1;
+            cursor = match + 1U;
+        }
+    }
+
+    size_t flush_to = final ? length : safe_start;
+    if (cursor < flush_to)
+    {
+        if (replay_write_all(destination_fd, buffer + cursor,
+                             flush_to - cursor) != 0)
+            return -1;
+        cursor = flush_to;
+    }
+    *consumed_out = cursor;
+    return 0;
+}
+
+static int replay_copy_regular_rewriting_home(
+    int source_fd, int destination_fd, off_t expected_size,
+    const char *source_home, const char *destination_home,
+    BackupCaptureReport *report)
+{
+    if (source_fd < 0 || destination_fd < 0 || expected_size < 0 ||
+        source_home == NULL || source_home[0] == '\0' ||
+        destination_home == NULL || destination_home[0] == '\0')
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    if (ftruncate(destination_fd, 0) != 0)
+        return -1;
+
+    enum { FILE_URI_PREFIX_LENGTH = 7, REWRITE_READ_SIZE = 65536 };
+    size_t old_length = strnlen(source_home, PATH_MAX);
+    size_t new_length = strnlen(destination_home, PATH_MAX);
+    if (old_length == PATH_MAX || new_length == PATH_MAX)
+    {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    unsigned char source_uri[PATH_MAX + FILE_URI_PREFIX_LENGTH + 1U];
+    unsigned char destination_uri[PATH_MAX + FILE_URI_PREFIX_LENGTH + 1U];
+    memcpy(source_uri, "file://", FILE_URI_PREFIX_LENGTH);
+    memcpy(source_uri + FILE_URI_PREFIX_LENGTH, source_home, old_length);
+    size_t source_uri_length = FILE_URI_PREFIX_LENGTH + old_length;
+    memcpy(destination_uri, "file://", FILE_URI_PREFIX_LENGTH);
+    memcpy(destination_uri + FILE_URI_PREFIX_LENGTH, destination_home,
+           new_length);
+    size_t destination_uri_length = FILE_URI_PREFIX_LENGTH + new_length;
+
+    unsigned char buffer[REWRITE_READ_SIZE + PATH_MAX +
+                         FILE_URI_PREFIX_LENGTH + 1U];
+    size_t carried = 0;
+    uint64_t copied = 0;
+
+    for (;;)
+    {
+        ssize_t received = read(source_fd, buffer + carried,
+                                REWRITE_READ_SIZE);
+        if (received < 0 && errno == EINTR)
+            continue;
+        if (received < 0)
+            return -1;
+        if (received == 0)
+        {
+            size_t consumed = 0;
+            if (replay_home_rewrite_flush(
+                    destination_fd, buffer, carried,
+                    source_uri, source_uri_length,
+                    destination_uri, destination_uri_length,
+                    1, &consumed) != 0)
+                return -1;
+            if (consumed != carried)
+            {
+                errno = EIO;
+                return -1;
+            }
+            break;
+        }
+
+        if ((uint64_t)received > UINT64_MAX - copied)
+        {
+            errno = EOVERFLOW;
+            return -1;
+        }
+        copied += (uint64_t)received;
+        size_t total = carried + (size_t)received;
+        size_t consumed = 0;
+        if (replay_home_rewrite_flush(
+                destination_fd, buffer, total,
+                source_uri, source_uri_length,
+                destination_uri, destination_uri_length,
+                0, &consumed) != 0)
+            return -1;
+        carried = total - consumed;
+        if (carried > source_uri_length)
+        {
+            errno = EIO;
+            return -1;
+        }
+        if (carried != 0)
+            memmove(buffer, buffer + consumed, carried);
+        if (backup_capture_report_tick(report, received, destination_fd) != 0)
+            return -1;
+    }
+
+    if (copied != (uint64_t)expected_size)
+    {
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
 static int replay_apply_regular(ReplayCollection *collection,
                                 ReplayEntry *replay,
                                 ReplayApplyFailure *failure)
@@ -1524,9 +1781,16 @@ static int replay_apply_regular(ReplayCollection *collection,
     }
     if (result == 0)
     {
-        result = portable_copy_regular(
-            source_fd, destination_fd, (off_t)entry->size,
-            collection->capture_report);
+        if (replay_regular_rewrites_home(collection, replay))
+            result = replay_copy_regular_rewriting_home(
+                source_fd, destination_fd, (off_t)entry->size,
+                collection->manifest->source_home,
+                collection->destination_home_path,
+                collection->capture_report);
+        else
+            result = portable_copy_regular(
+                source_fd, destination_fd, (off_t)entry->size,
+                collection->capture_report);
         if (result != 0)
             replay_apply_failure_record(
                 failure, PORTABLE_RESTORE_REPLAY_FAILURE_COPY_CONTENT, errno);

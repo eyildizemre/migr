@@ -1536,6 +1536,248 @@ static void test_destination_truncation(void)
     fixture_close(&fixture);
 }
 
+static void home_rewrite_roots(ManifestRoot roots[2])
+{
+    memset(roots, 0, 2U * sizeof(*roots));
+
+    strcpy(roots[0].id, "BUILTIN_DOT_CONFIG");
+    roots[0].policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(roots[0].payload_path, "BUILTIN_DOT_CONFIG");
+    strcpy(roots[0].source_path, ".config");
+    roots[0].has_restore_path = 1;
+    strcpy(roots[0].restore_path, ".config");
+
+    strcpy(roots[1].id, "BUILTIN_LOCAL_SHARE");
+    roots[1].policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(roots[1].payload_path, "BUILTIN_LOCAL_SHARE");
+    strcpy(roots[1].source_path, ".local/share");
+    roots[1].has_restore_path = 1;
+    strcpy(roots[1].restore_path, ".local/share");
+}
+
+static int write_home_rewrite_manifest(Fixture *fixture, ManifestRoot roots[2],
+                                       int version, const char *source_home)
+{
+    home_rewrite_roots(roots);
+    Manifest manifest = {
+        .version = version,
+        .representation = CLONE_PORTABLE_SIDECAR,
+        .scope = MANIFEST_SCOPE_CRITICAL,
+        .sidecar_version = SIDECAR_VERSION,
+        .root_count = 2,
+        .roots = roots
+    };
+    if (source_home != NULL)
+        snprintf(manifest.source_home, sizeof(manifest.source_home), "%s",
+                 source_home);
+    return manifest_write_v1_at(fixture->container_fd, &manifest);
+}
+
+static void write_home_rewrite_payload(Fixture *fixture,
+                                       const char *bookmarks,
+                                       const char *recent)
+{
+    make_dir_at(fixture->data_fd, "BUILTIN_DOT_CONFIG", 0700);
+    int config_fd = openat(fixture->data_fd, "BUILTIN_DOT_CONFIG",
+                           O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (config_fd < 0)
+        fatal("could not open home-rewrite config payload root");
+    make_dir_at(config_fd, "gtk-3.0", 0700);
+    int gtk_fd = openat(config_fd, "gtk-3.0",
+                        O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (gtk_fd < 0)
+        fatal("could not open home-rewrite GTK payload directory");
+    write_file_at(gtk_fd, "bookmarks", bookmarks);
+    close(gtk_fd);
+    close(config_fd);
+
+    make_dir_at(fixture->data_fd, "BUILTIN_LOCAL_SHARE", 0700);
+    int share_fd = openat(fixture->data_fd, "BUILTIN_LOCAL_SHARE",
+                          O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (share_fd < 0)
+        fatal("could not open home-rewrite share payload root");
+    write_file_at(share_fd, "recently-used.xbel", recent);
+    close(share_fd);
+}
+
+static int write_home_rewrite_sidecar(Fixture *fixture,
+                                      const char *bookmarks,
+                                      const char *recent)
+{
+    SidecarEntry entries[] = {
+        entry_for("BUILTIN_DOT_CONFIG", "", "", SIDECAR_KIND_DIRECTORY,
+                  0, 0700, 1700000650, 1, 1700000651, 2),
+        entry_for("BUILTIN_DOT_CONFIG", "gtk-3.0", "gtk-3.0",
+                  SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000652, 3, 1700000653, 4),
+        entry_for("BUILTIN_DOT_CONFIG", "gtk-3.0/bookmarks",
+                  "gtk-3.0/bookmarks", SIDECAR_KIND_REGULAR,
+                  strlen(bookmarks), 0600,
+                  1700000654, 5, 1700000655, 6),
+        entry_for("BUILTIN_LOCAL_SHARE", "", "", SIDECAR_KIND_DIRECTORY,
+                  0, 0700, 1700000656, 7, 1700000657, 8),
+        entry_for("BUILTIN_LOCAL_SHARE", "recently-used.xbel",
+                  "recently-used.xbel", SIDECAR_KIND_REGULAR,
+                  strlen(recent), 0600,
+                  1700000658, 9, 1700000659, 10)
+    };
+    return write_sidecar(fixture, entries,
+                         sizeof(entries) / sizeof(entries[0]), NULL, NULL);
+}
+
+static int home_rewrite_fixture_open(Fixture *fixture, ManifestRoot roots[2],
+                                     int version, const char *source_home,
+                                     const char *bookmarks,
+                                     const char *recent)
+{
+    ManifestRoot initial = root_for();
+    if (fixture_open(fixture, &initial) != 0)
+        return -1;
+    if (write_home_rewrite_manifest(fixture, roots, version, source_home) != 0)
+        return -1;
+    write_home_rewrite_payload(fixture, bookmarks, recent);
+    if (write_home_rewrite_sidecar(fixture, bookmarks, recent) != 0)
+        return -1;
+    return 0;
+}
+
+static void test_known_desktop_state_rewrites_home(void)
+{
+    printf(BLUE "::" NC " known desktop-state files rewrite a changed HOME\n");
+    static const char source_home[] = "/home/vii";
+    static const char bookmarks[] =
+        "file:///home/vii/Downloads Downloads\n"
+        "file:///home/vii/Documents\n"
+        "file:///home/vii7/not-the-source Similar\n"
+        "file:///home/vii\n"
+        "file:///tmp /home/vii\n";
+    static const char recent[] =
+        "<xbel><bookmark href=\"file:///home/vii/Downloads/a\"/>"
+        "<bookmark href=\"file:///home/vii7/no\"/>"
+        "<bookmark href=\"file:///home/vii\"/>"
+        "<metadata>/home/vii</metadata></xbel>\n";
+
+    ManifestRoot roots[2];
+    Fixture fixture;
+    int opened = home_rewrite_fixture_open(
+        &fixture, roots, MANIFEST_SELECTION_VERSION, source_home,
+        bookmarks, recent);
+    check(opened == 0, "changed-HOME rewrite fixture is created");
+    if (opened != 0)
+    {
+        fixture_close(&fixture);
+        return;
+    }
+
+    char expected_bookmarks[PATH_MAX * 4U];
+    char expected_recent[PATH_MAX * 3U];
+    snprintf(expected_bookmarks, sizeof(expected_bookmarks),
+             "file://%s/Downloads Downloads\n"
+             "file://%s/Documents\n"
+             "file:///home/vii7/not-the-source Similar\n"
+             "file://%s\n"
+             "file:///tmp /home/vii\n",
+             fixture.home, fixture.home, fixture.home);
+    snprintf(expected_recent, sizeof(expected_recent),
+             "<xbel><bookmark href=\"file://%s/Downloads/a\"/>"
+             "<bookmark href=\"file:///home/vii7/no\"/>"
+             "<bookmark href=\"file://%s\"/>"
+             "<metadata>/home/vii</metadata></xbel>\n",
+             fixture.home, fixture.home);
+
+    BackupCaptureReport capture_report = {0};
+    PortableRestoreReplayReport report;
+    int result = run_replay_with_capture(&fixture, &report, &capture_report);
+    check(result == 0 && report.failed_count == 0,
+          "changed-HOME desktop-state replay succeeds");
+
+    char restored_bookmarks[PATH_MAX], restored_recent[PATH_MAX];
+    path_join(restored_bookmarks, sizeof(restored_bookmarks), fixture.home,
+              "/.config/gtk-3.0/bookmarks");
+    path_join(restored_recent, sizeof(restored_recent), fixture.home,
+              "/.local/share/recently-used.xbel");
+    check(file_equals_noatime(restored_bookmarks, expected_bookmarks),
+          "GTK bookmarks rewrite only exact source-HOME path components");
+    check(file_equals_noatime(restored_recent, expected_recent),
+          "recent-files XBEL rewrites the source HOME without structural parsing");
+    check(capture_report.bytes_copied >= 0 &&
+              (size_t)capture_report.bytes_copied ==
+                  strlen(bookmarks) + strlen(recent),
+          "rewritten restore progress still counts source payload bytes");
+    fixture_close(&fixture);
+}
+
+static void test_known_desktop_state_same_home_is_verbatim(void)
+{
+    printf(BLUE "::" NC " known desktop-state files stay verbatim when HOME is unchanged\n");
+    ManifestRoot roots[2];
+    Fixture fixture;
+    ManifestRoot initial = root_for();
+    int opened = fixture_open(&fixture, &initial);
+    check(opened == 0, "same-HOME rewrite fixture is created");
+    if (opened != 0)
+        return;
+
+    char bookmarks[PATH_MAX * 2U];
+    char recent[PATH_MAX * 2U];
+    snprintf(bookmarks, sizeof(bookmarks),
+             "file://%s/Downloads Same\n", fixture.home);
+    snprintf(recent, sizeof(recent),
+             "<bookmark href=\"file://%s/Documents/a\"/>\n", fixture.home);
+    if (write_home_rewrite_manifest(&fixture, roots,
+                                    MANIFEST_SELECTION_VERSION,
+                                    fixture.home) != 0)
+        fatal("could not write same-HOME manifest");
+    write_home_rewrite_payload(&fixture, bookmarks, recent);
+    if (write_home_rewrite_sidecar(&fixture, bookmarks, recent) != 0)
+        fatal("could not write same-HOME sidecar");
+
+    PortableRestoreReplayReport report;
+    check(run_replay(&fixture, &report) == 0 && report.failed_count == 0,
+          "same-HOME desktop-state replay succeeds");
+    char restored_bookmarks[PATH_MAX], restored_recent[PATH_MAX];
+    path_join(restored_bookmarks, sizeof(restored_bookmarks), fixture.home,
+              "/.config/gtk-3.0/bookmarks");
+    path_join(restored_recent, sizeof(restored_recent), fixture.home,
+              "/.local/share/recently-used.xbel");
+    check(file_equals_noatime(restored_bookmarks, bookmarks) &&
+              file_equals_noatime(restored_recent, recent),
+          "same-HOME files remain byte-for-byte unchanged");
+    fixture_close(&fixture);
+}
+
+static void test_known_desktop_state_legacy_is_verbatim(void)
+{
+    printf(BLUE "::" NC " legacy desktop-state replay does not guess a source HOME\n");
+    static const char bookmarks[] = "file:///home/old/Downloads Legacy\n";
+    static const char recent[] =
+        "<bookmark href=\"file:///home/old/Documents/a\"/>\n";
+    ManifestRoot roots[2];
+    Fixture fixture;
+    int opened = home_rewrite_fixture_open(
+        &fixture, roots, MANIFEST_CURRENT_VERSION, NULL,
+        bookmarks, recent);
+    check(opened == 0, "legacy rewrite fixture is created");
+    if (opened != 0)
+    {
+        fixture_close(&fixture);
+        return;
+    }
+
+    PortableRestoreReplayReport report;
+    check(run_replay(&fixture, &report) == 0 && report.failed_count == 0,
+          "legacy desktop-state replay succeeds without source HOME");
+    char restored_bookmarks[PATH_MAX], restored_recent[PATH_MAX];
+    path_join(restored_bookmarks, sizeof(restored_bookmarks), fixture.home,
+              "/.config/gtk-3.0/bookmarks");
+    path_join(restored_recent, sizeof(restored_recent), fixture.home,
+              "/.local/share/recently-used.xbel");
+    check(file_equals_noatime(restored_bookmarks, bookmarks) &&
+              file_equals_noatime(restored_recent, recent),
+          "legacy files remain byte-for-byte unchanged");
+    fixture_close(&fixture);
+}
+
 static void reset_sync(int should_fail)
 {
     sync_calls = 0;
@@ -2551,6 +2793,9 @@ int main(void)
     test_collision_suffix_validation();
     test_normal_replay();
     test_destination_truncation();
+    test_known_desktop_state_rewrites_home();
+    test_known_desktop_state_same_home_is_verbatim();
+    test_known_desktop_state_legacy_is_verbatim();
     test_capture_report_sync_accumulates();
     test_capture_report_sync_failure();
     test_outstanding_claim_gate();
