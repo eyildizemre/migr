@@ -38,7 +38,7 @@ outgrows solo maintenance.
 
 ## D2 — 2026-06-27 — Batch package install first, per-package fallback on failure
 
-**Status:** Implemented
+**Status:** Superseded in part by D40
 
 **Decision:** Build one `argv[]` containing every package and run a single install
 command. Only if that exits non-zero, fall back to installing one package at a time,
@@ -3565,3 +3565,38 @@ semantics, and source-change refusal. It advances D25's v3 claim field from
 `physical_path` to v4 `physical_leaf` without weakening write-ahead ownership or
 cleanup ordering. D17/D21/D25 remain the historical grammar records for sidecar
 versions 1, 2, and 3 respectively.
+
+---
+
+## D40 — 2026-09-10 — Failed package batches are isolated with adaptive sub-batches
+
+**Status:** Implemented
+
+**Decision:** Package restore still starts with one install transaction containing
+the complete package list. If that transaction fails, migr retries the remaining
+contiguous range in progressively smaller batches. A failed range is halved until
+one package remains; only a failing singleton is recorded in
+`skipped-packages.txt`. After a successful range, the next batch grows again so
+healthy stretches return quickly to large transactions.
+
+The same recovery algorithm is used for Debian/Ubuntu, Fedora/RHEL, and Arch.
+Their package-manager command lines remain distro-specific: apt keeps `-m`, dnf
+keeps its ordinary install semantics, and pacman keeps `--needed --noconfirm`.
+
+**Why:** D2's one-package fallback preserves exact knowledge of which requested
+packages failed, but one unavailable name can turn a restore of hundreds of
+packages into hundreds of package-manager processes. That is especially expensive
+for dnf, where each process may reload repository metadata, and the same structural
+problem applies to pacman when an unavailable target aborts a batch.
+
+Using dnf's `--skip-unavailable` only on the full batch would make a zero exit code
+ambiguous: migr could no longer tell which requested names were skipped and would
+incorrectly count them as installed unless it added a second Fedora-specific
+inventory protocol. Adaptive isolation preserves D1's exact skipped-package log,
+requires no package-manager output parsing, and gives all supported distro families
+the same bounded recovery policy.
+
+**Relationship:** Supersedes D2 only where D2 requires falling back immediately to
+one install process per package. D2's single full-batch first attempt, D1's skipped
+package reporting, D12's explicit-package export, and all distro-specific install
+options remain in force.

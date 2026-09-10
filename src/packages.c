@@ -12,6 +12,31 @@
 #include "fileops.h"
 #include "utils.h"
 
+#ifdef PACKAGES_TEST_HOOKS
+static int packages_test_restore_override;
+static distro_t packages_test_restore_distro;
+static PackagesTestRunHook packages_test_run_hook;
+static void *packages_test_run_context;
+
+void packages_test_set_restore_hooks(distro_t distro,
+                                     PackagesTestRunHook run_hook,
+                                     void *context)
+{
+    packages_test_restore_override = 1;
+    packages_test_restore_distro = distro;
+    packages_test_run_hook = run_hook;
+    packages_test_run_context = context;
+}
+
+void packages_test_clear_restore_hooks(void)
+{
+    packages_test_restore_override = 0;
+    packages_test_restore_distro = DISTRO_UNKNOWN;
+    packages_test_run_hook = NULL;
+    packages_test_run_context = NULL;
+}
+#endif
+
 // Runs the distro's listing command and returns its whole output. Both public
 // entries share this, so the exported format can never differ depending on how
 // the destination was addressed.
@@ -239,6 +264,187 @@ void read_package_list(FILE *pkg_file, char ***pkgs_out, int *pkg_count_out,
     *pkg_count_out = pkg_count;
 }
 
+enum { PACKAGE_INSTALL_PREFIX_MAX = 5 };
+
+static size_t package_install_prefix(distro_t distro,
+                                     char *prefix[PACKAGE_INSTALL_PREFIX_MAX])
+{
+    switch (distro)
+    {
+        case DISTRO_DEBIAN:
+            prefix[0] = "sudo";
+            prefix[1] = "apt-get";
+            prefix[2] = "install";
+            prefix[3] = "-y";
+            prefix[4] = "-m";
+            return 5U;
+        case DISTRO_FEDORA:
+            prefix[0] = "sudo";
+            prefix[1] = "dnf";
+            prefix[2] = "install";
+            prefix[3] = "-y";
+            return 4U;
+        case DISTRO_ARCH:
+            prefix[0] = "sudo";
+            prefix[1] = "pacman";
+            prefix[2] = "-S";
+            prefix[3] = "--needed";
+            prefix[4] = "--noconfirm";
+            return 5U;
+        default:
+            return 0U;
+    }
+}
+
+static distro_t package_restore_distro(void)
+{
+#ifdef PACKAGES_TEST_HOOKS
+    if (packages_test_restore_override)
+        return packages_test_restore_distro;
+#endif
+    return detect_distro();
+}
+
+static int package_run_command(char *const argv[])
+{
+#ifdef PACKAGES_TEST_HOOKS
+    if (packages_test_restore_override && packages_test_run_hook != NULL)
+        return packages_test_run_hook(argv, packages_test_run_context);
+#endif
+    return run_command(argv);
+}
+
+static int package_run_batch(char **argv, char *const *prefix,
+                             size_t prefix_count, char **pkgs,
+                             size_t first, size_t count)
+{
+    for (size_t i = 0; i < prefix_count; i++)
+        argv[i] = prefix[i];
+    for (size_t i = 0; i < count; i++)
+        argv[prefix_count + i] = pkgs[first + i];
+    argv[prefix_count + count] = NULL;
+    return package_run_command(argv);
+}
+
+typedef struct {
+    char path[PATH_MAX];
+    FILE *stream;
+    int path_valid;
+    int write_failed;
+} PackageSkipLog;
+
+static void package_skip_log_init(PackageSkipLog *log, const char *home)
+{
+    memset(log, 0, sizeof(*log));
+    log->path_valid =
+        path_join(log->path, sizeof(log->path), home,
+                  "skipped-packages.txt") == 0;
+}
+
+static void package_skip_log_record(PackageSkipLog *log, const char *package,
+                                    int *had_error)
+{
+    if (!log->path_valid)
+    {
+        if (!log->write_failed)
+            print_error("Error: Could not write skipped package log\n");
+        log->write_failed = 1;
+        *had_error = 1;
+        return;
+    }
+
+    if (log->stream == NULL)
+    {
+        log->stream = fopen(log->path, "w");
+        if (log->stream == NULL)
+        {
+            if (!log->write_failed)
+                print_error("Error: Could not write skipped package log\n");
+            log->write_failed = 1;
+            log->path_valid = 0;
+            *had_error = 1;
+            return;
+        }
+    }
+
+    if (fprintf(log->stream, "%s\n", package) < 0)
+    {
+        if (!log->write_failed)
+            print_error("Error: Could not write skipped package log\n");
+        log->write_failed = 1;
+        *had_error = 1;
+    }
+}
+
+static void package_skip_log_close(PackageSkipLog *log, int *had_error)
+{
+    if (log->stream == NULL)
+        return;
+
+    if (fclose(log->stream) != 0)
+    {
+        if (!log->write_failed)
+            print_error("Error: Could not write skipped package log\n");
+        log->write_failed = 1;
+        *had_error = 1;
+    }
+    else if (!log->write_failed)
+    {
+        printf("  Skipped packages written to: %s\n", log->path);
+    }
+    log->stream = NULL;
+}
+
+static void package_install_adaptive(char **argv, char *const *prefix,
+                                     size_t prefix_count, char **pkgs,
+                                     size_t pkg_count, const char *home,
+                                     int *installed, int *skipped,
+                                     int *had_error)
+{
+    size_t first = 0;
+    size_t window = pkg_count;
+    PackageSkipLog skip_log;
+    package_skip_log_init(&skip_log, home);
+
+    while (first < pkg_count)
+    {
+        size_t remaining = pkg_count - first;
+        size_t count = window < remaining ? window : remaining;
+        if (package_run_batch(argv, prefix, prefix_count, pkgs, first, count) == 0)
+        {
+            *installed += (int)count;
+            first += count;
+            if (first == pkg_count)
+                break;
+
+            remaining = pkg_count - first;
+            if (count > SIZE_MAX / 2U)
+                window = remaining;
+            else
+            {
+                size_t grown = count * 2U;
+                window = grown < remaining ? grown : remaining;
+            }
+            continue;
+        }
+
+        if (count > 1U)
+        {
+            window = count / 2U;
+            if (window == 0U)
+                window = 1U;
+            continue;
+        }
+
+        package_skip_log_record(&skip_log, pkgs[first], had_error);
+        (*skipped)++;
+        first++;
+        window = 1U;
+    }
+
+    package_skip_log_close(&skip_log, had_error);
+}
+
 // Reads and processes packages.txt from the container root (never inside
 // data/: it is a control artifact, not payload, in both legacy and v1
 // layouts). Opened by directory fd with O_NOFOLLOW + O_NONBLOCK -- the same
@@ -286,7 +492,7 @@ void restore_packages(int source_root_fd, const char *home, int *had_error)
 
     printf("\nPackages\n");
 
-    distro_t distro = detect_distro();
+    distro_t distro = package_restore_distro();
 
     if (distro == DISTRO_UNKNOWN)
     {
@@ -308,150 +514,28 @@ void restore_packages(int source_root_fd, const char *home, int *had_error)
     read_package_list(pkg_file, &pkgs, &pkg_count, had_error);
     fclose(pkg_file);
 
-    char *batch_prefix[6];
-    int prefix = 0;
-    switch (distro)
-    {
-        case DISTRO_DEBIAN:
-            batch_prefix[0] = "sudo";
-            batch_prefix[1] = "apt-get";
-            batch_prefix[2] = "install";
-            batch_prefix[3] = "-y";
-            batch_prefix[4] = "-m";
-            prefix = 5;
-            break;
-        case DISTRO_FEDORA:
-            batch_prefix[0] = "sudo";
-            batch_prefix[1] = "dnf";
-            batch_prefix[2] = "install";
-            batch_prefix[3] = "-y";
-            prefix = 4;
-            break;
-        case DISTRO_ARCH:
-            batch_prefix[0] = "sudo";
-            batch_prefix[1] = "pacman";
-            batch_prefix[2] = "-S";
-            batch_prefix[3] = "--needed";
-            batch_prefix[4] = "--noconfirm";
-            prefix = 5;
-            break;
-        default: break;
-    }
+    char *batch_prefix[PACKAGE_INSTALL_PREFIX_MAX];
+    size_t prefix = package_install_prefix(distro, batch_prefix);
 
     int installed = 0, skipped = 0;
 
     if (pkgs != NULL && pkg_count > 0 && prefix > 0)
     {
-        // Try one batch first; fall back per package below.
-        // See docs/DECISIONS.md D2.
-        char **batch_argv = malloc((prefix + pkg_count + 1) * sizeof(char *));
+        size_t pkg_count_size = (size_t)pkg_count;
+        size_t argv_count = prefix + pkg_count_size + 1U;
+        char **batch_argv = argv_count <= SIZE_MAX / sizeof(*batch_argv)
+            ? malloc(argv_count * sizeof(*batch_argv)) : NULL;
         if (batch_argv != NULL)
         {
-            for (int i = 0; i < prefix; i++)
-                batch_argv[i] = batch_prefix[i];
-            for (int i = 0; i < pkg_count; i++)
-                batch_argv[prefix + i] = pkgs[i];
-            batch_argv[prefix + pkg_count] = NULL;
-
-            int rc = run_command((char *const *)batch_argv);
+            // Keep successful installs batched. If a batch fails, shrink the
+            // current range until the bad target is isolated, then grow the
+            // batch again. This preserves exact skipped-package accounting
+            // without turning one unavailable package into hundreds of package
+            // manager transactions. See docs/DECISIONS.md D40.
+            package_install_adaptive(batch_argv, batch_prefix, prefix, pkgs,
+                                     pkg_count_size, home, &installed, &skipped,
+                                     had_error);
             free(batch_argv);
-
-            if (rc == 0)
-            {
-                installed = pkg_count;
-            }
-            else
-            {
-                // Phase 2: per-package fallback, track failures
-                char skipped_path[PATH_MAX];
-                int can_write_skip_log =
-                    path_join(skipped_path, sizeof(skipped_path), home,
-                              "skipped-packages.txt") == 0;
-                FILE *skipped_f = NULL;
-                int skip_log_write_failed = 0;
-
-                for (int i = 0; i < pkg_count; i++)
-                {
-                    char *install_cmd[8];
-                    switch (distro)
-                    {
-                        case DISTRO_DEBIAN:
-                            install_cmd[0] = "sudo";
-                            install_cmd[1] = "apt-get";
-                            install_cmd[2] = "install";
-                            install_cmd[3] = "-y";
-                            install_cmd[4] = "-m";
-                            install_cmd[5] = pkgs[i];
-                            install_cmd[6] = NULL;
-                            break;
-                        case DISTRO_FEDORA:
-                            install_cmd[0] = "sudo";
-                            install_cmd[1] = "dnf";
-                            install_cmd[2] = "install";
-                            install_cmd[3] = "-y";
-                            install_cmd[4] = pkgs[i];
-                            install_cmd[5] = NULL;
-                            break;
-                        case DISTRO_ARCH:
-                            install_cmd[0] = "sudo";
-                            install_cmd[1] = "pacman";
-                            install_cmd[2] = "-S";
-                            install_cmd[3] = "--needed";
-                            install_cmd[4] = "--noconfirm";
-                            install_cmd[5] = pkgs[i];
-                            install_cmd[6] = NULL;
-                            break;
-                        default:
-                            install_cmd[0] = NULL;
-                            break;
-                    }
-
-                    if (install_cmd[0] == NULL) continue;
-
-                    if (run_command((char *const *)install_cmd) != 0)
-                    {
-                        if (!can_write_skip_log)
-                        {
-                            if (skipped == 0)
-                                print_error("Error: Could not write skipped package log\n");
-                            *had_error = 1;
-                        }
-                        else if (skipped_f == NULL)
-                        {
-                            skipped_f = fopen(skipped_path, "w");
-                            if (skipped_f == NULL)
-                            {
-                                print_error("Error: Could not write skipped package log\n");
-                                can_write_skip_log = 0;
-                                *had_error = 1;
-                            }
-                        }
-                        if (skipped_f != NULL)
-                        {
-                            if (fprintf(skipped_f, "%s\n", pkgs[i]) < 0)
-                            {
-                                if (!skip_log_write_failed)
-                                {
-                                    print_error("Error: Could not write skipped package log\n");
-                                    skip_log_write_failed = 1;
-                                }
-                                *had_error = 1;
-                            }
-                        }
-                        skipped++;
-                    }
-                    else
-                    {
-                        installed++;
-                    }
-                }
-
-                if (skipped_f != NULL)
-                {
-                    fclose(skipped_f);
-                    printf("  Skipped packages written to: %s\n", skipped_path);
-                }
-            }
         }
         else
         {

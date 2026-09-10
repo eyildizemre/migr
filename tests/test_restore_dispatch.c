@@ -31,6 +31,7 @@
 
 #include "backup.h"
 #include "manifest.h"
+#include "packages.h"
 #include "restore.h"
 #include "portable_restore_internal.h"
 #include "sidecar.h"
@@ -82,6 +83,22 @@ static int proc_thread_count(void)
         return -1;
     return count;
 }
+
+#ifdef PACKAGES_TEST_HOOKS
+typedef struct {
+    int call_count;
+    int thread_count;
+} PackageProgressProbe;
+
+static int package_progress_probe(char *const argv[], void *context)
+{
+    (void)argv;
+    PackageProgressProbe *probe = context;
+    probe->call_count++;
+    probe->thread_count = proc_thread_count();
+    return 0;
+}
+#endif
 
 static void skip_case(const char *label, const char *reason)
 {
@@ -1326,7 +1343,7 @@ static void test_versioned_restore_allows_ascii_case_distinct_names(void)
 
 static void test_live_restore_joins_progress_ticker(void)
 {
-    printf(BLUE "::" NC " restore dispatch: live progress ticker is joined before return\n");
+    printf(BLUE "::" NC " restore dispatch: live progress ticker is joined before optional restore steps\n");
 
     char source[PATH_MAX], home[PATH_MAX], restored[PATH_MAX];
     char output[16384];
@@ -1348,14 +1365,24 @@ static void test_live_restore_joins_progress_ticker(void)
     check(manifest_write_v1(source, &manifest) == 0,
           "fixture: write the live-progress restore manifest");
     write_payload_file(source, "data/PROGRESS", "payload.txt", "progress payload");
-    remove_fixture_packages(source);
+    char packages_path[PATH_MAX];
+    join_path(packages_path, sizeof(packages_path), source, "packages.txt");
+    write_file_mode(packages_path, "fixture-package\n", 0644);
 
     int previous_dry_run = dry_run;
     dry_run = 0;
     int threads_before = -1;
     int threads_after = -1;
+#ifdef PACKAGES_TEST_HOOKS
+    PackageProgressProbe package_probe = {0};
+    packages_test_set_restore_hooks(DISTRO_FEDORA, package_progress_probe,
+                                    &package_probe);
+#endif
     int rc = run_restore_forced_progress_in_process(
         source, "y\n", output, sizeof(output), &threads_before, &threads_after);
+#ifdef PACKAGES_TEST_HOOKS
+    packages_test_clear_restore_hooks();
+#endif
     dry_run = previous_dry_run;
 
     join_path(restored, sizeof(restored), home,
@@ -1366,6 +1393,11 @@ static void test_live_restore_joins_progress_ticker(void)
           "the restore-only progress force installs the real display path");
     check(threads_before > 0 && threads_after == threads_before,
           "a live restore joins its progress ticker before returning");
+#ifdef PACKAGES_TEST_HOOKS
+    check(package_probe.call_count == 1 &&
+              package_probe.thread_count == threads_before,
+          "package restore starts only after the progress ticker is joined");
+#endif
 
     remove_tree(source);
     remove_tree(home);

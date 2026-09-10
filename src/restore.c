@@ -2404,6 +2404,20 @@ int restore(const char *source)
         PortableRestoreOutcome outcome =
             portable_restore_orchestrate_at(&request, &report);
 
+        if (progress_installed)
+        {
+            restore_progress_stop_ticker(&progress_display);
+            progress_installed = 0;
+        }
+        if (progress_display.printed_anything)
+        {
+            capture_report.progress_cb(capture_report.bytes_copied,
+                                       capture_report.current_path,
+                                       capture_report.progress_userdata);
+            putchar('\n');
+            fflush(stdout);
+        }
+
         int had_portable_error = 0;
         if (outcome == PORTABLE_RESTORE_COMPLETE)
         {
@@ -2415,17 +2429,6 @@ int restore(const char *source)
         else if (outcome == PORTABLE_RESTORE_DRY_RUN &&
                  m.has_network_config)
             restore_network_config(source_root_fd, &had_portable_error);
-
-        if (progress_installed)
-            restore_progress_stop_ticker(&progress_display);
-        if (progress_display.printed_anything)
-        {
-            capture_report.progress_cb(capture_report.bytes_copied,
-                                       capture_report.current_path,
-                                       capture_report.progress_userdata);
-            putchar('\n');
-            fflush(stdout);
-        }
         printf("\n");
         switch (outcome)
         {

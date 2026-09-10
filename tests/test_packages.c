@@ -74,6 +74,119 @@ static void free_package_list(char **pkgs, int pkg_count)
     free(pkgs);
 }
 
+static int file_equals_text(const char *path, const char *expected);
+
+typedef struct {
+    const char *const *expected_prefix;
+    size_t expected_prefix_count;
+    const char *const *fail_tokens;
+    size_t fail_token_count;
+    size_t call_count;
+    size_t max_batch_count;
+    int prefix_ok;
+} PackageRunFixture;
+
+static int package_run_fixture(char *const argv[], void *context)
+{
+    PackageRunFixture *fixture = context;
+    fixture->call_count++;
+
+    size_t argc = 0;
+    while (argv[argc] != NULL)
+        argc++;
+
+    if (argc < fixture->expected_prefix_count)
+        fixture->prefix_ok = 0;
+    else
+    {
+        for (size_t i = 0; i < fixture->expected_prefix_count; i++)
+            if (strcmp(argv[i], fixture->expected_prefix[i]) != 0)
+                fixture->prefix_ok = 0;
+    }
+
+    size_t batch_count = argc >= fixture->expected_prefix_count
+        ? argc - fixture->expected_prefix_count : 0U;
+    if (batch_count > fixture->max_batch_count)
+        fixture->max_batch_count = batch_count;
+
+    for (size_t i = fixture->expected_prefix_count; i < argc; i++)
+        for (size_t j = 0; j < fixture->fail_token_count; j++)
+            if (strcmp(argv[i], fixture->fail_tokens[j]) == 0)
+                return 1;
+
+    return 0;
+}
+
+typedef struct {
+    int had_error;
+    int skipped_exists;
+    int skipped_matches;
+} PackageRestoreCaseResult;
+
+static int run_restore_packages_case(distro_t distro, const char *contents,
+                                     PackageRunFixture *runner,
+                                     const char *expected_skipped,
+                                     PackageRestoreCaseResult *result)
+{
+    char dir_path[] = "/tmp/migr_packages_restore_XXXXXX";
+    char *dir = mkdtemp(dir_path);
+    if (dir == NULL)
+        return 0;
+
+    char pkg_path[PATH_MAX];
+    char skipped_path[PATH_MAX];
+    int pkg_path_len = snprintf(pkg_path, sizeof(pkg_path),
+                                "%s/packages.txt", dir);
+    int skipped_path_len = snprintf(skipped_path, sizeof(skipped_path),
+                                    "%s/skipped-packages.txt", dir);
+    if (pkg_path_len < 0 || (size_t)pkg_path_len >= sizeof(pkg_path) ||
+        skipped_path_len < 0 ||
+        (size_t)skipped_path_len >= sizeof(skipped_path))
+    {
+        rmdir(dir);
+        return 0;
+    }
+
+    FILE *pkg_file = fopen(pkg_path, "w");
+    if (pkg_file == NULL)
+    {
+        rmdir(dir);
+        return 0;
+    }
+    int fixture_ok = fputs(contents, pkg_file) >= 0 && fclose(pkg_file) == 0;
+    if (!fixture_ok)
+    {
+        unlink(pkg_path);
+        rmdir(dir);
+        return 0;
+    }
+
+    int dir_fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dir_fd < 0)
+    {
+        unlink(pkg_path);
+        rmdir(dir);
+        return 0;
+    }
+
+    runner->prefix_ok = 1;
+    packages_test_set_restore_hooks(distro, package_run_fixture, runner);
+    result->had_error = 0;
+    restore_packages(dir_fd, dir, &result->had_error);
+    packages_test_clear_restore_hooks();
+    close(dir_fd);
+
+    result->skipped_exists = access(skipped_path, F_OK) == 0;
+    result->skipped_matches = expected_skipped != NULL
+        ? file_equals_text(skipped_path, expected_skipped)
+        : !result->skipped_exists;
+
+    unlink(skipped_path);
+    unlink(pkg_path);
+    rmdir(dir);
+    return 1;
+}
+
 static int file_equals_text(const char *path, const char *expected)
 {
     FILE *f = fopen(path, "rb");
@@ -296,29 +409,152 @@ static void test_stream_error(void)
     fclose(stream);
 }
 
+static void test_restore_packages_batch_prefixes(void)
+{
+    printf(BLUE "::" NC " restore_packages batches all supported package managers\n");
+
+    static const char *const debian_prefix[] = {
+        "sudo", "apt-get", "install", "-y", "-m"
+    };
+    static const char *const fedora_prefix[] = {
+        "sudo", "dnf", "install", "-y"
+    };
+    static const char *const arch_prefix[] = {
+        "sudo", "pacman", "-S", "--needed", "--noconfirm"
+    };
+    struct {
+        distro_t distro;
+        const char *name;
+        const char *const *prefix;
+        size_t prefix_count;
+    } cases[] = {
+        { DISTRO_DEBIAN, "Debian", debian_prefix,
+          sizeof(debian_prefix) / sizeof(debian_prefix[0]) },
+        { DISTRO_FEDORA, "Fedora", fedora_prefix,
+          sizeof(fedora_prefix) / sizeof(fedora_prefix[0]) },
+        { DISTRO_ARCH, "Arch", arch_prefix,
+          sizeof(arch_prefix) / sizeof(arch_prefix[0]) },
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+    {
+        PackageRunFixture runner = {
+            .expected_prefix = cases[i].prefix,
+            .expected_prefix_count = cases[i].prefix_count,
+        };
+        PackageRestoreCaseResult result = {0};
+        int fixture_ok = run_restore_packages_case(
+            cases[i].distro, "alpha\nbeta\n", &runner, NULL, &result);
+        char label[160];
+
+        snprintf(label, sizeof(label),
+                 "%s fixture runs through the package restore path",
+                 cases[i].name);
+        check(fixture_ok, label);
+        if (!fixture_ok)
+            continue;
+
+        snprintf(label, sizeof(label),
+                 "%s uses one full two-package batch with the canonical prefix",
+                 cases[i].name);
+        check(runner.prefix_ok && runner.call_count == 1U &&
+                  runner.max_batch_count == 2U,
+              label);
+        snprintf(label, sizeof(label),
+                 "%s successful batch creates no skipped-package log",
+                 cases[i].name);
+        check(result.had_error == 0 && result.skipped_matches, label);
+    }
+}
+
+static void test_restore_packages_adaptive_isolation(distro_t distro,
+                                                     const char *name,
+                                                     const char *const *prefix,
+                                                     size_t prefix_count)
+{
+    char packages[1024] = {0};
+    size_t used = 0;
+    for (int i = 0; i < 32; i++)
+    {
+        const char *package = i == 7 ? "bad-seven" :
+                              i == 23 ? "bad-twenty-three" : NULL;
+        char generated[32];
+        if (package == NULL)
+        {
+            snprintf(generated, sizeof(generated), "pkg-%02d", i);
+            package = generated;
+        }
+        int written = snprintf(packages + used, sizeof(packages) - used,
+                               "%s\n", package);
+        if (written < 0 || (size_t)written >= sizeof(packages) - used)
+        {
+            check(0, "fixture: adaptive package list fits its buffer");
+            return;
+        }
+        used += (size_t)written;
+    }
+
+    static const char *const failures[] = {
+        "bad-seven", "bad-twenty-three"
+    };
+    PackageRunFixture runner = {
+        .expected_prefix = prefix,
+        .expected_prefix_count = prefix_count,
+        .fail_tokens = failures,
+        .fail_token_count = sizeof(failures) / sizeof(failures[0]),
+    };
+    PackageRestoreCaseResult result = {0};
+    int fixture_ok = run_restore_packages_case(
+        distro, packages, &runner,
+        "bad-seven\nbad-twenty-three\n", &result);
+    char label[192];
+
+    snprintf(label, sizeof(label),
+             "%s adaptive-isolation fixture runs", name);
+    check(fixture_ok, label);
+    if (!fixture_ok)
+        return;
+
+    snprintf(label, sizeof(label),
+             "%s keeps every retry on the canonical package-manager prefix",
+             name);
+    check(runner.prefix_ok, label);
+    snprintf(label, sizeof(label),
+             "%s starts with the complete package batch", name);
+    check(runner.max_batch_count == 32U, label);
+    snprintf(label, sizeof(label),
+             "%s isolates sparse failures with fewer calls than per-package fallback",
+             name);
+    check(runner.call_count < 33U, label);
+    snprintf(label, sizeof(label),
+             "%s records only the two failing package names", name);
+    check(result.had_error == 0 && result.skipped_exists &&
+              result.skipped_matches,
+          label);
+}
+
+static void test_restore_packages_adaptive_batching(void)
+{
+    printf(BLUE "::" NC " restore_packages adaptively isolates failed batches\n");
+
+    static const char *const fedora_prefix[] = {
+        "sudo", "dnf", "install", "-y"
+    };
+    static const char *const arch_prefix[] = {
+        "sudo", "pacman", "-S", "--needed", "--noconfirm"
+    };
+
+    test_restore_packages_adaptive_isolation(
+        DISTRO_FEDORA, "Fedora", fedora_prefix,
+        sizeof(fedora_prefix) / sizeof(fedora_prefix[0]));
+    test_restore_packages_adaptive_isolation(
+        DISTRO_ARCH, "Arch", arch_prefix,
+        sizeof(arch_prefix) / sizeof(arch_prefix[0]));
+}
+
 static void test_restore_packages_batch_alloc_failure_is_reported(void)
 {
     printf(BLUE "::" NC " restore_packages reports an error when the batch argv allocation fails\n");
-
-    distro_t distro = detect_distro();
-    if (distro == DISTRO_UNKNOWN)
-    {
-        printf("  " BLUE "-" NC " unrecognized distro in this environment -- restore_packages()'s batch-install path is unreachable here, skipping\n");
-        return;
-    }
-
-    // Mirrors restore_packages()'s own switch purely to compute the exact
-    // batch_argv size it will request; not a duplicate of any decision logic.
-    int prefix;
-    switch (distro)
-    {
-        case DISTRO_DEBIAN: prefix = 5; break;
-        case DISTRO_FEDORA: prefix = 4; break;
-        case DISTRO_ARCH:   prefix = 5; break;
-        default:            prefix = 0; break;
-    }
-    if (prefix == 0)
-        return;
 
     char dir_path[] = "/tmp/migr_packages_alloc_fail_XXXXXX";
     char *dir = mkdtemp(dir_path);
@@ -350,11 +586,20 @@ static void test_restore_packages_batch_alloc_failure_is_reported(void)
         return;
     }
 
-    wrap_malloc_target_size = (size_t)(prefix + PKG_COUNT + 1) * sizeof(char *);
+    wrap_malloc_target_size = (size_t)(4 + PKG_COUNT + 1) * sizeof(char *);
     wrap_malloc_fired = 0;
 
+    static const char *const fedora_prefix[] = {
+        "sudo", "dnf", "install", "-y"
+    };
+    PackageRunFixture runner = {
+        .expected_prefix = fedora_prefix,
+        .expected_prefix_count = sizeof(fedora_prefix) / sizeof(fedora_prefix[0]),
+    };
+    packages_test_set_restore_hooks(DISTRO_FEDORA, package_run_fixture, &runner);
     int had_error = 0;
     restore_packages(dir_fd, "/tmp", &had_error);
+    packages_test_clear_restore_hooks();
 
     wrap_malloc_target_size = 0;
 
@@ -391,6 +636,8 @@ int main(void)
     test_stream_error();
 
     printf(BLUE "::" NC " restore_packages (unit)\n");
+    test_restore_packages_batch_prefixes();
+    test_restore_packages_adaptive_batching();
     test_restore_packages_batch_alloc_failure_is_reported();
 
     printf("packages tests: %d failure(s)\n", failures);

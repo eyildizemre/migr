@@ -3,6 +3,17 @@
 
 #include <stdio.h>
 
+#ifdef PACKAGES_TEST_HOOKS
+#include "detect.h"
+
+typedef int (*PackagesTestRunHook)(char *const argv[], void *context);
+
+void packages_test_set_restore_hooks(distro_t distro,
+                                     PackagesTestRunHook run_hook,
+                                     void *context);
+void packages_test_clear_restore_hooks(void);
+#endif
+
 /**
  * @brief Exports the same package list into an open container directory.
  *
