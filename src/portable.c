@@ -2089,8 +2089,9 @@ int open_source_node(int source_parent, const char *source_name,
     return open(root_path, flags);
 }
 
-int portable_copy_regular(int source_fd, int destination_fd, off_t expected_size,
-                          BackupCaptureReport *report)
+static int portable_copy_regular_impl(
+    int source_fd, int destination_fd, off_t expected_size,
+    BackupCaptureReport *report, uint64_t *digest)
 {
     if (source_fd < 0 || destination_fd < 0)
     {
@@ -2102,6 +2103,7 @@ int portable_copy_regular(int source_fd, int destination_fd, off_t expected_size
 
     unsigned char buffer[65536];
     uint64_t copied = 0;
+    uint64_t hash = HASH_FNV1A_OFFSET_BASIS;
     for (;;) {
         ssize_t received = read(source_fd, buffer, sizeof(buffer));
         if (received < 0 && errno == EINTR)
@@ -2127,6 +2129,8 @@ int portable_copy_regular(int source_fd, int destination_fd, off_t expected_size
             offset += (size_t)written;
         }
         copied += (uint64_t)received;
+        if (digest != NULL)
+            hash = hash_fnv1a_bytes(hash, buffer, (size_t)received);
         if (backup_capture_report_tick(report, received, destination_fd) != 0)
             return -1;
     }
@@ -2135,7 +2139,29 @@ int portable_copy_regular(int source_fd, int destination_fd, off_t expected_size
         errno = EIO;
         return -1;
     }
+    if (digest != NULL)
+        *digest = hash;
     return 0;
+}
+
+int portable_copy_regular(int source_fd, int destination_fd, off_t expected_size,
+                          BackupCaptureReport *report)
+{
+    return portable_copy_regular_impl(source_fd, destination_fd, expected_size,
+                                      report, NULL);
+}
+
+int portable_copy_regular_digest(
+    int source_fd, int destination_fd, off_t expected_size,
+    BackupCaptureReport *report, uint64_t *digest)
+{
+    if (digest == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    return portable_copy_regular_impl(source_fd, destination_fd, expected_size,
+                                      report, digest);
 }
 
 typedef struct {

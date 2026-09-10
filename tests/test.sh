@@ -584,6 +584,7 @@ EOF
     local explicit_container
     explicit_container=$(sole_final_container "$explicit_dest")
     assert_succeeds_with "Dry run mode enabled" ../migr restore "$explicit_container" --dry-run
+    assert_succeeds_with "Dry run mode enabled" ../migr restore "$explicit_container" --dry-run --no-verify
     assert_succeeds_with "Commands:" ../migr --help
 
     set +e
@@ -1094,6 +1095,14 @@ test_errors() {
         ../migr restore "$BACKUP_DIR" --include-network-config
     assert_succeeds_with "--include-network-config" ../migr --help
 
+    # post-copy verification is a restore-only policy; preflight still runs
+    # under --dry-run even though there is no copied destination to verify.
+    assert_fails_with "Error: --no-verify applies only to 'restore'." \
+        ../migr report --no-verify
+    assert_fails_with "Error: --no-verify applies only to 'restore'." \
+        ../migr backup "$BACKUP_DIR" --no-verify
+    assert_succeeds_with "--no-verify" ../migr --help
+
     # commands that take exactly one positional reject extras
     assert_exits_nonzero ../migr restore "$BACKUP_DIR" /tmp/extra
 
@@ -1118,6 +1127,8 @@ test_errors() {
     assert_succeeds_with "Usage:" ../migr report --max-depth=2 --help
     assert_succeeds_with "Usage:" ../migr restore --include-self --help
     assert_succeeds_with "Usage:" ../migr restore --include-network-config --help
+    assert_succeeds_with "Usage:" ../migr restore --no-verify --help
+    assert_succeeds_with "Usage:" ../migr backup --no-verify --help
     assert_succeeds_with "Usage:" ../migr help --critical
     # ...but a genuine conflict detected before --help is even parsed still refuses.
     assert_exits_nonzero ../migr backup --critical --comprehensive --help

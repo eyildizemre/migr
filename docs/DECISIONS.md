@@ -3637,3 +3637,63 @@ generic rule.
 a source HOME for older manifests; rewriting non-URI text in these files; XML
 parsing for the XBEL file; loading the whole file into memory merely to perform a
 prefix substitution.
+
+---
+
+## D42 — 2026-09-10 — Portable restore verifies applied content before success
+
+**Status:** Implemented
+
+**Decision:** A live portable restore performs a post-copy verification pass by
+default after replay has applied file content and metadata and before the restore
+is reported successful or optional package/network restoration begins.
+
+For every regular file, replay computes a 64-bit FNV-1a digest incrementally over the exact bytes
+successfully written to the destination. The verification pass reopens the
+destination through existing-only, fd-relative, no-follow traversal, hashes its
+current bytes, and requires the digest to match. The expected digest therefore
+describes the bytes migr actually intended to leave at the destination, including
+D41's bounded HOME-URI rewrite, rather than blindly describing the original
+portable payload.
+
+Symlinks are verified by no-follow identity checks plus exact target-byte
+comparison. Because reading a symlink target may advance the symlink's atime, the
+verifier reapplies the recorded symlink timestamps with no-follow semantics before
+declaring that entry verified. A hardlink representative is content-verified as a regular file;
+aliases are then verified by matching `st_dev`/`st_ino` with their referenced
+representative, so the same file content is not read again through every hardlink
+name. Directories require no additional content read after their existing replay
+and metadata checks.
+
+Any verification path, read, content, symlink-target, or hardlink-identity failure
+is a restore failure and retains the existing failing root/path diagnostics. A
+known mismatch is not reported as successful merely because destination mutation
+already occurred. Verification does not roll back already-applied files.
+
+`--no-verify` is a restore-only opt-out from this post-copy destination read-back.
+It does not weaken portable preflight, payload authentication, destination-identity
+validation, or any apply-time metadata checks. Dry-run restore does not run the
+post-copy verifier because it does not perform replay mutation.
+
+**Why:** A successful copy syscall sequence proves that the write path returned
+success, not that the destination still contains the intended bytes at the
+completion boundary. One destination read-back catches copy/storage corruption and
+destination path replacement that is observable when the entry is verified.
+Computing the expected digest while replay already streams the bytes avoids a
+second read of the backup payload and gives transformed files the correct expected
+content. This verification boundary detects non-adversarial accidental corruption;
+it is not a tamper-evidence mechanism. Reusing the repository's 64-bit FNV-1a
+primitive is sufficient for that probabilistic checksum role while keeping the CPU
+cost of a default-on full-tree read-back low.
+
+**Rejected:** treating a detected mismatch as a successful restore plus a warning
+file; re-reading and hashing the backup payload again after copy; hashing hardlink
+aliases independently; following destination symlinks during verification; using a
+cryptographic digest for a non-adversarial checksum boundary at the cost of
+substantially lower unoptimized throughput; making verification opt-in.
+
+**Relationship:** Complements D17/D39's independent restore validation and
+fail-closed rules, and D41 defines why the expected bytes for its two transformed
+files are the rewritten output. Package and network publication remains downstream
+of a fully successful portable replay, so a failed verification cannot be followed
+by those optional restore steps.

@@ -6,6 +6,7 @@
 #include <sys/types.h>
 
 #include "fileops.h"
+#include "hash.h"
 #include "manifest.h"
 #include "sidecar.h"
 
@@ -52,6 +53,11 @@ int portable_open_relative_parent(int base_fd, const char *relative,
 /** Copies a regular payload while updating optional progress and sync state. */
 int portable_copy_regular(int source_fd, int destination_fd,
                           off_t expected_size, BackupCaptureReport *report);
+
+/** Copies a regular payload and returns an FNV-1a digest of the bytes written. */
+int portable_copy_regular_digest(
+    int source_fd, int destination_fd, off_t expected_size,
+    BackupCaptureReport *report, uint64_t *digest);
 
 /**
  * A source root and its container address for a portable capture.

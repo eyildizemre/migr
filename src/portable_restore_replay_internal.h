@@ -26,6 +26,16 @@ int replay_failure_reason_format(const PortableRestoreReplayReport *report,
  * validation and immediately before linkat(), so a test can swap out the
  * reference target and prove the post-link identity check catches it. */
 void portable_restore_replay_test_set_hardlink_race_hook(void (*hook)(void));
+
+/* Fires after replay has finished mutating destination content and before the
+ * post-copy verification pass starts. Tests use it to model corruption or a
+ * pathname replacement in that exact boundary. */
+void portable_restore_replay_test_set_before_content_verification_hook(
+    void (*hook)(void));
+void portable_restore_replay_test_set_after_apply_hook(void (*hook)(void));
+void portable_restore_replay_test_set_verification_progress_enabled(int enabled);
+void portable_restore_replay_test_reset_verification_regular_read_count(void);
+size_t portable_restore_replay_test_verification_regular_read_count(void);
 #endif
 
 #endif

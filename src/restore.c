@@ -881,6 +881,39 @@ static void restore_report_progress(off_t bytes_restored,
     display->printed_anything = 1;
 }
 
+typedef struct {
+    BackupCaptureReport *report;
+    RestoreProgressDisplay *display;
+    int *ticker_installed;
+} RestoreProgressPhase;
+
+static void restore_progress_finish_phase(RestoreProgressPhase *phase)
+{
+    if (phase == NULL || phase->report == NULL || phase->display == NULL ||
+        phase->ticker_installed == NULL)
+        return;
+    if (*phase->ticker_installed)
+    {
+        restore_progress_stop_ticker(phase->display);
+        *phase->ticker_installed = 0;
+    }
+    if (phase->display->printed_anything)
+    {
+        if (phase->report->progress_cb != NULL)
+            phase->report->progress_cb(phase->report->bytes_copied,
+                                       phase->report->current_path,
+                                       phase->report->progress_userdata);
+        putchar('\n');
+        fflush(stdout);
+        phase->display->printed_anything = 0;
+    }
+}
+
+static void restore_before_content_verification(void *context)
+{
+    restore_progress_finish_phase(context);
+}
+
 // Restores one item whose source and destination relative addresses may
 // differ (e.g. a v1 root's "data/<payload>" source vs. its own restore
 // address), sharing the exact same status/preflight/apply behavior for
@@ -2259,8 +2292,10 @@ static void restore_v1(const char *source, int source_root_fd,
     }
 }
 
-int restore(const char *source)
+int restore_with_options(const char *source, const RestoreOptions *options)
 {
+    int skip_content_verification =
+        options != NULL && options->skip_content_verification;
     char home[PATH_MAX];
     if (resolve_target_home(home) != 0)
         return 1;
@@ -2379,7 +2414,8 @@ int restore(const char *source)
             .manifest = &m,
             .destination_home_fd = home_fd,
             .destination_home_path = home,
-            .destination_timestamp_policy = {0}
+            .destination_timestamp_policy = {0},
+            .skip_content_verification = skip_content_verification
         };
         for (int index = 0; index < XDG_RESTORE_COUNT; index++)
             request.destination_xdg_dirs[index] = xdg_dirs[index];
@@ -2400,23 +2436,19 @@ int restore(const char *source)
             progress_installed = 1;
         }
         request.capture_report = &capture_report;
+        RestoreProgressPhase progress_phase = {
+            .report = &capture_report,
+            .display = &progress_display,
+            .ticker_installed = &progress_installed
+        };
+        request.before_content_verification =
+            restore_before_content_verification;
+        request.before_content_verification_context = &progress_phase;
         PortableRestoreReplayReport report;
         PortableRestoreOutcome outcome =
             portable_restore_orchestrate_at(&request, &report);
 
-        if (progress_installed)
-        {
-            restore_progress_stop_ticker(&progress_display);
-            progress_installed = 0;
-        }
-        if (progress_display.printed_anything)
-        {
-            capture_report.progress_cb(capture_report.bytes_copied,
-                                       capture_report.current_path,
-                                       capture_report.progress_userdata);
-            putchar('\n');
-            fflush(stdout);
-        }
+        restore_progress_finish_phase(&progress_phase);
 
         int had_portable_error = 0;
         if (outcome == PORTABLE_RESTORE_COMPLETE)
@@ -2700,4 +2732,9 @@ cleanup:
     close(home_fd);
     close(source_root_fd);
     return result;
+}
+
+int restore(const char *source)
+{
+    return restore_with_options(source, NULL);
 }

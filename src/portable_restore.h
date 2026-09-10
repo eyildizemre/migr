@@ -25,6 +25,11 @@ typedef struct {
     MetadataTimestampPolicy destination_timestamp_policy;
     /* Borrowed byte/progress/sync state for a live replay; NULL disables it. */
     BackupCaptureReport *capture_report;
+    /* Verification is on by default. This opt-out is restore-only CLI policy. */
+    int skip_content_verification;
+    /* Lets the CLI retire its copy-progress renderer before verification starts. */
+    void (*before_content_verification)(void *context);
+    void *before_content_verification_context;
 } PortableRestoreRequest;
 
 typedef enum {
@@ -83,6 +88,10 @@ typedef enum {
     PORTABLE_RESTORE_REPLAY_FAILURE_RESOLVE_HARDLINK_REFERENCE,
     PORTABLE_RESTORE_REPLAY_FAILURE_CREATE_HARDLINK,
     PORTABLE_RESTORE_REPLAY_FAILURE_VERIFY_HARDLINK,
+    PORTABLE_RESTORE_REPLAY_FAILURE_VERIFY_DESTINATION_PATH,
+    PORTABLE_RESTORE_REPLAY_FAILURE_READ_DESTINATION_CONTENT,
+    PORTABLE_RESTORE_REPLAY_FAILURE_COMPARE_DESTINATION_CONTENT,
+    PORTABLE_RESTORE_REPLAY_FAILURE_VERIFY_DESTINATION_HARDLINK,
     PORTABLE_RESTORE_REPLAY_FAILURE_CLOSE_DESCRIPTOR
 } PortableRestoreReplayFailureStep;
 
@@ -91,6 +100,8 @@ typedef struct {
     size_t applied_count;
     size_t failed_count;
     size_t skipped_security_xattr_count;
+    size_t verification_checked_count;
+    size_t verification_failed_count;
     SidecarObjectKind failed_kind;
     int failed_kind_valid;
     PortableRestoreReplayFailureStep failure_step;

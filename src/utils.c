@@ -720,6 +720,7 @@ void print_help(void)
     printf("                        Back up NetworkManager, netplan,\n");
     printf("                        systemd-networkd, wpa_supplicant, and\n");
     printf("                        netctl configuration found on this system\n");
+    printf("      --no-verify       Skip post-copy content verification (restore only)\n");
     printf("\n");
     printf("Examples:\n");
     printf("  ./migr backup /mnt/drive\n");

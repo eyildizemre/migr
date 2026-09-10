@@ -116,6 +116,7 @@ int main(int argc, char *argv[])
         {"max-depth",      required_argument, NULL, 'd'},
         {"include-self",   no_argument,       NULL, 'I'},
         {"include-network-config", no_argument, NULL, 'N'},
+        {"no-verify",      no_argument,       NULL, 'V'},
         {NULL,             0,                 NULL,  0 }
     };
 
@@ -147,6 +148,7 @@ int main(int argc, char *argv[])
     int max_depth_given = 0;
     int include_self = 0;
     int include_network_config = 0;
+    int no_verify = 0;
     int non_help_option_given = 0;
 
     // Parse options only. optind was set above to skip the command word, or left
@@ -202,6 +204,10 @@ int main(int argc, char *argv[])
         case 'N':
             non_help_option_given = 1;
             include_network_config = 1;
+            break;
+        case 'V':
+            non_help_option_given = 1;
+            no_verify = 1;
             break;
         case '?':
         default:
@@ -286,6 +292,11 @@ int main(int argc, char *argv[])
         print_error("Error: --include-network-config applies only to 'backup'.\n");
         return 1;
     }
+    if (no_verify && action != ACTION_RESTORE)
+    {
+        print_error("Error: --no-verify applies only to 'restore'.\n");
+        return 1;
+    }
     if (path != NULL && (action == ACTION_REPORT || action == ACTION_NONE))
     {
         print_error("Error: 'report' takes no arguments.\n");
@@ -338,7 +349,10 @@ int main(int argc, char *argv[])
                 ret = 1;
                 break;
             }
-            ret = restore(path);
+            RestoreOptions restore_options = {
+                .skip_content_verification = no_verify
+            };
+            ret = restore_with_options(path, &restore_options);
             break;
         case ACTION_CONF:
             ret = config_edit() == 0 ? 0 : 1;

@@ -592,6 +592,12 @@ static int run_replay_with_capture(
     Fixture *fixture, PortableRestoreReplayReport *report,
     BackupCaptureReport *capture_report);
 
+static int run_replay_with_options(
+    Fixture *fixture, PortableRestoreReplayReport *report,
+    BackupCaptureReport *capture_report, int skip_content_verification,
+    void (*before_content_verification)(void *),
+    void *before_content_verification_context);
+
 static int run_replay_with_xdg(
     Fixture *fixture, PortableRestoreReplayReport *report,
     const char * const *destination_xdg_dirs);
@@ -604,6 +610,16 @@ static int run_replay(Fixture *fixture, PortableRestoreReplayReport *report)
 static int run_replay_with_capture(
     Fixture *fixture, PortableRestoreReplayReport *report,
     BackupCaptureReport *capture_report)
+{
+    return run_replay_with_options(fixture, report, capture_report, 0, NULL,
+                                   NULL);
+}
+
+static int run_replay_with_options(
+    Fixture *fixture, PortableRestoreReplayReport *report,
+    BackupCaptureReport *capture_report, int skip_content_verification,
+    void (*before_content_verification)(void *),
+    void *before_content_verification_context)
 {
     Manifest manifest;
     if (manifest_read_v1_at(fixture->container_fd, &manifest) !=
@@ -618,7 +634,11 @@ static int run_replay_with_capture(
             .nsec_exact = 1,
             .configured = 1
         },
-        .capture_report = capture_report
+        .capture_report = capture_report,
+        .skip_content_verification = skip_content_verification,
+        .before_content_verification = before_content_verification,
+        .before_content_verification_context =
+            before_content_verification_context
     };
     portable_restore_replay_report_init(report);
     int result = portable_restore_replay_at(&request, report);
@@ -651,6 +671,135 @@ static int run_replay_with_xdg(
     int result = portable_restore_replay_at(&request, report);
     manifest_free(&manifest);
     return result;
+}
+
+typedef enum {
+    VERIFICATION_MUTATION_NONE = 0,
+    VERIFICATION_MUTATION_REWRITE_FILE,
+    VERIFICATION_MUTATION_TRUNCATE_FILE,
+    VERIFICATION_MUTATION_REPLACE_FILE_WITH_SYMLINK,
+    VERIFICATION_MUTATION_REPLACE_PARENT_WITH_SYMLINK,
+    VERIFICATION_MUTATION_REPLACE_SYMLINK_TARGET,
+    VERIFICATION_MUTATION_REPLACE_HARDLINK_ALIAS
+} VerificationMutation;
+
+static Fixture *verification_mutation_fixture;
+static VerificationMutation verification_mutation;
+
+static void mutate_after_replay_apply(void)
+{
+    if (verification_mutation_fixture == NULL ||
+        verification_mutation == VERIFICATION_MUTATION_NONE)
+        fatal("invalid verification mutation hook state");
+
+    int root_fd = openat(verification_mutation_fixture->home_fd, "restored",
+                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (root_fd < 0)
+        fatal("could not open restored root for verification mutation");
+
+    switch (verification_mutation)
+    {
+        case VERIFICATION_MUTATION_REWRITE_FILE:
+            write_file_at(root_fd, "file", "ABCDEFGH");
+            break;
+        case VERIFICATION_MUTATION_TRUNCATE_FILE:
+        {
+            int fd = openat(root_fd, "file", O_WRONLY | O_TRUNC | O_CLOEXEC);
+            if (fd < 0 || close(fd) != 0)
+                fatal("could not truncate restored file before verification");
+            break;
+        }
+        case VERIFICATION_MUTATION_REPLACE_FILE_WITH_SYMLINK:
+            if (unlinkat(root_fd, "file", 0) != 0 ||
+                symlinkat("../outside", root_fd, "file") != 0)
+                fatal("could not replace restored file with symlink");
+            break;
+        case VERIFICATION_MUTATION_REPLACE_PARENT_WITH_SYMLINK:
+        {
+            int nested_fd = openat(root_fd, "nested",
+                                   O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                                       O_CLOEXEC);
+            if (nested_fd < 0 || unlinkat(nested_fd, "file", 0) != 0 ||
+                close(nested_fd) != 0 ||
+                unlinkat(root_fd, "nested", AT_REMOVEDIR) != 0 ||
+                symlinkat("../outside-dir", root_fd, "nested") != 0)
+                fatal("could not replace restored parent with symlink");
+            break;
+        }
+        case VERIFICATION_MUTATION_REPLACE_SYMLINK_TARGET:
+            if (unlinkat(root_fd, "link", 0) != 0 ||
+                symlinkat("other-target", root_fd, "link") != 0)
+                fatal("could not replace restored symlink target");
+            break;
+        case VERIFICATION_MUTATION_REPLACE_HARDLINK_ALIAS:
+            if (unlinkat(root_fd, "alias", 0) != 0)
+                fatal("could not remove restored hardlink alias");
+            write_file_at(root_fd, "alias", "hardlink payload");
+            break;
+        case VERIFICATION_MUTATION_NONE:
+            break;
+    }
+
+    if (close(root_fd) != 0)
+        fatal("could not close restored root after verification mutation");
+}
+
+static void set_verification_mutation(Fixture *fixture,
+                                      VerificationMutation mutation)
+{
+    verification_mutation_fixture = fixture;
+    verification_mutation = mutation;
+    portable_restore_replay_test_set_after_apply_hook(
+        mutation == VERIFICATION_MUTATION_NONE ? NULL : mutate_after_replay_apply);
+}
+
+static void clear_verification_mutation(void)
+{
+    portable_restore_replay_test_set_after_apply_hook(NULL);
+    verification_mutation = VERIFICATION_MUTATION_NONE;
+    verification_mutation_fixture = NULL;
+}
+
+typedef struct {
+    PortableRestoreReplayReport *report;
+    int calls;
+    size_t checked_when_called;
+    size_t regular_reads_when_called;
+} VerificationBoundaryProbe;
+
+static void note_verification_boundary(void *context)
+{
+    VerificationBoundaryProbe *probe = context;
+    if (probe == NULL)
+        return;
+    probe->calls++;
+    probe->checked_when_called = probe->report == NULL ? SIZE_MAX :
+                                 probe->report->verification_checked_count;
+    probe->regular_reads_when_called =
+        portable_restore_replay_test_verification_regular_read_count();
+}
+
+static int regular_verification_fixture_open(Fixture *fixture,
+                                             const char *payload)
+{
+    ManifestRoot root = root_for();
+    if (fixture_open(fixture, &root) != 0)
+        return -1;
+    make_dir_at(fixture->data_fd, "ROOT", 0700);
+    write_file_at(fixture->data_fd, "ROOT/file", payload);
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000620, 1, 1700000621, 2),
+        entry_for("ROOT", "file", "file", SIDECAR_KIND_REGULAR,
+                  strlen(payload), 0600,
+                  1700000622, 3, 1700000623, 4)
+    };
+    if (write_sidecar(fixture, entries, 2, NULL, NULL) != 0)
+    {
+        fixture_close(fixture);
+        return -1;
+    }
+    return 0;
 }
 
 static int run_portable_mount_case(
@@ -1466,7 +1615,9 @@ static void test_normal_replay(void)
     PortableRestoreReplayReport report;
     int result = run_replay(&fixture, &report);
     check(result == 0 && report.live_count == 3 &&
-              report.applied_count == 3 && report.failed_count == 0,
+              report.applied_count == 3 && report.failed_count == 0 &&
+              report.verification_checked_count == 1 &&
+              report.verification_failed_count == 0,
           "all live entries replay successfully");
 
     char restored_root[PATH_MAX], restored_nested[PATH_MAX],
@@ -1492,6 +1643,331 @@ static void test_normal_replay(void)
     check(file_equals_noatime(sentinel, "untouched"),
           "unrelated destination content remains untouched");
     fixture_close(&fixture);
+}
+
+static void test_regular_content_verification(void)
+{
+    printf(BLUE "::" NC " portable restore verifies regular content after replay\n");
+
+    Fixture success;
+    int opened = regular_verification_fixture_open(&success, "abcdefgh");
+    check(opened == 0, "regular verification fixture is created");
+    if (opened == 0)
+    {
+        PortableRestoreReplayReport report;
+        VerificationBoundaryProbe probe = { .report = &report };
+        portable_restore_replay_test_reset_verification_regular_read_count();
+        int result = run_replay_with_options(
+            &success, &report, NULL, 0, note_verification_boundary, &probe);
+        check(result == 0 && report.applied_count == 2 &&
+                  report.failed_count == 0 &&
+                  report.verification_checked_count == 1 &&
+                  report.verification_failed_count == 0 &&
+                  portable_restore_replay_test_verification_regular_read_count() == 1,
+              "regular destination bytes are read back exactly once");
+        check(probe.calls == 1 && probe.checked_when_called == 0 &&
+                  probe.regular_reads_when_called == 0,
+              "verification boundary callback runs before destination readback");
+        fixture_close(&success);
+    }
+
+    Fixture rewritten;
+    opened = regular_verification_fixture_open(&rewritten, "abcdefgh");
+    check(opened == 0, "same-size corruption fixture is created");
+    if (opened == 0)
+    {
+        set_verification_mutation(&rewritten,
+                                  VERIFICATION_MUTATION_REWRITE_FILE);
+        PortableRestoreReplayReport report;
+        int result = run_replay(&rewritten, &report);
+        clear_verification_mutation();
+        check(result != 0 && report.applied_count == 2 &&
+                  report.failed_count == 1 &&
+                  report.verification_checked_count == 1 &&
+                  report.verification_failed_count == 1 &&
+                  strcmp(report.failed_root_id, "ROOT") == 0 &&
+                  strcmp(report.failed_logical_path, "file") == 0 &&
+                  report.failed_kind_valid &&
+                  report.failed_kind == SIDECAR_KIND_REGULAR &&
+                  report.failure_step ==
+                      PORTABLE_RESTORE_REPLAY_FAILURE_COMPARE_DESTINATION_CONTENT &&
+                  report.failure_errno == EIO,
+              "same-size post-copy corruption is a restore failure");
+        fixture_close(&rewritten);
+    }
+
+    Fixture truncated;
+    opened = regular_verification_fixture_open(&truncated, "abcdefgh");
+    check(opened == 0, "truncation verification fixture is created");
+    if (opened == 0)
+    {
+        set_verification_mutation(&truncated,
+                                  VERIFICATION_MUTATION_TRUNCATE_FILE);
+        PortableRestoreReplayReport report;
+        int result = run_replay(&truncated, &report);
+        clear_verification_mutation();
+        check(result != 0 && report.verification_checked_count == 1 &&
+                  report.verification_failed_count == 1 &&
+                  report.failure_step ==
+                      PORTABLE_RESTORE_REPLAY_FAILURE_COMPARE_DESTINATION_CONTENT &&
+                  report.failure_errno == EIO,
+              "post-copy truncation is detected by content verification");
+        fixture_close(&truncated);
+    }
+
+    Fixture skipped;
+    opened = regular_verification_fixture_open(&skipped, "abcdefgh");
+    check(opened == 0, "verification opt-out fixture is created");
+    if (opened == 0)
+    {
+        PortableRestoreReplayReport report;
+        VerificationBoundaryProbe probe = { .report = &report };
+        portable_restore_replay_test_reset_verification_regular_read_count();
+        set_verification_mutation(&skipped,
+                                  VERIFICATION_MUTATION_REWRITE_FILE);
+        int result = run_replay_with_options(
+            &skipped, &report, NULL, 1, note_verification_boundary, &probe);
+        clear_verification_mutation();
+        char restored[PATH_MAX];
+        path_join(restored, sizeof(restored), skipped.home, "/restored/file");
+        check(result == 0 && report.failed_count == 0 &&
+                  report.verification_checked_count == 0 &&
+                  report.verification_failed_count == 0 && probe.calls == 0 &&
+                  portable_restore_replay_test_verification_regular_read_count() == 0 &&
+                  file_equals_noatime(restored, "ABCDEFGH"),
+              "verification opt-out skips readback and its boundary callback");
+        fixture_close(&skipped);
+    }
+}
+
+static void test_verification_refuses_destination_symlink_replacement(void)
+{
+    printf(BLUE "::" NC " portable verification refuses destination symlink replacement\n");
+
+    Fixture leaf;
+    int opened = regular_verification_fixture_open(&leaf, "abcdefgh");
+    check(opened == 0, "verification leaf-replacement fixture is created");
+    if (opened == 0)
+    {
+        write_file_at(leaf.home_fd, "outside", "abcdefgh");
+        set_verification_mutation(
+            &leaf, VERIFICATION_MUTATION_REPLACE_FILE_WITH_SYMLINK);
+        PortableRestoreReplayReport report;
+        int result = run_replay(&leaf, &report);
+        clear_verification_mutation();
+        char outside[PATH_MAX];
+        path_join(outside, sizeof(outside), leaf.home, "/outside");
+        check(result != 0 && report.verification_failed_count == 1 &&
+                  report.failure_step ==
+                      PORTABLE_RESTORE_REPLAY_FAILURE_VERIFY_DESTINATION_PATH &&
+                  file_equals_noatime(outside, "abcdefgh"),
+              "verification rejects a final symlink without following it");
+        fixture_close(&leaf);
+    }
+
+    ManifestRoot root = root_for();
+    Fixture parent;
+    opened = fixture_open(&parent, &root);
+    check(opened == 0, "verification parent-replacement fixture is created");
+    if (opened == 0)
+    {
+        make_dir_at(parent.data_fd, "ROOT", 0700);
+        int payload_root = openat(parent.data_fd, "ROOT",
+                                  O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (payload_root < 0)
+            fatal("could not open verification payload root");
+        make_dir_at(payload_root, "nested", 0700);
+        int nested = openat(payload_root, "nested",
+                            O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (nested < 0)
+            fatal("could not open verification payload parent");
+        write_file_at(nested, "file", "abcdefgh");
+        close(nested);
+        close(payload_root);
+        SidecarEntry entries[] = {
+            entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                      1700000630, 1, 1700000631, 2),
+            entry_for("ROOT", "nested", "nested", SIDECAR_KIND_DIRECTORY,
+                      0, 0700, 1700000632, 3, 1700000633, 4),
+            entry_for("ROOT", "nested/file", "nested/file",
+                      SIDECAR_KIND_REGULAR, 8, 0600,
+                      1700000634, 5, 1700000635, 6)
+        };
+        if (write_sidecar(&parent, entries, 3, NULL, NULL) != 0)
+            fatal("could not write verification parent sidecar");
+        make_dir_at(parent.home_fd, "outside-dir", 0700);
+        int outside_dir = openat(parent.home_fd, "outside-dir",
+                                 O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (outside_dir < 0)
+            fatal("could not open verification outside directory");
+        write_file_at(outside_dir, "file", "abcdefgh");
+        close(outside_dir);
+        set_verification_mutation(
+            &parent, VERIFICATION_MUTATION_REPLACE_PARENT_WITH_SYMLINK);
+        PortableRestoreReplayReport report;
+        int result = run_replay(&parent, &report);
+        clear_verification_mutation();
+        char outside[PATH_MAX];
+        path_join(outside, sizeof(outside), parent.home, "/outside-dir/file");
+        check(result != 0 && report.verification_failed_count == 1 &&
+                  report.failure_step ==
+                      PORTABLE_RESTORE_REPLAY_FAILURE_VERIFY_DESTINATION_PATH &&
+                  file_equals_noatime(outside, "abcdefgh"),
+              "verification refuses an intermediate symlink without following it");
+        fixture_close(&parent);
+    }
+}
+
+static int symlink_verification_fixture_open(Fixture *fixture)
+{
+    ManifestRoot root = root_for();
+    if (fixture_open(fixture, &root) != 0)
+        return -1;
+    make_dir_at(fixture->data_fd, "ROOT", 0700);
+    write_file_at(fixture->data_fd, "ROOT/link", "");
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000640, 1, 1700000641, 2),
+        entry_for("ROOT", "link", "link", SIDECAR_KIND_SYMLINK, 0, 0777,
+                  1700000642, 3, 1700000643, 4)
+    };
+    entries[1].symlink_target = text_bytes("target");
+    if (write_sidecar(fixture, entries, 2, NULL, NULL) != 0)
+    {
+        fixture_close(fixture);
+        return -1;
+    }
+    return 0;
+}
+
+static void test_symlink_content_verification(void)
+{
+    printf(BLUE "::" NC " portable restore verifies symlink target bytes\n");
+    Fixture success;
+    int opened = symlink_verification_fixture_open(&success);
+    check(opened == 0, "symlink verification fixture is created");
+    if (opened == 0)
+    {
+        PortableRestoreReplayReport report;
+        int result = run_replay(&success, &report);
+        check(result == 0 && report.verification_checked_count == 1 &&
+                  report.verification_failed_count == 0,
+              "restored symlink target passes post-copy verification");
+        struct stat restored;
+        int stat_result = fstatat(success.home_fd, "restored/link", &restored,
+                                  AT_SYMLINK_NOFOLLOW);
+        check(stat_result == 0 && S_ISLNK(restored.st_mode) &&
+                  restored.st_atim.tv_sec == (time_t)1700000642 &&
+                  restored.st_atim.tv_nsec == 3 &&
+                  restored.st_mtim.tv_sec == (time_t)1700000643 &&
+                  restored.st_mtim.tv_nsec == 4,
+              "symlink verification preserves the restored timestamps");
+        fixture_close(&success);
+    }
+
+    Fixture changed;
+    opened = symlink_verification_fixture_open(&changed);
+    check(opened == 0, "symlink target-mismatch fixture is created");
+    if (opened == 0)
+    {
+        set_verification_mutation(
+            &changed, VERIFICATION_MUTATION_REPLACE_SYMLINK_TARGET);
+        PortableRestoreReplayReport report;
+        int result = run_replay(&changed, &report);
+        clear_verification_mutation();
+        check(result != 0 && report.verification_checked_count == 1 &&
+                  report.verification_failed_count == 1 &&
+                  strcmp(report.failed_logical_path, "link") == 0 &&
+                  report.failed_kind_valid &&
+                  report.failed_kind == SIDECAR_KIND_SYMLINK &&
+                  report.failure_step ==
+                      PORTABLE_RESTORE_REPLAY_FAILURE_COMPARE_DESTINATION_CONTENT &&
+                  report.failure_errno == EIO,
+              "changed symlink target is a verification failure");
+        fixture_close(&changed);
+    }
+}
+
+static int hardlink_verification_fixture_open(Fixture *fixture)
+{
+    ManifestRoot root = root_for();
+    if (fixture_open(fixture, &root) != 0)
+        return -1;
+    make_dir_at(fixture->data_fd, "ROOT", 0700);
+    int root_fd = openat(fixture->data_fd, "ROOT",
+                         O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (root_fd < 0)
+        return -1;
+    write_file_at(root_fd, "representative", "hardlink payload");
+    write_file_at(root_fd, "alias", "");
+    close(root_fd);
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000660, 1, 1700000661, 2),
+        entry_for("ROOT", "representative", "representative",
+                  SIDECAR_KIND_REGULAR, strlen("hardlink payload"), 0600,
+                  1700000662, 3, 1700000663, 4),
+        entry_for("ROOT", "alias", "alias", SIDECAR_KIND_HARDLINK, 0, 0600,
+                  1700000664, 5, 1700000665, 6)
+    };
+    entries[2].hardlink_root_id = text_bytes("ROOT");
+    entries[2].hardlink_logical_path = text_bytes("representative");
+    if (write_sidecar(fixture, entries, 3, NULL, NULL) != 0)
+    {
+        fixture_close(fixture);
+        return -1;
+    }
+    return 0;
+}
+
+static void test_hardlink_content_verification(void)
+{
+    printf(BLUE "::" NC " portable restore verifies hardlinks by inode identity\n");
+    Fixture success;
+    int opened = hardlink_verification_fixture_open(&success);
+    check(opened == 0, "hardlink verification fixture is created");
+    if (opened == 0)
+    {
+        portable_restore_replay_test_reset_verification_regular_read_count();
+        PortableRestoreReplayReport report;
+        int result = run_replay(&success, &report);
+        struct stat representative;
+        struct stat alias;
+        int identity_ok =
+            fstatat(success.home_fd, "restored/representative",
+                    &representative, AT_SYMLINK_NOFOLLOW) == 0 &&
+            fstatat(success.home_fd, "restored/alias", &alias,
+                    AT_SYMLINK_NOFOLLOW) == 0 &&
+            replay_hardlink_identity_matches(&representative, &alias);
+        check(result == 0 && identity_ok &&
+                  report.verification_checked_count == 2 &&
+                  report.verification_failed_count == 0 &&
+                  portable_restore_replay_test_verification_regular_read_count() == 1,
+              "hardlink alias is verified without hashing its content again");
+        fixture_close(&success);
+    }
+
+    Fixture replaced;
+    opened = hardlink_verification_fixture_open(&replaced);
+    check(opened == 0, "hardlink identity-mismatch fixture is created");
+    if (opened == 0)
+    {
+        set_verification_mutation(
+            &replaced, VERIFICATION_MUTATION_REPLACE_HARDLINK_ALIAS);
+        PortableRestoreReplayReport report;
+        int result = run_replay(&replaced, &report);
+        clear_verification_mutation();
+        check(result != 0 && report.verification_checked_count == 1 &&
+                  report.verification_failed_count == 1 &&
+                  strcmp(report.failed_logical_path, "alias") == 0 &&
+                  report.failed_kind_valid &&
+                  report.failed_kind == SIDECAR_KIND_HARDLINK &&
+                  report.failure_step ==
+                      PORTABLE_RESTORE_REPLAY_FAILURE_VERIFY_DESTINATION_HARDLINK &&
+                  report.failure_errno == EIO,
+              "same-byte replacement cannot impersonate a hardlink alias");
+        fixture_close(&replaced);
+    }
 }
 
 static void test_destination_truncation(void)
@@ -1688,7 +2164,9 @@ static void test_known_desktop_state_rewrites_home(void)
     BackupCaptureReport capture_report = {0};
     PortableRestoreReplayReport report;
     int result = run_replay_with_capture(&fixture, &report, &capture_report);
-    check(result == 0 && report.failed_count == 0,
+    check(result == 0 && report.failed_count == 0 &&
+              report.verification_checked_count == 2 &&
+              report.verification_failed_count == 0,
           "changed-HOME desktop-state replay succeeds");
 
     char restored_bookmarks[PATH_MAX], restored_recent[PATH_MAX];
@@ -2793,6 +3271,10 @@ int main(void)
     test_collision_suffix_validation();
     test_normal_replay();
     test_destination_truncation();
+    test_regular_content_verification();
+    test_verification_refuses_destination_symlink_replacement();
+    test_symlink_content_verification();
+    test_hardlink_content_verification();
     test_known_desktop_state_rewrites_home();
     test_known_desktop_state_same_home_is_verbatim();
     test_known_desktop_state_legacy_is_verbatim();

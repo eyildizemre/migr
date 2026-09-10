@@ -34,6 +34,11 @@ void restore_test_set_network_reload_hook(RestoreTestNetworkReloadHook hook,
  * @param source Path to the dated backup directory (e.g. /mnt/drive/migr_backup_20260519).
  * @return 0 on success or user cancellation, 1 on error.
  */
+typedef struct {
+    int skip_content_verification;
+} RestoreOptions;
+
+int restore_with_options(const char *source, const RestoreOptions *options);
 int restore(const char *source);
 
 #endif

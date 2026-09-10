@@ -52,7 +52,7 @@ git config core.hooksPath hooks
 ./migr
 ./migr report [--critical | --comprehensive] [-s] [--max-depth=<N>]
 ./migr backup <PATH>
-./migr restore <SOURCE>
+./migr restore <SOURCE> [--no-verify]
 ./migr conf
 ```
 
@@ -145,6 +145,19 @@ be unexpected: a pre-existing destination symlink is refused cleanly and
 names the offending path, while a pre-existing regular file is replaced by
 the backup's version without a second prompt.
 
+Portable restore verifies its applied content before reporting success. For
+regular files it computes an FNV-1a checksum over the exact bytes written during replay,
+then reads the destination back through no-follow, fd-relative traversal and
+requires the digest to match. This includes files whose stored HOME URI is
+rewritten for the new account. Symlink target bytes are compared directly; their
+recorded timestamps are reapplied afterward because reading the target can advance
+the symlink's atime. Hardlink aliases are checked against their representative by filesystem inode
+identity without re-reading the same content through every alias. A read,
+path-identity, content, or hardlink-identity mismatch fails the restore before
+optional package or network restoration is published. `--no-verify` skips only
+this post-copy read-back pass; portable restore preflight remains mandatory,
+and dry runs perform no post-copy verification because they write no files.
+
 ## Options
 
 ```
@@ -160,6 +173,7 @@ the backup's version without a second prompt.
                       Back up NetworkManager, netplan,
                       systemd-networkd, wpa_supplicant, and
                       netctl configuration found on this system
+    --no-verify       Skip post-copy content verification (restore only)
 ```
 
 Status colors are automatic: they are used when stdout is a real terminal and
