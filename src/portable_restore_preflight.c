@@ -39,6 +39,12 @@ typedef struct PreflightEntries {
 typedef struct RestorePreflightProgress RestorePreflightProgress;
 
 typedef struct {
+    int fd;
+    int root_fd;
+    char prefix[PATH_MAX];
+} DestinationProfileAnchorCache;
+
+typedef struct {
     const Manifest *manifest;
     PortableRestorePreflightReport *report;
     RootMap root_map;
@@ -50,6 +56,8 @@ typedef struct {
     const char * const *destination_xdg_dirs;
     int xdg_anchor_fd[XDG_KEY_COUNT];
     char xdg_anchor_prefix[XDG_KEY_COUNT][PATH_MAX];
+    DestinationProfileAnchorCache home_profile_cache;
+    DestinationProfileAnchorCache xdg_profile_cache[XDG_KEY_COUNT];
     PreflightMemory memory;
     RestorePreflightProgress *progress;
 } Collection;
@@ -75,10 +83,21 @@ struct RestorePreflightProgress {
 
 #ifdef PORTABLE_RESTORE_PREFLIGHT_TEST_HOOKS
 static int portable_restore_preflight_test_progress_enabled;
+static size_t portable_restore_preflight_test_profile_root_walk_counter;
 
 void portable_restore_preflight_test_set_progress_enabled(int enabled)
 {
     portable_restore_preflight_test_progress_enabled = enabled != 0;
+}
+
+void portable_restore_preflight_test_reset_profile_root_walk_count(void)
+{
+    portable_restore_preflight_test_profile_root_walk_counter = 0;
+}
+
+size_t portable_restore_preflight_test_profile_root_walk_count(void)
+{
+    return portable_restore_preflight_test_profile_root_walk_counter;
 }
 #endif
 
@@ -458,13 +477,103 @@ static void entries_free(PreflightMemory *memory, PreflightEntries *entries)
     memset(entries, 0, sizeof(*entries));
 }
 
+static void destination_profile_cache_init(DestinationProfileAnchorCache *cache)
+{
+    if (cache == NULL)
+        return;
+    memset(cache, 0, sizeof(*cache));
+    cache->fd = -1;
+    cache->root_fd = -1;
+}
+
+static void destination_profile_cache_invalidate(
+    DestinationProfileAnchorCache *cache)
+{
+    if (cache == NULL)
+        return;
+    if (cache->fd >= 0)
+        (void)close(cache->fd);
+    destination_profile_cache_init(cache);
+}
+
+static size_t destination_profile_parent_length(const char *relative)
+{
+    const char *slash = strrchr(relative, '/');
+    return slash == NULL ? 0U : (size_t)(slash - relative);
+}
+
+static int destination_profile_cache_matches(
+    const DestinationProfileAnchorCache *cache, int root_fd,
+    const char *relative)
+{
+    if (cache == NULL || cache->fd < 0 || cache->root_fd != root_fd ||
+        cache->prefix[0] == '\0')
+        return 0;
+
+    size_t prefix_length = strlen(cache->prefix);
+    size_t parent_length = destination_profile_parent_length(relative);
+    if (prefix_length > parent_length ||
+        memcmp(cache->prefix, relative, prefix_length) != 0)
+        return 0;
+    return prefix_length == parent_length || relative[prefix_length] == '/';
+}
+
+static void destination_profile_cache_store(
+    DestinationProfileAnchorCache *cache, int root_fd, const char *relative,
+    size_t prefix_length, int directory_fd)
+{
+    if (cache == NULL || directory_fd < 0 || relative == NULL ||
+        prefix_length >= PATH_MAX)
+        return;
+
+    int saved = errno;
+    if (prefix_length == 0)
+    {
+        destination_profile_cache_invalidate(cache);
+        errno = saved;
+        return;
+    }
+
+    if (cache->fd >= 0 && cache->root_fd == root_fd &&
+        strlen(cache->prefix) == prefix_length &&
+        memcmp(cache->prefix, relative, prefix_length) == 0)
+    {
+        errno = saved;
+        return;
+    }
+
+    int cached_fd = dup_cloexec(directory_fd);
+    if (cached_fd < 0)
+    {
+        destination_profile_cache_invalidate(cache);
+        errno = saved;
+        return;
+    }
+    if (cache->fd >= 0)
+        (void)close(cache->fd);
+    cache->fd = cached_fd;
+    cache->root_fd = root_fd;
+    memcpy(cache->prefix, relative, prefix_length);
+    cache->prefix[prefix_length] = '\0';
+    errno = saved;
+}
+
+static void destination_profile_note_root_walk(void)
+{
+#ifdef PORTABLE_RESTORE_PREFLIGHT_TEST_HOOKS
+    if (portable_restore_preflight_test_profile_root_walk_counter != SIZE_MAX)
+        portable_restore_preflight_test_profile_root_walk_counter++;
+#endif
+}
+
 static int open_destination_profile_anchor(int home_fd, const char *relative,
+                                           DestinationProfileAnchorCache *cache,
                                            int *anchor_out,
                                            struct stat *existing,
                                            int *has_existing)
 {
     if (home_fd < 0 || relative == NULL || anchor_out == NULL ||
-        existing == NULL || has_existing == NULL ||
+        existing == NULL || has_existing == NULL || cache == NULL ||
         !relative_path_valid(relative, 1))
     {
         errno = EINVAL;
@@ -472,7 +581,32 @@ static int open_destination_profile_anchor(int home_fd, const char *relative,
     }
     *anchor_out = -1;
     *has_existing = 0;
-    int current = dup_cloexec(home_fd);
+
+    if (cache->fd >= 0 && cache->root_fd != home_fd)
+        destination_profile_cache_invalidate(cache);
+
+    int current = -1;
+    size_t current_prefix_length = 0;
+    size_t cursor_offset = 0;
+    if (destination_profile_cache_matches(cache, home_fd, relative))
+    {
+        current = dup_cloexec(cache->fd);
+        if (current >= 0)
+        {
+            current_prefix_length = strlen(cache->prefix);
+            cursor_offset = current_prefix_length + 1U;
+        }
+        else
+            destination_profile_cache_invalidate(cache);
+    }
+    else if (cache->fd >= 0)
+        destination_profile_cache_invalidate(cache);
+
+    if (current < 0)
+    {
+        destination_profile_note_root_walk();
+        current = dup_cloexec(home_fd);
+    }
     if (current < 0)
         return -1;
     if (relative[0] == '\0')
@@ -491,10 +625,13 @@ static int open_destination_profile_anchor(int home_fd, const char *relative,
 
     char copy[PATH_MAX];
     memcpy(copy, relative, strlen(relative) + 1U);
-    char *cursor = copy;
+    char *cursor = copy + cursor_offset;
     for (;;)
     {
         char *slash = strchr(cursor, '/');
+        size_t component_end = slash == NULL
+            ? strlen(relative)
+            : (size_t)(slash - copy);
         if (slash != NULL)
             *slash = '\0';
         if (slash == NULL)
@@ -531,6 +668,8 @@ static int open_destination_profile_anchor(int home_fd, const char *relative,
                         errno = saved;
                         return -1;
                     }
+                    destination_profile_cache_store(
+                        cache, home_fd, relative, strlen(relative), final_fd);
                     *anchor_out = final_fd;
                     return 0;
                 }
@@ -542,6 +681,8 @@ static int open_destination_profile_anchor(int home_fd, const char *relative,
                 errno = saved;
                 return -1;
             }
+            destination_profile_cache_store(
+                cache, home_fd, relative, current_prefix_length, current);
             *anchor_out = current;
             return 0;
         }
@@ -553,6 +694,8 @@ static int open_destination_profile_anchor(int home_fd, const char *relative,
         {
             if (errno == ENOENT)
             {
+                destination_profile_cache_store(
+                    cache, home_fd, relative, current_prefix_length, current);
                 *anchor_out = current;
                 return 0;
             }
@@ -569,6 +712,7 @@ static int open_destination_profile_anchor(int home_fd, const char *relative,
             return -1;
         }
         current = next;
+        current_prefix_length = component_end;
         cursor = slash + 1U;
     }
 }
@@ -577,19 +721,42 @@ static int collection_destination_route(Collection *collection,
                                         size_t root_index,
                                         const char *logical,
                                         int *anchor_out,
+                                        DestinationProfileAnchorCache **cache_out,
                                         char *relative,
                                         size_t relative_size)
 {
-    if (collection == NULL)
+    if (collection == NULL || cache_out == NULL)
     {
         errno = EINVAL;
         return -1;
     }
-    return destination_identity_route(
+    *cache_out = NULL;
+    if (destination_identity_route(
         collection->manifest, root_index, logical,
         collection->destination_home_fd, collection->destination_xdg_dirs,
         collection->xdg_anchor_fd, collection->xdg_anchor_prefix, anchor_out,
-        relative, relative_size);
+        relative, relative_size) != 0)
+        return -1;
+
+    const ManifestRoot *root = &collection->manifest->roots[root_index];
+    if (root->policy == ROOT_POLICY_HOME_RELATIVE)
+        *cache_out = &collection->home_profile_cache;
+    else if (root->policy == ROOT_POLICY_XDG)
+    {
+        int index = xdg_key_index(root->id);
+        if (index < 0 || index >= XDG_KEY_COUNT)
+        {
+            errno = EINVAL;
+            return -1;
+        }
+        *cache_out = &collection->xdg_profile_cache[index];
+    }
+    else
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    return 0;
 }
 
 /* Returns 0 on success, -1 for a per-entry violation (already recorded via
@@ -621,9 +788,10 @@ static int collect_metadata_profile(Collection *collection,
     desired.st_mode = entry->mode | type;
 
     int route_anchor = -1;
+    DestinationProfileAnchorCache *profile_cache = NULL;
     char relative[PATH_MAX];
     if (collection_destination_route(collection, root_index, entry->logical,
-                                     &route_anchor, relative,
+                                     &route_anchor, &profile_cache, relative,
                                      sizeof(relative)) != 0)
     {
         report_violation(collection->report, root_index, entry->logical);
@@ -634,7 +802,8 @@ static int collect_metadata_profile(Collection *collection,
     struct stat existing;
     memset(&existing, 0, sizeof(existing));
     int has_existing = 0;
-    if (open_destination_profile_anchor(route_anchor, relative, &anchor,
+    if (open_destination_profile_anchor(route_anchor, relative, profile_cache,
+                                        &anchor,
                                         &existing, &has_existing) != 0)
     {
         report_violation(collection->report, root_index, entry->logical);
@@ -672,12 +841,64 @@ static void portable_restore_estimate_add(
     report->estimated_bytes += (off_t)bytes;
 }
 
-static int collect_entry_finish(Collection *collection, int result)
+static int metadata_profile_order_compare(const void *left, const void *right)
 {
-    if (collection != NULL && collection->report != NULL)
-        preflight_progress_note(collection->progress,
-                                collection->report->live_count, "entries", 0);
-    return result;
+    const PreflightEntry *first = *(PreflightEntry * const *)left;
+    const PreflightEntry *second = *(PreflightEntry * const *)right;
+    if (first->root_index < second->root_index)
+        return -1;
+    if (first->root_index > second->root_index)
+        return 1;
+    return strcmp(first->logical, second->logical);
+}
+
+static int collect_metadata_profiles(Collection *collection)
+{
+    if (collection == NULL || collection->entries == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    size_t count = collection->entries->count;
+    if (count == 0)
+        return 0;
+    if (count > SIZE_MAX / sizeof(PreflightEntry *))
+    {
+        errno = E2BIG;
+        return -1;
+    }
+
+    size_t order_size = count * sizeof(PreflightEntry *);
+    PreflightEntry **order = preflight_alloc(&collection->memory, order_size);
+    if (order == NULL)
+        return -1;
+    for (size_t index = 0; index < count; index++)
+        order[index] = &collection->entries->items[index];
+
+    /* Sidecar live-state iteration is hash-table order.  Profile collection
+     * uses a sorted view so one pinned ancestor per destination root can serve
+     * consecutive siblings without changing the retained entry order. */
+    qsort(order, count, sizeof(*order), metadata_profile_order_compare);
+
+    for (size_t index = 0; index < count; index++)
+    {
+        PreflightEntry *entry = order[index];
+        int result = collect_metadata_profile(
+            collection, &collection->manifest->roots[entry->root_index],
+            entry->root_index, entry);
+        preflight_progress_note(collection->progress, index + 1U, "entries", 0);
+        if (result < -1)
+        {
+            int saved = errno;
+            preflight_free(&collection->memory, order, order_size);
+            errno = saved;
+            return -1;
+        }
+    }
+
+    preflight_free(&collection->memory, order, order_size);
+    return 0;
 }
 
 static int collect_entry(const SidecarLiveView *view, void *argument)
@@ -695,7 +916,7 @@ static int collect_entry(const SidecarLiveView *view, void *argument)
     if (root_index == SIZE_MAX)
     {
         report_violation(report, SIZE_MAX, "external-root");
-        return collect_entry_finish(collection, 0);
+        return 0;
     }
     if (report->roots[root_index].live_count != SIZE_MAX)
         report->roots[root_index].live_count++;
@@ -705,8 +926,8 @@ static int collect_entry(const SidecarLiveView *view, void *argument)
     {
         report_violation(report, root_index, "invalid-path");
         if (logical_valid < 0)
-            return collect_entry_finish(collection, 1);
-        return collect_entry_finish(collection, 0);
+            return 1;
+        return 0;
     }
     size_t address_index = SIZE_MAX;
     int address_valid = restore_address_index_entry_valid(
@@ -714,13 +935,13 @@ static int collect_entry(const SidecarLiveView *view, void *argument)
     if (address_valid != 1)
     {
         report_violation(report, root_index, "physical-mismatch");
-        return collect_entry_finish(collection, address_valid < 0 ? 1 : 0);
+        return address_valid < 0 ? 1 : 0;
     }
     char logical[PATH_MAX];
     if (entry->logical_path.length >= sizeof(logical))
     {
         report_violation(report, root_index, "invalid-path");
-        return collect_entry_finish(collection, 0);
+        return 0;
     }
     if (entry->logical_path.length != 0)
         memcpy(logical, entry->logical_path.data, entry->logical_path.length);
@@ -729,7 +950,7 @@ static int collect_entry(const SidecarLiveView *view, void *argument)
                              logical) != 1)
     {
         report_violation(report, root_index, logical);
-        return collect_entry_finish(collection, 0);
+        return 0;
     }
     if (entry->kind != SIDECAR_KIND_REGULAR &&
         entry->kind != SIDECAR_KIND_DIRECTORY &&
@@ -737,13 +958,13 @@ static int collect_entry(const SidecarLiveView *view, void *argument)
         entry->kind != SIDECAR_KIND_HARDLINK)
     {
         report_violation(report, root_index, "unsupported-kind");
-        return collect_entry_finish(collection, 0);
+        return 0;
     }
     if (entry->kind != SIDECAR_KIND_REGULAR &&
         entry->kind != SIDECAR_KIND_DIRECTORY && entry->size != 0)
     {
         report_violation(report, root_index, "invalid-size");
-        return collect_entry_finish(collection, 0);
+        return 0;
     }
     if (entry->kind == SIDECAR_KIND_REGULAR ||
         entry->kind == SIDECAR_KIND_DIRECTORY)
@@ -753,9 +974,9 @@ static int collect_entry(const SidecarLiveView *view, void *argument)
 
     PreflightEntries *entries = collection->entries;
     if (entries == NULL)
-        return collect_entry_finish(collection, 1);
+        return 1;
     if (entries_reserve(&collection->memory, entries, 1) != 0)
-        return collect_entry_finish(collection, 1);
+        return 1;
     PreflightEntry *destination = &entries->items[entries->count];
     memset(destination, 0, sizeof(*destination));
     if (copy_sidecar_path(&collection->memory, entry->logical_path,
@@ -765,7 +986,7 @@ static int collect_entry(const SidecarLiveView *view, void *argument)
                        destination->logical == NULL ? 0
                            : strlen(destination->logical) + 1U);
         destination->logical = NULL;
-        return collect_entry_finish(collection, 1);
+        return 1;
     }
     destination->root_index = root_index;
     destination->address_index = address_index;
@@ -788,12 +1009,7 @@ static int collect_entry(const SidecarLiveView *view, void *argument)
         }
     if (carries_security_xattr)
         metadata_profiles_note_security_xattr(&report->profiles);
-
-    if (collect_metadata_profile(collection,
-                                 &collection->manifest->roots[root_index],
-                                 root_index, destination) < -1)
-        return collect_entry_finish(collection, 1);
-    return collect_entry_finish(collection, 0);
+    return 0;
 }
 
 static void collection_identity_entry(void *context, size_t index,
@@ -1244,12 +1460,17 @@ static void collection_free(Collection *collection, PreflightEntries *entries)
 {
     if (collection == NULL)
         return;
+    destination_profile_cache_invalidate(&collection->home_profile_cache);
     for (int index = 0; index < XDG_KEY_COUNT; index++)
+    {
+        destination_profile_cache_invalidate(
+            &collection->xdg_profile_cache[index]);
         if (collection->xdg_anchor_fd[index] >= 0)
         {
             (void)close(collection->xdg_anchor_fd[index]);
             collection->xdg_anchor_fd[index] = -1;
         }
+    }
     entries_free(&collection->memory, entries);
     preflight_free(&collection->memory, collection->root_order,
                    collection->report == NULL ? 0
@@ -1310,8 +1531,12 @@ int portable_restore_preflight_at(
         .destination_xdg_dirs = request->destination_xdg_dirs,
         .progress = &progress
     };
+    destination_profile_cache_init(&collection.home_profile_cache);
     for (int index = 0; index < XDG_KEY_COUNT; index++)
+    {
         collection.xdg_anchor_fd[index] = -1;
+        destination_profile_cache_init(&collection.xdg_profile_cache[index]);
+    }
     if (collection_validate_manifest(&collection) != 0)
         goto fail;
 
@@ -1361,6 +1586,12 @@ int portable_restore_preflight_at(
     SidecarStatus status = sidecar_log_foreach(&sidecar, collect_entry,
                                                &collection);
     if (status != SIDECAR_STATUS_OK)
+    {
+        sidecar_log_close(&sidecar);
+        close(data_fd);
+        goto fail;
+    }
+    if (collect_metadata_profiles(&collection) != 0)
     {
         sidecar_log_close(&sidecar);
         close(data_fd);

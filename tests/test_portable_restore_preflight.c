@@ -554,6 +554,112 @@ static void test_valid_and_profiles(void)
     fixture_close(&fixture);
 }
 
+static void test_destination_profile_ancestor_cache(void)
+{
+    printf(BLUE "::" NC " destination profile walks reuse resolved ancestors\n");
+    ManifestRoot root = root_for("ROOT", "ROOT", "restored");
+    Fixture fixture;
+    int opened = fixture_open(&fixture, "profile-cache", &root, 1);
+    check(opened == 0, "profile-cache fixture is created");
+    if (opened != 0)
+        return;
+
+    make_root_payload(&fixture);
+    if (mkdirat(fixture.data_fd, "ROOT/deep", 0700) != 0 ||
+        mkdirat(fixture.data_fd, "ROOT/deep/a", 0700) != 0 ||
+        mkdirat(fixture.data_fd, "ROOT/deep/a/share", 0700) != 0 ||
+        mkdirat(fixture.data_fd, "ROOT/deep/a/share2", 0700) != 0)
+        fatal("could not create profile-cache payload directories");
+    write_file_at(fixture.data_fd, "ROOT/deep/a/share/alpha", "x");
+    write_file_at(fixture.data_fd, "ROOT/deep/a/share/beta", "x");
+    write_file_at(fixture.data_fd, "ROOT/deep/a/share/missing", "x");
+    write_file_at(fixture.data_fd, "ROOT/deep/a/share2/gamma", "x");
+
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0),
+        entry_for("ROOT", "deep", "deep", SIDECAR_KIND_DIRECTORY, 0),
+        entry_for("ROOT", "deep/a", "deep/a", SIDECAR_KIND_DIRECTORY, 0),
+        entry_for("ROOT", "deep/a/share", "deep/a/share",
+                  SIDECAR_KIND_DIRECTORY, 0),
+        entry_for("ROOT", "deep/a/share/alpha", "deep/a/share/alpha",
+                  SIDECAR_KIND_REGULAR, 1),
+        entry_for("ROOT", "deep/a/share/beta", "deep/a/share/beta",
+                  SIDECAR_KIND_REGULAR, 1),
+        entry_for("ROOT", "deep/a/share/missing", "deep/a/share/missing",
+                  SIDECAR_KIND_REGULAR, 1),
+        entry_for("ROOT", "deep/a/share2", "deep/a/share2",
+                  SIDECAR_KIND_DIRECTORY, 0),
+        entry_for("ROOT", "deep/a/share2/gamma", "deep/a/share2/gamma",
+                  SIDECAR_KIND_REGULAR, 1)
+    };
+    check(write_sidecar(&fixture, entries,
+                        sizeof(entries) / sizeof(entries[0])) == 0,
+          "profile-cache sidecar is committed");
+
+    char restored[PATH_MAX], deep[PATH_MAX], branch[PATH_MAX];
+    char share[PATH_MAX], share2[PATH_MAX];
+    fixture_path(restored, sizeof(restored), fixture.home, "/restored");
+    fixture_path(deep, sizeof(deep), restored, "/deep");
+    fixture_path(branch, sizeof(branch), deep, "/a");
+    fixture_path(share, sizeof(share), branch, "/share");
+    fixture_path(share2, sizeof(share2), branch, "/share2");
+    make_dir(restored);
+    make_dir(deep);
+    make_dir(branch);
+    make_dir(share);
+    make_dir(share2);
+    write_file_at(fixture.home_fd, "restored/deep/a/share/alpha", "old");
+    write_file_at(fixture.home_fd, "restored/deep/a/share/beta", "old");
+    write_file_at(fixture.home_fd, "restored/deep/a/share2/gamma", "old");
+
+    struct stat share_st, share2_st;
+    if (stat(share, &share_st) != 0 || stat(share2, &share2_st) != 0)
+        fatal("could not inspect profile-cache destination directories");
+
+    portable_restore_preflight_test_reset_profile_root_walk_count();
+    PortableRestorePreflightReport report;
+    int result = run_preflight(&fixture, &report);
+    size_t root_walks =
+        portable_restore_preflight_test_profile_root_walk_count();
+
+    int saw_existing_share = 0;
+    int saw_missing_share = 0;
+    int saw_existing_share2 = 0;
+    for (size_t index = 0; index < report.profiles.count; index++)
+    {
+        const MetadataProfile *profile = &report.profiles.items[index];
+        if (profile->desired_mode != 04755U)
+            continue;
+        if (profile->anchor_device == share_st.st_dev &&
+            profile->anchor_inode == share_st.st_ino)
+        {
+            if (profile->has_initial_owner &&
+                profile->initial_uid == geteuid() &&
+                profile->initial_gid == getegid())
+                saw_existing_share = 1;
+            if (!profile->has_initial_owner)
+                saw_missing_share = 1;
+        }
+        if (profile->anchor_device == share2_st.st_dev &&
+            profile->anchor_inode == share2_st.st_ino &&
+            profile->has_initial_owner &&
+            profile->initial_uid == geteuid() &&
+            profile->initial_gid == getegid())
+            saw_existing_share2 = 1;
+    }
+
+    check(result == 0 && report.live_count ==
+              sizeof(entries) / sizeof(entries[0]),
+          "deep sibling profile fixture passes preflight");
+    check(saw_existing_share && saw_missing_share && saw_existing_share2,
+          "cached walks preserve existing and missing destination profile state");
+    check(root_walks == 2,
+          "deep sibling groups need only two profile walks from the HOME anchor");
+
+    portable_restore_preflight_report_free(&report);
+    fixture_close(&fixture);
+}
+
 static void test_payload_inventory_progress(void)
 {
     printf(BLUE "::" NC " payload inventory reports live verification progress\n");
@@ -1927,6 +2033,7 @@ static void test_resolved_destination_identity_collisions(void)
 int main(void)
 {
     test_valid_and_profiles();
+    test_destination_profile_ancestor_cache();
     test_payload_inventory_progress();
     test_outstanding_claim_gate();
     test_missing_payload();

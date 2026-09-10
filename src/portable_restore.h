@@ -72,6 +72,8 @@ int portable_restore_preflight_at(
 
 #ifdef PORTABLE_RESTORE_PREFLIGHT_TEST_HOOKS
 void portable_restore_preflight_test_set_progress_enabled(int enabled);
+void portable_restore_preflight_test_reset_profile_root_walk_count(void);
+size_t portable_restore_preflight_test_profile_root_walk_count(void);
 #endif
 
 void portable_restore_replay_report_init(PortableRestoreReplayReport *report);
