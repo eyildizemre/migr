@@ -38,7 +38,7 @@ outgrows solo maintenance.
 
 ## D2 — 2026-06-27 — Batch package install first, per-package fallback on failure
 
-**Status:** Superseded in part by D40
+**Status:** Superseded in part by D46
 
 **Decision:** Build one `argv[]` containing every package and run a single install
 command. Only if that exits non-zero, fall back to installing one package at a time,
@@ -3570,7 +3570,7 @@ versions 1, 2, and 3 respectively.
 
 ## D40 — 2026-09-10 — Failed package batches are isolated with adaptive sub-batches
 
-**Status:** Implemented
+**Status:** Superseded by D46
 
 **Decision:** Package restore still starts with one install transaction containing
 the complete package list. If that transaction fails, migr retries the remaining
@@ -3807,3 +3807,51 @@ revert is based on measured performance, not a concurrency correctness failure.
 can exploit concurrent metadata I/O; guessing from device class such as SSD,
 rotational, removable, or virtualized; retaining an unused worker-pool race gate;
 and keeping the parallel path as an unmeasured optional branch.
+
+---
+
+## D46 — 2026-09-11 — Package restore uses one install transaction and verifies final state
+
+**Status:** Implemented
+
+**Decision:** Package restore performs at most one real install transaction per
+restore. Debian/Ubuntu keeps `apt-get install -y -m`. Fedora/RHEL adds
+`--skip-unavailable` to its single dnf transaction. Arch has no equivalent
+skip-unavailable transaction option, so migr first reads the local sync-database
+package names with `pacman -Slq`, omits requested names that are unavailable there,
+and passes the remaining set to one `pacman -S --needed --noconfirm` transaction.
+
+The install command's exit status is not used to decide which requested packages
+succeeded. After the transaction, migr reads installed package state once and
+compares the original requested list against that state: `dpkg-query` with
+installed-status filtering on Debian, `rpm -qa` names on Fedora, and `pacman -Qq`
+on Arch. Every requested name present in final state counts as installed; every
+requested name absent from final state is written to `skipped-packages.txt` per
+D1. A package already installed on Arch therefore still counts as restored even if
+it is no longer present in the current sync databases and was omitted from the
+install transaction. A failed state query is an error because migr can no longer
+produce trustworthy package accounting.
+
+Successful accounting is authoritative for the skip-log artifact as well as the
+summary. When no requested package is skipped, a stale `skipped-packages.txt` from
+an earlier restore is removed instead of being left to describe the new restore
+incorrectly.
+
+**Why:** D40's adaptive halving preserves exact skip accounting, but several
+unavailable packages scattered through a realistic list cause repeated package
+manager transactions, repeated dependency solving, and pages of duplicate failure
+output. The package managers already have enough native behavior to avoid that
+retry loop: apt and dnf can tolerate unavailable targets directly, while pacman's
+sync database can cheaply identify names that would make its all-or-nothing target
+resolution fail. Verifying final installed state separates accounting from package
+manager diagnostics and also handles already-installed packages and partial
+transaction outcomes without parsing human-readable output.
+
+**Rejected:** retaining adaptive or per-package retries as a fallback; scraping
+package-manager output to infer per-package success; suppressing repeated output
+instead of eliminating repeated transactions; and issuing one installed-state
+query process per requested package.
+
+**Relationship:** Supersedes D40 and the per-package fallback portion of D2. D1's
+exact skipped-package artifact and summary, D12's explicit-package export, and the
+distro-specific install commands remain in force.

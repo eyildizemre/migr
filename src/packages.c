@@ -16,15 +16,18 @@
 static int packages_test_restore_override;
 static distro_t packages_test_restore_distro;
 static PackagesTestRunHook packages_test_run_hook;
+static PackagesTestCaptureHook packages_test_capture_hook;
 static void *packages_test_run_context;
 
 void packages_test_set_restore_hooks(distro_t distro,
                                      PackagesTestRunHook run_hook,
+                                     PackagesTestCaptureHook capture_hook,
                                      void *context)
 {
     packages_test_restore_override = 1;
     packages_test_restore_distro = distro;
     packages_test_run_hook = run_hook;
+    packages_test_capture_hook = capture_hook;
     packages_test_run_context = context;
 }
 
@@ -33,6 +36,7 @@ void packages_test_clear_restore_hooks(void)
     packages_test_restore_override = 0;
     packages_test_restore_distro = DISTRO_UNKNOWN;
     packages_test_run_hook = NULL;
+    packages_test_capture_hook = NULL;
     packages_test_run_context = NULL;
 }
 #endif
@@ -264,7 +268,10 @@ void read_package_list(FILE *pkg_file, char ***pkgs_out, int *pkg_count_out,
     *pkg_count_out = pkg_count;
 }
 
-enum { PACKAGE_INSTALL_PREFIX_MAX = 5 };
+enum {
+    PACKAGE_INSTALL_PREFIX_MAX = 5,
+    PACKAGE_QUERY_BUFFER_SIZE = 5 * 1024 * 1024
+};
 
 static size_t package_install_prefix(distro_t distro,
                                      char *prefix[PACKAGE_INSTALL_PREFIX_MAX])
@@ -283,7 +290,8 @@ static size_t package_install_prefix(distro_t distro,
             prefix[1] = "dnf";
             prefix[2] = "install";
             prefix[3] = "-y";
-            return 4U;
+            prefix[4] = "--skip-unavailable";
+            return 5U;
         case DISTRO_ARCH:
             prefix[0] = "sudo";
             prefix[1] = "pacman";
@@ -314,16 +322,138 @@ static int package_run_command(char *const argv[])
     return run_command(argv);
 }
 
-static int package_run_batch(char **argv, char *const *prefix,
-                             size_t prefix_count, char **pkgs,
-                             size_t first, size_t count)
+static int package_capture_command(char *const argv[], char *output,
+                                   size_t output_size)
 {
-    for (size_t i = 0; i < prefix_count; i++)
-        argv[i] = prefix[i];
-    for (size_t i = 0; i < count; i++)
-        argv[prefix_count + i] = pkgs[first + i];
-    argv[prefix_count + count] = NULL;
-    return package_run_command(argv);
+#ifdef PACKAGES_TEST_HOOKS
+    if (packages_test_restore_override)
+    {
+        if (packages_test_capture_hook == NULL)
+            return -1;
+        return packages_test_capture_hook(argv, output, output_size,
+                                          packages_test_run_context);
+    }
+#endif
+    return run_command_capture(argv, output, output_size);
+}
+
+static char *const *package_installed_query(distro_t distro)
+{
+    static char *const debian_query[] = {
+        "dpkg-query", "-W",
+        "-f=${Package}\\t${binary:Package}\\t${db:Status-Status}\\n", NULL
+    };
+    static char *const fedora_query[] = {
+        "rpm", "-qa", "--qf", "%{NAME}\\n", NULL
+    };
+    static char *const arch_query[] = {"pacman", "-Qq", NULL};
+
+    switch (distro)
+    {
+        case DISTRO_DEBIAN: return debian_query;
+        case DISTRO_FEDORA: return fedora_query;
+        case DISTRO_ARCH: return arch_query;
+        default: return NULL;
+    }
+}
+
+static char *capture_package_query(char *const argv[], const char *label,
+                                   int *had_error)
+{
+    char *output = malloc(PACKAGE_QUERY_BUFFER_SIZE);
+    if (output == NULL)
+    {
+        print_error("Error: Could not allocate package query buffer\n");
+        *had_error = 1;
+        return NULL;
+    }
+
+    output[0] = '\0';
+    int result = package_capture_command(argv, output,
+                                         PACKAGE_QUERY_BUFFER_SIZE);
+    size_t length = strnlen(output, PACKAGE_QUERY_BUFFER_SIZE);
+    if (result != 0 || length >= PACKAGE_QUERY_BUFFER_SIZE - 1U)
+    {
+        print_error("Error: Could not query %s\n", label);
+        *had_error = 1;
+        free(output);
+        return NULL;
+    }
+    return output;
+}
+
+static int package_plain_list_contains(const char *list, const char *package)
+{
+    if (list == NULL || package == NULL)
+        return 0;
+
+    size_t package_length = strlen(package);
+    const char *line = list;
+    while (*line != '\0')
+    {
+        const char *newline = strchr(line, '\n');
+        size_t length = newline != NULL ? (size_t)(newline - line) : strlen(line);
+        if (length != 0 && line[length - 1U] == '\r')
+            length--;
+        if (length == package_length &&
+            memcmp(line, package, package_length) == 0)
+            return 1;
+        if (newline == NULL)
+            break;
+        line = newline + 1;
+    }
+    return 0;
+}
+
+static int package_inventory_contains(distro_t distro, const char *inventory,
+                                      const char *package)
+{
+    if (distro != DISTRO_DEBIAN)
+        return package_plain_list_contains(inventory, package);
+    if (inventory == NULL || package == NULL)
+        return 0;
+
+    size_t package_length = strlen(package);
+    const char *line = inventory;
+    while (*line != '\0')
+    {
+        const char *newline = strchr(line, '\n');
+        size_t length = newline != NULL ? (size_t)(newline - line) : strlen(line);
+        if (length != 0 && line[length - 1U] == '\r')
+            length--;
+        const char *first_tab = memchr(line, '\t', length);
+        if (first_tab != NULL)
+        {
+            size_t bare_length = (size_t)(first_tab - line);
+            const char *binary_name = first_tab + 1;
+            size_t after_first = length - bare_length - 1U;
+            const char *second_tab = memchr(binary_name, '\t', after_first);
+            if (second_tab != NULL)
+            {
+                size_t binary_length = (size_t)(second_tab - binary_name);
+                const char *status = second_tab + 1;
+                size_t status_length = after_first - binary_length - 1U;
+                int name_matches =
+                    (bare_length == package_length &&
+                     memcmp(line, package, package_length) == 0) ||
+                    (binary_length == package_length &&
+                     memcmp(binary_name, package, package_length) == 0);
+                if (name_matches && status_length == strlen("installed") &&
+                    memcmp(status, "installed", status_length) == 0)
+                    return 1;
+            }
+        }
+        if (newline == NULL)
+            break;
+        line = newline + 1;
+    }
+    return 0;
+}
+
+static char *package_arch_available(int *had_error)
+{
+    char *const query[] = {"pacman", "-Slq", NULL};
+    return capture_package_query(query, "Arch package availability", had_error);
 }
 
 typedef struct {
@@ -395,54 +525,71 @@ static void package_skip_log_close(PackageSkipLog *log, int *had_error)
     log->stream = NULL;
 }
 
-static void package_install_adaptive(char **argv, char *const *prefix,
-                                     size_t prefix_count, char **pkgs,
-                                     size_t pkg_count, const char *home,
-                                     int *installed, int *skipped,
-                                     int *had_error)
+static void package_skip_log_clear_if_empty(PackageSkipLog *log, int skipped,
+                                            int *had_error)
 {
-    size_t first = 0;
-    size_t window = pkg_count;
+    if (skipped != 0 || !log->path_valid)
+        return;
+
+    if (unlink(log->path) != 0 && errno != ENOENT)
+    {
+        print_error("Error: Could not clear skipped package log\n");
+        *had_error = 1;
+    }
+}
+
+static size_t package_build_install_argv(char **argv, char *const *prefix,
+                                         size_t prefix_count, char **pkgs,
+                                         size_t pkg_count,
+                                         const char *arch_available)
+{
+    for (size_t index = 0; index < prefix_count; index++)
+        argv[index] = prefix[index];
+
+    size_t install_count = 0;
+    for (size_t index = 0; index < pkg_count; index++)
+    {
+        if (arch_available != NULL &&
+            !package_plain_list_contains(arch_available, pkgs[index]))
+            continue;
+        argv[prefix_count + install_count] = pkgs[index];
+        install_count++;
+    }
+    argv[prefix_count + install_count] = NULL;
+    return install_count;
+}
+
+static int package_account_final_state(distro_t distro, char **pkgs,
+                                       size_t pkg_count, const char *home,
+                                       int *installed, int *skipped,
+                                       int *had_error)
+{
+    char *const *query = package_installed_query(distro);
+    if (query == NULL)
+        return -1;
+
+    char *inventory = capture_package_query(query, "installed packages",
+                                            had_error);
+    if (inventory == NULL)
+        return -1;
+
     PackageSkipLog skip_log;
     package_skip_log_init(&skip_log, home);
-
-    while (first < pkg_count)
+    for (size_t index = 0; index < pkg_count; index++)
     {
-        size_t remaining = pkg_count - first;
-        size_t count = window < remaining ? window : remaining;
-        if (package_run_batch(argv, prefix, prefix_count, pkgs, first, count) == 0)
+        if (package_inventory_contains(distro, inventory, pkgs[index]))
+            (*installed)++;
+        else
         {
-            *installed += (int)count;
-            first += count;
-            if (first == pkg_count)
-                break;
-
-            remaining = pkg_count - first;
-            if (count > SIZE_MAX / 2U)
-                window = remaining;
-            else
-            {
-                size_t grown = count * 2U;
-                window = grown < remaining ? grown : remaining;
-            }
-            continue;
+            package_skip_log_record(&skip_log, pkgs[index], had_error);
+            (*skipped)++;
         }
-
-        if (count > 1U)
-        {
-            window = count / 2U;
-            if (window == 0U)
-                window = 1U;
-            continue;
-        }
-
-        package_skip_log_record(&skip_log, pkgs[first], had_error);
-        (*skipped)++;
-        first++;
-        window = 1U;
     }
 
     package_skip_log_close(&skip_log, had_error);
+    package_skip_log_clear_if_empty(&skip_log, *skipped, had_error);
+    free(inventory);
+    return 0;
 }
 
 // Reads and processes packages.txt from the container root (never inside
@@ -518,6 +665,7 @@ void restore_packages(int source_root_fd, const char *home, int *had_error)
     size_t prefix = package_install_prefix(distro, batch_prefix);
 
     int installed = 0, skipped = 0;
+    int accounting_complete = pkg_count == 0;
 
     if (pkgs != NULL && pkg_count > 0 && prefix > 0)
     {
@@ -527,15 +675,29 @@ void restore_packages(int source_root_fd, const char *home, int *had_error)
             ? malloc(argv_count * sizeof(*batch_argv)) : NULL;
         if (batch_argv != NULL)
         {
-            // Keep successful installs batched. If a batch fails, shrink the
-            // current range until the bad target is isolated, then grow the
-            // batch again. This preserves exact skipped-package accounting
-            // without turning one unavailable package into hundreds of package
-            // manager transactions. See docs/DECISIONS.md D40.
-            package_install_adaptive(batch_argv, batch_prefix, prefix, pkgs,
-                                     pkg_count_size, home, &installed, &skipped,
-                                     had_error);
+            char *arch_available = NULL;
+            int may_install = 1;
+            if (distro == DISTRO_ARCH)
+            {
+                arch_available = package_arch_available(had_error);
+                if (arch_available == NULL)
+                    may_install = 0;
+            }
+
+            if (may_install)
+            {
+                size_t install_count = package_build_install_argv(
+                    batch_argv, batch_prefix, prefix, pkgs, pkg_count_size,
+                    arch_available);
+                if (install_count != 0)
+                    (void)package_run_command(batch_argv);
+            }
+            free(arch_available);
             free(batch_argv);
+
+            accounting_complete = package_account_final_state(
+                distro, pkgs, pkg_count_size, home, &installed, &skipped,
+                had_error) == 0;
         }
         else
         {
@@ -551,5 +713,6 @@ void restore_packages(int source_root_fd, const char *home, int *had_error)
         free(pkgs);
     }
 
-    printf("  %d installed, %d skipped.\n", installed, skipped);
+    if (accounting_complete)
+        printf("  %d installed, %d skipped.\n", installed, skipped);
 }

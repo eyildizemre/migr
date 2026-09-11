@@ -7,9 +7,12 @@
 #include "detect.h"
 
 typedef int (*PackagesTestRunHook)(char *const argv[], void *context);
+typedef int (*PackagesTestCaptureHook)(char *const argv[], char *output,
+                                       size_t output_size, void *context);
 
 void packages_test_set_restore_hooks(distro_t distro,
                                      PackagesTestRunHook run_hook,
+                                     PackagesTestCaptureHook capture_hook,
                                      void *context);
 void packages_test_clear_restore_hooks(void);
 #endif

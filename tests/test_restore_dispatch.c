@@ -98,6 +98,18 @@ static int package_progress_probe(char *const argv[], void *context)
     probe->thread_count = proc_thread_count();
     return 0;
 }
+
+static int package_progress_capture(char *const argv[], char *output,
+                                    size_t output_size, void *context)
+{
+    (void)context;
+    const char *installed = "fixture-package\n";
+    if (argv == NULL || argv[0] == NULL || strcmp(argv[0], "rpm") != 0 ||
+        strlen(installed) >= output_size)
+        return -1;
+    memcpy(output, installed, strlen(installed) + 1U);
+    return 0;
+}
 #endif
 
 static void skip_case(const char *label, const char *reason)
@@ -1376,6 +1388,7 @@ static void test_live_restore_joins_progress_ticker(void)
 #ifdef PACKAGES_TEST_HOOKS
     PackageProgressProbe package_probe = {0};
     packages_test_set_restore_hooks(DISTRO_FEDORA, package_progress_probe,
+                                    package_progress_capture,
                                     &package_probe);
 #endif
     int rc = run_restore_forced_progress_in_process(
