@@ -3702,7 +3702,7 @@ by those optional restore steps.
 
 ## D43 — 2026-09-11 — Portable payload preflight overlaps regular-file metadata I/O
 
-**Status:** Implemented
+**Status:** Reverted — see D45
 
 **Decision:** Portable restore preflight may use a bounded worker pool while
 inventorying a sufficiently large payload. The workers perform only the
@@ -3774,3 +3774,36 @@ format/path-specific rule instead of a broad heuristic.
 desktop services and dynamically guessing which files might change; matching by a
 loose string prefix; suppressing the file from backup or restore; and adding a
 second user-facing verification flag for this case.
+
+---
+
+## D45 — 2026-09-11 — Keep portable payload preflight scanning serial
+
+**Status:** Implemented
+
+**Decision:** Revert D43's bounded worker pool and keep the portable restore
+payload-inventory walk serial. The preflight therefore issues its payload metadata
+operations in the same single-threaded traversal used before D43. The dedicated
+ThreadSanitizer gate added solely for the worker pool is removed with that
+mechanism.
+
+No runtime storage heuristic or adaptive worker-count policy is added. The serial
+path is the default across local, removable, virtualized, and passthrough media
+until a future design has measured evidence that concurrent metadata submission is
+reliably beneficial under a distinguishable set of conditions.
+
+**Why:** A controlled cold-cache measurement on the same VM snapshot and the same
+39.1 GiB, 221,605-item USB-backed portable backup measured 71.92 seconds before
+D43 and 116.07 seconds with D43 enabled. The worker pool was therefore about 61%
+slower on the exact removable-media scenario that motivated the optimization.
+
+The observed behavior is consistent with the lower storage layer serializing the
+actual I/O: concurrent userspace submissions then cannot hide device latency, while
+mutex, condition-variable, queueing, and thread-wakeup costs are still paid for
+every dispatched batch. The implementation was correct and race-checked; the
+revert is based on measured performance, not a concurrency correctness failure.
+
+**Rejected:** tuning worker count or batch size without evidence that the medium
+can exploit concurrent metadata I/O; guessing from device class such as SSD,
+rotational, removable, or virtualized; retaining an unused worker-pool race gate;
+and keeping the parallel path as an unmeasured optional branch.

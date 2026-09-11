@@ -7,7 +7,6 @@ unexport SUDO_UID
 
 CHECK_STRICT_FLAGS = $(CFLAGS) -Wpedantic -Werror
 CHECK_SANITIZE_FLAGS = $(CHECK_STRICT_FLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer
-CHECK_THREAD_FLAGS = $(CHECK_STRICT_FLAGS) -fsanitize=thread -fno-omit-frame-pointer
 ANALYZER_CC = gcc
 ANALYZER_FLAGS = $(CFLAGS) -Wpedantic -Werror -fanalyzer
 
@@ -437,31 +436,6 @@ check-sanitize:
 	UBSAN_OPTIONS=halt_on_error=1 \
 	$(MAKE) CFLAGS="$(CHECK_SANITIZE_FLAGS)" test
 
-# The payload preflight worker pool is migr's first concurrent filesystem work.
-# Keep its race detector separate from ASan/UBSan, which cannot be combined with
-# ThreadSanitizer. Skip only when Clang or its TSan runtime cannot be built or
-# started on the host.
-check-thread:
-	@set -e; \
-	if ! command -v clang >/dev/null 2>&1; then \
-		echo "check-thread: clang not found; skipped."; \
-		exit 0; \
-	fi; \
-	probe=$$(mktemp /tmp/migr-tsan-probe.XXXXXX); \
-	trap 'rm -f "$$probe"; $(MAKE) clean >/dev/null' EXIT; \
-	if ! printf '%s\n' 'int main(void) { return 0; }' | \
-		clang -pthread -fsanitize=thread -x c - -o "$$probe" >/dev/null 2>&1; then \
-		echo "check-thread: clang ThreadSanitizer runtime unavailable; skipped."; \
-		exit 0; \
-	fi; \
-	if ! TSAN_OPTIONS=halt_on_error=1 "$$probe" >/dev/null 2>&1; then \
-		echo "check-thread: clang ThreadSanitizer runtime cannot start; skipped."; \
-		exit 0; \
-	fi; \
-	$(MAKE) clean; \
-	$(MAKE) CC=clang CFLAGS="$(CHECK_THREAD_FLAGS)" $(TEST_PORTABLE_RESTORE_PREFLIGHT); \
-	TSAN_OPTIONS=halt_on_error=1 ./$(TEST_PORTABLE_RESTORE_PREFLIGHT)
-
 # The host Phase B Valgrind gate runs VALGRIND_TESTS with strict compilation.
 # Its deliberate exclusions are documented with the list above.
 check-valgrind:
@@ -489,11 +463,10 @@ check:
 	$(MAKE) test
 	$(MAKE) check-strict
 	$(MAKE) check-sanitize
-	$(MAKE) check-thread
 	$(MAKE) check-valgrind
 	$(MAKE) check-analyze
 
 clean:
 	rm -f ./*.o $(TARGET) $(STATIC_TARGET) $(TEST_NATIVE_SELECTION) $(TEST_MANIFEST_SELECTION) $(TEST_PORTABLE_SELECTION) $(TEST_SELECTION) $(TEST_CONFIG) $(TEST_DETECT) $(TEST_REPORT) $(TEST_PATHJOIN) $(TEST_FD_LIMIT) $(TEST_CONFIRM) $(TEST_PACKAGES) $(TEST_XDG) $(TEST_GET_DIR_SIZE) $(TEST_RUN_COMMAND) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE) $(TEST_MANIFEST) $(TEST_ENCODING) $(TEST_PORTABLE_NAME) $(TEST_CONTAINER) $(TEST_SELFCOPY) $(TEST_RESTORE_NATIVE) $(TEST_RESTORE_SYNC) $(TEST_RESTORE_SOURCE_READ) $(TEST_BACKUP_SOURCE_READ) $(TEST_BACKUP_SYNC) $(TEST_RESTORE_DISPATCH) $(TEST_RESTORE_ATIME) $(TEST_BACKUP_PLAN) $(TEST_METADATA_CONTRACT) $(TEST_METADATA_SNAPSHOTS) $(TEST_SIDECAR) $(TEST_SIDECAR_STATE) $(TEST_SIDECAR_SCALE) $(TEST_PORTABLE_HASHSET) $(TEST_PORTABLE_CAPTURE) $(TEST_PORTABLE_CAPTURE_SCALE) $(TEST_PORTABLE_PREPARE) $(TEST_NATIVE_RECONCILE_SCALE) $(TEST_NATIVE_HARDLINK_SCALE) $(TEST_PORTABLE_COLLISION_SCALE) $(TEST_PORTABLE_HARDLINK_SCALE) $(TEST_PORTABLE_RESUME) $(TEST_PORTABLE_RECONCILE) $(TEST_PORTABLE_RECONCILE_SCALE) $(TEST_PORTABLE_RESTORE_PREFLIGHT) $(TEST_PORTABLE_RESTORE_REPLAY) $(TEST_PORTABLE_RESTORE_ORCHESTRATE) $(TEST_PORTABLE_RESTORE_INVARIANT)
 
-.PHONY: clean test check-strict check-sanitize check-thread check-valgrind check-analyze check
+.PHONY: clean test check-strict check-sanitize check-valgrind check-analyze check

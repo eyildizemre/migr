@@ -12,7 +12,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
-#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,7 +37,6 @@ typedef struct PreflightEntries {
 } PreflightEntries;
 
 typedef struct RestorePreflightProgress RestorePreflightProgress;
-typedef struct PayloadScanPool PayloadScanPool;
 
 typedef struct {
     int fd;
@@ -70,48 +68,9 @@ typedef struct {
     unsigned char *seen;
     char root_namespace_path[PATH_MAX];
     RestorePreflightProgress *progress;
-    PayloadScanPool *pool;
     size_t checked_count;
     int failed;
 } PayloadInventory;
-
-#define PAYLOAD_SCAN_MAX_WORKERS 8U
-#define PAYLOAD_SCAN_BATCH_SIZE 64U
-#define PAYLOAD_SCAN_MIN_PARALLEL_ENTRIES 32U
-
-typedef enum {
-    PAYLOAD_SCAN_WORK_READY = 0,
-    PAYLOAD_SCAN_WORK_STAT_FAILURE
-} PayloadScanWorkStatus;
-
-typedef struct {
-    int parent_fd;
-    size_t root_index;
-    size_t address_index;
-    char physical_leaf[SIDECAR_MAX_PHYSICAL_LEAF + 1U];
-    PayloadScanWorkStatus status;
-    struct stat st;
-    int failure_errno;
-} PayloadScanWork;
-
-struct PayloadScanPool {
-    pthread_mutex_t lock;
-    pthread_cond_t task_ready;
-    pthread_cond_t batch_done;
-    pthread_t workers[PAYLOAD_SCAN_MAX_WORKERS];
-    PayloadScanWork work[PAYLOAD_SCAN_BATCH_SIZE];
-    size_t queue[PAYLOAD_SCAN_BATCH_SIZE];
-    size_t queue_head;
-    size_t queue_count;
-    size_t pending;
-    size_t workers_started;
-    int shutdown;
-    int initialized;
-#ifdef PORTABLE_RESTORE_PREFLIGHT_TEST_HOOKS
-    size_t active_workers;
-    size_t peak_workers;
-#endif
-};
 
 struct RestorePreflightProgress {
     size_t total_count;
@@ -125,14 +84,6 @@ struct RestorePreflightProgress {
 #ifdef PORTABLE_RESTORE_PREFLIGHT_TEST_HOOKS
 static int portable_restore_preflight_test_progress_enabled;
 static size_t portable_restore_preflight_test_profile_root_walk_counter;
-static size_t portable_restore_preflight_test_payload_worker_count = SIZE_MAX;
-static unsigned int portable_restore_preflight_test_payload_worker_delay_ms;
-static char portable_restore_preflight_test_delayed_payload_leaf[
-    SIDECAR_MAX_PHYSICAL_LEAF + 1U];
-static char portable_restore_preflight_test_duplicate_payload_leaf[
-    SIDECAR_MAX_PHYSICAL_LEAF + 1U];
-static size_t portable_restore_preflight_test_last_payload_peak_workers;
-static size_t portable_restore_preflight_test_last_payload_checked_count;
 
 void portable_restore_preflight_test_set_progress_enabled(int enabled)
 {
@@ -147,53 +98,6 @@ void portable_restore_preflight_test_reset_profile_root_walk_count(void)
 size_t portable_restore_preflight_test_profile_root_walk_count(void)
 {
     return portable_restore_preflight_test_profile_root_walk_counter;
-}
-
-void portable_restore_preflight_test_configure_payload_pool(
-    size_t worker_count, unsigned int worker_delay_ms,
-    const char *delayed_payload_leaf,
-    const char *duplicate_payload_leaf)
-{
-    portable_restore_preflight_test_payload_worker_count = worker_count;
-    portable_restore_preflight_test_payload_worker_delay_ms = worker_delay_ms;
-    portable_restore_preflight_test_delayed_payload_leaf[0] = '\0';
-    portable_restore_preflight_test_duplicate_payload_leaf[0] = '\0';
-    if (delayed_payload_leaf != NULL)
-    {
-        size_t length = strnlen(delayed_payload_leaf,
-                                SIDECAR_MAX_PHYSICAL_LEAF + 1U);
-        if (length <= SIDECAR_MAX_PHYSICAL_LEAF)
-            memcpy(portable_restore_preflight_test_delayed_payload_leaf,
-                   delayed_payload_leaf, length + 1U);
-    }
-    if (duplicate_payload_leaf != NULL)
-    {
-        size_t length = strnlen(duplicate_payload_leaf,
-                                SIDECAR_MAX_PHYSICAL_LEAF + 1U);
-        if (length <= SIDECAR_MAX_PHYSICAL_LEAF)
-            memcpy(portable_restore_preflight_test_duplicate_payload_leaf,
-                   duplicate_payload_leaf, length + 1U);
-    }
-}
-
-void portable_restore_preflight_test_reset_payload_pool(void)
-{
-    portable_restore_preflight_test_payload_worker_count = SIZE_MAX;
-    portable_restore_preflight_test_payload_worker_delay_ms = 0;
-    portable_restore_preflight_test_delayed_payload_leaf[0] = '\0';
-    portable_restore_preflight_test_duplicate_payload_leaf[0] = '\0';
-    portable_restore_preflight_test_last_payload_peak_workers = 0;
-    portable_restore_preflight_test_last_payload_checked_count = 0;
-}
-
-size_t portable_restore_preflight_test_payload_peak_workers(void)
-{
-    return portable_restore_preflight_test_last_payload_peak_workers;
-}
-
-size_t portable_restore_preflight_test_payload_checked_count(void)
-{
-    return portable_restore_preflight_test_last_payload_checked_count;
 }
 #endif
 
@@ -1244,261 +1148,6 @@ static SidecarBytes manifest_root_id_bytes(const ManifestRoot *root)
     };
 }
 
-static size_t payload_scan_worker_count(const PayloadInventory *inventory)
-{
-    if (inventory == NULL || inventory->collection == NULL)
-        return 0;
-    size_t entry_count = inventory->collection->address_index.count;
-    if (entry_count < 2U)
-        return 0;
-
-#ifdef PORTABLE_RESTORE_PREFLIGHT_TEST_HOOKS
-    if (portable_restore_preflight_test_payload_worker_count != SIZE_MAX)
-    {
-        size_t requested = portable_restore_preflight_test_payload_worker_count;
-        if (requested > PAYLOAD_SCAN_MAX_WORKERS)
-            requested = PAYLOAD_SCAN_MAX_WORKERS;
-        return requested;
-    }
-#endif
-
-    if (entry_count < PAYLOAD_SCAN_MIN_PARALLEL_ENTRIES)
-        return 0;
-
-    long online = sysconf(_SC_NPROCESSORS_ONLN);
-    size_t workers = online > 0 ? (size_t)online : 2U;
-    if (workers < 2U)
-        workers = 2U;
-    if (workers > PAYLOAD_SCAN_MAX_WORKERS)
-        workers = PAYLOAD_SCAN_MAX_WORKERS;
-    if (workers > entry_count)
-        workers = entry_count;
-    return workers;
-}
-
-#ifdef PORTABLE_RESTORE_PREFLIGHT_TEST_HOOKS
-static void payload_scan_test_delay(const PayloadScanWork *work)
-{
-    unsigned int delay_ms = portable_restore_preflight_test_payload_worker_delay_ms;
-    if (delay_ms == 0 ||
-        (portable_restore_preflight_test_delayed_payload_leaf[0] != '\0' &&
-         (work == NULL ||
-          strcmp(portable_restore_preflight_test_delayed_payload_leaf,
-                 work->physical_leaf) != 0)))
-        return;
-    struct timespec delay = {
-        .tv_sec = delay_ms / 1000U,
-        .tv_nsec = (long)(delay_ms % 1000U) * 1000000L
-    };
-    while (nanosleep(&delay, &delay) != 0 && errno == EINTR)
-    {
-    }
-}
-#endif
-
-static void payload_scan_work_execute(PayloadScanWork *work)
-{
-    work->status = PAYLOAD_SCAN_WORK_READY;
-    work->failure_errno = 0;
-    memset(&work->st, 0, sizeof(work->st));
-
-#ifdef PORTABLE_RESTORE_PREFLIGHT_TEST_HOOKS
-    payload_scan_test_delay(work);
-#endif
-
-    if (fstatat(work->parent_fd, work->physical_leaf, &work->st,
-                AT_SYMLINK_NOFOLLOW) != 0)
-    {
-        work->status = PAYLOAD_SCAN_WORK_STAT_FAILURE;
-        work->failure_errno = errno;
-    }
-}
-
-static void *payload_scan_worker(void *argument)
-{
-    PayloadScanPool *pool = argument;
-    for (;;)
-    {
-        int rc = pthread_mutex_lock(&pool->lock);
-        if (rc != 0)
-            abort();
-        while (pool->queue_count == 0 && !pool->shutdown)
-        {
-            rc = pthread_cond_wait(&pool->task_ready, &pool->lock);
-            if (rc != 0)
-                abort();
-        }
-        if (pool->shutdown && pool->queue_count == 0)
-        {
-            if (pthread_mutex_unlock(&pool->lock) != 0)
-                abort();
-            return NULL;
-        }
-
-        size_t slot = pool->queue[pool->queue_head];
-        pool->queue_head = (pool->queue_head + 1U) % PAYLOAD_SCAN_BATCH_SIZE;
-        pool->queue_count--;
-#ifdef PORTABLE_RESTORE_PREFLIGHT_TEST_HOOKS
-        pool->active_workers++;
-        if (pool->active_workers > pool->peak_workers)
-            pool->peak_workers = pool->active_workers;
-#endif
-        if (pthread_mutex_unlock(&pool->lock) != 0)
-            abort();
-
-        payload_scan_work_execute(&pool->work[slot]);
-
-        rc = pthread_mutex_lock(&pool->lock);
-        if (rc != 0)
-            abort();
-#ifdef PORTABLE_RESTORE_PREFLIGHT_TEST_HOOKS
-        if (pool->active_workers == 0)
-            abort();
-        pool->active_workers--;
-#endif
-        if (pool->pending == 0)
-            abort();
-        pool->pending--;
-        if (pool->pending == 0)
-            rc = pthread_cond_signal(&pool->batch_done);
-        else
-            rc = 0;
-        if (rc != 0 || pthread_mutex_unlock(&pool->lock) != 0)
-            abort();
-    }
-}
-
-static void payload_scan_pool_stop(PayloadScanPool *pool)
-{
-    if (pool == NULL || !pool->initialized)
-        return;
-    int rc = pthread_mutex_lock(&pool->lock);
-    if (rc != 0)
-        abort();
-    pool->shutdown = 1;
-    rc = pthread_cond_broadcast(&pool->task_ready);
-    int unlock_rc = pthread_mutex_unlock(&pool->lock);
-    if (rc != 0 || unlock_rc != 0)
-        abort();
-    for (size_t index = 0; index < pool->workers_started; index++)
-    {
-        rc = pthread_join(pool->workers[index], NULL);
-        if (rc != 0)
-            abort();
-    }
-    rc = pthread_cond_destroy(&pool->batch_done);
-    if (rc != 0)
-        abort();
-    rc = pthread_cond_destroy(&pool->task_ready);
-    if (rc != 0)
-        abort();
-    rc = pthread_mutex_destroy(&pool->lock);
-    if (rc != 0)
-        abort();
-    memset(pool, 0, sizeof(*pool));
-}
-
-static int payload_scan_pool_start(PayloadScanPool *pool,
-                                   size_t worker_count)
-{
-    if (pool == NULL || worker_count < 2U ||
-        worker_count > PAYLOAD_SCAN_MAX_WORKERS)
-    {
-        errno = EINVAL;
-        return -1;
-    }
-    memset(pool, 0, sizeof(*pool));
-    int rc = pthread_mutex_init(&pool->lock, NULL);
-    if (rc != 0)
-    {
-        errno = rc;
-        return -1;
-    }
-    rc = pthread_cond_init(&pool->task_ready, NULL);
-    if (rc != 0)
-    {
-        (void)pthread_mutex_destroy(&pool->lock);
-        errno = rc;
-        return -1;
-    }
-    rc = pthread_cond_init(&pool->batch_done, NULL);
-    if (rc != 0)
-    {
-        (void)pthread_cond_destroy(&pool->task_ready);
-        (void)pthread_mutex_destroy(&pool->lock);
-        errno = rc;
-        return -1;
-    }
-
-    pool->initialized = 1;
-    for (size_t index = 0; index < worker_count; index++)
-    {
-        rc = pthread_create(&pool->workers[index], NULL, payload_scan_worker,
-                            pool);
-        if (rc != 0)
-        {
-            int saved = rc;
-            payload_scan_pool_stop(pool);
-            errno = saved;
-            return -1;
-        }
-        pool->workers_started++;
-    }
-    return 0;
-}
-
-static int payload_scan_pool_submit(PayloadScanPool *pool, size_t slot)
-{
-    if (pool == NULL || !pool->initialized || slot >= PAYLOAD_SCAN_BATCH_SIZE)
-    {
-        errno = EINVAL;
-        return -1;
-    }
-    int rc = pthread_mutex_lock(&pool->lock);
-    if (rc != 0)
-        abort();
-    if (pool->queue_count >= PAYLOAD_SCAN_BATCH_SIZE ||
-        pool->pending >= PAYLOAD_SCAN_BATCH_SIZE)
-    {
-        if (pthread_mutex_unlock(&pool->lock) != 0)
-            abort();
-        errno = EBUSY;
-        return -1;
-    }
-    size_t tail = (pool->queue_head + pool->queue_count) %
-                  PAYLOAD_SCAN_BATCH_SIZE;
-    pool->queue[tail] = slot;
-    pool->queue_count++;
-    pool->pending++;
-    rc = pthread_cond_signal(&pool->task_ready);
-    int unlock_rc = pthread_mutex_unlock(&pool->lock);
-    if (rc != 0 || unlock_rc != 0)
-        abort();
-    return 0;
-}
-
-static int payload_scan_pool_wait(PayloadScanPool *pool)
-{
-    if (pool == NULL || !pool->initialized)
-    {
-        errno = EINVAL;
-        return -1;
-    }
-    int rc = pthread_mutex_lock(&pool->lock);
-    if (rc != 0)
-        abort();
-    while (pool->pending != 0)
-    {
-        rc = pthread_cond_wait(&pool->batch_done, &pool->lock);
-        if (rc != 0)
-            abort();
-    }
-    rc = pthread_mutex_unlock(&pool->lock);
-    if (rc != 0)
-        abort();
-    return 0;
-}
-
 static void report_address_entry_violation(PayloadInventory *inventory,
                                            size_t root_index,
                                            const SidecarEntry *entry)
@@ -1558,225 +1207,6 @@ static int mark_payload_entry(PayloadInventory *inventory, size_t root_index,
 static int scan_root_payload_directory(PayloadInventory *inventory,
                                        int directory_fd, size_t root_index,
                                        SidecarBytes logical_parent);
-static int scan_root_payload_node(PayloadInventory *inventory, int parent_fd,
-                                  size_t root_index,
-                                  SidecarBytes logical_parent,
-                                  const char *physical_leaf);
-
-static int payload_scan_process_batch(PayloadInventory *inventory,
-                                      size_t batch_count)
-{
-    if (inventory == NULL || inventory->pool == NULL ||
-        batch_count > PAYLOAD_SCAN_BATCH_SIZE)
-    {
-        errno = EINVAL;
-        return -1;
-    }
-    if (batch_count == 0)
-        return 0;
-    if (payload_scan_pool_wait(inventory->pool) != 0)
-        return -1;
-
-    for (size_t index = 0; index < batch_count; index++)
-    {
-        PayloadScanWork *work = &inventory->pool->work[index];
-        if (work->status == PAYLOAD_SCAN_WORK_STAT_FAILURE)
-        {
-            errno = work->failure_errno != 0 ? work->failure_errno : EIO;
-            return -1;
-        }
-        if (work->status != PAYLOAD_SCAN_WORK_READY ||
-            mark_payload_entry(inventory, work->root_index,
-                               work->address_index, &work->st) != 0)
-        {
-            errno = EINVAL;
-            return -1;
-        }
-    }
-    return 0;
-}
-
-static int scan_root_payload_directory_parallel(
-    PayloadInventory *inventory, int directory_fd, size_t root_index,
-    SidecarBytes logical_parent)
-{
-    if (inventory == NULL || inventory->pool == NULL || directory_fd < 0)
-    {
-        errno = EINVAL;
-        return -1;
-    }
-
-    int scan_fd = dup_cloexec(directory_fd);
-    DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
-    if (directory == NULL)
-    {
-        int saved = errno;
-        if (scan_fd >= 0)
-            (void)close(scan_fd);
-        errno = saved;
-        return -1;
-    }
-
-    PayloadScanPool *pool = inventory->pool;
-    const ManifestRoot *root = &inventory->collection->manifest->roots[root_index];
-    size_t batch_count = 0;
-    int result = 0;
-    int saved = 0;
-    for (;;)
-    {
-        if (batch_count >= PAYLOAD_SCAN_BATCH_SIZE - 1U)
-        {
-            if (payload_scan_process_batch(inventory, batch_count) != 0)
-            {
-                result = -1;
-                saved = errno;
-                break;
-            }
-            batch_count = 0;
-        }
-
-        errno = 0;
-        struct dirent *dirent = readdir(directory);
-        if (dirent == NULL)
-        {
-            saved = errno;
-            if (payload_scan_process_batch(inventory, batch_count) != 0)
-            {
-                result = -1;
-                saved = errno;
-            }
-            else if (saved != 0)
-                result = -1;
-            break;
-        }
-        if (strcmp(dirent->d_name, ".") == 0 ||
-            strcmp(dirent->d_name, "..") == 0)
-            continue;
-
-        size_t name_length = strlen(dirent->d_name);
-        if (!text_component_valid(dirent->d_name, name_length) ||
-            name_length > SIDECAR_MAX_PHYSICAL_LEAF)
-        {
-            if (payload_scan_process_batch(inventory, batch_count) != 0)
-                saved = errno;
-            else
-                saved = EINVAL;
-            result = -1;
-            break;
-        }
-
-        SidecarBytes leaf = {
-            .data = (const unsigned char *)dirent->d_name,
-            .length = name_length
-        };
-        size_t address_index = SIZE_MAX;
-        /* The address index is fully built before payload inventory starts and
-         * remains immutable until the pool has been joined. */
-        int found = restore_address_index_find_physical(
-            &inventory->collection->address_index,
-            manifest_root_id_bytes(root), logical_parent, leaf,
-            &address_index);
-        if (found != 1)
-        {
-            if (payload_scan_process_batch(inventory, batch_count) != 0)
-                saved = errno;
-            else
-            {
-                report_violation(inventory->collection->report,
-                                 root_index, dirent->d_name);
-                saved = found < 0 ? errno : EINVAL;
-            }
-            result = -1;
-            break;
-        }
-
-        const SidecarEntry *address_entry =
-            inventory->collection->address_index.entries[address_index].entry;
-        if (address_entry == NULL)
-        {
-            if (payload_scan_process_batch(inventory, batch_count) != 0)
-                saved = errno;
-            else
-            {
-                report_violation(inventory->collection->report, root_index,
-                                 "payload-address");
-                saved = EINVAL;
-            }
-            result = -1;
-            break;
-        }
-
-        if (address_entry->kind == SIDECAR_KIND_DIRECTORY)
-        {
-            if (payload_scan_process_batch(inventory, batch_count) != 0)
-            {
-                result = -1;
-                saved = errno;
-                break;
-            }
-            batch_count = 0;
-            if (scan_root_payload_node(inventory, directory_fd, root_index,
-                                       logical_parent, dirent->d_name) != 0)
-            {
-                result = -1;
-                saved = errno;
-                break;
-            }
-            continue;
-        }
-
-        PayloadScanWork *work = &pool->work[batch_count];
-        memset(work, 0, sizeof(*work));
-        work->parent_fd = directory_fd;
-        work->root_index = root_index;
-        work->address_index = address_index;
-        memcpy(work->physical_leaf, dirent->d_name, name_length + 1U);
-        if (payload_scan_pool_submit(pool, batch_count) != 0)
-        {
-            int submit_error = errno;
-            if (payload_scan_process_batch(inventory, batch_count) != 0)
-                submit_error = errno;
-            result = -1;
-            saved = submit_error;
-            break;
-        }
-        batch_count++;
-
-#ifdef PORTABLE_RESTORE_PREFLIGHT_TEST_HOOKS
-        if (portable_restore_preflight_test_duplicate_payload_leaf[0] != '\0' &&
-            strcmp(portable_restore_preflight_test_duplicate_payload_leaf,
-                   dirent->d_name) == 0)
-        {
-            PayloadScanWork *duplicate = &pool->work[batch_count];
-            memset(duplicate, 0, sizeof(*duplicate));
-            duplicate->parent_fd = directory_fd;
-            duplicate->root_index = root_index;
-            duplicate->address_index = address_index;
-            memcpy(duplicate->physical_leaf, dirent->d_name,
-                   name_length + 1U);
-            if (payload_scan_pool_submit(pool, batch_count) != 0)
-            {
-                int submit_error = errno;
-                if (payload_scan_process_batch(inventory, batch_count) != 0)
-                    submit_error = errno;
-                result = -1;
-                saved = submit_error;
-                break;
-            }
-            batch_count++;
-        }
-#endif
-    }
-
-    if (closedir(directory) != 0 && result == 0)
-    {
-        result = -1;
-        saved = errno != 0 ? errno : EIO;
-    }
-    if (result != 0)
-        errno = saved != 0 ? saved : EIO;
-    return result;
-}
 
 static int scan_root_payload_node(PayloadInventory *inventory, int parent_fd,
                                   size_t root_index,
@@ -1828,10 +1258,6 @@ static int scan_root_payload_directory(PayloadInventory *inventory,
                                        int directory_fd, size_t root_index,
                                        SidecarBytes logical_parent)
 {
-    if (inventory != NULL && inventory->pool != NULL)
-        return scan_root_payload_directory_parallel(
-            inventory, directory_fd, root_index, logical_parent);
-
     int scan_fd = dup_cloexec(directory_fd);
     DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
     if (directory == NULL)
@@ -2000,38 +1426,8 @@ static int scan_payload_inventory(PayloadInventory *inventory)
 {
     if (inventory == NULL || inventory->data_fd < 0)
         return -1;
-
-#ifdef PORTABLE_RESTORE_PREFLIGHT_TEST_HOOKS
-    portable_restore_preflight_test_last_payload_peak_workers = 0;
-    portable_restore_preflight_test_last_payload_checked_count = 0;
-#endif
-
-    PayloadScanPool pool;
-    memset(&pool, 0, sizeof(pool));
-    size_t worker_count = payload_scan_worker_count(inventory);
-    if (worker_count >= 2U &&
-        payload_scan_pool_start(&pool, worker_count) == 0)
-        inventory->pool = &pool;
-
-    int result = scan_root_namespace_directory(
-        inventory, inventory->data_fd, 0);
-
-#ifdef PORTABLE_RESTORE_PREFLIGHT_TEST_HOOKS
-    if (inventory->pool != NULL)
-        portable_restore_preflight_test_last_payload_peak_workers =
-            pool.peak_workers;
-    portable_restore_preflight_test_last_payload_checked_count =
-        inventory->checked_count;
-#endif
-
-    if (inventory->pool != NULL)
-    {
-        inventory->pool = NULL;
-        payload_scan_pool_stop(&pool);
-    }
-    if (result != 0)
+    if (scan_root_namespace_directory(inventory, inventory->data_fd, 0) != 0)
         return -1;
-
     const RestoreAddressIndex *addresses = &inventory->collection->address_index;
     for (size_t index = 0; index < addresses->count; index++)
         if (inventory->seen[index] == 0)
