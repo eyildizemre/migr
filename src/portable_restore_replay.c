@@ -3033,6 +3033,28 @@ static int replay_verify_hardlink(ReplayCollection *collection,
     return result;
 }
 
+static int replay_regular_content_verification_excluded(
+    const SidecarEntry *entry)
+{
+    static const char root_id[] = "BUILTIN_LOCAL_SHARE";
+    static const char logical_prefix[] = "gvfs-metadata";
+    const size_t root_id_length = sizeof(root_id) - 1U;
+    const size_t logical_prefix_length = sizeof(logical_prefix) - 1U;
+
+    if (entry == NULL || entry->kind != SIDECAR_KIND_REGULAR ||
+        entry->root_id.data == NULL ||
+        entry->root_id.length != root_id_length ||
+        memcmp(entry->root_id.data, root_id, root_id_length) != 0 ||
+        entry->logical_path.data == NULL ||
+        entry->logical_path.length < logical_prefix_length ||
+        memcmp(entry->logical_path.data, logical_prefix,
+               logical_prefix_length) != 0)
+        return 0;
+
+    return entry->logical_path.length == logical_prefix_length ||
+           entry->logical_path.data[logical_prefix_length] == '/';
+}
+
 static int replay_verify_content(ReplayCollection *collection)
 {
     if (collection == NULL || collection->report == NULL)
@@ -3044,7 +3066,10 @@ static int replay_verify_content(ReplayCollection *collection)
     size_t total_count = 0;
     for (size_t index = 0; index < collection->count; index++)
     {
-        SidecarObjectKind kind = collection->items[index].entry->kind;
+        const SidecarEntry *entry = collection->items[index].entry;
+        if (replay_regular_content_verification_excluded(entry))
+            continue;
+        SidecarObjectKind kind = entry->kind;
         if ((kind == SIDECAR_KIND_REGULAR || kind == SIDECAR_KIND_SYMLINK ||
              kind == SIDECAR_KIND_HARDLINK) &&
             total_count != SIZE_MAX)
@@ -3064,6 +3089,8 @@ static int replay_verify_content(ReplayCollection *collection)
     for (size_t index = 0; index < collection->count; index++)
     {
         ReplayEntry *replay = &collection->items[index];
+        if (replay_regular_content_verification_excluded(replay->entry))
+            continue;
         ReplayApplyFailure failure = {0};
         int result = 0;
         switch (replay->entry->kind)

@@ -3648,13 +3648,13 @@ prefix substitution.
 default after replay has applied file content and metadata and before the restore
 is reported successful or optional package/network restoration begins.
 
-For every regular file, replay computes a 64-bit FNV-1a digest incrementally over the exact bytes
-successfully written to the destination. The verification pass reopens the
-destination through existing-only, fd-relative, no-follow traversal, hashes its
-current bytes, and requires the digest to match. The expected digest therefore
-describes the bytes migr actually intended to leave at the destination, including
-D41's bounded HOME-URI rewrite, rather than blindly describing the original
-portable payload.
+For every regular file, replay computes a 64-bit FNV-1a digest incrementally over
+the exact bytes successfully written to the destination. Except for the explicit
+live-state exclusions defined by D44, the verification pass reopens the destination
+through existing-only, fd-relative, no-follow traversal, hashes its current bytes,
+and requires the digest to match. The expected digest therefore describes the
+bytes migr actually intended to leave at the destination, including D41's bounded
+HOME-URI rewrite, rather than blindly describing the original portable payload.
 
 Symlinks are verified by no-follow identity checks plus exact target-byte
 comparison. Because reading a symlink target may advance the symlink's atime, the
@@ -3742,3 +3742,35 @@ or progress counters; parallel recursive directory traversal; and parallel
 destination-identity graph construction. Those designs widen the synchronization
 and descriptor-lifetime surface substantially beyond the I/O operation that
 motivates this change.
+
+---
+
+## D44 — 2026-09-11 — Restore verification excludes confirmed live daemon-owned state
+
+**Status:** Implemented
+
+**Decision:** D42's post-copy destination read-back excludes regular-file entries
+whose root is exactly `BUILTIN_LOCAL_SHARE` and whose logical path is exactly
+`gvfs-metadata` or is below `gvfs-metadata/` on a path-component boundary. These
+entries are still selected, copied, restored, and hashed during replay like other
+regular files. They are omitted only from the later destination read-back and from
+its verification progress/accounting.
+
+This is an explicitly named exception list, not a classifier for mutable files.
+Additional live-state paths require independent evidence before being added. A
+similarly spelled sibling such as `gvfs-metadata-x`, or the same logical path under
+another manifest root, remains subject to normal D42 verification. `--no-verify`
+continues to be the broader opt-out from the entire post-copy verification pass.
+
+**Why:** `~/.local/share/gvfs-metadata` is owned by the desktop metadata service and
+may be rewritten independently while a restore is still running. A later digest
+comparison therefore cannot distinguish a bad restore from legitimate concurrent
+daemon mutation. Treating that comparison as a restore failure creates a false
+positive after migr has already written the intended bytes. D41 provides the
+precedent for handling a confirmed desktop-state exception with a narrow,
+format/path-specific rule instead of a broad heuristic.
+
+**Rejected:** disabling verification for all of `.local/share`; detecting running
+desktop services and dynamically guessing which files might change; matching by a
+loose string prefix; suppressing the file from backup or restore; and adding a
+second user-facing verification flag for this case.

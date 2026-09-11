@@ -2117,6 +2117,211 @@ static int home_rewrite_fixture_open(Fixture *fixture, ManifestRoot roots[2],
     return 0;
 }
 
+static int verification_exclusion_fixture_open(Fixture *fixture)
+{
+    static const char gvfs_root_payload[] = "gvfs root payload";
+    static const char gvfs_home_payload[] = "gvfs home payload";
+    static const char lookalike_payload[] = "lookalike payload";
+    static const char other_root_payload[] = "other root payload";
+
+    ManifestRoot initial = root_for();
+    if (fixture_open(fixture, &initial) != 0)
+        return -1;
+
+    ManifestRoot roots[2];
+    if (write_home_rewrite_manifest(fixture, roots, MANIFEST_CURRENT_VERSION,
+                                    NULL) != 0)
+    {
+        fixture_close(fixture);
+        return -1;
+    }
+
+    make_dir_at(fixture->data_fd, "BUILTIN_LOCAL_SHARE", 0700);
+    int share_fd = openat(fixture->data_fd, "BUILTIN_LOCAL_SHARE",
+                          O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (share_fd < 0)
+        fatal("could not open verification-exclusion share payload root");
+    make_dir_at(share_fd, "gvfs-metadata", 0700);
+    write_file_at(share_fd, "gvfs-metadata/root", gvfs_root_payload);
+    write_file_at(share_fd, "gvfs-metadata/home", gvfs_home_payload);
+    write_file_at(share_fd, "gvfs-metadata-x", lookalike_payload);
+    if (close(share_fd) != 0)
+        fatal("could not close verification-exclusion share payload root");
+
+    make_dir_at(fixture->data_fd, "BUILTIN_DOT_CONFIG", 0700);
+    int config_fd = openat(fixture->data_fd, "BUILTIN_DOT_CONFIG",
+                           O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (config_fd < 0)
+        fatal("could not open verification-exclusion config payload root");
+    make_dir_at(config_fd, "gvfs-metadata", 0700);
+    write_file_at(config_fd, "gvfs-metadata/root", other_root_payload);
+    if (close(config_fd) != 0)
+        fatal("could not close verification-exclusion config payload root");
+
+    SidecarEntry entries[] = {
+        entry_for("BUILTIN_LOCAL_SHARE", "", "", SIDECAR_KIND_DIRECTORY,
+                  0, 0700, 1700000660, 1, 1700000661, 2),
+        entry_for("BUILTIN_LOCAL_SHARE", "gvfs-metadata", "gvfs-metadata",
+                  SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000662, 3, 1700000663, 4),
+        entry_for("BUILTIN_LOCAL_SHARE", "gvfs-metadata/root",
+                  "gvfs-metadata/root", SIDECAR_KIND_REGULAR,
+                  strlen(gvfs_root_payload), 0600,
+                  1700000664, 5, 1700000665, 6),
+        entry_for("BUILTIN_LOCAL_SHARE", "gvfs-metadata/home",
+                  "gvfs-metadata/home", SIDECAR_KIND_REGULAR,
+                  strlen(gvfs_home_payload), 0600,
+                  1700000666, 7, 1700000667, 8),
+        entry_for("BUILTIN_LOCAL_SHARE", "gvfs-metadata-x",
+                  "gvfs-metadata-x", SIDECAR_KIND_REGULAR,
+                  strlen(lookalike_payload), 0600,
+                  1700000668, 9, 1700000669, 10),
+        entry_for("BUILTIN_DOT_CONFIG", "", "", SIDECAR_KIND_DIRECTORY,
+                  0, 0700, 1700000670, 11, 1700000671, 12),
+        entry_for("BUILTIN_DOT_CONFIG", "gvfs-metadata", "gvfs-metadata",
+                  SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000672, 13, 1700000673, 14),
+        entry_for("BUILTIN_DOT_CONFIG", "gvfs-metadata/root",
+                  "gvfs-metadata/root", SIDECAR_KIND_REGULAR,
+                  strlen(other_root_payload), 0600,
+                  1700000674, 15, 1700000675, 16)
+    };
+    if (write_sidecar(fixture, entries,
+                      sizeof(entries) / sizeof(entries[0]), NULL, NULL) != 0)
+    {
+        fixture_close(fixture);
+        return -1;
+    }
+    return 0;
+}
+
+typedef struct {
+    Fixture *fixture;
+    const char *relative_paths[2];
+    const char *expected_contents[2];
+    size_t count;
+    int restored_contents_match;
+} VerificationPathMutationProbe;
+
+static void mutate_verification_paths(void *context)
+{
+    VerificationPathMutationProbe *probe = context;
+    if (probe == NULL || probe->fixture == NULL || probe->count == 0 ||
+        probe->count > sizeof(probe->relative_paths) /
+                           sizeof(probe->relative_paths[0]))
+        fatal("invalid verification-path mutation probe");
+
+    probe->restored_contents_match = 1;
+    for (size_t index = 0; index < probe->count; index++)
+    {
+        const char *relative = probe->relative_paths[index];
+        const char *expected = probe->expected_contents[index];
+        if (relative == NULL || expected == NULL)
+            fatal("invalid verification-path mutation target");
+        char path[PATH_MAX];
+        int length = snprintf(path, sizeof(path), "%s/%s", probe->fixture->home,
+                              relative);
+        if (length < 0 || (size_t)length >= sizeof(path))
+            fatal("invalid verification-path mutation target");
+        if (!file_equals_noatime(path, expected))
+            probe->restored_contents_match = 0;
+        write_file_at(probe->fixture->home_fd, relative,
+                      "live state changed after replay");
+    }
+}
+
+static void test_live_desktop_state_verification_exclusion(void)
+{
+    printf(BLUE "::" NC " live desktop state is excluded only from verification\n");
+
+    Fixture excluded;
+    int opened = verification_exclusion_fixture_open(&excluded);
+    check(opened == 0, "live-state verification-exclusion fixture is created");
+    if (opened == 0)
+    {
+        VerificationPathMutationProbe probe = {
+            .fixture = &excluded,
+            .relative_paths = {
+                ".local/share/gvfs-metadata/root",
+                ".local/share/gvfs-metadata/home"
+            },
+            .expected_contents = {
+                "gvfs root payload",
+                "gvfs home payload"
+            },
+            .count = 2
+        };
+        PortableRestoreReplayReport report;
+        portable_restore_replay_test_reset_verification_regular_read_count();
+        int result = run_replay_with_options(
+            &excluded, &report, NULL, 0, mutate_verification_paths, &probe);
+        char mutated_root[PATH_MAX];
+        path_join(mutated_root, sizeof(mutated_root), excluded.home,
+                  "/.local/share/gvfs-metadata/root");
+        check(probe.restored_contents_match,
+              "excluded live-state files are restored before verification");
+        check(result == 0 && report.failed_count == 0 &&
+                  report.verification_checked_count == 2 &&
+                  report.verification_failed_count == 0 &&
+                  portable_restore_replay_test_verification_regular_read_count() == 2,
+              "gvfs-metadata descendants are omitted from readback and accounting");
+        check(file_equals_noatime(mutated_root,
+                                 "live state changed after replay"),
+              "post-replay live-state mutation does not become a false failure");
+        fixture_close(&excluded);
+    }
+
+    Fixture lookalike;
+    opened = verification_exclusion_fixture_open(&lookalike);
+    check(opened == 0, "verification-prefix boundary fixture is created");
+    if (opened == 0)
+    {
+        VerificationPathMutationProbe probe = {
+            .fixture = &lookalike,
+            .relative_paths = { ".local/share/gvfs-metadata-x" },
+            .expected_contents = { "lookalike payload" },
+            .count = 1
+        };
+        PortableRestoreReplayReport report;
+        int result = run_replay_with_options(
+            &lookalike, &report, NULL, 0, mutate_verification_paths, &probe);
+        check(probe.restored_contents_match && result != 0 &&
+                  report.verification_failed_count == 1 &&
+                  strcmp(report.failed_root_id, "BUILTIN_LOCAL_SHARE") == 0 &&
+                  strcmp(report.failed_logical_path, "gvfs-metadata-x") == 0 &&
+                  report.failure_step ==
+                      PORTABLE_RESTORE_REPLAY_FAILURE_COMPARE_DESTINATION_CONTENT &&
+                  report.failure_errno == EIO,
+              "a similarly named sibling remains content-verified");
+        fixture_close(&lookalike);
+    }
+
+    Fixture other_root;
+    opened = verification_exclusion_fixture_open(&other_root);
+    check(opened == 0, "verification-root boundary fixture is created");
+    if (opened == 0)
+    {
+        VerificationPathMutationProbe probe = {
+            .fixture = &other_root,
+            .relative_paths = { ".config/gvfs-metadata/root" },
+            .expected_contents = { "other root payload" },
+            .count = 1
+        };
+        PortableRestoreReplayReport report;
+        int result = run_replay_with_options(
+            &other_root, &report, NULL, 0, mutate_verification_paths, &probe);
+        check(probe.restored_contents_match && result != 0 &&
+                  report.verification_failed_count == 1 &&
+                  strcmp(report.failed_root_id, "BUILTIN_DOT_CONFIG") == 0 &&
+                  strcmp(report.failed_logical_path, "gvfs-metadata/root") == 0 &&
+                  report.failure_step ==
+                      PORTABLE_RESTORE_REPLAY_FAILURE_COMPARE_DESTINATION_CONTENT &&
+                  report.failure_errno == EIO,
+              "the same logical path under another root remains verified");
+        fixture_close(&other_root);
+    }
+}
+
 static void test_known_desktop_state_rewrites_home(void)
 {
     printf(BLUE "::" NC " known desktop-state files rewrite a changed HOME\n");
@@ -3275,6 +3480,7 @@ int main(void)
     test_verification_refuses_destination_symlink_replacement();
     test_symlink_content_verification();
     test_hardlink_content_verification();
+    test_live_desktop_state_verification_exclusion();
     test_known_desktop_state_rewrites_home();
     test_known_desktop_state_same_home_is_verbatim();
     test_known_desktop_state_legacy_is_verbatim();
