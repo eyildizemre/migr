@@ -21,6 +21,18 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+enum {
+    REPLAY_FILE_URI_PREFIX_LENGTH = 7,
+    REPLAY_HOME_REWRITE_MAX_PAIRS = XDG_KEY_COUNT + 1
+};
+
+typedef struct {
+    unsigned char source_uri[PATH_MAX + REPLAY_FILE_URI_PREFIX_LENGTH + 1U];
+    unsigned char destination_uri[PATH_MAX + REPLAY_FILE_URI_PREFIX_LENGTH + 1U];
+    size_t source_uri_length;
+    size_t destination_uri_length;
+} ReplayHomeRewritePair;
+
 typedef struct {
     const SidecarEntry *entry;
     const SidecarXattr *xattrs;
@@ -70,6 +82,8 @@ typedef struct {
     int destination_home_fd;
     const char *destination_home_path;
     const char * const *destination_xdg_dirs;
+    const ReplayHomeRewritePair *home_rewrite_pairs;
+    size_t home_rewrite_pair_count;
     int xdg_anchor_fd[XDG_KEY_COUNT];
     char xdg_anchor_prefix[XDG_KEY_COUNT][PATH_MAX];
     ReplayParentCache parent_cache;
@@ -204,6 +218,8 @@ const char *replay_failure_step_text(PortableRestoreReplayFailureStep step)
             return "validate restore address index";
         case PORTABLE_RESTORE_REPLAY_FAILURE_VALIDATE_MANIFEST_OWNERSHIP:
             return "validate manifest ownership";
+        case PORTABLE_RESTORE_REPLAY_FAILURE_BUILD_HOME_REWRITE_TABLE:
+            return "build HOME URI rewrite table";
         case PORTABLE_RESTORE_REPLAY_FAILURE_VERIFY_PLACEHOLDER:
             return "verify placeholder payload";
         case PORTABLE_RESTORE_REPLAY_FAILURE_RESOLVE_HARDLINK_ENTRY:
@@ -1489,35 +1505,143 @@ static int replay_destination_parent(ReplayCollection *collection,
                                               leaf_size);
 }
 
-static int replay_regular_rewrites_home(const ReplayCollection *collection,
-                                        const ReplayEntry *replay)
+static int replay_entry_source_path(const ReplayCollection *collection,
+                                    const ReplayEntry *replay,
+                                    char out[PATH_MAX])
 {
     if (collection == NULL || collection->manifest == NULL || replay == NULL ||
-        replay->entry == NULL ||
+        replay->entry == NULL || out == NULL ||
         replay->root_index >= (size_t)collection->manifest->root_count ||
         collection->manifest->version != MANIFEST_SELECTION_VERSION ||
-        collection->manifest->source_home[0] == '\0' ||
-        collection->destination_home_path == NULL ||
-        strcmp(collection->manifest->source_home,
-               collection->destination_home_path) == 0)
-        return 0;
+        collection->manifest->source_home[0] == '\0')
+    {
+        errno = EINVAL;
+        return -1;
+    }
 
     char logical[PATH_MAX];
     replay_copy_bytes(logical, sizeof(logical), replay->entry->logical_path);
     if (replay->entry->logical_path.length >= sizeof(logical))
-        return 0;
+    {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
 
     char source_root[PATH_MAX];
     if (manifest_root_source_path(collection->manifest,
                                   (int)replay->root_index,
                                   source_root) != 0)
+        return -1;
+    if (logical[0] == '\0')
+    {
+        int length = snprintf(out, PATH_MAX, "%s", source_root);
+        return length >= 0 && (size_t)length < PATH_MAX ? 0 : -1;
+    }
+    return path_join(out, PATH_MAX, source_root, logical);
+}
+
+static int replay_home_rewrite_pair_set(ReplayHomeRewritePair *pair,
+                                        const char *source_path,
+                                        const char *destination_path)
+{
+    static const unsigned char file_uri[] = "file://";
+    if (pair == NULL || source_path == NULL || source_path[0] == '\0' ||
+        destination_path == NULL || destination_path[0] == '\0')
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    size_t source_length = strnlen(source_path, PATH_MAX);
+    size_t destination_length = strnlen(destination_path, PATH_MAX);
+    if (source_length == PATH_MAX || destination_length == PATH_MAX ||
+        source_length > SIZE_MAX - REPLAY_FILE_URI_PREFIX_LENGTH - 1U ||
+        destination_length > SIZE_MAX - REPLAY_FILE_URI_PREFIX_LENGTH - 1U)
+    {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    memcpy(pair->source_uri, file_uri, REPLAY_FILE_URI_PREFIX_LENGTH);
+    memcpy(pair->source_uri + REPLAY_FILE_URI_PREFIX_LENGTH, source_path,
+           source_length);
+    pair->source_uri_length = REPLAY_FILE_URI_PREFIX_LENGTH + source_length;
+    pair->source_uri[pair->source_uri_length] = '\0';
+    memcpy(pair->destination_uri, file_uri, REPLAY_FILE_URI_PREFIX_LENGTH);
+    memcpy(pair->destination_uri + REPLAY_FILE_URI_PREFIX_LENGTH,
+           destination_path, destination_length);
+    pair->destination_uri_length =
+        REPLAY_FILE_URI_PREFIX_LENGTH + destination_length;
+    pair->destination_uri[pair->destination_uri_length] = '\0';
+    return 0;
+}
+
+/* The request already owns the invocation's frozen XDG resolution. Build the
+ * rewrite table from that snapshot so replay cannot observe a later config
+ * change or parse the destination file once per desktop-state entry. */
+static int replay_home_rewrite_pairs_build(
+    const Manifest *manifest, const char * const *destination_xdg_dirs,
+    const char *destination_home, ReplayHomeRewritePair pairs[],
+    size_t *pair_count)
+{
+    if (manifest == NULL || pairs == NULL || pair_count == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    *pair_count = 0;
+    if (manifest->version != MANIFEST_SELECTION_VERSION ||
+        manifest->source_home[0] == '\0' || destination_home == NULL ||
+        destination_home[0] == '\0')
+        return 0;
+
+    for (int key = 0; key < XDG_KEY_COUNT; key++)
+    {
+        const ManifestRoot *root = NULL;
+        for (int index = 0; index < manifest->root_count; index++)
+            if (manifest->roots[index].policy == ROOT_POLICY_XDG &&
+                strcmp(manifest->roots[index].id, xdg_keys[key]) == 0)
+            {
+                root = &manifest->roots[index];
+                break;
+            }
+        if (root == NULL)
+            continue;
+
+        if (*pair_count >= REPLAY_HOME_REWRITE_MAX_PAIRS)
+        {
+            errno = EOVERFLOW;
+            return -1;
+        }
+        char source_path[PATH_MAX];
+        if (manifest_root_source_path(
+                manifest, (int)(root - manifest->roots), source_path) != 0 ||
+            replay_home_rewrite_pair_set(
+                &pairs[*pair_count], source_path,
+                destination_xdg_dirs == NULL ? NULL
+                                             : destination_xdg_dirs[key]) != 0)
+            return -1;
+        (*pair_count)++;
+    }
+
+    if (*pair_count >= REPLAY_HOME_REWRITE_MAX_PAIRS ||
+        replay_home_rewrite_pair_set(&pairs[*pair_count],
+                                     manifest->source_home,
+                                     destination_home) != 0)
+        return -1;
+    (*pair_count)++;
+    return 0;
+}
+
+static int replay_regular_rewrites_home(const ReplayCollection *collection,
+                                        const ReplayEntry *replay)
+{
+    if (collection == NULL || collection->manifest == NULL || replay == NULL ||
+        replay->entry == NULL || collection->home_rewrite_pair_count == 0)
         return 0;
 
     char source_path[PATH_MAX];
-    if (logical[0] == '\0')
-        memcpy(source_path, source_root, strlen(source_root) + 1U);
-    else if (path_join(source_path, sizeof(source_path), source_root,
-                       logical) != 0)
+    if (replay_entry_source_path(collection, replay, source_path) != 0)
         return 0;
 
     static const char *const known_home_relative_paths[] = {
@@ -1537,6 +1661,22 @@ static int replay_regular_rewrites_home(const ReplayCollection *collection,
             return 1;
     }
     return 0;
+}
+
+static int replay_regular_is_locally_authoritative(
+    const ReplayCollection *collection, const ReplayEntry *replay)
+{
+    if (collection == NULL || collection->manifest == NULL || replay == NULL ||
+        replay->entry == NULL || replay->entry->kind != SIDECAR_KIND_REGULAR)
+        return 0;
+
+    char source_path[PATH_MAX], known_path[PATH_MAX];
+    if (replay_entry_source_path(collection, replay, source_path) != 0 ||
+        path_join(known_path, sizeof(known_path),
+                  collection->manifest->source_home,
+                  ".config/user-dirs.dirs") != 0)
+        return 0;
+    return strcmp(source_path, known_path) == 0;
 }
 
 static int replay_write_all(int fd, const unsigned char *data, size_t length,
@@ -1577,7 +1717,7 @@ static size_t replay_bytes_find(const unsigned char *haystack,
 }
 
 /* Flushes every replacement whose trailing path-component boundary is already
- * known. On non-final chunks, at most one source-home length remains buffered
+ * known. On non-final chunks, at most one longest source URI remains buffered
  * so a match and its following boundary may straddle the next read. */
 static int replay_home_uri_boundary(unsigned char byte)
 {
@@ -1585,47 +1725,79 @@ static int replay_home_uri_boundary(unsigned char byte)
            byte == '\n' || byte == '"' || byte == '\'';
 }
 
-static int replay_home_rewrite_flush(int destination_fd,
-                                     const unsigned char *buffer,
-                                     size_t length,
-                                     const unsigned char *source_uri,
-                                     size_t source_uri_length,
-                                     const unsigned char *destination_uri,
-                                     size_t destination_uri_length,
-                                     int final, size_t *consumed_out,
-                                     uint64_t *hash)
+static int replay_home_rewrite_flush(
+    int destination_fd, const unsigned char *buffer, size_t length,
+    const ReplayHomeRewritePair *pairs, size_t pair_count, int final,
+    size_t *consumed_out, uint64_t *hash)
 {
-    if (destination_fd < 0 || buffer == NULL || source_uri == NULL ||
-        source_uri_length == 0 || destination_uri == NULL ||
-        consumed_out == NULL)
+    if (destination_fd < 0 || buffer == NULL || pairs == NULL ||
+        pair_count == 0 || consumed_out == NULL)
     {
         errno = EINVAL;
         return -1;
     }
 
+    size_t max_source_uri_length = 0;
+    for (size_t index = 0; index < pair_count; index++)
+        if (pairs[index].source_uri_length == 0 ||
+            pairs[index].destination_uri_length == 0 ||
+            pairs[index].source_uri_length >
+                sizeof(pairs[index].source_uri) ||
+            pairs[index].destination_uri_length >
+                sizeof(pairs[index].destination_uri))
+        {
+            errno = EINVAL;
+            return -1;
+        }
+        else if (pairs[index].source_uri_length > max_source_uri_length)
+            max_source_uri_length = pairs[index].source_uri_length;
+
     size_t safe_start = final ? length :
-        (length > source_uri_length ? length - source_uri_length : 0U);
+        (length > max_source_uri_length ?
+             length - max_source_uri_length : 0U);
     size_t cursor = 0;
     while (cursor < length)
     {
-        size_t relative = replay_bytes_find(
-            buffer + cursor, length - cursor,
-            source_uri, source_uri_length);
-        if (relative == SIZE_MAX)
-            break;
-        size_t match = cursor + relative;
-        if (!final && match >= safe_start)
+        size_t best_match = SIZE_MAX;
+        size_t best_pair = SIZE_MAX;
+        int best_boundary = 0;
+        for (size_t index = 0; index < pair_count; index++)
+        {
+            const ReplayHomeRewritePair *pair = &pairs[index];
+            size_t relative = replay_bytes_find(
+                buffer + cursor, length - cursor,
+                pair->source_uri, pair->source_uri_length);
+            if (relative == SIZE_MAX)
+                continue;
+            size_t match = cursor + relative;
+            if (!final && match >= safe_start)
+                continue;
+            size_t after = match + pair->source_uri_length;
+            int boundary = after < length
+                ? replay_home_uri_boundary(buffer[after]) : final;
+            if (best_pair == SIZE_MAX || match < best_match ||
+                (match == best_match &&
+                 ((boundary && !best_boundary) ||
+                  (boundary == best_boundary &&
+                   pair->source_uri_length >
+                       pairs[best_pair].source_uri_length))))
+            {
+                best_match = match;
+                best_pair = index;
+                best_boundary = boundary;
+            }
+        }
+        if (best_pair == SIZE_MAX)
             break;
 
-        size_t after = match + source_uri_length;
-        int component_boundary =
-            after < length ? replay_home_uri_boundary(buffer[after]) : final;
-        if (component_boundary)
+        const ReplayHomeRewritePair *pair = &pairs[best_pair];
+        size_t after = best_match + pair->source_uri_length;
+        if (best_boundary)
         {
             if (replay_write_all(destination_fd, buffer + cursor,
-                                 match - cursor, hash) != 0 ||
-                replay_write_all(destination_fd, destination_uri,
-                                 destination_uri_length, hash) != 0)
+                                 best_match - cursor, hash) != 0 ||
+                replay_write_all(destination_fd, pair->destination_uri,
+                                 pair->destination_uri_length, hash) != 0)
                 return -1;
             cursor = after;
         }
@@ -1634,9 +1806,9 @@ static int replay_home_rewrite_flush(int destination_fd,
             /* Emit one byte, not the whole rejected candidate: a canonical
              * path can contain a later suffix that is also its own prefix. */
             if (replay_write_all(destination_fd, buffer + cursor,
-                                 match + 1U - cursor, hash) != 0)
+                                 best_match + 1U - cursor, hash) != 0)
                 return -1;
-            cursor = match + 1U;
+            cursor = best_match + 1U;
         }
     }
 
@@ -1654,13 +1826,11 @@ static int replay_home_rewrite_flush(int destination_fd,
 
 static int replay_copy_regular_rewriting_home(
     int source_fd, int destination_fd, off_t expected_size,
-    const char *source_home, const char *destination_home,
+    const ReplayHomeRewritePair *pairs, size_t pair_count,
     BackupCaptureReport *report, uint64_t *digest)
 {
     if (source_fd < 0 || destination_fd < 0 || expected_size < 0 ||
-        source_home == NULL || source_home[0] == '\0' ||
-        destination_home == NULL || destination_home[0] == '\0' ||
-        digest == NULL)
+        pairs == NULL || pair_count == 0 || digest == NULL)
     {
         errno = EINVAL;
         return -1;
@@ -1668,27 +1838,9 @@ static int replay_copy_regular_rewriting_home(
     if (ftruncate(destination_fd, 0) != 0)
         return -1;
 
-    enum { FILE_URI_PREFIX_LENGTH = 7, REWRITE_READ_SIZE = 65536 };
-    size_t old_length = strnlen(source_home, PATH_MAX);
-    size_t new_length = strnlen(destination_home, PATH_MAX);
-    if (old_length == PATH_MAX || new_length == PATH_MAX)
-    {
-        errno = ENAMETOOLONG;
-        return -1;
-    }
-
-    unsigned char source_uri[PATH_MAX + FILE_URI_PREFIX_LENGTH + 1U];
-    unsigned char destination_uri[PATH_MAX + FILE_URI_PREFIX_LENGTH + 1U];
-    memcpy(source_uri, "file://", FILE_URI_PREFIX_LENGTH);
-    memcpy(source_uri + FILE_URI_PREFIX_LENGTH, source_home, old_length);
-    size_t source_uri_length = FILE_URI_PREFIX_LENGTH + old_length;
-    memcpy(destination_uri, "file://", FILE_URI_PREFIX_LENGTH);
-    memcpy(destination_uri + FILE_URI_PREFIX_LENGTH, destination_home,
-           new_length);
-    size_t destination_uri_length = FILE_URI_PREFIX_LENGTH + new_length;
-
+    enum { REWRITE_READ_SIZE = 65536 };
     unsigned char buffer[REWRITE_READ_SIZE + PATH_MAX +
-                         FILE_URI_PREFIX_LENGTH + 1U];
+                         REPLAY_FILE_URI_PREFIX_LENGTH + 1U];
     size_t carried = 0;
     uint64_t copied = 0;
     uint64_t hash = HASH_FNV1A_OFFSET_BASIS;
@@ -1706,9 +1858,7 @@ static int replay_copy_regular_rewriting_home(
             size_t consumed = 0;
             if (replay_home_rewrite_flush(
                     destination_fd, buffer, carried,
-                    source_uri, source_uri_length,
-                    destination_uri, destination_uri_length,
-                    1, &consumed, &hash) != 0)
+                    pairs, pair_count, 1, &consumed, &hash) != 0)
                 return -1;
             if (consumed != carried)
             {
@@ -1728,12 +1878,10 @@ static int replay_copy_regular_rewriting_home(
         size_t consumed = 0;
         if (replay_home_rewrite_flush(
                 destination_fd, buffer, total,
-                source_uri, source_uri_length,
-                destination_uri, destination_uri_length,
-                0, &consumed, &hash) != 0)
+                pairs, pair_count, 0, &consumed, &hash) != 0)
             return -1;
         carried = total - consumed;
-        if (carried > source_uri_length)
+        if (carried > PATH_MAX + REPLAY_FILE_URI_PREFIX_LENGTH)
         {
             errno = EIO;
             return -1;
@@ -1762,6 +1910,8 @@ static int replay_apply_regular(ReplayCollection *collection,
     const ManifestRoot *root = &collection->manifest->roots[
         replay->root_index];
     const SidecarEntry *entry = replay->entry;
+    if (replay_regular_is_locally_authoritative(collection, replay))
+        return 0;
     if (entry->size > (uint64_t)INTMAX_MAX)
     {
         errno = EOVERFLOW;
@@ -1819,8 +1969,8 @@ static int replay_apply_regular(ReplayCollection *collection,
         if (replay_regular_rewrites_home(collection, replay))
             result = replay_copy_regular_rewriting_home(
                 source_fd, destination_fd, (off_t)entry->size,
-                collection->manifest->source_home,
-                collection->destination_home_path,
+                collection->home_rewrite_pairs,
+                collection->home_rewrite_pair_count,
                 collection->capture_report, &replay->content_digest);
         else
             result = portable_copy_regular_digest(
@@ -3055,6 +3205,14 @@ static int replay_regular_content_verification_excluded(
            entry->logical_path.data[logical_prefix_length] == '/';
 }
 
+static int replay_content_verification_excluded(
+    const ReplayCollection *collection, const ReplayEntry *replay)
+{
+    return replay != NULL &&
+           (replay_regular_content_verification_excluded(replay->entry) ||
+            replay_regular_is_locally_authoritative(collection, replay));
+}
+
 static int replay_verify_content(ReplayCollection *collection)
 {
     if (collection == NULL || collection->report == NULL)
@@ -3066,8 +3224,9 @@ static int replay_verify_content(ReplayCollection *collection)
     size_t total_count = 0;
     for (size_t index = 0; index < collection->count; index++)
     {
-        const SidecarEntry *entry = collection->items[index].entry;
-        if (replay_regular_content_verification_excluded(entry))
+        const ReplayEntry *replay = &collection->items[index];
+        const SidecarEntry *entry = replay->entry;
+        if (replay_content_verification_excluded(collection, replay))
             continue;
         SidecarObjectKind kind = entry->kind;
         if ((kind == SIDECAR_KIND_REGULAR || kind == SIDECAR_KIND_SYMLINK ||
@@ -3089,7 +3248,7 @@ static int replay_verify_content(ReplayCollection *collection)
     for (size_t index = 0; index < collection->count; index++)
     {
         ReplayEntry *replay = &collection->items[index];
-        if (replay_regular_content_verification_excluded(replay->entry))
+        if (replay_content_verification_excluded(collection, replay))
             continue;
         ReplayApplyFailure failure = {0};
         int result = 0;
@@ -3179,8 +3338,14 @@ static int replay_run(ReplayCollection *collection)
                 replay->entry, &failure);
             return -1;
         }
-        if (replay->entry->kind == SIDECAR_KIND_REGULAR ||
-            replay->entry->kind == SIDECAR_KIND_SYMLINK)
+        if (replay->entry->kind == SIDECAR_KIND_REGULAR &&
+            replay_regular_is_locally_authoritative(collection, replay))
+        {
+            if (collection->report->preserved_local_state_count != SIZE_MAX)
+                collection->report->preserved_local_state_count++;
+        }
+        else if (replay->entry->kind == SIDECAR_KIND_REGULAR ||
+                 replay->entry->kind == SIDECAR_KIND_SYMLINK)
         {
             if (collection->report->applied_count != SIZE_MAX)
                 collection->report->applied_count++;
@@ -3276,12 +3441,29 @@ int portable_restore_replay_at(const PortableRestoreRequest *request,
         return -1;
     }
 
+    ReplayHomeRewritePair home_rewrite_pairs[
+        REPLAY_HOME_REWRITE_MAX_PAIRS] = {0};
+    size_t home_rewrite_pair_count = 0;
+    if (replay_home_rewrite_pairs_build(
+            request->manifest, request->destination_xdg_dirs,
+            request->destination_home_path, home_rewrite_pairs,
+            &home_rewrite_pair_count) != 0)
+    {
+        int saved = errno;
+        replay_report_step_failure(
+            report, request->manifest, SIZE_MAX, NULL,
+            PORTABLE_RESTORE_REPLAY_FAILURE_BUILD_HOME_REWRITE_TABLE, saved);
+        return -1;
+    }
+
     ReplayCollection collection = {
         .manifest = request->manifest,
         .data_fd = -1,
         .destination_home_fd = request->destination_home_fd,
         .destination_home_path = request->destination_home_path,
         .destination_xdg_dirs = request->destination_xdg_dirs,
+        .home_rewrite_pairs = home_rewrite_pairs,
+        .home_rewrite_pair_count = home_rewrite_pair_count,
         .timestamp_policy = timestamp_policy,
         .report = report,
         .capture_report = request->capture_report,

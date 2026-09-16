@@ -2516,6 +2516,11 @@ int restore_with_options(const char *source, const RestoreOptions *options)
                 break;
             }
         }
+        if (report.preserved_local_state_count != 0)
+            printf("Left %zu locally authoritative destination file%s "
+                   "untouched.\n",
+                   report.preserved_local_state_count,
+                   report.preserved_local_state_count == 1 ? "" : "s");
         if (report.skipped_security_xattr_count != 0)
             printf("Skipped %zu security.* attribute(s) that the destination "
                    "could not apply.\n",

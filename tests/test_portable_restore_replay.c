@@ -2117,6 +2117,106 @@ static int home_rewrite_fixture_open(Fixture *fixture, ManifestRoot roots[2],
     return 0;
 }
 
+static int xdg_home_rewrite_fixture_open(
+    Fixture *fixture, ManifestRoot roots[4], const char *bookmarks,
+    const char *recent)
+{
+    memset(roots, 0, 4U * sizeof(*roots));
+    strcpy(roots[0].id, "BUILTIN_DOT_CONFIG");
+    roots[0].policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(roots[0].payload_path, "BUILTIN_DOT_CONFIG");
+    strcpy(roots[0].source_path, ".config");
+    roots[0].has_restore_path = 1;
+    strcpy(roots[0].restore_path, ".config");
+
+    strcpy(roots[1].id, "BUILTIN_LOCAL_SHARE");
+    roots[1].policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(roots[1].payload_path, "BUILTIN_LOCAL_SHARE");
+    strcpy(roots[1].source_path, ".local/share");
+    roots[1].has_restore_path = 1;
+    strcpy(roots[1].restore_path, ".local/share");
+
+    strcpy(roots[2].id, "XDG_DOCUMENTS_DIR");
+    roots[2].policy = ROOT_POLICY_XDG;
+    strcpy(roots[2].payload_path, "XDG_DOCUMENTS_DIR");
+    strcpy(roots[2].source_path, "/source/home/Documents");
+
+    strcpy(roots[3].id, "XDG_DOWNLOAD_DIR");
+    roots[3].policy = ROOT_POLICY_XDG;
+    strcpy(roots[3].payload_path, "XDG_DOWNLOAD_DIR");
+    strcpy(roots[3].source_path, "/source/home/Downloads");
+
+    ManifestRoot initial = root_for();
+    if (fixture_open(fixture, &initial) != 0)
+        return -1;
+    Manifest manifest = {
+        .version = MANIFEST_SELECTION_VERSION,
+        .representation = CLONE_PORTABLE_SIDECAR,
+        .scope = MANIFEST_SCOPE_CRITICAL,
+        .sidecar_version = SIDECAR_VERSION,
+        .root_count = 4,
+        .roots = roots
+    };
+    strcpy(manifest.source_home, "/source/home");
+    if (manifest_write_v1_at(fixture->container_fd, &manifest) != 0)
+        return -1;
+
+    make_dir_at(fixture->data_fd, "BUILTIN_DOT_CONFIG", 0700);
+    int config_fd = openat(fixture->data_fd, "BUILTIN_DOT_CONFIG",
+                           O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (config_fd < 0)
+        fatal("could not open XDG rewrite config payload root");
+    make_dir_at(config_fd, "gtk-3.0", 0700);
+    int gtk_fd = openat(config_fd, "gtk-3.0",
+                        O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (gtk_fd < 0)
+        fatal("could not open XDG rewrite GTK payload directory");
+    write_file_at(gtk_fd, "bookmarks", bookmarks);
+    if (close(gtk_fd) != 0 || close(config_fd) != 0)
+        fatal("could not close XDG rewrite config payload root");
+
+    make_dir_at(fixture->data_fd, "BUILTIN_LOCAL_SHARE", 0700);
+    int share_fd = openat(fixture->data_fd, "BUILTIN_LOCAL_SHARE",
+                          O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (share_fd < 0)
+        fatal("could not open XDG rewrite share payload root");
+    write_file_at(share_fd, "recently-used.xbel", recent);
+    if (close(share_fd) != 0)
+        fatal("could not close XDG rewrite share payload root");
+    make_dir_at(fixture->data_fd, "XDG_DOCUMENTS_DIR", 0700);
+    make_dir_at(fixture->data_fd, "XDG_DOWNLOAD_DIR", 0700);
+
+    SidecarEntry entries[] = {
+        entry_for("BUILTIN_DOT_CONFIG", "", "",
+                  SIDECAR_KIND_DIRECTORY, 0, 0700, 1700000660, 1,
+                  1700000661, 2),
+        entry_for("BUILTIN_DOT_CONFIG", "gtk-3.0", "gtk-3.0",
+                  SIDECAR_KIND_DIRECTORY, 0, 0700, 1700000662, 3,
+                  1700000663, 4),
+        entry_for("BUILTIN_DOT_CONFIG", "gtk-3.0/bookmarks",
+                  "gtk-3.0/bookmarks", SIDECAR_KIND_REGULAR,
+                  strlen(bookmarks), 0600, 1700000664, 5,
+                  1700000665, 6),
+        entry_for("BUILTIN_LOCAL_SHARE", "", "",
+                  SIDECAR_KIND_DIRECTORY, 0, 0700, 1700000666, 7,
+                  1700000667, 8),
+        entry_for("BUILTIN_LOCAL_SHARE", "recently-used.xbel",
+                  "recently-used.xbel", SIDECAR_KIND_REGULAR,
+                  strlen(recent), 0600, 1700000668, 9,
+                  1700000669, 10),
+        entry_for("XDG_DOCUMENTS_DIR", "", "",
+                  SIDECAR_KIND_DIRECTORY, 0, 0700, 1700000670, 11,
+                  1700000671, 12),
+        entry_for("XDG_DOWNLOAD_DIR", "", "",
+                  SIDECAR_KIND_DIRECTORY, 0, 0700, 1700000672, 13,
+                  1700000673, 14)
+    };
+    if (write_sidecar(fixture, entries,
+                      sizeof(entries) / sizeof(entries[0]), NULL, NULL) != 0)
+        return -1;
+    return 0;
+}
+
 static int verification_exclusion_fixture_open(Fixture *fixture)
 {
     static const char gvfs_root_payload[] = "gvfs root payload";
@@ -2387,6 +2487,68 @@ static void test_known_desktop_state_rewrites_home(void)
               (size_t)capture_report.bytes_copied ==
                   strlen(bookmarks) + strlen(recent),
           "rewritten restore progress still counts source payload bytes");
+    fixture_close(&fixture);
+}
+
+static void test_known_desktop_state_rewrites_xdg_roots(void)
+{
+    printf(BLUE "::" NC
+           " known desktop-state files translate source XDG roots per key\n");
+    static const char bookmarks[] =
+        "file:///source/home/Documents/doc\n"
+        "file:///source/home/Downloads/download\n"
+        "file:///source/home/other fallback\n";
+    static const char recent[] =
+        "<bookmark href=\"file:///source/home/Downloads/recent\"/>"
+        "<bookmark href=\"file:///source/home/Documents/recent\"/>"
+        "<bookmark href=\"file:///source/home/other\"/>\n";
+
+    ManifestRoot roots[4];
+    Fixture fixture;
+    int opened = xdg_home_rewrite_fixture_open(
+        &fixture, roots, bookmarks, recent);
+    check(opened == 0, "per-key XDG rewrite fixture is created");
+    if (opened != 0)
+    {
+        fixture_close(&fixture);
+        return;
+    }
+
+    char documents[PATH_MAX], downloads[PATH_MAX];
+    path_join(documents, sizeof(documents), fixture.home, "/Belgeler");
+    path_join(downloads, sizeof(downloads), fixture.home, "/İndirilenler");
+    if (mkdir(documents, 0700) != 0 || mkdir(downloads, 0700) != 0)
+        fatal("could not create localized XDG destination directories");
+    const char *xdg_dirs[XDG_KEY_COUNT] = {0};
+    xdg_dirs[0] = documents;
+    xdg_dirs[1] = downloads;
+
+    PortableRestoreReplayReport report;
+    int result = run_replay_with_xdg(&fixture, &report, xdg_dirs);
+    check(result == 0 && report.failed_count == 0,
+          "per-key XDG desktop-state replay succeeds");
+
+    char expected_bookmarks[PATH_MAX * 4U];
+    char expected_recent[PATH_MAX * 4U];
+    snprintf(expected_bookmarks, sizeof(expected_bookmarks),
+             "file://%s/doc\n"
+             "file://%s/download\n"
+             "file://%s/other fallback\n",
+             documents, downloads, fixture.home);
+    snprintf(expected_recent, sizeof(expected_recent),
+             "<bookmark href=\"file://%s/recent\"/>"
+             "<bookmark href=\"file://%s/recent\"/>"
+             "<bookmark href=\"file://%s/other\"/>\n",
+             downloads, documents, fixture.home);
+
+    char restored_bookmarks[PATH_MAX], restored_recent[PATH_MAX];
+    path_join(restored_bookmarks, sizeof(restored_bookmarks), fixture.home,
+              "/.config/gtk-3.0/bookmarks");
+    path_join(restored_recent, sizeof(restored_recent), fixture.home,
+              "/.local/share/recently-used.xbel");
+    check(file_equals_noatime(restored_bookmarks, expected_bookmarks) &&
+              file_equals_noatime(restored_recent, expected_recent),
+          "longest per-key XDG prefixes beat the generic HOME fallback");
     fixture_close(&fixture);
 }
 
@@ -3482,6 +3644,7 @@ int main(void)
     test_hardlink_content_verification();
     test_live_desktop_state_verification_exclusion();
     test_known_desktop_state_rewrites_home();
+    test_known_desktop_state_rewrites_xdg_roots();
     test_known_desktop_state_same_home_is_verbatim();
     test_known_desktop_state_legacy_is_verbatim();
     test_capture_report_sync_accumulates();

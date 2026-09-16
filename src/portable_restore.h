@@ -62,6 +62,7 @@ typedef enum {
     PORTABLE_RESTORE_REPLAY_FAILURE_VALIDATE_ENTRY,
     PORTABLE_RESTORE_REPLAY_FAILURE_VALIDATE_ADDRESS_INDEX,
     PORTABLE_RESTORE_REPLAY_FAILURE_VALIDATE_MANIFEST_OWNERSHIP,
+    PORTABLE_RESTORE_REPLAY_FAILURE_BUILD_HOME_REWRITE_TABLE,
     PORTABLE_RESTORE_REPLAY_FAILURE_VERIFY_PLACEHOLDER,
     PORTABLE_RESTORE_REPLAY_FAILURE_RESOLVE_HARDLINK_ENTRY,
     PORTABLE_RESTORE_REPLAY_FAILURE_FIND_HARDLINK_ROOT,
@@ -99,6 +100,7 @@ typedef struct {
     size_t live_count;
     size_t applied_count;
     size_t failed_count;
+    size_t preserved_local_state_count;
     size_t skipped_security_xattr_count;
     size_t verification_checked_count;
     size_t verification_failed_count;

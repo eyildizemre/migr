@@ -950,6 +950,95 @@ static void test_normal_orchestration(void)
     fixture_close(&fixture);
 }
 
+static void test_user_dirs_is_preserved_as_local_state(void)
+{
+    printf(BLUE "::" NC
+           " portable restore preserves the destination user-dirs state\n");
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "BUILTIN_DOT_CONFIG");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "BUILTIN_DOT_CONFIG");
+    strcpy(root.source_path, ".config");
+    strcpy(root.restore_path, ".config");
+    root.has_restore_path = 1;
+
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "user-dirs preservation fixture is created");
+    if (opened != 0)
+        return;
+
+    Manifest manifest_model = {
+        .version = MANIFEST_SELECTION_VERSION,
+        .representation = CLONE_PORTABLE_SIDECAR,
+        .scope = MANIFEST_SCOPE_CRITICAL,
+        .sidecar_version = SIDECAR_VERSION,
+        .root_count = 1,
+        .roots = &root
+    };
+    strcpy(manifest_model.source_home, "/source/home");
+    check(manifest_write_v1_at(fixture.container_fd, &manifest_model) == 0,
+          "user-dirs preservation manifest is committed");
+
+    make_dir_at(fixture.data_fd, "BUILTIN_DOT_CONFIG", 0700);
+    int payload_fd = openat(fixture.data_fd, "BUILTIN_DOT_CONFIG",
+                            O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (payload_fd < 0)
+        fatal("could not open user-dirs preservation payload root");
+    static const char source_state[] =
+        "XDG_DOCUMENTS_DIR=\"$HOME/Documents\"\n";
+    write_file_at(payload_fd, "user-dirs.dirs", source_state);
+    if (close(payload_fd) != 0)
+        fatal("could not close user-dirs preservation payload root");
+
+    SidecarEntry entries[] = {
+        entry_for("BUILTIN_DOT_CONFIG", "", "", SIDECAR_KIND_DIRECTORY,
+                  0, 0700, (uint32_t)geteuid(), (uint32_t)getegid(),
+                  1700000680, 1, 1700000681, 2),
+        entry_for("BUILTIN_DOT_CONFIG", "user-dirs.dirs",
+                  "user-dirs.dirs", SIDECAR_KIND_REGULAR,
+                  sizeof(source_state) - 1U, 0600,
+                  (uint32_t)geteuid(), (uint32_t)getegid(),
+                  1700000682, 3, 1700000683, 4)
+    };
+    check(write_sidecar(&fixture, entries, 2) == 0,
+          "user-dirs preservation sidecar is committed");
+
+    make_dir_at(fixture.home_fd, ".config", 0700);
+    int config_fd = openat(fixture.home_fd, ".config",
+                           O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (config_fd < 0)
+        fatal("could not open destination config directory");
+    static const char destination_state[] =
+        "XDG_DOCUMENTS_DIR=\"$HOME/Belgeler\"\n";
+    write_file_at(config_fd, "user-dirs.dirs", destination_state);
+    if (close(config_fd) != 0)
+        fatal("could not close destination config directory");
+
+    PortableRestoreReplayReport report;
+    char output[4096];
+    OutputCapture capture;
+    output_capture_begin(&capture);
+    int result = run_orchestration(&fixture, &report, 1, "y\n");
+    output_capture_end(&capture, output, sizeof(output));
+
+    check(result == 0 && report.live_count == 2 &&
+              report.applied_count == 1 &&
+              report.preserved_local_state_count == 1 &&
+              report.failed_count == 0,
+          "user-dirs.dirs is excluded from applied content and counted separately");
+    char destination_path[PATH_MAX];
+    path_join_fixture(destination_path, sizeof(destination_path), fixture.home,
+                      "/.config/user-dirs.dirs");
+    check(file_equals(destination_path, destination_state),
+          "destination user-dirs.dirs remains byte-for-byte untouched");
+    check(strstr(output,
+                 "Portable restore left 1 locally authoritative file untouched") != NULL,
+          "portable summary names preserved local state separately");
+    fixture_close(&fixture);
+}
+
 static void test_security_xattr_tolerance_orchestration(void)
 {
     printf(BLUE "::" NC " portable security.* xattr tolerance orchestration\n");
@@ -2158,6 +2247,7 @@ int main(void)
 {
     test_invalid_request_still_zeroes_report();
     test_normal_orchestration();
+    test_user_dirs_is_preserved_as_local_state();
     test_security_xattr_tolerance_orchestration();
     test_hardlink_orchestration();
     test_hardlink_cross_root();

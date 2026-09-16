@@ -3855,3 +3855,43 @@ query process per requested package.
 **Relationship:** Supersedes D40 and the per-package fallback portion of D2. D1's
 exact skipped-package artifact and summary, D12's explicit-package export, and the
 distro-specific install commands remain in force.
+
+---
+
+## D47 — 2026-09-16 — Translate XDG names in known desktop state and preserve destination user-dirs state
+
+**Status:** Implemented
+
+**Decision:** Extend D41's bounded `file://` rewrite for VERSION=2 portable
+selection restores with one source-to-destination pair for every captured XDG
+root. The source side comes from the manifest root's absolute source path and the
+destination side comes from the invocation's already-resolved, frozen XDG target
+map. When more than one pair can begin at the same byte position, the longest
+component-boundary-valid source prefix wins. The generic source-HOME to
+destination-HOME pair remains the lowest-priority fallback for paths outside the
+known XDG roots. No URI parser, Unicode normalizer, or locale-aware comparator is
+introduced.
+
+`~/.config/user-dirs.dirs` is destination-owned state. If it is selected in the
+same versioned portable restore, migr leaves the destination copy untouched and
+omits the source entry from content verification. The final report counts it as
+preserved locally authoritative state rather than as an applied entry.
+
+Same-HOME known desktop-state restores, legacy manifests without a recorded
+source HOME, and all other non-authoritative regular files retain their
+previous byte-for-byte behavior. The destination-owned `user-dirs.dirs` file
+remains preserved even when HOME paths are otherwise unchanged. The existing
+native restore path is unchanged; this decision applies to the portable replay
+boundary where D41 operates.
+
+**Why:** XDG directory names are locale-specific. Rewriting only the captured
+HOME leaves GTK bookmarks and recent-file URIs pointing at the source locale's
+directory names after a cross-locale restore, even though content placement already
+uses the destination locale's frozen XDG map. The destination's
+`user-dirs.dirs` is likewise generated and owned locally, so restoring the source
+copy would invalidate the same map for later desktop sessions. The bounded pair
+table keeps both fixes in the existing literal-prefix mechanism and computes the
+mapping once per restore.
+
+**Relationship:** Extends D41's known desktop-state rewrite and applies D44's
+locally-authoritative-state principle to `user-dirs.dirs`.
