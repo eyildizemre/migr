@@ -3183,26 +3183,44 @@ static int replay_verify_hardlink(ReplayCollection *collection,
     return result;
 }
 
+typedef struct {
+    const char *root_id;
+    const char *logical_prefix;
+} ReplayContentVerificationExclusion;
+
 static int replay_regular_content_verification_excluded(
     const SidecarEntry *entry)
 {
-    static const char root_id[] = "BUILTIN_LOCAL_SHARE";
-    static const char logical_prefix[] = "gvfs-metadata";
-    const size_t root_id_length = sizeof(root_id) - 1U;
-    const size_t logical_prefix_length = sizeof(logical_prefix) - 1U;
+    static const ReplayContentVerificationExclusion exclusions[] = {
+        { "BUILTIN_LOCAL_SHARE", "gvfs-metadata" },
+        { "BUILTIN_DOT_CONFIG", "dconf/user" },
+        { "BUILTIN_LOCAL_SHARE", "gnome-shell/application_state" },
+        { "BUILTIN_LOCAL_SHARE", "flatpak" },
+        { "BUILTIN_LOCAL_SHARE", "org.gnome.TextEditor" }
+    };
 
     if (entry == NULL || entry->kind != SIDECAR_KIND_REGULAR ||
-        entry->root_id.data == NULL ||
-        entry->root_id.length != root_id_length ||
-        memcmp(entry->root_id.data, root_id, root_id_length) != 0 ||
-        entry->logical_path.data == NULL ||
-        entry->logical_path.length < logical_prefix_length ||
-        memcmp(entry->logical_path.data, logical_prefix,
-               logical_prefix_length) != 0)
+        entry->root_id.data == NULL || entry->logical_path.data == NULL)
         return 0;
 
-    return entry->logical_path.length == logical_prefix_length ||
-           entry->logical_path.data[logical_prefix_length] == '/';
+    for (size_t index = 0;
+         index < sizeof(exclusions) / sizeof(exclusions[0]); index++)
+    {
+        const char *root_id = exclusions[index].root_id;
+        const char *logical_prefix = exclusions[index].logical_prefix;
+        size_t root_id_length = strlen(root_id);
+        size_t logical_prefix_length = strlen(logical_prefix);
+        if (entry->root_id.length != root_id_length ||
+            memcmp(entry->root_id.data, root_id, root_id_length) != 0 ||
+            entry->logical_path.length < logical_prefix_length ||
+            memcmp(entry->logical_path.data, logical_prefix,
+                   logical_prefix_length) != 0)
+            continue;
+
+        return entry->logical_path.length == logical_prefix_length ||
+               entry->logical_path.data[logical_prefix_length] == '/';
+    }
+    return 0;
 }
 
 static int replay_content_verification_excluded(

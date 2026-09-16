@@ -3895,3 +3895,35 @@ mapping once per restore.
 
 **Relationship:** Extends D41's known desktop-state rewrite and applies D44's
 locally-authoritative-state principle to `user-dirs.dirs`.
+
+## D48 — 2026-09-16 — Extend live-state verification exclusions with measured desktop paths
+
+**Status:** Implemented
+
+**Decision:** Extend D44's explicit regular-file verification exclusion table
+with `BUILTIN_DOT_CONFIG:dconf/user`,
+`BUILTIN_LOCAL_SHARE:gnome-shell/application_state`, and the
+`BUILTIN_LOCAL_SHARE:flatpak` and
+`BUILTIN_LOCAL_SHARE:org.gnome.TextEditor` subtrees. The first two paths match
+only at their named path-component boundary; the latter two match their named
+subtrees. All four groups remain selected, copied, replayed, and accounted for
+normally; only the post-copy destination content read-back and its verification
+accounting omit them. Similar names and paths under another root remain subject
+to normal verification.
+
+**Why:** An independent SHA-256 cross-check of every distinct payload content
+hash in a real 39 GB, 221,605-item backup and its restored destination found
+these four groups changing under live desktop management, with no indication of
+a backup or replay defect. The named exclusions therefore extend D44's measured
+exception-list approach rather than guessing from a process or filesystem
+classifier. Keeping the matching component-boundary-aware also preserves the
+existing protection against lookalike siblings such as `flatpak-notes` and
+`gnome-shell-extra`.
+
+**Rejected:** excluding all of `dconf` or `gnome-shell`; disabling verification
+for all of `.local/share`; detecting live ownership dynamically; delaying and
+retrying the comparison; or suppressing these paths from backup or replay.
+
+**Relationship:** Extends D44's named live-state verification exceptions. D47's
+destination-owned `user-dirs.dirs` handling and all backup/replay behavior are
+unchanged.

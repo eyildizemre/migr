@@ -2295,6 +2295,213 @@ static int verification_exclusion_fixture_open(Fixture *fixture)
     return 0;
 }
 
+static const char additional_dconf_user_payload[] = "dconf user payload";
+static const char additional_dconf_user_lookalike_payload[] =
+    "dconf user lookalike payload";
+static const char additional_application_state_payload[] =
+    "application state payload";
+static const char additional_application_state_lookalike_payload[] =
+    "application state lookalike payload";
+static const char additional_flatpak_summary_payload[] =
+    "flatpak summary payload";
+static const char additional_flatpak_ref_payload[] = "flatpak ref payload";
+static const char additional_flatpak_appstream_payload[] =
+    "flatpak appstream payload";
+static const char additional_text_editor_session_payload[] =
+    "text editor session payload";
+static const char additional_text_editor_recent_payload[] =
+    "text editor recent payload";
+static const char additional_flatpak_lookalike_payload[] =
+    "flatpak lookalike payload";
+static const char additional_gnome_shell_lookalike_payload[] =
+    "gnome shell lookalike payload";
+
+static int additional_live_state_fixture_open(Fixture *fixture)
+{
+    ManifestRoot initial = root_for();
+    if (fixture_open(fixture, &initial) != 0)
+        return -1;
+
+    ManifestRoot roots[2];
+    if (write_home_rewrite_manifest(fixture, roots, MANIFEST_CURRENT_VERSION,
+                                    NULL) != 0)
+    {
+        fixture_close(fixture);
+        return -1;
+    }
+
+    make_dir_at(fixture->data_fd, "BUILTIN_DOT_CONFIG", 0700);
+    int config_fd = openat(fixture->data_fd, "BUILTIN_DOT_CONFIG",
+                           O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (config_fd < 0)
+        fatal("could not open additional live-state config payload root");
+    make_dir_at(config_fd, "dconf", 0700);
+    write_file_at(config_fd, "dconf/user", additional_dconf_user_payload);
+    write_file_at(config_fd, "dconf/user-extra",
+                  additional_dconf_user_lookalike_payload);
+    if (close(config_fd) != 0)
+        fatal("could not close additional live-state config payload root");
+
+    make_dir_at(fixture->data_fd, "BUILTIN_LOCAL_SHARE", 0700);
+    int share_fd = openat(fixture->data_fd, "BUILTIN_LOCAL_SHARE",
+                          O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (share_fd < 0)
+        fatal("could not open additional live-state share payload root");
+    make_dir_at(share_fd, "gnome-shell", 0700);
+    write_file_at(share_fd, "gnome-shell/application_state",
+                  additional_application_state_payload);
+    write_file_at(share_fd, "gnome-shell/application_state-extra",
+                  additional_application_state_lookalike_payload);
+    make_dir_at(share_fd, "flatpak", 0700);
+    make_dir_at(share_fd, "flatpak/repo", 0700);
+    make_dir_at(share_fd, "flatpak/repo/tmp", 0700);
+    make_dir_at(share_fd, "flatpak/repo/tmp/cache", 0700);
+    make_dir_at(share_fd, "flatpak/repo/tmp/cache/summaries", 0700);
+    write_file_at(share_fd, "flatpak/repo/tmp/cache/summaries/remote",
+                  additional_flatpak_summary_payload);
+    make_dir_at(share_fd, "flatpak/repo/refs", 0700);
+    make_dir_at(share_fd, "flatpak/repo/refs/remotes", 0700);
+    make_dir_at(share_fd, "flatpak/repo/refs/remotes/flathub", 0700);
+    make_dir_at(share_fd, "flatpak/repo/refs/remotes/flathub/appstream2",
+                0700);
+    write_file_at(share_fd,
+                  "flatpak/repo/refs/remotes/flathub/appstream2/x86_64",
+                  additional_flatpak_ref_payload);
+    make_dir_at(share_fd, "flatpak/appstream", 0700);
+    make_dir_at(share_fd, "flatpak/appstream/flathub", 0700);
+    make_dir_at(share_fd, "flatpak/appstream/flathub/x86_64", 0700);
+    write_file_at(share_fd,
+                  "flatpak/appstream/flathub/x86_64/appstream.xml.gz",
+                  additional_flatpak_appstream_payload);
+    make_dir_at(share_fd, "org.gnome.TextEditor", 0700);
+    write_file_at(share_fd, "org.gnome.TextEditor/session.gvariant",
+                  additional_text_editor_session_payload);
+    write_file_at(share_fd, "org.gnome.TextEditor/recently-used.xbel",
+                  additional_text_editor_recent_payload);
+    write_file_at(share_fd, "flatpak-notes",
+                  additional_flatpak_lookalike_payload);
+    write_file_at(share_fd, "gnome-shell-extra",
+                  additional_gnome_shell_lookalike_payload);
+    if (close(share_fd) != 0)
+        fatal("could not close additional live-state share payload root");
+
+    SidecarEntry entries[] = {
+        entry_for("BUILTIN_DOT_CONFIG", "", "", SIDECAR_KIND_DIRECTORY,
+                  0, 0700, 1700000700, 1, 1700000701, 2),
+        entry_for("BUILTIN_DOT_CONFIG", "dconf", "dconf",
+                  SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000702, 3, 1700000703, 4),
+        entry_for("BUILTIN_DOT_CONFIG", "dconf/user", "dconf/user",
+                  SIDECAR_KIND_REGULAR,
+                  strlen(additional_dconf_user_payload), 0600,
+                  1700000704, 5, 1700000705, 6),
+        entry_for("BUILTIN_DOT_CONFIG", "dconf/user-extra",
+                  "dconf/user-extra", SIDECAR_KIND_REGULAR,
+                  strlen(additional_dconf_user_lookalike_payload), 0600,
+                  1700000706, 7, 1700000707, 8),
+        entry_for("BUILTIN_LOCAL_SHARE", "", "", SIDECAR_KIND_DIRECTORY,
+                  0, 0700, 1700000708, 9, 1700000709, 10),
+        entry_for("BUILTIN_LOCAL_SHARE", "gnome-shell", "gnome-shell",
+                  SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000710, 11, 1700000711, 12),
+        entry_for("BUILTIN_LOCAL_SHARE", "gnome-shell/application_state",
+                  "gnome-shell/application_state", SIDECAR_KIND_REGULAR,
+                  strlen(additional_application_state_payload), 0600,
+                  1700000712, 13, 1700000713, 14),
+        entry_for("BUILTIN_LOCAL_SHARE",
+                  "gnome-shell/application_state-extra",
+                  "gnome-shell/application_state-extra", SIDECAR_KIND_REGULAR,
+                  strlen(additional_application_state_lookalike_payload), 0600,
+                  1700000714, 15, 1700000715, 16),
+        entry_for("BUILTIN_LOCAL_SHARE", "flatpak", "flatpak",
+                  SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000716, 17, 1700000717, 18),
+        entry_for("BUILTIN_LOCAL_SHARE", "flatpak/repo", "flatpak/repo",
+                  SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000718, 19, 1700000719, 20),
+        entry_for("BUILTIN_LOCAL_SHARE", "flatpak/repo/tmp",
+                  "flatpak/repo/tmp", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000720, 21, 1700000721, 22),
+        entry_for("BUILTIN_LOCAL_SHARE", "flatpak/repo/tmp/cache",
+                  "flatpak/repo/tmp/cache", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000722, 23, 1700000723, 24),
+        entry_for("BUILTIN_LOCAL_SHARE",
+                  "flatpak/repo/tmp/cache/summaries",
+                  "flatpak/repo/tmp/cache/summaries", SIDECAR_KIND_DIRECTORY,
+                  0, 0700, 1700000724, 25, 1700000725, 26),
+        entry_for("BUILTIN_LOCAL_SHARE",
+                  "flatpak/repo/tmp/cache/summaries/remote",
+                  "flatpak/repo/tmp/cache/summaries/remote",
+                  SIDECAR_KIND_REGULAR,
+                  strlen(additional_flatpak_summary_payload), 0600,
+                  1700000726, 27, 1700000727, 28),
+        entry_for("BUILTIN_LOCAL_SHARE", "flatpak/repo/refs",
+                  "flatpak/repo/refs", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000728, 29, 1700000729, 30),
+        entry_for("BUILTIN_LOCAL_SHARE", "flatpak/repo/refs/remotes",
+                  "flatpak/repo/refs/remotes", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000730, 31, 1700000731, 32),
+        entry_for("BUILTIN_LOCAL_SHARE", "flatpak/repo/refs/remotes/flathub",
+                  "flatpak/repo/refs/remotes/flathub", SIDECAR_KIND_DIRECTORY,
+                  0, 0700, 1700000732, 33, 1700000733, 34),
+        entry_for("BUILTIN_LOCAL_SHARE",
+                  "flatpak/repo/refs/remotes/flathub/appstream2",
+                  "flatpak/repo/refs/remotes/flathub/appstream2",
+                  SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000734, 35, 1700000735, 36),
+        entry_for("BUILTIN_LOCAL_SHARE",
+                  "flatpak/repo/refs/remotes/flathub/appstream2/x86_64",
+                  "flatpak/repo/refs/remotes/flathub/appstream2/x86_64",
+                  SIDECAR_KIND_REGULAR, strlen(additional_flatpak_ref_payload),
+                  0600, 1700000736, 37, 1700000737, 38),
+        entry_for("BUILTIN_LOCAL_SHARE", "flatpak/appstream",
+                  "flatpak/appstream", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000738, 39, 1700000739, 40),
+        entry_for("BUILTIN_LOCAL_SHARE", "flatpak/appstream/flathub",
+                  "flatpak/appstream/flathub", SIDECAR_KIND_DIRECTORY,
+                  0, 0700, 1700000740, 41, 1700000741, 42),
+        entry_for("BUILTIN_LOCAL_SHARE", "flatpak/appstream/flathub/x86_64",
+                  "flatpak/appstream/flathub/x86_64", SIDECAR_KIND_DIRECTORY,
+                  0, 0700, 1700000742, 43, 1700000743, 44),
+        entry_for("BUILTIN_LOCAL_SHARE",
+                  "flatpak/appstream/flathub/x86_64/appstream.xml.gz",
+                  "flatpak/appstream/flathub/x86_64/appstream.xml.gz",
+                  SIDECAR_KIND_REGULAR,
+                  strlen(additional_flatpak_appstream_payload), 0600,
+                  1700000744, 45, 1700000745, 46),
+        entry_for("BUILTIN_LOCAL_SHARE", "org.gnome.TextEditor",
+                  "org.gnome.TextEditor", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000746, 47, 1700000747, 48),
+        entry_for("BUILTIN_LOCAL_SHARE",
+                  "org.gnome.TextEditor/session.gvariant",
+                  "org.gnome.TextEditor/session.gvariant",
+                  SIDECAR_KIND_REGULAR,
+                  strlen(additional_text_editor_session_payload), 0600,
+                  1700000748, 49, 1700000749, 50),
+        entry_for("BUILTIN_LOCAL_SHARE",
+                  "org.gnome.TextEditor/recently-used.xbel",
+                  "org.gnome.TextEditor/recently-used.xbel",
+                  SIDECAR_KIND_REGULAR,
+                  strlen(additional_text_editor_recent_payload), 0600,
+                  1700000750, 51, 1700000751, 52),
+        entry_for("BUILTIN_LOCAL_SHARE", "flatpak-notes", "flatpak-notes",
+                  SIDECAR_KIND_REGULAR,
+                  strlen(additional_flatpak_lookalike_payload), 0600,
+                  1700000752, 53, 1700000753, 54),
+        entry_for("BUILTIN_LOCAL_SHARE", "gnome-shell-extra",
+                  "gnome-shell-extra", SIDECAR_KIND_REGULAR,
+                  strlen(additional_gnome_shell_lookalike_payload), 0600,
+                  1700000754, 55, 1700000755, 56)
+    };
+    if (write_sidecar(fixture, entries,
+                      sizeof(entries) / sizeof(entries[0]), NULL, NULL) != 0)
+    {
+        fixture_close(fixture);
+        return -1;
+    }
+    return 0;
+}
+
 typedef struct {
     Fixture *fixture;
     const char *relative_paths[2];
@@ -2420,6 +2627,106 @@ static void test_live_desktop_state_verification_exclusion(void)
               "the same logical path under another root remains verified");
         fixture_close(&other_root);
     }
+}
+
+static void test_additional_live_state_path(
+    const char *relative_one, const char *expected_one,
+    const char *relative_two, const char *expected_two, size_t count,
+    size_t expected_checked_count, const char *label)
+{
+    Fixture fixture;
+    int opened = additional_live_state_fixture_open(&fixture);
+    check(opened == 0, "additional live-state verification fixture is created");
+    if (opened != 0)
+        return;
+
+    VerificationPathMutationProbe probe = {
+        .fixture = &fixture,
+        .relative_paths = { relative_one, relative_two },
+        .expected_contents = { expected_one, expected_two },
+        .count = count
+    };
+    PortableRestoreReplayReport report;
+    portable_restore_replay_test_reset_verification_regular_read_count();
+    int result = run_replay_with_options(
+        &fixture, &report, NULL, 0, mutate_verification_paths, &probe);
+    check(probe.restored_contents_match && result == 0 &&
+              report.failed_count == 0 &&
+              report.verification_failed_count == 0 &&
+              report.verification_checked_count == expected_checked_count &&
+              portable_restore_replay_test_verification_regular_read_count() ==
+                  expected_checked_count,
+          label);
+    fixture_close(&fixture);
+}
+
+static void test_additional_live_state_boundary(
+    const char *relative, const char *expected, const char *logical_path,
+    const char *label)
+{
+    Fixture fixture;
+    int opened = additional_live_state_fixture_open(&fixture);
+    check(opened == 0, "additional live-state boundary fixture is created");
+    if (opened != 0)
+        return;
+
+    VerificationPathMutationProbe probe = {
+        .fixture = &fixture,
+        .relative_paths = { relative },
+        .expected_contents = { expected },
+        .count = 1
+    };
+    PortableRestoreReplayReport report;
+    portable_restore_replay_test_reset_verification_regular_read_count();
+    int result = run_replay_with_options(
+        &fixture, &report, NULL, 0, mutate_verification_paths, &probe);
+    check(probe.restored_contents_match && result != 0 &&
+              report.verification_checked_count > 0 &&
+              report.verification_checked_count <= 4 &&
+              report.verification_failed_count == 1 &&
+              portable_restore_replay_test_verification_regular_read_count() ==
+                  report.verification_checked_count &&
+              strcmp(report.failed_root_id, "BUILTIN_LOCAL_SHARE") == 0 &&
+              strcmp(report.failed_logical_path, logical_path) == 0 &&
+              report.failure_step ==
+                  PORTABLE_RESTORE_REPLAY_FAILURE_COMPARE_DESTINATION_CONTENT &&
+              report.failure_errno == EIO,
+          label);
+    fixture_close(&fixture);
+}
+
+static void test_additional_live_desktop_state_verification_exclusions(void)
+{
+    printf(BLUE "::" NC " additional confirmed live state is excluded only from verification\n");
+
+    test_additional_live_state_path(
+        ".config/dconf/user", additional_dconf_user_payload, NULL, NULL, 1,
+        4, "dconf/user is restored but omitted from content verification");
+    test_additional_live_state_path(
+        ".local/share/gnome-shell/application_state",
+        additional_application_state_payload, NULL, NULL, 1, 4,
+        "gnome-shell/application_state is restored but omitted from content verification");
+    test_additional_live_state_path(
+        ".local/share/flatpak/repo/tmp/cache/summaries/remote",
+        additional_flatpak_summary_payload,
+        ".local/share/flatpak/appstream/flathub/x86_64/appstream.xml.gz",
+        additional_flatpak_appstream_payload, 2, 4,
+        "flatpak descendants are restored but omitted from content verification");
+    test_additional_live_state_path(
+        ".local/share/org.gnome.TextEditor/session.gvariant",
+        additional_text_editor_session_payload,
+        ".local/share/org.gnome.TextEditor/recently-used.xbel",
+        additional_text_editor_recent_payload, 2, 4,
+        "Text Editor state descendants are restored but omitted from content verification");
+
+    test_additional_live_state_boundary(
+        ".local/share/flatpak-notes", additional_flatpak_lookalike_payload,
+        "flatpak-notes",
+        "flatpak-notes remains content-verified despite the flatpak rule");
+    test_additional_live_state_boundary(
+        ".local/share/gnome-shell-extra",
+        additional_gnome_shell_lookalike_payload, "gnome-shell-extra",
+        "gnome-shell-extra remains content-verified despite the gnome-shell rule");
 }
 
 static void test_known_desktop_state_rewrites_home(void)
@@ -3643,6 +3950,7 @@ int main(void)
     test_symlink_content_verification();
     test_hardlink_content_verification();
     test_live_desktop_state_verification_exclusion();
+    test_additional_live_desktop_state_verification_exclusions();
     test_known_desktop_state_rewrites_home();
     test_known_desktop_state_rewrites_xdg_roots();
     test_known_desktop_state_same_home_is_verbatim();
