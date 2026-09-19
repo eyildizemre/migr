@@ -788,7 +788,7 @@ static SidecarStatus ready_log(SidecarLog *log,
     return SIDECAR_STATUS_OK;
 }
 
-// Shared by all five sidecar_log_append_*() functions: the boundary check
+// Shared by all sidecar_log_append_*() functions: the boundary check
 // and poison-or-OK tail that runs once a record's own write and map
 // mutation have already succeeded.
 static SidecarStatus finish_append(SidecarLogImplementation *implementation)
@@ -896,6 +896,85 @@ SidecarStatus sidecar_log_append_entry_commit(SidecarLog *log)
     }
     map_apply_commit(&implementation->memory, &implementation->map,
                      &implementation->pending, existing_index, hash);
+    if (claim_index != MAP_INDEX_NONE)
+    {
+        status = map_apply_remove(&implementation->memory,
+                                  &implementation->claim_map, claim_index);
+        if (status != SIDECAR_STATUS_OK)
+        {
+            poison(implementation);
+            return status;
+        }
+    }
+    return finish_append(implementation);
+}
+
+SidecarStatus sidecar_log_append_group(SidecarLog *log,
+                                       const SidecarEntry *entry,
+                                       const SidecarXattr *xattrs)
+{
+    SidecarLogImplementation *implementation = NULL;
+    SidecarStatus status = ready_log(log, &implementation);
+    if (status != SIDECAR_STATUS_OK || entry == NULL)
+        return status != SIDECAR_STATUS_OK ? status
+                                           : SIDECAR_STATUS_INVALID_ARGUMENT;
+    if (implementation->pending.entry.entry.root_id.data != NULL)
+        return SIDECAR_STATUS_INVALID_ARGUMENT;
+    if ((entry->xattr_count == 0U) != (xattrs == NULL))
+    {
+        set_invalid_error();
+        return SIDECAR_STATUS_INVALID_ARGUMENT;
+    }
+
+    PendingEntry pending = {0};
+    status = copy_entry(&implementation->memory, entry, &pending.entry);
+    if (status != SIDECAR_STATUS_OK)
+        return status;
+    for (uint32_t index = 0; index < entry->xattr_count; index++)
+    {
+        status = copy_xattr(&implementation->memory, &xattrs[index],
+                            &pending.entry.xattrs[index]);
+        if (status != SIDECAR_STATUS_OK)
+        {
+            clear_entry(&implementation->memory, &pending.entry);
+            return status;
+        }
+    }
+    pending.xattrs_seen = entry->xattr_count;
+
+    status = validate_parent_topology(implementation,
+                                      pending.entry.entry.root_id,
+                                      pending.entry.entry.logical_path,
+                                      SIDECAR_STATUS_INVALID_ARGUMENT);
+    if (status != SIDECAR_STATUS_OK)
+    {
+        clear_entry(&implementation->memory, &pending.entry);
+        return status;
+    }
+
+    size_t existing_index = 0;
+    size_t claim_index = MAP_INDEX_NONE;
+    uint64_t hash = 0;
+    status = prepare_claim_consumption(
+        &implementation->claim_map, &pending.entry.entry, &claim_index);
+    if (status == SIDECAR_STATUS_OK)
+        status = map_prepare_commit(&implementation->memory,
+                                    &implementation->map, &pending.entry,
+                                    &existing_index, &hash);
+    if (status != SIDECAR_STATUS_OK)
+    {
+        clear_entry(&implementation->memory, &pending.entry);
+        return status;
+    }
+    if (sidecar_write_entry_group(implementation->fd, entry, xattrs) != 0)
+    {
+        status = status_from_errno();
+        clear_entry(&implementation->memory, &pending.entry);
+        poison(implementation);
+        return status;
+    }
+    map_apply_commit(&implementation->memory, &implementation->map, &pending,
+                     existing_index, hash);
     if (claim_index != MAP_INDEX_NONE)
     {
         status = map_apply_remove(&implementation->memory,

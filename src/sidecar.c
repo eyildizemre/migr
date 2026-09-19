@@ -47,6 +47,10 @@ void sidecar_test_set_interrupt(SidecarTestInterruptPoint point)
 #define SIDECAR_KIND_MAX 32U
 #define SIDECAR_READ_BUFFER 16384U
 
+enum {
+    SIDECAR_APPEND_ENTRY_GROUP = -2
+};
+
 typedef struct {
     unsigned char *data;
     size_t length;
@@ -327,6 +331,10 @@ static int append_buffer(int fd, const SidecarBuffer *buffer,
         before = SIDECAR_TEST_BEFORE_ENTRY_COMMIT;
         after = SIDECAR_TEST_AFTER_ENTRY_COMMIT;
         middle = SIDECAR_TEST_MID_ENTRY_COMMIT;
+    } else if (record_type == SIDECAR_APPEND_ENTRY_GROUP) {
+        before = SIDECAR_TEST_BEFORE_GROUP;
+        after = SIDECAR_TEST_AFTER_GROUP;
+        middle = SIDECAR_TEST_MID_GROUP;
     } else if (record_type == SIDECAR_RECORD_DELETE) {
         before = SIDECAR_TEST_BEFORE_DELETE;
         after = SIDECAR_TEST_AFTER_DELETE;
@@ -339,6 +347,11 @@ static int append_buffer(int fd, const SidecarBuffer *buffer,
     if (before != SIDECAR_TEST_INTERRUPT_NONE &&
         sidecar_test_interrupt_point == (sig_atomic_t)before)
         (void)kill(getpid(), SIGKILL);
+    if (record_type == SIDECAR_APPEND_ENTRY_GROUP &&
+        sidecar_test_interrupt_point == (sig_atomic_t)SIDECAR_TEST_FAIL_GROUP) {
+        errno = EIO;
+        return -1;
+    }
     if (middle != SIDECAR_TEST_INTERRUPT_NONE &&
         sidecar_test_interrupt_point == (sig_atomic_t)middle) {
         size_t partial = buffer->length / 2U;
@@ -523,6 +536,23 @@ static int build_xattr_buffer(const SidecarXattr *xattr, SidecarBuffer *buffer)
     return 0;
 }
 
+static int build_entry_group_buffer(const SidecarEntry *entry,
+                                    const SidecarXattr *xattrs,
+                                    SidecarBuffer *buffer)
+{
+    if (entry == NULL || ((entry->xattr_count == 0U) != (xattrs == NULL)))
+    {
+        set_invalid_error();
+        return -1;
+    }
+    if (build_entry_buffer(entry, buffer) != 0)
+        return -1;
+    for (uint32_t index = 0; index < entry->xattr_count; index++)
+        if (build_xattr_buffer(&xattrs[index], buffer) != 0)
+            return -1;
+    return buffer_append_tag(buffer, tag_entry_commit);
+}
+
 static int build_claim_buffer(const SidecarClaim *claim, SidecarBuffer *buffer)
 {
     if (validate_claim(claim) != 0)
@@ -595,6 +625,17 @@ int sidecar_write_entry_commit(int fd)
     int result = -1;
     if (buffer_append_tag(&buffer, tag_entry_commit) == 0)
         result = append_buffer(fd, &buffer, SIDECAR_RECORD_ENTRY_COMMIT);
+    buffer_free(&buffer);
+    return result;
+}
+
+int sidecar_write_entry_group(int fd, const SidecarEntry *entry,
+                              const SidecarXattr *xattrs)
+{
+    SidecarBuffer buffer = {0};
+    int result = -1;
+    if (build_entry_group_buffer(entry, xattrs, &buffer) == 0)
+        result = append_buffer(fd, &buffer, SIDECAR_APPEND_ENTRY_GROUP);
     buffer_free(&buffer);
     return result;
 }

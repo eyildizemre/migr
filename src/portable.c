@@ -1878,14 +1878,11 @@ static int append_group(PortableCaptureContext *context,
                         const SidecarEntry *entry,
                         const PortableXattrs *xattrs)
 {
-    SidecarStatus status = sidecar_log_append_entry(context->sidecar, entry);
-    if (status != SIDECAR_STATUS_OK)
+    size_t xattr_count = xattrs == NULL ? 0U : xattrs->count;
+    if (entry == NULL || xattr_count != entry->xattr_count)
         return -1;
-    for (size_t index = 0; xattrs != NULL && index < xattrs->count; index++)
-        if (sidecar_log_append_xattr(context->sidecar, &xattrs->items[index]) !=
-            SIDECAR_STATUS_OK)
-            return -1;
-    status = sidecar_log_append_entry_commit(context->sidecar);
+    SidecarStatus status = sidecar_log_append_group(
+        context->sidecar, entry, xattrs != NULL ? xattrs->items : NULL);
     return status == SIDECAR_STATUS_OK ? 0 : -1;
 }
 

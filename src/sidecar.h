@@ -157,6 +157,8 @@ int sidecar_write_header(int fd);
 int sidecar_write_entry(int fd, const SidecarEntry *entry);
 int sidecar_write_xattr(int fd, const SidecarXattr *xattr);
 int sidecar_write_entry_commit(int fd);
+int sidecar_write_entry_group(int fd, const SidecarEntry *entry,
+                              const SidecarXattr *xattrs);
 int sidecar_write_delete(int fd, const SidecarDelete *deletion);
 int sidecar_write_claim(int fd, const SidecarClaim *claim);
 int sidecar_claim_kind_valid(SidecarObjectKind kind);
@@ -183,6 +185,9 @@ SidecarStatus sidecar_log_append_entry(SidecarLog *log,
 SidecarStatus sidecar_log_append_xattr(SidecarLog *log,
                                        const SidecarXattr *xattr);
 SidecarStatus sidecar_log_append_entry_commit(SidecarLog *log);
+SidecarStatus sidecar_log_append_group(SidecarLog *log,
+                                       const SidecarEntry *entry,
+                                       const SidecarXattr *xattrs);
 SidecarStatus sidecar_log_append_delete(SidecarLog *log,
                                         const SidecarDelete *deletion);
 SidecarStatus sidecar_log_append_claim(SidecarLog *log,
@@ -217,6 +222,10 @@ typedef enum {
     SIDECAR_TEST_BEFORE_ENTRY_COMMIT,
     SIDECAR_TEST_AFTER_ENTRY_COMMIT,
     SIDECAR_TEST_MID_ENTRY_COMMIT,
+    SIDECAR_TEST_BEFORE_GROUP,
+    SIDECAR_TEST_AFTER_GROUP,
+    SIDECAR_TEST_MID_GROUP,
+    SIDECAR_TEST_FAIL_GROUP,
     SIDECAR_TEST_BEFORE_DELETE,
     SIDECAR_TEST_AFTER_DELETE,
     SIDECAR_TEST_MID_DELETE,

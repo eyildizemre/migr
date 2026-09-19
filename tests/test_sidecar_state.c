@@ -27,6 +27,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "sidecar.h"
@@ -226,6 +227,516 @@ static SidecarXattr sample_xattr(void)
         .name = { (const unsigned char *)"user.state", 10 },
         .value = { value, sizeof(value) }
     };
+}
+
+static SidecarXattr text_xattr(const char *name, const char *value)
+{
+    return (SidecarXattr){
+        .name = { (const unsigned char *)name, strlen(name) },
+        .value = { (const unsigned char *)value,
+                   value == NULL ? 0U : strlen(value) }
+    };
+}
+
+static int sidecar_bytes_equal(SidecarBytes left, SidecarBytes right)
+{
+    return left.length == right.length &&
+           (left.length == 0 ||
+            (left.data != NULL && right.data != NULL &&
+             memcmp(left.data, right.data, left.length) == 0));
+}
+
+static int sidecar_live_views_equal(const SidecarLiveView *left,
+                                    const SidecarLiveView *right)
+{
+    if (left == NULL || right == NULL || left->entry == NULL ||
+        right->entry == NULL || left->generation != right->generation)
+        return 0;
+
+    const SidecarEntry *left_entry = left->entry;
+    const SidecarEntry *right_entry = right->entry;
+    if (left_entry->kind != right_entry->kind ||
+        left_entry->mode != right_entry->mode ||
+        left_entry->uid != right_entry->uid ||
+        left_entry->gid != right_entry->gid ||
+        left_entry->atime_sec != right_entry->atime_sec ||
+        left_entry->atime_nsec != right_entry->atime_nsec ||
+        left_entry->mtime_sec != right_entry->mtime_sec ||
+        left_entry->mtime_nsec != right_entry->mtime_nsec ||
+        left_entry->size != right_entry->size ||
+        left_entry->xattr_count != right_entry->xattr_count ||
+        !sidecar_bytes_equal(left_entry->root_id, right_entry->root_id) ||
+        !sidecar_bytes_equal(left_entry->logical_path,
+                             right_entry->logical_path) ||
+        !sidecar_bytes_equal(left_entry->physical_leaf,
+                             right_entry->physical_leaf) ||
+        !sidecar_bytes_equal(left_entry->collision_suffix,
+                             right_entry->collision_suffix) ||
+        !sidecar_bytes_equal(left_entry->symlink_target,
+                             right_entry->symlink_target) ||
+        !sidecar_bytes_equal(left_entry->hardlink_root_id,
+                             right_entry->hardlink_root_id) ||
+        !sidecar_bytes_equal(left_entry->hardlink_logical_path,
+                             right_entry->hardlink_logical_path) ||
+        left->xattr_count != right->xattr_count)
+        return 0;
+
+    for (size_t index = 0; index < left->xattr_count; index++)
+        if (!sidecar_bytes_equal(left->xattrs[index].name,
+                                 right->xattrs[index].name) ||
+            !sidecar_bytes_equal(left->xattrs[index].value,
+                                 right->xattrs[index].value))
+            return 0;
+    return 1;
+}
+
+static ssize_t read_retry(int fd, void *buffer, size_t length)
+{
+    ssize_t result;
+    do
+        result = read(fd, buffer, length);
+    while (result < 0 && errno == EINTR);
+    return result;
+}
+
+static int sidecar_slots_equal(int left_container, int right_container)
+{
+    int left_fd = openat(left_container, SIDECAR_SLOT_NAME,
+                         O_RDONLY | O_CLOEXEC);
+    int right_fd = openat(right_container, SIDECAR_SLOT_NAME,
+                          O_RDONLY | O_CLOEXEC);
+    if (left_fd < 0 || right_fd < 0)
+    {
+        if (left_fd >= 0)
+            close(left_fd);
+        if (right_fd >= 0)
+            close(right_fd);
+        return 0;
+    }
+
+    struct stat left_stat;
+    struct stat right_stat;
+    int equal = fstat(left_fd, &left_stat) == 0 &&
+                fstat(right_fd, &right_stat) == 0 &&
+                left_stat.st_size >= 0 && right_stat.st_size >= 0 &&
+                left_stat.st_size == right_stat.st_size;
+    unsigned char left_buffer[4096];
+    unsigned char right_buffer[4096];
+    while (equal)
+    {
+        ssize_t left_length = read_retry(left_fd, left_buffer,
+                                         sizeof(left_buffer));
+        ssize_t right_length = read_retry(right_fd, right_buffer,
+                                          sizeof(right_buffer));
+        if (left_length < 0 || right_length < 0 ||
+            left_length != right_length ||
+            (left_length > 0 &&
+             memcmp(left_buffer, right_buffer, (size_t)left_length) != 0))
+            equal = 0;
+        if (left_length == 0 && right_length == 0)
+            break;
+    }
+    if (close(left_fd) != 0 || close(right_fd) != 0)
+        equal = 0;
+    return equal;
+}
+
+typedef struct {
+    SidecarEntry entry;
+    const SidecarXattr *xattrs;
+} GroupFixture;
+
+static int append_group_fixture(SidecarLog *log,
+                                const GroupFixture *fixture, int combined)
+{
+    if (log == NULL || fixture == NULL)
+        return -1;
+    SidecarClaim claim = {
+        .root_id = fixture->entry.root_id,
+        .logical_path = fixture->entry.logical_path,
+        .physical_leaf = fixture->entry.physical_leaf,
+        .kind = fixture->entry.kind
+    };
+    if (sidecar_log_append_claim(log, &claim) != SIDECAR_STATUS_OK)
+        return -1;
+    if (combined)
+        return sidecar_log_append_group(log, &fixture->entry,
+                                        fixture->xattrs) == SIDECAR_STATUS_OK
+                   ? 0
+                   : -1;
+    if (sidecar_log_append_entry(log, &fixture->entry) != SIDECAR_STATUS_OK)
+        return -1;
+    for (uint32_t index = 0; index < fixture->entry.xattr_count; index++)
+        if (sidecar_log_append_xattr(log, &fixture->xattrs[index]) !=
+            SIDECAR_STATUS_OK)
+            return -1;
+    return sidecar_log_append_entry_commit(log) == SIDECAR_STATUS_OK ? 0 : -1;
+}
+
+static int open_test_container(char *path)
+{
+    if (path == NULL || mkdtemp(path) == NULL)
+        return -1;
+    int fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0)
+        rmdir(path);
+    return fd;
+}
+
+static void test_group_byte_and_state_identity(void)
+{
+    printf(BLUE "::" NC " batched entry-group byte and state identity\n");
+    char combined_path[] = "/tmp/migr_sidecar_group_combined_XXXXXX";
+    char sequence_path[] = "/tmp/migr_sidecar_group_sequence_XXXXXX";
+    int combined_fd = open_test_container(combined_path);
+    int sequence_fd = open_test_container(sequence_path);
+    check(combined_fd >= 0 && sequence_fd >= 0,
+          "paired group-identity containers are created");
+    if (combined_fd < 0 || sequence_fd < 0)
+    {
+        if (combined_fd >= 0) {
+            close(combined_fd);
+            rmdir(combined_path);
+        }
+        if (sequence_fd >= 0) {
+            close(sequence_fd);
+            rmdir(sequence_path);
+        }
+        return;
+    }
+
+    SidecarXattr one_xattr = sample_xattr();
+    SidecarXattr several_xattrs[] = {
+        sample_xattr(),
+        text_xattr("user.alpha", "one"),
+        text_xattr("user.empty", NULL)
+    };
+    SidecarEntry regular_zero = entry_for(
+        "ROOT", "regular-zero", "payload/regular-zero", 0, 0);
+    SidecarEntry regular_one = entry_for(
+        "ROOT", "regular-one", "payload/regular-one", 17, 1);
+    SidecarEntry regular_several = entry_for(
+        "ROOT", "regular-several", "payload/regular-several", 23, 3);
+    SidecarEntry directory = entry_for(
+        "ROOT", "directory", "payload/directory", 0, 0);
+    directory.kind = SIDECAR_KIND_DIRECTORY;
+    directory.mode = 0750;
+    SidecarEntry symlink = entry_for(
+        "ROOT", "symlink", "payload/symlink", 0, 0);
+    symlink.kind = SIDECAR_KIND_SYMLINK;
+    symlink.symlink_target =
+        (SidecarBytes){ (const unsigned char *)"target", 6 };
+    SidecarEntry hardlink = entry_for(
+        "ROOT", "hardlink", "payload/hardlink", 0, 0);
+    hardlink.kind = SIDECAR_KIND_HARDLINK;
+    hardlink.hardlink_root_id =
+        (SidecarBytes){ (const unsigned char *)"ROOT", 4 };
+    hardlink.hardlink_logical_path =
+        (SidecarBytes){ (const unsigned char *)"regular-zero", 12 };
+    const GroupFixture fixtures[] = {
+        { regular_zero, NULL },
+        { regular_one, &one_xattr },
+        { regular_several, several_xattrs },
+        { directory, NULL },
+        { symlink, NULL },
+        { hardlink, NULL }
+    };
+    size_t fixture_count = sizeof(fixtures) / sizeof(fixtures[0]);
+
+    SidecarLog combined = {0};
+    SidecarLog sequence = {0};
+    int prepared = sidecar_log_create_at(combined_fd, &combined) ==
+                       SIDECAR_OPEN_FRESH &&
+                   sidecar_log_create_at(sequence_fd, &sequence) ==
+                       SIDECAR_OPEN_FRESH &&
+                   append_root_claim(&combined, "ROOT") == 0 &&
+                   append_root_claim(&sequence, "ROOT") == 0;
+    for (size_t index = 0; prepared && index < fixture_count; index++)
+        prepared = append_group_fixture(&combined, &fixtures[index], 1) == 0 &&
+                   append_group_fixture(&sequence, &fixtures[index], 0) == 0;
+    check(prepared, "all representative groups append through both paths");
+    check(prepared && sidecar_log_live_count(&combined) == fixture_count &&
+              sidecar_log_live_count(&sequence) == fixture_count &&
+              sidecar_log_claim_count(&combined) == 1 &&
+              sidecar_log_claim_count(&sequence) == 1,
+          "batched and incremental paths expose identical map counts");
+    for (size_t index = 0; prepared && index < fixture_count; index++)
+    {
+        SidecarLiveView combined_view = {0};
+        SidecarLiveView sequence_view = {0};
+        int combined_found = sidecar_log_find(
+            &combined, fixtures[index].entry.root_id,
+            fixtures[index].entry.logical_path, &combined_view);
+        int sequence_found = sidecar_log_find(
+            &sequence, fixtures[index].entry.root_id,
+            fixtures[index].entry.logical_path, &sequence_view);
+        check(combined_found == 1 && sequence_found == 1 &&
+                  sidecar_live_views_equal(&combined_view, &sequence_view),
+              "live lookup is identical for a representative group");
+    }
+    check(sidecar_log_close(&combined) == SIDECAR_STATUS_OK &&
+              sidecar_log_close(&sequence) == SIDECAR_STATUS_OK,
+          "paired group-identity logs close");
+    check(prepared && sidecar_slots_equal(combined_fd, sequence_fd),
+          "batched output is byte-identical to the incremental sequence");
+
+    int adopted = sidecar_log_adopt_at(combined_fd, &combined) ==
+                      SIDECAR_OPEN_RESUMABLE &&
+                  sidecar_log_adopt_at(sequence_fd, &sequence) ==
+                      SIDECAR_OPEN_RESUMABLE;
+    check(adopted, "both byte-identical logs adopt successfully");
+    check(adopted && sidecar_log_live_count(&combined) ==
+                          sidecar_log_live_count(&sequence) &&
+              sidecar_log_claim_count(&combined) ==
+                          sidecar_log_claim_count(&sequence),
+          "adopted logs retain identical map counts");
+    for (size_t index = 0; adopted && index < fixture_count; index++)
+    {
+        SidecarLiveView combined_view = {0};
+        SidecarLiveView sequence_view = {0};
+        int combined_found = sidecar_log_find(
+            &combined, fixtures[index].entry.root_id,
+            fixtures[index].entry.logical_path, &combined_view);
+        int sequence_found = sidecar_log_find(
+            &sequence, fixtures[index].entry.root_id,
+            fixtures[index].entry.logical_path, &sequence_view);
+        check(combined_found == sequence_found && combined_found == 1 &&
+                  sidecar_live_views_equal(&combined_view, &sequence_view),
+              "adopted live lookup remains identical");
+    }
+    sidecar_log_close(&combined);
+    sidecar_log_close(&sequence);
+    reset_slot(combined_fd);
+    reset_slot(sequence_fd);
+    close(combined_fd);
+    close(sequence_fd);
+    rmdir(combined_path);
+    rmdir(sequence_path);
+}
+
+static void test_group_partial_write(void)
+{
+    printf(BLUE "::" NC " partial batched group recovery\n");
+    char path[] = "/tmp/migr_sidecar_group_partial_XXXXXX";
+    int container_fd = open_test_container(path);
+    check(container_fd >= 0, "partial-group container is created");
+    if (container_fd < 0)
+        return;
+
+    SidecarLog log = {0};
+    SidecarEntry entry = entry_for("ROOT", "partial", "payload/partial", 31,
+                                   0);
+    SidecarClaim claim = claim_for("ROOT", "partial", "payload/partial",
+                                   SIDECAR_KIND_REGULAR);
+    int prepared = sidecar_log_create_at(container_fd, &log) ==
+                       SIDECAR_OPEN_FRESH &&
+                   append_root_claim(&log, "ROOT") == 0 &&
+                   sidecar_log_append_claim(&log, &claim) == SIDECAR_STATUS_OK;
+    uint64_t boundary = 0;
+    prepared = prepared && slot_size(container_fd, &boundary) == 0;
+    check(prepared, "partial-group fixture reaches a committed boundary");
+    if (prepared)
+        check(sidecar_log_close(&log) == SIDECAR_STATUS_OK,
+              "partial-group fixture closes before interruption");
+
+    pid_t child = prepared ? fork() : (pid_t)-1;
+    if (child == 0)
+    {
+        SidecarLog child_log = {0};
+        if (sidecar_log_adopt_at(container_fd, &child_log) !=
+            SIDECAR_OPEN_RESUMABLE)
+            _exit(2);
+        sidecar_test_set_interrupt(SIDECAR_TEST_MID_GROUP);
+        (void)sidecar_log_append_group(&child_log, &entry, NULL);
+        _exit(3);
+    }
+    if (prepared)
+    {
+        int wait_status = 0;
+        pid_t waited;
+        do {
+            waited = waitpid(child, &wait_status, 0);
+        } while (waited < 0 && errno == EINTR);
+        check(waited == child && WIFSIGNALED(wait_status) &&
+                  WTERMSIG(wait_status) == SIGKILL,
+              "partial group is interrupted inside its combined write");
+        SidecarLog adopted = {0};
+        int resumed = sidecar_log_adopt_at(container_fd, &adopted) ==
+                      SIDECAR_OPEN_RESUMABLE;
+        uint64_t recovered_size = 0;
+        check(resumed && slot_size(container_fd, &recovered_size) == 0 &&
+                  recovered_size == boundary &&
+                  sidecar_log_live_count(&adopted) == 0 &&
+                  sidecar_log_claim_count(&adopted) == 2,
+              "adoption discards the partial group at the prior boundary");
+        sidecar_log_close(&adopted);
+    }
+    else
+        check(0, "partial-group child could not be started");
+    reset_slot(container_fd);
+    close(container_fd);
+    rmdir(path);
+}
+
+static void test_group_failure_and_validation(void)
+{
+    printf(BLUE "::" NC " batched group failure and validation atomicity\n");
+    char failure_path[] = "/tmp/migr_sidecar_group_failure_XXXXXX";
+    int failure_fd = open_test_container(failure_path);
+    check(failure_fd >= 0, "group-failure container is created");
+    if (failure_fd >= 0)
+    {
+        SidecarLog log = {0};
+        SidecarEntry entry = entry_for("ROOT", "failed", "payload/failed",
+                                       19, 0);
+        SidecarClaim claim = claim_for("ROOT", "failed", "payload/failed",
+                                       SIDECAR_KIND_REGULAR);
+        int prepared = sidecar_log_create_at(failure_fd, &log) ==
+                           SIDECAR_OPEN_FRESH &&
+                       append_root_claim(&log, "ROOT") == 0 &&
+                       sidecar_log_append_claim(&log, &claim) ==
+                           SIDECAR_STATUS_OK;
+        uint64_t before = 0;
+        prepared = prepared && slot_size(failure_fd, &before) == 0;
+        sidecar_test_set_interrupt(SIDECAR_TEST_FAIL_GROUP);
+        SidecarStatus status = sidecar_log_append_group(&log, &entry, NULL);
+        sidecar_test_set_interrupt(SIDECAR_TEST_INTERRUPT_NONE);
+        uint64_t after = 0;
+        SidecarClaim later = claim_for("ROOT", "later", "payload/later",
+                                       SIDECAR_KIND_REGULAR);
+        SidecarLiveView view = {0};
+        SidecarClaimView claim_view = {0};
+        check(prepared && status == SIDECAR_STATUS_IO_ERROR &&
+                  slot_size(failure_fd, &after) == 0 && after == before &&
+                  sidecar_log_live_count(&log) == 0 &&
+                  sidecar_log_claim_count(&log) == 2 &&
+                  sidecar_log_find(&log, entry.root_id, entry.logical_path,
+                                   &view) == 0 &&
+                  sidecar_log_find_claim(&log, claim.root_id,
+                                         claim.logical_path, &claim_view) == 1,
+              "a failed group write poisons without mutating either map");
+        check(sidecar_log_append_claim(&log, &later) ==
+                  SIDECAR_STATUS_IO_ERROR,
+              "a poisoned log refuses a later append");
+        sidecar_log_close(&log);
+        reset_slot(failure_fd);
+        close(failure_fd);
+        rmdir(failure_path);
+    }
+
+    char validation_path[] = "/tmp/migr_sidecar_group_validation_XXXXXX";
+    int validation_fd = open_test_container(validation_path);
+    check(validation_fd >= 0, "group-validation container is created");
+    if (validation_fd < 0)
+        return;
+    SidecarLog log = {0};
+    SidecarEntry mismatch = entry_for("ROOT", "mismatch", "payload/mismatch",
+                                      7, 1);
+    SidecarXattr invalid = {
+        .name = { NULL, 1 },
+        .value = { (const unsigned char *)"value", 5 }
+    };
+    int prepared = sidecar_log_create_at(validation_fd, &log) ==
+                       SIDECAR_OPEN_FRESH &&
+                   append_root_claim(&log, "ROOT") == 0;
+    uint64_t before = 0;
+    prepared = prepared && slot_size(validation_fd, &before) == 0;
+    SidecarStatus mismatch_status = sidecar_log_append_group(&log, &mismatch,
+                                                              NULL);
+    uint64_t after_mismatch = 0;
+    SidecarStatus invalid_status = sidecar_log_append_group(&log, &mismatch,
+                                                             &invalid);
+    uint64_t after_invalid = 0;
+    SidecarClaim recovery = claim_for("ROOT", "recovery", "payload/recovery",
+                                      SIDECAR_KIND_REGULAR);
+    check(prepared && mismatch_status == SIDECAR_STATUS_INVALID_ARGUMENT &&
+              invalid_status == SIDECAR_STATUS_INVALID_ARGUMENT &&
+              slot_size(validation_fd, &after_mismatch) == 0 &&
+              slot_size(validation_fd, &after_invalid) == 0 &&
+              before == after_mismatch && after_mismatch == after_invalid &&
+              sidecar_log_append_claim(&log, &recovery) == SIDECAR_STATUS_OK,
+          "validation failures write no bytes, poison nothing, and leave no pending group");
+
+    SidecarEntry pending_entry = entry_for("ROOT", "pending",
+                                           "payload/pending", 8, 0);
+    SidecarClaim pending_claim = claim_for("ROOT", "pending",
+                                           "payload/pending",
+                                           SIDECAR_KIND_REGULAR);
+    int pending_ready = sidecar_log_append_claim(&log, &pending_claim) ==
+                            SIDECAR_STATUS_OK &&
+                        sidecar_log_append_entry(&log, &pending_entry) ==
+                            SIDECAR_STATUS_OK;
+    uint64_t pending_before = 0;
+    pending_ready = pending_ready &&
+                    slot_size(validation_fd, &pending_before) == 0;
+    SidecarStatus pending_group_status = sidecar_log_append_group(
+        &log, &pending_entry, NULL);
+    uint64_t pending_after = 0;
+    int pending_unchanged = slot_size(validation_fd, &pending_after) == 0 &&
+                            pending_before == pending_after;
+    SidecarStatus pending_commit_status = sidecar_log_append_entry_commit(&log);
+    check(pending_ready && pending_group_status ==
+                  SIDECAR_STATUS_INVALID_ARGUMENT &&
+              pending_unchanged &&
+              pending_commit_status == SIDECAR_STATUS_OK,
+          "group refuses an existing incremental pending entry without disturbing it");
+    sidecar_log_close(&log);
+    reset_slot(validation_fd);
+    close(validation_fd);
+    rmdir(validation_path);
+}
+
+static void test_group_interleaved_claims(void)
+{
+    printf(BLUE "::" NC " interleaved claim ordering for batched groups\n");
+    char path[] = "/tmp/migr_sidecar_group_interleaved_XXXXXX";
+    int container_fd = open_test_container(path);
+    check(container_fd >= 0, "interleaved-claim container is created");
+    if (container_fd < 0)
+        return;
+
+    SidecarLog log = {0};
+    SidecarEntry entry = entry_for("ROOT", "A", "payload/A", 11, 0);
+    SidecarClaim claim_a = claim_for("ROOT", "A", "payload/A",
+                                     SIDECAR_KIND_REGULAR);
+    SidecarClaim claim_b = claim_for("ROOT", "B", "payload/B",
+                                     SIDECAR_KIND_REGULAR);
+    int prepared = sidecar_log_create_at(container_fd, &log) ==
+                       SIDECAR_OPEN_FRESH &&
+                   append_root_claim(&log, "ROOT") == 0 &&
+                   sidecar_log_append_claim(&log, &claim_a) ==
+                       SIDECAR_STATUS_OK &&
+                   sidecar_log_append_claim(&log, &claim_b) ==
+                       SIDECAR_STATUS_OK &&
+                   sidecar_log_append_group(&log, &entry, NULL) ==
+                       SIDECAR_STATUS_OK;
+    SidecarLiveView view = {0};
+    SidecarClaimView claim_view = {0};
+    check(prepared && sidecar_log_live_count(&log) == 1 &&
+              sidecar_log_claim_count(&log) == 2 &&
+              sidecar_log_find(&log, entry.root_id, entry.logical_path,
+                               &view) == 1 &&
+              sidecar_log_find_claim(&log, claim_b.root_id,
+                                     claim_b.logical_path, &claim_view) == 1 &&
+              sidecar_log_find_claim(&log, claim_a.root_id,
+                                     claim_a.logical_path, &claim_view) == 0,
+          "group commit consumes A while the later B claim remains outstanding");
+    check(sidecar_log_close(&log) == SIDECAR_STATUS_OK,
+          "interleaved-claim fixture closes before adoption");
+    check(sidecar_log_adopt_at(container_fd, &log) == SIDECAR_OPEN_RESUMABLE &&
+              sidecar_log_live_count(&log) == 1 &&
+              sidecar_log_claim_count(&log) == 2 &&
+              sidecar_log_find(&log, entry.root_id, entry.logical_path,
+                               &view) == 1 &&
+              sidecar_log_find_claim(&log, claim_b.root_id,
+                                     claim_b.logical_path, &claim_view) == 1 &&
+              sidecar_log_find_claim(&log, claim_a.root_id,
+                                     claim_a.logical_path, &claim_view) == 0,
+          "adoption preserves the matching-key claim ordering");
+    sidecar_log_close(&log);
+    reset_slot(container_fd);
+    close(container_fd);
+    rmdir(path);
 }
 
 static void test_fresh_and_live_map(int container_fd)
@@ -1220,6 +1731,10 @@ int main(void)
         return 1;
     }
 
+    test_group_byte_and_state_identity();
+    test_group_partial_write();
+    test_group_failure_and_validation();
+    test_group_interleaved_claims();
     test_fresh_and_live_map(container_fd);
     test_claim_replay_and_transitions(container_fd);
     test_deleted_foreach(container_fd);

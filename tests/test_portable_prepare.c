@@ -585,7 +585,7 @@ static void test_resume_live_count(void)
     if (child < 0)
         fixture_fatal("could not fork resume fixture");
     if (child == 0) {
-        sidecar_test_set_interrupt(SIDECAR_TEST_AFTER_ENTRY_COMMIT);
+        sidecar_test_set_interrupt(SIDECAR_TEST_AFTER_GROUP);
         int result = portable_capture_fresh_prepared_at(
             container_fd, &request, &prepared, NULL, NULL);
         _exit(result == 0 ? 0 : 3);

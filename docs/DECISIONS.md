@@ -3927,3 +3927,44 @@ retrying the comparison; or suppressing these paths from backup or replay.
 **Relationship:** Extends D44's named live-state verification exceptions. D47's
 destination-owned `user-dirs.dirs` handling and all backup/replay behavior are
 unchanged.
+
+## D49 — 2026-09-19 — Write each portable sidecar entry group as one synchronous buffer
+
+**Status:** Implemented
+
+**Decision:** The portable capture path appends each `ENTRY` + `XATTR*` +
+`ENTRY_COMMIT` group through one `sidecar_log_append_group()` call. The sidecar
+codec builds the entry and every xattr with the existing record encoders,
+appends the existing commit tag, and hands the complete buffer to the existing
+short-write-safe write path once. The state layer validates and prepares all
+owned state before the write; only a successful write applies the same claim
+consumption and live-map insertion sequence as the incremental commit path.
+
+The incremental entry, xattr, and commit APIs remain available for compatibility
+and direct state/replay fixtures. `CLAIM` and `DELETE` remain synchronous and
+unbatched. No buffer or logical-size state survives the function call, and the
+sidecar close, periodic sync, and capture report paths are unchanged.
+
+**Why:** Real removable-media measurements showed that sidecar journal latency
+was dominated by the number of small writes rather than by the journal's total
+byte volume. Combining only the records whose consistency boundary is already
+one complete entry group reduces that operation count while preserving the
+existing byte grammar and truncation recovery. The combined write is also an
+atomic state boundary in memory: a failed write poisons the log without
+applying the prepared live or claim-map mutation.
+
+This scope is explicitly constrained by D25. The ownership `CLAIM` must still
+reach the journal before the corresponding payload mutation, so claims are not
+deferred into the group buffer. The same write-ahead ordering is preserved for
+the live-owner cleanup `DELETE` path. A partial group remains a valid truncated
+tail and adoption discards it back to the preceding complete boundary.
+
+**Rejected:** buffering records across capture calls; changing close or
+periodic-sync flush behavior; tracking a separate logical journal size; and
+combining `CLAIM` or `DELETE` with entry groups. Those changes require a wider
+durability and resume design than this measured, synchronous optimization.
+
+**Relationship:** Extends D25's write-ahead ownership boundary without weakening
+it. The revision-3 journal-batching invariants analysis records the crash,
+resume, and interleaved-claim constraints that define this implementation
+scope.

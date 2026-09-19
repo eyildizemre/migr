@@ -2580,7 +2580,7 @@ static void test_fresh_directory_case(const char *base, const char *label,
 
     check(run_fresh_sidecar_interrupt(container_fd, &request,
                                       PORTABLE_TEST_INTERRUPT_NONE,
-                                      SIDECAR_TEST_BEFORE_ENTRY) == 0,
+                                      SIDECAR_TEST_BEFORE_GROUP) == 0,
           nested ? "nested directory capture is killed before its first ENTRY"
                  : "empty directory capture is killed before its ENTRY");
     size_t expected_claims = nested ? 3 : 1;
@@ -2677,7 +2677,7 @@ static void test_shortened_directory_claim_resume(const char *base)
 
     check(run_fresh_sidecar_interrupt(container_fd, &request,
                                       PORTABLE_TEST_INTERRUPT_NONE,
-                                      SIDECAR_TEST_BEFORE_ENTRY) == 0,
+                                      SIDECAR_TEST_BEFORE_GROUP) == 0,
           "shortened directory capture is killed with its ancestry CLAIM chain durable");
     check(claim_leaf_matches(container_fd, "SHORT_DIR", long_name,
                              mapped.physical_leaf, SIDECAR_KIND_DIRECTORY) &&
@@ -2920,16 +2920,14 @@ static const SigkillCase regular_sigkill_cases[] = {
       SIDECAR_TEST_INTERRUPT_NONE, 0 },
     { "payload-close-after", PORTABLE_TEST_AFTER_PAYLOAD_CLOSE,
       SIDECAR_TEST_INTERRUPT_NONE, 0 },
-    { "entry-middle", PORTABLE_TEST_INTERRUPT_NONE,
-      SIDECAR_TEST_MID_ENTRY, 0 },
-    { "xattr-middle", PORTABLE_TEST_INTERRUPT_NONE,
-      SIDECAR_TEST_MID_XATTR, 1 },
-    { "commit-before", PORTABLE_TEST_INTERRUPT_NONE,
-      SIDECAR_TEST_BEFORE_ENTRY_COMMIT, 0 },
-    { "commit-after", PORTABLE_TEST_INTERRUPT_NONE,
-      SIDECAR_TEST_AFTER_ENTRY_COMMIT, 0 },
-    { "commit-middle", PORTABLE_TEST_INTERRUPT_NONE,
-      SIDECAR_TEST_MID_ENTRY_COMMIT, 0 }
+    { "group-before", PORTABLE_TEST_INTERRUPT_NONE,
+      SIDECAR_TEST_BEFORE_GROUP, 0 },
+    { "group-after", PORTABLE_TEST_INTERRUPT_NONE,
+      SIDECAR_TEST_AFTER_GROUP, 0 },
+    { "group-middle", PORTABLE_TEST_INTERRUPT_NONE,
+      SIDECAR_TEST_MID_GROUP, 0 },
+    { "group-xattr-middle", PORTABLE_TEST_INTERRUPT_NONE,
+      SIDECAR_TEST_MID_GROUP, 1 }
 };
 
 static const SigkillCase symlink_sigkill_cases[] = {
@@ -2941,29 +2939,25 @@ static const SigkillCase symlink_sigkill_cases[] = {
       SIDECAR_TEST_INTERRUPT_NONE, 0 },
     { "payload-replace-after", PORTABLE_TEST_AFTER_PAYLOAD_REPLACE,
       SIDECAR_TEST_INTERRUPT_NONE, 0 },
-    { "entry-middle", PORTABLE_TEST_INTERRUPT_NONE,
-      SIDECAR_TEST_MID_ENTRY, 0 },
-    { "xattr-middle", PORTABLE_TEST_INTERRUPT_NONE,
-      SIDECAR_TEST_MID_XATTR, 1 },
-    { "commit-before", PORTABLE_TEST_INTERRUPT_NONE,
-      SIDECAR_TEST_BEFORE_ENTRY_COMMIT, 0 },
-    { "commit-after", PORTABLE_TEST_INTERRUPT_NONE,
-      SIDECAR_TEST_AFTER_ENTRY_COMMIT, 0 },
-    { "commit-middle", PORTABLE_TEST_INTERRUPT_NONE,
-      SIDECAR_TEST_MID_ENTRY_COMMIT, 0 }
+    { "group-before", PORTABLE_TEST_INTERRUPT_NONE,
+      SIDECAR_TEST_BEFORE_GROUP, 0 },
+    { "group-after", PORTABLE_TEST_INTERRUPT_NONE,
+      SIDECAR_TEST_AFTER_GROUP, 0 },
+    { "group-middle", PORTABLE_TEST_INTERRUPT_NONE,
+      SIDECAR_TEST_MID_GROUP, 0 },
+    { "group-xattr-middle", PORTABLE_TEST_INTERRUPT_NONE,
+      SIDECAR_TEST_MID_GROUP, 1 }
 };
 
 static const SigkillCase directory_sigkill_cases[] = {
-    { "entry-middle", PORTABLE_TEST_INTERRUPT_NONE,
-      SIDECAR_TEST_MID_ENTRY, 0 },
-    { "xattr-middle", PORTABLE_TEST_INTERRUPT_NONE,
-      SIDECAR_TEST_MID_XATTR, 1 },
-    { "commit-before", PORTABLE_TEST_INTERRUPT_NONE,
-      SIDECAR_TEST_BEFORE_ENTRY_COMMIT, 0 },
-    { "commit-after", PORTABLE_TEST_INTERRUPT_NONE,
-      SIDECAR_TEST_AFTER_ENTRY_COMMIT, 0 },
-    { "commit-middle", PORTABLE_TEST_INTERRUPT_NONE,
-      SIDECAR_TEST_MID_ENTRY_COMMIT, 0 }
+    { "group-before", PORTABLE_TEST_INTERRUPT_NONE,
+      SIDECAR_TEST_BEFORE_GROUP, 0 },
+    { "group-after", PORTABLE_TEST_INTERRUPT_NONE,
+      SIDECAR_TEST_AFTER_GROUP, 0 },
+    { "group-middle", PORTABLE_TEST_INTERRUPT_NONE,
+      SIDECAR_TEST_MID_GROUP, 0 },
+    { "group-xattr-middle", PORTABLE_TEST_INTERRUPT_NONE,
+      SIDECAR_TEST_MID_GROUP, 1 }
 };
 
 static const SigkillCase hardlink_sigkill_cases[] = {
@@ -2975,14 +2969,12 @@ static const SigkillCase hardlink_sigkill_cases[] = {
       SIDECAR_TEST_INTERRUPT_NONE, 0 },
     { "payload-replace-after", PORTABLE_TEST_AFTER_PAYLOAD_REPLACE,
       SIDECAR_TEST_INTERRUPT_NONE, 0 },
-    { "entry-middle", PORTABLE_TEST_INTERRUPT_NONE,
-      SIDECAR_TEST_MID_ENTRY, 0 },
-    { "commit-before", PORTABLE_TEST_INTERRUPT_NONE,
-      SIDECAR_TEST_BEFORE_ENTRY_COMMIT, 0 },
-    { "commit-after", PORTABLE_TEST_INTERRUPT_NONE,
-      SIDECAR_TEST_AFTER_ENTRY_COMMIT, 0 },
-    { "commit-middle", PORTABLE_TEST_INTERRUPT_NONE,
-      SIDECAR_TEST_MID_ENTRY_COMMIT, 0 }
+    { "group-before", PORTABLE_TEST_INTERRUPT_NONE,
+      SIDECAR_TEST_BEFORE_GROUP, 0 },
+    { "group-after", PORTABLE_TEST_INTERRUPT_NONE,
+      SIDECAR_TEST_AFTER_GROUP, 0 },
+    { "group-middle", PORTABLE_TEST_INTERRUPT_NONE,
+      SIDECAR_TEST_MID_GROUP, 0 }
 };
 
 static void run_sigkill_boundaries(const char *base,
@@ -3057,9 +3049,9 @@ static const SigkillKind regular_sigkill_kind = {
     .resumable_label = "a killed capture remains resumable",
     .recovery_label = "source remains intact after interruption recovery",
     .xattr_skip_label = "xattr interruption fixture unavailable on this filesystem",
-    .xattr_check_label = "xattr set is exact after a mid-XATTR SIGKILL: "
-                         "the half-written record did not survive and the "
-                         "completed record is present",
+    .xattr_check_label = "xattr set is exact after a mid-group SIGKILL: "
+                         "the partial group did not survive and the "
+                         "retried group is present",
     .xattr_root_id = "ROOT",
     .xattr_name = "user.migr_resume",
     .xattr_value = "value",
@@ -3098,7 +3090,7 @@ static const SigkillKind directory_sigkill_kind = {
     .resumable_label = "a killed directory capture remains resumable",
     .recovery_label = "resumed directory has its payload and metadata entry",
     .xattr_skip_label = "directory xattr interruption fixture unavailable",
-    .xattr_check_label = "directory xattr set is exact after a mid-XATTR SIGKILL",
+    .xattr_check_label = "directory xattr set is exact after a mid-group SIGKILL",
     .xattr_root_id = "DIR",
     .xattr_name = "user.migr_directory_resume",
     .xattr_value = "value",
@@ -3152,7 +3144,7 @@ static int symlink_xattr_fixture_available(void)
 
 static void test_stale_xattr_interruption(const char *base)
 {
-    printf(BLUE "::" NC " stale xattr does not survive a mid-XATTR SIGKILL\n");
+    printf(BLUE "::" NC " stale xattr does not survive a mid-group SIGKILL\n");
     if (!regular_xattr_fixture_available())
     {
         skip_check("xattr interruption fixture unavailable on this filesystem");
@@ -3180,16 +3172,16 @@ static void test_stale_xattr_interruption(const char *base)
         return;
 
     /* Replace the source's xattr set: the stale attribute is removed and a
-     * fresh one added, so the interrupted run still has an XATTR record to
-     * write (SIDECAR_TEST_MID_XATTR only fires while one is being written). */
+     * fresh one added, so the interrupted run still has a grouped xattr to
+     * write. */
     if (removexattr(source_file, "user.migr_stale") != 0 ||
         setxattr(source_file, "user.migr_fresh", "new", 3, 0) != 0)
         fixture_fatal("could not switch the source xattr set");
 
     check(run_resume_interrupt(container_fd, &request,
                                PORTABLE_TEST_INTERRUPT_NONE,
-                               SIDECAR_TEST_MID_XATTR) == 0,
-          "resume is killed mid-XATTR-record");
+                               SIDECAR_TEST_MID_GROUP) == 0,
+          "resume is killed mid-group write");
     portable_capture_test_set_interrupt(PORTABLE_TEST_INTERRUPT_NONE);
     sidecar_test_set_interrupt(SIDECAR_TEST_INTERRUPT_NONE);
     check(portable_capture_resume_at(container_fd, &request, NULL) == 0,

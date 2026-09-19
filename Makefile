@@ -273,8 +273,8 @@ $(TEST_METADATA_SNAPSHOTS): tests/test_metadata_snapshots.c fileops.o metadata.o
 $(TEST_SIDECAR): tests/test_sidecar.c sidecar.o
 	$(CC) $(CFLAGS) -o $@ tests/test_sidecar.c sidecar.o
 
-$(TEST_SIDECAR_STATE): tests/test_sidecar_state.c sidecar.o sidecar_state.o sidecar_state_map.o hash.o
-	$(CC) $(CFLAGS) -o $@ tests/test_sidecar_state.c sidecar.o sidecar_state.o sidecar_state_map.o hash.o
+$(TEST_SIDECAR_STATE): tests/test_sidecar_state.c sidecar_test.o sidecar_state.o sidecar_state_map.o hash.o
+	$(CC) $(CFLAGS) -DSIDECAR_TEST_HOOKS -o $@ tests/test_sidecar_state.c sidecar_test.o sidecar_state.o sidecar_state_map.o hash.o
 
 sidecar_state_test.o: src/sidecar_state.c src/sidecar.h src/sidecar_state_internal.h
 	$(CC) $(CFLAGS) -DSIDECAR_STATE_TEST_HOOKS -c src/sidecar_state.c -o $@
