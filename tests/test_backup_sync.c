@@ -249,8 +249,8 @@ static void test_native_sync(void)
 {
     printf(":: native periodic capture sync\n");
     /* Direct/test reports stay at zero; production installs this shared default. */
-    check(BACKUP_SYNC_INTERVAL_BYTES == 256 * 1024 * 1024,
-          "production periodic sync interval is 256 MiB");
+    check(BACKUP_SYNC_INTERVAL_BYTES == 512 * 1024 * 1024,
+          "production periodic sync interval is 512 MiB");
     char base[PATH_MAX];
     char source_dir[PATH_MAX];
     char destination_dir[PATH_MAX];

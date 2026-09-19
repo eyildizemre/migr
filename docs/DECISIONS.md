@@ -2661,6 +2661,21 @@ retaining periodic smoothing for large captures. This reduces how often
 shorter or interruptible, so a metadata-heavy filesystem can still leave the
 process in kernel-uninterruptible sleep during one sync.
 
+**Revision (2026-09-19):** A second real-hardware measurement on the same
+removable exFAT USB destination and approximately 1.6G payload found that
+`syncfs()` accounted for roughly 98-99% of the live backup's total wall-clock
+time, confirmed with `strace -w -c` on the actual binary. Doubling the interval
+from 256 MiB to 512 MiB reduced the total `syncfs()` calls from 7 to 4 for
+that payload and produced a consistent approximately 14.2% wall-clock
+reduction across repeated trials in both run orderings. A 1 GiB interval did
+not provide a reliably distinguishable further gain: its marginal result
+changed sign with trial order. Disabling periodic sync produced a somewhat
+larger but not fundamentally different reduction, while removing the bounded
+data-loss-on-interruption property entirely, so it was rejected outright.
+`BACKUP_SYNC_INTERVAL_BYTES` is therefore raised from 256 MiB to 512 MiB;
+periodic syncing remains enabled to preserve D30's bounded interruption
+exposure.
+
 ---
 
 ## D31 — 2026-08-25 — Destination-allocation-aware, hardlink-deduplicated estimate

@@ -151,7 +151,7 @@ int progress_ticker_snapshot(ProgressTicker *ticker, off_t bytes,
 int progress_ticker_stop(ProgressTicker *ticker);
 
 /* Periodic mid-copy sync interval for live backups. */
-#define BACKUP_SYNC_INTERVAL_BYTES (256 * 1024 * 1024)
+#define BACKUP_SYNC_INTERVAL_BYTES (512 * 1024 * 1024)
 
 /**
  * @brief Returns whether a progress callback may fire now.
