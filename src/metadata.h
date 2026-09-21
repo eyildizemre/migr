@@ -52,6 +52,13 @@ typedef struct MetadataProfiles {
     size_t count;
     size_t capacity;
     size_t affected_objects;
+    // Restore-time privilege preflight (docs/DECISIONS.md D38 extended to
+    // restore): entries whose *recorded* owner this invocation cannot apply
+    // without CAP_CHOWN. Narrower than affected_objects/count, which also
+    // fold in the setuid/setgid-bit and existing-destination-owner reasons
+    // that make an object relevant to the metadata_profiles_probe() round
+    // trip but do not by themselves require root.
+    size_t foreign_owner_count;
     size_t security_xattr_entry_count;
     size_t example_count;
     char examples[METADATA_MAX_PREFLIGHT_EXAMPLES][PATH_MAX];

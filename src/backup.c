@@ -246,6 +246,62 @@ int restore_space_preflight(int destination_fd, const char *home,
     return 0;
 }
 
+// packages.txt is a container-root control artifact (never inside data/),
+// opened the same fd-anchored, no-follow way restore_packages() itself reads
+// it (src/packages.c) -- this is only an existence probe, not a parse, so a
+// plain fstatat() is enough regardless of what the entry turns out to be.
+static int restore_packages_txt_present(int source_root_fd, int *present)
+{
+    struct stat st;
+    if (fstatat(source_root_fd, "packages.txt", &st, AT_SYMLINK_NOFOLLOW) == 0)
+    {
+        *present = 1;
+        return 0;
+    }
+    if (errno == ENOENT)
+    {
+        *present = 0;
+        return 0;
+    }
+    return -1;
+}
+
+int restore_privilege_preflight(int source_root_fd, size_t foreign_owner_count)
+{
+    // Root can chown to any recorded owner, so a root-invoked restore never
+    // needs this refusal regardless of what the manifest/sidecar records
+    // (docs/DECISIONS.md D38).
+    if (geteuid() == 0)
+        return 0;
+
+    int packages_present;
+    if (restore_packages_txt_present(source_root_fd, &packages_present) != 0)
+    {
+        print_error("Error: Could not inspect packages.txt for the restore privilege preflight\n");
+        return -1;
+    }
+
+    if (foreign_owner_count == 0 && !packages_present)
+        return 0;
+
+    if (foreign_owner_count != 0 && packages_present)
+        print_error("Error: This restore needs root: it would restore %zu "
+                    "item(s) owned by a different user and install packages "
+                    "from packages.txt. Rerun the same migr command with "
+                    "sudo.\n",
+                    foreign_owner_count);
+    else if (foreign_owner_count != 0)
+        print_error("Error: This restore needs root: it would restore %zu "
+                    "item(s) owned by a different user. Rerun the same migr "
+                    "command with sudo.\n",
+                    foreign_owner_count);
+    else
+        print_error("Error: This restore needs root: it would install "
+                    "packages from packages.txt. Rerun the same migr "
+                    "command with sudo.\n");
+    return -1;
+}
+
 /* Returns 0 to proceed (space is adequate, or an earlier probe/estimate
  * step failed and already printed its own warning), or -1 if the
  * destination does not have enough free space (having already printed the

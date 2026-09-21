@@ -400,11 +400,15 @@ static void test_symlink_ownership_rejection(void)
     PortableRestoreReplayReport report;
     int result = run_orchestration(&fixture, &report, 1, "y\n");
     metadata_test_set_probe_hook(NULL, NULL);
-    check(result != 0 && metadata_test_probe_count() == 1 &&
+    // The restore privilege preflight (docs/DECISIONS.md D38 extended to
+    // restore) now catches this foreign owner before confirmation, so the
+    // post-confirmation metadata_profiles_probe() round trip this test used
+    // to rely on never runs at all.
+    check(result != 0 && metadata_test_probe_count() == 0 &&
               report.live_count == 2 && report.applied_count == 0,
-          "foreign symlink ownership is refused by the post-confirmation probe");
-    check(observation.called && observation.sentinel_untouched &&
-              observation.target_absent && access(target, F_OK) != 0,
+          "foreign symlink ownership is refused before confirmation by the restore privilege preflight");
+    check(!observation.called && file_equals(sentinel, "untouched") &&
+              access(target, F_OK) != 0,
           "ownership rejection leaves no destination mutation");
     fixture_close(&fixture);
 }
@@ -1879,11 +1883,15 @@ static void test_probe_rejection(void)
     metadata_test_set_probe_hook(NULL, NULL);
     int after_fds = open_fd_count();
     int after_entries = directory_entry_count(fixture.home);
-    check(result != 0 && metadata_test_probe_count() == 1,
-          "confirmation is followed by a rejecting ownership probe");
-    check(observation.called && observation.sentinel_untouched &&
-              observation.target_absent,
-          "probe observes an untouched destination before replay");
+    // The restore privilege preflight (docs/DECISIONS.md D38 extended to
+    // restore) now catches this foreign owner before confirmation, so the
+    // post-confirmation metadata_profiles_probe() round trip this test used
+    // to rely on never runs at all.
+    check(result != 0 && metadata_test_probe_count() == 0,
+          "the restore privilege preflight refuses before confirmation or probe");
+    check(!observation.called && access(target, F_OK) != 0 &&
+              file_equals(sentinel, "untouched"),
+          "the refusal leaves the destination untouched before replay");
     check(access(target, F_OK) != 0 && file_equals(sentinel, "untouched") &&
               before_entries >= 0 && after_entries == before_entries,
           "probe rejection leaves no named destination entry");

@@ -1377,9 +1377,20 @@ static void test_live_restore_joins_progress_ticker(void)
     check(manifest_write_v1(source, &manifest) == 0,
           "fixture: write the live-progress restore manifest");
     write_payload_file(source, "data/PROGRESS", "payload.txt", "progress payload");
-    char packages_path[PATH_MAX];
-    join_path(packages_path, sizeof(packages_path), source, "packages.txt");
-    write_file_mode(packages_path, "fixture-package\n", 0644);
+    // The restore privilege preflight (docs/DECISIONS.md D38 extended to
+    // restore) now refuses an unprivileged restore up front when
+    // packages.txt is present. Only plant it when this run can actually get
+    // past that gate, so the progress-ticker assertions below still exercise
+    // an ordinary unprivileged restore; the package-ordering assertion is
+    // skipped instead when not root, matching this suite's existing
+    // root-required convention (e.g. test_metadata_contract.c).
+    const int running_as_root = geteuid() == 0;
+    if (running_as_root)
+    {
+        char packages_path[PATH_MAX];
+        join_path(packages_path, sizeof(packages_path), source, "packages.txt");
+        write_file_mode(packages_path, "fixture-package\n", 0644);
+    }
 
     int previous_dry_run = dry_run;
     dry_run = 0;
@@ -1407,9 +1418,13 @@ static void test_live_restore_joins_progress_ticker(void)
     check(threads_before > 0 && threads_after == threads_before,
           "a live restore joins its progress ticker before returning");
 #ifdef PACKAGES_TEST_HOOKS
-    check(package_probe.call_count == 1 &&
-              package_probe.thread_count == threads_before,
-          "package restore starts only after the progress ticker is joined");
+    if (running_as_root)
+        check(package_probe.call_count == 1 &&
+                  package_probe.thread_count == threads_before,
+              "package restore starts only after the progress ticker is joined");
+    else
+        skip_case("package restore starts only after the progress ticker is joined",
+                  "requires root: packages.txt now needs privilege up front");
 #endif
 
     remove_tree(source);

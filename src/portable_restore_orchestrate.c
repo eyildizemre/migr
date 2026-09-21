@@ -87,6 +87,20 @@ static PortableRestoreOutcome portable_restore_orchestrate_impl(
         return PORTABLE_RESTORE_ERROR;
     }
 
+    // Runs before consent and before any destination mutation (also ahead of
+    // the dry-run branch below, so a dry run under insufficient privilege
+    // reports the same refusal rather than previewing a run it could not
+    // actually perform): the preflight above already built preflight.profiles
+    // (including foreign_owner_count), so this needs no extra pass over the
+    // sidecar/collection entries.
+    if (restore_privilege_preflight(request->source_container_fd,
+                                    preflight.profiles.foreign_owner_count) != 0)
+    {
+        report->live_count = preflight.live_count;
+        portable_restore_preflight_report_free(&preflight);
+        return PORTABLE_RESTORE_ERROR;
+    }
+
     const char *destination_home = request->destination_home_path != NULL
         ? request->destination_home_path : "destination home";
     if (restore_space_preflight(request->destination_home_fd, destination_home,

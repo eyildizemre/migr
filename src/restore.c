@@ -2596,6 +2596,17 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         goto cleanup;
     metadata_profiles_report(&metadata_profiles);
 
+    // Runs before consent and before any destination mutation, covering both
+    // v1 and legacy manifests: metadata_inventory_status above already built
+    // metadata_profiles (including foreign_owner_count) for whichever of the
+    // two ran, so this needs no extra pass over the payload. Kept after the
+    // informational metadata_profiles_report() above so a refusal is
+    // preceded by the same privilege-relevant profile detail an accepted
+    // restore would have shown.
+    if (restore_privilege_preflight(source_root_fd,
+                                    metadata_profiles.foreign_owner_count) != 0)
+        goto cleanup;
+
     if (dry_run)
     {
         printf("Dry run mode enabled. No changes will be made.\n\n");

@@ -168,8 +168,18 @@ int metadata_profiles_add(MetadataProfiles *profiles, int anchor_fd,
     if (profiles == NULL || anchor_fd < 0 || desired == NULL)
         return -1;
 
-    int privilege_relevant = desired->st_uid != geteuid() ||
-                             !gid_is_allowed(profiles, desired->st_gid) ||
+    // The restore-time privilege preflight (restore_privilege_preflight(),
+    // src/backup.c) needs to know, before any consent prompt or destination
+    // mutation, whether *any* entry's recorded owner will need CAP_CHOWN --
+    // narrower than privilege_relevant below, which also folds in the
+    // setuid/setgid-bit and existing-destination-owner reasons that justify
+    // a metadata_profiles_probe() round trip but do not by themselves
+    // require root.
+    int desired_owner_foreign = owner_is_foreign(profiles, desired);
+    if (desired_owner_foreign && profiles->foreign_owner_count != SIZE_MAX)
+        profiles->foreign_owner_count++;
+
+    int privilege_relevant = desired_owner_foreign ||
                              (desired->st_mode & (S_ISUID | S_ISGID)) != 0 ||
                              owner_is_foreign(profiles, existing);
     if (!privilege_relevant)

@@ -1,6 +1,7 @@
 #ifndef BACKUP_H
 #define BACKUP_H
 
+#include <stddef.h> /* size_t */
 #include <sys/types.h> /* off_t */
 
 typedef enum {
@@ -62,6 +63,20 @@ int destination_has_space(int dest_fd, off_t needed, off_t *free_bytes);
  */
 int restore_space_preflight(int destination_fd, const char *home,
                             off_t estimated_bytes, int estimate_had_error);
+
+/* Restore-time equivalent of docs/DECISIONS.md D38's backup-side pattern
+ * ("fail before mutation when the required privilege is missing, instruct
+ * the user to rerun through sudo") -- shared by native and portable restore,
+ * called once their metadata preflight has already computed
+ * foreign_owner_count (docs/DECISIONS.md D38: an ordinary, same-owner
+ * restore must keep working without root). source_root_fd is the backup
+ * container root, used only for a cheap packages.txt existence probe.
+ * Returns 0 to proceed (either privileged, or nothing found that needs it),
+ * or -1 to refuse (message already printed) -- always before any
+ * destination mutation or consent prompt.
+ */
+int restore_privilege_preflight(int source_root_fd,
+                                size_t foreign_owner_count);
 
 #ifdef BACKUP_TEST_HOOKS
 typedef void (*BackupTestInventoryHook)(const char *source_path,
