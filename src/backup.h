@@ -3,6 +3,7 @@
 
 #include <stddef.h> /* size_t */
 #include <sys/types.h> /* off_t */
+#include <time.h> /* struct timespec */
 
 typedef enum {
     BACKUP_CRITICAL,      /**< Documents, Downloads, Pictures, dotfiles, browser profiles, and packages. */
@@ -109,6 +110,13 @@ void backup_test_set_network_config_source_dir(const char *backend_name,
 
 void backup_test_force_portable_representation(int enabled);
 void backup_test_force_case_insensitive_destination(int enabled);
+
+/* Exposes the progress display's cumulative-average speed formula
+ * (total_bytes / elapsed since started_at) for direct unit testing with
+ * synthetic timestamps, without needing to fake wall-clock delays. */
+off_t backup_test_progress_speed(off_t total_bytes,
+                                 const struct timespec *started_at,
+                                 const struct timespec *now);
 #endif
 
 #endif

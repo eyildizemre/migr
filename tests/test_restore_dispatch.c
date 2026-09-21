@@ -1353,6 +1353,38 @@ static void test_versioned_restore_allows_ascii_case_distinct_names(void)
     remove_tree(home);
 }
 
+static void test_restore_progress_speed_is_cumulative_average(void)
+{
+    printf(BLUE "::" NC " utility: restore progress speed is a cumulative "
+                "average, not the last-interval rate\n");
+    struct timespec started_at = { .tv_sec = 1000, .tv_nsec = 0 };
+
+    // A long syncfs()-style stall: 60s elapsed, almost nothing restored yet.
+    struct timespec after_stall = { .tv_sec = 1060, .tv_nsec = 0 };
+    off_t speed_during_stall =
+        restore_test_progress_speed(100, &started_at, &after_stall);
+    check(speed_during_stall == 100 / 60,
+          "speed during a stall reflects the (tiny) average so far");
+
+    // A one-second burst that lands the bulk of the bytes right after the
+    // stall unblocks. The interval-only formula would report the burst rate
+    // here (~609900 B/s); the cumulative average must not.
+    struct timespec after_burst = { .tv_sec = 1061, .tv_nsec = 0 };
+    off_t speed_after_burst =
+        restore_test_progress_speed(610000, &started_at, &after_burst);
+    check(speed_after_burst == 10000,
+          "speed after a burst is total_bytes / elapsed since start (10000), "
+          "not the burst-only rate");
+    check(speed_after_burst < 609900 / 2,
+          "speed after a burst is nowhere near the burst-only interval rate");
+
+    // Guard clauses carried over from the interval formula.
+    check(restore_test_progress_speed(0, &started_at, &after_burst) == 0,
+          "zero bytes restored yields zero speed");
+    check(restore_test_progress_speed(610000, &started_at, &started_at) == 0,
+          "non-positive elapsed time yields zero speed");
+}
+
 static void test_live_restore_joins_progress_ticker(void)
 {
     printf(BLUE "::" NC " restore dispatch: live progress ticker is joined before optional restore steps\n");
@@ -3029,6 +3061,7 @@ int main(void)
     test_versioned_restore_rejects_non_directory_payload_paths();
     test_versioned_restore_refuses_bind_mount_aliases();
     test_versioned_restore_allows_ascii_case_distinct_names();
+    test_restore_progress_speed_is_cumulative_average();
     test_live_restore_joins_progress_ticker();
     test_native_identity_graph_keeps_nested_mount_views_route_specific();
     test_versioned_restore_refuses_differing_mount_id_aliases();

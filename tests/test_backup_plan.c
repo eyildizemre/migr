@@ -3007,6 +3007,38 @@ static void test_format_duration(void)
           "multi-hour durations preserve minute and second padding");
 }
 
+static void test_progress_speed_is_cumulative_average(void)
+{
+    printf(BLUE "::" NC " utility: progress speed is a cumulative average, "
+                "not the last-interval rate\n");
+    struct timespec started_at = { .tv_sec = 1000, .tv_nsec = 0 };
+
+    // A long syncfs()-style stall: 60s elapsed, almost nothing copied yet.
+    struct timespec after_stall = { .tv_sec = 1060, .tv_nsec = 0 };
+    off_t speed_during_stall =
+        backup_test_progress_speed(100, &started_at, &after_stall);
+    check(speed_during_stall == 100 / 60,
+          "speed during a stall reflects the (tiny) average so far");
+
+    // A one-second burst that lands the bulk of the bytes right after the
+    // stall unblocks. The interval-only formula would report the burst rate
+    // here (~609900 B/s); the cumulative average must not.
+    struct timespec after_burst = { .tv_sec = 1061, .tv_nsec = 0 };
+    off_t speed_after_burst =
+        backup_test_progress_speed(610000, &started_at, &after_burst);
+    check(speed_after_burst == 10000,
+          "speed after a burst is total_bytes / elapsed since start (10000), "
+          "not the burst-only rate");
+    check(speed_after_burst < 609900 / 2,
+          "speed after a burst is nowhere near the burst-only interval rate");
+
+    // Guard clauses carried over from the interval formula.
+    check(backup_test_progress_speed(0, &started_at, &after_burst) == 0,
+          "zero bytes copied yields zero speed");
+    check(backup_test_progress_speed(610000, &started_at, &started_at) == 0,
+          "non-positive elapsed time yields zero speed");
+}
+
 static void test_live_progress(void)
 {
     printf(BLUE "::" NC " production: live backup progress is chunked, final-flushed, and tty-gated\n");
@@ -3506,6 +3538,7 @@ int main(void)
     test_portable_prescan_failure_diagnostics();
     test_vscode_extension_snapshot();
     test_format_duration();
+    test_progress_speed_is_cumulative_average();
     test_live_progress();
     test_stalled_progress_ticker();
     test_missing_explicit_path_rejects_before_target_creation();

@@ -1,6 +1,9 @@
 #ifndef RESTORE_H
 #define RESTORE_H
 
+#include <sys/types.h> /* off_t */
+#include <time.h> /* struct timespec */
+
 #ifdef RESTORE_TEST_HOOKS
 typedef int (*RestoreTestNetworkReloadHook)(char *const argv[], void *context);
 
@@ -8,6 +11,13 @@ void restore_test_set_network_config_dest_dir(const char *backend_name,
                                               const char *dest_dir);
 void restore_test_set_network_reload_hook(RestoreTestNetworkReloadHook hook,
                                           void *context);
+
+/* Exposes the progress display's cumulative-average speed formula
+ * (total_bytes / elapsed since started_at) for direct unit testing with
+ * synthetic timestamps, without needing to fake wall-clock delays. */
+off_t restore_test_progress_speed(off_t total_bytes,
+                                  const struct timespec *started_at,
+                                  const struct timespec *now);
 #endif
 
 /**

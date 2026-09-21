@@ -1299,26 +1299,40 @@ typedef struct {
     int data_fd;
     int printed_anything;
     struct timespec started_at;
-    struct timespec last_sample_time;
-    off_t last_sample_bytes;
     ProgressTicker ticker;
 } BackupProgressDisplay;
 
-static off_t progress_speed(off_t bytes_copied, off_t last_sample_bytes,
-                            double sample_seconds)
+// Cumulative average since started_at, not the rate since the last callback:
+// a syncfs() stall followed by a buffered-write burst would otherwise show
+// near-zero speed during the stall and a wildly inflated spike right after
+// it, neither of which reflects the actual sustained throughput.
+static off_t progress_speed(off_t total_bytes, const struct timespec *started_at,
+                            const struct timespec *now)
 {
-    if (!isfinite(sample_seconds) || sample_seconds <= 0.0 ||
-        bytes_copied <= last_sample_bytes)
+    double elapsed_seconds = timespec_elapsed_seconds(started_at, now);
+    if (!isfinite(elapsed_seconds) || elapsed_seconds <= 0.0 ||
+        total_bytes <= 0)
         return 0;
 
-    off_t delta = bytes_copied - last_sample_bytes;
-    double speed = (double)delta / sample_seconds;
+    double speed = (double)total_bytes / elapsed_seconds;
     if (!isfinite(speed) || speed <= 0.0)
         return 0;
     if (speed >= (double)INTMAX_MAX)
         return (off_t)INTMAX_MAX;
     return (off_t)speed;
 }
+
+#ifdef BACKUP_TEST_HOOKS
+// Drives the cumulative-average formula directly with synthetic timestamps,
+// so a test can simulate a long stall followed by a burst without actually
+// sleeping.
+off_t backup_test_progress_speed(off_t total_bytes,
+                                 const struct timespec *started_at,
+                                 const struct timespec *now)
+{
+    return progress_speed(total_bytes, started_at, now);
+}
+#endif
 
 static long progress_elapsed_whole_seconds(double elapsed_seconds)
 {
@@ -1407,17 +1421,10 @@ static void backup_report_progress(off_t bytes_copied,
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
         return;
     if (!display->printed_anything)
-    {
         display->started_at = now;
-        display->last_sample_time = now;
-        display->last_sample_bytes = 0;
-    }
 
-    double sample_seconds = timespec_elapsed_seconds(
-        &display->last_sample_time, &now);
-    off_t speed_bytes = progress_speed(bytes_copied,
-                                       display->last_sample_bytes,
-                                       sample_seconds);
+    off_t speed_bytes = progress_speed(bytes_copied, &display->started_at,
+                                       &now);
 
     off_t free_bytes = 0;
     int free_bytes_known =
@@ -1443,8 +1450,6 @@ static void backup_report_progress(off_t bytes_copied,
                                   current_path,
                                   backup_test_progress_context);
 #endif
-    display->last_sample_time = now;
-    display->last_sample_bytes = bytes_copied;
     display->printed_anything = 1;
 }
 
