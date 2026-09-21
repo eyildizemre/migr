@@ -70,14 +70,12 @@ int restore_space_preflight(int destination_fd, const char *home,
  * the user to rerun through sudo") -- shared by native and portable restore,
  * called once their metadata preflight has already computed
  * foreign_owner_count (docs/DECISIONS.md D38: an ordinary, same-owner
- * restore must keep working without root). source_root_fd is the backup
- * container root, used only for a cheap packages.txt existence probe.
+ * restore must keep working without root).
  * Returns 0 to proceed (either privileged, or nothing found that needs it),
  * or -1 to refuse (message already printed) -- always before any
  * destination mutation or consent prompt.
  */
-int restore_privilege_preflight(int source_root_fd,
-                                size_t foreign_owner_count);
+int restore_privilege_preflight(size_t foreign_owner_count);
 
 #ifdef BACKUP_TEST_HOOKS
 typedef void (*BackupTestInventoryHook)(const char *source_path,

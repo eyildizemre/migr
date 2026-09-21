@@ -19,7 +19,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <ftw.h>
+#include <grp.h>
 #include <limits.h>
+#include <pwd.h>
 #include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -90,6 +92,10 @@ typedef struct {
     int thread_count;
 } PackageProgressProbe;
 
+typedef struct {
+    char marker_path[PATH_MAX];
+} PackagePrivilegeProbe;
+
 static int package_progress_probe(char *const argv[], void *context)
 {
     (void)argv;
@@ -110,12 +116,50 @@ static int package_progress_capture(char *const argv[], char *output,
     memcpy(output, installed, strlen(installed) + 1U);
     return 0;
 }
+
+static int package_privilege_probe(char *const argv[], void *context)
+{
+    PackagePrivilegeProbe *probe = context;
+    if (argv == NULL || argv[0] == NULL || argv[1] == NULL ||
+        argv[2] == NULL || argv[3] == NULL || argv[4] == NULL ||
+        argv[5] == NULL || argv[6] != NULL || strcmp(argv[0], "sudo") != 0 ||
+        strcmp(argv[1], "dnf") != 0 || strcmp(argv[2], "install") != 0 ||
+        strcmp(argv[3], "-y") != 0 ||
+        strcmp(argv[4], "--skip-unavailable") != 0 ||
+        strcmp(argv[5], "fixture-package") != 0)
+        return -1;
+
+    int fd = open(probe->marker_path,
+                  O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0)
+        return -1;
+    const char marker[] = "package install hook\n";
+    ssize_t written = write(fd, marker, sizeof(marker) - 1U);
+    int saved_errno = errno;
+    int close_result = close(fd);
+    if (written < 0)
+        errno = saved_errno;
+    return written == (ssize_t)(sizeof(marker) - 1U) && close_result == 0
+        ? 0 : -1;
+}
 #endif
 
 static void skip_case(const char *label, const char *reason)
 {
     printf("  " YELLOW "-" NC " %s skipped: %s\n", label, reason);
     skips++;
+}
+
+static int find_nobody(uid_t *uid, gid_t *gid)
+{
+    if (geteuid() != 0)
+        return 0;
+    struct passwd *nobody = getpwnam("nobody");
+    if (nobody == NULL || nobody->pw_uid == 0)
+        return 0;
+    *uid = nobody->pw_uid;
+    *gid = nobody->pw_gid;
+    return 1;
 }
 
 static void force_no_free_space(off_t needed, off_t *free_bytes,
@@ -283,10 +327,12 @@ static void remove_fixture_packages(const char *source)
 // one test's output or any accidental global mutation leaking into the next.
 // input may be NULL; live happy-path tests pass "y\n" through stdin so they
 // still exercise the production confirmation path.
-static int run_restore_capturing_with_input(const char *source,
-                                            const char *input,
-                                            char *output,
-                                            size_t output_size)
+static int run_restore_capturing_with_identity(const char *source,
+                                               const char *input,
+                                               char *output,
+                                               size_t output_size,
+                                               int drop_privileges,
+                                               uid_t uid, gid_t gid)
 {
     int output_pipe[2];
     int input_pipe[2];
@@ -313,6 +359,9 @@ static int run_restore_capturing_with_input(const char *source,
             _exit(2);
         close(output_pipe[1]);
         close(input_pipe[0]);
+        if (drop_privileges &&
+            (setgroups(0, NULL) != 0 || setgid(gid) != 0 || setuid(uid) != 0))
+            _exit(CHILD_SKIP);
         int rc = restore(source);
         fflush(stdout);
         fflush(stderr);
@@ -345,6 +394,15 @@ static int run_restore_capturing_with_input(const char *source,
     int status = 0;
     waitpid(pid, &status, 0);
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+static int run_restore_capturing_with_input(const char *source,
+                                            const char *input,
+                                            char *output,
+                                            size_t output_size)
+{
+    return run_restore_capturing_with_identity(source, input, output,
+                                                output_size, 0, 0, 0);
 }
 
 static int run_restore_capturing(const char *source, char *output,
@@ -1409,20 +1467,9 @@ static void test_live_restore_joins_progress_ticker(void)
     check(manifest_write_v1(source, &manifest) == 0,
           "fixture: write the live-progress restore manifest");
     write_payload_file(source, "data/PROGRESS", "payload.txt", "progress payload");
-    // The restore privilege preflight (docs/DECISIONS.md D38 extended to
-    // restore) now refuses an unprivileged restore up front when
-    // packages.txt is present. Only plant it when this run can actually get
-    // past that gate, so the progress-ticker assertions below still exercise
-    // an ordinary unprivileged restore; the package-ordering assertion is
-    // skipped instead when not root, matching this suite's existing
-    // root-required convention (e.g. test_metadata_contract.c).
-    const int running_as_root = geteuid() == 0;
-    if (running_as_root)
-    {
-        char packages_path[PATH_MAX];
-        join_path(packages_path, sizeof(packages_path), source, "packages.txt");
-        write_file_mode(packages_path, "fixture-package\n", 0644);
-    }
+    char packages_path[PATH_MAX];
+    join_path(packages_path, sizeof(packages_path), source, "packages.txt");
+    write_file_mode(packages_path, "fixture-package\n", 0644);
 
     int previous_dry_run = dry_run;
     dry_run = 0;
@@ -1450,18 +1497,121 @@ static void test_live_restore_joins_progress_ticker(void)
     check(threads_before > 0 && threads_after == threads_before,
           "a live restore joins its progress ticker before returning");
 #ifdef PACKAGES_TEST_HOOKS
-    if (running_as_root)
-        check(package_probe.call_count == 1 &&
-                  package_probe.thread_count == threads_before,
-              "package restore starts only after the progress ticker is joined");
-    else
-        skip_case("package restore starts only after the progress ticker is joined",
-                  "requires root: packages.txt now needs privilege up front");
+    check(package_probe.call_count == 1 &&
+              package_probe.thread_count == threads_before,
+          "package restore starts only after the progress ticker is joined");
 #endif
 
     remove_tree(source);
     remove_tree(home);
 }
+
+#ifdef PACKAGES_TEST_HOOKS
+static void test_unprivileged_restore_reaches_package_install(void)
+{
+    printf(BLUE "::" NC " restore dispatch: packages.txt does not require root preflight\n");
+
+    char source[PATH_MAX], home[PATH_MAX], restored[PATH_MAX];
+    char manifest_path[PATH_MAX], data_path[PATH_MAX];
+    char payload_dir[PATH_MAX], payload_path[PATH_MAX], packages_path[PATH_MAX];
+    char output[16384];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_packages_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_packages_home");
+    setenv("HOME", home, 1);
+
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "PACKAGES");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "PACKAGES");
+    strcpy(root.source_path, "packages-source");
+    strcpy(root.restore_path, "packages-dest");
+    root.has_restore_path = 1;
+
+    Manifest manifest;
+    make_v1_manifest(&manifest, &root, 1);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the package-restore manifest");
+    write_payload_file(source, "data/PACKAGES", "payload.txt",
+                       "package restore payload");
+    join_path(packages_path, sizeof(packages_path), source, "packages.txt");
+    write_file_mode(packages_path, "fixture-package\n", 0644);
+
+    join_path(manifest_path, sizeof(manifest_path), source, "manifest.txt");
+    join_path(data_path, sizeof(data_path), source, "data");
+    join_path(payload_dir, sizeof(payload_dir), data_path, "PACKAGES");
+    join_path(payload_path, sizeof(payload_path), payload_dir, "payload.txt");
+    if (chmod(source, 0755) != 0 || chmod(home, 0755) != 0)
+    {
+        skip_case("unprivileged package restore", "fixture permissions could not be prepared");
+        remove_tree(source);
+        remove_tree(home);
+        return;
+    }
+
+    int drop_privileges = 0;
+    uid_t nobody_uid = 0;
+    gid_t nobody_gid = 0;
+    if (geteuid() == 0)
+    {
+        if (!find_nobody(&nobody_uid, &nobody_gid))
+        {
+            skip_case("unprivileged package restore",
+                      "root test requires an unprivileged nobody identity");
+            remove_tree(source);
+            remove_tree(home);
+            return;
+        }
+        const char *owned_paths[] = {
+            source, manifest_path, data_path, payload_dir, payload_path,
+            packages_path, home
+        };
+        for (size_t index = 0;
+             index < sizeof(owned_paths) / sizeof(owned_paths[0]); index++)
+        {
+            if (chown(owned_paths[index], nobody_uid, nobody_gid) != 0)
+            {
+                skip_case("unprivileged package restore",
+                          "fixture ownership could not be assigned to nobody");
+                remove_tree(source);
+                remove_tree(home);
+                return;
+            }
+        }
+        drop_privileges = 1;
+    }
+
+    PackagePrivilegeProbe probe = {0};
+    join_path(probe.marker_path, sizeof(probe.marker_path), home,
+              "package-install-hook-called");
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    packages_test_set_restore_hooks(DISTRO_FEDORA, package_privilege_probe,
+                                    package_progress_capture, &probe);
+    int rc = run_restore_capturing_with_identity(
+        source, "y\n", output, sizeof(output), drop_privileges,
+        nobody_uid, nobody_gid);
+    packages_test_clear_restore_hooks();
+    dry_run = previous_dry_run;
+
+    join_path(restored, sizeof(restored), home,
+              "packages-dest/payload.txt");
+    if (rc == CHILD_SKIP)
+        skip_case("unprivileged package restore",
+                  "the test child could not drop to nobody");
+    else
+    {
+        check(rc == 0 && strstr(output, "This restore needs root") == NULL &&
+                  file_content_is(restored, "package restore payload"),
+              "packages.txt does not stop an unprivileged restore before mutation");
+        check(file_content_is(probe.marker_path, "package install hook\n"),
+              "recognized package restore reaches the sudo-prefixed install hook");
+    }
+
+    remove_tree(source);
+    remove_tree(home);
+}
+#endif
 
 static void test_native_identity_graph_keeps_nested_mount_views_route_specific(void)
 {
@@ -3063,6 +3213,9 @@ int main(void)
     test_versioned_restore_allows_ascii_case_distinct_names();
     test_restore_progress_speed_is_cumulative_average();
     test_live_restore_joins_progress_ticker();
+#ifdef PACKAGES_TEST_HOOKS
+    test_unprivileged_restore_reaches_package_install();
+#endif
     test_native_identity_graph_keeps_nested_mount_views_route_specific();
     test_versioned_restore_refuses_differing_mount_id_aliases();
     test_versioned_restore_refuses_destination_alias_collisions();

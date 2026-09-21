@@ -93,8 +93,7 @@ static PortableRestoreOutcome portable_restore_orchestrate_impl(
     // actually perform): the preflight above already built preflight.profiles
     // (including foreign_owner_count), so this needs no extra pass over the
     // sidecar/collection entries.
-    if (restore_privilege_preflight(request->source_container_fd,
-                                    preflight.profiles.foreign_owner_count) != 0)
+    if (restore_privilege_preflight(preflight.profiles.foreign_owner_count) != 0)
     {
         report->live_count = preflight.live_count;
         portable_restore_preflight_report_free(&preflight);

@@ -2608,8 +2608,7 @@ int restore_with_options(const char *source, const RestoreOptions *options)
     // informational metadata_profiles_report() above so a refusal is
     // preceded by the same privilege-relevant profile detail an accepted
     // restore would have shown.
-    if (restore_privilege_preflight(source_root_fd,
-                                    metadata_profiles.foreign_owner_count) != 0)
+    if (restore_privilege_preflight(metadata_profiles.foreign_owner_count) != 0)
         goto cleanup;
 
     if (dry_run)
