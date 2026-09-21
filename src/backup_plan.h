@@ -158,6 +158,37 @@ int backup_plan_home_relative(const char *home_real, const char *capture_path,
                               const char **restore_rel);
 
 /**
+ * @brief Recommended buffer size for backup_plan_builtin_reference_text():
+ * generous headroom over the current catalog's rendered size, so a stack
+ * buffer this size succeeds today and leaves room for catalog growth before
+ * a caller must ever handle -1.
+ */
+#define BACKUP_PLAN_BUILTIN_REFERENCE_MAX 4096
+
+/**
+ * @brief Formats the built-in critical/comprehensive catalog (dotfile
+ * entries + XDG dirs) as a "# "-prefixed reference block, for conf's
+ * first-run template -- generated from the live catalog so it can never
+ * drift out of sync with what backup_plan.c actually resolves.
+ *
+ * Two labeled groups are produced: entries always included (critical and
+ * comprehensive), and entries added only under --comprehensive. An XDG
+ * directory is labeled "<name>/ (XDG)" to mark it as resolved via
+ * user-dirs.dirs rather than a literal fixed path, distinct from a plain
+ * dotfile home_rel line.
+ *
+ * @param buf      Destination buffer; NUL-terminated on success, like the
+ *                  output of snprintf.
+ * @param buf_size Its size; BACKUP_PLAN_BUILTIN_REFERENCE_MAX is enough for
+ *                  the current catalog.
+ * @return The byte count written, excluding the NUL terminator, on success;
+ *         -1 if buf_size is too small to hold the whole block -- matching
+ *         path_join's fixed-buffer-with-truncation-detection convention, buf
+ *         is never left holding a silently truncated block on failure.
+ */
+int backup_plan_builtin_reference_text(char *buf, size_t buf_size);
+
+/**
  * @brief Releases the heap-owned root array. Safe on NULL and on an
  * all-zero/never-built BackupPlan.
  */

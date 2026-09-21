@@ -152,6 +152,89 @@ enum { BUILTIN_HOME_CATALOG_COUNT =
     sizeof(builtin_home_catalog) / sizeof(builtin_home_catalog[0]) };
 
 /* ------------------------------------------------------------------------- */
+/* Built-in catalog reference text, for conf's first-run template.           */
+/* ------------------------------------------------------------------------- */
+
+// Appends one "#   "-prefixed line to buf at *offset, matching path_join's
+// fixed-buffer-with-truncation-detection convention: a line that would not
+// fit whole fails the call instead of writing a partial line. label is the
+// single %s substitution (a home_rel or an XDG fallback name); suffix is
+// appended verbatim after it (e.g. "/ (XDG)" or "").
+static int append_ref_line(char *buf, size_t buf_size, size_t *offset,
+                           const char *label, const char *suffix)
+{
+    int n = snprintf(buf + *offset, buf_size - *offset, "#   %s%s\n", label, suffix);
+    if (n < 0 || (size_t)n >= buf_size - *offset)
+        return -1;
+    *offset += (size_t)n;
+    return 0;
+}
+
+static int append_ref_text(char *buf, size_t buf_size, size_t *offset, const char *text)
+{
+    int n = snprintf(buf + *offset, buf_size - *offset, "%s", text);
+    if (n < 0 || (size_t)n >= buf_size - *offset)
+        return -1;
+    *offset += (size_t)n;
+    return 0;
+}
+
+/* Formats the built-in critical/comprehensive catalog (dotfile entries +
+ * XDG dirs) as a "# "-prefixed reference block, for conf's first-run
+ * template -- generated from the live catalog so it can never drift out
+ * of sync with what backup_plan.c actually resolves. */
+int backup_plan_builtin_reference_text(char *buf, size_t buf_size)
+{
+    size_t offset = 0;
+
+    if (append_ref_text(buf, buf_size, &offset,
+            "# Built-in scope (already included by default; no action needed).\n"
+            "# This list is generated from the catalog at file-creation time --\n"
+            "# it is not refreshed later, so a conf file created before a future\n"
+            "# catalog change keeps showing what was built in when it was made.\n"
+            "#\n"
+            "# Always included (critical and comprehensive):\n") != 0)
+        return -1;
+
+    // indices 0-3 (Documents/Downloads/Pictures/Desktop): always included,
+    // the same split build_builtin_roots() applies. Labeled "(XDG)" since
+    // these are resolved via user-dirs.dirs, not literal fixed paths.
+    for (int i = 0; i < 4 && i < XDG_KEY_COUNT; i++)
+        if (append_ref_line(buf, buf_size, &offset, xdg_fallbacks[i], "/ (XDG)") != 0)
+            return -1;
+
+    for (int i = 0; i < BUILTIN_HOME_CATALOG_COUNT; i++)
+    {
+        const BuiltinHomeEntry *e = &builtin_home_catalog[i];
+        if (!e->comprehensive_only &&
+            append_ref_line(buf, buf_size, &offset, e->home_rel, "") != 0)
+            return -1;
+    }
+
+    if (append_ref_text(buf, buf_size, &offset,
+            "#\n"
+            "# Additional built-ins included only under --comprehensive:\n") != 0)
+        return -1;
+
+    // indices 4-5 (Videos/Music): comprehensive-only, per build_builtin_roots().
+    for (int i = 4; i < XDG_KEY_COUNT; i++)
+        if (append_ref_line(buf, buf_size, &offset, xdg_fallbacks[i], "/ (XDG)") != 0)
+            return -1;
+
+    for (int i = 0; i < BUILTIN_HOME_CATALOG_COUNT; i++)
+    {
+        const BuiltinHomeEntry *e = &builtin_home_catalog[i];
+        if (e->comprehensive_only &&
+            append_ref_line(buf, buf_size, &offset, e->home_rel, "") != 0)
+            return -1;
+    }
+
+    if (offset > (size_t)INT_MAX)
+        return -1;
+    return (int)offset;
+}
+
+/* ------------------------------------------------------------------------- */
 /* Leaf-preserving path normalization (docs/DECISIONS.md D16).               */
 /*                                                                           */
 /* Shared by every root category -- built-in, XDG, and explicit alike -- so  */

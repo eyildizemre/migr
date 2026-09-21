@@ -1,5 +1,7 @@
 #define _GNU_SOURCE
+#include "backup_plan.h"
 #include "config.h"
+#include "xdg.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -75,6 +77,59 @@ static void write_file(const char *path, const char *text)
     if (!f) { perror(path); exit(1); }
     CHECK(fputs(text, f) >= 0);
     CHECK(fclose(f) == 0);
+}
+
+static void builtin_reference_tests(void)
+{
+    char buf[BACKUP_PLAN_BUILTIN_REFERENCE_MAX];
+    int n = backup_plan_builtin_reference_text(buf, sizeof(buf));
+    CHECK(n > 0 && (size_t)n == strlen(buf));
+    CHECK(strstr(buf, "Always included") != NULL);
+    char *marker = strstr(buf, "Additional built-ins included only under --comprehensive:");
+    CHECK(marker != NULL);
+
+    /* XDG split ground truth (xdg_fallbacks/XDG_KEY_COUNT, exposed via
+     * xdg.h) rather than a second hand-maintained list: indices 0-3 must
+     * land before the comprehensive-only marker, 4-5 after it. */
+    for (int i = 0; i < XDG_KEY_COUNT; i++)
+    {
+        char needle[64];
+        int ln = snprintf(needle, sizeof(needle), "#   %s/ (XDG)\n", xdg_fallbacks[i]);
+        CHECK(ln > 0 && (size_t)ln < sizeof(needle));
+        char *found = strstr(buf, needle);
+        CHECK(found != NULL);
+        if (found && marker)
+            CHECK((i < 4) == (found < marker));
+    }
+
+    /* Every dotfile entry in builtin_home_catalog (src/backup_plan.c) is
+     * currently always-included -- comprehensive_only is 0 for all of them
+     * today. Update this list alongside the catalog if that ever changes. */
+    static const char *const always_included[] = {
+        ".ssh", ".gnupg", ".gitconfig", ".config", ".local/share",
+        ".local/state", ".local/bin", ".bashrc", ".bash_history",
+        ".bash_profile", ".bash_login", ".bash_logout", ".bash_aliases",
+        ".profile", ".zshenv", ".zsh_history", ".zprofile", ".zshrc",
+        ".zlogin", ".zlogout", ".inputrc", ".tmux.conf", ".screenrc",
+        ".mozilla", ".config/google-chrome", ".config/chromium",
+        ".config/BraveSoftware", ".config/vivaldi", ".config/microsoft-edge",
+        ".config/opera",
+    };
+    for (size_t i = 0; i < sizeof(always_included) / sizeof(always_included[0]); i++)
+    {
+        char needle[64];
+        int ln = snprintf(needle, sizeof(needle), "#   %s\n", always_included[i]);
+        CHECK(ln > 0 && (size_t)ln < sizeof(needle));
+        char *found = strstr(buf, needle);
+        CHECK(found != NULL);
+        if (found && marker) CHECK(found < marker);
+    }
+
+    /* A buffer too small to hold the whole block fails closed instead of
+     * handing back a silently truncated one. */
+    CHECK(backup_plan_builtin_reference_text(buf, 0) == -1);
+    CHECK(backup_plan_builtin_reference_text(buf, 1) == -1);
+    CHECK(backup_plan_builtin_reference_text(buf, 10) == -1);
 }
 
 static void parser_tests(void)
@@ -311,12 +366,22 @@ int main(int argc, char **argv)
         {
             FILE *file = fopen(argv[5], "r");
             if (!file) return 4;
-            char contents[1024] = {0};
+            char contents[4096] = {0};
             size_t n = fread(contents, 1, sizeof(contents) - 1, file);
             int closed = fclose(file);
             if (!n || closed || contents[0] != '#' ||
                 !strstr(contents, "[critical]\n    [include]\n\n    [exclude]\n\n[comprehensive]\n    [include]\n\n    [exclude]\n"))
                 return 5;
+            /* The generated built-in reference block must be embedded whole
+             * (byte-for-byte, straight from the same live-catalog generator
+             * builtin_reference_tests() exercises directly) and must precede
+             * the editable [critical]/[comprehensive] sections. */
+            char reference[BACKUP_PLAN_BUILTIN_REFERENCE_MAX];
+            if (backup_plan_builtin_reference_text(reference, sizeof(reference)) < 0)
+                return 9;
+            char *ref_at = strstr(contents, reference);
+            char *sections_at = strstr(contents, "[critical]\n");
+            if (!ref_at || !sections_at || ref_at > sections_at) return 10;
         }
         if (strcmp(mode, "remove") == 0) return unlink(argv[5]) == 0 ? 0 : 1;
         if (strcmp(mode, "fail") == 0) return 7;
@@ -324,6 +389,7 @@ int main(int argc, char **argv)
         if (strcmp(mode, "repair") == 0) write_file(argv[5], "[critical]\n[include]\nfixed\n");
         return failures ? 1 : 0;
     }
+    builtin_reference_tests();
     parser_tests();
     service_tests();
     printf("config tests: %d failures\n", failures);

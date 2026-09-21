@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include "backup_plan.h"
 #include "config.h"
 #include "fileops.h"
 #include "utils.h"
@@ -249,13 +250,29 @@ int config_load(const char *path, Config *out)
     return load_snapshot(path, 1, out);
 }
 
-static const char template[] =
+static const char template_intro[] =
     "# Includes in critical also apply to comprehensive; do not repeat them.\n"
     "# Excludes apply only to their own scope. Repeat them to exclude from both.\n"
-    "# Excludes win over includes. Paths are HOME-relative unless absolute.\n"
+    "# Excludes win over includes. Paths are HOME-relative unless absolute.\n";
+static const char template_separator[] = "#\n";
+static const char template_sections[] =
     "[critical]\n    [include]\n\n    [exclude]\n\n"
     "[comprehensive]\n    [include]\n\n    [exclude]\n";
 
+/* Sized for template_intro + template_separator + the built-in reference
+ * block + template_sections, all NUL-terminated; the trailing "+ 1" is that
+ * final NUL. */
+enum { TEMPLATE_CONTENT_MAX = sizeof(template_intro) - 1 +
+    sizeof(template_separator) - 1 + BACKUP_PLAN_BUILTIN_REFERENCE_MAX +
+    sizeof(template_sections) - 1 + 1 };
+
+// Only ever runs once, when the conf file doesn't exist yet (the lstat guard
+// above returns early otherwise) -- an already-existing conf file, including
+// one written before a later catalog change, is never touched by this
+// function, so its built-in reference block (if any) can go stale until the
+// user deletes and regenerates the file. Re-syncing it in place would mean
+// safely locating and replacing just the generated block without disturbing
+// the user's own [include]/[exclude] entries, which this does not attempt.
 static int create_template(const char *path)
 {
     struct stat st;
@@ -277,6 +294,19 @@ static int create_template(const char *path)
         *p = saved;
         if (!saved) break;
     }
+
+    // The reference block is generated from the live catalog (backup_plan.c)
+    // so this template can never hand-duplicate, and drift from, what
+    // build_builtin_roots() actually resolves.
+    char reference[BACKUP_PLAN_BUILTIN_REFERENCE_MAX];
+    if (backup_plan_builtin_reference_text(reference, sizeof(reference)) < 0)
+        return -1;
+    char content[TEMPLATE_CONTENT_MAX];
+    int content_len = snprintf(content, sizeof(content), "%s%s%s%s",
+                               template_intro, template_separator, reference,
+                               template_sections);
+    if (content_len < 0 || (size_t)content_len >= sizeof(content)) return -1;
+
     char temp[PATH_MAX];
     int n = snprintf(temp, sizeof(temp), "%s/.migr.conf-XXXXXX", parent);
     if (n < 0 || (size_t)n >= sizeof(temp)) return -1;
@@ -285,9 +315,9 @@ static int create_template(const char *path)
     int rc = -1;
     if (fchmod(fd, 0600) < 0) goto done;
     size_t offset = 0;
-    while (offset < sizeof(template) - 1)
+    while (offset < (size_t)content_len)
     {
-        ssize_t written = write(fd, template + offset, sizeof(template) - 1 - offset);
+        ssize_t written = write(fd, content + offset, (size_t)content_len - offset);
         if (written < 0 && errno == EINTR) continue;
         if (written <= 0) goto done;
         offset += (size_t)written;
