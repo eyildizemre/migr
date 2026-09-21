@@ -3,6 +3,7 @@
 #include "portable_restore_replay_internal.h"
 #include "portable_restore.h"
 #include "backup.h"
+#include "restore.h"
 #include "fsprobe.h"
 #include "metadata.h"
 #include "utils.h"
@@ -90,10 +91,14 @@ static PortableRestoreOutcome portable_restore_orchestrate_impl(
     // Runs before consent and before any destination mutation (also ahead of
     // the dry-run branch below, so a dry run under insufficient privilege
     // reports the same refusal rather than previewing a run it could not
-    // actually perform): the preflight above already built preflight.profiles
-    // (including foreign_owner_count), so this needs no extra pass over the
-    // sidecar/collection entries.
-    if (restore_privilege_preflight(preflight.profiles.foreign_owner_count) != 0)
+    // actually perform). The portable preflight already computed
+    // foreign_owner_count; the network check is a separate read-only scan of
+    // the manifest-declared container-root network directories.
+    int network_config_needs_privilege =
+        request->manifest->has_network_config &&
+        restore_network_config_would_write(request->source_container_fd);
+    if (restore_privilege_preflight(preflight.profiles.foreign_owner_count,
+                                    network_config_needs_privilege) != 0)
     {
         report->live_count = preflight.live_count;
         portable_restore_preflight_report_free(&preflight);

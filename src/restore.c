@@ -165,6 +165,52 @@ static int network_config_regular_count(DIR *dir, size_t *count)
     return failed ? -1 : 0;
 }
 
+int restore_network_config_would_write(int source_root_fd)
+{
+    int network_fd = openat(source_root_fd, "network",
+                            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (network_fd < 0)
+        return errno == ENOENT ? 0 : 1;
+
+    for (size_t i = 0; i < NETWORK_CONFIG_BACKEND_COUNT; i++)
+    {
+        int backend_fd = openat(network_fd,
+                                RESTORE_NETWORK_CONFIG_BACKENDS[i].container_subdir,
+                                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (backend_fd < 0)
+        {
+            if (errno == ENOENT)
+                continue;
+            (void)close(network_fd);
+            return 1;
+        }
+
+        DIR *dir = fdopendir(backend_fd);
+        if (dir == NULL)
+        {
+            (void)close(backend_fd);
+            (void)close(network_fd);
+            return 1;
+        }
+
+        size_t regular_count = 0;
+        int count_result = network_config_regular_count(dir, &regular_count);
+        int close_result = closedir(dir);
+        if (count_result != 0 || close_result != 0)
+        {
+            (void)close(network_fd);
+            return 1;
+        }
+        if (regular_count != 0)
+        {
+            (void)close(network_fd);
+            return 1;
+        }
+    }
+
+    return close(network_fd) == 0 ? 0 : 1;
+}
+
 static void report_network_config_unapplied(
     const RestoreNetworkConfigBackend *backend, const char *dest_dir, int reason)
 {
@@ -2608,7 +2654,11 @@ int restore_with_options(const char *source, const RestoreOptions *options)
     // informational metadata_profiles_report() above so a refusal is
     // preceded by the same privilege-relevant profile detail an accepted
     // restore would have shown.
-    if (restore_privilege_preflight(metadata_profiles.foreign_owner_count) != 0)
+    int network_config_needs_privilege =
+        mst == MANIFEST_STATUS_VALID && m.has_network_config &&
+        restore_network_config_would_write(source_root_fd);
+    if (restore_privilege_preflight(metadata_profiles.foreign_owner_count,
+                                    network_config_needs_privilege) != 0)
         goto cleanup;
 
     if (dry_run)

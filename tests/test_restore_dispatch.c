@@ -411,6 +411,44 @@ static int run_restore_capturing(const char *source, char *output,
     return run_restore_capturing_with_input(source, NULL, output, output_size);
 }
 
+static int run_restore_privilege_preflight_capturing(
+    size_t foreign_owner_count, int network_config_needs_privilege,
+    char *output, size_t output_size)
+{
+    int output_pipe[2];
+    if (pipe(output_pipe) != 0)
+    {
+        perror("pipe");
+        exit(1);
+    }
+    int saved_stderr = dup(STDERR_FILENO);
+    if (saved_stderr < 0 || dup2(output_pipe[1], STDERR_FILENO) < 0)
+    {
+        perror("dup");
+        exit(1);
+    }
+    close(output_pipe[1]);
+    int result = restore_privilege_preflight(
+        foreign_owner_count, network_config_needs_privilege);
+    fflush(stderr);
+    if (dup2(saved_stderr, STDERR_FILENO) < 0)
+    {
+        perror("dup2");
+        exit(1);
+    }
+    close(saved_stderr);
+
+    size_t total = 0;
+    ssize_t received;
+    while (total < output_size - 1U &&
+           (received = read(output_pipe[0], output + total,
+                            output_size - 1U - total)) > 0)
+        total += (size_t)received;
+    output[total] = '\0';
+    close(output_pipe[0]);
+    return result;
+}
+
 static int run_restore_forced_progress_in_process(const char *source,
                                                   const char *input,
                                                   char *output,
@@ -1734,6 +1772,192 @@ static void write_network_manifest(const char *source)
     }
 }
 
+static int prepare_unprivileged_restore_fixture(
+    const char *source, const char *home, const char *const *owned_paths,
+    size_t owned_path_count, int *drop_privileges, uid_t *uid, gid_t *gid)
+{
+    if (chmod(source, 0755) != 0 || chmod(home, 0755) != 0)
+        return -1;
+
+    *drop_privileges = 0;
+    *uid = 0;
+    *gid = 0;
+    if (geteuid() != 0)
+        return 0;
+
+    if (!find_nobody(uid, gid))
+        return CHILD_SKIP;
+    for (size_t index = 0; index < owned_path_count; index++)
+        if (chown(owned_paths[index], *uid, *gid) != 0)
+            return -1;
+    *drop_privileges = 1;
+    return 0;
+}
+
+static void test_network_config_privilege_refusal(void)
+{
+    printf(BLUE "::" NC
+           " network config privilege preflight: nonempty saved config refuses before consent\n");
+
+    char source[PATH_MAX], home[PATH_MAX], network[PATH_MAX];
+    char backend[PATH_MAX], saved_file[PATH_MAX], manifest_path[PATH_MAX];
+    char sentinel[PATH_MAX], output[16384];
+    fresh_mkdtemp(source, sizeof(source), "network_privilege_src");
+    fresh_mkdtemp(home, sizeof(home), "network_privilege_home");
+    setenv("HOME", home, 1);
+    write_network_manifest(source);
+    join_path(network, sizeof(network), source, "network");
+    join_path(backend, sizeof(backend), network, "networkmanager");
+    mkdir_p(backend);
+    join_path(saved_file, sizeof(saved_file), backend, "wifi.nmconnection");
+    write_file_mode(saved_file, "wifi", 0644);
+    join_path(manifest_path, sizeof(manifest_path), source, "manifest.txt");
+    join_path(sentinel, sizeof(sentinel), home, "sentinel");
+    write_file_mode(sentinel, "untouched", 0600);
+
+    const char *owned_paths[] = {
+        source, manifest_path, network, backend, saved_file, home, sentinel
+    };
+    int drop_privileges;
+    uid_t uid;
+    gid_t gid;
+    int preparation = prepare_unprivileged_restore_fixture(
+        source, home, owned_paths,
+        sizeof(owned_paths) / sizeof(owned_paths[0]),
+        &drop_privileges, &uid, &gid);
+    if (preparation == CHILD_SKIP)
+        skip_case("network-config privilege refusal",
+                  "root test requires an unprivileged nobody identity");
+    else if (preparation != 0)
+        skip_case("network-config privilege refusal",
+                  "fixture permissions or ownership could not be prepared");
+    else
+    {
+        int previous_dry_run = dry_run;
+        dry_run = 0;
+        int rc = run_restore_capturing_with_identity(
+            source, "y\n", output, sizeof(output), drop_privileges,
+            uid, gid);
+        dry_run = previous_dry_run;
+        check(rc != 0 &&
+                  strstr(output,
+                         "This restore needs root: it would apply saved network configuration") != NULL,
+              "a nonempty saved network configuration is a standalone root requirement");
+        check(strstr(output, "Continue?") == NULL &&
+                  file_content_is(sentinel, "untouched"),
+              "network privilege refusal precedes consent and destination mutation");
+    }
+
+    remove_tree(source);
+    remove_tree(home);
+}
+
+static void test_network_config_and_foreign_owner_refusal(void)
+{
+    printf(BLUE "::" NC
+           " network config privilege preflight: foreign ownership and network config share one refusal\n");
+    if (geteuid() != 0)
+    {
+        char output[1024];
+        int result = run_restore_privilege_preflight_capturing(
+            1, 1, output, sizeof(output));
+        check(result == -1 &&
+                  strstr(output,
+                         "different user and apply saved network configuration") != NULL,
+              "foreign ownership and network configuration are reported together");
+        return;
+    }
+
+    char source[PATH_MAX], home[PATH_MAX], data[PATH_MAX];
+    char payload_dir[PATH_MAX], payload_file[PATH_MAX];
+    char network[PATH_MAX], backend[PATH_MAX], saved_file[PATH_MAX];
+    char manifest_path[PATH_MAX], sentinel[PATH_MAX], output[16384];
+    fresh_mkdtemp(source, sizeof(source), "network_both_src");
+    fresh_mkdtemp(home, sizeof(home), "network_both_home");
+    setenv("HOME", home, 1);
+
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "ROOT");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "ROOT");
+    strcpy(root.source_path, "network-both-source");
+    strcpy(root.restore_path, "network-both-destination");
+    root.has_restore_path = 1;
+    Manifest manifest;
+    make_v1_manifest(&manifest, &root, 1);
+    manifest.has_network_config = 1;
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write combined network/foreign-owner manifest");
+    write_payload_file(source, "data/ROOT", "payload.txt", "payload");
+    join_path(data, sizeof(data), source, "data");
+    join_path(payload_dir, sizeof(payload_dir), data, "ROOT");
+    join_path(payload_file, sizeof(payload_file), payload_dir, "payload.txt");
+    if (chmod(payload_file, 0644) != 0)
+    {
+        skip_case("combined network/foreign-owner privilege refusal",
+                  "foreign-owned payload permissions could not be prepared");
+        remove_tree(source);
+        remove_tree(home);
+        return;
+    }
+
+    join_path(network, sizeof(network), source, "network");
+    join_path(backend, sizeof(backend), network, "networkmanager");
+    mkdir_p(backend);
+    join_path(saved_file, sizeof(saved_file), backend, "wifi.nmconnection");
+    write_file_mode(saved_file, "wifi", 0644);
+    join_path(manifest_path, sizeof(manifest_path), source, "manifest.txt");
+    join_path(sentinel, sizeof(sentinel), home, "sentinel");
+    write_file_mode(sentinel, "untouched", 0600);
+
+    uid_t nobody_uid;
+    gid_t nobody_gid;
+    if (!find_nobody(&nobody_uid, &nobody_gid))
+    {
+        skip_case("combined network/foreign-owner privilege refusal",
+                  "root test requires an unprivileged nobody identity");
+        remove_tree(source);
+        remove_tree(home);
+        return;
+    }
+    const char *owned_paths[] = {
+        source, manifest_path, data, payload_dir, network, backend,
+        saved_file, home, sentinel
+    };
+    int drop_privileges;
+    uid_t uid;
+    gid_t gid;
+    int preparation = prepare_unprivileged_restore_fixture(
+        source, home, owned_paths,
+        sizeof(owned_paths) / sizeof(owned_paths[0]),
+        &drop_privileges, &uid, &gid);
+    if (preparation != 0)
+    {
+        skip_case("combined network/foreign-owner privilege refusal",
+                  "fixture ownership could not be assigned to nobody");
+        remove_tree(source);
+        remove_tree(home);
+        return;
+    }
+
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    int rc = run_restore_capturing_with_identity(
+        source, "y\n", output, sizeof(output), drop_privileges, uid, gid);
+    dry_run = previous_dry_run;
+    check(rc != 0 &&
+              strstr(output,
+                     "different user and apply saved network configuration") != NULL,
+          "foreign ownership and network configuration are reported together");
+    check(strstr(output, "Continue?") == NULL &&
+              file_content_is(sentinel, "untouched"),
+          "the combined privilege refusal precedes consent and mutation");
+
+    remove_tree(source);
+    remove_tree(home);
+}
+
 static void test_dispatch_refuses_portable_v1(void)
 {
     printf(BLUE "::" NC " restore dispatch: portable v1 payload is never interpreted as a native tree\n");
@@ -2873,6 +3097,7 @@ static void test_network_config_restore_empty(void)
     printf(BLUE "::" NC " network config: an empty saved directory is a no-op\n");
 
     char source[PATH_MAX], home[PATH_MAX], dest_parent[PATH_MAX];
+    char network_root[PATH_MAX], manifest_path[PATH_MAX], sentinel[PATH_MAX];
     fresh_mkdtemp(source, sizeof(source), "network_empty_src");
     fresh_mkdtemp(home, sizeof(home), "network_empty_home");
     fresh_mkdtemp(dest_parent, sizeof(dest_parent), "network_empty_dest");
@@ -2880,8 +3105,12 @@ static void test_network_config_restore_empty(void)
     write_network_manifest(source);
 
     char network_dir[PATH_MAX];
+    join_path(network_root, sizeof(network_root), source, "network");
     join_path(network_dir, sizeof(network_dir), source, "network/networkmanager");
     mkdir_p(network_dir);
+    join_path(manifest_path, sizeof(manifest_path), source, "manifest.txt");
+    join_path(sentinel, sizeof(sentinel), home, "sentinel");
+    write_file_mode(sentinel, "untouched", 0600);
     char dest_dir[PATH_MAX], reload_marker[PATH_MAX];
     join_path(dest_dir, sizeof(dest_dir), dest_parent, "system-connections");
     join_path(reload_marker, sizeof(reload_marker), dest_parent,
@@ -2889,22 +3118,49 @@ static void test_network_config_restore_empty(void)
     restore_test_set_network_config_dest_dir("NetworkManager", dest_dir);
     restore_test_set_network_reload_hook(record_network_reload, reload_marker);
 
-    int previous_dry_run = dry_run;
-    dry_run = 0;
     char output[8192];
-    int rc = run_restore_capturing_with_input(source, "y\n", output,
-                                              sizeof(output));
+    const char *owned_paths[] = {
+        source, manifest_path, network_root, network_dir, home, sentinel
+    };
+    int drop_privileges;
+    uid_t uid;
+    gid_t gid;
+    int preparation = prepare_unprivileged_restore_fixture(
+        source, home, owned_paths,
+        sizeof(owned_paths) / sizeof(owned_paths[0]),
+        &drop_privileges, &uid, &gid);
+    int previous_dry_run = dry_run;
+    int rc = CHILD_SKIP;
+    if (preparation == 0)
+    {
+        dry_run = 0;
+        rc = run_restore_capturing_with_identity(
+            source, "y\n", output, sizeof(output), drop_privileges,
+            uid, gid);
+    }
     dry_run = previous_dry_run;
     restore_test_set_network_reload_hook(NULL, NULL);
     restore_test_set_network_config_dest_dir("NetworkManager", NULL);
 
-    check(rc == 0, "an empty saved network directory does not fail restore");
-    check(strstr(output, "Network configuration") == NULL,
-          "an empty saved network directory produces no network section");
-    check(access(dest_dir, F_OK) != 0,
-          "an empty saved network directory does not create the destination");
-    check(access(reload_marker, F_OK) != 0,
-          "an empty saved network directory does not reload NetworkManager");
+    if (preparation == CHILD_SKIP)
+        skip_case("empty network-config unprivileged restore",
+                  "root test requires an unprivileged nobody identity");
+    else if (preparation != 0)
+        skip_case("empty network-config unprivileged restore",
+                  "fixture permissions or ownership could not be prepared");
+    else
+    {
+        check(rc == 0 &&
+                  strstr(output, "This restore needs root") == NULL,
+              "an empty saved network directory does not require root");
+        check(strstr(output, "Network configuration") == NULL &&
+                  file_content_is(sentinel, "untouched"),
+              "an empty saved network directory remains a no-op");
+        check(access(dest_dir, F_OK) != 0,
+              "an empty saved network directory does not create the destination");
+        check(access(reload_marker, F_OK) != 0,
+              "an empty saved network directory does not reload NetworkManager");
+    }
 
     remove_tree(source);
     remove_tree(home);
@@ -3222,6 +3478,9 @@ int main(void)
     test_versioned_restore_identity_order_and_cross_root_hardlinks();
     test_v2_selection_restore_nested_metadata_order();
     test_v1_restore_space_preflight();
+    test_network_config_privilege_refusal();
+    test_network_config_and_foreign_owner_refusal();
+    backup_test_set_restore_privilege_bypass(1);
     test_network_config_backends(2, -1, -1, 0);
     test_network_config_backends(4, -1, -1, 0);
     test_network_config_backends(7, -1, -1, 0);
@@ -3245,8 +3504,11 @@ int main(void)
     test_network_config_restore_dry_run();
     test_network_config_reload_failure_is_best_effort();
     test_network_config_restore_continues_after_file_error();
+    backup_test_set_restore_privilege_bypass(0);
     test_network_config_restore_empty();
+    backup_test_set_restore_privilege_bypass(1);
     test_network_config_restore_unapplied_note();
+    backup_test_set_restore_privilege_bypass(0);
     test_network_config_restore_requires_declared_directory();
 
     if (failures > 0)

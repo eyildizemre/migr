@@ -70,12 +70,15 @@ int restore_space_preflight(int destination_fd, const char *home,
  * the user to rerun through sudo") -- shared by native and portable restore,
  * called once their metadata preflight has already computed
  * foreign_owner_count (docs/DECISIONS.md D38: an ordinary, same-owner
- * restore must keep working without root).
+ * restore must keep working without root). The network_config_needs_privilege
+ * parameter is non-zero when the saved network configuration contains a
+ * regular file that the restore would attempt to apply directly.
  * Returns 0 to proceed (either privileged, or nothing found that needs it),
  * or -1 to refuse (message already printed) -- always before any
  * destination mutation or consent prompt.
  */
-int restore_privilege_preflight(size_t foreign_owner_count);
+int restore_privilege_preflight(size_t foreign_owner_count,
+                                int network_config_needs_privilege);
 
 #ifdef BACKUP_TEST_HOOKS
 typedef void (*BackupTestInventoryHook)(const char *source_path,
@@ -108,6 +111,7 @@ void backup_test_set_network_config_source_dir(const char *backend_name,
 
 void backup_test_force_portable_representation(int enabled);
 void backup_test_force_case_insensitive_destination(int enabled);
+void backup_test_set_restore_privilege_bypass(int enabled);
 
 /* Exposes the progress display's cumulative-average speed formula
  * (total_bytes / elapsed since started_at) for direct unit testing with

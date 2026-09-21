@@ -11,11 +11,14 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <ftw.h>
+#include <grp.h>
 #include <limits.h>
+#include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "backup.h"
@@ -23,6 +26,7 @@
 #include "metadata.h"
 #include "fsprobe.h"
 #include "portable_restore.h"
+#include "restore.h"
 #include "sidecar.h"
 #include "utils.h"
 
@@ -33,6 +37,8 @@
 #define NC    "\033[0m"
 
 static int failures;
+
+enum { CHILD_SKIP = 77 };
 
 static void check(int condition, const char *label)
 {
@@ -98,6 +104,25 @@ static void remove_tree(const char *path)
     if (nftw(path, chmod_directory_callback, 16, FTW_PHYS) != 0 ||
         nftw(path, remove_callback, 16, FTW_DEPTH | FTW_PHYS) != 0)
         fatal("could not remove fixture tree");
+}
+
+static uid_t chown_tree_uid;
+static gid_t chown_tree_gid;
+
+static int chown_tree_callback(const char *path, const struct stat *st,
+                               int type, struct FTW *state)
+{
+    (void)st;
+    (void)type;
+    (void)state;
+    return lchown(path, chown_tree_uid, chown_tree_gid);
+}
+
+static int chown_tree(const char *path, uid_t uid, gid_t gid)
+{
+    chown_tree_uid = uid;
+    chown_tree_gid = gid;
+    return nftw(path, chown_tree_callback, 16, FTW_PHYS);
 }
 
 static void path_join_fixture(char *out, size_t out_size, const char *base,
@@ -2069,6 +2094,171 @@ static PortableRestoreOutcome run_direct_orchestration(
     return outcome;
 }
 
+static int run_direct_orchestration_with_identity(
+    Fixture *fixture, int nsec_exact, const char *answer, char *output,
+    size_t output_size, int drop_privileges, uid_t uid, gid_t gid)
+{
+    int output_pipe[2];
+    if (pipe(output_pipe) != 0)
+        fatal("could not create orchestration output pipe");
+    fflush(stdout);
+    fflush(stderr);
+    pid_t pid = fork();
+    if (pid < 0)
+        fatal("could not fork orchestration child");
+    if (pid == 0)
+    {
+        close(output_pipe[0]);
+        if (dup2(output_pipe[1], STDOUT_FILENO) < 0 ||
+            dup2(output_pipe[1], STDERR_FILENO) < 0)
+            _exit(2);
+        close(output_pipe[1]);
+        if (drop_privileges &&
+            (setgroups(0, NULL) != 0 || setgid(gid) != 0 || setuid(uid) != 0))
+            _exit(CHILD_SKIP);
+
+        PortableRestoreReplayReport report;
+        PortableRestoreOutcome outcome = run_direct_orchestration(
+            fixture, &report, nsec_exact, answer);
+        fflush(stdout);
+        fflush(stderr);
+        _exit(outcome == PORTABLE_RESTORE_ERROR ? 1 : 0);
+    }
+
+    close(output_pipe[1]);
+    size_t total = 0;
+    ssize_t received;
+    while (total < output_size - 1U &&
+           (received = read(output_pipe[0], output + total,
+                            output_size - 1U - total)) > 0)
+        total += (size_t)received;
+    output[total] = '\0';
+    close(output_pipe[0]);
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0)
+        fatal("could not wait for orchestration child");
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+static int prepare_network_privilege_fixture(
+    Fixture *fixture, uid_t owner_uid, gid_t owner_gid)
+{
+    build_payload(fixture, 0);
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  (uint32_t)owner_uid, (uint32_t)owner_gid,
+                  1700001100, 123456789, 1700001101, 987654321),
+        entry_for("ROOT", "file", "file", SIDECAR_KIND_REGULAR,
+                  strlen("portable payload"), 0600,
+                  (uint32_t)owner_uid, (uint32_t)owner_gid,
+                  1700001102, 333333333, 1700001103, 444444444)
+    };
+    if (write_sidecar(fixture, entries, 2) != 0)
+        return -1;
+    write_file_at(fixture->home_fd, "sentinel", "untouched");
+
+    Manifest manifest;
+    if (manifest_read_v1_at(fixture->container_fd, &manifest) !=
+            MANIFEST_STATUS_VALID)
+        return -1;
+    manifest.has_network_config = 1;
+    int manifest_result = manifest_write_v1_at(fixture->container_fd,
+                                               &manifest);
+    manifest_free(&manifest);
+    if (manifest_result != 0)
+        return -1;
+
+    make_dir_at(fixture->container_fd, "network", 0700);
+    int network_fd = openat(fixture->container_fd, "network",
+                            O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (network_fd < 0)
+        return -1;
+    make_dir_at(network_fd, "networkmanager", 0700);
+    int backend_fd = openat(network_fd, "networkmanager",
+                            O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (backend_fd < 0)
+    {
+        close(network_fd);
+        return -1;
+    }
+    write_file_at(backend_fd, "wifi.nmconnection", "wifi");
+    int result = close(backend_fd);
+    if (close(network_fd) != 0)
+        result = -1;
+    return result == 0 ? 0 : -1;
+}
+
+static void test_direct_network_config_privilege_preflight(void)
+{
+    printf(BLUE "::" NC " direct portable restore network-config privilege preflight\n");
+
+    uid_t owner_uid = (uid_t)geteuid();
+    gid_t owner_gid = (gid_t)getegid();
+    int drop_privileges = 0;
+    if (geteuid() == 0)
+    {
+        struct passwd *nobody = getpwnam("nobody");
+        if (nobody == NULL || nobody->pw_uid == 0)
+        {
+            printf("  " YELLOW "-" NC
+                   " direct network privilege preflight skipped: root test "
+                   "requires an unprivileged nobody identity\n");
+            return;
+        }
+        owner_uid = nobody->pw_uid;
+        owner_gid = nobody->pw_gid;
+        drop_privileges = 1;
+    }
+
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "direct-network-privilege fixture is created");
+    if (opened != 0)
+        return;
+    int failures_before_fixture = failures;
+    check(prepare_network_privilege_fixture(&fixture, owner_uid, owner_gid) == 0,
+          "direct-network-privilege fixture is populated");
+    if (failures != failures_before_fixture)
+    {
+        fixture_close(&fixture);
+        return;
+    }
+    if (drop_privileges &&
+        chown_tree(fixture.base, owner_uid, owner_gid) != 0)
+    {
+        printf("  " YELLOW "-" NC
+               " direct network privilege preflight skipped: fixture "
+               "ownership could not be assigned to nobody\n");
+        fixture_close(&fixture);
+        return;
+    }
+
+    char output[8192];
+    int result = run_direct_orchestration_with_identity(
+        &fixture, 1, "y\n", output, sizeof(output), drop_privileges,
+        owner_uid, owner_gid);
+    char restored[PATH_MAX], sentinel[PATH_MAX];
+    path_join_fixture(restored, sizeof(restored), fixture.home,
+                      "/restored/file");
+    path_join_fixture(sentinel, sizeof(sentinel), fixture.home, "/sentinel");
+    if (result == CHILD_SKIP)
+        printf("  " YELLOW "-" NC
+               " direct network privilege preflight skipped: child could "
+               "not drop to nobody\n");
+    else
+    {
+        check(result != 0 &&
+                  strstr(output,
+                         "This restore needs root: it would apply saved network configuration") != NULL,
+              "portable orchestration refuses nonempty network config before consent");
+        check(access(restored, F_OK) != 0 && file_equals(sentinel, "untouched"),
+              "portable network privilege refusal leaves the destination untouched");
+    }
+    fixture_close(&fixture);
+}
+
 static void test_direct_complete_outcome(void)
 {
     printf(BLUE "::" NC " direct portable restore complete outcome\n");
@@ -2272,6 +2462,7 @@ int main(void)
     test_dry_run();
     test_destination_space_preflight();
     test_coarse_timestamp_policy();
+    test_direct_network_config_privilege_preflight();
     test_direct_complete_outcome();
     test_direct_dry_run_outcome();
     test_direct_cancelled_outcome();

@@ -51,4 +51,9 @@ typedef struct {
 int restore_with_options(const char *source, const RestoreOptions *options);
 int restore(const char *source);
 
+/* Returns 1 when restoring the manifest's saved network configuration would
+ * encounter at least one regular file in a known backend directory, or when
+ * the read-only inspection cannot establish that safely. */
+int restore_network_config_would_write(int source_root_fd);
+
 #endif

@@ -63,6 +63,7 @@ static const char *backup_test_network_config_source_dirs[
     NETWORK_CONFIG_BACKEND_COUNT];
 static int backup_test_portable_representation_forced;
 static int backup_test_case_insensitive_destination_forced;
+static int backup_test_restore_privilege_bypass;
 
 void backup_test_set_inventory_hook(BackupTestInventoryHook hook,
                                     void *context)
@@ -113,6 +114,11 @@ void backup_test_force_portable_representation(int enabled)
 void backup_test_force_case_insensitive_destination(int enabled)
 {
     backup_test_case_insensitive_destination_forced = enabled != 0;
+}
+
+void backup_test_set_restore_privilege_bypass(int enabled)
+{
+    backup_test_restore_privilege_bypass = enabled != 0;
 }
 
 static void backup_test_before_source_open(const char *source_path)
@@ -246,21 +252,38 @@ int restore_space_preflight(int destination_fd, const char *home,
     return 0;
 }
 
-int restore_privilege_preflight(size_t foreign_owner_count)
+int restore_privilege_preflight(size_t foreign_owner_count,
+                                int network_config_needs_privilege)
 {
+#ifdef BACKUP_TEST_HOOKS
+    if (backup_test_restore_privilege_bypass)
+        return 0;
+#endif
+
     // Root can chown to any recorded owner, so a root-invoked restore never
     // needs this refusal regardless of what the manifest/sidecar records
     // (docs/DECISIONS.md D38).
     if (geteuid() == 0)
         return 0;
 
-    if (foreign_owner_count == 0)
+    if (foreign_owner_count == 0 && !network_config_needs_privilege)
         return 0;
 
-    print_error("Error: This restore needs root: it would restore %zu "
-                "item(s) owned by a different user. Rerun the same migr "
-                "command with sudo.\n",
-                foreign_owner_count);
+    if (foreign_owner_count != 0 && network_config_needs_privilege)
+        print_error("Error: This restore needs root: it would restore %zu "
+                    "item(s) owned by a different user and apply saved "
+                    "network configuration. Rerun the same migr command "
+                    "with sudo.\n",
+                    foreign_owner_count);
+    else if (foreign_owner_count != 0)
+        print_error("Error: This restore needs root: it would restore %zu "
+                    "item(s) owned by a different user. Rerun the same migr "
+                    "command with sudo.\n",
+                    foreign_owner_count);
+    else
+        print_error("Error: This restore needs root: it would apply saved "
+                    "network configuration. Rerun the same migr command "
+                    "with sudo.\n");
     return -1;
 }
 
