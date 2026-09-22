@@ -426,4 +426,14 @@ int run_command(char *const argv[]);
  */
 int run_command_capture(char *const argv[], char *output, size_t output_size);
 
+/**
+ * @brief Captures a command after dropping the child to the supplied identity.
+ *
+ * The child clears supplementary groups, sets its primary gid, then sets its
+ * uid before exec. Any failed drop step exits without executing argv[0]. This
+ * variant is used for the best-effort VS Code extension snapshot.
+ */
+int run_command_capture_as_identity(char *const argv[], char *output,
+                                     size_t output_size, uid_t uid, gid_t gid);
+
 #endif

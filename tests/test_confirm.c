@@ -161,6 +161,49 @@ static int run_target_home(const char *home_env, const char *sudo_uid_env,
     return result;
 }
 
+static void test_sudo_identity_resolution(const char *passwd_path)
+{
+    uid_t uid = (uid_t)-1;
+    gid_t gid = (gid_t)-1;
+
+    write_fixture(passwd_path,
+                  "user:x:001000:02000::/home/invoker:/bin/sh\n");
+    check(resolve_sudo_identity_for_test("01000", passwd_path,
+                                         &uid, &gid) == 0 &&
+              uid == (uid_t)1000 && gid == (gid_t)2000,
+          "SUDO_UID resolves the matching local uid and primary gid");
+
+    write_fixture(passwd_path,
+                  "user:x:1000:not-a-gid::/home/invoker:/bin/sh\n");
+    check(resolve_sudo_identity_for_test("1000", passwd_path,
+                                         &uid, &gid) != 0,
+          "matching passwd record with malformed gid is rejected");
+
+    write_fixture(passwd_path,
+                  "first:x:1000:1000::/home/first:/bin/sh\n"
+                  "second:x:1000:1000::/home/second:/bin/sh\n");
+    check(resolve_sudo_identity_for_test("1000", passwd_path,
+                                         &uid, &gid) != 0,
+          "duplicate local passwd uid is rejected for identity resolution");
+
+    write_fixture(passwd_path, "user:x:1000\n");
+    check(resolve_sudo_identity_for_test("1000", passwd_path,
+                                         &uid, &gid) != 0,
+          "matching malformed passwd record is rejected for identity resolution");
+
+    write_fixture(passwd_path,
+                  "user:x:1000:1000::relative/home:/bin/sh\n");
+    check(resolve_sudo_identity_for_test("1000", passwd_path,
+                                         &uid, &gid) != 0,
+          "invalid local home rejects sudo identity resolution");
+
+    write_fixture(passwd_path,
+                  "other:x:2000:2000::/home/other:/bin/sh\n");
+    check(resolve_sudo_identity_for_test("1000", passwd_path,
+                                         &uid, &gid) != 0,
+          "missing local passwd uid is rejected for identity resolution");
+}
+
 static void test_target_home_resolution(void)
 {
     char passwd_path[] = "/tmp/migr-passwd-XXXXXX";
@@ -171,6 +214,8 @@ static void test_target_home_resolution(void)
         exit(1);
     }
     close(passwd_fd);
+
+    test_sudo_identity_resolution(passwd_path);
 
     char home[PATH_MAX];
     char diagnostic[512];

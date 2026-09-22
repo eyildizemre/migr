@@ -2524,7 +2524,21 @@ static char *collect_vscode_extensions(void)
         return NULL;
 
     buffer[0] = '\0';
-    if (run_command_capture(vscode_extensions_cmd, buffer, buf_size) != 0)
+    int capture_status;
+    uid_t uid;
+    gid_t gid;
+    if (geteuid() == 0 && getenv("SUDO_UID") != NULL &&
+        resolve_sudo_identity(&uid, &gid) == 0)
+    {
+        capture_status = run_command_capture_as_identity(
+            vscode_extensions_cmd, buffer, buf_size, uid, gid);
+    }
+    else
+    {
+        capture_status = run_command_capture(vscode_extensions_cmd,
+                                             buffer, buf_size);
+    }
+    if (capture_status != 0)
     {
         free(buffer);
         return NULL;
@@ -2539,6 +2553,13 @@ static char *collect_vscode_extensions(void)
     free(buffer);
     return NULL;
 }
+
+#ifdef BACKUP_TEST_HOOKS
+char *backup_test_collect_vscode_extensions(void)
+{
+    return collect_vscode_extensions();
+}
+#endif
 
 static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
                       const SelectionPlan *selection, int include_self,

@@ -18,7 +18,7 @@ int verbose = 0;
 int dry_run = 0;
 int color_enabled = 0;
 
-static int parse_uid_decimal(const char *text, uid_t *out)
+static int parse_decimal_value(const char *text, uintmax_t *out)
 {
     if (text == NULL || text[0] == '\0')
         return -1;
@@ -35,6 +35,16 @@ static int parse_uid_decimal(const char *text, uid_t *out)
         value = value * 10U + digit;
     }
 
+    *out = value;
+    return 0;
+}
+
+static int parse_uid_decimal(const char *text, uid_t *out)
+{
+    uintmax_t value;
+    if (out == NULL || parse_decimal_value(text, &value) != 0)
+        return -1;
+
     uid_t uid = (uid_t)value;
     if ((uintmax_t)uid != value || uid == (uid_t)-1)
         return -1;
@@ -42,22 +52,43 @@ static int parse_uid_decimal(const char *text, uid_t *out)
     return 0;
 }
 
-static int resolve_sudo_home(uid_t target_uid, const char *passwd_path,
-                             char out[PATH_MAX])
+static int parse_gid_decimal(const char *text, gid_t *out)
+{
+    uintmax_t value;
+    if (out == NULL || parse_decimal_value(text, &value) != 0)
+        return -1;
+
+    gid_t gid = (gid_t)value;
+    if ((uintmax_t)gid != value || gid == (gid_t)-1)
+        return -1;
+    *out = gid;
+    return 0;
+}
+
+typedef enum {
+    SUDO_ACCOUNT_OK = 0,
+    SUDO_ACCOUNT_READ_ERROR,
+    SUDO_ACCOUNT_NOT_FOUND,
+    SUDO_ACCOUNT_AMBIGUOUS,
+    SUDO_ACCOUNT_MALFORMED,
+    SUDO_ACCOUNT_INVALID_HOME
+} SudoAccountResult;
+
+static SudoAccountResult resolve_sudo_account(uid_t target_uid,
+                                               const char *passwd_path,
+                                               char home_out[PATH_MAX],
+                                               gid_t *gid_out)
 {
     FILE *passwd = fopen(passwd_path, "r");
     if (passwd == NULL)
-    {
-        print_error("Error: Could not read local passwd database: %s\n",
-                    strerror(errno));
-        return -1;
-    }
+        return SUDO_ACCOUNT_READ_ERROR;
 
     char *line = NULL;
     size_t capacity = 0;
     size_t matches = 0;
     int matching_record_malformed = 0;
     int matching_home_invalid = 0;
+    gid_t resolved_gid = 0;
     char resolved[PATH_MAX] = {0};
     int read_error = 0;
     int read_errno = 0;
@@ -105,6 +136,13 @@ static int resolve_sudo_home(uid_t target_uid, const char *passwd_path,
             continue;
         }
 
+        gid_t record_gid = 0;
+        if (gid_out != NULL && parse_gid_decimal(fields[3], &record_gid) != 0)
+        {
+            matching_record_malformed = 1;
+            continue;
+        }
+
         const char *home = fields[5];
         if (home == NULL || home[0] != '/' ||
             strnlen(home, PATH_MAX) >= PATH_MAX)
@@ -113,6 +151,7 @@ static int resolve_sudo_home(uid_t target_uid, const char *passwd_path,
             continue;
         }
         memcpy(resolved, home, strlen(home) + 1U);
+        resolved_gid = record_gid;
     }
 
     free(line);
@@ -124,33 +163,87 @@ static int resolve_sudo_home(uid_t target_uid, const char *passwd_path,
 
     if (read_error)
     {
-        print_error("Error: Could not read local passwd database: %s\n",
-                    strerror(read_errno));
-        return -1;
+        errno = read_errno;
+        return SUDO_ACCOUNT_READ_ERROR;
     }
     if (matches == 0U)
-    {
-        print_error("Error: SUDO_UID does not match a local /etc/passwd entry.\n");
-        return -1;
-    }
+        return SUDO_ACCOUNT_NOT_FOUND;
     if (matches > 1U)
-    {
-        print_error("Error: SUDO_UID matches multiple local /etc/passwd entries.\n");
-        return -1;
-    }
+        return SUDO_ACCOUNT_AMBIGUOUS;
     if (matching_record_malformed)
-    {
-        print_error("Error: Local passwd entry for SUDO_UID is malformed.\n");
-        return -1;
-    }
+        return SUDO_ACCOUNT_MALFORMED;
     if (matching_home_invalid)
-    {
-        print_error("Error: Local passwd entry for SUDO_UID has an invalid home directory.\n");
-        return -1;
-    }
+        return SUDO_ACCOUNT_INVALID_HOME;
 
-    memcpy(out, resolved, strlen(resolved) + 1U);
+    if (home_out != NULL)
+        memcpy(home_out, resolved, strlen(resolved) + 1U);
+    if (gid_out != NULL)
+        *gid_out = resolved_gid;
+    return SUDO_ACCOUNT_OK;
+}
+
+static void report_sudo_account_error(SudoAccountResult result)
+{
+    switch (result)
+    {
+    case SUDO_ACCOUNT_READ_ERROR:
+        print_error("Error: Could not read local passwd database: %s\n",
+                    strerror(errno != 0 ? errno : EIO));
+        break;
+    case SUDO_ACCOUNT_NOT_FOUND:
+        print_error("Error: SUDO_UID does not match a local /etc/passwd entry.\n");
+        break;
+    case SUDO_ACCOUNT_AMBIGUOUS:
+        print_error("Error: SUDO_UID matches multiple local /etc/passwd entries.\n");
+        break;
+    case SUDO_ACCOUNT_MALFORMED:
+        print_error("Error: Local passwd entry for SUDO_UID is malformed.\n");
+        break;
+    case SUDO_ACCOUNT_INVALID_HOME:
+        print_error("Error: Local passwd entry for SUDO_UID has an invalid home directory.\n");
+        break;
+    case SUDO_ACCOUNT_OK:
+        break;
+    }
+}
+
+static int resolve_sudo_home(uid_t target_uid, const char *passwd_path,
+                             char out[PATH_MAX])
+{
+    SudoAccountResult result = resolve_sudo_account(target_uid, passwd_path,
+                                                    out, NULL);
+    if (result == SUDO_ACCOUNT_OK)
+        return 0;
+    report_sudo_account_error(result);
+    return -1;
+}
+
+static int resolve_sudo_identity_impl(const char *sudo_uid_env,
+                                      const char *passwd_path,
+                                      uid_t *uid_out, gid_t *gid_out)
+{
+    if (sudo_uid_env == NULL || passwd_path == NULL || passwd_path[0] == '\0' ||
+        uid_out == NULL || gid_out == NULL)
+        return -1;
+
+    uid_t uid;
+    if (parse_uid_decimal(sudo_uid_env, &uid) != 0)
+        return -1;
+
+    char home[PATH_MAX];
+    gid_t gid;
+    if (resolve_sudo_account(uid, passwd_path, home, &gid) != SUDO_ACCOUNT_OK)
+        return -1;
+
+    *uid_out = uid;
+    *gid_out = gid;
     return 0;
+}
+
+int resolve_sudo_identity(uid_t *uid_out, gid_t *gid_out)
+{
+    return resolve_sudo_identity_impl(getenv("SUDO_UID"), "/etc/passwd",
+                                      uid_out, gid_out);
 }
 
 static int resolve_target_home_impl(const char *home_env,
@@ -212,6 +305,14 @@ int resolve_target_home_for_test(const char *home_env,
 {
     return resolve_target_home_impl(home_env, sudo_uid_env, passwd_path,
                                     running_as_root, out);
+}
+
+int resolve_sudo_identity_for_test(const char *sudo_uid_env,
+                                   const char *passwd_path,
+                                   uid_t *uid_out, gid_t *gid_out)
+{
+    return resolve_sudo_identity_impl(sudo_uid_env, passwd_path,
+                                      uid_out, gid_out);
 }
 #endif
 

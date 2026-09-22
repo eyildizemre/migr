@@ -6,6 +6,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <grp.h>
 #include <dirent.h>
 #include <string.h>
 #include <time.h>
@@ -3754,7 +3755,9 @@ int run_command(char *const argv[])
     return -1; // should not reach here
 }
 
-int run_command_capture(char *const argv[], char *output, size_t output_size)
+static int run_command_capture_internal(char *const argv[], char *output,
+                                        size_t output_size, int drop_identity,
+                                        uid_t uid, gid_t gid)
 {
     if (output == NULL || output_size == 0)
     {
@@ -3785,6 +3788,16 @@ int run_command_capture(char *const argv[], char *output, size_t output_size)
             _exit(1); // Redirect failed; do not exec with the wrong stdout
         }
         close(pipefd[1]); // Close the original write end of the pipe
+
+        if (drop_identity)
+        {
+            if (setgroups(0, NULL) != 0)
+                _exit(125);
+            if (setgid(gid) != 0)
+                _exit(126);
+            if (setuid(uid) != 0)
+                _exit(127);
+        }
 
         execvp(argv[0], argv); // Execute the command
 
@@ -3832,4 +3845,15 @@ int run_command_capture(char *const argv[], char *output, size_t output_size)
         }
     }
     return -1; // should not reach here
+}
+
+int run_command_capture(char *const argv[], char *output, size_t output_size)
+{
+    return run_command_capture_internal(argv, output, output_size, 0, 0, 0);
+}
+
+int run_command_capture_as_identity(char *const argv[], char *output,
+                                    size_t output_size, uid_t uid, gid_t gid)
+{
+    return run_command_capture_internal(argv, output, output_size, 1, uid, gid);
 }
