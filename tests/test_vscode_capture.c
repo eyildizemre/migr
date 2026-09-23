@@ -50,7 +50,8 @@ static int parse_passwd_id(const char *text, uintmax_t *value)
     return 0;
 }
 
-static int find_local_unprivileged_identity(uid_t *uid_out, gid_t *gid_out)
+static int find_local_unprivileged_identity(uid_t *uid_out, gid_t *gid_out,
+                                            char home_out[PATH_MAX])
 {
     FILE *passwd = fopen("/etc/passwd", "r");
     if (passwd == NULL)
@@ -72,7 +73,8 @@ static int find_local_unprivileged_identity(uid_t *uid_out, gid_t *gid_out)
                 fields[colons + 1U] = p + 1;
             colons++;
         }
-        if (colons != 6U || fields[5] == NULL || fields[5][0] != '/')
+        if (colons != 6U || fields[5] == NULL || fields[5][0] != '/' ||
+            strlen(fields[5]) >= PATH_MAX)
             continue;
 
         uintmax_t uid_value;
@@ -89,6 +91,7 @@ static int find_local_unprivileged_identity(uid_t *uid_out, gid_t *gid_out)
 
         *uid_out = uid;
         *gid_out = gid;
+        memcpy(home_out, fields[5], strlen(fields[5]) + 1U);
         found = 1;
         break;
     }
@@ -98,11 +101,23 @@ static int find_local_unprivileged_identity(uid_t *uid_out, gid_t *gid_out)
     return found;
 }
 
-static int matches_identity(const char *output, uid_t uid, gid_t gid)
+#define UNSET_SENTINEL "<unset>"
+#define CALLER_HOME "/migr-test-caller-home"
+#define CALLER_XDG_CONFIG "/migr-test-caller-home/.config-override"
+
+static const char *env_or_unset(const char *name)
 {
-    char expected[128];
-    int length = snprintf(expected, sizeof(expected), "%ju %ju\n",
-                          (uintmax_t)uid, (uintmax_t)gid);
+    const char *value = getenv(name);
+    return value != NULL ? value : UNSET_SENTINEL;
+}
+
+static int matches_child(const char *output, uid_t uid, gid_t gid,
+                         const char *home, const char *xdg_config_home)
+{
+    char expected[PATH_MAX * 2 + 64];
+    int length = snprintf(expected, sizeof(expected), "%ju %ju %s %s\n",
+                          (uintmax_t)uid, (uintmax_t)gid, home,
+                          xdg_config_home);
     return length > 0 && (size_t)length < sizeof(expected) &&
            strcmp(output, expected) == 0;
 }
@@ -111,8 +126,66 @@ static char *collect_and_check_plain_identity(const char *label,
                                              uid_t uid, gid_t gid)
 {
     char *output = backup_test_collect_vscode_extensions();
-    check(output != NULL && matches_identity(output, uid, gid), label);
+    check(output != NULL &&
+              matches_child(output, uid, gid, CALLER_HOME, CALLER_XDG_CONFIG),
+          label);
     return output;
+}
+
+static int env_equals(char **env, const char *const *expected)
+{
+    size_t i = 0;
+    for (; expected[i] != NULL; i++)
+    {
+        if (env[i] == NULL || strcmp(env[i], expected[i]) != 0)
+            return 0;
+    }
+    return env[i] == NULL;
+}
+
+static void test_identity_environment(void)
+{
+    char *const base[] = {
+        "PATH=/usr/bin", "HOME=/root", "HOMEDIR=/keep",
+        "XDG_CONFIG_HOME=/root/.config", "XDG_CONFIG_HOME_X=/keep",
+        "XDG_DATA_HOME=/root/.local/share", "XDG_CACHE_HOME=/root/.cache",
+        "XDG_STATE_HOME=/root/.local/state", "XDG_RUNTIME_DIR=/run/user/1000",
+        "LANG=C.UTF-8", NULL
+    };
+    const char *const expected[] = {
+        "PATH=/usr/bin", "HOMEDIR=/keep", "XDG_CONFIG_HOME_X=/keep",
+        "XDG_RUNTIME_DIR=/run/user/1000", "LANG=C.UTF-8",
+        "HOME=/home/target", NULL
+    };
+    char *home_entry = NULL;
+    char **env = fileops_test_build_identity_environment(
+        base, "/home/target", &home_entry);
+    check(env != NULL && env_equals(env, expected),
+          "identity environment replaces HOME, drops XDG base-dir overrides, "
+          "and keeps other entries in order");
+    free(home_entry);
+    free(env);
+
+    char *const base_without_home[] = { "PATH=/usr/bin", NULL };
+    const char *const expected_added[] = {
+        "PATH=/usr/bin", "HOME=/home/target", NULL
+    };
+    home_entry = NULL;
+    env = fileops_test_build_identity_environment(
+        base_without_home, "/home/target", &home_entry);
+    check(env != NULL && env_equals(env, expected_added),
+          "identity environment adds HOME when the caller has none");
+    free(home_entry);
+    free(env);
+
+    home_entry = NULL;
+    check(fileops_test_build_identity_environment(
+              base, "relative/home", &home_entry) == NULL &&
+              home_entry == NULL,
+          "identity environment rejects a non-absolute home");
+    check(fileops_test_build_identity_environment(
+              base, NULL, &home_entry) == NULL && home_entry == NULL,
+          "identity environment rejects a missing home");
 }
 
 int main(int argc, char *argv[])
@@ -121,7 +194,8 @@ int main(int argc, char *argv[])
         strcmp(argv[1], "--list-extensions") == 0 &&
         strcmp(argv[2], "--show-versions") == 0)
     {
-        printf("%ju %ju\n", (uintmax_t)getuid(), (uintmax_t)getgid());
+        printf("%ju %ju %s %s\n", (uintmax_t)getuid(), (uintmax_t)getgid(),
+               env_or_unset("HOME"), env_or_unset("XDG_CONFIG_HOME"));
         return 0;
     }
 
@@ -154,6 +228,18 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    test_identity_environment();
+
+    if (setenv("HOME", CALLER_HOME, 1) != 0 ||
+        setenv("XDG_CONFIG_HOME", CALLER_XDG_CONFIG, 1) != 0)
+    {
+        perror("setenv caller HOME/XDG_CONFIG_HOME");
+        unlink(code_path);
+        rmdir(fixture_dir);
+        free(old_path);
+        return 1;
+    }
+
     uid_t invoking_uid = getuid();
     gid_t invoking_gid = getgid();
     unsetenv("SUDO_UID");
@@ -164,11 +250,23 @@ int main(int argc, char *argv[])
 
     uid_t target_uid = (uid_t)-1;
     gid_t target_gid = (gid_t)-1;
+    char target_home[PATH_MAX] = {0};
     int have_target = find_local_unprivileged_identity(&target_uid,
-                                                        &target_gid);
+                                                        &target_gid,
+                                                        target_home);
     char *const command[] = {
         "code", "--list-extensions", "--show-versions", NULL
     };
+
+    char untouched_output[] = "untouched";
+    check(run_command_capture_as_identity(
+              command, untouched_output, sizeof(untouched_output),
+              invoking_uid, invoking_gid, NULL) == -1 &&
+              run_command_capture_as_identity(
+                  command, untouched_output, sizeof(untouched_output),
+                  invoking_uid, invoking_gid, "relative/home") == -1 &&
+              strcmp(untouched_output, "untouched") == 0,
+          "identity capture without an absolute home fails before forking");
 
     if (geteuid() != 0)
     {
@@ -182,7 +280,7 @@ int main(int argc, char *argv[])
         char failure_output[128] = "must be cleared";
         int failure_status = run_command_capture_as_identity(
             command, failure_output, sizeof(failure_output), (uid_t)-1,
-            (gid_t)-1);
+            (gid_t)-1, "/home/target");
         check(failure_status >= 125 && failure_status <= 127 &&
                   failure_output[0] == '\0',
               "invalid target identity exits before the command can execute");
@@ -208,7 +306,8 @@ int main(int argc, char *argv[])
 
         char probe_output[128] = {0};
         int probe_status = run_command_capture_as_identity(
-            command, probe_output, sizeof(probe_output), target_uid, target_gid);
+            command, probe_output, sizeof(probe_output), target_uid, target_gid,
+            target_home);
         if (probe_status >= 125 && probe_status <= 127)
         {
             skip_case("root child drop to the SUDO_UID account",
@@ -219,19 +318,23 @@ int main(int argc, char *argv[])
         else
         {
             check(probe_status == 0 &&
-                      matches_identity(probe_output, target_uid, target_gid),
-                  "capture child runs with the target uid and primary gid");
+                      matches_child(probe_output, target_uid, target_gid,
+                                    target_home, UNSET_SENTINEL),
+                  "capture child runs with the target uid, primary gid, and "
+                  "home, without the caller's XDG_CONFIG_HOME");
 
             output = backup_test_collect_vscode_extensions();
             check(output != NULL &&
-                      matches_identity(output, target_uid, target_gid),
-                  "sudo VS Code capture resolves and uses the local account identity");
+                      matches_child(output, target_uid, target_gid,
+                                    target_home, UNSET_SENTINEL),
+                  "sudo VS Code capture resolves and uses the local account "
+                  "identity and home");
             free(output);
 
             char failure_output[128] = "must be cleared";
             int failure_status = run_command_capture_as_identity(
                 command, failure_output, sizeof(failure_output), target_uid,
-                (gid_t)-1);
+                (gid_t)-1, target_home);
             check(failure_status == 126 && failure_output[0] == '\0',
                   "failed setgid exits before the command can execute");
         }

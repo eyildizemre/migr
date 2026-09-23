@@ -220,10 +220,11 @@ static int resolve_sudo_home(uid_t target_uid, const char *passwd_path,
 
 static int resolve_sudo_identity_impl(const char *sudo_uid_env,
                                       const char *passwd_path,
-                                      uid_t *uid_out, gid_t *gid_out)
+                                      uid_t *uid_out, gid_t *gid_out,
+                                      char home_out[PATH_MAX])
 {
     if (sudo_uid_env == NULL || passwd_path == NULL || passwd_path[0] == '\0' ||
-        uid_out == NULL || gid_out == NULL)
+        uid_out == NULL || gid_out == NULL || home_out == NULL)
         return -1;
 
     uid_t uid;
@@ -237,13 +238,15 @@ static int resolve_sudo_identity_impl(const char *sudo_uid_env,
 
     *uid_out = uid;
     *gid_out = gid;
+    memcpy(home_out, home, strlen(home) + 1U);
     return 0;
 }
 
-int resolve_sudo_identity(uid_t *uid_out, gid_t *gid_out)
+int resolve_sudo_identity(uid_t *uid_out, gid_t *gid_out,
+                          char home_out[PATH_MAX])
 {
     return resolve_sudo_identity_impl(getenv("SUDO_UID"), "/etc/passwd",
-                                      uid_out, gid_out);
+                                      uid_out, gid_out, home_out);
 }
 
 static int resolve_target_home_impl(const char *home_env,
@@ -309,10 +312,11 @@ int resolve_target_home_for_test(const char *home_env,
 
 int resolve_sudo_identity_for_test(const char *sudo_uid_env,
                                    const char *passwd_path,
-                                   uid_t *uid_out, gid_t *gid_out)
+                                   uid_t *uid_out, gid_t *gid_out,
+                                   char home_out[PATH_MAX])
 {
     return resolve_sudo_identity_impl(sudo_uid_env, passwd_path,
-                                      uid_out, gid_out);
+                                      uid_out, gid_out, home_out);
 }
 #endif
 

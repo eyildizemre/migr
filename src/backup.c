@@ -2527,11 +2527,12 @@ static char *collect_vscode_extensions(void)
     int capture_status;
     uid_t uid;
     gid_t gid;
+    char home[PATH_MAX];
     if (geteuid() == 0 && getenv("SUDO_UID") != NULL &&
-        resolve_sudo_identity(&uid, &gid) == 0)
+        resolve_sudo_identity(&uid, &gid, home) == 0)
     {
         capture_status = run_command_capture_as_identity(
-            vscode_extensions_cmd, buffer, buf_size, uid, gid);
+            vscode_extensions_cmd, buffer, buf_size, uid, gid, home);
     }
     else
     {

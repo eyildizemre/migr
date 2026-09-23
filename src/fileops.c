@@ -3755,18 +3755,101 @@ int run_command(char *const argv[])
     return -1; // should not reach here
 }
 
+// Inherited from the elevated process, these describe root rather than the
+// user a dropped child runs as; without them consumers re-derive from HOME.
+static const char *const identity_env_dropped[] = {
+    "HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME",
+    "XDG_STATE_HOME"
+};
+
+static int env_entry_is_dropped(const char *entry)
+{
+    for (size_t i = 0;
+         i < sizeof(identity_env_dropped) / sizeof(identity_env_dropped[0]);
+         i++)
+    {
+        size_t name_len = strlen(identity_env_dropped[i]);
+        if (strncmp(entry, identity_env_dropped[i], name_len) == 0 &&
+            entry[name_len] == '=')
+            return 1;
+    }
+    return 0;
+}
+
+// Builds the environment for a child dropped to another user: every base
+// entry is kept in order except the dropped names, and HOME=home is appended.
+// Built before fork so the child only execs. The caller frees the array and
+// *home_entry_out (the one allocated entry); the other entries borrow base.
+static char **build_identity_environment(char *const *base, const char *home,
+                                         char **home_entry_out)
+{
+    if (home == NULL || home[0] != '/' || home_entry_out == NULL)
+    {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    size_t base_count = 0;
+    while (base != NULL && base[base_count] != NULL)
+        base_count++;
+
+    size_t home_len = strlen(home);
+    char *home_entry = malloc(sizeof("HOME=") + home_len);
+    char **env = malloc((base_count + 2U) * sizeof(*env));
+    if (home_entry == NULL || env == NULL)
+    {
+        free(home_entry);
+        free(env);
+        return NULL;
+    }
+    memcpy(home_entry, "HOME=", sizeof("HOME=") - 1U);
+    memcpy(home_entry + sizeof("HOME=") - 1U, home, home_len + 1U);
+
+    size_t count = 0;
+    for (size_t i = 0; i < base_count; i++)
+    {
+        if (!env_entry_is_dropped(base[i]))
+            env[count++] = base[i];
+    }
+    env[count++] = home_entry;
+    env[count] = NULL;
+
+    *home_entry_out = home_entry;
+    return env;
+}
+
+#ifdef FILEOPS_TEST_HOOKS
+char **fileops_test_build_identity_environment(char *const *base,
+                                               const char *home,
+                                               char **home_entry_out)
+{
+    return build_identity_environment(base, home, home_entry_out);
+}
+#endif
+
 static int run_command_capture_internal(char *const argv[], char *output,
                                         size_t output_size, int drop_identity,
-                                        uid_t uid, gid_t gid)
+                                        uid_t uid, gid_t gid, const char *home)
 {
     if (output == NULL || output_size == 0)
     {
         return -1; // nothing safe to write into
     }
 
+    char **child_env = NULL;
+    char *home_entry = NULL;
+    if (drop_identity)
+    {
+        child_env = build_identity_environment(environ, home, &home_entry);
+        if (child_env == NULL)
+            return -1;
+    }
+
     int pipefd[2];
     if (pipe(pipefd) == -1)
     {
+        free(home_entry);
+        free(child_env);
         return -1; // pipe creation failed
     }
 
@@ -3775,6 +3858,8 @@ static int run_command_capture_internal(char *const argv[], char *output,
     {
         close(pipefd[0]);
         close(pipefd[1]);
+        free(home_entry);
+        free(child_env);
         return -1; // fork failed
     }
     else if (pid == 0)
@@ -3797,9 +3882,12 @@ static int run_command_capture_internal(char *const argv[], char *output,
                 _exit(126);
             if (setuid(uid) != 0)
                 _exit(127);
+            execvpe(argv[0], argv, child_env);
         }
-
-        execvp(argv[0], argv); // Execute the command
+        else
+        {
+            execvp(argv[0], argv); // Execute the command
+        }
 
         // If execvp returns, it means it failed
         perror("execvp");
@@ -3809,6 +3897,8 @@ static int run_command_capture_internal(char *const argv[], char *output,
     {
         // Parent process
         close(pipefd[1]); // Close the write end of the pipe
+        free(home_entry); // the child execs from its own copy
+        free(child_env);
 
         size_t total = 0;
         for (;;)
@@ -3849,11 +3939,14 @@ static int run_command_capture_internal(char *const argv[], char *output,
 
 int run_command_capture(char *const argv[], char *output, size_t output_size)
 {
-    return run_command_capture_internal(argv, output, output_size, 0, 0, 0);
+    return run_command_capture_internal(argv, output, output_size, 0, 0, 0,
+                                        NULL);
 }
 
 int run_command_capture_as_identity(char *const argv[], char *output,
-                                    size_t output_size, uid_t uid, gid_t gid)
+                                    size_t output_size, uid_t uid, gid_t gid,
+                                    const char *home)
 {
-    return run_command_capture_internal(argv, output, output_size, 1, uid, gid);
+    return run_command_capture_internal(argv, output, output_size, 1, uid, gid,
+                                        home);
 }

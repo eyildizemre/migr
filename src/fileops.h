@@ -379,6 +379,10 @@ void restore_native_test_set_source_read_mode(
     RestoreNativeTestSourceReadMode mode);
 
 void restore_native_test_fail_source_read_after(size_t successful_opens);
+
+char **fileops_test_build_identity_environment(char *const *base,
+                                               const char *home,
+                                               char **home_entry_out);
 #endif
 
 /**
@@ -430,10 +434,15 @@ int run_command_capture(char *const argv[], char *output, size_t output_size);
  * @brief Captures a command after dropping the child to the supplied identity.
  *
  * The child clears supplementary groups, sets its primary gid, then sets its
- * uid before exec. Any failed drop step exits without executing argv[0]. This
- * variant is used for the best-effort VS Code extension snapshot.
+ * uid before exec. Any failed drop step exits without executing argv[0]. The
+ * child's environment carries HOME=home and omits the XDG base-directory
+ * overrides inherited from the elevated caller, so per-user paths resolve
+ * under the target user rather than root. Returns -1 before forking when
+ * home is NULL or not absolute. This variant is used for the best-effort
+ * VS Code extension snapshot.
  */
 int run_command_capture_as_identity(char *const argv[], char *output,
-                                     size_t output_size, uid_t uid, gid_t gid);
+                                    size_t output_size, uid_t uid, gid_t gid,
+                                    const char *home);
 
 #endif

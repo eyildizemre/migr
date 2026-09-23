@@ -22,13 +22,15 @@ extern int color_enabled; /**< Non-zero when status colors are enabled for stder
 int resolve_target_home(char out[PATH_MAX]);
 
 /**
- * @brief Resolves SUDO_UID and its primary gid from the local passwd file.
+ * @brief Resolves SUDO_UID, its primary gid, and its home from the local
+ *        passwd file.
  *
  * Reads /etc/passwd directly so static and dynamic builds use the same
  * NSS-independent account lookup. Returns -1 without diagnostics when the
  * invoking identity cannot be resolved.
  */
-int resolve_sudo_identity(uid_t *uid_out, gid_t *gid_out);
+int resolve_sudo_identity(uid_t *uid_out, gid_t *gid_out,
+                          char home_out[PATH_MAX]);
 
 #ifdef USER_CONTEXT_TEST_HOOKS
 int resolve_target_home_for_test(const char *home_env,
@@ -38,7 +40,8 @@ int resolve_target_home_for_test(const char *home_env,
                                  char out[PATH_MAX]);
 int resolve_sudo_identity_for_test(const char *sudo_uid_env,
                                    const char *passwd_path,
-                                   uid_t *uid_out, gid_t *gid_out);
+                                   uid_t *uid_out, gid_t *gid_out,
+                                   char home_out[PATH_MAX]);
 #endif
 
 /** @brief Prints a complete error message, optionally in bold red. */
