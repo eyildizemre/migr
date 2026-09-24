@@ -41,6 +41,59 @@ void packages_test_clear_restore_hooks(void)
 }
 #endif
 
+static int package_name_is_kernel_pinned(const char *name, size_t length)
+{
+    static const char *const arch_suffixes[] = {
+        ".x86_64", ".aarch64", ".i686", ".ppc64le", ".s390x"
+    };
+    if (length <= strlen("kmod-") || strncmp(name, "kmod-", 5) != 0)
+        return 0;
+    for (size_t index = 0;
+         index < sizeof(arch_suffixes) / sizeof(arch_suffixes[0]); index++)
+    {
+        size_t suffix_length = strlen(arch_suffixes[index]);
+        if (length > suffix_length &&
+            memcmp(name + length - suffix_length, arch_suffixes[index],
+                   suffix_length) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+// akmods names each module package it builds after one kernel release
+// (kmod-nvidia-7.2.5-200.fc44.x86_64). Such a package can only ever install
+// on that kernel, so a list for a new system drops it; the akmod-* package
+// that rebuilds it is listed on its own. Returns the remaining line count.
+static int drop_kernel_pinned_packages(char *buffer)
+{
+    char *read = buffer;
+    char *write = buffer;
+    int count = 0;
+    while (*read != '\0')
+    {
+        char *end = strchr(read, '\n');
+        size_t length = end != NULL ? (size_t)(end - read) : strlen(read);
+        size_t line_length = end != NULL ? length + 1U : length;
+        if (!package_name_is_kernel_pinned(read, length))
+        {
+            memmove(write, read, line_length);
+            write += line_length;
+            if (end != NULL)
+                count++;
+        }
+        read += line_length;
+    }
+    *write = '\0';
+    return count;
+}
+
+#ifdef PACKAGES_TEST_HOOKS
+int packages_test_drop_kernel_pinned(char *buffer)
+{
+    return drop_kernel_pinned_packages(buffer);
+}
+#endif
+
 // Runs the distro's listing command and returns its whole output. Both public
 // entries share this, so the exported format can never differ depending on how
 // the destination was addressed.
@@ -78,14 +131,7 @@ static char *collect_packages(int *count_out)
         return NULL;
     }
 
-    int count = 0;
-    for (char *p = buffer; *p; p++)
-    {
-        if (*p == '\n')
-            count++;
-    }
-
-    *count_out = count;
+    *count_out = drop_kernel_pinned_packages(buffer);
     return buffer;
 }
 

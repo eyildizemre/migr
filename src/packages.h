@@ -15,6 +15,7 @@ void packages_test_set_restore_hooks(distro_t distro,
                                      PackagesTestCaptureHook capture_hook,
                                      void *context);
 void packages_test_clear_restore_hooks(void);
+int packages_test_drop_kernel_pinned(char *buffer);
 #endif
 
 /**

@@ -835,8 +835,31 @@ static void test_restore_packages_batch_alloc_failure_is_reported(void)
     rmdir(dir_path);
 }
 
+static void test_kernel_pinned_packages_are_dropped(void)
+{
+    printf(BLUE "::" NC " kernel-pinned module packages are left out of the list\n");
+    char buffer[] =
+        "akmod-nvidia\n"
+        "kmod-nvidia-7.1.13-200.fc44.x86_64\n"
+        "kmod-nvidia\n"
+        "kernel-core\n"
+        "kmod-v4l2loopback-7.2.5-200.fc44.aarch64\n"
+        "kmodtool\n"
+        "nvidia-kmod-common\n";
+    int count = packages_test_drop_kernel_pinned(buffer);
+    check(count == 5 &&
+              strcmp(buffer, "akmod-nvidia\nkmod-nvidia\nkernel-core\n"
+                             "kmodtool\nnvidia-kmod-common\n") == 0,
+          "per-kernel kmod-* builds are dropped; akmod and meta packages stay");
+    char unterminated[] = "bash\nkmod-zfs-6.1.0-1.el9.x86_64";
+    check(packages_test_drop_kernel_pinned(unterminated) == 1 &&
+              strcmp(unterminated, "bash\n") == 0,
+          "an unterminated final kernel-pinned line is dropped too");
+}
+
 int main(void)
 {
+    test_kernel_pinned_packages_are_dropped();
     test_write_container_text_file_at();
 
     printf(BLUE "::" NC " package_token_is_safe (unit)\n");
