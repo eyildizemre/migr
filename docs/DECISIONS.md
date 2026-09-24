@@ -4182,3 +4182,26 @@ access. That is daemon-owned state changing independently of migr, the evidence
 D44 requires. Application files rewritten because a user left the application
 open (VS Code during the same restore) are not added; they are a warning matter,
 not live daemon state.
+
+---
+
+## D57 — 2026-09-24 — A user Flatpak installation with nothing deployed is left out
+
+**Status:** Implemented
+
+**Decision:** When building a critical or comprehensive plan, if
+`~/.local/share/flatpak` exists and neither its `app/` nor its `runtime/`
+directory has an entry, the directory is added to the plan's exclusions
+automatically, like a conf exclude, and `report` and backup print one note.
+A user installation with any deployed app or runtime is backed up as before.
+Explicit-path backups are unchanged.
+
+**Why:** On real hardware the backup carried a 1.5G OSTree repository from a
+user installation that had no applications (all were system-wide). Restoring it
+recreated a user `flathub` remote, so every later `flatpak install` asked which
+installation to use, and GNOME Software refreshed its catalog into the
+directory while the restore was writing it. With nothing deployed, the
+repository is only a download cache that Flatpak fetches again.
+
+**Relationship:** A narrow first step of backup-scope-overhaul's Flatpak
+adapter; recording and reinstalling deployed refs remains future work.

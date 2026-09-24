@@ -27,11 +27,16 @@ typedef struct SelectionPlan {
     SelectionRoot *roots;
     size_t root_count;
     SelectionPaths excludes; /* Canonical absolute rules, including missing paths. */
+    /* The user Flatpak installation had no deployed apps or runtimes, so its
+     * reconstructible repository was excluded automatically (D57). */
+    int flatpak_repo_excluded;
 } SelectionPlan;
 
 int selection_plan_build(const char *home, BackupMode mode,
                          const Config *config, SelectionPlan *out);
 void selection_plan_free(SelectionPlan *plan);
+/* Prints the plan's scope notes (automatic exclusions) for report/backup. */
+void selection_plan_print_notes(const SelectionPlan *plan);
 /* Owns a copied root/policy table. Uses VERSION=1 for unfiltered disjoint plans.
  * Caller supplies source identity and representation/sidecar/optional flags. */
 int selection_plan_manifest(const SelectionPlan *plan, Manifest *out);

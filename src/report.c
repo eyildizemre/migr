@@ -396,6 +396,11 @@ static int report_plan(const char *home, const BackupPlan *plan,
                                 : "Critical estimate";
         printf("\n");
         print_item(label, total_size);
+        if (selection != NULL && selection->flatpak_repo_excluded)
+        {
+            printf("\n");
+            selection_plan_print_notes(selection);
+        }
         if (had_error)
         {
             printf("\nWarning: some paths could not be measured; "

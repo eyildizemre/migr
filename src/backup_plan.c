@@ -1256,6 +1256,43 @@ static int selection_active(const ConfigRule *rule, BackupMode mode)
     return rule->scope == CONFIG_CRITICAL || mode == BACKUP_COMPREHENSIVE;
 }
 
+static int directory_has_entries(const char *path)
+{
+    DIR *dir = opendir(path);
+    if (dir == NULL)
+        return errno == ENOENT ? 0 : -1;
+    int found = 0;
+    struct dirent *entry;
+    while (!found && (entry = readdir(dir)) != NULL)
+        found = strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0;
+    closedir(dir);
+    return found;
+}
+
+/* A user Flatpak installation with nothing deployed under app/ or runtime/ is
+ * only a cache of downloaded objects that Flatpak fetches again on demand. */
+static int flatpak_user_installation_is_empty(const char *home_real)
+{
+    char installation[PATH_MAX], app[PATH_MAX], runtime[PATH_MAX];
+    struct stat st;
+    if (path_join(installation, sizeof(installation), home_real, ".local/share/flatpak") != 0 ||
+        path_join(app, sizeof(app), installation, "app") != 0 ||
+        path_join(runtime, sizeof(runtime), installation, "runtime") != 0 ||
+        lstat(installation, &st) != 0 || !S_ISDIR(st.st_mode))
+        return 0;
+    return directory_has_entries(app) == 0 && directory_has_entries(runtime) == 0;
+}
+
+void selection_plan_print_notes(const SelectionPlan *plan)
+{
+    if (plan == NULL)
+        return;
+    if (plan->flatpak_repo_excluded)
+        printf("Note: the user Flatpak installation (~/.local/share/flatpak) "
+               "has no applications or runtimes; its repository is a "
+               "download cache and is left out.\n");
+}
+
 int selection_plan_build(const char *home, BackupMode mode,
                          const Config *config, SelectionPlan *out)
 {
@@ -1302,6 +1339,17 @@ int selection_plan_build(const char *home, BackupMode mode,
             remaining--;
         }
         if (remaining == before) goto fail;
+    }
+    if (flatpak_user_installation_is_empty(plan.home))
+    {
+        char normalized[PATH_MAX];
+        int rc = selection_normalize(plan.home, "~/.local/share/flatpak", &plan.excludes, 1, normalized);
+        if (rc < 0) goto fail;
+        if (!rc)
+        {
+            if (selection_paths_add(&plan.excludes, normalized) < 0) goto fail;
+            plan.flatpak_repo_excluded = 1;
+        }
     }
     selection_paths_reduce(&plan.excludes);
     error = "could not resolve built-in selection";

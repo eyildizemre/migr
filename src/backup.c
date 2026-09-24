@@ -2744,6 +2744,7 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
                                estimate_had_error, raw_estimate_had_error,
                                target) != 0)
         goto fail_pre_container;
+    selection_plan_print_notes(selection);
 
     ShellHistorySelection shell_history = {0};
     if (backup_shell_history_selection(selection, &shell_history) != 0)

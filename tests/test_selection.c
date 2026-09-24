@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "selection.h"
+#include <errno.h>
 #include <fcntl.h>
 #include <ftw.h>
 #include <stdio.h>
@@ -211,6 +212,30 @@ int main(void)
             mapped_browser = 1;
         }
     CHECK(mapped_browser);
+    selection_plan_free(&a);
+    /* An empty user Flatpak installation is a download cache (D57). */
+    CHECK(mkdir(".local", 0700) == 0 || errno == EEXIST);
+    CHECK(mkdir(".local/share", 0700) == 0 || errno == EEXIST);
+    CHECK(mkdir(".local/share/flatpak", 0700) == 0);
+    CHECK(mkdir(".local/share/flatpak/repo", 0700) == 0);
+    CHECK(mkdir(".local/share/flatpak/app", 0700) == 0);
+    file(".local/share/flatpak/repo/object", "cached\n");
+    char flatpak_path[PATH_MAX];
+    CHECK(realpath(".local/share/flatpak", flatpak_path) != NULL);
+    CHECK(build(home, BACKUP_CRITICAL, "", &a) == 0);
+    int flatpak_excluded = 0;
+    for (size_t i = 0; i < a.excludes.count; i++)
+        if (!strcmp(a.excludes.paths[i], flatpak_path)) flatpak_excluded = 1;
+    CHECK(a.flatpak_repo_excluded && flatpak_excluded);
+    selection_plan_free(&a);
+    CHECK(build(home, BACKUP_CRITICAL, "[critical]\n[exclude]\n~/.local/share\n", &a) == 0);
+    CHECK(!a.flatpak_repo_excluded);
+    selection_plan_free(&a);
+    CHECK(mkdir(".local/share/flatpak/app/org.example.App", 0700) == 0);
+    CHECK(build(home, BACKUP_CRITICAL, "", &a) == 0);
+    CHECK(!a.flatpak_repo_excluded);
+    for (size_t i = 0; i < a.excludes.count; i++)
+        CHECK(strcmp(a.excludes.paths[i], flatpak_path) != 0);
     selection_plan_free(&a);
     const char *paths[] = {"extra", "extra/child", NULL};
     CHECK(backup_plan_build(home, BACKUP_EXPLICIT_PATHS, paths, &legacy) < 0);
