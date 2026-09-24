@@ -39,23 +39,31 @@ typedef struct {
     const char *dest_dir;
     NetworkConfigApplyMode apply_mode;
     const char *manual_apply_hint;
+    /* Written regardless of the backup's mode, which a portable container on
+     * exFAT/NTFS/FAT reports as 0755: NetworkManager refuses keyfiles that are
+     * not 0600, and every backend but networkd stores secrets in these files.
+     * networkd reads its configuration as the unprivileged systemd-network
+     * user, so its files keep the distributions' 0644 (except .netdev, see
+     * network_config_file_mode()). */
+    mode_t file_mode;
 } RestoreNetworkConfigBackend;
 
 static const RestoreNetworkConfigBackend RESTORE_NETWORK_CONFIG_BACKENDS[] = {
     { "NetworkManager", "networkmanager",
       "/etc/NetworkManager/system-connections",
-      NETWORK_CONFIG_APPLY_RELOAD, NULL },
+      NETWORK_CONFIG_APPLY_RELOAD, NULL, 0600 },
     { "netplan", "netplan", "/etc/netplan",
-      NETWORK_CONFIG_APPLY_MANUAL, "sudo netplan apply" },
+      NETWORK_CONFIG_APPLY_MANUAL, "sudo netplan apply", 0600 },
     { "systemd-networkd", "systemd-networkd", "/etc/systemd/network",
-      NETWORK_CONFIG_APPLY_MANUAL, "sudo networkctl reload" },
+      NETWORK_CONFIG_APPLY_MANUAL, "sudo networkctl reload", 0644 },
     { "wpa_supplicant", "wpa_supplicant", "/etc/wpa_supplicant",
       NETWORK_CONFIG_APPLY_MANUAL,
       "sudo systemctl restart wpa_supplicant@<interface> "
-      "(replace <interface> with your interface name)" },
+      "(replace <interface> with your interface name)", 0600 },
     { "netctl", "netctl", "/etc/netctl",
       NETWORK_CONFIG_APPLY_MANUAL,
-      "sudo netctl restart <profile> (replace <profile> with your profile name)" },
+      "sudo netctl restart <profile> (replace <profile> with your profile name)",
+      0600 },
 };
 
 #define NETWORK_CONFIG_BACKEND_COUNT \
@@ -93,6 +101,80 @@ void restore_test_set_progress_force(int force)
     restore_test_progress_force = force != 0;
 }
 #endif
+
+static const char *network_config_group_file = "/etc/group";
+
+#ifdef RESTORE_TEST_HOOKS
+void restore_test_set_network_config_group_file(const char *path)
+{
+    network_config_group_file = path != NULL ? path : "/etc/group";
+}
+#endif
+
+// Resolves a group from the local group file without NSS, as D38 does for
+// accounts. Returns -1 when it is absent, duplicated, or unreadable.
+static int network_config_local_gid(const char *name, gid_t *gid_out)
+{
+    FILE *groups = fopen(network_config_group_file, "re");
+    if (groups == NULL)
+        return -1;
+    char *line = NULL;
+    size_t capacity = 0;
+    size_t name_length = strlen(name);
+    int matches = 0;
+    gid_t found = 0;
+    while (getline(&line, &capacity, groups) >= 0)
+    {
+        if (strncmp(line, name, name_length) != 0 || line[name_length] != ':')
+            continue;
+        const char *gid_field = strchr(line + name_length + 1, ':');
+        if (gid_field == NULL)
+            continue;
+        gid_field++;
+        char *end = NULL;
+        errno = 0;
+        unsigned long value = strtoul(gid_field, &end, 10);
+        if (errno != 0 || end == gid_field || (*end != ':' && *end != '\n' &&
+                                               *end != '\0') ||
+            (unsigned long)(gid_t)value != value || (gid_t)value == (gid_t)-1)
+            continue;
+        found = (gid_t)value;
+        matches++;
+    }
+    free(line);
+    fclose(groups);
+    if (matches != 1)
+        return -1;
+    *gid_out = found;
+    return 0;
+}
+
+static int name_has_suffix(const char *name, const char *suffix)
+{
+    size_t name_length = strlen(name);
+    size_t suffix_length = strlen(suffix);
+    return name_length > suffix_length &&
+           strcmp(name + name_length - suffix_length, suffix) == 0;
+}
+
+// networkd reads its configuration as the unprivileged systemd-network user.
+// .netdev files can hold WireGuard private keys, so systemd recommends 0640
+// with group systemd-network for them; other files stay 0644.
+static mode_t network_config_file_mode(
+    const RestoreNetworkConfigBackend *backend, const char *name,
+    gid_t *group_out)
+{
+    *group_out = (gid_t)-1;
+    if (strcmp(backend->name, "systemd-networkd") == 0 &&
+        name_has_suffix(name, ".netdev"))
+    {
+        gid_t group;
+        if (network_config_local_gid("systemd-network", &group) == 0)
+            *group_out = group;
+        return 0640;
+    }
+    return backend->file_mode;
+}
 
 // The canonical XDG key/fallback table (xdg.h) is shared by both restore
 // paths: legacy records them as "KEY=value" lines in an unversioned
@@ -234,7 +316,8 @@ static void report_network_config_unapplied(
 // Returns 1 when a regular file was restored, 0 when the source entry was
 // deliberately skipped, and -1 on a per-file failure.
 static int restore_network_config_file_at(int network_fd, int dest_dir_fd,
-                                          const char *name)
+                                          const char *name, mode_t file_mode,
+                                          gid_t file_group)
 {
     struct stat entry_st;
     if (fstatat(network_fd, name, &entry_st, AT_SYMLINK_NOFOLLOW) != 0)
@@ -279,11 +362,10 @@ static int restore_network_config_file_at(int network_fd, int dest_dir_fd,
         return -1;
     }
 
-    mode_t source_mode = source_st.st_mode & 0777;
     int dest_fd = openat(dest_dir_fd, name,
                          O_WRONLY | O_CREAT | O_TRUNC | O_NONBLOCK |
                          O_NOFOLLOW | O_CLOEXEC,
-                         source_mode);
+                         file_mode);
     if (dest_fd < 0)
     {
         int saved_errno = errno;
@@ -311,7 +393,15 @@ static int restore_network_config_file_at(int network_fd, int dest_dir_fd,
         saved_errno = errno;
         failed = 1;
     }
-    if (!failed && fchmod(dest_fd, source_mode) != 0)
+    // Only root can hand the file to another group; without that the mode
+    // alone still keeps the secret from other users.
+    if (!failed && file_group != (gid_t)-1 && geteuid() == 0 &&
+        fchown(dest_fd, (uid_t)-1, file_group) != 0)
+    {
+        saved_errno = errno;
+        failed = 1;
+    }
+    if (!failed && fchmod(dest_fd, file_mode) != 0)
     {
         saved_errno = errno;
         failed = 1;
@@ -489,8 +579,11 @@ static void restore_network_config(int source_root_fd, int *had_error)
                 strcmp(entry->d_name, "..") == 0)
                 continue;
 
+            gid_t file_group;
+            mode_t file_mode = network_config_file_mode(backend, entry->d_name,
+                                                        &file_group);
             int file_result = restore_network_config_file_at(
-                dirfd(dir), dest_dir_fd, entry->d_name);
+                dirfd(dir), dest_dir_fd, entry->d_name, file_mode, file_group);
             if (file_result < 0)
             {
                 int saved_errno = errno;

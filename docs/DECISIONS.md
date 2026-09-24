@@ -4104,3 +4104,28 @@ items suspect, which listing them all addresses.
 **Relationship:** Supersedes D42's rule that a failed verification cannot be
 followed by package and network restoration. D42's default-on verification, its
 failure status, and D44/D48's exclusions are unchanged.
+
+---
+
+## D54 — 2026-09-24 — Restored network files get fixed per-backend modes
+
+**Status:** Implemented
+
+**Decision:** Restore writes each saved network file with a mode fixed by its
+backend instead of the mode recorded in the backup: `0600` for NetworkManager,
+netplan, wpa_supplicant, and netctl; `0644` for systemd-networkd, except
+`.netdev` files, which get `0640` and, when restore runs as root, the
+`systemd-network` group resolved from the local group file without NSS (as D38
+resolves accounts). A missing group leaves the file `0640 root:root`.
+
+**Why:** A portable container on exFAT reports every file as `0755`. On real
+hardware all six restored NetworkManager keyfiles were written `0755`;
+NetworkManager refused every one of them ("File permissions (100755) are
+insecure") although migr's own reload ran, and the Wi-Fi passwords in them were
+world-readable until a manual `chmod 600`. NetworkManager requires `0600`, and
+these backends store secrets in their files (D33). systemd-networkd parses its
+configuration as the unprivileged `systemd-network` user, so its files keep
+`0644`; a `.netdev` can hold a WireGuard private key, for which systemd documents
+`0640` with that group.
+
+**Relationship:** Extends D33's restore side. Capture is unchanged.

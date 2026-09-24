@@ -2994,6 +2994,75 @@ static void test_v1_restore_space_preflight(void)
     remove_tree(home);
 }
 
+static void test_network_config_restore_backend_modes(void)
+{
+    printf(BLUE "::" NC " network config: each backend gets its fixed file mode\n");
+
+    char source[PATH_MAX], home[PATH_MAX], dest_parent[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "network_mode_src");
+    fresh_mkdtemp(home, sizeof(home), "network_mode_home");
+    fresh_mkdtemp(dest_parent, sizeof(dest_parent), "network_mode_dest");
+    setenv("HOME", home, 1);
+    write_network_manifest(source);
+
+    char networkd_dir[PATH_MAX], wpa_dir[PATH_MAX], path[PATH_MAX];
+    join_path(networkd_dir, sizeof(networkd_dir), source,
+              "network/systemd-networkd");
+    join_path(wpa_dir, sizeof(wpa_dir), source, "network/wpa_supplicant");
+    mkdir_p(networkd_dir);
+    mkdir_p(wpa_dir);
+    join_path(path, sizeof(path), networkd_dir, "20-wired.network");
+    write_file_mode(path, "[Match]\nName=en*\n", 0755);
+    join_path(path, sizeof(path), networkd_dir, "30-wg.netdev");
+    write_file_mode(path, "[WireGuard]\nPrivateKey=fixture\n", 0755);
+    char group_file[PATH_MAX];
+    join_path(group_file, sizeof(group_file), dest_parent, "group");
+    write_file_mode(group_file,
+                    "systemd-networkd:x:4241:\nsystemd-network:x:4242:\n", 0644);
+    restore_test_set_network_config_group_file(group_file);
+    join_path(path, sizeof(path), wpa_dir, "wpa_supplicant.conf");
+    write_file_mode(path, "network={}\n", 0644);
+
+    char networkd_dest[PATH_MAX], wpa_dest[PATH_MAX];
+    join_path(networkd_dest, sizeof(networkd_dest), dest_parent, "network");
+    join_path(wpa_dest, sizeof(wpa_dest), dest_parent, "wpa_supplicant");
+    mkdir_p(networkd_dest);
+    mkdir_p(wpa_dest);
+    restore_test_set_network_config_dest_dir("systemd-networkd", networkd_dest);
+    restore_test_set_network_config_dest_dir("wpa_supplicant", wpa_dest);
+
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    char output[8192];
+    int rc = run_restore_capturing_with_input(source, "y\n", output,
+                                              sizeof(output));
+    dry_run = previous_dry_run;
+    restore_test_set_network_config_dest_dir("systemd-networkd", NULL);
+    restore_test_set_network_config_dest_dir("wpa_supplicant", NULL);
+    restore_test_set_network_config_group_file(NULL);
+
+    check(rc == 0, "live restore of networkd and wpa_supplicant files succeeds");
+    join_path(path, sizeof(path), networkd_dest, "20-wired.network");
+    check(file_matches(path, "[Match]\nName=en*\n", 0644),
+          "networkd configuration stays readable by systemd-network (0644)");
+    join_path(path, sizeof(path), networkd_dest, "30-wg.netdev");
+    check(file_matches(path, "[WireGuard]\nPrivateKey=fixture\n", 0640),
+          "a networkd .netdev that can hold keys is not world-readable (0640)");
+    struct stat netdev_st;
+    if (geteuid() == 0)
+        check(stat(path, &netdev_st) == 0 && netdev_st.st_gid == 4242,
+              "as root, a .netdev is handed to the systemd-network group");
+    else
+        skip_case(".netdev group assignment", "requires root");
+    join_path(path, sizeof(path), wpa_dest, "wpa_supplicant.conf");
+    check(file_matches(path, "network={}\n", 0600),
+          "wpa_supplicant configuration holding keys is written 0600");
+
+    remove_tree(source);
+    remove_tree(home);
+    remove_tree(dest_parent);
+}
+
 static void test_network_config_restore_success(void)
 {
     printf(BLUE "::" NC " network config: live restore copies regular files and reloads NetworkManager\n");
@@ -3014,7 +3083,8 @@ static void test_network_config_restore_success(void)
     join_path(wifi_source, sizeof(wifi_source), network_dir,
               "wifi.nmconnection");
     write_file_mode(office_source, "[connection]\nid=office\n", 0600);
-    write_file_mode(wifi_source, "[connection]\nid=wifi\n", 0640);
+    // What a portable container on exFAT reports for every file.
+    write_file_mode(wifi_source, "[connection]\nid=wifi\n", 0755);
 
     char ignored_dir[PATH_MAX], ignored_link[PATH_MAX];
     join_path(ignored_dir, sizeof(ignored_dir), network_dir, "ignored-dir");
@@ -3052,9 +3122,10 @@ static void test_network_config_restore_success(void)
 
     check(rc == 0, "live restore succeeds when the network destination is writable");
     check(file_matches(office_dest, "[connection]\nid=office\n", 0600),
-          "an existing connection file is replaced with the saved bytes and mode");
-    check(file_matches(wifi_dest, "[connection]\nid=wifi\n", 0640),
-          "a missing connection file is created with the saved bytes and mode");
+          "an existing connection file is replaced with the saved bytes as 0600");
+    check(file_matches(wifi_dest, "[connection]\nid=wifi\n", 0600),
+          "a 0755 saved connection file is created 0600, as NetworkManager "
+          "requires");
 
     char ignored_dest[PATH_MAX];
     join_path(ignored_dest, sizeof(ignored_dest), dest_dir, "ignored-dir");
@@ -3385,6 +3456,8 @@ static void test_network_config_backends(unsigned int mask, int blocked_index,
                                "[Match]\nName=eth0\n", "network={psk=\"fixture\"}\n",
                                "Key=fixture\n" };
     const size_t backend_count = sizeof(names) / sizeof(names[0]);
+    // Fixed per backend; networkd must stay readable by systemd-network.
+    const mode_t modes[] = { 0600, 0600, 0644, 0600, 0600 };
     const char *hints[] = { NULL, "sudo netplan apply", "sudo networkctl reload",
                            "sudo systemctl restart wpa_supplicant@<interface>",
                            "sudo netctl restart <profile>" };
@@ -3439,8 +3512,9 @@ static void test_network_config_backends(unsigned int mask, int blocked_index,
         int expected = (mask & (1u << i)) && !preview &&
                        ((int)i != blocked_index || running_as_root) &&
                        (int)i != broken_index;
-        check(expected ? file_matches(file, contents[i], 0600) : access(file, F_OK) != 0,
-              "each backend restores only its own saved bytes and mode");
+        check(expected ? file_matches(file, contents[i], modes[i])
+                       : access(file, F_OK) != 0,
+              "each backend restores only its own saved bytes with its fixed mode");
     }
     if ((mask & 1u) && !preview && blocked_index != 0 && broken_index != 0)
         check(file_content_is(marker, "sudo\nnmcli\nconnection\nreload\n"),
@@ -3630,6 +3704,7 @@ int main(void)
                                   "sudo systemctl restart wpa_supplicant@<interface>");
     test_network_config_roundtrip("netctl", "home-wifi", "sudo netctl restart <profile>");
     test_network_config_restore_success();
+    test_network_config_restore_backend_modes();
     test_network_config_restore_dry_run();
     test_network_config_reload_failure_is_best_effort();
     test_network_config_restore_continues_after_file_error();
