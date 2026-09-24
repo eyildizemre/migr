@@ -9,6 +9,7 @@
 
 #include "backup.h"
 #include "config.h"
+#include "repair.h"
 #include "report.h"
 #include "restore.h"
 #include "selection.h"
@@ -21,6 +22,7 @@ typedef enum {
     ACTION_BACKUP,
     ACTION_RESTORE,
     ACTION_VERIFY,
+    ACTION_REPAIR,
     ACTION_CONF,
     ACTION_HELP
 } Action;
@@ -35,6 +37,8 @@ static void action_lookup(const char *arg, Action *action)
         *action = ACTION_RESTORE;
     else if (strcmp(arg, "verify") == 0)
         *action = ACTION_VERIFY;
+    else if (strcmp(arg, "repair") == 0)
+        *action = ACTION_REPAIR;
     else if (strcmp(arg, "conf") == 0)
         *action = ACTION_CONF;
     else if (strcmp(arg, "help") == 0)
@@ -366,6 +370,15 @@ int main(int argc, char *argv[])
                 break;
             }
             ret = verify_backup(path);
+            break;
+        case ACTION_REPAIR:
+            if (path == NULL || user_paths[0] == NULL || user_paths[1] != NULL)
+            {
+                print_error("Usage: ./migr repair <SOURCE> <PATH>\n");
+                ret = 1;
+                break;
+            }
+            ret = repair_backup(path, user_paths[0]);
             break;
         case ACTION_CONF:
             ret = config_edit() == 0 ? 0 : 1;

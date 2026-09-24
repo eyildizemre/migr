@@ -795,6 +795,8 @@ void print_help(void)
     printf("  backup <PATH>         Create a resumable backup container under PATH\n");
     printf("  restore <SOURCE>      Restore files and packages from a backup at SOURCE\n");
     printf("  verify <SOURCE>       Check a portable backup against its capture record\n");
+    printf("  repair <SOURCE> <PATH>\n");
+    printf("                        Rebuild a damaged portable backup as a new copy under PATH\n");
     printf("  conf                  Edit persistent critical/comprehensive selection rules\n");
     printf("  help                  Show this help\n");
     printf("\n");

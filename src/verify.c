@@ -395,8 +395,8 @@ static void verify_item(VerifyRun *run, const VerifyItem *item)
         verify_parent_forget(run);
 }
 
-static int verify_open_container(const char *path, Manifest *manifest,
-                                 int *container_fd_out)
+int portable_container_open(const char *path, Manifest *manifest,
+                            int *container_fd_out)
 {
     char copy[PATH_MAX];
     size_t length = strlen(path);
@@ -464,8 +464,8 @@ int verify_backup(const char *path)
 {
     Manifest manifest;
     int container_fd = -1;
-    if (path == NULL || verify_open_container(path, &manifest,
-                                              &container_fd) != 0)
+    if (path == NULL || portable_container_open(path, &manifest,
+                                                &container_fd) != 0)
         return 1;
 
     VerifyRun run;

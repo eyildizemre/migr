@@ -4279,3 +4279,45 @@ restore-free check possible; this command is that check.
 
 **Relationship:** Builds on D59. Native backups stay out of scope until they
 record digests of their own.
+
+## D61 — 2026-09-24 — `migr repair` rebuilds a damaged portable journal as a new backup
+
+**Status:** Implemented
+
+**Decision:** `migr repair <SOURCE> <PATH>` reads a finished portable
+container and never writes to it. It reserves a new container under `PATH`,
+replays the old journal into a fresh one through the state layer's append
+API, and handles damage in four ways:
+
+1. A record that does not parse starts a damaged region. Parsing resumes at
+   the next `CLAIM`, `ENTRY`, or `DELETE` record start after the last complete
+   boundary (the tag field follows a NUL), behind a copy of the header. The
+   open group, if any, is dropped with the region.
+2. A group the state layer refuses before writing (`INVALID_ARGUMENT` or
+   `CORRUPT`, for example a child whose parent's `CLAIM` was lost) is left out.
+   A refused record whose item is live at the end lost nothing and is not
+   reported. Any other status means the new log is no longer trustworthy and
+   the repair stops.
+3. A directory that is still only claimed at the end gets a synthesized
+   `ENTRY`: mode, ownership, times, and xattrs of the nearest live ancestor
+   directory (a root takes its payload directory's), and the collision suffix
+   that makes its recorded physical leaf authenticate. Its children stay
+   reachable.
+4. Any other item still only claimed is removed with a `DELETE`.
+
+The rebuilt journal must pass the restore address index. Every left-out and
+re-created path is reported (the first 20 of each list). If nothing was
+damaged, the reserved container is removed and the backup is reported intact.
+Otherwise the payload and the other top-level files are copied beside the new
+journal (`copy_file_range`, with a read/write fallback) after a free-space
+check, the filesystem is synced, and the container is published under a new
+finished name.
+
+**Why:** On real hardware one reused 128 KiB exFAT cluster in an 84 MB journal
+made a 187k-item backup unrestorable, and recovery took a hand-written splice,
+record-by-record rebuild, and four hand-made directory commits. This command is
+that procedure, with the manual guesses replaced by the rules above.
+
+**Relationship:** Complements D51 (read-back before publishing) and D52
+(rewriting a recovered prefix). Record checksums in the journal format remain
+future work; they would turn "damaged region" into exact record ranges.

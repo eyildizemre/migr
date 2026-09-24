@@ -1,6 +1,18 @@
 #ifndef VERIFY_H
 #define VERIFY_H
 
+#include "manifest.h"
+
+/**
+ * @brief Opens a finished portable container for reading its journal.
+ *
+ * Refuses, with a printed reason, a partial container, a missing or unreadable
+ * manifest, a native backup, and a journal version this build does not read.
+ * On success the caller owns *manifest (manifest_free) and *container_fd_out.
+ */
+int portable_container_open(const char *path, Manifest *manifest,
+                            int *container_fd_out);
+
 /**
  * @brief Checks a finished portable backup against its own capture record.
  *

@@ -54,6 +54,7 @@ git config core.hooksPath hooks
 ./migr backup <PATH>
 ./migr restore <SOURCE> [--no-verify]
 ./migr verify <SOURCE>
+./migr repair <SOURCE> <PATH>
 ./migr conf
 ```
 
@@ -158,7 +159,16 @@ own with `migr verify <SOURCE>`, without restoring anything: it confirms that
 every item the journal records is present in the backup and that every file still
 has its captured size and content, and lists the ones that do not. Run it before
 wiping the source machine. Native backups record no content digests, so verify
-refuses them. Symlink target bytes are compared directly; their
+refuses them.
+
+If a portable backup's journal is damaged, for example by a failing drive,
+restore refuses it. `migr repair <SOURCE> <PATH>` rebuilds it as a new backup
+under `PATH` without writing to the original: the journal is replayed record by
+record, a damaged region is skipped up to the next intact record, a directory
+whose own record was lost is re-created with the metadata of the directory above
+it, and every item that cannot be recovered is listed. The payload is then copied
+next to the rebuilt journal, so `PATH` needs room for the whole backup. Check the
+copy with `migr verify` before restoring from it. Symlink target bytes are compared directly; their
 recorded timestamps are reapplied afterward because reading the target can advance
 the symlink's atime. Hardlink aliases are checked against their representative by filesystem inode
 identity without re-reading the same content through every alias. A read,

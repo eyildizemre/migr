@@ -1123,6 +1123,16 @@ test_errors() {
         ../migr verify "$BACKUP_DIR" --no-verify
     assert_succeeds_with "verify <SOURCE>" ../migr --help
 
+    # repair reads one backup and writes its copy under exactly one PATH
+    assert_fails_with "Usage: ./migr repair <SOURCE> <PATH>" ../migr repair
+    assert_fails_with "Usage: ./migr repair <SOURCE> <PATH>" \
+        ../migr repair "$BACKUP_DIR"
+    assert_fails_with "Usage: ./migr repair <SOURCE> <PATH>" \
+        ../migr repair "$BACKUP_DIR" /tmp /tmp/extra
+    assert_fails_with "Error: --dry-run applies only to 'backup' or 'restore'." \
+        ../migr repair "$BACKUP_DIR" /tmp --dry-run
+    assert_succeeds_with "repair <SOURCE> <PATH>" ../migr --help
+
     # report takes no arguments at all
     assert_exits_nonzero ../migr report /tmp/somewhere
 
