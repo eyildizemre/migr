@@ -44,7 +44,14 @@ typedef struct {
     size_t destination_order;
     uint64_t content_digest;
     int content_digest_valid;
+    unsigned char directory_state;
 } ReplayEntry;
+
+enum {
+    REPLAY_DIRECTORY_UNTOUCHED = 0,
+    REPLAY_DIRECTORY_PREPARED,
+    REPLAY_DIRECTORY_FINALIZED
+};
 
 /* ReplayEntry and RestoreAddressIndex share the same bounded allocation
  * budget. Keep per-entry replay state compact enough that the maximum live
@@ -3337,6 +3344,27 @@ static int replay_verify_content(ReplayCollection *collection)
     return 0;
 }
 
+/* Replay creates directories 0700 (owned by the restoring user) and applies
+ * their recorded metadata only after their children. When replay stops early,
+ * every directory this run prepared still gets that metadata, in the same
+ * reverse order, so a failed restore does not leave e.g. a root-owned 0700
+ * tree under HOME. Best-effort: the original failure stays the reported one. */
+static void replay_finalize_prepared_directories(ReplayCollection *collection)
+{
+    int saved = errno;
+    for (size_t index = collection->count; index != 0; index--)
+    {
+        ReplayEntry *replay = &collection->items[index - 1U];
+        if (replay->entry->kind != SIDECAR_KIND_DIRECTORY ||
+            replay->directory_state != REPLAY_DIRECTORY_PREPARED)
+            continue;
+        ReplayApplyFailure ignored = {0};
+        if (replay_apply_directory_metadata(collection, replay, &ignored) == 0)
+            replay->directory_state = REPLAY_DIRECTORY_FINALIZED;
+    }
+    errno = saved;
+}
+
 static int replay_run(ReplayCollection *collection)
 {
     if (collection == NULL || collection->report == NULL)
@@ -3378,8 +3406,11 @@ static int replay_run(ReplayCollection *collection)
             replay_report_apply_failure(
                 collection->report, collection->manifest, replay->root_index,
                 replay->entry, &failure);
+            replay_finalize_prepared_directories(collection);
             return -1;
         }
+        if (replay->entry->kind == SIDECAR_KIND_DIRECTORY)
+            replay->directory_state = REPLAY_DIRECTORY_PREPARED;
         if (replay->entry->kind == SIDECAR_KIND_REGULAR &&
             replay_regular_is_locally_authoritative(collection, replay))
         {
@@ -3407,6 +3438,7 @@ static int replay_run(ReplayCollection *collection)
             replay_report_apply_failure(
                 collection->report, collection->manifest, replay->root_index,
                 replay->entry, &failure);
+            replay_finalize_prepared_directories(collection);
             return -1;
         }
         if (collection->report->applied_count != SIZE_MAX)
@@ -3426,8 +3458,10 @@ static int replay_run(ReplayCollection *collection)
             replay_report_apply_failure(
                 collection->report, collection->manifest, replay->root_index,
                 replay->entry, &failure);
+            replay_finalize_prepared_directories(collection);
             return -1;
         }
+        replay->directory_state = REPLAY_DIRECTORY_FINALIZED;
         if (collection->report->applied_count != SIZE_MAX)
             collection->report->applied_count++;
     }

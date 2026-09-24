@@ -1385,6 +1385,73 @@ static void test_link_rerun_refuses_foreign_hardlink_name(void)
     fixture_close(&fixture);
 }
 
+static void test_failed_replay_finalizes_prepared_directories(void)
+{
+    printf(BLUE "::" NC " failed replay still finalizes prepared directories\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "failed replay fixture is created");
+    if (opened != 0)
+        return;
+
+    make_dir_at(fixture.data_fd, "ROOT", 0700);
+    int root_fd = openat(fixture.data_fd, "ROOT",
+                         O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (root_fd < 0)
+        fatal("could not open failed replay payload root");
+    make_dir_at(root_fd, "sub", 0700);
+    write_file_at(root_fd, "sub/file", "sub payload");
+    write_file_at(root_fd, "alias", "");
+    if (close(root_fd) != 0)
+        fatal("could not close failed replay payload root");
+
+    uint32_t uid = (uint32_t)geteuid();
+    uint32_t gid = (uint32_t)getegid();
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0750,
+                  uid, gid, 1700000900, 1, 1700000901, 2),
+        entry_for("ROOT", "sub", "sub", SIDECAR_KIND_DIRECTORY, 0, 0755,
+                  uid, gid, 1700000910, 3, 1700000911, 4),
+        entry_for("ROOT", "sub/file", "file", SIDECAR_KIND_REGULAR,
+                  strlen("sub payload"), 0644, uid, gid, 1700000920, 5,
+                  1700000921, 6),
+        entry_for("ROOT", "alias", "alias", SIDECAR_KIND_HARDLINK, 0, 0644,
+                  uid, gid, 1700000930, 7, 1700000931, 8)
+    };
+    entries[3].hardlink_root_id = text_bytes("ROOT");
+    entries[3].hardlink_logical_path = text_bytes("sub/file");
+    check(write_sidecar(&fixture, entries, 4) == 0,
+          "failed replay sidecar is committed");
+
+    make_dir_at(fixture.home_fd, "restored", 0700);
+    int restored_fd = openat(fixture.home_fd, "restored",
+                             O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (restored_fd < 0)
+        fatal("could not open failed replay destination");
+    write_file_at(restored_fd, "alias", "conflict");
+    close(restored_fd);
+
+    PortableRestoreReplayReport report;
+    int result = run_orchestration(&fixture, &report, 1, "y\n");
+    check(result != 0 && report.failed_count == 1 &&
+              strcmp(report.failed_logical_path, "alias") == 0 &&
+              report.failure_step ==
+                  PORTABLE_RESTORE_REPLAY_FAILURE_CHECK_DESTINATION,
+          "replay stops at the conflicting entry and reports it");
+
+    char sub[PATH_MAX], restored[PATH_MAX];
+    path_join_fixture(sub, sizeof(sub), fixture.home, "/restored/sub");
+    path_join_fixture(restored, sizeof(restored), fixture.home, "/restored");
+    check(metadata_exact(sub, 0755, (uid_t)uid, (gid_t)gid,
+                         1700000910, 3, 1700000911, 4),
+          "a directory created before the failure gets its recorded metadata");
+    check(metadata_exact(restored, 0750, (uid_t)uid, (gid_t)gid,
+                         1700000900, 1, 1700000901, 2),
+          "the prepared root directory gets its recorded metadata too");
+    fixture_close(&fixture);
+}
+
 static void test_hardlink_cross_root(void)
 {
     printf(BLUE "::" NC " portable hardlink cross-root reference\n");
@@ -2608,6 +2675,7 @@ int main(void)
     test_link_rerun_is_idempotent();
     test_link_rerun_refuses_different_symlink();
     test_link_rerun_refuses_foreign_hardlink_name();
+    test_failed_replay_finalizes_prepared_directories();
     test_hardlink_cross_root();
     test_hardlink_cross_root_invalid_xdg_reference();
     test_xdg_destination_orchestration();
