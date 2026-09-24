@@ -1575,9 +1575,16 @@ int portable_restore_preflight_at(
     /* Adoption repairs a truncated EOF tail in place.  Preflight is a
      * rejection-only gate, so require a complete sidecar before opening the
      * state log through that API. */
-    if (sidecar_is_complete_readonly(request->source_container_fd) != 0)
+    uint64_t sidecar_valid_bytes = 0;
+    uint64_t sidecar_file_bytes = 0;
+    SidecarStatus sidecar_complete = sidecar_check_complete_readonly(
+        request->source_container_fd, &sidecar_valid_bytes,
+        &sidecar_file_bytes);
+    if (sidecar_complete != SIDECAR_STATUS_OK)
     {
         close(data_fd);
+        sidecar_report_incomplete(sidecar_complete, sidecar_valid_bytes,
+                                  sidecar_file_bytes);
         report_violation(report, SIZE_MAX, "sidecar");
         goto fail;
     }
@@ -1593,6 +1600,10 @@ int portable_restore_preflight_at(
     }
     if (sidecar_log_claim_count(&sidecar) != 0)
     {
+        print_error("Error: the backup journal (%s) records %zu item%s whose "
+                    "capture never finished; this backup did not complete\n",
+                    SIDECAR_SLOT_NAME, sidecar_log_claim_count(&sidecar),
+                    sidecar_log_claim_count(&sidecar) == 1 ? "" : "s");
         sidecar_log_close(&sidecar);
         close(data_fd);
         report_violation(report, SIZE_MAX, "sidecar");

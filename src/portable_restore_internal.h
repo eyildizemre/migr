@@ -195,6 +195,14 @@ int sidecar_kind_to_type(SidecarObjectKind kind, mode_t *type);
 int destination_symlink_target_matches(int parent_fd, const char *leaf,
                                        SidecarBytes target);
 int sidecar_is_complete_readonly(int container_fd);
+/* Parses the whole journal read-only. valid_bytes is the last complete record
+ * boundary and file_bytes the journal size; both may be NULL. */
+SidecarStatus sidecar_check_complete_readonly(int container_fd,
+                                              uint64_t *valid_bytes,
+                                              uint64_t *file_bytes);
+/* Names why a journal is unusable for restore; silent for SIDECAR_STATUS_OK. */
+void sidecar_report_incomplete(SidecarStatus status, uint64_t valid_bytes,
+                               uint64_t file_bytes);
 
 void destination_identity_graph_init(DestinationIdentityGraph *graph,
                                      DestinationIdentityBounds bounds);

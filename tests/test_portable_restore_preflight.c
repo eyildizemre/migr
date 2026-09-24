@@ -2036,8 +2036,95 @@ static void test_resolved_destination_identity_collisions(void)
     fixture_close(&fixture);
 }
 
+static int run_preflight_capturing_all(Fixture *fixture,
+                                       PortableRestorePreflightReport *report,
+                                       char *output, size_t output_size)
+{
+    fflush(stdout);
+    fflush(stderr);
+    FILE *file = tmpfile();
+    int saved_stdout = dup(STDOUT_FILENO);
+    int saved_stderr = dup(STDERR_FILENO);
+    if (file == NULL || saved_stdout < 0 || saved_stderr < 0 ||
+        dup2(fileno(file), STDOUT_FILENO) < 0 ||
+        dup2(fileno(file), STDERR_FILENO) < 0)
+        fatal("could not redirect preflight output");
+    int result = run_preflight(fixture, report);
+    fflush(stdout);
+    fflush(stderr);
+    if (dup2(saved_stdout, STDOUT_FILENO) < 0 ||
+        dup2(saved_stderr, STDERR_FILENO) < 0 || close(saved_stdout) != 0 ||
+        close(saved_stderr) != 0)
+        fatal("could not restore preflight output");
+    rewind(file);
+    size_t received = fread(output, 1, output_size - 1U, file);
+    output[received] = '\0';
+    fclose(file);
+    return result;
+}
+
+static void test_unusable_journal_is_explained(void)
+{
+    printf(BLUE "::" NC " an unusable backup journal is explained\n");
+    static const char *const cases[] = { "damaged", "cut short" };
+    for (size_t index = 0; index < 2; index++)
+    {
+        ManifestRoot root = root_for("ROOT", "ROOT", "restored");
+        Fixture fixture;
+        int opened = fixture_open(&fixture, "journal-explained", &root, 1);
+        check(opened == 0, "unusable-journal fixture is created");
+        if (opened != 0)
+            return;
+        make_root_payload(&fixture);
+        write_file_at(fixture.data_fd, "ROOT/a", "payload-a");
+        write_file_at(fixture.data_fd, "ROOT/b", "payload-b");
+        SidecarEntry entries[] = {
+            entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0),
+            entry_for("ROOT", "a", "a", SIDECAR_KIND_REGULAR, 9),
+            entry_for("ROOT", "b", "b", SIDECAR_KIND_REGULAR, 9)
+        };
+        entries[0].uid = (uint32_t)geteuid();
+        entries[0].gid = (uint32_t)getegid();
+        check(write_sidecar(&fixture, entries, 3) == 0,
+              "unusable-journal sidecar is committed");
+        int fd = openat(fixture.container_fd, SIDECAR_SLOT_NAME,
+                        O_RDWR | O_CLOEXEC);
+        struct stat st;
+        if (fd < 0 || fstat(fd, &st) != 0)
+            fatal("could not open the journal to damage it");
+        if (index == 0)
+        {
+            char zeros[16] = {0};
+            if (pwrite(fd, zeros, sizeof(zeros), st.st_size / 2) !=
+                (ssize_t)sizeof(zeros))
+                fatal("could not damage the journal");
+        }
+        else if (ftruncate(fd, st.st_size - 5) != 0)
+            fatal("could not cut the journal short");
+        close(fd);
+
+        PortableRestorePreflightReport report;
+        char output[8192];
+        int result = run_preflight_capturing_all(&fixture, &report, output,
+                                                 sizeof(output));
+        const char *expected = index == 0 ? "is damaged at byte"
+                                          : "ends in the middle of a record";
+        char label[128];
+        snprintf(label, sizeof(label),
+                 "a %s journal is refused and the reason is named",
+                 cases[index]);
+        check(result != 0 && report.violation_count == 1 &&
+                  strstr(output, "sidecar.migr") != NULL &&
+                  strstr(output, expected) != NULL,
+              label);
+        portable_restore_preflight_report_free(&report);
+        fixture_close(&fixture);
+    }
+}
+
 int main(void)
 {
+    test_unusable_journal_is_explained();
     test_valid_and_profiles();
     test_destination_profile_ancestor_cache();
     test_payload_inventory_progress();

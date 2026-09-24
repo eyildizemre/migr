@@ -2656,22 +2656,80 @@ int destination_symlink_target_matches(int parent_fd, const char *leaf,
            (length == 0 || memcmp(buffer, target.data, (size_t)length) == 0);
 }
 
-int sidecar_is_complete_readonly(int container_fd)
+SidecarStatus sidecar_check_complete_readonly(int container_fd,
+                                              uint64_t *valid_bytes,
+                                              uint64_t *file_bytes)
 {
+    if (valid_bytes != NULL)
+        *valid_bytes = 0;
+    if (file_bytes != NULL)
+        *file_bytes = 0;
     int fd = openat(container_fd, SIDECAR_SLOT_NAME,
                     O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOATIME |
                         O_CLOEXEC);
     if (fd < 0)
-        return -1;
+        return SIDECAR_STATUS_IO_ERROR;
 
+    struct stat st;
     SidecarParseResult parse;
-    SidecarStatus status = sidecar_parse_fd(fd, NULL, NULL, &parse);
+    memset(&parse, 0, sizeof(parse));
+    SidecarStatus status = fstat(fd, &st) == 0
+        ? sidecar_parse_fd(fd, NULL, NULL, &parse) : SIDECAR_STATUS_IO_ERROR;
     int saved = errno;
     if (close(fd) != 0 && status == SIDECAR_STATUS_OK)
     {
         status = SIDECAR_STATUS_IO_ERROR;
         saved = EIO;
     }
+    if (status != SIDECAR_STATUS_IO_ERROR)
+    {
+        if (valid_bytes != NULL)
+            *valid_bytes = parse.last_valid_boundary;
+        if (file_bytes != NULL)
+            *file_bytes = (uint64_t)st.st_size;
+    }
     errno = saved;
-    return status == SIDECAR_STATUS_OK ? 0 : -1;
+    return status;
+}
+
+int sidecar_is_complete_readonly(int container_fd)
+{
+    return sidecar_check_complete_readonly(container_fd, NULL, NULL) ==
+                   SIDECAR_STATUS_OK
+               ? 0 : -1;
+}
+
+void sidecar_report_incomplete(SidecarStatus status, uint64_t valid_bytes,
+                               uint64_t file_bytes)
+{
+    switch (status)
+    {
+        case SIDECAR_STATUS_OK:
+            return;
+        case SIDECAR_STATUS_TRUNCATED_TAIL:
+            print_error("Error: the backup journal (%s) ends in the middle of "
+                        "a record at byte %ju; this backup did not finish "
+                        "writing it\n",
+                        SIDECAR_SLOT_NAME, (uintmax_t)valid_bytes);
+            return;
+        case SIDECAR_STATUS_CORRUPT:
+            print_error("Error: the backup journal (%s) is damaged at byte %ju "
+                        "of %ju; everything after that point is unreadable\n",
+                        SIDECAR_SLOT_NAME, (uintmax_t)valid_bytes,
+                        (uintmax_t)file_bytes);
+            return;
+        case SIDECAR_STATUS_UNKNOWN_VERSION:
+            print_error("Error: the backup journal (%s) was written by a newer "
+                        "migr\n", SIDECAR_SLOT_NAME);
+            return;
+        case SIDECAR_STATUS_IO_ERROR:
+            print_error("Error: could not read the backup journal (%s): %s\n",
+                        SIDECAR_SLOT_NAME, strerror(errno != 0 ? errno : EIO));
+            return;
+        default:
+            print_error("Error: the backup journal (%s) could not be parsed at "
+                        "byte %ju\n",
+                        SIDECAR_SLOT_NAME, (uintmax_t)valid_bytes);
+            return;
+    }
 }
