@@ -311,15 +311,25 @@ int replay_failure_reason_format(const PortableRestoreReplayReport *report,
         ? replay_failure_kind_text(report->failed_kind) : NULL;
     if (step == NULL || (report->failed_kind_valid && kind == NULL))
         return 0;
+    int failure_errno = report->failure_errno;
+    // A read-back that simply differs is recorded as EIO; read errors have
+    // their own step, so this one must not read like a disk failure.
+    if (report->failure_step ==
+            PORTABLE_RESTORE_REPLAY_FAILURE_COMPARE_DESTINATION_CONTENT &&
+        failure_errno == EIO)
+    {
+        step = "content differs from the backup";
+        failure_errno = 0;
+    }
     int length;
-    if (kind != NULL && report->failure_errno != 0)
+    if (kind != NULL && failure_errno != 0)
         length = snprintf(out, out_size, "%s, %s: %s", kind, step,
-                          strerror(report->failure_errno));
+                          strerror(failure_errno));
     else if (kind != NULL)
         length = snprintf(out, out_size, "%s, %s", kind, step);
-    else if (report->failure_errno != 0)
+    else if (failure_errno != 0)
         length = snprintf(out, out_size, "%s: %s", step,
-                          strerror(report->failure_errno));
+                          strerror(failure_errno));
     else
         length = snprintf(out, out_size, "%s", step);
     if (length < 0 || (size_t)length >= out_size)

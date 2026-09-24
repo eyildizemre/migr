@@ -1693,6 +1693,11 @@ static void test_regular_content_verification(void)
                       PORTABLE_RESTORE_REPLAY_FAILURE_COMPARE_DESTINATION_CONTENT &&
                   report.failure_errno == EIO,
               "same-size post-copy corruption is a restore failure");
+        char reason[256];
+        check(replay_failure_reason_format(&report, reason, sizeof(reason)) == 1 &&
+                  strcmp(reason,
+                         "regular file, content differs from the backup") == 0,
+              "a content mismatch is described as such, not as an I/O error");
         fixture_close(&rewritten);
     }
 
