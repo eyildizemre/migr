@@ -14,6 +14,7 @@
 #include "restore.h"
 #include "backup.h"
 #include "container.h"
+#include "dconf_restore.h"
 #include "detect.h"
 #include "fileops.h"
 #include "fsprobe.h"
@@ -332,6 +333,34 @@ static int restore_network_config_file_at(int network_fd, int dest_dir_fd,
         return -1;
     }
     return 1;
+}
+
+// Loads the backed-up dconf database into a running session, where replacing
+// ~/.config/dconf/user alone is overwritten by the dconf service (D50).
+static void restore_dconf_settings(int database_fd, int *had_error)
+{
+    if (database_fd < 0)
+        return;
+    size_t keys = 0;
+    DconfRestoreStatus status = dconf_restore_apply(database_fd, &keys);
+    if (status == DCONF_RESTORE_APPLIED && keys != 0)
+    {
+        printf("\nDesktop settings (dconf)\n");
+        printf("  Applied %zu saved setting%s to the running session. Some, "
+               "such as enabled GNOME Shell extensions, take effect after "
+               "logging out and back in.\n",
+               keys, keys == 1 ? "" : "s");
+    }
+    else if (status == DCONF_RESTORE_FAILED)
+    {
+        printf("\nDesktop settings (dconf)\n");
+        print_warning("  Warning: could not apply the saved settings to the "
+                      "running session, which may overwrite them. Log out, "
+                      "then run the same restore again from a text console "
+                      "(Ctrl+Alt+F3).\n");
+        if (had_error != NULL)
+            *had_error = 1;
+    }
 }
 
 static void restore_network_config(int source_root_fd, int *had_error)
@@ -2460,13 +2489,15 @@ int restore_with_options(const char *source, const RestoreOptions *options)
             return 1;
         }
 
+        int dconf_database_fd = -1;
         PortableRestoreRequest request = {
             .source_container_fd = source_root_fd,
             .manifest = &m,
             .destination_home_fd = home_fd,
             .destination_home_path = home,
             .destination_timestamp_policy = {0},
-            .skip_content_verification = skip_content_verification
+            .skip_content_verification = skip_content_verification,
+            .dconf_database_fd_out = &dconf_database_fd
         };
         for (int index = 0; index < XDG_RESTORE_COUNT; index++)
             request.destination_xdg_dirs[index] = xdg_dirs[index];
@@ -2504,6 +2535,7 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         int had_portable_error = 0;
         if (outcome == PORTABLE_RESTORE_COMPLETE)
         {
+            restore_dconf_settings(dconf_database_fd, &had_portable_error);
             // Packages are published only after a fully successful replay.
             restore_packages(source_root_fd, home, &had_portable_error);
             if (m.has_network_config)
@@ -2512,6 +2544,8 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         else if (outcome == PORTABLE_RESTORE_DRY_RUN &&
                  m.has_network_config)
             restore_network_config(source_root_fd, &had_portable_error);
+        if (dconf_database_fd >= 0)
+            close(dconf_database_fd);
         printf("\n");
         switch (outcome)
         {

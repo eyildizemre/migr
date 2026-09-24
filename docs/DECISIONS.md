@@ -3983,3 +3983,42 @@ durability and resume design than this measured, synchronous optimization.
 it. The revision-3 journal-batching invariants analysis records the crash,
 resume, and interleaved-claim constraints that define this implementation
 scope.
+
+---
+
+## D50 — 2026-09-24 — Load the restored dconf database into a running session
+
+**Status:** Implemented (portable restore)
+
+**Decision:** When a portable replay applies the source HOME's
+`.config/dconf/user` (identified like D41's known files, from the manifest source
+root plus sidecar logical path, so only VERSION=2 manifests qualify), replay hands
+a read-only fd of that entry's backup payload to the caller. After a complete
+replay and before packages, restore copies the payload into a private
+`/tmp/migr-dconf-*` directory, reads it with `dconf dump /` through a profile
+naming only that copy (`DCONF_PROFILE`, `XDG_CONFIG_HOME`), and applies the dump
+with `dconf load /` over the target user's session bus
+(`/run/user/<uid>/bus`). Under sudo both commands run as the invoking user,
+resolved as in D38. Keys absent from the backup keep their current values.
+
+With no session bus socket, nothing can hold the database in memory, so the
+restored file is already the result and no command runs. With no `dconf` on
+`PATH`, no dconf service can run either. A dump that fills its bounded buffer
+is never loaded. A failed dump or load is reported as a restore warning with
+the recovery path (log out, rerun from a text console).
+
+**Why:** The first real restore into a live GNOME session applied 87 of 238
+backed-up keys. `dconf-service` keeps the user database in memory and writes
+the whole file back on its next change, so a file replaced underneath it is
+lost. D44/D48 exclude `dconf/user` from read-back verification because it is
+live, which also hid the loss. The payload, not the destination file, is the
+source because the destination may already have been overwritten.
+
+**Rejected:** terminating `dconf-service` after replacing the file (a write
+between replacement and termination still wins, and running clients see no
+change notifications); only warning (leaves the user's desktop settings to a
+manual step); adding a text dump to the backup format (the binary database
+already carries the data).
+
+**Relationship:** Complements D44/D48 rather than replacing them: the byte-level
+read-back exclusion stays, because the file remains live after the load.

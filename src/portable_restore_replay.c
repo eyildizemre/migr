@@ -103,6 +103,7 @@ typedef struct {
     int skip_content_verification;
     void (*before_content_verification)(void *context);
     void *before_content_verification_context;
+    int *dconf_database_fd_out;
 } ReplayCollection;
 
 typedef struct {
@@ -1684,6 +1685,42 @@ static int replay_regular_is_locally_authoritative(
                   ".config/user-dirs.dirs") != 0)
         return 0;
     return strcmp(source_path, known_path) == 0;
+}
+
+static int replay_regular_is_dconf_database(const ReplayCollection *collection,
+                                            const ReplayEntry *replay)
+{
+    if (collection == NULL || collection->manifest == NULL || replay == NULL ||
+        replay->entry == NULL || replay->entry->kind != SIDECAR_KIND_REGULAR)
+        return 0;
+
+    char source_path[PATH_MAX], known_path[PATH_MAX];
+    if (replay_entry_source_path(collection, replay, source_path) != 0 ||
+        path_join(known_path, sizeof(known_path),
+                  collection->manifest->source_home,
+                  ".config/dconf/user") != 0)
+        return 0;
+    return strcmp(source_path, known_path) == 0;
+}
+
+// Hands the applied dconf database's payload to the caller (see
+// PortableRestoreRequest). Best-effort: without it the restored file is still
+// in place and only the running-session load is skipped.
+static void replay_capture_dconf_database(ReplayCollection *collection,
+                                          ReplayEntry *replay)
+{
+    if (collection->dconf_database_fd_out == NULL ||
+        *collection->dconf_database_fd_out >= 0 ||
+        !replay_regular_is_dconf_database(collection, replay))
+        return;
+    int saved = errno;
+    int fd = -1;
+    struct stat st;
+    if (replay_open_payload(collection,
+                            &collection->manifest->roots[replay->root_index],
+                            replay->entry, &fd, &st) == 0)
+        *collection->dconf_database_fd_out = fd;
+    errno = saved;
 }
 
 static int replay_write_all(int fd, const unsigned char *data, size_t length,
@@ -3411,6 +3448,8 @@ static int replay_run(ReplayCollection *collection)
         }
         if (replay->entry->kind == SIDECAR_KIND_DIRECTORY)
             replay->directory_state = REPLAY_DIRECTORY_PREPARED;
+        else if (replay->entry->kind == SIDECAR_KIND_REGULAR)
+            replay_capture_dconf_database(collection, replay);
         if (replay->entry->kind == SIDECAR_KIND_REGULAR &&
             replay_regular_is_locally_authoritative(collection, replay))
         {
@@ -3546,7 +3585,8 @@ int portable_restore_replay_at(const PortableRestoreRequest *request,
         .skip_content_verification = request->skip_content_verification,
         .before_content_verification = request->before_content_verification,
         .before_content_verification_context =
-            request->before_content_verification_context
+            request->before_content_verification_context,
+        .dconf_database_fd_out = request->dconf_database_fd_out
     };
     for (int index = 0; index < XDG_KEY_COUNT; index++)
         collection.xdg_anchor_fd[index] = -1;

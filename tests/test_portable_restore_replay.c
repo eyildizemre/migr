@@ -2117,6 +2117,111 @@ static int home_rewrite_fixture_open(Fixture *fixture, ManifestRoot roots[2],
     return 0;
 }
 
+static int run_replay_with_dconf(Fixture *fixture,
+                                 PortableRestoreReplayReport *report,
+                                 int *dconf_database_fd)
+{
+    Manifest manifest;
+    if (manifest_read_v1_at(fixture->container_fd, &manifest) !=
+            MANIFEST_STATUS_VALID)
+        return -1;
+    PortableRestoreRequest request = {
+        .source_container_fd = fixture->container_fd,
+        .manifest = &manifest,
+        .destination_home_fd = fixture->home_fd,
+        .destination_home_path = fixture->home,
+        .destination_timestamp_policy = {
+            .nsec_exact = 1,
+            .configured = 1
+        },
+        .dconf_database_fd_out = dconf_database_fd
+    };
+    portable_restore_replay_report_init(report);
+    int result = portable_restore_replay_at(&request, report);
+    manifest_free(&manifest);
+    return result;
+}
+
+static int dconf_fixture_open(Fixture *fixture, ManifestRoot roots[2],
+                              int version, const char *source_home)
+{
+    ManifestRoot initial = root_for();
+    if (fixture_open(fixture, &initial) != 0 ||
+        write_home_rewrite_manifest(fixture, roots, version, source_home) != 0)
+        return -1;
+    make_dir_at(fixture->data_fd, "BUILTIN_DOT_CONFIG", 0700);
+    int config_fd = openat(fixture->data_fd, "BUILTIN_DOT_CONFIG",
+                           O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (config_fd < 0)
+        fatal("could not open dconf config payload root");
+    make_dir_at(config_fd, "dconf", 0700);
+    write_file_at(config_fd, "dconf/user", "GVDB-backup");
+    write_file_at(config_fd, "dconf/other", "not-the-database");
+    close(config_fd);
+    make_dir_at(fixture->data_fd, "BUILTIN_LOCAL_SHARE", 0700);
+
+    SidecarEntry entries[] = {
+        entry_for("BUILTIN_DOT_CONFIG", "", "", SIDECAR_KIND_DIRECTORY,
+                  0, 0700, 1700000950, 1, 1700000951, 2),
+        entry_for("BUILTIN_DOT_CONFIG", "dconf", "dconf",
+                  SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000952, 3, 1700000953, 4),
+        entry_for("BUILTIN_DOT_CONFIG", "dconf/other", "dconf/other",
+                  SIDECAR_KIND_REGULAR, strlen("not-the-database"), 0600,
+                  1700000954, 5, 1700000955, 6),
+        entry_for("BUILTIN_DOT_CONFIG", "dconf/user", "dconf/user",
+                  SIDECAR_KIND_REGULAR, strlen("GVDB-backup"), 0600,
+                  1700000956, 7, 1700000957, 8),
+        entry_for("BUILTIN_LOCAL_SHARE", "", "", SIDECAR_KIND_DIRECTORY,
+                  0, 0700, 1700000958, 9, 1700000959, 10)
+    };
+    return write_sidecar(fixture, entries,
+                         sizeof(entries) / sizeof(entries[0]), NULL, NULL);
+}
+
+static void test_dconf_database_handoff(void)
+{
+    printf(BLUE "::" NC " replay hands back the applied dconf database\n");
+    ManifestRoot roots[2];
+    Fixture fixture;
+    int opened = dconf_fixture_open(&fixture, roots,
+                                    MANIFEST_SELECTION_VERSION, "/home/vii");
+    check(opened == 0, "dconf handoff fixture is created");
+    if (opened != 0)
+    {
+        fixture_close(&fixture);
+        return;
+    }
+    PortableRestoreReplayReport report;
+    int dconf_fd = -1;
+    check(run_replay_with_dconf(&fixture, &report, &dconf_fd) == 0 &&
+              report.failed_count == 0,
+          "replay with a dconf database succeeds");
+    char content[64] = {0};
+    ssize_t got = dconf_fd >= 0
+        ? pread(dconf_fd, content, sizeof(content) - 1U, 0) : -1;
+    check(got == (ssize_t)strlen("GVDB-backup") &&
+              strcmp(content, "GVDB-backup") == 0,
+          "the source HOME's .config/dconf/user payload is handed back");
+    if (dconf_fd >= 0)
+        close(dconf_fd);
+    fixture_close(&fixture);
+
+    opened = dconf_fixture_open(&fixture, roots, MANIFEST_CURRENT_VERSION,
+                                NULL);
+    check(opened == 0, "dconf fixture without a source HOME is created");
+    if (opened != 0)
+    {
+        fixture_close(&fixture);
+        return;
+    }
+    dconf_fd = -1;
+    check(run_replay_with_dconf(&fixture, &report, &dconf_fd) == 0 &&
+              dconf_fd == -1,
+          "without a recorded source HOME nothing is handed back");
+    fixture_close(&fixture);
+}
+
 static int xdg_home_rewrite_fixture_open(
     Fixture *fixture, ManifestRoot roots[4], const char *bookmarks,
     const char *recent)
@@ -3937,6 +4042,7 @@ static void test_collection_failure_reason_without_errno(void)
 
 int main(void)
 {
+    test_dconf_database_handoff();
     test_symlink_collection_validation();
     test_hardlink_identity_validation();
     test_physical_logical_mismatch();
