@@ -113,6 +113,7 @@ void backup_test_set_progress_hook(BackupTestProgressHook hook,
 
 void backup_test_set_network_config_source_dir(const char *backend_name,
                                                const char *source_dir);
+void backup_test_set_crypto_policy_source(const char *path);
 
 /* Runs after the final sync and before the journal is read back from the
  * destination, so a test can make the device's copy differ. */

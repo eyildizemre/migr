@@ -312,6 +312,11 @@ Restore reloads NetworkManager profiles automatically with `nmcli connection rel
 never auto-applied: applying them can interrupt connectivity, including an SSH
 session running restore. The output gives the manual command to use when ready;
 interface or profile placeholders must be replaced for the target system.
+The system crypto policy (`/etc/crypto-policies/config`, where present) is recorded
+as `network/crypto-policy`, since some saved connections, such as 802.1X networks
+that still need TLS 1.0, authenticate only under a relaxed policy. When the target
+uses a different policy, restore prints the `update-crypto-policies` command but
+never changes the policy itself.
 
 Explicit paths keep accepting valid sources both inside and outside `$HOME`. A root
 proven to be inside the source home is restored automatically to the same relative

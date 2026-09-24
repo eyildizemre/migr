@@ -44,6 +44,16 @@ int resolve_sudo_identity_for_test(const char *sudo_uid_env,
                                    char home_out[PATH_MAX]);
 #endif
 
+#define CRYPTO_POLICY_MAX 64
+/**
+ * @brief Reads the policy name from a crypto-policies config file such as
+ *        /etc/crypto-policies/config (first non-comment token, e.g.
+ *        "DEFAULT:SHA1"), relative to dir_fd (AT_FDCWD for an absolute
+ *        path). Returns -1 when unreadable or not a policy name.
+ */
+int crypto_policy_read_at(int dir_fd, const char *path,
+                          char out[CRYPTO_POLICY_MAX]);
+
 /** @brief Prints a complete error message, optionally in bold red. */
 void print_error(const char *fmt, ...);
 

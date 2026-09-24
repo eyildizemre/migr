@@ -1163,6 +1163,29 @@ static int copy_network_config_backend_at(
     return 0;
 }
 
+static const char *crypto_policy_source = "/etc/crypto-policies/config";
+
+#ifdef BACKUP_TEST_HOOKS
+void backup_test_set_crypto_policy_source(const char *path)
+{
+    crypto_policy_source = path != NULL ? path : "/etc/crypto-policies/config";
+}
+#endif
+
+// Saved connections can depend on the system crypto policy (for example
+// 802.1X networks that need TLS 1.0 under DEFAULT:SHA1). Restore only
+// suggests it, so a missing or unreadable policy is simply not recorded.
+static int record_crypto_policy_at(int network_fd)
+{
+    char policy[CRYPTO_POLICY_MAX];
+    if (crypto_policy_read_at(AT_FDCWD, crypto_policy_source, policy) != 0)
+        return 0;
+    char line[CRYPTO_POLICY_MAX + 1];
+    snprintf(line, sizeof(line), "%s\n", policy);
+    return write_container_text_file_at(network_fd, "crypto-policy", line) == 0
+        ? 0 : -1;
+}
+
 static int copy_network_config_at(int container_fd, CloneRepresentation repr,
                                   unsigned int present_mask,
                                   unsigned int *processed_mask)
@@ -1204,6 +1227,13 @@ static int copy_network_config_at(int container_fd, CloneRepresentation repr,
             break;
         }
         *processed_mask |= 1u << i;
+    }
+    if (!failed && record_crypto_policy_at(network_fd) != 0)
+    {
+        saved_errno = errno;
+        print_error("Error: --include-network-config: could not record the "
+                    "system crypto policy: %s\n", strerror(saved_errno));
+        failed = 1;
     }
 
     if (close(network_fd) != 0 && !failed)

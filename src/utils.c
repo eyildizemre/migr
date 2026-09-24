@@ -870,3 +870,38 @@ int confirm_action_default_yes(const char *message)
 {
     return confirm_action_with_default(message, 1);
 }
+
+int crypto_policy_read_at(int dir_fd, const char *path,
+                          char out[CRYPTO_POLICY_MAX])
+{
+    out[0] = '\0';
+    int fd = openat(dir_fd, path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    char buffer[4096];
+    ssize_t got = read(fd, buffer, sizeof(buffer) - 1U);
+    close(fd);
+    if (got < 0)
+        return -1;
+    buffer[got] = '\0';
+    for (char *line = buffer; line != NULL && *line != '\0';)
+    {
+        char *end = strchr(line, '\n');
+        if (end != NULL)
+            *end = '\0';
+        line += strspn(line, " \t");
+        size_t length = strcspn(line, " \t\r");
+        if (length != 0 && line[0] != '#')
+        {
+            if (length >= CRYPTO_POLICY_MAX ||
+                strspn(line, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+                             "0123456789:_-.") < length)
+                return -1;
+            memcpy(out, line, length);
+            out[length] = '\0';
+            return 0;
+        }
+        line = end != NULL ? end + 1 : NULL;
+    }
+    return -1;
+}

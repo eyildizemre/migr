@@ -3255,11 +3255,20 @@ static void test_network_config_restore_success(void)
     join_path(wifi_dest, sizeof(wifi_dest), dest_dir, "wifi.nmconnection");
     write_file_mode(office_dest, "stale", 0600);
 
+    char saved_policy[PATH_MAX], current_policy[PATH_MAX];
+    join_path(saved_policy, sizeof(saved_policy), source,
+              "network/crypto-policy");
+    join_path(current_policy, sizeof(current_policy), dest_parent,
+              "crypto-policies-config");
+    write_file_mode(saved_policy, "DEFAULT:SHA1\n", 0600);
+    write_file_mode(current_policy, "# comment\nDEFAULT\n", 0644);
+
     char reload_marker[PATH_MAX];
     join_path(reload_marker, sizeof(reload_marker), dest_parent,
               "reload.marker");
     restore_test_set_network_config_dest_dir("NetworkManager", dest_dir);
     restore_test_set_network_reload_hook(record_network_reload, reload_marker);
+    restore_test_set_crypto_policy_current(current_policy);
 
     int previous_dry_run = dry_run;
     dry_run = 0;
@@ -3267,6 +3276,7 @@ static void test_network_config_restore_success(void)
     int rc = run_restore_capturing_with_input(source, "y\n", output,
                                               sizeof(output));
     dry_run = previous_dry_run;
+    restore_test_set_crypto_policy_current(NULL);
     restore_test_set_network_reload_hook(NULL, NULL);
     restore_test_set_network_config_dest_dir("NetworkManager", NULL);
 
@@ -3286,6 +3296,13 @@ static void test_network_config_restore_success(void)
           "reload uses exactly sudo nmcli connection reload once");
     check(strstr(output, "Restored 2 network connection files") != NULL,
           "the live restore reports the number of applied connection files");
+    check(strstr(output, "used the crypto policy DEFAULT:SHA1 (this system: "
+                         "DEFAULT)") != NULL &&
+              strstr(output, "sudo update-crypto-policies --set DEFAULT:SHA1") !=
+                  NULL,
+          "a different source crypto policy is named with the command to apply it");
+    check(file_content_is(current_policy, "# comment\nDEFAULT\n"),
+          "the system crypto policy is never changed by the restore");
 
     remove_tree(source);
     remove_tree(home);
@@ -3313,14 +3330,23 @@ static void test_network_config_restore_dry_run(void)
     join_path(dest_dir, sizeof(dest_dir), dest_parent, "system-connections");
     join_path(reload_marker, sizeof(reload_marker), dest_parent,
               "reload.marker");
+    char saved_policy[PATH_MAX], current_policy[PATH_MAX];
+    join_path(saved_policy, sizeof(saved_policy), source,
+              "network/crypto-policy");
+    join_path(current_policy, sizeof(current_policy), dest_parent,
+              "crypto-policies-config");
+    write_file_mode(saved_policy, "DEFAULT:SHA1\n", 0600);
+    write_file_mode(current_policy, "DEFAULT:SHA1\n", 0644);
     restore_test_set_network_config_dest_dir("NetworkManager", dest_dir);
     restore_test_set_network_reload_hook(record_network_reload, reload_marker);
+    restore_test_set_crypto_policy_current(current_policy);
 
     int previous_dry_run = dry_run;
     dry_run = 1;
     char output[8192];
     int rc = run_restore_capturing(source, output, sizeof(output));
     dry_run = previous_dry_run;
+    restore_test_set_crypto_policy_current(NULL);
     restore_test_set_network_reload_hook(NULL, NULL);
     restore_test_set_network_config_dest_dir("NetworkManager", NULL);
 
@@ -3332,6 +3358,8 @@ static void test_network_config_restore_dry_run(void)
           "network dry-run does not create the destination directory");
     check(access(reload_marker, F_OK) != 0,
           "network dry-run never invokes the reload command");
+    check(strstr(output, "crypto policy") == NULL,
+          "a matching crypto policy prints no hint");
 
     remove_tree(source);
     remove_tree(home);

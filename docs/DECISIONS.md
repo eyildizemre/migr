@@ -4205,3 +4205,24 @@ repository is only a download cache that Flatpak fetches again.
 
 **Relationship:** A narrow first step of backup-scope-overhaul's Flatpak
 adapter; recording and reinstalling deployed refs remains future work.
+
+## D58 — 2026-09-24 — Network capture records the crypto policy; restore only suggests it
+
+**Status:** Implemented
+
+**Decision:** With `--include-network-config`, backup reads the policy name
+from `/etc/crypto-policies/config` (first non-comment token, limited to
+letters, digits, and `:_-.`) and writes it as `network/crypto-policy`. A
+missing, unreadable, or unrecognized file records nothing; failing to write the
+record fails the network capture like any other network file. Restore compares
+it with the target's policy and, when they differ, prints the
+`sudo update-crypto-policies --set <policy>` command. It never runs it.
+
+**Why:** On real hardware the restored 802.1X (PEAP/MSCHAPv2) profiles needed
+TLS 1.0. Their keyfiles carried `phase1-auth-flags`, but the source system also
+relied on the `DEFAULT:SHA1` policy, which had to be re-applied by hand. The
+policy is a machine-wide security setting, so changing it is left to the user,
+with the exact command in hand.
+
+**Relationship:** Extends D54's network restore. Older restores ignore the
+extra file because they only open the known backend directories.

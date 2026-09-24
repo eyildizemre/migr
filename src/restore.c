@@ -629,6 +629,31 @@ static void restore_dconf_settings(int database_fd, int *had_error)
     }
 }
 
+static const char *crypto_policy_current = "/etc/crypto-policies/config";
+
+#ifdef RESTORE_TEST_HOOKS
+void restore_test_set_crypto_policy_current(const char *path)
+{
+    crypto_policy_current = path != NULL ? path : "/etc/crypto-policies/config";
+}
+#endif
+
+// Suggests, never applies, the source system's crypto policy: changing it is a
+// system-wide security decision the user makes.
+static void restore_crypto_policy_hint(int network_fd)
+{
+    char saved[CRYPTO_POLICY_MAX], current[CRYPTO_POLICY_MAX];
+    if (crypto_policy_read_at(network_fd, "crypto-policy", saved) != 0 ||
+        crypto_policy_read_at(AT_FDCWD, crypto_policy_current, current) != 0 ||
+        strcmp(saved, current) == 0)
+        return;
+    printf("\nSystem crypto policy\n");
+    printf("  The source system used the crypto policy %s (this system: %s). "
+           "If restored Wi-Fi (802.1X) or VPN connections fail to "
+           "authenticate, apply it with: sudo update-crypto-policies --set %s\n",
+           saved, current, saved);
+}
+
 // A native container mirrors each root under data/<payload>, so the dconf
 // database of the root captured from HOME/.config is at a fixed place.
 static int native_dconf_database_fd(int source_root_fd, const Manifest *m)
@@ -842,6 +867,7 @@ static void restore_network_config(int source_root_fd, int *had_error)
                           "yourself, or restart NetworkManager, to apply them.\n");
         }
     }
+    restore_crypto_policy_hint(network_fd);
     if (!found_backend)
     {
         print_error("Error: manifest declares network configuration, but none "

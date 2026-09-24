@@ -2364,6 +2364,14 @@ static void test_include_network_config_backup(void)
     backup_test_set_network_config_source_dir("systemd-networkd",
                                               missing_networkd);
 
+    char policy_source[PATH_MAX], policy_expected[PATH_MAX];
+    join_path(policy_source, sizeof(policy_source), home, "crypto-policy-config");
+    join_path(policy_expected, sizeof(policy_expected), home,
+              "crypto-policy-expected");
+    write_file(policy_source, "# system-wide crypto policy\n\n  DEFAULT:SHA1 \n");
+    write_file(policy_expected, "DEFAULT:SHA1\n");
+    backup_test_set_crypto_policy_source(policy_source);
+
     char live_target[PATH_MAX];
     fresh_mkdtemp(live_target, sizeof(live_target), "plan_network_live");
     dry_run = 0;
@@ -2399,6 +2407,12 @@ static void test_include_network_config_backup(void)
         check(files_are_equal(wifi, copied_wifi) &&
                   files_are_equal(vpn, copied_vpn),
               "NetworkManager files are copied byte-for-byte under network/networkmanager/");
+
+        char copied_policy[PATH_MAX];
+        join_path(copied_policy, sizeof(copied_policy), network_dir,
+                  "crypto-policy");
+        check(files_are_equal(policy_expected, copied_policy),
+              "the system crypto policy name is recorded as network/crypto-policy");
 
         struct stat source_st, copied_st;
         int source_mode_ok = stat(wifi, &source_st) == 0;
@@ -2442,6 +2456,7 @@ static void test_include_network_config_backup(void)
     backup_test_set_network_config_source_dir("netplan", missing_netplan);
     backup_test_set_network_config_source_dir("systemd-networkd",
                                               missing_networkd);
+    write_file(policy_source, "# no policy line\nnot/a/policy\n");
     char empty_target[PATH_MAX];
     fresh_mkdtemp(empty_target, sizeof(empty_target), "plan_network_empty_target");
     char empty_output[8192];
@@ -2459,6 +2474,16 @@ static void test_include_network_config_backup(void)
     check(empty_rc == 0 && have_empty_container && dir_exists(empty_network) &&
               dir_exists(empty_nm) && directory_empty(empty_nm),
           "an empty readable backend creates its empty subdirectory and still succeeds");
+    if (have_empty_container)
+    {
+        char empty_policy[PATH_MAX];
+        struct stat policy_st;
+        join_path(empty_policy, sizeof(empty_policy), empty_network,
+                  "crypto-policy");
+        check(lstat(empty_policy, &policy_st) != 0 && errno == ENOENT,
+              "an unrecognized crypto policy file is not recorded");
+    }
+    backup_test_set_crypto_policy_source(NULL);
     if (have_empty_container)
     {
         Manifest manifest;
