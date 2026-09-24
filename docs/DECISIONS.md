@@ -3657,7 +3657,7 @@ prefix substitution.
 
 ## D42 — 2026-09-10 — Portable restore verifies applied content before success
 
-**Status:** Implemented
+**Status:** Implemented; superseded in part by D53
 
 **Decision:** A live portable restore performs a post-copy verification pass by
 default after replay has applied file content and metadata and before the restore
@@ -4076,3 +4076,31 @@ on a resume that actually has a tail.
 **Relationship:** Keeps D25/D49's recovery rule (discard back to the last
 complete boundary) and only changes how the discard is performed. D51 checks
 the result from the device before publishing.
+
+---
+
+## D53 — 2026-09-24 — Verification reports every mismatch and no longer blocks dependent restore steps
+
+**Status:** Implemented
+
+**Decision:** D42's read-back pass now checks every non-excluded item even after
+a mismatch. The first mismatch remains the report's failing root/path and cause;
+every mismatch is counted, and up to eight are listed after the pass. Because
+verification runs only after every entry has been applied, a pass with
+mismatches ends in a distinct `PORTABLE_RESTORE_VERIFICATION_FAILED` outcome.
+Restore then still runs dconf (D50), package, and network restoration, and exits
+with an error summary pointing at the listed items. A content mismatch reads
+"content differs from the backup" instead of the internal `EIO`'s "Input/output
+error". Apply-phase failures keep the `PORTABLE_RESTORE_ERROR` outcome and still
+skip every dependent step.
+
+**Why:** On real hardware a live-state lock file rewritten by a background
+service stopped verification at item 1,922 of 158,956. The remaining items were
+never checked, and packages and network configuration were skipped although all
+files were already on disk, which forced a full rerun. A mismatch found after
+application does not make the dependent steps less valid; it makes the specific
+items suspect, which listing them all addresses.
+
+**Relationship:** Supersedes D42's rule that a failed verification cannot be
+followed by package and network restoration. D42's default-on verification, its
+failure status, and D44/D48's exclusions are unchanged.

@@ -680,7 +680,8 @@ typedef enum {
     VERIFICATION_MUTATION_REPLACE_FILE_WITH_SYMLINK,
     VERIFICATION_MUTATION_REPLACE_PARENT_WITH_SYMLINK,
     VERIFICATION_MUTATION_REPLACE_SYMLINK_TARGET,
-    VERIFICATION_MUTATION_REPLACE_HARDLINK_ALIAS
+    VERIFICATION_MUTATION_REPLACE_HARDLINK_ALIAS,
+    VERIFICATION_MUTATION_REWRITE_TWO_OF_THREE
 } VerificationMutation;
 
 static Fixture *verification_mutation_fixture;
@@ -735,6 +736,10 @@ static void mutate_after_replay_apply(void)
             if (unlinkat(root_fd, "alias", 0) != 0)
                 fatal("could not remove restored hardlink alias");
             write_file_at(root_fd, "alias", "hardlink payload");
+            break;
+        case VERIFICATION_MUTATION_REWRITE_TWO_OF_THREE:
+            write_file_at(root_fd, "a", "AAAA");
+            write_file_at(root_fd, "c", "CCCC");
             break;
         case VERIFICATION_MUTATION_NONE:
             break;
@@ -1745,6 +1750,48 @@ static void test_regular_content_verification(void)
     }
 }
 
+static void test_verification_checks_every_item(void)
+{
+    printf(BLUE "::" NC " portable verification checks every item after a mismatch\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "multi-mismatch verification fixture is created");
+    if (opened != 0)
+        return;
+    make_dir_at(fixture.data_fd, "ROOT", 0700);
+    write_file_at(fixture.data_fd, "ROOT/a", "aaaa");
+    write_file_at(fixture.data_fd, "ROOT/b", "bbbb");
+    write_file_at(fixture.data_fd, "ROOT/c", "cccc");
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000960, 1, 1700000961, 2),
+        entry_for("ROOT", "a", "a", SIDECAR_KIND_REGULAR, 4, 0600,
+                  1700000962, 3, 1700000963, 4),
+        entry_for("ROOT", "b", "b", SIDECAR_KIND_REGULAR, 4, 0600,
+                  1700000964, 5, 1700000965, 6),
+        entry_for("ROOT", "c", "c", SIDECAR_KIND_REGULAR, 4, 0600,
+                  1700000966, 7, 1700000967, 8)
+    };
+    check(write_sidecar(&fixture, entries, 4, NULL, NULL) == 0,
+          "multi-mismatch sidecar is committed");
+
+    set_verification_mutation(&fixture, VERIFICATION_MUTATION_REWRITE_TWO_OF_THREE);
+    PortableRestoreReplayReport report;
+    int result = run_replay(&fixture, &report);
+    clear_verification_mutation();
+    check(result != 0 && report.applied_count == 4 &&
+              report.verification_checked_count == 3 &&
+              report.verification_failed_count == 2 &&
+              report.failed_count == 2,
+          "verification continues past the first mismatch and counts every one");
+    check(strcmp(report.failed_logical_path, "a") == 0 &&
+              report.failure_step ==
+                  PORTABLE_RESTORE_REPLAY_FAILURE_COMPARE_DESTINATION_CONTENT,
+          "the first mismatch remains the reported failure");
+    fixture_close(&fixture);
+}
+
 static void test_verification_refuses_destination_symlink_replacement(void)
 {
     printf(BLUE "::" NC " portable verification refuses destination symlink replacement\n");
@@ -1962,7 +2009,7 @@ static void test_hardlink_content_verification(void)
         PortableRestoreReplayReport report;
         int result = run_replay(&replaced, &report);
         clear_verification_mutation();
-        check(result != 0 && report.verification_checked_count == 1 &&
+        check(result != 0 && report.verification_checked_count == 2 &&
                   report.verification_failed_count == 1 &&
                   strcmp(report.failed_logical_path, "alias") == 0 &&
                   report.failed_kind_valid &&
@@ -4047,6 +4094,7 @@ static void test_collection_failure_reason_without_errno(void)
 
 int main(void)
 {
+    test_verification_checks_every_item();
     test_dconf_database_handoff();
     test_symlink_collection_validation();
     test_hardlink_identity_validation();

@@ -163,6 +163,18 @@ static PortableRestoreOutcome portable_restore_orchestrate_impl(
     }
 
     result = portable_restore_replay_at(&replay_request, report);
+    if (result != 0 && report->verification_failed_count != 0)
+    {
+        printf("Portable restore applied %zu item%s; %zu of %zu verified "
+               "item%s differ%s from the backup\n",
+               report->applied_count, report->applied_count == 1 ? "" : "s",
+               report->verification_failed_count,
+               report->verification_checked_count,
+               report->verification_checked_count == 1 ? "" : "s",
+               report->verification_failed_count == 1 ? "s" : "");
+        portable_restore_preflight_report_free(&preflight);
+        return PORTABLE_RESTORE_VERIFICATION_FAILED;
+    }
     if (result != 0)
     {
         char reason[256];
@@ -210,5 +222,7 @@ int portable_restore_at(const PortableRestoreRequest *request,
                    "that the destination could not apply\n",
                    report->skipped_security_xattr_count);
     }
-    return outcome == PORTABLE_RESTORE_ERROR ? -1 : 0;
+    return outcome == PORTABLE_RESTORE_ERROR ||
+                   outcome == PORTABLE_RESTORE_VERIFICATION_FAILED
+               ? -1 : 0;
 }

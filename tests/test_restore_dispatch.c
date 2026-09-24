@@ -36,6 +36,7 @@
 #include "packages.h"
 #include "restore.h"
 #include "portable_restore_internal.h"
+#include "portable_restore_replay_internal.h"
 #include "sidecar.h"
 #include "utils.h"
 
@@ -1958,6 +1959,133 @@ static void test_network_config_and_foreign_owner_refusal(void)
     remove_tree(home);
 }
 
+static char verification_mutation_path[PATH_MAX];
+
+static void rewrite_restored_file_after_apply(void)
+{
+    write_file_mode(verification_mutation_path, "changed", 0600);
+}
+
+static int package_marker_probe(char *const argv[], void *context)
+{
+    (void)argv;
+    PackagePrivilegeProbe *probe = context;
+    int fd = open(probe->marker_path,
+                  O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0)
+        return -1;
+    return close(fd);
+}
+
+static void test_verification_failure_still_restores_packages(void)
+{
+    printf(BLUE "::" NC " restore dispatch: packages still run after a verification mismatch\n");
+
+    char source[PATH_MAX], home[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_verify_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_verify_home");
+    setenv("HOME", home, 1);
+
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "ROOT");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "ROOT");
+    strcpy(root.source_path, "/source/ROOT");
+    strcpy(root.restore_path, "restored");
+    root.has_restore_path = 1;
+
+    Manifest manifest;
+    make_v1_manifest(&manifest, &root, 1);
+    manifest.representation = CLONE_PORTABLE_SIDECAR;
+    manifest.sidecar_version = SIDECAR_VERSION;
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write portable manifest for verification mismatch");
+    write_payload_file(source, "data/ROOT", "file", "payload");
+    char packages_path[PATH_MAX];
+    join_path(packages_path, sizeof(packages_path), source, "packages.txt");
+    write_file_mode(packages_path, "fixture-package\n", 0644);
+
+    char payload_root[PATH_MAX];
+    join_path(payload_root, sizeof(payload_root), source, "data/ROOT");
+    struct stat root_st;
+    if (stat(payload_root, &root_st) != 0)
+    {
+        check(0, "fixture: inspect portable payload root");
+        remove_tree(source);
+        remove_tree(home);
+        return;
+    }
+    uint32_t uid = (uint32_t)geteuid();
+    uint32_t gid = (uint32_t)getegid();
+    SidecarEntry root_entry = {
+        .root_id = sidecar_text("ROOT"),
+        .logical_path = sidecar_text(""),
+        .physical_leaf = sidecar_text(""),
+        .kind = SIDECAR_KIND_DIRECTORY,
+        .mode = 0700, .uid = uid, .gid = gid,
+        .atime_sec = 1700000700, .mtime_sec = 1700000701,
+        .size = (uint64_t)root_st.st_size
+    };
+    SidecarEntry file_entry = {
+        .root_id = sidecar_text("ROOT"),
+        .logical_path = sidecar_text("file"),
+        .physical_leaf = sidecar_text("file"),
+        .kind = SIDECAR_KIND_REGULAR,
+        .mode = 0600, .uid = uid, .gid = gid,
+        .atime_sec = 1700000710, .mtime_sec = 1700000711,
+        .size = strlen("payload")
+    };
+    int container_fd = open(source, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    SidecarLog sidecar = {0};
+    int sidecar_created = container_fd >= 0 &&
+        sidecar_log_create_at(container_fd, &sidecar) == SIDECAR_OPEN_FRESH;
+    int sidecar_ok = sidecar_created &&
+        append_committed_sidecar_entry(&sidecar, &root_entry) == 0 &&
+        append_committed_sidecar_entry(&sidecar, &file_entry) == 0;
+    if (sidecar_created && sidecar_log_close(&sidecar) != SIDECAR_STATUS_OK)
+        sidecar_ok = 0;
+    if (container_fd >= 0 && close(container_fd) != 0)
+        sidecar_ok = 0;
+    check(sidecar_ok, "fixture: commit portable sidecar for verification mismatch");
+    if (!sidecar_ok)
+    {
+        remove_tree(source);
+        remove_tree(home);
+        return;
+    }
+
+    join_path(verification_mutation_path, sizeof(verification_mutation_path),
+              home, "restored/file");
+    PackagePrivilegeProbe probe = {0};
+    join_path(probe.marker_path, sizeof(probe.marker_path), home,
+              "package-install-hook-called");
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    packages_test_set_restore_hooks(DISTRO_FEDORA, package_marker_probe,
+                                    package_progress_capture, &probe);
+    portable_restore_replay_test_set_after_apply_hook(
+        rewrite_restored_file_after_apply);
+    char output[16384];
+    int rc = run_restore_capturing_with_input(source, "y\n", output,
+                                               sizeof(output));
+    portable_restore_replay_test_set_after_apply_hook(NULL);
+    packages_test_clear_restore_hooks();
+    dry_run = previous_dry_run;
+
+    check(rc != 0 &&
+              strstr(output, "ROOT:file (regular file, content differs from "
+                             "the backup)") != NULL &&
+              strstr(output, "1 differs from the backup (listed above)") != NULL,
+          "the mismatch is listed and the restore ends with an error");
+    struct stat marker;
+    check(stat(probe.marker_path, &marker) == 0,
+          "packages are still restored once every file was applied");
+
+    remove_tree(source);
+    remove_tree(home);
+}
+
 static void test_dispatch_refuses_portable_v1(void)
 {
     printf(BLUE "::" NC " restore dispatch: portable v1 payload is never interpreted as a native tree\n");
@@ -3455,6 +3583,7 @@ int main(void)
     test_dispatch_refuses_partial_source();
     test_dispatch_requires_v1_manifest_for_final_container_name();
     test_dispatch_refuses_portable_v1();
+    test_verification_failure_still_restores_packages();
     test_portable_replay_failure_names_entry();
     test_v1_refuses_missing_declared_payloads();
 

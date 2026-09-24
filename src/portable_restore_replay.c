@@ -47,6 +47,13 @@ typedef struct {
     unsigned char directory_state;
 } ReplayEntry;
 
+#define REPLAY_VERIFICATION_EXAMPLES 8
+
+typedef struct {
+    char location[MANIFEST_ID_MAX + PATH_MAX + 2];
+    char reason[256];
+} ReplayVerificationExample;
+
 enum {
     REPLAY_DIRECTORY_UNTOUCHED = 0,
     REPLAY_DIRECTORY_PREPARED,
@@ -2767,17 +2774,6 @@ static void replay_verification_progress_finish(
     display->active = 0;
 }
 
-static void replay_verification_progress_cancel(
-    ReplayVerificationProgress *display)
-{
-    if (display == NULL || !display->active)
-        return;
-    replay_verification_progress_stop_ticker(display);
-    putchar('\n');
-    fflush(stdout);
-    display->active = 0;
-}
-
 static int replay_open_existing_relative_parent_cached(
     ReplayCollection *collection, int base_fd, const char *relative,
     int *parent_out, char *leaf, size_t leaf_size)
@@ -3339,6 +3335,8 @@ static int replay_verify_content(ReplayCollection *collection)
         before_content_verification_hook();
 #endif
 
+    ReplayVerificationExample examples[REPLAY_VERIFICATION_EXAMPLES];
+    size_t example_count = 0;
     ReplayVerificationProgress progress;
     replay_verification_progress_start(&progress, total_count);
     for (size_t index = 0; index < collection->count; index++)
@@ -3377,18 +3375,49 @@ static int replay_verify_content(ReplayCollection *collection)
             &progress, collection->report->verification_checked_count, 0);
         if (result != 0)
         {
+            // Every item is already applied, so keep checking: one mismatch
+            // must not hide the rest. The first one stays the reported one.
             if (collection->report->verification_failed_count != SIZE_MAX)
                 collection->report->verification_failed_count++;
-            replay_verification_progress_cancel(&progress);
-            replay_report_apply_failure(
-                collection->report, collection->manifest, replay->root_index,
-                replay->entry, &failure);
-            return -1;
+            if (collection->report->verification_failed_count == 1)
+                replay_report_apply_failure(
+                    collection->report, collection->manifest,
+                    replay->root_index, replay->entry, &failure);
+            else if (collection->report->failed_count != SIZE_MAX)
+                collection->report->failed_count++;
+            if (example_count < REPLAY_VERIFICATION_EXAMPLES)
+            {
+                ReplayVerificationExample *example = &examples[example_count++];
+                PortableRestoreReplayReport scratch;
+                portable_restore_replay_report_init(&scratch);
+                replay_report_apply_failure(
+                    &scratch, collection->manifest, replay->root_index,
+                    replay->entry, &failure);
+                snprintf(example->location, sizeof(example->location),
+                         "%s:%s", scratch.failed_root_id,
+                         scratch.failed_logical_path[0] != '\0'
+                             ? scratch.failed_logical_path : ".");
+                if (replay_failure_reason_format(&scratch, example->reason,
+                                                 sizeof(example->reason)) != 1)
+                    example->reason[0] = '\0';
+            }
         }
     }
     replay_verification_progress_finish(
         &progress, collection->report->verification_checked_count);
-    return 0;
+    size_t failed = collection->report->verification_failed_count;
+    if (failed == 0)
+        return 0;
+    printf("Verification found %zu restored item%s that differ%s from the "
+           "backup:\n", failed, failed == 1 ? "" : "s", failed == 1 ? "s" : "");
+    for (size_t index = 0; index < example_count; index++)
+        printf("  %s%s%s%s\n", examples[index].location,
+               examples[index].reason[0] != '\0' ? " (" : "",
+               examples[index].reason,
+               examples[index].reason[0] != '\0' ? ")" : "");
+    if (failed > example_count)
+        printf("  ... and %zu more\n", failed - example_count);
+    return -1;
 }
 
 /* Replay creates directories 0700 (owned by the restoring user) and applies

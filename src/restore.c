@@ -2533,10 +2533,12 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         restore_progress_finish_phase(&progress_phase);
 
         int had_portable_error = 0;
-        if (outcome == PORTABLE_RESTORE_COMPLETE)
+        if (outcome == PORTABLE_RESTORE_COMPLETE ||
+            outcome == PORTABLE_RESTORE_VERIFICATION_FAILED)
         {
+            // Every entry was applied, so the dependent steps still run even
+            // when verification found differences; those are reported below.
             restore_dconf_settings(dconf_database_fd, &had_portable_error);
-            // Packages are published only after a fully successful replay.
             restore_packages(source_root_fd, home, &had_portable_error);
             if (m.has_network_config)
                 restore_network_config(source_root_fd, &had_portable_error);
@@ -2577,6 +2579,17 @@ int restore_with_options(const char *source, const RestoreOptions *options)
             case PORTABLE_RESTORE_CANCELLED:
                 printf("Cancelled.\n");
                 break;
+            case PORTABLE_RESTORE_VERIFICATION_FAILED:
+            {
+                char item_phrase[64];
+                format_item_count_phrase(item_phrase, sizeof(item_phrase),
+                                         report.applied_count, "restored");
+                printf("Restore finished with errors: %s, %zu differ%s from "
+                       "the backup (listed above)\n",
+                       item_phrase, report.verification_failed_count,
+                       report.verification_failed_count == 1 ? "s" : "");
+                break;
+            }
             case PORTABLE_RESTORE_ERROR:
             default:
             {
@@ -2614,7 +2627,9 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         manifest_free(&m);
         close(home_fd);
         close(source_root_fd);
-        return (outcome == PORTABLE_RESTORE_ERROR || had_portable_error) ? 1 : 0;
+        return (outcome == PORTABLE_RESTORE_ERROR ||
+                outcome == PORTABLE_RESTORE_VERIFICATION_FAILED ||
+                had_portable_error) ? 1 : 0;
     }
 
     if (mst == MANIFEST_STATUS_VALID &&

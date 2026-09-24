@@ -41,7 +41,10 @@ typedef enum {
     PORTABLE_RESTORE_COMPLETE,
     PORTABLE_RESTORE_DRY_RUN,
     PORTABLE_RESTORE_CANCELLED,
-    PORTABLE_RESTORE_ERROR
+    PORTABLE_RESTORE_ERROR,
+    /* Every entry was applied, but read-back verification found items that
+     * differ from the backup (report->verification_failed_count). */
+    PORTABLE_RESTORE_VERIFICATION_FAILED
 } PortableRestoreOutcome;
 
 typedef struct {
