@@ -3125,6 +3125,29 @@ static void test_network_config_restore_backend_modes(void)
     join_path(path, sizeof(path), wpa_dest, "wpa_supplicant.conf");
     check(file_matches(path, "network={}\n", 0600),
           "wpa_supplicant configuration holding keys is written 0600");
+    check(strstr(output, "sudo systemctl restart wpa_supplicant@") != NULL,
+          "without NetworkManager the wpa_supplicant restart hint is shown");
+
+    // Every backend in the fixture stays redirected: a root test run must
+    // never write into the real /etc.
+    restore_test_set_network_config_dest_dir("systemd-networkd", networkd_dest);
+    restore_test_set_network_config_dest_dir("wpa_supplicant", wpa_dest);
+    restore_test_set_network_config_group_file(group_file);
+    restore_test_set_network_manager_runtime_dir(dest_parent);
+    dry_run = 0;
+    rc = run_restore_capturing_with_input(source, "y\n", output,
+                                          sizeof(output));
+    dry_run = previous_dry_run;
+    restore_test_set_network_manager_runtime_dir("/nonexistent/migr-test-nm");
+    restore_test_set_network_config_group_file(NULL);
+    restore_test_set_network_config_dest_dir("systemd-networkd", NULL);
+    restore_test_set_network_config_dest_dir("wpa_supplicant", NULL);
+    check(rc == 0 &&
+              strstr(output, "NetworkManager manages Wi-Fi on this system") !=
+                  NULL &&
+              strstr(output, "sudo systemctl restart wpa_supplicant@") == NULL,
+          "with NetworkManager running the wpa_supplicant files need no "
+          "restart");
 
     remove_tree(source);
     remove_tree(home);
@@ -3714,6 +3737,8 @@ static void test_network_config_roundtrip(const char *backend_name,
 
 int main(void)
 {
+    // Network hints must not depend on whether this machine runs NetworkManager.
+    restore_test_set_network_manager_runtime_dir("/nonexistent/migr-test-nm");
     printf(BLUE "::" NC " restore dispatch (unit)\n");
 
     dry_run = 1; // inherited by every fork()ed restore() call below; no confirm_action() prompt is ever reached

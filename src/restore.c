@@ -103,6 +103,23 @@ void restore_test_set_progress_force(int force)
 #endif
 
 static const char *network_config_group_file = "/etc/group";
+static const char *network_manager_runtime_dir = "/run/NetworkManager";
+
+#ifdef RESTORE_TEST_HOOKS
+void restore_test_set_network_manager_runtime_dir(const char *path)
+{
+    network_manager_runtime_dir =
+        path != NULL ? path : "/run/NetworkManager";
+}
+#endif
+
+// NetworkManager drives wpa_supplicant over D-Bus with its own profiles, so
+// on such a system the files in /etc/wpa_supplicant are not read by anything.
+static int network_manager_is_running(void)
+{
+    struct stat st;
+    return lstat(network_manager_runtime_dir, &st) == 0 && S_ISDIR(st.st_mode);
+}
 
 #ifdef RESTORE_TEST_HOOKS
 void restore_test_set_network_config_group_file(const char *path)
@@ -756,7 +773,16 @@ static void restore_network_config(int source_root_fd, int *had_error)
         if (backend->apply_mode == NETWORK_CONFIG_APPLY_RELOAD)
             printf("  Restored %zu network connection file%s\n",
                    restored, restored == 1 ? "" : "s");
-        if (backend->apply_mode == NETWORK_CONFIG_APPLY_MANUAL)
+        if (backend->apply_mode == NETWORK_CONFIG_APPLY_MANUAL &&
+            strcmp(backend->name, "wpa_supplicant") == 0 &&
+            network_manager_is_running())
+        {
+            printf("  Restored %zu %s file(s) to %s/. NetworkManager manages "
+                   "Wi-Fi on this system and does not read them; they were "
+                   "restored for reference and need no restart.\n",
+                   restored, backend->name, dest_dir);
+        }
+        else if (backend->apply_mode == NETWORK_CONFIG_APPLY_MANUAL)
         {
             printf("  Restored %zu %s file(s) to %s/. Run `%s` yourself when "
                    "ready. This can briefly interrupt network connectivity, "
