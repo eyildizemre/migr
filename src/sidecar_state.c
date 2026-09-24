@@ -4,6 +4,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -678,6 +679,78 @@ fail:
     return status;
 }
 
+/* Copies the journal's valid prefix into a new file and renames it over the
+ * slot, instead of shrinking the slot in place. On real exFAT media, a cluster
+ * freed by ftruncate() was later handed to another object in the container
+ * while the re-extended journal still wrote to it. A fresh file gets fresh
+ * clusters, and the old ones leave with the old inode. The original stays
+ * intact until the rename. */
+static int rewrite_sidecar_prefix(int container_fd, int source_fd,
+                                  off_t length, int *out_fd)
+{
+    if (unlinkat(container_fd, SIDECAR_REWRITE_NAME, 0) != 0 &&
+        errno != ENOENT)
+        return -1;
+    int fd = openat(container_fd, SIDECAR_REWRITE_NAME,
+                    O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0)
+        return -1;
+
+    unsigned char buffer[65536];
+    off_t offset = 0;
+    while (offset < length)
+    {
+        size_t want = (uint64_t)(length - offset) < sizeof(buffer)
+            ? (size_t)(length - offset) : sizeof(buffer);
+        ssize_t got = pread(source_fd, buffer, want, offset);
+        if (got < 0 && errno == EINTR)
+            continue;
+        if (got <= 0)
+        {
+            if (got == 0)
+                errno = EIO;
+            goto fail;
+        }
+        size_t done = 0;
+        while (done < (size_t)got)
+        {
+            ssize_t written = write(fd, buffer + done, (size_t)got - done);
+            if (written < 0 && errno == EINTR)
+                continue;
+            if (written <= 0)
+            {
+                if (written == 0)
+                    errno = EIO;
+                goto fail;
+            }
+            done += (size_t)written;
+        }
+        offset += got;
+    }
+    if (fsync(fd) != 0 ||
+        renameat(container_fd, SIDECAR_REWRITE_NAME,
+                 container_fd, SIDECAR_SLOT_NAME) != 0)
+        goto fail;
+    if (fsync(container_fd) != 0)
+    {
+        int saved = errno;
+        close(fd);
+        errno = saved;
+        return -1;
+    }
+    *out_fd = fd;
+    return 0;
+
+fail:
+    {
+        int saved = errno;
+        close(fd);
+        (void)unlinkat(container_fd, SIDECAR_REWRITE_NAME, 0);
+        errno = saved;
+    }
+    return -1;
+}
+
 SidecarOpenStatus sidecar_log_adopt_at(int container_fd, SidecarLog *out)
 {
     if (container_fd < 0 || out == NULL || out->implementation != NULL)
@@ -741,11 +814,22 @@ SidecarOpenStatus sidecar_log_adopt_at(int container_fd, SidecarLog *out)
         }
         clear_entry(&log->memory, &log->pending.entry);
         log->pending.xattrs_seen = 0;
-        if (ftruncate(fd, truncate_offset) != 0)
+        int rewritten_fd = -1;
+        if (rewrite_sidecar_prefix(container_fd, fd, truncate_offset,
+                                   &rewritten_fd) != 0)
         {
             status = SIDECAR_OPEN_IO_ERROR;
             goto fail;
         }
+        (void)close(fd);
+        fd = rewritten_fd;
+        log->fd = rewritten_fd;
+    }
+    else if (unlinkat(container_fd, SIDECAR_REWRITE_NAME, 0) != 0 &&
+             errno != ENOENT)
+    {
+        status = SIDECAR_OPEN_IO_ERROR;
+        goto fail;
     }
 
     out->implementation = log;

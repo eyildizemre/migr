@@ -4049,3 +4049,30 @@ failure to the moment the source machine still exists.
 the preceding sync guarantees; it cannot prove that later reads will match.
 Payload files are not read back; a capture-time content digest would be the
 basis for verifying them.
+
+---
+
+## D52 — 2026-09-24 — Journal adoption rewrites the recovered prefix instead of truncating in place
+
+**Status:** Implemented
+
+**Decision:** When `sidecar_log_adopt_at()` finds a truncated tail, it copies
+the journal up to the last valid boundary into `sidecar.migr.rewrite`, `fsync`s
+it, renames it over `sidecar.migr`, `fsync`s the container directory, and
+continues the log on the new file. It no longer calls `ftruncate()` on the slot.
+A rewrite file left by an interrupted adoption is removed at the start of the
+next adoption. The original journal is untouched until the rename, so a crash at
+any point leaves either the old journal with its tail or the rewritten prefix.
+
+**Why:** On a real exFAT stick, a resume truncated the journal back into cluster
+330, the destination probe then created and deleted a directory in the freed
+cluster, and the re-extended journal was stored in that same physical cluster.
+The drive ended up with a deleted directory block inside the journal and restore
+refused the backup. Whether the Linux exFAT driver or the device is at fault, a
+freshly created file receives freshly allocated clusters, and the freed ones
+leave with the old inode. The cost is one sequential copy of the journal, only
+on a resume that actually has a tail.
+
+**Relationship:** Keeps D25/D49's recovery rule (discard back to the last
+complete boundary) and only changes how the discard is performed. D51 checks
+the result from the device before publishing.

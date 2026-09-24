@@ -7,6 +7,9 @@
 #define SIDECAR_MAGIC "MIGR_SIDECAR"
 #define SIDECAR_VERSION 4
 #define SIDECAR_SLOT_NAME "sidecar.migr"
+/* Adoption writes a recovered journal prefix here, then renames it over the
+ * slot; a leftover from an interrupted adoption is discarded on the next one. */
+#define SIDECAR_REWRITE_NAME "sidecar.migr.rewrite"
 
 #define SIDECAR_MAX_ROOT_ID 64U
 #define SIDECAR_MAX_PATH 4096U

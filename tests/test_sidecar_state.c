@@ -1624,6 +1624,16 @@ static void test_truncated_tail(int container_fd)
     if (fd >= 0)
         close(fd);
 
+    struct stat before_adoption;
+    check(fstatat(container_fd, SIDECAR_SLOT_NAME, &before_adoption, 0) == 0,
+          "the journal with a tail is statable");
+    int stale_fd = openat(container_fd, SIDECAR_REWRITE_NAME,
+                          O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    check(stale_fd >= 0 && write_all_test(stale_fd, tail, 4) == 0,
+          "a rewrite file left by an interrupted adoption is planted");
+    if (stale_fd >= 0)
+        close(stale_fd);
+
     uint64_t adopted_boundary = 0;
     check(sidecar_log_adopt_at(container_fd, &log) == SIDECAR_OPEN_RESUMABLE &&
           slot_size(container_fd, &adopted_boundary) == 0 &&
@@ -1632,7 +1642,13 @@ static void test_truncated_tail(int container_fd)
     struct stat st;
     check(fstatat(container_fd, SIDECAR_SLOT_NAME, &st, 0) == 0 &&
           (uint64_t)st.st_size == boundary,
-          "adoption truncates the incomplete tail");
+          "adoption drops the incomplete tail");
+    check(st.st_ino != before_adoption.st_ino,
+          "the recovered prefix is a new file, not the old one shrunk in place");
+    struct stat stale;
+    check(fstatat(container_fd, SIDECAR_REWRITE_NAME, &stale, 0) != 0 &&
+              errno == ENOENT,
+          "no rewrite file remains after adoption");
     SidecarLiveView view;
     check(sidecar_log_find(&log,
                            (SidecarBytes){ (const unsigned char *)"ROOT", 4 },
