@@ -88,17 +88,20 @@ static PortableRestoreOutcome portable_restore_orchestrate_impl(
         return PORTABLE_RESTORE_ERROR;
     }
 
-    // Runs before consent and before any destination mutation (also ahead of
-    // the dry-run branch below, so a dry run under insufficient privilege
-    // reports the same refusal rather than previewing a run it could not
-    // actually perform). The portable preflight already computed
-    // foreign_owner_count; the network check is a separate read-only scan of
-    // the manifest-declared container-root network directories.
+    // Runs before consent and before any destination mutation. A dry run
+    // only reads, so it previews and notes the requirement instead of
+    // refusing. The portable preflight already computed foreign_owner_count;
+    // the network check is a separate read-only scan of the manifest-declared
+    // container-root network directories.
     int network_config_needs_privilege =
         request->manifest->has_network_config &&
         restore_network_config_would_write(request->source_container_fd);
-    if (restore_privilege_preflight(preflight.profiles.foreign_owner_count,
-                                    network_config_needs_privilege) != 0)
+    if (dry_run)
+        restore_privilege_dry_run_note(preflight.profiles.foreign_owner_count,
+                                       network_config_needs_privilege);
+    else if (restore_privilege_preflight(
+                 preflight.profiles.foreign_owner_count,
+                 network_config_needs_privilege) != 0)
     {
         report->live_count = preflight.live_count;
         portable_restore_preflight_report_free(&preflight);

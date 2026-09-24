@@ -1847,6 +1847,17 @@ static void test_network_config_privilege_refusal(void)
         check(strstr(output, "Continue?") == NULL &&
                   file_content_is(sentinel, "untouched"),
               "network privilege refusal precedes consent and destination mutation");
+
+        dry_run = 1;
+        rc = run_restore_capturing_with_identity(
+            source, NULL, output, sizeof(output), drop_privileges, uid, gid);
+        dry_run = previous_dry_run;
+        check(rc == 0 &&
+                  strstr(output, "This restore needs root") == NULL &&
+                  strstr(output, "Note: the real restore needs root: it would "
+                                 "apply saved network configuration") != NULL &&
+                  file_content_is(sentinel, "untouched"),
+              "an unprivileged dry run previews and notes the root requirement");
     }
 
     remove_tree(source);

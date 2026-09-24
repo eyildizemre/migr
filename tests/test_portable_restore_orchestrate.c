@@ -2525,6 +2525,20 @@ static void test_direct_network_config_privilege_preflight(void)
               "portable orchestration refuses nonempty network config before consent");
         check(access(restored, F_OK) != 0 && file_equals(sentinel, "untouched"),
               "portable network privilege refusal leaves the destination untouched");
+
+        int previous_dry_run = dry_run;
+        dry_run = 1;
+        result = run_direct_orchestration_with_identity(
+            &fixture, 1, "y\n", output, sizeof(output), drop_privileges,
+            owner_uid, owner_gid);
+        dry_run = previous_dry_run;
+        check(result == 0 &&
+                  strstr(output, "This restore needs root") == NULL &&
+                  strstr(output, "Note: the real restore needs root: it would "
+                                 "apply saved network configuration") != NULL &&
+                  access(restored, F_OK) != 0,
+              "an unprivileged portable dry run previews and notes the root "
+              "requirement");
     }
     fixture_close(&fixture);
 }

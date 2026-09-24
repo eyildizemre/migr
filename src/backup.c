@@ -297,6 +297,22 @@ int restore_privilege_preflight(size_t foreign_owner_count,
     return -1;
 }
 
+void restore_privilege_dry_run_note(size_t foreign_owner_count,
+                                    int network_config_needs_privilege)
+{
+    if (geteuid() == 0 ||
+        (foreign_owner_count == 0 && !network_config_needs_privilege))
+        return;
+    printf("Note: the real restore needs root: it would ");
+    if (foreign_owner_count != 0)
+        printf("restore %zu item(s) owned by a different user%s",
+               foreign_owner_count,
+               network_config_needs_privilege ? " and " : "");
+    if (network_config_needs_privilege)
+        printf("apply saved network configuration");
+    printf(". Run it with sudo.\n");
+}
+
 /* Returns 0 to proceed (space is adequate, or an earlier probe/estimate
  * step failed and already printed its own warning), or -1 if the
  * destination does not have enough free space (having already printed the

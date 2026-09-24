@@ -2941,8 +2941,11 @@ int restore_with_options(const char *source, const RestoreOptions *options)
     int network_config_needs_privilege =
         mst == MANIFEST_STATUS_VALID && m.has_network_config &&
         restore_network_config_would_write(source_root_fd);
-    if (restore_privilege_preflight(metadata_profiles.foreign_owner_count,
-                                    network_config_needs_privilege) != 0)
+    if (dry_run)
+        restore_privilege_dry_run_note(metadata_profiles.foreign_owner_count,
+                                       network_config_needs_privilege);
+    else if (restore_privilege_preflight(metadata_profiles.foreign_owner_count,
+                                         network_config_needs_privilege) != 0)
         goto cleanup;
 
     if (dry_run)
