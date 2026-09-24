@@ -4129,3 +4129,34 @@ configuration as the unprivileged `systemd-network` user, so its files keep
 `0640` with that group.
 
 **Relationship:** Extends D33's restore side. Capture is unchanged.
+
+---
+
+## D55 — 2026-09-24 — Portable backup tolerates changes in confirmed live desktop state
+
+**Status:** Implemented
+
+**Decision:** The confirmed live-state paths of D44/D48 move to one shared list
+(`src/live_state.c`) used by both restore verification and portable capture. For
+those paths only, a source change between pre-scan and capture no longer aborts
+the backup: a member that disappeared is left out, one that appeared after the
+pre-scan planned its directory is left out, one replaced before it could be
+opened is left out, and a file or directory that changed while it was read is
+kept as read. A regular file's entry keeps the pre-scan metadata that its copy
+was bounded by, so entry and payload stay consistent. Every tolerated change is
+counted and the backup prints one note. Changes to any other path still abort
+exactly as before.
+
+**Why:** Both real `--comprehensive` backups stopped at
+`gvfs-metadata/root-*.log`, one of them after 48 minutes. That abort left a
+partial journal whose resume truncation later cost a journal cluster (D52). GNOME's
+metadata service rotates those files whenever it pleases, so aborting on them
+reports ordinary desktop activity as an inconsistent source. D44 established that
+these paths are live; this applies the same evidence to capture.
+
+**Rejected:** removing gvfs-metadata from the backup scope (D44 already rejected
+suppressing it); retrying a changed file (a continuously written file can still
+fail); tolerating changes under arbitrary paths.
+
+**Relationship:** Extends D44/D48 from restore verification to capture; the list,
+its path-component boundary rule, and its evidence requirement are unchanged.

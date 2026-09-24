@@ -257,6 +257,98 @@ static void rewrite_source_after_payload_write(void *userdata)
     write_file(path, "changed-after-payload-copy");
 }
 
+typedef enum {
+    LIVE_CASE_VANISH,
+    LIVE_CASE_APPEAR,
+    LIVE_CASE_CHANGE_DURING_COPY
+} LiveCase;
+
+// Captures BUILTIN_LOCAL_SHARE/<dir>/{keep,churn} after changing <dir> the
+// way a running desktop service does between pre-scan and capture.
+static int run_live_case(const char *dir, LiveCase live_case,
+                         BackupCaptureReport *report, size_t *live_count)
+{
+    char base[PATH_MAX], source[PATH_MAX], scratch[PATH_MAX];
+    char container[PATH_MAX], subdir[PATH_MAX], keep[PATH_MAX];
+    char churn[PATH_MAX], appeared[PATH_MAX];
+    make_base(base, sizeof(base));
+    join_path(source, sizeof(source), base, "source");
+    join_path(scratch, sizeof(scratch), base, "scratch");
+    join_path(container, sizeof(container), base, "container");
+    join_path(subdir, sizeof(subdir), source, dir);
+    join_path(keep, sizeof(keep), subdir, "keep");
+    join_path(churn, sizeof(churn), subdir, "churn");
+    join_path(appeared, sizeof(appeared), subdir, "appeared");
+    make_directory(source);
+    make_directory(scratch);
+    make_directory(container);
+    make_directory(subdir);
+    write_file(keep, "stable");
+    write_file(churn, "rotating");
+
+    PortableRootSpec root = root_spec("BUILTIN_LOCAL_SHARE", source,
+                                      "BUILTIN_LOCAL_SHARE");
+    PortableCaptureRequest request = request_for(&root, 1, 1);
+    int scratch_fd = open_directory(scratch);
+    int container_fd = open_directory(container);
+    PortablePreparedCapture prepared;
+    memset(&prepared, 0, sizeof(prepared));
+    int result = portable_capture_prepare(scratch_fd, &request, &prepared);
+    if (result == 0 && live_case == LIVE_CASE_VANISH && unlink(churn) != 0)
+        fixture_fatal("could not remove the live fixture file");
+    if (result == 0 && live_case == LIVE_CASE_APPEAR)
+        write_file(appeared, "new");
+    if (live_case == LIVE_CASE_CHANGE_DURING_COPY)
+        portable_capture_test_set_after_payload_write_hook(
+            rewrite_source_after_payload_write, churn);
+    backup_capture_report_init(report);
+    *live_count = 0;
+    if (result == 0)
+        result = portable_capture_fresh_prepared_at(
+            container_fd, &request, &prepared, live_count, report);
+    portable_capture_test_set_after_payload_write_hook(NULL, NULL);
+    portable_prepared_capture_free(&prepared);
+    if (close(scratch_fd) != 0 || close(container_fd) != 0)
+        fixture_fatal("could not close live-state fixture");
+    remove_tree(base);
+    return result;
+}
+
+static void test_live_state_changes_are_tolerated(void)
+{
+    printf(BLUE "::" NC " portable capture tolerates changes in live desktop state\n");
+    BackupCaptureReport report;
+    size_t live_count = 0;
+
+    int result = run_live_case("gvfs-metadata", LIVE_CASE_VANISH, &report,
+                               &live_count);
+    check(result == 0 && report.live_state_changes >= 1 && live_count == 3U,
+          "a live file that disappears after the pre-scan is left out");
+
+    result = run_live_case("gvfs-metadata", LIVE_CASE_APPEAR, &report,
+                           &live_count);
+    check(result == 0 && report.live_state_changes >= 1 && live_count == 4U,
+          "a live file that appears after the pre-scan is left out");
+
+    result = run_live_case("gvfs-metadata", LIVE_CASE_CHANGE_DURING_COPY,
+                           &report, &live_count);
+    check(result == 0 && report.live_state_changes >= 1 && live_count == 4U,
+          "a live file that changes during its copy is kept as read");
+
+    result = run_live_case("gvfs-metadata-x", LIVE_CASE_VANISH, &report,
+                           &live_count);
+    check(result != 0 &&
+              report.failure_kind == BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED &&
+              report.live_state_changes == 0,
+          "a similarly named path outside the live list still aborts");
+
+    result = run_live_case("gvfs-metadata-x", LIVE_CASE_CHANGE_DURING_COPY,
+                           &report, &live_count);
+    check(result != 0 &&
+              report.failure_kind == BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED,
+          "a change during copy outside the live list still aborts");
+}
+
 static void test_prepared_capture_reports_progress(void)
 {
     printf(BLUE "::" NC " portable capture reports chunk-level progress\n");
@@ -882,6 +974,7 @@ int main(void)
     test_operational_failure_reports_path();
     test_socket_is_informational();
     test_prepared_at_rejects_invalid_prepared();
+    test_live_state_changes_are_tolerated();
     printf("portable prepare tests: %d failure(s), %d skipped\n",
            failures, skips);
     return failures == 0 ? 0 : 1;

@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "portable.h"
+#include "live_state.h"
 #include "portable_reconcile_internal.h"
 #include "portable_fsops_internal.h"
 #include "portable_hashset_internal.h"
@@ -2247,6 +2248,31 @@ static void portable_capture_context_failure_record(
                                     logical);
 }
 
+// Live desktop state (D55) is rewritten by running services independently of
+// migr, so a change there between pre-scan and capture is expected rather
+// than a sign of an inconsistent source; everything else still aborts.
+static int capture_tolerates_live_change(const PortableCaptureContext *context,
+                                         const PortableRootSpec *root,
+                                         const char *logical)
+{
+    if (context == NULL || root == NULL || logical == NULL ||
+        !live_state_path(root->id, strlen(root->id), logical, strlen(logical)))
+        return 0;
+    if (context->progress_report != NULL &&
+        context->progress_report->live_state_changes != SIZE_MAX)
+        context->progress_report->live_state_changes++;
+    return 1;
+}
+
+// A tolerated live entry that vanished, appeared after the pre-scan, or was
+// replaced before it could be opened is left out of this backup.
+static int capture_skip_live_entry(int *no_destination_object)
+{
+    if (no_destination_object != NULL)
+        *no_destination_object = 1;
+    return 0;
+}
+
 static int capture_current_source_seen(const PortableCaptureContext *context,
                                        const PortableRootSpec *root)
 {
@@ -2267,6 +2293,9 @@ static int capture_current_source_seen(const PortableCaptureContext *context,
             continue;
         int present = visited_contains(context->visited, root->id,
                                        entry->logical_path);
+        if (present == 0 &&
+            capture_tolerates_live_change(context, root, entry->logical_path))
+            continue;
         if (present != 1) {
             portable_capture_context_failure_record(
                 context,
@@ -2404,12 +2433,20 @@ static int prepared_source_validate_root(
         if (prepared_source_member_stat(root_fd, entry->logical_path,
                                         &member_stat) != 0) {
             int saved_errno = errno;
+            if (source_lookup_failure_kind(saved_errno) ==
+                    BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED &&
+                capture_tolerates_live_change(context, root,
+                                              entry->logical_path))
+                continue;
             portable_capture_context_failure_record(
                 context, source_lookup_failure_kind(saved_errno), saved_errno,
                 root, entry->logical_path);
             failed = 1;
             break;
         }
+        if (!source_kind_is_address_bearing(member_stat.st_mode) &&
+            capture_tolerates_live_change(context, root, entry->logical_path))
+            continue;
         if (!source_kind_is_address_bearing(member_stat.st_mode)) {
             portable_capture_context_failure_record(
                 context, BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED, 0, root,
@@ -2626,7 +2663,8 @@ static int capture_directory(PortableCaptureContext *context,
             context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
             logical);
         failed = 1;
-    } else if (!failed && !metadata_source_unchanged(before, &after)) {
+    } else if (!failed && !metadata_source_unchanged(before, &after) &&
+               !capture_tolerates_live_change(context, root, logical)) {
         portable_capture_context_failure_record(
             context, BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED, 0, root, logical);
         failed = 1;
@@ -2776,7 +2814,10 @@ static int capture_regular(PortableCaptureContext *context,
             context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
             logical);
         failed = 1;
-    } else if (!metadata_source_unchanged(before, &after)) {
+    } else if (!metadata_source_unchanged(before, &after) &&
+               !capture_tolerates_live_change(context, root, logical)) {
+        // A tolerated live file keeps the bytes read; its entry records the
+        // pre-scan metadata that portable_copy_regular() copied against.
         portable_capture_context_failure_record(
             context, BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED, 0, root, logical);
         failed = 1;
@@ -2942,7 +2983,8 @@ static int capture_symlink(PortableCaptureContext *context,
         xattrs_free(&xattrs);
         return -1;
     }
-    if (!metadata_symlink_unchanged(before, &after)) {
+    if (!metadata_symlink_unchanged(before, &after) &&
+        !capture_tolerates_live_change(context, root, logical)) {
         portable_capture_context_failure_record(
             context, BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED, 0, root, logical);
         xattrs_free(&xattrs);
@@ -3182,7 +3224,10 @@ static int capture_hardlink(PortableCaptureContext *context,
             context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
             logical);
         failed = 1;
-    } else if (!metadata_source_unchanged(before, &after)) {
+    } else if (!metadata_source_unchanged(before, &after) &&
+               !capture_tolerates_live_change(context, root, logical)) {
+        // A tolerated live file keeps the bytes read; its entry records the
+        // pre-scan metadata that portable_copy_regular() copied against.
         portable_capture_context_failure_record(
             context, BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED, 0, root, logical);
         failed = 1;
@@ -3236,6 +3281,10 @@ static int capture_node(PortableCaptureContext *context,
     struct stat before;
     if (read_source_stat(source_parent, source_name, root_path, &before) != 0) {
         int saved_errno = errno;
+        if (source_lookup_failure_kind(saved_errno) ==
+                BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED &&
+            capture_tolerates_live_change(context, root, logical))
+            return capture_skip_live_entry(no_destination_object);
         portable_capture_context_failure_record(
             context, source_lookup_failure_kind(saved_errno), saved_errno,
             root, logical);
@@ -3267,6 +3316,9 @@ static int capture_node(PortableCaptureContext *context,
                           S_ISLNK(before.st_mode);
     if ((address_bearing && prepared_member != 1) ||
         (!address_bearing && prepared_member == 1)) {
+        // Appeared (or changed kind) after the pre-scan planned its name.
+        if (capture_tolerates_live_change(context, root, logical))
+            return capture_skip_live_entry(no_destination_object);
         portable_capture_context_failure_record(
             context, BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED, 0, root, logical);
         return -1;
@@ -3327,6 +3379,10 @@ static int capture_node(PortableCaptureContext *context,
                                      &before);
     if (source_fd < 0) {
         int saved_errno = errno;
+        if (source_lookup_failure_kind(saved_errno) ==
+                BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED &&
+            capture_tolerates_live_change(context, root, logical))
+            return capture_skip_live_entry(no_destination_object);
         portable_capture_context_failure_record(
             context, source_lookup_failure_kind(saved_errno), saved_errno,
             root, logical);
@@ -3342,9 +3398,11 @@ static int capture_node(PortableCaptureContext *context,
         return -1;
     }
     if (!metadata_source_unchanged(&before, &opened)) {
+        close(source_fd);
+        if (capture_tolerates_live_change(context, root, logical))
+            return capture_skip_live_entry(no_destination_object);
         portable_capture_context_failure_record(
             context, BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED, 0, root, logical);
-        close(source_fd);
         return -1;
     }
 

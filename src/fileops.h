@@ -160,6 +160,9 @@ typedef struct {
     void *progress_userdata;
     struct timespec progress_last_fired;
     int progress_unthrottled;
+    /* Portable capture: confirmed live-state paths (D55) that changed,
+     * appeared, or disappeared during capture and were tolerated. */
+    size_t live_state_changes;
 } BackupCaptureReport;
 
 void backup_capture_report_init(BackupCaptureReport *report);

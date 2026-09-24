@@ -3026,6 +3026,13 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
             putchar('\n');
             fflush(stdout);
         }
+        if (capture_report.live_state_changes != 0)
+            printf("Note: live desktop state (such as GNOME's file metadata) "
+                   "changed %zu time%s during the backup; it was saved as read, "
+                   "and files that appeared or disappeared meanwhile were left "
+                   "out.\n",
+                   capture_report.live_state_changes,
+                   capture_report.live_state_changes == 1 ? "" : "s");
         close(data_fd);
 
         // packages.txt is a migr-owned control artifact, not a payload root, so
