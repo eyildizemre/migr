@@ -771,6 +771,21 @@ static int collection_destination_route(Collection *collection,
     return 0;
 }
 
+/* A root's own entry has an empty logical path; examples name it the way the
+ * user sees it instead: its HOME-relative restore path (".bashrc") or the
+ * last component of its source directory ("Desktop"). */
+static const char *preflight_entry_label(const ManifestRoot *root,
+                                         const char *logical)
+{
+    if (logical == NULL || logical[0] != '\0' || root == NULL)
+        return logical;
+    if (root->has_restore_path && root->restore_path[0] != '\0')
+        return root->restore_path;
+    const char *slash = strrchr(root->source_path, '/');
+    const char *leaf = slash != NULL ? slash + 1 : root->source_path;
+    return leaf[0] != '\0' ? leaf : root->id;
+}
+
 /* Returns 0 on success, -1 for a per-entry violation (already recorded via
  * report_violation(), safe for the caller to log and keep scanning past),
  * or -2 for an internal/unexpected failure unrelated to this entry's data
@@ -799,6 +814,7 @@ static int collect_metadata_profile(Collection *collection,
         return -2;
     desired.st_mode = entry->mode | type;
 
+    const char *label = preflight_entry_label(root, entry->logical);
     int route_anchor = -1;
     DestinationProfileAnchorCache *profile_cache = NULL;
     char relative[PATH_MAX];
@@ -806,7 +822,7 @@ static int collect_metadata_profile(Collection *collection,
                                      &route_anchor, &profile_cache, relative,
                                      sizeof(relative)) != 0)
     {
-        report_violation(collection->report, root_index, entry->logical);
+        report_violation(collection->report, root_index, label);
         return -1;
     }
 
@@ -825,14 +841,14 @@ static int collect_metadata_profile(Collection *collection,
                                         accepted_symlink_target, &anchor,
                                         &existing, &has_existing) != 0)
     {
-        report_violation(collection->report, root_index, entry->logical);
+        report_violation(collection->report, root_index, label);
         return -1;
     }
 
     int result = metadata_profiles_add(&collection->report->profiles, anchor,
                                        &desired,
                                        has_existing ? &existing : NULL,
-                                       entry->logical);
+                                       label);
     int saved = errno;
     if (close(anchor) != 0 && result == 0)
     {
@@ -841,7 +857,7 @@ static int collect_metadata_profile(Collection *collection,
     }
     errno = saved;
     if (result != 0)
-        report_violation(collection->report, root_index, entry->logical);
+        report_violation(collection->report, root_index, label);
     return result;
 }
 

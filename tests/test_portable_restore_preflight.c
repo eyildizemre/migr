@@ -2063,6 +2063,43 @@ static int run_preflight_capturing_all(Fixture *fixture,
     return result;
 }
 
+static void test_root_entry_examples_are_named(void)
+{
+    printf(BLUE "::" NC " a root entry is named in preflight examples\n");
+    ManifestRoot root = root_for("ROOT", "ROOT", "restored");
+    Fixture fixture;
+    int opened = fixture_open(&fixture, "root-example", &root, 1);
+    check(opened == 0, "root-example fixture is created");
+    if (opened != 0)
+        return;
+    make_root_payload(&fixture);
+    write_file_at(fixture.data_fd, "ROOT/file", "payload");
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0),
+        entry_for("ROOT", "file", "file", SIDECAR_KIND_REGULAR, 7)
+    };
+    entries[0].uid = (uint32_t)geteuid() + 1U;
+    entries[0].gid = (uint32_t)getegid();
+    entries[1].uid = (uint32_t)geteuid();
+    entries[1].gid = (uint32_t)getegid();
+    check(write_sidecar(&fixture, entries, 2) == 0,
+          "root-example sidecar is committed");
+    PortableRestorePreflightReport report;
+    int result = run_preflight(&fixture, &report);
+    int named = 0, blank = 0;
+    for (size_t index = 0; index < report.profiles.example_count; index++)
+    {
+        if (strcmp(report.profiles.examples[index], "restored") == 0)
+            named = 1;
+        if (report.profiles.examples[index][0] == '\0')
+            blank = 1;
+    }
+    check(result == 0 && named && !blank,
+          "a foreign-owned root entry is listed by its restore name, not blank");
+    portable_restore_preflight_report_free(&report);
+    fixture_close(&fixture);
+}
+
 static void test_unusable_journal_is_explained(void)
 {
     printf(BLUE "::" NC " an unusable backup journal is explained\n");
@@ -2124,6 +2161,7 @@ static void test_unusable_journal_is_explained(void)
 
 int main(void)
 {
+    test_root_entry_examples_are_named();
     test_unusable_journal_is_explained();
     test_valid_and_profiles();
     test_destination_profile_ancestor_cache();
