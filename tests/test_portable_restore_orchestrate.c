@@ -794,6 +794,15 @@ static void probe_observer(void *context)
     observation->target_absent = access(observation->target, F_OK) != 0;
 }
 
+static int before_confirmation_calls;
+static int count_before_confirmation;
+
+static void note_before_confirmation(void *context)
+{
+    (void)context;
+    before_confirmation_calls++;
+}
+
 static PortableRestoreRequest request_for(Fixture *fixture,
                                           Manifest *manifest,
                                           int nsec_exact)
@@ -812,6 +821,8 @@ static PortableRestoreRequest request_for(Fixture *fixture,
         request.destination_xdg_dirs[index] =
             fixture->xdg_dirs[index][0] == '\0'
                 ? NULL : fixture->xdg_dirs[index];
+    if (count_before_confirmation)
+        request.before_confirmation = note_before_confirmation;
     return request;
 }
 
@@ -1449,6 +1460,41 @@ static void test_failed_replay_finalizes_prepared_directories(void)
     check(metadata_exact(restored, 0750, (uid_t)uid, (gid_t)gid,
                          1700000900, 1, 1700000901, 2),
           "the prepared root directory gets its recorded metadata too");
+    fixture_close(&fixture);
+}
+
+static void test_before_confirmation_hook(void)
+{
+    printf(BLUE "::" NC " the pre-confirmation hook runs only for a live prompt\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "pre-confirmation fixture is created");
+    if (opened != 0)
+        return;
+    check(prepare_direct_basic_fixture(&fixture, (uint32_t)geteuid()) == 0,
+          "pre-confirmation sidecar is committed");
+    PortableRestoreReplayReport report;
+    count_before_confirmation = 1;
+
+    before_confirmation_calls = 0;
+    int previous_dry_run = dry_run;
+    dry_run = 1;
+    int result = run_orchestration(&fixture, &report, 1, "y\n");
+    dry_run = previous_dry_run;
+    check(result == 0 && before_confirmation_calls == 0,
+          "a dry run shows no prompt and does not call the hook");
+
+    before_confirmation_calls = 0;
+    result = run_orchestration(&fixture, &report, 1, "n\n");
+    check(before_confirmation_calls == 1,
+          "the hook runs once before a prompt that is then declined");
+
+    before_confirmation_calls = 0;
+    result = run_orchestration(&fixture, &report, 1, "y\n");
+    check(result == 0 && before_confirmation_calls == 1,
+          "the hook runs once before an accepted prompt");
+    count_before_confirmation = 0;
     fixture_close(&fixture);
 }
 
@@ -2676,6 +2722,7 @@ int main(void)
     test_link_rerun_refuses_different_symlink();
     test_link_rerun_refuses_foreign_hardlink_name();
     test_failed_replay_finalizes_prepared_directories();
+    test_before_confirmation_hook();
     test_hardlink_cross_root();
     test_hardlink_cross_root_invalid_xdg_reference();
     test_xdg_destination_orchestration();

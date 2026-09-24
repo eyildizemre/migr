@@ -425,6 +425,147 @@ static int restore_network_config_file_at(int network_fd, int dest_dir_fd,
     return 1;
 }
 
+typedef struct {
+    const char *comm;
+    const char *label;
+} RestoreWriterApp;
+
+// Applications whose settings the default scope restores and which rewrite
+// them while running or on exit. Matched by /proc/<pid>/comm (truncated to 15
+// bytes by the kernel). GNOME Software refreshes the restored Flatpak repo.
+static const RestoreWriterApp restore_writer_apps[] = {
+    { "code", "Visual Studio Code" },
+    { "firefox", "Firefox" },
+    { "firefox-bin", "Firefox" },
+    { "brave", "Brave" },
+    { "chrome", "Google Chrome" },
+    { "chromium", "Chromium" },
+    { "chromium-browse", "Chromium" },
+    { "vivaldi-bin", "Vivaldi" },
+    { "msedge", "Microsoft Edge" },
+    { "opera", "Opera" },
+    { "gnome-software", "GNOME Software" }
+};
+
+static const char *restore_proc_root = "/proc";
+
+#ifdef RESTORE_TEST_HOOKS
+void restore_test_set_proc_root(const char *path)
+{
+    restore_proc_root = path != NULL ? path : "/proc";
+}
+#endif
+
+static int restore_read_small_file_at(int dir_fd, const char *name,
+                                      char *out, size_t size)
+{
+    int fd = openat(dir_fd, name, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    ssize_t got = read(fd, out, size - 1U);
+    close(fd);
+    if (got < 0)
+        return -1;
+    out[got] = '\0';
+    return 0;
+}
+
+static int restore_process_uid_at(int pid_fd, uid_t *uid)
+{
+    char status[4096];
+    if (restore_read_small_file_at(pid_fd, "status", status,
+                                   sizeof(status)) != 0)
+        return -1;
+    const char *line = strstr(status, "\nUid:");
+    if (line == NULL)
+        return -1;
+    char *end = NULL;
+    errno = 0;
+    unsigned long value = strtoul(line + strlen("\nUid:"), &end, 10);
+    if (errno != 0 || end == line + strlen("\nUid:"))
+        return -1;
+    *uid = (uid_t)value;
+    return 0;
+}
+
+// Collects the distinct labels of known writer applications run by uid.
+static size_t restore_running_writer_labels(uid_t uid, const char **labels,
+                                            size_t max_labels)
+{
+    DIR *proc = opendir(restore_proc_root);
+    if (proc == NULL)
+        return 0;
+    size_t count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(proc)) != NULL)
+    {
+        if (entry->d_name[0] < '1' || entry->d_name[0] > '9' ||
+            strspn(entry->d_name, "0123456789") != strlen(entry->d_name))
+            continue;
+        int pid_fd = openat(dirfd(proc), entry->d_name,
+                            O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (pid_fd < 0)
+            continue;
+        char comm[64];
+        uid_t owner;
+        int readable = restore_process_uid_at(pid_fd, &owner) == 0 &&
+                       restore_read_small_file_at(pid_fd, "comm", comm,
+                                                  sizeof(comm)) == 0;
+        close(pid_fd);
+        if (!readable || owner != uid)
+            continue;
+        comm[strcspn(comm, "\n")] = '\0';
+        for (size_t index = 0;
+             index < sizeof(restore_writer_apps) / sizeof(restore_writer_apps[0]);
+             index++)
+        {
+            if (strcmp(comm, restore_writer_apps[index].comm) != 0)
+                continue;
+            const char *label = restore_writer_apps[index].label;
+            int seen = 0;
+            for (size_t known = 0; known < count && !seen; known++)
+                seen = strcmp(labels[known], label) == 0;
+            if (!seen && count < max_labels)
+                labels[count++] = label;
+            break;
+        }
+    }
+    closedir(proc);
+    return count;
+}
+
+#ifdef RESTORE_TEST_HOOKS
+size_t restore_test_running_writer_labels(uid_t uid, const char **labels,
+                                          size_t max_labels)
+{
+    return restore_running_writer_labels(uid, labels, max_labels);
+}
+#endif
+
+// Printed right before the confirmation prompt: an open application that owns
+// restored settings writes over them while the restore runs or when it exits.
+static void restore_warn_running_writers(void *context)
+{
+    (void)context;
+    uid_t uid = geteuid();
+    gid_t gid;
+    char sudo_home[PATH_MAX];
+    if (geteuid() == 0 && getenv("SUDO_UID") != NULL &&
+        resolve_sudo_identity(&uid, &gid, sudo_home) != 0)
+        return;
+    const char *labels[sizeof(restore_writer_apps) /
+                       sizeof(restore_writer_apps[0])];
+    size_t count = restore_running_writer_labels(
+        uid, labels, sizeof(labels) / sizeof(labels[0]));
+    if (count == 0)
+        return;
+    printf("\nThese applications are running and can overwrite restored "
+           "settings while the restore runs or when they close: ");
+    for (size_t index = 0; index < count; index++)
+        printf("%s%s", index == 0 ? "" : ", ", labels[index]);
+    printf(".\nClose them before continuing.\n\n");
+}
+
 // Loads the backed-up dconf database into a running session, where replacing
 // ~/.config/dconf/user alone is overwritten by the dconf service (D50).
 static void restore_dconf_settings(int database_fd, int *had_error)
@@ -2590,6 +2731,7 @@ int restore_with_options(const char *source, const RestoreOptions *options)
             .destination_home_path = home,
             .destination_timestamp_policy = {0},
             .skip_content_verification = skip_content_verification,
+            .before_confirmation = restore_warn_running_writers,
             .dconf_database_fd_out = &dconf_database_fd
         };
         for (int index = 0; index < XDG_RESTORE_COUNT; index++)

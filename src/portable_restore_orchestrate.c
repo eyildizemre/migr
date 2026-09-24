@@ -125,6 +125,8 @@ static PortableRestoreOutcome portable_restore_orchestrate_impl(
     }
 
     metadata_profiles_report(&preflight.profiles);
+    if (request->before_confirmation != NULL)
+        request->before_confirmation(request->before_confirmation_context);
     if (!portable_restore_confirm(
             preflight.profiles.security_xattr_entry_count))
     {

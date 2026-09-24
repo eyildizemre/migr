@@ -1959,6 +1959,25 @@ static void test_network_config_and_foreign_owner_refusal(void)
     remove_tree(home);
 }
 
+static void write_fake_process(const char *proc_root, const char *pid,
+                               const char *comm, uid_t uid, int with_status)
+{
+    char dir[PATH_MAX], file[PATH_MAX], content[128];
+    join_path(dir, sizeof(dir), proc_root, pid);
+    mkdir_p(dir);
+    join_path(file, sizeof(file), dir, "comm");
+    snprintf(content, sizeof(content), "%s\n", comm);
+    write_file_mode(file, content, 0644);
+    if (!with_status)
+        return;
+    join_path(file, sizeof(file), dir, "status");
+    snprintf(content, sizeof(content),
+             "Name:\t%s\nUmask:\t0022\nUid:\t%ju\t%ju\t%ju\t%ju\n",
+             comm, (uintmax_t)uid, (uintmax_t)uid, (uintmax_t)uid,
+             (uintmax_t)uid);
+    write_file_mode(file, content, 0644);
+}
+
 static char verification_mutation_path[PATH_MAX];
 
 static void rewrite_restored_file_after_apply(void)
@@ -2066,9 +2085,15 @@ static void test_verification_failure_still_restores_packages(void)
                                     package_progress_capture, &probe);
     portable_restore_replay_test_set_after_apply_hook(
         rewrite_restored_file_after_apply);
+    char proc_root[PATH_MAX];
+    join_path(proc_root, sizeof(proc_root), home, "fake-proc");
+    mkdir_p(proc_root);
+    write_fake_process(proc_root, "4242", "code", geteuid(), 1);
+    restore_test_set_proc_root(proc_root);
     char output[16384];
     int rc = run_restore_capturing_with_input(source, "y\n", output,
                                                sizeof(output));
+    restore_test_set_proc_root(NULL);
     portable_restore_replay_test_set_after_apply_hook(NULL);
     packages_test_clear_restore_hooks();
     dry_run = previous_dry_run;
@@ -2081,9 +2106,41 @@ static void test_verification_failure_still_restores_packages(void)
     struct stat marker;
     check(stat(probe.marker_path, &marker) == 0,
           "packages are still restored once every file was applied");
+    const char *warning = strstr(output, "These applications are running");
+    const char *prompt = strstr(output, "Continue?");
+    check(warning != NULL && prompt != NULL && warning < prompt &&
+              strstr(warning, "Visual Studio Code") != NULL,
+          "a running writer is named before the confirmation prompt");
 
     remove_tree(source);
     remove_tree(home);
+}
+
+static void test_running_writer_detection(void)
+{
+    printf(BLUE "::" NC " restore dispatch: running applications that own restored settings are named\n");
+    char proc_root[PATH_MAX];
+    fresh_mkdtemp(proc_root, sizeof(proc_root), "dispatch_fake_proc");
+    uid_t me = geteuid();
+    write_fake_process(proc_root, "101", "code", me, 1);
+    write_fake_process(proc_root, "102", "firefox", me + 1, 1);
+    write_fake_process(proc_root, "103", "code", me, 1);
+    write_fake_process(proc_root, "104", "gnome-software", me, 1);
+    write_fake_process(proc_root, "105", "brave", me, 0);
+    write_fake_process(proc_root, "106", "bash", me, 1);
+    write_fake_process(proc_root, "self", "code", me, 1);
+
+    restore_test_set_proc_root(proc_root);
+    const char *labels[8];
+    size_t count = restore_test_running_writer_labels(me, labels, 8);
+    restore_test_set_proc_root(NULL);
+    check(count == 2 &&
+              ((strcmp(labels[0], "Visual Studio Code") == 0 &&
+                strcmp(labels[1], "GNOME Software") == 0) ||
+               (strcmp(labels[1], "Visual Studio Code") == 0 &&
+                strcmp(labels[0], "GNOME Software") == 0)),
+          "only the target user's known writers are named, each once");
+    remove_tree(proc_root);
 }
 
 static void test_dispatch_refuses_portable_v1(void)
@@ -3657,6 +3714,7 @@ int main(void)
     test_dispatch_refuses_partial_source();
     test_dispatch_requires_v1_manifest_for_final_container_name();
     test_dispatch_refuses_portable_v1();
+    test_running_writer_detection();
     test_verification_failure_still_restores_packages();
     test_portable_replay_failure_names_entry();
     test_v1_refuses_missing_declared_payloads();

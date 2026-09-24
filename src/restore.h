@@ -8,6 +8,9 @@
 typedef int (*RestoreTestNetworkReloadHook)(char *const argv[], void *context);
 
 void restore_test_set_network_config_group_file(const char *path);
+void restore_test_set_proc_root(const char *path);
+size_t restore_test_running_writer_labels(uid_t uid, const char **labels,
+                                          size_t max_labels);
 void restore_test_set_network_config_dest_dir(const char *backend_name,
                                               const char *dest_dir);
 void restore_test_set_network_reload_hook(RestoreTestNetworkReloadHook hook,
