@@ -4258,3 +4258,24 @@ checked on its own before the source machine is wiped.
 
 **Relationship:** Supersedes D42's claim that replay needs no second source of
 truth. FNV-1a stays a corruption check, not tamper evidence.
+
+## D60 — 2026-09-24 — `migr verify` checks a portable backup against its journal
+
+**Status:** Implemented
+
+**Decision:** `migr verify <SOURCE>` opens a finished portable container the way
+restore preflight does (complete journal required, no outstanding claims, a
+consistent address index) and then checks every live entry against the payload
+tree, in path order, following each ancestor's recorded physical leaf: a
+directory must be a directory, a symlink or hardlink placeholder an empty
+regular file, and a regular file must have its recorded size and D59 content
+digest. Every mismatch is counted; the first eight are listed with their
+reason. It writes nothing. Exit status is 0 only when everything matches.
+Native containers and other journal versions are refused with the reason.
+
+**Why:** Before wiping the source machine, the only way to know a backup would
+restore was to restore it. The capture digest (D59) makes an independent,
+restore-free check possible; this command is that check.
+
+**Relationship:** Builds on D59. Native backups stay out of scope until they
+record digests of their own.

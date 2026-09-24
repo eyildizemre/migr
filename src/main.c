@@ -13,12 +13,14 @@
 #include "restore.h"
 #include "selection.h"
 #include "utils.h"
+#include "verify.h"
 
 typedef enum {
     ACTION_NONE,
     ACTION_REPORT,
     ACTION_BACKUP,
     ACTION_RESTORE,
+    ACTION_VERIFY,
     ACTION_CONF,
     ACTION_HELP
 } Action;
@@ -31,6 +33,8 @@ static void action_lookup(const char *arg, Action *action)
         *action = ACTION_BACKUP;
     else if (strcmp(arg, "restore") == 0)
         *action = ACTION_RESTORE;
+    else if (strcmp(arg, "verify") == 0)
+        *action = ACTION_VERIFY;
     else if (strcmp(arg, "conf") == 0)
         *action = ACTION_CONF;
     else if (strcmp(arg, "help") == 0)
@@ -353,6 +357,15 @@ int main(int argc, char *argv[])
                 .skip_content_verification = no_verify
             };
             ret = restore_with_options(path, &restore_options);
+            break;
+        case ACTION_VERIFY:
+            if (path == NULL || user_paths[0] != NULL)
+            {
+                print_error("Usage: ./migr verify <SOURCE>\n");
+                ret = 1;
+                break;
+            }
+            ret = verify_backup(path);
             break;
         case ACTION_CONF:
             ret = config_edit() == 0 ? 0 : 1;

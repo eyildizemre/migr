@@ -794,6 +794,7 @@ void print_help(void)
     printf("  report [SCOPE]        Show backup analysis report (default when no command given)\n");
     printf("  backup <PATH>         Create a resumable backup container under PATH\n");
     printf("  restore <SOURCE>      Restore files and packages from a backup at SOURCE\n");
+    printf("  verify <SOURCE>       Check a portable backup against its capture record\n");
     printf("  conf                  Edit persistent critical/comprehensive selection rules\n");
     printf("  help                  Show this help\n");
     printf("\n");
@@ -833,6 +834,7 @@ void print_help(void)
     printf("  ./migr backup /mnt/drive ~/Documents ~/Projects\n");
     printf("  ./migr report --critical --summary\n");
     printf("  ./migr conf\n");
+    printf("  ./migr verify /mnt/drive/migr_backup_20260720_143012\n");
     printf("  ./migr restore /mnt/drive/migr_backup_20260720_143012\n");
 }
 

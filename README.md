@@ -53,6 +53,7 @@ git config core.hooksPath hooks
 ./migr report [--critical | --comprehensive] [-s] [--max-depth=<N>]
 ./migr backup <PATH>
 ./migr restore <SOURCE> [--no-verify]
+./migr verify <SOURCE>
 ./migr conf
 ```
 
@@ -152,7 +153,12 @@ requires the digest to match. This includes files whose stored HOME URI is
 rewritten for the new account. Portable backup also records, for every regular
 file, a digest of the bytes it captured; replay compares the bytes it reads from
 the backup against it, so a backup file damaged after capture is reported as such
-instead of being restored and "verified" as correct. Symlink target bytes are compared directly; their
+instead of being restored and "verified" as correct. The same check runs on its
+own with `migr verify <SOURCE>`, without restoring anything: it confirms that
+every item the journal records is present in the backup and that every file still
+has its captured size and content, and lists the ones that do not. Run it before
+wiping the source machine. Native backups record no content digests, so verify
+refuses them. Symlink target bytes are compared directly; their
 recorded timestamps are reapplied afterward because reading the target can advance
 the symlink's atime. Hardlink aliases are checked against their representative by filesystem inode
 identity without re-reading the same content through every alias. A read,

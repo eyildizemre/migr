@@ -1112,6 +1112,16 @@ test_errors() {
 
     # commands that take exactly one positional reject extras
     assert_exits_nonzero ../migr restore "$BACKUP_DIR" /tmp/extra
+    assert_fails_with "Usage: ./migr verify <SOURCE>" \
+        ../migr verify "$BACKUP_DIR" /tmp/extra
+
+    # verify checks an existing backup and takes no backup/restore options
+    assert_fails_with "Usage: ./migr verify <SOURCE>" ../migr verify
+    assert_fails_with "Error: --dry-run applies only to 'backup' or 'restore'." \
+        ../migr verify "$BACKUP_DIR" --dry-run
+    assert_fails_with "Error: --no-verify applies only to 'restore'." \
+        ../migr verify "$BACKUP_DIR" --no-verify
+    assert_succeeds_with "verify <SOURCE>" ../migr --help
 
     # report takes no arguments at all
     assert_exits_nonzero ../migr report /tmp/somewhere
