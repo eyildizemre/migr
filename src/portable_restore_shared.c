@@ -2638,6 +2638,24 @@ int sidecar_kind_to_type(SidecarObjectKind kind, mode_t *type)
     }
 }
 
+int destination_symlink_target_matches(int parent_fd, const char *leaf,
+                                       SidecarBytes target)
+{
+    if (leaf == NULL || (target.data == NULL && target.length != 0))
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    char buffer[PATH_MAX];
+    if (target.length >= sizeof(buffer))
+        return 0;
+    ssize_t length = readlinkat(parent_fd, leaf, buffer, sizeof(buffer));
+    if (length < 0)
+        return errno == EINVAL ? 0 : -1;
+    return (size_t)length == target.length &&
+           (length == 0 || memcmp(buffer, target.data, (size_t)length) == 0);
+}
+
 int sidecar_is_complete_readonly(int container_fd)
 {
     int fd = openat(container_fd, SIDECAR_SLOT_NAME,

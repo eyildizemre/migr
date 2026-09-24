@@ -1228,6 +1228,163 @@ static void test_hardlink_orchestration(void)
     fixture_close(&fixture);
 }
 
+static void build_link_rerun_payload(Fixture *fixture)
+{
+    make_dir_at(fixture->data_fd, "ROOT", 0700);
+    int root_fd = openat(fixture->data_fd, "ROOT",
+                         O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (root_fd < 0)
+        fatal("could not open link rerun payload root");
+    write_file_at(root_fd, "alias", "");
+    write_file_at(root_fd, "link", "");
+    write_file_at(root_fd, "representative", "rerun payload");
+    if (close(root_fd) != 0)
+        fatal("could not close link rerun payload root");
+}
+
+static int write_link_rerun_sidecar(Fixture *fixture)
+{
+    uint32_t uid = (uint32_t)geteuid();
+    uint32_t gid = (uint32_t)getegid();
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  uid, gid, 1700000800, 1, 1700000801, 2),
+        entry_for("ROOT", "representative", "representative",
+                  SIDECAR_KIND_REGULAR, strlen("rerun payload"), 0640,
+                  uid, gid, 1700000810, 3, 1700000811, 4),
+        entry_for("ROOT", "alias", "alias", SIDECAR_KIND_HARDLINK, 0,
+                  0640, uid, gid, 1700000820, 5, 1700000821, 6),
+        entry_for("ROOT", "link", "link", SIDECAR_KIND_SYMLINK, 0, 0777,
+                  uid, gid, 1700000830, 7, 1700000831, 8)
+    };
+    entries[2].hardlink_root_id = text_bytes("ROOT");
+    entries[2].hardlink_logical_path = text_bytes("representative");
+    entries[3].symlink_target = text_bytes("representative");
+    return write_sidecar(fixture, entries, 4);
+}
+
+static int symlink_target_is(const char *path, const char *expected)
+{
+    char target[PATH_MAX];
+    ssize_t length = readlink(path, target, sizeof(target));
+    return length >= 0 && (size_t)length == strlen(expected) &&
+           memcmp(target, expected, (size_t)length) == 0;
+}
+
+static void test_link_rerun_is_idempotent(void)
+{
+    printf(BLUE "::" NC " portable restore rerun over its own links\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "link rerun fixture is created");
+    if (opened != 0)
+        return;
+
+    build_link_rerun_payload(&fixture);
+    check(write_link_rerun_sidecar(&fixture) == 0,
+          "link rerun sidecar is committed");
+
+    PortableRestoreReplayReport first;
+    int first_result = run_orchestration(&fixture, &first, 1, "y\n");
+    check(first_result == 0 && first.applied_count == 4 &&
+              first.failed_count == 0,
+          "the first restore applies the symlink and the hardlink");
+
+    PortableRestoreReplayReport second;
+    int second_result = run_orchestration(&fixture, &second, 1, "y\n");
+    check(second_result == 0 && second.live_count == 4 &&
+              second.applied_count == 4 && second.failed_count == 0,
+          "a rerun accepts the symlink and hardlink it already restored");
+
+    char representative[PATH_MAX], alias[PATH_MAX], link[PATH_MAX];
+    path_join_fixture(representative, sizeof(representative), fixture.home,
+                      "/restored/representative");
+    path_join_fixture(alias, sizeof(alias), fixture.home, "/restored/alias");
+    path_join_fixture(link, sizeof(link), fixture.home, "/restored/link");
+    struct stat representative_st, alias_st;
+    check(stat(representative, &representative_st) == 0 &&
+              stat(alias, &alias_st) == 0 &&
+              representative_st.st_dev == alias_st.st_dev &&
+              representative_st.st_ino == alias_st.st_ino &&
+              file_equals(alias, "rerun payload"),
+          "the rerun keeps the hardlink on the representative inode");
+    check(symlink_exact(link, "representative", 0777, geteuid(), getegid(),
+                        1700000830, 7, 1700000831, 8),
+          "the rerun keeps the symlink target and reapplies its metadata");
+    fixture_close(&fixture);
+}
+
+static void test_link_rerun_refuses_different_symlink(void)
+{
+    printf(BLUE "::" NC " portable restore refuses a different existing symlink\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "different symlink fixture is created");
+    if (opened != 0)
+        return;
+
+    build_link_rerun_payload(&fixture);
+    check(write_link_rerun_sidecar(&fixture) == 0,
+          "different symlink sidecar is committed");
+    make_dir_at(fixture.home_fd, "restored", 0700);
+    char link[PATH_MAX];
+    path_join_fixture(link, sizeof(link), fixture.home, "/restored/link");
+    check(symlink("elsewhere", link) == 0,
+          "a symlink with a different target is planted");
+
+    PortableRestoreReplayReport report;
+    int result = run_orchestration(&fixture, &report, 1, "y\n");
+    check(result != 0 && report.applied_count == 0,
+          "a symlink with a different target is still refused");
+    check(symlink_target_is(link, "elsewhere"),
+          "the refused symlink is left untouched");
+    fixture_close(&fixture);
+}
+
+static void test_link_rerun_refuses_foreign_hardlink_name(void)
+{
+    printf(BLUE "::" NC " portable restore refuses a foreign hardlink name\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "foreign hardlink fixture is created");
+    if (opened != 0)
+        return;
+
+    build_link_rerun_payload(&fixture);
+    check(write_link_rerun_sidecar(&fixture) == 0,
+          "foreign hardlink sidecar is committed");
+    PortableRestoreReplayReport first;
+    check(run_orchestration(&fixture, &first, 1, "y\n") == 0,
+          "the first restore succeeds");
+
+    char alias[PATH_MAX];
+    path_join_fixture(alias, sizeof(alias), fixture.home, "/restored/alias");
+    check(unlink(alias) == 0, "the restored hardlink name is removed");
+    int restored_fd = openat(fixture.home_fd, "restored",
+                             O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (restored_fd < 0)
+        fatal("could not open foreign hardlink destination");
+    write_file_at(restored_fd, "alias", "unrelated");
+    close(restored_fd);
+
+    PortableRestoreReplayReport report;
+    int result = run_orchestration(&fixture, &report, 1, "y\n");
+    check(result != 0 && report.failed_count == 1 &&
+              strcmp(report.failed_logical_path, "alias") == 0 &&
+              report.failed_kind_valid &&
+              report.failed_kind == SIDECAR_KIND_HARDLINK &&
+              report.failure_step ==
+                  PORTABLE_RESTORE_REPLAY_FAILURE_CHECK_DESTINATION &&
+              report.failure_errno == EEXIST,
+          "a hardlink name on another inode is still a conflict");
+    check(file_equals(alias, "unrelated"),
+          "the conflicting file is left untouched");
+    fixture_close(&fixture);
+}
+
 static void test_hardlink_cross_root(void)
 {
     printf(BLUE "::" NC " portable hardlink cross-root reference\n");
@@ -2448,6 +2605,9 @@ int main(void)
     test_user_dirs_is_preserved_as_local_state();
     test_security_xattr_tolerance_orchestration();
     test_hardlink_orchestration();
+    test_link_rerun_is_idempotent();
+    test_link_rerun_refuses_different_symlink();
+    test_link_rerun_refuses_foreign_hardlink_name();
     test_hardlink_cross_root();
     test_hardlink_cross_root_invalid_xdg_reference();
     test_xdg_destination_orchestration();

@@ -566,8 +566,13 @@ static void destination_profile_note_root_walk(void)
 #endif
 }
 
+/* accepted_symlink_target is non-NULL only for a symlink entry: an existing
+ * destination symlink with exactly that target is the entry already restored
+ * (a rerun) and is profiled like any existing leaf. Every other existing
+ * symlink leaf is refused so no write can be redirected through it. */
 static int open_destination_profile_anchor(int home_fd, const char *relative,
                                            DestinationProfileAnchorCache *cache,
+                                           const SidecarBytes *accepted_symlink_target,
                                            int *anchor_out,
                                            struct stat *existing,
                                            int *has_existing)
@@ -641,10 +646,17 @@ static int open_destination_profile_anchor(int home_fd, const char *relative,
             {
                 if (S_ISLNK(st.st_mode))
                 {
-                    int saved = ELOOP;
-                    close(current);
-                    errno = saved;
-                    return -1;
+                    int matches = accepted_symlink_target != NULL
+                        ? destination_symlink_target_matches(
+                              current, cursor, *accepted_symlink_target)
+                        : 0;
+                    if (matches != 1)
+                    {
+                        int saved = matches < 0 ? errno : ELOOP;
+                        close(current);
+                        errno = saved;
+                        return -1;
+                    }
                 }
                 *existing = st;
                 *has_existing = 1;
@@ -802,8 +814,15 @@ static int collect_metadata_profile(Collection *collection,
     struct stat existing;
     memset(&existing, 0, sizeof(existing));
     int has_existing = 0;
+    const SidecarBytes *accepted_symlink_target = NULL;
+    if (entry->kind == SIDECAR_KIND_SYMLINK &&
+        entry->address_index < collection->address_index.count &&
+        collection->address_index.entries[entry->address_index].entry != NULL)
+        accepted_symlink_target = &collection->address_index
+                                       .entries[entry->address_index]
+                                       .entry->symlink_target;
     if (open_destination_profile_anchor(route_anchor, relative, profile_cache,
-                                        &anchor,
+                                        accepted_symlink_target, &anchor,
                                         &existing, &has_existing) != 0)
     {
         report_violation(collection->report, root_index, entry->logical);

@@ -2094,16 +2094,29 @@ static int replay_apply_symlink(ReplayCollection *collection,
             failure,
             PORTABLE_RESTORE_REPLAY_FAILURE_RESOLVE_DESTINATION_PARENT,
             errno);
+    int already_present = 0;
     if (result == 0)
     {
         struct stat existing;
         if (fstatat(parent_fd, leaf, &existing, AT_SYMLINK_NOFOLLOW) == 0)
         {
-            errno = EEXIST;
-            result = -1;
-            replay_apply_failure_record(
-                failure, PORTABLE_RESTORE_REPLAY_FAILURE_CHECK_DESTINATION,
-                errno);
+            // A symlink with the recorded target is this entry from an
+            // earlier run; its metadata is still applied below.
+            int matches = S_ISLNK(existing.st_mode)
+                ? destination_symlink_target_matches(parent_fd, leaf,
+                                                     entry->symlink_target)
+                : 0;
+            if (matches == 1)
+                already_present = 1;
+            else
+            {
+                if (matches == 0)
+                    errno = EEXIST;
+                result = -1;
+                replay_apply_failure_record(
+                    failure, PORTABLE_RESTORE_REPLAY_FAILURE_CHECK_DESTINATION,
+                    errno);
+            }
         }
         else if (errno != ENOENT)
         {
@@ -2113,7 +2126,8 @@ static int replay_apply_symlink(ReplayCollection *collection,
                 errno);
         }
     }
-    if (result == 0 && symlinkat(target, parent_fd, leaf) != 0)
+    if (result == 0 && !already_present &&
+        symlinkat(target, parent_fd, leaf) != 0)
     {
         result = -1;
         replay_apply_failure_record(
@@ -2281,16 +2295,25 @@ static int replay_apply_hardlink(ReplayCollection *collection,
             PORTABLE_RESTORE_REPLAY_FAILURE_RESOLVE_HARDLINK_REFERENCE,
             errno);
     }
+    int already_linked = 0;
     if (result == 0)
     {
         struct stat existing;
         if (fstatat(parent_fd, leaf, &existing, AT_SYMLINK_NOFOLLOW) == 0)
         {
-            errno = EEXIST;
-            result = -1;
-            replay_apply_failure_record(
-                failure, PORTABLE_RESTORE_REPLAY_FAILURE_CHECK_DESTINATION,
-                errno);
+            // A name already on the reference's inode is this entry from an
+            // earlier run.
+            if (S_ISREG(existing.st_mode) &&
+                replay_hardlink_identity_matches(&existing, &reference_before))
+                already_linked = 1;
+            else
+            {
+                errno = EEXIST;
+                result = -1;
+                replay_apply_failure_record(
+                    failure, PORTABLE_RESTORE_REPLAY_FAILURE_CHECK_DESTINATION,
+                    errno);
+            }
         }
         else if (errno != ENOENT)
         {
@@ -2301,10 +2324,11 @@ static int replay_apply_hardlink(ReplayCollection *collection,
         }
     }
 #ifdef PORTABLE_RESTORE_REPLAY_TEST_HOOKS
-    if (result == 0 && hardlink_race_hook != NULL)
+    if (result == 0 && !already_linked && hardlink_race_hook != NULL)
         hardlink_race_hook();
 #endif
-    if (result == 0 && linkat(ref_parent_fd, ref_leaf, parent_fd, leaf, 0) != 0)
+    if (result == 0 && !already_linked &&
+        linkat(ref_parent_fd, ref_leaf, parent_fd, leaf, 0) != 0)
     {
         result = -1;
         replay_apply_failure_record(

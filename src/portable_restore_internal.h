@@ -189,6 +189,11 @@ int destination_identity_route(
     int *xdg_anchor_fd, char (*xdg_anchor_prefix)[PATH_MAX], int *anchor_out,
     char *relative, size_t relative_size);
 int sidecar_kind_to_type(SidecarObjectKind kind, mode_t *type);
+/* Returns 1 when leaf is a symlink whose target is exactly target, 0 when it
+ * is not a symlink or points elsewhere, and -1 with errno on a read error.
+ * A restore rerun treats a matching symlink as already applied. */
+int destination_symlink_target_matches(int parent_fd, const char *leaf,
+                                       SidecarBytes target);
 int sidecar_is_complete_readonly(int container_fd);
 
 void destination_identity_graph_init(DestinationIdentityGraph *graph,
