@@ -1989,6 +1989,65 @@ static void write_fake_process(const char *proc_root, const char *pid,
     write_file_mode(file, content, 0644);
 }
 
+static void ignore_dconf_database(int database_fd, void *context)
+{
+    (void)database_fd;
+    (void)context;
+}
+
+static void record_dconf_database(int database_fd, void *context)
+{
+    const char *marker = context;
+    char content[128] = {0};
+    ssize_t got = pread(database_fd, content, sizeof(content) - 1U, 0);
+    if (got >= 0)
+        write_file_mode(marker, content, 0600);
+}
+
+static void test_native_restore_applies_dconf(void)
+{
+    printf(BLUE "::" NC " restore dispatch: a native restore hands its dconf database to the session step\n");
+    char source[PATH_MAX], home[PATH_MAX], marker[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_native_dconf_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_native_dconf_home");
+    setenv("HOME", home, 1);
+
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "BUILTIN_DOT_CONFIG");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "BUILTIN_DOT_CONFIG");
+    strcpy(root.source_path, ".config");
+    strcpy(root.restore_path, ".config");
+    root.has_restore_path = 1;
+    Manifest manifest;
+    make_v1_manifest(&manifest, &root, 1);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the native dconf manifest");
+    write_payload_file(source, "data/BUILTIN_DOT_CONFIG/dconf", "user",
+                       "GVDB-native");
+    remove_fixture_packages(source);
+
+    join_path(marker, sizeof(marker), home, "dconf-handed-over");
+    restore_test_set_dconf_hook(record_dconf_database, marker);
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    char output[16384];
+    int rc = run_restore_capturing_with_input(source, "y\n", output,
+                                               sizeof(output));
+    dry_run = previous_dry_run;
+    restore_test_set_dconf_hook(ignore_dconf_database, NULL);
+
+    char restored[PATH_MAX];
+    join_path(restored, sizeof(restored), home, ".config/dconf/user");
+    check(rc == 0 && file_content_is(restored, "GVDB-native"),
+          "the native restore writes the dconf database");
+    check(file_content_is(marker, "GVDB-native"),
+          "the backed-up database is handed to the running-session step");
+    remove_tree(source);
+    remove_tree(home);
+}
+
 static char verification_mutation_path[PATH_MAX];
 
 static void rewrite_restored_file_after_apply(void)
@@ -3737,6 +3796,8 @@ static void test_network_config_roundtrip(const char *backend_name,
 
 int main(void)
 {
+    // No dispatch test may reach the real dconf of the user running it.
+    restore_test_set_dconf_hook(ignore_dconf_database, NULL);
     // Network hints must not depend on whether this machine runs NetworkManager.
     restore_test_set_network_manager_runtime_dir("/nonexistent/migr-test-nm");
     printf(BLUE "::" NC " restore dispatch (unit)\n");
@@ -3751,6 +3812,7 @@ int main(void)
     test_dispatch_requires_v1_manifest_for_final_container_name();
     test_dispatch_refuses_portable_v1();
     test_running_writer_detection();
+    test_native_restore_applies_dconf();
     test_verification_failure_still_restores_packages();
     test_portable_replay_failure_names_entry();
     test_v1_refuses_missing_declared_payloads();

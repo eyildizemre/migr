@@ -3988,7 +3988,7 @@ scope.
 
 ## D50 — 2026-09-24 — Load the restored dconf database into a running session
 
-**Status:** Implemented (portable restore)
+**Status:** Implemented
 
 **Decision:** When a portable replay applies the source HOME's
 `.config/dconf/user` (identified like D41's known files, from the manifest source
@@ -4000,6 +4000,10 @@ naming only that copy (`DCONF_PROFILE`, `XDG_CONFIG_HOME`), and applies the dump
 with `dconf load /` over the target user's session bus
 (`/run/user/<uid>/bus`). Under sudo both commands run as the invoking user,
 resolved as in D38. Keys absent from the backup keep their current values.
+
+A native restore finds the same database directly in its container, under
+`data/<payload>/dconf/user` of the root captured from `.config`, and applies it
+the same way after its files are restored.
 
 With no session bus socket, nothing can hold the database in memory, so the
 restored file is already the result and no command runs. With no `dconf` on

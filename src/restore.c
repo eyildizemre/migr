@@ -583,6 +583,17 @@ static void restore_warn_running_writers(void *context)
     printf(".\nClose them before continuing.\n\n");
 }
 
+#ifdef RESTORE_TEST_HOOKS
+static RestoreTestDconfHook restore_test_dconf_hook;
+static void *restore_test_dconf_context;
+
+void restore_test_set_dconf_hook(RestoreTestDconfHook hook, void *context)
+{
+    restore_test_dconf_hook = hook;
+    restore_test_dconf_context = context;
+}
+#endif
+
 // Loads the backed-up dconf database into a running session, where replacing
 // ~/.config/dconf/user alone is overwritten by the dconf service (D50).
 static void restore_dconf_settings(int database_fd, int *had_error)
@@ -590,6 +601,13 @@ static void restore_dconf_settings(int database_fd, int *had_error)
     if (database_fd < 0)
         return;
     size_t keys = 0;
+#ifdef RESTORE_TEST_HOOKS
+    if (restore_test_dconf_hook != NULL)
+    {
+        restore_test_dconf_hook(database_fd, restore_test_dconf_context);
+        return;
+    }
+#endif
     DconfRestoreStatus status = dconf_restore_apply(database_fd, &keys);
     if (status == DCONF_RESTORE_APPLIED && keys != 0)
     {
@@ -609,6 +627,34 @@ static void restore_dconf_settings(int database_fd, int *had_error)
         if (had_error != NULL)
             *had_error = 1;
     }
+}
+
+// A native container mirrors each root under data/<payload>, so the dconf
+// database of the root captured from HOME/.config is at a fixed place.
+static int native_dconf_database_fd(int source_root_fd, const Manifest *m)
+{
+    for (int index = 0; index < m->root_count; index++)
+    {
+        const ManifestRoot *root = &m->roots[index];
+        if (root->policy != ROOT_POLICY_HOME_RELATIVE ||
+            strcmp(root->source_path, ".config") != 0)
+            continue;
+        char relative[PATH_MAX];
+        int length = snprintf(relative, sizeof(relative), "data/%s/dconf/user",
+                              root->payload_path);
+        if (length < 0 || (size_t)length >= sizeof(relative))
+            return -1;
+        int fd = openat(source_root_fd, relative,
+                        O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+        struct stat st;
+        if (fd >= 0 && (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)))
+        {
+            close(fd);
+            fd = -1;
+        }
+        return fd;
+    }
+    return -1;
 }
 
 static void restore_network_config(int source_root_fd, int *had_error)
@@ -3079,6 +3125,13 @@ int restore_with_options(const char *source, const RestoreOptions *options)
     native_inode_map_free(ctx.inode_map);
     ctx.inode_map = NULL;
 
+    if (!dry_run && mst == MANIFEST_STATUS_VALID)
+    {
+        int dconf_database_fd = native_dconf_database_fd(source_root_fd, &m);
+        restore_dconf_settings(dconf_database_fd, &had_error);
+        if (dconf_database_fd >= 0)
+            close(dconf_database_fd);
+    }
     restore_packages(source_root_fd, home, &had_error);
     if (mst == MANIFEST_STATUS_VALID && m.has_network_config)
         restore_network_config(source_root_fd, &had_error);
