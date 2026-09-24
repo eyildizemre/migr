@@ -109,6 +109,13 @@ void backup_test_set_progress_hook(BackupTestProgressHook hook,
 void backup_test_set_network_config_source_dir(const char *backend_name,
                                                const char *source_dir);
 
+/* Runs after the final sync and before the journal is read back from the
+ * destination, so a test can make the device's copy differ. */
+typedef void (*BackupTestSidecarReadbackHook)(int container_fd, void *context);
+
+void backup_test_set_sidecar_readback_hook(BackupTestSidecarReadbackHook hook,
+                                           void *context);
+
 void backup_test_force_portable_representation(int enabled);
 void backup_test_force_case_insensitive_destination(int enabled);
 void backup_test_set_restore_privilege_bypass(int enabled);

@@ -27,6 +27,7 @@
 #include "packages.h"
 #include "portable.h"
 #include "selfcopy.h"
+#include "sidecar.h"
 #include "utils.h"
 #include "xdg.h"
 
@@ -64,6 +65,15 @@ static const char *backup_test_network_config_source_dirs[
 static int backup_test_portable_representation_forced;
 static int backup_test_case_insensitive_destination_forced;
 static int backup_test_restore_privilege_bypass;
+static BackupTestSidecarReadbackHook backup_test_sidecar_readback_hook;
+static void *backup_test_sidecar_readback_context;
+
+void backup_test_set_sidecar_readback_hook(BackupTestSidecarReadbackHook hook,
+                                           void *context)
+{
+    backup_test_sidecar_readback_hook = hook;
+    backup_test_sidecar_readback_context = context;
+}
 
 void backup_test_set_inventory_hook(BackupTestInventoryHook hook,
                                     void *context)
@@ -2562,6 +2572,59 @@ char *backup_test_collect_vscode_extensions(void)
 }
 #endif
 
+/* Every read during capture is served from the page cache, so a journal the
+ * device stored differently (e.g. a cluster the filesystem also handed to
+ * another file) still parses there. After syncing, drop the journal's clean
+ * pages and parse it again from the device before publishing. Returns 0 when
+ * it parses completely, 1 when it is damaged (valid_bytes is the last valid
+ * record boundary), and -1 with errno when it cannot be read. */
+static int backup_sidecar_readback(int container_fd, uint64_t *valid_bytes,
+                                   uint64_t *file_bytes)
+{
+    *valid_bytes = 0;
+    *file_bytes = 0;
+    if (container_fd < 0)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    if (syncfs(container_fd) != 0)
+        return -1;
+#ifdef BACKUP_TEST_HOOKS
+    if (backup_test_sidecar_readback_hook != NULL)
+        backup_test_sidecar_readback_hook(container_fd,
+                                          backup_test_sidecar_readback_context);
+#endif
+    int fd = openat(container_fd, SIDECAR_SLOT_NAME,
+                    O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    struct stat st;
+    if (fstat(fd, &st) != 0)
+    {
+        int saved = errno;
+        close(fd);
+        errno = saved;
+        return -1;
+    }
+    (void)posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+    SidecarParseResult parse;
+    memset(&parse, 0, sizeof(parse));
+    SidecarStatus status = sidecar_parse_fd(fd, NULL, NULL, &parse);
+    int saved = errno;
+    close(fd);
+    *file_bytes = (uint64_t)st.st_size;
+    *valid_bytes = parse.last_valid_boundary;
+    if (status == SIDECAR_STATUS_IO_ERROR)
+    {
+        errno = saved != 0 ? saved : EIO;
+        return -1;
+    }
+    return status == SIDECAR_STATUS_OK &&
+                   parse.bytes_read == (uint64_t)st.st_size
+               ? 0 : 1;
+}
+
 static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
                       const SelectionPlan *selection, int include_self,
                       int include_network_config)
@@ -3103,6 +3166,32 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
     }
 
     printf("Finalizing (syncing to disk)...\n");
+    if (repr == CLONE_PORTABLE_SIDECAR)
+    {
+        uint64_t valid_bytes = 0;
+        uint64_t file_bytes = 0;
+        int readback = backup_sidecar_readback(container_root_fd(&container),
+                                               &valid_bytes, &file_bytes);
+        if (readback != 0)
+        {
+            if (readback > 0)
+                print_error("Error: the backup journal (%s) read back from %s "
+                            "is damaged at byte %ju of %ju: the drive did not "
+                            "keep what was written\n",
+                            SIDECAR_SLOT_NAME, target, (uintmax_t)valid_bytes,
+                            (uintmax_t)file_bytes);
+            else
+                print_error("Error: could not read the backup journal (%s) "
+                            "back from %s: %s\n",
+                            SIDECAR_SLOT_NAME, target, strerror(errno));
+            printf("The backup was not published and cannot be restored or "
+                   "resumed. Remove %s/%s and back up again, preferably to a "
+                   "different drive.\n",
+                   target, container_current_name(&container));
+            finish_result = 1;
+            goto finish;
+        }
+    }
     ContainerStatus final_status = container_finalize(&container);
     if (final_status != CONTAINER_OK)
     {

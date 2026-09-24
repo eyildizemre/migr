@@ -2988,6 +2988,93 @@ static void test_portable_prescan_failure_diagnostics(void)
     remove_tree(home);
 }
 
+// Counts the target's published (".partial"-less) and in-progress containers.
+static void count_containers(const char *target, int *published, int *partial)
+{
+    *published = 0;
+    *partial = 0;
+    DIR *dir = opendir(target);
+    if (dir == NULL)
+        return;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL)
+    {
+        if (strncmp(entry->d_name, "migr_backup_", 12) != 0)
+            continue;
+        size_t length = strlen(entry->d_name);
+        if (length > 8 && strcmp(entry->d_name + length - 8, ".partial") == 0)
+            (*partial)++;
+        else
+            (*published)++;
+    }
+    closedir(dir);
+}
+
+// Stands in for a drive that stored a different cluster than the one
+// written: a run of zero bytes replaces part of the journal on disk.
+static void damage_sidecar_on_disk(int container_fd, void *context)
+{
+    (void)context;
+    int fd = openat(container_fd, "sidecar.migr", O_WRONLY | O_CLOEXEC);
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) != 0 || st.st_size < 64)
+        _exit(3);
+    char zeros[32] = {0};
+    if (pwrite(fd, zeros, sizeof(zeros), st.st_size / 3) !=
+            (ssize_t)sizeof(zeros) ||
+        close(fd) != 0)
+        _exit(3);
+}
+
+static void test_portable_sidecar_readback(void)
+{
+    printf(BLUE "::" NC " production: portable journal is read back before publishing\n");
+    char home[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_readback_home");
+    setenv("HOME", home, 1);
+    char source[PATH_MAX], file[PATH_MAX], nested[PATH_MAX];
+    join_path(source, sizeof(source), home, "source");
+    join_path(nested, sizeof(nested), source, "nested");
+    mkdir_p(nested);
+    join_path(file, sizeof(file), source, "a.txt");
+    write_file(file, "alpha\n");
+    join_path(file, sizeof(file), nested, "b.txt");
+    write_file(file, "beta\n");
+    char *paths[] = { source, NULL };
+
+    char target[PATH_MAX];
+    char output[8192];
+    int published = 0, partial = 0;
+    fresh_mkdtemp(target, sizeof(target), "plan_readback_target");
+    backup_test_force_portable_representation(1);
+    int rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                  output, sizeof(output));
+    backup_test_force_portable_representation(0);
+    count_containers(target, &published, &partial);
+    check(rc == 0 && published == 1 && partial == 0 &&
+              strstr(output, "Backup complete") != NULL,
+          "a journal that reads back intact is published");
+    remove_tree(target);
+
+    fresh_mkdtemp(target, sizeof(target), "plan_readback_target");
+    backup_test_force_portable_representation(1);
+    backup_test_set_sidecar_readback_hook(damage_sidecar_on_disk, NULL);
+    rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                              output, sizeof(output));
+    backup_test_set_sidecar_readback_hook(NULL, NULL);
+    backup_test_force_portable_representation(0);
+    count_containers(target, &published, &partial);
+    check(rc == 1 && published == 0 && partial == 1,
+          "a journal damaged on the drive keeps the backup unpublished");
+    check(strstr(output, "sidecar.migr") != NULL &&
+              strstr(output, "is damaged at byte") != NULL &&
+              strstr(output, "did not keep what was written") != NULL &&
+              strstr(output, "Backup complete") == NULL,
+          "the damaged journal is reported with its offset, not as complete");
+    remove_tree(target);
+    remove_tree(home);
+}
+
 static void test_format_duration(void)
 {
     printf(BLUE "::" NC " utility: duration formatting for progress output\n");
@@ -3536,6 +3623,7 @@ int main(void)
     test_include_self_backup();
     test_include_network_config_backup();
     test_portable_prescan_failure_diagnostics();
+    test_portable_sidecar_readback();
     test_vscode_extension_snapshot();
     test_format_duration();
     test_progress_speed_is_cumulative_average();

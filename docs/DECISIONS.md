@@ -4022,3 +4022,30 @@ already carries the data).
 
 **Relationship:** Complements D44/D48 rather than replacing them: the byte-level
 read-back exclusion stays, because the file remains live after the load.
+
+---
+
+## D51 — 2026-09-24 — Read the portable journal back from the device before publishing
+
+**Status:** Implemented
+
+**Decision:** Before `container_finalize()` publishes a portable container,
+backup syncs the container's filesystem, drops `sidecar.migr`'s clean pages
+with `posix_fadvise(POSIX_FADV_DONTNEED)`, and parses the whole journal again
+with `sidecar_parse_fd()`. Only a journal that parses to `SIDECAR_STATUS_OK`
+through its full size is published. A damaged journal is reported with its last
+valid record boundary and file size, and the container stays unpublished with a
+message to remove it and back up again, preferably to a different drive.
+Native containers have no journal and are unchanged.
+
+**Why:** On real hardware a finished backup reported `OK` while one 128 KiB
+cluster of its journal already held a deleted directory block on disk. Every
+read during capture, including resume adoption, was served from the page cache,
+so the damage surfaced only when the new machine read the drive and restore
+refused the backup. Parsing from the device before publication moves that
+failure to the moment the source machine still exists.
+
+**Limits:** Dropping cached pages is advisory and only affects clean pages, which
+the preceding sync guarantees; it cannot prove that later reads will match.
+Payload files are not read back; a capture-time content digest would be the
+basis for verifying them.
