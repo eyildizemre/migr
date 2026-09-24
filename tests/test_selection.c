@@ -237,6 +237,32 @@ int main(void)
     for (size_t i = 0; i < a.excludes.count; i++)
         CHECK(strcmp(a.excludes.paths[i], flatpak_path) != 0);
     selection_plan_free(&a);
+    /* Top-level HOME entries the plan leaves out are listed, largest first. */
+    CHECK(mkdir(".var", 0700) == 0);
+    file(".var/state", "0123456789");
+    CHECK(mkdir("Games", 0700) == 0);
+    file("Games/save", "01234");
+    CHECK(mkdir(".cache", 0700) == 0);
+    file(".cache/blob", "cache");
+    CHECK(mkdir("Skipped", 0700) == 0);
+    CHECK(build(home, BACKUP_CRITICAL, "[critical]\n[exclude]\n~/Skipped\n", &a) == 0);
+    SelectionUncovered *uncovered = NULL;
+    size_t uncovered_count = 0;
+    CHECK(selection_plan_uncovered(&a, &uncovered, &uncovered_count) == 0);
+    int saw_var = 0, saw_games = 0, var_first = 0, saw_covered = 0;
+    for (size_t i = 0; i < uncovered_count; i++)
+    {
+        const char *name = uncovered[i].name;
+        if (!strcmp(name, ".var")) { saw_var = 1; var_first = !saw_games && uncovered[i].size == 10; }
+        if (!strcmp(name, "Games")) saw_games = uncovered[i].size == 5;
+        if (!strcmp(name, ".cache") || !strcmp(name, ".config") || !strcmp(name, ".local") ||
+            !strcmp(name, "Documents") || !strcmp(name, "Skipped") || !strcmp(name, ".profile"))
+            saw_covered = 1;
+    }
+    CHECK(saw_var && saw_games && var_first);
+    CHECK(!saw_covered);
+    free(uncovered);
+    selection_plan_free(&a);
     const char *paths[] = {"extra", "extra/child", NULL};
     CHECK(backup_plan_build(home, BACKUP_EXPLICIT_PATHS, paths, &legacy) < 0);
     backup_plan_free(&legacy);

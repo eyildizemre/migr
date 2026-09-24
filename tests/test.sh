@@ -112,6 +112,11 @@ assert_contains() {
     fi
 }
 
+# The part of a report above its "Not included" list: what the scope covers.
+included_part() {
+    printf '%s' "${1%%Not included*}"
+}
+
 assert_not_contains() {
     local output="$1"
     local unexpected="$2"
@@ -289,7 +294,8 @@ test_report() {
         echo -e "  ${RED}✗${NC} Default report differs from explicit critical report."
         exit 1
     fi
-    assert_not_contains "$default_output" "Projects"
+    assert_not_contains "$(included_part "$default_output")" "Projects"
+    assert_contains "${default_output#*Not included}" "Projects"
     assert_contains "$default_output" "Desktop"
     assert_contains "$critical_output" "Dotfiles & Config"
     assert_contains "$critical_output" ".profile"
@@ -436,7 +442,8 @@ test_report() {
     assert_contains "$comprehensive_output" "Desktop"
     assert_contains "$comprehensive_output" "Videos"
     assert_contains "$comprehensive_output" "Music"
-    assert_not_contains "$comprehensive_output" "Projects"
+    assert_not_contains "$(included_part "$comprehensive_output")" "Projects"
+    assert_contains "${comprehensive_output#*Not included}" "Projects"
     assert_contains "$comprehensive_output" "Firefox"
     assert_not_contains "$comprehensive_output" ".mozilla"
     assert_not_contains "$comprehensive_output" "google-chrome"

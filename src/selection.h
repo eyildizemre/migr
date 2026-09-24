@@ -37,6 +37,21 @@ int selection_plan_build(const char *home, BackupMode mode,
 void selection_plan_free(SelectionPlan *plan);
 /* Prints the plan's scope notes (automatic exclusions) for report/backup. */
 void selection_plan_print_notes(const SelectionPlan *plan);
+
+/* A top-level HOME entry that no planned root covers and no exclusion names. */
+typedef struct {
+    char name[NAME_MAX + 1];
+    off_t size;
+    int size_known;
+} SelectionUncovered;
+
+/* Lists top-level HOME entries the plan leaves out, largest first, skipping
+ * entries that contain a planned root, excluded entries, and .cache. The
+ * caller frees *out. Returns -1 when HOME cannot be listed. */
+int selection_plan_uncovered(const SelectionPlan *plan,
+                             SelectionUncovered **out, size_t *count);
+/* Prints selection_plan_uncovered()'s result, bounded, for report/backup. */
+void selection_plan_print_uncovered(const SelectionPlan *plan);
 /* Owns a copied root/policy table. Uses VERSION=1 for unfiltered disjoint plans.
  * Caller supplies source identity and representation/sidecar/optional flags. */
 int selection_plan_manifest(const SelectionPlan *plan, Manifest *out);

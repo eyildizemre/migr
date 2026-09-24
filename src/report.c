@@ -401,6 +401,11 @@ static int report_plan(const char *home, const BackupPlan *plan,
             printf("\n");
             selection_plan_print_notes(selection);
         }
+        if (selection != NULL)
+        {
+            printf("\n");
+            selection_plan_print_uncovered(selection);
+        }
         if (had_error)
         {
             printf("\nWarning: some paths could not be measured; "

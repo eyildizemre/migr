@@ -1293,6 +1293,141 @@ void selection_plan_print_notes(const SelectionPlan *plan)
                "download cache and is left out.\n");
 }
 
+// Sums regular-file sizes below dir_fd/name without following symlinks.
+// Unreadable subtrees make the total a lower bound (*complete = 0).
+static off_t tree_size_at(int dir_fd, const char *name, int depth,
+                          int *complete)
+{
+    struct stat st;
+    if (fstatat(dir_fd, name, &st, AT_SYMLINK_NOFOLLOW) != 0)
+    {
+        *complete = 0;
+        return 0;
+    }
+    if (!S_ISDIR(st.st_mode))
+        return S_ISREG(st.st_mode) ? st.st_size : 0;
+    if (depth > 256)
+    {
+        *complete = 0;
+        return 0;
+    }
+    int fd = openat(dir_fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    DIR *dir = fd >= 0 ? fdopendir(fd) : NULL;
+    if (dir == NULL)
+    {
+        if (fd >= 0)
+            close(fd);
+        *complete = 0;
+        return 0;
+    }
+    off_t total = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL)
+    {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            continue;
+        total += tree_size_at(dirfd(dir), entry->d_name, depth + 1, complete);
+    }
+    closedir(dir);
+    return total;
+}
+
+static int uncovered_compare(const void *left, const void *right)
+{
+    const SelectionUncovered *a = left, *b = right;
+    if (a->size != b->size)
+        return a->size > b->size ? -1 : 1;
+    return strcmp(a->name, b->name);
+}
+
+int selection_plan_uncovered(const SelectionPlan *plan,
+                             SelectionUncovered **out, size_t *count)
+{
+    if (plan == NULL || out == NULL || count == NULL)
+        return -1;
+    *out = NULL;
+    *count = 0;
+    int home_fd = open(plan->home, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    DIR *dir = home_fd >= 0 ? fdopendir(home_fd) : NULL;
+    if (dir == NULL)
+    {
+        if (home_fd >= 0)
+            close(home_fd);
+        return -1;
+    }
+    SelectionUncovered *items = NULL;
+    size_t used = 0, capacity = 0;
+    int failed = 0;
+    struct dirent *entry;
+    while (!failed && (entry = readdir(dir)) != NULL)
+    {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0 ||
+            strcmp(entry->d_name, ".cache") == 0)
+            continue;
+        char path[PATH_MAX];
+        if (path_join(path, sizeof(path), plan->home, entry->d_name) != 0)
+            continue;
+        int skip = 0;
+        for (size_t i = 0; i < plan->root_count && !skip; i++)
+            skip = path_covers(path, plan->roots[i].root.capture_path) ||
+                   path_covers(plan->roots[i].root.capture_path, path);
+        for (size_t i = 0; i < plan->excludes.count && !skip; i++)
+            skip = path_covers(plan->excludes.paths[i], path);
+        if (skip)
+            continue;
+        if (used == capacity)
+        {
+            size_t grown = capacity ? capacity * 2 : 16;
+            SelectionUncovered *next = realloc(items, grown * sizeof(*items));
+            if (next == NULL)
+            {
+                failed = 1;
+                break;
+            }
+            items = next;
+            capacity = grown;
+        }
+        SelectionUncovered *item = &items[used++];
+        snprintf(item->name, sizeof(item->name), "%s", entry->d_name);
+        item->size_known = 1;
+        item->size = tree_size_at(dirfd(dir), entry->d_name, 0, &item->size_known);
+    }
+    closedir(dir);
+    if (failed)
+    {
+        free(items);
+        return -1;
+    }
+    if (used > 1)
+        qsort(items, used, sizeof(*items), uncovered_compare);
+    *out = items;
+    *count = used;
+    return 0;
+}
+
+void selection_plan_print_uncovered(const SelectionPlan *plan)
+{
+    SelectionUncovered *items = NULL;
+    size_t count = 0;
+    if (selection_plan_uncovered(plan, &items, &count) != 0 || count == 0)
+    {
+        free(items);
+        return;
+    }
+    enum { SHOWN = 15 };
+    printf("Not included (add a path with `migr conf` to back it up):\n");
+    for (size_t i = 0; i < count && i < SHOWN; i++)
+    {
+        char size[32];
+        format_size(items[i].size, size, sizeof(size));
+        printf("  %-28s %s%s\n", items[i].name, items[i].size_known ? "" : ">",
+               size);
+    }
+    if (count > SHOWN)
+        printf("  ... and %zu more\n", count - SHOWN);
+    free(items);
+}
+
 int selection_plan_build(const char *home, BackupMode mode,
                          const Config *config, SelectionPlan *out)
 {
