@@ -178,6 +178,22 @@ static void test_identity_environment(void)
     free(home_entry);
     free(env);
 
+    const char *const overrides[] = {
+        "XDG_CONFIG_HOME=/tmp/profile", "LANG=tr_TR.UTF-8", NULL
+    };
+    const char *const expected_overridden[] = {
+        "PATH=/usr/bin", "HOMEDIR=/keep", "XDG_CONFIG_HOME_X=/keep",
+        "XDG_RUNTIME_DIR=/run/user/1000", "HOME=/home/target",
+        "XDG_CONFIG_HOME=/tmp/profile", "LANG=tr_TR.UTF-8", NULL
+    };
+    home_entry = NULL;
+    env = fileops_test_build_command_environment(
+        base, "/home/target", overrides, &home_entry);
+    check(env != NULL && env_equals(env, expected_overridden),
+          "overrides replace inherited entries and may re-set a dropped name");
+    free(home_entry);
+    free(env);
+
     home_entry = NULL;
     check(fileops_test_build_identity_environment(
               base, "relative/home", &home_entry) == NULL &&

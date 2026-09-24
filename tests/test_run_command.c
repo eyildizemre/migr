@@ -1,8 +1,12 @@
 #define _GNU_SOURCE
 
 #include <errno.h>
+#include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+#include <unistd.h>
 
 #include "fileops.h"
 
@@ -116,6 +120,103 @@ int main(void)
           "a NULL output buffer is rejected before anything is spawned");
     check(run_command_capture(echo_argv, output, 0) == -1,
           "a zero-size output buffer is rejected before anything is spawned");
+
+    printf(BLUE "::" NC " run_command_capture_with (unit)\n");
+
+    setenv("MIGR_TEST_INHERITED", "base", 1);
+    setenv("MIGR_TEST_REPLACED", "old", 1);
+    const char *const overrides[] = {
+        "MIGR_TEST_REPLACED=new", "MIGR_TEST_ADDED=1", NULL
+    };
+    RunCommandOptions env_options = { .env = overrides };
+    char *const env_argv[] = {
+        "sh", "-c",
+        "printf '%s|%s|%s|' \"$MIGR_TEST_INHERITED\" \"$MIGR_TEST_REPLACED\" "
+        "\"$MIGR_TEST_ADDED\"",
+        NULL
+    };
+    rc = run_command_capture_with(env_argv, output, sizeof(output),
+                                  &env_options);
+    check(rc == 0 && strncmp(output, "base|new|1|", 11) == 0,
+          "env entries are added and replace inherited ones");
+    // The shell would collapse duplicate names, so inspect the raw
+    // environment the child was given.
+    char raw_env[65536];
+    char *const raw_env_argv[] = { "env", NULL };
+    rc = run_command_capture_with(raw_env_argv, raw_env, sizeof(raw_env),
+                                  &env_options);
+    size_t replaced_count = 0;
+    for (const char *line = raw_env; line != NULL && *line != '\0';)
+    {
+        if (strncmp(line, "MIGR_TEST_REPLACED=", 19) == 0)
+            replaced_count++;
+        line = strchr(line, '\n');
+        if (line != NULL)
+            line++;
+    }
+    check(rc == 0 && replaced_count == 1 &&
+              strstr(raw_env, "MIGR_TEST_REPLACED=new\n") != NULL,
+          "a replaced name appears exactly once in the child's environment");
+
+    const char *const malformed[] = { "NOEQUALS", NULL };
+    RunCommandOptions malformed_options = { .env = malformed };
+    check(run_command_capture_with(echo_argv, output, sizeof(output),
+                                   &malformed_options) == -1,
+          "a malformed env entry is rejected before anything is spawned");
+    RunCommandOptions homeless_drop = {
+        .drop_identity = 1, .uid = getuid(), .gid = getgid()
+    };
+    check(run_command_capture_with(echo_argv, output, sizeof(output),
+                                   &homeless_drop) == -1,
+          "an identity drop without a home is rejected before spawning");
+
+    char *const cat_argv[] = { "cat", NULL };
+    RunCommandOptions stdin_options = {
+        .stdin_data = "hello\n", .stdin_length = strlen("hello\n")
+    };
+    rc = run_command_capture_with(cat_argv, output, sizeof(output),
+                                  &stdin_options);
+    check(rc == 0 && strcmp(output, "hello\n") == 0,
+          "stdin data reaches the child");
+
+    RunCommandOptions empty_stdin = { .stdin_data = "", .stdin_length = 0 };
+    output[0] = '\1';
+    rc = run_command_capture_with(cat_argv, output, sizeof(output),
+                                  &empty_stdin);
+    check(rc == 0 && output[0] == '\0',
+          "empty stdin data gives the child an immediate EOF");
+
+    // Far larger than both pipe buffers: cat echoes while migr is still
+    // writing, so a write-all-then-read implementation would deadlock.
+    size_t big_length = 2U * 1024U * 1024U;
+    char *big = malloc(big_length);
+    if (big == NULL)
+    {
+        printf("could not allocate the large stdin fixture\n");
+        return 1;
+    }
+    memset(big, 'x', big_length);
+    RunCommandOptions big_options = {
+        .stdin_data = big, .stdin_length = big_length
+    };
+    char tiny[16];
+    rc = run_command_capture_with(cat_argv, tiny, sizeof(tiny), &big_options);
+    check(rc == 0 && strlen(tiny) == sizeof(tiny) - 1U,
+          "large stdin is fed while stdout is drained, without deadlock");
+
+    char *const ignore_argv[] = { "true", NULL };
+    rc = run_command_capture_with(ignore_argv, output, sizeof(output),
+                                  &big_options);
+    sigset_t mask, pending;
+    sigemptyset(&mask);
+    sigemptyset(&pending);
+    int mask_ok = sigprocmask(SIG_BLOCK, NULL, &mask) == 0 &&
+                  sigpending(&pending) == 0;
+    check(rc == 0 && mask_ok && !sigismember(&mask, SIGPIPE) &&
+              !sigismember(&pending, SIGPIPE),
+          "a child that ignores its stdin cannot kill migr with SIGPIPE, "
+          "and the signal mask is restored");
+    free(big);
 
     printf("run_command tests: %d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;

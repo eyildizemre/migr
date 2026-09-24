@@ -383,6 +383,10 @@ void restore_native_test_fail_source_read_after(size_t successful_opens);
 char **fileops_test_build_identity_environment(char *const *base,
                                                const char *home,
                                                char **home_entry_out);
+char **fileops_test_build_command_environment(char *const *base,
+                                              const char *home,
+                                              const char *const *overrides,
+                                              char **home_entry_out);
 #endif
 
 /**
@@ -444,5 +448,35 @@ int run_command_capture(char *const argv[], char *output, size_t output_size);
 int run_command_capture_as_identity(char *const argv[], char *output,
                                     size_t output_size, uid_t uid, gid_t gid,
                                     const char *home);
+
+/** @brief Options for run_command_capture_with(); zero-initialize. */
+typedef struct {
+    /** Nonzero: drop the child to uid/gid with HOME=home, exactly like
+     *  run_command_capture_as_identity(). home is then required. */
+    int drop_identity;
+    uid_t uid;
+    gid_t gid;
+    const char *home;
+    /** NULL-terminated "NAME=value" entries set in the child's environment,
+     *  replacing inherited entries of the same name; may be NULL. */
+    const char *const *env;
+    /** Bytes written to the child's stdin, which is then closed. When NULL
+     *  the child inherits migr's stdin. */
+    const void *stdin_data;
+    size_t stdin_length;
+} RunCommandOptions;
+
+/**
+ * @brief run_command_capture() with an optional identity drop, environment
+ *        overrides, and stdin data.
+ *
+ * Stdin is written while stdout is captured, so a large input cannot deadlock
+ * against the child's output, and a child that exits without reading its
+ * stdin cannot kill migr with SIGPIPE. Returns -1 before forking for invalid
+ * options (a drop without home, a malformed env entry).
+ */
+int run_command_capture_with(char *const argv[], char *output,
+                             size_t output_size,
+                             const RunCommandOptions *options);
 
 #endif

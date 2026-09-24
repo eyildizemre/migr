@@ -6,6 +6,9 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <poll.h>
+#include <pthread.h>
+#include <signal.h>
 #include <grp.h>
 #include <dirent.h>
 #include <string.h>
@@ -3776,42 +3779,80 @@ static int env_entry_is_dropped(const char *entry)
     return 0;
 }
 
-// Builds the environment for a child dropped to another user: every base
-// entry is kept in order except the dropped names, and HOME=home is appended.
-// Built before fork so the child only execs. The caller frees the array and
-// *home_entry_out (the one allocated entry); the other entries borrow base.
-static char **build_identity_environment(char *const *base, const char *home,
-                                         char **home_entry_out)
+static int env_entry_has_name(const char *entry, const char *name,
+                              size_t name_len)
 {
-    if (home == NULL || home[0] != '/' || home_entry_out == NULL)
+    return strncmp(entry, name, name_len) == 0 && entry[name_len] == '=';
+}
+
+// Builds a child environment before fork so the child only execs. Every base
+// entry is kept in order except, when home is non-NULL, the identity-dropped
+// names, and any name that overrides sets. HOME=home (if any) and then the
+// overrides are appended. The caller frees the array and *home_entry_out (the
+// one allocated entry, or NULL); the other entries borrow base or overrides.
+static char **build_command_environment(char *const *base, const char *home,
+                                        const char *const *overrides,
+                                        char **home_entry_out)
+{
+    if (home_entry_out == NULL || (home != NULL && home[0] != '/'))
     {
         errno = EINVAL;
         return NULL;
+    }
+    *home_entry_out = NULL;
+
+    size_t override_count = 0;
+    while (overrides != NULL && overrides[override_count] != NULL)
+    {
+        const char *equals = strchr(overrides[override_count], '=');
+        if (equals == NULL || equals == overrides[override_count])
+        {
+            errno = EINVAL;
+            return NULL;
+        }
+        override_count++;
     }
 
     size_t base_count = 0;
     while (base != NULL && base[base_count] != NULL)
         base_count++;
 
-    size_t home_len = strlen(home);
-    char *home_entry = malloc(sizeof("HOME=") + home_len);
-    char **env = malloc((base_count + 2U) * sizeof(*env));
-    if (home_entry == NULL || env == NULL)
+    char *home_entry = NULL;
+    if (home != NULL)
+    {
+        size_t home_len = strlen(home);
+        home_entry = malloc(sizeof("HOME=") + home_len);
+        if (home_entry == NULL)
+            return NULL;
+        memcpy(home_entry, "HOME=", sizeof("HOME=") - 1U);
+        memcpy(home_entry + sizeof("HOME=") - 1U, home, home_len + 1U);
+    }
+    char **env = malloc((base_count + override_count + 2U) * sizeof(*env));
+    if (env == NULL)
     {
         free(home_entry);
-        free(env);
         return NULL;
     }
-    memcpy(home_entry, "HOME=", sizeof("HOME=") - 1U);
-    memcpy(home_entry + sizeof("HOME=") - 1U, home, home_len + 1U);
 
     size_t count = 0;
     for (size_t i = 0; i < base_count; i++)
     {
-        if (!env_entry_is_dropped(base[i]))
+        if (home != NULL && env_entry_is_dropped(base[i]))
+            continue;
+        int overridden = 0;
+        for (size_t j = 0; j < override_count && !overridden; j++)
+        {
+            size_t name_len = (size_t)(strchr(overrides[j], '=') -
+                                       overrides[j]);
+            overridden = env_entry_has_name(base[i], overrides[j], name_len);
+        }
+        if (!overridden)
             env[count++] = base[i];
     }
-    env[count++] = home_entry;
+    if (home_entry != NULL)
+        env[count++] = home_entry;
+    for (size_t j = 0; j < override_count; j++)
+        env[count++] = (char *)overrides[j];
     env[count] = NULL;
 
     *home_entry_out = home_entry;
@@ -3823,41 +3864,154 @@ char **fileops_test_build_identity_environment(char *const *base,
                                                const char *home,
                                                char **home_entry_out)
 {
-    return build_identity_environment(base, home, home_entry_out);
+    if (home == NULL)
+    {
+        errno = EINVAL;
+        return NULL;
+    }
+    return build_command_environment(base, home, NULL, home_entry_out);
+}
+
+char **fileops_test_build_command_environment(char *const *base,
+                                              const char *home,
+                                              const char *const *overrides,
+                                              char **home_entry_out)
+{
+    return build_command_environment(base, home, overrides, home_entry_out);
 }
 #endif
 
+// Feeds options->stdin_data (if any) while capturing stdout, interleaved with
+// poll() so neither side can block the other. SIGPIPE from a child that exits
+// without reading its stdin is blocked for the duration and consumed, so it
+// cannot terminate migr.
+static void run_command_exchange(int out_fd, int in_fd,
+                                 const RunCommandOptions *options,
+                                 char *output, size_t output_size)
+{
+    size_t total = 0;
+    size_t written = 0;
+    const unsigned char *data = options != NULL
+        ? (const unsigned char *)options->stdin_data : NULL;
+    size_t length = data != NULL ? options->stdin_length : 0;
+    if (in_fd >= 0 && written == length)
+    {
+        close(in_fd);
+        in_fd = -1;
+    }
+
+    char discard[4096];
+    for (;;)
+    {
+        struct pollfd fds[2] = {
+            { .fd = out_fd, .events = POLLIN },
+            { .fd = in_fd, .events = POLLOUT }
+        };
+        int ready = poll(fds, in_fd >= 0 ? 2U : 1U, -1);
+        if (ready < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+        if (in_fd >= 0 && fds[1].revents != 0)
+        {
+            ssize_t sent = write(in_fd, data + written, length - written);
+            if (sent > 0)
+                written += (size_t)sent;
+            if ((sent < 0 && errno != EAGAIN && errno != EINTR) ||
+                written == length)
+            {
+                close(in_fd);
+                in_fd = -1;
+            }
+        }
+        if (fds[0].revents != 0)
+        {
+            // Once the buffer is full, keep draining (and discarding) so the
+            // child is never killed by SIGPIPE on its own stdout and its real
+            // exit status is still reported.
+            char *target = total < output_size - 1U ? output + total : discard;
+            size_t room = total < output_size - 1U
+                ? output_size - 1U - total : sizeof(discard);
+            ssize_t bytes_read = read(out_fd, target, room);
+            if (bytes_read < 0 && errno == EINTR)
+                continue;
+            if (bytes_read <= 0)
+                break;
+            if (target != discard)
+                total += (size_t)bytes_read;
+        }
+    }
+    output[total] = '\0';
+    if (in_fd >= 0)
+        close(in_fd);
+}
+
 static int run_command_capture_internal(char *const argv[], char *output,
-                                        size_t output_size, int drop_identity,
-                                        uid_t uid, gid_t gid, const char *home)
+                                        size_t output_size,
+                                        const RunCommandOptions *options)
 {
     if (output == NULL || output_size == 0)
     {
         return -1; // nothing safe to write into
     }
+    int drop_identity = options != NULL && options->drop_identity;
+    if (drop_identity && options->home == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    int feed_stdin = options != NULL && options->stdin_data != NULL;
 
     char **child_env = NULL;
     char *home_entry = NULL;
-    if (drop_identity)
+    if (drop_identity || (options != NULL && options->env != NULL))
     {
-        child_env = build_identity_environment(environ, home, &home_entry);
+        child_env = build_command_environment(
+            environ, drop_identity ? options->home : NULL,
+            options->env, &home_entry);
         if (child_env == NULL)
             return -1;
     }
 
     int pipefd[2];
+    int stdin_pipe[2] = { -1, -1 };
     if (pipe(pipefd) == -1)
     {
         free(home_entry);
         free(child_env);
         return -1; // pipe creation failed
     }
+    if (feed_stdin && pipe(stdin_pipe) == -1)
+    {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        free(home_entry);
+        free(child_env);
+        return -1;
+    }
+
+    sigset_t sigpipe_set, previous_mask;
+    sigemptyset(&sigpipe_set);
+    sigaddset(&sigpipe_set, SIGPIPE);
+    int sigpipe_was_blocked = 1;
+    if (feed_stdin &&
+        pthread_sigmask(SIG_BLOCK, &sigpipe_set, &previous_mask) == 0)
+        sigpipe_was_blocked = sigismember(&previous_mask, SIGPIPE);
 
     pid_t pid = fork();
     if (pid == -1)
     {
         close(pipefd[0]);
         close(pipefd[1]);
+        if (feed_stdin)
+        {
+            close(stdin_pipe[0]);
+            close(stdin_pipe[1]);
+            if (!sigpipe_was_blocked)
+                pthread_sigmask(SIG_SETMASK, &previous_mask, NULL);
+        }
         free(home_entry);
         free(child_env);
         return -1; // fork failed
@@ -3874,20 +4028,29 @@ static int run_command_capture_internal(char *const argv[], char *output,
         }
         close(pipefd[1]); // Close the original write end of the pipe
 
+        if (feed_stdin)
+        {
+            close(stdin_pipe[1]);
+            if (dup2(stdin_pipe[0], STDIN_FILENO) == -1)
+                _exit(1);
+            close(stdin_pipe[0]);
+            if (!sigpipe_was_blocked)
+                pthread_sigmask(SIG_SETMASK, &previous_mask, NULL);
+        }
+
         if (drop_identity)
         {
             if (setgroups(0, NULL) != 0)
                 _exit(125);
-            if (setgid(gid) != 0)
+            if (setgid(options->gid) != 0)
                 _exit(126);
-            if (setuid(uid) != 0)
+            if (setuid(options->uid) != 0)
                 _exit(127);
+        }
+        if (child_env != NULL)
             execvpe(argv[0], argv, child_env);
-        }
         else
-        {
             execvp(argv[0], argv); // Execute the command
-        }
 
         // If execvp returns, it means it failed
         perror("execvp");
@@ -3899,31 +4062,28 @@ static int run_command_capture_internal(char *const argv[], char *output,
         close(pipefd[1]); // Close the write end of the pipe
         free(home_entry); // the child execs from its own copy
         free(child_env);
-
-        size_t total = 0;
-        for (;;)
+        int in_fd = -1;
+        if (feed_stdin)
         {
-            ssize_t bytes_read = read(pipefd[0], output + total,
-                                      output_size - total - 1);
-            if (bytes_read < 0 && errno == EINTR)
-                continue;
-            if (bytes_read <= 0)
-                break;
-            total += bytes_read;
+            close(stdin_pipe[0]);
+            in_fd = stdin_pipe[1];
+            int flags = fcntl(in_fd, F_GETFL);
+            if (flags >= 0)
+                (void)fcntl(in_fd, F_SETFL, flags | O_NONBLOCK);
         }
-        output[total] = '\0'; // Null-terminate the output string
 
-        // The buffer may have filled while the child still had more to write.
-        // Closing the read end now would make its next write() raise SIGPIPE,
-        // killing it before it reaches its own normal exit -- keep draining
-        // (and discarding) the pipe until the child's write end genuinely
-        // closes, so truncation stays silent the way this function documents
-        // instead of also corrupting the reported exit status.
-        char discard[4096];
-        while (read(pipefd[0], discard, sizeof(discard)) > 0)
-            ;
-
+        run_command_exchange(pipefd[0], in_fd, options, output, output_size);
         close(pipefd[0]); // Close the read end of the pipe
+
+        if (feed_stdin && !sigpipe_was_blocked)
+        {
+            sigset_t pending;
+            struct timespec no_wait = { 0, 0 };
+            if (sigpending(&pending) == 0 && sigismember(&pending, SIGPIPE))
+                (void)sigtimedwait(&sigpipe_set, NULL, &no_wait);
+            pthread_sigmask(SIG_SETMASK, &previous_mask, NULL);
+        }
+
         int status;
         if (waitpid(pid, &status, 0) == -1)
         {
@@ -3939,14 +4099,27 @@ static int run_command_capture_internal(char *const argv[], char *output,
 
 int run_command_capture(char *const argv[], char *output, size_t output_size)
 {
-    return run_command_capture_internal(argv, output, output_size, 0, 0, 0,
-                                        NULL);
+    return run_command_capture_internal(argv, output, output_size, NULL);
 }
 
 int run_command_capture_as_identity(char *const argv[], char *output,
                                     size_t output_size, uid_t uid, gid_t gid,
                                     const char *home)
 {
-    return run_command_capture_internal(argv, output, output_size, 1, uid, gid,
-                                        home);
+    if (home == NULL || home[0] != '/')
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    RunCommandOptions options = {
+        .drop_identity = 1, .uid = uid, .gid = gid, .home = home
+    };
+    return run_command_capture_internal(argv, output, output_size, &options);
+}
+
+int run_command_capture_with(char *const argv[], char *output,
+                             size_t output_size,
+                             const RunCommandOptions *options)
+{
+    return run_command_capture_internal(argv, output, output_size, options);
 }
