@@ -26,6 +26,7 @@
 #include "portable_restore.h"
 #include "portable_restore_replay_internal.h"
 #include "sidecar.h"
+#include "fixture_content_digest.h"
 
 extern void replay_copy_bytes(char *destination, size_t destination_size,
                               SidecarBytes source);
@@ -441,14 +442,20 @@ static int write_sidecar(Fixture *fixture, const SidecarEntry *entries,
                          const char *xattr_name)
 {
     SidecarLog log = {0};
+    SidecarEntry *filled = malloc((count != 0 ? count : 1U) * sizeof(*filled));
+    if (filled == NULL)
+        return -1;
+    fixture_fill_content_digests(fixture->data_fd, entries, count, filled);
+    int result = 0;
     if (sidecar_log_create_at(fixture->container_fd, &log) !=
             SIDECAR_OPEN_FRESH ||
-        append_entries(&log, entries, count, xattr_name) != 0 ||
+        append_entries(&log, filled, count, xattr_name) != 0 ||
         (deletion != NULL && sidecar_log_append_delete(&log, deletion) !=
              SIDECAR_STATUS_OK) ||
         sidecar_log_close(&log) != SIDECAR_STATUS_OK)
-        return -1;
-    return 0;
+        result = -1;
+    free(filled);
+    return result;
 }
 
 static int write_raw_entries_sidecar(Fixture *fixture,
@@ -465,10 +472,14 @@ static int write_raw_entries_sidecar(Fixture *fixture,
                     O_WRONLY | O_APPEND | O_CLOEXEC);
     if (fd < 0)
         return -1;
-    int result = 1;
+    SidecarEntry *filled = malloc((count != 0 ? count : 1U) * sizeof(*filled));
+    int result = filled != NULL;
+    if (result)
+        fixture_fill_content_digests(fixture->data_fd, entries, count, filled);
     for (size_t index = 0; index < count && result; index++)
-        result = sidecar_write_entry(fd, &entries[index]) == 0 &&
+        result = sidecar_write_entry(fd, &filled[index]) == 0 &&
                  sidecar_write_entry_commit(fd) == 0;
+    free(filled);
     if (close(fd) != 0)
         result = 0;
     return result ? 0 : -1;
@@ -1723,6 +1734,34 @@ static void test_regular_content_verification(void)
                   report.failure_errno == EIO,
               "post-copy truncation is detected by content verification");
         fixture_close(&truncated);
+    }
+
+    Fixture damaged;
+    opened = regular_verification_fixture_open(&damaged, "abcdefgh");
+    check(opened == 0, "damaged backup payload fixture is created");
+    if (opened == 0)
+    {
+        // Same size, different bytes: only the capture digest can tell.
+        write_file_at(damaged.data_fd, "ROOT/file", "abcdefgX");
+        PortableRestoreReplayReport report;
+        int result = run_replay(&damaged, &report);
+        char restored[PATH_MAX];
+        path_join(restored, sizeof(restored), damaged.home, "/restored/file");
+        check(result != 0 && report.applied_count == 2 &&
+                  report.verification_checked_count == 1 &&
+                  report.verification_failed_count == 1 &&
+                  strcmp(report.failed_logical_path, "file") == 0 &&
+                  report.failure_step ==
+                      PORTABLE_RESTORE_REPLAY_FAILURE_COMPARE_BACKUP_CONTENT &&
+                  report.failure_errno == EIO &&
+                  file_equals_noatime(restored, "abcdefgX"),
+              "a backup payload that changed after capture fails verification");
+        char reason[256];
+        check(replay_failure_reason_format(&report, reason, sizeof(reason)) == 1 &&
+                  strcmp(reason, "regular file, the backup's copy changed "
+                                 "after it was captured") == 0,
+              "the mismatch is described as damage to the backup itself");
+        fixture_close(&damaged);
     }
 
     Fixture skipped;

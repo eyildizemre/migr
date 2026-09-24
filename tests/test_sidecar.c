@@ -1,4 +1,4 @@
-// Unit tests for the sidecar v4 codec (docs/DECISIONS.md D17/D21/D22/D25/D39): magic/version
+// Unit tests for the sidecar v5 codec (docs/DECISIONS.md D17/D21/D22/D25/D39/D58): magic/version
 // header, ENTRY/XATTR/ENTRY_COMMIT/DELETE/CLAIM record framing, canonical numeric
 // parsing, and every SIDECAR_MAX_* ceiling declared there. This is the codec
 // alone -- no live-state map, no resume, no adopt; that stateful layer is a
@@ -165,7 +165,8 @@ static int append_regular_entry_with_fields(RawBuffer *buffer,
            raw_text_field(buffer, "8") == 0 &&
            raw_text_field(buffer, "123") == 0 &&
            raw_text_field(buffer, "0") == 0 &&
-           raw_text_field(buffer, xattr_count) == 0 ? 0 : -1;
+           raw_text_field(buffer, xattr_count) == 0 &&
+           raw_text_field(buffer, "0") == 0 ? 0 : -1;
 }
 
 static int append_regular_entry(RawBuffer *buffer, const char *mode,
@@ -242,6 +243,7 @@ static int roundtrip_callback(const SidecarRecord *record, void *context)
         state->entries++;
         if (entry->kind != SIDECAR_KIND_REGULAR || entry->mode != 0644 ||
             entry->uid != 1000 || entry->gid != 1000 || entry->size != 321 ||
+            entry->content_digest != UINT64_C(0xfedcba9876543210) ||
             entry->atime_sec != -7 || entry->mtime_nsec != 456789 ||
             entry->root_id.length != 4 ||
             memcmp(entry->root_id.data, "ROOT", 4) != 0 ||
@@ -295,12 +297,13 @@ static void test_header_and_roundtrip(int fd)
 
     unsigned char actual[32] = {0};
     ssize_t count = pread(fd, actual, sizeof(actual), 0);
-    const unsigned char expected[] = SIDECAR_MAGIC "\0" "4\0";
+    const unsigned char expected[] = SIDECAR_MAGIC "\0" "5\0";
     check(count == (ssize_t)sizeof(expected) - 1 &&
           memcmp(actual, expected, sizeof(expected) - 1U) == 0,
           "header bytes are byte-exact");
 
     SidecarEntry entry = sample_entry();
+    entry.content_digest = UINT64_C(0xfedcba9876543210);
     static const unsigned char xattr_value[] = { 0x00, 0x01, 0xff, 0x00 };
     SidecarXattr xattr = {
         .name = { (const unsigned char *)"user.test", 9 },
@@ -522,7 +525,7 @@ static int parse_regular_leaf_fixture(int fd, const void *leaf,
         return -1;
     static const unsigned char logical[] = "dir/file";
     RawBuffer buffer = {0};
-    int built = append_header(&buffer, "4") == 0 &&
+    int built = append_header(&buffer, "5") == 0 &&
                 append_regular_entry_with_fields(
                     &buffer, logical, sizeof(logical) - 1U, leaf,
                     leaf_length, "0", "0") == 0 &&
@@ -813,6 +816,14 @@ static void test_symlink_and_hardlink_writer(int fd)
           "non-zero symlink size is rejected");
 
     entry = sample_entry();
+    entry.kind = SIDECAR_KIND_DIRECTORY;
+    entry.content_digest = 1;
+    errno = 0;
+    check(reset_file(fd) == 0 && sidecar_write_header(fd) == 0 &&
+          sidecar_write_entry(fd, &entry) != 0 && errno == EINVAL,
+          "a content digest on a non-regular entry is rejected");
+
+    entry = sample_entry();
     entry.kind = SIDECAR_KIND_HARDLINK;
     entry.size = 0;
     entry.xattr_count = 0;
@@ -909,7 +920,7 @@ static void test_tail_and_boundary(int fd)
 {
     printf(BLUE "::" NC " sidecar tail recovery and boundaries\n");
     RawBuffer buffer = {0};
-    check(append_header(&buffer, "4") == 0 &&
+    check(append_header(&buffer, "5") == 0 &&
           append_regular_entry(&buffer, "420", "0") == 0 &&
           append_commit(&buffer) == 0,
           "valid prefix fixture is built");
@@ -936,7 +947,7 @@ static void test_tail_and_boundary(int fd)
           "incomplete CLAIM is a truncated tail at the prior boundary");
 
     RawBuffer complete_claim = {0};
-    check(append_header(&complete_claim, "4") == 0 &&
+    check(append_header(&complete_claim, "5") == 0 &&
               append_claim(&complete_claim, "ROOT", "dir/file",
                            "file", "regular") == 0 &&
               set_raw_file(fd, &complete_claim) == 0,
@@ -949,7 +960,7 @@ static void test_tail_and_boundary(int fd)
 
     check(set_raw_file(fd, &buffer) == 0, "prefix is restored");
     RawBuffer uncommitted = {0};
-    check(append_header(&uncommitted, "4") == 0 &&
+    check(append_header(&uncommitted, "5") == 0 &&
           append_regular_entry(&uncommitted, "420", "0") == 0 &&
           set_raw_file(fd, &uncommitted) == 0,
           "uncommitted group is written");
@@ -985,7 +996,7 @@ static void test_corruption_and_versions(int fd)
           "v2 CLAIM fixture is written");
     status = sidecar_parse_fd(fd, NULL, NULL, &result);
     check(status == SIDECAR_STATUS_UNKNOWN_VERSION,
-          "v2 CLAIM is refused at the v4 version boundary");
+          "v2 CLAIM is refused at the v5 version boundary");
 
     raw_free(&buffer);
     memset(&buffer, 0, sizeof(buffer));
@@ -993,7 +1004,15 @@ static void test_corruption_and_versions(int fd)
           "v3 header fixture is written");
     status = sidecar_parse_fd(fd, NULL, NULL, &result);
     check(status == SIDECAR_STATUS_UNKNOWN_VERSION,
-          "v3 sidecar is refused at the v4 version boundary");
+          "v3 sidecar is refused at the v5 version boundary");
+
+    raw_free(&buffer);
+    memset(&buffer, 0, sizeof(buffer));
+    check(append_header(&buffer, "4") == 0 && set_raw_file(fd, &buffer) == 0,
+          "v4 header fixture is written");
+    status = sidecar_parse_fd(fd, NULL, NULL, &result);
+    check(status == SIDECAR_STATUS_UNKNOWN_VERSION,
+          "v4 sidecar without content digests is refused at the v5 boundary");
 
     check(reset_file(fd) == 0 &&
           write_all_test(fd, (const unsigned char *)"MIGR_SIDECAR\0", 13) == 0 &&
@@ -1005,7 +1024,7 @@ static void test_corruption_and_versions(int fd)
 
     raw_free(&buffer);
     memset(&buffer, 0, sizeof(buffer));
-    check(append_header(&buffer, "4") == 0 &&
+    check(append_header(&buffer, "5") == 0 &&
           append_regular_entry(&buffer, "0420", "0") == 0 &&
           append_commit(&buffer) == 0 && set_raw_file(fd, &buffer) == 0,
           "non-canonical numeric fixture is written");
@@ -1015,7 +1034,7 @@ static void test_corruption_and_versions(int fd)
 
     raw_free(&buffer);
     memset(&buffer, 0, sizeof(buffer));
-    check(append_header(&buffer, "4") == 0 && raw_tag(&buffer, "UNKNOWN") == 0 &&
+    check(append_header(&buffer, "5") == 0 && raw_tag(&buffer, "UNKNOWN") == 0 &&
           set_raw_file(fd, &buffer) == 0,
           "unknown tag fixture is written");
     status = sidecar_parse_fd(fd, NULL, NULL, &result);
@@ -1024,7 +1043,7 @@ static void test_corruption_and_versions(int fd)
     raw_free(&buffer);
 
     memset(&buffer, 0, sizeof(buffer));
-    check(append_header(&buffer, "4") == 0 &&
+    check(append_header(&buffer, "5") == 0 &&
               append_claim(&buffer, "ROOT", "dir/file", "file",
                            "fifo") == 0 && set_raw_file(fd, &buffer) == 0,
           "unsupported CLAIM kind fixture is written");
@@ -1034,12 +1053,14 @@ static void test_corruption_and_versions(int fd)
 
     raw_free(&buffer);
     memset(&buffer, 0, sizeof(buffer));
-    check(append_header(&buffer, "4") == 0 && raw_tag(&buffer, "ENTRY") == 0 &&
+    check(append_header(&buffer, "5") == 0 && raw_tag(&buffer, "ENTRY") == 0 &&
               raw_text_field(&buffer, "ROOT") == 0 &&
               raw_text_field(&buffer, "dir/file") == 0 &&
               raw_text_field(&buffer, "file") == 0 &&
               raw_text_field(&buffer, "") == 0 &&
               raw_text_field(&buffer, "regular") == 0 &&
+              raw_text_field(&buffer, "0") == 0 &&
+              raw_text_field(&buffer, "0") == 0 &&
               raw_text_field(&buffer, "0") == 0 &&
               raw_text_field(&buffer, "0") == 0 &&
               raw_text_field(&buffer, "0") == 0 &&
@@ -1061,7 +1082,7 @@ static void test_corruption_and_versions(int fd)
 
     raw_free(&buffer);
     memset(&buffer, 0, sizeof(buffer));
-    check(append_header(&buffer, "4") == 0 && raw_tag(&buffer, "CLAIM") == 0 &&
+    check(append_header(&buffer, "5") == 0 && raw_tag(&buffer, "CLAIM") == 0 &&
               raw_text_field(&buffer, "ROOT") == 0 &&
               raw_text_field(&buffer, "dir/file") == 0 &&
               raw_text_field(&buffer, "regular") == 0 &&
@@ -1083,7 +1104,7 @@ static void test_corruption_and_versions(int fd)
     raw_free(&buffer);
     memset(&buffer, 0, sizeof(buffer));
     static const unsigned char hardlink_xattr_value[] = { 'v' };
-    check(append_header(&buffer, "4") == 0 &&
+    check(append_header(&buffer, "5") == 0 &&
               raw_tag(&buffer, "ENTRY") == 0 &&
               raw_text_field(&buffer, "ROOT") == 0 &&
               raw_text_field(&buffer, "dir/file") == 0 &&
@@ -1130,7 +1151,7 @@ static void test_symlink_kind_parsing(int fd)
 {
     printf(BLUE "::" NC " sidecar symlink grammar\n");
     RawBuffer buffer = {0};
-    check(append_header(&buffer, "4") == 0 && raw_tag(&buffer, "ENTRY") == 0 &&
+    check(append_header(&buffer, "5") == 0 && raw_tag(&buffer, "ENTRY") == 0 &&
           raw_text_field(&buffer, "ROOT") == 0 &&
           raw_text_field(&buffer, "link") == 0 &&
           raw_text_field(&buffer, "link") == 0 &&
@@ -1169,7 +1190,7 @@ static void test_reader_path_ceiling(int fd)
     memset(path, 'p', SIDECAR_MAX_PATH + 1U);
     static const unsigned char leaf[] = "file";
 
-    check(append_header(&buffer, "4") == 0 &&
+    check(append_header(&buffer, "5") == 0 &&
           append_regular_entry_with_fields(
               &buffer, path, SIDECAR_MAX_PATH, leaf, sizeof(leaf) - 1U,
               "0", "0") == 0 &&
@@ -1180,7 +1201,7 @@ static void test_reader_path_ceiling(int fd)
           "reader accepts a path at its ceiling");
 
     raw_free(&buffer);
-    check(append_header(&buffer, "4") == 0 &&
+    check(append_header(&buffer, "5") == 0 &&
           append_regular_entry_with_fields(
               &buffer, path, SIDECAR_MAX_PATH + 1U, leaf,
               sizeof(leaf) - 1U, "0", "0") == 0 &&

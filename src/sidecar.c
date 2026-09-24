@@ -398,8 +398,9 @@ static int validate_entry(const SidecarEntry *entry)
         set_invalid_error();
         return -1;
     }
-    if (entry->kind != SIDECAR_KIND_REGULAR &&
-        entry->kind != SIDECAR_KIND_DIRECTORY && entry->size != 0)
+    if ((entry->kind != SIDECAR_KIND_REGULAR &&
+         entry->kind != SIDECAR_KIND_DIRECTORY && entry->size != 0) ||
+        (entry->kind != SIDECAR_KIND_REGULAR && entry->content_digest != 0))
     {
         set_invalid_error();
         return -1;
@@ -513,7 +514,12 @@ static int build_entry_buffer(const SidecarEntry *entry, SidecarBuffer *buffer)
         buffer_append_uint(buffer, entry->xattr_count) != 0)
         return -1;
 
-    if (entry->kind == SIDECAR_KIND_SYMLINK)
+    if (entry->kind == SIDECAR_KIND_REGULAR)
+    {
+        if (buffer_append_uint(buffer, entry->content_digest) != 0)
+            return -1;
+    }
+    else if (entry->kind == SIDECAR_KIND_SYMLINK)
     {
         if (buffer_append_field(buffer, entry->symlink_target) != 0)
             return -1;
@@ -1028,7 +1034,13 @@ static SidecarStatus parse_entry(SidecarReader *reader, SidecarEntry *entry)
         status = SIDECAR_STATUS_CORRUPT;
         goto fail;
     }
-    if (entry->kind == SIDECAR_KIND_SYMLINK)
+    if (entry->kind == SIDECAR_KIND_REGULAR)
+    {
+        status = parse_uint_field(reader, UINT64_MAX, &entry->content_digest);
+        if (status != SIDECAR_STATUS_OK)
+            goto fail;
+    }
+    else if (entry->kind == SIDECAR_KIND_SYMLINK)
     {
         status = read_required_field(reader, SIDECAR_MAX_SYMLINK_TARGET,
                                      &entry->symlink_target);

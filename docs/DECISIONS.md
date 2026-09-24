@@ -3657,7 +3657,7 @@ prefix substitution.
 
 ## D42 — 2026-09-10 — Portable restore verifies applied content before success
 
-**Status:** Implemented; superseded in part by D53
+**Status:** Implemented; superseded in part by D53 and D59
 
 **Decision:** A live portable restore performs a post-copy verification pass by
 default after replay has applied file content and metadata and before the restore
@@ -4226,3 +4226,35 @@ with the exact command in hand.
 
 **Relationship:** Extends D54's network restore. Older restores ignore the
 extra file because they only open the known backend directories.
+
+## D59 — 2026-09-24 — Sidecar v5 records a capture-time content digest
+
+**Status:** Implemented
+
+**Decision:** `SIDECAR_VERSION` advances from 4 to 5. A regular-file `ENTRY`
+gains one kind-specific field after `xattr_count`: `content_digest`, the 64-bit
+FNV-1a of the bytes capture read and wrote into the payload, as a canonical
+unsigned decimal. Other kinds carry no such field, and both the writer and the
+state layer refuse a non-zero digest on them. Capture computes the digest while
+streaming the copy; a resumed capture that keeps an unchanged payload keeps its
+recorded entry and digest.
+
+Replay hashes the bytes it reads from the payload separately from the bytes it
+writes (they differ only under D41's HOME-URI rewrite) and compares the former
+with the recorded digest. A mismatch does not stop the replay: the verification
+pass reports that item as "the backup's copy changed after it was captured",
+counted and listed like any other D53 mismatch. The D42 read-back of the
+destination is unchanged and still compares against the written bytes.
+
+There is no v4 compatibility layer, matching the earlier transitions (R-4): a
+v5 reader refuses v4 sidecars, and v4 partials are not adopted or resumed.
+
+**Why:** D42's expected digest came from the bytes replay wrote, so a payload
+damaged inside the container after capture was read, written, and "verified"
+as correct. On real hardware the only independent evidence that a 159k-file
+restore matched its backup was a manual comparison against the container. With
+the digest recorded at capture, restore verifies end to end, and a backup can be
+checked on its own before the source machine is wiped.
+
+**Relationship:** Supersedes D42's claim that replay needs no second source of
+truth. FNV-1a stays a corruption check, not tamper evidence.

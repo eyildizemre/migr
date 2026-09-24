@@ -38,6 +38,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "hash.h"
 #include "manifest.h"
 #include "portable.h"
 #include "portable_hashset_internal.h"
@@ -714,6 +715,12 @@ static void test_case_collision_prescan(const char *base)
               sidecar_bytes_match_text(collision_lower.entry->collision_suffix,
                                         "%7E1"),
           "resolved collision writes both physical payloads and suffix fields");
+    uint64_t expected_digest = hash_fnv1a_bytes(
+        HASH_FNV1A_OFFSET_BASIS, (const unsigned char *)"x", 1U);
+    check(collision_entries &&
+              collision_upper.entry->content_digest == expected_digest &&
+              collision_lower.entry->content_digest == expected_digest,
+          "each captured regular entry records the digest of its bytes");
     if (collision_log_open)
         sidecar_log_close(&collision_log);
     portable_prescan_report_free(&report);

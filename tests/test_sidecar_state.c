@@ -1186,6 +1186,11 @@ static void test_v4_parent_chain_and_leaf_identity(int container_fd)
     check(sidecar_log_append_entry(&log, &invalid_root_entry) ==
               SIDECAR_STATUS_INVALID_ARGUMENT,
           "state API rejects a root ENTRY carrying a physical leaf");
+    SidecarEntry digest_root_entry = root_entry;
+    digest_root_entry.content_digest = 1;
+    check(sidecar_log_append_entry(&log, &digest_root_entry) ==
+              SIDECAR_STATUS_INVALID_ARGUMENT,
+          "state API rejects a content digest on a directory ENTRY");
     check(sidecar_log_close(&log) == SIDECAR_STATUS_OK,
           "root leaf guard fixture closes");
 }

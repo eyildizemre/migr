@@ -32,6 +32,7 @@
 #include <unistd.h>
 
 #include "backup.h"
+#include "hash.h"
 #include "manifest.h"
 #include "packages.h"
 #include "restore.h"
@@ -2123,7 +2124,10 @@ static void test_verification_failure_still_restores_packages(void)
         .kind = SIDECAR_KIND_REGULAR,
         .mode = 0600, .uid = uid, .gid = gid,
         .atime_sec = 1700000710, .mtime_sec = 1700000711,
-        .size = strlen("payload")
+        .size = strlen("payload"),
+        .content_digest = hash_fnv1a_bytes(HASH_FNV1A_OFFSET_BASIS,
+                                           (const unsigned char *)"payload",
+                                           strlen("payload"))
     };
     int container_fd = open(source, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     SidecarLog sidecar = {0};

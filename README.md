@@ -149,7 +149,10 @@ Portable restore verifies its applied content before reporting success. For
 regular files it computes an FNV-1a checksum over the exact bytes written during replay,
 then reads the destination back through no-follow, fd-relative traversal and
 requires the digest to match. This includes files whose stored HOME URI is
-rewritten for the new account. Symlink target bytes are compared directly; their
+rewritten for the new account. Portable backup also records, for every regular
+file, a digest of the bytes it captured; replay compares the bytes it reads from
+the backup against it, so a backup file damaged after capture is reported as such
+instead of being restored and "verified" as correct. Symlink target bytes are compared directly; their
 recorded timestamps are reapplied afterward because reading the target can advance
 the symlink's atime. Hardlink aliases are checked against their representative by filesystem inode
 identity without re-reading the same content through every alias. A read,

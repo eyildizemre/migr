@@ -28,6 +28,7 @@
 #include "portable_restore.h"
 #include "restore.h"
 #include "sidecar.h"
+#include "fixture_content_digest.h"
 #include "utils.h"
 
 #define GREEN "\033[0;32m"
@@ -629,12 +630,18 @@ static int write_sidecar(Fixture *fixture, const SidecarEntry *entries,
                          size_t count)
 {
     SidecarLog log = {0};
+    SidecarEntry *filled = malloc((count != 0 ? count : 1U) * sizeof(*filled));
+    if (filled == NULL)
+        return -1;
+    fixture_fill_content_digests(fixture->data_fd, entries, count, filled);
+    int result = 0;
     if (sidecar_log_create_at(fixture->container_fd, &log) !=
             SIDECAR_OPEN_FRESH ||
-        append_entries(&log, entries, count) != 0 ||
+        append_entries(&log, filled, count) != 0 ||
         sidecar_log_close(&log) != SIDECAR_STATUS_OK)
-        return -1;
-    return 0;
+        result = -1;
+    free(filled);
+    return result;
 }
 
 static int write_sidecar_with_xattr(Fixture *fixture,
@@ -644,10 +651,18 @@ static int write_sidecar_with_xattr(Fixture *fixture,
 {
     SidecarLog log = {0};
     if (fixture == NULL || entries == NULL || xattr == NULL ||
-        xattr_index >= count ||
-        sidecar_log_create_at(fixture->container_fd, &log) !=
-            SIDECAR_OPEN_FRESH)
+        xattr_index >= count)
         return -1;
+    SidecarEntry *filled = malloc(count * sizeof(*filled));
+    if (filled == NULL)
+        return -1;
+    fixture_fill_content_digests(fixture->data_fd, entries, count, filled);
+    if (sidecar_log_create_at(fixture->container_fd, &log) !=
+            SIDECAR_OPEN_FRESH)
+    {
+        free(filled);
+        return -1;
+    }
 
     int failed = 0;
     for (size_t index = 0; index < count; index++)
@@ -659,7 +674,7 @@ static int write_sidecar_with_xattr(Fixture *fixture,
             .kind = entries[index].kind
         };
         if (sidecar_log_append_claim(&log, &claim) != SIDECAR_STATUS_OK ||
-            sidecar_log_append_entry(&log, &entries[index]) !=
+            sidecar_log_append_entry(&log, &filled[index]) !=
                 SIDECAR_STATUS_OK ||
             (index == xattr_index &&
              sidecar_log_append_xattr(&log, xattr) != SIDECAR_STATUS_OK) ||
@@ -671,6 +686,7 @@ static int write_sidecar_with_xattr(Fixture *fixture,
     }
     if (sidecar_log_close(&log) != SIDECAR_STATUS_OK)
         failed = 1;
+    free(filled);
     return failed ? -1 : 0;
 }
 

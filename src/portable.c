@@ -2790,8 +2790,11 @@ static int capture_regular(PortableCaptureContext *context,
         snprintf(context->progress_report->current_path,
                  sizeof(context->progress_report->current_path), "%s",
                  logical[0] == '\0' ? root->capture_path : logical);
-    if (portable_copy_regular(source_fd, destination_fd, before->st_size,
-                              context->progress_report) != 0) {
+    uint64_t content_digest = 0;
+    if (portable_copy_regular_digest(source_fd, destination_fd,
+                                     before->st_size,
+                                     context->progress_report,
+                                     &content_digest) != 0) {
         int saved_errno = errno;
         portable_capture_context_failure_record(
             context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
@@ -2817,7 +2820,7 @@ static int capture_regular(PortableCaptureContext *context,
     } else if (!metadata_source_unchanged(before, &after) &&
                !capture_tolerates_live_change(context, root, logical)) {
         // A tolerated live file keeps the bytes read; its entry records the
-        // pre-scan metadata that portable_copy_regular() copied against.
+        // pre-scan metadata that portable_copy_regular_digest() copied against.
         portable_capture_context_failure_record(
             context, BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED, 0, root, logical);
         failed = 1;
@@ -2850,8 +2853,11 @@ static int capture_regular(PortableCaptureContext *context,
                              collision_suffix,
                              before,
                              context->nsec_exact,
-                             xattrs, &sidecar_entry, NULL, NULL, NULL) != 0 ||
-             append_group(context, &sidecar_entry, xattrs) != 0;
+                             xattrs, &sidecar_entry, NULL, NULL, NULL) != 0;
+    if (!failed) {
+        sidecar_entry.content_digest = content_digest;
+        failed = append_group(context, &sidecar_entry, xattrs) != 0;
+    }
     xattrs_free(xattrs);
     return failed ? -1 : 0;
 }

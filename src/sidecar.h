@@ -5,7 +5,7 @@
 #include <stdint.h>
 
 #define SIDECAR_MAGIC "MIGR_SIDECAR"
-#define SIDECAR_VERSION 4
+#define SIDECAR_VERSION 5
 #define SIDECAR_SLOT_NAME "sidecar.migr"
 /* Adoption writes a recovered journal prefix here, then renames it over the
  * slot; a leftover from an interrupted adoption is discarded on the next one. */
@@ -86,6 +86,8 @@ typedef struct {
     uint32_t mtime_nsec;
     uint64_t size;
     uint32_t xattr_count;
+    /* FNV-1a of a regular file's bytes as captured; 0 for other kinds. */
+    uint64_t content_digest;
     SidecarBytes symlink_target;
     SidecarBytes hardlink_root_id;
     SidecarBytes hardlink_logical_path;

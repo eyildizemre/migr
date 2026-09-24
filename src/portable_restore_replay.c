@@ -45,6 +45,8 @@ typedef struct {
     size_t destination_order;
     uint64_t content_digest;
     int content_digest_valid;
+    /* The payload read from the backup did not match its capture digest. */
+    int payload_differs;
     unsigned char directory_state;
 } ReplayEntry;
 
@@ -294,6 +296,8 @@ const char *replay_failure_step_text(PortableRestoreReplayFailureStep step)
             return "read restored content";
         case PORTABLE_RESTORE_REPLAY_FAILURE_COMPARE_DESTINATION_CONTENT:
             return "compare restored content";
+        case PORTABLE_RESTORE_REPLAY_FAILURE_COMPARE_BACKUP_CONTENT:
+            return "compare backup content";
         case PORTABLE_RESTORE_REPLAY_FAILURE_VERIFY_DESTINATION_HARDLINK:
             return "verify restored hardlink";
         case PORTABLE_RESTORE_REPLAY_FAILURE_CLOSE_DESCRIPTOR:
@@ -327,6 +331,13 @@ int replay_failure_reason_format(const PortableRestoreReplayReport *report,
         failure_errno == EIO)
     {
         step = "content differs from the backup";
+        failure_errno = 0;
+    }
+    else if (report->failure_step ==
+                 PORTABLE_RESTORE_REPLAY_FAILURE_COMPARE_BACKUP_CONTENT &&
+             failure_errno == EIO)
+    {
+        step = "the backup's copy changed after it was captured";
         failure_errno = 0;
     }
     int length;
@@ -1889,10 +1900,11 @@ static int replay_home_rewrite_flush(
 static int replay_copy_regular_rewriting_home(
     int source_fd, int destination_fd, off_t expected_size,
     const ReplayHomeRewritePair *pairs, size_t pair_count,
-    BackupCaptureReport *report, uint64_t *digest)
+    BackupCaptureReport *report, uint64_t *digest, uint64_t *source_digest)
 {
     if (source_fd < 0 || destination_fd < 0 || expected_size < 0 ||
-        pairs == NULL || pair_count == 0 || digest == NULL)
+        pairs == NULL || pair_count == 0 || digest == NULL ||
+        source_digest == NULL)
     {
         errno = EINVAL;
         return -1;
@@ -1906,6 +1918,7 @@ static int replay_copy_regular_rewriting_home(
     size_t carried = 0;
     uint64_t copied = 0;
     uint64_t hash = HASH_FNV1A_OFFSET_BASIS;
+    uint64_t read_hash = HASH_FNV1A_OFFSET_BASIS;
 
     for (;;)
     {
@@ -1936,6 +1949,8 @@ static int replay_copy_regular_rewriting_home(
             return -1;
         }
         copied += (uint64_t)received;
+        read_hash = hash_fnv1a_bytes(read_hash, buffer + carried,
+                                     (size_t)received);
         size_t total = carried + (size_t)received;
         size_t consumed = 0;
         if (replay_home_rewrite_flush(
@@ -1960,6 +1975,7 @@ static int replay_copy_regular_rewriting_home(
         return -1;
     }
     *digest = hash;
+    *source_digest = read_hash;
     return 0;
 }
 
@@ -2028,21 +2044,31 @@ static int replay_apply_regular(ReplayCollection *collection,
     }
     if (result == 0)
     {
+        // The written bytes differ from the read ones only when HOME paths
+        // are rewritten; the read ones are what the capture digest covers.
+        uint64_t source_digest = 0;
         if (replay_regular_rewrites_home(collection, replay))
             result = replay_copy_regular_rewriting_home(
                 source_fd, destination_fd, (off_t)entry->size,
                 collection->home_rewrite_pairs,
                 collection->home_rewrite_pair_count,
-                collection->capture_report, &replay->content_digest);
+                collection->capture_report, &replay->content_digest,
+                &source_digest);
         else
+        {
             result = portable_copy_regular_digest(
                 source_fd, destination_fd, (off_t)entry->size,
                 collection->capture_report, &replay->content_digest);
+            source_digest = replay->content_digest;
+        }
         if (result != 0)
             replay_apply_failure_record(
                 failure, PORTABLE_RESTORE_REPLAY_FAILURE_COPY_CONTENT, errno);
         else
+        {
             replay->content_digest_valid = 1;
+            replay->payload_differs = source_digest != entry->content_digest;
+        }
     }
     if (result == 0)
     {
@@ -3039,7 +3065,19 @@ static int replay_verify_regular(ReplayCollection *collection,
     }
 
     uint64_t digest = 0;
-    int result = replay_destination_regular_digest(parent_fd, leaf, &digest,
+    int result = 0;
+    if (replay->payload_differs)
+    {
+        // The restored file matches what was read, but the backup's copy no
+        // longer matches what was captured: the backup itself is damaged.
+        errno = EIO;
+        result = -1;
+        replay_apply_failure_record(
+            failure, PORTABLE_RESTORE_REPLAY_FAILURE_COMPARE_BACKUP_CONTENT,
+            errno);
+    }
+    if (result == 0)
+        result = replay_destination_regular_digest(parent_fd, leaf, &digest,
                                                    failure);
     if (result == 0 && digest != replay->content_digest)
     {
