@@ -4160,3 +4160,21 @@ fail); tolerating changes under arbitrary paths.
 
 **Relationship:** Extends D44/D48 from restore verification to capture; the list,
 its path-component boundary rule, and its evidence requirement are unchanged.
+
+---
+
+## D56 — 2026-09-24 — Podman's storage lock is confirmed live state
+
+**Status:** Implemented
+
+**Decision:** `BUILTIN_LOCAL_SHARE:containers/storage/storage.lock` joins the
+shared live-state list (D44/D48/D55). Nothing else under `containers/` does.
+
+**Why:** On real hardware a restore's verification failed on this file after
+rootless Podman had started twice during restores. The terminal (Ptyxis) queries
+Podman for Toolbox/Distrobox containers when it starts or opens a window, which
+launches a `podman-pause` scope, and Podman rewrites its lock file on each
+access. That is daemon-owned state changing independently of migr, the evidence
+D44 requires. Application files rewritten because a user left the application
+open (VS Code during the same restore) are not added; they are a warning matter,
+not live daemon state.

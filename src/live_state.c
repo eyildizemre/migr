@@ -12,7 +12,8 @@ static const LiveStatePath live_state_paths[] = {
     { "BUILTIN_DOT_CONFIG", "dconf/user" },
     { "BUILTIN_LOCAL_SHARE", "gnome-shell/application_state" },
     { "BUILTIN_LOCAL_SHARE", "flatpak" },
-    { "BUILTIN_LOCAL_SHARE", "org.gnome.TextEditor" }
+    { "BUILTIN_LOCAL_SHARE", "org.gnome.TextEditor" },
+    { "BUILTIN_LOCAL_SHARE", "containers/storage/storage.lock" }
 };
 
 int live_state_path(const char *root_id, size_t root_id_length,
