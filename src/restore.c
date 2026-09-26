@@ -445,24 +445,30 @@ static int restore_network_config_file_at(int network_fd, int dest_dir_fd,
 typedef struct {
     const char *comm;
     const char *label;
+    /* Below HOME: what the application owns and rewrites, restored last
+     * while it runs (D66); NULL for none. */
+    const char *settings;
 } RestoreWriterApp;
 
 // Applications whose settings the default scope restores and which rewrite
 // them while running or on exit. Matched by /proc/<pid>/comm (truncated to 15
 // bytes by the kernel). GNOME Software refreshes the restored Flatpak repo.
 static const RestoreWriterApp restore_writer_apps[] = {
-    { "code", "Visual Studio Code" },
-    { "firefox", "Firefox" },
-    { "firefox-bin", "Firefox" },
-    { "brave", "Brave" },
-    { "chrome", "Google Chrome" },
-    { "chromium", "Chromium" },
-    { "chromium-browse", "Chromium" },
-    { "vivaldi-bin", "Vivaldi" },
-    { "msedge", "Microsoft Edge" },
-    { "opera", "Opera" },
-    { "gnome-software", "GNOME Software" }
+    { "code", "Visual Studio Code", ".config/Code" },
+    { "firefox", "Firefox", ".mozilla/firefox" },
+    { "firefox-bin", "Firefox", ".mozilla/firefox" },
+    { "brave", "Brave", ".config/BraveSoftware" },
+    { "chrome", "Google Chrome", ".config/google-chrome" },
+    { "chromium", "Chromium", ".config/chromium" },
+    { "chromium-browse", "Chromium", ".config/chromium" },
+    { "vivaldi-bin", "Vivaldi", ".config/vivaldi" },
+    { "msedge", "Microsoft Edge", ".config/microsoft-edge" },
+    { "opera", "Opera", ".config/opera" },
+    { "gnome-software", "GNOME Software", NULL }
 };
+
+#define RESTORE_WRITER_APP_COUNT \
+    (sizeof(restore_writer_apps) / sizeof(restore_writer_apps[0]))
 
 static const char *restore_proc_root = "/proc";
 
@@ -505,9 +511,10 @@ static int restore_process_uid_at(int pid_fd, uid_t *uid)
     return 0;
 }
 
-// Collects the distinct labels of known writer applications run by uid.
-static size_t restore_running_writer_labels(uid_t uid, const char **labels,
-                                            size_t max_labels)
+// Collects the distinct known writer applications run by uid, as indexes
+// into restore_writer_apps, one per label.
+static size_t restore_running_writers(uid_t uid, size_t *found,
+                                      size_t max_found)
 {
     DIR *proc = opendir(restore_proc_root);
     if (proc == NULL)
@@ -532,22 +539,69 @@ static size_t restore_running_writer_labels(uid_t uid, const char **labels,
         if (!readable || owner != uid)
             continue;
         comm[strcspn(comm, "\n")] = '\0';
-        for (size_t index = 0;
-             index < sizeof(restore_writer_apps) / sizeof(restore_writer_apps[0]);
-             index++)
+        for (size_t index = 0; index < RESTORE_WRITER_APP_COUNT; index++)
         {
             if (strcmp(comm, restore_writer_apps[index].comm) != 0)
                 continue;
-            const char *label = restore_writer_apps[index].label;
             int seen = 0;
             for (size_t known = 0; known < count && !seen; known++)
-                seen = strcmp(labels[known], label) == 0;
-            if (!seen && count < max_labels)
-                labels[count++] = label;
+                seen = strcmp(restore_writer_apps[found[known]].label,
+                              restore_writer_apps[index].label) == 0;
+            if (!seen && count < max_found)
+                found[count++] = index;
             break;
         }
     }
     closedir(proc);
+    return count;
+}
+
+static size_t restore_running_writer_labels(uid_t uid, const char **labels,
+                                            size_t max_labels)
+{
+    size_t found[RESTORE_WRITER_APP_COUNT];
+    size_t count = restore_running_writers(uid, found,
+                                           RESTORE_WRITER_APP_COUNT);
+    if (count > max_labels)
+        count = max_labels;
+    for (size_t index = 0; index < count; index++)
+        labels[index] = restore_writer_apps[found[index]].label;
+    return count;
+}
+
+// The user whose applications matter: the sudo invoker under sudo (D38).
+static int restore_session_uid(uid_t *uid)
+{
+    *uid = geteuid();
+    gid_t gid;
+    char sudo_home[PATH_MAX];
+    if (geteuid() == 0 && getenv("SUDO_UID") != NULL &&
+        resolve_sudo_identity(uid, &gid, sudo_home) != 0)
+        return -1;
+    return 0;
+}
+
+// What a portable restore defers (D66): the settings of every writer
+// application running now. Returns how many paths were filled.
+static size_t restore_deferred_paths(PortableRestoreDeferredPath *paths,
+                                     size_t max_paths)
+{
+    uid_t uid;
+    if (restore_session_uid(&uid) != 0)
+        return 0;
+    size_t found[RESTORE_WRITER_APP_COUNT];
+    size_t running = restore_running_writers(uid, found,
+                                             RESTORE_WRITER_APP_COUNT);
+    size_t count = 0;
+    for (size_t index = 0; index < running && count < max_paths; index++)
+    {
+        const RestoreWriterApp *app = &restore_writer_apps[found[index]];
+        if (app->settings == NULL)
+            continue;
+        paths[count].label = app->label;
+        paths[count].home_relative = app->settings;
+        count++;
+    }
     return count;
 }
 
@@ -561,26 +615,100 @@ size_t restore_test_running_writer_labels(uid_t uid, const char **labels,
 
 // Printed right before the confirmation prompt: an open application that owns
 // restored settings writes over them while the restore runs or when it exits.
+// What a portable restore defers for the applications running when it
+// starts (D66), and how to retire the progress line before asking about them.
+typedef struct {
+    PortableRestoreDeferredPath paths[RESTORE_WRITER_APP_COUNT];
+    size_t count;
+    void (*retire_progress)(void *context);
+    void *progress;
+} RestoreDeferral;
+
+static void restore_print_labels(const char *const *labels, size_t count)
+{
+    for (size_t index = 0; index < count; index++)
+        printf("%s%s", index == 0 ? ""
+                       : index + 1U == count ? " and " : ", ",
+               labels[index]);
+}
+
+// Printed right before the confirmation prompt. With a deferral (portable
+// restore), the settings of open applications are restored last; without one
+// they can only be named.
 static void restore_warn_running_writers(void *context)
 {
-    (void)context;
-    uid_t uid = geteuid();
-    gid_t gid;
-    char sudo_home[PATH_MAX];
-    if (geteuid() == 0 && getenv("SUDO_UID") != NULL &&
-        resolve_sudo_identity(&uid, &gid, sudo_home) != 0)
+    const RestoreDeferral *deferral = context;
+    uid_t uid;
+    if (restore_session_uid(&uid) != 0)
         return;
-    const char *labels[sizeof(restore_writer_apps) /
-                       sizeof(restore_writer_apps[0])];
-    size_t count = restore_running_writer_labels(
-        uid, labels, sizeof(labels) / sizeof(labels[0]));
+    const char *labels[RESTORE_WRITER_APP_COUNT];
+    size_t count = restore_running_writer_labels(uid, labels,
+                                                 RESTORE_WRITER_APP_COUNT);
     if (count == 0)
         return;
-    printf("\nThese applications are running and can overwrite restored "
-           "settings while the restore runs or when they close: ");
-    for (size_t index = 0; index < count; index++)
-        printf("%s%s", index == 0 ? "" : ", ", labels[index]);
-    printf(".\nClose them before continuing.\n\n");
+    printf("\n");
+    restore_print_labels(labels, count);
+    if (deferral != NULL && deferral->count != 0)
+        printf(" %s open. The settings %s owns are restored last, after "
+               "everything else; close %s before then.\n\n",
+               count == 1 ? "is" : "are", count == 1 ? "it" : "each",
+               count == 1 ? "it" : "them");
+    else
+        printf(" %s running and can overwrite restored settings while the "
+               "restore runs or when %s. Close %s before continuing.\n\n",
+               count == 1 ? "is" : "are",
+               count == 1 ? "it closes" : "they close",
+               count == 1 ? "it" : "them");
+}
+
+// Runs once replay reaches the deferred settings (D66). Waiting here costs
+// nothing: everything else is already restored. Returns 1 to restore them,
+// 0 to leave them out.
+static int restore_before_deferred(void *context)
+{
+    RestoreDeferral *deferral = context;
+    if (deferral->retire_progress != NULL)
+        deferral->retire_progress(deferral->progress);
+    uid_t uid;
+    if (restore_session_uid(&uid) != 0)
+        return 1;
+    for (;;)
+    {
+        const char *running[RESTORE_WRITER_APP_COUNT];
+        size_t running_count = restore_running_writer_labels(
+            uid, running, RESTORE_WRITER_APP_COUNT);
+        const char *open[RESTORE_WRITER_APP_COUNT];
+        size_t open_count = 0;
+        for (size_t index = 0; index < running_count; index++)
+            for (size_t path = 0; path < deferral->count; path++)
+                if (strcmp(running[index], deferral->paths[path].label) == 0)
+                {
+                    open[open_count++] = running[index];
+                    break;
+                }
+        if (open_count == 0)
+            return 1;
+        printf("\n");
+        restore_print_labels(open, open_count);
+        printf(" %s still open. Close %s and press Enter to restore %s "
+               "settings, type s to leave them out, or c to restore them "
+               "anyway: ",
+               open_count == 1 ? "is" : "are", open_count == 1 ? "it" : "them",
+               open_count == 1 ? "its" : "their");
+        fflush(stdout);
+        char answer[32];
+        if (fgets(answer, sizeof(answer), stdin) == NULL)
+        {
+            printf("\nNo answer; restoring them now. ");
+            restore_print_labels(open, open_count);
+            printf(" may overwrite them on closing.\n");
+            return 1;
+        }
+        if (answer[0] == 's' || answer[0] == 'S')
+            return 0;
+        if (answer[0] == 'c' || answer[0] == 'C')
+            return 1;
+    }
 }
 
 #ifdef RESTORE_TEST_HOOKS
@@ -2822,6 +2950,9 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         }
 
         int dconf_database_fd = -1;
+        RestoreDeferral deferral = {0};
+        deferral.count = restore_deferred_paths(deferral.paths,
+                                                RESTORE_WRITER_APP_COUNT);
         PortableRestoreRequest request = {
             .source_container_fd = source_root_fd,
             .manifest = &m,
@@ -2830,6 +2961,9 @@ int restore_with_options(const char *source, const RestoreOptions *options)
             .destination_timestamp_policy = {0},
             .skip_content_verification = skip_content_verification,
             .before_confirmation = restore_warn_running_writers,
+            .before_confirmation_context = &deferral,
+            .before_deferred = restore_before_deferred,
+            .before_deferred_context = &deferral,
             .dconf_database_fd_out = &dconf_database_fd
         };
         for (int index = 0; index < XDG_RESTORE_COUNT; index++)
@@ -2859,6 +2993,13 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         request.before_content_verification =
             restore_before_content_verification;
         request.before_content_verification_context = &progress_phase;
+        if (deferral.count != 0)
+        {
+            request.deferred_paths = deferral.paths;
+            request.deferred_path_count = deferral.count;
+        }
+        deferral.retire_progress = restore_before_content_verification;
+        deferral.progress = &progress_phase;
         PortableRestoreReplayReport report;
         PortableRestoreOutcome outcome =
             portable_restore_orchestrate_at(&request, &report);
@@ -2957,6 +3098,13 @@ int restore_with_options(const char *source, const RestoreOptions *options)
                    "already written in place.\n",
                    report.live_state_kept_count,
                    report.live_state_kept_count == 1 ? "" : "s");
+        if (report.deferred_skipped_count != 0)
+            printf("Left out %zu settings file%s of applications that stayed "
+                   "open; close them and run the same restore again to put "
+                   "%s back.\n",
+                   report.deferred_skipped_count,
+                   report.deferred_skipped_count == 1 ? "" : "s",
+                   report.deferred_skipped_count == 1 ? "it" : "them");
         if (report.skipped_security_xattr_count != 0)
             printf("Skipped %zu security.* attribute(s) that the destination "
                    "could not apply.\n",
@@ -3057,12 +3205,16 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         native_restore_security_dry_run_notice(
             metadata_profiles.security_xattr_entry_count);
     }
-    else if (!native_restore_confirm(
-                 metadata_profiles.security_xattr_entry_count))
+    else
     {
-        printf("Cancelled.\n");
-        result = 0;
-        goto cleanup;
+        restore_warn_running_writers(NULL);
+        if (!native_restore_confirm(
+                metadata_profiles.security_xattr_entry_count))
+        {
+            printf("Cancelled.\n");
+            result = 0;
+            goto cleanup;
+        }
     }
 
     printf("Restoring from: %s\n\n", source);

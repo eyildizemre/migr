@@ -50,7 +50,15 @@ typedef struct {
     unsigned char directory_state;
     /* Live desktop state already present at the destination (D65). */
     int kept_live_state;
+    /* REPLAY_DEFERRED_* (D66). */
+    unsigned char deferral;
 } ReplayEntry;
+
+enum {
+    REPLAY_NOT_DEFERRED = 0,
+    REPLAY_DEFERRED,
+    REPLAY_DEFERRED_SKIPPED
+};
 
 #define REPLAY_VERIFICATION_EXAMPLES 8
 
@@ -116,6 +124,10 @@ typedef struct {
     void (*before_content_verification)(void *context);
     void *before_content_verification_context;
     int *dconf_database_fd_out;
+    const PortableRestoreDeferredPath *deferred_paths;
+    size_t deferred_path_count;
+    int (*before_deferred)(void *context);
+    void *before_deferred_context;
 } ReplayCollection;
 
 typedef struct {
@@ -3341,7 +3353,8 @@ static int replay_content_verification_excluded(
     const ReplayCollection *collection, const ReplayEntry *replay)
 {
     return replay != NULL &&
-           (replay_regular_content_verification_excluded(replay->entry) ||
+           (replay->deferral == REPLAY_DEFERRED_SKIPPED ||
+            replay_regular_content_verification_excluded(replay->entry) ||
             replay_regular_is_locally_authoritative(collection, replay));
 }
 
@@ -3481,6 +3494,145 @@ static void replay_finalize_prepared_directories(ReplayCollection *collection)
     errno = saved;
 }
 
+// Applies one entry of any kind but a directory's final metadata, with the
+// accounting the apply passes share. On failure the report names the entry
+// and prepared directories are finalized.
+static int replay_apply_entry(ReplayCollection *collection,
+                              ReplayEntry *replay,
+                              unsigned char *printed_roots)
+{
+    ReplayApplyFailure failure = {0};
+    int result;
+    replay_print_verbose_root(collection, replay->root_index, printed_roots);
+    if (replay->entry->kind == SIDECAR_KIND_HARDLINK)
+        result = replay_apply_hardlink(collection, replay, &failure);
+    else if (replay->entry->kind == SIDECAR_KIND_SYMLINK)
+        result = replay_apply_symlink(collection, replay, &failure);
+    else if (replay->entry->kind == SIDECAR_KIND_DIRECTORY)
+        result = replay_prepare_directory(collection, replay, &failure);
+    else
+        result = replay_apply_regular(collection, replay, &failure);
+    if (result != 0)
+    {
+        replay_report_apply_failure(
+            collection->report, collection->manifest, replay->root_index,
+            replay->entry, &failure);
+        replay_finalize_prepared_directories(collection);
+        return -1;
+    }
+    if (replay->entry->kind == SIDECAR_KIND_DIRECTORY)
+        replay->directory_state = REPLAY_DIRECTORY_PREPARED;
+    else if (replay->entry->kind == SIDECAR_KIND_REGULAR)
+        replay_capture_dconf_database(collection, replay);
+    if (replay->entry->kind == SIDECAR_KIND_REGULAR &&
+        replay_regular_is_locally_authoritative(collection, replay))
+    {
+        if (collection->report->preserved_local_state_count != SIZE_MAX)
+            collection->report->preserved_local_state_count++;
+    }
+    else if (replay->kept_live_state)
+    {
+        if (collection->report->live_state_kept_count != SIZE_MAX)
+            collection->report->live_state_kept_count++;
+    }
+    else if (replay->entry->kind != SIDECAR_KIND_DIRECTORY)
+    {
+        if (collection->report->applied_count != SIZE_MAX)
+            collection->report->applied_count++;
+    }
+    return 0;
+}
+
+static int replay_path_is_below(const char *path, const char *prefix)
+{
+    size_t length = strlen(prefix);
+    return length != 0 && strncmp(path, prefix, length) == 0 &&
+           (path[length] == '\0' || path[length] == '/');
+}
+
+static int replay_relative_is_deferred(const ReplayCollection *collection,
+                                       const char *relative)
+{
+    for (size_t index = 0; index < collection->deferred_path_count; index++)
+        if (collection->deferred_paths[index].home_relative != NULL &&
+            replay_path_is_below(relative,
+                                 collection->deferred_paths[index].home_relative))
+            return 1;
+    return 0;
+}
+
+// Marks what an open application owns (D66): regular files and symlinks
+// below a deferred path of a home-relative root, and hardlinks whose own
+// name or representative is there, so a link never precedes its target.
+static void replay_mark_deferred(ReplayCollection *collection)
+{
+    if (collection->deferred_path_count == 0)
+        return;
+    for (size_t index = 0; index < collection->count; index++)
+    {
+        ReplayEntry *replay = &collection->items[index];
+        const ManifestRoot *root =
+            &collection->manifest->roots[replay->root_index];
+        if (replay->entry->kind == SIDECAR_KIND_DIRECTORY ||
+            root->policy != ROOT_POLICY_HOME_RELATIVE)
+            continue;
+        char relative[PATH_MAX];
+        int deferred =
+            replay_destination_relative(collection, replay, relative,
+                                        sizeof(relative)) == 0 &&
+            replay_relative_is_deferred(collection, relative);
+        if (!deferred && replay->entry->kind == SIDECAR_KIND_HARDLINK &&
+            replay->hardlink_ref_entry != NULL &&
+            replay->hardlink_ref_root_index <
+                (size_t)collection->manifest->root_count)
+        {
+            const ManifestRoot *ref_root =
+                &collection->manifest->roots[replay->hardlink_ref_root_index];
+            deferred = ref_root->policy == ROOT_POLICY_HOME_RELATIVE &&
+                       replay_hardlink_ref_relative(
+                           ref_root, replay->hardlink_ref_entry,
+                           collection->destination_xdg_dirs, relative,
+                           sizeof(relative)) == 0 &&
+                       replay_relative_is_deferred(collection, relative);
+        }
+        if (!deferred)
+            continue;
+        replay->deferral = REPLAY_DEFERRED;
+        if (collection->report->deferred_count != SIZE_MAX)
+            collection->report->deferred_count++;
+    }
+}
+
+// Restores what was deferred, now that everything else is in place, unless
+// before_deferred says to leave it out (D66).
+static int replay_apply_deferred(ReplayCollection *collection,
+                                 unsigned char *printed_roots)
+{
+    if (collection->report->deferred_count == 0)
+        return 0;
+    int restore = collection->before_deferred == NULL ||
+                  collection->before_deferred(
+                      collection->before_deferred_context) != 0;
+    for (int hardlinks = 0; hardlinks < 2; hardlinks++)
+        for (size_t index = 0; index < collection->count; index++)
+        {
+            ReplayEntry *replay = &collection->items[index];
+            if (replay->deferral != REPLAY_DEFERRED ||
+                (replay->entry->kind == SIDECAR_KIND_HARDLINK) != hardlinks)
+                continue;
+            if (!restore)
+            {
+                replay->deferral = REPLAY_DEFERRED_SKIPPED;
+                if (collection->report->deferred_skipped_count != SIZE_MAX)
+                    collection->report->deferred_skipped_count++;
+                continue;
+            }
+            if (replay_apply_entry(collection, replay, printed_roots) != 0)
+                return -1;
+        }
+    return 0;
+}
+
 static int replay_run(ReplayCollection *collection)
 {
     if (collection == NULL || collection->report == NULL)
@@ -3502,71 +3654,29 @@ static int replay_run(ReplayCollection *collection)
      *    is already on disk before its parent's own metadata (mtime
      *    especially) is set (D17, "directories: children first, then exact
      *    post-order metadata"). */
+    replay_mark_deferred(collection);
     for (size_t index = 0; index < collection->count; index++)
     {
         ReplayEntry *replay = &collection->items[index];
-        ReplayApplyFailure failure = {0};
-        int result;
-        if (replay->entry->kind == SIDECAR_KIND_HARDLINK)
+        if (replay->entry->kind == SIDECAR_KIND_HARDLINK ||
+            replay->deferral != REPLAY_NOT_DEFERRED)
             continue;
-        replay_print_verbose_root(collection, replay->root_index,
-                                  printed_roots);
-        if (replay->entry->kind == SIDECAR_KIND_SYMLINK)
-            result = replay_apply_symlink(collection, replay, &failure);
-        else if (replay->entry->kind == SIDECAR_KIND_DIRECTORY)
-            result = replay_prepare_directory(collection, replay, &failure);
-        else
-            result = replay_apply_regular(collection, replay, &failure);
-        if (result != 0)
-        {
-            replay_report_apply_failure(
-                collection->report, collection->manifest, replay->root_index,
-                replay->entry, &failure);
-            replay_finalize_prepared_directories(collection);
+        if (replay_apply_entry(collection, replay, printed_roots) != 0)
             return -1;
-        }
-        if (replay->entry->kind == SIDECAR_KIND_DIRECTORY)
-            replay->directory_state = REPLAY_DIRECTORY_PREPARED;
-        else if (replay->entry->kind == SIDECAR_KIND_REGULAR)
-            replay_capture_dconf_database(collection, replay);
-        if (replay->entry->kind == SIDECAR_KIND_REGULAR &&
-            replay_regular_is_locally_authoritative(collection, replay))
-        {
-            if (collection->report->preserved_local_state_count != SIZE_MAX)
-                collection->report->preserved_local_state_count++;
-        }
-        else if (replay->kept_live_state)
-        {
-            if (collection->report->live_state_kept_count != SIZE_MAX)
-                collection->report->live_state_kept_count++;
-        }
-        else if (replay->entry->kind == SIDECAR_KIND_REGULAR ||
-                 replay->entry->kind == SIDECAR_KIND_SYMLINK)
-        {
-            if (collection->report->applied_count != SIZE_MAX)
-                collection->report->applied_count++;
-        }
     }
 
     for (size_t index = 0; index < collection->count; index++)
     {
         ReplayEntry *replay = &collection->items[index];
-        if (replay->entry->kind != SIDECAR_KIND_HARDLINK)
+        if (replay->entry->kind != SIDECAR_KIND_HARDLINK ||
+            replay->deferral != REPLAY_NOT_DEFERRED)
             continue;
-        replay_print_verbose_root(collection, replay->root_index,
-                                  printed_roots);
-        ReplayApplyFailure failure = {0};
-        if (replay_apply_hardlink(collection, replay, &failure) != 0)
-        {
-            replay_report_apply_failure(
-                collection->report, collection->manifest, replay->root_index,
-                replay->entry, &failure);
-            replay_finalize_prepared_directories(collection);
+        if (replay_apply_entry(collection, replay, printed_roots) != 0)
             return -1;
-        }
-        if (collection->report->applied_count != SIZE_MAX)
-            collection->report->applied_count++;
     }
+
+    if (replay_apply_deferred(collection, printed_roots) != 0)
+        return -1;
 
     for (size_t index = collection->count; index != 0; index--)
     {
@@ -3670,7 +3780,11 @@ int portable_restore_replay_at(const PortableRestoreRequest *request,
         .before_content_verification = request->before_content_verification,
         .before_content_verification_context =
             request->before_content_verification_context,
-        .dconf_database_fd_out = request->dconf_database_fd_out
+        .dconf_database_fd_out = request->dconf_database_fd_out,
+        .deferred_paths = request->deferred_paths,
+        .deferred_path_count = request->deferred_path_count,
+        .before_deferred = request->before_deferred,
+        .before_deferred_context = request->before_deferred_context
     };
     for (int index = 0; index < XDG_KEY_COUNT; index++)
         collection.xdg_anchor_fd[index] = -1;

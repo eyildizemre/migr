@@ -4470,3 +4470,50 @@ keep. Missing files are still filled in.
 
 **Relationship:** Part of the live-environment design. Not backing this
 state up at all belongs to the backup-scope overhaul.
+
+## D66 — 2026-09-26 — A portable restore restores open applications' settings last
+
+**Status:** Implemented
+
+**Decision:** `restore_writer_apps` gives each known writer application the
+path below HOME it owns (VS Code `.config/Code`, Firefox
+`.mozilla/firefox`, the Chromium family's `.config/<browser>`; none for GNOME
+Software).
+
+- **Detection:** When a portable restore starts, the applications of the
+  target user that are running have their paths passed in the request as
+  deferred paths.
+- **Replay:** It marks as deferred every regular file and symlink below one
+  of them (home-relative roots only), and every hardlink whose own name or
+  representative is there, so a link never precedes its target. Directories
+  are prepared as usual. Deferred items are skipped by the first two passes.
+- **The decision:** Once everything else is restored, replay calls
+  `before_deferred` once, then applies the deferred items or marks them
+  skipped. Skipped items are counted in `deferred_skipped_count` and left
+  out of verification. Directory metadata is finalized afterwards, as
+  always.
+- **Asking:** The CLI's `before_deferred` retires the progress line. If none
+  of the deferred applications is still open, it restores silently.
+  Otherwise it asks once:
+  - Enter checks again
+  - `s` leaves the settings out, and the summary tells the user to rerun the
+    restore after closing them
+  - `c` restores them anyway
+  - end of input (nobody to answer) restores them with a note that the
+    application may overwrite them on closing
+- **Before the confirmation prompt:** The warning says these settings are
+  restored last.
+
+A native restore prints the plain warning before its prompt (restored here,
+since it had lost the call) but does not defer.
+
+**Why:** An application that saves its state on exit overwrites restored
+settings after migr has finished, where no verification can see it. VS Code
+did exactly that on the first real restore. Asking at the start would stall
+an unattended run for its whole length. At the end nothing else is left to
+do, so waiting costs nothing, and the application has had the whole restore
+to be closed.
+
+**Relationship:** Part of the live-environment design. Native restore
+deferral, and Flatpak applications (`~/.var/app/<id>`, detectable with
+`flatpak ps`, once that scope is captured at all), are open.

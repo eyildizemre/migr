@@ -626,6 +626,12 @@ static int run_replay_with_capture(
                                    NULL);
 }
 
+// Deferral options every run_replay*() passes on (D66); unset by default.
+static const PortableRestoreDeferredPath *replay_deferred_paths;
+static size_t replay_deferred_path_count;
+static int (*replay_before_deferred)(void *);
+static void *replay_before_deferred_context;
+
 static int run_replay_with_options(
     Fixture *fixture, PortableRestoreReplayReport *report,
     BackupCaptureReport *capture_report, int skip_content_verification,
@@ -649,7 +655,11 @@ static int run_replay_with_options(
         .skip_content_verification = skip_content_verification,
         .before_content_verification = before_content_verification,
         .before_content_verification_context =
-            before_content_verification_context
+            before_content_verification_context,
+        .deferred_paths = replay_deferred_paths,
+        .deferred_path_count = replay_deferred_path_count,
+        .before_deferred = replay_before_deferred,
+        .before_deferred_context = replay_before_deferred_context
     };
     portable_restore_replay_report_init(report);
     int result = portable_restore_replay_at(&request, report);
@@ -2413,6 +2423,119 @@ static int xdg_home_rewrite_fixture_open(
     return 0;
 }
 
+typedef struct {
+    const char *home;
+    int decision;
+    int calls;
+    int others_in_place;
+    int deferred_absent;
+} DeferralProbe;
+
+static int probe_before_deferred(void *context)
+{
+    DeferralProbe *probe = context;
+    char other[PATH_MAX], deferred[PATH_MAX], link[PATH_MAX];
+    path_join(other, sizeof(other), probe->home, "/restored/other");
+    path_join(deferred, sizeof(deferred), probe->home,
+              "/restored/app/settings");
+    path_join(link, sizeof(link), probe->home, "/restored/app-link");
+    struct stat st;
+    probe->calls++;
+    probe->others_in_place = file_equals_noatime(other, "other file");
+    probe->deferred_absent = lstat(deferred, &st) != 0 &&
+                             lstat(link, &st) != 0;
+    return probe->decision;
+}
+
+static int deferral_fixture_open(Fixture *fixture)
+{
+    ManifestRoot root = root_for();
+    if (fixture_open(fixture, &root) != 0)
+        return -1;
+    make_dir_at(fixture->data_fd, "ROOT", 0700);
+    make_dir_at(fixture->data_fd, "ROOT/app", 0700);
+    write_file_at(fixture->data_fd, "ROOT/app/settings", "app settings");
+    write_file_at(fixture->data_fd, "ROOT/other", "other file");
+    write_file_at(fixture->data_fd, "ROOT/app-link", "");
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000900, 1, 1700000901, 2),
+        entry_for("ROOT", "app", "app", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000902, 3, 1700000903, 4),
+        entry_for("ROOT", "app/settings", "app/settings",
+                  SIDECAR_KIND_REGULAR, strlen("app settings"), 0600,
+                  1700000904, 5, 1700000905, 6),
+        entry_for("ROOT", "other", "other", SIDECAR_KIND_REGULAR,
+                  strlen("other file"), 0600, 1700000906, 7, 1700000907, 8),
+        entry_for("ROOT", "app-link", "app-link", SIDECAR_KIND_HARDLINK, 0,
+                  0600, 1700000908, 9, 1700000909, 10)
+    };
+    entries[4].hardlink_root_id = text_bytes("ROOT");
+    entries[4].hardlink_logical_path = text_bytes("app/settings");
+    if (write_sidecar(fixture, entries, sizeof(entries) / sizeof(entries[0]),
+                      NULL, NULL) != 0)
+    {
+        fixture_close(fixture);
+        return -1;
+    }
+    return 0;
+}
+
+// Files an open application owns are restored after everything else, or
+// left out, as the caller decides then (D66). A hardlink to one of them
+// follows its representative.
+static void test_deferred_paths_restore_last(void)
+{
+    printf(BLUE "::" NC " deferred application settings are restored last\n");
+    static const PortableRestoreDeferredPath paths[] = {
+        { "Test App", "restored/app" }
+    };
+    for (int decision = 0; decision <= 1; decision++)
+    {
+        Fixture fixture;
+        int opened = deferral_fixture_open(&fixture);
+        check(opened == 0, "deferral fixture is created");
+        if (opened != 0)
+            continue;
+        DeferralProbe probe = { .home = fixture.home, .decision = decision };
+        replay_deferred_paths = paths;
+        replay_deferred_path_count = 1;
+        replay_before_deferred = probe_before_deferred;
+        replay_before_deferred_context = &probe;
+        PortableRestoreReplayReport report;
+        int result = run_replay(&fixture, &report);
+        replay_deferred_paths = NULL;
+        replay_deferred_path_count = 0;
+        replay_before_deferred = NULL;
+        replay_before_deferred_context = NULL;
+
+        char deferred[PATH_MAX], link[PATH_MAX];
+        path_join(deferred, sizeof(deferred), fixture.home,
+                  "/restored/app/settings");
+        path_join(link, sizeof(link), fixture.home, "/restored/app-link");
+        struct stat st;
+        check(result == 0 && probe.calls == 1 && probe.others_in_place &&
+                  probe.deferred_absent && report.deferred_count == 2,
+              decision
+                  ? "the caller is asked once, after everything else is in "
+                    "place"
+                  : "the caller is asked with the deferred files not yet "
+                    "written");
+        if (decision)
+            check(file_equals_noatime(deferred, "app settings") &&
+                      stat(link, &st) == 0 && report.deferred_skipped_count == 0 &&
+                      report.verification_failed_count == 0,
+                  "restoring them writes the deferred file and its hardlink");
+        else
+            check(lstat(deferred, &st) != 0 && lstat(link, &st) != 0 &&
+                      report.deferred_skipped_count == 2 &&
+                      report.verification_failed_count == 0,
+                  "leaving them out writes neither and verification skips "
+                  "them");
+        fixture_close(&fixture);
+    }
+}
+
 static int verification_exclusion_fixture_open(Fixture *fixture)
 {
     static const char gvfs_root_payload[] = "gvfs root payload";
@@ -4164,6 +4287,7 @@ int main(void)
     // A direct sudo run must not aim restores at the invoking user's home
     // (D38); make and test.sh drop SUDO_UID already.
     unsetenv("SUDO_UID");
+    test_deferred_paths_restore_last();
     test_verification_checks_every_item();
     test_dconf_database_handoff();
     test_symlink_collection_validation();

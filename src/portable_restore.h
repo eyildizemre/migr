@@ -11,6 +11,14 @@
 #include "sidecar.h"
 #include "xdg.h"
 
+/* Files an open application would overwrite, restored last (D66). */
+typedef struct {
+    /* Shown to the user, e.g. "Visual Studio Code". */
+    const char *label;
+    /* Below the destination home, e.g. ".config/Code". */
+    const char *home_relative;
+} PortableRestoreDeferredPath;
+
 typedef struct {
     int source_container_fd;
     const Manifest *manifest;
@@ -39,6 +47,14 @@ typedef struct {
      * payload there so the caller can load it into a running session. The
      * caller closes it. NULL disables this. */
     int *dconf_database_fd_out;
+    /* Optional. Regular files, symlinks, and hardlinks below these paths of
+     * home-relative roots are restored after everything else. Right before
+     * that, before_deferred (if set) decides: 1 restores them, 0 leaves them
+     * out. Directories are prepared as usual. */
+    const PortableRestoreDeferredPath *deferred_paths;
+    size_t deferred_path_count;
+    int (*before_deferred)(void *context);
+    void *before_deferred_context;
 } PortableRestoreRequest;
 
 typedef enum {
@@ -117,6 +133,10 @@ typedef struct {
     /* Live desktop state a running service had already written at the
      * destination, left as it was (D65). */
     size_t live_state_kept_count;
+    /* Items restored last because an open application owns them (D66), and
+     * how many of those were left out at the user's request. */
+    size_t deferred_count;
+    size_t deferred_skipped_count;
     size_t skipped_security_xattr_count;
     size_t verification_checked_count;
     size_t verification_failed_count;

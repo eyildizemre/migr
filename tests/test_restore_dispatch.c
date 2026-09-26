@@ -2179,14 +2179,141 @@ static void test_verification_failure_still_restores_packages(void)
     struct stat marker;
     check(stat(probe.marker_path, &marker) == 0,
           "packages are still restored once every file was applied");
-    const char *warning = strstr(output, "These applications are running");
+    const char *warning = strstr(output, "Visual Studio Code is open.");
     const char *prompt = strstr(output, "Continue?");
-    check(warning != NULL && prompt != NULL && warning < prompt &&
-              strstr(warning, "Visual Studio Code") != NULL,
+    check(warning != NULL && prompt != NULL && warning < prompt,
           "a running writer is named before the confirmation prompt");
 
     remove_tree(source);
     remove_tree(home);
+}
+
+// A portable restore with Visual Studio Code open (a fake /proc entry that
+// stays running) restores its settings last and asks first (D66).
+static int run_deferred_settings_restore(const char *input, char *output,
+                                         size_t output_size,
+                                         int *settings_restored,
+                                         int *other_restored)
+{
+    char source[PATH_MAX], home[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_defer_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_defer_home");
+    setenv("HOME", home, 1);
+
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "CONFIG");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "CONFIG");
+    strcpy(root.source_path, "/source/.config");
+    strcpy(root.restore_path, ".config");
+    root.has_restore_path = 1;
+    Manifest manifest;
+    make_v1_manifest(&manifest, &root, 1);
+    manifest.representation = CLONE_PORTABLE_SIDECAR;
+    manifest.sidecar_version = SIDECAR_VERSION;
+    if (manifest_write_v1(source, &manifest) != 0)
+        return -1;
+    write_payload_file(source, "data/CONFIG/Code", "settings.json", "{}");
+    write_payload_file(source, "data/CONFIG", "other.txt", "other");
+
+    uint32_t uid = (uint32_t)geteuid(), gid = (uint32_t)getegid();
+    SidecarEntry entries[] = {
+        { .root_id = sidecar_text("CONFIG"), .logical_path = sidecar_text(""),
+          .physical_leaf = sidecar_text(""), .kind = SIDECAR_KIND_DIRECTORY,
+          .mode = 0700, .uid = uid, .gid = gid,
+          .atime_sec = 1700000950, .mtime_sec = 1700000951 },
+        { .root_id = sidecar_text("CONFIG"),
+          .logical_path = sidecar_text("Code"),
+          .physical_leaf = sidecar_text("Code"),
+          .kind = SIDECAR_KIND_DIRECTORY, .mode = 0700, .uid = uid,
+          .gid = gid, .atime_sec = 1700000952, .mtime_sec = 1700000953 },
+        { .root_id = sidecar_text("CONFIG"),
+          .logical_path = sidecar_text("Code/settings.json"),
+          .physical_leaf = sidecar_text("settings.json"),
+          .kind = SIDECAR_KIND_REGULAR, .mode = 0600, .uid = uid, .gid = gid,
+          .atime_sec = 1700000954, .mtime_sec = 1700000955, .size = 2,
+          .content_digest = hash_fnv1a_bytes(HASH_FNV1A_OFFSET_BASIS,
+                                             (const unsigned char *)"{}", 2) },
+        { .root_id = sidecar_text("CONFIG"),
+          .logical_path = sidecar_text("other.txt"),
+          .physical_leaf = sidecar_text("other.txt"),
+          .kind = SIDECAR_KIND_REGULAR, .mode = 0600, .uid = uid, .gid = gid,
+          .atime_sec = 1700000956, .mtime_sec = 1700000957, .size = 5,
+          .content_digest = hash_fnv1a_bytes(HASH_FNV1A_OFFSET_BASIS,
+                                             (const unsigned char *)"other",
+                                             5) }
+    };
+    int container_fd = open(source, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    SidecarLog sidecar = {0};
+    int ok = container_fd >= 0 &&
+             sidecar_log_create_at(container_fd, &sidecar) ==
+                 SIDECAR_OPEN_FRESH;
+    for (size_t index = 0; ok && index < sizeof(entries) / sizeof(entries[0]);
+         index++)
+        ok = append_committed_sidecar_entry(&sidecar, &entries[index]) == 0;
+    if (container_fd >= 0)
+    {
+        if (sidecar_log_close(&sidecar) != SIDECAR_STATUS_OK)
+            ok = 0;
+        close(container_fd);
+    }
+    if (!ok)
+        return -1;
+
+    char proc_root[PATH_MAX];
+    join_path(proc_root, sizeof(proc_root), home, "fake-proc");
+    mkdir_p(proc_root);
+    write_fake_process(proc_root, "4242", "code", geteuid(), 1);
+    restore_test_set_proc_root(proc_root);
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    int rc = run_restore_capturing_with_input(source, input, output,
+                                              output_size);
+    dry_run = previous_dry_run;
+    restore_test_set_proc_root(NULL);
+
+    char settings[PATH_MAX], other[PATH_MAX];
+    join_path(settings, sizeof(settings), home, ".config/Code/settings.json");
+    join_path(other, sizeof(other), home, ".config/other.txt");
+    *settings_restored = file_content_is(settings, "{}");
+    *other_restored = file_content_is(other, "other");
+    remove_tree(source);
+    remove_tree(home);
+    return rc;
+}
+
+static void test_open_application_settings_are_deferred(void)
+{
+    printf(BLUE "::" NC " restore dispatch: an open application's settings are restored last\n");
+    char output[16384];
+    int settings = 0, other = 0;
+    int rc = run_deferred_settings_restore("y\ns\n", output, sizeof(output),
+                                           &settings, &other);
+    const char *prompt = strstr(output, "Continue?");
+    const char *question = strstr(output, "Visual Studio Code is still open. "
+                                          "Close it and press Enter");
+    check(rc == 0 && prompt != NULL && question != NULL && prompt < question &&
+              other && !settings &&
+              strstr(output, "Left out 1 settings file of applications that "
+                             "stayed open") != NULL,
+          "asked at the end, s leaves the open application's settings out "
+          "while everything else is restored");
+
+    rc = run_deferred_settings_restore("y\n", output, sizeof(output),
+                                       &settings, &other);
+    check(rc == 0 && other && settings &&
+              strstr(output, "No answer; restoring them now.") != NULL,
+          "with no one to answer, the settings are restored anyway, with a "
+          "note");
+
+    rc = run_deferred_settings_restore("y\n\nc\n", output, sizeof(output),
+                                       &settings, &other);
+    const char *first = strstr(output, "is still open.");
+    check(rc == 0 && settings && first != NULL &&
+              strstr(first + 1, "is still open.") != NULL,
+          "Enter checks again while the application is still open, and c "
+          "restores the settings anyway");
 }
 
 static void test_running_writer_detection(void)
@@ -3846,6 +3973,7 @@ int main(void)
     test_dispatch_requires_v1_manifest_for_final_container_name();
     test_dispatch_refuses_portable_v1();
     test_running_writer_detection();
+    test_open_application_settings_are_deferred();
     test_native_restore_applies_dconf();
     test_verification_failure_still_restores_packages();
     test_portable_replay_failure_names_entry();

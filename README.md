@@ -161,6 +161,15 @@ the same compiled selection. Explicit-path backups ignore this config, and
 restore follows the selection recorded in the backup manifest rather than the
 target machine's current config.
 
+Applications that rewrite their own settings while running or when they close
+(VS Code and the common browsers) are detected when a portable restore starts.
+Their settings are restored last, after everything else. If one is still open
+then, restore asks once: close it and press Enter, type `s` to leave its
+settings out (run the same restore again later to put them back), or `c` to
+restore them anyway. With nobody to answer, they are restored with a note. A
+native restore names such applications before its prompt but does not defer
+their files.
+
 Frequently rewritten desktop state (such as GNOME's file metadata) is restored
 only where nothing is there yet: a file a running service has already written
 on the new system is left as it is, and the summary counts it.
