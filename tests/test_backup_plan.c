@@ -1207,13 +1207,13 @@ static int run_backup_capturing_with_options(const char *target, BackupMode mode
         close(pipefd[0]);
         if (dup2(pipefd[1], STDOUT_FILENO) < 0 ||
             dup2(pipefd[1], STDERR_FILENO) < 0)
-            _exit(2);
+            _exit(125);
         close(pipefd[1]);
         int rc = backup(target, mode, (char **)paths, include_self,
                         include_network_config);
         fflush(stdout);
         fflush(stderr);
-        _exit(rc == 0 ? 0 : 1);
+        _exit(rc);
     }
 
     close(pipefd[1]);
@@ -1274,7 +1274,7 @@ static int run_scoped_backup_capturing_input(const char *target, BackupMode mode
         if (dup2(input_pipe[0], STDIN_FILENO) < 0 ||
             dup2(output_pipe[1], STDOUT_FILENO) < 0 ||
             dup2(output_pipe[1], STDERR_FILENO) < 0)
-            _exit(2);
+            _exit(125);
         close(input_pipe[0]);
         close(output_pipe[1]);
 
@@ -1285,7 +1285,7 @@ static int run_scoped_backup_capturing_input(const char *target, BackupMode mode
         selection_plan_free(&selection);
         fflush(stdout);
         fflush(stderr);
-        _exit(rc == 0 ? 0 : 1);
+        _exit(rc);
     }
 
     close(input_pipe[0]);
@@ -2109,7 +2109,7 @@ static void test_allocation_aware_estimate(void)
                                           sizeof(fit_output));
     backup_test_set_block_size_hook(NULL, NULL);
     backup_test_set_free_space_hook(NULL, NULL);
-    check(fit_result == 1 &&
+    check(fit_result == 2 &&
               strstr(fit_output, "Estimated backup size: 15B") != NULL &&
               strstr(fit_output, "Destination free space: 15B") != NULL &&
               strstr(fit_output, "need 5B more") != NULL,
@@ -2158,7 +2158,7 @@ static void test_destination_space_preflight(void)
     char shortfall_text[32];
     format_size(source_stat_ok ? source_st.st_size : 0,
                 shortfall_text, sizeof(shortfall_text));
-    check(live_rc == 1 && dry_rc == 1,
+    check(live_rc == 2 && dry_rc == 2,
           "insufficient space refuses both live and dry-run backups");
     check(strcmp(live_output, dry_output) == 0,
           "insufficient-space output is identical live and dry-run");
@@ -2185,7 +2185,7 @@ static void test_destination_space_preflight(void)
                                            BACKUP_EXPLICIT_PATHS, paths,
                                            rollback_output,
                                            sizeof(rollback_output));
-    check(rollback_rc == 1 && !dir_exists(created_target),
+    check(rollback_rc == 2 && !dir_exists(created_target),
           "a newly created destination is rolled back on space refusal");
 
     backup_test_set_block_size_hook(NULL, NULL);
@@ -2252,7 +2252,7 @@ static void test_include_self_backup(void)
     int missing_rc = run_backup_capturing_with_options(
         missing_target, BACKUP_EXPLICIT_PATHS, paths, 1, 0,
         missing_output, sizeof(missing_output));
-    check(missing_rc == 1 && !dir_exists(missing_target),
+    check(missing_rc == 2 && !dir_exists(missing_target),
           "an absent migr-static fails before creating a destination container");
     check(strstr(missing_output, "make migr-static") != NULL,
           "the missing-static refusal tells the user how to build it");
@@ -2700,7 +2700,7 @@ static void test_include_network_config_backup(void)
         int denied_rc = run_backup_capturing_with_options(
             denied_target, BACKUP_EXPLICIT_PATHS, paths, 0, 1,
             denied_output, sizeof(denied_output));
-        check(denied_rc == 1 && directory_empty(denied_target),
+        check(denied_rc == 2 && directory_empty(denied_target),
               "an unreadable backend still refuses when the other backends are absent");
         check(strstr(denied_output, "NetworkManager") != NULL &&
                   strstr(denied_output, "same migr command with sudo") != NULL,
@@ -2728,7 +2728,7 @@ static void test_include_network_config_backup(void)
     int operational_rc = run_backup_capturing_with_options(
         operational_target, BACKUP_EXPLICIT_PATHS, paths, 0, 1,
         operational_output, sizeof(operational_output));
-    check(operational_rc == 1 && directory_empty(operational_target),
+    check(operational_rc == 2 && directory_empty(operational_target),
           "a non-permission backend probe failure still refuses before capture");
     check(strstr(operational_output, "NetworkManager") != NULL &&
               strstr(operational_output, "cannot read") != NULL &&
@@ -2765,7 +2765,7 @@ static void test_include_network_config_backup(void)
             failing_target, BACKUP_EXPLICIT_PATHS, paths, 0, 1,
             failing_output, sizeof(failing_output));
 
-        check(failing_rc == 1 && directory_empty(failing_target),
+        check(failing_rc == 2 && directory_empty(failing_target),
               "an unreadable network configuration file refuses before container creation");
         check(strstr(failing_output, "unreadable.nmconnection") != NULL &&
                   strstr(failing_output, "same migr command with sudo") != NULL,
@@ -3096,7 +3096,7 @@ static void test_portable_prescan_failure_diagnostics(void)
                                   output, sizeof(output));
     backup_test_force_case_insensitive_destination(0);
     backup_test_force_portable_representation(0);
-    check(rc == 1 && directory_empty(target),
+    check(rc == 2 && directory_empty(target),
           "an unresolved portable pre-scan violation refuses before container creation");
     check(strstr(output, "unresolved issue") != NULL &&
               strstr(output, "blocked-fifo") != NULL &&
@@ -3114,7 +3114,7 @@ static void test_portable_prescan_failure_diagnostics(void)
     backup_test_force_case_insensitive_destination(0);
     backup_test_force_portable_representation(0);
     dry_run = 0;
-    check(rc == 1 && directory_empty(target),
+    check(rc == 2 && directory_empty(target),
           "a dry-run portable pre-scan violation refuses without creating a container");
     check(strstr(output, "nothing would be created") != NULL &&
               strstr(output, "blocked-fifo") != NULL &&
@@ -3145,7 +3145,7 @@ static void test_portable_prescan_failure_diagnostics(void)
         rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
                                   output, sizeof(output));
         backup_test_force_portable_representation(0);
-        check(rc == 1 && directory_empty(target),
+        check(rc == 2 && directory_empty(target),
               "an operational portable pre-scan failure refuses before container creation");
         check(strstr(output, "could not scan blocked-directory") != NULL &&
                   (strstr(output, "Permission denied") != NULL ||
@@ -3239,7 +3239,7 @@ static void test_portable_sidecar_readback(void)
     backup_test_set_sidecar_readback_hook(NULL, NULL);
     backup_test_force_portable_representation(0);
     count_containers(target, &published, &partial);
-    check(rc == 1 && published == 0 && partial == 1,
+    check(rc == 2 && published == 0 && partial == 1,
           "a journal damaged on the drive keeps the backup unpublished");
     check(strstr(output, "sidecar.migr") != NULL &&
               strstr(output, "is damaged at byte") != NULL &&

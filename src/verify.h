@@ -21,7 +21,9 @@ int portable_container_open(const char *path, Manifest *manifest,
  * when it was captured (docs/DECISIONS.md D59). Reads only; nothing in the
  * backup is changed.
  *
- * @return 0 when everything matches, 1 on a mismatch or any error.
+ * @return MIGR_EXIT_OK when everything matches, MIGR_EXIT_CHANGED on a
+ *         mismatch, and MIGR_EXIT_FAILURE when the backup cannot be checked
+ *         (D68).
  */
 int verify_backup(const char *path);
 

@@ -44,7 +44,9 @@ struct SelectionPlan;
  *                     binary into the container root (docs/DECISIONS.md D9).
  * @param include_network_config Non-zero to capture supported system network
  *                               configuration under container-root network/.
- * @return 0 on success, 1 on error.
+ * @return MIGR_EXIT_OK on success or cancellation, MIGR_EXIT_CHANGED when
+ *         it completed but files changed while being read (D63), and
+ *         MIGR_EXIT_FAILURE on error (D68).
  */
 int backup(const char *target, BackupMode mode, char **paths, int include_self,
            int include_network_config);

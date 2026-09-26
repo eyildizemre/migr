@@ -12,6 +12,17 @@ extern int dry_run; /**< Non-zero when -n/--dry-run is passed; suppresses all wr
 extern int color_enabled; /**< Non-zero when status colors are enabled for stderr. */
 
 /**
+ * Exit statuses of every command, as in GNU tar (docs/DECISIONS.md D68).
+ * backup(), backup_selection(), restore_with_options() and verify_backup()
+ * return these directly.
+ */
+enum {
+    MIGR_EXIT_OK = 0,      /**< Completed as asked. */
+    MIGR_EXIT_CHANGED = 1, /**< Completed, but something changed or differs; the run says what. */
+    MIGR_EXIT_FAILURE = 2  /**< Failed, refused, or was used wrongly. */
+};
+
+/**
  * @brief Resolves the HOME of the user whose data this invocation targets.
  *
  * Ordinary runs use HOME. When the process runs as root and SUDO_UID is

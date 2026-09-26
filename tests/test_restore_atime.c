@@ -135,7 +135,7 @@ static int run_restore_with_confirmation(const char *source)
         verbose = 0;
         int rc = restore(source);
         fflush(stdout);
-        _exit(rc == 0 ? 0 : 1);
+        _exit(rc);
     }
 
     close(input[0]);

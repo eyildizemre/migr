@@ -4270,7 +4270,9 @@ tree, in path order, following each ancestor's recorded physical leaf: a
 directory must be a directory, a symlink or hardlink placeholder an empty
 regular file, and a regular file must have its recorded size and D59 content
 digest. Every mismatch is counted; the first eight are listed with their
-reason. It writes nothing. Exit status is 0 only when everything matches.
+reason. It writes nothing. Exit status is 0 only when everything matches
+(D68 splits the rest into 1 for differences and 2 for a backup it cannot
+check).
 Native containers and other journal versions are refused with the reason.
 
 **Why:** Before wiping the source machine, the only way to know a backup would
@@ -4546,3 +4548,30 @@ wrote them. D53 reported those as "content differs from the backup", the same
 words as real corruption, so a routine later write read like damage.
 
 **Relationship:** Refines D53. Part of the live-environment design.
+
+## D68 — 2026-09-27 — Exit status 1 means "completed with changes", 2 means failure
+
+**Status:** Implemented
+
+**Decision:** Every command exits with one of three statuses, as GNU tar
+does:
+- 0: completed as asked, or cancelled at the confirmation.
+- 1: completed, but something changed or differs, and the run lists it:
+  - a backup whose source changed while being read (D63),
+  - a restore whose items another program changed afterwards (D67),
+  - `verify` finding items that differ from their capture (D59), as cmp and
+    diff exit 1 on a difference.
+- 2: failed or refused, including a wrong command line, a failed optional
+  restore step (packages, network), and a restore verification failure.
+
+`backup()`, `backup_selection()`, `restore_with_options()`, and
+`verify_backup()` return these statuses (`MIGR_EXIT_OK`,
+`MIGR_EXIT_CHANGED`, `MIGR_EXIT_FAILURE` in `utils.h`); `main` maps the
+other commands' success and failure to 0 and 2.
+
+**Why:** D63 and D67 made 1 mean "completed, but look at the list", while
+failures also exited 1, so a script could not tell a finished backup from a
+failed one. tar, which D63 already followed for status 1, uses 2 for
+failure.
+
+**Relationship:** Refines D59, D63, and D67.

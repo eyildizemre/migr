@@ -357,7 +357,7 @@ static int run_restore_capturing_with_identity(const char *source,
         if (dup2(output_pipe[1], STDOUT_FILENO) < 0 ||
             dup2(output_pipe[1], STDERR_FILENO) < 0 ||
             dup2(input_pipe[0], STDIN_FILENO) < 0)
-            _exit(2);
+            _exit(125);
         close(output_pipe[1]);
         close(input_pipe[0]);
         if (drop_privileges &&
@@ -366,7 +366,7 @@ static int run_restore_capturing_with_identity(const char *source,
         int rc = restore(source);
         fflush(stdout);
         fflush(stderr);
-        _exit(rc == 0 ? 0 : 1);
+        _exit(rc);
     }
 
     close(output_pipe[1]);
@@ -885,7 +885,7 @@ static void test_dispatch_refuses_unknown_version(void)
 
     char output[8192];
     int rc = run_restore_capturing(source, output, sizeof(output));
-    check(rc != 0, "restore refuses an unrecognized manifest version");
+    check(rc == 2, "restore refuses an unrecognized manifest version");
     check(strstr(output, "Main Directories") == NULL, "the legacy path is never attempted");
     check(strstr(output, "Roots") == NULL, "the v1 path is never attempted");
 
@@ -906,7 +906,7 @@ static void test_dispatch_refuses_malformed_v1(void)
 
     char output[8192];
     int rc = run_restore_capturing(source, output, sizeof(output));
-    check(rc != 0, "restore refuses a malformed v1 manifest");
+    check(rc == 2, "restore refuses a malformed v1 manifest");
     check(strstr(output, "Main Directories") == NULL, "the legacy path is never attempted");
     check(strstr(output, "Roots") == NULL, "the v1 path is never attempted");
 
@@ -930,7 +930,7 @@ static void test_dispatch_refuses_partial_source(void)
 
     char output[8192];
     int rc = run_restore_capturing(source, output, sizeof(output));
-    check(rc != 0, "restore refuses a .partial-named source directory");
+    check(rc == 2, "restore refuses a .partial-named source directory");
     check(strstr(output, "in-progress or abandoned") != NULL,
           "the refusal names the reason: an in-progress/abandoned container");
 
@@ -2183,11 +2183,11 @@ static void test_verification_failure_still_restores_packages(void)
     packages_test_clear_restore_hooks();
     dry_run = previous_dry_run;
 
-    check(rc != 0 &&
+    check(rc == 2 &&
               strstr(output, "ROOT:file (regular file, content differs from "
                              "the backup)") != NULL &&
               strstr(output, "1 differs from the backup (listed above)") != NULL,
-          "the mismatch is listed and the restore ends with an error");
+          "the mismatch is listed and the restore fails with status 2");
     struct stat marker;
     check(stat(probe.marker_path, &marker) == 0,
           "packages are still restored once every file was applied");

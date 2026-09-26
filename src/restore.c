@@ -2838,13 +2838,13 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         options != NULL && options->skip_content_verification;
     char home[PATH_MAX];
     if (resolve_target_home(home) != 0)
-        return 1;
+        return MIGR_EXIT_FAILURE;
 
     struct stat st;
     if (stat(source, &st) != 0 || !S_ISDIR(st.st_mode))
     {
         print_error("Error: Source directory not found: %s\n", source);
-        return 1;
+        return MIGR_EXIT_FAILURE;
     }
 
     // A live or abandoned ".partial" container (docs/DECISIONS.md D15) is
@@ -2855,7 +2855,7 @@ int restore_with_options(const char *source, const RestoreOptions *options)
     if ((size_t)snprintf(source_copy, sizeof(source_copy), "%s", source) >= sizeof(source_copy))
     {
         print_error("Error: Source path too long: %s\n", source);
-        return 1;
+        return MIGR_EXIT_FAILURE;
     }
     size_t source_len = strlen(source_copy);
     while (source_len > 1 && source_copy[source_len - 1] == '/')
@@ -2865,7 +2865,7 @@ int restore_with_options(const char *source, const RestoreOptions *options)
     if (container_name_is_partial(source_leaf))
     {
         print_error("Error: %s is an in-progress or abandoned backup container, not a finished one.\n", source);
-        return 1;
+        return MIGR_EXIT_FAILURE;
     }
     int source_is_versioned_final = container_name_is_final(source_leaf);
 
@@ -2873,7 +2873,7 @@ int restore_with_options(const char *source, const RestoreOptions *options)
     if (source_root_fd < 0)
     {
         print_error("Error: Could not open source directory: %s\n", source);
-        return 1;
+        return MIGR_EXIT_FAILURE;
     }
 
     // Classified before any confirmation or filesystem mutation: an unknown
@@ -2885,19 +2885,19 @@ int restore_with_options(const char *source, const RestoreOptions *options)
     {
         print_error("Error: manifest.txt records a format version this build does not understand; refusing to guess.\n");
         close(source_root_fd);
-        return 1;
+        return MIGR_EXIT_FAILURE;
     }
     if (mst == MANIFEST_STATUS_MALFORMED)
     {
         print_error("Error: manifest.txt is malformed; refusing to restore.\n");
         close(source_root_fd);
-        return 1;
+        return MIGR_EXIT_FAILURE;
     }
     if (mst == MANIFEST_STATUS_IO_ERROR)
     {
         print_error("Error: Could not read manifest.txt.\n");
         close(source_root_fd);
-        return 1;
+        return MIGR_EXIT_FAILURE;
     }
     // mst is now MISSING, LEGACY, or VALID.
 
@@ -2905,13 +2905,13 @@ int restore_with_options(const char *source, const RestoreOptions *options)
     {
         print_error("Error: A finalized versioned container is missing manifest.txt; refusing to treat it as a legacy backup.\n");
         close(source_root_fd);
-        return 1;
+        return MIGR_EXIT_FAILURE;
     }
     if (source_is_versioned_final && mst == MANIFEST_STATUS_LEGACY)
     {
         print_error("Error: A finalized versioned container carries a legacy manifest; refusing to guess its layout.\n");
         close(source_root_fd);
-        return 1;
+        return MIGR_EXIT_FAILURE;
     }
     int home_fd = open(home, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (home_fd < 0)
@@ -2923,7 +2923,7 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         if (mst == MANIFEST_STATUS_VALID)
             manifest_free(&m);
         close(source_root_fd);
-        return 1;
+        return MIGR_EXIT_FAILURE;
     }
 
     if (mst == MANIFEST_STATUS_VALID &&
@@ -2946,7 +2946,7 @@ int restore_with_options(const char *source, const RestoreOptions *options)
             manifest_free(&m);
             close(home_fd);
             close(source_root_fd);
-            return 1;
+            return MIGR_EXIT_FAILURE;
         }
 
         int dconf_database_fd = -1;
@@ -3119,12 +3119,14 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         manifest_free(&m);
         close(home_fd);
         close(source_root_fd);
+        if (outcome == PORTABLE_RESTORE_ERROR ||
+            outcome == PORTABLE_RESTORE_VERIFICATION_FAILED ||
+            had_portable_error)
+            return MIGR_EXIT_FAILURE;
         // Items another program changed after restore are not failures, but
-        // like a backup whose source changed, the run ends with 1 (D67).
-        return (outcome == PORTABLE_RESTORE_ERROR ||
-                outcome == PORTABLE_RESTORE_VERIFICATION_FAILED ||
-                had_portable_error ||
-                report.verification_changed_count != 0) ? 1 : 0;
+        // like a backup whose source changed, the run says so (D67).
+        return report.verification_changed_count != 0 ? MIGR_EXIT_CHANGED
+                                                      : MIGR_EXIT_OK;
     }
 
     if (mst == MANIFEST_STATUS_VALID &&
@@ -3133,7 +3135,7 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         manifest_free(&m);
         close(home_fd);
         close(source_root_fd);
-        return 1;
+        return MIGR_EXIT_FAILURE;
     }
 
     RestoreTargetMap target_map = {0};
@@ -3145,7 +3147,7 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         manifest_free(&m);
         close(home_fd);
         close(source_root_fd);
-        return 1;
+        return MIGR_EXIT_FAILURE;
     }
 
     CloneContext ctx = {
@@ -3163,7 +3165,7 @@ int restore_with_options(const char *source, const RestoreOptions *options)
     restore_timestamp_anchors_init(&timestamp_anchors);
     RestoreProgressDisplay progress_display = {0};
     int progress_installed = 0;
-    int result = 1;
+    int result = MIGR_EXIT_FAILURE;
 
     RestoreNativeStatus metadata_inventory_status;
     if (mst == MANIFEST_STATUS_VALID)
@@ -3221,7 +3223,7 @@ int restore_with_options(const char *source, const RestoreOptions *options)
                 metadata_profiles.security_xattr_entry_count))
         {
             printf("Cancelled.\n");
-            result = 0;
+            result = MIGR_EXIT_OK;
             goto cleanup;
         }
     }
@@ -3345,7 +3347,7 @@ int restore_with_options(const char *source, const RestoreOptions *options)
     if (skipped_security_xattrs != 0)
         printf("Skipped %zu security.* attribute(s) that the destination "
                "could not apply.\n", skipped_security_xattrs);
-    result = had_error ? 1 : 0;
+    result = had_error ? MIGR_EXIT_FAILURE : MIGR_EXIT_OK;
 
 cleanup:
     if (progress_installed)
@@ -3355,7 +3357,7 @@ cleanup:
     metadata_profiles_free(&metadata_profiles);
     restore_timestamp_anchors_free(&timestamp_anchors);
     if (restore_target_map_free(&target_map) != 0)
-        result = 1;
+        result = MIGR_EXIT_FAILURE;
     manifest_free(&m);
     close(home_fd);
     close(source_root_fd);

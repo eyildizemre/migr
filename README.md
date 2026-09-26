@@ -65,7 +65,7 @@ A backup does not stop when files change under it. A file written while it is
 read is read again; one still being written after three reads is kept as last
 read. Items removed before they could be read, or created after their folder
 was scanned, are left out. The backup still completes, lists what changed, and
-exits with status 1 instead of 0. Frequently rewritten desktop state (such as
+exits with status 1 instead of 0 (2 means it failed). Frequently rewritten desktop state (such as
 GNOME's file metadata) is only counted, not listed.
 
 On btrfs (Fedora's default), a backup reads its sources from a read-only
@@ -201,7 +201,7 @@ file is still the one restore wrote (its inode, size, and modification time
 unchanged), is a failure: the restore ends with errors, though package and
 network restoration still run. A file that another program rewrote, replaced,
 or removed after restore is listed separately as changed afterwards, is not a
-failure, and makes the restore exit 1. `--no-verify` skips only
+failure, and makes the restore exit 1 instead of 0; a failure exits 2. `--no-verify` skips only
 this post-copy read-back pass; portable restore preflight remains mandatory,
 and dry runs perform no post-copy verification because they write no files.
 
@@ -259,6 +259,16 @@ sudo ./migr backup /mnt/drive ~/Documents ~/Projects
 sudo ./migr backup /mnt/drive --include-self
 sudo ./migr backup /mnt/drive --include-network-config
 ```
+
+## Exit Status
+
+As with GNU tar:
+
+| Status | Meaning |
+|--------|---------|
+| 0 | Completed as asked (or cancelled at the confirmation). |
+| 1 | Completed, but something changed or differs, and the run lists it: files that changed while a backup read them, restored items another program changed afterwards, or items `verify` found different from their capture. |
+| 2 | Failed or refused, including a wrong command line. |
 
 ## Key Features
 

@@ -256,7 +256,7 @@ static void test_refusals(void)
     join(path, sizeof(path), fixture.container, SIDECAR_SLOT_NAME);
     append_text(path, "ENTRY");
     int rc = run_verify(fixture.container, output, sizeof(output));
-    check(rc == 1 && strstr(output, "Backup verified") == NULL &&
+    check(rc == 2 && strstr(output, "Backup verified") == NULL &&
               strstr(output, SIDECAR_SLOT_NAME) != NULL,
           "an incomplete journal is refused and named");
     remove_tree(fixture.base);
@@ -282,7 +282,7 @@ static void test_refusals(void)
         fatal("could not write the native manifest");
     close(native_fd);
     rc = run_verify(native, output, sizeof(output));
-    check(rc == 1 && strstr(output, "is a native backup") != NULL,
+    check(rc == 2 && strstr(output, "is a native backup") != NULL,
           "a native backup is refused: it records no content digests");
     remove_tree(native);
 }

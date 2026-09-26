@@ -182,7 +182,7 @@ static int run_backup_as(const char *target, const char *home,
         close(output_pipe[0]);
         if (dup2(output_pipe[1], STDOUT_FILENO) < 0 ||
             dup2(output_pipe[1], STDERR_FILENO) < 0)
-            _exit(2);
+            _exit(125);
         close(output_pipe[1]);
         if (!drop_identity(uid, gid) || setenv("HOME", home, 1) != 0 ||
             (require_no_cap_chown && has_effective_cap_chown()))
@@ -192,7 +192,7 @@ static int run_backup_as(const char *target, const char *home,
         int result = backup(target, BACKUP_EXPLICIT_PATHS, paths, 0, 0);
         fflush(stdout);
         fflush(stderr);
-        _exit(result == 0 ? 0 : 1);
+        _exit(result);
     }
 
     close(output_pipe[1]);
@@ -259,7 +259,7 @@ static int run_backup_race(const char *target, const char *home,
         close(output_pipe[0]);
         if (dup2(output_pipe[1], STDOUT_FILENO) < 0 ||
             dup2(output_pipe[1], STDERR_FILENO) < 0)
-            _exit(2);
+            _exit(125);
         close(output_pipe[1]);
         if (!drop_identity(uid, gid) || setenv("HOME", home, 1) != 0)
             _exit(CHILD_SKIP);
@@ -268,7 +268,7 @@ static int run_backup_race(const char *target, const char *home,
         int result = backup(target, BACKUP_EXPLICIT_PATHS, paths, 0, 0);
         fflush(stdout);
         fflush(stderr);
-        _exit(result == 0 ? 0 : 1);
+        _exit(result);
     }
 
     close(ready[1]);
@@ -377,7 +377,7 @@ static void test_inventory_race(uid_t uid, gid_t gid)
     char output[32768];
     int result = run_backup_race(target, home, source, file, uid, gid,
                                  output, sizeof(output), &after);
-    check_result(result == 1, "ownership change after lstat rejects the backup");
+    check_result(result == 2, "ownership change after lstat rejects the backup");
     check_result(contains(output, "could not safely read 1 source object(s)"),
                  "the race is reported as a source-safe-read refusal");
     check_result(contains(output, "no container was created"),
@@ -414,7 +414,7 @@ static void test_bounded_examples(uid_t uid, gid_t gid)
     char output[65536];
     int result = run_backup_as(target, home, source, uid, gid, 0,
                                output, sizeof(output));
-    check_result(result == 1, "foreign regular files reject the backup");
+    check_result(result == 2, "foreign regular files reject the backup");
     check_result(contains(output, "could not safely read 20 source object(s)"),
                  "the refusal count includes every foreign file");
     check_result(count_occurrences(output, "source-read example:") == 16,
@@ -445,7 +445,7 @@ static void test_uninspected_subtree(uid_t uid, gid_t gid)
     char output[32768];
     int result = run_backup_as(target, home, source, uid, gid, 0,
                                output, sizeof(output));
-    check_result(result == 1, "a foreign directory rejects the backup");
+    check_result(result == 2, "a foreign directory rejects the backup");
     check_result(contains(output, "could not safely read 1 source object(s)"),
                  "the foreign directory is a source-read blocker");
     check_result(contains(output, "1 source subtree(s) could not be inspected"),
@@ -482,7 +482,7 @@ static void test_ownership_probe_rejection(uid_t uid, gid_t gid)
         remove_tree(base);
         return;
     }
-    check_result(result == 1, "foreign group ownership rejects the backup");
+    check_result(result == 2, "foreign group ownership rejects the backup");
     check_result(contains(output, "native metadata preflight failed"),
                  "ownership failure is distinct from source-safe-read refusal");
     check_result(directory_entry_count(target) == 0,
@@ -621,7 +621,7 @@ static int run_backup_capture_race(const char *target, const char *home,
         close(output_pipe[0]);
         if (dup2(output_pipe[1], STDOUT_FILENO) < 0 ||
             dup2(output_pipe[1], STDERR_FILENO) < 0)
-            _exit(2);
+            _exit(125);
         close(output_pipe[1]);
         if (!drop_identity(uid, gid) || setenv("HOME", home, 1) != 0)
         {
@@ -634,7 +634,7 @@ static int run_backup_capture_race(const char *target, const char *home,
         int result = backup(target, BACKUP_EXPLICIT_PATHS, paths, 0, 0);
         fflush(stdout);
         fflush(stderr);
-        _exit(result == 0 ? 0 : 1);
+        _exit(result);
     }
 
     close(ready[1]);
@@ -754,7 +754,7 @@ static void test_capture_race(uid_t uid, gid_t gid)
         remove_tree(base);
         return;
     }
-    check_result(result == 1, "capture-time ownership change rejects the backup");
+    check_result(result == 2, "capture-time ownership change rejects the backup");
     check_result(contains(output, "Could not safely read source for"),
                  "capture reports a distinct source-safe-read refusal");
     check_result(contains(output, file),

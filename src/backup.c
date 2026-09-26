@@ -2405,7 +2405,7 @@ static int backup_dry_run(const char *target, BackupMode mode,
     if (backup_shell_history_selection(selection, &shell_history) != 0)
     {
         backup_plan_free(plan);
-        return 1;
+        return MIGR_EXIT_FAILURE;
     }
 
     // The destination is inspected exactly as a live run would inspect
@@ -2416,7 +2416,7 @@ static int backup_dry_run(const char *target, BackupMode mode,
     if (ensure_target_root(target, &target_created) != 0)
     {
         backup_plan_free(plan);
-        return 1;
+        return MIGR_EXIT_FAILURE;
     }
 
     CloneRepresentation advisory_repr = CLONE_NATIVE_TREE;
@@ -2452,7 +2452,7 @@ static int backup_dry_run(const char *target, BackupMode mode,
                 rmdir(target);
             metadata_profiles_free(&advisory_profiles);
             backup_plan_free(plan);
-            return 1;
+            return MIGR_EXIT_FAILURE;
         }
 
         advisory_probe_failed = backup_representation_preflight(
@@ -2464,7 +2464,7 @@ static int backup_dry_run(const char *target, BackupMode mode,
         if (target_created)
             rmdir(target);
         backup_plan_free(plan);
-        return 1;
+        return MIGR_EXIT_FAILURE;
     }
 
     if (advisory_fd >= 0)
@@ -2480,7 +2480,7 @@ static int backup_dry_run(const char *target, BackupMode mode,
             close(advisory_fd);
             metadata_profiles_free(&advisory_profiles);
             backup_plan_free(plan);
-            return 1;
+            return MIGR_EXIT_FAILURE;
         }
         if (advisory_failed)
             print_warning("Warning: could not complete the read-only metadata preview; "
@@ -2513,7 +2513,7 @@ static int backup_dry_run(const char *target, BackupMode mode,
             close(advisory_fd);
             metadata_profiles_free(&advisory_profiles);
             backup_plan_free(plan);
-            return 1;
+            return MIGR_EXIT_FAILURE;
         }
         char advisory_machine_id[MANIFEST_MACHINE_ID_MAX];
         int advisory_has_machine_id = read_machine_id(
@@ -2550,7 +2550,7 @@ static int backup_dry_run(const char *target, BackupMode mode,
             close(advisory_fd);
             metadata_profiles_free(&advisory_profiles);
             backup_plan_free(plan);
-            return 1;
+            return MIGR_EXIT_FAILURE;
         }
         advisory_prescan = advisory_prepared.report;
         memset(&advisory_prepared.report, 0,
@@ -2739,7 +2739,7 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
     if (destination_conflicts)
     {
         backup_plan_free(&plan);
-        return 1;
+        return MIGR_EXIT_FAILURE;
     }
 
     int self_fd = -1;
@@ -2748,7 +2748,7 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
         probe_self_binary(&self_fd, self_arch, sizeof(self_arch)) != 0)
     {
         backup_plan_free(&plan);
-        return 1;
+        return MIGR_EXIT_FAILURE;
     }
     unsigned int network_config_present_mask = 0;
     if (include_network_config &&
@@ -2757,7 +2757,7 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
         if (self_fd >= 0)
             close(self_fd);
         backup_plan_free(&plan);
-        return 1;
+        return MIGR_EXIT_FAILURE;
     }
 
     off_t estimated_size = 0;
@@ -2785,7 +2785,7 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
         if (self_fd >= 0)
             close(self_fd);
         backup_plan_free(&plan);
-        return 1;
+        return MIGR_EXIT_FAILURE;
     }
     if (selection != NULL)
         manifest_set_source_identity(&manifest);
@@ -2808,7 +2808,7 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
     source_read_refusals_init(&source_read_refusals);
     SourceSnapshot source_snapshot;
     source_snapshot_init(&source_snapshot);
-    int finish_result = 1;
+    int finish_result = MIGR_EXIT_FAILURE;
 
     if (ensure_target_root(target, &target_created) != 0)
         goto fail_pre_container;
@@ -3283,7 +3283,7 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
         else
             printf("Unusable container left behind; it cannot be resumed, remove it: %s/%s\n",
                    target, container_current_name(&container));
-        finish_result = 1;
+        finish_result = MIGR_EXIT_FAILURE;
         goto finish;
     }
 
@@ -3310,7 +3310,7 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
                    "resumed. Remove %s/%s and back up again, preferably to a "
                    "different drive.\n",
                    target, container_current_name(&container));
-            finish_result = 1;
+            finish_result = MIGR_EXIT_FAILURE;
             goto finish;
         }
     }
@@ -3326,7 +3326,7 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
 
         printf("Incomplete backup kept for resume: %s/%s\n",
                target, container_current_name(&container));
-        finish_result = 1;
+        finish_result = MIGR_EXIT_FAILURE;
         goto finish;
     }
 
@@ -3348,7 +3348,8 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
                                         container_current_name(&container));
     // A source that changed under the backup does not fail it, but the run
     // ends with the list and a warning status (D63).
-    finish_result = print_source_changes(&capture_report) ? 1 : 0;
+    finish_result = print_source_changes(&capture_report) ? MIGR_EXIT_CHANGED
+                                                          : MIGR_EXIT_OK;
 
 finish:
     source_snapshot_end(&source_snapshot);
@@ -3363,7 +3364,7 @@ finish:
     return finish_result;
 
 cancel_pre_container:
-    finish_result = 0;
+    finish_result = MIGR_EXIT_OK;
 fail_pre_container:
     source_snapshot_end(&source_snapshot);
     if (self_fd >= 0)
@@ -3386,11 +3387,11 @@ int backup(const char *target, BackupMode mode, char **paths, int include_self,
 {
     char home[PATH_MAX];
     if (resolve_target_home(home) != 0)
-        return 1;
+        return MIGR_EXIT_FAILURE;
 
     BackupPlan plan;
     if (backup_plan_build(home, mode, (const char *const *)paths, &plan) != 0)
-        return 1;
+        return MIGR_EXIT_FAILURE;
     return backup_run(target, mode, plan, NULL, include_self,
                       include_network_config);
 }
@@ -3405,12 +3406,12 @@ int backup_selection(const char *target, BackupMode mode,
         selection->scope != expected)
     {
         print_error("Error: invalid scoped backup selection\n");
-        return 1;
+        return MIGR_EXIT_FAILURE;
     }
 
     BackupPlan plan;
     if (backup_plan_from_selection(selection, &plan) != 0)
-        return 1;
+        return MIGR_EXIT_FAILURE;
     return backup_run(target, mode, plan, selection, include_self,
                       include_network_config);
 }

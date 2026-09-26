@@ -168,10 +168,10 @@ assert_exits_nonzero() {
     fi
 }
 
-# Stronger form: the command must exit non-zero AND print an expected message.
-# This distinguishes a clean, intentional refusal from a crash that also happens
-# to exit non-zero (e.g. a segfault on a NULL path), which a bare exit-code check
-# would wave through.
+# Stronger form: the command must exit 2, migr's failure status (D68), AND
+# print an expected message. This distinguishes a clean, intentional refusal
+# from a crash that also happens to exit non-zero (e.g. a segfault on a NULL
+# path), which a bare exit-code check would wave through.
 assert_fails_with() {
     local expected="$1"; shift
     local out rc
@@ -179,12 +179,12 @@ assert_fails_with() {
     out=$("$@" 2>&1)
     rc=$?
     set -e
-    if [ "$rc" -ne 0 ] && [[ "$out" == *"$expected"* ]]; then
+    if [ "$rc" -eq 2 ] && [[ "$out" == *"$expected"* ]]; then
         # Deliberately omit "$*" here: these commands carry a multi-KB HOME that
         # would flood the log. The expected message identifies the case.
         echo -e "  ${GREEN}✓${NC} Refused with '$expected'"
     else
-        echo -e "  ${RED}✗${NC} Expected non-zero exit and '$expected' from: $*"
+        echo -e "  ${RED}✗${NC} Expected exit 2 and '$expected' from: $*"
         echo "  exit=$rc  output: $out"
         exit 1
     fi

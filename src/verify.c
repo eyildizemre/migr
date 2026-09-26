@@ -466,7 +466,7 @@ int verify_backup(const char *path)
     int container_fd = -1;
     if (path == NULL || portable_container_open(path, &manifest,
                                                 &container_fd) != 0)
-        return 1;
+        return MIGR_EXIT_FAILURE;
 
     VerifyRun run;
     memset(&run, 0, sizeof(run));
@@ -475,7 +475,7 @@ int verify_backup(const char *path)
     run.data_fd = -1;
     SidecarLog sidecar = {0};
     int sidecar_open = 0;
-    int result = 1;
+    int result = MIGR_EXIT_FAILURE;
 
     uint64_t valid_bytes = 0, file_bytes = 0;
     SidecarStatus complete = sidecar_check_complete_readonly(
@@ -554,9 +554,12 @@ int verify_backup(const char *path)
     {
         print_success("Backup verified: all %zu item%s match what was "
                       "captured\n", run.count, run.count == 1 ? "" : "s");
-        result = 0;
+        result = MIGR_EXIT_OK;
         goto done;
     }
+    // Differences are what verify is for, not a failure to run it; they
+    // exit 1, as cmp and diff do (D68).
+    result = MIGR_EXIT_CHANGED;
     printf("Verification found %zu item%s that differ%s from what was "
            "captured:\n", run.failed, run.failed == 1 ? "" : "s",
            run.failed == 1 ? "s" : "");

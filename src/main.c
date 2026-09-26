@@ -77,10 +77,10 @@ static int run_scoped_report(BackupMode mode, int summary, ReportDepth depth)
 {
     SelectionPlan selection = {0};
     if (load_selection(mode, &selection, verbose && !summary) != 0)
-        return 1;
+        return MIGR_EXIT_FAILURE;
     int result = report_selection(&selection, summary, depth);
     selection_plan_free(&selection);
-    return result;
+    return result == 0 ? MIGR_EXIT_OK : MIGR_EXIT_FAILURE;
 }
 
 // backup and restore run as root (docs/DECISIONS.md D62): one password up
@@ -159,7 +159,7 @@ int main(int argc, char *argv[])
         if (action == ACTION_NONE)
         {
             print_error("Unknown command: %s\n", argv[1]);
-            return 1;
+            return MIGR_EXIT_FAILURE;
         }
         optind = 2; // Start parsing after the first argument (the action)
     }
@@ -204,7 +204,7 @@ int main(int argc, char *argv[])
             if (mode_flag_given)
             {
                 print_error("Error: --critical and --comprehensive are mutually exclusive.\n");
-                return 1;
+                return MIGR_EXIT_FAILURE;
             }
             mode = (opt == 'C') ? BACKUP_COMPREHENSIVE : BACKUP_CRITICAL;
             mode_flag_given = 1;
@@ -218,7 +218,7 @@ int main(int argc, char *argv[])
             if (parse_report_depth(optarg, &depth) != 0)
             {
                 print_error("Error: --max-depth must be a non-negative integer.\n");
-                return 1;
+                return MIGR_EXIT_FAILURE;
             }
             max_depth_given = 1;
             verbose = 1;
@@ -238,7 +238,7 @@ int main(int argc, char *argv[])
         case '?':
         default:
             print_error("For help: ./migr --help\n");
-            return 1;
+            return MIGR_EXIT_FAILURE;
         }
     }
 
@@ -250,7 +250,7 @@ int main(int argc, char *argv[])
     if (action == ACTION_HELP)
     {
         print_help();
-        return 0;
+        return MIGR_EXIT_OK;
     }
 
     if (optind < argc)
@@ -268,7 +268,7 @@ int main(int argc, char *argv[])
             if (mode_flag_given)
             {
                 print_error("Error: cannot combine --critical/--comprehensive with explicit paths.\n");
-                return 1;
+                return MIGR_EXIT_FAILURE;
             }
             mode = BACKUP_EXPLICIT_PATHS;
         }
@@ -277,12 +277,12 @@ int main(int argc, char *argv[])
     if (action == ACTION_CONF && path != NULL)
     {
         print_error("Error: 'conf' takes no arguments.\n");
-        return 1;
+        return MIGR_EXIT_FAILURE;
     }
     if (action == ACTION_CONF && non_help_option_given)
     {
         print_error("Error: 'conf' does not accept backup/report options.\n");
-        return 1;
+        return MIGR_EXIT_FAILURE;
     }
 
     // Cross-cutting checks: reject inputs the chosen command has no use for.
@@ -291,48 +291,48 @@ int main(int argc, char *argv[])
         action != ACTION_REPORT && action != ACTION_NONE)
     {
         print_error("Error: --critical/--comprehensive apply only to 'backup' or 'report'.\n");
-        return 1;
+        return MIGR_EXIT_FAILURE;
     }
     if (summary_flag && action != ACTION_REPORT && action != ACTION_NONE)
     {
         print_error("Error: --summary applies only to 'report'.\n");
-        return 1;
+        return MIGR_EXIT_FAILURE;
     }
     if (max_depth_given && action != ACTION_REPORT && action != ACTION_NONE)
     {
         print_error("Error: --max-depth applies only to 'report'.\n");
-        return 1;
+        return MIGR_EXIT_FAILURE;
     }
     if (dry_run && action != ACTION_BACKUP && action != ACTION_RESTORE)
     {
         print_error("Error: --dry-run applies only to 'backup' or 'restore'.\n");
-        return 1;
+        return MIGR_EXIT_FAILURE;
     }
     if (include_self && action != ACTION_BACKUP)
     {
         print_error("Error: --include-self applies only to 'backup'.\n");
-        return 1;
+        return MIGR_EXIT_FAILURE;
     }
     if (include_network_config && action != ACTION_BACKUP)
     {
         print_error("Error: --include-network-config applies only to 'backup'.\n");
-        return 1;
+        return MIGR_EXIT_FAILURE;
     }
     if (no_verify && action != ACTION_RESTORE)
     {
         print_error("Error: --no-verify applies only to 'restore'.\n");
-        return 1;
+        return MIGR_EXIT_FAILURE;
     }
     if (path != NULL && (action == ACTION_REPORT || action == ACTION_NONE))
     {
         print_error("Error: 'report' takes no arguments.\n");
-        return 1;
+        return MIGR_EXIT_FAILURE;
     }
     // --- EXECUTION PHASE ---
     // Dispatching only after parsing completes means option position is irrelevant
     // (`migr backup -n /mnt` and `migr backup /mnt -n` behave identically), and the
     // positional arguments above are already settled by getopt's permutation.
-    int ret = 0;
+    int ret = MIGR_EXIT_OK;
     switch (action)
     {
         case ACTION_NONE:
@@ -343,12 +343,12 @@ int main(int argc, char *argv[])
             if (path == NULL)
             {
                 print_error("Usage: ./migr backup <PATH> [--critical | --comprehensive | <PATH...>]\n");
-                ret = 1;
+                ret = MIGR_EXIT_FAILURE;
                 break;
             }
             if (require_root("backup") != 0)
             {
-                ret = 1;
+                ret = MIGR_EXIT_FAILURE;
                 break;
             }
             if (mode == BACKUP_EXPLICIT_PATHS)
@@ -358,7 +358,7 @@ int main(int argc, char *argv[])
             {
                 SelectionPlan selection = {0};
                 if (load_selection(mode, &selection, verbose || dry_run) != 0)
-                    ret = 1;
+                    ret = MIGR_EXIT_FAILURE;
                 else
                 {
                     ret = backup_selection(path, mode, &selection, include_self,
@@ -371,18 +371,18 @@ int main(int argc, char *argv[])
             if (path == NULL)
             {
                 print_error("Usage: ./migr restore <SOURCE>\n");
-                ret = 1;
+                ret = MIGR_EXIT_FAILURE;
                 break;
             }
             if (user_paths[0] != NULL)
             {
                 print_error("Error: restore does not accept additional paths.\n");
-                ret = 1;
+                ret = MIGR_EXIT_FAILURE;
                 break;
             }
             if (require_root("restore") != 0)
             {
-                ret = 1;
+                ret = MIGR_EXIT_FAILURE;
                 break;
             }
             RestoreOptions restore_options = {
@@ -394,7 +394,7 @@ int main(int argc, char *argv[])
             if (path == NULL || user_paths[0] != NULL)
             {
                 print_error("Usage: ./migr verify <SOURCE>\n");
-                ret = 1;
+                ret = MIGR_EXIT_FAILURE;
                 break;
             }
             ret = verify_backup(path);
@@ -403,13 +403,14 @@ int main(int argc, char *argv[])
             if (path == NULL || user_paths[0] == NULL || user_paths[1] != NULL)
             {
                 print_error("Usage: ./migr repair <SOURCE> <PATH>\n");
-                ret = 1;
+                ret = MIGR_EXIT_FAILURE;
                 break;
             }
-            ret = repair_backup(path, user_paths[0]);
+            ret = repair_backup(path, user_paths[0]) == 0
+                ? MIGR_EXIT_OK : MIGR_EXIT_FAILURE;
             break;
         case ACTION_CONF:
-            ret = config_edit() == 0 ? 0 : 1;
+            ret = config_edit() == 0 ? MIGR_EXIT_OK : MIGR_EXIT_FAILURE;
             break;
         case ACTION_HELP:
             // Unreachable: handled immediately after the getopt loop, above.
