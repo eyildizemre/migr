@@ -2774,6 +2774,34 @@ static void test_live_desktop_state_verification_exclusion(void)
         fixture_close(&excluded);
     }
 
+    // Fill, don't fight (D65): live state a running service already wrote
+    // at the destination stays as it is; what is missing is restored.
+    Fixture kept;
+    opened = verification_exclusion_fixture_open(&kept);
+    check(opened == 0, "live-state fill fixture is created");
+    if (opened == 0)
+    {
+        make_dir_at(kept.home_fd, ".local", 0700);
+        make_dir_at(kept.home_fd, ".local/share", 0700);
+        make_dir_at(kept.home_fd, ".local/share/gvfs-metadata", 0700);
+        write_file_at(kept.home_fd, ".local/share/gvfs-metadata/root",
+                      "written by the running service");
+        PortableRestoreReplayReport report;
+        int result = run_replay(&kept, &report);
+        char service_file[PATH_MAX], missing_file[PATH_MAX];
+        path_join(service_file, sizeof(service_file), kept.home,
+                  "/.local/share/gvfs-metadata/root");
+        path_join(missing_file, sizeof(missing_file), kept.home,
+                  "/.local/share/gvfs-metadata/home");
+        check(result == 0 && report.live_state_kept_count == 1 &&
+                  file_equals_noatime(service_file,
+                                      "written by the running service") &&
+                  file_equals_noatime(missing_file, "gvfs home payload"),
+              "live state already written by a service is kept, and the "
+              "missing live file is filled in");
+        fixture_close(&kept);
+    }
+
     Fixture lookalike;
     opened = verification_exclusion_fixture_open(&lookalike);
     check(opened == 0, "verification-prefix boundary fixture is created");

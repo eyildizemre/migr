@@ -48,6 +48,8 @@ typedef struct {
     /* The payload read from the backup did not match its capture digest. */
     int payload_differs;
     unsigned char directory_state;
+    /* Live desktop state already present at the destination (D65). */
+    int kept_live_state;
 } ReplayEntry;
 
 #define REPLAY_VERIFICATION_EXAMPLES 8
@@ -1716,6 +1718,28 @@ static int replay_regular_is_locally_authoritative(
     return strcmp(source_path, known_path) == 0;
 }
 
+static int replay_regular_content_verification_excluded(
+    const SidecarEntry *entry);
+
+// Fill, don't fight (D65): confirmed live desktop state that a running
+// service has already written at the destination is left as it is; it is
+// restored only where nothing is there yet. Returns 1 when present.
+static int replay_live_state_present(ReplayCollection *collection,
+                                     const ReplayEntry *replay)
+{
+    if (!replay_regular_content_verification_excluded(replay->entry))
+        return 0;
+    int parent_fd = -1;
+    char leaf[NAME_MAX + 1U];
+    if (replay_destination_parent(collection, replay, &parent_fd, leaf,
+                                  sizeof(leaf)) != 0)
+        return 0;
+    struct stat st;
+    int present = fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) == 0;
+    close(parent_fd);
+    return present;
+}
+
 static int replay_regular_is_dconf_database(const ReplayCollection *collection,
                                             const ReplayEntry *replay)
 {
@@ -1990,6 +2014,11 @@ static int replay_apply_regular(ReplayCollection *collection,
     const SidecarEntry *entry = replay->entry;
     if (replay_regular_is_locally_authoritative(collection, replay))
         return 0;
+    if (replay_live_state_present(collection, replay))
+    {
+        replay->kept_live_state = 1;
+        return 0;
+    }
     if (entry->size > (uint64_t)INTMAX_MAX)
     {
         errno = EOVERFLOW;
@@ -3505,6 +3534,11 @@ static int replay_run(ReplayCollection *collection)
         {
             if (collection->report->preserved_local_state_count != SIZE_MAX)
                 collection->report->preserved_local_state_count++;
+        }
+        else if (replay->kept_live_state)
+        {
+            if (collection->report->live_state_kept_count != SIZE_MAX)
+                collection->report->live_state_kept_count++;
         }
         else if (replay->entry->kind == SIDECAR_KIND_REGULAR ||
                  replay->entry->kind == SIDECAR_KIND_SYMLINK)

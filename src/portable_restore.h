@@ -114,6 +114,9 @@ typedef struct {
     size_t applied_count;
     size_t failed_count;
     size_t preserved_local_state_count;
+    /* Live desktop state a running service had already written at the
+     * destination, left as it was (D65). */
+    size_t live_state_kept_count;
     size_t skipped_security_xattr_count;
     size_t verification_checked_count;
     size_t verification_failed_count;

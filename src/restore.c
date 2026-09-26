@@ -2952,6 +2952,11 @@ int restore_with_options(const char *source, const RestoreOptions *options)
                    "untouched.\n",
                    report.preserved_local_state_count,
                    report.preserved_local_state_count == 1 ? "" : "s");
+        if (report.live_state_kept_count != 0)
+            printf("Left %zu file%s that running desktop services had "
+                   "already written in place.\n",
+                   report.live_state_kept_count,
+                   report.live_state_kept_count == 1 ? "" : "s");
         if (report.skipped_security_xattr_count != 0)
             printf("Skipped %zu security.* attribute(s) that the destination "
                    "could not apply.\n",

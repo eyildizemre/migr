@@ -161,6 +161,10 @@ the same compiled selection. Explicit-path backups ignore this config, and
 restore follows the selection recorded in the backup manifest rather than the
 target machine's current config.
 
+Frequently rewritten desktop state (such as GNOME's file metadata) is restored
+only where nothing is there yet: a file a running service has already written
+on the new system is left as it is, and the summary counts it.
+
 Restore is intended to run soon after a fresh distribution install. If the
 target has since accumulated its own files at the same paths, the result may
 be unexpected: a pre-existing destination symlink is refused cleanly and

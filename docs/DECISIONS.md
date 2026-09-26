@@ -4450,3 +4450,23 @@ real ones. The namespace keeps all of them as they are.
 **Relationship:** Complements D63. Verified as root: test.sh's btrfs phase
 (loop image, a writer rewriting a file nonstop, a nested subvolume), and a
 real `sudo migr backup --critical` of a btrfs `/home` in a VM.
+
+## D65 — 2026-09-26 — Restore fills live desktop state but does not fight it
+
+**Status:** Implemented
+
+**Decision:** A regular file on the confirmed live-state list (D44, D48,
+D55, D56) is restored only when nothing is at its destination. If a running
+service has already written it, replay leaves it as it is, counts it in
+`live_state_kept_count`, and the summary says how many were left in place.
+It stays out of content verification, as before.
+
+**Why:** Even a restore right after a fresh install runs inside a desktop
+session: GNOME Software, the file indexer, gvfs, and Ptyxis' Podman queries
+start at login and write this state at once. Overwriting their files only
+lost to the next write, or broke the service's view of its own state. The
+state is regenerable, so the service's current version is the right one to
+keep. Missing files are still filled in.
+
+**Relationship:** Part of the live-environment design. Not backing this
+state up at all belongs to the backup-scope overhaul.

@@ -54,12 +54,17 @@ static int portable_restore_confirm(size_t security_xattr_entries)
     return confirm_action(message);
 }
 
-static void portable_restore_print_preserved_local_state(size_t count)
+static void portable_restore_print_preserved_local_state(size_t count,
+                                                         size_t live_kept)
 {
     if (count != 0)
         printf("Portable restore left %zu locally authoritative file%s "
                "untouched\n",
                count, count == 1 ? "" : "s");
+    if (live_kept != 0)
+        printf("Portable restore left %zu file%s that running desktop "
+               "services had already written in place\n",
+               live_kept, live_kept == 1 ? "" : "s");
 }
 
 static PortableRestoreOutcome portable_restore_orchestrate_impl(
@@ -221,7 +226,8 @@ int portable_restore_at(const PortableRestoreRequest *request,
         printf("Portable restore complete: %zu applied\n",
                report->applied_count);
         portable_restore_print_preserved_local_state(
-            report->preserved_local_state_count);
+            report->preserved_local_state_count,
+            report->live_state_kept_count);
         if (report->skipped_security_xattr_count != 0)
             printf("Portable restore skipped %zu security.* attribute(s) "
                    "that the destination could not apply\n",
