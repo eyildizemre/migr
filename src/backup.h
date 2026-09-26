@@ -72,7 +72,8 @@ int restore_space_preflight(int destination_fd, const char *home,
  * the user to rerun through sudo") -- shared by native and portable restore,
  * called once their metadata preflight has already computed
  * foreign_owner_count (docs/DECISIONS.md D38: an ordinary, same-owner
- * restore must keep working without root). The network_config_needs_privilege
+ * restore must keep working without root), or once a native one stopped at
+ * a file of another user that it could not read without root. The network_config_needs_privilege
  * parameter is non-zero when the saved network configuration contains a
  * regular file that the restore would attempt to apply directly.
  * Returns 0 to proceed (either privileged, or nothing found that needs it),

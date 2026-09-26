@@ -3456,12 +3456,18 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         metadata_inventory_status = restore_legacy_metadata_inventory(
             source, source_root_fd, home, home_fd, &ctx, &metadata_profiles,
             &timestamp_anchors, &restore_estimate);
+    int network_config_needs_privilege =
+        mst == MANIFEST_STATUS_VALID && m.has_network_config &&
+        restore_network_config_would_write(source_root_fd);
     if (metadata_inventory_status != RESTORE_NATIVE_OK)
     {
-        if (metadata_inventory_status == RESTORE_NATIVE_SOURCE_SAFE_READ)
-            report_source_safe_read_refusal("native restore payload", NULL);
-        else
+        // Without root, the kernel refuses the no-atime read of a file
+        // another user owns: the restore needs root, which the privilege
+        // refusal says in terms the user can act on (D38).
+        if (metadata_inventory_status != RESTORE_NATIVE_SOURCE_SAFE_READ)
             print_error("Error: native metadata preflight failed; no destination was changed\n");
+        else if (restore_privilege_preflight(1, network_config_needs_privilege) == 0)
+            report_source_safe_read_refusal("native restore payload", NULL);
         native_restore_estimate_free(&restore_estimate);
         goto cleanup;
     }
@@ -3480,9 +3486,6 @@ int restore_with_options(const char *source, const RestoreOptions *options)
     // informational metadata_profiles_report() above so a refusal is
     // preceded by the same privilege-relevant profile detail an accepted
     // restore would have shown.
-    int network_config_needs_privilege =
-        mst == MANIFEST_STATUS_VALID && m.has_network_config &&
-        restore_network_config_would_write(source_root_fd);
     if (dry_run)
         restore_privilege_dry_run_note(metadata_profiles.foreign_owner_count,
                                        network_config_needs_privilege);

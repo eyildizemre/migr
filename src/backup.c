@@ -280,17 +280,17 @@ int restore_privilege_preflight(size_t foreign_owner_count,
     if (foreign_owner_count == 0 && !network_config_needs_privilege)
         return 0;
 
+    // No count: a native inventory that stopped at an unreadable file of
+    // another user knows of at least one, not how many.
     if (foreign_owner_count != 0 && network_config_needs_privilege)
-        print_error("Error: This restore needs root: it would restore %zu "
-                    "item(s) owned by a different user and apply saved "
-                    "network configuration. Rerun the same migr command "
-                    "with sudo.\n",
-                    foreign_owner_count);
+        print_error("Error: This restore needs root: it would restore items "
+                    "owned by a different user and apply saved network "
+                    "configuration. Rerun the same migr command with "
+                    "sudo.\n");
     else if (foreign_owner_count != 0)
-        print_error("Error: This restore needs root: it would restore %zu "
-                    "item(s) owned by a different user. Rerun the same migr "
-                    "command with sudo.\n",
-                    foreign_owner_count);
+        print_error("Error: This restore needs root: it would restore items "
+                    "owned by a different user. Rerun the same migr command "
+                    "with sudo.\n");
     else
         print_error("Error: This restore needs root: it would apply saved "
                     "network configuration. Rerun the same migr command "
