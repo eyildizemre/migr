@@ -2348,6 +2348,170 @@ static void test_open_application_settings_are_deferred(void)
           "restores the settings anyway");
 }
 
+// A native restore with Visual Studio Code and Google Chrome open holds
+// back what they own until everything else is restored (D69): Code's folder
+// inside the .config root, and the whole Chrome root.
+typedef struct {
+    int code_restored;
+    int chrome_restored;
+    int other_restored;
+    int config_mtime_kept;
+} NativeDeferredOutcome;
+
+static const time_t native_config_mtime = 1700001000;
+
+static int run_native_deferred_restore(const char *input, char *output,
+                                       size_t output_size,
+                                       NativeDeferredOutcome *outcome)
+{
+    char source[PATH_MAX], home[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_native_defer_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_native_defer_home");
+    setenv("HOME", home, 1);
+
+    ManifestRoot roots[2];
+    memset(roots, 0, sizeof(roots));
+    strcpy(roots[0].id, "CONFIG");
+    roots[0].policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(roots[0].payload_path, "CONFIG");
+    strcpy(roots[0].source_path, ".config");
+    strcpy(roots[0].restore_path, ".config");
+    roots[0].has_restore_path = 1;
+    strcpy(roots[1].id, "CHROME");
+    roots[1].policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(roots[1].payload_path, "CHROME");
+    strcpy(roots[1].source_path, ".config/google-chrome");
+    strcpy(roots[1].restore_path, ".config/google-chrome");
+    roots[1].has_restore_path = 1;
+    Manifest manifest;
+    make_v1_manifest(&manifest, roots, 2);
+    if (manifest_write_v1(source, &manifest) != 0)
+        return -1;
+    write_payload_file(source, "data/CONFIG/Code", "settings.json", "{}");
+    write_payload_file(source, "data/CONFIG", "other.txt", "other");
+    write_payload_file(source, "data/CHROME", "Local State", "chrome");
+    remove_fixture_packages(source);
+    char config_payload[PATH_MAX];
+    join_path(config_payload, sizeof(config_payload), source, "data/CONFIG");
+    struct timespec times[2] = {
+        { .tv_sec = native_config_mtime, .tv_nsec = 0 },
+        { .tv_sec = native_config_mtime, .tv_nsec = 0 }
+    };
+    if (utimensat(AT_FDCWD, config_payload, times, 0) != 0)
+        return -1;
+
+    char proc_root[PATH_MAX];
+    join_path(proc_root, sizeof(proc_root), source, "fake-proc");
+    mkdir_p(proc_root);
+    write_fake_process(proc_root, "4242", "code", geteuid(), 1);
+    write_fake_process(proc_root, "4243", "chrome", geteuid(), 1);
+    restore_test_set_proc_root(proc_root);
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    int rc = run_restore_capturing_with_input(source, input, output,
+                                              output_size);
+    dry_run = previous_dry_run;
+    restore_test_set_proc_root("/nonexistent/migr-test-proc");
+
+    char path[PATH_MAX];
+    join_path(path, sizeof(path), home, ".config/Code/settings.json");
+    outcome->code_restored = file_content_is(path, "{}");
+    join_path(path, sizeof(path), home, ".config/google-chrome/Local State");
+    outcome->chrome_restored = file_content_is(path, "chrome");
+    join_path(path, sizeof(path), home, ".config/other.txt");
+    outcome->other_restored = file_content_is(path, "other");
+    join_path(path, sizeof(path), home, ".config");
+    struct stat config_st;
+    outcome->config_mtime_kept =
+        stat(path, &config_st) == 0 &&
+        config_st.st_mtim.tv_sec == native_config_mtime;
+    remove_tree(source);
+    remove_tree(home);
+    return rc;
+}
+
+static void test_native_open_application_settings_are_deferred(void)
+{
+    printf(BLUE "::" NC " restore dispatch: a native restore restores open applications' settings last\n");
+    char output[16384];
+    NativeDeferredOutcome outcome;
+    int rc = run_native_deferred_restore("y\ns\n", output, sizeof(output),
+                                         &outcome);
+    const char *warning = strstr(output, "are open. The settings each owns "
+                                         "are restored last");
+    const char *prompt = strstr(output, "Continue?");
+    // Both are named in /proc's order, which the test does not fix.
+    const char *question = strstr(output, " are still open. Close them and "
+                                          "press Enter");
+    check(rc == 0 && warning != NULL && prompt != NULL && question != NULL &&
+              warning < prompt && prompt < question &&
+              strstr(prompt, "Visual Studio Code") != NULL &&
+              strstr(prompt, "Google Chrome") != NULL,
+          "the open applications are named before the prompt and asked "
+          "about at the end");
+    check(outcome.other_restored && !outcome.code_restored &&
+              !outcome.chrome_restored &&
+              strstr(output, "Left out the settings of applications that "
+                             "stayed open (~/.config/google-chrome, "
+                             "~/.config/Code)") != NULL,
+          "s leaves out a folder inside a root and a whole root, while "
+          "everything else is restored");
+
+    rc = run_native_deferred_restore("y\n", output, sizeof(output),
+                                     &outcome);
+    check(rc == 0 && outcome.other_restored && outcome.code_restored &&
+              outcome.chrome_restored &&
+              strstr(output, "No answer; restoring them now.") != NULL &&
+              strstr(output, "Restore complete: 2 items restored") != NULL,
+          "with no one to answer, both are restored anyway, with a note, and "
+          "the whole root is counted");
+    check(outcome.config_mtime_kept,
+          "the folder holding the late settings keeps its restored "
+          "modification time");
+
+    rc = run_native_deferred_restore("y\n\nc\n", output, sizeof(output),
+                                     &outcome);
+    const char *first = strstr(output, "are still open.");
+    check(rc == 0 && outcome.code_restored && outcome.chrome_restored &&
+              first != NULL && strstr(first + 1, "are still open.") != NULL,
+          "Enter checks again while they are still open, and c restores "
+          "them anyway");
+}
+
+static void test_legacy_open_application_settings_are_deferred(void)
+{
+    printf(BLUE "::" NC " restore dispatch: a legacy restore holds back an open browser's profile too\n");
+    char source[PATH_MAX], home[PATH_MAX], proc_root[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_legacy_defer_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_legacy_defer_home");
+    setenv("HOME", home, 1);
+    write_payload_file(source, ".mozilla/firefox", "profiles.ini", "[General]");
+    write_payload_file(source, ".mozilla", "other.txt", "other");
+    remove_fixture_packages(source);
+    join_path(proc_root, sizeof(proc_root), source, "fake-proc");
+    mkdir_p(proc_root);
+    write_fake_process(proc_root, "4242", "firefox", geteuid(), 1);
+    restore_test_set_proc_root(proc_root);
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    char output[16384];
+    int rc = run_restore_capturing_with_input(source, "y\ns\n", output,
+                                              sizeof(output));
+    dry_run = previous_dry_run;
+    restore_test_set_proc_root("/nonexistent/migr-test-proc");
+
+    char profile[PATH_MAX], other[PATH_MAX];
+    join_path(profile, sizeof(profile), home, ".mozilla/firefox/profiles.ini");
+    join_path(other, sizeof(other), home, ".mozilla/other.txt");
+    check(rc == 0 && file_content_is(other, "other") &&
+              access(profile, F_OK) != 0 &&
+              strstr(output, "Firefox is still open.") != NULL &&
+              strstr(output, "(~/.mozilla/firefox)") != NULL,
+          "s leaves the profile out of the legacy .mozilla item");
+    remove_tree(source);
+    remove_tree(home);
+}
+
 static void test_running_writer_detection(void)
 {
     printf(BLUE "::" NC " restore dispatch: running applications that own restored settings are named\n");
@@ -4008,6 +4172,8 @@ int main(void)
     test_dispatch_refuses_portable_v1();
     test_running_writer_detection();
     test_open_application_settings_are_deferred();
+    test_native_open_application_settings_are_deferred();
+    test_legacy_open_application_settings_are_deferred();
     test_native_restore_applies_dconf();
     test_verification_failure_still_restores_packages();
     test_portable_replay_failure_names_entry();

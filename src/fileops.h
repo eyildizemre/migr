@@ -30,6 +30,11 @@ typedef struct CloneContext {
     void *inode_map; /* NativeInodeMap; backup/restore tracking; NULL disables it. */
     void *visited; /* Native visited-path set, backup-only; NULL disables tracking. */
     const struct SelectionRoot *selection; /* Borrowed, native backup-only. */
+    /* Restore only: payload paths, named as restore_native_at_report() names
+     * them (source_rel and the names below it), whose subtrees the apply pass
+     * leaves out so the caller can restore them last (D69). Borrowed. */
+    const char *const *skipped_paths;
+    size_t skipped_count;
 } CloneContext;
 
 /* Opaque native hardlink map ownership. */

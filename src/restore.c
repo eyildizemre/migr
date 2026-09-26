@@ -581,7 +581,7 @@ static int restore_session_uid(uid_t *uid)
     return 0;
 }
 
-// What a portable restore defers (D66): the settings of every writer
+// What a restore defers (D66, D69): the settings of every writer
 // application running now. Returns how many paths were filled.
 static size_t restore_deferred_paths(PortableRestoreDeferredPath *paths,
                                      size_t max_paths)
@@ -613,10 +613,8 @@ size_t restore_test_running_writer_labels(uid_t uid, const char **labels,
 }
 #endif
 
-// Printed right before the confirmation prompt: an open application that owns
-// restored settings writes over them while the restore runs or when it exits.
-// What a portable restore defers for the applications running when it
-// starts (D66), and how to retire the progress line before asking about them.
+// What a restore defers for the applications running when it starts (D66,
+// D69), and how to retire the progress line before asking about them.
 typedef struct {
     PortableRestoreDeferredPath paths[RESTORE_WRITER_APP_COUNT];
     size_t count;
@@ -632,9 +630,10 @@ static void restore_print_labels(const char *const *labels, size_t count)
                labels[index]);
 }
 
-// Printed right before the confirmation prompt. With a deferral (portable
-// restore), the settings of open applications are restored last; without one
-// they can only be named.
+// Printed right before the confirmation prompt: an open application that owns
+// restored settings writes over them while the restore runs or when it exits.
+// When some own settings, those are restored last; otherwise the applications
+// can only be named.
 static void restore_warn_running_writers(void *context)
 {
     const RestoreDeferral *deferral = context;
@@ -1547,20 +1546,279 @@ static int restore_item_at(const CloneContext *ctx,
     return 1;
 }
 
+// A part of a native restore held back until everything else is restored,
+// because an application that was open when the restore started owns it
+// (D69): a whole item, or a subtree left out of an item's walk.
+typedef struct {
+    char source_rel[PATH_MAX + 8];
+    char home_relative[PATH_MAX];
+    char label[PATH_MAX + 64];
+    const char *app;
+    int whole_item;
+} NativeDeferredItem;
+
+typedef struct {
+    const RestoreDeferral *settings; /* Open applications' settings. */
+    NativeDeferredItem *items;
+    size_t count;
+    size_t capacity;
+} NativeDeferral;
+
+// Whether the HOME-relative path inner is outer or lies below it.
+static int home_path_within(const char *inner, const char *outer)
+{
+    size_t length = strlen(outer);
+    if (length == 0)
+        return 1;
+    return strncmp(inner, outer, length) == 0 &&
+           (inner[length] == '\0' || inner[length] == '/');
+}
+
+static NativeDeferredItem *native_deferral_add(NativeDeferral *deferral)
+{
+    if (deferral->count == deferral->capacity)
+    {
+        size_t capacity = deferral->capacity == 0 ? 4U
+                                                  : deferral->capacity * 2U;
+        NativeDeferredItem *items =
+            realloc(deferral->items, capacity * sizeof(*items));
+        if (items == NULL)
+            return NULL;
+        deferral->items = items;
+        deferral->capacity = capacity;
+    }
+    NativeDeferredItem *item = &deferral->items[deferral->count++];
+    memset(item, 0, sizeof(*item));
+    return item;
+}
+
+// Records the part of an item that lands below HOME at home_relative and
+// that settings owns. Returns 1 when recorded, 0 when the backup has nothing
+// there, and -1 on error.
+static int native_deferral_note(NativeDeferral *deferral, int source_root_fd,
+                                const char *source_rel,
+                                const char *home_relative, const char *label,
+                                const PortableRestoreDeferredPath *settings)
+{
+    int whole = home_path_within(home_relative, settings->home_relative);
+    NativeDeferredItem *item = native_deferral_add(deferral);
+    if (item == NULL)
+    {
+        print_error("Error: Out of memory while ordering the restore\n");
+        return -1;
+    }
+    item->app = settings->label;
+    item->whole_item = whole;
+    int written;
+    if (whole)
+        written = snprintf(item->source_rel, sizeof(item->source_rel), "%s",
+                           source_rel) < (int)sizeof(item->source_rel) &&
+                  snprintf(item->home_relative, sizeof(item->home_relative),
+                           "%s", home_relative) <
+                      (int)sizeof(item->home_relative) &&
+                  snprintf(item->label, sizeof(item->label), "%s", label) <
+                      (int)sizeof(item->label);
+    else
+    {
+        const char *suffix = settings->home_relative + strlen(home_relative) +
+                             (home_relative[0] != '\0');
+        written = snprintf(item->source_rel, sizeof(item->source_rel),
+                           "%s/%s", source_rel, suffix) <
+                      (int)sizeof(item->source_rel) &&
+                  snprintf(item->home_relative, sizeof(item->home_relative),
+                           "%s", settings->home_relative) <
+                      (int)sizeof(item->home_relative) &&
+                  snprintf(item->label, sizeof(item->label), "%s:%s", label,
+                           suffix) < (int)sizeof(item->label);
+    }
+    if (!written)
+    {
+        deferral->count--;
+        print_error("Error: Failed to restore %s\n", label);
+        return -1;
+    }
+    RestoreSourceStatus status =
+        restore_native_source_status_at(source_root_fd, item->source_rel);
+    if (status == RESTORE_SOURCE_PRESENT)
+        return 1;
+    deferral->count--;
+    if (status == RESTORE_SOURCE_MISSING)
+        return 0;
+    print_error("Error: Failed to inspect %s\n", label);
+    return -1;
+}
+
+// Restores an item that lands below HOME at home_relative. With a deferral,
+// the settings of applications open at the start are held back (D69): an
+// item inside such settings waits whole, and settings inside the item are
+// left out of its walk; restore_native_deferred() restores both. Returns as
+// restore_item_at() does, except that an item waiting whole returns 0 and
+// is counted when it is restored.
+static int restore_home_item_deferring(
+    const CloneContext *ctx, int source_root_fd, const char *source_rel,
+    int home_fd, const char *home_relative, const char *label,
+    int source_required, NativeDeferral *deferral,
+    const RestoreTimestampAnchors *timestamp_anchors,
+    size_t *skipped_security_xattrs, BackupCaptureReport *capture_report)
+{
+    size_t settings_count = deferral != NULL ? deferral->settings->count : 0;
+    for (size_t index = 0; index < settings_count; index++)
+    {
+        const PortableRestoreDeferredPath *settings =
+            &deferral->settings->paths[index];
+        if (home_path_within(home_relative, settings->home_relative))
+            return native_deferral_note(deferral, source_root_fd, source_rel,
+                                        home_relative, label, settings) < 0
+                ? -1 : 0;
+    }
+    size_t first = deferral != NULL ? deferral->count : 0;
+    for (size_t index = 0; index < settings_count; index++)
+    {
+        const PortableRestoreDeferredPath *settings =
+            &deferral->settings->paths[index];
+        if (home_path_within(settings->home_relative, home_relative) &&
+            native_deferral_note(deferral, source_root_fd, source_rel,
+                                 home_relative, label, settings) < 0)
+            return -1;
+    }
+
+    const char *skipped[RESTORE_WRITER_APP_COUNT];
+    CloneContext item_ctx = *ctx;
+    item_ctx.skipped_count = 0;
+    for (size_t index = first; deferral != NULL && index < deferral->count &&
+                               item_ctx.skipped_count < RESTORE_WRITER_APP_COUNT;
+         index++)
+        skipped[item_ctx.skipped_count++] = deferral->items[index].source_rel;
+    item_ctx.skipped_paths = skipped;
+    return restore_item_at(&item_ctx, source_root_fd, source_rel, home_fd,
+                           home_relative, label, source_required,
+                           timestamp_anchors, skipped_security_xattrs,
+                           capture_report);
+}
+
 // A backup-relative path restored directly into home under the same name on
 // both sides (legacy's Projects/dotfiles/browser-config items).
 static int restore_home_item(const CloneContext *ctx, int source_root_fd,
                              int home_fd, const char *rel_path,
+                             NativeDeferral *deferral,
                              const RestoreTimestampAnchors *timestamp_anchors,
                              size_t *skipped_security_xattrs,
                              BackupCaptureReport *capture_report)
 {
-    int rc = restore_item_at(ctx, source_root_fd, rel_path, home_fd, rel_path,
-                             rel_path, 0, timestamp_anchors,
-                             skipped_security_xattrs, capture_report);
+    int rc = restore_home_item_deferring(ctx, source_root_fd, rel_path,
+                                         home_fd, rel_path, rel_path, 0,
+                                         deferral, timestamp_anchors,
+                                         skipped_security_xattrs,
+                                         capture_report);
     if (rc > 0 && dry_run)
         printf("  Would restore: %s\n", rel_path);
     return rc;
+}
+
+// Restoring a held-back item creates it inside a folder whose times were
+// already restored. Their values are read before and put back after, as if
+// the item had been restored in its turn (D69). Returns an fd for
+// native_parent_times_put_back(), or -1 when the folder is not there as a
+// plain directory.
+static int native_parent_times_take(int home_fd, const char *home_relative,
+                                    struct timespec times[2])
+{
+    char parent[PATH_MAX];
+    if (snprintf(parent, sizeof(parent), "%s", home_relative) >=
+        (int)sizeof(parent))
+        return -1;
+    char *slash = strrchr(parent, '/');
+    if (slash == NULL)
+        parent[0] = '\0';
+    else
+        *slash = '\0';
+    int fd = restore_destination_anchor_fd(home_fd, parent);
+    if (fd < 0)
+        return -1;
+    struct stat anchor_st, parent_st;
+    if (fstat(fd, &anchor_st) != 0 ||
+        (parent[0] != '\0' &&
+         fstatat(home_fd, parent, &parent_st, AT_SYMLINK_NOFOLLOW) != 0) ||
+        (parent[0] != '\0' && (parent_st.st_dev != anchor_st.st_dev ||
+                               parent_st.st_ino != anchor_st.st_ino)))
+    {
+        close(fd);
+        return -1;
+    }
+    times[0] = anchor_st.st_atim;
+    times[1] = anchor_st.st_mtim;
+    return fd;
+}
+
+// Restores what restore_home_item_deferring() held back once everything else
+// is restored, and asks first if an application that owns it is still open
+// (D69). Returns 1 when the user left them out.
+static int restore_native_deferred(
+    const CloneContext *ctx, int source_root_fd, int home_fd,
+    const NativeDeferral *deferral, int *count, int *had_error,
+    const RestoreTimestampAnchors *timestamp_anchors,
+    size_t *skipped_security_xattrs, BackupCaptureReport *capture_report)
+{
+    if (deferral->count == 0)
+        return 0;
+    RestoreDeferral question = {
+        .retire_progress = deferral->settings->retire_progress,
+        .progress = deferral->settings->progress
+    };
+    for (size_t index = 0; index < deferral->count; index++)
+    {
+        int known = 0;
+        for (size_t app = 0; app < question.count && !known; app++)
+            known = strcmp(question.paths[app].label,
+                           deferral->items[index].app) == 0;
+        if (!known && question.count < RESTORE_WRITER_APP_COUNT)
+        {
+            question.paths[question.count].label = deferral->items[index].app;
+            question.paths[question.count].home_relative =
+                deferral->items[index].home_relative;
+            question.count++;
+        }
+    }
+    if (!restore_before_deferred(&question))
+        return 1;
+
+    for (size_t index = 0; index < deferral->count; index++)
+    {
+        const NativeDeferredItem *item = &deferral->items[index];
+        struct timespec times[2];
+        int parent_fd = native_parent_times_take(home_fd, item->home_relative,
+                                                 times);
+        int rc = restore_item_at(ctx, source_root_fd, item->source_rel,
+                                 home_fd, item->home_relative, item->label, 0,
+                                 timestamp_anchors, skipped_security_xattrs,
+                                 capture_report);
+        if (rc > 0 && item->whole_item)
+            (*count)++;
+        else if (rc < 0)
+            *had_error = 1;
+        if (parent_fd >= 0)
+        {
+            if (futimens(parent_fd, times) != 0)
+            {
+                print_error("Error: Could not restore the times of the folder "
+                            "holding ~/%s: %s\n", item->home_relative,
+                            strerror(errno));
+                *had_error = 1;
+            }
+            close(parent_fd);
+        }
+    }
+    return 0;
+}
+
+static void native_deferral_print_left_out(const NativeDeferral *deferral)
+{
+    printf("Left out the settings of applications that stayed open (");
+    for (size_t index = 0; index < deferral->count; index++)
+        printf("%s~/%s", index == 0 ? "" : ", ",
+               deferral->items[index].home_relative);
+    printf("); close them and run the same restore again to put them "
+           "back.\n");
 }
 
 // Versioned restore phases consume the same invocation-stable anchor/relative
@@ -1607,6 +1865,7 @@ static const char *legacy_xdg_source_name(
 // legacy layout and its all-or-nothing XDG destination resolution.
 static int restore_legacy(const char *source, int source_root_fd, const char *home, int home_fd,
                           const CloneContext *ctx, int *count, int *had_error,
+                          NativeDeferral *deferral,
                           const RestoreTimestampAnchors *timestamp_anchors,
                           size_t *skipped_security_xattrs,
                           BackupCaptureReport *capture_report)
@@ -1679,8 +1938,9 @@ static int restore_legacy(const char *source, int source_root_fd, const char *ho
         if (LEGACY_HOME_ITEMS[i].kind != LEGACY_HOME_ITEM_PROJECTS)
             continue;
         rc = restore_home_item(ctx, source_root_fd, home_fd,
-                               LEGACY_HOME_ITEMS[i].name, timestamp_anchors,
-                               skipped_security_xattrs, capture_report);
+                               LEGACY_HOME_ITEMS[i].name, deferral,
+                               timestamp_anchors, skipped_security_xattrs,
+                               capture_report);
         if (rc > 0)
             (*count)++;
         else if (rc < 0)
@@ -1693,7 +1953,7 @@ static int restore_legacy(const char *source, int source_root_fd, const char *ho
         if (LEGACY_HOME_ITEMS[i].kind != LEGACY_HOME_ITEM_DOTFILE)
             continue;
         rc = restore_home_item(ctx, source_root_fd, home_fd,
-                               LEGACY_HOME_ITEMS[i].name,
+                               LEGACY_HOME_ITEMS[i].name, deferral,
                                timestamp_anchors, skipped_security_xattrs,
                                capture_report);
         if (rc > 0)
@@ -1708,7 +1968,7 @@ static int restore_legacy(const char *source, int source_root_fd, const char *ho
         if (LEGACY_HOME_ITEMS[i].kind != LEGACY_HOME_ITEM_BROWSER)
             continue;
         rc = restore_home_item(ctx, source_root_fd, home_fd,
-                               LEGACY_HOME_ITEMS[i].name,
+                               LEGACY_HOME_ITEMS[i].name, deferral,
                                timestamp_anchors, skipped_security_xattrs,
                                capture_report);
         if (rc > 0)
@@ -2739,8 +2999,8 @@ static RestoreNativeStatus restore_v1_metadata_inventory(
 // locale, and MANUAL_NATIVE roots are reported without being auto-restored.
 static void restore_v1(const char *source, int source_root_fd,
                        const CloneContext *ctx, const Manifest *m,
-                       const RestoreTargetMap *target_map, int *count,
-                       int *had_error,
+                       const RestoreTargetMap *target_map, int home_fd,
+                       int *count, int *had_error, NativeDeferral *deferral,
                        const RestoreTimestampAnchors *timestamp_anchors,
                        size_t *skipped_security_xattrs,
                        BackupCaptureReport *capture_report,
@@ -2765,11 +3025,20 @@ static void restore_v1(const char *source, int source_root_fd,
 
         const RestoreTargetRoot *destination = &target_map->roots[root_index];
 
-        int rc = restore_item_at(ctx, source_root_fd, source_rel,
-                                 destination->route.anchor_fd,
-                                 destination->route.relative, root->id, 1,
-                                 timestamp_anchors,
-                                 skipped_security_xattrs, capture_report);
+        int rc = root->policy == ROOT_POLICY_HOME_RELATIVE &&
+                         destination->route.anchor_fd == home_fd
+            ? restore_home_item_deferring(ctx, source_root_fd, source_rel,
+                                          home_fd,
+                                          destination->route.relative,
+                                          root->id, 1, deferral,
+                                          timestamp_anchors,
+                                          skipped_security_xattrs,
+                                          capture_report)
+            : restore_item_at(ctx, source_root_fd, source_rel,
+                              destination->route.anchor_fd,
+                              destination->route.relative, root->id, 1,
+                              timestamp_anchors, skipped_security_xattrs,
+                              capture_report);
         if (rc > 0 && dry_run)
         {
             if (root->policy == ROOT_POLICY_HOME_RELATIVE)
@@ -3165,6 +3434,17 @@ int restore_with_options(const char *source, const RestoreOptions *options)
     restore_timestamp_anchors_init(&timestamp_anchors);
     RestoreProgressDisplay progress_display = {0};
     int progress_installed = 0;
+    RestoreProgressPhase progress_phase = {
+        .report = &capture_report,
+        .display = &progress_display,
+        .ticker_installed = &progress_installed
+    };
+    RestoreDeferral open_settings = {
+        .retire_progress = restore_before_content_verification,
+        .progress = &progress_phase
+    };
+    NativeDeferral deferral = { .settings = &open_settings };
+    int left_out_deferred = 0;
     int result = MIGR_EXIT_FAILURE;
 
     RestoreNativeStatus metadata_inventory_status;
@@ -3218,7 +3498,9 @@ int restore_with_options(const char *source, const RestoreOptions *options)
     }
     else
     {
-        restore_warn_running_writers(NULL);
+        open_settings.count = restore_deferred_paths(open_settings.paths,
+                                                     RESTORE_WRITER_APP_COUNT);
+        restore_warn_running_writers(&open_settings);
         if (!native_restore_confirm(
                 metadata_profiles.security_xattr_entry_count))
         {
@@ -3289,32 +3571,26 @@ int restore_with_options(const char *source, const RestoreOptions *options)
 
     if (mst == MANIFEST_STATUS_VALID)
     {
-        restore_v1(source, source_root_fd, &ctx, &m, &target_map, &count,
-                   &had_error, &timestamp_anchors,
+        restore_v1(source, source_root_fd, &ctx, &m, &target_map, home_fd,
+                   &count, &had_error, dry_run ? NULL : &deferral,
+                   &timestamp_anchors,
                    &skipped_security_xattrs, &capture_report,
                    target_map.order);
     }
     else
     {
         if (restore_legacy(source, source_root_fd, home, home_fd, &ctx,
-                           &count, &had_error, &timestamp_anchors,
+                           &count, &had_error, dry_run ? NULL : &deferral,
+                           &timestamp_anchors,
                            &skipped_security_xattrs, &capture_report) != 0)
             goto cleanup;
     }
+    if (!dry_run)
+        left_out_deferred = restore_native_deferred(
+            &ctx, source_root_fd, home_fd, &deferral, &count, &had_error,
+            &timestamp_anchors, &skipped_security_xattrs, &capture_report);
 
-    if (progress_installed)
-    {
-        restore_progress_stop_ticker(&progress_display);
-        progress_installed = 0;
-    }
-    if (progress_display.printed_anything)
-    {
-        capture_report.progress_cb(capture_report.bytes_copied,
-                                   capture_report.current_path,
-                                   capture_report.progress_userdata);
-        putchar('\n');
-        fflush(stdout);
-    }
+    restore_progress_finish_phase(&progress_phase);
 
     native_inode_map_free(ctx.inode_map);
     ctx.inode_map = NULL;
@@ -3344,6 +3620,8 @@ int restore_with_options(const char *source, const RestoreOptions *options)
                item_phrase);
     else
         print_success("Restore complete: %s\n", item_phrase);
+    if (left_out_deferred)
+        native_deferral_print_left_out(&deferral);
     if (skipped_security_xattrs != 0)
         printf("Skipped %zu security.* attribute(s) that the destination "
                "could not apply.\n", skipped_security_xattrs);
@@ -3352,6 +3630,7 @@ int restore_with_options(const char *source, const RestoreOptions *options)
 cleanup:
     if (progress_installed)
         restore_progress_stop_ticker(&progress_display);
+    free(deferral.items);
     native_inode_map_free(ctx.inode_map);
     ctx.inode_map = NULL;
     metadata_profiles_free(&metadata_profiles);

@@ -4506,8 +4506,8 @@ Software).
 - **Before the confirmation prompt:** The warning says these settings are
   restored last.
 
-A native restore prints the plain warning before its prompt (restored here,
-since it had lost the call) but does not defer.
+A native restore printed only the plain warning before its prompt and did
+not defer, until D69.
 
 **Why:** An application that saves its state on exit overwrites restored
 settings after migr has finished, where no verification can see it. VS Code
@@ -4516,9 +4516,9 @@ an unattended run for its whole length. At the end nothing else is left to
 do, so waiting costs nothing, and the application has had the whole restore
 to be closed.
 
-**Relationship:** Part of the live-environment design. Native restore
-deferral, and Flatpak applications (`~/.var/app/<id>`, detectable with
-`flatpak ps`, once that scope is captured at all), are open.
+**Relationship:** Part of the live-environment design. D69 gives native
+restore the same behavior. Flatpak applications (`~/.var/app/<id>`,
+detectable with `flatpak ps`, once that scope is captured at all) are open.
 
 ## D67 — 2026-09-26 — Verification tells later writes apart from corruption
 
@@ -4575,3 +4575,31 @@ failed one. tar, which D63 already followed for status 1, uses 2 for
 failure.
 
 **Relationship:** Refines D59, D63, and D67.
+
+## D69 — 2026-09-27 — A native restore restores open applications' settings last too
+
+**Status:** Implemented
+
+**Decision:** A native restore (v1 and legacy layouts) defers the same
+paths as a portable one (D66), with the same warning, the same question at
+the end, and the same answers. The native walker restores whole trees, so
+deferral works on items below HOME:
+- **An item inside such settings** (a root such as
+  `.config/google-chrome`) waits whole.
+- **Settings inside an item** (`.config/Code` inside the `.config` root) are
+  left out of that item's apply pass. `CloneContext.skipped_paths` names
+  them by payload path; the validate pass still covers them.
+- **At the end:** Once every item is restored, the CLI asks as in D66. Each
+  held-back part is then restored as an item of its own; a whole item is
+  counted then. `s` leaves them out, and the summary names their paths.
+- **The folder above:** Restoring a part late creates it inside a folder
+  whose times were already applied. That folder's times are read before and
+  put back after, as if the part had been restored in its turn.
+
+XDG roots and dry runs do not defer.
+
+**Why:** The two representations must behave alike. A native restore named
+open applications but restored their settings in place, where the
+application overwrote them on closing.
+
+**Relationship:** Extends D66 to native restore.
