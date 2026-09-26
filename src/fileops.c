@@ -85,7 +85,49 @@ static void backup_test_before_capture_source_open(const char *source_path)
     if (backup_test_capture_hook != NULL)
         backup_test_capture_hook(source_path, backup_test_capture_context);
 }
+
+static int backup_test_open_fault;
+
+void backup_test_fail_next_source_open(int error)
+{
+    backup_test_open_fault = error;
+}
+
+static BackupTestCaptureHook backup_test_after_copy_hook;
+static void *backup_test_after_copy_context;
+
+void backup_test_set_after_copy_hook(BackupTestCaptureHook hook,
+                                     void *context)
+{
+    backup_test_after_copy_hook = hook;
+    backup_test_after_copy_context = context;
+}
 #endif
+
+// Opens a capture source; tests can make the next open fail.
+static int capture_open_source(const char *path, int flags)
+{
+#ifdef BACKUP_TEST_HOOKS
+    if (backup_test_open_fault != 0)
+    {
+        errno = backup_test_open_fault;
+        backup_test_open_fault = 0;
+        return -1;
+    }
+#endif
+    return open(path, flags);
+}
+
+static void backup_test_after_capture_copy(const char *source_path)
+{
+#ifdef BACKUP_TEST_HOOKS
+    if (backup_test_after_copy_hook != NULL)
+        backup_test_after_copy_hook(source_path,
+                                    backup_test_after_copy_context);
+#else
+    (void)source_path;
+#endif
+}
 
 typedef struct {
     dev_t device;
@@ -727,9 +769,11 @@ static int native_inode_map_seed_existing_at(
         int owned = selection_source_owns(ctx->selection, source_path);
         if (owned <= 0) return owned;
     }
+    // Seeding only saves relinking hardlinks on a resume; a source that
+    // vanished or changed since is left to the capture pass (D63).
     struct stat source_st;
     if (lstat(source_path, &source_st) != 0)
-        return -1;
+        return errno == ENOENT ? 0 : -1;
 
     struct stat destination_st;
     if (fstatat(destination_dir_fd, destination_leaf, &destination_st,
@@ -750,12 +794,14 @@ static int native_inode_map_seed_existing_at(
         if (source_fd < 0)
             return errno == EPERM ? 0 : -1;
         struct stat opened;
-        int failed = fstat(source_fd, &opened) != 0 ||
-                     !metadata_source_unchanged(&source_st, &opened);
+        int failed = fstat(source_fd, &opened) != 0;
+        int changed = !failed && !metadata_source_unchanged(&source_st, &opened);
         if (close(source_fd) != 0)
             failed = 1;
         if (failed)
             return -1;
+        if (changed)
+            return 0;
         return native_inode_map_insert(ctx->inode_map, source_st.st_dev,
                                        source_st.st_ino, destination_dir_fd,
                                        destination_leaf);
@@ -770,12 +816,15 @@ static int native_inode_map_seed_existing_at(
     if (source_fd < 0)
         return errno == EPERM ? 0 : -1;
     struct stat opened;
-    int failed = fstat(source_fd, &opened) != 0 ||
-                 !metadata_source_unchanged(&source_st, &opened);
-    if (failed)
+    if (fstat(source_fd, &opened) != 0)
     {
         close(source_fd);
         return -1;
+    }
+    if (!metadata_source_unchanged(&source_st, &opened))
+    {
+        close(source_fd);
+        return 0;
     }
 
     int destination_fd = openat(destination_dir_fd, destination_leaf,
@@ -800,7 +849,7 @@ static int native_inode_map_seed_existing_root_at(
     }
     struct stat source_st;
     if (lstat(source_path, &source_st) != 0)
-        return -1;
+        return errno == ENOENT ? 0 : -1;
 
     struct stat destination_st;
     if (fstat(destination_root_fd, &destination_st) != 0)
@@ -814,12 +863,15 @@ static int native_inode_map_seed_existing_root_at(
     if (source_fd < 0)
         return errno == EPERM ? 0 : -1;
     struct stat opened;
-    int failed = fstat(source_fd, &opened) != 0 ||
-                 !metadata_source_unchanged(&source_st, &opened);
-    if (failed)
+    if (fstat(source_fd, &opened) != 0)
     {
         close(source_fd);
         return -1;
+    }
+    if (!metadata_source_unchanged(&source_st, &opened))
+    {
+        close(source_fd);
+        return 0;
     }
 
     int destination_fd = fcntl(destination_root_fd, F_DUPFD_CLOEXEC, 0);
@@ -1173,10 +1225,19 @@ static BackupCaptureStatus capture_entry_at(const CloneContext *ctx,
 // refused rather than replaced.
 static int capture_symlink_at(const char *src, int dest_dir_fd, const char *leaf,
                               const struct stat *st,
-                              MetadataTimestampPolicy policy)
+                              MetadataTimestampPolicy policy,
+                              BackupCaptureReport *report)
 {
     char link_target[PATH_MAX];
     ssize_t len = readlink(src, link_target, sizeof(link_target));
+    if (len < 0 && (errno == ENOENT || errno == EINVAL))
+    {
+        // Removed, or no longer a symlink, since it was listed (D63).
+        backup_capture_report_note_change(
+            report, errno == ENOENT ? BACKUP_SOURCE_VANISHED
+                                    : BACKUP_SOURCE_CHANGED, src);
+        return BACKUP_CAPTURE_SKIPPED;
+    }
     if (len < 0 || (size_t)len >= sizeof(link_target))
         return -1;
     link_target[len] = '\0';
@@ -1206,10 +1267,12 @@ static int capture_symlink_at(const char *src, int dest_dir_fd, const char *leaf
     if (!failed && collect_symlink_xattrs(src, &xattrs) != 0)
         failed = 1;
 
+    // A symlink retargeted meanwhile keeps the target read (D63).
     struct stat after;
-    if (!failed &&
-        (lstat(src, &after) != 0 || !metadata_symlink_unchanged(st, &after)))
+    if (!failed && lstat(src, &after) != 0)
         failed = 1;
+    else if (!failed && !metadata_symlink_unchanged(st, &after))
+        backup_capture_report_note_change(report, BACKUP_SOURCE_CHANGED, src);
     if (!failed && metadata_apply_xattrs_symlink_at(dest_dir_fd, leaf,
                                                     xattrs.items,
                                                     xattrs.count) != 0)
@@ -1224,8 +1287,10 @@ static int capture_symlink_at(const char *src, int dest_dir_fd, const char *leaf
 // A write() that reports zero bytes for a non-zero request has made no
 // progress and never will on a retry, so it is treated as the failure it is
 // rather than spun on forever.
+// copied_out != NULL accepts whatever length the source has when read and
+// reports it; otherwise a length other than expected_size is EIO.
 static int copy_file_contents(int src_fd, int dest_fd, off_t expected_size,
-                              BackupCaptureReport *report)
+                              BackupCaptureReport *report, off_t *copied_out)
 {
     char buffer[8192];
     off_t copied = 0;
@@ -1254,6 +1319,11 @@ static int copy_file_contents(int src_fd, int dest_fd, off_t expected_size,
         if (backup_capture_report_tick(report, bytes_read, dest_fd) != 0)
             return -1;
     }
+    if (copied_out != NULL)
+    {
+        *copied_out = copied;
+        return 0;
+    }
     if (expected_size < 0 || copied != expected_size)
     {
         errno = EIO;
@@ -1262,11 +1332,14 @@ static int copy_file_contents(int src_fd, int dest_fd, off_t expected_size,
     return 0;
 }
 
+// A source that changed since desired was taken fails the tail, unless
+// source_changed is given: a live backup source (D63) then only sets it.
 static int apply_fd_metadata_tail(int destination_fd,
                                   const struct stat *desired,
                                   int source_fd,
                                   MetadataTimestampPolicy policy,
-                                  size_t *out_skipped_security)
+                                  size_t *out_skipped_security,
+                                  int *source_changed)
 {
     PortableXattrs xattrs = {0};
     int failed = metadata_apply_ownership_and_mode_fd(destination_fd,
@@ -1274,9 +1347,15 @@ static int apply_fd_metadata_tail(int destination_fd,
     if (!failed && collect_xattrs(source_fd, &xattrs) != 0)
         failed = 1;
     struct stat after;
-    if (!failed && (fstat(source_fd, &after) != 0 ||
-                    !metadata_source_unchanged(desired, &after)))
+    if (!failed && fstat(source_fd, &after) != 0)
         failed = 1;
+    else if (!failed && !metadata_source_unchanged(desired, &after))
+    {
+        if (source_changed != NULL)
+            *source_changed = 1;
+        else
+            failed = 1;
+    }
     if (!failed)
     {
         size_t skipped_security = 0;
@@ -1296,7 +1375,8 @@ static int apply_fd_metadata_tail(int destination_fd,
 static BackupCaptureStatus capture_hardlink_at(
     int src_fd, int dest_dir_fd, const char *leaf,
     int representative_parent_fd, const char *representative_leaf,
-    const struct stat *source_snapshot)
+    const struct stat *source_snapshot, const char *src,
+    BackupCaptureReport *report)
 {
     if (source_snapshot == NULL || !S_ISREG(source_snapshot->st_mode) ||
         representative_parent_fd < 0 ||
@@ -1307,10 +1387,13 @@ static BackupCaptureStatus capture_hardlink_at(
         return BACKUP_CAPTURE_ERROR;
     }
 
+    // The link shares its representative's captured content; a change to the
+    // source meanwhile is only reported (D63).
     struct stat source_after;
-    int source_failed = fstat(src_fd, &source_after) != 0 ||
-                        !metadata_source_unchanged(source_snapshot,
-                                                   &source_after);
+    int source_failed = fstat(src_fd, &source_after) != 0;
+    if (!source_failed &&
+        !metadata_source_unchanged(source_snapshot, &source_after))
+        backup_capture_report_note_change(report, BACKUP_SOURCE_CHANGED, src);
     if (close(src_fd) != 0)
         source_failed = 1;
     if (source_failed)
@@ -1358,7 +1441,8 @@ static BackupCaptureStatus capture_regular_at(
 #ifdef BACKUP_TEST_HOOKS
     backup_test_before_capture_source_open(src);
 #endif
-    int src_fd = open(src, O_RDONLY | O_NOATIME | O_CLOEXEC | O_NOFOLLOW);
+    int src_fd = capture_open_source(src, O_RDONLY | O_NOATIME | O_CLOEXEC |
+                                              O_NOFOLLOW);
     if (src_fd < 0)
     {
         if (errno == EPERM)
@@ -1366,16 +1450,31 @@ static BackupCaptureStatus capture_regular_at(
             capture_report_source_refusal(report, src);
             return BACKUP_CAPTURE_SOURCE_SAFE_READ;
         }
+        // Removed, or replaced by a symlink, since it was listed (D63).
+        if (errno == ENOENT || errno == ELOOP)
+        {
+            backup_capture_report_note_change(
+                report, errno == ENOENT ? BACKUP_SOURCE_VANISHED
+                                        : BACKUP_SOURCE_CHANGED, src);
+            return BACKUP_CAPTURE_SKIPPED;
+        }
         return BACKUP_CAPTURE_ERROR;
     }
 
+    // The open fd is what gets captured; a file rewritten since it was
+    // listed is simply taken as it is now.
+    (void)st;
     struct stat source_snapshot;
-    if (fstat(src_fd, &source_snapshot) != 0 ||
-        !S_ISREG(source_snapshot.st_mode) ||
-        !metadata_source_unchanged(st, &source_snapshot))
+    if (fstat(src_fd, &source_snapshot) != 0)
     {
         close(src_fd);
         return BACKUP_CAPTURE_ERROR;
+    }
+    if (!S_ISREG(source_snapshot.st_mode))
+    {
+        close(src_fd);
+        backup_capture_report_note_change(report, BACKUP_SOURCE_CHANGED, src);
+        return BACKUP_CAPTURE_SKIPPED;
     }
 
     if (ctx->inode_map != NULL && source_snapshot.st_nlink > 1)
@@ -1397,7 +1496,7 @@ static BackupCaptureStatus capture_regular_at(
             return capture_hardlink_at(src_fd, dest_dir_fd, leaf,
                                        representative_parent_fd,
                                        representative_leaf,
-                                       &source_snapshot);
+                                       &source_snapshot, src, report);
     }
 
     struct stat dest_st;
@@ -1425,10 +1524,14 @@ static BackupCaptureStatus capture_regular_at(
             struct stat opened_dest;
             int failed = fstat(dest_fd, &opened_dest) != 0 ||
                          !S_ISREG(opened_dest.st_mode);
+            int tail_changed = 0;
             if (!failed &&
                 apply_fd_metadata_tail(dest_fd, &source_snapshot, src_fd,
-                                       policy, NULL) != 0)
+                                       policy, NULL, &tail_changed) != 0)
                 failed = 1;
+            if (!failed && tail_changed)
+                backup_capture_report_note_change(
+                    report, BACKUP_SOURCE_CHANGED, src);
             if (close(dest_fd) != 0)
                 failed = 1;
             if (close(src_fd) != 0)
@@ -1464,12 +1567,54 @@ static BackupCaptureStatus capture_regular_at(
 
     if (report != NULL)
         snprintf(report->current_path, sizeof(report->current_path), "%s", src);
-    int failed = copy_file_contents(src_fd, dest_fd, source_snapshot.st_size,
-                                    report) != 0;
+    // A file written while it is read is read again, up to
+    // BACKUP_CAPTURE_READ_ATTEMPTS times; one still changing after that is
+    // kept as last read, with that read's length, and reported (D63).
+    int failed = 0;
+    int changed = 0;
+    for (unsigned int attempt = 1;; attempt++)
+    {
+        off_t copied = 0;
+        if (lseek(src_fd, 0, SEEK_SET) != 0 || ftruncate(dest_fd, 0) != 0 ||
+            lseek(dest_fd, 0, SEEK_SET) != 0 ||
+            copy_file_contents(src_fd, dest_fd, 0, report, &copied) != 0)
+        {
+            failed = 1;
+            break;
+        }
+        backup_test_after_capture_copy(src);
+        struct stat after;
+        if (fstat(src_fd, &after) != 0)
+        {
+            failed = 1;
+            break;
+        }
+        // Unchanged metadata with a different length read is not a writer
+        // but a short read, and stays an error.
+        int unchanged = metadata_source_unchanged(&source_snapshot, &after);
+        if (unchanged && copied != after.st_size)
+        {
+            errno = EIO;
+            failed = 1;
+            break;
+        }
+        source_snapshot = after;
+        if (unchanged)
+            break;
+        if (attempt >= BACKUP_CAPTURE_READ_ATTEMPTS)
+        {
+            source_snapshot.st_size = copied;
+            changed = 1;
+            break;
+        }
+        backup_capture_reread_pause(attempt);
+    }
     if (!failed &&
         apply_fd_metadata_tail(dest_fd, &source_snapshot, src_fd, policy,
-                               NULL) != 0)
+                               NULL, &changed) != 0)
         failed = 1;
+    if (!failed && changed)
+        backup_capture_report_note_change(report, BACKUP_SOURCE_CHANGED, src);
 
     // A write deferred by the kernel (quota, ENOSPC, a network filesystem)
     // can surface only here, so a failed close means the payload is not
@@ -1502,8 +1647,9 @@ static BackupCaptureStatus capture_directory_at(
 #ifdef BACKUP_TEST_HOOKS
     backup_test_before_capture_source_open(src);
 #endif
-    int source_fd = open(src, O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
-                              O_NOATIME | O_CLOEXEC);
+    int source_fd = capture_open_source(src, O_RDONLY | O_DIRECTORY |
+                                                 O_NOFOLLOW | O_NOATIME |
+                                                 O_CLOEXEC);
     if (source_fd < 0)
     {
         if (errno == EPERM)
@@ -1511,12 +1657,20 @@ static BackupCaptureStatus capture_directory_at(
             capture_report_source_refusal(report, src);
             return BACKUP_CAPTURE_SOURCE_SAFE_READ;
         }
+        // Removed, or replaced by something else, since it was listed (D63).
+        if (errno == ENOENT || errno == ENOTDIR || errno == ELOOP)
+        {
+            backup_capture_report_note_change(
+                report, errno == ENOENT ? BACKUP_SOURCE_VANISHED
+                                        : BACKUP_SOURCE_CHANGED, src);
+            return BACKUP_CAPTURE_SKIPPED;
+        }
         return BACKUP_CAPTURE_ERROR;
     }
+    (void)st;
     struct stat source_snapshot;
     if (fstat(source_fd, &source_snapshot) != 0 ||
-        !S_ISDIR(source_snapshot.st_mode) ||
-        !metadata_source_unchanged(st, &source_snapshot))
+        !S_ISDIR(source_snapshot.st_mode))
     {
         close(source_fd);
         return BACKUP_CAPTURE_ERROR;
@@ -1600,10 +1754,14 @@ static BackupCaptureStatus capture_directory_at(
         if (result == BACKUP_CAPTURE_OK)
             result = BACKUP_CAPTURE_ERROR;
     }
+    int directory_changed = 0;
     if (result == BACKUP_CAPTURE_OK &&
         apply_fd_metadata_tail(child_fd, &source_snapshot, source_fd,
-                               metadata_policy_from_context(ctx), NULL) != 0)
+                               metadata_policy_from_context(ctx), NULL,
+                               &directory_changed) != 0)
         result = BACKUP_CAPTURE_ERROR;
+    if (result == BACKUP_CAPTURE_OK && directory_changed)
+        backup_capture_report_note_change(report, BACKUP_SOURCE_CHANGED, src);
     if (close(source_fd) != 0)
     {
         if (result == BACKUP_CAPTURE_OK)
@@ -1664,13 +1822,20 @@ static BackupCaptureStatus capture_entry_at(const CloneContext *ctx,
     }
     struct stat st;
     if (lstat(src, &st) != 0)
-        return BACKUP_CAPTURE_ERROR;
+    {
+        if (errno != ENOENT)
+            return BACKUP_CAPTURE_ERROR;
+        // Listed by readdir, gone before it could be read (D63).
+        backup_capture_report_note_change(report, BACKUP_SOURCE_VANISHED, src);
+        return BACKUP_CAPTURE_OK;
+    }
 
     MetadataTimestampPolicy policy = metadata_policy_from_context(ctx);
     BackupCaptureStatus status;
     int trackable = 1;
     if (S_ISLNK(st.st_mode))
-        status = capture_symlink_at(src, dest_dir_fd, leaf, &st, policy);
+        status = capture_symlink_at(src, dest_dir_fd, leaf, &st, policy,
+                                    report);
     else if (S_ISREG(st.st_mode))
         status = capture_regular_at(ctx, src, dest_dir_fd, leaf, &st, report);
     else if (S_ISDIR(st.st_mode))
@@ -1697,6 +1862,10 @@ static BackupCaptureStatus capture_entry_at(const CloneContext *ctx,
     else
         return BACKUP_CAPTURE_ERROR;
 
+    // Left out, so not visited: a resume then removes its stale payload.
+    if (status == BACKUP_CAPTURE_SKIPPED)
+        return BACKUP_CAPTURE_OK;
+
     if (status == BACKUP_CAPTURE_OK && trackable && ctx->visited != NULL &&
         native_visited_add(ctx->visited, root_key, rel_path) < 0)
         return BACKUP_CAPTURE_ERROR;
@@ -1709,6 +1878,37 @@ void backup_capture_report_init(BackupCaptureReport *report)
     if (report == NULL)
         return;
     memset(report, 0, sizeof(*report));
+}
+
+void backup_capture_report_note_change(BackupCaptureReport *report,
+                                       BackupSourceChangeKind kind,
+                                       const char *location)
+{
+    if (report == NULL || kind < 0 || kind >= BACKUP_SOURCE_CHANGE_KINDS)
+        return;
+    BackupSourceChangeList *list = &report->source_changes[kind];
+    if (list->count != SIZE_MAX)
+        list->count++;
+    if (list->example_count < BACKUP_SOURCE_CHANGE_EXAMPLES)
+        snprintf(list->examples[list->example_count++], PATH_MAX, "%s",
+                 location != NULL ? location : "");
+}
+
+void backup_capture_reread_pause(unsigned int attempt)
+{
+    struct timespec pause = { 0, (long)attempt * 50L * 1000L * 1000L };
+    while (nanosleep(&pause, &pause) != 0 && errno == EINTR)
+        ;
+}
+
+int backup_capture_report_has_changes(const BackupCaptureReport *report)
+{
+    if (report == NULL)
+        return 0;
+    for (int kind = 0; kind < BACKUP_SOURCE_CHANGE_KINDS; kind++)
+        if (report->source_changes[kind].count != 0)
+            return 1;
+    return 0;
 }
 
 int backup_capture_report_tick(BackupCaptureReport *report,
@@ -2956,7 +3156,7 @@ static RestoreNativeStatus restore_entry_regular(
             size_t skipped_security = 0;
             int failed = apply_fd_metadata_tail(dst_fd, &desired_st, src_fd,
                                                 policy,
-                                                &skipped_security) != 0;
+                                                &skipped_security, NULL) != 0;
             restore_report_security_skipped(restore_report, skipped_security);
             if (close(src_fd) != 0)
                 failed = 1;
@@ -2990,7 +3190,7 @@ static RestoreNativeStatus restore_entry_regular(
             snprintf(capture_report->current_path,
                      sizeof(capture_report->current_path), "%s", logical_path);
         int failed = copy_file_contents(src_fd, dst_fd, desired_st.st_size,
-                                        capture_report) != 0;
+                                        capture_report, NULL) != 0;
 
         // collect_xattrs() reads the payload's *current* xattrs -- unlike
         // desired_st (a snapshot from an earlier pass), there is no
@@ -3000,7 +3200,7 @@ static RestoreNativeStatus restore_entry_regular(
         size_t skipped_security = 0;
         if (!failed &&
             apply_fd_metadata_tail(dst_fd, &desired_st, src_fd, policy,
-                                   &skipped_security) != 0)
+                                   &skipped_security, NULL) != 0)
             failed = 1;
         restore_report_security_skipped(restore_report, skipped_security);
 
@@ -3147,7 +3347,7 @@ static RestoreNativeStatus restore_entry_directory(
             size_t skipped_security = 0;
             if (apply_fd_metadata_tail(
                     dest_dir_fd, &desired_st, source_dir_fd,
-                    metadata_policy_from_context(ctx), &skipped_security) != 0)
+                    metadata_policy_from_context(ctx), &skipped_security, NULL) != 0)
                 failed = 1;
             restore_report_security_skipped(restore_report, skipped_security);
         }

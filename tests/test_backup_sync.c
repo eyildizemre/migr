@@ -353,6 +353,63 @@ static void test_native_short_copy_refuses(void)
     remove_tree(base);
 }
 
+// A short read with no change to the source is a read anomaly, not a writer
+// (D63): it fails the portable capture instead of being kept as read.
+static void test_portable_short_copy_refuses(void)
+{
+    printf(":: portable capture rejects a short source read\n");
+    char base[PATH_MAX];
+    char source_dir[PATH_MAX];
+    char scratch[PATH_MAX];
+    char container[PATH_MAX];
+    char source[PATH_MAX];
+    make_base(base, sizeof(base));
+    join_path(source_dir, sizeof(source_dir), base, "source");
+    join_path(scratch, sizeof(scratch), base, "scratch");
+    join_path(container, sizeof(container), base, "container");
+    make_directory(source_dir);
+    make_directory(scratch);
+    make_directory(container);
+    join_path(source, sizeof(source), source_dir, "payload");
+    write_bytes(source, 80);
+
+    int scratch_fd = open_directory(scratch);
+    int container_fd = open_directory(container);
+    PortableRootSpec root = {
+        .id = "ROOT",
+        .policy = ROOT_POLICY_HOME_RELATIVE,
+        .capture_path = source_dir,
+        .payload_path = "ROOT",
+        .source_path = source_dir,
+        .restore_path = "",
+        .has_restore_path = 1
+    };
+    PortableCaptureRequest request = portable_request(&root);
+    PortablePreparedCapture prepared = {0};
+    BackupCaptureReport report;
+    backup_capture_report_init(&report);
+    int result = -1;
+    short_read_triggered = 0;
+    if (portable_capture_prepare(scratch_fd, &request, &prepared) == 0)
+    {
+        size_t live_count = 0;
+        short_read_enabled = 1;
+        result = portable_capture_fresh_prepared_at(
+            container_fd, &request, &prepared, &live_count, &report);
+        short_read_enabled = 0;
+    }
+    portable_prepared_capture_free(&prepared);
+    close_fixture_fd(scratch_fd);
+    close_fixture_fd(container_fd);
+    check(short_read_triggered && result != 0 &&
+              report.failure_kind == BACKUP_CAPTURE_FAILURE_OPERATIONAL &&
+              report.failure_errno == EIO &&
+              !backup_capture_report_has_changes(&report),
+          "a short read with an unchanged source fails instead of being kept "
+          "as a changed file");
+    remove_tree(base);
+}
+
 static void test_native_eintr_read_retries(void)
 {
     printf(":: native capture retries a read() interrupted by EINTR\n");
@@ -483,6 +540,7 @@ int main(void)
 {
     test_native_sync();
     test_native_short_copy_refuses();
+    test_portable_short_copy_refuses();
     test_native_eintr_read_retries();
     test_portable_sync();
     return failures == 0 ? 0 : 1;

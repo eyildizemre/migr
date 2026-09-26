@@ -2164,8 +2164,12 @@ static void test_capture_source_plan_mismatch(const char *base)
         join_path(removed, sizeof(removed), source_path, "foo");
         if (unlink(removed) != 0)
             fixture_fatal("could not remove the planned collision member");
-        check(portable_capture_root(&context, &root) != 0,
-              "a planned collision member disappearing aborts capture");
+        struct stat kept;
+        check(portable_capture_root(&context, &root) == 0 &&
+                  fstatat(context.data_fd, "CASE/Foo", &kept,
+                          AT_SYMLINK_NOFOLLOW) == 0,
+              "a planned collision member that disappears is left out and "
+              "the rest is captured");
     }
     portable_prescan_report_free(&report);
     close_live_capture(container_fd, &log, &context);
@@ -2193,8 +2197,9 @@ static void test_capture_source_plan_mismatch(const char *base)
         struct stat st;
         int late_absent = fstatat(context.data_fd, "CASE/late", &st,
                                   AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT;
-        check(capture_result != 0 && late_absent,
-              "a new ordinary source child absent from prepared membership is rejected before that payload is created");
+        check(capture_result == 0 && late_absent,
+              "a source child that appears after the pre-scan is left out, "
+              "never written under an unplanned name");
     }
     portable_prescan_report_free(&report);
     close_live_capture(container_fd, &log, &context);
@@ -2335,10 +2340,14 @@ static void test_prepared_missing_member_precedes_relocation(const char *base)
     SidecarLog log = {0};
     int adopted = sidecar_log_adopt_at(container_fd, &log) ==
                   SIDECAR_OPEN_RESUMABLE;
-    check(resume_result != 0 && old_lower && relocated_absent && old_plain &&
-              adopted && live_entry_identity(&log, "CASE", "foo", "foo", "") &&
-              live_entry_identity(&log, "CASE", "plain", "plain", ""),
-          "a missing prepared member aborts before relocation or stale cleanup mutates old state");
+    SidecarLiveView plain_view;
+    check(resume_result == 0 && !old_lower && !relocated_absent &&
+              !old_plain && adopted &&
+              live_entry_identity(&log, "CASE", "foo", "foo%7E1", "%7E1") &&
+              sidecar_log_find(&log, bytes("CASE"), bytes("plain"),
+                               &plain_view) == 0,
+          "a prepared member removed before a resume is left out while the "
+          "planned relocation still completes");
     if (adopted && sidecar_log_close(&log) != SIDECAR_STATUS_OK)
         fixture_fatal("could not close prepared-drift sidecar");
     if (prepared_ok)

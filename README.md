@@ -59,7 +59,14 @@ sudo ./migr restore <SOURCE> [--no-verify]
 ```
 
 `backup` and `restore` run as root: they ask for the sudo password once, at the
-start, and then run unattended. Under `sudo`, migr still backs up and restores
+start, and then run unattended.
+
+A backup does not stop when files change under it. A file written while it is
+read is read again; one still being written after three reads is kept as last
+read. Items removed before they could be read, or created after their folder
+was scanned, are left out. The backup still completes, lists what changed, and
+exits with status 1 instead of 0. Frequently rewritten desktop state (such as
+GNOME's file metadata) is only counted, not listed. Under `sudo`, migr still backs up and restores
 the invoking user's home and writes restored files as that user. Their
 `--dry-run` previews, and every other command, need no root.
 

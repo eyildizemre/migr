@@ -4354,3 +4354,48 @@ one's own machine.
 **Relationship:** Supersedes D38's "ordinary backup and restore remain usable
 without root privileges"; D38's identity rules (acting for the sudo-invoking
 user) are unchanged.
+
+## D63 — 2026-09-26 — A backup completes when its source changes under it
+
+**Status:** Implemented
+
+**Decision:** Native and portable capture no longer stop when the source
+changes while it is read. Each change is one of three kinds:
+
+- **Changed:** A regular file whose metadata differs after a read is read
+  again: rewound, the payload truncated, up to three reads with a 50 ms,
+  100 ms pause between them. A file stable on a later read is captured
+  cleanly with nothing reported. One still changing after the third read is
+  kept as last read: its entry records that read's metadata and length, and
+  its D59 digest covers those bytes. Directories, symlinks, and hardlinks
+  whose metadata changed while captured are kept as read.
+- **Vanished:** An item removed after it was listed (the pre-scan for
+  portable, readdir for native) is left out and not marked visited, so a
+  resuming run removes its stale payload.
+- **Appeared** (portable only): An item created after the pre-scan planned
+  its folder's names is left out; it is never written under a name the
+  pre-scan did not plan.
+
+A different kind of object at the same path is left out. For a planned
+portable member, the membership check after its root reports it as vanished
+once. A read that returns fewer bytes than the file's size while its
+metadata stays unchanged is not a writer but a read anomaly, and still fails
+the capture with EIO.
+
+The capture report counts each kind and keeps the first eight source paths.
+Backup prints them after "Backup complete" and exits with status 1 when
+anything changed. Confirmed live state (D55, D56) is tolerated as before and
+only counted. A test build can make the next native source open fail
+(`backup_test_fail_next_source_open`), since removing a source no longer
+fails a capture.
+
+**Why:** A backup of a live system sees files change: another terminal
+commits to a repository, an editor saves. Stopping the whole backup for that
+left a partial to resume, which is not how archivers behave. GNU tar warns
+"file changed as we read it" and exits 1; rsync and restic continue. Most
+writes finish within milliseconds, so a reread usually captures the file
+cleanly.
+
+**Relationship:** Generalizes D55's tolerance from live state to every path.
+Part of the live-environment design. A btrfs snapshot of the source (later)
+removes most of these cases.

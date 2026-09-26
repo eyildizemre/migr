@@ -1734,22 +1734,19 @@ static void restore_test_path(char *saved)
 
 typedef struct {
     const char *path;
-    int removed;
-} RemoveBeforeCapture;
+    int failed;
+} FailBeforeCapture;
 
-static void remove_before_capture(const char *source_path, void *context)
+// A removed source is left out without failing the backup (D63), so a
+// failed capture comes from a read error injected into the source's open.
+static void fail_before_capture(const char *source_path, void *context)
 {
-    RemoveBeforeCapture *fixture = context;
+    FailBeforeCapture *fixture = context;
     if (fixture == NULL || source_path == NULL ||
-        fixture->removed || strcmp(source_path, fixture->path) != 0)
+        fixture->failed || strcmp(source_path, fixture->path) != 0)
         return;
-
-    if (unlink(source_path) != 0)
-    {
-        printf(RED "fixture: could not remove source before capture" NC "\n");
-        exit(1);
-    }
-    fixture->removed = 1;
+    backup_test_fail_next_source_open(EIO);
+    fixture->failed = 1;
 }
 
 static void test_vscode_extension_snapshot(void)
@@ -1827,15 +1824,15 @@ static void test_vscode_extension_snapshot(void)
     // Resume identity includes scope, so a scoped partial cannot be adopted by
     // an explicit invocation. Plant the stale control into a matching explicit
     // partial instead, which exercises the same post-adoption clearing path.
-    RemoveBeforeCapture remove_fixture = { .path = explicit_source };
-    backup_test_set_capture_hook(remove_before_capture, &remove_fixture);
+    FailBeforeCapture fail_fixture = { .path = explicit_source };
+    backup_test_set_capture_hook(fail_before_capture, &fail_fixture);
     rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, explicit_paths,
                               output, sizeof(output));
     backup_test_set_capture_hook(NULL, NULL);
 
     char partial[PATH_MAX];
     int have_partial = find_partial_container_dir(target, partial, sizeof(partial));
-    check(rc != 0 && have_partial && access(explicit_source, F_OK) != 0,
+    check(rc != 0 && have_partial,
           "fixture leaves a resumable explicit partial before stale-control cleanup");
     if (have_partial)
     {
@@ -2317,6 +2314,159 @@ static void test_include_self_backup(void)
     remove_tree(target_parent);
     remove_tree(live_target);
     remove_tree(dry_target);
+}
+
+static void unlink_source_before_open(const char *source_path, void *context)
+{
+    if (strcmp(source_path, (const char *)context) == 0)
+        unlink(source_path);
+}
+
+// Rewrites the source after every read, the way a file under constant
+// writing looks to a backup.
+static void rewrite_source_after_copy(const char *source_path, void *context)
+{
+    if (strcmp(source_path, (const char *)context) == 0)
+        write_file(source_path, "rewritten while read");
+}
+
+static int rewrite_once_count;
+
+static void rewrite_source_once_after_copy(const char *source_path,
+                                           void *context)
+{
+    if (strcmp(source_path, (const char *)context) == 0 &&
+        rewrite_once_count++ == 0)
+        write_file(source_path, "rewritten once");
+}
+
+static int file_text_is(const char *path, const char *expected)
+{
+    char buffer[256];
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return 0;
+    ssize_t length = read(fd, buffer, sizeof(buffer));
+    close(fd);
+    return length == (ssize_t)strlen(expected) &&
+           memcmp(buffer, expected, (size_t)length) == 0;
+}
+
+// Native capture of a live source (D63): a vanished file is left out, a
+// file written while read is read again, and one still changing is kept as
+// last read; the backup completes either way and exits 1 when anything
+// changed.
+static void test_native_backup_of_a_changing_source(void)
+{
+    printf(BLUE "::" NC " production: a native backup completes when its source changes under it\n");
+
+    char home[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_live_home");
+    setenv("HOME", home, 1);
+    char source[PATH_MAX], stable[PATH_MAX], vanishing[PATH_MAX];
+    char busy[PATH_MAX];
+    join_path(source, sizeof(source), home, "work");
+    mkdir_p(source);
+    join_path(stable, sizeof(stable), source, "stable.txt");
+    join_path(vanishing, sizeof(vanishing), source, "vanishing.txt");
+    join_path(busy, sizeof(busy), source, "busy.txt");
+    write_file(stable, "stable");
+    write_file(vanishing, "about to go");
+    write_file(busy, "original");
+    char *paths[] = { source, NULL };
+    dry_run = 0;
+
+    char target[PATH_MAX], container[PATH_MAX], payload[PATH_MAX];
+    char output[8192];
+    fresh_mkdtemp(target, sizeof(target), "plan_live_vanish");
+    backup_test_set_capture_hook(unlink_source_before_open, vanishing);
+    int rc = run_backup_capturing_with_options(
+        target, BACKUP_EXPLICIT_PATHS, paths, 0, 0, output, sizeof(output));
+    backup_test_set_capture_hook(NULL, NULL);
+    int found = find_container_dir(target, container, sizeof(container));
+    if (found)
+        join_path(payload, sizeof(payload), container,
+                  "data/EXPLICIT_0/vanishing.txt");
+    check(rc == 1 && found && access(payload, F_OK) != 0 &&
+              strstr(output, "Backup complete") != NULL &&
+              strstr(output, "1 item removed before it could be read") !=
+                  NULL &&
+              strstr(output, vanishing) != NULL,
+          "a file removed before it is read is left out, listed, and the "
+          "backup still completes with status 1");
+
+    write_file(vanishing, "back again");
+    fresh_mkdtemp(target, sizeof(target), "plan_live_busy");
+    backup_test_set_after_copy_hook(rewrite_source_after_copy, busy);
+    rc = run_backup_capturing_with_options(
+        target, BACKUP_EXPLICIT_PATHS, paths, 0, 0, output, sizeof(output));
+    backup_test_set_after_copy_hook(NULL, NULL);
+    found = find_container_dir(target, container, sizeof(container));
+    if (found)
+        join_path(payload, sizeof(payload), container,
+                  "data/EXPLICIT_0/busy.txt");
+    check(rc == 1 && found && file_text_is(payload, "rewritten while read") &&
+              strstr(output, "1 file kept as last read") != NULL &&
+              strstr(output, busy) != NULL,
+          "a file still changing after every reread is kept as last read "
+          "and listed");
+
+    write_file(busy, "original");
+    fresh_mkdtemp(target, sizeof(target), "plan_live_once");
+    rewrite_once_count = 0;
+    backup_test_set_after_copy_hook(rewrite_source_once_after_copy, busy);
+    rc = run_backup_capturing_with_options(
+        target, BACKUP_EXPLICIT_PATHS, paths, 0, 0, output, sizeof(output));
+    backup_test_set_after_copy_hook(NULL, NULL);
+    found = find_container_dir(target, container, sizeof(container));
+    if (found)
+        join_path(payload, sizeof(payload), container,
+                  "data/EXPLICIT_0/busy.txt");
+    check(rc == 0 && found && file_text_is(payload, "rewritten once") &&
+              strstr(output, "changed while they were being backed up") ==
+                  NULL,
+          "a file written once while it is read is read again and captured "
+          "cleanly, with status 0");
+
+    // Resume: a file captured by an interrupted run and removed before the
+    // resuming run reads it must not keep its stale payload.
+    char first_root[PATH_MAX], second_root[PATH_MAX], captured[PATH_MAX];
+    join_path(first_root, sizeof(first_root), home, "resume_dir");
+    mkdir_p(first_root);
+    join_path(captured, sizeof(captured), first_root, "captured.txt");
+    write_file(captured, "captured by the first run");
+    join_path(second_root, sizeof(second_root), home, "resume_file.txt");
+    write_file(second_root, "fails in the first run");
+    char *resume_paths[] = { first_root, second_root, NULL };
+    fresh_mkdtemp(target, sizeof(target), "plan_live_resume");
+    FailBeforeCapture fail_fixture = { .path = second_root };
+    backup_test_set_capture_hook(fail_before_capture, &fail_fixture);
+    rc = run_backup_capturing_with_options(
+        target, BACKUP_EXPLICIT_PATHS, resume_paths, 0, 0, output,
+        sizeof(output));
+    backup_test_set_capture_hook(NULL, NULL);
+    char partial[PATH_MAX];
+    int have_partial = find_partial_container_dir(target, partial,
+                                                  sizeof(partial));
+    if (have_partial)
+        join_path(payload, sizeof(payload), partial,
+                  "data/EXPLICIT_0/captured.txt");
+    check(rc != 0 && have_partial && access(payload, F_OK) == 0,
+          "fixture: an interrupted run leaves a partial holding the first "
+          "root's file");
+    backup_test_set_capture_hook(unlink_source_before_open, captured);
+    rc = run_backup_capturing_with_options(
+        target, BACKUP_EXPLICIT_PATHS, resume_paths, 0, 0, output,
+        sizeof(output));
+    backup_test_set_capture_hook(NULL, NULL);
+    found = find_container_dir(target, container, sizeof(container));
+    if (found)
+        join_path(payload, sizeof(payload), container,
+                  "data/EXPLICIT_0/captured.txt");
+    check(rc == 1 && found && access(payload, F_OK) != 0 &&
+              strstr(output, "Resuming an interrupted backup") != NULL,
+          "a resumed backup drops the stale payload of a file that vanished "
+          "before it was read");
 }
 
 static void test_include_network_config_backup(void)
@@ -3646,6 +3796,7 @@ int main(void)
     test_allocation_aware_estimate();
     test_destination_space_preflight();
     test_include_self_backup();
+    test_native_backup_of_a_changing_source();
     test_include_network_config_backup();
     test_portable_prescan_failure_diagnostics();
     test_portable_sidecar_readback();

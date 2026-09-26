@@ -251,10 +251,35 @@ static void record_portable_progress(off_t bytes_copied,
     trace->count++;
 }
 
-static void rewrite_source_after_payload_write(void *userdata)
+// A writer that never stops: rewrites the file after every read, re-arming
+// the one-shot hook each time.
+static void rewrite_source_every_read(void *userdata)
 {
-    const char *path = userdata;
-    write_file(path, "changed-after-payload-copy");
+    write_file((const char *)userdata, "changed-after-payload-copy");
+    portable_capture_test_set_after_payload_write_hook(
+        rewrite_source_every_read, userdata);
+}
+
+static int rewrite_once_calls;
+
+// A writer that finishes while the first read runs, as a git commit or an
+// editor save does.
+static void rewrite_source_once(void *userdata)
+{
+    if (rewrite_once_calls++ == 0)
+        write_file((const char *)userdata, "rewritten once");
+}
+
+static int file_contains(const char *path, const char *expected)
+{
+    char buffer[256];
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return 0;
+    ssize_t length = read(fd, buffer, sizeof(buffer));
+    close(fd);
+    return length == (ssize_t)strlen(expected) &&
+           memcmp(buffer, expected, (size_t)length) == 0;
 }
 
 typedef enum {
@@ -300,7 +325,7 @@ static int run_live_case(const char *dir, LiveCase live_case,
         write_file(appeared, "new");
     if (live_case == LIVE_CASE_CHANGE_DURING_COPY)
         portable_capture_test_set_after_payload_write_hook(
-            rewrite_source_after_payload_write, churn);
+            rewrite_source_every_read, churn);
     backup_capture_report_init(report);
     *live_count = 0;
     if (result == 0)
@@ -337,16 +362,26 @@ static void test_live_state_changes_are_tolerated(void)
 
     result = run_live_case("gvfs-metadata-x", LIVE_CASE_VANISH, &report,
                            &live_count);
-    check(result != 0 &&
-              report.failure_kind == BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED &&
-              report.live_state_changes == 0,
-          "a similarly named path outside the live list still aborts");
+    check(result == 0 && report.live_state_changes == 0 &&
+              report.source_changes[BACKUP_SOURCE_VANISHED].count == 1 &&
+              live_count == 3U,
+          "outside the live list, a vanished file is left out and reported");
+
+    result = run_live_case("gvfs-metadata-x", LIVE_CASE_APPEAR, &report,
+                           &live_count);
+    check(result == 0 && report.live_state_changes == 0 &&
+              report.source_changes[BACKUP_SOURCE_APPEARED].count == 1 &&
+              live_count == 4U,
+          "outside the live list, a file that appeared is left out and "
+          "reported");
 
     result = run_live_case("gvfs-metadata-x", LIVE_CASE_CHANGE_DURING_COPY,
                            &report, &live_count);
-    check(result != 0 &&
-              report.failure_kind == BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED,
-          "a change during copy outside the live list still aborts");
+    check(result == 0 && report.live_state_changes == 0 &&
+              report.source_changes[BACKUP_SOURCE_CHANGED].count == 1 &&
+              live_count == 4U,
+          "outside the live list, a file changing on every read is kept as "
+          "last read and reported");
 }
 
 static void test_prepared_capture_reports_progress(void)
@@ -468,12 +503,13 @@ static void test_prepared_capture_reports_failure_reason(void)
         ? portable_capture_fresh_prepared_at(
               container_fd, &request, &prepared, NULL, &capture_report)
         : -1;
-    check(capture_result != 0 &&
-              capture_report.failure_kind ==
-                  BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED &&
-              capture_report.failure_errno == 0 &&
-              strcmp(capture_report.failed_source_path, "file") == 0,
-          "a source-plan drift reports the changed logical path explicitly");
+    const BackupSourceChangeList *vanished =
+        &capture_report.source_changes[BACKUP_SOURCE_VANISHED];
+    check(capture_result == 0 && vanished->count == 1 &&
+              vanished->example_count == 1 &&
+              strcmp(vanished->examples[0], source_file) == 0,
+          "a prepared member removed before capture is left out and reported "
+          "by its source path");
 
     portable_prepared_capture_free(&prepared);
     if (close(scratch_fd) != 0 || close(container_fd) != 0)
@@ -498,22 +534,63 @@ static void test_prepared_capture_reports_failure_reason(void)
     prepare_result = portable_capture_prepare(scratch_fd, &request, &prepared);
     backup_capture_report_init(&capture_report);
     portable_capture_test_set_after_payload_write_hook(
-        rewrite_source_after_payload_write, source_file);
+        rewrite_source_every_read, source_file);
     capture_result = prepare_result == 0
         ? portable_capture_fresh_prepared_at(
               container_fd, &request, &prepared, NULL, &capture_report)
         : -1;
     portable_capture_test_set_after_payload_write_hook(NULL, NULL);
-    check(capture_result != 0 &&
-              capture_report.failure_kind ==
-                  BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED &&
-              capture_report.failure_errno == 0 &&
-              strcmp(capture_report.failed_source_path, "file") == 0,
-          "a source mutated during payload capture reports the changed path");
+    const BackupSourceChangeList *changed =
+        &capture_report.source_changes[BACKUP_SOURCE_CHANGED];
+    char payload[PATH_MAX];
+    join_path(payload, sizeof(payload), container, "data/ROOT/file");
+    check(capture_result == 0 && changed->count == 1 &&
+              strcmp(changed->examples[0], source_file) == 0 &&
+              file_contains(payload, "changed-after-payload-copy") &&
+              backup_capture_report_has_changes(&capture_report),
+          "a file still changing after every reread is kept as last read and "
+          "reported");
 
     portable_prepared_capture_free(&prepared);
     if (close(scratch_fd) != 0 || close(container_fd) != 0)
         fixture_fatal("could not close mid-copy source-change fixture");
+    remove_tree(base);
+
+    make_base(base, sizeof(base));
+    join_path(source, sizeof(source), base, "source");
+    join_path(scratch, sizeof(scratch), base, "scratch");
+    join_path(container, sizeof(container), base, "container");
+    join_path(source_file, sizeof(source_file), source, "file");
+    make_directory(source);
+    make_directory(scratch);
+    make_directory(container);
+    write_file(source_file, "stable-before-copy");
+
+    root = root_spec("ROOT", source, "ROOT");
+    request = request_for(&root, 1, 1);
+    scratch_fd = open_directory(scratch);
+    container_fd = open_directory(container);
+    memset(&prepared, 0, sizeof(prepared));
+    prepare_result = portable_capture_prepare(scratch_fd, &request, &prepared);
+    backup_capture_report_init(&capture_report);
+    rewrite_once_calls = 0;
+    portable_capture_test_set_after_payload_write_hook(rewrite_source_once,
+                                                       source_file);
+    capture_result = prepare_result == 0
+        ? portable_capture_fresh_prepared_at(
+              container_fd, &request, &prepared, NULL, &capture_report)
+        : -1;
+    portable_capture_test_set_after_payload_write_hook(NULL, NULL);
+    join_path(payload, sizeof(payload), container, "data/ROOT/file");
+    check(capture_result == 0 && rewrite_once_calls == 1 &&
+              !backup_capture_report_has_changes(&capture_report) &&
+              file_contains(payload, "rewritten once"),
+          "a file written once while it is read is read again and captured "
+          "as it now is, with nothing to report");
+
+    portable_prepared_capture_free(&prepared);
+    if (close(scratch_fd) != 0 || close(container_fd) != 0)
+        fixture_fatal("could not close rewrite-once fixture");
     remove_tree(base);
 
     make_base(base, sizeof(base));

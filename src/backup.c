@@ -668,6 +668,42 @@ static void print_portable_prescan_failure(const PortablePrescanReport *report,
                 target, outcome);
 }
 
+static void print_source_change_list(const BackupSourceChangeList *list,
+                                     const char *singular,
+                                     const char *plural)
+{
+    if (list->count == 0)
+        return;
+    printf("  %zu %s:\n", list->count, list->count == 1 ? singular : plural);
+    for (size_t index = 0; index < list->example_count; index++)
+        printf("    %s\n", list->examples[index]);
+    if (list->count > list->example_count)
+        printf("    ... and %zu more\n", list->count - list->example_count);
+}
+
+// Lists what changed under the backup (D63); returns whether anything did.
+static int print_source_changes(const BackupCaptureReport *report)
+{
+    if (!backup_capture_report_has_changes(report))
+        return 0;
+    printf("\n");
+    fflush(stdout);
+    print_warning("Some files changed while they were being backed up:\n");
+    print_source_change_list(
+        &report->source_changes[BACKUP_SOURCE_CHANGED],
+        "file kept as last read; it was still being written",
+        "files kept as last read; they were still being written");
+    print_source_change_list(
+        &report->source_changes[BACKUP_SOURCE_VANISHED],
+        "item removed before it could be read; not in this backup",
+        "items removed before they could be read; not in this backup");
+    print_source_change_list(
+        &report->source_changes[BACKUP_SOURCE_APPEARED],
+        "item created after its folder was scanned; not in this backup",
+        "items created after their folder was scanned; not in this backup");
+    return 1;
+}
+
 static void print_portable_capture_failure(const BackupCaptureReport *report)
 {
     const char *path = report != NULL && report->failed_source_path[0] != '\0'
@@ -2980,6 +3016,8 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
         }
     }
 
+    BackupCaptureReport capture_report;
+    backup_capture_report_init(&capture_report);
     if (!had_error)
     {
         printf("Backing up to: %s/%s\n", target, container_current_name(&container));
@@ -2987,8 +3025,6 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
             printf("Resuming an interrupted backup of the same job.\n");
         printf("\n");
 
-        BackupCaptureReport capture_report;
-        backup_capture_report_init(&capture_report);
         capture_report.sync_interval_bytes = BACKUP_SYNC_INTERVAL_BYTES;
         BackupProgressDisplay progress_display = {
             .estimated_total_bytes = estimate_had_error || raw_estimate_had_error
@@ -3283,7 +3319,9 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
     if (include_network_config)
         print_network_config_completion(network_config_processed_mask, target,
                                         container_current_name(&container));
-    finish_result = 0;
+    // A source that changed under the backup does not fail it, but the run
+    // ends with the list and a warning status (D63).
+    finish_result = print_source_changes(&capture_report) ? 1 : 0;
 
 finish:
     if (self_fd >= 0)

@@ -3,6 +3,7 @@
 #include "metadata.h"
 #include "report.h"
 #include "utils.h"
+#include <errno.h>
 #include <fcntl.h>
 #include <ftw.h>
 #include <stdio.h>
@@ -12,25 +13,23 @@
 
 static int failures;
 static int failure_triggered;
+// A source that vanishes is left out without failing (D63), so these
+// fixtures inject a read error instead: the named path's open fails with EIO,
+// an ordinary BACKUP_CAPTURE_ERROR, right as capture reaches it.
 static void remove_child_before_open(const char *path, void *context)
 {
     if (strcmp(path, context) != 0) return;
-    if (unlink("Documents/alias") == 0 && rmdir("Documents") == 0)
-        failure_triggered = 1;
+    backup_test_fail_next_source_open(EIO);
+    failure_triggered = 1;
 }
-// D2/D3 fixture: generalizes the trick above to an arbitrary root path,
-// so a root that is neither first nor last in a plan can be made to fail
-// its own directory open (ENOENT, an ordinary BACKUP_CAPTURE_ERROR) right
-// as capture_roots() reaches it.
+// D2/D3 fixture: the same failure for a root that is neither first nor last
+// in a plan, as capture_roots() reaches it.
 static void remove_root_before_open(const char *path, void *context)
 {
     const char *target = context;
     if (strcmp(path, target) != 0) return;
-    char child[PATH_MAX];
-    if ((size_t)snprintf(child, sizeof(child), "%s/note", target) >= sizeof(child))
-        return;
-    if (unlink(child) == 0 && rmdir(target) == 0)
-        failure_triggered = 1;
+    backup_test_fail_next_source_open(EIO);
+    failure_triggered = 1;
 }
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL %d: %s\n", __LINE__, #x); failures++; } } while (0)
 #define REQUIRE(x) do { if (!(x)) { perror(#x); exit(1); } } while (0)

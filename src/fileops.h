@@ -119,7 +119,10 @@ void native_restore_estimate_free(NativeRestoreEstimate *estimate);
 typedef enum {
     BACKUP_CAPTURE_ERROR = -1,
     BACKUP_CAPTURE_OK = 0,
-    BACKUP_CAPTURE_SOURCE_SAFE_READ = -2
+    BACKUP_CAPTURE_SOURCE_SAFE_READ = -2,
+    /* Internal to native capture: the source vanished or changed kind and
+     * was left out (D63). Never returned to a caller. */
+    BACKUP_CAPTURE_SKIPPED = 1
 } BackupCaptureStatus;
 
 typedef void (*BackupProgressCallback)(off_t bytes_copied,
@@ -135,6 +138,27 @@ typedef enum {
     BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED,
     BACKUP_CAPTURE_FAILURE_INTERNAL
 } BackupCaptureFailureKind;
+
+/* A source that changed under a running backup (docs/DECISIONS.md D63). The
+ * backup still completes; these are counted and summarized, and make it exit
+ * with a warning status. */
+typedef enum {
+    /* Still changing after every reread; kept as last read. */
+    BACKUP_SOURCE_CHANGED = 0,
+    /* Removed after the pre-scan, before it could be read. */
+    BACKUP_SOURCE_VANISHED,
+    /* Created after the pre-scan; not in this backup. */
+    BACKUP_SOURCE_APPEARED,
+    BACKUP_SOURCE_CHANGE_KINDS
+} BackupSourceChangeKind;
+
+#define BACKUP_SOURCE_CHANGE_EXAMPLES 8U
+
+typedef struct {
+    size_t count;
+    size_t example_count;
+    char examples[BACKUP_SOURCE_CHANGE_EXAMPLES][PATH_MAX];
+} BackupSourceChangeList;
 
 /**
  * @brief State shared by one native capture or restore across its roots.
@@ -163,9 +187,22 @@ typedef struct {
     /* Portable capture: confirmed live-state paths (D55) that changed,
      * appeared, or disappeared during capture and were tolerated. */
     size_t live_state_changes;
+    /* Every other source change, by kind (D63). */
+    BackupSourceChangeList source_changes[BACKUP_SOURCE_CHANGE_KINDS];
 } BackupCaptureReport;
 
 void backup_capture_report_init(BackupCaptureReport *report);
+/* Records one source change; location is shown as given. */
+void backup_capture_report_note_change(BackupCaptureReport *report,
+                                       BackupSourceChangeKind kind,
+                                       const char *location);
+/* Nonzero when any source change other than live state was recorded. */
+int backup_capture_report_has_changes(const BackupCaptureReport *report);
+
+/* A file still changing after this many reads is kept as last read (D63). */
+#define BACKUP_CAPTURE_READ_ATTEMPTS 3U
+/* Waits a little longer before each reread of a changing file. */
+void backup_capture_reread_pause(unsigned int attempt);
 int backup_capture_report_tick(BackupCaptureReport *report,
                                off_t chunk_size, int destination_fd);
 
@@ -174,6 +211,12 @@ typedef void (*BackupTestCaptureHook)(const char *source_path,
                                       void *context);
 
 void backup_test_set_capture_hook(BackupTestCaptureHook hook, void *context);
+/* Runs after every native read of a regular source's content; a hook that
+ * writes the source makes that read a changed one. */
+void backup_test_set_after_copy_hook(BackupTestCaptureHook hook,
+                                     void *context);
+/* Makes the next native capture source open fail with error. */
+void backup_test_fail_next_source_open(int error);
 #endif
 
 /**
