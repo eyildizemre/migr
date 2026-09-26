@@ -426,15 +426,25 @@ static void test_symlink_ownership_rejection(void)
     PortableRestoreReplayReport report;
     int result = run_orchestration(&fixture, &report, 1, "y\n");
     metadata_test_set_probe_hook(NULL, NULL);
-    // The restore privilege preflight (docs/DECISIONS.md D38 extended to
-    // restore) now catches this foreign owner before confirmation, so the
-    // post-confirmation metadata_profiles_probe() round trip this test used
-    // to rely on never runs at all.
-    check(result != 0 && metadata_test_probe_count() == 0 &&
-              report.live_count == 2 && report.applied_count == 0,
-          "foreign symlink ownership is refused before confirmation by the restore privilege preflight");
-    check(!observation.called && file_equals(sentinel, "untouched") &&
-              access(target, F_OK) != 0,
+    // Without root, the restore privilege preflight (docs/DECISIONS.md D38
+    // extended to restore) refuses this foreign owner before confirmation,
+    // so the metadata probe never runs. Root passes that preflight, and the
+    // post-confirmation probe refuses the owner instead: (uid_t)-1 cannot be
+    // applied by anyone.
+    if (geteuid() == 0)
+        check(result != 0 && metadata_test_probe_count() == 1 &&
+                  report.live_count == 2 && report.applied_count == 0 &&
+                  observation.called && observation.sentinel_untouched &&
+                  observation.target_absent,
+              "foreign symlink ownership is refused by the post-confirmation "
+              "probe");
+    else
+        check(result != 0 && metadata_test_probe_count() == 0 &&
+                  report.live_count == 2 && report.applied_count == 0 &&
+                  !observation.called,
+              "foreign symlink ownership is refused before confirmation by "
+              "the restore privilege preflight");
+    check(file_equals(sentinel, "untouched") && access(target, F_OK) != 0,
           "ownership rejection leaves no destination mutation");
     fixture_close(&fixture);
 }
@@ -2194,14 +2204,21 @@ static void test_probe_rejection(void)
     metadata_test_set_probe_hook(NULL, NULL);
     int after_fds = open_fd_count();
     int after_entries = directory_entry_count(fixture.home);
-    // The restore privilege preflight (docs/DECISIONS.md D38 extended to
-    // restore) now catches this foreign owner before confirmation, so the
-    // post-confirmation metadata_profiles_probe() round trip this test used
-    // to rely on never runs at all.
-    check(result != 0 && metadata_test_probe_count() == 0,
-          "the restore privilege preflight refuses before confirmation or probe");
-    check(!observation.called && access(target, F_OK) != 0 &&
-              file_equals(sentinel, "untouched"),
+    // As in test_symlink_ownership_rejection(): without root the privilege
+    // preflight refuses before confirmation; root confirms, and the probe
+    // refuses the owner it cannot apply.
+    if (geteuid() == 0)
+        check(result != 0 && metadata_test_probe_count() == 1 &&
+                  observation.called && observation.sentinel_untouched &&
+                  observation.target_absent,
+              "confirmation is followed by a rejecting ownership probe on an "
+              "untouched destination");
+    else
+        check(result != 0 && metadata_test_probe_count() == 0 &&
+                  !observation.called,
+              "the restore privilege preflight refuses before confirmation "
+              "or probe");
+    check(access(target, F_OK) != 0 && file_equals(sentinel, "untouched"),
           "the refusal leaves the destination untouched before replay");
     check(access(target, F_OK) != 0 && file_equals(sentinel, "untouched") &&
               before_entries >= 0 && after_entries == before_entries,
