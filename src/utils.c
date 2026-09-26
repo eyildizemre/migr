@@ -800,6 +800,9 @@ void print_help(void)
     printf("  conf                  Edit persistent critical/comprehensive selection rules\n");
     printf("  help                  Show this help\n");
     printf("\n");
+    printf("backup and restore need root: run them with sudo. Their --dry-run\n");
+    printf("previews and the other commands do not.\n");
+    printf("\n");
     printf("Scope (backup/report, mutually exclusive):\n");
     printf("  --critical            Personal content plus persistent user state (default)\n");
     printf("  --comprehensive       Everything --critical covers, plus Videos and Music\n");
@@ -831,13 +834,13 @@ void print_help(void)
     printf("      --no-verify       Skip post-copy content verification (restore only)\n");
     printf("\n");
     printf("Examples:\n");
-    printf("  ./migr backup /mnt/drive\n");
-    printf("  ./migr backup /mnt/drive --comprehensive\n");
-    printf("  ./migr backup /mnt/drive ~/Documents ~/Projects\n");
+    printf("  sudo ./migr backup /mnt/drive\n");
+    printf("  sudo ./migr backup /mnt/drive --comprehensive\n");
+    printf("  sudo ./migr backup /mnt/drive ~/Documents ~/Projects\n");
     printf("  ./migr report --critical --summary\n");
     printf("  ./migr conf\n");
     printf("  ./migr verify /mnt/drive/migr_backup_20260720_143012\n");
-    printf("  ./migr restore /mnt/drive/migr_backup_20260720_143012\n");
+    printf("  sudo ./migr restore /mnt/drive/migr_backup_20260720_143012\n");
 }
 
 static int confirm_action_with_default(const char *message, int default_yes)

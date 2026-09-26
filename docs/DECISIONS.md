@@ -4321,3 +4321,34 @@ that procedure, with the manual guesses replaced by the rules above.
 **Relationship:** Complements D51 (read-back before publishing) and D52
 (rewriting a recovered prefix). Record checksums in the journal format remain
 future work; they would turn "damaged region" into exact record ranges.
+
+## D62 — 2026-09-26 — `backup` and `restore` run as root
+
+**Status:** Implemented
+
+**Decision:** The CLI refuses `backup` and `restore` without root, with the
+command to rerun under `sudo`. Their `--dry-run` previews, and `report`,
+`verify`, `repair`, and `conf`, keep running without root. Under `sudo`,
+migr still acts for the invoking user (D38). The check lives in the CLI
+only: library entry points keep their own privilege checks (the restore
+preflight's "needs root" refusal). The integration suite links a build of
+the CLI compiled with `MIGR_ALLOW_UNPRIVILEGED`, which skips only this check,
+so it can drive both commands as an ordinary user. Phase 9 checks the real
+binary's refusal.
+
+**Why:** A non-root restore reached `sudo dnf install` and `sudo nmcli` only
+after it had copied everything, so an unattended run could stop at a password
+prompt hours in. Root is also what makes the rest of the live-environment
+design possible:
+- a btrfs snapshot of the source
+- reading files inside HOME owned by other uids (Podman's subuid-owned
+  storage)
+- restoring ownership and SELinux labels consistently
+
+Tools doing the same job (Timeshift, snapper, Migration Assistant, package
+managers) require administrator rights, and a distro hop always happens on
+one's own machine.
+
+**Relationship:** Supersedes D38's "ordinary backup and restore remain usable
+without root privileges"; D38's identity rules (acting for the sudo-invoking
+user) are unchanged.

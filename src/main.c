@@ -83,6 +83,24 @@ static int run_scoped_report(BackupMode mode, int summary, ReportDepth depth)
     return result;
 }
 
+// backup and restore run as root (docs/DECISIONS.md D62): one password up
+// front, then nothing stops to ask again. A dry run only reads, so it stays
+// available without root. The integration suite links a build that skips
+// this check, so it can exercise both commands without sudo.
+static int require_root(const char *command)
+{
+#ifdef MIGR_ALLOW_UNPRIVILEGED
+    (void)command;
+    return 0;
+#else
+    if (dry_run || geteuid() == 0)
+        return 0;
+    print_error("Error: '%s' needs root. Rerun the same migr command with "
+                "sudo.\n", command);
+    return -1;
+#endif
+}
+
 static int parse_report_depth(const char *argument, ReportDepth *depth)
 {
     if (argument[0] == '\0')
@@ -328,6 +346,11 @@ int main(int argc, char *argv[])
                 ret = 1;
                 break;
             }
+            if (require_root("backup") != 0)
+            {
+                ret = 1;
+                break;
+            }
             if (mode == BACKUP_EXPLICIT_PATHS)
                 ret = backup(path, mode, user_paths, include_self,
                              include_network_config);
@@ -354,6 +377,11 @@ int main(int argc, char *argv[])
             if (user_paths[0] != NULL)
             {
                 print_error("Error: restore does not accept additional paths.\n");
+                ret = 1;
+                break;
+            }
+            if (require_root("restore") != 0)
+            {
                 ret = 1;
                 break;
             }

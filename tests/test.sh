@@ -22,6 +22,11 @@ CASEFOLD_LOOP=""
 # phase just needs *a* package list to exist. So the suite runs with stubs ahead
 # of the real tools on PATH, and Phase 5 restores REAL_PATH to exercise the
 # genuine one exactly once.
+# backup and restore require root (docs/DECISIONS.md D62). The suite drives a
+# build that skips only that check, so it runs as an ordinary user; Phase 9
+# checks the real binary's refusal.
+MIGR="${MIGR:-./migr-unprivileged}"
+
 STUB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/stubs" && pwd)"
 export REAL_PATH="$PATH"
 export PATH="$STUB_DIR:$PATH"
@@ -251,7 +256,7 @@ test_report() {
     local depth_zero depth_two depth_root summary_depth
     local critical_root_count comprehensive_root_count default_root_count
     local raw_status_calls captured_output default_total without_browser
-    output=$(../migr report)
+    output=$("$MIGR" report)
 
     raw_status_calls=$(grep -nE 'printf\("Error: |printf\("Warning: ' \
         ../src/*.c || true)
@@ -264,7 +269,7 @@ test_report() {
     fi
 
     if captured_output=$(HOME="$TEST_DIR/missing-home" \
-        ../migr report --critical 2>&1); then
+        "$MIGR" report --critical 2>&1); then
         echo -e "  ${RED}✗${NC} Missing HOME unexpectedly allowed report execution."
         exit 1
     elif [[ "$captured_output" == *$'\033['* ]]; then
@@ -281,7 +286,7 @@ test_report() {
 
     # Default entry points must select the same roots and presentation as critical.
     default_output="$output"
-    bare_output=$(../migr)
+    bare_output=$("$MIGR")
     if [ "$default_output" = "$bare_output" ]; then
         echo -e "  ${GREEN}✓${NC} No-flag report output remains byte-for-byte stable."
     else
@@ -289,7 +294,7 @@ test_report() {
         exit 1
     fi
 
-    critical_output=$(../migr report --critical)
+    critical_output=$("$MIGR" report --critical)
     if [ "$default_output" != "$critical_output" ]; then
         echo -e "  ${RED}✗${NC} Default report differs from explicit critical report."
         exit 1
@@ -317,7 +322,7 @@ test_report() {
     printf 'depth two\n' > "$depth_root/level1/level2/file.txt"
     printf 'depth leaf\n' > "$depth_root/level1/level2/leaf/file.txt"
 
-    critical_verbose=$(../migr report --critical -v)
+    critical_verbose=$("$MIGR" report --critical -v)
     assert_contains "$critical_verbose" "($HOME/Documents)"
     assert_contains "$critical_verbose" "($depth_root)"
     assert_not_contains "$critical_verbose" "($depth_root/level1)"
@@ -330,7 +335,7 @@ test_report() {
         echo -e "  ${RED}✗${NC} Critical verbose printed the Documents root $critical_root_count times."
         exit 1
     fi
-    comprehensive_verbose=$(../migr report --comprehensive -v)
+    comprehensive_verbose=$("$MIGR" report --comprehensive -v)
     assert_contains "$comprehensive_verbose" "($HOME/Documents)"
     assert_contains "$comprehensive_verbose" "($depth_root)"
     assert_not_contains "$comprehensive_verbose" "Measuring:"
@@ -341,7 +346,7 @@ test_report() {
         echo -e "  ${RED}✗${NC} Comprehensive verbose printed the Documents root $comprehensive_root_count times."
         exit 1
     fi
-    default_verbose=$(../migr report -v)
+    default_verbose=$("$MIGR" report -v)
     if [ "$default_verbose" != "$critical_verbose" ]; then
         echo -e "  ${RED}✗${NC} Default verbose report differs from explicit critical report."
         exit 1
@@ -357,32 +362,32 @@ test_report() {
         exit 1
     fi
 
-    depth_zero=$(../migr report --critical --max-depth=0)
+    depth_zero=$("$MIGR" report --critical --max-depth=0)
     assert_contains "$depth_zero" "($HOME/Documents)"
     assert_not_contains "$depth_zero" "($depth_root)"
-    depth_two=$(../migr report --critical --max-depth=2)
+    depth_two=$("$MIGR" report --critical --max-depth=2)
     assert_contains "$depth_two" "($depth_root)"
     assert_contains "$depth_two" "($depth_root/level1)"
     assert_not_contains "$depth_two" "($depth_root/level1/level2)"
     assert_fails_with "Error: --max-depth must be a non-negative integer." \
-        ../migr report --critical --max-depth=garbage
+        "$MIGR" report --critical --max-depth=garbage
     assert_fails_with "Error: --max-depth must be a non-negative integer." \
-        ../migr report --critical --max-depth=-1
+        "$MIGR" report --critical --max-depth=-1
     assert_fails_with "Error: --max-depth must be a non-negative integer." \
-        ../migr report --critical --max-depth=full
+        "$MIGR" report --critical --max-depth=full
     assert_fails_with "Error: --max-depth applies only to 'report'." \
-        ../migr backup "$BACKUP_DIR" --max-depth=1
+        "$MIGR" backup "$BACKUP_DIR" --max-depth=1
     assert_fails_with "Error: --max-depth applies only to 'report'." \
-        ../migr restore "$BACKUP_DIR" --max-depth=1
+        "$MIGR" restore "$BACKUP_DIR" --max-depth=1
     rm -rf "$depth_root"
 
     # Make the profile contribution large enough that the human formatter cannot
     # round it away, then prove the live critical total changes when that root is
     # absent. Restore the small fixture before the remaining phases.
     printf '%4096s\n' '' > "$HOME/.profile"
-    critical_summary=$(../migr report --critical -s)
-    implicit_summary=$(../migr report --summary)
-    default_total=$(../migr | awk '/Critical estimate/ {print $NF}')
+    critical_summary=$("$MIGR" report --critical -s)
+    implicit_summary=$("$MIGR" report --summary)
+    default_total=$("$MIGR" | awk '/Critical estimate/ {print $NF}')
     if [ "$default_total" != "$critical_summary" ]; then
         echo -e "  ${RED}✗${NC} Default estimate disagrees with the critical summary."
         exit 1
@@ -394,14 +399,14 @@ test_report() {
         echo -e "  ${RED}✗${NC} Critical summary format or implicit-scope default is wrong: '$critical_summary'"
         exit 1
     fi
-    summary_verbose=$(../migr report --critical -s -v)
+    summary_verbose=$("$MIGR" report --critical -s -v)
     if [ "$summary_verbose" = "$critical_summary" ]; then
         echo -e "  ${GREEN}✓${NC} Summary suppresses verbose detail."
     else
         echo -e "  ${RED}✗${NC} Summary and summary+verbose outputs differ."
         exit 1
     fi
-    summary_depth=$(../migr report --critical -s --max-depth=2)
+    summary_depth=$("$MIGR" report --critical -s --max-depth=2)
     if [ "$summary_depth" = "$critical_summary" ]; then
         echo -e "  ${GREEN}✓${NC} Summary suppresses an explicit max-depth breakdown."
     else
@@ -409,8 +414,8 @@ test_report() {
         exit 1
     fi
     mv "$HOME/.profile" "$HOME/.profile.report-test"
-    without_profile=$(../migr report --critical -s)
-    default_total=$(../migr report | awk '/Critical estimate/ {print $NF}')
+    without_profile=$("$MIGR" report --critical -s)
+    default_total=$("$MIGR" report | awk '/Critical estimate/ {print $NF}')
     if [ "$default_total" != "$without_profile" ]; then
         echo -e "  ${RED}✗${NC} Default report disagrees after removing .profile."
         exit 1
@@ -426,10 +431,10 @@ test_report() {
     # Use a visible size delta to verify browser contents affect the estimate,
     # rather than merely checking that a browser heading is printed.
     printf '%65536s' '' > "$HOME/.mozilla/firefox/profile/report-size.bin"
-    critical_summary=$(../migr report --critical -s)
-    default_total=$(../migr | awk '/Critical estimate/ {print $NF}')
+    critical_summary=$("$MIGR" report --critical -s)
+    default_total=$("$MIGR" | awk '/Critical estimate/ {print $NF}')
     rm "$HOME/.mozilla/firefox/profile/report-size.bin"
-    without_browser=$(../migr report --summary)
+    without_browser=$("$MIGR" report --summary)
     if [ "$default_total" != "$critical_summary" ] || \
        [ "$without_browser" = "$critical_summary" ]; then
         echo -e "  ${RED}✗${NC} Browser contents are missing from the default critical estimate."
@@ -437,7 +442,7 @@ test_report() {
     fi
     echo -e "  ${GREEN}✓${NC} Browser contents contribute to default and explicit critical totals."
 
-    comprehensive_output=$(../migr report --comprehensive)
+    comprehensive_output=$("$MIGR" report --comprehensive)
     assert_contains "$comprehensive_output" "Comprehensive estimate"
     assert_contains "$comprehensive_output" "Desktop"
     assert_contains "$comprehensive_output" "Videos"
@@ -447,7 +452,7 @@ test_report() {
     assert_contains "$comprehensive_output" "Firefox"
     assert_not_contains "$comprehensive_output" ".mozilla"
     assert_not_contains "$comprehensive_output" "google-chrome"
-    comprehensive_summary=$(../migr report --comprehensive --summary)
+    comprehensive_summary=$("$MIGR" report --comprehensive --summary)
     if [[ "$comprehensive_summary" =~ ^[0-9]+(\.[0-9]+)?(B|K|M|G)$ ]]; then
         echo -e "  ${GREEN}✓${NC} Comprehensive summary is only the formatted total."
     else
@@ -460,7 +465,7 @@ test_dry_run() {
     echo -e "${BLUE}::${NC} Phase 2: --dry-run"
 
     local output plain_output verbose_output
-    output=$(../migr backup "$BACKUP_DIR" -n 2>&1)
+    output=$("$MIGR" backup "$BACKUP_DIR" -n 2>&1)
 
     assert_contains "$output" "Dry run"
 
@@ -491,7 +496,7 @@ test_dry_run() {
     fi
 
     plain_output="$output"
-    verbose_output=$(../migr backup "$BACKUP_DIR" -n -v 2>&1)
+    verbose_output=$("$MIGR" backup "$BACKUP_DIR" -n -v 2>&1)
     if [ "$plain_output" = "$verbose_output" ]; then
         echo -e "  ${GREEN}✓${NC} Native dry-run is unchanged by verbose."
     else
@@ -511,7 +516,7 @@ test_conf_public_wiring() {
     fi
     echo -e "  ${GREEN}✓${NC} Scoped report and backup preview leave missing configuration absent."
 
-    EDITOR=true VISUAL= ../migr conf
+    EDITOR=true VISUAL= "$MIGR" conf
     assert_file_exists "$config_file"
     if [ "$(stat -c '%a' "$config_dir")" = "700" ] &&
        [ "$(stat -c '%a' "$config_file")" = "600" ] &&
@@ -523,9 +528,9 @@ test_conf_public_wiring() {
         exit 1
     fi
 
-    assert_fails_with "Error: 'conf' takes no arguments." ../migr conf extra
-    assert_fails_with "Error: 'conf' does not accept backup/report options." ../migr conf -v
-    assert_succeeds_with "Commands:" ../migr conf --help
+    assert_fails_with "Error: 'conf' takes no arguments." "$MIGR" conf extra
+    assert_fails_with "Error: 'conf' does not accept backup/report options." "$MIGR" conf -v
+    assert_succeeds_with "Commands:" "$MIGR" conf --help
 
     cat > "$config_file" <<'EOF'
 [critical]
@@ -533,10 +538,10 @@ test_conf_public_wiring() {
 Downloads
 EOF
     local report_output dry_output
-    report_output=$(../migr report --critical -v)
+    report_output=$("$MIGR" report --critical -v)
     assert_contains "$report_output" "Scope config: $config_file (1 configured rule)"
     assert_not_contains "$report_output" "($HOME/Downloads)"
-    dry_output=$(../migr backup "$BACKUP_DIR" --dry-run 2>&1)
+    dry_output=$("$MIGR" backup "$BACKUP_DIR" --dry-run 2>&1)
     assert_contains "$dry_output" "Scope config: $config_file (1 configured rule)"
     assert_contains "$dry_output" "Selection policy"
     assert_contains "$dry_output" "Excludes: $HOME/Downloads"
@@ -548,10 +553,10 @@ EOF
     [exclude]
 Documents
 EOF
-    report_output=$(../migr report --critical -v)
+    report_output=$("$MIGR" report --critical -v)
     assert_contains "$report_output" "Scope config: $config_file (1 configured rule)"
     assert_contains "$report_output" "($HOME/Documents)"
-    dry_output=$(../migr backup "$BACKUP_DIR" --dry-run 2>&1)
+    dry_output=$("$MIGR" backup "$BACKUP_DIR" --dry-run 2>&1)
     assert_contains "$dry_output" "Scope config: $config_file (1 configured rule)"
     assert_contains "$dry_output" "No active exclusions for this scope."
     assert_not_contains "$dry_output" "Excludes: $HOME/Documents"
@@ -564,7 +569,7 @@ ConfiguredOnly
 
 [comprehensive]
 EOF
-    report_output=$(../migr report --comprehensive -v)
+    report_output=$("$MIGR" report --comprehensive -v)
     assert_contains "$report_output" "Scope config: $config_file (1 configured rule)"
     assert_contains "$report_output" "($HOME/ConfiguredOnly)"
 
@@ -572,11 +577,11 @@ EOF
 [critical]
 broken-value
 EOF
-    assert_fails_with "path outside include/exclude section" ../migr
-    assert_fails_with "path outside include/exclude section" ../migr report --comprehensive
+    assert_fails_with "path outside include/exclude section" "$MIGR"
+    assert_fails_with "path outside include/exclude section" "$MIGR" report --comprehensive
 
     local blocked_dest="$TEST_DIR/conf-blocked-dest"
-    assert_fails_with "path outside include/exclude section" ../migr backup "$blocked_dest"
+    assert_fails_with "path outside include/exclude section" "$MIGR" backup "$blocked_dest"
     if [ -e "$blocked_dest" ]; then
         echo -e "  ${RED}✗${NC} Malformed config reached destination mutation."
         exit 1
@@ -587,15 +592,15 @@ EOF
     local explicit_dest="$TEST_DIR/conf-explicit-dest"
     mkdir -p "$explicit_source" "$explicit_dest"
     printf 'config bypass\n' > "$explicit_source/file.txt"
-    ../migr backup "$explicit_dest" "$explicit_source" >/dev/null
+    "$MIGR" backup "$explicit_dest" "$explicit_source" >/dev/null
     local explicit_container
     explicit_container=$(sole_final_container "$explicit_dest")
-    assert_succeeds_with "Dry run mode enabled" ../migr restore "$explicit_container" --dry-run
-    assert_succeeds_with "Dry run mode enabled" ../migr restore "$explicit_container" --dry-run --no-verify
-    assert_succeeds_with "Commands:" ../migr --help
+    assert_succeeds_with "Dry run mode enabled" "$MIGR" restore "$explicit_container" --dry-run
+    assert_succeeds_with "Dry run mode enabled" "$MIGR" restore "$explicit_container" --dry-run --no-verify
+    assert_succeeds_with "Commands:" "$MIGR" --help
 
     set +e
-    EDITOR=true VISUAL= ../migr conf >/dev/null 2>&1
+    EDITOR=true VISUAL= "$MIGR" conf >/dev/null 2>&1
     local invalid_conf_rc=$?
     set -e
     if [ "$invalid_conf_rc" -ne 0 ]; then
@@ -626,7 +631,7 @@ test_backup() {
 
     local output
     # -v needed: without it, individual filenames are not printed
-    output=$(../migr backup "$BACKUP_DIR" -v 2>&1)
+    output=$("$MIGR" backup "$BACKUP_DIR" -v 2>&1)
 
     assert_contains "$output" "Finalizing (syncing to disk)..."
     assert_contains "$output" "Backup complete"
@@ -729,7 +734,7 @@ test_backup() {
     local no_code_target="$TEST_DIR/no-code-backup"
     mkdir -p "$no_code_target"
     local no_code_output
-    no_code_output=$(PATH="$STUB_DIR" ../migr backup "$no_code_target" --critical 2>&1)
+    no_code_output=$(PATH="$STUB_DIR" "$MIGR" backup "$no_code_target" --critical 2>&1)
     assert_contains "$no_code_output" "Backup complete"
     assert_contains "$no_code_output" \
         "Note: no VS Code extension list was captured for this backup."
@@ -756,7 +761,7 @@ test_shell_history_consent() {
 
     local output
     output=$(printf 'n\n' | env HOME="$history_home" \
-        ../migr backup "$decline_target" --critical 2>&1)
+        "$MIGR" backup "$decline_target" --critical 2>&1)
     assert_contains "$output" ".bash_history, .zsh_history"
     assert_contains "$output" "[Y/n]"
     assert_contains "$output" "Backup cancelled; no container was created."
@@ -768,7 +773,7 @@ test_shell_history_consent() {
     fi
 
     output=$(printf 'y\n' | env HOME="$history_home" \
-        ../migr backup "$accept_target" --critical 2>&1)
+        "$MIGR" backup "$accept_target" --critical 2>&1)
     assert_contains "$output" ".bash_history, .zsh_history"
     assert_contains "$output" "Backup complete"
     local actual_backup
@@ -793,7 +798,7 @@ test_restore() {
 
     local output
     # restore() calls confirm_action() — pipe "y" to mock user interaction
-    output=$(echo "y" | ../migr restore "$actual_backup" 2>&1)
+    output=$(echo "y" | "$MIGR" restore "$actual_backup" 2>&1)
 
     assert_contains "$output" "Restore complete"
     assert_not_contains "$output" "Restored:"
@@ -828,7 +833,7 @@ test_packages() {
     # The one phase that runs the distribution's genuine listing command: every
     # assertion below is about what that command actually produces, so a stub
     # here would assert nothing at all.
-    PATH="$REAL_PATH" ../migr backup "$pkg_backup"
+    PATH="$REAL_PATH" "$MIGR" backup "$pkg_backup"
 
     local actual_backup
     actual_backup=$(sole_final_container "$pkg_backup")
@@ -925,7 +930,7 @@ test_error_propagation() {
 
     local output rc
     # `if` suppresses set -e; output is captured whether the command exits 0 or not
-    if output=$(../migr backup "$err_backup" "$HOME/locked.txt" 2>&1); then rc=0; else rc=$?; fi
+    if output=$("$MIGR" backup "$err_backup" "$HOME/locked.txt" 2>&1); then rc=0; else rc=$?; fi
     chmod 644 "$HOME/locked.txt"  # restore so teardown and later phases are unaffected
 
     if [ "$rc" -ne 0 ]; then
@@ -959,7 +964,7 @@ test_comprehensive() {
     echo "music" > "$HOME/Music/song.txt"
 
     local output
-    output=$(../migr backup "$comp_backup" --comprehensive 2>&1)
+    output=$("$MIGR" backup "$comp_backup" --comprehensive 2>&1)
 
     assert_contains "$output" "Backup complete"
 
@@ -980,7 +985,7 @@ test_explicit_paths() {
     mkdir -p "$paths_backup"
 
     local output
-    output=$(../migr backup "$paths_backup" "$HOME/Documents" 2>&1)
+    output=$("$MIGR" backup "$paths_backup" "$HOME/Documents" 2>&1)
 
     assert_contains "$output" "Backup complete"
 
@@ -1025,7 +1030,7 @@ test_explicit_paths() {
     echo A > "$HOME/dir_a/same.txt"
     echo B > "$HOME/dir_b/same.txt"
 
-    output=$(../migr backup "$trailing_backup" "$HOME/dir_a/same.txt" "$HOME/dir_b/" 2>&1)
+    output=$("$MIGR" backup "$trailing_backup" "$HOME/dir_a/same.txt" "$HOME/dir_b/" 2>&1)
     assert_contains "$output" "Backup complete"
 
     local trailing_actual
@@ -1043,7 +1048,7 @@ test_explicit_paths() {
     # because a flat layout could not represent it, now two separate roots.
     local samename_backup="$TEST_DIR/backup_paths_samename"
     mkdir -p "$samename_backup"
-    output=$(../migr backup "$samename_backup" "$HOME/dir_a/same.txt" "$HOME/dir_b/same.txt" 2>&1)
+    output=$("$MIGR" backup "$samename_backup" "$HOME/dir_a/same.txt" "$HOME/dir_b/same.txt" 2>&1)
     assert_contains "$output" "Backup complete"
 
     local samename_actual
@@ -1061,104 +1066,114 @@ test_errors() {
     echo -e "${BLUE}::${NC} Phase 9: error paths"
 
     # missing required arguments
-    assert_exits_nonzero ../migr backup
-    assert_exits_nonzero ../migr restore
-    assert_exits_nonzero ../migr restore /nonexistent/path
+    assert_exits_nonzero "$MIGR" backup
+    assert_exits_nonzero "$MIGR" restore
+    assert_exits_nonzero "$MIGR" restore /nonexistent/path
 
     # unrecognised command word
-    assert_exits_nonzero ../migr bogus
+    assert_exits_nonzero "$MIGR" bogus
 
     # the two scope flags are mutually exclusive
-    assert_exits_nonzero ../migr backup "$BACKUP_DIR" --critical --comprehensive
+    assert_exits_nonzero "$MIGR" backup "$BACKUP_DIR" --critical --comprehensive
 
     # a scope flag cannot be combined with explicit paths
-    assert_exits_nonzero ../migr backup "$BACKUP_DIR" --comprehensive "$HOME/Documents"
+    assert_exits_nonzero "$MIGR" backup "$BACKUP_DIR" --comprehensive "$HOME/Documents"
 
     # scope flags apply to backup only
-    assert_exits_nonzero ../migr restore "$BACKUP_DIR" --comprehensive
+    assert_exits_nonzero "$MIGR" restore "$BACKUP_DIR" --comprehensive
 
     # summary is a report-only presentation mode
-    assert_exits_nonzero ../migr backup "$BACKUP_DIR" --summary
-    assert_exits_nonzero ../migr restore "$BACKUP_DIR" --summary
+    assert_exits_nonzero "$MIGR" backup "$BACKUP_DIR" --summary
+    assert_exits_nonzero "$MIGR" restore "$BACKUP_DIR" --summary
 
     # dry-run is a backup/restore-only presentation mode
     assert_fails_with "Error: --dry-run applies only to 'backup' or 'restore'." \
-        ../migr report --dry-run
+        "$MIGR" report --dry-run
     assert_fails_with "Error: --dry-run applies only to 'backup' or 'restore'." \
-        ../migr --dry-run
+        "$MIGR" --dry-run
 
     # include-self is meaningful only for backup, and help documents the
     # static-binary prerequisite before a real backup can refuse it.
     assert_fails_with "Error: --include-self applies only to 'backup'." \
-        ../migr report --include-self
+        "$MIGR" report --include-self
     assert_fails_with "Error: --include-self applies only to 'backup'." \
-        ../migr restore "$BACKUP_DIR" --include-self
-    assert_succeeds_with "--include-self" ../migr --help
+        "$MIGR" restore "$BACKUP_DIR" --include-self
+    assert_succeeds_with "--include-self" "$MIGR" --help
 
     # include-network-config is meaningful only for backup.
     assert_fails_with "Error: --include-network-config applies only to 'backup'." \
-        ../migr report --include-network-config
+        "$MIGR" report --include-network-config
     assert_fails_with "Error: --include-network-config applies only to 'backup'." \
-        ../migr restore "$BACKUP_DIR" --include-network-config
-    assert_succeeds_with "--include-network-config" ../migr --help
+        "$MIGR" restore "$BACKUP_DIR" --include-network-config
+    assert_succeeds_with "--include-network-config" "$MIGR" --help
 
     # post-copy verification is a restore-only policy; preflight still runs
     # under --dry-run even though there is no copied destination to verify.
     assert_fails_with "Error: --no-verify applies only to 'restore'." \
-        ../migr report --no-verify
+        "$MIGR" report --no-verify
     assert_fails_with "Error: --no-verify applies only to 'restore'." \
-        ../migr backup "$BACKUP_DIR" --no-verify
-    assert_succeeds_with "--no-verify" ../migr --help
+        "$MIGR" backup "$BACKUP_DIR" --no-verify
+    assert_succeeds_with "--no-verify" "$MIGR" --help
+
+    # backup and restore need root; their dry runs and the other commands do not
+    if [ "$(id -u)" -ne 0 ]; then
+        assert_fails_with "Error: 'backup' needs root. Rerun the same migr command with sudo." \
+            ../migr backup "$BACKUP_DIR"
+        assert_fails_with "Error: 'restore' needs root. Rerun the same migr command with sudo." \
+            ../migr restore "$BACKUP_DIR"
+        assert_succeeds_with "Dry run complete" \
+            ../migr backup "$BACKUP_DIR" --dry-run
+    fi
 
     # commands that take exactly one positional reject extras
-    assert_exits_nonzero ../migr restore "$BACKUP_DIR" /tmp/extra
+    assert_exits_nonzero "$MIGR" restore "$BACKUP_DIR" /tmp/extra
     assert_fails_with "Usage: ./migr verify <SOURCE>" \
-        ../migr verify "$BACKUP_DIR" /tmp/extra
+        "$MIGR" verify "$BACKUP_DIR" /tmp/extra
 
     # verify checks an existing backup and takes no backup/restore options
-    assert_fails_with "Usage: ./migr verify <SOURCE>" ../migr verify
+    assert_fails_with "Usage: ./migr verify <SOURCE>" "$MIGR" verify
     assert_fails_with "Error: --dry-run applies only to 'backup' or 'restore'." \
-        ../migr verify "$BACKUP_DIR" --dry-run
+        "$MIGR" verify "$BACKUP_DIR" --dry-run
     assert_fails_with "Error: --no-verify applies only to 'restore'." \
-        ../migr verify "$BACKUP_DIR" --no-verify
-    assert_succeeds_with "verify <SOURCE>" ../migr --help
+        "$MIGR" verify "$BACKUP_DIR" --no-verify
+    assert_succeeds_with "verify <SOURCE>" "$MIGR" --help
 
     # repair reads one backup and writes its copy under exactly one PATH
-    assert_fails_with "Usage: ./migr repair <SOURCE> <PATH>" ../migr repair
+    assert_fails_with "Usage: ./migr repair <SOURCE> <PATH>" "$MIGR" repair
     assert_fails_with "Usage: ./migr repair <SOURCE> <PATH>" \
-        ../migr repair "$BACKUP_DIR"
+        "$MIGR" repair "$BACKUP_DIR"
     assert_fails_with "Usage: ./migr repair <SOURCE> <PATH>" \
-        ../migr repair "$BACKUP_DIR" /tmp /tmp/extra
+        "$MIGR" repair "$BACKUP_DIR" /tmp /tmp/extra
     assert_fails_with "Error: --dry-run applies only to 'backup' or 'restore'." \
-        ../migr repair "$BACKUP_DIR" /tmp --dry-run
-    assert_succeeds_with "repair <SOURCE> <PATH>" ../migr --help
+        "$MIGR" repair "$BACKUP_DIR" /tmp --dry-run
+    assert_succeeds_with "repair <SOURCE> <PATH>" "$MIGR" --help
 
     # report takes no arguments at all
-    assert_exits_nonzero ../migr report /tmp/somewhere
+    assert_exits_nonzero "$MIGR" report /tmp/somewhere
 
     # a missing explicit root rejects the whole invocation rather than silently
     # backing up less than was asked for
     assert_fails_with "could not resolve path" \
-        ../migr backup "$BACKUP_DIR" "$HOME/no_such_root"
+        "$MIGR" backup "$BACKUP_DIR" "$HOME/no_such_root"
 
     # overlapping roots are refused as a set, in dry-run exactly as live
     mkdir -p "$HOME/dir_a/nested"
-    assert_fails_with "overlap" ../migr backup "$BACKUP_DIR" "$HOME/dir_a" "$HOME/dir_a/nested"
-    assert_fails_with "overlap" ../migr backup "$BACKUP_DIR" "$HOME/dir_a" "$HOME/dir_a/nested" --dry-run
+    assert_fails_with "overlap" "$MIGR" backup "$BACKUP_DIR" "$HOME/dir_a" "$HOME/dir_a/nested"
+    assert_fails_with "overlap" "$MIGR" backup "$BACKUP_DIR" "$HOME/dir_a" "$HOME/dir_a/nested" --dry-run
 
     # -h/--help must win over a scope-only flag that would otherwise be
     # rejected as "applies only to backup/report" -- the user asked for help,
     # not a scope validation error.
-    assert_succeeds_with "Usage:" ../migr backup --critical --help
-    assert_succeeds_with "Usage:" ../migr report --summary --help
-    assert_succeeds_with "Usage:" ../migr report --max-depth=2 --help
-    assert_succeeds_with "Usage:" ../migr restore --include-self --help
-    assert_succeeds_with "Usage:" ../migr restore --include-network-config --help
-    assert_succeeds_with "Usage:" ../migr restore --no-verify --help
-    assert_succeeds_with "Usage:" ../migr backup --no-verify --help
-    assert_succeeds_with "Usage:" ../migr help --critical
+    assert_succeeds_with "Usage:" "$MIGR" backup --critical --help
+    assert_succeeds_with "Usage:" "$MIGR" report --summary --help
+    assert_succeeds_with "Usage:" "$MIGR" report --max-depth=2 --help
+    assert_succeeds_with "Usage:" "$MIGR" restore --include-self --help
+    assert_succeeds_with "Usage:" "$MIGR" restore --include-network-config --help
+    assert_succeeds_with "Usage:" "$MIGR" restore --no-verify --help
+    assert_succeeds_with "Usage:" "$MIGR" backup --no-verify --help
+    assert_succeeds_with "Usage:" "$MIGR" help --critical
     # ...but a genuine conflict detected before --help is even parsed still refuses.
-    assert_exits_nonzero ../migr backup --critical --comprehensive --help
+    assert_exits_nonzero "$MIGR" backup --critical --comprehensive --help
 }
 
 test_truncation() {
@@ -1174,17 +1189,17 @@ test_truncation() {
     # confirms a clean refusal rather than a crash on a NULL path. `env HOME=...`
     # sets the oversized HOME for this one command only, so it never leaks onward.
     assert_fails_with "HOME path too long" \
-        env HOME="$longhome" ../migr backup "$BACKUP_DIR" --critical
+        env HOME="$longhome" "$MIGR" backup "$BACKUP_DIR" --critical
 
     # Same guard on restore. --dry-run skips the interactive confirm yet still
     # reaches xdg_resolve before touching anything.
     mkdir -p "$TEST_DIR/dummy_src"
     assert_fails_with "HOME path too long" \
-        env HOME="$longhome" ../migr restore "$TEST_DIR/dummy_src" --dry-run
+        env HOME="$longhome" "$MIGR" restore "$TEST_DIR/dummy_src" --dry-run
 
     # Gap 3: report must not present a silent 0B estimate as success.
     assert_fails_with "HOME path too long" \
-        env HOME="$longhome" ../migr report
+        env HOME="$longhome" "$MIGR" report
 
     # Gap 2: an unusable destination must be refused in dry-run exactly as it is
     # live, so the preview can never promise a backup that would fail. Payload
@@ -1198,9 +1213,9 @@ test_truncation() {
 
     local dry live dry_out live_out
     set +e
-    dry_out=$(../migr backup "$unusable" --critical --dry-run 2>&1)
+    dry_out=$("$MIGR" backup "$unusable" --critical --dry-run 2>&1)
     dry=$?
-    live_out=$(../migr backup "$unusable" --critical 2>&1)
+    live_out=$("$MIGR" backup "$unusable" --critical 2>&1)
     live=$?
     set -e
 
@@ -1222,7 +1237,7 @@ test_truncation() {
     src="$TEST_DIR/$leaf"
     echo hi > "$src"
 
-    deep_out=$(../migr backup "$deep" "$src" 2>&1)
+    deep_out=$("$MIGR" backup "$deep" "$src" 2>&1)
     if [[ "$deep_out" == *"Backup complete"* ]] && \
        [ "$(cat "$(sole_final_container "$deep")/data/EXPLICIT_0")" = "hi" ]; then
         echo -e "  ${GREEN}✓${NC} A deep-but-valid destination backs up without a PATH_MAX join."
@@ -1260,9 +1275,9 @@ test_truncation() {
     echo prefs > "$TEST_DIR/dummy_src/.config/google-chrome/Default/Preferences"
     local deep_home_out deep_home_rc deep_home_live_out deep_home_live_rc
     set +e
-    deep_home_out=$(env HOME="$deep_home" ../migr restore "$TEST_DIR/dummy_src" --dry-run 2>&1)
+    deep_home_out=$(env HOME="$deep_home" "$MIGR" restore "$TEST_DIR/dummy_src" --dry-run 2>&1)
     deep_home_rc=$?
-    deep_home_live_out=$(printf 'y\n' | env HOME="$deep_home" ../migr restore "$TEST_DIR/dummy_src" 2>&1)
+    deep_home_live_out=$(printf 'y\n' | env HOME="$deep_home" "$MIGR" restore "$TEST_DIR/dummy_src" 2>&1)
     deep_home_live_rc=$?
     set -e
     if [ "$deep_home_rc" -eq 0 ] &&
@@ -1296,7 +1311,7 @@ test_truncation() {
 
     local too_deep_out too_deep_rc
     set +e
-    too_deep_out=$(env HOME="$too_deep_home" ../migr restore "$TEST_DIR/dummy_src" --dry-run 2>&1)
+    too_deep_out=$(env HOME="$too_deep_home" "$MIGR" restore "$TEST_DIR/dummy_src" --dry-run 2>&1)
     too_deep_rc=$?
     set -e
     if [ "$too_deep_rc" -ne 0 ] &&
@@ -1332,7 +1347,7 @@ test_truncation() {
                     XDG_STATE_HOME="$canon_state" \
                     XDG_CACHE_HOME="$canon_cache" \
                     XDG_CONFIG_HOME="$canon_config" \
-                    ../migr backup "$canon_backup" --critical 2>&1)
+                    "$MIGR" backup "$canon_backup" --critical 2>&1)
     canon_rc=$?
     set -e
 
@@ -1360,9 +1375,9 @@ test_restore_path_safety() {
 
     local dry_out dry_rc live_out live_rc
     set +e
-    dry_out=$(env HOME="$dangling_home" ../migr restore "$dangling_src" --dry-run 2>&1)
+    dry_out=$(env HOME="$dangling_home" "$MIGR" restore "$dangling_src" --dry-run 2>&1)
     dry_rc=$?
-    live_out=$(printf 'y\n' | env HOME="$dangling_home" ../migr restore "$dangling_src" 2>&1)
+    live_out=$(printf 'y\n' | env HOME="$dangling_home" "$MIGR" restore "$dangling_src" 2>&1)
     live_rc=$?
     set -e
     if [ "$dry_rc" -eq 0 ] &&
@@ -1389,9 +1404,9 @@ test_restore_path_safety() {
     ln -s "$outside_src" "$unsafe_src/.config"
 
     set +e
-    dry_out=$(env HOME="$unsafe_home" ../migr restore "$unsafe_src" --dry-run 2>&1)
+    dry_out=$(env HOME="$unsafe_home" "$MIGR" restore "$unsafe_src" --dry-run 2>&1)
     dry_rc=$?
-    live_out=$(printf 'y\n' | env HOME="$unsafe_home" ../migr restore "$unsafe_src" 2>&1)
+    live_out=$(printf 'y\n' | env HOME="$unsafe_home" "$MIGR" restore "$unsafe_src" 2>&1)
     live_rc=$?
     set -e
     if [ "$dry_rc" -ne 0 ] &&
@@ -1431,14 +1446,14 @@ ROOT ID=EXPLICIT_1 POLICY=MANUAL_NATIVE PAYLOAD=EXPLICIT_1 SOURCE=/mnt/external/
 EOF
 
     local dry_out
-    dry_out=$(env HOME="$v1_home" ../migr restore "$v1_src" --dry-run 2>&1)
+    dry_out=$(env HOME="$v1_home" "$MIGR" restore "$v1_src" --dry-run 2>&1)
     assert_contains "$dry_out" "Roots"
     assert_contains "$dry_out" "Would restore: EXPLICIT_0 -> ~/Documents/project"
     assert_contains "$dry_out" "Manual Roots"
     assert_contains "$dry_out" "/mnt/external/project"
 
     local live_out
-    live_out=$(printf 'y\n' | env HOME="$v1_home" ../migr restore "$v1_src" 2>&1)
+    live_out=$(printf 'y\n' | env HOME="$v1_home" "$MIGR" restore "$v1_src" 2>&1)
     assert_contains "$live_out" "Restore complete"
     assert_file_exists "$v1_home/Documents/project/note.txt"
     if [ "$(cat "$v1_home/Documents/project/note.txt")" = "project-note" ]; then
@@ -1459,14 +1474,14 @@ EOF
     # (docs/DECISIONS.md D15) -- an interrupted backup may be incomplete.
     local partial_src="$TEST_DIR/migr_backup_20260101_000000.partial"
     mkdir -p "$partial_src"
-    assert_fails_with "in-progress or abandoned" ../migr restore "$partial_src" --dry-run
+    assert_fails_with "in-progress or abandoned" "$MIGR" restore "$partial_src" --dry-run
 
     # An unrecognized manifest version refuses the whole restore before ever
     # reaching the confirmation prompt -- no piped "y" is needed here.
     local unknown_src="$TEST_DIR/unknown_version_src"
     mkdir -p "$unknown_src"
     printf 'MIGR_MANIFEST\nVERSION=999\n' > "$unknown_src/manifest.txt"
-    assert_fails_with "does not understand" env HOME="$v1_home" ../migr restore "$unknown_src"
+    assert_fails_with "does not understand" env HOME="$v1_home" "$MIGR" restore "$unknown_src"
 
     # packages.txt is fd-anchored: a symlinked file must never be followed into
     # an arbitrary location.
@@ -1479,7 +1494,7 @@ EOF
 
     local pkg_live_out pkg_live_rc
     set +e
-    pkg_live_out=$(printf 'y\n' | env HOME="$pkg_home" ../migr restore "$pkg_src" 2>&1)
+    pkg_live_out=$(printf 'y\n' | env HOME="$pkg_home" "$MIGR" restore "$pkg_src" 2>&1)
     pkg_live_rc=$?
     set -e
     if [ "$pkg_live_rc" -ne 0 ] &&
@@ -1519,10 +1534,10 @@ EOF
 
     local space_dry_out space_dry_rc space_live_out space_live_rc
     set +e
-    space_dry_out=$(env HOME="$space_home" ../migr restore \
+    space_dry_out=$(env HOME="$space_home" "$MIGR" restore \
         "$space_src" --dry-run 2>&1)
     space_dry_rc=$?
-    space_live_out=$(printf 'y\n' | env HOME="$space_home" ../migr \
+    space_live_out=$(printf 'y\n' | env HOME="$space_home" "$MIGR" \
         restore "$space_src" 2>&1)
     space_live_rc=$?
     set -e
@@ -1573,7 +1588,7 @@ test_xdg_nested_destination_recovery() {
     # failure for a destination that a live restore would actually create --
     # while still never creating anything itself.
     local xdg_dry_out
-    xdg_dry_out=$(env HOME="$xdg_home" ../migr restore "$xdg_src" --dry-run 2>&1)
+    xdg_dry_out=$(env HOME="$xdg_home" "$MIGR" restore "$xdg_src" --dry-run 2>&1)
     assert_contains "$xdg_dry_out" "Would restore"
     if [ -e "$xdg_home/data" ]; then
         echo -e "  ${RED}✗${NC} Dry-run created \$HOME/data while resolving the XDG destination"
@@ -1583,7 +1598,7 @@ test_xdg_nested_destination_recovery() {
     fi
 
     local xdg_out
-    xdg_out=$(printf 'y\n' | env HOME="$xdg_home" ../migr restore "$xdg_src" 2>&1)
+    xdg_out=$(printf 'y\n' | env HOME="$xdg_home" "$MIGR" restore "$xdg_src" 2>&1)
     assert_contains "$xdg_out" "Restore complete"
     assert_file_exists "$xdg_home/data/Documents/note.txt"
     if [ "$(cat "$xdg_home/data/Documents/note.txt")" = "nested-doc" ]; then
@@ -1611,7 +1626,7 @@ test_native_restore_progress() {
     local pty_output pty_rc redirected_output
     set +e
     pty_output=$(printf 'y\n' | socat - \
-        "EXEC:env HOME=$progress_home ../migr restore $progress_src,pty,setsid,ctty,echo=0" \
+        "EXEC:env HOME=$progress_home "$MIGR" restore $progress_src,pty,setsid,ctty,echo=0" \
         2>&1)
     pty_rc=$?
     set -e
@@ -1628,7 +1643,7 @@ test_native_restore_progress() {
     fi
 
     redirected_output=$(printf 'y\n' | env HOME="$redirected_home" \
-        ../migr restore "$progress_src" 2>&1)
+        "$MIGR" restore "$progress_src" 2>&1)
     if [[ "$redirected_output" != *"Restored:"* ]] &&
        [ -f "$redirected_home/Documents/progress.txt" ]; then
         echo -e "  ${GREEN}✓${NC} Native restore suppresses progress when stdout is redirected."
@@ -1647,8 +1662,8 @@ test_probe_refusal() {
     # and dry-run, before writing anything. This needs no special privilege.
     local file_dest="$TEST_DIR/not_a_dir"
     : > "$file_dest"
-    assert_fails_with "is not a directory" ../migr backup "$file_dest"
-    assert_fails_with "is not a directory" ../migr backup "$file_dest" --dry-run
+    assert_fails_with "is not a directory" "$MIGR" backup "$file_dest"
+    assert_fails_with "is not a directory" "$MIGR" backup "$file_dest" --dry-run
     rm -f "$file_dest"
 
     # The remaining cases lean on directory mode bits, which root ignores.
@@ -1663,7 +1678,7 @@ test_probe_refusal() {
     local ro_dest="$TEST_DIR/readonly_dest"
     mkdir -p "$ro_dest"
     chmod 555 "$ro_dest"
-    assert_fails_with "could not probe" ../migr backup "$ro_dest"
+    assert_fails_with "could not probe" "$MIGR" backup "$ro_dest"
     if [ ! -d "$ro_dest" ]; then
         echo -e "  ${RED}✗${NC} pre-existing read-only dest was removed on refusal"
         exit 1
@@ -1671,7 +1686,7 @@ test_probe_refusal() {
 
     # Same read-only destination under --dry-run: the probe now runs for
     # real (I-6), so it must refuse identically to the live case above.
-    assert_fails_with "could not probe" ../migr backup "$ro_dest" --dry-run
+    assert_fails_with "could not probe" "$MIGR" backup "$ro_dest" --dry-run
     if compgen -G "$ro_dest/migr_backup_*" > /dev/null; then
         echo -e "  ${RED}✗${NC} dry-run wrote a backup dir into a read-only dest"
         exit 1
@@ -1685,7 +1700,7 @@ test_probe_refusal() {
     local new_dest="$TEST_DIR/new_probe_failure"
     local nd_out nd_rc
     set +e
-    nd_out=$(umask 0222; ../migr backup "$new_dest" 2>&1)
+    nd_out=$(umask 0222; "$MIGR" backup "$new_dest" 2>&1)
     nd_rc=$?
     set -e
     if [ "$nd_rc" -eq 0 ] || [[ "$nd_out" != *"could not probe"* ]]; then
@@ -1731,7 +1746,7 @@ test_native_stale_reconciliation() {
     sr_race_pid=$!
     local sr_first_out sr_first_rc
     set +e
-    sr_first_out=$(../migr backup "$sr_dest" "$sr_keep" "$sr_broken" 2>&1)
+    sr_first_out=$("$MIGR" backup "$sr_dest" "$sr_keep" "$sr_broken" 2>&1)
     sr_first_rc=$?
     set -e
     set +e
@@ -1751,7 +1766,7 @@ test_native_stale_reconciliation() {
     rm -f "$sr_keep/gone.txt"
 
     local sr_final sr_second_out
-    sr_second_out=$(../migr backup "$sr_dest" "$sr_keep" "$sr_broken" 2>&1)
+    sr_second_out=$("$MIGR" backup "$sr_dest" "$sr_keep" "$sr_broken" 2>&1)
     sr_final=$(sole_final_container "$sr_dest")
     assert_no_partial "$sr_dest"
     if [ ! -e "$sr_final/data/EXPLICIT_0/gone.txt" ] &&
@@ -1787,7 +1802,7 @@ test_native_stale_reconciliation() {
     ) &
     local sg_race_pid=$!
     set +e
-    ../migr backup "$sg_dest" "$sg_keep" "$sg_broken" >/dev/null 2>&1
+    "$MIGR" backup "$sg_dest" "$sg_keep" "$sg_broken" >/dev/null 2>&1
     local sg_first_rc=$?
     wait "$sg_race_pid"
     local sg_first_race=$?
@@ -1814,7 +1829,7 @@ test_native_stale_reconciliation() {
     ) &
     local sg_second_race_pid=$!
     set +e
-    ../migr backup "$sg_dest" "$sg_keep" "$sg_broken" >/dev/null 2>&1
+    "$MIGR" backup "$sg_dest" "$sg_keep" "$sg_broken" >/dev/null 2>&1
     local sg_second_rc=$?
     wait "$sg_second_race_pid"
     local sg_second_race=$?
@@ -1849,7 +1864,7 @@ test_container_production() {
     local dry_dest="$TEST_DIR/cp_dry/never_created"
     mkdir -p "$TEST_DIR/cp_dry"
     local dry_out
-    dry_out=$(../migr backup "$dry_dest" --critical --dry-run 2>&1)
+    dry_out=$("$MIGR" backup "$dry_dest" --critical --dry-run 2>&1)
     if [ -e "$dry_dest" ]; then
         echo -e "  ${RED}✗${NC} Dry run created the destination root"
         exit 1
@@ -1864,10 +1879,10 @@ test_container_production() {
     # --- two consecutive backups produce two distinct finalized containers ---
     local twice="$TEST_DIR/cp_twice"
     mkdir -p "$twice"
-    ../migr backup "$twice" --critical >/dev/null 2>&1
+    "$MIGR" backup "$twice" --critical >/dev/null 2>&1
     # container names carry a whole-second timestamp; the second backup must get
     # its own container either way, via the "-N" suffix if the clock has not moved
-    ../migr backup "$twice" --critical >/dev/null 2>&1
+    "$MIGR" backup "$twice" --critical >/dev/null 2>&1
     local twice_count
     twice_count=$(containers_matching "$twice" final | grep -c . || true)
     assert_no_partial "$twice"
@@ -1889,7 +1904,7 @@ test_container_production() {
 
     local link_out link_rc link_final_count link_final
     set +e
-    link_out=$(../migr backup "$link_path" "$link_src" 2>&1)
+    link_out=$("$MIGR" backup "$link_path" "$link_src" 2>&1)
     link_rc=$?
     set -e
     link_final=$(containers_matching "$link_real" final)
@@ -1918,7 +1933,7 @@ test_container_production() {
 
         local first_out first_rc
         set +e
-        first_out=$(../migr backup "$resume_dest" "$resume_src" 2>&1)
+        first_out=$("$MIGR" backup "$resume_dest" "$resume_src" 2>&1)
         first_rc=$?
         set -e
 
@@ -1955,7 +1970,7 @@ test_container_production() {
 
         chmod 644 "$resume_src/locked.txt"
         local second_out
-        second_out=$(../migr backup "$resume_dest" "$resume_src" 2>&1)
+        second_out=$("$MIGR" backup "$resume_dest" "$resume_src" 2>&1)
 
         local resumed
         resumed=$(sole_final_container "$resume_dest")
@@ -1982,12 +1997,12 @@ test_container_production() {
         local stale_dest="$TEST_DIR/cp_stale"
         mkdir -p "$stale_dest"
         chmod 000 "$resume_src/locked.txt"
-        ../migr backup "$stale_dest" "$resume_src" >/dev/null 2>&1 || true
+        "$MIGR" backup "$stale_dest" "$resume_src" >/dev/null 2>&1 || true
         local stale_partial
         stale_partial=$(containers_matching "$stale_dest" partial)
         echo "malicious-package" > "$stale_partial/packages.txt"
         chmod 644 "$resume_src/locked.txt"
-        ../migr backup "$stale_dest" "$resume_src" >/dev/null 2>&1
+        "$MIGR" backup "$stale_dest" "$resume_src" >/dev/null 2>&1
 
         local stale_final
         stale_final=$(sole_final_container "$stale_dest")
@@ -2004,7 +2019,7 @@ test_container_production() {
         local stuck_dest="$TEST_DIR/cp_stuck"
         mkdir -p "$stuck_dest"
         chmod 000 "$resume_src/locked.txt"
-        ../migr backup "$stuck_dest" "$resume_src" >/dev/null 2>&1 || true
+        "$MIGR" backup "$stuck_dest" "$resume_src" >/dev/null 2>&1 || true
         local stuck_partial
         stuck_partial=$(containers_matching "$stuck_dest" partial)
         mkdir -p "$stuck_partial/packages.txt/stuck"
@@ -2012,7 +2027,7 @@ test_container_production() {
 
         local stuck_out stuck_rc
         set +e
-        stuck_out=$(../migr backup "$stuck_dest" "$resume_src" 2>&1)
+        stuck_out=$("$MIGR" backup "$stuck_dest" "$resume_src" 2>&1)
         stuck_rc=$?
         set -e
         if [ "$stuck_rc" -ne 0 ] &&
@@ -2029,7 +2044,7 @@ test_container_production() {
     # --- a destination inside a selected root is refused before anything runs ---
     local self_out self_rc
     set +e
-    self_out=$(../migr backup "$HOME/Documents/selfbackup" "$HOME/Documents" 2>&1)
+    self_out=$("$MIGR" backup "$HOME/Documents/selfbackup" "$HOME/Documents" 2>&1)
     self_rc=$?
     set -e
     if [ "$self_rc" -ne 0 ] && [ ! -e "$HOME/Documents/selfbackup" ] &&
@@ -2042,7 +2057,7 @@ test_container_production() {
     fi
 
     set +e
-    self_out=$(../migr backup "$HOME/Documents/selfbackup" "$HOME/Documents" --dry-run 2>&1)
+    self_out=$("$MIGR" backup "$HOME/Documents/selfbackup" "$HOME/Documents" --dry-run 2>&1)
     self_rc=$?
     set -e
     if [ "$self_rc" -ne 0 ] && [ ! -e "$HOME/Documents/selfbackup" ]; then
@@ -2055,7 +2070,7 @@ test_container_production() {
     # A built-in scope selects HOME's own subtrees, so a destination inside one
     # of them is the same hazard without any explicit path being named.
     assert_fails_with "destination is inside" \
-        ../migr backup "$HOME/Documents/inner_backup" --critical
+        "$MIGR" backup "$HOME/Documents/inner_backup" --critical
 
     # A destination is a place to write into, so it must be followed through its
     # final symlink: a link living outside every root but pointing inside one
@@ -2068,7 +2083,7 @@ test_container_production() {
 
     local alias_out alias_rc
     set +e
-    alias_out=$(../migr backup "$alias_link" "$alias_src" 2>&1)
+    alias_out=$("$MIGR" backup "$alias_link" "$alias_src" 2>&1)
     alias_rc=$?
     set -e
     local alias_entries
@@ -2087,7 +2102,7 @@ test_container_production() {
     local ok_link="$TEST_DIR/cp_ok_link"
     mkdir -p "$TEST_DIR/cp_ok_dest"
     ln -s "$TEST_DIR/cp_ok_dest" "$ok_link"
-    assert_contains "$(../migr backup "$ok_link" "$alias_src" 2>&1)" "Backup complete"
+    assert_contains "$("$MIGR" backup "$ok_link" "$alias_src" 2>&1)" "Backup complete"
 
     # --- the packages.txt control slot is never opened in place ---
     # Both hazards below live in an adopted partial. Reusing whatever object is
@@ -2110,7 +2125,7 @@ test_container_production() {
             rm -rf "$dest"; mkdir -p "$dest"
             echo locked > "$slot_locked"
             chmod 000 "$slot_locked"
-            ../migr backup "$dest" --critical >/dev/null 2>&1 || true
+            "$MIGR" backup "$dest" --critical >/dev/null 2>&1 || true
             chmod 644 "$slot_locked"
             p=$(containers_matching "$dest" partial)
             if [ -z "$p" ] || [ ! -d "$p" ]; then
@@ -2125,7 +2140,7 @@ test_container_production() {
         fifo_partial=$(make_partial_with_empty_slot "$fifo_dest")
         mkfifo "$fifo_partial/packages.txt"
         set +e
-        timeout 60 ../migr backup "$fifo_dest" --critical >/dev/null 2>&1
+        timeout 60 "$MIGR" backup "$fifo_dest" --critical >/dev/null 2>&1
         fifo_rc=$?
         set -e
         local fifo_final
@@ -2143,7 +2158,7 @@ test_container_production() {
         echo sentinel-original > "$hl_sentinel"
         hl_partial=$(make_partial_with_empty_slot "$hl_dest")
         ln "$hl_sentinel" "$hl_partial/packages.txt"
-        ../migr backup "$hl_dest" --critical >/dev/null 2>&1
+        "$MIGR" backup "$hl_dest" --critical >/dev/null 2>&1
 
         local hl_final
         hl_final=$(sole_final_container "$hl_dest")
@@ -2162,7 +2177,7 @@ test_container_production() {
     local ext_dest="$TEST_DIR/cp_ext" ext_root="$TEST_DIR/outside_home"
     mkdir -p "$ext_dest" "$ext_root"
     echo external > "$ext_root/data.txt"
-    ../migr backup "$ext_dest" "$HOME/Documents" "$ext_root" >/dev/null 2>&1
+    "$MIGR" backup "$ext_dest" "$HOME/Documents" "$ext_root" >/dev/null 2>&1
 
     local ext_actual
     ext_actual=$(sole_final_container "$ext_dest")
@@ -2177,7 +2192,7 @@ test_container_production() {
 
     local ext_home="$TEST_DIR/cp_ext_home" ext_restore_out
     mkdir -p "$ext_home"
-    ext_restore_out=$(printf 'y\n' | env HOME="$ext_home" ../migr restore "$ext_actual" 2>&1)
+    ext_restore_out=$(printf 'y\n' | env HOME="$ext_home" "$MIGR" restore "$ext_actual" 2>&1)
     assert_contains "$ext_restore_out" "Manual Roots"
     assert_contains "$ext_restore_out" "$ext_root"
     # the home-relative sibling root proves the restore itself ran
@@ -2251,8 +2266,8 @@ test_portable_vfat_dispatch() {
     echo "second vfat file" > "$HOME/Documents/second.txt"
 
     local portable_dry portable_dry_verbose
-    portable_dry=$(../migr backup "$mount_point/dry-run-dest" --dry-run 2>&1)
-    portable_dry_verbose=$(../migr backup "$mount_point/dry-run-dest" --dry-run -v 2>&1)
+    portable_dry=$("$MIGR" backup "$mount_point/dry-run-dest" --dry-run 2>&1)
+    portable_dry_verbose=$("$MIGR" backup "$mount_point/dry-run-dest" --dry-run -v 2>&1)
     if [ "$portable_dry" = "$portable_dry_verbose" ]; then
         echo -e "  ${GREEN}✓${NC} Portable dry-run is unchanged by verbose."
     else
@@ -2260,7 +2275,7 @@ test_portable_vfat_dispatch() {
         exit 1
     fi
 
-    output=$(../migr backup "$mount_point/dest" -v 2>&1)
+    output=$("$MIGR" backup "$mount_point/dest" -v 2>&1)
     assert_contains "$output" "Backup complete"
 
     local capture_verbose_count
@@ -2280,7 +2295,7 @@ test_portable_vfat_dispatch() {
     rm -f "$actual_backup/packages.txt"
     rm -rf "$HOME"
     mkdir -p "$HOME"
-    output=$(printf 'y\n' | ../migr restore "$actual_backup" -v 2>&1)
+    output=$(printf 'y\n' | "$MIGR" restore "$actual_backup" -v 2>&1)
     assert_contains "$output" "Restore complete"
     assert_not_contains "$output" "Restored:"
     local restore_verbose_count
@@ -2310,7 +2325,7 @@ test_portable_vfat_dispatch() {
     local portable_pty_output portable_pty_rc
     set +e
     portable_pty_output=$(printf 'y\n' | socat - \
-        "EXEC:env HOME=$portable_progress_home ../migr restore $actual_backup -v,pty,setsid,ctty,echo=0" \
+        "EXEC:env HOME=$portable_progress_home "$MIGR" restore $actual_backup -v,pty,setsid,ctty,echo=0" \
         2>&1)
     portable_pty_rc=$?
     set -e
@@ -2406,7 +2421,7 @@ EOF
     local casefold_out casefold_rc
     set +e
     casefold_out=$(printf 'y\n' | env HOME="$casefold_home" \
-        ../migr restore "$source" 2>&1)
+        "$MIGR" restore "$source" 2>&1)
     casefold_rc=$?
     set -e
     if [ "$casefold_rc" -ne 0 ] &&
@@ -2426,7 +2441,7 @@ EOF
     local byte_out byte_rc
     set +e
     byte_out=$(printf 'y\n' | env HOME="$byte_home" \
-        ../migr restore "$source" 2>&1)
+        "$MIGR" restore "$source" 2>&1)
     byte_rc=$?
     set -e
     if [ "$byte_rc" -eq 0 ] &&

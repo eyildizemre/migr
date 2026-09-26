@@ -51,12 +51,17 @@ git config core.hooksPath hooks
 ```bash
 ./migr
 ./migr report [--critical | --comprehensive] [-s] [--max-depth=<N>]
-./migr backup <PATH>
-./migr restore <SOURCE> [--no-verify]
+sudo ./migr backup <PATH>
+sudo ./migr restore <SOURCE> [--no-verify]
 ./migr verify <SOURCE>
 ./migr repair <SOURCE> <PATH>
 ./migr conf
 ```
+
+`backup` and `restore` run as root: they ask for the sudo password once, at the
+start, and then run unattended. Under `sudo`, migr still backs up and restores
+the invoking user's home and writes restored files as that user. Their
+`--dry-run` previews, and every other command, need no root.
 
 ## Example
 
@@ -216,11 +221,11 @@ Backup-only explicit paths:
 ```
 
 ```bash
-./migr backup /mnt/drive
-./migr backup /mnt/drive --comprehensive
-./migr backup /mnt/drive ~/Documents ~/Projects
-./migr backup /mnt/drive --include-self
-./migr backup /mnt/drive --include-network-config
+sudo ./migr backup /mnt/drive
+sudo ./migr backup /mnt/drive --comprehensive
+sudo ./migr backup /mnt/drive ~/Documents ~/Projects
+sudo ./migr backup /mnt/drive --include-self
+sudo ./migr backup /mnt/drive --include-network-config
 ```
 
 ## Key Features
@@ -319,10 +324,8 @@ the bundled binary matches the target machine's architecture.
 
 `--include-network-config` independently captures NetworkManager, netplan,
 systemd-networkd, wpa_supplicant, and netctl into backend directories under `network/`.
-Absent backends are silently skipped; an unreadable backend fails the backup
-(run normally, then rerun the same migr command with `sudo` if permissions refuse
-access). Ordinary backup and restore do not require root merely because migr
-supports this option. If none are found, backup succeeds with a note.
+Absent backends are silently skipped; an unreadable backend fails the backup.
+If none are found, backup succeeds with a note.
 NetworkManager, netplan, wpa_supplicant, and netctl files can expose WiFi passwords
 or PSKs in plain text. Networkd delegates WiFi authentication to other tools, but
 its files can contain other secrets, such as WireGuard private keys.
