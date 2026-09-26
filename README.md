@@ -66,7 +66,15 @@ read is read again; one still being written after three reads is kept as last
 read. Items removed before they could be read, or created after their folder
 was scanned, are left out. The backup still completes, lists what changed, and
 exits with status 1 instead of 0. Frequently rewritten desktop state (such as
-GNOME's file metadata) is only counted, not listed. Under `sudo`, migr still backs up and restores
+GNOME's file metadata) is only counted, not listed.
+
+On btrfs (Fedora's default), a backup reads its sources from a read-only
+snapshot taken just before the scan, so nothing changes under it at all. The
+snapshot is visible only to migr, lives inside the subvolume as
+`.migr-snapshot-<pid>`, and is deleted when capture ends; one left by an
+interrupted run is removed by the next. Nested subvolumes and mounts are
+read live. A subvolume that holds the backup destination, or one mounted at
+`/`, is always read live. Under `sudo`, migr still backs up and restores
 the invoking user's home and writes restored files as that user. Their
 `--dry-run` previews, and every other command, need no root.
 

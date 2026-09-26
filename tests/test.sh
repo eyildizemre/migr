@@ -15,6 +15,9 @@ PORTABLE_VFAT_MOUNT=""
 PORTABLE_VFAT_LOOP=""
 CASEFOLD_MOUNT=""
 CASEFOLD_LOOP=""
+BTRFS_MOUNT=""
+BTRFS_LOOP=""
+BTRFS_WRITER=""
 
 # Every backup whose scope exports a package list forks the distribution's real
 # listing command, and a single `dnf repoquery` costs more than the entire rest
@@ -94,6 +97,16 @@ teardown() {
     fi
     if [ -n "$CASEFOLD_LOOP" ]; then
         losetup -d "$CASEFOLD_LOOP" 2>/dev/null || true
+    fi
+    if [ -n "$BTRFS_WRITER" ]; then
+        kill "$BTRFS_WRITER" 2>/dev/null || true
+        wait "$BTRFS_WRITER" 2>/dev/null || true
+    fi
+    if [ -n "$BTRFS_MOUNT" ]; then
+        umount -l "$BTRFS_MOUNT" 2>/dev/null || true
+    fi
+    if [ -n "$BTRFS_LOOP" ]; then
+        losetup -d "$BTRFS_LOOP" 2>/dev/null || true
     fi
     rm -rf "$TEST_DIR"
 }
@@ -2467,6 +2480,84 @@ EOF
     CASEFOLD_LOOP=""
 }
 
+# A backup of a btrfs source reads a read-only snapshot (docs/DECISIONS.md
+# D64): a file rewritten nonstop during the backup is captured once, cleanly;
+# a nested subvolume keeps its content; no snapshot is left behind.
+test_btrfs_snapshot_capture() {
+    echo -e "${BLUE}::${NC} Phase 17: btrfs source snapshot"
+
+    if [ "$(id -u)" -ne 0 ]; then
+        echo -e "  ${BLUE}↷${NC} skipped: root is required for loop, mount, and snapshot setup."
+        return
+    fi
+    local tool
+    for tool in losetup mkfs.btrfs btrfs mount; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            echo -e "  ${BLUE}↷${NC} skipped: '$tool' is not available."
+            return
+        fi
+    done
+
+    local image="$TEST_DIR/btrfs.img"
+    local mount_point="$TEST_DIR/btrfs"
+    local loop output rc
+    if ! truncate -s 256M "$image" 2>/dev/null ||
+       ! loop=$(losetup -f --show "$image" 2>&1); then
+        echo -e "  ${BLUE}↷${NC} skipped: could not attach a btrfs image."
+        return
+    fi
+    BTRFS_LOOP="$loop"
+    if ! mkfs.btrfs -q "$loop" >/dev/null 2>&1 ||
+       ! mkdir -p "$mount_point" ||
+       ! mount -t btrfs "$loop" "$mount_point" 2>/dev/null; then
+        echo -e "  ${BLUE}↷${NC} skipped: btrfs formatting or mounting is unavailable."
+        return
+    fi
+    BTRFS_MOUNT="$mount_point"
+
+    btrfs subvolume create "$mount_point/home" >/dev/null
+    local home="$mount_point/home/user"
+    mkdir -p "$home/Documents"
+    echo "steady" > "$home/Documents/steady.txt"
+    btrfs subvolume create "$home/Documents/nested" >/dev/null
+    echo "inside a nested subvolume" > "$home/Documents/nested/file.txt"
+    echo "0" > "$home/Documents/busy.txt"
+
+    ( while :; do date +%s%N > "$home/Documents/busy.txt"; done ) &
+    BTRFS_WRITER=$!
+
+    local dest="$TEST_DIR/btrfs-dest"
+    set +e
+    output=$(env HOME="$home" "$MIGR" backup "$dest" "$home/Documents" 2>&1)
+    rc=$?
+    set -e
+    kill "$BTRFS_WRITER" 2>/dev/null || true
+    wait "$BTRFS_WRITER" 2>/dev/null || true
+    BTRFS_WRITER=""
+
+    local container nested_copy leftovers
+    container=$(containers_matching "$dest" final | head -n 1)
+    nested_copy="$container/data/EXPLICIT_0/nested/file.txt"
+    leftovers=$(find "$mount_point/home" -maxdepth 1 -name '.migr-snapshot-*' | wc -l)
+    if [ "$rc" -eq 0 ] &&
+       [[ "$output" == *"Backing up $mount_point/home from a read-only snapshot."* ]] &&
+       [[ "$output" != *"changed while they were being backed up"* ]] &&
+       [ -n "$container" ] &&
+       [ "$(cat "$nested_copy" 2>/dev/null)" = "inside a nested subvolume" ] &&
+       [ "$leftovers" -eq 0 ]; then
+        echo -e "  ${GREEN}✓${NC} A btrfs source is backed up from one snapshot, nested subvolumes included, and the snapshot is removed."
+    else
+        echo -e "  ${RED}✗${NC} The btrfs snapshot backup did not behave as expected"
+        echo "  exit=$rc leftovers=$leftovers container=$container output: $output"
+        exit 1
+    fi
+
+    umount "$mount_point"
+    BTRFS_MOUNT=""
+    losetup -d "$loop"
+    BTRFS_LOOP=""
+}
+
 # --- 4. RUN TESTS ---
 echo -e "${BLUE}migr integration tests${NC}"
 setup
@@ -2490,4 +2581,5 @@ test_probe_refusal
 test_container_production
 test_portable_vfat_dispatch
 test_casefold_name_equivalence
+test_btrfs_snapshot_capture
 echo -e "${GREEN}all tests passed${NC}"

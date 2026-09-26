@@ -4399,3 +4399,54 @@ cleanly.
 **Relationship:** Generalizes D55's tolerance from live state to every path.
 Part of the live-environment design. A btrfs snapshot of the source (later)
 removes most of these cases.
+
+## D64 — 2026-09-26 — Backups read btrfs sources from a read-only snapshot
+
+**Status:** Implemented
+
+**Decision:** Between the representation preflight and the end of capture, a
+live backup reads every source that lives on btrfs from a read-only snapshot.
+
+1. **Subvolume:** For each root, migr finds its subvolume by walking up to
+   inode 256.
+2. **Snapshot:** It creates a read-only snapshot inside the subvolume as
+   `.migr-snapshot-<pid>` (`BTRFS_IOC_SNAP_CREATE_V2`). A snapshot with that
+   prefix whose process is gone is deleted first.
+3. **Snapshot view:** Instead of rewriting any path, the capturing thread
+   enters a mount namespace of its own (`unshare(CLONE_NEWNS)`, then a
+   recursive private `/`) and bind-mounts each snapshot over its subvolume's
+   path. Every absolute source path then reads one point in time. Selection
+   matching, manifest source paths, live-state paths, and the progress
+   thread need no change; the progress thread stays in the original
+   namespace.
+4. **Nested content:** Nested subvolumes appear as empty directories in a
+   snapshot, and a bind hides the mounts below its path. Both are mounted
+   back from the live tree, recursively:
+   - nested subvolumes come from `BTRFS_IOC_GET_SUBVOL_ROOTREF` and
+     `BTRFS_IOC_INO_LOOKUP_USER`
+   - mounts come from `/proc/self/mountinfo`
+5. **Bind sources:** They are opened only after entering the namespace; a
+   bind source must belong to the caller's namespace.
+6. **End of capture:** migr returns to the original namespace (`setns`) and
+   deletes the snapshots, before packages and the VS Code list are
+   collected, and on every failure path.
+
+It needs root, which D62 guarantees. These are left live:
+- a subvolume mounted at `/`
+- a subvolume that holds the backup destination, so no write ever meets the
+  read-only view
+- dry runs
+
+Any failure to snapshot, list, or mount leaves every source live, with a
+one-line note. D63 still applies to live sources.
+
+**Why:** A backup that reads one point in time has nothing to reread,
+report, or leave out. Fedora installs on btrfs with `/home` as a subvolume,
+so the common case needs no filesystem change. Rewriting capture paths
+instead would have touched every place a source path is used: native
+selection matching compares absolute paths, and manifests must record the
+real ones. The namespace keeps all of them as they are.
+
+**Relationship:** Complements D63. Verified as root: test.sh's btrfs phase
+(loop image, a writer rewriting a file nonstop, a nested subvolume), and a
+real `sudo migr backup --critical` of a btrfs `/home` in a VM.

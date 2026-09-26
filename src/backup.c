@@ -19,6 +19,7 @@
 #include "backup.h"
 #include "backup_plan.h"
 #include "selection.h"
+#include "source_snapshot.h"
 #include "container.h"
 #include "fileops.h"
 #include "fsprobe.h"
@@ -666,6 +667,24 @@ static void print_portable_prescan_failure(const PortablePrescanReport *report,
 
     print_error("Error: portable pre-scan failed or found an unresolvable conflict at %s; %s\n",
                 target, outcome);
+}
+
+static void begin_source_snapshot(SourceSnapshot *snapshot,
+                                  const BackupPlan *plan, const char *target)
+{
+    const char *paths[MANIFEST_MAX_ROOTS];
+    size_t count = 0;
+    for (int index = 0; index < plan->root_count &&
+                        count < sizeof(paths) / sizeof(paths[0]); index++)
+        paths[count++] = plan->roots[index].capture_path;
+    char note[PATH_MAX + 128];
+    size_t snapshotted = source_snapshot_begin(snapshot, paths, count, target,
+                                               note, sizeof(note));
+    for (size_t index = 0; index < snapshotted; index++)
+        printf("Backing up %s from a read-only snapshot.\n",
+               snapshot->entries[index].subvolume_path);
+    if (note[0] != '\0')
+        printf("Note: %s.\n", note);
 }
 
 static void print_source_change_list(const BackupSourceChangeList *list,
@@ -2787,6 +2806,8 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
     metadata_profiles_init(&metadata_profiles);
     SourceReadRefusals source_read_refusals;
     source_read_refusals_init(&source_read_refusals);
+    SourceSnapshot source_snapshot;
+    source_snapshot_init(&source_snapshot);
     int finish_result = 1;
 
     if (ensure_target_root(target, &target_created) != 0)
@@ -2841,6 +2862,11 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
     // The representation is part of the resume identity, so it must be settled
     // before the manifest is matched against an existing partial.
     manifest.representation = repr;
+
+    // From here until capture ends, sources on btrfs are read from a
+    // read-only snapshot (D64): the pre-scan and the capture see one point
+    // in time.
+    begin_source_snapshot(&source_snapshot, &plan, target);
 
     PortableCaptureRequest portable_request = {0};
     char portable_machine_id[MANIFEST_MACHINE_ID_MAX];
@@ -3114,6 +3140,7 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
             putchar('\n');
             fflush(stdout);
         }
+        source_snapshot_end(&source_snapshot);
         if (capture_report.live_state_changes != 0)
             printf("Note: live desktop state (such as GNOME's file metadata) "
                    "changed %zu time%s during the backup; it was saved as read, "
@@ -3324,6 +3351,7 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
     finish_result = print_source_changes(&capture_report) ? 1 : 0;
 
 finish:
+    source_snapshot_end(&source_snapshot);
     if (self_fd >= 0)
         close(self_fd);
     container_close(&container);
@@ -3337,6 +3365,7 @@ finish:
 cancel_pre_container:
     finish_result = 0;
 fail_pre_container:
+    source_snapshot_end(&source_snapshot);
     if (self_fd >= 0)
         close(self_fd);
     container_close(&container);
