@@ -502,13 +502,13 @@ static void test_restore_packages_batch_prefixes(void)
     printf(BLUE "::" NC " restore_packages uses one native install transaction\n");
 
     static const char *const debian_prefix[] = {
-        "sudo", "apt-get", "install", "-y", "-m"
+        "apt-get", "install", "-y", "-m"
     };
     static const char *const fedora_prefix[] = {
-        "sudo", "dnf", "install", "-y", "--skip-unavailable"
+        "dnf", "install", "-y", "--skip-unavailable"
     };
     static const char *const arch_prefix[] = {
-        "sudo", "pacman", "-S", "--needed", "--noconfirm"
+        "pacman", "-S", "--needed", "--noconfirm"
     };
     struct {
         distro_t distro;
@@ -684,10 +684,10 @@ static void test_restore_packages_single_pass_accounting(void)
     printf(BLUE "::" NC " restore_packages derives skips from final package state\n");
 
     static const char *const fedora_prefix[] = {
-        "sudo", "dnf", "install", "-y", "--skip-unavailable"
+        "dnf", "install", "-y", "--skip-unavailable"
     };
     static const char *const arch_prefix[] = {
-        "sudo", "pacman", "-S", "--needed", "--noconfirm"
+        "pacman", "-S", "--needed", "--noconfirm"
     };
 
     test_restore_packages_sparse_unavailable(
@@ -736,7 +736,7 @@ static void test_restore_packages_single_pass_accounting(void)
           "an already-installed Arch package need not be available in sync databases to count as restored");
 
     static const char *const debian_prefix[] = {
-        "sudo", "apt-get", "install", "-y", "-m"
+        "apt-get", "install", "-y", "-m"
     };
     PackageRunFixture debian_status = {
         .expected_prefix = debian_prefix,
@@ -806,11 +806,11 @@ static void test_restore_packages_batch_alloc_failure_is_reported(void)
         return;
     }
 
-    wrap_malloc_target_size = (size_t)(5 + PKG_COUNT + 1) * sizeof(char *);
+    wrap_malloc_target_size = (size_t)(4 + PKG_COUNT + 1) * sizeof(char *);
     wrap_malloc_fired = 0;
 
     static const char *const fedora_prefix[] = {
-        "sudo", "dnf", "install", "-y", "--skip-unavailable"
+        "dnf", "install", "-y", "--skip-unavailable"
     };
     PackageRunFixture runner = {
         .expected_prefix = fedora_prefix,

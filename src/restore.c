@@ -217,7 +217,7 @@ static const char *network_config_dest_dir(size_t backend_index)
 static int run_network_config_reload(void)
 {
     char *const reload_argv[] = {
-        "sudo", "nmcli", "connection", "reload", NULL
+        "nmcli", "connection", "reload", NULL
     };
 #ifdef RESTORE_TEST_HOOKS
     if (restore_test_network_reload_hook != NULL)

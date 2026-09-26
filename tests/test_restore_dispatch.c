@@ -124,11 +124,10 @@ static int package_privilege_probe(char *const argv[], void *context)
     PackagePrivilegeProbe *probe = context;
     if (argv == NULL || argv[0] == NULL || argv[1] == NULL ||
         argv[2] == NULL || argv[3] == NULL || argv[4] == NULL ||
-        argv[5] == NULL || argv[6] != NULL || strcmp(argv[0], "sudo") != 0 ||
-        strcmp(argv[1], "dnf") != 0 || strcmp(argv[2], "install") != 0 ||
-        strcmp(argv[3], "-y") != 0 ||
-        strcmp(argv[4], "--skip-unavailable") != 0 ||
-        strcmp(argv[5], "fixture-package") != 0)
+        argv[5] != NULL || strcmp(argv[0], "dnf") != 0 ||
+        strcmp(argv[1], "install") != 0 || strcmp(argv[2], "-y") != 0 ||
+        strcmp(argv[3], "--skip-unavailable") != 0 ||
+        strcmp(argv[4], "fixture-package") != 0)
         return -1;
 
     int fd = open(probe->marker_path,
@@ -3296,8 +3295,8 @@ static void test_network_config_restore_success(void)
     check(access(ignored_dest, F_OK) != 0,
           "non-regular network backup entries are skipped");
     check(file_content_is(reload_marker,
-                          "sudo\nnmcli\nconnection\nreload\n"),
-          "reload uses exactly sudo nmcli connection reload once");
+                          "nmcli\nconnection\nreload\n"),
+          "reload uses exactly nmcli connection reload once");
     check(strstr(output, "Restored 2 network connection files") != NULL,
           "the live restore reports the number of applied connection files");
     check(strstr(output, "used the crypto policy DEFAULT:SHA1 (this system: "
@@ -3409,7 +3408,7 @@ static void test_network_config_reload_failure_is_best_effort(void)
                  "'nmcli connection reload' did not succeed") != NULL,
           "reload failure emits the best-effort warning");
     check(file_content_is(reload_marker,
-                          "sudo\nnmcli\nconnection\nreload\n"),
+                          "nmcli\nconnection\nreload\n"),
           "the failing reload path still receives the exact command argv");
 
     remove_tree(source);
@@ -3465,7 +3464,7 @@ static void test_network_config_restore_continues_after_file_error(void)
     check(file_matches(good_dest, "good", 0600),
           "later regular connection files are still restored");
     check(file_content_is(reload_marker,
-                          "sudo\nnmcli\nconnection\nreload\n"),
+                          "nmcli\nconnection\nreload\n"),
           "reload still runs after at least one connection file was restored");
 
     remove_tree(source);
@@ -3699,7 +3698,7 @@ static void test_network_config_backends(unsigned int mask, int blocked_index,
               "each backend restores only its own saved bytes with its fixed mode");
     }
     if ((mask & 1u) && !preview && blocked_index != 0 && broken_index != 0)
-        check(file_content_is(marker, "sudo\nnmcli\nconnection\nreload\n"),
+        check(file_content_is(marker, "nmcli\nconnection\nreload\n"),
               "only NetworkManager invokes the reload hook, exactly once");
     else
         check(access(marker, F_OK) != 0, "no automatic reload without live NetworkManager files");

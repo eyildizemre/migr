@@ -4334,7 +4334,9 @@ only: library entry points keep their own privilege checks (the restore
 preflight's "needs root" refusal). The integration suite links a build of
 the CLI compiled with `MIGR_ALLOW_UNPRIVILEGED`, which skips only this check,
 so it can drive both commands as an ordinary user. Phase 9 checks the real
-binary's refusal.
+binary's refusal. The package install and `nmcli connection reload` commands that
+restore runs itself no longer carry a `sudo` prefix; hints printed for the
+user to run later keep theirs.
 
 **Why:** A non-root restore reached `sudo dnf install` and `sudo nmcli` only
 after it had copied everything, so an unattended run could stop at a password

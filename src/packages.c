@@ -315,7 +315,7 @@ void read_package_list(FILE *pkg_file, char ***pkgs_out, int *pkg_count_out,
 }
 
 enum {
-    PACKAGE_INSTALL_PREFIX_MAX = 5,
+    PACKAGE_INSTALL_PREFIX_MAX = 4,
     PACKAGE_QUERY_BUFFER_SIZE = 5 * 1024 * 1024
 };
 
@@ -324,27 +324,25 @@ static size_t package_install_prefix(distro_t distro,
 {
     switch (distro)
     {
+        // restore runs as root (D62), so these need no sudo of their own.
         case DISTRO_DEBIAN:
-            prefix[0] = "sudo";
-            prefix[1] = "apt-get";
-            prefix[2] = "install";
-            prefix[3] = "-y";
-            prefix[4] = "-m";
-            return 5U;
+            prefix[0] = "apt-get";
+            prefix[1] = "install";
+            prefix[2] = "-y";
+            prefix[3] = "-m";
+            return 4U;
         case DISTRO_FEDORA:
-            prefix[0] = "sudo";
-            prefix[1] = "dnf";
-            prefix[2] = "install";
-            prefix[3] = "-y";
-            prefix[4] = "--skip-unavailable";
-            return 5U;
+            prefix[0] = "dnf";
+            prefix[1] = "install";
+            prefix[2] = "-y";
+            prefix[3] = "--skip-unavailable";
+            return 4U;
         case DISTRO_ARCH:
-            prefix[0] = "sudo";
-            prefix[1] = "pacman";
-            prefix[2] = "-S";
-            prefix[3] = "--needed";
-            prefix[4] = "--noconfirm";
-            return 5U;
+            prefix[0] = "pacman";
+            prefix[1] = "-S";
+            prefix[2] = "--needed";
+            prefix[3] = "--noconfirm";
+            return 4U;
         default:
             return 0U;
     }
