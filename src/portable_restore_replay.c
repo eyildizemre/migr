@@ -52,6 +52,13 @@ typedef struct {
     int kept_live_state;
     /* REPLAY_DEFERRED_* (D66). */
     unsigned char deferral;
+    /* The regular file as replay left it: identity, size, and mtime right
+     * after its last metadata step (D67). */
+    int written_valid;
+    dev_t written_dev;
+    ino_t written_ino;
+    off_t written_size;
+    struct timespec written_mtime;
 } ReplayEntry;
 
 enum {
@@ -2157,6 +2164,15 @@ static int replay_apply_regular(ReplayCollection *collection,
             replay_apply_failure_record(
                 failure, PORTABLE_RESTORE_REPLAY_FAILURE_APPLY_TIMES, errno);
     }
+    struct stat written;
+    if (result == 0 && fstat(destination_fd, &written) == 0)
+    {
+        replay->written_valid = 1;
+        replay->written_dev = written.st_dev;
+        replay->written_ino = written.st_ino;
+        replay->written_size = written.st_size;
+        replay->written_mtime = written.st_mtim;
+    }
 
     int saved = errno;
     if (destination_fd >= 0 && close(destination_fd) != 0 && result == 0)
@@ -3080,6 +3096,28 @@ static int replay_destination_regular_digest(
     return result;
 }
 
+// Whether the file at leaf is no longer the one replay left: removed,
+// replaced by another regular file, or rewritten (its size or mtime moved;
+// replay set mtime to the backup's, and a writer sets it to now). Content
+// that differs while all of these match is corruption, not a later write,
+// and anything but a regular file in its place stays a failure.
+static int replay_changed_after_restore(const ReplayEntry *replay,
+                                        int parent_fd, const char *leaf)
+{
+    struct stat now;
+    if (fstatat(parent_fd, leaf, &now, AT_SYMLINK_NOFOLLOW) != 0)
+        return errno == ENOENT;
+    if (!S_ISREG(now.st_mode))
+        return 0;
+    return now.st_dev != replay->written_dev ||
+           now.st_ino != replay->written_ino ||
+           now.st_size != replay->written_size ||
+           now.st_mtim.tv_sec != replay->written_mtime.tv_sec ||
+           now.st_mtim.tv_nsec != replay->written_mtime.tv_nsec;
+}
+
+// Returns 0 when the restored file matches, 1 when another program changed
+// it after it was restored (D67), and -1 on a mismatch or error.
 static int replay_verify_regular(ReplayCollection *collection,
                                  ReplayEntry *replay,
                                  ReplayApplyFailure *failure)
@@ -3120,7 +3158,19 @@ static int replay_verify_regular(ReplayCollection *collection,
     if (result == 0)
         result = replay_destination_regular_digest(parent_fd, leaf, &digest,
                                                    failure);
-    if (result == 0 && digest != replay->content_digest)
+    int differs = result == 0 && digest != replay->content_digest;
+    if (!replay->payload_differs && replay->written_valid &&
+        (result != 0 || differs) &&
+        replay_changed_after_restore(replay, parent_fd, leaf))
+    {
+        // Another program wrote, replaced, or removed it after replay left
+        // it; the restore itself was right (D67).
+        if (failure != NULL)
+            *failure = (ReplayApplyFailure){0};
+        errno = 0;
+        result = 1;
+    }
+    else if (differs)
     {
         errno = EIO;
         result = -1;
@@ -3390,6 +3440,8 @@ static int replay_verify_content(ReplayCollection *collection)
 
     ReplayVerificationExample examples[REPLAY_VERIFICATION_EXAMPLES];
     size_t example_count = 0;
+    ReplayVerificationExample changed[REPLAY_VERIFICATION_EXAMPLES];
+    size_t changed_count = 0;
     ReplayVerificationProgress progress;
     replay_verification_progress_start(&progress, total_count);
     for (size_t index = 0; index < collection->count; index++)
@@ -3426,7 +3478,22 @@ static int replay_verify_content(ReplayCollection *collection)
             collection->report->verification_checked_count++;
         replay_verification_progress_note(
             &progress, collection->report->verification_checked_count, 0);
-        if (result != 0)
+        if (result > 0)
+        {
+            if (collection->report->verification_changed_count != SIZE_MAX)
+                collection->report->verification_changed_count++;
+            if (changed_count < REPLAY_VERIFICATION_EXAMPLES)
+            {
+                char logical[PATH_MAX];
+                replay_copy_bytes(logical, sizeof(logical),
+                                  replay->entry->logical_path);
+                snprintf(changed[changed_count++].location,
+                         sizeof(changed[0].location), "%s:%s",
+                         collection->manifest->roots[replay->root_index].id,
+                         logical[0] != '\0' ? logical : ".");
+            }
+        }
+        else if (result != 0)
         {
             // Every item is already applied, so keep checking: one mismatch
             // must not hide the rest. The first one stays the reported one.
@@ -3458,6 +3525,18 @@ static int replay_verify_content(ReplayCollection *collection)
     }
     replay_verification_progress_finish(
         &progress, collection->report->verification_checked_count);
+    size_t changed_total = collection->report->verification_changed_count;
+    if (changed_total != 0)
+    {
+        printf("%zu restored item%s changed by other programs after "
+               "%s restored; not errors:\n", changed_total,
+               changed_total == 1 ? " was" : "s were",
+               changed_total == 1 ? "it was" : "they were");
+        for (size_t index = 0; index < changed_count; index++)
+            printf("  %s\n", changed[index].location);
+        if (changed_total > changed_count)
+            printf("  ... and %zu more\n", changed_total - changed_count);
+    }
     size_t failed = collection->report->verification_failed_count;
     if (failed == 0)
         return 0;

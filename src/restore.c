@@ -3035,6 +3035,12 @@ int restore_with_options(const char *source, const RestoreOptions *options)
                            item_phrase);
                 else
                     print_success("Restore complete: %s\n", item_phrase);
+                if (report.verification_changed_count != 0)
+                    printf("%zu of them %s changed afterwards by other "
+                           "programs (listed above).\n",
+                           report.verification_changed_count,
+                           report.verification_changed_count == 1 ? "was"
+                                                                  : "were");
                 break;
             }
             case PORTABLE_RESTORE_DRY_RUN:
@@ -3113,9 +3119,12 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         manifest_free(&m);
         close(home_fd);
         close(source_root_fd);
+        // Items another program changed after restore are not failures, but
+        // like a backup whose source changed, the run ends with 1 (D67).
         return (outcome == PORTABLE_RESTORE_ERROR ||
                 outcome == PORTABLE_RESTORE_VERIFICATION_FAILED ||
-                had_portable_error) ? 1 : 0;
+                had_portable_error ||
+                report.verification_changed_count != 0) ? 1 : 0;
     }
 
     if (mst == MANIFEST_STATUS_VALID &&

@@ -702,8 +702,40 @@ typedef enum {
     VERIFICATION_MUTATION_REPLACE_PARENT_WITH_SYMLINK,
     VERIFICATION_MUTATION_REPLACE_SYMLINK_TARGET,
     VERIFICATION_MUTATION_REPLACE_HARDLINK_ALIAS,
-    VERIFICATION_MUTATION_REWRITE_TWO_OF_THREE
+    VERIFICATION_MUTATION_REWRITE_TWO_OF_THREE,
+    VERIFICATION_MUTATION_WRITE_FILE,
+    VERIFICATION_MUTATION_REMOVE_FILE,
+    VERIFICATION_MUTATION_RESIZE_KEEPING_TIMES
 } VerificationMutation;
+
+// Changes content while keeping size and times, the way corruption below
+// the filesystem looks: nothing a writing program would leave behind.
+// Flips the first byte in place, keeping size and times.
+static void flip_first_byte_at(int dir_fd, const char *name)
+{
+    struct stat before;
+    unsigned char byte = 0;
+    int fd = openat(dir_fd, name, O_RDWR | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0 || fstat(fd, &before) != 0 || pread(fd, &byte, 1, 0) != 1)
+        fatal("could not read a file to corrupt");
+    byte ^= 0xFF;
+    if (pwrite(fd, &byte, 1, 0) != 1 || close(fd) != 0)
+        fatal("could not corrupt a file");
+    struct timespec times[2] = { before.st_atim, before.st_mtim };
+    if (utimensat(dir_fd, name, times, AT_SYMLINK_NOFOLLOW) != 0)
+        fatal("could not keep a corrupted file's times");
+}
+
+static void corrupt_file_at(int dir_fd, const char *name, const char *text)
+{
+    struct stat before;
+    if (fstatat(dir_fd, name, &before, AT_SYMLINK_NOFOLLOW) != 0)
+        fatal("could not inspect a file to corrupt");
+    write_file_at(dir_fd, name, text);
+    struct timespec times[2] = { before.st_atim, before.st_mtim };
+    if (utimensat(dir_fd, name, times, AT_SYMLINK_NOFOLLOW) != 0)
+        fatal("could not keep a corrupted file's times");
+}
 
 static Fixture *verification_mutation_fixture;
 static VerificationMutation verification_mutation;
@@ -722,7 +754,18 @@ static void mutate_after_replay_apply(void)
     switch (verification_mutation)
     {
         case VERIFICATION_MUTATION_REWRITE_FILE:
+            corrupt_file_at(root_fd, "file", "ABCDEFGH");
+            break;
+        case VERIFICATION_MUTATION_WRITE_FILE:
+            // Same length: only the new mtime tells a later write apart.
             write_file_at(root_fd, "file", "ABCDEFGH");
+            break;
+        case VERIFICATION_MUTATION_REMOVE_FILE:
+            if (unlinkat(root_fd, "file", 0) != 0)
+                fatal("could not remove the restored file");
+            break;
+        case VERIFICATION_MUTATION_RESIZE_KEEPING_TIMES:
+            corrupt_file_at(root_fd, "file", "a longer text than before");
             break;
         case VERIFICATION_MUTATION_TRUNCATE_FILE:
         {
@@ -759,8 +802,8 @@ static void mutate_after_replay_apply(void)
             write_file_at(root_fd, "alias", "hardlink payload");
             break;
         case VERIFICATION_MUTATION_REWRITE_TWO_OF_THREE:
-            write_file_at(root_fd, "a", "AAAA");
-            write_file_at(root_fd, "c", "CCCC");
+            corrupt_file_at(root_fd, "a", "AAAA");
+            corrupt_file_at(root_fd, "c", "CCCC");
             break;
         case VERIFICATION_MUTATION_NONE:
             break;
@@ -1737,13 +1780,40 @@ static void test_regular_content_verification(void)
         PortableRestoreReplayReport report;
         int result = run_replay(&truncated, &report);
         clear_verification_mutation();
-        check(result != 0 && report.verification_checked_count == 1 &&
-                  report.verification_failed_count == 1 &&
-                  report.failure_step ==
-                      PORTABLE_RESTORE_REPLAY_FAILURE_COMPARE_DESTINATION_CONTENT &&
-                  report.failure_errno == EIO,
-              "post-copy truncation is detected by content verification");
+        check(result == 0 && report.verification_checked_count == 1 &&
+                  report.verification_failed_count == 0 &&
+                  report.verification_changed_count == 1,
+              "a file truncated after it was restored is reported as changed "
+              "by another program, not as a failure");
         fixture_close(&truncated);
+    }
+
+    static const VerificationMutation later_writes[] = {
+        VERIFICATION_MUTATION_WRITE_FILE, VERIFICATION_MUTATION_REMOVE_FILE,
+        VERIFICATION_MUTATION_RESIZE_KEEPING_TIMES
+    };
+    static const char *const later_labels[] = {
+        "a file another program rewrote after restore is not a failure",
+        "a file another program removed after restore is not a failure",
+        ("a file whose size changed after restore, even with its times "
+         "kept, is not a failure")
+    };
+    for (size_t index = 0; index < 3; index++)
+    {
+        Fixture later;
+        opened = regular_verification_fixture_open(&later, "abcdefgh");
+        check(opened == 0, "later-write verification fixture is created");
+        if (opened != 0)
+            continue;
+        set_verification_mutation(&later, later_writes[index]);
+        PortableRestoreReplayReport report;
+        int result = run_replay(&later, &report);
+        clear_verification_mutation();
+        check(result == 0 && report.verification_failed_count == 0 &&
+                  report.verification_changed_count == 1 &&
+                  report.failure_step == PORTABLE_RESTORE_REPLAY_FAILURE_NONE,
+              later_labels[index]);
+        fixture_close(&later);
     }
 
     Fixture damaged;
@@ -2851,8 +2921,7 @@ static void mutate_verification_paths(void *context)
             fatal("invalid verification-path mutation target");
         if (!file_equals_noatime(path, expected))
             probe->restored_contents_match = 0;
-        write_file_at(probe->fixture->home_fd, relative,
-                      "live state changed after replay");
+        flip_first_byte_at(probe->fixture->home_fd, relative);
     }
 }
 
@@ -2891,8 +2960,7 @@ static void test_live_desktop_state_verification_exclusion(void)
                   report.verification_failed_count == 0 &&
                   portable_restore_replay_test_verification_regular_read_count() == 2,
               "gvfs-metadata descendants are omitted from readback and accounting");
-        check(file_equals_noatime(mutated_root,
-                                 "live state changed after replay"),
+        check(!file_equals_noatime(mutated_root, "gvfs root payload"),
               "post-replay live-state mutation does not become a false failure");
         fixture_close(&excluded);
     }

@@ -192,7 +192,18 @@ own with `migr verify <SOURCE>`, without restoring anything: it confirms that
 every item the journal records is present in the backup and that every file still
 has its captured size and content, and lists the ones that do not. Run it before
 wiping the source machine. Native backups record no content digests, so verify
-refuses them.
+refuses them. Symlink target bytes are compared directly; their
+recorded timestamps are reapplied afterward because reading the target can advance
+the symlink's atime. Hardlink aliases are checked against their representative by filesystem inode
+identity without re-reading the same content through every alias. A read,
+path-identity, or hardlink-identity mismatch, or content that differs while the
+file is still the one restore wrote (its inode, size, and modification time
+unchanged), is a failure: the restore ends with errors, though package and
+network restoration still run. A file that another program rewrote, replaced,
+or removed after restore is listed separately as changed afterwards, is not a
+failure, and makes the restore exit 1. `--no-verify` skips only
+this post-copy read-back pass; portable restore preflight remains mandatory,
+and dry runs perform no post-copy verification because they write no files.
 
 If a portable backup's journal is damaged, for example by a failing drive,
 restore refuses it. `migr repair <SOURCE> <PATH>` rebuilds it as a new backup
@@ -201,14 +212,7 @@ record, a damaged region is skipped up to the next intact record, a directory
 whose own record was lost is re-created with the metadata of the directory above
 it, and every item that cannot be recovered is listed. The payload is then copied
 next to the rebuilt journal, so `PATH` needs room for the whole backup. Check the
-copy with `migr verify` before restoring from it. Symlink target bytes are compared directly; their
-recorded timestamps are reapplied afterward because reading the target can advance
-the symlink's atime. Hardlink aliases are checked against their representative by filesystem inode
-identity without re-reading the same content through every alias. A read,
-path-identity, content, or hardlink-identity mismatch fails the restore before
-optional package or network restoration is published. `--no-verify` skips only
-this post-copy read-back pass; portable restore preflight remains mandatory,
-and dry runs perform no post-copy verification because they write no files.
+copy with `migr verify` before restoring from it.
 
 ## Options
 

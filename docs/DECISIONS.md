@@ -4517,3 +4517,32 @@ to be closed.
 **Relationship:** Part of the live-environment design. Native restore
 deferral, and Flatpak applications (`~/.var/app/<id>`, detectable with
 `flatpak ps`, once that scope is captured at all), are open.
+
+## D67 — 2026-09-26 — Verification tells later writes apart from corruption
+
+**Status:** Implemented
+
+**Decision:** Right after replay's last metadata step on a regular file (its
+times), it records the file's device, inode, size, and mtime. When
+verification then finds different content, or no file, the item is
+"changed afterwards" instead of a failure if:
+- it was removed, or
+- it is still a regular file whose inode, size, or mtime differs from the
+  recorded one.
+
+Replay set mtime to the backup's value; a program that writes the file sets
+it to now or changes its size, while corruption below the filesystem does
+neither. A different kind of object in its place (a planted symlink) and a
+damaged backup copy (D59) stay failures.
+
+Changed items are counted in `verification_changed_count`, listed after
+verification (the first eight), and mentioned in the final summary. The
+restore completes, and exits 1, as a backup does when its source changed
+(D63). Hardlink creation, which changes a representative's ctime, does not
+matter: ctime is not compared.
+
+**Why:** A running desktop writes some restored files right after replay
+wrote them. D53 reported those as "content differs from the backup", the same
+words as real corruption, so a routine later write read like damage.
+
+**Relationship:** Refines D53. Part of the live-environment design.

@@ -140,6 +140,9 @@ typedef struct {
     size_t skipped_security_xattr_count;
     size_t verification_checked_count;
     size_t verification_failed_count;
+    /* Items whose read-back differed because another program changed or
+     * removed them after they were restored; not failures (D67). */
+    size_t verification_changed_count;
     SidecarObjectKind failed_kind;
     int failed_kind_valid;
     PortableRestoreReplayFailureStep failure_step;

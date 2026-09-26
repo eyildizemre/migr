@@ -2050,9 +2050,21 @@ static void test_native_restore_applies_dconf(void)
 
 static char verification_mutation_path[PATH_MAX];
 
+// Changes the restored bytes but keeps size and times, as corruption would;
+// a later write by another program is not a verification failure (D67).
+static void write_restored_file_after_apply(void)
+{
+    write_file_mode(verification_mutation_path, "written later", 0600);
+}
+
 static void rewrite_restored_file_after_apply(void)
 {
-    write_file_mode(verification_mutation_path, "changed", 0600);
+    struct stat before;
+    if (stat(verification_mutation_path, &before) != 0)
+        return;
+    write_file_mode(verification_mutation_path, "CHANGED", 0600);
+    struct timespec times[2] = { before.st_atim, before.st_mtim };
+    (void)utimensat(AT_FDCWD, verification_mutation_path, times, 0);
 }
 
 static int package_marker_probe(char *const argv[], void *context)
@@ -2166,7 +2178,7 @@ static void test_verification_failure_still_restores_packages(void)
     char output[16384];
     int rc = run_restore_capturing_with_input(source, "y\n", output,
                                                sizeof(output));
-    restore_test_set_proc_root(NULL);
+    restore_test_set_proc_root("/nonexistent/migr-test-proc");
     portable_restore_replay_test_set_after_apply_hook(NULL);
     packages_test_clear_restore_hooks();
     dry_run = previous_dry_run;
@@ -2183,6 +2195,26 @@ static void test_verification_failure_still_restores_packages(void)
     const char *prompt = strstr(output, "Continue?");
     check(warning != NULL && prompt != NULL && warning < prompt,
           "a running writer is named before the confirmation prompt");
+
+    // The same file written afterwards by another program (a new mtime) is
+    // not a failure: it is listed, and the restore ends with 1 (D67).
+    remove_tree(home);
+    mkdir_p(home);
+    dry_run = 0;
+    portable_restore_replay_test_set_after_apply_hook(
+        write_restored_file_after_apply);
+    rc = run_restore_capturing_with_input(source, "y\n", output,
+                                          sizeof(output));
+    portable_restore_replay_test_set_after_apply_hook(NULL);
+    dry_run = previous_dry_run;
+    check(rc == 1 && strstr(output, "Restore complete") != NULL &&
+              strstr(output, "1 restored item was changed by other programs "
+                             "after it was restored; not errors:\n"
+                             "  ROOT:file") != NULL &&
+              strstr(output, "1 of them was changed afterwards") != NULL &&
+              strstr(output, "differs from the backup") == NULL,
+          "a later write by another program is listed, not failed, and the "
+          "restore exits 1");
 
     remove_tree(source);
     remove_tree(home);
@@ -2271,7 +2303,7 @@ static int run_deferred_settings_restore(const char *input, char *output,
     int rc = run_restore_capturing_with_input(source, input, output,
                                               output_size);
     dry_run = previous_dry_run;
-    restore_test_set_proc_root(NULL);
+    restore_test_set_proc_root("/nonexistent/migr-test-proc");
 
     char settings[PATH_MAX], other[PATH_MAX];
     join_path(settings, sizeof(settings), home, ".config/Code/settings.json");
@@ -2333,7 +2365,7 @@ static void test_running_writer_detection(void)
     restore_test_set_proc_root(proc_root);
     const char *labels[8];
     size_t count = restore_test_running_writer_labels(me, labels, 8);
-    restore_test_set_proc_root(NULL);
+    restore_test_set_proc_root("/nonexistent/migr-test-proc");
     check(count == 2 &&
               ((strcmp(labels[0], "Visual Studio Code") == 0 &&
                 strcmp(labels[1], "GNOME Software") == 0) ||
@@ -3961,6 +3993,8 @@ int main(void)
     restore_test_set_dconf_hook(ignore_dconf_database, NULL);
     // Network hints must not depend on whether this machine runs NetworkManager.
     restore_test_set_network_manager_runtime_dir("/nonexistent/migr-test-nm");
+    // Nor on which applications happen to be running on the test machine.
+    restore_test_set_proc_root("/nonexistent/migr-test-proc");
     printf(BLUE "::" NC " restore dispatch (unit)\n");
 
     dry_run = 1; // inherited by every fork()ed restore() call below; no confirm_action() prompt is ever reached
