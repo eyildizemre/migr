@@ -3827,6 +3827,9 @@ static void test_network_config_roundtrip(const char *backend_name,
 
 int main(void)
 {
+    // A direct sudo run must not aim restores at the invoking user's home
+    // (D38); make and test.sh drop SUDO_UID already.
+    unsetenv("SUDO_UID");
     // No dispatch test may reach the real dconf of the user running it.
     restore_test_set_dconf_hook(ignore_dconf_database, NULL);
     // Network hints must not depend on whether this machine runs NetworkManager.

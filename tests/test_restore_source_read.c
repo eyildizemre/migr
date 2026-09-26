@@ -300,6 +300,9 @@ static void test_apply_partial_refusal(const char *source_root,
 
 int main(void)
 {
+    // A direct sudo run must not aim restores at the invoking user's home
+    // (D38); make and test.sh drop SUDO_UID already.
+    unsetenv("SUDO_UID");
     char base[PATH_MAX];
     char source_root[PATH_MAX];
     char dest_root[PATH_MAX];

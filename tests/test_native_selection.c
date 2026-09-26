@@ -86,6 +86,9 @@ static char *read_report(const SelectionPlan *plan, int summary)
 }
 int main(void)
 {
+    // A direct sudo run must not aim restores at the invoking user's home
+    // (D38); make and test.sh drop SUDO_UID already.
+    unsetenv("SUDO_UID");
     char temp[] = "/tmp/migr-native-selection-XXXXXX";
     REQUIRE(mkdtemp(temp) != NULL);
     REQUIRE(chdir(temp) == 0);

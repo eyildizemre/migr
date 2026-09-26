@@ -362,6 +362,9 @@ static void test_v1_directory_and_symlink_atime(void)
 
 int main(void)
 {
+    // A direct sudo run must not aim restores at the invoking user's home
+    // (D38); make and test.sh drop SUDO_UID already.
+    unsetenv("SUDO_UID");
     printf(BLUE "::" NC " restore source atime (public dispatch)\n");
     dry_run = 0;
     verbose = 0;

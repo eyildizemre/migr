@@ -859,6 +859,9 @@ static void test_kernel_pinned_packages_are_dropped(void)
 
 int main(void)
 {
+    // A direct sudo run must not aim restores at the invoking user's home
+    // (D38); make and test.sh drop SUDO_UID already.
+    unsetenv("SUDO_UID");
     test_kernel_pinned_packages_are_dropped();
     test_write_container_text_file_at();
 

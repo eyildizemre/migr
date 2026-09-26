@@ -4133,6 +4133,9 @@ static void test_collection_failure_reason_without_errno(void)
 
 int main(void)
 {
+    // A direct sudo run must not aim restores at the invoking user's home
+    // (D38); make and test.sh drop SUDO_UID already.
+    unsetenv("SUDO_UID");
     test_verification_checks_every_item();
     test_dconf_database_handoff();
     test_symlink_collection_validation();

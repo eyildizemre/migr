@@ -770,6 +770,9 @@ static void test_capture_race(uid_t uid, gid_t gid)
 
 int main(void)
 {
+    // A direct sudo run must not aim restores at the invoking user's home
+    // (D38); make and test.sh drop SUDO_UID already.
+    unsetenv("SUDO_UID");
     printf(BLUE "::" NC " native backup source-safe-read tests\n");
 
     uid_t uid = 0;

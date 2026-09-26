@@ -2743,6 +2743,9 @@ static void test_direct_measures_timestamp_policy(void)
 
 int main(void)
 {
+    // A direct sudo run must not aim restores at the invoking user's home
+    // (D38); make and test.sh drop SUDO_UID already.
+    unsetenv("SUDO_UID");
     test_invalid_request_still_zeroes_report();
     test_normal_orchestration();
     test_user_dirs_is_preserved_as_local_state();

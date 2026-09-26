@@ -908,6 +908,9 @@ static void test_native_reconciliation(void)
 
 int main(void)
 {
+    // A direct sudo run must not aim restores at the invoking user's home
+    // (D38); make and test.sh drop SUDO_UID already.
+    unsetenv("SUDO_UID");
     printf(BLUE "::" NC " backup capture walker (unit)\n");
 
     test_native_hardlinks();

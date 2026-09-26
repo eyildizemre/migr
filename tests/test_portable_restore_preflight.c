@@ -2161,6 +2161,9 @@ static void test_unusable_journal_is_explained(void)
 
 int main(void)
 {
+    // A direct sudo run must not aim restores at the invoking user's home
+    // (D38); make and test.sh drop SUDO_UID already.
+    unsetenv("SUDO_UID");
     test_root_entry_examples_are_named();
     test_unusable_journal_is_explained();
     test_valid_and_profiles();

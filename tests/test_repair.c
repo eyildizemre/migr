@@ -541,6 +541,9 @@ static void test_refusals(void)
 
 int main(void)
 {
+    // A direct sudo run must not aim restores at the invoking user's home
+    // (D38); make and test.sh drop SUDO_UID already.
+    unsetenv("SUDO_UID");
     printf(BLUE "::" NC " migr repair\n");
     test_intact_journal();
     test_damaged_file_record();

@@ -3754,6 +3754,9 @@ static void test_unusable_target_does_not_leak_the_plan(void)
 
 int main(void)
 {
+    // A direct sudo run must not aim restores at the invoking user's home
+    // (D38); make and test.sh drop SUDO_UID already.
+    unsetenv("SUDO_UID");
     printf(BLUE "::" NC " backup root planner (unit)\n");
 
     test_critical_root_set();

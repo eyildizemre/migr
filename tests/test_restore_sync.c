@@ -237,6 +237,9 @@ static void test_restore_sync_failure_aborts(void)
 
 int main(void)
 {
+    // A direct sudo run must not aim restores at the invoking user's home
+    // (D38); make and test.sh drop SUDO_UID already.
+    unsetenv("SUDO_UID");
     test_restore_sync_accumulates_across_files();
     test_restore_sync_failure_aborts();
     return failures == 0 ? 0 : 1;

@@ -1687,6 +1687,9 @@ static void test_metadata_apply_xattrs_symlink_race(void)
 
 int main(void)
 {
+    // A direct sudo run must not aim restores at the invoking user's home
+    // (D38); make and test.sh drop SUDO_UID already.
+    unsetenv("SUDO_UID");
     printf(BLUE "::" NC " native file-kind metadata contract (entry gate)\n");
 
     static const MatrixCase cases[] = {

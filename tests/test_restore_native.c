@@ -1138,6 +1138,9 @@ static void test_rejects_invalid_context(void)
 
 int main(void)
 {
+    // A direct sudo run must not aim restores at the invoking user's home
+    // (D38); make and test.sh drop SUDO_UID already.
+    unsetenv("SUDO_UID");
     printf(BLUE "::" NC " restore_native_at (unit)\n");
 
     test_rejects_destination_intermediate_symlink_escape();
