@@ -1884,11 +1884,9 @@ void backup_capture_report_note_change(BackupCaptureReport *report,
         [BACKUP_SOURCE_APPEARED] = "Created after its folder was scanned"
     };
     run_log_printf("%s: %s\n", labels[kind], location != NULL ? location : "");
-    BackupSourceChangeList *list = &report->source_changes[kind];
-    if (list->count != SIZE_MAX)
-        list->count++;
-    if (list->example_count < BACKUP_SOURCE_CHANGE_EXAMPLES)
-        snprintf(list->examples[list->example_count++], PATH_MAX, "%s",
+    char *text = example_list_next(&report->source_changes[kind]);
+    if (text != NULL)
+        snprintf(text, EXAMPLE_TEXT_MAX, "%s",
                  location != NULL ? location : "");
 }
 

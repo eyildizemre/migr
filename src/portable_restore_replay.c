@@ -67,13 +67,6 @@ enum {
     REPLAY_DEFERRED_SKIPPED
 };
 
-#define REPLAY_VERIFICATION_EXAMPLES 8
-
-typedef struct {
-    char location[MANIFEST_ID_MAX + PATH_MAX + 2];
-    char reason[256];
-} ReplayVerificationExample;
-
 enum {
     REPLAY_DIRECTORY_UNTOUCHED = 0,
     REPLAY_DIRECTORY_PREPARED,
@@ -3444,10 +3437,9 @@ static int replay_verify_content(ReplayCollection *collection)
         before_content_verification_hook();
 #endif
 
-    ReplayVerificationExample examples[REPLAY_VERIFICATION_EXAMPLES];
-    size_t example_count = 0;
-    ReplayVerificationExample changed[REPLAY_VERIFICATION_EXAMPLES];
-    size_t changed_count = 0;
+    // Both are counted in the report as well; these keep examples.
+    ExampleList failed = {0};
+    ExampleList changed = {0};
     ReplayVerificationProgress progress;
     replay_verification_progress_start(&progress, total_count);
     for (size_t index = 0; index < collection->count; index++)
@@ -3490,13 +3482,13 @@ static int replay_verify_content(ReplayCollection *collection)
                 collection->report->verification_changed_count++;
             replay_log_entry(collection, replay,
                              "Changed by another program after restore");
-            if (changed_count < REPLAY_VERIFICATION_EXAMPLES)
+            char *text = example_list_next(&changed);
+            if (text != NULL)
             {
                 char logical[PATH_MAX];
                 replay_copy_bytes(logical, sizeof(logical),
                                   replay->entry->logical_path);
-                snprintf(changed[changed_count++].location,
-                         sizeof(changed[0].location), "%s:%s",
+                snprintf(text, EXAMPLE_TEXT_MAX, "%s:%s",
                          collection->manifest->roots[replay->root_index].id,
                          logical[0] != '\0' ? logical : ".");
             }
@@ -3513,50 +3505,43 @@ static int replay_verify_content(ReplayCollection *collection)
                     replay->root_index, replay->entry, &failure);
             else if (collection->report->failed_count != SIZE_MAX)
                 collection->report->failed_count++;
-            if (example_count < REPLAY_VERIFICATION_EXAMPLES)
+            char *text = example_list_next(&failed);
+            if (text != NULL)
             {
-                ReplayVerificationExample *example = &examples[example_count++];
                 PortableRestoreReplayReport scratch;
                 portable_restore_replay_report_init(&scratch);
                 replay_report_apply_failure(
                     &scratch, collection->manifest, replay->root_index,
                     replay->entry, &failure);
-                snprintf(example->location, sizeof(example->location),
-                         "%s:%s", scratch.failed_root_id,
+                char reason[256];
+                if (replay_failure_reason_format(&scratch, reason,
+                                                 sizeof(reason)) != 1)
+                    reason[0] = '\0';
+                snprintf(text, EXAMPLE_TEXT_MAX, "%s:%s%s%s%s",
+                         scratch.failed_root_id,
                          scratch.failed_logical_path[0] != '\0'
-                             ? scratch.failed_logical_path : ".");
-                if (replay_failure_reason_format(&scratch, example->reason,
-                                                 sizeof(example->reason)) != 1)
-                    example->reason[0] = '\0';
+                             ? scratch.failed_logical_path : ".",
+                         reason[0] != '\0' ? " (" : "", reason,
+                         reason[0] != '\0' ? ")" : "");
             }
         }
     }
     replay_verification_progress_finish(
         &progress, collection->report->verification_checked_count);
-    size_t changed_total = collection->report->verification_changed_count;
-    if (changed_total != 0)
+    if (changed.count != 0)
     {
         printf("%zu restored item%s changed by other programs after "
-               "%s restored; not errors:\n", changed_total,
-               changed_total == 1 ? " was" : "s were",
-               changed_total == 1 ? "it was" : "they were");
-        for (size_t index = 0; index < changed_count; index++)
-            printf("  %s\n", changed[index].location);
-        if (changed_total > changed_count)
-            printf("  ... and %zu more\n", changed_total - changed_count);
+               "%s restored; not errors:\n", changed.count,
+               changed.count == 1 ? " was" : "s were",
+               changed.count == 1 ? "it was" : "they were");
+        example_list_print(&changed, "  ");
     }
-    size_t failed = collection->report->verification_failed_count;
-    if (failed == 0)
+    if (failed.count == 0)
         return 0;
     printf("Verification found %zu restored item%s that differ%s from the "
-           "backup:\n", failed, failed == 1 ? "" : "s", failed == 1 ? "s" : "");
-    for (size_t index = 0; index < example_count; index++)
-        printf("  %s%s%s%s\n", examples[index].location,
-               examples[index].reason[0] != '\0' ? " (" : "",
-               examples[index].reason,
-               examples[index].reason[0] != '\0' ? ")" : "");
-    if (failed > example_count)
-        printf("  ... and %zu more\n", failed - example_count);
+           "backup:\n", failed.count, failed.count == 1 ? "" : "s",
+           failed.count == 1 ? "s" : "");
+    example_list_print(&failed, "  ");
     return -1;
 }
 

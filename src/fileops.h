@@ -8,6 +8,8 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
+#include "utils.h"
+
 /**
  * @brief How a clone is oriented and represented.
  *
@@ -167,14 +169,6 @@ typedef enum {
     BACKUP_SOURCE_CHANGE_KINDS
 } BackupSourceChangeKind;
 
-#define BACKUP_SOURCE_CHANGE_EXAMPLES 8U
-
-typedef struct {
-    size_t count;
-    size_t example_count;
-    char examples[BACKUP_SOURCE_CHANGE_EXAMPLES][PATH_MAX];
-} BackupSourceChangeList;
-
 /**
  * @brief State shared by one native capture or restore across its roots.
  *
@@ -203,7 +197,7 @@ typedef struct {
      * appeared, or disappeared during capture and were tolerated. */
     size_t live_state_changes;
     /* Every other source change, by kind (D63). */
-    BackupSourceChangeList source_changes[BACKUP_SOURCE_CHANGE_KINDS];
+    ExampleList source_changes[BACKUP_SOURCE_CHANGE_KINDS];
 } BackupCaptureReport;
 
 void backup_capture_report_init(BackupCaptureReport *report);

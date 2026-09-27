@@ -784,17 +784,14 @@ static void begin_source_snapshot(SourceSnapshot *snapshot,
         printf("Note: %s.\n", note);
 }
 
-static void print_source_change_list(const BackupSourceChangeList *list,
+static void print_source_change_list(const ExampleList *list,
                                      const char *singular,
                                      const char *plural)
 {
     if (list->count == 0)
         return;
     printf("  %zu %s:\n", list->count, list->count == 1 ? singular : plural);
-    for (size_t index = 0; index < list->example_count; index++)
-        printf("    %s\n", list->examples[index]);
-    if (list->count > list->example_count)
-        printf("    ... and %zu more\n", list->count - list->example_count);
+    example_list_print(list, "    ");
 }
 
 // Lists what changed under the backup (D63); returns whether anything did.

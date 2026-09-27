@@ -1021,6 +1021,25 @@ int write_all(int fd, const void *data, size_t length)
     return 0;
 }
 
+char *example_list_next(ExampleList *list)
+{
+    if (list->count != SIZE_MAX)
+        list->count++;
+    if (list->kept == EXAMPLE_LIST_KEPT)
+        return NULL;
+    char *text = list->text[list->kept++];
+    text[0] = '\0';
+    return text;
+}
+
+void example_list_print(const ExampleList *list, const char *indent)
+{
+    for (size_t index = 0; index < list->kept; index++)
+        printf("%s%s\n", indent, list->text[index]);
+    if (list->count > list->kept)
+        printf("%s... and %zu more\n", indent, list->count - list->kept);
+}
+
 /* ------------------------------------------------------------------------- */
 /* Run log (docs/DECISIONS.md D79)                                           */
 /* ------------------------------------------------------------------------- */

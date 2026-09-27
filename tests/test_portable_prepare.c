@@ -525,11 +525,11 @@ static void test_prepared_capture_reports_failure_reason(void)
         ? portable_capture_fresh_prepared_at(
               container_fd, &request, &prepared, NULL, &capture_report)
         : -1;
-    const BackupSourceChangeList *vanished =
+    const ExampleList *vanished =
         &capture_report.source_changes[BACKUP_SOURCE_VANISHED];
     check(capture_result == 0 && vanished->count == 1 &&
-              vanished->example_count == 1 &&
-              strcmp(vanished->examples[0], source_file) == 0,
+              vanished->kept == 1 &&
+              strcmp(vanished->text[0], source_file) == 0,
           "a prepared member removed before capture is left out and reported "
           "by its source path");
 
@@ -562,12 +562,12 @@ static void test_prepared_capture_reports_failure_reason(void)
               container_fd, &request, &prepared, NULL, &capture_report)
         : -1;
     portable_capture_test_set_after_payload_write_hook(NULL, NULL);
-    const BackupSourceChangeList *changed =
+    const ExampleList *changed =
         &capture_report.source_changes[BACKUP_SOURCE_CHANGED];
     char payload[PATH_MAX];
     join_path(payload, sizeof(payload), container, "data/ROOT/file");
     check(capture_result == 0 && changed->count == 1 &&
-              strcmp(changed->examples[0], source_file) == 0 &&
+              strcmp(changed->text[0], source_file) == 0 &&
               file_contains(payload, "changed-after-payload-copy") &&
               backup_capture_report_has_changes(&capture_report),
           "a file still changing after every reread is kept as last read and "

@@ -150,6 +150,26 @@ void print_source_safe_read_refusal(const char *label);
  */
 int write_all(int fd, const void *data, size_t length);
 
+#define EXAMPLE_LIST_KEPT 8
+#define EXAMPLE_TEXT_MAX (PATH_MAX + 512)
+
+/* Counts items and keeps the text of the first EXAMPLE_LIST_KEPT, for a
+ * summary that names a few and says how many more there were. Zero it to
+ * start. */
+typedef struct {
+    size_t count;
+    size_t kept;
+    char text[EXAMPLE_LIST_KEPT][EXAMPLE_TEXT_MAX];
+} ExampleList;
+
+/* Counts one item and returns where to write its text (EXAMPLE_TEXT_MAX
+ * bytes), or NULL once EXAMPLE_LIST_KEPT are kept. */
+char *example_list_next(ExampleList *list);
+
+/* Prints each kept text on its own line after indent, then how many more
+ * there were. */
+void example_list_print(const ExampleList *list, const char *indent);
+
 /** @brief Prints a complete warning message, optionally in bold yellow. */
 void print_warning(const char *fmt, ...);
 

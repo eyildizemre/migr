@@ -198,7 +198,7 @@ static int path_mount_id(const char *path, unsigned int *mount_id)
     return 0;
 }
 
-static void path_join(char *out, size_t out_size, const char *base,
+static void path_concat(char *out, size_t out_size, const char *base,
                       const char *suffix)
 {
     size_t base_length = strlen(base);
@@ -366,9 +366,9 @@ static int fixture_open(Fixture *fixture, ManifestRoot *root)
                  "/tmp/migr_portable_replay_XXXXXX") < 0 ||
         mkdtemp(fixture->base) == NULL)
         return -1;
-    path_join(fixture->container, sizeof(fixture->container),
+    path_concat(fixture->container, sizeof(fixture->container),
               fixture->base, "/container");
-    path_join(fixture->home, sizeof(fixture->home), fixture->base, "/home");
+    path_concat(fixture->home, sizeof(fixture->home), fixture->base, "/home");
     if (mkdir(fixture->container, 0700) != 0 ||
         mkdir(fixture->home, 0700) != 0)
     {
@@ -939,7 +939,7 @@ static int run_nested_mount_view_graph_case(
             _exit(CHILD_SKIP);
 
         char documents_desc[PATH_MAX];
-        path_join(documents_desc, sizeof(documents_desc),
+        path_concat(documents_desc, sizeof(documents_desc),
                   documents_shared, "/desc");
         if (mount(alternate, documents_desc, NULL, MS_BIND, NULL) != 0)
             _exit(CHILD_SKIP);
@@ -1022,7 +1022,7 @@ static void test_symlink_collection_validation(void)
         PortableRestoreReplayReport report;
         int result = run_replay(&fixture, &report);
         char restored[PATH_MAX];
-        path_join(restored, sizeof(restored), fixture.home, "/restored/link");
+        path_concat(restored, sizeof(restored), fixture.home, "/restored/link");
         check(result != 0 && report.live_count == 2 &&
                   report.failed_count == 1 &&
                   strcmp(report.failed_logical_path, "link") == 0 &&
@@ -1054,7 +1054,7 @@ static void test_symlink_collection_validation(void)
         PortableRestoreReplayReport report;
         int result = run_replay(&missing, &report);
         char sentinel[PATH_MAX];
-        path_join(sentinel, sizeof(sentinel), missing.home, "/sentinel");
+        path_concat(sentinel, sizeof(sentinel), missing.home, "/sentinel");
         check(result != 0 && report.failed_count == 1 &&
                   strcmp(report.failed_logical_path, "link") == 0 &&
                   report.failed_kind_valid &&
@@ -1075,10 +1075,10 @@ static void test_symlink_collection_validation(void)
         make_dir_at(redirected.data_fd, "ROOT", 0700);
         write_file_at(redirected.home_fd, "sentinel", "untouched");
         char outside[PATH_MAX], payload_link[PATH_MAX];
-        path_join(outside, sizeof(outside), redirected.base, "/outside");
+        path_concat(outside, sizeof(outside), redirected.base, "/outside");
         if (mkdir(outside, 0700) != 0)
             fatal("could not create payload redirect target");
-        path_join(payload_link, sizeof(payload_link), redirected.base,
+        path_concat(payload_link, sizeof(payload_link), redirected.base,
                   "/container/data/ROOT/link");
         check(symlink(outside, payload_link) == 0,
               "payload placeholder symlink is planted");
@@ -1092,7 +1092,7 @@ static void test_symlink_collection_validation(void)
         PortableRestoreReplayReport report;
         int result = run_replay(&redirected, &report);
         char sentinel[PATH_MAX];
-        path_join(sentinel, sizeof(sentinel), redirected.home, "/sentinel");
+        path_concat(sentinel, sizeof(sentinel), redirected.home, "/sentinel");
         check(result != 0 && report.failed_count == 1 &&
                   strcmp(report.failed_logical_path, "link") == 0 &&
                   report.failed_kind_valid &&
@@ -1205,7 +1205,7 @@ static void test_physical_logical_mismatch(void)
               strcmp(report.failed_logical_path, "innocuous.txt") == 0,
           "replay refuses a mismatched physical path");
     char sentinel[PATH_MAX];
-    path_join(sentinel, sizeof(sentinel), fixture.home, "/sentinel");
+    path_concat(sentinel, sizeof(sentinel), fixture.home, "/sentinel");
     check(file_equals_noatime(sentinel, "untouched"),
           "physical-mismatch refusal leaves the destination untouched");
     fixture_close(&fixture);
@@ -1253,7 +1253,7 @@ static void test_shortened_leaf_replay(void)
         if (n < 0 || (size_t)n >= sizeof(logical_suffix))
             fatal("shortened logical destination path is too long");
         char restored[PATH_MAX];
-        path_join(restored, sizeof(restored), fixture.home, logical_suffix);
+        path_concat(restored, sizeof(restored), fixture.home, logical_suffix);
         check(result == 0 && report.live_count == 2 &&
                   report.applied_count == 2 && report.failed_count == 0 &&
                   file_equals_noatime(restored, "payload"),
@@ -1264,7 +1264,7 @@ static void test_shortened_leaf_replay(void)
         if (n < 0 || (size_t)n >= sizeof(physical_suffix))
             fatal("shortened physical destination path is too long");
         char leaked[PATH_MAX];
-        path_join(leaked, sizeof(leaked), fixture.home, physical_suffix);
+        path_concat(leaked, sizeof(leaked), fixture.home, physical_suffix);
         check(access(leaked, F_OK) != 0,
               "shortening marker is never exposed as the destination name");
         fixture_close(&fixture);
@@ -1333,7 +1333,7 @@ static void test_shortened_leaf_replay(void)
         PortableRestoreReplayReport report;
         int result = run_replay(&corrupt, &report);
         char sentinel[PATH_MAX];
-        path_join(sentinel, sizeof(sentinel), corrupt.home, "/sentinel");
+        path_concat(sentinel, sizeof(sentinel), corrupt.home, "/sentinel");
         check(result != 0 && report.failed_count == 1 &&
                   file_equals_noatime(sentinel, "untouched"),
               "tampered shortened leaf is refused before destination mutation");
@@ -1419,7 +1419,7 @@ static void test_deep_parent_relative_replay(void)
     PortableRestoreReplayReport report;
     int result = run_replay(&fixture, &report);
     char sentinel[PATH_MAX];
-    path_join(sentinel, sizeof(sentinel), fixture.home, "/sentinel");
+    path_concat(sentinel, sizeof(sentinel), fixture.home, "/sentinel");
     char restored[PATH_MAX];
     int restored_length = snprintf(restored, sizeof(restored), "%s/restored/%s",
                                    fixture.home, file_logical);
@@ -1545,9 +1545,9 @@ static void test_collision_suffix_validation(void)
                   report.applied_count == 4 && report.failed_count == 0,
               "suffixed ancestor and suffixed leaf replay successfully");
         char nested[PATH_MAX], leaf[PATH_MAX];
-        path_join(nested, sizeof(nested), fixture.home,
+        path_concat(nested, sizeof(nested), fixture.home,
                   "/restored/dir/file");
-        path_join(leaf, sizeof(leaf), fixture.home, "/restored/Foo");
+        path_concat(leaf, sizeof(leaf), fixture.home, "/restored/Foo");
         check(file_equals_noatime(nested, "nested"),
               "child beneath a suffixed directory is restored by logical name");
         check(file_equals_noatime(leaf, "leaf"),
@@ -1691,10 +1691,10 @@ static void test_normal_replay(void)
 
     char restored_root[PATH_MAX], restored_nested[PATH_MAX],
         restored_file[PATH_MAX], sentinel[PATH_MAX];
-    path_join(restored_root, sizeof(restored_root), fixture.home, "/restored");
-    path_join(restored_nested, sizeof(restored_nested), restored_root, "/nested");
-    path_join(restored_file, sizeof(restored_file), restored_nested, "/file");
-    path_join(sentinel, sizeof(sentinel), fixture.home, "/sentinel");
+    path_concat(restored_root, sizeof(restored_root), fixture.home, "/restored");
+    path_concat(restored_nested, sizeof(restored_nested), restored_root, "/nested");
+    path_concat(restored_file, sizeof(restored_file), restored_nested, "/file");
+    path_concat(sentinel, sizeof(sentinel), fixture.home, "/sentinel");
     check(file_equals_noatime(restored_file, "portable payload"),
           "regular payload content is restored");
     check(metadata_exact(restored_root, 0500, (uid_t)geteuid(),
@@ -1826,7 +1826,7 @@ static void test_regular_content_verification(void)
         PortableRestoreReplayReport report;
         int result = run_replay(&damaged, &report);
         char restored[PATH_MAX];
-        path_join(restored, sizeof(restored), damaged.home, "/restored/file");
+        path_concat(restored, sizeof(restored), damaged.home, "/restored/file");
         check(result != 0 && report.applied_count == 2 &&
                   report.verification_checked_count == 1 &&
                   report.verification_failed_count == 1 &&
@@ -1858,7 +1858,7 @@ static void test_regular_content_verification(void)
             &skipped, &report, NULL, 1, note_verification_boundary, &probe);
         clear_verification_mutation();
         char restored[PATH_MAX];
-        path_join(restored, sizeof(restored), skipped.home, "/restored/file");
+        path_concat(restored, sizeof(restored), skipped.home, "/restored/file");
         check(result == 0 && report.failed_count == 0 &&
                   report.verification_checked_count == 0 &&
                   report.verification_failed_count == 0 && probe.calls == 0 &&
@@ -1927,7 +1927,7 @@ static void test_verification_refuses_destination_symlink_replacement(void)
         int result = run_replay(&leaf, &report);
         clear_verification_mutation();
         char outside[PATH_MAX];
-        path_join(outside, sizeof(outside), leaf.home, "/outside");
+        path_concat(outside, sizeof(outside), leaf.home, "/outside");
         check(result != 0 && report.verification_failed_count == 1 &&
                   report.failure_step ==
                       PORTABLE_RESTORE_REPLAY_FAILURE_VERIFY_DESTINATION_PATH &&
@@ -1979,7 +1979,7 @@ static void test_verification_refuses_destination_symlink_replacement(void)
         int result = run_replay(&parent, &report);
         clear_verification_mutation();
         char outside[PATH_MAX];
-        path_join(outside, sizeof(outside), parent.home, "/outside-dir/file");
+        path_concat(outside, sizeof(outside), parent.home, "/outside-dir/file");
         check(result != 0 && report.verification_failed_count == 1 &&
                   report.failure_step ==
                       PORTABLE_RESTORE_REPLAY_FAILURE_VERIFY_DESTINATION_PATH &&
@@ -2173,7 +2173,7 @@ static void test_destination_truncation(void)
           "restore overwrites the existing regular file");
 
     char restored_file[PATH_MAX];
-    path_join(restored_file, sizeof(restored_file), fixture.home,
+    path_concat(restored_file, sizeof(restored_file), fixture.home,
               "/restored/file");
     struct stat restored_stat;
     check(fstatat(fixture.home_fd, "restored/file", &restored_stat,
@@ -2420,7 +2420,7 @@ static void test_dconf_database_kept_only_for_a_session_load(void)
         if (dconf_fd >= 0)
             close(dconf_fd);
         char database[PATH_MAX];
-        path_join(database, sizeof(database), fixture.home,
+        path_concat(database, sizeof(database), fixture.home,
                   "/.config/dconf/user");
         if (session_loads)
             check(result == 0 && report.live_state_kept_count == 1 &&
@@ -2548,10 +2548,10 @@ static int probe_before_deferred(void *context)
 {
     DeferralProbe *probe = context;
     char other[PATH_MAX], deferred[PATH_MAX], link[PATH_MAX];
-    path_join(other, sizeof(other), probe->home, "/restored/other");
-    path_join(deferred, sizeof(deferred), probe->home,
+    path_concat(other, sizeof(other), probe->home, "/restored/other");
+    path_concat(deferred, sizeof(deferred), probe->home,
               "/restored/app/settings");
-    path_join(link, sizeof(link), probe->home, "/restored/app-link");
+    path_concat(link, sizeof(link), probe->home, "/restored/app-link");
     struct stat st;
     probe->calls++;
     probe->others_in_place = file_equals_noatime(other, "other file");
@@ -2623,9 +2623,9 @@ static void test_deferred_paths_restore_last(void)
         replay_before_deferred_context = NULL;
 
         char deferred[PATH_MAX], link[PATH_MAX];
-        path_join(deferred, sizeof(deferred), fixture.home,
+        path_concat(deferred, sizeof(deferred), fixture.home,
                   "/restored/app/settings");
-        path_join(link, sizeof(link), fixture.home, "/restored/app-link");
+        path_concat(link, sizeof(link), fixture.home, "/restored/app-link");
         struct stat st;
         check(result == 0 && probe.calls == 1 && probe.others_in_place &&
                   probe.deferred_absent && report.deferred_count == 2,
@@ -2994,7 +2994,7 @@ static void test_live_desktop_state_verification_exclusion(void)
         int result = run_replay_with_options(
             &excluded, &report, NULL, 0, mutate_verification_paths, &probe);
         char mutated_root[PATH_MAX];
-        path_join(mutated_root, sizeof(mutated_root), excluded.home,
+        path_concat(mutated_root, sizeof(mutated_root), excluded.home,
                   "/.local/share/gvfs-metadata/root");
         check(probe.restored_contents_match,
               "excluded live-state files are restored before verification");
@@ -3023,9 +3023,9 @@ static void test_live_desktop_state_verification_exclusion(void)
         PortableRestoreReplayReport report;
         int result = run_replay(&kept, &report);
         char service_file[PATH_MAX], missing_file[PATH_MAX];
-        path_join(service_file, sizeof(service_file), kept.home,
+        path_concat(service_file, sizeof(service_file), kept.home,
                   "/.local/share/gvfs-metadata/root");
-        path_join(missing_file, sizeof(missing_file), kept.home,
+        path_concat(missing_file, sizeof(missing_file), kept.home,
                   "/.local/share/gvfs-metadata/home");
         check(result == 0 && report.live_state_kept_count == 1 &&
                   file_equals_noatime(service_file,
@@ -3240,9 +3240,9 @@ static void test_known_desktop_state_rewrites_home(void)
           "changed-HOME desktop-state replay succeeds");
 
     char restored_bookmarks[PATH_MAX], restored_recent[PATH_MAX];
-    path_join(restored_bookmarks, sizeof(restored_bookmarks), fixture.home,
+    path_concat(restored_bookmarks, sizeof(restored_bookmarks), fixture.home,
               "/.config/gtk-3.0/bookmarks");
-    path_join(restored_recent, sizeof(restored_recent), fixture.home,
+    path_concat(restored_recent, sizeof(restored_recent), fixture.home,
               "/.local/share/recently-used.xbel");
     check(file_equals_noatime(restored_bookmarks, expected_bookmarks),
           "GTK bookmarks rewrite only exact source-HOME path components");
@@ -3280,8 +3280,8 @@ static void test_known_desktop_state_rewrites_xdg_roots(void)
     }
 
     char documents[PATH_MAX], downloads[PATH_MAX];
-    path_join(documents, sizeof(documents), fixture.home, "/Belgeler");
-    path_join(downloads, sizeof(downloads), fixture.home, "/İndirilenler");
+    path_concat(documents, sizeof(documents), fixture.home, "/Belgeler");
+    path_concat(downloads, sizeof(downloads), fixture.home, "/İndirilenler");
     if (mkdir(documents, 0700) != 0 || mkdir(downloads, 0700) != 0)
         fatal("could not create localized XDG destination directories");
     const char *xdg_dirs[XDG_KEY_COUNT] = {0};
@@ -3307,9 +3307,9 @@ static void test_known_desktop_state_rewrites_xdg_roots(void)
              downloads, documents, fixture.home);
 
     char restored_bookmarks[PATH_MAX], restored_recent[PATH_MAX];
-    path_join(restored_bookmarks, sizeof(restored_bookmarks), fixture.home,
+    path_concat(restored_bookmarks, sizeof(restored_bookmarks), fixture.home,
               "/.config/gtk-3.0/bookmarks");
-    path_join(restored_recent, sizeof(restored_recent), fixture.home,
+    path_concat(restored_recent, sizeof(restored_recent), fixture.home,
               "/.local/share/recently-used.xbel");
     check(file_equals_noatime(restored_bookmarks, expected_bookmarks) &&
               file_equals_noatime(restored_recent, expected_recent),
@@ -3346,9 +3346,9 @@ static void test_known_desktop_state_same_home_is_verbatim(void)
     check(run_replay(&fixture, &report) == 0 && report.failed_count == 0,
           "same-HOME desktop-state replay succeeds");
     char restored_bookmarks[PATH_MAX], restored_recent[PATH_MAX];
-    path_join(restored_bookmarks, sizeof(restored_bookmarks), fixture.home,
+    path_concat(restored_bookmarks, sizeof(restored_bookmarks), fixture.home,
               "/.config/gtk-3.0/bookmarks");
-    path_join(restored_recent, sizeof(restored_recent), fixture.home,
+    path_concat(restored_recent, sizeof(restored_recent), fixture.home,
               "/.local/share/recently-used.xbel");
     check(file_equals_noatime(restored_bookmarks, bookmarks) &&
               file_equals_noatime(restored_recent, recent),
@@ -3378,9 +3378,9 @@ static void test_known_desktop_state_legacy_is_verbatim(void)
     check(run_replay(&fixture, &report) == 0 && report.failed_count == 0,
           "legacy desktop-state replay succeeds without source HOME");
     char restored_bookmarks[PATH_MAX], restored_recent[PATH_MAX];
-    path_join(restored_bookmarks, sizeof(restored_bookmarks), fixture.home,
+    path_concat(restored_bookmarks, sizeof(restored_bookmarks), fixture.home,
               "/.config/gtk-3.0/bookmarks");
-    path_join(restored_recent, sizeof(restored_recent), fixture.home,
+    path_concat(restored_recent, sizeof(restored_recent), fixture.home,
               "/.local/share/recently-used.xbel");
     check(file_equals_noatime(restored_bookmarks, bookmarks) &&
               file_equals_noatime(restored_recent, recent),
@@ -3525,7 +3525,7 @@ static void test_outstanding_claim_gate(void)
               report.failed_count == 1,
           "replay rejects the claim before collecting or mutating entries");
     char sentinel[PATH_MAX];
-    path_join(sentinel, sizeof(sentinel), fixture.home, "/sentinel");
+    path_concat(sentinel, sizeof(sentinel), fixture.home, "/sentinel");
     check(file_equals_noatime(sentinel, "untouched"),
           "claim-gate replay leaves the destination untouched");
     fixture_close(&fixture);
@@ -3561,7 +3561,7 @@ static void test_xattr_replay(void)
           "xattr-bearing entries replay successfully");
 
     char restored_file[PATH_MAX];
-    path_join(restored_file, sizeof(restored_file), fixture.home,
+    path_concat(restored_file, sizeof(restored_file), fixture.home,
               "/restored/file");
     char value[64];
     ssize_t length = getxattr(restored_file, "user.migr_test", value,
@@ -3604,7 +3604,7 @@ static void test_xattr_reconciliation(void)
      * then restore again over the same destination: exact-set reconciliation
      * must remove the stale one and overwrite the changed one. */
     char restored_file[PATH_MAX];
-    path_join(restored_file, sizeof(restored_file), fixture.home,
+    path_concat(restored_file, sizeof(restored_file), fixture.home,
               "/restored/file");
     check(setxattr(restored_file, "user.migr_stale", "stale", 5, 0) == 0,
           "fixture: a stale destination xattr is planted");
@@ -3658,7 +3658,7 @@ static void test_gate_refuses_trusted_before_mutation(void)
           "trusted.* sidecar is committed");
 
     char sentinel[PATH_MAX];
-    path_join(sentinel, sizeof(sentinel), fixture.home, "/sentinel");
+    path_concat(sentinel, sizeof(sentinel), fixture.home, "/sentinel");
     write_file_at(fixture.home_fd, "sentinel", "untouched");
 
     PortableRestoreReplayReport report;
@@ -3670,7 +3670,7 @@ static void test_gate_refuses_trusted_before_mutation(void)
           "gate refusal leaves the destination sentinel untouched");
 
     char restored_file[PATH_MAX];
-    path_join(restored_file, sizeof(restored_file), fixture.home,
+    path_concat(restored_file, sizeof(restored_file), fixture.home,
               "/restored/file");
     check(access(restored_file, F_OK) != 0,
           "gate refusal never creates the entry's destination path");
@@ -3703,7 +3703,7 @@ static void test_gate_allows_security_only(void)
     int result = run_replay(&fixture, &report);
 
     char restored_file[PATH_MAX];
-    path_join(restored_file, sizeof(restored_file), fixture.home,
+    path_concat(restored_file, sizeof(restored_file), fixture.home,
               "/restored/file");
     /*
      * The gate must not refuse a security.*-only payload (the probe masks
@@ -3764,11 +3764,11 @@ static void test_payload_swap(void)
               report.failure_errno == EIO,
           "payload replacement is caught after reporting prior progress");
     char restored_first[PATH_MAX], restored_file[PATH_MAX], sentinel[PATH_MAX];
-    path_join(restored_first, sizeof(restored_first), fixture.home,
+    path_concat(restored_first, sizeof(restored_first), fixture.home,
               "/restored/a");
-    path_join(restored_file, sizeof(restored_file), fixture.home,
+    path_concat(restored_file, sizeof(restored_file), fixture.home,
               "/restored/file");
-    path_join(sentinel, sizeof(sentinel), fixture.home, "/sentinel");
+    path_concat(sentinel, sizeof(sentinel), fixture.home, "/sentinel");
     check(file_equals_noatime(restored_first, "applied"),
           "entries before the swapped payload remain applied");
     check(access(restored_file, F_OK) != 0,
@@ -3807,7 +3807,7 @@ static void test_tombstone_skipped(void)
               report.applied_count == 1 && report.failed_count == 0,
           "only the live root is replayed");
     char deleted[PATH_MAX];
-    path_join(deleted, sizeof(deleted), fixture.home, "/restored/deleted");
+    path_concat(deleted, sizeof(deleted), fixture.home, "/restored/deleted");
     check(access(deleted, F_OK) != 0,
           "tombstoned entry is not resurrected");
     fixture_close(&fixture);
@@ -3885,7 +3885,7 @@ static void test_hardlink_toctou_race(void)
           "detected instead of silently accepted");
 
     char representative[PATH_MAX];
-    path_join(representative, sizeof(representative), fixture.home,
+    path_concat(representative, sizeof(representative), fixture.home,
               "/restored/representative");
     check(file_equals_noatime(representative, "swapped payload"),
           "the swap actually took effect between validation and linkat");
@@ -3957,9 +3957,9 @@ static void test_resolved_destination_identity_replay(void)
         fatal("could not close direct replay Shared target");
 
     char shared[PATH_MAX], alias[PATH_MAX], sentinel[PATH_MAX];
-    path_join(shared, sizeof(shared), fixture.home, "/Shared");
-    path_join(alias, sizeof(alias), fixture.home, "/Alias");
-    path_join(sentinel, sizeof(sentinel), shared, "/file");
+    path_concat(shared, sizeof(shared), fixture.home, "/Shared");
+    path_concat(alias, sizeof(alias), fixture.home, "/Alias");
+    path_concat(sentinel, sizeof(sentinel), shared, "/file");
     xdg_dirs[0] = shared;
     xdg_dirs[1] = alias;
     PortableRestoreReplayReport report;
@@ -4053,14 +4053,14 @@ static void test_resolved_destination_identity_replay(void)
     char outer[PATH_MAX], middle[PATH_MAX], leaf[PATH_MAX];
     char documents_alias[PATH_MAX], downloads_alias[PATH_MAX];
     char outer_file[PATH_MAX], leaf_file[PATH_MAX];
-    path_join(outer, sizeof(outer), fixture.home, "/Outer");
-    path_join(middle, sizeof(middle), outer, "/Middle");
-    path_join(leaf, sizeof(leaf), middle, "/Leaf");
-    path_join(documents_alias, sizeof(documents_alias), fixture.home, "/d");
-    path_join(downloads_alias, sizeof(downloads_alias), fixture.home,
+    path_concat(outer, sizeof(outer), fixture.home, "/Outer");
+    path_concat(middle, sizeof(middle), outer, "/Middle");
+    path_concat(leaf, sizeof(leaf), middle, "/Leaf");
+    path_concat(documents_alias, sizeof(documents_alias), fixture.home, "/d");
+    path_concat(downloads_alias, sizeof(downloads_alias), fixture.home,
               "/a-very-long-download-alias");
-    path_join(outer_file, sizeof(outer_file), outer, "/outer.txt");
-    path_join(leaf_file, sizeof(leaf_file), leaf, "/leaf-link.txt");
+    path_concat(outer_file, sizeof(outer_file), outer, "/outer.txt");
+    path_concat(leaf_file, sizeof(leaf_file), leaf, "/leaf-link.txt");
     xdg_dirs[0] = documents_alias;
     xdg_dirs[1] = downloads_alias;
 
@@ -4127,8 +4127,8 @@ static void test_ascii_case_distinct_names(void)
     PortableRestoreReplayReport report;
     int result = run_replay(&fixture, &report);
     char upper[PATH_MAX], lower[PATH_MAX];
-    path_join(upper, sizeof(upper), fixture.home, "/restored/Documents");
-    path_join(lower, sizeof(lower), fixture.home, "/restored/documents");
+    path_concat(upper, sizeof(upper), fixture.home, "/restored/Documents");
+    path_concat(lower, sizeof(lower), fixture.home, "/restored/documents");
     check(result == 0 && report.failed_count == 0 &&
               file_equals_noatime(upper, "UPPER") &&
               file_equals_noatime(lower, "LOWER"),
@@ -4153,23 +4153,23 @@ static void test_portable_identity_graph_keeps_nested_mount_views_route_specific
     char documents_root[PATH_MAX], downloads_root[PATH_MAX];
     char documents_shared[PATH_MAX], downloads_shared[PATH_MAX];
     char documents_desc[PATH_MAX], downloads_desc[PATH_MAX], alternate[PATH_MAX];
-    path_join(documents_root, sizeof(documents_root), fixture.home,
+    path_concat(documents_root, sizeof(documents_root), fixture.home,
               "/Documents");
-    path_join(downloads_root, sizeof(downloads_root), fixture.home,
+    path_concat(downloads_root, sizeof(downloads_root), fixture.home,
               "/Downloads");
-    path_join(documents_shared, sizeof(documents_shared), fixture.home,
+    path_concat(documents_shared, sizeof(documents_shared), fixture.home,
               "/Documents/shared");
-    path_join(downloads_shared, sizeof(downloads_shared), fixture.home,
+    path_concat(downloads_shared, sizeof(downloads_shared), fixture.home,
               "/Downloads/shared");
-    path_join(documents_desc, sizeof(documents_desc), documents_shared, "/desc");
-    path_join(downloads_desc, sizeof(downloads_desc), downloads_shared, "/desc");
-    path_join(alternate, sizeof(alternate), fixture.home, "/alternate");
+    path_concat(documents_desc, sizeof(documents_desc), documents_shared, "/desc");
+    path_concat(downloads_desc, sizeof(downloads_desc), downloads_shared, "/desc");
+    path_concat(alternate, sizeof(alternate), fixture.home, "/alternate");
     if (mkdir(documents_shared, 0700) != 0 || mkdir(downloads_shared, 0700) != 0 ||
         mkdir(documents_desc, 0700) != 0 || mkdir(downloads_desc, 0700) != 0)
         fatal("could not create nested mount-view destinations");
 
     char alternate_file[PATH_MAX];
-    path_join(alternate_file, sizeof(alternate_file), alternate,
+    path_concat(alternate_file, sizeof(alternate_file), alternate,
               "/downloads-file");
     if (mkdir(alternate_file, 0700) != 0)
         fatal("could not create alternate nested mount-view descendant");
@@ -4237,17 +4237,17 @@ static void test_differing_mount_ids_do_not_hide_portable_collisions(void)
     char documents_root[PATH_MAX], downloads_root[PATH_MAX];
     char documents_shared[PATH_MAX], downloads_shared[PATH_MAX];
     char sentinel[PATH_MAX];
-    path_join(documents_root, sizeof(documents_root), fixture.home,
+    path_concat(documents_root, sizeof(documents_root), fixture.home,
               "/Documents");
-    path_join(downloads_root, sizeof(downloads_root), fixture.home,
+    path_concat(downloads_root, sizeof(downloads_root), fixture.home,
               "/Downloads");
-    path_join(documents_shared, sizeof(documents_shared), fixture.home,
+    path_concat(documents_shared, sizeof(documents_shared), fixture.home,
               "/Documents/shared");
-    path_join(downloads_shared, sizeof(downloads_shared), fixture.home,
+    path_concat(downloads_shared, sizeof(downloads_shared), fixture.home,
               "/Downloads/shared");
     if (mkdir(documents_shared, 0700) != 0 || mkdir(downloads_shared, 0700) != 0)
         fatal("could not create differing-mount-id destinations");
-    path_join(sentinel, sizeof(sentinel), downloads_shared, "/file");
+    path_concat(sentinel, sizeof(sentinel), downloads_shared, "/file");
     int sentinel_fd = open(sentinel, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
                            0600);
     if (sentinel_fd < 0 || write(sentinel_fd, "ORIGINAL", 8) != 8 ||
@@ -4328,9 +4328,9 @@ static void test_v2_nested_root_replay_order(void)
     PortableRestoreReplayReport report;
     int result = run_replay(&fixture, &report);
     char home_file[PATH_MAX], child_file[PATH_MAX], documents[PATH_MAX];
-    path_join(home_file, sizeof(home_file), fixture.home, "/home.txt");
-    path_join(child_file, sizeof(child_file), fixture.home, "/Documents/child.txt");
-    path_join(documents, sizeof(documents), fixture.home, "/Documents");
+    path_concat(home_file, sizeof(home_file), fixture.home, "/home.txt");
+    path_concat(child_file, sizeof(child_file), fixture.home, "/Documents/child.txt");
+    path_concat(documents, sizeof(documents), fixture.home, "/Documents");
     struct stat home_st, documents_st;
     int metadata_ok = stat(fixture.home, &home_st) == 0 &&
                       stat(documents, &documents_st) == 0;

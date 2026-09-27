@@ -22,17 +22,10 @@
 #include "sidecar.h"
 #include "utils.h"
 
-#define VERIFY_EXAMPLES 8
-
 typedef struct {
     const SidecarEntry *entry;
     size_t root_index;
 } VerifyItem;
-
-typedef struct {
-    char location[MANIFEST_ID_MAX + PATH_MAX + 2];
-    char reason[160];
-} VerifyExample;
 
 typedef struct {
     const Manifest *manifest;
@@ -53,11 +46,9 @@ typedef struct {
     size_t parent_logical_length;
 
     size_t checked;
-    size_t failed;
     uint64_t bytes_read;
     uint64_t total_bytes;
-    VerifyExample examples[VERIFY_EXAMPLES];
-    size_t example_count;
+    ExampleList failed;
 
     int progress;
     struct timespec started_at;
@@ -150,24 +141,23 @@ static void verify_record(VerifyRun *run, const VerifyItem *item,
 static void verify_record(VerifyRun *run, const VerifyItem *item,
                           const char *format, ...)
 {
-    if (run->failed != SIZE_MAX)
-        run->failed++;
-    if (run->example_count >= VERIFY_EXAMPLES)
+    char *text = example_list_next(&run->failed);
+    if (text == NULL)
         return;
-    VerifyExample *example = &run->examples[run->example_count++];
+    char reason[160];
+    va_list arguments;
+    va_start(arguments, format);
+    (void)vsnprintf(reason, sizeof(reason), format, arguments);
+    va_end(arguments);
     const SidecarEntry *entry = item->entry;
-    (void)snprintf(example->location, sizeof(example->location), "%.*s:%.*s",
+    (void)snprintf(text, EXAMPLE_TEXT_MAX, "%.*s:%.*s (%s)",
                    (int)entry->root_id.length,
                    (const char *)entry->root_id.data,
                    entry->logical_path.length != 0
                        ? (int)entry->logical_path.length : 1,
                    entry->logical_path.length != 0
-                       ? (const char *)entry->logical_path.data : ".");
-    va_list arguments;
-    va_start(arguments, format);
-    (void)vsnprintf(example->reason, sizeof(example->reason), format,
-                    arguments);
-    va_end(arguments);
+                       ? (const char *)entry->logical_path.data : ".",
+                   reason);
 }
 
 // The payload may be owned by another user (a backup taken under sudo), in
@@ -551,7 +541,8 @@ int verify_backup(const char *path)
     }
 
     fflush(stdout);
-    if (run.failed == 0)
+    size_t failed = run.failed.count;
+    if (failed == 0)
     {
         print_success("Backup verified: all %zu item%s match what was "
                       "captured\n", run.count, run.count == 1 ? "" : "s");
@@ -562,13 +553,9 @@ int verify_backup(const char *path)
     // exit 1, as cmp and diff do (D68).
     result = MIGR_EXIT_CHANGED;
     printf("Verification found %zu item%s that differ%s from what was "
-           "captured:\n", run.failed, run.failed == 1 ? "" : "s",
-           run.failed == 1 ? "s" : "");
-    for (size_t index = 0; index < run.example_count; index++)
-        printf("  %s (%s)\n", run.examples[index].location,
-               run.examples[index].reason);
-    if (run.failed > run.example_count)
-        printf("  ... and %zu more\n", run.failed - run.example_count);
+           "captured:\n", failed, failed == 1 ? "" : "s",
+           failed == 1 ? "s" : "");
+    example_list_print(&run.failed, "  ");
 
 done:
     verify_parent_forget(&run);
