@@ -451,10 +451,15 @@ typedef struct {
 } RestoreWriterApp;
 
 // Applications whose settings the default scope restores and which rewrite
-// them while running or on exit. Matched by /proc/<pid>/comm (truncated to 15
-// bytes by the kernel). GNOME Software refreshes the restored Flatpak repo.
+// them while running or on exit, one entry per path an application owns.
+// Matched by /proc/<pid>/comm (truncated to 15 bytes by the kernel). VS Code
+// updates its extensions on its own (D77). GNOME Software refreshes the
+// restored Flatpak repo.
 static const RestoreWriterApp restore_writer_apps[] = {
     { "code", "Visual Studio Code", ".config/Code" },
+    { "code", "Visual Studio Code", ".vscode" },
+    { "codium", "VSCodium", ".config/VSCodium" },
+    { "codium", "VSCodium", ".vscode-oss" },
     { "firefox", "Firefox", ".mozilla/firefox" },
     { "firefox-bin", "Firefox", ".mozilla/firefox" },
     { "brave", "Brave", ".config/BraveSoftware" },

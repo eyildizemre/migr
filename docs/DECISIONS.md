@@ -4813,3 +4813,25 @@ distro hop, and the data D75 restores had no application to use it.
 
 **Relationship:** Complements D75. Snap is not covered yet.
 
+## D77 — 2026-09-27 — VS Code extensions are backed up as files
+
+**Status:** Implemented
+
+**Decision:** `~/.vscode` and `~/.vscode-oss` (VSCodium) are built-in roots
+in every scope (`BUILTIN_DOT_VSCODE`, `BUILTIN_DOT_VSCODE_OSS`). Each holds
+the installed extensions, one directory per extension plus the editor's
+`extensions.json`, so a restore brings them back installed. While VS Code or
+VSCodium runs, these directories count as its settings (D66, D69) and are
+restored last, since the editor updates extensions on its own; the table of
+running applications lists one entry per path an application owns.
+`vs-code-extensions.txt` is still written: some extensions carry native
+binaries for one architecture (`linux-x64`), and the list is how a machine
+with another one reinstalls them.
+
+**Why:** Only the extension list was kept, and restore did not act on it, so
+every extension had to be reinstalled by hand. The first real backup's
+`~/.vscode` held 23 extensions in 1.8 GB.
+
+**Relationship:** Extends D66 and D69. A Flatpak VS Code keeps its
+extensions under `~/.var/app` (D75).
+

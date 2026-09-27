@@ -2358,9 +2358,10 @@ static void test_open_application_settings_are_deferred(void)
 
 // A native restore with Visual Studio Code and Google Chrome open holds
 // back what they own until everything else is restored (D69): Code's folder
-// inside the .config root, and the whole Chrome root.
+// inside the .config root, and the whole Chrome and .vscode roots.
 typedef struct {
     int code_restored;
+    int extensions_restored;
     int chrome_restored;
     int other_restored;
     int config_mtime_kept;
@@ -2377,7 +2378,7 @@ static int run_native_deferred_restore(const char *input, char *output,
     fresh_mkdtemp(home, sizeof(home), "dispatch_native_defer_home");
     setenv("HOME", home, 1);
 
-    ManifestRoot roots[2];
+    ManifestRoot roots[3];
     memset(roots, 0, sizeof(roots));
     strcpy(roots[0].id, "CONFIG");
     roots[0].policy = ROOT_POLICY_HOME_RELATIVE;
@@ -2391,11 +2392,19 @@ static int run_native_deferred_restore(const char *input, char *output,
     strcpy(roots[1].source_path, ".config/google-chrome");
     strcpy(roots[1].restore_path, ".config/google-chrome");
     roots[1].has_restore_path = 1;
+    strcpy(roots[2].id, "VSCODE");
+    roots[2].policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(roots[2].payload_path, "VSCODE");
+    strcpy(roots[2].source_path, ".vscode");
+    strcpy(roots[2].restore_path, ".vscode");
+    roots[2].has_restore_path = 1;
     Manifest manifest;
-    make_v1_manifest(&manifest, roots, 2);
+    make_v1_manifest(&manifest, roots, 3);
     if (manifest_write_v1(source, &manifest) != 0)
         return -1;
     write_payload_file(source, "data/CONFIG/Code", "settings.json", "{}");
+    write_payload_file(source, "data/VSCODE/extensions", "extensions.json",
+                       "[]");
     write_payload_file(source, "data/CONFIG", "other.txt", "other");
     write_payload_file(source, "data/CHROME", "Local State", "chrome");
     remove_fixture_packages(source);
@@ -2424,6 +2433,8 @@ static int run_native_deferred_restore(const char *input, char *output,
     char path[PATH_MAX];
     join_path(path, sizeof(path), home, ".config/Code/settings.json");
     outcome->code_restored = file_content_is(path, "{}");
+    join_path(path, sizeof(path), home, ".vscode/extensions/extensions.json");
+    outcome->extensions_restored = file_content_is(path, "[]");
     join_path(path, sizeof(path), home, ".config/google-chrome/Local State");
     outcome->chrome_restored = file_content_is(path, "chrome");
     join_path(path, sizeof(path), home, ".config/other.txt");
@@ -2457,22 +2468,30 @@ static void test_native_open_application_settings_are_deferred(void)
               strstr(prompt, "Google Chrome") != NULL,
           "the open applications are named before the prompt and asked "
           "about at the end");
+    const char *left_out = strstr(output, "Left out the settings of "
+                                          "applications that stayed open (");
+    const char *left_out_end = left_out != NULL ? strchr(left_out, '\n')
+                                                : NULL;
+    const char *chrome = strstr(output, "~/.config/google-chrome");
+    const char *code = strstr(output, "~/.config/Code");
+    const char *extensions = strstr(output, "~/.vscode");
     check(outcome.other_restored && !outcome.code_restored &&
-              !outcome.chrome_restored &&
-              strstr(output, "Left out the settings of applications that "
-                             "stayed open (~/.config/google-chrome, "
-                             "~/.config/Code)") != NULL,
-          "s leaves out a folder inside a root and a whole root, while "
-          "everything else is restored");
+              !outcome.chrome_restored && !outcome.extensions_restored &&
+              left_out_end != NULL &&
+              chrome > left_out && chrome < left_out_end &&
+              code > left_out && code < left_out_end &&
+              extensions > left_out && extensions < left_out_end,
+          "s leaves out a folder inside a root and whole roots, VS Code's "
+          "extensions included, while everything else is restored");
 
     rc = run_native_deferred_restore("y\n", output, sizeof(output),
                                      &outcome);
     check(rc == 0 && outcome.other_restored && outcome.code_restored &&
-              outcome.chrome_restored &&
+              outcome.chrome_restored && outcome.extensions_restored &&
               strstr(output, "No answer; restoring them now.") != NULL &&
-              strstr(output, "Restore complete: 2 items restored") != NULL,
+              strstr(output, "Restore complete: 3 items restored") != NULL,
           "with no one to answer, both are restored anyway, with a note, and "
-          "the whole root is counted");
+          "the whole roots are counted");
     check(outcome.config_mtime_kept,
           "the folder holding the late settings keeps its restored "
           "modification time");
@@ -2557,14 +2576,16 @@ static void test_running_writer_detection(void)
     for (size_t index = 0; index < count; index++)
     {
         code += strcmp(labels[index], "Visual Studio Code") == 0 &&
-                strcmp(settings[index], ".config/Code") == 0;
+                (strcmp(settings[index], ".config/Code") == 0 ||
+                 strcmp(settings[index], ".vscode") == 0);
         software += strcmp(labels[index], "GNOME Software") == 0 &&
                     settings[index][0] == '\0';
         spotify += strcmp(labels[index], "com.spotify.Client") == 0 &&
                    strcmp(settings[index], ".var/app/com.spotify.Client") == 0;
     }
-    check(count == 3 && code == 1 && software == 1,
-          "only the target user's known writers are named, each once");
+    check(count == 4 && code == 2 && software == 1,
+          "only the target user's known writers are named, once per path "
+          "they own");
     check(spotify == 1,
           "an open Flatpak app is named by its app id and owns its "
           "~/.var/app directory, once for all its processes");

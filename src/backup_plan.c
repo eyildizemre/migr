@@ -125,6 +125,8 @@ static const BuiltinHomeEntry builtin_home_catalog[] = {
     { "BUILTIN_LOCAL_STATE",            ".local/state",         BACKUP_ROOT_DOTFILE, 0 },
     { "BUILTIN_LOCAL_BIN",              ".local/bin",           BACKUP_ROOT_DOTFILE, 0 },
     { "BUILTIN_FLATPAK_APPS",           ".var/app",             BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_DOT_VSCODE",             ".vscode",              BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_DOT_VSCODE_OSS",         ".vscode-oss",          BACKUP_ROOT_DOTFILE, 0 },
     { "BUILTIN_DOT_BASHRC",             ".bashrc",              BACKUP_ROOT_DOTFILE, 0 },
     { "BUILTIN_DOT_BASH_HISTORY",        ".bash_history",         BACKUP_ROOT_DOTFILE, 0 },
     { "BUILTIN_DOT_BASH_PROFILE",        ".bash_profile",        BACKUP_ROOT_DOTFILE, 0 },

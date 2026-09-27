@@ -282,7 +282,7 @@ As with GNU tar:
 
 ## What Gets Backed Up
 
-**`--critical` (default):** Documents, Downloads, Pictures, Desktop, persistent user config/state under `~/.config`, `~/.local/share`, `~/.local/state`, user-local executables under `~/.local/bin`, Flatpak applications' settings and data under `~/.var/app` (without each application's `cache/`), and common shell/terminal dotfiles.
+**`--critical` (default):** Documents, Downloads, Pictures, Desktop, persistent user config/state under `~/.config`, `~/.local/share`, `~/.local/state`, user-local executables under `~/.local/bin`, Flatpak applications' settings and data under `~/.var/app` (without each application's `cache/`), VS Code and VSCodium extensions under `~/.vscode` and `~/.vscode-oss`, and common shell/terminal dotfiles.
 
 **`--comprehensive`:** Everything `--critical` covers, plus Videos and Music.
 
@@ -315,7 +315,7 @@ backups remain literal requests and do not add this consent gate.
 
 **Group memberships (all scopes except explicit paths):** The groups you were added to, such as `libvirt`, `docker`, or `dialout`, saved by name as `groups.txt`. Restore adds you back to each of them the new system has, after installing packages, since packages create groups; it takes effect at your next login. Groups the new system does not have are listed, not created.
 
-**VS Code extensions (all scopes except explicit paths):** When `code` is available and lists extensions, migr saves `code --list-extensions --show-versions` to `vs-code-extensions.txt` as a best-effort snapshot. Restore does not install VS Code or extensions from this file. Once VS Code is set up on the new system, each saved line can be passed to `code --install-extension` directly, or replayed with a simple shell loop.
+**VS Code extensions (all scopes except explicit paths):** Installed extensions come back with `~/.vscode`, installed and with their state. When `code` is available and lists extensions, migr also saves `code --list-extensions --show-versions` to `vs-code-extensions.txt`. Some extensions carry native code for one CPU architecture; on a machine with another one, pass each saved line to `code --install-extension` instead. Restore does not install from this file.
 
 ## Backup Containers
 
