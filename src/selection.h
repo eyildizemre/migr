@@ -42,6 +42,8 @@ void selection_plan_print_notes(const SelectionPlan *plan);
 typedef struct {
     char name[NAME_MAX + 1];
     off_t size;
+    /* 0 when size is a lower bound: parts were unreadable, on another
+     * filesystem, or beyond the walk's budget. */
     int size_known;
 } SelectionUncovered;
 

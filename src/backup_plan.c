@@ -1326,31 +1326,39 @@ void selection_plan_print_notes(const SelectionPlan *plan)
                "download cache and is left out.\n");
 }
 
-// Sums regular-file sizes below dir_fd/name without following symlinks.
-// Unreadable subtrees make the total a lower bound (*complete = 0).
+// Entries looked at per top-level entry: the list is only informational, so
+// a large tree shows a lower bound instead of a full walk.
+#define UNCOVERED_WALK_BUDGET 10000U
+
+typedef struct {
+    dev_t device;  /* HOME's filesystem; another one is not measured. */
+    size_t budget; /* Entries still to look at. */
+    int complete;  /* 0 once the total is only a lower bound. */
+} TreeWalk;
+
+// Sums regular-file sizes below dir_fd/name without following symlinks or
+// entering another filesystem (a NAS mounted in HOME, say).
 static off_t tree_size_at(int dir_fd, const char *name, int depth,
-                          int *complete)
+                          TreeWalk *walk)
 {
     struct stat st;
-    if (fstatat(dir_fd, name, &st, AT_SYMLINK_NOFOLLOW) != 0)
+    if (walk->budget == 0 || depth > 256 ||
+        fstatat(dir_fd, name, &st, AT_SYMLINK_NOFOLLOW) != 0 ||
+        st.st_dev != walk->device)
     {
-        *complete = 0;
+        walk->complete = 0;
         return 0;
     }
+    walk->budget--;
     if (!S_ISDIR(st.st_mode))
         return S_ISREG(st.st_mode) ? st.st_size : 0;
-    if (depth > 256)
-    {
-        *complete = 0;
-        return 0;
-    }
     int fd = openat(dir_fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     DIR *dir = fd >= 0 ? fdopendir(fd) : NULL;
     if (dir == NULL)
     {
         if (fd >= 0)
             close(fd);
-        *complete = 0;
+        walk->complete = 0;
         return 0;
     }
     off_t total = 0;
@@ -1359,7 +1367,7 @@ static off_t tree_size_at(int dir_fd, const char *name, int depth,
     {
         if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
             continue;
-        total += tree_size_at(dirfd(dir), entry->d_name, depth + 1, complete);
+        total += tree_size_at(dirfd(dir), entry->d_name, depth + 1, walk);
     }
     closedir(dir);
     return total;
@@ -1381,7 +1389,9 @@ int selection_plan_uncovered(const SelectionPlan *plan,
     *out = NULL;
     *count = 0;
     int home_fd = open(plan->home, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    DIR *dir = home_fd >= 0 ? fdopendir(home_fd) : NULL;
+    struct stat home_st;
+    DIR *dir = home_fd >= 0 && fstat(home_fd, &home_st) == 0
+        ? fdopendir(home_fd) : NULL;
     if (dir == NULL)
     {
         if (home_fd >= 0)
@@ -1422,8 +1432,9 @@ int selection_plan_uncovered(const SelectionPlan *plan,
         }
         SelectionUncovered *item = &items[used++];
         snprintf(item->name, sizeof(item->name), "%s", entry->d_name);
-        item->size_known = 1;
-        item->size = tree_size_at(dirfd(dir), entry->d_name, 0, &item->size_known);
+        TreeWalk walk = { home_st.st_dev, UNCOVERED_WALK_BUDGET, 1 };
+        item->size = tree_size_at(dirfd(dir), entry->d_name, 0, &walk);
+        item->size_known = walk.complete;
     }
     closedir(dir);
     if (failed)

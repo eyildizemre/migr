@@ -261,6 +261,29 @@ int main(void)
     }
     CHECK(saw_var && saw_games && var_first);
     CHECK(!saw_covered);
+    for (size_t i = 0; i < uncovered_count; i++)
+        CHECK(uncovered[i].size_known);
+    free(uncovered);
+    selection_plan_free(&a);
+    /* A tree larger than the walk's budget shows a lower bound. */
+    CHECK(mkdir("Huge", 0700) == 0);
+    for (int i = 0; i < 10001; i++)
+    {
+        char name[64];
+        snprintf(name, sizeof(name), "Huge/%05d", i);
+        file(name, "1");
+    }
+    CHECK(build(home, BACKUP_CRITICAL, "", &a) == 0);
+    CHECK(selection_plan_uncovered(&a, &uncovered, &uncovered_count) == 0);
+    int huge_bounded = 0, games_exact = 0;
+    for (size_t i = 0; i < uncovered_count; i++)
+    {
+        if (!strcmp(uncovered[i].name, "Huge"))
+            huge_bounded = !uncovered[i].size_known && uncovered[i].size < 10001;
+        if (!strcmp(uncovered[i].name, "Games"))
+            games_exact = uncovered[i].size_known && uncovered[i].size == 5;
+    }
+    CHECK(huge_bounded && games_exact);
     free(uncovered);
     selection_plan_free(&a);
     /* D75: Flatpak apps' settings and data are a built-in root, their caches
