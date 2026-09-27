@@ -966,6 +966,17 @@ static void restore_crypto_policy_hint(int network_fd)
            saved, current, saved);
 }
 
+// Whether restore_dconf_settings() will load the database into a running
+// session, which then settles the settings of an existing ~/.config/dconf/user.
+static int restore_dconf_loads_into_session(void)
+{
+#ifdef RESTORE_TEST_HOOKS
+    if (restore_test_dconf_hook != NULL)
+        return 1;
+#endif
+    return dconf_restore_session_loads();
+}
+
 // A native container mirrors each root under data/<payload>, so the dconf
 // database of the root captured from HOME/.config is at a fixed place.
 static int native_dconf_database_fd(int source_root_fd, const Manifest *m)
@@ -3455,7 +3466,8 @@ int restore_with_options(const char *source, const RestoreOptions *options)
             .before_confirmation_context = &deferral,
             .before_deferred = restore_before_deferred,
             .before_deferred_context = &deferral,
-            .dconf_database_fd_out = &dconf_database_fd
+            .dconf_database_fd_out = &dconf_database_fd,
+            .dconf_loads_into_session = restore_dconf_loads_into_session()
         };
         for (int index = 0; index < XDG_RESTORE_COUNT; index++)
             request.destination_xdg_dirs[index] = xdg_dirs[index];

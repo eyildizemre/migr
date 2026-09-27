@@ -131,6 +131,7 @@ typedef struct {
     void (*before_content_verification)(void *context);
     void *before_content_verification_context;
     int *dconf_database_fd_out;
+    int dconf_loads_into_session;
     const PortableRestoreDeferredPath *deferred_paths;
     size_t deferred_path_count;
     int (*before_deferred)(void *context);
@@ -1751,25 +1752,6 @@ static int replay_regular_is_locally_authoritative(
 static int replay_regular_content_verification_excluded(
     const SidecarEntry *entry);
 
-// Fill, don't fight (D65): confirmed live desktop state that a running
-// service has already written at the destination is left as it is; it is
-// restored only where nothing is there yet. Returns 1 when present.
-static int replay_live_state_present(ReplayCollection *collection,
-                                     const ReplayEntry *replay)
-{
-    if (!replay_regular_content_verification_excluded(replay->entry))
-        return 0;
-    int parent_fd = -1;
-    char leaf[NAME_MAX + 1U];
-    if (replay_destination_parent(collection, replay, &parent_fd, leaf,
-                                  sizeof(leaf)) != 0)
-        return 0;
-    struct stat st;
-    int present = fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) == 0;
-    close(parent_fd);
-    return present;
-}
-
 static int replay_regular_is_dconf_database(const ReplayCollection *collection,
                                             const ReplayEntry *replay)
 {
@@ -1784,6 +1766,31 @@ static int replay_regular_is_dconf_database(const ReplayCollection *collection,
                   ".config/dconf/user") != 0)
         return 0;
     return strcmp(source_path, known_path) == 0;
+}
+
+// Fill, don't fight (D65): confirmed live desktop state that a running
+// service has already written at the destination is left as it is; it is
+// restored only where nothing is there yet. Returns 1 when present.
+static int replay_live_state_present(ReplayCollection *collection,
+                                     const ReplayEntry *replay)
+{
+    if (!replay_regular_content_verification_excluded(replay->entry))
+        return 0;
+    // The dconf database holds the user's settings, not state a service
+    // regenerates: an existing one is left only to the load into the
+    // running session that follows replay (D80).
+    if (!collection->dconf_loads_into_session &&
+        replay_regular_is_dconf_database(collection, replay))
+        return 0;
+    int parent_fd = -1;
+    char leaf[NAME_MAX + 1U];
+    if (replay_destination_parent(collection, replay, &parent_fd, leaf,
+                                  sizeof(leaf)) != 0)
+        return 0;
+    struct stat st;
+    int present = fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) == 0;
+    close(parent_fd);
+    return present;
 }
 
 // Hands the applied dconf database's payload to the caller (see
@@ -3879,6 +3886,7 @@ int portable_restore_replay_at(const PortableRestoreRequest *request,
         .before_content_verification_context =
             request->before_content_verification_context,
         .dconf_database_fd_out = request->dconf_database_fd_out,
+        .dconf_loads_into_session = request->dconf_loads_into_session,
         .deferred_paths = request->deferred_paths,
         .deferred_path_count = request->deferred_path_count,
         .before_deferred = request->before_deferred,

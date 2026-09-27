@@ -2290,7 +2290,7 @@ static int home_rewrite_fixture_open(Fixture *fixture, ManifestRoot roots[2],
 
 static int run_replay_with_dconf(Fixture *fixture,
                                  PortableRestoreReplayReport *report,
-                                 int *dconf_database_fd)
+                                 int *dconf_database_fd, int session_loads)
 {
     Manifest manifest;
     if (manifest_read_v1_at(fixture->container_fd, &manifest) !=
@@ -2305,7 +2305,8 @@ static int run_replay_with_dconf(Fixture *fixture,
             .nsec_exact = 1,
             .configured = 1
         },
-        .dconf_database_fd_out = dconf_database_fd
+        .dconf_database_fd_out = dconf_database_fd,
+        .dconf_loads_into_session = session_loads
     };
     portable_restore_replay_report_init(report);
     int result = portable_restore_replay_at(&request, report);
@@ -2365,7 +2366,7 @@ static void test_dconf_database_handoff(void)
     }
     PortableRestoreReplayReport report;
     int dconf_fd = -1;
-    check(run_replay_with_dconf(&fixture, &report, &dconf_fd) == 0 &&
+    check(run_replay_with_dconf(&fixture, &report, &dconf_fd, 1) == 0 &&
               report.failed_count == 0,
           "replay with a dconf database succeeds");
     char content[64] = {0};
@@ -2387,10 +2388,52 @@ static void test_dconf_database_handoff(void)
         return;
     }
     dconf_fd = -1;
-    check(run_replay_with_dconf(&fixture, &report, &dconf_fd) == 0 &&
+    check(run_replay_with_dconf(&fixture, &report, &dconf_fd, 1) == 0 &&
               dconf_fd == -1,
           "without a recorded source HOME nothing is handed back");
     fixture_close(&fixture);
+}
+
+// An existing database is the user's settings too: it is left in place only
+// for a load into the running session, and written otherwise (D80).
+static void test_dconf_database_kept_only_for_a_session_load(void)
+{
+    printf(BLUE "::" NC " an existing dconf database is kept only for a session load\n");
+    for (int session_loads = 0; session_loads <= 1; session_loads++)
+    {
+        ManifestRoot roots[2];
+        Fixture fixture;
+        if (dconf_fixture_open(&fixture, roots, MANIFEST_SELECTION_VERSION,
+                               "/home/vii") != 0)
+        {
+            check(0, "dconf keep fixture is created");
+            fixture_close(&fixture);
+            return;
+        }
+        make_dir_at(fixture.home_fd, ".config", 0700);
+        make_dir_at(fixture.home_fd, ".config/dconf", 0700);
+        write_file_at(fixture.home_fd, ".config/dconf/user", "GVDB-live");
+        PortableRestoreReplayReport report;
+        int dconf_fd = -1;
+        int result = run_replay_with_dconf(&fixture, &report, &dconf_fd,
+                                           session_loads);
+        if (dconf_fd >= 0)
+            close(dconf_fd);
+        char database[PATH_MAX];
+        path_join(database, sizeof(database), fixture.home,
+                  "/.config/dconf/user");
+        if (session_loads)
+            check(result == 0 && report.live_state_kept_count == 1 &&
+                      file_equals_noatime(database, "GVDB-live"),
+                  "with a session load to follow, the existing database "
+                  "is left to it");
+        else
+            check(result == 0 && report.live_state_kept_count == 0 &&
+                      file_equals_noatime(database, "GVDB-backup"),
+                  "without a session load, the backed-up database replaces "
+                  "the existing one");
+        fixture_close(&fixture);
+    }
 }
 
 static int xdg_home_rewrite_fixture_open(
@@ -4358,6 +4401,7 @@ int main(void)
     test_deferred_paths_restore_last();
     test_verification_checks_every_item();
     test_dconf_database_handoff();
+    test_dconf_database_kept_only_for_a_session_load();
     test_symlink_collection_validation();
     test_hardlink_identity_validation();
     test_physical_logical_mismatch();

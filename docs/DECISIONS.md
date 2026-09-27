@@ -4471,7 +4471,8 @@ state is regenerable, so the service's current version is the right one to
 keep. Missing files are still filled in.
 
 **Relationship:** Part of the live-environment design. Not backing this
-state up at all belongs to the backup-scope overhaul.
+state up at all belongs to the backup-scope overhaul. D80 narrows it for the dconf
+database.
 
 ## D66 — 2026-09-26 — A portable restore restores open applications' settings last
 
@@ -4898,3 +4899,20 @@ run that went as asked would only be clutter on the new system.
 **Relationship:** Uses D68's exit statuses. Restore's list of what is left
 to do by hand (D78) goes next to the backup whatever the status.
 
+## D80 — 2026-09-27 — An existing dconf database is kept only for a session load
+
+**Status:** Implemented
+
+**Decision:** Replay leaves an existing `~/.config/dconf/user` in place
+(D65) only when restore will load the backup's settings into a running
+session right after it (D50): the target user has a session bus and dconf
+is installed. Otherwise replay writes the backed-up database like any other
+file. Restore asks before replay and passes the answer in the request
+(`dconf_loads_into_session`).
+
+**Why:** The dconf database is the user's settings, not state a service
+regenerates. With no session, nothing loaded the backup's settings and
+nothing said so, although a restore from a text console is what the dconf
+failure message recommends.
+
+**Relationship:** Narrows D65 for one file; D50's load is unchanged.

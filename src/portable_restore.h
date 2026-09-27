@@ -47,6 +47,10 @@ typedef struct {
      * payload there so the caller can load it into a running session. The
      * caller closes it. NULL disables this. */
     int *dconf_database_fd_out;
+    /* Nonzero when the caller loads that payload into a running session
+     * (D50). Only then is an existing ~/.config/dconf/user left in place like
+     * other live state (D65); otherwise replay writes it (D80). */
+    int dconf_loads_into_session;
     /* Optional. Regular files, symlinks, and hardlinks below these paths of
      * home-relative roots are restored after everything else. Right before
      * that, before_deferred (if set) decides: 1 restores them, 0 leaves them

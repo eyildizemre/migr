@@ -235,6 +235,34 @@ static size_t dconf_dump_key_count(const char *dump)
     return count;
 }
 
+// Whether the target user has a session bus a dconf service could run on,
+// and dconf to load into it; fills the runtime directory and bus paths.
+static DconfRestoreStatus dconf_session_check(const DconfTarget *target,
+                                              char runtime_dir[PATH_MAX],
+                                              char bus_path[PATH_MAX])
+{
+    int runtime_length = snprintf(runtime_dir, PATH_MAX, "%s/%ju",
+                                  dconf_runtime_root, (uintmax_t)target->uid);
+    if (runtime_length < 0 || runtime_length >= PATH_MAX ||
+        path_join(bus_path, PATH_MAX, runtime_dir, "bus") != 0)
+        return DCONF_RESTORE_FAILED;
+    struct stat bus_st;
+    if (lstat(bus_path, &bus_st) != 0 || !S_ISSOCK(bus_st.st_mode))
+        return DCONF_RESTORE_NO_SESSION;
+    if (!dconf_command_available())
+        return DCONF_RESTORE_UNAVAILABLE;
+    return DCONF_RESTORE_APPLIED;
+}
+
+int dconf_restore_session_loads(void)
+{
+    DconfTarget target;
+    char runtime_dir[PATH_MAX], bus_path[PATH_MAX];
+    return dconf_target_resolve(&target) == 0 &&
+           dconf_session_check(&target, runtime_dir, bus_path) ==
+               DCONF_RESTORE_APPLIED;
+}
+
 DconfRestoreStatus dconf_restore_apply(int database_fd, size_t *applied_keys)
 {
     if (applied_keys != NULL)
@@ -247,16 +275,10 @@ DconfRestoreStatus dconf_restore_apply(int database_fd, size_t *applied_keys)
         return DCONF_RESTORE_FAILED;
 
     char runtime_dir[PATH_MAX], bus_path[PATH_MAX];
-    int runtime_length = snprintf(runtime_dir, sizeof(runtime_dir), "%s/%ju",
-                                  dconf_runtime_root, (uintmax_t)target.uid);
-    if (runtime_length < 0 || (size_t)runtime_length >= sizeof(runtime_dir) ||
-        path_join(bus_path, sizeof(bus_path), runtime_dir, "bus") != 0)
-        return DCONF_RESTORE_FAILED;
-    struct stat bus_st;
-    if (lstat(bus_path, &bus_st) != 0 || !S_ISSOCK(bus_st.st_mode))
-        return DCONF_RESTORE_NO_SESSION;
-    if (!dconf_command_available())
-        return DCONF_RESTORE_UNAVAILABLE;
+    DconfRestoreStatus session = dconf_session_check(&target, runtime_dir,
+                                                     bus_path);
+    if (session != DCONF_RESTORE_APPLIED)
+        return session;
 
     DconfWorkDir work;
     if (dconf_work_dir_create(&work, database_fd, &target) != 0)
