@@ -66,6 +66,9 @@ static const char *backup_test_network_config_source_dirs[
 static int backup_test_portable_representation_forced;
 static int backup_test_case_insensitive_destination_forced;
 static int backup_test_restore_privilege_bypass;
+static int backup_test_invoker_set;
+static uid_t backup_test_invoker_uid;
+static gid_t backup_test_invoker_gid;
 static BackupTestSidecarReadbackHook backup_test_sidecar_readback_hook;
 static void *backup_test_sidecar_readback_context;
 
@@ -130,6 +133,13 @@ void backup_test_force_case_insensitive_destination(int enabled)
 void backup_test_set_restore_privilege_bypass(int enabled)
 {
     backup_test_restore_privilege_bypass = enabled != 0;
+}
+
+void backup_test_set_invoker(int enabled, uid_t uid, gid_t gid)
+{
+    backup_test_invoker_set = enabled != 0;
+    backup_test_invoker_uid = uid;
+    backup_test_invoker_gid = gid;
 }
 
 static void backup_test_before_source_open(const char *source_path)
@@ -312,6 +322,79 @@ void restore_privilege_dry_run_note(size_t foreign_owner_count,
     if (network_config_needs_privilege)
         printf("apply saved network configuration");
     printf(". Run it with sudo.\n");
+}
+
+// The user a sudo backup runs for (D38). Returns 0 with their ids, or -1
+// when the backup does not run through sudo.
+static int backup_invoker_identity(uid_t *uid, gid_t *gid)
+{
+#ifdef BACKUP_TEST_HOOKS
+    if (backup_test_invoker_set)
+    {
+        *uid = backup_test_invoker_uid;
+        *gid = backup_test_invoker_gid;
+        return 0;
+    }
+#endif
+    char home[PATH_MAX];
+    if (geteuid() != 0 || getenv("SUDO_UID") == NULL ||
+        resolve_sudo_identity(uid, gid, home) != 0)
+        return -1;
+    return 0;
+}
+
+// A sudo backup on a destination that records ownership belongs to the user
+// who ran it (D70), so they can look at, preview, and delete it without
+// sudo. Only migr's own entries change hands: the destination folder when
+// migr created it, the container, data/, and the files at the container's
+// top. Payload entries keep the owners they were captured with, and
+// network/ stays root's, since it can hold Wi-Fi secrets.
+static void backup_give_to_invoker(int container_fd, int target_created)
+{
+    uid_t uid;
+    gid_t gid;
+    if (container_fd < 0 || backup_invoker_identity(&uid, &gid) != 0)
+        return;
+    int failed = fchown(container_fd, uid, gid) != 0;
+    if (target_created)
+    {
+        int parent_fd = openat(container_fd, "..",
+                               O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (parent_fd < 0 || fchown(parent_fd, uid, gid) != 0)
+            failed = 1;
+        if (parent_fd >= 0)
+            close(parent_fd);
+    }
+    int scan_fd = openat(container_fd, ".",
+                         O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    DIR *dir = scan_fd < 0 ? NULL : fdopendir(scan_fd);
+    if (dir == NULL)
+    {
+        if (scan_fd >= 0)
+            close(scan_fd);
+        failed = 1;
+    }
+    struct dirent *entry;
+    while (dir != NULL && (entry = readdir(dir)) != NULL)
+    {
+        struct stat st;
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0 ||
+            fstatat(container_fd, entry->d_name, &st,
+                    AT_SYMLINK_NOFOLLOW) != 0 ||
+            !(S_ISREG(st.st_mode) ||
+              (S_ISDIR(st.st_mode) && strcmp(entry->d_name, "data") == 0)))
+            continue;
+        if (fchownat(container_fd, entry->d_name, uid, gid,
+                     AT_SYMLINK_NOFOLLOW) != 0)
+            failed = 1;
+    }
+    if (dir != NULL)
+        closedir(dir);
+    if (failed)
+        print_warning("Warning: could not give every part of the backup "
+                      "container to the user who ran sudo: %s\n",
+                      strerror(errno));
 }
 
 /* Returns 0 to proceed (space is adequate, or an earlier probe/estimate
@@ -3353,6 +3436,8 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
 
 finish:
     source_snapshot_end(&source_snapshot);
+    if (repr == CLONE_NATIVE_TREE)
+        backup_give_to_invoker(container_root_fd(&container), target_created);
     if (self_fd >= 0)
         close(self_fd);
     container_close(&container);

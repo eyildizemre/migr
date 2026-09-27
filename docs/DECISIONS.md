@@ -4603,3 +4603,30 @@ open applications but restored their settings in place, where the
 application overwrote them on closing.
 
 **Relationship:** Extends D66 to native restore.
+
+## D70 — 2026-09-27 — A sudo backup belongs to the user who ran sudo
+
+**Status:** Implemented
+
+**Decision:** When a native backup runs through sudo (D62), migr hands its
+own entries to the invoking user (`SUDO_UID`, resolved as in D38), both when
+the run succeeds and when it stops after creating the container:
+- the destination folder, if migr created it,
+- the container,
+- `data/`,
+- the regular files at the container's top (manifest, journal, package
+  lists, the bundled migr).
+
+Payload entries keep the owners they were captured with, which native
+restore depends on. `network/` stays root's, since it can hold Wi-Fi
+secrets. A portable backup changes nothing: FAT and exFAT take owners from
+the mount. A failed handover is a warning, not a failure.
+
+**Why:** Under sudo everything migr wrote belonged to root. The user could
+not delete their own backup, and a restore preview without sudo (which D62
+keeps root-free) stopped at the no-atime open of the root-owned `data/`.
+Restore itself is unaffected: it runs as root and takes owners from the
+payload, not from the container.
+
+**Relationship:** Follows D62. Uses D38's invoker identity.
+

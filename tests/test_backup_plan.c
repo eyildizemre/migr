@@ -3539,6 +3539,83 @@ static void test_dangling_explicit_leaf_symlink_is_captured_as_symlink(void)
     remove_tree(target);
 }
 
+static int owned_by(const char *path, uid_t uid, gid_t gid)
+{
+    struct stat st;
+    return lstat(path, &st) == 0 && st.st_uid == uid && st.st_gid == gid;
+}
+
+// A sudo backup belongs to the user who ran sudo (D70); the payload keeps
+// the owner it was captured with. Needs root to hand anything over.
+static void test_sudo_backup_belongs_to_invoker(void)
+{
+    printf(BLUE "::" NC " production: a sudo backup's container belongs to the user who ran sudo\n");
+    if (geteuid() != 0)
+    {
+        printf(BLUE "  (skipped: handing files to another user needs root)\n" NC);
+        return;
+    }
+    const uid_t invoker_uid = 4242;
+    const gid_t invoker_gid = 4343;
+
+    char home[PATH_MAX], parent[PATH_MAX], target[PATH_MAX], file[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_home");
+    setenv("HOME", home, 1);
+    join_path(file, sizeof(file), home, "payload.txt");
+    write_file(file, "payload");
+    char *paths[] = { file, NULL };
+    fresh_mkdtemp(parent, sizeof(parent), "plan_target");
+    join_path(target, sizeof(target), parent, "created-by-migr");
+
+    dry_run = 0;
+    char output[8192];
+    backup_test_set_invoker(1, invoker_uid, invoker_gid);
+    int rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                  output, sizeof(output));
+    backup_test_set_invoker(0, 0, 0);
+
+    char container[PATH_MAX], data[PATH_MAX], manifest[PATH_MAX];
+    char payload[PATH_MAX];
+    int found = find_container_dir(target, container, sizeof(container));
+    join_path(data, sizeof(data), container, "data");
+    join_path(manifest, sizeof(manifest), container, "manifest.txt");
+    join_path(payload, sizeof(payload), data, "EXPLICIT_0");
+    check(rc == 0 && found &&
+              owned_by(target, invoker_uid, invoker_gid) &&
+              owned_by(container, invoker_uid, invoker_gid) &&
+              owned_by(data, invoker_uid, invoker_gid) &&
+              owned_by(manifest, invoker_uid, invoker_gid),
+          "the folder migr created, the container, data/, and manifest.txt "
+          "belong to the invoker");
+    check(owned_by(payload, 0, 0) && owned_by(parent, 0, 0),
+          "the payload keeps its captured owner, and a folder migr did not "
+          "create is left alone");
+
+    remove_tree(target);
+    rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths, output,
+                              sizeof(output));
+    found = find_container_dir(target, container, sizeof(container));
+    check(rc == 0 && found && owned_by(target, 0, 0) &&
+              owned_by(container, 0, 0),
+          "a backup that does not run through sudo hands nothing over");
+
+    // A portable destination gets ownership from its mount, not from chown.
+    remove_tree(target);
+    backup_test_force_portable_representation(1);
+    backup_test_set_invoker(1, invoker_uid, invoker_gid);
+    char *home_paths[] = { NULL };
+    rc = run_backup_capturing(target, BACKUP_CRITICAL, home_paths, output,
+                              sizeof(output));
+    backup_test_set_invoker(0, 0, 0);
+    backup_test_force_portable_representation(0);
+    found = find_container_dir(target, container, sizeof(container));
+    check(rc == 0 && found && owned_by(container, 0, 0),
+          "a portable backup hands nothing over");
+
+    remove_tree(home);
+    remove_tree(parent);
+}
+
 static void test_dangling_builtin_dotfile_is_captured_not_silently_dropped(void)
 {
     printf(BLUE "::" NC " production: a dangling built-in dotfile symlink is actually captured, not silently dropped\n");
@@ -3811,6 +3888,7 @@ int main(void)
     test_missing_explicit_path_rejects_before_target_creation();
     test_overlap_rejected_before_destination_created_live_and_dry_run();
     test_dangling_explicit_leaf_symlink_is_captured_as_symlink();
+    test_sudo_backup_belongs_to_invoker();
     test_dangling_builtin_dotfile_is_captured_not_silently_dropped();
     test_shell_history_consent_gate();
     test_unusable_target_does_not_leak_the_plan();

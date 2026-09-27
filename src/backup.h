@@ -128,6 +128,9 @@ void backup_test_set_sidecar_readback_hook(BackupTestSidecarReadbackHook hook,
 void backup_test_force_portable_representation(int enabled);
 void backup_test_force_case_insensitive_destination(int enabled);
 void backup_test_set_restore_privilege_bypass(int enabled);
+/* Hands a native backup's container to uid:gid as if sudo had been run by
+ * them (D70); 0 restores the real lookup. */
+void backup_test_set_invoker(int enabled, uid_t uid, gid_t gid);
 
 /* Exposes the progress display's cumulative-average speed formula
  * (total_bytes / elapsed since started_at) for direct unit testing with

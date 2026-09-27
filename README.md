@@ -59,7 +59,13 @@ sudo ./migr restore <SOURCE> [--no-verify]
 ```
 
 `backup` and `restore` run as root: they ask for the sudo password once, at the
-start, and then run unattended.
+start, and then run unattended. A backup on a drive that records file owners
+(ext4, btrfs, xfs) still belongs to the user who ran sudo: the backup folder,
+its `data/` folder, and its top-level files, and the destination folder when
+migr created it. That user can look at it, preview a restore from it, and
+delete it without sudo. Backed-up files keep their own owners, and saved
+network configuration stays root's. On FAT and exFAT drives, owners come from
+how the drive is mounted.
 
 A backup does not stop when files change under it. A file written while it is
 read is read again; one still being written after three reads is kept as last
