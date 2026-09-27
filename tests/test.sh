@@ -313,7 +313,10 @@ test_report() {
     assert_contains "$default_output" "Desktop"
     assert_contains "$critical_output" "Dotfiles & Config"
     assert_contains "$critical_output" ".profile"
+    assert_contains "$critical_output" ".local/share"
     assert_contains "$critical_output" "Firefox"
+    browsers_part=${critical_output#*Browsers}
+    assert_not_contains "${browsers_part%%$'\n\n'*}" ".profile"
     assert_not_contains "$critical_output" ".mozilla"
     assert_not_contains "$critical_output" "google-chrome"
     assert_contains "$critical_output" "Critical estimate"

@@ -238,35 +238,37 @@ static const char *scoped_group_title(BackupRootGroup group)
 static const char *scoped_root_name(const char *home,
                                     const BackupPlanRoot *root)
 {
-    if (root->group == BACKUP_ROOT_BROWSER && home != NULL)
-    {
-        static const struct {
-            const char *home_relative;
-            const char *display_name;
-        } browser_names[] = {
-            { ".mozilla",              "Firefox" },
-            { ".config/google-chrome", "Chrome" },
-            { ".config/chromium",      "Chromium" },
-            { ".config/BraveSoftware", "Brave" },
-            { ".config/vivaldi",       "Vivaldi" },
-            { ".config/microsoft-edge", "Edge" },
-            { ".config/opera",         "Opera" },
-        };
-        char home_real[PATH_MAX];
-        const char *restore_rel = NULL;
+    static const struct {
+        const char *home_relative;
+        const char *display_name;
+    } browser_names[] = {
+        { ".mozilla",              "Firefox" },
+        { ".config/google-chrome", "Chrome" },
+        { ".config/chromium",      "Chromium" },
+        { ".config/BraveSoftware", "Brave" },
+        { ".config/vivaldi",       "Vivaldi" },
+        { ".config/microsoft-edge", "Edge" },
+        { ".config/opera",         "Opera" },
+    };
+    char home_real[PATH_MAX];
+    const char *restore_rel = NULL;
 
-        /* backup_plan_build() canonicalizes HOME before building capture_path. */
-        if (realpath(home, home_real) != NULL &&
-            backup_plan_home_relative(home_real, root->capture_path,
-                                      &restore_rel))
+    /* backup_plan_build() canonicalizes HOME before building capture_path.
+     * A dotfile root is shown by its path below HOME (.local/share), since
+     * its last component alone (share) says little. */
+    if ((root->group == BACKUP_ROOT_BROWSER ||
+         root->group == BACKUP_ROOT_DOTFILE) && home != NULL &&
+        realpath(home, home_real) != NULL &&
+        backup_plan_home_relative(home_real, root->capture_path,
+                                  &restore_rel) && restore_rel[0] != '\0')
+    {
+        if (root->group == BACKUP_ROOT_DOTFILE)
+            return restore_rel;
+        for (size_t i = 0;
+             i < sizeof(browser_names) / sizeof(browser_names[0]); i++)
         {
-            for (size_t i = 0;
-                 i < sizeof(browser_names) / sizeof(browser_names[0]);
-                 i++)
-            {
-                if (strcmp(restore_rel, browser_names[i].home_relative) == 0)
-                    return browser_names[i].display_name;
-            }
+            if (strcmp(restore_rel, browser_names[i].home_relative) == 0)
+                return browser_names[i].display_name;
         }
     }
 
@@ -321,60 +323,66 @@ static int report_plan(const char *home, const BackupPlan *plan,
 
     off_t total = 0;
     int had_error = 0;
-    int printed_group[4] = { 0, 0, 0, 0 };
 
     if (!summary)
         print_report_header(home);
 
+    // Roots come in path order; each is listed under its own group's
+    // heading, the groups in BackupRootGroup order.
     size_t count = selection ? selection->root_count : (size_t)plan->root_count;
-    for (size_t i = 0; i < count; i++)
+    for (int group = BACKUP_ROOT_MAIN; group <= BACKUP_ROOT_EXPLICIT; group++)
     {
-        const SelectionRoot *filter = selection ? &selection->roots[i] : NULL;
-        const BackupPlanRoot *root = filter ? &filter->root : &plan->roots[i];
-        off_t bytes = 0;
-        int present = 0;
-        ReportBreakdown breakdown = { NULL, 0, 0 };
-        int want_breakdown = !summary && verbose;
-        int measure_rc = measure_scoped_root(root->capture_path, depth,
-                                             want_breakdown ? &breakdown : NULL,
-                                             &bytes, &present, filter);
-
-        if (measure_rc != 0)
+        int printed_group = 0;
+        for (size_t i = 0; i < count; i++)
         {
-            had_error = 1;
+            const SelectionRoot *filter = selection ? &selection->roots[i] : NULL;
+            const BackupPlanRoot *root = filter ? &filter->root : &plan->roots[i];
+            if ((int)root->group != group)
+                continue;
+            off_t bytes = 0;
+            int present = 0;
+            ReportBreakdown breakdown = { NULL, 0, 0 };
+            int want_breakdown = !summary && verbose;
+            int measure_rc = measure_scoped_root(root->capture_path, depth,
+                                                 want_breakdown ? &breakdown : NULL,
+                                                 &bytes, &present, filter);
+
+            if (measure_rc != 0)
+            {
+                had_error = 1;
+                report_breakdown_free(&breakdown);
+                continue;
+            }
+            if (!present)
+            {
+                report_breakdown_free(&breakdown);
+                continue;
+            }
+
+            total += bytes;
+            if (!summary)
+            {
+                if (!printed_group)
+                {
+                    print_section(scoped_group_title(root->group));
+                    printed_group = 1;
+                }
+
+                char size[32];
+                format_size(bytes, size, sizeof(size));
+                if (verbose)
+                {
+                    print_item_with_path(scoped_root_name(home, root), size,
+                                         root->capture_path, 0);
+                    print_report_breakdown(&breakdown);
+                }
+                else
+                {
+                    print_item(scoped_root_name(home, root), size);
+                }
+            }
             report_breakdown_free(&breakdown);
-            continue;
         }
-        if (!present)
-        {
-            report_breakdown_free(&breakdown);
-            continue;
-        }
-
-        total += bytes;
-        if (!summary)
-        {
-            if (root->group >= 0 && root->group < 4 &&
-                !printed_group[root->group])
-            {
-                print_section(scoped_group_title(root->group));
-                printed_group[root->group] = 1;
-            }
-
-            char size[32];
-            format_size(bytes, size, sizeof(size));
-            if (verbose)
-            {
-                print_item_with_path(scoped_root_name(home, root), size,
-                                     root->capture_path, 0);
-                print_report_breakdown(&breakdown);
-            }
-            else
-            {
-                print_item(scoped_root_name(home, root), size);
-            }
-        }
-        report_breakdown_free(&breakdown);
     }
 
     char total_size[32];
