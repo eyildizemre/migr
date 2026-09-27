@@ -1989,6 +1989,14 @@ static void write_fake_process(const char *proc_root, const char *pid,
     write_file_mode(file, content, 0644);
 }
 
+static void write_fake_cgroup(const char *proc_root, const char *pid,
+                              const char *cgroup)
+{
+    char file[PATH_MAX];
+    snprintf(file, sizeof(file), "%s/%s/cgroup", proc_root, pid);
+    write_file_mode(file, cgroup, 0644);
+}
+
 static void ignore_dconf_database(int database_fd, void *context)
 {
     (void)database_fd;
@@ -2525,17 +2533,41 @@ static void test_running_writer_detection(void)
     write_fake_process(proc_root, "105", "brave", me, 0);
     write_fake_process(proc_root, "106", "bash", me, 1);
     write_fake_process(proc_root, "self", "code", me, 1);
+    const char *scope = "0::/user.slice/user-1000.slice/user@1000.service/"
+                        "app.slice/app-flatpak-com.spotify.Client-3353534066"
+                        ".scope\n";
+    write_fake_process(proc_root, "107", "spotify", me, 1);
+    write_fake_cgroup(proc_root, "107", scope);
+    write_fake_process(proc_root, "108", "zypak-sandbox", me, 1);
+    write_fake_cgroup(proc_root, "108", scope);
+    write_fake_process(proc_root, "109", "signal-desktop", me + 1, 1);
+    write_fake_cgroup(proc_root, "109", "0::/user.slice/app.slice/"
+                                        "app-flatpak-org.signal.Signal-12"
+                                        ".scope\n");
+    write_fake_process(proc_root, "110", "gnome-terminal-", me, 1);
+    write_fake_cgroup(proc_root, "110", "0::/user.slice/app.slice/"
+                                        "app-flatpak-../../etc-12.scope\n");
 
     restore_test_set_proc_root(proc_root);
     const char *labels[8];
-    size_t count = restore_test_running_writer_labels(me, labels, 8);
+    const char *settings[8];
+    size_t count = restore_test_running_writers(me, labels, settings, 8);
     restore_test_set_proc_root("/nonexistent/migr-test-proc");
-    check(count == 2 &&
-              ((strcmp(labels[0], "Visual Studio Code") == 0 &&
-                strcmp(labels[1], "GNOME Software") == 0) ||
-               (strcmp(labels[1], "Visual Studio Code") == 0 &&
-                strcmp(labels[0], "GNOME Software") == 0)),
+    int code = 0, software = 0, spotify = 0;
+    for (size_t index = 0; index < count; index++)
+    {
+        code += strcmp(labels[index], "Visual Studio Code") == 0 &&
+                strcmp(settings[index], ".config/Code") == 0;
+        software += strcmp(labels[index], "GNOME Software") == 0 &&
+                    settings[index][0] == '\0';
+        spotify += strcmp(labels[index], "com.spotify.Client") == 0 &&
+                   strcmp(settings[index], ".var/app/com.spotify.Client") == 0;
+    }
+    check(count == 3 && code == 1 && software == 1,
           "only the target user's known writers are named, each once");
+    check(spotify == 1,
+          "an open Flatpak app is named by its app id and owns its "
+          "~/.var/app directory, once for all its processes");
     remove_tree(proc_root);
 }
 

@@ -4767,3 +4767,27 @@ captures.
 
 **Relationship:** Follows D62 (restore runs as root) and D38.
 
+## D75 — 2026-09-27 — Flatpak applications' data is backed up without their caches
+
+**Status:** Implemented
+
+**Decision:** `~/.var/app` is a built-in root in every scope
+(`BUILTIN_FLATPAK_APPS`), where each Flatpak application keeps its
+settings and data. At planning time, `<app-id>/cache` is excluded for each
+application found there, the way D57 excludes an empty user installation.
+Everything else under an application's directory is kept: Signal keeps its
+message database under `config/`.
+
+At restore, a Flatpak application that is running is recognized by its
+systemd scope, `app-flatpak-<app-id>-<n>.scope` in `/proc/<pid>/cgroup`,
+and its `~/.var/app/<app-id>` is treated as the settings of an open
+application (D66, D69): restored last, with the same question. It is named
+by its app id.
+
+**Why:** Per-app settings of Flatpak applications (Spotify's preferences)
+were in no scope. Their caches can be large (Spotify's was 565 MB, about 10
+GB on an older install) and are rebuilt by the applications.
+
+**Relationship:** Extends D66 and D69 to Flatpak applications. Reinstalling
+the applications themselves is separate.
+

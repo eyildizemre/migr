@@ -124,6 +124,7 @@ static const BuiltinHomeEntry builtin_home_catalog[] = {
     { "BUILTIN_LOCAL_SHARE",            ".local/share",         BACKUP_ROOT_DOTFILE, 0 },
     { "BUILTIN_LOCAL_STATE",            ".local/state",         BACKUP_ROOT_DOTFILE, 0 },
     { "BUILTIN_LOCAL_BIN",              ".local/bin",           BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_FLATPAK_APPS",           ".var/app",             BACKUP_ROOT_DOTFILE, 0 },
     { "BUILTIN_DOT_BASHRC",             ".bashrc",              BACKUP_ROOT_DOTFILE, 0 },
     { "BUILTIN_DOT_BASH_HISTORY",        ".bash_history",         BACKUP_ROOT_DOTFILE, 0 },
     { "BUILTIN_DOT_BASH_PROFILE",        ".bash_profile",        BACKUP_ROOT_DOTFILE, 0 },
@@ -1281,6 +1282,38 @@ static int flatpak_user_installation_is_empty(const char *home_real)
     return directory_has_entries(app) == 0 && directory_has_entries(runtime) == 0;
 }
 
+/* A Flatpak application keeps its settings and data in ~/.var/app/<app-id>
+ * and its cache in cache/ there, which it rebuilds on its own (D75). */
+static int exclude_flatpak_app_caches(SelectionPlan *plan)
+{
+    char apps[PATH_MAX];
+    if (path_join(apps, sizeof(apps), plan->home, ".var/app") != 0)
+        return -1;
+    DIR *dir = opendir(apps);
+    if (dir == NULL)
+        return 0;
+    int result = 0;
+    struct dirent *entry;
+    while (result == 0 && (entry = readdir(dir)) != NULL)
+    {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            continue;
+        char cache[PATH_MAX];
+        char normalized[PATH_MAX];
+        int length = snprintf(cache, sizeof(cache), "~/.var/app/%s/cache",
+                              entry->d_name);
+        if (length < 0 || (size_t)length >= sizeof(cache))
+            continue;
+        int rc = selection_normalize(plan->home, cache, &plan->excludes, 1,
+                                     normalized);
+        if (rc < 0 ||
+            (rc == 0 && selection_paths_add(&plan->excludes, normalized) < 0))
+            result = -1;
+    }
+    closedir(dir);
+    return result;
+}
+
 void selection_plan_print_notes(const SelectionPlan *plan)
 {
     if (plan == NULL)
@@ -1484,6 +1517,7 @@ int selection_plan_build(const char *home, BackupMode mode,
             plan.flatpak_repo_excluded = 1;
         }
     }
+    if (exclude_flatpak_app_caches(&plan) != 0) goto fail;
     selection_paths_reduce(&plan.excludes);
     error = "could not resolve built-in selection";
     if (build_builtin_roots(plan.home, mode, &rb, &plan.excludes) < 0) goto fail;

@@ -13,8 +13,8 @@ void restore_test_set_crypto_policy_current(const char *path);
 typedef void (*RestoreTestDconfHook)(int database_fd, void *context);
 void restore_test_set_dconf_hook(RestoreTestDconfHook hook, void *context);
 void restore_test_set_network_manager_runtime_dir(const char *path);
-size_t restore_test_running_writer_labels(uid_t uid, const char **labels,
-                                          size_t max_labels);
+size_t restore_test_running_writers(uid_t uid, const char **labels,
+                                    const char **settings, size_t max);
 void restore_test_set_network_config_dest_dir(const char *backend_name,
                                               const char *dest_dir);
 void restore_test_set_network_reload_hook(RestoreTestNetworkReloadHook hook,

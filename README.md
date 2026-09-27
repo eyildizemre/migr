@@ -168,7 +168,8 @@ restore follows the selection recorded in the backup manifest rather than the
 target machine's current config.
 
 Applications that rewrite their own settings while running or when they close
-(VS Code and the common browsers) are detected when a restore starts.
+(VS Code, the common browsers, and every Flatpak application) are detected
+when a restore starts.
 Their settings are restored last, after everything else. If one is still open
 then, restore asks once: close it and press Enter, type `s` to leave its
 settings out (run the same restore again later to put them back), or `c` to
@@ -281,7 +282,7 @@ As with GNU tar:
 
 ## What Gets Backed Up
 
-**`--critical` (default):** Documents, Downloads, Pictures, Desktop, persistent user config/state under `~/.config`, `~/.local/share`, `~/.local/state`, user-local executables under `~/.local/bin`, and common shell/terminal dotfiles.
+**`--critical` (default):** Documents, Downloads, Pictures, Desktop, persistent user config/state under `~/.config`, `~/.local/share`, `~/.local/state`, user-local executables under `~/.local/bin`, Flatpak applications' settings and data under `~/.var/app` (without each application's `cache/`), and common shell/terminal dotfiles.
 
 **`--comprehensive`:** Everything `--critical` covers, plus Videos and Music.
 

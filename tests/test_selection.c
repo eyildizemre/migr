@@ -263,6 +263,24 @@ int main(void)
     CHECK(!saw_covered);
     free(uncovered);
     selection_plan_free(&a);
+    /* D75: Flatpak apps' settings and data are a built-in root, their caches
+     * are not. */
+    CHECK(mkdir(".var/app", 0700) == 0);
+    CHECK(mkdir(".var/app/com.example.App", 0700) == 0);
+    CHECK(mkdir(".var/app/com.example.App/config", 0700) == 0);
+    CHECK(mkdir(".var/app/com.example.App/cache", 0700) == 0);
+    file(".var/app/com.example.App/cache/blob", "cache");
+    CHECK(build(home, BACKUP_CRITICAL, "", &a) == 0);
+    char cache[PATH_MAX];
+    snprintf(cache, sizeof(cache), "%s/.var/app/com.example.App/cache", home);
+    int cache_excluded = 0, config_excluded = 0;
+    for (size_t i = 0; i < a.excludes.count; i++)
+    {
+        cache_excluded |= !strcmp(a.excludes.paths[i], cache);
+        config_excluded |= strstr(a.excludes.paths[i], "/config") != NULL;
+    }
+    CHECK(find_root(&a, ".var/app") >= 0 && cache_excluded && !config_excluded);
+    selection_plan_free(&a);
     const char *paths[] = {"extra", "extra/child", NULL};
     CHECK(backup_plan_build(home, BACKUP_EXPLICIT_PATHS, paths, &legacy) < 0);
     backup_plan_free(&legacy);
