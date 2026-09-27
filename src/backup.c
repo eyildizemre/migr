@@ -2987,8 +2987,8 @@ static char *backup_collect_groups(void)
 // NULL leaves the slot empty, which is what an explicit-paths backup, which
 // records no system state, asks for. Either way a stale list in an adopted
 // container never survives. Returns 0 with its line count when written, 1
-// when the slot was left empty, and -1, reported, when the slot could not be
-// made safe.
+// when the slot was left empty, and -1, reported, when the list could not be
+// written or the slot made safe.
 static int backup_save_list_at(int container_fd, const char *leaf,
                                char *contents, size_t *lines)
 {
@@ -2996,10 +2996,11 @@ static int backup_save_list_at(int container_fd, const char *leaf,
     for (const char *p = contents; p != NULL && *p != '\0'; p++)
         *lines += *p == '\n';
     int written = write_container_text_file_at(container_fd, leaf, contents);
+    int saved = errno;
     free(contents);
     if (written < 0)
-        print_error("Error: could not safely update %s in the backup "
-                    "container\n", leaf);
+        print_error("Error: could not write %s into the backup container: "
+                    "%s\n", leaf, strerror(saved));
     return written;
 }
 
@@ -3540,12 +3541,14 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
         else
         {
             printf("\nPackages\n");
-            // A missing package list is tolerable and has always been a
-            // warning; a control slot that could not be made safe is not.
+            // A system without a package list is a warning; a list the
+            // destination could not store, or a slot that could not be made
+            // safe, is an error.
             int pkg = packages_at(container_fd, "packages.txt");
             if (pkg < 0)
             {
-                print_error("Error: could not clear packages.txt from the backup container\n");
+                print_error("Error: could not write packages.txt into the "
+                            "backup container: %s\n", strerror(errno));
                 had_error = 1;
             }
             else if (pkg > 0)
@@ -3576,8 +3579,9 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
 
             if (vscode < 0)
             {
-                print_error("Error: could not safely update vs-code-extensions.txt "
-                            "in the backup container\n");
+                print_error("Error: could not write vs-code-extensions.txt "
+                            "into the backup container: %s\n",
+                            strerror(errno));
                 had_error = 1;
             }
             else if (vscode > 0)

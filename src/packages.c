@@ -204,24 +204,32 @@ int write_container_text_file_at(int container_fd, const char *leaf,
     struct stat st;
     if (fd < 0 || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode))
     {
+        int saved = fd >= 0 ? EINVAL : errno;
         if (fd >= 0)
             close(fd);
-        print_error("Error: Could not write %s.\n", leaf);
-        return packages_clear_at(container_fd, leaf) == 0 ? 1 : -1;
+        (void)packages_clear_at(container_fd, leaf);
+        errno = saved;
+        return -1;
     }
 
     FILE *out = fdopen(fd, "w");
     if (out == NULL)
     {
+        int saved = errno;
         close(fd);
-        print_error("Error: Could not write %s.\n", leaf);
-        return packages_clear_at(container_fd, leaf) == 0 ? 1 : -1;
+        (void)packages_clear_at(container_fd, leaf);
+        errno = saved;
+        return -1;
     }
 
+    // A list the destination could not store is a failed write, not an
+    // empty list: the truncated file goes, and the caller is told.
     if (write_text_buffer(out, buffer) != 0)
     {
-        print_error("Error: Could not write %s.\n", leaf);
-        return packages_clear_at(container_fd, leaf) == 0 ? 1 : -1;
+        int saved = errno;
+        (void)packages_clear_at(container_fd, leaf);
+        errno = saved;
+        return -1;
     }
 
     return 0;

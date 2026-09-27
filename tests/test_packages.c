@@ -1,10 +1,13 @@
 #define _GNU_SOURCE
 
+#include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -306,6 +309,21 @@ static void test_write_container_text_file_at(void)
     rc = write_container_text_file_at(dir_fd, "snapshot.txt", NULL);
     check(rc == 1 && access(snapshot_path, F_OK) != 0,
           "no content clears a stale artifact and reports the tolerable empty state");
+
+    // A destination that cannot store the list fails the write: nothing
+    // truncated is left, and it does not read as an empty list.
+    struct rlimit limit, small;
+    check(getrlimit(RLIMIT_FSIZE, &limit) == 0, "fixture: read the file size limit");
+    small = limit;
+    small.rlim_cur = 4;
+    void (*previous)(int) = signal(SIGXFSZ, SIG_IGN);
+    check(setrlimit(RLIMIT_FSIZE, &small) == 0, "fixture: cap the file size");
+    rc = write_container_text_file_at(dir_fd, "snapshot.txt", snapshot);
+    int saved = errno;
+    check(setrlimit(RLIMIT_FSIZE, &limit) == 0, "fixture: restore the file size limit");
+    signal(SIGXFSZ, previous);
+    check(rc == -1 && saved == EFBIG && access(snapshot_path, F_OK) != 0,
+          "a failed write is an error with its cause, and leaves no truncated list");
 
     char outside_path[PATH_MAX], hostile_path[PATH_MAX];
     snprintf(outside_path, sizeof(outside_path), "%s/outside.txt", dir);

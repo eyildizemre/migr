@@ -37,14 +37,15 @@ int packages_test_drop_kernel_pinned(char *buffer);
  * cannot be written in full -- so a container that goes on to be finalized
  * carries either a complete package list or none at all, never a stale,
  * hostile, or truncated one. The three return values exist because those are
- * three different situations for the caller: a missing package list is
- * tolerable, an unclearable control slot is not.
+ * three different situations for the caller: a system without a package list
+ * is tolerable, a destination that could not store one is not.
  *
  * @param container_fd Directory fd of the container; not closed here.
  * @param leaf         File name to create beneath it; a single component.
- * @return 0 when a complete list was written; 1 when no list was written and
- *         the slot was left empty; -1 when the slot could not be made safe, in
- *         which case the container must not be finalized.
+ * @return 0 when a complete list was written; 1 when no list could be
+ *         produced and the slot was left empty; -1 with errno when the list
+ *         could not be written or the slot made safe, in which case the
+ *         container must not be finalized.
  */
 int packages_at(int container_fd, const char *leaf);
 
@@ -60,9 +61,10 @@ int packages_at(int container_fd, const char *leaf);
  * @param container_fd Directory fd of the container; not closed here.
  * @param leaf         File name to create beneath it; a single component.
  * @param buffer       Complete NUL-terminated contents, or NULL for no content.
- * @return 0 when the buffer was written; 1 when the slot was left empty after
- *         no content or a recoverable write failure; -1 when the slot could
- *         not be made safe and the container must not be finalized.
+ * @return 0 when the buffer was written; 1 when there was no content and the
+ *         slot was left empty; -1 with errno when the buffer could not be
+ *         written or the slot made safe, in which case the container must not
+ *         be finalized.
  */
 int write_container_text_file_at(int container_fd, const char *leaf,
                                  const char *buffer);
