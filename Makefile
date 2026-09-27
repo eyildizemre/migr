@@ -1,6 +1,10 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -g -I src -pthread
-# Each object records the headers it includes, so a changed header rebuilds it.
+# Each object records the headers it includes, so a changed header rebuilds it:
+# -MMD writes that list beside the object as a make rule (foo.o -> foo.d),
+# -MP adds an empty rule per header so a deleted header does not break the
+# build. The last line of this file reads the .d files back; git ignores
+# them and clean removes them.
 DEPFLAGS = -MMD -MP
 
 # Test fixtures set HOME explicitly; a sudo-inherited caller UID must not
