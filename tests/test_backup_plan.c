@@ -3616,7 +3616,25 @@ static void test_sudo_backup_belongs_to_invoker(void)
     printf(BLUE "::" NC " production: a sudo backup's container belongs to the user who ran sudo\n");
     if (geteuid() != 0)
     {
-        printf(BLUE "  (skipped: handing files to another user needs root)\n" NC);
+        // Without root the handover fails, and the warning names why.
+        char home[PATH_MAX], target[PATH_MAX], file[PATH_MAX], output[8192];
+        fresh_mkdtemp(home, sizeof(home), "plan_home");
+        setenv("HOME", home, 1);
+        join_path(file, sizeof(file), home, "payload.txt");
+        write_file(file, "payload");
+        char *paths[] = { file, NULL };
+        fresh_mkdtemp(target, sizeof(target), "plan_target");
+        dry_run = 0;
+        backup_test_set_invoker(1, getuid() + 1, getgid());
+        int rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                      output, sizeof(output));
+        backup_test_set_invoker(0, 0, 0);
+        check(rc == 0 && strstr(output, "to the user who ran sudo: "
+                                        "Operation not permitted") != NULL,
+              "a handover that fails is a warning naming its cause");
+        remove_tree(home);
+        remove_tree(target);
+        printf(BLUE "  (the rest needs root to hand files to another user)\n" NC);
         return;
     }
     const uid_t invoker_uid = 4242;

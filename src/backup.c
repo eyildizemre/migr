@@ -370,13 +370,15 @@ static void backup_give_to_invoker(int container_fd, int target_created)
     gid_t gid;
     if (container_fd < 0 || backup_invoker_identity(&uid, &gid) != 0)
         return;
-    int failed = fchown(container_fd, uid, gid) != 0;
+    int error = 0; /* The first failure's errno. */
+    if (fchown(container_fd, uid, gid) != 0)
+        error = errno;
     if (target_created)
     {
         int parent_fd = openat(container_fd, "..",
                                O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-        if (parent_fd < 0 || fchown(parent_fd, uid, gid) != 0)
-            failed = 1;
+        if ((parent_fd < 0 || fchown(parent_fd, uid, gid) != 0) && error == 0)
+            error = errno;
         if (parent_fd >= 0)
             close(parent_fd);
     }
@@ -385,9 +387,10 @@ static void backup_give_to_invoker(int container_fd, int target_created)
     DIR *dir = scan_fd < 0 ? NULL : fdopendir(scan_fd);
     if (dir == NULL)
     {
+        if (error == 0)
+            error = errno;
         if (scan_fd >= 0)
             close(scan_fd);
-        failed = 1;
     }
     struct dirent *entry;
     while (dir != NULL && (entry = readdir(dir)) != NULL)
@@ -401,15 +404,15 @@ static void backup_give_to_invoker(int container_fd, int target_created)
               (S_ISDIR(st.st_mode) && strcmp(entry->d_name, "data") == 0)))
             continue;
         if (fchownat(container_fd, entry->d_name, uid, gid,
-                     AT_SYMLINK_NOFOLLOW) != 0)
-            failed = 1;
+                     AT_SYMLINK_NOFOLLOW) != 0 && error == 0)
+            error = errno;
     }
     if (dir != NULL)
         closedir(dir);
-    if (failed)
+    if (error != 0)
         print_warning("Warning: could not give every part of the backup "
                       "container to the user who ran sudo: %s\n",
-                      strerror(errno));
+                      strerror(error));
 }
 
 /* Returns 0 to proceed (space is adequate, or an earlier probe/estimate
