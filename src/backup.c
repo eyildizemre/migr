@@ -2940,7 +2940,7 @@ static char *backup_collect_groups(void)
 {
     char user[ACCOUNT_NAME_MAX];
     return local_account_name(backup_source_uid(), user) == 0
-        ? groups_collect("/etc/group", user) : NULL;
+        ? groups_collect(user) : NULL;
 }
 
 // Saves a list restore acts on at the container root, consuming contents;

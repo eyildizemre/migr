@@ -102,7 +102,6 @@ void restore_test_set_progress_force(int force)
 }
 #endif
 
-static const char *network_config_group_file = "/etc/group";
 static const char *network_manager_runtime_dir = "/run/NetworkManager";
 
 #ifdef RESTORE_TEST_HOOKS
@@ -119,51 +118,6 @@ static int network_manager_is_running(void)
 {
     struct stat st;
     return lstat(network_manager_runtime_dir, &st) == 0 && S_ISDIR(st.st_mode);
-}
-
-#ifdef RESTORE_TEST_HOOKS
-void restore_test_set_network_config_group_file(const char *path)
-{
-    network_config_group_file = path != NULL ? path : "/etc/group";
-}
-#endif
-
-// Resolves a group from the local group file without NSS, as D38 does for
-// accounts. Returns -1 when it is absent, duplicated, or unreadable.
-static int network_config_local_gid(const char *name, gid_t *gid_out)
-{
-    FILE *groups = fopen(network_config_group_file, "re");
-    if (groups == NULL)
-        return -1;
-    char *line = NULL;
-    size_t capacity = 0;
-    size_t name_length = strlen(name);
-    int matches = 0;
-    gid_t found = 0;
-    while (getline(&line, &capacity, groups) >= 0)
-    {
-        if (strncmp(line, name, name_length) != 0 || line[name_length] != ':')
-            continue;
-        const char *gid_field = strchr(line + name_length + 1, ':');
-        if (gid_field == NULL)
-            continue;
-        gid_field++;
-        char *end = NULL;
-        errno = 0;
-        unsigned long value = strtoul(gid_field, &end, 10);
-        if (errno != 0 || end == gid_field || (*end != ':' && *end != '\n' &&
-                                               *end != '\0') ||
-            (unsigned long)(gid_t)value != value || (gid_t)value == (gid_t)-1)
-            continue;
-        found = (gid_t)value;
-        matches++;
-    }
-    free(line);
-    fclose(groups);
-    if (matches != 1)
-        return -1;
-    *gid_out = found;
-    return 0;
 }
 
 static int name_has_suffix(const char *name, const char *suffix)
@@ -186,7 +140,7 @@ static mode_t network_config_file_mode(
         name_has_suffix(name, ".netdev"))
     {
         gid_t group;
-        if (network_config_local_gid("systemd-network", &group) == 0)
+        if (local_group_gid("systemd-network", &group) == 0)
             *group_out = group;
         return 0640;
     }

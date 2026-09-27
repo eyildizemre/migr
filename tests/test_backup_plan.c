@@ -1797,7 +1797,7 @@ static void test_vscode_extension_snapshot(void)
 
     char user[ACCOUNT_NAME_MAX];
     char *groups = local_account_name(getuid(), user) == 0
-        ? groups_collect("/etc/group", user) : NULL;
+        ? groups_collect(user) : NULL;
     if (groups != NULL && have_container)
     {
         join_path(expected, sizeof(expected), stub_dir, "groups.txt");

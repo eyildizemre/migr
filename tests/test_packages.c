@@ -878,22 +878,36 @@ static void test_groups_collect(void)
                      "extra:x:8:eyildizemre,other:more\n"
                      "eyildizemre2:x:7:eyildizemre2\n"
                      "short:x:9:ale\n"
+                     "badgid:x:9x:eyildizemre\n"
+                     "twice:x:20:\n"
+                     "twice:x:21:\n"
                      "dialout:x:18:bob,eyildizemre") == 0,
           "group fixture is written");
-    char *groups = groups_collect(path, "eyildizemre");
+    packages_test_set_group_file(path);
+    char *groups = groups_collect("eyildizemre");
     check(groups != NULL && strcmp(groups, "wheel\nlibvirt\ndialout\n") == 0,
           "only groups whose member list names the user are listed, in file "
           "order, without malformed lines or unsafe names");
     free(groups);
 
-    groups = groups_collect(path, "carol");
+    groups = groups_collect("carol");
     check(groups != NULL && groups[0] == '\0',
           "a user in no group gets an empty list, not a failure");
     free(groups);
 
+    gid_t gid = 0;
+    check(local_group_gid("libvirt", &gid) == 0 && gid == 970,
+          "a group's gid is looked up by its name");
+    check(local_group_gid("twice", &gid) != 0 &&
+              local_group_gid("nosuch", &gid) != 0 &&
+              local_group_gid("badgid", &gid) != 0,
+          "a group listed twice, absent, or with a malformed gid has none");
+
     unlink(path);
-    check(groups_collect(path, "eyildizemre") == NULL,
-          "an unreadable group file yields no list");
+    check(groups_collect("eyildizemre") == NULL &&
+              local_group_gid("libvirt", &gid) != 0,
+          "an unreadable group file yields no list and no gid");
+    packages_test_set_group_file(NULL);
 }
 
 typedef struct {

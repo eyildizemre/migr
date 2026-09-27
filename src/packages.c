@@ -738,20 +738,56 @@ static int group_name_is_safe(const char *name)
                         "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-") == length;
 }
 
-// Splits one group file line in place into its name and member list.
+// Splits one group file line in place into its name, gid, and member list.
 // Returns -1 for a line that is not name:password:gid:members.
-static int group_line_split(char *line, char **name, char **members)
+static int group_line_split(char *line, char **name, gid_t *gid,
+                            char **members)
 {
     line[strcspn(line, "\n")] = '\0';
     char *password = strchr(line, ':');
-    char *gid = password != NULL ? strchr(password + 1, ':') : NULL;
-    char *list = gid != NULL ? strchr(gid + 1, ':') : NULL;
+    char *gid_field = password != NULL ? strchr(password + 1, ':') : NULL;
+    char *list = gid_field != NULL ? strchr(gid_field + 1, ':') : NULL;
     if (list == NULL || strchr(list + 1, ':') != NULL)
+        return -1;
+    char *end = NULL;
+    errno = 0;
+    unsigned long value = strtoul(gid_field + 1, &end, 10);
+    if (errno != 0 || end == gid_field + 1 || end != list ||
+        (unsigned long)(gid_t)value != value || (gid_t)value == (gid_t)-1)
         return -1;
     *password = '\0';
     *name = line;
+    *gid = (gid_t)value;
     *members = list + 1;
     return 0;
+}
+
+typedef int (*GroupLineCallback)(const char *name, gid_t gid,
+                                 const char *members, void *context);
+
+// Calls line_callback for every well-formed line of the local group file,
+// read without NSS as D38 reads accounts, until it returns nonzero. Returns
+// -1 when the file cannot be read or line_callback returns -1.
+static int group_file_foreach(GroupLineCallback line_callback, void *context)
+{
+    FILE *groups = fopen(group_file_path(), "re");
+    if (groups == NULL)
+        return -1;
+    char *line = NULL;
+    size_t capacity = 0;
+    int stop = 0;
+    while (stop == 0 && getline(&line, &capacity, groups) >= 0)
+    {
+        char *name;
+        gid_t gid;
+        char *members;
+        if (group_line_split(line, &name, &gid, &members) == 0)
+            stop = line_callback(name, gid, members, context);
+    }
+    int failed = stop < 0 || ferror(groups) != 0;
+    free(line);
+    fclose(groups);
+    return failed ? -1 : 0;
 }
 
 static int group_members_include(const char *members, const char *user)
@@ -769,41 +805,65 @@ static int group_members_include(const char *members, const char *user)
     return 0;
 }
 
-char *groups_collect(const char *group_path, const char *user)
+typedef struct {
+    const char *user;
+    FILE *out;
+} GroupCollect;
+
+static int collect_group(const char *name, gid_t gid, const char *members,
+                         void *context)
 {
-    FILE *groups = fopen(group_path, "re");
-    if (groups == NULL)
-        return NULL;
+    (void)gid;
+    const GroupCollect *collect = context;
+    if (!group_name_is_safe(name) ||
+        !group_members_include(members, collect->user))
+        return 0;
+    return fprintf(collect->out, "%s\n", name) < 0 ? -1 : 0;
+}
+
+char *groups_collect(const char *user)
+{
     char *list = NULL;
     size_t list_size = 0;
-    FILE *out = open_memstream(&list, &list_size);
-    if (out == NULL)
-    {
-        fclose(groups);
+    GroupCollect collect = { user, open_memstream(&list, &list_size) };
+    if (collect.out == NULL)
         return NULL;
-    }
-
-    char *line = NULL;
-    size_t capacity = 0;
-    int failed = 0;
-    while (!failed && getline(&line, &capacity, groups) >= 0)
-    {
-        char *name;
-        char *members;
-        if (group_line_split(line, &name, &members) == 0 &&
-            group_name_is_safe(name) && group_members_include(members, user))
-            failed = fprintf(out, "%s\n", name) < 0;
-    }
-    failed |= ferror(groups) != 0;
-    free(line);
-    fclose(groups);
-    failed |= fclose(out) != 0;
+    int failed = group_file_foreach(collect_group, &collect) != 0;
+    failed |= fclose(collect.out) != 0;
     if (failed)
     {
         free(list);
         return NULL;
     }
     return list;
+}
+
+typedef struct {
+    const char *name;
+    gid_t gid;
+    int matches;
+} GroupLookup;
+
+static int lookup_group(const char *name, gid_t gid, const char *members,
+                        void *context)
+{
+    (void)members;
+    GroupLookup *lookup = context;
+    if (strcmp(name, lookup->name) == 0)
+    {
+        lookup->gid = gid;
+        lookup->matches++;
+    }
+    return 0;
+}
+
+int local_group_gid(const char *name, gid_t *gid)
+{
+    GroupLookup lookup = { name, 0, 0 };
+    if (group_file_foreach(lookup_group, &lookup) != 0 || lookup.matches != 1)
+        return -1;
+    *gid = lookup.gid;
+    return 0;
 }
 
 static void print_group_names(char **names, const int *pick, int count)
@@ -840,6 +900,29 @@ static char *join_group_names(char **names, const int *pick, int count)
     return joined;
 }
 
+typedef struct {
+    char **names;
+    int count;
+    const char *user;
+    int *wanted;
+    int *missing;
+} GroupMatch;
+
+static int match_group(const char *name, gid_t gid, const char *members,
+                       void *context)
+{
+    (void)gid;
+    GroupMatch *match = context;
+    for (int i = 0; i < match->count; i++)
+    {
+        if (!match->missing[i] || strcmp(match->names[i], name) != 0)
+            continue;
+        match->missing[i] = 0;
+        match->wanted[i] = !group_members_include(members, match->user);
+    }
+    return 0;
+}
+
 void restore_groups(int source_root_fd, const char *user, FILE *todo,
                     int *had_error)
 {
@@ -856,7 +939,6 @@ void restore_groups(int source_root_fd, const char *user, FILE *todo,
 
     int *wanted = NULL;
     int *missing = NULL;
-    FILE *groups = NULL;
     if (count == 0)
     {
         printf("  The backup saved no group memberships.\n");
@@ -864,8 +946,7 @@ void restore_groups(int source_root_fd, const char *user, FILE *todo,
     }
     wanted = calloc((size_t)count, sizeof(*wanted));
     missing = calloc((size_t)count, sizeof(*missing));
-    groups = fopen(group_file_path(), "re");
-    if (user == NULL || wanted == NULL || missing == NULL || groups == NULL)
+    if (user == NULL || wanted == NULL || missing == NULL)
     {
         print_error("Error: Could not match the saved group memberships "
                     "against this system\n");
@@ -877,24 +958,8 @@ void restore_groups(int source_root_fd, const char *user, FILE *todo,
     // when it does and does not list the user yet.
     for (int i = 0; i < count; i++)
         missing[i] = group_name_is_safe(names[i]);
-    char *line = NULL;
-    size_t capacity = 0;
-    while (getline(&line, &capacity, groups) >= 0)
-    {
-        char *name;
-        char *members;
-        if (group_line_split(line, &name, &members) != 0)
-            continue;
-        for (int i = 0; i < count; i++)
-        {
-            if (!missing[i] || strcmp(names[i], name) != 0)
-                continue;
-            missing[i] = 0;
-            wanted[i] = !group_members_include(members, user);
-        }
-    }
-    free(line);
-    if (ferror(groups))
+    GroupMatch match = { names, count, user, wanted, missing };
+    if (group_file_foreach(match_group, &match) != 0)
     {
         print_error("Error: Could not read %s\n", group_file_path());
         *had_error = 1;
@@ -958,8 +1023,6 @@ void restore_groups(int source_root_fd, const char *user, FILE *todo,
     }
 
 done:
-    if (groups != NULL)
-        fclose(groups);
     free(wanted);
     free(missing);
     free_name_list(names, count);

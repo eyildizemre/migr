@@ -2,6 +2,7 @@
 #define PACKAGES_H
 
 #include <stdio.h>
+#include <sys/types.h>
 
 #ifdef PACKAGES_TEST_HOOKS
 #include "detect.h"
@@ -144,7 +145,7 @@ void read_package_list(FILE *pkg_file, char ***pkgs_out, int *pkg_count_out,
 void restore_packages(int source_root_fd, FILE *todo, int *had_error);
 
 /**
- * @brief Lists the groups whose member list in group_path names user, one
+ * @brief Lists the groups whose member list in /etc/group names user, one
  *        name per line.
  *
  * These are the user's supplementary memberships, by name since GIDs differ
@@ -155,7 +156,15 @@ void restore_packages(int source_root_fd, FILE *todo, int *had_error);
  * @return A heap string, empty when user is in no group; NULL when the file
  *         cannot be read.
  */
-char *groups_collect(const char *group_path, const char *user);
+char *groups_collect(const char *user);
+
+/**
+ * @brief Looks a group's gid up in /etc/group, read the same way.
+ *
+ * @return 0, or -1 when the group is absent, listed twice, or the file cannot
+ *         be read.
+ */
+int local_group_gid(const char *name, gid_t *gid);
 
 /**
  * @brief Adds user to the groups a restored groups.txt lists.
