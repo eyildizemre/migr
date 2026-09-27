@@ -3590,6 +3590,18 @@ static void test_sudo_backup_belongs_to_invoker(void)
     check(owned_by(payload, 0, 0) && owned_by(parent, 0, 0),
           "the payload keeps its captured owner, and a folder migr did not "
           "create is left alone");
+    Manifest recorded;
+    int container_fd = open(container, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int manifest_ok = container_fd >= 0 &&
+                      manifest_read_v1_at(container_fd, &recorded) ==
+                          MANIFEST_STATUS_VALID;
+    check(manifest_ok && recorded.has_source_identity &&
+              recorded.source_uid == invoker_uid,
+          "the manifest records the invoker as whose data this is");
+    if (manifest_ok)
+        manifest_free(&recorded);
+    if (container_fd >= 0)
+        close(container_fd);
 
     remove_tree(target);
     rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths, output,
@@ -3609,8 +3621,17 @@ static void test_sudo_backup_belongs_to_invoker(void)
     backup_test_set_invoker(0, 0, 0);
     backup_test_force_portable_representation(0);
     found = find_container_dir(target, container, sizeof(container));
-    check(rc == 0 && found && owned_by(container, 0, 0),
-          "a portable backup hands nothing over");
+    container_fd = open(container, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    manifest_ok = container_fd >= 0 &&
+                  manifest_read_v1_at(container_fd, &recorded) ==
+                      MANIFEST_STATUS_VALID;
+    check(rc == 0 && found && owned_by(container, 0, 0) && manifest_ok &&
+              recorded.source_uid == invoker_uid,
+          "a portable backup hands nothing over, and records the invoker too");
+    if (manifest_ok)
+        manifest_free(&recorded);
+    if (container_fd >= 0)
+        close(container_fd);
 
     remove_tree(home);
     remove_tree(parent);

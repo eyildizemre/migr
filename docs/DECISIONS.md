@@ -4622,6 +4622,10 @@ restore depends on. `network/` stays root's, since it can hold Wi-Fi
 secrets. A portable backup changes nothing: FAT and exFAT take owners from
 the mount. A failed handover is a warning, not a failure.
 
+The manifest's source identity (D15) names the invoker too: its source uid
+is `SUDO_UID` under sudo. It had recorded root, so every sudo backup looked
+like root's.
+
 **Why:** Under sudo everything migr wrote belonged to root. The user could
 not delete their own backup, and a restore preview without sudo (which D62
 keeps root-free) stopped at the no-atime open of the root-owned `data/`.

@@ -343,6 +343,15 @@ static int backup_invoker_identity(uid_t *uid, gid_t *gid)
     return 0;
 }
 
+// Whose data a backup holds, as recorded in its source identity (D15): the
+// sudo invoker when run through sudo (D62), otherwise the caller.
+static uid_t backup_source_uid(void)
+{
+    uid_t uid;
+    gid_t gid;
+    return backup_invoker_identity(&uid, &gid) == 0 ? uid : getuid();
+}
+
 // A sudo backup on a destination that records ownership belongs to the user
 // who ran it (D70), so they can look at, preview, and delete it without
 // sudo. Only migr's own entries change hands: the destination folder when
@@ -1750,7 +1759,7 @@ static void manifest_set_source_identity(Manifest *out)
     if (read_machine_id(machine_id, sizeof(machine_id)) == 0)
     {
         memcpy(out->machine_id, machine_id, strlen(machine_id) + 1);
-        out->source_uid = getuid();
+        out->source_uid = backup_source_uid();
         out->has_source_identity = 1;
     }
 }
@@ -2603,7 +2612,7 @@ static int backup_dry_run(const char *target, BackupMode mode,
             advisory_machine_id, sizeof(advisory_machine_id)) == 0;
         PortableCaptureRequest advisory_request;
         int request_result = portable_capture_request_for_execution(
-            plan, selection, advisory_machine_id, advisory_has_machine_id, getuid(),
+            plan, selection, advisory_machine_id, advisory_has_machine_id, backup_source_uid(),
             advisory_profile.nsec_exact,
             advisory_profile.capabilities[FS_CAP_CASE_SENSITIVE].status ==
                 FS_CAP_SUPPORTED,
@@ -2968,7 +2977,7 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
         int has_machine_id = read_machine_id(portable_machine_id,
                                              sizeof(portable_machine_id)) == 0;
         if (portable_capture_request_for_execution(
-                &plan, selection, portable_machine_id, has_machine_id, getuid(),
+                &plan, selection, portable_machine_id, has_machine_id, backup_source_uid(),
                 profile.nsec_exact,
                 profile.capabilities[FS_CAP_CASE_SENSITIVE].status ==
                     FS_CAP_SUPPORTED,
