@@ -1035,6 +1035,15 @@ test_comprehensive() {
     output=$("$MIGR" backup "$comp_backup" --comprehensive 2>&1)
 
     assert_contains "$output" "Backup complete"
+    # Sections without verbose lines under them print no heading, and no
+    # section leaves an empty line of its own behind.
+    assert_not_contains "$output" "Main Directories"
+    if [[ "$output" == *$'\n\n\n'* ]]; then
+        echo -e "  ${RED}✗${NC} Backup output has two empty lines in a row."
+        echo "$output"
+        exit 1
+    fi
+    echo -e "  ${GREEN}✓${NC} Backup output has no empty headings or doubled empty lines."
 
     local actual_backup
     actual_backup=$(sole_final_container "$comp_backup")

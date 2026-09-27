@@ -2241,7 +2241,8 @@ static void capture_roots(const CloneContext *ctx, const BackupPlan *plan,
             if (root->group != root_sections[s].group)
                 continue;
 
-            if (!printed_heading)
+            // Headings only group the verbose lines under them.
+            if (verbose && !printed_heading)
             {
                 printf("\n%s\n", root_sections[s].heading);
                 printed_heading = 1;
@@ -3368,7 +3369,6 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
             printf("Updating this install's backup in place.\n");
         else if (adopted)
             printf("Resuming an interrupted backup of this install.\n");
-        printf("\n");
 
         capture_report.sync_interval_bytes = BACKUP_SYNC_INTERVAL_BYTES;
         BackupProgressDisplay progress_display = {
