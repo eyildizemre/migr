@@ -3936,29 +3936,16 @@ static void test_updates_rewrite_a_grown_journal(void)
     remove_tree(target);
 }
 
-static void grow_source_before_inventory(const char *source_path,
-                                         void *context)
-{
-    if (strcmp(source_path, (const char *)context) != 0)
-        return;
-    int fd = open(source_path, O_WRONLY | O_APPEND | O_CLOEXEC);
-    if (fd >= 0)
-    {
-        (void)write(fd, "!", 1);
-        close(fd);
-    }
-}
-
 // An update that stops before changing anything gives the finished backup its
 // name back instead of leaving it looking unfinished (D72).
 static void test_failed_update_keeps_the_finished_backup(void)
 {
     printf(BLUE "::" NC " production: an update that stops before changing anything keeps the backup as it was\n");
 
-    char home[PATH_MAX], target[PATH_MAX], file[PATH_MAX];
+    char home[PATH_MAX], target[PATH_MAX], file[PATH_MAX], inside[PATH_MAX];
     fresh_mkdtemp(home, sizeof(home), "plan_home");
     setenv("HOME", home, 1);
-    join_path(file, sizeof(file), home, "file.txt");
+    join_path(file, sizeof(file), home, "item");
     write_file(file, "before");
     fresh_mkdtemp(target, sizeof(target), "plan_target");
     char *paths[] = { file, NULL };
@@ -3971,10 +3958,14 @@ static void test_failed_update_keeps_the_finished_backup(void)
     int found = find_container_dir(target, container, sizeof(container));
     join_path(payload, sizeof(payload), container, "data/EXPLICIT_0");
 
-    backup_test_set_inventory_hook(grow_source_before_inventory, file);
+    // The item is now a folder where the backup holds a file, which the
+    // metadata preflight refuses.
+    unlink(file);
+    mkdir_p(file);
+    join_path(inside, sizeof(inside), file, "inside.txt");
+    write_file(inside, "now a folder");
     int second_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
                                          output, sizeof(output));
-    backup_test_set_inventory_hook(NULL, NULL);
     char updating[PATH_MAX + 16];
     snprintf(updating, sizeof(updating), "%s.updating", container);
     check(first_rc == 0 && found && second_rc == 2 &&
@@ -3982,6 +3973,64 @@ static void test_failed_update_keeps_the_finished_backup(void)
               access(container, F_OK) == 0 && access(updating, F_OK) != 0 &&
               file_text_is(payload, "before"),
           "the backup keeps its finished name and content");
+
+    remove_tree(home);
+    remove_tree(target);
+}
+
+typedef struct {
+    const char *folder;   /* Gets a new file when the preflight opens it. */
+    const char *vanished; /* Removed when the preflight opens it. */
+} PreflightChange;
+
+static void change_source_during_preflight(const char *source_path,
+                                           void *context)
+{
+    const PreflightChange *change = context;
+    if (strcmp(source_path, change->vanished) == 0)
+        unlink(source_path);
+    if (strcmp(source_path, change->folder) == 0)
+    {
+        char added[PATH_MAX];
+        join_path(added, sizeof(added), source_path, "added.txt");
+        write_file(added, "written meanwhile");
+    }
+}
+
+// The native metadata preflight walks the whole source before capture; what
+// changes under it meanwhile is left to capture (D63), not a refusal.
+static void test_native_preflight_of_a_changing_source(void)
+{
+    printf(BLUE "::" NC " production: a native preflight goes on when its source changes under it\n");
+
+    char home[PATH_MAX], target[PATH_MAX], work[PATH_MAX], gone[PATH_MAX];
+    char kept[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_home");
+    setenv("HOME", home, 1);
+    join_path(work, sizeof(work), home, "work");
+    mkdir_p(work);
+    join_path(gone, sizeof(gone), work, "gone.txt");
+    join_path(kept, sizeof(kept), work, "kept.txt");
+    write_file(gone, "removed during the preflight");
+    write_file(kept, "kept");
+    fresh_mkdtemp(target, sizeof(target), "plan_target");
+    char *paths[] = { work, NULL };
+    char output[8192];
+    dry_run = 0;
+
+    PreflightChange change = { .folder = work, .vanished = gone };
+    backup_test_set_inventory_hook(change_source_during_preflight, &change);
+    int rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                  output, sizeof(output));
+    backup_test_set_inventory_hook(NULL, NULL);
+    char container[PATH_MAX], payload[PATH_MAX];
+    int found = find_container_dir(target, container, sizeof(container));
+    join_path(payload, sizeof(payload), container,
+              "data/EXPLICIT_0/kept.txt");
+    check(rc == 0 && found && strstr(output, "preflight failed") == NULL &&
+              file_text_is(payload, "kept"),
+          "a file removed and a folder written during the preflight do not "
+          "stop the backup");
 
     remove_tree(home);
     remove_tree(target);
@@ -4311,6 +4360,7 @@ int main(void)
     test_backup_updates_in_place(1);
     test_backup_leaves_another_install_alone();
     test_failed_update_keeps_the_finished_backup();
+    test_native_preflight_of_a_changing_source();
     test_update_repairs_payload_without_walking_it();
     test_updates_rewrite_a_grown_journal();
     test_dangling_builtin_dotfile_is_captured_not_silently_dropped();

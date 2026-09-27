@@ -4384,6 +4384,11 @@ changes while it is read. Each change is one of three kinds:
   its folder's names is left out; it is never written under a name the
   pre-scan did not plan.
 
+The native metadata preflight, which walks the source before capture,
+follows the same rule: an item gone by the time it is opened is left to
+capture, and one that changed is profiled as first seen, instead of
+refusing the whole backup.
+
 A different kind of object at the same path is left out. For a planned
 portable member, the membership check after its root reports it as vanished
 once. A read that returns fewer bytes than the file's size while its

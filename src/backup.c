@@ -2483,6 +2483,13 @@ static void source_read_refusals_report(const SourceReadRefusals *refusals)
                refusals->uninspected_subtree_count);
 }
 
+// Opening an item listed a moment ago failed because it is gone, or was
+// replaced by something else (a symlink, a file where a folder was).
+static int source_vanished(int error)
+{
+    return error == ENOENT || error == ENOTDIR || error == ELOOP;
+}
+
 static int backup_metadata_inventory(const char *source_path, int anchor_fd,
                                      int destination_root_fd,
                                      const char *destination_rel,
@@ -2495,9 +2502,12 @@ static int backup_metadata_inventory(const char *source_path, int anchor_fd,
         int owned = selection_source_owns(selection, source_path);
         if (owned <= 0) return owned;
     }
+    // The source may change while it is walked (D63): an item gone since it
+    // was listed is left to capture, which leaves it out and says so, and
+    // one that changed is profiled as first seen.
     struct stat source_st;
     if (lstat(source_path, &source_st) != 0)
-        return -1;
+        return errno == ENOENT ? 0 : -1;
 
     struct stat existing_st;
     int destination_exists = 0;
@@ -2532,14 +2542,9 @@ static int backup_metadata_inventory(const char *source_path, int anchor_fd,
                 source_read_refusal_record(refusals, source_path, 0);
                 return 0;
             }
-            return -1;
+            return source_vanished(errno) ? 0 : -1;
         }
-        struct stat opened;
-        int failed = fstat(fd, &opened) != 0 ||
-                     !metadata_source_unchanged(&source_st, &opened);
-        if (close(fd) != 0)
-            failed = 1;
-        return failed ? -1 : 0;
+        return close(fd) != 0 ? -1 : 0;
     }
 
     if (!S_ISDIR(source_st.st_mode))
@@ -2557,14 +2562,7 @@ static int backup_metadata_inventory(const char *source_path, int anchor_fd,
             source_read_refusal_record(refusals, source_path, 1);
             return 0;
         }
-        return -1;
-    }
-    struct stat opened;
-    if (fstat(source_fd, &opened) != 0 ||
-        !metadata_source_unchanged(&source_st, &opened))
-    {
-        close(source_fd);
-        return -1;
+        return source_vanished(errno) ? 0 : -1;
     }
     int scan_fd = fcntl(source_fd, F_DUPFD_CLOEXEC, 0);
     DIR *dir = scan_fd < 0 ? NULL : fdopendir(scan_fd);
@@ -2606,9 +2604,6 @@ static int backup_metadata_inventory(const char *source_path, int anchor_fd,
         }
     }
     if (closedir(dir) != 0)
-        failed = 1;
-    if (!failed && (fstat(source_fd, &opened) != 0 ||
-                    !metadata_source_unchanged(&source_st, &opened)))
         failed = 1;
     if (close(source_fd) != 0)
         failed = 1;
