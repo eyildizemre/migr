@@ -310,9 +310,9 @@ const char *replay_failure_step_text(PortableRestoreReplayFailureStep step)
         case PORTABLE_RESTORE_REPLAY_FAILURE_READ_DESTINATION_CONTENT:
             return "read restored content";
         case PORTABLE_RESTORE_REPLAY_FAILURE_COMPARE_DESTINATION_CONTENT:
-            return "compare restored content";
+            return "content differs from the backup";
         case PORTABLE_RESTORE_REPLAY_FAILURE_COMPARE_BACKUP_CONTENT:
-            return "compare backup content";
+            return "the backup's copy changed after it was captured";
         case PORTABLE_RESTORE_REPLAY_FAILURE_VERIFY_DESTINATION_HARDLINK:
             return "verify restored hardlink";
         case PORTABLE_RESTORE_REPLAY_FAILURE_CLOSE_DESCRIPTOR:
@@ -338,23 +338,14 @@ int replay_failure_reason_format(const PortableRestoreReplayReport *report,
         ? replay_failure_kind_text(report->failed_kind) : NULL;
     if (step == NULL || (report->failed_kind_valid && kind == NULL))
         return 0;
-    int failure_errno = report->failure_errno;
-    // A read-back that simply differs is recorded as EIO; read errors have
-    // their own step, so this one must not read like a disk failure.
-    if (report->failure_step ==
-            PORTABLE_RESTORE_REPLAY_FAILURE_COMPARE_DESTINATION_CONTENT &&
-        failure_errno == EIO)
-    {
-        step = "content differs from the backup";
-        failure_errno = 0;
-    }
-    else if (report->failure_step ==
-                 PORTABLE_RESTORE_REPLAY_FAILURE_COMPARE_BACKUP_CONTENT &&
-             failure_errno == EIO)
-    {
-        step = "the backup's copy changed after it was captured";
-        failure_errno = 0;
-    }
+    // A comparison that fails has found a difference and records EIO; read
+    // errors have their own steps, so it must not read like a disk failure.
+    int failure_errno =
+        report->failure_step ==
+                PORTABLE_RESTORE_REPLAY_FAILURE_COMPARE_DESTINATION_CONTENT ||
+        report->failure_step ==
+                PORTABLE_RESTORE_REPLAY_FAILURE_COMPARE_BACKUP_CONTENT
+            ? 0 : report->failure_errno;
     int length;
     if (kind != NULL && failure_errno != 0)
         length = snprintf(out, out_size, "%s, %s: %s", kind, step,
