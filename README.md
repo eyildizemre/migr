@@ -1,28 +1,31 @@
 # migr
 
-A CLI tool for migrating between Linux distributions. Detects your distro, backs up your main directories, browser profiles, and dotfiles, exports your package list, and restores everything on the new system.
+migr moves your home folder, packages, and desktop settings from one Linux
+installation to another, across distributions too: back up to a drive,
+reinstall, restore.
 
-Built out of necessity — I was moving from Ubuntu to Fedora, stressing over browser configs, SSH keys, and dotfiles. This automates what I was doing by hand.
+It is not released yet: there are no packages, so build it from source.
 
-Originally written in one day for an Intro to CS final project.
+## Why migr
 
-## Target Distributions
-
-`migr` targets three package-manager families:
-
-| Family | Package manager | Examples |
-|---|---|---|
-| Debian | `dpkg` / `apt` | Debian, Ubuntu, Mint, Pop!_OS, elementary, Zorin |
-| Fedora | `rpm` / `dnf` | Fedora, RHEL, CentOS, Nobara |
-| Arch | `pacman` | Arch, Manjaro, EndeavourOS, Garuda |
-
-Derivatives are resolved through the `ID_LIKE` field of `/etc/os-release`, so a
-distribution works even if it is not named above, as long as it declares one of these
-families and uses its package manager.
-
-Distributions outside these three — openSUSE, Void, Gentoo, and others — are detected
-as unknown. Files, dotfiles, and browser profiles are still backed up and restored
-normally; only the package list is skipped.
+- **More than files.** Besides your folders and dotfiles, it brings back the
+  packages you installed, system-wide Flatpak applications, your group
+  memberships, GNOME settings, and, if you ask, your network connections. What
+  the new system cannot take is listed with the command to run, never dropped
+  silently.
+- **Any drive.** On ext4, btrfs, or xfs a backup is a plain folder you can copy
+  back with `cp -a`. On exFAT, FAT32, or NTFS, which cannot store Linux owners,
+  permissions, or extended attributes, migr keeps them in a journal beside your
+  files and restores them exactly.
+- **Safe on a running desktop.** A file that changes while it is read is read
+  again, and on btrfs the backup reads a read-only snapshot. Applications that
+  rewrite their settings are restored last.
+- **Resumable and updatable.** An interrupted backup continues where it
+  stopped. Backing up to the same drive again updates the backup and copies
+  only what changed.
+- **Checked before you wipe.** For a backup on exFAT, FAT32, or NTFS,
+  `migr verify` confirms that every file on the drive still matches what was
+  captured, and restore reads back every file it wrote.
 
 ## Build
 
@@ -30,213 +33,308 @@ normally; only the package list is skipped.
 make
 ```
 
-To create the standalone binary used by `backup --include-self`, also build:
+This needs a C compiler and `make`. Run migr from the source folder as
+`./migr`. Pre-built .deb, .rpm, and AUR packages are planned.
+
+## Quick start
 
 ```bash
-make migr-static
+./migr report                                  # what a backup takes, and what it leaves out
+./migr conf                                    # optional: add or exclude paths
+sudo ./migr backup /mnt/usb                    # back up to the drive mounted at /mnt/usb
+./migr verify /mnt/usb/migr-$USER              # check the backup before wiping this system
 ```
 
-`migr-static` must sit beside the running `migr` executable when the backup
-starts. The backup command validates that it is a static ELF binary before
-copying it.
-
-To activate the pre-commit hook (runs build + tests when C/shell/Makefile changes are staged), run this once after cloning:
+Then install the new distribution, create your user, log in, build migr, and
+plug the drive in:
 
 ```bash
-git config core.hooksPath hooks
+sudo ./migr restore /mnt/usb/migr-$USER
 ```
 
-## Usage
+`report`, `verify`, and every `--dry-run` preview run without root.
 
-```bash
-./migr
-./migr report [--critical | --comprehensive] [-s] [--max-depth=<N>]
-sudo ./migr backup <PATH>
-sudo ./migr restore <SOURCE> [--no-verify]
-./migr verify <SOURCE>
-./migr repair <SOURCE> <PATH>
-./migr conf
-```
+## What gets migrated
 
-`backup` and `restore` run as root: they ask for the sudo password once, at the
-start, and then run unattended. A backup on a drive that records file owners
-(ext4, btrfs, xfs) still belongs to the user who ran sudo: the backup folder,
-its `data/` folder, and its top-level files, and the destination folder when
-migr created it. That user can look at it, preview a restore from it, and
-delete it without sudo. Backed-up files keep their own owners, and saved
-network configuration stays root's. On FAT and exFAT drives, owners come from
-how the drive is mounted.
+| What | Backed up | On restore |
+|---|---|---|
+| Your folders | Documents, Downloads, Pictures, Desktop, found by their localized names (`xdg-user-dirs`) | Restored into the new system's folders of the same kind, whatever they are called there |
+| Settings and app data | `~/.config`, `~/.local/share`, `~/.local/state`, `~/.local/bin`, and Flatpak applications' data in `~/.var/app` without their caches | Restored; open applications are handled last (see [Restoring](#restoring)) |
+| Shell and tools | `.ssh`, `.gnupg`, `.gitconfig`, bash and zsh startup and history files, `.inputrc`, `.tmux.conf`, `.screenrc` | Restored |
+| Browsers | Firefox, Chrome, Chromium, Brave, Vivaldi, Edge, Opera | Restored |
+| VS Code, VSCodium | `~/.vscode` and `~/.vscode-oss`, with installed extensions | Restored as files |
+| GNOME settings | the dconf database | Loaded into your session when you are logged in; otherwise in place for your next login |
+| Packages | the packages you installed yourself, not their dependencies | Installed in one transaction; the ones the new system cannot install are listed |
+| Flatpak applications | the system-wide installation's applications and their remotes | Installed from the remotes the new system has; the others are listed |
+| Groups | groups you were added to, such as `libvirt`, `docker`, or `dialout` | You are added back to the ones the new system has; the others are listed |
+| Network (opt-in) | NetworkManager, netplan, systemd-networkd, wpa_supplicant, and netctl configuration | Written back; NetworkManager reloads it, the others are left for you to apply |
 
-A backup does not stop when files change under it. A file written while it is
-read is read again; one still being written after three reads is kept as last
-read. Items removed before they could be read, or created after their folder
-was scanned, are left out. The backup still completes, lists what changed, and
-exits with status 1 instead of 0 (2 means it failed). Frequently rewritten desktop state (such as
-GNOME's file metadata) is only counted, not listed.
+That is the default scope, `--critical`. `--comprehensive` adds Videos and
+Music. Listing paths after the destination (`sudo ./migr backup /mnt/usb
+~/Documents ~/Projects`) backs up exactly those paths and nothing else: no
+package, Flatpak, or group lists.
 
-On btrfs (Fedora's default), a backup reads its sources from a read-only
-snapshot taken just before the scan, so nothing changes under it at all. The
-snapshot is visible only to migr, lives inside the subvolume as
-`.migr-snapshot-<pid>`, and is deleted when capture ends; one left by an
-interrupted run is removed by the next. Nested subvolumes and mounts are
-read live. A subvolume that holds the backup destination, or one mounted at
-`/`, is always read live. Under `sudo`, migr still backs up and restores
-the invoking user's home and writes restored files as that user. Their
-`--dry-run` previews, and every other command, need no root.
-
-## Example
-
-```bash
-migr report --critical -v
-```
+`migr report` shows the scope, its size, and the largest folders it leaves out:
 
 ```text
-Scope config: /home/eyildizemre/.config/migr/migr.conf (0 configured rules)
-
+$ ./migr report
 Backup Analysis · Fedora/RHEL
 /home/eyildizemre
 
-Dotfiles & Config
-  .bash_history                         26B  (/home/eyildizemre/.bash_history)
-  .bashrc                               37B  (/home/eyildizemre/.bashrc)
-
 Main Directories
-  Documents                          300.2K  (/home/eyildizemre/Documents)
-    Projects                           300.1K  (/home/eyildizemre/Documents/Projects)
-  Pictures                           128.1K  (/home/eyildizemre/Pictures)
+  Desktop                                0B
+  Documents                            2.3M
+  Downloads                            1.4M
+  Pictures                             4.3M
 
-  Critical estimate                  428.3K
+Dotfiles & Config
+  .bash_history                         27B
+  .bash_logout                          18B
+  .bash_profile                        144B
+  .bashrc                              522B
+  .config                              133B
+  .gitconfig                            20B
+  .local/bin                            31B
+  .local/share                           0B
+  .ssh                                  65B
+
+  Critical estimate                    8.0M
+
+Not included (add a path with `migr conf` to back it up):
+  Games                        2.9M
 ```
 
-Running the backup shows the same scope, asks before capturing shell history
-(see [Dotfiles](#what-gets-backed-up) below), and reports what it actually
-wrote once it finishes:
+`-v` adds each item's path and the folders under it, `--max-depth=N` limits
+how deep that goes, and `-s` prints only the total.
 
-```bash
-migr backup /media/usb --critical
-```
+### Changing the scope
+
+`migr conf` opens `~/.config/migr/migr.conf` (under `$XDG_CONFIG_HOME` when
+that is set) in your `$EDITOR`. The file has include and exclude sections for
+`critical` and `comprehensive`. Paths are relative to your home unless
+absolute; `critical` includes also apply to `comprehensive`, and an exclusion
+wins over an include. `report` and `backup` read it every time; restore follows
+the scope recorded in the backup instead.
+
+## Backing up
+
+`backup` runs as root so it can read everything in your home and keep every
+owner and label. Under `sudo` it still backs up your home, not root's, and the
+backup belongs to you: you can look at it, preview a restore from it, and
+delete it without `sudo`.
 
 ```text
-Estimated backup size: 428.3K
-Destination free space: 15.2G
+$ sudo ./migr backup /mnt/usb
+Estimated backup size: 8.0M
+Destination free space: 4.0G
+
+Not included (add a path with `migr conf` to back it up):
+  Games                        2.9M
 
 This backup includes 1 item(s) that can carry secrets typed at a shell prompt (.bash_history). Make sure the destination is trustworthy before continuing. Continue? [Y/n]: y
-Backing up to: /media/usb/migr-eyildizemre.partial
+Backing up /home from a read-only snapshot.
+Backing up to: /mnt/usb/migr-eyildizemre.partial
 
-Main Directories
-
-Dotfiles
 
 Packages
-Saved 454 packages to packages.txt
+Saved 362 packages to packages.txt
 
 VS Code Extensions
   Note: no VS Code extension list was captured for this backup.
 
+Groups
+Saved 0 group memberships to groups.txt
+
+Flatpak Applications
+  Note: no system-wide Flatpak applications were found.
+
 Finalizing (syncing to disk)...
-  OK: Backup complete: 4 items copied
-Location: /media/usb/migr-eyildizemre
+Location: /mnt/usb/migr-eyildizemre
+  OK: Backup complete: 31 items copied
 ```
 
-## Commands
+**Before anything is written**, migr checks that the backup fits on the drive
+and that the drive is not inside what it backs up. Shell history files can hold
+passwords typed at a prompt, so it asks before taking them; `.ssh`, `.gnupg`,
+and network configuration hold secrets too, so keep the drive somewhere safe.
+
+**While you keep working.** A file written while it is read is read again; one
+still changing after three reads is kept as last read. Files removed before
+they were read, or created after their folder was scanned, are left out. The
+backup still completes, lists what changed, and exits with status 1. Desktop
+state that changes all the time, such as GNOME's file metadata, is only counted.
+On btrfs, Fedora's default, migr reads from a read-only snapshot instead, so
+nothing changes under it at all; the snapshot is removed when the backup ends.
+
+**Where it goes.** The backup is a folder named after you, `migr-<user>`. If
+that name already holds another installation's backup (another computer, or
+this one before a reinstall), the new one is named after the day,
+`migr-<user>-YYYY-MM-DD`, and the old one is left alone.
+
+**Interrupted and repeated backups.** While running, the backup is called
+`migr-<user>.partial`; run the same command again to continue it. Backing up
+again to the same place updates the backup in place: unchanged files are
+skipped, changed ones copied again, and files you deleted leave the backup.
+During an update it is called `migr-<user>.updating`, so an interrupted update
+is never mistaken for a finished backup.
+
+**Linux or non-Linux drives.** On a drive that can hold Linux metadata (ext4,
+btrfs, xfs) the backup is a plain copy of your files. On exFAT, FAT32, or NTFS,
+file names are encoded so the drive accepts them, and the true names, owners,
+permissions, times, and extended attributes are kept in a journal next to them.
+migr picks the form by testing the drive; there is no option.
+
+**Options.**
+- `--include-network-config` also backs up NetworkManager, netplan,
+  systemd-networkd, wpa_supplicant, and netctl configuration, and the system
+  crypto policy. These files can hold Wi-Fi passwords and VPN keys in plain
+  text.
+- `--include-self` puts a static migr binary in the backup, so the new system
+  can run migr before building it. Build it first with `make migr-static`,
+  which needs a static C library (`glibc-static` on Fedora). FAT and exFAT
+  drives may not let it run in place; copy it to your home first
+  (`cp migr ~/migr && chmod +x ~/migr`).
+- `--dry-run` shows what would be backed up and writes nothing.
+
+## Checking a backup
+
+Run `migr verify` before you wipe the old system. It reads every file in the
+backup and compares it with what was captured, without restoring anything:
+
+```text
+$ ./migr verify /mnt/usb/migr-eyildizemre
+Backup taken 2026-09-27 22:48
+Verifying 31 items (8.0M) in /mnt/usb/migr-eyildizemre
+  OK: Backup verified: all 31 items match what was captured
+```
+
+A file that went missing or changed is listed, and verify exits with status 1.
+It checks backups on exFAT, FAT32, and NTFS drives, which record what they
+captured; a backup on a Linux filesystem is a plain copy with no such record,
+and verify refuses it.
+
+If the journal of such a backup is damaged, for example by a failing drive,
+restore refuses it. `migr repair <SOURCE> <PATH>` then rebuilds it as a new
+backup under `PATH` without touching the original: damaged records are
+skipped, a folder whose own record was lost gets the settings of the folder
+above it, and everything that cannot be recovered is listed. The files are
+copied too, so `PATH` needs room for the whole backup, and it cannot be the
+folder holding the damaged one. Run `migr verify` on the copy before
+restoring from it.
+
+## Restoring
+
+Restore runs as root, like backup, and restores into your home, not root's.
+It is meant for a freshly installed system: it replaces files the new system
+already has at the same paths (a new install's default `.bashrc`, for example)
+with your backed-up ones; a symlink in the way is refused and named.
+
+Before writing anything, restore checks the whole backup and the destination,
+shows when the backup was taken and how much room it needs, and asks once.
+Then it restores your files, loads your GNOME settings, installs packages and
+Flatpak applications, adds you back to your groups, and writes the network
+configuration.
+
+```text
+$ sudo ./migr restore /mnt/usb/migr-eyildizemre
+Backup taken 2026-09-27 22:48
+Estimated restore size: 8.0M
+Destination free space: 90.2G
+...
+This restore includes 31 item(s) carrying security.* attributes (e.g. SELinux labels); if this destination or account cannot apply one, that item's other content and metadata will still be restored and only the attribute will be skipped. Continue? [y/N]: y
+
+Packages
+Installing packages (this may take a while)...
+...
+  362 installed, 0 skipped.
+
+Groups
+  The backup saved no group memberships.
+
+  OK: Restore complete: 31 items restored
+```
+
+**Open applications.** VS Code, the common browsers, and Flatpak applications
+rewrite their settings while they run or when they close, so their settings are
+restored last. If one is still open then, restore asks you to close it and
+press Enter, to skip its settings (run the same restore again later to put them
+back), or to restore them anyway.
+
+**GNOME settings** are loaded into the running session when you are logged in,
+so the session does not overwrite them.
+
+**From an exFAT, FAT32, or NTFS backup**, restore also leaves desktop state
+that services rewrite all the time alone where the new system has already
+written it, and restores it only where nothing is there yet. When your home
+path or folder names differ on the new system, it rewrites them in GTK
+bookmarks and the recent files list, and it keeps the new system's
+`~/.config/user-dirs.dirs`.
+
+**What's left for you.** Restore ends with what it could not do: packages the
+new system could not install, Flatpak applications it could not install, and
+groups it does not have, each with the command to run. The same list is saved
+next to the backup as `migr-<user>-todo.txt`, so nothing of migr is left in
+your new home.
+
+**Checking the result.** A restore from an exFAT, FAT32, or NTFS backup reads
+back every file it wrote. A file that does not read back as it was captured
+fails the restore (exit status 2); a file another program changed after restore
+wrote it is listed separately and gives exit status 1. `--no-verify` skips this
+read-back. `--dry-run` shows what would be restored and writes nothing.
+
+## What migr does not do
+
+- **System files.** Only your home is migrated, plus the network configuration
+  you opt into. Other files under `/etc`, system services, and other users'
+  homes are not.
+- **Package names across families.** A package named differently on the new
+  distribution is not translated; it is listed for you to install.
+- **Unknown distributions.** Outside the Debian, Fedora, and Arch families
+  (below), files are migrated but packages are not.
+- **Snap** applications and their data.
+- **Creating what is missing.** Groups the new system lacks are not created,
+  and Flatpak remotes are not added, since adding one needs its signing key.
+- **Custom locations.** `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, and
+  `XDG_STATE_HOME` set elsewhere than their defaults, and zsh's `ZDOTDIR`, are
+  not followed yet.
+- **Paths outside your home.** Listed explicitly, they can be backed up only
+  to a Linux filesystem, and restore does not put them back: it shows where
+  they came from and where the backup holds them.
+
+### Supported distributions
+
+| Family | Package manager | Examples |
+|---|---|---|
+| Debian | `apt` | Debian, Ubuntu, Mint, Pop!_OS, elementary, Zorin |
+| Fedora | `dnf` | Fedora, RHEL, CentOS, Nobara |
+| Arch | `pacman` | Arch, Manjaro, EndeavourOS, Garuda |
+
+Other derivatives are recognized through `ID_LIKE` in `/etc/os-release`.
+
+## Reference
+
+### Commands and options
 
 ```
 report [SCOPE]        Show backup analysis report (default when no command given)
-backup <PATH>         Create this user's backup under PATH, or update it in place
+backup <PATH>         Create a resumable backup container under PATH
 restore <SOURCE>      Restore files and packages from a backup at SOURCE
+verify <SOURCE>       Check a portable backup against its capture record
+repair <SOURCE> <PATH>
+                      Rebuild a damaged portable backup as a new copy under PATH
 conf                  Edit persistent critical/comprehensive selection rules
-help                  Show help
-```
+help                  Show this help
 
-`migr conf` opens the persistent scope configuration in the first nonempty
-`EDITOR` or `VISUAL` (falling back to `vi`). The file is
-`$XDG_CONFIG_HOME/migr/migr.conf` when `XDG_CONFIG_HOME` is an absolute path;
-otherwise it is `<resolved-home>/.config/migr/migr.conf`. Under `sudo`, migr
-retains the sudo-invoking user's HOME context instead of
-silently switching to `/root`. An absolute `XDG_CONFIG_HOME` is still honored
-only when it is present in the effective sudo environment. On first use, `conf`
-creates a commented empty template. Ordinary `report` and scoped `backup`
-commands never create the file: a missing or empty config simply keeps the
-built-in selection.
+--critical            Personal content plus persistent user state (default)
+--comprehensive       Everything --critical covers, plus Videos and Music
+<PATH...>             Paths listed after the destination are backed up
+                      exactly as given, with no assumptions
 
-The config has `critical` and `comprehensive` include/exclude sections. Critical
-includes also apply to comprehensive; excludes apply only to their own scope,
-and an exclusion wins over an include. Paths are relative to `$HOME` unless
-absolute. Scoped report, size estimation, preflight, capture, and resume all use
-the same compiled selection. Explicit-path backups ignore this config, and
-restore follows the selection recorded in the backup manifest rather than the
-target machine's current config.
-
-Applications that rewrite their own settings while running or when they close
-(VS Code, the common browsers, and every Flatpak application) are detected
-when a restore starts.
-Their settings are restored last, after everything else. If one is still open
-then, restore asks once: close it and press Enter, type `s` to leave its
-settings out (run the same restore again later to put them back), or `c` to
-restore them anyway. With nobody to answer, they are restored with a note.
-
-Frequently rewritten desktop state (such as GNOME's file metadata) is restored
-only where nothing is there yet: a file a running service has already written
-on the new system is left as it is, and the summary counts it.
-
-Restore ends with what is left for you to do by hand: packages the new
-system could not install, Flatpak applications it could not install, and
-groups it does not have, each with the command to run. The same list is kept
-next to the backup as `<backup>-todo.txt` (for `migr-eyildizemre/`,
-`migr-eyildizemre-todo.txt` in the folder holding it), so the new system holds only
-what was restored.
-
-Restore is intended to run soon after a fresh distribution install. If the
-target has since accumulated its own files at the same paths, the result may
-be unexpected: a pre-existing destination symlink is refused cleanly and
-names the offending path, while a pre-existing regular file is replaced by
-the backup's version without a second prompt.
-
-Portable restore verifies its applied content before reporting success. For
-regular files it computes an FNV-1a checksum over the exact bytes written during replay,
-then reads the destination back through no-follow, fd-relative traversal and
-requires the digest to match. This includes files whose stored HOME URI is
-rewritten for the new account. Portable backup also records, for every regular
-file, a digest of the bytes it captured; replay compares the bytes it reads from
-the backup against it, so a backup file damaged after capture is reported as such
-instead of being restored and "verified" as correct. The same check runs on its
-own with `migr verify <SOURCE>`, without restoring anything: it confirms that
-every item the journal records is present in the backup and that every file still
-has its captured size and content, and lists the ones that do not. Run it before
-wiping the source machine. Native backups record no content digests, so verify
-refuses them. Symlink target bytes are compared directly; their
-recorded timestamps are reapplied afterward because reading the target can advance
-the symlink's atime. Hardlink aliases are checked against their representative by filesystem inode
-identity without re-reading the same content through every alias. A read,
-path-identity, or hardlink-identity mismatch, or content that differs while the
-file is still the one restore wrote (its inode, size, and modification time
-unchanged), is a failure: the restore ends with errors, though package and
-network restoration still run. A file that another program rewrote, replaced,
-or removed after restore is listed separately as changed afterwards, is not a
-failure, and makes the restore exit 1 instead of 0; a failure exits 2. `--no-verify` skips only
-this post-copy read-back pass; portable restore preflight remains mandatory,
-and dry runs perform no post-copy verification because they write no files.
-
-If a portable backup's journal is damaged, for example by a failing drive,
-restore refuses it. `migr repair <SOURCE> <PATH>` rebuilds it as a new backup
-under `PATH` without writing to the original: the journal is replayed record by
-record, a damaged region is skipped up to the next intact record, a directory
-whose own record was lost is re-created with the metadata of the directory above
-it, and every item that cannot be recovered is listed. The payload is then copied
-next to the rebuilt journal, so `PATH` needs room for the whole backup. `PATH`
-cannot be the folder holding the damaged backup, where the next backup would
-find two backups of the same install. Check the copy with `migr verify` before
-restoring from it.
-
-## Options
-
-```
 -n, --dry-run         Preview actions without making changes
 -v, --verbose         Verbose output
 -h, --help            Show this help
 -s, --summary         Print only the selected report scope total
-    --max-depth=<N>
-                      Report directory breakdown depth (implies --verbose)
+    --max-depth=<N>   Report directory breakdown depth (implies --verbose)
     --include-self    Include a validated static migr binary in the backup
                       (requires building migr-static)
     --include-network-config
@@ -246,35 +344,7 @@ restoring from it.
     --no-verify       Skip post-copy content verification (restore only)
 ```
 
-Status colors are automatic: they are used when stdout is a real terminal and
-suppressed when output is piped, redirected, or captured. Errors are bold red,
-warnings are bold yellow, and successful `Backup complete`/`Restore complete`
-messages are bold green. `Dry run complete` remains uncolored because it reports
-a preview rather than a completed operation.
-
-Scope (`backup`/`report`, mutually exclusive):
-
-```
---critical            Use personal content plus persistent user state (backup default)
---comprehensive       Use everything --critical covers, plus Videos and Music
-```
-
-Backup-only explicit paths:
-
-```
-<PATH...>             Paths listed after the destination are backed up exactly as
-                      given, with no assumptions
-```
-
-```bash
-sudo ./migr backup /mnt/drive
-sudo ./migr backup /mnt/drive --comprehensive
-sudo ./migr backup /mnt/drive ~/Documents ~/Projects
-sudo ./migr backup /mnt/drive --include-self
-sudo ./migr backup /mnt/drive --include-network-config
-```
-
-## Exit Status
+### Exit status
 
 As with GNU tar:
 
@@ -284,347 +354,59 @@ As with GNU tar:
 | 1 | Completed, but something changed or differs, and the run lists it: files that changed while a backup read them, restored items another program changed afterwards, or items `verify` found different from their capture. |
 | 2 | Failed or refused, including a wrong command line. |
 
-## Logs
+### Logs
 
 A backup or restore that ends with status 1 or 2 keeps a log of the run:
 everything it printed, without colors, plus the full lists the terminal only
-shows examples of (files that changed while read, restored files left as a
-running service wrote them, and the like). The last line of the run names it.
+shows examples of. The last line of the run names it.
 
 - **Backup:** inside the backup, `logs/backup-YYYY-MM-DD-HHMMSS.log`, so it
   travels with the backup when the old system is reinstalled.
 - **Restore:** `~/.local/state/migr/restore-YYYY-MM-DD-HHMMSS.log` on the new
   system.
 
-A run that ends with status 0 keeps no log, and removes the folders it made
-for one, so a clean backup and restore leave nothing of migr on the new
-system. The newest 10 logs in each place are kept. Reports, dry runs, and
-`verify` keep none: they change nothing and print everything they know.
+A run that ends with status 0 keeps no log. The newest 10 logs in each place
+are kept. Reports, dry runs, and `verify` keep none.
 
-## Key Features
-
-- **Smart Resume:** Interrupted backups resume automatically — files already cloned (matching size and timestamp) are skipped.
-- **Localization:** Directory names are resolved via `xdg-user-dirs` — if your Documents folder is `Belgeler`, migr finds and backs it up correctly without any configuration.
-
-## What Gets Backed Up
-
-**`--critical` (default):** Documents, Downloads, Pictures, Desktop, persistent user config/state under `~/.config`, `~/.local/share`, `~/.local/state`, user-local executables under `~/.local/bin`, Flatpak applications' settings and data under `~/.var/app` (without each application's `cache/`), VS Code and VSCodium extensions under `~/.vscode` and `~/.vscode-oss`, and common shell/terminal dotfiles.
-
-**`--comprehensive`:** Everything `--critical` covers, plus Videos and Music.
-
-**Explicit paths:** Exactly what you specify — no assumptions made.
-
-The critical and comprehensive sets can be extended or pruned with `migr conf`.
-Configured exclusions prune whole subtrees from report, estimation, preflight,
-and capture; configured includes retain their restore mapping when they overlap
-localized XDG directories. Dry-run shows the active selection policy before any
-backup is created.
-
-The built-in persistent roots currently use the conventional HOME-relative XDG
-locations above; custom `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, and
-`XDG_STATE_HOME` locations are not resolved yet. zsh startup files are likewise
-read from HOME and do not follow `ZDOTDIR` yet.
-
-**Dotfiles (all scopes except explicit paths):** .ssh, .gnupg, .gitconfig, .bashrc, .bash_history, .bash_profile, .bash_login, .bash_logout, .bash_aliases, .profile, .zshenv, .zsh_history, .zprofile, .zshrc, .zlogin, .zlogout, .inputrc, .tmux.conf, .screenrc
-
-Scoped backups ask before capturing `.bash_history` or `.zsh_history`, because
-those plaintext logs can contain secrets typed at a shell prompt. The prompt
-defaults to yes for an interactive Enter, but unavailable input (EOF) always
-declines; dry-run reports the history files without prompting. Explicit-path
-backups remain literal requests and do not add this consent gate.
-
-**Browser Profiles (all scopes except explicit paths):** Firefox is retained as a separate browser-profile root; Chromium-family profiles under `~/.config` are covered by the persistent config root.
-
-**Packages (all scopes except explicit paths):** The list of packages you explicitly installed — not the thousands of dependencies pulled in alongside them — saved as packages.txt and reinstalled on restore. Anything the new distribution cannot resolve is listed at the end of the restore, never silently dropped.
-
-**Flatpak applications (all scopes except explicit paths):** The applications in the system-wide Flatpak installation, saved with their remotes as `flatpak-apps.txt` and installed on restore after packages. Applications whose remote (such as `flathub`) the new system does not have are listed with the command to run once it is added. A user installation under `~/.local/share/flatpak` comes back with your files.
-
-**Group memberships (all scopes except explicit paths):** The groups you were added to, such as `libvirt`, `docker`, or `dialout`, saved by name as `groups.txt`. Restore adds you back to each of them the new system has, after installing packages, since packages create groups; it takes effect at your next login. Groups the new system does not have are listed, not created.
-
-**VS Code extensions (all scopes except explicit paths):** Installed extensions come back with `~/.vscode`, installed and with their state. When `code` is available and lists extensions, migr also saves `code --list-extensions --show-versions` to `vs-code-extensions.txt`. Some extensions carry native code for one CPU architecture; on a machine with another one, pass each saved line to `code --install-extension` instead. Restore does not install from this file.
-
-## Backup Containers
-
-A successful live backup is published under the name of the user it belongs
-to:
+## Backup format
 
 ```
 migr-<user>/
+├── manifest.txt           # what was backed up, from where, and how
+├── sidecar.migr           # journal of names and metadata (exFAT, FAT32, NTFS only)
+├── packages.txt           # packages you installed
+├── groups.txt             # your group memberships
+├── flatpak-apps.txt       # system-wide Flatpak applications and their remotes
+├── vs-code-extensions.txt # `code --list-extensions`, when VS Code is installed
+├── network/               # with --include-network-config
+├── migr                   # with --include-self
+├── logs/                  # logs of backups that ended with status 1 or 2
+└── data/                  # your files
 ```
 
-When that name already holds another install's backup (another computer, or
-the system before a reinstall), the new one is named after the day it was first
-taken, `migr-<user>-YYYY-MM-DD`, then `-2`, `-3` the same day; the existing one
-is never touched. Which backup is whose is decided by the machine and user
-recorded in its manifest, not by its name. Characters in the user name that
-some filesystems reject become `_`.
+`data/` holds one folder per backed-up item, such as `XDG_DOCUMENTS_DIR` or
+`BUILTIN_DOT_SSH`, and `manifest.txt` records where each came from. On a Linux
+filesystem each is a plain copy with its owners, permissions, times, extended
+attributes, and hardlinks, which you can copy back without migr (`cp -a`). On
+exFAT, FAT32, or NTFS, names are percent-encoded where the drive would reject
+them and the files carry no Linux metadata; `sidecar.migr` holds the true names
+and metadata, so restore such a backup with migr. The list files are plain
+text, one entry per line.
 
-While the backup is running, migr writes to the same name with a `.partial` suffix.
-A failed or interrupted backup is never published as complete; a later invocation of
-the same job can resume a matching usable partial. Restore refuses `.partial`
-containers.
-
-Backing up again to the same PATH updates this install's backup in place
-instead of creating another one. It is renamed to `migr-<user>.updating` while
-the update runs, so an interrupted update is never taken for a complete backup,
-and the next backup finishes it; one that stops before changing anything gets
-its name back. Unchanged files are skipped, changed ones are copied again, and
-files that were removed, or are no longer selected, leave the backup. When the
-selection itself changed (a `migr conf` edit, another scope), roots that are no
-longer selected are removed with their records. `verify` and `restore` show
-when the backup was last taken. With explicit paths, root names follow the
-sorted order of the paths, so adding a path may copy the others again.
-
-Before publishing a container under its final name, migr flushes the destination
-filesystem and then flushes the destination directory after the atomic rename.
-Therefore a container that appears under its final name — and the accompanying
-`Backup complete` message — has passed the durable-finalization boundary. An
-interrupted backup before that point remains a `.partial` that can be resumed.
-
-The container root holds migr-owned control files and optional bundled content.
-The selected payload roots live below `data/`:
-
-```
-migr-<user>/
-├── manifest.txt
-├── packages.txt        # present when this scope exports a package list
-├── groups.txt          # present when this scope exports group memberships
-├── flatpak-apps.txt    # present when system-wide Flatpak applications exist
-├── vs-code-extensions.txt # present when code lists installed extensions
-├── migr                # present with --include-self
-├── network/            # with --include-network-config when a backend is found
-├── logs/               # logs of backup runs that ended with status 1 or 2
-└── data/
-    └── <logical roots>
-```
-
-`manifest.txt` records the version, representation, scope, root table, and stable source
-identity when one is available. Backups with filtered or delegated selections use
-manifest VERSION=2 to persist the source-home address and active exclusions, so
-restore can reconstruct the same ownership and destination map without reading
-the current `migr.conf`. Unfiltered source-disjoint backups remain VERSION=1 for
-compatibility. With `--include-self`, the manifest also records the bundled
-binary's architecture, for example `ARCH=x86_64`. With `--include-network-config`, it
-records `NETWORK_CONFIG=1` when at least one supported backend was found, even if
-its directory was empty. Older unversioned and manifest-less backups remain readable
-through an isolated legacy restore path.
-
-`--include-self` copies the validated `migr-static` binary into the container root as
-`migr`, so the backup carries a standalone migr executable with it. Native Linux
-filesystems preserve its executable bit. FAT32 and exFAT derive Unix permission
-bits from mount options; NTFS behaviour depends on the driver and mount options.
-The copy may or may not be runnable in place, and on mounts with fixed permission
-bits, `chmod +x` can report success without making it executable. If the copy will
-not run from the drive, enter the backup directory on the target system and copy
-it to a filesystem that supports Unix permissions and permits execution first:
-`cp migr ~/migr && chmod +x ~/migr`. The recorded `ARCH` value lets you check that
-the bundled binary matches the target machine's architecture.
-
-`--include-network-config` independently captures NetworkManager, netplan,
-systemd-networkd, wpa_supplicant, and netctl into backend directories under `network/`.
-Absent backends are silently skipped; an unreadable backend fails the backup.
-If none are found, backup succeeds with a note.
-NetworkManager, netplan, wpa_supplicant, and netctl files can expose WiFi passwords
-or PSKs in plain text. Networkd delegates WiFi authentication to other tools, but
-its files can contain other secrets, such as WireGuard private keys.
-Restore reloads NetworkManager profiles automatically with `nmcli connection reload`
-(best-effort; it only re-reads profiles). The other four backends are written but
-never auto-applied: applying them can interrupt connectivity, including an SSH
-session running restore. The output gives the manual command to use when ready;
-interface or profile placeholders must be replaced for the target system.
-The system crypto policy (`/etc/crypto-policies/config`, where present) is recorded
-as `network/crypto-policy`, since some saved connections, such as 802.1X networks
-that still need TLS 1.0, authenticate only under a relaxed policy. When the target
-uses a different policy, restore prints the `update-crypto-policies` command but
-never changes the policy itself.
-
-Explicit paths keep accepting valid sources both inside and outside `$HOME`. A root
-proven to be inside the source home is restored automatically to the same relative
-location below the target home. An external root is still captured on a native
-destination, under `data/EXPLICIT_n`, but restore only reports its recorded source and
-backup location; it does not guess where to write it.
-
-The backup destination must resolve outside every selected root, including through
-symlinks. Otherwise migr refuses the entire invocation before creating anything, so a
-backup can never recurse into and consume its own output.
-
-Before reserving a container, backup estimates the selected source roots and
-compares that total with the destination's user-available free space. The same
-preflight runs for live and --dry-run invocations and for critical,
-comprehensive, and explicit-path backups. When the estimate fits, the two
-preflight lines are printed before the normal backup output:
-
-    Estimated backup size: 4.2G
-    Destination free space: 3.8G
-
-If the estimate is larger than the available space, the backup is refused
-before a container is created:
-
-    Estimated backup size: 4.2G
-    Destination free space: 3.8G
-    Error: not enough free space at /mnt/backup (need 0.4G more)
-
-Regular-file contributions use the destination filesystem's allocation unit,
-and hardlinked content is counted once across the selected roots. The
-comparison is still an exact estimate, not a promised reservation: filesystem
-metadata, sparse-file allocation, xattr overhead, and representation details
-can make actual consumption differ. If a source root cannot be measured for a
-reason other than disappearing during planning, migr warns and skips this
-advisory check rather than refusing a backup on an incomplete estimate.
-
-During a live backup, an interactive terminal also receives a single
-overwriting progress line while regular-file bytes are copied:
-
-    Progress: 13.4M/33.6M copied, 22.7G free, elapsed 00:12, speed 1.1M/s, current: /home/eyildizemre/Documents/video.mp4
-
-The line is sampled during large-file copies, identifies the file being copied,
-shows elapsed time and current speed, and re-reads the destination's available
-space. Progress is installed only when stdout is an interactive terminal, so
-piped, redirected, and scripted backups keep the normal output unchanged. It
-does not display an ETA.
-
-Live backups also periodically flush the destination filesystem during the
-copy. This smooths writeback and reduces, without eliminating, the amount of
-in-flight data exposed to a mid-copy interruption; the final flushes above
-still define the durable completion boundary.
-
-Before a live backup creates a container, migr probes the destination filesystem.
-A destination that cannot faithfully hold the required Linux semantics uses a portable
-sidecar representation (a state log preserving the true metadata alongside a plain,
-percent-encoded payload) instead of being refused. External explicit roots remain
-ineligible for portable capture: they have no faithful restore-address policy (see below).
-
-## Core Metadata Fidelity
-
-On a native destination — ext4, btrfs, or any other filesystem that can hold full
-Linux semantics — a migr backup is nothing more than a plain, browsable copy of the
-source tree: no encoding, no sidecar file, and no migr-specific format of any kind.
-The backup can be fully recovered with `cp -a` on any Linux system, with or without
-migr itself (see [docs/DECISIONS.md](docs/DECISIONS.md) D8).
-
-Native backup and restore preserve the exact numeric ownership (uid/gid), permission
-mode, and atime/mtime timestamps for regular files, directories, FIFOs, and symlinks.
-Ownership is recorded truthfully and applied best-effort: a non-root user who cannot
-`chown` sees a warning per entry, never a silent normalization, and any metadata
-read-back mismatch after a reported success aborts the operation (a filesystem that
-lies is refused). Restored directories and symlinks receive the exact saved atime;
-the source symlink's own atime cannot be preserved across restore because Linux
-`readlinkat()` perturbs it with no suppression flag — a documented kernel limitation,
-not a silent degradation.
-
-Destinations that cannot faithfully hold these semantics are detected by an
-on-disk capability probe before anything is written: a filesystem that loses
-metadata (for example exFAT/NTFS/FAT32) is refused for capture, not silently
-degraded. Portable capture to such filesystems, with a sidecar state log
-preserving the true metadata, is dispatched automatically based on the same
-capability probe — no flag, no override (see
-[docs/DECISIONS.md](docs/DECISIONS.md) D14, D24).
-
-Portable capture and replay also handle symlinks: the payload contains an empty
-regular placeholder while the sidecar
-record carries the target and core metadata, so the target is never written into
-the payload. Symlink xattrs are collected and replayed through the no-follow
-`l*` family, with exact-set reconciliation and the same fail-closed rules as
-other object kinds.
-
-Portable payload names are percent-encoded on disk while the sidecar preserves
-the true logical name; restore always creates that logical name, never a decoded
-or re-derived substitute. On a case-insensitive destination, sibling collisions
-are resolved deterministically with a `%7EN` suffix on the payload name; only
-unresolvable cases such as `NAME_MAX`/`PATH_MAX` overflow or a root-payload
-namespace collision refuse the entire invocation before anything is written.
-
-Hardlinked files keep their shared identity across both representations.
-Native capture links a later occurrence of an already-seen file to its first
-copy instead of duplicating its bytes; an adopted native resume seeds that
-representative from the existing payload before walking, so traversal order
-cannot flip the group. Native restore does not read the sidecar: it tracks
-source inode identity, seeds existing representatives before every native
-apply walk, and recreates later members with real links, while applying
-metadata and xattrs only to the representative. This keeps a hardlink group
-stable when restore is resumed in a new process.
-Portable capture records the first-seen file as
-regular and every later occurrence as a hardlink record referencing it,
-including across different backup roots; restore replays the group with
-`link()`, and because the link shares the representative's inode, its
-extended attributes arrive automatically without a second write.
-
-Native backups also reconcile themselves on resume: after every root
-captures cleanly, migr scans the destination tree directly and removes any
-file or subtree whose source counterpart is gone, so a file deleted from
-source cannot survive a resumed backup. Deletion only ever runs after a
-completely clean capture -- an interrupted or partially failed run leaves
-the destination untouched -- and an interruption during the removal itself
-is safely picked up and finished on the next resume, with no separate
-recovery step. Unlike the sidecar-based paths above, this is native
-production-path work today: it runs on every real backup, not only through
-a test-only entry point.
-
-## Report
-
-Running `migr` or `migr report` reports the critical backup scope. Every report
-uses the same live root plan as backup; `--critical` selects the default explicitly,
-and `--comprehensive` selects the wider scope. Sections show only roots included
-in that scope, including Desktop, persistent config/state, browser data, and
-shell/terminal configuration in critical backups.
-Totals measure logical source sizes, not destination allocation or container
-metadata overhead. With `-s`/`--summary`, only the selected scope's total is printed
-on one line for scripting.
-
-With `-v`/`--verbose`, each item includes its full source path and directories
-below it are listed with their own recursive totals. Bare `-v` lists one level
-below each root. `--max-depth=N` limits the listed directory levels while still
-measuring every listed directory recursively. `--max-depth` implies `--verbose`,
-and `--max-depth=0` keeps only the root item. Summary mode always suppresses
-the breakdown.
+## Development
 
 ```bash
-./migr report --critical
-./migr report --comprehensive
-./migr report --critical --summary
-./migr report --critical --max-depth=2
+make test             # the test suite
+sudo make test        # also runs the phases that need root
+make check-strict     # gcc and clang with -Wpedantic -Werror
+make check-sanitize   # AddressSanitizer and UndefinedBehaviorSanitizer
 ```
 
-A depth-limited report keeps the root's full total while adding directory
-subtotals:
+`git config core.hooksPath hooks` enables a pre-commit hook that builds and
+runs the tests when C, shell, or Makefile changes are staged.
 
-```text
-  Documents                            384B  (/home/eyildizemre/Documents)
-    Projects                            324B  (/home/eyildizemre/Documents/Projects)
-```
-
-## Under the Hood
-
-This tool was fully refactored to eliminate all shell-based execution. It no longer calls `system()` or `popen()` anywhere in the codebase — functions that silently pass strings to `/bin/sh` and are a well-known vector for shell injection vulnerabilities.
-
-In their place, a custom pure C POSIX engine handles all I/O and process execution:
-
-- **`backup_capture_at()` / `restore_native_at()`** — separate backup and restore walkers. Backup reads a pathname-based source into a directory-fd-anchored payload destination; restore anchors both payload and destination traversal to directory file descriptors. Both preserve permissions and timestamps, reproduce symlinks and FIFOs, and skip sockets and device nodes with a warning. Replaces `cp -r`.
-- **`get_dir_size()`** — recursive directory size calculation via `lstat` and `dirent`. Replaces `du`.
-- **`run_command()`** — shell-free subprocess execution via `fork`/`execvp`/`waitpid`. Replaces `system()`.
-- **`run_command_capture()`** — same as above, with stdout captured into a buffer via an anonymous `pipe`. Replaces `popen()`.
-
-Package listing and restoration commands (`apt-mark`, `dnf`, `pacman`, `apt-get`) are launched directly as process arguments — no shell is ever spawned. Size reporting uses native `off_t` arithmetic throughout for correct behaviour on both 32-bit (LFS) and 64-bit architectures.
-
-## Design Decisions
-
-Why things are the way they are — including what was rejected, and why — is
+Why things are the way they are, including what was rejected and why, is
 recorded in [docs/DECISIONS.md](docs/DECISIONS.md).
-
-## Planned
-
-- [x] Dry-run mode
-- [x] Pure C refactor
-- [x] Comprehensive vs. critical-only backup modes
-- [x] Localization (xdg-user-dirs support)
-- [x] Cross-locale restore mapping (manifest system)
-- [x] Resumable versioned backup containers
-- [x] Backups to filesystems that cannot hold Linux metadata (exFAT/NTFS/FAT32)
-- [x] VS Code extensions backed up with their files
-- [x] Logging
-- [x] Network configuration backup
-- [x] Self-contained backup (`--include-self` static binary)
-- [ ] Provide pre-built .deb, .rpm, and AUR packages
 
 ## License
 
