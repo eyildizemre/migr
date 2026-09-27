@@ -3765,6 +3765,49 @@ static void test_backup_updates_in_place(int portable)
     remove_tree(target);
 }
 
+// Updating a finished portable backup trusts that its payload matched its
+// journal and skips the item-by-item payload walk (D72), so what the walk
+// would have caught must still be covered: an item whose payload is gone is
+// copied again, and a stray file does not stop the update.
+static void test_update_repairs_payload_without_walking_it(void)
+{
+    printf(BLUE "::" NC " production: a portable update recopies a missing payload file\n");
+
+    char home[PATH_MAX], target[PATH_MAX], dir[PATH_MAX], file[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_home");
+    setenv("HOME", home, 1);
+    join_path(dir, sizeof(dir), home, "notes");
+    mkdir_p(dir);
+    join_path(file, sizeof(file), dir, "file.txt");
+    write_file(file, "payload");
+    fresh_mkdtemp(target, sizeof(target), "plan_target");
+    char *paths[] = { dir, NULL };
+    char output[8192];
+    dry_run = 0;
+    backup_test_force_portable_representation(1);
+
+    int first_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                        output, sizeof(output));
+    char container[PATH_MAX], payload[PATH_MAX], stray[PATH_MAX];
+    int found = find_container_dir(target, container, sizeof(container));
+    join_path(payload, sizeof(payload), container, "data/EXPLICIT_0/file.txt");
+    join_path(stray, sizeof(stray), container, "data/EXPLICIT_0/stray.txt");
+    check(first_rc == 0 && found && unlink(payload) == 0,
+          "fixture: remove an item's payload from a finished backup");
+    write_file(stray, "not in the journal");
+
+    int second_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                         output, sizeof(output));
+    backup_test_force_portable_representation(0);
+    check(second_rc == 0 && file_text_is(payload, "payload") &&
+              journal_root_entries(container, "EXPLICIT_0") == 2,
+          "the update copies the missing item again, and a stray file does "
+          "not stop it");
+
+    remove_tree(home);
+    remove_tree(target);
+}
+
 static void grow_source_before_inventory(const char *source_path,
                                          void *context)
 {
@@ -4140,6 +4183,7 @@ int main(void)
     test_backup_updates_in_place(1);
     test_backup_leaves_another_install_alone();
     test_failed_update_keeps_the_finished_backup();
+    test_update_repairs_payload_without_walking_it();
     test_dangling_builtin_dotfile_is_captured_not_silently_dropped();
     test_shell_history_consent_gate();
     test_unusable_target_does_not_leak_the_plan();

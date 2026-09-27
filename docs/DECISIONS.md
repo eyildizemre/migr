@@ -4694,6 +4694,17 @@ PATH instead of creating another one.
   and rename, and records `UPDATED=<seconds>` for when the run started; verify
   and restore print it.
 
+- **Speed:** When the adopted backup was finished, its payload matched its
+  journal, and capture checks the payload of every item it keeps
+  (`existing_payload_matches()`) or copies it again. The final payload
+  inventory then checks each root only at its top
+  (`PortableCaptureRequest.payload_matches_journal`); the item-by-item walk,
+  which finds payload nodes the journal does not know, still runs for a
+  fresh capture and for a resumed interrupted run. For 187,000 files on a
+  vfat loop, an unchanged update took 9.0 s with the walk and 3.9 s without,
+  10 changed files 3.8 s, against 23 to 31 s for a fresh backup; on ext4
+  (native) an update took 2.4 s against 10 to 13 s.
+
 **Why:** Each run used to create a new timestamped backup, so keeping a
 backup current cost a full copy and left old ones to delete by hand. Most of
 the mechanism (resume, reconcile, the journal) already existed.

@@ -3416,6 +3416,7 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
         else
         {
             size_t live_count = 0;
+            portable_request.payload_matches_journal = container.from_finished;
             int capture_result = adopted
                 ? portable_capture_resume_prepared_at(
                       container_fd, &portable_request, &prepared, &live_count,

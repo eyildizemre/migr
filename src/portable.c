@@ -4438,6 +4438,7 @@ int portable_capture_resume_prepared_at(
         context_ready = 1;
         context.progress_report = progress_report;
         context.resume_mode = 1;
+        context.payload_matches_journal = request->payload_matches_journal;
         context.collision_plan = &prepared->report.collision_plan;
         context.current_source = &prepared->report.current_source;
         if (portable_capture_owners_reload(&context) != 0 ||

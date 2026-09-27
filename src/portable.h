@@ -91,6 +91,11 @@ typedef struct {
     const struct SelectionPlan *selection_plan; /* Borrowed, optional. */
     int nsec_exact;
     int case_sensitive;
+    /* The container's payload and journal matched when this run took it
+     * over: a finished backup being updated (docs/DECISIONS.md D72). A
+     * resume then checks each root's payload only at its top, not item by
+     * item, after capture. */
+    int payload_matches_journal;
 } PortableCaptureRequest;
 
 /* Binds a compiled D34 selection to an existing request. The caller owns roots
@@ -221,6 +226,7 @@ typedef struct PortableCaptureContext {
     int nsec_exact;
     int case_sensitive;
     int resume_mode;
+    int payload_matches_journal; /* See PortableCaptureRequest. */
     const PortableCollisionPlan *collision_plan;
     const PortableCurrentSourceSet *current_source;
     void *visited;

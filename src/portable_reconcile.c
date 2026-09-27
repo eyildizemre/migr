@@ -1121,11 +1121,16 @@ static int reconcile_inventory(PortableCaptureContext *context,
         goto close_fail;
     }
 
+    // The item-by-item pass finds payload nodes the journal does not know.
+    // A finished backup had none, and capture itself checked or rewrote the
+    // payload of every item it kept (D72), so an update skips it.
+    int deep = !context->payload_matches_journal;
     int result = -1;
     if (active == 1) {
         if (root_owner->state != PORTABLE_OWNER_LIVE ||
-            inventory_scan_live_node(&inventory, root_owner, root_parent,
-                                     root_leaf, &root_stat) != 0)
+            (deep && inventory_scan_live_node(&inventory, root_owner,
+                                              root_parent, root_leaf,
+                                              &root_stat) != 0))
             goto close_fail;
         result = 0;
     } else if (deleted == 1 && root_tombstone->state == PORTABLE_OWNER_TOMBSTONE) {
@@ -1143,7 +1148,7 @@ static int reconcile_inventory(PortableCaptureContext *context,
         goto fail;
     root_parent = -1;
     if (result != 0 || portable_capture_owners_reload(context) != 0 ||
-        inventory_all_live_seen(context, root, &inventory.seen) != 0)
+        (deep && inventory_all_live_seen(context, root, &inventory.seen) != 0))
         goto fail;
     visited_dispose(&inventory.seen);
     return 0;
