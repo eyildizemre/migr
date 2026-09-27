@@ -648,18 +648,113 @@ static int restore_session_uid(uid_t *uid)
     return 0;
 }
 
+// What a restore leaves for the user to do by hand: written by the steps
+// that re-create system state, shown at the very end of the run, and kept
+// next to the backup.
+typedef struct {
+    char *text;
+    size_t size;
+    FILE *stream;
+    int written; /* The steps ran, so the list next to the backup is due. */
+} RestoreTodo;
+
 // Re-creates the system state the backup lists, after its files: packages
 // first, since they bring Flatpak and groups along.
-static void restore_system_lists(int source_root_fd, const char *home,
+static void restore_system_lists(int source_root_fd, RestoreTodo *todo,
                                  int *had_error)
 {
-    restore_packages(source_root_fd, home, had_error);
-    restore_flatpak_apps(source_root_fd, had_error);
+    todo->stream = open_memstream(&todo->text, &todo->size);
+    if (todo->stream == NULL)
+    {
+        print_error("Error: Could not collect what is left to do by hand\n");
+        *had_error = 1;
+        return;
+    }
+    todo->written = !dry_run;
+    restore_packages(source_root_fd, todo->stream, had_error);
+    restore_flatpak_apps(source_root_fd, todo->stream, had_error);
     uid_t uid;
     char user[ACCOUNT_NAME_MAX];
     int resolved = restore_session_uid(&uid) == 0 &&
                    local_account_name(uid, user) == 0;
-    restore_groups(source_root_fd, resolved ? user : NULL, had_error);
+    restore_groups(source_root_fd, resolved ? user : NULL, todo->stream,
+                   had_error);
+}
+
+// Replaces <backup>-todo.txt next to the backup with text, or removes it
+// when text is empty; the drive is what the user carries, and the backup
+// itself stays unchanged. Returns 0, or -1 with errno.
+static int restore_todo_write(const char *source, const char *text,
+                              char path[PATH_MAX])
+{
+    char backup[PATH_MAX];
+    if (realpath(source, backup) == NULL)
+        return -1;
+    char *slash = strrchr(backup, '/');
+    if (slash == NULL || slash[1] == '\0' ||
+        snprintf(path, PATH_MAX, "%s-todo.txt", backup) >= PATH_MAX)
+    {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    if (unlink(path) != 0 && errno != ENOENT)
+        return -1;
+    if (text[0] == '\0')
+        return 0;
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                  0644);
+    if (fd < 0)
+        return -1;
+    uid_t uid;
+    gid_t gid;
+    char home[PATH_MAX];
+    if (geteuid() == 0 && getenv("SUDO_UID") != NULL &&
+        resolve_sudo_identity(&uid, &gid, home) == 0)
+        (void)fchown(fd, uid, gid);
+    FILE *out = fdopen(fd, "w");
+    if (out == NULL)
+    {
+        int saved = errno;
+        close(fd);
+        errno = saved;
+        return -1;
+    }
+    int failed = fputs("What's left for you\n", out) < 0 ||
+                 fputs(text, out) < 0;
+    int saved = errno;
+    if (fclose(out) != 0 && !failed)
+    {
+        failed = 1;
+        saved = errno;
+    }
+    errno = saved;
+    return failed ? -1 : 0;
+}
+
+// Ends the run with what is left to do by hand and keeps it next to the
+// backup.
+static void restore_todo_finish(RestoreTodo *todo, const char *source)
+{
+    if (todo->stream == NULL)
+        return;
+    if (fclose(todo->stream) != 0 || todo->text == NULL)
+    {
+        free(todo->text);
+        return;
+    }
+    if (todo->written)
+    {
+        if (todo->text[0] != '\0')
+            printf("\nWhat's left for you\n%s", todo->text);
+        char path[PATH_MAX] = "";
+        if (restore_todo_write(source, todo->text, path) != 0)
+            print_warning("Warning: could not keep this list next to the "
+                          "backup%s%s: %s\n", path[0] != '\0' ? " in " : "",
+                          path, strerror(errno));
+        else if (todo->text[0] != '\0')
+            printf("This list is also in %s\n", path);
+    }
+    free(todo->text);
 }
 
 #ifdef RESTORE_TEST_HOOKS
@@ -3311,6 +3406,7 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         }
 
         int dconf_database_fd = -1;
+        RestoreTodo todo = {0};
         RestoreDeferral deferral = {0};
         restore_defer_running_writers(&deferral);
         PortableRestoreRequest request = {
@@ -3373,7 +3469,7 @@ int restore_with_options(const char *source, const RestoreOptions *options)
             // Every entry was applied, so the dependent steps still run even
             // when verification found differences; those are reported below.
             restore_dconf_settings(dconf_database_fd, &had_portable_error);
-            restore_system_lists(source_root_fd, home, &had_portable_error);
+            restore_system_lists(source_root_fd, &todo, &had_portable_error);
             if (m.has_network_config)
                 restore_network_config(source_root_fd, &had_portable_error);
         }
@@ -3475,6 +3571,7 @@ int restore_with_options(const char *source, const RestoreOptions *options)
             printf("Skipped %zu security.* attribute(s) that the destination "
                    "could not apply.\n",
                    report.skipped_security_xattr_count);
+        restore_todo_finish(&todo, source);
         free_xdg_dirs(xdg_dirs);
         manifest_free(&m);
         close(home_fd);
@@ -3535,6 +3632,7 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         .progress = &progress_phase
     };
     NativeDeferral deferral = { .settings = &open_settings };
+    RestoreTodo todo = {0};
     int left_out_deferred = 0;
     int result = MIGR_EXIT_FAILURE;
 
@@ -3695,7 +3793,7 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         if (dconf_database_fd >= 0)
             close(dconf_database_fd);
     }
-    restore_system_lists(source_root_fd, home, &had_error);
+    restore_system_lists(source_root_fd, &todo, &had_error);
     if (mst == MANIFEST_STATUS_VALID && m.has_network_config)
         restore_network_config(source_root_fd, &had_error);
 
@@ -3718,6 +3816,7 @@ int restore_with_options(const char *source, const RestoreOptions *options)
     if (skipped_security_xattrs != 0)
         printf("Skipped %zu security.* attribute(s) that the destination "
                "could not apply.\n", skipped_security_xattrs);
+    restore_todo_finish(&todo, source);
     result = had_error ? MIGR_EXIT_FAILURE : MIGR_EXIT_OK;
 
 cleanup:

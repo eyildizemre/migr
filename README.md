@@ -179,6 +179,13 @@ Frequently rewritten desktop state (such as GNOME's file metadata) is restored
 only where nothing is there yet: a file a running service has already written
 on the new system is left as it is, and the summary counts it.
 
+Restore ends with what is left for you to do by hand: packages the new
+system could not install, Flatpak applications it could not install, and
+groups it does not have, each with the command to run. The same list is kept
+next to the backup as `<backup>-todo.txt` (for `migr-eyildizemre/`,
+`migr-eyildizemre-todo.txt` in the folder holding it), so the new system holds only
+what was restored.
+
 Restore is intended to run soon after a fresh distribution install. If the
 target has since accumulated its own files at the same paths, the result may
 be unexpected: a pre-existing destination symlink is refused cleanly and
@@ -309,7 +316,7 @@ backups remain literal requests and do not add this consent gate.
 
 **Browser Profiles (all scopes except explicit paths):** Firefox is retained as a separate browser-profile root; Chromium-family profiles under `~/.config` are covered by the persistent config root.
 
-**Packages (all scopes except explicit paths):** The list of packages you explicitly installed — not the thousands of dependencies pulled in alongside them — saved as packages.txt and reinstalled on restore. Anything the new distribution cannot resolve is written to `skipped-packages.txt` rather than silently dropped.
+**Packages (all scopes except explicit paths):** The list of packages you explicitly installed — not the thousands of dependencies pulled in alongside them — saved as packages.txt and reinstalled on restore. Anything the new distribution cannot resolve is listed at the end of the restore, never silently dropped.
 
 **Flatpak applications (all scopes except explicit paths):** The applications in the system-wide Flatpak installation, saved with their remotes as `flatpak-apps.txt` and installed on restore after packages. Applications whose remote (such as `flathub`) the new system does not have are listed with the command to run once it is added. A user installation under `~/.local/share/flatpak` comes back with your files.
 

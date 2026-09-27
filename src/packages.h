@@ -131,11 +131,15 @@ void read_package_list(FILE *pkg_file, char ***pkgs_out, int *pkg_count_out,
  * packages.txt and an unrecognized distro are skipped without making the
  * restore fatal, while failures to read or inspect the file set had_error.
  *
+ * This and the restore steps below write what is left for the user to do
+ * by hand to todo, one paragraph each with the command to run.
+ *
  * @param source_root_fd Directory fd the restored packages.txt is read from.
- * @param home           Home directory path, used for the skipped-packages log.
+ * @param todo           Receives the packages the system does not have after
+ *                       the install.
  * @param had_error      Set to 1 on a real failure; untouched otherwise.
  */
-void restore_packages(int source_root_fd, const char *home, int *had_error);
+void restore_packages(int source_root_fd, FILE *todo, int *had_error);
 
 /**
  * @brief Lists the groups whose member list in group_path names user, one
@@ -156,15 +160,17 @@ char *groups_collect(const char *group_path, const char *user);
  *
  * Runs after restore_packages(), since packages create groups (the libvirt
  * package creates libvirt). Groups this system has and user is not yet in
- * are added with one usermod; groups it lacks are listed and never created,
- * since one comes with software that would give it a system GID. An absent
+ * are added with one usermod; groups it lacks are listed, with the command
+ * to add them later, and never created, since one comes with software that
+ * would give it a system GID. An absent
  * groups.txt is skipped silently. A dry run only says what it would add.
  *
  * @param user      Login name to add; NULL when it could not be resolved,
  *                  which fails the step if there is anything to add.
  * @param had_error Set to 1 on a real failure; untouched otherwise.
  */
-void restore_groups(int source_root_fd, const char *user, int *had_error);
+void restore_groups(int source_root_fd, const char *user, FILE *todo,
+                    int *had_error);
 
 /**
  * @brief Lists the system installation's Flatpak applications as
@@ -187,10 +193,10 @@ char *flatpak_apps_collect(void);
  * remote it lacks are listed with the command to run once the remote is
  * added: adding one needs its signing key, which the backup does not have.
  * An absent list is skipped silently, and a system without flatpak gets the
- * apps listed. A dry run only says what it would install.
+ * apps listed in todo. A dry run only says what it would install.
  *
  * @param had_error Set to 1 on a real failure; untouched otherwise.
  */
-void restore_flatpak_apps(int source_root_fd, int *had_error);
+void restore_flatpak_apps(int source_root_fd, FILE *todo, int *had_error);
 
 #endif

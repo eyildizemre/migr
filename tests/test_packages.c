@@ -76,6 +76,7 @@ static void free_package_list(char **pkgs, int pkg_count)
 }
 
 static int file_equals_text(const char *path, const char *expected);
+static int write_text(const char *path, const char *text);
 
 typedef struct {
     distro_t distro;
@@ -93,7 +94,6 @@ typedef struct {
     int prefix_ok;
     int forbidden_seen;
     int capture_ok;
-    const char *existing_skip_log;
 } PackageRunFixture;
 
 static int package_run_fixture(char *const argv[], void *context)
@@ -191,6 +191,8 @@ typedef struct {
     int skipped_matches;
 } PackageRestoreCaseResult;
 
+// Runs restore_packages() on contents. expected_skipped lists, one per
+// line, the packages the todo must name as not installed; NULL means none.
 static int run_restore_packages_case(distro_t distro, const char *contents,
                                      PackageRunFixture *runner,
                                      const char *expected_skipped,
@@ -202,57 +204,20 @@ static int run_restore_packages_case(distro_t distro, const char *contents,
         return 0;
 
     char pkg_path[PATH_MAX];
-    char skipped_path[PATH_MAX];
-    int pkg_path_len = snprintf(pkg_path, sizeof(pkg_path),
-                                "%s/packages.txt", dir);
-    int skipped_path_len = snprintf(skipped_path, sizeof(skipped_path),
-                                    "%s/skipped-packages.txt", dir);
-    if (pkg_path_len < 0 || (size_t)pkg_path_len >= sizeof(pkg_path) ||
-        skipped_path_len < 0 ||
-        (size_t)skipped_path_len >= sizeof(skipped_path))
+    snprintf(pkg_path, sizeof(pkg_path), "%s/packages.txt", dir);
+    int dir_fd = -1;
+    char *todo_text = NULL;
+    size_t todo_size = 0;
+    FILE *todo = NULL;
+    if (write_text(pkg_path, contents) != 0 ||
+        (dir_fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC)) < 0 ||
+        (todo = open_memstream(&todo_text, &todo_size)) == NULL)
     {
-        rmdir(dir);
-        return 0;
-    }
-
-    FILE *pkg_file = fopen(pkg_path, "w");
-    if (pkg_file == NULL)
-    {
-        rmdir(dir);
-        return 0;
-    }
-    int fixture_ok = fputs(contents, pkg_file) >= 0 && fclose(pkg_file) == 0;
-    if (!fixture_ok)
-    {
-        unlink(pkg_path);
-        rmdir(dir);
-        return 0;
-    }
-
-    int dir_fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (dir_fd < 0)
-    {
-        unlink(pkg_path);
-        rmdir(dir);
-        return 0;
-    }
-
-    if (runner->existing_skip_log != NULL)
-    {
-        FILE *stale = fopen(skipped_path, "w");
-        int stale_ok = stale != NULL;
-        if (stale_ok && fputs(runner->existing_skip_log, stale) < 0)
-            stale_ok = 0;
-        if (stale != NULL && fclose(stale) != 0)
-            stale_ok = 0;
-        if (!stale_ok)
-        {
+        if (dir_fd >= 0)
             close(dir_fd);
-            unlink(skipped_path);
-            unlink(pkg_path);
-            rmdir(dir);
-            return 0;
-        }
+        unlink(pkg_path);
+        rmdir(dir);
+        return 0;
     }
 
     runner->distro = distro;
@@ -261,16 +226,32 @@ static int run_restore_packages_case(distro_t distro, const char *contents,
     packages_test_set_restore_hooks(distro, package_run_fixture,
                                     package_capture_fixture, runner);
     result->had_error = 0;
-    restore_packages(dir_fd, dir, &result->had_error);
+    restore_packages(dir_fd, todo, &result->had_error);
     packages_test_clear_restore_hooks();
     close(dir_fd);
+    fclose(todo);
 
-    result->skipped_exists = access(skipped_path, F_OK) == 0;
+    // The todo names the packages on one line, as "    a b c".
+    char expected[8192] = "    ";
+    for (const char *p = expected_skipped; p != NULL && *p != '\0'; p++)
+    {
+        size_t used = strlen(expected);
+        if (used + 2U < sizeof(expected))
+        {
+            expected[used] = *p == '\n' ? (p[1] != '\0' ? ' ' : '\n') : *p;
+            expected[used + 1U] = '\0';
+        }
+    }
+    size_t text_length = strlen(todo_text);
+    size_t expected_length = strlen(expected);
+    result->skipped_exists = text_length != 0;
     result->skipped_matches = expected_skipped != NULL
-        ? file_equals_text(skipped_path, expected_skipped)
+        ? strstr(todo_text, "could not install") != NULL &&
+              text_length >= expected_length &&
+              strcmp(todo_text + text_length - expected_length, expected) == 0
         : !result->skipped_exists;
 
-    unlink(skipped_path);
+    free(todo_text);
     unlink(pkg_path);
     rmdir(dir);
     return 1;
@@ -565,7 +546,7 @@ static void test_restore_packages_batch_prefixes(void)
                       cases[i].expected_availability_queries,
               label);
         snprintf(label, sizeof(label),
-                 "%s successful batch creates no skipped-package log",
+                 "%s successful batch leaves nothing to do by hand",
                  cases[i].name);
         check(result.had_error == 0 && result.skipped_matches, label);
     }
@@ -671,7 +652,8 @@ static void test_restore_packages_sparse_unavailable(distro_t distro,
                   (distro == DISTRO_ARCH ? 1U : 0U),
           label);
     snprintf(label, sizeof(label),
-             "%s records exactly the 14 packages absent from final state", name);
+             "%s leaves exactly the 14 packages absent from final state to "
+             "do by hand", name);
     check(result.had_error == 0 && result.skipped_exists &&
               result.skipped_matches,
           label);
@@ -755,22 +737,6 @@ static void test_restore_packages_single_pass_accounting(void)
               debian_status_result.had_error == 0 &&
               debian_status_result.skipped_matches,
           "Debian final-state accounting accepts only installed dpkg states");
-
-    PackageRunFixture stale_log = {
-        .expected_prefix = fedora_prefix,
-        .expected_prefix_count = sizeof(fedora_prefix) /
-                                 sizeof(fedora_prefix[0]),
-        .installed_output = "alpha\nbeta\n",
-        .existing_skip_log = "stale-package\n",
-    };
-    PackageRestoreCaseResult stale_log_result = {0};
-    fixture_ok = run_restore_packages_case(
-        DISTRO_FEDORA, "alpha\nbeta\n", &stale_log, NULL,
-        &stale_log_result);
-    check(fixture_ok && stale_log_result.had_error == 0 &&
-              !stale_log_result.skipped_exists &&
-              stale_log_result.skipped_matches,
-          "successful zero-skip accounting removes a stale skipped-package log");
 }
 
 static void test_restore_packages_batch_alloc_failure_is_reported(void)
@@ -821,8 +787,11 @@ static void test_restore_packages_batch_alloc_failure_is_reported(void)
     packages_test_set_restore_hooks(DISTRO_FEDORA, package_run_fixture,
                                     package_capture_fixture, &runner);
     int had_error = 0;
-    restore_packages(dir_fd, "/tmp", &had_error);
+    FILE *todo = tmpfile();
+    restore_packages(dir_fd, todo, &had_error);
     packages_test_clear_restore_hooks();
+    if (todo != NULL)
+        fclose(todo);
 
     wrap_malloc_target_size = 0;
 
@@ -929,15 +898,20 @@ static int group_run_fixture(char *const argv[], void *context)
     return fixture->result;
 }
 
-typedef void (*RestoreStep)(int dir_fd, int *had_error, void *context);
+typedef void (*RestoreStep)(int dir_fd, FILE *todo, int *had_error,
+                            void *context);
+
+// What a restore step left to do by hand in the last run_control_file_case().
+static char last_todo[2048];
 
 // Runs step against a container holding leaf with contents (none when NULL),
-// capturing what it prints. Returns had_error, or -1 when the fixture could
-// not be built.
+// capturing what it prints and its todo. Returns had_error, or -1 when the
+// fixture could not be built.
 static int run_control_file_case(const char *leaf, const char *contents,
                                  RestoreStep step, void *context,
                                  char *output, size_t output_size)
 {
+    last_todo[0] = '\0';
     char dir[] = "/tmp/migr_control_restore_XXXXXX";
     if (mkdtemp(dir) == NULL)
         return -1;
@@ -955,7 +929,10 @@ static int run_control_file_case(const char *leaf, const char *contents,
         fflush(stdout);
         dup2(fileno(captured), STDOUT_FILENO);
         had_error = 0;
-        step(dir_fd, &had_error, context);
+        FILE *todo = fmemopen(last_todo, sizeof(last_todo), "w");
+        step(dir_fd, todo, &had_error, context);
+        if (todo != NULL)
+            fclose(todo);
         fflush(stdout);
         dup2(saved_stdout, STDOUT_FILENO);
 
@@ -976,9 +953,10 @@ static int run_control_file_case(const char *leaf, const char *contents,
     return had_error;
 }
 
-static void restore_groups_step(int dir_fd, int *had_error, void *context)
+static void restore_groups_step(int dir_fd, FILE *todo, int *had_error,
+                                void *context)
 {
-    restore_groups(dir_fd, context, had_error);
+    restore_groups(dir_fd, context, todo, had_error);
 }
 
 // Runs restore_groups() for user against a target group file.
@@ -1026,9 +1004,12 @@ static void test_restore_groups(void)
           "has and does not list them in yet");
     check(strstr(output, "Added eyildizemre to libvirt, dialout. This takes effect "
                          "at the next login.") != NULL &&
-              strstr(output, "Left out, not on this system: media.") != NULL,
+              strstr(output, "Left out, not on this system: media.") != NULL &&
+              strstr(last_todo, "    sudo usermod -a -G media eyildizemre\n") !=
+                  NULL,
           "the summary names the groups added and the ones this system "
-          "lacks, and skips saved names no system could have");
+          "lacks, with the command for later, and skips saved names no "
+          "system could have");
 
     memset(&runner, 0, sizeof(runner));
     dry_run = 1;
@@ -1115,10 +1096,11 @@ static int flatpak_run_fixture(char *const argv[], void *context)
     return 0;
 }
 
-static void restore_flatpak_step(int dir_fd, int *had_error, void *context)
+static void restore_flatpak_step(int dir_fd, FILE *todo, int *had_error,
+                                 void *context)
 {
     (void)context;
-    restore_flatpak_apps(dir_fd, had_error);
+    restore_flatpak_apps(dir_fd, todo, had_error);
 }
 
 static int run_restore_flatpak_case(const char *list, FlatpakFixture *fixture,
@@ -1158,12 +1140,16 @@ static void test_restore_flatpak_apps(void)
                      "fedora org.example.C") == 0,
           "missing apps are installed with one call per remote the system "
           "has, skipping installed apps and unsafe names");
-    const char *hint = strstr(output, "No remote named elsewhere here; add "
-                                      "it, then run: flatpak install "
-                                      "elsewhere net.example.E net.example.G\n");
-    check(strstr(output, "2 installed, 1 not installed: com.example.D.") !=
-              NULL &&
-              hint != NULL && strstr(hint + 1, "No remote named") == NULL,
+    const char *hint = strstr(last_todo, "add the remote, then run:\n"
+                                         "    sudo flatpak install --system "
+                                         "elsewhere net.example.E "
+                                         "net.example.G\n");
+    check(strstr(output, "2 installed, 1 not installed.") != NULL &&
+              strstr(last_todo, "did not install:\n    sudo flatpak install "
+                                "--system flathub com.example.D\n") != NULL &&
+              hint != NULL &&
+              strstr(strstr(hint, "--system elsewhere") + 1,
+                     "--system elsewhere") == NULL,
           "the summary names apps that did not install and gives the "
           "command for a remote the system lacks");
 
@@ -1180,10 +1166,12 @@ static void test_restore_flatpak_apps(void)
     FlatpakFixture absent = { .remotes = NULL };
     rc = run_restore_flatpak_case(list, &absent, output, sizeof(output));
     check(rc == 0 && absent.installs == 0 &&
-              strstr(output, "Flatpak is not installed here; left out: "
-                             "com.example.A com.example.B org.example.C "
-                             "com.example.D net.example.E net.example.G.") !=
-                  NULL,
+              strstr(output, "Flatpak is not installed here; 6 applications "
+                             "left out.") != NULL &&
+              strstr(last_todo, "    sudo flatpak install --system flathub "
+                                "com.example.A com.example.B "
+                                "com.example.D\n") != NULL &&
+              strstr(last_todo, "--system fedora org.example.C\n") != NULL,
           "without flatpak the apps are listed, not a failure");
 
     FlatpakFixture unused = fixture;

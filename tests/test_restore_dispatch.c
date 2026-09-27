@@ -2505,6 +2505,62 @@ static void test_native_open_application_settings_are_deferred(void)
           "them anyway");
 }
 
+// What is left to do by hand ends the run and is kept next to the backup,
+// as <backup>-todo.txt; a restore with nothing left removes it.
+static void test_restore_keeps_the_todo_next_to_the_backup(void)
+{
+    printf(BLUE "::" NC " restore dispatch: what is left to do by hand ends the run and stays next to the backup\n");
+    char source[PATH_MAX], home[PATH_MAX], packages[PATH_MAX];
+    char todo_path[PATH_MAX + sizeof("-todo.txt")], output[16384];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_todo_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_todo_home");
+    setenv("HOME", home, 1);
+    write_payload_file(source, ".config", "app.conf", "settings");
+    join_path(packages, sizeof(packages), source, "packages.txt");
+    write_file_mode(packages, "fixture-package\nmissing-package\n", 0644);
+    snprintf(todo_path, sizeof(todo_path), "%s-todo.txt", source);
+
+    PackagePrivilegeProbe probe = {0};
+    join_path(probe.marker_path, sizeof(probe.marker_path), home,
+              "package-install-hook-called");
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    packages_test_set_restore_hooks(DISTRO_FEDORA, package_marker_probe,
+                                    package_progress_capture, &probe);
+    int rc = run_restore_capturing_with_input(source, "y\n", output,
+                                              sizeof(output));
+    const char *section = strstr(output, "\nWhat's left for you\n"
+                                         "  Packages this system could not "
+                                         "install");
+    check(rc == 0 && section != NULL &&
+              strstr(section, "    missing-package\n") != NULL &&
+              strstr(section, todo_path) != NULL,
+          "the run ends with the packages left to install by hand and says "
+          "where the list is kept");
+    FILE *todo = fopen(todo_path, "r");
+    char kept[512] = "";
+    if (todo != NULL)
+    {
+        kept[fread(kept, 1, sizeof(kept) - 1U, todo)] = '\0';
+        fclose(todo);
+    }
+    check(strncmp(kept, "What's left for you\n", 20) == 0 &&
+              strstr(kept, "    missing-package\n") != NULL,
+          "the same list is written next to the backup");
+
+    write_file_mode(packages, "fixture-package\n", 0644);
+    rc = run_restore_capturing_with_input(source, "y\n", output,
+                                          sizeof(output));
+    check(rc == 0 && strstr(output, "What's left for you") == NULL &&
+              access(todo_path, F_OK) != 0,
+          "a restore with nothing left to do removes the old list");
+    packages_test_clear_restore_hooks();
+    dry_run = previous_dry_run;
+    unlink(todo_path);
+    remove_tree(source);
+    remove_tree(home);
+}
+
 static void test_legacy_open_application_settings_are_deferred(void)
 {
     printf(BLUE "::" NC " restore dispatch: a legacy restore holds back an open browser's profile too\n");
@@ -4227,6 +4283,7 @@ int main(void)
     test_open_application_settings_are_deferred();
     test_native_open_application_settings_are_deferred();
     test_legacy_open_application_settings_are_deferred();
+    test_restore_keeps_the_todo_next_to_the_backup();
     test_native_restore_applies_dconf();
     test_verification_failure_still_restores_packages();
     test_portable_replay_failure_names_entry();

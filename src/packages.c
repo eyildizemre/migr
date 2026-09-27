@@ -507,88 +507,6 @@ static char *package_arch_available(int *had_error)
     return capture_package_query(query, "Arch package availability", had_error);
 }
 
-typedef struct {
-    char path[PATH_MAX];
-    FILE *stream;
-    int path_valid;
-    int write_failed;
-} PackageSkipLog;
-
-static void package_skip_log_init(PackageSkipLog *log, const char *home)
-{
-    memset(log, 0, sizeof(*log));
-    log->path_valid =
-        path_join(log->path, sizeof(log->path), home,
-                  "skipped-packages.txt") == 0;
-}
-
-static void package_skip_log_record(PackageSkipLog *log, const char *package,
-                                    int *had_error)
-{
-    if (!log->path_valid)
-    {
-        if (!log->write_failed)
-            print_error("Error: Could not write skipped package log\n");
-        log->write_failed = 1;
-        *had_error = 1;
-        return;
-    }
-
-    if (log->stream == NULL)
-    {
-        log->stream = fopen(log->path, "w");
-        if (log->stream == NULL)
-        {
-            if (!log->write_failed)
-                print_error("Error: Could not write skipped package log\n");
-            log->write_failed = 1;
-            log->path_valid = 0;
-            *had_error = 1;
-            return;
-        }
-    }
-
-    if (fprintf(log->stream, "%s\n", package) < 0)
-    {
-        if (!log->write_failed)
-            print_error("Error: Could not write skipped package log\n");
-        log->write_failed = 1;
-        *had_error = 1;
-    }
-}
-
-static void package_skip_log_close(PackageSkipLog *log, int *had_error)
-{
-    if (log->stream == NULL)
-        return;
-
-    if (fclose(log->stream) != 0)
-    {
-        if (!log->write_failed)
-            print_error("Error: Could not write skipped package log\n");
-        log->write_failed = 1;
-        *had_error = 1;
-    }
-    else if (!log->write_failed)
-    {
-        printf("  Skipped packages written to: %s\n", log->path);
-    }
-    log->stream = NULL;
-}
-
-static void package_skip_log_clear_if_empty(PackageSkipLog *log, int skipped,
-                                            int *had_error)
-{
-    if (skipped != 0 || !log->path_valid)
-        return;
-
-    if (unlink(log->path) != 0 && errno != ENOENT)
-    {
-        print_error("Error: Could not clear skipped package log\n");
-        *had_error = 1;
-    }
-}
-
 static size_t package_build_install_argv(char **argv, char *const *prefix,
                                          size_t prefix_count, char **pkgs,
                                          size_t pkg_count,
@@ -610,8 +528,9 @@ static size_t package_build_install_argv(char **argv, char *const *prefix,
     return install_count;
 }
 
+// Counts the packages the system has now and lists the others in todo.
 static int package_account_final_state(distro_t distro, char **pkgs,
-                                       size_t pkg_count, const char *home,
+                                       size_t pkg_count, FILE *todo,
                                        int *installed, int *skipped,
                                        int *had_error)
 {
@@ -624,21 +543,22 @@ static int package_account_final_state(distro_t distro, char **pkgs,
     if (inventory == NULL)
         return -1;
 
-    PackageSkipLog skip_log;
-    package_skip_log_init(&skip_log, home);
     for (size_t index = 0; index < pkg_count; index++)
     {
         if (package_inventory_contains(distro, inventory, pkgs[index]))
-            (*installed)++;
-        else
         {
-            package_skip_log_record(&skip_log, pkgs[index], had_error);
-            (*skipped)++;
+            (*installed)++;
+            continue;
         }
+        if (*skipped == 0)
+            fprintf(todo, "  Packages this system could not install, often "
+                          "from a repository it does not have yet:\n    ");
+        fprintf(todo, "%s%s", *skipped == 0 ? "" : " ", pkgs[index]);
+        (*skipped)++;
     }
+    if (*skipped != 0)
+        fprintf(todo, "\n");
 
-    package_skip_log_close(&skip_log, had_error);
-    package_skip_log_clear_if_empty(&skip_log, *skipped, had_error);
     free(inventory);
     return 0;
 }
@@ -701,7 +621,7 @@ static void free_name_list(char **names, int count)
     free(names);
 }
 
-void restore_packages(int source_root_fd, const char *home, int *had_error)
+void restore_packages(int source_root_fd, FILE *todo, int *had_error)
 {
     FILE *pkg_file = NULL;
     int opened = open_control_file(source_root_fd, "packages.txt", &pkg_file,
@@ -770,7 +690,7 @@ void restore_packages(int source_root_fd, const char *home, int *had_error)
             free(batch_argv);
 
             accounting_complete = package_account_final_state(
-                distro, pkgs, pkg_count_size, home, &installed, &skipped,
+                distro, pkgs, pkg_count_size, todo, &installed, &skipped,
                 had_error) == 0;
         }
         else
@@ -912,7 +832,8 @@ static char *join_group_names(char **names, const int *pick, int count)
     return joined;
 }
 
-void restore_groups(int source_root_fd, const char *user, int *had_error)
+void restore_groups(int source_root_fd, const char *user, FILE *todo,
+                    int *had_error)
 {
     FILE *list = NULL;
     if (open_control_file(source_root_fd, "groups.txt", &list, had_error) !=
@@ -1020,6 +941,12 @@ void restore_groups(int source_root_fd, const char *user, int *had_error)
         printf("  Left out, not on this system: ");
         print_group_names(names, missing, count);
         printf(".\n");
+        char *joined = join_group_names(names, missing, count);
+        if (joined != NULL)
+            fprintf(todo, "  Groups this system does not have; once the "
+                          "software that brings them is installed, run:\n"
+                          "    sudo usermod -a -G %s %s\n", joined, user);
+        free(joined);
     }
 
 done:
@@ -1098,18 +1025,29 @@ static FlatpakApp *read_flatpak_apps(FILE *list, size_t *count_out,
     return apps;
 }
 
-// Prints the ids of apps from remote (every remote when NULL) that pick
-// selects, separated by spaces.
-static void print_flatpak_ids(const FlatpakApp *apps, size_t count,
-                              const char *remote, const int *pick)
+// Writes under heading one install command per remote for the apps pick
+// selects; nothing when it selects none.
+static void flatpak_todo(FILE *todo, const char *heading,
+                         const FlatpakApp *apps, size_t count, const int *pick)
 {
-    const char *separator = "";
-    for (size_t i = 0; i < count; i++)
+    int wrote_heading = 0;
+    for (size_t first = 0; first < count; first++)
     {
-        if (!pick[i] || (remote != NULL && strcmp(apps[i].remote, remote) != 0))
+        int remote_seen = !pick[first];
+        for (size_t earlier = 0; earlier < first && !remote_seen; earlier++)
+            remote_seen = pick[earlier] &&
+                          strcmp(apps[earlier].remote, apps[first].remote) == 0;
+        if (remote_seen)
             continue;
-        printf("%s%s", separator, apps[i].app);
-        separator = " ";
+        if (!wrote_heading)
+            fprintf(todo, "  %s\n", heading);
+        wrote_heading = 1;
+        fprintf(todo, "    sudo flatpak install --system %s",
+                apps[first].remote);
+        for (size_t i = first; i < count; i++)
+            if (pick[i] && strcmp(apps[i].remote, apps[first].remote) == 0)
+                fprintf(todo, " %s", apps[i].app);
+        fprintf(todo, "\n");
     }
 }
 
@@ -1153,7 +1091,7 @@ static void install_flatpak_apps(const FlatpakApp *apps, size_t count,
     free(done);
 }
 
-void restore_flatpak_apps(int source_root_fd, int *had_error)
+void restore_flatpak_apps(int source_root_fd, FILE *todo, int *had_error)
 {
     FILE *list = NULL;
     if (open_control_file(source_root_fd, "flatpak-apps.txt", &list,
@@ -1191,9 +1129,10 @@ void restore_flatpak_apps(int source_root_fd, int *had_error)
     {
         for (size_t i = 0; i < count; i++)
             unreachable[i] = 1;
-        printf("  Flatpak is not installed here; left out: ");
-        print_flatpak_ids(apps, count, NULL, unreachable);
-        printf(".\n");
+        printf("  Flatpak is not installed here; %zu application%s left "
+               "out.\n", count, count == 1 ? "" : "s");
+        flatpak_todo(todo, "Flatpak applications, once Flatpak is installed "
+                           "and has their remotes:", apps, count, unreachable);
         goto done;
     }
     installed = capture_package_query(installed_query,
@@ -1218,8 +1157,10 @@ void restore_flatpak_apps(int source_root_fd, int *had_error)
 
     if (wanted_count != 0 && dry_run)
     {
-        printf("  Would install ");
-        print_flatpak_ids(apps, count, NULL, wanted);
+        printf("  Would install");
+        for (size_t i = 0; i < count; i++)
+            if (wanted[i])
+                printf(" %s", apps[i].app);
         printf("\n");
     }
     else if (wanted_count != 0)
@@ -1239,14 +1180,10 @@ void restore_flatpak_apps(int source_root_fd, int *had_error)
                         !package_plain_list_contains(installed, apps[i].app);
             failed += wanted[i];
         }
-        printf("  %zu installed, %zu not installed", wanted_count - failed,
+        printf("  %zu installed, %zu not installed.\n", wanted_count - failed,
                failed);
-        if (failed != 0)
-        {
-            printf(": ");
-            print_flatpak_ids(apps, count, NULL, wanted);
-        }
-        printf(".\n");
+        flatpak_todo(todo, "Flatpak applications that did not install:", apps,
+                     count, wanted);
     }
     else
         printf("  Every saved Flatpak application this system can reach is "
@@ -1254,19 +1191,16 @@ void restore_flatpak_apps(int source_root_fd, int *had_error)
 
     // Adding a remote needs its signing key, which the backup does not have,
     // so a remote the system lacks is left to the user.
+    size_t unreachable_count = 0;
     for (size_t i = 0; i < count; i++)
-    {
-        int first = unreachable[i];
-        for (size_t earlier = 0; earlier < i && first; earlier++)
-            first = !unreachable[earlier] ||
-                    strcmp(apps[earlier].remote, apps[i].remote) != 0;
-        if (!first)
-            continue;
-        printf("  No remote named %s here; add it, then run: "
-               "flatpak install %s ", apps[i].remote, apps[i].remote);
-        print_flatpak_ids(apps, count, apps[i].remote, unreachable);
-        printf("\n");
-    }
+        unreachable_count += unreachable[i];
+    if (unreachable_count != 0)
+        printf("  %zu application%s from remotes this system does not have "
+               "left out.\n", unreachable_count,
+               unreachable_count == 1 ? "" : "s");
+    flatpak_todo(todo, "Flatpak applications whose remote this system does "
+                       "not have; add the remote, then run:",
+                 apps, count, unreachable);
 
 done:
     free(installed);

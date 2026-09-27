@@ -21,7 +21,7 @@ It is to record *why*, and what was rejected, so neither gets re-litigated later
 
 ## D1 — 2026-06-27 — Unresolvable packages are written to `skipped-packages.txt`
 
-**Status:** Implemented
+**Status:** Superseded in part by D78 (the list moved next to the backup)
 
 **Decision:** Packages that fail to install on restore are written to
 `$HOME/skipped-packages.txt`, with a `N installed, N skipped` summary.
@@ -4834,4 +4834,30 @@ every extension had to be reinstalled by hand. The first real backup's
 
 **Relationship:** Extends D66 and D69. A Flatpak VS Code keeps its
 extensions under `~/.var/app` (D75).
+
+## D78 — 2026-09-27 — Restore ends with what is left to do by hand
+
+**Status:** Implemented
+
+**Decision:** The restore steps that re-create system state (packages,
+Flatpak applications, groups) write what they could not do into one list,
+each part with the command to run: packages the system could not install,
+Flatpak applications that did not install or whose remote it lacks, and
+groups it does not have. Restore ends with that list under "What's left for
+you" and writes the same text next to the backup, as `<backup>-todo.txt` in
+the folder holding it (`migr-vii7-todo.txt` beside `migr-vii7/`). It goes
+there, not into the backup, which restore never changes, and not into
+HOME, so the new system holds only what was restored; the drive is what
+the user carries. A restore with nothing left removes an earlier list; a
+dry run writes none; an unwritable drive is a warning. The file belongs to
+the sudo invoker where the filesystem records owners.
+
+`$HOME/skipped-packages.txt` (D1) is gone: restore wrote it as root into
+the new home, and it covered packages only.
+
+**Why:** After the first real restore, the packages from third-party
+repositories had to be installed by hand, and D74 and D76 added more of
+the same kind: groups and Flatpak remotes the new system lacks.
+
+**Relationship:** Supersedes D1's file; keeps D40's final-state accounting.
 
