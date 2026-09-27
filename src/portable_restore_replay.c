@@ -1726,8 +1726,11 @@ static int replay_regular_rewrites_home(const ReplayCollection *collection,
     return 0;
 }
 
-static int replay_regular_is_locally_authoritative(
-    const ReplayCollection *collection, const ReplayEntry *replay)
+// Whether replay's regular file is the one at home_relative below the source
+// HOME the manifest records.
+static int replay_regular_is_home_file(const ReplayCollection *collection,
+                                       const ReplayEntry *replay,
+                                       const char *home_relative)
 {
     if (collection == NULL || collection->manifest == NULL || replay == NULL ||
         replay->entry == NULL || replay->entry->kind != SIDECAR_KIND_REGULAR)
@@ -1736,10 +1739,16 @@ static int replay_regular_is_locally_authoritative(
     char source_path[PATH_MAX], known_path[PATH_MAX];
     if (replay_entry_source_path(collection, replay, source_path) != 0 ||
         path_join(known_path, sizeof(known_path),
-                  collection->manifest->source_home,
-                  ".config/user-dirs.dirs") != 0)
+                  collection->manifest->source_home, home_relative) != 0)
         return 0;
     return strcmp(source_path, known_path) == 0;
+}
+
+static int replay_regular_is_locally_authoritative(
+    const ReplayCollection *collection, const ReplayEntry *replay)
+{
+    return replay_regular_is_home_file(collection, replay,
+                                       ".config/user-dirs.dirs");
 }
 
 static int replay_regular_content_verification_excluded(
@@ -1748,17 +1757,8 @@ static int replay_regular_content_verification_excluded(
 static int replay_regular_is_dconf_database(const ReplayCollection *collection,
                                             const ReplayEntry *replay)
 {
-    if (collection == NULL || collection->manifest == NULL || replay == NULL ||
-        replay->entry == NULL || replay->entry->kind != SIDECAR_KIND_REGULAR)
-        return 0;
-
-    char source_path[PATH_MAX], known_path[PATH_MAX];
-    if (replay_entry_source_path(collection, replay, source_path) != 0 ||
-        path_join(known_path, sizeof(known_path),
-                  collection->manifest->source_home,
-                  ".config/dconf/user") != 0)
-        return 0;
-    return strcmp(source_path, known_path) == 0;
+    return replay_regular_is_home_file(collection, replay,
+                                       ".config/dconf/user");
 }
 
 // Fill, don't fight (D65): confirmed live desktop state that a running
