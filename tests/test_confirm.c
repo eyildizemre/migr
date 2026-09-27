@@ -611,6 +611,19 @@ static void test_run_log(void)
               access(dropped, F_OK) != 0,
           "the newest ten logs are kept");
 
+    // A log that cannot be created takes back the folders made for it.
+    char dir[16 + NAME_MAX + 2] = "made/";
+    memset(dir + 5, 'x', NAME_MAX + 1);
+    char made[PATH_MAX + 8];
+    snprintf(made, sizeof(made), "%s/made", base);
+    char *argv[] = { "migr", NULL };
+    int started = run_log_start(1, argv) == 0;
+    int attached = run_log_attach(base_fd, dir, "restore", (uid_t)-1,
+                                  (gid_t)-1);
+    run_log_finish(1);
+    check(started && attached != 0 && access(made, F_OK) != 0,
+          "a log that cannot be created takes back the folders made for it");
+
     close(base_fd);
     char command[PATH_MAX + 16];
     snprintf(command, sizeof(command), "rm -rf %s", base);

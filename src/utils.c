@@ -1222,6 +1222,32 @@ static void run_log_prune(int dir_fd, const char *prefix)
     }
 }
 
+// Removes a directory created for the log, keeping its parent's times as
+// the run left them: a restore has already restored those.
+static void run_log_remove_created(size_t slot)
+{
+    int parent = run_log.created_parent_fd[slot];
+    struct stat before;
+    int timed = fstat(parent, &before) == 0;
+    if (unlinkat(parent, run_log.created_name[slot], AT_REMOVEDIR) == 0 &&
+        timed)
+    {
+        struct timespec times[2] = { before.st_atim, before.st_mtim };
+        (void)futimens(parent, times);
+    }
+}
+
+// Removes the directories made for a log that will not be written.
+static void run_log_undo_created(void)
+{
+    for (size_t slot = run_log.created_count; slot > 0; slot--)
+    {
+        run_log_remove_created(slot - 1U);
+        close(run_log.created_parent_fd[slot - 1U]);
+    }
+    run_log.created_count = 0;
+}
+
 int run_log_attach(int base_fd, const char *dir, const char *prefix,
                    uid_t uid, gid_t gid)
 {
@@ -1229,7 +1255,10 @@ int run_log_attach(int base_fd, const char *dir, const char *prefix,
         return 0;
     int dir_fd = run_log_open_dir(base_fd, dir, uid, gid);
     if (dir_fd < 0)
+    {
+        run_log_undo_created();
         return -1;
+    }
 
     char stamp[32] = "";
     time_t now = time(NULL);
@@ -1254,6 +1283,7 @@ int run_log_attach(int base_fd, const char *dir, const char *prefix,
     if (fd < 0)
     {
         close(dir_fd);
+        run_log_undo_created();
         return -1;
     }
     if (uid != (uid_t)-1)
@@ -1277,21 +1307,6 @@ int run_log_attach(int base_fd, const char *dir, const char *prefix,
     pthread_mutex_unlock(&run_log.lock);
     run_log_prune(dir_fd, prefix);
     return 0;
-}
-
-// Removes a directory created for the log, keeping its parent's times as
-// the run left them: a restore has already restored those.
-static void run_log_remove_created(size_t slot)
-{
-    int parent = run_log.created_parent_fd[slot];
-    struct stat before;
-    int timed = fstat(parent, &before) == 0;
-    if (unlinkat(parent, run_log.created_name[slot], AT_REMOVEDIR) == 0 &&
-        timed)
-    {
-        struct timespec times[2] = { before.st_atim, before.st_mtim };
-        (void)futimens(parent, times);
-    }
 }
 
 const char *run_log_finish(int keep)
@@ -1337,8 +1352,7 @@ const char *run_log_finish(int keep)
     else if (run_log.dir_fd >= 0)
     {
         (void)unlinkat(run_log.dir_fd, run_log.name, 0);
-        for (size_t slot = run_log.created_count; slot > 0; slot--)
-            run_log_remove_created(slot - 1U);
+        run_log_undo_created();
     }
 
     for (size_t slot = 0; slot < run_log.created_count; slot++)
