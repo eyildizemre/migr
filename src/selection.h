@@ -52,8 +52,9 @@ typedef struct {
  * caller frees *out. Returns -1 when HOME cannot be listed. */
 int selection_plan_uncovered(const SelectionPlan *plan,
                              SelectionUncovered **out, size_t *count);
-/* Prints selection_plan_uncovered()'s result, bounded, for report/backup. */
-void selection_plan_print_uncovered(const SelectionPlan *plan);
+/* Prints selection_plan_uncovered()'s result, bounded, for report/backup.
+ * Returns 1 when it printed anything. */
+int selection_plan_print_uncovered(const SelectionPlan *plan);
 /* Owns a copied root/policy table. Uses VERSION=1 for unfiltered disjoint plans.
  * Caller supplies source identity and representation/sidecar/optional flags. */
 int selection_plan_manifest(const SelectionPlan *plan, Manifest *out);

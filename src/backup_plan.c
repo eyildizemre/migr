@@ -1449,14 +1449,14 @@ int selection_plan_uncovered(const SelectionPlan *plan,
     return 0;
 }
 
-void selection_plan_print_uncovered(const SelectionPlan *plan)
+int selection_plan_print_uncovered(const SelectionPlan *plan)
 {
     SelectionUncovered *items = NULL;
     size_t count = 0;
     if (selection_plan_uncovered(plan, &items, &count) != 0 || count == 0)
     {
         free(items);
-        return;
+        return 0;
     }
     enum { SHOWN = 15 };
     printf("Not included (add a path with `migr conf` to back it up):\n");
@@ -1470,6 +1470,7 @@ void selection_plan_print_uncovered(const SelectionPlan *plan)
     if (count > SHOWN)
         printf("  ... and %zu more\n", count - SHOWN);
     free(items);
+    return 1;
 }
 
 int selection_plan_build(const char *home, BackupMode mode,
