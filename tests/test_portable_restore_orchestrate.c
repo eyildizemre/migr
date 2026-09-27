@@ -2567,8 +2567,8 @@ static void test_direct_network_config_privilege_preflight(void)
         dry_run = previous_dry_run;
         check(result == 0 &&
                   strstr(output, "This restore needs root") == NULL &&
-                  strstr(output, "Note: the real restore needs root: it would "
-                                 "apply saved network configuration") != NULL &&
+                  strstr(output, "Note: the real restore needs root. Run it "
+                                 "with sudo.") != NULL &&
                   access(restored, F_OK) != 0,
               "an unprivileged portable dry run previews and notes the root "
               "requirement");

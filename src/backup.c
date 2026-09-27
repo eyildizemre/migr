@@ -314,20 +314,10 @@ int restore_privilege_preflight(size_t foreign_owner_count,
     return -1;
 }
 
-void restore_privilege_dry_run_note(size_t foreign_owner_count,
-                                    int network_config_needs_privilege)
+void restore_privilege_dry_run_note(void)
 {
-    if (geteuid() == 0 ||
-        (foreign_owner_count == 0 && !network_config_needs_privilege))
-        return;
-    printf("Note: the real restore needs root: it would ");
-    if (foreign_owner_count != 0)
-        printf("restore %zu item(s) owned by a different user%s",
-               foreign_owner_count,
-               network_config_needs_privilege ? " and " : "");
-    if (network_config_needs_privilege)
-        printf("apply saved network configuration");
-    printf(". Run it with sudo.\n");
+    if (geteuid() != 0)
+        printf("Note: the real restore needs root. Run it with sudo.\n");
 }
 
 // The user a sudo backup runs for (D38). Returns 0 with their ids, or -1

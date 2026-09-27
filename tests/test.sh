@@ -609,6 +609,10 @@ EOF
     explicit_container=$(sole_final_container "$explicit_dest")
     assert_succeeds_with "Dry run mode enabled" "$MIGR" restore "$explicit_container" --dry-run
     assert_succeeds_with "Dry run mode enabled" "$MIGR" restore "$explicit_container" --dry-run --no-verify
+    if [ "$(id -u)" -ne 0 ]; then
+        assert_succeeds_with "Note: the real restore needs root. Run it with sudo." \
+            "$MIGR" restore "$explicit_container" --dry-run
+    fi
     assert_succeeds_with "Commands:" "$MIGR" --help
 
     set +e

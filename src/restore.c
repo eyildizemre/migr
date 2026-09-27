@@ -3668,8 +3668,7 @@ int restore_with_options(const char *source, const RestoreOptions *options)
     // preceded by the same privilege-relevant profile detail an accepted
     // restore would have shown.
     if (dry_run)
-        restore_privilege_dry_run_note(metadata_profiles.foreign_owner_count,
-                                       network_config_needs_privilege);
+        restore_privilege_dry_run_note();
     else if (restore_privilege_preflight(metadata_profiles.foreign_owner_count,
                                          network_config_needs_privilege) != 0)
         goto cleanup;

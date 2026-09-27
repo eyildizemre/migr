@@ -83,10 +83,9 @@ int restore_space_preflight(int destination_fd, const char *home,
 int restore_privilege_preflight(size_t foreign_owner_count,
                                 int network_config_needs_privilege);
 
-/* A dry run only reads, so instead of refusing it notes why the real restore
- * would need root (silent when it would not). */
-void restore_privilege_dry_run_note(size_t foreign_owner_count,
-                                    int network_config_needs_privilege);
+/* A dry run runs without root (D62), so it notes that the real restore
+ * needs it. */
+void restore_privilege_dry_run_note(void);
 
 #ifdef BACKUP_TEST_HOOKS
 typedef void (*BackupTestInventoryHook)(const char *source_path,

@@ -1860,8 +1860,8 @@ static void test_network_config_privilege_refusal(void)
         dry_run = previous_dry_run;
         check(rc == 0 &&
                   strstr(output, "This restore needs root") == NULL &&
-                  strstr(output, "Note: the real restore needs root: it would "
-                                 "apply saved network configuration") != NULL &&
+                  strstr(output, "Note: the real restore needs root. Run it "
+                                 "with sudo.") != NULL &&
                   file_content_is(sentinel, "untouched"),
               "an unprivileged dry run previews and notes the root requirement");
     }

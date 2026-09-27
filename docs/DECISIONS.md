@@ -4335,7 +4335,8 @@ future work; they would turn "damaged region" into exact record ranges.
 
 **Decision:** The CLI refuses `backup` and `restore` without root, with the
 command to rerun under `sudo`. Their `--dry-run` previews, and `report`,
-`verify`, `repair`, and `conf`, keep running without root. Under `sudo`,
+`verify`, `repair`, and `conf`, keep running without root; a restore
+preview run that way notes that the real restore needs root. Under `sudo`,
 migr still acts for the invoking user (D38). The check lives in the CLI
 only: library entry points keep their own privilege checks (the restore
 preflight's "needs root" refusal). The integration suite links a build of
