@@ -1566,9 +1566,11 @@ static BackupCaptureStatus capture_regular_at(
     // kept as last read, with that read's length, and reported (D63).
     int failed = 0;
     int changed = 0;
+    off_t copied = 0;
     for (unsigned int attempt = 1;; attempt++)
     {
-        off_t copied = 0;
+        backup_capture_report_reread(report, copied);
+        copied = 0;
         if (lseek(src_fd, 0, SEEK_SET) != 0 || ftruncate(dest_fd, 0) != 0 ||
             lseek(dest_fd, 0, SEEK_SET) != 0 ||
             copy_file_contents(src_fd, dest_fd, 0, report, &copied) != 0)
@@ -1904,6 +1906,12 @@ void backup_capture_reread_pause(unsigned int attempt)
     struct timespec pause = { 0, (long)attempt * 50L * 1000L * 1000L };
     while (nanosleep(&pause, &pause) != 0 && errno == EINTR)
         ;
+}
+
+void backup_capture_report_reread(BackupCaptureReport *report, off_t bytes)
+{
+    if (report != NULL)
+        report->bytes_copied -= bytes;
 }
 
 int backup_capture_report_has_changes(const BackupCaptureReport *report)

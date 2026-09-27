@@ -211,6 +211,10 @@ void backup_capture_report_init(BackupCaptureReport *report);
 void backup_capture_report_note_change(BackupCaptureReport *report,
                                        BackupSourceChangeKind kind,
                                        const char *location);
+/* A file read again starts its count over: removes the bytes of the read
+ * before from bytes_copied (they stay in the sync accounting, since they were
+ * written). */
+void backup_capture_report_reread(BackupCaptureReport *report, off_t bytes);
 /* Nonzero when any source change other than live state was recorded. */
 int backup_capture_report_has_changes(const BackupCaptureReport *report);
 

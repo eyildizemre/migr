@@ -2837,8 +2837,10 @@ static int capture_regular(PortableCaptureContext *context,
     uint64_t content_digest = 0;
     struct stat captured = *before;
     int failed = 0;
+    uint64_t copied = 0;
     for (unsigned int attempt = 1;; attempt++) {
-        uint64_t copied = 0;
+        backup_capture_report_reread(context->progress_report, (off_t)copied);
+        copied = 0;
         if (portable_copy_regular_as_is(source_fd, destination_fd,
                                         context->progress_report,
                                         &content_digest, &copied) != 0) {

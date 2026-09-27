@@ -2437,10 +2437,22 @@ static void test_native_backup_of_a_changing_source(void)
 
     write_file(vanishing, "back again");
     fresh_mkdtemp(target, sizeof(target), "plan_live_busy");
+    // Shared: the backup runs in a child.
+    BackupProgressTrace *busy_trace = mmap(NULL, sizeof(*busy_trace),
+                                           PROT_READ | PROT_WRITE,
+                                           MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (busy_trace == MAP_FAILED)
+    {
+        printf(RED "fixture: could not create shared progress trace" NC "\n");
+        exit(1);
+    }
+    *busy_trace = (BackupProgressTrace){0};
+    backup_test_set_progress_hook(record_backup_progress, busy_trace);
     backup_test_set_after_copy_hook(rewrite_source_after_copy, busy);
     rc = run_backup_capturing_with_options(
         target, BACKUP_EXPLICIT_PATHS, paths, 0, 0, output, sizeof(output));
     backup_test_set_after_copy_hook(NULL, NULL);
+    backup_test_set_progress_hook(NULL, NULL);
     found = find_container_dir(target, container, sizeof(container));
     if (found)
         join_path(payload, sizeof(payload), container,
@@ -2450,6 +2462,11 @@ static void test_native_backup_of_a_changing_source(void)
               strstr(output, busy) != NULL,
           "a file still changing after every reread is kept as last read "
           "and listed");
+    check(busy_trace->previous == (off_t)(strlen("stable") +
+                                          strlen("back again") +
+                                          strlen("rewritten while read")),
+          "progress counts the bytes of the read kept, not of every read");
+    munmap(busy_trace, sizeof(*busy_trace));
     struct stat busy_st, payload_st;
     check(found && stat(busy, &busy_st) == 0 &&
               stat(payload, &payload_st) == 0 &&

@@ -572,6 +572,9 @@ static void test_prepared_capture_reports_failure_reason(void)
               backup_capture_report_has_changes(&capture_report),
           "a file still changing after every reread is kept as last read and "
           "reported");
+    check(capture_report.bytes_copied ==
+              (off_t)strlen("changed-after-payload-copy"),
+          "progress counts the bytes of the read kept, not of every read");
     check(!sidecar_mtime_matches_source(container_fd, "file", source_file),
           "its entry keeps the times from before the last read, so the next "
           "update reads it again");
