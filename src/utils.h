@@ -33,21 +33,22 @@ enum {
 int resolve_target_home(char out[PATH_MAX]);
 
 /**
- * @brief Resolves SUDO_UID, its primary gid, and its home from the local
- *        passwd file.
+ * @brief The user who ran migr through sudo, whom it acts for (D38).
  *
- * Reads /etc/passwd directly so static and dynamic builds use the same
- * NSS-independent account lookup. Returns -1 without diagnostics when the
- * invoking identity cannot be resolved.
+ * SUDO_UID, its primary gid, and its home come from /etc/passwd directly, so
+ * static and dynamic builds use the same NSS-independent account lookup.
+ *
+ * @return 1 with the invoker's uid, gid, and home (home may be NULL) when
+ *         root runs with SUDO_UID set; 0, outputs untouched, otherwise; -1
+ *         when SUDO_UID does not resolve to a local account.
  */
-int resolve_sudo_identity(uid_t *uid_out, gid_t *gid_out,
-                          char home_out[PATH_MAX]);
+int sudo_invoker(uid_t *uid, gid_t *gid, char home[PATH_MAX]);
 
 #define ACCOUNT_NAME_MAX 256
 
 /**
  * @brief Resolves uid's login name from the local passwd file without NSS,
- *        the way resolve_sudo_identity() resolves an account (D38).
+ *        the way sudo_invoker() resolves an account (D38).
  *
  * Returns -1 when no single well-formed entry has that uid.
  */

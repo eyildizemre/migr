@@ -259,11 +259,21 @@ static int resolve_sudo_identity_impl(const char *sudo_uid_env,
     return 0;
 }
 
-int resolve_sudo_identity(uid_t *uid_out, gid_t *gid_out,
-                          char home_out[PATH_MAX])
+int sudo_invoker(uid_t *uid, gid_t *gid, char home[PATH_MAX])
 {
-    return resolve_sudo_identity_impl(getenv("SUDO_UID"), "/etc/passwd",
-                                      uid_out, gid_out, home_out);
+    if (geteuid() != 0 || getenv("SUDO_UID") == NULL)
+        return 0;
+    uid_t found_uid;
+    gid_t found_gid;
+    char found_home[PATH_MAX];
+    if (resolve_sudo_identity_impl(getenv("SUDO_UID"), "/etc/passwd",
+                                   &found_uid, &found_gid, found_home) != 0)
+        return -1;
+    *uid = found_uid;
+    *gid = found_gid;
+    if (home != NULL)
+        memcpy(home, found_home, strlen(found_home) + 1U);
+    return 1;
 }
 
 static int local_account_name_impl(uid_t uid, const char *passwd_path,

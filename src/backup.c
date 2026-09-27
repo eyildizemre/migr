@@ -342,11 +342,7 @@ static int backup_invoker_identity(uid_t *uid, gid_t *gid)
         return 0;
     }
 #endif
-    char home[PATH_MAX];
-    if (geteuid() != 0 || getenv("SUDO_UID") == NULL ||
-        resolve_sudo_identity(uid, gid, home) != 0)
-        return -1;
-    return 0;
+    return sudo_invoker(uid, gid, NULL) == 1 ? 0 : -1;
 }
 
 // Whose data a backup holds, as recorded in its source identity (D15): the
@@ -2906,8 +2902,7 @@ static char *collect_vscode_extensions(void)
     uid_t uid;
     gid_t gid;
     char home[PATH_MAX];
-    if (geteuid() == 0 && getenv("SUDO_UID") != NULL &&
-        resolve_sudo_identity(&uid, &gid, home) == 0)
+    if (sudo_invoker(&uid, &gid, home) == 1)
     {
         capture_status = run_command_capture_as_identity(
             vscode_extensions_cmd, buffer, buf_size, uid, gid, home);

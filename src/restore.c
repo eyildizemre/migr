@@ -641,11 +641,7 @@ static int restore_session_uid(uid_t *uid)
 {
     *uid = geteuid();
     gid_t gid;
-    char sudo_home[PATH_MAX];
-    if (geteuid() == 0 && getenv("SUDO_UID") != NULL &&
-        resolve_sudo_identity(uid, &gid, sudo_home) != 0)
-        return -1;
-    return 0;
+    return sudo_invoker(uid, &gid, NULL) < 0 ? -1 : 0;
 }
 
 // What a restore leaves for the user to do by hand: written by the steps
@@ -707,9 +703,7 @@ static int restore_todo_write(const char *source, const char *text,
         return -1;
     uid_t uid;
     gid_t gid;
-    char home[PATH_MAX];
-    if (geteuid() == 0 && getenv("SUDO_UID") != NULL &&
-        resolve_sudo_identity(&uid, &gid, home) == 0)
+    if (sudo_invoker(&uid, &gid, NULL) == 1)
         (void)fchown(fd, uid, gid);
     FILE *out = fdopen(fd, "w");
     if (out == NULL)
@@ -3421,10 +3415,7 @@ int restore_with_options(const char *source, const RestoreOptions *options)
     // (D79); a restore that ends cleanly takes it away again.
     uid_t log_uid = (uid_t)-1;
     gid_t log_gid = (gid_t)-1;
-    char sudo_home[PATH_MAX];
-    if (geteuid() == 0 && getenv("SUDO_UID") != NULL &&
-        resolve_sudo_identity(&log_uid, &log_gid, sudo_home) != 0)
-        log_uid = (uid_t)-1;
+    (void)sudo_invoker(&log_uid, &log_gid, NULL);
     (void)run_log_attach(home_fd, ".local/state/migr", "restore", log_uid,
                          log_gid);
 

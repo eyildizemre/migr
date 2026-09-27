@@ -43,11 +43,11 @@ typedef struct {
 static int dconf_target_resolve(DconfTarget *target)
 {
     memset(target, 0, sizeof(*target));
-    if (geteuid() == 0 && getenv("SUDO_UID") != NULL)
+    int sudo = sudo_invoker(&target->uid, &target->gid, target->home);
+    if (sudo < 0)
+        return -1;
+    if (sudo)
     {
-        if (resolve_sudo_identity(&target->uid, &target->gid,
-                                  target->home) != 0)
-            return -1;
         target->drop_identity = target->uid != 0;
         return 0;
     }
