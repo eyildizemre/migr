@@ -815,6 +815,36 @@ test_restore() {
     assert_contains "$output" "Restore complete"
     assert_not_contains "$output" "Restored:"
 
+    # A clean backup and restore keep no log (D79).
+    assert_not_contains "$output" "Log: "
+    if [ -e "$HOME/.local/state/migr" ] || [ -e "$actual_backup/logs" ]; then
+        echo -e "  ${RED}✗${NC} A clean run left a log behind."
+        exit 1
+    fi
+    echo -e "  ${GREEN}✓${NC} A clean backup and restore leave no log."
+
+    # A restore that fails keeps its log and says where.
+    local log_home="$TEST_DIR/log_home"
+    mkdir -p "$log_home/Documents"
+    ln -s /etc/hostname "$log_home/Documents/note.txt"
+    local failed_output failed_rc log_file
+    set +e
+    failed_output=$(echo "y" | HOME="$log_home" "$MIGR" restore "$actual_backup" 2>&1)
+    failed_rc=$?
+    set -e
+    log_file=$(printf '%s\n' "$failed_output" | sed -n 's/^Log: //p')
+    if [ "$failed_rc" -eq 2 ] &&
+       [[ "$log_file" == "$log_home/.local/state/migr/restore-"*.log ]] &&
+       grep -q "^migr run started" "$log_file" &&
+       grep -qF "$(printf '%s\n' "$failed_output" | grep '^Error' | head -1)" "$log_file"; then
+        echo -e "  ${GREEN}✓${NC} A failed restore keeps its log, with what it printed."
+    else
+        echo -e "  ${RED}✗${NC} A failed restore did not keep its log (exit $failed_rc)."
+        echo "$failed_output"
+        exit 1
+    fi
+    rm -rf "$log_home"
+
     assert_file_exists "$HOME/Documents/note.txt"
     assert_file_exists "$HOME/Desktop/keep.txt"
     assert_file_exists "$HOME/.ssh/config"

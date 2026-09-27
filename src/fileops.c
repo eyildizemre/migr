@@ -1880,6 +1880,12 @@ void backup_capture_report_note_change(BackupCaptureReport *report,
 {
     if (report == NULL || kind < 0 || kind >= BACKUP_SOURCE_CHANGE_KINDS)
         return;
+    static const char *const labels[BACKUP_SOURCE_CHANGE_KINDS] = {
+        [BACKUP_SOURCE_CHANGED] = "Changed while read, kept as last read",
+        [BACKUP_SOURCE_VANISHED] = "Removed before it could be read",
+        [BACKUP_SOURCE_APPEARED] = "Created after its folder was scanned"
+    };
+    run_log_printf("%s: %s\n", labels[kind], location != NULL ? location : "");
     BackupSourceChangeList *list = &report->source_changes[kind];
     if (list->count != SIZE_MAX)
         list->count++;

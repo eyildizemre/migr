@@ -3367,6 +3367,14 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
     int container_fd = container_root_fd(&container);
     int had_error = 0;
     unsigned int network_config_processed_mask = 0;
+
+    // The run's log goes into the backup it describes (D79); in a native one
+    // it belongs to the user who ran sudo, like migr's other entries (D70).
+    uid_t log_uid = (uid_t)-1;
+    gid_t log_gid = (gid_t)-1;
+    if (repr == CLONE_NATIVE_TREE)
+        (void)backup_invoker_identity(&log_uid, &log_gid);
+    (void)run_log_attach(container_fd, "logs", "backup", log_uid, log_gid);
     // A partial is only worth resuming if its manifest proves which job it
     // belongs to. A fresh container whose manifest never got written can never
     // be adopted, so it must not be reported as resumable.
@@ -3419,7 +3427,7 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
         progress_force = backup_test_progress_hook != NULL;
 #endif
         if (!estimate_had_error && !raw_estimate_had_error &&
-            (isatty(fileno(stdout)) || progress_force))
+            (isatty(STDOUT_FILENO) || progress_force))
         {
             capture_report.progress_cb = backup_report_progress;
             capture_report.progress_userdata = &progress_display;

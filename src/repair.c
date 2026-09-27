@@ -1102,7 +1102,7 @@ int repair_backup(const char *source, const char *dest_root)
         goto done;
     }
 
-    copy.progress = isatty(fileno(stdout));
+    copy.progress = isatty(STDOUT_FILENO);
     copy_started = 1;
     if (copy_container(source_fd, container_fd, &copy) != 0)
         goto done;

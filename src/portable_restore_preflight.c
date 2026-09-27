@@ -106,7 +106,7 @@ static int preflight_progress_should_install(void)
 #ifdef PORTABLE_RESTORE_PREFLIGHT_TEST_HOOKS
     return portable_restore_preflight_test_progress_enabled;
 #else
-    return isatty(fileno(stdout));
+    return isatty(STDOUT_FILENO);
 #endif
 }
 

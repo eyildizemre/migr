@@ -1571,7 +1571,7 @@ static int restore_progress_should_install(void)
     if (restore_test_progress_force)
         return 1;
 #endif
-    return isatty(fileno(stdout));
+    return isatty(STDOUT_FILENO);
 }
 
 static void restore_report_progress(off_t bytes_restored,
@@ -3381,6 +3381,17 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         close(source_root_fd);
         return MIGR_EXIT_FAILURE;
     }
+
+    // The run's log belongs to the new system's user, where XDG puts logs
+    // (D79); a restore that ends cleanly takes it away again.
+    uid_t log_uid = (uid_t)-1;
+    gid_t log_gid = (gid_t)-1;
+    char sudo_home[PATH_MAX];
+    if (geteuid() == 0 && getenv("SUDO_UID") != NULL &&
+        resolve_sudo_identity(&log_uid, &log_gid, sudo_home) != 0)
+        log_uid = (uid_t)-1;
+    (void)run_log_attach(home_fd, ".local/state/migr", "restore", log_uid,
+                         log_gid);
 
     if (mst == MANIFEST_STATUS_VALID &&
         m.representation == CLONE_PORTABLE_SIDECAR)

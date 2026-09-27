@@ -351,6 +351,8 @@ int main(int argc, char *argv[])
                 ret = MIGR_EXIT_FAILURE;
                 break;
             }
+            if (!dry_run)
+                (void)run_log_start(argc, argv);
             if (mode == BACKUP_EXPLICIT_PATHS)
                 ret = backup(path, mode, user_paths, include_self,
                              include_network_config);
@@ -385,6 +387,8 @@ int main(int argc, char *argv[])
                 ret = MIGR_EXIT_FAILURE;
                 break;
             }
+            if (!dry_run)
+                (void)run_log_start(argc, argv);
             RestoreOptions restore_options = {
                 .skip_content_verification = no_verify
             };
@@ -417,5 +421,9 @@ int main(int argc, char *argv[])
             break;
     }
 
+    // Only a run with something to say keeps its log (D79).
+    const char *log = run_log_finish(ret != MIGR_EXIT_OK);
+    if (log != NULL)
+        printf("Log: %s\n", log);
     return ret;
 }

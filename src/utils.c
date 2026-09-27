@@ -1,6 +1,8 @@
+#define _GNU_SOURCE /* fopencookie, memfd_create */
 #include <stdio.h>
 #include <stdarg.h>
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
@@ -8,7 +10,9 @@
 #include <limits.h>
 #include <stdint.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -965,3 +969,387 @@ int crypto_policy_read_at(int dir_fd, const char *path,
     }
     return -1;
 }
+
+/* ------------------------------------------------------------------------- */
+/* Run log (docs/DECISIONS.md D79)                                           */
+/* ------------------------------------------------------------------------- */
+
+#define RUN_LOG_KEPT 10
+#define RUN_LOG_DEPTH_MAX 4
+
+// One of the standard streams while a log runs: what it prints goes to the
+// terminal as before, and to the log without colors and with a line redrawn
+// through '\r' only as last drawn.
+typedef struct {
+    int terminal_fd;
+    int escape; /* 1 after ESC, 2 inside a CSI sequence */
+    size_t length;
+    char line[4096];
+} RunLogTee;
+
+static struct {
+    pthread_mutex_t lock;
+    int active;
+    int sink_fd; /* A memfd until attached, then the log file. */
+    FILE *saved_stdout;
+    FILE *saved_stderr;
+    RunLogTee out;
+    RunLogTee err;
+    int dir_fd; /* The log's directory once attached, else -1. */
+    char name[64];
+    /* Directories created for the log, outermost first, each by its
+     * parent's fd and its name; removed with a log that is not kept. */
+    size_t created_count;
+    int created_parent_fd[RUN_LOG_DEPTH_MAX];
+    char created_name[RUN_LOG_DEPTH_MAX][NAME_MAX + 1];
+} run_log = { .lock = PTHREAD_MUTEX_INITIALIZER, .sink_fd = -1,
+              .dir_fd = -1 };
+
+static int write_all_fd(int fd, const char *data, size_t length)
+{
+    while (length > 0)
+    {
+        ssize_t written = write(fd, data, length);
+        if (written < 0 && errno == EINTR)
+            continue;
+        if (written <= 0)
+            return -1;
+        data += written;
+        length -= (size_t)written;
+    }
+    return 0;
+}
+
+// Caller holds run_log.lock. A log that cannot be written stays quiet: the
+// run itself goes on, and the terminal still shows everything.
+static void run_log_sink(const char *data, size_t length)
+{
+    if (run_log.sink_fd >= 0)
+        (void)write_all_fd(run_log.sink_fd, data, length);
+}
+
+static void run_log_tee_consume(RunLogTee *tee, const char *data, size_t size)
+{
+    pthread_mutex_lock(&run_log.lock);
+    for (size_t index = 0; index < size; index++)
+    {
+        char c = data[index];
+        if (tee->escape == 1)
+        {
+            tee->escape = c == '[' ? 2 : 0;
+            continue;
+        }
+        if (tee->escape == 2)
+        {
+            if (c >= 0x40 && c <= 0x7e)
+                tee->escape = 0;
+            continue;
+        }
+        if (c == '\033')
+        {
+            tee->escape = 1;
+            continue;
+        }
+        if (c == '\r')
+        {
+            tee->length = 0;
+            continue;
+        }
+        tee->line[tee->length++] = c;
+        if (c == '\n' || tee->length == sizeof(tee->line))
+        {
+            run_log_sink(tee->line, tee->length);
+            tee->length = 0;
+        }
+    }
+    pthread_mutex_unlock(&run_log.lock);
+}
+
+static ssize_t run_log_tee_write(void *cookie, const char *data, size_t size)
+{
+    RunLogTee *tee = cookie;
+    if (write_all_fd(tee->terminal_fd, data, size) != 0)
+        return -1;
+    run_log_tee_consume(tee, data, size);
+    return (ssize_t)size;
+}
+
+int run_log_start(int argc, char *const argv[])
+{
+    if (run_log.active)
+        return 0;
+    int sink = memfd_create("migr-log", MFD_CLOEXEC);
+    if (sink < 0)
+        return -1;
+    cookie_io_functions_t io = { .write = run_log_tee_write };
+    FILE *out = fopencookie(&run_log.out, "w", io);
+    FILE *err = fopencookie(&run_log.err, "w", io);
+    if (out == NULL || err == NULL)
+    {
+        if (out != NULL)
+            fclose(out);
+        if (err != NULL)
+            fclose(err);
+        close(sink);
+        return -1;
+    }
+    // The same buffering the standard streams had on the terminal.
+    setvbuf(out, NULL, isatty(STDOUT_FILENO) ? _IOLBF : _IOFBF, BUFSIZ);
+    setvbuf(err, NULL, _IONBF, 0);
+    fflush(stdout);
+    fflush(stderr);
+
+    memset(&run_log.out, 0, sizeof(run_log.out));
+    memset(&run_log.err, 0, sizeof(run_log.err));
+    run_log.out.terminal_fd = STDOUT_FILENO;
+    run_log.err.terminal_fd = STDERR_FILENO;
+    run_log.sink_fd = sink;
+    run_log.dir_fd = -1;
+    run_log.created_count = 0;
+    run_log.saved_stdout = stdout;
+    run_log.saved_stderr = stderr;
+    // glibc lets the standard streams be replaced, so every printf and
+    // print_error reaches the log while fds 1 and 2 stay the terminal.
+    stdout = out;
+    stderr = err;
+    run_log.active = 1;
+
+    char started[64] = "";
+    time_t now = time(NULL);
+    struct tm local;
+    if (localtime_r(&now, &local) != NULL)
+        strftime(started, sizeof(started), "%Y-%m-%d %H:%M:%S %z", &local);
+    run_log_printf("migr run started %s:", started);
+    for (int index = 0; index < argc; index++)
+        run_log_printf(" %s", argv[index]);
+    run_log_printf("\n\n");
+    return 0;
+}
+
+void run_log_printf(const char *fmt, ...)
+{
+    if (!run_log.active)
+        return;
+    char text[PATH_MAX + 256];
+    va_list args;
+    va_start(args, fmt);
+    int length = vsnprintf(text, sizeof(text), fmt, args);
+    va_end(args);
+    if (length < 0)
+        return;
+    // What was printed before comes first, even while stdout is buffered.
+    fflush(stdout);
+    pthread_mutex_lock(&run_log.lock);
+    run_log_sink(text, (size_t)length < sizeof(text) ? (size_t)length
+                                                     : sizeof(text) - 1U);
+    pthread_mutex_unlock(&run_log.lock);
+}
+
+// Opens dir below base_fd, creating what is missing (0700, owned by
+// uid:gid unless uid is -1) and recording it, without following symlinks.
+static int run_log_open_dir(int base_fd, const char *dir, uid_t uid, gid_t gid)
+{
+    char path[PATH_MAX];
+    if (snprintf(path, sizeof(path), "%s", dir) >= (int)sizeof(path))
+        return -1;
+    int current = dup_cloexec(base_fd);
+    char *save = NULL;
+    for (char *component = strtok_r(path, "/", &save);
+         current >= 0 && component != NULL;
+         component = strtok_r(NULL, "/", &save))
+    {
+        int created = mkdirat(current, component, 0700) == 0;
+        if (!created && errno != EEXIST)
+        {
+            close(current);
+            return -1;
+        }
+        int next = openat(current, component,
+                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (created && next >= 0 && uid != (uid_t)-1)
+            (void)fchown(next, uid, gid);
+        if (created && run_log.created_count < RUN_LOG_DEPTH_MAX)
+        {
+            size_t slot = run_log.created_count++;
+            run_log.created_parent_fd[slot] = dup_cloexec(current);
+            snprintf(run_log.created_name[slot],
+                     sizeof(run_log.created_name[slot]), "%s", component);
+        }
+        close(current);
+        current = next;
+    }
+    return current;
+}
+
+static int run_log_name_cmp(const void *a, const void *b)
+{
+    return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+// Removes the oldest of dir_fd's logs named <prefix>-*.log beyond the newest
+// RUN_LOG_KEPT; the names carry their time, so they sort by it.
+static void run_log_prune(int dir_fd, const char *prefix)
+{
+    int fd = dup_cloexec(dir_fd);
+    DIR *dir = fd >= 0 ? fdopendir(fd) : NULL;
+    if (dir == NULL)
+    {
+        if (fd >= 0)
+            close(fd);
+        return;
+    }
+    char *names[256];
+    size_t count = 0;
+    size_t prefix_length = strlen(prefix);
+    struct dirent *entry;
+    while (count < sizeof(names) / sizeof(names[0]) &&
+           (entry = readdir(dir)) != NULL)
+    {
+        size_t length = strlen(entry->d_name);
+        if (strncmp(entry->d_name, prefix, prefix_length) == 0 &&
+            entry->d_name[prefix_length] == '-' && length > 4U &&
+            strcmp(entry->d_name + length - 4U, ".log") == 0 &&
+            (names[count] = strdup(entry->d_name)) != NULL)
+            count++;
+    }
+    closedir(dir);
+    qsort(names, count, sizeof(names[0]), run_log_name_cmp);
+    for (size_t index = 0; index < count; index++)
+    {
+        if (index + RUN_LOG_KEPT < count)
+            (void)unlinkat(dir_fd, names[index], 0);
+        free(names[index]);
+    }
+}
+
+int run_log_attach(int base_fd, const char *dir, const char *prefix,
+                   uid_t uid, gid_t gid)
+{
+    if (!run_log.active || run_log.dir_fd >= 0)
+        return 0;
+    int dir_fd = run_log_open_dir(base_fd, dir, uid, gid);
+    if (dir_fd < 0)
+        return -1;
+
+    char stamp[32] = "";
+    time_t now = time(NULL);
+    struct tm local;
+    if (localtime_r(&now, &local) != NULL)
+        strftime(stamp, sizeof(stamp), "%Y-%m-%d-%H%M%S", &local);
+    int fd = -1;
+    for (int attempt = 1; fd < 0 && attempt < 10; attempt++)
+    {
+        if (attempt == 1)
+            snprintf(run_log.name, sizeof(run_log.name), "%s-%s.log", prefix,
+                     stamp);
+        else
+            snprintf(run_log.name, sizeof(run_log.name), "%s-%s-%d.log",
+                     prefix, stamp, attempt);
+        fd = openat(dir_fd, run_log.name,
+                    O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_APPEND |
+                    O_CLOEXEC, 0600);
+        if (fd < 0 && errno != EEXIST)
+            break;
+    }
+    if (fd < 0)
+    {
+        close(dir_fd);
+        return -1;
+    }
+    if (uid != (uid_t)-1)
+        (void)fchown(fd, uid, gid);
+
+    // What was printed before there was a place for it goes in first.
+    fflush(stdout);
+    fflush(stderr);
+    pthread_mutex_lock(&run_log.lock);
+    char buffer[65536];
+    ssize_t got;
+    off_t offset = 0;
+    while ((got = pread(run_log.sink_fd, buffer, sizeof(buffer), offset)) > 0)
+    {
+        (void)write_all_fd(fd, buffer, (size_t)got);
+        offset += got;
+    }
+    close(run_log.sink_fd);
+    run_log.sink_fd = fd;
+    run_log.dir_fd = dir_fd;
+    pthread_mutex_unlock(&run_log.lock);
+    run_log_prune(dir_fd, prefix);
+    return 0;
+}
+
+// Removes a directory created for the log, keeping its parent's times as
+// the run left them: a restore has already restored those.
+static void run_log_remove_created(size_t slot)
+{
+    int parent = run_log.created_parent_fd[slot];
+    struct stat before;
+    int timed = fstat(parent, &before) == 0;
+    if (unlinkat(parent, run_log.created_name[slot], AT_REMOVEDIR) == 0 &&
+        timed)
+    {
+        struct timespec times[2] = { before.st_atim, before.st_mtim };
+        (void)futimens(parent, times);
+    }
+}
+
+const char *run_log_finish(int keep)
+{
+    static char kept[PATH_MAX];
+    if (!run_log.active)
+        return NULL;
+    fflush(stdout);
+    fflush(stderr);
+    FILE *out = stdout;
+    FILE *err = stderr;
+    stdout = run_log.saved_stdout;
+    stderr = run_log.saved_stderr;
+    fclose(out);
+    fclose(err);
+
+    pthread_mutex_lock(&run_log.lock);
+    RunLogTee *tees[] = { &run_log.out, &run_log.err };
+    for (size_t index = 0; index < 2; index++)
+        if (tees[index]->length != 0)
+        {
+            run_log_sink(tees[index]->line, tees[index]->length);
+            run_log_sink("\n", 1);
+        }
+    pthread_mutex_unlock(&run_log.lock);
+
+    kept[0] = '\0';
+    if (run_log.dir_fd >= 0 && keep)
+    {
+        (void)fsync(run_log.sink_fd);
+        char link[64];
+        char dir[PATH_MAX];
+        snprintf(link, sizeof(link), "/proc/self/fd/%d", run_log.dir_fd);
+        ssize_t length = readlink(link, dir, sizeof(dir) - 1U);
+        if (length > 0)
+        {
+            dir[length] = '\0';
+            if (snprintf(kept, sizeof(kept), "%s/%s", dir, run_log.name) >=
+                (int)sizeof(kept))
+                kept[0] = '\0';
+        }
+    }
+    else if (run_log.dir_fd >= 0)
+    {
+        (void)unlinkat(run_log.dir_fd, run_log.name, 0);
+        for (size_t slot = run_log.created_count; slot > 0; slot--)
+            run_log_remove_created(slot - 1U);
+    }
+
+    for (size_t slot = 0; slot < run_log.created_count; slot++)
+        close(run_log.created_parent_fd[slot]);
+    run_log.created_count = 0;
+    if (run_log.dir_fd >= 0)
+        close(run_log.dir_fd);
+    run_log.dir_fd = -1;
+    close(run_log.sink_fd);
+    run_log.sink_fd = -1;
+    run_log.active = 0;
+    return kept[0] != '\0' ? kept : NULL;
+}
+

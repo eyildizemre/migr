@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "utils.h"
@@ -487,9 +488,141 @@ static void test_progress_line_fit_fallback(void)
           "progress line beyond the fallback width is clamped to columns minus one");
 }
 
+static int read_small(const char *path, char *out, size_t size)
+{
+    FILE *f = fopen(path, "r");
+    if (f == NULL)
+        return -1;
+    size_t length = fread(out, 1, size - 1U, f);
+    out[length] = '\0';
+    fclose(f);
+    return 0;
+}
+
+// Runs one logged "run" into base/<dir>, printing what a real one does:
+// colors, a progress line redrawn with '\r', and a line for the log only.
+// restored, when set, gets its times set midway, as a restore sets those of
+// the folders it restores. The terminal side goes to /dev/null. Returns the
+// kept path, or NULL.
+static const char *logged_run(int base_fd, const char *dir, int keep,
+                              const char *restored)
+{
+    fflush(stdout);
+    int saved = dup(STDOUT_FILENO);
+    int null_fd = open("/dev/null", O_WRONLY);
+    dup2(null_fd, STDOUT_FILENO);
+    close(null_fd);
+    char *argv[] = { "migr", "restore", "/backup", NULL };
+    const char *kept = NULL;
+    fflush(stderr);
+    int saved_err = dup(STDERR_FILENO);
+    dup2(STDOUT_FILENO, STDERR_FILENO);
+    if (run_log_start(3, argv) == 0)
+    {
+        printf("before attach\n");
+        run_log_attach(base_fd, dir, "restore", (uid_t)-1, (gid_t)-1);
+        printf("\033[1;31mError: red\033[0m\n");
+        printf("\rCopying 10%%");
+        fflush(stdout);
+        printf("\rCopying 100%%\n");
+        run_log_printf("Listed only here: a/b\n");
+        struct timespec times[2] = { { 1000000000, 0 }, { 1000000000, 0 } };
+        if (restored != NULL)
+            utimensat(AT_FDCWD, restored, times, 0);
+        fprintf(stderr, "unterminated");
+        kept = run_log_finish(keep);
+    }
+    fflush(stdout);
+    dup2(saved, STDOUT_FILENO);
+    close(saved);
+    dup2(saved_err, STDERR_FILENO);
+    close(saved_err);
+    return kept;
+}
+
+static void test_run_log(void)
+{
+    char base[] = "/tmp/migr-run-log-XXXXXX";
+    if (mkdtemp(base) == NULL)
+    {
+        check(0, "run log fixture is created");
+        return;
+    }
+    char state[PATH_MAX];
+    snprintf(state, sizeof(state), "%s/.local", base);
+    int base_fd = open(base, O_RDONLY | O_DIRECTORY);
+
+    const char *kept = logged_run(base_fd, ".local/state/migr", 1, NULL);
+    char text[1024] = "";
+    check(kept != NULL && read_small(kept, text, sizeof(text)) == 0 &&
+              strncmp(text, "migr run started ", 17) == 0 &&
+              strstr(text, ": migr restore /backup\n\nbefore attach\n"
+                           "Error: red\nCopying 100%\nListed only here: "
+                           "a/b\nunterminated\n") != NULL,
+          "a kept log holds the run as printed, without colors, with a "
+          "redrawn line as last drawn, and the log-only lines");
+    struct stat st;
+    check(kept != NULL && stat(kept, &st) == 0 && (st.st_mode & 0777) == 0600,
+          "a log is readable by its owner only");
+
+    // A clean run on a system whose .local/state is there, and gets its
+    // times from the restore, leaves it exactly so.
+    char aside[] = "/tmp/migr-run-log-aside-XXXXXX";
+    char local_state[PATH_MAX];
+    snprintf(local_state, sizeof(local_state), "%s/.local/state", base);
+    int moved = mkdtemp(aside) != NULL && rmdir(aside) == 0 &&
+                rename(state, aside) == 0 && mkdir(state, 0700) == 0 &&
+                mkdir(local_state, 0700) == 0;
+    kept = logged_run(base_fd, ".local/state/migr", 0, local_state);
+    char migr_dir[PATH_MAX + 8];
+    snprintf(migr_dir, sizeof(migr_dir), "%s/migr", local_state);
+    struct stat state_st;
+    check(moved && kept == NULL && access(migr_dir, F_OK) != 0 &&
+              stat(local_state, &state_st) == 0 &&
+              state_st.st_mtim.tv_sec == 1000000000,
+          "a log that is not kept goes away with the folder made for it, and "
+          "the folder holding it keeps the times the run gave it");
+
+    // With nothing there, the folders made for the log go too.
+    moved = rmdir(local_state) == 0 && rmdir(state) == 0;
+    kept = logged_run(base_fd, ".local/state/migr", 0, NULL);
+    check(moved && kept == NULL && access(state, F_OK) != 0,
+          "every folder made only for a log that is not kept goes away");
+    rename(aside, state);
+
+    for (int i = 0; i < 12; i++)
+    {
+        char old_log[PATH_MAX + 64];
+        snprintf(old_log, sizeof(old_log), "%s/restore-2000-01-%02d-000000.log",
+                 migr_dir, i + 1);
+        FILE *f = fopen(old_log, "w");
+        if (f != NULL)
+            fclose(f);
+    }
+    kept = logged_run(base_fd, ".local/state/migr", 1, NULL);
+    char oldest_kept[PATH_MAX + 64], dropped[PATH_MAX + 64];
+    // With the two logs of this test's runs, the newest ten reach back to
+    // the fifth.
+    snprintf(oldest_kept, sizeof(oldest_kept),
+             "%s/restore-2000-01-05-000000.log", migr_dir);
+    snprintf(dropped, sizeof(dropped), "%s/restore-2000-01-04-000000.log",
+             migr_dir);
+    check(kept != NULL && access(oldest_kept, F_OK) == 0 &&
+              access(dropped, F_OK) != 0,
+          "the newest ten logs are kept");
+
+    close(base_fd);
+    char command[PATH_MAX + 16];
+    snprintf(command, sizeof(command), "rm -rf %s", base);
+    if (system(command) != 0)
+        check(0, "run log fixture is removed");
+}
+
 int main(void)
 {
     char output[256];
+
+    test_run_log();
 
 #ifdef USER_CONTEXT_TEST_HOOKS
     test_target_home_resolution();

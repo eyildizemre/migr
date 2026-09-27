@@ -4861,3 +4861,40 @@ the same kind: groups and Flatpak remotes the new system lacks.
 
 **Relationship:** Supersedes D1's file; keeps D40's final-state accounting.
 
+## D79 — 2026-09-27 — A backup or restore keeps a log only when it has something to say
+
+**Status:** Implemented
+
+**Decision:** `backup` and `restore` (not dry runs) log the run. At the
+start, `stdout` and `stderr` are replaced by `fopencookie()` streams that
+write to the terminal as before and to the log: fds 1 and 2 stay the
+terminal, so `isatty()`, colors, and the progress line are unchanged, and
+the log gets the text without ANSI sequences and a `\r`-redrawn line only
+as last drawn. The terminal checks use `isatty(STDOUT_FILENO)`, since a
+cookie stream has no fd. `run_log_printf()` writes to the log only: every
+source change during a backup (D63), and every restored item counted
+rather than listed (left as a running service wrote it, left as the
+destination had it, left out because its application stayed open,
+changed afterwards). Child processes (dnf, flatpak) write to the terminal
+directly and are not in the log.
+
+The log is held in a memfd until the run knows where it goes:
+- **Backup:** `logs/backup-YYYY-MM-DD-HHMMSS.log` in the container, owned
+  like migr's other entries (D70). The source system is usually reinstalled
+  next, so a log left on it would be gone when it is needed.
+- **Restore:** `~/.local/state/migr/restore-YYYY-MM-DD-HHMMSS.log`, owned by
+  the user; XDG puts logs in the state directory.
+
+A run that ends with status 1 or 2 (D68) keeps its log and names it last;
+one that ends with 0 removes it and the directories it created for it, and
+puts back the times their parent had just before, which a restore has set.
+A run killed midway keeps what it wrote. The newest 10 logs in each place
+are kept; directories are created 0700 and the log 0600.
+
+**Why:** A run left no record beyond scrollback, and the terminal shows
+only examples of long lists. migr runs once per distro hop, so a log of a
+run that went as asked would only be clutter on the new system.
+
+**Relationship:** Uses D68's exit statuses. Restore's list of what is left
+to do by hand (D78) goes next to the backup whatever the status.
+

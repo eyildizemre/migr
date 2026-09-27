@@ -282,6 +282,23 @@ As with GNU tar:
 | 1 | Completed, but something changed or differs, and the run lists it: files that changed while a backup read them, restored items another program changed afterwards, or items `verify` found different from their capture. |
 | 2 | Failed or refused, including a wrong command line. |
 
+## Logs
+
+A backup or restore that ends with status 1 or 2 keeps a log of the run:
+everything it printed, without colors, plus the full lists the terminal only
+shows examples of (files that changed while read, restored files left as a
+running service wrote them, and the like). The last line of the run names it.
+
+- **Backup:** inside the backup, `logs/backup-YYYY-MM-DD-HHMMSS.log`, so it
+  travels with the backup when the old system is reinstalled.
+- **Restore:** `~/.local/state/migr/restore-YYYY-MM-DD-HHMMSS.log` on the new
+  system.
+
+A run that ends with status 0 keeps no log, and removes the folders it made
+for one, so a clean backup and restore leave nothing of migr on the new
+system. The newest 10 logs in each place are kept. Reports, dry runs, and
+`verify` keep none: they change nothing and print everything they know.
+
 ## Key Features
 
 - **Smart Resume:** Interrupted backups resume automatically — files already cloned (matching size and timestamp) are skipped.
@@ -374,6 +391,7 @@ migr-<user>/
 ├── vs-code-extensions.txt # present when code lists installed extensions
 ├── migr                # present with --include-self
 ├── network/            # with --include-network-config when a backend is found
+├── logs/               # logs of backup runs that ended with status 1 or 2
 └── data/
     └── <logical roots>
 ```
@@ -600,8 +618,8 @@ recorded in [docs/DECISIONS.md](docs/DECISIONS.md).
 - [x] Cross-locale restore mapping (manifest system)
 - [x] Resumable versioned backup containers
 - [x] Backups to filesystems that cannot hold Linux metadata (exFAT/NTFS/FAT32)
-- [x] VS Code extension list snapshot on backup (capture-only)
-- [ ] Logging
+- [x] VS Code extensions backed up with their files
+- [x] Logging
 - [x] Network configuration backup
 - [x] Self-contained backup (`--include-self` static binary)
 - [ ] Provide pre-built .deb, .rpm, and AUR packages

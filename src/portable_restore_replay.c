@@ -392,6 +392,17 @@ static void replay_report_security_skipped(
         report->skipped_security_xattr_count += count;
 }
 
+// Names one entry in the log's full list of what the summary counts (D79).
+static void replay_log_entry(const ReplayCollection *collection,
+                             const ReplayEntry *replay, const char *what)
+{
+    char logical[PATH_MAX];
+    replay_copy_bytes(logical, sizeof(logical), replay->entry->logical_path);
+    run_log_printf("%s: %s:%s\n", what,
+                   collection->manifest->roots[replay->root_index].id,
+                   logical[0] != '\0' ? logical : ".");
+}
+
 static int replay_entries_reserve(ReplayCollection *collection, size_t extra)
 {
     if (collection == NULL)
@@ -2698,7 +2709,7 @@ static int replay_verification_progress_should_install(void)
     if (verification_progress_enabled)
         return 1;
 #endif
-    return isatty(fileno(stdout));
+    return isatty(STDOUT_FILENO);
 }
 
 static long replay_verification_elapsed_seconds(
@@ -3482,6 +3493,8 @@ static int replay_verify_content(ReplayCollection *collection)
         {
             if (collection->report->verification_changed_count != SIZE_MAX)
                 collection->report->verification_changed_count++;
+            replay_log_entry(collection, replay,
+                             "Changed by another program after restore");
             if (changed_count < REPLAY_VERIFICATION_EXAMPLES)
             {
                 char logical[PATH_MAX];
@@ -3608,11 +3621,15 @@ static int replay_apply_entry(ReplayCollection *collection,
     {
         if (collection->report->preserved_local_state_count != SIZE_MAX)
             collection->report->preserved_local_state_count++;
+        replay_log_entry(collection, replay,
+                         "Left as the destination had it");
     }
     else if (replay->kept_live_state)
     {
         if (collection->report->live_state_kept_count != SIZE_MAX)
             collection->report->live_state_kept_count++;
+        replay_log_entry(collection, replay,
+                         "Left as a running service wrote it");
     }
     else if (replay->entry->kind != SIDECAR_KIND_DIRECTORY)
     {
@@ -3704,6 +3721,8 @@ static int replay_apply_deferred(ReplayCollection *collection,
                 replay->deferral = REPLAY_DEFERRED_SKIPPED;
                 if (collection->report->deferred_skipped_count != SIZE_MAX)
                     collection->report->deferred_skipped_count++;
+                replay_log_entry(collection, replay,
+                                 "Left out, its application stayed open");
                 continue;
             }
             if (replay_apply_entry(collection, replay, printed_roots) != 0)

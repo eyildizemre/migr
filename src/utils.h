@@ -69,6 +69,48 @@ const char *invoker_name(void);
  */
 void print_backup_time(time_t taken);
 
+/**
+ * @brief Starts the run log of a backup or restore (docs/DECISIONS.md D79).
+ *
+ * From here on everything printed to stdout and stderr also goes to the
+ * log, without colors and with a progress line only as last drawn; fds 1
+ * and 2 stay the terminal. The log is held in memory until
+ * run_log_attach() gives it a place. Its first line names the command.
+ *
+ * @return 0, or -1 when no log could be started; the run goes on without.
+ */
+int run_log_start(int argc, char *const argv[]);
+
+/**
+ * @brief Writes to the log only, for the full lists the terminal shows
+ *        examples of. Does nothing when no log runs.
+ */
+void run_log_printf(const char *fmt, ...)
+    __attribute__((format(printf, 1, 2)));
+
+/**
+ * @brief Gives the log its place: <dir>/<prefix>-YYYY-MM-DD-HHMMSS.log below
+ *        base_fd, with what was printed so far.
+ *
+ * Missing directories of dir are created 0700 and, with the log, owned by
+ * uid:gid unless uid is -1. The newest 10 logs with that prefix are kept.
+ * Only the first call of a run counts.
+ *
+ * @return 0, or -1 when it could not be created; the run goes on without.
+ */
+int run_log_attach(int base_fd, const char *dir, const char *prefix,
+                   uid_t uid, gid_t gid);
+
+/**
+ * @brief Ends the log and puts the standard streams back.
+ *
+ * A log that is not kept is removed with the directories created for it,
+ * so a run that leaves nothing to say leaves nothing behind.
+ *
+ * @return The kept log's path, or NULL.
+ */
+const char *run_log_finish(int keep);
+
 #ifdef USER_CONTEXT_TEST_HOOKS
 int resolve_target_home_for_test(const char *home_env,
                                  const char *sudo_uid_env,

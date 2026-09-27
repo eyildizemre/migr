@@ -534,7 +534,7 @@ int verify_backup(const char *path)
     print_backup_time(manifest.updated);
     printf("Verifying %zu item%s (%s) in %s\n", run.count,
            run.count == 1 ? "" : "s", total, path);
-    run.progress = isatty(fileno(stdout)) &&
+    run.progress = isatty(STDOUT_FILENO) &&
                    clock_gettime(CLOCK_MONOTONIC, &run.started_at) == 0;
     run.last_redraw = run.started_at;
     for (size_t index = 0; index < run.count; index++)
