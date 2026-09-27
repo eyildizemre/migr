@@ -1,5 +1,7 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -g -I src -pthread
+# Each object records the headers it includes, so a changed header rebuilds it.
+DEPFLAGS = -MMD -MP
 
 # Test fixtures set HOME explicitly; a sudo-inherited caller UID must not
 # redirect them into the invoking user's real account.
@@ -68,6 +70,11 @@ STATIC_TARGET = migr-static
 VPATH = src
 SRCS = selection_match.c selection.c config.c main.c detect.c report.c backup.c backup_plan.c packages.c restore.c dconf_restore.c live_state.c utils.c selfcopy.c fileops.c fsprobe.c xdg.c manifest.c encoding.c portable_name.c container.c metadata.c metadata_xattr.c portable_hashset.c portable_prescan.c portable_fsops.c portable.c portable_reconcile.c portable_restore_replay.c portable_restore_shared.c portable_restore_orchestrate.c portable_restore_preflight.c sidecar.c sidecar_state.c sidecar_state_map.c hash.c verify.c repair.c source_snapshot.c
 OBJS = $(SRCS:.c=.o)
+# Every object but main.o, which tests link against.
+LIB_OBJS = $(filter-out main.o,$(OBJS))
+# LIB_OBJS with the named test-hook builds (x_test.o) in place of their
+# plain ones (x.o).
+with_hooks = $(1) $(filter-out $(patsubst %_test.o,%.o,$(1)),$(LIB_OBJS))
 STATIC_OBJS = $(SRCS:.c=_static.o)
 ANALYZER_SRCS = $(wildcard src/*.c)
 
@@ -77,29 +84,11 @@ $(TARGET): $(OBJS)
 $(STATIC_TARGET): $(STATIC_OBJS)
 	$(CC) $(CFLAGS) -static -o $(STATIC_TARGET) $(STATIC_OBJS)
 
-selection.o selection_static.o: src/selection.h src/config.h src/backup_plan.h
-backup_plan.o backup_plan_static.o backup_plan_test.o: src/selection.h
-
-selection_match.o selection_match_static.o fileops.o fileops_static.o fileops_test.o backup.o backup_static.o backup_test.o report.o report_test.o report_static.o portable.o portable_static.o portable_test.o portable_prescan.o portable_prescan_static.o portable_prescan_test.o: src/selection.h
-portable.o portable_static.o portable_test.o: src/portable_name.h
-portable_prescan.o portable_prescan_static.o portable_prescan_test.o: src/portable_name.h
-backup.o backup_static.o backup_test.o fileops.o fileops_static.o fileops_test.o portable.o portable_static.o portable_test.o portable_fsops.o portable_fsops_static.o portable_prescan.o portable_prescan_static.o portable_prescan_test.o portable_reconcile.o portable_reconcile_static.o portable_reconcile_test.o portable_restore_preflight.o portable_restore_preflight_static.o portable_restore_replay.o portable_restore_replay_static.o portable_restore_replay_test.o portable_restore_shared.o portable_restore_shared_static.o restore.o restore_static.o restore_test.o: src/portable.h
-fileops.o fileops_static.o backup.o backup_static.o restore.o dconf_restore.o restore_static.o metadata.o metadata_static.o: src/fileops.h
-dconf_restore.o dconf_restore_static.o dconf_restore_test.o: src/dconf_restore.h src/utils.h
-live_state.o live_state_static.o: src/live_state.h
-portable.o portable_static.o portable_test.o portable_restore_replay.o portable_restore_replay_static.o portable_restore_replay_test.o: src/live_state.h
-restore.o restore_static.o restore_test.o: src/dconf_restore.h
-verify.o verify_static.o repair.o repair_static.o main.o main_static.o: src/verify.h
-source_snapshot.o source_snapshot_static.o backup.o backup_static.o backup_test.o: src/source_snapshot.h
-repair.o repair_static.o main.o main_static.o: src/repair.h
-
-config.o config_static.o: src/config.h src/fileops.h
-
 %.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 %_static.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 TEST_DETECT = tests/test_detect
 TEST_MANIFEST_SELECTION = tests/test_manifest_selection
@@ -158,247 +147,241 @@ TEST_PORTABLE_RESTORE_REPLAY = tests/test_portable_restore_replay
 TEST_PORTABLE_RESTORE_ORCHESTRATE = tests/test_portable_restore_orchestrate
 TEST_PORTABLE_RESTORE_INVARIANT = tests/test_portable_restore_invariant
 
-$(TEST_DETECT): tests/test_detect.c detect.o
-	$(CC) $(CFLAGS) -o $@ tests/test_detect.c detect.o
+$(TEST_DETECT): tests/test_detect.c $(LIB_OBJS)
+	$(CC) $(CFLAGS) -o $@ $(filter %.c %.o,$^)
 
-report_test.o: src/report.c src/report.h src/backup_plan.h src/detect.h src/fileops.h src/utils.h
-	$(CC) $(CFLAGS) -c src/report.c -o $@
+report_test.o: src/report.c
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c src/report.c -o $@
 
-$(TEST_MANIFEST_SELECTION): tests/test_manifest_selection.c $(filter-out main.o,$(OBJS))
-	$(CC) $(CFLAGS) -o $@ tests/test_manifest_selection.c $(filter-out main.o,$(OBJS))
+$(TEST_MANIFEST_SELECTION): tests/test_manifest_selection.c $(LIB_OBJS)
+	$(CC) $(CFLAGS) -o $@ $(filter %.c %.o,$^)
 
-$(TEST_NATIVE_SELECTION): tests/test_native_selection.c fileops_test.o $(filter-out main.o fileops.o,$(OBJS))
-	$(CC) $(CFLAGS) -DBACKUP_TEST_HOOKS -o $@ tests/test_native_selection.c fileops_test.o $(filter-out main.o fileops.o,$(OBJS))
+$(TEST_NATIVE_SELECTION): tests/test_native_selection.c $(call with_hooks,fileops_test.o)
+	$(CC) $(CFLAGS) -DBACKUP_TEST_HOOKS -o $@ $(filter %.c %.o,$^)
 
-$(TEST_PORTABLE_SELECTION): tests/test_portable_selection.c $(filter-out main.o,$(OBJS))
-	$(CC) $(CFLAGS) -o $@ tests/test_portable_selection.c $(filter-out main.o,$(OBJS))
+$(TEST_PORTABLE_SELECTION): tests/test_portable_selection.c $(LIB_OBJS)
+	$(CC) $(CFLAGS) -o $@ $(filter %.c %.o,$^)
 
-$(TEST_SELECTION): tests/test_selection.c src/selection.h $(filter-out main.o,$(OBJS))
-	$(CC) $(CFLAGS) -o $@ tests/test_selection.c $(filter-out main.o,$(OBJS))
+$(TEST_SELECTION): tests/test_selection.c $(LIB_OBJS) src/selection.h
+	$(CC) $(CFLAGS) -o $@ $(filter %.c %.o,$^)
 
-$(TEST_CONFIG): tests/test_config.c src/config.h config.o $(filter-out main.o config.o,$(OBJS))
-	$(CC) $(CFLAGS) -Wl,--wrap=read -Wl,--wrap=waitpid -o $@ tests/test_config.c config.o $(filter-out main.o config.o,$(OBJS))
+$(TEST_CONFIG): tests/test_config.c $(LIB_OBJS) src/config.h
+	$(CC) $(CFLAGS) -Wl,--wrap=read -Wl,--wrap=waitpid -o $@ $(filter %.c %.o,$^)
 
-$(TEST_REPORT): tests/test_report.c report_test.o $(filter-out main.o report.o,$(OBJS))
-	$(CC) $(CFLAGS) -Wl,--wrap=readdir -o $@ tests/test_report.c report_test.o $(filter-out main.o report.o,$(OBJS))
+$(TEST_REPORT): tests/test_report.c $(call with_hooks,report_test.o)
+	$(CC) $(CFLAGS) -Wl,--wrap=readdir -o $@ $(filter %.c %.o,$^)
 
-$(TEST_PATHJOIN): tests/test_pathjoin.c utils.o
-	$(CC) $(CFLAGS) -o $@ tests/test_pathjoin.c utils.o
+$(TEST_PATHJOIN): tests/test_pathjoin.c $(LIB_OBJS)
+	$(CC) $(CFLAGS) -o $@ $(filter %.c %.o,$^)
 
-$(TEST_FD_LIMIT): tests/test_fd_limit.c utils.o
-	$(CC) $(CFLAGS) -o $@ tests/test_fd_limit.c utils.o
+$(TEST_FD_LIMIT): tests/test_fd_limit.c $(LIB_OBJS)
+	$(CC) $(CFLAGS) -o $@ $(filter %.c %.o,$^)
 
-utils_test.o: src/utils.c src/utils.h
-	$(CC) $(CFLAGS) -DUSER_CONTEXT_TEST_HOOKS -c src/utils.c -o $@
+utils_test.o: src/utils.c
+	$(CC) $(CFLAGS) $(DEPFLAGS) -DUSER_CONTEXT_TEST_HOOKS -c src/utils.c -o $@
 
-$(TEST_CONFIRM): tests/test_confirm.c utils_test.o
-	$(CC) $(CFLAGS) -DUSER_CONTEXT_TEST_HOOKS -o $@ tests/test_confirm.c utils_test.o
+$(TEST_CONFIRM): tests/test_confirm.c $(call with_hooks,utils_test.o)
+	$(CC) $(CFLAGS) -DUSER_CONTEXT_TEST_HOOKS -o $@ $(filter %.c %.o,$^)
 
-packages_test.o: src/packages.c src/packages.h
-	$(CC) $(CFLAGS) -DPACKAGES_TEST_HOOKS -c src/packages.c -o $@
+packages_test.o: src/packages.c
+	$(CC) $(CFLAGS) $(DEPFLAGS) -DPACKAGES_TEST_HOOKS -c src/packages.c -o $@
 
-$(TEST_PACKAGES): tests/test_packages.c packages_test.o fileops.o detect.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o utils.o selection_match.o selection.o backup_plan.o xdg.o
-	$(CC) $(CFLAGS) -DPACKAGES_TEST_HOOKS -Wl,--wrap=malloc -o $@ tests/test_packages.c packages_test.o fileops.o detect.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o utils.o selection_match.o selection.o backup_plan.o xdg.o
+$(TEST_PACKAGES): tests/test_packages.c $(call with_hooks,packages_test.o)
+	$(CC) $(CFLAGS) -DPACKAGES_TEST_HOOKS -Wl,--wrap=malloc -o $@ $(filter %.c %.o,$^)
 
-$(TEST_XDG): tests/test_xdg.c xdg.o utils.o
-	$(CC) $(CFLAGS) -o $@ tests/test_xdg.c xdg.o utils.o
+$(TEST_XDG): tests/test_xdg.c $(LIB_OBJS)
+	$(CC) $(CFLAGS) -o $@ $(filter %.c %.o,$^)
 
-$(TEST_GET_DIR_SIZE): tests/test_get_dir_size.c fileops.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o utils.o selection_match.o selection.o backup_plan.o xdg.o
-	$(CC) $(CFLAGS) -o $@ tests/test_get_dir_size.c fileops.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o utils.o selection_match.o selection.o backup_plan.o xdg.o
+$(TEST_GET_DIR_SIZE): tests/test_get_dir_size.c $(LIB_OBJS)
+	$(CC) $(CFLAGS) -o $@ $(filter %.c %.o,$^)
 
-$(TEST_PORTABLE_HASHSET): tests/test_portable_hashset.c fileops.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o utils.o selection_match.o selection.o backup_plan.o xdg.o
-	$(CC) $(CFLAGS) -o $@ tests/test_portable_hashset.c fileops.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o utils.o selection_match.o selection.o backup_plan.o xdg.o
+$(TEST_PORTABLE_HASHSET): tests/test_portable_hashset.c $(LIB_OBJS)
+	$(CC) $(CFLAGS) -o $@ $(filter %.c %.o,$^)
 
-$(TEST_RUN_COMMAND): tests/test_run_command.c fileops.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o utils.o selection_match.o selection.o backup_plan.o xdg.o
-	$(CC) $(CFLAGS) -Wl,--wrap=read -o $@ tests/test_run_command.c fileops.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o utils.o selection_match.o selection.o backup_plan.o xdg.o
+$(TEST_RUN_COMMAND): tests/test_run_command.c $(LIB_OBJS)
+	$(CC) $(CFLAGS) -Wl,--wrap=read -o $@ $(filter %.c %.o,$^)
 
-$(TEST_SPECIAL_FILES): tests/test_special_files.c fileops_test.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o utils.o selection_match.o selection.o backup_plan.o xdg.o
-	$(CC) $(CFLAGS) -DFILEOPS_TEST_HOOKS -DBACKUP_TEST_HOOKS -Wl,--wrap=readlink -o $@ tests/test_special_files.c fileops_test.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o utils.o selection_match.o selection.o backup_plan.o xdg.o
+$(TEST_SPECIAL_FILES): tests/test_special_files.c $(call with_hooks,fileops_test.o)
+	$(CC) $(CFLAGS) -DFILEOPS_TEST_HOOKS -DBACKUP_TEST_HOOKS -Wl,--wrap=readlink -o $@ $(filter %.c %.o,$^)
 
-$(TEST_FSPROBE): tests/test_fsprobe.c fsprobe.o utils.o
-	$(CC) $(CFLAGS) -o $@ tests/test_fsprobe.c fsprobe.o utils.o
+$(TEST_FSPROBE): tests/test_fsprobe.c $(LIB_OBJS)
+	$(CC) $(CFLAGS) -o $@ $(filter %.c %.o,$^)
 
-$(TEST_MANIFEST): tests/test_manifest.c manifest.o encoding.o utils.o
-	$(CC) $(CFLAGS) -Wl,--wrap=strdup -o $@ tests/test_manifest.c manifest.o encoding.o utils.o
+$(TEST_MANIFEST): tests/test_manifest.c $(LIB_OBJS)
+	$(CC) $(CFLAGS) -Wl,--wrap=strdup -o $@ $(filter %.c %.o,$^)
 
-$(TEST_ENCODING): tests/test_encoding.c encoding.o
-	$(CC) $(CFLAGS) -o $@ tests/test_encoding.c encoding.o
+$(TEST_ENCODING): tests/test_encoding.c $(LIB_OBJS)
+	$(CC) $(CFLAGS) -o $@ $(filter %.c %.o,$^)
 
-portable_name.o portable_name_static.o portable_name_test.o: src/portable_name.h src/encoding.h src/hash.h src/sidecar.h
-portable_restore_shared.o portable_restore_shared_static.o: src/portable_restore_internal.h src/portable_name.h
+portable_name_test.o: src/portable_name.c
+	$(CC) $(CFLAGS) $(DEPFLAGS) -DPORTABLE_NAME_TEST_HOOKS -c src/portable_name.c -o $@
 
-portable_name_test.o: src/portable_name.c src/portable_name.h src/encoding.h src/hash.h src/sidecar.h
-	$(CC) $(CFLAGS) -DPORTABLE_NAME_TEST_HOOKS -c src/portable_name.c -o $@
+portable_restore_shared_test.o: src/portable_restore_shared.c
+	$(CC) $(CFLAGS) $(DEPFLAGS) -DPORTABLE_RESTORE_ADDRESS_TEST_HOOKS -DPORTABLE_NAME_TEST_HOOKS -c src/portable_restore_shared.c -o $@
 
-portable_restore_shared_test.o: src/portable_restore_shared.c src/portable_restore_internal.h src/portable_name.h
-	$(CC) $(CFLAGS) -DPORTABLE_RESTORE_ADDRESS_TEST_HOOKS -DPORTABLE_NAME_TEST_HOOKS -c src/portable_restore_shared.c -o $@
+$(TEST_PORTABLE_NAME): tests/test_portable_name.c $(call with_hooks,portable_name_test.o)
+	$(CC) $(CFLAGS) -DPORTABLE_NAME_TEST_HOOKS -o $@ $(filter %.c %.o,$^)
 
-$(TEST_PORTABLE_NAME): tests/test_portable_name.c portable_name_test.o encoding.o hash.o
-	$(CC) $(CFLAGS) -DPORTABLE_NAME_TEST_HOOKS -o $@ tests/test_portable_name.c portable_name_test.o encoding.o hash.o
+container_test.o: src/container.c
+	$(CC) $(CFLAGS) $(DEPFLAGS) -DCONTAINER_TEST_HOOKS -c src/container.c -o $@
 
-container_test.o: src/container.c src/container.h
-	$(CC) $(CFLAGS) -DCONTAINER_TEST_HOOKS -c src/container.c -o $@
+$(TEST_CONTAINER): tests/test_container.c $(call with_hooks,container_test.o)
+	$(CC) $(CFLAGS) -DCONTAINER_TEST_HOOKS -o $@ $(filter %.c %.o,$^)
 
-$(TEST_CONTAINER): tests/test_container.c container_test.o manifest.o encoding.o utils.o
-	$(CC) $(CFLAGS) -DCONTAINER_TEST_HOOKS -o $@ tests/test_container.c container_test.o manifest.o encoding.o utils.o
+$(TEST_SELFCOPY): tests/test_selfcopy.c $(LIB_OBJS) $(TARGET)
+	$(CC) $(CFLAGS) -o $@ $(filter %.c %.o,$^)
 
-$(TEST_SELFCOPY): tests/test_selfcopy.c selfcopy.o utils.o $(TARGET)
-	$(CC) $(CFLAGS) -o $@ tests/test_selfcopy.c selfcopy.o utils.o
+$(TEST_RESTORE_NATIVE): tests/test_restore_native.c $(LIB_OBJS)
+	$(CC) $(CFLAGS) -o $@ $(filter %.c %.o,$^)
 
-$(TEST_RESTORE_NATIVE): tests/test_restore_native.c fileops.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o utils.o selection_match.o selection.o backup_plan.o xdg.o
-	$(CC) $(CFLAGS) -o $@ tests/test_restore_native.c fileops.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o utils.o selection_match.o selection.o backup_plan.o xdg.o
+$(TEST_RESTORE_SYNC): tests/test_restore_sync.c $(LIB_OBJS)
+	$(CC) $(CFLAGS) -Wl,--wrap=syncfs -o $@ $(filter %.c %.o,$^)
 
-$(TEST_RESTORE_SYNC): tests/test_restore_sync.c fileops.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o utils.o selection_match.o selection.o backup_plan.o xdg.o
-	$(CC) $(CFLAGS) -Wl,--wrap=syncfs -o $@ tests/test_restore_sync.c fileops.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o utils.o selection_match.o selection.o backup_plan.o xdg.o
+fileops_test.o: src/fileops.c
+	$(CC) $(CFLAGS) $(DEPFLAGS) -DFILEOPS_TEST_HOOKS -DBACKUP_TEST_HOOKS -DNATIVE_VISITED_TEST_HOOKS -c src/fileops.c -o $@
 
-fileops_test.o: src/fileops.c src/fileops.h src/metadata.h src/portable.h
-	$(CC) $(CFLAGS) -DFILEOPS_TEST_HOOKS -DBACKUP_TEST_HOOKS -DNATIVE_VISITED_TEST_HOOKS -c src/fileops.c -o $@
+$(TEST_RESTORE_SOURCE_READ): tests/test_restore_source_read.c $(call with_hooks,fileops_test.o)
+	$(CC) $(CFLAGS) -DFILEOPS_TEST_HOOKS -o $@ $(filter %.c %.o,$^)
 
-$(TEST_RESTORE_SOURCE_READ): tests/test_restore_source_read.c fileops_test.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o utils.o selection_match.o selection.o backup_plan.o xdg.o
-	$(CC) $(CFLAGS) -DFILEOPS_TEST_HOOKS -o $@ tests/test_restore_source_read.c fileops_test.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o utils.o selection_match.o selection.o backup_plan.o xdg.o
+backup_test.o: src/backup.c
+	$(CC) $(CFLAGS) $(DEPFLAGS) -DBACKUP_TEST_HOOKS -c src/backup.c -o $@
 
-backup_test.o: src/backup.c src/backup.h src/backup_plan.h src/fileops.h src/metadata.h
-	$(CC) $(CFLAGS) -DBACKUP_TEST_HOOKS -c src/backup.c -o $@
+restore_test.o: src/restore.c
+	$(CC) $(CFLAGS) $(DEPFLAGS) -DRESTORE_TEST_HOOKS -c src/restore.c -o $@
 
-restore_test.o: src/restore.c src/restore.h src/backup.h src/container.h src/detect.h src/fileops.h src/fsprobe.h src/manifest.h src/metadata.h src/packages.h src/portable.h src/portable_restore.h src/utils.h src/xdg.h
-	$(CC) $(CFLAGS) -DRESTORE_TEST_HOOKS -c src/restore.c -o $@
+backup_plan_test.o: src/backup_plan.c
+	$(CC) $(CFLAGS) $(DEPFLAGS) -DBACKUP_PLAN_TEST_HOOKS -c src/backup_plan.c -o $@
 
-backup_plan_test.o: src/backup_plan.c src/backup_plan.h src/hash.h src/utils.h src/xdg.h
-	$(CC) $(CFLAGS) -DBACKUP_PLAN_TEST_HOOKS -c src/backup_plan.c -o $@
+$(TEST_BACKUP_SOURCE_READ): tests/test_backup_source_read.c $(call with_hooks,backup_test.o fileops_test.o)
+	$(CC) $(CFLAGS) -DBACKUP_TEST_HOOKS -o $@ $(filter %.c %.o,$^)
 
-$(TEST_BACKUP_SOURCE_READ): tests/test_backup_source_read.c backup_test.o source_snapshot.o selfcopy.o backup_plan.o selection.o container.o fileops_test.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o fsprobe.o manifest.o encoding.o packages.o utils.o xdg.o detect.o selection_match.o
-	$(CC) $(CFLAGS) -DBACKUP_TEST_HOOKS -o $@ tests/test_backup_source_read.c backup_test.o source_snapshot.o selfcopy.o backup_plan.o selection.o container.o fileops_test.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o fsprobe.o manifest.o encoding.o packages.o utils.o xdg.o detect.o selection_match.o
+dconf_restore_test.o: src/dconf_restore.c
+	$(CC) $(CFLAGS) $(DEPFLAGS) -DDCONF_RESTORE_TEST_HOOKS -c src/dconf_restore.c -o $@
 
-dconf_restore_test.o: src/dconf_restore.c src/dconf_restore.h src/fileops.h src/utils.h
-	$(CC) $(CFLAGS) -DDCONF_RESTORE_TEST_HOOKS -c src/dconf_restore.c -o $@
-
-$(TEST_LIVE_STATE): tests/test_live_state.c live_state.o
-	$(CC) $(CFLAGS) -o $@ tests/test_live_state.c live_state.o
+$(TEST_LIVE_STATE): tests/test_live_state.c $(LIB_OBJS)
+	$(CC) $(CFLAGS) -o $@ $(filter %.c %.o,$^)
 
 # The CLI without the root requirement for backup and restore (D62), so the
 # integration suite can drive both commands as an ordinary user.
-main_unprivileged.o: main.c src/verify.h src/repair.h
-	$(CC) $(CFLAGS) -DMIGR_ALLOW_UNPRIVILEGED -c src/main.c -o $@
+main_unprivileged.o: main.c
+	$(CC) $(CFLAGS) $(DEPFLAGS) -DMIGR_ALLOW_UNPRIVILEGED -c src/main.c -o $@
 
-$(TEST_MIGR_UNPRIVILEGED): main_unprivileged.o $(filter-out main.o,$(OBJS))
-	$(CC) $(CFLAGS) -o $@ main_unprivileged.o $(filter-out main.o,$(OBJS))
+$(TEST_MIGR_UNPRIVILEGED): main_unprivileged.o $(LIB_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^
 
-$(TEST_VERIFY): tests/test_verify.c verify.o portable_restore_shared.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o fileops.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o metadata.o metadata_xattr.o utils.o selection_match.o selection.o backup_plan.o xdg.o container.o fsprobe.o
-	$(CC) $(CFLAGS) -o $@ tests/test_verify.c verify.o portable_restore_shared.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o fileops.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o metadata.o metadata_xattr.o utils.o selection_match.o selection.o backup_plan.o xdg.o container.o fsprobe.o
+$(TEST_VERIFY): tests/test_verify.c $(LIB_OBJS)
+	$(CC) $(CFLAGS) -o $@ $(filter %.c %.o,$^)
 
-$(TEST_REPAIR): tests/test_repair.c repair.o verify.o portable_restore_shared.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o fileops.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o metadata.o metadata_xattr.o utils.o selection_match.o selection.o backup_plan.o xdg.o container.o fsprobe.o
-	$(CC) $(CFLAGS) -o $@ tests/test_repair.c repair.o verify.o portable_restore_shared.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o fileops.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o metadata.o metadata_xattr.o utils.o selection_match.o selection.o backup_plan.o xdg.o container.o fsprobe.o
+$(TEST_REPAIR): tests/test_repair.c $(LIB_OBJS)
+	$(CC) $(CFLAGS) -o $@ $(filter %.c %.o,$^)
 
-$(TEST_SOURCE_SNAPSHOT): tests/test_source_snapshot.c source_snapshot.o utils.o
-	$(CC) $(CFLAGS) -o $@ tests/test_source_snapshot.c source_snapshot.o utils.o
+$(TEST_SOURCE_SNAPSHOT): tests/test_source_snapshot.c $(LIB_OBJS)
+	$(CC) $(CFLAGS) -o $@ $(filter %.c %.o,$^)
 
-$(TEST_DCONF_RESTORE): tests/test_dconf_restore.c dconf_restore_test.o fileops.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o utils.o selection_match.o selection.o backup_plan.o xdg.o
-	$(CC) $(CFLAGS) -DDCONF_RESTORE_TEST_HOOKS -o $@ tests/test_dconf_restore.c dconf_restore_test.o fileops.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o utils.o selection_match.o selection.o backup_plan.o xdg.o
+$(TEST_DCONF_RESTORE): tests/test_dconf_restore.c $(call with_hooks,dconf_restore_test.o)
+	$(CC) $(CFLAGS) -DDCONF_RESTORE_TEST_HOOKS -o $@ $(filter %.c %.o,$^)
 
-$(TEST_VSCODE_CAPTURE): tests/test_vscode_capture.c backup_test.o source_snapshot.o selfcopy.o backup_plan.o selection.o container.o fileops_test.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o fsprobe.o manifest.o encoding.o packages.o utils.o xdg.o detect.o selection_match.o
-	$(CC) $(CFLAGS) -DBACKUP_TEST_HOOKS -DFILEOPS_TEST_HOOKS -o $@ tests/test_vscode_capture.c backup_test.o source_snapshot.o selfcopy.o backup_plan.o selection.o container.o fileops_test.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o fsprobe.o manifest.o encoding.o packages.o utils.o xdg.o detect.o selection_match.o
+$(TEST_VSCODE_CAPTURE): tests/test_vscode_capture.c $(call with_hooks,backup_test.o fileops_test.o)
+	$(CC) $(CFLAGS) -DBACKUP_TEST_HOOKS -DFILEOPS_TEST_HOOKS -o $@ $(filter %.c %.o,$^)
 
-$(TEST_BACKUP_SYNC): tests/test_backup_sync.c fileops_test.o portable_test.o portable_reconcile_test.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o metadata.o metadata_xattr.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o utils.o selection_match.o selection.o backup_plan.o xdg.o
-	$(CC) $(CFLAGS) -DBACKUP_TEST_HOOKS -Wl,--wrap=syncfs -Wl,--wrap=read -o $@ tests/test_backup_sync.c fileops_test.o portable_test.o portable_reconcile_test.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o metadata.o metadata_xattr.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o utils.o selection_match.o selection.o backup_plan.o xdg.o
+$(TEST_BACKUP_SYNC): tests/test_backup_sync.c $(call with_hooks,fileops_test.o portable_test.o portable_reconcile_test.o)
+	$(CC) $(CFLAGS) -DBACKUP_TEST_HOOKS -Wl,--wrap=syncfs -Wl,--wrap=read -o $@ $(filter %.c %.o,$^)
 
-$(TEST_RESTORE_DISPATCH): tests/test_restore_dispatch.c restore_test.o dconf_restore.o portable_restore_replay_test.o portable_restore_preflight.o portable_restore_orchestrate.o portable_restore_shared.o fileops.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o fsprobe.o manifest.o encoding.o container.o utils.o xdg.o detect.o backup_test.o source_snapshot.o selfcopy.o backup_plan.o selection.o packages_test.o selection_match.o
-	$(CC) $(CFLAGS) -DBACKUP_TEST_HOOKS -DRESTORE_TEST_HOOKS -DPACKAGES_TEST_HOOKS -DPORTABLE_RESTORE_REPLAY_TEST_HOOKS -o $@ tests/test_restore_dispatch.c restore_test.o dconf_restore.o portable_restore_replay_test.o portable_restore_preflight.o portable_restore_orchestrate.o portable_restore_shared.o fileops.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o fsprobe.o manifest.o encoding.o container.o utils.o xdg.o detect.o backup_test.o source_snapshot.o selfcopy.o backup_plan.o selection.o packages_test.o selection_match.o
+$(TEST_RESTORE_DISPATCH): tests/test_restore_dispatch.c $(call with_hooks,restore_test.o portable_restore_replay_test.o backup_test.o packages_test.o)
+	$(CC) $(CFLAGS) -DBACKUP_TEST_HOOKS -DRESTORE_TEST_HOOKS -DPACKAGES_TEST_HOOKS -DPORTABLE_RESTORE_REPLAY_TEST_HOOKS -o $@ $(filter %.c %.o,$^)
 
-$(TEST_RESTORE_ATIME): tests/test_restore_atime.c restore.o dconf_restore.o portable_restore_replay.o portable_restore_preflight.o portable_restore_orchestrate.o portable_restore_shared.o fileops.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o fsprobe.o manifest.o encoding.o container.o utils.o xdg.o detect.o backup.o source_snapshot.o selfcopy.o backup_plan.o selection.o packages.o selection_match.o
-	$(CC) $(CFLAGS) -o $@ tests/test_restore_atime.c restore.o dconf_restore.o portable_restore_replay.o portable_restore_preflight.o portable_restore_orchestrate.o portable_restore_shared.o fileops.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o fsprobe.o manifest.o encoding.o container.o utils.o xdg.o detect.o backup.o source_snapshot.o selfcopy.o backup_plan.o selection.o packages.o selection_match.o
+$(TEST_RESTORE_ATIME): tests/test_restore_atime.c $(LIB_OBJS)
+	$(CC) $(CFLAGS) -o $@ $(filter %.c %.o,$^)
 
-$(TEST_BACKUP_PLAN): tests/test_backup_plan.c backup_test.o source_snapshot.o selfcopy.o backup_plan_test.o selection.o container.o fileops_test.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o fsprobe.o manifest.o encoding.o packages.o utils.o xdg.o detect.o selection_match.o
-	$(CC) $(CFLAGS) -DBACKUP_TEST_HOOKS -DBACKUP_PLAN_TEST_HOOKS -o $@ tests/test_backup_plan.c backup_test.o source_snapshot.o selfcopy.o backup_plan_test.o selection.o container.o fileops_test.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o fsprobe.o manifest.o encoding.o packages.o utils.o xdg.o detect.o selection_match.o
+$(TEST_BACKUP_PLAN): tests/test_backup_plan.c $(call with_hooks,backup_test.o backup_plan_test.o fileops_test.o)
+	$(CC) $(CFLAGS) -DBACKUP_TEST_HOOKS -DBACKUP_PLAN_TEST_HOOKS -o $@ $(filter %.c %.o,$^)
 
-$(TEST_METADATA_CONTRACT): tests/test_metadata_contract.c fileops.o metadata.o metadata_xattr_test.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o utils.o selection_match.o selection.o backup_plan.o xdg.o
-	$(CC) $(CFLAGS) -DMETADATA_XATTR_TEST_HOOKS -o $@ tests/test_metadata_contract.c fileops.o metadata.o metadata_xattr_test.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o utils.o selection_match.o selection.o backup_plan.o xdg.o
+$(TEST_METADATA_CONTRACT): tests/test_metadata_contract.c $(call with_hooks,metadata_xattr_test.o)
+	$(CC) $(CFLAGS) -DMETADATA_XATTR_TEST_HOOKS -o $@ $(filter %.c %.o,$^)
 
-$(TEST_METADATA_SNAPSHOTS): tests/test_metadata_snapshots.c fileops.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o utils.o selection_match.o selection.o backup_plan.o xdg.o
-	$(CC) $(CFLAGS) -o $@ tests/test_metadata_snapshots.c fileops.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o utils.o selection_match.o selection.o backup_plan.o xdg.o
+$(TEST_METADATA_SNAPSHOTS): tests/test_metadata_snapshots.c $(LIB_OBJS)
+	$(CC) $(CFLAGS) -o $@ $(filter %.c %.o,$^)
 
-$(TEST_SIDECAR): tests/test_sidecar.c sidecar.o
-	$(CC) $(CFLAGS) -o $@ tests/test_sidecar.c sidecar.o
+$(TEST_SIDECAR): tests/test_sidecar.c $(LIB_OBJS)
+	$(CC) $(CFLAGS) -o $@ $(filter %.c %.o,$^)
 
-$(TEST_SIDECAR_STATE): tests/test_sidecar_state.c sidecar_test.o sidecar_state.o sidecar_state_map.o hash.o
-	$(CC) $(CFLAGS) -DSIDECAR_TEST_HOOKS -o $@ tests/test_sidecar_state.c sidecar_test.o sidecar_state.o sidecar_state_map.o hash.o
+$(TEST_SIDECAR_STATE): tests/test_sidecar_state.c $(call with_hooks,sidecar_test.o)
+	$(CC) $(CFLAGS) -DSIDECAR_TEST_HOOKS -o $@ $(filter %.c %.o,$^)
 
-sidecar_state_test.o: src/sidecar_state.c src/sidecar.h src/sidecar_state_internal.h
-	$(CC) $(CFLAGS) -DSIDECAR_STATE_TEST_HOOKS -c src/sidecar_state.c -o $@
+sidecar_state_test.o: src/sidecar_state.c
+	$(CC) $(CFLAGS) $(DEPFLAGS) -DSIDECAR_STATE_TEST_HOOKS -c src/sidecar_state.c -o $@
 
-sidecar_state_map_test.o: src/sidecar_state_map.c src/sidecar_state_internal.h src/sidecar.h
-	$(CC) $(CFLAGS) -DSIDECAR_STATE_TEST_HOOKS -c src/sidecar_state_map.c -o $@
+sidecar_state_map_test.o: src/sidecar_state_map.c
+	$(CC) $(CFLAGS) $(DEPFLAGS) -DSIDECAR_STATE_TEST_HOOKS -c src/sidecar_state_map.c -o $@
 
-$(TEST_SIDECAR_SCALE): tests/test_sidecar_scale.c sidecar.o sidecar_state_test.o sidecar_state_map_test.o hash.o
-	$(CC) $(CFLAGS) -o $@ tests/test_sidecar_scale.c sidecar.o sidecar_state_test.o sidecar_state_map_test.o hash.o
+$(TEST_SIDECAR_SCALE): tests/test_sidecar_scale.c $(call with_hooks,sidecar_state_test.o sidecar_state_map_test.o)
+	$(CC) $(CFLAGS) -o $@ $(filter %.c %.o,$^)
 
-$(TEST_PORTABLE_CAPTURE): tests/test_portable_capture.c portable.o portable_reconcile.o portable_fsops.o portable_prescan_test.o portable_name_test.o portable_hashset.o fileops.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o metadata.o metadata_xattr.o utils.o selection_match.o selection.o backup_plan.o xdg.o
-	$(CC) $(CFLAGS) -DPORTABLE_PRESCAN_TEST_HOOKS -DPORTABLE_NAME_TEST_HOOKS -o $@ tests/test_portable_capture.c portable.o portable_reconcile.o portable_fsops.o portable_prescan_test.o portable_name_test.o portable_hashset.o fileops.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o metadata.o metadata_xattr.o utils.o selection_match.o selection.o backup_plan.o xdg.o
+$(TEST_PORTABLE_CAPTURE): tests/test_portable_capture.c $(call with_hooks,portable_prescan_test.o portable_name_test.o)
+	$(CC) $(CFLAGS) -DPORTABLE_PRESCAN_TEST_HOOKS -DPORTABLE_NAME_TEST_HOOKS -o $@ $(filter %.c %.o,$^)
 
-portable_test.o: src/portable.c src/portable.h src/sidecar.h src/portable_reconcile_internal.h src/portable_hashset_internal.h src/portable_prescan_internal.h src/portable_fsops_internal.h
-	$(CC) $(CFLAGS) -DPORTABLE_CAPTURE_TEST_HOOKS -c src/portable.c -o $@
+portable_test.o: src/portable.c
+	$(CC) $(CFLAGS) $(DEPFLAGS) -DPORTABLE_CAPTURE_TEST_HOOKS -c src/portable.c -o $@
 
-portable_reconcile_test.o: src/portable_reconcile.c src/portable.h src/sidecar.h src/portable_reconcile_internal.h src/portable_hashset_internal.h src/portable_fsops_internal.h src/utils.h
-	$(CC) $(CFLAGS) -DPORTABLE_CAPTURE_TEST_HOOKS -c src/portable_reconcile.c -o $@
+portable_reconcile_test.o: src/portable_reconcile.c
+	$(CC) $(CFLAGS) $(DEPFLAGS) -DPORTABLE_CAPTURE_TEST_HOOKS -c src/portable_reconcile.c -o $@
 
-portable_prescan_test.o: src/portable_prescan.c src/portable.h src/sidecar.h src/portable_prescan_internal.h src/portable_hashset_internal.h src/portable_fsops_internal.h src/encoding.h src/portable_name.h src/utils.h
-	$(CC) $(CFLAGS) -DPORTABLE_PRESCAN_TEST_HOOKS -DPORTABLE_NAME_TEST_HOOKS -c src/portable_prescan.c -o $@
+portable_prescan_test.o: src/portable_prescan.c
+	$(CC) $(CFLAGS) $(DEPFLAGS) -DPORTABLE_PRESCAN_TEST_HOOKS -DPORTABLE_NAME_TEST_HOOKS -c src/portable_prescan.c -o $@
 
-$(TEST_PORTABLE_CAPTURE_SCALE): tests/test_portable_capture_scale.c portable_test.o portable_reconcile_test.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o fileops.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o metadata.o metadata_xattr.o utils.o selection_match.o selection.o backup_plan.o xdg.o
-	$(CC) $(CFLAGS) -o $@ tests/test_portable_capture_scale.c portable_test.o portable_reconcile_test.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o fileops.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o metadata.o metadata_xattr.o utils.o selection_match.o selection.o backup_plan.o xdg.o
+$(TEST_PORTABLE_CAPTURE_SCALE): tests/test_portable_capture_scale.c $(call with_hooks,portable_test.o portable_reconcile_test.o)
+	$(CC) $(CFLAGS) -o $@ $(filter %.c %.o,$^)
 
-$(TEST_PORTABLE_PREPARE): tests/test_portable_prepare.c portable_test.o portable_reconcile_test.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o fileops.o sidecar_test.o sidecar_state_test.o sidecar_state_map_test.o hash.o live_state.o manifest.o encoding.o metadata.o metadata_xattr.o utils.o selection_match.o selection.o backup_plan.o xdg.o
-	$(CC) $(CFLAGS) -DPORTABLE_CAPTURE_TEST_HOOKS -DSIDECAR_TEST_HOOKS -o $@ tests/test_portable_prepare.c portable_test.o portable_reconcile_test.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o fileops.o sidecar_test.o sidecar_state_test.o sidecar_state_map_test.o hash.o live_state.o manifest.o encoding.o metadata.o metadata_xattr.o utils.o selection_match.o selection.o backup_plan.o xdg.o
+$(TEST_PORTABLE_PREPARE): tests/test_portable_prepare.c $(call with_hooks,portable_test.o portable_reconcile_test.o sidecar_test.o sidecar_state_test.o sidecar_state_map_test.o)
+	$(CC) $(CFLAGS) -DPORTABLE_CAPTURE_TEST_HOOKS -DSIDECAR_TEST_HOOKS -o $@ $(filter %.c %.o,$^)
 
-$(TEST_NATIVE_RECONCILE_SCALE): tests/test_native_reconcile_scale.c fileops_test.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o utils.o selection_match.o selection.o backup_plan.o xdg.o
-	$(CC) $(CFLAGS) -DNATIVE_VISITED_TEST_HOOKS -o $@ tests/test_native_reconcile_scale.c fileops_test.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o utils.o selection_match.o selection.o backup_plan.o xdg.o
+$(TEST_NATIVE_RECONCILE_SCALE): tests/test_native_reconcile_scale.c $(call with_hooks,fileops_test.o)
+	$(CC) $(CFLAGS) -DNATIVE_VISITED_TEST_HOOKS -o $@ $(filter %.c %.o,$^)
 
-$(TEST_NATIVE_HARDLINK_SCALE): tests/test_native_hardlink_scale.c fileops_test.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o utils.o selection_match.o selection.o backup_plan.o xdg.o
-	$(CC) $(CFLAGS) -DNATIVE_VISITED_TEST_HOOKS -o $@ tests/test_native_hardlink_scale.c fileops_test.o metadata.o metadata_xattr.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o utils.o selection_match.o selection.o backup_plan.o xdg.o
+$(TEST_NATIVE_HARDLINK_SCALE): tests/test_native_hardlink_scale.c $(call with_hooks,fileops_test.o)
+	$(CC) $(CFLAGS) -DNATIVE_VISITED_TEST_HOOKS -o $@ $(filter %.c %.o,$^)
 
-$(TEST_PORTABLE_COLLISION_SCALE): tests/test_portable_collision_scale.c portable_test.o portable_reconcile_test.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o fileops.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o metadata.o metadata_xattr.o utils.o selection_match.o selection.o backup_plan.o xdg.o
-	$(CC) $(CFLAGS) -DPORTABLE_CAPTURE_TEST_HOOKS -o $@ tests/test_portable_collision_scale.c portable_test.o portable_reconcile_test.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o fileops.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o metadata.o metadata_xattr.o utils.o selection_match.o selection.o backup_plan.o xdg.o
+$(TEST_PORTABLE_COLLISION_SCALE): tests/test_portable_collision_scale.c $(call with_hooks,portable_test.o portable_reconcile_test.o)
+	$(CC) $(CFLAGS) -DPORTABLE_CAPTURE_TEST_HOOKS -o $@ $(filter %.c %.o,$^)
 
-$(TEST_PORTABLE_HARDLINK_SCALE): tests/test_portable_hardlink_scale.c portable_test.o portable_reconcile_test.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o fileops.o sidecar.o sidecar_state_test.o sidecar_state_map_test.o hash.o live_state.o manifest.o encoding.o metadata.o metadata_xattr.o utils.o selection_match.o selection.o backup_plan.o xdg.o
-	$(CC) $(CFLAGS) -DPORTABLE_CAPTURE_TEST_HOOKS -o $@ tests/test_portable_hardlink_scale.c portable_test.o portable_reconcile_test.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o fileops.o sidecar.o sidecar_state_test.o sidecar_state_map_test.o hash.o live_state.o manifest.o encoding.o metadata.o metadata_xattr.o utils.o selection_match.o selection.o backup_plan.o xdg.o
+$(TEST_PORTABLE_HARDLINK_SCALE): tests/test_portable_hardlink_scale.c $(call with_hooks,portable_test.o portable_reconcile_test.o sidecar_state_test.o sidecar_state_map_test.o)
+	$(CC) $(CFLAGS) -DPORTABLE_CAPTURE_TEST_HOOKS -o $@ $(filter %.c %.o,$^)
 
-sidecar_test.o: src/sidecar.c src/sidecar.h
-	$(CC) $(CFLAGS) -DSIDECAR_TEST_HOOKS -c src/sidecar.c -o $@
+sidecar_test.o: src/sidecar.c
+	$(CC) $(CFLAGS) $(DEPFLAGS) -DSIDECAR_TEST_HOOKS -c src/sidecar.c -o $@
 
-$(TEST_PORTABLE_RESUME): tests/test_portable_resume.c portable_test.o portable_reconcile_test.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o fileops.o sidecar_test.o sidecar_state_test.o sidecar_state_map_test.o hash.o live_state.o manifest.o encoding.o metadata.o metadata_xattr.o utils.o selection_match.o selection.o backup_plan.o xdg.o
-	$(CC) $(CFLAGS) -DPORTABLE_CAPTURE_TEST_HOOKS -DSIDECAR_TEST_HOOKS -o $@ tests/test_portable_resume.c portable_test.o portable_reconcile_test.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o fileops.o sidecar_test.o sidecar_state_test.o sidecar_state_map_test.o hash.o live_state.o manifest.o encoding.o metadata.o metadata_xattr.o utils.o selection_match.o selection.o backup_plan.o xdg.o
+$(TEST_PORTABLE_RESUME): tests/test_portable_resume.c $(call with_hooks,portable_test.o portable_reconcile_test.o sidecar_test.o sidecar_state_test.o sidecar_state_map_test.o)
+	$(CC) $(CFLAGS) -DPORTABLE_CAPTURE_TEST_HOOKS -DSIDECAR_TEST_HOOKS -o $@ $(filter %.c %.o,$^)
 
-$(TEST_PORTABLE_RECONCILE): tests/test_portable_reconcile.c portable_test.o portable_reconcile_test.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o fileops.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o metadata.o metadata_xattr.o utils.o selection_match.o selection.o backup_plan.o xdg.o
-	$(CC) $(CFLAGS) -DPORTABLE_CAPTURE_TEST_HOOKS -o $@ tests/test_portable_reconcile.c portable_test.o portable_reconcile_test.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o fileops.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o metadata.o metadata_xattr.o utils.o selection_match.o selection.o backup_plan.o xdg.o
+$(TEST_PORTABLE_RECONCILE): tests/test_portable_reconcile.c $(call with_hooks,portable_test.o portable_reconcile_test.o)
+	$(CC) $(CFLAGS) -DPORTABLE_CAPTURE_TEST_HOOKS -o $@ $(filter %.c %.o,$^)
 
-$(TEST_PORTABLE_RECONCILE_SCALE): tests/test_portable_reconcile_scale.c portable_test.o portable_reconcile_test.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o fileops.o sidecar.o sidecar_state_test.o sidecar_state_map_test.o hash.o live_state.o manifest.o encoding.o metadata.o metadata_xattr.o utils.o selection_match.o selection.o backup_plan.o xdg.o
-	$(CC) $(CFLAGS) -DPORTABLE_CAPTURE_TEST_HOOKS -o $@ tests/test_portable_reconcile_scale.c portable_test.o portable_reconcile_test.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o fileops.o sidecar.o sidecar_state_test.o sidecar_state_map_test.o hash.o live_state.o manifest.o encoding.o metadata.o metadata_xattr.o utils.o selection_match.o selection.o backup_plan.o xdg.o
+$(TEST_PORTABLE_RECONCILE_SCALE): tests/test_portable_reconcile_scale.c $(call with_hooks,portable_test.o portable_reconcile_test.o sidecar_state_test.o sidecar_state_map_test.o)
+	$(CC) $(CFLAGS) -DPORTABLE_CAPTURE_TEST_HOOKS -o $@ $(filter %.c %.o,$^)
 
-portable_restore_replay_test.o: src/portable_restore_replay.c src/portable_restore.h src/portable_restore_internal.h src/portable_restore_replay_internal.h src/backup.h src/manifest.h src/metadata.h src/portable.h src/sidecar.h src/utils.h
-	$(CC) $(CFLAGS) -DPORTABLE_RESTORE_REPLAY_TEST_HOOKS -c src/portable_restore_replay.c -o $@
+portable_restore_replay_test.o: src/portable_restore_replay.c
+	$(CC) $(CFLAGS) $(DEPFLAGS) -DPORTABLE_RESTORE_REPLAY_TEST_HOOKS -c src/portable_restore_replay.c -o $@
 
-portable_restore_preflight.o: src/portable_restore_preflight.c src/portable_restore.h src/portable_restore_internal.h src/manifest.h src/metadata.h src/sidecar.h src/utils.h
-	$(CC) $(CFLAGS) -c src/portable_restore_preflight.c -o $@
+portable_restore_preflight_test.o: src/portable_restore_preflight.c
+	$(CC) $(CFLAGS) $(DEPFLAGS) -DPORTABLE_RESTORE_PREFLIGHT_TEST_HOOKS -c src/portable_restore_preflight.c -o $@
 
-portable_restore_preflight_test.o: src/portable_restore_preflight.c src/portable_restore.h src/portable_restore_internal.h src/manifest.h src/metadata.h src/sidecar.h src/utils.h
-	$(CC) $(CFLAGS) -DPORTABLE_RESTORE_PREFLIGHT_TEST_HOOKS -c src/portable_restore_preflight.c -o $@
+metadata_test.o: src/metadata.c
+	$(CC) $(CFLAGS) $(DEPFLAGS) -DMETADATA_TEST_HOOKS -c src/metadata.c -o $@
 
-metadata_test.o: src/metadata.c src/metadata.h src/fileops.h
-	$(CC) $(CFLAGS) -DMETADATA_TEST_HOOKS -c src/metadata.c -o $@
+metadata_xattr_test.o: src/metadata_xattr.c
+	$(CC) $(CFLAGS) $(DEPFLAGS) -DMETADATA_XATTR_TEST_HOOKS -c src/metadata_xattr.c -o $@
 
-metadata_xattr_test.o: src/metadata_xattr.c src/metadata.h
-	$(CC) $(CFLAGS) -DMETADATA_XATTR_TEST_HOOKS -c src/metadata_xattr.c -o $@
+$(TEST_PORTABLE_RESTORE_PREFLIGHT): tests/test_portable_restore_preflight.c $(call with_hooks,portable_restore_replay_test.o portable_restore_preflight_test.o metadata_test.o)
+	$(CC) $(CFLAGS) -DMETADATA_TEST_HOOKS -DPORTABLE_RESTORE_PREFLIGHT_TEST_HOOKS -o $@ $(filter %.c %.o,$^)
 
-$(TEST_PORTABLE_RESTORE_PREFLIGHT): tests/test_portable_restore_preflight.c portable_restore_replay_test.o portable_restore_preflight_test.o portable_restore_orchestrate.o restore.o dconf_restore.o portable_restore_shared.o fsprobe.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o metadata_test.o metadata_xattr.o utils.o xdg.o backup.o source_snapshot.o selfcopy.o backup_plan.o selection.o container.o fileops.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o packages.o detect.o selection_match.o
-	$(CC) $(CFLAGS) -DMETADATA_TEST_HOOKS -DPORTABLE_RESTORE_PREFLIGHT_TEST_HOOKS -o $@ tests/test_portable_restore_preflight.c portable_restore_replay_test.o portable_restore_preflight_test.o portable_restore_orchestrate.o restore.o dconf_restore.o portable_restore_shared.o fsprobe.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o metadata_test.o metadata_xattr.o utils.o xdg.o backup.o source_snapshot.o selfcopy.o backup_plan.o selection.o container.o fileops.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o packages.o detect.o selection_match.o
+$(TEST_PORTABLE_RESTORE_REPLAY): tests/test_portable_restore_replay.c $(call with_hooks,portable_restore_replay_test.o)
+	$(CC) $(CFLAGS) -DPORTABLE_RESTORE_REPLAY_TEST_HOOKS -Wl,--wrap=syncfs -o $@ $(filter %.c %.o,$^)
 
-$(TEST_PORTABLE_RESTORE_REPLAY): tests/test_portable_restore_replay.c portable_restore_replay_test.o portable_restore_preflight.o portable_restore_orchestrate.o restore.o dconf_restore.o portable_restore_shared.o fsprobe.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o metadata.o metadata_xattr.o utils.o xdg.o backup.o source_snapshot.o selfcopy.o backup_plan.o selection.o container.o fileops.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o packages.o detect.o selection_match.o
-	$(CC) $(CFLAGS) -DPORTABLE_RESTORE_REPLAY_TEST_HOOKS -Wl,--wrap=syncfs -o $@ tests/test_portable_restore_replay.c portable_restore_replay_test.o portable_restore_preflight.o portable_restore_orchestrate.o restore.o dconf_restore.o portable_restore_shared.o fsprobe.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o metadata.o metadata_xattr.o utils.o xdg.o backup.o source_snapshot.o selfcopy.o backup_plan.o selection.o container.o fileops.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o packages.o detect.o selection_match.o
+$(TEST_PORTABLE_RESTORE_ORCHESTRATE): tests/test_portable_restore_orchestrate.c $(call with_hooks,portable_restore_replay_test.o metadata_test.o backup_test.o)
+	$(CC) $(CFLAGS) -DBACKUP_TEST_HOOKS -DMETADATA_TEST_HOOKS -o $@ $(filter %.c %.o,$^)
 
-$(TEST_PORTABLE_RESTORE_ORCHESTRATE): tests/test_portable_restore_orchestrate.c portable_restore_replay_test.o portable_restore_preflight.o portable_restore_orchestrate.o restore.o dconf_restore.o portable_restore_shared.o fsprobe.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o metadata_test.o metadata_xattr.o utils.o xdg.o backup_test.o source_snapshot.o selfcopy.o backup_plan.o selection.o container.o fileops.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o packages.o detect.o selection_match.o
-	$(CC) $(CFLAGS) -DBACKUP_TEST_HOOKS -DMETADATA_TEST_HOOKS -o $@ tests/test_portable_restore_orchestrate.c portable_restore_replay_test.o portable_restore_preflight.o portable_restore_orchestrate.o restore.o dconf_restore.o portable_restore_shared.o fsprobe.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o metadata_test.o metadata_xattr.o utils.o xdg.o backup_test.o source_snapshot.o selfcopy.o backup_plan.o selection.o container.o fileops.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name.o portable_hashset.o packages.o detect.o selection_match.o
-
-$(TEST_PORTABLE_RESTORE_INVARIANT): tests/test_portable_restore_invariant.c portable_restore_replay_test.o portable_restore_preflight.o portable_restore_orchestrate.o restore.o dconf_restore.o portable_restore_shared_test.o fsprobe.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o metadata.o metadata_xattr.o utils.o xdg.o backup.o source_snapshot.o selfcopy.o backup_plan.o selection.o container.o fileops.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name_test.o portable_hashset.o packages.o detect.o selection_match.o
-	$(CC) $(CFLAGS) -DPORTABLE_RESTORE_ADDRESS_TEST_HOOKS -DPORTABLE_NAME_TEST_HOOKS -o $@ tests/test_portable_restore_invariant.c portable_restore_replay_test.o portable_restore_preflight.o portable_restore_orchestrate.o restore.o dconf_restore.o portable_restore_shared_test.o fsprobe.o sidecar.o sidecar_state.o sidecar_state_map.o hash.o live_state.o manifest.o encoding.o metadata.o metadata_xattr.o utils.o xdg.o backup.o source_snapshot.o selfcopy.o backup_plan.o selection.o container.o fileops.o portable.o portable_reconcile.o portable_fsops.o portable_prescan.o portable_name_test.o portable_hashset.o packages.o detect.o selection_match.o
+$(TEST_PORTABLE_RESTORE_INVARIANT): tests/test_portable_restore_invariant.c $(call with_hooks,portable_restore_replay_test.o portable_restore_shared_test.o portable_name_test.o)
+	$(CC) $(CFLAGS) -DPORTABLE_RESTORE_ADDRESS_TEST_HOOKS -DPORTABLE_NAME_TEST_HOOKS -o $@ $(filter %.c %.o,$^)
 
 test: $(TEST_NATIVE_SELECTION) $(TEST_MANIFEST_SELECTION) $(TEST_PORTABLE_SELECTION) $(TEST_SELECTION) $(TEST_CONFIG) $(TARGET) $(TEST_DETECT) $(TEST_REPORT) $(TEST_PATHJOIN) $(TEST_FD_LIMIT) $(TEST_CONFIRM) $(TEST_PACKAGES) $(TEST_XDG) $(TEST_GET_DIR_SIZE) $(TEST_RUN_COMMAND) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE) $(TEST_MANIFEST) $(TEST_ENCODING) $(TEST_PORTABLE_NAME) $(TEST_CONTAINER) $(TEST_SELFCOPY) $(TEST_RESTORE_NATIVE) $(TEST_RESTORE_SYNC) $(TEST_RESTORE_SOURCE_READ) $(TEST_BACKUP_SOURCE_READ) $(TEST_VSCODE_CAPTURE) $(TEST_DCONF_RESTORE) $(TEST_LIVE_STATE) $(TEST_VERIFY) $(TEST_REPAIR) $(TEST_SOURCE_SNAPSHOT) $(TEST_MIGR_UNPRIVILEGED) $(TEST_BACKUP_SYNC) $(TEST_RESTORE_DISPATCH) $(TEST_RESTORE_ATIME) $(TEST_BACKUP_PLAN) $(TEST_METADATA_CONTRACT) $(TEST_METADATA_SNAPSHOTS) $(TEST_SIDECAR) $(TEST_SIDECAR_STATE) $(TEST_SIDECAR_SCALE) $(TEST_PORTABLE_HASHSET) $(TEST_PORTABLE_CAPTURE) $(TEST_PORTABLE_CAPTURE_SCALE) $(TEST_PORTABLE_PREPARE) $(TEST_NATIVE_RECONCILE_SCALE) $(TEST_NATIVE_HARDLINK_SCALE) $(TEST_PORTABLE_COLLISION_SCALE) $(TEST_PORTABLE_HARDLINK_SCALE) $(TEST_PORTABLE_RESUME) $(TEST_PORTABLE_RECONCILE) $(TEST_PORTABLE_RECONCILE_SCALE) $(TEST_PORTABLE_RESTORE_PREFLIGHT) $(TEST_PORTABLE_RESTORE_REPLAY) $(TEST_PORTABLE_RESTORE_ORCHESTRATE) $(TEST_PORTABLE_RESTORE_INVARIANT)
 	./$(TEST_DETECT)
@@ -519,6 +502,8 @@ check:
 	$(MAKE) check-analyze
 
 clean:
-	rm -f ./*.o $(TARGET) $(STATIC_TARGET) $(TEST_NATIVE_SELECTION) $(TEST_MANIFEST_SELECTION) $(TEST_PORTABLE_SELECTION) $(TEST_SELECTION) $(TEST_CONFIG) $(TEST_DETECT) $(TEST_REPORT) $(TEST_PATHJOIN) $(TEST_FD_LIMIT) $(TEST_CONFIRM) $(TEST_PACKAGES) $(TEST_XDG) $(TEST_GET_DIR_SIZE) $(TEST_RUN_COMMAND) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE) $(TEST_MANIFEST) $(TEST_ENCODING) $(TEST_PORTABLE_NAME) $(TEST_CONTAINER) $(TEST_SELFCOPY) $(TEST_RESTORE_NATIVE) $(TEST_RESTORE_SYNC) $(TEST_RESTORE_SOURCE_READ) $(TEST_BACKUP_SOURCE_READ) $(TEST_VSCODE_CAPTURE) $(TEST_DCONF_RESTORE) $(TEST_LIVE_STATE) $(TEST_VERIFY) $(TEST_REPAIR) $(TEST_SOURCE_SNAPSHOT) $(TEST_MIGR_UNPRIVILEGED) $(TEST_BACKUP_SYNC) $(TEST_RESTORE_DISPATCH) $(TEST_RESTORE_ATIME) $(TEST_BACKUP_PLAN) $(TEST_METADATA_CONTRACT) $(TEST_METADATA_SNAPSHOTS) $(TEST_SIDECAR) $(TEST_SIDECAR_STATE) $(TEST_SIDECAR_SCALE) $(TEST_PORTABLE_HASHSET) $(TEST_PORTABLE_CAPTURE) $(TEST_PORTABLE_CAPTURE_SCALE) $(TEST_PORTABLE_PREPARE) $(TEST_NATIVE_RECONCILE_SCALE) $(TEST_NATIVE_HARDLINK_SCALE) $(TEST_PORTABLE_COLLISION_SCALE) $(TEST_PORTABLE_HARDLINK_SCALE) $(TEST_PORTABLE_RESUME) $(TEST_PORTABLE_RECONCILE) $(TEST_PORTABLE_RECONCILE_SCALE) $(TEST_PORTABLE_RESTORE_PREFLIGHT) $(TEST_PORTABLE_RESTORE_REPLAY) $(TEST_PORTABLE_RESTORE_ORCHESTRATE) $(TEST_PORTABLE_RESTORE_INVARIANT)
+	rm -f ./*.o ./*.d $(TARGET) $(STATIC_TARGET) $(TEST_NATIVE_SELECTION) $(TEST_MANIFEST_SELECTION) $(TEST_PORTABLE_SELECTION) $(TEST_SELECTION) $(TEST_CONFIG) $(TEST_DETECT) $(TEST_REPORT) $(TEST_PATHJOIN) $(TEST_FD_LIMIT) $(TEST_CONFIRM) $(TEST_PACKAGES) $(TEST_XDG) $(TEST_GET_DIR_SIZE) $(TEST_RUN_COMMAND) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE) $(TEST_MANIFEST) $(TEST_ENCODING) $(TEST_PORTABLE_NAME) $(TEST_CONTAINER) $(TEST_SELFCOPY) $(TEST_RESTORE_NATIVE) $(TEST_RESTORE_SYNC) $(TEST_RESTORE_SOURCE_READ) $(TEST_BACKUP_SOURCE_READ) $(TEST_VSCODE_CAPTURE) $(TEST_DCONF_RESTORE) $(TEST_LIVE_STATE) $(TEST_VERIFY) $(TEST_REPAIR) $(TEST_SOURCE_SNAPSHOT) $(TEST_MIGR_UNPRIVILEGED) $(TEST_BACKUP_SYNC) $(TEST_RESTORE_DISPATCH) $(TEST_RESTORE_ATIME) $(TEST_BACKUP_PLAN) $(TEST_METADATA_CONTRACT) $(TEST_METADATA_SNAPSHOTS) $(TEST_SIDECAR) $(TEST_SIDECAR_STATE) $(TEST_SIDECAR_SCALE) $(TEST_PORTABLE_HASHSET) $(TEST_PORTABLE_CAPTURE) $(TEST_PORTABLE_CAPTURE_SCALE) $(TEST_PORTABLE_PREPARE) $(TEST_NATIVE_RECONCILE_SCALE) $(TEST_NATIVE_HARDLINK_SCALE) $(TEST_PORTABLE_COLLISION_SCALE) $(TEST_PORTABLE_HARDLINK_SCALE) $(TEST_PORTABLE_RESUME) $(TEST_PORTABLE_RECONCILE) $(TEST_PORTABLE_RECONCILE_SCALE) $(TEST_PORTABLE_RESTORE_PREFLIGHT) $(TEST_PORTABLE_RESTORE_REPLAY) $(TEST_PORTABLE_RESTORE_ORCHESTRATE) $(TEST_PORTABLE_RESTORE_INVARIANT)
 
 .PHONY: clean test check-strict check-sanitize check-valgrind check-analyze check
+
+-include $(wildcard *.d)
