@@ -2262,25 +2262,25 @@ static void portable_capture_context_failure_record(
 // A source that changes under a running backup is expected, not an error
 // (D63): the entry is kept as read or left out, and the change is reported.
 // Confirmed live desktop state (D55) changes constantly and is only counted.
-// BACKUP_SOURCE_CHANGE_KINDS tolerates without reporting: used where a
-// planned member is skipped, since the membership check after the root
-// reports every planned member that was not captured as vanished, once.
-static int capture_tolerate_change(const PortableCaptureContext *context,
-                                   const PortableRootSpec *root,
-                                   const char *logical,
-                                   BackupSourceChangeKind kind)
+// BACKUP_SOURCE_CHANGE_KINDS is not reported: used where a planned member is
+// skipped, since the membership check after the root reports every planned
+// member that was not captured as vanished, once.
+static void capture_note_change(const PortableCaptureContext *context,
+                                const PortableRootSpec *root,
+                                const char *logical,
+                                BackupSourceChangeKind kind)
 {
     if (context == NULL || root == NULL || root->id == NULL || logical == NULL)
-        return 0;
+        return;
     BackupCaptureReport *report = context->progress_report;
     if (live_state_path(root->id, strlen(root->id), logical, strlen(logical)))
     {
         if (report != NULL && report->live_state_changes != SIZE_MAX)
             report->live_state_changes++;
-        return 1;
+        return;
     }
     if (kind == BACKUP_SOURCE_CHANGE_KINDS)
-        return 1;
+        return;
     const char *base = root->source_path != NULL && root->source_path[0] == '/'
         ? root->source_path : root->capture_path;
     char location[PATH_MAX];
@@ -2290,13 +2290,16 @@ static int capture_tolerate_change(const PortableCaptureContext *context,
         snprintf(location, sizeof(location), "%s/%s",
                  base != NULL ? base : "", logical);
     backup_capture_report_note_change(report, kind, location);
-    return 1;
 }
 
-// A tolerated live entry that vanished, appeared after the pre-scan, or was
-// replaced before it could be opened is left out of this backup.
-static int capture_skip_live_entry(int *no_destination_object)
+// An entry that vanished, appeared after the pre-scan, or was replaced
+// before it could be opened is left out of this backup.
+static int capture_leave_out(const PortableCaptureContext *context,
+                             const PortableRootSpec *root,
+                             const char *logical, BackupSourceChangeKind kind,
+                             int *no_destination_object)
 {
+    capture_note_change(context, root, logical, kind);
     if (no_destination_object != NULL)
         *no_destination_object = 1;
     return 0;
@@ -2322,16 +2325,15 @@ static int capture_current_source_seen(const PortableCaptureContext *context,
             continue;
         int present = visited_contains(context->visited, root->id,
                                        entry->logical_path);
-        if (present == 0 &&
-            capture_tolerate_change(context, root, entry->logical_path,
-                                    BACKUP_SOURCE_VANISHED))
+        if (present == 0) {
+            capture_note_change(context, root, entry->logical_path,
+                                BACKUP_SOURCE_VANISHED);
             continue;
+        }
         if (present != 1) {
             portable_capture_context_failure_record(
-                context,
-                present == 0 ? BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED
-                             : BACKUP_CAPTURE_FAILURE_INTERNAL,
-                0, root, entry->logical_path);
+                context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root,
+                entry->logical_path);
             return -1;
         }
     }
@@ -2464,27 +2466,20 @@ static int prepared_source_validate_root(
                                         &member_stat) != 0) {
             int saved_errno = errno;
             if (source_lookup_failure_kind(saved_errno) ==
-                    BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED &&
-                capture_tolerate_change(context, root, entry->logical_path,
-                                        BACKUP_SOURCE_CHANGE_KINDS))
+                BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED) {
+                capture_note_change(context, root, entry->logical_path,
+                                    BACKUP_SOURCE_CHANGE_KINDS);
                 continue;
+            }
             portable_capture_context_failure_record(
-                context, source_lookup_failure_kind(saved_errno), saved_errno,
+                context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
                 root, entry->logical_path);
             failed = 1;
             break;
         }
-        if (!source_kind_is_address_bearing(member_stat.st_mode) &&
-            capture_tolerate_change(context, root, entry->logical_path,
-                                    BACKUP_SOURCE_CHANGE_KINDS))
-            continue;
-        if (!source_kind_is_address_bearing(member_stat.st_mode)) {
-            portable_capture_context_failure_record(
-                context, BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED, 0, root,
-                entry->logical_path);
-            failed = 1;
-            break;
-        }
+        if (!source_kind_is_address_bearing(member_stat.st_mode))
+            capture_note_change(context, root, entry->logical_path,
+                                BACKUP_SOURCE_CHANGE_KINDS);
     }
     if (root_fd >= 0 && close(root_fd) != 0) {
         int saved_errno = errno;
@@ -2694,12 +2689,8 @@ static int capture_directory(PortableCaptureContext *context,
             context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
             logical);
         failed = 1;
-    } else if (!failed && !metadata_source_unchanged(before, &after) &&
-               !capture_tolerate_change(context, root, logical,
-                                        BACKUP_SOURCE_CHANGED)) {
-        portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED, 0, root, logical);
-        failed = 1;
+    } else if (!failed && !metadata_source_unchanged(before, &after)) {
+        capture_note_change(context, root, logical, BACKUP_SOURCE_CHANGED);
     }
 
     if (!failed && verify_pending_readback_names(destination_fd, &pending) != 0) {
@@ -2876,8 +2867,7 @@ static int capture_regular(PortableCaptureContext *context,
             // Recorded with the times from before this read, not the newer
             // ones it may have missed, so the next update reads it again.
             captured.st_size = (off_t)copied;
-            (void)capture_tolerate_change(context, root, logical,
-                                          BACKUP_SOURCE_CHANGED);
+            capture_note_change(context, root, logical, BACKUP_SOURCE_CHANGED);
             break;
         }
         captured = after;
@@ -3047,14 +3037,8 @@ static int capture_symlink(PortableCaptureContext *context,
         xattrs_free(&xattrs);
         return -1;
     }
-    if (!metadata_symlink_unchanged(before, &after) &&
-        !capture_tolerate_change(context, root, logical,
-                                 BACKUP_SOURCE_CHANGED)) {
-        portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED, 0, root, logical);
-        xattrs_free(&xattrs);
-        return -1;
-    }
+    if (!metadata_symlink_unchanged(before, &after))
+        capture_note_change(context, root, logical, BACKUP_SOURCE_CHANGED);
 
     if (visited_add(context->visited, root->id, logical) != 0) {
         xattrs_free(&xattrs);
@@ -3289,14 +3273,10 @@ static int capture_hardlink(PortableCaptureContext *context,
             context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
             logical);
         failed = 1;
-    } else if (!metadata_source_unchanged(before, &after) &&
-               !capture_tolerate_change(context, root, logical,
-                                        BACKUP_SOURCE_CHANGED)) {
-        // A tolerated live file keeps the bytes read; its entry records the
-        // pre-scan metadata that portable_copy_regular() copied against.
-        portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED, 0, root, logical);
-        failed = 1;
+    } else if (!metadata_source_unchanged(before, &after)) {
+        // A changed file keeps the bytes read; its entry records the pre-scan
+        // metadata that portable_copy_regular() copied against.
+        capture_note_change(context, root, logical, BACKUP_SOURCE_CHANGED);
     }
     if (close(destination_fd) != 0) {
         int saved_errno = errno;
@@ -3348,13 +3328,13 @@ static int capture_node(PortableCaptureContext *context,
     if (read_source_stat(source_parent, source_name, root_path, &before) != 0) {
         int saved_errno = errno;
         if (source_lookup_failure_kind(saved_errno) ==
-                BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED &&
-            capture_tolerate_change(context, root, logical,
-                                    BACKUP_SOURCE_CHANGE_KINDS))
-            return capture_skip_live_entry(no_destination_object);
+            BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED)
+            return capture_leave_out(context, root, logical,
+                                     BACKUP_SOURCE_CHANGE_KINDS,
+                                     no_destination_object);
         portable_capture_context_failure_record(
-            context, source_lookup_failure_kind(saved_errno), saved_errno,
-            root, logical);
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
+            logical);
         return -1;
     }
 
@@ -3384,14 +3364,11 @@ static int capture_node(PortableCaptureContext *context,
     if ((address_bearing && prepared_member != 1) ||
         (!address_bearing && prepared_member == 1)) {
         // Appeared (or changed kind) after the pre-scan planned its name.
-        if (capture_tolerate_change(context, root, logical,
-                                    prepared_member != 1
-                                        ? BACKUP_SOURCE_APPEARED
-                                        : BACKUP_SOURCE_CHANGE_KINDS))
-            return capture_skip_live_entry(no_destination_object);
-        portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED, 0, root, logical);
-        return -1;
+        return capture_leave_out(context, root, logical,
+                                 prepared_member != 1
+                                     ? BACKUP_SOURCE_APPEARED
+                                     : BACKUP_SOURCE_CHANGE_KINDS,
+                                 no_destination_object);
     }
 
     const PortableCollisionPlanEntry *planned =
@@ -3450,13 +3427,13 @@ static int capture_node(PortableCaptureContext *context,
     if (source_fd < 0) {
         int saved_errno = errno;
         if (source_lookup_failure_kind(saved_errno) ==
-                BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED &&
-            capture_tolerate_change(context, root, logical,
-                                    BACKUP_SOURCE_CHANGE_KINDS))
-            return capture_skip_live_entry(no_destination_object);
+            BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED)
+            return capture_leave_out(context, root, logical,
+                                     BACKUP_SOURCE_CHANGE_KINDS,
+                                     no_destination_object);
         portable_capture_context_failure_record(
-            context, source_lookup_failure_kind(saved_errno), saved_errno,
-            root, logical);
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
+            logical);
         return -1;
     }
     struct stat opened;
@@ -3476,13 +3453,9 @@ static int capture_node(PortableCaptureContext *context,
             before = opened;
         } else {
             close(source_fd);
-            if (capture_tolerate_change(context, root, logical,
-                                        BACKUP_SOURCE_CHANGE_KINDS))
-                return capture_skip_live_entry(no_destination_object);
-            portable_capture_context_failure_record(
-                context, BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED, 0, root,
-                logical);
-            return -1;
+            return capture_leave_out(context, root, logical,
+                                     BACKUP_SOURCE_CHANGE_KINDS,
+                                     no_destination_object);
         }
     }
 
