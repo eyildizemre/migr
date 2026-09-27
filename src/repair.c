@@ -896,6 +896,23 @@ static int destination_inside_source(const char *source, const char *dest)
            (dest_real[length] == '\0' || dest_real[length] == '/');
 }
 
+// A copy next to the backup it repairs would make the next backup to that
+// folder find two of this install's backups and refuse to choose (D72).
+static int destination_holds_source(const char *source, const char *dest)
+{
+    char source_real[PATH_MAX], dest_real[PATH_MAX];
+    if (realpath(source, source_real) == NULL ||
+        realpath(dest, dest_real) == NULL)
+        return 0;
+    char *slash = strrchr(source_real, '/');
+    if (slash == NULL)
+        return 0;
+    if (slash == source_real)
+        slash++;
+    *slash = '\0';
+    return strcmp(source_real, dest_real) == 0;
+}
+
 static int read_journal(int container_fd, unsigned char **data_out,
                         size_t *length_out)
 {
@@ -962,6 +979,14 @@ int repair_backup(const char *source, const char *dest_root)
     {
         print_error("Error: the repaired copy cannot be written inside the "
                     "backup it repairs.\n");
+        return 1;
+    }
+    if (destination_holds_source(source, dest_root))
+    {
+        print_error("Error: the repaired copy cannot go in the folder that "
+                    "holds the backup it repairs: the next backup there would "
+                    "find two backups of this install. Choose another folder "
+                    "or drive.\n");
         return 1;
     }
     Manifest manifest;

@@ -518,6 +518,10 @@ static void test_refusals(void)
                           sizeof(output));
     check(rc == 1 && strstr(output, "inside the backup") != NULL,
           "the repaired copy is never written inside the damaged backup");
+    rc = run_captured(call_repair, fixture.container, fixture.base, output,
+                      sizeof(output));
+    check(rc == 1 && strstr(output, "find two backups of this install") != NULL,
+          "the repaired copy is never written next to the damaged backup");
 
     size_t length = 0;
     unsigned char *data = read_all(fixture.journal, &length);

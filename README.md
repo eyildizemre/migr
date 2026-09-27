@@ -223,8 +223,10 @@ under `PATH` without writing to the original: the journal is replayed record by
 record, a damaged region is skipped up to the next intact record, a directory
 whose own record was lost is re-created with the metadata of the directory above
 it, and every item that cannot be recovered is listed. The payload is then copied
-next to the rebuilt journal, so `PATH` needs room for the whole backup. Check the
-copy with `migr verify` before restoring from it.
+next to the rebuilt journal, so `PATH` needs room for the whole backup. `PATH`
+cannot be the folder holding the damaged backup, where the next backup would
+find two backups of the same install. Check the copy with `migr verify` before
+restoring from it.
 
 ## Options
 

@@ -4289,7 +4289,10 @@ record digests of their own.
 **Status:** Implemented
 
 **Decision:** `migr repair <SOURCE> <PATH>` reads a finished portable
-container and never writes to it. It reserves a new container under `PATH`,
+container and never writes to it. `PATH` may be neither inside that
+container nor the folder holding it: since D72, the next backup to that folder
+would find two backups of the install and refuse to choose. It reserves a new
+container under `PATH`,
 replays the old journal into a fresh one through the state layer's append
 API, and handles damage in four ways:
 
