@@ -249,6 +249,15 @@ int resolve_sudo_identity(uid_t *uid_out, gid_t *gid_out,
                                       uid_out, gid_out, home_out);
 }
 
+void print_backup_time(time_t taken)
+{
+    struct tm local;
+    char text[32];
+    if (taken > 0 && localtime_r(&taken, &local) != NULL &&
+        strftime(text, sizeof(text), "%Y-%m-%d %H:%M", &local) != 0)
+        printf("Backup taken %s\n", text);
+}
+
 const char *invoker_name(void)
 {
     const char *names[] = {

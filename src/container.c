@@ -19,7 +19,8 @@
 /*   migr-<owner>                     the first backup of a user            */
 /*   migr-<owner>-YYYY-MM-DD[-N]      when that name belongs to another     */
 /*                                    install; N counts from 2              */
-/* followed by ".partial" while the backup is being created.                */
+/* followed by ".partial" while the backup is being created, and by         */
+/* ".updating" while a finished one is updated in place (D72).              */
 /*                                                                           */
 /* <owner> is the user's name, reduced to characters every destination     */
 /* filesystem accepts. Which backup belongs to whom is decided by the       */
@@ -30,6 +31,13 @@
 #define CONTAINER_OWNER_MAX 32
 #define CONTAINER_DATE_LEN 10 /* "YYYY-MM-DD" */
 #define CONTAINER_PARTIAL_SUFFIX ".partial"
+#define CONTAINER_UPDATING_SUFFIX ".updating"
+
+typedef enum {
+    NAME_FINISHED,
+    NAME_PARTIAL,
+    NAME_UPDATING
+} NameState;
 
 #ifdef CONTAINER_TEST_HOOKS
 static ContainerTestReserveHook container_test_reserve_hook;
@@ -164,16 +172,27 @@ static int stem_matches_base(const char *stem, size_t stem_length,
     return 1;
 }
 
-// Whether entry is one of base's in-progress names; writes its finished name.
-static int parse_partial_name(const char *entry, const char *base,
-                              char final_out[CONTAINER_NAME_MAX],
-                              int *index_out)
+// Whether entry is one of base's names, finished or in progress; writes its
+// finished name and which state the entry is in.
+static int parse_owned_name(const char *entry, const char *base,
+                            char final_out[CONTAINER_NAME_MAX],
+                            int *index_out, NameState *state_out)
 {
     size_t length = strlen(entry);
-    if (length >= CONTAINER_NAME_MAX ||
-        !ends_with(entry, CONTAINER_PARTIAL_SUFFIX))
+    if (length >= CONTAINER_NAME_MAX)
         return 0;
-    size_t stem_length = length - strlen(CONTAINER_PARTIAL_SUFFIX);
+    size_t stem_length = length;
+    *state_out = NAME_FINISHED;
+    if (ends_with(entry, CONTAINER_PARTIAL_SUFFIX))
+    {
+        stem_length -= strlen(CONTAINER_PARTIAL_SUFFIX);
+        *state_out = NAME_PARTIAL;
+    }
+    else if (ends_with(entry, CONTAINER_UPDATING_SUFFIX))
+    {
+        stem_length -= strlen(CONTAINER_UPDATING_SUFFIX);
+        *state_out = NAME_UPDATING;
+    }
     if (!stem_matches_base(entry, stem_length, base, index_out))
         return 0;
     memcpy(final_out, entry, stem_length);
@@ -193,6 +212,22 @@ static int stem_is_container_name(const char *stem, size_t stem_length)
         if (!name_char_valid((unsigned char)stem[i]))
             return 0;
     return 1;
+}
+
+// Whether a finished backup holds final_name, as itself or while it is
+// updated in place. Returns 1 when taken, 0 when free, -1 on error.
+static int final_name_taken(int dir_fd, const char *final_name)
+{
+    char updating[CONTAINER_NAME_MAX];
+    int n = snprintf(updating, sizeof(updating), "%s" CONTAINER_UPDATING_SUFFIX,
+                     final_name);
+    if (n < 0 || (size_t)n >= sizeof(updating))
+        return -1;
+    struct stat st;
+    if (fstatat(dir_fd, final_name, &st, AT_SYMLINK_NOFOLLOW) == 0 ||
+        fstatat(dir_fd, updating, &st, AT_SYMLINK_NOFOLLOW) == 0)
+        return 1;
+    return errno == ENOENT ? 0 : -1;
 }
 
 // Removes a partial this invocation just created and does not intend to
@@ -234,10 +269,10 @@ ContainerStatus container_reserve_fd(int dest_root_fd, const char *owner,
             return CONTAINER_ERR_IO;
         }
 
-        struct stat st;
-        if (fstatat(dir_fd, final_name, &st, AT_SYMLINK_NOFOLLOW) == 0)
+        int taken = final_name_taken(dir_fd, final_name);
+        if (taken > 0)
             continue; // final already taken; try next suffix
-        if (errno != ENOENT)
+        if (taken < 0)
         {
             close(dir_fd);
             return CONTAINER_ERR_IO;
@@ -286,7 +321,8 @@ ContainerStatus container_reserve_fd(int dest_root_fd, const char *owner,
         // Post-claim recheck: closes the race where a concurrent invocation
         // finalizes a matching final name between our first check above and
         // here. Only our own just-created (still-empty) partial is removed.
-        if (fstatat(dir_fd, final_name, &st, AT_SYMLINK_NOFOLLOW) == 0)
+        taken = final_name_taken(dir_fd, final_name);
+        if (taken > 0)
         {
             if (abandon_own_claim(dir_fd, partial_fd, partial_name) != 0)
             {
@@ -299,7 +335,7 @@ ContainerStatus container_reserve_fd(int dest_root_fd, const char *owner,
             }
             continue;
         }
-        if (errno != ENOENT)
+        if (taken < 0)
         {
             // Already failing for this reason regardless of the cleanup's
             // outcome.
@@ -381,6 +417,7 @@ ContainerStatus container_adopt_fd(int dest_root_fd, const char *owner,
     char best_partial[CONTAINER_NAME_MAX];
     char best_final[CONTAINER_NAME_MAX];
     int best_suffix = 0;
+    NameState best_state = NAME_PARTIAL;
     int found = 0;
     int scan_error = 0;
 
@@ -397,8 +434,9 @@ ContainerStatus container_adopt_fd(int dest_root_fd, const char *owner,
 
         char candidate_final[CONTAINER_NAME_MAX];
         int candidate_suffix;
-        if (!parse_partial_name(entry->d_name, base, candidate_final,
-                                &candidate_suffix))
+        NameState candidate_state;
+        if (!parse_owned_name(entry->d_name, base, candidate_final,
+                              &candidate_suffix, &candidate_state))
             continue; // not this owner's grammar (includes "." and "..")
 
         int cand_fd = openat(root_fd, entry->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
@@ -434,25 +472,18 @@ ContainerStatus container_adopt_fd(int dest_root_fd, const char *owner,
             continue;
         }
 
-        ManifestIdentityComparison cmp = manifest_resume_identity_compare(&cand_manifest, wanted_identity);
+        // The same install's backup is adopted even when its job changed
+        // since (D72): the caller brings it up to date.
+        int same_install = manifest_install_identity_equal(&cand_manifest,
+                                                           wanted_identity);
         manifest_free(&cand_manifest);
-
-        if (cmp == MANIFEST_IDENTITY_ERROR)
-        {
-            // An allocation failure while comparing is an operational fault,
-            // not proof this candidate isn't a match -- must not silently
-            // fall through to NO_MATCH (docs/DECISIONS.md D15).
-            scan_error = 1;
-            close(cand_fd);
-            break;
-        }
-        if (cmp != MANIFEST_IDENTITY_EQUAL)
+        if (!same_install)
         {
             close(cand_fd);
             continue;
         }
 
-        // parse_partial_name() already rejects any entry name that would not
+        // parse_owned_name() already rejects any entry name that would not
         // fit CONTAINER_NAME_MAX, so d_name_len here is provably in range --
         // checked again anyway rather than trusting that invariant blind.
         size_t d_name_len = strlen(entry->d_name);
@@ -470,6 +501,7 @@ ContainerStatus container_adopt_fd(int dest_root_fd, const char *owner,
             memcpy(best_partial, entry->d_name, d_name_len + 1);
             snprintf(best_final, sizeof(best_final), "%s", candidate_final);
             best_suffix = candidate_suffix;
+            best_state = candidate_state;
         }
         else
         {
@@ -498,11 +530,45 @@ ContainerStatus container_adopt_fd(int dest_root_fd, const char *owner,
         return CONTAINER_ERR_AMBIGUOUS;
     }
 
+    // A finished backup is renamed to its ".updating" name while this handle
+    // holds its lock, so no one takes it for complete until it is published
+    // again (D72). The renamed entry must still be the directory locked.
+    if (best_state == NAME_FINISHED)
+    {
+        char updating[CONTAINER_NAME_MAX];
+        int n = snprintf(updating, sizeof(updating),
+                         "%s" CONTAINER_UPDATING_SUFFIX, best_final);
+        struct stat locked_st, renamed_st;
+        ContainerStatus status = CONTAINER_OK;
+        if (n < 0 || (size_t)n >= sizeof(updating) ||
+            fstat(best_fd, &locked_st) != 0)
+            status = CONTAINER_ERR_IO;
+        else if (renameat2(root_fd, best_final, root_fd, updating,
+                           RENAME_NOREPLACE) != 0)
+            status = errno == ENOSYS || errno == EINVAL ||
+                     errno == EOPNOTSUPP
+                ? CONTAINER_ERR_NOREPLACE : CONTAINER_ERR_IO;
+        else if (fstatat(root_fd, updating, &renamed_st,
+                         AT_SYMLINK_NOFOLLOW) != 0 ||
+                 renamed_st.st_dev != locked_st.st_dev ||
+                 renamed_st.st_ino != locked_st.st_ino)
+            status = CONTAINER_ERR_IO;
+        if (status != CONTAINER_OK)
+        {
+            close(best_fd);
+            close(root_fd);
+            return status;
+        }
+        memcpy(best_partial, updating, (size_t)n + 1U);
+    }
+
     out->dir_fd = root_fd;
     out->partial_fd = best_fd; // the same verified fd; never closed and reopened by name
     snprintf(out->partial_name, sizeof(out->partial_name), "%s", best_partial);
     snprintf(out->final_name, sizeof(out->final_name), "%s", best_final);
     out->suffix = best_suffix;
+    out->updating = best_state != NAME_PARTIAL;
+    out->from_finished = best_state == NAME_FINISHED;
     out->state = CONTAINER_STATE_PARTIAL;
     return CONTAINER_OK;
 }
@@ -565,6 +631,19 @@ ContainerStatus container_finalize(BackupContainer *container)
     return CONTAINER_OK;
 }
 
+ContainerStatus container_restore_finished_name(BackupContainer *container)
+{
+    if (container == NULL || container->state != CONTAINER_STATE_PARTIAL ||
+        !container->from_finished)
+        return CONTAINER_ERR_INVALID;
+    if (renameat2(container->dir_fd, container->partial_name,
+                  container->dir_fd, container->final_name,
+                  RENAME_NOREPLACE) != 0)
+        return CONTAINER_ERR_IO;
+    container->state = CONTAINER_STATE_FINALIZED;
+    return CONTAINER_OK;
+}
+
 void container_close(BackupContainer *container)
 {
     if (container == NULL)
@@ -601,10 +680,14 @@ const char *container_current_name(const BackupContainer *container)
 
 int container_name_is_partial(const char *name)
 {
-    if (name == NULL || !ends_with(name, CONTAINER_PARTIAL_SUFFIX))
+    if (name == NULL)
         return 0;
-    return stem_is_container_name(name, strlen(name) -
-                                            strlen(CONTAINER_PARTIAL_SUFFIX));
+    const char *suffix = ends_with(name, CONTAINER_PARTIAL_SUFFIX)
+        ? CONTAINER_PARTIAL_SUFFIX
+        : ends_with(name, CONTAINER_UPDATING_SUFFIX)
+            ? CONTAINER_UPDATING_SUFFIX : NULL;
+    return suffix != NULL &&
+           stem_is_container_name(name, strlen(name) - strlen(suffix));
 }
 
 int container_name_is_final(const char *name)

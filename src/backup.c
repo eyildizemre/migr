@@ -69,6 +69,7 @@ static int backup_test_restore_privilege_bypass;
 static int backup_test_invoker_set;
 static uid_t backup_test_invoker_uid;
 static gid_t backup_test_invoker_gid;
+static const char *backup_test_machine_id;
 static BackupTestSidecarReadbackHook backup_test_sidecar_readback_hook;
 static void *backup_test_sidecar_readback_context;
 
@@ -133,6 +134,11 @@ void backup_test_force_case_insensitive_destination(int enabled)
 void backup_test_set_restore_privilege_bypass(int enabled)
 {
     backup_test_restore_privilege_bypass = enabled != 0;
+}
+
+void backup_test_set_machine_id(const char *machine_id)
+{
+    backup_test_machine_id = machine_id;
 }
 
 void backup_test_set_invoker(int enabled, uid_t uid, gid_t gid)
@@ -1710,6 +1716,13 @@ static int ensure_target_root(const char *path, int *created)
 // manifest failure later.
 static int read_machine_id(char *out, size_t out_size)
 {
+#ifdef BACKUP_TEST_HOOKS
+    if (backup_test_machine_id != NULL)
+    {
+        int n = snprintf(out, out_size, "%s", backup_test_machine_id);
+        return n > 0 && (size_t)n < out_size ? 0 : -1;
+    }
+#endif
     static const char *const sources[] = {
         "/etc/machine-id",
         "/var/lib/dbus/machine-id",
@@ -1905,6 +1918,176 @@ static int portable_capture_request_for_execution(
 
 // Every user-derived object lives below data/ (docs/DECISIONS.md D15), so the
 // container root stays reserved for migr's own control artifacts. Opened with
+/* ------------------------------------------------------------------------- */
+/* Updating a backup in place (docs/DECISIONS.md D72).                       */
+/* ------------------------------------------------------------------------- */
+
+typedef struct {
+    char *root_id;
+    char *logical_path;
+} DroppedPath;
+
+// Journal records of roots the new selection left out, collected before any
+// of them is deleted: live views are only valid until the next mutation.
+typedef struct {
+    const Manifest *previous;
+    const unsigned char *dropped; /* per root of previous */
+    DroppedPath *paths;
+    size_t count;
+    size_t capacity;
+    int failed;
+} DroppedPaths;
+
+static int root_is_dropped(const DroppedPaths *dropped, SidecarBytes root_id)
+{
+    for (int i = 0; i < dropped->previous->root_count; i++)
+        if (dropped->dropped[i] &&
+            strlen(dropped->previous->roots[i].id) == root_id.length &&
+            memcmp(dropped->previous->roots[i].id, root_id.data,
+                   root_id.length) == 0)
+            return 1;
+    return 0;
+}
+
+static int dropped_paths_add(DroppedPaths *dropped, SidecarBytes root_id,
+                             SidecarBytes logical_path)
+{
+    if (!root_is_dropped(dropped, root_id))
+        return 0;
+    if (dropped->count == dropped->capacity)
+    {
+        size_t capacity = dropped->capacity == 0 ? 64U
+                                                 : dropped->capacity * 2U;
+        DroppedPath *paths = realloc(dropped->paths,
+                                     capacity * sizeof(*paths));
+        if (paths == NULL)
+        {
+            dropped->failed = 1;
+            return -1;
+        }
+        dropped->paths = paths;
+        dropped->capacity = capacity;
+    }
+    DroppedPath *path = &dropped->paths[dropped->count];
+    path->root_id = strndup((const char *)root_id.data, root_id.length);
+    path->logical_path = strndup((const char *)logical_path.data,
+                                 logical_path.length);
+    if (path->root_id == NULL || path->logical_path == NULL)
+    {
+        free(path->root_id);
+        free(path->logical_path);
+        dropped->failed = 1;
+        return -1;
+    }
+    dropped->count++;
+    return 0;
+}
+
+static int collect_dropped_live(const SidecarLiveView *view, void *context)
+{
+    return dropped_paths_add(context, view->entry->root_id,
+                             view->entry->logical_path);
+}
+
+static int collect_dropped_claim(const SidecarClaimView *view, void *context)
+{
+    return dropped_paths_add(context, view->claim->root_id,
+                             view->claim->logical_path);
+}
+
+// Deletes the journal records of dropped roots, live and claimed alike, and
+// makes the deletions durable before the caller writes the new manifest.
+static int forget_dropped_journal_paths(int container_fd, DroppedPaths *dropped)
+{
+    SidecarLog log = {0};
+    SidecarOpenStatus open_status = sidecar_log_adopt_at(container_fd, &log);
+    if (open_status == SIDECAR_OPEN_MISSING)
+        return 0;
+    if (open_status != SIDECAR_OPEN_RESUMABLE)
+        return -1;
+    int failed =
+        sidecar_log_foreach(&log, collect_dropped_live, dropped) !=
+            SIDECAR_STATUS_OK ||
+        sidecar_log_claim_foreach(&log, collect_dropped_claim, dropped) !=
+            SIDECAR_STATUS_OK ||
+        dropped->failed;
+    for (size_t i = 0; !failed && i < dropped->count; i++)
+    {
+        SidecarDelete deletion = {
+            .root_id = { (const unsigned char *)dropped->paths[i].root_id,
+                         strlen(dropped->paths[i].root_id) },
+            .logical_path = {
+                (const unsigned char *)dropped->paths[i].logical_path,
+                strlen(dropped->paths[i].logical_path) }
+        };
+        failed = sidecar_log_append_delete(&log, &deletion) !=
+                 SIDECAR_STATUS_OK;
+    }
+    if (sidecar_log_close(&log) != SIDECAR_STATUS_OK)
+        failed = 1;
+    int journal_fd = openat(container_fd, SIDECAR_SLOT_NAME,
+                            O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (journal_fd < 0 || fsync(journal_fd) != 0)
+        failed = 1;
+    if (journal_fd >= 0)
+        close(journal_fd);
+    return failed ? -1 : 0;
+}
+
+// Removes what an adopted backup holds for roots the current selection no
+// longer has: their journal records (portable) and their payload. The new
+// manifest is written only afterwards, so an interrupted run leaves them
+// listed for the next one to finish.
+static int drop_left_out_roots(int container_fd, const Manifest *current,
+                               int *changed)
+{
+    Manifest previous;
+    if (manifest_read_v1_at(container_fd, &previous) != MANIFEST_STATUS_VALID)
+        return -1;
+    unsigned char *flags = calloc((size_t)previous.root_count + 1U, 1U);
+    if (flags == NULL)
+    {
+        manifest_free(&previous);
+        return -1;
+    }
+    int any = 0;
+    for (int i = 0; i < previous.root_count; i++)
+    {
+        int kept = 0;
+        for (int j = 0; j < current->root_count && !kept; j++)
+            kept = manifest_root_equal(&previous.roots[i], &current->roots[j]);
+        flags[i] = !kept;
+        any |= !kept;
+    }
+
+    *changed = any;
+    DroppedPaths dropped = { .previous = &previous, .dropped = flags };
+    int failed = any && previous.representation == CLONE_PORTABLE_SIDECAR &&
+                 forget_dropped_journal_paths(container_fd, &dropped) != 0;
+    int data_fd = any && !failed
+        ? openat(container_fd, "data",
+                 O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        : -1;
+    if (any && !failed && data_fd < 0 && errno != ENOENT)
+        failed = 1;
+    for (int i = 0; data_fd >= 0 && !failed && i < previous.root_count; i++)
+        if (flags[i] &&
+            fileops_remove_tree_at(data_fd, previous.roots[i].payload_path) != 0)
+            failed = 1;
+    if (data_fd >= 0)
+        close(data_fd);
+
+    for (size_t i = 0; i < dropped.count; i++)
+    {
+        free(dropped.paths[i].root_id);
+        free(dropped.paths[i].logical_path);
+    }
+    free(dropped.paths);
+    free(flags);
+    manifest_free(&previous);
+    return failed ? -1 : 0;
+}
+
 // O_NOFOLLOW | O_DIRECTORY: in an adopted container this entry may already
 // exist, and only a genuine directory is acceptable — a symlink there would
 // otherwise place the whole payload outside the container.
@@ -2885,6 +3068,7 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
         manifest_set_self_binary(&manifest, self_arch);
     if (include_network_config && network_config_present_mask != 0)
         manifest.has_network_config = 1;
+    manifest.updated = time(NULL);
 
     // Hoisted so both cleanup epilogues can release every resource
     // unconditionally: each handle is inert until its corresponding operation
@@ -2901,6 +3085,7 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
     SourceSnapshot source_snapshot;
     source_snapshot_init(&source_snapshot);
     int finish_result = MIGR_EXIT_FAILURE;
+    int adopted_changed = 0;
 
     if (ensure_target_root(target, &target_created) != 0)
         goto fail_pre_container;
@@ -3003,6 +3188,7 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
             manifest_set_self_binary(&prepared.manifest, self_arch);
         if (include_network_config && network_config_present_mask != 0)
             prepared.manifest.has_network_config = 1;
+        prepared.manifest.updated = manifest.updated;
     }
     const Manifest *identity_manifest = repr == CLONE_PORTABLE_SIDECAR
         ? &prepared.manifest : &manifest;
@@ -3014,6 +3200,17 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
     if (adopt_status == CONTAINER_OK)
     {
         adopted = 1;
+        // An adopted backup may have been taken with another selection: roots
+        // it no longer has are removed first, so the checks below see only
+        // payload this run keeps, and before its manifest is replaced (D72).
+        if (drop_left_out_roots(container_root_fd(&container),
+                                identity_manifest, &adopted_changed) != 0)
+        {
+            print_error("Error: Could not remove the parts of the backup that "
+                        "are no longer selected\n");
+            adopted_changed = 1;
+            goto fail_pre_container;
+        }
         int adopted_data_fd = openat(container_root_fd(&container), "data",
                                      O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
                                      O_CLOEXEC);
@@ -3084,19 +3281,27 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
                 goto fail_pre_container;
             }
         }
-        if (container_reserve_fd(target_fd, invoker_name(), time(NULL),
+        if (container_reserve_fd(target_fd, invoker_name(), manifest.updated,
                                  &container) != CONTAINER_OK)
         {
             print_error("Error: Could not create a backup container under %s\n", target);
             goto fail_pre_container;
         }
+        if (container.suffix != 0)
+            printf("Note: a backup under %s already has this user's name but "
+                   "belongs to another install (or is in use); it is left "
+                   "alone, and this one is %s.\n\n",
+                   target, container.final_name);
     }
     else
     {
         if (adopt_status == CONTAINER_ERR_AMBIGUOUS)
-            print_error("Error: more than one interrupted backup under %s matches this job; "
-                   "resuming would be a guess. Remove or move the ones you do not want.\n",
-                   target);
+            print_error("Error: more than one backup under %s belongs to this "
+                        "install; choosing one would be a guess. Remove or move "
+                        "the ones you do not want.\n", target);
+        else if (adopt_status == CONTAINER_ERR_NOREPLACE)
+            print_error("Error: %s does not support the atomic rename migr "
+                        "needs to update a backup in place\n", target);
         else
             print_error("Error: could not examine existing backups under %s\n", target);
         goto fail_pre_container;
@@ -3112,17 +3317,17 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
     // be adopted, so it must not be reported as resumable.
     int resumable = 1;
 
-    // A fresh container gets its manifest before any payload: it is the format
-    // discriminator, the representation record and the root table, so a
-    // container without one is not a v1 container at all. An adopted one
-    // already carries a manifest that was read back and matched during
-    // adoption; rewriting it would truncate proven-good state for no gain.
-    if (!adopted && repr == CLONE_NATIVE_TREE &&
+    // A native container gets its manifest before any payload: it is the
+    // format discriminator, the representation record and the root table, so
+    // a container without one is not a v1 container at all. An adopted one
+    // gets this run's, atomically: its selection and time may have changed.
+    // A fresh portable container is written by its capture.
+    if (!had_error && (adopted || repr == CLONE_NATIVE_TREE) &&
         manifest_write_v1_at(container_fd, identity_manifest) != 0)
     {
         print_error("Error: Could not write manifest.txt into the backup container\n");
         had_error = 1;
-        resumable = 0;
+        resumable = adopted;
     }
 
     int data_fd = -1;
@@ -3141,8 +3346,10 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
     if (!had_error)
     {
         printf("Backing up to: %s/%s\n", target, container_current_name(&container));
-        if (adopted)
-            printf("Resuming an interrupted backup of the same job.\n");
+        if (container.updating)
+            printf("Updating this install's backup in place.\n");
+        else if (adopted)
+            printf("Resuming an interrupted backup of this install.\n");
         printf("\n");
 
         capture_report.sync_interval_bytes = BACKUP_SYNC_INTERVAL_BYTES;
@@ -3463,6 +3670,13 @@ cancel_pre_container:
     finish_result = MIGR_EXIT_OK;
 fail_pre_container:
     source_snapshot_end(&source_snapshot);
+    // A finished backup taken over for an update and left unchanged is
+    // published again as it was, rather than left looking unfinished.
+    if (container.from_finished && !adopted_changed &&
+        container_restore_finished_name(&container) != CONTAINER_OK)
+        print_warning("Warning: %s/%s could not get its name back; the next "
+                      "backup finishes it.\n", target,
+                      container_current_name(&container));
     if (self_fd >= 0)
         close(self_fd);
     container_close(&container);

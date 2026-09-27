@@ -4664,3 +4664,41 @@ gets the same hostname again.
 D15's claim, lock, adoption, and publication rules stay. Existing backups in
 the old naming are not migrated (pre-release).
 
+## D72 — 2026-09-27 — A backup is updated in place
+
+**Status:** Implemented
+
+**Decision:** A backup run takes over this install's existing backup under
+PATH instead of creating another one.
+- **Which backup:** `container_adopt_fd()` scans the user's names (D71),
+  finished and in progress, and matches by install identity
+  (`manifest_install_identity_equal()`): machine-id, source uid (the sudo
+  invoker since D70), representation, and journal version. Scope, roots,
+  exclusions, and bundled extras may differ. More than one match is refused
+  as ambiguous, as before.
+- **Finished backups:** A finished match is renamed to `<name>.updating`
+  (`renameat2` with `RENAME_NOREPLACE`) while its lock is held, and checked to
+  be the locked directory. `.updating` names count as taken for reservation
+  and as in progress for restore and verify. Finalizing renames it back. A run
+  that stops before changing anything renames it back at once
+  (`container_restore_finished_name()`).
+- **Changed selection:** Right after adoption, roots of the old manifest
+  with no identical root in the new one (`manifest_root_equal()`) are
+  removed: in a portable backup their journal records (live and claimed) get
+  DELETE records, fsynced, then their payload trees are removed. Only then is
+  the new manifest written, so an interrupted run leaves them listed for the
+  next one to finish.
+- **The rest:** Capture runs as a resume does: unchanged files are skipped,
+  changed ones recopied, and reconcile removes what left the source or the
+  selection. The manifest is now written through `manifest.txt.new`, fsync,
+  and rename, and records `UPDATED=<seconds>` for when the run started; verify
+  and restore print it.
+
+**Why:** Each run used to create a new timestamped backup, so keeping a
+backup current cost a full copy and left old ones to delete by hand. Most of
+the mechanism (resume, reconcile, the journal) already existed.
+
+**Relationship:** Builds on D15's resume and D25's claims; uses D71's names.
+Explicit-path roots are numbered in sorted path order, so adding a path can
+renumber, and thus recopy, the others.
+

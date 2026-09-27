@@ -97,7 +97,10 @@ int main(void)
     struct stat before, after;
     CHECK(fstat(reserved.partial_fd, &before) == 0);
     container_close(&reserved);
-    CHECK(container_adopt("partials", "eyildizemre", &changed, &adopted) == CONTAINER_ERR_NO_MATCH);
+    // A changed selection is still this install's backup: an update follows
+    // the new selection instead of starting another backup (D72).
+    CHECK(container_adopt("partials", "eyildizemre", &changed, &adopted) == CONTAINER_OK);
+    container_close(&adopted);
     CHECK(container_adopt("partials", "eyildizemre", &same, &adopted) == CONTAINER_OK);
     CHECK(fstat(adopted.partial_fd, &after) == 0 && before.st_ino == after.st_ino);
     container_close(&adopted);

@@ -971,6 +971,63 @@ static void test_resume_identity_includes_network_config(void)
           "matching network-config state preserves resume identity");
 }
 
+static void test_updated_round_trips(void)
+{
+    printf(BLUE "::" NC " versioned manifest: UPDATED records when the backup was taken\n");
+
+    Manifest m;
+    ManifestRoot roots[2];
+    fill_reference_manifest(&m, roots);
+    m.has_network_config = 1;
+    m.updated = 1790000000;
+    check(manifest_write_v1(test_dir, &m) == 0,
+          "a manifest writes UPDATED after NETWORK_CONFIG");
+    Manifest read;
+    ManifestStatus st = manifest_read_v1(test_dir, &read);
+    check(st == MANIFEST_STATUS_VALID && read.updated == 1790000000 &&
+              read.has_network_config && read.root_count == 2,
+          "UPDATED round-trips, and the lines after it stay aligned");
+    if (st == MANIFEST_STATUS_VALID)
+        manifest_free(&read);
+
+    m.updated = 0;
+    check(manifest_write_v1(test_dir, &m) == 0 &&
+              manifest_read_v1(test_dir, &read) == MANIFEST_STATUS_VALID &&
+              read.updated == 0,
+          "a manifest without UPDATED reads as unrecorded");
+    manifest_free(&read);
+    remove_manifest(test_dir);
+}
+
+static void test_install_identity(void)
+{
+    printf(BLUE "::" NC " versioned manifest: install identity ignores the selection\n");
+
+    Manifest a, b;
+    ManifestRoot a_roots[2], b_roots[2];
+    fill_reference_manifest(&a, a_roots);
+    fill_reference_manifest(&b, b_roots);
+    b.scope = MANIFEST_SCOPE_COMPREHENSIVE;
+    b.root_count = 1;
+    b.has_network_config = !a.has_network_config;
+    check(manifest_install_identity_equal(&a, &b),
+          "another scope, root table, or extras is still the same install");
+    b.source_uid = a.source_uid + 1U;
+    check(!manifest_install_identity_equal(&a, &b), "another user is not");
+    fill_reference_manifest(&b, b_roots);
+    b.machine_id[0] = b.machine_id[0] == '0' ? '1' : '0';
+    check(!manifest_install_identity_equal(&a, &b), "another machine is not");
+    fill_reference_manifest(&b, b_roots);
+    b.representation = a.representation == CLONE_NATIVE_TREE
+        ? CLONE_PORTABLE_SIDECAR : CLONE_NATIVE_TREE;
+    check(!manifest_install_identity_equal(&a, &b),
+          "another representation is not");
+    fill_reference_manifest(&b, b_roots);
+    b.has_source_identity = 0;
+    check(!manifest_install_identity_equal(&a, &b),
+          "a backup without a source identity is not");
+}
+
 static void test_fd_writer(void)
 {
     printf(BLUE "::" NC " versioned manifest: fd-relative writer\n");
@@ -1010,23 +1067,33 @@ static void test_fd_writer(void)
           "the fd and pathname writers produce byte-identical output");
 
     // A symlink standing where manifest.txt belongs must not be written
-    // through: the format state would land wherever it points.
+    // through: the format state would land wherever it points. The manifest
+    // is renamed into place (D72), which replaces such a link instead.
     remove_manifest(test_dir);
     char outside[512];
     snprintf(outside, sizeof(outside), "%s/outside.txt", test_dir);
     write_raw(outside, "untouched");
     check(symlink(outside, path) == 0, "fixture: manifest.txt is a symlink to another file");
 
-    check(manifest_write_v1_at(dir_fd, &m) == 1,
-          "manifest_write_v1_at refuses to write through a symlinked manifest.txt");
+    struct stat replaced;
+    check(manifest_write_v1_at(dir_fd, &m) == 0 &&
+              lstat(path, &replaced) == 0 && S_ISREG(replaced.st_mode),
+          "manifest_write_v1_at replaces a symlinked manifest.txt with a file");
     char after[512];
     check(slurp(outside, after, sizeof(after)) == 9 && strcmp(after, "untouched") == 0,
           "the symlink's target is unchanged");
+
+    // The file it writes first is opened without following a link either.
+    char temporary[512];
+    snprintf(temporary, sizeof(temporary), "%s/manifest.txt.new", test_dir);
+    check(symlink(outside, temporary) == 0,
+          "fixture: manifest.txt.new is a symlink to another file");
     check(manifest_write_v1(test_dir, &m) == 1,
-          "the pathname writer refuses the same symlink");
+          "a symlinked manifest.txt.new is refused");
     check(slurp(outside, after, sizeof(after)) == 9 && strcmp(after, "untouched") == 0,
           "the symlink's target is still unchanged");
 
+    unlink(temporary);
     unlink(path);
     unlink(outside);
     close(dir_fd);
@@ -1060,6 +1127,8 @@ int main(void)
     test_write_rejects_inconsistent_input();
     test_resume_identity_includes_self_binary();
     test_resume_identity_includes_network_config();
+    test_updated_round_trips();
+    test_install_identity();
     test_fd_writer();
 
     rmdir(test_dir);

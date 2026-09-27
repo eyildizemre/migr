@@ -3,6 +3,7 @@
 
 #include <limits.h>   /* PATH_MAX */
 #include <sys/types.h> /* uid_t */
+#include <time.h>      /* time_t */
 
 #include "fileops.h" /* CloneRepresentation */
 #include "selfcopy.h" /* MIGR_ARCH_MAX */
@@ -144,6 +145,7 @@ typedef struct {
     int has_self_binary;
     char arch[MIGR_ARCH_MAX];
     int has_network_config;
+    time_t updated; /**< When the backup was last taken (D72); 0 when unrecorded. */
     int root_count;
     ManifestRoot *roots;
     char source_home[PATH_MAX]; /* VERSION=2 source address anchor, never opened. */
@@ -236,6 +238,20 @@ typedef enum {
  *         failure while comparing root tables) -- never silently DIFFERENT.
  */
 ManifestIdentityComparison manifest_resume_identity_compare(const Manifest *a, const Manifest *b);
+
+/**
+ * @brief Whether two manifests describe backups of the same install
+ *        (docs/DECISIONS.md D72): the same machine and user (both with a
+ *        source identity), representation, and journal version.
+ *
+ * Unlike manifest_resume_identity_compare(), the job itself may differ:
+ * scope, roots, exclusions, and bundled extras change when the user's
+ * selection does, and an update in place follows them.
+ */
+int manifest_install_identity_equal(const Manifest *a, const Manifest *b);
+
+/** @brief Whether two roots are the same root: id, policy, and addresses. */
+int manifest_root_equal(const ManifestRoot *a, const ManifestRoot *b);
 
 /**
  * @brief Writes a versioned manifest to container_fd's manifest.txt in full.

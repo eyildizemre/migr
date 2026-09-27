@@ -3182,6 +3182,8 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         close(source_root_fd);
         return MIGR_EXIT_FAILURE;
     }
+    if (mst == MANIFEST_STATUS_VALID)
+        print_backup_time(m.updated);
     int home_fd = open(home, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (home_fd < 0)
     {

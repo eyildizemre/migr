@@ -927,7 +927,6 @@ typedef struct
 } MismatchCase;
 
 static void mutate_representation(Manifest *m) { m->representation = CLONE_PORTABLE_SIDECAR; }
-static void mutate_scope(Manifest *m) { m->scope = MANIFEST_SCOPE_CRITICAL; }
 static void mutate_sidecar_version(Manifest *m) { m->sidecar_version = 7; }
 static void mutate_machine_id(Manifest *m) { strcpy(m->machine_id, "00000000000000000000000000000000"); }
 static void mutate_source_uid(Manifest *m) { m->source_uid = 2000; }
@@ -935,7 +934,6 @@ static void mutate_no_identity(Manifest *m) { m->has_source_identity = 0; }
 
 static const MismatchCase mismatch_cases[] = {
     { mutate_representation,  "a representation mismatch is not adopted" },
-    { mutate_scope,           "a scope mismatch is not adopted" },
     { mutate_sidecar_version, "a sidecar_version mismatch is not adopted" },
     { mutate_machine_id,      "a machine_id mismatch is not adopted" },
     { mutate_source_uid,      "a source_uid mismatch is not adopted" },
@@ -944,7 +942,7 @@ static const MismatchCase mismatch_cases[] = {
 
 static void test_adopt_rejects_identity_mismatches(void)
 {
-    printf(BLUE "::" NC " container: adopt rejects every identity-field mismatch\n");
+    printf(BLUE "::" NC " container: adopt rejects another install's backup\n");
 
     for (size_t i = 0; i < sizeof(mismatch_cases) / sizeof(mismatch_cases[0]); i++)
     {
@@ -1039,16 +1037,18 @@ static void root_mismatch_setup_restore_path_value(ManifestRoot *c, ManifestRoot
 }
 
 static const RootMismatchCase root_mismatch_cases[] = {
-    { root_mismatch_setup_source_path,        "a source_path-only difference is not adopted" },
-    { root_mismatch_setup_payload_path,       "a payload_path-only difference is not adopted" },
-    { root_mismatch_setup_policy,             "a policy (and has_restore_path) difference is not adopted" },
-    { root_mismatch_setup_restore_path_value, "a restore_path value difference is not adopted" },
+    { root_mismatch_setup_source_path,        "a source_path-only difference is adopted" },
+    { root_mismatch_setup_payload_path,       "a payload_path-only difference is adopted" },
+    { root_mismatch_setup_policy,             "a policy (and has_restore_path) difference is adopted" },
+    { root_mismatch_setup_restore_path_value, "a restore_path value difference is adopted" },
 };
 
-static void test_adopt_rejects_root_table_mismatch(void)
+// The same install's backup is adopted whatever its selection was: the
+// caller brings it up to the current one (D72).
+static void test_adopt_follows_a_changed_selection(void)
 {
-    printf(BLUE "::" NC " container: a differing root table is not adopted"
-                " (source_path/payload_path/policy/restore_path)\n");
+    printf(BLUE "::" NC " container: the same install's backup is adopted after its selection changed"
+                " (scope/source_path/payload_path/policy/restore_path)\n");
 
     for (size_t i = 0; i < sizeof(root_mismatch_cases) / sizeof(root_mismatch_cases[0]); i++)
     {
@@ -1074,12 +1074,74 @@ static void test_adopt_rejects_root_table_mismatch(void)
         wanted.root_count = 1;
         wanted.roots = &wanted_root;
 
+        wanted.scope = MANIFEST_SCOPE_CRITICAL;
+
         BackupContainer adopted;
-        check(container_adopt(test_root, OWNER, &wanted, &adopted) == CONTAINER_ERR_NO_MATCH,
+        check(container_adopt(test_root, OWNER, &wanted, &adopted) == CONTAINER_OK &&
+                  !adopted.updating,
               root_mismatch_cases[i].label);
         container_close(&adopted);
     }
 
+    fresh_test_root();
+}
+
+static void test_adopt_takes_a_finished_backup_for_update(void)
+{
+    printf(BLUE "::" NC " container: a finished backup of the same install is updated under .updating\n");
+    fresh_test_root();
+
+    Manifest m;
+    make_reference_manifest(&m);
+    BackupContainer c;
+    check(container_reserve(test_root, OWNER, FIXED_TIME, &c) == CONTAINER_OK,
+          "fixture: reserve");
+    int container_fd = container_root_fd(&c);
+    check(manifest_write_v1_at(container_fd, &m) == 0 &&
+              container_finalize(&c) == CONTAINER_OK,
+          "fixture: publish a finished backup");
+    struct stat published;
+    check(fstat(container_fd, &published) == 0, "fixture: stat it");
+    container_close(&c);
+
+    BackupContainer adopted;
+    check(container_adopt(test_root, OWNER, &m, &adopted) == CONTAINER_OK &&
+              adopted.updating &&
+              strcmp(adopted.partial_name, "migr-" OWNER ".updating") == 0 &&
+              strcmp(adopted.final_name, "migr-" OWNER) == 0,
+          "it is adopted and renamed to its .updating name");
+    struct stat locked;
+    char final_path[PATH_MAX], updating_path[PATH_MAX];
+    path_under_root(final_path, sizeof(final_path), "migr-" OWNER);
+    path_under_root(updating_path, sizeof(updating_path),
+                    "migr-" OWNER ".updating");
+    check(fstat(container_root_fd(&adopted), &locked) == 0 &&
+              locked.st_ino == published.st_ino &&
+              access(final_path, F_OK) != 0 && access(updating_path, F_OK) == 0,
+          "the same directory is held, and no finished name is left meanwhile");
+    check(container_name_is_partial("migr-" OWNER ".updating") &&
+              !container_name_is_final("migr-" OWNER ".updating"),
+          "an .updating name is in progress, not finished");
+
+    BackupContainer other;
+    check(container_reserve(test_root, OWNER, FIXED_TIME, &other) == CONTAINER_OK &&
+              other.suffix == 1,
+          "a new reservation does not take the name being updated");
+    container_close(&other);
+
+    check(container_finalize(&adopted) == CONTAINER_OK &&
+              access(final_path, F_OK) == 0 && access(updating_path, F_OK) != 0,
+          "finalizing publishes it under its finished name again");
+    container_close(&adopted);
+
+    Manifest other_install;
+    make_reference_manifest(&other_install);
+    strcpy(other_install.machine_id, "00000000000000000000000000000000");
+    check(container_adopt(test_root, OWNER, &other_install, &adopted) ==
+                  CONTAINER_ERR_NO_MATCH &&
+              access(final_path, F_OK) == 0,
+          "another install's finished backup is left alone");
+    container_close(&adopted);
     fresh_test_root();
 }
 
@@ -1427,7 +1489,8 @@ int main(void)
     test_adopt_skips_locked_partial();
     test_adopt_ambiguous_on_multiple_matches();
     test_adopt_rejects_identity_mismatches();
-    test_adopt_rejects_root_table_mismatch();
+    test_adopt_follows_a_changed_selection();
+    test_adopt_takes_a_finished_backup_for_update();
     test_adopt_rejects_non_valid_manifests();
     test_adopt_fails_closed_on_scan_error();
     test_adopt_ignores_names_outside_the_grammar();

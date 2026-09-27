@@ -531,6 +531,7 @@ int verify_backup(const char *path)
     format_size((off_t)(run.total_bytes > INT64_MAX ? INT64_MAX
                                                     : run.total_bytes),
                 total, sizeof(total));
+    print_backup_time(manifest.updated);
     printf("Verifying %zu item%s (%s) in %s\n", run.count,
            run.count == 1 ? "" : "s", total, path);
     run.progress = isatty(fileno(stdout)) &&

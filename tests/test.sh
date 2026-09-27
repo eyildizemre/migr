@@ -1885,20 +1885,23 @@ test_container_production() {
             "does not exist yet; the preview below reflects its parent directory's filesystem instead."
     fi
 
-    # --- two consecutive backups produce two distinct finalized containers ---
+    # --- a second backup of the same install updates the first in place (D72) ---
     local twice="$TEST_DIR/cp_twice"
     mkdir -p "$twice"
     "$MIGR" backup "$twice" --critical >/dev/null 2>&1
-    # container names carry a whole-second timestamp; the second backup must get
-    # its own container either way, via the "-N" suffix if the clock has not moved
-    "$MIGR" backup "$twice" --critical >/dev/null 2>&1
-    local twice_count
+    local twice_first twice_second_out twice_count
+    twice_first=$(containers_matching "$twice" final)
+    twice_second_out=$("$MIGR" backup "$twice" --critical 2>&1)
     twice_count=$(containers_matching "$twice" final | grep -c . || true)
     assert_no_partial "$twice"
-    if [ "$twice_count" -eq 2 ]; then
-        echo -e "  ${GREEN}✓${NC} Two consecutive backups produced two distinct finalized containers."
+    if [ "$twice_count" -eq 1 ] &&
+       [ "$(containers_matching "$twice" final)" = "$twice_first" ] &&
+       [[ "$twice_second_out" == *"Updating this install's backup in place."* ]] &&
+       [[ "$twice_second_out" == *"Backup complete"* ]]; then
+        echo -e "  ${GREEN}✓${NC} A second backup updated the first one in place."
     else
-        echo -e "  ${RED}✗${NC} Expected 2 finalized containers, found $twice_count"
+        echo -e "  ${RED}✗${NC} Expected the second backup to update the first, found $twice_count"
+        echo "$twice_second_out"
         exit 1
     fi
 

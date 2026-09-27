@@ -2203,6 +2203,19 @@ static int native_open_relative_parent(int root_fd, const char *rel_path,
     }
 }
 
+int fileops_remove_tree_at(int root_fd, const char *rel_path)
+{
+    int parent_fd;
+    char leaf[NAME_MAX + 1];
+    if (native_open_relative_parent(root_fd, rel_path, &parent_fd, leaf,
+                                    sizeof(leaf)) != 0)
+        return errno == ENOENT ? 0 : -1;
+    int result = native_remove_leaf(parent_fd, leaf);
+    if (close(parent_fd) != 0)
+        result = -1;
+    return result;
+}
+
 void native_reconcile_report_init(NativeReconcileReport *report)
 {
     if (report == NULL)

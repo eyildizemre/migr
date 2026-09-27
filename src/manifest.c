@@ -558,6 +558,15 @@ static ManifestStatus manifest_parse_v1_body(FILE *f, Manifest *out)
                          &fail_status) != 0) goto fail;
     }
 
+    // Optional UPDATED=<seconds since the epoch> (D72).
+    if (line_key_is(line, "UPDATED", key_len))
+    {
+        if (parse_uint_field(value, INT64_MAX, &n) != 0 || n == 0) goto fail;
+        m.updated = (time_t)n;
+        if (read_kv_line(f, line, sizeof(line), &value, &key_len,
+                         &fail_status) != 0) goto fail;
+    }
+
     if (m.version == MANIFEST_SELECTION_VERSION)
     {
         if (!line_key_is(line, "SOURCE_HOME", key_len) ||
@@ -717,7 +726,7 @@ ManifestStatus manifest_read_v1_at(int container_fd, Manifest *out)
 // Two roots are the same identity if every field the manifest actually
 // records about them matches -- not just id, which by itself only proves
 // they occupy the same slot, not that the slot means the same thing.
-static int root_identity_equal(const ManifestRoot *a, const ManifestRoot *b)
+int manifest_root_equal(const ManifestRoot *a, const ManifestRoot *b)
 {
     if (strcmp(a->id, b->id) != 0)
         return 0;
@@ -739,6 +748,16 @@ static int root_ptr_id_cmp(const void *pa, const void *pb)
     const ManifestRoot *a = *(const ManifestRoot * const *)pa;
     const ManifestRoot *b = *(const ManifestRoot * const *)pb;
     return strcmp(a->id, b->id);
+}
+
+int manifest_install_identity_equal(const Manifest *a, const Manifest *b)
+{
+    return a != NULL && b != NULL &&
+           a->representation == b->representation &&
+           a->sidecar_version == b->sidecar_version &&
+           a->has_source_identity && b->has_source_identity &&
+           strcmp(a->machine_id, b->machine_id) == 0 &&
+           a->source_uid == b->source_uid;
 }
 
 ManifestIdentityComparison manifest_resume_identity_compare(const Manifest *a, const Manifest *b)
@@ -807,7 +826,7 @@ ManifestIdentityComparison manifest_resume_identity_compare(const Manifest *a, c
 
     result = MANIFEST_IDENTITY_EQUAL;
     for (int i = 0; i < n; i++)
-        if (!root_identity_equal(sa[i], sb[i]))
+        if (!manifest_root_equal(sa[i], sb[i]))
         {
             result = MANIFEST_IDENTITY_DIFFERENT;
             break;
@@ -925,6 +944,10 @@ static int manifest_serialize(FILE *f, const Manifest *m)
         fprintf(f, "NETWORK_CONFIG=1\n") < 0)
         failed = 1;
 
+    if (!failed && m->updated > 0 &&
+        fprintf(f, "UPDATED=%jd\n", (intmax_t)m->updated) < 0)
+        failed = 1;
+
     if (!failed && m->version == MANIFEST_SELECTION_VERSION)
     {
         char home[MANIFEST_ENC_MAX];
@@ -991,10 +1014,12 @@ int manifest_write_v1_at(int container_fd, const Manifest *m)
     if (container_fd < 0 || manifest_model_is_invalid(m))
         return 1;
 
-    // O_NOFOLLOW so a symlink standing where manifest.txt belongs fails the
-    // open (ELOOP) rather than having the container's own format state written
-    // through it to somewhere else.
-    int fd = openat(container_fd, "manifest.txt",
+    // Written beside and renamed over manifest.txt, so an update in place
+    // (D72) that is interrupted leaves the old or the new manifest, never a
+    // torn one. O_NOFOLLOW so a symlink standing there fails the open (ELOOP)
+    // rather than having the container's format state written through it.
+    static const char temporary[] = "manifest.txt.new";
+    int fd = openat(container_fd, temporary,
                     O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0644);
     if (fd < 0)
         return 1;
@@ -1003,13 +1028,20 @@ int manifest_write_v1_at(int container_fd, const Manifest *m)
     if (f == NULL)
     {
         close(fd);
+        (void)unlinkat(container_fd, temporary, 0);
         return 1;
     }
 
     int failed = manifest_serialize(f, m);
+    if (!failed && (fflush(f) != 0 || fsync(fd) != 0))
+        failed = 1;
     if (fclose(f) != 0) // also closes fd
         failed = 1;
-
+    if (!failed &&
+        renameat(container_fd, temporary, container_fd, "manifest.txt") != 0)
+        failed = 1;
+    if (failed)
+        (void)unlinkat(container_fd, temporary, 0);
     return failed ? 1 : 0;
 }
 

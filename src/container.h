@@ -77,10 +77,16 @@ typedef struct BackupContainer {
     int  dir_fd;                        /**< dest_root, opened once, O_CLOEXEC. */
     int  partial_fd;                    /**< the container directory itself, O_CLOEXEC;
                                               valid whenever state != CONTAINER_STATE_EMPTY. */
-    char partial_name[CONTAINER_NAME_MAX]; /**< leaf name while reserved/adopted. */
+    char partial_name[CONTAINER_NAME_MAX]; /**< leaf name while in progress: the
+                                                 ".partial" or ".updating" name. */
     char final_name[CONTAINER_NAME_MAX];   /**< leaf name once finalized. */
     int  suffix;                        /**< which name was used: 0 plain, 1 dated,
                                               N >= 2 the "-N" after the date. */
+    int  updating;                      /**< adopted a finished backup (or one
+                                              already being updated), now under
+                                              its ".updating" name (D72). */
+    int  from_finished;                 /**< this handle renamed a finished
+                                              backup to ".updating". */
 } BackupContainer;
 
 /**
@@ -155,42 +161,44 @@ ContainerStatus container_reserve(const char *dest_root, const char *owner,
                                   time_t timestamp, BackupContainer *out);
 
 /**
- * @brief Resumes the one existing ".partial" under dest_root whose manifest
- * proves it is the same job as wanted_identity.
+ * @brief Takes over the one existing backup under dest_root that belongs to
+ * the same install as wanted_identity: an interrupted one to resume, or a
+ * finished one to update in place (docs/DECISIONS.md D72).
  *
- * Scans dest_root's entries, considering only the ".partial" names
- * container_reserve() can produce for owner (docs/DECISIONS.md D71). Each
- * candidate is opened by directory fd (never re-resolved by path) and
- * flock(LOCK_EX | LOCK_NB)'d before its manifest is read: a candidate another
- * live process already holds is skipped as "in use", not treated as an error.
- * Only a manifest that reads back MANIFEST_STATUS_VALID and compares equal
- * via manifest_resume_identity_compare() counts as a match; missing, legacy,
- * malformed, or unknown-version manifests are simply not adoptable. A
- * wanted_identity with no source identity can never match anything
- * (docs/DECISIONS.md D15) and is rejected before any scan is attempted.
+ * Scans dest_root's entries, considering only the names container_reserve()
+ * can produce for owner, finished, ".partial", or ".updating"
+ * (docs/DECISIONS.md D71). Each candidate is opened by directory fd (never
+ * re-resolved by path) and flock(LOCK_EX | LOCK_NB)'d before its manifest is
+ * read: a candidate another live process already holds is skipped as "in
+ * use", not treated as an error. Only a manifest that reads back
+ * MANIFEST_STATUS_VALID and satisfies manifest_install_identity_equal()
+ * counts as a match; missing, legacy, malformed, or unknown-version
+ * manifests are simply not adoptable. A wanted_identity with no source
+ * identity can never match anything (docs/DECISIONS.md D15) and is rejected
+ * before any scan is attempted.
  *
- * Any operational failure while scanning, opening a candidate, or comparing
- * its identity (including an allocation failure inside
- * manifest_resume_identity_compare() -- MANIFEST_IDENTITY_ERROR, never
- * silently treated as DIFFERENT) -- as opposed to that candidate simply not
- * matching -- makes the whole call fail closed (CONTAINER_ERR_IO) even if
- * exactly one match was already found: an entry this call could not read (or
- * could not finish comparing) might have been a second match it never got to
- * see.
+ * Any operational failure while scanning, opening a candidate, or reading
+ * its manifest -- as opposed to that candidate simply not matching -- makes
+ * the whole call fail closed (CONTAINER_ERR_IO) even if exactly one match was
+ * already found: an entry this call could not read might have been a second
+ * match it never got to see.
  *
- * On the single-match success path, the same fd already opened, locked, and
- * verified during the scan is transferred into *out; it is never closed and
- * reopened by name.
+ * A finished match is renamed to "<name>.updating" (renameat2 with
+ * RENAME_NOREPLACE) while its lock is held, and out->updating is set, as it
+ * is for a match already named ".updating". On the single-match success
+ * path, the same fd already opened, locked, and verified during the scan is
+ * transferred into *out; it is never closed and reopened by name.
  *
  * @param dest_root      Destination directory to scan.
  * @param owner          The user whose names are scanned.
  * @param wanted_identity The identity (docs/DECISIONS.md D15) an existing
- *                        container's manifest must match to be resumed.
+ *                        container's manifest must match to be taken over.
  * @param out            Zeroed and populated on any return; CONTAINER_OK
  *                        leaves it holding an owned, locked handle.
  * @return CONTAINER_OK, CONTAINER_ERR_NO_MATCH, CONTAINER_ERR_AMBIGUOUS,
- *         CONTAINER_ERR_IO, or CONTAINER_ERR_INVALID (NULL out, dest_root, or
- *         wanted_identity).
+ *         CONTAINER_ERR_NOREPLACE (a finished match could not be renamed
+ *         atomically), CONTAINER_ERR_IO, or CONTAINER_ERR_INVALID (NULL out,
+ *         dest_root, owner, or wanted_identity).
  */
 ContainerStatus container_adopt(const char *dest_root, const char *owner,
                                 const Manifest *wanted_identity,
@@ -210,6 +218,16 @@ ContainerStatus container_adopt(const char *dest_root, const char *owner,
  *         CONTAINER_ERR_IO, or CONTAINER_ERR_INVALID (NULL, or wrong state).
  */
 ContainerStatus container_finalize(BackupContainer *container);
+
+/**
+ * @brief Gives a finished backup that this handle renamed for an update its
+ * finished name back, for a run that stops before changing anything in it
+ * (docs/DECISIONS.md D72). Nothing is synced: nothing was written.
+ *
+ * @return CONTAINER_OK, CONTAINER_ERR_IO, or CONTAINER_ERR_INVALID (a handle
+ *         that did not rename a finished backup, or is not in progress).
+ */
+ContainerStatus container_restore_finished_name(BackupContainer *container);
 
 /**
  * @brief Releases container's fds (and thus any flock() it holds) and zeroes it.
@@ -248,7 +266,8 @@ const char *container_current_name(const BackupContainer *container);
 
 /**
  * @brief Whether name is any user's in-progress container name ("migr-"
- * followed by name characters, then ".partial"; docs/DECISIONS.md D71) --
+ * followed by name characters, then ".partial" or ".updating";
+ * docs/DECISIONS.md D71, D72) --
  * i.e. an in-progress or abandoned container, not a finalized one. The
  * owner is not known here, so the check is by shape only.
  *

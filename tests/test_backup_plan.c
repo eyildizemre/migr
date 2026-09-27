@@ -36,6 +36,7 @@
 #include "backup_plan.h"
 #include "manifest.h"
 #include "selection.h"
+#include "sidecar.h"
 #include "utils.h"
 
 #define GREEN "\033[0;32m"
@@ -1847,7 +1848,7 @@ static void test_vscode_extension_snapshot(void)
     if (have_container)
         join_path(snapshot, sizeof(snapshot), container, "vs-code-extensions.txt");
     check(rc == 0 && have_container &&
-              strstr(output, "Resuming an interrupted backup of the same job.") != NULL,
+              strstr(output, "Resuming an interrupted backup of this install.") != NULL,
           "the second explicit run adopts and completes the matching partial");
     check(have_container && access(snapshot, F_OK) != 0,
           "an adopted explicit backup clears a stale VS Code extension snapshot");
@@ -3637,6 +3638,231 @@ static void test_sudo_backup_belongs_to_invoker(void)
     remove_tree(parent);
 }
 
+static int count_final_containers(const char *target)
+{
+    DIR *dir = opendir(target);
+    if (dir == NULL)
+        return -1;
+    int count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL)
+        count += strncmp(entry->d_name, "migr-", 5) == 0 &&
+                 strchr(entry->d_name, '.') == NULL;
+    closedir(dir);
+    return count;
+}
+
+typedef struct {
+    const char *root_id;
+    size_t count;
+} RootEntryCount;
+
+static int count_root_entries(const SidecarLiveView *view, void *context)
+{
+    RootEntryCount *counter = context;
+    counter->count += view->entry->root_id.length == strlen(counter->root_id) &&
+                      memcmp(view->entry->root_id.data, counter->root_id,
+                             view->entry->root_id.length) == 0;
+    return 0;
+}
+
+// Live journal entries of root_id in a portable container, or SIZE_MAX.
+static size_t journal_root_entries(const char *container, const char *root_id)
+{
+    int container_fd = open(container, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    SidecarLog log = {0};
+    RootEntryCount counter = { .root_id = root_id };
+    int ok = container_fd >= 0 &&
+             sidecar_log_adopt_at(container_fd, &log) == SIDECAR_OPEN_RESUMABLE;
+    if (ok)
+        ok = sidecar_log_foreach(&log, count_root_entries, &counter) ==
+             SIDECAR_STATUS_OK;
+    if (ok)
+        sidecar_log_close(&log);
+    if (container_fd >= 0)
+        close(container_fd);
+    return ok ? counter.count : SIZE_MAX;
+}
+
+// A second backup of the same install updates the first in place (D72):
+// changed files are recopied, removed ones leave the payload, and a root
+// the new selection lacks is removed with its journal records.
+static void test_backup_updates_in_place(int portable)
+{
+    printf(BLUE "::" NC " production: a second %s backup updates the first in place\n",
+           portable ? "portable" : "native");
+
+    char home[PATH_MAX], target[PATH_MAX], dir[PATH_MAX], kept[PATH_MAX];
+    char removed[PATH_MAX], dropped[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_home");
+    setenv("HOME", home, 1);
+    join_path(dir, sizeof(dir), home, "notes");
+    mkdir_p(dir);
+    join_path(kept, sizeof(kept), dir, "kept.txt");
+    join_path(removed, sizeof(removed), dir, "removed.txt");
+    join_path(dropped, sizeof(dropped), home, "dropped.txt");
+    write_file(kept, "first");
+    write_file(removed, "removed");
+    write_file(dropped, "dropped");
+    fresh_mkdtemp(target, sizeof(target), "plan_target");
+
+    dry_run = 0;
+    backup_test_force_portable_representation(portable);
+    char output[8192];
+    char *first_paths[] = { dir, dropped, NULL };
+    int first_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS,
+                                        first_paths, output, sizeof(output));
+    char container[PATH_MAX];
+    struct stat first_st = {0};
+    int found = find_container_dir(target, container, sizeof(container)) &&
+                stat(container, &first_st) == 0;
+
+    write_file(kept, "second, longer");
+    check(unlink(removed) == 0, "fixture: remove a backed-up file");
+    char *second_paths[] = { dir, NULL };
+    int second_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS,
+                                         second_paths, output, sizeof(output));
+    backup_test_force_portable_representation(0);
+
+    struct stat second_st = {0};
+    char payload[PATH_MAX];
+    check(first_rc == 0 && second_rc == 0 && found &&
+              count_final_containers(target) == 1 &&
+              stat(container, &second_st) == 0 &&
+              second_st.st_ino == first_st.st_ino &&
+              find_partial_container_dir(target, payload, sizeof(payload)) == 0 &&
+              strstr(output, "Updating this install's backup in place.") != NULL,
+          "the same container is updated and published under the same name");
+
+    join_path(payload, sizeof(payload), container, "data/EXPLICIT_0/kept.txt");
+    check(file_text_is(payload, "second, longer"), "a changed file is recopied");
+    join_path(payload, sizeof(payload), container, "data/EXPLICIT_0/removed.txt");
+    check(access(payload, F_OK) != 0, "a removed file leaves the payload");
+    join_path(payload, sizeof(payload), container, "data/EXPLICIT_1");
+    check(access(payload, F_OK) != 0,
+          "a root the new selection lacks leaves the payload");
+
+    Manifest recorded;
+    int container_fd = open(container, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int manifest_ok = container_fd >= 0 &&
+                      manifest_read_v1_at(container_fd, &recorded) ==
+                          MANIFEST_STATUS_VALID;
+    check(manifest_ok && recorded.root_count == 1 &&
+              strcmp(recorded.roots[0].id, "EXPLICIT_0") == 0 &&
+              recorded.updated > 0,
+          "the manifest lists the new selection and when it was taken");
+    if (manifest_ok)
+        manifest_free(&recorded);
+    if (container_fd >= 0)
+        close(container_fd);
+    if (portable)
+        check(journal_root_entries(container, "EXPLICIT_1") == 0 &&
+                  journal_root_entries(container, "EXPLICIT_0") == 2,
+              "the journal keeps the kept root's entries and none of the "
+              "dropped root's");
+
+    remove_tree(home);
+    remove_tree(target);
+}
+
+static void grow_source_before_inventory(const char *source_path,
+                                         void *context)
+{
+    if (strcmp(source_path, (const char *)context) != 0)
+        return;
+    int fd = open(source_path, O_WRONLY | O_APPEND | O_CLOEXEC);
+    if (fd >= 0)
+    {
+        (void)write(fd, "!", 1);
+        close(fd);
+    }
+}
+
+// An update that stops before changing anything gives the finished backup its
+// name back instead of leaving it looking unfinished (D72).
+static void test_failed_update_keeps_the_finished_backup(void)
+{
+    printf(BLUE "::" NC " production: an update that stops before changing anything keeps the backup as it was\n");
+
+    char home[PATH_MAX], target[PATH_MAX], file[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_home");
+    setenv("HOME", home, 1);
+    join_path(file, sizeof(file), home, "file.txt");
+    write_file(file, "before");
+    fresh_mkdtemp(target, sizeof(target), "plan_target");
+    char *paths[] = { file, NULL };
+    char output[8192];
+    dry_run = 0;
+
+    int first_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                        output, sizeof(output));
+    char container[PATH_MAX], payload[PATH_MAX];
+    int found = find_container_dir(target, container, sizeof(container));
+    join_path(payload, sizeof(payload), container, "data/EXPLICIT_0");
+
+    backup_test_set_inventory_hook(grow_source_before_inventory, file);
+    int second_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                         output, sizeof(output));
+    backup_test_set_inventory_hook(NULL, NULL);
+    char updating[PATH_MAX + 16];
+    snprintf(updating, sizeof(updating), "%s.updating", container);
+    check(first_rc == 0 && found && second_rc == 2 &&
+              strstr(output, "metadata preflight failed") != NULL &&
+              access(container, F_OK) == 0 && access(updating, F_OK) != 0 &&
+              file_text_is(payload, "before"),
+          "the backup keeps its finished name and content");
+
+    remove_tree(home);
+    remove_tree(target);
+}
+
+// A backup of this user's name that belongs to another install is left alone
+// (D71, D72): this install gets a dated backup of its own and updates it.
+static void test_backup_leaves_another_install_alone(void)
+{
+    printf(BLUE "::" NC " production: another install's backup is left alone\n");
+
+    char home[PATH_MAX], target[PATH_MAX], file[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_home");
+    setenv("HOME", home, 1);
+    join_path(file, sizeof(file), home, "file.txt");
+    write_file(file, "old install");
+    fresh_mkdtemp(target, sizeof(target), "plan_target");
+    char *paths[] = { file, NULL };
+    char output[8192];
+    dry_run = 0;
+
+    backup_test_set_machine_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    int old_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                      output, sizeof(output));
+    char old_container[PATH_MAX], old_payload[PATH_MAX];
+    int found = find_container_dir(target, old_container,
+                                   sizeof(old_container));
+    join_path(old_payload, sizeof(old_payload), old_container,
+              "data/EXPLICIT_0");
+
+    write_file(file, "new install");
+    backup_test_set_machine_id("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    int new_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                      output, sizeof(output));
+    check(old_rc == 0 && new_rc == 0 && found &&
+              count_final_containers(target) == 2 &&
+              file_text_is(old_payload, "old install") &&
+              strstr(output, "belongs to another install") != NULL,
+          "the new install gets its own dated backup; the old one is untouched");
+
+    new_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                  output, sizeof(output));
+    backup_test_set_machine_id(NULL);
+    check(new_rc == 0 && count_final_containers(target) == 2 &&
+              strstr(output, "Updating this install's backup in place.") != NULL &&
+              file_text_is(old_payload, "old install"),
+          "the next run updates the new install's backup, not the old one");
+
+    remove_tree(home);
+    remove_tree(target);
+}
+
 static void test_dangling_builtin_dotfile_is_captured_not_silently_dropped(void)
 {
     printf(BLUE "::" NC " production: a dangling built-in dotfile symlink is actually captured, not silently dropped\n");
@@ -3910,6 +4136,10 @@ int main(void)
     test_overlap_rejected_before_destination_created_live_and_dry_run();
     test_dangling_explicit_leaf_symlink_is_captured_as_symlink();
     test_sudo_backup_belongs_to_invoker();
+    test_backup_updates_in_place(0);
+    test_backup_updates_in_place(1);
+    test_backup_leaves_another_install_alone();
+    test_failed_update_keeps_the_finished_backup();
     test_dangling_builtin_dotfile_is_captured_not_silently_dropped();
     test_shell_history_consent_gate();
     test_unusable_target_does_not_leak_the_plan();

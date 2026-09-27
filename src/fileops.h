@@ -83,6 +83,16 @@ typedef enum {
 } NativeReconcileStatus;
 
 /**
+ * @brief Removes rel_path below root_fd and everything under it, following
+ * no symlink on the way. A path that is already gone is not an error. Meant
+ * for trees migr owns, such as a payload root left out of an updated backup
+ * (docs/DECISIONS.md D72).
+ *
+ * @return 0 on success, -1 on error.
+ */
+int fileops_remove_tree_at(int root_fd, const char *rel_path);
+
+/**
  * @brief Removes destination entries absent from a completed native capture.
  *
  * The caller must invoke this only after every root in the capture walk has

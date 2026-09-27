@@ -52,6 +52,13 @@ int resolve_sudo_identity(uid_t *uid_out, gid_t *gid_out,
  */
 const char *invoker_name(void);
 
+/**
+ * @brief Prints "Backup taken <local YYYY-MM-DD HH:MM>" and a newline when a
+ *        backup's manifest records when it was taken (docs/DECISIONS.md D72);
+ *        prints nothing for 0.
+ */
+void print_backup_time(time_t taken);
+
 #ifdef USER_CONTEXT_TEST_HOOKS
 int resolve_target_home_for_test(const char *home_env,
                                  const char *sudo_uid_env,

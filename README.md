@@ -142,7 +142,7 @@ Location: /media/usb/migr-eyildizemre
 
 ```
 report [SCOPE]        Show backup analysis report (default when no command given)
-backup <PATH>         Create a resumable backup container under PATH
+backup <PATH>         Create this user's backup under PATH, or update it in place
 restore <SOURCE>      Restore files and packages from a backup at SOURCE
 conf                  Edit persistent critical/comprehensive selection rules
 help                  Show help
@@ -332,6 +332,17 @@ While the backup is running, migr writes to the same name with a `.partial` suff
 A failed or interrupted backup is never published as complete; a later invocation of
 the same job can resume a matching usable partial. Restore refuses `.partial`
 containers.
+
+Backing up again to the same PATH updates this install's backup in place
+instead of creating another one. It is renamed to `migr-<user>.updating` while
+the update runs, so an interrupted update is never taken for a complete backup,
+and the next backup finishes it; one that stops before changing anything gets
+its name back. Unchanged files are skipped, changed ones are copied again, and
+files that were removed, or are no longer selected, leave the backup. When the
+selection itself changed (a `migr conf` edit, another scope), roots that are no
+longer selected are removed with their records. `verify` and `restore` show
+when the backup was last taken. With explicit paths, root names follow the
+sorted order of the paths, so adding a path may copy the others again.
 
 Before publishing a container under its final name, migr flushes the destination
 filesystem and then flushes the destination directory after the atomic rename.

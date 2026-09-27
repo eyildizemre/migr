@@ -184,8 +184,26 @@ static void test_clean_backup(void)
     int rc = run_verify(fixture.container, output, sizeof(output));
     check(rc == 0 && strstr(output, "Verifying 6 items") != NULL &&
               strstr(output, "Backup verified: all 6 items match what was "
-                             "captured") != NULL,
+                             "captured") != NULL &&
+              strstr(output, "Backup taken") == NULL,
           "every item of an intact backup matches its capture record");
+
+    Manifest manifest;
+    int container_fd = open(fixture.container,
+                            O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0 ||
+        manifest_read_v1_at(container_fd, &manifest) != MANIFEST_STATUS_VALID)
+        fatal("could not read the fixture manifest");
+    manifest.updated = 1790500000; // 2026-09-27 09:06:40 UTC
+    if (manifest_write_v1_at(container_fd, &manifest) != 0)
+        fatal("could not stamp the fixture manifest");
+    manifest_free(&manifest);
+    close(container_fd);
+    setenv("TZ", "UTC", 1);
+    tzset();
+    rc = run_verify(fixture.container, output, sizeof(output));
+    check(rc == 0 && strstr(output, "Backup taken 2026-09-27 09:06\n") != NULL,
+          "when the backup was taken is shown before verifying it");
     remove_tree(fixture.base);
 }
 
