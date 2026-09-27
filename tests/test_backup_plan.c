@@ -35,6 +35,7 @@
 #include "backup.h"
 #include "backup_plan.h"
 #include "manifest.h"
+#include "packages.h"
 #include "selection.h"
 #include "sidecar.h"
 #include "utils.h"
@@ -1793,6 +1794,20 @@ static void test_vscode_extension_snapshot(void)
     check(strstr(output,
                  "Saved VS Code extension list to vs-code-extensions.txt") != NULL,
           "a successful extension snapshot is reported");
+
+    char user[ACCOUNT_NAME_MAX];
+    char *groups = local_account_name(getuid(), user) == 0
+        ? groups_collect("/etc/group", user) : NULL;
+    if (groups != NULL && have_container)
+    {
+        join_path(expected, sizeof(expected), stub_dir, "groups.txt");
+        write_file(expected, groups);
+        join_path(snapshot, sizeof(snapshot), container, "groups.txt");
+        check(files_are_equal(expected, snapshot) &&
+                  strstr(output, " to groups.txt") != NULL,
+              "a scoped backup saves the user's group memberships");
+    }
+    free(groups);
     remove_tree(target);
 
     write_file(code_stub, "#!/bin/sh\nexit 7\n");
@@ -1839,6 +1854,8 @@ static void test_vscode_extension_snapshot(void)
     {
         join_path(snapshot, sizeof(snapshot), partial, "vs-code-extensions.txt");
         write_file(snapshot, "stale@9.9.9\n");
+        join_path(snapshot, sizeof(snapshot), partial, "groups.txt");
+        write_file(snapshot, "stale\n");
     }
     write_file(explicit_source, "resume payload\n");
 
@@ -1852,6 +1869,10 @@ static void test_vscode_extension_snapshot(void)
           "the second explicit run adopts and completes the matching partial");
     check(have_container && access(snapshot, F_OK) != 0,
           "an adopted explicit backup clears a stale VS Code extension snapshot");
+    if (have_container)
+        join_path(snapshot, sizeof(snapshot), container, "groups.txt");
+    check(have_container && access(snapshot, F_OK) != 0,
+          "an adopted explicit backup clears a stale group list");
 
     remove_tree(target);
     remove_tree(home);

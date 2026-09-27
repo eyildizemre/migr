@@ -14,6 +14,7 @@ void packages_test_set_restore_hooks(distro_t distro,
                                      PackagesTestRunHook run_hook,
                                      PackagesTestCaptureHook capture_hook,
                                      void *context);
+void packages_test_set_group_file(const char *path);
 void packages_test_clear_restore_hooks(void);
 int packages_test_drop_kernel_pinned(char *buffer);
 #endif
@@ -135,5 +136,34 @@ void read_package_list(FILE *pkg_file, char ***pkgs_out, int *pkg_count_out,
  * @param had_error      Set to 1 on a real failure; untouched otherwise.
  */
 void restore_packages(int source_root_fd, const char *home, int *had_error);
+
+/**
+ * @brief Lists the groups whose member list in group_path names user, one
+ *        name per line.
+ *
+ * These are the user's supplementary memberships, by name since GIDs differ
+ * between installs. The file is read directly, without NSS, as D38 reads
+ * accounts: a directory service's groups are not the install's. Names a
+ * restore would not accept are left out.
+ *
+ * @return A heap string, empty when user is in no group; NULL when the file
+ *         cannot be read.
+ */
+char *groups_collect(const char *group_path, const char *user);
+
+/**
+ * @brief Adds user to the groups a restored groups.txt lists.
+ *
+ * Runs after restore_packages(), since packages create groups (the libvirt
+ * package creates libvirt). Groups this system has and user is not yet in
+ * are added with one usermod; groups it lacks are listed and never created,
+ * since one comes with software that would give it a system GID. An absent
+ * groups.txt is skipped silently. A dry run only says what it would add.
+ *
+ * @param user      Login name to add; NULL when it could not be resolved,
+ *                  which fails the step if there is anything to add.
+ * @param had_error Set to 1 on a real failure; untouched otherwise.
+ */
+void restore_groups(int source_root_fd, const char *user, int *had_error);
 
 #endif

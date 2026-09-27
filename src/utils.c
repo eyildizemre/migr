@@ -77,7 +77,8 @@ typedef enum {
 static SudoAccountResult resolve_sudo_account(uid_t target_uid,
                                                const char *passwd_path,
                                                char home_out[PATH_MAX],
-                                               gid_t *gid_out)
+                                               gid_t *gid_out,
+                                               char name_out[ACCOUNT_NAME_MAX])
 {
     FILE *passwd = fopen(passwd_path, "r");
     if (passwd == NULL)
@@ -90,6 +91,7 @@ static SudoAccountResult resolve_sudo_account(uid_t target_uid,
     int matching_home_invalid = 0;
     gid_t resolved_gid = 0;
     char resolved[PATH_MAX] = {0};
+    char resolved_name[ACCOUNT_NAME_MAX] = {0};
     int read_error = 0;
     int read_errno = 0;
 
@@ -150,7 +152,15 @@ static SudoAccountResult resolve_sudo_account(uid_t target_uid,
             matching_home_invalid = 1;
             continue;
         }
+        size_t name_length = strnlen(fields[0], ACCOUNT_NAME_MAX);
+        if (name_out != NULL &&
+            (name_length == 0 || name_length >= ACCOUNT_NAME_MAX))
+        {
+            matching_record_malformed = 1;
+            continue;
+        }
         memcpy(resolved, home, strlen(home) + 1U);
+        memcpy(resolved_name, fields[0], name_length + 1U);
         resolved_gid = record_gid;
     }
 
@@ -179,6 +189,8 @@ static SudoAccountResult resolve_sudo_account(uid_t target_uid,
         memcpy(home_out, resolved, strlen(resolved) + 1U);
     if (gid_out != NULL)
         *gid_out = resolved_gid;
+    if (name_out != NULL)
+        memcpy(name_out, resolved_name, strlen(resolved_name) + 1U);
     return SUDO_ACCOUNT_OK;
 }
 
@@ -211,7 +223,7 @@ static int resolve_sudo_home(uid_t target_uid, const char *passwd_path,
                              char out[PATH_MAX])
 {
     SudoAccountResult result = resolve_sudo_account(target_uid, passwd_path,
-                                                    out, NULL);
+                                                    out, NULL, NULL);
     if (result == SUDO_ACCOUNT_OK)
         return 0;
     report_sudo_account_error(result);
@@ -233,7 +245,8 @@ static int resolve_sudo_identity_impl(const char *sudo_uid_env,
 
     char home[PATH_MAX];
     gid_t gid;
-    if (resolve_sudo_account(uid, passwd_path, home, &gid) != SUDO_ACCOUNT_OK)
+    if (resolve_sudo_account(uid, passwd_path, home, &gid, NULL) !=
+        SUDO_ACCOUNT_OK)
         return -1;
 
     *uid_out = uid;
@@ -247,6 +260,18 @@ int resolve_sudo_identity(uid_t *uid_out, gid_t *gid_out,
 {
     return resolve_sudo_identity_impl(getenv("SUDO_UID"), "/etc/passwd",
                                       uid_out, gid_out, home_out);
+}
+
+static int local_account_name_impl(uid_t uid, const char *passwd_path,
+                                   char out[ACCOUNT_NAME_MAX])
+{
+    return resolve_sudo_account(uid, passwd_path, NULL, NULL, out) ==
+           SUDO_ACCOUNT_OK ? 0 : -1;
+}
+
+int local_account_name(uid_t uid, char out[ACCOUNT_NAME_MAX])
+{
+    return local_account_name_impl(uid, "/etc/passwd", out);
 }
 
 void print_backup_time(time_t taken)
@@ -330,6 +355,12 @@ int resolve_target_home_for_test(const char *home_env,
 {
     return resolve_target_home_impl(home_env, sudo_uid_env, passwd_path,
                                     running_as_root, out);
+}
+
+int local_account_name_for_test(uid_t uid, const char *passwd_path,
+                                char out[ACCOUNT_NAME_MAX])
+{
+    return local_account_name_impl(uid, passwd_path, out);
 }
 
 int resolve_sudo_identity_for_test(const char *sudo_uid_env,

@@ -206,6 +206,31 @@ static void test_sudo_identity_resolution(const char *passwd_path)
           "missing local passwd uid is rejected for identity resolution");
 }
 
+static void test_local_account_name(const char *passwd_path)
+{
+    char name[ACCOUNT_NAME_MAX];
+
+    write_fixture(passwd_path,
+                  "root:x:0:0::/root:/bin/sh\n"
+                  "eyildizemre:x:1000:1000::/home/eyildizemre:/bin/sh\n");
+    check(local_account_name_for_test(1000, passwd_path, name) == 0 &&
+              strcmp(name, "eyildizemre") == 0,
+          "a uid resolves to its local login name");
+
+    check(local_account_name_for_test(2000, passwd_path, name) != 0,
+          "a uid with no local entry has no name");
+
+    write_fixture(passwd_path,
+                  "eyildizemre:x:1000:1000::/home/eyildizemre:/bin/sh\n"
+                  "twin:x:1000:1000::/home/twin:/bin/sh\n");
+    check(local_account_name_for_test(1000, passwd_path, name) != 0,
+          "a uid shared by two local entries has no name");
+
+    write_fixture(passwd_path, ":x:1000:1000::/home/eyildizemre:/bin/sh\n");
+    check(local_account_name_for_test(1000, passwd_path, name) != 0,
+          "an entry with an empty name has no name");
+}
+
 static void test_target_home_resolution(void)
 {
     char passwd_path[] = "/tmp/migr-passwd-XXXXXX";
@@ -218,6 +243,7 @@ static void test_target_home_resolution(void)
     close(passwd_fd);
 
     test_sudo_identity_resolution(passwd_path);
+    test_local_account_name(passwd_path);
 
     char home[PATH_MAX];
     char diagnostic[512];

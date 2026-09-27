@@ -18,6 +18,7 @@ static distro_t packages_test_restore_distro;
 static PackagesTestRunHook packages_test_run_hook;
 static PackagesTestCaptureHook packages_test_capture_hook;
 static void *packages_test_run_context;
+static const char *packages_test_group_file;
 
 void packages_test_set_restore_hooks(distro_t distro,
                                      PackagesTestRunHook run_hook,
@@ -31,6 +32,11 @@ void packages_test_set_restore_hooks(distro_t distro,
     packages_test_run_context = context;
 }
 
+void packages_test_set_group_file(const char *path)
+{
+    packages_test_group_file = path;
+}
+
 void packages_test_clear_restore_hooks(void)
 {
     packages_test_restore_override = 0;
@@ -38,6 +44,7 @@ void packages_test_clear_restore_hooks(void)
     packages_test_run_hook = NULL;
     packages_test_capture_hook = NULL;
     packages_test_run_context = NULL;
+    packages_test_group_file = NULL;
 }
 #endif
 
@@ -636,50 +643,73 @@ static int package_account_final_state(distro_t distro, char **pkgs,
     return 0;
 }
 
-// Reads and processes packages.txt from the container root (never inside
-// data/: it is a control artifact, not payload, in both legacy and v1
-// layouts). Opened by directory fd with O_NOFOLLOW + O_NONBLOCK -- the same
-// discipline manifest.c uses for manifest.txt: a symlinked packages.txt is
-// never followed into an arbitrary location, and a FIFO there can never
-// hang this call waiting for a writer that will never come.
-void restore_packages(int source_root_fd, const char *home, int *had_error)
+enum { CONTROL_FILE_OPEN, CONTROL_FILE_ABSENT, CONTROL_FILE_UNUSABLE };
+
+// Opens a list at the container root (never inside data/: it is a control
+// artifact, not payload, in both legacy and v1 layouts). Opened by directory
+// fd with O_NOFOLLOW + O_NONBLOCK -- the same discipline manifest.c uses for
+// manifest.txt: a symlinked list is never followed into an arbitrary
+// location, and a FIFO there can never hang this call waiting for a writer
+// that will never come.
+static int open_control_file(int source_root_fd, const char *leaf,
+                             FILE **out, int *had_error)
 {
-    int fd = openat(source_root_fd, "packages.txt", O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    int fd = openat(source_root_fd, leaf,
+                    O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0)
     {
         if (errno == ENOENT)
-            printf("\nNote: packages.txt not found, skipping package restore.\n");
-        else
-        {
-            print_error("Error: Could not read packages.txt\n");
-            *had_error = 1;
-        }
-        return;
+            return CONTROL_FILE_ABSENT;
+        print_error("Error: Could not read %s\n", leaf);
+        *had_error = 1;
+        return CONTROL_FILE_UNUSABLE;
     }
 
     struct stat st;
     if (fstat(fd, &st) != 0)
     {
         close(fd);
-        print_error("Error: Could not inspect packages.txt\n");
+        print_error("Error: Could not inspect %s\n", leaf);
         *had_error = 1;
-        return;
+        return CONTROL_FILE_UNUSABLE;
     }
     if (!S_ISREG(st.st_mode))
     {
         close(fd);
-        print_warning("Warning: packages.txt is not a regular file, skipping package restore.\n");
-        return;
+        print_warning("Warning: %s is not a regular file, skipping it.\n",
+                      leaf);
+        return CONTROL_FILE_UNUSABLE;
     }
 
-    FILE *pkg_file = fdopen(fd, "r");
-    if (pkg_file == NULL)
+    *out = fdopen(fd, "r");
+    if (*out == NULL)
     {
         close(fd);
-        print_error("Error: Could not read packages.txt\n");
+        print_error("Error: Could not read %s\n", leaf);
         *had_error = 1;
-        return;
+        return CONTROL_FILE_UNUSABLE;
     }
+    return CONTROL_FILE_OPEN;
+}
+
+static void free_name_list(char **names, int count)
+{
+    if (names == NULL)
+        return;
+    for (int i = 0; i < count; i++)
+        free(names[i]);
+    free(names);
+}
+
+void restore_packages(int source_root_fd, const char *home, int *had_error)
+{
+    FILE *pkg_file = NULL;
+    int opened = open_control_file(source_root_fd, "packages.txt", &pkg_file,
+                                   had_error);
+    if (opened == CONTROL_FILE_ABSENT)
+        printf("\nNote: packages.txt not found, skipping package restore.\n");
+    if (opened != CONTROL_FILE_OPEN)
+        return;
 
     printf("\nPackages\n");
 
@@ -750,13 +780,252 @@ void restore_packages(int source_root_fd, const char *home, int *had_error)
         }
     }
 
-    if (pkgs != NULL)
-    {
-        for (int i = 0; i < pkg_count; i++)
-            free(pkgs[i]);
-        free(pkgs);
-    }
+    free_name_list(pkgs, pkg_count);
 
     if (accounting_complete)
         printf("  %d installed, %d skipped.\n", installed, skipped);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Supplementary group memberships                                           */
+/* ------------------------------------------------------------------------- */
+
+static const char *group_file_path(void)
+{
+#ifdef PACKAGES_TEST_HOOKS
+    if (packages_test_group_file != NULL)
+        return packages_test_group_file;
+#endif
+    return "/etc/group";
+}
+
+// Group names as useradd accepts them. Anything else in a restored list is
+// skipped, so it can neither become a usermod option nor split the
+// comma-separated group argument.
+static int group_name_is_safe(const char *name)
+{
+    size_t length = strlen(name);
+    return length != 0 && length < ACCOUNT_NAME_MAX && name[0] != '-' &&
+           strspn(name, "abcdefghijklmnopqrstuvwxyz"
+                        "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-") == length;
+}
+
+// Splits one group file line in place into its name and member list.
+// Returns -1 for a line that is not name:password:gid:members.
+static int group_line_split(char *line, char **name, char **members)
+{
+    line[strcspn(line, "\n")] = '\0';
+    char *password = strchr(line, ':');
+    char *gid = password != NULL ? strchr(password + 1, ':') : NULL;
+    char *list = gid != NULL ? strchr(gid + 1, ':') : NULL;
+    if (list == NULL || strchr(list + 1, ':') != NULL)
+        return -1;
+    *password = '\0';
+    *name = line;
+    *members = list + 1;
+    return 0;
+}
+
+static int group_members_include(const char *members, const char *user)
+{
+    size_t user_length = strlen(user);
+    for (const char *member = members; *member != '\0';)
+    {
+        size_t length = strcspn(member, ",");
+        if (length == user_length && memcmp(member, user, length) == 0)
+            return 1;
+        member += length;
+        if (*member == ',')
+            member++;
+    }
+    return 0;
+}
+
+char *groups_collect(const char *group_path, const char *user)
+{
+    FILE *groups = fopen(group_path, "re");
+    if (groups == NULL)
+        return NULL;
+    char *list = NULL;
+    size_t list_size = 0;
+    FILE *out = open_memstream(&list, &list_size);
+    if (out == NULL)
+    {
+        fclose(groups);
+        return NULL;
+    }
+
+    char *line = NULL;
+    size_t capacity = 0;
+    int failed = 0;
+    while (!failed && getline(&line, &capacity, groups) >= 0)
+    {
+        char *name;
+        char *members;
+        if (group_line_split(line, &name, &members) == 0 &&
+            group_name_is_safe(name) && group_members_include(members, user))
+            failed = fprintf(out, "%s\n", name) < 0;
+    }
+    failed |= ferror(groups) != 0;
+    free(line);
+    fclose(groups);
+    failed |= fclose(out) != 0;
+    if (failed)
+    {
+        free(list);
+        return NULL;
+    }
+    return list;
+}
+
+static void print_group_names(char **names, const int *pick, int count)
+{
+    const char *separator = "";
+    for (int i = 0; i < count; i++)
+    {
+        if (!pick[i])
+            continue;
+        printf("%s%s", separator, names[i]);
+        separator = ", ";
+    }
+}
+
+// Joins the picked names with commas, as usermod -G takes them.
+static char *join_group_names(char **names, const int *pick, int count)
+{
+    size_t size = 1;
+    for (int i = 0; i < count; i++)
+        if (pick[i])
+            size += strlen(names[i]) + 1U;
+    char *joined = malloc(size);
+    if (joined == NULL)
+        return NULL;
+    joined[0] = '\0';
+    for (int i = 0; i < count; i++)
+    {
+        if (!pick[i])
+            continue;
+        if (joined[0] != '\0')
+            strcat(joined, ",");
+        strcat(joined, names[i]);
+    }
+    return joined;
+}
+
+void restore_groups(int source_root_fd, const char *user, int *had_error)
+{
+    FILE *list = NULL;
+    if (open_control_file(source_root_fd, "groups.txt", &list, had_error) !=
+        CONTROL_FILE_OPEN)
+        return;
+
+    printf("\nGroups\n");
+    char **names = NULL;
+    int count = 0;
+    read_package_list(list, &names, &count, had_error);
+    fclose(list);
+
+    int *wanted = NULL;
+    int *missing = NULL;
+    FILE *groups = NULL;
+    if (count == 0)
+    {
+        printf("  The backup saved no group memberships.\n");
+        goto done;
+    }
+    wanted = calloc((size_t)count, sizeof(*wanted));
+    missing = calloc((size_t)count, sizeof(*missing));
+    groups = fopen(group_file_path(), "re");
+    if (user == NULL || wanted == NULL || missing == NULL || groups == NULL)
+    {
+        print_error("Error: Could not match the saved group memberships "
+                    "against this system\n");
+        *had_error = 1;
+        goto done;
+    }
+
+    // A recorded group is missing until the group file has it, and wanted
+    // when it does and does not list the user yet.
+    for (int i = 0; i < count; i++)
+        missing[i] = group_name_is_safe(names[i]);
+    char *line = NULL;
+    size_t capacity = 0;
+    while (getline(&line, &capacity, groups) >= 0)
+    {
+        char *name;
+        char *members;
+        if (group_line_split(line, &name, &members) != 0)
+            continue;
+        for (int i = 0; i < count; i++)
+        {
+            if (!missing[i] || strcmp(names[i], name) != 0)
+                continue;
+            missing[i] = 0;
+            wanted[i] = !group_members_include(members, user);
+        }
+    }
+    free(line);
+    if (ferror(groups))
+    {
+        print_error("Error: Could not read %s\n", group_file_path());
+        *had_error = 1;
+        goto done;
+    }
+
+    int wanted_count = 0;
+    int missing_count = 0;
+    for (int i = 0; i < count; i++)
+    {
+        wanted_count += wanted[i];
+        missing_count += missing[i];
+    }
+
+    if (wanted_count == 0)
+        printf("  %s is already in every saved group this system has.\n",
+               user);
+    else if (dry_run)
+    {
+        printf("  Would add %s to ", user);
+        print_group_names(names, wanted, count);
+        printf(".\n");
+    }
+    else
+    {
+        char *joined = join_group_names(names, wanted, count);
+        if (joined == NULL)
+        {
+            print_error("Error: Could not allocate the group list\n");
+            *had_error = 1;
+            goto done;
+        }
+        char *argv[] = {
+            "usermod", "-a", "-G", joined, "--", (char *)user, NULL
+        };
+        int status = package_run_command(argv);
+        free(joined);
+        if (status != 0)
+        {
+            print_error("Error: Could not add %s to the saved groups "
+                        "(usermod exited with %d)\n", user, status);
+            *had_error = 1;
+            goto done;
+        }
+        printf("  Added %s to ", user);
+        print_group_names(names, wanted, count);
+        printf(". This takes effect at the next login.\n");
+    }
+
+    if (missing_count != 0)
+    {
+        printf("  Left out, not on this system: ");
+        print_group_names(names, missing, count);
+        printf(".\n");
+    }
+
+done:
+    if (groups != NULL)
+        fclose(groups);
+    free(wanted);
+    free(missing);
+    free_name_list(names, count);
 }

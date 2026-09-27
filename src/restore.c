@@ -581,6 +581,19 @@ static int restore_session_uid(uid_t *uid)
     return 0;
 }
 
+// Re-creates the system state the backup lists, after its files: packages
+// first, since they bring groups along.
+static void restore_system_lists(int source_root_fd, const char *home,
+                                 int *had_error)
+{
+    restore_packages(source_root_fd, home, had_error);
+    uid_t uid;
+    char user[ACCOUNT_NAME_MAX];
+    int resolved = restore_session_uid(&uid) == 0 &&
+                   local_account_name(uid, user) == 0;
+    restore_groups(source_root_fd, resolved ? user : NULL, had_error);
+}
+
 // What a restore defers (D66, D69): the settings of every writer
 // application running now. Returns how many paths were filled.
 static size_t restore_deferred_paths(PortableRestoreDeferredPath *paths,
@@ -3284,7 +3297,7 @@ int restore_with_options(const char *source, const RestoreOptions *options)
             // Every entry was applied, so the dependent steps still run even
             // when verification found differences; those are reported below.
             restore_dconf_settings(dconf_database_fd, &had_portable_error);
-            restore_packages(source_root_fd, home, &had_portable_error);
+            restore_system_lists(source_root_fd, home, &had_portable_error);
             if (m.has_network_config)
                 restore_network_config(source_root_fd, &had_portable_error);
         }
@@ -3607,7 +3620,7 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         if (dconf_database_fd >= 0)
             close(dconf_database_fd);
     }
-    restore_packages(source_root_fd, home, &had_error);
+    restore_system_lists(source_root_fd, home, &had_error);
     if (mst == MANIFEST_STATUS_VALID && m.has_network_config)
         restore_network_config(source_root_fd, &had_error);
 

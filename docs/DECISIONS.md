@@ -4742,3 +4742,28 @@ once more: an unchanged update takes 4.3 s instead of 3.9 s.
 
 **Relationship:** Part of D72. Uses D52's rewrite-then-rename.
 
+## D74 — 2026-09-27 — Restore adds the user back to their groups
+
+**Status:** Implemented
+
+**Decision:** Every scope but explicit paths records the user's
+supplementary groups by name in `groups.txt` at the container root, as it
+records `packages.txt`. They are the groups whose member list in
+`/etc/group` names the user, read without NSS as D38 reads accounts; the
+user is the sudo invoker under sudo (D70). Restore, after packages, adds the
+user it targets to every recorded group the system has and does not list
+them in yet, with one `usermod -a -G`, and lists the recorded groups the
+system lacks. It never creates a group: a missing one comes with software
+that is not installed yet, and a group made in advance would not get the
+system GID its package gives it. Admin groups are not special: `wheel` is
+added back where it exists and listed where it does not (Ubuntu names it
+`sudo`); migr does not translate between them, because that decides who
+administers the system.
+
+**Why:** After the first real restore, virt-manager asked for a password
+for `qemu:///system`: the user was no longer in `libvirt`, which the old
+install's polkit rules trusted. Groups live in `/etc/group`, which no scope
+captures.
+
+**Relationship:** Follows D62 (restore runs as root) and D38.
+

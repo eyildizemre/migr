@@ -10,6 +10,7 @@
 
 #include "detect.h"
 #include "packages.h"
+#include "utils.h"
 
 #define GREEN "\033[0;32m"
 #define RED   "\033[0;31m"
@@ -857,6 +858,197 @@ static void test_kernel_pinned_packages_are_dropped(void)
           "an unterminated final kernel-pinned line is dropped too");
 }
 
+static int write_text(const char *path, const char *text)
+{
+    FILE *f = fopen(path, "w");
+    if (f == NULL)
+        return -1;
+    int ok = fputs(text, f) >= 0;
+    return fclose(f) == 0 && ok ? 0 : -1;
+}
+
+static void test_groups_collect(void)
+{
+    printf(BLUE "::" NC " groups_collect (unit)\n");
+    char path[] = "/tmp/migr_group_XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0)
+    {
+        check(0, "group fixture is created");
+        return;
+    }
+    close(fd);
+
+    check(write_text(path,
+                     "root:x:0:\n"
+                     "wheel:x:10:eyildizemre,other\n"
+                     "libvirt:x:970:eyildizemre\n"
+                     "docker:x:971:bob\n"
+                     "eyildizemre:x:1000:\n"
+                     "not a group line\n"
+                     "bad,name:x:5:eyildizemre\n"
+                     "-G:x:6:eyildizemre\n"
+                     "extra:x:8:eyildizemre,other:more\n"
+                     "eyildizemre2:x:7:eyildizemre2\n"
+                     "short:x:9:ale\n"
+                     "dialout:x:18:bob,eyildizemre") == 0,
+          "group fixture is written");
+    char *groups = groups_collect(path, "eyildizemre");
+    check(groups != NULL && strcmp(groups, "wheel\nlibvirt\ndialout\n") == 0,
+          "only groups whose member list names the user are listed, in file "
+          "order, without malformed lines or unsafe names");
+    free(groups);
+
+    groups = groups_collect(path, "carol");
+    check(groups != NULL && groups[0] == '\0',
+          "a user in no group gets an empty list, not a failure");
+    free(groups);
+
+    unlink(path);
+    check(groups_collect(path, "eyildizemre") == NULL,
+          "an unreadable group file yields no list");
+}
+
+typedef struct {
+    int calls;
+    int result;
+    char argv_text[512];
+} GroupRunFixture;
+
+static int group_run_fixture(char *const argv[], void *context)
+{
+    GroupRunFixture *fixture = context;
+    fixture->calls++;
+    fixture->argv_text[0] = '\0';
+    for (size_t i = 0; argv[i] != NULL; i++)
+    {
+        size_t used = strlen(fixture->argv_text);
+        snprintf(fixture->argv_text + used, sizeof(fixture->argv_text) - used,
+                 "%s%s", i == 0 ? "" : " ", argv[i]);
+    }
+    return fixture->result;
+}
+
+// Runs restore_groups() against a container holding groups_txt (none when
+// NULL) and a target group file, capturing what it prints. Returns
+// had_error, or -1 when the fixture could not be built.
+static int run_restore_groups_case(const char *groups_txt,
+                                   const char *group_file, const char *user,
+                                   GroupRunFixture *runner,
+                                   char *output, size_t output_size)
+{
+    char dir[] = "/tmp/migr_groups_restore_XXXXXX";
+    if (mkdtemp(dir) == NULL)
+        return -1;
+    char list_path[PATH_MAX];
+    char group_path[PATH_MAX];
+    snprintf(list_path, sizeof(list_path), "%s/groups.txt", dir);
+    snprintf(group_path, sizeof(group_path), "%s/group", dir);
+    int dir_fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    FILE *captured = tmpfile();
+    int saved_stdout = dup(STDOUT_FILENO);
+    int ready = dir_fd >= 0 && captured != NULL && saved_stdout >= 0 &&
+                write_text(group_path, group_file) == 0 &&
+                (groups_txt == NULL || write_text(list_path, groups_txt) == 0);
+
+    int had_error = -1;
+    if (ready)
+    {
+        packages_test_set_restore_hooks(DISTRO_FEDORA, group_run_fixture, NULL,
+                                        runner);
+        packages_test_set_group_file(group_path);
+        fflush(stdout);
+        dup2(fileno(captured), STDOUT_FILENO);
+        had_error = 0;
+        restore_groups(dir_fd, user, &had_error);
+        fflush(stdout);
+        dup2(saved_stdout, STDOUT_FILENO);
+        packages_test_clear_restore_hooks();
+
+        size_t length = 0;
+        if (fseek(captured, 0, SEEK_SET) == 0)
+            length = fread(output, 1, output_size - 1U, captured);
+        output[length] = '\0';
+    }
+
+    if (saved_stdout >= 0)
+        close(saved_stdout);
+    if (captured != NULL)
+        fclose(captured);
+    if (dir_fd >= 0)
+        close(dir_fd);
+    unlink(list_path);
+    unlink(group_path);
+    rmdir(dir);
+    return had_error;
+}
+
+static void test_restore_groups(void)
+{
+    printf(BLUE "::" NC " restore_groups (unit)\n");
+    const char *saved = "wheel\nlibvirt\ndialout\nmedia\n-G\nbad,name\n";
+    const char *target = "wheel:x:10:eyildizemre\n"
+                         "libvirt:x:970:\n"
+                         "dialout:x:18:bob\n";
+    char output[1024];
+    GroupRunFixture runner = {0};
+
+    int rc = run_restore_groups_case(saved, target, "eyildizemre", &runner, output,
+                                     sizeof(output));
+    check(rc == 0 && runner.calls == 1 &&
+              strcmp(runner.argv_text,
+                     "usermod -a -G libvirt,dialout -- eyildizemre") == 0,
+          "the user is added in one usermod to the saved groups the system "
+          "has and does not list them in yet");
+    check(strstr(output, "Added eyildizemre to libvirt, dialout. This takes effect "
+                         "at the next login.") != NULL &&
+              strstr(output, "Left out, not on this system: media.") != NULL,
+          "the summary names the groups added and the ones this system "
+          "lacks, and skips saved names no system could have");
+
+    memset(&runner, 0, sizeof(runner));
+    dry_run = 1;
+    rc = run_restore_groups_case(saved, target, "eyildizemre", &runner, output,
+                                 sizeof(output));
+    dry_run = 0;
+    check(rc == 0 && runner.calls == 0 &&
+              strstr(output, "Would add eyildizemre to libvirt, dialout.") != NULL,
+          "a dry run says which groups it would add and runs nothing");
+
+    memset(&runner, 0, sizeof(runner));
+    runner.result = 6;
+    rc = run_restore_groups_case(saved, target, "eyildizemre", &runner, output,
+                                 sizeof(output));
+    check(rc == 1 && runner.calls == 1,
+          "a failed usermod fails the step");
+
+    memset(&runner, 0, sizeof(runner));
+    rc = run_restore_groups_case("wheel\n", target, "eyildizemre", &runner, output,
+                                 sizeof(output));
+    check(rc == 0 && runner.calls == 0 &&
+              strstr(output, "already in every saved group") != NULL,
+          "nothing runs when the user is already in every saved group");
+
+    memset(&runner, 0, sizeof(runner));
+    rc = run_restore_groups_case(saved, target, NULL, &runner, output,
+                                 sizeof(output));
+    check(rc == 1 && runner.calls == 0,
+          "an unresolved user fails the step without running usermod");
+
+    memset(&runner, 0, sizeof(runner));
+    rc = run_restore_groups_case("", target, NULL, &runner, output,
+                                 sizeof(output));
+    check(rc == 0 && runner.calls == 0 &&
+              strstr(output, "saved no group memberships") != NULL,
+          "an empty list needs no user and changes nothing");
+
+    memset(&runner, 0, sizeof(runner));
+    rc = run_restore_groups_case(NULL, target, "eyildizemre", &runner, output,
+                                 sizeof(output));
+    check(rc == 0 && runner.calls == 0 && output[0] == '\0',
+          "a backup without groups.txt is skipped silently");
+}
+
 int main(void)
 {
     // A direct sudo run must not aim restores at the invoking user's home
@@ -887,6 +1079,9 @@ int main(void)
     test_restore_packages_batch_prefixes();
     test_restore_packages_single_pass_accounting();
     test_restore_packages_batch_alloc_failure_is_reported();
+
+    test_groups_collect();
+    test_restore_groups();
 
     printf("packages tests: %d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;

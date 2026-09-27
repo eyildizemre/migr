@@ -310,6 +310,8 @@ backups remain literal requests and do not add this consent gate.
 
 **Packages (all scopes except explicit paths):** The list of packages you explicitly installed — not the thousands of dependencies pulled in alongside them — saved as packages.txt and reinstalled on restore. Anything the new distribution cannot resolve is written to `skipped-packages.txt` rather than silently dropped.
 
+**Group memberships (all scopes except explicit paths):** The groups you were added to, such as `libvirt`, `docker`, or `dialout`, saved by name as `groups.txt`. Restore adds you back to each of them the new system has, after installing packages, since packages create groups; it takes effect at your next login. Groups the new system does not have are listed, not created.
+
 **VS Code extensions (all scopes except explicit paths):** When `code` is available and lists extensions, migr saves `code --list-extensions --show-versions` to `vs-code-extensions.txt` as a best-effort snapshot. Restore does not install VS Code or extensions from this file. Once VS Code is set up on the new system, each saved line can be passed to `code --install-extension` directly, or replayed with a simple shell loop.
 
 ## Backup Containers
@@ -357,6 +359,7 @@ The selected payload roots live below `data/`:
 migr-<user>/
 ├── manifest.txt
 ├── packages.txt        # present when this scope exports a package list
+├── groups.txt          # present when this scope exports group memberships
 ├── vs-code-extensions.txt # present when code lists installed extensions
 ├── migr                # present with --include-self
 ├── network/            # with --include-network-config when a backend is found

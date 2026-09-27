@@ -2901,7 +2901,10 @@ static int backup_dry_run(const char *target, BackupMode mode,
     printf("\nControls\n");
     printf("  Would write manifest.txt\n");
     if (mode != BACKUP_EXPLICIT_PATHS)
+    {
         printf("  Would export package list to packages.txt\n");
+        printf("  Would save group memberships to groups.txt\n");
+    }
     if (include_self)
         printf("  Would copy migr-static (%s) to the container root as migr\n",
                self_arch);
@@ -3542,6 +3545,43 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
             {
                 printf("Saved VS Code extension list to vs-code-extensions.txt\n");
             }
+        }
+
+        // Group memberships follow the same rule: restore adds the user to
+        // whatever groups.txt lists.
+        if (mode == BACKUP_EXPLICIT_PATHS)
+        {
+            if (packages_clear_at(container_fd, "groups.txt") != 0)
+            {
+                print_error("Error: could not clear groups.txt from the backup "
+                            "container\n");
+                had_error = 1;
+            }
+        }
+        else
+        {
+            printf("\nGroups\n");
+            char user[ACCOUNT_NAME_MAX];
+            char *groups = local_account_name(backup_source_uid(), user) == 0
+                ? groups_collect("/etc/group", user) : NULL;
+            int written = write_container_text_file_at(container_fd,
+                                                       "groups.txt", groups);
+            size_t group_count = 0;
+            for (const char *p = groups; p != NULL && *p != '\0'; p++)
+                group_count += *p == '\n';
+            free(groups);
+            if (written < 0)
+            {
+                print_error("Error: could not safely update groups.txt in the "
+                            "backup container\n");
+                had_error = 1;
+            }
+            else if (written > 0)
+                print_warning("  Warning: group memberships were not saved "
+                              "for this backup.\n");
+            else
+                printf("Saved %zu group membership%s to groups.txt\n",
+                       group_count, group_count == 1 ? "" : "s");
         }
 
         if (!had_error)

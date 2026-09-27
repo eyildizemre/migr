@@ -43,6 +43,16 @@ int resolve_target_home(char out[PATH_MAX]);
 int resolve_sudo_identity(uid_t *uid_out, gid_t *gid_out,
                           char home_out[PATH_MAX]);
 
+#define ACCOUNT_NAME_MAX 256
+
+/**
+ * @brief Resolves uid's login name from the local passwd file without NSS,
+ *        the way resolve_sudo_identity() resolves an account (D38).
+ *
+ * Returns -1 when no single well-formed entry has that uid.
+ */
+int local_account_name(uid_t uid, char out[ACCOUNT_NAME_MAX]);
+
 /**
  * @brief The login name of the user a run acts for, for naming only: the
  *        sudo invoker under sudo (SUDO_USER), otherwise USER or LOGNAME.
@@ -65,6 +75,8 @@ int resolve_target_home_for_test(const char *home_env,
                                  const char *passwd_path,
                                  int running_as_root,
                                  char out[PATH_MAX]);
+int local_account_name_for_test(uid_t uid, const char *passwd_path,
+                                char out[ACCOUNT_NAME_MAX]);
 int resolve_sudo_identity_for_test(const char *sudo_uid_env,
                                    const char *passwd_path,
                                    uid_t *uid_out, gid_t *gid_out,
