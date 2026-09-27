@@ -485,7 +485,7 @@ int verify_backup(const char *path)
         sidecar_report_incomplete(complete, valid_bytes, file_bytes);
         goto done;
     }
-    if (sidecar_log_adopt_at(container_fd, &sidecar) !=
+    if (sidecar_log_open_readonly_at(container_fd, &sidecar) !=
         SIDECAR_OPEN_RESUMABLE)
     {
         print_error("Error: Could not open the backup journal (%s).\n",

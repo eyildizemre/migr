@@ -744,13 +744,18 @@ fail:
     return -1;
 }
 
-SidecarOpenStatus sidecar_log_adopt_at(int container_fd, SidecarLog *out)
+// Loads the journal in the slot. A writable open repairs a truncated tail
+// and discards a leftover rewrite; a read-only one changes nothing in the
+// container and refuses a journal that would need that repair.
+static SidecarOpenStatus open_existing_log(int container_fd, int writable,
+                                           SidecarLog *out)
 {
     if (container_fd < 0 || out == NULL || out->implementation != NULL)
         return SIDECAR_OPEN_INVALID_ARGUMENT;
 
     int fd = openat(container_fd, SIDECAR_SLOT_NAME,
-                    O_RDWR | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+                    (writable ? O_RDWR : O_RDONLY) | O_NOFOLLOW | O_CLOEXEC |
+                        O_NONBLOCK);
     if (fd < 0)
     {
         if (errno == ENOENT)
@@ -794,6 +799,11 @@ SidecarOpenStatus sidecar_log_adopt_at(int container_fd, SidecarLog *out)
         goto fail;
     }
 
+    if (parse_status == SIDECAR_STATUS_TRUNCATED_TAIL && !writable)
+    {
+        status = SIDECAR_OPEN_UNUSABLE;
+        goto fail;
+    }
     if (parse_status == SIDECAR_STATUS_TRUNCATED_TAIL)
     {
         off_t truncate_offset = (off_t)result.last_valid_boundary;
@@ -818,7 +828,8 @@ SidecarOpenStatus sidecar_log_adopt_at(int container_fd, SidecarLog *out)
         fd = rewritten_fd;
         log->fd = rewritten_fd;
     }
-    else if (unlinkat(container_fd, SIDECAR_REWRITE_NAME, 0) != 0 &&
+    else if (writable &&
+             unlinkat(container_fd, SIDECAR_REWRITE_NAME, 0) != 0 &&
              errno != ENOENT)
     {
         status = SIDECAR_OPEN_IO_ERROR;
@@ -836,6 +847,17 @@ fail:
         errno = saved;
     }
     return status;
+}
+
+SidecarOpenStatus sidecar_log_adopt_at(int container_fd, SidecarLog *out)
+{
+    return open_existing_log(container_fd, 1, out);
+}
+
+SidecarOpenStatus sidecar_log_open_readonly_at(int container_fd,
+                                               SidecarLog *out)
+{
+    return open_existing_log(container_fd, 0, out);
 }
 
 // Live groups to rewrite. The map is in hash order; a rewritten journal

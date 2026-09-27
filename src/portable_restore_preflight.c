@@ -1588,9 +1588,8 @@ int portable_restore_preflight_at(
     if (data_fd < 0)
         goto fail;
 
-    /* Adoption repairs a truncated EOF tail in place.  Preflight is a
-     * rejection-only gate, so require a complete sidecar before opening the
-     * state log through that API. */
+    /* A complete journal is required, and its problem named when it is not;
+     * the read-only open below would only say it is unusable. */
     uint64_t sidecar_valid_bytes = 0;
     uint64_t sidecar_file_bytes = 0;
     SidecarStatus sidecar_complete = sidecar_check_complete_readonly(
@@ -1606,7 +1605,7 @@ int portable_restore_preflight_at(
     }
 
     SidecarLog sidecar = {0};
-    SidecarOpenStatus sidecar_status = sidecar_log_adopt_at(
+    SidecarOpenStatus sidecar_status = sidecar_log_open_readonly_at(
         request->source_container_fd, &sidecar);
     if (sidecar_status != SIDECAR_OPEN_RESUMABLE)
     {

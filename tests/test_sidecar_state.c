@@ -1639,6 +1639,16 @@ static void test_truncated_tail(int container_fd)
     if (stale_fd >= 0)
         close(stale_fd);
 
+    struct stat after_reader;
+    check(sidecar_log_open_readonly_at(container_fd, &log) ==
+                  SIDECAR_OPEN_UNUSABLE &&
+              log.implementation == NULL &&
+              fstatat(container_fd, SIDECAR_SLOT_NAME, &after_reader, 0) == 0 &&
+              after_reader.st_ino == before_adoption.st_ino &&
+              after_reader.st_size == before_adoption.st_size &&
+              faccessat(container_fd, SIDECAR_REWRITE_NAME, F_OK, 0) == 0,
+          "a read-only open refuses the tail and changes nothing");
+
     uint64_t adopted_boundary = 0;
     check(sidecar_log_adopt_at(container_fd, &log) == SIDECAR_OPEN_RESUMABLE &&
           slot_size(container_fd, &adopted_boundary) == 0 &&

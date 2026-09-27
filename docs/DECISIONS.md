@@ -4270,7 +4270,9 @@ tree, in path order, following each ancestor's recorded physical leaf: a
 directory must be a directory, a symlink or hardlink placeholder an empty
 regular file, and a regular file must have its recorded size and D59 content
 digest. Every mismatch is counted; the first eight are listed with their
-reason. It writes nothing. Exit status is 0 only when everything matches
+reason. It writes nothing: verify and restore load the journal with
+`sidecar_log_open_readonly_at()`, which neither repairs a tail nor removes a
+leftover rewrite, so a read-only mount works. Exit status is 0 only when everything matches
 (D68 splits the rest into 1 for differences and 2 for a backup it cannot
 check).
 Native containers and other journal versions are refused with the reason.

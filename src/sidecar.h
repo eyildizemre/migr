@@ -191,6 +191,12 @@ SidecarStatus sidecar_parse_fd(int fd, SidecarRecordCallback callback,
 /* The container directory fd is borrowed; the returned log owns its slot fd. */
 SidecarOpenStatus sidecar_log_create_at(int container_fd, SidecarLog *out);
 SidecarOpenStatus sidecar_log_adopt_at(int container_fd, SidecarLog *out);
+/* Loads the journal read-only for readers (verify, restore): nothing in the
+ * container changes, so a read-only mount works. A truncated tail, which
+ * adoption would repair, is SIDECAR_OPEN_UNUSABLE. Success is
+ * SIDECAR_OPEN_RESUMABLE; the log must not be appended to. */
+SidecarOpenStatus sidecar_log_open_readonly_at(int container_fd,
+                                               SidecarLog *out);
 SidecarStatus sidecar_log_close(SidecarLog *log);
 
 SidecarStatus sidecar_log_append_entry(SidecarLog *log,

@@ -207,6 +207,29 @@ static void test_clean_backup(void)
     remove_tree(fixture.base);
 }
 
+// verify only reads: a journal it may not write is checked all the same,
+// and nothing in the container is removed.
+static void test_read_only_backup(void)
+{
+    printf(BLUE "::" NC " verify: a backup it may not write\n");
+    Fixture fixture;
+    fixture_create(&fixture);
+    char journal[PATH_MAX], leftover[PATH_MAX];
+    join(journal, sizeof(journal), fixture.container, "sidecar.migr");
+    join(leftover, sizeof(leftover), fixture.container,
+         "sidecar.migr.rewrite");
+    write_text(leftover, "left by an interrupted rewrite");
+    if (chmod(journal, 0444) != 0)
+        fatal("could not make the journal read-only");
+    char output[8192];
+    int rc = run_verify(fixture.container, output, sizeof(output));
+    check(rc == 0 && strstr(output, "Backup verified") != NULL,
+          "a read-only journal is verified");
+    check(access(leftover, F_OK) == 0,
+          "verify leaves every file in the container in place");
+    remove_tree(fixture.base);
+}
+
 static void test_damaged_payloads(void)
 {
     printf(BLUE "::" NC " verify: damaged payloads are named\n");
@@ -312,6 +335,7 @@ int main(void)
     unsetenv("SUDO_UID");
     printf(BLUE "::" NC " migr verify\n");
     test_clean_backup();
+    test_read_only_backup();
     test_damaged_payloads();
     test_refusals();
     if (failures != 0)

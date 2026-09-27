@@ -3916,7 +3916,7 @@ int portable_restore_replay_at(const PortableRestoreRequest *request,
         goto fail;
 
     SidecarLog sidecar = {0};
-    if (sidecar_log_adopt_at(request->source_container_fd, &sidecar) !=
+    if (sidecar_log_open_readonly_at(request->source_container_fd, &sidecar) !=
         SIDECAR_OPEN_RESUMABLE)
     {
         close(collection.data_fd);
