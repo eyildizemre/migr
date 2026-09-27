@@ -2904,6 +2904,8 @@ static int backup_dry_run(const char *target, BackupMode mode,
     {
         printf("  Would export package list to packages.txt\n");
         printf("  Would save group memberships to groups.txt\n");
+        printf("  Would list system-wide Flatpak applications in "
+               "flatpak-apps.txt\n");
     }
     if (include_self)
         printf("  Would copy migr-static (%s) to the container root as migr\n",
@@ -2972,6 +2974,34 @@ char *backup_test_collect_vscode_extensions(void)
     return collect_vscode_extensions();
 }
 #endif
+
+// The supplementary groups of the user whose data the backup holds (D74).
+static char *backup_collect_groups(void)
+{
+    char user[ACCOUNT_NAME_MAX];
+    return local_account_name(backup_source_uid(), user) == 0
+        ? groups_collect("/etc/group", user) : NULL;
+}
+
+// Saves a list restore acts on at the container root, consuming contents;
+// NULL leaves the slot empty, which is what an explicit-paths backup, which
+// records no system state, asks for. Either way a stale list in an adopted
+// container never survives. Returns 0 with its line count when written, 1
+// when the slot was left empty, and -1, reported, when the slot could not be
+// made safe.
+static int backup_save_list_at(int container_fd, const char *leaf,
+                               char *contents, size_t *lines)
+{
+    *lines = 0;
+    for (const char *p = contents; p != NULL && *p != '\0'; p++)
+        *lines += *p == '\n';
+    int written = write_container_text_file_at(container_fd, leaf, contents);
+    free(contents);
+    if (written < 0)
+        print_error("Error: could not safely update %s in the backup "
+                    "container\n", leaf);
+    return written;
+}
 
 /* Every read during capture is served from the page cache, so a journal the
  * device stored differently (e.g. a cluster the filesystem also handed to
@@ -3547,41 +3577,42 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
             }
         }
 
-        // Group memberships follow the same rule: restore adds the user to
-        // whatever groups.txt lists.
+        // Group memberships and Flatpak applications follow the same rule:
+        // restore acts on whatever groups.txt and flatpak-apps.txt list.
+        size_t lines = 0;
         if (mode == BACKUP_EXPLICIT_PATHS)
         {
-            if (packages_clear_at(container_fd, "groups.txt") != 0)
-            {
-                print_error("Error: could not clear groups.txt from the backup "
-                            "container\n");
+            if (backup_save_list_at(container_fd, "groups.txt", NULL,
+                                    &lines) < 0 ||
+                backup_save_list_at(container_fd, "flatpak-apps.txt", NULL,
+                                    &lines) < 0)
                 had_error = 1;
-            }
         }
         else
         {
             printf("\nGroups\n");
-            char user[ACCOUNT_NAME_MAX];
-            char *groups = local_account_name(backup_source_uid(), user) == 0
-                ? groups_collect("/etc/group", user) : NULL;
-            int written = write_container_text_file_at(container_fd,
-                                                       "groups.txt", groups);
-            size_t group_count = 0;
-            for (const char *p = groups; p != NULL && *p != '\0'; p++)
-                group_count += *p == '\n';
-            free(groups);
-            if (written < 0)
-            {
-                print_error("Error: could not safely update groups.txt in the "
-                            "backup container\n");
+            int saved = backup_save_list_at(container_fd, "groups.txt",
+                                            backup_collect_groups(), &lines);
+            if (saved < 0)
                 had_error = 1;
-            }
-            else if (written > 0)
+            else if (saved > 0)
                 print_warning("  Warning: group memberships were not saved "
                               "for this backup.\n");
             else
                 printf("Saved %zu group membership%s to groups.txt\n",
-                       group_count, group_count == 1 ? "" : "s");
+                       lines, lines == 1 ? "" : "s");
+
+            printf("\nFlatpak Applications\n");
+            saved = backup_save_list_at(container_fd, "flatpak-apps.txt",
+                                        flatpak_apps_collect(), &lines);
+            if (saved < 0)
+                had_error = 1;
+            else if (saved > 0)
+                printf("  Note: no system-wide Flatpak applications were "
+                       "found.\n");
+            else
+                printf("Saved %zu Flatpak application%s to "
+                       "flatpak-apps.txt\n", lines, lines == 1 ? "" : "s");
         }
 
         if (!had_error)

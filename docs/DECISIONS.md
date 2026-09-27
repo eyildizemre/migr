@@ -4791,3 +4791,25 @@ GB on an older install) and are rebuilt by the applications.
 **Relationship:** Extends D66 and D69 to Flatpak applications. Reinstalling
 the applications themselves is separate.
 
+## D76 — 2026-09-27 — Restore reinstalls system-wide Flatpak applications
+
+**Status:** Implemented
+
+**Decision:** Every scope but explicit paths records the system Flatpak
+installation's applications in `flatpak-apps.txt` at the container root,
+the output of `flatpak list --system --app --columns=origin,application`
+(`<remote>\t<app-id>` per line). Restore, after packages (which may bring
+Flatpak itself) and before groups, skips the ones already installed and
+installs the rest with one `flatpak install --system -y <remote> <ids>` per
+remote the system has, then counts what is installed. Apps whose remote the
+system lacks are listed with the command to run once it is added: migr does
+not add remotes, since that needs the remote's signing key, which the
+backup does not have. A system without Flatpak gets the apps listed. A user
+installation needs no list: it is captured as files (D57).
+
+**Why:** Fedora installs Flatpaks system-wide, and `packages.txt` lists only
+the distribution's packages, so every Flatpak application was lost in a
+distro hop, and the data D75 restores had no application to use it.
+
+**Relationship:** Complements D75. Snap is not covered yet.
+

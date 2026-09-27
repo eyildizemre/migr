@@ -644,11 +644,12 @@ static int restore_session_uid(uid_t *uid)
 }
 
 // Re-creates the system state the backup lists, after its files: packages
-// first, since they bring groups along.
+// first, since they bring Flatpak and groups along.
 static void restore_system_lists(int source_root_fd, const char *home,
                                  int *had_error)
 {
     restore_packages(source_root_fd, home, had_error);
+    restore_flatpak_apps(source_root_fd, had_error);
     uid_t uid;
     char user[ACCOUNT_NAME_MAX];
     int resolved = restore_session_uid(&uid) == 0 &&

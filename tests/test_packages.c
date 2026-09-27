@@ -929,41 +929,35 @@ static int group_run_fixture(char *const argv[], void *context)
     return fixture->result;
 }
 
-// Runs restore_groups() against a container holding groups_txt (none when
-// NULL) and a target group file, capturing what it prints. Returns
-// had_error, or -1 when the fixture could not be built.
-static int run_restore_groups_case(const char *groups_txt,
-                                   const char *group_file, const char *user,
-                                   GroupRunFixture *runner,
-                                   char *output, size_t output_size)
+typedef void (*RestoreStep)(int dir_fd, int *had_error, void *context);
+
+// Runs step against a container holding leaf with contents (none when NULL),
+// capturing what it prints. Returns had_error, or -1 when the fixture could
+// not be built.
+static int run_control_file_case(const char *leaf, const char *contents,
+                                 RestoreStep step, void *context,
+                                 char *output, size_t output_size)
 {
-    char dir[] = "/tmp/migr_groups_restore_XXXXXX";
+    char dir[] = "/tmp/migr_control_restore_XXXXXX";
     if (mkdtemp(dir) == NULL)
         return -1;
-    char list_path[PATH_MAX];
-    char group_path[PATH_MAX];
-    snprintf(list_path, sizeof(list_path), "%s/groups.txt", dir);
-    snprintf(group_path, sizeof(group_path), "%s/group", dir);
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/%s", dir, leaf);
     int dir_fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     FILE *captured = tmpfile();
     int saved_stdout = dup(STDOUT_FILENO);
     int ready = dir_fd >= 0 && captured != NULL && saved_stdout >= 0 &&
-                write_text(group_path, group_file) == 0 &&
-                (groups_txt == NULL || write_text(list_path, groups_txt) == 0);
+                (contents == NULL || write_text(path, contents) == 0);
 
     int had_error = -1;
     if (ready)
     {
-        packages_test_set_restore_hooks(DISTRO_FEDORA, group_run_fixture, NULL,
-                                        runner);
-        packages_test_set_group_file(group_path);
         fflush(stdout);
         dup2(fileno(captured), STDOUT_FILENO);
         had_error = 0;
-        restore_groups(dir_fd, user, &had_error);
+        step(dir_fd, &had_error, context);
         fflush(stdout);
         dup2(saved_stdout, STDOUT_FILENO);
-        packages_test_clear_restore_hooks();
 
         size_t length = 0;
         if (fseek(captured, 0, SEEK_SET) == 0)
@@ -977,10 +971,40 @@ static int run_restore_groups_case(const char *groups_txt,
         fclose(captured);
     if (dir_fd >= 0)
         close(dir_fd);
-    unlink(list_path);
-    unlink(group_path);
+    unlink(path);
     rmdir(dir);
     return had_error;
+}
+
+static void restore_groups_step(int dir_fd, int *had_error, void *context)
+{
+    restore_groups(dir_fd, context, had_error);
+}
+
+// Runs restore_groups() for user against a target group file.
+static int run_restore_groups_case(const char *groups_txt,
+                                   const char *group_file, const char *user,
+                                   GroupRunFixture *runner,
+                                   char *output, size_t output_size)
+{
+    char group_path[] = "/tmp/migr_group_target_XXXXXX";
+    int fd = mkstemp(group_path);
+    if (fd < 0)
+        return -1;
+    close(fd);
+    int rc = -1;
+    if (write_text(group_path, group_file) == 0)
+    {
+        packages_test_set_restore_hooks(DISTRO_FEDORA, group_run_fixture, NULL,
+                                        runner);
+        packages_test_set_group_file(group_path);
+        rc = run_control_file_case("groups.txt", groups_txt,
+                                   restore_groups_step, (void *)user, output,
+                                   output_size);
+        packages_test_clear_restore_hooks();
+    }
+    unlink(group_path);
+    return rc;
 }
 
 static void test_restore_groups(void)
@@ -1049,6 +1073,126 @@ static void test_restore_groups(void)
           "a backup without groups.txt is skipped silently");
 }
 
+typedef struct {
+    const char *remotes; /* NULL: flatpak is not installed. */
+    const char *installed_before;
+    const char *installed_after;
+    int installs;
+    char install_argv[3][256];
+} FlatpakFixture;
+
+static int flatpak_capture_fixture(char *const argv[], char *output,
+                                   size_t output_size, void *context)
+{
+    FlatpakFixture *fixture = context;
+    const char *text = NULL;
+    if (strcmp(argv[1], "remotes") == 0)
+        text = fixture->remotes;
+    else if (strcmp(argv[1], "list") == 0)
+        text = fixture->installs == 0 ? fixture->installed_before
+                                      : fixture->installed_after;
+    if (text == NULL)
+        return 1;
+    snprintf(output, output_size, "%s", text);
+    return 0;
+}
+
+static int flatpak_run_fixture(char *const argv[], void *context)
+{
+    FlatpakFixture *fixture = context;
+    if (fixture->installs < 3)
+    {
+        char *joined = fixture->install_argv[fixture->installs];
+        joined[0] = '\0';
+        for (size_t i = 0; argv[i] != NULL; i++)
+        {
+            size_t used = strlen(joined);
+            snprintf(joined + used, 256U - used, "%s%s", i == 0 ? "" : " ",
+                     argv[i]);
+        }
+    }
+    fixture->installs++;
+    return 0;
+}
+
+static void restore_flatpak_step(int dir_fd, int *had_error, void *context)
+{
+    (void)context;
+    restore_flatpak_apps(dir_fd, had_error);
+}
+
+static int run_restore_flatpak_case(const char *list, FlatpakFixture *fixture,
+                                    char *output, size_t output_size)
+{
+    packages_test_set_restore_hooks(DISTRO_FEDORA, flatpak_run_fixture,
+                                    flatpak_capture_fixture, fixture);
+    int rc = run_control_file_case("flatpak-apps.txt", list,
+                                   restore_flatpak_step, NULL, output,
+                                   output_size);
+    packages_test_clear_restore_hooks();
+    return rc;
+}
+
+static void test_restore_flatpak_apps(void)
+{
+    printf(BLUE "::" NC " restore_flatpak_apps (unit)\n");
+    const char *list = "flathub\tcom.example.A\n"
+                       "flathub\tcom.example.B\n"
+                       "fedora\torg.example.C\n"
+                       "flathub\tcom.example.D\n"
+                       "elsewhere\tnet.example.E\n"
+                       "elsewhere\tnet.example.G\n"
+                       "-x\tnet.example.F\n"
+                       "flathub\t--or-update\n";
+    char output[2048];
+    FlatpakFixture fixture = {
+        .remotes = "fedora\nflathub\n",
+        .installed_before = "com.example.B\n",
+        .installed_after = "com.example.A\ncom.example.B\norg.example.C\n"
+    };
+    int rc = run_restore_flatpak_case(list, &fixture, output, sizeof(output));
+    check(rc == 0 && fixture.installs == 2 &&
+              strcmp(fixture.install_argv[0], "flatpak install --system -y "
+                     "flathub com.example.A com.example.D") == 0 &&
+              strcmp(fixture.install_argv[1], "flatpak install --system -y "
+                     "fedora org.example.C") == 0,
+          "missing apps are installed with one call per remote the system "
+          "has, skipping installed apps and unsafe names");
+    const char *hint = strstr(output, "No remote named elsewhere here; add "
+                                      "it, then run: flatpak install "
+                                      "elsewhere net.example.E net.example.G\n");
+    check(strstr(output, "2 installed, 1 not installed: com.example.D.") !=
+              NULL &&
+              hint != NULL && strstr(hint + 1, "No remote named") == NULL,
+          "the summary names apps that did not install and gives the "
+          "command for a remote the system lacks");
+
+    FlatpakFixture dry = fixture;
+    dry.installs = 0;
+    dry_run = 1;
+    rc = run_restore_flatpak_case(list, &dry, output, sizeof(output));
+    dry_run = 0;
+    check(rc == 0 && dry.installs == 0 &&
+              strstr(output, "Would install com.example.A org.example.C "
+                             "com.example.D") != NULL,
+          "a dry run says what it would install and installs nothing");
+
+    FlatpakFixture absent = { .remotes = NULL };
+    rc = run_restore_flatpak_case(list, &absent, output, sizeof(output));
+    check(rc == 0 && absent.installs == 0 &&
+              strstr(output, "Flatpak is not installed here; left out: "
+                             "com.example.A com.example.B org.example.C "
+                             "com.example.D net.example.E net.example.G.") !=
+                  NULL,
+          "without flatpak the apps are listed, not a failure");
+
+    FlatpakFixture unused = fixture;
+    unused.installs = 0;
+    rc = run_restore_flatpak_case(NULL, &unused, output, sizeof(output));
+    check(rc == 0 && unused.installs == 0 && output[0] == '\0',
+          "a backup without flatpak-apps.txt is skipped silently");
+}
+
 int main(void)
 {
     // A direct sudo run must not aim restores at the invoking user's home
@@ -1082,6 +1226,7 @@ int main(void)
 
     test_groups_collect();
     test_restore_groups();
+    test_restore_flatpak_apps();
 
     printf("packages tests: %d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;

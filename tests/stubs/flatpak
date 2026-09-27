@@ -1,0 +1,16 @@
+#!/bin/sh
+# Test stub for flatpak.
+#
+# The suite runs with this directory ahead of the real one on PATH, so a
+# backup lists the same application everywhere and a restore finds it
+# already installed, never reaching the host's real Flatpak installation.
+case "$*" in
+    "list --system --app --columns=origin,application")
+        printf 'flathub\tcom.example.MigrStub\n' ;;
+    "list --system --app --columns=application")
+        printf 'com.example.MigrStub\n' ;;
+    "remotes --system --columns=name")
+        printf 'flathub\n' ;;
+    *)
+        exit 1 ;;
+esac

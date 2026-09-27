@@ -1808,6 +1808,18 @@ static void test_vscode_extension_snapshot(void)
               "a scoped backup saves the user's group memberships");
     }
     free(groups);
+
+    // tests/stubs/flatpak, ahead on PATH, lists one application.
+    if (have_container)
+    {
+        join_path(expected, sizeof(expected), stub_dir, "flatpak-apps.txt");
+        write_file(expected, "flathub\tcom.example.MigrStub\n");
+        join_path(snapshot, sizeof(snapshot), container, "flatpak-apps.txt");
+    }
+    check(have_container && files_are_equal(expected, snapshot) &&
+              strstr(output, "Saved 1 Flatpak application to "
+                             "flatpak-apps.txt") != NULL,
+          "a scoped backup lists the system-wide Flatpak applications");
     remove_tree(target);
 
     write_file(code_stub, "#!/bin/sh\nexit 7\n");
@@ -1856,6 +1868,8 @@ static void test_vscode_extension_snapshot(void)
         write_file(snapshot, "stale@9.9.9\n");
         join_path(snapshot, sizeof(snapshot), partial, "groups.txt");
         write_file(snapshot, "stale\n");
+        join_path(snapshot, sizeof(snapshot), partial, "flatpak-apps.txt");
+        write_file(snapshot, "stale\tcom.example.Stale\n");
     }
     write_file(explicit_source, "resume payload\n");
 
@@ -1873,6 +1887,10 @@ static void test_vscode_extension_snapshot(void)
         join_path(snapshot, sizeof(snapshot), container, "groups.txt");
     check(have_container && access(snapshot, F_OK) != 0,
           "an adopted explicit backup clears a stale group list");
+    if (have_container)
+        join_path(snapshot, sizeof(snapshot), container, "flatpak-apps.txt");
+    check(have_container && access(snapshot, F_OK) != 0,
+          "an adopted explicit backup clears a stale Flatpak application list");
 
     remove_tree(target);
     remove_tree(home);
