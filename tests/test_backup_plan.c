@@ -2450,6 +2450,13 @@ static void test_native_backup_of_a_changing_source(void)
               strstr(output, busy) != NULL,
           "a file still changing after every reread is kept as last read "
           "and listed");
+    struct stat busy_st, payload_st;
+    check(found && stat(busy, &busy_st) == 0 &&
+              stat(payload, &payload_st) == 0 &&
+              (busy_st.st_mtim.tv_sec != payload_st.st_mtim.tv_sec ||
+               busy_st.st_mtim.tv_nsec != payload_st.st_mtim.tv_nsec),
+          "it keeps the times from before the last read, so the next update "
+          "reads it again");
 
     write_file(busy, "original");
     fresh_mkdtemp(target, sizeof(target), "plan_live_once");

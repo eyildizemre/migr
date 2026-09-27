@@ -4370,8 +4370,9 @@ changes while it is read. Each change is one of three kinds:
   again: rewound, the payload truncated, up to three reads with a 50 ms,
   100 ms pause between them. A file stable on a later read is captured
   cleanly with nothing reported. One still changing after the third read is
-  kept as last read: its entry records that read's metadata and length, and
-  its D59 digest covers those bytes. Directories, symlinks, and hardlinks
+  kept as last read: its entry records that read's length with the
+  metadata from before it, so the file's newer times make the next update
+  read it again, and its D59 digest covers those bytes. Directories, symlinks, and hardlinks
   whose metadata changed while captured are kept as read.
 - **Vanished:** An item removed after it was listed (the pre-scan for
   portable, readdir for native) is left out and not marked visited, so a

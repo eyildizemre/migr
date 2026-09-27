@@ -231,6 +231,28 @@ static int sidecar_count(const char *container_path, size_t expected)
     return result;
 }
 
+// Whether the journal records logical under ROOT with the mtime the source
+// file has now.
+static int sidecar_mtime_matches_source(int container_fd, const char *logical,
+                                        const char *source_path)
+{
+    struct stat st;
+    SidecarLog log = {0};
+    SidecarLiveView view;
+    int matches = stat(source_path, &st) == 0 &&
+                  sidecar_log_open_readonly_at(container_fd, &log) ==
+                      SIDECAR_OPEN_RESUMABLE &&
+                  sidecar_log_find(
+                      &log, (SidecarBytes){ (const unsigned char *)"ROOT", 4 },
+                      (SidecarBytes){ (const unsigned char *)logical,
+                                      strlen(logical) },
+                      &view) == 1 &&
+                  view.entry->mtime_sec == st.st_mtim.tv_sec &&
+                  view.entry->mtime_nsec == (uint32_t)st.st_mtim.tv_nsec;
+    (void)sidecar_log_close(&log);
+    return matches;
+}
+
 typedef struct {
     off_t previous;
     size_t count;
@@ -550,6 +572,9 @@ static void test_prepared_capture_reports_failure_reason(void)
               backup_capture_report_has_changes(&capture_report),
           "a file still changing after every reread is kept as last read and "
           "reported");
+    check(!sidecar_mtime_matches_source(container_fd, "file", source_file),
+          "its entry keeps the times from before the last read, so the next "
+          "update reads it again");
 
     portable_prepared_capture_free(&prepared);
     if (close(scratch_fd) != 0 || close(container_fd) != 0)

@@ -1592,15 +1592,20 @@ static BackupCaptureStatus capture_regular_at(
             failed = 1;
             break;
         }
-        source_snapshot = after;
         if (unchanged)
+        {
+            source_snapshot = after;
             break;
+        }
         if (attempt >= BACKUP_CAPTURE_READ_ATTEMPTS)
         {
+            // Kept with the times from before this read, not the newer ones
+            // it may have missed, so the next update reads it again.
             source_snapshot.st_size = copied;
             changed = 1;
             break;
         }
+        source_snapshot = after;
         backup_capture_reread_pause(attempt);
     }
     if (!failed &&

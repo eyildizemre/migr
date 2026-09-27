@@ -2872,17 +2872,21 @@ static int capture_regular(PortableCaptureContext *context,
             failed = 1;
             break;
         }
-        captured = after;
-        if (unchanged)
+        if (unchanged) {
+            captured = after;
             break;
+        }
         if (attempt >= BACKUP_CAPTURE_READ_ATTEMPTS ||
             live_state_path(root->id, strlen(root->id), logical,
                             strlen(logical))) {
+            // Recorded with the times from before this read, not the newer
+            // ones it may have missed, so the next update reads it again.
             captured.st_size = (off_t)copied;
             (void)capture_tolerate_change(context, root, logical,
                                           BACKUP_SOURCE_CHANGED);
             break;
         }
+        captured = after;
         backup_capture_reread_pause(attempt);
     }
     portable_test_interrupt_if(PORTABLE_TEST_BEFORE_PAYLOAD_CLOSE);
