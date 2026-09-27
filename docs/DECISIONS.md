@@ -4713,3 +4713,32 @@ the mechanism (resume, reconcile, the journal) already existed.
 Explicit-path roots are numbered in sorted path order, so adding a path can
 renumber, and thus recopy, the others.
 
+## D73 — 2026-09-27 — An updated journal is rewritten once dead records outweigh live ones
+
+**Status:** Implemented
+
+**Decision:** After a successful portable capture, `sidecar_compact_at()`
+reopens the journal and serializes each live item as a rewrite would. When
+the file is over twice that size (dead records, from deletions, replaced
+groups, and consumed claims, take more bytes than live ones), it writes a new
+journal beside the slot (`sidecar.migr.rewrite`): the header, then per live
+item its CLAIM and ENTRY group, since every group commits against a claim
+(D25). Items go out by depth, then in append order, so every parent is live
+before its children; the map itself is in hash order. The file is synced and
+renamed over the slot (D52's pattern), and the directory synced. A journal
+with claims pending is left as it is. A failure is a warning: the old
+journal is complete. The D51 readback then checks the file that is published.
+
+**Why:** Every update appends, so a backup updated many times would carry its
+whole history. Rewriting on every update would cost more than a small update
+itself.
+
+**Measured:** 187,000 items on a vfat loop: a full-change update grew the
+journal from 32.3 MB to 70.8 MB, and the rewrite brought it back to 32.3 MB
+in about 1.7 s, reading included, of a 38 s update; verify and a restore dry
+run passed on the result. Writing record by record took 12 s on vfat, so
+groups are serialized into 1 MiB writes. The check itself reads the journal
+once more: an unchanged update takes 4.3 s instead of 3.9 s.
+
+**Relationship:** Part of D72. Uses D52's rewrite-then-rename.
+

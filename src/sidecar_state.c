@@ -846,6 +846,155 @@ fail:
     return status;
 }
 
+// Live groups to rewrite. The map is in hash order; a rewritten journal
+// needs every parent live before its children, so groups go out by depth,
+// then in the order they were appended.
+typedef struct {
+    SidecarLiveView *views;
+    size_t count;
+    size_t capacity;
+    uint64_t live_bytes;
+    unsigned char *scratch;
+    size_t scratch_capacity;
+} CompactState;
+
+static int collect_live_group(const SidecarLiveView *view, void *context)
+{
+    CompactState *state = context;
+    size_t length = 0;
+    if (sidecar_append_claimed_group(view->entry, view->xattrs,
+                                     &state->scratch, &length,
+                                     &state->scratch_capacity) != 0)
+        return -1;
+    if (state->count == state->capacity)
+    {
+        size_t capacity = state->capacity == 0 ? 1024U : state->capacity * 2U;
+        SidecarLiveView *views = realloc(state->views,
+                                         capacity * sizeof(*views));
+        if (views == NULL)
+            return -1;
+        state->views = views;
+        state->capacity = capacity;
+    }
+    state->views[state->count++] = *view;
+    state->live_bytes += length;
+    return 0;
+}
+
+static size_t logical_depth(SidecarBytes logical_path)
+{
+    size_t depth = logical_path.length != 0;
+    for (size_t i = 0; i < logical_path.length; i++)
+        depth += logical_path.data[i] == '/';
+    return depth;
+}
+
+static int live_view_order(const void *left, const void *right)
+{
+    const SidecarLiveView *a = left, *b = right;
+    size_t a_depth = logical_depth(a->entry->logical_path);
+    size_t b_depth = logical_depth(b->entry->logical_path);
+    if (a_depth != b_depth)
+        return a_depth < b_depth ? -1 : 1;
+    return a->generation < b->generation ? -1 : a->generation > b->generation;
+}
+
+static int write_all_bytes(int fd, const unsigned char *data, size_t length)
+{
+    while (length > 0)
+    {
+        ssize_t written = write(fd, data, length);
+        if (written < 0 && errno == EINTR)
+            continue;
+        if (written <= 0)
+            return -1;
+        data += written;
+        length -= (size_t)written;
+    }
+    return 0;
+}
+
+// Each group is committed against its own claim, as capture writes it
+// (D25), and the bytes go out in large writes.
+static int write_live_groups(int fd, CompactState *state)
+{
+    enum { FLUSH_BYTES = 1024 * 1024 };
+    size_t length = 0;
+    for (size_t i = 0; i < state->count; i++)
+    {
+        if (sidecar_append_claimed_group(state->views[i].entry,
+                                         state->views[i].xattrs,
+                                         &state->scratch, &length,
+                                         &state->scratch_capacity) != 0)
+            return -1;
+        if (length >= FLUSH_BYTES || i + 1U == state->count)
+        {
+            if (write_all_bytes(fd, state->scratch, length) != 0)
+                return -1;
+            length = 0;
+        }
+    }
+    return 0;
+}
+
+SidecarStatus sidecar_compact_at(int container_fd, uint64_t *before,
+                                 uint64_t *after)
+{
+    if (container_fd < 0 || before == NULL || after == NULL)
+        return SIDECAR_STATUS_INVALID_ARGUMENT;
+    struct stat slot;
+    if (fstatat(container_fd, SIDECAR_SLOT_NAME, &slot,
+                AT_SYMLINK_NOFOLLOW) != 0)
+        return SIDECAR_STATUS_IO_ERROR;
+    *before = *after = (uint64_t)slot.st_size;
+
+    SidecarLog log = {0};
+    if (sidecar_log_adopt_at(container_fd, &log) != SIDECAR_OPEN_RESUMABLE)
+        return SIDECAR_STATUS_IO_ERROR;
+    CompactState state = {0};
+    SidecarStatus status = sidecar_log_claim_count(&log) != 0
+        ? SIDECAR_STATUS_OK
+        : sidecar_log_foreach(&log, collect_live_group, &state);
+    if (status != SIDECAR_STATUS_OK || sidecar_log_claim_count(&log) != 0 ||
+        state.live_bytes >= *before ||
+        *before - state.live_bytes <= state.live_bytes)
+    {
+        free(state.views);
+        free(state.scratch);
+        (void)sidecar_log_close(&log);
+        return status;
+    }
+    if (state.count > 1U)
+        qsort(state.views, state.count, sizeof(*state.views), live_view_order);
+
+    status = SIDECAR_STATUS_IO_ERROR;
+    int fd = -1;
+    if (unlinkat(container_fd, SIDECAR_REWRITE_NAME, 0) == 0 ||
+        errno == ENOENT)
+        fd = openat(container_fd, SIDECAR_REWRITE_NAME,
+                    O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    int written = fd >= 0 && sidecar_write_header(fd) == 0 &&
+                  write_live_groups(fd, &state) == 0;
+    struct stat rewritten;
+    if (written && fsync(fd) == 0 && fstat(fd, &rewritten) == 0 &&
+        renameat(container_fd, SIDECAR_REWRITE_NAME, container_fd,
+                 SIDECAR_SLOT_NAME) == 0)
+    {
+        *after = (uint64_t)rewritten.st_size;
+        status = fsync(container_fd) == 0 ? SIDECAR_STATUS_OK
+                                          : SIDECAR_STATUS_IO_ERROR;
+    }
+    else
+        (void)unlinkat(container_fd, SIDECAR_REWRITE_NAME, 0);
+    if (fd >= 0 && close(fd) != 0)
+        status = SIDECAR_STATUS_IO_ERROR;
+    free(state.views);
+    free(state.scratch);
+    if (sidecar_log_close(&log) != SIDECAR_STATUS_OK)
+        status = SIDECAR_STATUS_IO_ERROR;
+    return status;
+}
+
 SidecarStatus sidecar_log_close(SidecarLog *log)
 {
     if (log == NULL)

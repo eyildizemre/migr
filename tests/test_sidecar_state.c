@@ -1736,6 +1736,131 @@ static void test_interior_corruption_and_hardlink(int container_fd)
     unlink(outside);
 }
 
+// Publishes ROOT's directory and files f00..f(count-1), then rewrites each
+// file `rounds` more times in reverse order, so most records are dead and
+// the live groups end in the reverse of the files' first order. After any
+// rewrite the directory itself is committed again last, after its children,
+// as capture does when it finishes a directory.
+static int compaction_fixture(int container_fd, int count, int rounds)
+{
+    if (reset_slot(container_fd) != 0)
+        return -1;
+    SidecarLog log = {0};
+    SidecarEntry root = entry_for("ROOT", "", "", 0, 0);
+    root.kind = SIDECAR_KIND_DIRECTORY;
+    root.mode = 0755;
+    SidecarClaim root_claim = claim_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY);
+    int ok = sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH &&
+             sidecar_log_append_claim(&log, &root_claim) == SIDECAR_STATUS_OK &&
+             sidecar_log_append_group(&log, &root, NULL) == SIDECAR_STATUS_OK;
+    char names[32][16];
+    for (int round = 0; ok && round <= rounds; round++)
+        for (int i = 0; ok && i < count; i++)
+        {
+            int index = round == 0 ? i : count - 1 - i;
+            snprintf(names[index], sizeof(names[index]), "f%02d", index);
+            SidecarEntry entry = entry_for("ROOT", names[index], names[index],
+                                           (uint64_t)(round + 1), 0);
+            SidecarClaim claim = claim_for("ROOT", names[index], names[index],
+                                           SIDECAR_KIND_REGULAR);
+            SidecarDelete deletion = { entry.root_id, entry.logical_path };
+            ok = (round == 0 ||
+                  sidecar_log_append_delete(&log, &deletion) ==
+                      SIDECAR_STATUS_OK) &&
+                 sidecar_log_append_claim(&log, &claim) == SIDECAR_STATUS_OK &&
+                 sidecar_log_append_group(&log, &entry, NULL) ==
+                     SIDECAR_STATUS_OK;
+        }
+    SidecarDelete root_deletion = { root.root_id, root.logical_path };
+    if (ok && rounds > 0)
+        ok = sidecar_log_append_delete(&log, &root_deletion) ==
+                 SIDECAR_STATUS_OK &&
+             sidecar_log_append_claim(&log, &root_claim) == SIDECAR_STATUS_OK &&
+             sidecar_log_append_group(&log, &root, NULL) == SIDECAR_STATUS_OK;
+    return sidecar_log_close(&log) == SIDECAR_STATUS_OK && ok ? 0 : -1;
+}
+
+typedef struct {
+    uint64_t generations[32];
+    uint64_t sizes[32];
+    size_t count;
+} CompactionProbe;
+
+static int compaction_probe(const SidecarLiveView *view, void *context)
+{
+    CompactionProbe *probe = context;
+    probe->count++;
+    if (view->entry->logical_path.length == 3)
+    {
+        int index = (view->entry->logical_path.data[1] - '0') * 10 +
+                    (view->entry->logical_path.data[2] - '0');
+        probe->generations[index] = view->generation;
+        probe->sizes[index] = view->entry->size;
+    }
+    return 0;
+}
+
+static void test_compaction(int container_fd)
+{
+    printf(BLUE "::" NC " compaction rewrites the journal to its live state\n");
+
+    uint64_t before = 0, after = 0;
+    struct stat original, compacted;
+    check(compaction_fixture(container_fd, 20, 0) == 0 &&
+              fstatat(container_fd, SIDECAR_SLOT_NAME, &original, 0) == 0 &&
+              sidecar_compact_at(container_fd, &before, &after) ==
+                  SIDECAR_STATUS_OK &&
+              before == after &&
+              fstatat(container_fd, SIDECAR_SLOT_NAME, &compacted, 0) == 0 &&
+              compacted.st_ino == original.st_ino,
+          "a journal without dead records is left as it is");
+
+    check(compaction_fixture(container_fd, 20, 3) == 0 &&
+              sidecar_compact_at(container_fd, &before, &after) ==
+                  SIDECAR_STATUS_OK &&
+              after < before && after * 2U < before,
+          "a journal mostly made of dead records is rewritten smaller");
+    uint64_t on_disk = 0;
+    SidecarLog log = {0};
+    CompactionProbe probe = {0};
+    int adopted = sidecar_log_adopt_at(container_fd, &log) ==
+                  SIDECAR_OPEN_RESUMABLE;
+    check(slot_size(container_fd, &on_disk) == 0 && on_disk == after &&
+              adopted && sidecar_log_claim_count(&log) == 0 &&
+              sidecar_log_foreach(&log, compaction_probe, &probe) ==
+                  SIDECAR_STATUS_OK &&
+              probe.count == 21,
+          "the rewritten journal adopts with every live item and no claims, "
+          "its directory first although it was committed last");
+    int in_order = 1, latest = 1;
+    for (int i = 0; i < 20; i++)
+    {
+        latest = latest && probe.sizes[i] == 4;
+        in_order = in_order &&
+                   (i == 0 || probe.generations[i] < probe.generations[i - 1]);
+    }
+    check(latest && in_order,
+          "each item keeps its last state, in the order it was appended");
+    if (adopted)
+        sidecar_log_close(&log);
+    check(faccessat(container_fd, SIDECAR_REWRITE_NAME, F_OK, 0) != 0,
+          "no rewrite file is left behind");
+
+    SidecarClaim pending = claim_for("ROOT", "f00", "f00",
+                                     SIDECAR_KIND_REGULAR);
+    SidecarDelete deletion = { pending.root_id, pending.logical_path };
+    check(compaction_fixture(container_fd, 20, 3) == 0 &&
+              sidecar_log_adopt_at(container_fd, &log) ==
+                  SIDECAR_OPEN_RESUMABLE &&
+              sidecar_log_append_delete(&log, &deletion) == SIDECAR_STATUS_OK &&
+              sidecar_log_append_claim(&log, &pending) == SIDECAR_STATUS_OK &&
+              sidecar_log_close(&log) == SIDECAR_STATUS_OK &&
+              sidecar_compact_at(container_fd, &before, &after) ==
+                  SIDECAR_STATUS_OK &&
+              before == after,
+          "a journal with a claim pending is left as it is");
+}
+
 int main(void)
 {
     char directory[] = "/tmp/migr_sidecar_state_XXXXXX";
@@ -1768,6 +1893,7 @@ int main(void)
     test_missing_and_slot_types(container_fd);
     test_truncated_tail(container_fd);
     test_interior_corruption_and_hardlink(container_fd);
+    test_compaction(container_fd);
 
     reset_slot(container_fd);
     close(container_fd);

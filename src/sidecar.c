@@ -646,6 +646,33 @@ int sidecar_write_entry_group(int fd, const SidecarEntry *entry,
     return result;
 }
 
+int sidecar_append_claimed_group(const SidecarEntry *entry,
+                                 const SidecarXattr *xattrs,
+                                 unsigned char **data, size_t *length,
+                                 size_t *capacity)
+{
+    if (entry == NULL || data == NULL || length == NULL || capacity == NULL)
+    {
+        set_invalid_error();
+        return -1;
+    }
+    SidecarClaim claim = {
+        .root_id = entry->root_id,
+        .logical_path = entry->logical_path,
+        .physical_leaf = entry->physical_leaf,
+        .kind = entry->kind
+    };
+    SidecarBuffer buffer = { *data, *length, *capacity };
+    int result = build_claim_buffer(&claim, &buffer) == 0 &&
+                         build_entry_group_buffer(entry, xattrs, &buffer) == 0
+                     ? 0 : -1;
+    *data = buffer.data;
+    *capacity = buffer.capacity;
+    if (result == 0)
+        *length = buffer.length;
+    return result;
+}
+
 int sidecar_write_delete(int fd, const SidecarDelete *deletion)
 {
     SidecarBuffer buffer = {0};

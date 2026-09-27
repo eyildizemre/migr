@@ -2088,6 +2088,28 @@ static int drop_left_out_roots(int container_fd, const Manifest *current,
     return failed ? -1 : 0;
 }
 
+// Every update appends to the journal; once records no longer live outweigh
+// those that do, it is rewritten to its live state (D73). A failure leaves
+// the old journal in place, which is still complete.
+static void compact_journal(int container_fd)
+{
+    uint64_t before = 0, after = 0;
+    if (sidecar_compact_at(container_fd, &before, &after) != SIDECAR_STATUS_OK)
+    {
+        print_warning("Warning: could not rewrite the backup journal without "
+                      "its old records; it stays as it was.\n");
+        return;
+    }
+    if (after < before)
+    {
+        char before_text[32], after_text[32];
+        format_size((off_t)before, before_text, sizeof(before_text));
+        format_size((off_t)after, after_text, sizeof(after_text));
+        printf("Rewrote the backup journal without its old records: %s to "
+               "%s.\n", before_text, after_text);
+    }
+}
+
 // O_NOFOLLOW | O_DIRECTORY: in an adopted container this entry may already
 // exist, and only a genuine directory is acceptable — a symlink there would
 // otherwise place the whole payload outside the container.
@@ -3430,6 +3452,8 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
                 print_portable_capture_failure(&capture_report);
                 had_error = 1;
             }
+            else
+                compact_journal(container_fd);
         }
 
         if (progress_installed)

@@ -164,6 +164,14 @@ int sidecar_write_xattr(int fd, const SidecarXattr *xattr);
 int sidecar_write_entry_commit(int fd);
 int sidecar_write_entry_group(int fd, const SidecarEntry *entry,
                               const SidecarXattr *xattrs);
+/* Appends the CLAIM entry's group commits against and the group itself, the
+ * bytes sidecar_write_claim() and sidecar_write_entry_group() would write,
+ * to a caller-owned buffer grown with realloc(): *data holds *length bytes
+ * in *capacity. On failure *length is unchanged. */
+int sidecar_append_claimed_group(const SidecarEntry *entry,
+                                 const SidecarXattr *xattrs,
+                                 unsigned char **data, size_t *length,
+                                 size_t *capacity);
 int sidecar_write_delete(int fd, const SidecarDelete *deletion);
 int sidecar_write_claim(int fd, const SidecarClaim *claim);
 int sidecar_claim_kind_valid(SidecarObjectKind kind);
@@ -198,6 +206,15 @@ SidecarStatus sidecar_log_append_delete(SidecarLog *log,
 SidecarStatus sidecar_log_append_claim(SidecarLog *log,
                                        const SidecarClaim *claim);
 
+/* Rewrites the journal in container_fd to its live items, each a CLAIM and
+ * the ENTRY group committed against it, parents first and without DELETE
+ * records, once the records no longer live take more bytes than those that
+ * do (docs/DECISIONS.md D73). The new journal is
+ * written beside the slot, synced, and renamed over it, so an interruption
+ * leaves the old or the new one. A journal with claims pending is left as
+ * it is. before and after receive the journal's size. */
+SidecarStatus sidecar_compact_at(int container_fd, uint64_t *before,
+                                 uint64_t *after);
 size_t sidecar_log_live_count(const SidecarLog *log);
 size_t sidecar_log_claim_count(const SidecarLog *log);
 int sidecar_log_find(const SidecarLog *log, SidecarBytes root_id,

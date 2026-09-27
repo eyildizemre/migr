@@ -3808,6 +3808,53 @@ static void test_update_repairs_payload_without_walking_it(void)
     remove_tree(target);
 }
 
+// Every update appends to a portable journal; once dead records outweigh
+// live ones it is rewritten to its live state (D73), and the next update
+// takes the rewritten journal over like any other.
+static void test_updates_rewrite_a_grown_journal(void)
+{
+    printf(BLUE "::" NC " production: repeated updates rewrite a grown journal\n");
+
+    char home[PATH_MAX], target[PATH_MAX], dir[PATH_MAX], file[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_home");
+    setenv("HOME", home, 1);
+    join_path(dir, sizeof(dir), home, "notes");
+    mkdir_p(dir);
+    join_path(file, sizeof(file), dir, "file.txt");
+    fresh_mkdtemp(target, sizeof(target), "plan_target");
+    char *paths[] = { dir, NULL };
+    char output[8192];
+    dry_run = 0;
+    backup_test_force_portable_representation(1);
+
+    int rewritten = 0, failed = 0;
+    for (int run = 0; run < 8 && !rewritten && !failed; run++)
+    {
+        char content[32];
+        snprintf(content, sizeof(content), "version %d", run);
+        write_file(file, content);
+        failed = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                      output, sizeof(output)) != 0;
+        rewritten = strstr(output, "Rewrote the backup journal without its "
+                                   "old records") != NULL;
+    }
+    write_file(file, "after the rewrite");
+    int after_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                        output, sizeof(output));
+    backup_test_force_portable_representation(0);
+
+    char container[PATH_MAX], payload[PATH_MAX];
+    int found = find_container_dir(target, container, sizeof(container));
+    join_path(payload, sizeof(payload), container, "data/EXPLICIT_0/file.txt");
+    check(!failed && rewritten, "the journal is rewritten once it has grown");
+    check(after_rc == 0 && found && file_text_is(payload, "after the rewrite") &&
+              journal_root_entries(container, "EXPLICIT_0") == 2,
+          "the next update takes the rewritten journal over");
+
+    remove_tree(home);
+    remove_tree(target);
+}
+
 static void grow_source_before_inventory(const char *source_path,
                                          void *context)
 {
@@ -4184,6 +4231,7 @@ int main(void)
     test_backup_leaves_another_install_alone();
     test_failed_update_keeps_the_finished_backup();
     test_update_repairs_payload_without_walking_it();
+    test_updates_rewrite_a_grown_journal();
     test_dangling_builtin_dotfile_is_captured_not_silently_dropped();
     test_shell_history_consent_gate();
     test_unusable_target_does_not_leak_the_plan();
