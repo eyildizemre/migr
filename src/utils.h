@@ -143,6 +143,12 @@ void print_error(const char *fmt, ...);
  */
 void print_source_safe_read_refusal(const char *label);
 
+/**
+ * @brief Writes all of data to fd, retrying short writes and EINTR.
+ * @return 0, or -1 with errno (EIO for a write that makes no progress).
+ */
+int write_all(int fd, const void *data, size_t length);
+
 /** @brief Prints a complete warning message, optionally in bold yellow. */
 void print_warning(const char *fmt, ...);
 

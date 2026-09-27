@@ -314,14 +314,7 @@ static int create_template(const char *path)
     if (fd < 0) return -1;
     int rc = -1;
     if (fchmod(fd, 0600) < 0) goto done;
-    size_t offset = 0;
-    while (offset < (size_t)content_len)
-    {
-        ssize_t written = write(fd, content + offset, (size_t)content_len - offset);
-        if (written < 0 && errno == EINTR) continue;
-        if (written <= 0) goto done;
-        offset += (size_t)written;
-    }
+    if (write_all(fd, content, (size_t)content_len) != 0) goto done;
     if (fsync(fd) < 0) goto done;
     /* link publishes the complete inode atomically without replacing a winner. */
     if (link(temp, path) < 0 && errno != EEXIST) goto done;

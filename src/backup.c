@@ -904,26 +904,8 @@ static int copy_self_binary_at(int container_fd, int source_fd,
         if (n == 0)
             break;
 
-        size_t written = 0;
-        while (written < (size_t)n)
-        {
-            ssize_t w = write(dest_fd, buffer + written,
-                              (size_t)n - written);
-            if (w < 0)
-            {
-                if (errno == EINTR)
-                    continue;
-                failed = 1;
-                break;
-            }
-            if (w == 0)
-            {
-                errno = EIO;
-                failed = 1;
-                break;
-            }
-            written += (size_t)w;
-        }
+        if (write_all(dest_fd, buffer, (size_t)n) != 0)
+            failed = 1;
     }
 
     if (!failed && fchmod(dest_fd, 0755) != 0 &&
@@ -1175,25 +1157,10 @@ static int copy_network_config_file_at(int source_dir_fd, int network_fd,
         if (n == 0)
             break;
 
-        size_t written = 0;
-        while (written < (size_t)n)
+        if (write_all(dest_fd, buffer, (size_t)n) != 0)
         {
-            ssize_t w = write(dest_fd, buffer + written, (size_t)n - written);
-            if (w < 0)
-            {
-                if (errno == EINTR)
-                    continue;
-                saved_errno = errno;
-                failed = 1;
-                break;
-            }
-            if (w == 0)
-            {
-                saved_errno = EIO;
-                failed = 1;
-                break;
-            }
-            written += (size_t)w;
+            saved_errno = errno;
+            failed = 1;
         }
     }
 

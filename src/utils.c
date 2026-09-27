@@ -991,6 +991,26 @@ int crypto_policy_read_at(int dir_fd, const char *path,
     return -1;
 }
 
+int write_all(int fd, const void *data, size_t length)
+{
+    const unsigned char *bytes = data;
+    while (length > 0)
+    {
+        ssize_t written = write(fd, bytes, length);
+        if (written < 0 && errno == EINTR)
+            continue;
+        if (written <= 0)
+        {
+            if (written == 0)
+                errno = EIO;
+            return -1;
+        }
+        bytes += written;
+        length -= (size_t)written;
+    }
+    return 0;
+}
+
 /* ------------------------------------------------------------------------- */
 /* Run log (docs/DECISIONS.md D79)                                           */
 /* ------------------------------------------------------------------------- */
@@ -1026,27 +1046,13 @@ static struct {
 } run_log = { .lock = PTHREAD_MUTEX_INITIALIZER, .sink_fd = -1,
               .dir_fd = -1 };
 
-static int write_all_fd(int fd, const char *data, size_t length)
-{
-    while (length > 0)
-    {
-        ssize_t written = write(fd, data, length);
-        if (written < 0 && errno == EINTR)
-            continue;
-        if (written <= 0)
-            return -1;
-        data += written;
-        length -= (size_t)written;
-    }
-    return 0;
-}
 
 // Caller holds run_log.lock. A log that cannot be written stays quiet: the
 // run itself goes on, and the terminal still shows everything.
 static void run_log_sink(const char *data, size_t length)
 {
     if (run_log.sink_fd >= 0)
-        (void)write_all_fd(run_log.sink_fd, data, length);
+        (void)write_all(run_log.sink_fd, data, length);
 }
 
 static void run_log_tee_consume(RunLogTee *tee, const char *data, size_t size)
@@ -1089,7 +1095,7 @@ static void run_log_tee_consume(RunLogTee *tee, const char *data, size_t size)
 static ssize_t run_log_tee_write(void *cookie, const char *data, size_t size)
 {
     RunLogTee *tee = cookie;
-    if (write_all_fd(tee->terminal_fd, data, size) != 0)
+    if (write_all(tee->terminal_fd, data, size) != 0)
         return -1;
     run_log_tee_consume(tee, data, size);
     return (ssize_t)size;
@@ -1319,7 +1325,7 @@ int run_log_attach(int base_fd, const char *dir, const char *prefix,
     off_t offset = 0;
     while ((got = pread(run_log.sink_fd, buffer, sizeof(buffer), offset)) > 0)
     {
-        (void)write_all_fd(fd, buffer, (size_t)got);
+        (void)write_all(fd, buffer, (size_t)got);
         offset += got;
     }
     close(run_log.sink_fd);

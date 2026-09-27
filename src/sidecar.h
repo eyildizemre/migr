@@ -173,6 +173,10 @@ int sidecar_append_claimed_group(const SidecarEntry *entry,
                                  unsigned char **data, size_t *length,
                                  size_t *capacity);
 int sidecar_write_delete(int fd, const SidecarDelete *deletion);
+/* Writes all of data, retrying short writes and EINTR; -1 with errno (EIO
+ * for a write that makes no progress). The sidecar layer's own copy of
+ * utils' write_all(), so it links without the rest of migr. */
+int sidecar_write_all(int fd, const unsigned char *data, size_t length);
 int sidecar_write_claim(int fd, const SidecarClaim *claim);
 int sidecar_claim_kind_valid(SidecarObjectKind kind);
 int sidecar_physical_leaf_valid(SidecarBytes logical_path,

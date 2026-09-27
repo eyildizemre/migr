@@ -79,29 +79,20 @@ static int dconf_command_available(void)
     return 0;
 }
 
-static int write_all_at(int dir_fd, const char *name, const void *data,
-                        size_t length)
+static int write_file_at(int dir_fd, const char *name, const void *data,
+                         size_t length)
 {
     int fd = openat(dir_fd, name,
                     O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
                     0600);
     if (fd < 0)
         return -1;
-    const unsigned char *bytes = data;
-    size_t offset = 0;
-    while (offset < length)
+    if (write_all(fd, data, length) != 0)
     {
-        ssize_t written = write(fd, bytes + offset, length - offset);
-        if (written < 0 && errno == EINTR)
-            continue;
-        if (written <= 0)
-        {
-            int saved = written < 0 ? errno : EIO;
-            close(fd);
-            errno = saved;
-            return -1;
-        }
-        offset += (size_t)written;
+        int saved = errno;
+        close(fd);
+        errno = saved;
+        return -1;
     }
     return close(fd);
 }
@@ -128,23 +119,11 @@ static int copy_database_at(int database_fd, int dir_fd, const char *name)
         }
         if (got == 0)
             break;
-        size_t done = 0;
-        while (done < (size_t)got)
+        if (write_all(fd, buffer, (size_t)got) != 0)
         {
-            ssize_t written = write(fd, buffer + done, (size_t)got - done);
-            if (written < 0 && errno == EINTR)
-                continue;
-            if (written <= 0)
-            {
-                if (written == 0)
-                    errno = EIO;
-                result = -1;
-                break;
-            }
-            done += (size_t)written;
-        }
-        if (result != 0)
+            result = -1;
             break;
+        }
         offset += got;
     }
     int saved = errno;
@@ -197,7 +176,7 @@ static int dconf_work_dir_create(DconfWorkDir *work, int database_fd,
     static const char profile[] = "user-db:user\n";
     if (mkdirat(work->fd, "dconf", 0700) != 0 ||
         copy_database_at(database_fd, work->fd, "dconf/user") != 0 ||
-        write_all_at(work->fd, "profile", profile, sizeof(profile) - 1U) != 0)
+        write_file_at(work->fd, "profile", profile, sizeof(profile) - 1U) != 0)
         goto fail;
     if (target->drop_identity)
     {

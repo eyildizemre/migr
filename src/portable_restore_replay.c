@@ -1816,22 +1816,10 @@ static void replay_capture_dconf_database(ReplayCollection *collection,
 static int replay_write_all(int fd, const unsigned char *data, size_t length,
                             uint64_t *hash)
 {
-    size_t offset = 0;
-    while (offset < length)
-    {
-        ssize_t written = write(fd, data + offset, length - offset);
-        if (written < 0 && errno == EINTR)
-            continue;
-        if (written <= 0)
-        {
-            if (written == 0)
-                errno = EIO;
-            return -1;
-        }
-        if (hash != NULL)
-            *hash = hash_fnv1a_bytes(*hash, data + offset, (size_t)written);
-        offset += (size_t)written;
-    }
+    if (write_all(fd, data, length) != 0)
+        return -1;
+    if (hash != NULL)
+        *hash = hash_fnv1a_bytes(*hash, data, length);
     return 0;
 }
 

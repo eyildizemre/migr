@@ -2119,16 +2119,8 @@ static int portable_copy_regular_impl(
             return -1;
         }
 
-        size_t offset = 0;
-        while (offset < (size_t)received) {
-            ssize_t written = write(destination_fd, buffer + offset,
-                                     (size_t)received - offset);
-            if (written < 0 && errno == EINTR)
-                continue;
-            if (written <= 0)
-                return -1;
-            offset += (size_t)written;
-        }
+        if (write_all(destination_fd, buffer, (size_t)received) != 0)
+            return -1;
         copied += (uint64_t)received;
         if (digest != NULL)
             hash = hash_fnv1a_bytes(hash, buffer, (size_t)received);

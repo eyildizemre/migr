@@ -270,7 +270,7 @@ static int buffer_append_int(SidecarBuffer *buffer, int64_t value)
     return buffer_append_field(buffer, field);
 }
 
-static int write_all(int fd, const unsigned char *data, size_t length)
+int sidecar_write_all(int fd, const unsigned char *data, size_t length)
 {
     size_t written = 0;
     while (written < length)
@@ -357,13 +357,13 @@ static int append_buffer(int fd, const SidecarBuffer *buffer,
         size_t partial = buffer->length / 2U;
         if (partial == 0)
             partial = 1U;
-        if (write_all(fd, buffer->data, partial) != 0)
+        if (sidecar_write_all(fd, buffer->data, partial) != 0)
             return -1;
         (void)kill(getpid(), SIGKILL);
     }
 #endif
 
-    int result = write_all(fd, buffer->data, buffer->length);
+    int result = sidecar_write_all(fd, buffer->data, buffer->length);
 #ifdef SIDECAR_TEST_HOOKS
     if (result == 0 && after != SIDECAR_TEST_INTERRUPT_NONE &&
         sidecar_test_interrupt_point == (sig_atomic_t)after)

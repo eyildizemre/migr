@@ -704,20 +704,8 @@ static int rewrite_sidecar_prefix(int container_fd, int source_fd,
                 errno = EIO;
             goto fail;
         }
-        size_t done = 0;
-        while (done < (size_t)got)
-        {
-            ssize_t written = write(fd, buffer + done, (size_t)got - done);
-            if (written < 0 && errno == EINTR)
-                continue;
-            if (written <= 0)
-            {
-                if (written == 0)
-                    errno = EIO;
-                goto fail;
-            }
-            done += (size_t)written;
-        }
+        if (sidecar_write_all(fd, buffer, (size_t)got) != 0)
+            goto fail;
         offset += got;
     }
     if (fsync(fd) != 0 ||
@@ -913,21 +901,6 @@ static int live_view_order(const void *left, const void *right)
     return a->generation < b->generation ? -1 : a->generation > b->generation;
 }
 
-static int write_all_bytes(int fd, const unsigned char *data, size_t length)
-{
-    while (length > 0)
-    {
-        ssize_t written = write(fd, data, length);
-        if (written < 0 && errno == EINTR)
-            continue;
-        if (written <= 0)
-            return -1;
-        data += written;
-        length -= (size_t)written;
-    }
-    return 0;
-}
-
 // Each group is committed against its own claim, as capture writes it
 // (D25), and the bytes go out in large writes.
 static int write_live_groups(int fd, CompactState *state)
@@ -943,7 +916,7 @@ static int write_live_groups(int fd, CompactState *state)
             return -1;
         if (length >= FLUSH_BYTES || i + 1U == state->count)
         {
-            if (write_all_bytes(fd, state->scratch, length) != 0)
+            if (sidecar_write_all(fd, state->scratch, length) != 0)
                 return -1;
             length = 0;
         }

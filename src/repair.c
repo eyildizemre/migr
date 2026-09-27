@@ -263,27 +263,6 @@ static int salvage_record(const SidecarRecord *record, void *context)
     return 0;
 }
 
-static int pwrite_all(int fd, const unsigned char *data, size_t length,
-                      off_t offset)
-{
-    while (length != 0)
-    {
-        ssize_t written = pwrite(fd, data, length, offset);
-        if (written < 0 && errno == EINTR)
-            continue;
-        if (written <= 0)
-        {
-            if (written == 0)
-                errno = EIO;
-            return -1;
-        }
-        data += written;
-        length -= (size_t)written;
-        offset += written;
-    }
-    return 0;
-}
-
 // Record starts are recognizable in the text: every record begins with its
 // tag field right after the NUL that ends the previous field. ENTRY_COMMIT and
 // XATTR are never resumed at, since they only continue an open group.
@@ -348,10 +327,9 @@ static int salvage_journal(RepairSalvage *salvage, const unsigned char *data,
     for (;;)
     {
         pending_clear(salvage);
-        if (ftruncate(scratch, 0) != 0 ||
-            pwrite_all(scratch, data, header_length, 0) != 0 ||
-            pwrite_all(scratch, data + start, length - start,
-                       (off_t)header_length) != 0)
+        if (ftruncate(scratch, 0) != 0 || lseek(scratch, 0, SEEK_SET) != 0 ||
+            write_all(scratch, data, header_length) != 0 ||
+            write_all(scratch, data + start, length - start) != 0)
         {
             print_error("Error: Could not write a scratch file: %s\n",
                         strerror(errno));
@@ -704,21 +682,8 @@ static int copy_file_at(int source_dir, const char *name, int dest_dir,
         else
         {
             moved = read(source, buffer, sizeof(buffer));
-            for (ssize_t done = 0; moved > 0 && done < moved;)
-            {
-                ssize_t written = write(dest, buffer + done,
-                                        (size_t)(moved - done));
-                if (written < 0 && errno == EINTR)
-                    continue;
-                if (written <= 0)
-                {
-                    if (written == 0)
-                        errno = EIO;
-                    moved = -1;
-                    break;
-                }
-                done += written;
-            }
+            if (moved > 0 && write_all(dest, buffer, (size_t)moved) != 0)
+                moved = -1;
         }
         if (moved < 0 && errno == EINTR)
             continue;
