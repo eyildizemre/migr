@@ -36,6 +36,7 @@
 #include "backup_plan.h"
 #include "manifest.h"
 #include "packages.h"
+#include "groups.h"
 #include "selection.h"
 #include "sidecar.h"
 #include "utils.h"

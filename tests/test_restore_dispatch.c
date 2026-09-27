@@ -35,6 +35,7 @@
 #include "hash.h"
 #include "manifest.h"
 #include "packages.h"
+#include "groups.h"
 #include "restore.h"
 #include "portable_restore_internal.h"
 #include "portable_restore_replay_internal.h"
@@ -3587,7 +3588,7 @@ static void test_network_config_restore_backend_modes(void)
     join_path(group_file, sizeof(group_file), dest_parent, "group");
     write_file_mode(group_file,
                     "systemd-networkd:x:4241:\nsystemd-network:x:4242:\n", 0644);
-    packages_test_set_group_file(group_file);
+    groups_test_set_group_file(group_file);
     join_path(path, sizeof(path), wpa_dir, "wpa_supplicant.conf");
     write_file_mode(path, "network={}\n", 0644);
 
@@ -3607,7 +3608,7 @@ static void test_network_config_restore_backend_modes(void)
     dry_run = previous_dry_run;
     restore_test_set_network_config_dest_dir("systemd-networkd", NULL);
     restore_test_set_network_config_dest_dir("wpa_supplicant", NULL);
-    packages_test_set_group_file(NULL);
+    groups_test_set_group_file(NULL);
 
     check(rc == 0, "live restore of networkd and wpa_supplicant files succeeds");
     join_path(path, sizeof(path), networkd_dest, "20-wired.network");
@@ -3632,14 +3633,14 @@ static void test_network_config_restore_backend_modes(void)
     // never write into the real /etc.
     restore_test_set_network_config_dest_dir("systemd-networkd", networkd_dest);
     restore_test_set_network_config_dest_dir("wpa_supplicant", wpa_dest);
-    packages_test_set_group_file(group_file);
+    groups_test_set_group_file(group_file);
     restore_test_set_network_manager_runtime_dir(dest_parent);
     dry_run = 0;
     rc = run_restore_capturing_with_input(source, "y\n", output,
                                           sizeof(output));
     dry_run = previous_dry_run;
     restore_test_set_network_manager_runtime_dir("/nonexistent/migr-test-nm");
-    packages_test_set_group_file(NULL);
+    groups_test_set_group_file(NULL);
     restore_test_set_network_config_dest_dir("systemd-networkd", NULL);
     restore_test_set_network_config_dest_dir("wpa_supplicant", NULL);
     check(rc == 0 &&

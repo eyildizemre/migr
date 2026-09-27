@@ -68,7 +68,7 @@ VALGRIND_TESTS = \
 TARGET = migr
 STATIC_TARGET = migr-static
 VPATH = src
-SRCS = selection_match.c selection.c config.c main.c detect.c report.c backup.c backup_plan.c packages.c restore.c dconf_restore.c live_state.c utils.c selfcopy.c fileops.c fsprobe.c xdg.c manifest.c encoding.c portable_name.c container.c metadata.c metadata_xattr.c portable_hashset.c portable_prescan.c portable_fsops.c portable.c portable_reconcile.c portable_restore_replay.c portable_restore_shared.c portable_restore_orchestrate.c portable_restore_preflight.c sidecar.c sidecar_state.c sidecar_state_map.c hash.c verify.c repair.c source_snapshot.c
+SRCS = selection_match.c selection.c config.c main.c detect.c report.c backup.c backup_plan.c packages.c groups.c flatpak.c restore.c dconf_restore.c live_state.c utils.c selfcopy.c fileops.c fsprobe.c xdg.c manifest.c encoding.c portable_name.c container.c metadata.c metadata_xattr.c portable_hashset.c portable_prescan.c portable_fsops.c portable.c portable_reconcile.c portable_restore_replay.c portable_restore_shared.c portable_restore_orchestrate.c portable_restore_preflight.c sidecar.c sidecar_state.c sidecar_state_map.c hash.c verify.c repair.c source_snapshot.c
 OBJS = $(SRCS:.c=.o)
 # Every object but main.o, which tests link against.
 LIB_OBJS = $(filter-out main.o,$(OBJS))
@@ -186,8 +186,11 @@ $(TEST_CONFIRM): tests/test_confirm.c $(call with_hooks,utils_test.o)
 packages_test.o: src/packages.c
 	$(CC) $(CFLAGS) $(DEPFLAGS) -DPACKAGES_TEST_HOOKS -c src/packages.c -o $@
 
-$(TEST_PACKAGES): tests/test_packages.c $(call with_hooks,packages_test.o)
-	$(CC) $(CFLAGS) -DPACKAGES_TEST_HOOKS -Wl,--wrap=malloc -o $@ $(filter %.c %.o,$^)
+groups_test.o: src/groups.c
+	$(CC) $(CFLAGS) $(DEPFLAGS) -DGROUPS_TEST_HOOKS -c src/groups.c -o $@
+
+$(TEST_PACKAGES): tests/test_packages.c $(call with_hooks,packages_test.o groups_test.o)
+	$(CC) $(CFLAGS) -DPACKAGES_TEST_HOOKS -DGROUPS_TEST_HOOKS -Wl,--wrap=malloc -o $@ $(filter %.c %.o,$^)
 
 $(TEST_XDG): tests/test_xdg.c $(LIB_OBJS)
 	$(CC) $(CFLAGS) -o $@ $(filter %.c %.o,$^)
@@ -287,8 +290,8 @@ $(TEST_VSCODE_CAPTURE): tests/test_vscode_capture.c $(call with_hooks,backup_tes
 $(TEST_BACKUP_SYNC): tests/test_backup_sync.c $(call with_hooks,fileops_test.o portable_test.o portable_reconcile_test.o)
 	$(CC) $(CFLAGS) -DBACKUP_TEST_HOOKS -Wl,--wrap=syncfs -Wl,--wrap=read -o $@ $(filter %.c %.o,$^)
 
-$(TEST_RESTORE_DISPATCH): tests/test_restore_dispatch.c $(call with_hooks,restore_test.o portable_restore_replay_test.o backup_test.o packages_test.o)
-	$(CC) $(CFLAGS) -DBACKUP_TEST_HOOKS -DRESTORE_TEST_HOOKS -DPACKAGES_TEST_HOOKS -DPORTABLE_RESTORE_REPLAY_TEST_HOOKS -o $@ $(filter %.c %.o,$^)
+$(TEST_RESTORE_DISPATCH): tests/test_restore_dispatch.c $(call with_hooks,restore_test.o portable_restore_replay_test.o backup_test.o packages_test.o groups_test.o)
+	$(CC) $(CFLAGS) -DBACKUP_TEST_HOOKS -DRESTORE_TEST_HOOKS -DPACKAGES_TEST_HOOKS -DGROUPS_TEST_HOOKS -DPORTABLE_RESTORE_REPLAY_TEST_HOOKS -o $@ $(filter %.c %.o,$^)
 
 $(TEST_RESTORE_ATIME): tests/test_restore_atime.c $(LIB_OBJS)
 	$(CC) $(CFLAGS) -o $@ $(filter %.c %.o,$^)

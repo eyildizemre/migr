@@ -26,6 +26,8 @@
 #include "manifest.h"
 #include "metadata.h"
 #include "packages.h"
+#include "groups.h"
+#include "flatpak.h"
 #include "portable.h"
 #include "selfcopy.h"
 #include "sidecar.h"

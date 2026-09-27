@@ -21,6 +21,8 @@
 #include "manifest.h"
 #include "metadata.h"
 #include "packages.h"
+#include "groups.h"
+#include "flatpak.h"
 #include "portable.h"
 #include "portable_restore.h"
 #include "portable_restore_internal.h"

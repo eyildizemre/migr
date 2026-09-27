@@ -13,6 +13,8 @@
 
 #include "detect.h"
 #include "packages.h"
+#include "groups.h"
+#include "flatpak.h"
 #include "utils.h"
 
 #define GREEN "\033[0;32m"
@@ -883,7 +885,7 @@ static void test_groups_collect(void)
                      "twice:x:21:\n"
                      "dialout:x:18:bob,eyildizemre") == 0,
           "group fixture is written");
-    packages_test_set_group_file(path);
+    groups_test_set_group_file(path);
     char *groups = groups_collect("eyildizemre");
     check(groups != NULL && strcmp(groups, "wheel\nlibvirt\ndialout\n") == 0,
           "only groups whose member list names the user are listed, in file "
@@ -907,7 +909,7 @@ static void test_groups_collect(void)
     check(groups_collect("eyildizemre") == NULL &&
               local_group_gid("libvirt", &gid) != 0,
           "an unreadable group file yields no list and no gid");
-    packages_test_set_group_file(NULL);
+    groups_test_set_group_file(NULL);
 }
 
 typedef struct {
@@ -1007,11 +1009,12 @@ static int run_restore_groups_case(const char *groups_txt,
     {
         packages_test_set_restore_hooks(DISTRO_FEDORA, group_run_fixture, NULL,
                                         runner);
-        packages_test_set_group_file(group_path);
+        groups_test_set_group_file(group_path);
         rc = run_control_file_case("groups.txt", groups_txt,
                                    restore_groups_step, (void *)user, output,
                                    output_size);
         packages_test_clear_restore_hooks();
+        groups_test_set_group_file(NULL);
     }
     unlink(group_path);
     return rc;

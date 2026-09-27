@@ -2,7 +2,6 @@
 #define PACKAGES_H
 
 #include <stdio.h>
-#include <sys/types.h>
 
 #ifdef PACKAGES_TEST_HOOKS
 #include "detect.h"
@@ -15,7 +14,6 @@ void packages_test_set_restore_hooks(distro_t distro,
                                      PackagesTestRunHook run_hook,
                                      PackagesTestCaptureHook capture_hook,
                                      void *context);
-void packages_test_set_group_file(const char *path);
 void packages_test_clear_restore_hooks(void);
 int packages_test_drop_kernel_pinned(char *buffer);
 #endif
@@ -134,8 +132,8 @@ void read_package_list(FILE *pkg_file, char ***pkgs_out, int *pkg_count_out,
  * packages.txt and an unrecognized distro are skipped without making the
  * restore fatal, while failures to read or inspect the file set had_error.
  *
- * This and the restore steps below write what is left for the user to do
- * by hand to todo, one paragraph each with the command to run.
+ * This, restore_groups(), and restore_flatpak_apps() write what is left for
+ * the user to do by hand to todo, one paragraph each with the command to run.
  *
  * @param source_root_fd Directory fd the restored packages.txt is read from.
  * @param todo           Receives the packages the system does not have after
@@ -143,71 +141,5 @@ void read_package_list(FILE *pkg_file, char ***pkgs_out, int *pkg_count_out,
  * @param had_error      Set to 1 on a real failure; untouched otherwise.
  */
 void restore_packages(int source_root_fd, FILE *todo, int *had_error);
-
-/**
- * @brief Lists the groups whose member list in /etc/group names user, one
- *        name per line.
- *
- * These are the user's supplementary memberships, by name since GIDs differ
- * between installs. The file is read directly, without NSS, as D38 reads
- * accounts: a directory service's groups are not the install's. Names a
- * restore would not accept are left out.
- *
- * @return A heap string, empty when user is in no group; NULL when the file
- *         cannot be read.
- */
-char *groups_collect(const char *user);
-
-/**
- * @brief Looks a group's gid up in /etc/group, read the same way.
- *
- * @return 0, or -1 when the group is absent, listed twice, or the file cannot
- *         be read.
- */
-int local_group_gid(const char *name, gid_t *gid);
-
-/**
- * @brief Adds user to the groups a restored groups.txt lists.
- *
- * Runs after restore_packages(), since packages create groups (the libvirt
- * package creates libvirt). Groups this system has and user is not yet in
- * are added with one usermod; groups it lacks are listed, with the command
- * to add them later, and never created, since one comes with software that
- * would give it a system GID. An absent
- * groups.txt is skipped silently. A dry run only says what it would add.
- *
- * @param user      Login name to add; NULL when it could not be resolved,
- *                  which fails the step if there is anything to add.
- * @param had_error Set to 1 on a real failure; untouched otherwise.
- */
-void restore_groups(int source_root_fd, const char *user, FILE *todo,
-                    int *had_error);
-
-/**
- * @brief Lists the system installation's Flatpak applications as
- *        "<remote>\t<app-id>" lines, the output of
- *        `flatpak list --system --app --columns=origin,application`.
- *
- * A user installation needs no list: it is captured as files (D57).
- *
- * @return A heap string, or NULL when flatpak is missing or lists nothing.
- */
-char *flatpak_apps_collect(void);
-
-/**
- * @brief Installs the applications a restored flatpak-apps.txt lists into
- *        the system installation (D76).
- *
- * Runs after restore_packages(), which may bring Flatpak itself. Apps
- * already installed are skipped; the rest are installed with one
- * `flatpak install --system -y` per remote the system has. Apps whose
- * remote it lacks are listed with the command to run once the remote is
- * added: adding one needs its signing key, which the backup does not have.
- * An absent list is skipped silently, and a system without flatpak gets the
- * apps listed in todo. A dry run only says what it would install.
- *
- * @param had_error Set to 1 on a real failure; untouched otherwise.
- */
-void restore_flatpak_apps(int source_root_fd, FILE *todo, int *had_error);
 
 #endif
