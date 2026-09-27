@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -642,6 +643,49 @@ ContainerStatus container_restore_finished_name(BackupContainer *container)
         return CONTAINER_ERR_IO;
     container->state = CONTAINER_STATE_FINALIZED;
     return CONTAINER_OK;
+}
+
+static const int guard_signals[] = { SIGINT, SIGTERM, SIGHUP };
+#define GUARD_SIGNAL_COUNT (sizeof(guard_signals) / sizeof(guard_signals[0]))
+static struct sigaction guard_saved[GUARD_SIGNAL_COUNT];
+static int guard_dir_fd = -1;
+static char guard_updating[CONTAINER_NAME_MAX];
+static char guard_final[CONTAINER_NAME_MAX];
+
+static void guard_signal_handler(int signal_number)
+{
+    (void)renameat2(guard_dir_fd, guard_updating, guard_dir_fd, guard_final,
+                    RENAME_NOREPLACE);
+    signal(signal_number, SIG_DFL);
+    raise(signal_number);
+}
+
+void container_guard_finished_name(const BackupContainer *container)
+{
+    if (container == NULL || container->state != CONTAINER_STATE_PARTIAL ||
+        !container->from_finished || guard_dir_fd >= 0)
+        return;
+    memcpy(guard_updating, container->partial_name, sizeof(guard_updating));
+    memcpy(guard_final, container->final_name, sizeof(guard_final));
+    guard_dir_fd = container->dir_fd;
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = guard_signal_handler;
+    sigfillset(&action.sa_mask);
+    // A signal the caller ignores (nohup's SIGHUP) stays ignored.
+    for (size_t index = 0; index < GUARD_SIGNAL_COUNT; index++)
+        if (sigaction(guard_signals[index], NULL, &guard_saved[index]) == 0 &&
+            guard_saved[index].sa_handler != SIG_IGN)
+            sigaction(guard_signals[index], &action, NULL);
+}
+
+void container_unguard_finished_name(void)
+{
+    if (guard_dir_fd < 0)
+        return;
+    for (size_t index = 0; index < GUARD_SIGNAL_COUNT; index++)
+        sigaction(guard_signals[index], &guard_saved[index], NULL);
+    guard_dir_fd = -1;
 }
 
 void container_close(BackupContainer *container)

@@ -230,6 +230,19 @@ ContainerStatus container_finalize(BackupContainer *container);
 ContainerStatus container_restore_finished_name(BackupContainer *container);
 
 /**
+ * @brief Until container_unguard_finished_name(), an interrupt (SIGINT,
+ * SIGTERM, SIGHUP) gives the finished backup this handle renamed for an
+ * update its finished name back before the process ends, as
+ * container_restore_finished_name() does for a run that stops by itself.
+ * For the time before anything in the backup changes. Does nothing for a
+ * handle that did not rename a finished backup.
+ */
+void container_guard_finished_name(const BackupContainer *container);
+
+/** @brief Ends container_guard_finished_name(); safe when not guarding. */
+void container_unguard_finished_name(void);
+
+/**
  * @brief Releases container's fds (and thus any flock() it holds) and zeroes it.
  *
  * Never deletes anything on disk: an unfinalized partial is left in place for

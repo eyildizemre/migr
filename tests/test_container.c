@@ -10,6 +10,7 @@
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <signal.h>
 #include <string.h>
 #include <sys/file.h> /* flock */
 #include <sys/socket.h>
@@ -1145,6 +1146,54 @@ static void test_adopt_takes_a_finished_backup_for_update(void)
     fresh_test_root();
 }
 
+// Adopts the one finished backup under test_root in a child that is then
+// killed by SIGTERM, with the finished-name guard on or already off.
+static int finished_backup_after_interrupt(int guarded)
+{
+    Manifest m;
+    make_reference_manifest(&m);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0)
+    {
+        BackupContainer adopted;
+        if (container_adopt(test_root, OWNER, &m, &adopted) != CONTAINER_OK)
+            _exit(1);
+        container_guard_finished_name(&adopted);
+        if (!guarded)
+            container_unguard_finished_name();
+        raise(SIGTERM);
+        _exit(2);
+    }
+    int status = 0;
+    if (child < 0 || waitpid(child, &status, 0) != child ||
+        !WIFSIGNALED(status) || WTERMSIG(status) != SIGTERM)
+        return -1;
+    char final_path[PATH_MAX];
+    path_under_root(final_path, sizeof(final_path), "migr-" OWNER);
+    return access(final_path, F_OK) == 0;
+}
+
+static void test_interrupt_gives_the_finished_name_back(void)
+{
+    printf(BLUE "::" NC " container: an interrupt before any change leaves the backup finished\n");
+    fresh_test_root();
+    Manifest m;
+    make_reference_manifest(&m);
+    BackupContainer c;
+    check(container_reserve(test_root, OWNER, FIXED_TIME, &c) == CONTAINER_OK &&
+              manifest_write_v1_at(container_root_fd(&c), &m) == 0 &&
+              container_finalize(&c) == CONTAINER_OK,
+          "fixture: publish a finished backup");
+    container_close(&c);
+
+    check(finished_backup_after_interrupt(1) == 1,
+          "an interrupted run puts the finished name back while guarded");
+    check(finished_backup_after_interrupt(0) == 0,
+          "once unguarded, an interrupt leaves the .updating name");
+    fresh_test_root();
+}
+
 typedef struct
 {
     const char *content; // NULL means "write no manifest.txt at all"
@@ -1491,6 +1540,7 @@ int main(void)
     test_adopt_rejects_identity_mismatches();
     test_adopt_follows_a_changed_selection();
     test_adopt_takes_a_finished_backup_for_update();
+    test_interrupt_gives_the_finished_name_back();
     test_adopt_rejects_non_valid_manifests();
     test_adopt_fails_closed_on_scan_error();
     test_adopt_ignores_names_outside_the_grammar();

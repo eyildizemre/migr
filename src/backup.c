@@ -3266,6 +3266,10 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
             adopted_changed = 1;
             goto fail_pre_container;
         }
+        // Until this run writes into it, an interrupt puts the backup back
+        // under its finished name, as a run that stops by itself does.
+        if (!adopted_changed)
+            container_guard_finished_name(&container);
         int adopted_data_fd = openat(container_root_fd(&container), "data",
                                      O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
                                      O_CLOEXEC);
@@ -3363,6 +3367,7 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
     }
     close(target_fd);
     target_fd = -1;
+    container_unguard_finished_name();
 
     int container_fd = container_root_fd(&container);
     int had_error = 0;
@@ -3773,6 +3778,7 @@ finish:
 cancel_pre_container:
     finish_result = MIGR_EXIT_OK;
 fail_pre_container:
+    container_unguard_finished_name();
     source_snapshot_end(&source_snapshot);
     // A finished backup taken over for an update and left unchanged is
     // published again as it was, rather than left looking unfinished.

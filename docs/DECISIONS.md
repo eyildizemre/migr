@@ -4682,7 +4682,9 @@ PATH instead of creating another one.
   be the locked directory. `.updating` names count as taken for reservation
   and as in progress for restore and verify. Finalizing renames it back. A run
   that stops before changing anything renames it back at once
-  (`container_restore_finished_name()`).
+  (`container_restore_finished_name()`), and so does an interrupt (SIGINT,
+  SIGTERM, SIGHUP) in that time: the metadata preflight of a native backup
+  can take minutes (`container_guard_finished_name()`).
 - **Changed selection:** Right after adoption, roots of the old manifest
   with no identical root in the new one (`manifest_root_equal()`) are
   removed: in a portable backup their journal records (live and claimed) get
