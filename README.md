@@ -135,7 +135,6 @@ This backup includes 1 item(s) that can carry secrets typed at a shell prompt (.
 Backing up /home from a read-only snapshot.
 Backing up to: /mnt/usb/migr-eyildizemre.partial
 
-
 Packages
 Saved 362 packages to packages.txt
 
@@ -240,8 +239,7 @@ $ sudo ./migr restore /mnt/usb/migr-eyildizemre
 Backup taken 2026-09-27 22:48
 Estimated restore size: 8.0M
 Destination free space: 90.2G
-...
-This restore includes 31 item(s) carrying security.* attributes (e.g. SELinux labels); if this destination or account cannot apply one, that item's other content and metadata will still be restored and only the attribute will be skipped. Continue? [y/N]: y
+This will restore files to your home directory. Continue? [y/N]: y
 
 Packages
 Installing packages (this may take a while)...
