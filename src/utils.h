@@ -298,6 +298,19 @@ int path_join_n(char *buf, size_t size, const char *dir,
                 const char *name, size_t name_len);
 
 /**
+ * @brief Writes dir_fd's path, then "/" and rel unless rel is empty, for a
+ *        message naming a file the run met; "?" stands for a directory whose
+ *        path the kernel cannot give.
+ */
+void describe_path_at(int dir_fd, const char *rel, char *out, size_t size);
+
+/**
+ * @brief Says that restore will not write through the symbolic link at
+ *        dir_fd/rel: the user put it there and has to move it aside.
+ */
+void print_destination_symlink_refusal(int dir_fd, const char *rel);
+
+/**
  * @brief Whether `parent` contains `path` at a path-component boundary,
  * inclusive of equality.
  *

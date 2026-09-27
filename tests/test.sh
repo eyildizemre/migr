@@ -845,6 +845,28 @@ test_restore() {
     fi
     rm -rf "$log_home"
 
+    # A destination symlink is refused by name: a file, a restore root, or a
+    # folder on the way to one.
+    assert_contains "$failed_output" \
+        "$log_home/Documents/note.txt is a symbolic link"
+    local link_home="$TEST_DIR/link_home" link_case
+    for link_case in .ssh .local; do
+        rm -rf "$link_home"
+        mkdir -p "$link_home" "$TEST_DIR/link_target"
+        ln -s "$TEST_DIR/link_target" "$link_home/$link_case"
+        set +e
+        failed_output=$(echo "y" | HOME="$link_home" "$MIGR" restore "$actual_backup" 2>&1)
+        failed_rc=$?
+        set -e
+        if [ "$failed_rc" -ne 2 ]; then
+            echo -e "  ${RED}✗${NC} A restore through $link_case did not fail."
+            exit 1
+        fi
+        assert_contains "$failed_output" \
+            "$link_home/$link_case is a symbolic link, which restore does not write through"
+    done
+    rm -rf "$link_home" "$TEST_DIR/link_target"
+
     assert_file_exists "$HOME/Documents/note.txt"
     assert_file_exists "$HOME/Desktop/keep.txt"
     assert_file_exists "$HOME/.ssh/config"

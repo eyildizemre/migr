@@ -2566,6 +2566,7 @@ static RestoreResolveResult resolve_parent(int root_fd, const char *rel,
         {
             int saved_errno = errno;
             close(cur_fd);
+            errno = saved_errno;
             if (!create_intermediates && saved_errno == ENOENT)
                 return RESTORE_RESOLVE_MISSING;
             return RESTORE_RESOLVE_ERROR;
@@ -3497,6 +3498,7 @@ static RestoreNativeStatus restore_entry_at(
     }
     if (dest_exists && S_ISLNK(dest_st.st_mode))
     {
+        print_destination_symlink_refusal(dest_parent_fd, dest_leaf);
         close(source_object_fd);
         restore_report_failure(restore_report, logical_path);
         return -1;
@@ -3720,6 +3722,13 @@ RestoreNativeStatus restore_native_metadata_inventory_at(
                        &dest_parent_fd, dest_leaf, sizeof(dest_leaf));
     if (dest_result == RESTORE_RESOLVE_ERROR)
     {
+        int saved_errno = errno;
+        char path[PATH_MAX + NAME_MAX + 2];
+        describe_path_at(destination_root_fd, destination_rel, path,
+                         sizeof(path));
+        print_error("Error: cannot reach %s (%s); a folder on the way that is "
+                    "a symbolic link is not followed. Move it aside and run "
+                    "the restore again.\n", path, strerror(saved_errno));
         close(source_parent_fd);
         return -1;
     }

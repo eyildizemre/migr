@@ -2454,6 +2454,31 @@ static int restore_target_map_free(RestoreTargetMap *map)
     return failed ? -1 : 0;
 }
 
+// Finds the first entry along relative below anchor_fd that is a symbolic
+// link, which the destination walk refuses to follow. Returns 1 with its
+// path below the anchor in out, or 0 when there is none.
+static int restore_first_symlink(int anchor_fd, const char *relative,
+                                 char *out, size_t size)
+{
+    if (snprintf(out, size, "%s", relative) >= (int)size)
+        return 0;
+    for (char *component = out;;)
+    {
+        char *slash = strchr(component, '/');
+        if (slash != NULL)
+            *slash = '\0';
+        struct stat st;
+        if (fstatat(anchor_fd, out, &st, AT_SYMLINK_NOFOLLOW) != 0)
+            return 0;
+        if (S_ISLNK(st.st_mode))
+            return 1;
+        if (slash == NULL)
+            return 0;
+        *slash = '/';
+        component = slash + 1;
+    }
+}
+
 static int restore_target_identity_add(
     RestoreTargetMap *map, const Manifest *manifest, size_t root_index,
     const char *logical, const struct stat *source_st, size_t owner,
@@ -2490,17 +2515,19 @@ static int restore_target_identity_add(
     if (status == DESTINATION_IDENTITY_OK)
         return 0;
 
+    int saved_errno = errno;
+    char symlink_rel[PATH_MAX];
     const char *entry_name = logical[0] == '\0' ? "." : logical;
+    char destination[PATH_MAX];
+    if ((logical[0] == '\0' &&
+         snprintf(destination, sizeof(destination), "%s",
+                  target->absolute) >= (int)sizeof(destination)) ||
+        (logical[0] != '\0' &&
+         path_join(destination, sizeof(destination), target->absolute,
+                   logical) != 0))
+        snprintf(destination, sizeof(destination), "%s", relative);
     if (status == DESTINATION_IDENTITY_COLLISION)
     {
-        char destination[PATH_MAX];
-        if ((logical[0] == '\0' &&
-             snprintf(destination, sizeof(destination), "%s",
-                      target->absolute) >= (int)sizeof(destination)) ||
-            (logical[0] != '\0' &&
-             path_join(destination, sizeof(destination), target->absolute,
-                       logical) != 0))
-            snprintf(destination, sizeof(destination), "%s", relative);
         size_t conflicting_root = SIZE_MAX;
         if (conflicting_owner != SIZE_MAX)
             conflicting_root = conflicting_owner % MANIFEST_MAX_ROOTS;
@@ -2520,14 +2547,6 @@ static int restore_target_identity_add(
             name_conflict.failure == DESTINATION_NAME_FAILURE_CASEFOLD
                 ? "casefold name lookup"
                 : "name lookup capability is unknown";
-        char destination[PATH_MAX];
-        if ((logical[0] == '\0' &&
-             snprintf(destination, sizeof(destination), "%s",
-                      target->absolute) >= (int)sizeof(destination)) ||
-            (logical[0] != '\0' &&
-             path_join(destination, sizeof(destination), target->absolute,
-                       logical) != 0))
-            snprintf(destination, sizeof(destination), "%s", relative);
         size_t conflicting_root = SIZE_MAX;
         if (conflicting_owner != SIZE_MAX)
             conflicting_root = conflicting_owner % MANIFEST_MAX_ROOTS;
@@ -2559,9 +2578,14 @@ static int restore_target_identity_add(
             print_error("Error: Could not allocate destination identity state for manifest root %s entry %s\n",
                         root->id, entry_name);
     }
+    else if (restore_first_symlink(target->route.anchor_fd, relative,
+                                   symlink_rel, sizeof(symlink_rel)))
+        print_destination_symlink_refusal(target->route.anchor_fd,
+                                          symlink_rel);
     else
-        print_error("Error: Could not safely inspect restore destination for manifest root %s entry %s\n",
-                    root->id, entry_name);
+        print_error("Error: Could not safely inspect restore destination %s "
+                    "for manifest root %s entry %s (%s)\n", destination,
+                    root->id, entry_name, strerror(saved_errno));
     return -1;
 }
 

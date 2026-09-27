@@ -1345,9 +1345,15 @@ static void test_versioned_restore_rejects_non_directory_payload_paths(void)
               file_content_is(blocked, "ORIGINAL")) ||
              (variant == 1 && S_ISLNK(blocked_st.st_mode) &&
               file_content_is(sentinel, "ORIGINAL")));
+        // A symlink is refused by its path, the other entries by the root
+        // and entry they belong to.
+        char symlink_refusal[PATH_MAX + 64];
+        snprintf(symlink_refusal, sizeof(symlink_refusal),
+                 "%s is a symbolic link", blocked);
         check(rc != 0 &&
-                  strstr(output,
-                         "manifest root XDG_DOCUMENTS_DIR entry shared") != NULL &&
+                  strstr(output, variant == 0
+                             ? "manifest root XDG_DOCUMENTS_DIR entry shared"
+                             : symlink_refusal) != NULL &&
                   blocked_intact,
               variants[variant]);
 

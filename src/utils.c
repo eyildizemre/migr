@@ -820,6 +820,27 @@ int path_join_n(char *buf, size_t size, const char *dir,
     return 0;
 }
 
+void describe_path_at(int dir_fd, const char *rel, char *out, size_t size)
+{
+    char link[64];
+    char dir[PATH_MAX];
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", dir_fd);
+    ssize_t length = readlink(link, dir, sizeof(dir) - 1U);
+    if (length <= 0)
+        snprintf(dir, sizeof(dir), "?");
+    else
+        dir[length] = '\0';
+    snprintf(out, size, "%s%s%s", dir, rel[0] != '\0' ? "/" : "", rel);
+}
+
+void print_destination_symlink_refusal(int dir_fd, const char *rel)
+{
+    char path[PATH_MAX * 2];
+    describe_path_at(dir_fd, rel, path, sizeof(path));
+    print_error("Error: %s is a symbolic link, which restore does not write "
+                "through. Move it aside and run the restore again.\n", path);
+}
+
 int path_join(char *buf, size_t size, const char *dir, const char *name)
 {
     return path_join_n(buf, size, dir, name, strlen(name));
@@ -1337,17 +1358,7 @@ const char *run_log_finish(int keep)
     if (run_log.dir_fd >= 0 && keep)
     {
         (void)fsync(run_log.sink_fd);
-        char link[64];
-        char dir[PATH_MAX];
-        snprintf(link, sizeof(link), "/proc/self/fd/%d", run_log.dir_fd);
-        ssize_t length = readlink(link, dir, sizeof(dir) - 1U);
-        if (length > 0)
-        {
-            dir[length] = '\0';
-            if (snprintf(kept, sizeof(kept), "%s/%s", dir, run_log.name) >=
-                (int)sizeof(kept))
-                kept[0] = '\0';
-        }
+        describe_path_at(run_log.dir_fd, run_log.name, kept, sizeof(kept));
     }
     else if (run_log.dir_fd >= 0)
     {
