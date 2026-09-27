@@ -220,9 +220,7 @@ int visited_contains(const PortableVisited *visited,
 static uint64_t prescan_inode_hash(const PrescanInodeSet *set,
                                    dev_t device, ino_t inode)
 {
-    uint64_t hash = HASH_FNV1A_OFFSET_BASIS ^ set->hash_salt;
-    hash = hash_fnv1a_uint64(hash, (uint64_t)device);
-    return hash_fnv1a_uint64(hash, (uint64_t)inode);
+    return hash_uint64_pair(set->hash_salt, (uint64_t)device, (uint64_t)inode);
 }
 
 int prescan_inode_set_rehash(PrescanInodeSet *set,
@@ -345,9 +343,7 @@ void prescan_inode_set_free(void *opaque)
 static uint64_t inode_map_hash(const PortableInodeMap *map, dev_t device,
                                ino_t inode)
 {
-    uint64_t hash = HASH_FNV1A_OFFSET_BASIS ^ map->hash_salt;
-    hash = hash_fnv1a_uint64(hash, (uint64_t)device);
-    return hash_fnv1a_uint64(hash, (uint64_t)inode);
+    return hash_uint64_pair(map->hash_salt, (uint64_t)device, (uint64_t)inode);
 }
 
 static int inode_map_rehash(PortableInodeMap *map, size_t new_capacity)

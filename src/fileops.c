@@ -162,9 +162,7 @@ typedef struct {
 static uint64_t native_inode_hash(const NativeInodeMap *map, dev_t device,
                                   ino_t inode)
 {
-    uint64_t hash = HASH_FNV1A_OFFSET_BASIS ^ map->hash_salt;
-    hash = hash_fnv1a_uint64(hash, (uint64_t)device);
-    return hash_fnv1a_uint64(hash, (uint64_t)inode);
+    return hash_uint64_pair(map->hash_salt, (uint64_t)device, (uint64_t)inode);
 }
 
 static int native_inode_map_rehash(NativeInodeMap *map, size_t capacity)
@@ -238,9 +236,7 @@ static int native_inode_map_locate(const NativeInodeMap *map,
 static uint64_t native_dir_fd_hash(const NativeDirFdPool *pool,
                                    dev_t device, ino_t inode)
 {
-    uint64_t hash = HASH_FNV1A_OFFSET_BASIS ^ pool->hash_salt;
-    hash = hash_fnv1a_uint64(hash, (uint64_t)device);
-    return hash_fnv1a_uint64(hash, (uint64_t)inode);
+    return hash_uint64_pair(pool->hash_salt, (uint64_t)device, (uint64_t)inode);
 }
 
 static int native_dir_fd_pool_rehash(NativeDirFdPool *pool, size_t capacity)
@@ -468,9 +464,7 @@ typedef struct {
 
 static uint64_t native_estimate_inode_hash(dev_t device, ino_t inode)
 {
-    uint64_t hash = HASH_FNV1A_OFFSET_BASIS;
-    hash = hash_fnv1a_uint64(hash, (uint64_t)device);
-    return hash_fnv1a_uint64(hash, (uint64_t)inode);
+    return hash_uint64_pair(0, (uint64_t)device, (uint64_t)inode);
 }
 
 static int native_estimate_seen_rehash(NativeEstimateSeen *seen,

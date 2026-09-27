@@ -1036,9 +1036,7 @@ void destination_identity_test_force_casefold(int enabled)
 
 static uint64_t destination_identity_hash(dev_t dev, ino_t ino)
 {
-    uint64_t hash = HASH_FNV1A_OFFSET_BASIS;
-    hash = hash_fnv1a_uint64(hash, (uint64_t)dev);
-    return hash_fnv1a_uint64(hash, (uint64_t)ino);
+    return hash_uint64_pair(0, (uint64_t)dev, (uint64_t)ino);
 }
 
 static uint64_t destination_namespace_hash(const DestinationIdentityGraph *graph,
@@ -1702,9 +1700,8 @@ static DestinationIdentityStatus destination_name_equivalence_check(
 static uint64_t destination_topology_hash(const DestinationIdentityGraph *graph,
                                           size_t parent, size_t child)
 {
-    uint64_t hash = HASH_FNV1A_OFFSET_BASIS ^ graph->hash_salt;
-    hash = hash_fnv1a_uint64(hash, (uint64_t)parent);
-    return hash_fnv1a_uint64(hash, (uint64_t)child);
+    return hash_uint64_pair(graph->hash_salt, (uint64_t)parent,
+                            (uint64_t)child);
 }
 
 static int destination_topology_add(DestinationIdentityGraph *graph,

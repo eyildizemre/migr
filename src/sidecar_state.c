@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "sidecar_state_internal.h"
+#include "hash.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -403,15 +404,6 @@ fail:
     return status;
 }
 
-static uint64_t mix_hash(uint64_t value)
-{
-    value ^= value >> 30;
-    value *= UINT64_C(0xbf58476d1ce4e5b9);
-    value ^= value >> 27;
-    value *= UINT64_C(0x94d049bb133111eb);
-    return value ^ (value >> 31);
-}
-
 uint64_t sidecar_process_salt(void)
 {
     static uint64_t salt;
@@ -433,7 +425,7 @@ uint64_t sidecar_process_salt(void)
         fallback ^= (uint64_t)now.tv_nsec << 32;
         fallback ^= (uint64_t)(unsigned long)getpid();
         fallback ^= (uint64_t)(uintptr_t)&salt;
-        salt = mix_hash(fallback);
+        salt = hash_mix64(fallback);
     }
     initialized = 1;
     return salt;

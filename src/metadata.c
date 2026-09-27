@@ -392,9 +392,7 @@ typedef struct {
 static uint64_t metadata_snapshot_index_hash(uint64_t salt, dev_t device,
                                              ino_t inode)
 {
-    uint64_t hash = HASH_FNV1A_OFFSET_BASIS ^ salt;
-    hash = hash_fnv1a_uint64(hash, (uint64_t)device);
-    return hash_fnv1a_uint64(hash, (uint64_t)inode);
+    return hash_uint64_pair(salt, (uint64_t)device, (uint64_t)inode);
 }
 
 // Returns 1 with *out_index set to the matching slot, 0 with *out_index set

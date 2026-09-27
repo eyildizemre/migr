@@ -20,3 +20,20 @@ uint64_t hash_fnv1a_uint64(uint64_t hash, uint64_t value)
     }
     return hash;
 }
+
+uint64_t hash_mix64(uint64_t value)
+{
+    value ^= value >> 30;
+    value *= UINT64_C(0xbf58476d1ce4e5b9);
+    value ^= value >> 27;
+    value *= UINT64_C(0x94d049bb133111eb);
+    return value ^ (value >> 31);
+}
+
+uint64_t hash_uint64_pair(uint64_t salt, uint64_t first, uint64_t second)
+{
+    uint64_t hash = HASH_FNV1A_OFFSET_BASIS ^ salt;
+    hash = hash_fnv1a_uint64(hash, first);
+    hash = hash_fnv1a_uint64(hash, second);
+    return hash_mix64(hash);
+}

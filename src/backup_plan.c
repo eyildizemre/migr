@@ -783,9 +783,7 @@ typedef struct {
 
 static uint64_t estimate_inode_hash(dev_t dev, ino_t ino)
 {
-    uint64_t hash = HASH_FNV1A_OFFSET_BASIS;
-    hash = hash_fnv1a_uint64(hash, (uint64_t)dev);
-    return hash_fnv1a_uint64(hash, (uint64_t)ino);
+    return hash_uint64_pair(0, (uint64_t)dev, (uint64_t)ino);
 }
 
 static int estimate_seen_rehash(EstimateSeen *seen, size_t new_capacity)
