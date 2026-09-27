@@ -47,9 +47,61 @@ ssize_t __wrap_read(int fd, void *buf, size_t count)
     return __real_read(fd, buf, count);
 }
 
+// Runs argv with fds 1 and 2 pointing at one temporary file and a fully
+// buffered stdout holding "before\n", then returns what the file got.
+static void run_into_file(char *const argv[], int capture, char *out,
+                          size_t out_size)
+{
+    out[0] = '\0';
+    char path[] = "/tmp/migr_run_command_XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0)
+        return;
+    fflush(stdout);
+    fflush(stderr);
+    int saved_out = dup(STDOUT_FILENO);
+    int saved_err = dup(STDERR_FILENO);
+    dup2(fd, STDOUT_FILENO);
+    dup2(fd, STDERR_FILENO);
+    setvbuf(stdout, NULL, _IOFBF, BUFSIZ);
+    printf("before\n");
+    char captured[64];
+    if (capture)
+        (void)run_command_capture(argv, captured, sizeof(captured));
+    else
+        (void)run_command(argv);
+    fflush(stdout);
+    dup2(saved_out, STDOUT_FILENO);
+    dup2(saved_err, STDERR_FILENO);
+    close(saved_out);
+    close(saved_err);
+    setvbuf(stdout, NULL, _IOLBF, BUFSIZ);
+    ssize_t length = pread(fd, out, out_size - 1U, 0);
+    out[length > 0 ? length : 0] = '\0';
+    close(fd);
+    unlink(path);
+}
+
 int main(void)
 {
     printf(BLUE "::" NC " run_command (unit)\n");
+
+    char text[256];
+    char *const missing_quiet[] = { "migr-test-nonexistent-binary-xyz", NULL };
+    run_into_file(missing_quiet, 0, text, sizeof(text));
+    check(strcmp(text, "before\n") == 0,
+          "a command that cannot be run prints nothing of its own");
+    run_into_file(missing_quiet, 1, text, sizeof(text));
+    check(strcmp(text, "before\n") == 0,
+          "a captured command that cannot be run prints nothing of its own");
+    char *const after_argv[] = { "sh", "-c", "echo after", NULL };
+    run_into_file(after_argv, 0, text, sizeof(text));
+    check(strcmp(text, "before\nafter\n") == 0,
+          "what migr printed comes before the command's output");
+    char *const after_err_argv[] = { "sh", "-c", "echo after >&2", NULL };
+    run_into_file(after_err_argv, 1, text, sizeof(text));
+    check(strcmp(text, "before\nafter\n") == 0,
+          "what migr printed comes before a captured command's stderr");
 
     char *const true_argv[] = { "true", NULL };
     check(run_command(true_argv) == 0, "a successful command exits 0");

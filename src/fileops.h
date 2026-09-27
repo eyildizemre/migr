@@ -466,8 +466,9 @@ int get_dir_size(const char *path, off_t *size);
  * @brief Executes a command via fork/execvp without invoking a shell.
  *
  * Forks a child process, executes argv[0] with the given argument vector,
- * and blocks until the child exits. Uses _exit in the child to avoid
- * flushing shared stdio buffers.
+ * and blocks until the child exits. stdout is flushed first, so the
+ * command's output follows what migr printed. A program that cannot be run
+ * exits the child with status 1 without printing anything.
  *
  * @param argv NULL-terminated argument vector; argv[0] is the program to run.
  * @return The child's exit status on success, -1 if fork or waitpid fails.
@@ -483,7 +484,7 @@ int run_command(char *const argv[]);
  * output must be non-NULL and output_size must be at least 1 (room for
  * the null terminator even with zero bytes of captured output); both are
  * rejected with -1 before anything is spawned. Child-side redirection or
- * exec failures terminate the child with status 1.
+ * exec failures terminate the child with status 1 without printing.
  *
  * @param argv        NULL-terminated argument vector; argv[0] is the program to run.
  * @param output      Buffer to receive the captured stdout; must be non-NULL.

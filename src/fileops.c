@@ -3955,6 +3955,8 @@ int get_dir_size(const char *path, off_t *size)
 
 int run_command(char *const argv[])
 {
+    // What migr printed so far comes before the command's own output.
+    fflush(stdout);
     pid_t pid = fork();
 
     if (pid == -1)
@@ -3963,13 +3965,11 @@ int run_command(char *const argv[])
     }
     else if (pid == 0)
     {
-        // Child process
+        // Child process. No stdio until exec: stdout and stderr may be the
+        // run log's streams, whose lock another thread can hold at fork().
+        // An exec failure exits with 1 silently; the caller reports it.
         execvp(argv[0], argv);
-        
-        // If execvp returns, it means it failed
-        perror("execvp");
-        _exit(1); // _exit() is used to exit immediately since we're in a child process. 
-                  // exit() could've caused issues because it might flush stdio buffers that are shared with the parent process.
+        _exit(1); // not exit(): it would flush stdio buffers shared with the parent
     }
     else 
     {
@@ -4237,6 +4237,8 @@ static int run_command_capture_internal(char *const argv[], char *output,
         pthread_sigmask(SIG_BLOCK, &sigpipe_set, &previous_mask) == 0)
         sigpipe_was_blocked = sigismember(&previous_mask, SIGPIPE);
 
+    // What migr printed so far comes before the command's own stderr.
+    fflush(stdout);
     pid_t pid = fork();
     if (pid == -1)
     {
@@ -4255,14 +4257,11 @@ static int run_command_capture_internal(char *const argv[], char *output,
     }
     else if (pid == 0)
     {
-        // Child process
+        // Child process. No stdio until exec, as in run_command().
         close(pipefd[0]); // Close the read end of the pipe
 
         if (dup2(pipefd[1], STDOUT_FILENO) == -1)
-        {
-            perror("dup2");
             _exit(1); // Redirect failed; do not exec with the wrong stdout
-        }
         close(pipefd[1]); // Close the original write end of the pipe
 
         if (feed_stdin)
@@ -4289,9 +4288,7 @@ static int run_command_capture_internal(char *const argv[], char *output,
         else
             execvp(argv[0], argv); // Execute the command
 
-        // If execvp returns, it means it failed
-        perror("execvp");
-        _exit(1); // Exit immediately since we're in a child process
+        _exit(1); // exec failed: an absent optional command stays silent
     }
     else
     {
