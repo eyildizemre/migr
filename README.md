@@ -121,7 +121,7 @@ Estimated backup size: 428.3K
 Destination free space: 15.2G
 
 This backup includes 1 item(s) that can carry secrets typed at a shell prompt (.bash_history). Make sure the destination is trustworthy before continuing. Continue? [Y/n]: y
-Backing up to: /media/usb/migr_backup_20260907_151730.partial
+Backing up to: /media/usb/migr-eyildizemre.partial
 
 Main Directories
 
@@ -135,7 +135,7 @@ VS Code Extensions
 
 Finalizing (syncing to disk)...
   OK: Backup complete: 4 items copied
-Location: /media/usb/migr_backup_20260907_151730
+Location: /media/usb/migr-eyildizemre
 ```
 
 ## Commands
@@ -314,17 +314,24 @@ backups remain literal requests and do not add this consent gate.
 
 ## Backup Containers
 
-A successful live backup is published as:
+A successful live backup is published under the name of the user it belongs
+to:
 
 ```
-migr_backup_YYYYMMDD_HHMMSS[-N]/
+migr-<user>/
 ```
+
+When that name already holds another install's backup (another computer, or
+the system before a reinstall), the new one is named after the day it was first
+taken, `migr-<user>-YYYY-MM-DD`, then `-2`, `-3` the same day; the existing one
+is never touched. Which backup is whose is decided by the machine and user
+recorded in its manifest, not by its name. Characters in the user name that
+some filesystems reject become `_`.
 
 While the backup is running, migr writes to the same name with a `.partial` suffix.
 A failed or interrupted backup is never published as complete; a later invocation of
 the same job can resume a matching usable partial. Restore refuses `.partial`
-containers. If multiple backups begin in the same second, `-1`, `-2`, and so on keep
-their names distinct without replacing an existing backup.
+containers.
 
 Before publishing a container under its final name, migr flushes the destination
 filesystem and then flushes the destination directory after the atomic rename.
@@ -336,7 +343,7 @@ The container root holds migr-owned control files and optional bundled content.
 The selected payload roots live below `data/`:
 
 ```
-migr_backup_YYYYMMDD_HHMMSS[-N]/
+migr-<user>/
 ├── manifest.txt
 ├── packages.txt        # present when this scope exports a package list
 ├── vs-code-extensions.txt # present when code lists installed extensions

@@ -2656,7 +2656,7 @@ static int backup_dry_run(const char *target, BackupMode mode,
 
     printf("Dry run mode enabled. No changes will be made.\n\n");
     printf("Would create a versioned backup container under: %s\n", target);
-    printf("  Its migr_backup_<timestamp> name is chosen when the backup actually runs.\n");
+    printf("  Its name, migr-<user> or a dated one when that is taken, is chosen when the backup actually runs.\n");
 
     preview_roots(plan, &count);
 
@@ -3008,7 +3008,8 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
         ? &prepared.manifest : &manifest;
 
     int adopted = 0;
-    ContainerStatus adopt_status = container_adopt_fd(target_fd, identity_manifest,
+    ContainerStatus adopt_status = container_adopt_fd(target_fd, invoker_name(),
+                                                      identity_manifest,
                                                       &container);
     if (adopt_status == CONTAINER_OK)
     {
@@ -3083,7 +3084,8 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
                 goto fail_pre_container;
             }
         }
-        if (container_reserve_fd(target_fd, time(NULL), &container) != CONTAINER_OK)
+        if (container_reserve_fd(target_fd, invoker_name(), time(NULL),
+                                 &container) != CONTAINER_OK)
         {
             print_error("Error: Could not create a backup container under %s\n", target);
             goto fail_pre_container;

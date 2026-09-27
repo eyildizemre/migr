@@ -4634,3 +4634,33 @@ payload, not from the container.
 
 **Relationship:** Follows D62. Uses D38's invoker identity.
 
+## D71 — 2026-09-27 — A backup is named after its user
+
+**Status:** Implemented
+
+**Decision:** A container is named `migr-<user>`, for the user a run acts
+for (`SUDO_USER` under sudo, otherwise `USER` or `LOGNAME`), and
+`migr-<user>.partial` while it is created. When that name is taken, the next
+candidates are `migr-<user>-YYYY-MM-DD`, with the local date of the run, then
+the same with `-2`, `-3`, and so on. Characters outside `[A-Za-z0-9._-]`
+become `_`, a leading dot too, and the user part is cut to 32 characters.
+- Reservation keeps D15's claim, lock, and recheck protocol; only the
+  candidate names change.
+- Adoption scans only the reserving user's names, parsed exactly, so another
+  user's names (including one that merely starts the same) are never
+  candidates.
+- `container_name_is_partial()` and `container_name_is_final()` check the
+  shape only (`migr-` and name characters, with or without `.partial`),
+  since restore and verify do not know the owner.
+- Which backup is whose is decided by the manifest's source identity (D15),
+  never by the name.
+
+**Why:** A timestamped name made every run a new backup. One backup per user
+and machine, updated in place, needs a stable name. A date suffix tells an
+older install's backup apart where a hostname cannot: a reinstall often
+gets the same hostname again.
+
+**Relationship:** Replaces D15's `migr_backup_YYYYMMDD_HHMMSS[-N]` naming;
+D15's claim, lock, adoption, and publication rules stay. Existing backups in
+the old naming are not migrated (pre-release).
+

@@ -1002,7 +1002,8 @@ int repair_backup(const char *source, const char *dest_root)
                     strerror(errno));
         goto done;
     }
-    if (container_reserve_fd(dest_root_fd, time(NULL), &container) !=
+    if (container_reserve_fd(dest_root_fd, invoker_name(), time(NULL),
+                             &container) !=
         CONTAINER_OK)
     {
         print_error("Error: Could not create a backup container under %s.\n",

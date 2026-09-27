@@ -921,7 +921,7 @@ static void test_dispatch_refuses_partial_source(void)
     char parent[PATH_MAX];
     fresh_mkdtemp(parent, sizeof(parent), "dispatch_parent");
     char source[PATH_MAX];
-    join_path(source, sizeof(source), parent, "migr_backup_20260101_000000.partial");
+    join_path(source, sizeof(source), parent, "migr-eyildizemre.partial");
     mkdir_p(source);
 
     char home[PATH_MAX];
@@ -945,7 +945,7 @@ static void test_dispatch_requires_v1_manifest_for_final_container_name(void)
     char parent[PATH_MAX];
     fresh_mkdtemp(parent, sizeof(parent), "dispatch_parent");
     char source[PATH_MAX];
-    join_path(source, sizeof(source), parent, "migr_backup_20260101_000000");
+    join_path(source, sizeof(source), parent, "migr-eyildizemre");
     mkdir_p(source);
     write_payload_file(source, "data/EXPLICIT_0", "note.txt", "orphaned-v1-payload");
 
@@ -963,7 +963,7 @@ static void test_dispatch_requires_v1_manifest_for_final_container_name(void)
 
     char legacy_source[PATH_MAX];
     join_path(legacy_source, sizeof(legacy_source), parent,
-              "migr_backup_20260101_000000-1");
+              "migr-eyildizemre-2026-01-01");
     mkdir_p(legacy_source);
     write_raw(legacy_source, "XDG_DOCUMENTS_DIR=Belgeler\n");
 
@@ -4113,7 +4113,7 @@ static void test_network_config_roundtrip(const char *backend_name,
         exit(1);
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL)
-        if (strncmp(entry->d_name, "migr_backup_", 12) == 0 &&
+        if (strncmp(entry->d_name, "migr-", 5) == 0 &&
             strstr(entry->d_name, ".partial") == NULL)
             join_path(container, sizeof(container), target, entry->d_name);
     if (closedir(dir) != 0)

@@ -249,6 +249,19 @@ int resolve_sudo_identity(uid_t *uid_out, gid_t *gid_out,
                                       uid_out, gid_out, home_out);
 }
 
+const char *invoker_name(void)
+{
+    const char *names[] = {
+        geteuid() == 0 ? getenv("SUDO_USER") : NULL,
+        getenv("USER"),
+        getenv("LOGNAME")
+    };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+        if (names[i] != NULL && names[i][0] != '\0')
+            return names[i];
+    return "user";
+}
+
 static int resolve_target_home_impl(const char *home_env,
                                     const char *sudo_uid_env,
                                     const char *passwd_path,
@@ -839,8 +852,8 @@ void print_help(void)
     printf("  sudo ./migr backup /mnt/drive ~/Documents ~/Projects\n");
     printf("  ./migr report --critical --summary\n");
     printf("  ./migr conf\n");
-    printf("  ./migr verify /mnt/drive/migr_backup_20260720_143012\n");
-    printf("  sudo ./migr restore /mnt/drive/migr_backup_20260720_143012\n");
+    printf("  ./migr verify /mnt/drive/migr-eyildizemre\n");
+    printf("  sudo ./migr restore /mnt/drive/migr-eyildizemre\n");
 }
 
 static int confirm_action_with_default(const char *message, int default_yes)

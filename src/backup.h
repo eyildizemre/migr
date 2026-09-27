@@ -16,7 +16,7 @@ struct SelectionPlan;
 /**
  * @brief Backs up files from HOME into a versioned container inside target.
  *
- * Writes to target/migr_backup_YYYYMMDD_HHMMSS[-N].partial/ and publishes it
+ * Writes to target/migr-<user>.partial/ (docs/DECISIONS.md D71) and publishes it
  * with an atomic no-replace rename to the same name without the suffix, so an
  * interrupted backup can never look complete (docs/DECISIONS.md D15). Every
  * captured object lives below the container's data/, addressed by its manifest
@@ -35,7 +35,7 @@ struct SelectionPlan;
  * configuration state) left exactly one unfinished container behind, this
  * resumes into it instead of starting a second one.
  *
- * @param target Destination directory; the dated backup subdirectory is created inside it.
+ * @param target Destination directory; the backup container is created inside it.
  * @param mode   Selects which files are included (BACKUP_CRITICAL, BACKUP_COMPREHENSIVE, or BACKUP_EXPLICIT_PATHS).
  * @param paths  NULL-terminated array of paths (absolute, or relative to the
  *               current working directory); required when mode is

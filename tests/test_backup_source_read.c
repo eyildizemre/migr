@@ -552,7 +552,7 @@ static int run_capture_as(const char *source, const char *destination,
 
 static int count_container_names(const char *path, int partial)
 {
-    const char prefix[] = "migr_backup_";
+    const char prefix[] = "migr-";
     const char suffix[] = ".partial";
     DIR *dir = opendir(path);
     if (dir == NULL)

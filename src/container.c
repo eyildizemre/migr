@@ -14,18 +14,21 @@
 #include "container.h"
 
 /* ========================================================================= */
-/* Naming (docs/DECISIONS.md D15):                                          */
+/* Naming (docs/DECISIONS.md D71):                                          */
 /*                                                                           */
-/*   migr_backup_YYYYMMDD_HHMMSS[-N].partial   (live)                       */
-/*   migr_backup_YYYYMMDD_HHMMSS[-N]           (finalized)                  */
+/*   migr-<owner>                     the first backup of a user            */
+/*   migr-<owner>-YYYY-MM-DD[-N]      when that name belongs to another     */
+/*                                    install; N counts from 2              */
+/* followed by ".partial" while the backup is being created.                */
 /*                                                                           */
-/* N, when present, has no leading zero (the writer below never produces    */
-/* "-0"); the parser mirrors that exactly so a foreign or hand-crafted name  */
-/* can never be misread as one of ours.                                     */
+/* <owner> is the user's name, reduced to characters every destination     */
+/* filesystem accepts. Which backup belongs to whom is decided by the       */
+/* manifest, never by the name.                                             */
 /* ========================================================================= */
 
-#define CONTAINER_PREFIX "migr_backup_"
-#define CONTAINER_STAMP_LEN 15 /* "YYYYMMDD_HHMMSS" */
+#define CONTAINER_PREFIX "migr-"
+#define CONTAINER_OWNER_MAX 32
+#define CONTAINER_DATE_LEN 10 /* "YYYY-MM-DD" */
 #define CONTAINER_PARTIAL_SUFFIX ".partial"
 
 #ifdef CONTAINER_TEST_HOOKS
@@ -55,107 +58,140 @@ static void container_test_after_partial_mkdir(int dir_fd,
 }
 #endif
 
-static int all_digits(const char *s, size_t n)
+static int name_char_valid(unsigned char c)
 {
-    for (size_t i = 0; i < n; i++)
-        if (!isdigit((unsigned char)s[i]))
+    return isalnum(c) || c == '.' || c == '_' || c == '-';
+}
+
+static int ends_with(const char *name, const char *suffix)
+{
+    size_t length = strlen(name), suffix_length = strlen(suffix);
+    return length > suffix_length &&
+           strcmp(name + length - suffix_length, suffix) == 0;
+}
+
+// "migr-<owner>": owner characters outside the portable set become '_'. The
+// dot is kept inside a name but not at its start, where it would hide it.
+static void build_base(const char *owner, char out[CONTAINER_NAME_MAX])
+{
+    size_t length = strlen(CONTAINER_PREFIX);
+    memcpy(out, CONTAINER_PREFIX, length);
+    for (size_t i = 0; owner != NULL && owner[i] != '\0' &&
+                       i < CONTAINER_OWNER_MAX; i++)
+    {
+        unsigned char c = (unsigned char)owner[i];
+        out[length++] = name_char_valid(c) && !(i == 0 && c == '.')
+            ? (char)c : '_';
+    }
+    if (length == strlen(CONTAINER_PREFIX))
+        out[length++] = '_';
+    out[length] = '\0';
+}
+
+// The index-th name for base: base itself, then base-YYYY-MM-DD, then
+// base-YYYY-MM-DD-2, -3, ... with the local date of when.
+static int build_names(const char *base, int index, time_t when,
+                       char final_out[CONTAINER_NAME_MAX],
+                       char partial_out[CONTAINER_NAME_MAX])
+{
+    int n;
+    if (index == 0)
+        n = snprintf(final_out, CONTAINER_NAME_MAX, "%s", base);
+    else
+    {
+        struct tm tmbuf;
+        if (localtime_r(&when, &tmbuf) == NULL)
+            return -1;
+        char date[CONTAINER_DATE_LEN + 1];
+        if (strftime(date, sizeof(date), "%Y-%m-%d", &tmbuf) !=
+            CONTAINER_DATE_LEN)
+            return -1;
+        n = index == 1
+            ? snprintf(final_out, CONTAINER_NAME_MAX, "%s-%s", base, date)
+            : snprintf(final_out, CONTAINER_NAME_MAX, "%s-%s-%d", base, date,
+                       index);
+    }
+    if (n < 0 || n >= CONTAINER_NAME_MAX)
+        return -1;
+    n = snprintf(partial_out, CONTAINER_NAME_MAX, "%s" CONTAINER_PARTIAL_SUFFIX,
+                 final_out);
+    return n < 0 || n >= CONTAINER_NAME_MAX ? -1 : 0;
+}
+
+// Whether stem (a name without its state suffix) is base, base-YYYY-MM-DD,
+// or base-YYYY-MM-DD-N with N >= 2 and no leading zero: exactly what
+// build_names() writes. Sets *index_out to the index that wrote it.
+static int stem_matches_base(const char *stem, size_t stem_length,
+                             const char *base, int *index_out)
+{
+    size_t base_length = strlen(base);
+    if (stem_length < base_length || strncmp(stem, base, base_length) != 0)
+        return 0;
+    const char *rest = stem + base_length;
+    size_t rest_length = stem_length - base_length;
+    if (rest_length == 0)
+    {
+        *index_out = 0;
+        return 1;
+    }
+    if (rest_length < 1 + CONTAINER_DATE_LEN || rest[0] != '-')
+        return 0;
+    const char *date = rest + 1;
+    for (size_t i = 0; i < CONTAINER_DATE_LEN; i++)
+        if ((i == 4 || i == 7) ? date[i] != '-'
+                               : !isdigit((unsigned char)date[i]))
             return 0;
+    const char *number = date + CONTAINER_DATE_LEN;
+    size_t number_length = rest_length - 1 - CONTAINER_DATE_LEN;
+    if (number_length == 0)
+    {
+        *index_out = 1;
+        return 1;
+    }
+    if (number_length < 2 || number[0] != '-' || number[1] < '1' ||
+        number[1] > '9' || number_length > 10)
+        return 0;
+    long value = 0;
+    for (size_t i = 1; i < number_length; i++)
+    {
+        if (!isdigit((unsigned char)number[i]))
+            return 0;
+        value = value * 10 + (number[i] - '0');
+    }
+    if (value < 2 || value >= INT_MAX)
+        return 0;
+    *index_out = (int)value;
     return 1;
 }
 
-// Preserve backup.c's existing local-time naming convention. Tests fix the
-// timezone, not the clock, to make the expected string computable.
-static int format_stamp(time_t when, char *out, size_t out_size)
+// Whether entry is one of base's in-progress names; writes its finished name.
+static int parse_partial_name(const char *entry, const char *base,
+                              char final_out[CONTAINER_NAME_MAX],
+                              int *index_out)
 {
-    struct tm tmbuf;
-    if (localtime_r(&when, &tmbuf) == NULL)
-        return -1;
-    int n = snprintf(out, out_size, CONTAINER_PREFIX "%04d%02d%02d_%02d%02d%02d",
-                      tmbuf.tm_year + 1900, tmbuf.tm_mon + 1, tmbuf.tm_mday,
-                      tmbuf.tm_hour, tmbuf.tm_min, tmbuf.tm_sec);
-    if (n < 0 || (size_t)n >= out_size)
-        return -1;
-    return 0;
+    size_t length = strlen(entry);
+    if (length >= CONTAINER_NAME_MAX ||
+        !ends_with(entry, CONTAINER_PARTIAL_SUFFIX))
+        return 0;
+    size_t stem_length = length - strlen(CONTAINER_PARTIAL_SUFFIX);
+    if (!stem_matches_base(entry, stem_length, base, index_out))
+        return 0;
+    memcpy(final_out, entry, stem_length);
+    final_out[stem_length] = '\0';
+    return 1;
 }
 
-// Builds the final and partial leaf names for a given base+suffix. suffix == 0
-// means "no -N at all" (the first candidate), matching what parse_partial_name
-// accepts back.
-static int build_names(const char *base, int suffix,
-                        char *final_out, size_t final_size,
-                        char *partial_out, size_t partial_size)
+// Whether stem looks like any user's container name, for callers that do not
+// know the owner (restore and verify refusing an unfinished backup).
+static int stem_is_container_name(const char *stem, size_t stem_length)
 {
-    int n = (suffix == 0)
-        ? snprintf(final_out, final_size, "%s", base)
-        : snprintf(final_out, final_size, "%s-%d", base, suffix);
-    if (n < 0 || (size_t)n >= final_size)
-        return -1;
-
-    n = snprintf(partial_out, partial_size, "%s" CONTAINER_PARTIAL_SUFFIX, final_out);
-    if (n < 0 || (size_t)n >= partial_size)
-        return -1;
-
-    return 0;
-}
-
-// Recognizes exactly the grammar container_reserve() can produce and writes
-// the corresponding final (non-".partial") name to final_out, which must be
-// CONTAINER_NAME_MAX bytes (matching every other name buffer in this file).
-// Rejects "-0", "-00", "-01", any other leading zero, a bare "-", and any
-// suffix that would not fit in int -- none of which the writer ever produces.
-static int parse_partial_name(const char *entry, char *final_out, int *suffix_out)
-{
-    static const char suffix_marker[] = CONTAINER_PARTIAL_SUFFIX;
-    const size_t suffix_len = sizeof(suffix_marker) - 1;
-    const size_t prefix_len = sizeof(CONTAINER_PREFIX) - 1;
-
-    size_t len = strlen(entry);
-    if (len >= CONTAINER_NAME_MAX) // would not fit our own fixed-size storage
+    size_t prefix_length = strlen(CONTAINER_PREFIX);
+    if (stem_length <= prefix_length || stem_length >= CONTAINER_NAME_MAX ||
+        strncmp(stem, CONTAINER_PREFIX, prefix_length) != 0)
         return 0;
-    if (len <= suffix_len || strcmp(entry + len - suffix_len, suffix_marker) != 0)
-        return 0;
-
-    size_t base_len = len - suffix_len;
-    if (base_len < prefix_len + CONTAINER_STAMP_LEN)
-        return 0;
-    if (strncmp(entry, CONTAINER_PREFIX, prefix_len) != 0)
-        return 0;
-
-    const char *stamp = entry + prefix_len;
-    if (!all_digits(stamp, 8) || stamp[8] != '_' || !all_digits(stamp + 9, 6))
-        return 0;
-
-    size_t rest_len = base_len - (prefix_len + CONTAINER_STAMP_LEN);
-    const char *rest = entry + prefix_len + CONTAINER_STAMP_LEN;
-
-    int suffix = 0;
-    if (rest_len > 0)
-    {
-        if (rest[0] != '-' || rest_len < 2 || rest[1] < '1' || rest[1] > '9')
+    for (size_t i = prefix_length; i < stem_length; i++)
+        if (!name_char_valid((unsigned char)stem[i]))
             return 0;
-        for (size_t i = 1; i < rest_len; i++)
-            if (!isdigit((unsigned char)rest[i]))
-                return 0;
-
-        char numbuf[CONTAINER_NAME_MAX]; // rest_len < CONTAINER_NAME_MAX (len already bounded above)
-        memcpy(numbuf, rest + 1, rest_len - 1);
-        numbuf[rest_len - 1] = '\0';
-
-        char *end;
-        errno = 0;
-        long v = strtol(numbuf, &end, 10);
-        // container_reserve()'s loop condition is "suffix < INT_MAX" (to
-        // keep suffix++ itself from overflowing), so INT_MAX is never a
-        // suffix the writer can actually produce -- only up to INT_MAX - 1.
-        // The parser must reject exactly what the writer cannot produce.
-        if (errno != 0 || *end != '\0' || v <= 0 || v >= INT_MAX)
-            return 0;
-        suffix = (int)v;
-    }
-
-    memcpy(final_out, entry, base_len);
-    final_out[base_len] = '\0';
-    *suffix_out = suffix;
     return 1;
 }
 
@@ -172,10 +208,10 @@ static int abandon_own_claim(int dir_fd, int partial_fd, const char *partial_nam
     return rc;
 }
 
-ContainerStatus container_reserve_fd(int dest_root_fd, time_t timestamp,
-                                     BackupContainer *out)
+ContainerStatus container_reserve_fd(int dest_root_fd, const char *owner,
+                                     time_t timestamp, BackupContainer *out)
 {
-    if (out == NULL || dest_root_fd < 0)
+    if (out == NULL || dest_root_fd < 0 || owner == NULL)
         return CONTAINER_ERR_INVALID;
 
     int dir_fd = fcntl(dest_root_fd, F_DUPFD_CLOEXEC, 0);
@@ -183,11 +219,7 @@ ContainerStatus container_reserve_fd(int dest_root_fd, time_t timestamp,
         return CONTAINER_ERR_IO;
 
     char base[CONTAINER_NAME_MAX];
-    if (format_stamp(timestamp, base, sizeof(base)) != 0)
-    {
-        close(dir_fd);
-        return CONTAINER_ERR_IO;
-    }
+    build_base(owner, base);
 
     // suffix < INT_MAX (not <=) so suffix++ below never overflows a signed
     // int; this is a bound derived from the type, not a policy ceiling.
@@ -195,8 +227,8 @@ ContainerStatus container_reserve_fd(int dest_root_fd, time_t timestamp,
     {
         char final_name[CONTAINER_NAME_MAX];
         char partial_name[CONTAINER_NAME_MAX];
-        if (build_names(base, suffix, final_name, sizeof(final_name),
-                         partial_name, sizeof(partial_name)) != 0)
+        if (build_names(base, suffix, timestamp, final_name,
+                        partial_name) != 0)
         {
             close(dir_fd);
             return CONTAINER_ERR_IO;
@@ -289,8 +321,8 @@ ContainerStatus container_reserve_fd(int dest_root_fd, time_t timestamp,
     return CONTAINER_ERR_IO;
 }
 
-ContainerStatus container_reserve(const char *dest_root, time_t timestamp,
-                                  BackupContainer *out)
+ContainerStatus container_reserve(const char *dest_root, const char *owner,
+                                  time_t timestamp, BackupContainer *out)
 {
     if (out == NULL)
         return CONTAINER_ERR_INVALID;
@@ -303,16 +335,17 @@ ContainerStatus container_reserve(const char *dest_root, time_t timestamp,
     int dest_root_fd = open(dest_root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (dest_root_fd < 0)
         return CONTAINER_ERR_IO;
-    ContainerStatus status = container_reserve_fd(dest_root_fd, timestamp, out);
+    ContainerStatus status = container_reserve_fd(dest_root_fd, owner,
+                                                  timestamp, out);
     close(dest_root_fd);
     return status;
 }
 
-ContainerStatus container_adopt_fd(int dest_root_fd,
+ContainerStatus container_adopt_fd(int dest_root_fd, const char *owner,
                                    const Manifest *wanted_identity,
                                    BackupContainer *out)
 {
-    if (out == NULL || dest_root_fd < 0)
+    if (out == NULL || dest_root_fd < 0 || owner == NULL)
         return CONTAINER_ERR_INVALID;
     if (wanted_identity == NULL)
         return CONTAINER_ERR_INVALID;
@@ -324,6 +357,8 @@ ContainerStatus container_adopt_fd(int dest_root_fd,
     int root_fd = fcntl(dest_root_fd, F_DUPFD_CLOEXEC, 0);
     if (root_fd < 0)
         return CONTAINER_ERR_IO;
+    char base[CONTAINER_NAME_MAX];
+    build_base(owner, base);
 
     // Scanning needs its own fd (readdir position) without a second open() by
     // path: dup the already-open root_fd instead.
@@ -362,8 +397,9 @@ ContainerStatus container_adopt_fd(int dest_root_fd,
 
         char candidate_final[CONTAINER_NAME_MAX];
         int candidate_suffix;
-        if (!parse_partial_name(entry->d_name, candidate_final, &candidate_suffix))
-            continue; // not our grammar at all (includes "." and "..")
+        if (!parse_partial_name(entry->d_name, base, candidate_final,
+                                &candidate_suffix))
+            continue; // not this owner's grammar (includes "." and "..")
 
         int cand_fd = openat(root_fd, entry->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
         if (cand_fd < 0)
@@ -471,7 +507,7 @@ ContainerStatus container_adopt_fd(int dest_root_fd,
     return CONTAINER_OK;
 }
 
-ContainerStatus container_adopt(const char *dest_root,
+ContainerStatus container_adopt(const char *dest_root, const char *owner,
                                 const Manifest *wanted_identity,
                                 BackupContainer *out)
 {
@@ -486,7 +522,7 @@ ContainerStatus container_adopt(const char *dest_root,
     int dest_root_fd = open(dest_root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (dest_root_fd < 0)
         return CONTAINER_ERR_IO;
-    ContainerStatus status = container_adopt_fd(dest_root_fd,
+    ContainerStatus status = container_adopt_fd(dest_root_fd, owner,
                                                 wanted_identity, out);
     close(dest_root_fd);
     return status;
@@ -565,25 +601,14 @@ const char *container_current_name(const BackupContainer *container)
 
 int container_name_is_partial(const char *name)
 {
-    if (name == NULL)
+    if (name == NULL || !ends_with(name, CONTAINER_PARTIAL_SUFFIX))
         return 0;
-    char final_out[CONTAINER_NAME_MAX];
-    int suffix;
-    return parse_partial_name(name, final_out, &suffix) ? 1 : 0;
+    return stem_is_container_name(name, strlen(name) -
+                                            strlen(CONTAINER_PARTIAL_SUFFIX));
 }
 
 int container_name_is_final(const char *name)
 {
-    if (name == NULL)
-        return 0;
-
-    char partial_name[CONTAINER_NAME_MAX];
-    int n = snprintf(partial_name, sizeof(partial_name), "%s%s",
-                     name, CONTAINER_PARTIAL_SUFFIX);
-    if (n < 0 || (size_t)n >= sizeof(partial_name))
-        return 0;
-
-    char final_out[CONTAINER_NAME_MAX];
-    int suffix;
-    return parse_partial_name(partial_name, final_out, &suffix) ? 1 : 0;
+    return name != NULL && !container_name_is_partial(name) &&
+           stem_is_container_name(name, strlen(name));
 }

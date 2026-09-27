@@ -210,15 +210,14 @@ assert_succeeds_with() {
     fi
 }
 
-# The finalized and in-progress container grammars (docs/DECISIONS.md D15) are
-# matched separately and exactly. A glob that accepts either would let a test
-# treat a leftover ".partial" — the one thing a successful backup must never
-# leave behind — as its result.
+# Finished and in-progress containers (docs/DECISIONS.md D71) are matched
+# separately. A glob that accepts either would let a test treat a leftover
+# ".partial" — the one thing a successful backup must never leave behind — as
+# its result.
 containers_matching() {
     local dir="$1" want="$2" entry leaf
-    local stamp='migr_backup_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9]'
     shopt -s nullglob
-    for entry in "$dir"/migr_backup_*; do
+    for entry in "$dir"/migr-*; do
         [ -d "$entry" ] || continue
         leaf=$(basename "$entry")
         if [ "$want" = partial ]; then
@@ -227,10 +226,7 @@ containers_matching() {
         else
             [[ "$leaf" == *.partial ]] && continue
         fi
-        # shellcheck disable=SC2254
-        case "$leaf" in
-            $stamp|$stamp-[1-9]*) printf '%s\n' "$entry" ;;
-        esac
+        [[ "$leaf" =~ ^migr-[A-Za-z0-9._-]+$ ]] && printf '%s\n' "$entry"
     done
     shopt -u nullglob
 }
@@ -499,7 +495,7 @@ test_dry_run() {
     # override shell behavior of treating an empty query as literal string
     # to prevent false positives when no backup dirs exist yet
     shopt -s nullglob
-    backup_dirs=("$BACKUP_DIR"/migr_backup_*)
+    backup_dirs=("$BACKUP_DIR"/migr-*)
     shopt -u nullglob # reset to default behavior
     if [ "${#backup_dirs[@]}" -gt 0 ]; then
         echo -e "  ${RED}✗${NC} Dry run wrote files to disk!"
@@ -1485,7 +1481,7 @@ EOF
 
     # A .partial-named source is refused before manifest dispatch
     # (docs/DECISIONS.md D15) -- an interrupted backup may be incomplete.
-    local partial_src="$TEST_DIR/migr_backup_20260101_000000.partial"
+    local partial_src="$TEST_DIR/migr-eyildizemre.partial"
     mkdir -p "$partial_src"
     assert_fails_with "in-progress or abandoned" "$MIGR" restore "$partial_src" --dry-run
 
@@ -1700,7 +1696,7 @@ test_probe_refusal() {
     # Same read-only destination under --dry-run: the probe now runs for
     # real (I-6), so it must refuse identically to the live case above.
     assert_fails_with "could not probe" "$MIGR" backup "$ro_dest" --dry-run
-    if compgen -G "$ro_dest/migr_backup_*" > /dev/null; then
+    if compgen -G "$ro_dest/migr-*" > /dev/null; then
         echo -e "  ${RED}✗${NC} dry-run wrote a backup dir into a read-only dest"
         exit 1
     fi
@@ -1748,7 +1744,7 @@ test_native_stale_reconciliation() {
     local sr_race_pid sr_race_status
     (
         for _ in $(seq 1 1000); do
-            if compgen -G "$sr_dest/migr_backup_*.partial" > /dev/null; then
+            if compgen -G "$sr_dest/migr-*.partial" > /dev/null; then
                 chmod 000 "$sr_broken"
                 exit 0
             fi
@@ -1805,7 +1801,7 @@ test_native_stale_reconciliation() {
 
     (
         for _ in $(seq 1 1000); do
-            if compgen -G "$sg_dest/migr_backup_*.partial" > /dev/null; then
+            if compgen -G "$sg_dest/migr-*.partial" > /dev/null; then
                 chmod 000 "$sg_broken"
                 exit 0
             fi
@@ -1832,7 +1828,7 @@ test_native_stale_reconciliation() {
     rm -f "$sg_keep/gone.txt"
     (
         for _ in $(seq 1 1000); do
-            if compgen -G "$sg_dest/migr_backup_*.partial" > /dev/null; then
+            if compgen -G "$sg_dest/migr-*.partial" > /dev/null; then
                 chmod 000 "$sg_broken"
                 exit 0
             fi
@@ -1923,7 +1919,7 @@ test_container_production() {
     link_final=$(containers_matching "$link_real" final)
     link_final_count=$(printf '%s' "$link_final" | grep -c . || true)
     if [ "$link_rc" -eq 0 ] && [ "$link_final_count" -eq 1 ] &&
-       [ "$(cat "$link_real"/migr_backup_*/data/EXPLICIT_0/file.txt)" = "symlink-target" ] &&
+       [ "$(cat "$link_real"/migr-*/data/EXPLICIT_0/file.txt)" = "symlink-target" ] &&
        [[ "$link_out" == *"Backup complete"* ]]; then
         echo -e "  ${GREEN}✓${NC} A destination final symlink is followed for a valid backup."
     else

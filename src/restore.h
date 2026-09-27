@@ -49,7 +49,7 @@ off_t restore_test_progress_speed(off_t total_bytes,
  * payload succeeds. NetworkManager profiles are reloaded best-effort; netplan
  * and systemd-networkd configuration is written with manual apply instructions.
  *
- * @param source Path to the dated backup directory (e.g. /mnt/drive/migr_backup_20260519).
+ * @param source Path to the backup container (e.g. /mnt/drive/migr-eyildizemre).
  * @return MIGR_EXIT_OK on success or user cancellation, MIGR_EXIT_CHANGED
  *         when it completed but other programs changed restored items
  *         afterwards (D67), and MIGR_EXIT_FAILURE on error (D68).

@@ -274,7 +274,7 @@ static void test_v1_directory_and_symlink_atime(void)
 
     char parent[PATH_MAX], source[PATH_MAX], home[PATH_MAX];
     fresh_mkdtemp(parent, sizeof(parent), "restore_atime_v1_parent");
-    join_path(source, sizeof(source), parent, "migr_backup_20260101_000000");
+    join_path(source, sizeof(source), parent, "migr-eyildizemre");
     if (mkdir(source, 0700) != 0)
         die_fixture("could not create versioned source");
     fresh_mkdtemp(home, sizeof(home), "restore_atime_v1_home");

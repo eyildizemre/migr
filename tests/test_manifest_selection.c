@@ -92,13 +92,13 @@ int main(void)
         CHECK(manifest_entry_owned(&m, 1, "../escape") < 0);
     }
     BackupContainer reserved = {0}, adopted = {0};
-    CHECK(container_reserve("partials", 1700000000, &reserved) == CONTAINER_OK);
+    CHECK(container_reserve("partials", "eyildizemre", 1700000000, &reserved) == CONTAINER_OK);
     CHECK(manifest_write_v1_at(reserved.partial_fd, &m) == 0);
     struct stat before, after;
     CHECK(fstat(reserved.partial_fd, &before) == 0);
     container_close(&reserved);
-    CHECK(container_adopt("partials", &changed, &adopted) == CONTAINER_ERR_NO_MATCH);
-    CHECK(container_adopt("partials", &same, &adopted) == CONTAINER_OK);
+    CHECK(container_adopt("partials", "eyildizemre", &changed, &adopted) == CONTAINER_ERR_NO_MATCH);
+    CHECK(container_adopt("partials", "eyildizemre", &same, &adopted) == CONTAINER_OK);
     CHECK(fstat(adopted.partial_fd, &after) == 0 && before.st_ino == after.st_ino);
     container_close(&adopted);
     CHECK(mkdir("home/Extra", 0700) == 0);

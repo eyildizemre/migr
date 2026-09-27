@@ -1519,7 +1519,7 @@ static int find_container_dir(const char *target, char *out, size_t out_size)
     while ((e = readdir(d)) != NULL)
     {
         size_t len = strlen(e->d_name);
-        if (strncmp(e->d_name, "migr_backup_", 12) != 0)
+        if (strncmp(e->d_name, "migr-", 5) != 0)
             continue;
         if (len >= 8 && strcmp(e->d_name + len - 8, ".partial") == 0)
             continue;
@@ -1544,7 +1544,7 @@ static int find_partial_container_dir(const char *target, char *out,
     while ((e = readdir(d)) != NULL)
     {
         size_t len = strlen(e->d_name);
-        if (strncmp(e->d_name, "migr_backup_", 12) != 0 ||
+        if (strncmp(e->d_name, "migr-", 5) != 0 ||
             len < 8 || strcmp(e->d_name + len - 8, ".partial") != 0)
             continue;
 
@@ -3174,7 +3174,7 @@ static void count_containers(const char *target, int *published, int *partial)
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL)
     {
-        if (strncmp(entry->d_name, "migr_backup_", 12) != 0)
+        if (strncmp(entry->d_name, "migr-", 5) != 0)
             continue;
         size_t length = strlen(entry->d_name);
         if (length > 8 && strcmp(entry->d_name + length - 8, ".partial") == 0)

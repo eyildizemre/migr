@@ -53,11 +53,10 @@ typedef enum {
 } ContainerState;
 
 /**
- * @brief "migr_backup_YYYYMMDD_HHMMSS[-N]", plus the longer of ".partial" or
- * nothing, plus a NUL. Sized generously above the ~47-byte worst case (an N up
- * to INT_MAX) rather than to a specific expected count -- see container_reserve().
+ * @brief "migr-<owner>-YYYY-MM-DD-N" with an owner of up to 32 characters,
+ * plus ".partial", plus a NUL: 68 bytes at most, rounded up (D71).
  */
-#define CONTAINER_NAME_MAX 64
+#define CONTAINER_NAME_MAX 96
 
 /**
  * @brief A caller-owned handle on one backup container.
@@ -80,7 +79,8 @@ typedef struct BackupContainer {
                                               valid whenever state != CONTAINER_STATE_EMPTY. */
     char partial_name[CONTAINER_NAME_MAX]; /**< leaf name while reserved/adopted. */
     char final_name[CONTAINER_NAME_MAX];   /**< leaf name once finalized. */
-    int  suffix;                        /**< the "-N" used, 0 if none; diagnostic only. */
+    int  suffix;                        /**< which name was used: 0 plain, 1 dated,
+                                              N >= 2 the "-N" after the date. */
 } BackupContainer;
 
 /**
@@ -93,14 +93,15 @@ typedef struct BackupContainer {
  * semantics are identical to container_reserve().
  *
  * @param dest_root_fd Open directory fd for the destination root.
+ * @param owner The user the backup belongs to; see container_reserve().
  * @param timestamp Naming clock, interpreted in local time.
  * @param out Caller-provided handle. The fd entry point does not initialize
  *             it before use; callers should pass a zeroed handle, while the
  *             path wrapper retains the historical initialization contract.
  * @return CONTAINER_OK, CONTAINER_ERR_IO, or CONTAINER_ERR_INVALID.
  */
-ContainerStatus container_reserve_fd(int dest_root_fd, time_t timestamp,
-                                      BackupContainer *out);
+ContainerStatus container_reserve_fd(int dest_root_fd, const char *owner,
+                                     time_t timestamp, BackupContainer *out);
 
 /**
  * @brief Adopts a matching partial under an already-open destination root.
@@ -111,25 +112,27 @@ ContainerStatus container_reserve_fd(int dest_root_fd, time_t timestamp,
  * container_adopt().
  *
  * @param dest_root_fd Open directory fd for the destination root.
+ * @param owner The user whose names are scanned; see container_reserve().
  * @param wanted_identity Identity that the candidate manifest must match.
  * @param out Caller-provided handle; the path wrapper retains the historical
  *             zeroing contract.
  * @return CONTAINER_OK, CONTAINER_ERR_NO_MATCH, CONTAINER_ERR_AMBIGUOUS,
  *         CONTAINER_ERR_IO, or CONTAINER_ERR_INVALID.
  */
-ContainerStatus container_adopt_fd(int dest_root_fd,
+ContainerStatus container_adopt_fd(int dest_root_fd, const char *owner,
                                    const Manifest *wanted_identity,
                                    BackupContainer *out);
 
 /**
  * @brief Claims a fresh, uniquely-named ".partial" container under dest_root.
  *
- * The base name is derived from timestamp via localtime_r() (production's own
- * clock, passed in rather than read internally so tests can supply a fixed
- * value -- there is deliberately no CLI/environment clock override). Candidate
+ * Names are tried in order (docs/DECISIONS.md D71): "migr-<owner>", then
+ * "migr-<owner>-YYYY-MM-DD" with timestamp's local date, then that name with
+ * "-2", "-3", ... (no bound but int's range). owner characters outside
+ * [A-Za-z0-9._-] become '_' and it is cut to 32 characters. Candidate
  * allocation considers both the partial and final forms of each name and
- * atomically claims the first free one; collisions advance to "-1", "-2", ...
- * with no artificial upper bound on N (only int's own range).
+ * atomically claims the first free one. timestamp is passed in rather than
+ * read here so tests can supply a fixed value.
  *
  * dest_root is opened exactly once; every subsequent check uses that same
  * directory fd (fstatat/mkdirat/openat), so a path-level swap of dest_root
@@ -140,21 +143,23 @@ ContainerStatus container_adopt_fd(int dest_root_fd,
  * returns CONTAINER_OK and before container_finalize().
  *
  * @param dest_root Destination directory the container is created under.
+ * @param owner     The user the backup belongs to, for its name.
  * @param timestamp Naming clock, interpreted in local time.
  * @param out       Zeroed and populated on any return; CONTAINER_OK leaves it
  *                  holding an owned handle the caller must eventually pass to
  *                  container_finalize() and/or container_close().
  * @return CONTAINER_OK, CONTAINER_ERR_IO, or CONTAINER_ERR_INVALID (NULL out,
- *         or NULL dest_root).
+ *         dest_root, or owner).
  */
-ContainerStatus container_reserve(const char *dest_root, time_t timestamp, BackupContainer *out);
+ContainerStatus container_reserve(const char *dest_root, const char *owner,
+                                  time_t timestamp, BackupContainer *out);
 
 /**
  * @brief Resumes the one existing ".partial" under dest_root whose manifest
  * proves it is the same job as wanted_identity.
  *
- * Scans dest_root's entries, considering only names matching the exact
- * grammar container_reserve() can produce (docs/DECISIONS.md D15). Each
+ * Scans dest_root's entries, considering only the ".partial" names
+ * container_reserve() can produce for owner (docs/DECISIONS.md D71). Each
  * candidate is opened by directory fd (never re-resolved by path) and
  * flock(LOCK_EX | LOCK_NB)'d before its manifest is read: a candidate another
  * live process already holds is skipped as "in use", not treated as an error.
@@ -178,6 +183,7 @@ ContainerStatus container_reserve(const char *dest_root, time_t timestamp, Backu
  * reopened by name.
  *
  * @param dest_root      Destination directory to scan.
+ * @param owner          The user whose names are scanned.
  * @param wanted_identity The identity (docs/DECISIONS.md D15) an existing
  *                        container's manifest must match to be resumed.
  * @param out            Zeroed and populated on any return; CONTAINER_OK
@@ -186,7 +192,9 @@ ContainerStatus container_reserve(const char *dest_root, time_t timestamp, Backu
  *         CONTAINER_ERR_IO, or CONTAINER_ERR_INVALID (NULL out, dest_root, or
  *         wanted_identity).
  */
-ContainerStatus container_adopt(const char *dest_root, const Manifest *wanted_identity, BackupContainer *out);
+ContainerStatus container_adopt(const char *dest_root, const char *owner,
+                                const Manifest *wanted_identity,
+                                BackupContainer *out);
 
 /**
  * @brief Atomically publishes a reserved/adopted container under its final name.
@@ -231,7 +239,7 @@ int container_root_fd(const BackupContainer *container);
  * adopted, the published name once finalized.
  *
  * Lets a caller report where a container actually is without reaching into the
- * handle or reconstructing the name from the D15 grammar itself.
+ * handle or reconstructing the name from the D71 grammar itself.
  *
  * @return A pointer into the handle (valid until it is closed or reused), or
  *         NULL for NULL or a handle in CONTAINER_STATE_EMPTY.
@@ -239,14 +247,10 @@ int container_root_fd(const BackupContainer *container);
 const char *container_current_name(const BackupContainer *container);
 
 /**
- * @brief Whether name matches the exact ".partial" leaf grammar
- * container_reserve() can produce (docs/DECISIONS.md D15) -- i.e. whether it
- * names an in-progress or abandoned container, not a finalized one.
- *
- * Shares parse_partial_name()'s grammar so the naming rule stays defined in
- * one place: a name that merely happens to end in ".partial" without matching
- * the "migr_backup_YYYYMMDD_HHMMSS[-N].partial" shape is not considered ours
- * and is reported as not partial.
+ * @brief Whether name is any user's in-progress container name ("migr-"
+ * followed by name characters, then ".partial"; docs/DECISIONS.md D71) --
+ * i.e. an in-progress or abandoned container, not a finalized one. The
+ * owner is not known here, so the check is by shape only.
  *
  * @param name A single path component (a leaf name, not a full path).
  * @return Non-zero if name matches the partial-container grammar, 0 otherwise
@@ -255,11 +259,8 @@ const char *container_current_name(const BackupContainer *container);
 int container_name_is_partial(const char *name);
 
 /**
- * @brief Whether name matches the exact finalized-container leaf grammar
- * container_finalize() can publish.
- *
- * This is the same grammar as container_name_is_partial(), without the
- * ".partial" suffix.
+ * @brief Whether name is any user's finished container name: the shape
+ * container_name_is_partial() accepts, without its suffix.
  *
  * @param name A single path component (a leaf name, not a full path).
  * @return Non-zero if name matches the finalized-container grammar, 0

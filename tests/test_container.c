@@ -112,16 +112,23 @@ static void write_raw(const char *path, const char *content)
     fclose(f);
 }
 
-// The exact "migr_backup_YYYYMMDD_HHMMSS" string container_reserve() must
-// produce for FIXED_TIME, under the forced UTC timezone (localtime_r ==
-// gmtime_r there).
+// The user every reservation below is named after.
+#define OWNER "eyildizemre"
+
+// The first name container_reserve() tries for OWNER.
 static void compute_expected_base(char *out, size_t out_size)
+{
+    snprintf(out, out_size, "migr-" OWNER);
+}
+
+// The second name: dated with FIXED_TIME's local date, under the forced UTC
+// timezone (localtime_r == gmtime_r there).
+static void compute_expected_dated(char *out, size_t out_size)
 {
     struct tm tmbuf;
     gmtime_r(&FIXED_TIME, &tmbuf);
-    snprintf(out, out_size, "migr_backup_%04d%02d%02d_%02d%02d%02d",
-              tmbuf.tm_year + 1900, tmbuf.tm_mon + 1, tmbuf.tm_mday,
-              tmbuf.tm_hour, tmbuf.tm_min, tmbuf.tm_sec);
+    snprintf(out, out_size, "migr-" OWNER "-%04d-%02d-%02d",
+             tmbuf.tm_year + 1900, tmbuf.tm_mon + 1, tmbuf.tm_mday);
 }
 
 static void make_reference_manifest(Manifest *m)
@@ -144,7 +151,7 @@ static void make_reference_manifest(Manifest *m)
 
 static void test_reserve_generates_expected_stamp(void)
 {
-    printf(BLUE "::" NC " container: reserve names by local time (forced to UTC for this test)\n");
+    printf(BLUE "::" NC " container: the first reservation is named after its owner\n");
     fresh_test_root();
 
     char expected_final[CONTAINER_NAME_MAX];
@@ -153,8 +160,8 @@ static void test_reserve_generates_expected_stamp(void)
     snprintf(expected_partial, sizeof(expected_partial), "%s.partial", expected_final);
 
     BackupContainer c;
-    check(container_reserve(test_root, FIXED_TIME, &c) == CONTAINER_OK, "reserve succeeds");
-    check(strcmp(c.final_name, expected_final) == 0, "final_name matches the expected local-time stamp");
+    check(container_reserve(test_root, OWNER, FIXED_TIME, &c) == CONTAINER_OK, "reserve succeeds");
+    check(strcmp(c.final_name, expected_final) == 0, "final_name is migr-<owner>");
     check(strcmp(c.partial_name, expected_partial) == 0, "partial_name is final_name + \".partial\"");
     check(c.suffix == 0, "first reservation has no suffix");
 
@@ -164,21 +171,54 @@ static void test_reserve_generates_expected_stamp(void)
 
 static void test_reserve_partial_collision_advances_suffix(void)
 {
-    printf(BLUE "::" NC " container: a partial-name collision advances to the next suffix\n");
+    printf(BLUE "::" NC " container: taken names advance to the dated name, then to -2\n");
     fresh_test_root();
 
-    BackupContainer first;
-    check(container_reserve(test_root, FIXED_TIME, &first) == CONTAINER_OK, "fixture: first reservation");
-    check(first.suffix == 0, "fixture: first reservation has suffix 0");
+    char expected_dated[CONTAINER_NAME_MAX], expected_second[CONTAINER_NAME_MAX + 4];
+    compute_expected_dated(expected_dated, sizeof(expected_dated));
+    snprintf(expected_second, sizeof(expected_second), "%s-2", expected_dated);
 
-    BackupContainer second;
-    check(container_reserve(test_root, FIXED_TIME, &second) == CONTAINER_OK,
-          "second same-second reservation still succeeds");
-    check(second.suffix == 1, "second reservation advances to suffix 1");
-    check(strcmp(first.partial_name, second.partial_name) != 0, "the two partials have distinct names");
+    BackupContainer first, second, third;
+    check(container_reserve(test_root, OWNER, FIXED_TIME, &first) == CONTAINER_OK, "fixture: first reservation");
+    check(first.suffix == 0, "fixture: first reservation has suffix 0");
+    check(container_reserve(test_root, OWNER, FIXED_TIME, &second) == CONTAINER_OK &&
+              second.suffix == 1 && strcmp(second.final_name, expected_dated) == 0,
+          "the second is named after the local date");
+    check(container_reserve(test_root, OWNER, FIXED_TIME, &third) == CONTAINER_OK &&
+              third.suffix == 2 && strcmp(third.final_name, expected_second) == 0,
+          "the third on the same day gets -2");
 
     container_close(&first);
     container_close(&second);
+    container_close(&third);
+    fresh_test_root();
+}
+
+static void test_reserve_sanitizes_the_owner(void)
+{
+    printf(BLUE "::" NC " container: owner characters some filesystems reject become '_'\n");
+    static const struct {
+        const char *owner;
+        const char *expected;
+    } cases[] = {
+        { "john.doe-2_x", "migr-john.doe-2_x" },
+        { "a:b/c d", "migr-a_b_c_d" },
+        { ".hidden", "migr-_hidden" },
+        { "", "migr-_" },
+        { "abcdefghijabcdefghijabcdefghijabcdefghij",
+          "migr-abcdefghijabcdefghijabcdefghijab" },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+    {
+        fresh_test_root();
+        BackupContainer c;
+        check(container_reserve(test_root, cases[i].owner, FIXED_TIME, &c) ==
+                      CONTAINER_OK &&
+                  strcmp(c.final_name, cases[i].expected) == 0 &&
+                  container_name_is_final(c.final_name),
+              cases[i].expected);
+        container_close(&c);
+    }
     fresh_test_root();
 }
 
@@ -204,7 +244,7 @@ static void test_reserve_fd_is_anchored(void)
           "fixture: replace the destination path with a different directory");
 
     BackupContainer reserved = {0};
-    ContainerStatus status = container_reserve_fd(root_fd, FIXED_TIME, &reserved);
+    ContainerStatus status = container_reserve_fd(root_fd, OWNER, FIXED_TIME, &reserved);
     check(status == CONTAINER_OK,
           "reserve_fd succeeds against the originally opened destination");
     check(fstat(root_fd, &(struct stat){0}) == 0,
@@ -250,7 +290,7 @@ static void test_reserve_final_collision_advances_suffix(void)
     check(mkdir(preexisting_path, 0700) == 0, "fixture: pre-create the final name for suffix 0");
 
     BackupContainer c;
-    check(container_reserve(test_root, FIXED_TIME, &c) == CONTAINER_OK,
+    check(container_reserve(test_root, OWNER, FIXED_TIME, &c) == CONTAINER_OK,
           "reserve succeeds by skipping the taken suffix");
     check(c.suffix == 1, "suffix 0's final was taken, so suffix 1 was claimed instead");
 
@@ -305,7 +345,7 @@ static void test_concurrent_reserve_claims_distinct_partials(void)
             close(go_pipe[0]);
 
             BackupContainer c;
-            ContainerStatus st = container_reserve(test_root, FIXED_TIME, &c);
+            ContainerStatus st = container_reserve(test_root, OWNER, FIXED_TIME, &c);
             int reply = (st == CONTAINER_OK) ? c.suffix : -1;
             if (write(result_pipe[1], &reply, sizeof(reply)) != (ssize_t)sizeof(reply))
                 _exit(2);
@@ -397,7 +437,7 @@ static void test_reserve_flock_race_advances_suffix(void)
     container_test_set_reserve_hook(reserve_race_hook, NULL);
 
     BackupContainer c;
-    ContainerStatus status = container_reserve(test_root, FIXED_TIME, &c);
+    ContainerStatus status = container_reserve(test_root, OWNER, FIXED_TIME, &c);
 
     container_test_set_reserve_hook(NULL, NULL);
 
@@ -432,7 +472,7 @@ static void test_finalize_success(void)
     fresh_test_root();
 
     BackupContainer c;
-    check(container_reserve(test_root, FIXED_TIME, &c) == CONTAINER_OK, "fixture: reserve");
+    check(container_reserve(test_root, OWNER, FIXED_TIME, &c) == CONTAINER_OK, "fixture: reserve");
 
     char partial_path[PATH_MAX], final_path[PATH_MAX];
     path_under_root(partial_path, sizeof(partial_path), c.partial_name);
@@ -474,7 +514,7 @@ static void test_finalize_sync_failure_leaves_partial(void)
     fresh_test_root();
 
     BackupContainer c;
-    ContainerStatus reserve_status = container_reserve(test_root, FIXED_TIME, &c);
+    ContainerStatus reserve_status = container_reserve(test_root, OWNER, FIXED_TIME, &c);
     check(reserve_status == CONTAINER_OK, "fixture: reserve");
     if (reserve_status != CONTAINER_OK)
     {
@@ -514,7 +554,7 @@ static void test_finalize_refuses_existing_final(void)
     fresh_test_root();
 
     BackupContainer c;
-    check(container_reserve(test_root, FIXED_TIME, &c) == CONTAINER_OK, "fixture: reserve");
+    check(container_reserve(test_root, OWNER, FIXED_TIME, &c) == CONTAINER_OK, "fixture: reserve");
 
     char final_path[PATH_MAX];
     path_under_root(final_path, sizeof(final_path), c.final_name);
@@ -544,7 +584,7 @@ static void test_finalize_rejects_invalid_handle(void)
 
     fresh_test_root();
     BackupContainer c;
-    check(container_reserve(test_root, FIXED_TIME, &c) == CONTAINER_OK, "fixture: reserve");
+    check(container_reserve(test_root, OWNER, FIXED_TIME, &c) == CONTAINER_OK, "fixture: reserve");
     check(container_finalize(&c) == CONTAINER_OK, "fixture: finalize once");
     check(container_finalize(&c) == CONTAINER_ERR_INVALID,
           "finalizing an already-finalized handle is refused");
@@ -559,7 +599,7 @@ static void test_close_does_not_delete(void)
     fresh_test_root();
 
     BackupContainer c;
-    check(container_reserve(test_root, FIXED_TIME, &c) == CONTAINER_OK, "fixture: reserve");
+    check(container_reserve(test_root, OWNER, FIXED_TIME, &c) == CONTAINER_OK, "fixture: reserve");
     char partial_path[PATH_MAX];
     path_under_root(partial_path, sizeof(partial_path), c.partial_name);
 
@@ -608,23 +648,27 @@ static void test_null_arguments_are_rejected_safely(void)
     printf(BLUE "::" NC " container: NULL/missing arguments are rejected without crashing\n");
 
     BackupContainer c;
-    check(container_reserve(test_root, FIXED_TIME, NULL) == CONTAINER_ERR_INVALID,
+    check(container_reserve(test_root, OWNER, FIXED_TIME, NULL) == CONTAINER_ERR_INVALID,
           "reserve with a NULL out is rejected");
-    check(container_reserve(NULL, FIXED_TIME, &c) == CONTAINER_ERR_INVALID,
+    check(container_reserve(NULL, OWNER, FIXED_TIME, &c) == CONTAINER_ERR_INVALID,
           "reserve with a NULL dest_root is rejected");
-    check(container_reserve_fd(-1, FIXED_TIME, &c) == CONTAINER_ERR_INVALID,
+    check(container_reserve_fd(-1, OWNER, FIXED_TIME, &c) == CONTAINER_ERR_INVALID,
           "reserve_fd with an invalid dest_root_fd is rejected");
+    check(container_reserve(test_root, NULL, FIXED_TIME, &c) == CONTAINER_ERR_INVALID,
+          "reserve with a NULL owner is rejected");
 
     Manifest wanted;
     make_reference_manifest(&wanted);
-    check(container_adopt(test_root, &wanted, NULL) == CONTAINER_ERR_INVALID,
+    check(container_adopt(test_root, OWNER, &wanted, NULL) == CONTAINER_ERR_INVALID,
           "adopt with a NULL out is rejected");
-    check(container_adopt(NULL, &wanted, &c) == CONTAINER_ERR_INVALID,
+    check(container_adopt(NULL, OWNER, &wanted, &c) == CONTAINER_ERR_INVALID,
           "adopt with a NULL dest_root is rejected");
-    check(container_adopt(test_root, NULL, &c) == CONTAINER_ERR_INVALID,
+    check(container_adopt(test_root, OWNER, NULL, &c) == CONTAINER_ERR_INVALID,
           "adopt with a NULL wanted_identity is rejected");
-    check(container_adopt_fd(-1, &wanted, &c) == CONTAINER_ERR_INVALID,
+    check(container_adopt_fd(-1, OWNER, &wanted, &c) == CONTAINER_ERR_INVALID,
           "adopt_fd with an invalid dest_root_fd is rejected");
+    check(container_adopt(test_root, NULL, &wanted, &c) == CONTAINER_ERR_INVALID,
+          "adopt with a NULL owner is rejected");
 
     check(container_finalize(NULL) == CONTAINER_ERR_INVALID, "finalize(NULL) is rejected");
 
@@ -646,7 +690,7 @@ static void test_adopt_rejects_wanted_without_identity(void)
     wanted.has_source_identity = 0;
 
     BackupContainer adopted;
-    check(container_adopt(test_root, &wanted, &adopted) == CONTAINER_ERR_NO_MATCH,
+    check(container_adopt(test_root, OWNER, &wanted, &adopted) == CONTAINER_ERR_NO_MATCH,
           "an invocation without a source identity can never adopt anything");
     container_close(&adopted);
 }
@@ -657,7 +701,7 @@ static void test_adopt_matches_and_retains_inode(void)
     fresh_test_root();
 
     BackupContainer reserved;
-    check(container_reserve(test_root, FIXED_TIME, &reserved) == CONTAINER_OK, "fixture: reserve");
+    check(container_reserve(test_root, OWNER, FIXED_TIME, &reserved) == CONTAINER_OK, "fixture: reserve");
 
     char reserved_name_copy[CONTAINER_NAME_MAX];
     snprintf(reserved_name_copy, sizeof(reserved_name_copy), "%s", reserved.partial_name);
@@ -676,7 +720,7 @@ static void test_adopt_matches_and_retains_inode(void)
     Manifest wanted;
     make_reference_manifest(&wanted);
     BackupContainer adopted;
-    ContainerStatus st = container_adopt(test_root, &wanted, &adopted);
+    ContainerStatus st = container_adopt(test_root, OWNER, &wanted, &adopted);
     check(st == CONTAINER_OK, "a partial with a matching manifest is adopted");
 
     if (st == CONTAINER_OK)
@@ -708,7 +752,7 @@ static void test_adopt_fd_is_anchored(void)
     make_reference_manifest(&manifest);
 
     BackupContainer reserved;
-    check(container_reserve(test_root, FIXED_TIME, &reserved) == CONTAINER_OK,
+    check(container_reserve(test_root, OWNER, FIXED_TIME, &reserved) == CONTAINER_OK,
           "fixture: reserve a partial for fd adoption");
     char partial_name[CONTAINER_NAME_MAX] = {0};
     snprintf(partial_name, sizeof(partial_name), "%s", reserved.partial_name);
@@ -739,7 +783,7 @@ static void test_adopt_fd_is_anchored(void)
           "fixture: replace the destination path with a different directory");
 
     BackupContainer adopted = {0};
-    ContainerStatus status = container_adopt_fd(root_fd, &manifest, &adopted);
+    ContainerStatus status = container_adopt_fd(root_fd, OWNER, &manifest, &adopted);
     check(status == CONTAINER_OK,
           "adopt_fd finds the matching partial under the opened destination");
     check(fstat(root_fd, &(struct stat){0}) == 0,
@@ -784,7 +828,7 @@ static void test_adopt_fd_failure_keeps_borrowed_fd(void)
     make_reference_manifest(&manifest);
 
     BackupContainer first;
-    check(container_reserve(test_root, FIXED_TIME, &first) == CONTAINER_OK,
+    check(container_reserve(test_root, OWNER, FIXED_TIME, &first) == CONTAINER_OK,
           "fixture: reserve the first matching partial");
     char first_path[PATH_MAX];
     path_under_root(first_path, sizeof(first_path), first.partial_name);
@@ -793,7 +837,7 @@ static void test_adopt_fd_failure_keeps_borrowed_fd(void)
     container_close(&first);
 
     BackupContainer second;
-    check(container_reserve(test_root, FIXED_TIME, &second) == CONTAINER_OK,
+    check(container_reserve(test_root, OWNER, FIXED_TIME, &second) == CONTAINER_OK,
           "fixture: reserve the second matching partial");
     char second_path[PATH_MAX];
     path_under_root(second_path, sizeof(second_path), second.partial_name);
@@ -806,7 +850,7 @@ static void test_adopt_fd_failure_keeps_borrowed_fd(void)
     if (root_fd >= 0)
     {
         BackupContainer adopted = {0};
-        check(container_adopt_fd(root_fd, &manifest, &adopted) == CONTAINER_ERR_AMBIGUOUS,
+        check(container_adopt_fd(root_fd, OWNER, &manifest, &adopted) == CONTAINER_ERR_AMBIGUOUS,
               "adopt_fd refuses two matching partials without guessing");
         check(fstat(root_fd, &(struct stat){0}) == 0,
               "adopt_fd leaves the borrowed destination fd open after failure");
@@ -823,7 +867,7 @@ static void test_adopt_skips_locked_partial(void)
     fresh_test_root();
 
     BackupContainer holder;
-    check(container_reserve(test_root, FIXED_TIME, &holder) == CONTAINER_OK, "fixture: reserve");
+    check(container_reserve(test_root, OWNER, FIXED_TIME, &holder) == CONTAINER_OK, "fixture: reserve");
 
     Manifest m;
     make_reference_manifest(&m);
@@ -836,7 +880,7 @@ static void test_adopt_skips_locked_partial(void)
     Manifest wanted;
     make_reference_manifest(&wanted);
     BackupContainer adopted;
-    check(container_adopt(test_root, &wanted, &adopted) == CONTAINER_ERR_NO_MATCH,
+    check(container_adopt(test_root, OWNER, &wanted, &adopted) == CONTAINER_ERR_NO_MATCH,
           "the only matching partial is locked, so nothing is adopted");
 
     container_close(&adopted);
@@ -853,14 +897,14 @@ static void test_adopt_ambiguous_on_multiple_matches(void)
     make_reference_manifest(&m);
 
     BackupContainer first;
-    check(container_reserve(test_root, FIXED_TIME, &first) == CONTAINER_OK, "fixture: reserve first");
+    check(container_reserve(test_root, OWNER, FIXED_TIME, &first) == CONTAINER_OK, "fixture: reserve first");
     char first_dir[PATH_MAX];
     path_under_root(first_dir, sizeof(first_dir), first.partial_name);
     check(manifest_write_v1(first_dir, &m) == 0, "fixture: write manifest into first");
     container_close(&first);
 
     BackupContainer second;
-    check(container_reserve(test_root, FIXED_TIME, &second) == CONTAINER_OK, "fixture: reserve second");
+    check(container_reserve(test_root, OWNER, FIXED_TIME, &second) == CONTAINER_OK, "fixture: reserve second");
     check(second.suffix != 0, "fixture: second reservation collided to a distinct suffix");
     char second_dir[PATH_MAX];
     path_under_root(second_dir, sizeof(second_dir), second.partial_name);
@@ -870,7 +914,7 @@ static void test_adopt_ambiguous_on_multiple_matches(void)
     Manifest wanted;
     make_reference_manifest(&wanted);
     BackupContainer adopted;
-    check(container_adopt(test_root, &wanted, &adopted) == CONTAINER_ERR_AMBIGUOUS,
+    check(container_adopt(test_root, OWNER, &wanted, &adopted) == CONTAINER_ERR_AMBIGUOUS,
           "two unlocked exact matches are refused as ambiguous, not guessed at");
     container_close(&adopted);
     fresh_test_root();
@@ -907,7 +951,7 @@ static void test_adopt_rejects_identity_mismatches(void)
         fresh_test_root();
 
         BackupContainer c;
-        check(container_reserve(test_root, FIXED_TIME, &c) == CONTAINER_OK, "fixture: reserve a container");
+        check(container_reserve(test_root, OWNER, FIXED_TIME, &c) == CONTAINER_OK, "fixture: reserve a container");
 
         Manifest variant;
         make_reference_manifest(&variant);
@@ -921,7 +965,7 @@ static void test_adopt_rejects_identity_mismatches(void)
         Manifest wanted;
         make_reference_manifest(&wanted);
         BackupContainer adopted;
-        check(container_adopt(test_root, &wanted, &adopted) == CONTAINER_ERR_NO_MATCH,
+        check(container_adopt(test_root, OWNER, &wanted, &adopted) == CONTAINER_ERR_NO_MATCH,
               mismatch_cases[i].label);
         container_close(&adopted);
     }
@@ -1019,7 +1063,7 @@ static void test_adopt_rejects_root_table_mismatch(void)
         candidate.roots = &candidate_root;
 
         BackupContainer c;
-        check(container_reserve(test_root, FIXED_TIME, &c) == CONTAINER_OK, "fixture: reserve");
+        check(container_reserve(test_root, OWNER, FIXED_TIME, &c) == CONTAINER_OK, "fixture: reserve");
         char dir_path[PATH_MAX];
         path_under_root(dir_path, sizeof(dir_path), c.partial_name);
         check(manifest_write_v1(dir_path, &candidate) == 0, "fixture: write the candidate's root table");
@@ -1031,7 +1075,7 @@ static void test_adopt_rejects_root_table_mismatch(void)
         wanted.roots = &wanted_root;
 
         BackupContainer adopted;
-        check(container_adopt(test_root, &wanted, &adopted) == CONTAINER_ERR_NO_MATCH,
+        check(container_adopt(test_root, OWNER, &wanted, &adopted) == CONTAINER_ERR_NO_MATCH,
               root_mismatch_cases[i].label);
         container_close(&adopted);
     }
@@ -1061,7 +1105,7 @@ static void test_adopt_rejects_non_valid_manifests(void)
         fresh_test_root();
 
         BackupContainer c;
-        check(container_reserve(test_root, FIXED_TIME, &c) == CONTAINER_OK, "fixture: reserve a container");
+        check(container_reserve(test_root, OWNER, FIXED_TIME, &c) == CONTAINER_OK, "fixture: reserve a container");
 
         if (raw_manifest_cases[i].content != NULL)
         {
@@ -1074,7 +1118,7 @@ static void test_adopt_rejects_non_valid_manifests(void)
         Manifest wanted;
         make_reference_manifest(&wanted);
         BackupContainer adopted;
-        check(container_adopt(test_root, &wanted, &adopted) == CONTAINER_ERR_NO_MATCH,
+        check(container_adopt(test_root, OWNER, &wanted, &adopted) == CONTAINER_ERR_NO_MATCH,
               raw_manifest_cases[i].label);
         container_close(&adopted);
     }
@@ -1091,21 +1135,21 @@ static void test_adopt_fails_closed_on_scan_error(void)
     make_reference_manifest(&m);
 
     BackupContainer good;
-    check(container_reserve(test_root, FIXED_TIME, &good) == CONTAINER_OK,
+    check(container_reserve(test_root, OWNER, FIXED_TIME, &good) == CONTAINER_OK,
           "fixture: reserve a genuinely matching container");
     char good_dir[PATH_MAX];
     path_under_root(good_dir, sizeof(good_dir), good.partial_name);
     check(manifest_write_v1(good_dir, &m) == 0, "fixture: write its matching manifest");
 
-    char good_final_copy[CONTAINER_NAME_MAX];
-    snprintf(good_final_copy, sizeof(good_final_copy), "%s", good.final_name);
     container_close(&good);
 
-    // A second, distinct-suffix name that matches the naming grammar but is a
-    // *file*, not a directory: openat(..., O_DIRECTORY) on it fails ENOTDIR --
-    // a real, portable, root-independent operational error during the scan.
-    char bogus_name[CONTAINER_NAME_MAX + 16]; // + "-1.partial", generously
-    snprintf(bogus_name, sizeof(bogus_name), "%s-1.partial", good_final_copy);
+    // A second, dated name that matches the naming grammar but is a *file*,
+    // not a directory: openat(..., O_DIRECTORY) on it fails ENOTDIR -- a
+    // real, portable, root-independent operational error during the scan.
+    char dated[CONTAINER_NAME_MAX];
+    compute_expected_dated(dated, sizeof(dated));
+    char bogus_name[CONTAINER_NAME_MAX + 16]; // + ".partial", generously
+    snprintf(bogus_name, sizeof(bogus_name), "%s.partial", dated);
     char bogus_path[PATH_MAX];
     path_under_root(bogus_path, sizeof(bogus_path), bogus_name);
     int fd = creat(bogus_path, 0600);
@@ -1116,7 +1160,7 @@ static void test_adopt_fails_closed_on_scan_error(void)
     Manifest wanted;
     make_reference_manifest(&wanted);
     BackupContainer adopted;
-    check(container_adopt(test_root, &wanted, &adopted) == CONTAINER_ERR_IO,
+    check(container_adopt(test_root, OWNER, &wanted, &adopted) == CONTAINER_ERR_IO,
           "the unreadable bogus candidate fails the scan closed, not just skips itself");
     container_close(&adopted);
     fresh_test_root();
@@ -1135,15 +1179,13 @@ static void test_adopt_ignores_names_outside_the_grammar(void)
     // none of them is recognized as a candidate at all, the whole call must
     // still report NO_MATCH.
     static const char *bogus_bases[] = {
-        "migr_backup_20260101_000000-0",            // "-0": never produced (no leading-zero suffix)
-        "migr_backup_20260101_000000-00",           // leading zero, longer
-        "migr_backup_20260101_000000-01",           // leading zero before a real digit
-        "migr_backup_20260101_00000",               // time-of-day one digit short
-        "not_migr_backup_20260101_000000",          // wrong prefix
-        "migr_backup_20260101_000000-2147483647",   // suffix == INT_MAX: reserve()'s loop
-                                                     // condition ("suffix < INT_MAX") means
-                                                     // it can never actually produce this
-                                                     // value, only up to INT_MAX - 1
+        "migr-eyildizemre-2026-01-01-1",  // -1 is never written: numbering starts at 2
+        "migr-eyildizemre-2026-01-01-02", // leading zero
+        "migr-eyildizemre-2026-1-01",     // not a YYYY-MM-DD date
+        "migr-eyildizemre-backup",        // not a date at all
+        "migr-eyildizemre2",              // another owner whose name starts the same
+        "migr_eyildizemre",               // wrong prefix
+        "migr_backup_20260101_000000",    // the old grammar
     };
 
     for (size_t i = 0; i < sizeof(bogus_bases) / sizeof(bogus_bases[0]); i++)
@@ -1159,7 +1201,7 @@ static void test_adopt_ignores_names_outside_the_grammar(void)
     Manifest wanted;
     make_reference_manifest(&wanted);
     BackupContainer adopted;
-    check(container_adopt(test_root, &wanted, &adopted) == CONTAINER_ERR_NO_MATCH,
+    check(container_adopt(test_root, OWNER, &wanted, &adopted) == CONTAINER_ERR_NO_MATCH,
           "none of the grammar-violating names are recognized as candidates, despite matching manifests");
     container_close(&adopted);
     fresh_test_root();
@@ -1179,41 +1221,43 @@ static void test_name_is_partial_matches_the_reserve_grammar(void)
     check(container_name_is_final("") == 0, "an empty name is not final");
 
     static const char *valid_partials[] = {
-        "migr_backup_20260101_000000.partial",
-        "migr_backup_20260101_000000-1.partial",
-        "migr_backup_20260101_000000-42.partial",
+        "migr-eyildizemre.partial",
+        "migr-eyildizemre-2026-01-01.partial",
+        "migr-eyildizemre-2026-01-01-42.partial",
+        "migr-john.doe.partial",
     };
     for (size_t i = 0; i < sizeof(valid_partials) / sizeof(valid_partials[0]); i++)
         check(container_name_is_partial(valid_partials[i]) != 0,
               "a genuine .partial container name is recognized");
 
     static const char *valid_finals[] = {
-        "migr_backup_20260101_000000",
-        "migr_backup_20260101_000000-1",
-        "migr_backup_20260101_000000-42",
+        "migr-eyildizemre",
+        "migr-eyildizemre-2026-01-01",
+        "migr-eyildizemre-2026-01-01-42",
+        "migr-john.doe",
     };
     for (size_t i = 0; i < sizeof(valid_finals) / sizeof(valid_finals[0]); i++)
         check(container_name_is_final(valid_finals[i]) != 0,
               "a genuine finalized container name is recognized");
 
     static const char *not_partials[] = {
-        "migr_backup_20260101_000000",              // finalized: no ".partial" at all
-        "migr_backup_20260101_000000-0.partial",    // "-0": never produced (no leading-zero suffix)
-        "migr_backup_20260101_00000.partial",       // stamp one digit short
-        "not_migr_backup_20260101_000000.partial",  // wrong prefix
-        "myfiles.partial",                          // an unrelated directory, not ours
-        "migr_backup_20260101_000000.partial/",     // trailing slash: not a bare leaf name
+        "migr-eyildizemre",                    // finalized: no ".partial" at all
+        "migr-.partial",                       // no owner
+        "migr-a:b.partial",                    // a character the writer never keeps
+        "migr_backup_20260101_000000.partial", // the old grammar
+        "myfiles.partial",                     // an unrelated directory, not ours
+        "migr-eyildizemre.partial/",           // trailing slash: not a bare leaf name
     };
     for (size_t i = 0; i < sizeof(not_partials) / sizeof(not_partials[0]); i++)
         check(container_name_is_partial(not_partials[i]) == 0,
               "a name outside the exact grammar is not treated as partial");
 
     static const char *not_finals[] = {
-        "migr_backup_20260101_000000.partial",
-        "migr_backup_20260101_000000-0",
-        "migr_backup_20260101_00000",
-        "not_migr_backup_20260101_000000",
-        "migr_backup_20260101_000000/",
+        "migr-eyildizemre.partial",
+        "migr-",
+        "migr-a b",
+        "migr_backup_20260101_000000",
+        "migr-eyildizemre/",
     };
     for (size_t i = 0; i < sizeof(not_finals) / sizeof(not_finals[0]); i++)
         check(container_name_is_final(not_finals[i]) == 0,
@@ -1230,7 +1274,7 @@ static void test_manifest_read_v1_at_rejects_non_regular(void)
     fresh_test_root();
 
     BackupContainer c;
-    check(container_reserve(test_root, FIXED_TIME, &c) == CONTAINER_OK, "fixture: reserve a container");
+    check(container_reserve(test_root, OWNER, FIXED_TIME, &c) == CONTAINER_OK, "fixture: reserve a container");
 
     char dir_path[PATH_MAX];
     path_under_root(dir_path, sizeof(dir_path), c.partial_name);
@@ -1360,6 +1404,7 @@ int main(void)
 
     test_reserve_generates_expected_stamp();
     test_reserve_partial_collision_advances_suffix();
+    test_reserve_sanitizes_the_owner();
     test_reserve_fd_is_anchored();
     test_reserve_final_collision_advances_suffix();
     test_concurrent_reserve_claims_distinct_partials();
