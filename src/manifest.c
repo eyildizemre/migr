@@ -1090,6 +1090,15 @@ static int canonical_path(const char *path, int absolute, int empty_ok)
     return 1;
 }
 
+const char *manifest_root_label(const ManifestRoot *root)
+{
+    if (root->has_restore_path && root->restore_path[0] != '\0')
+        return root->restore_path;
+    const char *slash = strrchr(root->source_path, '/');
+    const char *leaf = slash != NULL ? slash + 1 : root->source_path;
+    return leaf[0] != '\0' ? leaf : root->id;
+}
+
 int manifest_root_source_path(const Manifest *m, int root_index, char out[PATH_MAX])
 {
     if (!m || m->version != MANIFEST_SELECTION_VERSION || root_index < 0 ||

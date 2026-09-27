@@ -2993,9 +2993,6 @@ static RestoreNativeStatus restore_entry_symlink(
             }
             if (xattr_requirements != NULL)
                 xattr_requirements->symlink_namespaces |= namespaces;
-            if (profiles != NULL &&
-                (namespaces & METADATA_XATTR_NS_SECURITY) != 0)
-                metadata_profiles_note_security_xattr(profiles);
         }
 
         if (pass == RESTORE_VALIDATE && skip_symlink_target_read)
@@ -3128,9 +3125,6 @@ static RestoreNativeStatus restore_entry_regular(
                 }
                 if (xattr_requirements != NULL)
                     xattr_requirements->regular_namespaces |= namespaces;
-                if (profiles != NULL &&
-                    (namespaces & METADATA_XATTR_NS_SECURITY) != 0)
-                    metadata_profiles_note_security_xattr(profiles);
             }
             native_restore_estimate_regular(estimate, &opened_source_st);
             if (close(src_fd) == 0)
@@ -3301,9 +3295,6 @@ static RestoreNativeStatus restore_entry_directory(
             }
             if (xattr_requirements != NULL)
                 xattr_requirements->directory_namespaces |= namespaces;
-            if (profiles != NULL &&
-                (namespaces & METADATA_XATTR_NS_SECURITY) != 0)
-                metadata_profiles_note_security_xattr(profiles);
         }
 
         int dest_dir_fd = open_destination_directory(pass, dest_parent_fd,

@@ -1525,7 +1525,7 @@ EOF
     local dry_out
     dry_out=$(env HOME="$v1_home" "$MIGR" restore "$v1_src" --dry-run 2>&1)
     assert_contains "$dry_out" "Roots"
-    assert_contains "$dry_out" "Would restore: EXPLICIT_0 -> ~/Documents/project"
+    assert_contains "$dry_out" "Would restore: ~/Documents/project"
     assert_contains "$dry_out" "Manual Roots"
     assert_contains "$dry_out" "/mnt/external/project"
 

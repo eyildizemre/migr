@@ -242,12 +242,6 @@ int metadata_profiles_add(MetadataProfiles *profiles, int anchor_fd,
     return 0;
 }
 
-void metadata_profiles_note_security_xattr(MetadataProfiles *profiles)
-{
-    if (profiles != NULL && profiles->security_xattr_entry_count != SIZE_MAX)
-        profiles->security_xattr_entry_count++;
-}
-
 static int set_probe_times(int fd, MetadataTimestampPolicy policy,
                            struct timespec out[2])
 {
@@ -317,9 +311,10 @@ int metadata_profiles_probe(const MetadataProfiles *profiles,
     return 0;
 }
 
+// A diagnostic for -v: which owners and modes the preflight checked.
 void metadata_profiles_report(const MetadataProfiles *profiles)
 {
-    if (profiles == NULL || profiles->affected_objects == 0)
+    if (!verbose || profiles == NULL || profiles->affected_objects == 0)
         return;
 
     printf("Metadata preflight: %zu object(s), %zu privilege-relevant profile(s)\n",

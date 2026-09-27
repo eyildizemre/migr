@@ -292,6 +292,10 @@ int manifest_write_v1(const char *backup_dir, const Manifest *m);
  * @brief Releases the heap-owned root array. Safe on NULL and on an all-zero Manifest.
  */
 void manifest_free(Manifest *m);
+/* How a root is named to the user: its HOME-relative restore path
+ * (".bashrc"), else the last component of its source ("Desktop"), else its
+ * id. */
+const char *manifest_root_label(const ManifestRoot *root);
 /* Filesystem-independent VERSION=2 source addressing and entry ownership.
  * On a validated manifest, an entry is owned (1), excluded/delegated (0), or invalid (-1).
  * Callers must reject unowned entries found in finalized payloads. */

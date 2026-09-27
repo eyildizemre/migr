@@ -11,47 +11,18 @@
 #include <errno.h>
 #include <stdio.h>
 
+// The preflight's roots follow the manifest's, index for index.
 static void portable_restore_preview(
-    const PortableRestorePreflightReport *report)
+    const PortableRestorePreflightReport *report, const Manifest *manifest)
 {
-    if (report == NULL)
-        return;
-    printf("Portable restore dry run: %zu live entr%s would be applied\n",
-           report->live_count, report->live_count == 1 ? "y" : "ies");
-    if (report->profiles.security_xattr_entry_count != 0)
-        printf("  %zu item(s) carry security.* attributes; whether they can "
-               "be applied here is measured, not predicted, and is only "
-               "found out on a live run\n",
-               report->profiles.security_xattr_entry_count);
     for (size_t index = 0; index < report->root_count; index++)
-        if (report->roots[index].live_count != 0)
-            printf("  root %s: %zu live entr%s\n",
-                   report->roots[index].id,
-                   report->roots[index].live_count,
-                   report->roots[index].live_count == 1 ? "y" : "ies");
-}
-
-static int portable_restore_confirm(size_t security_xattr_entries)
-{
-    const char *ordinary_message =
-        "This will restore portable files to the destination. Continue?";
-    if (security_xattr_entries == 0)
-        return confirm_action(ordinary_message);
-
-    char message[768];
-    int length = snprintf(
-        message, sizeof(message),
-        "This restore includes %zu item(s) carrying security.* attributes "
-        "(e.g. SELinux labels); if this destination or account cannot "
-        "apply one, that item's other content and metadata will still be "
-        "restored and only the attribute will be skipped. Continue?",
-        security_xattr_entries);
-    if (length < 0 || (size_t)length >= sizeof(message))
-        return confirm_action(
-            "This restore includes security.* attributes; an attribute "
-            "that cannot be applied will be skipped while the item's other "
-            "content and metadata are restored. Continue?");
-    return confirm_action(message);
+    {
+        size_t count = report->roots[index].live_count;
+        if (count != 0)
+            printf("  Would restore: %s (%zu item%s)\n",
+                   manifest_root_label(&manifest->roots[index]), count,
+                   count == 1 ? "" : "s");
+    }
 }
 
 static void portable_restore_print_preserved_local_state(size_t count,
@@ -126,7 +97,7 @@ static PortableRestoreOutcome portable_restore_orchestrate_impl(
     if (dry_run)
     {
         report->live_count = preflight.live_count;
-        portable_restore_preview(&preflight);
+        portable_restore_preview(&preflight, request->manifest);
         portable_restore_preflight_report_free(&preflight);
         return PORTABLE_RESTORE_DRY_RUN;
     }
@@ -134,8 +105,8 @@ static PortableRestoreOutcome portable_restore_orchestrate_impl(
     metadata_profiles_report(&preflight.profiles);
     if (request->before_confirmation != NULL)
         request->before_confirmation(request->before_confirmation_context);
-    if (!portable_restore_confirm(
-            preflight.profiles.security_xattr_entry_count))
+    if (!confirm_action(
+            "This will restore files to your home directory. Continue?"))
     {
         printf("Cancelled.\n");
         portable_restore_preflight_report_free(&preflight);

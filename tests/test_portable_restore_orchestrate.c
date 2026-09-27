@@ -1105,6 +1105,28 @@ static void test_user_dirs_is_preserved_as_local_state(void)
     fixture_close(&fixture);
 }
 
+static void test_metadata_report_needs_verbose(void)
+{
+    printf(BLUE "::" NC " metadata preflight detail is for -v\n");
+    MetadataProfiles profiles;
+    metadata_profiles_init(&profiles);
+    profiles.affected_objects = 1;
+    char output[512];
+    OutputCapture capture;
+    output_capture_begin(&capture);
+    metadata_profiles_report(&profiles);
+    output_capture_end(&capture, output, sizeof(output));
+    check(output[0] == '\0', "without -v the preflight detail is not printed");
+    int previous_verbose = verbose;
+    verbose = 1;
+    output_capture_begin(&capture);
+    metadata_profiles_report(&profiles);
+    output_capture_end(&capture, output, sizeof(output));
+    verbose = previous_verbose;
+    check(strstr(output, "Metadata preflight: 1 object(s)") != NULL,
+          "with -v it is");
+}
+
 static void test_security_xattr_tolerance_orchestration(void)
 {
     printf(BLUE "::" NC " portable security.* xattr tolerance orchestration\n");
@@ -1166,9 +1188,8 @@ static void test_security_xattr_tolerance_orchestration(void)
     };
     int preflight_result = manifest_status == MANIFEST_STATUS_VALID
         ? portable_restore_preflight_at(&preflight_request, &preflight) : -1;
-    check(preflight_result == 0 &&
-              preflight.profiles.security_xattr_entry_count == 1,
-          "preflight counts the entry carrying security.*");
+    check(preflight_result == 0,
+          "preflight accepts the entry carrying security.*");
     portable_restore_preflight_report_free(&preflight);
     if (manifest_status == MANIFEST_STATUS_VALID)
         manifest_free(&manifest);
@@ -1183,9 +1204,11 @@ static void test_security_xattr_tolerance_orchestration(void)
               report.failed_count == 0 &&
               report.skipped_security_xattr_count >= 1,
           "security.* set refusal does not abort portable replay");
-    check(strstr(output, "carrying security.* attributes") != NULL &&
-              strstr(output, "only the attribute will be skipped") != NULL,
-          "the existing confirmation prompt includes the security warning");
+    check(strstr(output, "This will restore files to your home directory. "
+                         "Continue?") != NULL &&
+              strstr(output, "security.* attributes;") == NULL,
+          "the confirmation is the ordinary one; only the summary counts "
+          "skipped attributes");
     char summary_marker[128];
     int summary_length = snprintf(
         summary_marker, sizeof(summary_marker), "Portable restore skipped %zu "
@@ -1506,10 +1529,17 @@ static void test_before_confirmation_hook(void)
     before_confirmation_calls = 0;
     int previous_dry_run = dry_run;
     dry_run = 1;
+    char preview[4096];
+    OutputCapture capture;
+    output_capture_begin(&capture);
     int result = run_orchestration(&fixture, &report, 1, "y\n");
+    output_capture_end(&capture, preview, sizeof(preview));
     dry_run = previous_dry_run;
     check(result == 0 && before_confirmation_calls == 0,
           "a dry run shows no prompt and does not call the hook");
+    check(strstr(preview, "  Would restore: restored (") != NULL &&
+              strstr(preview, "ROOT") == NULL,
+          "a dry run names each root by where it goes, not by its id");
 
     before_confirmation_calls = 0;
     result = run_orchestration(&fixture, &report, 1, "n\n");
@@ -2766,6 +2796,7 @@ int main(void)
     test_invalid_request_still_zeroes_report();
     test_normal_orchestration();
     test_user_dirs_is_preserved_as_local_state();
+    test_metadata_report_needs_verbose();
     test_security_xattr_tolerance_orchestration();
     test_hardlink_orchestration();
     test_link_rerun_is_idempotent();

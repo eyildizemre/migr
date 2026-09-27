@@ -1400,38 +1400,6 @@ static void restore_security_skipped_add(size_t *total, size_t count)
         *total += count;
 }
 
-static void native_restore_security_dry_run_notice(size_t entries)
-{
-    if (entries != 0)
-        printf("Security notice: %zu item(s) carry security.* attributes; "
-               "whether they can be applied here is measured, not "
-               "predicted, and is only found out on a live run.\n",
-               entries);
-}
-
-static int native_restore_confirm(size_t security_xattr_entries)
-{
-    const char *ordinary_message =
-        "This will restore files to your home directory. Continue?";
-    if (security_xattr_entries == 0)
-        return confirm_action(ordinary_message);
-
-    char message[768];
-    int length = snprintf(
-        message, sizeof(message),
-        "This restore includes %zu item(s) carrying security.* attributes "
-        "(e.g. SELinux labels); if this destination or account cannot "
-        "apply one, that item's other content and metadata will still be "
-        "restored and only the attribute will be skipped. Continue?",
-        security_xattr_entries);
-    if (length < 0 || (size_t)length >= sizeof(message))
-        return confirm_action(
-            "This restore includes security.* attributes; an attribute "
-            "that cannot be applied will be skipped while the item's other "
-            "content and metadata are restored. Continue?");
-    return confirm_action(message);
-}
-
 typedef struct {
     int printed_anything;
     struct timespec started_at;
@@ -3214,15 +3182,13 @@ static void restore_v1(const char *source, int source_root_fd,
             if (root->policy == ROOT_POLICY_HOME_RELATIVE)
             {
                 if (root->restore_path[0] != '\0')
-                    printf("  Would restore: %s -> ~/%s\n", root->id,
-                           root->restore_path);
+                    printf("  Would restore: ~/%s\n", root->restore_path);
                 else
-                    printf("  Would restore: %s -> ~\n", root->id);
+                    printf("  Would restore: ~\n");
             }
             else
             {
-                printf("  Would restore: %s -> %s/\n", root->id,
-                       destination->absolute);
+                printf("  Would restore: %s/\n", destination->absolute);
             }
         }
         if (rc > 0)
@@ -3676,17 +3642,13 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         goto cleanup;
 
     if (dry_run)
-    {
         printf("Dry run mode enabled. No changes will be made.\n\n");
-        native_restore_security_dry_run_notice(
-            metadata_profiles.security_xattr_entry_count);
-    }
     else
     {
         restore_defer_running_writers(&open_settings);
         restore_warn_running_writers(&open_settings);
-        if (!native_restore_confirm(
-                metadata_profiles.security_xattr_entry_count))
+        if (!confirm_action(
+                "This will restore files to your home directory. Continue?"))
         {
             printf("Cancelled.\n");
             result = MIGR_EXIT_OK;

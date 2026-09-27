@@ -772,18 +772,13 @@ static int collection_destination_route(Collection *collection,
 }
 
 /* A root's own entry has an empty logical path; examples name it the way the
- * user sees it instead: its HOME-relative restore path (".bashrc") or the
- * last component of its source directory ("Desktop"). */
+ * user sees it instead. */
 static const char *preflight_entry_label(const ManifestRoot *root,
                                          const char *logical)
 {
     if (logical == NULL || logical[0] != '\0' || root == NULL)
         return logical;
-    if (root->has_restore_path && root->restore_path[0] != '\0')
-        return root->restore_path;
-    const char *slash = strrchr(root->source_path, '/');
-    const char *leaf = slash != NULL ? slash + 1 : root->source_path;
-    return leaf[0] != '\0' ? leaf : root->id;
+    return manifest_root_label(root);
 }
 
 /* Returns 0 on success, -1 for a per-entry violation (already recorded via
@@ -1032,18 +1027,6 @@ static int collect_entry(const SidecarLiveView *view, void *argument)
     destination->size = entry->size;
     entries->count++;
 
-    int carries_security_xattr = 0;
-    for (size_t xindex = 0; xindex < view->xattr_count; xindex++)
-        if ((metadata_xattr_namespace_bytes(
-                 view->xattrs[xindex].name.data,
-                 view->xattrs[xindex].name.length) &
-             METADATA_XATTR_NS_SECURITY) != 0)
-        {
-            carries_security_xattr = 1;
-            break;
-        }
-    if (carries_security_xattr)
-        metadata_profiles_note_security_xattr(&report->profiles);
     return 0;
 }
 

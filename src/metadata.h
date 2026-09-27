@@ -59,7 +59,6 @@ typedef struct MetadataProfiles {
     // that make an object relevant to the metadata_profiles_probe() round
     // trip but do not by themselves require root.
     size_t foreign_owner_count;
-    size_t security_xattr_entry_count;
     size_t example_count;
     char examples[METADATA_MAX_PREFLIGHT_EXAMPLES][PATH_MAX];
 } MetadataProfiles;
@@ -95,7 +94,6 @@ int metadata_profiles_add(MetadataProfiles *profiles, int anchor_fd,
 int metadata_profiles_probe(const MetadataProfiles *profiles,
                             MetadataTimestampPolicy policy);
 void metadata_profiles_report(const MetadataProfiles *profiles);
-void metadata_profiles_note_security_xattr(MetadataProfiles *profiles);
 int metadata_xattr_capability_probe(
     int anchor_fd, const MetadataXattrRequirements *required);
 int metadata_xattr_namespaces_fd(int fd, unsigned int *out);

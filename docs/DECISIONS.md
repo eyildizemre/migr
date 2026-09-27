@@ -1411,6 +1411,9 @@ will accept. All other namespaces and errno values retain E-3's fail-closed
 behaviour. The rule is shared by native and portable restore because both
 paths use `metadata_apply_xattrs_target()`.
 
+D81 later dropped the warning from the confirmation and the dry run; the
+apply-time tolerance and the summary count remain.
+
 ---
 
 ## D21 — 2026-08-08 — Portable case-collision resolution: deterministic suffix
@@ -4930,3 +4933,25 @@ nothing said so, although a restore from a text console is what the dconf
 failure message recommends.
 
 **Relationship:** Narrows D65 for one file; D50's load is unchanged.
+
+## D81 — 2026-09-27 — Restore asks one plain question and previews in the user's terms
+
+**Status:** Implemented
+
+**Decision:** Native and portable restore confirm with the same question,
+"This will restore files to your home directory. Continue?". It no longer
+folds in D20 E-11's count of items carrying `security.*` attributes, and
+dry runs no longer print that count. An attribute the destination refuses
+is still skipped as E-11 describes and counted in the final summary. The
+preflight's owner and mode detail (`Metadata preflight: …` with its
+examples) is printed only with `-v`, and restore previews name each root
+by where it goes (`~/.bashrc`, `Documents`) instead of by its manifest id.
+
+**Why:** E-11's warning was written for unprivileged restores. Since D62
+restore runs as root, and a backup from Fedora labels nearly every item, so
+every restore from Fedora asked about a refusal that is rare and that the
+summary reports when it happens. The profile detail and the manifest ids
+describe the implementation, not the user's files.
+
+**Relationship:** Replaces the preflight warning of D20 E-11; its apply-time
+tolerance and summary count are unchanged.
