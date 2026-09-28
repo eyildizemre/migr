@@ -311,8 +311,9 @@ static int journal_has(const char *container, const char *logical,
         out->mode = view.entry->mode;
         out->kind = view.entry->kind;
         static unsigned char suffix[SIDECAR_MAX_COLLISION_SUFFIX + 1U];
-        memcpy(suffix, view.entry->collision_suffix.data,
-               view.entry->collision_suffix.length);
+        if (view.entry->collision_suffix.length != 0)
+            memcpy(suffix, view.entry->collision_suffix.data,
+                   view.entry->collision_suffix.length);
         suffix[view.entry->collision_suffix.length] = '\0';
         out->collision_suffix = (SidecarBytes){
             suffix, view.entry->collision_suffix.length
