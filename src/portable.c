@@ -4088,6 +4088,11 @@ int portable_capture_root(PortableCaptureContext *context,
             context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, NULL);
         return -1;
     }
+    if (fileops_make_parents_at(context->data_fd, root->payload_path) != 0) {
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, errno, root, NULL);
+        return -1;
+    }
     int result = capture_node(context, root, "", "", "", -1, NULL,
                               root->capture_path, -1, NULL, NULL);
     if (result != 0)

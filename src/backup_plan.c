@@ -13,6 +13,7 @@
 #include "backup_plan.h"
 #include "selection.h"
 #include "hash.h"
+#include "encoding.h"
 #include "utils.h" /* path_join, path_join_n */
 #include "xdg.h"
 
@@ -49,7 +50,7 @@ static int copy_field(char *dest, size_t dest_size, const char *src,
 // roots have no restore_path at all -- they are never "reusing" source_path
 // for it).
 static int append_root(RootBuilder *rb, const char *id, RootPolicy policy,
-                       const char *payload_path, const char *source_path,
+                       const char *source_path,
                        const char *restore_path, int has_restore_path,
                        const char *capture_path, BackupRootGroup group)
 {
@@ -85,10 +86,6 @@ static int append_root(RootBuilder *rb, const char *id, RootPolicy policy,
         return -1;
     mr->policy = policy;
 
-    if (copy_field(mr->payload_path, sizeof(mr->payload_path), payload_path,
-                   "Error: payload path too long for %s\n", id) != 0)
-        return -1;
-
     if (copy_field(mr->source_path, sizeof(mr->source_path), source_path,
                    "Error: source path too long: %s\n", source_path) != 0)
         return -1;
@@ -112,44 +109,45 @@ static int append_root(RootBuilder *rb, const char *id, RootPolicy policy,
 typedef struct {
     const char *id;
     const char *home_rel;
+    const char *payload_name; // its folder under data/settings/
     BackupRootGroup group;
     int comprehensive_only;
 } BuiltinHomeEntry;
 
 static const BuiltinHomeEntry builtin_home_catalog[] = {
-    { "BUILTIN_DOT_SSH",                ".ssh",                 BACKUP_ROOT_DOTFILE, 0 },
-    { "BUILTIN_DOT_GNUPG",              ".gnupg",               BACKUP_ROOT_DOTFILE, 0 },
-    { "BUILTIN_DOT_GITCONFIG",          ".gitconfig",           BACKUP_ROOT_DOTFILE, 0 },
-    { "BUILTIN_DOT_CONFIG",             ".config",              BACKUP_ROOT_DOTFILE, 0 },
-    { "BUILTIN_LOCAL_SHARE",            ".local/share",         BACKUP_ROOT_DOTFILE, 0 },
-    { "BUILTIN_LOCAL_STATE",            ".local/state",         BACKUP_ROOT_DOTFILE, 0 },
-    { "BUILTIN_LOCAL_BIN",              ".local/bin",           BACKUP_ROOT_DOTFILE, 0 },
-    { "BUILTIN_FLATPAK_APPS",           ".var/app",             BACKUP_ROOT_DOTFILE, 0 },
-    { "BUILTIN_DOT_VSCODE",             ".vscode",              BACKUP_ROOT_DOTFILE, 0 },
-    { "BUILTIN_DOT_VSCODE_OSS",         ".vscode-oss",          BACKUP_ROOT_DOTFILE, 0 },
-    { "BUILTIN_DOT_BASHRC",             ".bashrc",              BACKUP_ROOT_DOTFILE, 0 },
-    { "BUILTIN_DOT_BASH_HISTORY",        ".bash_history",         BACKUP_ROOT_DOTFILE, 0 },
-    { "BUILTIN_DOT_BASH_PROFILE",        ".bash_profile",        BACKUP_ROOT_DOTFILE, 0 },
-    { "BUILTIN_DOT_BASH_LOGIN",          ".bash_login",          BACKUP_ROOT_DOTFILE, 0 },
-    { "BUILTIN_DOT_BASH_LOGOUT",         ".bash_logout",         BACKUP_ROOT_DOTFILE, 0 },
-    { "BUILTIN_DOT_BASH_ALIASES",        ".bash_aliases",        BACKUP_ROOT_DOTFILE, 0 },
-    { "BUILTIN_DOT_PROFILE",            ".profile",             BACKUP_ROOT_DOTFILE, 0 },
-    { "BUILTIN_DOT_ZSHENV",              ".zshenv",              BACKUP_ROOT_DOTFILE, 0 },
-    { "BUILTIN_DOT_ZSH_HISTORY",         ".zsh_history",          BACKUP_ROOT_DOTFILE, 0 },
-    { "BUILTIN_DOT_ZPROFILE",            ".zprofile",            BACKUP_ROOT_DOTFILE, 0 },
-    { "BUILTIN_DOT_ZSHRC",               ".zshrc",               BACKUP_ROOT_DOTFILE, 0 },
-    { "BUILTIN_DOT_ZLOGIN",              ".zlogin",              BACKUP_ROOT_DOTFILE, 0 },
-    { "BUILTIN_DOT_ZLOGOUT",             ".zlogout",             BACKUP_ROOT_DOTFILE, 0 },
-    { "BUILTIN_DOT_INPUTRC",              ".inputrc",             BACKUP_ROOT_DOTFILE, 0 },
-    { "BUILTIN_DOT_TMUX_CONF",            ".tmux.conf",           BACKUP_ROOT_DOTFILE, 0 },
-    { "BUILTIN_DOT_SCREENRC",             ".screenrc",            BACKUP_ROOT_DOTFILE, 0 },
-    { "BUILTIN_BROWSER_MOZILLA",        ".mozilla",             BACKUP_ROOT_BROWSER, 0 },
-    { "BUILTIN_BROWSER_GOOGLE_CHROME",  ".config/google-chrome", BACKUP_ROOT_BROWSER, 0 },
-    { "BUILTIN_BROWSER_CHROMIUM",       ".config/chromium",      BACKUP_ROOT_BROWSER, 0 },
-    { "BUILTIN_BROWSER_BRAVE",          ".config/BraveSoftware", BACKUP_ROOT_BROWSER, 0 },
-    { "BUILTIN_BROWSER_VIVALDI",        ".config/vivaldi",       BACKUP_ROOT_BROWSER, 0 },
-    { "BUILTIN_BROWSER_MICROSOFT_EDGE", ".config/microsoft-edge", BACKUP_ROOT_BROWSER, 0 },
-    { "BUILTIN_BROWSER_OPERA",          ".config/opera",         BACKUP_ROOT_BROWSER, 0 },
+    { "BUILTIN_DOT_SSH",                ".ssh",                  "ssh",            BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_DOT_GNUPG",              ".gnupg",                "gnupg",          BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_DOT_GITCONFIG",          ".gitconfig",            "gitconfig",      BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_DOT_CONFIG",             ".config",               "config",         BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_LOCAL_SHARE",            ".local/share",          "local-share",    BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_LOCAL_STATE",            ".local/state",          "local-state",    BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_LOCAL_BIN",              ".local/bin",            "local-bin",      BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_FLATPAK_APPS",           ".var/app",              "flatpak-apps",   BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_DOT_VSCODE",             ".vscode",               "vscode",         BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_DOT_VSCODE_OSS",         ".vscode-oss",           "vscodium",       BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_DOT_BASHRC",             ".bashrc",               "bashrc",         BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_DOT_BASH_HISTORY",       ".bash_history",         "bash-history",   BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_DOT_BASH_PROFILE",       ".bash_profile",         "bash-profile",   BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_DOT_BASH_LOGIN",         ".bash_login",           "bash-login",     BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_DOT_BASH_LOGOUT",        ".bash_logout",          "bash-logout",    BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_DOT_BASH_ALIASES",       ".bash_aliases",         "bash-aliases",   BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_DOT_PROFILE",            ".profile",              "profile",        BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_DOT_ZSHENV",             ".zshenv",               "zshenv",         BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_DOT_ZSH_HISTORY",        ".zsh_history",          "zsh-history",    BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_DOT_ZPROFILE",           ".zprofile",             "zprofile",       BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_DOT_ZSHRC",              ".zshrc",                "zshrc",          BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_DOT_ZLOGIN",             ".zlogin",               "zlogin",         BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_DOT_ZLOGOUT",            ".zlogout",              "zlogout",        BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_DOT_INPUTRC",            ".inputrc",              "inputrc",        BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_DOT_TMUX_CONF",          ".tmux.conf",            "tmux-conf",      BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_DOT_SCREENRC",           ".screenrc",             "screenrc",       BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_BROWSER_MOZILLA",        ".mozilla",              "firefox",        BACKUP_ROOT_BROWSER, 0 },
+    { "BUILTIN_BROWSER_GOOGLE_CHROME",  ".config/google-chrome", "google-chrome",  BACKUP_ROOT_BROWSER, 0 },
+    { "BUILTIN_BROWSER_CHROMIUM",       ".config/chromium",      "chromium",       BACKUP_ROOT_BROWSER, 0 },
+    { "BUILTIN_BROWSER_BRAVE",          ".config/BraveSoftware", "brave",          BACKUP_ROOT_BROWSER, 0 },
+    { "BUILTIN_BROWSER_VIVALDI",        ".config/vivaldi",       "vivaldi",        BACKUP_ROOT_BROWSER, 0 },
+    { "BUILTIN_BROWSER_MICROSOFT_EDGE", ".config/microsoft-edge", "microsoft-edge", BACKUP_ROOT_BROWSER, 0 },
+    { "BUILTIN_BROWSER_OPERA",          ".config/opera",         "opera",          BACKUP_ROOT_BROWSER, 0 },
 };
 enum { BUILTIN_HOME_CATALOG_COUNT =
     sizeof(builtin_home_catalog) / sizeof(builtin_home_catalog[0]) };
@@ -457,7 +455,7 @@ static int build_builtin_roots(const char *home_real, BackupMode mode, RootBuild
             break;
         }
 
-        if (append_root(rb, xdg_keys[i], ROOT_POLICY_XDG, xdg_keys[i], capture_path,
+        if (append_root(rb, xdg_keys[i], ROOT_POLICY_XDG, capture_path,
                         NULL, 0, capture_path, BACKUP_ROOT_MAIN) != 0)
         {
             failed = 1;
@@ -495,7 +493,7 @@ static int build_builtin_roots(const char *home_real, BackupMode mode, RootBuild
             return -1;
         }
 
-        if (append_root(rb, e->id, ROOT_POLICY_HOME_RELATIVE, e->id, e->home_rel,
+        if (append_root(rb, e->id, ROOT_POLICY_HOME_RELATIVE, e->home_rel,
                         e->home_rel, 1, capture_path, e->group) != 0)
             return -1;
     }
@@ -595,13 +593,13 @@ static int build_explicit_roots(const char *home_real, const char *const *explic
         if (backup_plan_home_relative(home_real, tmp[i].capture_path,
                                       &restore_rel))
         {
-            if (append_root(rb, id, ROOT_POLICY_HOME_RELATIVE, id, restore_rel,
+            if (append_root(rb, id, ROOT_POLICY_HOME_RELATIVE, restore_rel,
                             restore_rel, 1, tmp[i].capture_path, BACKUP_ROOT_EXPLICIT) != 0)
                 failed = 1;
         }
         else
         {
-            if (append_root(rb, id, ROOT_POLICY_MANUAL_NATIVE, id, tmp[i].capture_path,
+            if (append_root(rb, id, ROOT_POLICY_MANUAL_NATIVE, tmp[i].capture_path,
                             NULL, 0, tmp[i].capture_path, BACKUP_ROOT_EXPLICIT) != 0)
                 failed = 1;
         }
@@ -609,6 +607,155 @@ static int build_explicit_roots(const char *home_real, const char *const *explic
 
     free(tmp);
     return failed ? -1 : 0;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Payload names (docs/DECISIONS.md D82).                                    */
+/* ------------------------------------------------------------------------- */
+
+// NAME_MAX less room for a collision suffix: at most MANIFEST_MAX_ROOTS roots
+// can take a name before a free one turns up.
+enum { PAYLOAD_NAME_MAX = NAME_MAX - 8 };
+
+static const BuiltinHomeEntry *builtin_catalog_entry(const char *id)
+{
+    for (int i = 0; i < BUILTIN_HOME_CATALOG_COUNT; i++)
+        if (strcmp(builtin_home_catalog[i].id, id) == 0)
+            return &builtin_home_catalog[i];
+    return NULL;
+}
+
+static char ascii_lower(char c)
+{
+    return c >= 'A' && c <= 'Z' ? (char)(c - 'A' + 'a') : c;
+}
+
+static int path_has_hidden_component(const char *path)
+{
+    for (const char *p = path; *p != '\0'; p++)
+        if (*p == '.' && (p == path || p[-1] == '/'))
+            return 1;
+    return 0;
+}
+
+// ".config/Code" -> "config-code": no leading dots, '/' and '_' become '-',
+// ASCII letters lowercase.
+static void settings_name_from_path(const char *path, char *out,
+                                    size_t out_size)
+{
+    size_t length = 0;
+    int component_start = 1;
+    for (const char *p = path; *p != '\0' && length + 1 < out_size; p++)
+    {
+        if (component_start && *p == '.')
+            continue;
+        component_start = *p == '/';
+        out[length++] = *p == '/' || *p == '_' ? '-' : ascii_lower(*p);
+    }
+    out[length] = '\0';
+}
+
+// Makes name one that FAT, exFAT, and NTFS accept as it is: they refuse
+// control characters, "*:<>?\| and a trailing dot or space, and hold at most
+// 255 UTF-16 units, which NAME_MAX bytes of UTF-8 never exceed. Returns -1
+// for a name that cannot be kept: invalid UTF-8, empty, or too long.
+static int payload_name_make_portable(char *name)
+{
+    if (!encoding_utf8_valid(name))
+        return -1;
+    size_t length = strlen(name);
+    for (size_t i = 0; i < length; i++)
+    {
+        unsigned char c = (unsigned char)name[i];
+        if (c < 0x20 || c == 0x7F || strchr("\"*:<>?\\|", c) != NULL)
+            name[i] = '-';
+    }
+    while (length > 0 && (name[length - 1] == '.' || name[length - 1] == ' '))
+        name[--length] = '\0';
+    return length == 0 || length > PAYLOAD_NAME_MAX ? -1 : 0;
+}
+
+// A root's place under data/ before collisions: a folder of the user's own,
+// one whose path holds no hidden component, at the top under its name on
+// disk; anything else in settings/, a built-in under its catalog name.
+static int payload_path_base(const char *home, const BackupPlanRoot *root,
+                             char *out, size_t out_size)
+{
+    const ManifestRoot *mr = &root->manifest_root;
+    const BuiltinHomeEntry *builtin = builtin_catalog_entry(mr->id);
+    const char *relative;
+    if (!backup_plan_home_relative(home, root->capture_path, &relative))
+        relative = root->capture_path + 1;
+    int user_folder = builtin == NULL && !path_has_hidden_component(relative);
+
+    char name[PATH_MAX];
+    if (builtin != NULL)
+        snprintf(name, sizeof(name), "%s", builtin->payload_name);
+    else if (user_folder)
+        snprintf(name, sizeof(name), "%s", strrchr(root->capture_path, '/') + 1);
+    else
+        settings_name_from_path(relative, name, sizeof(name));
+    if (payload_name_make_portable(name) != 0)
+        snprintf(name, sizeof(name), "%s", mr->id);
+
+    int n = user_folder
+        ? snprintf(out, out_size, "%s", name)
+        : snprintf(out, out_size, BACKUP_PLAN_SETTINGS_DIR "/%s", name);
+    return n < 0 || (size_t)n >= out_size ? -1 : 0;
+}
+
+// exFAT, FAT, and NTFS do not tell names apart by case. Only ASCII is folded
+// here; the portable prescan measures other letters on the drive itself.
+static int payload_paths_clash(const char *a, const char *b)
+{
+    for (;; a++, b++)
+    {
+        if (ascii_lower(*a) != ascii_lower(*b))
+            return 0;
+        if (*a == '\0')
+            return 1;
+    }
+}
+
+static int payload_path_taken(const char *path, const BackupPlanRoot *roots,
+                              size_t count, size_t stride)
+{
+    if (strchr(path, '/') == NULL &&
+        payload_paths_clash(path, BACKUP_PLAN_SETTINGS_DIR))
+        return 1;
+    for (size_t i = 0; i < count; i++)
+    {
+        const BackupPlanRoot *root = (const BackupPlanRoot *)
+            ((const char *)roots + i * stride);
+        if (payload_paths_clash(path, root->manifest_root.payload_path))
+            return 1;
+    }
+    return 0;
+}
+
+// Names each root's folder under data/ in plan order; a name already taken
+// gets "-2", "-3", and so on. The roots lie stride bytes apart, as qsort()
+// takes them, so a SelectionPlan's roots are named in place too.
+static int assign_payload_paths(const char *home, BackupPlanRoot *roots,
+                                size_t count, size_t stride)
+{
+    for (size_t i = 0; i < count; i++)
+    {
+        BackupPlanRoot *root = (BackupPlanRoot *)((char *)roots + i * stride);
+        char *path = root->manifest_root.payload_path;
+        char base[PATH_MAX];
+        if (payload_path_base(home, root, base, sizeof(base)) != 0)
+            return -1;
+        snprintf(path, PATH_MAX, "%s", base);
+        for (size_t suffix = 2; payload_path_taken(path, roots, i, stride);
+             suffix++)
+        {
+            int n = snprintf(path, PATH_MAX, "%s-%zu", base, suffix);
+            if (n < 0 || n >= PATH_MAX)
+                return -1;
+        }
+    }
+    return 0;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -759,6 +906,13 @@ int backup_plan_build(const char *home, BackupMode mode,
 
     if (rc == 0)
         rc = validate_no_duplicates_or_overlap(rb.items, rb.count);
+    if (rc == 0 && rb.count > 0 &&
+        assign_payload_paths(home_real, rb.items, (size_t)rb.count,
+                             sizeof(*rb.items)) != 0)
+    {
+        print_error("Error: could not name the backup's folders\n");
+        rc = -1;
+    }
 
     if (rc != 0)
     {
@@ -1546,7 +1700,7 @@ int selection_plan_build(const char *home, BackupMode mode,
         if (rc == 1) continue;
         if (lstat(normalized, &st) < 0 || !root_type_allowed(st.st_mode) ||
             !selection_root_readable(normalized, st.st_mode)) goto fail;
-        if (append_root(&rb, "", ROOT_POLICY_MANUAL_NATIVE, "", normalized, NULL, 0,
+        if (append_root(&rb, "", ROOT_POLICY_MANUAL_NATIVE, normalized, NULL, 0,
                         normalized, BACKUP_ROOT_EXPLICIT) < 0) goto fail;
     }
     for (int i = 0; i < rb.count; i++) selection_set_mapping(plan.home, &rb.items[i]);
@@ -1580,15 +1734,16 @@ int selection_plan_build(const char *home, BackupMode mode,
         root->parent = parent;
         root->xdg_aliases = aliases;
         if (!root->root.manifest_root.id[0])
-        {
             snprintf(root->root.manifest_root.id, sizeof(root->root.manifest_root.id),
                      "CONFIG_%zu", configured++);
-            strcpy(root->root.manifest_root.payload_path, root->root.manifest_root.id);
-        }
         if (parent >= 0 && selection_paths_add(&plan.roots[parent].delegated,
             root_relative(plan.roots[parent].root.capture_path, candidate->capture_path)) < 0) goto fail;
     }
     if (plan.root_count > MANIFEST_MAX_ROOTS) { error = "too many compiled roots"; goto fail; }
+    error = "could not name the backup's folders";
+    if (plan.root_count != 0 &&
+        assign_payload_paths(plan.home, &plan.roots[0].root, plan.root_count,
+                             sizeof(*plan.roots)) != 0) goto fail;
     for (size_t i = 0; i < plan.excludes.count; i++)
     {
         int owner = -1;

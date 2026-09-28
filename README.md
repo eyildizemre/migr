@@ -380,11 +380,16 @@ migr-<user>/
 ├── migr                   # with --include-self
 ├── logs/                  # logs of backups that ended with status 1 or 2
 └── data/                  # your files
+    ├── Documents/         # your own folders, named as in your home
+    ├── Pictures/
+    └── settings/          # everything else: config, ssh, bashrc, firefox, ...
 ```
 
-`data/` holds one folder per backed-up item, such as `XDG_DOCUMENTS_DIR` or
-`BUILTIN_DOT_SSH`, and `manifest.txt` records where each came from. On a Linux
-filesystem each is a plain copy with its owners, permissions, times, extended
+`data/` holds one folder per backed-up item, and `manifest.txt` records where
+each came from. Your own folders keep their names, localized ones included
+(`Belgeler` on a Turkish system); hidden items such as `~/.config` or
+`~/.ssh` go in `settings/` without their leading dot. Two items with the same
+name get `-2`, `-3`, and so on. On a Linux filesystem each is a plain copy with its owners, permissions, times, extended
 attributes, and hardlinks, which you can copy back without migr (`cp -a`). On
 exFAT, FAT32, or NTFS, names are percent-encoded where the drive would reject
 them and the files carry no Linux metadata; `sidecar.migr` holds the true names

@@ -20,7 +20,7 @@
 //
 // A final group checks the orchestration contract the entry point enforces: a
 // NULL, wrong-direction, or portable context is refused, never silently cloned,
-// and neither is a destination leaf that is not a single safe component.
+// and neither is a destination path with an empty, ".", or ".." component.
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -1173,13 +1173,26 @@ int main(void)
     check(backup_capture_at(&ctx, src_file, -1, "refused") == -1,
           "an invalid destination fd is refused");
 
-    static const char *const unsafe_leaves[] = { "", ".", "..", "a/b", "/abs", NULL };
+    static const char *const unsafe_leaves[] = {
+        "", ".", "..", "/abs", "a/../b", "a//b", "a/", NULL
+    };
     int all_unsafe_refused = 1;
     for (int i = 0; unsafe_leaves[i] != NULL; i++)
         if (backup_capture_at(&ctx, src_file, dest_fd, unsafe_leaves[i]) != -1)
             all_unsafe_refused = 0;
     check(all_unsafe_refused && backup_capture_at(&ctx, src_file, dest_fd, NULL) == -1,
-          "a destination leaf that is not a single safe component is refused");
+          "a destination path with an empty, \".\", or \"..\" component is refused");
+
+    check(backup_capture_at(&ctx, src_file, dest_fd, "group/leaf") == 0 &&
+          fstatat(dest_fd, "group/leaf", &st, AT_SYMLINK_NOFOLLOW) == 0 &&
+          S_ISREG(st.st_mode),
+          "a destination path in a folder is captured, the folder created");
+    char outside_leaf[PATH_MAX];
+    check(symlinkat(outside_dir, dest_fd, "linked") == 0 &&
+          backup_capture_at(&ctx, src_file, dest_fd, "linked/leaf") == -1 &&
+          path_join(outside_leaf, sizeof(outside_leaf), outside_dir, "leaf") == 0 &&
+          lstat(outside_leaf, &st) == -1,
+          "a symlink in place of that folder is refused, not descended through");
 
     char refused_path[PATH_MAX];
     check(path_join(refused_path, sizeof(refused_path), dest_dir, "refused") == 0 &&

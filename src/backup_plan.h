@@ -8,6 +8,12 @@
 #include "manifest.h" /* ManifestRoot, ManifestScope */
 
 /**
+ * @brief The folder of data/ that holds every root other than the user's own
+ * folders (docs/DECISIONS.md D82).
+ */
+#define BACKUP_PLAN_SETTINGS_DIR "settings"
+
+/**
  * @brief Presentation/current-execution grouping for a planned root.
  *
  * Purely about which heading a root is listed under in backup output. It

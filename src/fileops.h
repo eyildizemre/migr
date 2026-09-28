@@ -95,6 +95,14 @@ typedef enum {
 int fileops_remove_tree_at(int root_fd, const char *rel_path);
 
 /**
+ * @brief Creates the folders above rel_path's last component beneath
+ * root_fd, keeping those that exist and following no symlink on the way.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int fileops_make_parents_at(int root_fd, const char *rel_path);
+
+/**
  * @brief Removes destination entries absent from a completed native capture.
  *
  * The caller must invoke this only after every root in the capture walk has
@@ -260,16 +268,18 @@ void backup_test_fail_next_source_open(int error);
  *
  * @param ctx                 Clone orientation and representation; must not be NULL.
  * @param source_path         Path to the source file, directory, or symlink.
- * @param destination_root_fd Open directory fd anchoring destination_leaf; never closed here.
- * @param destination_leaf    Exactly one path component to create beneath it; a name
- *                            containing '/', or "." or "..", is refused.
+ * @param destination_root_fd Open directory fd anchoring destination_path; never closed here.
+ * @param destination_path    Where to create it beneath that fd: one path component, or
+ *                            several when the payload sits in a folder of data/
+ *                            (docs/DECISIONS.md D82), which is created as needed. An
+ *                            empty component, ".", or ".." is refused.
  * @return BACKUP_CAPTURE_OK on success, BACKUP_CAPTURE_ERROR on an ordinary
  *         failure, or BACKUP_CAPTURE_SOURCE_SAFE_READ when O_NOATIME access
  *         was refused.
  */
 BackupCaptureStatus backup_capture_at_report(
     const CloneContext *ctx, const char *source_path,
-    int destination_root_fd, const char *destination_leaf,
+    int destination_root_fd, const char *destination_path,
     BackupCaptureReport *report);
 
 /**
@@ -280,7 +290,7 @@ BackupCaptureStatus backup_capture_at_report(
  */
 BackupCaptureStatus backup_capture_at_report_continue(
     const CloneContext *ctx, const char *source_path,
-    int destination_root_fd, const char *destination_leaf,
+    int destination_root_fd, const char *destination_path,
     BackupCaptureReport *report);
 
 /**

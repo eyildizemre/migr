@@ -484,8 +484,8 @@ test_dry_run() {
     # The preview must name the payload addresses the live run would use, and
     # must not invent a container name: the "-N" suffix is only settled when a
     # container is actually claimed.
-    assert_contains "$output" "data/XDG_DOCUMENTS_DIR"
-    assert_contains "$output" "data/BUILTIN_DOT_BASHRC"
+    assert_contains "$output" "data/Documents"
+    assert_contains "$output" "data/settings/bashrc"
     assert_contains "$output" "Would write manifest.txt"
     if [[ "$output" == *".partial"* ]]; then
         echo -e "  ${RED}✗${NC} Dry run named a specific container it cannot know yet"
@@ -661,19 +661,19 @@ test_backup() {
     assert_no_partial "$BACKUP_DIR"
 
     # Every captured object is addressed by its manifest root id under data/.
-    assert_file_exists "$actual_backup/data/XDG_DOCUMENTS_DIR/note.txt"
-    assert_file_exists "$actual_backup/data/XDG_DESKTOP_DIR/keep.txt"
-    assert_file_exists "$actual_backup/data/BUILTIN_DOT_SSH/config"
-    assert_file_exists "$actual_backup/data/BUILTIN_DOT_BASHRC"
-    assert_file_exists "$actual_backup/data/BUILTIN_DOT_BASH_PROFILE"
-    assert_file_exists "$actual_backup/data/BUILTIN_DOT_ZSHRC"
-    assert_file_exists "$actual_backup/data/BUILTIN_DOT_TMUX_CONF"
-    assert_file_exists "$actual_backup/data/BUILTIN_DOT_CONFIG/some-marker-file"
-    assert_file_exists "$actual_backup/data/BUILTIN_LOCAL_SHARE/some-marker-file"
-    assert_file_exists "$actual_backup/data/BUILTIN_LOCAL_STATE/some-marker-file"
-    assert_file_exists "$actual_backup/data/BUILTIN_LOCAL_BIN/some-marker-tool"
+    assert_file_exists "$actual_backup/data/Documents/note.txt"
+    assert_file_exists "$actual_backup/data/Desktop/keep.txt"
+    assert_file_exists "$actual_backup/data/settings/ssh/config"
+    assert_file_exists "$actual_backup/data/settings/bashrc"
+    assert_file_exists "$actual_backup/data/settings/bash-profile"
+    assert_file_exists "$actual_backup/data/settings/zshrc"
+    assert_file_exists "$actual_backup/data/settings/tmux-conf"
+    assert_file_exists "$actual_backup/data/settings/config/some-marker-file"
+    assert_file_exists "$actual_backup/data/settings/local-share/some-marker-file"
+    assert_file_exists "$actual_backup/data/settings/local-state/some-marker-file"
+    assert_file_exists "$actual_backup/data/settings/local-bin/some-marker-tool"
 
-    if [ -p "$actual_backup/data/XDG_DOCUMENTS_DIR/events.fifo" ]; then
+    if [ -p "$actual_backup/data/Documents/events.fifo" ]; then
         echo -e "  ${GREEN}✓${NC} FIFO preserved as a FIFO."
     else
         echo -e "  ${RED}✗${NC} FIFO not copied as a FIFO"
@@ -681,7 +681,7 @@ test_backup() {
     fi
 
     # verify symlink was faithfully copied as a symlink, not a regular file
-    if [ -L "$actual_backup/data/XDG_DOCUMENTS_DIR/shortcut" ]; then
+    if [ -L "$actual_backup/data/Documents/shortcut" ]; then
         echo -e "  ${GREEN}✓${NC} Symlink preserved."
     else
         echo -e "  ${RED}✗${NC} Symlink not copied as symlink"
@@ -690,8 +690,8 @@ test_backup() {
 
     # the absolute symlink must actually have been copied — otherwise the source-mode
     # check below passes vacuously (nothing was there to mutate the target through)
-    if [ -L "$actual_backup/data/XDG_DOCUMENTS_DIR/cfg-link" ] && \
-       [ "$(readlink "$actual_backup/data/XDG_DOCUMENTS_DIR/cfg-link")" = "$HOME/.ssh/config" ]; then
+    if [ -L "$actual_backup/data/Documents/cfg-link" ] && \
+       [ "$(readlink "$actual_backup/data/Documents/cfg-link")" = "$HOME/.ssh/config" ]; then
         echo -e "  ${GREEN}✓${NC} Absolute symlink copied with target intact."
     else
         echo -e "  ${RED}✗${NC} cfg-link not copied as a symlink to $HOME/.ssh/config"
@@ -711,16 +711,16 @@ test_backup() {
 
     # Firefox remains independent, while Chromium-family data is owned by the
     # broader persistent .config root and must not be duplicated.
-    assert_file_exists "$actual_backup/data/BUILTIN_BROWSER_MOZILLA/firefox/profile/places.sqlite"
-    assert_file_exists "$actual_backup/data/BUILTIN_DOT_CONFIG/google-chrome/Default/Preferences"
-    if [ -e "$actual_backup/data/BUILTIN_BROWSER_GOOGLE_CHROME" ]; then
+    assert_file_exists "$actual_backup/data/settings/firefox/firefox/profile/places.sqlite"
+    assert_file_exists "$actual_backup/data/settings/config/google-chrome/Default/Preferences"
+    if [ -e "$actual_backup/data/settings/google-chrome" ]; then
         echo -e "  ${RED}✗${NC} Chrome was copied a second time as a separate root"
         exit 1
     else
         echo -e "  ${GREEN}✓${NC} Chrome is captured once through the .config owner."
     fi
 
-    if [ -e "$actual_backup/data/BUILTIN_PROJECTS" ]; then
+    if [ -e "$actual_backup/data/Projects" ]; then
         echo -e "  ${RED}✗${NC} Projects should not be a built-in backup root"
         exit 1
     else
@@ -794,8 +794,8 @@ test_shell_history_consent() {
     assert_contains "$output" "Backup complete"
     local actual_backup
     actual_backup=$(sole_final_container "$accept_target")
-    assert_file_exists "$actual_backup/data/BUILTIN_DOT_BASH_HISTORY"
-    assert_file_exists "$actual_backup/data/BUILTIN_DOT_ZSH_HISTORY"
+    assert_file_exists "$actual_backup/data/settings/bash-history"
+    assert_file_exists "$actual_backup/data/settings/zsh-history"
 }
 
 test_restore() {
@@ -1049,10 +1049,10 @@ test_comprehensive() {
     actual_backup=$(sole_final_container "$comp_backup")
 
     # Desktop is already critical; Videos and Music distinguish comprehensive.
-    assert_file_exists "$actual_backup/data/XDG_DESKTOP_DIR"
-    assert_file_exists "$actual_backup/data/XDG_VIDEOS_DIR/clip.txt"
-    assert_file_exists "$actual_backup/data/XDG_MUSIC_DIR/song.txt"
-    assert_file_exists "$actual_backup/data/XDG_DOCUMENTS_DIR"
+    assert_file_exists "$actual_backup/data/Desktop"
+    assert_file_exists "$actual_backup/data/Videos/clip.txt"
+    assert_file_exists "$actual_backup/data/Music/song.txt"
+    assert_file_exists "$actual_backup/data/Documents"
 }
 
 test_explicit_paths() {
@@ -1070,10 +1070,10 @@ test_explicit_paths() {
     actual_backup=$(sole_final_container "$paths_backup")
 
     # the one requested root, under its ordinal identity
-    assert_file_exists "$actual_backup/data/EXPLICIT_0/note.txt"
+    assert_file_exists "$actual_backup/data/Documents/note.txt"
 
     # dotfiles must be absent — explicit-paths mode makes no assumptions
-    if [ -e "$actual_backup/data/BUILTIN_DOT_BASHRC" ]; then
+    if [ -e "$actual_backup/data/settings/bashrc" ]; then
         echo -e "  ${RED}✗${NC} .bashrc should not be in an explicit-paths backup"
         exit 1
     else
@@ -1112,9 +1112,8 @@ test_explicit_paths() {
 
     local trailing_actual
     trailing_actual=$(sole_final_container "$trailing_backup")
-    # ids follow the sorted normalized paths, so dir_a's file is EXPLICIT_0
-    if [ "$(cat "$trailing_actual/data/EXPLICIT_0")" = "A" ] && \
-       [ "$(cat "$trailing_actual/data/EXPLICIT_1/same.txt")" = "B" ]; then
+    if [ "$(cat "$trailing_actual/data/same.txt")" = "A" ] && \
+       [ "$(cat "$trailing_actual/data/dir_b/same.txt")" = "B" ]; then
         echo -e "  ${GREEN}✓${NC} Trailing slash preserved both explicit items."
     else
         echo -e "  ${RED}✗${NC} Trailing slash caused explicit items to overwrite or merge."
@@ -1130,9 +1129,9 @@ test_explicit_paths() {
 
     local samename_actual
     samename_actual=$(sole_final_container "$samename_backup")
-    if [ "$(cat "$samename_actual/data/EXPLICIT_0")" = "A" ] && \
-       [ "$(cat "$samename_actual/data/EXPLICIT_1")" = "B" ]; then
-        echo -e "  ${GREEN}✓${NC} Same-basename explicit roots are kept apart as EXPLICIT_0/1."
+    if [ "$(cat "$samename_actual/data/same.txt")" = "A" ] && \
+       [ "$(cat "$samename_actual/data/same.txt-2")" = "B" ]; then
+        echo -e "  ${GREEN}✓${NC} Same-basename explicit roots are kept apart as same.txt and same.txt-2."
     else
         echo -e "  ${RED}✗${NC} Same-basename explicit roots collided"
         exit 1
@@ -1314,6 +1313,7 @@ test_truncation() {
     src="$TEST_DIR/$leaf"
     echo hi > "$src"
 
+    # A name this long leaves no room for a suffix, so its folder takes the id.
     deep_out=$("$MIGR" backup "$deep" "$src" 2>&1)
     if [[ "$deep_out" == *"Backup complete"* ]] && \
        [ "$(cat "$(sole_final_container "$deep")/data/EXPLICIT_0")" = "hi" ]; then
@@ -1834,7 +1834,7 @@ test_native_stale_reconciliation() {
     local sr_partial
     sr_partial=$(containers_matching "$sr_dest" partial)
     if [ "$sr_first_rc" -eq 0 ] || [ "$sr_race_status" -ne 0 ] ||
-       [ -z "$sr_partial" ] || [ ! -f "$sr_partial/data/EXPLICIT_0/gone.txt" ]; then
+       [ -z "$sr_partial" ] || [ ! -f "$sr_partial/data/cp_stale_reconcile_a_keep/gone.txt" ]; then
         echo -e "  ${RED}✗${NC} Reconciliation fixture did not produce a partial containing the keep root"
         echo "  exit=$sr_first_rc race=$sr_race_status output: $sr_first_out"
         return 1
@@ -1846,9 +1846,9 @@ test_native_stale_reconciliation() {
     sr_second_out=$("$MIGR" backup "$sr_dest" "$sr_keep" "$sr_broken" 2>&1)
     sr_final=$(sole_final_container "$sr_dest")
     assert_no_partial "$sr_dest"
-    if [ ! -e "$sr_final/data/EXPLICIT_0/gone.txt" ] &&
-       [ "$(cat "$sr_final/data/EXPLICIT_0/keeps.txt")" = "stays-forever" ] &&
-       [ "$(cat "$sr_final/data/EXPLICIT_1/locked.txt")" = "locked" ]; then
+    if [ ! -e "$sr_final/data/cp_stale_reconcile_a_keep/gone.txt" ] &&
+       [ "$(cat "$sr_final/data/cp_stale_reconcile_a_keep/keeps.txt")" = "stays-forever" ] &&
+       [ "$(cat "$sr_final/data/cp_stale_reconcile_b_broken/locked.txt")" = "locked" ]; then
         echo -e "  ${GREEN}✓${NC} A disappeared source file is removed from the resumed final backup."
     else
         echo -e "  ${RED}✗${NC} Stale reconciliation removed the wrong thing, or not the right one"
@@ -1887,7 +1887,7 @@ test_native_stale_reconciliation() {
     local sg_partial
     sg_partial=$(containers_matching "$sg_dest" partial)
     if [ "$sg_first_rc" -eq 0 ] || [ "$sg_first_race" -ne 0 ] ||
-       [ -z "$sg_partial" ] || [ ! -f "$sg_partial/data/EXPLICIT_0/gone.txt" ]; then
+       [ -z "$sg_partial" ] || [ ! -f "$sg_partial/data/cp_stale_reconcile_gate_a_keep/gone.txt" ]; then
         echo -e "  ${RED}✗${NC} Global reconciliation gate fixture did not produce its first partial"
         return 1
     fi
@@ -1915,7 +1915,7 @@ test_native_stale_reconciliation() {
     sg_partial=$(containers_matching "$sg_dest" partial)
     if [ "$sg_second_rc" -ne 0 ] && [ "$sg_second_race" -eq 0 ] &&
        [ -z "$(containers_matching "$sg_dest" final)" ] &&
-       [ -f "$sg_partial/data/EXPLICIT_0/gone.txt" ]; then
+       [ -f "$sg_partial/data/cp_stale_reconcile_gate_a_keep/gone.txt" ]; then
         echo -e "  ${GREEN}✓${NC} An incomplete walk leaves stale payload untouched and blocks finalization."
     else
         echo -e "  ${RED}✗${NC} An incomplete walk authorized stale deletion"
@@ -1990,7 +1990,7 @@ test_container_production() {
     link_final=$(containers_matching "$link_real" final)
     link_final_count=$(printf '%s' "$link_final" | grep -c . || true)
     if [ "$link_rc" -eq 0 ] && [ "$link_final_count" -eq 1 ] &&
-       [ "$(cat "$link_real"/migr-*/data/EXPLICIT_0/file.txt)" = "symlink-target" ] &&
+       [ "$(cat "$link_real"/migr-*/data/cp_fix_verify_src/file.txt)" = "symlink-target" ] &&
        [[ "$link_out" == *"Backup complete"* ]]; then
         echo -e "  ${GREEN}✓${NC} A destination final symlink is followed for a valid backup."
     else
@@ -2056,8 +2056,8 @@ test_container_production() {
         resumed=$(sole_final_container "$resume_dest")
         assert_no_partial "$resume_dest"
         assert_contains "$second_out" "Resuming an interrupted backup"
-        if [ "$(cat "$resumed/data/EXPLICIT_0/good.txt")" = "readable" ] &&
-           [ "$(cat "$resumed/data/EXPLICIT_0/locked.txt")" = "locked" ]; then
+        if [ "$(cat "$resumed/data/resume_root/good.txt")" = "readable" ] &&
+           [ "$(cat "$resumed/data/resume_root/locked.txt")" = "locked" ]; then
             echo -e "  ${GREEN}✓${NC} The rerun adopted that partial and finalized it with the full payload."
         else
             echo -e "  ${RED}✗${NC} Resumed container is missing payload"
@@ -2262,7 +2262,7 @@ test_container_production() {
     local ext_actual
     ext_actual=$(sole_final_container "$ext_dest")
     if grep -q "^ROOT ID=EXPLICIT_1 POLICY=MANUAL_NATIVE " "$ext_actual/manifest.txt" &&
-       [ "$(cat "$ext_actual/data/EXPLICIT_1/data.txt")" = "external" ]; then
+       [ "$(cat "$ext_actual/data/outside_home/data.txt")" = "external" ]; then
         echo -e "  ${GREEN}✓${NC} An external root is captured under data/ as MANUAL_NATIVE."
     else
         echo -e "  ${RED}✗${NC} External root not captured as MANUAL_NATIVE"
@@ -2359,7 +2359,7 @@ test_portable_vfat_dispatch() {
     assert_contains "$output" "Backup complete"
 
     local capture_verbose_count
-    capture_verbose_count=$(grep -F -c "  Capturing: $HOME/Documents -> data/XDG_DOCUMENTS_DIR" <<<"$output" || true)
+    capture_verbose_count=$(grep -F -c "  Capturing: $HOME/Documents -> data/Documents" <<<"$output" || true)
     if [ "$capture_verbose_count" -eq 1 ]; then
         echo -e "  ${GREEN}✓${NC} Portable capture reports the root once, not once per file."
     else
@@ -2604,7 +2604,7 @@ test_btrfs_snapshot_capture() {
 
     local container nested_copy leftovers
     container=$(containers_matching "$dest" final | head -n 1)
-    nested_copy="$container/data/EXPLICIT_0/nested/file.txt"
+    nested_copy="$container/data/Documents/nested/file.txt"
     leftovers=$(find "$mount_point/home" -maxdepth 1 -name '.migr-snapshot-*' | wc -l)
     if [ "$rc" -eq 0 ] &&
        [[ "$output" == *"Backing up $mount_point/home from a read-only snapshot."* ]] &&

@@ -60,6 +60,24 @@ static int destination_leaf_is_safe(const char *leaf)
            strcmp(leaf, "..") != 0;
 }
 
+// A root's payload may sit in a folder of data/ (docs/DECISIONS.md D82), so
+// the capture entry point takes a relative path of such leaves.
+static int destination_path_is_safe(const char *path)
+{
+    if (path == NULL || strnlen(path, PATH_MAX) >= PATH_MAX)
+        return 0;
+    char copy[PATH_MAX];
+    strcpy(copy, path);
+    char *leaf = copy;
+    for (char *slash; (slash = strchr(leaf, '/')) != NULL; leaf = slash + 1)
+    {
+        *slash = '\0';
+        if (!destination_leaf_is_safe(leaf))
+            return 0;
+    }
+    return destination_leaf_is_safe(leaf);
+}
+
 static void capture_report_source_refusal(BackupCaptureReport *report,
                                           const char *source_path)
 {
@@ -1932,20 +1950,24 @@ int backup_capture_report_tick(BackupCaptureReport *report,
     return 0;
 }
 
+static int native_open_relative_parent(int root_fd, const char *rel_path,
+                                       int *parent_out, char *leaf_out,
+                                       size_t leaf_size);
+
 BackupCaptureStatus backup_capture_at_report(
     const CloneContext *ctx, const char *source_path,
-    int destination_root_fd, const char *destination_leaf,
+    int destination_root_fd, const char *destination_path,
     BackupCaptureReport *report)
 {
     backup_capture_report_init(report);
     return backup_capture_at_report_continue(ctx, source_path,
                                              destination_root_fd,
-                                             destination_leaf, report);
+                                             destination_path, report);
 }
 
 BackupCaptureStatus backup_capture_at_report_continue(
     const CloneContext *ctx, const char *source_path,
-    int destination_root_fd, const char *destination_leaf,
+    int destination_root_fd, const char *destination_path,
     BackupCaptureReport *report)
 {
     // Fail closed on a mis-dispatched context rather than running a native clone blindly:
@@ -1955,11 +1977,20 @@ BackupCaptureStatus backup_capture_at_report_continue(
         ctx->representation != CLONE_NATIVE_TREE)
         return BACKUP_CAPTURE_ERROR;
     if (source_path == NULL || destination_root_fd < 0 ||
-        !destination_leaf_is_safe(destination_leaf))
+        !destination_path_is_safe(destination_path))
         return BACKUP_CAPTURE_ERROR;
 
-    return capture_entry_at(ctx, source_path, destination_root_fd,
-                            destination_leaf, destination_leaf, "", report);
+    int parent_fd;
+    char leaf[NAME_MAX + 1U];
+    if (fileops_make_parents_at(destination_root_fd, destination_path) != 0 ||
+        native_open_relative_parent(destination_root_fd, destination_path,
+                                    &parent_fd, leaf, sizeof(leaf)) != 0)
+        return BACKUP_CAPTURE_ERROR;
+    BackupCaptureStatus status = capture_entry_at(
+        ctx, source_path, parent_fd, leaf, destination_path, "", report);
+    if (close(parent_fd) != 0 && status == BACKUP_CAPTURE_OK)
+        status = BACKUP_CAPTURE_ERROR;
+    return status;
 }
 
 BackupCaptureStatus backup_capture_at(const CloneContext *ctx,
@@ -2218,6 +2249,34 @@ int fileops_remove_tree_at(int root_fd, const char *rel_path)
     return result;
 }
 
+int fileops_make_parents_at(int root_fd, const char *rel_path)
+{
+    if (root_fd < 0 || rel_path == NULL ||
+        strnlen(rel_path, PATH_MAX) >= PATH_MAX)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    char copy[PATH_MAX];
+    strcpy(copy, rel_path);
+    int current = fcntl(root_fd, F_DUPFD_CLOEXEC, 0);
+    char *cursor = copy;
+    for (char *slash; current >= 0 && (slash = strchr(cursor, '/')) != NULL;
+         cursor = slash + 1)
+    {
+        *slash = '\0';
+        int next = -1;
+        if (mkdirat(current, cursor, 0700) == 0 || errno == EEXIST)
+            next = openat(current, cursor,
+                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        int saved = errno;
+        close(current);
+        errno = saved;
+        current = next;
+    }
+    return current < 0 ? -1 : close(current);
+}
+
 void native_reconcile_report_init(NativeReconcileReport *report)
 {
     if (report == NULL)
@@ -2225,25 +2284,22 @@ void native_reconcile_report_init(NativeReconcileReport *report)
     memset(report, 0, sizeof(*report));
 }
 
-NativeReconcileStatus native_reconcile_stale_at(const void *visited,
-                                                const char *root_key,
-                                                int data_fd,
-                                                NativeReconcileReport *report)
+// root_key names the root in the visited set; its payload is leaf beneath
+// parent_fd.
+static NativeReconcileStatus native_reconcile_root_at(
+    const void *visited, const char *root_key, int parent_fd,
+    const char *leaf, NativeReconcileReport *report)
 {
-    native_reconcile_report_init(report);
-    if (visited == NULL || root_key == NULL || data_fd < 0)
-        return NATIVE_RECONCILE_ERROR;
-
     int root_visited = native_visited_contains(visited, root_key, "");
     if (root_visited < 0)
         return NATIVE_RECONCILE_ERROR;
 
     struct stat root_st;
-    if (fstatat(data_fd, root_key, &root_st, AT_SYMLINK_NOFOLLOW) != 0)
+    if (fstatat(parent_fd, leaf, &root_st, AT_SYMLINK_NOFOLLOW) != 0)
         return errno == ENOENT ? NATIVE_RECONCILE_OK : NATIVE_RECONCILE_ERROR;
     if (root_visited == 0)
     {
-        if (native_remove_leaf(data_fd, root_key) == 0)
+        if (native_remove_leaf(parent_fd, leaf) == 0)
             return NATIVE_RECONCILE_OK;
         if (report != NULL)
             (void)snprintf(report->failed_relative_path,
@@ -2254,7 +2310,7 @@ NativeReconcileStatus native_reconcile_stale_at(const void *visited,
     if (!S_ISDIR(root_st.st_mode))
         return NATIVE_RECONCILE_OK;
 
-    int root_fd = openat(data_fd, root_key,
+    int root_fd = openat(parent_fd, leaf,
                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (root_fd < 0)
         return NATIVE_RECONCILE_ERROR;
@@ -2339,6 +2395,27 @@ NativeReconcileStatus native_reconcile_stale_at(const void *visited,
     if (futimens(root_fd, times) != 0)
         result = NATIVE_RECONCILE_ERROR;
     if (close(root_fd) != 0)
+        result = NATIVE_RECONCILE_ERROR;
+    return result;
+}
+
+NativeReconcileStatus native_reconcile_stale_at(const void *visited,
+                                                const char *root_key,
+                                                int data_fd,
+                                                NativeReconcileReport *report)
+{
+    native_reconcile_report_init(report);
+    if (visited == NULL || root_key == NULL || data_fd < 0)
+        return NATIVE_RECONCILE_ERROR;
+
+    int parent_fd;
+    char leaf[NAME_MAX + 1U];
+    if (native_open_relative_parent(data_fd, root_key, &parent_fd, leaf,
+                                    sizeof(leaf)) != 0)
+        return errno == ENOENT ? NATIVE_RECONCILE_OK : NATIVE_RECONCILE_ERROR;
+    NativeReconcileStatus result = native_reconcile_root_at(
+        visited, root_key, parent_fd, leaf, report);
+    if (close(parent_fd) != 0)
         result = NATIVE_RECONCILE_ERROR;
     return result;
 }

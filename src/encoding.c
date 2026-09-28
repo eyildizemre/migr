@@ -187,6 +187,27 @@ static int append_percent_escape(unsigned char byte, char *out, size_t *offset,
     return 0;
 }
 
+int encoding_utf8_valid(const char *text)
+{
+    if (text == NULL)
+        return 0;
+    size_t length = strlen(text);
+    for (size_t i = 0; i < length; )
+    {
+        if ((unsigned char)text[i] < 0x80)
+        {
+            i++;
+            continue;
+        }
+        size_t sequence_length = utf8_valid_sequence_len(
+            (const unsigned char *)text + i, length - i);
+        if (sequence_length == 0)
+            return 0;
+        i += sequence_length;
+    }
+    return 1;
+}
+
 static int component_percent_encode(const char *raw, char *out,
                                      size_t out_size)
 {

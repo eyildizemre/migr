@@ -182,16 +182,17 @@ int selection_plan_validate(const SelectionPlan *plan)
             strnlen(mr->id, sizeof(mr->id)) == sizeof(mr->id) ||
             strnlen(mr->payload_path, sizeof(mr->payload_path)) == sizeof(mr->payload_path) ||
             *source != '/' || !canonical_relative(source + 1) ||
-            !mr->id[0] || strcmp(mr->id, mr->payload_path) ||
-            !canonical_relative(mr->payload_path) || strchr(mr->payload_path, '/') ||
+            !mr->id[0] || !mr->payload_path[0] || !canonical_relative(mr->payload_path) ||
             !valid_paths(&root->excluded, 0) || !valid_paths(&root->delegated, 0) ||
             excluded_path(&plan->excludes, source)) return -1;
         int parent = -1;
         for (size_t j = 0; j < i; j++)
         {
             const SelectionRoot *earlier = &plan->roots[j];
+            const char *payload = earlier->root.manifest_root.payload_path;
             if (strcmp(earlier->root.capture_path, source) >= 0 ||
-                !strcmp(earlier->root.manifest_root.payload_path, mr->payload_path)) return -1;
+                selection_path_covers(payload, mr->payload_path) ||
+                selection_path_covers(mr->payload_path, payload)) return -1;
             if (selection_path_covers(earlier->root.capture_path, source)) parent = (int)j;
         }
         if (root->parent != parent) return -1;

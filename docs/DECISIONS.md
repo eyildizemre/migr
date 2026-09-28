@@ -4955,3 +4955,40 @@ describe the implementation, not the user's files.
 
 **Relationship:** Replaces the preflight warning of D20 E-11; its apply-time
 tolerance and summary count are unchanged.
+
+## D82 — 2026-09-28 — Payload folders carry names the user can read
+
+**Status:** Implemented
+
+**Decision:** A root's payload folder under `data/` is named for the user, not
+by its manifest id. The id stays the manifest key restore maps by; only
+`payload_path` changes.
+- **Own folders at the top:** a root whose path (relative to HOME inside it,
+  absolute outside it) has no component starting with `.` keeps the last
+  component of its source path as it is on disk: `Belgeler`, `Projects`,
+  `notes.txt`.
+- **Everything else in `settings/`:** a built-in root takes its name from a
+  column of `builtin_home_catalog` (`ssh`, `config`, `local-share`,
+  `firefox`, ...). Any other root drops each component's leading dots, turns
+  `/` and `_` into `-`, and lowercases ASCII (`.config/Code` becomes
+  `config-code`).
+- **Names every destination accepts:** root payload paths bypass D19's
+  encoding, so control characters and `"*:<>?\|` become `-` and a trailing
+  dot or space is dropped. A name that is not UTF-8, is left empty, or is too
+  long for a suffix falls back to the id.
+- **Collisions:** in plan order, a name already taken, compared without ASCII
+  case, gets `-2`, `-3`, and so on. A top-level folder never takes `settings`.
+  Other case pairs are left to the portable prescan (D21), which measures them
+  on the drive.
+- **Two components:** native capture and stale reconciliation now walk a
+  payload path to its parent without following symlinks, and create
+  `settings/` when needed; portable capture creates it the same way.
+
+**Why:** The ids (`XDG_DOCUMENTS_DIR`, `BUILTIN_DOT_SSH`) describe migr's
+catalog. Someone opening a backup without migr, which D15 keeps possible for
+native backups, looks for `Documents`.
+
+**Relationship:** Replaces D16's `data/EXPLICIT_n` and the plan's
+`payload_path == id` rule. A backup made before this is updated in place
+through D72: each root whose payload path changed is left out and captured
+again, so its first update copies everything once more.

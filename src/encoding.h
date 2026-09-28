@@ -25,4 +25,7 @@ int encoding_percent_encode(EncodingMode mode, const char *raw,
 int encoding_percent_decode(EncodingMode mode, const char *encoded,
                             char *out, size_t out_size);
 
+/** @brief Whether text is well-formed, shortest-form UTF-8. */
+int encoding_utf8_valid(const char *text);
+
 #endif

@@ -397,6 +397,13 @@ static void backup_give_to_invoker(int container_fd, int target_created)
     }
     if (dir != NULL)
         closedir(dir);
+    // The folder the capture made for non-user roots is migr's too (D82).
+    struct stat settings_st;
+    if (fstatat(container_fd, "data/" BACKUP_PLAN_SETTINGS_DIR, &settings_st,
+                AT_SYMLINK_NOFOLLOW) == 0 && S_ISDIR(settings_st.st_mode) &&
+        fchownat(container_fd, "data/" BACKUP_PLAN_SETTINGS_DIR, uid, gid,
+                 AT_SYMLINK_NOFOLLOW) != 0 && error == 0)
+        error = errno;
     if (error != 0)
         print_warning("Warning: could not give every part of the backup "
                       "container to the user who ran sudo: %s\n",

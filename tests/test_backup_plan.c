@@ -352,11 +352,103 @@ static void test_localized_xdg_uses_canonical_id(void)
     const BackupPlanRoot *r = find_root(&plan, "XDG_DOCUMENTS_DIR");
     check(r != NULL, "the localized directory is planned under the canonical XDG_DOCUMENTS_DIR id");
     if (r != NULL)
+    {
         check(strstr(r->capture_path, "/Belgeler") != NULL,
               "its capture_path points at the actual localized directory");
+        check(strcmp(r->manifest_root.payload_path, "Belgeler") == 0,
+              "its payload folder keeps the localized name");
+    }
 
     backup_plan_free(&plan);
     remove_tree(home);
+}
+
+static const BackupPlanRoot *find_root_at(const BackupPlan *plan,
+                                          const char *home,
+                                          const char *relative)
+{
+    char path[PATH_MAX];
+    join_path(path, sizeof(path), home, relative);
+    for (int i = 0; i < plan->root_count; i++)
+        if (strcmp(plan->roots[i].capture_path, path) == 0)
+            return &plan->roots[i];
+    return NULL;
+}
+
+static int payload_is(const BackupPlan *plan, const char *home,
+                      const char *relative, const char *expected)
+{
+    const BackupPlanRoot *root = find_root_at(plan, home, relative);
+    return root != NULL &&
+           strcmp(root->manifest_root.payload_path, expected) == 0;
+}
+
+static void test_payload_names(void)
+{
+    printf(BLUE "::" NC " model: payload folders carry names the user can read (D82)\n");
+
+    char home[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_home");
+    char path[PATH_MAX];
+    join_path(path, sizeof(path), home, "a");
+    mkdir_p(path);
+    join_path(path, sizeof(path), home, "b");
+    mkdir_p(path);
+    // The first four are folders, the rest files.
+    static const char *const roots[] = {
+        "Projects", "Settings", ".config/Code", "work/.hidden",
+        "a/same.txt", "b/same.txt", "Foo", "foo", "what?.", "bad\xff"
+    };
+    enum { ROOTS = sizeof(roots) / sizeof(roots[0]) };
+    char storage[ROOTS][PATH_MAX];
+    char *paths[ROOTS + 2];
+    for (int i = 0; i < ROOTS; i++)
+    {
+        join_path(storage[i], sizeof(storage[i]), home, roots[i]);
+        if (i < 4)
+            mkdir_p(storage[i]);
+        else
+            write_file(storage[i], "x");
+        paths[i] = storage[i];
+    }
+    char outside[PATH_MAX];
+    fresh_mkdtemp(outside, sizeof(outside), "plan_outside");
+    paths[ROOTS] = outside;
+    paths[ROOTS + 1] = NULL;
+
+    BackupPlan plan;
+    check(backup_plan_build(home, BACKUP_EXPLICIT_PATHS,
+                            (const char *const *)paths, &plan) == 0,
+          "plan builds");
+    check(payload_is(&plan, home, "Projects", "Projects"),
+          "a folder of the user's keeps its name at the top of data/");
+    check(payload_is(&plan, home, ".config/Code", "settings/config-code") &&
+              payload_is(&plan, home, "work/.hidden", "settings/work-hidden"),
+          "a path with a hidden component goes in settings/, lowercase and "
+          "without dots");
+    check(payload_is(&plan, home, "Settings", "Settings-2"),
+          "a user folder named like settings/ takes a suffix");
+    check(payload_is(&plan, home, "a/same.txt", "same.txt") &&
+              payload_is(&plan, home, "b/same.txt", "same.txt-2"),
+          "a second root of the same name takes -2");
+    check(payload_is(&plan, home, "Foo", "Foo") &&
+              payload_is(&plan, home, "foo", "foo-2"),
+          "names that differ only in case collide");
+    check(payload_is(&plan, home, "what?.", "what-"),
+          "characters FAT, exFAT, and NTFS refuse are replaced, a trailing "
+          "dot dropped");
+    const BackupPlanRoot *bad = find_root_at(&plan, home, "bad\xff");
+    check(bad != NULL &&
+              strcmp(bad->manifest_root.payload_path, bad->manifest_root.id) == 0,
+          "a name that is not UTF-8 falls back to the root's id");
+    check(plan.root_count > 0 &&
+              strcmp(plan.roots[plan.root_count - 1].manifest_root.payload_path,
+                     strrchr(outside, '/') + 1) == 0,
+          "a root outside HOME is named after its last component");
+
+    backup_plan_free(&plan);
+    remove_tree(home);
+    remove_tree(outside);
 }
 
 static void test_fixed_builtin_fields(void)
@@ -374,7 +466,7 @@ static void test_fixed_builtin_fields(void)
     if (r != NULL)
     {
         check(r->manifest_root.policy == ROOT_POLICY_HOME_RELATIVE, "policy is HOME_RELATIVE");
-        check(strcmp(r->manifest_root.payload_path, "BUILTIN_DOT_SSH") == 0, "payload_path is the fixed id");
+        check(strcmp(r->manifest_root.payload_path, "settings/ssh") == 0, "payload_path is settings/ and the catalog name");
         check(strcmp(r->manifest_root.restore_path, ".ssh") == 0, "restore_path is the home-relative address");
         check(r->manifest_root.has_restore_path == 1, "has_restore_path is set");
         check(r->group == BACKUP_ROOT_DOTFILE, "presentation group is DOTFILE");
@@ -385,8 +477,8 @@ static void test_fixed_builtin_fields(void)
     {
         check(r->manifest_root.policy == ROOT_POLICY_HOME_RELATIVE,
               ".local/share policy is HOME_RELATIVE");
-        check(strcmp(r->manifest_root.payload_path, "BUILTIN_LOCAL_SHARE") == 0,
-              ".local/share payload_path uses its fixed id");
+        check(strcmp(r->manifest_root.payload_path, "settings/local-share") == 0,
+              ".local/share payload_path uses its catalog name");
         check(strcmp(r->manifest_root.restore_path, ".local/share") == 0,
               ".local/share restore_path is home-relative");
         check(r->group == BACKUP_ROOT_DOTFILE,
@@ -2427,7 +2519,7 @@ static void test_native_backup_of_a_changing_source(void)
     int found = find_container_dir(target, container, sizeof(container));
     if (found)
         join_path(payload, sizeof(payload), container,
-                  "data/EXPLICIT_0/vanishing.txt");
+                  "data/work/vanishing.txt");
     check(rc == 1 && found && access(payload, F_OK) != 0 &&
               strstr(output, "Backup complete") != NULL &&
               strstr(output, "1 item removed before it could be read") !=
@@ -2457,7 +2549,7 @@ static void test_native_backup_of_a_changing_source(void)
     found = find_container_dir(target, container, sizeof(container));
     if (found)
         join_path(payload, sizeof(payload), container,
-                  "data/EXPLICIT_0/busy.txt");
+                  "data/work/busy.txt");
     check(rc == 1 && found && file_text_is(payload, "rewritten while read") &&
               strstr(output, "1 file kept as last read") != NULL &&
               strstr(output, busy) != NULL,
@@ -2486,7 +2578,7 @@ static void test_native_backup_of_a_changing_source(void)
     found = find_container_dir(target, container, sizeof(container));
     if (found)
         join_path(payload, sizeof(payload), container,
-                  "data/EXPLICIT_0/busy.txt");
+                  "data/work/busy.txt");
     check(rc == 0 && found && file_text_is(payload, "rewritten once") &&
               strstr(output, "changed while they were being backed up") ==
                   NULL,
@@ -2515,7 +2607,7 @@ static void test_native_backup_of_a_changing_source(void)
                                                   sizeof(partial));
     if (have_partial)
         join_path(payload, sizeof(payload), partial,
-                  "data/EXPLICIT_0/captured.txt");
+                  "data/resume_dir/captured.txt");
     check(rc != 0 && have_partial && access(payload, F_OK) == 0,
           "fixture: an interrupted run leaves a partial holding the first "
           "root's file");
@@ -2527,7 +2619,7 @@ static void test_native_backup_of_a_changing_source(void)
     found = find_container_dir(target, container, sizeof(container));
     if (found)
         join_path(payload, sizeof(payload), container,
-                  "data/EXPLICIT_0/captured.txt");
+                  "data/resume_dir/captured.txt");
     check(rc == 1 && found && access(payload, F_OK) != 0 &&
               strstr(output, "Resuming an interrupted backup") != NULL,
           "a resumed backup drops the stale payload of a file that vanished "
@@ -3595,7 +3687,7 @@ static void test_dangling_explicit_leaf_symlink_is_captured_as_symlink(void)
           "a finalized container with a data/ namespace was created");
 
     char copied_link[PATH_MAX];
-    join_path(copied_link, sizeof(copied_link), payload_dir, "EXPLICIT_0");
+    join_path(copied_link, sizeof(copied_link), payload_dir, "danglink");
     struct stat st;
     check(lstat(copied_link, &st) == 0 && S_ISLNK(st.st_mode),
           "the dangling symlink was captured as a symlink, not skipped or turned into something else");
@@ -3642,11 +3734,14 @@ static void test_sudo_backup_belongs_to_invoker(void)
     const gid_t invoker_gid = 4343;
 
     char home[PATH_MAX], parent[PATH_MAX], target[PATH_MAX], file[PATH_MAX];
+    char hidden[PATH_MAX];
     fresh_mkdtemp(home, sizeof(home), "plan_home");
     setenv("HOME", home, 1);
     join_path(file, sizeof(file), home, "payload.txt");
     write_file(file, "payload");
-    char *paths[] = { file, NULL };
+    join_path(hidden, sizeof(hidden), home, ".hidden");
+    write_file(hidden, "hidden");
+    char *paths[] = { file, hidden, NULL };
     fresh_mkdtemp(parent, sizeof(parent), "plan_target");
     join_path(target, sizeof(target), parent, "created-by-migr");
 
@@ -3658,18 +3753,20 @@ static void test_sudo_backup_belongs_to_invoker(void)
     backup_test_set_invoker(0, 0, 0);
 
     char container[PATH_MAX], data[PATH_MAX], manifest[PATH_MAX];
-    char payload[PATH_MAX];
+    char payload[PATH_MAX], settings[PATH_MAX];
     int found = find_container_dir(target, container, sizeof(container));
     join_path(data, sizeof(data), container, "data");
     join_path(manifest, sizeof(manifest), container, "manifest.txt");
-    join_path(payload, sizeof(payload), data, "EXPLICIT_0");
+    join_path(payload, sizeof(payload), data, "payload.txt");
+    join_path(settings, sizeof(settings), data, "settings");
     check(rc == 0 && found &&
               owned_by(target, invoker_uid, invoker_gid) &&
               owned_by(container, invoker_uid, invoker_gid) &&
               owned_by(data, invoker_uid, invoker_gid) &&
+              owned_by(settings, invoker_uid, invoker_gid) &&
               owned_by(manifest, invoker_uid, invoker_gid),
-          "the folder migr created, the container, data/, and manifest.txt "
-          "belong to the invoker");
+          "the folder migr created, the container, data/, data/settings/, "
+          "and manifest.txt belong to the invoker");
     check(owned_by(payload, 0, 0) && owned_by(parent, 0, 0),
           "the payload keeps its captured owner, and a folder migr did not "
           "create is left alone");
@@ -3812,7 +3909,7 @@ static void test_update_recaptures_a_recreated_folder(int portable)
 
     char container[PATH_MAX], payload[PATH_MAX];
     int found = find_container_dir(target, container, sizeof(container));
-    join_path(payload, sizeof(payload), container, "data/EXPLICIT_0/sub/file.txt");
+    join_path(payload, sizeof(payload), container, "data/notes/sub/file.txt");
     check(first_rc == 0 && second_rc == 0 && unchanged_rc == 0,
           "an update after the removal, changed or not, succeeds");
     check(third_rc == 0 && found && file_text_is(payload, "again"),
@@ -3858,12 +3955,12 @@ static void test_update_reuses_a_dropped_root_id(int portable)
 
     char container[PATH_MAX], payload[PATH_MAX];
     int found = find_container_dir(target, container, sizeof(container));
-    join_path(payload, sizeof(payload), container, "data/EXPLICIT_0/sub/file.txt");
+    join_path(payload, sizeof(payload), container, "data/dir/sub/file.txt");
     int a_kept = file_text_is(payload, "a");
-    join_path(payload, sizeof(payload), container, "data/EXPLICIT_1/sub/file.txt");
+    join_path(payload, sizeof(payload), container, "data/dir-2/sub/file.txt");
     check(first_rc == 0 && second_rc == 0 && found && a_kept &&
               file_text_is(payload, "b"),
-          "both roots are captured, each under its own id");
+          "both roots are captured, each in its own folder");
 
     remove_tree(home);
     remove_tree(target);
@@ -3919,11 +4016,11 @@ static void test_backup_updates_in_place(int portable)
               strstr(output, "Updating this install's backup in place.") != NULL,
           "the same container is updated and published under the same name");
 
-    join_path(payload, sizeof(payload), container, "data/EXPLICIT_0/kept.txt");
+    join_path(payload, sizeof(payload), container, "data/notes/kept.txt");
     check(file_text_is(payload, "second, longer"), "a changed file is recopied");
-    join_path(payload, sizeof(payload), container, "data/EXPLICIT_0/removed.txt");
+    join_path(payload, sizeof(payload), container, "data/notes/removed.txt");
     check(access(payload, F_OK) != 0, "a removed file leaves the payload");
-    join_path(payload, sizeof(payload), container, "data/EXPLICIT_1");
+    join_path(payload, sizeof(payload), container, "data/dropped.txt");
     check(access(payload, F_OK) != 0,
           "a root the new selection lacks leaves the payload");
 
@@ -3975,8 +4072,8 @@ static void test_update_repairs_payload_without_walking_it(void)
                                         output, sizeof(output));
     char container[PATH_MAX], payload[PATH_MAX], stray[PATH_MAX];
     int found = find_container_dir(target, container, sizeof(container));
-    join_path(payload, sizeof(payload), container, "data/EXPLICIT_0/file.txt");
-    join_path(stray, sizeof(stray), container, "data/EXPLICIT_0/stray.txt");
+    join_path(payload, sizeof(payload), container, "data/notes/file.txt");
+    join_path(stray, sizeof(stray), container, "data/notes/stray.txt");
     check(first_rc == 0 && found && unlink(payload) == 0,
           "fixture: remove an item's payload from a finished backup");
     write_file(stray, "not in the journal");
@@ -4030,7 +4127,7 @@ static void test_updates_rewrite_a_grown_journal(void)
 
     char container[PATH_MAX], payload[PATH_MAX];
     int found = find_container_dir(target, container, sizeof(container));
-    join_path(payload, sizeof(payload), container, "data/EXPLICIT_0/file.txt");
+    join_path(payload, sizeof(payload), container, "data/notes/file.txt");
     check(!failed && rewritten, "the journal is rewritten once it has grown");
     check(after_rc == 0 && found && file_text_is(payload, "after the rewrite") &&
               journal_root_entries(container, "EXPLICIT_0") == 2,
@@ -4060,7 +4157,7 @@ static void test_failed_update_keeps_the_finished_backup(void)
                                         output, sizeof(output));
     char container[PATH_MAX], payload[PATH_MAX];
     int found = find_container_dir(target, container, sizeof(container));
-    join_path(payload, sizeof(payload), container, "data/EXPLICIT_0");
+    join_path(payload, sizeof(payload), container, "data/item");
 
     // The item is now a folder where the backup holds a file, which the
     // metadata preflight refuses.
@@ -4130,7 +4227,7 @@ static void test_native_preflight_of_a_changing_source(void)
     char container[PATH_MAX], payload[PATH_MAX];
     int found = find_container_dir(target, container, sizeof(container));
     join_path(payload, sizeof(payload), container,
-              "data/EXPLICIT_0/kept.txt");
+              "data/work/kept.txt");
     check(rc == 0 && found && strstr(output, "preflight failed") == NULL &&
               file_text_is(payload, "kept"),
           "a file removed and a folder written during the preflight do not "
@@ -4163,7 +4260,7 @@ static void test_backup_leaves_another_install_alone(void)
     int found = find_container_dir(target, old_container,
                                    sizeof(old_container));
     join_path(old_payload, sizeof(old_payload), old_container,
-              "data/EXPLICIT_0");
+              "data/file.txt");
 
     write_file(file, "new install");
     backup_test_set_machine_id("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
@@ -4217,7 +4314,7 @@ static void test_dangling_builtin_dotfile_is_captured_not_silently_dropped(void)
     check(find_payload_dir(target, payload_dir, sizeof(payload_dir)),
           "a finalized container with a data/ namespace was created");
     char copied_profile[PATH_MAX];
-    join_path(copied_profile, sizeof(copied_profile), payload_dir, "BUILTIN_DOT_PROFILE");
+    join_path(copied_profile, sizeof(copied_profile), payload_dir, "settings/profile");
     struct stat st;
     check(lstat(copied_profile, &st) == 0 && S_ISLNK(st.st_mode),
           "the dangling .profile symlink the plan promised to capture actually made it into the backup");
@@ -4280,9 +4377,9 @@ static void test_shell_history_consent_gate(void)
     check(find_payload_dir(target, payload, sizeof(payload)),
           "accepted shell-history backup publishes a container");
     char copied[PATH_MAX];
-    join_path(copied, sizeof(copied), payload, "BUILTIN_DOT_BASH_HISTORY");
+    join_path(copied, sizeof(copied), payload, "settings/bash-history");
     check(access(copied, F_OK) == 0, "accepted backup captures .bash_history");
-    join_path(copied, sizeof(copied), payload, "BUILTIN_DOT_ZSH_HISTORY");
+    join_path(copied, sizeof(copied), payload, "settings/zsh-history");
     check(access(copied, F_OK) == 0, "accepted backup captures .zsh_history");
     remove_tree(target);
 
@@ -4361,7 +4458,7 @@ static void test_shell_history_consent_gate(void)
           "explicit-path history backup is not gated");
     check(find_payload_dir(target, payload, sizeof(payload)),
           "explicit history backup publishes a container");
-    join_path(copied, sizeof(copied), payload, "EXPLICIT_0");
+    join_path(copied, sizeof(copied), payload, "settings/bash-history");
     check(access(copied, F_OK) == 0, "explicit history path is captured");
     remove_tree(target);
 
@@ -4412,6 +4509,7 @@ int main(void)
     test_missing_optional_builtin_is_skipped_not_fatal();
     test_localized_xdg_uses_canonical_id();
     test_fixed_builtin_fields();
+    test_payload_names();
     test_builtin_config_collapses_browser_descendant();
     test_zero_root_builtin_plan_is_safe();
     test_builtin_ancestor_symlink_alias_is_detected_as_duplicate();
