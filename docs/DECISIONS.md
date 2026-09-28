@@ -12,6 +12,8 @@ It is to record *why*, and what was rejected, so neither gets re-litigated later
   that is later reversed keeps its number; the reversal is a new entry that names
   what it supersedes. Removing reversed decisions would hide exactly the reasoning
   that makes the rest trustworthy.
+- Wording may be edited; what an entry decided and why may not. A changed
+  decision is a new entry.
 - Code comments cite entries as `docs/DECISIONS.md D9`.
 - Every entry carries a **Status**. `Implemented` means the code does this today.
   `Decided` means the reasoning is settled but nothing is built yet — those entries
@@ -111,10 +113,10 @@ pattern. No expectation of community involvement is implied by any of this.
 **Decision:** Cloud storage support is off the roadmap for now.
 
 **Why:** The feature's goal was a backup that reaches cloud storage without leaving
-the keyboard. The single first-hand attempt at such a flow — uploading a
-GPG-encrypted tar archive of a full backup — ran into transfer difficulties and was
-eventually completed by hand, through a browser. One attempt on one machine is not
-an experience base to design a backup feature on.
+the keyboard. The only such flow tried — uploading a GPG-encrypted tar archive
+of a full backup — ran into transfer difficulties and ended in a manual upload
+through a browser. A single attempt is not enough experience to design a backup
+feature on.
 
 **Recorded for any future revisit:** cloud support without built-in encryption is
 incomplete. The manual flow required GPG-encrypting the archive before upload; a
@@ -679,8 +681,7 @@ its descendants are not represented as a precise affected-object count. The capt
 pass preserves the same strict refusal if ownership changes after preflight.
 
 Native restore reads its own source (the payload tree it is restoring from) under the
-same discipline, not only capture's read of the user's original files. The entry-gate
-tests added ahead of the native metadata-fidelity work surfaced a concrete instance of
+same discipline, not only capture's read of the user's original files. A concrete case of
 why this matters: `restore_entry_at()`'s directory branch always recurses during
 `RESTORE_VALIDATE` (unlike the FIFO/regular branches, which return before touching
 content), so its own `readdir()` could perturb the source directory's atime before
@@ -1579,11 +1580,10 @@ deterministic suffixes. A real source `foo~1` file forced the plan to skip to
 placed beneath the correct physical parent. A capture declaring
 `case_sensitive=1` invented no suffixes.
 
-Resume renumbering was also verified: adding a new sibling that sorts before an
-existing owner released the owner's old physical name and moved it to its new
-suffix-bearing name without changing its content. That path exposed and fixed
-a real bug (`6e43026`, amended through `c7896a0`), and the correction was
-verified on real vfat.
+Resume renumbering is covered too: adding a new sibling that sorts before an
+existing owner releases the owner's old physical name and moves it to its new
+suffix-bearing name without changing its content. This path is verified on
+vfat.
 
 The F-5 root-payload namespace probe detected a measured root-pair collision on
 a real case-insensitive destination, closing a gap that host tests could not
@@ -2740,11 +2740,9 @@ their actual destination allocation semantics justify it.
 **Revision (2026-08-26):** Allocation rounding is retained only for the
 internal D27 free-space fit check. The user-facing `Estimated backup size`
 line and D28's live `Progress` total now use the raw source-byte total instead
-of destination-allocation-rounded bytes. This follows live testing on the same
-Ventoy exFAT destination with 128 KiB clusters: a roughly 100M source backup
-was displayed as 200.7M and a 646M source backup as 1.6G under the reverted
-rounded-progress approach, inflating the apparent source size by roughly
-2--2.5x.
+of destination-allocation-rounded bytes. On an exFAT destination with 128 KiB
+clusters, the rounded figures overstated the source by roughly 2--2.5x: about
+100M was displayed as 200.7M, and 646M as 1.6G.
 
 ---
 
@@ -4014,10 +4012,9 @@ restored file is already the result and no command runs. With no `dconf` on
 is never loaded. A failed dump or load is reported as a restore warning with
 the recovery path (log out, rerun from a text console).
 
-**Why:** The first real restore into a live GNOME session applied 87 of 238
-backed-up keys. `dconf-service` keeps the user database in memory and writes
-the whole file back on its next change, so a file replaced underneath it is
-lost. D44/D48 exclude `dconf/user` from read-back verification because it is
+**Why:** `dconf-service` keeps the user database in memory and writes the
+whole file back on its next change, so a file replaced underneath a running
+session is lost, and with it most of the restored keys. D44/D48 exclude `dconf/user` from read-back verification because it is
 live, which also hid the loss. The payload, not the destination file, is the
 source because the destination may already have been overwritten.
 
@@ -4045,11 +4042,11 @@ valid record boundary and file size, and the container stays unpublished with a
 message to remove it and back up again, preferably to a different drive.
 Native containers have no journal and are unchanged.
 
-**Why:** On real hardware a finished backup reported `OK` while one 128 KiB
-cluster of its journal already held a deleted directory block on disk. Every
-read during capture, including resume adoption, was served from the page cache,
-so the damage surfaced only when the new machine read the drive and restore
-refused the backup. Parsing from the device before publication moves that
+**Why:** A finished backup can report `OK` while its journal is already damaged
+on the device, for example by an exFAT cluster reused for a directory block.
+Every read during capture, including resume adoption, is served from the page
+cache, so such damage surfaces only when another machine reads the drive and
+restore refuses the backup. Parsing from the device before publication moves that
 failure to the moment the source machine still exists.
 
 **Limits:** Dropping cached pages is advisory and only affects clean pages, which
@@ -4101,10 +4098,10 @@ with an error summary pointing at the listed items. A content mismatch reads
 error". Apply-phase failures keep the `PORTABLE_RESTORE_ERROR` outcome and still
 skip every dependent step.
 
-**Why:** On real hardware a live-state lock file rewritten by a background
-service stopped verification at item 1,922 of 158,956. The remaining items were
-never checked, and packages and network configuration were skipped although all
-files were already on disk, which forced a full rerun. A mismatch found after
+**Why:** One live-state file rewritten by a background service stopped
+verification at its first mismatch. The remaining items went unchecked, and
+packages and network configuration were skipped although every file was
+already on disk, so the whole restore had to run again. A mismatch found after
 application does not make the dependent steps less valid; it makes the specific
 items suspect, which listing them all addresses.
 
@@ -4177,14 +4174,13 @@ its path-component boundary rule, and its evidence requirement are unchanged.
 **Decision:** `BUILTIN_LOCAL_SHARE:containers/storage/storage.lock` joins the
 shared live-state list (D44/D48/D55). Nothing else under `containers/` does.
 
-**Why:** On real hardware a restore's verification failed on this file after
-rootless Podman had started twice during restores. The terminal (Ptyxis) queries
-Podman for Toolbox/Distrobox containers when it starts or opens a window, which
-launches a `podman-pause` scope, and Podman rewrites its lock file on each
-access. That is daemon-owned state changing independently of migr, the evidence
-D44 requires. Application files rewritten because a user left the application
-open (VS Code during the same restore) are not added; they are a warning matter,
-not live daemon state.
+**Why:** Rootless Podman rewrites its lock file on each access. A terminal
+that lists Toolbox or Distrobox containers (Ptyxis) queries Podman when it
+starts or opens a window, which launches a `podman-pause` scope, so the file
+changes during a restore without Podman being used. That is daemon-owned
+state changing independently of migr, the evidence D44 requires. Application
+files rewritten because an application was left open (such as VS Code) are not
+added; they are a warning matter, not live daemon state.
 
 ---
 
@@ -4199,11 +4195,11 @@ automatically, like a conf exclude, and `report` and backup print one note.
 A user installation with any deployed app or runtime is backed up as before.
 Explicit-path backups are unchanged.
 
-**Why:** On real hardware the backup carried a 1.5G OSTree repository from a
-user installation that had no applications (all were system-wide). Restoring it
-recreated a user `flathub` remote, so every later `flatpak install` asked which
-installation to use, and GNOME Software refreshed its catalog into the
-directory while the restore was writing it. With nothing deployed, the
+**Why:** A user installation whose applications are all installed
+system-wide can still hold an OSTree repository of a gigabyte or more.
+Restoring it recreates a user `flathub` remote, so every later `flatpak install`
+asks which installation to use, and GNOME Software refreshes its catalog into
+the directory while the restore writes it. With nothing deployed, the
 repository is only a download cache that Flatpak fetches again.
 
 **Relationship:** A narrow first step of backup-scope-overhaul's Flatpak
@@ -4221,9 +4217,9 @@ record fails the network capture like any other network file. Restore compares
 it with the target's policy and, when they differ, prints the
 `sudo update-crypto-policies --set <policy>` command. It never runs it.
 
-**Why:** On real hardware the restored 802.1X (PEAP/MSCHAPv2) profiles needed
-TLS 1.0. Their keyfiles carried `phase1-auth-flags`, but the source system also
-relied on the `DEFAULT:SHA1` policy, which had to be re-applied by hand. The
+**Why:** 802.1X (PEAP/MSCHAPv2) profiles that use TLS 1.0 carry
+`phase1-auth-flags` in their keyfiles, but also depend on a system crypto policy
+that allows it, such as `DEFAULT:SHA1`, which a fresh install does not have. The
 policy is a machine-wide security setting, so changing it is left to the user,
 with the exact command in hand.
 
@@ -4256,8 +4252,7 @@ v5 reader refuses v4 sidecars, and v4 partials are not adopted or resumed.
 
 **Why:** D42's expected digest came from the bytes replay wrote, so a payload
 damaged inside the container after capture was read, written, and "verified"
-as correct. On real hardware the only independent evidence that a 159k-file
-restore matched its backup was a manual comparison against the container. With
+as correct, and only a manual comparison against the container could tell. With
 the digest recorded at capture, restore verifies end to end, and a backup can be
 checked on its own before the source machine is wiped.
 
@@ -4325,9 +4320,9 @@ journal (`copy_file_range`, with a read/write fallback) after a free-space
 check, the filesystem is synced, and the container is published under a new
 finished name.
 
-**Why:** On real hardware one reused 128 KiB exFAT cluster in an 84 MB journal
-made a 187k-item backup unrestorable, and recovery took a hand-written splice,
-record-by-record rebuild, and four hand-made directory commits. This command is
+**Why:** One damaged cluster in the journal makes a whole portable backup
+unrestorable, although its payload is intact. Recovering it by hand takes a
+splice, a record-by-record rebuild, and directory commits made by hand. This command is
 that procedure, with the manual guesses replaced by the rules above.
 
 **Relationship:** Complements D51 (read-back before publishing) and D52
@@ -4528,8 +4523,8 @@ A native restore printed only the plain warning before its prompt and did
 not defer, until D69.
 
 **Why:** An application that saves its state on exit overwrites restored
-settings after migr has finished, where no verification can see it. VS Code
-did exactly that on the first real restore. Asking at the start would stall
+settings after migr has finished, where no verification can see it; VS Code
+is one such application. Asking at the start would stall
 an unattended run for its whole length. At the end nothing else is left to
 do, so waiting costs nothing, and the application has had the whole restore
 to be closed.
@@ -4780,10 +4775,10 @@ added back where it exists and listed where it does not (Ubuntu names it
 `sudo`); migr does not translate between them, because that decides who
 administers the system.
 
-**Why:** After the first real restore, virt-manager asked for a password
-for `qemu:///system`: the user was no longer in `libvirt`, which the old
-install's polkit rules trusted. Groups live in `/etc/group`, which no scope
-captures.
+**Why:** Supplementary groups live in `/etc/group`, which no scope captures,
+so a new install leaves the user only in the groups its installer assigns.
+What depended on the others stops working quietly: without `libvirt`, for
+example, virt-manager asks for a password for `qemu:///system`.
 
 **Relationship:** Follows D62 (restore runs as root) and D38.
 
@@ -4849,8 +4844,7 @@ binaries for one architecture (`linux-x64`), and the list is how a machine
 with another one reinstalls them.
 
 **Why:** Only the extension list was kept, and restore did not act on it, so
-every extension had to be reinstalled by hand. The first real backup's
-`~/.vscode` held 23 extensions in 1.8 GB.
+every extension had to be reinstalled by hand.
 
 **Relationship:** Extends D66 and D69. A Flatpak VS Code keeps its
 extensions under `~/.var/app` (D75).
@@ -4875,9 +4869,9 @@ the sudo invoker where the filesystem records owners.
 `$HOME/skipped-packages.txt` (D1) is gone: restore wrote it as root into
 the new home, and it covered packages only.
 
-**Why:** After the first real restore, the packages from third-party
-repositories had to be installed by hand, and D74 and D76 added more of
-the same kind: groups and Flatpak remotes the new system lacks.
+**Why:** Some steps are left to the user: packages from third-party
+repositories, and, since D74 and D76, groups and Flatpak remotes the new
+system lacks.
 
 **Relationship:** Supersedes D1's file; keeps D40's final-state accounting.
 
