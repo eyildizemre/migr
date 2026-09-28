@@ -5,7 +5,7 @@
 #include <time.h> /* struct timespec */
 
 #ifdef RESTORE_TEST_HOOKS
-typedef int (*RestoreTestNetworkReloadHook)(char *const argv[], void *context);
+typedef int (*RestoreTestNetworkCommandHook)(char *const argv[], void *context);
 
 void restore_test_set_proc_root(const char *path);
 void restore_test_set_crypto_policy_current(const char *path);
@@ -16,8 +16,8 @@ size_t restore_test_running_writers(uid_t uid, const char **labels,
                                     const char **settings, size_t max);
 void restore_test_set_network_config_dest_dir(const char *backend_name,
                                               const char *dest_dir);
-void restore_test_set_network_reload_hook(RestoreTestNetworkReloadHook hook,
-                                          void *context);
+void restore_test_set_network_command_hook(RestoreTestNetworkCommandHook hook,
+                                           void *context);
 
 /* Exposes the progress display's cumulative-average speed formula
  * (total_bytes / elapsed since started_at) for direct unit testing with

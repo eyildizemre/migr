@@ -74,8 +74,8 @@ static const RestoreNetworkConfigBackend RESTORE_NETWORK_CONFIG_BACKENDS[] = {
 
 #ifdef RESTORE_TEST_HOOKS
 static const char *restore_test_network_config_dest_dirs[NETWORK_CONFIG_BACKEND_COUNT];
-static RestoreTestNetworkReloadHook restore_test_network_reload_hook;
-static void *restore_test_network_reload_context;
+static RestoreTestNetworkCommandHook restore_test_network_command_hook;
+static void *restore_test_network_command_context;
 static int restore_test_progress_force;
 
 void restore_test_set_network_config_dest_dir(const char *backend_name,
@@ -91,11 +91,11 @@ void restore_test_set_network_config_dest_dir(const char *backend_name,
     }
 }
 
-void restore_test_set_network_reload_hook(RestoreTestNetworkReloadHook hook,
-                                          void *context)
+void restore_test_set_network_command_hook(RestoreTestNetworkCommandHook hook,
+                                           void *context)
 {
-    restore_test_network_reload_hook = hook;
-    restore_test_network_reload_context = context;
+    restore_test_network_command_hook = hook;
+    restore_test_network_command_context = context;
 }
 
 void restore_test_set_progress_force(int force)
@@ -170,17 +170,25 @@ static const char *network_config_dest_dir(size_t backend_index)
     return RESTORE_NETWORK_CONFIG_BACKENDS[backend_index].dest_dir;
 }
 
+// Runs a command the network restore applies its files with. Its output is
+// not shown: migr reports what the command did.
+static int run_network_command(char *const argv[])
+{
+#ifdef RESTORE_TEST_HOOKS
+    if (restore_test_network_command_hook != NULL)
+        return restore_test_network_command_hook(
+            argv, restore_test_network_command_context);
+#endif
+    char output[1024];
+    return run_command_capture(argv, output, sizeof(output));
+}
+
 static int run_network_config_reload(void)
 {
     char *const reload_argv[] = {
         "nmcli", "connection", "reload", NULL
     };
-#ifdef RESTORE_TEST_HOOKS
-    if (restore_test_network_reload_hook != NULL)
-        return restore_test_network_reload_hook(
-            reload_argv, restore_test_network_reload_context);
-#endif
-    return run_command(reload_argv);
+    return run_network_command(reload_argv);
 }
 
 static int network_config_regular_count(DIR *dir, size_t *count)
@@ -900,9 +908,11 @@ void restore_test_set_crypto_policy_current(const char *path)
 }
 #endif
 
-// Suggests, never applies, the source system's crypto policy: changing it is a
-// system-wide security decision the user makes.
-static void restore_crypto_policy_hint(int network_fd)
+// Sets the source system's crypto policy, which its saved connections may
+// need, such as 802.1X networks that still use TLS 1.0 (D83). A target
+// without crypto policies has nothing to set. Like the reload above, a
+// failure is a warning with the command to run.
+static void restore_crypto_policy(int network_fd)
 {
     char saved[CRYPTO_POLICY_MAX], current[CRYPTO_POLICY_MAX];
     if (crypto_policy_read_at(network_fd, "crypto-policy", saved) != 0 ||
@@ -910,10 +920,27 @@ static void restore_crypto_policy_hint(int network_fd)
         strcmp(saved, current) == 0)
         return;
     printf("\nSystem crypto policy\n");
-    printf("  The source system used the crypto policy %s (this system: %s). "
-           "If restored Wi-Fi (802.1X) or VPN connections fail to "
-           "authenticate, apply it with: sudo update-crypto-policies --set %s\n",
-           saved, current, saved);
+    if (dry_run)
+    {
+        printf("  Would set the crypto policy to %s, as on the source system "
+               "(this system: %s).\n", saved, current);
+        return;
+    }
+    char *const set_argv[] = {
+        "update-crypto-policies", "--set", saved, NULL
+    };
+    if (run_network_command(set_argv) == 0)
+    {
+        printf("  Set the crypto policy to %s, as on the source system "
+               "(it was %s). Services pick it up when they start, so "
+               "restart the computer. To undo: sudo update-crypto-policies "
+               "--set %s\n", saved, current, current);
+        return;
+    }
+    print_warning("  Warning: could not set the crypto policy to %s (this "
+                  "system: %s). If restored Wi-Fi (802.1X) or VPN connections "
+                  "fail to authenticate, run: sudo update-crypto-policies "
+                  "--set %s\n", saved, current, saved);
 }
 
 // Whether restore_dconf_settings() will load the database into a running
@@ -1140,7 +1167,7 @@ static void restore_network_config(int source_root_fd, int *had_error)
                           "yourself, or restart NetworkManager, to apply them.\n");
         }
     }
-    restore_crypto_policy_hint(network_fd);
+    restore_crypto_policy(network_fd);
     if (!found_backend)
     {
         print_error("Error: manifest declares network configuration, but none "

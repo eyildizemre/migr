@@ -1746,7 +1746,7 @@ static void test_versioned_restore_refuses_differing_mount_id_aliases(void)
     remove_tree(home);
 }
 
-static int record_network_reload(char *const argv[], void *context)
+static int record_network_command(char *const argv[], void *context)
 {
     const char *marker_path = context;
     FILE *f = fopen(marker_path, "a");
@@ -1761,9 +1761,9 @@ static int record_network_reload(char *const argv[], void *context)
     return fclose(f) == 0 ? 0 : -1;
 }
 
-static int record_failed_network_reload(char *const argv[], void *context)
+static int record_failed_network_command(char *const argv[], void *context)
 {
-    if (record_network_reload(argv, context) != 0)
+    if (record_network_command(argv, context) != 0)
         return -1;
     return 1;
 }
@@ -3709,7 +3709,7 @@ static void test_network_config_restore_success(void)
     join_path(reload_marker, sizeof(reload_marker), dest_parent,
               "reload.marker");
     restore_test_set_network_config_dest_dir("NetworkManager", dest_dir);
-    restore_test_set_network_reload_hook(record_network_reload, reload_marker);
+    restore_test_set_network_command_hook(record_network_command, reload_marker);
     restore_test_set_crypto_policy_current(current_policy);
 
     int previous_dry_run = dry_run;
@@ -3719,7 +3719,7 @@ static void test_network_config_restore_success(void)
                                               sizeof(output));
     dry_run = previous_dry_run;
     restore_test_set_crypto_policy_current(NULL);
-    restore_test_set_network_reload_hook(NULL, NULL);
+    restore_test_set_network_command_hook(NULL, NULL);
     restore_test_set_network_config_dest_dir("NetworkManager", NULL);
 
     check(rc == 0, "live restore succeeds when the network destination is writable");
@@ -3734,17 +3734,17 @@ static void test_network_config_restore_success(void)
     check(access(ignored_dest, F_OK) != 0,
           "non-regular network backup entries are skipped");
     check(file_content_is(reload_marker,
-                          "nmcli\nconnection\nreload\n"),
-          "reload uses exactly nmcli connection reload once");
+                          "nmcli\nconnection\nreload\n"
+                          "update-crypto-policies\n--set\nDEFAULT:SHA1\n"),
+          "reload runs nmcli connection reload once, then sets the source "
+          "crypto policy");
     check(strstr(output, "Restored 2 network connection files") != NULL,
           "the live restore reports the number of applied connection files");
-    check(strstr(output, "used the crypto policy DEFAULT:SHA1 (this system: "
-                         "DEFAULT)") != NULL &&
-              strstr(output, "sudo update-crypto-policies --set DEFAULT:SHA1") !=
-                  NULL,
-          "a different source crypto policy is named with the command to apply it");
-    check(file_content_is(current_policy, "# comment\nDEFAULT\n"),
-          "the system crypto policy is never changed by the restore");
+    check(strstr(output, "Set the crypto policy to DEFAULT:SHA1, as on the "
+                         "source system (it was DEFAULT)") != NULL &&
+              strstr(output, "To undo: sudo update-crypto-policies --set "
+                             "DEFAULT\n") != NULL,
+          "the changed crypto policy is reported with the command to undo it");
 
     remove_tree(source);
     remove_tree(home);
@@ -3780,7 +3780,7 @@ static void test_network_config_restore_dry_run(void)
     write_file_mode(saved_policy, "DEFAULT:SHA1\n", 0600);
     write_file_mode(current_policy, "DEFAULT:SHA1\n", 0644);
     restore_test_set_network_config_dest_dir("NetworkManager", dest_dir);
-    restore_test_set_network_reload_hook(record_network_reload, reload_marker);
+    restore_test_set_network_command_hook(record_network_command, reload_marker);
     restore_test_set_crypto_policy_current(current_policy);
 
     int previous_dry_run = dry_run;
@@ -3789,7 +3789,7 @@ static void test_network_config_restore_dry_run(void)
     int rc = run_restore_capturing(source, output, sizeof(output));
     dry_run = previous_dry_run;
     restore_test_set_crypto_policy_current(NULL);
-    restore_test_set_network_reload_hook(NULL, NULL);
+    restore_test_set_network_command_hook(NULL, NULL);
     restore_test_set_network_config_dest_dir("NetworkManager", NULL);
 
     check(rc == 0, "network dry-run succeeds");
@@ -3801,7 +3801,21 @@ static void test_network_config_restore_dry_run(void)
     check(access(reload_marker, F_OK) != 0,
           "network dry-run never invokes the reload command");
     check(strstr(output, "crypto policy") == NULL,
-          "a matching crypto policy prints no hint");
+          "a matching crypto policy prints nothing");
+
+    write_file_mode(current_policy, "DEFAULT\n", 0644);
+    restore_test_set_network_command_hook(record_network_command, reload_marker);
+    restore_test_set_crypto_policy_current(current_policy);
+    dry_run = 1;
+    rc = run_restore_capturing(source, output, sizeof(output));
+    dry_run = previous_dry_run;
+    restore_test_set_crypto_policy_current(NULL);
+    restore_test_set_network_command_hook(NULL, NULL);
+    check(rc == 0 && strstr(output, "Would set the crypto policy to "
+                                    "DEFAULT:SHA1, as on the source system "
+                                    "(this system: DEFAULT)") != NULL &&
+              access(reload_marker, F_OK) != 0,
+          "a different crypto policy is previewed and not set");
 
     remove_tree(source);
     remove_tree(home);
@@ -3810,7 +3824,7 @@ static void test_network_config_restore_dry_run(void)
 
 static void test_network_config_reload_failure_is_best_effort(void)
 {
-    printf(BLUE "::" NC " network config: reload failure warns without failing restore\n");
+    printf(BLUE "::" NC " network config: a failed reload or crypto policy warns without failing restore\n");
 
     char source[PATH_MAX], home[PATH_MAX], dest_parent[PATH_MAX];
     fresh_mkdtemp(source, sizeof(source), "network_reload_src");
@@ -3829,9 +3843,17 @@ static void test_network_config_reload_failure_is_best_effort(void)
     join_path(dest_dir, sizeof(dest_dir), dest_parent, "system-connections");
     join_path(reload_marker, sizeof(reload_marker), dest_parent,
               "reload.marker");
+    char saved_policy[PATH_MAX], current_policy[PATH_MAX];
+    join_path(saved_policy, sizeof(saved_policy), source,
+              "network/crypto-policy");
+    join_path(current_policy, sizeof(current_policy), dest_parent,
+              "crypto-policies-config");
+    write_file_mode(saved_policy, "DEFAULT:SHA1\n", 0600);
+    write_file_mode(current_policy, "DEFAULT\n", 0644);
     restore_test_set_network_config_dest_dir("NetworkManager", dest_dir);
-    restore_test_set_network_reload_hook(record_failed_network_reload,
-                                         reload_marker);
+    restore_test_set_network_command_hook(record_failed_network_command,
+                                          reload_marker);
+    restore_test_set_crypto_policy_current(current_policy);
 
     int previous_dry_run = dry_run;
     dry_run = 0;
@@ -3839,16 +3861,24 @@ static void test_network_config_reload_failure_is_best_effort(void)
     int rc = run_restore_capturing_with_input(source, "y\n", output,
                                               sizeof(output));
     dry_run = previous_dry_run;
-    restore_test_set_network_reload_hook(NULL, NULL);
+    restore_test_set_crypto_policy_current(NULL);
+    restore_test_set_network_command_hook(NULL, NULL);
     restore_test_set_network_config_dest_dir("NetworkManager", NULL);
 
-    check(rc == 0, "reload failure does not mark an otherwise successful restore failed");
+    check(rc == 0, "a failed reload or crypto policy does not mark an "
+                   "otherwise successful restore failed");
     check(strstr(output,
                  "'nmcli connection reload' did not succeed") != NULL,
           "reload failure emits the best-effort warning");
+    check(strstr(output, "could not set the crypto policy to DEFAULT:SHA1 "
+                         "(this system: DEFAULT)") != NULL &&
+              strstr(output, "run: sudo update-crypto-policies --set "
+                             "DEFAULT:SHA1") != NULL,
+          "a failed crypto policy warns with the command to run");
     check(file_content_is(reload_marker,
-                          "nmcli\nconnection\nreload\n"),
-          "the failing reload path still receives the exact command argv");
+                          "nmcli\nconnection\nreload\n"
+                          "update-crypto-policies\n--set\nDEFAULT:SHA1\n"),
+          "the failing path still receives the exact commands");
 
     remove_tree(source);
     remove_tree(home);
@@ -3886,7 +3916,7 @@ static void test_network_config_restore_continues_after_file_error(void)
     join_path(reload_marker, sizeof(reload_marker), dest_parent,
               "reload.marker");
     restore_test_set_network_config_dest_dir("NetworkManager", dest_dir);
-    restore_test_set_network_reload_hook(record_network_reload, reload_marker);
+    restore_test_set_network_command_hook(record_network_command, reload_marker);
 
     int previous_dry_run = dry_run;
     dry_run = 0;
@@ -3894,7 +3924,7 @@ static void test_network_config_restore_continues_after_file_error(void)
     int rc = run_restore_capturing_with_input(source, "y\n", output,
                                               sizeof(output));
     dry_run = previous_dry_run;
-    restore_test_set_network_reload_hook(NULL, NULL);
+    restore_test_set_network_command_hook(NULL, NULL);
     restore_test_set_network_config_dest_dir("NetworkManager", NULL);
 
     check(rc != 0, "an unexpected per-file failure marks the overall restore failed");
@@ -3935,7 +3965,7 @@ static void test_network_config_restore_empty(void)
     join_path(reload_marker, sizeof(reload_marker), dest_parent,
               "reload.marker");
     restore_test_set_network_config_dest_dir("NetworkManager", dest_dir);
-    restore_test_set_network_reload_hook(record_network_reload, reload_marker);
+    restore_test_set_network_command_hook(record_network_command, reload_marker);
 
     char output[8192];
     const char *owned_paths[] = {
@@ -3958,7 +3988,7 @@ static void test_network_config_restore_empty(void)
             uid, gid);
     }
     dry_run = previous_dry_run;
-    restore_test_set_network_reload_hook(NULL, NULL);
+    restore_test_set_network_command_hook(NULL, NULL);
     restore_test_set_network_config_dest_dir("NetworkManager", NULL);
 
     if (preparation == CHILD_SKIP)
@@ -4010,7 +4040,7 @@ static void test_network_config_restore_unapplied_note(void)
     join_path(reload_marker, sizeof(reload_marker), dest_parent,
               "reload.marker");
     restore_test_set_network_config_dest_dir("NetworkManager", dest_dir);
-    restore_test_set_network_reload_hook(record_network_reload, reload_marker);
+    restore_test_set_network_command_hook(record_network_command, reload_marker);
 
     int previous_dry_run = dry_run;
     dry_run = 0;
@@ -4018,7 +4048,7 @@ static void test_network_config_restore_unapplied_note(void)
     int rc = run_restore_capturing_with_input(source, "y\n", output,
                                               sizeof(output));
     dry_run = previous_dry_run;
-    restore_test_set_network_reload_hook(NULL, NULL);
+    restore_test_set_network_command_hook(NULL, NULL);
     restore_test_set_network_config_dest_dir("NetworkManager", NULL);
 
     check(rc == 0,
@@ -4114,13 +4144,13 @@ static void test_network_config_backends(unsigned int mask, int blocked_index,
                 exit(1);
         }
     }
-    restore_test_set_network_reload_hook(record_network_reload, marker);
+    restore_test_set_network_command_hook(record_network_command, marker);
     int previous_dry_run = dry_run;
     dry_run = preview;
     char output[16384];
     int rc = run_restore_capturing_with_input(source, "y\n", output, sizeof(output));
     dry_run = previous_dry_run;
-    restore_test_set_network_reload_hook(NULL, NULL);
+    restore_test_set_network_command_hook(NULL, NULL);
     for (size_t i = 0; i < backend_count; i++)
         restore_test_set_network_config_dest_dir(names[i], NULL);
     check((rc != 0) == (mask == 0 || broken_index >= 0),
@@ -4245,10 +4275,10 @@ static void test_network_config_roundtrip(const char *backend_name,
         setenv("HOME", restored_home, 1);
         for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
             restore_test_set_network_config_dest_dir(names[i], dest);
-        restore_test_set_network_reload_hook(record_network_reload, marker);
+        restore_test_set_network_command_hook(record_network_command, marker);
         char output[16384];
         int rc = run_restore_capturing_with_input(container, "y\n", output, sizeof(output));
-        restore_test_set_network_reload_hook(NULL, NULL);
+        restore_test_set_network_command_hook(NULL, NULL);
         for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
             restore_test_set_network_config_dest_dir(names[i], NULL);
         check(rc == 0 && file_matches(restored, "fixture network configuration\n", 0600),

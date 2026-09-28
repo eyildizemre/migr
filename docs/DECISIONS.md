@@ -4230,6 +4230,8 @@ with the exact command in hand.
 **Relationship:** Extends D54's network restore. Older restores ignore the
 extra file because they only open the known backend directories.
 
+**Note (D83):** Restore now sets the recorded policy instead of suggesting it.
+
 ## D59 — 2026-09-24 — Sidecar v5 records a capture-time content digest
 
 **Status:** Implemented
@@ -4992,3 +4994,26 @@ native backups, looks for `Documents`.
 `payload_path == id` rule. A backup made before this is updated in place
 through D72: each root whose payload path changed is left out and captured
 again, so its first update copies everything once more.
+
+## D83 — 2026-09-28 — Restore sets the saved crypto policy
+
+**Status:** Implemented
+
+**Decision:** When a restore writes network configuration and the backup's
+`network/crypto-policy` differs from the target's, restore runs
+`update-crypto-policies --set <policy>` and says what it changed, that
+services pick it up when they start, and the command that undoes it. A dry
+run says it would set it. A target without `/etc/crypto-policies/config`
+has nothing to set. A failure is a warning with the command to run, like a
+failed `nmcli connection reload` (D54), and does not change the exit
+status.
+
+**Why:** The policy is recorded only with `--include-network-config`, which
+asks for the saved connections to work on the new system. Some need a policy
+other than the default, such as 802.1X networks that still use TLS 1.0 and
+SHA-1 (`DEFAULT:SHA1`); as a suggestion, those connections kept failing
+until the command was found and run. The change is system-wide, so it is
+reported together with the command that undoes it.
+
+**Relationship:** Replaces D58's suggestion; D58's capture is unchanged.
+
