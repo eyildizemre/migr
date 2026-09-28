@@ -1925,8 +1925,10 @@ static int dropped_paths_add(DroppedPaths *dropped, SidecarBytes root_id,
     }
     DroppedPath *path = &dropped->paths[dropped->count];
     path->root_id = strndup((const char *)root_id.data, root_id.length);
-    path->logical_path = strndup((const char *)logical_path.data,
-                                 logical_path.length);
+    // A root's own entry has an empty logical path, which may carry no data.
+    path->logical_path = logical_path.length != 0
+        ? strndup((const char *)logical_path.data, logical_path.length)
+        : strdup("");
     if (path->root_id == NULL || path->logical_path == NULL)
     {
         free(path->root_id);
