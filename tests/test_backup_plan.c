@@ -3766,6 +3766,109 @@ static size_t journal_root_entries(const char *container, const char *root_id)
     return ok ? counter.count : SIZE_MAX;
 }
 
+// A folder removed and backed up, then made again: the journal still holds
+// the removed folder's deletions when the next updates run.
+static void test_update_recaptures_a_recreated_folder(int portable)
+{
+    printf(BLUE "::" NC " production: a %s update captures a folder made again after its removal\n",
+           portable ? "portable" : "native");
+
+    char home[PATH_MAX], target[PATH_MAX], dir[PATH_MAX], sub[PATH_MAX];
+    char file[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_home");
+    setenv("HOME", home, 1);
+    join_path(dir, sizeof(dir), home, "notes");
+    join_path(sub, sizeof(sub), dir, "sub");
+    join_path(file, sizeof(file), sub, "file.txt");
+    mkdir_p(sub);
+    write_file(file, "first");
+    // Enough live items that the update keeps the deletions in the journal
+    // rather than rewriting it (D73).
+    for (int i = 0; i < 32; i++)
+    {
+        char name[32], other[PATH_MAX];
+        snprintf(name, sizeof(name), "keep-%02d.txt", i);
+        join_path(other, sizeof(other), dir, name);
+        write_file(other, "kept");
+    }
+    fresh_mkdtemp(target, sizeof(target), "plan_target");
+
+    dry_run = 0;
+    backup_test_force_portable_representation(portable);
+    char output[8192];
+    char *paths[] = { dir, NULL };
+    int first_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                        output, sizeof(output));
+    remove_tree(sub);
+    int second_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                         output, sizeof(output));
+    int unchanged_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS,
+                                            paths, output, sizeof(output));
+    mkdir_p(sub);
+    write_file(file, "again");
+    int third_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                        output, sizeof(output));
+    backup_test_force_portable_representation(0);
+
+    char container[PATH_MAX], payload[PATH_MAX];
+    int found = find_container_dir(target, container, sizeof(container));
+    join_path(payload, sizeof(payload), container, "data/EXPLICIT_0/sub/file.txt");
+    check(first_rc == 0 && second_rc == 0 && unchanged_rc == 0,
+          "an update after the removal, changed or not, succeeds");
+    check(third_rc == 0 && found && file_text_is(payload, "again"),
+          "the folder is captured again");
+
+    remove_tree(home);
+    remove_tree(target);
+}
+
+// A root left out and a new root under the same id, as when an explicit
+// path sorts ahead of an earlier one: the new root is captured afresh.
+static void test_update_reuses_a_dropped_root_id(int portable)
+{
+    printf(BLUE "::" NC " production: a %s update captures a new root under a dropped root's id\n",
+           portable ? "portable" : "native");
+
+    char home[PATH_MAX], target[PATH_MAX], a[PATH_MAX], b[PATH_MAX];
+    char file[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_home");
+    setenv("HOME", home, 1);
+    join_path(a, sizeof(a), home, "a/dir");
+    join_path(b, sizeof(b), home, "b/dir");
+    join_path(file, sizeof(file), a, "sub");
+    mkdir_p(file);
+    join_path(file, sizeof(file), a, "sub/file.txt");
+    write_file(file, "a");
+    join_path(file, sizeof(file), b, "sub");
+    mkdir_p(file);
+    join_path(file, sizeof(file), b, "sub/file.txt");
+    write_file(file, "b");
+    fresh_mkdtemp(target, sizeof(target), "plan_target");
+
+    dry_run = 0;
+    backup_test_force_portable_representation(portable);
+    char output[8192];
+    char *first_paths[] = { b, NULL };
+    int first_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS,
+                                        first_paths, output, sizeof(output));
+    char *second_paths[] = { a, b, NULL };
+    int second_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS,
+                                         second_paths, output, sizeof(output));
+    backup_test_force_portable_representation(0);
+
+    char container[PATH_MAX], payload[PATH_MAX];
+    int found = find_container_dir(target, container, sizeof(container));
+    join_path(payload, sizeof(payload), container, "data/EXPLICIT_0/sub/file.txt");
+    int a_kept = file_text_is(payload, "a");
+    join_path(payload, sizeof(payload), container, "data/EXPLICIT_1/sub/file.txt");
+    check(first_rc == 0 && second_rc == 0 && found && a_kept &&
+              file_text_is(payload, "b"),
+          "both roots are captured, each under its own id");
+
+    remove_tree(home);
+    remove_tree(target);
+}
+
 // A second backup of the same install updates the first in place (D72):
 // changed files are recopied, removed ones leave the payload, and a root
 // the new selection lacks is removed with its journal records.
@@ -4359,6 +4462,10 @@ int main(void)
     test_sudo_backup_belongs_to_invoker();
     test_backup_updates_in_place(0);
     test_backup_updates_in_place(1);
+    test_update_reuses_a_dropped_root_id(0);
+    test_update_reuses_a_dropped_root_id(1);
+    test_update_recaptures_a_recreated_folder(0);
+    test_update_recaptures_a_recreated_folder(1);
     test_backup_leaves_another_install_alone();
     test_failed_update_keeps_the_finished_backup();
     test_native_preflight_of_a_changing_source();

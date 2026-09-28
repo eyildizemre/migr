@@ -530,7 +530,8 @@ static int cleanup_work_item(PortableCaptureContext *context,
     if (portable_recorded_parent_open(context, root, item->logical_path,
                                       allow_tombstone,
                                       &parent_fd, leaf, &kind, &state) != 0)
-        return -1;
+        // A deleted item whose folder is gone has no payload left.
+        return allow_tombstone && errno == ENOENT ? 0 : -1;
     if (kind != item->kind || state != item->state ||
         (item->logical_path[0] != '\0' &&
          strcmp(leaf, item->physical_leaf) != 0)) {

@@ -1440,8 +1440,10 @@ int portable_recorded_parent_open(
 
     char target_leaf[SIDECAR_MAX_PHYSICAL_LEAF + 1U];
     if (recorded_state_copy(context, root->id, logical, allow_tombstone,
-                            target_leaf, kind_out, state_out) != 0)
+                            target_leaf, kind_out, state_out) != 0) {
+        errno = EINVAL;
         return -1;
+    }
 
     int root_parent = -1;
     char root_leaf[NAME_MAX + 1U];
@@ -1488,11 +1490,13 @@ int portable_recorded_parent_open(
             char ancestor_leaf[SIDECAR_MAX_PHYSICAL_LEAF + 1U];
             SidecarObjectKind ancestor_kind;
             PortableOwnerState ancestor_state;
-            if (recorded_state_copy(context, root->id, prefix, 0,
-                                    ancestor_leaf, &ancestor_kind,
-                                    &ancestor_state) != 0 ||
+            // A deleted item's folders may have been deleted with it.
+            if (recorded_state_copy(context, root->id, prefix,
+                                    allow_tombstone, ancestor_leaf,
+                                    &ancestor_kind, &ancestor_state) != 0 ||
                 ancestor_kind != SIDECAR_KIND_DIRECTORY) {
                 close(current_fd);
+                errno = EINVAL;
                 return -1;
             }
             int child_fd = open_child_directory(current_fd, ancestor_leaf);
@@ -1631,9 +1635,11 @@ int portable_physical_owner_for_node(
     return 1;
 }
 
+// With allow_tombstone, logical and its folders may be deleted items, whose
+// recorded leaves give the address they had.
 static int portable_recorded_address_matches_current_internal(
     PortableCaptureContext *context, const PortableRootSpec *root,
-    const char *logical, int allow_target_tombstone)
+    const char *logical, int allow_tombstone)
 {
     if (context == NULL || root == NULL || logical == NULL)
         return -1;
@@ -1659,10 +1665,8 @@ static int portable_recorded_address_matches_current_internal(
         char current_suffix[SIDECAR_MAX_COLLISION_SUFFIX + 1U];
         SidecarObjectKind old_kind;
         PortableOwnerState old_state;
-        int is_target = end == logical_length;
-        if (recorded_state_copy(context, root->id, prefix,
-                                allow_target_tombstone && is_target, old_leaf,
-                                &old_kind, &old_state) != 0 ||
+        if (recorded_state_copy(context, root->id, prefix, allow_tombstone,
+                                old_leaf, &old_kind, &old_state) != 0 ||
             portable_current_assignment(context, root, prefix, current_leaf,
                                         current_suffix) != 0)
             return -1;
