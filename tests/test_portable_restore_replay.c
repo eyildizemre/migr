@@ -3187,9 +3187,11 @@ static void test_additional_live_desktop_state_verification_exclusions(void)
         "gnome-shell-extra remains content-verified despite the gnome-shell rule");
 }
 
-static void test_known_desktop_state_rewrites_home(void)
+// VERSION=1 manifests record SOURCE_HOME too since D86.
+static void test_known_desktop_state_rewrites_home(int version)
 {
-    printf(BLUE "::" NC " known desktop-state files rewrite a changed HOME\n");
+    printf(BLUE "::" NC " known desktop-state files rewrite a changed HOME (VERSION=%d)\n",
+           version);
     static const char source_home[] = "/home/vii";
     static const char bookmarks[] =
         "file:///home/vii/Downloads Downloads\n"
@@ -3206,8 +3208,7 @@ static void test_known_desktop_state_rewrites_home(void)
     ManifestRoot roots[2];
     Fixture fixture;
     int opened = home_rewrite_fixture_open(
-        &fixture, roots, MANIFEST_SELECTION_VERSION, source_home,
-        bookmarks, recent);
+        &fixture, roots, version, source_home, bookmarks, recent);
     check(opened == 0, "changed-HOME rewrite fixture is created");
     if (opened != 0)
     {
@@ -3358,7 +3359,7 @@ static void test_known_desktop_state_same_home_is_verbatim(void)
 
 static void test_known_desktop_state_legacy_is_verbatim(void)
 {
-    printf(BLUE "::" NC " legacy desktop-state replay does not guess a source HOME\n");
+    printf(BLUE "::" NC " desktop-state replay does not guess an unrecorded source HOME\n");
     static const char bookmarks[] = "file:///home/old/Downloads Legacy\n";
     static const char recent[] =
         "<bookmark href=\"file:///home/old/Documents/a\"/>\n";
@@ -3367,7 +3368,7 @@ static void test_known_desktop_state_legacy_is_verbatim(void)
     int opened = home_rewrite_fixture_open(
         &fixture, roots, MANIFEST_CURRENT_VERSION, NULL,
         bookmarks, recent);
-    check(opened == 0, "legacy rewrite fixture is created");
+    check(opened == 0, "no-SOURCE_HOME rewrite fixture is created");
     if (opened != 0)
     {
         fixture_close(&fixture);
@@ -3376,7 +3377,7 @@ static void test_known_desktop_state_legacy_is_verbatim(void)
 
     PortableRestoreReplayReport report;
     check(run_replay(&fixture, &report) == 0 && report.failed_count == 0,
-          "legacy desktop-state replay succeeds without source HOME");
+          "desktop-state replay succeeds without source HOME");
     char restored_bookmarks[PATH_MAX], restored_recent[PATH_MAX];
     path_concat(restored_bookmarks, sizeof(restored_bookmarks), fixture.home,
               "/.config/gtk-3.0/bookmarks");
@@ -3384,7 +3385,7 @@ static void test_known_desktop_state_legacy_is_verbatim(void)
               "/.local/share/recently-used.xbel");
     check(file_equals_noatime(restored_bookmarks, bookmarks) &&
               file_equals_noatime(restored_recent, recent),
-          "legacy files remain byte-for-byte unchanged");
+          "files remain byte-for-byte unchanged without SOURCE_HOME");
     fixture_close(&fixture);
 }
 
@@ -4416,7 +4417,8 @@ int main(void)
     test_hardlink_content_verification();
     test_live_desktop_state_verification_exclusion();
     test_additional_live_desktop_state_verification_exclusions();
-    test_known_desktop_state_rewrites_home();
+    test_known_desktop_state_rewrites_home(MANIFEST_SELECTION_VERSION);
+    test_known_desktop_state_rewrites_home(MANIFEST_CURRENT_VERSION);
     test_known_desktop_state_rewrites_xdg_roots();
     test_known_desktop_state_same_home_is_verbatim();
     test_known_desktop_state_legacy_is_verbatim();

@@ -22,6 +22,7 @@
 #include "metadata.h"
 #include "packages.h"
 #include "groups.h"
+#include "home_rewrite.h"
 #include "flatpak.h"
 #include "portable.h"
 #include "portable_restore.h"
@@ -1584,6 +1585,10 @@ static int native_deferral_note(NativeDeferral *deferral, int source_root_fd,
     return -1;
 }
 
+// The new system's user-dirs.dirs stays: it names the XDG folders a restore
+// puts content in (D47, D86).
+static const char user_dirs[] = ".config/user-dirs.dirs";
+
 // Restores an item that lands below HOME at home_relative. With a deferral,
 // the settings of applications open at the start are held back (D69): an
 // item inside such settings waits whole, and settings inside the item are
@@ -1597,6 +1602,8 @@ static int restore_home_item_deferring(
     const RestoreTimestampAnchors *timestamp_anchors,
     size_t *skipped_security_xattrs, BackupCaptureReport *capture_report)
 {
+    if (strcmp(home_relative, user_dirs) == 0)
+        return 0;
     size_t settings_count = deferral != NULL ? deferral->settings->count : 0;
     for (size_t index = 0; index < settings_count; index++)
     {
@@ -1618,13 +1625,20 @@ static int restore_home_item_deferring(
             return -1;
     }
 
-    const char *skipped[WRITER_APPS_MAX];
+    const char *skipped[WRITER_APPS_MAX + 1];
     CloneContext item_ctx = *ctx;
     item_ctx.skipped_count = 0;
     for (size_t index = first; deferral != NULL && index < deferral->count &&
                                item_ctx.skipped_count < WRITER_APPS_MAX;
          index++)
         skipped[item_ctx.skipped_count++] = deferral->items[index].source_rel;
+    char user_dirs_rel[PATH_MAX + 32];
+    if (home_path_within(user_dirs, home_relative) &&
+        snprintf(user_dirs_rel, sizeof(user_dirs_rel), "%s/%s", source_rel,
+                 user_dirs + strlen(home_relative) +
+                     (home_relative[0] != '\0')) <
+            (int)sizeof(user_dirs_rel))
+        skipped[item_ctx.skipped_count++] = user_dirs_rel;
     item_ctx.skipped_paths = skipped;
     return restore_item_at(&item_ctx, source_root_fd, source_rel, home_fd,
                            home_relative, label, source_required,
@@ -2787,6 +2801,44 @@ fail:
     return -1;
 }
 
+// Native restore copies files as they are; afterwards the source HOME and
+// XDG folders are rewritten in the desktop-state files that store file://
+// URIs, as portable replay does while it copies them (D41, D47, D86). A file
+// this run did not write holds no source paths to replace.
+static void restore_native_rewrite_home(int home_fd, const char *home,
+                                        const Manifest *m,
+                                        const RestoreTargetMap *target_map,
+                                        int *had_error)
+{
+    const char *xdg_dirs[XDG_KEY_COUNT] = {0};
+    for (int index = 0; index < m->root_count; index++)
+    {
+        int key = xdg_key_index(m->roots[index].id);
+        if (m->roots[index].policy == ROOT_POLICY_XDG && key >= 0)
+            xdg_dirs[key] = target_map->roots[index].absolute;
+    }
+    HomeRewritePair pairs[HOME_REWRITE_MAX_PAIRS];
+    size_t pair_count = 0;
+    if (home_rewrite_pairs_build(m, xdg_dirs, home, pairs, &pair_count) != 0)
+    {
+        print_error("Error: Could not map the backup's home folder to this "
+                    "system's: %s\n", strerror(errno));
+        *had_error = 1;
+        return;
+    }
+    for (size_t index = 0; pair_count != 0 && index < HOME_REWRITE_FILE_COUNT;
+         index++)
+        if (home_rewrite_file_at(home_fd, home_rewrite_files[index], pairs,
+                                 pair_count) != 0 &&
+            errno != ENOENT)
+        {
+            print_error("Error: Could not point ~/%s at this system's home "
+                        "folder: %s\n", home_rewrite_files[index],
+                        strerror(errno));
+            *had_error = 1;
+        }
+}
+
 static RestoreNativeStatus restore_metadata_item(
     const CloneContext *ctx, int source_root_fd, const char *source_rel,
     int destination_root_fd, const char *destination_rel, const char *label,
@@ -3568,6 +3620,8 @@ int restore_with_options(const char *source, const RestoreOptions *options)
 
     if (!dry_run && mst == MANIFEST_STATUS_VALID)
     {
+        restore_native_rewrite_home(home_fd, home, &m, &target_map,
+                                    &had_error);
         int dconf_database_fd = native_dconf_database_fd(source_root_fd, &m);
         restore_dconf_settings(dconf_database_fd, &had_error);
         if (dconf_database_fd >= 0)

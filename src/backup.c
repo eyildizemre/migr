@@ -1778,6 +1778,9 @@ static int manifest_from_plan(const BackupPlan *plan, Manifest *out)
     }
 
     manifest_set_source_identity(out);
+    char home[PATH_MAX];
+    if (resolve_target_home(home) == 0)
+        manifest_set_source_home(out, home);
 
     return 0;
 }
@@ -3380,6 +3383,7 @@ static int backup_run(const char *target_arg, BackupMode mode,
         if (include_network_config && network_config_present_mask != 0)
             prepared.manifest.has_network_config = 1;
         prepared.manifest.updated = manifest.updated;
+        manifest_set_source_home(&prepared.manifest, manifest.source_home);
     }
     const Manifest *identity_manifest = repr == CLONE_PORTABLE_SIDECAR
         ? &prepared.manifest : &manifest;

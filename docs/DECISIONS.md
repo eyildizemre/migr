@@ -3621,7 +3621,7 @@ options remain in force.
 
 ## D41 — 2026-09-10 — Rewrite source HOME in two known desktop-state files
 
-**Status:** Implemented
+**Status:** Implemented; extended by D86 (VERSION=1 manifests, native restore)
 
 **Decision:** A VERSION=2 portable restore whose recorded `SOURCE_HOME` differs
 from the destination HOME rewrites that exact source-home prefix in only these two
@@ -3876,7 +3876,7 @@ distro-specific install commands remain in force.
 
 ## D47 — 2026-09-16 — Translate XDG names in known desktop state and preserve destination user-dirs state
 
-**Status:** Implemented
+**Status:** Implemented; extended by D86 (VERSION=1 manifests, native restore)
 
 **Decision:** Extend D41's bounded `file://` rewrite for VERSION=2 portable
 selection restores with one source-to-destination pair for every captured XDG
@@ -3989,7 +3989,7 @@ scope.
 
 ## D50 — 2026-09-24 — Load the restored dconf database into a running session
 
-**Status:** Implemented
+**Status:** Implemented; extended by D86 (VERSION=1 portable backups with SOURCE_HOME)
 
 **Decision:** When a portable replay applies the source HOME's
 `.config/dconf/user` (identified like D41's known files, from the manifest source
@@ -5078,4 +5078,38 @@ unreadable to them, and GNOME Files marked the folders read-only.
 **Relationship:** Supersedes D17's "UID remapping and current-user
 normalization are not performed" for the backup's own user; D17's metadata
 contract is otherwise unchanged.
+
+## D86 — 2026-09-29 — Every backup records its source HOME; native restore rewrites it too
+
+**Status:** Implemented
+
+**Decision:** D41 and D47 apply to every backup and both representations.
+- **Manifest:** VERSION=1 manifests carry `SOURCE_HOME` too, after the
+  source identity and before `ROOT_COUNT`, as VERSION=2 ones do.
+  `manifest_set_source_home()` records it only when it is a normalized
+  absolute path. A manifest without it still reads, and restores without
+  rewriting, as before. `manifest_root_source_path()` needs only
+  `SOURCE_HOME`, not VERSION=2: a VERSION=1 HOME-relative root's source is
+  relative to it, and XDG and external roots are absolute.
+- **Portable:** replay's rewrite table, known-file matching, and source paths
+  no longer require VERSION=2, so a VERSION=1 backup with `SOURCE_HOME` also
+  gets D47's kept `user-dirs.dirs` and D50's dconf session load.
+- **Native:** the destination's `.config/user-dirs.dirs` is left out of the
+  walk, as D69 leaves out deferred parts, and never restored. Once every item
+  is restored, `restore_native_rewrite_home()` rewrites the two known files
+  in place (`home_rewrite_file_at()`): through the same descriptor, so they
+  keep their inode, owner, mode, and extended attributes, with their times
+  put back. The rewrite table's XDG destinations come from the restore's
+  target map, resolved before anything was written.
+- **Shared code:** the rewrite table and the streaming copy moved from
+  portable replay to `home_rewrite.c`.
+
+**Why:** VERSION=2 is written only when `migr.conf` excludes something or
+nests roots, so an ordinary backup never recorded its HOME, and D41 and D47
+never ran for it: after a restore under another user name, GTK bookmarks
+pointed at the old, missing home and GNOME Files showed them as broken.
+Native restore had no rewrite at all.
+
+**Relationship:** Extends D41 and D47; completes D50 for VERSION=1 portable
+backups.
 

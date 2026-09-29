@@ -272,10 +272,11 @@ so the session does not overwrite them.
 
 **From an exFAT, FAT32, or NTFS backup**, restore also leaves desktop state
 that services rewrite all the time alone where the new system has already
-written it, and restores it only where nothing is there yet. When your home
-path or folder names differ on the new system, it rewrites them in GTK
-bookmarks and the recent files list, and it keeps the new system's
-`~/.config/user-dirs.dirs`.
+written it, and restores it only where nothing is there yet.
+
+**When your home path or folder names differ** on the new system, restore
+rewrites them in GTK bookmarks and the recent files list, and it keeps the
+new system's `~/.config/user-dirs.dirs`.
 
 **What's left for you.** Restore ends with what it could not do: packages the
 new system could not install, Flatpak applications it could not install, and

@@ -103,6 +103,7 @@ int legacy_manifest_read(const char *backup_dir, char **out, int n)
 /*   MACHINE_ID=<hex>                    (both lines present, or neither)   */
 /*   SOURCE_UID=<uint>                                                      */
 /*   SOURCE_GID=<uint>                   (optional, after SOURCE_UID)       */
+/*   SOURCE_HOME=<enc>                   (absent before D86)                */
 /*   ROOT_COUNT=<uint>                                                      */
 /*   ROOT ID=<id> POLICY=<policy> PAYLOAD=<enc> SOURCE=<enc> [RESTORE=<enc>]*/
 /*   ... exactly ROOT_COUNT such lines ...                                  */
@@ -578,13 +579,15 @@ static ManifestStatus manifest_parse_v1_body(FILE *f, Manifest *out)
                          &fail_status) != 0) goto fail;
     }
 
-    if (m.version == MANIFEST_SELECTION_VERSION)
+    // SOURCE_HOME=<enc>: required by VERSION=2; VERSION=1 manifests written
+    // before D86 lack it.
+    if (line_key_is(line, "SOURCE_HOME", key_len))
     {
-        if (!line_key_is(line, "SOURCE_HOME", key_len) ||
-            encoding_percent_decode(ENCODING_MODE_MANIFEST_PATH, value,
+        if (encoding_percent_decode(ENCODING_MODE_MANIFEST_PATH, value,
                                     m.source_home, sizeof(m.source_home)) != 0) goto fail;
         if (read_kv_line(f, line, sizeof(line), &value, &key_len, &fail_status) != 0) goto fail;
     }
+    else if (m.version == MANIFEST_SELECTION_VERSION) goto fail;
 
     // ROOT_COUNT=<uint>
     if (!line_key_is(line, "ROOT_COUNT", key_len)) goto fail;
@@ -961,7 +964,7 @@ static int manifest_serialize(FILE *f, const Manifest *m)
         fprintf(f, "UPDATED=%jd\n", (intmax_t)m->updated) < 0)
         failed = 1;
 
-    if (!failed && m->version == MANIFEST_SELECTION_VERSION)
+    if (!failed && m->source_home[0] != '\0')
     {
         char home[MANIFEST_ENC_MAX];
         if (encoding_percent_encode(ENCODING_MODE_MANIFEST_PATH, m->source_home,
@@ -1112,10 +1115,16 @@ const char *manifest_root_label(const ManifestRoot *root)
     return leaf[0] != '\0' ? leaf : root->id;
 }
 
+void manifest_set_source_home(Manifest *m, const char *home)
+{
+    m->source_home[0] = '\0';
+    if (canonical_path(home, 1, 0))
+        strcpy(m->source_home, home);
+}
+
 int manifest_root_source_path(const Manifest *m, int root_index, char out[PATH_MAX])
 {
-    if (!m || m->version != MANIFEST_SELECTION_VERSION || root_index < 0 ||
-        root_index >= m->root_count || !m->roots ||
+    if (!m || root_index < 0 || root_index >= m->root_count || !m->roots ||
         !canonical_path(m->source_home, 1, 0)) return -1;
     const ManifestRoot *root = &m->roots[root_index];
     if (root->source_path[0] == '/')
@@ -1133,7 +1142,8 @@ int manifest_selection_valid(const Manifest *m)
 {
     if (!m) return 0;
     if (m->version == MANIFEST_CURRENT_VERSION)
-        return !m->source_home[0] && !m->exclude_count && !m->excludes;
+        return (!m->source_home[0] || canonical_path(m->source_home, 1, 0)) &&
+               !m->exclude_count && !m->excludes;
     if (m->version != MANIFEST_SELECTION_VERSION || !canonical_path(m->source_home, 1, 0) ||
         m->scope == MANIFEST_SCOPE_EXPLICIT || m->root_count < 0 || m->root_count > MANIFEST_MAX_ROOTS ||
         (m->root_count && !m->roots) || m->exclude_count > MANIFEST_MAX_EXCLUDES ||

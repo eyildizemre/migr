@@ -241,9 +241,9 @@ int selection_plan_manifest(const SelectionPlan *plan, Manifest *out)
         m.roots = calloc(plan->root_count, sizeof(*m.roots));
         if (!m.roots) goto fail;
     }
+    manifest_set_source_home(&m, plan->home);
     if (m.version == MANIFEST_SELECTION_VERSION)
     {
-        strcpy(m.source_home, plan->home);
         m.exclude_count = plan->excludes.count;
         if (m.exclude_count)
         {

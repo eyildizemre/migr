@@ -72,7 +72,7 @@ VALGRIND_TESTS = \
 TARGET = migr
 STATIC_TARGET = migr-static
 VPATH = src
-SRCS = selection_match.c selection.c config.c main.c detect.c report.c backup.c backup_plan.c packages.c groups.c flatpak.c restore.c dconf_restore.c live_state.c utils.c selfcopy.c fileops.c fsprobe.c xdg.c manifest.c encoding.c portable_name.c container.c metadata.c metadata_xattr.c portable_hashset.c portable_prescan.c portable_fsops.c portable.c portable_reconcile.c portable_restore_replay.c portable_restore_shared.c portable_restore_orchestrate.c portable_restore_preflight.c sidecar.c sidecar_state.c sidecar_state_map.c hash.c verify.c repair.c source_snapshot.c writer_apps.c
+SRCS = selection_match.c selection.c config.c main.c detect.c report.c backup.c backup_plan.c packages.c groups.c flatpak.c restore.c dconf_restore.c live_state.c utils.c selfcopy.c fileops.c fsprobe.c xdg.c manifest.c encoding.c portable_name.c container.c metadata.c metadata_xattr.c portable_hashset.c portable_prescan.c portable_fsops.c portable.c portable_reconcile.c portable_restore_replay.c portable_restore_shared.c portable_restore_orchestrate.c portable_restore_preflight.c sidecar.c sidecar_state.c sidecar_state_map.c hash.c verify.c repair.c source_snapshot.c writer_apps.c home_rewrite.c
 OBJS = $(SRCS:.c=.o)
 # Every object but main.o, which tests link against.
 LIB_OBJS = $(filter-out main.o,$(OBJS))

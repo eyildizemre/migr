@@ -301,9 +301,13 @@ void manifest_free(Manifest *m);
  * (".bashrc"), else the last component of its source ("Desktop"), else its
  * id. */
 const char *manifest_root_label(const ManifestRoot *root);
-/* Filesystem-independent VERSION=2 source addressing and entry ownership.
- * On a validated manifest, an entry is owned (1), excluded/delegated (0), or invalid (-1).
- * Callers must reject unowned entries found in finalized payloads. */
+/* Records home as the source HOME when it is a normalized absolute path;
+ * otherwise leaves none, as manifests written before D86 have none. */
+void manifest_set_source_home(Manifest *m, const char *home);
+/* Filesystem-independent source addressing (needs SOURCE_HOME) and, for
+ * VERSION=2, entry ownership. On a validated manifest, an entry is owned (1),
+ * excluded/delegated (0), or invalid (-1). Callers must reject unowned
+ * entries found in finalized payloads. */
 int manifest_root_source_path(const Manifest *m, int root_index, char out[PATH_MAX]);
 int manifest_entry_owned(const Manifest *m, int root_index, const char *relative);
 int manifest_selection_valid(const Manifest *m);

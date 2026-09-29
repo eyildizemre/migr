@@ -2446,6 +2446,65 @@ static void test_restore_gives_the_backup_users_items_to_the_restorer(void)
     remove_tree(home);
 }
 
+// A native restore onto another home path and locale points GTK bookmarks at
+// the new home's folders and keeps the new system's user-dirs.dirs (D86).
+static void test_native_restore_rewrites_the_source_home(void)
+{
+    printf(BLUE "::" NC " restore dispatch: native desktop state follows the new home\n");
+    char source[PATH_MAX], home[PATH_MAX], output[16384];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_home_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_home_home");
+    setenv("HOME", home, 1);
+
+    ManifestRoot roots[2];
+    memset(roots, 0, sizeof(roots));
+    strcpy(roots[0].id, "CONFIG");
+    roots[0].policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(roots[0].payload_path, "settings/config");
+    strcpy(roots[0].source_path, ".config");
+    strcpy(roots[0].restore_path, ".config");
+    roots[0].has_restore_path = 1;
+    strcpy(roots[1].id, "XDG_DOCUMENTS_DIR");
+    roots[1].policy = ROOT_POLICY_XDG;
+    strcpy(roots[1].payload_path, "Documents");
+    strcpy(roots[1].source_path, "/home/olduser/Belgeler");
+    Manifest manifest;
+    make_v1_manifest(&manifest, roots, 2);
+    strcpy(manifest.source_home, "/home/olduser");
+    int ok = manifest_write_v1(source, &manifest) == 0;
+    write_payload_file(source, "data/settings/config/gtk-3.0", "bookmarks",
+                       "file:///home/olduser/Belgeler\n"
+                       "file:///home/olduser/Music Music\n");
+    write_payload_file(source, "data/settings/config", "user-dirs.dirs",
+                       "XDG_DOCUMENTS_DIR=\"$HOME/Belgeler\"\n");
+    write_payload_file(source, "data/Documents", "doc.txt", "doc");
+    remove_fixture_packages(source);
+    static const char own_user_dirs[] =
+        "XDG_DOCUMENTS_DIR=\"$HOME/Documents\"\n";
+    write_payload_file(home, ".config", "user-dirs.dirs", own_user_dirs);
+
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    int rc = ok ? run_restore_capturing_with_input(source, "y\n", output,
+                                                   sizeof(output))
+                : -1;
+    dry_run = previous_dry_run;
+
+    char path[PATH_MAX], expected[PATH_MAX * 2 + 64];
+    snprintf(expected, sizeof(expected),
+             "file://%s/Documents\nfile://%s/Music Music\n", home, home);
+    join_path(path, sizeof(path), home, ".config/gtk-3.0/bookmarks");
+    int bookmarks = file_content_is(path, expected);
+    join_path(path, sizeof(path), home, ".config/user-dirs.dirs");
+    int user_dirs = file_content_is(path, own_user_dirs);
+    join_path(path, sizeof(path), home, "Documents/doc.txt");
+    check(rc == 0 && bookmarks && file_content_is(path, "doc"),
+          "GTK bookmarks point at the new home's folders");
+    check(user_dirs, "the new system's user-dirs.dirs is kept");
+    remove_tree(source);
+    remove_tree(home);
+}
+
 static void test_open_application_settings_are_deferred(void)
 {
     printf(BLUE "::" NC " restore dispatch: an open application's settings are restored last\n");
@@ -4435,6 +4494,7 @@ int main(void)
     test_dispatch_refuses_portable_v1();
     test_running_writer_detection();
     test_restore_gives_the_backup_users_items_to_the_restorer();
+    test_native_restore_rewrites_the_source_home();
     test_open_application_settings_are_deferred();
     test_native_open_application_settings_are_deferred();
     test_legacy_open_application_settings_are_deferred();
