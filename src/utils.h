@@ -316,6 +316,14 @@ int backup_sync_due(off_t *bytes_since_sync, off_t chunk_size,
 int path_join(char *buf, size_t size, const char *dir, const char *name);
 
 /**
+ * @brief Copies path without its trailing slashes ("/" stays "/"), so a
+ *        folder typed as "dir/" joins a name as "dir/name", not "dir//name".
+ *
+ * @return 0 on success, -1 if the result does not fit in size.
+ */
+int path_trim_trailing_slashes(char *buf, size_t size, const char *path);
+
+/**
  * @brief Like path_join but uses only the first name_len bytes of name.
  *
  * For joining a path span that is not NUL-terminated at the boundary, such

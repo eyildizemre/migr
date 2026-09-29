@@ -936,10 +936,15 @@ static void remove_unpublished(BackupContainer *container, int dest_root_fd)
     (void)unlinkat(dest_root_fd, name, AT_REMOVEDIR);
 }
 
-int repair_backup(const char *source, const char *dest_root)
+int repair_backup(const char *source, const char *dest_root_arg)
 {
-    if (source == NULL || dest_root == NULL)
+    if (source == NULL || dest_root_arg == NULL)
         return 1;
+    // A path too long to trim is refused below like any unusable one.
+    char trimmed[PATH_MAX];
+    const char *dest_root =
+        path_trim_trailing_slashes(trimmed, sizeof(trimmed), dest_root_arg) == 0
+            ? trimmed : dest_root_arg;
     if (destination_inside_source(source, dest_root))
     {
         print_error("Error: the repaired copy cannot be written inside the "

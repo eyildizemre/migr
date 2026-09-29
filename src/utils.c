@@ -856,6 +856,16 @@ int path_join(char *buf, size_t size, const char *dir, const char *name)
     return path_join_n(buf, size, dir, name, strlen(name));
 }
 
+int path_trim_trailing_slashes(char *buf, size_t size, const char *path)
+{
+    int length = snprintf(buf, size, "%s", path);
+    if (length < 0 || (size_t)length >= size)
+        return -1;
+    while (length > 1 && buf[length - 1] == '/')
+        buf[--length] = '\0';
+    return 0;
+}
+
 int path_covers(const char *parent, const char *path)
 {
     size_t n = strlen(parent);

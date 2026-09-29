@@ -608,7 +608,13 @@ EOF
     local explicit_dest="$TEST_DIR/conf-explicit-dest"
     mkdir -p "$explicit_source" "$explicit_dest"
     printf 'config bypass\n' > "$explicit_source/file.txt"
-    "$MIGR" backup "$explicit_dest" "$explicit_source" >/dev/null
+    local explicit_output
+    explicit_output=$("$MIGR" backup "$explicit_dest/" "$explicit_source" 2>&1)
+    if grep -q '//' <<<"$explicit_output"; then
+        echo -e "  ${RED}✗${NC} A destination typed with a trailing slash printed a double slash."
+        exit 1
+    fi
+    echo -e "  ${GREEN}✓${NC} A destination typed with a trailing slash prints single slashes."
     local explicit_container
     explicit_container=$(sole_final_container "$explicit_dest")
     assert_succeeds_with "Dry run mode enabled" "$MIGR" restore "$explicit_container" --dry-run

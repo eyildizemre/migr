@@ -3177,10 +3177,15 @@ static int backup_sidecar_readback(int container_fd, uint64_t *valid_bytes,
                ? 0 : 1;
 }
 
-static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
-                      const SelectionPlan *selection, int include_self,
-                      int include_network_config)
+static int backup_run(const char *target_arg, BackupMode mode,
+                      BackupPlan plan, const SelectionPlan *selection,
+                      int include_self, int include_network_config)
 {
+    // A path too long to trim is refused below like any unusable one.
+    char trimmed[PATH_MAX];
+    const char *target =
+        path_trim_trailing_slashes(trimmed, sizeof(trimmed), target_arg) == 0
+            ? trimmed : target_arg;
     // Asked before the destination is created, probed or previewed, so a
     // destination inside a selected root is refused identically in a live run
     // and a dry run, with nothing written either way.
