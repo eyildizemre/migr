@@ -407,6 +407,26 @@ static int restore_network_config_file_at(int network_fd, int dest_dir_fd,
     return 1;
 }
 
+// The backup's user, as its manifest records it, becomes the user this
+// restore acts for, the sudo invoker as elsewhere (D38): a new system may
+// give the same person another uid (D85). Without a recorded source user,
+// owners stay as recorded.
+static OwnerMap restore_owner_map(const Manifest *m)
+{
+    OwnerMap map = {0};
+    uid_t uid = geteuid();
+    gid_t gid = getegid();
+    if (!m->has_source_identity || sudo_invoker(&uid, &gid, NULL) < 0)
+        return map;
+    map.map_uid = 1;
+    map.from_uid = m->source_uid;
+    map.to_uid = uid;
+    map.map_gid = m->has_source_gid;
+    map.from_gid = m->source_gid;
+    map.to_gid = gid;
+    return map;
+}
+
 // What a restore leaves for the user to do by hand: written by the steps
 // that re-create system state, shown at the very end of the run, and kept
 // next to the backup.
@@ -3176,6 +3196,7 @@ int restore_with_options(const char *source, const RestoreOptions *options)
             .destination_home_fd = home_fd,
             .destination_home_path = home,
             .destination_timestamp_policy = {0},
+            .owner_map = restore_owner_map(&m),
             .skip_content_verification = skip_content_verification,
             .before_confirmation = restore_warn_running_writers,
             .before_confirmation_context = &deferral,
@@ -3371,7 +3392,9 @@ int restore_with_options(const char *source, const RestoreOptions *options)
 
     CloneContext ctx = {
         .operation = CLONE_RESTORE,
-        .representation = CLONE_NATIVE_TREE
+        .representation = CLONE_NATIVE_TREE,
+        .owner_map = mst == MANIFEST_STATUS_VALID ? restore_owner_map(&m)
+                                                 : (OwnerMap){0}
     };
     BackupCaptureReport capture_report;
     backup_capture_report_init(&capture_report);

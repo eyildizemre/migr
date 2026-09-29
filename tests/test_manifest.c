@@ -119,6 +119,8 @@ static void test_full_roundtrip_with_problem_bytes(void)
     m.has_source_identity = 1;
     strcpy(m.machine_id, "deadbeefcafef00d0123456789abcdef");
     m.source_uid = 1000;
+    m.has_source_gid = 1;
+    m.source_gid = 1001;
     m.has_self_binary = 1;
     strcpy(m.arch, "x86_64");
 
@@ -159,6 +161,8 @@ static void test_full_roundtrip_with_problem_bytes(void)
         check(read.has_source_identity == 1, "source identity presence round-trips");
         check(strcmp(read.machine_id, m.machine_id) == 0, "machine_id round-trips");
         check(read.source_uid == 1000, "source_uid round-trips");
+        check(read.has_source_gid == 1 && read.source_gid == 1001,
+              "source_gid round-trips");
         check(read.has_self_binary == 1, "self-binary presence round-trips");
         check(strcmp(read.arch, "x86_64") == 0,
               "ARCH round-trips after source identity");
@@ -187,6 +191,17 @@ static void test_full_roundtrip_with_problem_bytes(void)
 
         manifest_free(&read); // heap-owned (calloc'd by manifest_read_v1) -- safe to free
     }
+
+    // A manifest written before SOURCE_GID existed still reads, without it.
+    m.has_source_gid = 0;
+    check(manifest_write_v1(test_dir, &m) == 0,
+          "a manifest without SOURCE_GID is written");
+    st = manifest_read_v1(test_dir, &read);
+    check(st == MANIFEST_STATUS_VALID && read.has_source_gid == 0 &&
+              read.source_uid == 1000 && read.has_self_binary == 1,
+          "a manifest without SOURCE_GID reads back without it");
+    if (st == MANIFEST_STATUS_VALID)
+        manifest_free(&read);
 
     remove_manifest(test_dir);
 }

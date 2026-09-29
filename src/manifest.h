@@ -142,6 +142,11 @@ typedef struct {
     int has_source_identity;
     char machine_id[MANIFEST_MACHINE_ID_MAX];
     uid_t source_uid;
+    /* The source user's primary group; recorded since D85, so older
+     * manifests lack it. Restore gives the source user's items to the user
+     * it acts for (D85). */
+    int has_source_gid;
+    gid_t source_gid;
     int has_self_binary;
     char arch[MIGR_ARCH_MAX];
     int has_network_config;

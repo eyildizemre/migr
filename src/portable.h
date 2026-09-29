@@ -86,6 +86,7 @@ typedef struct {
     int has_source_identity;
     const char *machine_id;
     uid_t source_uid;
+    gid_t source_gid;
     const PortableRootSpec *roots;
     size_t root_count;
     const struct SelectionPlan *selection_plan; /* Borrowed, optional. */

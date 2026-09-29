@@ -2331,6 +2331,121 @@ static int run_deferred_settings_restore(const char *input, char *output,
     return rc;
 }
 
+enum { BACKUP_USER_UID = 54321, BACKUP_USER_GID = 54322 };
+
+// A backup made by a user this system knows under another uid.
+static void make_foreign_user_manifest(Manifest *manifest, ManifestRoot *root,
+                                       const char *source_path)
+{
+    memset(root, 0, sizeof(*root));
+    strcpy(root->id, "NOTES");
+    root->policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root->payload_path, "NOTES");
+    strcpy(root->source_path, source_path);
+    strcpy(root->restore_path, "notes");
+    root->has_restore_path = 1;
+    make_v1_manifest(manifest, root, 1);
+    manifest->has_source_identity = 1;
+    strcpy(manifest->machine_id, "0123456789abcdef0123456789abcdef");
+    manifest->source_uid = BACKUP_USER_UID;
+    manifest->has_source_gid = 1;
+    manifest->source_gid = BACKUP_USER_GID;
+}
+
+static int restored_file_is_mine(const char *home)
+{
+    char path[PATH_MAX];
+    struct stat st;
+    join_path(path, sizeof(path), home, "notes/file.txt");
+    return file_content_is(path, "notes") && stat(path, &st) == 0 &&
+           st.st_uid == geteuid() && st.st_gid == getegid();
+}
+
+// The backup's user becomes the user restore acts for (D85): a new system
+// may give the same person another uid.
+static void test_restore_gives_the_backup_users_items_to_the_restorer(void)
+{
+    printf(BLUE "::" NC " restore dispatch: the backup user's items go to the restoring user\n");
+    char source[PATH_MAX], home[PATH_MAX], output[16384];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_owner_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_owner_home");
+    setenv("HOME", home, 1);
+
+    ManifestRoot root;
+    Manifest manifest;
+    make_foreign_user_manifest(&manifest, &root, "/source/notes");
+    manifest.representation = CLONE_PORTABLE_SIDECAR;
+    manifest.sidecar_version = SIDECAR_VERSION;
+    int ok = manifest_write_v1(source, &manifest) == 0;
+    write_payload_file(source, "data/NOTES", "file.txt", "notes");
+    SidecarEntry entries[] = {
+        { .root_id = sidecar_text("NOTES"), .logical_path = sidecar_text(""),
+          .physical_leaf = sidecar_text(""), .kind = SIDECAR_KIND_DIRECTORY,
+          .mode = 0700, .uid = BACKUP_USER_UID, .gid = BACKUP_USER_GID,
+          .atime_sec = 1700000960, .mtime_sec = 1700000961 },
+        { .root_id = sidecar_text("NOTES"),
+          .logical_path = sidecar_text("file.txt"),
+          .physical_leaf = sidecar_text("file.txt"),
+          .kind = SIDECAR_KIND_REGULAR, .mode = 0600, .uid = BACKUP_USER_UID,
+          .gid = BACKUP_USER_GID, .atime_sec = 1700000962,
+          .mtime_sec = 1700000963, .size = 5,
+          .content_digest = hash_fnv1a_bytes(HASH_FNV1A_OFFSET_BASIS,
+                                             (const unsigned char *)"notes",
+                                             5) }
+    };
+    int container_fd = open(source, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    SidecarLog sidecar = {0};
+    ok = ok && container_fd >= 0 &&
+         sidecar_log_create_at(container_fd, &sidecar) == SIDECAR_OPEN_FRESH;
+    for (size_t index = 0; ok && index < sizeof(entries) / sizeof(entries[0]);
+         index++)
+        ok = append_committed_sidecar_entry(&sidecar, &entries[index]) == 0;
+    if (container_fd >= 0)
+    {
+        if (sidecar_log_close(&sidecar) != SIDECAR_STATUS_OK)
+            ok = 0;
+        close(container_fd);
+    }
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    int rc = ok ? run_restore_capturing_with_input(source, "y\n", output,
+                                                   sizeof(output))
+                : -1;
+    check(rc == 0 && restored_file_is_mine(home),
+          "a portable restore gives them to the restoring user");
+    remove_tree(source);
+    remove_tree(home);
+
+    // A native payload carries its owners on the files, which only root can
+    // set to another user.
+    if (geteuid() != 0)
+    {
+        printf("  (native case needs root; skipped)\n");
+        dry_run = previous_dry_run;
+        return;
+    }
+    fresh_mkdtemp(source, sizeof(source), "dispatch_owner_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_owner_home");
+    setenv("HOME", home, 1);
+    make_foreign_user_manifest(&manifest, &root, ".notes");
+    ok = manifest_write_v1(source, &manifest) == 0;
+    write_payload_file(source, "data/NOTES", "file.txt", "notes");
+    remove_fixture_packages(source);
+    char payload[PATH_MAX], file[PATH_MAX];
+    join_path(payload, sizeof(payload), source, "data/NOTES");
+    join_path(file, sizeof(file), payload, "file.txt");
+    ok = ok && chown(payload, BACKUP_USER_UID, BACKUP_USER_GID) == 0 &&
+         chown(file, BACKUP_USER_UID, BACKUP_USER_GID) == 0;
+    rc = ok ? run_restore_capturing_with_input(source, "y\n", output,
+                                               sizeof(output))
+            : -1;
+    dry_run = previous_dry_run;
+    check(rc == 0 && restored_file_is_mine(home),
+          "a native restore gives them to the restoring user");
+    remove_tree(source);
+    remove_tree(home);
+}
+
 static void test_open_application_settings_are_deferred(void)
 {
     printf(BLUE "::" NC " restore dispatch: an open application's settings are restored last\n");
@@ -4319,6 +4434,7 @@ int main(void)
     test_dispatch_requires_v1_manifest_for_final_container_name();
     test_dispatch_refuses_portable_v1();
     test_running_writer_detection();
+    test_restore_gives_the_backup_users_items_to_the_restorer();
     test_open_application_settings_are_deferred();
     test_native_open_application_settings_are_deferred();
     test_legacy_open_application_settings_are_deferred();

@@ -54,6 +54,7 @@ typedef struct {
     int destination_home_fd;
     const char *destination_home_path;
     const char * const *destination_xdg_dirs;
+    const OwnerMap *owner_map;
     int xdg_anchor_fd[XDG_KEY_COUNT];
     char xdg_anchor_prefix[XDG_KEY_COUNT][PATH_MAX];
     DestinationProfileAnchorCache home_profile_cache;
@@ -804,6 +805,9 @@ static int collect_metadata_profile(Collection *collection,
         errno = E2BIG;
         return -2;
     }
+    // Profiled as restored: the backup user's items go to the restoring
+    // user (D85).
+    metadata_owner_map_apply(collection->owner_map, &desired);
     mode_t type;
     if (sidecar_kind_to_type(entry->kind, &type) != 0)
         return -2;
@@ -1554,6 +1558,7 @@ int portable_restore_preflight_at(
         .destination_home_fd = request->destination_home_fd,
         .destination_home_path = request->destination_home_path,
         .destination_xdg_dirs = request->destination_xdg_dirs,
+        .owner_map = &request->owner_map,
         .progress = &progress
     };
     destination_profile_cache_init(&collection.home_profile_cache);

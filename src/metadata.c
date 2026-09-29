@@ -568,6 +568,16 @@ static int metadata_stat_core_matches(const struct stat *actual,
            same_timespec(actual->st_mtim, mtime);
 }
 
+void metadata_owner_map_apply(const OwnerMap *map, struct stat *st)
+{
+    if (map == NULL || st == NULL)
+        return;
+    if (map->map_uid && st->st_uid == map->from_uid)
+        st->st_uid = map->to_uid;
+    if (map->map_gid && st->st_gid == map->from_gid)
+        st->st_gid = map->to_gid;
+}
+
 int metadata_apply_ownership_and_mode_fd(int fd, const struct stat *desired)
 {
     if (fd < 0 || desired == NULL)

@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
+#include "metadata.h"
 #include "utils.h"
 
 /**
@@ -37,6 +38,7 @@ typedef struct CloneContext {
      * leaves out so the caller can restore them last (D69). Borrowed. */
     const char *const *skipped_paths;
     size_t skipped_count;
+    OwnerMap owner_map; /* Restore only: who gets the backup user's items. */
 } CloneContext;
 
 /* Opaque native hardlink map ownership. */

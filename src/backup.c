@@ -347,6 +347,14 @@ static uid_t backup_source_uid(void)
     return backup_invoker_identity(&uid, &gid) == 0 ? uid : getuid();
 }
 
+// That user's primary group, recorded beside the uid (D85).
+static gid_t backup_source_gid(void)
+{
+    uid_t uid;
+    gid_t gid;
+    return backup_invoker_identity(&uid, &gid) == 0 ? gid : getgid();
+}
+
 // A sudo backup on a destination that records ownership belongs to the user
 // who ran it (D70), so they can look at, preview, and delete it without
 // sudo. Only migr's own entries change hands: the destination folder when
@@ -1736,6 +1744,8 @@ static void manifest_set_source_identity(Manifest *out)
     {
         memcpy(out->machine_id, machine_id, strlen(machine_id) + 1);
         out->source_uid = backup_source_uid();
+        out->source_gid = backup_source_gid();
+        out->has_source_gid = 1;
         out->has_source_identity = 1;
     }
 }
@@ -1836,8 +1846,8 @@ static void portable_root_specs_from_plan(const BackupPlan *plan,
 // strings are borrowed from plan or machine_id and must outlive the request.
 static int portable_capture_request_from_plan(
     const BackupPlan *plan, const char *machine_id, int has_machine_id,
-    uid_t source_uid, int nsec_exact, int case_sensitive,
-    PortableRootSpec *roots_storage, PortableCaptureRequest *out)
+    int nsec_exact, int case_sensitive, PortableRootSpec *roots_storage,
+    PortableCaptureRequest *out)
 {
     if (plan == NULL || out == NULL ||
         (plan->root_count > 0 && roots_storage == NULL))
@@ -1849,7 +1859,8 @@ static int portable_capture_request_from_plan(
         .scope = plan->scope,
         .has_source_identity = has_machine_id,
         .machine_id = has_machine_id ? machine_id : NULL,
-        .source_uid = source_uid,
+        .source_uid = backup_source_uid(),
+        .source_gid = backup_source_gid(),
         .roots = plan->root_count > 0 ? roots_storage : NULL,
         .root_count = (size_t)plan->root_count,
         .nsec_exact = nsec_exact,
@@ -1860,13 +1871,13 @@ static int portable_capture_request_from_plan(
 
 static int portable_capture_request_for_execution(
     const BackupPlan *plan, const SelectionPlan *selection,
-    const char *machine_id, int has_machine_id, uid_t source_uid,
-    int nsec_exact, int case_sensitive, PortableRootSpec *roots_storage,
+    const char *machine_id, int has_machine_id, int nsec_exact,
+    int case_sensitive, PortableRootSpec *roots_storage,
     PortableCaptureRequest *out)
 {
     if (portable_capture_request_from_plan(
-            plan, machine_id, has_machine_id, source_uid, nsec_exact,
-            case_sensitive, roots_storage, out) != 0)
+            plan, machine_id, has_machine_id, nsec_exact, case_sensitive,
+            roots_storage, out) != 0)
         return -1;
     if (selection != NULL &&
         portable_capture_request_set_selection(
@@ -2938,7 +2949,7 @@ static int backup_dry_run(const char *target, BackupMode mode,
             advisory_machine_id, sizeof(advisory_machine_id)) == 0;
         PortableCaptureRequest advisory_request;
         int request_result = portable_capture_request_for_execution(
-            plan, selection, advisory_machine_id, advisory_has_machine_id, backup_source_uid(),
+            plan, selection, advisory_machine_id, advisory_has_machine_id,
             advisory_profile.nsec_exact,
             advisory_profile.capabilities[FS_CAP_CASE_SENSITIVE].status ==
                 FS_CAP_SUPPORTED,
@@ -3342,7 +3353,7 @@ static int backup_run(const char *target_arg, BackupMode mode,
         int has_machine_id = read_machine_id(portable_machine_id,
                                              sizeof(portable_machine_id)) == 0;
         if (portable_capture_request_for_execution(
-                &plan, selection, portable_machine_id, has_machine_id, backup_source_uid(),
+                &plan, selection, portable_machine_id, has_machine_id,
                 profile.nsec_exact,
                 profile.capabilities[FS_CAP_CASE_SENSITIVE].status ==
                     FS_CAP_SUPPORTED,

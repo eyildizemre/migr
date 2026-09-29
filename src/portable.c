@@ -3748,6 +3748,8 @@ static int build_manifest(const PortableCaptureRequest *request,
                 return -1;
             }
             manifest->source_uid = request->source_uid;
+            manifest->source_gid = request->source_gid;
+            manifest->has_source_gid = 1;
         }
         if (!manifest_selection_valid(manifest)) {
             manifest_free(manifest);
@@ -3767,6 +3769,8 @@ static int build_manifest(const PortableCaptureRequest *request,
                       request->machine_id) != 0)
             return -1;
         manifest->source_uid = request->source_uid;
+        manifest->source_gid = request->source_gid;
+        manifest->has_source_gid = 1;
     }
 
     if (request->root_count > MANIFEST_MAX_ROOTS ||

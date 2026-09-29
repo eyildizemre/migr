@@ -258,6 +258,9 @@ Groups
   OK: Restore complete: 31 items restored
 ```
 
+**Your files stay yours.** What belonged to you in the backup belongs to you
+on the new system, even when it gives your account another user ID.
+
 **Open applications.** VS Code, the common browsers, and Flatpak applications
 rewrite their settings while they run or when they close, so their settings are
 restored last. If one is still open then, restore asks you to close it and

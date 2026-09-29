@@ -1337,16 +1337,21 @@ static int copy_file_contents(int src_fd, int dest_fd, off_t expected_size,
 
 // A source that changed since desired was taken fails the tail, unless
 // source_changed is given: a live backup source (D63) then only sets it.
+// desired is the source object as snapshotted; owner_map (NULL for none)
+// gives the backup user's items to the restoring user (D85).
 static int apply_fd_metadata_tail(int destination_fd,
                                   const struct stat *desired,
+                                  const OwnerMap *owner_map,
                                   int source_fd,
                                   MetadataTimestampPolicy policy,
                                   size_t *out_skipped_security,
                                   int *source_changed)
 {
+    struct stat target = *desired;
+    metadata_owner_map_apply(owner_map, &target);
     PortableXattrs xattrs = {0};
     int failed = metadata_apply_ownership_and_mode_fd(destination_fd,
-                                                       desired) != 0;
+                                                       &target) != 0;
     if (!failed && collect_xattrs(source_fd, &xattrs) != 0)
         failed = 1;
     struct stat after;
@@ -1369,7 +1374,7 @@ static int apply_fd_metadata_tail(int destination_fd,
         if (xattr_result != 0)
             failed = 1;
     }
-    if (!failed && metadata_apply_times_fd(destination_fd, desired, policy) != 0)
+    if (!failed && metadata_apply_times_fd(destination_fd, &target, policy) != 0)
         failed = 1;
     xattrs_free(&xattrs);
     return failed ? -1 : 0;
@@ -1529,8 +1534,9 @@ static BackupCaptureStatus capture_regular_at(
                          !S_ISREG(opened_dest.st_mode);
             int tail_changed = 0;
             if (!failed &&
-                apply_fd_metadata_tail(dest_fd, &source_snapshot, src_fd,
-                                       policy, NULL, &tail_changed) != 0)
+                apply_fd_metadata_tail(dest_fd, &source_snapshot, NULL,
+                                       src_fd, policy, NULL,
+                                       &tail_changed) != 0)
                 failed = 1;
             if (!failed && tail_changed)
                 backup_capture_report_note_change(
@@ -1620,8 +1626,8 @@ static BackupCaptureStatus capture_regular_at(
         backup_capture_reread_pause(attempt);
     }
     if (!failed &&
-        apply_fd_metadata_tail(dest_fd, &source_snapshot, src_fd, policy,
-                               NULL, &changed) != 0)
+        apply_fd_metadata_tail(dest_fd, &source_snapshot, NULL, src_fd,
+                               policy, NULL, &changed) != 0)
         failed = 1;
     if (!failed && changed)
         backup_capture_report_note_change(report, BACKUP_SOURCE_CHANGED, src);
@@ -1766,7 +1772,7 @@ static BackupCaptureStatus capture_directory_at(
     }
     int directory_changed = 0;
     if (result == BACKUP_CAPTURE_OK &&
-        apply_fd_metadata_tail(child_fd, &source_snapshot, source_fd,
+        apply_fd_metadata_tail(child_fd, &source_snapshot, NULL, source_fd,
                                metadata_policy_from_context(ctx), NULL,
                                &directory_changed) != 0)
         result = BACKUP_CAPTURE_ERROR;
@@ -3126,8 +3132,10 @@ static RestoreNativeStatus restore_entry_symlink(
             restore_report_failure(restore_report, logical_path);
             return -1;
         }
+        struct stat target_st = desired_st;
+        metadata_owner_map_apply(&ctx->owner_map, &target_st);
         failed = metadata_apply_symlink_ownership_at(dest_parent_fd, dest_leaf,
-                                                     &desired_st) != 0;
+                                                     &target_st) != 0;
         if (!failed)
         {
             size_t skipped_security = 0;
@@ -3140,7 +3148,7 @@ static RestoreNativeStatus restore_entry_symlink(
         }
         if (!failed &&
             metadata_apply_symlink_times_at(
-                dest_parent_fd, dest_leaf, &desired_st,
+                dest_parent_fd, dest_leaf, &target_st,
                 metadata_policy_from_context(ctx)) != 0)
             failed = 1;
         xattrs_free(&xattrs);
@@ -3251,7 +3259,8 @@ static RestoreNativeStatus restore_entry_regular(
         if (content_skip)
         {
             size_t skipped_security = 0;
-            int failed = apply_fd_metadata_tail(dst_fd, &desired_st, src_fd,
+            int failed = apply_fd_metadata_tail(dst_fd, &desired_st,
+                                                &ctx->owner_map, src_fd,
                                                 policy,
                                                 &skipped_security, NULL) != 0;
             restore_report_security_skipped(restore_report, skipped_security);
@@ -3296,8 +3305,9 @@ static RestoreNativeStatus restore_entry_regular(
         // already verified against, not after it.
         size_t skipped_security = 0;
         if (!failed &&
-            apply_fd_metadata_tail(dst_fd, &desired_st, src_fd, policy,
-                                   &skipped_security, NULL) != 0)
+            apply_fd_metadata_tail(dst_fd, &desired_st, &ctx->owner_map,
+                                   src_fd, policy, &skipped_security,
+                                   NULL) != 0)
             failed = 1;
         restore_report_security_skipped(restore_report, skipped_security);
 
@@ -3443,7 +3453,7 @@ static RestoreNativeStatus restore_entry_directory(
             // already verified against, not after it.
             size_t skipped_security = 0;
             if (apply_fd_metadata_tail(
-                    dest_dir_fd, &desired_st, source_dir_fd,
+                    dest_dir_fd, &desired_st, &ctx->owner_map, source_dir_fd,
                     metadata_policy_from_context(ctx), &skipped_security, NULL) != 0)
                 failed = 1;
             restore_report_security_skipped(restore_report, skipped_security);
@@ -3490,7 +3500,9 @@ static RestoreNativeStatus restore_entry_fifo(
             restore_report_failure(restore_report, logical_path);
             return -1;
         }
-        int failed = metadata_apply_fd(dest_fd, &desired_st,
+        struct stat target_st = desired_st;
+        metadata_owner_map_apply(&ctx->owner_map, &target_st);
+        int failed = metadata_apply_fd(dest_fd, &target_st,
                                        metadata_policy_from_context(ctx)) != 0;
         if (close(dest_fd) != 0)
             failed = 1;
@@ -3589,12 +3601,16 @@ static RestoreNativeStatus restore_entry_at(
         // into payload directories must not turn each child directory into a
         // new probe domain: ACLs and access policy may differ between roots,
         // but the plan deliberately bounds profiles by restore roots.
+        // Profiled as restored: the backup user's items go to the
+        // restoring user (D85).
+        struct stat profile_st = source_st;
+        metadata_owner_map_apply(&ctx->owner_map, &profile_st);
         int profile_failed = profiles != NULL && metadata_anchor_fd < 0;
         if (!profile_failed && profiles != NULL &&
             !S_ISSOCK(source_st.st_mode) &&
             !S_ISCHR(source_st.st_mode) &&
             !S_ISBLK(source_st.st_mode) &&
-            metadata_profiles_add(profiles, metadata_anchor_fd, &source_st,
+            metadata_profiles_add(profiles, metadata_anchor_fd, &profile_st,
                                   dest_exists ? &dest_st : NULL,
                                   logical_path) != 0)
             profile_failed = 1;

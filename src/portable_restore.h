@@ -31,6 +31,8 @@ typedef struct {
     const char *destination_xdg_dirs[XDG_KEY_COUNT];
     /* Measured policy for the destination filesystem. */
     MetadataTimestampPolicy destination_timestamp_policy;
+    /* Who gets the backup user's items (D85); zeroed for as recorded. */
+    OwnerMap owner_map;
     /* Borrowed byte/progress/sync state for a live replay; NULL disables it. */
     BackupCaptureReport *capture_report;
     /* Verification is on by default. This opt-out is restore-only CLI policy. */

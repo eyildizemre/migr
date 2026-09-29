@@ -518,7 +518,7 @@ D8's native exit-right boundary.
 
 ## D17 — 2026-08-01 — Sidecar v1 and the core metadata contract are frozen
 
-**Status:** Implemented (Phase B closed 2026-08-04; as-built notes in "Restore atime exactness" and "Relationship" below)
+**Status:** Implemented (Phase B closed 2026-08-04; as-built notes in "Restore atime exactness" and "Relationship" below); superseded in part by D85 (the backup user's items go to the restoring user)
 
 **Decision:** Phase B uses a versioned, NUL-framed, append-only sidecar as the
 authoritative state log for portable capture and resume. The sidecar and its payload
@@ -5048,3 +5048,34 @@ more than it protects, while a restore that skips still has the backup.
 
 **Relationship:** Applies D66's question to backups of live sources.
 Complements D63 and D64.
+
+## D85 — 2026-09-29 — Restore gives the backup user's items to the restoring user
+
+**Status:** Implemented
+
+**Decision:** Restore gives every item the backup's user owned to the user it
+acts for: the sudo invoker (D38), otherwise the caller.
+- **Who the backup's user is:** the manifest's `SOURCE_UID` (D15), and a new
+  `SOURCE_GID` after it, the user's primary group. Backups record both;
+  `SOURCE_GID` is optional when read, so a manifest without it still
+  restores, with only the uid mapped.
+- **Where:** One `OwnerMap`, built by restore from the manifest, is applied
+  wherever restore decides an owner: native `apply_fd_metadata_tail()`, the
+  symlink and FIFO paths, portable replay's desired stat
+  (`replay_desired_stat()`), and both metadata-profile preflights, so the
+  privilege check and the chown probe see the owners actually written.
+  Change detection on the payload still compares the payload's own
+  metadata.
+- **Other owners:** Items the backup's user did not own keep their recorded
+  owner: files made with `sudo` in HOME stay root's, and rootless Podman's
+  subordinate ids stay as they were.
+
+**Why:** A new system may give the same person another uid, or another name
+and uid. Restoring numeric owners as recorded left the new user's own
+folders owned by an id that is not theirs: `.local/share` at 0700 became
+unreadable to them, and GNOME Files marked the folders read-only.
+
+**Relationship:** Supersedes D17's "UID remapping and current-user
+normalization are not performed" for the backup's own user; D17's metadata
+contract is otherwise unchanged.
+

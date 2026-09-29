@@ -117,6 +117,7 @@ typedef struct {
     ReplayParentCache verification_parent_cache;
     ReplayPayloadParentCache payload_cache;
     MetadataTimestampPolicy timestamp_policy;
+    OwnerMap owner_map;
     PortableRestoreReplayReport *report;
     BackupCaptureReport *capture_report;
     MetadataXattrRequirements xattr_requirements;
@@ -565,6 +566,17 @@ int replay_stat_from_entry(const SidecarEntry *entry, struct stat *desired)
     return 0;
 }
 
+// The entry's metadata as restored: the backup user's items go to the
+// restoring user (D85).
+static int replay_desired_stat(const ReplayCollection *collection,
+                               const SidecarEntry *entry, struct stat *desired)
+{
+    if (replay_stat_from_entry(entry, desired) != 0)
+        return -1;
+    metadata_owner_map_apply(&collection->owner_map, desired);
+    return 0;
+}
+
 static int replay_bytes_compare(SidecarBytes left, SidecarBytes right)
 {
     size_t common = left.length < right.length ? left.length : right.length;
@@ -808,7 +820,7 @@ static int replay_collect_entry(const SidecarLiveView *view, void *argument)
     }
 
     struct stat desired;
-    if (replay_stat_from_entry(entry, &desired) != 0)
+    if (replay_desired_stat(collection, entry, &desired) != 0)
     {
         int saved = errno;
         replay_report_step_failure(
@@ -2036,7 +2048,7 @@ static int replay_apply_regular(ReplayCollection *collection,
         return -1;
     }
     struct stat desired;
-    if (replay_stat_from_entry(entry, &desired) != 0)
+    if (replay_desired_stat(collection, entry, &desired) != 0)
     {
         replay_apply_failure_record(
             failure, PORTABLE_RESTORE_REPLAY_FAILURE_VALIDATE_ENTRY, errno);
@@ -2208,7 +2220,7 @@ static int replay_apply_symlink(ReplayCollection *collection,
 
     const SidecarEntry *entry = replay->entry;
     struct stat desired;
-    if (replay_stat_from_entry(entry, &desired) != 0)
+    if (replay_desired_stat(collection, entry, &desired) != 0)
     {
         replay_apply_failure_record(
             failure, PORTABLE_RESTORE_REPLAY_FAILURE_VALIDATE_ENTRY, errno);
@@ -2575,7 +2587,7 @@ static int replay_apply_directory_metadata(ReplayCollection *collection,
         *failure = (ReplayApplyFailure){0};
     const SidecarEntry *entry = replay->entry;
     struct stat desired;
-    if (replay_stat_from_entry(entry, &desired) != 0)
+    if (replay_desired_stat(collection, entry, &desired) != 0)
     {
         replay_apply_failure_record(
             failure, PORTABLE_RESTORE_REPLAY_FAILURE_VALIDATE_ENTRY, errno);
@@ -3242,7 +3254,7 @@ static int replay_verify_symlink(ReplayCollection *collection,
     }
 
     struct stat desired;
-    if (result == 0 && replay_stat_from_entry(entry, &desired) != 0)
+    if (result == 0 && replay_desired_stat(collection, entry, &desired) != 0)
     {
         result = -1;
         replay_apply_failure_record(
@@ -3843,6 +3855,7 @@ int portable_restore_replay_at(const PortableRestoreRequest *request,
         .home_rewrite_pairs = home_rewrite_pairs,
         .home_rewrite_pair_count = home_rewrite_pair_count,
         .timestamp_policy = timestamp_policy,
+        .owner_map = request->owner_map,
         .report = report,
         .capture_report = request->capture_report,
         .skip_content_verification = request->skip_content_verification,

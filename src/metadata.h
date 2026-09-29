@@ -132,6 +132,23 @@ int metadata_source_unchanged(const struct stat *before,
 int metadata_symlink_unchanged(const struct stat *before,
                                const struct stat *after);
 
+/**
+ * @brief The backup's user, as its manifest records it, and the user a
+ *        restore acts for (D85). A zeroed map changes nothing.
+ */
+typedef struct {
+    int map_uid;
+    uid_t from_uid;
+    uid_t to_uid;
+    int map_gid;
+    gid_t from_gid;
+    gid_t to_gid;
+} OwnerMap;
+
+/* Gives st's owner and group to the restoring user where they are the
+ * backup user's; any other owner is kept as recorded. */
+void metadata_owner_map_apply(const OwnerMap *map, struct stat *st);
+
 int metadata_apply_fd(int fd, const struct stat *desired,
                       MetadataTimestampPolicy policy);
 int metadata_apply_ownership_and_mode_fd(int fd,

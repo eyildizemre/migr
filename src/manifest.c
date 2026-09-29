@@ -102,6 +102,7 @@ int legacy_manifest_read(const char *backup_dir, char **out, int n)
 /*   SIDECAR_VERSION=<uint>              (0 = no sidecar)                   */
 /*   MACHINE_ID=<hex>                    (both lines present, or neither)   */
 /*   SOURCE_UID=<uint>                                                      */
+/*   SOURCE_GID=<uint>                   (optional, after SOURCE_UID)       */
 /*   ROOT_COUNT=<uint>                                                      */
 /*   ROOT ID=<id> POLICY=<policy> PAYLOAD=<enc> SOURCE=<enc> [RESTORE=<enc>]*/
 /*   ... exactly ROOT_COUNT such lines ...                                  */
@@ -223,9 +224,11 @@ static int parse_uint_field(const char *s, uintmax_t max, uintmax_t *out)
     return 0;
 }
 
-// uid_t's own maximum, derived rather than assumed -- uintmax_t can hold it
-// exactly regardless of uid_t's or long's actual width on a given platform.
+// uid_t's and gid_t's own maximums, derived rather than assumed -- uintmax_t
+// can hold them exactly regardless of the types' or long's actual width on a
+// given platform.
 #define MANIFEST_UID_MAX ((uintmax_t)(uid_t)-1)
+#define MANIFEST_GID_MAX ((uintmax_t)(gid_t)-1)
 
 // Strips exactly one trailing "\r\n" or "\n", in place.
 static void chomp(char *line)
@@ -535,6 +538,14 @@ static ManifestStatus manifest_parse_v1_body(FILE *f, Manifest *out)
 
         if (read_kv_line(f, line, sizeof(line), &value, &key_len,
                          &fail_status) != 0) goto fail;
+        if (line_key_is(line, "SOURCE_GID", key_len))
+        {
+            if (parse_uint_field(value, MANIFEST_GID_MAX, &n) != 0) goto fail;
+            m.source_gid = (gid_t)n;
+            m.has_source_gid = 1;
+            if (read_kv_line(f, line, sizeof(line), &value, &key_len,
+                             &fail_status) != 0) goto fail;
+        }
     }
     // 'value'/'line' now holds whatever line follows the optional identity pair.
 
@@ -934,6 +945,8 @@ static int manifest_serialize(FILE *f, const Manifest *m)
     {
         if (fprintf(f, "MACHINE_ID=%s\n", m->machine_id) < 0) failed = 1;
         if (!failed && fprintf(f, "SOURCE_UID=%lu\n", (unsigned long)m->source_uid) < 0) failed = 1;
+        if (!failed && m->has_source_gid &&
+            fprintf(f, "SOURCE_GID=%lu\n", (unsigned long)m->source_gid) < 0) failed = 1;
     }
 
     if (!failed && m->has_self_binary &&
