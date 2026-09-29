@@ -5,6 +5,10 @@ set -euo pipefail
 
 # This suite owns its fixture HOME even when invoked through sudo.
 unset SUDO_UID
+# Nor does it wait for a keyboard: a question it does not answer itself, such
+# as a backup asking about an application open on this machine (D84), reads
+# end of input.
+exec </dev/null
 
 GREEN='\033[0;32m'
 RED='\033[0;31m'

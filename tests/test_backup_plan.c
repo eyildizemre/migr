@@ -4644,6 +4644,8 @@ int main(void)
     // A direct sudo run must not aim restores at the invoking user's home
     // (D38); make and test.sh drop SUDO_UID already.
     unsetenv("SUDO_UID");
+    // Nor on which applications happen to be running on the test machine.
+    writer_apps_test_set_proc_root("/nonexistent/migr-test-proc");
     printf(BLUE "::" NC " backup root planner (unit)\n");
 
     test_critical_root_set();
