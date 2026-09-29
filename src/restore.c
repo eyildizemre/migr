@@ -461,6 +461,35 @@ static void restore_system_lists(int source_root_fd, RestoreTodo *todo,
                    had_error);
 }
 
+// Saved passwords and sign-ins, encrypted with the login password (D87).
+static const char login_keyring[] = ".local/share/keyrings/login.keyring";
+
+// The login keyring in home as it is now; st_ino is 0 when there is none.
+static void login_keyring_stat(int home_fd, struct stat *st)
+{
+    if (fstatat(home_fd, login_keyring, st, AT_SYMLINK_NOFOLLOW) != 0)
+        memset(st, 0, sizeof(*st));
+}
+
+// A restore that replaced the login keyring leaves the running session with
+// the one it replaced, so that session saves no new passwords; and the new
+// one opens with the old system's password until it is typed once (D87).
+static void restore_login_keyring_todo(int home_fd, const struct stat *before,
+                                       FILE *todo)
+{
+    struct stat after;
+    login_keyring_stat(home_fd, &after);
+    if (todo == NULL || after.st_ino == 0 ||
+        (after.st_dev == before->st_dev && after.st_ino == before->st_ino &&
+         after.st_ctim.tv_sec == before->st_ctim.tv_sec &&
+         after.st_ctim.tv_nsec == before->st_ctim.tv_nsec))
+        return;
+    fputs("  Log out and back in before you sign in anywhere: until then, this "
+          "session cannot save passwords to the restored login keyring. If "
+          "your password differs from the old system's, the first app that "
+          "needs the keyring asks for the old one once.\n", todo);
+}
+
 // Replaces <backup>-todo.txt next to the backup with text, or removes it
 // when text is empty; the drive is what the user carries, and the backup
 // itself stays unchanged. Returns 0, or -1 with errno.
@@ -3206,6 +3235,8 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         close(source_root_fd);
         return MIGR_EXIT_FAILURE;
     }
+    struct stat keyring_before;
+    login_keyring_stat(home_fd, &keyring_before);
 
     // The run's log belongs to the new system's user, where XDG puts logs
     // (D79); a restore that ends cleanly takes it away again.
@@ -3305,6 +3336,7 @@ int restore_with_options(const char *source, const RestoreOptions *options)
             // when verification found differences; those are reported below.
             restore_dconf_settings(dconf_database_fd, &had_portable_error);
             restore_system_lists(source_root_fd, &todo, &had_portable_error);
+            restore_login_keyring_todo(home_fd, &keyring_before, todo.stream);
             if (m.has_network_config)
                 restore_network_config(source_root_fd, &had_portable_error);
         }
@@ -3628,6 +3660,7 @@ int restore_with_options(const char *source, const RestoreOptions *options)
             close(dconf_database_fd);
     }
     restore_system_lists(source_root_fd, &todo, &had_error);
+    restore_login_keyring_todo(home_fd, &keyring_before, todo.stream);
     if (mst == MANIFEST_STATUS_VALID && m.has_network_config)
         restore_network_config(source_root_fd, &had_error);
 

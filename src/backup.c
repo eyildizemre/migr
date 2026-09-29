@@ -2139,6 +2139,35 @@ static void preview_roots(const BackupPlan *plan, int *count)
     }
 }
 
+// 1 when HOME/name exists and the selection backs it up, 0 when it does not,
+// -1 after a message when it cannot be inspected.
+static int backup_selects_home_file(const SelectionPlan *selection,
+                                    const char *name)
+{
+    char path[PATH_MAX];
+    if (path_join(path, sizeof(path), selection->home, name) != 0)
+    {
+        print_error("Error: %s/%s is too long to inspect safely\n",
+                    selection->home, name);
+        return -1;
+    }
+
+    struct stat st;
+    if (lstat(path, &st) != 0)
+    {
+        if (errno == ENOENT || errno == ENOTDIR)
+            return 0;
+        print_error("Error: could not inspect %s before backup: %s\n", path,
+                    strerror(errno));
+        return -1;
+    }
+
+    for (size_t root = 0; root < selection->root_count; root++)
+        if (selection_source_owns(&selection->roots[root], path) == 1)
+            return 1;
+    return 0;
+}
+
 typedef struct {
     unsigned int mask;
     size_t count;
@@ -2168,32 +2197,13 @@ static int backup_shell_history_selection(const SelectionPlan *selection,
 
     for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++)
     {
-        char candidate[PATH_MAX];
-        if (path_join(candidate, sizeof(candidate), selection->home,
-                      candidates[i].name) != 0)
-        {
-            print_error("Error: shell history path is too long to inspect safely\n");
+        int selected = backup_selects_home_file(selection, candidates[i].name);
+        if (selected < 0)
             return -1;
-        }
-
-        struct stat st;
-        if (lstat(candidate, &st) != 0)
+        if (selected)
         {
-            if (errno == ENOENT || errno == ENOTDIR)
-                continue;
-            print_error("Error: could not inspect %s before backup: %s\n",
-                        candidate, strerror(errno));
-            return -1;
-        }
-
-        for (size_t root = 0; root < selection->root_count; root++)
-        {
-            if (selection_source_owns(&selection->roots[root], candidate) == 1)
-            {
-                owned->mask |= candidates[i].bit;
-                owned->count++;
-                break;
-            }
+            owned->mask |= candidates[i].bit;
+            owned->count++;
         }
     }
     return 0;
@@ -2239,6 +2249,17 @@ static int backup_shell_history_confirm(const ShellHistorySelection *owned)
         return -1;
     }
     return confirm_action_default_yes(message) ? 1 : 0;
+}
+
+// Saved passwords and sign-ins, encrypted with the login password (D87).
+static const char login_keyring[] = ".local/share/keyrings/login.keyring";
+
+static void print_login_keyring_note(void)
+{
+    printf("\nUse the same password for your user on the new system. Your "
+           "saved passwords and sign-ins (the login keyring) open with this "
+           "system's password; with a different one, the first app that needs "
+           "them asks for this system's password once.\n");
 }
 
 /* ------------------------------------------------------------------------- */
@@ -3319,6 +3340,11 @@ static int backup_run(const char *target_arg, BackupMode mode,
         printf("Backup cancelled; no container was created.\n");
         goto cancel_pre_container;
     }
+    int keyring_selected =
+        selection != NULL ? backup_selects_home_file(selection, login_keyring)
+                          : 0;
+    if (keyring_selected < 0)
+        goto fail_pre_container;
 
     // Probe the destination and choose a representation before any container
     // exists. An unreliable probe is fatal, never a silent fall-through. If we
@@ -3921,6 +3947,8 @@ static int backup_run(const char *target_arg, BackupMode mode,
     // ends with the list and a warning status (D63).
     finish_result = print_source_changes(&capture_report) ? MIGR_EXIT_CHANGED
                                                           : MIGR_EXIT_OK;
+    if (keyring_selected)
+        print_login_keyring_note();
 
 finish:
     source_snapshot_end(&source_snapshot);

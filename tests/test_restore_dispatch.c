@@ -2743,6 +2743,113 @@ static void test_restore_keeps_the_todo_next_to_the_backup(void)
     remove_tree(home);
 }
 
+// Restores a backup whose one root is the keyrings folder, holding name, into
+// a new home that already has a login keyring when existing is set.
+static int run_keyring_restore(int portable, const char *name, int existing,
+                               int dry, char *output, size_t output_size)
+{
+    char source[PATH_MAX], home[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_keyring_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_keyring_home");
+    setenv("HOME", home, 1);
+    write_payload_file(home, ".local/share/keyrings",
+                       existing ? "login.keyring" : "other.keyring",
+                       "new system");
+
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "KEYRINGS");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "KEYRINGS");
+    strcpy(root.source_path,
+           portable ? "/source/keyrings" : ".local/share/keyrings");
+    strcpy(root.restore_path, ".local/share/keyrings");
+    root.has_restore_path = 1;
+    Manifest manifest;
+    make_v1_manifest(&manifest, &root, 1);
+    if (portable)
+    {
+        manifest.representation = CLONE_PORTABLE_SIDECAR;
+        manifest.sidecar_version = SIDECAR_VERSION;
+    }
+    int ok = manifest_write_v1(source, &manifest) == 0;
+    static const char content[] = "old system";
+    write_payload_file(source, "data/KEYRINGS", name, content);
+    remove_fixture_packages(source);
+
+    if (portable)
+    {
+        SidecarEntry entries[] = {
+            { .root_id = sidecar_text("KEYRINGS"),
+              .logical_path = sidecar_text(""),
+              .physical_leaf = sidecar_text(""),
+              .kind = SIDECAR_KIND_DIRECTORY, .mode = 0700,
+              .uid = (uint32_t)geteuid(), .gid = (uint32_t)getegid(),
+              .atime_sec = 1700001100, .mtime_sec = 1700001101 },
+            { .root_id = sidecar_text("KEYRINGS"),
+              .logical_path = sidecar_text(name),
+              .physical_leaf = sidecar_text(name),
+              .kind = SIDECAR_KIND_REGULAR, .mode = 0600,
+              .uid = (uint32_t)geteuid(), .gid = (uint32_t)getegid(),
+              .atime_sec = 1700001102, .mtime_sec = 1700001103,
+              .size = sizeof(content) - 1U,
+              .content_digest = hash_fnv1a_bytes(
+                  HASH_FNV1A_OFFSET_BASIS, (const unsigned char *)content,
+                  sizeof(content) - 1U) }
+        };
+        int container_fd = open(source, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        SidecarLog sidecar = {0};
+        ok = ok && container_fd >= 0 &&
+             sidecar_log_create_at(container_fd, &sidecar) ==
+                 SIDECAR_OPEN_FRESH;
+        for (size_t index = 0;
+             ok && index < sizeof(entries) / sizeof(entries[0]); index++)
+            ok = append_committed_sidecar_entry(&sidecar, &entries[index]) == 0;
+        if (container_fd >= 0)
+        {
+            if (sidecar_log_close(&sidecar) != SIDECAR_STATUS_OK)
+                ok = 0;
+            close(container_fd);
+        }
+    }
+
+    int previous_dry_run = dry_run;
+    dry_run = dry;
+    int rc = ok ? run_restore_capturing_with_input(source, "y\n", output,
+                                                   output_size)
+                : -1;
+    dry_run = previous_dry_run;
+    char todo[PATH_MAX + sizeof("-todo.txt")];
+    snprintf(todo, sizeof(todo), "%s-todo.txt", source);
+    unlink(todo);
+    remove_tree(source);
+    remove_tree(home);
+    return rc;
+}
+
+// A restore that replaces the login keyring says to log out before signing
+// in anywhere, and what a different password asks for (D87).
+static void test_restore_of_the_login_keyring_says_to_log_out(void)
+{
+    printf(BLUE "::" NC " restore dispatch: a restored login keyring asks for a new login\n");
+    static const char note[] = "\nWhat's left for you\n  Log out and back in "
+                               "before you sign in anywhere";
+    char output[16384];
+    int rc = run_keyring_restore(1, "login.keyring", 0, 0, output,
+                                 sizeof(output));
+    check(rc == 0 && strstr(output, note) != NULL,
+          "a portable restore that brings the keyring says so");
+    rc = run_keyring_restore(0, "login.keyring", 1, 0, output, sizeof(output));
+    check(rc == 0 && strstr(output, note) != NULL,
+          "a native restore over the new system's keyring says so");
+    rc = run_keyring_restore(0, "login.keyring", 1, 1, output, sizeof(output));
+    check(rc == 0 && strstr(output, "Log out and back in") == NULL,
+          "a dry run does not");
+    rc = run_keyring_restore(1, "other.keyring", 1, 0, output, sizeof(output));
+    check(rc == 0 && strstr(output, "Log out and back in") == NULL,
+          "a restore that leaves the login keyring alone does not");
+}
+
 static void test_legacy_open_application_settings_are_deferred(void)
 {
     printf(BLUE "::" NC " restore dispatch: a legacy restore holds back an open browser's profile too\n");
@@ -4499,6 +4606,7 @@ int main(void)
     test_native_open_application_settings_are_deferred();
     test_legacy_open_application_settings_are_deferred();
     test_restore_keeps_the_todo_next_to_the_backup();
+    test_restore_of_the_login_keyring_says_to_log_out();
     test_native_restore_applies_dconf();
     test_verification_failure_still_restores_packages();
     test_portable_replay_failure_names_entry();

@@ -5113,3 +5113,41 @@ Native restore had no rewrite at all.
 **Relationship:** Extends D41 and D47; completes D50 for VERSION=1 portable
 backups.
 
+## D87 — 2026-09-29 — The login keyring needs the same password; migr says so and asks nothing
+
+**Status:** Implemented
+
+**Decision:** migr states what the login keyring
+(`~/.local/share/keyrings/login.keyring`) needs and never asks for
+confirmation about it.
+- **Backup:** When the selection backs the keyring up, the run ends by telling
+  the user to give their user the same password on the new system, and what a
+  different one costs. An explicit-path backup has no selection and gets no
+  note, as with D35.
+- **Restore:** When the keyring is a different file after the restore than
+  before it (another inode or a changed ctime), "What's left for you" says to
+  log out and back in before signing in anywhere, and that with a different
+  password the first application that needs the keyring asks for the old one
+  once. A dry run changes nothing and gets no note.
+
+**Why:** The login keyring is encrypted with the login password, and GNOME
+opens it at login with the password typed there.
+- **The restoring session:** The running keyring daemon keeps the replaced
+  keyring in memory. Its next write rereads the restored file, finds it
+  locked, and fails without a prompt, so a password saved before the next
+  login is lost.
+- **The next login:** With another password the keyring stays locked. The
+  first application that asks for a secret gets GNOME's prompt; once the old
+  password is typed there, GNOME re-encrypts the keyring with the login
+  password, and later logins open it on their own. Without the old password
+  its contents cannot be read, among them the cookies and saved passwords of
+  Chromium-based browsers.
+
+migr cannot re-encrypt the keyring without both passwords, and it does not ask
+for passwords. Unlike D35, where declining leaves the history out, no answer
+to a confirmation would change what migr does, so the requirement is stated
+instead.
+
+**Relationship:** KDE's KWallet opens with the login password the same way and
+is not covered.
+

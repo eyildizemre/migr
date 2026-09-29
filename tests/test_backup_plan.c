@@ -4607,6 +4607,68 @@ static void test_shell_history_consent_gate(void)
     remove_tree(home);
 }
 
+// A backup that takes the login keyring ends by asking for the same password
+// on the new system (D87).
+static void test_login_keyring_note(void)
+{
+    printf(BLUE "::" NC " production: a backup with the login keyring asks for the same password\n");
+
+    char home[PATH_MAX], keyrings[PATH_MAX], keyring[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "keyring_home");
+    setenv("HOME", home, 1);
+    join_path(keyrings, sizeof(keyrings), home, ".local/share/keyrings");
+    mkdir_p(keyrings);
+    join_path(keyring, sizeof(keyring), keyrings, "login.keyring");
+    write_file(keyring, "encrypted");
+
+    static const char note[] = "Use the same password for your user on the "
+                               "new system.";
+    Config empty_config = {0};
+    char output[16384];
+    char target[PATH_MAX];
+    dry_run = 0;
+    fresh_mkdtemp(target, sizeof(target), "keyring_target");
+    int rc = run_scoped_backup_capturing_input(
+        target, BACKUP_CRITICAL, &empty_config, NULL, output, sizeof(output));
+    const char *at = strstr(output, note);
+    check(rc == 0 && at != NULL && strstr(at, "Location:") == NULL,
+          "the note ends the run");
+    remove_tree(target);
+
+    ConfigRule exclude = {
+        .scope = CONFIG_CRITICAL,
+        .action = CONFIG_EXCLUDE,
+        .path = keyrings,
+        .line = 1,
+    };
+    Config excluding = { .rules = &exclude, .count = 1 };
+    fresh_mkdtemp(target, sizeof(target), "keyring_target");
+    rc = run_scoped_backup_capturing_input(
+        target, BACKUP_CRITICAL, &excluding, NULL, output, sizeof(output));
+    check(rc == 0 && strstr(output, note) == NULL,
+          "an excluded keyring gets no note");
+    remove_tree(target);
+
+    dry_run = 1;
+    fresh_mkdtemp(target, sizeof(target), "keyring_target");
+    rc = run_scoped_backup_capturing_input(
+        target, BACKUP_CRITICAL, &empty_config, NULL, output, sizeof(output));
+    dry_run = 0;
+    check(rc == 0 && strstr(output, note) == NULL,
+          "a dry run gets no note");
+    remove_tree(target);
+
+    check(unlink(keyring) == 0, "fixture removes the keyring");
+    fresh_mkdtemp(target, sizeof(target), "keyring_target");
+    rc = run_scoped_backup_capturing_input(
+        target, BACKUP_CRITICAL, &empty_config, NULL, output, sizeof(output));
+    check(rc == 0 && strstr(output, note) == NULL,
+          "a home without a keyring gets no note");
+    remove_tree(target);
+
+    remove_tree(home);
+}
+
 static void test_unusable_target_does_not_leak_the_plan(void)
 {
     printf(BLUE "::" NC " production: a destination that cannot even be inspected does not leak the plan\n");
@@ -4717,6 +4779,7 @@ int main(void)
     test_updates_rewrite_a_grown_journal();
     test_dangling_builtin_dotfile_is_captured_not_silently_dropped();
     test_shell_history_consent_gate();
+    test_login_keyring_note();
     test_unusable_target_does_not_leak_the_plan();
 
     if (failures > 0)

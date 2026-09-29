@@ -46,8 +46,8 @@ sudo ./migr backup /mnt/usb                    # back up to the drive mounted at
 ./migr verify /mnt/usb/migr-$USER              # check the backup before wiping this system
 ```
 
-Then install the new distribution, create your user, log in, build migr, and
-plug the drive in:
+Then install the new distribution, create your user with the same password
+you use now, log in, build migr, and plug the drive in:
 
 ```bash
 sudo ./migr restore /mnt/usb/migr-$USER
@@ -269,6 +269,14 @@ back), or to restore them anyway.
 
 **GNOME settings** are loaded into the running session when you are logged in,
 so the session does not overwrite them.
+
+**Saved passwords and sign-ins** live in the login keyring, which opens with
+your login password. Give your user on the new system the same password; with
+a different one, the first app that needs the keyring asks for the old
+password once, and without it the keyring cannot be opened. After a restore
+that brings the keyring back, log out and back in before signing in anywhere:
+the running session cannot save to the restored keyring. Backup and restore
+both remind you.
 
 **From an exFAT, FAT32, or NTFS backup**, restore also leaves desktop state
 that services rewrite all the time alone where the new system has already
