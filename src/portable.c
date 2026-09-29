@@ -4100,6 +4100,37 @@ int portable_capture_root(PortableCaptureContext *context,
     return capture_current_source_seen(context, root);
 }
 
+// Captures and reconciles every root, the deferred ones last (D84).
+// Returns 0, or -1 once one fails.
+static int capture_roots(PortableCaptureContext *context,
+                         const PortableCaptureRequest *request)
+{
+    for (int deferred = 0; deferred <= 1; deferred++) {
+        int asked = 0;
+        for (size_t index = 0; index < request->root_count; index++) {
+            const PortableRootSpec *root = &request->roots[index];
+            int root_deferred = request->deferred != NULL &&
+                                request->deferred[index] != 0;
+            if (root_deferred != deferred)
+                continue;
+            if (deferred && !asked && request->before_deferred != NULL)
+                request->before_deferred(request->before_deferred_context);
+            asked = 1;
+            if (verbose)
+                printf("  Capturing: %s -> data/%s\n", root->capture_path,
+                       root->payload_path);
+            if (portable_capture_root(context, root) != 0)
+                return -1;
+            if (reconcile_root(context, root) != 0) {
+                portable_capture_context_failure_record(
+                    context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, NULL);
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
 int portable_capture_fresh_prepared_at(
     int container_fd, const PortableCaptureRequest *request,
     const PortablePreparedCapture *prepared, size_t *live_count,
@@ -4192,24 +4223,8 @@ int portable_capture_fresh_prepared_at(
             failed = 1;
         }
     }
-    for (size_t index = 0; !failed && index < request->root_count; index++)
-    {
-        if (verbose)
-            printf("  Capturing: %s -> data/%s\n",
-                   request->roots[index].capture_path,
-                   request->roots[index].payload_path);
-        if (portable_capture_root(&context, &request->roots[index]) != 0) {
-            failed = 1;
-            break;
-        }
-        if (reconcile_root(&context, &request->roots[index]) != 0) {
-            portable_capture_context_failure_record(
-                &context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
-                &request->roots[index], NULL);
-            failed = 1;
-            break;
-        }
-    }
+    if (!failed && capture_roots(&context, request) != 0)
+        failed = 1;
     if (!failed && sidecar_log_claim_count(&sidecar) != 0) {
         portable_capture_failure_record(
             progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL, NULL);
@@ -4427,24 +4442,8 @@ int portable_capture_resume_prepared_at(
                 &context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL, NULL);
             failed = 1;
         }
-        for (size_t index = 0; !failed && index < request->root_count;
-             index++) {
-            if (verbose)
-                printf("  Capturing: %s -> data/%s\n",
-                       request->roots[index].capture_path,
-                       request->roots[index].payload_path);
-            if (portable_capture_root(&context, &request->roots[index]) != 0) {
-                failed = 1;
-                break;
-            }
-            if (reconcile_root(&context, &request->roots[index]) != 0) {
-                portable_capture_context_failure_record(
-                    &context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
-                    &request->roots[index], NULL);
-                failed = 1;
-                break;
-            }
-        }
+        if (!failed && capture_roots(&context, request) != 0)
+            failed = 1;
     }
     if (!failed && sidecar_log_claim_count(&sidecar) != 0) {
         portable_capture_failure_record(

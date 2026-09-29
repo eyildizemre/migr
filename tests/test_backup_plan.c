@@ -40,6 +40,7 @@
 #include "selection.h"
 #include "sidecar.h"
 #include "utils.h"
+#include "writer_apps.h"
 
 #define GREEN "\033[0;32m"
 #define RED   "\033[0;31m"
@@ -1273,16 +1274,30 @@ static void test_root_count_ceiling_is_enforced(void)
 /* Production integration (backup())                                        */
 /* ========================================================================= */
 
-static int run_backup_capturing_with_options(const char *target, BackupMode mode,
-                                             char *const *paths, int include_self,
-                                             int include_network_config,
-                                             char *output, size_t output_size)
+// input, if not NULL, is what the backup reads on stdin; otherwise stdin is
+// inherited.
+static int run_backup_capturing_input(const char *target, BackupMode mode,
+                                      char *const *paths, int include_self,
+                                      int include_network_config,
+                                      const char *input, char *output,
+                                      size_t output_size)
 {
     int pipefd[2];
-    if (pipe(pipefd) != 0)
+    int input_pipe[2] = { -1, -1 };
+    if (pipe(pipefd) != 0 || (input != NULL && pipe(input_pipe) != 0))
     {
         perror("pipe");
         exit(1);
+    }
+    if (input != NULL)
+    {
+        size_t length = strlen(input);
+        if (write(input_pipe[1], input, length) != (ssize_t)length)
+        {
+            perror("write");
+            exit(1);
+        }
+        close(input_pipe[1]);
     }
     // Every check()/printf() so far in this process may still be sitting
     // unflushed in stdio's buffer (fully buffered, since stdout/stderr
@@ -1301,9 +1316,12 @@ static int run_backup_capturing_with_options(const char *target, BackupMode mode
     {
         close(pipefd[0]);
         if (dup2(pipefd[1], STDOUT_FILENO) < 0 ||
-            dup2(pipefd[1], STDERR_FILENO) < 0)
+            dup2(pipefd[1], STDERR_FILENO) < 0 ||
+            (input != NULL && dup2(input_pipe[0], STDIN_FILENO) < 0))
             _exit(125);
         close(pipefd[1]);
+        if (input != NULL)
+            close(input_pipe[0]);
         int rc = backup(target, mode, (char **)paths, include_self,
                         include_network_config);
         fflush(stdout);
@@ -1312,6 +1330,8 @@ static int run_backup_capturing_with_options(const char *target, BackupMode mode
     }
 
     close(pipefd[1]);
+    if (input != NULL)
+        close(input_pipe[0]);
     size_t total = 0;
     ssize_t n;
     while (total < output_size - 1 &&
@@ -1323,6 +1343,16 @@ static int run_backup_capturing_with_options(const char *target, BackupMode mode
     int status = 0;
     waitpid(pid, &status, 0);
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+static int run_backup_capturing_with_options(const char *target, BackupMode mode,
+                                             char *const *paths, int include_self,
+                                             int include_network_config,
+                                             char *output, size_t output_size)
+{
+    return run_backup_capturing_input(target, mode, paths, include_self,
+                                      include_network_config, NULL, output,
+                                      output_size);
 }
 
 static int run_backup_capturing(const char *target, BackupMode mode,
@@ -3966,6 +3996,118 @@ static void test_update_reuses_a_dropped_root_id(int portable)
     remove_tree(target);
 }
 
+static void write_fake_process(const char *proc_root, const char *pid,
+                               const char *comm)
+{
+    char dir[PATH_MAX], file[PATH_MAX], content[128];
+    join_path(dir, sizeof(dir), proc_root, pid);
+    mkdir_p(dir);
+    join_path(file, sizeof(file), dir, "comm");
+    snprintf(content, sizeof(content), "%s\n", comm);
+    write_file(file, content);
+    join_path(file, sizeof(file), dir, "status");
+    uintmax_t uid = (uintmax_t)geteuid();
+    snprintf(content, sizeof(content), "Name:\t%s\nUid:\t%ju\t%ju\t%ju\t%ju\n",
+             comm, uid, uid, uid, uid);
+    write_file(file, content);
+}
+
+// Visual Studio Code open, and so still running at the end (a fake /proc
+// entry), while a live source is backed up: .config goes last (D84).
+static void test_open_application_settings_are_backed_up_last(int portable)
+{
+    printf(BLUE "::" NC " production: a %s backup captures an open application's settings last\n",
+           portable ? "portable" : "native");
+
+    char home[PATH_MAX], target[PATH_MAX], config[PATH_MAX], notes[PATH_MAX];
+    char file[PATH_MAX], proc_root[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_home");
+    setenv("HOME", home, 1);
+    join_path(config, sizeof(config), home, ".config");
+    join_path(file, sizeof(file), config, "Code");
+    mkdir_p(file);
+    join_path(file, sizeof(file), config, "Code/settings.json");
+    write_file(file, "{}");
+    join_path(notes, sizeof(notes), home, "notes");
+    mkdir_p(notes);
+    join_path(file, sizeof(file), notes, "a.txt");
+    write_file(file, "a");
+    join_path(proc_root, sizeof(proc_root), home, "fake-proc");
+    write_fake_process(proc_root, "4242", "code");
+
+    dry_run = 0;
+    int previous_verbose = verbose;
+    verbose = 1;
+    backup_test_force_portable_representation(portable);
+    writer_apps_test_set_proc_root(proc_root);
+    char *paths[] = { config, notes, NULL };
+    char unanswered[16384], again[16384], anyway[16384], closed[16384];
+    const char *inputs[] = { "", "\n", "c\n" };
+    char *outputs[] = { unanswered, again, anyway };
+    int rcs[3];
+    int saved[3];
+    for (int run = 0; run < 3; run++)
+    {
+        fresh_mkdtemp(target, sizeof(target), "plan_target");
+        rcs[run] = run_backup_capturing_input(target, BACKUP_EXPLICIT_PATHS,
+                                              paths, 0, 0, inputs[run],
+                                              outputs[run], sizeof(unanswered));
+        char container[PATH_MAX], payload[PATH_MAX];
+        saved[run] = find_container_dir(target, container, sizeof(container));
+        join_path(payload, sizeof(payload), container,
+                  "data/settings/config/Code/settings.json");
+        saved[run] = saved[run] && file_text_is(payload, "{}");
+        remove_tree(target);
+    }
+    writer_apps_test_set_proc_root("/nonexistent/migr-test-proc");
+    fresh_mkdtemp(target, sizeof(target), "plan_target");
+    int closed_rc = run_backup_capturing_input(target, BACKUP_EXPLICIT_PATHS,
+                                               paths, 0, 0, "", closed,
+                                               sizeof(closed));
+    remove_tree(target);
+    backup_test_force_portable_representation(0);
+    verbose = previous_verbose;
+
+    char announcement[PATH_MAX + 128], config_line[PATH_MAX + 32];
+    char notes_line[PATH_MAX + 32];
+    snprintf(announcement, sizeof(announcement),
+             "Visual Studio Code is open, so %s is backed up last", config);
+    snprintf(config_line, sizeof(config_line), "Capturing: %s ->", config);
+    snprintf(notes_line, sizeof(notes_line), "Capturing: %s ->", notes);
+    const char *prompt = "Visual Studio Code is still open. Close it and "
+                         "press Enter";
+    const char *note = "Note: Visual Studio Code was open while its settings "
+                       "were backed up";
+    const char *config_at = strstr(unanswered, config_line);
+    const char *notes_at = strstr(unanswered, notes_line);
+    const char *prompt_at = strstr(unanswered, prompt);
+    check(rcs[0] == 0 && saved[0] && strstr(unanswered, announcement) != NULL &&
+              notes_at != NULL && prompt_at != NULL && config_at != NULL &&
+              notes_at < prompt_at && prompt_at < config_at,
+          "the settings' root is named up front and captured after the "
+          "others, once asked");
+    check(strstr(unanswered, "No answer; backing them up as they are.") &&
+              strstr(unanswered, note) != NULL,
+          "with nobody to answer, they are captured and the summary says the "
+          "application was open");
+    prompt_at = strstr(again, prompt);
+    check(rcs[1] == 0 && saved[1] && prompt_at != NULL &&
+              strstr(prompt_at + 1, prompt) != NULL,
+          "Enter checks again and asks again while it is still open");
+    check(rcs[2] == 0 && saved[2] && strstr(anyway, prompt) != NULL &&
+              strstr(anyway, "No answer") == NULL &&
+              strstr(anyway, note) == NULL,
+          "c captures them as they are, with no note");
+    config_at = strstr(closed, config_line);
+    notes_at = strstr(closed, notes_line);
+    check(closed_rc == 0 && strstr(closed, "is backed up last") == NULL &&
+              strstr(closed, "still open") == NULL && config_at != NULL &&
+              notes_at != NULL && config_at < notes_at,
+          "with no application open, nothing waits");
+
+    remove_tree(home);
+}
+
 // A second backup of the same install updates the first in place (D72):
 // changed files are recopied, removed ones leave the payload, and a root
 // the new selection lacks is removed with its journal records.
@@ -4564,6 +4706,8 @@ int main(void)
     test_update_reuses_a_dropped_root_id(1);
     test_update_recaptures_a_recreated_folder(0);
     test_update_recaptures_a_recreated_folder(1);
+    test_open_application_settings_are_backed_up_last(0);
+    test_open_application_settings_are_backed_up_last(1);
     test_backup_leaves_another_install_alone();
     test_failed_update_keeps_the_finished_backup();
     test_native_preflight_of_a_changing_source();

@@ -51,6 +51,12 @@ size_t source_snapshot_begin(SourceSnapshot *snapshot,
 /* Idempotent; safe on an initialized snapshot that never began. */
 void source_snapshot_end(SourceSnapshot *snapshot);
 
+/* Returns 1 when path, as the calling thread sees it, reads a read-only
+ * btrfs subvolume, such as a snapshot source_snapshot_begin() mounted over
+ * it. Anything else, including a path that cannot be inspected, is read
+ * live: 0. */
+int source_snapshot_covers(const char *path);
+
 /* Undoes one /proc/self/mountinfo path field escape (\040 and the like) in
  * place. Exposed for tests. */
 void source_snapshot_unescape_mount_path(char *path);

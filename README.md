@@ -18,8 +18,9 @@ It is not released yet: there are no packages, so build it from source.
   permissions, or extended attributes, migr keeps them in a journal beside your
   files and restores them exactly.
 - **Safe on a running desktop.** A file that changes while it is read is read
-  again, and on btrfs the backup reads a read-only snapshot. Applications that
-  rewrite their settings are restored last.
+  again, and on btrfs the backup reads a read-only snapshot; elsewhere, open
+  applications' settings are backed up last. Applications that rewrite their
+  settings are restored last.
 - **Resumable and updatable.** An interrupted backup continues where it
   stopped. Backing up to the same drive again updates the backup and copies
   only what changed.
@@ -164,6 +165,11 @@ backup still completes, lists what changed, and exits with status 1. Desktop
 state that changes all the time, such as GNOME's file metadata, is only counted.
 On btrfs, Fedora's default, migr reads from a read-only snapshot instead, so
 nothing changes under it at all; the snapshot is removed when the backup ends.
+Without a snapshot, the folders that hold an open application's settings (VS
+Code, the common browsers, Flatpak applications) are backed up last: files
+such as a browser's history database and its journal belong together, and
+read minutes apart they may not match. If the application is still open then,
+migr asks you to close it and press Enter, or to back them up as they are.
 
 **Where it goes.** The backup is a folder named after you, `migr-<user>`. If
 that name already holds another installation's backup (another computer, or

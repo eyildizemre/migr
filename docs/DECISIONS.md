@@ -5011,3 +5011,40 @@ reported together with the command that undoes it.
 
 **Relationship:** Replaces D58's suggestion; D58's capture is unchanged.
 
+## D84 — 2026-09-29 — A backup read live captures open applications' settings last
+
+**Status:** Implemented
+
+**Decision:** Once the snapshot has begun (D64), a backup looks up the
+invoking user's running applications with the table restore uses (D66),
+now shared in `writer_apps.c`. A root is deferred when it holds, or lies
+inside, a path one of them owns and that path is read live: it exists and
+is not on a read-only btrfs subvolume (`source_snapshot_covers()`). VS
+Code's `.config/Code` defers the whole `.config` root.
+- **Up front:** The backup names the applications and the roots that wait.
+- **Order:** Native `capture_roots()` and the portable capture loop take
+  every other root first. The portable request carries the deferred flags
+  and a `before_deferred` callback, as `PortableRestoreRequest` does.
+- **Asking:** Before the first deferred root, the backup checks again. If
+  none of the applications is still running, it continues. Otherwise it
+  stops the progress line and asks: Enter checks again, `c` captures the
+  roots as they are. At end of input it captures them, and a note after
+  capture names the applications that were open.
+- **Not deferred:** roots read from a snapshot, dry runs, and applications
+  started after capture began, which D63 covers. A backup that already
+  failed does not ask.
+
+The exit status is unchanged: waiting is not a change.
+
+**Why:** A snapshot captures an application's files at one moment, as a
+power loss would leave them, which applications are built to survive. A
+source read live has no such moment. D63's reread keeps each file whole but
+not files that belong together: a browser's `places.sqlite` and
+`places.sqlite-wal` read minutes apart may not match. Whole roots wait
+because both capture paths reconcile a root against its previous copy, so a
+subtree left out of its root would read as deleted; moving roots only
+changes the loop order. There is no "skip": a backup without `.config` loses
+more than it protects, while a restore that skips still has the backup.
+
+**Relationship:** Applies D66's question to backups of live sources.
+Complements D63 and D64.

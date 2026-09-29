@@ -96,6 +96,12 @@ typedef struct {
      * resume then checks each root's payload only at its top, not item by
      * item, after capture. */
     int payload_matches_journal;
+    /* Roots captured after all the others, indexed like roots; NULL for
+     * none. before_deferred, if set, runs once before the first of them
+     * (docs/DECISIONS.md D84). */
+    const unsigned char *deferred;
+    void (*before_deferred)(void *context);
+    void *before_deferred_context;
 } PortableCaptureRequest;
 
 /* Binds a compiled D34 selection to an existing request. The caller owns roots

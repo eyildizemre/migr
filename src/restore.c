@@ -28,6 +28,7 @@
 #include "portable_restore_internal.h"
 #include "portable_restore_replay_internal.h"
 #include "utils.h"
+#include "writer_apps.h"
 #include "xdg.h"
 
 typedef enum {
@@ -406,208 +407,6 @@ static int restore_network_config_file_at(int network_fd, int dest_dir_fd,
     return 1;
 }
 
-typedef struct {
-    const char *comm;
-    const char *label;
-    /* Below HOME: what the application owns and rewrites, restored last
-     * while it runs (D66); NULL for none. */
-    const char *settings;
-} RestoreWriterApp;
-
-// Applications whose settings the default scope restores and which rewrite
-// them while running or on exit, one entry per path an application owns.
-// Matched by /proc/<pid>/comm (truncated to 15 bytes by the kernel). VS Code
-// updates its extensions on its own (D77). GNOME Software refreshes the
-// restored Flatpak repo.
-static const RestoreWriterApp restore_writer_apps[] = {
-    { "code", "Visual Studio Code", ".config/Code" },
-    { "code", "Visual Studio Code", ".vscode" },
-    { "codium", "VSCodium", ".config/VSCodium" },
-    { "codium", "VSCodium", ".vscode-oss" },
-    { "firefox", "Firefox", ".mozilla/firefox" },
-    { "firefox-bin", "Firefox", ".mozilla/firefox" },
-    { "brave", "Brave", ".config/BraveSoftware" },
-    { "chrome", "Google Chrome", ".config/google-chrome" },
-    { "chromium", "Chromium", ".config/chromium" },
-    { "chromium-browse", "Chromium", ".config/chromium" },
-    { "vivaldi-bin", "Vivaldi", ".config/vivaldi" },
-    { "msedge", "Microsoft Edge", ".config/microsoft-edge" },
-    { "opera", "Opera", ".config/opera" },
-    { "gnome-software", "GNOME Software", NULL }
-};
-
-#define RESTORE_WRITER_APP_COUNT \
-    (sizeof(restore_writer_apps) / sizeof(restore_writer_apps[0]))
-
-static const char *restore_proc_root = "/proc";
-
-#ifdef RESTORE_TEST_HOOKS
-void restore_test_set_proc_root(const char *path)
-{
-    restore_proc_root = path != NULL ? path : "/proc";
-}
-#endif
-
-static int restore_read_small_file_at(int dir_fd, const char *name,
-                                      char *out, size_t size)
-{
-    int fd = openat(dir_fd, name, O_RDONLY | O_CLOEXEC);
-    if (fd < 0)
-        return -1;
-    ssize_t got = read(fd, out, size - 1U);
-    close(fd);
-    if (got < 0)
-        return -1;
-    out[got] = '\0';
-    return 0;
-}
-
-static int restore_process_uid_at(int pid_fd, uid_t *uid)
-{
-    char status[4096];
-    if (restore_read_small_file_at(pid_fd, "status", status,
-                                   sizeof(status)) != 0)
-        return -1;
-    const char *line = strstr(status, "\nUid:");
-    if (line == NULL)
-        return -1;
-    char *end = NULL;
-    errno = 0;
-    unsigned long value = strtoul(line + strlen("\nUid:"), &end, 10);
-    if (errno != 0 || end == line + strlen("\nUid:"))
-        return -1;
-    *uid = (uid_t)value;
-    return 0;
-}
-
-/* Running writers tracked at once: the table's, and open Flatpak apps. */
-#define RESTORE_WRITER_MAX (RESTORE_WRITER_APP_COUNT + 24U)
-#define RESTORE_FLATPAK_APP_ID_MAX 128
-
-// A running application and one path below HOME it owns; an application
-// that owns several appears once per path.
-typedef struct {
-    char label[RESTORE_FLATPAK_APP_ID_MAX];
-    char settings[RESTORE_FLATPAK_APP_ID_MAX + sizeof(".var/app/")]; /* "" for none */
-} RunningWriter;
-
-static void restore_writer_add(RunningWriter *writers, size_t *count,
-                               size_t max, const char *label,
-                               const char *settings)
-{
-    for (size_t index = 0; index < *count; index++)
-        if (strcmp(writers[index].label, label) == 0 &&
-            strcmp(writers[index].settings, settings) == 0)
-            return;
-    if (*count == max)
-        return;
-    snprintf(writers[*count].label, sizeof(writers[*count].label), "%s",
-             label);
-    snprintf(writers[*count].settings, sizeof(writers[*count].settings), "%s",
-             settings);
-    (*count)++;
-}
-
-// A Flatpak application runs in the systemd scope
-// app-flatpak-<app-id>-<number>.scope, which /proc/<pid>/cgroup names. Its
-// data lives in ~/.var/app/<app-id> (D75). Returns 1 with the id.
-static int restore_flatpak_app_id(const char *cgroup,
-                                  char id[RESTORE_FLATPAK_APP_ID_MAX])
-{
-    static const char prefix[] = "/app-flatpak-";
-    const char *start = strstr(cgroup, prefix);
-    const char *end = start != NULL ? strstr(start, ".scope") : NULL;
-    if (end == NULL)
-        return 0;
-    start += sizeof(prefix) - 1U;
-    const char *number = end;
-    while (number > start && number[-1] != '-')
-        number--;
-    size_t length = number > start ? (size_t)(number - 1 - start) : 0;
-    if (length == 0 || length >= RESTORE_FLATPAK_APP_ID_MAX ||
-        strspn(start, "abcdefghijklmnopqrstuvwxyz"
-                      "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-") < length)
-        return 0;
-    memcpy(id, start, length);
-    id[length] = '\0';
-    return 1;
-}
-
-// Collects the known writer applications and open Flatpak apps run by uid.
-static size_t restore_running_writers(uid_t uid, RunningWriter *writers,
-                                      size_t max)
-{
-    DIR *proc = opendir(restore_proc_root);
-    if (proc == NULL)
-        return 0;
-    size_t count = 0;
-    struct dirent *entry;
-    while ((entry = readdir(proc)) != NULL)
-    {
-        if (entry->d_name[0] < '1' || entry->d_name[0] > '9' ||
-            strspn(entry->d_name, "0123456789") != strlen(entry->d_name))
-            continue;
-        int pid_fd = openat(dirfd(proc), entry->d_name,
-                            O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-        if (pid_fd < 0)
-            continue;
-        char comm[64];
-        char cgroup[1024];
-        uid_t owner;
-        int readable = restore_process_uid_at(pid_fd, &owner) == 0 &&
-                       owner == uid &&
-                       restore_read_small_file_at(pid_fd, "comm", comm,
-                                                  sizeof(comm)) == 0;
-        int in_cgroup = readable &&
-                        restore_read_small_file_at(pid_fd, "cgroup", cgroup,
-                                                   sizeof(cgroup)) == 0;
-        close(pid_fd);
-        if (!readable)
-            continue;
-        comm[strcspn(comm, "\n")] = '\0';
-        for (size_t index = 0; index < RESTORE_WRITER_APP_COUNT; index++)
-        {
-            const RestoreWriterApp *app = &restore_writer_apps[index];
-            if (strcmp(comm, app->comm) == 0)
-                restore_writer_add(writers, &count, max, app->label,
-                                   app->settings != NULL ? app->settings : "");
-        }
-        char id[RESTORE_FLATPAK_APP_ID_MAX];
-        char settings[sizeof(writers->settings)];
-        if (in_cgroup && restore_flatpak_app_id(cgroup, id))
-        {
-            snprintf(settings, sizeof(settings), ".var/app/%s", id);
-            restore_writer_add(writers, &count, max, id, settings);
-        }
-    }
-    closedir(proc);
-    return count;
-}
-
-// The distinct labels of writers, in order.
-static size_t restore_writer_labels(const RunningWriter *writers,
-                                    size_t count, const char **labels)
-{
-    size_t labeled = 0;
-    for (size_t index = 0; index < count; index++)
-    {
-        int seen = 0;
-        for (size_t known = 0; known < labeled && !seen; known++)
-            seen = strcmp(labels[known], writers[index].label) == 0;
-        if (!seen)
-            labels[labeled++] = writers[index].label;
-    }
-    return labeled;
-}
-
-// The user whose applications matter: the sudo invoker under sudo (D38).
-static int restore_session_uid(uid_t *uid)
-{
-    *uid = geteuid();
-    gid_t gid;
-    return sudo_invoker(uid, &gid, NULL) < 0 ? -1 : 0;
-}
-
 // What a restore leaves for the user to do by hand: written by the steps
 // that re-create system state, shown at the very end of the run, and kept
 // next to the backup.
@@ -635,7 +434,7 @@ static void restore_system_lists(int source_root_fd, RestoreTodo *todo,
     restore_flatpak_apps(source_root_fd, todo->stream, had_error);
     uid_t uid;
     char user[ACCOUNT_NAME_MAX];
-    int resolved = restore_session_uid(&uid) == 0 &&
+    int resolved = writer_apps_session_uid(&uid) == 0 &&
                    local_account_name(uid, user) == 0;
     restore_groups(source_root_fd, resolved ? user : NULL, todo->stream,
                    had_error);
@@ -715,27 +514,11 @@ static void restore_todo_finish(RestoreTodo *todo, const char *source)
     free(todo->text);
 }
 
-#ifdef RESTORE_TEST_HOOKS
-size_t restore_test_running_writers(uid_t uid, const char **labels,
-                                    const char **settings, size_t max)
-{
-    static RunningWriter writers[RESTORE_WRITER_MAX];
-    size_t count = restore_running_writers(
-        uid, writers, max < RESTORE_WRITER_MAX ? max : RESTORE_WRITER_MAX);
-    for (size_t index = 0; index < count; index++)
-    {
-        labels[index] = writers[index].label;
-        settings[index] = writers[index].settings;
-    }
-    return count;
-}
-#endif
-
 // What a restore defers for the applications running when it starts (D66,
 // D69), and how to retire the progress line before asking about them.
 typedef struct {
-    RunningWriter writers[RESTORE_WRITER_MAX]; /* What paths point into. */
-    PortableRestoreDeferredPath paths[RESTORE_WRITER_MAX];
+    RunningWriter writers[WRITER_APPS_MAX]; /* What paths point into. */
+    PortableRestoreDeferredPath paths[WRITER_APPS_MAX];
     size_t count;
     void (*retire_progress)(void *context);
     void *progress;
@@ -746,10 +529,10 @@ static void restore_defer_running_writers(RestoreDeferral *deferral)
 {
     deferral->count = 0;
     uid_t uid;
-    if (restore_session_uid(&uid) != 0)
+    if (writer_apps_session_uid(&uid) != 0)
         return;
-    size_t running = restore_running_writers(uid, deferral->writers,
-                                             RESTORE_WRITER_MAX);
+    size_t running = writer_apps_running(uid, deferral->writers,
+                                         WRITER_APPS_MAX);
     for (size_t index = 0; index < running; index++)
     {
         const RunningWriter *writer = &deferral->writers[index];
@@ -761,14 +544,6 @@ static void restore_defer_running_writers(RestoreDeferral *deferral)
     }
 }
 
-static void restore_print_labels(const char *const *labels, size_t count)
-{
-    for (size_t index = 0; index < count; index++)
-        printf("%s%s", index == 0 ? ""
-                       : index + 1U == count ? " and " : ", ",
-               labels[index]);
-}
-
 // Printed right before the confirmation prompt: an open application that owns
 // restored settings writes over them while the restore runs or when it exits.
 // When some own settings, those are restored last; otherwise the applications
@@ -777,17 +552,17 @@ static void restore_warn_running_writers(void *context)
 {
     const RestoreDeferral *deferral = context;
     uid_t uid;
-    if (restore_session_uid(&uid) != 0)
+    if (writer_apps_session_uid(&uid) != 0)
         return;
-    RunningWriter running[RESTORE_WRITER_MAX];
-    const char *labels[RESTORE_WRITER_MAX];
-    size_t count = restore_writer_labels(
-        running, restore_running_writers(uid, running, RESTORE_WRITER_MAX),
+    RunningWriter running[WRITER_APPS_MAX];
+    const char *labels[WRITER_APPS_MAX];
+    size_t count = writer_apps_labels(
+        running, writer_apps_running(uid, running, WRITER_APPS_MAX),
         labels);
     if (count == 0)
         return;
     printf("\n");
-    restore_print_labels(labels, count);
+    writer_apps_print_labels(labels, count);
     if (deferral != NULL && deferral->count != 0)
         printf(" %s open. The settings %s owns are restored last, after "
                "everything else; close %s before then.\n\n",
@@ -810,16 +585,16 @@ static int restore_before_deferred(void *context)
     if (deferral->retire_progress != NULL)
         deferral->retire_progress(deferral->progress);
     uid_t uid;
-    if (restore_session_uid(&uid) != 0)
+    if (writer_apps_session_uid(&uid) != 0)
         return 1;
     for (;;)
     {
-        RunningWriter writers[RESTORE_WRITER_MAX];
-        const char *running[RESTORE_WRITER_MAX];
-        size_t running_count = restore_writer_labels(
-            writers, restore_running_writers(uid, writers, RESTORE_WRITER_MAX),
+        RunningWriter writers[WRITER_APPS_MAX];
+        const char *running[WRITER_APPS_MAX];
+        size_t running_count = writer_apps_labels(
+            writers, writer_apps_running(uid, writers, WRITER_APPS_MAX),
             running);
-        const char *open[RESTORE_WRITER_MAX];
+        const char *open[WRITER_APPS_MAX];
         size_t open_count = 0;
         for (size_t index = 0; index < running_count; index++)
             for (size_t path = 0; path < deferral->count; path++)
@@ -831,7 +606,7 @@ static int restore_before_deferred(void *context)
         if (open_count == 0)
             return 1;
         printf("\n");
-        restore_print_labels(open, open_count);
+        writer_apps_print_labels(open, open_count);
         printf(" %s still open. Close %s and press Enter to restore %s "
                "settings, type s to leave them out, or c to restore them "
                "anyway: ",
@@ -842,7 +617,7 @@ static int restore_before_deferred(void *context)
         if (fgets(answer, sizeof(answer), stdin) == NULL)
         {
             printf("\nNo answer; restoring them now. ");
-            restore_print_labels(open, open_count);
+            writer_apps_print_labels(open, open_count);
             printf(" may overwrite them on closing.\n");
             return 1;
         }
@@ -1823,11 +1598,11 @@ static int restore_home_item_deferring(
             return -1;
     }
 
-    const char *skipped[RESTORE_WRITER_MAX];
+    const char *skipped[WRITER_APPS_MAX];
     CloneContext item_ctx = *ctx;
     item_ctx.skipped_count = 0;
     for (size_t index = first; deferral != NULL && index < deferral->count &&
-                               item_ctx.skipped_count < RESTORE_WRITER_MAX;
+                               item_ctx.skipped_count < WRITER_APPS_MAX;
          index++)
         skipped[item_ctx.skipped_count++] = deferral->items[index].source_rel;
     item_ctx.skipped_paths = skipped;
@@ -1912,7 +1687,7 @@ static int restore_native_deferred(
         for (size_t app = 0; app < question.count && !known; app++)
             known = strcmp(question.paths[app].label,
                            deferral->items[index].app) == 0;
-        if (!known && question.count < RESTORE_WRITER_MAX)
+        if (!known && question.count < WRITER_APPS_MAX)
         {
             question.paths[question.count].label = deferral->items[index].app;
             question.paths[question.count].home_relative =

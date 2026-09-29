@@ -41,6 +41,7 @@
 #include "portable_restore_replay_internal.h"
 #include "sidecar.h"
 #include "utils.h"
+#include "writer_apps.h"
 
 #ifdef RESTORE_TEST_HOOKS
 void restore_test_set_progress_force(int force);
@@ -2189,11 +2190,11 @@ static void test_verification_failure_still_restores_packages(void)
     join_path(proc_root, sizeof(proc_root), home, "fake-proc");
     mkdir_p(proc_root);
     write_fake_process(proc_root, "4242", "code", geteuid(), 1);
-    restore_test_set_proc_root(proc_root);
+    writer_apps_test_set_proc_root(proc_root);
     char output[16384];
     int rc = run_restore_capturing_with_input(source, "y\n", output,
                                                sizeof(output));
-    restore_test_set_proc_root("/nonexistent/migr-test-proc");
+    writer_apps_test_set_proc_root("/nonexistent/migr-test-proc");
     portable_restore_replay_test_set_after_apply_hook(NULL);
     packages_test_clear_restore_hooks();
     dry_run = previous_dry_run;
@@ -2312,13 +2313,13 @@ static int run_deferred_settings_restore(const char *input, char *output,
     join_path(proc_root, sizeof(proc_root), home, "fake-proc");
     mkdir_p(proc_root);
     write_fake_process(proc_root, "4242", "code", geteuid(), 1);
-    restore_test_set_proc_root(proc_root);
+    writer_apps_test_set_proc_root(proc_root);
     int previous_dry_run = dry_run;
     dry_run = 0;
     int rc = run_restore_capturing_with_input(source, input, output,
                                               output_size);
     dry_run = previous_dry_run;
-    restore_test_set_proc_root("/nonexistent/migr-test-proc");
+    writer_apps_test_set_proc_root("/nonexistent/migr-test-proc");
 
     char settings[PATH_MAX], other[PATH_MAX];
     join_path(settings, sizeof(settings), home, ".config/Code/settings.json");
@@ -2429,13 +2430,13 @@ static int run_native_deferred_restore(const char *input, char *output,
     mkdir_p(proc_root);
     write_fake_process(proc_root, "4242", "code", geteuid(), 1);
     write_fake_process(proc_root, "4243", "chrome", geteuid(), 1);
-    restore_test_set_proc_root(proc_root);
+    writer_apps_test_set_proc_root(proc_root);
     int previous_dry_run = dry_run;
     dry_run = 0;
     int rc = run_restore_capturing_with_input(source, input, output,
                                               output_size);
     dry_run = previous_dry_run;
-    restore_test_set_proc_root("/nonexistent/migr-test-proc");
+    writer_apps_test_set_proc_root("/nonexistent/migr-test-proc");
 
     char path[PATH_MAX];
     join_path(path, sizeof(path), home, ".config/Code/settings.json");
@@ -2581,14 +2582,14 @@ static void test_legacy_open_application_settings_are_deferred(void)
     join_path(proc_root, sizeof(proc_root), source, "fake-proc");
     mkdir_p(proc_root);
     write_fake_process(proc_root, "4242", "firefox", geteuid(), 1);
-    restore_test_set_proc_root(proc_root);
+    writer_apps_test_set_proc_root(proc_root);
     int previous_dry_run = dry_run;
     dry_run = 0;
     char output[16384];
     int rc = run_restore_capturing_with_input(source, "y\ns\n", output,
                                               sizeof(output));
     dry_run = previous_dry_run;
-    restore_test_set_proc_root("/nonexistent/migr-test-proc");
+    writer_apps_test_set_proc_root("/nonexistent/migr-test-proc");
 
     char profile[PATH_MAX], other[PATH_MAX];
     join_path(profile, sizeof(profile), home, ".mozilla/firefox/profiles.ini");
@@ -2630,21 +2631,22 @@ static void test_running_writer_detection(void)
     write_fake_cgroup(proc_root, "110", "0::/user.slice/app.slice/"
                                         "app-flatpak-../../etc-12.scope\n");
 
-    restore_test_set_proc_root(proc_root);
-    const char *labels[8];
-    const char *settings[8];
-    size_t count = restore_test_running_writers(me, labels, settings, 8);
-    restore_test_set_proc_root("/nonexistent/migr-test-proc");
+    writer_apps_test_set_proc_root(proc_root);
+    RunningWriter writers[8];
+    size_t count = writer_apps_running(me, writers, 8);
+    writer_apps_test_set_proc_root("/nonexistent/migr-test-proc");
     int code = 0, software = 0, spotify = 0;
     for (size_t index = 0; index < count; index++)
     {
-        code += strcmp(labels[index], "Visual Studio Code") == 0 &&
-                (strcmp(settings[index], ".config/Code") == 0 ||
-                 strcmp(settings[index], ".vscode") == 0);
-        software += strcmp(labels[index], "GNOME Software") == 0 &&
-                    settings[index][0] == '\0';
-        spotify += strcmp(labels[index], "com.spotify.Client") == 0 &&
-                   strcmp(settings[index], ".var/app/com.spotify.Client") == 0;
+        const char *label = writers[index].label;
+        const char *settings = writers[index].settings;
+        code += strcmp(label, "Visual Studio Code") == 0 &&
+                (strcmp(settings, ".config/Code") == 0 ||
+                 strcmp(settings, ".vscode") == 0);
+        software += strcmp(label, "GNOME Software") == 0 &&
+                    settings[0] == '\0';
+        spotify += strcmp(label, "com.spotify.Client") == 0 &&
+                   strcmp(settings, ".var/app/com.spotify.Client") == 0;
     }
     check(count == 4 && code == 2 && software == 1,
           "only the target user's known writers are named, once per path "
@@ -4304,7 +4306,7 @@ int main(void)
     // Network hints must not depend on whether this machine runs NetworkManager.
     restore_test_set_network_manager_runtime_dir("/nonexistent/migr-test-nm");
     // Nor on which applications happen to be running on the test machine.
-    restore_test_set_proc_root("/nonexistent/migr-test-proc");
+    writer_apps_test_set_proc_root("/nonexistent/migr-test-proc");
     printf(BLUE "::" NC " restore dispatch (unit)\n");
 
     dry_run = 1; // inherited by every fork()ed restore() call below; no confirm_action() prompt is ever reached

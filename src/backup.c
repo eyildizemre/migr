@@ -32,6 +32,7 @@
 #include "selfcopy.h"
 #include "sidecar.h"
 #include "utils.h"
+#include "writer_apps.h"
 #include "xdg.h"
 
 typedef struct {
@@ -2226,64 +2227,224 @@ static int backup_shell_history_confirm(const ShellHistorySelection *owned)
     return confirm_action_default_yes(message) ? 1 : 0;
 }
 
+/* ------------------------------------------------------------------------- */
+/* Applications open on a live source (docs/DECISIONS.md D84).               */
+/* ------------------------------------------------------------------------- */
+
+// The roots that hold the settings of applications running when capture
+// starts, read live and so captured last, and what asking about them needs.
+typedef struct {
+    unsigned char roots[MANIFEST_MAX_ROOTS]; /* 1: captured last */
+    size_t root_count;
+    RunningWriter writers[WRITER_APPS_MAX]; /* those that defer a root */
+    size_t writer_count;
+    const char *labels[WRITER_APPS_MAX]; /* their applications, distinct */
+    size_t label_count;
+    uid_t uid;
+    BackupProgressDisplay *progress; /* NULL when no progress line is shown */
+    const char *unanswered[WRITER_APPS_MAX]; /* still open, nobody answered */
+    size_t unanswered_count;
+} BackupDeferral;
+
+// Defers every root that holds, or lies inside, the settings of a writer
+// application running now, unless those settings are read from a snapshot,
+// which already sees them at one point in time (D64).
+static void backup_defer_open_writers(BackupDeferral *deferral,
+                                      const BackupPlan *plan)
+{
+    char home[PATH_MAX];
+    if (writer_apps_session_uid(&deferral->uid) != 0 ||
+        resolve_target_home(home) != 0)
+        return;
+    RunningWriter running[WRITER_APPS_MAX];
+    size_t count = writer_apps_running(deferral->uid, running,
+                                       WRITER_APPS_MAX);
+    for (size_t index = 0; index < count; index++)
+    {
+        char settings[PATH_MAX];
+        struct stat st;
+        if (running[index].settings[0] == '\0' ||
+            path_join(settings, sizeof(settings), home,
+                      running[index].settings) != 0 ||
+            lstat(settings, &st) != 0 || source_snapshot_covers(settings))
+            continue;
+        int defers = 0;
+        for (int root = 0; root < plan->root_count; root++)
+        {
+            const char *capture = plan->roots[root].capture_path;
+            if (!path_covers(capture, settings) &&
+                !path_covers(settings, capture))
+                continue;
+            defers = 1;
+            if (!deferral->roots[root])
+                deferral->root_count++;
+            deferral->roots[root] = 1;
+        }
+        if (defers)
+            deferral->writers[deferral->writer_count++] = running[index];
+    }
+    deferral->label_count = writer_apps_labels(
+        deferral->writers, deferral->writer_count, deferral->labels);
+}
+
+static void backup_print_deferral(const BackupDeferral *deferral,
+                                  const BackupPlan *plan)
+{
+    if (deferral->root_count == 0)
+        return;
+    writer_apps_print_labels(deferral->labels, deferral->label_count);
+    printf(" %s open, so ", deferral->label_count == 1 ? "is" : "are");
+    size_t shown = 0;
+    for (int root = 0; root < plan->root_count; root++)
+    {
+        if (!deferral->roots[root])
+            continue;
+        shown++;
+        printf("%s%s", shown == 1 ? ""
+                       : shown == deferral->root_count ? " and " : ", ",
+               plan->roots[root].capture_path);
+    }
+    printf(" %s backed up last, after everything else; close %s before "
+           "then.\n", deferral->root_count == 1 ? "is" : "are",
+           deferral->label_count == 1 ? "it" : "them");
+}
+
+// Which of the deferring applications are still running, into open.
+static size_t backup_deferral_still_open(const BackupDeferral *deferral,
+                                         const char **open)
+{
+    RunningWriter writers[WRITER_APPS_MAX];
+    size_t count = writer_apps_running(deferral->uid, writers,
+                                       WRITER_APPS_MAX);
+    size_t open_count = 0;
+    for (size_t label = 0; label < deferral->label_count; label++)
+        for (size_t index = 0; index < count; index++)
+            if (strcmp(writers[index].label, deferral->labels[label]) == 0)
+            {
+                open[open_count++] = deferral->labels[label];
+                break;
+            }
+    return open_count;
+}
+
+// Runs once every other root is captured (D84). Waiting here costs nothing:
+// the rest of the backup is done. The roots are captured whatever the
+// answer; a backup that left them out would lose more than it protects.
+static void backup_before_deferred(void *context)
+{
+    BackupDeferral *deferral = context;
+    const char *open[WRITER_APPS_MAX];
+    size_t open_count = backup_deferral_still_open(deferral, open);
+    if (open_count == 0)
+        return;
+    BackupProgressDisplay *progress = deferral->progress;
+    int ticking = progress != NULL && progress->ticker.running;
+    if (ticking)
+        backup_progress_stop_ticker(progress);
+    if (progress != NULL && progress->printed_anything)
+        putchar('\n');
+    while (open_count != 0)
+    {
+        printf("\n");
+        writer_apps_print_labels(open, open_count);
+        printf(" %s still open. Close %s and press Enter to back up %s "
+               "settings, or type c to back them up as they are: ",
+               open_count == 1 ? "is" : "are", open_count == 1 ? "it" : "them",
+               open_count == 1 ? "its" : "their");
+        fflush(stdout);
+        char answer[32];
+        if (fgets(answer, sizeof(answer), stdin) == NULL)
+        {
+            printf("\nNo answer; backing them up as they are.\n");
+            memcpy(deferral->unanswered, open, open_count * sizeof(*open));
+            deferral->unanswered_count = open_count;
+            break;
+        }
+        if (answer[0] == 'c' || answer[0] == 'C')
+            break;
+        open_count = backup_deferral_still_open(deferral, open);
+    }
+    fflush(stdout);
+    if (ticking &&
+        progress_ticker_start(&progress->ticker, backup_ticker_redraw,
+                              progress) != 0)
+        print_warning("  Warning: progress stall redraw is unavailable: %s\n",
+                      strerror(errno));
+}
+
+static void capture_plan_root(const CloneContext *ctx, const BackupPlan *plan,
+                              const SelectionPlan *selection, int index,
+                              int data_fd, int *count, int *had_error,
+                              BackupCaptureReport *capture_report)
+{
+    const BackupPlanRoot *root = &plan->roots[index];
+    if (verbose)
+        printf("  Capturing: %s -> data/%s\n",
+               root->capture_path, root->manifest_root.payload_path);
+
+    CloneContext root_ctx = *ctx;
+    root_ctx.selection = selection ? &selection->roots[(size_t)index] : NULL;
+
+    capture_report->failed_source_path[0] = '\0';
+    BackupCaptureStatus capture_status = backup_capture_at_report_continue(
+        &root_ctx, root->capture_path, data_fd,
+        root->manifest_root.payload_path, capture_report);
+    if (capture_status != BACKUP_CAPTURE_OK)
+    {
+        if (capture_status == BACKUP_CAPTURE_SOURCE_SAFE_READ)
+        {
+            const char *failed_source =
+                capture_report->failed_source_path[0] != '\0'
+                    ? capture_report->failed_source_path
+                    : root->capture_path;
+            print_source_safe_read_refusal(failed_source);
+        }
+        else
+            print_error("Error: Failed to capture %s\n", root->capture_path);
+        *had_error = 1;
+    }
+    else
+    {
+        (*count)++;
+    }
+}
+
 // selection is the optional compiled plan (docs/DECISIONS.md D34) backing
 // *plan's roots one-for-one by index (backup_plan_from_selection() builds
 // plan that way); NULL means an unfiltered explicit-path backup, which needs
 // no per-entry filter. Each root gets its own CloneContext copy so the
 // borrowed SelectionRoot pointer never leaks across roots, while inode_map
-// and visited stay the single shared instances the caller created.
+// and visited stay the single shared instances the caller created. Deferred
+// roots go last (D84); a backup that already failed has no one to ask.
 static void capture_roots(const CloneContext *ctx, const BackupPlan *plan,
                           const SelectionPlan *selection, int data_fd,
-                          int *count, int *had_error,
+                          BackupDeferral *deferral, int *count, int *had_error,
                           BackupCaptureReport *capture_report)
 {
     // A mismatched pair would index selection->roots past its end with no
     // error, silently capturing a root under the wrong filter -- this is a
     // caller bug, not something to recover from at runtime.
     assert(!selection || (size_t)plan->root_count == selection->root_count);
-    for (int s = 0; s < ROOT_SECTION_COUNT; s++)
+    for (int deferred = 0; deferred <= 1; deferred++)
     {
-        int printed_heading = 0;
-        for (int i = 0; i < plan->root_count; i++)
+        if (deferred && deferral->root_count != 0 && !*had_error)
+            backup_before_deferred(deferral);
+        for (int s = 0; s < ROOT_SECTION_COUNT; s++)
         {
-            const BackupPlanRoot *root = &plan->roots[i];
-            if (root->group != root_sections[s].group)
-                continue;
-
-            // Headings only group the verbose lines under them.
-            if (verbose && !printed_heading)
+            int printed_heading = 0;
+            for (int i = 0; i < plan->root_count; i++)
             {
-                printf("\n%s\n", root_sections[s].heading);
-                printed_heading = 1;
-            }
-            if (verbose)
-                printf("  Capturing: %s -> data/%s\n",
-                       root->capture_path, root->manifest_root.payload_path);
-
-            CloneContext root_ctx = *ctx;
-            root_ctx.selection = selection ? &selection->roots[(size_t)i] : NULL;
-
-            capture_report->failed_source_path[0] = '\0';
-            BackupCaptureStatus capture_status = backup_capture_at_report_continue(
-                &root_ctx, root->capture_path, data_fd,
-                root->manifest_root.payload_path, capture_report);
-            if (capture_status != BACKUP_CAPTURE_OK)
-            {
-                if (capture_status == BACKUP_CAPTURE_SOURCE_SAFE_READ)
+                if (plan->roots[i].group != root_sections[s].group ||
+                    deferral->roots[i] != deferred)
+                    continue;
+                // Headings only group the verbose lines under them.
+                if (verbose && !printed_heading)
                 {
-                    const char *failed_source =
-                        capture_report->failed_source_path[0] != '\0'
-                            ? capture_report->failed_source_path
-                            : root->capture_path;
-                    print_source_safe_read_refusal(failed_source);
+                    printf("\n%s\n", root_sections[s].heading);
+                    printed_heading = 1;
                 }
-                else
-                    print_error("Error: Failed to capture %s\n", root->capture_path);
-                *had_error = 1;
-            }
-            else
-            {
-                (*count)++;
+                capture_plan_root(ctx, plan, selection, i, data_fd, count,
+                                  had_error, capture_report);
             }
         }
     }
@@ -3099,6 +3260,7 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
     source_read_refusals_init(&source_read_refusals);
     SourceSnapshot source_snapshot;
     source_snapshot_init(&source_snapshot);
+    BackupDeferral deferral = {0};
     int finish_result = MIGR_EXIT_FAILURE;
     int adopted_changed = 0;
 
@@ -3156,6 +3318,7 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
     // read-only snapshot (D64): the pre-scan and the capture see one point
     // in time.
     begin_source_snapshot(&source_snapshot, &plan, target);
+    backup_defer_open_writers(&deferral, &plan);
 
     PortableCaptureRequest portable_request = {0};
     char portable_machine_id[MANIFEST_MACHINE_ID_MAX];
@@ -3375,6 +3538,7 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
             printf("Updating this install's backup in place.\n");
         else if (adopted)
             printf("Resuming an interrupted backup of this install.\n");
+        backup_print_deferral(&deferral, &plan);
 
         capture_report.sync_interval_bytes = BACKUP_SYNC_INTERVAL_BYTES;
         BackupProgressDisplay progress_display = {
@@ -3399,6 +3563,7 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
                 print_warning("  Warning: progress stall redraw is unavailable: %s\n",
                               strerror(errno));
             progress_installed = 1;
+            deferral.progress = &progress_display;
         }
 
         if (repr == CLONE_NATIVE_TREE)
@@ -3427,8 +3592,8 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
                     had_error = 1;
                 }
                 if (!had_error)
-                    capture_roots(&ctx, &plan, selection, data_fd, &count, &had_error,
-                                  &capture_report);
+                    capture_roots(&ctx, &plan, selection, data_fd, &deferral,
+                                  &count, &had_error, &capture_report);
                 if (!had_error)
                     reconcile_roots(ctx.visited, &plan, data_fd, &had_error);
                 native_inode_map_free(ctx.inode_map);
@@ -3441,6 +3606,12 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
         {
             size_t live_count = 0;
             portable_request.payload_matches_journal = container.from_finished;
+            if (deferral.root_count != 0)
+            {
+                portable_request.deferred = deferral.roots;
+                portable_request.before_deferred = backup_before_deferred;
+                portable_request.before_deferred_context = &deferral;
+            }
             int capture_result = adopted
                 ? portable_capture_resume_prepared_at(
                       container_fd, &portable_request, &prepared, &live_count,
@@ -3476,6 +3647,17 @@ static int backup_run(const char *target, BackupMode mode, BackupPlan plan,
                    "out.\n",
                    capture_report.live_state_changes,
                    capture_report.live_state_changes == 1 ? "" : "s");
+        if (deferral.unanswered_count != 0)
+        {
+            size_t open_count = deferral.unanswered_count;
+            printf("Note: ");
+            writer_apps_print_labels(deferral.unanswered, open_count);
+            printf(" %s open while %s settings were backed up, so they are "
+                   "as %s last saved them.\n",
+                   open_count == 1 ? "was" : "were",
+                   open_count == 1 ? "its" : "their",
+                   open_count == 1 ? "it" : "they");
+        }
         close(data_fd);
 
         // packages.txt is a migr-owned control artifact, not a payload root, so
@@ -3851,10 +4033,12 @@ BackupCaptureStatus backup_selection_capture(const CloneContext *ctx,
     {
         int had_error = 0;
         int count = 0;
+        BackupDeferral none = {0};
         if (seed_native_hardlink_map(&run, &backup_plan, plan, data_fd) != 0)
             had_error = 1;
         if (!had_error)
-            capture_roots(&run, &backup_plan, plan, data_fd, &count, &had_error, report);
+            capture_roots(&run, &backup_plan, plan, data_fd, &none, &count,
+                          &had_error, report);
         if (!had_error)
             reconcile_roots(run.visited, &backup_plan, data_fd, &had_error);
         status = had_error ? BACKUP_CAPTURE_ERROR : BACKUP_CAPTURE_OK;

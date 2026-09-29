@@ -72,7 +72,7 @@ VALGRIND_TESTS = \
 TARGET = migr
 STATIC_TARGET = migr-static
 VPATH = src
-SRCS = selection_match.c selection.c config.c main.c detect.c report.c backup.c backup_plan.c packages.c groups.c flatpak.c restore.c dconf_restore.c live_state.c utils.c selfcopy.c fileops.c fsprobe.c xdg.c manifest.c encoding.c portable_name.c container.c metadata.c metadata_xattr.c portable_hashset.c portable_prescan.c portable_fsops.c portable.c portable_reconcile.c portable_restore_replay.c portable_restore_shared.c portable_restore_orchestrate.c portable_restore_preflight.c sidecar.c sidecar_state.c sidecar_state_map.c hash.c verify.c repair.c source_snapshot.c
+SRCS = selection_match.c selection.c config.c main.c detect.c report.c backup.c backup_plan.c packages.c groups.c flatpak.c restore.c dconf_restore.c live_state.c utils.c selfcopy.c fileops.c fsprobe.c xdg.c manifest.c encoding.c portable_name.c container.c metadata.c metadata_xattr.c portable_hashset.c portable_prescan.c portable_fsops.c portable.c portable_reconcile.c portable_restore_replay.c portable_restore_shared.c portable_restore_orchestrate.c portable_restore_preflight.c sidecar.c sidecar_state.c sidecar_state_map.c hash.c verify.c repair.c source_snapshot.c writer_apps.c
 OBJS = $(SRCS:.c=.o)
 # Every object but main.o, which tests link against.
 LIB_OBJS = $(filter-out main.o,$(OBJS))
@@ -256,6 +256,9 @@ backup_test.o: src/backup.c
 restore_test.o: src/restore.c
 	$(CC) $(CFLAGS) $(DEPFLAGS) -DRESTORE_TEST_HOOKS -c src/restore.c -o $@
 
+writer_apps_test.o: src/writer_apps.c
+	$(CC) $(CFLAGS) $(DEPFLAGS) -DWRITER_APPS_TEST_HOOKS -c src/writer_apps.c -o $@
+
 backup_plan_test.o: src/backup_plan.c
 	$(CC) $(CFLAGS) $(DEPFLAGS) -DBACKUP_PLAN_TEST_HOOKS -c src/backup_plan.c -o $@
 
@@ -294,14 +297,14 @@ $(TEST_VSCODE_CAPTURE): tests/test_vscode_capture.c $(call with_hooks,backup_tes
 $(TEST_BACKUP_SYNC): tests/test_backup_sync.c $(call with_hooks,fileops_test.o portable_test.o portable_reconcile_test.o)
 	$(CC) $(CFLAGS) -DBACKUP_TEST_HOOKS -Wl,--wrap=syncfs -Wl,--wrap=read -o $@ $(filter %.c %.o,$^)
 
-$(TEST_RESTORE_DISPATCH): tests/test_restore_dispatch.c $(call with_hooks,restore_test.o portable_restore_replay_test.o backup_test.o packages_test.o groups_test.o)
-	$(CC) $(CFLAGS) -DBACKUP_TEST_HOOKS -DRESTORE_TEST_HOOKS -DPACKAGES_TEST_HOOKS -DGROUPS_TEST_HOOKS -DPORTABLE_RESTORE_REPLAY_TEST_HOOKS -o $@ $(filter %.c %.o,$^)
+$(TEST_RESTORE_DISPATCH): tests/test_restore_dispatch.c $(call with_hooks,restore_test.o portable_restore_replay_test.o backup_test.o packages_test.o groups_test.o writer_apps_test.o)
+	$(CC) $(CFLAGS) -DBACKUP_TEST_HOOKS -DRESTORE_TEST_HOOKS -DPACKAGES_TEST_HOOKS -DGROUPS_TEST_HOOKS -DPORTABLE_RESTORE_REPLAY_TEST_HOOKS -DWRITER_APPS_TEST_HOOKS -o $@ $(filter %.c %.o,$^)
 
 $(TEST_RESTORE_ATIME): tests/test_restore_atime.c $(LIB_OBJS)
 	$(CC) $(CFLAGS) -o $@ $(filter %.c %.o,$^)
 
-$(TEST_BACKUP_PLAN): tests/test_backup_plan.c $(call with_hooks,backup_test.o backup_plan_test.o fileops_test.o)
-	$(CC) $(CFLAGS) -DBACKUP_TEST_HOOKS -DBACKUP_PLAN_TEST_HOOKS -o $@ $(filter %.c %.o,$^)
+$(TEST_BACKUP_PLAN): tests/test_backup_plan.c $(call with_hooks,backup_test.o backup_plan_test.o fileops_test.o writer_apps_test.o)
+	$(CC) $(CFLAGS) -DBACKUP_TEST_HOOKS -DBACKUP_PLAN_TEST_HOOKS -DWRITER_APPS_TEST_HOOKS -o $@ $(filter %.c %.o,$^)
 
 $(TEST_METADATA_CONTRACT): tests/test_metadata_contract.c $(call with_hooks,metadata_xattr_test.o)
 	$(CC) $(CFLAGS) -DMETADATA_XATTR_TEST_HOOKS -o $@ $(filter %.c %.o,$^)

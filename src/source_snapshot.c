@@ -125,6 +125,21 @@ static int subvolume_root_of(const char *source, char out[PATH_MAX])
     }
 }
 
+int source_snapshot_covers(const char *path)
+{
+    char subvolume[PATH_MAX];
+    if (path == NULL || subvolume_root_of(path, subvolume) != 1)
+        return 0;
+    int fd = open(subvolume, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0)
+        return 0;
+    __u64 flags = 0;
+    int read_only = ioctl(fd, BTRFS_IOC_SUBVOL_GETFLAGS, &flags) == 0 &&
+                    (flags & BTRFS_SUBVOL_RDONLY) != 0;
+    close(fd);
+    return read_only;
+}
+
 static int path_is_within(const char *path, const char *root)
 {
     size_t length = strlen(root);
