@@ -130,6 +130,45 @@ ContainerStatus container_adopt_fd(int dest_root_fd, const char *owner,
                                    BackupContainer *out);
 
 /**
+ * @brief What an update would find under a destination root for owner
+ * (docs/DECISIONS.md D88).
+ */
+typedef struct {
+    size_t own;   /**< backups of this install, finished or in progress. */
+    size_t other; /**< finished backups of another install in the same
+                       format (representation and journal version). */
+    char other_name[CONTAINER_NAME_MAX]; /**< the first of those. */
+    time_t other_updated; /**< when it was last taken; 0 when unrecorded. */
+} ContainerSurvey;
+
+/**
+ * @brief Counts owner's backups under dest_root_fd as container_adopt_fd()
+ * would see them, without taking any: those of wanted_identity's install,
+ * and finished ones of another install that could be updated instead.
+ * Entries locked by a live process or without a valid manifest are passed
+ * over.
+ *
+ * @return 0, or -1 when the destination or an entry could not be examined.
+ */
+int container_survey_fd(int dest_root_fd, const char *owner,
+                        const Manifest *wanted_identity,
+                        ContainerSurvey *out);
+
+/**
+ * @brief container_adopt_fd(), also taking the finished backup named
+ * other_name (a leaf name) when it was taken by another install in the same
+ * format, as the user chose (docs/DECISIONS.md D88). It is adopted like this
+ * install's own; the caller's manifest then gives it this install's identity.
+ *
+ * @return As container_adopt_fd(); CONTAINER_ERR_INVALID also for a NULL
+ *         other_name.
+ */
+ContainerStatus container_adopt_other_fd(int dest_root_fd, const char *owner,
+                                         const Manifest *wanted_identity,
+                                         const char *other_name,
+                                         BackupContainer *out);
+
+/**
  * @brief Claims a fresh, uniquely-named ".partial" container under dest_root.
  *
  * Names are tried in order (docs/DECISIONS.md D71): "migr-<owner>", then

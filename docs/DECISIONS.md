@@ -4679,7 +4679,8 @@ the old naming are not migrated (pre-release).
 
 ## D72 — 2026-09-27 — A backup is updated in place
 
-**Status:** Implemented
+**Status:** Implemented; extended by D88 (another install's backup, and
+portable metadata-only changes)
 
 **Decision:** A backup run takes over this install's existing backup under
 PATH instead of creating another one.
@@ -5150,4 +5151,53 @@ instead.
 
 **Relationship:** KDE's KWallet opens with the login password the same way and
 is not covered.
+
+## D88 — 2026-09-30 — One backup can be updated across installs
+
+**Status:** Implemented
+
+**Decision:** A backup another install took can be updated from this one,
+with the user's consent, and a portable update no longer copies a file whose
+metadata alone changed.
+- **Candidates:** `container_survey_fd()` counts the user's backups under
+  PATH (D71) as adoption sees them: those of this install, and finished ones
+  of another install (another machine-id or source uid) with the same
+  representation and journal version. Backups in progress and backups locked
+  by a live process are never candidates.
+- **The question:** When no backup is this install's and exactly one other
+  is a candidate, backup asks, with no as the default, whether to update it;
+  its name and when it was last taken are shown, and that files not on this
+  system will be removed from it. The question comes right after the
+  destination probe settles the representation, before the snapshot and the
+  pre-scan, so nothing is read or written first. No, or end of input, keeps
+  the earlier behavior: a new backup next to it. With more than one
+  candidate there is no question.
+- **Adoption:** `container_adopt_other_fd()` adopts as `container_adopt_fd()`
+  does, also taking the finished backup of that name when it is in the same
+  format. The run then writes its own manifest into it, as D72 does, so the
+  backup is this install's from then on and later updates match without a
+  question.
+- **Metadata-only changes (portable):** When a regular file's live record
+  differs from it but the content signals match (address, collision suffix,
+  size, mtime to the recorded precision) and the payload exists at that size,
+  capture appends a DELETE, a CLAIM, and an ENTRY group with the current
+  metadata and the recorded content digest (D59), and leaves the payload
+  alone (`capture_metadata_change()`). An interruption after the claim leaves
+  the state an interrupted copy leaves before its payload is written, and
+  the next run copies that file again. Native updates already worked this
+  way: a file with the same size and mtime is not copied, and its metadata is
+  brought up to date.
+
+**Why:** A restored system has a new machine-id, so its first backup was a
+full new one next to the old, and after a distro hop almost every file
+differs from its record in metadata alone: SELinux labels present on one
+system and not the other, atimes, owners. The identity check exists so that
+two installs sharing a drive never overwrite each other's backups; adopting
+replaces the other install's backup with this system's files, which only the
+user can decide. No metadata is dropped from the record to make the update
+cheaper; recording a change costs a journal group (about 170 bytes, D73)
+instead of the file.
+
+**Relationship:** Extends D72; uses D59's content digest; D73 compacts the
+journal as the added records accumulate.
 

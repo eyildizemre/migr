@@ -173,13 +173,17 @@ migr asks you to close it and press Enter, or to back them up as they are.
 
 **Where it goes.** The backup is a folder named after you, `migr-<user>`. If
 that name already holds another installation's backup (another computer, or
-this one before a reinstall), the new one is named after the day,
-`migr-<user>-YYYY-MM-DD`, and the old one is left alone.
+this one before a reinstall), migr asks whether to update it from this system,
+so one backup can follow you from one distribution to the next. The default
+is no: the new backup is named after the day, `migr-<user>-YYYY-MM-DD`, and
+the old one is left alone. With more than one such backup, migr does not ask.
 
 **Interrupted and repeated backups.** While running, the backup is called
 `migr-<user>.partial`; run the same command again to continue it. Backing up
 again to the same place updates the backup in place: unchanged files are
-skipped, changed ones copied again, and files you deleted leave the backup.
+skipped, changed ones copied again, and files you deleted leave the backup. A
+file whose permissions, owner, access time, or extended attributes changed but
+whose content did not is not copied again; only its record is.
 During an update it is called `migr-<user>.updating`, so an interrupted update
 is never mistaken for a finished backup.
 

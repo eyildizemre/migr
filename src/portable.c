@@ -902,6 +902,28 @@ int entries_equal(const SidecarEntry *current,
            xattrs_equal(xattrs, previous);
 }
 
+/* Whether a regular file differs from its record at most in metadata (mode,
+ * owner, atime, xattrs): the same address, and the size and mtime that resume
+ * and native updates already trust to tell content apart. */
+static int entry_content_equal(const SidecarEntry *current,
+                               const SidecarEntry *entry)
+{
+    return current->kind == SIDECAR_KIND_REGULAR &&
+           entry->kind == SIDECAR_KIND_REGULAR &&
+           sidecar_bytes_equal(current->root_id, entry->root_id) &&
+           sidecar_bytes_equal(current->logical_path, entry->logical_path) &&
+           sidecar_bytes_equal(current->physical_leaf, entry->physical_leaf) &&
+           sidecar_bytes_equal(current->collision_suffix,
+                               entry->collision_suffix) &&
+           sidecar_bytes_equal(current->hardlink_root_id,
+                               entry->hardlink_root_id) &&
+           sidecar_bytes_equal(current->hardlink_logical_path,
+                               entry->hardlink_logical_path) &&
+           current->size == entry->size &&
+           current->mtime_sec == entry->mtime_sec &&
+           current->mtime_nsec == entry->mtime_nsec;
+}
+
 static int existing_payload_matches(int data_fd, const char *payload_path,
                                     int destination_parent,
                                     const char *destination_leaf,
@@ -2914,6 +2936,25 @@ static int capture_regular(PortableCaptureContext *context,
     return failed ? -1 : 0;
 }
 
+/* Records a regular file whose metadata alone changed with its recorded
+ * content digest, and leaves its payload as it is (D88). A run interrupted
+ * in between leaves a claim, which the next one reconciles by copying the
+ * file again. */
+static int capture_metadata_change(PortableCaptureContext *context,
+                                   const PortableRootSpec *root,
+                                   const char *logical,
+                                   const char *physical_leaf,
+                                   const SidecarEntry *entry,
+                                   const PortableXattrs *xattrs,
+                                   const CapturePreviousEntry *previous_hint)
+{
+    return replace_live_capture(context, root, logical, previous_hint) == 0 &&
+                   append_capture_claim(context, root, logical, physical_leaf,
+                                        SIDECAR_KIND_REGULAR) == 0 &&
+                   append_group(context, entry, xattrs) == 0
+               ? 0 : -1;
+}
+
 static int capture_special(PortableCaptureContext *context,
                            const PortableRootSpec *root,
                            const char *logical,
@@ -3525,12 +3566,14 @@ static int capture_node(PortableCaptureContext *context,
             previous_hint.view = previous;
         if (live == 1) {
             SidecarEntry current;
-            int matches = entry_from_stat(root->id, logical, physical_leaf,
-                                          collision_suffix, &before,
-                                          context->nsec_exact, &xattrs,
-                                          &current, NULL, NULL, NULL) == 0 &&
-                          entries_equal(&current, &previous, &xattrs);
-            if (matches) {
+            int built = entry_from_stat(root->id, logical, physical_leaf,
+                                        collision_suffix, &before,
+                                        context->nsec_exact, &xattrs,
+                                        &current, NULL, NULL, NULL) == 0;
+            int matches = built && entries_equal(&current, &previous, &xattrs);
+            int same_content = built && !matches && previous.entry != NULL &&
+                               entry_content_equal(&current, previous.entry);
+            if (matches || same_content) {
                 int payload = existing_payload_matches(
                     context->data_fd, root->payload_path, destination_parent,
                     destination_leaf, is_root, current.size);
@@ -3539,9 +3582,23 @@ static int capture_node(PortableCaptureContext *context,
                     close(source_fd);
                     return -1;
                 }
-                if (payload == 1) {
+                if (payload == 1 && matches) {
                     xattrs_free(&xattrs);
                     return close(source_fd) == 0 ? 0 : -1;
+                }
+                if (payload == 1) {
+                    current.content_digest = previous.entry->content_digest;
+                    int result = capture_metadata_change(
+                        context, root, logical, physical_leaf, &current,
+                        &xattrs, &previous_hint);
+                    xattrs_free(&xattrs);
+                    if (close(source_fd) != 0)
+                        result = -1;
+                    if (result != 0)
+                        portable_capture_context_failure_record(
+                            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root,
+                            logical);
+                    return result;
                 }
             }
         }

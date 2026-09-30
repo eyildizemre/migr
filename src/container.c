@@ -378,9 +378,115 @@ ContainerStatus container_reserve(const char *dest_root, const char *owner,
     return status;
 }
 
-ContainerStatus container_adopt_fd(int dest_root_fd, const char *owner,
-                                   const Manifest *wanted_identity,
-                                   BackupContainer *out)
+// Opens and locks root_fd's entry name and reads its manifest. Returns 1 with
+// *fd_out and *manifest_out owned by the caller, 0 for an entry to pass over
+// (gone, locked by a live process, or without a valid manifest), or -1 when
+// it could not be examined, which might hide a match.
+static int open_candidate(int root_fd, const char *name, int *fd_out,
+                          Manifest *manifest_out)
+{
+    int fd = openat(root_fd, name,
+                    O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0)
+        return errno == ENOENT ? 0 : -1;
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0)
+    {
+        int lock_errno = errno;
+        close(fd);
+        return lock_errno == EWOULDBLOCK ? 0 : -1;
+    }
+    ManifestStatus status = manifest_read_v1_at(fd, manifest_out);
+    if (status != MANIFEST_STATUS_VALID)
+    {
+        close(fd);
+        return status == MANIFEST_STATUS_IO_ERROR ? -1 : 0;
+    }
+    *fd_out = fd;
+    return 1;
+}
+
+// Whether two backups are written the same way, so one can be updated as the
+// other would be: representation and journal version.
+static int same_format(const Manifest *a, const Manifest *b)
+{
+    return a->representation == b->representation &&
+           a->sidecar_version == b->sidecar_version;
+}
+
+int container_survey_fd(int dest_root_fd, const char *owner,
+                        const Manifest *wanted_identity,
+                        ContainerSurvey *out)
+{
+    if (out == NULL || dest_root_fd < 0 || owner == NULL ||
+        wanted_identity == NULL)
+        return -1;
+    memset(out, 0, sizeof(*out));
+    int scan_fd = fcntl(dest_root_fd, F_DUPFD_CLOEXEC, 0);
+    DIR *dirp = scan_fd >= 0 ? fdopendir(scan_fd) : NULL;
+    if (dirp == NULL)
+    {
+        if (scan_fd >= 0)
+            close(scan_fd);
+        return -1;
+    }
+    // The duplicate shares its position with dest_root_fd, which an earlier
+    // scan may have left at the end.
+    rewinddir(dirp);
+    char base[CONTAINER_NAME_MAX];
+    build_base(owner, base);
+
+    int result = 0;
+    for (;;)
+    {
+        errno = 0;
+        struct dirent *entry = readdir(dirp);
+        if (entry == NULL)
+        {
+            if (errno != 0)
+                result = -1;
+            break;
+        }
+        char final_name[CONTAINER_NAME_MAX];
+        int suffix;
+        NameState state;
+        if (!parse_owned_name(entry->d_name, base, final_name, &suffix,
+                              &state))
+            continue;
+        int fd;
+        Manifest manifest;
+        int opened = open_candidate(dest_root_fd, entry->d_name, &fd,
+                                    &manifest);
+        if (opened < 0)
+        {
+            result = -1;
+            break;
+        }
+        if (opened == 0)
+            continue;
+        if (manifest_install_identity_equal(&manifest, wanted_identity))
+            out->own++;
+        else if (state == NAME_FINISHED &&
+                 same_format(&manifest, wanted_identity))
+        {
+            if (out->other == 0)
+            {
+                memcpy(out->other_name, final_name, sizeof(out->other_name));
+                out->other_updated = manifest.updated;
+            }
+            out->other++;
+        }
+        manifest_free(&manifest);
+        close(fd);
+    }
+    closedir(dirp);
+    return result;
+}
+
+// container_adopt_fd(), also taking other_name, when not NULL, as a finished
+// backup of another install in the same format.
+static ContainerStatus adopt_fd(int dest_root_fd, const char *owner,
+                                const Manifest *wanted_identity,
+                                const char *other_name, BackupContainer *out)
 {
     if (out == NULL || dest_root_fd < 0 || owner == NULL)
         return CONTAINER_ERR_INVALID;
@@ -413,6 +519,9 @@ ContainerStatus container_adopt_fd(int dest_root_fd, const char *owner,
         close(root_fd);
         return CONTAINER_ERR_IO;
     }
+    // The duplicate shares its position with dest_root_fd, which an earlier
+    // scan (container_survey_fd()) may have left at the end.
+    rewinddir(dirp);
 
     int best_fd = -1;
     char best_partial[CONTAINER_NAME_MAX];
@@ -440,45 +549,28 @@ ContainerStatus container_adopt_fd(int dest_root_fd, const char *owner,
                               &candidate_suffix, &candidate_state))
             continue; // not this owner's grammar (includes "." and "..")
 
-        int cand_fd = openat(root_fd, entry->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-        if (cand_fd < 0)
-        {
-            if (errno == ENOENT)
-                continue; // removed concurrently between readdir() and here
-            scan_error = 1;
-            break;
-        }
-
-        if (flock(cand_fd, LOCK_EX | LOCK_NB) != 0)
-        {
-            int lock_errno = errno;
-            close(cand_fd);
-            if (lock_errno == EWOULDBLOCK)
-                continue; // a live process holds this one; not adoptable, not an error
-            scan_error = 1;
-            break;
-        }
-
+        int cand_fd;
         Manifest cand_manifest;
-        ManifestStatus mst = manifest_read_v1_at(cand_fd, &cand_manifest);
-        if (mst == MANIFEST_STATUS_IO_ERROR)
+        int opened = open_candidate(root_fd, entry->d_name, &cand_fd,
+                                    &cand_manifest);
+        if (opened < 0)
         {
             scan_error = 1; // an unreadable candidate could be hiding a second match
-            close(cand_fd);
             break;
         }
-        if (mst != MANIFEST_STATUS_VALID)
-        {
-            close(cand_fd); // missing/legacy/malformed/unknown-version: not adoptable
+        if (opened == 0)
             continue;
-        }
 
         // The same install's backup is adopted even when its job changed
-        // since (D72): the caller brings it up to date.
-        int same_install = manifest_install_identity_equal(&cand_manifest,
-                                                           wanted_identity);
+        // since (D72): the caller brings it up to date. Another install's
+        // is taken only when the user chose it by name (D88).
+        int adoptable =
+            manifest_install_identity_equal(&cand_manifest, wanted_identity) ||
+            (other_name != NULL && candidate_state == NAME_FINISHED &&
+             strcmp(entry->d_name, other_name) == 0 &&
+             same_format(&cand_manifest, wanted_identity));
         manifest_free(&cand_manifest);
-        if (!same_install)
+        if (!adoptable)
         {
             close(cand_fd);
             continue;
@@ -572,6 +664,23 @@ ContainerStatus container_adopt_fd(int dest_root_fd, const char *owner,
     out->from_finished = best_state == NAME_FINISHED;
     out->state = CONTAINER_STATE_PARTIAL;
     return CONTAINER_OK;
+}
+
+ContainerStatus container_adopt_fd(int dest_root_fd, const char *owner,
+                                   const Manifest *wanted_identity,
+                                   BackupContainer *out)
+{
+    return adopt_fd(dest_root_fd, owner, wanted_identity, NULL, out);
+}
+
+ContainerStatus container_adopt_other_fd(int dest_root_fd, const char *owner,
+                                         const Manifest *wanted_identity,
+                                         const char *other_name,
+                                         BackupContainer *out)
+{
+    if (other_name == NULL)
+        return CONTAINER_ERR_INVALID;
+    return adopt_fd(dest_root_fd, owner, wanted_identity, other_name, out);
 }
 
 ContainerStatus container_adopt(const char *dest_root, const char *owner,

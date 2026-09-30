@@ -4108,6 +4108,178 @@ static void test_open_application_settings_are_backed_up_last(int portable)
     remove_tree(home);
 }
 
+// Makes container's backup look taken on another machine.
+static int mark_as_another_install(const char *container)
+{
+    int fd = open(container, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    Manifest manifest;
+    int ok = fd >= 0 &&
+             manifest_read_v1_at(fd, &manifest) == MANIFEST_STATUS_VALID;
+    if (ok)
+    {
+        strcpy(manifest.machine_id, "00000000000000000000000000000000");
+        ok = manifest_write_v1_at(fd, &manifest) == 0;
+        manifest_free(&manifest);
+    }
+    if (fd >= 0)
+        close(fd);
+    return ok;
+}
+
+static int manifest_machine_id_is(const char *container, const char *id)
+{
+    int fd = open(container, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    Manifest manifest;
+    int ok = fd >= 0 &&
+             manifest_read_v1_at(fd, &manifest) == MANIFEST_STATUS_VALID;
+    if (ok)
+    {
+        ok = strcmp(manifest.machine_id, id) == 0;
+        manifest_free(&manifest);
+    }
+    if (fd >= 0)
+        close(fd);
+    return ok;
+}
+
+// A backup another install took is updated from this one only when the user
+// says so; otherwise a new one is made next to it (D88).
+static void test_update_takes_another_installs_backup_on_yes(int portable)
+{
+    printf(BLUE "::" NC " production: a %s backup of another install is updated only on yes\n",
+           portable ? "portable" : "native");
+
+    char home[PATH_MAX], target[PATH_MAX], dir[PATH_MAX], file[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_home");
+    setenv("HOME", home, 1);
+    join_path(dir, sizeof(dir), home, "notes");
+    mkdir_p(dir);
+    join_path(file, sizeof(file), dir, "file.txt");
+    char *paths[] = { dir, NULL };
+    static const char question[] = "was taken on another install";
+    char output[8192], container[PATH_MAX];
+
+    dry_run = 0;
+    backup_test_force_portable_representation(portable);
+    for (int answer_yes = 1; answer_yes >= 0; answer_yes--)
+    {
+        fresh_mkdtemp(target, sizeof(target), "plan_target");
+        write_file(file, "first");
+        int first_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS,
+                                            paths, output, sizeof(output));
+        int marked = first_rc == 0 &&
+                     find_container_dir(target, container,
+                                        sizeof(container)) &&
+                     mark_as_another_install(container);
+        write_file(file, "second, longer");
+        int rc = run_backup_capturing_input(
+            target, BACKUP_EXPLICIT_PATHS, paths, 0, 0,
+            answer_yes ? "y\n" : "", output, sizeof(output));
+        char payload[PATH_MAX];
+        join_path(payload, sizeof(payload), container, "data/notes/file.txt");
+        if (answer_yes)
+            check(marked && rc == 0 && strstr(output, question) != NULL &&
+                      strstr(output, "Updating the other install's backup "
+                                     "in place") != NULL &&
+                      count_final_containers(target) == 1 &&
+                      file_text_is(payload, "second, longer") &&
+                      !manifest_machine_id_is(
+                          container, "00000000000000000000000000000000"),
+                  "on yes, it is updated and becomes this install's");
+        else
+            check(marked && rc == 0 && strstr(output, question) != NULL &&
+                      count_final_containers(target) == 2 &&
+                      file_text_is(payload, "first"),
+                  "with nobody to answer, a new backup is made next to it");
+        remove_tree(target);
+    }
+    backup_test_force_portable_representation(0);
+    remove_tree(home);
+}
+
+// A record of root_id/logical in a portable backup's journal.
+static int journal_record(const char *container, const char *root_id,
+                          const char *logical, uint32_t *mode,
+                          uint64_t *digest)
+{
+    int fd = open(container, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    SidecarLog log = {0};
+    int ok = fd >= 0 &&
+             sidecar_log_adopt_at(fd, &log) == SIDECAR_OPEN_RESUMABLE;
+    if (ok)
+    {
+        SidecarLiveView view;
+        ok = sidecar_log_find(
+                 &log,
+                 (SidecarBytes){ (const unsigned char *)root_id,
+                                 strlen(root_id) },
+                 (SidecarBytes){ (const unsigned char *)logical,
+                                 strlen(logical) },
+                 &view) == 1;
+        if (ok)
+        {
+            *mode = view.entry->mode;
+            *digest = view.entry->content_digest;
+        }
+        sidecar_log_close(&log);
+    }
+    if (fd >= 0)
+        close(fd);
+    return ok;
+}
+
+// A portable update records a file whose metadata alone changed without
+// copying it again, as a native update does (D88).
+static void test_portable_update_records_a_metadata_change(void)
+{
+    printf(BLUE "::" NC " production: a portable update does not recopy a file whose metadata alone changed\n");
+
+    char home[PATH_MAX], target[PATH_MAX], dir[PATH_MAX], file[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_home");
+    setenv("HOME", home, 1);
+    join_path(dir, sizeof(dir), home, "notes");
+    mkdir_p(dir);
+    join_path(file, sizeof(file), dir, "file.txt");
+    write_file(file, "content");
+    check(chmod(file, 0644) == 0, "fixture: set the file's mode");
+    fresh_mkdtemp(target, sizeof(target), "plan_target");
+    char *paths[] = { dir, NULL };
+    char output[8192], container[PATH_MAX], payload[PATH_MAX];
+
+    dry_run = 0;
+    backup_test_force_portable_representation(1);
+    uint32_t mode = 0, second_mode = 0;
+    uint64_t digest = 0, second_digest = 0;
+    int ok = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                  output, sizeof(output)) == 0 &&
+             find_container_dir(target, container, sizeof(container)) &&
+             journal_record(container, "EXPLICIT_0", "file.txt", &mode,
+                            &digest);
+    join_path(payload, sizeof(payload), container, "data/notes/file.txt");
+    // Same length, other bytes: a copy made again would put "content" back.
+    write_file(payload, "CONTENT");
+    check(ok && chmod(file, 0600) == 0, "fixture: back up, then change the mode");
+
+    int rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths, output,
+                                  sizeof(output));
+    check(rc == 0 && file_text_is(payload, "CONTENT") &&
+              journal_record(container, "EXPLICIT_0", "file.txt",
+                             &second_mode, &second_digest) &&
+              (second_mode & 07777) == 0600 && (mode & 07777) == 0644 &&
+              second_digest == digest,
+          "the new mode is recorded with the same digest, and the payload is "
+          "not written");
+
+    write_file(file, "changed content");
+    rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths, output,
+                              sizeof(output));
+    check(rc == 0 && file_text_is(payload, "changed content"),
+          "a changed file is still copied again");
+    backup_test_force_portable_representation(0);
+    remove_tree(home);
+    remove_tree(target);
+}
+
 // A second backup of the same install updates the first in place (D72):
 // changed files are recopied, removed ones leave the payload, and a root
 // the new selection lacks is removed with its journal records.
@@ -4766,6 +4938,9 @@ int main(void)
     test_sudo_backup_belongs_to_invoker();
     test_backup_updates_in_place(0);
     test_backup_updates_in_place(1);
+    test_update_takes_another_installs_backup_on_yes(0);
+    test_update_takes_another_installs_backup_on_yes(1);
+    test_portable_update_records_a_metadata_change();
     test_update_reuses_a_dropped_root_id(0);
     test_update_reuses_a_dropped_root_id(1);
     test_update_recaptures_a_recreated_folder(0);

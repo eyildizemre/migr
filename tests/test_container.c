@@ -1146,6 +1146,68 @@ static void test_adopt_takes_a_finished_backup_for_update(void)
     fresh_test_root();
 }
 
+// Another install's finished backup is counted for the question and adopted
+// only when chosen by name (D88).
+static void test_another_installs_backup_is_taken_only_by_name(void)
+{
+    printf(BLUE "::" NC " container: another install's finished backup is offered, and adopted only by name\n");
+    fresh_test_root();
+
+    Manifest theirs;
+    make_reference_manifest(&theirs);
+    theirs.updated = FIXED_TIME;
+    BackupContainer c;
+    check(container_reserve(test_root, OWNER, FIXED_TIME, &c) == CONTAINER_OK &&
+              manifest_write_v1_at(container_root_fd(&c), &theirs) == 0 &&
+              container_finalize(&c) == CONTAINER_OK,
+          "fixture: publish another install's backup");
+    container_close(&c);
+
+    Manifest mine;
+    make_reference_manifest(&mine);
+    strcpy(mine.machine_id, "00000000000000000000000000000000");
+    int root_fd = open(test_root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    ContainerSurvey survey;
+    check(root_fd >= 0 &&
+              container_survey_fd(root_fd, OWNER, &mine, &survey) == 0 &&
+              survey.own == 0 && survey.other == 1 &&
+              strcmp(survey.other_name, "migr-" OWNER) == 0 &&
+              survey.other_updated == FIXED_TIME,
+          "it is counted as another install's, with its name and time");
+    check(container_survey_fd(root_fd, OWNER, &theirs, &survey) == 0 &&
+              survey.own == 1 && survey.other == 0,
+          "for its own install it is that install's");
+
+    Manifest portable = mine;
+    portable.representation = CLONE_PORTABLE_SIDECAR;
+    portable.sidecar_version = 1;
+    check(container_survey_fd(root_fd, OWNER, &portable, &survey) == 0 &&
+              survey.other == 0,
+          "a backup in another format is not offered");
+
+    BackupContainer adopted;
+    check(container_adopt_fd(root_fd, OWNER, &mine, &adopted) ==
+              CONTAINER_ERR_NO_MATCH,
+          "without a choice it is not adopted");
+    container_close(&adopted);
+    check(container_adopt_other_fd(root_fd, OWNER, &portable, "migr-" OWNER,
+                                   &adopted) == CONTAINER_ERR_NO_MATCH,
+          "chosen for another format, it is not adopted");
+    container_close(&adopted);
+    check(container_adopt_other_fd(root_fd, OWNER, &mine, "migr-" OWNER,
+                                   &adopted) == CONTAINER_OK &&
+              adopted.updating && adopted.from_finished,
+          "chosen by name, it is adopted for an update");
+    container_close(&adopted);
+
+    check(container_survey_fd(root_fd, OWNER, &mine, &survey) == 0 &&
+              survey.own == 0 && survey.other == 0,
+          "one left being updated is not offered");
+    if (root_fd >= 0)
+        close(root_fd);
+    fresh_test_root();
+}
+
 // Adopts the one finished backup under test_root in a child that is then
 // killed by SIGTERM, with the finished-name guard on or already off.
 static int finished_backup_after_interrupt(int guarded)
@@ -1540,6 +1602,7 @@ int main(void)
     test_adopt_rejects_identity_mismatches();
     test_adopt_follows_a_changed_selection();
     test_adopt_takes_a_finished_backup_for_update();
+    test_another_installs_backup_is_taken_only_by_name();
     test_interrupt_gives_the_finished_name_back();
     test_adopt_rejects_non_valid_manifests();
     test_adopt_fails_closed_on_scan_error();

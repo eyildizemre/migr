@@ -2262,6 +2262,37 @@ static void print_login_keyring_note(void)
            "them asks for this system's password once.\n");
 }
 
+// When no backup under target is this install's and exactly one finished
+// backup of another install could be updated instead, asks whether to update
+// it, with no as the default and when nobody answers (D88). On yes, its name
+// goes to other_name; otherwise other_name is empty.
+static void backup_offer_other_install(int target_fd, const char *target,
+                                       const Manifest *wanted,
+                                       char other_name[CONTAINER_NAME_MAX])
+{
+    other_name[0] = '\0';
+    ContainerSurvey survey;
+    if (container_survey_fd(target_fd, invoker_name(), wanted, &survey) != 0 ||
+        survey.own != 0 || survey.other != 1)
+        return;
+
+    char when[48] = "";
+    struct tm local;
+    if (survey.other_updated > 0 &&
+        localtime_r(&survey.other_updated, &local) != NULL)
+        strftime(when, sizeof(when), " (last updated %Y-%m-%d %H:%M)", &local);
+    char message[PATH_MAX + CONTAINER_NAME_MAX + 192];
+    int length = snprintf(message, sizeof(message),
+                          "%s/%s was taken on another install%s. Update it "
+                          "from this system? Files that are not here will be "
+                          "removed from it.",
+                          target, survey.other_name, when);
+    if (length < 0 || (size_t)length >= sizeof(message))
+        return;
+    if (confirm_action(message))
+        memcpy(other_name, survey.other_name, CONTAINER_NAME_MAX);
+}
+
 /* ------------------------------------------------------------------------- */
 /* Applications open on a live source (docs/DECISIONS.md D84).               */
 /* ------------------------------------------------------------------------- */
@@ -3358,6 +3389,13 @@ static int backup_run(const char *target_arg, BackupMode mode,
     // The representation is part of the resume identity, so it must be settled
     // before the manifest is matched against an existing partial.
     manifest.representation = repr;
+    manifest.sidecar_version =
+        repr == CLONE_PORTABLE_SIDECAR ? SIDECAR_VERSION : 0;
+
+    // Asked before anything is read, so an unattended run is not held up
+    // later (D88).
+    char other_install[CONTAINER_NAME_MAX];
+    backup_offer_other_install(target_fd, target, &manifest, other_install);
 
     // From here until capture ends, sources on btrfs are read from a
     // read-only snapshot (D64): the pre-scan and the capture see one point
@@ -3415,9 +3453,13 @@ static int backup_run(const char *target_arg, BackupMode mode,
         ? &prepared.manifest : &manifest;
 
     int adopted = 0;
-    ContainerStatus adopt_status = container_adopt_fd(target_fd, invoker_name(),
-                                                      identity_manifest,
-                                                      &container);
+    ContainerStatus adopt_status =
+        other_install[0] != '\0'
+            ? container_adopt_other_fd(target_fd, invoker_name(),
+                                       identity_manifest, other_install,
+                                       &container)
+            : container_adopt_fd(target_fd, invoker_name(), identity_manifest,
+                                 &container);
     if (adopt_status == CONTAINER_OK)
     {
         adopted = 1;
@@ -3580,7 +3622,10 @@ static int backup_run(const char *target_arg, BackupMode mode,
     if (!had_error)
     {
         printf("Backing up to: %s/%s\n", target, container_current_name(&container));
-        if (container.updating)
+        if (container.updating && other_install[0] != '\0')
+            printf("Updating the other install's backup in place; from now "
+                   "on it is this install's.\n");
+        else if (container.updating)
             printf("Updating this install's backup in place.\n");
         else if (adopted)
             printf("Resuming an interrupted backup of this install.\n");
