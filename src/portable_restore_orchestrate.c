@@ -103,12 +103,12 @@ static PortableRestoreOutcome portable_restore_orchestrate_impl(
     }
 
     metadata_profiles_report(&preflight.profiles);
-    if (request->before_confirmation != NULL)
-        request->before_confirmation(request->before_confirmation_context);
-    if (!confirm_action(
-            "This will restore files to your home directory. Continue?"))
+    int confirmed = request->confirm != NULL
+        ? request->confirm(request->confirm_context)
+        : confirm_action(
+              "This will restore files to your home directory. Continue?");
+    if (!confirmed)
     {
-        printf("Cancelled.\n");
         portable_restore_preflight_report_free(&preflight);
         return PORTABLE_RESTORE_CANCELLED;
     }

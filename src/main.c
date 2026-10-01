@@ -9,6 +9,7 @@
 
 #include "backup.h"
 #include "config.h"
+#include "console.h"
 #include "repair.h"
 #include "report.h"
 #include "restore.h"
@@ -176,6 +177,7 @@ int main(int argc, char *argv[])
     int include_network_config = 0;
     int no_verify = 0;
     int non_help_option_given = 0;
+    int console = 0;
 
     // Parse options only. optind was set above to skip the command word, or left
     // at 1 when no command was given (e.g. `migr --help`). getopt_long permutes
@@ -387,6 +389,14 @@ int main(int argc, char *argv[])
                 ret = MIGR_EXIT_FAILURE;
                 break;
             }
+            // Handed over from the desktop, the restore closes it first (D89).
+            console = console_restore_service();
+            if (console && console_restore_take_over() != 0)
+            {
+                console = 0;
+                ret = MIGR_EXIT_FAILURE;
+                break;
+            }
             if (!dry_run)
                 (void)run_log_start(argc, argv);
             RestoreOptions restore_options = {
@@ -425,5 +435,7 @@ int main(int argc, char *argv[])
     const char *log = run_log_finish(ret != MIGR_EXIT_OK);
     if (log != NULL)
         printf("Log: %s\n", log);
+    if (console)
+        console_restore_finish();
     return ret;
 }

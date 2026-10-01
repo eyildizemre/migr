@@ -13,6 +13,7 @@
 
 #include "restore.h"
 #include "backup.h"
+#include "console.h"
 #include "container.h"
 #include "dconf_restore.h"
 #include "detect.h"
@@ -484,10 +485,16 @@ static void restore_login_keyring_todo(int home_fd, const struct stat *before,
          after.st_ctim.tv_sec == before->st_ctim.tv_sec &&
          after.st_ctim.tv_nsec == before->st_ctim.tv_nsec))
         return;
-    fputs("  Log out and back in before you sign in anywhere: until then, this "
-          "session cannot save passwords to the restored login keyring. If "
-          "your password differs from the old system's, the first app that "
-          "needs the keyring asks for the old one once.\n", todo);
+    static const char old_password[] =
+        "If your password differs from the old system's, the first app that "
+        "needs the keyring asks for the old one once.";
+    // On a text console no session runs, and the next login opens it (D89).
+    if (console_restore_service())
+        fprintf(todo, "  %s\n", old_password);
+    else
+        fprintf(todo, "  Log out and back in before you sign in anywhere: "
+                "until then, this session cannot save passwords to the "
+                "restored login keyring. %s\n", old_password);
 }
 
 // Replaces <backup>-todo.txt next to the backup with text, or removes it
@@ -598,9 +605,8 @@ static void restore_defer_running_writers(RestoreDeferral *deferral)
 // restored settings writes over them while the restore runs or when it exits.
 // When some own settings, those are restored last; otherwise the applications
 // can only be named.
-static void restore_warn_running_writers(void *context)
+static void restore_warn_running_writers(const RestoreDeferral *deferral)
 {
-    const RestoreDeferral *deferral = context;
     uid_t uid;
     if (writer_apps_session_uid(&uid) != 0)
         return;
@@ -613,7 +619,7 @@ static void restore_warn_running_writers(void *context)
         return;
     printf("\n");
     writer_apps_print_labels(labels, count);
-    if (deferral != NULL && deferral->count != 0)
+    if (deferral->count != 0)
         printf(" %s open. The settings %s owns are restored last, after "
                "everything else; close %s before then.\n\n",
                count == 1 ? "is" : "are", count == 1 ? "it" : "each",
@@ -624,6 +630,40 @@ static void restore_warn_running_writers(void *context)
                count == 1 ? "is" : "are",
                count == 1 ? "it closes" : "they close",
                count == 1 ? "it" : "them");
+}
+
+// The one question before a restore changes anything (D81).
+typedef struct {
+    const RestoreDeferral *deferral;
+    const char *source;
+    int skip_content_verification;
+    int handed_over; /* 1 to a text console, -1 when that failed. */
+} RestoreConfirmation;
+
+// Asks before the first change. Started from the desktop, the restore
+// continues on a text console, and this run only hands it over; that console
+// run asks nothing more (D89). Returns 1 to restore here.
+static int restore_confirm(void *context)
+{
+    RestoreConfirmation *confirmation = context;
+    if (console_restore_service())
+        return 1;
+    int vt = console_restore_vt();
+    if (vt == 0)
+        restore_warn_running_writers(confirmation->deferral);
+    else
+        printf("The restore runs on a text screen with the desktop closed; "
+               "the login screen comes back when it ends.\n");
+    if (!confirm_action(
+            "This will restore files to your home directory. Continue?"))
+        return 0;
+    if (vt == 0)
+        return 1;
+    confirmation->handed_over =
+        console_restore_hand_over(vt, confirmation->source,
+                                  confirmation->skip_content_verification) == 0
+            ? 1 : -1;
+    return 0;
 }
 
 // Runs once replay reaches the deferred settings (D66). Waiting here costs
@@ -3273,6 +3313,11 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         RestoreTodo todo = {0};
         RestoreDeferral deferral = {0};
         restore_defer_running_writers(&deferral);
+        RestoreConfirmation confirmation = {
+            .deferral = &deferral,
+            .source = source,
+            .skip_content_verification = skip_content_verification
+        };
         PortableRestoreRequest request = {
             .source_container_fd = source_root_fd,
             .manifest = &m,
@@ -3281,8 +3326,8 @@ int restore_with_options(const char *source, const RestoreOptions *options)
             .destination_timestamp_policy = {0},
             .owner_map = restore_owner_map(&m),
             .skip_content_verification = skip_content_verification,
-            .before_confirmation = restore_warn_running_writers,
-            .before_confirmation_context = &deferral,
+            .confirm = restore_confirm,
+            .confirm_context = &confirmation,
             .before_deferred = restore_before_deferred,
             .before_deferred_context = &deferral,
             .dconf_database_fd_out = &dconf_database_fd,
@@ -3380,7 +3425,8 @@ int restore_with_options(const char *source, const RestoreOptions *options)
                 break;
             }
             case PORTABLE_RESTORE_CANCELLED:
-                printf("Cancelled.\n");
+                if (confirmation.handed_over == 0)
+                    printf("Cancelled.\n");
                 break;
             case PORTABLE_RESTORE_VERIFICATION_FAILED:
             {
@@ -3445,7 +3491,7 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         close(source_root_fd);
         if (outcome == PORTABLE_RESTORE_ERROR ||
             outcome == PORTABLE_RESTORE_VERIFICATION_FAILED ||
-            had_portable_error)
+            had_portable_error || confirmation.handed_over < 0)
             return MIGR_EXIT_FAILURE;
         // Items another program changed after restore are not failures, but
         // like a backup whose source changed, the run says so (D67).
@@ -3555,12 +3601,17 @@ int restore_with_options(const char *source, const RestoreOptions *options)
     else
     {
         restore_defer_running_writers(&open_settings);
-        restore_warn_running_writers(&open_settings);
-        if (!confirm_action(
-                "This will restore files to your home directory. Continue?"))
+        RestoreConfirmation confirmation = {
+            .deferral = &open_settings,
+            .source = source,
+            .skip_content_verification = skip_content_verification
+        };
+        if (!restore_confirm(&confirmation))
         {
-            printf("Cancelled.\n");
-            result = MIGR_EXIT_OK;
+            if (confirmation.handed_over == 0)
+                printf("Cancelled.\n");
+            result = confirmation.handed_over < 0 ? MIGR_EXIT_FAILURE
+                                                  : MIGR_EXIT_OK;
             goto cleanup;
         }
     }

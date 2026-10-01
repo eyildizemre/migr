@@ -40,10 +40,11 @@ typedef struct {
     /* Lets the CLI retire its copy-progress renderer before verification starts. */
     void (*before_content_verification)(void *context);
     void *before_content_verification_context;
-    /* Optional; runs once right before the confirmation prompt of a live
-     * (non-dry-run) orchestrated restore. */
-    void (*before_confirmation)(void *context);
-    void *before_confirmation_context;
+    /* Optional; asks in place of the default question before a live
+     * (non-dry-run) orchestrated restore changes anything. Returns 1 to
+     * restore, 0 to stop with PORTABLE_RESTORE_CANCELLED. */
+    int (*confirm)(void *context);
+    void *confirm_context;
     /* Optional. Initialize *dconf_database_fd_out to -1; when replay applies
      * the source HOME's .config/dconf/user, it stores a read-only fd of that
      * payload there so the caller can load it into a running session. The

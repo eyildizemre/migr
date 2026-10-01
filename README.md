@@ -19,8 +19,9 @@ It is not released yet: there are no packages, so build it from source.
   files and restores them exactly.
 - **Safe on a running desktop.** A file that changes while it is read is read
   again, and on btrfs the backup reads a read-only snapshot; elsewhere, open
-  applications' settings are backed up last. Applications that rewrite their
-  settings are restored last.
+  applications' settings are backed up last. Restore closes the desktop and
+  continues on a text screen, so no running program writes over what it brings
+  back.
 - **Resumable and updatable.** An interrupted backup continues where it
   stopped. Backing up to the same drive again updates the backup and copies
   only what changed.
@@ -240,17 +241,29 @@ with your backed-up ones; a symlink in the way is refused and named.
 
 Before writing anything, restore checks the whole backup and the destination,
 shows when the backup was taken and how much room it needs, and asks once.
-Then it restores your files, loads your GNOME settings, installs packages and
-Flatpak applications, adds you back to your groups, and writes the network
-configuration.
+Then it restores your files, installs packages and Flatpak applications, adds
+you back to your groups, and writes the network configuration.
+
+**Run from the desktop, restore continues on a text screen.** Desktops and
+their applications keep writing their settings while you are logged in, and
+again when you log out, after the restore. So when you start restore from a
+terminal on the desktop, it closes the desktop, starts itself again on a text
+screen, checks everything again, and restores there with nothing running in
+your session:
 
 ```text
 $ sudo ./migr restore /mnt/usb/migr-eyildizemre
 Backup taken 2026-09-27 22:48
 Estimated restore size: 8.0M
 Destination free space: 90.2G
+The restore runs on a text screen with the desktop closed; the login screen comes back when it ends.
 This will restore files to your home directory. Continue? [y/N]: y
+Continuing on a text screen.
+```
 
+On the text screen:
+
+```text
 Packages
 Installing packages (this may take a while)...
 ...
@@ -260,14 +273,22 @@ Groups
   The backup saved no group memberships.
 
   OK: Restore complete: 31 items restored
+
+Press Enter to return to the login screen.
 ```
+
+Your first login then reads the restored settings. The login screen also comes
+back if the restore fails. Over SSH, from a text console you logged in on, or
+while another user is logged in to a desktop, restore runs where you started
+it.
 
 **Your files stay yours.** What belonged to you in the backup belongs to you
 on the new system, even when it gives your account another user ID.
 
-**Open applications.** VS Code, the common browsers, and Flatpak applications
-rewrite their settings while they run or when they close, so their settings are
-restored last. If one is still open then, restore asks you to close it and
+**Open applications.** When restore runs while you are logged in to the
+desktop, VS Code, the common browsers, and Flatpak applications may be open.
+They rewrite their settings while they run or when they close, so their
+settings are restored last. If one is still open then, restore asks you to close it and
 press Enter, to skip its settings (run the same restore again later to put them
 back), or to restore them anyway.
 
@@ -278,9 +299,9 @@ so the session does not overwrite them.
 your login password. Give your user on the new system the same password; with
 a different one, the first app that needs the keyring asks for the old
 password once, and without it the keyring cannot be opened. After a restore
-that brings the keyring back, log out and back in before signing in anywhere:
-the running session cannot save to the restored keyring. Backup and restore
-both remind you.
+in your desktop session brings the keyring back, log out and back in before
+signing in anywhere: the running session cannot save to the restored keyring.
+Backup and restore both remind you.
 
 **From an exFAT, FAT32, or NTFS backup**, restore also leaves desktop state
 that services rewrite all the time alone where the new system has already

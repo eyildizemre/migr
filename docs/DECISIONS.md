@@ -4933,7 +4933,8 @@ failure message recommends.
 
 ## D81 — 2026-09-27 — Restore asks one plain question and previews in the user's terms
 
-**Status:** Implemented
+**Status:** Implemented; extended by D89 (a line before the question of a
+restore started on the desktop)
 
 **Decision:** Native and portable restore confirm with the same question,
 "This will restore files to your home directory. Continue?". It no longer
@@ -5116,7 +5117,7 @@ backups.
 
 ## D87 — 2026-09-29 — The login keyring needs the same password; migr says so and asks nothing
 
-**Status:** Implemented
+**Status:** Implemented; the restore note changed by D89 on a text console
 
 **Decision:** migr states what the login keyring
 (`~/.local/share/keyrings/login.keyring`) needs and never asks for
@@ -5201,3 +5202,79 @@ instead of the file.
 **Relationship:** Extends D72; uses D59's content digest; D73 compacts the
 journal as the added records accumulate.
 
+
+## D89 — 2026-10-01 — A restore started on the desktop continues on a text console
+
+**Status:** Implemented
+
+**Decision:** A restore started under sudo from a desktop session closes that
+desktop and restores from a system service on a virtual console, after the
+user's consent.
+- **When:** Not a dry run; run under sudo from a session scope
+  (`session-N.scope` in `/proc/self/cgroup`) whose logind record
+  (`/run/systemd/sessions/N`) is the invoker's `wayland` or `x11` session of
+  class `user`; no other such session open (greeters and closing sessions do
+  not count); systemd running, `display-manager.service` active, and a console
+  from tty7 to tty15 that no program has open (`VT_GETSTATE`). Otherwise the
+  restore runs in place, unchanged.
+- **The question:** D81's question, after every check, with one line before
+  it in place of the warning about open applications: the restore runs on a
+  text screen with the desktop closed, and the login screen comes back when
+  it ends. No, or end of input, changes nothing. A fresh install has no work
+  to save, so the line describes what migr does rather than warning.
+- **Handover:** migr copies itself to `/run/migr/migr`, with the SELinux label
+  of `/usr/bin` when it has one, and starts it with `systemd-run
+  --unit=migr-restore --collect` on that console (`TTYPath=`, standard input
+  and output, `TTYReset=`, `TTYVHangup=`, `TTYVTDisallocate=`), with
+  `ExecStopPost=systemctl start display-manager.service`, the invoker's
+  `SUDO_UID`, `SUDO_GID`, and `SUDO_USER`, `MIGR_CONSOLE_RESTORE` set to its
+  own PID, and the same options. The source is resolved to an absolute path
+  and each `$` in it doubled, since systemd expands variables in a service's
+  command line. The desktop run prints `Continuing on a text screen.` and
+  exits 0.
+- **The service:** It waits up to ten seconds for the desktop run to exit,
+  removes its binary, stops the display manager, ends the invoker's sessions
+  (`loginctl terminate-user`), and waits up to thirty seconds until the
+  invoker's slice holds no process, warning if one is left. It then switches
+  the screen to its console (`VT_ACTIVATE`, `VT_WAITACTIVE`) and restores:
+  every check again, no question. It ends with `Press Enter to return to the
+  login screen.`, discarding what was typed before. When the desktop cannot be
+  closed or the console shown, it restores nothing. However the service ends,
+  `ExecStopPost=` starts the display manager.
+- **On the console:** No application of the user runs, so D66 and D69 defer
+  nothing; with no session bus, D50 does not load dconf and the database file
+  is written (D80); D87's note keeps only what a different password costs.
+  D65 is unchanged.
+
+**Why:** A desktop session writes the files restore brings back: some programs
+while they run, others when they exit, which is at logout, after the restore
+(dconf, GNOME Shell, Plasma, xfconfd, browsers, editors). D50, D66, D69, and
+D87 each answer known programs, and every desktop environment adds programs.
+With no session running while files are written, none of them matters.
+- **Display manager first:** With automatic login, ending the session alone
+  lets the display manager log the user back in during the restore.
+- **Then the user's processes:** Some display managers leave the session and
+  its processes running after they stop.
+- **tty7 and up:** logind starts a getty on tty1 to tty6 when one is shown
+  (`NAutoVTs=`), which would take the console.
+- **The copy and its label:** SELinux policy does not let systemd start a
+  binary in a home directory, and a binary with the label of `/run` runs in
+  systemd's own confined domain, which cannot read a backup drive; with the
+  label of system binaries the service runs unconfined, as a command under
+  sudo does. A binary on the backup drive or in the home being restored is not
+  one to run from either.
+- **Asked on the desktop:** The user answers where they typed the command.
+  The service checks again because the desktop run's results describe the
+  system before the desktop closed.
+
+**Rejected:**
+- Telling the user to log out and run migr from a text console: the result is
+  the same, but each user would have to find a console, log in there, and know
+  why.
+- Warning before the question when the active Wi-Fi connection keeps its
+  password for the user alone, and so ends with the session: packages that
+  cannot install without a network are listed in "What's left for you"
+  (D78), which is what the warning would say in advance.
+
+**Relationship:** Extends D81. D50, D66, D69, and D87's request to log out
+remain for restores that run in a session.
