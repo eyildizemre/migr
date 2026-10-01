@@ -131,6 +131,8 @@ void read_package_list(FILE *pkg_file, char ***pkgs_out, int *pkg_count_out,
  * distro's package manager. A dry run only previews; a missing or non-regular
  * packages.txt and an unrecognized distro are skipped without making the
  * restore fatal, while failures to read or inspect the file set had_error.
+ * Without a network (online 0) nothing is installed, and the packages the
+ * system does not have are listed to install later (D90).
  *
  * This, restore_groups(), and restore_flatpak_apps() write what is left for
  * the user to do by hand to todo, one paragraph each with the command to run.
@@ -140,6 +142,7 @@ void read_package_list(FILE *pkg_file, char ***pkgs_out, int *pkg_count_out,
  *                       the install.
  * @param had_error      Set to 1 on a real failure; untouched otherwise.
  */
-void restore_packages(int source_root_fd, FILE *todo, int *had_error);
+void restore_packages(int source_root_fd, int online, FILE *todo,
+                      int *had_error);
 
 #endif

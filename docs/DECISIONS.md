@@ -2784,7 +2784,7 @@ post-order restore requirements remain unchanged.
 
 ## D33 — 2026-09-05 — Capture network backends independently; apply disruptive changes manually
 
-**Status:** Implemented
+**Status:** Implemented; restored before packages since D90
 
 **Decision:** `--include-network-config` checks five backends independently
 through a backend table: NetworkManager, netplan, systemd-networkd,
@@ -5278,3 +5278,63 @@ With no session running while files are written, none of them matters.
 
 **Relationship:** Extends D81. D50, D66, D69, and D87's request to log out
 remain for restores that run in a session.
+
+## D90 — 2026-10-01 — Restore brings the network up before packages
+
+**Status:** Implemented
+
+**Decision:** Restore writes the network configuration before packages, and
+waits for NetworkManager to be online before it installs them.
+- **Order:** files, dconf, network configuration, then packages, Flatpak
+  applications, and groups. The network configuration is restored as D33,
+  D54, and D58/D83 describe; only its place changes.
+- **Online:** NetworkManager's state (`nmcli -t -f STATE general`) is
+  `connected`. NetworkManager reports that once its connectivity check has
+  fetched the distribution's test file (Fedora, Ubuntu, and Arch configure
+  one), or, with the check turned off, once a default route exists. Restore
+  first asks for a fresh check (`nmcli networking connectivity check`).
+- **The wait:** When the backup lists packages or Flatpak applications
+  (`packages.txt`, `flatpak-apps.txt`), the run is not a dry run,
+  NetworkManager runs, and the system is not online, restore prints a
+  `Network` section and checks once a second for up to 90 seconds. It names
+  the profile NetworkManager is activating (`Connecting to <name>...`, again
+  when that changes), or says `Waiting for a network connection...` when none
+  is; online, it names the active profile (`Connected to <name>.`). The wait
+  does not depend on the backup's network configuration.
+- **Offline at the limit:** Restore installs no packages and no Flatpak
+  applications. It still counts what the system has (local queries) and lists
+  the rest in "What's left for you" (D78), under "to install once this system
+  is online", with their commands.
+- **Activation:** migr does not activate profiles. `nmcli connection reload`
+  (D33) loads the restored ones, and NetworkManager activates a saved profile
+  with autoconnect on for a device that is not connected; one that is
+  connected keeps its connection.
+
+**Why:** Packages and Flatpak applications are downloaded. With the network
+configuration restored after them, a restored system without a connection
+yet installed nothing although the backup held what would connect it, and
+on a text console (D89) there is no panel to connect from. Waiting covers
+networks that take long to join, such as 802.1X Wi-Fi, and a profile the
+installer created that is still connecting.
+- **NetworkManager's check:** It fetches a file from the distribution's
+  server, where packages come from. A ping is dropped by many networks, and
+  migr has no HTTP client or server of its own to ask.
+- **No trying by migr:** NetworkManager already chooses among saved profiles
+  for networks in range.
+- **A VPN profile** whose plugin a package installs later is loaded all the
+  same; its plugin is needed only to connect, so the earlier reload loses
+  nothing.
+- **90 seconds:** joining 802.1X Wi-Fi can take 30 to 40 seconds.
+- **No install offline:** a package manager without a network fails on every
+  repository, after timeouts that can add up to minutes each, and the result
+  is the same list.
+
+**Limits:** A Wi-Fi password kept in the user's keyring or KWallet is not in
+the profile (`psk-flags=1`), so that network does not connect before the user
+logs in, the wait ends at the limit, and packages are listed. Without
+NetworkManager there is nothing to ask, and the install is tried as before;
+the other backends (netplan, systemd-networkd, wpa_supplicant, netctl) keep
+D33's manual apply.
+
+**Relationship:** Changes the order of D33's restore; D78 lists what could not
+be installed.

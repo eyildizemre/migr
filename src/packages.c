@@ -527,11 +527,12 @@ static size_t package_build_install_argv(char **argv, char *const *prefix,
     return install_count;
 }
 
-// Counts the packages the system has now and lists the others in todo.
+// Counts the packages the system has now and lists the others in todo under
+// heading.
 static int package_account_final_state(distro_t distro, char **pkgs,
                                        size_t pkg_count, FILE *todo,
-                                       int *installed, int *skipped,
-                                       int *had_error)
+                                       const char *heading, int *installed,
+                                       int *skipped, int *had_error)
 {
     char *const *query = package_installed_query(distro);
     if (query == NULL)
@@ -550,8 +551,7 @@ static int package_account_final_state(distro_t distro, char **pkgs,
             continue;
         }
         if (*skipped == 0)
-            fprintf(todo, "  Packages this system could not install, often "
-                          "from a repository it does not have yet:\n    ");
+            fprintf(todo, "  %s\n    ", heading);
         fprintf(todo, "%s%s", *skipped == 0 ? "" : " ", pkgs[index]);
         (*skipped)++;
     }
@@ -618,7 +618,35 @@ void package_free_name_list(char **names, int count)
     free(names);
 }
 
-void restore_packages(int source_root_fd, FILE *todo, int *had_error)
+// Installs pkgs in one package manager call; on Arch, only those its
+// repositories have.
+static void package_install_batch(distro_t distro, char *const *prefix,
+                                  size_t prefix_count, char **pkgs,
+                                  size_t pkg_count, int *had_error)
+{
+    size_t argv_count = prefix_count + pkg_count + 1U;
+    char **argv = argv_count <= SIZE_MAX / sizeof(*argv)
+        ? malloc(argv_count * sizeof(*argv)) : NULL;
+    if (argv == NULL)
+    {
+        print_error("Error: Could not allocate package install batch\n");
+        *had_error = 1;
+        return;
+    }
+    char *arch_available = NULL;
+    if (distro != DISTRO_ARCH ||
+        (arch_available = package_arch_available(had_error)) != NULL)
+    {
+        if (package_build_install_argv(argv, prefix, prefix_count, pkgs,
+                                       pkg_count, arch_available) != 0)
+            (void)package_run_command(argv);
+    }
+    free(arch_available);
+    free(argv);
+}
+
+void restore_packages(int source_root_fd, int online, FILE *todo,
+                      int *had_error)
 {
     FILE *pkg_file = NULL;
     int opened = package_open_control_file(source_root_fd, "packages.txt",
@@ -645,7 +673,10 @@ void restore_packages(int source_root_fd, FILE *todo, int *had_error)
         return;
     }
 
-    printf("Installing packages (this may take a while)...\n");
+    if (online)
+        printf("Installing packages (this may take a while)...\n");
+    else
+        printf("  No network connection; not installing.\n");
 
     char **pkgs = NULL;
     int pkg_count = 0;
@@ -660,41 +691,15 @@ void restore_packages(int source_root_fd, FILE *todo, int *had_error)
 
     if (pkgs != NULL && pkg_count > 0 && prefix > 0)
     {
-        size_t pkg_count_size = (size_t)pkg_count;
-        size_t argv_count = prefix + pkg_count_size + 1U;
-        char **batch_argv = argv_count <= SIZE_MAX / sizeof(*batch_argv)
-            ? malloc(argv_count * sizeof(*batch_argv)) : NULL;
-        if (batch_argv != NULL)
-        {
-            char *arch_available = NULL;
-            int may_install = 1;
-            if (distro == DISTRO_ARCH)
-            {
-                arch_available = package_arch_available(had_error);
-                if (arch_available == NULL)
-                    may_install = 0;
-            }
-
-            if (may_install)
-            {
-                size_t install_count = package_build_install_argv(
-                    batch_argv, batch_prefix, prefix, pkgs, pkg_count_size,
-                    arch_available);
-                if (install_count != 0)
-                    (void)package_run_command(batch_argv);
-            }
-            free(arch_available);
-            free(batch_argv);
-
-            accounting_complete = package_account_final_state(
-                distro, pkgs, pkg_count_size, todo, &installed, &skipped,
-                had_error) == 0;
-        }
-        else
-        {
-            print_error("Error: Could not allocate package install batch\n");
-            *had_error = 1;
-        }
+        if (online)
+            package_install_batch(distro, batch_prefix, prefix, pkgs,
+                                  (size_t)pkg_count, had_error);
+        accounting_complete = package_account_final_state(
+            distro, pkgs, (size_t)pkg_count, todo,
+            online ? "Packages this system could not install, often from a "
+                     "repository it does not have yet:"
+                   : "Packages to install once this system is online:",
+            &installed, &skipped, had_error) == 0;
     }
 
     package_free_name_list(pkgs, pkg_count);

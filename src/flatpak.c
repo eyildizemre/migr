@@ -139,7 +139,8 @@ static void install_flatpak_apps(const FlatpakApp *apps, size_t count,
     free(done);
 }
 
-void restore_flatpak_apps(int source_root_fd, FILE *todo, int *had_error)
+void restore_flatpak_apps(int source_root_fd, int online, FILE *todo,
+                          int *had_error)
 {
     FILE *list = NULL;
     if (package_open_control_file(source_root_fd, "flatpak-apps.txt", &list,
@@ -210,6 +211,12 @@ void restore_flatpak_apps(int source_root_fd, FILE *todo, int *had_error)
             if (wanted[i])
                 printf(" %s", apps[i].app);
         printf("\n");
+    }
+    else if (wanted_count != 0 && !online)
+    {
+        printf("  No network connection; not installing.\n");
+        flatpak_todo(todo, "Flatpak applications to install once this system "
+                           "is online:", apps, count, wanted);
     }
     else if (wanted_count != 0)
     {

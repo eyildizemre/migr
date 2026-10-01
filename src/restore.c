@@ -194,6 +194,164 @@ static int run_network_config_reload(void)
     return run_network_command(reload_argv);
 }
 
+// How long restore waits for a network before packages, checking once a
+// second (D90).
+#define NETWORK_WAIT_SECONDS 90
+static long network_wait_interval_ms = 1000;
+
+#ifdef RESTORE_TEST_HOOKS
+static RestoreTestNetworkQueryHook restore_test_network_query_hook;
+static void *restore_test_network_query_context;
+
+void restore_test_set_network_query_hook(RestoreTestNetworkQueryHook hook,
+                                         void *context, long interval_ms)
+{
+    restore_test_network_query_hook = hook;
+    restore_test_network_query_context = context;
+    network_wait_interval_ms = hook != NULL ? interval_ms : 1000;
+}
+#endif
+
+// Runs an nmcli query of the wait for a network into output.
+static int network_query(char *const argv[], char *output, size_t size)
+{
+    output[0] = '\0';
+#ifdef RESTORE_TEST_HOOKS
+    if (restore_test_network_query_hook != NULL)
+        return restore_test_network_query_hook(
+            argv, output, size, restore_test_network_query_context);
+#endif
+    return run_command_capture(argv, output, size);
+}
+
+// NetworkManager's state is "connected" once its connectivity check fetched
+// the distribution's test file, or, with that check turned off, once a
+// default route exists.
+static int network_online(void)
+{
+    char *const query[] = { "nmcli", "-t", "-f", "STATE", "general", NULL };
+    char state[64];
+    return network_query(query, state, sizeof(state)) == 0 &&
+           strcmp(state, "connected\n") == 0;
+}
+
+// Copies the next field of a line of nmcli's terse output, where ':' ends a
+// field and a backslash escapes ':' and '\' in values. Returns where the
+// following field starts, or NULL after the line's last field.
+static const char *network_terse_field(const char *line, char *out,
+                                       size_t size)
+{
+    size_t used = 0;
+    for (; *line != '\0' && *line != '\n' && *line != ':'; line++)
+    {
+        if (*line == '\\' && line[1] != '\0' && line[1] != '\n')
+            line++;
+        if (used + 1U < size)
+            out[used++] = *line;
+    }
+    out[used] = '\0';
+    return *line == ':' ? line + 1 : NULL;
+}
+
+// From the NAME:TYPE:STATE lines of the active connections: the profile
+// being activated and the first one activated, loopback aside; "" for none.
+static void network_parse_connections(const char *list, char *activating,
+                                      char *activated, size_t size)
+{
+    activating[0] = activated[0] = '\0';
+    for (const char *line = list; *line != '\0';)
+    {
+        char name[256], type[64], state[64];
+        const char *next = network_terse_field(line, name, sizeof(name));
+        next = next != NULL ? network_terse_field(next, type, sizeof(type))
+                            : NULL;
+        if (next != NULL)
+        {
+            (void)network_terse_field(next, state, sizeof(state));
+            char *target = strcmp(state, "activating") == 0 ? activating
+                : strcmp(state, "activated") == 0 &&
+                          strcmp(type, "loopback") != 0 ? activated
+                : NULL;
+            if (target != NULL && target[0] == '\0')
+                snprintf(target, size, "%s", name);
+        }
+        line = strchrnul(line, '\n');
+        if (*line == '\n')
+            line++;
+    }
+}
+
+static void network_connections(char *activating, char *activated,
+                                size_t size)
+{
+    char *const query[] = { "nmcli", "-t", "-f", "NAME,TYPE,STATE",
+                            "connection", "show", "--active", NULL };
+    char list[4096];
+    if (network_query(query, list, sizeof(list)) != 0)
+        list[0] = '\0';
+    network_parse_connections(list, activating, activated, size);
+}
+
+// Packages and Flatpak applications come from the network. Right before them,
+// NetworkManager gets time to bring up a profile, restored or the installer's,
+// and the user sees which one it is trying (D90). Returns 0 when the system
+// stayed offline; without NetworkManager there is nothing to ask, and the
+// install is tried.
+static int restore_wait_for_network(int source_root_fd)
+{
+    if (dry_run || !network_manager_is_running() ||
+        (faccessat(source_root_fd, "packages.txt", F_OK,
+                   AT_SYMLINK_NOFOLLOW) != 0 &&
+         faccessat(source_root_fd, "flatpak-apps.txt", F_OK,
+                   AT_SYMLINK_NOFOLLOW) != 0))
+        return 1;
+    // A fresh check, rather than one NetworkManager made minutes ago.
+    char *const check[] = { "nmcli", "networking", "connectivity", "check",
+                            NULL };
+    char ignored[64];
+    (void)network_query(check, ignored, sizeof(ignored));
+    if (network_online())
+        return 1;
+
+    printf("\nNetwork\n");
+    char shown[256] = "", activating[256], activated[256];
+    int waiting_shown = 0;
+    for (long waited = 0; waited < NETWORK_WAIT_SECONDS * 1000L;
+         waited += 1000L)
+    {
+        network_connections(activating, activated, sizeof(activating));
+        if (activating[0] != '\0' && strcmp(activating, shown) != 0)
+        {
+            printf("  Connecting to %s...\n", activating);
+            snprintf(shown, sizeof(shown), "%s", activating);
+        }
+        else if (activating[0] == '\0' && shown[0] == '\0' && !waiting_shown)
+        {
+            printf("  Waiting for a network connection...\n");
+            waiting_shown = 1;
+        }
+        fflush(stdout);
+        struct timespec delay = { network_wait_interval_ms / 1000L,
+                                  (network_wait_interval_ms % 1000L) *
+                                      1000000L };
+        while (nanosleep(&delay, &delay) != 0 && errno == EINTR)
+            ;
+        if (network_online())
+        {
+            network_connections(activating, activated, sizeof(activated));
+            if (activated[0] != '\0')
+                printf("  Connected to %s.\n", activated);
+            else
+                printf("  Connected.\n");
+            return 1;
+        }
+    }
+    printf("  No network connection after %d seconds. Packages and Flatpak "
+           "applications are listed at the end, to install once this system "
+           "is online.\n", NETWORK_WAIT_SECONDS);
+    return 0;
+}
+
 static int network_config_regular_count(DIR *dir, size_t *count)
 {
     *count = 0;
@@ -439,8 +597,8 @@ typedef struct {
     int written; /* The steps ran, so the list next to the backup is due. */
 } RestoreTodo;
 
-// Re-creates the system state the backup lists, after its files: packages
-// first, since they bring Flatpak and groups along.
+// Re-creates the system state the backup lists, after its files and network
+// configuration: packages first, since they bring Flatpak and groups along.
 static void restore_system_lists(int source_root_fd, RestoreTodo *todo,
                                  int *had_error)
 {
@@ -452,8 +610,9 @@ static void restore_system_lists(int source_root_fd, RestoreTodo *todo,
         return;
     }
     todo->written = !dry_run;
-    restore_packages(source_root_fd, todo->stream, had_error);
-    restore_flatpak_apps(source_root_fd, todo->stream, had_error);
+    int online = restore_wait_for_network(source_root_fd);
+    restore_packages(source_root_fd, online, todo->stream, had_error);
+    restore_flatpak_apps(source_root_fd, online, todo->stream, had_error);
     uid_t uid;
     char user[ACCOUNT_NAME_MAX];
     int resolved = writer_apps_session_uid(&uid) == 0 &&
@@ -3380,10 +3539,10 @@ int restore_with_options(const char *source, const RestoreOptions *options)
             // Every entry was applied, so the dependent steps still run even
             // when verification found differences; those are reported below.
             restore_dconf_settings(dconf_database_fd, &had_portable_error);
-            restore_system_lists(source_root_fd, &todo, &had_portable_error);
-            restore_login_keyring_todo(home_fd, &keyring_before, todo.stream);
             if (m.has_network_config)
                 restore_network_config(source_root_fd, &had_portable_error);
+            restore_system_lists(source_root_fd, &todo, &had_portable_error);
+            restore_login_keyring_todo(home_fd, &keyring_before, todo.stream);
         }
         else if (outcome == PORTABLE_RESTORE_DRY_RUN &&
                  m.has_network_config)
@@ -3710,10 +3869,10 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         if (dconf_database_fd >= 0)
             close(dconf_database_fd);
     }
-    restore_system_lists(source_root_fd, &todo, &had_error);
-    restore_login_keyring_todo(home_fd, &keyring_before, todo.stream);
     if (mst == MANIFEST_STATUS_VALID && m.has_network_config)
         restore_network_config(source_root_fd, &had_error);
+    restore_system_lists(source_root_fd, &todo, &had_error);
+    restore_login_keyring_todo(home_fd, &keyring_before, todo.stream);
 
     printf("\n");
     char item_phrase[64];

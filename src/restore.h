@@ -15,6 +15,12 @@ void restore_test_set_network_config_dest_dir(const char *backend_name,
                                               const char *dest_dir);
 void restore_test_set_network_command_hook(RestoreTestNetworkCommandHook hook,
                                            void *context);
+/* Answers the nmcli queries of the wait for a network (D90) in place of
+ * NetworkManager, and shortens that wait's polling interval. */
+typedef int (*RestoreTestNetworkQueryHook)(char *const argv[], char *output,
+                                           size_t output_size, void *context);
+void restore_test_set_network_query_hook(RestoreTestNetworkQueryHook hook,
+                                         void *context, long interval_ms);
 
 /* Exposes the progress display's cumulative-average speed formula
  * (total_bytes / elapsed since started_at) for direct unit testing with

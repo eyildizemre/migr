@@ -4034,6 +4034,126 @@ static void test_network_config_restore_success(void)
     remove_tree(dest_parent);
 }
 
+#ifdef PACKAGES_TEST_HOOKS
+// NetworkManager as the wait for a network sees it: offline at first, then
+// connecting to a network whose name needs nmcli's escaping, then online
+// after `connect_after` state queries (never, when negative). The success
+// line of the restore goes to stderr, so checks look for lines one by one.
+typedef struct {
+    int connect_after;
+    int state_queries;
+} FakeNetworkManager;
+
+static int answer_network_query(char *const argv[], char *output,
+                                size_t output_size, void *context)
+{
+    FakeNetworkManager *nm = context;
+    const char *answer = "";
+    if (strcmp(argv[1], "networking") == 0)
+        answer = nm->connect_after == 0 ? "full\n" : "none\n";
+    else if (strcmp(argv[3], "STATE") == 0)
+        answer = nm->connect_after >= 0 &&
+                         nm->state_queries++ >= nm->connect_after
+                     ? "connected\n" : "connecting\n";
+    else if (nm->connect_after < 0)
+        answer = "lo:loopback:activated\n";
+    else if (nm->state_queries > nm->connect_after)
+        answer = "Cafe\\:2:802-11-wireless:activated\nlo:loopback:activated\n";
+    else
+        answer = "lo:loopback:activated\nCafe\\:2:802-11-wireless:activating\n";
+    snprintf(output, output_size, "%s", answer);
+    return 0;
+}
+
+static void run_network_wait_restore(int connect_after, char *output,
+                                     size_t output_size)
+{
+    char source[PATH_MAX], home[PATH_MAX], dest_parent[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "network_wait_src");
+    fresh_mkdtemp(home, sizeof(home), "network_wait_home");
+    fresh_mkdtemp(dest_parent, sizeof(dest_parent), "network_wait_dest");
+    setenv("HOME", home, 1);
+    write_network_manifest(source);
+    char network_dir[PATH_MAX], saved[PATH_MAX], packages[PATH_MAX];
+    join_path(network_dir, sizeof(network_dir), source,
+              "network/networkmanager");
+    mkdir_p(network_dir);
+    join_path(saved, sizeof(saved), network_dir, "Cafe.nmconnection");
+    write_file_mode(saved, "[connection]\nid=Cafe:2\n", 0600);
+    join_path(packages, sizeof(packages), source, "packages.txt");
+    write_file_mode(packages, "fixture-package\n", 0644);
+    char dest_dir[PATH_MAX], reload_marker[PATH_MAX];
+    join_path(dest_dir, sizeof(dest_dir), dest_parent, "system-connections");
+    mkdir_p(dest_dir);
+    join_path(reload_marker, sizeof(reload_marker), dest_parent,
+              "reload.marker");
+
+    FakeNetworkManager nm = { .connect_after = connect_after };
+    PackageProgressProbe package_probe = {0};
+    restore_test_set_network_config_dest_dir("NetworkManager", dest_dir);
+    restore_test_set_network_command_hook(record_network_command, reload_marker);
+    restore_test_set_network_manager_runtime_dir(dest_parent);
+    restore_test_set_network_query_hook(answer_network_query, &nm, 0);
+    packages_test_set_restore_hooks(DISTRO_FEDORA, package_progress_probe,
+                                    package_progress_capture, &package_probe);
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    int rc = run_restore_capturing_with_input(source, "y\n", output,
+                                              output_size);
+    dry_run = previous_dry_run;
+    packages_test_clear_restore_hooks();
+    restore_test_set_network_query_hook(NULL, NULL, 0);
+    restore_test_set_network_manager_runtime_dir("/nonexistent/migr-test-nm");
+    restore_test_set_network_command_hook(NULL, NULL);
+    restore_test_set_network_config_dest_dir("NetworkManager", NULL);
+    check(rc == 0 && strstr(output, "\nPackages\n") != NULL,
+          "the restore finishes, packages included");
+
+    remove_tree(source);
+    remove_tree(home);
+    remove_tree(dest_parent);
+}
+
+static void test_restore_waits_for_a_network_before_packages(void)
+{
+    printf(BLUE "::" NC " network: restore waits for a connection before packages\n");
+    char output[16384];
+
+    run_network_wait_restore(2, output, sizeof(output));
+    const char *configured = strstr(output, "Network configuration (NetworkManager)");
+    const char *connecting = strstr(output, "\nNetwork\n  Connecting to Cafe:2...\n");
+    const char *packages = strstr(output, "\nPackages\n");
+    check(configured != NULL && connecting != NULL && packages != NULL &&
+              configured < connecting && connecting < packages,
+          "the network configuration is restored, then the wait names the "
+          "network being connected, then packages install");
+    check(strstr(output, "  Connected to Cafe:2.\n") != NULL &&
+              strstr(output, "Waiting for a network") == NULL,
+          "the connected network is named once it is online");
+
+    run_network_wait_restore(-1, output, sizeof(output));
+    const char *waiting = strstr(output, "\nNetwork\n  Waiting for a network "
+                                         "connection...\n");
+    const char *gave_up = strstr(output, "  No network connection after 90 "
+                                         "seconds. Packages and Flatpak "
+                                         "applications are listed at the end, "
+                                         "to install once this system is "
+                                         "online.\n");
+    check(waiting != NULL && gave_up != NULL && waiting < gave_up &&
+              strstr(waiting + strlen("\nNetwork\n  Waiting"),
+                     "Waiting for a network") == NULL &&
+              strstr(output, "Connecting to") == NULL &&
+              strstr(output, "\nPackages\n  No network connection; not "
+                             "installing.\n") != NULL,
+          "with nothing to connect to, the wait says so once, gives up at "
+          "the limit, and installs nothing");
+
+    run_network_wait_restore(0, output, sizeof(output));
+    check(strstr(output, "\nNetwork\n") == NULL,
+          "an online system waits for nothing and prints nothing");
+}
+#endif
+
 static void test_network_config_restore_dry_run(void)
 {
     printf(BLUE "::" NC " network config: dry-run previews without touching the destination\n");
@@ -4655,6 +4775,9 @@ int main(void)
                                   "sudo systemctl restart wpa_supplicant@<interface>");
     test_network_config_roundtrip("netctl", "home-wifi", "sudo netctl restart <profile>");
     test_network_config_restore_success();
+#ifdef PACKAGES_TEST_HOOKS
+    test_restore_waits_for_a_network_before_packages();
+#endif
     test_network_config_restore_backend_modes();
     test_network_config_restore_dry_run();
     test_network_config_reload_failure_is_best_effort();

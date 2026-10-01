@@ -198,7 +198,8 @@ migr picks the form by testing the drive; there is no option.
 - `--include-network-config` also backs up NetworkManager, netplan,
   systemd-networkd, wpa_supplicant, and netctl configuration, and the system
   crypto policy. These files can hold Wi-Fi passwords and VPN keys in plain
-  text.
+  text. With them, a restored system connects to your saved networks before
+  packages install, without you typing a password.
 - `--include-self` puts a static migr binary in the backup, so the new system
   can run migr before building it. Build it first with `make migr-static`,
   which needs a static C library (`glibc-static` on Fedora). FAT and exFAT
@@ -241,8 +242,8 @@ with your backed-up ones; a symlink in the way is refused and named.
 
 Before writing anything, restore checks the whole backup and the destination,
 shows when the backup was taken and how much room it needs, and asks once.
-Then it restores your files, installs packages and Flatpak applications, adds
-you back to your groups, and writes the network configuration.
+Then it restores your files, writes the network configuration, installs
+packages and Flatpak applications, and adds you back to your groups.
 
 **Run from the desktop, restore continues on a text screen.** Desktops and
 their applications keep writing their settings while you are logged in, and
@@ -291,6 +292,23 @@ They rewrite their settings while they run or when they close, so their
 settings are restored last. If one is still open then, restore asks you to close it and
 press Enter, to skip its settings (run the same restore again later to put them
 back), or to restore them anyway.
+
+**Network before packages.** Packages and Flatpak applications are downloaded,
+so restore first makes sure the system is online, by NetworkManager's own
+check. If it is not, restore waits up to 90 seconds and shows which network
+NetworkManager is connecting to, such as one from the restored network
+configuration:
+
+```text
+Network
+  Connecting to DormWifi...
+  Connected to DormWifi.
+```
+
+Without a connection by then it installs nothing and lists the packages and
+Flatpak applications at the end, with the commands to install them once you
+are online. A Wi-Fi password kept only in your keyring is not in
+the restored configuration, so that network connects only after you log in.
 
 **GNOME settings** are loaded into the running session when you are logged in,
 so the session does not overwrite them.

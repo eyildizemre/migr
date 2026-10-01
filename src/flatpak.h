@@ -24,10 +24,13 @@ char *flatpak_apps_collect(void);
  * remote it lacks are listed with the command to run once the remote is
  * added: adding one needs its signing key, which the backup does not have.
  * An absent list is skipped silently, and a system without flatpak gets the
- * apps listed in todo. A dry run only says what it would install.
+ * apps listed in todo. A dry run only says what it would install. Without a
+ * network (online 0) nothing is installed, and the apps are listed to
+ * install later (D90).
  *
  * @param had_error Set to 1 on a real failure; untouched otherwise.
  */
-void restore_flatpak_apps(int source_root_fd, FILE *todo, int *had_error);
+void restore_flatpak_apps(int source_root_fd, int online, FILE *todo,
+                          int *had_error);
 
 #endif

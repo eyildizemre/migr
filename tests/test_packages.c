@@ -196,6 +196,9 @@ typedef struct {
     int skipped_matches;
 } PackageRestoreCaseResult;
 
+// Whether the package and Flatpak restores below run with a network (D90).
+static int restore_online = 1;
+
 // Runs restore_packages() on contents. expected_skipped lists, one per
 // line, the packages the todo must name as not installed; NULL means none.
 static int run_restore_packages_case(distro_t distro, const char *contents,
@@ -231,7 +234,7 @@ static int run_restore_packages_case(distro_t distro, const char *contents,
     packages_test_set_restore_hooks(distro, package_run_fixture,
                                     package_capture_fixture, runner);
     result->had_error = 0;
-    restore_packages(dir_fd, todo, &result->had_error);
+    restore_packages(dir_fd, restore_online, todo, &result->had_error);
     packages_test_clear_restore_hooks();
     close(dir_fd);
     fclose(todo);
@@ -251,7 +254,10 @@ static int run_restore_packages_case(distro_t distro, const char *contents,
     size_t expected_length = strlen(expected);
     result->skipped_exists = text_length != 0;
     result->skipped_matches = expected_skipped != NULL
-        ? strstr(todo_text, "could not install") != NULL &&
+        ? strstr(todo_text, restore_online
+                                ? "could not install"
+                                : "to install once this system is online") !=
+                  NULL &&
               text_length >= expected_length &&
               strcmp(todo_text + text_length - expected_length, expected) == 0
         : !result->skipped_exists;
@@ -757,6 +763,23 @@ static void test_restore_packages_single_pass_accounting(void)
               debian_status_result.had_error == 0 &&
               debian_status_result.skipped_matches,
           "Debian final-state accounting accepts only installed dpkg states");
+
+    PackageRunFixture offline = {
+        .expected_prefix = fedora_prefix,
+        .expected_prefix_count = sizeof(fedora_prefix) /
+                                 sizeof(fedora_prefix[0]),
+        .installed_output = "alpha\n",
+    };
+    PackageRestoreCaseResult offline_result = {0};
+    restore_online = 0;
+    fixture_ok = run_restore_packages_case(
+        DISTRO_FEDORA, "alpha\nbeta\n", &offline, "beta\n", &offline_result);
+    restore_online = 1;
+    check(fixture_ok && offline.call_count == 0U &&
+              offline.installed_query_count == 1U &&
+              offline_result.had_error == 0 && offline_result.skipped_matches,
+          "offline, nothing is installed and the missing packages are listed "
+          "to install once the system is online");
 }
 
 static void test_restore_packages_batch_alloc_failure_is_reported(void)
@@ -808,7 +831,7 @@ static void test_restore_packages_batch_alloc_failure_is_reported(void)
                                     package_capture_fixture, &runner);
     int had_error = 0;
     FILE *todo = tmpfile();
-    restore_packages(dir_fd, todo, &had_error);
+    restore_packages(dir_fd, 1, todo, &had_error);
     packages_test_clear_restore_hooks();
     if (todo != NULL)
         fclose(todo);
@@ -1135,7 +1158,7 @@ static void restore_flatpak_step(int dir_fd, FILE *todo, int *had_error,
                                  void *context)
 {
     (void)context;
-    restore_flatpak_apps(dir_fd, todo, had_error);
+    restore_flatpak_apps(dir_fd, restore_online, todo, had_error);
 }
 
 static int run_restore_flatpak_case(const char *list, FlatpakFixture *fixture,
@@ -1197,6 +1220,20 @@ static void test_restore_flatpak_apps(void)
               strstr(output, "Would install com.example.A org.example.C "
                              "com.example.D") != NULL,
           "a dry run says what it would install and installs nothing");
+
+    FlatpakFixture offline = fixture;
+    offline.installs = 0;
+    restore_online = 0;
+    rc = run_restore_flatpak_case(list, &offline, output, sizeof(output));
+    restore_online = 1;
+    check(rc == 0 && offline.installs == 0 &&
+              strstr(output, "No network connection; not installing.") !=
+                  NULL &&
+              strstr(last_todo, "to install once this system is online:\n"
+                                "    sudo flatpak install --system flathub "
+                                "com.example.A com.example.D\n") != NULL,
+          "offline, nothing is installed and the missing apps are listed "
+          "with their command");
 
     FlatpakFixture absent = { .remotes = NULL };
     rc = run_restore_flatpak_case(list, &absent, output, sizeof(output));
