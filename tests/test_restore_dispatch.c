@@ -1121,7 +1121,14 @@ static void test_portable_replay_failure_names_entry(void)
     join_path(restored, sizeof(restored), home, "restored");
     mkdir_p(restored);
     join_path(existing, sizeof(existing), restored, "link");
-    write_file_mode(existing, "existing", 0600);
+    // A file or symlink would give way to the backup's symlink (D96).
+    if (mkfifo(existing, 0600) != 0)
+    {
+        check(0, "fixture: plant a FIFO where the symlink goes");
+        remove_tree(source);
+        remove_tree(home);
+        return;
+    }
     remove_fixture_packages(source);
 
     int previous_dry_run = dry_run;
@@ -1146,7 +1153,8 @@ static void test_portable_replay_failure_names_entry(void)
           "portable replay summary identifies the failing entry and cause");
     check(strstr(output, final_summary) != NULL,
           "restore final summary preserves the failing entry and cause");
-    check(file_content_is(existing, "existing"),
+    struct stat existing_st;
+    check(lstat(existing, &existing_st) == 0 && S_ISFIFO(existing_st.st_mode),
           "reported replay conflict leaves the existing destination untouched");
 
     remove_tree(source);

@@ -256,7 +256,7 @@ static int link_target_is(const char *path, const char *expected)
 
 static void test_backup_symlink_replaces_a_destination_symlink(void)
 {
-    printf(BLUE "::" NC " restore_native_at: the backup's symlink replaces a symlink at its place\n");
+    printf(BLUE "::" NC " restore_native_at: the backup's symlink replaces a file or symlink at its place\n");
 
     char source_root[PATH_MAX], dest_root[PATH_MAX], outside_root[PATH_MAX];
     fresh_mkdtemp(source_root, sizeof(source_root), "restore_src");
@@ -267,9 +267,14 @@ static void test_backup_symlink_replaces_a_destination_symlink(void)
     write_file(sentinel, "do-not-touch");
 
     char source_link[PATH_MAX], other[PATH_MAX], same[PATH_MAX];
+    char file[PATH_MAX], folder[PATH_MAX];
     join_path(source_link, sizeof(source_link), source_root, "link");
     join_path(other, sizeof(other), dest_root, "other");
     join_path(same, sizeof(same), dest_root, "same");
+    join_path(file, sizeof(file), dest_root, "file");
+    join_path(folder, sizeof(folder), dest_root, "folder");
+    write_file(file, "fresh install");
+    check(mkdir(folder, 0755) == 0, "fixture: a folder where the link goes");
     check(symlink("backup-target", source_link) == 0 &&
               symlink(sentinel, other) == 0 &&
               symlink("backup-target", same) == 0,
@@ -291,6 +296,15 @@ static void test_backup_symlink_replaces_a_destination_symlink(void)
                             "same") == 0 &&
               link_target_is(same, "backup-target"),
           "a symlink with the same target stays the backup's symlink");
+    check(restore_native_at(&RESTORE_CTX, source_fd, "link", dest_fd,
+                            "file") == 0 &&
+              link_target_is(file, "backup-target"),
+          "a file is replaced by the backup's symlink");
+    struct stat st;
+    check(restore_native_at(&RESTORE_CTX, source_fd, "link", dest_fd,
+                            "folder") != 0 &&
+              lstat(folder, &st) == 0 && S_ISDIR(st.st_mode),
+          "a folder is not removed for the backup's symlink");
 
     close(source_fd);
     close(dest_fd);

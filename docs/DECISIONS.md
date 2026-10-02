@@ -5568,18 +5568,18 @@ final state. Uses D12's export commands.
 
 ---
 
-## D96 — 2026-10-03 — A backed-up symlink replaces the new system's symlink
+## D96 — 2026-10-03 — A backed-up symlink replaces the new system's file or symlink
 
 **Status:** Implemented
 
 **Decision:** Where the backup has a symlink and the new system already has
-a symlink at the same path, restore puts the backup's symlink there. The
-existing link itself is removed and the backup's created in its place; it is
-never written through. Portable restore keeps treating a link with the
-backup's target as the entry already restored. Where the backup has a file
-or folder and the new system has a symlink, restore still refuses before
-writing anything and names the path; any other object where the backup has
-a symlink still fails that entry.
+a symlink or a regular file at the same path, restore puts the backup's
+symlink there. The existing object itself is removed and the backup's link
+created in its place; nothing is written through a link. Portable restore
+keeps treating a link with the backup's target as the entry already
+restored. A folder where the backup has a symlink still fails that entry,
+and where the backup has a file or folder and the new system has a symlink,
+restore still refuses before writing anything and names the path.
 
 **Why:** Fresh installs create symlinks in the home before restore runs.
 Ubuntu 26.04 Desktop has three snap user-service links under
@@ -5593,6 +5593,12 @@ as Akonadi's under another UID. Replacing a symlink writes nothing through
 it, which is what the refusal guards against. A symlink where the backup has
 a file or folder is not part of a fresh install: restore runs right after
 installing, with nothing in between.
+
+A fresh install also has regular files where a backup can hold symlinks: a
+dotfile manager links `~/.bashrc` into its own folder, and the new system
+ships its own `~/.bashrc`. Restore already replaces a fresh install's file
+with a backed-up file, so a backed-up link replaces it too. This departs from native restore's rule that an existing object must
+have the source's type, which still holds for every other pairing.
 
 **Relationship:** Keeps D17's no-follow handling of destinations; narrows the
 refusal of an existing destination symlink to file and folder entries.

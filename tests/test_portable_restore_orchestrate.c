@@ -465,7 +465,8 @@ static void test_symlink_destination_conflict(void)
                              O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (restored_fd < 0)
         fatal("could not open symlink conflict destination");
-    write_file_at(restored_fd, "link", "existing");
+    make_dir_at(restored_fd, "link", 0700);
+    write_file_at(restored_fd, "link/kept", "existing");
     close(restored_fd);
 
     uint32_t uid = (uint32_t)geteuid();
@@ -481,20 +482,13 @@ static void test_symlink_destination_conflict(void)
           "symlink conflict sidecar is committed");
     PortableRestoreReplayReport report;
     int result = run_orchestration(&fixture, &report, 1, "y\n");
-    check(result != 0 && report.live_count == 2 &&
-              report.applied_count == 0 && report.failed_count == 1 &&
-              strcmp(report.failed_logical_path, "link") == 0 &&
-              report.failed_kind_valid &&
-              report.failed_kind == SIDECAR_KIND_SYMLINK &&
-              report.failure_step ==
-                  PORTABLE_RESTORE_REPLAY_FAILURE_CHECK_DESTINATION &&
-              report.failure_errno == EEXIST,
-          "existing destination leaf is rejected as a replay conflict");
+    check(result != 0 && report.applied_count == 0,
+          "an existing folder is refused before anything is restored");
     char existing[PATH_MAX];
     path_join_fixture(existing, sizeof(existing), fixture.home,
-                      "/restored/link");
+                      "/restored/link/kept");
     check(file_equals(existing, "existing"),
-          "destination conflict leaves the existing regular file intact");
+          "the refusal leaves the existing folder intact");
     fixture_close(&fixture);
 }
 
@@ -1368,32 +1362,40 @@ static void test_link_rerun_is_idempotent(void)
     fixture_close(&fixture);
 }
 
-static void test_link_replaces_a_different_symlink(void)
+// Restores over a file or a symlink with another target at restored/link.
+static void check_link_replaces(int plant_file, const char *label)
 {
-    printf(BLUE "::" NC " portable restore replaces a symlink with another target\n");
     ManifestRoot root = root_for();
     Fixture fixture;
-    int opened = fixture_open(&fixture, &root);
-    check(opened == 0, "different symlink fixture is created");
-    if (opened != 0)
-        return;
-
+    if (fixture_open(&fixture, &root) != 0)
+        fatal("could not create the link replacement fixture");
     build_link_rerun_payload(&fixture);
-    check(write_link_rerun_sidecar(&fixture) == 0,
-          "different symlink sidecar is committed");
+    if (write_link_rerun_sidecar(&fixture) != 0)
+        fatal("could not commit the link replacement sidecar");
     make_dir_at(fixture.home_fd, "restored", 0700);
     char link[PATH_MAX];
     path_join_fixture(link, sizeof(link), fixture.home, "/restored/link");
-    check(symlink("elsewhere", link) == 0,
-          "a symlink with a different target is planted");
+    if (plant_file)
+        write_file_at(fixture.home_fd, "restored/link", "fresh install");
+    else if (symlink("elsewhere", link) != 0)
+        fatal("could not plant the other symlink");
 
     PortableRestoreReplayReport report;
     int result = run_orchestration(&fixture, &report, 1, "y\n");
     check(result == 0 && report.failed_count == 0 &&
               symlink_exact(link, "representative", 0777, geteuid(),
                             getegid(), 1700000830, 7, 1700000831, 8),
-          "the backup's symlink, with its metadata, takes the other's place");
+          label);
     fixture_close(&fixture);
+}
+
+static void test_link_replaces_a_file_or_symlink(void)
+{
+    printf(BLUE "::" NC " portable restore puts the backup's symlink in place "
+                "of a file or another symlink\n");
+    check_link_replaces(0, "a symlink with another target is replaced, "
+                           "metadata included");
+    check_link_replaces(1, "a file is replaced, metadata included");
 }
 
 static void test_link_rerun_refuses_foreign_hardlink_name(void)
@@ -2799,7 +2801,7 @@ int main(void)
     test_security_xattr_tolerance_orchestration();
     test_hardlink_orchestration();
     test_link_rerun_is_idempotent();
-    test_link_replaces_a_different_symlink();
+    test_link_replaces_a_file_or_symlink();
     test_link_rerun_refuses_foreign_hardlink_name();
     test_failed_replay_finalizes_prepared_directories();
     test_confirmation_hook();

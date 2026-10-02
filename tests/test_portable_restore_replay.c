@@ -1011,7 +1011,9 @@ static void test_symlink_collection_validation(void)
         make_dir_at(fixture.data_fd, "ROOT", 0700);
         write_file_at(fixture.data_fd, "ROOT/link", "");
         make_dir_at(fixture.home_fd, "restored", 0700);
-        write_file_at(fixture.home_fd, "restored/link", "sentinel");
+        // A file or symlink would give way to the backup's symlink (D96).
+        if (mkfifoat(fixture.home_fd, "restored/link", 0600) != 0)
+            fatal("could not plant the FIFO");
         SidecarEntry entries[] = {
             entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
                       1700000200, 0, 1700000201, 0),
@@ -1032,7 +1034,9 @@ static void test_symlink_collection_validation(void)
                       PORTABLE_RESTORE_REPLAY_FAILURE_CHECK_DESTINATION &&
                   report.failure_errno == EEXIST,
               "collection accepts the symlink before destination validation fails");
-        check(file_equals_noatime(restored, "sentinel"),
+        struct stat restored_st;
+        check(lstat(restored, &restored_st) == 0 &&
+                  S_ISFIFO(restored_st.st_mode),
               "collection failure leaves the destination untouched");
         fixture_close(&fixture);
     }

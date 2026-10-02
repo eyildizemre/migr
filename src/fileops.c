@@ -3055,10 +3055,12 @@ static RestoreNativeStatus restore_entry_symlink(
     int source_is_root, int dest_is_root, int dest_exists,
     const struct stat *dest_st, int source_object_fd, struct stat desired_st)
 {
-        // The backup's symlink takes the place of a symlink the new system
-        // has there (D96); any other object there stays and fails it.
+        // The backup's symlink takes the place of a file or symlink the new
+        // system has there (D96); a folder or anything else stays and fails
+        // it.
         if (source_is_root || dest_is_root ||
-            (dest_exists && !S_ISLNK(dest_st->st_mode)))
+            (dest_exists && !S_ISLNK(dest_st->st_mode) &&
+             !S_ISREG(dest_st->st_mode)))
         {
             close(source_object_fd);
             restore_report_failure(restore_report, logical_path);

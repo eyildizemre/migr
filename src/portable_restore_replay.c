@@ -1924,18 +1924,20 @@ static int replay_apply_symlink(ReplayCollection *collection,
         if (fstatat(parent_fd, leaf, &existing, AT_SYMLINK_NOFOLLOW) == 0)
         {
             // A symlink with the recorded target is this entry from an
-            // earlier run; its metadata is still applied below. A symlink
-            // with another target gives way to it (D96).
+            // earlier run; its metadata is still applied below. A file or a
+            // symlink with another target gives way to it (D96).
+            int replaceable = S_ISLNK(existing.st_mode) ||
+                              S_ISREG(existing.st_mode);
             int matches = S_ISLNK(existing.st_mode)
                 ? destination_symlink_target_matches(parent_fd, leaf,
                                                      entry->symlink_target)
                 : 0;
             if (matches == 1)
                 already_present = 1;
-            else if (matches < 0 || !S_ISLNK(existing.st_mode) ||
+            else if (matches < 0 || !replaceable ||
                      unlinkat(parent_fd, leaf, 0) != 0)
             {
-                if (matches == 0 && !S_ISLNK(existing.st_mode))
+                if (!replaceable)
                     errno = EEXIST;
                 result = -1;
                 replay_apply_failure_record(
