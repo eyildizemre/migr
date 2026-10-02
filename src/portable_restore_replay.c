@@ -4,6 +4,7 @@
 #include "portable_restore_internal.h"
 #include "portable_restore_replay_internal.h"
 #include "portable_restore.h"
+#include "podman_state.h"
 #include "backup.h"
 #include "home_rewrite.h"
 #include "manifest.h"
@@ -53,7 +54,8 @@ typedef struct {
 enum {
     REPLAY_NOT_DEFERRED = 0,
     REPLAY_DEFERRED,
-    REPLAY_DEFERRED_SKIPPED
+    REPLAY_DEFERRED_SKIPPED,
+    REPLAY_LEFT_OUT /* Podman container state that would not work here (D94). */
 };
 
 enum {
@@ -119,6 +121,7 @@ typedef struct {
     size_t deferred_path_count;
     int (*before_deferred)(void *context);
     void *before_deferred_context;
+    PodmanContainers *left_out_containers;
 } ReplayCollection;
 
 typedef struct {
@@ -3079,6 +3082,7 @@ static int replay_content_verification_excluded(
 {
     return replay != NULL &&
            (replay->deferral == REPLAY_DEFERRED_SKIPPED ||
+            replay->deferral == REPLAY_LEFT_OUT ||
             replay_regular_content_verification_excluded(replay->entry) ||
             replay_regular_is_locally_authoritative(collection, replay));
 }
@@ -3326,7 +3330,8 @@ static void replay_mark_deferred(ReplayCollection *collection)
         const ManifestRoot *root =
             &collection->manifest->roots[replay->root_index];
         if (replay->entry->kind == SIDECAR_KIND_DIRECTORY ||
-            root->policy != ROOT_POLICY_HOME_RELATIVE)
+            root->policy != ROOT_POLICY_HOME_RELATIVE ||
+            replay->deferral != REPLAY_NOT_DEFERRED)
             continue;
         char relative[PATH_MAX];
         int deferred =
@@ -3353,6 +3358,93 @@ static void replay_mark_deferred(ReplayCollection *collection)
         if (collection->report->deferred_count != SIZE_MAX)
             collection->report->deferred_count++;
     }
+}
+
+// Reads the backup's containers.json from its payload, at most 16 MiB.
+static int replay_read_containers_json(ReplayCollection *collection,
+                                       const ReplayEntry *replay,
+                                       PodmanContainers *out)
+{
+    int fd = -1;
+    struct stat st;
+    if (replay_open_payload(collection,
+                            &collection->manifest->roots[replay->root_index],
+                            replay->entry, &fd, &st) != 0)
+        return -1;
+    int result = -1;
+    char *text = NULL;
+    if (st.st_size > 16 * 1024 * 1024 ||
+        (text = malloc((size_t)st.st_size + 1U)) == NULL)
+        goto done;
+    size_t length = 0;
+    while (length < (size_t)st.st_size)
+    {
+        ssize_t count = read(fd, text + length, (size_t)st.st_size - length);
+        if (count < 0 && errno == EINTR)
+            continue;
+        if (count <= 0)
+            goto done;
+        length += (size_t)count;
+    }
+    result = podman_containers_parse(text, length, out);
+done:
+    free(text);
+    close(fd);
+    return result;
+}
+
+// Leaves out the backup's podman container state, which would not work on
+// this system (D94): the containers its containers.json names, their
+// writable layers and links, and podman's database. The containers' names
+// go to the caller.
+static int replay_mark_left_out_containers(ReplayCollection *collection)
+{
+    PodmanContainers *containers = collection->left_out_containers;
+    char storage[PATH_MAX];
+    if (containers == NULL ||
+        path_join(storage, sizeof(storage),
+                  collection->manifest->source_home, PODMAN_STORAGE) != 0)
+        return 0;
+    for (size_t index = 0; index < collection->count; index++)
+        if (replay_regular_is_home_file(collection, &collection->items[index],
+                                        PODMAN_STORAGE "/"
+                                        PODMAN_CONTAINERS_JSON))
+        {
+            if (replay_read_containers_json(collection,
+                                            &collection->items[index],
+                                            containers) != 0)
+            {
+                print_error("Error: Could not read the backup's podman "
+                            "containers.json\n");
+                return -1;
+            }
+            break;
+        }
+
+    size_t storage_length = strlen(storage);
+    for (size_t index = 0; index < collection->count; index++)
+    {
+        ReplayEntry *replay = &collection->items[index];
+        char source_path[PATH_MAX], target[PATH_MAX];
+        if (replay_entry_source_path(collection, replay, source_path) != 0 ||
+            strncmp(source_path, storage, storage_length) != 0 ||
+            source_path[storage_length] != '/')
+            continue;
+        const char *link_target = NULL;
+        const SidecarBytes *link = &replay->entry->symlink_target;
+        if (replay->entry->kind == SIDECAR_KIND_SYMLINK &&
+            link->length < sizeof(target) &&
+            memchr(link->data, '\0', link->length) == NULL)
+        {
+            memcpy(target, link->data, link->length);
+            target[link->length] = '\0';
+            link_target = target;
+        }
+        if (podman_state_left_out(containers, source_path + storage_length + 1,
+                                  link_target))
+            replay->deferral = REPLAY_LEFT_OUT;
+    }
+    return 0;
 }
 
 // Restores what was deferred, now that everything else is in place, unless
@@ -3408,6 +3500,8 @@ static int replay_run(ReplayCollection *collection)
      *    is already on disk before its parent's own metadata (mtime
      *    especially) is set (D17, "directories: children first, then exact
      *    post-order metadata"). */
+    if (replay_mark_left_out_containers(collection) != 0)
+        return -1;
     replay_mark_deferred(collection);
     for (size_t index = 0; index < collection->count; index++)
     {
@@ -3435,7 +3529,8 @@ static int replay_run(ReplayCollection *collection)
     for (size_t index = collection->count; index != 0; index--)
     {
         ReplayEntry *replay = &collection->items[index - 1U];
-        if (replay->entry->kind != SIDECAR_KIND_DIRECTORY)
+        if (replay->entry->kind != SIDECAR_KIND_DIRECTORY ||
+            replay->deferral == REPLAY_LEFT_OUT)
             continue;
         replay_print_verbose_root(collection, replay->root_index,
                                   printed_roots);
@@ -3539,7 +3634,8 @@ int portable_restore_replay_at(const PortableRestoreRequest *request,
         .deferred_paths = request->deferred_paths,
         .deferred_path_count = request->deferred_path_count,
         .before_deferred = request->before_deferred,
-        .before_deferred_context = request->before_deferred_context
+        .before_deferred_context = request->before_deferred_context,
+        .left_out_containers = request->left_out_containers
     };
     for (int index = 0; index < XDG_KEY_COUNT; index++)
         collection.xdg_anchor_fd[index] = -1;

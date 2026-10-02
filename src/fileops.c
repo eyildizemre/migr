@@ -3021,12 +3021,15 @@ static RestoreNativeStatus restore_linked_regular_at(
 // buffer plus multiple struct stat locals.
 #define RESTORE_MAX_DEPTH 512
 
-// A subtree the caller restores last (D69) is left out of the apply pass;
-// the validate pass still covers it.
+// A subtree the caller restores last (D69), or leaves out (D94), is left
+// out of the apply pass; the validate pass still covers it.
 static int restore_path_is_skipped(const CloneContext *ctx, const char *path)
 {
     for (size_t index = 0; index < ctx->skipped_count; index++)
         if (strcmp(ctx->skipped_paths[index], path) == 0)
+            return 1;
+    for (size_t index = 0; index < ctx->left_out_count; index++)
+        if (strcmp(ctx->left_out_paths[index], path) == 0)
             return 1;
     return 0;
 }

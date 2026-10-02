@@ -5466,3 +5466,61 @@ recorded.
 
 **Relationship:** Extends D85's owner map.
 
+---
+
+## D94 — 2026-10-02 — Containers that would not start are left out of a restore
+
+**Status:** Implemented
+
+**Decision:** Restore leaves out rootless podman's container state when the
+backup's home (`SOURCE_HOME`, D86) differs from the restoring user's, or
+when SELinux ran where the backup was taken and does not run on the
+restoring system. Backup records the first as before and the second as
+`SELINUX=1` in the manifest. Images and volumes are restored either way;
+otherwise everything is restored as before.
+- **Left out**, below `~/.local/share/containers/storage`: podman's database
+  (`db.sql` with its `-journal`, `-wal`, and `-shm` files,
+  `libpod/bolt_state.db`), the container registry `overlay-containers/`,
+  and each container's writable layer `overlay/<id>/` with its short link in
+  `overlay/l/`. The ids are the `layer` fields of the backup's
+  `overlay-containers/containers.json`.
+- **`layers.json`:** after replay, restore drops the entries of layers whose
+  folder is not there, keeping the file's owner, mode, and times, so the
+  restored file differs from the backup's by design.
+- **"What's left for you"** (D78) names the containers left out and says to
+  create them again.
+
+**Why:**
+- **Another home:** podman's database records its user's home, and under
+  another home every podman command stops (`database configuration
+  mismatch`). Without the database, the restored containers become
+  "external" containers that cannot start and keep their names taken; a
+  Toolbox container also carries the old user name and a bind mount of the
+  old home.
+- **SELinux lost:** podman records an SELinux mount label for a container
+  made where SELinux runs, and a kernel without SELinux refuses it when
+  podman mounts the container's shm (`invalid argument`). A container made
+  without SELinux starts where it runs.
+- **The writable layers** of left-out containers would be layers nothing
+  uses, and a Toolbox with packages installed in it holds gigabytes. Without
+  their entries in `layers.json`, `podman system check` reports damage.
+- Measured on Fedora 44 KDE, Ubuntu 26.04, and Arch (podman 5.8, 5.7, 6.1):
+  with this state left out, podman starts with a new database, lists the
+  images, a new container finds the volume's data, the old names are free,
+  and `podman system check` is clean. Each podman read the others'
+  databases, so a backup from the same home with SELinux on both sides or
+  neither keeps its containers.
+
+**Limits:** A volume is listed by `podman volume ls` only once a container
+uses it by name; its data is there. Rootless Docker's state is not handled.
+
+**Rejected:**
+- Rewriting podman's database: it is SQLite, which migr does not read, and
+  the containers it describes still name the old user and home.
+- Running podman during restore: it may not be installed until the package
+  step, a text-console restore has no user session (D89), and it would tie
+  restore to podman's command line.
+
+**Relationship:** Uses D86's `SOURCE_HOME`; `layers.json` is rewritten after
+replay as D86 rewrites desktop state.
+

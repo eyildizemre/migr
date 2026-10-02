@@ -586,6 +586,15 @@ static ManifestStatus manifest_parse_v1_body(FILE *f, Manifest *out)
                          &fail_status) != 0) goto fail;
     }
 
+    // Optional SELINUX=1: SELinux ran where the backup was taken (D94).
+    if (line_key_is(line, "SELINUX", key_len))
+    {
+        if (strcmp(value, "1") != 0) goto fail;
+        m.selinux = 1;
+        if (read_kv_line(f, line, sizeof(line), &value, &key_len,
+                         &fail_status) != 0) goto fail;
+    }
+
     // Optional UPDATED=<seconds since the epoch> (D72).
     if (line_key_is(line, "UPDATED", key_len))
     {
@@ -983,6 +992,9 @@ static int manifest_serialize(FILE *f, const Manifest *m)
 
     if (!failed && m->has_network_config &&
         fprintf(f, "NETWORK_CONFIG=1\n") < 0)
+        failed = 1;
+
+    if (!failed && m->selinux && fprintf(f, "SELINUX=1\n") < 0)
         failed = 1;
 
     if (!failed && m->updated > 0 &&

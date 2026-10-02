@@ -23,6 +23,7 @@
 #include "manifest.h"
 #include "metadata.h"
 #include "packages.h"
+#include "podman_state.h"
 #include "groups.h"
 #include "home_rewrite.h"
 #include "flatpak.h"
@@ -1064,12 +1065,12 @@ void restore_test_set_relabel_hook(RestoreTestRelabelHook hook, void *context)
 }
 #endif
 
-static int selinux_runs(void)
+static int restore_selinux_runs(void)
 {
 #ifdef RESTORE_TEST_HOOKS
     return restore_test_relabel_hook != NULL;
 #else
-    return access("/sys/fs/selinux/enforce", F_OK) == 0;
+    return selinux_runs();
 #endif
 }
 
@@ -1192,7 +1193,7 @@ static int relabel_list_tree(RelabelList *list, const char *root,
 static void restore_selinux_labels(const char *const *paths, size_t count,
                                    int *had_error)
 {
-    if (dry_run || count == 0 || !selinux_runs())
+    if (dry_run || count == 0 || !restore_selinux_runs())
         return;
 
     RelabelList list = {0};
@@ -1245,7 +1246,7 @@ static void restore_selinux_label_roots(const Manifest *m, const char *home,
                                         const char *const *xdg_dirs,
                                         int *had_error)
 {
-    if (dry_run || m->root_count <= 0 || !selinux_runs())
+    if (dry_run || m->root_count <= 0 || !restore_selinux_runs())
         return;
     size_t count = (size_t)m->root_count;
     char (*joined)[PATH_MAX] = calloc(count, sizeof(*joined));
@@ -2440,6 +2441,194 @@ static int v1_payload_rel(const ManifestRoot *root, char *out, size_t out_size)
 {
     int n = snprintf(out, out_size, "data/%s", root->payload_path);
     return n < 0 || (size_t)n >= out_size ? -1 : 0;
+}
+
+// Whether the backup's rootless containers would not work here (D94): they
+// name the old home, or carry SELinux labels that a kernel without SELinux
+// refuses. Their images and volumes are restored either way.
+static int restore_leaves_out_containers(const Manifest *m, const char *home)
+{
+    return (m->source_home[0] != '\0' && strcmp(m->source_home, home) != 0) ||
+           (m->selinux && !restore_selinux_runs());
+}
+
+// The payload paths of a native backup's podman container state, which the
+// restore leaves out (D94), and the containers they belong to.
+typedef struct {
+    char **paths;
+    size_t count;
+    PodmanContainers containers;
+    int read_containers;
+} NativeLeftOut;
+
+static void native_left_out_free(NativeLeftOut *left_out)
+{
+    for (size_t index = 0; index < left_out->count; index++)
+        free(left_out->paths[index]);
+    free(left_out->paths);
+    podman_containers_free(&left_out->containers);
+    memset(left_out, 0, sizeof(*left_out));
+}
+
+static int native_left_out_read_containers(NativeLeftOut *left_out,
+                                           int storage_fd)
+{
+    int fd = openat(storage_fd, PODMAN_CONTAINERS_JSON,
+                    O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0)
+        return errno == ENOENT ? 0 : -1;
+    struct stat st;
+    char *text = NULL;
+    size_t length = 0;
+    int failed = fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+                 st.st_size > 16 * 1024 * 1024 ||
+                 (text = malloc((size_t)st.st_size + 1U)) == NULL;
+    while (!failed && length < (size_t)st.st_size)
+    {
+        ssize_t count = read(fd, text + length, (size_t)st.st_size - length);
+        if (count < 0 && errno == EINTR)
+            continue;
+        failed = count <= 0;
+        if (!failed)
+            length += (size_t)count;
+    }
+    failed = failed ||
+             podman_containers_parse(text, length, &left_out->containers) != 0;
+    free(text);
+    close(fd);
+    return failed ? -1 : 0;
+}
+
+// Adds what podman_state_left_out() names among the entries of folder, a
+// folder below the payload's storage folder at storage_rel.
+static int native_left_out_scan(NativeLeftOut *left_out, int storage_fd,
+                                const char *storage_rel, const char *folder)
+{
+    int fd = openat(storage_fd, folder[0] != '\0' ? folder : ".",
+                    O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0)
+        return errno == ENOENT ? 0 : -1;
+    DIR *dir = fdopendir(fd);
+    if (dir == NULL)
+    {
+        close(fd);
+        return -1;
+    }
+    int failed = 0;
+    struct dirent *entry;
+    while (!failed && (errno = 0, entry = readdir(dir)) != NULL)
+    {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            continue;
+        char relative[PATH_MAX], target[PATH_MAX];
+        if (snprintf(relative, sizeof(relative), "%s%s%s", folder,
+                     folder[0] != '\0' ? "/" : "", entry->d_name) >=
+            (int)sizeof(relative))
+            continue;
+        ssize_t target_length = readlinkat(dirfd(dir), entry->d_name, target,
+                                           sizeof(target) - 1U);
+        if (target_length >= 0)
+            target[target_length] = '\0';
+        if (!podman_state_left_out(&left_out->containers, relative,
+                                   target_length >= 0 ? target : NULL))
+            continue;
+        char **paths = realloc(left_out->paths,
+                               (left_out->count + 1U) * sizeof(*paths));
+        char *path = NULL;
+        failed = paths == NULL ||
+                 asprintf(&path, "%s/%s", storage_rel, relative) < 0;
+        if (paths != NULL)
+            left_out->paths = paths;
+        if (!failed)
+            left_out->paths[left_out->count++] = path;
+    }
+    if (!failed && errno != 0)
+        failed = 1;
+    if (closedir(dir) != 0)
+        failed = 1;
+    return failed ? -1 : 0;
+}
+
+// Finds the podman storage folder in the native backup's home-relative
+// roots and lists what of it the restore leaves out.
+static int native_left_out_build(int source_root_fd, const Manifest *m,
+                                 NativeLeftOut *left_out)
+{
+    static const char *const folders[] = { "", "libpod", "overlay",
+                                           "overlay/l" };
+    for (int index = 0; index < m->root_count; index++)
+    {
+        const ManifestRoot *root = &m->roots[index];
+        char payload[PATH_MAX + 8], storage_rel[2 * PATH_MAX];
+        if (root->policy != ROOT_POLICY_HOME_RELATIVE ||
+            !home_path_within(PODMAN_STORAGE, root->restore_path) ||
+            v1_payload_rel(root, payload, sizeof(payload)) != 0)
+            continue;
+        size_t root_length = strlen(root->restore_path);
+        const char *suffix = &PODMAN_STORAGE[root_length];
+        if (root_length != 0 && *suffix == '/')
+            suffix++;
+        snprintf(storage_rel, sizeof(storage_rel), "%s%s%s", payload,
+                 suffix[0] != '\0' ? "/" : "", suffix);
+        int storage_fd = openat(source_root_fd, storage_rel,
+                                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (storage_fd < 0)
+        {
+            if (errno == ENOENT)
+                continue;
+            return -1;
+        }
+        int failed = 0;
+        if (!left_out->read_containers)
+        {
+            failed = native_left_out_read_containers(left_out,
+                                                     storage_fd) != 0;
+            left_out->read_containers = 1;
+        }
+        for (size_t folder = 0;
+             !failed && folder < sizeof(folders) / sizeof(folders[0]); folder++)
+            failed = native_left_out_scan(left_out, storage_fd, storage_rel,
+                                          folders[folder]) != 0;
+        close(storage_fd);
+        if (failed)
+            return -1;
+    }
+    return 0;
+}
+
+// After a restore that left containers out (D94), layers.json lists only
+// the layers that were restored.
+static void restore_podman_layers_json(int home_fd, int *had_error)
+{
+    if (dry_run)
+        return;
+    int storage_fd = openat(home_fd, PODMAN_STORAGE,
+                            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (storage_fd < 0 && errno == ENOENT)
+        return;
+    if (storage_fd < 0 || podman_layers_json_drop_missing(storage_fd) < 0)
+    {
+        print_error("Error: Could not update ~/%s/overlay-layers/layers.json: "
+                    "%s\n", PODMAN_STORAGE, strerror(errno));
+        *had_error = 1;
+    }
+    if (storage_fd >= 0)
+        close(storage_fd);
+}
+
+// Names the containers a restore left out (D94).
+static void restore_containers_todo(const PodmanContainers *containers,
+                                    FILE *todo)
+{
+    if (todo == NULL || containers->name_count == 0)
+        return;
+    fprintf(todo, "  Podman containers from the old system were left out, "
+                  "since they would not start here: ");
+    for (size_t index = 0; index < containers->name_count; index++)
+        fprintf(todo, "%s%s", index == 0 ? "" : ", ",
+                containers->names[index]);
+    fprintf(todo, ". Their images and volumes are restored; create them "
+                  "again, with podman create or toolbox create.\n");
 }
 
 static int seed_native_restore_root(const CloneContext *ctx,
@@ -3757,6 +3946,8 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         int dconf_database_fd = -1;
         RestoreTodo todo = {0};
         RestoreDeferral deferral = {0};
+        PodmanContainers left_out_containers = {0};
+        int leave_out_containers = restore_leaves_out_containers(&m, home);
         restore_defer_running_writers(&deferral);
         RestoreConfirmation confirmation = {
             .deferral = &deferral,
@@ -3776,7 +3967,9 @@ int restore_with_options(const char *source, const RestoreOptions *options)
             .before_deferred = restore_before_deferred,
             .before_deferred_context = &deferral,
             .dconf_database_fd_out = &dconf_database_fd,
-            .dconf_loads_into_session = restore_dconf_loads_into_session()
+            .dconf_loads_into_session = restore_dconf_loads_into_session(),
+            .left_out_containers =
+                leave_out_containers ? &left_out_containers : NULL
         };
         for (int index = 0; index < XDG_RESTORE_COUNT; index++)
             request.destination_xdg_dirs[index] = xdg_dirs[index];
@@ -3824,6 +4017,8 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         {
             // Every entry was applied, so the dependent steps still run even
             // when verification found differences; those are reported below.
+            if (leave_out_containers)
+                restore_podman_layers_json(home_fd, &had_portable_error);
             restore_selinux_label_roots(&m, home,
                                         (const char *const *)xdg_dirs,
                                         &had_portable_error);
@@ -3833,6 +4028,7 @@ int restore_with_options(const char *source, const RestoreOptions *options)
             restore_system_lists(source_root_fd, &todo, &had_portable_error);
             restore_login_keyring_todo(home_fd, &keyring_before, todo.stream);
             restore_subid_todo(&request.owner_map, todo.stream);
+            restore_containers_todo(&left_out_containers, todo.stream);
         }
         else if (outcome == PORTABLE_RESTORE_DRY_RUN &&
                  m.has_network_config)
@@ -3934,6 +4130,7 @@ int restore_with_options(const char *source, const RestoreOptions *options)
                    "could not apply.\n",
                    report.skipped_security_xattr_count);
         restore_todo_finish(&todo, source);
+        podman_containers_free(&left_out_containers);
         free_xdg_dirs(xdg_dirs);
         manifest_free(&m);
         close(home_fd);
@@ -3999,6 +4196,20 @@ int restore_with_options(const char *source, const RestoreOptions *options)
     RestoreTodo todo = {0};
     int left_out_deferred = 0;
     int result = MIGR_EXIT_FAILURE;
+    NativeLeftOut left_out = {0};
+    int leave_out_containers = mst == MANIFEST_STATUS_VALID &&
+                               restore_leaves_out_containers(&m, home);
+    if (leave_out_containers)
+    {
+        if (native_left_out_build(source_root_fd, &m, &left_out) != 0)
+        {
+            print_error("Error: Could not read the backup's podman state: "
+                        "%s\n", strerror(errno));
+            goto cleanup;
+        }
+        ctx.left_out_paths = (const char *const *)left_out.paths;
+        ctx.left_out_count = left_out.count;
+    }
 
     RestoreNativeStatus metadata_inventory_status;
     if (mst == MANIFEST_STATUS_VALID)
@@ -4155,6 +4366,8 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         const char *xdg_dirs[XDG_KEY_COUNT];
         native_xdg_dirs(&m, &target_map, xdg_dirs);
         restore_native_rewrite_home(home_fd, home, &m, xdg_dirs, &had_error);
+        if (leave_out_containers)
+            restore_podman_layers_json(home_fd, &had_error);
         restore_selinux_label_roots(&m, home, xdg_dirs, &had_error);
         int dconf_database_fd = native_dconf_database_fd(source_root_fd, &m);
         restore_dconf_settings(dconf_database_fd, &had_error);
@@ -4172,6 +4385,7 @@ int restore_with_options(const char *source, const RestoreOptions *options)
     restore_system_lists(source_root_fd, &todo, &had_error);
     restore_login_keyring_todo(home_fd, &keyring_before, todo.stream);
     restore_subid_todo(&ctx.owner_map, todo.stream);
+    restore_containers_todo(&left_out.containers, todo.stream);
 
     printf("\n");
     char item_phrase[64];
@@ -4198,6 +4412,7 @@ int restore_with_options(const char *source, const RestoreOptions *options)
 cleanup:
     if (progress_installed)
         restore_progress_stop_ticker(&progress_display);
+    native_left_out_free(&left_out);
     free(deferral.items);
     native_inode_map_free(ctx.inode_map);
     ctx.inode_map = NULL;

@@ -63,6 +63,10 @@ int local_account_name(uid_t uid, char out[ACCOUNT_NAME_MAX]);
  */
 const char *invoker_name(void);
 
+/* Whether SELinux runs on this system: its filesystem is mounted, in
+ * enforcing or permissive mode (D92, D94). */
+int selinux_runs(void);
+
 /**
  * @brief Prints "Backup taken <local YYYY-MM-DD HH:MM>" and a newline when a
  *        backup's manifest records when it was taken (docs/DECISIONS.md D72);

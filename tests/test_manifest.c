@@ -126,6 +126,7 @@ static void test_full_roundtrip_with_problem_bytes(void)
     m.source_subgids = (SubidRanges){ .count = 1,
                                       .ranges = { { 100000, 65536 } } };
     strcpy(m.source_home, "/home/u");
+    m.selinux = 1;
     m.has_self_binary = 1;
     strcpy(m.arch, "x86_64");
 
@@ -180,6 +181,7 @@ static void test_full_roundtrip_with_problem_bytes(void)
               "ARCH round-trips after source identity");
         check(read.has_network_config == 0,
               "an absent NETWORK_CONFIG field remains absent");
+        check(read.selinux == 1, "SELINUX round-trips (D94)");
         check(read.root_count == 2, "root_count round-trips");
 
         if (read.root_count == 2)
@@ -209,13 +211,14 @@ static void test_full_roundtrip_with_problem_bytes(void)
     m.has_source_gid = 0;
     m.source_subuids.count = 0;
     m.source_subgids.count = 0;
+    m.selinux = 0;
     m.source_home[0] = '\0';
     check(manifest_write_v1(test_dir, &m) == 0,
           "a manifest without SOURCE_GID or SOURCE_HOME is written");
     st = manifest_read_v1(test_dir, &read);
     check(st == MANIFEST_STATUS_VALID && read.has_source_gid == 0 &&
               read.source_subuids.count == 0 &&
-              read.source_subgids.count == 0 &&
+              read.source_subgids.count == 0 && read.selinux == 0 &&
               read.source_home[0] == '\0' && read.source_uid == 1000 &&
               read.has_self_binary == 1,
           "a manifest without SOURCE_GID or SOURCE_HOME reads back without them");
@@ -639,6 +642,24 @@ static void test_malformed_variants(void)
         Manifest m;
         check(manifest_read_v1(test_dir, &m) == MANIFEST_STATUS_MALFORMED,
               "SOURCE_UID beyond uid_t's range is refused, not wrapped to 0");
+        remove_manifest(test_dir);
+    }
+
+    // SELINUX is presence-only, like NETWORK_CONFIG.
+    {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/manifest.txt", test_dir);
+        write_raw(path,
+            "MIGR_MANIFEST\n"
+            "VERSION=1\n"
+            "REPRESENTATION=native\n"
+            "SCOPE=critical\n"
+            "SIDECAR_VERSION=0\n"
+            "SELINUX=0\n"
+            "ROOT_COUNT=0\n");
+        Manifest m;
+        check(manifest_read_v1(test_dir, &m) == MANIFEST_STATUS_MALFORMED,
+              "SELINUX accepts only the value 1");
         remove_manifest(test_dir);
     }
 

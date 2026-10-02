@@ -297,6 +297,11 @@ void print_backup_time(time_t taken)
         printf("Backup taken %s\n", text);
 }
 
+int selinux_runs(void)
+{
+    return access("/sys/fs/selinux/enforce", F_OK) == 0;
+}
+
 const char *invoker_name(void)
 {
     const char *names[] = {

@@ -156,6 +156,7 @@ typedef struct {
     int has_self_binary;
     char arch[MIGR_ARCH_MAX];
     int has_network_config;
+    int selinux; /**< SELinux ran where the backup was taken (D94). */
     time_t updated; /**< When the backup was last taken (D72); 0 when unrecorded. */
     int root_count;
     ManifestRoot *roots;

@@ -38,6 +38,11 @@ typedef struct CloneContext {
      * leaves out so the caller can restore them last (D69). Borrowed. */
     const char *const *skipped_paths;
     size_t skipped_count;
+    /* Restore only: payload paths, named the same way, whose subtrees the
+     * apply pass leaves out altogether: podman container state that would
+     * not work on this system (D94). Borrowed. */
+    const char *const *left_out_paths;
+    size_t left_out_count;
     OwnerMap owner_map; /* Restore only: who gets the backup user's items. */
 } CloneContext;
 

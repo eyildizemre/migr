@@ -2531,6 +2531,228 @@ static void test_restore_moves_container_users_to_the_new_ids(void)
               "an owner the new IDs do not reach is kept as recorded");
 }
 
+#define PODMAN_IMAGE_LAYER \
+    "74d97c428c51a828f9051a7a40a53ff1fc99e54fc30323ce36760701b0b7f711"
+#define PODMAN_KEEP_LAYER \
+    "36e4a73b816d1df10ebd79e384109824196fd9ee2150abc61b9843fc46cbe7a3"
+
+// A rootless podman storage folder: an image's layer, the writable layer of
+// a container named keep, their short links, the database, and a volume.
+static const struct {
+    SidecarObjectKind kind;
+    const char *relative;
+    const char *content; /* a file's bytes, or a symlink's target */
+} podman_fixture[] = {
+    { SIDECAR_KIND_DIRECTORY, "", NULL },
+    { SIDECAR_KIND_REGULAR, "db.sql", "sqlite" },
+    { SIDECAR_KIND_DIRECTORY, "overlay", NULL },
+    { SIDECAR_KIND_DIRECTORY, "overlay/" PODMAN_IMAGE_LAYER, NULL },
+    { SIDECAR_KIND_REGULAR, "overlay/" PODMAN_IMAGE_LAYER "/shadow", "image" },
+    { SIDECAR_KIND_DIRECTORY, "overlay/" PODMAN_KEEP_LAYER, NULL },
+    { SIDECAR_KIND_REGULAR, "overlay/" PODMAN_KEEP_LAYER "/rwfile", "rw" },
+    { SIDECAR_KIND_DIRECTORY, "overlay/l", NULL },
+    { SIDECAR_KIND_SYMLINK, "overlay/l/IMAGELINK",
+      "../" PODMAN_IMAGE_LAYER "/diff" },
+    { SIDECAR_KIND_SYMLINK, "overlay/l/KEEPLINK",
+      "../" PODMAN_KEEP_LAYER "/diff" },
+    { SIDECAR_KIND_DIRECTORY, "overlay-containers", NULL },
+    { SIDECAR_KIND_REGULAR, "overlay-containers/containers.json",
+      "[{\"id\":\"77\",\"names\":[\"keep\"],\"layer\":\""
+      PODMAN_KEEP_LAYER "\"}]" },
+    { SIDECAR_KIND_DIRECTORY, "overlay-layers", NULL },
+    { SIDECAR_KIND_REGULAR, "overlay-layers/layers.json",
+      "[{\"id\":\"" PODMAN_IMAGE_LAYER "\"},{\"id\":\"" PODMAN_KEEP_LAYER
+      "\",\"parent\":\"" PODMAN_IMAGE_LAYER "\"}]" },
+    { SIDECAR_KIND_DIRECTORY, "volumes", NULL },
+    { SIDECAR_KIND_REGULAR, "volumes/v", "volume" }
+};
+
+// Writes the podman fixture as a native or portable backup of a user whose
+// home was source_home, and restores it into a fresh home. Returns the
+// restore's status; home names the restored home, removed by the caller.
+static int run_podman_restore(int portable, const char *source_home,
+                              int selinux, char home[PATH_MAX], char *output,
+                              size_t output_size)
+{
+    char source[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_podman_src");
+    fresh_mkdtemp(home, PATH_MAX, "dispatch_podman_home");
+    setenv("HOME", home, 1);
+
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "PODMAN");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "PODMAN");
+    snprintf(root.source_path, sizeof(root.source_path), "%s%s%s",
+             portable ? (source_home != NULL ? source_home : home) : "",
+             portable ? "/" : "", ".local/share/containers/storage");
+    strcpy(root.restore_path, ".local/share/containers/storage");
+    root.has_restore_path = 1;
+    Manifest manifest;
+    make_v1_manifest(&manifest, &root, 1);
+    snprintf(manifest.source_home, sizeof(manifest.source_home), "%s",
+             source_home != NULL ? source_home : home);
+    manifest.selinux = selinux;
+    if (portable)
+    {
+        manifest.representation = CLONE_PORTABLE_SIDECAR;
+        manifest.sidecar_version = SIDECAR_VERSION;
+    }
+    int ok = manifest_write_v1(source, &manifest) == 0;
+    remove_fixture_packages(source);
+
+    char payload[PATH_MAX];
+    join_path(payload, sizeof(payload), source, "data/PODMAN");
+    int container_fd = open(source, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    SidecarLog sidecar = {0};
+    ok = ok && container_fd >= 0 &&
+         (!portable ||
+          sidecar_log_create_at(container_fd, &sidecar) == SIDECAR_OPEN_FRESH);
+    for (size_t index = 0;
+         ok && index < sizeof(podman_fixture) / sizeof(podman_fixture[0]);
+         index++)
+    {
+        const char *relative = podman_fixture[index].relative;
+        const char *content = podman_fixture[index].content;
+        char path[PATH_MAX];
+        join_path(path, sizeof(path), payload, relative);
+        SidecarEntry entry = {
+            .root_id = sidecar_text("PODMAN"),
+            .logical_path = sidecar_text(relative),
+            .physical_leaf = sidecar_text(strrchr(relative, '/') != NULL
+                                              ? strrchr(relative, '/') + 1
+                                              : relative),
+            .kind = podman_fixture[index].kind,
+            .mode = 0700, .uid = (uint32_t)geteuid(),
+            .gid = (uint32_t)getegid(),
+            .atime_sec = 1700002000, .mtime_sec = 1700002001
+        };
+        if (entry.kind == SIDECAR_KIND_DIRECTORY)
+            mkdir_p(path);
+        else if (entry.kind == SIDECAR_KIND_REGULAR)
+        {
+            write_file_mode(path, content, 0600);
+            entry.mode = 0600;
+            entry.size = strlen(content);
+            entry.content_digest = hash_fnv1a_bytes(
+                HASH_FNV1A_OFFSET_BASIS, (const unsigned char *)content,
+                strlen(content));
+        }
+        else if (portable)
+        {
+            // A portable payload holds a symlink as an empty placeholder.
+            write_file_mode(path, "", 0600);
+            entry.mode = 0777;
+            entry.symlink_target = sidecar_text(content);
+        }
+        else
+            ok = symlink(content, path) == 0;
+        if (portable)
+            ok = ok && append_committed_sidecar_entry(&sidecar, &entry) == 0;
+    }
+    if (portable && sidecar_log_close(&sidecar) != SIDECAR_STATUS_OK)
+        ok = 0;
+    if (container_fd >= 0)
+        close(container_fd);
+
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    int rc = ok ? run_restore_capturing_with_input(source, "y\n", output,
+                                                   output_size)
+                : -1;
+    dry_run = previous_dry_run;
+    char todo[PATH_MAX + sizeof("-todo.txt")];
+    snprintf(todo, sizeof(todo), "%s-todo.txt", source);
+    unlink(todo);
+    remove_tree(source);
+    return rc;
+}
+
+static int podman_restored(const char *home, const char *relative)
+{
+    char storage[PATH_MAX], path[PATH_MAX];
+    struct stat st;
+    join_path(storage, sizeof(storage), home,
+              ".local/share/containers/storage");
+    join_path(path, sizeof(path), storage, relative);
+    return lstat(path, &st) == 0;
+}
+
+static char relabel_record[PATH_MAX];
+static int record_relabel(char *const argv[], const char *paths,
+                          size_t paths_length, void *context);
+
+// Containers made under another home, or with SELinux labels a system
+// without SELinux refuses, are left out; images and volumes are not (D94).
+static void test_restore_leaves_out_containers_that_would_not_work(void)
+{
+    printf(BLUE "::" NC " restore dispatch: containers of another home are left out, images and volumes kept\n");
+    for (int portable = 0; portable < 2; portable++)
+    {
+        char home[PATH_MAX], output[16384], layers[PATH_MAX];
+        int rc = run_podman_restore(portable, "/home/old", 0, home, output,
+                                    sizeof(output));
+        join_path(layers, sizeof(layers), home,
+                  ".local/share/containers/storage/overlay-layers/layers.json");
+        check(rc == 0 && !podman_restored(home, "db.sql") &&
+                  !podman_restored(home, "overlay-containers") &&
+                  !podman_restored(home, "overlay/" PODMAN_KEEP_LAYER) &&
+                  !podman_restored(home, "overlay/l/KEEPLINK"),
+              portable ? "portable: the database, the container, its layer "
+                         "and link are left out"
+                       : "native: the database, the container, its layer "
+                         "and link are left out");
+        check(podman_restored(home, "overlay/" PODMAN_IMAGE_LAYER "/shadow") &&
+                  podman_restored(home, "overlay/l/IMAGELINK") &&
+                  podman_restored(home, "volumes/v") &&
+                  file_content_is(layers, "[{\"id\":\"" PODMAN_IMAGE_LAYER
+                                          "\"}]"),
+              portable ? "portable: the image, its link, and the volume stay, "
+                         "and layers.json lists only the image's layer"
+                       : "native: the image, its link, and the volume stay, "
+                         "and layers.json lists only the image's layer");
+        check(strstr(output, "  Podman containers from the old system were "
+                             "left out, since they would not start here: "
+                             "keep. Their images and volumes are restored; "
+                             "create them again, with podman create or "
+                             "toolbox create.\n") != NULL,
+              portable ? "portable: the left-out container is named at the end"
+                       : "native: the left-out container is named at the end");
+        remove_tree(home);
+
+        rc = run_podman_restore(portable, NULL, 1, home, output,
+                                sizeof(output));
+        check(rc == 0 && !podman_restored(home, "db.sql") &&
+                  !podman_restored(home, "overlay/" PODMAN_KEEP_LAYER) &&
+                  podman_restored(home, "overlay/" PODMAN_IMAGE_LAYER),
+              portable ? "portable: containers made where SELinux ran are "
+                         "left out where it does not"
+                       : "native: containers made where SELinux ran are "
+                         "left out where it does not");
+        remove_tree(home);
+
+        // Where SELinux runs here as well, they are kept.
+        char record_dir[PATH_MAX];
+        fresh_mkdtemp(record_dir, sizeof(record_dir), "dispatch_podman_relabel");
+        join_path(relabel_record, sizeof(relabel_record), record_dir, "runs");
+        restore_test_set_relabel_hook(record_relabel, NULL);
+        rc = run_podman_restore(portable, NULL, 1, home, output,
+                                sizeof(output));
+        restore_test_set_relabel_hook(NULL, NULL);
+        remove_tree(record_dir);
+        check(rc == 0 && podman_restored(home, "db.sql") &&
+                  podman_restored(home, "overlay/" PODMAN_KEEP_LAYER "/rwfile") &&
+                  podman_restored(home, "overlay/l/KEEPLINK") &&
+                  podman_restored(home,
+                                  "overlay-containers/containers.json") &&
+                  strstr(output, "Podman containers") == NULL,
+              portable ? "portable: in the same home, everything is restored"
+                       : "native: in the same home, everything is restored");
+        remove_tree(home);
+    }
+}
+
 // A native restore onto another home path and locale points GTK bookmarks at
 // the new home's folders and keeps the new system's user-dirs.dirs (D86).
 static void test_native_restore_rewrites_the_source_home(void)
@@ -4899,6 +5121,7 @@ int main(void)
     test_running_writer_detection();
     test_restore_gives_the_backup_users_items_to_the_restorer();
     test_restore_moves_container_users_to_the_new_ids();
+    test_restore_leaves_out_containers_that_would_not_work();
     test_native_restore_rewrites_the_source_home();
     test_open_application_settings_are_deferred();
     test_native_open_application_settings_are_deferred();

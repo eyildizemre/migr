@@ -3327,6 +3327,8 @@ static int backup_run(const char *target_arg, BackupMode mode,
         manifest_set_self_binary(&manifest, self_arch);
     if (include_network_config && network_config_present_mask != 0)
         manifest.has_network_config = 1;
+    // Containers created where SELinux runs carry its labels (D94).
+    manifest.selinux = selinux_runs();
     manifest.updated = time(NULL);
 
     // Hoisted so both cleanup epilogues can release every resource
@@ -3460,6 +3462,7 @@ static int backup_run(const char *target_arg, BackupMode mode,
             prepared.manifest.has_network_config = 1;
         prepared.manifest.updated = manifest.updated;
         manifest_set_source_home(&prepared.manifest, manifest.source_home);
+        prepared.manifest.selinux = manifest.selinux;
         prepared.manifest.source_subuids = manifest.source_subuids;
         prepared.manifest.source_subgids = manifest.source_subgids;
     }

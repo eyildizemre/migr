@@ -292,6 +292,11 @@ gives you for them.
 the restored files the labels its policy sets, as `restorecon` does. Backups
 do not carry labels, so one set by hand with `chcon` is not kept.
 
+**Podman containers that would not start are left out.** Containers made
+under another home, or on a system with SELinux and restored onto one
+without, would not start, so restore leaves them out and names them at the
+end. Their images and volumes are restored; you create the containers again.
+
 **Open applications.** When restore runs while you are logged in to the
 desktop, VS Code, the common browsers, and Flatpak applications may be open.
 They rewrite their settings while they run or when they close, so their

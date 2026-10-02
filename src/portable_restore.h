@@ -7,6 +7,7 @@
 
 #include "fileops.h"
 #include "manifest.h"
+#include "podman_state.h"
 #include "metadata.h"
 #include "sidecar.h"
 #include "xdg.h"
@@ -62,6 +63,10 @@ typedef struct {
     size_t deferred_path_count;
     int (*before_deferred)(void *context);
     void *before_deferred_context;
+    /* Optional. When set, podman's container state in the source HOME's
+     * storage folder is left out (D94), and the containers it leaves out
+     * are stored here; the caller frees them with podman_containers_free(). */
+    PodmanContainers *left_out_containers;
 } PortableRestoreRequest;
 
 typedef enum {
