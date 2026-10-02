@@ -43,6 +43,7 @@
 #include "portable.h"
 #include "portable_hashset_internal.h"
 #include "portable_name.h"
+#include "utils.h"
 #include "portable_prescan_internal.h" /* Direct prescan_request() validation
                                         * coverage uses this internal seam. */
 #include "selection.h"
@@ -5619,6 +5620,68 @@ static void test_preflight_refusal(const char *source)
     remove_tree(container_path);
 }
 
+// A root only --comprehensive takes is captured after the critical ones,
+// wherever it stands in the request (D97).
+static void test_critical_roots_first(const char *base)
+{
+    printf(BLUE "::" NC " portable capture takes the critical roots first\n");
+    char source[PATH_MAX], later[PATH_MAX], first[PATH_MAX];
+    char container[PATH_MAX], file[PATH_MAX];
+    join_path(source, sizeof(source), base, "order-source");
+    join_path(later, sizeof(later), source, "later");
+    join_path(first, sizeof(first), source, "first");
+    join_path(container, sizeof(container), base, "order-container");
+    make_directory(source);
+    make_directory(later);
+    make_directory(first);
+    make_directory(container);
+    join_path(file, sizeof(file), later, "file");
+    write_file(file, "x", 1);
+    join_path(file, sizeof(file), first, "file");
+    write_file(file, "x", 1);
+
+    PortableRootSpec roots[] = {
+        root_spec("LATER", later, "LATER"),
+        root_spec("FIRST", first, "FIRST"),
+    };
+    roots[0].comprehensive_only = 1;
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_COMPREHENSIVE,
+        .roots = roots,
+        .root_count = 2,
+        .nsec_exact = 1,
+        .case_sensitive = 1
+    };
+    int container_fd = open(container, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    FILE *captured = tmpfile();
+    int saved_stdout = dup(STDOUT_FILENO);
+    if (container_fd < 0 || captured == NULL || saved_stdout < 0)
+        fixture_fatal("could not set up the capture order fixture");
+    fflush(stdout);
+    dup2(fileno(captured), STDOUT_FILENO);
+    int previous_verbose = verbose;
+    verbose = 1;
+    PortablePrescanReport report;
+    portable_prescan_report_init(&report);
+    int result = portable_capture_fresh_at(container_fd, &request, &report);
+    verbose = previous_verbose;
+    portable_prescan_report_free(&report);
+    fflush(stdout);
+    dup2(saved_stdout, STDOUT_FILENO);
+    close(saved_stdout);
+    close(container_fd);
+
+    char output[4096] = "";
+    rewind(captured);
+    output[fread(output, 1, sizeof(output) - 1, captured)] = '\0';
+    fclose(captured);
+    const char *first_line = strstr(output, "-> data/FIRST");
+    const char *later_line = strstr(output, "-> data/LATER");
+    check(result == 0 && first_line != NULL && later_line != NULL &&
+              first_line < later_line,
+          "the critical root is captured before the one listed ahead of it");
+}
+
 int main(void)
 {
     printf(BLUE "::" NC " portable capture core\n");
@@ -5637,6 +5700,7 @@ int main(void)
         fixture_fatal("could not open container fixture");
 
     test_entry_helpers(source_path);
+    test_critical_roots_first(root_path);
     test_append_physical();
     test_path_validation();
     test_collision_suffix_parser();

@@ -5603,3 +5603,25 @@ have the source's type, which still holds for every other pairing.
 **Relationship:** Keeps D17's no-follow handling of destinations; narrows the
 refusal of an existing destination symlink to file and folder entries.
 
+---
+
+## D97 — 2026-10-03 — A comprehensive backup takes the critical roots first
+
+**Status:** Implemented
+
+**Decision:** Each planned root records whether only `--comprehensive`
+takes it: the Videos and Music XDG folders, a catalog entry marked
+comprehensive-only, and a `comprehensive` include in the configuration. A
+path that a critical request also names is critical, and so is a root a
+critical include inherits into. Native and portable capture take the
+critical roots first and the comprehensive-only ones after them; within each
+group the order is as before. Roots deferred for a running application
+(D84) still come last of all.
+
+**Why:** Capture took the main folders first (native) or followed path order
+(portable), so Videos and Music, usually the largest folders, could come
+before `~/.ssh` or `~/.config`. A backup interrupted partway then held the
+folders that are easiest to replace and missed the ones that are not.
+
+**Relationship:** Keeps D84's deferral as the outermost order.
+

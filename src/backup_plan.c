@@ -461,6 +461,7 @@ static int build_builtin_roots(const char *home_real, BackupMode mode, RootBuild
             failed = 1;
             break;
         }
+        rb->items[rb->count - 1].comprehensive_only = i >= 4;
     }
 
     for (int i = 0; i < XDG_KEY_COUNT; i++)
@@ -496,6 +497,7 @@ static int build_builtin_roots(const char *home_real, BackupMode mode, RootBuild
         if (append_root(rb, e->id, ROOT_POLICY_HOME_RELATIVE, e->home_rel,
                         e->home_rel, 1, capture_path, e->group) != 0)
             return -1;
+        rb->items[rb->count - 1].comprehensive_only = e->comprehensive_only;
     }
 
     return 0;
@@ -1726,6 +1728,7 @@ int selection_plan_build(const char *home, BackupMode mode,
             !selection_root_readable(normalized, st.st_mode)) goto fail;
         if (append_root(&rb, "", ROOT_POLICY_MANUAL_NATIVE, normalized, NULL, 0,
                         normalized, BACKUP_ROOT_EXPLICIT) < 0) goto fail;
+        rb.items[rb.count - 1].comprehensive_only = rule->scope == CONFIG_COMPREHENSIVE;
     }
     for (int i = 0; i < rb.count; i++) selection_set_mapping(plan.home, &rb.items[i]);
     if (rb.count > 1) qsort(rb.items, (size_t)rb.count, sizeof(*rb.items), selection_candidate_cmp);
@@ -1742,17 +1745,23 @@ int selection_plan_build(const char *home, BackupMode mode,
         uint32_t aliases = 0;
         int rank = selection_xdg_rank(candidate);
         if (rank < XDG_KEY_COUNT) aliases |= UINT32_C(1) << rank;
+        /* A path any critical request names is critical. */
         while (i + 1 < rb.count && !strcmp(candidate->capture_path, rb.items[i + 1].capture_path))
         {
             rank = selection_xdg_rank(&rb.items[++i]);
             if (rank < XDG_KEY_COUNT) aliases |= UINT32_C(1) << rank;
+            candidate->comprehensive_only &= rb.items[i].comprehensive_only;
         }
         int parent = -1;
         for (size_t j = 0; j < plan.root_count; j++)
             if (is_ancestor(plan.roots[j].root.capture_path, candidate->capture_path)) parent = (int)j;
         /* Configured descendants inherit their owner; built-in restore mappings
          * survive when the ancestor would place their data elsewhere. */
-        if (parent >= 0 && root_mapping_inherited(&plan.roots[parent].root, candidate)) continue;
+        if (parent >= 0 && root_mapping_inherited(&plan.roots[parent].root, candidate))
+        {
+            plan.roots[parent].root.comprehensive_only &= candidate->comprehensive_only;
+            continue;
+        }
         SelectionRoot *root = &plan.roots[plan.root_count++];
         root->root = *candidate;
         root->parent = parent;

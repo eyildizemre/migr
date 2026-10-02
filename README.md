@@ -72,7 +72,8 @@ sudo ./migr restore /mnt/usb/migr-$USER
 | Network (opt-in) | NetworkManager, netplan, systemd-networkd, wpa_supplicant, and netctl configuration, and the system crypto policy | Written back; NetworkManager reloads it and the crypto policy is set, the others are left for you to apply |
 
 That is the default scope, `--critical`. `--comprehensive` adds Videos and
-Music. Listing paths after the destination (`sudo ./migr backup /mnt/usb
+Music, and takes them after everything `--critical` covers, so an
+interrupted run already holds the rest. Listing paths after the destination (`sudo ./migr backup /mnt/usb
 ~/Documents ~/Projects`) backs up exactly those paths and nothing else: no
 package, Flatpak, or group lists.
 

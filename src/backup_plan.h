@@ -44,6 +44,9 @@ typedef struct {
     char capture_path[PATH_MAX];
     ManifestRoot manifest_root;
     BackupRootGroup group;
+    /* In --comprehensive only, not --critical: captured after the others,
+     * so an interrupted run already holds the critical ones. */
+    int comprehensive_only;
 } BackupPlanRoot;
 
 /**

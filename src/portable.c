@@ -3751,7 +3751,8 @@ int portable_capture_request_set_selection(
             .source_path = mapped->source_path,
             .restore_path = mapped->restore_path,
             .has_restore_path = mapped->has_restore_path,
-            .selection = selection
+            .selection = selection,
+            .comprehensive_only = root->comprehensive_only
         };
     }
     request->scope = plan->scope;
@@ -4171,31 +4172,35 @@ int portable_capture_root(PortableCaptureContext *context,
     return capture_current_source_seen(context, root);
 }
 
-// Captures and reconciles every root, the deferred ones last (D84).
+// Captures and reconciles every root: the critical ones first, then those
+// only --comprehensive takes, and the deferred ones last (D84, D97).
 // Returns 0, or -1 once one fails.
 static int capture_roots(PortableCaptureContext *context,
                          const PortableCaptureRequest *request)
 {
     for (int deferred = 0; deferred <= 1; deferred++) {
         int asked = 0;
-        for (size_t index = 0; index < request->root_count; index++) {
-            const PortableRootSpec *root = &request->roots[index];
-            int root_deferred = request->deferred != NULL &&
-                                request->deferred[index] != 0;
-            if (root_deferred != deferred)
-                continue;
-            if (deferred && !asked && request->before_deferred != NULL)
-                request->before_deferred(request->before_deferred_context);
-            asked = 1;
-            if (verbose)
-                printf("  Capturing: %s -> data/%s\n", root->capture_path,
-                       root->payload_path);
-            if (portable_capture_root(context, root) != 0)
-                return -1;
-            if (reconcile_root(context, root) != 0) {
-                portable_capture_context_failure_record(
-                    context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, NULL);
-                return -1;
+        for (int later = 0; later <= 1; later++) {
+            for (size_t index = 0; index < request->root_count; index++) {
+                const PortableRootSpec *root = &request->roots[index];
+                int root_deferred = request->deferred != NULL &&
+                                    request->deferred[index] != 0;
+                if (root_deferred != deferred ||
+                    root->comprehensive_only != later)
+                    continue;
+                if (deferred && !asked && request->before_deferred != NULL)
+                    request->before_deferred(request->before_deferred_context);
+                asked = 1;
+                if (verbose)
+                    printf("  Capturing: %s -> data/%s\n", root->capture_path,
+                           root->payload_path);
+                if (portable_capture_root(context, root) != 0)
+                    return -1;
+                if (reconcile_root(context, root) != 0) {
+                    portable_capture_context_failure_record(
+                        context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, NULL);
+                    return -1;
+                }
             }
         }
     }

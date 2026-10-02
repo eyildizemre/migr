@@ -4718,6 +4718,88 @@ static void test_dangling_builtin_dotfile_is_captured_not_silently_dropped(void)
     remove_tree(target);
 }
 
+// Where name's "Capturing:" line starts in output, or NULL.
+static const char *capture_line(const char *output, const char *home,
+                                const char *name)
+{
+    char line[PATH_MAX + 32];
+    snprintf(line, sizeof(line), "Capturing: %s/%s -> ", home, name);
+    return strstr(output, line);
+}
+
+static void test_comprehensive_captures_critical_roots_first(void)
+{
+    printf(BLUE "::" NC " production: --comprehensive captures the --critical roots first\n");
+
+    char home[PATH_MAX], target[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "critical_first_home");
+    setenv("HOME", home, 1);
+    static const char *const critical[] = { "Documents", ".ssh", "notes" };
+    static const char *const later[] = { "Music", "Videos", "Projects" };
+    for (size_t i = 0; i < 3; i++)
+    {
+        char path[PATH_MAX];
+        join_path(path, sizeof(path), home, critical[i]);
+        mkdir_p(path);
+        join_path(path, sizeof(path), home, later[i]);
+        mkdir_p(path);
+    }
+    char projects[PATH_MAX], notes[PATH_MAX];
+    join_path(projects, sizeof(projects), home, "Projects");
+    join_path(notes, sizeof(notes), home, "notes");
+    ConfigRule rules[] = {
+        { .scope = CONFIG_COMPREHENSIVE, .action = CONFIG_INCLUDE,
+          .path = projects, .line = 1 },
+        { .scope = CONFIG_CRITICAL, .action = CONFIG_INCLUDE,
+          .path = notes, .line = 2 },
+    };
+    Config config = { .rules = rules, .count = 2 };
+
+    SelectionPlan plan = {0};
+    check(selection_plan_build(home, BACKUP_COMPREHENSIVE, &config, &plan) == 0,
+          "the comprehensive plan builds");
+    int flags_ok = plan.root_count == 6;
+    for (size_t i = 0; i < plan.root_count; i++)
+    {
+        const char *leaf = strrchr(plan.roots[i].root.capture_path, '/') + 1;
+        int expected = strcmp(leaf, "Music") == 0 ||
+                       strcmp(leaf, "Videos") == 0 ||
+                       strcmp(leaf, "Projects") == 0;
+        flags_ok = flags_ok &&
+                   plan.roots[i].root.comprehensive_only == expected;
+    }
+    check(flags_ok, "Videos, Music, and a comprehensive include are the "
+                    "roots only --comprehensive takes");
+    selection_plan_free(&plan);
+
+    fresh_mkdtemp(target, sizeof(target), "critical_first_target");
+    int previous_verbose = verbose;
+    verbose = 1;
+    dry_run = 0;
+    char output[32768];
+    int rc = run_scoped_backup_capturing_input(
+        target, BACKUP_COMPREHENSIVE, &config, NULL, output, sizeof(output));
+    verbose = previous_verbose;
+    const char *last_critical = output;
+    const char *first_later = NULL;
+    int all_found = 1;
+    for (size_t i = 0; i < 3; i++)
+    {
+        const char *c = capture_line(output, home, critical[i]);
+        const char *l = capture_line(output, home, later[i]);
+        all_found = all_found && c != NULL && l != NULL;
+        if (c != NULL && c > last_critical)
+            last_critical = c;
+        if (l != NULL && (first_later == NULL || l < first_later))
+            first_later = l;
+    }
+    check(rc == 0 && all_found && last_critical < first_later,
+          "every critical root is captured before the first comprehensive one");
+
+    remove_tree(target);
+    remove_tree(home);
+}
+
 static void test_shell_history_consent_gate(void)
 {
     printf(BLUE "::" NC " production: scoped shell-history capture requires explicit consent\n");
@@ -5036,6 +5118,7 @@ int main(void)
     test_updates_rewrite_a_grown_journal();
     test_dangling_builtin_dotfile_is_captured_not_silently_dropped();
     test_shell_history_consent_gate();
+    test_comprehensive_captures_critical_roots_first();
     test_login_keyring_note();
     test_unusable_target_does_not_leak_the_plan();
 

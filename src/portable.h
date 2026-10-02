@@ -75,6 +75,7 @@ typedef struct {
     const char *restore_path;
     int has_restore_path;
     const struct SelectionRoot *selection; /* Borrowed compiled ownership, optional. */
+    int comprehensive_only; /* Captured after the critical roots. */
 } PortableRootSpec;
 
 /**

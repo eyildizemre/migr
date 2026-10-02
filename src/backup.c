@@ -1852,7 +1852,8 @@ static void portable_root_specs_from_plan(const BackupPlan *plan,
             .payload_path = root->manifest_root.payload_path,
             .source_path = root->manifest_root.source_path,
             .restore_path = root->manifest_root.restore_path,
-            .has_restore_path = root->manifest_root.has_restore_path
+            .has_restore_path = root->manifest_root.has_restore_path,
+            .comprehensive_only = root->comprehensive_only
         };
     }
 }
@@ -2492,8 +2493,9 @@ static void capture_plan_root(const CloneContext *ctx, const BackupPlan *plan,
 // plan that way); NULL means an unfiltered explicit-path backup, which needs
 // no per-entry filter. Each root gets its own CloneContext copy so the
 // borrowed SelectionRoot pointer never leaks across roots, while inode_map
-// and visited stay the single shared instances the caller created. Deferred
-// roots go last (D84); a backup that already failed has no one to ask.
+// and visited stay the single shared instances the caller created. Critical
+// roots go first (D97) and deferred roots last (D84); a backup that already
+// failed has no one to ask.
 static void capture_roots(const CloneContext *ctx, const BackupPlan *plan,
                           const SelectionPlan *selection, int data_fd,
                           BackupDeferral *deferral, int *count, int *had_error,
@@ -2507,22 +2509,26 @@ static void capture_roots(const CloneContext *ctx, const BackupPlan *plan,
     {
         if (deferred && deferral->root_count != 0 && !*had_error)
             backup_before_deferred(deferral);
-        for (int s = 0; s < ROOT_SECTION_COUNT; s++)
+        for (int later = 0; later <= 1; later++)
         {
-            int printed_heading = 0;
-            for (int i = 0; i < plan->root_count; i++)
+            for (int s = 0; s < ROOT_SECTION_COUNT; s++)
             {
-                if (plan->roots[i].group != root_sections[s].group ||
-                    deferral->roots[i] != deferred)
-                    continue;
-                // Headings only group the verbose lines under them.
-                if (verbose && !printed_heading)
+                int printed_heading = 0;
+                for (int i = 0; i < plan->root_count; i++)
                 {
-                    printf("\n%s\n", root_sections[s].heading);
-                    printed_heading = 1;
+                    if (plan->roots[i].group != root_sections[s].group ||
+                        plan->roots[i].comprehensive_only != later ||
+                        deferral->roots[i] != deferred)
+                        continue;
+                    // Headings only group the verbose lines under them.
+                    if (verbose && !printed_heading)
+                    {
+                        printf("\n%s\n", root_sections[s].heading);
+                        printed_heading = 1;
+                    }
+                    capture_plan_root(ctx, plan, selection, i, data_fd, count,
+                                      had_error, capture_report);
                 }
-                capture_plan_root(ctx, plan, selection, i, data_fd, count,
-                                  had_error, capture_report);
             }
         }
     }
