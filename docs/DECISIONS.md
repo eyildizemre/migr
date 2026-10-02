@@ -5055,7 +5055,7 @@ Complements D63 and D64.
 
 ## D85 — 2026-09-29 — Restore gives the backup user's items to the restoring user
 
-**Status:** Implemented
+**Status:** Implemented; extended by D93 (the user's subordinate IDs)
 
 **Decision:** Restore gives every item the backup's user owned to the user it
 acts for: the sudo invoker (D38), otherwise the caller.
@@ -5429,3 +5429,40 @@ rules under `/etc`, outside the backup.
 so the policy's own tool sets it, on any distribution where SELinux runs.
 Ends D20 E-10 for `security.selinux`; E-8's removal tolerance and E-11's
 count no longer meet it.
+
+---
+
+## D93 — 2026-10-02 — Rootless containers' files follow the user's subordinate IDs
+
+**Status:** Implemented
+
+**Decision:** Restore moves files owned by the backup user's subordinate IDs
+to the restoring user's.
+- **Backup** records the user's ranges from `/etc/subuid` and `/etc/subgid`
+  (lines by name or by uid, in file order) in the manifest:
+  `SOURCE_SUBUID=<start>:<count>[,...]` and `SOURCE_SUBGID=...`, after
+  `SOURCE_GID`. A system that gives the user none records none.
+- **Restore** reads the restoring user's ranges and gives an owner or group
+  in the old ones the ID at the same position in the new ones, counted
+  across ranges, as D85 does for the user's own IDs. An ID the new ranges do
+  not reach is kept as recorded.
+- **Fewer IDs:** when the new system gives the user fewer IDs than the old
+  one, "What's left for you" (D78) says so and how many to add with `usermod
+  --add-subuids` and `--add-subgids`.
+- A manifest without these lines restores as before.
+
+**Why:** A rootless container's user N is, on disk, the user's Nth
+subordinate ID. Distributions start the ranges differently: Fedora gives the
+first user 524288-589823, Ubuntu and Arch 100000-165535 (`SUB_UID_MIN`), and
+a second user on one system gets the next range. Restored unchanged, the
+files of container users fell outside the new range, and inside a container
+`/etc/shadow` belonged to group 65534 instead of `shadow`. Moved by position,
+a Fedora backup's images worked on Arch and an Arch backup's on Fedora, with
+`podman system check` clean.
+
+**Limits:** Only the files are read; ranges a system serves from elsewhere
+(`subid` in `nsswitch.conf`) are not seen. At most 8 ranges per user are
+recorded.
+
+**Relationship:** Extends D85's owner map.
+

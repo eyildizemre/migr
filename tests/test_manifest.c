@@ -121,6 +121,10 @@ static void test_full_roundtrip_with_problem_bytes(void)
     m.source_uid = 1000;
     m.has_source_gid = 1;
     m.source_gid = 1001;
+    m.source_subuids = (SubidRanges){
+        .count = 2, .ranges = { { 524288, 65536 }, { 700000, 1000 } } };
+    m.source_subgids = (SubidRanges){ .count = 1,
+                                      .ranges = { { 100000, 65536 } } };
     strcpy(m.source_home, "/home/u");
     m.has_self_binary = 1;
     strcpy(m.arch, "x86_64");
@@ -164,6 +168,11 @@ static void test_full_roundtrip_with_problem_bytes(void)
         check(read.source_uid == 1000, "source_uid round-trips");
         check(read.has_source_gid == 1 && read.source_gid == 1001,
               "source_gid round-trips");
+        check(memcmp(&read.source_subuids, &m.source_subuids,
+                      sizeof(m.source_subuids)) == 0 &&
+                  memcmp(&read.source_subgids, &m.source_subgids,
+                         sizeof(m.source_subgids)) == 0,
+              "the subordinate ID ranges round-trip (D93)");
         check(strcmp(read.source_home, "/home/u") == 0,
               "a VERSION=1 source HOME round-trips");
         check(read.has_self_binary == 1, "self-binary presence round-trips");
@@ -198,11 +207,15 @@ static void test_full_roundtrip_with_problem_bytes(void)
     // A manifest written before SOURCE_GID and a VERSION=1 SOURCE_HOME
     // existed still reads, without them.
     m.has_source_gid = 0;
+    m.source_subuids.count = 0;
+    m.source_subgids.count = 0;
     m.source_home[0] = '\0';
     check(manifest_write_v1(test_dir, &m) == 0,
           "a manifest without SOURCE_GID or SOURCE_HOME is written");
     st = manifest_read_v1(test_dir, &read);
     check(st == MANIFEST_STATUS_VALID && read.has_source_gid == 0 &&
+              read.source_subuids.count == 0 &&
+              read.source_subgids.count == 0 &&
               read.source_home[0] == '\0' && read.source_uid == 1000 &&
               read.has_self_binary == 1,
           "a manifest without SOURCE_GID or SOURCE_HOME reads back without them");
@@ -626,6 +639,27 @@ static void test_malformed_variants(void)
         Manifest m;
         check(manifest_read_v1(test_dir, &m) == MANIFEST_STATUS_MALFORMED,
               "SOURCE_UID beyond uid_t's range is refused, not wrapped to 0");
+        remove_manifest(test_dir);
+    }
+
+    // A subordinate ID range without IDs is malformed, not "no ranges" (D93).
+    {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/manifest.txt", test_dir);
+        write_raw(path,
+            "MIGR_MANIFEST\n"
+            "VERSION=1\n"
+            "REPRESENTATION=native\n"
+            "SCOPE=critical\n"
+            "SIDECAR_VERSION=0\n"
+            "MACHINE_ID=deadbeef\n"
+            "SOURCE_UID=1000\n"
+            "SOURCE_GID=1000\n"
+            "SOURCE_SUBUID=524288:0\n"
+            "ROOT_COUNT=0\n");
+        Manifest m;
+        check(manifest_read_v1(test_dir, &m) == MANIFEST_STATUS_MALFORMED,
+              "a SOURCE_SUBUID range of no IDs is refused");
         remove_manifest(test_dir);
     }
 

@@ -103,6 +103,8 @@ int legacy_manifest_read(const char *backup_dir, char **out, int n)
 /*   MACHINE_ID=<hex>                    (both lines present, or neither)   */
 /*   SOURCE_UID=<uint>                                                      */
 /*   SOURCE_GID=<uint>                   (optional, after SOURCE_UID)       */
+/*   SOURCE_SUBUID=<start>:<count>[,...] (optional, after SOURCE_GID; D93)  */
+/*   SOURCE_SUBGID=<start>:<count>[,...] (optional, after SOURCE_SUBUID)    */
 /*   SOURCE_HOME=<enc>                   (absent before D86)                */
 /*   ROOT_COUNT=<uint>                                                      */
 /*   ROOT ID=<id> POLICY=<policy> PAYLOAD=<enc> SOURCE=<enc> [RESTORE=<enc>]*/
@@ -547,6 +549,20 @@ static ManifestStatus manifest_parse_v1_body(FILE *f, Manifest *out)
             if (read_kv_line(f, line, sizeof(line), &value, &key_len,
                              &fail_status) != 0) goto fail;
         }
+        if (line_key_is(line, "SOURCE_SUBUID", key_len))
+        {
+            if (subid_ranges_parse(value, &m.source_subuids) != 0 ||
+                m.source_subuids.count == 0) goto fail;
+            if (read_kv_line(f, line, sizeof(line), &value, &key_len,
+                             &fail_status) != 0) goto fail;
+        }
+        if (line_key_is(line, "SOURCE_SUBGID", key_len))
+        {
+            if (subid_ranges_parse(value, &m.source_subgids) != 0 ||
+                m.source_subgids.count == 0) goto fail;
+            if (read_kv_line(f, line, sizeof(line), &value, &key_len,
+                             &fail_status) != 0) goto fail;
+        }
     }
     // 'value'/'line' now holds whatever line follows the optional identity pair.
 
@@ -950,6 +966,15 @@ static int manifest_serialize(FILE *f, const Manifest *m)
         if (!failed && fprintf(f, "SOURCE_UID=%lu\n", (unsigned long)m->source_uid) < 0) failed = 1;
         if (!failed && m->has_source_gid &&
             fprintf(f, "SOURCE_GID=%lu\n", (unsigned long)m->source_gid) < 0) failed = 1;
+        char ranges[SUBID_TEXT_MAX];
+        if (!failed && m->source_subuids.count != 0 &&
+            (subid_ranges_format(&m->source_subuids, ranges,
+                                 sizeof(ranges)) != 0 ||
+             fprintf(f, "SOURCE_SUBUID=%s\n", ranges) < 0)) failed = 1;
+        if (!failed && m->source_subgids.count != 0 &&
+            (subid_ranges_format(&m->source_subgids, ranges,
+                                 sizeof(ranges)) != 0 ||
+             fprintf(f, "SOURCE_SUBGID=%s\n", ranges) < 0)) failed = 1;
     }
 
     if (!failed && m->has_self_binary &&

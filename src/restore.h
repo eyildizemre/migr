@@ -21,6 +21,9 @@ typedef int (*RestoreTestNetworkQueryHook)(char *const argv[], char *output,
                                            size_t output_size, void *context);
 void restore_test_set_network_query_hook(RestoreTestNetworkQueryHook hook,
                                          void *context, long interval_ms);
+/* Reads the restoring user's subordinate IDs (D93) from these files in
+ * place of /etc/subuid and /etc/subgid; NULL restores the real one. */
+void restore_test_set_subid_files(const char *subuid, const char *subgid);
 /* Runs the SELinux relabel of the restored paths (D92) in place of
  * restorecon; paths is the NUL-separated list restorecon would read. Without
  * a hook, a test restore treats SELinux as not running. */

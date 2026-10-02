@@ -284,7 +284,9 @@ while another user is logged in to a desktop, restore runs where you started
 it.
 
 **Your files stay yours.** What belonged to you in the backup belongs to you
-on the new system, even when it gives your account another user ID.
+on the new system, even when it gives your account another user ID. Files of
+your rootless containers (Podman, Toolbox) move to the IDs the new system
+gives you for them.
 
 **SELinux labels come from the new system.** Where SELinux runs, restore gives
 the restored files the labels its policy sets, as `restorecon` does. Backups

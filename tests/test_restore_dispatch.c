@@ -2446,6 +2446,91 @@ static void test_restore_gives_the_backup_users_items_to_the_restorer(void)
     remove_tree(home);
 }
 
+// Restores notes/file.txt from a native backup whose user had Fedora's
+// subordinate IDs, onto a system giving the restoring user target_ranges
+// (an /etc/subuid and /etc/subgid line's start:count). As root, the file
+// belongs to a container user, owner IDs above the first subordinate ID.
+static int run_subid_restore(const char *target_ranges, uint32_t owner,
+                             char *output, size_t output_size,
+                             struct stat *restored)
+{
+    char source[PATH_MAX], home[PATH_MAX], subids[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_subid_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_subid_home");
+    setenv("HOME", home, 1);
+    join_path(subids, sizeof(subids), home, "subid");
+    char line[64];
+    snprintf(line, sizeof(line), "%lu:%s\n", (unsigned long)geteuid(),
+             target_ranges);
+    write_file_mode(subids, line, 0644);
+    restore_test_set_subid_files(subids, subids);
+
+    ManifestRoot root;
+    Manifest manifest;
+    make_foreign_user_manifest(&manifest, &root, ".notes");
+    manifest.source_uid = geteuid();
+    manifest.source_gid = getegid();
+    manifest.source_subuids = (SubidRanges){ .count = 1,
+                                             .ranges = { { 524288, 65536 } } };
+    manifest.source_subgids = manifest.source_subuids;
+    int ok = manifest_write_v1(source, &manifest) == 0;
+    write_payload_file(source, "data/NOTES", "file.txt", "notes");
+    remove_fixture_packages(source);
+    char file[PATH_MAX];
+    join_path(file, sizeof(file), source, "data/NOTES/file.txt");
+    if (geteuid() == 0)
+        ok = ok && chown(file, 524288 + owner, 524288 + owner) == 0;
+
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    int rc = ok ? run_restore_capturing_with_input(source, "y\n", output,
+                                                   output_size)
+                : -1;
+    dry_run = previous_dry_run;
+    char restored_path[PATH_MAX];
+    join_path(restored_path, sizeof(restored_path), home, "notes/file.txt");
+    if (stat(restored_path, restored) != 0)
+        rc = -1;
+    restore_test_set_subid_files(NULL, NULL);
+    char todo[PATH_MAX + sizeof("-todo.txt")];
+    snprintf(todo, sizeof(todo), "%s-todo.txt", source);
+    unlink(todo);
+    remove_tree(source);
+    remove_tree(home);
+    return rc;
+}
+
+// Rootless containers' files move to the restoring user's subordinate IDs
+// (D93).
+static void test_restore_moves_container_users_to_the_new_ids(void)
+{
+    printf(BLUE "::" NC " restore dispatch: container users keep their place among the new IDs\n");
+    char output[16384];
+    struct stat restored;
+    int rc = run_subid_restore("100000:65536", 42, output, sizeof(output),
+                               &restored);
+    check(rc == 0 && strstr(output, "fewer subordinate IDs") == NULL,
+          "as many IDs as before need nothing from the user");
+    if (geteuid() == 0)
+        check(restored.st_uid == 100000 + 42 && restored.st_gid == 100000 + 42,
+              "a container user's file is owned by the same place in the "
+              "new range");
+    else
+        printf("  (moving owners needs root; skipped)\n");
+
+    rc = run_subid_restore("100000:100", 142, output, sizeof(output),
+                           &restored);
+    check(rc == 0 && strstr(output, "\nWhat's left for you\n  Rootless "
+                                    "containers (Podman, Toolbox): this "
+                                    "system gives you fewer subordinate "
+                                    "IDs") != NULL &&
+              strstr(output, "Give yourself 65536 of each") != NULL,
+          "fewer IDs than before are named at the end, with how many");
+    if (geteuid() == 0)
+        check(restored.st_uid == 524288 + 142,
+              "an owner the new IDs do not reach is kept as recorded");
+}
+
 // A native restore onto another home path and locale points GTK bookmarks at
 // the new home's folders and keeps the new system's user-dirs.dirs (D86).
 static void test_native_restore_rewrites_the_source_home(void)
@@ -4813,6 +4898,7 @@ int main(void)
     test_dispatch_refuses_portable_v1();
     test_running_writer_detection();
     test_restore_gives_the_backup_users_items_to_the_restorer();
+    test_restore_moves_container_users_to_the_new_ids();
     test_native_restore_rewrites_the_source_home();
     test_open_application_settings_are_deferred();
     test_native_open_application_settings_are_deferred();

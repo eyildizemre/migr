@@ -572,10 +572,17 @@ void metadata_owner_map_apply(const OwnerMap *map, struct stat *st)
 {
     if (map == NULL || st == NULL)
         return;
+    uint32_t id;
     if (map->map_uid && st->st_uid == map->from_uid)
         st->st_uid = map->to_uid;
+    else if (subid_map(&map->from_subuids, &map->to_subuids,
+                       (uint32_t)st->st_uid, &id) == 1)
+        st->st_uid = (uid_t)id;
     if (map->map_gid && st->st_gid == map->from_gid)
         st->st_gid = map->to_gid;
+    else if (subid_map(&map->from_subgids, &map->to_subgids,
+                       (uint32_t)st->st_gid, &id) == 1)
+        st->st_gid = (gid_t)id;
 }
 
 int metadata_apply_ownership_and_mode_fd(int fd, const struct stat *desired)

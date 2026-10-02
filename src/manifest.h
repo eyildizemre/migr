@@ -7,6 +7,7 @@
 
 #include "fileops.h" /* CloneRepresentation */
 #include "selfcopy.h" /* MIGR_ARCH_MAX */
+#include "subid.h"    /* SubidRanges */
 
 /**
  * @brief Legacy manifest: an unversioned "KEY=value" file recording only XDG
@@ -147,6 +148,11 @@ typedef struct {
      * it acts for (D85). */
     int has_source_gid;
     gid_t source_gid;
+    /* The source user's subordinate IDs, which rootless containers' files
+     * are owned by (D93); none in manifests before D93 or when the system
+     * gave the user none. */
+    SubidRanges source_subuids;
+    SubidRanges source_subgids;
     int has_self_binary;
     char arch[MIGR_ARCH_MAX];
     int has_network_config;

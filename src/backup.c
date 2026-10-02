@@ -6,6 +6,7 @@
 #include <dirent.h>
 #include <limits.h>
 #include <math.h>
+#include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1747,6 +1748,17 @@ static void manifest_set_source_identity(Manifest *out)
         out->source_gid = backup_source_gid();
         out->has_source_gid = 1;
         out->has_source_identity = 1;
+        // Rootless containers' files belong to the user's subordinate IDs,
+        // which restore moves to the new system's (D93).
+        struct passwd *user = getpwuid(out->source_uid);
+        const char *name = user != NULL ? user->pw_name : NULL;
+        if (subid_ranges_read("/etc/subuid", name, out->source_uid,
+                              &out->source_subuids) != 0 ||
+            subid_ranges_read("/etc/subgid", name, out->source_uid,
+                              &out->source_subgids) != 0)
+            print_warning("Warning: Could not read /etc/subuid or "
+                          "/etc/subgid; files of rootless containers will "
+                          "keep their owners as they are.\n");
     }
 }
 
@@ -3448,6 +3460,8 @@ static int backup_run(const char *target_arg, BackupMode mode,
             prepared.manifest.has_network_config = 1;
         prepared.manifest.updated = manifest.updated;
         manifest_set_source_home(&prepared.manifest, manifest.source_home);
+        prepared.manifest.source_subuids = manifest.source_subuids;
+        prepared.manifest.source_subgids = manifest.source_subgids;
     }
     const Manifest *identity_manifest = repr == CLONE_PORTABLE_SIDECAR
         ? &prepared.manifest : &manifest;

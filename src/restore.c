@@ -9,6 +9,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <limits.h>
+#include <pwd.h>
 #include <unistd.h>
 
 #include "restore.h"
@@ -567,6 +568,18 @@ static int restore_network_config_file_at(int network_fd, int dest_dir_fd,
     return 1;
 }
 
+// Where restore reads the restoring user's subordinate IDs (D93).
+static const char *restore_subuid_path = "/etc/subuid";
+static const char *restore_subgid_path = "/etc/subgid";
+
+#ifdef RESTORE_TEST_HOOKS
+void restore_test_set_subid_files(const char *subuid, const char *subgid)
+{
+    restore_subuid_path = subuid != NULL ? subuid : "/etc/subuid";
+    restore_subgid_path = subgid != NULL ? subgid : "/etc/subgid";
+}
+#endif
+
 // The backup's user, as its manifest records it, becomes the user this
 // restore acts for, the sudo invoker as elsewhere (D38): a new system may
 // give the same person another uid (D85). Without a recorded source user,
@@ -584,7 +597,41 @@ static OwnerMap restore_owner_map(const Manifest *m)
     map.map_gid = m->has_source_gid;
     map.from_gid = m->source_gid;
     map.to_gid = gid;
+    // Rootless containers' files move from the backup user's subordinate
+    // IDs to the restoring user's (D93). Without the new system's, they
+    // keep the recorded IDs, and restore says so at the end.
+    map.from_subuids = m->source_subuids;
+    map.from_subgids = m->source_subgids;
+    if (m->source_subuids.count == 0 && m->source_subgids.count == 0)
+        return map;
+    struct passwd *user = getpwuid(uid);
+    const char *name = user != NULL ? user->pw_name : NULL;
+    if (subid_ranges_read(restore_subuid_path, name, uid,
+                          &map.to_subuids) != 0 ||
+        subid_ranges_read(restore_subgid_path, name, uid,
+                          &map.to_subgids) != 0)
+        print_warning("Warning: Could not read /etc/subuid or /etc/subgid; "
+                      "files of rootless containers keep the IDs the "
+                      "backup recorded.\n");
     return map;
+}
+
+// Says what the old system's rootless containers need when this one gives
+// the user fewer subordinate IDs (D93).
+static void restore_subid_todo(const OwnerMap *map, FILE *todo)
+{
+    uint64_t uids = subid_ranges_total(&map->from_subuids);
+    uint64_t gids = subid_ranges_total(&map->from_subgids);
+    if (todo == NULL || (subid_ranges_total(&map->to_subuids) >= uids &&
+                         subid_ranges_total(&map->to_subgids) >= gids))
+        return;
+    fprintf(todo, "  Rootless containers (Podman, Toolbox): this system gives "
+                  "you fewer subordinate IDs than the old one (/etc/subuid, "
+                  "/etc/subgid), so files of container users beyond them "
+                  "keep the old system's IDs. Give yourself %llu of each with "
+                  "sudo usermod --add-subuids and --add-subgids, then pull "
+                  "those images again.\n",
+            (unsigned long long)(uids > gids ? uids : gids));
 }
 
 // What a restore leaves for the user to do by hand: written by the steps
@@ -3785,6 +3832,7 @@ int restore_with_options(const char *source, const RestoreOptions *options)
                 restore_network_config(source_root_fd, &had_portable_error);
             restore_system_lists(source_root_fd, &todo, &had_portable_error);
             restore_login_keyring_todo(home_fd, &keyring_before, todo.stream);
+            restore_subid_todo(&request.owner_map, todo.stream);
         }
         else if (outcome == PORTABLE_RESTORE_DRY_RUN &&
                  m.has_network_config)
@@ -4123,6 +4171,7 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         restore_network_config(source_root_fd, &had_error);
     restore_system_lists(source_root_fd, &todo, &had_error);
     restore_login_keyring_todo(home_fd, &keyring_before, todo.stream);
+    restore_subid_todo(&ctx.owner_map, todo.stream);
 
     printf("\n");
     char item_phrase[64];

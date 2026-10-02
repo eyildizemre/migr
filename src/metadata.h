@@ -8,6 +8,7 @@
 #include <sys/types.h>
 
 #include "sidecar.h"
+#include "subid.h"
 
 typedef struct CloneContext CloneContext;
 
@@ -141,7 +142,8 @@ int metadata_symlink_unchanged(const struct stat *before,
 
 /**
  * @brief The backup's user, as its manifest records it, and the user a
- *        restore acts for (D85). A zeroed map changes nothing.
+ *        restore acts for (D85), with their subordinate IDs (D93). A zeroed
+ *        map changes nothing.
  */
 typedef struct {
     int map_uid;
@@ -150,10 +152,16 @@ typedef struct {
     int map_gid;
     gid_t from_gid;
     gid_t to_gid;
+    SubidRanges from_subuids;
+    SubidRanges to_subuids;
+    SubidRanges from_subgids;
+    SubidRanges to_subgids;
 } OwnerMap;
 
 /* Gives st's owner and group to the restoring user where they are the
- * backup user's; any other owner is kept as recorded. */
+ * backup user's, and moves an ID among the backup user's subordinate IDs to
+ * the same place among the restoring user's; any other owner, and one the
+ * restoring user's IDs do not reach, is kept as recorded. */
 void metadata_owner_map_apply(const OwnerMap *map, struct stat *st);
 
 int metadata_apply_fd(int fd, const struct stat *desired,
