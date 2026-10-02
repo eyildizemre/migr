@@ -1006,6 +1006,236 @@ static int native_dconf_database_fd(int source_root_fd, const Manifest *m)
     return -1;
 }
 
+#ifdef RESTORE_TEST_HOOKS
+static RestoreTestRelabelHook restore_test_relabel_hook;
+static void *restore_test_relabel_context;
+
+void restore_test_set_relabel_hook(RestoreTestRelabelHook hook, void *context)
+{
+    restore_test_relabel_hook = hook;
+    restore_test_relabel_context = context;
+}
+#endif
+
+static int selinux_runs(void)
+{
+#ifdef RESTORE_TEST_HOOKS
+    return restore_test_relabel_hook != NULL;
+#else
+    return access("/sys/fs/selinux/enforce", F_OK) == 0;
+#endif
+}
+
+typedef struct {
+    char *data;
+    size_t length;
+    size_t capacity;
+} RelabelList;
+
+static int relabel_list_add(RelabelList *list, const char *path, size_t length)
+{
+    if (list->capacity - list->length < length + 1U)
+    {
+        size_t capacity = list->capacity == 0 ? 65536U : list->capacity;
+        while (capacity - list->length < length + 1U)
+        {
+            if (capacity > SIZE_MAX / 2U)
+                return -1;
+            capacity *= 2U;
+        }
+        char *data = realloc(list->data, capacity);
+        if (data == NULL)
+            return -1;
+        list->data = data;
+        list->capacity = capacity;
+    }
+    memcpy(list->data + list->length, path, length);
+    list->data[list->length + length] = '\0';
+    list->length += length + 1U;
+    return 0;
+}
+
+// Appends root and everything below it on its filesystem, NUL-separated;
+// a mount point below root is left out with what is mounted there, and a
+// path too long for restorecon is counted in too_long.
+// The list is its own queue, so one directory is open at a time, each with
+// O_NOATIME: reading a restored folder must not change its access time.
+static int relabel_list_tree(RelabelList *list, const char *root,
+                             size_t *too_long)
+{
+    struct stat root_st;
+    if (strlen(root) >= PATH_MAX)
+    {
+        (*too_long)++;
+        return 0;
+    }
+    if (lstat(root, &root_st) != 0)
+        return errno == ENOENT ? 0 : -1; // a root with nothing restored
+    size_t cursor = list->length;
+    if (relabel_list_add(list, root, strlen(root)) != 0)
+        return -1;
+    while (cursor < list->length)
+    {
+        char path[PATH_MAX];
+        size_t length = strlen(list->data + cursor);
+        memcpy(path, list->data + cursor, length + 1U);
+        cursor += length + 1U;
+
+        // A program may remove what it wrote since the restore; that is
+        // not an error of the relabel.
+        struct stat st;
+        if (lstat(path, &st) != 0)
+        {
+            if (errno == ENOENT)
+                continue;
+            return -1;
+        }
+        if (!S_ISDIR(st.st_mode))
+            continue;
+        int fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NOATIME |
+                                O_CLOEXEC);
+        if (fd < 0 && errno == ENOENT)
+            continue;
+        DIR *dir = fd >= 0 ? fdopendir(fd) : NULL;
+        if (dir == NULL)
+        {
+            if (fd >= 0)
+                close(fd);
+            return -1;
+        }
+        int failed = 0;
+        struct dirent *entry;
+        while (!failed && (errno = 0, entry = readdir(dir)) != NULL)
+        {
+            struct stat child_st;
+            if (strcmp(entry->d_name, ".") == 0 ||
+                strcmp(entry->d_name, "..") == 0)
+                continue;
+            if (fstatat(dirfd(dir), entry->d_name, &child_st,
+                        AT_SYMLINK_NOFOLLOW) != 0)
+            {
+                failed = errno != ENOENT;
+                continue;
+            }
+            if (child_st.st_dev != root_st.st_dev)
+                continue; // a mount point
+            char child[PATH_MAX];
+            int child_length = snprintf(child, sizeof(child), "%s/%s", path,
+                                        entry->d_name);
+            if (child_length < 0 || (size_t)child_length >= sizeof(child))
+                (*too_long)++;
+            else
+                failed = relabel_list_add(list, child,
+                                          (size_t)child_length) != 0;
+        }
+        if (!failed && errno != 0)
+            failed = 1;
+        if (closedir(dir) != 0 || failed)
+            return -1;
+    }
+    return 0;
+}
+
+// Restore writes no SELinux label (D92). Where SELinux runs, the restored
+// paths get the labels this system's policy sets. migr lists them and
+// restorecon labels exactly those, without reading a folder itself; -F sets
+// whole labels, also of the types a user may customize. The listing stays on
+// each root's filesystem, so a drive mounted below a restored folder, such
+// as the backup's own, is not relabelled.
+static void restore_selinux_labels(const char *const *paths, size_t count,
+                                   int *had_error)
+{
+    if (dry_run || count == 0 || !selinux_runs())
+        return;
+
+    RelabelList list = {0};
+    size_t too_long = 0;
+    for (size_t index = 0; index < count; index++)
+        if (paths[index][0] != '\0' &&
+            relabel_list_tree(&list, paths[index], &too_long) != 0)
+        {
+            print_error("Error: Could not list %s to set its SELinux labels: "
+                        "%s\n", paths[index], strerror(errno));
+            *had_error = 1;
+            free(list.data);
+            return;
+        }
+
+    if (list.length != 0)
+    {
+        char *const argv[] = { "restorecon", "-F", "-0", "-f", "-", NULL };
+        int status;
+#ifdef RESTORE_TEST_HOOKS
+        status = restore_test_relabel_hook(argv, list.data, list.length,
+                                           restore_test_relabel_context);
+#else
+        char output[1024];
+        RunCommandOptions options = {
+            .stdin_data = list.data,
+            .stdin_length = list.length
+        };
+        status = run_command_capture_with(argv, output, sizeof(output),
+                                          &options);
+#endif
+        if (status != 0)
+        {
+            print_error("Error: Could not set SELinux labels on the restored "
+                        "files; restorecon exited with %d\n", status);
+            *had_error = 1;
+        }
+    }
+    if (too_long != 0)
+        print_warning("Warning: %zu restored path%s too long for restorecon "
+                      "keep%s the SELinux label of %s folder.\n", too_long,
+                      too_long == 1 ? " is" : "s are",
+                      too_long == 1 ? "s" : "", too_long == 1 ? "its" : "their");
+    free(list.data);
+}
+
+// Labels the roots a versioned backup restored (D92). xdg_dirs are this
+// home's user folders, as the restore resolved them.
+static void restore_selinux_label_roots(const Manifest *m, const char *home,
+                                        const char *const *xdg_dirs,
+                                        int *had_error)
+{
+    if (dry_run || m->root_count <= 0 || !selinux_runs())
+        return;
+    size_t count = (size_t)m->root_count;
+    char (*joined)[PATH_MAX] = calloc(count, sizeof(*joined));
+    const char **paths = calloc(count, sizeof(*paths));
+    if (joined == NULL || paths == NULL)
+    {
+        print_error("Error: Could not set SELinux labels on the restored "
+                    "files: out of memory\n");
+        *had_error = 1;
+        free(joined);
+        free(paths);
+        return;
+    }
+    size_t used = 0;
+    for (size_t index = 0; index < count; index++)
+    {
+        const ManifestRoot *root = &m->roots[index];
+        if (root->policy == ROOT_POLICY_HOME_RELATIVE)
+        {
+            if (root->restore_path[0] == '\0')
+                paths[used++] = home;
+            else if (path_join(joined[index], PATH_MAX, home,
+                               root->restore_path) == 0)
+                paths[used++] = joined[index];
+        }
+        else if (root->policy == ROOT_POLICY_XDG)
+        {
+            int key = xdg_key_index(root->id);
+            if (key >= 0 && xdg_dirs[key] != NULL)
+                paths[used++] = xdg_dirs[key];
+        }
+    }
+    restore_selinux_labels(paths, used, had_error);
+    free(paths);
+    free(joined);
+}
+
 static void restore_network_config(int source_root_fd, int *had_error)
 {
     int network_fd = openat(source_root_fd, "network",
@@ -1164,6 +1394,7 @@ static void restore_network_config(int source_root_fd, int *had_error)
 
         if (restored == 0)
             continue;
+        restore_selinux_labels(&dest_dir, 1, had_error);
 
         if (backend->apply_mode == NETWORK_CONFIG_APPLY_RELOAD)
             printf("  Restored %zu network connection file%s\n",
@@ -3033,18 +3264,26 @@ fail:
 // XDG folders are rewritten in the desktop-state files that store file://
 // URIs, as portable replay does while it copies them (D41, D47, D86). A file
 // this run did not write holds no source paths to replace.
-static void restore_native_rewrite_home(int home_fd, const char *home,
-                                        const Manifest *m,
-                                        const RestoreTargetMap *target_map,
-                                        int *had_error)
+// The user folders a native restore put the backup's XDG roots in.
+static void native_xdg_dirs(const Manifest *m,
+                            const RestoreTargetMap *target_map,
+                            const char *xdg_dirs[XDG_KEY_COUNT])
 {
-    const char *xdg_dirs[XDG_KEY_COUNT] = {0};
+    for (int index = 0; index < XDG_KEY_COUNT; index++)
+        xdg_dirs[index] = NULL;
     for (int index = 0; index < m->root_count; index++)
     {
         int key = xdg_key_index(m->roots[index].id);
         if (m->roots[index].policy == ROOT_POLICY_XDG && key >= 0)
             xdg_dirs[key] = target_map->roots[index].absolute;
     }
+}
+
+static void restore_native_rewrite_home(int home_fd, const char *home,
+                                        const Manifest *m,
+                                        const char *const *xdg_dirs,
+                                        int *had_error)
+{
     HomeRewritePair pairs[HOME_REWRITE_MAX_PAIRS];
     size_t pair_count = 0;
     if (home_rewrite_pairs_build(m, xdg_dirs, home, pairs, &pair_count) != 0)
@@ -3538,6 +3777,9 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         {
             // Every entry was applied, so the dependent steps still run even
             // when verification found differences; those are reported below.
+            restore_selinux_label_roots(&m, home,
+                                        (const char *const *)xdg_dirs,
+                                        &had_portable_error);
             restore_dconf_settings(dconf_database_fd, &had_portable_error);
             if (m.has_network_config)
                 restore_network_config(source_root_fd, &had_portable_error);
@@ -3862,12 +4104,20 @@ int restore_with_options(const char *source, const RestoreOptions *options)
 
     if (!dry_run && mst == MANIFEST_STATUS_VALID)
     {
-        restore_native_rewrite_home(home_fd, home, &m, &target_map,
-                                    &had_error);
+        const char *xdg_dirs[XDG_KEY_COUNT];
+        native_xdg_dirs(&m, &target_map, xdg_dirs);
+        restore_native_rewrite_home(home_fd, home, &m, xdg_dirs, &had_error);
+        restore_selinux_label_roots(&m, home, xdg_dirs, &had_error);
         int dconf_database_fd = native_dconf_database_fd(source_root_fd, &m);
         restore_dconf_settings(dconf_database_fd, &had_error);
         if (dconf_database_fd >= 0)
             close(dconf_database_fd);
+    }
+    else if (mst != MANIFEST_STATUS_VALID)
+    {
+        // An unversioned backup records no roots; its folders are in home.
+        const char *legacy_home = home;
+        restore_selinux_labels(&legacy_home, 1, &had_error);
     }
     if (mst == MANIFEST_STATUS_VALID && m.has_network_config)
         restore_network_config(source_root_fd, &had_error);

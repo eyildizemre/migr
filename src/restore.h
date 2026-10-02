@@ -21,6 +21,12 @@ typedef int (*RestoreTestNetworkQueryHook)(char *const argv[], char *output,
                                            size_t output_size, void *context);
 void restore_test_set_network_query_hook(RestoreTestNetworkQueryHook hook,
                                          void *context, long interval_ms);
+/* Runs the SELinux relabel of the restored paths (D92) in place of
+ * restorecon; paths is the NUL-separated list restorecon would read. Without
+ * a hook, a test restore treats SELinux as not running. */
+typedef int (*RestoreTestRelabelHook)(char *const argv[], const char *paths,
+                                      size_t paths_length, void *context);
+void restore_test_set_relabel_hook(RestoreTestRelabelHook hook, void *context);
 
 /* Exposes the progress display's cumulative-average speed formula
  * (total_bytes / elapsed since started_at) for direct unit testing with

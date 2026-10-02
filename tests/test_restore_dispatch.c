@@ -2850,6 +2850,98 @@ static void test_restore_of_the_login_keyring_says_to_log_out(void)
           "a restore that leaves the login keyring alone does not");
 }
 
+// The restore runs in a child process, so the relabel is recorded in a file:
+// per restorecon run, its command line, then each path it was given.
+static char relabel_record[PATH_MAX];
+
+static int record_relabel(char *const argv[], const char *paths,
+                          size_t paths_length, void *context)
+{
+    FILE *f = fopen(relabel_record, "a");
+    if (f == NULL)
+        return -1;
+    for (size_t index = 0; argv[index] != NULL; index++)
+        fprintf(f, "%s%s", index == 0 ? "" : " ", argv[index]);
+    fputc('\n', f);
+    for (size_t offset = 0; offset < paths_length;
+         offset += strlen(paths + offset) + 1U)
+        fprintf(f, "%s\n", paths + offset);
+    if (fclose(f) != 0)
+        return -1;
+    return context != NULL ? 1 : 0;
+}
+
+static int line_ends_with(const char *line, const char *suffix)
+{
+    size_t length = strlen(line), suffix_length = strlen(suffix);
+    return length >= suffix_length &&
+           strcmp(line + length - suffix_length, suffix) == 0;
+}
+
+// Whether the restore ran restorecon once, on the keyrings root it restored
+// and what is in it: the restored login.keyring and the new system's
+// other.keyring.
+static int relabelled_keyrings_once(void)
+{
+    char lines[5][PATH_MAX];
+    int count = 0;
+    FILE *f = fopen(relabel_record, "r");
+    if (f == NULL)
+        return 0;
+    char buffer[PATH_MAX];
+    while (fgets(buffer, sizeof(buffer), f) != NULL)
+    {
+        if (count < 5)
+            memcpy(lines[count], buffer, sizeof(buffer));
+        count++;
+    }
+    fclose(f);
+    unlink(relabel_record);
+    if (count != 4 || strcmp(lines[0], "restorecon -F -0 -f -\n") != 0 ||
+        lines[1][0] != '/' ||
+        !line_ends_with(lines[1], "/.local/share/keyrings\n"))
+        return 0;
+    int restored = 0, existing = 0;
+    for (int index = 2; index < count; index++)
+    {
+        restored |= line_ends_with(lines[index],
+                                   "/.local/share/keyrings/login.keyring\n");
+        existing |= line_ends_with(lines[index],
+                                   "/.local/share/keyrings/other.keyring\n");
+    }
+    return restored && existing;
+}
+
+// Where SELinux runs, the restored roots get this system's policy labels
+// (D92).
+static void test_restore_relabels_the_restored_roots(void)
+{
+    printf(BLUE "::" NC " restore dispatch: restored roots get the policy's SELinux labels\n");
+    char output[16384], record_dir[PATH_MAX];
+    fresh_mkdtemp(record_dir, sizeof(record_dir), "dispatch_relabel");
+    join_path(relabel_record, sizeof(relabel_record), record_dir, "runs");
+    static int fail;
+    restore_test_set_relabel_hook(record_relabel, NULL);
+    int rc = run_keyring_restore(1, "login.keyring", 0, 0, output,
+                                 sizeof(output));
+    check(rc == 0 && relabelled_keyrings_once(),
+          "a portable restore relabels the root it restored");
+    rc = run_keyring_restore(0, "login.keyring", 0, 0, output, sizeof(output));
+    check(rc == 0 && relabelled_keyrings_once(),
+          "a native restore relabels the root it restored");
+    rc = run_keyring_restore(0, "login.keyring", 0, 1, output, sizeof(output));
+    check(rc == 0 && access(relabel_record, F_OK) != 0,
+          "a dry run relabels nothing");
+    restore_test_set_relabel_hook(record_relabel, &fail);
+    rc = run_keyring_restore(1, "login.keyring", 0, 0, output, sizeof(output));
+    check(rc != 0 && relabelled_keyrings_once() &&
+              strstr(output, "Could not set SELinux labels on the restored "
+                             "files; restorecon exited with 1") != NULL,
+          "a failed relabel is an error of the restore");
+    restore_test_set_relabel_hook(NULL, NULL);
+    remove_tree(record_dir);
+}
+
 static void test_legacy_open_application_settings_are_deferred(void)
 {
     printf(BLUE "::" NC " restore dispatch: a legacy restore holds back an open browser's profile too\n");
@@ -4778,6 +4870,7 @@ int main(void)
 #ifdef PACKAGES_TEST_HOOKS
     test_restore_waits_for_a_network_before_packages();
 #endif
+    test_restore_relabels_the_restored_roots();
     test_network_config_restore_backend_modes();
     test_network_config_restore_dry_run();
     test_network_config_reload_failure_is_best_effort();

@@ -176,7 +176,8 @@ Append-only so an interrupted backup resumes by replaying what was recorded.
 ## D7 — 2026-07-19 — Nothing distro-specific enters the codebase
 
 **Status:** Standing principle. The generic xattr mechanism it prescribes is part of
-the sidecar work (D6) and not yet implemented.
+the sidecar work (D6) and not yet implemented. Its SELinux worked example is
+reversed by D92.
 
 **Decision:** `migr` contains no code path that exists for one distribution's
 benefit. A distro-hopping tool with distro assumptions contradicts its own purpose.
@@ -1131,7 +1132,8 @@ new nor a Phase D regression.
 
 ## D20 — 2026-08-07 — Portable and native xattr/ACL handling: generic capture and replay, no framework-specific code
 
-**Status:** Implemented (Phase E closed 2026-08-08; as-built notes below)
+**Status:** Implemented (Phase E closed 2026-08-08; as-built notes below);
+`security.selinux` is not carried since D92
 
 **Decision:** Both portable and native destinations capture and replay
 every extended attribute through the generic `getxattr`/`setxattr` family,
@@ -5364,3 +5366,66 @@ this kind.
 
 **Relationship:** Changes D46's apt command.
 
+---
+
+## D92 — 2026-10-02 — SELinux labels come from the restoring system's policy
+
+**Status:** Implemented
+
+**Decision:** migr does not carry SELinux labels.
+- **Backup** records no `security.selinux`. Portable capture leaves it out of
+  the sidecar; a native backup's copies keep the label the backup's own
+  filesystem gives them.
+- **Restore** neither writes nor removes one. A restored object keeps the
+  label the kernel gave it when restore created it, and a label recorded by
+  an earlier backup is ignored.
+- **Where SELinux runs** (`/sys/fs/selinux` is mounted), restore then gives
+  every restored path the label this system's policy sets: the roots it
+  restored, once the home rewrite (D86) is done, and a network configuration
+  folder it wrote into (D33). migr lists the paths and runs
+  `restorecon -F -0 -f -` on that list. `-F` sets the whole label, also of
+  the types a user may customize. The listing opens each folder with
+  `O_NOATIME`, since a folder restorecon read itself would lose its restored
+  access time, and stays on each root's filesystem, so a drive mounted below
+  a restored folder, such as the backup's own, is left alone. A failed
+  relabel is an error of the restore.
+- Other `security.*` attributes are carried as D20 describes.
+
+**Why:** A label is what a system's policy assigns to a path, not data of
+the file. Carried, it broke restores in both directions:
+- **Onto a system without SELinux**, root may write any `security.*` value,
+  so a Fedora backup's labels landed on Ubuntu and Arch as plain attributes.
+  A rootless container copies a file's attributes the first time it writes
+  to it, and a user namespace may not write `security.*`: no container from
+  the restored images started. Any unprivileged copy that keeps attributes
+  (`cp -a`, `rsync -X`) meets the same refusal.
+- **Onto a system with SELinux**, a file restored without a label took its
+  folder's: a container volume's data from an Ubuntu backup got
+  `data_home_t` instead of `container_file_t`, and the container could not
+  read it until it was relabelled. `~/.ssh` without `ssh_home_t` is the same
+  case for sshd.
+- **Between releases**, a recorded label is the old policy's; the restoring
+  system's policy is the one that applies.
+
+Checked on Fedora 44 with every restored path relabelled this way: a
+restored rootless container, whose writable layer became
+`container_ro_file_t` on disk, started and wrote to it, since podman mounts
+a container's files with its own label.
+
+**Limits:** A label set by hand with `chcon` is not kept. SELinux itself
+drops such labels on every relabel; lasting ones are `semanage fcontext`
+rules under `/etc`, outside the backup.
+
+**Rejected:**
+- Writing recorded labels only where SELinux runs and relabelling only what
+  has none: three cases for one attribute, and a recorded label is still
+  the old policy's.
+- `restorecon -R` on the roots: it reads every restored folder, which sets
+  their access times to the time of the restore.
+- Looking labels up with libselinux: Arch's repositories do not carry it,
+  and the static build (D9) could not load it at run time.
+
+**Relationship:** Reverses D7's worked example: the label is the policy's,
+so the policy's own tool sets it, on any distribution where SELinux runs.
+Ends D20 E-10 for `security.selinux`; E-8's removal tolerance and E-11's
+count no longer meet it.

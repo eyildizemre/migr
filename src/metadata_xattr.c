@@ -177,6 +177,19 @@ unsigned int metadata_xattr_namespace_bytes(const unsigned char *name,
     return 0;
 }
 
+int metadata_xattr_is_selinux_label(const unsigned char *name, size_t length)
+{
+    static const char label[] = "security.selinux";
+    return name != NULL && length == sizeof(label) - 1U &&
+           memcmp(name, label, length) == 0;
+}
+
+static int metadata_xattr_selinux_label(const char *name)
+{
+    return metadata_xattr_is_selinux_label((const unsigned char *)name,
+                                           strlen(name));
+}
+
 static unsigned int metadata_xattr_namespace(const char *name)
 {
     if (name == NULL)
@@ -266,7 +279,8 @@ static int metadata_apply_xattrs_target(const MetadataXattrTarget *target,
     {
         char *name = existing_names + offset;
         size_t name_length = strlen(name);
-        if (!metadata_xattr_input_contains(xattrs, count, name))
+        if (!metadata_xattr_selinux_label(name) &&
+            !metadata_xattr_input_contains(xattrs, count, name))
         {
             if (metadata_xattr_remove(target, name) != 0)
             {
@@ -303,6 +317,10 @@ static int metadata_apply_xattrs_target(const MetadataXattrTarget *target,
     for (size_t index = 0; index < count; index++)
     {
         const SidecarXattr *current = &xattrs[index];
+        // A backup taken before D92 holds the source system's label.
+        if (metadata_xattr_is_selinux_label(current->name.data,
+                                            current->name.length))
+            continue;
         char *name = malloc(current->name.length + 1U);
         if (name == NULL)
         {

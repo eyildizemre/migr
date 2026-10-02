@@ -121,7 +121,7 @@ the scope recorded in the backup instead.
 ## Backing up
 
 `backup` runs as root so it can read everything in your home and keep every
-owner and label. Under `sudo` it still backs up your home, not root's, and the
+owner. Under `sudo` it still backs up your home, not root's, and the
 backup belongs to you: you can look at it, preview a restore from it, and
 delete it without `sudo`.
 
@@ -285,6 +285,10 @@ it.
 
 **Your files stay yours.** What belonged to you in the backup belongs to you
 on the new system, even when it gives your account another user ID.
+
+**SELinux labels come from the new system.** Where SELinux runs, restore gives
+the restored files the labels its policy sets, as `restorecon` does. Backups
+do not carry labels, so one set by hand with `chcon` is not kept.
 
 **Open applications.** When restore runs while you are logged in to the
 desktop, VS Code, the common browsers, and Flatpak applications may be open.

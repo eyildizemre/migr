@@ -597,6 +597,11 @@ int collect_xattrs(int fd, PortableXattrs *out)
             xattrs_free(out);
             return -1;
         }
+        if (metadata_xattr_is_selinux_label(
+                (const unsigned char *)names + offset, name_length)) {
+            offset += name_length + 1U;
+            continue;
+        }
         if (xattrs_reserve(out, 1) != 0) {
             free(names);
             xattrs_free(out);
@@ -685,6 +690,11 @@ int collect_symlink_xattrs(const char *path, PortableXattrs *out)
             free(names);
             xattrs_free(out);
             return -1;
+        }
+        if (metadata_xattr_is_selinux_label(
+                (const unsigned char *)names + offset, name_length)) {
+            offset += name_length + 1U;
+            continue;
         }
         if (xattrs_reserve(out, 1) != 0) {
             free(names);

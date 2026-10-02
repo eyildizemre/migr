@@ -107,6 +107,13 @@ int metadata_xattr_namespaces_path(const char *path, unsigned int *out);
 unsigned int metadata_xattr_namespace_bytes(const unsigned char *name,
                                             size_t length);
 
+/*
+ * Whether an xattr name is the SELinux label. Labels are not carried: capture
+ * leaves them out, replay neither writes nor removes one, and a restore where
+ * SELinux runs sets them from the policy (D92).
+ */
+int metadata_xattr_is_selinux_label(const unsigned char *name, size_t length);
+
 #ifdef METADATA_TEST_HOOKS
 typedef void (*MetadataTestProbeHook)(void *context);
 

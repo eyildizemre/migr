@@ -41,6 +41,7 @@
 
 #include "fileops.h"
 #include "metadata.h"
+#include "portable.h"
 #include "utils.h"
 
 #define GREEN "\033[0;32m"
@@ -1429,6 +1430,69 @@ static void test_metadata_apply_xattrs_tolerates_foreign_security(void)
     remove_tree(base);
 }
 
+static void test_selinux_label_not_carried(void)
+{
+    const char *case_name = "xattr-selinux-label";
+    char base[PATH_MAX];
+    if (!make_shm_root(base, sizeof(base)))
+    {
+        skip_case(case_name, "a private tmpfs fixture is unavailable");
+        return;
+    }
+
+    char path[PATH_MAX];
+    join_or_die(path, sizeof(path), base, "entry");
+    write_file(path, "selinux-label");
+    unsigned char label[256];
+    ssize_t label_length = get_xattr_value(path, "security.selinux", label,
+                                           sizeof(label), 0);
+    if (label_length < 0)
+    {
+        skip_case(case_name, "the fixture carries no SELinux label");
+        remove_tree(base);
+        return;
+    }
+
+    int fd = open(path, O_WRONLY);
+    if (fd < 0)
+        fatal("could not open the selinux-label fixture");
+    PortableXattrs collected = {0};
+    int found = 0;
+    if (collect_xattrs(fd, &collected) != 0)
+        fatal("could not collect the selinux-label fixture's xattrs");
+    for (size_t index = 0; index < collected.count; index++)
+        if (metadata_xattr_is_selinux_label(collected.items[index].name.data,
+                                            collected.items[index].name.length))
+            found = 1;
+    xattrs_free(&collected);
+    check_result(!found, case_name,
+                 "capture leaves the SELinux label out (D92)");
+
+    /* A backup taken before D92 holds the source system's label. */
+    static const unsigned char name[] = "security.selinux";
+    static const unsigned char foreign[] = "system_u:object_r:migr_foreign_t:s0";
+    SidecarXattr recorded = {
+        .name = { .data = name, .length = sizeof(name) - 1U },
+        .value = { .data = foreign, .length = sizeof(foreign) }
+    };
+    size_t skipped_security = SIZE_MAX;
+    check_result(metadata_apply_xattrs_fd_report(fd, &recorded, 1,
+                                                 &skipped_security) == 0 &&
+                     skipped_security == 0,
+                 case_name, "a recorded label is neither written nor counted "
+                            "as skipped");
+    skipped_security = SIZE_MAX;
+    check_result(metadata_apply_xattrs_fd_report(fd, NULL, 0,
+                                                 &skipped_security) == 0 &&
+                     skipped_security == 0,
+                 case_name, "the destination's own label is not removed");
+    check_result(xattr_value_equals(path, "security.selinux", label,
+                                    (size_t)label_length, 0),
+                 case_name, "the destination keeps the label it had");
+    close(fd);
+    remove_tree(base);
+}
+
 static void test_metadata_apply_xattrs_tolerates_security_set(void)
 {
     const char *case_name = "xattr-security-set";
@@ -1710,6 +1774,7 @@ int main(void)
     test_metadata_xattr_capability_probe();
     test_metadata_xattr_gate_no_unrelated_namespace();
     test_metadata_apply_xattrs_tolerates_foreign_security();
+    test_selinux_label_not_carried();
     test_metadata_apply_xattrs_tolerates_security_set();
     test_metadata_xattr_gate_trusted_refusal();
     test_metadata_apply_split_equivalence();
