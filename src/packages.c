@@ -323,7 +323,7 @@ void read_package_list(FILE *pkg_file, char ***pkgs_out, int *pkg_count_out,
     *pkg_count_out = pkg_count;
 }
 
-enum { PACKAGE_INSTALL_PREFIX_MAX = 4 };
+enum { PACKAGE_INSTALL_PREFIX_MAX = 6 };
 
 static size_t package_install_prefix(distro_t distro,
                                      char *prefix[PACKAGE_INSTALL_PREFIX_MAX])
@@ -332,11 +332,16 @@ static size_t package_install_prefix(distro_t distro,
     {
         // restore runs as root (D62), so these need no sudo of their own.
         case DISTRO_DEBIAN:
-            prefix[0] = "apt-get";
-            prefix[1] = "install";
-            prefix[2] = "-y";
-            prefix[3] = "-m";
-            return 4U;
+            // A package's debconf question would stop the restore until
+            // answered; unasked, each keeps its default or current answer
+            // (D91).
+            prefix[0] = "env";
+            prefix[1] = "DEBIAN_FRONTEND=noninteractive";
+            prefix[2] = "apt-get";
+            prefix[3] = "install";
+            prefix[4] = "-y";
+            prefix[5] = "-m";
+            return 6U;
         case DISTRO_FEDORA:
             prefix[0] = "dnf";
             prefix[1] = "install";

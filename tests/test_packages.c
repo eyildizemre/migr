@@ -510,7 +510,8 @@ static void test_restore_packages_batch_prefixes(void)
     printf(BLUE "::" NC " restore_packages uses one native install transaction\n");
 
     static const char *const debian_prefix[] = {
-        "apt-get", "install", "-y", "-m"
+        "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y",
+        "-m"
     };
     static const char *const fedora_prefix[] = {
         "dnf", "install", "-y", "--skip-unavailable"
@@ -745,7 +746,8 @@ static void test_restore_packages_single_pass_accounting(void)
           "an already-installed Arch package need not be available in sync databases to count as restored");
 
     static const char *const debian_prefix[] = {
-        "apt-get", "install", "-y", "-m"
+        "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y",
+        "-m"
     };
     PackageRunFixture debian_status = {
         .expected_prefix = debian_prefix,

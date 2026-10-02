@@ -3828,7 +3828,7 @@ and keeping the parallel path as an unmeasured optional branch.
 
 ## D46 — 2026-09-11 — Package restore uses one install transaction and verifies final state
 
-**Status:** Implemented
+**Status:** Implemented; apt runs without questions since D91
 
 **Decision:** Package restore performs at most one real install transaction per
 restore. Debian/Ubuntu keeps `apt-get install -y -m`. Fedora/RHEL adds
@@ -5338,3 +5338,29 @@ D33's manual apply.
 
 **Relationship:** Changes the order of D33's restore; D78 lists what could not
 be installed.
+
+---
+
+## D91 — 2026-10-02 — apt installs without asking
+
+**Status:** Implemented
+
+**Decision:** Restore runs apt as `env DEBIAN_FRONTEND=noninteractive apt-get
+install -y -m`. A package's debconf questions are not asked: each takes its
+default, or the answer the system already holds.
+
+**Why:** `-y` answers apt's own confirmation, not the questions packages ask
+while they are configured. With the terminal attached, the first such question
+stops the restore until someone answers it. A backup taken under another
+desktop does this: on Ubuntu 26.04 Desktop, installing `sddm` from a KDE
+backup stopped at "Default display manager: 1. gdm3 2. sddm", and on a text
+console (D89) that is a dialog in the middle of a restore. Non-interactively,
+installing `sddm` and then `lightdm` kept gdm3 as the default
+(`/etc/X11/default-display-manager`, `display-manager.service`), and GDM
+started after a reboot. dnf (`-y`) and pacman (`--noconfirm`) ask nothing of
+this kind.
+
+**Limits:** Another answer is set afterwards with `dpkg-reconfigure <package>`.
+
+**Relationship:** Changes D46's apt command.
+
