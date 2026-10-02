@@ -700,27 +700,27 @@ static void run_matrix_case(const MatrixCase *test_case)
             read_link_target_or_die(restore_path, before_target,
                                     sizeof(before_target));
             if (lstat(restore_path, &before) != 0)
-                fatal("could not inspect the restored symlink before refusal");
+                fatal("could not inspect the restored symlink before a rerun");
             int source_fd = open_directory(capture_root);
             int destination_fd = open_directory(restore_root);
             check_result(restore_native_at(&RESTORE_CTX, source_fd, "entry",
-                                           destination_fd, "entry") != 0,
+                                           destination_fd, "entry") == 0,
                          test_case->name,
-                         "restore refuses an existing final symlink");
+                         "restore replaces an existing final symlink (D96)");
             close(source_fd);
             close(destination_fd);
             if (lstat(restore_path, &after) != 0)
-                fatal("could not inspect the restored symlink after refusal");
+                fatal("could not inspect the restored symlink after a rerun");
             read_link_target_or_die(restore_path, after_target,
                                     sizeof(after_target));
-            check_result(before.st_dev == after.st_dev &&
-                             before.st_ino == after.st_ino &&
-                             same_core_times(&before, &after),
+            // Reading the backup's symlink moved its access time (D17), so
+            // only the target and modification time must come back alike.
+            check_result(S_ISLNK(after.st_mode) &&
+                             same_timespec(before.st_mtim, after.st_mtim) &&
+                             strcmp(before_target, after_target) == 0,
                          test_case->name,
-                         "restore refusal leaves symlink metadata untouched");
-            check_result(strcmp(before_target, after_target) == 0,
-                         test_case->name,
-                         "restore refusal leaves symlink target untouched");
+                         "a rerun leaves the same symlink target and "
+                         "modification time");
         }
     }
 

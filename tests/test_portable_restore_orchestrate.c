@@ -1324,14 +1324,6 @@ static int write_link_rerun_sidecar(Fixture *fixture)
     return write_sidecar(fixture, entries, 4);
 }
 
-static int symlink_target_is(const char *path, const char *expected)
-{
-    char target[PATH_MAX];
-    ssize_t length = readlink(path, target, sizeof(target));
-    return length >= 0 && (size_t)length == strlen(expected) &&
-           memcmp(target, expected, (size_t)length) == 0;
-}
-
 static void test_link_rerun_is_idempotent(void)
 {
     printf(BLUE "::" NC " portable restore rerun over its own links\n");
@@ -1376,9 +1368,9 @@ static void test_link_rerun_is_idempotent(void)
     fixture_close(&fixture);
 }
 
-static void test_link_rerun_refuses_different_symlink(void)
+static void test_link_replaces_a_different_symlink(void)
 {
-    printf(BLUE "::" NC " portable restore refuses a different existing symlink\n");
+    printf(BLUE "::" NC " portable restore replaces a symlink with another target\n");
     ManifestRoot root = root_for();
     Fixture fixture;
     int opened = fixture_open(&fixture, &root);
@@ -1397,10 +1389,10 @@ static void test_link_rerun_refuses_different_symlink(void)
 
     PortableRestoreReplayReport report;
     int result = run_orchestration(&fixture, &report, 1, "y\n");
-    check(result != 0 && report.applied_count == 0,
-          "a symlink with a different target is still refused");
-    check(symlink_target_is(link, "elsewhere"),
-          "the refused symlink is left untouched");
+    check(result == 0 && report.failed_count == 0 &&
+              symlink_exact(link, "representative", 0777, geteuid(),
+                            getegid(), 1700000830, 7, 1700000831, 8),
+          "the backup's symlink, with its metadata, takes the other's place");
     fixture_close(&fixture);
 }
 
@@ -2807,7 +2799,7 @@ int main(void)
     test_security_xattr_tolerance_orchestration();
     test_hardlink_orchestration();
     test_link_rerun_is_idempotent();
-    test_link_rerun_refuses_different_symlink();
+    test_link_replaces_a_different_symlink();
     test_link_rerun_refuses_foreign_hardlink_name();
     test_failed_replay_finalizes_prepared_directories();
     test_confirmation_hook();

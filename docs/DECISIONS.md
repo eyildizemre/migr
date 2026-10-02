@@ -5565,3 +5565,35 @@ and removing the package that pulled it in let autoremove remove it too.
 
 **Relationship:** Extends D46: one install transaction, accounting from the
 final state. Uses D12's export commands.
+
+---
+
+## D96 — 2026-10-03 — A backed-up symlink replaces the new system's symlink
+
+**Status:** Implemented
+
+**Decision:** Where the backup has a symlink and the new system already has
+a symlink at the same path, restore puts the backup's symlink there. The
+existing link itself is removed and the backup's created in its place; it is
+never written through. Portable restore keeps treating a link with the
+backup's target as the entry already restored. Where the backup has a file
+or folder and the new system has a symlink, restore still refuses before
+writing anything and names the path; any other object where the backup has
+a symlink still fails that entry.
+
+**Why:** Fresh installs create symlinks in the home before restore runs.
+Ubuntu 26.04 Desktop has three snap user-service links under
+`~/.config/systemd/user/*.wants/`; Fedora 44 KDE has
+`~/.local/share/akonadi/socket-<hostname>-default`, pointing to
+`/run/user/<uid>/akonadi`. The same links are in a backup of such a system.
+Native restore refused every existing destination symlink, so restoring an
+Ubuntu backup onto a fresh Ubuntu stopped before writing anything, naming one
+link per run; portable restore stopped on a link whose target differed, such
+as Akonadi's under another UID. Replacing a symlink writes nothing through
+it, which is what the refusal guards against. A symlink where the backup has
+a file or folder is not part of a fresh install: restore runs right after
+installing, with nothing in between.
+
+**Relationship:** Keeps D17's no-follow handling of destinations; narrows the
+refusal of an existing destination symlink to file and folder entries.
+

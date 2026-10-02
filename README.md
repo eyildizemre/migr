@@ -236,9 +236,12 @@ restoring from it.
 ## Restoring
 
 Restore runs as root, like backup, and restores into your home, not root's.
-It is meant for a freshly installed system: it replaces files the new system
-already has at the same paths (a new install's default `.bashrc`, for example)
-with your backed-up ones; a symlink in the way is refused and named.
+It is meant for a freshly installed system: install it, start it, connect
+whatever holds the backup, and run restore, with nothing in between. It
+replaces files the new system already has at the same paths (a new install's
+default `.bashrc`, for example) with your backed-up ones, and its symlinks
+with your backed-up symlinks; a symlink where the backup has a file or folder
+is refused and named.
 
 Before writing anything, restore checks the whole backup and the destination,
 shows when the backup was taken and how much room it needs, and asks once.

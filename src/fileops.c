@@ -3053,9 +3053,12 @@ static RestoreNativeStatus restore_entry_symlink(
     MetadataXattrRequirements *xattr_requirements,
     int skip_symlink_target_read, RestoreNativeReport *restore_report,
     int source_is_root, int dest_is_root, int dest_exists,
-    int source_object_fd, struct stat desired_st)
+    const struct stat *dest_st, int source_object_fd, struct stat desired_st)
 {
-        if (source_is_root || dest_is_root || dest_exists)
+        // The backup's symlink takes the place of a symlink the new system
+        // has there (D96); any other object there stays and fails it.
+        if (source_is_root || dest_is_root ||
+            (dest_exists && !S_ISLNK(dest_st->st_mode)))
         {
             close(source_object_fd);
             restore_report_failure(restore_report, logical_path);
@@ -3129,7 +3132,9 @@ static RestoreNativeStatus restore_entry_symlink(
             restore_report_failure(restore_report, logical_path);
             return RESTORE_NATIVE_ERROR;
         }
-        if (symlinkat(target, dest_parent_fd, dest_leaf) != 0)
+        if ((dest_exists && unlinkat(dest_parent_fd, dest_leaf, 0) != 0 &&
+             errno != ENOENT) ||
+            symlinkat(target, dest_parent_fd, dest_leaf) != 0)
         {
             xattrs_free(&xattrs);
             restore_report_failure(restore_report, logical_path);
@@ -3581,7 +3586,9 @@ static RestoreNativeStatus restore_entry_at(
         restore_report_failure(restore_report, logical_path);
         return -1;
     }
-    if (dest_exists && S_ISLNK(dest_st.st_mode))
+    // Restore never writes through a symlink; only a symlink from the backup
+    // may replace one (D96).
+    if (dest_exists && S_ISLNK(dest_st.st_mode) && !S_ISLNK(source_st.st_mode))
     {
         print_destination_symlink_refusal(dest_parent_fd, dest_leaf);
         close(source_object_fd);
@@ -3643,7 +3650,7 @@ static RestoreNativeStatus restore_entry_at(
                                      profiles, estimate, xattr_requirements,
                                      skip_symlink_target_read, restore_report,
                                      source_is_root, dest_is_root, dest_exists,
-                                     source_object_fd, desired_st);
+                                     &dest_st, source_object_fd, desired_st);
 
     if (S_ISREG(source_st.st_mode))
         return restore_entry_regular(ctx, pass, source_parent_fd, source_leaf,

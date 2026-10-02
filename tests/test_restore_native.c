@@ -229,7 +229,7 @@ static void test_rejects_final_destination_symlink(void)
     int dest_fd = open_dir_fd(dest_root);
 
     int rc = restore_native_at(&RESTORE_CTX, source_fd, "note.txt", dest_fd, "note.txt");
-    check(rc != 0, "restoring onto an existing destination symlink is refused, regardless of source type");
+    check(rc != 0, "restoring a file onto an existing destination symlink is refused");
 
     char content[64];
     read_file(sentinel_path, content, sizeof(content));
@@ -238,6 +238,59 @@ static void test_rejects_final_destination_symlink(void)
     struct stat st;
     check(lstat(link_path, &st) == 0 && S_ISLNK(st.st_mode),
           "the destination symlink itself is left in place, never replaced");
+
+    close(source_fd);
+    close(dest_fd);
+    remove_tree(source_root);
+    remove_tree(dest_root);
+    remove_tree(outside_root);
+}
+
+static int link_target_is(const char *path, const char *expected)
+{
+    char target[PATH_MAX];
+    ssize_t length = readlink(path, target, sizeof(target));
+    return length >= 0 && (size_t)length == strlen(expected) &&
+           memcmp(target, expected, (size_t)length) == 0;
+}
+
+static void test_backup_symlink_replaces_a_destination_symlink(void)
+{
+    printf(BLUE "::" NC " restore_native_at: the backup's symlink replaces a symlink at its place\n");
+
+    char source_root[PATH_MAX], dest_root[PATH_MAX], outside_root[PATH_MAX];
+    fresh_mkdtemp(source_root, sizeof(source_root), "restore_src");
+    fresh_mkdtemp(dest_root, sizeof(dest_root), "restore_dst");
+    fresh_mkdtemp(outside_root, sizeof(outside_root), "restore_outside");
+    char sentinel[PATH_MAX];
+    join_path(sentinel, sizeof(sentinel), outside_root, "secret.txt");
+    write_file(sentinel, "do-not-touch");
+
+    char source_link[PATH_MAX], other[PATH_MAX], same[PATH_MAX];
+    join_path(source_link, sizeof(source_link), source_root, "link");
+    join_path(other, sizeof(other), dest_root, "other");
+    join_path(same, sizeof(same), dest_root, "same");
+    check(symlink("backup-target", source_link) == 0 &&
+              symlink(sentinel, other) == 0 &&
+              symlink("backup-target", same) == 0,
+          "fixture: the backup's symlink, and the new system's symlinks "
+          "with another target and with the same one");
+
+    int source_fd = open_dir_fd(source_root);
+    int dest_fd = open_dir_fd(dest_root);
+
+    check(restore_native_at(&RESTORE_CTX, source_fd, "link", dest_fd,
+                            "other") == 0 &&
+              link_target_is(other, "backup-target"),
+          "a symlink with another target is replaced by the backup's");
+    char content[64];
+    read_file(sentinel, content, sizeof(content));
+    check(strcmp(content, "do-not-touch") == 0,
+          "the replaced symlink's target is never written through");
+    check(restore_native_at(&RESTORE_CTX, source_fd, "link", dest_fd,
+                            "same") == 0 &&
+              link_target_is(same, "backup-target"),
+          "a symlink with the same target stays the backup's symlink");
 
     close(source_fd);
     close(dest_fd);
@@ -1145,6 +1198,7 @@ int main(void)
 
     test_rejects_destination_intermediate_symlink_escape();
     test_rejects_final_destination_symlink();
+    test_backup_symlink_replaces_a_destination_symlink();
     test_rejects_source_intermediate_symlink_redirect();
     test_recreates_source_leaf_symlink_without_following();
 
