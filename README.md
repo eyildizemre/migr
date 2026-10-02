@@ -359,6 +359,10 @@ read-back. `--dry-run` shows what would be restored and writes nothing.
   homes are not.
 - **Package names across families.** A package named differently on the new
   distribution is not translated; it is listed for you to install.
+- **Leaving out another desktop's packages.** Restore installs every package
+  in the backup. Restored onto another desktop, it installs the old desktop's
+  packages too; they do not change the desktop you log in to, and removing
+  them is left to you.
 - **Unknown distributions.** Outside the Debian, Fedora, and Arch families
   (below), files are migrated but packages are not.
 - **Snap** applications and their data.
@@ -367,9 +371,11 @@ read-back. `--dry-run` shows what would be restored and writes nothing.
 - **Custom locations.** `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, and
   `XDG_STATE_HOME` set elsewhere than their defaults, and zsh's `ZDOTDIR`, are
   not followed yet.
-- **Paths outside your home.** Listed explicitly, they can be backed up only
-  to a Linux filesystem, and restore does not put them back: it shows where
-  they came from and where the backup holds them.
+- **Paths outside your home.** migr does not look for your files outside your
+  home: a folder a tool keeps elsewhere, such as XAMPP's `/opt/lampp/htdocs`,
+  is yours to copy. Listed explicitly, such paths can be backed up only to a
+  Linux filesystem, and restore does not put them back: it shows where they
+  came from and where the backup holds them.
 
 ### Supported distributions
 
