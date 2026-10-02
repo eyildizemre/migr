@@ -230,7 +230,7 @@ containers_matching() {
         else
             [[ "$leaf" == *.partial ]] && continue
         fi
-        [[ "$leaf" =~ ^migr-[A-Za-z0-9._-]+$ ]] && printf '%s\n' "$entry"
+        [[ "$leaf" =~ ^migr-[[:alnum:]._-]+$ ]] && printf '%s\n' "$entry"
     done
     shopt -u nullglob
 }
