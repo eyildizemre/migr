@@ -511,10 +511,9 @@ static char *package_arch_available(int *had_error)
     return package_capture_query(query, "Arch package availability", had_error);
 }
 
-static size_t package_build_install_argv(char **argv, char *const *prefix,
-                                         size_t prefix_count, char **pkgs,
-                                         size_t pkg_count,
-                                         const char *arch_available)
+static size_t package_build_argv(char **argv, char *const *prefix,
+                                 size_t prefix_count, char **pkgs,
+                                 size_t pkg_count, const char *arch_available)
 {
     for (size_t index = 0; index < prefix_count; index++)
         argv[index] = prefix[index];
@@ -532,22 +531,13 @@ static size_t package_build_install_argv(char **argv, char *const *prefix,
     return install_count;
 }
 
-// Counts the packages the system has now and lists the others in todo under
+// Counts the packages inventory has and lists the others in todo under
 // heading.
-static int package_account_final_state(distro_t distro, char **pkgs,
-                                       size_t pkg_count, FILE *todo,
-                                       const char *heading, int *installed,
-                                       int *skipped, int *had_error)
+static void package_account_final_state(distro_t distro, const char *inventory,
+                                        char **pkgs, size_t pkg_count,
+                                        FILE *todo, const char *heading,
+                                        int *installed, int *skipped)
 {
-    char *const *query = package_installed_query(distro);
-    if (query == NULL)
-        return -1;
-
-    char *inventory = package_capture_query(query, "installed packages",
-                                            had_error);
-    if (inventory == NULL)
-        return -1;
-
     for (size_t index = 0; index < pkg_count; index++)
     {
         if (package_inventory_contains(distro, inventory, pkgs[index]))
@@ -562,9 +552,6 @@ static int package_account_final_state(distro_t distro, char **pkgs,
     }
     if (*skipped != 0)
         fprintf(todo, "\n");
-
-    free(inventory);
-    return 0;
 }
 
 // Opens a list at the container root (never inside data/: it is a control
@@ -642,12 +629,124 @@ static void package_install_batch(distro_t distro, char *const *prefix,
     if (distro != DISTRO_ARCH ||
         (arch_available = package_arch_available(had_error)) != NULL)
     {
-        if (package_build_install_argv(argv, prefix, prefix_count, pkgs,
-                                       pkg_count, arch_available) != 0)
+        if (package_build_argv(argv, prefix, prefix_count, pkgs, pkg_count,
+                               arch_available) != 0)
             (void)package_run_command(argv);
     }
     free(arch_available);
     free(argv);
+}
+
+// Marks installed packages as explicitly installed. The backup listed them
+// as such, but here something else pulled them in; unmarked, the next backup
+// would leave them out and autoremove could take them away (D95). The
+// command's output is a state change, not progress, so only errors show.
+static void package_mark_explicit(distro_t distro, char **pkgs,
+                                  size_t pkg_count)
+{
+    static char *const debian_mark[] = {"apt-mark", "manual"};
+    static char *const fedora_mark[] = {"dnf", "-y", "-q", "mark", "user"};
+    static char *const arch_mark[] = {"pacman", "-D", "--asexplicit"};
+    char *const *prefix;
+    size_t prefix_count;
+    switch (distro)
+    {
+        case DISTRO_DEBIAN:
+            prefix = debian_mark;
+            prefix_count = sizeof(debian_mark) / sizeof(debian_mark[0]);
+            break;
+        case DISTRO_FEDORA:
+            prefix = fedora_mark;
+            prefix_count = sizeof(fedora_mark) / sizeof(fedora_mark[0]);
+            break;
+        case DISTRO_ARCH:
+            prefix = arch_mark;
+            prefix_count = sizeof(arch_mark) / sizeof(arch_mark[0]);
+            break;
+        default:
+            return;
+    }
+
+    char **argv = malloc((prefix_count + pkg_count + 1U) * sizeof(*argv));
+    int failed = argv == NULL;
+    if (!failed)
+    {
+        char output[4096];
+        package_build_argv(argv, prefix, prefix_count, pkgs, pkg_count, NULL);
+        failed = package_capture_command(argv, output, sizeof(output)) != 0;
+    }
+    if (failed)
+        print_warning("Warning: Could not mark %zu installed package(s) as "
+                      "explicitly installed.\n", pkg_count);
+    free(argv);
+}
+
+// Installs the listed packages the system lacks, marks the ones it has, and
+// accounts for the list from the final state (D46, D95). Packages already
+// there never reach the package manager, which would print a line for each.
+// Returns -1 when the installed state cannot be read.
+static int package_restore_list(distro_t distro, char *const *prefix,
+                                size_t prefix_count, char **pkgs,
+                                size_t pkg_count, int online, FILE *todo,
+                                int *installed, int *skipped, int *had_error)
+{
+    char *const *query = package_installed_query(distro);
+    char *inventory = package_capture_query(query, "installed packages",
+                                            had_error);
+    if (inventory == NULL)
+        return -1;
+    char *explicit_list = package_capture_query(
+        get_package_cmd(distro), "explicitly installed packages", had_error);
+    char **missing = malloc(pkg_count * sizeof(*missing));
+    char **unmarked = malloc(pkg_count * sizeof(*unmarked));
+    if (missing == NULL || unmarked == NULL)
+    {
+        print_error("Error: Could not allocate the package lists\n");
+        *had_error = 1;
+        free(missing);
+        free(unmarked);
+        free(explicit_list);
+        free(inventory);
+        return -1;
+    }
+
+    size_t missing_count = 0, unmarked_count = 0;
+    for (size_t index = 0; index < pkg_count; index++)
+    {
+        if (!package_inventory_contains(distro, inventory, pkgs[index]))
+            missing[missing_count++] = pkgs[index];
+        else if (explicit_list != NULL &&
+                 !package_plain_list_contains(explicit_list, pkgs[index]))
+            unmarked[unmarked_count++] = pkgs[index];
+    }
+    if (unmarked_count != 0)
+        package_mark_explicit(distro, unmarked, unmarked_count);
+
+    if (online && missing_count != 0)
+    {
+        printf("  %zu of %zu are already installed; installing %zu (this may "
+               "take a while)...\n",
+               pkg_count - missing_count, pkg_count, missing_count);
+        package_install_batch(distro, prefix, prefix_count, missing,
+                              missing_count, had_error);
+        free(inventory);
+        inventory = package_capture_query(query, "installed packages",
+                                          had_error);
+    }
+    if (inventory != NULL)
+        package_account_final_state(
+            distro, inventory, pkgs, pkg_count, todo,
+            online ? "Packages this system could not install, often from a "
+                     "repository it does not have yet:"
+                   : "Packages to install once this system is online:",
+            installed, skipped);
+
+    int result = inventory != NULL ? 0 : -1;
+    free(missing);
+    free(unmarked);
+    free(explicit_list);
+    free(inventory);
+    return result;
 }
 
 void restore_packages(int source_root_fd, int online, FILE *todo,
@@ -678,9 +777,7 @@ void restore_packages(int source_root_fd, int online, FILE *todo,
         return;
     }
 
-    if (online)
-        printf("Installing packages (this may take a while)...\n");
-    else
+    if (!online)
         printf("  No network connection; not installing.\n");
 
     char **pkgs = NULL;
@@ -695,17 +792,9 @@ void restore_packages(int source_root_fd, int online, FILE *todo,
     int accounting_complete = pkg_count == 0;
 
     if (pkgs != NULL && pkg_count > 0 && prefix > 0)
-    {
-        if (online)
-            package_install_batch(distro, batch_prefix, prefix, pkgs,
-                                  (size_t)pkg_count, had_error);
-        accounting_complete = package_account_final_state(
-            distro, pkgs, (size_t)pkg_count, todo,
-            online ? "Packages this system could not install, often from a "
-                     "repository it does not have yet:"
-                   : "Packages to install once this system is online:",
-            &installed, &skipped, had_error) == 0;
-    }
+        accounting_complete = package_restore_list(
+            distro, batch_prefix, prefix, pkgs, (size_t)pkg_count, online,
+            todo, &installed, &skipped, had_error) == 0;
 
     package_free_name_list(pkgs, pkg_count);
 

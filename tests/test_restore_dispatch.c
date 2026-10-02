@@ -100,12 +100,17 @@ typedef struct {
     char marker_path[PATH_MAX];
 } PackagePrivilegeProbe;
 
+// Set by the install hooks; the next installed-state query reports the
+// fixture package and clears it.
+static int fixture_package_installed;
+
 static int package_progress_probe(char *const argv[], void *context)
 {
     (void)argv;
     PackageProgressProbe *probe = context;
     probe->call_count++;
     probe->thread_count = proc_thread_count();
+    fixture_package_installed = 1;
     return 0;
 }
 
@@ -113,11 +118,20 @@ static int package_progress_capture(char *const argv[], char *output,
                                     size_t output_size, void *context)
 {
     (void)context;
-    const char *installed = "fixture-package\n";
-    if (argv == NULL || argv[0] == NULL || strcmp(argv[0], "rpm") != 0 ||
-        strlen(installed) >= output_size)
+    const char *text;
+    if (argv[0] != NULL && strcmp(argv[0], "rpm") == 0)
+    {
+        text = fixture_package_installed ? "fixture-package\n" : "";
+        fixture_package_installed = 0;
+    }
+    else if (argv[0] != NULL && strcmp(argv[0], "dnf") == 0 &&
+             argv[1] != NULL && strcmp(argv[1], "repoquery") == 0)
+        text = "";
+    else
         return -1;
-    memcpy(output, installed, strlen(installed) + 1U);
+    if (strlen(text) >= output_size)
+        return -1;
+    memcpy(output, text, strlen(text) + 1U);
     return 0;
 }
 
@@ -142,6 +156,7 @@ static int package_privilege_probe(char *const argv[], void *context)
     int close_result = close(fd);
     if (written < 0)
         errno = saved_errno;
+    fixture_package_installed = 1;
     return written == (ssize_t)(sizeof(marker) - 1U) && close_result == 0
         ? 0 : -1;
 }
@@ -2091,6 +2106,7 @@ static int package_marker_probe(char *const argv[], void *context)
                   O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd < 0)
         return -1;
+    fixture_package_installed = 1;
     return close(fd);
 }
 
@@ -2196,7 +2212,6 @@ static void test_verification_failure_still_restores_packages(void)
                                                sizeof(output));
     writer_apps_test_set_proc_root("/nonexistent/migr-test-proc");
     portable_restore_replay_test_set_after_apply_hook(NULL);
-    packages_test_clear_restore_hooks();
     dry_run = previous_dry_run;
 
     check(rc == 2 &&
@@ -2222,6 +2237,7 @@ static void test_verification_failure_still_restores_packages(void)
     rc = run_restore_capturing_with_input(source, "y\n", output,
                                           sizeof(output));
     portable_restore_replay_test_set_after_apply_hook(NULL);
+    packages_test_clear_restore_hooks();
     dry_run = previous_dry_run;
     check(rc == 1 && strstr(output, "Restore complete") != NULL &&
               strstr(output, "1 restored item was changed by other programs "

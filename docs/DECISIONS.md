@@ -3830,7 +3830,8 @@ and keeping the parallel path as an unmeasured optional branch.
 
 ## D46 — 2026-09-11 — Package restore uses one install transaction and verifies final state
 
-**Status:** Implemented; apt runs without questions since D91
+**Status:** Implemented; apt runs without questions since D91; only the
+missing packages are installed since D95
 
 **Decision:** Package restore performs at most one real install transaction per
 restore. Debian/Ubuntu keeps `apt-get install -y -m`. Fedora/RHEL adds
@@ -5524,3 +5525,43 @@ uses it by name; its data is there. Rootless Docker's state is not handled.
 **Relationship:** Uses D86's `SOURCE_HOME`; `layers.json` is rewritten after
 replay as D86 rewrites desktop state.
 
+---
+
+## D95 — 2026-10-02 — Restore installs only the packages the system lacks
+
+**Status:** Implemented
+
+**Decision:** Before the install transaction, restore reads which listed
+packages the system already has, with the installed-state query D46 runs
+afterwards, and which of those are explicitly installed, with D12's export
+command.
+- **Packages it lacks** go to the one install transaction (D46). When it
+  lacks none, no transaction runs.
+- **Packages it has as dependencies** are marked explicitly installed:
+  `apt-mark manual`, `dnf -y -q mark user`, or `pacman -D --asexplicit`. The
+  command's output is not shown; a failure prints a warning.
+- **Packages it has as explicit** are left alone.
+
+Accounting stays D46's: after a transaction the installed state is read
+again; without one, the first reading is the final state.
+
+**Why:** On a fresh install of the same distribution most of the list is
+already there, and each package manager prints a line for every given
+package it already has: `Package "…" is already installed.` (dnf), `… is
+already the newest version` (apt), `warning: … is up to date -- skipping`
+(pacman). Given its own list, Fedora 44 KDE printed 397 lines for 388
+packages, Ubuntu 26.04 49 for 43, and Arch 91 for 90; the packages actually
+installed were lost among them. Reading state instead of filtering that
+output keeps restore independent of the package manager's language, which
+follows the system locale. Restore also stops upgrading installed packages
+as a side effect: apt and pacman upgraded a listed package that was out of
+date, which on Arch is a partial upgrade.
+
+A package the backup listed as explicit can be on the new system as another
+package's dependency. apt-get install marks it manual, but dnf reports it
+already installed and pacman's `--needed` skips it, `--asexplicit` included,
+so both left it a dependency. The next backup's list (D12) then left it out,
+and removing the package that pulled it in let autoremove remove it too.
+
+**Relationship:** Extends D46: one install transaction, accounting from the
+final state. Uses D12's export commands.

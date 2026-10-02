@@ -89,26 +89,73 @@ typedef struct {
     size_t expected_prefix_count;
     const char *const *forbidden_tokens;
     size_t forbidden_token_count;
+    // What the system has before the install transaction (NULL: nothing)
+    // and after it, and which of its packages are explicitly installed
+    // (NULL: none).
+    const char *installed_before;
     const char *installed_output;
+    const char *explicit_output;
     const char *available_output;
     int run_result;
     size_t call_count;
     size_t max_batch_count;
     size_t installed_query_count;
+    size_t explicit_query_count;
     size_t availability_query_count;
+    size_t mark_count;
+    char marked[256];
     int prefix_ok;
     int forbidden_seen;
     int capture_ok;
 } PackageRunFixture;
+
+static size_t argv_length(char *const argv[])
+{
+    size_t argc = 0;
+    while (argv[argc] != NULL)
+        argc++;
+    return argc;
+}
+
+static int argv_starts_with(char *const argv[], const char *const *prefix,
+                            size_t prefix_count)
+{
+    for (size_t i = 0; i < prefix_count; i++)
+        if (argv[i] == NULL || strcmp(argv[i], prefix[i]) != 0)
+            return 0;
+    return 1;
+}
+
+// The mark command per distro, and the names it was given, space-separated.
+static int package_mark_fixture(PackageRunFixture *fixture,
+                                char *const argv[])
+{
+    static const char *const debian_mark[] = {"apt-mark", "manual"};
+    static const char *const fedora_mark[] = {"dnf", "-y", "-q", "mark",
+                                              "user"};
+    static const char *const arch_mark[] = {"pacman", "-D", "--asexplicit"};
+    const char *const *prefix = fixture->distro == DISTRO_DEBIAN ? debian_mark
+        : fixture->distro == DISTRO_FEDORA ? fedora_mark : arch_mark;
+    size_t prefix_count = fixture->distro == DISTRO_DEBIAN ? 2U
+        : fixture->distro == DISTRO_FEDORA ? 5U : 3U;
+    if (!argv_starts_with(argv, prefix, prefix_count))
+        return 0;
+    fixture->mark_count++;
+    for (size_t i = prefix_count; argv[i] != NULL; i++)
+    {
+        size_t used = strlen(fixture->marked);
+        snprintf(fixture->marked + used, sizeof(fixture->marked) - used,
+                 "%s%s", used != 0 ? " " : "", argv[i]);
+    }
+    return 1;
+}
 
 static int package_run_fixture(char *const argv[], void *context)
 {
     PackageRunFixture *fixture = context;
     fixture->call_count++;
 
-    size_t argc = 0;
-    while (argv[argc] != NULL)
-        argc++;
+    size_t argc = argv_length(argv);
 
     if (argc < fixture->expected_prefix_count)
         fixture->prefix_ok = 0;
@@ -137,8 +184,23 @@ static int package_capture_fixture(char *const argv[], char *output,
 {
     PackageRunFixture *fixture = context;
     const char *text = NULL;
+    // Before the install transaction runs, the system has what it had.
+    const char *installed = fixture->call_count == 0
+        ? (fixture->installed_before != NULL ? fixture->installed_before : "")
+        : fixture->installed_output;
+    char *const *explicit_query = get_package_cmd(fixture->distro);
 
-    if (fixture->distro == DISTRO_DEBIAN &&
+    if (explicit_query != NULL &&
+        argv_length(argv) == argv_length(explicit_query) &&
+        argv_starts_with(argv, (const char *const *)explicit_query,
+                         argv_length(explicit_query)))
+    {
+        fixture->explicit_query_count++;
+        text = fixture->explicit_output != NULL ? fixture->explicit_output : "";
+    }
+    else if (package_mark_fixture(fixture, argv))
+        text = "";
+    else if (fixture->distro == DISTRO_DEBIAN &&
         strcmp(argv[0], "dpkg-query") == 0 &&
         argv[1] != NULL && strcmp(argv[1], "-W") == 0 &&
         argv[2] != NULL &&
@@ -147,7 +209,7 @@ static int package_capture_fixture(char *const argv[], char *output,
         argv[3] == NULL)
     {
         fixture->installed_query_count++;
-        text = fixture->installed_output;
+        text = installed;
     }
     else if (fixture->distro == DISTRO_FEDORA &&
              strcmp(argv[0], "rpm") == 0 &&
@@ -157,7 +219,7 @@ static int package_capture_fixture(char *const argv[], char *output,
              argv[4] == NULL)
     {
         fixture->installed_query_count++;
-        text = fixture->installed_output;
+        text = installed;
     }
     else if (fixture->distro == DISTRO_ARCH &&
              strcmp(argv[0], "pacman") == 0 &&
@@ -165,7 +227,7 @@ static int package_capture_fixture(char *const argv[], char *output,
              argv[2] == NULL)
     {
         fixture->installed_query_count++;
-        text = fixture->installed_output;
+        text = installed;
     }
     else if (fixture->distro == DISTRO_ARCH &&
              strcmp(argv[0], "pacman") == 0 &&
@@ -566,9 +628,9 @@ static void test_restore_packages_batch_prefixes(void)
                   runner.max_batch_count == 2U,
               label);
         snprintf(label, sizeof(label),
-                 "%s verifies final installed state exactly once",
+                 "%s reads installed state before and after the transaction",
                  cases[i].name);
-        check(runner.capture_ok && runner.installed_query_count == 1U &&
+        check(runner.capture_ok && runner.installed_query_count == 2U &&
                   runner.availability_query_count ==
                       cases[i].expected_availability_queries,
               label);
@@ -672,9 +734,9 @@ static void test_restore_packages_sparse_unavailable(distro_t distro,
                    ? PKG_COUNT - UNAVAILABLE_COUNT : PKG_COUNT),
           label);
     snprintf(label, sizeof(label),
-             "%s performs one final-state query and no adaptive retries",
-             name);
-    check(runner.installed_query_count == 1U &&
+             "%s reads installed state before and after, with no adaptive "
+             "retries", name);
+    check(runner.installed_query_count == 2U &&
               runner.availability_query_count ==
                   (distro == DISTRO_ARCH ? 1U : 0U),
           label);
@@ -721,7 +783,7 @@ static void test_restore_packages_single_pass_accounting(void)
     check(fixture_ok,
           "nonzero install-transaction fixture runs");
     check(fixture_ok && failed_transaction.call_count == 1U &&
-              failed_transaction.installed_query_count == 1U &&
+              failed_transaction.installed_query_count == 2U &&
               failed_result.had_error == 0 && failed_result.skipped_matches,
           "a non-availability install failure is classified from final state, not command exit status");
 
@@ -731,7 +793,9 @@ static void test_restore_packages_single_pass_accounting(void)
         .expected_prefix_count = sizeof(arch_prefix) / sizeof(arch_prefix[0]),
         .forbidden_tokens = unavailable_preinstalled,
         .forbidden_token_count = 1U,
+        .installed_before = "beta\n",
         .installed_output = "alpha\nbeta\n",
+        .explicit_output = "beta\n",
         .available_output = "alpha\n",
     };
     PackageRestoreCaseResult preinstalled_result = {0};
@@ -753,15 +817,20 @@ static void test_restore_packages_single_pass_accounting(void)
         .expected_prefix = debian_prefix,
         .expected_prefix_count = sizeof(debian_prefix) /
                                  sizeof(debian_prefix[0]),
+        .installed_before =
+            "alpha\talpha\tinstalled\n"
+            "beta\tbeta\tconfig-files\n",
         .installed_output =
             "alpha\talpha\tinstalled\n"
             "beta\tbeta\tconfig-files\n",
+        .explicit_output = "alpha\n",
     };
     PackageRestoreCaseResult debian_status_result = {0};
     fixture_ok = run_restore_packages_case(
         DISTRO_DEBIAN, "alpha\nbeta\n", &debian_status, "beta\n",
         &debian_status_result);
-    check(fixture_ok && debian_status.installed_query_count == 1U &&
+    check(fixture_ok && debian_status.installed_query_count == 2U &&
+              debian_status.max_batch_count == 1U &&
               debian_status_result.had_error == 0 &&
               debian_status_result.skipped_matches,
           "Debian final-state accounting accepts only installed dpkg states");
@@ -770,7 +839,8 @@ static void test_restore_packages_single_pass_accounting(void)
         .expected_prefix = fedora_prefix,
         .expected_prefix_count = sizeof(fedora_prefix) /
                                  sizeof(fedora_prefix[0]),
-        .installed_output = "alpha\n",
+        .installed_before = "alpha\n",
+        .explicit_output = "alpha\n",
     };
     PackageRestoreCaseResult offline_result = {0};
     restore_online = 0;
@@ -782,6 +852,87 @@ static void test_restore_packages_single_pass_accounting(void)
               offline_result.had_error == 0 && offline_result.skipped_matches,
           "offline, nothing is installed and the missing packages are listed "
           "to install once the system is online");
+}
+
+static void test_restore_packages_skips_what_is_installed(void)
+{
+    printf(BLUE "::" NC " restore_packages leaves installed packages out of "
+                "the transaction and marks them explicit\n");
+
+    static const char *const fedora_prefix[] = {
+        "dnf", "install", "-y", "--skip-unavailable"
+    };
+    static const char *const installed_packages[] = {"alpha", "beta"};
+    PackageRunFixture partial = {
+        .expected_prefix = fedora_prefix,
+        .expected_prefix_count = sizeof(fedora_prefix) /
+                                 sizeof(fedora_prefix[0]),
+        .forbidden_tokens = installed_packages,
+        .forbidden_token_count = 2U,
+        .installed_before = "alpha\nbeta\n",
+        .installed_output = "alpha\nbeta\ngamma\n",
+        .explicit_output = "alpha\n",
+    };
+    PackageRestoreCaseResult result = {0};
+    int fixture_ok = run_restore_packages_case(
+        DISTRO_FEDORA, "alpha\nbeta\ngamma\n", &partial, NULL, &result);
+    check(fixture_ok && partial.call_count == 1U &&
+              partial.max_batch_count == 1U && !partial.forbidden_seen &&
+              result.had_error == 0 && result.skipped_matches,
+          "only the missing package reaches the package manager");
+    check(partial.mark_count == 1U && strcmp(partial.marked, "beta") == 0,
+          "an installed package not marked explicit is marked, once");
+
+    static const struct {
+        distro_t distro;
+        const char *name;
+        const char *installed;
+    } cases[] = {
+        { DISTRO_DEBIAN, "Debian",
+          "alpha\talpha\tinstalled\nbeta\tbeta\tinstalled\n" },
+        { DISTRO_FEDORA, "Fedora", "alpha\nbeta\n" },
+        { DISTRO_ARCH, "Arch", "alpha\nbeta\n" },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+    {
+        PackageRunFixture complete = {
+            .installed_before = cases[i].installed,
+            .explicit_output = "alpha\nbeta\n",
+        };
+        PackageRestoreCaseResult complete_result = {0};
+        fixture_ok = run_restore_packages_case(
+            cases[i].distro, "alpha\nbeta\n", &complete, NULL,
+            &complete_result);
+        char label[160];
+        snprintf(label, sizeof(label),
+                 "%s with everything installed and marked runs no package "
+                 "manager command", cases[i].name);
+        check(fixture_ok && complete.capture_ok && complete.call_count == 0U &&
+                  complete.mark_count == 0U &&
+                  complete.installed_query_count == 1U &&
+                  complete.explicit_query_count == 1U &&
+                  complete.availability_query_count == 0U &&
+                  complete_result.had_error == 0 &&
+                  complete_result.skipped_matches,
+              label);
+
+        PackageRunFixture unmarked = {
+            .installed_before = cases[i].installed,
+            .explicit_output = "",
+        };
+        PackageRestoreCaseResult unmarked_result = {0};
+        fixture_ok = run_restore_packages_case(
+            cases[i].distro, "alpha\nbeta\n", &unmarked, NULL,
+            &unmarked_result);
+        snprintf(label, sizeof(label),
+                 "%s marks installed packages with its own command",
+                 cases[i].name);
+        check(fixture_ok && unmarked.capture_ok && unmarked.call_count == 0U &&
+                  unmarked.mark_count == 1U &&
+                  strcmp(unmarked.marked, "alpha beta") == 0 &&
+                  unmarked_result.had_error == 0,
+              label);
+    }
 }
 
 static void test_restore_packages_batch_alloc_failure_is_reported(void)
@@ -825,6 +976,7 @@ static void test_restore_packages_batch_alloc_failure_is_reported(void)
         "dnf", "install", "-y", "--skip-unavailable"
     };
     PackageRunFixture runner = {
+        .distro = DISTRO_FEDORA,
         .expected_prefix = fedora_prefix,
         .expected_prefix_count = sizeof(fedora_prefix) / sizeof(fedora_prefix[0]),
         .installed_output = "",
@@ -1284,6 +1436,7 @@ int main(void)
     printf(BLUE "::" NC " restore_packages (unit)\n");
     test_restore_packages_batch_prefixes();
     test_restore_packages_single_pass_accounting();
+    test_restore_packages_skips_what_is_installed();
     test_restore_packages_batch_alloc_failure_is_reported();
 
     test_groups_collect();

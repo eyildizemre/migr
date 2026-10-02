@@ -66,7 +66,7 @@ sudo ./migr restore /mnt/usb/migr-$USER
 | Browsers | Firefox, Chrome, Chromium, Brave, Vivaldi, Edge, Opera | Restored |
 | VS Code, VSCodium | `~/.vscode` and `~/.vscode-oss`, with installed extensions | Restored as files |
 | GNOME settings | the dconf database | Loaded into your session when you are logged in; otherwise in place for your next login |
-| Packages | the packages you installed yourself, not their dependencies | Installed in one transaction; the ones the new system cannot install are listed |
+| Packages | the packages you installed yourself, not their dependencies | The ones the new system lacks are installed in one transaction; the ones it cannot install are listed |
 | Flatpak applications | the system-wide installation's applications and their remotes | Installed from the remotes the new system has; the others are listed |
 | Groups | groups you were added to, such as `libvirt`, `docker`, or `dialout` | You are added back to the ones the new system has; the others are listed |
 | Network (opt-in) | NetworkManager, netplan, systemd-networkd, wpa_supplicant, and netctl configuration, and the system crypto policy | Written back; NetworkManager reloads it and the crypto policy is set, the others are left for you to apply |
@@ -266,7 +266,7 @@ On the text screen:
 
 ```text
 Packages
-Installing packages (this may take a while)...
+  349 of 362 are already installed; installing 13 (this may take a while)...
 ...
   362 installed, 0 skipped.
 
