@@ -2081,6 +2081,87 @@ static void test_plan_estimate_tolerates_missing_root(void)
     remove_tree(home);
 }
 
+// Any plain read under relatime would move a year-2000 access time forward.
+#define OLD_ATIME 946684800
+
+static void set_old_atime(const char *path)
+{
+    struct timespec times[2] = { { OLD_ATIME, 0 }, { 0, UTIME_OMIT } };
+    if (utimensat(AT_FDCWD, path, times, AT_SYMLINK_NOFOLLOW) != 0)
+    {
+        printf(RED "fixture: could not set the access time of %s" NC "\n", path);
+        exit(1);
+    }
+}
+
+static int atime_is_old(const char *path)
+{
+    struct stat st;
+    return lstat(path, &st) == 0 && st.st_atim.tv_sec == OLD_ATIME;
+}
+
+static void test_planning_keeps_access_times(void)
+{
+    printf(BLUE "::" NC " model: planning a backup leaves folders' access times as they are\n");
+
+    char home[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_atime_home");
+    setenv("HOME", home, 1);
+
+    static const char *const folders[] = {
+        "picked/sub", "left/sub", ".var/app/org.example.App",
+        ".local/share/flatpak/app", ".local/share/flatpak/runtime",
+        "picked", "left", ".var", ".var/app", ".local", ".local/share",
+        ".local/share/flatpak",
+    };
+    enum { FOLDER_COUNT = sizeof(folders) / sizeof(folders[0]) };
+    char paths[FOLDER_COUNT][PATH_MAX];
+    for (size_t i = 0; i < FOLDER_COUNT; i++)
+    {
+        join_path(paths[i], sizeof(paths[i]), home, folders[i]);
+        mkdir_p(paths[i]);
+    }
+    char picked[PATH_MAX], picked_sub[PATH_MAX], file[PATH_MAX];
+    join_path(picked, sizeof(picked), home, "picked");
+    join_path(picked_sub, sizeof(picked_sub), picked, "sub");
+    join_path(file, sizeof(file), picked_sub, "picked.txt");
+    write_file(file, "picked payload");
+    join_path(file, sizeof(file), home, "left/sub/left.txt");
+    write_file(file, "left payload");
+    set_old_atime(home);
+    for (size_t i = 0; i < FOLDER_COUNT; i++)
+        set_old_atime(paths[i]);
+
+    char *roots[] = { picked, NULL };
+    BackupPlan plan;
+    off_t total = 0;
+    int had_error = -1;
+    if (backup_plan_build(home, BACKUP_EXPLICIT_PATHS,
+                          (const char *const *)roots, &plan) == 0)
+    {
+        backup_plan_estimate_size(&plan, 0, &total, &had_error);
+        backup_plan_free(&plan);
+    }
+    check(had_error == 0 && atime_is_old(picked) && atime_is_old(picked_sub),
+          "the size estimate");
+
+    SelectionPlan selection;
+    SelectionUncovered *items = NULL;
+    size_t count = 0;
+    check(selection_plan_build(home, BACKUP_CRITICAL, NULL, &selection) == 0 &&
+              selection_plan_uncovered(&selection, &items, &count) == 0 &&
+              count > 0,
+          "the plan and the list of what it leaves out are built");
+    free(items);
+    selection_plan_free(&selection);
+    int kept = atime_is_old(home);
+    for (size_t i = 0; i < FOLDER_COUNT; i++)
+        kept = kept && atime_is_old(paths[i]);
+    check(kept, "the Flatpak checks and the list of what is left out");
+
+    remove_tree(home);
+}
+
 #ifdef BACKUP_PLAN_TEST_HOOKS
 static void rename_directory_out_from_under_its_open_fd(int parent_fd,
                                                          const char *name)
@@ -4917,6 +4998,7 @@ int main(void)
     test_root_count_ceiling_is_enforced();
 
     test_plan_estimate_tolerates_missing_root();
+    test_planning_keeps_access_times();
 #ifdef BACKUP_PLAN_TEST_HOOKS
     test_estimate_survives_ancestor_rename_mid_walk();
 #endif

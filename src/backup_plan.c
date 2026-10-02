@@ -938,6 +938,31 @@ typedef struct {
     size_t capacity;
 } EstimateSeen;
 
+// Like the copy, the planning walks leave access times as they are. Without
+// root, a folder someone else owns refuses O_NOATIME; the plain open keeps
+// an unprivileged report measuring it.
+static int open_dir_noatime(int parent_fd, const char *name, int flags)
+{
+    flags |= O_RDONLY | O_DIRECTORY | O_CLOEXEC;
+    int fd = openat(parent_fd, name, flags | O_NOATIME);
+    if (fd < 0 && errno == EPERM)
+        fd = openat(parent_fd, name, flags);
+    return fd;
+}
+
+static DIR *opendir_noatime(const char *path)
+{
+    int fd = open_dir_noatime(AT_FDCWD, path, 0);
+    DIR *dir = fd >= 0 ? fdopendir(fd) : NULL;
+    if (dir == NULL && fd >= 0)
+    {
+        int saved_errno = errno;
+        close(fd);
+        errno = saved_errno;
+    }
+    return dir;
+}
+
 static uint64_t estimate_inode_hash(dev_t dev, ino_t ino)
 {
     return hash_uint64_pair(0, (uint64_t)dev, (uint64_t)ino);
@@ -1182,8 +1207,7 @@ static int estimate_walk_fd(int parent_fd, const char *name, off_t block_size,
     if (estimate_add_size(size, st.st_size) != 0)
         return -1;
 
-    int dir_fd = openat(parent_fd, name,
-                        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    int dir_fd = open_dir_noatime(parent_fd, name, O_NOFOLLOW);
     if (dir_fd < 0)
         return -1;
 
@@ -1413,7 +1437,7 @@ static int selection_active(const ConfigRule *rule, BackupMode mode)
 
 static int directory_has_entries(const char *path)
 {
-    DIR *dir = opendir(path);
+    DIR *dir = opendir_noatime(path);
     if (dir == NULL)
         return errno == ENOENT ? 0 : -1;
     int found = 0;
@@ -1445,7 +1469,7 @@ static int exclude_flatpak_app_caches(SelectionPlan *plan)
     char apps[PATH_MAX];
     if (path_join(apps, sizeof(apps), plan->home, ".var/app") != 0)
         return -1;
-    DIR *dir = opendir(apps);
+    DIR *dir = opendir_noatime(apps);
     if (dir == NULL)
         return 0;
     int result = 0;
@@ -1506,7 +1530,7 @@ static off_t tree_size_at(int dir_fd, const char *name, int depth,
     walk->budget--;
     if (!S_ISDIR(st.st_mode))
         return S_ISREG(st.st_mode) ? st.st_size : 0;
-    int fd = openat(dir_fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    int fd = open_dir_noatime(dir_fd, name, O_NOFOLLOW);
     DIR *dir = fd >= 0 ? fdopendir(fd) : NULL;
     if (dir == NULL)
     {
@@ -1542,7 +1566,7 @@ int selection_plan_uncovered(const SelectionPlan *plan,
         return -1;
     *out = NULL;
     *count = 0;
-    int home_fd = open(plan->home, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int home_fd = open_dir_noatime(AT_FDCWD, plan->home, 0);
     struct stat home_st;
     DIR *dir = home_fd >= 0 && fstat(home_fd, &home_st) == 0
         ? fdopendir(home_fd) : NULL;
