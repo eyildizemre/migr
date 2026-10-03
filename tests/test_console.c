@@ -85,9 +85,17 @@ static void test_graphical_session(void)
     check(console_test_graphical_session(sessions, desktop_cgroup, 1001) == 0,
           "a session of another user than the invoker is not taken");
     check(console_test_graphical_session(
-              sessions, "0::/user.slice/user-1000.slice/user@1000.service/app.slice\n",
+              sessions, "0::/user.slice/user-1000.slice/user@1000.service/"
+                        "app.slice/ptyxis-spawn-1.scope\n", 1000) == 1,
+          "a terminal the desktop's service manager started is on the desktop");
+    check(console_test_graphical_session(
+              sessions, "0::/user.slice/user-1001.slice/user@1001.service/"
+                        "app.slice/app-org.kde.konsole-2.scope/tab(3).scope\n",
               1000) == 0,
-          "a process outside a session scope stays in place");
+          "another user's service manager is not the invoker's desktop");
+    check(console_test_graphical_session(
+              sessions, "0::/system.slice/sshd.service\n", 1000) == 0,
+          "a process outside a session and the service manager stays in place");
     check(console_test_graphical_session(
               sessions, "0::/user.slice/user-1000.slice/session-9.scope\n",
               1000) == 0,
@@ -102,8 +110,16 @@ static void test_graphical_session(void)
     write_session("6", "1001", "x11", "user", "online");
     check(console_test_graphical_session(sessions, desktop_cgroup, 1000) == 0,
           "with another user's desktop open, the restore stays in place");
+    check(console_test_graphical_session(
+              sessions, "0::/user.slice/user-1000.slice/user@1000.service/"
+                        "app.slice/ptyxis-spawn-1.scope\n", 1000) == 0,
+          "so does one from a terminal the service manager started");
 
     remove_session("2");
+    check(console_test_graphical_session(
+              sessions, "0::/user.slice/user-1000.slice/user@1000.service/"
+                        "app.slice/ptyxis-spawn-1.scope\n", 1000) == 0,
+          "without a desktop of the invoker's own, the restore stays in place");
     remove_session("2.ref");
     remove_session("c1");
     remove_session("5");

@@ -5208,18 +5208,21 @@ journal as the added records accumulate.
 
 ## D89 — 2026-10-01 — A restore started on the desktop continues on a text console
 
-**Status:** Implemented
+**Status:** Implemented; desktop detection revised 2026-10-04
 
 **Decision:** A restore started under sudo from a desktop session closes that
 desktop and restores from a system service on a virtual console, after the
 user's consent.
-- **When:** Not a dry run; run under sudo from a session scope
-  (`session-N.scope` in `/proc/self/cgroup`) whose logind record
-  (`/run/systemd/sessions/N`) is the invoker's `wayland` or `x11` session of
-  class `user`; no other such session open (greeters and closing sessions do
-  not count); systemd running, `display-manager.service` active, and a console
-  from tty7 to tty15 that no program has open (`VT_GETSTATE`). Otherwise the
-  restore runs in place, unchanged.
+- **When:** Not a dry run; sudo was run on the desktop: the first ancestor of
+  migr running as the invoker (sudo's own processes skipped) is either under
+  the invoker's service manager (`user@UID.service` in its
+  `/proc/PID/cgroup`) or in a session scope (`session-N.scope`) whose logind
+  record (`/run/systemd/sessions/N`) is the invoker's; the invoker's `wayland`
+  or `x11` session of class `user` is the only such session open (greeters
+  and closing sessions do not count); systemd running,
+  `display-manager.service` active, and a console from tty7 to tty15 that no
+  program has open (`VT_GETSTATE`). Otherwise the restore runs in place,
+  unchanged.
 - **The question:** D81's question, after every check, with one line before
   it in place of the warning about open applications: the restore runs on a
   text screen with the desktop closed, and the login screen comes back when
@@ -5281,6 +5284,14 @@ With no session running while files are written, none of them matters.
 
 **Relationship:** Extends D81. D50, D66, D69, and D87's request to log out
 remain for restores that run in a session.
+
+**Revision (2026-10-04):** The check first read migr's own cgroup and required
+a session scope there. GNOME and KDE start a terminal under the user's service
+manager, outside the session scope, and some systems give sudo a session of
+its own (`pam_systemd` in sudo's PAM stack), so a restore started from a
+terminal on those desktops stayed in place. The process that ran sudo is
+examined instead; an SSH or console login is a `tty` session and still stays
+in place.
 
 ## D90 — 2026-10-01 — Restore brings the network up before packages
 

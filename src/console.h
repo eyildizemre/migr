@@ -8,9 +8,9 @@
 
 /**
  * @brief The virtual console a restore run here can continue on, or 0 when it
- *        stays in this session: migr runs under sudo from the only graphical
- *        session, systemd runs a display manager, and a console above the
- *        ones logind gives gettys is free.
+ *        stays in this session: sudo was run on the desktop of the only
+ *        graphical session, systemd runs a display manager, and a console
+ *        above the ones logind gives gettys is free.
  */
 int console_restore_vt(void);
 

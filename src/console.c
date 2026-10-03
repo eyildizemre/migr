@@ -95,39 +95,81 @@ static int session_graphical(const char *sessions_dir, const char *id,
     return 1;
 }
 
-// Whether the session named in cgroup (/proc/self/cgroup, where sudo leaves
-// it) is uid's graphical login, and the only one: stopping the display
-// manager ends every user's.
+// Whether cgroup, the invoker's process's, is on uid's desktop, and that
+// desktop is the only one: stopping the display manager ends every user's.
+// A terminal is on the desktop either inside its graphical session (Xfce) or
+// started by uid's service manager, which only the desktop does
+// (user@UID.service; GNOME, KDE); an SSH or console login is a tty session.
 static int graphical_session(const char *sessions_dir, const char *cgroup,
                              uid_t uid)
 {
+    char manager[64];
+    snprintf(manager, sizeof(manager), "/user@%lu.service/",
+             (unsigned long)uid);
     const char *start = strstr(cgroup, "/session-");
-    if (start == NULL)
-        return 0;
-    start += strlen("/session-");
-    size_t length = strcspn(start, ".\n");
-    char id[64];
-    if (length == 0 || length >= sizeof(id) ||
-        strncmp(start + length, ".scope", strlen(".scope")) != 0)
-        return 0;
-    memcpy(id, start, length);
-    id[length] = '\0';
-    uid_t owner;
-    if (!session_graphical(sessions_dir, id, &owner) || owner != uid)
+    char id[64] = "";
+    if (start != NULL)
+    {
+        start += strlen("/session-");
+        size_t length = strcspn(start, ".\n");
+        if (length == 0 || length >= sizeof(id) ||
+            strncmp(start + length, ".scope", strlen(".scope")) != 0)
+            return 0;
+        memcpy(id, start, length);
+        id[length] = '\0';
+    }
+    else if (strstr(cgroup, manager) == NULL)
         return 0;
 
     DIR *dir = opendir(sessions_dir);
     if (dir == NULL)
         return 0;
     size_t count = 0;
+    int found = 0;
     struct dirent *entry;
     // Each session also has a <id>.ref FIFO here.
     while ((entry = readdir(dir)) != NULL)
-        if (entry->d_name[0] != '.' && strchr(entry->d_name, '.') == NULL &&
-            session_graphical(sessions_dir, entry->d_name, &owner))
-            count++;
+    {
+        uid_t owner;
+        if (entry->d_name[0] == '.' || strchr(entry->d_name, '.') != NULL ||
+            !session_graphical(sessions_dir, entry->d_name, &owner))
+            continue;
+        count++;
+        if (owner == uid && (id[0] == '\0' || strcmp(entry->d_name, id) == 0))
+            found = 1;
+    }
     closedir(dir);
-    return count == 1;
+    return count == 1 && found;
+}
+
+// The cgroup of the process that ran sudo: the first ancestor running as
+// uid. sudo's own processes say nothing, as some systems give sudo a session
+// of its own (pam_systemd).
+static int invoker_cgroup(uid_t uid, char *cgroup, size_t size)
+{
+    pid_t pid = getppid();
+    for (int depth = 0; pid > 1 && depth < 32; depth++)
+    {
+        char path[64], status[4096];
+        snprintf(path, sizeof(path), "/proc/%ld/status", (long)pid);
+        if (read_text(path, status, sizeof(status)) != 0)
+            return -1;
+        const char *uids = strstr(status, "\nUid:");
+        const char *ppid = strstr(status, "\nPPid:");
+        unsigned long effective;
+        long parent;
+        if (uids == NULL || ppid == NULL ||
+            sscanf(uids, "\nUid: %*s %lu", &effective) != 1 ||
+            sscanf(ppid, "\nPPid: %ld", &parent) != 1)
+            return -1;
+        if (effective == (unsigned long)uid)
+        {
+            snprintf(path, sizeof(path), "/proc/%ld/cgroup", (long)pid);
+            return read_text(path, cgroup, size);
+        }
+        pid = (pid_t)parent;
+    }
+    return -1;
 }
 
 // The first console from FIRST_VT on that no program has open; in_use has a
@@ -166,7 +208,7 @@ int console_restore_vt(void)
     char cgroup[4096];
     if (sudo_invoker(&uid, &gid, NULL) != 1 ||
         access("/run/systemd/system", F_OK) != 0 ||
-        read_text("/proc/self/cgroup", cgroup, sizeof(cgroup)) != 0 ||
+        invoker_cgroup(uid, cgroup, sizeof(cgroup)) != 0 ||
         !graphical_session(SESSIONS_DIR, cgroup, uid))
         return 0;
     char *is_active[] = { "systemctl", "is-active", "--quiet",
