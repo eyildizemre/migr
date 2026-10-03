@@ -604,6 +604,15 @@ static ManifestStatus manifest_parse_v1_body(FILE *f, Manifest *out)
                          &fail_status) != 0) goto fail;
     }
 
+    // Optional SIZE=<bytes> (D98).
+    if (line_key_is(line, "SIZE", key_len))
+    {
+        if (parse_uint_field(value, INT64_MAX, &n) != 0 || n == 0) goto fail;
+        m.size = (off_t)n;
+        if (read_kv_line(f, line, sizeof(line), &value, &key_len,
+                         &fail_status) != 0) goto fail;
+    }
+
     // SOURCE_HOME=<enc>: required by VERSION=2; VERSION=1 manifests written
     // before D86 lack it.
     if (line_key_is(line, "SOURCE_HOME", key_len))
@@ -999,6 +1008,10 @@ static int manifest_serialize(FILE *f, const Manifest *m)
 
     if (!failed && m->updated > 0 &&
         fprintf(f, "UPDATED=%jd\n", (intmax_t)m->updated) < 0)
+        failed = 1;
+
+    if (!failed && m->size > 0 &&
+        fprintf(f, "SIZE=%jd\n", (intmax_t)m->size) < 0)
         failed = 1;
 
     if (!failed && m->source_home[0] != '\0')

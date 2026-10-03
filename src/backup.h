@@ -106,6 +106,7 @@ void backup_test_set_block_size_hook(BackupTestBlockSizeHook hook,
                                      void *context);
 
 typedef void (*BackupTestProgressHook)(off_t bytes_copied,
+                                       off_t bytes_unchanged,
                                        off_t estimated_total,
                                        const char *current_path,
                                        void *context);

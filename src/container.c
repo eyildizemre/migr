@@ -464,7 +464,10 @@ int container_survey_fd(int dest_root_fd, const char *owner,
         if (opened == 0)
             continue;
         if (manifest_install_identity_equal(&manifest, wanted_identity))
+        {
             out->own++;
+            out->own_size = state == NAME_PARTIAL ? 0 : manifest.size;
+        }
         else if (state == NAME_FINISHED &&
                  same_format(&manifest, wanted_identity))
         {
@@ -472,6 +475,7 @@ int container_survey_fd(int dest_root_fd, const char *owner,
             {
                 memcpy(out->other_name, final_name, sizeof(out->other_name));
                 out->other_updated = manifest.updated;
+                out->other_size = manifest.size;
             }
             out->other++;
         }

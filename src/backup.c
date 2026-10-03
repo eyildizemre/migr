@@ -423,14 +423,15 @@ static void backup_give_to_invoker(int container_fd, int target_created)
 /* Returns 0 to proceed (space is adequate, or an earlier probe/estimate
  * step failed and already printed its own warning), or -1 if the
  * destination does not have enough free space (having already printed the
- * shortfall error). The caller is responsible for its own cleanup and
- * return value in that case.
+ * shortfall error). reused_size is the space the backup being updated
+ * already holds there (D98). The caller is responsible for its own cleanup
+ * and return value in that case.
  */
 static int backup_space_preflight(int dest_fd, off_t estimated_size,
                                   off_t raw_estimated_size,
                                   int estimate_had_error,
                                   int raw_estimate_had_error,
-                                  const char *target)
+                                  off_t reused_size, const char *target)
 {
     if (estimate_had_error || raw_estimate_had_error)
     {
@@ -439,9 +440,10 @@ static int backup_space_preflight(int dest_fd, off_t estimated_size,
         return 0;
     }
 
+    off_t needed = estimated_size > reused_size
+        ? estimated_size - reused_size : 0;
     off_t free_bytes = 0;
-    int has_space = destination_has_space(dest_fd, estimated_size,
-                                          &free_bytes);
+    int has_space = destination_has_space(dest_fd, needed, &free_bytes);
     if (has_space < 0)
     {
         print_warning("Warning: could not determine destination free space; "
@@ -454,18 +456,43 @@ static int backup_space_preflight(int dest_fd, off_t estimated_size,
     format_size(raw_estimated_size, estimated_text, sizeof(estimated_text));
     format_size(free_bytes, free_text, sizeof(free_text));
     printf("Estimated backup size: %s\n", estimated_text);
+    if (reused_size > 0)
+    {
+        char reused_text[32];
+        format_size(reused_size, reused_text, sizeof(reused_text));
+        printf("Size of the backup being updated: %s\n", reused_text);
+    }
     printf("Destination free space: %s\n", free_text);
     printf("\n");
 
     if (!has_space)
     {
-        off_t shortfall = estimated_size - free_bytes;
+        off_t shortfall = needed - free_bytes;
         char shortfall_text[32];
         format_size(shortfall, shortfall_text, sizeof(shortfall_text));
         print_error("Error: not enough free space at %s (need %s more)\n",
                     target, shortfall_text);
         return -1;
     }
+    return 0;
+}
+
+/* The space the backup an update would take already holds under dest_fd,
+ * most of which the update keeps (D98): this install's, or with take_other
+ * the one finished backup of another install it offers to update instead.
+ * 0 when there is none, its size is unrecorded, or it is a first backup
+ * still unfinished.
+ */
+static off_t backup_reused_size(int dest_fd, const Manifest *wanted,
+                                int take_other)
+{
+    ContainerSurvey survey;
+    if (container_survey_fd(dest_fd, invoker_name(), wanted, &survey) != 0)
+        return 0;
+    if (survey.own == 1)
+        return survey.own_size;
+    if (survey.own == 0 && survey.other == 1 && take_other)
+        return survey.other_size;
     return 0;
 }
 
@@ -1462,6 +1489,7 @@ static void print_network_config_completion(unsigned int processed_mask,
 
 typedef struct {
     off_t estimated_total_bytes;
+    int updating; /* an existing backup: unchanged files are checked, not copied */
     int data_fd;
     int printed_anything;
     struct timespec started_at;
@@ -1511,6 +1539,7 @@ static long progress_elapsed_whole_seconds(double elapsed_seconds)
 
 static void backup_render_progress(BackupProgressDisplay *display,
                                    off_t bytes_copied,
+                                   off_t bytes_unchanged,
                                    off_t speed_bytes,
                                    off_t free_bytes,
                                    int free_bytes_known,
@@ -1520,11 +1549,14 @@ static void backup_render_progress(BackupProgressDisplay *display,
     double elapsed_seconds = timespec_elapsed_seconds(&display->started_at,
                                                       now);
     char copied_text[32];
+    char checked_text[32];
     char estimated_text[32];
     char free_text[32];
     char elapsed_text[32];
     char speed_text[32];
     format_size(bytes_copied, copied_text, sizeof(copied_text));
+    format_size(bytes_copied + bytes_unchanged, checked_text,
+                sizeof(checked_text));
     if (display->estimated_total_bytes > 0)
         format_size(display->estimated_total_bytes, estimated_text,
                     sizeof(estimated_text));
@@ -1540,7 +1572,17 @@ static void backup_render_progress(BackupProgressDisplay *display,
         ? current_path : "unknown";
 
     char line[PATH_MAX + 256U];
-    if (display->estimated_total_bytes > 0)
+    if (display->updating && display->estimated_total_bytes > 0)
+        snprintf(line, sizeof(line),
+                 "Progress: %s/%s checked, %s copied, %s free, elapsed %s, "
+                 "speed %s/s, current: %s", checked_text, estimated_text,
+                 copied_text, free_text, elapsed_text, speed_text, path_text);
+    else if (display->updating)
+        snprintf(line, sizeof(line),
+                 "Progress: %s checked, %s copied, %s free, elapsed %s, "
+                 "speed %s/s, current: %s", checked_text, copied_text,
+                 free_text, elapsed_text, speed_text, path_text);
+    else if (display->estimated_total_bytes > 0)
         snprintf(line, sizeof(line),
                  "Progress: %s/%s copied, %s free, elapsed %s, speed %s/s, "
                  "current: %s", copied_text, estimated_text, free_text,
@@ -1559,9 +1601,9 @@ static void backup_ticker_redraw(const ProgressTickerSnapshot *snapshot,
                                  const struct timespec *now, void *context)
 {
     BackupProgressDisplay *display = context;
-    backup_render_progress(display, snapshot->bytes, snapshot->speed_bytes,
-                           snapshot->free_bytes, snapshot->free_bytes_known,
-                           snapshot->path, now);
+    backup_render_progress(display, snapshot->bytes, snapshot->unchanged_bytes,
+                           snapshot->speed_bytes, snapshot->free_bytes,
+                           snapshot->free_bytes_known, snapshot->path, now);
 }
 
 static void backup_progress_stop_ticker(BackupProgressDisplay *display)
@@ -1576,6 +1618,7 @@ static void backup_progress_stop_ticker(BackupProgressDisplay *display)
 }
 
 static void backup_report_progress(off_t bytes_copied,
+                                   off_t bytes_unchanged,
                                    const char *current_path,
                                    void *userdata)
 {
@@ -1596,9 +1639,9 @@ static void backup_report_progress(off_t bytes_copied,
     int free_bytes_known =
         destination_free_bytes(display->data_fd, &free_bytes) == 0;
 
-    if (progress_ticker_snapshot(&display->ticker, bytes_copied, speed_bytes,
-                                 free_bytes, free_bytes_known, current_path,
-                                 &now) != 0)
+    if (progress_ticker_snapshot(&display->ticker, bytes_copied,
+                                 bytes_unchanged, speed_bytes, free_bytes,
+                                 free_bytes_known, current_path, &now) != 0)
     {
         int saved_errno = errno;
         backup_progress_stop_ticker(display);
@@ -1606,12 +1649,12 @@ static void backup_report_progress(off_t bytes_copied,
                       "snapshot failure: %s\n", strerror(saved_errno));
     }
 
-    backup_render_progress(display, bytes_copied, speed_bytes, free_bytes,
-                           free_bytes_known, current_path, &now);
+    backup_render_progress(display, bytes_copied, bytes_unchanged, speed_bytes,
+                           free_bytes, free_bytes_known, current_path, &now);
 
 #ifdef BACKUP_TEST_HOOKS
     if (backup_test_progress_hook != NULL)
-        backup_test_progress_hook(bytes_copied,
+        backup_test_progress_hook(bytes_copied, bytes_unchanged,
                                   display->estimated_total_bytes,
                                   current_path,
                                   backup_test_progress_context);
@@ -2938,7 +2981,26 @@ static int backup_dry_run(const char *target, BackupMode mode,
                "parent directory's filesystem instead.\n\n", target);
     int advisory_probe_failed = 0;
     if (advisory_fd >= 0)
+        advisory_probe_failed = backup_representation_preflight(
+            advisory_fd, target, &advisory_profile, &advisory_repr) != 0;
+    if (advisory_fd >= 0 && !advisory_probe_failed)
     {
+        // The backup a live run would update, which it offers to when it
+        // belongs to another install (D88, D98).
+        off_t reused_size = 0;
+        if (!advisory_used_parent)
+        {
+            Manifest wanted = {
+                .representation = advisory_repr,
+                .sidecar_version = advisory_repr == CLONE_PORTABLE_SIDECAR
+                    ? SIDECAR_VERSION : 0,
+                .source_uid = backup_source_uid()
+            };
+            wanted.has_source_identity =
+                read_machine_id(wanted.machine_id,
+                                sizeof(wanted.machine_id)) == 0;
+            reused_size = backup_reused_size(advisory_fd, &wanted, 1);
+        }
         off_t advisory_block_size = 0;
         (void)destination_block_size(advisory_fd, &advisory_block_size);
         backup_execution_estimate(plan, selection, advisory_block_size,
@@ -2947,7 +3009,8 @@ static int backup_dry_run(const char *target, BackupMode mode,
                                   &raw_estimate_had_error);
         if (backup_space_preflight(advisory_fd, estimated_size,
                                    raw_estimated_size, estimate_had_error,
-                                   raw_estimate_had_error, target) != 0)
+                                   raw_estimate_had_error, reused_size,
+                                   target) != 0)
         {
             close(advisory_fd);
             if (target_created)
@@ -2956,9 +3019,6 @@ static int backup_dry_run(const char *target, BackupMode mode,
             backup_plan_free(plan);
             return MIGR_EXIT_FAILURE;
         }
-
-        advisory_probe_failed = backup_representation_preflight(
-            advisory_fd, target, &advisory_profile, &advisory_repr) != 0;
     }
     if (advisory_probe_failed)
     {
@@ -3365,15 +3425,39 @@ static int backup_run(const char *target_arg, BackupMode mode,
         goto fail_pre_container;
     }
 
+    // Probe the destination and choose a representation before any container
+    // exists. An unreliable probe is fatal, never a silent fall-through. If we
+    // created the destination root this run and then refuse, roll it back so a
+    // rejected attempt leaves nothing behind.
+    CloneRepresentation repr = CLONE_NATIVE_TREE;
+    FsCapabilityProfile profile;
+    if (backup_representation_preflight(target_fd, target, &profile, &repr) != 0)
+        goto fail_pre_container;
+
+    // The representation is part of the resume identity, so it must be settled
+    // before the manifest is matched against an existing partial.
+    manifest.representation = repr;
+    manifest.sidecar_version =
+        repr == CLONE_PORTABLE_SIDECAR ? SIDECAR_VERSION : 0;
+
+    // Asked before anything is read, so an unattended run is not held up
+    // later (D88).
+    char other_install[CONTAINER_NAME_MAX];
+    backup_offer_other_install(target_fd, target, &manifest, other_install);
+
     off_t target_block_size = 0;
     (void)destination_block_size(target_fd, &target_block_size);
     backup_execution_estimate(&plan, selection, target_block_size,
                               &estimated_size, &estimate_had_error);
     backup_execution_estimate(&plan, selection, 1, &raw_estimated_size,
                               &raw_estimate_had_error);
+    if (!estimate_had_error)
+        manifest.size = estimated_size;
 
     if (backup_space_preflight(target_fd, estimated_size, raw_estimated_size,
                                estimate_had_error, raw_estimate_had_error,
+                               backup_reused_size(target_fd, &manifest,
+                                                  other_install[0] != '\0'),
                                target) != 0)
         goto fail_pre_container;
     selection_plan_print_notes(selection);
@@ -3396,26 +3480,6 @@ static int backup_run(const char *target_arg, BackupMode mode,
                           : 0;
     if (keyring_selected < 0)
         goto fail_pre_container;
-
-    // Probe the destination and choose a representation before any container
-    // exists. An unreliable probe is fatal, never a silent fall-through. If we
-    // created the destination root this run and then refuse, roll it back so a
-    // rejected attempt leaves nothing behind.
-    CloneRepresentation repr = CLONE_NATIVE_TREE;
-    FsCapabilityProfile profile;
-    if (backup_representation_preflight(target_fd, target, &profile, &repr) != 0)
-        goto fail_pre_container;
-
-    // The representation is part of the resume identity, so it must be settled
-    // before the manifest is matched against an existing partial.
-    manifest.representation = repr;
-    manifest.sidecar_version =
-        repr == CLONE_PORTABLE_SIDECAR ? SIDECAR_VERSION : 0;
-
-    // Asked before anything is read, so an unattended run is not held up
-    // later (D88).
-    char other_install[CONTAINER_NAME_MAX];
-    backup_offer_other_install(target_fd, target, &manifest, other_install);
 
     // From here until capture ends, sources on btrfs are read from a
     // read-only snapshot (D64): the pre-scan and the capture see one point
@@ -3467,6 +3531,7 @@ static int backup_run(const char *target_arg, BackupMode mode,
         if (include_network_config && network_config_present_mask != 0)
             prepared.manifest.has_network_config = 1;
         prepared.manifest.updated = manifest.updated;
+        prepared.manifest.size = manifest.size;
         manifest_set_source_home(&prepared.manifest, manifest.source_home);
         prepared.manifest.selinux = manifest.selinux;
         prepared.manifest.source_subuids = manifest.source_subuids;
@@ -3658,6 +3723,7 @@ static int backup_run(const char *target_arg, BackupMode mode,
         BackupProgressDisplay progress_display = {
             .estimated_total_bytes = estimate_had_error || raw_estimate_had_error
                 ? 0 : raw_estimated_size,
+            .updating = adopted,
             .data_fd = data_fd
         };
         int progress_installed = 0;
@@ -3748,6 +3814,7 @@ static int backup_run(const char *target_arg, BackupMode mode,
         if (progress_installed && progress_display.printed_anything)
         {
             capture_report.progress_cb(capture_report.bytes_copied,
+                                       capture_report.bytes_unchanged,
                                        capture_report.current_path,
                                        capture_report.progress_userdata);
             putchar('\n');

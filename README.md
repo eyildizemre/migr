@@ -185,7 +185,9 @@ the old one is left alone. With more than one such backup, migr does not ask.
 again to the same place updates the backup in place: unchanged files are
 skipped, changed ones copied again, and files you deleted leave the backup. A
 file whose permissions, owner, access time, or extended attributes changed but
-whose content did not is not copied again; only its record is.
+whose content did not is not copied again; only its record is. An update
+needs room only for what grew since the last backup, and its progress line
+shows how much it has checked beside how much it copied.
 During an update it is called `migr-<user>.updating`, so an interrupted update
 is never mistaken for a finished backup.
 

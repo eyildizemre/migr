@@ -240,6 +240,7 @@ void *array_reserve(void *items, size_t *capacity, size_t count,
 
 typedef struct {
     off_t bytes;
+    off_t unchanged_bytes;
     off_t speed_bytes;
     off_t free_bytes;
     int free_bytes_known;
@@ -278,8 +279,9 @@ int progress_ticker_start(ProgressTicker *ticker,
  * @brief Replaces the ticker's last synchronized progress snapshot.
  */
 int progress_ticker_snapshot(ProgressTicker *ticker, off_t bytes,
-                             off_t speed_bytes, off_t free_bytes,
-                             int free_bytes_known, const char *current_path,
+                             off_t unchanged_bytes, off_t speed_bytes,
+                             off_t free_bytes, int free_bytes_known,
+                             const char *current_path,
                              const struct timespec *snapshot_at);
 
 /**

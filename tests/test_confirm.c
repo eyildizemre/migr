@@ -414,7 +414,7 @@ static void test_progress_ticker_stop_ignores_resolved_thread_error(void)
 
     check(ticker.initialized && ticker.running,
           "progress ticker reports a live worker after start");
-    check(progress_ticker_snapshot(&ticker, 1, 1, 0, 0,
+    check(progress_ticker_snapshot(&ticker, 1, 0, 1, 0, 0,
                                    "fixture", &snapshot_at) == 0,
           "progress ticker accepts a synchronized snapshot");
 

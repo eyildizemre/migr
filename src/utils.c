@@ -711,8 +711,9 @@ int progress_ticker_start(ProgressTicker *ticker,
 }
 
 int progress_ticker_snapshot(ProgressTicker *ticker, off_t bytes,
-                             off_t speed_bytes, off_t free_bytes,
-                             int free_bytes_known, const char *current_path,
+                             off_t unchanged_bytes, off_t speed_bytes,
+                             off_t free_bytes, int free_bytes_known,
+                             const char *current_path,
                              const struct timespec *snapshot_at)
 {
     if (ticker == NULL || snapshot_at == NULL)
@@ -738,6 +739,7 @@ int progress_ticker_snapshot(ProgressTicker *ticker, off_t bytes,
         return -1;
     }
     ticker->snapshot.bytes = bytes;
+    ticker->snapshot.unchanged_bytes = unchanged_bytes;
     ticker->snapshot.speed_bytes = speed_bytes;
     ticker->snapshot.free_bytes = free_bytes;
     ticker->snapshot.free_bytes_known = free_bytes_known;

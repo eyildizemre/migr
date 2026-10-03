@@ -209,8 +209,8 @@ static int preflight_progress_snapshot(RestorePreflightProgress *display,
         preflight_progress_stop_ticker(display);
         return 0;
     }
-    return progress_ticker_snapshot(&display->ticker, checked_as_off_t, 0, 0, 0,
-                                    phase, now);
+    return progress_ticker_snapshot(&display->ticker, checked_as_off_t, 0, 0,
+                                    0, 0, phase, now);
 }
 
 static void preflight_progress_disable_ticker(RestorePreflightProgress *display,

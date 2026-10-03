@@ -1834,9 +1834,11 @@ static int restore_progress_should_install(void)
 }
 
 static void restore_report_progress(off_t bytes_restored,
+                                    off_t bytes_unchanged,
                                     const char *current_path,
                                     void *userdata)
 {
+    (void)bytes_unchanged;
     RestoreProgressDisplay *display = userdata;
     if (display == NULL)
         return;
@@ -1850,8 +1852,8 @@ static void restore_report_progress(off_t bytes_restored,
     off_t speed_bytes = progress_speed(bytes_restored, &display->started_at,
                                        &now);
 
-    if (progress_ticker_snapshot(&display->ticker, bytes_restored, speed_bytes,
-                                 0, 0, current_path, &now) != 0)
+    if (progress_ticker_snapshot(&display->ticker, bytes_restored, 0,
+                                 speed_bytes, 0, 0, current_path, &now) != 0)
     {
         int saved_errno = errno;
         restore_progress_stop_ticker(display);
@@ -1884,6 +1886,7 @@ static void restore_progress_finish_phase(RestoreProgressPhase *phase)
     {
         if (phase->report->progress_cb != NULL)
             phase->report->progress_cb(phase->report->bytes_copied,
+                                       phase->report->bytes_unchanged,
                                        phase->report->current_path,
                                        phase->report->progress_userdata);
         putchar('\n');

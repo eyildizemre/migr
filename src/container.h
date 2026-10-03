@@ -135,10 +135,14 @@ ContainerStatus container_adopt_fd(int dest_root_fd, const char *owner,
  */
 typedef struct {
     size_t own;   /**< backups of this install, finished or in progress. */
+    off_t own_size; /**< the recorded size of the last of those, when it
+                         holds a whole backup: finished or being updated,
+                         not a first one interrupted (D98); else 0. */
     size_t other; /**< finished backups of another install in the same
                        format (representation and journal version). */
     char other_name[CONTAINER_NAME_MAX]; /**< the first of those. */
     time_t other_updated; /**< when it was last taken; 0 when unrecorded. */
+    off_t other_size; /**< its recorded size (D98); 0 when unrecorded. */
 } ContainerSurvey;
 
 /**

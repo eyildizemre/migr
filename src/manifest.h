@@ -158,6 +158,7 @@ typedef struct {
     int has_network_config;
     int selinux; /**< SELinux ran where the backup was taken (D94). */
     time_t updated; /**< When the backup was last taken (D72); 0 when unrecorded. */
+    off_t size; /**< Its estimated size on its destination then (D98); 0 when unrecorded. */
     int root_count;
     ManifestRoot *roots;
     char source_home[PATH_MAX]; /* VERSION=2 source address anchor, never opened. */

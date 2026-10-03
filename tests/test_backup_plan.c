@@ -1446,9 +1446,11 @@ typedef struct {
     int timing_valid;
 } BackupProgressTrace;
 
-static void record_backup_progress(off_t bytes_copied, off_t estimated_total,
+static void record_backup_progress(off_t bytes_copied, off_t bytes_unchanged,
+                                   off_t estimated_total,
                                    const char *current_path, void *context)
 {
+    (void)bytes_unchanged;
     BackupProgressTrace *trace = context;
     if (trace == NULL)
         return;
@@ -2045,6 +2047,21 @@ static void provide_fixed_free_space(off_t needed, off_t *free_bytes,
     *free_bytes = *(const off_t *)context;
 }
 
+// The forked backup sees free space just short of what it needs.
+static void provide_almost_enough_space(off_t needed, off_t *free_bytes,
+                                        void *context)
+{
+    (void)context;
+    *free_bytes = needed - 1;
+}
+
+static void provide_just_enough_space(off_t needed, off_t *free_bytes,
+                                      void *context)
+{
+    (void)context;
+    *free_bytes = needed;
+}
+
 static void test_plan_estimate_tolerates_missing_root(void)
 {
     printf(BLUE "::" NC " model: size estimation tolerates a root that vanishes after planning\n");
@@ -2358,6 +2375,87 @@ static void test_allocation_aware_estimate(void)
               strstr(fit_output, "Destination free space: 15B") != NULL &&
               strstr(fit_output, "need 5B more") != NULL,
           "the free-space fit check still uses the rounded estimate");
+
+    remove_tree(home);
+    remove_tree(target_parent);
+}
+
+static void test_update_counts_the_backup_it_replaces(int portable)
+{
+    printf(BLUE "::" NC " production: a %s update needs space only for what grew, and shows what it checked\n",
+           portable ? "portable" : "native");
+    backup_test_force_portable_representation(portable);
+
+    char home[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_home");
+    mkdir_p(home);
+    setenv("HOME", home, 1);
+    char docs[PATH_MAX], kept[PATH_MAX], added[PATH_MAX];
+    join_path(docs, sizeof(docs), home, "docs");
+    mkdir_p(docs);
+    join_path(kept, sizeof(kept), docs, "kept.bin");
+    write_large_file(kept, 4000);
+    join_path(added, sizeof(added), docs, "added.txt");
+    char *paths[] = { docs, NULL };
+
+    char target_parent[PATH_MAX];
+    fresh_mkdtemp(target_parent, sizeof(target_parent), "plan_target_parent");
+    char target[PATH_MAX];
+    join_path(target, sizeof(target), target_parent, "update-space");
+
+    off_t no_rounding_block_size = 1;
+    backup_test_set_block_size_hook(set_test_block_size,
+                                    &no_rounding_block_size);
+    backup_test_set_free_space_hook(provide_free_space, NULL);
+    dry_run = 0;
+    char output[8192];
+    check(run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths, output,
+                               sizeof(output)) == 0,
+          "the first backup completes");
+    char container[PATH_MAX];
+    Manifest manifest = {0};
+    int container_fd = find_container_dir(target, container, sizeof(container))
+        ? open(container, O_RDONLY | O_DIRECTORY | O_CLOEXEC) : -1;
+    check(container_fd >= 0 &&
+              manifest_read_v1_at(container_fd, &manifest) ==
+                  MANIFEST_STATUS_VALID &&
+              manifest.size >= 4000,
+          "the manifest records the backup's size");
+    manifest_free(&manifest);
+    if (container_fd >= 0)
+        close(container_fd);
+
+    write_large_file(added, 100);
+    backup_test_set_free_space_hook(provide_almost_enough_space, NULL);
+    dry_run = 1;
+    int dry_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                      output, sizeof(output));
+    // The shortfall is reported against free space one byte short of the
+    // need, so that free space shows what the update asked for.
+    const char *free_line = strstr(output, "Destination free space: ");
+    intmax_t free_shown = -1;
+    char unit = '\0';
+    if (free_line != NULL)
+        (void)sscanf(free_line, "Destination free space: %jd%c", &free_shown,
+                     &unit);
+    check(dry_rc == 2 && unit == 'B' && free_shown < 4000 &&
+              strstr(output, "Size of the backup being updated: ") != NULL &&
+              strstr(output, "need 1B more") != NULL,
+          "a dry-run update asks only for the growth beyond the old backup");
+
+    backup_test_set_free_space_hook(provide_just_enough_space, NULL);
+    backup_test_set_progress_hook(record_backup_progress, NULL);
+    dry_run = 0;
+    int live_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                       output, sizeof(output));
+    backup_test_set_progress_hook(NULL, NULL);
+    backup_test_set_free_space_hook(NULL, NULL);
+    backup_test_set_block_size_hook(NULL, NULL);
+    backup_test_force_portable_representation(0);
+    check(live_rc == 0, "the update fits when only its growth fits");
+    check(strstr(output, "Progress: 4.0K/") != NULL &&
+              strstr(output, " checked, 100B copied") != NULL,
+          "update progress shows the checked bytes beside the copied ones");
 
     remove_tree(home);
     remove_tree(target_parent);
@@ -5086,6 +5184,8 @@ int main(void)
 #endif
     test_allocation_aware_estimate();
     test_destination_space_preflight();
+    test_update_counts_the_backup_it_replaces(0);
+    test_update_counts_the_backup_it_replaces(1);
     test_include_self_backup();
     test_native_backup_of_a_changing_source();
     test_include_network_config_backup();

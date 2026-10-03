@@ -2481,7 +2481,7 @@ uid/gid, and xattrs on both names.
 
 ## D27 — 2026-08-24 — Destination free-space preflight
 
-**Status:** Implemented
+**Status:** Implemented; an update counts the backup it replaces since D98
 
 **Decision:** Before reserving a backup container, backup estimates the
 selected plan's source bytes and compares that estimate with the destination
@@ -2525,7 +2525,7 @@ it is a separate decision rather than an implicit escape from this guard.
 
 ## D28 — 2026-08-24 — Interactive backup progress is informational and backup-only
 
-**Status:** Implemented
+**Status:** Implemented; an update shows what it checked since D98
 
 **Decision:** A live backup counts successful regular-file content bytes and,
 when stdout is an interactive terminal, periodically displays those bytes
@@ -5625,3 +5625,41 @@ folders that are easiest to replace and missed the ones that are not.
 
 **Relationship:** Keeps D84's deferral as the outermost order.
 
+---
+
+## D98 — 2026-10-03 — An update counts the backup it replaces
+
+**Status:** Implemented
+
+**Decision:** Every manifest records the backup's estimated size on its
+destination, D27's estimate, as `SIZE`. Before an update, the free-space
+preflight subtracts the size recorded in the backup it would update from the
+estimate and compares the rest with free space. That backup is this
+install's, when it is finished or being updated, or the finished backup of
+another install that the user chose to update (D88). An unfinished first
+backup and one without a recorded size are credited nothing. To know which
+backup applies, the destination's representation is probed and the D88
+question asked before the preflight. A dry run credits the backup a live run
+would update, or would offer to update.
+
+The progress line of an update or a resumed backup shows the bytes checked,
+those copied plus those found already in the backup, against the estimate,
+and the bytes copied beside them:
+`Progress: 21.4G/37.1G checked, 483.6M copied, ...`. A first backup's line
+is unchanged.
+
+**Why:** The preflight compared the whole estimate with free space, while the
+backup being updated already occupies most of that estimate on the same
+destination and an update rewrites only what changed. A destination with room
+for one copy of a backup refused every update of it. The progress line
+divided copied bytes by the whole estimate, so an update ended at a small
+fraction of it.
+
+**Rejected:** Measuring the exact difference in advance compares every source
+file with its copy before capture, a second pass of per-file metadata calls
+on destinations where D45 measured them as slow; summing the existing payload
+walks it for the same reason. The recorded size is approximate, as D27's
+estimate is: the payload of files deleted from the source is removed after
+the capture, so an update can briefly need more than the difference. A write
+failure stays the authoritative out-of-space signal, and the interrupted
+update resumes.

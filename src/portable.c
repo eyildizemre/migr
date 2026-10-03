@@ -3592,6 +3592,10 @@ static int capture_node(PortableCaptureContext *context,
                     close(source_fd);
                     return -1;
                 }
+                if (payload == 1)
+                    backup_capture_report_unchanged(
+                        context->progress_report, (off_t)current.size,
+                        logical[0] == '\0' ? root->capture_path : logical);
                 if (payload == 1 && matches) {
                     xattrs_free(&xattrs);
                     return close(source_fd) == 0 ? 0 : -1;

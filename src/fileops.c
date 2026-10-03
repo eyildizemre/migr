@@ -1547,6 +1547,8 @@ static BackupCaptureStatus capture_regular_at(
                 failed = 1;
             if (failed)
                 return BACKUP_CAPTURE_ERROR;
+            backup_capture_report_unchanged(report, source_snapshot.st_size,
+                                            src);
             if (ctx->inode_map != NULL && source_snapshot.st_nlink > 1 &&
                 native_inode_map_insert(ctx->inode_map,
                                         source_snapshot.st_dev,
@@ -1946,14 +1948,28 @@ int backup_capture_report_tick(BackupCaptureReport *report,
     if (report->progress_cb != NULL &&
         backup_progress_should_fire(&report->progress_last_fired,
                                     report->progress_unthrottled))
-        report->progress_cb(report->bytes_copied, report->current_path,
-                            report->progress_userdata);
+        report->progress_cb(report->bytes_copied, report->bytes_unchanged,
+                            report->current_path, report->progress_userdata);
     if (report->sync_interval_bytes > 0 &&
         backup_sync_due(&report->bytes_since_sync, chunk_size,
                         report->sync_interval_bytes) &&
         syncfs(destination_fd) != 0)
         return -1;
     return 0;
+}
+
+void backup_capture_report_unchanged(BackupCaptureReport *report,
+                                     off_t bytes, const char *path)
+{
+    if (report == NULL)
+        return;
+    report->bytes_unchanged += bytes;
+    snprintf(report->current_path, sizeof(report->current_path), "%s", path);
+    if (report->progress_cb != NULL &&
+        backup_progress_should_fire(&report->progress_last_fired,
+                                    report->progress_unthrottled))
+        report->progress_cb(report->bytes_copied, report->bytes_unchanged,
+                            report->current_path, report->progress_userdata);
 }
 
 static int native_open_relative_parent(int root_fd, const char *rel_path,

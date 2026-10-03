@@ -1156,6 +1156,7 @@ static void test_another_installs_backup_is_taken_only_by_name(void)
     Manifest theirs;
     make_reference_manifest(&theirs);
     theirs.updated = FIXED_TIME;
+    theirs.size = 4096;
     BackupContainer c;
     check(container_reserve(test_root, OWNER, FIXED_TIME, &c) == CONTAINER_OK &&
               manifest_write_v1_at(container_root_fd(&c), &theirs) == 0 &&
@@ -1172,11 +1173,11 @@ static void test_another_installs_backup_is_taken_only_by_name(void)
               container_survey_fd(root_fd, OWNER, &mine, &survey) == 0 &&
               survey.own == 0 && survey.other == 1 &&
               strcmp(survey.other_name, "migr-" OWNER) == 0 &&
-              survey.other_updated == FIXED_TIME,
-          "it is counted as another install's, with its name and time");
+              survey.other_updated == FIXED_TIME && survey.other_size == 4096,
+          "it is counted as another install's, with its name, time and size");
     check(container_survey_fd(root_fd, OWNER, &theirs, &survey) == 0 &&
-              survey.own == 1 && survey.other == 0,
-          "for its own install it is that install's");
+              survey.own == 1 && survey.own_size == 4096 && survey.other == 0,
+          "for its own install it is that install's, with its size");
 
     Manifest portable = mine;
     portable.representation = CLONE_PORTABLE_SIDECAR;
@@ -1203,6 +1204,22 @@ static void test_another_installs_backup_is_taken_only_by_name(void)
     check(container_survey_fd(root_fd, OWNER, &mine, &survey) == 0 &&
               survey.own == 0 && survey.other == 0,
           "one left being updated is not offered");
+    check(container_survey_fd(root_fd, OWNER, &theirs, &survey) == 0 &&
+              survey.own == 1 && survey.own_size == 4096,
+          "one being updated keeps its size for its own install");
+    if (root_fd >= 0)
+        close(root_fd);
+
+    fresh_test_root();
+    check(container_reserve(test_root, OWNER, FIXED_TIME, &c) == CONTAINER_OK &&
+              manifest_write_v1_at(container_root_fd(&c), &theirs) == 0,
+          "fixture: leave a first backup unfinished");
+    container_close(&c);
+    root_fd = open(test_root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    check(root_fd >= 0 &&
+              container_survey_fd(root_fd, OWNER, &theirs, &survey) == 0 &&
+              survey.own == 1 && survey.own_size == 0,
+          "an unfinished first backup counts no size");
     if (root_fd >= 0)
         close(root_fd);
     fresh_test_root();

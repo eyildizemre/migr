@@ -260,9 +260,11 @@ typedef struct {
 } ProgressTrace;
 
 static void record_portable_progress(off_t bytes_copied,
+                                     off_t bytes_unchanged,
                                      const char *current_path,
                                      void *userdata)
 {
+    (void)bytes_unchanged;
     (void)current_path;
     ProgressTrace *trace = userdata;
     if (trace == NULL)

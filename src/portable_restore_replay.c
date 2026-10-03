@@ -2461,7 +2461,7 @@ static int replay_verification_snapshot(ReplayVerificationProgress *display,
         replay_verification_progress_stop_ticker(display);
         return 0;
     }
-    return progress_ticker_snapshot(&display->ticker, checked, 0, 0, 0,
+    return progress_ticker_snapshot(&display->ticker, checked, 0, 0, 0, 0,
                                     "verification", now);
 }
 

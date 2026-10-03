@@ -158,6 +158,7 @@ typedef enum {
 } BackupCaptureStatus;
 
 typedef void (*BackupProgressCallback)(off_t bytes_copied,
+                                       off_t bytes_unchanged,
                                        const char *current_path,
                                        void *userdata);
 
@@ -191,6 +192,8 @@ typedef enum {
  * content bytes only. Hardlinked siblings add no new bytes because they are
  * linked to an existing representative, matching the source-size accounting
  * used by backup_plan_estimate_size().
+ * bytes_unchanged counts the regular-file bytes an update or resume found
+ * already in the backup and did not copy.
  * bytes_since_sync accumulates the same content bytes until the configured
  * periodic-sync interval is reached; an interval of zero disables syncing.
  * The failure fields are populated by portable capture; native capture keeps
@@ -201,6 +204,7 @@ typedef struct {
     BackupCaptureFailureKind failure_kind;
     int failure_errno;
     off_t bytes_copied;
+    off_t bytes_unchanged;
     char current_path[PATH_MAX];
     off_t bytes_since_sync;
     off_t sync_interval_bytes;
@@ -233,6 +237,10 @@ int backup_capture_report_has_changes(const BackupCaptureReport *report);
 void backup_capture_reread_pause(unsigned int attempt);
 int backup_capture_report_tick(BackupCaptureReport *report,
                                off_t chunk_size, int destination_fd);
+/* A file the backup already holds as it is now: counts its bytes as
+ * unchanged and shows path as the current one. */
+void backup_capture_report_unchanged(BackupCaptureReport *report,
+                                     off_t bytes, const char *path);
 
 #ifdef BACKUP_TEST_HOOKS
 typedef void (*BackupTestCaptureHook)(const char *source_path,
