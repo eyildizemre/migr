@@ -279,7 +279,10 @@ DconfRestoreStatus dconf_restore_apply(int database_fd, size_t *applied_keys)
                  runtime_dir) >= (int)sizeof(runtime_env))
         goto done;
 
-    const char *const dump_env[] = { profile_env, config_env, NULL };
+    // dconf keeps state in the runtime directory even to read; the invoker's
+    // environment may name root's, which the user cannot write.
+    const char *const dump_env[] = { profile_env, config_env, runtime_env,
+                                     NULL };
     RunCommandOptions dump_options = {
         .drop_identity = target.drop_identity,
         .uid = target.uid,

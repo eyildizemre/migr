@@ -131,8 +131,10 @@ static int fake_dconf(int argc, char *argv[])
                     env_is("DCONF_PROFILE", expected_profile);
         free(profile);
         free(database);
-        snprintf(line, sizeof(line), "dump %s config=%s",
-                 valid ? "valid" : "invalid", config != NULL ? config : "");
+        const char *runtime = getenv("XDG_RUNTIME_DIR");
+        snprintf(line, sizeof(line), "dump %s config=%s runtime=%s",
+                 valid ? "valid" : "invalid", config != NULL ? config : "",
+                 runtime != NULL ? runtime : "");
         log_line(line);
         if (env_is("MIGR_FAKE_DCONF_FAIL", "dump"))
             return 3;
@@ -306,16 +308,30 @@ int main(int argc, char *argv[])
     setenv("PATH", fixture.bin, 1);
 
     fixture_reset_log(&fixture);
+    // sudo may leave root's runtime directory in the environment.
+    const char *inherited = getenv("XDG_RUNTIME_DIR");
+    char *saved_runtime = inherited != NULL ? strdup(inherited) : NULL;
+    setenv("XDG_RUNTIME_DIR", "/run/user/0", 1);
     check(dconf_restore_apply(database_fd, &keys) == DCONF_RESTORE_APPLIED &&
               keys == 3,
           "a running session gets the backup's settings loaded");
+    if (saved_runtime != NULL)
+        setenv("XDG_RUNTIME_DIR", saved_runtime, 1);
+    else
+        unsetenv("XDG_RUNTIME_DIR");
+    free(saved_runtime);
     log = fixture_log(&fixture);
     char expected_load[PATH_MAX * 2 + 64];
     snprintf(expected_load, sizeof(expected_load),
              "load stdin=match bus=unix:path=%s runtime=%s\n", fixture.bus,
              fixture.runtime_dir);
+    char expected_dump_runtime[PATH_MAX + 16];
+    snprintf(expected_dump_runtime, sizeof(expected_dump_runtime),
+             "runtime=%s\nload", fixture.runtime_dir);
     check(strstr(log, "dump valid config=") != NULL,
           "the dump reads a private copy of the backup through its own profile");
+    check(strstr(log, expected_dump_runtime) != NULL,
+          "the dump uses the user's runtime directory, not the invoker's");
     check(strstr(log, expected_load) != NULL,
           "the load receives the whole dump over the user's session bus");
     check(work_dir_removed(log), "the private work directory is removed");
