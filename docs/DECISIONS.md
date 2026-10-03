@@ -5540,7 +5540,7 @@ replay as D86 rewrites desktop state.
 
 ## D95 — 2026-10-02 — Restore installs only the packages the system lacks
 
-**Status:** Implemented
+**Status:** Implemented; the install's own output is not shown since D99
 
 **Decision:** Before the install transaction, restore reads which listed
 packages the system already has, with the installed-state query D46 runs
@@ -5674,3 +5674,31 @@ estimate is: the payload of files deleted from the source is removed after
 the capture, so an update can briefly need more than the difference. A write
 failure stays the authoritative out-of-space signal, and the interrupted
 update resumes.
+
+---
+
+## D99 — 2026-10-04 — Install commands run without their output
+
+**Status:** Implemented
+
+**Decision:** The package install transaction (D46, D95) and each Flatpak
+install (D76) run with standard output discarded and standard error kept,
+its last 4 KiB. restore prints one line before the command; on a terminal,
+the time the command has taken follows that line and is redrawn until it
+ends. When the command exits with a nonzero status, a warning names it and
+its status and the kept errors follow. A successful command shows nothing of
+its own. The accounting after it is unchanged: packages and applications
+that did not install are counted and listed in "What's left for you".
+
+**Why:** Each tool prints its whole transaction: dnf a table of every
+package and dependency, a line for each download and install, and its
+scriptlets' output; Flatpak the permissions of each application and a
+progress table it redraws for the terminal's width, which breaks when the
+window changes size. A Fedora 44 restore installing 86 packages and their
+dependencies printed about 1,700 lines. What matters afterwards is already in
+restore's own summary: what installed, and what did not and why to look.
+
+**Rejected:** Parsing each tool's progress lines into one of migr's own
+depends on every tool's output format and language. Quiet flags differ
+between tools and still print some progress; discarding standard output
+does the same for all of them.

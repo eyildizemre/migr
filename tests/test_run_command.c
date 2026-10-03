@@ -173,6 +173,25 @@ int main(void)
     check(run_command_capture(echo_argv, output, 0) == -1,
           "a zero-size output buffer is rejected before anything is spawned");
 
+    printf(BLUE "::" NC " run_command_errors (unit)\n");
+
+    char errors[64];
+    char *const mixed_argv[] = {
+        "sh", "-c", "echo progress; echo broken >&2; exit 3", NULL
+    };
+    rc = run_command_errors(mixed_argv, errors, sizeof(errors));
+    check(rc == 3 && strcmp(errors, "broken\n") == 0,
+          "only the command's errors are kept, with its exit code");
+    char tail[16];
+    char *const many_errors_argv[] = { "sh", "-c", "seq 1 3000 >&2", NULL };
+    rc = run_command_errors(many_errors_argv, tail, sizeof(tail));
+    check(rc == 0 && strlen(tail) == sizeof(tail) - 1U &&
+              strcmp(tail + strlen(tail) - 10, "2999\n3000\n") == 0,
+          "errors longer than the buffer keep their end");
+    check(run_command_errors(true_argv, NULL, sizeof(errors)) == -1 &&
+              run_command_errors(true_argv, errors, 0) == -1,
+          "a missing errors buffer is rejected before anything is spawned");
+
     printf(BLUE "::" NC " run_command_capture_with (unit)\n");
 
     setenv("MIGR_TEST_INHERITED", "base", 1);

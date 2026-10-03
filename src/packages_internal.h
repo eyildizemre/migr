@@ -17,6 +17,10 @@ void package_free_name_list(char **names, int count);
 
 /* run_command() and run_command_capture(), or the test hooks in their place. */
 int package_run_command(char *const argv[]);
+/* Prints line and runs an install command without its progress output; on a
+ * terminal the time it has taken follows line. What the command reports as
+ * errors is shown only when it fails. Returns its exit status. */
+int package_install_command(char *const argv[], const char *line);
 int package_capture_command(char *const argv[], char *output,
                             size_t output_size);
 

@@ -392,6 +392,65 @@ int package_capture_command(char *const argv[], char *output,
     return run_command_capture(argv, output, output_size);
 }
 
+typedef struct {
+    const char *line;
+    struct timespec started;
+} PackageInstallDisplay;
+
+static void package_install_redraw(const ProgressTickerSnapshot *snapshot,
+                                   const struct timespec *now, void *context)
+{
+    (void)snapshot;
+    const PackageInstallDisplay *display = context;
+    char elapsed[32];
+    format_duration((long)timespec_elapsed_seconds(&display->started, now),
+                    elapsed, sizeof(elapsed));
+    printf("\r%s elapsed %s", display->line, elapsed);
+    fflush(stdout);
+}
+
+int package_install_command(char *const argv[], const char *line)
+{
+    printf("%s", line);
+#ifdef PACKAGES_TEST_HOOKS
+    if (packages_test_restore_override && packages_test_run_hook != NULL)
+    {
+        printf("\n");
+        return packages_test_run_hook(argv, packages_test_run_context);
+    }
+#endif
+    // The ticker redraws only once no snapshot came for a while; one at the
+    // start keeps it redrawing the elapsed time until the command ends.
+    PackageInstallDisplay display = { .line = line };
+    ProgressTicker ticker;
+    int ticking = isatty(STDOUT_FILENO) &&
+                  clock_gettime(CLOCK_MONOTONIC, &display.started) == 0 &&
+                  progress_ticker_start(&ticker, package_install_redraw,
+                                        &display) == 0;
+    if (ticking)
+        (void)progress_ticker_snapshot(&ticker, 0, 0, 0, 0, 0, NULL,
+                                       &display.started);
+    char errors[4096];
+    int status = run_command_errors(argv, errors, sizeof(errors));
+    // A live thread would keep pointers into this stack frame.
+    if (ticking && progress_ticker_stop(&ticker) != 0)
+        abort();
+    printf("\n");
+    if (status != 0)
+    {
+        // Named after the program env runs, not env (D91).
+        size_t name = 0;
+        while (argv[name + 1] != NULL && (strcmp(argv[name], "env") == 0 ||
+                                          strchr(argv[name], '=') != NULL))
+            name++;
+        print_warning("  %s exited with status %d.\n", argv[name], status);
+        if (errors[0] != '\0')
+            fprintf(stderr, "%s%s", errors,
+                    errors[strlen(errors) - 1U] == '\n' ? "" : "\n");
+    }
+    return status;
+}
+
 static char *const *package_installed_query(distro_t distro)
 {
     static char *const debian_query[] = {
@@ -614,7 +673,8 @@ void package_free_name_list(char **names, int count)
 // repositories have.
 static void package_install_batch(distro_t distro, char *const *prefix,
                                   size_t prefix_count, char **pkgs,
-                                  size_t pkg_count, int *had_error)
+                                  size_t pkg_count, const char *line,
+                                  int *had_error)
 {
     size_t argv_count = prefix_count + pkg_count + 1U;
     char **argv = argv_count <= SIZE_MAX / sizeof(*argv)
@@ -631,7 +691,7 @@ static void package_install_batch(distro_t distro, char *const *prefix,
     {
         if (package_build_argv(argv, prefix, prefix_count, pkgs, pkg_count,
                                arch_available) != 0)
-            (void)package_run_command(argv);
+            (void)package_install_command(argv, line);
     }
     free(arch_available);
     free(argv);
@@ -724,11 +784,12 @@ static int package_restore_list(distro_t distro, char *const *prefix,
 
     if (online && missing_count != 0)
     {
-        printf("  %zu of %zu are already installed; installing %zu (this may "
-               "take a while)...\n",
-               pkg_count - missing_count, pkg_count, missing_count);
+        char line[128];
+        snprintf(line, sizeof(line), "  %zu of %zu are already installed; "
+                 "installing %zu (this may take a while)...",
+                 pkg_count - missing_count, pkg_count, missing_count);
         package_install_batch(distro, prefix, prefix_count, missing,
-                              missing_count, had_error);
+                              missing_count, line, had_error);
         free(inventory);
         inventory = package_capture_query(query, "installed packages",
                                           had_error);

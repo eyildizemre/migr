@@ -4107,6 +4107,74 @@ int run_command(char *const argv[])
     return -1; // should not reach here
 }
 
+int run_command_errors(char *const argv[], char *errors, size_t errors_size)
+{
+    if (errors == NULL || errors_size == 0)
+        return -1;
+    errors[0] = '\0';
+    int pipefd[2];
+    if (pipe2(pipefd, O_CLOEXEC) != 0)
+        return -1;
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == -1)
+    {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return -1;
+    }
+    if (pid == 0)
+    {
+        // No stdio until exec, as in run_command().
+        int null_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+        if (null_fd < 0 || dup2(null_fd, STDOUT_FILENO) < 0 ||
+            dup2(pipefd[1], STDERR_FILENO) < 0)
+            _exit(1);
+        execvp(argv[0], argv);
+        _exit(1);
+    }
+    close(pipefd[1]);
+    // Only the end is kept: a failing command says why last.
+    size_t used = 0;
+    char chunk[4096];
+    for (;;)
+    {
+        ssize_t got = read(pipefd[0], chunk, sizeof(chunk));
+        if (got < 0 && errno == EINTR)
+            continue;
+        if (got <= 0)
+            break;
+        size_t length = (size_t)got;
+        size_t room = errors_size - 1U;
+        if (length >= room)
+        {
+            memcpy(errors, chunk + length - room, room);
+            used = room;
+        }
+        else
+        {
+            if (used + length > room)
+            {
+                size_t drop = used + length - room;
+                memmove(errors, errors + drop, used - drop);
+                used -= drop;
+            }
+            memcpy(errors + used, chunk, length);
+            used += length;
+        }
+    }
+    errors[used] = '\0';
+    close(pipefd[0]);
+    int status;
+    pid_t waited;
+    do
+        waited = waitpid(pid, &status, 0);
+    while (waited < 0 && errno == EINTR);
+    if (waited == -1 || !WIFEXITED(status))
+        return -1;
+    return WEXITSTATUS(status);
+}
+
 // Inherited from the elevated process, these describe root rather than the
 // user a dropped child runs as; without them consumers re-derive from HOME.
 static const char *const identity_env_dropped[] = {

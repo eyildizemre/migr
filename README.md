@@ -272,8 +272,7 @@ On the text screen:
 
 ```text
 Packages
-  349 of 362 are already installed; installing 13 (this may take a while)...
-...
+  349 of 362 are already installed; installing 13 (this may take a while)... elapsed 02:41
   362 installed, 0 skipped.
 
 Groups

@@ -501,6 +501,16 @@ int get_dir_size(const char *path, off_t *size);
 int run_command(char *const argv[]);
 
 /**
+ * @brief run_command() with the command's standard output discarded and its
+ *        standard error kept: the last errors_size - 1 bytes of it, always
+ *        NUL-terminated, for the caller to show when the command fails.
+ *
+ * @return The child's exit status, or -1 if the arguments are invalid or
+ *         pipe, fork, or waitpid fails.
+ */
+int run_command_errors(char *const argv[], char *errors, size_t errors_size);
+
+/**
  * @brief Executes a command and captures its stdout into a caller-supplied buffer.
  *
  * Uses fork/execvp with an anonymous pipe redirecting the child's stdout.

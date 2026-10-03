@@ -133,7 +133,10 @@ static void install_flatpak_apps(const FlatpakApp *apps, size_t count,
             done[i] = 1;
         }
         argv[argc] = NULL;
-        (void)package_run_command(argv);
+        char line[sizeof(apps[first].remote) + 64];
+        snprintf(line, sizeof(line), "  Installing %zu from %s (this may take "
+                 "a while)...", argc - 5U, apps[first].remote);
+        (void)package_install_command(argv, line);
     }
     free(argv);
     free(done);
@@ -220,7 +223,6 @@ void restore_flatpak_apps(int source_root_fd, int online, FILE *todo,
     }
     else if (wanted_count != 0)
     {
-        printf("Installing Flatpak applications (this may take a while)...\n");
         install_flatpak_apps(apps, count, wanted, had_error);
         free(installed);
         installed = package_capture_query(installed_query,
