@@ -564,15 +564,41 @@ static int package_inventory_contains(distro_t distro, const char *inventory,
     return 0;
 }
 
-static char *package_arch_available(int *had_error)
+// The names its repositories have, where one name they lack makes the
+// package manager refuse the whole install (pacman, apt-get); NULL where it
+// skips such names itself (dnf --skip-unavailable).
+static char *const *package_available_query(distro_t distro)
 {
-    char *const query[] = {"pacman", "-Slq", NULL};
-    return package_capture_query(query, "Arch package availability", had_error);
+    static char *const debian_query[] = {"apt-cache", "pkgnames", NULL};
+    static char *const arch_query[] = {"pacman", "-Slq", NULL};
+    switch (distro)
+    {
+        case DISTRO_DEBIAN: return debian_query;
+        case DISTRO_ARCH: return arch_query;
+        default: return NULL;
+    }
+}
+
+// A Debian name can carry an architecture ("libc6:i386"); the repositories
+// list the name without it.
+static int package_available_contains(const char *available,
+                                      const char *package)
+{
+    const char *colon = strchr(package, ':');
+    if (colon == NULL)
+        return package_plain_list_contains(available, package);
+    char name[256];
+    size_t length = (size_t)(colon - package);
+    if (length >= sizeof(name))
+        return 0;
+    memcpy(name, package, length);
+    name[length] = '\0';
+    return package_plain_list_contains(available, name);
 }
 
 static size_t package_build_argv(char **argv, char *const *prefix,
                                  size_t prefix_count, char **pkgs,
-                                 size_t pkg_count, const char *arch_available)
+                                 size_t pkg_count, const char *available)
 {
     for (size_t index = 0; index < prefix_count; index++)
         argv[index] = prefix[index];
@@ -580,8 +606,8 @@ static size_t package_build_argv(char **argv, char *const *prefix,
     size_t install_count = 0;
     for (size_t index = 0; index < pkg_count; index++)
     {
-        if (arch_available != NULL &&
-            !package_plain_list_contains(arch_available, pkgs[index]))
+        if (available != NULL &&
+            !package_available_contains(available, pkgs[index]))
             continue;
         argv[prefix_count + install_count] = pkgs[index];
         install_count++;
@@ -669,8 +695,8 @@ void package_free_name_list(char **names, int count)
     free(names);
 }
 
-// Installs pkgs in one package manager call; on Arch, only those its
-// repositories have.
+// Installs pkgs in one package manager call; with apt and pacman, only those
+// their repositories have.
 static void package_install_batch(distro_t distro, char *const *prefix,
                                   size_t prefix_count, char **pkgs,
                                   size_t pkg_count, const char *line,
@@ -685,15 +711,17 @@ static void package_install_batch(distro_t distro, char *const *prefix,
         *had_error = 1;
         return;
     }
-    char *arch_available = NULL;
-    if (distro != DISTRO_ARCH ||
-        (arch_available = package_arch_available(had_error)) != NULL)
+    char *const *query = package_available_query(distro);
+    char *available = NULL;
+    if (query == NULL ||
+        (available = package_capture_query(query, "package availability",
+                                           had_error)) != NULL)
     {
         if (package_build_argv(argv, prefix, prefix_count, pkgs, pkg_count,
-                               arch_available) != 0)
+                               available) != 0)
             (void)package_install_command(argv, line);
     }
-    free(arch_available);
+    free(available);
     free(argv);
 }
 

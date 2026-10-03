@@ -229,10 +229,14 @@ static int package_capture_fixture(char *const argv[], char *output,
         fixture->installed_query_count++;
         text = installed;
     }
-    else if (fixture->distro == DISTRO_ARCH &&
-             strcmp(argv[0], "pacman") == 0 &&
-             argv[1] != NULL && strcmp(argv[1], "-Slq") == 0 &&
-             argv[2] == NULL)
+    else if ((fixture->distro == DISTRO_ARCH &&
+              strcmp(argv[0], "pacman") == 0 &&
+              argv[1] != NULL && strcmp(argv[1], "-Slq") == 0 &&
+              argv[2] == NULL) ||
+             (fixture->distro == DISTRO_DEBIAN &&
+              strcmp(argv[0], "apt-cache") == 0 &&
+              argv[1] != NULL && strcmp(argv[1], "pkgnames") == 0 &&
+              argv[2] == NULL))
     {
         fixture->availability_query_count++;
         text = fixture->available_output;
@@ -592,7 +596,8 @@ static void test_restore_packages_batch_prefixes(void)
     } cases[] = {
         { DISTRO_DEBIAN, "Debian", debian_prefix,
           sizeof(debian_prefix) / sizeof(debian_prefix[0]),
-          "alpha\talpha\tinstalled\nbeta\tbeta\tinstalled\n", NULL, 0U },
+          "alpha\talpha\tinstalled\nbeta\tbeta\tinstalled\n", "alpha\nbeta\n",
+          1U },
         { DISTRO_FEDORA, "Fedora", fedora_prefix,
           sizeof(fedora_prefix) / sizeof(fedora_prefix[0]),
           "alpha\nbeta\n", NULL, 0U },
@@ -824,6 +829,7 @@ static void test_restore_packages_single_pass_accounting(void)
             "alpha\talpha\tinstalled\n"
             "beta\tbeta\tconfig-files\n",
         .explicit_output = "alpha\n",
+        .available_output = "alpha\nbeta\n",
     };
     PackageRestoreCaseResult debian_status_result = {0};
     fixture_ok = run_restore_packages_case(
@@ -834,6 +840,34 @@ static void test_restore_packages_single_pass_accounting(void)
               debian_status_result.had_error == 0 &&
               debian_status_result.skipped_matches,
           "Debian final-state accounting accepts only installed dpkg states");
+
+    // apt-get refuses a whole install for one name it cannot find.
+    static const char *const debian_unavailable[] = {"code"};
+    PackageRunFixture debian_filter = {
+        .expected_prefix = debian_prefix,
+        .expected_prefix_count = sizeof(debian_prefix) /
+                                 sizeof(debian_prefix[0]),
+        .forbidden_tokens = debian_unavailable,
+        .forbidden_token_count = 1U,
+        .installed_before = "",
+        .installed_output =
+            "alpha\talpha\tinstalled\n"
+            "libfoo\tlibfoo:i386\tinstalled\n",
+        .explicit_output = "",
+        .available_output = "alpha\nlibfoo\n",
+    };
+    PackageRestoreCaseResult debian_filter_result = {0};
+    fixture_ok = run_restore_packages_case(
+        DISTRO_DEBIAN, "alpha\ncode\nlibfoo:i386\n", &debian_filter,
+        "code\n", &debian_filter_result);
+    check(fixture_ok && debian_filter.capture_ok &&
+              debian_filter.availability_query_count == 1U &&
+              debian_filter.call_count == 1U &&
+              debian_filter.max_batch_count == 2U &&
+              !debian_filter.forbidden_seen &&
+              debian_filter_result.skipped_matches,
+          "Debian sends apt-get only what its repositories have, foreign "
+          "architectures included, and lists the rest");
 
     PackageRunFixture offline = {
         .expected_prefix = fedora_prefix,

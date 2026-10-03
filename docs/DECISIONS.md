@@ -3831,7 +3831,8 @@ and keeping the parallel path as an unmeasured optional branch.
 ## D46 — 2026-09-11 — Package restore uses one install transaction and verifies final state
 
 **Status:** Implemented; apt runs without questions since D91; only the
-missing packages are installed since D95
+missing packages are installed since D95; apt's targets are checked against
+its repositories since 2026-10-04
 
 **Decision:** Package restore performs at most one real install transaction per
 restore. Debian/Ubuntu keeps `apt-get install -y -m`. Fedora/RHEL adds
@@ -3874,6 +3875,14 @@ query process per requested package.
 **Relationship:** Supersedes D40 and the per-package fallback portion of D2. D1's
 exact skipped-package artifact and summary, D12's explicit-package export, and the
 distro-specific install commands remain in force.
+
+**Revision (2026-10-04):** apt-get does not tolerate an unavailable target:
+`-m` covers package files that fail to download, while a name it cannot
+locate makes it refuse the whole transaction. Debian/Ubuntu therefore reads
+the names its repositories have with `apt-cache pkgnames`, as Arch reads
+`pacman -Slq`, and omits the others from the transaction. A name with an
+architecture (`libc6:i386`) is looked up without it. Accounting is
+unchanged: an omitted name is absent from final state and listed.
 
 ---
 
