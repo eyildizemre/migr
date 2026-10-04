@@ -503,15 +503,19 @@ check-sanitize:
 	$(MAKE) CFLAGS="$(CHECK_SANITIZE_FLAGS)" test
 
 # The host Phase B Valgrind gate runs VALGRIND_TESTS with strict compilation.
-# Its deliberate exclusions are documented with the list above.
+# Its deliberate exclusions are documented with the list above. Valgrind
+# reports go to one file per process, shown when a binary fails: written to
+# stderr, they would mix into the output that tests capture from children.
 check-valgrind:
 	@set -e; \
-	trap '$(MAKE) clean >/dev/null' EXIT; \
+	logs=$$(mktemp -d); \
+	trap 'rm -rf "$$logs"; $(MAKE) clean >/dev/null' EXIT; \
 	$(MAKE) clean; \
 	$(MAKE) CFLAGS="$(CHECK_STRICT_FLAGS)" $(VALGRIND_TESTS); \
 	for binary in $(VALGRIND_TESTS); do \
 		echo "==> valgrind ./$$binary"; \
-		valgrind --error-exitcode=1 --trace-children=yes --leak-check=full --track-origins=yes ./$$binary; \
+		rm -f "$$logs"/*; \
+		valgrind --error-exitcode=1 --trace-children=yes --leak-check=full --track-origins=yes --log-file="$$logs/%p.log" ./$$binary || { cat "$$logs"/*; exit 1; }; \
 	done
 
 # The host Phase B static-analysis gate: GCC analyzes every source file
