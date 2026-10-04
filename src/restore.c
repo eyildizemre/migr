@@ -937,8 +937,12 @@ void restore_test_set_dconf_hook(RestoreTestDconfHook hook, void *context)
 #endif
 
 // Loads the backed-up dconf database into a running session, where replacing
-// ~/.config/dconf/user alone is overwritten by the dconf service (D50).
-static void restore_dconf_settings(int database_fd, int *had_error)
+// ~/.config/dconf/user alone is overwritten by the dconf service (D50), with
+// paths under the backup's home folder naming this system's (D101).
+static void restore_dconf_settings(int database_fd, int home_fd,
+                                   const Manifest *m, const char *home,
+                                   const char *const *xdg_dirs,
+                                   int *had_error)
 {
     if (database_fd < 0)
         return;
@@ -950,7 +954,15 @@ static void restore_dconf_settings(int database_fd, int *had_error)
         return;
     }
 #endif
-    DconfRestoreStatus status = dconf_restore_apply(database_fd, &keys);
+    // The same table failed for the files rewritten before, and was
+    // reported there.
+    HomeRewritePair pairs[HOME_REWRITE_DCONF_MAX_PAIRS];
+    size_t pair_count = 0;
+    if (home_rewrite_dconf_pairs_build(m, xdg_dirs, home, pairs,
+                                       &pair_count) != 0)
+        pair_count = 0;
+    DconfRestoreStatus status = dconf_restore_apply(database_fd, home_fd,
+                                                    pairs, pair_count, &keys);
     if (status == DCONF_RESTORE_APPLIED && keys != 0)
     {
         printf("\nDesktop settings (dconf)\n");
@@ -966,6 +978,13 @@ static void restore_dconf_settings(int database_fd, int *had_error)
                       "running session, which may overwrite them. Log out, "
                       "then run the same restore again from a text console "
                       "(Ctrl+Alt+F3).\n");
+        if (had_error != NULL)
+            *had_error = 1;
+    }
+    else if (status == DCONF_RESTORE_HOME_NOT_REWRITTEN)
+    {
+        print_error("Error: Could not point the desktop settings in "
+                    "~/.config/dconf/user at this system's home folder\n");
         if (had_error != NULL)
             *had_error = 1;
     }
@@ -4039,7 +4058,9 @@ int restore_with_options(const char *source, const RestoreOptions *options)
             restore_selinux_label_roots(&m, home,
                                         (const char *const *)xdg_dirs,
                                         &had_portable_error);
-            restore_dconf_settings(dconf_database_fd, &had_portable_error);
+            restore_dconf_settings(dconf_database_fd, home_fd, &m, home,
+                                   (const char *const *)xdg_dirs,
+                                   &had_portable_error);
             if (m.has_network_config)
                 restore_network_config(source_root_fd, &had_portable_error);
             restore_system_lists(source_root_fd, &todo, &had_portable_error);
@@ -4387,7 +4408,8 @@ int restore_with_options(const char *source, const RestoreOptions *options)
             restore_podman_layers_json(home_fd, &had_error);
         restore_selinux_label_roots(&m, home, xdg_dirs, &had_error);
         int dconf_database_fd = native_dconf_database_fd(source_root_fd, &m);
-        restore_dconf_settings(dconf_database_fd, &had_error);
+        restore_dconf_settings(dconf_database_fd, home_fd, &m, home, xdg_dirs,
+                               &had_error);
         if (dconf_database_fd >= 0)
             close(dconf_database_fd);
     }

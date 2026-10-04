@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -17,10 +18,12 @@ const char *const home_rewrite_files[HOME_REWRITE_FILE_COUNT] = {
     ".local/share/recently-used.xbel"
 };
 
-static int pair_set(HomeRewritePair *pair, const char *source_path,
-                    const char *destination_path)
+static const char file_uri[] = "file://";
+
+// prefix is file_uri or shorter.
+static int pair_set(HomeRewritePair *pair, const char *prefix,
+                    const char *source_path, const char *destination_path)
 {
-    static const unsigned char file_uri[] = "file://";
     if (pair == NULL || source_path == NULL || source_path[0] == '\0' ||
         destination_path == NULL || destination_path[0] == '\0')
     {
@@ -38,16 +41,15 @@ static int pair_set(HomeRewritePair *pair, const char *source_path,
         return -1;
     }
 
-    memcpy(pair->source_uri, file_uri, HOME_REWRITE_URI_PREFIX_LENGTH);
-    memcpy(pair->source_uri + HOME_REWRITE_URI_PREFIX_LENGTH, source_path,
-           source_length);
-    pair->source_uri_length = HOME_REWRITE_URI_PREFIX_LENGTH + source_length;
+    size_t prefix_length = strlen(prefix);
+    memcpy(pair->source_uri, prefix, prefix_length);
+    memcpy(pair->source_uri + prefix_length, source_path, source_length);
+    pair->source_uri_length = prefix_length + source_length;
     pair->source_uri[pair->source_uri_length] = '\0';
-    memcpy(pair->destination_uri, file_uri, HOME_REWRITE_URI_PREFIX_LENGTH);
-    memcpy(pair->destination_uri + HOME_REWRITE_URI_PREFIX_LENGTH,
-           destination_path, destination_length);
-    pair->destination_uri_length =
-        HOME_REWRITE_URI_PREFIX_LENGTH + destination_length;
+    memcpy(pair->destination_uri, prefix, prefix_length);
+    memcpy(pair->destination_uri + prefix_length, destination_path,
+           destination_length);
+    pair->destination_uri_length = prefix_length + destination_length;
     pair->destination_uri[pair->destination_uri_length] = '\0';
     return 0;
 }
@@ -88,7 +90,7 @@ int home_rewrite_pairs_build(const Manifest *manifest,
         char source_path[PATH_MAX];
         if (manifest_root_source_path(
                 manifest, (int)(root - manifest->roots), source_path) != 0 ||
-            pair_set(&pairs[*pair_count], source_path,
+            pair_set(&pairs[*pair_count], file_uri, source_path,
                      destination_xdg_dirs == NULL
                          ? NULL : destination_xdg_dirs[key]) != 0)
             return -1;
@@ -96,10 +98,35 @@ int home_rewrite_pairs_build(const Manifest *manifest,
     }
 
     if (*pair_count >= HOME_REWRITE_MAX_PAIRS ||
-        pair_set(&pairs[*pair_count], manifest->source_home,
+        pair_set(&pairs[*pair_count], file_uri, manifest->source_home,
                  destination_home) != 0)
         return -1;
     (*pair_count)++;
+    return 0;
+}
+
+int home_rewrite_dconf_pairs_build(const Manifest *manifest,
+                                   const char *const *destination_xdg_dirs,
+                                   const char *destination_home,
+                                   HomeRewritePair pairs[], size_t *pair_count)
+{
+    HomeRewritePair uris[HOME_REWRITE_MAX_PAIRS];
+    size_t uri_count = 0;
+    if (pair_count == NULL ||
+        home_rewrite_pairs_build(manifest, destination_xdg_dirs,
+                                 destination_home, uris, &uri_count) != 0)
+        return -1;
+    static const char *const prefixes[] = { file_uri, "'", "\"" };
+    *pair_count = 0;
+    for (size_t index = 0; index < uri_count; index++)
+        for (size_t form = 0; form < sizeof(prefixes) / sizeof(prefixes[0]);
+             form++)
+            if (pair_set(&pairs[(*pair_count)++], prefixes[form],
+                         (const char *)uris[index].source_uri +
+                             HOME_REWRITE_URI_PREFIX_LENGTH,
+                         (const char *)uris[index].destination_uri +
+                             HOME_REWRITE_URI_PREFIX_LENGTH) != 0)
+                return -1;
     return 0;
 }
 
@@ -340,6 +367,40 @@ static int copy_back(int from_fd, int to_fd)
     }
 }
 
+char *home_rewrite_text(const char *text, const HomeRewritePair *pairs,
+                        size_t pair_count)
+{
+    if (text == NULL)
+    {
+        errno = EINVAL;
+        return NULL;
+    }
+    int fd = memfd_create("migr-home-rewrite", MFD_CLOEXEC);
+    if (fd < 0)
+        return NULL;
+    char *rewritten = NULL;
+    size_t consumed = 0;
+    off_t length = -1;
+    if (rewrite_flush(fd, (const unsigned char *)text, strlen(text), pairs,
+                      pair_count, 1, &consumed, NULL) == 0 &&
+        (length = lseek(fd, 0, SEEK_CUR)) >= 0 &&
+        (rewritten = malloc((size_t)length + 1U)) != NULL)
+    {
+        if (pread(fd, rewritten, (size_t)length, 0) == length)
+            rewritten[length] = '\0';
+        else
+        {
+            free(rewritten);
+            rewritten = NULL;
+            errno = EIO;
+        }
+    }
+    int saved = errno;
+    close(fd);
+    errno = saved;
+    return rewritten;
+}
+
 int home_rewrite_file_at(int dir_fd, const char *path,
                          const HomeRewritePair *pairs, size_t pair_count)
 {
@@ -372,6 +433,33 @@ int home_rewrite_file_at(int dir_fd, const char *path,
     int saved = errno;
     if (copy_fd >= 0)
         close(copy_fd);
+    if (close(fd) != 0 && !failed)
+    {
+        failed = 1;
+        saved = errno;
+    }
+    errno = saved;
+    return failed ? -1 : 0;
+}
+
+int home_rewrite_replace_at(int dir_fd, const char *path, int content_fd)
+{
+    int fd = openat(dir_fd, path, O_RDWR | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    struct stat st;
+    int failed = fstat(fd, &st) != 0;
+    if (!failed && !S_ISREG(st.st_mode))
+    {
+        errno = EINVAL;
+        failed = 1;
+    }
+    if (!failed)
+    {
+        struct timespec times[2] = { st.st_atim, st.st_mtim };
+        failed = copy_back(content_fd, fd) != 0 || futimens(fd, times) != 0;
+    }
+    int saved = errno;
     if (close(fd) != 0 && !failed)
     {
         failed = 1;

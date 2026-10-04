@@ -12,6 +12,8 @@
 #include <unistd.h>
 
 #include "dconf_restore.h"
+#include "home_rewrite.h"
+#include "manifest.h"
 
 #define GREEN "\033[0;32m"
 #define RED   "\033[0;31m"
@@ -20,12 +22,24 @@
 
 #define DATABASE_BYTES "GVDB-test-bytes"
 #define DUMP_TEXT \
+    "[org/gnome/desktop/background]\n" \
+    "picture-uri='file:///home/old/Pictures/sky.jpg'\n" \
+    "\n" \
     "[org/gnome/desktop/interface]\n" \
     "color-scheme='prefer-dark'\n" \
-    "clock-show-seconds=true\n" \
     "\n" \
     "[org/gnome/shell]\n" \
-    "enabled-extensions=['a@b']\n"
+    "favorite-apps=['/home/old', \"/home/old/it's\", '/home/older']\n"
+#define REWRITTEN_TEXT \
+    "[org/gnome/desktop/background]\n" \
+    "picture-uri='file:///home/new/Pictures/sky.jpg'\n" \
+    "\n" \
+    "[org/gnome/desktop/interface]\n" \
+    "color-scheme='prefer-dark'\n" \
+    "\n" \
+    "[org/gnome/shell]\n" \
+    "favorite-apps=['/home/new', \"/home/new/it's\", '/home/older']\n"
+#define COMPILED_PREFIX "compiled\n"
 
 static int failures;
 
@@ -151,12 +165,28 @@ static int fake_dconf(int argc, char *argv[])
         const char *runtime = getenv("XDG_RUNTIME_DIR");
         char line[PATH_MAX * 2 + 64];
         snprintf(line, sizeof(line), "load stdin=%s bus=%s runtime=%s",
-                 input != NULL && strcmp(input, DUMP_TEXT) == 0 ? "match"
-                                                                : "differs",
+                 input == NULL ? "differs" :
+                 strcmp(input, DUMP_TEXT) == 0 ? "match" :
+                 strcmp(input, REWRITTEN_TEXT) == 0 ? "rewritten" : "differs",
                  bus != NULL ? bus : "", runtime != NULL ? runtime : "");
         free(input);
         log_line(line);
         return env_is("MIGR_FAKE_DCONF_FAIL", "load") ? 4 : 0;
+    }
+    if (argc == 4 && strcmp(argv[1], "compile") == 0)
+    {
+        char keyfile[PATH_MAX];
+        snprintf(keyfile, sizeof(keyfile), "%s/user", argv[3]);
+        char *input = read_all_path(keyfile);
+        log_line("compile");
+        FILE *output = fopen(argv[2], "w");
+        int written = input != NULL && output != NULL &&
+                      fputs(COMPILED_PREFIX, output) >= 0 &&
+                      fputs(input, output) >= 0;
+        free(input);
+        if (output != NULL && fclose(output) != 0)
+            written = 0;
+        return written && !env_is("MIGR_FAKE_DCONF_FAIL", "compile") ? 0 : 5;
     }
     log_line("unexpected invocation");
     return 2;
@@ -171,6 +201,8 @@ typedef struct {
     char bus[PATH_MAX];
     char log[PATH_MAX];
     char database[PATH_MAX];
+    char home[PATH_MAX];
+    char home_database[PATH_MAX];
 } Fixture;
 
 static void fixture_path(char *out, const char *base, const char *leaf)
@@ -190,6 +222,9 @@ static void fixture_open(Fixture *fixture)
     fixture_path(fixture->runtime_root, fixture->root, "run-user");
     fixture_path(fixture->log, fixture->root, "log");
     fixture_path(fixture->database, fixture->root, "database");
+    fixture_path(fixture->home, fixture->root, "home");
+    fixture_path(fixture->home_database, fixture->home,
+                 ".config/dconf/user");
     if (snprintf(fixture->runtime_dir, sizeof(fixture->runtime_dir), "%s/%ju",
                  fixture->runtime_root, (uintmax_t)geteuid()) >=
         (int)sizeof(fixture->runtime_dir))
@@ -201,6 +236,7 @@ static void fixture_open(Fixture *fixture)
     if (mkdir(fixture->bin, 0755) != 0 || mkdir(fixture->empty_bin, 0755) != 0 ||
         mkdir(fixture->runtime_root, 0755) != 0 ||
         mkdir(fixture->runtime_dir, 0700) != 0 ||
+        mkdir(fixture->home, 0700) != 0 ||
         symlink("/proc/self/exe", dconf_link) != 0)
         fatal("prepare dconf fixture");
 
@@ -244,6 +280,12 @@ static void fixture_close(Fixture *fixture)
     char path[PATH_MAX];
     unlink(fixture->log);
     unlink(fixture->database);
+    unlink(fixture->home_database);
+    fixture_path(path, fixture->home, ".config/dconf");
+    rmdir(path);
+    fixture_path(path, fixture->home, ".config");
+    rmdir(path);
+    rmdir(fixture->home);
     unlink(fixture->bus);
     fixture_path(path, fixture->bin, "dconf");
     unlink(path);
@@ -280,6 +322,54 @@ static int work_dir_removed(const char *log)
     return lstat(path, &st) != 0 && errno == ENOENT;
 }
 
+// The restored database in the home folder, as replay leaves it.
+static int fixture_home_open(Fixture *fixture)
+{
+    char path[PATH_MAX];
+    fixture_path(path, fixture->home, ".config");
+    if (mkdir(path, 0700) != 0)
+        fatal("prepare home fixture");
+    fixture_path(path, fixture->home, ".config/dconf");
+    FILE *database = NULL;
+    if (mkdir(path, 0700) != 0 ||
+        (database = fopen(fixture->home_database, "w")) == NULL ||
+        fputs(DATABASE_BYTES, database) < 0 || fclose(database) != 0)
+        fatal("write home database fixture");
+    int fd = open(fixture->home, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0)
+        fatal("open home fixture");
+    return fd;
+}
+
+static void fixture_reset_home(Fixture *fixture)
+{
+    fixture_reset_log(fixture);
+    FILE *database = fopen(fixture->home_database, "w");
+    if (database == NULL || fputs(DATABASE_BYTES, database) < 0 ||
+        fclose(database) != 0)
+        fatal("reset home database fixture");
+}
+
+static void build_pairs(const char *source_home, HomeRewritePair *pairs,
+                        size_t *pair_count)
+{
+    static Manifest manifest;
+    memset(&manifest, 0, sizeof(manifest));
+    snprintf(manifest.source_home, sizeof(manifest.source_home), "%s",
+             source_home);
+    if (home_rewrite_dconf_pairs_build(&manifest, NULL, "/home/new", pairs,
+                                       pair_count) != 0)
+        fatal("build rewrite pairs");
+}
+
+static int home_database_is(Fixture *fixture, const char *expected)
+{
+    char *content = read_all_path(fixture->home_database);
+    int same = content != NULL && strcmp(content, expected) == 0;
+    free(content);
+    return same;
+}
+
 int main(int argc, char *argv[])
 {
     const char *slash = strrchr(argv[0], '/');
@@ -294,16 +384,55 @@ int main(int argc, char *argv[])
 
     size_t keys = 99;
     int database_fd = open_database(&fixture);
-    check(dconf_restore_apply(database_fd, &keys) == DCONF_RESTORE_NO_SESSION &&
-              keys == 0,
+    int home_fd = fixture_home_open(&fixture);
+    check(dconf_restore_apply(database_fd, home_fd, NULL, 0, &keys) ==
+              DCONF_RESTORE_NO_SESSION && keys == 0,
           "without a session bus the restored file is left as the result");
     char *log = fixture_log(&fixture);
     check(log[0] == '\0', "no dconf command runs without a session");
     free(log);
 
+    HomeRewritePair pairs[HOME_REWRITE_DCONF_MAX_PAIRS];
+    size_t pair_count = 0;
+    build_pairs("/home/old", pairs, &pair_count);
+    struct stat before, after;
+    if (stat(fixture.home_database, &before) != 0)
+        fatal("stat home database");
+    check(dconf_restore_apply(database_fd, home_fd, pairs, pair_count,
+                              &keys) == DCONF_RESTORE_NO_SESSION,
+          "without a session, settings naming the old home are rewritten");
+    check(home_database_is(&fixture, COMPILED_PREFIX REWRITTEN_TEXT) &&
+              stat(fixture.home_database, &after) == 0 &&
+              after.st_ino == before.st_ino,
+          "the rewritten dump is compiled into the same restored file, "
+          "URIs and quoted paths alike, longer names untouched");
+    log = fixture_log(&fixture);
+    check(work_dir_removed(log), "the private work directory is removed");
+    free(log);
+
+    fixture_reset_home(&fixture);
+    build_pairs("/home/elsewhere", pairs, &pair_count);
+    check(dconf_restore_apply(database_fd, home_fd, pairs, pair_count,
+                              &keys) == DCONF_RESTORE_NO_SESSION &&
+              home_database_is(&fixture, DATABASE_BYTES),
+          "a database with nothing to rewrite stays as restored");
+    log = fixture_log(&fixture);
+    check(strstr(log, "compile") == NULL, "nothing is compiled for it");
+    free(log);
+
+    fixture_reset_home(&fixture);
+    build_pairs("/home/old", pairs, &pair_count);
+    setenv("MIGR_FAKE_DCONF_FAIL", "compile", 1);
+    check(dconf_restore_apply(database_fd, home_fd, pairs, pair_count,
+                              &keys) == DCONF_RESTORE_HOME_NOT_REWRITTEN &&
+              home_database_is(&fixture, DATABASE_BYTES),
+          "a failed compile is reported and leaves the restored file");
+    fixture_reset_home(&fixture);
+
     fixture_bind_bus(&fixture);
     setenv("PATH", fixture.empty_bin, 1);
-    check(dconf_restore_apply(database_fd, &keys) == DCONF_RESTORE_UNAVAILABLE,
+    check(dconf_restore_apply(database_fd, home_fd, NULL, 0, &keys) ==
+              DCONF_RESTORE_UNAVAILABLE,
           "a session without dconf installed is reported as unavailable");
     setenv("PATH", fixture.bin, 1);
 
@@ -312,8 +441,8 @@ int main(int argc, char *argv[])
     const char *inherited = getenv("XDG_RUNTIME_DIR");
     char *saved_runtime = inherited != NULL ? strdup(inherited) : NULL;
     setenv("XDG_RUNTIME_DIR", "/run/user/0", 1);
-    check(dconf_restore_apply(database_fd, &keys) == DCONF_RESTORE_APPLIED &&
-              keys == 3,
+    check(dconf_restore_apply(database_fd, home_fd, NULL, 0, &keys) ==
+              DCONF_RESTORE_APPLIED && keys == 3,
           "a running session gets the backup's settings loaded");
     if (saved_runtime != NULL)
         setenv("XDG_RUNTIME_DIR", saved_runtime, 1);
@@ -338,8 +467,21 @@ int main(int argc, char *argv[])
     free(log);
 
     fixture_reset_log(&fixture);
+    check(dconf_restore_apply(database_fd, home_fd, pairs, pair_count,
+                              &keys) == DCONF_RESTORE_APPLIED && keys == 3,
+          "a running session gets the rewritten settings loaded");
+    log = fixture_log(&fixture);
+    check(strstr(log, "load stdin=rewritten") != NULL &&
+              strstr(log, "compile") == NULL &&
+              home_database_is(&fixture, DATABASE_BYTES),
+          "the load carries the paths of this system's home, and the file "
+          "is left to the session");
+    free(log);
+
+    fixture_reset_log(&fixture);
     setenv("MIGR_FAKE_DCONF_FAIL", "dump", 1);
-    check(dconf_restore_apply(database_fd, &keys) == DCONF_RESTORE_FAILED,
+    check(dconf_restore_apply(database_fd, home_fd, NULL, 0, &keys) ==
+              DCONF_RESTORE_FAILED,
           "a failed dump is reported");
     log = fixture_log(&fixture);
     check(strstr(log, "load") == NULL && work_dir_removed(log),
@@ -348,13 +490,14 @@ int main(int argc, char *argv[])
 
     fixture_reset_log(&fixture);
     setenv("MIGR_FAKE_DCONF_FAIL", "load", 1);
-    check(dconf_restore_apply(database_fd, &keys) == DCONF_RESTORE_FAILED &&
-              keys == 0,
+    check(dconf_restore_apply(database_fd, home_fd, NULL, 0, &keys) ==
+              DCONF_RESTORE_FAILED && keys == 0,
           "a failed load is reported");
 
     fixture_reset_log(&fixture);
     dconf_restore_test_set_dump_limit(16);
-    check(dconf_restore_apply(database_fd, &keys) == DCONF_RESTORE_FAILED,
+    check(dconf_restore_apply(database_fd, home_fd, NULL, 0, &keys) ==
+              DCONF_RESTORE_FAILED,
           "a dump larger than the limit is rejected");
     log = fixture_log(&fixture);
     check(strstr(log, "load") == NULL,
@@ -363,7 +506,8 @@ int main(int argc, char *argv[])
 
     fixture_reset_log(&fixture);
     setenv("MIGR_FAKE_DCONF_EMPTY", "1", 1);
-    check(dconf_restore_apply(database_fd, &keys) == DCONF_RESTORE_APPLIED &&
+    check(dconf_restore_apply(database_fd, home_fd, NULL, 0, &keys) ==
+              DCONF_RESTORE_APPLIED &&
               keys == 0,
           "an empty database applies nothing");
     log = fixture_log(&fixture);
@@ -371,9 +515,11 @@ int main(int argc, char *argv[])
     free(log);
 
     fixture_reset_log(&fixture);
-    check(dconf_restore_apply(-1, &keys) == DCONF_RESTORE_FAILED,
+    check(dconf_restore_apply(-1, home_fd, NULL, 0, &keys) ==
+              DCONF_RESTORE_FAILED,
           "an invalid database fd is rejected");
 
+    close(home_fd);
     close(database_fd);
     fixture_close(&fixture);
     if (failures != 0)

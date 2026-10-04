@@ -3624,6 +3624,7 @@ options remain in force.
 ## D41 — 2026-09-10 — Rewrite source HOME in two known desktop-state files
 
 **Status:** Implemented; extended by D86 (VERSION=1 manifests, native restore)
+and D101 (dconf)
 
 **Decision:** A VERSION=2 portable restore whose recorded `SOURCE_HOME` differs
 from the destination HOME rewrites that exact source-home prefix in only these two
@@ -3889,6 +3890,7 @@ unchanged: an omitted name is absent from final state and listed.
 ## D47 — 2026-09-16 — Translate XDG names in known desktop state and preserve destination user-dirs state
 
 **Status:** Implemented; extended by D86 (VERSION=1 manifests, native restore)
+and D101 (dconf)
 
 **Decision:** Extend D41's bounded `file://` rewrite for VERSION=2 portable
 selection restores with one source-to-destination pair for every captured XDG
@@ -5743,3 +5745,31 @@ settings, custom icons and emblems.
 
 **Relationship:** Limits D65; D80's dconf rule is unchanged and applies
 within a running session.
+
+## D101 — 2026-10-04 — Desktop settings name the restoring system's home folder
+
+**Status:** Implemented
+
+**Decision:** Before the dconf settings are used, every path in them under
+the backup's home or XDG folders is rewritten to the matching folder of this
+system, with the pairs of D41 and D47. In the text of `dconf dump /`, a path
+appears as a `file://` URI or as the start of a quoted string (`'/home/...`
+or `"/home/...`); either form is rewritten when the path ends at a component.
+- **With a session (D50):** the rewritten dump is what `dconf load /`
+  applies.
+- **Without one (D80, D100):** the database file is already restored. When
+  the rewrite changed the dump, it is compiled into a new database (`dconf
+  compile`, which reads the format `dconf dump` writes) and that content
+  replaces the restored file's, which keeps its inode, owner, mode,
+  extended attributes, and times. A failure leaves the restored file as it
+  is and is reported. Without `dconf` installed nothing is rewritten, since
+  nothing reads the database.
+
+**Why:** dconf stores absolute paths: the wallpaper (`picture-uri`), the last
+folder of each file dialog, an application's default directories. A restore
+to another user name left them naming a home folder that does not exist on
+the new system, so the wallpaper did not load although its file was
+restored.
+
+**Relationship:** Extends D41 and D47 to the dconf database; D50's load and
+D80's file rule are unchanged.

@@ -3,6 +3,8 @@
 
 #include <stddef.h>
 
+#include "home_rewrite.h"
+
 typedef enum {
     /* The database's settings were loaded into the running dconf service. */
     DCONF_RESTORE_APPLIED,
@@ -12,7 +14,10 @@ typedef enum {
     /* dconf is not installed, so no running session can hold settings. */
     DCONF_RESTORE_UNAVAILABLE,
     /* A session exists but its settings could not be loaded. */
-    DCONF_RESTORE_FAILED
+    DCONF_RESTORE_FAILED,
+    /* No session, and the restored file still names the backup's home
+     * folder where it should name this system's. */
+    DCONF_RESTORE_HOME_NOT_REWRITTEN
 } DconfRestoreStatus;
 
 /**
@@ -24,12 +29,21 @@ typedef enum {
  * with `dconf dump /` through a private profile, then applies the result with
  * `dconf load /` over the user's session bus. Under sudo both commands run as
  * the invoking user. Keys absent from the backup keep their current values.
+ * Paths that name the backup's home and XDG folders are rewritten first;
+ * without a session, the restored ~/.config/dconf/user below home_fd is
+ * compiled anew when the rewrite changed anything.
  *
  * @param database_fd  Readable fd of the backed-up database; borrowed.
+ * @param home_fd      The restored home folder; borrowed.
+ * @param pairs        From home_rewrite_dconf_pairs_build(); pair_count may
+ *                     be 0, which rewrites nothing.
  * @param applied_keys Receives the number of keys loaded on success; may be
  *                     NULL.
  */
-DconfRestoreStatus dconf_restore_apply(int database_fd, size_t *applied_keys);
+DconfRestoreStatus dconf_restore_apply(int database_fd, int home_fd,
+                                       const HomeRewritePair *pairs,
+                                       size_t pair_count,
+                                       size_t *applied_keys);
 
 /* Nonzero when dconf_restore_apply() would load into a running session:
  * the target user has a session bus and dconf is installed. */

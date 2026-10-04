@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include "fileops.h"
+#include "home_rewrite.h"
 #include "utils.h"
 
 #define DCONF_DUMP_LIMIT_DEFAULT (8U * 1024U * 1024U)
@@ -138,7 +139,9 @@ typedef struct {
     int fd;
 } DconfWorkDir;
 
-static const char *const dconf_work_files[] = { "dconf/user", "profile" };
+static const char *const dconf_work_files[] = {
+    "dconf/user", "profile", "keyfiles/user", "compiled"
+};
 
 static void dconf_work_dir_remove(DconfWorkDir *work)
 {
@@ -149,6 +152,7 @@ static void dconf_work_dir_remove(DconfWorkDir *work)
          index++)
         (void)unlinkat(work->fd, dconf_work_files[index], 0);
     (void)unlinkat(work->fd, "dconf", AT_REMOVEDIR);
+    (void)unlinkat(work->fd, "keyfiles", AT_REMOVEDIR);
     close(work->fd);
     work->fd = -1;
     (void)rmdir(work->path);
@@ -198,6 +202,49 @@ fail:
         errno = saved;
     }
     return -1;
+}
+
+// Compiles settings, a dump, into a database in the work directory and puts
+// it in place of the restored ~/.config/dconf/user (dconf compile reads the
+// same key file format that dconf dump writes).
+static int dconf_replace_database(const DconfWorkDir *work,
+                                  const DconfTarget *target,
+                                  const char *settings, int home_fd)
+{
+    char keyfiles[PATH_MAX], compiled[PATH_MAX];
+    if (path_join(keyfiles, sizeof(keyfiles), work->path, "keyfiles") != 0 ||
+        path_join(compiled, sizeof(compiled), work->path, "compiled") != 0 ||
+        mkdirat(work->fd, "keyfiles", 0700) != 0 ||
+        write_file_at(work->fd, "keyfiles/user", settings,
+                      strlen(settings)) != 0)
+        return -1;
+    if (target->drop_identity &&
+        (fchownat(work->fd, "keyfiles/user", target->uid, target->gid,
+                  AT_SYMLINK_NOFOLLOW) != 0 ||
+         fchownat(work->fd, "keyfiles", target->uid, target->gid,
+                  AT_SYMLINK_NOFOLLOW) != 0))
+        return -1;
+
+    RunCommandOptions options = {
+        .drop_identity = target->drop_identity,
+        .uid = target->uid,
+        .gid = target->gid,
+        .home = target->drop_identity ? target->home : NULL
+    };
+    char output[256];
+    char *const compile_argv[] = { "dconf", "compile", compiled, keyfiles,
+                                   NULL };
+    if (run_command_capture_with(compile_argv, output, sizeof(output),
+                                 &options) != 0)
+        return -1;
+    int fd = openat(work->fd, "compiled", O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    int result = home_rewrite_replace_at(home_fd, ".config/dconf/user", fd);
+    int saved = errno;
+    close(fd);
+    errno = saved;
+    return result;
 }
 
 static size_t dconf_dump_key_count(const char *dump)
@@ -254,7 +301,10 @@ int dconf_restore_session_running(void)
            status == DCONF_RESTORE_UNAVAILABLE;
 }
 
-DconfRestoreStatus dconf_restore_apply(int database_fd, size_t *applied_keys)
+DconfRestoreStatus dconf_restore_apply(int database_fd, int home_fd,
+                                       const HomeRewritePair *pairs,
+                                       size_t pair_count,
+                                       size_t *applied_keys)
 {
     if (applied_keys != NULL)
         *applied_keys = 0;
@@ -268,15 +318,24 @@ DconfRestoreStatus dconf_restore_apply(int database_fd, size_t *applied_keys)
     char runtime_dir[PATH_MAX], bus_path[PATH_MAX];
     DconfRestoreStatus session = dconf_session_check(&target, runtime_dir,
                                                      bus_path);
-    if (session != DCONF_RESTORE_APPLIED)
+    // Without a session the restored file is the result; only paths that
+    // name the backup's home folder may need changing in it.
+    if (session == DCONF_RESTORE_NO_SESSION &&
+        (pair_count == 0 || !dconf_command_available()))
         return session;
+    if (session == DCONF_RESTORE_UNAVAILABLE ||
+        session == DCONF_RESTORE_FAILED)
+        return session;
+    int loads = session == DCONF_RESTORE_APPLIED;
 
+    DconfRestoreStatus status = loads ? DCONF_RESTORE_FAILED
+                                      : DCONF_RESTORE_HOME_NOT_REWRITTEN;
     DconfWorkDir work;
     if (dconf_work_dir_create(&work, database_fd, &target) != 0)
-        return DCONF_RESTORE_FAILED;
+        return status;
 
-    DconfRestoreStatus status = DCONF_RESTORE_FAILED;
     char *dump = malloc(dconf_dump_limit);
+    char *rewritten = NULL;
     char profile_env[PATH_MAX + 32], config_env[PATH_MAX + 32];
     char bus_env[PATH_MAX + 64], runtime_env[PATH_MAX + 32];
     if (dump == NULL ||
@@ -311,7 +370,26 @@ DconfRestoreStatus dconf_restore_apply(int database_fd, size_t *applied_keys)
     // would apply an arbitrary subset.
     if (dump_length >= dconf_dump_limit - 1U)
         goto done;
-    size_t keys = dconf_dump_key_count(dump);
+
+    // Paths under the backup's home folder (a wallpaper, a last-used folder)
+    // name this system's (D101).
+    const char *settings = dump;
+    if (pair_count != 0)
+    {
+        rewritten = home_rewrite_text(dump, pairs, pair_count);
+        if (rewritten == NULL)
+            goto done;
+        settings = rewritten;
+    }
+    if (!loads)
+    {
+        if (strcmp(settings, dump) == 0 ||
+            dconf_replace_database(&work, &target, settings, home_fd) == 0)
+            status = DCONF_RESTORE_NO_SESSION;
+        goto done;
+    }
+
+    size_t keys = dconf_dump_key_count(settings);
     if (keys == 0)
     {
         status = DCONF_RESTORE_APPLIED;
@@ -325,8 +403,8 @@ DconfRestoreStatus dconf_restore_apply(int database_fd, size_t *applied_keys)
         .gid = target.gid,
         .home = target.drop_identity ? target.home : NULL,
         .env = load_env,
-        .stdin_data = dump,
-        .stdin_length = dump_length
+        .stdin_data = settings,
+        .stdin_length = strlen(settings)
     };
     char load_output[256];
     char *const load_argv[] = { "dconf", "load", "/", NULL };
@@ -338,6 +416,7 @@ DconfRestoreStatus dconf_restore_apply(int database_fd, size_t *applied_keys)
     status = DCONF_RESTORE_APPLIED;
 
 done:
+    free(rewritten);
     free(dump);
     dconf_work_dir_remove(&work);
     return status;
