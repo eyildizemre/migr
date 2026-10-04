@@ -520,13 +520,14 @@ check-valgrind:
 		PATH="$(CURDIR)/tests/stubs:$$PATH" valgrind --error-exitcode=1 --trace-children=yes --trace-children-skip='/usr/*,/bin/*,/sbin/*' --leak-check=full --track-origins=yes --log-file="$$logs/%p.log" ./$$binary || { cat "$$logs"/*; exit 1; }; \
 	done
 
-# The host Phase B static-analysis gate: GCC analyzes every source file
-# compile-only. Tests are intentionally outside this target's scope.
+# The host Phase B static-analysis gate: GCC analyzes every source file,
+# discarding the object. -fsyntax-only would stop before the analyzer runs.
+# Tests are intentionally outside this target's scope.
 check-analyze:
 	@set -e; \
 	for source in $(ANALYZER_SRCS); do \
 		echo "==> gcc -fanalyzer $$source"; \
-		$(ANALYZER_CC) $(ANALYZER_FLAGS) -fsyntax-only "$$source"; \
+		$(ANALYZER_CC) $(ANALYZER_FLAGS) -c -o /dev/null "$$source"; \
 	done
 
 # Run the complete host gate in the roadmap order. Each prerequisite target
