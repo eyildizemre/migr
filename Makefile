@@ -514,11 +514,13 @@ check-valgrind:
 	trap 'rm -rf "$$logs"; $(MAKE) clean >/dev/null' EXIT; \
 	$(MAKE) clean; \
 	$(MAKE) CFLAGS="$(CHECK_STRICT_FLAGS)" $(VALGRIND_TESTS); \
+	failed=; \
 	for binary in $(VALGRIND_TESTS); do \
 		echo "==> valgrind ./$$binary"; \
 		rm -f "$$logs"/*; \
-		PATH="$(CURDIR)/tests/stubs:$$PATH" valgrind --error-exitcode=1 --trace-children=yes --trace-children-skip='/usr/*,/bin/*,/sbin/*' --leak-check=full --track-origins=yes --log-file="$$logs/%p.log" ./$$binary || { cat "$$logs"/*; exit 1; }; \
-	done
+		PATH="$(CURDIR)/tests/stubs:$$PATH" valgrind --error-exitcode=1 --trace-children=yes --trace-children-skip='/usr/*,/bin/*,/sbin/*' --leak-check=full --track-origins=yes --log-file="$$logs/%p.log" ./$$binary || { cat "$$logs"/*; failed="$$failed $$binary"; }; \
+	done; \
+	if [ -n "$$failed" ]; then echo "check-valgrind failed:$$failed"; exit 1; fi
 
 # The host Phase B static-analysis gate: GCC analyzes every source file,
 # discarding the object. -fsyntax-only would stop before the analyzer runs.
