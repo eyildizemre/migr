@@ -102,19 +102,20 @@ static int work_list_append(ReconcileWorkList *list,
             return -1;
         list->items = items;
     }
-    ReconcileWorkItem item = {
+    ReconcileWorkItem *item = &list->items[list->count];
+    *item = (ReconcileWorkItem){
         .kind = owner->kind,
         .state = owner->state,
-        .reason = reason
+        .reason = reason,
+        .logical_path = strdup(owner->logical_path),
+        .physical_leaf = strdup(owner->physical_leaf)
     };
-    item.logical_path = strdup(owner->logical_path);
-    item.physical_leaf = strdup(owner->physical_leaf);
-    if (item.logical_path == NULL || item.physical_leaf == NULL) {
-        free(item.logical_path);
-        free(item.physical_leaf);
+    if (item->logical_path == NULL || item->physical_leaf == NULL) {
+        free(item->logical_path);
+        free(item->physical_leaf);
         return -1;
     }
-    list->items[list->count++] = item;
+    list->count++;
     return 0;
 }
 

@@ -336,7 +336,8 @@ static int report_plan(const char *home, const BackupPlan *plan,
         for (size_t i = 0; i < count; i++)
         {
             const SelectionRoot *filter = selection ? &selection->roots[i] : NULL;
-            const BackupPlanRoot *root = filter ? &filter->root : &plan->roots[i];
+            const BackupPlanRoot *root = selection ? &selection->roots[i].root
+                                                   : &plan->roots[i];
             if ((int)root->group != group)
                 continue;
             off_t bytes = 0;

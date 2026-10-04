@@ -1299,7 +1299,8 @@ static void estimate_plan(const BackupPlan *plan, const SelectionPlan *selection
     for (size_t i = 0; i < count; i++)
     {
         const SelectionRoot *filter = selection ? &selection->roots[i] : NULL;
-        const char *path = filter ? filter->root.capture_path : plan->roots[i].capture_path;
+        const char *path = selection ? selection->roots[i].root.capture_path
+                                     : plan->roots[i].capture_path;
         char relative[PATH_MAX] = "";
         off_t root_size = 0;
         size_t seen_before_root = seen.count;

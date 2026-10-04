@@ -178,13 +178,11 @@ static int portable_current_source_add(PortableCurrentSourceSet *set,
     }
     PortableCurrentSourceEntry *entry = &set->entries[set->count];
     memset(entry, 0, sizeof(*entry));
-    entry->logical_path = portable_text_duplicate(logical_path);
-    if (entry->logical_path == NULL ||
-        copy_text(entry->root_id, sizeof(entry->root_id), root_id) != 0) {
-        free(entry->logical_path);
-        memset(entry, 0, sizeof(*entry));
+    if (copy_text(entry->root_id, sizeof(entry->root_id), root_id) != 0)
         return -1;
-    }
+    entry->logical_path = portable_text_duplicate(logical_path);
+    if (entry->logical_path == NULL)
+        return -1;
     set->count++;
     set->sorted = 0;
     return 0;
