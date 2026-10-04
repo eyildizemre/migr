@@ -1186,7 +1186,7 @@ static void test_another_installs_backup_is_taken_only_by_name(void)
               survey.other == 0,
           "a backup in another format is not offered");
 
-    BackupContainer adopted;
+    BackupContainer adopted = {0};
     check(container_adopt_fd(root_fd, OWNER, &mine, &adopted) ==
               CONTAINER_ERR_NO_MATCH,
           "without a choice it is not adopted");
