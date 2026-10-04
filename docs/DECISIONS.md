@@ -5728,8 +5728,8 @@ started on the desktop now continues on a text console after the session
 has ended (D89), and a restore may also start from a console or over SSH.
 The state on the list was then written by a session that is no longer
 running, and nothing rewrites it. Keeping the fresh install's copy lost what
-the backup held: `gvfs-metadata` records starred files, custom folder icons
-and emblems.
+the backup held: `gvfs-metadata` records each folder's view and sort
+settings, custom icons and emblems.
 
 **Relationship:** Limits D65; D80's dconf rule is unchanged and applies
 within a running session.
