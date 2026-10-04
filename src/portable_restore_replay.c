@@ -1370,8 +1370,8 @@ static int replay_open_relative_parent_cached(ReplayCollection *collection,
     }
 
     if (relative[0] == '\0')
-        return portable_open_relative_parent(base_fd, relative, parent_out,
-                                             leaf, leaf_size);
+        return portable_open_restore_parent(base_fd, relative, parent_out,
+                                            leaf, leaf_size);
     if (!relative_path_valid(relative, 0))
     {
         errno = EINVAL;
@@ -1402,8 +1402,8 @@ static int replay_open_relative_parent_cached(ReplayCollection *collection,
         }
     }
 
-    if (portable_open_relative_parent(base_fd, relative, parent_out, leaf,
-                                      leaf_size) != 0)
+    if (portable_open_restore_parent(base_fd, relative, parent_out, leaf,
+                                     leaf_size) != 0)
         return -1;
 
     if (slash == NULL)

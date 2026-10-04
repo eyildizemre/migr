@@ -1718,6 +1718,52 @@ static void test_normal_replay(void)
     fixture_close(&fixture);
 }
 
+static void test_intermediate_folder_owner(void)
+{
+    printf(BLUE "::" NC " a folder made on the way to a root belongs to "
+           "the home's owner\n");
+    if (geteuid() != 0)
+    {
+        skip_case("intermediate folder owner", "needs root");
+        return;
+    }
+
+    ManifestRoot root = root_for();
+    snprintf(root.restore_path, sizeof(root.restore_path), ".var/app");
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "intermediate-owner fixture is created");
+    if (opened != 0)
+        return;
+
+    // The home of another user, as under sudo; a fresh install has no .var.
+    const uid_t owner = 65534;
+    const gid_t group = 65534;
+    if (fchown(fixture.home_fd, owner, group) != 0)
+        fatal("could not hand the fixture home to another user");
+    make_dir_at(fixture.data_fd, "ROOT", 0700);
+    write_file_at(fixture.data_fd, "ROOT/file", "data");
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0755,
+                  1700000700, 1, 1700000701, 2),
+        entry_for("ROOT", "file", "file", SIDECAR_KIND_REGULAR, 4, 0600,
+                  1700000702, 3, 1700000703, 4)
+    };
+    check(write_sidecar(&fixture, entries, 2, NULL, NULL) == 0,
+          "intermediate-owner sidecar is committed");
+
+    PortableRestoreReplayReport report;
+    check(run_replay(&fixture, &report) == 0 && report.failed_count == 0,
+          "a root below a missing folder restores");
+
+    struct stat made;
+    check(fstatat(fixture.home_fd, ".var", &made, AT_SYMLINK_NOFOLLOW) == 0 &&
+              S_ISDIR(made.st_mode) && made.st_uid == owner &&
+              made.st_gid == group && (made.st_mode & 07777) == 0700,
+          "the missing folder is made 0700 for the home's owner");
+    fixture_close(&fixture);
+}
+
 static void test_regular_content_verification(void)
 {
     printf(BLUE "::" NC " portable restore verifies regular content after replay\n");
@@ -4415,6 +4461,7 @@ int main(void)
     test_collision_suffix_validation();
     test_normal_replay();
     test_destination_truncation();
+    test_intermediate_folder_owner();
     test_regular_content_verification();
     test_verification_refuses_destination_symlink_replacement();
     test_symlink_content_verification();

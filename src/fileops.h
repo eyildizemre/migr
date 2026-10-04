@@ -110,6 +110,15 @@ int fileops_remove_tree_at(int root_fd, const char *rel_path);
 int fileops_make_parents_at(int root_fd, const char *rel_path);
 
 /**
+ * @brief Creates leaf beneath parent_fd as a folder a restore needs on the
+ * way to a root, with mode 0700 and the owner and group of parent_fd. A
+ * leaf that exists is kept as it is.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int fileops_make_intermediate_dir_at(int parent_fd, const char *leaf);
+
+/**
  * @brief Removes destination entries absent from a completed native capture.
  *
  * The caller must invoke this only after every root in the capture walk has

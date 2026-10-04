@@ -112,9 +112,11 @@ int remove_leaf(int parent_fd, const char *name)
     return unlinkat(parent_fd, name, 0) == 0 ? 0 : -1;
 }
 
-int portable_open_relative_parent(int base_fd, const char *relative,
-                                  int *parent_out, char *leaf,
-                                  size_t leaf_size)
+// A restore gives the folders it makes the owner of the folder above
+// (fileops_make_intermediate_dir_at); a backup's payload folders need not.
+static int open_relative_parent(int base_fd, const char *relative,
+                                int *parent_out, char *leaf,
+                                size_t leaf_size, int restore)
 {
     if (base_fd < 0 || relative == NULL || parent_out == NULL ||
         leaf == NULL || leaf_size == 0 ||
@@ -163,7 +165,11 @@ int portable_open_relative_parent(int base_fd, const char *relative,
                 return -1;
             }
         } else if (errno == ENOENT) {
-            if (mkdirat(current, cursor, 0700) != 0 && errno != EEXIST) {
+            int made = restore
+                ? fileops_make_intermediate_dir_at(current, cursor)
+                : (mkdirat(current, cursor, 0700) == 0 || errno == EEXIST
+                       ? 0 : -1);
+            if (made != 0) {
                 int saved = errno;
                 (void)close(current);
                 errno = saved;
@@ -199,6 +205,22 @@ int portable_open_relative_parent(int base_fd, const char *relative,
         current = next;
         cursor = slash + 1;
     }
+}
+
+int portable_open_relative_parent(int base_fd, const char *relative,
+                                  int *parent_out, char *leaf,
+                                  size_t leaf_size)
+{
+    return open_relative_parent(base_fd, relative, parent_out, leaf,
+                                leaf_size, 0);
+}
+
+int portable_open_restore_parent(int base_fd, const char *relative,
+                                 int *parent_out, char *leaf,
+                                 size_t leaf_size)
+{
+    return open_relative_parent(base_fd, relative, parent_out, leaf,
+                                leaf_size, 1);
 }
 
 /* Opens an existing payload parent without creating any component. */

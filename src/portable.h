@@ -50,6 +50,14 @@ int portable_open_relative_parent(int base_fd, const char *relative,
                                   int *parent_out, char *leaf,
                                   size_t leaf_size);
 
+/**
+ * Same as portable_open_relative_parent() for a restore: each folder it
+ * creates gets the owner and group of the folder above it.
+ */
+int portable_open_restore_parent(int base_fd, const char *relative,
+                                 int *parent_out, char *leaf,
+                                 size_t leaf_size);
+
 /** Copies a regular payload while updating optional progress and sync state. */
 int portable_copy_regular(int source_fd, int destination_fd,
                           off_t expected_size, BackupCaptureReport *report);

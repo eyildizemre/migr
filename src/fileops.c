@@ -2299,6 +2299,22 @@ int fileops_make_parents_at(int root_fd, const char *rel_path)
     return current < 0 ? -1 : close(current);
 }
 
+int fileops_make_intermediate_dir_at(int parent_fd, const char *leaf)
+{
+    if (mkdirat(parent_fd, leaf, 0700) != 0)
+        return errno == EEXIST ? 0 : -1;
+    // Made by root, a folder such as a fresh install's missing ~/.var would
+    // shut its user out of everything restored below it.
+    struct stat parent, made;
+    if (fstat(parent_fd, &parent) != 0 ||
+        fstatat(parent_fd, leaf, &made, AT_SYMLINK_NOFOLLOW) != 0)
+        return -1;
+    if (made.st_uid == parent.st_uid && made.st_gid == parent.st_gid)
+        return 0;
+    return fchownat(parent_fd, leaf, parent.st_uid, parent.st_gid,
+                    AT_SYMLINK_NOFOLLOW);
+}
+
 void native_reconcile_report_init(NativeReconcileReport *report)
 {
     if (report == NULL)
@@ -2655,7 +2671,7 @@ static RestoreResolveResult resolve_parent(int root_fd, const char *rel,
                              O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
         if (next_fd < 0 && errno == ENOENT && create_intermediates)
         {
-            if (mkdirat(cur_fd, comp, 0700) != 0 && errno != EEXIST)
+            if (fileops_make_intermediate_dir_at(cur_fd, comp) != 0)
             {
                 close(cur_fd);
                 return RESTORE_RESOLVE_ERROR;

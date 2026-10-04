@@ -548,6 +548,47 @@ static void test_restores_nested_files_and_directories(void)
     remove_tree(dest_root);
 }
 
+static void test_intermediate_folder_owner(void)
+{
+    printf(BLUE "::" NC " restore_native_at: a folder made on the way to the destination belongs to its parent's owner\n");
+    if (geteuid() != 0)
+    {
+        printf(BLUE "  (skipped: needs root)\n" NC);
+        return;
+    }
+
+    char source_root[PATH_MAX], dest_root[PATH_MAX];
+    fresh_mkdtemp(source_root, sizeof(source_root), "restore_src");
+    fresh_mkdtemp(dest_root, sizeof(dest_root), "restore_dst");
+    char proj_path[PATH_MAX];
+    join_path(proj_path, sizeof(proj_path), source_root, "proj");
+    check(mkdir(proj_path, 0755) == 0, "fixture: mkdir proj");
+    write_file_under(source_root, "proj/file.txt", "data");
+
+    // The home of another user, as under sudo; a fresh install has no .var.
+    const uid_t owner = 65534;
+    const gid_t group = 65534;
+    check(chown(dest_root, owner, group) == 0,
+          "fixture: the destination belongs to another user");
+
+    int source_fd = open_dir_fd(source_root);
+    int dest_fd = open_dir_fd(dest_root);
+    check(restore_native_at(&RESTORE_CTX, source_fd, "proj", dest_fd,
+                            ".var/app") == 0,
+          "restoring below a missing folder succeeds");
+
+    struct stat made;
+    check(fstatat(dest_fd, ".var", &made, AT_SYMLINK_NOFOLLOW) == 0 &&
+              S_ISDIR(made.st_mode) && made.st_uid == owner &&
+              made.st_gid == group && (made.st_mode & 07777) == 0700,
+          "the missing folder is made 0700 for its parent's owner");
+
+    close(source_fd);
+    close(dest_fd);
+    remove_tree(source_root);
+    remove_tree(dest_root);
+}
+
 static void test_relinks_hardlinked_payload_files(void)
 {
     printf(BLUE "::" NC " restore_native_at: hardlinked payload files relink to one destination inode\n");
@@ -1219,6 +1260,7 @@ int main(void)
     test_rejects_lexically_invalid_relative_paths();
 
     test_restores_nested_files_and_directories();
+    test_intermediate_folder_owner();
     test_relinks_hardlinked_payload_files();
     test_failed_hardlink_representative_is_not_recorded();
     test_restores_names_with_problem_bytes();
