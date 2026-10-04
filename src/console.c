@@ -370,6 +370,17 @@ static int user_slice_populated(uid_t uid)
            strstr(events, "populated 1") != NULL;
 }
 
+// Runs argv with what it writes kept off the console unless it fails:
+// systemctl adds notes of its own, such as a unit file changed on disk.
+static int run_quiet(char *const argv[])
+{
+    char errors[1024] = "";
+    int status = run_command_errors(argv, errors, sizeof(errors));
+    if (status != 0)
+        fputs(errors, stderr);
+    return status;
+}
+
 int console_restore_take_over(void)
 {
     // The desktop run removes its log as it exits.
@@ -383,7 +394,7 @@ int console_restore_take_over(void)
     uid_t uid;
     gid_t gid;
     char *stop[] = { "systemctl", "stop", "display-manager.service", NULL };
-    if (sudo_invoker(&uid, &gid, NULL) != 1 || run_command(stop) != 0)
+    if (sudo_invoker(&uid, &gid, NULL) != 1 || run_quiet(stop) != 0)
     {
         print_error("Error: Could not close the desktop. Nothing was "
                     "changed.\n");
@@ -393,14 +404,14 @@ int console_restore_take_over(void)
     char user[32];
     snprintf(user, sizeof(user), "%lu", (unsigned long)uid);
     char *terminate[] = { "loginctl", "terminate-user", user, NULL };
-    (void)run_command(terminate);
+    (void)run_quiet(terminate);
     // Returns once every unit in the slice has stopped, the user's service
     // manager included; each unit's own stop timeout bounds the wait, after
     // which systemd kills what is left.
     char slice[64];
     snprintf(slice, sizeof(slice), "user-%lu.slice", (unsigned long)uid);
     char *stop_user[] = { "systemctl", "stop", slice, NULL };
-    (void)run_command(stop_user);
+    (void)run_quiet(stop_user);
     if (user_slice_populated(uid))
         print_warning("  Warning: some of your programs are still "
                       "running and may write over restored files.\n");

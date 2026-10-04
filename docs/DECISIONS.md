@@ -5237,7 +5237,8 @@ journal as the added records accumulate.
 
 **Status:** Implemented; desktop detection revised 2026-10-04; the console
 run no longer repeats the payload scan (2026-10-04); the wait for the user's
-processes revised 2026-10-04
+processes revised 2026-10-04; systemctl's notes kept off the console
+(2026-10-04)
 
 **Decision:** A restore started under sudo from a desktop session closes that
 desktop and restores from a system service on a virtual console, after the
@@ -5271,7 +5272,9 @@ user's consent.
   removes its binary, stops the display manager, ends the invoker's sessions
   (`loginctl terminate-user`), and stops the invoker's slice (`systemctl
   stop user-UID.slice`), which returns once every unit in it has stopped;
-  it warns if a process is still left. It then switches
+  it warns if a process is still left. What these commands print shows only
+  when one fails: systemctl adds notes of its own to the console, such as a
+  unit file changed on disk since the last reload. It then switches
   the screen to its console (`VT_ACTIVATE`, `VT_WAITACTIVE`) and restores:
   every check again but the scan of a portable backup's payload against its
   journal, which the desktop run made before asking, and no question. It ends with `Press Enter to return to the
