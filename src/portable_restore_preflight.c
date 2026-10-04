@@ -1449,6 +1449,28 @@ static int scan_payload_inventory(PayloadInventory *inventory)
     return inventory->failed ? -1 : 0;
 }
 
+// Checks that the payload holds exactly the journal's entries.
+static int check_payloads(Collection *collection, int data_fd,
+                          RestorePreflightProgress *progress)
+{
+    unsigned char *seen = calloc(collection->address_index.count == 0
+                                     ? 1 : collection->address_index.count,
+                                 1);
+    if (seen == NULL)
+        return -1;
+    preflight_progress_note(progress, 0, "payload", 1);
+    PayloadInventory inventory = {
+        .data_fd = data_fd,
+        .collection = collection,
+        .seen = seen,
+        .progress = progress
+    };
+    int result = scan_payload_inventory(&inventory);
+    preflight_progress_finish(progress, inventory.checked_count, "payload");
+    free(seen);
+    return result;
+}
+
 static void report_print(const PortableRestorePreflightReport *report)
 {
     if (report == NULL || report->violation_count == 0)
@@ -1599,7 +1621,8 @@ int portable_restore_preflight_at(
     }
 
     size_t sidecar_live_count = sidecar_log_live_count(&sidecar);
-    preflight_progress_start(&progress, sidecar_live_count, "entries");
+    if (!request->backup_checked)
+        preflight_progress_start(&progress, sidecar_live_count, "entries");
     if (restore_address_index_build(&collection.address_index,
                                     &collection.memory, &sidecar, NULL) != 0)
     {
@@ -1643,25 +1666,8 @@ int portable_restore_preflight_at(
         goto fail;
     }
 
-    unsigned char *seen = calloc(collection.address_index.count == 0
-                                     ? 1 : collection.address_index.count,
-                                 1);
-    if (seen == NULL)
-    {
-        sidecar_log_close(&sidecar);
-        close(data_fd);
-        goto fail;
-    }
-    preflight_progress_note(&progress, 0, "payload", 1);
-    PayloadInventory inventory = {
-        .data_fd = data_fd,
-        .collection = &collection,
-        .seen = seen,
-        .progress = &progress
-    };
-    int result = scan_payload_inventory(&inventory);
-    preflight_progress_finish(&progress, inventory.checked_count, "payload");
-    free(seen);
+    int result = request->backup_checked
+        ? 0 : check_payloads(&collection, data_fd, &progress);
     if (sidecar_log_close(&sidecar) != SIDECAR_STATUS_OK)
         result = -1;
     if (close(data_fd) != 0)

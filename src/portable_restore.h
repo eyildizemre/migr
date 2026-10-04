@@ -38,6 +38,10 @@ typedef struct {
     BackupCaptureReport *capture_report;
     /* Verification is on by default. This opt-out is restore-only CLI policy. */
     int skip_content_verification;
+    /* Nonzero when this run continues one that checked every payload against
+     * the journal before handing over to a text console (D89): preflight
+     * skips that scan and says nothing of it. */
+    int backup_checked;
     /* Lets the CLI retire its copy-progress renderer before verification starts. */
     void (*before_content_verification)(void *context);
     void *before_content_verification_context;

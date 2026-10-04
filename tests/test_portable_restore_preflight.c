@@ -456,6 +456,9 @@ static int append_raw_suffix_entry(Fixture *fixture,
                                           suffix_length, "regular", "600");
 }
 
+// Set for a run that continues one which already checked the payload (D89).
+static int preflight_backup_checked;
+
 static int run_preflight_with_xdg(
     Fixture *fixture, PortableRestorePreflightReport *report,
     const char * const *destination_xdg_dirs)
@@ -468,7 +471,8 @@ static int run_preflight_with_xdg(
         .source_container_fd = fixture->container_fd,
         .manifest = &manifest,
         .destination_home_fd = fixture->home_fd,
-        .destination_home_path = fixture->home
+        .destination_home_path = fixture->home,
+        .backup_checked = preflight_backup_checked
     };
     for (int index = 0; index < XDG_KEY_COUNT; index++)
         request.destination_xdg_dirs[index] =
@@ -776,6 +780,13 @@ static void test_missing_payload(void)
     check(run_preflight(&fixture, &report) != 0 &&
           file_equals(sentinel, "untouched"),
           "missing payload is refused");
+    portable_restore_preflight_report_free(&report);
+
+    // The console run after a hand-over does not scan the payload again.
+    preflight_backup_checked = 1;
+    check(run_preflight(&fixture, &report) == 0,
+          "a run continuing a checked backup skips the payload scan");
+    preflight_backup_checked = 0;
     portable_restore_preflight_report_free(&report);
     fixture_close(&fixture);
 }

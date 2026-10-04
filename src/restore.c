@@ -3976,6 +3976,8 @@ int restore_with_options(const char *source, const RestoreOptions *options)
             .destination_timestamp_policy = {0},
             .owner_map = restore_owner_map(&m),
             .skip_content_verification = skip_content_verification,
+            // The desktop run checked the payload before handing over (D89).
+            .backup_checked = console_restore_service(),
             .confirm = restore_confirm,
             .confirm_context = &confirmation,
             .before_deferred = restore_before_deferred,

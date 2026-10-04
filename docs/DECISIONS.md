@@ -5217,7 +5217,8 @@ journal as the added records accumulate.
 
 ## D89 — 2026-10-01 — A restore started on the desktop continues on a text console
 
-**Status:** Implemented; desktop detection revised 2026-10-04
+**Status:** Implemented; desktop detection revised 2026-10-04; the console
+run no longer repeats the payload scan (2026-10-04)
 
 **Decision:** A restore started under sudo from a desktop session closes that
 desktop and restores from a system service on a virtual console, after the
@@ -5252,14 +5253,15 @@ user's consent.
   (`loginctl terminate-user`), and waits up to thirty seconds until the
   invoker's slice holds no process, warning if one is left. It then switches
   the screen to its console (`VT_ACTIVATE`, `VT_WAITACTIVE`) and restores:
-  every check again, no question. It ends with `Press Enter to return to the
+  every check again but the scan of a portable backup's payload against its
+  journal, which the desktop run made before asking, and no question. It ends with `Press Enter to return to the
   login screen.`, discarding what was typed before. When the desktop cannot be
   closed or the console shown, it restores nothing. However the service ends,
   `ExecStopPost=` starts the display manager.
 - **On the console:** No application of the user runs, so D66 and D69 defer
   nothing; with no session bus, D50 does not load dconf and the database file
   is written (D80); D87's note keeps only what a different password costs.
-  D65 is unchanged.
+  D65 keeps nothing, and the backup's live desktop state is restored (D100).
 
 **Why:** A desktop session writes the files restore brings back: some programs
 while they run, others when they exit, which is at logout, after the restore
