@@ -4774,7 +4774,8 @@ once more: an unchanged update takes 4.3 s instead of 3.9 s.
 
 ## D74 — 2026-09-27 — Restore adds the user back to their groups
 
-**Status:** Implemented
+**Status:** Implemented; a missing administrators' group is no longer listed
+(2026-10-04)
 
 **Decision:** Every scope but explicit paths records the user's
 supplementary groups by name in `groups.txt` at the container root, as it
@@ -4796,6 +4797,13 @@ What depended on the others stops working quietly: without `libvirt`, for
 example, virt-manager asks for a password for `qemu:///system`.
 
 **Relationship:** Follows D62 (restore runs as root) and D38.
+
+**Revision (2026-10-04):** A recorded administrators' group (`wheel`, `sudo`,
+`admin`) the system lacks is no longer listed. The list tells the user to
+install the software that brings a missing group, and no software brings
+another distribution's administrators' group; the user restore targets runs
+it under sudo and is in this system's own. Where the group exists, the user
+is still added to it, and migr still does not translate between them.
 
 ## D75 — 2026-09-27 — Flatpak applications' data is backed up without their caches
 
@@ -4866,7 +4874,8 @@ extensions under `~/.var/app` (D75).
 
 ## D78 — 2026-09-27 — Restore ends with what is left to do by hand
 
-**Status:** Implemented
+**Status:** Implemented; a long package list is named only in the copy next
+to the backup (2026-10-04)
 
 **Decision:** The restore steps that re-create system state (packages,
 Flatpak applications, groups) write what they could not do into one list,
@@ -4889,6 +4898,13 @@ repositories, and, since D74 and D76, groups and Flatpak remotes the new
 system lacks.
 
 **Relationship:** Supersedes D1's file; keeps D40's final-state accounting.
+
+**Revision (2026-10-04):** The packages come last, after the steps. When more
+than ten are left, the screen gives their number and says the copy next to
+the backup names them; a copy that could not be written leaves them on the
+screen. A restore from another distribution leaves hundreds of names that
+have no package of that name here, and listed in full they pushed the steps
+the user has to take off the screen.
 
 ## D79 — 2026-09-27 — A backup or restore keeps a log only when it has something to say
 

@@ -141,8 +141,9 @@ void read_package_list(FILE *pkg_file, char ***pkgs_out, int *pkg_count_out,
  * @param todo           Receives the packages the system does not have after
  *                       the install.
  * @param had_error      Set to 1 on a real failure; untouched otherwise.
+ * @return How many packages it wrote to todo.
  */
-void restore_packages(int source_root_fd, int online, FILE *todo,
-                      int *had_error);
+int restore_packages(int source_root_fd, int online, FILE *todo,
+                     int *had_error);
 
 #endif

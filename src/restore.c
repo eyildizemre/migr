@@ -642,8 +642,17 @@ typedef struct {
     char *text;
     size_t size;
     FILE *stream;
+    /* The packages it could not install, kept apart: from another
+     * distribution they can run to hundreds of names. */
+    char *packages_text;
+    size_t packages_size;
+    FILE *packages;
+    int package_count;
     int written; /* The steps ran, so the list next to the backup is due. */
 } RestoreTodo;
+
+// More package names than this are left to the list next to the backup.
+#define TODO_PACKAGES_SHOWN 10
 
 // Re-creates the system state the backup lists, after its files and network
 // configuration: packages first, since they bring Flatpak and groups along.
@@ -651,7 +660,9 @@ static void restore_system_lists(int source_root_fd, RestoreTodo *todo,
                                  int *had_error)
 {
     todo->stream = open_memstream(&todo->text, &todo->size);
-    if (todo->stream == NULL)
+    todo->packages = open_memstream(&todo->packages_text,
+                                    &todo->packages_size);
+    if (todo->stream == NULL || todo->packages == NULL)
     {
         print_error("Error: Could not collect what is left to do by hand\n");
         *had_error = 1;
@@ -659,7 +670,8 @@ static void restore_system_lists(int source_root_fd, RestoreTodo *todo,
     }
     todo->written = !dry_run;
     int online = restore_wait_for_network(source_root_fd);
-    restore_packages(source_root_fd, online, todo->stream, had_error);
+    todo->package_count = restore_packages(source_root_fd, online,
+                                           todo->packages, had_error);
     restore_flatpak_apps(source_root_fd, online, todo->stream, had_error);
     uid_t uid;
     char user[ACCOUNT_NAME_MAX];
@@ -753,29 +765,40 @@ static int restore_todo_write(const char *source, const char *text,
 }
 
 // Ends the run with what is left to do by hand and keeps it next to the
-// backup.
+// backup. The steps come first; a long package list stays in the copy next to
+// the backup, where it does not push them off the screen.
 static void restore_todo_finish(RestoreTodo *todo, const char *source)
 {
-    if (todo->stream == NULL)
-        return;
-    if (fclose(todo->stream) != 0 || todo->text == NULL)
+    int closed = todo->stream != NULL && fclose(todo->stream) == 0 &&
+                 todo->text != NULL;
+    closed = todo->packages != NULL && fclose(todo->packages) == 0 &&
+             todo->packages_text != NULL && closed;
+    char *text = NULL;
+    if (closed && todo->written &&
+        asprintf(&text, "%s%s", todo->text, todo->packages_text) >= 0)
     {
-        free(todo->text);
-        return;
-    }
-    if (todo->written)
-    {
-        if (todo->text[0] != '\0')
-            printf("\nWhat's left for you\n%s", todo->text);
         char path[PATH_MAX] = "";
-        if (restore_todo_write(source, todo->text, path) != 0)
+        int kept = restore_todo_write(source, text, path) == 0;
+        int saved = errno;
+        if (text[0] != '\0')
+        {
+            printf("\nWhat's left for you\n%s", todo->text);
+            if (kept && todo->package_count > TODO_PACKAGES_SHOWN)
+                printf("  %d packages this system does not have; the copy "
+                       "of this list names them.\n", todo->package_count);
+            else
+                printf("%s", todo->packages_text);
+        }
+        if (!kept)
             print_warning("Warning: could not keep this list next to the "
                           "backup%s%s: %s\n", path[0] != '\0' ? " in " : "",
-                          path, strerror(errno));
-        else if (todo->text[0] != '\0')
+                          path, strerror(saved));
+        else if (text[0] != '\0')
             printf("This list is also in %s\n", path);
     }
+    free(text);
     free(todo->text);
+    free(todo->packages_text);
 }
 
 // What a restore defers for the applications running when it starts (D66,

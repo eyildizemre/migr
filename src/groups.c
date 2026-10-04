@@ -223,6 +223,15 @@ static int match_group(const char *name, gid_t gid, const char *members,
     return 0;
 }
 
+// Each distribution names its administrators' group (wheel, sudo, admin).
+// One this system lacks is not software left to install, and whoever runs
+// restore under sudo is already in this system's own.
+static int group_is_administrators(const char *name)
+{
+    return strcmp(name, "wheel") == 0 || strcmp(name, "sudo") == 0 ||
+           strcmp(name, "admin") == 0;
+}
+
 void restore_groups(int source_root_fd, const char *user, FILE *todo,
                     int *had_error)
 {
@@ -270,6 +279,8 @@ void restore_groups(int source_root_fd, const char *user, FILE *todo,
     int missing_count = 0;
     for (int i = 0; i < count; i++)
     {
+        if (group_is_administrators(names[i]))
+            missing[i] = 0;
         wanted_count += wanted[i];
         missing_count += missing[i];
     }

@@ -3066,6 +3066,25 @@ static void test_restore_keeps_the_todo_next_to_the_backup(void)
               strstr(kept, "    missing-package\n") != NULL,
           "the same list is written next to the backup");
 
+    write_file_mode(packages, "fixture-package\nm1\nm2\nm3\nm4\nm5\nm6\nm7\n"
+                              "m8\nm9\nm10\nm11\n", 0644);
+    rc = run_restore_capturing_with_input(source, "y\n", output,
+                                          sizeof(output));
+    section = strstr(output, "\nWhat's left for you\n");
+    todo = fopen(todo_path, "r");
+    kept[0] = '\0';
+    if (todo != NULL)
+    {
+        kept[fread(kept, 1, sizeof(kept) - 1U, todo)] = '\0';
+        fclose(todo);
+    }
+    check(rc == 0 && section != NULL &&
+              strstr(section, "  11 packages this system does not have; the "
+                              "copy of this list names them.\n") != NULL &&
+              strstr(section, " m11") == NULL &&
+              strstr(kept, "    m1 m2 m3 m4 m5 m6 m7 m8 m9 m10 m11\n") != NULL,
+          "a long package list is counted on screen and named in the copy");
+
     write_file_mode(packages, "fixture-package\n", 0644);
     rc = run_restore_capturing_with_input(source, "y\n", output,
                                           sizeof(output));

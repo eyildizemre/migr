@@ -826,7 +826,8 @@ static int package_restore_list(distro_t distro, char *const *prefix,
         package_account_final_state(
             distro, inventory, pkgs, pkg_count, todo,
             online ? "Packages this system could not install, often from a "
-                     "repository it does not have yet:"
+                     "repository it does not have yet, or named differently "
+                     "on this distribution:"
                    : "Packages to install once this system is online:",
             installed, skipped);
 
@@ -838,8 +839,8 @@ static int package_restore_list(distro_t distro, char *const *prefix,
     return result;
 }
 
-void restore_packages(int source_root_fd, int online, FILE *todo,
-                      int *had_error)
+int restore_packages(int source_root_fd, int online, FILE *todo,
+                     int *had_error)
 {
     FILE *pkg_file = NULL;
     int opened = package_open_control_file(source_root_fd, "packages.txt",
@@ -847,7 +848,7 @@ void restore_packages(int source_root_fd, int online, FILE *todo,
     if (opened == CONTROL_FILE_ABSENT)
         printf("\nNote: packages.txt not found, skipping package restore.\n");
     if (opened != CONTROL_FILE_OPEN)
-        return;
+        return 0;
 
     printf("\nPackages\n");
 
@@ -857,13 +858,13 @@ void restore_packages(int source_root_fd, int online, FILE *todo,
     {
         print_warning("Warning: Unrecognized distro, skipping package install.\n");
         fclose(pkg_file);
-        return;
+        return 0;
     }
     if (dry_run)
     {
         printf("  Would install packages from packages.txt\n");
         fclose(pkg_file);
-        return;
+        return 0;
     }
 
     if (!online)
@@ -889,4 +890,5 @@ void restore_packages(int source_root_fd, int online, FILE *todo,
 
     if (accounting_complete)
         printf("  %d installed, %d skipped.\n", installed, skipped);
+    return skipped;
 }

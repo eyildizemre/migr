@@ -1281,6 +1281,18 @@ static void test_restore_groups(void)
           "nothing runs when the user is already in every saved group");
 
     memset(&runner, 0, sizeof(runner));
+    rc = run_restore_groups_case("wheel\nmedia\n", "sudo:x:27:eyildizemre\n",
+                                 "eyildizemre", &runner, output,
+                                 sizeof(output));
+    check(rc == 0 && runner.calls == 0 &&
+              strstr(output, "Left out, not on this system: media.") != NULL &&
+              strstr(last_todo, "    sudo usermod -a -G media eyildizemre\n") !=
+                  NULL &&
+              strstr(last_todo, "wheel") == NULL,
+          "an administrators' group this system names differently is not "
+          "left to the user");
+
+    memset(&runner, 0, sizeof(runner));
     rc = run_restore_groups_case(saved, target, NULL, &runner, output,
                                  sizeof(output));
     check(rc == 1 && runner.calls == 0,
