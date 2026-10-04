@@ -394,16 +394,16 @@ int console_restore_take_over(void)
     snprintf(user, sizeof(user), "%lu", (unsigned long)uid);
     char *terminate[] = { "loginctl", "terminate-user", user, NULL };
     (void)run_command(terminate);
-    for (int waited = 0; user_slice_populated(uid); waited++)
-    {
-        if (waited == 300)
-        {
-            print_warning("  Warning: some of your programs are still "
-                          "running and may write over restored files.\n");
-            break;
-        }
-        sleep_ms(100);
-    }
+    // Returns once every unit in the slice has stopped, the user's service
+    // manager included; each unit's own stop timeout bounds the wait, after
+    // which systemd kills what is left.
+    char slice[64];
+    snprintf(slice, sizeof(slice), "user-%lu.slice", (unsigned long)uid);
+    char *stop_user[] = { "systemctl", "stop", slice, NULL };
+    (void)run_command(stop_user);
+    if (user_slice_populated(uid))
+        print_warning("  Warning: some of your programs are still "
+                      "running and may write over restored files.\n");
 
     // Stopping the display manager shows another console.
     int vt = stdin_vt();

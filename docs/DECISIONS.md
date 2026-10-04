@@ -5218,7 +5218,8 @@ journal as the added records accumulate.
 ## D89 — 2026-10-01 — A restore started on the desktop continues on a text console
 
 **Status:** Implemented; desktop detection revised 2026-10-04; the console
-run no longer repeats the payload scan (2026-10-04)
+run no longer repeats the payload scan (2026-10-04); the wait for the user's
+processes revised 2026-10-04
 
 **Decision:** A restore started under sudo from a desktop session closes that
 desktop and restores from a system service on a virtual console, after the
@@ -5250,8 +5251,9 @@ user's consent.
   exits 0.
 - **The service:** It waits up to ten seconds for the desktop run to exit,
   removes its binary, stops the display manager, ends the invoker's sessions
-  (`loginctl terminate-user`), and waits up to thirty seconds until the
-  invoker's slice holds no process, warning if one is left. It then switches
+  (`loginctl terminate-user`), and stops the invoker's slice (`systemctl
+  stop user-UID.slice`), which returns once every unit in it has stopped;
+  it warns if a process is still left. It then switches
   the screen to its console (`VT_ACTIVATE`, `VT_WAITACTIVE`) and restores:
   every check again but the scan of a portable backup's payload against its
   journal, which the desktop run made before asking, and no question. It ends with `Press Enter to return to the
@@ -5303,6 +5305,12 @@ its own (`pam_systemd` in sudo's PAM stack), so a restore started from a
 terminal on those desktops stayed in place. The process that ran sudo is
 examined instead; an SSH or console login is a `tty` session and still stays
 in place.
+
+**Revision (2026-10-04):** The service waited at most thirty seconds for the
+invoker's slice to empty. A program that ignores SIGTERM outlasts that (Plasma's
+shell has a 40-second stop timeout, the user's service manager one minute), and
+the restore then started with it running. Stopping the slice leaves the bound
+to each unit's stop timeout, after which systemd kills the unit's processes.
 
 ## D90 — 2026-10-01 — Restore brings the network up before packages
 
