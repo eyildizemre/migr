@@ -158,6 +158,8 @@ typedef struct {
      * how many of those were left out at the user's request. */
     size_t deferred_count;
     size_t deferred_skipped_count;
+    /* Podman container state that would not work here, left out (D94). */
+    size_t left_out_count;
     size_t skipped_security_xattr_count;
     size_t verification_checked_count;
     size_t verification_failed_count;

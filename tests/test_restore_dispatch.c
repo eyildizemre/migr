@@ -2743,6 +2743,11 @@ static void test_restore_leaves_out_containers_that_would_not_work(void)
                              "toolbox create.\n") != NULL,
               portable ? "portable: the left-out container is named at the end"
                        : "native: the left-out container is named at the end");
+        if (portable)
+            check(strstr(output, "Left out 6 items of podman's container "
+                                 "state, which would not work on this "
+                                 "system.\n") != NULL,
+                  "portable: the summary counts what was left out");
         remove_tree(home);
 
         rc = run_podman_restore(portable, NULL, 1, home, output,

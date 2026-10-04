@@ -4163,6 +4163,10 @@ int restore_with_options(const char *source, const RestoreOptions *options)
                    report.deferred_skipped_count,
                    report.deferred_skipped_count == 1 ? "" : "s",
                    report.deferred_skipped_count == 1 ? "it" : "them");
+        if (report.left_out_count != 0)
+            printf("Left out %zu item%s of podman's container state, which "
+                   "would not work on this system.\n", report.left_out_count,
+                   report.left_out_count == 1 ? "" : "s");
         if (report.skipped_security_xattr_count != 0)
             printf("Skipped %zu security.* attribute(s) that the destination "
                    "could not apply.\n",

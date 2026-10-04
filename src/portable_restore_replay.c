@@ -3450,7 +3450,12 @@ static int replay_mark_left_out_containers(ReplayCollection *collection)
         }
         if (podman_state_left_out(containers, source_path + storage_length + 1,
                                   link_target))
+        {
             replay->deferral = REPLAY_LEFT_OUT;
+            collection->report->left_out_count++;
+            replay_log_entry(collection, replay,
+                             "Left out, podman state that would not work here");
+        }
     }
     return 0;
 }

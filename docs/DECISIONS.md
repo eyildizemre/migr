@@ -5521,7 +5521,8 @@ otherwise everything is restored as before.
   folder is not there, keeping the file's owner, mode, and times, so the
   restored file differs from the backup's by design.
 - **"What's left for you"** (D78) names the containers left out and says to
-  create them again.
+  create them again. A portable restore's summary counts the items left out
+  on a line of its own, since they are neither restored nor failed.
 
 **Why:**
 - **Another home:** podman's database records its user's home, and under
