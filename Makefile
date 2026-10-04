@@ -19,8 +19,7 @@ ANALYZER_FLAGS = $(CFLAGS) -Wpedantic -Werror -fanalyzer
 # Valgrind covers the non-scale test suite plus the native visited-set and native
 # hardlink inode-map scale tests, whose large allocation volumes are themselves
 # memory-safety subjects. Five larger scale binaries remain excluded because of
-# their disproportionate runtime. test_backup_plan is also excluded pending a
-# fixture fix for its uninitialized payload_dir in the dangling-dotfile test.
+# their disproportionate runtime.
 VALGRIND_TESTS = \
 	tests/test_detect \
 	tests/test_manifest_selection \
@@ -70,7 +69,8 @@ VALGRIND_TESTS = \
 	tests/test_restore_dispatch \
 	tests/test_restore_atime \
 	tests/test_metadata_contract \
-	tests/test_metadata_snapshots
+	tests/test_metadata_snapshots \
+	tests/test_backup_plan
 
 TARGET = migr
 STATIC_TARGET = migr-static
@@ -506,6 +506,8 @@ check-sanitize:
 # Its deliberate exclusions are documented with the list above. Valgrind
 # reports go to one file per process, shown when a binary fails: written to
 # stderr, they would mix into the output that tests capture from children.
+# Children installed on the system (sh, dnf, flatpak) are not traced, and the
+# package tools are the stubs `make test` gives test_backup_plan.
 check-valgrind:
 	@set -e; \
 	logs=$$(mktemp -d); \
@@ -515,7 +517,7 @@ check-valgrind:
 	for binary in $(VALGRIND_TESTS); do \
 		echo "==> valgrind ./$$binary"; \
 		rm -f "$$logs"/*; \
-		valgrind --error-exitcode=1 --trace-children=yes --leak-check=full --track-origins=yes --log-file="$$logs/%p.log" ./$$binary || { cat "$$logs"/*; exit 1; }; \
+		PATH="$(CURDIR)/tests/stubs:$$PATH" valgrind --error-exitcode=1 --trace-children=yes --trace-children-skip='/usr/*,/bin/*,/sbin/*' --leak-check=full --track-origins=yes --log-file="$$logs/%p.log" ./$$binary || { cat "$$logs"/*; exit 1; }; \
 	done
 
 # The host Phase B static-analysis gate: GCC analyzes every source file
