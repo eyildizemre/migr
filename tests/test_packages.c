@@ -1314,6 +1314,8 @@ static void test_restore_groups(void)
 
 typedef struct {
     const char *remotes; /* NULL: flatpak is not installed. */
+    const char *all_remotes; /* With disabled ones; NULL: same as remotes. */
+    int add_fails;
     const char *installed_before;
     const char *installed_after;
     int installs;
@@ -1326,7 +1328,9 @@ static int flatpak_capture_fixture(char *const argv[], char *output,
     FlatpakFixture *fixture = context;
     const char *text = NULL;
     if (strcmp(argv[1], "remotes") == 0)
-        text = fixture->remotes;
+        text = strcmp(argv[3], "--show-disabled") == 0 &&
+               fixture->all_remotes != NULL ? fixture->all_remotes
+                                            : fixture->remotes;
     else if (strcmp(argv[1], "list") == 0)
         text = fixture->installs == 0 ? fixture->installed_before
                                       : fixture->installed_after;
@@ -1351,7 +1355,7 @@ static int flatpak_run_fixture(char *const argv[], void *context)
         }
     }
     fixture->installs++;
-    return 0;
+    return strcmp(argv[1], "remote-add") == 0 && fixture->add_fails;
 }
 
 static void restore_flatpak_step(int dir_fd, FILE *todo, int *had_error,
@@ -1453,6 +1457,83 @@ static void test_restore_flatpak_apps(void)
           "a backup without flatpak-apps.txt is skipped silently");
 }
 
+// Flathub is added when the saved applications need it and the system has
+// no remote of that name; one it has turned off stays off (D102).
+static void test_restore_flatpak_flathub(void)
+{
+    printf(BLUE "::" NC " restore_flatpak_apps: flathub (unit)\n");
+    const char *list = "flathub\tcom.example.A\n"
+                       "fedora\torg.example.C\n";
+    static const char add[] = "flatpak remote-add --if-not-exists --system "
+                              "flathub https://dl.flathub.org/repo/"
+                              "flathub.flatpakrepo";
+    char output[2048];
+    FlatpakFixture missing = {
+        .remotes = "fedora\n",
+        .installed_before = "",
+        .installed_after = "com.example.A\norg.example.C\n"
+    };
+    int rc = run_restore_flatpak_case(list, &missing, output, sizeof(output));
+    check(rc == 0 && missing.installs == 3 &&
+              strcmp(missing.install_argv[0], add) == 0 &&
+              strcmp(missing.install_argv[1], "flatpak install --system -y "
+                     "flathub com.example.A") == 0 &&
+              strstr(output, "Adding the Flathub remote") != NULL &&
+              strstr(output, "2 installed, 0 not installed.") != NULL &&
+              strstr(last_todo, "flathub") == NULL,
+          "a missing flathub is added from its own address before the "
+          "installs, and its applications install");
+
+    FlatpakFixture dry = missing;
+    dry.installs = 0;
+    dry_run = 1;
+    rc = run_restore_flatpak_case(list, &dry, output, sizeof(output));
+    dry_run = 0;
+    check(rc == 0 && dry.installs == 0 &&
+              strstr(output, "Would add the Flathub remote") != NULL &&
+              strstr(output, "Would install com.example.A org.example.C") !=
+                  NULL,
+          "a dry run says it would add flathub and install from it");
+
+    FlatpakFixture failed = missing;
+    failed.installs = 0;
+    failed.add_fails = 1;
+    failed.installed_after = "org.example.C\n";
+    rc = run_restore_flatpak_case(list, &failed, output, sizeof(output));
+    char expected[512];
+    snprintf(expected, sizeof(expected),
+             "does not have yet; run:\n    sudo %s\n    sudo flatpak install "
+             "--system flathub com.example.A\n", add);
+    check(rc == 0 && failed.installs == 2 &&
+              strstr(last_todo, expected) != NULL,
+          "when adding fails, its applications are listed after the exact "
+          "command that adds it");
+
+    FlatpakFixture offline = missing;
+    offline.installs = 0;
+    restore_online = 0;
+    rc = run_restore_flatpak_case(list, &offline, output, sizeof(output));
+    restore_online = 1;
+    check(rc == 0 && offline.installs == 0 &&
+              strstr(last_todo, expected) != NULL,
+          "offline, flathub is not added and the command is listed");
+
+    FlatpakFixture disabled = missing;
+    disabled.installs = 0;
+    disabled.all_remotes = "fedora\nflathub\n";
+    disabled.installed_after = "org.example.C\n";
+    rc = run_restore_flatpak_case(list, &disabled, output, sizeof(output));
+    check(rc == 0 && disabled.installs == 1 &&
+              strcmp(disabled.install_argv[0], "flatpak install --system -y "
+                     "fedora org.example.C") == 0 &&
+              strstr(last_todo, "has turned off; run:\n    sudo flatpak "
+                                "remote-modify --system --enable flathub\n"
+                                "    sudo flatpak install --system flathub "
+                                "com.example.A\n") != NULL,
+          "a flathub this system turned off stays off, with the command that "
+          "turns it on");
+}
+
 int main(void)
 {
     // A direct sudo run must not aim restores at the invoking user's home
@@ -1488,6 +1569,7 @@ int main(void)
     test_groups_collect();
     test_restore_groups();
     test_restore_flatpak_apps();
+    test_restore_flatpak_flathub();
 
     printf("packages tests: %d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;

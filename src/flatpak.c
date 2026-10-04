@@ -142,6 +142,56 @@ static void install_flatpak_apps(const FlatpakApp *apps, size_t count,
     free(done);
 }
 
+// The one remote migr adds itself, from Flathub's own address, never from
+// the backup (D102): its .flatpakrepo file carries the signing key.
+#define FLATHUB "flathub"
+#define FLATHUB_URL "https://dl.flathub.org/repo/flathub.flatpakrepo"
+
+typedef enum {
+    FLATHUB_NOT_NEEDED, /* No saved application needs a missing flathub. */
+    FLATHUB_ADDED,      /* Added now, or would be in a dry run. */
+    FLATHUB_DISABLED,   /* This system has it turned off. */
+    FLATHUB_MISSING     /* Not added: offline, or adding it failed. */
+} FlathubState;
+
+// Adds flathub when an application the system cannot reach comes from it
+// and no remote of that name is there, enabled or not.
+static FlathubState flathub_provide(const FlatpakApp *apps, size_t count,
+                                    const int *unreachable, int online)
+{
+    int needed = 0;
+    for (size_t i = 0; i < count && !needed; i++)
+        needed = unreachable[i] && strcmp(apps[i].remote, FLATHUB) == 0;
+    if (!needed)
+        return FLATHUB_NOT_NEEDED;
+
+    char *const all_query[] = {
+        "flatpak", "remotes", "--system", "--show-disabled",
+        "--columns=name", NULL
+    };
+    char all[4096] = "";
+    if (package_capture_command(all_query, all, sizeof(all)) == 0 &&
+        package_plain_list_contains(all, FLATHUB))
+        return FLATHUB_DISABLED;
+    if (dry_run)
+    {
+        printf("  Would add the Flathub remote, which the saved applications "
+               "come from.\n");
+        return FLATHUB_ADDED;
+    }
+    if (!online)
+        return FLATHUB_MISSING;
+
+    char *const add[] = {
+        "flatpak", "remote-add", "--if-not-exists", "--system", FLATHUB,
+        FLATHUB_URL, NULL
+    };
+    return package_install_command(add, "  Adding the Flathub remote, which "
+                                        "the saved applications come "
+                                        "from...") == 0
+        ? FLATHUB_ADDED : FLATHUB_MISSING;
+}
+
 void restore_flatpak_apps(int source_root_fd, int online, FILE *todo,
                           int *had_error)
 {
@@ -168,8 +218,10 @@ void restore_flatpak_apps(int source_root_fd, int online, FILE *todo,
     char *remotes = malloc(PACKAGE_QUERY_BUFFER_SIZE);
     int *wanted = calloc(count, sizeof(*wanted));
     int *unreachable = calloc(count, sizeof(*unreachable));
+    int *from_flathub = calloc(count, sizeof(*from_flathub));
     char *installed = NULL;
-    if (remotes == NULL || wanted == NULL || unreachable == NULL)
+    if (remotes == NULL || wanted == NULL || unreachable == NULL ||
+        from_flathub == NULL)
     {
         print_error("Error: Could not allocate the Flatpak application list\n");
         *had_error = 1;
@@ -206,6 +258,21 @@ void restore_flatpak_apps(int source_root_fd, int online, FILE *todo,
         else
             unreachable[i] = 1;
     }
+    FlathubState flathub = flathub_provide(apps, count, unreachable, online);
+    // Each flathub application is now wanted, or left with the command its
+    // own state needs.
+    for (size_t i = 0; i < count; i++)
+        if (unreachable[i] && strcmp(apps[i].remote, FLATHUB) == 0)
+        {
+            unreachable[i] = 0;
+            if (flathub == FLATHUB_ADDED)
+            {
+                wanted[i] = 1;
+                wanted_count++;
+            }
+            else
+                from_flathub[i] = 1;
+        }
 
     if (wanted_count != 0 && dry_run)
     {
@@ -246,15 +313,25 @@ void restore_flatpak_apps(int source_root_fd, int online, FILE *todo,
         printf("  Every saved Flatpak application this system can reach is "
                "installed.\n");
 
-    // Adding a remote needs its signing key, which the backup does not have,
-    // so a remote the system lacks is left to the user.
+    // Adding any other remote needs its signing key, which the backup does
+    // not have, so a remote the system lacks is left to the user.
     size_t unreachable_count = 0;
     for (size_t i = 0; i < count; i++)
-        unreachable_count += unreachable[i];
+        unreachable_count += unreachable[i] + from_flathub[i];
     if (unreachable_count != 0)
         printf("  %zu application%s from remotes this system does not have "
                "left out.\n", unreachable_count,
                unreachable_count == 1 ? "" : "s");
+    flatpak_todo(todo, flathub == FLATHUB_DISABLED
+                     ? "Flatpak applications from Flathub, which this system "
+                       "has turned off; run:\n"
+                       "    sudo flatpak remote-modify --system --enable "
+                       FLATHUB
+                     : "Flatpak applications from Flathub, which this system "
+                       "does not have yet; run:\n"
+                       "    sudo flatpak remote-add --if-not-exists --system "
+                       FLATHUB " " FLATHUB_URL,
+                 apps, count, from_flathub);
     flatpak_todo(todo, "Flatpak applications whose remote this system does "
                        "not have; add the remote, then run:",
                  apps, count, unreachable);
@@ -264,6 +341,7 @@ done:
     free(remotes);
     free(wanted);
     free(unreachable);
+    free(from_flathub);
     free(apps);
 }
 

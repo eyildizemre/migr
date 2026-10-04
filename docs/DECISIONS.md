@@ -4831,7 +4831,7 @@ the applications themselves is separate.
 
 ## D76 — 2026-09-27 — Restore reinstalls system-wide Flatpak applications
 
-**Status:** Implemented
+**Status:** Implemented; restore adds flathub itself since D102
 
 **Decision:** Every scope but explicit paths records the system Flatpak
 installation's applications in `flatpak-apps.txt` at the container root,
@@ -5793,3 +5793,37 @@ restored.
 
 **Relationship:** Extends D41 and D47 to the dconf database; D50's load and
 D80's file rule are unchanged.
+
+## D102 — 2026-10-04 — Restore adds flathub when the saved applications need it
+
+**Status:** Implemented
+
+**Decision:** When a saved Flatpak application comes from the remote
+`flathub` and the system has no remote of that name, restore adds it before
+installing: `flatpak remote-add --if-not-exists --system flathub
+https://dl.flathub.org/repo/flathub.flatpakrepo`, with the address fixed in
+migr. Its applications are then installed with the others (D76).
+- **Consent:** No question of its own. The restore's question covers it, as
+  it covers the packages restore installs; a dry run says it would add it.
+- **Only flathub:** Any other remote the system lacks is listed with the
+  install command, as before.
+- **Turned off:** A flathub the system has but has disabled stays disabled;
+  "What's left for you" (D78) gives `flatpak remote-modify --system --enable
+  flathub` before the install command.
+- **Not added:** Offline, or when adding fails, "What's left for you" gives
+  the exact `remote-add` command before the install command.
+
+**Why:** Ubuntu does not set up flathub, and Fedora sets it up only when its
+third-party repositories are turned on, which the KDE edition never asks
+about; on both, every saved application from flathub was left out. D76
+leaves a missing remote to the user because the backup does not carry its
+signing key. Flathub's `.flatpakrepo` file carries the key and is fetched
+from its own address over HTTPS, so nothing is taken from the backup, and a
+backup that names another remote `flathub` still gets the real one.
+
+**Rejected:** Turning on Fedora's third-party repositories
+(`fedora-third-party enable`), which also turns on other vendors'
+repositories. Turning a disabled flathub back on: a disabled remote is a
+choice made on this system.
+
+**Relationship:** Narrows D76's rule on missing remotes for flathub alone.
