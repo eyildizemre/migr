@@ -349,7 +349,7 @@ new system's `~/.config/user-dirs.dirs`.
 new system could not install, Flatpak applications it could not install, and
 groups it does not have, each with the command to run. The same list is saved
 next to the backup as `migr-<user>-todo.txt`, so nothing of migr is left in
-your new home.
+your new home; the screen counts the packages, and the saved list names them.
 
 **Checking the result.** A restore from an exFAT, FAT32, or NTFS backup reads
 back every file it wrote. A file that does not read back as it was captured

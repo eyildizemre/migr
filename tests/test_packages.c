@@ -305,16 +305,15 @@ static int run_restore_packages_case(distro_t distro, const char *contents,
     close(dir_fd);
     fclose(todo);
 
-    // The todo names the packages on one line, as "    a b c".
-    char expected[8192] = "    ";
+    // The todo names the packages one per line, as "    a\n    b\n".
+    char expected[8192] = "";
     for (const char *p = expected_skipped; p != NULL && *p != '\0'; p++)
     {
         size_t used = strlen(expected);
-        if (used + 2U < sizeof(expected))
-        {
-            expected[used] = *p == '\n' ? (p[1] != '\0' ? ' ' : '\n') : *p;
-            expected[used + 1U] = '\0';
-        }
+        if (used + 6U < sizeof(expected))
+            snprintf(expected + used, sizeof(expected) - used, "%s%c",
+                     p == expected_skipped || p[-1] == '\n' ? "    " : "",
+                     *p);
     }
     size_t text_length = strlen(todo_text);
     size_t expected_length = strlen(expected);

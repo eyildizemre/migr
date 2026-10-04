@@ -631,12 +631,10 @@ static void package_account_final_state(distro_t distro, const char *inventory,
             continue;
         }
         if (*skipped == 0)
-            fprintf(todo, "  %s\n    ", heading);
-        fprintf(todo, "%s%s", *skipped == 0 ? "" : " ", pkgs[index]);
+            fprintf(todo, "  %s\n", heading);
+        fprintf(todo, "    %s\n", pkgs[index]);
         (*skipped)++;
     }
-    if (*skipped != 0)
-        fprintf(todo, "\n");
 }
 
 // Opens a list at the container root (never inside data/: it is a control

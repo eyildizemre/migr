@@ -4874,8 +4874,8 @@ extensions under `~/.var/app` (D75).
 
 ## D78 — 2026-09-27 — Restore ends with what is left to do by hand
 
-**Status:** Implemented; a long package list is named only in the copy next
-to the backup (2026-10-04)
+**Status:** Implemented; package names are listed only in the copy next to
+the backup (2026-10-04)
 
 **Decision:** The restore steps that re-create system state (packages,
 Flatpak applications, groups) write what they could not do into one list,
@@ -4899,9 +4899,9 @@ system lacks.
 
 **Relationship:** Supersedes D1's file; keeps D40's final-state accounting.
 
-**Revision (2026-10-04):** The packages come last, after the steps. When more
-than ten are left, the screen gives their number and says the copy next to
-the backup names them; a copy that could not be written leaves them on the
+**Revision (2026-10-04):** The packages come last, after the steps, one name
+per line. The screen gives only their number and says the copy next to the
+backup names them; a copy that could not be written leaves the names on the
 screen. A restore from another distribution leaves hundreds of names that
 have no package of that name here, and listed in full they pushed the steps
 the user has to take off the screen.

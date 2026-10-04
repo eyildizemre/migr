@@ -642,17 +642,14 @@ typedef struct {
     char *text;
     size_t size;
     FILE *stream;
-    /* The packages it could not install, kept apart: from another
-     * distribution they can run to hundreds of names. */
+    /* The packages it could not install, one per line, kept apart: from
+     * another distribution they can run to hundreds of names. */
     char *packages_text;
     size_t packages_size;
     FILE *packages;
     int package_count;
     int written; /* The steps ran, so the list next to the backup is due. */
 } RestoreTodo;
-
-// More package names than this are left to the list next to the backup.
-#define TODO_PACKAGES_SHOWN 10
 
 // Re-creates the system state the backup lists, after its files and network
 // configuration: packages first, since they bring Flatpak and groups along.
@@ -765,8 +762,9 @@ static int restore_todo_write(const char *source, const char *text,
 }
 
 // Ends the run with what is left to do by hand and keeps it next to the
-// backup. The steps come first; a long package list stays in the copy next to
-// the backup, where it does not push them off the screen.
+// backup. The steps come first; the screen counts the packages and leaves
+// their names to the copy next to the backup, where they cannot push the
+// steps off the screen.
 static void restore_todo_finish(RestoreTodo *todo, const char *source)
 {
     int closed = todo->stream != NULL && fclose(todo->stream) == 0 &&
@@ -783,9 +781,11 @@ static void restore_todo_finish(RestoreTodo *todo, const char *source)
         if (text[0] != '\0')
         {
             printf("\nWhat's left for you\n%s", todo->text);
-            if (kept && todo->package_count > TODO_PACKAGES_SHOWN)
-                printf("  %d packages this system does not have; the copy "
-                       "of this list names them.\n", todo->package_count);
+            if (kept && todo->package_count != 0)
+                printf("  %d package%s this system does not have; the copy "
+                       "of this list names %s.\n", todo->package_count,
+                       todo->package_count == 1 ? "" : "s",
+                       todo->package_count == 1 ? "it" : "them");
             else
                 printf("%s", todo->packages_text);
         }

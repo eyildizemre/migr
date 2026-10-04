@@ -3047,14 +3047,14 @@ static void test_restore_keeps_the_todo_next_to_the_backup(void)
                                     package_progress_capture, &probe);
     int rc = run_restore_capturing_with_input(source, "y\n", output,
                                               sizeof(output));
-    const char *section = strstr(output, "\nWhat's left for you\n"
-                                         "  Packages this system could not "
-                                         "install");
+    const char *section = strstr(output, "\nWhat's left for you\n");
     check(rc == 0 && section != NULL &&
-              strstr(section, "    missing-package\n") != NULL &&
+              strstr(section, "  1 package this system does not have; the "
+                              "copy of this list names it.\n") != NULL &&
+              strstr(section, "missing-package") == NULL &&
               strstr(section, todo_path) != NULL,
-          "the run ends with the packages left to install by hand and says "
-          "where the list is kept");
+          "the run ends with the number of packages left to install by hand "
+          "and says where the list naming them is kept");
     FILE *todo = fopen(todo_path, "r");
     char kept[512] = "";
     if (todo != NULL)
@@ -3082,8 +3082,12 @@ static void test_restore_keeps_the_todo_next_to_the_backup(void)
               strstr(section, "  11 packages this system does not have; the "
                               "copy of this list names them.\n") != NULL &&
               strstr(section, " m11") == NULL &&
-              strstr(kept, "    m1 m2 m3 m4 m5 m6 m7 m8 m9 m10 m11\n") != NULL,
-          "a long package list is counted on screen and named in the copy");
+              strstr(kept, "could not install, often from a repository it "
+                           "does not have yet, or named differently on this "
+                           "distribution:\n    m1\n    m2\n") != NULL &&
+              strstr(kept, "    m10\n    m11\n") != NULL,
+          "a long list is counted on screen and named in the copy, one "
+          "package per line");
 
     write_file_mode(packages, "fixture-package\n", 0644);
     rc = run_restore_capturing_with_input(source, "y\n", output,
