@@ -4081,6 +4081,19 @@ int get_dir_size(const char *path, off_t *size)
     return -1; // unknown file type (unreachable on Linux); refuse defensively
 }
 
+// A child that points its stdio at a pipe or /dev/null with dup2() and then
+// execs or _exit()s hands those descriptors on; GCC's analyzer (13 and later)
+// reports them as leaked. Clang does not know the warning.
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 13
+#define CHILD_REDIRECT_BEGIN                                    \
+    _Pragma("GCC diagnostic push")                              \
+    _Pragma("GCC diagnostic ignored \"-Wanalyzer-fd-leak\"")
+#define CHILD_REDIRECT_END _Pragma("GCC diagnostic pop")
+#else
+#define CHILD_REDIRECT_BEGIN
+#define CHILD_REDIRECT_END
+#endif
+
 int run_command(char *const argv[])
 {
     // What migr printed so far comes before the command's own output.
@@ -4141,6 +4154,7 @@ int run_command_errors(char *const argv[], char *errors, size_t errors_size)
     }
     if (pid == 0)
     {
+        CHILD_REDIRECT_BEGIN
         // No stdio until exec, as in run_command().
         int null_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
         if (null_fd < 0 || dup2(null_fd, STDOUT_FILENO) < 0 ||
@@ -4148,6 +4162,7 @@ int run_command_errors(char *const argv[], char *errors, size_t errors_size)
             _exit(1);
         execvp(argv[0], argv);
         _exit(1);
+        CHILD_REDIRECT_END
     }
     close(pipefd[1]);
     // Only the end is kept: a failing command says why last.
@@ -4453,6 +4468,7 @@ static int run_command_capture_internal(char *const argv[], char *output,
     }
     else if (pid == 0)
     {
+        CHILD_REDIRECT_BEGIN
         // Child process. No stdio until exec, as in run_command().
         close(pipefd[0]); // Close the read end of the pipe
 
@@ -4485,6 +4501,7 @@ static int run_command_capture_internal(char *const argv[], char *output,
             execvp(argv[0], argv); // Execute the command
 
         _exit(1); // exec failed: an absent optional command stays silent
+        CHILD_REDIRECT_END
     }
     else
     {
