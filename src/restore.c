@@ -1026,6 +1026,17 @@ static int restore_dconf_loads_into_session(void)
     return dconf_restore_session_loads();
 }
 
+// Whether the target user has a running session, whose services rewrite
+// live desktop state (D65, D100).
+static int restore_session_running(void)
+{
+#ifdef RESTORE_TEST_HOOKS
+    if (restore_test_dconf_hook != NULL)
+        return 1;
+#endif
+    return dconf_restore_session_running();
+}
+
 // A native container mirrors each root under data/<payload>, so the dconf
 // database of the root captured from HOME/.config is at a fixed place.
 static int native_dconf_database_fd(int source_root_fd, const Manifest *m)
@@ -3971,6 +3982,7 @@ int restore_with_options(const char *source, const RestoreOptions *options)
             .before_deferred_context = &deferral,
             .dconf_database_fd_out = &dconf_database_fd,
             .dconf_loads_into_session = restore_dconf_loads_into_session(),
+            .session_running = restore_session_running(),
             .left_out_containers =
                 leave_out_containers ? &left_out_containers : NULL
         };

@@ -242,6 +242,18 @@ int dconf_restore_session_loads(void)
                DCONF_RESTORE_APPLIED;
 }
 
+int dconf_restore_session_running(void)
+{
+    DconfTarget target;
+    char runtime_dir[PATH_MAX], bus_path[PATH_MAX];
+    if (dconf_target_resolve(&target) != 0)
+        return 0;
+    DconfRestoreStatus status = dconf_session_check(&target, runtime_dir,
+                                                    bus_path);
+    return status == DCONF_RESTORE_APPLIED ||
+           status == DCONF_RESTORE_UNAVAILABLE;
+}
+
 DconfRestoreStatus dconf_restore_apply(int database_fd, size_t *applied_keys)
 {
     if (applied_keys != NULL)

@@ -35,6 +35,10 @@ DconfRestoreStatus dconf_restore_apply(int database_fd, size_t *applied_keys);
  * the target user has a session bus and dconf is installed. */
 int dconf_restore_session_loads(void);
 
+/* Nonzero when the target user has a session bus: a session is running, and
+ * its services rewrite their own state (D65, D100). */
+int dconf_restore_session_running(void);
+
 #ifdef DCONF_RESTORE_TEST_HOOKS
 /* Replaces "/run/user" as the parent of the per-uid runtime directory. */
 void dconf_restore_test_set_runtime_root(const char *path);

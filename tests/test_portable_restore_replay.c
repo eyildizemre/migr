@@ -631,6 +631,8 @@ static const PortableRestoreDeferredPath *replay_deferred_paths;
 static size_t replay_deferred_path_count;
 static int (*replay_before_deferred)(void *);
 static void *replay_before_deferred_context;
+// A desktop session runs unless a test says otherwise (D65, D100).
+static int replay_session_running = 1;
 
 static int run_replay_with_options(
     Fixture *fixture, PortableRestoreReplayReport *report,
@@ -659,7 +661,8 @@ static int run_replay_with_options(
         .deferred_paths = replay_deferred_paths,
         .deferred_path_count = replay_deferred_path_count,
         .before_deferred = replay_before_deferred,
-        .before_deferred_context = replay_before_deferred_context
+        .before_deferred_context = replay_before_deferred_context,
+        .session_running = replay_session_running
     };
     portable_restore_replay_report_init(report);
     int result = portable_restore_replay_at(&request, report);
@@ -683,7 +686,8 @@ static int run_replay_with_xdg(
         .destination_timestamp_policy = {
             .nsec_exact = 1,
             .configured = 1
-        }
+        },
+        .session_running = replay_session_running
     };
     for (int index = 0; index < XDG_KEY_COUNT; index++)
         request.destination_xdg_dirs[index] =
@@ -2356,7 +2360,8 @@ static int run_replay_with_dconf(Fixture *fixture,
             .configured = 1
         },
         .dconf_database_fd_out = dconf_database_fd,
-        .dconf_loads_into_session = session_loads
+        .dconf_loads_into_session = session_loads,
+        .session_running = 1
     };
     portable_restore_replay_report_init(report);
     int result = portable_restore_replay_at(&request, report);
@@ -3084,6 +3089,32 @@ static void test_live_desktop_state_verification_exclusion(void)
               "live state already written by a service is kept, and the "
               "missing live file is filled in");
         fixture_close(&kept);
+    }
+
+    // With no session running, nothing rewrites that state: the backup's
+    // copy replaces what a desktop wrote before a console restore (D100).
+    Fixture console;
+    opened = verification_exclusion_fixture_open(&console);
+    check(opened == 0, "console live-state fixture is created");
+    if (opened == 0)
+    {
+        make_dir_at(console.home_fd, ".local", 0700);
+        make_dir_at(console.home_fd, ".local/share", 0700);
+        make_dir_at(console.home_fd, ".local/share/gvfs-metadata", 0700);
+        write_file_at(console.home_fd, ".local/share/gvfs-metadata/root",
+                      "written before the console restore");
+        replay_session_running = 0;
+        PortableRestoreReplayReport report;
+        int result = run_replay(&console, &report);
+        replay_session_running = 1;
+        char restored_file[PATH_MAX];
+        path_concat(restored_file, sizeof(restored_file), console.home,
+                  "/.local/share/gvfs-metadata/root");
+        check(result == 0 && report.live_state_kept_count == 0 &&
+                  file_equals_noatime(restored_file, "gvfs root payload"),
+              "without a running session, the backup's live state replaces "
+              "what is there");
+        fixture_close(&console);
     }
 
     Fixture lookalike;

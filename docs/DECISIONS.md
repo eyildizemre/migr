@@ -4479,7 +4479,7 @@ real `sudo migr backup --critical` of a btrfs `/home` in a VM.
 
 ## D65 — 2026-09-26 — Restore fills live desktop state but does not fight it
 
-**Status:** Implemented
+**Status:** Implemented; limited to a running session by D100
 
 **Decision:** A regular file on the confirmed live-state list (D44, D48,
 D55, D56) is restored only when nothing is at its destination. If a running
@@ -4496,7 +4496,7 @@ keep. Missing files are still filled in.
 
 **Relationship:** Part of the live-environment design. Not backing this
 state up at all belongs to the backup-scope overhaul. D80 narrows it for the dconf
-database.
+database; D100 limits it to a running session.
 
 ## D66 — 2026-09-26 — A portable restore restores open applications' settings last
 
@@ -5711,3 +5711,25 @@ restore's own summary: what installed, and what did not and why to look.
 depends on every tool's output format and language. Quiet flags differ
 between tools and still print some progress; discarding standard output
 does the same for all of them.
+
+## D100 — 2026-10-04 — Live desktop state is kept only while a session runs
+
+**Status:** Implemented
+
+**Decision:** Replay leaves live desktop state already at its destination in
+place (D65) only when the target user has a running session, which restore
+takes to be a session bus in the user's runtime directory, as D80 does.
+Without one, replay restores the backup's copy like any other file. Restore
+asks before replay and passes the answer in the request
+(`session_running`).
+
+**Why:** D65 assumed every restore runs inside a desktop session. A restore
+started on the desktop now continues on a text console after the session
+has ended (D89), and a restore may also start from a console or over SSH.
+The state on the list was then written by a session that is no longer
+running, and nothing rewrites it. Keeping the fresh install's copy lost what
+the backup held: `gvfs-metadata` records starred files, custom folder icons
+and emblems.
+
+**Relationship:** Limits D65; D80's dconf rule is unchanged and applies
+within a running session.

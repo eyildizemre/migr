@@ -55,6 +55,11 @@ typedef struct {
      * (D50). Only then is an existing ~/.config/dconf/user left in place like
      * other live state (D65); otherwise replay writes it (D80). */
     int dconf_loads_into_session;
+    /* Nonzero when the target user has a running session, whose services
+     * rewrite live desktop state: only then is such state that is already
+     * at its destination left in place (D65). Otherwise the backup's copy
+     * is restored, as from a text console (D100). */
+    int session_running;
     /* Optional. Regular files, symlinks, and hardlinks below these paths of
      * home-relative roots are restored after everything else. Right before
      * that, before_deferred (if set) decides: 1 restores them, 0 leaves them
