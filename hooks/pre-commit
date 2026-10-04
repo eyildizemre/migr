@@ -12,15 +12,16 @@ if ! git diff --cached --name-only | grep -qE '\.(c|h|sh)$|(^|/)Makefile$|^tests
     exit 0
 fi
 
-echo "▶ Running pre-commit checks..."
+# Every gate runs on exactly what is staged, in a copy: unstaged edits can
+# neither hide a failure nor cause one, and the working tree's build stays.
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+git checkout-index --all --prefix="$work/"
 
-if ! make > /tmp/migr-build.log 2>&1; then
-    echo "× Build failed. See /tmp/migr-build.log for details."
-    exit 1
-fi
+echo "▶ Running every gate on the staged tree (this takes several minutes)..."
 
-if ! make test > /tmp/migr-test.log 2>&1; then
-    echo "× Tests failed. See /tmp/migr-test.log for details."
+if ! make -C "$work" check > /tmp/migr-check.log 2>&1; then
+    echo "× A gate failed. See /tmp/migr-check.log for details."
     exit 1
 fi
 
