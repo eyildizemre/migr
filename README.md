@@ -47,8 +47,9 @@ sudo ./migr backup /mnt/usb                    # back up to the drive mounted at
 ./migr verify /mnt/usb/migr-$USER              # check the backup before wiping this system
 ```
 
-Then install the new distribution, create your user with the same password
-you use now, log in, build migr, and plug the drive in:
+Then install the new distribution, create your user with the same user name
+and password you use now (see [Restoring](#restoring)), log in, build migr,
+and plug the drive in:
 
 ```bash
 sudo ./migr restore /mnt/usb/migr-$USER
@@ -341,9 +342,22 @@ Backup and restore both remind you.
 that services rewrite all the time alone where the new system has already
 written it, and restores it only where nothing is there yet.
 
-**When your home path or folder names differ** on the new system, restore
-rewrites them in GTK bookmarks and the recent files list, and it keeps the
-new system's `~/.config/user-dirs.dirs`.
+**Same user name.** Give your user on the new system the same name, and keep
+your home's folders (Documents, Pictures, and so on) in the same language.
+Another name moves your home to another path, `/home/eyildizemre2` instead
+of `/home/eyildizemre`, and another language renames its folders, `Belgeler`
+instead of `Documents`. Restore rewrites these paths where the desktop keeps
+them: GTK bookmarks, the recent files list, and GNOME settings such as the
+wallpaper and the folders file dialogs remember; it keeps the new system's
+`~/.config/user-dirs.dirs`. Paths that applications keep in their own files
+still name the old ones, for example:
+
+- Obsidian opens without your vault: the vault is restored, under the new
+  path, and you open it again.
+- An editor's recent projects lead nowhere.
+- A script or a desktop launcher that names the old path fails.
+
+Another name also leaves your Podman containers out (above).
 
 **What's left for you.** Restore ends with what it could not do: packages the
 new system could not install, Flatpak applications it could not install, and
@@ -372,7 +386,14 @@ read-back. `--dry-run` shows what would be restored and writes nothing.
   (below), files are migrated but packages are not.
 - **Snap** applications and their data.
 - **Creating what is missing.** Groups the new system lacks are not created,
-  and Flatpak remotes are not added, since adding one needs its signing key.
+  and Flatpak remotes other than Flathub are not added, since adding one
+  needs its signing key.
+- **Old paths in applications' own files.** Under another user name or in
+  another language, applications' own files still name the old home and
+  folders (see [Restoring](#restoring)). Each application keeps paths in a
+  format of its own, some in databases or in files with checksums, so
+  rewriting them takes a rule for every application and could damage files
+  migr cannot check. Keeping the same user name and folder names avoids it.
 - **Custom locations.** `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, and
   `XDG_STATE_HOME` set elsewhere than their defaults, and zsh's `ZDOTDIR`, are
   not followed yet.
