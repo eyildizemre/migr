@@ -146,6 +146,18 @@ static int fake_dconf(int argc, char *argv[])
         free(profile);
         free(database);
         const char *runtime = getenv("XDG_RUNTIME_DIR");
+        // dconf keeps a file of its own there, as dconf/user.
+        char shm[PATH_MAX];
+        if (runtime != NULL &&
+            snprintf(shm, sizeof(shm), "%s/dconf", runtime) <
+                (int)sizeof(shm) &&
+            (mkdir(shm, 0700) == 0 || errno == EEXIST))
+        {
+            strncat(shm, "/user", sizeof(shm) - strlen(shm) - 1U);
+            FILE *flag = fopen(shm, "w");
+            if (flag != NULL)
+                fclose(flag);
+        }
         snprintf(line, sizeof(line), "dump %s config=%s runtime=%s",
                  valid ? "valid" : "invalid", config != NULL ? config : "",
                  runtime != NULL ? runtime : "");
@@ -287,6 +299,10 @@ static void fixture_close(Fixture *fixture)
     rmdir(path);
     rmdir(fixture->home);
     unlink(fixture->bus);
+    fixture_path(path, fixture->runtime_dir, "dconf/user");
+    unlink(path);
+    fixture_path(path, fixture->runtime_dir, "dconf");
+    rmdir(path);
     fixture_path(path, fixture->bin, "dconf");
     unlink(path);
     rmdir(fixture->bin);
@@ -408,6 +424,15 @@ int main(int argc, char *argv[])
           "URIs and quoted paths alike, longer names untouched");
     log = fixture_log(&fixture);
     check(work_dir_removed(log), "the private work directory is removed");
+    const char *config = strstr(log, "config=");
+    size_t config_length = config != NULL ? strcspn(config + 7, " \n") : 0;
+    char expected_runtime[PATH_MAX + 32];
+    snprintf(expected_runtime, sizeof(expected_runtime),
+             " runtime=%.*s/runtime\n", (int)config_length,
+             config != NULL ? config + 7 : "");
+    check(config_length != 0 && strstr(log, expected_runtime) != NULL,
+          "without a session the dump's runtime directory is a folder of "
+          "the work directory, not the user's, which is gone");
     free(log);
 
     fixture_reset_home(&fixture);

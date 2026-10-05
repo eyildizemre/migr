@@ -140,7 +140,7 @@ typedef struct {
 } DconfWorkDir;
 
 static const char *const dconf_work_files[] = {
-    "dconf/user", "profile", "keyfiles/user", "compiled"
+    "dconf/user", "profile", "keyfiles/user", "compiled", "runtime/dconf/user"
 };
 
 static void dconf_work_dir_remove(DconfWorkDir *work)
@@ -153,6 +153,8 @@ static void dconf_work_dir_remove(DconfWorkDir *work)
         (void)unlinkat(work->fd, dconf_work_files[index], 0);
     (void)unlinkat(work->fd, "dconf", AT_REMOVEDIR);
     (void)unlinkat(work->fd, "keyfiles", AT_REMOVEDIR);
+    (void)unlinkat(work->fd, "runtime/dconf", AT_REMOVEDIR);
+    (void)unlinkat(work->fd, "runtime", AT_REMOVEDIR);
     close(work->fd);
     work->fd = -1;
     (void)rmdir(work->path);
@@ -334,8 +336,21 @@ DconfRestoreStatus dconf_restore_apply(int database_fd, int home_fd,
     if (dconf_work_dir_create(&work, database_fd, &target) != 0)
         return status;
 
-    char *dump = malloc(dconf_dump_limit);
+    char *dump = NULL;
     char *rewritten = NULL;
+    // Without a session the user's runtime directory is gone, and dconf
+    // would try to make it again; a folder of the work directory stands in.
+    // Not the work directory itself, where dconf's own dconf/user would be
+    // the database.
+    if (!loads &&
+        (mkdirat(work.fd, "runtime", 0700) != 0 ||
+         (target.drop_identity &&
+          fchownat(work.fd, "runtime", target.uid, target.gid,
+                   AT_SYMLINK_NOFOLLOW) != 0) ||
+         path_join(runtime_dir, PATH_MAX, work.path, "runtime") != 0))
+        goto done;
+
+    dump = malloc(dconf_dump_limit);
     char profile_env[PATH_MAX + 32], config_env[PATH_MAX + 32];
     char bus_env[PATH_MAX + 64], runtime_env[PATH_MAX + 32];
     if (dump == NULL ||

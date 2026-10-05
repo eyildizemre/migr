@@ -5783,7 +5783,10 @@ or `"/home/...`); either form is rewritten when the path ends at a component.
   replaces the restored file's, which keeps its inode, owner, mode,
   extended attributes, and times. A failure leaves the restored file as it
   is and is reported. Without `dconf` installed nothing is rewritten, since
-  nothing reads the database.
+  nothing reads the database. The user's runtime directory is gone with the
+  session, so `dconf dump` gets a folder of migr's private work directory
+  in its place; dconf would otherwise try to make the user's again and
+  print an error for each value it reads.
 
 **Why:** dconf stores absolute paths: the wallpaper (`picture-uri`), the last
 folder of each file dialog, an application's default directories. A restore
