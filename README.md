@@ -382,9 +382,9 @@ read-back. `--dry-run` shows what would be restored and writes nothing.
 - **Package names across families.** A package named differently on the new
   distribution is not translated; it is listed for you to install.
 - **Leaving out another desktop's packages.** Drivers aside, restore installs
-  every package in the backup. Restored onto another desktop, it installs the old desktop's
-  packages too; they do not change the desktop you log in to, and removing
-  them is left to you.
+  every package in the backup. Restored onto another desktop, it installs the
+  old desktop's packages too; they do not change the desktop you log in to,
+  and removing them is left to you.
 - **Unknown distributions.** Outside the Debian, Fedora, and Arch families
   (below), files are migrated but packages are not.
 - **Snap** applications and their data.
