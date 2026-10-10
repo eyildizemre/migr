@@ -5917,3 +5917,42 @@ does it is known.
 **Rejected:** Updating the given backup in place of the one the parent would
 find. The destination would then mean two things, a folder to back up into or
 a backup to update, depending on what is in it.
+
+## D106 — 2026-10-11 — `migr verify` checks a native backup against its source
+
+**Status:** Implemented
+
+**Decision:** `migr verify` checks a native backup by comparing each regular
+file and symlink in it with the item at the same place in its source, named
+by the manifest's roots. Nothing at capture records their content, so an
+item is compared only when its source has not changed since the backup: a
+regular file or a symlink with the backup's modification time, and with a
+change time before the backup started (the manifest's `UPDATED`), since a
+program can set a modification time back but not a change time. For such an
+item:
+- **Regular file:** another size, or other bytes, is a difference.
+- **Symlink:** another target is a difference.
+
+A source item that is missing, of another kind, changed since the backup,
+or unreadable is counted as not checked, never as a difference. Directories,
+and files outside `data/`, are not compared. Exit status follows D68: 0 when
+every item compared matches, 1 when some differ, with the first ones listed,
+and 2 when none could be compared, which names the reason: a native backup
+is checked on the system it was taken from, before that system is replaced.
+A manifest without the source home names home-relative roots against the
+home of the user running verify.
+
+**Why:** Before wiping the source machine, a native backup had no check
+short of restoring it, though a USB drive fails the same way under either
+representation, and Linux filesystems keep no checksum of file content. A
+record of digests at capture, as the sidecar keeps (D59), would need a
+second journal for native backups, kept across updates and resumed runs;
+the source it would stand for is still there at the moment the check is
+needed.
+
+**Rejected:** Recording content digests during native capture, for the cost
+above; it would also check a native backup without its source, which this
+does not.
+
+**Relationship:** Extends D60 to native backups, which it left out until
+they recorded digests of their own.

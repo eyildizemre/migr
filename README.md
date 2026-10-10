@@ -25,9 +25,11 @@ It is not released yet: there are no packages, so build it from source.
 - **Resumable and updatable.** An interrupted backup continues where it
   stopped. Backing up to the same drive again updates the backup and copies
   only what changed.
-- **Checked before you wipe.** For a backup on exFAT, FAT32, or NTFS,
-  `migr verify` confirms that every file on the drive still matches what was
-  captured, and restore reads back every file it wrote.
+- **Checked before you wipe.** `migr verify` confirms that every file on the
+  drive still matches: what was captured, for a backup on exFAT, FAT32, or
+  NTFS, or the files it was taken from, for a backup on a Linux filesystem.
+  From an exFAT, FAT32, or NTFS backup, restore also reads back every file it
+  wrote.
 
 ## Build
 
@@ -216,7 +218,7 @@ migr picks the form by testing the drive; there is no option.
 ## Checking a backup
 
 Run `migr verify` before you wipe the old system. It reads every file in the
-backup and compares it with what was captured, without restoring anything:
+backup and compares it, without restoring anything:
 
 ```text
 $ ./migr verify /mnt/usb/migr-eyildizemre
@@ -226,9 +228,16 @@ Verifying 31 items (8.0M) in /mnt/usb/migr-eyildizemre
 ```
 
 A file that went missing or changed is listed, and verify exits with status 1.
-It checks backups on exFAT, FAT32, and NTFS drives, which record what they
-captured; a backup on a Linux filesystem is a plain copy with no such record,
-and verify refuses it.
+
+A backup on exFAT, FAT32, or NTFS records what it captured, and verify checks
+it against that record, on any system. A backup on a Linux filesystem is a
+plain copy with no such record: verify compares it with the files of the
+system it was taken from, so **run it on that system, before it is
+replaced**. On another system, or once the old one is gone, there is nothing
+to compare with, and verify says it cannot check the backup (exit status 2).
+A file changed on the old system since the backup cannot be compared; such
+files are counted, not listed, so run verify right after the backup to check
+nearly all of it.
 
 If the journal of such a backup is damaged, for example by a failing drive,
 restore refuses it. `migr repair <SOURCE> <PATH>` then rebuilds it as a new
@@ -438,7 +447,7 @@ Other derivatives are recognized through `ID_LIKE` in `/etc/os-release`.
 report [SCOPE]        Show backup analysis report (default when no command given)
 backup <PATH>         Create a resumable backup container under PATH
 restore <SOURCE>      Restore files and packages from a backup at SOURCE
-verify <SOURCE>       Check a portable backup against its capture record
+verify <SOURCE>       Check a backup before you wipe the old system
 repair <SOURCE> <PATH>
                       Rebuild a damaged portable backup as a new copy under PATH
 conf                  Edit persistent critical/comprehensive selection rules

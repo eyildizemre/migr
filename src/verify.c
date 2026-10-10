@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "verify.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -49,6 +50,14 @@ typedef struct {
     uint64_t bytes_read;
     uint64_t total_bytes;
     ExampleList failed;
+
+    /* A native backup, checked against its source: the root being walked,
+     * whether the walk only counts, and the items compared and not. */
+    const char *root_id;
+    time_t taken;
+    int counting;
+    size_t compared;
+    size_t unchecked;
 
     int progress;
     struct timespec started_at;
@@ -385,8 +394,10 @@ static void verify_item(VerifyRun *run, const VerifyItem *item)
         verify_parent_forget(run);
 }
 
-int portable_container_open(const char *path, Manifest *manifest,
-                            int *container_fd_out)
+// Opens a finished container and reads its manifest, with a printed reason
+// when it is not one.
+static int finished_container_open(const char *path, Manifest *manifest,
+                                   int *container_fd_out)
 {
     char copy[PATH_MAX];
     size_t length = strlen(path);
@@ -428,20 +439,402 @@ int portable_container_open(const char *path, Manifest *manifest,
         close(container_fd);
         return -1;
     }
-    if (manifest->representation != CLONE_PORTABLE_SIDECAR)
+    *container_fd_out = container_fd;
+    return 0;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Native backups, checked against their source (docs/DECISIONS.md D106).     */
+/* ------------------------------------------------------------------------- */
+
+static void native_record(VerifyRun *run, const char *relative,
+                          const char *format, ...)
+    __attribute__((format(printf, 3, 4)));
+
+static void native_record(VerifyRun *run, const char *relative,
+                          const char *format, ...)
+{
+    char *text = example_list_next(&run->failed);
+    if (text == NULL)
+        return;
+    char reason[160];
+    va_list arguments;
+    va_start(arguments, format);
+    (void)vsnprintf(reason, sizeof(reason), format, arguments);
+    va_end(arguments);
+    (void)snprintf(text, EXAMPLE_TEXT_MAX, "%s:%s (%s)", run->root_id,
+                   relative[0] != '\0' ? relative : ".", reason);
+}
+
+// Whether the source has not been modified since the backup copied it: the
+// backup keeps the source's modification time, and a destination without
+// nanosecond times keeps whole seconds. A program can set a modification
+// time back, but not the change time, which must predate the backup's start.
+// A difference between two items of the same time is then the backup's.
+static int native_same_time(const VerifyRun *run, const struct stat *backup,
+                            const struct stat *source)
+{
+    return source->st_mtim.tv_sec == backup->st_mtim.tv_sec &&
+           (backup->st_mtim.tv_nsec == 0 ||
+            source->st_mtim.tv_nsec == backup->st_mtim.tv_nsec) &&
+           (run->taken == 0 || source->st_ctim.tv_sec < run->taken);
+}
+
+static int stat_unchanged(const struct stat *before, const struct stat *after)
+{
+    return S_ISREG(after->st_mode) && after->st_size == before->st_size &&
+           after->st_mtim.tv_sec == before->st_mtim.tv_sec &&
+           after->st_mtim.tv_nsec == before->st_mtim.tv_nsec &&
+           after->st_ctim.tv_sec == before->st_ctim.tv_sec &&
+           after->st_ctim.tv_nsec == before->st_ctim.tv_nsec;
+}
+
+// Reads until size bytes or the end; the count, or -1.
+static ssize_t read_full(int fd, unsigned char *buffer, size_t size)
+{
+    size_t total = 0;
+    while (total < size)
     {
-        print_error("Error: %s is a native backup; only portable backups "
-                    "record the content digests verify checks against.\n",
-                    path);
-        manifest_free(manifest);
-        close(container_fd);
-        return -1;
+        ssize_t received = read(fd, buffer + total, size - total);
+        if (received < 0 && errno == EINTR)
+            continue;
+        if (received < 0)
+            return -1;
+        if (received == 0)
+            break;
+        total += (size_t)received;
     }
-    if (manifest->sidecar_version != SIDECAR_VERSION)
+    return (ssize_t)total;
+}
+
+static void native_compare_file(VerifyRun *run, int parent_fd,
+                                const char *leaf, const struct stat *backup,
+                                const char *source, const char *relative)
+{
+    struct stat before;
+    int source_fd = -1;
+    if (lstat(source, &before) != 0 || !S_ISREG(before.st_mode) ||
+        !native_same_time(run, backup, &before) ||
+        (before.st_size == backup->st_size &&
+         (source_fd = open_payload_node(AT_FDCWD, source, O_RDONLY)) < 0))
     {
-        print_error("Error: %s was written with journal version %d; this "
-                    "build verifies version %d.\n", path,
-                    manifest->sidecar_version, SIDECAR_VERSION);
+        run->unchecked++;
+        run->bytes_read += (uint64_t)backup->st_size;
+        return;
+    }
+    if (before.st_size != backup->st_size)
+    {
+        native_record(run, relative, "size is %jd bytes, the source has %jd",
+                      (intmax_t)backup->st_size, (intmax_t)before.st_size);
+        run->bytes_read += (uint64_t)backup->st_size;
+        return;
+    }
+    int backup_fd = open_payload_node(parent_fd, leaf, O_RDONLY);
+    if (backup_fd < 0)
+    {
+        native_record(run, relative, "could not be read: %s",
+                      strerror(errno));
+        close(source_fd);
+        return;
+    }
+    static unsigned char ours[65536], theirs[65536];
+    int differs = 0, backup_error = 0, source_error = 0;
+    for (;;)
+    {
+        ssize_t got = read_full(backup_fd, ours, sizeof(ours));
+        if (got < 0)
+        {
+            backup_error = errno;
+            break;
+        }
+        ssize_t want = read_full(source_fd, theirs, sizeof(theirs));
+        if (want < 0)
+        {
+            source_error = 1;
+            break;
+        }
+        run->bytes_read += (uint64_t)got;
+        verify_progress_note(run, 0);
+        if (got != want || memcmp(ours, theirs, (size_t)got) != 0)
+        {
+            differs = 1;
+            break;
+        }
+        if (got == 0)
+            break;
+    }
+    struct stat after;
+    int changed = source_error || fstat(source_fd, &after) != 0 ||
+                  !stat_unchanged(&before, &after);
+    close(backup_fd);
+    close(source_fd);
+    if (backup_error != 0)
+        native_record(run, relative, "could not be read: %s",
+                      strerror(backup_error));
+    else if (changed)
+        run->unchecked++;
+    else if (differs)
+        native_record(run, relative, "content differs from the source");
+    else
+        run->compared++;
+}
+
+static void native_compare_symlink(VerifyRun *run, int parent_fd,
+                                   const char *leaf,
+                                   const struct stat *backup,
+                                   const char *source, const char *relative)
+{
+    struct stat source_st;
+    if (lstat(source, &source_st) != 0 || !S_ISLNK(source_st.st_mode) ||
+        !native_same_time(run, backup, &source_st))
+    {
+        run->unchecked++;
+        return;
+    }
+    char ours[PATH_MAX], theirs[PATH_MAX];
+    ssize_t got = readlinkat(parent_fd, leaf, ours, sizeof(ours));
+    if (got < 0 || (size_t)got >= sizeof(ours))
+    {
+        native_record(run, relative, "could not be read: %s",
+                      got < 0 ? strerror(errno) : "target too long");
+        return;
+    }
+    ssize_t want = readlink(source, theirs, sizeof(theirs));
+    if (want < 0)
+        run->unchecked++;
+    else if (want == got && memcmp(ours, theirs, (size_t)got) == 0)
+        run->compared++;
+    else
+        native_record(run, relative, "target differs from the source");
+}
+
+static void native_walk(VerifyRun *run, int dir_fd, char *source,
+                        size_t source_length, char *relative,
+                        size_t relative_length);
+
+// One item of the backup at parent_fd/leaf, whose source is source and whose
+// path in its root is relative.
+static void native_item(VerifyRun *run, int parent_fd, const char *leaf,
+                        char *source, size_t source_length, char *relative,
+                        size_t relative_length)
+{
+    struct stat st;
+    if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) != 0)
+    {
+        if (!run->counting)
+            native_record(run, relative, "could not be read: %s",
+                          strerror(errno));
+        return;
+    }
+    if (S_ISDIR(st.st_mode))
+    {
+        int child = open_payload_node(parent_fd, leaf,
+                                      O_RDONLY | O_DIRECTORY);
+        if (child < 0)
+        {
+            if (!run->counting)
+                native_record(run, relative, "could not be read: %s",
+                              strerror(errno));
+            return;
+        }
+        native_walk(run, child, source, source_length, relative,
+                    relative_length);
+        close(child);
+        return;
+    }
+    if (!S_ISREG(st.st_mode) && !S_ISLNK(st.st_mode))
+        return;
+    if (run->counting)
+    {
+        run->count++;
+        if (S_ISREG(st.st_mode))
+            run->total_bytes += (uint64_t)st.st_size;
+        return;
+    }
+    if (S_ISREG(st.st_mode))
+        native_compare_file(run, parent_fd, leaf, &st, source, relative);
+    else
+        native_compare_symlink(run, parent_fd, leaf, &st, source, relative);
+    run->checked++;
+    verify_progress_note(run, 0);
+}
+
+static void native_walk(VerifyRun *run, int dir_fd, char *source,
+                        size_t source_length, char *relative,
+                        size_t relative_length)
+{
+    int fd = dup(dir_fd);
+    DIR *dir = fd >= 0 ? fdopendir(fd) : NULL;
+    if (dir == NULL)
+    {
+        if (!run->counting)
+            native_record(run, relative, "could not be read: %s",
+                          strerror(errno));
+        if (fd >= 0)
+            close(fd);
+        return;
+    }
+    for (;;)
+    {
+        errno = 0;
+        struct dirent *entry = readdir(dir);
+        if (entry == NULL)
+            break;
+        const char *name = entry->d_name;
+        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
+            continue;
+        size_t name_length = strlen(name);
+        size_t separator = relative_length != 0;
+        if (source_length + 1U + name_length >= PATH_MAX ||
+            relative_length + separator + name_length >= PATH_MAX)
+        {
+            if (!run->counting)
+                native_record(run, relative, "holds a path too long to check");
+            continue;
+        }
+        source[source_length] = '/';
+        memcpy(source + source_length + 1U, name, name_length + 1U);
+        if (separator)
+            relative[relative_length] = '/';
+        memcpy(relative + relative_length + separator, name, name_length + 1U);
+        native_item(run, dir_fd, name, source,
+                    source_length + 1U + name_length, relative,
+                    relative_length + separator + name_length);
+        source[source_length] = '\0';
+        relative[relative_length] = '\0';
+    }
+    if (errno != 0 && !run->counting)
+        native_record(run, relative, "could not be read: %s", strerror(errno));
+    closedir(dir);
+}
+
+// A root's source path; a manifest that does not record the source home
+// names home-relative roots against the home of the user running verify.
+static int native_root_source(const Manifest *manifest, int index,
+                              char out[PATH_MAX])
+{
+    if (manifest_root_source_path(manifest, index, out) == 0)
+        return 0;
+    const char *recorded = manifest->roots[index].source_path;
+    char home[PATH_MAX];
+    if (recorded[0] == '/')
+        return snprintf(out, PATH_MAX, "%s", recorded) < PATH_MAX ? 0 : -1;
+    if (resolve_target_home(home) != 0)
+        return -1;
+    if (recorded[0] == '\0')
+        return snprintf(out, PATH_MAX, "%s", home) < PATH_MAX ? 0 : -1;
+    return path_join(out, PATH_MAX, home, recorded);
+}
+
+static void native_walk_roots(VerifyRun *run, const Manifest *manifest)
+{
+    for (int index = 0; index < manifest->root_count; index++)
+    {
+        const ManifestRoot *root = &manifest->roots[index];
+        char source[PATH_MAX], relative[PATH_MAX] = "";
+        run->root_id = root->id;
+        if (native_root_source(manifest, index, source) != 0)
+        {
+            if (!run->counting)
+                native_record(run, "", "its source path cannot be named");
+            continue;
+        }
+        native_item(run, run->data_fd, root->payload_path, source,
+                    strlen(source), relative, 0);
+    }
+}
+
+// Compares every file and symlink of a native backup with the source it was
+// taken from. Nothing recorded the content, so what changed in the source
+// since the backup is counted as not checked, never as a difference (D106).
+static int verify_native(const char *path, const Manifest *manifest,
+                         int container_fd)
+{
+    VerifyRun run;
+    memset(&run, 0, sizeof(run));
+    run.parent_fd = -1;
+    run.taken = manifest->updated;
+    run.data_fd = openat(container_fd, "data",
+                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (run.data_fd < 0)
+    {
+        print_error("Error: Could not open data/ in the backup: %s\n",
+                    strerror(errno));
+        return MIGR_EXIT_FAILURE;
+    }
+    run.counting = 1;
+    native_walk_roots(&run, manifest);
+    run.counting = 0;
+
+    char total[32];
+    format_size((off_t)(run.total_bytes > INT64_MAX ? INT64_MAX
+                                                    : run.total_bytes),
+                total, sizeof(total));
+    print_backup_time(manifest->updated);
+    printf("Verifying %zu item%s (%s) in %s against their source\n",
+           run.count, run.count == 1 ? "" : "s", total, path);
+    run.progress = isatty(STDOUT_FILENO) &&
+                   clock_gettime(CLOCK_MONOTONIC, &run.started_at) == 0;
+    run.last_redraw = run.started_at;
+    native_walk_roots(&run, manifest);
+    close(run.data_fd);
+    if (run.progress)
+    {
+        verify_progress_note(&run, 1);
+        putchar('\n');
+    }
+    fflush(stdout);
+
+    size_t failed = run.failed.count;
+    if (failed == 0 && run.compared == 0 && run.unchecked != 0)
+    {
+        print_error("Error: none of the backup's files could be compared "
+                    "with their source. A native backup is checked on the "
+                    "system it was taken from, before that system is "
+                    "replaced.\n");
+        return MIGR_EXIT_FAILURE;
+    }
+    if (run.unchecked != 0)
+        printf("Note: %zu item%s changed in the source since the backup, or "
+               "could not be read there, and %s not checked.\n",
+               run.unchecked, run.unchecked == 1 ? "" : "s",
+               run.unchecked == 1 ? "was" : "were");
+    if (failed == 0)
+    {
+        print_success("Backup verified: all %zu item%s compared match the "
+                      "source\n", run.compared,
+                      run.compared == 1 ? "" : "s");
+        return MIGR_EXIT_OK;
+    }
+    printf("Verification found %zu item%s that differ%s from the source:\n",
+           failed, failed == 1 ? "" : "s", failed == 1 ? "s" : "");
+    example_list_print(&run.failed, "  ");
+    return MIGR_EXIT_CHANGED;
+}
+
+static int journal_version_supported(const char *path,
+                                     const Manifest *manifest)
+{
+    if (manifest->sidecar_version == SIDECAR_VERSION)
+        return 1;
+    print_error("Error: %s was written with journal version %d; this build "
+                "reads version %d.\n", path, manifest->sidecar_version,
+                SIDECAR_VERSION);
+    return 0;
+}
+
+int portable_container_open(const char *path, Manifest *manifest,
+                            int *container_fd_out)
+{
+    int container_fd = -1;
+    if (finished_container_open(path, manifest, &container_fd) != 0)
+        return -1;
+    if (manifest->representation != CLONE_PORTABLE_SIDECAR)
+        print_error("Error: %s is a native backup, which has no journal.\n",
+                    path);
+    if (manifest->representation != CLONE_PORTABLE_SIDECAR ||
+        !journal_version_supported(path, manifest))
+    {
         manifest_free(manifest);
         close(container_fd);
         return -1;
@@ -454,9 +847,19 @@ int verify_backup(const char *path)
 {
     Manifest manifest;
     int container_fd = -1;
-    if (path == NULL || portable_container_open(path, &manifest,
-                                                &container_fd) != 0)
+    if (path == NULL ||
+        finished_container_open(path, &manifest, &container_fd) != 0)
         return MIGR_EXIT_FAILURE;
+    if (manifest.representation == CLONE_NATIVE_TREE ||
+        !journal_version_supported(path, &manifest))
+    {
+        int native = manifest.representation == CLONE_NATIVE_TREE
+            ? verify_native(path, &manifest, container_fd)
+            : MIGR_EXIT_FAILURE;
+        manifest_free(&manifest);
+        close(container_fd);
+        return native;
+    }
 
     VerifyRun run;
     memset(&run, 0, sizeof(run));
