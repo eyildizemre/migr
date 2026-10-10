@@ -338,7 +338,10 @@ a different one, the first app that needs the keyring asks for the old
 password once, and without it the keyring cannot be opened. After a restore
 in your desktop session brings the keyring back, log out and back in before
 signing in anywhere: the running session cannot save to the restored keyring.
-Backup and restore both remind you.
+Backup and restore both remind you. To use a new password, change it on the
+old system before the backup, then log out and back in: if your saved
+passwords still open without asking for the old one, the keyring follows the
+new password.
 
 **From an exFAT, FAT32, or NTFS backup**, restore also leaves desktop state
 that services rewrite all the time alone where the new system has already
@@ -391,6 +394,9 @@ read-back. `--dry-run` shows what would be restored and writes nothing.
 - **Unknown distributions.** Outside the Debian, Fedora, and Arch families
   (below), files are migrated but packages are not.
 - **Snap** applications and their data.
+- **Third-party repositories.** Packages from repositories you added
+  yourself, such as VS Code's or Brave's, are listed with the ones the new
+  system could not install; add the repository there and install them.
 - **Python packages for another Python version.** Packages installed with
   `pip install --user` live in `~/.local/lib/python3.X` and come back, but a
   system with another Python version does not load them; install them again
@@ -400,10 +406,11 @@ read-back. `--dry-run` shows what would be restored and writes nothing.
   needs its signing key.
 - **Old paths in applications' own files.** Under another user name or in
   another language, applications' own files still name the old home and
-  folders (see [Restoring](#restoring)). Each application keeps paths in a
-  format of its own, some in databases or in files with checksums, so
-  rewriting them takes a rule for every application and could damage files
-  migr cannot check. Keeping the same user name and folder names avoids it.
+  folders (see [Restoring](#restoring)). No distribution rewrites them when a
+  user is renamed either: each application keeps paths in a format of its
+  own, some in databases or in files with checksums. A different user name is
+  yours to handle; migr only updates the desktop's own records it restores.
+  Keeping the same user name and folder names avoids it.
 - **Custom locations.** `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, and
   `XDG_STATE_HOME` set elsewhere than their defaults, and zsh's `ZDOTDIR`, are
   not followed yet.
