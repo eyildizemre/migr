@@ -775,6 +775,20 @@ test_backup() {
     else
         echo -e "  ${GREEN}✓${NC} Missing code leaves no VS Code extension snapshot and does not fail backup."
     fi
+
+    # The backup itself given as the destination is refused, naming the folder
+    # that holds it, and nothing is written into it.
+    local container_entries refusal
+    container_entries=$(ls -A "$actual_backup")
+    refusal="is a migr backup itself; to update it, give the folder that holds it: $(realpath "$BACKUP_DIR")."
+    assert_fails_with "$refusal" "$MIGR" backup "$actual_backup"
+    assert_fails_with "$refusal" "$MIGR" backup "$actual_backup/" -n
+    if [ "$(ls -A "$actual_backup")" = "$container_entries" ]; then
+        echo -e "  ${GREEN}✓${NC} A refused backup into a backup leaves it as it was."
+    else
+        echo -e "  ${RED}✗${NC} Refused backup into a backup changed its entries"
+        exit 1
+    fi
 }
 
 test_shell_history_consent() {

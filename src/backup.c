@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <dirent.h>
+#include <libgen.h>
 #include <limits.h>
 #include <math.h>
 #include <pwd.h>
@@ -2860,6 +2861,24 @@ static int backup_metadata_inventory(const char *source_path, int anchor_fd,
     return failed ? -1 : 0;
 }
 
+// A backup given as the destination would get a new one inside it, as large
+// as the whole selection; the folder holding it is the destination that
+// updates it.
+static int backup_target_is_container(int target_fd, const char *target)
+{
+    Manifest manifest;
+    if (manifest_read_v1_at(target_fd, &manifest) != MANIFEST_STATUS_VALID)
+        return 0;
+    manifest_free(&manifest);
+    char *resolved = realpath(target, NULL);
+    print_error("Error: %s is a migr backup itself; to update it, give the "
+                "folder that holds it%s%s.\n", target,
+                resolved != NULL ? ": " : "",
+                resolved != NULL ? dirname(resolved) : "");
+    free(resolved);
+    return 1;
+}
+
 // backup_dry_run()'s advisory probes only need an fd on the filesystem
 // `target` would land on -- exactly what a live run's mkdir(target) requires
 // its parent to already provide. So when target doesn't exist yet (the
@@ -2981,8 +3000,11 @@ static int backup_dry_run(const char *target, BackupMode mode,
                "parent directory's filesystem instead.\n\n", target);
     int advisory_probe_failed = 0;
     if (advisory_fd >= 0)
-        advisory_probe_failed = backup_representation_preflight(
-            advisory_fd, target, &advisory_profile, &advisory_repr) != 0;
+        advisory_probe_failed =
+            (!advisory_used_parent &&
+             backup_target_is_container(advisory_fd, target)) ||
+            backup_representation_preflight(
+                advisory_fd, target, &advisory_profile, &advisory_repr) != 0;
     if (advisory_fd >= 0 && !advisory_probe_failed)
     {
         // The backup a live run would update, which it offers to when it
@@ -3424,6 +3446,8 @@ static int backup_run(const char *target_arg, BackupMode mode,
         print_error("Error: Could not open backup destination %s\n", target);
         goto fail_pre_container;
     }
+    if (backup_target_is_container(target_fd, target))
+        goto fail_pre_container;
 
     // Probe the destination and choose a representation before any container
     // exists. An unreliable probe is fatal, never a silent fall-through. If we

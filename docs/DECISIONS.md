@@ -5896,3 +5896,24 @@ them.
 
 **Relationship:** Adds to D16's built-in catalog. Python packages for another
 Python version come back but are not loaded there; the README says so.
+
+## D105 — 2026-10-10 — A backup given as the destination is refused
+
+**Status:** Implemented
+
+**Decision:** When the destination of `migr backup` holds a valid manifest at
+its root, so it is itself a migr backup, the backup stops before anything is
+read or written, with exit status 2, and names the folder that holds it:
+"Error: <destination> is a migr backup itself; to update it, give the folder
+that holds it: <parent>." A dry run stops the same way.
+
+**Why:** The destination is the folder a backup goes into; the backup is
+found inside it by name. Given the backup's own folder, migr looked for a
+backup inside it, found none, and planned a new one the size of the whole
+selection, refused for want of space or, with enough of it, written inside
+the old one. The intent, updating that backup, is clear, and the folder that
+does it is known.
+
+**Rejected:** Updating the given backup in place of the one the parent would
+find. The destination would then mean two things, a folder to back up into or
+a backup to update, depending on what is in it.

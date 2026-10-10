@@ -180,6 +180,8 @@ this one before a reinstall), migr asks whether to update it from this system,
 so one backup can follow you from one distribution to the next. The default
 is no: the new backup is named after the day, `migr-<user>-YYYY-MM-DD`, and
 the old one is left alone. With more than one such backup, migr does not ask.
+To update a backup, give the folder that holds it, as when you took it; given
+the backup's own folder, migr stops and names the one to give.
 
 **Interrupted and repeated backups.** While running, the backup is called
 `migr-<user>.partial`; run the same command again to continue it. Backing up
