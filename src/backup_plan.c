@@ -122,6 +122,7 @@ static const BuiltinHomeEntry builtin_home_catalog[] = {
     { "BUILTIN_LOCAL_SHARE",            ".local/share",          "local-share",    BACKUP_ROOT_DOTFILE, 0 },
     { "BUILTIN_LOCAL_STATE",            ".local/state",          "local-state",    BACKUP_ROOT_DOTFILE, 0 },
     { "BUILTIN_LOCAL_BIN",              ".local/bin",            "local-bin",      BACKUP_ROOT_DOTFILE, 0 },
+    { "BUILTIN_LOCAL_LIB",              ".local/lib",            "local-lib",      BACKUP_ROOT_DOTFILE, 0 },
     { "BUILTIN_FLATPAK_APPS",           ".var/app",              "flatpak-apps",   BACKUP_ROOT_DOTFILE, 0 },
     { "BUILTIN_DOT_VSCODE",             ".vscode",               "vscode",         BACKUP_ROOT_DOTFILE, 0 },
     { "BUILTIN_DOT_VSCODE_OSS",         ".vscode-oss",           "vscodium",       BACKUP_ROOT_DOTFILE, 0 },

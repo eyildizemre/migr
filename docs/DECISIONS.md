@@ -5872,3 +5872,27 @@ system's dependency data rather than the new one's.
 
 **Relationship:** Narrows D46 and D95: the transaction leaves these packages
 out. The kernel-pinned `kmod-*` names are still dropped at backup.
+
+## D104 — 2026-10-10 — `~/.local/lib` is backed up
+
+**Status:** Implemented
+
+**Decision:** `~/.local/lib` is a built-in root, `BUILTIN_LOCAL_LIB`, beside
+`~/.local/bin`, in every backup scope, stored under `data/settings/local-lib`.
+Restore says nothing of its own about launchers whose program is missing.
+
+**Why:** Programs installed into the home put their files there: an AppImage
+installer keeps the program under `~/.local/lib/<name>/<version>/` and its
+launcher in `~/.local/bin` and `~/.local/share/applications`, and
+`pip install --user` keeps the modules its `~/.local/bin` commands import in
+`~/.local/lib/python3.X/site-packages`. With the launchers backed up and that
+folder not, the launchers came back pointing at nothing.
+
+**Rejected:** Reporting launchers whose program is missing. With
+`~/.local/lib` backed up, what remains are programs outside the home (`/opt`,
+`/usr/local`), which migr does not migrate; finding them takes parsing
+`Exec=` lines (quoting, `env`, field codes), and restore could only list
+them.
+
+**Relationship:** Adds to D16's built-in catalog. Python packages for another
+Python version come back but are not loaded there; the README says so.

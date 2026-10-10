@@ -62,7 +62,7 @@ sudo ./migr restore /mnt/usb/migr-$USER
 | What | Backed up | On restore |
 |---|---|---|
 | Your folders | Documents, Downloads, Pictures, Desktop, found by their localized names (`xdg-user-dirs`) | Restored into the new system's folders of the same kind, whatever they are called there |
-| Settings and app data | `~/.config`, `~/.local/share`, `~/.local/state`, `~/.local/bin`, and Flatpak applications' data in `~/.var/app` without their caches | Restored; open applications are handled last (see [Restoring](#restoring)) |
+| Settings and app data | `~/.config`, `~/.local/share`, `~/.local/state`, `~/.local/bin`, `~/.local/lib`, and Flatpak applications' data in `~/.var/app` without their caches | Restored; open applications are handled last (see [Restoring](#restoring)) |
 | Shell and tools | `.ssh`, `.gnupg`, `.gitconfig`, bash and zsh startup and history files, `.inputrc`, `.tmux.conf`, `.screenrc` | Restored |
 | Browsers | Firefox, Chrome, Chromium, Brave, Vivaldi, Edge, Opera | Restored |
 | VS Code, VSCodium | `~/.vscode` and `~/.vscode-oss`, with installed extensions | Restored as files |
@@ -378,7 +378,8 @@ read-back. `--dry-run` shows what would be restored and writes nothing.
 
 - **System files.** Only your home is migrated, plus the network configuration
   you opt into. Other files under `/etc`, system services, and other users'
-  homes are not.
+  homes are not. Nor is a program installed by hand under `/opt` or
+  `/usr/local`; its launcher in your home comes back without it.
 - **Package names across families.** A package named differently on the new
   distribution is not translated; it is listed for you to install.
 - **Leaving out another desktop's packages.** Drivers aside, restore installs
@@ -388,6 +389,10 @@ read-back. `--dry-run` shows what would be restored and writes nothing.
 - **Unknown distributions.** Outside the Debian, Fedora, and Arch families
   (below), files are migrated but packages are not.
 - **Snap** applications and their data.
+- **Python packages for another Python version.** Packages installed with
+  `pip install --user` live in `~/.local/lib/python3.X` and come back, but a
+  system with another Python version does not load them; install them again
+  there.
 - **Creating what is missing.** Groups the new system lacks are not created,
   and Flatpak remotes other than Flathub are not added, since adding one
   needs its signing key.

@@ -107,7 +107,7 @@ static void builtin_reference_tests(void)
      * today. Update this list alongside the catalog if that ever changes. */
     static const char *const always_included[] = {
         ".ssh", ".gnupg", ".gitconfig", ".config", ".local/share",
-        ".local/state", ".local/bin", ".bashrc", ".bash_history",
+        ".local/state", ".local/bin", ".local/lib", ".bashrc", ".bash_history",
         ".bash_profile", ".bash_login", ".bash_logout", ".bash_aliases",
         ".profile", ".zshenv", ".zsh_history", ".zprofile", ".zshrc",
         ".zlogin", ".zlogout", ".inputrc", ".tmux.conf", ".screenrc",

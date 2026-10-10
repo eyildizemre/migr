@@ -193,7 +193,7 @@ static void make_full_home(const char *home)
     const char *dirs[] = {
         "Documents", "Downloads", "Pictures", "Desktop", "Videos", "Music",
         "Projects", ".ssh", ".gnupg", ".mozilla", ".config",
-        ".local/share", ".local/state", ".local/bin",
+        ".local/share", ".local/state", ".local/bin", ".local/lib",
         ".config/google-chrome", ".config/chromium", ".config/BraveSoftware",
         ".config/vivaldi", ".config/microsoft-edge", ".config/opera",
         NULL
@@ -252,6 +252,7 @@ static void test_critical_root_set(void)
         { "BUILTIN_LOCAL_SHARE", ".local/share" },
         { "BUILTIN_LOCAL_STATE", ".local/state" },
         { "BUILTIN_LOCAL_BIN", ".local/bin" },
+        { "BUILTIN_LOCAL_LIB", ".local/lib" },
         { "BUILTIN_DOT_BASH_PROFILE", ".bash_profile" },
         { "BUILTIN_DOT_BASH_LOGIN", ".bash_login" },
         { "BUILTIN_DOT_BASH_LOGOUT", ".bash_logout" },

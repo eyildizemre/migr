@@ -61,6 +61,7 @@ setup() {
     mkdir -p "$HOME/.local/share"
     mkdir -p "$HOME/.local/state"
     mkdir -p "$HOME/.local/bin"
+    mkdir -p "$HOME/.local/lib/some-marker-app"
     mkdir -p "$BACKUP_DIR"
 
     echo "test doc"  > "$HOME/Documents/note.txt"
@@ -80,6 +81,7 @@ setup() {
     echo "state marker" > "$HOME/.local/state/some-marker-file"
     echo '#!/bin/sh' > "$HOME/.local/bin/some-marker-tool"
     chmod 755 "$HOME/.local/bin/some-marker-tool"
+    echo "app marker" > "$HOME/.local/lib/some-marker-app/some-marker-file"
     ln -s "$HOME/Documents/note.txt" "$HOME/Documents/shortcut"
     # 0600 file + an absolute symlink to it: backing up the symlink must not
     # chmod the target. Regression fixture for the symlink source-mutation bug.
@@ -682,6 +684,7 @@ test_backup() {
     assert_file_exists "$actual_backup/data/settings/local-share/some-marker-file"
     assert_file_exists "$actual_backup/data/settings/local-state/some-marker-file"
     assert_file_exists "$actual_backup/data/settings/local-bin/some-marker-tool"
+    assert_file_exists "$actual_backup/data/settings/local-lib/some-marker-app/some-marker-file"
 
     if [ -p "$actual_backup/data/Documents/events.fifo" ]; then
         echo -e "  ${GREEN}✓${NC} FIFO preserved as a FIFO."
@@ -889,6 +892,7 @@ test_restore() {
     assert_file_exists "$HOME/.local/share/some-marker-file"
     assert_file_exists "$HOME/.local/state/some-marker-file"
     assert_file_exists "$HOME/.local/bin/some-marker-tool"
+    assert_file_exists "$HOME/.local/lib/some-marker-app/some-marker-file"
 
     if [ -p "$HOME/Documents/events.fifo" ]; then
         echo -e "  ${GREEN}✓${NC} FIFO restored as a FIFO."
