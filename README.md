@@ -67,7 +67,7 @@ sudo ./migr restore /mnt/usb/migr-$USER
 | Browsers | Firefox, Chrome, Chromium, Brave, Vivaldi, Edge, Opera | Restored |
 | VS Code, VSCodium | `~/.vscode` and `~/.vscode-oss`, with installed extensions | Restored as files |
 | GNOME settings | the dconf database | Loaded into your session when you are logged in; otherwise in place for your next login |
-| Packages | the packages you installed yourself, not their dependencies | The ones the new system lacks are installed in one transaction; the ones it cannot install are listed |
+| Packages | the packages you installed yourself, not their dependencies | The ones the new system lacks are installed in one transaction; drivers and the ones it cannot install are listed |
 | Flatpak applications | the system-wide installation's applications and their remotes | Installed from the remotes the new system has, adding Flathub when they need it; the others are listed |
 | Groups | groups you were added to, such as `libvirt`, `docker`, or `dialout` | You are added back to the ones the new system has; the others are listed |
 | Network (opt-in) | NetworkManager, netplan, systemd-networkd, wpa_supplicant, and netctl configuration, and the system crypto policy | Written back; NetworkManager reloads it and the crypto policy is set, the others are left for you to apply |
@@ -361,7 +361,10 @@ Another name also leaves your Podman containers out (above).
 
 **What's left for you.** Restore ends with what it could not do: packages the
 new system could not install, Flatpak applications it could not install, and
-groups it does not have, each with the command to run. The same list is saved
+groups it does not have, each with the command to run. Drivers and other
+packages that bring kernel modules are listed there too, not installed: set
+up at the end of a restore, on hardware and a kernel they were not set up
+for, they can keep the next boot from reaching the desktop. The same list is saved
 next to the backup as `migr-<user>-todo.txt`, so nothing of migr is left in
 your new home; the screen counts the packages, and the saved list names them.
 
@@ -378,8 +381,8 @@ read-back. `--dry-run` shows what would be restored and writes nothing.
   homes are not.
 - **Package names across families.** A package named differently on the new
   distribution is not translated; it is listed for you to install.
-- **Leaving out another desktop's packages.** Restore installs every package
-  in the backup. Restored onto another desktop, it installs the old desktop's
+- **Leaving out another desktop's packages.** Drivers aside, restore installs
+  every package in the backup. Restored onto another desktop, it installs the old desktop's
   packages too; they do not change the desktop you log in to, and removing
   them is left to you.
 - **Unknown distributions.** Outside the Debian, Fedora, and Arch families

@@ -596,6 +596,301 @@ static int package_available_contains(const char *available,
     return package_plain_list_contains(available, name);
 }
 
+typedef struct {
+    char *text;
+    size_t length;
+} NameList;
+
+static int name_list_add(NameList *list, const char *name)
+{
+    size_t length = strlen(name);
+    char *grown = realloc(list->text, list->length + length + 2U);
+    if (grown == NULL)
+        return -1;
+    memcpy(grown + list->length, name, length);
+    list->length += length;
+    grown[list->length++] = '\n';
+    grown[list->length] = '\0';
+    list->text = grown;
+    return 0;
+}
+
+static int name_list_has(const NameList *list, const char *name)
+{
+    return package_plain_list_contains(list->text, name);
+}
+
+// The kernels Arch's repositories carry; a package built against one names
+// it among its dependencies.
+static const char *const arch_kernels[] = {
+    "linux", "linux-lts", "linux-zen", "linux-hardened"
+};
+
+static int arch_is_kernel(const char *name)
+{
+    for (size_t i = 0; i < sizeof(arch_kernels) / sizeof(arch_kernels[0]); i++)
+        if (strcmp(name, arch_kernels[i]) == 0)
+            return 1;
+    return 0;
+}
+
+// The value of field on a line of pacman -Sii in the C locale
+// ("Depends On      : linux  libglvnd"), or NULL on another field's line.
+static const char *pacman_field(const char *line, size_t length,
+                                const char *field, size_t *value_length)
+{
+    size_t at = strlen(field);
+    if (length <= at || memcmp(line, field, at) != 0)
+        return NULL;
+    while (at < length && line[at] == ' ')
+        at++;
+    if (at + 1U >= length || line[at] != ':' || line[at + 1U] != ' ')
+        return NULL;
+    *value_length = length - at - 2U;
+    return line + at + 2U;
+}
+
+// Copies the next name of a field value into name, without the version a
+// dependency or a provision may carry ("nvidia-utils=615.78.08"); returns 0
+// once there is none. "None" names nothing.
+static int pacman_next_name(const char **cursor, const char *end,
+                            char name[256])
+{
+    for (;;)
+    {
+        while (*cursor < end && **cursor == ' ')
+            (*cursor)++;
+        if (*cursor >= end)
+            return 0;
+        const char *start = *cursor;
+        while (*cursor < end && **cursor != ' ')
+            (*cursor)++;
+        size_t length = 0;
+        while (start + length < *cursor && strchr("=<>", start[length]) == NULL)
+            length++;
+        if (length == 0 || length >= 256U ||
+            (length == 4U && memcmp(start, "None", 4U) == 0))
+            continue;
+        memcpy(name, start, length);
+        name[length] = '\0';
+        return 1;
+    }
+}
+
+// pacman -Sii for every name in names: their records, in the C locale.
+static char *pacman_records(const NameList *names, int *had_error)
+{
+    static char *const prefix[] = {"env", "LC_ALL=C", "pacman", "-Sii"};
+    size_t prefix_count = sizeof(prefix) / sizeof(prefix[0]);
+    size_t count = 0;
+    for (size_t i = 0; i < names->length; i++)
+        count += names->text[i] == '\n';
+    char *copy = strdup(names->text);
+    char **argv = malloc((prefix_count + count + 1U) * sizeof(*argv));
+    char *records = NULL;
+    if (copy != NULL && argv != NULL)
+    {
+        memcpy(argv, prefix, sizeof(prefix));
+        size_t argc = prefix_count;
+        for (char *save = NULL, *name = strtok_r(copy, "\n", &save);
+             name != NULL; name = strtok_r(NULL, "\n", &save))
+            argv[argc++] = name;
+        argv[argc] = NULL;
+        records = package_capture_query(argv, "packages that bring kernel "
+                                        "modules", had_error);
+    }
+    else
+    {
+        print_error("Error: Could not allocate the package query\n");
+        *had_error = 1;
+    }
+    free(argv);
+    free(copy);
+    return records;
+}
+
+typedef struct {
+    const char *name, *provides, *depends, *required_by;
+    size_t name_length, provides_length, depends_length, required_length;
+} PacmanRecord;
+
+// Whether a dependency of record is a kernel by name or in marks. A package
+// that needs only a module the kernel itself provides ("NTSYNC-MODULE")
+// depends on the kernel's name nowhere.
+static int pacman_record_qualifies(const PacmanRecord *record,
+                                   const NameList *marks)
+{
+    const char *cursor = record->depends;
+    const char *end = record->depends + record->depends_length;
+    char name[256];
+    while (pacman_next_name(&cursor, end, name))
+        if (arch_is_kernel(name) || name_list_has(marks, name))
+            return 1;
+    return 0;
+}
+
+// Takes a record of the current round: a kernel or a package that brings
+// modules has the packages that need it examined next round.
+static int pacman_take_record(const PacmanRecord *record, NameList *held,
+                              NameList *marks, NameList *next)
+{
+    char name[256];
+    const char *cursor = record->name;
+    if (!pacman_next_name(&cursor, record->name + record->name_length, name))
+        return 0;
+    if (!arch_is_kernel(name))
+    {
+        if (name_list_has(held, name) ||
+            (strcmp(name, "dkms") != 0 &&
+             !pacman_record_qualifies(record, marks)))
+            return 0;
+        if (name_list_add(held, name) != 0 || name_list_add(marks, name) != 0)
+            return -1;
+        cursor = record->provides;
+        const char *end = record->provides + record->provides_length;
+        while (pacman_next_name(&cursor, end, name))
+            if (!name_list_has(marks, name) && name_list_add(marks, name) != 0)
+                return -1;
+    }
+    cursor = record->required_by;
+    const char *end = record->required_by + record->required_length;
+    while (pacman_next_name(&cursor, end, name))
+        if (!arch_is_kernel(name) && !name_list_has(held, name) &&
+            !name_list_has(next, name) && name_list_add(next, name) != 0)
+            return -1;
+    return 0;
+}
+
+// Arch has no recursive reverse query: from dkms and the kernels, each round
+// reads the packages that need the last round's, and keeps those that need
+// dkms, a kernel by name, or a package kept before, or what it provides
+// ("V4L2LOOPBACK-MODULE"). pacman fails on a name its repositories lack, so
+// the first round takes only those they have.
+static char *arch_module_packages(int *had_error)
+{
+    char *available = package_capture_query(
+        package_available_query(DISTRO_ARCH), "package availability",
+        had_error);
+    if (available == NULL)
+        return NULL;
+    NameList held = {0}, marks = {0}, round = {0};
+    int failed = 0;
+    if (package_plain_list_contains(available, "dkms"))
+        failed = name_list_add(&round, "dkms") != 0;
+    for (size_t i = 0;
+         !failed && i < sizeof(arch_kernels) / sizeof(arch_kernels[0]); i++)
+        if (package_plain_list_contains(available, arch_kernels[i]))
+            failed = name_list_add(&round, arch_kernels[i]) != 0;
+    free(available);
+    while (!failed && round.length != 0)
+    {
+        char *records = pacman_records(&round, had_error);
+        if (records == NULL)
+        {
+            free(round.text);
+            free(marks.text);
+            free(held.text);
+            return NULL;
+        }
+        NameList next = {0};
+        PacmanRecord record = {0};
+        for (const char *line = records; !failed && *line != '\0';)
+        {
+            const char *newline = strchr(line, '\n');
+            size_t length = newline != NULL ? (size_t)(newline - line)
+                                            : strlen(line);
+            const char *value;
+            size_t value_length;
+            if (length == 0)
+            {
+                failed = record.name != NULL &&
+                         pacman_take_record(&record, &held, &marks,
+                                            &next) != 0;
+                record = (PacmanRecord){0};
+            }
+            else if ((value = pacman_field(line, length, "Name",
+                                           &value_length)) != NULL)
+            {
+                record.name = value;
+                record.name_length = value_length;
+            }
+            else if ((value = pacman_field(line, length, "Provides",
+                                           &value_length)) != NULL)
+            {
+                record.provides = value;
+                record.provides_length = value_length;
+            }
+            else if ((value = pacman_field(line, length, "Depends On",
+                                           &value_length)) != NULL)
+            {
+                record.depends = value;
+                record.depends_length = value_length;
+            }
+            else if ((value = pacman_field(line, length, "Required By",
+                                           &value_length)) != NULL)
+            {
+                record.required_by = value;
+                record.required_length = value_length;
+            }
+            line += newline != NULL ? length + 1U : length;
+        }
+        if (!failed && record.name != NULL)
+            failed = pacman_take_record(&record, &held, &marks, &next) != 0;
+        free(records);
+        free(round.text);
+        round = next;
+    }
+    free(round.text);
+    free(marks.text);
+    if (failed)
+    {
+        print_error("Error: Could not allocate the package query\n");
+        *had_error = 1;
+        free(held.text);
+        return NULL;
+    }
+    return held.text != NULL ? held.text : strdup("");
+}
+
+// The packages that bring kernel modules (D103): a module builder (akmods,
+// dkms), a package built against a kernel, and those needing one, directly or
+// through others, one name per line. NULL, with an error printed, when the
+// package manager cannot tell.
+static char *package_module_query(distro_t distro, int *had_error)
+{
+    // apt-cache prints each package it reaches on a line of its own, the
+    // ones needing it indented below, so the whole output serves as the list.
+    static char *const debian_query[] = {
+        "env", "LC_ALL=C", "apt-cache", "rdepends", "--recurse",
+        "--no-suggests", "--no-recommends", "--no-enhances", "--no-conflicts",
+        "--no-breaks", "--no-replaces", "dkms", NULL
+    };
+    static char *const fedora_query[] = {
+        "dnf", "repoquery", "-q", "--whatrequires", "akmods,dkms",
+        "--recursive", "--qf", "%{name}\\n", NULL
+    };
+    switch (distro)
+    {
+        case DISTRO_DEBIAN:
+            return package_capture_query(debian_query, "packages that bring "
+                                         "kernel modules", had_error);
+        case DISTRO_FEDORA:
+            return package_capture_query(fedora_query, "packages that bring "
+                                         "kernel modules", had_error);
+        case DISTRO_ARCH:
+            return arch_module_packages(had_error);
+        default:
+            return NULL;
+    }
+}
+
+static int package_brings_modules(const char *modules, const char *package)
+{
+    return modules != NULL &&
+           (strcmp(package, "akmods") == 0 || strcmp(package, "dkms") == 0 ||
+            package_available_contains(modules, package));
+}
+
 static size_t package_build_argv(char **argv, char *const *prefix,
                                  size_t prefix_count, char **pkgs,
                                  size_t pkg_count, const char *available)
@@ -616,21 +911,25 @@ static size_t package_build_argv(char **argv, char *const *prefix,
     return install_count;
 }
 
-// Counts the packages inventory has and lists the others in todo under
-// heading.
+// Of the packages that bring kernel modules, or else of the others, counts
+// the ones inventory has and lists the rest in todo under heading.
 static void package_account_final_state(distro_t distro, const char *inventory,
                                         char **pkgs, size_t pkg_count,
+                                        const char *modules, int bring_modules,
                                         FILE *todo, const char *heading,
                                         int *installed, int *skipped)
 {
+    int listed = 0;
     for (size_t index = 0; index < pkg_count; index++)
     {
+        if (package_brings_modules(modules, pkgs[index]) != bring_modules)
+            continue;
         if (package_inventory_contains(distro, inventory, pkgs[index]))
         {
             (*installed)++;
             continue;
         }
-        if (*skipped == 0)
+        if (listed++ == 0)
             fprintf(todo, "  %s\n", heading);
         fprintf(todo, "    %s\n", pkgs[index]);
         (*skipped)++;
@@ -808,28 +1107,47 @@ static int package_restore_list(distro_t distro, char *const *prefix,
     if (unmarked_count != 0)
         package_mark_explicit(distro, unmarked, unmarked_count);
 
-    if (online && missing_count != 0)
+    // Without the list of packages that bring kernel modules, none of the
+    // missing ones is installed: any of them could be such a package (D103).
+    char *modules = NULL;
+    if (online && missing_count != 0 &&
+        (modules = package_module_query(distro, had_error)) != NULL)
     {
+        size_t install_count = 0;
+        for (size_t index = 0; index < missing_count; index++)
+            if (!package_brings_modules(modules, missing[index]))
+                missing[install_count++] = missing[index];
         char line[128];
         snprintf(line, sizeof(line), "  %zu of %zu are already installed; "
                  "installing %zu (this may take a while)...",
-                 pkg_count - missing_count, pkg_count, missing_count);
-        package_install_batch(distro, prefix, prefix_count, missing,
-                              missing_count, line, had_error);
-        free(inventory);
-        inventory = package_capture_query(query, "installed packages",
-                                          had_error);
+                 pkg_count - missing_count, pkg_count, install_count);
+        if (install_count != 0)
+        {
+            package_install_batch(distro, prefix, prefix_count, missing,
+                                  install_count, line, had_error);
+            free(inventory);
+            inventory = package_capture_query(query, "installed packages",
+                                              had_error);
+        }
     }
     if (inventory != NULL)
+    {
         package_account_final_state(
-            distro, inventory, pkgs, pkg_count, todo,
+            distro, inventory, pkgs, pkg_count, modules, 0, todo,
             online ? "Packages this system could not install, often from a "
                      "repository it does not have yet, or named differently "
                      "on this distribution:"
                    : "Packages to install once this system is online:",
             installed, skipped);
+        package_account_final_state(
+            distro, inventory, pkgs, pkg_count, modules, 1, todo,
+            "Packages that bring kernel modules, such as drivers; left out, "
+            "because a driver belongs to this system's own setup:",
+            installed, skipped);
+    }
 
     int result = inventory != NULL ? 0 : -1;
+    free(modules);
     free(missing);
     free(unmarked);
     free(explicit_list);

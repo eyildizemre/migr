@@ -5830,3 +5830,45 @@ repositories. Turning a disabled flathub back on: a disabled remote is a
 choice made on this system.
 
 **Relationship:** Narrows D76's rule on missing remotes for flathub alone.
+
+## D103 — 2026-10-10 — Restore leaves packages that bring kernel modules to the user
+
+**Status:** Implemented
+
+**Decision:** Restore does not install a package that brings kernel modules;
+it lists it under "What's left for you" (D78), under a heading of its own,
+with the packages the system could not install. Such a package is a module
+builder (`akmods`, `dkms`), a package built against a kernel, or one that
+needs either, directly or through other packages. The package manager tells
+which, from the repositories of the restoring system, once per restore and
+only when there are packages to install:
+- **Fedora:** `dnf repoquery --whatrequires akmods,dkms --recursive`.
+- **Debian, Ubuntu:** `apt-cache rdepends --recurse dkms`, without weak
+  dependencies; Ubuntu's prebuilt `linux-modules-nvidia-*` come in as the
+  alternatives of `nvidia-dkms-*`.
+- **Arch:** pacman has no recursive reverse query, so restore follows the
+  "Required By" field of `pacman -Sii` round by round from `dkms` and the
+  kernels (`linux`, `linux-lts`, `linux-zen`, `linux-hardened`). A package
+  counts when it needs `dkms`, a kernel by its name, or a package that
+  counts, or what that package provides (`V4L2LOOPBACK-MODULE`). One that
+  needs only a module the kernel itself provides (`ntsync-autoload` needs
+  `NTSYNC-MODULE`) does not count, nor do the packages that need it (`wine`).
+- **Unknown:** When the query fails, restore installs none of the missing
+  packages, since any of them could bring a module, and the error is
+  reported.
+
+**Why:** A driver package installed at the end of a restore blacklists the
+kernel's own driver, builds a module for the running kernel, and changes the
+boot chain, on hardware, firmware, and a kernel it was not set up for; the
+next boot can stop before the desktop. Names do not tell such packages
+apart: `xorg-x11-drv-nvidia-cuda` brings `akmod-nvidia` through its
+dependencies, as `nvidia-driver-580` brings `nvidia-dkms-580`. A driver
+belongs to the new system's own setup, done when it boots.
+
+**Rejected:** Name patterns (`akmod-*`, `*-dkms`, `*nvidia*`), which miss
+the packages that pull a module in under another name. Marking the packages
+at backup, which would leave existing backups out and needs the old
+system's dependency data rather than the new one's.
+
+**Relationship:** Narrows D46 and D95: the transaction leaves these packages
+out. The kernel-pinned `kmod-*` names are still dropped at backup.

@@ -96,12 +96,18 @@ typedef struct {
     const char *installed_output;
     const char *explicit_output;
     const char *available_output;
+    // What the query for packages that bring kernel modules prints: dnf's
+    // and apt-cache's output, or the pacman -Sii records it picks from.
+    const char *module_output;
+    const char *pacman_records;
+    int module_query_fails;
     int run_result;
     size_t call_count;
     size_t max_batch_count;
     size_t installed_query_count;
     size_t explicit_query_count;
     size_t availability_query_count;
+    size_t module_query_count;
     size_t mark_count;
     char marked[256];
     int prefix_ok;
@@ -179,6 +185,37 @@ static int package_run_fixture(char *const argv[], void *context)
     return fixture->run_result;
 }
 
+// The records of pacman_records, blank-line separated, whose names argv
+// gives after "env LC_ALL=C pacman -Sii".
+static int pacman_records_fixture(const char *records, char *const argv[],
+                                  char *output, size_t output_size)
+{
+    size_t used = 0;
+    output[0] = '\0';
+    for (const char *record = records != NULL ? records : "";
+         *record != '\0';)
+    {
+        const char *end = strstr(record, "\n\n");
+        size_t length = end != NULL ? (size_t)(end - record) + 2U
+                                    : strlen(record);
+        const char *name = strchr(record, ':');
+        for (size_t i = 4; name != NULL && argv[i] != NULL; i++)
+        {
+            size_t name_length = strlen(argv[i]);
+            if (strncmp(name + 2, argv[i], name_length) != 0 ||
+                name[2 + name_length] != '\n')
+                continue;
+            if (used + length >= output_size)
+                return -1;
+            memcpy(output + used, record, length);
+            used += length;
+            output[used] = '\0';
+        }
+        record += length;
+    }
+    return 0;
+}
+
 static int package_capture_fixture(char *const argv[], char *output,
                                    size_t output_size, void *context)
 {
@@ -241,6 +278,29 @@ static int package_capture_fixture(char *const argv[], char *output,
         fixture->availability_query_count++;
         text = fixture->available_output;
     }
+    else if ((fixture->distro == DISTRO_FEDORA &&
+              strcmp(argv[0], "dnf") == 0 && argv[1] != NULL &&
+              strcmp(argv[1], "repoquery") == 0 && argv[2] != NULL &&
+              strcmp(argv[2], "-q") == 0) ||
+             (fixture->distro == DISTRO_DEBIAN &&
+              strcmp(argv[0], "env") == 0 && argv[2] != NULL &&
+              strcmp(argv[2], "apt-cache") == 0 && argv[3] != NULL &&
+              strcmp(argv[3], "rdepends") == 0))
+    {
+        fixture->module_query_count++;
+        if (fixture->module_query_fails)
+            return 1;
+        text = fixture->module_output != NULL ? fixture->module_output : "";
+    }
+    else if (fixture->distro == DISTRO_ARCH &&
+             strcmp(argv[0], "env") == 0 && argv[2] != NULL &&
+             strcmp(argv[2], "pacman") == 0 && argv[3] != NULL &&
+             strcmp(argv[3], "-Sii") == 0)
+    {
+        fixture->module_query_count++;
+        return pacman_records_fixture(fixture->pacman_records, argv, output,
+                                      output_size);
+    }
     else
     {
         fixture->capture_ok = 0;
@@ -260,6 +320,7 @@ typedef struct {
     int had_error;
     int skipped_exists;
     int skipped_matches;
+    char todo[1024];
 } PackageRestoreCaseResult;
 
 // Whether the package and Flatpak restores below run with a network (D90).
@@ -326,6 +387,7 @@ static int run_restore_packages_case(distro_t distro, const char *contents,
               text_length >= expected_length &&
               strcmp(todo_text + text_length - expected_length, expected) == 0
         : !result->skipped_exists;
+    snprintf(result->todo, sizeof(result->todo), "%s", todo_text);
 
     free(todo_text);
     unlink(pkg_path);
@@ -600,9 +662,10 @@ static void test_restore_packages_batch_prefixes(void)
         { DISTRO_FEDORA, "Fedora", fedora_prefix,
           sizeof(fedora_prefix) / sizeof(fedora_prefix[0]),
           "alpha\nbeta\n", NULL, 0U },
+        // Arch reads its repositories' names for the module query too.
         { DISTRO_ARCH, "Arch", arch_prefix,
           sizeof(arch_prefix) / sizeof(arch_prefix[0]),
-          "alpha\nbeta\n", "alpha\nbeta\n", 1U },
+          "alpha\nbeta\n", "alpha\nbeta\n", 2U },
     };
 
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
@@ -742,7 +805,7 @@ static void test_restore_packages_sparse_unavailable(distro_t distro,
              "retries", name);
     check(runner.installed_query_count == 2U &&
               runner.availability_query_count ==
-                  (distro == DISTRO_ARCH ? 1U : 0U),
+                  (distro == DISTRO_ARCH ? 2U : 0U),
           label);
     snprintf(label, sizeof(label),
              "%s leaves exactly the 14 packages absent from final state to "
@@ -966,6 +1029,136 @@ static void test_restore_packages_skips_what_is_installed(void)
                   unmarked_result.had_error == 0,
               label);
     }
+}
+
+static void test_restore_packages_leaves_module_packages(void)
+{
+    printf(BLUE "::" NC " restore_packages leaves packages that bring kernel "
+                "modules to What's left (D103)\n");
+    static const char *const heading =
+        "  Packages that bring kernel modules, such as drivers; left out, "
+        "because a driver belongs to this system's own setup:\n";
+    char expected[512];
+    static const char *const debian_prefix[] = {
+        "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y",
+        "-m"
+    };
+    static const char *const fedora_prefix[] = {
+        "dnf", "install", "-y", "--skip-unavailable"
+    };
+    static const char *const arch_prefix[] = {
+        "pacman", "-S", "--needed", "--noconfirm"
+    };
+
+    static const char *const fedora_held[] = {
+        "akmod-nvidia", "xorg-x11-drv-nvidia-cuda", "dkms"
+    };
+    PackageRunFixture fedora = {
+        .expected_prefix = fedora_prefix,
+        .expected_prefix_count = 4U,
+        .forbidden_tokens = fedora_held,
+        .forbidden_token_count = 3U,
+        .installed_output = "alpha\n",
+        .module_output = "akmod-nvidia\nkmod-nvidia\n"
+                         "xorg-x11-drv-nvidia-cuda\n",
+    };
+    PackageRestoreCaseResult result = {0};
+    int fixture_ok = run_restore_packages_case(
+        DISTRO_FEDORA, "alpha\nakmod-nvidia\nxorg-x11-drv-nvidia-cuda\ndkms\n",
+        &fedora, NULL, &result);
+    snprintf(expected, sizeof(expected),
+             "%s    akmod-nvidia\n    xorg-x11-drv-nvidia-cuda\n    dkms\n",
+             heading);
+    check(fixture_ok && fedora.capture_ok && fedora.module_query_count == 1U &&
+              fedora.call_count == 1U && fedora.max_batch_count == 1U &&
+              !fedora.forbidden_seen && result.had_error == 0 &&
+              strcmp(result.todo, expected) == 0,
+          "Fedora installs the rest and lists a driver, what pulls it, and "
+          "dkms itself");
+
+    static const char *const debian_held[] = {"nvidia-driver-580"};
+    PackageRunFixture debian = {
+        .expected_prefix = debian_prefix,
+        .expected_prefix_count = 6U,
+        .forbidden_tokens = debian_held,
+        .forbidden_token_count = 1U,
+        .installed_output = "alpha\talpha\tinstalled\n",
+        .available_output = "alpha\nnvidia-driver-580\n",
+        .module_output = "dkms\nReverse Depends:\n  nvidia-dkms-580\n"
+                         "nvidia-dkms-580\nReverse Depends:\n"
+                         "  nvidia-driver-580\nnvidia-driver-580\n"
+                         "Reverse Depends:\n",
+    };
+    result = (PackageRestoreCaseResult){0};
+    fixture_ok = run_restore_packages_case(
+        DISTRO_DEBIAN, "alpha\nnvidia-driver-580\n", &debian, NULL, &result);
+    snprintf(expected, sizeof(expected), "%s    nvidia-driver-580\n",
+             heading);
+    check(fixture_ok && debian.capture_ok && debian.call_count == 1U &&
+              debian.max_batch_count == 1U && !debian.forbidden_seen &&
+              result.had_error == 0 && strcmp(result.todo, expected) == 0,
+          "Debian lists a driver that needs dkms through another package");
+
+    // nvidia-open names the kernel; ntsync-autoload needs only a module the
+    // kernel provides, so wine, which needs it, is installed;
+    // v4l2loopback-utils needs what a dkms package provides.
+    static const char *const arch_held[] = {
+        "nvidia-open", "v4l2loopback-utils"
+    };
+    PackageRunFixture arch = {
+        .expected_prefix = arch_prefix,
+        .expected_prefix_count = 4U,
+        .forbidden_tokens = arch_held,
+        .forbidden_token_count = 2U,
+        .installed_output = "alpha\nwine\n",
+        .available_output = "alpha\nwine\nnvidia-open\nv4l2loopback-utils\n"
+                            "dkms\nlinux\n",
+        .pacman_records =
+            "Name            : dkms\nProvides        : None\n"
+            "Depends On      : bash\n"
+            "Required By     : v4l2loopback-dkms\n\n"
+            "Name            : linux\nProvides        : NTSYNC-MODULE\n"
+            "Depends On      : coreutils\n"
+            "Required By     : nvidia-open  ntsync-autoload\n\n"
+            "Name            : v4l2loopback-dkms\n"
+            "Provides        : V4L2LOOPBACK-MODULE=0.13\n"
+            "Depends On      : dkms\n"
+            "Required By     : v4l2loopback-utils\n\n"
+            "Name            : v4l2loopback-utils\nProvides        : None\n"
+            "Depends On      : V4L2LOOPBACK-MODULE\n"
+            "Required By     : None\n\n"
+            "Name            : nvidia-open\nProvides        : NVIDIA-MODULE\n"
+            "Depends On      : linux  nvidia-utils=615.78.08\n"
+            "Required By     : None\n\n"
+            "Name            : ntsync-autoload\nProvides        : None\n"
+            "Depends On      : NTSYNC-MODULE\n"
+            "Required By     : wine\n\n"
+            "Name            : wine\nProvides        : None\n"
+            "Depends On      : ntsync-autoload\n"
+            "Required By     : None\n",
+    };
+    result = (PackageRestoreCaseResult){0};
+    fixture_ok = run_restore_packages_case(
+        DISTRO_ARCH, "alpha\nwine\nnvidia-open\nv4l2loopback-utils\n", &arch,
+        NULL, &result);
+    snprintf(expected, sizeof(expected),
+             "%s    nvidia-open\n    v4l2loopback-utils\n", heading);
+    check(fixture_ok && arch.capture_ok && arch.module_query_count == 3U &&
+              arch.call_count == 1U && arch.max_batch_count == 2U &&
+              !arch.forbidden_seen && result.had_error == 0 &&
+              strcmp(result.todo, expected) == 0,
+          "Arch follows the packages that need dkms or a kernel by name");
+
+    PackageRunFixture failing = {
+        .installed_output = "",
+        .module_query_fails = 1,
+    };
+    result = (PackageRestoreCaseResult){0};
+    fixture_ok = run_restore_packages_case(DISTRO_FEDORA, "alpha\n", &failing,
+                                           "alpha\n", &result);
+    check(fixture_ok && failing.call_count == 0U && result.had_error == 1 &&
+              result.skipped_matches,
+          "without the list of such packages nothing is installed");
 }
 
 static void test_restore_packages_batch_alloc_failure_is_reported(void)
@@ -1563,6 +1756,7 @@ int main(void)
     test_restore_packages_batch_prefixes();
     test_restore_packages_single_pass_accounting();
     test_restore_packages_skips_what_is_installed();
+    test_restore_packages_leaves_module_packages();
     test_restore_packages_batch_alloc_failure_is_reported();
 
     test_groups_collect();
