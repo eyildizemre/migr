@@ -1283,9 +1283,12 @@ static int run_backup_capturing_input(const char *target, BackupMode mode,
                                       const char *input, char *output,
                                       size_t output_size)
 {
+    // Without input, standard input is an empty pipe, not the terminal the
+    // tests run from: a question gets end of input, as under make check,
+    // instead of waiting unseen for a key.
     int pipefd[2];
-    int input_pipe[2] = { -1, -1 };
-    if (pipe(pipefd) != 0 || (input != NULL && pipe(input_pipe) != 0))
+    int input_pipe[2];
+    if (pipe(pipefd) != 0 || pipe(input_pipe) != 0)
     {
         perror("pipe");
         exit(1);
@@ -1298,8 +1301,8 @@ static int run_backup_capturing_input(const char *target, BackupMode mode,
             perror("write");
             exit(1);
         }
-        close(input_pipe[1]);
     }
+    close(input_pipe[1]);
     // Every check()/printf() so far in this process may still be sitting
     // unflushed in stdio's buffer (fully buffered, since stdout/stderr
     // aren't a tty here) -- fork() copies that buffer into the child, whose
@@ -1318,11 +1321,10 @@ static int run_backup_capturing_input(const char *target, BackupMode mode,
         close(pipefd[0]);
         if (dup2(pipefd[1], STDOUT_FILENO) < 0 ||
             dup2(pipefd[1], STDERR_FILENO) < 0 ||
-            (input != NULL && dup2(input_pipe[0], STDIN_FILENO) < 0))
+            dup2(input_pipe[0], STDIN_FILENO) < 0)
             _exit(125);
         close(pipefd[1]);
-        if (input != NULL)
-            close(input_pipe[0]);
+        close(input_pipe[0]);
         int rc = backup(target, mode, (char **)paths, include_self,
                         include_network_config);
         fflush(stdout);
@@ -1331,8 +1333,7 @@ static int run_backup_capturing_input(const char *target, BackupMode mode,
     }
 
     close(pipefd[1]);
-    if (input != NULL)
-        close(input_pipe[0]);
+    close(input_pipe[0]);
     size_t total = 0;
     ssize_t n;
     while (total < output_size - 1 &&
