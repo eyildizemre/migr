@@ -197,10 +197,38 @@ During an update it is called `migr-<user>.updating`, so an interrupted update
 is never mistaken for a finished backup.
 
 **Linux or non-Linux drives.** On a drive that can hold Linux metadata (ext4,
-btrfs, xfs) the backup is a plain copy of your files. On exFAT, FAT32, or NTFS,
-file names are encoded so the drive accepts them, and the true names, owners,
-permissions, times, and extended attributes are kept in a journal next to them.
-migr picks the form by testing the drive; there is no option.
+btrfs, xfs, f2fs) the backup is a plain copy of your files. On exFAT, FAT32, or
+NTFS, file names are encoded so the drive accepts them, and the true names,
+owners, permissions, times, and extended attributes are kept in a journal next
+to them. migr picks the form by testing the drive; there is no option.
+
+**A USB flash drive you can reformat.** Format it, or a partition of it, as
+f2fs. In testing, f2fs was substantially faster than ext4 on slow flash drives,
+which write many small files very slowly under ext4. A drive that has other
+uses can keep them: give the backup a partition of its own with GNOME Disks or
+KDE Partition Manager.
+
+**Encrypting the drive.** If the drive may be lost or reach someone else, put
+the backup partition inside LUKS encryption before formatting it; migr does
+not encrypt backups itself. Creating a LUKS container erases the partition, so
+make sure you name the right one, by its stable name under
+`/dev/disk/by-id/`, and unmount it first if the desktop mounted it. If you lose
+the passphrase, the backup cannot be recovered.
+
+```sh
+lsblk -o NAME,MODEL,SIZE,FSTYPE,MOUNTPOINTS
+ls -l /dev/disk/by-id/ | grep -i usb
+
+sudo cryptsetup luksFormat /dev/disk/by-id/<drive>-partN
+sudo cryptsetup open /dev/disk/by-id/<drive>-partN migr-backup
+sudo mkfs.f2fs -l migr /dev/mapper/migr-backup
+sudo cryptsetup close migr-backup
+```
+
+Without encryption, `sudo mkfs.f2fs -l migr /dev/disk/by-id/<drive>-partN`
+alone formats the partition. When the drive is plugged in again, the desktop
+asks for the passphrase and mounts the partition at `/run/media/<user>/migr`;
+back up to it and restore from it as from any other drive.
 
 **Options.**
 - `--include-network-config` also backs up NetworkManager, netplan,
