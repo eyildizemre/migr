@@ -3,6 +3,7 @@
 
 #include "backup_plan.h"
 #include "config.h"
+#include "utils.h"
 #include <stdint.h>
 
 typedef struct {
@@ -67,6 +68,13 @@ int selection_root_owns(const SelectionRoot *root, const char *rel);
 int selection_source_owns(const SelectionRoot *root, const char *source);
 void selection_plan_estimate_size(const SelectionPlan *plan, off_t block_size,
                                   off_t *total, int *had_error);
+/* backup_plan_estimate_size(), or the selection's estimate when selection is
+ * not NULL, that also keeps the first root it could not measure, and why, in
+ * failed (which may be NULL). */
+void backup_estimate_size_report(const BackupPlan *plan,
+                                 const SelectionPlan *selection,
+                                 off_t block_size, off_t *total,
+                                 int *had_error, FailedItem *failed);
 /* Inventory is read-only; the caller probes the aggregated profiles before
  * setting metadata_preflight_done and capturing an identically adopted policy. */
 int backup_selection_inventory(const SelectionPlan *plan, int anchor_fd,

@@ -1284,7 +1284,8 @@ static int estimate_walk_fd(int parent_fd, const char *name, off_t block_size,
 }
 
 static void estimate_plan(const BackupPlan *plan, const SelectionPlan *selection,
-                           off_t block_size, off_t *total, int *had_error)
+                           off_t block_size, off_t *total, int *had_error,
+                           FailedItem *failed)
 {
     if (total == NULL || had_error == NULL)
         return;
@@ -1314,11 +1315,13 @@ static void estimate_plan(const BackupPlan *plan, const SelectionPlan *selection
             seen.count = seen_before_root;
             if (saved_errno == ENOENT || saved_errno == ENOTDIR)
                 continue;
+            failed_item_note(failed, path, "measure its size", saved_errno);
             *had_error = 1;
             continue;
         }
         if (estimate_add_size(total, root_size) != 0)
         {
+            failed_item_note(failed, path, "add up its size", EOVERFLOW);
             seen.count = seen_before_root;
             *had_error = 1;
         }
@@ -1804,7 +1807,7 @@ fail:
 void backup_plan_estimate_size(const BackupPlan *plan, off_t block_size,
                                off_t *total, int *had_error)
 {
-    estimate_plan(plan, NULL, block_size, total, had_error);
+    estimate_plan(plan, NULL, block_size, total, had_error, NULL);
 }
 
 void selection_plan_estimate_size(const SelectionPlan *plan, off_t block_size,
@@ -1812,5 +1815,21 @@ void selection_plan_estimate_size(const SelectionPlan *plan, off_t block_size,
 {
     if (!total || !had_error) return;
     if (selection_plan_validate(plan) < 0) { *total = 0; *had_error = 1; return; }
-    estimate_plan(NULL, plan, block_size, total, had_error);
+    estimate_plan(NULL, plan, block_size, total, had_error, NULL);
+}
+
+void backup_estimate_size_report(const BackupPlan *plan,
+                                 const SelectionPlan *selection,
+                                 off_t block_size, off_t *total,
+                                 int *had_error, FailedItem *failed)
+{
+    if (selection != NULL && selection_plan_validate(selection) < 0)
+    {
+        *total = 0;
+        *had_error = 1;
+        failed_item_note(failed, "", "check the selection", EINVAL);
+        return;
+    }
+    estimate_plan(selection != NULL ? NULL : plan, selection, block_size,
+                  total, had_error, failed);
 }

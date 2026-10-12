@@ -2202,6 +2202,49 @@ static void rename_directory_out_from_under_its_open_fd(int parent_fd,
     }
 }
 
+static void test_estimate_names_an_unmeasurable_root(void)
+{
+    printf(BLUE "::" NC " model: a root the estimate cannot measure is named with errno\n");
+
+    if (geteuid() == 0)
+    {
+        printf("  - skipped: root reads a locked folder\n");
+        return;
+    }
+    char home[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_home");
+    mkdir_p(home);
+    setenv("HOME", home, 1);
+
+    char root[PATH_MAX], locked[PATH_MAX], file[PATH_MAX];
+    join_path(root, sizeof(root), home, "root");
+    join_path(locked, sizeof(locked), root, "locked");
+    join_path(file, sizeof(file), locked, "inside.txt");
+    mkdir_p(locked);
+    write_file(file, "payload");
+    char *paths[] = { root, NULL };
+
+    BackupPlan plan;
+    check(backup_plan_build(home, BACKUP_EXPLICIT_PATHS,
+                            (const char *const *)paths, &plan) == 0,
+          "the estimate fixture builds");
+    check(chmod(locked, 0000) == 0, "a folder in the root cannot be read");
+
+    off_t total = -1;
+    int had_error = 0;
+    FailedItem failed = {0};
+    backup_estimate_size_report(&plan, NULL, 0, &total, &had_error, &failed);
+    check(had_error == 1 && strcmp(failed.path, root) == 0 &&
+              failed.step.step != NULL &&
+              strcmp(failed.step.step, "measure its size") == 0 &&
+              failed.step.err == EACCES,
+          "the estimate names the root, the step, and errno");
+
+    check(chmod(locked, 0755) == 0, "the folder can be read again");
+    backup_plan_free(&plan);
+    remove_tree(home);
+}
+
 static void test_estimate_survives_ancestor_rename_mid_walk(void)
 {
     printf(BLUE "::" NC " model: size estimation stays anchored to an already-opened "
@@ -5183,6 +5226,7 @@ int main(void)
     test_plan_estimate_tolerates_missing_root();
     test_planning_keeps_access_times();
 #ifdef BACKUP_PLAN_TEST_HOOKS
+    test_estimate_names_an_unmeasurable_root();
     test_estimate_survives_ancestor_rename_mid_walk();
 #endif
     test_allocation_aware_estimate();

@@ -434,6 +434,15 @@ void failed_item_note(FailedItem *failed, const char *path, const char *step,
     failed_step_note(&failed->step, step, err);
 }
 
+const char *command_failure_text(int result, char *buf, size_t size)
+{
+    if (result < 0)
+        snprintf(buf, size, "%s", strerror(errno));
+    else
+        snprintf(buf, size, "it exited with status %d", result);
+    return buf;
+}
+
 void failed_step_note_reason(FailedStep *failed, const char *step,
                              const char *reason)
 {

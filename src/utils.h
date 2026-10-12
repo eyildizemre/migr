@@ -187,6 +187,12 @@ void failed_item_note(FailedItem *failed, const char *path, const char *step,
                       int err);
 
 /**
+ * @brief Words what run_command() or a variant returned for a failed
+ *        command: "it exited with status N", or errno's text for -1.
+ */
+const char *command_failure_text(int result, char *buf, size_t size);
+
+/**
  * @brief Records step with a fixed reason unless a step was already
  *        recorded.
  */

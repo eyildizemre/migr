@@ -1069,16 +1069,20 @@ static void package_mark_explicit(distro_t distro, char **pkgs,
     }
 
     char **argv = malloc((prefix_count + pkg_count + 1U) * sizeof(*argv));
-    int failed = argv == NULL;
-    if (!failed)
+    int result = -1;
+    if (argv != NULL)
     {
         char output[4096];
         package_build_argv(argv, prefix, prefix_count, pkgs, pkg_count, NULL);
-        failed = package_capture_command(argv, output, sizeof(output)) != 0;
+        result = package_capture_command(argv, output, sizeof(output));
     }
-    if (failed)
+    if (result != 0)
+    {
+        char cause[128];
         print_warning("Warning: Could not mark %zu installed package(s) as "
-                      "explicitly installed.\n", pkg_count);
+                      "explicitly installed: %s.\n", pkg_count,
+                      command_failure_text(result, cause, sizeof(cause)));
+    }
     free(argv);
 }
 

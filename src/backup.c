@@ -163,7 +163,10 @@ static void backup_test_before_source_open(const char *source_path)
 int destination_block_size(int dest_fd, off_t *block_size)
 {
     if (dest_fd < 0 || block_size == NULL)
+    {
+        errno = EINVAL;
         return -1;
+    }
 
 #ifdef BACKUP_TEST_HOOKS
     if (backup_test_block_size_hook != NULL)
@@ -182,19 +185,26 @@ int destination_block_size(int dest_fd, off_t *block_size)
     uintmax_t selected = (uintmax_t)(fs.f_frsize != 0
                                          ? fs.f_frsize : fs.f_bsize);
     if (selected == 0 || selected > (uintmax_t)INTMAX_MAX)
+    {
+        errno = EINVAL;
         return -1;
+    }
     *block_size = (off_t)selected;
     return 0;
 }
 
 // Returns 1 when the destination has at least `needed` bytes available, 0
-// when it clearly does not, and -1 when the filesystem space cannot be read.
+// when it clearly does not, and -1 with errno when the filesystem space
+// cannot be read.
 // f_bavail is the space this unprivileged process can actually consume;
 // f_bfree also includes blocks reserved for root.
 int destination_has_space(int dest_fd, off_t needed, off_t *free_bytes)
 {
     if (dest_fd < 0 || needed < 0 || free_bytes == NULL)
+    {
+        errno = EINVAL;
         return -1;
+    }
 
 #ifdef BACKUP_TEST_HOOKS
     if (backup_test_free_space_hook != NULL)
@@ -203,14 +213,22 @@ int destination_has_space(int dest_fd, off_t needed, off_t *free_bytes)
         backup_test_free_space_hook(needed, free_bytes,
                                     backup_test_free_space_context);
         if (*free_bytes < 0)
+        {
+            errno = EIO;
             return -1;
+        }
         return needed <= *free_bytes;
     }
 #endif
 
     off_t block_size = 0;
-    if (destination_block_size(dest_fd, &block_size) != 0 || block_size <= 0)
+    if (destination_block_size(dest_fd, &block_size) != 0)
         return -1;
+    if (block_size <= 0)
+    {
+        errno = EINVAL;
+        return -1;
+    }
 
     struct statfs fs;
     if (fstatfs(dest_fd, &fs) != 0)
@@ -219,7 +237,10 @@ int destination_has_space(int dest_fd, off_t needed, off_t *free_bytes)
     uintmax_t blocks = (uintmax_t)fs.f_bavail;
     uintmax_t allocation_size = (uintmax_t)block_size;
     if (blocks > UINTMAX_MAX / allocation_size)
+    {
+        errno = EOVERFLOW;
         return -1;
+    }
 
     uintmax_t available = blocks * allocation_size;
     *free_bytes = available > (uintmax_t)INTMAX_MAX
@@ -241,17 +262,21 @@ int restore_space_preflight(int destination_fd, const char *home,
 {
     if (estimate_had_error)
     {
-        print_warning("Warning: could not fully estimate restore size; "
-                      "skipping the free-space preflight check.\n");
+        print_warning("Warning: could not fully estimate restore size: out "
+                      "of memory, or a total too large to count; skipping "
+                      "the free-space preflight check.\n");
         return 0;
     }
 
     off_t block_size = 0;
-    if (destination_block_size(destination_fd, &block_size) != 0 ||
-        block_size <= 0)
+    int block_failed = destination_block_size(destination_fd,
+                                              &block_size) != 0;
+    if (block_failed || block_size <= 0)
     {
-        print_warning("Warning: could not determine destination free space; "
-                      "skipping the free-space preflight check.\n");
+        print_warning("Warning: could not determine destination free space: "
+                      "%s; skipping the free-space preflight check.\n",
+                      block_failed ? strerror(errno)
+                                   : "it reports no block size");
         return 0;
     }
 
@@ -260,8 +285,9 @@ int restore_space_preflight(int destination_fd, const char *home,
                                           &free_bytes);
     if (has_space < 0)
     {
-        print_warning("Warning: could not determine destination free space; "
-                      "skipping the free-space preflight check.\n");
+        print_warning("Warning: could not determine destination free space: "
+                      "%s; skipping the free-space preflight check.\n",
+                      strerror(errno));
         return 0;
     }
 
@@ -432,12 +458,15 @@ static int backup_space_preflight(int dest_fd, off_t estimated_size,
                                   off_t raw_estimated_size,
                                   int estimate_had_error,
                                   int raw_estimate_had_error,
+                                  const FailedItem *estimate_failure,
                                   off_t reused_size, const char *target)
 {
     if (estimate_had_error || raw_estimate_had_error)
     {
-        print_warning("Warning: could not fully estimate backup size; "
-                      "skipping the free-space preflight check.\n");
+        print_step_warning(&estimate_failure->step,
+                           "Warning: could not fully estimate backup size at "
+                           "%s", estimate_failure->path);
+        print_warning("  The free-space check is skipped.\n");
         return 0;
     }
 
@@ -447,8 +476,9 @@ static int backup_space_preflight(int dest_fd, off_t estimated_size,
     int has_space = destination_has_space(dest_fd, needed, &free_bytes);
     if (has_space < 0)
     {
-        print_warning("Warning: could not determine destination free space; "
-                      "skipping the free-space preflight check.\n");
+        print_warning("Warning: could not determine destination free space: "
+                      "%s; skipping the free-space preflight check.\n",
+                      strerror(errno));
         return 0;
     }
 
@@ -1803,8 +1833,9 @@ static void manifest_set_source_identity(Manifest *out)
             subid_ranges_read("/etc/subgid", name, out->source_uid,
                               &out->source_subgids) != 0)
             print_warning("Warning: Could not read /etc/subuid or "
-                          "/etc/subgid; files of rootless containers will "
-                          "keep their owners as they are.\n");
+                          "/etc/subgid: %s; files of rootless containers "
+                          "will keep their owners as they are.\n",
+                          strerror(errno));
     }
 }
 
@@ -1870,12 +1901,10 @@ static int backup_plan_from_selection(const SelectionPlan *selection,
 static void backup_execution_estimate(const BackupPlan *plan,
                                       const SelectionPlan *selection,
                                       off_t block_size, off_t *total,
-                                      int *had_error)
+                                      int *had_error, FailedItem *failed)
 {
-    if (selection != NULL)
-        selection_plan_estimate_size(selection, block_size, total, had_error);
-    else
-        backup_plan_estimate_size(plan, block_size, total, had_error);
+    backup_estimate_size_report(plan, selection, block_size, total, had_error,
+                                failed);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -2132,10 +2161,13 @@ static int drop_left_out_roots(int container_fd, const Manifest *current,
 static void compact_journal(int container_fd)
 {
     uint64_t before = 0, after = 0;
-    if (sidecar_compact_at(container_fd, &before, &after) != SIDECAR_STATUS_OK)
+    SidecarStatus status = sidecar_compact_at(container_fd, &before, &after);
+    if (status != SIDECAR_STATUS_OK)
     {
         print_warning("Warning: could not rewrite the backup journal without "
-                      "its old records; it stays as it was.\n");
+                      "its old records: %s; it stays as it was.\n",
+                      status == SIDECAR_STATUS_IO_ERROR
+                          ? strerror(errno) : sidecar_status_reason(status));
         return;
     }
     if (after < before)
@@ -3100,8 +3132,9 @@ static int backup_dry_run(const char *target, BackupMode mode,
     int advisory_fd = open_advisory_probe_fd(target, &advisory_used_parent);
     if (advisory_fd < 0)
         print_warning("Warning: could not preview destination-dependent checks "
-               "(size estimate, free space, filesystem capabilities) for %s; "
-               "the live backup will check these before writing.\n", target);
+               "(size estimate, free space, filesystem capabilities) for %s: "
+               "%s; the live backup will check these before writing.\n",
+               target, strerror(errno));
     else if (advisory_used_parent)
         printf("Note: %s does not exist yet; the preview below reflects its "
                "parent directory's filesystem instead.\n\n", target);
@@ -3132,14 +3165,16 @@ static int backup_dry_run(const char *target, BackupMode mode,
         }
         off_t advisory_block_size = 0;
         (void)destination_block_size(advisory_fd, &advisory_block_size);
+        FailedItem estimate_failure = {0};
         backup_execution_estimate(plan, selection, advisory_block_size,
-                                  &estimated_size, &estimate_had_error);
+                                  &estimated_size, &estimate_had_error,
+                                  &estimate_failure);
         backup_execution_estimate(plan, selection, 1, &raw_estimated_size,
-                                  &raw_estimate_had_error);
+                                  &raw_estimate_had_error, &estimate_failure);
         if (backup_space_preflight(advisory_fd, estimated_size,
                                    raw_estimated_size, estimate_had_error,
-                                   raw_estimate_had_error, reused_size,
-                                   target) != 0)
+                                   raw_estimate_had_error, &estimate_failure,
+                                   reused_size, target) != 0)
         {
             close(advisory_fd);
             if (target_created)
@@ -3589,15 +3624,18 @@ static int backup_run(const char *target_arg, BackupMode mode,
 
     off_t target_block_size = 0;
     (void)destination_block_size(target_fd, &target_block_size);
+    FailedItem estimate_failure = {0};
     backup_execution_estimate(&plan, selection, target_block_size,
-                              &estimated_size, &estimate_had_error);
+                              &estimated_size, &estimate_had_error,
+                              &estimate_failure);
     backup_execution_estimate(&plan, selection, 1, &raw_estimated_size,
-                              &raw_estimate_had_error);
+                              &raw_estimate_had_error, &estimate_failure);
     if (!estimate_had_error)
         manifest.size = estimated_size;
 
     if (backup_space_preflight(target_fd, estimated_size, raw_estimated_size,
                                estimate_had_error, raw_estimate_had_error,
+                               &estimate_failure,
                                backup_reused_size(target_fd, &manifest,
                                                   other_install[0] != '\0'),
                                target) != 0)
@@ -4040,13 +4078,20 @@ static int backup_run(const char *target_arg, BackupMode mode,
         else
         {
             printf("\nGroups\n");
+            errno = 0;
+            char *groups = backup_collect_groups();
+            int groups_errno = errno;
             int saved = backup_save_list_at(container_fd, "groups.txt",
-                                            backup_collect_groups(), &lines);
+                                            groups, &lines);
             if (saved < 0)
                 had_error = 1;
             else if (saved > 0)
                 print_warning("  Warning: group memberships were not saved "
-                              "for this backup.\n");
+                              "for this backup: %s.\n",
+                              groups_errno != 0
+                                  ? strerror(groups_errno)
+                                  : "the user is not in the local account "
+                                    "or group files");
             else
                 printf("Saved %zu group membership%s to groups.txt\n",
                        lines, lines == 1 ? "" : "s");
@@ -4223,9 +4268,9 @@ fail_pre_container:
     // published again as it was, rather than left looking unfinished.
     if (container.from_finished && !adopted_changed &&
         container_restore_finished_name(&container) != CONTAINER_OK)
-        print_warning("Warning: %s/%s could not get its name back; the next "
-                      "backup finishes it.\n", target,
-                      container_current_name(&container));
+        print_warning("Warning: %s/%s could not get its name back: %s; the "
+                      "next backup finishes it.\n", target,
+                      container_current_name(&container), strerror(errno));
     if (self_fd >= 0)
         close(self_fd);
     container_close(&container);

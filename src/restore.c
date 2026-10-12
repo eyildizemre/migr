@@ -612,9 +612,9 @@ static OwnerMap restore_owner_map(const Manifest *m)
                           &map.to_subuids) != 0 ||
         subid_ranges_read(restore_subgid_path, name, uid,
                           &map.to_subgids) != 0)
-        print_warning("Warning: Could not read /etc/subuid or /etc/subgid; "
-                      "files of rootless containers keep the IDs the "
-                      "backup recorded.\n");
+        print_warning("Warning: Could not read /etc/subuid or /etc/subgid: "
+                      "%s; files of rootless containers keep the IDs the "
+                      "backup recorded.\n", strerror(errno));
     return map;
 }
 
@@ -1049,7 +1049,8 @@ static void restore_crypto_policy(int network_fd)
     char *const set_argv[] = {
         "update-crypto-policies", "--set", saved, NULL
     };
-    if (run_network_command(set_argv) == 0)
+    int set = run_network_command(set_argv);
+    if (set == 0)
     {
         printf("  Set the crypto policy to %s, as on the source system "
                "(it was %s). Services pick it up when they start, so "
@@ -1057,10 +1058,13 @@ static void restore_crypto_policy(int network_fd)
                "--set %s\n", saved, current, current);
         return;
     }
+    char cause[128];
     print_warning("  Warning: could not set the crypto policy to %s (this "
-                  "system: %s). If restored Wi-Fi (802.1X) or VPN connections "
-                  "fail to authenticate, run: sudo update-crypto-policies "
-                  "--set %s\n", saved, current, saved);
+                  "system: %s): update-crypto-policies failed: %s. If "
+                  "restored Wi-Fi (802.1X) or VPN connections fail to "
+                  "authenticate, run: sudo update-crypto-policies --set %s\n",
+                  saved, current,
+                  command_failure_text(set, cause, sizeof(cause)), saved);
 }
 
 // Whether restore_dconf_settings() will load the database into a running
@@ -1528,11 +1532,17 @@ static void restore_network_config(int source_root_fd, int *had_error)
                    "so migr does not run it automatically.\n",
                    restored, backend->name, dest_dir, backend->manual_apply_hint);
         }
-        else if (run_network_config_reload() != 0)
+        else
         {
-            print_warning("Warning: restored network connection files, but "
-                          "'nmcli connection reload' did not succeed. Run it "
-                          "yourself, or restart NetworkManager, to apply them.\n");
+            int reloaded = run_network_config_reload();
+            char cause[128];
+            if (reloaded != 0)
+                print_warning("Warning: restored network connection files, "
+                              "but 'nmcli connection reload' did not "
+                              "succeed: %s. Run it yourself, or restart "
+                              "NetworkManager, to apply them.\n",
+                              command_failure_text(reloaded, cause,
+                                                   sizeof(cause)));
         }
     }
     restore_crypto_policy(network_fd);
