@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "portable.h"
+#include "container.h"
 #include "live_state.h"
 #include "portable_reconcile_internal.h"
 #include "portable_fsops_internal.h"
@@ -3611,7 +3612,10 @@ static int capture_node(PortableCaptureContext *context,
             int matches = built && entries_equal(&current, &previous, &xattrs);
             int same_content = built && !matches && previous.entry != NULL &&
                                entry_content_equal(&current, previous.entry);
-            if (matches || same_content) {
+            // A copy verify found damaged is written again (D107).
+            int recopy = recopy_list_contains(context->recopy, root->id,
+                                              logical);
+            if (!recopy && (matches || same_content)) {
                 int payload = existing_payload_matches(
                     context->data_fd, root->payload_path, destination_parent,
                     destination_leaf, is_root, current.size);
@@ -4566,6 +4570,7 @@ int portable_capture_resume_prepared_at(
         context.progress_report = progress_report;
         context.resume_mode = 1;
         context.payload_matches_journal = request->payload_matches_journal;
+        context.recopy = request->recopy;
         context.collision_plan = &prepared->report.collision_plan;
         context.current_source = &prepared->report.current_source;
         if (portable_capture_owners_reload(&context) != 0 ||

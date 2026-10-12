@@ -3582,6 +3582,8 @@ static int backup_run(const char *target_arg, BackupMode mode,
     BackupDeferral deferral = {0};
     int finish_result = MIGR_EXIT_FAILURE;
     int adopted_changed = 0;
+    RecopyList recopy = {0};
+    int recopy_unread = 0;
 
     if (ensure_target_root(target, &target_created) != 0)
         goto fail_pre_container;
@@ -3856,6 +3858,15 @@ static int backup_run(const char *target_arg, BackupMode mode,
         else if (adopted)
             printf("Resuming an interrupted backup of this install.\n");
         backup_print_deferral(&deferral, &plan);
+        // The files verify found damaged are copied again (D107).
+        if (recopy_list_read(container_root_fd(&container), &recopy) != 0)
+        {
+            print_warning("Warning: could not read the list of damaged "
+                          "files (%s) in the backup: %s; they are not "
+                          "copied again.\n", CONTAINER_RECOPY_NAME,
+                          strerror(errno));
+            recopy_unread = 1;
+        }
 
         capture_report.sync_interval_bytes = BACKUP_SYNC_INTERVAL_BYTES;
         BackupProgressDisplay progress_display = {
@@ -3891,7 +3902,8 @@ static int backup_run(const char *target_arg, BackupMode mode,
                 .representation = repr,
                 .timestamp_policy_configured = 1,
                 .nsec_exact = profile.nsec_exact,
-                .metadata_preflight_done = 1
+                .metadata_preflight_done = 1,
+                .recopy = &recopy
             };
             ctx.inode_map = native_inode_map_create();
             ctx.visited = native_visited_create();
@@ -3931,6 +3943,7 @@ static int backup_run(const char *target_arg, BackupMode mode,
         {
             size_t live_count = 0;
             portable_request.payload_matches_journal = container.from_finished;
+            portable_request.recopy = &recopy;
             if (deferral.root_count != 0)
             {
                 portable_request.deferred = deferral.roots;
@@ -4172,6 +4185,11 @@ static int backup_run(const char *target_arg, BackupMode mode,
     }
 
     printf("Finalizing (syncing to disk)...\n");
+    // Every damaged file on the list was copied again.
+    if (!recopy_unread && recopy_list_remove(container_root_fd(&container)) != 0)
+        print_warning("Warning: could not remove the list of damaged files "
+                      "(%s) from the backup: %s; the next update copies them "
+                      "again.\n", CONTAINER_RECOPY_NAME, strerror(errno));
     if (repr == CLONE_PORTABLE_SIDECAR)
     {
         uint64_t valid_bytes = 0;
@@ -4248,6 +4266,7 @@ finish:
     metadata_profiles_free(&metadata_profiles);
     portable_prepared_capture_free(&prepared);
     free(portable_roots);
+    recopy_list_free(&recopy);
     manifest_free(&manifest);
     backup_plan_free(&plan);
     return finish_result;
@@ -4270,6 +4289,7 @@ fail_pre_container:
     metadata_profiles_free(&metadata_profiles);
     portable_prepared_capture_free(&prepared);
     free(portable_roots);
+    recopy_list_free(&recopy);
     if (target_fd >= 0)
         close(target_fd);
     if (target_created)

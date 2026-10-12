@@ -40,6 +40,7 @@
 #include "selection.h"
 #include "sidecar.h"
 #include "utils.h"
+#include "verify.h"
 #include "writer_apps.h"
 
 #define GREEN "\033[0;32m"
@@ -4856,6 +4857,141 @@ static void test_native_update_splits_a_broken_hardlink(void)
     remove_tree(target);
 }
 
+static int run_verify_capturing(const char *container, char *output,
+                                size_t output_size)
+{
+    int pipefd[2];
+    if (pipe(pipefd) != 0)
+    {
+        perror("pipe");
+        exit(1);
+    }
+    fflush(stdout);
+    fflush(stderr);
+    pid_t pid = fork();
+    if (pid < 0)
+    {
+        perror("fork");
+        exit(1);
+    }
+    if (pid == 0)
+    {
+        close(pipefd[0]);
+        if (dup2(pipefd[1], STDOUT_FILENO) < 0 ||
+            dup2(pipefd[1], STDERR_FILENO) < 0)
+            _exit(125);
+        close(pipefd[1]);
+        int rc = verify_backup(container);
+        fflush(stdout);
+        fflush(stderr);
+        _exit(rc);
+    }
+    close(pipefd[1]);
+    size_t total = 0;
+    ssize_t n;
+    while (total < output_size - 1 &&
+           (n = read(pipefd[0], output + total, output_size - 1 - total)) > 0)
+        total += (size_t)n;
+    output[total] = '\0';
+    close(pipefd[0]);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+// The regular file below dir whose content is text, into out.
+static int find_file_with_text(const char *dir, const char *text, char *out,
+                               size_t out_size)
+{
+    DIR *listing = opendir(dir);
+    if (listing == NULL)
+        return 0;
+    int found = 0;
+    struct dirent *entry;
+    while (!found && (entry = readdir(listing)) != NULL)
+    {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            continue;
+        char path[PATH_MAX];
+        join_path(path, sizeof(path), dir, entry->d_name);
+        struct stat st;
+        if (lstat(path, &st) != 0)
+            continue;
+        if (S_ISDIR(st.st_mode))
+            found = find_file_with_text(path, text, out, out_size);
+        else if (S_ISREG(st.st_mode) && file_text_is(path, text))
+        {
+            snprintf(out, out_size, "%s", path);
+            found = 1;
+        }
+    }
+    closedir(listing);
+    return found;
+}
+
+// A copy damaged on the drive after capture keeps its size and times, so an
+// update would skip it; verify lists it and the update copies it again
+// (D107).
+static void test_update_copies_again_what_verify_found_damaged(int portable)
+{
+    printf(BLUE "::" NC " production: a %s update copies again the files verify found damaged\n",
+           portable ? "portable" : "native");
+    backup_test_force_portable_representation(portable);
+
+    char home[PATH_MAX], target[PATH_MAX], docs[PATH_MAX], file[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_home");
+    setenv("HOME", home, 1);
+    join_path(docs, sizeof(docs), home, "docs");
+    join_path(file, sizeof(file), docs, "file.txt");
+    mkdir_p(docs);
+    write_file(file, "the content as captured");
+    // Native verify compares only a source whose change time predates the
+    // backup's start.
+    time_t later = time(NULL) + 1;
+    while (time(NULL) < later)
+        usleep(10000);
+    fresh_mkdtemp(target, sizeof(target), "plan_target");
+    char *paths[] = { docs, NULL };
+    char output[8192];
+    dry_run = 0;
+    int first_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                        output, sizeof(output));
+
+    char container[PATH_MAX], data[PATH_MAX], copy[PATH_MAX], list[PATH_MAX];
+    int found = find_container_dir(target, container, sizeof(container));
+    join_path(data, sizeof(data), container, "data");
+    join_path(list, sizeof(list), container, "recopy.list");
+    struct stat captured;
+    int damaged = found &&
+        find_file_with_text(data, "the content as captured", copy,
+                            sizeof(copy)) &&
+        stat(copy, &captured) == 0;
+    if (damaged)
+    {
+        write_file(copy, "THE CONTENT AS CAPTURED");
+        struct timespec times[2] = { captured.st_atim, captured.st_mtim };
+        damaged = utimensat(AT_FDCWD, copy, times, 0) == 0;
+    }
+
+    int verify_rc = run_verify_capturing(container, output, sizeof(output));
+    check(first_rc == 0 && damaged && verify_rc == 1 &&
+              strstr(output, "recopy.list") != NULL &&
+              access(list, F_OK) == 0,
+          "verify lists the damaged file in the backup and says to update it");
+
+    int update_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                         output, sizeof(output));
+    backup_test_force_portable_representation(0);
+    check(update_rc == 0 && file_text_is(copy, "the content as captured") &&
+              access(list, F_OK) != 0,
+          "the update copies it again and removes the list");
+    check(run_verify_capturing(container, output, sizeof(output)) == 0,
+          "the backup then verifies");
+
+    remove_tree(home);
+    remove_tree(target);
+}
+
 typedef struct {
     const char *folder;   /* Gets a new file when the preflight opens it. */
     const char *vanished; /* Removed when the preflight opens it. */
@@ -5371,6 +5507,8 @@ int main(void)
     test_destination_space_preflight();
     test_update_counts_the_backup_it_replaces(0);
     test_update_counts_the_backup_it_replaces(1);
+    test_update_copies_again_what_verify_found_damaged(0);
+    test_update_copies_again_what_verify_found_damaged(1);
     test_include_self_backup();
     test_native_backup_of_a_changing_source();
     test_include_network_config_backup();

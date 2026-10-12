@@ -12,6 +12,7 @@
 
 struct SelectionPlan;
 struct SelectionRoot;
+struct RecopyList;
 
 typedef struct {
     SidecarXattr *items;
@@ -106,6 +107,9 @@ typedef struct {
      * resume then checks each root's payload only at its top, not item by
      * item, after capture. */
     int payload_matches_journal;
+    /* Files to copy again although their source is unchanged
+     * (docs/DECISIONS.md D107). Borrowed; NULL for none. */
+    const struct RecopyList *recopy;
     /* Roots captured after all the others, indexed like roots; NULL for
      * none. before_deferred, if set, runs once before the first of them
      * (docs/DECISIONS.md D84). */
@@ -243,6 +247,7 @@ typedef struct PortableCaptureContext {
     int case_sensitive;
     int resume_mode;
     int payload_matches_journal; /* See PortableCaptureRequest. */
+    const struct RecopyList *recopy; /* See PortableCaptureRequest. */
     const PortableCollisionPlan *collision_plan;
     const PortableCurrentSourceSet *current_source;
     void *visited;

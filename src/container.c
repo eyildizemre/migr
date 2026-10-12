@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,6 +14,7 @@
 #include <unistd.h>
 
 #include "container.h"
+#include "utils.h"
 
 /* ========================================================================= */
 /* Naming (docs/DECISIONS.md D71):                                          */
@@ -851,4 +853,156 @@ int container_name_is_final(const char *name)
 {
     return name != NULL && !container_name_is_partial(name) &&
            stem_is_container_name(name, strlen(name));
+}
+
+/* ------------------------------------------------------------------------- */
+/* Items to copy again (docs/DECISIONS.md D107)                              */
+/* ------------------------------------------------------------------------- */
+
+#define RECOPY_LIST_MAX_BYTES (64U * 1024U * 1024U)
+
+int recopy_list_add(RecopyList *list, const char *root, const char *path,
+                    size_t path_length)
+{
+    size_t root_length = strlen(root);
+    size_t needed = root_length + path_length + 2U;
+    char *data = array_reserve(list->data, &list->capacity, list->length,
+                               needed, 1U, 4096U, RECOPY_LIST_MAX_BYTES);
+    if (data == NULL)
+        return -1;
+    list->data = data;
+    memcpy(data + list->length, root, root_length + 1U);
+    list->length += root_length + 1U;
+    memcpy(data + list->length, path, path_length);
+    list->length += path_length;
+    data[list->length++] = '\0';
+    return 0;
+}
+
+int recopy_list_write(int container_fd, const RecopyList *list)
+{
+    // Written beside and renamed over the list, so a run that stops halfway
+    // leaves the old list or the new one.
+    static const char temporary[] = CONTAINER_RECOPY_NAME ".new";
+    int fd = openat(container_fd, temporary,
+                    O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0)
+        return -1;
+    int failed = write_all(fd, list->data, list->length) != 0 ||
+                 fsync(fd) != 0;
+    int saved = errno;
+    if (close(fd) != 0 && !failed)
+    {
+        failed = 1;
+        saved = errno;
+    }
+    if (!failed && renameat(container_fd, temporary, container_fd,
+                            CONTAINER_RECOPY_NAME) != 0)
+    {
+        failed = 1;
+        saved = errno;
+    }
+    if (failed)
+    {
+        (void)unlinkat(container_fd, temporary, 0);
+        errno = saved;
+        return -1;
+    }
+    return 0;
+}
+
+static int recopy_item_compare(const void *left_pointer,
+                               const void *right_pointer)
+{
+    const RecopyItem *left = left_pointer;
+    const RecopyItem *right = right_pointer;
+    int order = strcmp(left->root, right->root);
+    return order != 0 ? order : strcmp(left->path, right->path);
+}
+
+int recopy_list_read(int container_fd, RecopyList *list)
+{
+    memset(list, 0, sizeof(*list));
+    int fd = openat(container_fd, CONTAINER_RECOPY_NAME,
+                    O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0)
+        return errno == ENOENT ? 0 : -1;
+    struct stat st;
+    int bad = fstat(fd, &st) != 0 ? errno
+        : !S_ISREG(st.st_mode) ||
+              (uintmax_t)st.st_size > RECOPY_LIST_MAX_BYTES ? EINVAL
+                                                            : 0;
+    if (bad != 0)
+    {
+        close(fd);
+        errno = bad;
+        return -1;
+    }
+    size_t size = (size_t)st.st_size;
+    list->data = malloc(size + 1U);
+    ssize_t got = list->data == NULL ? -1 : read(fd, list->data, size + 1U);
+    int saved = errno;
+    close(fd);
+    if (got < 0 || (size_t)got != size)
+    {
+        recopy_list_free(list);
+        errno = got < 0 ? saved : EINVAL;
+        return -1;
+    }
+    list->length = size;
+
+    size_t strings = 0;
+    for (size_t index = 0; index < size; index++)
+        strings += list->data[index] == '\0';
+    if (size != 0 && (list->data[size - 1U] != '\0' || strings % 2U != 0))
+    {
+        recopy_list_free(list);
+        errno = EINVAL;
+        return -1;
+    }
+    list->count = strings / 2U;
+    if (list->count == 0)
+        return 0;
+    list->items = malloc(list->count * sizeof(*list->items));
+    if (list->items == NULL)
+    {
+        recopy_list_free(list);
+        return -1;
+    }
+    const char *cursor = list->data;
+    for (size_t index = 0; index < list->count; index++)
+    {
+        list->items[index].root = cursor;
+        cursor += strlen(cursor) + 1U;
+        list->items[index].path = cursor;
+        cursor += strlen(cursor) + 1U;
+    }
+    qsort(list->items, list->count, sizeof(*list->items),
+          recopy_item_compare);
+    return 0;
+}
+
+int recopy_list_contains(const RecopyList *list, const char *root,
+                         const char *path)
+{
+    if (list == NULL || list->count == 0)
+        return 0;
+    RecopyItem key = { root, path };
+    return bsearch(&key, list->items, list->count, sizeof(*list->items),
+                   recopy_item_compare) != NULL;
+}
+
+int recopy_list_remove(int container_fd)
+{
+    if (unlinkat(container_fd, CONTAINER_RECOPY_NAME, 0) == 0 ||
+        errno == ENOENT)
+        return 0;
+    return -1;
+}
+
+void recopy_list_free(RecopyList *list)
+{
+    free(list->data);
+    free(list->items);
+    memset(list, 0, sizeof(*list));
 }

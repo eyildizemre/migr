@@ -5969,3 +5969,35 @@ does not.
 
 **Relationship:** Extends D60 to native backups, which it left out until
 they recorded digests of their own.
+
+## D107 — 2026-10-12 — An update copies again the files verify found damaged
+
+**Status:** Implemented
+
+**Decision:** When `migr verify` finds damaged files, it lists them in the
+backup as `recopy.list`, without asking, and says that an update of the
+backup from the system it was taken from copies them again. The list holds
+each file's root (its payload path in a native backup, its id in a portable
+one) and its path in that root, as NUL-terminated pairs; a later verify
+replaces it. The next update reads it and writes those files again even
+where their source looks unchanged, and removes it once the update has
+finished without errors. A list that cannot be read is warned about, kept,
+and not acted on.
+
+**Why:** An update skips a file whose source size and modification time
+match what it captured (D72), so a copy damaged on the drive after capture
+stayed damaged through every update; touching the source would change the
+file's own modification time, and taking the copy out by hand means working
+inside the backup. The list keeps the damaged copy until a new one replaces
+it.
+
+**Rejected:**
+- Verify stays read-only and leaves the repair to the user.
+- Verify removes the damaged copies itself: until the next update the
+  backup would hold less than it did, and nothing at all for a file whose
+  source is gone.
+- Every update compares the content of each kept file: it would read the
+  whole backup on each run.
+
+**Relationship:** Extends D60 and D106: verify now writes into the backup
+when it finds damage. Uses D72's update in place.

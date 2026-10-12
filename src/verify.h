@@ -22,8 +22,9 @@ int portable_container_open(const char *path, Manifest *manifest,
  * regular file must still have the size and content digest recorded when it
  * was captured (docs/DECISIONS.md D59). A native backup records no content,
  * so each of its files and symlinks is compared with its source; a source
- * changed since the backup is counted as not checked (D106). Reads only;
- * nothing in the backup is changed.
+ * changed since the backup is counted as not checked (D106). Nothing in the
+ * backup is changed, except that the damaged files are listed in it for the
+ * next update to copy again (D107).
  *
  * @return MIGR_EXIT_OK when everything checked matches, MIGR_EXIT_CHANGED on a
  *         mismatch, and MIGR_EXIT_FAILURE when the backup cannot be checked,

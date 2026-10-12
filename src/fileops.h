@@ -23,6 +23,7 @@ typedef enum { CLONE_BACKUP, CLONE_RESTORE } CloneOperation;
 typedef enum { CLONE_NATIVE_TREE, CLONE_PORTABLE_SIDECAR } CloneRepresentation;
 
 struct SelectionRoot;
+struct RecopyList;
 
 typedef struct CloneContext {
     CloneOperation operation;
@@ -33,6 +34,9 @@ typedef struct CloneContext {
     void *inode_map; /* NativeInodeMap; backup/restore tracking; NULL disables it. */
     void *visited; /* Native visited-path set, backup-only; NULL disables tracking. */
     const struct SelectionRoot *selection; /* Borrowed, native backup-only. */
+    /* Backup only: files to copy again although their source is unchanged
+     * (docs/DECISIONS.md D107). Borrowed; NULL for none. */
+    const struct RecopyList *recopy;
     /* Restore only: payload paths, named as restore_native_at_report() names
      * them (source_rel and the names below it), whose subtrees the apply pass
      * leaves out so the caller can restore them last (D69). Borrowed. */

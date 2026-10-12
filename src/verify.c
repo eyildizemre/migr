@@ -50,10 +50,16 @@ typedef struct {
     uint64_t bytes_read;
     uint64_t total_bytes;
     ExampleList failed;
+    /* Every damaged file, for the next update to copy again (D107), and
+     * errno when one could not be added. */
+    RecopyList recopy;
+    int recopy_errno;
 
-    /* A native backup, checked against its source: the root being walked,
-     * whether the walk only counts, and the items compared and not. */
+    /* A native backup, checked against its source: the root being walked
+     * (its id, and its payload path, which capture names it by), whether
+     * the walk only counts, and the items compared and not. */
     const char *root_id;
+    const char *root_payload;
     time_t taken;
     int counting;
     size_t compared;
@@ -145,9 +151,22 @@ static void verify_record(VerifyRun *run, const VerifyItem *item,
                           const char *format, ...)
     __attribute__((format(printf, 3, 4)));
 
+static void verify_recopy(VerifyRun *run, const char *root,
+                          const char *path, size_t path_length)
+{
+    if (run->recopy_errno == 0 &&
+        recopy_list_add(&run->recopy, root, path, path_length) != 0)
+        run->recopy_errno = errno;
+}
+
 static void verify_record(VerifyRun *run, const VerifyItem *item,
                           const char *format, ...)
 {
+    if (item->entry->kind == SIDECAR_KIND_REGULAR &&
+        item->root_index != SIZE_MAX)
+        verify_recopy(run, run->manifest->roots[item->root_index].id,
+                      (const char *)item->entry->logical_path.data,
+                      item->entry->logical_path.length);
     char *text = example_list_next(&run->failed);
     if (text == NULL)
         return;
@@ -392,6 +411,28 @@ static void verify_item(VerifyRun *run, const VerifyItem *item)
         verify_parent_forget(run);
 }
 
+// Saves the damaged files in the backup, where the next update finds them
+// and copies them again (docs/DECISIONS.md D107), and says what to do.
+static void verify_save_recopy(VerifyRun *run, int container_fd)
+{
+    if (run->recopy.length == 0)
+        return;
+    if (run->recopy_errno == 0 &&
+        recopy_list_write(container_fd, &run->recopy) == 0)
+    {
+        printf("The damaged files are listed in the backup as %s. To repair "
+               "them, update this backup from the system it was taken from, "
+               "with the options it was taken with: the update copies them "
+               "again and then removes the list.\n", CONTAINER_RECOPY_NAME);
+        return;
+    }
+    print_warning("Warning: could not list the damaged files in the backup: "
+                  "%s. An update does not copy them again; take a new backup "
+                  "instead.\n",
+                  strerror(run->recopy_errno != 0 ? run->recopy_errno
+                                                  : errno));
+}
+
 // Opens a finished container and reads its manifest, with a printed reason
 // when it is not one.
 static int finished_container_open(const char *path, Manifest *manifest,
@@ -506,6 +547,23 @@ static ssize_t read_full(int fd, unsigned char *buffer, size_t size)
     return (ssize_t)total;
 }
 
+// A file found damaged: noted, and listed for the next update.
+static void native_damaged(VerifyRun *run, const char *relative,
+                           const char *format, ...)
+    __attribute__((format(printf, 3, 4)));
+
+static void native_damaged(VerifyRun *run, const char *relative,
+                           const char *format, ...)
+{
+    verify_recopy(run, run->root_payload, relative, strlen(relative));
+    char reason[160];
+    va_list arguments;
+    va_start(arguments, format);
+    (void)vsnprintf(reason, sizeof(reason), format, arguments);
+    va_end(arguments);
+    native_record(run, relative, "%s", reason);
+}
+
 static void native_compare_file(VerifyRun *run, int parent_fd,
                                 const char *leaf, const struct stat *backup,
                                 const char *source, const char *relative)
@@ -523,17 +581,18 @@ static void native_compare_file(VerifyRun *run, int parent_fd,
     }
     if (before.st_size != backup->st_size)
     {
-        native_record(run, relative, "size is %jd bytes, the source has %jd",
-                      (intmax_t)backup->st_size, (intmax_t)before.st_size);
+        native_damaged(run, relative, "size is %jd bytes, the source has %jd",
+                       (intmax_t)backup->st_size, (intmax_t)before.st_size);
         run->bytes_read += (uint64_t)backup->st_size;
         return;
     }
     int backup_fd = open_payload_node(parent_fd, leaf, O_RDONLY);
     if (backup_fd < 0)
     {
-        native_record(run, relative, "could not be read: %s",
-                      strerror(errno));
+        int saved = errno;
         close(source_fd);
+        native_damaged(run, relative, "could not be read: %s",
+                       strerror(saved));
         return;
     }
     static unsigned char ours[65536], theirs[65536];
@@ -568,12 +627,12 @@ static void native_compare_file(VerifyRun *run, int parent_fd,
     close(backup_fd);
     close(source_fd);
     if (backup_error != 0)
-        native_record(run, relative, "could not be read: %s",
-                      strerror(backup_error));
+        native_damaged(run, relative, "could not be read: %s",
+                       strerror(backup_error));
     else if (changed)
         run->unchecked++;
     else if (differs)
-        native_record(run, relative, "content differs from the source");
+        native_damaged(run, relative, "content differs from the source");
     else
         run->compared++;
 }
@@ -732,6 +791,7 @@ static void native_walk_roots(VerifyRun *run, const Manifest *manifest)
         const ManifestRoot *root = &manifest->roots[index];
         char source[PATH_MAX], relative[PATH_MAX] = "";
         run->root_id = root->id;
+        run->root_payload = root->payload_path;
         if (native_root_source(manifest, index, source) != 0)
         {
             if (!run->counting)
@@ -808,6 +868,8 @@ static int verify_native(const char *path, const Manifest *manifest,
     printf("Verification found %zu item%s that differ%s from the source:\n",
            failed, failed == 1 ? "" : "s", failed == 1 ? "s" : "");
     example_list_print(&run.failed, "  ");
+    verify_save_recopy(&run, container_fd);
+    recopy_list_free(&run.recopy);
     return MIGR_EXIT_CHANGED;
 }
 
@@ -958,8 +1020,10 @@ int verify_backup(const char *path)
            "captured:\n", failed, failed == 1 ? "" : "s",
            failed == 1 ? "s" : "");
     example_list_print(&run.failed, "  ");
+    verify_save_recopy(&run, container_fd);
 
 done:
+    recopy_list_free(&run.recopy);
     verify_parent_forget(&run);
     free(run.items);
     restore_address_index_free(&run.memory, &run.address_index);

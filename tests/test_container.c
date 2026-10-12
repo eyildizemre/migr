@@ -1580,6 +1580,43 @@ static void test_resume_identity_compare_ignores_root_order(void)
           "NULL b is handled without crashing");
 }
 
+// The list of files to copy again survives a write and a read, is found by
+// root and path, and a torn one is refused (D107).
+static void test_recopy_list_round_trip(void)
+{
+    printf(BLUE "::" NC " container: the list of files to copy again round-trips\n");
+    fresh_test_root();
+    int root_fd = open(test_root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+
+    RecopyList written = {0};
+    RecopyList read_back = {0};
+    check(root_fd >= 0 &&
+              recopy_list_add(&written, "home/docs", "b/file", 6) == 0 &&
+              recopy_list_add(&written, "EXPLICIT_0", "a.txt and more", 5) == 0 &&
+              recopy_list_write(root_fd, &written) == 0 &&
+              recopy_list_read(root_fd, &read_back) == 0 &&
+              read_back.count == 2,
+          "a written list reads back with every item");
+    check(recopy_list_contains(&read_back, "home/docs", "b/file") &&
+              recopy_list_contains(&read_back, "EXPLICIT_0", "a.txt") &&
+              !recopy_list_contains(&read_back, "home/docs", "a.txt") &&
+              !recopy_list_contains(NULL, "home/docs", "b/file"),
+          "an item is found by its root and path, and only that item");
+    recopy_list_free(&read_back);
+
+    int fd = openat(root_fd, CONTAINER_RECOPY_NAME, O_WRONLY | O_TRUNC);
+    check(fd >= 0 && write(fd, "root\0path", 9) == 9 && close(fd) == 0 &&
+              recopy_list_read(root_fd, &read_back) == -1 && errno == EINVAL,
+          "a list cut short is refused");
+    check(recopy_list_remove(root_fd) == 0 &&
+              recopy_list_read(root_fd, &read_back) == 0 &&
+              read_back.count == 0 && recopy_list_remove(root_fd) == 0,
+          "a removed list reads as empty, and removing it again is fine");
+    recopy_list_free(&written);
+    if (root_fd >= 0)
+        close(root_fd);
+}
+
 int main(void)
 {
     printf(BLUE "::" NC " container (unit)\n");
@@ -1628,6 +1665,7 @@ int main(void)
 
     test_manifest_read_v1_at_rejects_non_regular();
     test_resume_identity_compare_ignores_root_order();
+    test_recopy_list_round_trip();
 
     clean_test_root();
 

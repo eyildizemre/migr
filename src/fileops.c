@@ -18,6 +18,7 @@
 #include <stdint.h>
 
 #include "fileops.h"
+#include "container.h"
 #include "selection.h"
 #include "hash.h"
 #include "metadata.h"
@@ -1632,9 +1633,12 @@ static BackupCaptureStatus capture_hardlink_at(
     return BACKUP_CAPTURE_OK;
 }
 
+// recopy: verify found the copy damaged, so it is written again even if it
+// looks unchanged (docs/DECISIONS.md D107).
 static BackupCaptureStatus capture_regular_at(
     const CloneContext *ctx, const char *src, int dest_dir_fd,
-    const char *leaf, const struct stat *st, BackupCaptureReport *report)
+    const char *leaf, const struct stat *st, int recopy,
+    BackupCaptureReport *report)
 {
     MetadataTimestampPolicy policy = metadata_policy_from_context(ctx);
 #ifdef BACKUP_TEST_HOOKS
@@ -1710,7 +1714,7 @@ static BackupCaptureStatus capture_regular_at(
         // copy that shares its inode with other names, unless it matches a
         // source that is a hardlink too: writing it in place would write them
         // as well.
-        int resumable = S_ISREG(dest_st.st_mode) &&
+        int resumable = S_ISREG(dest_st.st_mode) && !recopy &&
             dest_st.st_size == source_snapshot.st_size &&
             dest_st.st_mtim.tv_sec == source_snapshot.st_mtim.tv_sec &&
             policy.nsec_exact &&
@@ -2173,7 +2177,9 @@ static BackupCaptureStatus capture_entry_at(const CloneContext *ctx,
         status = capture_symlink_at(src, dest_dir_fd, leaf, &st, policy,
                                     report);
     else if (S_ISREG(st.st_mode))
-        status = capture_regular_at(ctx, src, dest_dir_fd, leaf, &st, report);
+        status = capture_regular_at(
+            ctx, src, dest_dir_fd, leaf, &st,
+            recopy_list_contains(ctx->recopy, root_key, rel_path), report);
     else if (S_ISDIR(st.st_mode))
         status = capture_directory_at(ctx, src, dest_dir_fd, leaf, &st,
                                       root_key, rel_path, report);

@@ -256,6 +256,8 @@ Verifying 31 items (8.0M) in /mnt/usb/migr-eyildizemre
 ```
 
 A file that went missing or changed is listed, and verify exits with status 1.
+Verify also notes the damaged files in the backup, and the next update of the
+backup copies them again.
 
 A backup on exFAT, FAT32, or NTFS records what it captured, and verify checks
 it against that record, on any system. A backup on a Linux filesystem is a

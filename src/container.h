@@ -1,6 +1,7 @@
 #ifndef CONTAINER_H
 #define CONTAINER_H
 
+#include <stddef.h> /* size_t */
 #include <time.h> /* time_t */
 
 #include "manifest.h" /* Manifest */
@@ -342,6 +343,47 @@ int container_name_is_partial(const char *name);
  *         otherwise (including a NULL name).
  */
 int container_name_is_final(const char *name);
+
+/*
+ * The items `migr verify` found damaged, which the next update copies again
+ * although their source is unchanged (docs/DECISIONS.md D107). The file
+ * holds pairs of NUL-terminated strings: the item's root (its payload path
+ * in a native backup, its id in a portable one) and its path in that root.
+ */
+#define CONTAINER_RECOPY_NAME "recopy.list"
+
+typedef struct {
+    const char *root;
+    const char *path;
+} RecopyItem;
+
+typedef struct RecopyList {
+    char *data;
+    size_t length;
+    size_t capacity;
+    RecopyItem *items; /* Sorted, once read. */
+    size_t count;
+} RecopyList;
+
+/* Adds an item; path need not be NUL-terminated. 0, or -1 with errno. */
+int recopy_list_add(RecopyList *list, const char *root, const char *path,
+                    size_t path_length);
+
+/* Writes the list into the container, replacing any earlier one. 0, or -1
+ * with errno. */
+int recopy_list_write(int container_fd, const RecopyList *list);
+
+/* Reads the container's list; none is an empty list. 0, or -1 with errno
+ * (EINVAL for a malformed list). */
+int recopy_list_read(int container_fd, RecopyList *list);
+
+int recopy_list_contains(const RecopyList *list, const char *root,
+                         const char *path);
+
+/* Removes the container's list; none is not an error. 0, or -1 with errno. */
+int recopy_list_remove(int container_fd);
+
+void recopy_list_free(RecopyList *list);
 
 #ifdef CONTAINER_TEST_HOOKS
 /**
