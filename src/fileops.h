@@ -80,8 +80,12 @@ void native_inode_map_test_reset_probe_count(void);
 size_t native_inode_map_test_dir_fd_count(const void *map);
 #endif
 
+/* The first entry that could not be removed: its path below the root, what
+ * was being done (a fixed phrase), and errno, 0 when the phrase says why. */
 typedef struct {
     char failed_relative_path[PATH_MAX];
+    const char *failed_operation;
+    int failure_errno;
 } NativeReconcileReport;
 
 void native_reconcile_report_init(NativeReconcileReport *report);
@@ -205,13 +209,16 @@ typedef enum {
  * already in the backup and did not copy.
  * bytes_since_sync accumulates the same content bytes until the configured
  * periodic-sync interval is reached; an interval of zero disables syncing.
- * The failure fields are populated by portable capture; native capture keeps
- * using failed_source_path for its source-safe-read refusal contract.
+ * The failure fields keep the first item that failed: its path, the kind,
+ * errno (0 when failed_operation says why), and, for native capture, what was
+ * being done. A native source-safe-read refusal sets only
+ * failed_source_path.
  */
 typedef struct {
     char failed_source_path[PATH_MAX];
     BackupCaptureFailureKind failure_kind;
     int failure_errno;
+    const char *failed_operation;
     off_t bytes_copied;
     off_t bytes_unchanged;
     char current_path[PATH_MAX];
@@ -344,7 +351,11 @@ typedef struct {
     size_t applied_count;
     size_t failed_count;
     size_t skipped_security_xattr_count;
+    /* The first item that failed, below the restore root: what was being
+     * done (a fixed phrase) and errno, 0 when the phrase says why. */
     char failed_logical_path[PATH_MAX];
+    const char *failed_operation;
+    int failure_errno;
 } RestoreNativeReport;
 
 /**

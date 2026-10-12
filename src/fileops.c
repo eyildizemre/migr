@@ -88,6 +88,20 @@ static void capture_report_source_refusal(BackupCaptureReport *report,
                    sizeof(report->failed_source_path), "%s", source_path);
 }
 
+// Keeps the first item a native capture could not handle, what was being
+// done, and err, 0 when operation says why on its own. Called before any
+// cleanup that could change errno.
+static void capture_fail(BackupCaptureReport *report, const char *source_path,
+                         const char *operation, int err)
+{
+    if (report == NULL || report->failed_source_path[0] != '\0')
+        return;
+    capture_report_source_refusal(report, source_path);
+    report->failure_kind = BACKUP_CAPTURE_FAILURE_OPERATIONAL;
+    report->failure_errno = err;
+    report->failed_operation = operation;
+}
+
 #ifdef BACKUP_TEST_HOOKS
 static BackupTestCaptureHook backup_test_capture_hook;
 static void *backup_test_capture_context;
@@ -1251,58 +1265,91 @@ static int capture_symlink_at(const char *src, int dest_dir_fd, const char *leaf
         return BACKUP_CAPTURE_SKIPPED;
     }
     if (len < 0 || (size_t)len >= sizeof(link_target))
+    {
+        capture_fail(report, src, "read the link",
+                     len < 0 ? errno : ENAMETOOLONG);
         return -1;
+    }
     link_target[len] = '\0';
 
     if (symlinkat(link_target, dest_dir_fd, leaf) != 0)
     {
         if (errno != EEXIST)
+        {
+            capture_fail(report, src, "create the link in the backup", errno);
             return -1;
+        }
 
         struct stat dest_st;
-        if (fstatat(dest_dir_fd, leaf, &dest_st, AT_SYMLINK_NOFOLLOW) != 0 ||
-            !S_ISLNK(dest_st.st_mode))
+        if (fstatat(dest_dir_fd, leaf, &dest_st, AT_SYMLINK_NOFOLLOW) != 0)
+        {
+            capture_fail(report, src, "inspect what the backup holds there",
+                         errno);
             return -1;
+        }
+        if (!S_ISLNK(dest_st.st_mode))
+        {
+            capture_fail(report, src,
+                         "the backup holds another kind of item there", 0);
+            return -1;
+        }
 
         char existing[PATH_MAX];
         ssize_t existing_len = readlinkat(dest_dir_fd, leaf, existing, sizeof(existing));
         if (existing_len < 0 || (size_t)existing_len >= sizeof(existing))
+        {
+            capture_fail(report, src, "read the link in the backup",
+                         existing_len < 0 ? errno : ENAMETOOLONG);
             return -1;
+        }
         existing[existing_len] = '\0';
 
         if (strcmp(existing, link_target) != 0)
+        {
+            capture_fail(report, src,
+                         "the backup holds a link with another target there",
+                         0);
             return -1;
+        }
     }
 
     PortableXattrs xattrs = {0};
-    int failed = metadata_apply_symlink_ownership_at(dest_dir_fd, leaf, st);
-    if (!failed && collect_symlink_xattrs(src, &xattrs) != 0)
-        failed = 1;
-
-    // A symlink retargeted meanwhile keeps the target read (D63).
+    const char *operation = NULL;
     struct stat after;
-    if (!failed && lstat(src, &after) != 0)
-        failed = 1;
-    else if (!failed && !metadata_symlink_unchanged(st, &after))
-        backup_capture_report_note_change(report, BACKUP_SOURCE_CHANGED, src);
-    if (!failed && metadata_apply_xattrs_symlink_at(dest_dir_fd, leaf,
-                                                    xattrs.items,
-                                                    xattrs.count) != 0)
-        failed = 1;
-    if (!failed && metadata_apply_symlink_times_at(dest_dir_fd, leaf, st,
-                                                   policy) != 0)
-        failed = 1;
+    if (metadata_apply_symlink_ownership_at(dest_dir_fd, leaf, st) != 0)
+        operation = "set the owner of its copy";
+    else if (collect_symlink_xattrs(src, &xattrs) != 0)
+        operation = "read its extended attributes";
+    else if (lstat(src, &after) != 0)
+        operation = "inspect it again after reading";
+    else
+    {
+        // A symlink retargeted meanwhile keeps the target read (D63).
+        if (!metadata_symlink_unchanged(st, &after))
+            backup_capture_report_note_change(report, BACKUP_SOURCE_CHANGED,
+                                              src);
+        if (metadata_apply_xattrs_symlink_at(dest_dir_fd, leaf, xattrs.items,
+                                             xattrs.count) != 0)
+            operation = "set the extended attributes of its copy";
+        else if (metadata_apply_symlink_times_at(dest_dir_fd, leaf, st,
+                                                 policy) != 0)
+            operation = "set the times of its copy";
+    }
+    if (operation != NULL)
+        capture_fail(report, src, operation, errno);
     xattrs_free(&xattrs);
-    return failed ? -1 : 0;
+    return operation != NULL ? -1 : 0;
 }
 
 // A write() that reports zero bytes for a non-zero request has made no
 // progress and never will on a retry, so it is treated as the failure it is
 // rather than spun on forever.
 // copied_out != NULL accepts whatever length the source has when read and
-// reports it; otherwise a length other than expected_size is EIO.
+// reports it; otherwise a length other than expected_size fails with errno
+// 0. *failed_step names the step that failed.
 static int copy_file_contents(int src_fd, int dest_fd, off_t expected_size,
-                              BackupCaptureReport *report, off_t *copied_out)
+                              BackupCaptureReport *report, off_t *copied_out,
+                              const char **failed_step)
 {
     char buffer[8192];
     off_t copied = 0;
@@ -1312,15 +1359,24 @@ static int copy_file_contents(int src_fd, int dest_fd, off_t expected_size,
         if (bytes_read < 0 && errno == EINTR)
             continue;
         if (bytes_read < 0)
+        {
+            *failed_step = "read the content";
             return -1;
+        }
         if (bytes_read == 0)
             break;
 
         if (write_all(dest_fd, buffer, (size_t)bytes_read) != 0)
+        {
+            *failed_step = "write the content";
             return -1;
+        }
         copied += bytes_read;
         if (backup_capture_report_tick(report, bytes_read, dest_fd) != 0)
+        {
+            *failed_step = "flush the written content to disk";
             return -1;
+        }
     }
     if (copied_out != NULL)
     {
@@ -1329,7 +1385,8 @@ static int copy_file_contents(int src_fd, int dest_fd, off_t expected_size,
     }
     if (expected_size < 0 || copied != expected_size)
     {
-        errno = EIO;
+        *failed_step = "the content's length differs from the recorded size";
+        errno = 0;
         return -1;
     }
     return 0;
@@ -1338,46 +1395,55 @@ static int copy_file_contents(int src_fd, int dest_fd, off_t expected_size,
 // A source that changed since desired was taken fails the tail, unless
 // source_changed is given: a live backup source (D63) then only sets it.
 // desired is the source object as snapshotted; owner_map (NULL for none)
-// gives the backup user's items to the restoring user (D85).
+// gives the backup user's items to the restoring user (D85). *failed_step
+// names the step that failed; errno is 0 when the step says why.
 static int apply_fd_metadata_tail(int destination_fd,
                                   const struct stat *desired,
                                   const OwnerMap *owner_map,
                                   int source_fd,
                                   MetadataTimestampPolicy policy,
                                   size_t *out_skipped_security,
-                                  int *source_changed)
+                                  int *source_changed,
+                                  const char **failed_step)
 {
     struct stat target = *desired;
     metadata_owner_map_apply(owner_map, &target);
     PortableXattrs xattrs = {0};
-    int failed = metadata_apply_ownership_and_mode_fd(destination_fd,
-                                                       &target) != 0;
-    if (!failed && collect_xattrs(source_fd, &xattrs) != 0)
-        failed = 1;
+    const char *step = NULL;
     struct stat after;
-    if (!failed && fstat(source_fd, &after) != 0)
-        failed = 1;
-    else if (!failed && !metadata_source_unchanged(desired, &after))
+    if (metadata_apply_ownership_and_mode_fd(destination_fd, &target) != 0)
+        step = "set the owner and permissions";
+    else if (collect_xattrs(source_fd, &xattrs) != 0)
+        step = "read the extended attributes";
+    else if (fstat(source_fd, &after) != 0)
+        step = "inspect it again after reading";
+    else if (!metadata_source_unchanged(desired, &after) &&
+             source_changed == NULL)
     {
-        if (source_changed != NULL)
-            *source_changed = 1;
-        else
-            failed = 1;
+        step = "it changed while it was read";
+        errno = 0;
     }
-    if (!failed)
+    else
     {
+        if (!metadata_source_unchanged(desired, &after))
+            *source_changed = 1;
         size_t skipped_security = 0;
         int xattr_result = metadata_apply_xattrs_fd_report(
             destination_fd, xattrs.items, xattrs.count, &skipped_security);
         if (out_skipped_security != NULL)
             *out_skipped_security = skipped_security;
         if (xattr_result != 0)
-            failed = 1;
+            step = "set the extended attributes";
+        else if (metadata_apply_times_fd(destination_fd, &target, policy) != 0)
+            step = "set the times";
     }
-    if (!failed && metadata_apply_times_fd(destination_fd, &target, policy) != 0)
-        failed = 1;
+    int saved_errno = errno;
     xattrs_free(&xattrs);
-    return failed ? -1 : 0;
+    errno = saved_errno;
+    if (step == NULL)
+        return 0;
+    *failed_step = step;
+    return -1;
 }
 
 static BackupCaptureStatus capture_hardlink_at(
@@ -1391,6 +1457,7 @@ static BackupCaptureStatus capture_hardlink_at(
         !destination_leaf_is_safe(leaf) ||
         !destination_leaf_is_safe(representative_leaf))
     {
+        capture_fail(report, src, "its name cannot be used in the backup", 0);
         close(src_fd);
         return BACKUP_CAPTURE_ERROR;
     }
@@ -1398,14 +1465,19 @@ static BackupCaptureStatus capture_hardlink_at(
     // The link shares its representative's captured content; a change to the
     // source meanwhile is only reported (D63).
     struct stat source_after;
-    int source_failed = fstat(src_fd, &source_after) != 0;
-    if (!source_failed &&
-        !metadata_source_unchanged(source_snapshot, &source_after))
+    if (fstat(src_fd, &source_after) != 0)
+    {
+        capture_fail(report, src, "inspect it", errno);
+        close(src_fd);
+        return BACKUP_CAPTURE_ERROR;
+    }
+    if (!metadata_source_unchanged(source_snapshot, &source_after))
         backup_capture_report_note_change(report, BACKUP_SOURCE_CHANGED, src);
     if (close(src_fd) != 0)
-        source_failed = 1;
-    if (source_failed)
+    {
+        capture_fail(report, src, "close it", errno);
         return BACKUP_CAPTURE_ERROR;
+    }
 
     // The map records the destination representative, not the source inode:
     // a copied source and its payload necessarily have different identities.
@@ -1413,28 +1485,53 @@ static BackupCaptureStatus capture_hardlink_at(
     // both resume validation and the post-link identity check.
     struct stat representative;
     if (fstatat(representative_parent_fd, representative_leaf,
-                &representative, AT_SYMLINK_NOFOLLOW) != 0 ||
-        !S_ISREG(representative.st_mode))
+                &representative, AT_SYMLINK_NOFOLLOW) != 0)
+    {
+        capture_fail(report, src,
+                     "inspect the copy it shares with its other names", errno);
         return BACKUP_CAPTURE_ERROR;
+    }
+    if (!S_ISREG(representative.st_mode))
+    {
+        capture_fail(report, src,
+                     "the copy it shares with its other names is not a file",
+                     0);
+        return BACKUP_CAPTURE_ERROR;
+    }
 
     struct stat existing;
     if (fstatat(dest_dir_fd, leaf, &existing, AT_SYMLINK_NOFOLLOW) == 0)
     {
         if (native_hardlink_identity_matches(&existing, &representative))
             return BACKUP_CAPTURE_OK;
+        capture_fail(report, src, "the backup holds another item there", 0);
         return BACKUP_CAPTURE_ERROR;
     }
     if (errno != ENOENT)
+    {
+        capture_fail(report, src, "inspect what the backup holds there", errno);
         return BACKUP_CAPTURE_ERROR;
+    }
 
     if (linkat(representative_parent_fd, representative_leaf, dest_dir_fd,
                leaf, 0) != 0)
+    {
+        capture_fail(report, src, "link it to its other names in the backup",
+                     errno);
         return BACKUP_CAPTURE_ERROR;
+    }
 
     struct stat linked;
-    if (fstatat(dest_dir_fd, leaf, &linked, AT_SYMLINK_NOFOLLOW) != 0 ||
-        !native_hardlink_identity_matches(&linked, &representative))
+    if (fstatat(dest_dir_fd, leaf, &linked, AT_SYMLINK_NOFOLLOW) != 0)
     {
+        capture_fail(report, src, "inspect its link in the backup", errno);
+        return BACKUP_CAPTURE_ERROR;
+    }
+    if (!native_hardlink_identity_matches(&linked, &representative))
+    {
+        capture_fail(report, src,
+                     "its link in the backup does not lead to the shared copy",
+                     0);
         errno = EIO;
         return BACKUP_CAPTURE_ERROR;
     }
@@ -1466,6 +1563,7 @@ static BackupCaptureStatus capture_regular_at(
                                         : BACKUP_SOURCE_CHANGED, src);
             return BACKUP_CAPTURE_SKIPPED;
         }
+        capture_fail(report, src, "open it", errno);
         return BACKUP_CAPTURE_ERROR;
     }
 
@@ -1475,6 +1573,7 @@ static BackupCaptureStatus capture_regular_at(
     struct stat source_snapshot;
     if (fstat(src_fd, &source_snapshot) != 0)
     {
+        capture_fail(report, src, "inspect it", errno);
         close(src_fd);
         return BACKUP_CAPTURE_ERROR;
     }
@@ -1497,6 +1596,7 @@ static BackupCaptureStatus capture_regular_at(
                                           sizeof(representative_leaf));
         if (found < 0)
         {
+            capture_fail(report, src, "look up its other names", errno);
             close(src_fd);
             return BACKUP_CAPTURE_ERROR;
         }
@@ -1507,6 +1607,7 @@ static BackupCaptureStatus capture_regular_at(
                                        &source_snapshot, src, report);
     }
 
+    const char *step = NULL;
     struct stat dest_st;
     if (fstatat(dest_dir_fd, leaf, &dest_st, AT_SYMLINK_NOFOLLOW) == 0)
     {
@@ -1514,6 +1615,8 @@ static BackupCaptureStatus capture_regular_at(
         // the same address is a collision, never something to truncate.
         if (!S_ISREG(dest_st.st_mode))
         {
+            capture_fail(report, src,
+                         "the backup holds another kind of item there", 0);
             close(src_fd);
             return BACKUP_CAPTURE_ERROR;
         }
@@ -1526,25 +1629,39 @@ static BackupCaptureStatus capture_regular_at(
                                  O_WRONLY | O_NOFOLLOW | O_CLOEXEC);
             if (dest_fd < 0)
             {
+                capture_fail(report, src, "open its copy in the backup", errno);
                 close(src_fd);
                 return BACKUP_CAPTURE_ERROR;
             }
             struct stat opened_dest;
-            int failed = fstat(dest_fd, &opened_dest) != 0 ||
-                         !S_ISREG(opened_dest.st_mode);
             int tail_changed = 0;
-            if (!failed &&
-                apply_fd_metadata_tail(dest_fd, &source_snapshot, NULL,
-                                       src_fd, policy, NULL,
-                                       &tail_changed) != 0)
-                failed = 1;
+            int failed = 1;
+            if (fstat(dest_fd, &opened_dest) != 0)
+                capture_fail(report, src, "inspect its copy in the backup",
+                             errno);
+            else if (!S_ISREG(opened_dest.st_mode))
+                capture_fail(report, src,
+                             "the backup holds another kind of item there", 0);
+            else if (apply_fd_metadata_tail(dest_fd, &source_snapshot, NULL,
+                                            src_fd, policy, NULL,
+                                            &tail_changed, &step) != 0)
+                capture_fail(report, src, step, errno);
+            else
+                failed = 0;
             if (!failed && tail_changed)
                 backup_capture_report_note_change(
                     report, BACKUP_SOURCE_CHANGED, src);
             if (close(dest_fd) != 0)
+            {
+                capture_fail(report, src, "close its copy in the backup",
+                             errno);
                 failed = 1;
+            }
             if (close(src_fd) != 0)
+            {
+                capture_fail(report, src, "close it", errno);
                 failed = 1;
+            }
             if (failed)
                 return BACKUP_CAPTURE_ERROR;
             backup_capture_report_unchanged(report, source_snapshot.st_size,
@@ -1554,16 +1671,19 @@ static BackupCaptureStatus capture_regular_at(
                                         source_snapshot.st_dev,
                                         source_snapshot.st_ino,
                                         dest_dir_fd, leaf) != 0)
+            {
+                capture_fail(report, src, "record its other names", errno);
                 return BACKUP_CAPTURE_ERROR;
+            }
             return BACKUP_CAPTURE_OK;
         }
     }
     else if (errno != ENOENT)
     {
+        capture_fail(report, src, "inspect what the backup holds there", errno);
         close(src_fd);
         return BACKUP_CAPTURE_ERROR;
     }
-
     // O_NOFOLLOW makes a symlink planted at this address fail the open with
     // ELOOP instead of being written through; O_TRUNC can therefore only ever
     // apply to the regular file the check above already accepted.
@@ -1572,6 +1692,7 @@ static BackupCaptureStatus capture_regular_at(
                          source_snapshot.st_mode & 07777);
     if (dest_fd < 0)
     {
+        capture_fail(report, src, "create its copy in the backup", errno);
         close(src_fd);
         return BACKUP_CAPTURE_ERROR;
     }
@@ -1588,10 +1709,17 @@ static BackupCaptureStatus capture_regular_at(
     {
         backup_capture_report_reread(report, copied);
         copied = 0;
-        if (lseek(src_fd, 0, SEEK_SET) != 0 || ftruncate(dest_fd, 0) != 0 ||
-            lseek(dest_fd, 0, SEEK_SET) != 0 ||
-            copy_file_contents(src_fd, dest_fd, 0, report, &copied) != 0)
+        if (lseek(src_fd, 0, SEEK_SET) != 0)
+            step = "go back to its start";
+        else if (ftruncate(dest_fd, 0) != 0 ||
+                 lseek(dest_fd, 0, SEEK_SET) != 0)
+            step = "empty its copy in the backup";
+        else
+            (void)copy_file_contents(src_fd, dest_fd, 0, report, &copied,
+                                     &step);
+        if (step != NULL)
         {
+            capture_fail(report, src, step, errno);
             failed = 1;
             break;
         }
@@ -1599,6 +1727,7 @@ static BackupCaptureStatus capture_regular_at(
         struct stat after;
         if (fstat(src_fd, &after) != 0)
         {
+            capture_fail(report, src, "inspect it again after reading", errno);
             failed = 1;
             break;
         }
@@ -1607,6 +1736,8 @@ static BackupCaptureStatus capture_regular_at(
         int unchanged = metadata_source_unchanged(&source_snapshot, &after);
         if (unchanged && copied != after.st_size)
         {
+            capture_fail(report, src,
+                         "fewer or more bytes were read than its size", 0);
             errno = EIO;
             failed = 1;
             break;
@@ -1629,8 +1760,11 @@ static BackupCaptureStatus capture_regular_at(
     }
     if (!failed &&
         apply_fd_metadata_tail(dest_fd, &source_snapshot, NULL, src_fd,
-                               policy, NULL, &changed) != 0)
+                               policy, NULL, &changed, &step) != 0)
+    {
+        capture_fail(report, src, step, errno);
         failed = 1;
+    }
     if (!failed && changed)
         backup_capture_report_note_change(report, BACKUP_SOURCE_CHANGED, src);
 
@@ -1638,15 +1772,25 @@ static BackupCaptureStatus capture_regular_at(
     // can surface only here, so a failed close means the payload is not
     // actually complete and must be reported as such.
     if (close(dest_fd) != 0)
+    {
+        capture_fail(report, src, "finish writing its copy in the backup",
+                     errno);
         failed = 1;
+    }
     if (close(src_fd) != 0)
+    {
+        capture_fail(report, src, "close it", errno);
         failed = 1;
+    }
     if (failed)
         return BACKUP_CAPTURE_ERROR;
     if (ctx->inode_map != NULL && source_snapshot.st_nlink > 1 &&
         native_inode_map_insert(ctx->inode_map, source_snapshot.st_dev,
                                 source_snapshot.st_ino, dest_dir_fd, leaf) != 0)
+    {
+        capture_fail(report, src, "record its other names", errno);
         return BACKUP_CAPTURE_ERROR;
+    }
     return BACKUP_CAPTURE_OK;
 }
 
@@ -1683,19 +1827,24 @@ static BackupCaptureStatus capture_directory_at(
                                         : BACKUP_SOURCE_CHANGED, src);
             return BACKUP_CAPTURE_SKIPPED;
         }
+        capture_fail(report, src, "open the folder", errno);
         return BACKUP_CAPTURE_ERROR;
     }
     (void)st;
     struct stat source_snapshot;
-    if (fstat(source_fd, &source_snapshot) != 0 ||
-        !S_ISDIR(source_snapshot.st_mode))
+    int inspect_errno = fstat(source_fd, &source_snapshot) != 0 ? errno
+        : S_ISDIR(source_snapshot.st_mode)                       ? 0
+                                                                 : ENOTDIR;
+    if (inspect_errno != 0)
     {
+        capture_fail(report, src, "inspect the folder", inspect_errno);
         close(source_fd);
         return BACKUP_CAPTURE_ERROR;
     }
 
     if (mkdirat(dest_dir_fd, leaf, 0700) != 0 && errno != EEXIST)
     {
+        capture_fail(report, src, "create the folder in the backup", errno);
         close(source_fd);
         return BACKUP_CAPTURE_ERROR;
     }
@@ -1707,6 +1856,11 @@ static BackupCaptureStatus capture_directory_at(
                           O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (child_fd < 0)
     {
+        capture_fail(report, src,
+                     errno == ENOTDIR || errno == ELOOP
+                         ? "the backup holds another kind of item there"
+                         : "open the folder in the backup",
+                     errno == ENOTDIR || errno == ELOOP ? 0 : errno);
         close(source_fd);
         return BACKUP_CAPTURE_ERROR;
     }
@@ -1715,6 +1869,7 @@ static BackupCaptureStatus capture_directory_at(
     DIR *dir = scan_fd < 0 ? NULL : fdopendir(scan_fd);
     if (dir == NULL)
     {
+        capture_fail(report, src, "list the folder", errno);
         if (scan_fd >= 0)
             close(scan_fd);
         close(source_fd);
@@ -1735,7 +1890,10 @@ static BackupCaptureStatus capture_directory_at(
         if (entry == NULL)
         {
             if (errno != 0)
+            {
+                capture_fail(report, src, "list the folder", errno);
                 result = BACKUP_CAPTURE_ERROR;
+            }
             break;
         }
 
@@ -1745,15 +1903,13 @@ static BackupCaptureStatus capture_directory_at(
         // Only the source path grows as we descend; refuse rather than act on
         // a truncated one. The destination never concatenates at all.
         char child_src[PATH_MAX];
-        if (path_join(child_src, sizeof(child_src), src, entry->d_name) != 0)
-        {
-            result = BACKUP_CAPTURE_ERROR;
-            break;
-        }
         char child_rel[PATH_MAX];
-        if (append_relative(child_rel, sizeof(child_rel), rel_path,
+        if (path_join(child_src, sizeof(child_src), src, entry->d_name) != 0 ||
+            append_relative(child_rel, sizeof(child_rel), rel_path,
                             entry->d_name) != 0)
         {
+            capture_fail(report, src, "name an item in the folder",
+                         ENAMETOOLONG);
             result = BACKUP_CAPTURE_ERROR;
             break;
         }
@@ -1769,24 +1925,31 @@ static BackupCaptureStatus capture_directory_at(
 
     if (closedir(dir) != 0)
     {
+        capture_fail(report, src, "list the folder", errno);
         if (result == BACKUP_CAPTURE_OK)
             result = BACKUP_CAPTURE_ERROR;
     }
     int directory_changed = 0;
+    const char *step = NULL;
     if (result == BACKUP_CAPTURE_OK &&
         apply_fd_metadata_tail(child_fd, &source_snapshot, NULL, source_fd,
                                metadata_policy_from_context(ctx), NULL,
-                               &directory_changed) != 0)
+                               &directory_changed, &step) != 0)
+    {
+        capture_fail(report, src, step, errno);
         result = BACKUP_CAPTURE_ERROR;
+    }
     if (result == BACKUP_CAPTURE_OK && directory_changed)
         backup_capture_report_note_change(report, BACKUP_SOURCE_CHANGED, src);
     if (close(source_fd) != 0)
     {
+        capture_fail(report, src, "close the folder", errno);
         if (result == BACKUP_CAPTURE_OK)
             result = BACKUP_CAPTURE_ERROR;
     }
     if (close(child_fd) != 0)
     {
+        capture_fail(report, src, "close the folder in the backup", errno);
         if (result == BACKUP_CAPTURE_OK)
             result = BACKUP_CAPTURE_ERROR;
     }
@@ -1796,16 +1959,30 @@ static BackupCaptureStatus capture_directory_at(
 // Recreate the node itself, never its contents: reading a FIFO blocks until a
 // writer appears, which would hang the whole backup. An existing FIFO at this
 // address is accepted so an interrupted backup can resume past it.
-static int capture_fifo_at(const CloneContext *ctx, int dest_dir_fd,
-                           const char *leaf, const struct stat *st)
+static int capture_fifo_at(const CloneContext *ctx, const char *src,
+                           int dest_dir_fd, const char *leaf,
+                           const struct stat *st, BackupCaptureReport *report)
 {
     if (mkfifoat(dest_dir_fd, leaf, st->st_mode & 07777) != 0)
     {
-        struct stat dest_st;
-        if (errno != EEXIST ||
-            fstatat(dest_dir_fd, leaf, &dest_st, AT_SYMLINK_NOFOLLOW) != 0 ||
-            !S_ISFIFO(dest_st.st_mode))
+        if (errno != EEXIST)
+        {
+            capture_fail(report, src, "create the FIFO in the backup", errno);
             return -1;
+        }
+        struct stat dest_st;
+        if (fstatat(dest_dir_fd, leaf, &dest_st, AT_SYMLINK_NOFOLLOW) != 0)
+        {
+            capture_fail(report, src, "inspect what the backup holds there",
+                         errno);
+            return -1;
+        }
+        if (!S_ISFIFO(dest_st.st_mode))
+        {
+            capture_fail(report, src,
+                         "the backup holds another kind of item there", 0);
+            return -1;
+        }
     }
 
     // O_RDONLY | O_NONBLOCK is the one way to open a FIFO that returns
@@ -1815,14 +1992,30 @@ static int capture_fifo_at(const CloneContext *ctx, int dest_dir_fd,
     int fifo_fd = openat(dest_dir_fd, leaf,
                          O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
     if (fifo_fd < 0)
+    {
+        capture_fail(report, src, "open the FIFO in the backup", errno);
         return -1;
+    }
 
     struct stat opened;
-    int failed = fstat(fifo_fd, &opened) != 0 || !S_ISFIFO(opened.st_mode) ||
-                 metadata_apply_fd(fifo_fd, st,
-                                    metadata_policy_from_context(ctx)) != 0;
+    int failed = 1;
+    if (fstat(fifo_fd, &opened) != 0)
+        capture_fail(report, src, "inspect the FIFO in the backup", errno);
+    else if (!S_ISFIFO(opened.st_mode))
+        capture_fail(report, src,
+                     "the backup holds another kind of item there", 0);
+    else if (metadata_apply_fd(fifo_fd, st,
+                               metadata_policy_from_context(ctx)) != 0)
+        capture_fail(report, src,
+                     "set the owner, permissions, and times of its copy",
+                     errno);
+    else
+        failed = 0;
     if (close(fifo_fd) != 0)
+    {
+        capture_fail(report, src, "close the FIFO in the backup", errno);
         failed = 1;
+    }
     return failed ? -1 : 0;
 }
 
@@ -1836,13 +2029,19 @@ static BackupCaptureStatus capture_entry_at(const CloneContext *ctx,
     if (ctx->selection)
     {
         int owned = selection_source_owns(ctx->selection, src);
+        if (owned < 0)
+            capture_fail(report, src, "it lies outside its root in the selection",
+                         0);
         if (owned <= 0) return owned == 0 ? BACKUP_CAPTURE_OK : BACKUP_CAPTURE_ERROR;
     }
     struct stat st;
     if (lstat(src, &st) != 0)
     {
         if (errno != ENOENT)
+        {
+            capture_fail(report, src, "inspect it", errno);
             return BACKUP_CAPTURE_ERROR;
+        }
         // Listed by readdir, gone before it could be read (D63).
         backup_capture_report_note_change(report, BACKUP_SOURCE_VANISHED, src);
         return BACKUP_CAPTURE_OK;
@@ -1860,7 +2059,7 @@ static BackupCaptureStatus capture_entry_at(const CloneContext *ctx,
         status = capture_directory_at(ctx, src, dest_dir_fd, leaf, &st,
                                       root_key, rel_path, report);
     else if (S_ISFIFO(st.st_mode))
-        status = capture_fifo_at(ctx, dest_dir_fd, leaf, &st);
+        status = capture_fifo_at(ctx, src, dest_dir_fd, leaf, &st, report);
     else if (S_ISSOCK(st.st_mode))
     {
         // Sockets and device nodes carry no copyable content: a socket is a
@@ -1878,7 +2077,10 @@ static BackupCaptureStatus capture_entry_at(const CloneContext *ctx,
         status = BACKUP_CAPTURE_OK;
     }
     else
+    {
+        capture_fail(report, src, "it is of a kind migr cannot back up", 0);
         return BACKUP_CAPTURE_ERROR;
+    }
 
     // Left out, so not visited: a resume then removes its stale payload.
     if (status == BACKUP_CAPTURE_SKIPPED)
@@ -1886,7 +2088,10 @@ static BackupCaptureStatus capture_entry_at(const CloneContext *ctx,
 
     if (status == BACKUP_CAPTURE_OK && trackable && ctx->visited != NULL &&
         native_visited_add(ctx->visited, root_key, rel_path) < 0)
+    {
+        capture_fail(report, src, "record it as backed up", errno);
         return BACKUP_CAPTURE_ERROR;
+    }
 
     return status;
 }
@@ -1995,23 +2200,33 @@ BackupCaptureStatus backup_capture_at_report_continue(
     // Fail closed on a mis-dispatched context rather than running a native clone blindly:
     // a wrong direction or an unimplemented representation must not silently produce a
     // native tree where a sidecar was required.
+    const char *label = source_path != NULL ? source_path : "";
     if (ctx == NULL || ctx->operation != CLONE_BACKUP ||
-        ctx->representation != CLONE_NATIVE_TREE)
-        return BACKUP_CAPTURE_ERROR;
-    if (source_path == NULL || destination_root_fd < 0 ||
+        ctx->representation != CLONE_NATIVE_TREE ||
+        source_path == NULL || destination_root_fd < 0 ||
         !destination_path_is_safe(destination_path))
+    {
+        capture_fail(report, label, "it was given to the capture wrongly", 0);
         return BACKUP_CAPTURE_ERROR;
+    }
 
     int parent_fd;
     char leaf[NAME_MAX + 1U];
     if (fileops_make_parents_at(destination_root_fd, destination_path) != 0 ||
         native_open_relative_parent(destination_root_fd, destination_path,
                                     &parent_fd, leaf, sizeof(leaf)) != 0)
+    {
+        capture_fail(report, label, "open its place in the backup", errno);
         return BACKUP_CAPTURE_ERROR;
+    }
     BackupCaptureStatus status = capture_entry_at(
         ctx, source_path, parent_fd, leaf, destination_path, "", report);
-    if (close(parent_fd) != 0 && status == BACKUP_CAPTURE_OK)
-        status = BACKUP_CAPTURE_ERROR;
+    if (close(parent_fd) != 0)
+    {
+        capture_fail(report, label, "close its place in the backup", errno);
+        if (status == BACKUP_CAPTURE_OK)
+            status = BACKUP_CAPTURE_ERROR;
+    }
     return status;
 }
 
@@ -2071,31 +2286,60 @@ static int native_stale_list_append(NativeStaleList *list,
     return 0;
 }
 
+// Keeps the first entry reconciliation could not handle, below its root.
+static void reconcile_fail(NativeReconcileReport *report, const char *rel_path,
+                           const char *operation, int err)
+{
+    if (report == NULL || report->failed_operation != NULL)
+        return;
+    (void)snprintf(report->failed_relative_path,
+                   sizeof(report->failed_relative_path), "%s", rel_path);
+    report->failed_operation = operation;
+    report->failure_errno = err;
+}
+
 static int native_reconcile_scan_node(const void *visited,
                                       const char *root_key, int parent_fd,
                                       const char *leaf, const char *rel_path,
-                                      NativeStaleList *stale)
+                                      NativeStaleList *stale,
+                                      NativeReconcileReport *report)
 {
     int contains = native_visited_contains(visited, root_key, rel_path);
     if (contains < 0)
+    {
+        reconcile_fail(report, rel_path, "look it up among the items backed up",
+                       0);
         return -1;
+    }
     if (contains == 0)
-        return native_stale_list_append(stale, rel_path);
+    {
+        if (native_stale_list_append(stale, rel_path) == 0)
+            return 0;
+        reconcile_fail(report, rel_path, "list it for removal", errno);
+        return -1;
+    }
 
     struct stat st;
     if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) != 0)
+    {
+        reconcile_fail(report, rel_path, "inspect it", errno);
         return -1;
+    }
     if (!S_ISDIR(st.st_mode))
         return 0;
 
     int child_fd = openat(parent_fd, leaf,
                           O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (child_fd < 0)
+    {
+        reconcile_fail(report, rel_path, "open the folder", errno);
         return -1;
+    }
     int scan_fd = fcntl(child_fd, F_DUPFD_CLOEXEC, 0);
     DIR *dir = scan_fd < 0 ? NULL : fdopendir(scan_fd);
     if (dir == NULL)
     {
+        reconcile_fail(report, rel_path, "list the folder", errno);
         if (scan_fd >= 0)
             close(scan_fd);
         close(child_fd);
@@ -2111,7 +2355,10 @@ static int native_reconcile_scan_node(const void *visited,
         if (entry == NULL)
         {
             if (errno != 0)
+            {
+                reconcile_fail(report, rel_path, "list the folder", errno);
                 failed = 1;
+            }
             break;
         }
         if (strcmp(entry->d_name, ".") == 0 ||
@@ -2120,21 +2367,37 @@ static int native_reconcile_scan_node(const void *visited,
 
         char child_rel[PATH_MAX];
         if (append_relative(child_rel, sizeof(child_rel), rel_path,
-                            entry->d_name) != 0 ||
-            native_reconcile_scan_node(visited, root_key, child_fd,
-                                       entry->d_name, child_rel, stale) != 0)
+                            entry->d_name) != 0)
+        {
+            reconcile_fail(report, rel_path, "name an item in the folder",
+                           ENAMETOOLONG);
+            failed = 1;
+            break;
+        }
+        if (native_reconcile_scan_node(visited, root_key, child_fd,
+                                       entry->d_name, child_rel, stale,
+                                       report) != 0)
         {
             failed = 1;
             break;
         }
     }
     if (closedir(dir) != 0)
+    {
+        reconcile_fail(report, rel_path, "list the folder", errno);
         failed = 1;
+    }
     struct timespec times[2] = {st.st_atim, st.st_mtim};
     if (futimens(child_fd, times) != 0)
+    {
+        reconcile_fail(report, rel_path, "put back the folder's times", errno);
         failed = 1;
+    }
     if (close(child_fd) != 0)
+    {
+        reconcile_fail(report, rel_path, "close the folder", errno);
         failed = 1;
+    }
     return failed ? -1 : 0;
 }
 
@@ -2150,13 +2413,16 @@ static int native_remove_directory_tree(int parent_fd, const char *leaf)
     DIR *dir = scan_fd < 0 ? NULL : fdopendir(scan_fd);
     if (dir == NULL)
     {
+        int saved_errno = errno;
         if (scan_fd >= 0)
             close(scan_fd);
         close(directory_fd);
+        errno = saved_errno;
         return -1;
     }
 
-    int failed = 0;
+    // errno is that of the first failure, kept through the cleanup below.
+    int err = 0;
     struct dirent *entry;
     for (;;)
     {
@@ -2164,8 +2430,7 @@ static int native_remove_directory_tree(int parent_fd, const char *leaf)
         entry = readdir(dir);
         if (entry == NULL)
         {
-            if (errno != 0)
-                failed = 1;
+            err = errno;
             break;
         }
         if (strcmp(entry->d_name, ".") == 0 ||
@@ -2173,16 +2438,19 @@ static int native_remove_directory_tree(int parent_fd, const char *leaf)
             continue;
         if (native_remove_leaf(directory_fd, entry->d_name) != 0)
         {
-            failed = 1;
+            err = errno != 0 ? errno : EIO;
             break;
         }
     }
-    if (closedir(dir) != 0)
-        failed = 1;
-    if (close(directory_fd) != 0)
-        failed = 1;
-    if (failed)
+    if (closedir(dir) != 0 && err == 0)
+        err = errno;
+    if (close(directory_fd) != 0 && err == 0)
+        err = errno;
+    if (err != 0)
+    {
+        errno = err;
         return -1;
+    }
     if (unlinkat(parent_fd, leaf, AT_REMOVEDIR) == 0 || errno == ENOENT)
         return 0;
     return -1;
@@ -2330,19 +2598,24 @@ static NativeReconcileStatus native_reconcile_root_at(
 {
     int root_visited = native_visited_contains(visited, root_key, "");
     if (root_visited < 0)
+    {
+        reconcile_fail(report, "", "look it up among the items backed up", 0);
         return NATIVE_RECONCILE_ERROR;
+    }
 
     struct stat root_st;
     if (fstatat(parent_fd, leaf, &root_st, AT_SYMLINK_NOFOLLOW) != 0)
-        return errno == ENOENT ? NATIVE_RECONCILE_OK : NATIVE_RECONCILE_ERROR;
+    {
+        if (errno == ENOENT)
+            return NATIVE_RECONCILE_OK;
+        reconcile_fail(report, "", "inspect it", errno);
+        return NATIVE_RECONCILE_ERROR;
+    }
     if (root_visited == 0)
     {
         if (native_remove_leaf(parent_fd, leaf) == 0)
             return NATIVE_RECONCILE_OK;
-        if (report != NULL)
-            (void)snprintf(report->failed_relative_path,
-                           sizeof(report->failed_relative_path), "%s",
-                           root_key);
+        reconcile_fail(report, "", "remove it from the backup", errno);
         return NATIVE_RECONCILE_ERROR;
     }
     if (!S_ISDIR(root_st.st_mode))
@@ -2351,11 +2624,15 @@ static NativeReconcileStatus native_reconcile_root_at(
     int root_fd = openat(parent_fd, leaf,
                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (root_fd < 0)
+    {
+        reconcile_fail(report, "", "open the folder", errno);
         return NATIVE_RECONCILE_ERROR;
+    }
     int scan_fd = fcntl(root_fd, F_DUPFD_CLOEXEC, 0);
     DIR *dir = scan_fd < 0 ? NULL : fdopendir(scan_fd);
     if (dir == NULL)
     {
+        reconcile_fail(report, "", "list the folder", errno);
         if (scan_fd >= 0)
             close(scan_fd);
         close(root_fd);
@@ -2372,7 +2649,10 @@ static NativeReconcileStatus native_reconcile_root_at(
         if (entry == NULL)
         {
             if (errno != 0)
+            {
+                reconcile_fail(report, "", "list the folder", errno);
                 scan_failed = 1;
+            }
             break;
         }
         if (strcmp(entry->d_name, ".") == 0 ||
@@ -2380,14 +2660,17 @@ static NativeReconcileStatus native_reconcile_root_at(
             continue;
         if (native_reconcile_scan_node(visited, root_key, root_fd,
                                        entry->d_name, entry->d_name,
-                                       &stale) != 0)
+                                       &stale, report) != 0)
         {
             scan_failed = 1;
             break;
         }
     }
     if (closedir(dir) != 0)
+    {
+        reconcile_fail(report, "", "list the folder", errno);
         scan_failed = 1;
+    }
 
     NativeReconcileStatus result = NATIVE_RECONCILE_OK;
     if (scan_failed)
@@ -2396,44 +2679,60 @@ static NativeReconcileStatus native_reconcile_root_at(
     {
         for (size_t index = 0; index < stale.count; index++)
         {
+            const char *item = stale.items[index];
             int parent_fd = -1;
             char leaf[NAME_MAX + 1U];
             int open_result = native_open_relative_parent(
-                root_fd, stale.items[index], &parent_fd, leaf, sizeof(leaf));
+                root_fd, item, &parent_fd, leaf, sizeof(leaf));
             int remove_result;
             if (open_result == 0)
             {
                 struct stat parent_st;
                 remove_result = fstat(parent_fd, &parent_st);
-                if (remove_result == 0)
+                if (remove_result != 0)
+                    reconcile_fail(report, item, "inspect its folder", errno);
+                else
                 {
                     remove_result = native_remove_leaf(parent_fd, leaf);
+                    if (remove_result != 0)
+                        reconcile_fail(report, item,
+                                       "remove it from the backup", errno);
                     struct timespec times[2] = {parent_st.st_atim, parent_st.st_mtim};
                     if (futimens(parent_fd, times) != 0)
+                    {
+                        reconcile_fail(report, item,
+                                       "put back its folder's times", errno);
                         remove_result = -1;
+                    }
                 }
             }
             else
-                remove_result = errno == ENOENT ? 0 : -1;
-            if (open_result != 0 || remove_result != 0)
             {
-                result = NATIVE_RECONCILE_ERROR;
-                if (report != NULL && report->failed_relative_path[0] == '\0')
-                    (void)snprintf(report->failed_relative_path,
-                                   sizeof(report->failed_relative_path), "%s",
-                                   stale.items[index]);
+                reconcile_fail(report, item, "open its folder", errno);
+                remove_result = errno == ENOENT ? 0 : -1;
             }
-            if (parent_fd >= 0 && close(parent_fd) != 0)
+            if (open_result != 0 || remove_result != 0)
                 result = NATIVE_RECONCILE_ERROR;
+            if (parent_fd >= 0 && close(parent_fd) != 0)
+            {
+                reconcile_fail(report, item, "close its folder", errno);
+                result = NATIVE_RECONCILE_ERROR;
+            }
         }
     }
 
     native_stale_list_free(&stale);
     struct timespec times[2] = {root_st.st_atim, root_st.st_mtim};
     if (futimens(root_fd, times) != 0)
+    {
+        reconcile_fail(report, "", "put back the folder's times", errno);
         result = NATIVE_RECONCILE_ERROR;
+    }
     if (close(root_fd) != 0)
+    {
+        reconcile_fail(report, "", "close the folder", errno);
         result = NATIVE_RECONCILE_ERROR;
+    }
     return result;
 }
 
@@ -2444,17 +2743,28 @@ NativeReconcileStatus native_reconcile_stale_at(const void *visited,
 {
     native_reconcile_report_init(report);
     if (visited == NULL || root_key == NULL || data_fd < 0)
+    {
+        reconcile_fail(report, "", "it was given to reconciliation wrongly", 0);
         return NATIVE_RECONCILE_ERROR;
+    }
 
     int parent_fd;
     char leaf[NAME_MAX + 1U];
     if (native_open_relative_parent(data_fd, root_key, &parent_fd, leaf,
                                     sizeof(leaf)) != 0)
-        return errno == ENOENT ? NATIVE_RECONCILE_OK : NATIVE_RECONCILE_ERROR;
+    {
+        if (errno == ENOENT)
+            return NATIVE_RECONCILE_OK;
+        reconcile_fail(report, "", "open its folder", errno);
+        return NATIVE_RECONCILE_ERROR;
+    }
     NativeReconcileStatus result = native_reconcile_root_at(
         visited, root_key, parent_fd, leaf, report);
     if (close(parent_fd) != 0)
+    {
+        reconcile_fail(report, "", "close its folder", errno);
         result = NATIVE_RECONCILE_ERROR;
+    }
     return result;
 }
 
@@ -2542,8 +2852,12 @@ static void restore_native_test_after_apply(const char *logical_path)
 }
 #endif
 
+// Counts a failed item and keeps the first: where, what was being done, and
+// err, 0 when operation says why on its own. Called before any cleanup that
+// could change errno.
 static void restore_report_failure(RestoreNativeReport *report,
-                                   const char *logical_path)
+                                   const char *logical_path,
+                                   const char *operation, int err)
 {
     if (report == NULL)
         return;
@@ -2553,6 +2867,18 @@ static void restore_report_failure(RestoreNativeReport *report,
         return;
     (void)snprintf(report->failed_logical_path,
                    sizeof(report->failed_logical_path), "%s", logical_path);
+    report->failed_operation = operation;
+    report->failure_errno = err;
+}
+
+// Keeps the first of several steps that failed, for one report at the end.
+static void restore_note_failure(const char **operation, int *err,
+                                 const char *text, int value)
+{
+    if (*operation != NULL)
+        return;
+    *operation = text;
+    *err = value;
 }
 
 static void restore_report_applied(RestoreNativeReport *report)
@@ -2832,16 +3158,19 @@ static SourceOpenStatus open_source_regular(
                     O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_NOATIME | O_CLOEXEC);
     if (fd < 0)
         return errno == EPERM ? SOURCE_OPEN_SAFE_READ : SOURCE_OPEN_ERROR;
-    if (fstat(fd, opened_st) != 0 || !S_ISREG(opened_st->st_mode) ||
+    int err = fstat(fd, opened_st) != 0 ? errno : 0;
+    if (err != 0 || !S_ISREG(opened_st->st_mode) ||
         !native_hardlink_identity_matches(object_st, opened_st))
     {
         close(fd);
+        errno = err;
         return SOURCE_OPEN_ERROR;
     }
     *out_fd = fd;
     return SOURCE_OPEN_OK;
 }
 
+// errno is 0 when another kind of item stands at the address.
 static int open_destination_regular(int dest_parent_fd, const char *dest_leaf,
                                     mode_t mode, struct stat *opened_st,
                                     int *created)
@@ -2851,32 +3180,31 @@ static int open_destination_regular(int dest_parent_fd, const char *dest_leaf,
     {
         int fd = openat(dest_parent_fd, dest_leaf,
                         O_WRONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
-        if (fd >= 0)
+        if (fd < 0 && errno == ENOENT)
         {
-            if (fstat(fd, opened_st) == 0 && S_ISREG(opened_st->st_mode))
-                return fd;
-            close(fd);
-            return -1;
-        }
-        if (errno != ENOENT)
-            return -1;
-
-        fd = openat(dest_parent_fd, dest_leaf,
-                    O_WRONLY | O_CREAT | O_EXCL | O_NONBLOCK |
-                    O_NOFOLLOW | O_CLOEXEC, mode);
-        if (fd >= 0)
-        {
-            if (fstat(fd, opened_st) == 0 && S_ISREG(opened_st->st_mode))
-            {
+            fd = openat(dest_parent_fd, dest_leaf,
+                        O_WRONLY | O_CREAT | O_EXCL | O_NONBLOCK |
+                        O_NOFOLLOW | O_CLOEXEC, mode);
+            if (fd < 0 && errno == EEXIST)
+                continue;
+            if (fd >= 0)
                 *created = 1;
-                return fd;
-            }
-            close(fd);
+        }
+        if (fd < 0)
+        {
+            if (errno == ELOOP || errno == EISDIR)
+                errno = 0;
             return -1;
         }
-        if (errno != EEXIST)
-            return -1;
+        int err = fstat(fd, opened_st) != 0 ? errno : 0;
+        if (err == 0 && S_ISREG(opened_st->st_mode))
+            return fd;
+        close(fd);
+        *created = 0;
+        errno = err;
+        return -1;
     }
+    errno = EEXIST;
     return -1;
 }
 
@@ -2897,16 +3225,19 @@ static SourceOpenStatus open_source_directory(
                     O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NOATIME | O_CLOEXEC);
     if (fd < 0)
         return errno == EPERM ? SOURCE_OPEN_SAFE_READ : SOURCE_OPEN_ERROR;
-    if (fstat(fd, opened_st) != 0 || !S_ISDIR(opened_st->st_mode) ||
+    int err = fstat(fd, opened_st) != 0 ? errno : 0;
+    if (err != 0 || !S_ISDIR(opened_st->st_mode) ||
         !native_hardlink_identity_matches(object_st, opened_st))
     {
         close(fd);
+        errno = err;
         return SOURCE_OPEN_ERROR;
     }
     *out_fd = fd;
     return SOURCE_OPEN_OK;
 }
 
+// -1 with errno 0 when another kind of item stands at the address.
 static int open_destination_directory(RestorePass pass,
                                       int dest_parent_fd, const char *dest_leaf)
 {
@@ -2915,10 +3246,12 @@ static int open_destination_directory(RestorePass pass,
     if (dest_leaf[0] == '\0')
     {
         int fd = fcntl(dest_parent_fd, F_DUPFD_CLOEXEC, 0);
-        if (fd < 0 || !fd_is_directory(fd))
+        if (fd < 0)
+            return -1;
+        if (!fd_is_directory(fd))
         {
-            if (fd >= 0)
-                close(fd);
+            close(fd);
+            errno = 0;
             return -1;
         }
         return fd;
@@ -2926,19 +3259,21 @@ static int open_destination_directory(RestorePass pass,
 
     int fd = openat(dest_parent_fd, dest_leaf,
                     O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-    if (fd >= 0)
-        return fd;
-    if (errno != ENOENT)
-        return -1;
-    if (pass == RESTORE_VALIDATE)
-        return -2;
-
-    if (mkdirat(dest_parent_fd, dest_leaf, 0700) != 0 && errno != EEXIST)
-        return -1;
-    return openat(dest_parent_fd, dest_leaf,
-                  O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0 && errno == ENOENT)
+    {
+        if (pass == RESTORE_VALIDATE)
+            return -2;
+        if (mkdirat(dest_parent_fd, dest_leaf, 0700) != 0 && errno != EEXIST)
+            return -1;
+        fd = openat(dest_parent_fd, dest_leaf,
+                    O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    }
+    if (fd < 0 && (errno == ENOTDIR || errno == ELOOP))
+        errno = 0;
+    return fd;
 }
 
+// errno is 0 when another kind of item stands at the address.
 static int open_destination_fifo(int dest_parent_fd, const char *dest_leaf,
                                  mode_t mode, struct stat *opened_st)
 {
@@ -2952,10 +3287,16 @@ static int open_destination_fifo(int dest_parent_fd, const char *dest_leaf,
                     O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
     }
     if (fd < 0)
+    {
+        if (errno == ELOOP)
+            errno = 0;
         return -1;
-    if (fstat(fd, opened_st) == 0 && S_ISFIFO(opened_st->st_mode))
+    }
+    int err = fstat(fd, opened_st) != 0 ? errno : 0;
+    if (err == 0 && S_ISFIFO(opened_st->st_mode))
         return fd;
     close(fd);
+    errno = err;
     return -1;
 }
 
@@ -2987,52 +3328,69 @@ static RestoreNativeStatus restore_linked_regular_at(
     const struct stat *desired_st, const char *logical_path,
     RestoreNativeReport *restore_report)
 {
-    int failed = 0;
+    const char *operation = NULL;
+    int err = 0;
     struct stat source_after;
-    if (fstat(source_fd, &source_after) != 0 ||
-        !metadata_source_unchanged(desired_st, &source_after))
-        failed = 1;
+    if (fstat(source_fd, &source_after) != 0)
+        restore_note_failure(&operation, &err,
+                             "inspect its copy in the backup", errno);
+    else if (!metadata_source_unchanged(desired_st, &source_after))
+        restore_note_failure(&operation, &err,
+                             "its copy in the backup changed while it was read",
+                             0);
     if (close(source_fd) != 0)
-        failed = 1;
+        restore_note_failure(&operation, &err,
+                             "close its copy in the backup", errno);
 
     struct stat representative;
-    if (!failed &&
-        (fstatat(representative_parent_fd, representative_leaf,
-                 &representative, AT_SYMLINK_NOFOLLOW) != 0 ||
-         !S_ISREG(representative.st_mode)))
-        failed = 1;
+    if (operation == NULL)
+    {
+        if (fstatat(representative_parent_fd, representative_leaf,
+                    &representative, AT_SYMLINK_NOFOLLOW) != 0)
+            restore_note_failure(&operation, &err,
+                                 "inspect the file it shares content with",
+                                 errno);
+        else if (!S_ISREG(representative.st_mode))
+            restore_note_failure(&operation, &err,
+                                 "the item it shares content with is not a "
+                                 "file", 0);
+    }
 
-    if (!failed)
+    if (operation == NULL)
     {
         struct stat existing;
         if (fstatat(destination_parent_fd, destination_leaf, &existing,
                     AT_SYMLINK_NOFOLLOW) == 0)
         {
             if (!native_hardlink_identity_matches(&existing, &representative))
-                failed = 1;
+                restore_note_failure(&operation, &err,
+                                     "another item is already there", 0);
         }
-        else if (errno == ENOENT)
-        {
-            if (linkat(representative_parent_fd, representative_leaf,
-                       destination_parent_fd, destination_leaf, 0) != 0)
-                failed = 1;
-            else
-            {
-                struct stat linked;
-                if (fstatat(destination_parent_fd, destination_leaf, &linked,
-                            AT_SYMLINK_NOFOLLOW) != 0 ||
-                    !native_hardlink_identity_matches(&linked,
-                                                      &representative))
-                    failed = 1;
-            }
-        }
+        else if (errno != ENOENT)
+            restore_note_failure(&operation, &err,
+                                 "inspect what is already there", errno);
+        else if (linkat(representative_parent_fd, representative_leaf,
+                        destination_parent_fd, destination_leaf, 0) != 0)
+            restore_note_failure(&operation, &err,
+                                 "link it to its other names", errno);
         else
-            failed = 1;
+        {
+            struct stat linked;
+            if (fstatat(destination_parent_fd, destination_leaf, &linked,
+                        AT_SYMLINK_NOFOLLOW) != 0)
+                restore_note_failure(&operation, &err, "inspect its link",
+                                     errno);
+            else if (!native_hardlink_identity_matches(&linked,
+                                                       &representative))
+                restore_note_failure(&operation, &err,
+                                     "its link does not lead to the shared "
+                                     "file", 0);
+        }
     }
 
-    if (failed)
+    if (operation != NULL)
     {
-        restore_report_failure(restore_report, logical_path);
+        restore_report_failure(restore_report, logical_path, operation, err);
         return RESTORE_NATIVE_ERROR;
     }
     restore_report_applied(restore_report);
@@ -3094,8 +3452,13 @@ static RestoreNativeStatus restore_entry_symlink(
             (dest_exists && !S_ISLNK(dest_st->st_mode) &&
              !S_ISREG(dest_st->st_mode)))
         {
+            restore_report_failure(restore_report, logical_path,
+                                   source_is_root || dest_is_root
+                                       ? "a link cannot be restored as a root"
+                                       : "a folder or another kind of item is "
+                                         "already there",
+                                   0);
             close(source_object_fd);
-            restore_report_failure(restore_report, logical_path);
             return -1;
         }
 
@@ -3110,8 +3473,11 @@ static RestoreNativeStatus restore_entry_symlink(
                 metadata_xattr_namespaces_path(source_xattr_path,
                                                &namespaces) != 0)
             {
+                restore_report_failure(
+                    restore_report, logical_path,
+                    "read the extended attributes of its copy in the backup",
+                    errno);
                 close(source_object_fd);
-                restore_report_failure(restore_report, logical_path);
                 return -1;
             }
             if (xattr_requirements != NULL)
@@ -3130,17 +3496,28 @@ static RestoreNativeStatus restore_entry_symlink(
                                  target, sizeof(target) - 1);
         if (len < 0 || (size_t)len == sizeof(target) - 1)
         {
+            restore_report_failure(restore_report, logical_path,
+                                   "read its copy in the backup",
+                                   len < 0 ? errno : ENAMETOOLONG);
             close(source_object_fd);
-            restore_report_failure(restore_report, logical_path);
             return -1;
         }
         struct stat after;
         if (fstatat(source_parent_fd, source_leaf, &after,
-                    AT_SYMLINK_NOFOLLOW) != 0 ||
-            !metadata_symlink_unchanged(&desired_st, &after))
+                    AT_SYMLINK_NOFOLLOW) != 0)
         {
+            restore_report_failure(restore_report, logical_path,
+                                   "inspect its copy in the backup again",
+                                   errno);
             close(source_object_fd);
-            restore_report_failure(restore_report, logical_path);
+            return -1;
+        }
+        if (!metadata_symlink_unchanged(&desired_st, &after))
+        {
+            restore_report_failure(
+                restore_report, logical_path,
+                "its copy in the backup changed while it was read", 0);
+            close(source_object_fd);
             return -1;
         }
         close(source_object_fd);
@@ -3162,23 +3539,32 @@ static RestoreNativeStatus restore_entry_symlink(
             failed = 1;
         if (failed)
         {
+            restore_report_failure(
+                restore_report, logical_path,
+                "read the extended attributes of its copy in the backup",
+                errno);
             xattrs_free(&xattrs);
-            restore_report_failure(restore_report, logical_path);
             return RESTORE_NATIVE_ERROR;
         }
-        if ((dest_exists && unlinkat(dest_parent_fd, dest_leaf, 0) != 0 &&
-             errno != ENOENT) ||
-            symlinkat(target, dest_parent_fd, dest_leaf) != 0)
+        const char *operation = NULL;
+        if (dest_exists && unlinkat(dest_parent_fd, dest_leaf, 0) != 0 &&
+            errno != ENOENT)
+            operation = "remove what is already there";
+        else if (symlinkat(target, dest_parent_fd, dest_leaf) != 0)
+            operation = "create the link";
+        if (operation != NULL)
         {
+            restore_report_failure(restore_report, logical_path, operation,
+                                   errno);
             xattrs_free(&xattrs);
-            restore_report_failure(restore_report, logical_path);
             return -1;
         }
         struct stat target_st = desired_st;
         metadata_owner_map_apply(&ctx->owner_map, &target_st);
-        failed = metadata_apply_symlink_ownership_at(dest_parent_fd, dest_leaf,
-                                                     &target_st) != 0;
-        if (!failed)
+        if (metadata_apply_symlink_ownership_at(dest_parent_fd, dest_leaf,
+                                                &target_st) != 0)
+            operation = "set the owner of the link";
+        else
         {
             size_t skipped_security = 0;
             int xattr_result = metadata_apply_xattrs_symlink_at_report(
@@ -3186,19 +3572,19 @@ static RestoreNativeStatus restore_entry_symlink(
                 &skipped_security);
             restore_report_security_skipped(restore_report, skipped_security);
             if (xattr_result != 0)
-                failed = 1;
+                operation = "set the extended attributes of the link";
+            else if (metadata_apply_symlink_times_at(
+                         dest_parent_fd, dest_leaf, &target_st,
+                         metadata_policy_from_context(ctx)) != 0)
+                operation = "set the times of the link";
         }
-        if (!failed &&
-            metadata_apply_symlink_times_at(
-                dest_parent_fd, dest_leaf, &target_st,
-                metadata_policy_from_context(ctx)) != 0)
-            failed = 1;
-        xattrs_free(&xattrs);
-        if (!failed)
+        if (operation == NULL)
             restore_report_applied(restore_report);
         else
-            restore_report_failure(restore_report, logical_path);
-        return failed ? RESTORE_NATIVE_ERROR : RESTORE_NATIVE_OK;
+            restore_report_failure(restore_report, logical_path, operation,
+                                   errno);
+        xattrs_free(&xattrs);
+        return operation != NULL ? RESTORE_NATIVE_ERROR : RESTORE_NATIVE_OK;
 }
 
 static RestoreNativeStatus restore_entry_regular(
@@ -3215,8 +3601,13 @@ static RestoreNativeStatus restore_entry_regular(
         if (source_is_root || dest_is_root ||
             (dest_exists && !S_ISREG(dest_st.st_mode)))
         {
+            restore_report_failure(restore_report, logical_path,
+                                   source_is_root || dest_is_root
+                                       ? "a file cannot be restored as a root"
+                                       : "a folder or another kind of item is "
+                                         "already there",
+                                   0);
             close(source_object_fd);
-            restore_report_failure(restore_report, logical_path);
             return -1;
         }
 
@@ -3225,18 +3616,31 @@ static RestoreNativeStatus restore_entry_regular(
         SourceOpenStatus source_status = open_source_regular(
             pass, source_parent_fd, source_leaf, &source_st, &opened_source_st,
             &src_fd);
+        int open_errno = errno;
         close(source_object_fd);
         if (source_status == SOURCE_OPEN_SAFE_READ)
         {
-            restore_report_failure(restore_report, logical_path);
+            restore_report_failure(restore_report, logical_path,
+                                   "open its copy in the backup without "
+                                   "changing its access time", open_errno);
             return RESTORE_NATIVE_SOURCE_SAFE_READ;
         }
-        if (source_status != SOURCE_OPEN_OK ||
-            !metadata_source_unchanged(&desired_st, &opened_source_st))
+        if (source_status != SOURCE_OPEN_OK)
         {
-            if (src_fd >= 0)
-                close(src_fd);
-            restore_report_failure(restore_report, logical_path);
+            restore_report_failure(restore_report, logical_path,
+                                   open_errno != 0
+                                       ? "open its copy in the backup"
+                                       : "its copy in the backup changed "
+                                         "while it was opened",
+                                   open_errno);
+            return RESTORE_NATIVE_ERROR;
+        }
+        if (!metadata_source_unchanged(&desired_st, &opened_source_st))
+        {
+            restore_report_failure(restore_report, logical_path,
+                                   "its copy in the backup changed since it "
+                                   "was checked", 0);
+            close(src_fd);
             return RESTORE_NATIVE_ERROR;
         }
         if (pass == RESTORE_VALIDATE)
@@ -3246,8 +3650,11 @@ static RestoreNativeStatus restore_entry_regular(
                 unsigned int namespaces = 0;
                 if (metadata_xattr_namespaces_fd(src_fd, &namespaces) != 0)
                 {
+                    restore_report_failure(
+                        restore_report, logical_path,
+                        "read the extended attributes of its copy in the "
+                        "backup", errno);
                     close(src_fd);
-                    restore_report_failure(restore_report, logical_path);
                     return RESTORE_NATIVE_ERROR;
                 }
                 if (xattr_requirements != NULL)
@@ -3256,7 +3663,8 @@ static RestoreNativeStatus restore_entry_regular(
             native_restore_estimate_regular(estimate, &opened_source_st);
             if (close(src_fd) == 0)
                 return RESTORE_NATIVE_OK;
-            restore_report_failure(restore_report, logical_path);
+            restore_report_failure(restore_report, logical_path,
+                                   "close its copy in the backup", errno);
             return RESTORE_NATIVE_ERROR;
         }
 
@@ -3270,8 +3678,9 @@ static RestoreNativeStatus restore_entry_regular(
                 representative_leaf, sizeof(representative_leaf));
             if (found < 0)
             {
+                restore_report_failure(restore_report, logical_path,
+                                       "look up its other names", errno);
                 close(src_fd);
-                restore_report_failure(restore_report, logical_path);
                 return RESTORE_NATIVE_ERROR;
             }
             if (found > 0)
@@ -3288,8 +3697,12 @@ static RestoreNativeStatus restore_entry_regular(
                                                &opened_dest_st, &dest_created);
         if (dst_fd < 0)
         {
+            restore_report_failure(restore_report, logical_path,
+                                   errno != 0 ? "open it for writing"
+                                              : "a folder or another kind of "
+                                                "item is already there",
+                                   errno);
             close(src_fd);
-            restore_report_failure(restore_report, logical_path);
             return -1;
         }
         MetadataTimestampPolicy policy = metadata_policy_from_context(ctx);
@@ -3298,47 +3711,27 @@ static RestoreNativeStatus restore_entry_regular(
             opened_dest_st.st_mtim.tv_sec == desired_st.st_mtim.tv_sec &&
             policy.nsec_exact &&
             opened_dest_st.st_mtim.tv_nsec == desired_st.st_mtim.tv_nsec;
-        if (content_skip)
+        const char *operation = NULL;
+        int err = 0;
+        const char *step = NULL;
+        if (!content_skip)
         {
-            size_t skipped_security = 0;
-            int failed = apply_fd_metadata_tail(dst_fd, &desired_st,
-                                                &ctx->owner_map, src_fd,
-                                                policy,
-                                                &skipped_security, NULL) != 0;
-            restore_report_security_skipped(restore_report, skipped_security);
-            if (close(src_fd) != 0)
-                failed = 1;
-            if (close(dst_fd) != 0)
-                failed = 1;
-            if (!failed && ctx->inode_map != NULL &&
-                opened_source_st.st_nlink > 1 &&
-                native_inode_map_insert(ctx->inode_map,
-                                        opened_source_st.st_dev,
-                                        opened_source_st.st_ino,
-                                        dest_parent_fd, dest_leaf) != 0)
-                failed = 1;
-            if (!failed && pass == RESTORE_APPLY)
+            if (ftruncate(dst_fd, 0) != 0)
             {
-                restore_report_applied(restore_report);
-                restore_native_test_after_apply(logical_path);
+                restore_report_failure(restore_report, logical_path,
+                                       "empty it before writing", errno);
+                close(src_fd);
+                close(dst_fd);
+                return -1;
             }
-            else if (failed && pass == RESTORE_APPLY)
-                restore_report_failure(restore_report, logical_path);
-            return failed ? RESTORE_NATIVE_ERROR : RESTORE_NATIVE_OK;
+            if (capture_report != NULL)
+                snprintf(capture_report->current_path,
+                         sizeof(capture_report->current_path), "%s",
+                         logical_path);
+            if (copy_file_contents(src_fd, dst_fd, desired_st.st_size,
+                                   capture_report, NULL, &step) != 0)
+                restore_note_failure(&operation, &err, step, errno);
         }
-        if (ftruncate(dst_fd, 0) != 0)
-        {
-            close(src_fd);
-            close(dst_fd);
-            restore_report_failure(restore_report, logical_path);
-            return -1;
-        }
-
-        if (capture_report != NULL)
-            snprintf(capture_report->current_path,
-                     sizeof(capture_report->current_path), "%s", logical_path);
-        int failed = copy_file_contents(src_fd, dst_fd, desired_st.st_size,
-                                        capture_report, NULL) != 0;
 
         // collect_xattrs() reads the payload's *current* xattrs -- unlike
         // desired_st (a snapshot from an earlier pass), there is no
@@ -3346,31 +3739,34 @@ static RestoreNativeStatus restore_entry_regular(
         // inside the same before/after window the content copy above is
         // already verified against, not after it.
         size_t skipped_security = 0;
-        if (!failed &&
+        if (operation == NULL &&
             apply_fd_metadata_tail(dst_fd, &desired_st, &ctx->owner_map,
                                    src_fd, policy, &skipped_security,
-                                   NULL) != 0)
-            failed = 1;
+                                   NULL, &step) != 0)
+            restore_note_failure(&operation, &err, step, errno);
         restore_report_security_skipped(restore_report, skipped_security);
 
         if (close(src_fd) != 0)
-            failed = 1;
+            restore_note_failure(&operation, &err,
+                                 "close its copy in the backup", errno);
         if (close(dst_fd) != 0)
-            failed = 1;
-        if (!failed && ctx->inode_map != NULL &&
+            restore_note_failure(&operation, &err, "finish writing it", errno);
+        if (operation == NULL && ctx->inode_map != NULL &&
             opened_source_st.st_nlink > 1 &&
             native_inode_map_insert(ctx->inode_map, opened_source_st.st_dev,
                                     opened_source_st.st_ino,
                                     dest_parent_fd, dest_leaf) != 0)
-            failed = 1;
-        if (!failed && pass == RESTORE_APPLY)
+            restore_note_failure(&operation, &err, "record its other names",
+                                 errno);
+        if (operation == NULL && pass == RESTORE_APPLY)
         {
             restore_report_applied(restore_report);
             restore_native_test_after_apply(logical_path);
         }
-        else if (failed && pass == RESTORE_APPLY)
-            restore_report_failure(restore_report, logical_path);
-        return failed ? RESTORE_NATIVE_ERROR : RESTORE_NATIVE_OK;
+        else if (operation != NULL && pass == RESTORE_APPLY)
+            restore_report_failure(restore_report, logical_path, operation,
+                                   err);
+        return operation != NULL ? RESTORE_NATIVE_ERROR : RESTORE_NATIVE_OK;
 }
 
 static RestoreNativeStatus restore_entry_directory(
@@ -3386,8 +3782,10 @@ static RestoreNativeStatus restore_entry_directory(
 {
         if (dest_exists && !S_ISDIR(dest_st.st_mode))
         {
+            restore_report_failure(restore_report, logical_path,
+                                   "a file or another kind of item is "
+                                   "already there", 0);
             close(source_object_fd);
-            restore_report_failure(restore_report, logical_path);
             return -1;
         }
 
@@ -3396,18 +3794,31 @@ static RestoreNativeStatus restore_entry_directory(
         SourceOpenStatus source_status = open_source_directory(
             pass, source_object_fd, &source_st, &opened_source_st,
             &source_dir_fd);
+        int open_errno = errno;
         close(source_object_fd);
         if (source_status == SOURCE_OPEN_SAFE_READ)
         {
-            restore_report_failure(restore_report, logical_path);
+            restore_report_failure(restore_report, logical_path,
+                                   "open its copy in the backup without "
+                                   "changing its access time", open_errno);
             return RESTORE_NATIVE_SOURCE_SAFE_READ;
         }
-        if (source_status != SOURCE_OPEN_OK ||
-            !metadata_source_unchanged(&desired_st, &opened_source_st))
+        if (source_status != SOURCE_OPEN_OK)
         {
-            if (source_dir_fd >= 0)
-                close(source_dir_fd);
-            restore_report_failure(restore_report, logical_path);
+            restore_report_failure(restore_report, logical_path,
+                                   open_errno != 0
+                                       ? "open its copy in the backup"
+                                       : "its copy in the backup changed "
+                                         "while it was opened",
+                                   open_errno);
+            return RESTORE_NATIVE_ERROR;
+        }
+        if (!metadata_source_unchanged(&desired_st, &opened_source_st))
+        {
+            restore_report_failure(restore_report, logical_path,
+                                   "its copy in the backup changed since it "
+                                   "was checked", 0);
+            close(source_dir_fd);
             return RESTORE_NATIVE_ERROR;
         }
         native_restore_estimate_add_bytes(estimate, opened_source_st.st_size);
@@ -3418,8 +3829,11 @@ static RestoreNativeStatus restore_entry_directory(
             unsigned int namespaces = 0;
             if (metadata_xattr_namespaces_fd(source_dir_fd, &namespaces) != 0)
             {
+                restore_report_failure(
+                    restore_report, logical_path,
+                    "read the extended attributes of its copy in the backup",
+                    errno);
                 close(source_dir_fd);
-                restore_report_failure(restore_report, logical_path);
                 return RESTORE_NATIVE_ERROR;
             }
             if (xattr_requirements != NULL)
@@ -3430,8 +3844,12 @@ static RestoreNativeStatus restore_entry_directory(
                                                      dest_leaf);
         if (dest_dir_fd == -1)
         {
+            restore_report_failure(restore_report, logical_path,
+                                   errno != 0 ? "create or open the folder"
+                                              : "a file or another kind of "
+                                                "item is already there",
+                                   errno);
             close(source_dir_fd);
-            restore_report_failure(restore_report, logical_path);
             return -1;
         }
         if (dest_dir_fd == -2)
@@ -3441,15 +3859,18 @@ static RestoreNativeStatus restore_entry_directory(
         DIR *dirp = scan_fd < 0 ? NULL : fdopendir(scan_fd);
         if (dirp == NULL)
         {
+            restore_report_failure(restore_report, logical_path,
+                                   "list its copy in the backup", errno);
             if (scan_fd >= 0)
                 close(scan_fd);
             close(source_dir_fd);
             if (dest_dir_fd >= 0)
                 close(dest_dir_fd);
-            restore_report_failure(restore_report, logical_path);
             return -1;
         }
 
+        const char *operation = NULL;
+        int err = 0;
         int failed = 0;
         RestoreNativeStatus subtree_status = RESTORE_NATIVE_OK;
         for (;;)
@@ -3459,7 +3880,11 @@ static RestoreNativeStatus restore_entry_directory(
             if (entry == NULL)
             {
                 if (errno != 0)
+                {
+                    restore_note_failure(&operation, &err,
+                                         "list its copy in the backup", errno);
                     failed = 1;
+                }
                 break;
             }
             if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
@@ -3484,7 +3909,11 @@ static RestoreNativeStatus restore_entry_directory(
             }
         }
         if (closedir(dirp) != 0)
+        {
+            restore_note_failure(&operation, &err,
+                                 "list its copy in the backup", errno);
             failed = 1;
+        }
 
         if (!failed && pass == RESTORE_APPLY)
         {
@@ -3494,10 +3923,15 @@ static RestoreNativeStatus restore_entry_directory(
             // inside the same before/after window the subtree walk above is
             // already verified against, not after it.
             size_t skipped_security = 0;
+            const char *step = NULL;
             if (apply_fd_metadata_tail(
                     dest_dir_fd, &desired_st, &ctx->owner_map, source_dir_fd,
-                    metadata_policy_from_context(ctx), &skipped_security, NULL) != 0)
+                    metadata_policy_from_context(ctx), &skipped_security, NULL,
+                    &step) != 0)
+            {
+                restore_note_failure(&operation, &err, step, errno);
                 failed = 1;
+            }
             restore_report_security_skipped(restore_report, skipped_security);
         }
 
@@ -3508,7 +3942,8 @@ static RestoreNativeStatus restore_entry_directory(
             restore_report_applied(restore_report);
         else if (failed && pass == RESTORE_APPLY &&
                  subtree_status == RESTORE_NATIVE_OK)
-            restore_report_failure(restore_report, logical_path);
+            restore_report_failure(restore_report, logical_path, operation,
+                                   err);
         if (failed && subtree_status == RESTORE_NATIVE_OK)
             subtree_status = RESTORE_NATIVE_ERROR;
         return failed ? subtree_status : RESTORE_NATIVE_OK;
@@ -3524,8 +3959,13 @@ static RestoreNativeStatus restore_entry_fifo(
         if (source_is_root || dest_is_root ||
             (dest_exists && !S_ISFIFO(dest_st.st_mode)))
         {
+            restore_report_failure(restore_report, logical_path,
+                                   source_is_root || dest_is_root
+                                       ? "a FIFO cannot be restored as a root"
+                                       : "another kind of item is already "
+                                         "there",
+                                   0);
             close(source_object_fd);
-            restore_report_failure(restore_report, logical_path);
             return -1;
         }
         close(source_object_fd);
@@ -3539,20 +3979,30 @@ static RestoreNativeStatus restore_entry_fifo(
                                             &opened_dest_st);
         if (dest_fd < 0)
         {
-            restore_report_failure(restore_report, logical_path);
+            restore_report_failure(restore_report, logical_path,
+                                   errno != 0 ? "create or open the FIFO"
+                                              : "another kind of item is "
+                                                "already there",
+                                   errno);
             return -1;
         }
         struct stat target_st = desired_st;
         metadata_owner_map_apply(&ctx->owner_map, &target_st);
-        int failed = metadata_apply_fd(dest_fd, &target_st,
-                                       metadata_policy_from_context(ctx)) != 0;
+        const char *operation = NULL;
+        int err = 0;
+        if (metadata_apply_fd(dest_fd, &target_st,
+                              metadata_policy_from_context(ctx)) != 0)
+            restore_note_failure(&operation, &err,
+                                 "set its owner, permissions, and times",
+                                 errno);
         if (close(dest_fd) != 0)
-            failed = 1;
-        if (!failed)
+            restore_note_failure(&operation, &err, "close the FIFO", errno);
+        if (operation == NULL)
             restore_report_applied(restore_report);
         else
-            restore_report_failure(restore_report, logical_path);
-        return failed ? RESTORE_NATIVE_ERROR : RESTORE_NATIVE_OK;
+            restore_report_failure(restore_report, logical_path, operation,
+                                   err);
+        return operation != NULL ? RESTORE_NATIVE_ERROR : RESTORE_NATIVE_OK;
 }
 
 static RestoreNativeStatus restore_entry_socket(
@@ -3595,7 +4045,8 @@ static RestoreNativeStatus restore_entry_at(
 {
     if (depth > RESTORE_MAX_DEPTH)
     {
-        restore_report_failure(restore_report, logical_path);
+        restore_report_failure(restore_report, logical_path,
+                               "it is nested deeper than restore follows", 0);
         return -1;
     }
 
@@ -3607,7 +4058,8 @@ static RestoreNativeStatus restore_entry_at(
                                                &source_st);
     if (source_object_fd < 0)
     {
-        restore_report_failure(restore_report, logical_path);
+        restore_report_failure(restore_report, logical_path,
+                               "inspect its copy in the backup", errno);
         return -1;
     }
 
@@ -3616,8 +4068,9 @@ static RestoreNativeStatus restore_entry_at(
     if (destination_status(dest_parent_fd, dest_leaf, &dest_st,
                            &dest_exists) != 0)
     {
+        restore_report_failure(restore_report, logical_path,
+                               "inspect what is already there", errno);
         close(source_object_fd);
-        restore_report_failure(restore_report, logical_path);
         return -1;
     }
     // Restore never writes through a symlink; only a symlink from the backup
@@ -3625,8 +4078,9 @@ static RestoreNativeStatus restore_entry_at(
     if (dest_exists && S_ISLNK(dest_st.st_mode) && !S_ISLNK(source_st.st_mode))
     {
         print_destination_symlink_refusal(dest_parent_fd, dest_leaf);
+        restore_report_failure(restore_report, logical_path,
+                               "a symbolic link is already there", 0);
         close(source_object_fd);
-        restore_report_failure(restore_report, logical_path);
         return -1;
     }
 
@@ -3635,8 +4089,9 @@ static RestoreNativeStatus restore_entry_at(
     {
         if (metadata_snapshot_record(snapshots, &source_st) != 0)
         {
+            restore_report_failure(restore_report, logical_path,
+                                   "record its metadata", errno);
             close(source_object_fd);
-            restore_report_failure(restore_report, logical_path);
             return -1;
         }
         // One profile anchor governs the whole restore root.  It is the
@@ -3660,8 +4115,11 @@ static RestoreNativeStatus restore_entry_at(
             profile_failed = 1;
         if (profile_failed)
         {
+            restore_report_failure(restore_report, logical_path,
+                                   "check what the destination can hold for "
+                                   "its metadata",
+                                   metadata_anchor_fd < 0 ? 0 : errno);
             close(source_object_fd);
-            restore_report_failure(restore_report, logical_path);
             return -1;
         }
     }
@@ -3672,8 +4130,10 @@ static RestoreNativeStatus restore_entry_at(
         if (snapshot == NULL || !metadata_snapshot_matches(snapshot, &source_st) ||
             metadata_snapshot_to_stat(snapshot, &desired_st) != 0)
         {
+            restore_report_failure(restore_report, logical_path,
+                                   "its copy in the backup changed since it "
+                                   "was checked", 0);
             close(source_object_fd);
-            restore_report_failure(restore_report, logical_path);
             return -1;
         }
     }
@@ -3718,8 +4178,9 @@ static RestoreNativeStatus restore_entry_at(
         return restore_entry_device(pass, source_leaf, source_object_fd,
                                     source_st);
 
+    restore_report_failure(restore_report, logical_path,
+                           "it is of a kind migr cannot restore", 0);
     close(source_object_fd);
-    restore_report_failure(restore_report, logical_path);
     return -1;
 }
 
@@ -3912,10 +4373,20 @@ RestoreNativeStatus restore_native_at_report(
     int source_parent_fd = -1;
     char source_leaf[RESTORE_LEAF_MAX];
     if (!restore_arguments_valid(ctx, source_root_fd, source_rel,
-                                 destination_root_fd, destination_rel) ||
-        resolve_parent(source_root_fd, source_rel, 0, &source_parent_fd,
-                       source_leaf, sizeof(source_leaf)) != RESTORE_RESOLVE_OK)
+                                 destination_root_fd, destination_rel))
+    {
+        restore_report_failure(report, source_rel,
+                               "it was given to the restore wrongly", 0);
         return -1;
+    }
+    if (resolve_parent(source_root_fd, source_rel, 0, &source_parent_fd,
+                       source_leaf, sizeof(source_leaf)) != RESTORE_RESOLVE_OK)
+    {
+        restore_report_failure(report, source_rel,
+                               "open the folders above its copy in the backup",
+                               errno);
+        return -1;
+    }
 
     int dest_parent_fd = -1;
     char dest_leaf[RESTORE_LEAF_MAX];
@@ -3925,6 +4396,8 @@ RestoreNativeStatus restore_native_at_report(
                        sizeof(dest_leaf));
     if (dest_result == RESTORE_RESOLVE_ERROR)
     {
+        restore_report_failure(report, source_rel,
+                               "open the folders above it", errno);
         close(source_parent_fd);
         return -1;
     }
@@ -3938,6 +4411,8 @@ RestoreNativeStatus restore_native_at_report(
                                                           destination_rel);
     if (metadata_anchor_fd < 0)
     {
+        restore_report_failure(report, source_rel,
+                               "open the folder it goes into", errno);
         close(source_parent_fd);
         if (dest_parent_fd >= 0)
             close(dest_parent_fd);
@@ -3953,11 +4428,21 @@ RestoreNativeStatus restore_native_at_report(
     if (rc == 0 && !ctx->metadata_preflight_done &&
         metadata_profiles_probe(&profiles,
                                 metadata_policy_from_context(ctx)) != 0)
+    {
+        restore_report_failure(report, source_rel,
+                               "the destination cannot keep the owners, "
+                               "permissions, or times it needs", 0);
         rc = -1;
+    }
     if (rc == 0 && !ctx->metadata_preflight_done &&
         metadata_xattr_capability_probe(metadata_anchor_fd,
                                         &xattr_requirements) != 0)
+    {
+        restore_report_failure(report, source_rel,
+                               "the destination cannot keep the extended "
+                               "attributes it needs", 0);
         rc = -1;
+    }
     close(metadata_anchor_fd);
 
     if (rc == 0)
@@ -3969,7 +4454,11 @@ RestoreNativeStatus restore_native_at_report(
                                      &dest_parent_fd, dest_leaf,
                                      sizeof(dest_leaf));
         if (dest_result != RESTORE_RESOLVE_OK)
+        {
+            restore_report_failure(report, source_rel,
+                                   "create the folders above it", errno);
             rc = -1;
+        }
     }
     if (rc == 0)
         rc = restore_entry_at(ctx, RESTORE_APPLY, source_parent_fd,
@@ -3978,7 +4467,7 @@ RestoreNativeStatus restore_native_at_report(
                               NULL, NULL, destination_root_fd, 0, report,
                               capture_report, 0);
     if (rc != RESTORE_NATIVE_OK && report->failed_count == 0)
-        restore_report_failure(report, source_rel);
+        restore_report_failure(report, source_rel, NULL, 0);
     close(source_parent_fd);
     if (dest_parent_fd >= 0)
         close(dest_parent_fd);

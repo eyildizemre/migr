@@ -927,6 +927,15 @@ static void test_rejects_wrong_existing_destination_types(void)
                             dest_fd, "fifo") != 0,
           "FIFO-to-regular replacement is refused");
 
+    RestoreNativeReport report;
+    check(restore_native_at_report(&RESTORE_CTX, source_fd, "regular",
+                                   dest_fd, "regular", &report, NULL) != 0 &&
+              strcmp(report.failed_logical_path, "regular") == 0 &&
+              report.failed_operation != NULL &&
+              strstr(report.failed_operation, "already there") != NULL &&
+              report.failure_errno == 0,
+          "the refusal names the item and says what stands in its place");
+
     struct stat st;
     check(lstat(dest_regular, &st) == 0 && S_ISDIR(st.st_mode),
           "the wrong-type destination directory remains intact");
@@ -938,6 +947,44 @@ static void test_rejects_wrong_existing_destination_types(void)
     check(strcmp(content, "fifo-sentinel") == 0,
           "the FIFO target's regular-file sentinel remains intact");
 
+    close(source_fd);
+    close(dest_fd);
+    remove_tree(source_root);
+    remove_tree(dest_root);
+}
+
+static void test_reports_the_failed_item_with_errno(void)
+{
+    printf(BLUE "::" NC " restore_native_at: a failure names the item, the step, and errno\n");
+
+    if (geteuid() == 0)
+    {
+        printf("  - skipped: root writes into a read-only folder\n");
+        return;
+    }
+    char source_root[PATH_MAX], dest_root[PATH_MAX];
+    fresh_mkdtemp(source_root, sizeof(source_root), "restore_src");
+    fresh_mkdtemp(dest_root, sizeof(dest_root), "restore_dst");
+    char source_dir[PATH_MAX], locked[PATH_MAX];
+    join_path(source_dir, sizeof(source_dir), source_root, "folder");
+    join_path(locked, sizeof(locked), dest_root, "locked");
+    check(mkdir(source_dir, 0755) == 0 && mkdir(locked, 0755) == 0,
+          "fixture: a folder in the backup and its place on the new system");
+    write_file_under(source_root, "folder/inside", "content");
+    check(chmod(locked, 0555) == 0, "fixture: the place cannot be written to");
+
+    int source_fd = open_dir_fd(source_root);
+    int dest_fd = open_dir_fd(dest_root);
+    RestoreNativeReport report;
+    check(restore_native_at_report(&RESTORE_CTX, source_fd, "folder",
+                                   dest_fd, "locked", &report, NULL) != 0 &&
+              strcmp(report.failed_logical_path, "folder/inside") == 0 &&
+              report.failed_operation != NULL &&
+              strcmp(report.failed_operation, "open it for writing") == 0 &&
+              report.failure_errno == EACCES,
+          "the file that could not be written is named with errno");
+
+    check(chmod(locked, 0755) == 0, "fixture: make the place writable again");
     close(source_fd);
     close(dest_fd);
     remove_tree(source_root);
@@ -1267,6 +1314,7 @@ int main(void)
     test_regular_file_resume_and_overwrite();
     test_restores_fifo();
     test_rejects_wrong_existing_destination_types();
+    test_reports_the_failed_item_with_errno();
     test_skips_socket_without_failing();
     test_skips_device_node_without_failing();
     test_preserves_caller_owned_root_fds();

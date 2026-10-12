@@ -149,6 +149,15 @@ void print_error(const char *fmt, ...);
 void print_source_safe_read_refusal(const char *label);
 
 /**
+ * @brief Reports one item a run could not handle: "Error: could not <verb>
+ *        <path>: <operation>", followed by err's text unless err is 0, in
+ *        which case operation says why on its own. The log also gets err's
+ *        name and number.
+ */
+void print_item_failure(const char *verb, const char *path,
+                        const char *operation, int err);
+
+/**
  * @brief Writes all of data to fd, retrying short writes and EINTR.
  * @return 0, or -1 with errno (EIO for a write that makes no progress).
  */

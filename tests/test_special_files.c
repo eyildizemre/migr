@@ -862,6 +862,11 @@ static void test_native_reconciliation(void)
                   report.failed_relative_path[0] != '\0' &&
                   access(blocked, F_OK) == 0 && access(outside_stale, F_OK) != 0,
               "a deletion failure is reported while later stale entries are attempted");
+        check(report.failed_operation != NULL &&
+                  strcmp(report.failed_operation,
+                         "remove it from the backup") == 0 &&
+                  report.failure_errno == EACCES,
+              "the deletion failure says what was being done and errno");
         if (chmod(blocked, 0755) != 0)
             fatal("could not restore blocked stale directory permissions");
     }
@@ -1156,6 +1161,44 @@ int main(void)
           "a directory where a regular file belongs is refused");
     check(backup_capture_at(&ctx, src_fifo, dest_fd, "collide_dir") != 0,
           "a directory where a FIFO belongs is refused");
+
+    // A refusal names the item, what was being done, and errno, which is 0
+    // when the operation says why.
+    BackupCaptureReport report;
+    backup_capture_report_init(&report);
+    check(backup_capture_at_report(&ctx, src_symlink, dest_fd,
+                                   "differing.link", &report) != 0 &&
+              strcmp(report.failed_source_path, src_symlink) == 0 &&
+              report.failed_operation != NULL &&
+              strstr(report.failed_operation, "another target") != NULL &&
+              report.failure_errno == 0,
+          "the differing symlink is named with the reason for its refusal");
+    check(backup_capture_at_report(&ctx, nested_child, dest_fd,
+                                   "collide_file", &report) != 0 &&
+              strcmp(report.failed_source_path, nested_child) == 0 &&
+              report.failed_operation != NULL &&
+              strstr(report.failed_operation, "another kind of item") != NULL &&
+              report.failure_errno == 0,
+          "a type collision is named with its reason");
+
+    char unreadable[PATH_MAX];
+    if (path_join(unreadable, sizeof(unreadable), src_dir, "unreadable.txt") != 0)
+        fatal("could not build fixture paths");
+    write_file(unreadable, "secret");
+    if (chmod(unreadable, 0000) != 0)
+        fatal("could not make the unreadable fixture");
+    if (geteuid() == 0)
+        skip_check("an unreadable file is named with errno (root reads it)");
+    else
+        check(backup_capture_at_report(&ctx, unreadable, dest_fd,
+                                       "unreadable.txt", &report) != 0 &&
+                  strcmp(report.failed_source_path, unreadable) == 0 &&
+                  report.failed_operation != NULL &&
+                  strcmp(report.failed_operation, "open it") == 0 &&
+                  report.failure_errno == EACCES,
+              "an unreadable file is named with what failed and errno");
+    if (chmod(unreadable, 0644) != 0)
+        fatal("could not restore the unreadable fixture");
 
     /* --------------------------------------------------------------------- */
     /* Entry-point contract                                                   */

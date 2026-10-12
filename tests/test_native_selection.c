@@ -282,7 +282,7 @@ int main(void)
 
     CHECK(status2 != BACKUP_CAPTURE_OK);
     CHECK(failure_triggered);
-    CHECK(strstr(captured_text, "Error: Failed to capture") != NULL);
+    CHECK(strstr(captured_text, "Error: could not back up") != NULL);
     CHECK(strstr(captured_text, fail_path) != NULL);
     CHECK(strstr(captured_text, "selected native capture failed") == NULL);
     free(captured_text);

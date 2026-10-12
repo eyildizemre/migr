@@ -2509,21 +2509,32 @@ static void capture_plan_root(const CloneContext *ctx, const BackupPlan *plan,
     root_ctx.selection = selection ? &selection->roots[(size_t)index] : NULL;
 
     capture_report->failed_source_path[0] = '\0';
+    capture_report->failure_kind = BACKUP_CAPTURE_FAILURE_NONE;
+    capture_report->failure_errno = 0;
+    capture_report->failed_operation = NULL;
     BackupCaptureStatus capture_status = backup_capture_at_report_continue(
         &root_ctx, root->capture_path, data_fd,
         root->manifest_root.payload_path, capture_report);
     if (capture_status != BACKUP_CAPTURE_OK)
     {
+        const char *failed_source =
+            capture_report->failed_source_path[0] != '\0'
+                ? capture_report->failed_source_path
+                : root->capture_path;
         if (capture_status == BACKUP_CAPTURE_SOURCE_SAFE_READ)
-        {
-            const char *failed_source =
-                capture_report->failed_source_path[0] != '\0'
-                    ? capture_report->failed_source_path
-                    : root->capture_path;
             print_source_safe_read_refusal(failed_source);
-        }
         else
-            print_error("Error: Failed to capture %s\n", root->capture_path);
+        {
+            print_item_failure("back up", failed_source,
+                               capture_report->failed_operation,
+                               capture_report->failure_errno);
+            size_t root_length = strlen(root->capture_path);
+            const char *below =
+                strncmp(failed_source, root->capture_path, root_length) == 0
+                    ? failed_source + root_length : "";
+            run_log_printf("  Its place in the backup: data/%s%s\n",
+                           root->manifest_root.payload_path, below);
+        }
         *had_error = 1;
     }
     else
@@ -2612,13 +2623,13 @@ static void reconcile_roots(const void *visited, const BackupPlan *plan,
                 visited, root->manifest_root.payload_path, data_fd,
                 &report) != NATIVE_RECONCILE_OK)
         {
-            if (report.failed_relative_path[0] != '\0')
-                print_error("Error: Could not reconcile stale entries under data/%s (%s)\n",
-                            root->manifest_root.payload_path,
-                            report.failed_relative_path);
-            else
-                print_error("Error: Could not reconcile stale entries under data/%s\n",
-                            root->manifest_root.payload_path);
+            char path[PATH_MAX * 2 + 8];
+            snprintf(path, sizeof(path), "data/%s%s%s",
+                     root->manifest_root.payload_path,
+                     report.failed_relative_path[0] != '\0' ? "/" : "",
+                     report.failed_relative_path);
+            print_item_failure("clean up", path,
+                               report.failed_operation, report.failure_errno);
             *had_error = 1;
         }
     }

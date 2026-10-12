@@ -1,4 +1,4 @@
-#define _GNU_SOURCE /* fopencookie, memfd_create */
+#define _GNU_SOURCE /* fopencookie, memfd_create, strerrorname_np */
 #include <stdio.h>
 #include <stdarg.h>
 #include <ctype.h>
@@ -415,6 +415,20 @@ void print_source_safe_read_refusal(const char *label)
            "refused the O_NOATIME open; an O_NOATIME-less retry was not "
            "attempted because it could change atime (ownership or "
            "CAP_FOWNER is required).\n", label);
+}
+
+void print_item_failure(const char *verb, const char *path,
+                        const char *operation, int err)
+{
+    if (operation == NULL)
+        operation = "an internal step failed";
+    print_error("Error: could not %s %s: %s%s%s\n", verb, path, operation,
+                err != 0 ? ": " : "", err != 0 ? strerror(err) : "");
+    if (err != 0)
+    {
+        const char *name = strerrorname_np(err);
+        run_log_printf("  errno %d (%s)\n", err, name != NULL ? name : "?");
+    }
 }
 
 void print_warning(const char *fmt, ...)

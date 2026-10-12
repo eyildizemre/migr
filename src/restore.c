@@ -1759,6 +1759,44 @@ static int restore_timestamp_anchor_policy(const RestoreTimestampAnchors *anchor
     return -1;
 }
 
+// The home folder of the run, shown as ~ in the items an error names.
+static char restore_shown_home[PATH_MAX];
+
+// Names the first item a native restore could not handle by where it goes
+// on this system; its place in the backup and the counts go to the log.
+static void report_native_restore_failure(int dest_root_fd,
+                                          const char *dest_rel,
+                                          const char *source_rel,
+                                          const RestoreNativeReport *report)
+{
+    const char *failed = report->failed_logical_path;
+    size_t source_length = strlen(source_rel);
+    const char *below = strncmp(failed, source_rel, source_length) == 0
+        ? failed + source_length : "";
+    if (dest_rel[0] == '\0' && below[0] == '/')
+        below++;
+    char rel[PATH_MAX * 2];
+    snprintf(rel, sizeof(rel), "%s%s", dest_rel, below);
+    char path[PATH_MAX * 3];
+    describe_path_at(dest_root_fd, rel, path, sizeof(path));
+
+    char shown[sizeof(path) + 1];
+    size_t home_length = strlen(restore_shown_home);
+    if (home_length != 0 &&
+        strncmp(path, restore_shown_home, home_length) == 0 &&
+        (path[home_length] == '/' || path[home_length] == '\0'))
+        snprintf(shown, sizeof(shown), "~%s", path + home_length);
+    else
+        snprintf(shown, sizeof(shown), "%s", path);
+
+    print_item_failure("restore", shown, report->failed_operation,
+                       report->failure_errno);
+    run_log_printf("  Its copy in the backup: %s\n",
+                   failed[0] != '\0' ? failed : source_rel);
+    run_log_printf("  %zu item(s) applied, %zu failed in this part\n",
+                   report->applied_count, report->failed_count);
+}
+
 // Reports the kernel's strict source-read refusal without suggesting an
 // atime-changing fallback; a live replay also includes its partial counts.
 static void report_source_safe_read_refusal(const char *label,
@@ -2040,7 +2078,8 @@ static int restore_item_at(const CloneContext *ctx,
         if (native_status == RESTORE_NATIVE_SOURCE_SAFE_READ)
             report_source_safe_read_refusal(label, &report);
         else
-            print_error("Error: Failed to restore %s\n", label);
+            report_native_restore_failure(dest_root_fd, dest_rel, source_rel,
+                                          &report);
         return -1;
     }
     return 1;
@@ -3877,6 +3916,7 @@ int restore_with_options(const char *source, const RestoreOptions *options)
     char home[PATH_MAX];
     if (resolve_target_home(home) != 0)
         return MIGR_EXIT_FAILURE;
+    snprintf(restore_shown_home, sizeof(restore_shown_home), "%s", home);
 
     struct stat st;
     if (stat(source, &st) != 0 || !S_ISDIR(st.st_mode))
