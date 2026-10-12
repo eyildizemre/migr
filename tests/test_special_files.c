@@ -13,10 +13,9 @@
 //
 // The second is the destination contract that makes writing into an adopted,
 // already-populated container safe: no symlink at any destination address is
-// followed, work a previous run finished is resumed past, and every other
-// collision is refused rather than overwritten. A sentinel outside the
-// destination directory proves the refusals are real rather than merely
-// reported.
+// followed, work a previous run finished is resumed past, and anything else
+// at an address is an older copy, removed and captured again. A sentinel
+// outside the destination directory proves nothing is written through.
 //
 // A final group checks the orchestration contract the entry point enforces: a
 // NULL, wrong-direction, or portable context is refused, never silently cloned,
@@ -1038,17 +1037,19 @@ int main(void)
     write_file(src_file, "payload");
 
     // A symlink standing exactly where the walker would create its final
-    // object: writing through it would land in outside/, so it must be refused.
+    // object: writing through it would land in outside/, so it is replaced.
     char final_link[PATH_MAX];
     if (path_join(final_link, sizeof(final_link), dest_dir, "final_link") != 0)
         fatal("could not build fixture paths");
     if (symlink(sentinel, final_link) != 0)
         fatal("could not create the final-destination symlink fixture");
 
-    check(backup_capture_at(&ctx, src_file, dest_fd, "final_link") != 0,
-          "a symlink at the final destination address is refused, not written through");
+    check(backup_capture_at(&ctx, src_file, dest_fd, "final_link") == 0 &&
+          lstat(final_link, &st) == 0 && S_ISREG(st.st_mode) &&
+          file_contains(final_link, "payload"),
+          "a symlink at the final destination address is replaced, not written through");
     check(file_contains(sentinel, "untouched"),
-          "the file outside the destination is unchanged by that refusal");
+          "the file outside the destination is unchanged by that replacement");
 
     // The same escape one level down: the source is a directory, and the
     // destination already holds a symlinked subdirectory the walker would
@@ -1078,10 +1079,11 @@ int main(void)
     if (symlink(outside_dir, intermediate_link) != 0)
         fatal("could not create the intermediate symlink fixture");
 
-    check(backup_capture_at(&ctx, nested_src, dest_fd, "tree") != 0,
-          "an intermediate destination symlink is refused, not descended through");
+    check(backup_capture_at(&ctx, nested_src, dest_fd, "tree") == 0 &&
+          lstat(intermediate_link, &st) == 0 && S_ISDIR(st.st_mode),
+          "an intermediate destination symlink is replaced, not descended through");
     check(file_contains(sentinel, "untouched"),
-          "the file outside the destination is unchanged by that refusal either");
+          "the file outside the destination is unchanged by that replacement either");
 
     /* --------------------------------------------------------------------- */
     /* Resume and collision                                                   */
@@ -1122,8 +1124,14 @@ int main(void)
         fatal("could not build fixture paths");
     if (symlink("some-other-target", differing_link) != 0)
         fatal("could not create the differing symlink fixture");
-    check(backup_capture_at(&ctx, src_symlink, dest_fd, "differing.link") != 0,
-          "an existing symlink with a different target is refused, not replaced");
+    char differing_target[PATH_MAX];
+    ssize_t differing_length = -1;
+    check(backup_capture_at(&ctx, src_symlink, dest_fd, "differing.link") == 0 &&
+          (differing_length = readlink(differing_link, differing_target,
+                                       sizeof(differing_target) - 1U)) > 0 &&
+          (differing_target[differing_length] = '\0',
+           strcmp(differing_target, "target-of-the-source-link") == 0),
+          "an existing symlink with a different target is replaced");
 
     readlink_truncate_path = src_symlink;
     readlink_truncate_triggered = 0;
@@ -1143,43 +1151,63 @@ int main(void)
           file_contains(existing_dir_child, "smuggled"),
           "resuming into it still writes the source's own children");
 
-    // Type collisions in both directions: a regular file where a directory
-    // belongs, and a directory where a regular file belongs.
+    // Another type at an address, in each direction: a regular file where a
+    // directory belongs, a directory where a regular file belongs, and one
+    // where a FIFO belongs.
     char collide_file[PATH_MAX];
     if (path_join(collide_file, sizeof(collide_file), dest_dir, "collide_file") != 0)
         fatal("could not build fixture paths");
     write_file(collide_file, "not a directory");
-    check(backup_capture_at(&ctx, nested_child, dest_fd, "collide_file") != 0,
-          "a regular file where a directory belongs is refused");
+    check(backup_capture_at(&ctx, nested_child, dest_fd, "collide_file") == 0 &&
+          lstat(collide_file, &st) == 0 && S_ISDIR(st.st_mode),
+          "a regular file where a directory belongs is replaced");
 
-    char collide_dir[PATH_MAX];
-    if (path_join(collide_dir, sizeof(collide_dir), dest_dir, "collide_dir") != 0)
+    char collide_dir[PATH_MAX], collide_child[PATH_MAX];
+    if (path_join(collide_dir, sizeof(collide_dir), dest_dir, "collide_dir") != 0 ||
+        path_join(collide_child, sizeof(collide_child), collide_dir, "child") != 0)
         fatal("could not build fixture paths");
     if (mkdir(collide_dir, 0755) != 0)
         fatal("could not create the colliding directory fixture");
-    check(backup_capture_at(&ctx, src_file, dest_fd, "collide_dir") != 0,
-          "a directory where a regular file belongs is refused");
-    check(backup_capture_at(&ctx, src_fifo, dest_fd, "collide_dir") != 0,
-          "a directory where a FIFO belongs is refused");
+    write_file(collide_child, "older copy");
+    check(backup_capture_at(&ctx, src_file, dest_fd, "collide_dir") == 0 &&
+          file_contains(collide_dir, "payload"),
+          "a directory where a regular file belongs is replaced with its contents");
 
-    // A refusal names the item, what was being done, and errno, which is 0
-    // when the operation says why.
+    char collide_fifo[PATH_MAX];
+    if (path_join(collide_fifo, sizeof(collide_fifo), dest_dir, "collide_fifo") != 0)
+        fatal("could not build fixture paths");
+    if (mkdir(collide_fifo, 0755) != 0)
+        fatal("could not create the colliding directory fixture");
+    check(backup_capture_at(&ctx, src_fifo, dest_fd, "collide_fifo") == 0 &&
+          lstat(collide_fifo, &st) == 0 && S_ISFIFO(st.st_mode),
+          "a directory where a FIFO belongs is replaced");
+
+    // A failure names the item, what was being done, and errno.
     BackupCaptureReport report;
     backup_capture_report_init(&report);
-    check(backup_capture_at_report(&ctx, src_symlink, dest_fd,
-                                   "differing.link", &report) != 0 &&
-              strcmp(report.failed_source_path, src_symlink) == 0 &&
-              report.failed_operation != NULL &&
-              strstr(report.failed_operation, "another target") != NULL &&
-              report.failure_errno == 0,
-          "the differing symlink is named with the reason for its refusal");
-    check(backup_capture_at_report(&ctx, nested_child, dest_fd,
-                                   "collide_file", &report) != 0 &&
-              strcmp(report.failed_source_path, nested_child) == 0 &&
-              report.failed_operation != NULL &&
-              strstr(report.failed_operation, "another kind of item") != NULL &&
-              report.failure_errno == 0,
-          "a type collision is named with its reason");
+    char locked[PATH_MAX], locked_child[PATH_MAX];
+    if (path_join(locked, sizeof(locked), dest_dir, "locked") != 0 ||
+        path_join(locked_child, sizeof(locked_child), locked, "child") != 0)
+        fatal("could not build fixture paths");
+    if (mkdir(locked, 0755) != 0)
+        fatal("could not create the locked directory fixture");
+    write_file(locked_child, "older copy");
+    if (chmod(locked, 0555) != 0)
+        fatal("could not lock the directory fixture");
+    if (geteuid() == 0)
+        skip_check("an older copy that cannot be removed is named with errno "
+                   "(root removes it)");
+    else
+        check(backup_capture_at_report(&ctx, src_file, dest_fd, "locked",
+                                       &report) != 0 &&
+                  strcmp(report.failed_source_path, src_file) == 0 &&
+                  report.failed_operation != NULL &&
+                  strcmp(report.failed_operation,
+                         "remove its older copy in the backup") == 0 &&
+                  report.failure_errno == EACCES,
+              "an older copy that cannot be removed is named with errno");
+    if (chmod(locked, 0755) != 0)
+        fatal("could not unlock the directory fixture");
 
     char unreadable[PATH_MAX];
     if (path_join(unreadable, sizeof(unreadable), src_dir, "unreadable.txt") != 0)

@@ -4681,7 +4681,7 @@ static void test_failed_update_keeps_the_finished_backup(void)
 {
     printf(BLUE "::" NC " production: an update that stops before changing anything keeps the backup as it was\n");
 
-    char home[PATH_MAX], target[PATH_MAX], file[PATH_MAX], inside[PATH_MAX];
+    char home[PATH_MAX], target[PATH_MAX], file[PATH_MAX];
     fresh_mkdtemp(home, sizeof(home), "plan_home");
     setenv("HOME", home, 1);
     join_path(file, sizeof(file), home, "item");
@@ -4697,22 +4697,107 @@ static void test_failed_update_keeps_the_finished_backup(void)
     int found = find_container_dir(target, container, sizeof(container));
     join_path(payload, sizeof(payload), container, "data/item");
 
-    // The item is now a folder where the backup holds a file, which the
-    // metadata preflight refuses.
-    unlink(file);
-    mkdir_p(file);
-    join_path(inside, sizeof(inside), file, "inside.txt");
-    write_file(inside, "now a folder");
+    // The item grew past the backup's own size, and the destination has no
+    // room for the difference.
+    char grown[16384];
+    memset(grown, 'x', sizeof(grown) - 1U);
+    grown[sizeof(grown) - 1U] = '\0';
+    write_file(file, grown);
+    off_t no_rounding_block_size = 1;
+    backup_test_set_block_size_hook(set_test_block_size,
+                                    &no_rounding_block_size);
+    backup_test_set_free_space_hook(force_no_free_space, NULL);
     int second_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
                                          output, sizeof(output));
+    backup_test_set_free_space_hook(NULL, NULL);
+    backup_test_set_block_size_hook(NULL, NULL);
     char updating[PATH_MAX + 16];
     snprintf(updating, sizeof(updating), "%s.updating", container);
     check(first_rc == 0 && found && second_rc == 2 &&
-              strstr(output, "the backup holds another kind of item there") !=
-                  NULL &&
+              strstr(output, "not enough free space") != NULL &&
               access(container, F_OK) == 0 && access(updating, F_OK) != 0 &&
               file_text_is(payload, "before"),
           "the backup keeps its finished name and content");
+
+    remove_tree(home);
+    remove_tree(target);
+}
+
+// What a native update finds at an item's address came from that item, so a
+// link with another target, another kind of item, or a separate copy of what
+// is now a hardlink is replaced (D72).
+static void test_native_update_replaces_changed_items(void)
+{
+    printf(BLUE "::" NC " production: a native update replaces items whose kind or link changed\n");
+
+    char home[PATH_MAX], target[PATH_MAX], work[PATH_MAX], link_path[PATH_MAX];
+    char kind[PATH_MAX], inside[PATH_MAX], folder[PATH_MAX], folder_file[PATH_MAX];
+    char first[PATH_MAX], second[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_home");
+    setenv("HOME", home, 1);
+    join_path(work, sizeof(work), home, "work");
+    join_path(link_path, sizeof(link_path), work, "link");
+    join_path(kind, sizeof(kind), work, "kind");
+    join_path(inside, sizeof(inside), kind, "inside.txt");
+    join_path(folder, sizeof(folder), work, "folder");
+    join_path(folder_file, sizeof(folder_file), folder, "file.txt");
+    join_path(first, sizeof(first), work, "first");
+    join_path(second, sizeof(second), work, "second");
+    mkdir_p(folder);
+    write_file(folder_file, "in a folder");
+    write_file(kind, "a file");
+    write_file(first, "shared");
+    write_file(second, "shared");
+    if (symlink("old-target", link_path) != 0)
+        check(0, "the link fixture is created");
+    fresh_mkdtemp(target, sizeof(target), "plan_target");
+    char *paths[] = { work, NULL };
+    char output[8192];
+    dry_run = 0;
+    int first_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                        output, sizeof(output));
+
+    unlink(link_path);
+    unlink(kind);
+    mkdir_p(kind);
+    write_file(inside, "now a folder");
+    remove_tree(folder);
+    unlink(second);
+    if (symlink("new-target", link_path) != 0 ||
+        symlink("elsewhere", folder) != 0 || link(first, second) != 0)
+        check(0, "the changed fixtures are created");
+    int second_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                         output, sizeof(output));
+
+    char container[PATH_MAX], data[PATH_MAX], copy[PATH_MAX];
+    int found = find_container_dir(target, container, sizeof(container));
+    join_path(data, sizeof(data), container, "data/work");
+    char link_target[PATH_MAX] = "";
+    join_path(copy, sizeof(copy), data, "link");
+    ssize_t link_length = readlink(copy, link_target, sizeof(link_target) - 1U);
+    if (link_length > 0)
+        link_target[link_length] = '\0';
+    char folder_target[PATH_MAX] = "";
+    join_path(copy, sizeof(copy), data, "folder");
+    ssize_t folder_length = readlink(copy, folder_target,
+                                     sizeof(folder_target) - 1U);
+    if (folder_length > 0)
+        folder_target[folder_length] = '\0';
+    struct stat first_copy = {0}, second_copy = {0};
+    join_path(copy, sizeof(copy), data, "first");
+    int first_ok = lstat(copy, &first_copy) == 0;
+    join_path(copy, sizeof(copy), data, "second");
+    int second_ok = lstat(copy, &second_copy) == 0;
+    join_path(copy, sizeof(copy), data, "kind/inside.txt");
+    check(first_rc == 0 && second_rc == 0 && found, "the update succeeds");
+    check(strcmp(link_target, "new-target") == 0,
+          "a link with another target is replaced");
+    check(file_text_is(copy, "now a folder"),
+          "a file that became a folder is replaced");
+    check(strcmp(folder_target, "elsewhere") == 0,
+          "a folder that became a link is replaced");
+    check(first_ok && second_ok && first_copy.st_ino == second_copy.st_ino,
+          "a separate copy of what is now a hardlink is replaced by the link");
 
     remove_tree(home);
     remove_tree(target);
@@ -5260,6 +5345,7 @@ int main(void)
     test_open_application_settings_are_backed_up_last(1);
     test_backup_leaves_another_install_alone();
     test_failed_update_keeps_the_finished_backup();
+    test_native_update_replaces_changed_items();
     test_native_preflight_of_a_changing_source();
     test_update_repairs_payload_without_walking_it();
     test_updates_rewrite_a_grown_journal();

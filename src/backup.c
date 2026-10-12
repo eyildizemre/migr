@@ -2702,7 +2702,9 @@ static int metadata_existing_at(int root_fd, const char *rel,
         {
             int saved_errno = errno;
             close(current);
-            if (saved_errno == ENOENT)
+            // ENOTDIR: an older copy of another kind is on the way, and
+            // capture replaces it with a folder.
+            if (saved_errno == ENOENT || saved_errno == ENOTDIR)
                 return 0;
             errno = saved_errno;
             return -1;
@@ -2824,15 +2826,10 @@ static int backup_metadata_inventory(const char *source_path, int anchor_fd,
         return -1;
     }
 
+    // Another kind of item there is an older copy, which capture replaces.
     if (destination_exists &&
-        ((S_ISDIR(source_st.st_mode) && !S_ISDIR(existing_st.st_mode)) ||
-         (S_ISREG(source_st.st_mode) && !S_ISREG(existing_st.st_mode)) ||
-         (S_ISFIFO(source_st.st_mode) && !S_ISFIFO(existing_st.st_mode))))
-    {
-        failed_item_note(failure, source_path,
-                         "the backup holds another kind of item there", 0);
-        return -1;
-    }
+        (source_st.st_mode & S_IFMT) != (existing_st.st_mode & S_IFMT))
+        destination_exists = 0;
 
     if (!S_ISSOCK(source_st.st_mode) && !S_ISCHR(source_st.st_mode) &&
         !S_ISBLK(source_st.st_mode) &&

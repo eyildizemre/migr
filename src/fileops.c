@@ -1336,10 +1336,34 @@ static BackupCaptureStatus capture_entry_at(const CloneContext *ctx,
                                             const char *rel_path,
                                             BackupCaptureReport *report);
 
+static int native_remove_leaf(int parent_fd, const char *leaf);
+
+// Everything at an address in a native backup was captured from the same
+// source path (D72), so another kind of item there, or a link to another
+// target, is an older copy: it is removed, never written through, and the
+// current one takes its place.
+static int capture_remove_older_copy(int dest_dir_fd, const char *leaf,
+                                     const char *src,
+                                     BackupCaptureReport *report)
+{
+    if (native_remove_leaf(dest_dir_fd, leaf) == 0)
+        return 0;
+    capture_fail(report, src, "remove its older copy in the backup", errno);
+    return -1;
+}
+
+static int symlink_has_target_at(int dir_fd, const char *leaf,
+                                 const char *target)
+{
+    char existing[PATH_MAX];
+    ssize_t length = readlinkat(dir_fd, leaf, existing, sizeof(existing));
+    return length >= 0 && (size_t)length == strlen(target) &&
+           memcmp(existing, target, (size_t)length) == 0;
+}
+
 // An identical symlink already at this address is work a previous run
-// finished, so resuming past it succeeds. Any other object there -- a
-// symlink to somewhere else included -- is a genuine collision and is
-// refused rather than replaced.
+// finished, so resuming past it succeeds; anything else there is an older
+// copy and is replaced.
 static int capture_symlink_at(const char *src, int dest_dir_fd, const char *leaf,
                               const struct stat *st,
                               MetadataTimestampPolicy policy,
@@ -1370,37 +1394,16 @@ static int capture_symlink_at(const char *src, int dest_dir_fd, const char *leaf
             capture_fail(report, src, "create the link in the backup", errno);
             return -1;
         }
-
-        struct stat dest_st;
-        if (fstatat(dest_dir_fd, leaf, &dest_st, AT_SYMLINK_NOFOLLOW) != 0)
+        if (!symlink_has_target_at(dest_dir_fd, leaf, link_target))
         {
-            capture_fail(report, src, "inspect what the backup holds there",
-                         errno);
-            return -1;
-        }
-        if (!S_ISLNK(dest_st.st_mode))
-        {
-            capture_fail(report, src,
-                         "the backup holds another kind of item there", 0);
-            return -1;
-        }
-
-        char existing[PATH_MAX];
-        ssize_t existing_len = readlinkat(dest_dir_fd, leaf, existing, sizeof(existing));
-        if (existing_len < 0 || (size_t)existing_len >= sizeof(existing))
-        {
-            capture_fail(report, src, "read the link in the backup",
-                         existing_len < 0 ? errno : ENAMETOOLONG);
-            return -1;
-        }
-        existing[existing_len] = '\0';
-
-        if (strcmp(existing, link_target) != 0)
-        {
-            capture_fail(report, src,
-                         "the backup holds a link with another target there",
-                         0);
-            return -1;
+            if (capture_remove_older_copy(dest_dir_fd, leaf, src, report) != 0)
+                return -1;
+            if (symlinkat(link_target, dest_dir_fd, leaf) != 0)
+            {
+                capture_fail(report, src, "create the link in the backup",
+                             errno);
+                return -1;
+            }
         }
     }
 
@@ -1595,10 +1598,10 @@ static BackupCaptureStatus capture_hardlink_at(
     {
         if (native_hardlink_identity_matches(&existing, &representative))
             return BACKUP_CAPTURE_OK;
-        capture_fail(report, src, "the backup holds another item there", 0);
-        return BACKUP_CAPTURE_ERROR;
+        if (capture_remove_older_copy(dest_dir_fd, leaf, src, report) != 0)
+            return BACKUP_CAPTURE_ERROR;
     }
-    if (errno != ENOENT)
+    else if (errno != ENOENT)
     {
         capture_fail(report, src, "inspect what the backup holds there", errno);
         return BACKUP_CAPTURE_ERROR;
@@ -1702,16 +1705,17 @@ static BackupCaptureStatus capture_regular_at(
     struct stat dest_st;
     if (fstatat(dest_dir_fd, leaf, &dest_st, AT_SYMLINK_NOFOLLOW) == 0)
     {
-        // A matching size and mtime is the resume signal; a different type at
-        // the same address is a collision, never something to truncate.
+        // A matching size and mtime is the resume signal; another kind of
+        // item there is an older copy, never something to truncate.
         if (!S_ISREG(dest_st.st_mode))
         {
-            capture_fail(report, src,
-                         "the backup holds another kind of item there", 0);
-            close(src_fd);
-            return BACKUP_CAPTURE_ERROR;
+            if (capture_remove_older_copy(dest_dir_fd, leaf, src, report) != 0)
+            {
+                close(src_fd);
+                return BACKUP_CAPTURE_ERROR;
+            }
         }
-        if (dest_st.st_size == source_snapshot.st_size &&
+        else if (dest_st.st_size == source_snapshot.st_size &&
             dest_st.st_mtim.tv_sec == source_snapshot.st_mtim.tv_sec &&
             policy.nsec_exact &&
             dest_st.st_mtim.tv_nsec == source_snapshot.st_mtim.tv_nsec)
@@ -1892,6 +1896,25 @@ static BackupCaptureStatus capture_regular_at(
 // directory (e.g. 0555) impossible to descend into and populate, and the
 // transient 0700 is never more permissive to group or other than the mode it
 // ends up with.
+// The folder's copy at leaf, made if missing. O_NOFOLLOW rejects a symlink
+// standing there (descending through it would write payload outside the
+// container), O_DIRECTORY every other kind of item: errno is then ELOOP or
+// ENOTDIR, and the caller replaces it.
+static int open_folder_copy_at(int dest_dir_fd, const char *leaf,
+                               const char **step)
+{
+    if (mkdirat(dest_dir_fd, leaf, 0700) != 0 && errno != EEXIST)
+    {
+        *step = "create the folder in the backup";
+        return -1;
+    }
+    int fd = openat(dest_dir_fd, leaf,
+                    O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0)
+        *step = "open the folder in the backup";
+    return fd;
+}
+
 static BackupCaptureStatus capture_directory_at(
     const CloneContext *ctx, const char *src, int dest_dir_fd,
     const char *leaf, const struct stat *st, const char *root_key,
@@ -1933,25 +1956,17 @@ static BackupCaptureStatus capture_directory_at(
         return BACKUP_CAPTURE_ERROR;
     }
 
-    if (mkdirat(dest_dir_fd, leaf, 0700) != 0 && errno != EEXIST)
+    const char *step = NULL;
+    int child_fd = open_folder_copy_at(dest_dir_fd, leaf, &step);
+    if (child_fd < 0 && (errno == ENOTDIR || errno == ELOOP))
     {
-        capture_fail(report, src, "create the folder in the backup", errno);
-        close(source_fd);
-        return BACKUP_CAPTURE_ERROR;
+        step = "remove its older copy in the backup";
+        if (native_remove_leaf(dest_dir_fd, leaf) == 0)
+            child_fd = open_folder_copy_at(dest_dir_fd, leaf, &step);
     }
-
-    // O_NOFOLLOW rejects a symlink standing where the directory should be
-    // (descending through it would write payload outside the container);
-    // O_DIRECTORY rejects every other wrong type in the same call.
-    int child_fd = openat(dest_dir_fd, leaf,
-                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (child_fd < 0)
     {
-        capture_fail(report, src,
-                     errno == ENOTDIR || errno == ELOOP
-                         ? "the backup holds another kind of item there"
-                         : "open the folder in the backup",
-                     errno == ENOTDIR || errno == ELOOP ? 0 : errno);
+        capture_fail(report, src, step, errno);
         close(source_fd);
         return BACKUP_CAPTURE_ERROR;
     }
@@ -2021,7 +2036,7 @@ static BackupCaptureStatus capture_directory_at(
             result = BACKUP_CAPTURE_ERROR;
     }
     int directory_changed = 0;
-    const char *step = NULL;
+    step = NULL;
     if (result == BACKUP_CAPTURE_OK &&
         apply_fd_metadata_tail(child_fd, &source_snapshot, NULL, source_fd,
                                metadata_policy_from_context(ctx), NULL,
@@ -2049,7 +2064,8 @@ static BackupCaptureStatus capture_directory_at(
 
 // Recreate the node itself, never its contents: reading a FIFO blocks until a
 // writer appears, which would hang the whole backup. An existing FIFO at this
-// address is accepted so an interrupted backup can resume past it.
+// address is accepted so an interrupted backup can resume past it; anything
+// else there is an older copy and is replaced.
 static int capture_fifo_at(const CloneContext *ctx, const char *src,
                            int dest_dir_fd, const char *leaf,
                            const struct stat *st, BackupCaptureReport *report)
@@ -2070,9 +2086,14 @@ static int capture_fifo_at(const CloneContext *ctx, const char *src,
         }
         if (!S_ISFIFO(dest_st.st_mode))
         {
-            capture_fail(report, src,
-                         "the backup holds another kind of item there", 0);
-            return -1;
+            if (capture_remove_older_copy(dest_dir_fd, leaf, src, report) != 0)
+                return -1;
+            if (mkfifoat(dest_dir_fd, leaf, st->st_mode & 07777) != 0)
+            {
+                capture_fail(report, src, "create the FIFO in the backup",
+                             errno);
+                return -1;
+            }
         }
     }
 

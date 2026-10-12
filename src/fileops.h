@@ -292,8 +292,10 @@ void backup_test_fail_next_source_open(int error);
  * Resuming is address-by-address, and only where the existing object proves the work
  * was already done: a regular file whose size and mtime match is skipped, a symlink
  * with the identical target is accepted, and an existing directory or FIFO is
- * accepted when it is genuinely that type. Every other collision -- a differing
- * symlink target, or any type mismatch -- is an error, never an overwrite.
+ * accepted when it is genuinely that type. Everything at an address came from the
+ * same source path (docs/DECISIONS.md D72), so a symlink with another target or an
+ * object of another type is an older copy: it is removed, never written through,
+ * and captured again.
  *
  * The context is validated, not merely carried: a NULL ctx, a mismatched operation, or
  * an unsupported representation is refused rather than run, so a dispatch mistake
