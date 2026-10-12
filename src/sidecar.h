@@ -60,6 +60,10 @@ typedef enum {
     SIDECAR_STATUS_CALLBACK
 } SidecarStatus;
 
+/* What a status other than SIDECAR_STATUS_OK means, as a reason for an
+ * error message; SIDECAR_STATUS_IO_ERROR leaves the cause in errno. */
+const char *sidecar_status_reason(SidecarStatus status);
+
 typedef enum {
     SIDECAR_OPEN_FRESH = 0,
     SIDECAR_OPEN_RESUMABLE,

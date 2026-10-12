@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <stdint.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -108,7 +109,8 @@ static void install_flatpak_apps(const FlatpakApp *apps, size_t count,
     int *done = calloc(count, sizeof(*done));
     if (argv == NULL || done == NULL)
     {
-        print_error("Error: Could not allocate the Flatpak install batch\n");
+        print_error("Error: Could not allocate the Flatpak install batch: %s\n",
+                    strerror(errno));
         *had_error = 1;
         free(argv);
         free(done);
@@ -223,7 +225,8 @@ void restore_flatpak_apps(int source_root_fd, int online, FILE *todo,
     if (remotes == NULL || wanted == NULL || unreachable == NULL ||
         from_flathub == NULL)
     {
-        print_error("Error: Could not allocate the Flatpak application list\n");
+        print_error("Error: Could not allocate the Flatpak application list: %s\n",
+                    strerror(errno));
         *had_error = 1;
         goto done;
     }

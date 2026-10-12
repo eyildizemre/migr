@@ -258,7 +258,7 @@ void restore_groups(int source_root_fd, const char *user, FILE *todo,
     if (user == NULL || wanted == NULL || missing == NULL)
     {
         print_error("Error: Could not match the saved group memberships "
-                    "against this system\n");
+                    "against this system: %s\n", strerror(errno));
         *had_error = 1;
         goto done;
     }
@@ -270,7 +270,8 @@ void restore_groups(int source_root_fd, const char *user, FILE *todo,
     GroupMatch match = { names, count, user, wanted, missing };
     if (group_file_foreach(match_group, &match) != 0)
     {
-        print_error("Error: Could not read %s\n", group_file_path());
+        print_error("Error: Could not read %s: %s\n", group_file_path(),
+                    strerror(errno));
         *had_error = 1;
         goto done;
     }
@@ -299,7 +300,8 @@ void restore_groups(int source_root_fd, const char *user, FILE *todo,
         char *joined = join_group_names(names, wanted, count);
         if (joined == NULL)
         {
-            print_error("Error: Could not allocate the group list\n");
+            print_error("Error: Could not allocate the group list: %s\n",
+                        strerror(errno));
             *had_error = 1;
             goto done;
         }
@@ -307,11 +309,15 @@ void restore_groups(int source_root_fd, const char *user, FILE *todo,
             "usermod", "-a", "-G", joined, "--", (char *)user, NULL
         };
         int status = package_run_command(argv);
+        int saved_errno = errno;
         free(joined);
         if (status != 0)
         {
-            print_error("Error: Could not add %s to the saved groups "
-                        "(usermod exited with %d)\n", user, status);
+            errno = saved_errno;
+            FailedStep failed = {0};
+            failed_step_note_command(&failed, "run usermod", status);
+            print_step_failure(&failed, "Error: Could not add %s to the saved "
+                                        "groups", user);
             *had_error = 1;
             goto done;
         }

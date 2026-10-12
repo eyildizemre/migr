@@ -435,7 +435,8 @@ static int finished_container_open(const char *path, Manifest *manifest,
                  status == MANIFEST_STATUS_LEGACY)
             print_error("Error: %s is not a versioned migr backup.\n", path);
         else
-            print_error("Error: Could not read manifest.txt in %s.\n", path);
+            print_error("Error: Could not read manifest.txt in %s: %s\n",
+                        path, strerror(errno));
         close(container_fd);
         return -1;
     }
@@ -881,8 +882,8 @@ int verify_backup(const char *path)
     if (sidecar_log_open_readonly_at(container_fd, &sidecar) !=
         SIDECAR_OPEN_RESUMABLE)
     {
-        print_error("Error: Could not open the backup journal (%s).\n",
-                    SIDECAR_SLOT_NAME);
+        print_error("Error: Could not open the backup journal (%s): %s\n",
+                    SIDECAR_SLOT_NAME, strerror(errno));
         goto done;
     }
     sidecar_open = 1;

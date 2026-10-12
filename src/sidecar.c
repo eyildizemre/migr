@@ -701,6 +701,28 @@ int sidecar_live_entry_count_allowed(uint64_t count)
     return count <= SIDECAR_MAX_LIVE_ENTRIES;
 }
 
+const char *sidecar_status_reason(SidecarStatus status)
+{
+    switch (status)
+    {
+        case SIDECAR_STATUS_OK: return "it succeeded";
+        case SIDECAR_STATUS_TRUNCATED_TAIL: return "the journal ends mid-record";
+        case SIDECAR_STATUS_INVALID_ARGUMENT:
+            return "the journal state refused the record";
+        case SIDECAR_STATUS_IO_ERROR: return "the journal could not be read "
+                                             "or written";
+        case SIDECAR_STATUS_CORRUPT: return "the journal is damaged there";
+        case SIDECAR_STATUS_UNKNOWN_VERSION:
+            return "the journal's format is newer than this migr";
+        case SIDECAR_STATUS_LIMIT: return "a journal limit was reached";
+        case SIDECAR_STATUS_ALLOCATION: return "out of memory";
+        case SIDECAR_STATUS_UNSUPPORTED_KIND:
+            return "the journal names a kind of item migr does not know";
+        case SIDECAR_STATUS_CALLBACK: return "a step reading the journal failed";
+    }
+    return "the journal returned an unknown status";
+}
+
 static const char *sidecar_object_kind_name(SidecarObjectKind kind)
 {
     switch (kind)

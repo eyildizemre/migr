@@ -10,6 +10,7 @@
 
 #include <errno.h>
 #include <stdio.h>
+#include <string.h>
 
 // The preflight's roots follow the manifest's, index for index.
 static void portable_restore_preview(
@@ -121,8 +122,10 @@ static PortableRestoreOutcome portable_restore_orchestrate_impl(
         {
             report->live_count = preflight.live_count;
             fflush(stdout);
-            print_error("Error: could not measure destination timestamp support; "
-                   "no destination was changed\n");
+            print_error("Error: could not measure how precisely the "
+                        "destination keeps file times: %s\n",
+                        strerror(errno));
+            print_error("  No destination was changed.\n");
             portable_restore_preflight_report_free(&preflight);
             return PORTABLE_RESTORE_ERROR;
         }

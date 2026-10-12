@@ -157,13 +157,14 @@ void print_source_safe_read_refusal(const char *label);
 void print_item_failure(const char *verb, const char *path,
                         const char *operation, int err);
 
-/* The first step of several that failed, with errno, 0 when the step says
- * why on its own, or, for a command, its exit status. Zero-initialized, it
- * holds none. */
+/* The first step of several that failed, and why: errno, a command's exit
+ * status, or a fixed reason; none of them when the step says why on its
+ * own. Zero-initialized, it holds none. */
 typedef struct {
     const char *step;
     int err;
     int exit_status;
+    const char *reason;
 } FailedStep;
 
 /**
@@ -184,6 +185,13 @@ typedef struct {
  */
 void failed_item_note(FailedItem *failed, const char *path, const char *step,
                       int err);
+
+/**
+ * @brief Records step with a fixed reason unless a step was already
+ *        recorded.
+ */
+void failed_step_note_reason(FailedStep *failed, const char *step,
+                             const char *reason);
 
 /**
  * @brief Records a command that failed, given what run_command() and its

@@ -105,7 +105,9 @@ static char *collect_packages(int *count_out)
 
     if (cmd == NULL)
     {
-        print_error("Error: Could not detect distribution.\n");
+        print_error("Error: Could not detect the distribution; migr knows "
+                    "the package managers of the Fedora, Debian, and Arch "
+                    "families.\n");
         return NULL;
     }
 
@@ -119,15 +121,20 @@ static char *collect_packages(int *count_out)
     char *buffer = malloc(buf_size);
     if (buffer == NULL)
     {
-        print_error("Error: Could not allocate buffer.\n");
+        print_error("Error: Could not allocate the package list: %s\n",
+                    strerror(errno));
         return NULL;
     }
 
     buffer[0] = '\0';
 
-    if (run_command_capture(cmd, buffer, buf_size) != 0)
+    int listed = run_command_capture(cmd, buffer, buf_size);
+    if (listed != 0)
     {
-        print_error("Error: Could not run package command.\n");
+        FailedStep failed = {0};
+        failed_step_note_command(&failed, "run it", listed);
+        print_step_failure(&failed, "Error: Could not list the installed "
+                                    "packages with %s", cmd[0]);
         free(buffer);
         return NULL;
     }
@@ -477,7 +484,8 @@ char *package_capture_query(char *const argv[], const char *label,
     char *output = malloc(PACKAGE_QUERY_BUFFER_SIZE);
     if (output == NULL)
     {
-        print_error("Error: Could not allocate package query buffer\n");
+        print_error("Error: Could not allocate package query buffer: %s\n",
+                    strerror(errno));
         *had_error = 1;
         return NULL;
     }
@@ -488,7 +496,13 @@ char *package_capture_query(char *const argv[], const char *label,
     size_t length = strnlen(output, PACKAGE_QUERY_BUFFER_SIZE);
     if (result != 0 || length >= PACKAGE_QUERY_BUFFER_SIZE - 1U)
     {
-        print_error("Error: Could not query %s\n", label);
+        FailedStep failed = {0};
+        if (result != 0)
+            failed_step_note_command(&failed, "run the query", result);
+        else
+            failed_step_note(&failed, "its answer is larger than migr reads",
+                             0);
+        print_step_failure(&failed, "Error: Could not query %s", label);
         *had_error = 1;
         free(output);
         return NULL;
@@ -701,7 +715,7 @@ static char *pacman_records(const NameList *names, int *had_error)
     }
     else
     {
-        print_error("Error: Could not allocate the package query\n");
+        print_error("Error: Could not allocate the package query: %s\n", strerror(errno));
         *had_error = 1;
     }
     free(argv);
@@ -844,7 +858,7 @@ static char *arch_module_packages(int *had_error)
     free(marks.text);
     if (failed)
     {
-        print_error("Error: Could not allocate the package query\n");
+        print_error("Error: Could not allocate the package query: %s\n", strerror(errno));
         *had_error = 1;
         free(held.text);
         return NULL;
@@ -951,7 +965,7 @@ int package_open_control_file(int source_root_fd, const char *leaf,
     {
         if (errno == ENOENT)
             return CONTROL_FILE_ABSENT;
-        print_error("Error: Could not read %s\n", leaf);
+        print_error("Error: Could not read %s: %s\n", leaf, strerror(errno));
         *had_error = 1;
         return CONTROL_FILE_UNUSABLE;
     }
@@ -959,8 +973,9 @@ int package_open_control_file(int source_root_fd, const char *leaf,
     struct stat st;
     if (fstat(fd, &st) != 0)
     {
+        print_error("Error: Could not inspect %s: %s\n", leaf,
+                    strerror(errno));
         close(fd);
-        print_error("Error: Could not inspect %s\n", leaf);
         *had_error = 1;
         return CONTROL_FILE_UNUSABLE;
     }
@@ -975,8 +990,8 @@ int package_open_control_file(int source_root_fd, const char *leaf,
     *out = fdopen(fd, "r");
     if (*out == NULL)
     {
+        print_error("Error: Could not read %s: %s\n", leaf, strerror(errno));
         close(fd);
-        print_error("Error: Could not read %s\n", leaf);
         *had_error = 1;
         return CONTROL_FILE_UNUSABLE;
     }
@@ -1004,7 +1019,8 @@ static void package_install_batch(distro_t distro, char *const *prefix,
         ? malloc(argv_count * sizeof(*argv)) : NULL;
     if (argv == NULL)
     {
-        print_error("Error: Could not allocate package install batch\n");
+        print_error("Error: Could not allocate package install batch: %s\n",
+                    strerror(errno));
         *had_error = 1;
         return;
     }
@@ -1086,7 +1102,7 @@ static int package_restore_list(distro_t distro, char *const *prefix,
     char **unmarked = malloc(pkg_count * sizeof(*unmarked));
     if (missing == NULL || unmarked == NULL)
     {
-        print_error("Error: Could not allocate the package lists\n");
+        print_error("Error: Could not allocate the package lists: %s\n", strerror(errno));
         *had_error = 1;
         free(missing);
         free(unmarked);

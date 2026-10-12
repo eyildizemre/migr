@@ -1059,7 +1059,8 @@ static int validate_destination_identity(Collection *collection)
             errno == E2BIG)
             print_error("Error: Portable restore destination identity budget exceeded while registering destination HOME ancestry\n");
         else
-            print_error("Error: Could not inspect destination HOME ancestry for portable restore\n");
+            print_error("Error: Could not inspect destination HOME ancestry for portable restore: %s\n",
+                        strerror(errno));
         report_violation(collection->report, SIZE_MAX, "destination HOME");
         destination_identity_graph_free(&graph);
         return -1;
@@ -1085,7 +1086,8 @@ static int validate_destination_identity(Collection *collection)
         if (status == DESTINATION_IDENTITY_RESOURCE_ERROR && errno == E2BIG)
             print_error("Error: Portable restore destination identity budget exceeded while ordering the destination namespace\n");
         else
-            print_error("Error: Could not order the portable restore destination namespace\n");
+            print_error("Error: Could not order the portable restore destination namespace: %s\n",
+                        strerror(errno));
         report_violation(collection->report, SIZE_MAX,
                          "destination namespace");
         destination_identity_graph_free(&graph);

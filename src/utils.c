@@ -434,6 +434,15 @@ void failed_item_note(FailedItem *failed, const char *path, const char *step,
     failed_step_note(&failed->step, step, err);
 }
 
+void failed_step_note_reason(FailedStep *failed, const char *step,
+                             const char *reason)
+{
+    if (failed == NULL || failed->step != NULL)
+        return;
+    failed_step_note(failed, step, 0);
+    failed->reason = reason;
+}
+
 void failed_step_note_command(FailedStep *failed, const char *step,
                               int result)
 {
@@ -458,6 +467,8 @@ static void print_step(int warning, const FailedStep *failed,
     else if (failed != NULL && failed->exit_status != 0)
         snprintf(cause, sizeof(cause), ": it exited with status %d",
                  failed->exit_status);
+    else if (failed != NULL && failed->reason != NULL)
+        snprintf(cause, sizeof(cause), ": %s", failed->reason);
     if (warning)
         print_warning("%s: %s%s\n", message, step, cause);
     else

@@ -2269,8 +2269,8 @@ int destination_identity_graph_add_entries(
         if (view.root_index >= (size_t)manifest->root_count ||
             destination_identity_logical_copy(&view, logical) != 0)
         {
-            print_error("Error: Could not read portable restore destination entry %zu\n",
-                        index);
+            print_error("Error: Could not read portable restore destination entry %zu: %s\n",
+                        index, strerror(errno));
             report_failure(context, index);
             return -1;
         }
@@ -2282,9 +2282,9 @@ int destination_identity_graph_add_entries(
                 destination_xdg_dirs, xdg_anchor_fd, xdg_anchor_prefix,
                 &anchor, relative, sizeof(relative)) != 0)
         {
-            print_error("Error: Could not resolve portable restore destination for manifest root %s entry %s\n",
+            print_error("Error: Could not resolve portable restore destination for manifest root %s entry %s: %s\n",
                         manifest->roots[view.root_index].id,
-                        logical[0] == '\0' ? "." : logical);
+                        logical[0] == '\0' ? "." : logical, strerror(errno));
             report_failure(context, index);
             return -1;
         }
@@ -2295,7 +2295,7 @@ int destination_identity_graph_add_entries(
             int key = xdg_key_index(root->id);
             if (key < 0 || key >= XDG_KEY_COUNT)
             {
-                print_error("Error: Could not identify XDG restore destination for manifest root %s\n",
+                print_error("Error: Could not identify XDG restore destination for manifest root %s: it names no user folder\n",
                             root->id);
                 report_failure(context, index);
                 return -1;
@@ -2311,8 +2311,8 @@ int destination_identity_graph_add_entries(
                         print_error("Error: Portable restore destination identity budget exceeded while registering XDG ancestry for manifest root %s\n",
                                     root->id);
                     else
-                        print_error("Error: Could not inspect XDG destination ancestry for manifest root %s\n",
-                                    root->id);
+                        print_error("Error: Could not inspect XDG destination ancestry for manifest root %s: %s\n",
+                                    root->id, strerror(errno));
                     report_failure(context, index);
                     return -1;
                 }
@@ -2414,8 +2414,8 @@ int destination_identity_graph_add_entries(
                 print_error("Error: Portable restore destination identity budget exceeded while mapping manifest root %s entry %s\n",
                             root->id, logical[0] == '\0' ? "." : logical);
             else
-                print_error("Error: Could not inspect mapped restore destination for manifest root %s entry %s\n",
-                            root->id, logical[0] == '\0' ? "." : logical);
+                print_error("Error: Could not inspect mapped restore destination for manifest root %s entry %s: %s\n",
+                            root->id, logical[0] == '\0' ? "." : logical, strerror(errno));
             report_failure(context, index);
             return -1;
         }

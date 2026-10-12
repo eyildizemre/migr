@@ -4504,7 +4504,8 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         ctx.inode_map = native_inode_map_create();
         if (ctx.inode_map == NULL)
         {
-            print_error("Error: Could not initialize native hardlink restore tracking: %s\n", strerror(errno));
+            print_error("Error: Could not initialize native hardlink restore tracking: %s\n",
+                        strerror(errno));
             goto cleanup;
         }
 

@@ -324,10 +324,14 @@ int console_restore_hand_over(int vt, const char *source,
     argv[argc++] = "--";
     argv[argc++] = escaped;
     argv[argc] = NULL;
-    if (run_command(argv) != 0)
+    int started = run_command(argv);
+    if (started != 0)
     {
-        print_error("Error: Could not start the restore on a text screen. "
-                    "Nothing was changed.\n");
+        FailedStep failed = {0};
+        failed_step_note_command(&failed, "run systemd-run", started);
+        print_step_failure(&failed, "Error: Could not start the restore on a "
+                                    "text screen");
+        print_error("  Nothing was changed.\n");
         return -1;
     }
     printf("Continuing on a text screen.\n");
@@ -394,10 +398,21 @@ int console_restore_take_over(void)
     uid_t uid;
     gid_t gid;
     char *stop[] = { "systemctl", "stop", "display-manager.service", NULL };
-    if (sudo_invoker(&uid, &gid, NULL) != 1 || run_quiet(stop) != 0)
+    FailedStep failed = {0};
+    if (sudo_invoker(&uid, &gid, NULL) != 1)
+        failed_step_note(&failed, "it was not started with sudo", 0);
+    else
     {
-        print_error("Error: Could not close the desktop. Nothing was "
-                    "changed.\n");
+        int stopped = run_quiet(stop);
+        if (stopped != 0)
+            failed_step_note_command(&failed,
+                                     "run systemctl stop "
+                                     "display-manager.service", stopped);
+    }
+    if (failed.step != NULL)
+    {
+        print_step_failure(&failed, "Error: Could not close the desktop");
+        print_error("  Nothing was changed.\n");
         return -1;
     }
     // Some display managers leave the session running.
@@ -421,8 +436,9 @@ int console_restore_take_over(void)
     if (ioctl(STDIN_FILENO, VT_ACTIVATE, vt) != 0 ||
         ioctl(STDIN_FILENO, VT_WAITACTIVE, vt) != 0)
     {
-        print_error("Error: Could not show the text screen. Nothing was "
-                    "changed.\n");
+        print_error("Error: Could not show the text screen %d: %s\n", vt,
+                    strerror(errno));
+        print_error("  Nothing was changed.\n");
         return -1;
     }
     return 0;

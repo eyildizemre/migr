@@ -512,14 +512,25 @@ static int synthesize_directory_metadata(RepairSalvage *salvage,
     return 0;
 }
 
+static void note_sidecar_failure(FailedStep *failed, const char *step,
+                                 SidecarStatus status)
+{
+    if (status == SIDECAR_STATUS_IO_ERROR)
+        failed_step_note(failed, step, errno);
+    else
+        failed_step_note_reason(failed, step, sidecar_status_reason(status));
+}
+
 // Every item whose capture began but whose ENTRY was lost is either re-created
 // (a directory, so its recorded children stay reachable) or left out.
-static int close_open_claims(RepairSalvage *salvage)
+static int close_open_claims(RepairSalvage *salvage, FailedStep *failed)
 {
     RepairClaims claims = {0};
-    if (sidecar_log_claim_foreach(salvage->log, collect_claim, &claims) !=
-        SIDECAR_STATUS_OK)
+    SidecarStatus listed = sidecar_log_claim_foreach(salvage->log,
+                                                     collect_claim, &claims);
+    if (listed != SIDECAR_STATUS_OK)
     {
+        note_sidecar_failure(failed, "list them", listed);
         claims_free(&claims);
         return -1;
     }
@@ -547,12 +558,18 @@ static int close_open_claims(RepairSalvage *salvage)
                 {
                     if (path_list_add(&salvage->recreated, claim->root_id,
                                       claim->logical_path) != 0)
+                    {
+                        failed_step_note(failed, "note a re-created folder",
+                                         errno);
                         result = -1;
+                    }
                     continue;
                 }
                 if (status != SIDECAR_STATUS_INVALID_ARGUMENT &&
                     status != SIDECAR_STATUS_CORRUPT)
                 {
+                    note_sidecar_failure(failed, "record a re-created folder",
+                                         status);
                     result = -1;
                     break;
                 }
@@ -564,15 +581,27 @@ static int close_open_claims(RepairSalvage *salvage)
             .root_id = claim->root_id,
             .logical_path = claim->logical_path
         };
-        if (sidecar_log_append_delete(salvage->log, &deletion) !=
-                SIDECAR_STATUS_OK ||
-            path_list_add(&salvage->dropped, claim->root_id,
-                          claim->logical_path) != 0)
+        SidecarStatus deleted = sidecar_log_append_delete(salvage->log,
+                                                          &deletion);
+        if (deleted != SIDECAR_STATUS_OK)
+        {
+            note_sidecar_failure(failed, "record an item left out", deleted);
             result = -1;
+        }
+        else if (path_list_add(&salvage->dropped, claim->root_id,
+                               claim->logical_path) != 0)
+        {
+            failed_step_note(failed, "note an item left out", errno);
+            result = -1;
+        }
     }
     claims_free(&claims);
     if (result == 0 && sidecar_log_claim_count(salvage->log) != 0)
+    {
+        failed_step_note_reason(failed, "settle every one",
+                                "some are still unfinished");
         result = -1;
+    }
     return result;
 }
 
@@ -802,7 +831,11 @@ static int copy_container(int source_fd, int dest_fd, RepairCopy *copy)
 {
     DIR *directory = fdopendir(dup(source_fd));
     if (directory == NULL)
+    {
+        print_error("Error: Could not list the backup to copy it: %s\n",
+                    strerror(errno));
         return -1;
+    }
     int result = 0;
     char failed[NAME_MAX + 1U] = "";
     for (;;)
@@ -1001,8 +1034,8 @@ int repair_backup(const char *source, const char *dest_root_arg)
                              &container) !=
         CONTAINER_OK)
     {
-        print_error("Error: Could not create a backup container under %s.\n",
-                    dest_root);
+        print_error("Error: Could not create a backup container under %s: "
+                    "%s\n", dest_root, strerror(errno));
         goto done;
     }
     container_reserved = 1;
@@ -1019,10 +1052,11 @@ int repair_backup(const char *source, const char *dest_root_arg)
     fflush(stdout);
     if (salvage_journal(&salvage, journal, journal_length) != 0)
         goto done;
-    if (close_open_claims(&salvage) != 0)
+    FailedStep settle_failure = {0};
+    if (close_open_claims(&salvage, &settle_failure) != 0)
     {
-        print_error("Error: Could not settle the journal's unfinished "
-                    "items.\n");
+        print_step_failure(&settle_failure, "Error: Could not settle the "
+                                            "journal's unfinished items");
         goto done;
     }
     keep_lost_only(&salvage);

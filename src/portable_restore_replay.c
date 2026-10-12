@@ -917,7 +917,8 @@ static int replay_selection_destinations_valid(ReplayCollection *collection)
             errno == E2BIG)
             print_error("Error: Portable restore destination identity budget exceeded while registering destination HOME ancestry\n");
         else
-            print_error("Error: Could not inspect destination HOME ancestry for portable restore\n");
+            print_error("Error: Could not inspect destination HOME ancestry for portable restore: %s\n",
+                        strerror(saved));
         replay_report_step_failure(
             collection->report, collection->manifest, SIZE_MAX, NULL,
             PORTABLE_RESTORE_REPLAY_FAILURE_REGISTER_DESTINATION_ANCHOR,
@@ -946,7 +947,8 @@ static int replay_selection_destinations_valid(ReplayCollection *collection)
         if (status == DESTINATION_IDENTITY_RESOURCE_ERROR && errno == E2BIG)
             print_error("Error: Portable restore destination identity budget exceeded while ordering the destination namespace\n");
         else
-            print_error("Error: Could not order the portable restore destination namespace\n");
+            print_error("Error: Could not order the portable restore destination namespace: %s\n",
+                        strerror(saved));
         replay_report_step_failure(
             collection->report, collection->manifest, SIZE_MAX, NULL,
             PORTABLE_RESTORE_REPLAY_FAILURE_FINALIZE_DESTINATION_IDENTITY,
@@ -961,11 +963,12 @@ static int replay_selection_destinations_valid(ReplayCollection *collection)
                 &collection->items[index].destination_order) != 0)
         {
             int saved = errno;
-            print_error("Error: Could not order portable restore destination for manifest root %s entry %.*s\n",
+            print_error("Error: Could not order portable restore destination for manifest root %s entry %.*s: %s\n",
                         collection->manifest->roots[
                             collection->items[index].root_index].id,
                         (int)collection->items[index].entry->logical_path.length,
-                        collection->items[index].entry->logical_path.data);
+                        collection->items[index].entry->logical_path.data,
+                        strerror(saved));
             replay_report_step_failure(
                 collection->report, collection->manifest,
                 collection->items[index].root_index,
@@ -3423,7 +3426,7 @@ static int replay_mark_left_out_containers(ReplayCollection *collection)
                                             containers) != 0)
             {
                 print_error("Error: Could not read the backup's podman "
-                            "containers.json\n");
+                            "containers.json: %s\n", strerror(errno));
                 return -1;
             }
             break;
