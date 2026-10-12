@@ -506,15 +506,17 @@ static int backup_representation_preflight(int dest_fd, const char *target,
                                            FsCapabilityProfile *out_profile,
                                            CloneRepresentation *out_repr)
 {
-    const char *refusal = NULL;
     if (fsprobe_fd(dest_fd, out_profile) != 0)
-        refusal = "could not probe the destination filesystem at";
-    else if (select_representation(out_profile, out_repr) != 0)
-        refusal = "the destination filesystem is not usable for backup at";
-
-    if (refusal != NULL)
     {
-        print_error("Error: %s %s\n", refusal, target);
+        print_error("Error: could not probe the destination filesystem at "
+                    "%s: %s\n", target, strerror(errno));
+        return -1;
+    }
+    if (select_representation(out_profile, out_repr) != 0)
+    {
+        print_error("Error: could not measure what the destination "
+                    "filesystem at %s can keep, so the backup's format "
+                    "would be a guess\n", target);
         return -1;
     }
 #ifdef BACKUP_TEST_HOOKS
@@ -858,6 +860,7 @@ static void print_portable_capture_failure(const BackupCaptureReport *report)
 {
     const char *path = report != NULL && report->failed_source_path[0] != '\0'
         ? report->failed_source_path : NULL;
+    const char *operation = report != NULL ? report->failed_operation : NULL;
 
     if (report != NULL &&
         report->failure_kind == BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED)
@@ -870,23 +873,19 @@ static void print_portable_capture_failure(const BackupCaptureReport *report)
         return;
     }
 
-    if (report != NULL &&
-        report->failure_kind == BACKUP_CAPTURE_FAILURE_OPERATIONAL)
-    {
-        int err = report->failure_errno != 0 ? report->failure_errno : EIO;
-        if (path != NULL)
-            print_error("Error: portable capture failed while processing %s (%s)\n",
-                        path, strerror(err));
-        else
-            print_error("Error: portable capture failed (%s)\n", strerror(err));
-        return;
-    }
-
+    // An internal failure carries no errno: the operation says what the
+    // capture's own state refused.
+    int err = report != NULL &&
+              report->failure_kind == BACKUP_CAPTURE_FAILURE_OPERATIONAL
+        ? (report->failure_errno != 0 ? report->failure_errno : EIO)
+        : 0;
     if (path != NULL)
-        print_error("Error: portable capture state could not be updated safely while processing %s\n",
-                    path);
+        print_item_failure("back up", path, operation, err);
     else
-        print_error("Error: portable capture state could not be initialized or updated safely\n");
+    {
+        FailedStep failed = { .step = operation, .err = err };
+        print_step_failure(&failed, "Error: the portable backup stopped");
+    }
 }
 
 static int self_binary_clear_at(int container_fd)
@@ -1685,7 +1684,8 @@ static int ensure_target_root(const char *path, int *created)
     {
         // A real access failure (e.g. EACCES) must not masquerade as "absent";
         // otherwise dry-run would promise to create something it cannot reach.
-        print_error("Error: Could not access %s\n", path);
+        print_error("Error: Could not access %s: %s\n", path,
+                    strerror(errno));
         return 1;
     }
 
@@ -1706,7 +1706,8 @@ static int ensure_target_root(const char *path, int *created)
         // Accept it only if it is a directory, and never claim we made it.
         if (stat(path, &st) != 0)
         {
-            print_error("Error: Could not access %s\n", path);
+            print_error("Error: Could not access %s: %s\n", path,
+                        strerror(errno));
             return 1;
         }
         if (!S_ISDIR(st.st_mode))
@@ -1716,7 +1717,8 @@ static int ensure_target_root(const char *path, int *created)
         }
         return 0;
     }
-    print_error("Error: Could not create directory %s\n", path);
+    print_error("Error: Could not create directory %s: %s\n", path,
+                strerror(errno));
     return 1;
 }
 
@@ -2302,7 +2304,8 @@ static int backup_shell_history_confirm(const ShellHistorySelection *owned)
         owned->count, backup_shell_history_names(owned));
     if (length < 0 || (size_t)length >= sizeof(message))
     {
-        print_error("Error: could not build the shell history consent prompt\n");
+        print_error("Error: could not build the shell history consent "
+                    "prompt: the names it lists are too long\n");
         return -1;
     }
     return confirm_action_default_yes(message) ? 1 : 0;
@@ -3557,7 +3560,8 @@ static int backup_run(const char *target_arg, BackupMode mode,
     target_fd = open(target, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (target_fd < 0)
     {
-        print_error("Error: Could not open backup destination %s\n", target);
+        print_error("Error: Could not open backup destination %s: %s\n",
+                    target, strerror(errno));
         goto fail_pre_container;
     }
     if (backup_target_is_container(target_fd, target))
@@ -3696,7 +3700,7 @@ static int backup_run(const char *target_arg, BackupMode mode,
                                 identity_manifest, &adopted_changed) != 0)
         {
             print_error("Error: Could not remove the parts of the backup that "
-                        "are no longer selected\n");
+                        "are no longer selected: %s\n", strerror(errno));
             adopted_changed = 1;
             goto fail_pre_container;
         }
@@ -3737,7 +3741,8 @@ static int backup_run(const char *target_arg, BackupMode mode,
         if (container_reserve_fd(target_fd, invoker_name(), manifest.updated,
                                  &container) != CONTAINER_OK)
         {
-            print_error("Error: Could not create a backup container under %s\n", target);
+            print_error("Error: Could not create a backup container under %s: %s\n",
+                        target, strerror(errno));
             goto fail_pre_container;
         }
         if (container.suffix != 0)
@@ -3756,7 +3761,8 @@ static int backup_run(const char *target_arg, BackupMode mode,
             print_error("Error: %s does not support the atomic rename migr "
                         "needs to update a backup in place\n", target);
         else
-            print_error("Error: could not examine existing backups under %s\n", target);
+            print_error("Error: could not examine existing backups under %s: %s\n",
+                        target, strerror(errno));
         goto fail_pre_container;
     }
     close(target_fd);
@@ -3787,7 +3793,8 @@ static int backup_run(const char *target_arg, BackupMode mode,
     if (!had_error && (adopted || repr == CLONE_NATIVE_TREE) &&
         manifest_write_v1_at(container_fd, identity_manifest) != 0)
     {
-        print_error("Error: Could not write manifest.txt into the backup container\n");
+        print_error("Error: Could not write manifest.txt into the backup container: %s\n",
+                    strerror(errno));
         had_error = 1;
         resumable = adopted;
     }
@@ -3798,7 +3805,8 @@ static int backup_run(const char *target_arg, BackupMode mode,
         data_fd = open_data_dir(container_fd);
         if (data_fd < 0)
         {
-            print_error("Error: Could not open the container's data/ directory\n");
+            print_error("Error: Could not open the container's data/ directory: %s\n",
+                        strerror(errno));
             had_error = 1;
         }
     }
@@ -3857,7 +3865,8 @@ static int backup_run(const char *target_arg, BackupMode mode,
             ctx.visited = native_visited_create();
             if (ctx.inode_map == NULL || ctx.visited == NULL)
             {
-                print_error("Error: Could not initialize native hardlink/resume tracking: %s\n", strerror(errno));
+                print_error("Error: Could not initialize native hardlink/resume tracking: %s\n",
+                            strerror(errno));
                 native_inode_map_free(ctx.inode_map);
                 native_visited_free(ctx.visited);
                 had_error = 1;
@@ -3956,7 +3965,8 @@ static int backup_run(const char *target_arg, BackupMode mode,
         {
             if (packages_clear_at(container_fd, "packages.txt") != 0)
             {
-                print_error("Error: could not clear packages.txt from the backup container\n");
+                print_error("Error: could not clear packages.txt from the backup container: %s\n",
+                            strerror(errno));
                 had_error = 1;
             }
         }
@@ -3987,7 +3997,7 @@ static int backup_run(const char *target_arg, BackupMode mode,
             if (packages_clear_at(container_fd, "vs-code-extensions.txt") != 0)
             {
                 print_error("Error: could not clear vs-code-extensions.txt from "
-                            "the backup container\n");
+                            "the backup container: %s\n", strerror(errno));
                 had_error = 1;
             }
         }
@@ -4073,7 +4083,7 @@ static int backup_run(const char *target_arg, BackupMode mode,
             else if (self_binary_clear_at(container_fd) != 0)
             {
                 print_error("Error: could not clear a stale bundled migr binary "
-                            "from the backup container\n");
+                            "from the backup container: %s\n", strerror(errno));
                 had_error = 1;
             }
         }
@@ -4094,7 +4104,7 @@ static int backup_run(const char *target_arg, BackupMode mode,
             else if (network_config_clear_at(container_fd) != 0)
             {
                 print_error("Error: could not clear stale network configuration "
-                            "from the backup container\n");
+                            "from the backup container: %s\n", strerror(errno));
                 had_error = 1;
             }
         }
@@ -4158,7 +4168,8 @@ static int backup_run(const char *target_arg, BackupMode mode,
         else if (final_status == CONTAINER_ERR_NOREPLACE)
             print_error("Error: %s does not support the atomic rename migr publishes backups with\n", target);
         else
-            print_error("Error: Could not publish the completed backup container\n");
+            print_error("Error: Could not publish the completed backup container: %s\n",
+                        strerror(errno));
 
         printf("Incomplete backup kept for resume: %s/%s\n",
                target, container_current_name(&container));

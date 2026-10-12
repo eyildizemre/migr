@@ -2260,11 +2260,15 @@ static void portable_capture_failure_reset(BackupCaptureReport *report)
     report->failed_source_path[0] = '\0';
     report->failure_kind = BACKUP_CAPTURE_FAILURE_NONE;
     report->failure_errno = 0;
+    report->failed_operation = NULL;
 }
 
+// Keeps the first failure: the item, as a source path (the root's own when
+// logical is empty or NULL, none without a root), what was being done, and
+// errno for an operational one.
 static void portable_capture_failure_record(
     BackupCaptureReport *report, BackupCaptureFailureKind kind, int err,
-    const PortableRootSpec *root, const char *logical)
+    const char *operation, const PortableRootSpec *root, const char *logical)
 {
     if (report == NULL || report->failure_kind != BACKUP_CAPTURE_FAILURE_NONE ||
         kind == BACKUP_CAPTURE_FAILURE_NONE)
@@ -2274,25 +2278,26 @@ static void portable_capture_failure_record(
     report->failure_errno = kind == BACKUP_CAPTURE_FAILURE_OPERATIONAL
         ? (err != 0 ? err : EIO)
         : 0;
+    report->failed_operation = operation;
 
-    const char *path = NULL;
-    if (logical != NULL && logical[0] != '\0')
-        path = logical;
-    else if (root != NULL)
-        path = root->capture_path;
-    if (path != NULL)
+    report->failed_source_path[0] = '\0';
+    if (root != NULL && root->capture_path != NULL)
         (void)snprintf(report->failed_source_path,
-                       sizeof(report->failed_source_path), "%s", path);
+                       sizeof(report->failed_source_path), "%s%s%s",
+                       root->capture_path,
+                       logical != NULL && logical[0] != '\0' ? "/" : "",
+                       logical != NULL ? logical : "");
 }
 
 static void portable_capture_context_failure_record(
     const PortableCaptureContext *context, BackupCaptureFailureKind kind,
-    int err, const PortableRootSpec *root, const char *logical)
+    int err, const char *operation, const PortableRootSpec *root,
+    const char *logical)
 {
     if (context == NULL)
         return;
-    portable_capture_failure_record(context->progress_report, kind, err, root,
-                                    logical);
+    portable_capture_failure_record(
+        context->progress_report, kind, err, operation, root, logical);
 }
 
 // A source that changes under a running backup is expected, not an error
@@ -2346,13 +2351,15 @@ static int capture_current_source_seen(const PortableCaptureContext *context,
 {
     if (context == NULL || root == NULL || context->current_source == NULL) {
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, NULL);
+            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+            "look up the items the source was scanned with", root, NULL);
         return -1;
     }
     const PortableCurrentSourceSet *set = context->current_source;
     if (!set->sorted) {
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, NULL);
+            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+            "look up the items the source was scanned with", root, NULL);
         return -1;
     }
     for (size_t index = 0; index < set->count; index++) {
@@ -2368,7 +2375,8 @@ static int capture_current_source_seen(const PortableCaptureContext *context,
         }
         if (present != 1) {
             portable_capture_context_failure_record(
-                context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root,
+                context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+                "look it up among the items the source was scanned with", root,
                 entry->logical_path);
             return -1;
         }
@@ -2442,7 +2450,8 @@ static int prepared_source_validate_root(
         root->capture_path == NULL || context->current_source == NULL ||
         !context->current_source->sorted) {
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, NULL);
+            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+            "it was given to the capture wrongly", root, NULL);
         return -1;
     }
 
@@ -2450,7 +2459,9 @@ static int prepared_source_validate_root(
         context->current_source, root->id, "");
     if (root_member < 0) {
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, NULL);
+            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+            "look it up among the items the source was scanned with", root,
+            NULL);
         return -1;
     }
 
@@ -2459,14 +2470,15 @@ static int prepared_source_validate_root(
         int saved_errno = errno;
         portable_capture_context_failure_record(
             context, source_lookup_failure_kind(saved_errno), saved_errno,
-            root, NULL);
+            "inspect it", root, NULL);
         return -1;
     }
     int root_address_bearing = source_kind_is_address_bearing(root_stat.st_mode);
     if ((root_address_bearing && root_member != 1) ||
         (!root_address_bearing && root_member == 1)) {
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED, 0, root, NULL);
+            context, BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED, 0,
+            "it changed kind since the source was scanned", root, NULL);
         return -1;
     }
 
@@ -2478,7 +2490,7 @@ static int prepared_source_validate_root(
             int saved_errno = errno;
             portable_capture_context_failure_record(
                 context, source_lookup_failure_kind(saved_errno), saved_errno,
-                root, NULL);
+                "open the folder", root, NULL);
             return -1;
         }
     }
@@ -2493,7 +2505,8 @@ static int prepared_source_validate_root(
         struct stat member_stat;
         if (root_fd < 0) {
             portable_capture_context_failure_record(
-                context, BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED, 0, root,
+                context, BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED, 0,
+                "it changed since the source was scanned", root,
                 entry->logical_path);
             failed = 1;
             break;
@@ -2509,7 +2522,7 @@ static int prepared_source_validate_root(
             }
             portable_capture_context_failure_record(
                 context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
-                root, entry->logical_path);
+                "inspect it", root, entry->logical_path);
             failed = 1;
             break;
         }
@@ -2520,8 +2533,8 @@ static int prepared_source_validate_root(
     if (root_fd >= 0 && close(root_fd) != 0) {
         int saved_errno = errno;
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
-            NULL);
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
+            "close the folder", root, NULL);
         failed = 1;
     }
     return failed ? -1 : 0;
@@ -2568,8 +2581,8 @@ static int capture_directory(PortableCaptureContext *context,
     if (directory == NULL) {
         int saved_errno = errno;
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
-            logical);
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
+            "list the folder", root, logical);
         if (scan_fd >= 0)
             close(scan_fd);
         xattrs_free(xattrs);
@@ -2590,8 +2603,8 @@ static int capture_directory(PortableCaptureContext *context,
         if (entry == NULL) {
             if (errno != 0) {
                 portable_capture_context_failure_record(
-                    context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, errno, root,
-                    logical);
+                    context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, errno,
+                    "list the folder", root, logical);
                 failed = 1;
             }
             break;
@@ -2604,7 +2617,8 @@ static int capture_directory(PortableCaptureContext *context,
         if (append_logical(child_logical, sizeof(child_logical), logical,
                            entry->d_name) != 0) {
             portable_capture_context_failure_record(
-                context, BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED, 0, root,
+                context, BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED, 0,
+                "its path is longer than the journal can record", root,
                 logical);
             failed = 1;
             break;
@@ -2613,8 +2627,8 @@ static int capture_directory(PortableCaptureContext *context,
             int owned = selection_root_owns(root->selection, child_logical);
             if (owned < 0) {
                 portable_capture_context_failure_record(
-                    context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root,
-                    child_logical);
+                    context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+                    "match it against the selection", root, child_logical);
                 failed = 1;
                 break;
             }
@@ -2626,8 +2640,8 @@ static int capture_directory(PortableCaptureContext *context,
         if (capture_assignment_resolve(context, root, child_logical,
                                        entry->d_name, &assignment) != 0) {
             portable_capture_context_failure_record(
-                context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root,
-                child_logical);
+                context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+                "choose its name in the backup", root, child_logical);
             failed = 1;
             break;
         }
@@ -2674,8 +2688,8 @@ static int capture_directory(PortableCaptureContext *context,
                  (current_plan != NULL || existing_plan != NULL) &&
                  (current_plan == NULL || existing_plan == NULL))) {
                 portable_capture_context_failure_record(
-                    context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root,
-                    child_logical);
+                    context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+                    "choose its name in the backup", root, child_logical);
                 failed = 1;
                 break;
             }
@@ -2686,8 +2700,8 @@ static int capture_directory(PortableCaptureContext *context,
             if (pending_readback_names_add(&pending,
                                            assignment.physical_leaf) != 0) {
                 portable_capture_context_failure_record(
-                    context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root,
-                    child_logical);
+                    context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+                    "note its name for reading back", root, child_logical);
                 failed = 1;
                 break;
             }
@@ -2710,8 +2724,8 @@ static int capture_directory(PortableCaptureContext *context,
     if (closedir(directory) != 0) {
         int saved_errno = errno;
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
-            logical);
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
+            "list the folder", root, logical);
         failed = 1;
     }
 
@@ -2722,8 +2736,8 @@ static int capture_directory(PortableCaptureContext *context,
     if (!failed && fstat(source_fd, &after) != 0) {
         int saved_errno = errno;
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
-            logical);
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
+            "inspect the folder again after reading", root, logical);
         failed = 1;
     } else if (!failed && !metadata_source_unchanged(before, &after)) {
         capture_note_change(context, root, logical, BACKUP_SOURCE_CHANGED);
@@ -2732,15 +2746,15 @@ static int capture_directory(PortableCaptureContext *context,
     if (!failed && verify_pending_readback_names(destination_fd, &pending) != 0) {
         int saved_errno = errno;
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
-            logical);
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
+            "read back the names written in the backup", root, logical);
         failed = 1;
     }
     if (close(source_fd) != 0) {
         int saved_errno = errno;
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
-            logical);
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
+            "close the folder", root, logical);
         failed = 1;
     }
     if (failed) {
@@ -2757,7 +2771,8 @@ static int capture_directory(PortableCaptureContext *context,
                         xattrs, &sidecar_entry, NULL, NULL, NULL) != 0 ||
         append_group(context, &sidecar_entry, xattrs) != 0) {
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, logical);
+            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+            "record the folder in the journal", root, logical);
         pending_readback_names_free(&pending);
         xattrs_free(xattrs);
         close(destination_fd);
@@ -2768,8 +2783,8 @@ static int capture_directory(PortableCaptureContext *context,
     if (close(destination_fd) != 0) {
         int saved_errno = errno;
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
-            logical);
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
+            "close the folder in the backup", root, logical);
         return -1;
     }
     return 0;
@@ -2796,7 +2811,7 @@ static int capture_regular(PortableCaptureContext *context,
             int saved_errno = errno;
             portable_capture_context_failure_record(
                 context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
-                root, logical);
+                "open its place in the backup", root, logical);
             xattrs_free(xattrs);
             close(source_fd);
             return -1;
@@ -2835,8 +2850,8 @@ static int capture_regular(PortableCaptureContext *context,
     if (ensure_regular_leaf(parent_fd, destination_leaf, &destination_fd) != 0) {
         int saved_errno = errno;
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
-            logical);
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
+            "create its copy in the backup", root, logical);
         if (destination_is_root)
             close(parent_fd);
         xattrs_free(xattrs);
@@ -2866,7 +2881,7 @@ static int capture_regular(PortableCaptureContext *context,
             int saved_errno = errno;
             portable_capture_context_failure_record(
                 context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
-                root, logical);
+                "copy its content", root, logical);
             failed = 1;
             break;
         }
@@ -2878,7 +2893,7 @@ static int capture_regular(PortableCaptureContext *context,
             int saved_errno = errno;
             portable_capture_context_failure_record(
                 context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
-                root, logical);
+                "inspect it again after reading", root, logical);
             failed = 1;
             break;
         }
@@ -2887,8 +2902,8 @@ static int capture_regular(PortableCaptureContext *context,
         int unchanged = metadata_source_unchanged(&captured, &after);
         if (unchanged && copied != (uint64_t)after.st_size) {
             portable_capture_context_failure_record(
-                context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, EIO, root,
-                logical);
+                context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, EIO,
+                "fewer or more bytes were read than its size", root, logical);
             errno = EIO;
             failed = 1;
             break;
@@ -2913,16 +2928,16 @@ static int capture_regular(PortableCaptureContext *context,
     if (close(destination_fd) != 0) {
         int saved_errno = errno;
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
-            logical);
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
+            "finish writing its copy in the backup", root, logical);
         failed = 1;
     }
     portable_test_interrupt_if(PORTABLE_TEST_AFTER_PAYLOAD_CLOSE);
     if (close(source_fd) != 0) {
         int saved_errno = errno;
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
-            logical);
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
+            "close it", root, logical);
         failed = 1;
     }
     if (destination_is_root)
@@ -3002,7 +3017,7 @@ static int capture_special(PortableCaptureContext *context,
             int saved_errno = errno;
             portable_capture_context_failure_record(
                 context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
-                root, logical);
+                "open its place in the backup", root, logical);
             return -1;
         }
         destination_leaf = root_leaf;
@@ -3023,8 +3038,8 @@ static int capture_special(PortableCaptureContext *context,
     if (remove_leaf(parent_fd, destination_leaf) != 0) {
         int saved_errno = errno;
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
-            logical);
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
+            "remove an old copy from the backup", root, logical);
         if (destination_is_root)
             close(parent_fd);
         return -1;
@@ -3056,8 +3071,8 @@ static int capture_symlink(PortableCaptureContext *context,
     if (target_length < 0) {
         int saved_errno = errno;
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
-            logical);
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
+            "read the link", root, logical);
         return -1;
     }
 
@@ -3065,15 +3080,16 @@ static int capture_symlink(PortableCaptureContext *context,
     if (source_symlink_xattr_path(source_parent, source_name, root_path,
                                   source_path, sizeof(source_path)) != 0) {
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, logical);
+            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+            "find its extended attributes", root, logical);
         return -1;
     }
     PortableXattrs xattrs;
     if (collect_symlink_xattrs(source_path, &xattrs) != 0) {
         int saved_errno = errno;
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
-            logical);
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
+            "read its extended attributes", root, logical);
         return -1;
     }
 
@@ -3088,7 +3104,7 @@ static int capture_symlink(PortableCaptureContext *context,
         int saved_errno = errno;
         portable_capture_context_failure_record(
             context, source_lookup_failure_kind(saved_errno), saved_errno,
-            root, logical);
+            "inspect it again after reading", root, logical);
         xattrs_free(&xattrs);
         return -1;
     }
@@ -3150,7 +3166,7 @@ static int capture_symlink(PortableCaptureContext *context,
             int saved_errno = errno;
             portable_capture_context_failure_record(
                 context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
-                root, logical);
+                "open its place in the backup", root, logical);
             xattrs_free(&xattrs);
             return -1;
         }
@@ -3186,8 +3202,8 @@ static int capture_symlink(PortableCaptureContext *context,
                             &destination_fd) != 0) {
         int saved_errno = errno;
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
-            logical);
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
+            "create its copy in the backup", root, logical);
         if (destination_is_root)
             close(parent_fd);
         xattrs_free(&xattrs);
@@ -3277,7 +3293,7 @@ static int capture_hardlink(PortableCaptureContext *context,
             int saved_errno = errno;
             portable_capture_context_failure_record(
                 context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
-                root, logical);
+                "open its place in the backup", root, logical);
             close(source_fd);
             return -1;
         }
@@ -3311,8 +3327,8 @@ static int capture_hardlink(PortableCaptureContext *context,
     if (ensure_regular_leaf(parent_fd, destination_leaf, &destination_fd) != 0) {
         int saved_errno = errno;
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
-            logical);
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
+            "create its copy in the backup", root, logical);
         if (destination_is_root)
             close(parent_fd);
         close(source_fd);
@@ -3325,8 +3341,8 @@ static int capture_hardlink(PortableCaptureContext *context,
     if (fstat(source_fd, &after) != 0) {
         int saved_errno = errno;
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
-            logical);
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
+            "inspect it again after reading", root, logical);
         failed = 1;
     } else if (!metadata_source_unchanged(before, &after)) {
         // A changed file keeps the bytes read; its entry records the pre-scan
@@ -3336,22 +3352,22 @@ static int capture_hardlink(PortableCaptureContext *context,
     if (close(destination_fd) != 0) {
         int saved_errno = errno;
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
-            logical);
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
+            "finish writing its copy in the backup", root, logical);
         failed = 1;
     }
     if (destination_is_root && close(parent_fd) != 0) {
         int saved_errno = errno;
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
-            logical);
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
+            "close its place in the backup", root, logical);
         failed = 1;
     }
     if (close(source_fd) != 0) {
         int saved_errno = errno;
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
-            logical);
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
+            "close it", root, logical);
         failed = 1;
     }
     if (failed)
@@ -3373,7 +3389,8 @@ static int capture_node(PortableCaptureContext *context,
         int owned = selection_root_owns(root->selection, logical);
         if (owned < 0) {
             portable_capture_context_failure_record(
-                context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, logical);
+                context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+                "match it against the selection", root, logical);
             return -1;
         }
         if (owned == 0)
@@ -3388,8 +3405,8 @@ static int capture_node(PortableCaptureContext *context,
                                      BACKUP_SOURCE_CHANGE_KINDS,
                                      no_destination_object);
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
-            logical);
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
+            "inspect it", root, logical);
         return -1;
     }
 
@@ -3398,20 +3415,25 @@ static int capture_node(PortableCaptureContext *context,
           (physical_leaf[0] != '\0' || collision_suffix[0] != '\0')) ||
          (logical[0] != '\0' && !safe_component(physical_leaf)))) {
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, logical);
+            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+            "it was given to the capture wrongly", root, logical);
         return -1;
     }
 
     if (context->current_source == NULL) {
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, logical);
+            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+            "look it up among the items the source was scanned with", root,
+            logical);
         return -1;
     }
     int prepared_member = portable_current_source_contains(
         context->current_source, root->id, logical);
     if (prepared_member < 0) {
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, logical);
+            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+            "look it up among the items the source was scanned with", root,
+            logical);
         return -1;
     }
     int address_bearing = S_ISDIR(before.st_mode) || S_ISREG(before.st_mode) ||
@@ -3433,12 +3455,16 @@ static int capture_node(PortableCaptureContext *context,
         if (strcmp(planned->physical_leaf, physical_leaf) != 0 ||
             strcmp(planned->collision_suffix, collision_suffix) != 0) {
             portable_capture_context_failure_record(
-                context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, logical);
+                context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+                "its name in the backup differs from the one planned", root,
+                logical);
             return -1;
         }
     } else if (collision_suffix[0] != '\0') {
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, logical);
+            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+            "its name in the backup differs from the one planned", root,
+            logical);
         return -1;
     }
 
@@ -3454,8 +3480,8 @@ static int capture_node(PortableCaptureContext *context,
     if (S_ISFIFO(before.st_mode)) {
         errno = EOPNOTSUPP;
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, EOPNOTSUPP, root,
-            logical);
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, EOPNOTSUPP,
+            "keep a FIFO in a portable backup", root, logical);
         return -1;
     }
     if (S_ISLNK(before.st_mode)) {
@@ -3466,14 +3492,15 @@ static int capture_node(PortableCaptureContext *context,
                                      is_root, &before);
         if (result != 0)
             portable_capture_context_failure_record(
-                context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, logical);
+                context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+                "record the link in the journal", root, logical);
         return result;
     }
     if (!S_ISREG(before.st_mode) && !S_ISDIR(before.st_mode)) {
         errno = EOPNOTSUPP;
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, EOPNOTSUPP, root,
-            logical);
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, EOPNOTSUPP,
+            "keep this kind of item in a portable backup", root, logical);
         return -1;
     }
 
@@ -3487,16 +3514,16 @@ static int capture_node(PortableCaptureContext *context,
                                      BACKUP_SOURCE_CHANGE_KINDS,
                                      no_destination_object);
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
-            logical);
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, "open it",
+            root, logical);
         return -1;
     }
     struct stat opened;
     if (fstat(source_fd, &opened) != 0) {
         int saved_errno = errno;
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
-            logical);
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
+            "inspect it", root, logical);
         close(source_fd);
         return -1;
     }
@@ -3538,8 +3565,9 @@ static int capture_node(PortableCaptureContext *context,
                 is_root, representative);
             if (result != 0)
                 portable_capture_context_failure_record(
-                    context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root,
-                    logical);
+                    context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+                    "record it as another name of a file already backed up",
+                    root, logical);
             return result;
         }
     }
@@ -3548,8 +3576,8 @@ static int capture_node(PortableCaptureContext *context,
     if (collect_xattrs(source_fd, &xattrs) != 0) {
         int saved_errno = errno;
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
-            logical);
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
+            "read its extended attributes", root, logical);
         close(source_fd);
         return -1;
     }
@@ -3610,8 +3638,8 @@ static int capture_node(PortableCaptureContext *context,
                         result = -1;
                     if (result != 0)
                         portable_capture_context_failure_record(
-                            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root,
-                            logical);
+                            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+                            "record it in the journal", root, logical);
                     return result;
                 }
             }
@@ -3625,7 +3653,8 @@ static int capture_node(PortableCaptureContext *context,
                                      is_root, &xattrs, &previous_hint);
         if (result != 0)
             portable_capture_context_failure_record(
-                context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, logical);
+                context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+                "record it in the journal", root, logical);
         return result;
     }
 
@@ -3638,7 +3667,7 @@ static int capture_node(PortableCaptureContext *context,
             int saved_errno = errno;
             portable_capture_context_failure_record(
                 context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
-                root, logical);
+                "open its place in the backup", root, logical);
             xattrs_free(&xattrs);
             close(source_fd);
             return -1;
@@ -3669,8 +3698,8 @@ static int capture_node(PortableCaptureContext *context,
     if (ensure_directory_leaf(parent_fd, destination_leaf, &destination_fd) != 0) {
         int saved_errno = errno;
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, root,
-            logical);
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
+            "create the folder in the backup", root, logical);
         if (is_root)
             close(parent_fd);
         xattrs_free(&xattrs);
@@ -3683,7 +3712,8 @@ static int capture_node(PortableCaptureContext *context,
         if (is_root)
             close(parent_fd);
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, logical);
+            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+            "record the folder in the journal", root, logical);
         return -1;
     }
     if (is_root)
@@ -4142,31 +4172,36 @@ int portable_capture_root(PortableCaptureContext *context,
         context->data_fd < 0 || context->sidecar == NULL ||
         !root_spec_valid(root)) {
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, NULL);
+            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+            "it was given to the capture wrongly", root, NULL);
         return -1;
     }
     /* visited is root-local; inode_map spans every root in this context. */
     PortableVisited *visited = context->visited;
     if (visited_reset(visited) != 0) {
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, NULL);
+            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+            "reset the list of items backed up", root, NULL);
         return -1;
     }
     if (prepared_source_validate_root(context, root) != 0)
         return -1;
     if (prepare_collision_relocations(context, root) != 0) {
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, NULL);
+            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+            "plan the names that collide", root, NULL);
         return -1;
     }
     if (portable_capture_owners_reload(context) != 0) {
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, NULL);
+            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+            "load the owners already recorded", root, NULL);
         return -1;
     }
     if (fileops_make_parents_at(context->data_fd, root->payload_path) != 0) {
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, errno, root, NULL);
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, errno,
+            "create the folders above it in the backup", root, NULL);
         return -1;
     }
     int result = capture_node(context, root, "", "", "", -1, NULL,
@@ -4202,7 +4237,8 @@ static int capture_roots(PortableCaptureContext *context,
                     return -1;
                 if (reconcile_root(context, root) != 0) {
                     portable_capture_context_failure_record(
-                        context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, root, NULL);
+                        context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+                        "remove the items no longer in the source", root, NULL);
                     return -1;
                 }
             }
@@ -4227,7 +4263,8 @@ int portable_capture_fresh_prepared_at(
         !request_selection_valid(request) ||
         prepared == NULL || !prepared->ready) {
         portable_capture_failure_record(
-            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL, NULL);
+            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+            "it was given to the capture wrongly", NULL, NULL);
         return -1;
     }
 
@@ -4236,12 +4273,14 @@ int portable_capture_fresh_prepared_at(
     if (request_status == PORTABLE_PREPARED_REQUEST_ERROR ||
         request_status == PORTABLE_PREPARED_REQUEST_MISMATCH) {
         portable_capture_failure_record(
-            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL, NULL);
+            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+            "the scan does not match this backup", NULL, NULL);
         return -1;
     }
     if (fresh_namespace_is_empty(container_fd) != 0) {
         portable_capture_failure_record(
-            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL, NULL);
+            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+            "the new backup is not empty", NULL, NULL);
         return -1;
     }
 
@@ -4256,7 +4295,7 @@ int portable_capture_fresh_prepared_at(
         int saved_errno = errno;
         portable_capture_failure_record(
             progress_report, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
-            NULL, NULL);
+            "write manifest.txt", NULL, NULL);
         goto done;
     }
     portable_test_interrupt_if(PORTABLE_TEST_AFTER_MANIFEST);
@@ -4265,7 +4304,7 @@ int portable_capture_fresh_prepared_at(
         int saved_errno = errno;
         portable_capture_failure_record(
             progress_report, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
-            NULL, NULL);
+            "create data/", NULL, NULL);
         goto done;
     }
     data_fd = openat(container_fd, "data",
@@ -4274,13 +4313,14 @@ int portable_capture_fresh_prepared_at(
         int saved_errno = errno;
         portable_capture_failure_record(
             progress_report, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
-            NULL, NULL);
+            "open data/", NULL, NULL);
         goto done;
     }
 
     if (sidecar_log_create_at(container_fd, &sidecar) != SIDECAR_OPEN_FRESH) {
         portable_capture_failure_record(
-            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL, NULL);
+            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+            "create the journal", NULL, NULL);
         goto done;
     }
     sidecar_ready = 1;
@@ -4290,7 +4330,8 @@ int portable_capture_fresh_prepared_at(
                                                request->case_sensitive) != 0;
     if (failed)
         portable_capture_failure_record(
-            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL, NULL);
+            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+            "set up the capture", NULL, NULL);
     if (!failed) {
         context_ready = 1;
         context.progress_report = progress_report;
@@ -4299,7 +4340,8 @@ int portable_capture_fresh_prepared_at(
         if (portable_capture_owners_reload(&context) != 0 ||
             sticky_seed_inode_map(context.inode_map, request, &sidecar) != 0) {
             portable_capture_context_failure_record(
-                &context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL, NULL);
+                &context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+                "load the owners and hardlinks already recorded", NULL, NULL);
             failed = 1;
         }
     }
@@ -4307,7 +4349,8 @@ int portable_capture_fresh_prepared_at(
         failed = 1;
     if (!failed && sidecar_log_claim_count(&sidecar) != 0) {
         portable_capture_failure_record(
-            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL, NULL);
+            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+            "some items are still unfinished in the journal", NULL, NULL);
         failed = 1;
     }
     result = failed ? -1 : 0;
@@ -4319,19 +4362,21 @@ done:
         portable_capture_context_close(&context);
     if (sidecar_ready && sidecar_log_close(&sidecar) != SIDECAR_STATUS_OK) {
         portable_capture_failure_record(
-            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL, NULL);
+            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+            "close the journal", NULL, NULL);
         result = -1;
     }
     if (data_fd >= 0 && close(data_fd) != 0) {
         int saved_errno = errno;
         portable_capture_failure_record(
             progress_report, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
-            NULL, NULL);
+            "close data/", NULL, NULL);
         result = -1;
     }
     if (result != 0)
         portable_capture_failure_record(
-            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL, NULL);
+            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+            "finish the backup", NULL, NULL);
     return result;
 }
 
@@ -4413,7 +4458,8 @@ int portable_capture_resume_prepared_at(
         !request_selection_valid(request) ||
         prepared == NULL || !prepared->ready) {
         portable_capture_failure_record(
-            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL, NULL);
+            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+            "it was given to the capture wrongly", NULL, NULL);
         return -1;
     }
 
@@ -4422,7 +4468,8 @@ int portable_capture_resume_prepared_at(
     if (request_status == PORTABLE_PREPARED_REQUEST_ERROR ||
         request_status == PORTABLE_PREPARED_REQUEST_MISMATCH) {
         portable_capture_failure_record(
-            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL, NULL);
+            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+            "the scan does not match this backup", NULL, NULL);
         return -1;
     }
 
@@ -4437,7 +4484,8 @@ int portable_capture_resume_prepared_at(
                                                          &existing);
     if (manifest_status != MANIFEST_STATUS_VALID) {
         portable_capture_failure_record(
-            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL, NULL);
+            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+            "read the backup's manifest.txt", NULL, NULL);
         goto done;
     }
     ManifestIdentityComparison identity =
@@ -4450,12 +4498,14 @@ int portable_capture_resume_prepared_at(
          * refuse resume today; keeping them separate prevents this distinction
          * from disappearing if a future change handles them differently. */
         portable_capture_failure_record(
-            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL, NULL);
+            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+            "the backup's manifest names another backup", NULL, NULL);
         goto done;
     }
     if (identity != MANIFEST_IDENTITY_EQUAL) {
         portable_capture_failure_record(
-            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL, NULL);
+            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+            "the backup's manifest names another backup", NULL, NULL);
         goto done;
     }
 
@@ -4464,7 +4514,7 @@ int portable_capture_resume_prepared_at(
         int saved_errno = errno;
         portable_capture_failure_record(
             progress_report, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
-            NULL, NULL);
+            "open data/", NULL, NULL);
         goto done;
     }
     int data_missing = data_state == 1;
@@ -4478,27 +4528,28 @@ int portable_capture_resume_prepared_at(
                 int saved_errno = errno;
                 portable_capture_failure_record(
                     progress_report, BACKUP_CAPTURE_FAILURE_OPERATIONAL,
-                    saved_errno, NULL, NULL);
+                    saved_errno, "create data/", NULL, NULL);
                 failed = 1;
             }
         }
         if (!failed && data_namespace_is_empty(data_fd) != 0) {
             portable_capture_failure_record(
-                progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL,
-                NULL);
+                progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+                "data/ is not empty", NULL, NULL);
             failed = 1;
         }
         if (!failed &&
             sidecar_log_create_at(container_fd, &sidecar) !=
                 SIDECAR_OPEN_FRESH) {
             portable_capture_failure_record(
-                progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL,
-                NULL);
+                progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+                "create the journal", NULL, NULL);
             failed = 1;
         }
     } else if (sidecar_status != SIDECAR_OPEN_RESUMABLE || data_missing) {
         portable_capture_failure_record(
-            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL, NULL);
+            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+            "the journal and data/ do not match", NULL, NULL);
         failed = 1;
     }
 
@@ -4506,7 +4557,8 @@ int portable_capture_resume_prepared_at(
                                                 request->nsec_exact,
                                                 request->case_sensitive) != 0) {
         portable_capture_failure_record(
-            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL, NULL);
+            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+            "set up the capture", NULL, NULL);
         failed = 1;
     }
     if (!failed) {
@@ -4519,7 +4571,8 @@ int portable_capture_resume_prepared_at(
         if (portable_capture_owners_reload(&context) != 0 ||
             sticky_seed_inode_map(context.inode_map, request, &sidecar) != 0) {
             portable_capture_context_failure_record(
-                &context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL, NULL);
+                &context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+                "load the owners and hardlinks already recorded", NULL, NULL);
             failed = 1;
         }
         if (!failed && capture_roots(&context, request) != 0)
@@ -4527,7 +4580,8 @@ int portable_capture_resume_prepared_at(
     }
     if (!failed && sidecar_log_claim_count(&sidecar) != 0) {
         portable_capture_failure_record(
-            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL, NULL);
+            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+            "some items are still unfinished in the journal", NULL, NULL);
         failed = 1;
     }
     result = failed ? -1 : 0;
@@ -4539,20 +4593,22 @@ done:
         portable_capture_context_close(&context);
     if (sidecar_log_close(&sidecar) != SIDECAR_STATUS_OK) {
         portable_capture_failure_record(
-            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL, NULL);
+            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+            "close the journal", NULL, NULL);
         result = -1;
     }
     if (data_fd >= 0 && close(data_fd) != 0) {
         int saved_errno = errno;
         portable_capture_failure_record(
             progress_report, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
-            NULL, NULL);
+            "close data/", NULL, NULL);
         result = -1;
     }
     manifest_free(&existing);
     if (result != 0)
         portable_capture_failure_record(
-            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0, NULL, NULL);
+            progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+            "finish the backup", NULL, NULL);
     return result;
 }
 

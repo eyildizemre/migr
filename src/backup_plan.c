@@ -451,7 +451,7 @@ static int build_builtin_roots(const char *home_real, BackupMode mode, RootBuild
             continue;
         if (rc < 0)
         {
-            print_error("Error: could not resolve %s\n", xdg_dirs[i]);
+            print_error("Error: could not resolve %s: %s\n", xdg_dirs[i], strerror(errno));
             failed = 1;
             break;
         }
@@ -491,7 +491,7 @@ static int build_builtin_roots(const char *home_real, BackupMode mode, RootBuild
             continue;
         if (rc < 0)
         {
-            print_error("Error: could not resolve %s\n", raw);
+            print_error("Error: could not resolve %s: %s\n", raw, strerror(errno));
             return -1;
         }
 
@@ -572,7 +572,8 @@ static int build_explicit_roots(const char *home_real, const char *const *explic
         if (normalize_explicit_path(explicit_paths[i], tmp[i].capture_path,
                                     sizeof(tmp[i].capture_path)) != 0)
         {
-            print_error("Error: could not resolve path: %s\n", explicit_paths[i]);
+            print_error("Error: could not resolve path: %s: %s\n",
+                        explicit_paths[i], strerror(errno));
             free(tmp);
             return -1;
         }
@@ -881,7 +882,8 @@ int backup_plan_build(const char *home, BackupMode mode,
         if (errno == ENAMETOOLONG)
             print_error("Error: HOME path too long to resolve user directories\n");
         else
-            print_error("Error: Could not resolve HOME directory: %s\n", home);
+            print_error("Error: Could not resolve HOME directory: %s: %s\n",
+                        home, strerror(errno));
         return -1;
     }
     struct stat home_st;
@@ -913,7 +915,7 @@ int backup_plan_build(const char *home, BackupMode mode,
         assign_payload_paths(home_real, rb.items, (size_t)rb.count,
                              sizeof(*rb.items)) != 0)
     {
-        print_error("Error: could not name the backup's folders\n");
+        print_error("Error: could not name the backup's folders: %s\n", strerror(errno));
         rc = -1;
     }
 
