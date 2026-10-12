@@ -862,7 +862,7 @@ static void test_dispatch_routes_missing_manifest_to_legacy(void)
     int rc = run_restore_capturing(source, output, sizeof(output));
     check(rc == 0, "restore succeeds with no manifest.txt present");
     check(strstr(output, "Main Directories") != NULL, "the legacy section header appears");
-    check(strstr(output, "Roots") == NULL, "the v1 section header does not appear");
+    check(strstr(output, "\nFiles\n") == NULL, "the v1 section header does not appear");
 
     remove_tree(source);
     remove_tree(home);
@@ -883,7 +883,7 @@ static void test_dispatch_routes_legacy_xdg_manifest_to_legacy(void)
     int rc = run_restore_capturing(source, output, sizeof(output));
     check(rc == 0, "restore succeeds with an old-style XDG-key manifest.txt");
     check(strstr(output, "Main Directories") != NULL, "the legacy section header appears");
-    check(strstr(output, "Roots") == NULL, "the v1 section header does not appear");
+    check(strstr(output, "\nFiles\n") == NULL, "the v1 section header does not appear");
 
     remove_tree(source);
     remove_tree(home);
@@ -904,7 +904,7 @@ static void test_dispatch_refuses_unknown_version(void)
     int rc = run_restore_capturing(source, output, sizeof(output));
     check(rc == 2, "restore refuses an unrecognized manifest version");
     check(strstr(output, "Main Directories") == NULL, "the legacy path is never attempted");
-    check(strstr(output, "Roots") == NULL, "the v1 path is never attempted");
+    check(strstr(output, "\nFiles\n") == NULL, "the v1 path is never attempted");
 
     remove_tree(source);
     remove_tree(home);
@@ -925,7 +925,7 @@ static void test_dispatch_refuses_malformed_v1(void)
     int rc = run_restore_capturing(source, output, sizeof(output));
     check(rc == 2, "restore refuses a malformed v1 manifest");
     check(strstr(output, "Main Directories") == NULL, "the legacy path is never attempted");
-    check(strstr(output, "Roots") == NULL, "the v1 path is never attempted");
+    check(strstr(output, "\nFiles\n") == NULL, "the v1 path is never attempted");
 
     remove_tree(source);
     remove_tree(home);
@@ -3421,7 +3421,7 @@ static void test_dispatch_refuses_portable_v1(void)
     check(rc != 0, "portable v1 restore is refused while its replay path is absent");
     check(strstr(output, "Portable restore preflight refused") != NULL,
           "the refusal identifies the portable preflight path");
-    check(strstr(output, "Roots") == NULL,
+    check(strstr(output, "\nFiles\n") == NULL,
           "portable payload never reaches the native root walker");
 
     remove_tree(source);
@@ -3467,7 +3467,7 @@ static void test_v1_refuses_missing_declared_payloads(void)
           "the missing manual root is reported");
     check(strstr(output, "backup location:") == NULL,
           "restore never advertises a nonexistent MANUAL_NATIVE payload");
-    check(strstr(output, "Roots") == NULL,
+    check(strstr(output, "\nFiles\n") == NULL,
           "payload validation fails before the root walker starts");
 
     remove_tree(source);
@@ -3516,7 +3516,7 @@ static void test_v1_restores_home_relative_and_xdg_reports_manual_native(void)
     char output[8192];
     int rc = run_restore_capturing(source, output, sizeof(output));
     check(rc == 0, "restore succeeds on a valid v1 manifest");
-    check(strstr(output, "Roots") != NULL, "the v1 section header appears");
+    check(strstr(output, "\nFiles\n") != NULL, "the v1 section header appears");
     check(strstr(output, "Main Directories") == NULL, "the legacy path is never attempted");
 
     check(strstr(output, "Would restore: ~/Documents/project\n") != NULL,
@@ -3531,7 +3531,7 @@ static void test_v1_restores_home_relative_and_xdg_reports_manual_native(void)
               strstr(output, expected_xdg_preview) != NULL,
           "the XDG root is previewed against the target locale's resolved directory");
 
-    check(strstr(output, "Manual Roots") != NULL, "the manual-roots section appears");
+    check(strstr(output, "Restore by hand") != NULL, "the restore-by-hand section appears");
     check(strstr(output, "EXPLICIT_1") != NULL, "the MANUAL_NATIVE root's id is listed");
     check(strstr(output, "/mnt/external/project") != NULL,
           "the MANUAL_NATIVE root's recorded source path is listed (docs/DECISIONS.md D16)");

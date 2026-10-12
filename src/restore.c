@@ -3899,7 +3899,7 @@ static void restore_v1(const char *source, int source_root_fd,
                        BackupCaptureReport *capture_report,
                        const int *root_order)
 {
-    printf("Roots\n");
+    printf("Files\n");
 
     for (int i = 0; i < m->root_count; i++)
     {
@@ -3958,7 +3958,7 @@ static void restore_v1(const char *source, int source_root_fd,
 
     if (manual_count > 0)
     {
-        printf("\nManual Roots\n");
+        printf("\nRestore by hand\n");
         printf("  Not restored automatically; recover these from the backup directly.\n");
         for (int i = 0; i < m->root_count; i++)
         {

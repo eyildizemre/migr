@@ -1552,9 +1552,9 @@ EOF
 
     local dry_out
     dry_out=$(env HOME="$v1_home" "$MIGR" restore "$v1_src" --dry-run 2>&1)
-    assert_contains "$dry_out" "Roots"
+    assert_contains "$dry_out" "Files"
     assert_contains "$dry_out" "Would restore: ~/Documents/project"
-    assert_contains "$dry_out" "Manual Roots"
+    assert_contains "$dry_out" "Restore by hand"
     assert_contains "$dry_out" "/mnt/external/project"
 
     local live_out
@@ -2301,7 +2301,7 @@ test_container_production() {
     local ext_home="$TEST_DIR/cp_ext_home" ext_restore_out
     mkdir -p "$ext_home"
     ext_restore_out=$(printf 'y\n' | env HOME="$ext_home" "$MIGR" restore "$ext_actual" 2>&1)
-    assert_contains "$ext_restore_out" "Manual Roots"
+    assert_contains "$ext_restore_out" "Restore by hand"
     assert_contains "$ext_restore_out" "$ext_root"
     # the home-relative sibling root proves the restore itself ran
     if [ -f "$ext_home/Documents/note.txt" ] && [ ! -e "$ext_home/data.txt" ]; then

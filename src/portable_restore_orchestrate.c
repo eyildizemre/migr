@@ -148,6 +148,7 @@ static PortableRestoreOutcome portable_restore_orchestrate_impl(
         return PORTABLE_RESTORE_ERROR;
     }
 
+    printf("\nFiles\n");
     result = portable_restore_replay_at(&replay_request, report);
     if (result != 0 && report->verification_failed_count != 0)
     {
