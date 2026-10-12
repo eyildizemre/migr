@@ -4943,6 +4943,19 @@ run that went as asked would only be clutter on the new system.
 **Relationship:** Uses D68's exit statuses. Restore's list of what is left
 to do by hand (D78) goes next to the backup whatever the status.
 
+**Revision (2026-10-12):** The log mirrors the terminal, so it can say no
+more about a failure than the message does. Every error and warning names
+the item it concerns, what was being done to it, and the cause: errno's
+text, a command's exit status, or a fixed reason when neither applies. A
+refusal whose wording already says why (a malformed manifest, a name
+collision) needs nothing more. The terminal gets one line,
+`Error: could not <verb> <item>: <step>: <cause>`, naming a backup's item
+by its source path and a restore's by its path on this system, with the
+home folder as `~`. The log also gets errno's name and number, and for a backup the
+item's place in the container, for a restore its copy in the backup and
+the counts so far. A failure deep in a walk is recorded where it happens,
+before any cleanup can change errno, and only the first one is kept.
+
 ## D80 — 2026-09-27 — An existing dconf database is kept only for a session load
 
 **Status:** Implemented
