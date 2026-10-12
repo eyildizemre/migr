@@ -1706,8 +1706,18 @@ static BackupCaptureStatus capture_regular_at(
     if (fstatat(dest_dir_fd, leaf, &dest_st, AT_SYMLINK_NOFOLLOW) == 0)
     {
         // A matching size and mtime is the resume signal; another kind of
-        // item there is an older copy, never something to truncate.
-        if (!S_ISREG(dest_st.st_mode))
+        // item there is an older copy, never something to truncate. So is a
+        // copy that shares its inode with other names, unless it matches a
+        // source that is a hardlink too: writing it in place would write them
+        // as well.
+        int resumable = S_ISREG(dest_st.st_mode) &&
+            dest_st.st_size == source_snapshot.st_size &&
+            dest_st.st_mtim.tv_sec == source_snapshot.st_mtim.tv_sec &&
+            policy.nsec_exact &&
+            dest_st.st_mtim.tv_nsec == source_snapshot.st_mtim.tv_nsec;
+        int shared = S_ISREG(dest_st.st_mode) && dest_st.st_nlink > 1 &&
+            (!resumable || source_snapshot.st_nlink == 1);
+        if (!S_ISREG(dest_st.st_mode) || shared)
         {
             if (capture_remove_older_copy(dest_dir_fd, leaf, src, report) != 0)
             {
@@ -1715,10 +1725,7 @@ static BackupCaptureStatus capture_regular_at(
                 return BACKUP_CAPTURE_ERROR;
             }
         }
-        else if (dest_st.st_size == source_snapshot.st_size &&
-            dest_st.st_mtim.tv_sec == source_snapshot.st_mtim.tv_sec &&
-            policy.nsec_exact &&
-            dest_st.st_mtim.tv_nsec == source_snapshot.st_mtim.tv_nsec)
+        else if (resumable)
         {
             int dest_fd = openat(dest_dir_fd, leaf,
                                  O_WRONLY | O_NOFOLLOW | O_CLOEXEC);

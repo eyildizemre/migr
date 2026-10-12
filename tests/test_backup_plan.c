@@ -4803,6 +4803,59 @@ static void test_native_update_replaces_changed_items(void)
     remove_tree(target);
 }
 
+// Two names that were one file share their copy in a native backup; once
+// they are separate files, writing one copy must not write the other. Names
+// that are still one file keep sharing theirs.
+static void test_native_update_splits_a_broken_hardlink(void)
+{
+    printf(BLUE "::" NC " production: a native update splits the copy of a broken hardlink\n");
+
+    char home[PATH_MAX], target[PATH_MAX], work[PATH_MAX];
+    char broken[PATH_MAX], split[PATH_MAX], kept[PATH_MAX], linked[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_home");
+    setenv("HOME", home, 1);
+    join_path(work, sizeof(work), home, "work");
+    join_path(broken, sizeof(broken), work, "broken");
+    join_path(split, sizeof(split), work, "split");
+    join_path(kept, sizeof(kept), work, "kept");
+    join_path(linked, sizeof(linked), work, "linked");
+    mkdir_p(work);
+    write_file(broken, "AAAA");
+    write_file(kept, "kept");
+    if (link(broken, split) != 0 || link(kept, linked) != 0)
+        check(0, "the hardlink fixtures are created");
+    fresh_mkdtemp(target, sizeof(target), "plan_target");
+    char *paths[] = { work, NULL };
+    char output[8192];
+    dry_run = 0;
+    int first_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                        output, sizeof(output));
+
+    unlink(split);
+    write_file(split, "BBBB");
+    int second_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                         output, sizeof(output));
+
+    char container[PATH_MAX], copy[PATH_MAX];
+    int found = find_container_dir(target, container, sizeof(container));
+    struct stat kept_copy = {0}, linked_copy = {0};
+    join_path(copy, sizeof(copy), container, "data/work/kept");
+    int kept_ok = lstat(copy, &kept_copy) == 0;
+    join_path(copy, sizeof(copy), container, "data/work/linked");
+    int linked_ok = lstat(copy, &linked_copy) == 0;
+    char broken_copy[PATH_MAX];
+    join_path(broken_copy, sizeof(broken_copy), container, "data/work/broken");
+    join_path(copy, sizeof(copy), container, "data/work/split");
+    check(first_rc == 0 && second_rc == 0 && found, "the update succeeds");
+    check(file_text_is(broken_copy, "AAAA") && file_text_is(copy, "BBBB"),
+          "each name of a broken hardlink keeps its own content");
+    check(kept_ok && linked_ok && kept_copy.st_ino == linked_copy.st_ino,
+          "names that are still one file keep sharing their copy");
+
+    remove_tree(home);
+    remove_tree(target);
+}
+
 typedef struct {
     const char *folder;   /* Gets a new file when the preflight opens it. */
     const char *vanished; /* Removed when the preflight opens it. */
@@ -5346,6 +5399,7 @@ int main(void)
     test_backup_leaves_another_install_alone();
     test_failed_update_keeps_the_finished_backup();
     test_native_update_replaces_changed_items();
+    test_native_update_splits_a_broken_hardlink();
     test_native_preflight_of_a_changing_source();
     test_update_repairs_payload_without_walking_it();
     test_updates_rewrite_a_grown_journal();
