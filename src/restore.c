@@ -2088,6 +2088,8 @@ static int restore_item_at(const CloneContext *ctx,
                                               source_rel, &preflight);
             return -1;
         }
+        if (capture_report != NULL)
+            capture_report->items += preflight.applied_count;
         return 1;
     }
 
@@ -2110,6 +2112,8 @@ static int restore_item_at(const CloneContext *ctx,
                                           &report);
         return -1;
     }
+    if (capture_report != NULL)
+        capture_report->items += report.applied_count;
     return 1;
 }
 
@@ -2338,7 +2342,7 @@ static int native_parent_times_take(int home_fd, const char *home_relative,
 // (D69). Returns 1 when the user left them out.
 static int restore_native_deferred(
     const CloneContext *ctx, int source_root_fd, int home_fd,
-    const NativeDeferral *deferral, int *count, int *had_error,
+    const NativeDeferral *deferral, int *had_error,
     const RestoreTimestampAnchors *timestamp_anchors,
     size_t *skipped_security_xattrs, BackupCaptureReport *capture_report)
 {
@@ -2375,9 +2379,7 @@ static int restore_native_deferred(
                                  home_fd, item->home_relative, item->label, 0,
                                  timestamp_anchors, skipped_security_xattrs,
                                  capture_report);
-        if (rc > 0 && item->whole_item)
-            (*count)++;
-        else if (rc < 0)
+        if (rc < 0)
             *had_error = 1;
         if (parent_fd >= 0)
         {
@@ -2447,7 +2449,7 @@ static const char *legacy_xdg_source_name(
 // from an unversioned or manifest-absent backup. This path preserves the
 // legacy layout and its all-or-nothing XDG destination resolution.
 static int restore_legacy(const char *source, int source_root_fd, const char *home, int home_fd,
-                          const CloneContext *ctx, int *count, int *had_error,
+                          const CloneContext *ctx, int *had_error,
                           NativeDeferral *deferral,
                           const RestoreTimestampAnchors *timestamp_anchors,
                           size_t *skipped_security_xattrs,
@@ -2503,9 +2505,7 @@ static int restore_legacy(const char *source, int source_root_fd, const char *ho
                                  skipped_security_xattrs, capture_report);
         if (rc > 0 && dry_run)
             printf("  Would restore: %s -> %s/\n", name, xdg_dirs[i]);
-        if (rc > 0)
-            (*count)++;
-        else if (rc < 0)
+        if (rc < 0)
             *had_error = 1;
 
         if (close(xdg_dest_fd) != 0)
@@ -2526,9 +2526,7 @@ static int restore_legacy(const char *source, int source_root_fd, const char *ho
                                LEGACY_HOME_ITEMS[i].name, deferral,
                                timestamp_anchors, skipped_security_xattrs,
                                capture_report);
-        if (rc > 0)
-            (*count)++;
-        else if (rc < 0)
+        if (rc < 0)
             *had_error = 1;
     }
 
@@ -2541,9 +2539,7 @@ static int restore_legacy(const char *source, int source_root_fd, const char *ho
                                LEGACY_HOME_ITEMS[i].name, deferral,
                                timestamp_anchors, skipped_security_xattrs,
                                capture_report);
-        if (rc > 0)
-            (*count)++;
-        else if (rc < 0)
+        if (rc < 0)
             *had_error = 1;
     }
 
@@ -2556,9 +2552,7 @@ static int restore_legacy(const char *source, int source_root_fd, const char *ho
                                LEGACY_HOME_ITEMS[i].name, deferral,
                                timestamp_anchors, skipped_security_xattrs,
                                capture_report);
-        if (rc > 0)
-            (*count)++;
-        else if (rc < 0)
+        if (rc < 0)
             *had_error = 1;
     }
 
@@ -3899,7 +3893,7 @@ static RestoreNativeStatus restore_v1_metadata_inventory(
 static void restore_v1(const char *source, int source_root_fd,
                        const CloneContext *ctx, const Manifest *m,
                        const RestoreTargetMap *target_map, int home_fd,
-                       int *count, int *had_error, NativeDeferral *deferral,
+                       int *had_error, NativeDeferral *deferral,
                        const RestoreTimestampAnchors *timestamp_anchors,
                        size_t *skipped_security_xattrs,
                        BackupCaptureReport *capture_report,
@@ -3953,9 +3947,7 @@ static void restore_v1(const char *source, int source_root_fd,
                 printf("  Would restore: %s/\n", destination->absolute);
             }
         }
-        if (rc > 0)
-            (*count)++;
-        else if (rc < 0)
+        if (rc < 0)
             *had_error = 1;
     }
 
@@ -4476,7 +4468,6 @@ int restore_with_options(const char *source, const RestoreOptions *options)
 
     printf("Restoring from: %s\n\n", source);
 
-    int count = 0;
     int had_error = 0;
     size_t skipped_security_xattrs = 0;
 
@@ -4548,7 +4539,7 @@ int restore_with_options(const char *source, const RestoreOptions *options)
     if (mst == MANIFEST_STATUS_VALID)
     {
         restore_v1(source, source_root_fd, &ctx, &m, &target_map, home_fd,
-                   &count, &had_error, dry_run ? NULL : &deferral,
+                   &had_error, dry_run ? NULL : &deferral,
                    &timestamp_anchors,
                    &skipped_security_xattrs, &capture_report,
                    target_map.order);
@@ -4556,14 +4547,14 @@ int restore_with_options(const char *source, const RestoreOptions *options)
     else
     {
         if (restore_legacy(source, source_root_fd, home, home_fd, &ctx,
-                           &count, &had_error, dry_run ? NULL : &deferral,
+                           &had_error, dry_run ? NULL : &deferral,
                            &timestamp_anchors,
                            &skipped_security_xattrs, &capture_report) != 0)
             goto cleanup;
     }
     if (!dry_run)
         left_out_deferred = restore_native_deferred(
-            &ctx, source_root_fd, home_fd, &deferral, &count, &had_error,
+            &ctx, source_root_fd, home_fd, &deferral, &had_error,
             &timestamp_anchors, &skipped_security_xattrs, &capture_report);
 
     restore_progress_finish_phase(&progress_phase);
@@ -4600,7 +4591,8 @@ int restore_with_options(const char *source, const RestoreOptions *options)
 
     printf("\n");
     char item_phrase[64];
-    format_item_count_phrase(item_phrase, sizeof(item_phrase), (size_t)count,
+    format_item_count_phrase(item_phrase, sizeof(item_phrase),
+                             capture_report.items,
                              dry_run ? "would be restored" : "restored");
     if (dry_run && had_error)
         printf("Dry run finished with errors: %s, some items failed validation\n",

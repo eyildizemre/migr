@@ -4956,6 +4956,10 @@ static void test_update_copies_again_what_verify_found_damaged(int portable)
     dry_run = 0;
     int first_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
                                         output, sizeof(output));
+    // Both representations count the folder and the file, not the root.
+    check(first_rc == 0 &&
+              strstr(output, "Backup complete: 2 items in the backup") != NULL,
+          "the backup counts every item it holds");
 
     char container[PATH_MAX], data[PATH_MAX], copy[PATH_MAX], list[PATH_MAX];
     int found = find_container_dir(target, container, sizeof(container));

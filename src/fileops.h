@@ -216,6 +216,8 @@ typedef enum {
  * already in the backup and did not copy.
  * bytes_since_sync accumulates the same content bytes until the configured
  * periodic-sync interval is reached; an interval of zero disables syncing.
+ * items counts what a run backed up or restored: every file, folder, link,
+ * and FIFO.
  * The failure fields keep the first item that failed: its path, the kind,
  * errno (0 when failed_operation says why), and, for native capture, what was
  * being done. A native source-safe-read refusal sets only
@@ -228,6 +230,7 @@ typedef struct {
     const char *failed_operation;
     off_t bytes_copied;
     off_t bytes_unchanged;
+    size_t items;
     char current_path[PATH_MAX];
     off_t bytes_since_sync;
     off_t sync_interval_bytes;
@@ -357,6 +360,7 @@ typedef enum {
 } RestoreNativeStatus;
 
 typedef struct {
+    /* Items restored, or in a preflight, items it would restore. */
     size_t applied_count;
     size_t failed_count;
     size_t skipped_security_xattr_count;

@@ -3007,9 +3007,9 @@ static void test_native_open_application_settings_are_deferred(void)
     check(rc == 0 && outcome.other_restored && outcome.code_restored &&
               outcome.chrome_restored && outcome.extensions_restored &&
               strstr(output, "No answer; restoring them now.") != NULL &&
-              strstr(output, "Restore complete: 3 items restored") != NULL,
+              strstr(output, "Restore complete: 9 items restored") != NULL,
           "with no one to answer, both are restored anyway, with a note, and "
-          "the whole roots are counted");
+          "every item is counted once, the late ones included");
     check(outcome.config_mtime_kept,
           "the folder holding the late settings keeps its restored "
           "modification time");

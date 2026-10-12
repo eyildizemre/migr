@@ -2529,7 +2529,7 @@ static void backup_before_deferred(void *context)
 
 static void capture_plan_root(const CloneContext *ctx, const BackupPlan *plan,
                               const SelectionPlan *selection, int index,
-                              int data_fd, int *count, int *had_error,
+                              int data_fd, int *had_error,
                               BackupCaptureReport *capture_report)
 {
     const BackupPlanRoot *root = &plan->roots[index];
@@ -2569,10 +2569,6 @@ static void capture_plan_root(const CloneContext *ctx, const BackupPlan *plan,
         }
         *had_error = 1;
     }
-    else
-    {
-        (*count)++;
-    }
 }
 
 // selection is the optional compiled plan (docs/DECISIONS.md D34) backing
@@ -2585,7 +2581,7 @@ static void capture_plan_root(const CloneContext *ctx, const BackupPlan *plan,
 // failed has no one to ask.
 static void capture_roots(const CloneContext *ctx, const BackupPlan *plan,
                           const SelectionPlan *selection, int data_fd,
-                          BackupDeferral *deferral, int *count, int *had_error,
+                          BackupDeferral *deferral, int *had_error,
                           BackupCaptureReport *capture_report)
 {
     // A mismatched pair would index selection->roots past its end with no
@@ -2613,7 +2609,7 @@ static void capture_roots(const CloneContext *ctx, const BackupPlan *plan,
                         printf("\n%s\n", root_sections[s].heading);
                         printed_heading = 1;
                     }
-                    capture_plan_root(ctx, plan, selection, i, data_fd, count,
+                    capture_plan_root(ctx, plan, selection, i, data_fd,
                                       had_error, capture_report);
                 }
             }
@@ -3346,11 +3342,9 @@ static int backup_dry_run(const char *target, BackupMode mode,
     if (include_network_config)
         print_network_config_dry_run(network_config_present_mask);
 
-    printf("\n");
-    char item_phrase[64];
-    format_item_count_phrase(item_phrase, sizeof(item_phrase),
-                             (size_t)count, "would be copied");
-    printf("Dry run complete: %s\n", item_phrase);
+    // The paths listed above; their files are counted when the backup runs.
+    printf("\nDry run complete: %d path%s would be backed up\n", count,
+           count == 1 ? "" : "s");
 
     backup_plan_free(plan);
     return 0;
@@ -3533,7 +3527,8 @@ static int backup_run(const char *target_arg, BackupMode mode,
     off_t raw_estimated_size = 0;
     int raw_estimate_had_error = 0;
 
-    int count = 0;
+    // Items backed up: every file, folder, link, and FIFO.
+    size_t count = 0;
 
     if (dry_run)
     {
@@ -3930,7 +3925,8 @@ static int backup_run(const char *target_arg, BackupMode mode,
                 }
                 if (!had_error)
                     capture_roots(&ctx, &plan, selection, data_fd, &deferral,
-                                  &count, &had_error, &capture_report);
+                                  &had_error, &capture_report);
+                count = capture_report.items;
                 if (!had_error)
                     reconcile_roots(ctx.visited, &plan, data_fd, &had_error);
                 native_inode_map_free(ctx.inode_map);
@@ -3957,7 +3953,7 @@ static int backup_run(const char *target_arg, BackupMode mode,
                 : portable_capture_fresh_prepared_at(
                       container_fd, &portable_request, &prepared, &live_count,
                       &capture_report);
-            count = (int)live_count;
+            count = live_count;
             if (capture_result != 0)
             {
                 print_portable_capture_failure(&capture_report);
@@ -4168,10 +4164,8 @@ static int backup_run(const char *target_arg, BackupMode mode,
         // Nothing is published: an incomplete container must never look
         // complete.
         char item_phrase[64];
-        format_item_count_phrase(item_phrase, sizeof(item_phrase),
-                                 (size_t)count,
-                                 repr == CLONE_PORTABLE_SIDECAR
-                                     ? "committed" : "copied");
+        format_item_count_phrase(item_phrase, sizeof(item_phrase), count,
+                                 "backed up");
         printf("Backup finished with errors: %s, some items failed\n",
                item_phrase);
         if (resumable)
@@ -4234,8 +4228,9 @@ static int backup_run(const char *target_arg, BackupMode mode,
     }
 
     char item_phrase[64];
-    format_item_count_phrase(item_phrase, sizeof(item_phrase), (size_t)count,
-                             "copied");
+    // An update copies only what changed; the count is the whole backup.
+    format_item_count_phrase(item_phrase, sizeof(item_phrase), count,
+                             "in the backup");
     print_success("Backup complete: %s\n", item_phrase);
     printf("Location: %s/%s\n", target, container_current_name(&container));
     if (include_self && repr == CLONE_PORTABLE_SIDECAR)
@@ -4392,13 +4387,12 @@ BackupCaptureStatus backup_selection_capture(const CloneContext *ctx,
     if (run.inode_map && run.visited)
     {
         int had_error = 0;
-        int count = 0;
         BackupDeferral none = {0};
         if (seed_native_hardlink_map(&run, &backup_plan, plan, data_fd,
                                      NULL) != 0)
             had_error = 1;
         if (!had_error)
-            capture_roots(&run, &backup_plan, plan, data_fd, &none, &count,
+            capture_roots(&run, &backup_plan, plan, data_fd, &none,
                           &had_error, report);
         if (!had_error)
             reconcile_roots(run.visited, &backup_plan, data_fd, &had_error);

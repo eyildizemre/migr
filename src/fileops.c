@@ -2217,6 +2217,8 @@ static BackupCaptureStatus capture_entry_at(const CloneContext *ctx,
         capture_fail(report, src, "record it as backed up", errno);
         return BACKUP_CAPTURE_ERROR;
     }
+    if (status == BACKUP_CAPTURE_OK && trackable && report != NULL)
+        report->items++;
 
     return status;
 }
@@ -4263,39 +4265,6 @@ static RestoreNativeStatus restore_entry_at(
         }
     }
 
-    if (S_ISLNK(source_st.st_mode))
-        return restore_entry_symlink(ctx, pass, source_parent_fd, source_leaf,
-                                     dest_parent_fd, dest_leaf, logical_path,
-                                     profiles, estimate, xattr_requirements,
-                                     skip_symlink_target_read, restore_report,
-                                     source_is_root, dest_is_root, dest_exists,
-                                     &dest_st, source_object_fd, desired_st);
-
-    if (S_ISREG(source_st.st_mode))
-        return restore_entry_regular(ctx, pass, source_parent_fd, source_leaf,
-                                     dest_parent_fd, dest_leaf, logical_path,
-                                     profiles, xattr_requirements, estimate,
-                                     restore_report, capture_report,
-                                     source_is_root, dest_is_root, dest_exists,
-                                     dest_st, source_st, desired_st,
-                                     source_object_fd);
-
-    if (S_ISDIR(source_st.st_mode))
-        return restore_entry_directory(ctx, pass, dest_parent_fd, dest_leaf,
-                                       logical_path, snapshots, profiles,
-                                       estimate, xattr_requirements,
-                                       metadata_anchor_fd,
-                                       skip_symlink_target_read,
-                                       restore_report, capture_report,
-                                       dest_exists, dest_st, source_st,
-                                       desired_st, source_object_fd, depth);
-
-    if (S_ISFIFO(source_st.st_mode))
-        return restore_entry_fifo(ctx, pass, dest_parent_fd, dest_leaf,
-                                  logical_path, restore_report,
-                                  source_is_root, dest_is_root, dest_exists,
-                                  dest_st, source_object_fd, desired_st);
-
     if (S_ISSOCK(source_st.st_mode))
         return restore_entry_socket(pass, source_leaf, source_object_fd);
 
@@ -4303,10 +4272,51 @@ static RestoreNativeStatus restore_entry_at(
         return restore_entry_device(pass, source_leaf, source_object_fd,
                                     source_st);
 
-    restore_report_failure(restore_report, logical_path,
-                           "it is of a kind migr cannot restore", 0);
-    close(source_object_fd);
-    return -1;
+    RestoreNativeStatus status;
+    if (S_ISLNK(source_st.st_mode))
+        status = restore_entry_symlink(ctx, pass, source_parent_fd,
+                                       source_leaf, dest_parent_fd, dest_leaf,
+                                       logical_path, profiles, estimate,
+                                       xattr_requirements,
+                                       skip_symlink_target_read,
+                                       restore_report, source_is_root,
+                                       dest_is_root, dest_exists, &dest_st,
+                                       source_object_fd, desired_st);
+    else if (S_ISREG(source_st.st_mode))
+        status = restore_entry_regular(ctx, pass, source_parent_fd,
+                                       source_leaf, dest_parent_fd, dest_leaf,
+                                       logical_path, profiles,
+                                       xattr_requirements, estimate,
+                                       restore_report, capture_report,
+                                       source_is_root, dest_is_root,
+                                       dest_exists, dest_st, source_st,
+                                       desired_st, source_object_fd);
+    else if (S_ISDIR(source_st.st_mode))
+        status = restore_entry_directory(ctx, pass, dest_parent_fd, dest_leaf,
+                                         logical_path, snapshots, profiles,
+                                         estimate, xattr_requirements,
+                                         metadata_anchor_fd,
+                                         skip_symlink_target_read,
+                                         restore_report, capture_report,
+                                         dest_exists, dest_st, source_st,
+                                         desired_st, source_object_fd, depth);
+    else if (S_ISFIFO(source_st.st_mode))
+        status = restore_entry_fifo(ctx, pass, dest_parent_fd, dest_leaf,
+                                    logical_path, restore_report,
+                                    source_is_root, dest_is_root, dest_exists,
+                                    dest_st, source_object_fd, desired_st);
+    else
+    {
+        restore_report_failure(restore_report, logical_path,
+                               "it is of a kind migr cannot restore", 0);
+        close(source_object_fd);
+        return -1;
+    }
+    // The apply pass counts what it restores; the validate pass counts what
+    // it would, which is all a dry run does.
+    if (pass == RESTORE_VALIDATE && status == RESTORE_NATIVE_OK)
+        restore_report_applied(restore_report);
+    return status;
 }
 
 static int restore_arguments_valid(const CloneContext *ctx,
@@ -4559,11 +4569,14 @@ RestoreNativeStatus restore_native_at_report(
         }
     }
     if (rc == 0)
+    {
+        report->applied_count = 0;
         rc = restore_entry_at(ctx, RESTORE_APPLY, fds.source_parent_fd,
                               fds.source_leaf, fds.dest_parent_fd,
                               fds.dest_leaf, source_rel, &snapshots, NULL,
                               NULL, NULL, destination_root_fd, 0, report,
                               capture_report, 0);
+    }
     if (rc != RESTORE_NATIVE_OK && report->failed_count == 0)
         restore_report_failure(report, source_rel, NULL, 0);
     restore_root_close(&fds);

@@ -155,7 +155,7 @@ Flatpak Applications
 
 Finalizing (syncing to disk)...
 Location: /mnt/usb/migr-eyildizemre
-  OK: Backup complete: 31 items copied
+  OK: Backup complete: 31 items in the backup
 ```
 
 **Before anything is written**, migr checks that the backup fits on the drive
