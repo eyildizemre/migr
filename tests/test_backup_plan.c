@@ -4665,7 +4665,8 @@ static void test_failed_update_keeps_the_finished_backup(void)
     char updating[PATH_MAX + 16];
     snprintf(updating, sizeof(updating), "%s.updating", container);
     check(first_rc == 0 && found && second_rc == 2 &&
-              strstr(output, "metadata preflight failed") != NULL &&
+              strstr(output, "the backup holds another kind of item there") !=
+                  NULL &&
               access(container, F_OK) == 0 && access(updating, F_OK) != 0 &&
               file_text_is(payload, "before"),
           "the backup keeps its finished name and content");

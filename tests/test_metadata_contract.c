@@ -1086,7 +1086,8 @@ static void test_native_seed_recopies_without_nsec_exact(void)
                      source_first_st.st_ino == source_second_st.st_ino,
                  case_name, "coarse seed source pair shares one inode");
     check_result(native_inode_map_seed_existing(&coarse_ctx, source_first,
-                                                destination_fd, "first") == 0,
+                                                destination_fd, "first",
+                                                NULL) == 0,
                  case_name,
                  "coarse seed inspection completes without adopting the destination");
     int first_result = backup_capture_at(&coarse_ctx, source_first,
@@ -1136,14 +1137,14 @@ static void test_metadata_helper_failure_paths(void)
                  case_name, "apply rejects a NULL desired stat");
     check_result(metadata_apply_symlink_at(-1, "file", &st, policy) == -1,
                  case_name, "symlink apply rejects an invalid directory fd");
-    check_result(metadata_profiles_probe(NULL, policy) == -1,
+    check_result(metadata_profiles_probe(NULL, policy, NULL) == -1,
                  case_name, "profile probe rejects a NULL profile set");
 
     MetadataProfiles profiles;
     metadata_profiles_init(&profiles);
     check_result(metadata_profiles_add(&profiles, -1, &st, NULL, NULL) == -1,
                  case_name, "profile collection rejects an invalid anchor fd");
-    check_result(metadata_profiles_probe(&profiles, policy) == 0,
+    check_result(metadata_profiles_probe(&profiles, policy, NULL) == 0,
                  case_name, "an empty profile set needs no live probe");
 
     MetadataSnapshots snapshots;

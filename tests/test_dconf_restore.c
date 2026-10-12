@@ -401,7 +401,7 @@ int main(int argc, char *argv[])
     size_t keys = 99;
     int database_fd = open_database(&fixture);
     int home_fd = fixture_home_open(&fixture);
-    check(dconf_restore_apply(database_fd, home_fd, NULL, 0, &keys) ==
+    check(dconf_restore_apply(database_fd, home_fd, NULL, 0, &keys, NULL) ==
               DCONF_RESTORE_NO_SESSION && keys == 0,
           "without a session bus the restored file is left as the result");
     char *log = fixture_log(&fixture);
@@ -415,7 +415,7 @@ int main(int argc, char *argv[])
     if (stat(fixture.home_database, &before) != 0)
         fatal("stat home database");
     check(dconf_restore_apply(database_fd, home_fd, pairs, pair_count,
-                              &keys) == DCONF_RESTORE_NO_SESSION,
+                              &keys, NULL) == DCONF_RESTORE_NO_SESSION,
           "without a session, settings naming the old home are rewritten");
     check(home_database_is(&fixture, COMPILED_PREFIX REWRITTEN_TEXT) &&
               stat(fixture.home_database, &after) == 0 &&
@@ -438,7 +438,7 @@ int main(int argc, char *argv[])
     fixture_reset_home(&fixture);
     build_pairs("/home/elsewhere", pairs, &pair_count);
     check(dconf_restore_apply(database_fd, home_fd, pairs, pair_count,
-                              &keys) == DCONF_RESTORE_NO_SESSION &&
+                              &keys, NULL) == DCONF_RESTORE_NO_SESSION &&
               home_database_is(&fixture, DATABASE_BYTES),
           "a database with nothing to rewrite stays as restored");
     log = fixture_log(&fixture);
@@ -449,14 +449,14 @@ int main(int argc, char *argv[])
     build_pairs("/home/old", pairs, &pair_count);
     setenv("MIGR_FAKE_DCONF_FAIL", "compile", 1);
     check(dconf_restore_apply(database_fd, home_fd, pairs, pair_count,
-                              &keys) == DCONF_RESTORE_HOME_NOT_REWRITTEN &&
+                              &keys, NULL) == DCONF_RESTORE_HOME_NOT_REWRITTEN &&
               home_database_is(&fixture, DATABASE_BYTES),
           "a failed compile is reported and leaves the restored file");
     fixture_reset_home(&fixture);
 
     fixture_bind_bus(&fixture);
     setenv("PATH", fixture.empty_bin, 1);
-    check(dconf_restore_apply(database_fd, home_fd, NULL, 0, &keys) ==
+    check(dconf_restore_apply(database_fd, home_fd, NULL, 0, &keys, NULL) ==
               DCONF_RESTORE_UNAVAILABLE,
           "a session without dconf installed is reported as unavailable");
     setenv("PATH", fixture.bin, 1);
@@ -466,7 +466,7 @@ int main(int argc, char *argv[])
     const char *inherited = getenv("XDG_RUNTIME_DIR");
     char *saved_runtime = inherited != NULL ? strdup(inherited) : NULL;
     setenv("XDG_RUNTIME_DIR", "/run/user/0", 1);
-    check(dconf_restore_apply(database_fd, home_fd, NULL, 0, &keys) ==
+    check(dconf_restore_apply(database_fd, home_fd, NULL, 0, &keys, NULL) ==
               DCONF_RESTORE_APPLIED && keys == 3,
           "a running session gets the backup's settings loaded");
     if (saved_runtime != NULL)
@@ -493,7 +493,7 @@ int main(int argc, char *argv[])
 
     fixture_reset_log(&fixture);
     check(dconf_restore_apply(database_fd, home_fd, pairs, pair_count,
-                              &keys) == DCONF_RESTORE_APPLIED && keys == 3,
+                              &keys, NULL) == DCONF_RESTORE_APPLIED && keys == 3,
           "a running session gets the rewritten settings loaded");
     log = fixture_log(&fixture);
     check(strstr(log, "load stdin=rewritten") != NULL &&
@@ -505,7 +505,7 @@ int main(int argc, char *argv[])
 
     fixture_reset_log(&fixture);
     setenv("MIGR_FAKE_DCONF_FAIL", "dump", 1);
-    check(dconf_restore_apply(database_fd, home_fd, NULL, 0, &keys) ==
+    check(dconf_restore_apply(database_fd, home_fd, NULL, 0, &keys, NULL) ==
               DCONF_RESTORE_FAILED,
           "a failed dump is reported");
     log = fixture_log(&fixture);
@@ -515,15 +515,21 @@ int main(int argc, char *argv[])
 
     fixture_reset_log(&fixture);
     setenv("MIGR_FAKE_DCONF_FAIL", "load", 1);
-    check(dconf_restore_apply(database_fd, home_fd, NULL, 0, &keys) ==
-              DCONF_RESTORE_FAILED && keys == 0,
+    FailedStep failed = {0};
+    check(dconf_restore_apply(database_fd, home_fd, NULL, 0, &keys,
+                              &failed) == DCONF_RESTORE_FAILED && keys == 0,
           "a failed load is reported");
+    check(failed.step != NULL && strcmp(failed.step, "run dconf load") == 0 &&
+              failed.err == 0 && failed.exit_status != 0,
+          "the failed step is dconf load, with its exit status");
 
     fixture_reset_log(&fixture);
     dconf_restore_test_set_dump_limit(16);
-    check(dconf_restore_apply(database_fd, home_fd, NULL, 0, &keys) ==
-              DCONF_RESTORE_FAILED,
-          "a dump larger than the limit is rejected");
+    failed = (FailedStep){0};
+    check(dconf_restore_apply(database_fd, home_fd, NULL, 0, &keys,
+                              &failed) == DCONF_RESTORE_FAILED &&
+              failed.step != NULL && strstr(failed.step, "larger") != NULL,
+          "a dump larger than the limit is rejected, and says so");
     log = fixture_log(&fixture);
     check(strstr(log, "load") == NULL,
           "a truncated dump is never loaded");
@@ -531,7 +537,7 @@ int main(int argc, char *argv[])
 
     fixture_reset_log(&fixture);
     setenv("MIGR_FAKE_DCONF_EMPTY", "1", 1);
-    check(dconf_restore_apply(database_fd, home_fd, NULL, 0, &keys) ==
+    check(dconf_restore_apply(database_fd, home_fd, NULL, 0, &keys, NULL) ==
               DCONF_RESTORE_APPLIED &&
               keys == 0,
           "an empty database applies nothing");
@@ -540,7 +546,7 @@ int main(int argc, char *argv[])
     free(log);
 
     fixture_reset_log(&fixture);
-    check(dconf_restore_apply(-1, home_fd, NULL, 0, &keys) ==
+    check(dconf_restore_apply(-1, home_fd, NULL, 0, &keys, NULL) ==
               DCONF_RESTORE_FAILED,
           "an invalid database fd is rejected");
 

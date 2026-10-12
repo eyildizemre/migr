@@ -184,7 +184,7 @@ static void test_rejects_destination_intermediate_symlink_escape(void)
     int dest_fd = open_dir_fd(dest_root);
 
     check(restore_native_preflight_at(&RESTORE_CTX, source_fd, "note.txt",
-                                      dest_fd, "escape_link/smuggled.txt") != 0,
+                                      dest_fd, "escape_link/smuggled.txt", NULL) != 0,
           "preflight refuses the intermediate destination symlink");
     int rc = restore_native_at(&RESTORE_CTX, source_fd, "note.txt",
                                dest_fd, "escape_link/smuggled.txt");
@@ -340,7 +340,7 @@ static void test_rejects_source_intermediate_symlink_redirect(void)
           "source status reports an unsafe intermediate symlink as an error");
     check(restore_native_preflight_at(&RESTORE_CTX, source_fd,
                                       "redirect/secret.txt",
-                                      dest_fd, "out.txt") != 0,
+                                      dest_fd, "out.txt", NULL) != 0,
           "preflight refuses the intermediate source symlink");
     int rc = restore_native_at(&RESTORE_CTX, source_fd,
                                "redirect/secret.txt", dest_fd, "out.txt");
@@ -1187,7 +1187,7 @@ static void test_rejects_excessive_recursion_depth(void)
     int dest_fd = open_dir_fd(dest_root);
 
     check(restore_native_preflight_at(&RESTORE_CTX, source_fd, "root",
-                                      dest_fd, "root") != 0,
+                                      dest_fd, "root", NULL) != 0,
           "excessive payload nesting is refused instead of exhausting the stack");
 
     close(source_fd);

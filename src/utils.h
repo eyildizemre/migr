@@ -157,6 +157,55 @@ void print_source_safe_read_refusal(const char *label);
 void print_item_failure(const char *verb, const char *path,
                         const char *operation, int err);
 
+/* The first step of several that failed, with errno, 0 when the step says
+ * why on its own, or, for a command, its exit status. Zero-initialized, it
+ * holds none. */
+typedef struct {
+    const char *step;
+    int err;
+    int exit_status;
+} FailedStep;
+
+/**
+ * @brief Records step and err unless a step was already recorded. Called
+ *        before any cleanup that could change errno.
+ */
+void failed_step_note(FailedStep *failed, const char *step, int err);
+
+/* The first item of a walk that failed, and the step that failed on it. */
+typedef struct {
+    char path[PATH_MAX];
+    FailedStep step;
+} FailedItem;
+
+/**
+ * @brief Records path, step, and err unless an item was already recorded;
+ *        failed may be NULL.
+ */
+void failed_item_note(FailedItem *failed, const char *path, const char *step,
+                      int err);
+
+/**
+ * @brief Records a command that failed, given what run_command() and its
+ *        variants returned: a positive exit status, or -1 with errno.
+ */
+void failed_step_note_command(FailedStep *failed, const char *step,
+                              int result);
+
+/**
+ * @brief Prints the formatted message as an error, followed by ": <step>"
+ *        and errno's text unless it is 0. The log also gets errno's name and
+ *        number.
+ */
+void print_step_failure(const FailedStep *failed, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+
+/**
+ * @brief print_step_failure() for a warning.
+ */
+void print_step_warning(const FailedStep *failed, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+
 /**
  * @brief Writes all of data to fd, retrying short writes and EINTR.
  * @return 0, or -1 with errno (EIO for a write that makes no progress).

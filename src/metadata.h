@@ -9,6 +9,7 @@
 
 #include "sidecar.h"
 #include "subid.h"
+#include "utils.h"
 
 typedef struct CloneContext CloneContext;
 
@@ -92,8 +93,26 @@ int metadata_profiles_add(MetadataProfiles *profiles, int anchor_fd,
                           const struct stat *desired,
                           const struct stat *existing,
                           const char *path);
+/* Where and how a metadata_profiles_probe() round trip failed: the step,
+ * the folder it ran in (borrowed from the profiles), and what it tried to
+ * set. */
+typedef struct {
+    FailedStep step;
+    int anchor_fd;
+    uid_t uid;
+    gid_t gid;
+    mode_t mode;
+} MetadataProbeFailure;
+
+/* failure, which may be NULL, receives the profile that failed. */
 int metadata_profiles_probe(const MetadataProfiles *profiles,
-                            MetadataTimestampPolicy policy);
+                            MetadataTimestampPolicy policy,
+                            MetadataProbeFailure *failure);
+/* Says where the destination could not keep the owner, permissions, or
+ * times the failed probe tried, as an error or a warning, and then the
+ * followup line. */
+void metadata_probe_failure_print(const MetadataProbeFailure *failure,
+                                  int warning, const char *followup);
 void metadata_profiles_report(const MetadataProfiles *profiles);
 int metadata_xattr_capability_probe(
     int anchor_fd, const MetadataXattrRequirements *required);

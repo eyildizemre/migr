@@ -708,7 +708,8 @@ int main(void)
     REQUIRE(backup_selection_inventory(&plan, native_fd, -1, &profiles) == 0);
     REQUIRE(metadata_profiles_probe(
                 &profiles,
-                (MetadataTimestampPolicy){.configured = 1, .nsec_exact = 1}) == 0);
+                (MetadataTimestampPolicy){.configured = 1, .nsec_exact = 1},
+                NULL) == 0);
     metadata_profiles_free(&profiles);
     CloneContext native_context = {
         .operation = CLONE_BACKUP,

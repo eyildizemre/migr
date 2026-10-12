@@ -450,9 +450,9 @@ static void test_native_hardlink_interrupt_resume(void)
         .inode_map = map
     };
     check(native_inode_map_seed_existing(&context, source_first_root,
-                                         destination_fd, "root-a") == 0 &&
+                                         destination_fd, "root-a", NULL) == 0 &&
               native_inode_map_seed_existing(&context, source_second_root,
-                                             destination_fd, "root-b") == 0,
+                                             destination_fd, "root-b", NULL) == 0,
           "native hardlink resume seeds existing representatives before walking");
     int resume_result = backup_capture_at(&context, source_second_root,
                                           destination_fd, "root-b");
@@ -606,9 +606,9 @@ static void test_native_restore_hardlink_interrupt_resume(void)
         .inode_map = map
     };
     check(native_inode_map_seed_existing(&context, source_first_root,
-                                         destination_fd, "root-a") == 0 &&
+                                         destination_fd, "root-a", NULL) == 0 &&
               native_inode_map_seed_existing(&context, source_second_root,
-                                             destination_fd, "root-b") == 0,
+                                             destination_fd, "root-b", NULL) == 0,
           "native restore resume seeds existing representatives before walking");
 
     RestoreNativeReport sibling_report;

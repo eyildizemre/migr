@@ -483,8 +483,11 @@ static void test_ownership_probe_rejection(uid_t uid, gid_t gid)
         return;
     }
     check_result(result == 2, "foreign group ownership rejects the backup");
-    check_result(contains(output, "native metadata preflight failed"),
-                 "ownership failure is distinct from source-safe-read refusal");
+    check_result(contains(output, "cannot keep the owner") &&
+                     contains(output, "give the test file the owner") &&
+                     contains(output, "No container was created."),
+                 "ownership failure names the folder and the step, distinct "
+                 "from source-safe-read refusal");
     check_result(directory_entry_count(target) == 0,
                  "ownership-probe refusal leaves no container");
     remove_tree(base);

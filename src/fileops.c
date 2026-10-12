@@ -734,16 +734,17 @@ static int native_seed_relative_path_is_safe(const char *rel)
 
 static int native_inode_map_seed_existing_at(
     const CloneContext *ctx, const char *source_path, int destination_dir_fd,
-    const char *destination_leaf);
+    const char *destination_leaf, FailedItem *failed);
 
 static int native_inode_map_seed_existing_directory_at(
     const CloneContext *ctx, const char *source_path, int source_fd,
-    int destination_fd)
+    int destination_fd, FailedItem *failed)
 {
     int scan_fd = fcntl(source_fd, F_DUPFD_CLOEXEC, 0);
     DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
     if (directory == NULL)
     {
+        failed_item_note(failed, source_path, "list the folder", errno);
         if (scan_fd >= 0)
             close(scan_fd);
         close(source_fd);
@@ -751,7 +752,7 @@ static int native_inode_map_seed_existing_directory_at(
         return -1;
     }
 
-    int failed = 0;
+    int result = 0;
     for (;;)
     {
         errno = 0;
@@ -759,7 +760,10 @@ static int native_inode_map_seed_existing_directory_at(
         if (entry == NULL)
         {
             if (errno != 0)
-                failed = 1;
+            {
+                failed_item_note(failed, source_path, "list the folder", errno);
+                result = -1;
+            }
             break;
         }
         if (strcmp(entry->d_name, ".") == 0 ||
@@ -768,44 +772,103 @@ static int native_inode_map_seed_existing_directory_at(
 
         char child_source[PATH_MAX];
         if (path_join(child_source, sizeof(child_source), source_path,
-                      entry->d_name) != 0 ||
-            native_inode_map_seed_existing_at(ctx, child_source,
-                                               destination_fd,
-                                               entry->d_name) != 0)
+                      entry->d_name) != 0)
         {
-            failed = 1;
+            failed_item_note(failed, source_path, "name an item in the folder",
+                             ENAMETOOLONG);
+            result = -1;
+            break;
+        }
+        if (native_inode_map_seed_existing_at(ctx, child_source,
+                                               destination_fd, entry->d_name,
+                                               failed) != 0)
+        {
+            result = -1;
             break;
         }
     }
     if (closedir(directory) != 0)
-        failed = 1;
+    {
+        failed_item_note(failed, source_path, "list the folder", errno);
+        result = -1;
+    }
     if (close(source_fd) != 0)
-        failed = 1;
+    {
+        failed_item_note(failed, source_path, "close the folder", errno);
+        result = -1;
+    }
     if (close(destination_fd) != 0)
-        failed = 1;
-    return failed ? -1 : 0;
+    {
+        failed_item_note(failed, source_path, "close its existing copy",
+                         errno);
+        result = -1;
+    }
+    return result;
+}
+
+// Opens the source folder already known to be one, for the walk below it;
+// 1 to skip it (unreadable without changing its access time, or changed),
+// -1 on an error.
+static int native_seed_open_folder(const char *source_path,
+                                   const struct stat *source_st,
+                                   int *source_fd, FailedItem *failed)
+{
+    *source_fd = open(source_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                                       O_NOATIME | O_CLOEXEC);
+    if (*source_fd < 0)
+    {
+        if (errno == EPERM)
+            return 1;
+        failed_item_note(failed, source_path, "open the folder", errno);
+        return -1;
+    }
+    struct stat opened;
+    if (fstat(*source_fd, &opened) != 0)
+    {
+        failed_item_note(failed, source_path, "inspect the folder", errno);
+        close(*source_fd);
+        return -1;
+    }
+    if (!metadata_source_unchanged(source_st, &opened))
+    {
+        close(*source_fd);
+        return 1;
+    }
+    return 0;
 }
 
 static int native_inode_map_seed_existing_at(
     const CloneContext *ctx, const char *source_path, int destination_dir_fd,
-    const char *destination_leaf)
+    const char *destination_leaf, FailedItem *failed)
 {
     if (ctx->selection)
     {
         int owned = selection_source_owns(ctx->selection, source_path);
+        if (owned < 0)
+            failed_item_note(failed, source_path,
+                             "it lies outside its root in the selection", 0);
         if (owned <= 0) return owned;
     }
     // Seeding only saves relinking hardlinks on a resume; a source that
     // vanished or changed since is left to the capture pass (D63).
     struct stat source_st;
     if (lstat(source_path, &source_st) != 0)
-        return errno == ENOENT ? 0 : -1;
+    {
+        if (errno == ENOENT)
+            return 0;
+        failed_item_note(failed, source_path, "inspect it", errno);
+        return -1;
+    }
 
     struct stat destination_st;
     if (fstatat(destination_dir_fd, destination_leaf, &destination_st,
                 AT_SYMLINK_NOFOLLOW) != 0)
     {
-        return errno == ENOENT ? 0 : -1;
+        if (errno == ENOENT)
+            return 0;
+        failed_item_note(failed, source_path, "inspect its existing copy",
+                         errno);
+        return -1;
     }
 
     if (S_ISREG(source_st.st_mode))
@@ -818,127 +881,155 @@ static int native_inode_map_seed_existing_at(
         int source_fd = open(source_path,
                              O_RDONLY | O_NOATIME | O_CLOEXEC | O_NOFOLLOW);
         if (source_fd < 0)
-            return errno == EPERM ? 0 : -1;
-        struct stat opened;
-        int failed = fstat(source_fd, &opened) != 0;
-        int changed = !failed && !metadata_source_unchanged(&source_st, &opened);
-        if (close(source_fd) != 0)
-            failed = 1;
-        if (failed)
+        {
+            if (errno == EPERM)
+                return 0;
+            failed_item_note(failed, source_path, "open it", errno);
             return -1;
-        if (changed)
-            return 0;
-        return native_inode_map_insert(ctx->inode_map, source_st.st_dev,
-                                       source_st.st_ino, destination_dir_fd,
-                                       destination_leaf);
+        }
+        struct stat opened;
+        int result = 0;
+        if (fstat(source_fd, &opened) != 0)
+        {
+            failed_item_note(failed, source_path, "inspect it", errno);
+            result = -1;
+        }
+        int changed = result == 0 &&
+                      !metadata_source_unchanged(&source_st, &opened);
+        if (close(source_fd) != 0)
+        {
+            failed_item_note(failed, source_path, "close it", errno);
+            result = -1;
+        }
+        if (result != 0 || changed)
+            return result;
+        if (native_inode_map_insert(ctx->inode_map, source_st.st_dev,
+                                    source_st.st_ino, destination_dir_fd,
+                                    destination_leaf) != 0)
+        {
+            failed_item_note(failed, source_path, "record its other names",
+                             errno);
+            return -1;
+        }
+        return 0;
     }
 
     if (!S_ISDIR(source_st.st_mode) || !S_ISDIR(destination_st.st_mode))
         return 0;
 
-    int source_fd = open(source_path,
-                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
-                         O_NOATIME | O_CLOEXEC);
-    if (source_fd < 0)
-        return errno == EPERM ? 0 : -1;
-    struct stat opened;
-    if (fstat(source_fd, &opened) != 0)
-    {
-        close(source_fd);
-        return -1;
-    }
-    if (!metadata_source_unchanged(&source_st, &opened))
-    {
-        close(source_fd);
-        return 0;
-    }
+    int source_fd;
+    int opened = native_seed_open_folder(source_path, &source_st, &source_fd,
+                                         failed);
+    if (opened != 0)
+        return opened > 0 ? 0 : -1;
 
     int destination_fd = openat(destination_dir_fd, destination_leaf,
                                 O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
                                 O_CLOEXEC);
     if (destination_fd < 0)
     {
+        failed_item_note(failed, source_path, "open its existing copy",
+                         errno);
         close(source_fd);
         return -1;
     }
     return native_inode_map_seed_existing_directory_at(
-        ctx, source_path, source_fd, destination_fd);
+        ctx, source_path, source_fd, destination_fd, failed);
 }
 
 static int native_inode_map_seed_existing_root_at(
-    const CloneContext *ctx, const char *source_path, int destination_root_fd)
+    const CloneContext *ctx, const char *source_path, int destination_root_fd,
+    FailedItem *failed)
 {
     if (ctx->selection)
     {
         int owned = selection_source_owns(ctx->selection, source_path);
+        if (owned < 0)
+            failed_item_note(failed, source_path,
+                             "it lies outside its root in the selection", 0);
         if (owned <= 0) return owned;
     }
     struct stat source_st;
     if (lstat(source_path, &source_st) != 0)
-        return errno == ENOENT ? 0 : -1;
+    {
+        if (errno == ENOENT)
+            return 0;
+        failed_item_note(failed, source_path, "inspect it", errno);
+        return -1;
+    }
 
     struct stat destination_st;
     if (fstat(destination_root_fd, &destination_st) != 0)
+    {
+        failed_item_note(failed, source_path, "inspect its existing copy",
+                         errno);
         return -1;
+    }
     if (!S_ISDIR(destination_st.st_mode) || !S_ISDIR(source_st.st_mode))
         return 0;
 
-    int source_fd = open(source_path,
-                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
-                         O_NOATIME | O_CLOEXEC);
-    if (source_fd < 0)
-        return errno == EPERM ? 0 : -1;
-    struct stat opened;
-    if (fstat(source_fd, &opened) != 0)
-    {
-        close(source_fd);
-        return -1;
-    }
-    if (!metadata_source_unchanged(&source_st, &opened))
-    {
-        close(source_fd);
-        return 0;
-    }
+    int source_fd;
+    int opened = native_seed_open_folder(source_path, &source_st, &source_fd,
+                                         failed);
+    if (opened != 0)
+        return opened > 0 ? 0 : -1;
 
     int destination_fd = fcntl(destination_root_fd, F_DUPFD_CLOEXEC, 0);
     if (destination_fd < 0)
     {
+        failed_item_note(failed, source_path, "open its existing copy",
+                         errno);
         close(source_fd);
         return -1;
     }
     return native_inode_map_seed_existing_directory_at(
-        ctx, source_path, source_fd, destination_fd);
+        ctx, source_path, source_fd, destination_fd, failed);
 }
 
 int native_inode_map_seed_existing(const CloneContext *ctx,
                                    const char *source_path,
                                    int destination_root_fd,
-                                   const char *destination_rel)
+                                   const char *destination_rel,
+                                   FailedItem *failed)
 {
     if (ctx == NULL ||
         (ctx->operation != CLONE_BACKUP && ctx->operation != CLONE_RESTORE) ||
         ctx->representation != CLONE_NATIVE_TREE ||
         source_path == NULL || destination_root_fd < 0 ||
-        !native_seed_relative_path_is_safe(destination_rel))
+        !native_seed_relative_path_is_safe(destination_rel) ||
+        (ctx->selection && ctx->operation != CLONE_BACKUP))
+    {
+        failed_item_note(failed, source_path != NULL ? source_path : "",
+                         "it was given to the hardlink seeding wrongly", 0);
         return -1;
-    if (ctx->selection && ctx->operation != CLONE_BACKUP) return -1;
+    }
     if (ctx->inode_map == NULL)
         return 0;
     if (destination_rel[0] == '\0')
         return native_inode_map_seed_existing_root_at(
-            ctx, source_path, destination_root_fd);
+            ctx, source_path, destination_root_fd, failed);
 
     int destination_parent_fd = -1;
     char destination_leaf[NAME_MAX + 1U];
     RestoreResolveResult resolved = resolve_parent(
         destination_root_fd, destination_rel, 0, &destination_parent_fd,
         destination_leaf, sizeof(destination_leaf));
+    if (resolved == RESTORE_RESOLVE_MISSING)
+        return 0;
     if (resolved != RESTORE_RESOLVE_OK)
-        return resolved == RESTORE_RESOLVE_MISSING ? 0 : -1;
+    {
+        failed_item_note(failed, source_path,
+                         "open the folders above its existing copy", errno);
+        return -1;
+    }
     int result = native_inode_map_seed_existing_at(
-        ctx, source_path, destination_parent_fd, destination_leaf);
+        ctx, source_path, destination_parent_fd, destination_leaf, failed);
     if (close(destination_parent_fd) != 0)
+    {
+        failed_item_note(failed, source_path,
+                         "close the folder above its existing copy", errno);
         result = -1;
+    }
     return result;
 }
 
@@ -4206,10 +4297,12 @@ RestoreSourceStatus restore_native_source_status_at(int source_root_fd,
                                                      const char *source_rel)
 {
     if (source_root_fd < 0 || source_rel == NULL ||
-        !fd_is_directory(source_root_fd))
+        !fd_is_directory(source_root_fd) ||
+        (source_rel[0] != '\0' && !relative_path_is_safe(source_rel)))
+    {
+        errno = EINVAL;
         return RESTORE_SOURCE_ERROR;
-    if (source_rel[0] != '\0' && !relative_path_is_safe(source_rel))
-        return RESTORE_SOURCE_ERROR;
+    }
 
     int source_parent_fd = -1;
     char source_leaf[RESTORE_LEAF_MAX];
@@ -4230,60 +4323,112 @@ RestoreSourceStatus restore_native_source_status_at(int source_root_fd,
         close(object_fd);
         return RESTORE_SOURCE_PRESENT;
     }
+    errno = saved_errno;
     return saved_errno == ENOENT
         ? RESTORE_SOURCE_MISSING
         : RESTORE_SOURCE_ERROR;
 }
 
-RestoreNativeStatus restore_native_preflight_at(
-    const CloneContext *ctx, int source_root_fd, const char *source_rel,
-    int destination_root_fd, const char *destination_rel)
+static void restore_native_report_init(RestoreNativeReport *report)
 {
+    if (report != NULL)
+        memset(report, 0, sizeof(*report));
+}
+
+// The parents of one restore root on both sides, and the folder its
+// metadata is profiled against. dest_parent_fd is -1 while the root's place
+// on this system does not exist yet.
+typedef struct {
+    int source_parent_fd;
+    char source_leaf[RESTORE_LEAF_MAX];
+    int dest_parent_fd;
+    char dest_leaf[RESTORE_LEAF_MAX];
+    int metadata_anchor_fd;
+} RestoreRootFds;
+
+static void restore_root_close(RestoreRootFds *fds)
+{
+    if (fds->source_parent_fd >= 0)
+        close(fds->source_parent_fd);
+    if (fds->dest_parent_fd >= 0)
+        close(fds->dest_parent_fd);
+    if (fds->metadata_anchor_fd >= 0)
+        close(fds->metadata_anchor_fd);
+    fds->source_parent_fd = fds->dest_parent_fd = fds->metadata_anchor_fd = -1;
+}
+
+// 0 with fds open, or -1 with the failure in report and nothing open.
+static int restore_root_open(const CloneContext *ctx, int source_root_fd,
+                             const char *source_rel, int destination_root_fd,
+                             const char *destination_rel, RestoreRootFds *fds,
+                             RestoreNativeReport *report)
+{
+    fds->source_parent_fd = fds->dest_parent_fd = fds->metadata_anchor_fd = -1;
     if (!restore_arguments_valid(ctx, source_root_fd, source_rel,
                                  destination_root_fd, destination_rel))
-        return -1;
-
-    int source_parent_fd = -1;
-    char source_leaf[RESTORE_LEAF_MAX];
-    if (resolve_parent(source_root_fd, source_rel, 0, &source_parent_fd,
-                       source_leaf, sizeof(source_leaf)) != RESTORE_RESOLVE_OK)
-        return -1;
-
-    int dest_parent_fd = -1;
-    char dest_leaf[RESTORE_LEAF_MAX];
-    RestoreResolveResult dest_result =
-        resolve_parent(destination_root_fd, destination_rel, 0,
-                       &dest_parent_fd, dest_leaf, sizeof(dest_leaf));
-    if (dest_result == RESTORE_RESOLVE_ERROR)
     {
-        close(source_parent_fd);
+        restore_report_failure(report, source_rel,
+                               "it was given to the restore wrongly", 0);
         return -1;
     }
+    if (resolve_parent(source_root_fd, source_rel, 0, &fds->source_parent_fd,
+                       fds->source_leaf, sizeof(fds->source_leaf)) !=
+        RESTORE_RESOLVE_OK)
+    {
+        restore_report_failure(report, source_rel,
+                               "open the folders above its copy in the backup",
+                               errno);
+        return -1;
+    }
+    if (resolve_parent(destination_root_fd, destination_rel, 0,
+                       &fds->dest_parent_fd, fds->dest_leaf,
+                       sizeof(fds->dest_leaf)) == RESTORE_RESOLVE_ERROR)
+    {
+        int err = errno;
+        int not_a_folder = err == ELOOP || err == ENOTDIR;
+        restore_report_failure(report, source_rel,
+                               not_a_folder
+                                   ? "a folder on the way is a symbolic link "
+                                     "or not a folder; move it aside and run "
+                                     "the restore again"
+                                   : "open the folders above it",
+                               not_a_folder ? 0 : err);
+        restore_root_close(fds);
+        return -1;
+    }
+    fds->metadata_anchor_fd = destination_metadata_anchor(destination_root_fd,
+                                                          destination_rel);
+    if (fds->metadata_anchor_fd < 0)
+    {
+        restore_report_failure(report, source_rel,
+                               "open the folder it goes into", errno);
+        restore_root_close(fds);
+        return -1;
+    }
+    return 0;
+}
+
+RestoreNativeStatus restore_native_preflight_at(
+    const CloneContext *ctx, int source_root_fd, const char *source_rel,
+    int destination_root_fd, const char *destination_rel,
+    RestoreNativeReport *report)
+{
+    restore_native_report_init(report);
+    RestoreRootFds fds;
+    if (restore_root_open(ctx, source_root_fd, source_rel, destination_root_fd,
+                          destination_rel, &fds, report) != 0)
+        return -1;
 
     MetadataSnapshots snapshots;
     MetadataProfiles profiles;
     metadata_snapshots_init(&snapshots);
     metadata_profiles_init(&profiles);
-    int metadata_anchor_fd = destination_metadata_anchor(destination_root_fd,
-                                                          destination_rel);
-    if (metadata_anchor_fd < 0)
-    {
-        close(source_parent_fd);
-        if (dest_parent_fd >= 0)
-            close(dest_parent_fd);
-        metadata_snapshots_free(&snapshots);
-        metadata_profiles_free(&profiles);
-        return -1;
-    }
-    int rc = restore_entry_at(ctx, RESTORE_VALIDATE, source_parent_fd,
-                              source_leaf, dest_parent_fd, dest_leaf,
-                              source_rel, &snapshots, &profiles,
-                              NULL, NULL, metadata_anchor_fd, 0, NULL, NULL,
-                              0);
-    close(metadata_anchor_fd);
-    close(source_parent_fd);
-    if (dest_parent_fd >= 0)
-        close(dest_parent_fd);
+    int rc = restore_entry_at(ctx, RESTORE_VALIDATE, fds.source_parent_fd,
+                              fds.source_leaf, fds.dest_parent_fd,
+                              fds.dest_leaf, source_rel, &snapshots,
+                              &profiles, NULL, NULL, fds.metadata_anchor_fd, 0,
+                              report, NULL, 0);
+    restore_root_close(&fds);
     metadata_snapshots_free(&snapshots);
     metadata_profiles_free(&profiles);
     return rc;
@@ -4292,68 +4437,31 @@ RestoreNativeStatus restore_native_preflight_at(
 RestoreNativeStatus restore_native_metadata_inventory_at(
     const CloneContext *ctx, int source_root_fd, const char *source_rel,
     int destination_root_fd, const char *destination_rel,
-    MetadataProfiles *profiles, NativeRestoreEstimate *estimate)
+    MetadataProfiles *profiles, NativeRestoreEstimate *estimate,
+    RestoreNativeReport *report)
 {
-    if (profiles == NULL || !restore_arguments_valid(ctx, source_root_fd,
-                                                     source_rel,
-                                                     destination_root_fd,
-                                                     destination_rel))
-        return -1;
-
-    int source_parent_fd = -1;
-    char source_leaf[RESTORE_LEAF_MAX];
-    if (resolve_parent(source_root_fd, source_rel, 0, &source_parent_fd,
-                       source_leaf, sizeof(source_leaf)) != RESTORE_RESOLVE_OK)
-        return -1;
-
-    int dest_parent_fd = -1;
-    char dest_leaf[RESTORE_LEAF_MAX];
-    RestoreResolveResult dest_result =
-        resolve_parent(destination_root_fd, destination_rel, 0,
-                       &dest_parent_fd, dest_leaf, sizeof(dest_leaf));
-    if (dest_result == RESTORE_RESOLVE_ERROR)
+    restore_native_report_init(report);
+    RestoreRootFds fds;
+    if (profiles == NULL)
     {
-        int saved_errno = errno;
-        char path[PATH_MAX + NAME_MAX + 2];
-        describe_path_at(destination_root_fd, destination_rel, path,
-                         sizeof(path));
-        print_error("Error: cannot reach %s (%s); a folder on the way that is "
-                    "a symbolic link is not followed. Move it aside and run "
-                    "the restore again.\n", path, strerror(saved_errno));
-        close(source_parent_fd);
+        restore_report_failure(report, source_rel,
+                               "it was given to the restore wrongly", 0);
         return -1;
     }
+    if (restore_root_open(ctx, source_root_fd, source_rel, destination_root_fd,
+                          destination_rel, &fds, report) != 0)
+        return -1;
 
     MetadataSnapshots snapshots;
     metadata_snapshots_init(&snapshots);
-    int metadata_anchor_fd = destination_metadata_anchor(destination_root_fd,
-                                                          destination_rel);
-    if (metadata_anchor_fd < 0)
-    {
-        close(source_parent_fd);
-        if (dest_parent_fd >= 0)
-            close(dest_parent_fd);
-        metadata_snapshots_free(&snapshots);
-        return -1;
-    }
-    int rc = restore_entry_at(ctx, RESTORE_VALIDATE, source_parent_fd,
-                              source_leaf, dest_parent_fd, dest_leaf,
-                              source_rel, &snapshots, profiles,
-                              estimate, NULL, metadata_anchor_fd, 1, NULL,
-                              NULL, 0);
-    close(metadata_anchor_fd);
-    close(source_parent_fd);
-    if (dest_parent_fd >= 0)
-        close(dest_parent_fd);
+    int rc = restore_entry_at(ctx, RESTORE_VALIDATE, fds.source_parent_fd,
+                              fds.source_leaf, fds.dest_parent_fd,
+                              fds.dest_leaf, source_rel, &snapshots, profiles,
+                              estimate, NULL, fds.metadata_anchor_fd, 1,
+                              report, NULL, 0);
+    restore_root_close(&fds);
     metadata_snapshots_free(&snapshots);
     return rc;
-}
-
-static void restore_native_report_init(RestoreNativeReport *report)
-{
-    if (report == NULL)
-        return;
-    memset(report, 0, sizeof(*report));
 }
 
 RestoreNativeStatus restore_native_at_report(
@@ -4363,79 +4471,35 @@ RestoreNativeStatus restore_native_at_report(
 {
     RestoreNativeReport local_report;
     if (report == NULL)
-    {
-        restore_native_report_init(&local_report);
         report = &local_report;
-    }
-    else
-        restore_native_report_init(report);
+    restore_native_report_init(report);
 
-    int source_parent_fd = -1;
-    char source_leaf[RESTORE_LEAF_MAX];
-    if (!restore_arguments_valid(ctx, source_root_fd, source_rel,
-                                 destination_root_fd, destination_rel))
-    {
-        restore_report_failure(report, source_rel,
-                               "it was given to the restore wrongly", 0);
+    RestoreRootFds fds;
+    if (restore_root_open(ctx, source_root_fd, source_rel, destination_root_fd,
+                          destination_rel, &fds, report) != 0)
         return -1;
-    }
-    if (resolve_parent(source_root_fd, source_rel, 0, &source_parent_fd,
-                       source_leaf, sizeof(source_leaf)) != RESTORE_RESOLVE_OK)
-    {
-        restore_report_failure(report, source_rel,
-                               "open the folders above its copy in the backup",
-                               errno);
-        return -1;
-    }
-
-    int dest_parent_fd = -1;
-    char dest_leaf[RESTORE_LEAF_MAX];
-    RestoreResolveResult dest_result =
-        resolve_parent(destination_root_fd, destination_rel, 0,
-                       &dest_parent_fd, dest_leaf,
-                       sizeof(dest_leaf));
-    if (dest_result == RESTORE_RESOLVE_ERROR)
-    {
-        restore_report_failure(report, source_rel,
-                               "open the folders above it", errno);
-        close(source_parent_fd);
-        return -1;
-    }
 
     MetadataSnapshots snapshots;
     MetadataProfiles profiles;
     MetadataXattrRequirements xattr_requirements = {0};
     metadata_snapshots_init(&snapshots);
     metadata_profiles_init(&profiles);
-    int metadata_anchor_fd = destination_metadata_anchor(destination_root_fd,
-                                                          destination_rel);
-    if (metadata_anchor_fd < 0)
-    {
-        restore_report_failure(report, source_rel,
-                               "open the folder it goes into", errno);
-        close(source_parent_fd);
-        if (dest_parent_fd >= 0)
-            close(dest_parent_fd);
-        metadata_snapshots_free(&snapshots);
-        metadata_profiles_free(&profiles);
-        return -1;
-    }
-    int rc = restore_entry_at(ctx, RESTORE_VALIDATE, source_parent_fd,
-                              source_leaf, dest_parent_fd, dest_leaf,
-                              source_rel, &snapshots, &profiles,
-                              NULL, &xattr_requirements, metadata_anchor_fd,
-                              0, report, NULL, 0);
+    int rc = restore_entry_at(ctx, RESTORE_VALIDATE, fds.source_parent_fd,
+                              fds.source_leaf, fds.dest_parent_fd,
+                              fds.dest_leaf, source_rel, &snapshots,
+                              &profiles, NULL, &xattr_requirements,
+                              fds.metadata_anchor_fd, 0, report, NULL, 0);
+    MetadataProbeFailure probe_failure;
     if (rc == 0 && !ctx->metadata_preflight_done &&
-        metadata_profiles_probe(&profiles,
-                                metadata_policy_from_context(ctx)) != 0)
+        metadata_profiles_probe(&profiles, metadata_policy_from_context(ctx),
+                                &probe_failure) != 0)
     {
-        restore_report_failure(report, source_rel,
-                               "the destination cannot keep the owners, "
-                               "permissions, or times it needs", 0);
+        restore_report_failure(report, source_rel, probe_failure.step.step,
+                               probe_failure.step.err);
         rc = -1;
     }
     if (rc == 0 && !ctx->metadata_preflight_done &&
-        metadata_xattr_capability_probe(metadata_anchor_fd,
+        metadata_xattr_capability_probe(fds.metadata_anchor_fd,
                                         &xattr_requirements) != 0)
     {
         restore_report_failure(report, source_rel,
@@ -4443,17 +4507,17 @@ RestoreNativeStatus restore_native_at_report(
                                "attributes it needs", 0);
         rc = -1;
     }
-    close(metadata_anchor_fd);
+    close(fds.metadata_anchor_fd);
+    fds.metadata_anchor_fd = -1;
 
     if (rc == 0)
     {
-        if (dest_parent_fd >= 0)
-            close(dest_parent_fd);
-        dest_parent_fd = -1;
-        dest_result = resolve_parent(destination_root_fd, destination_rel, 1,
-                                     &dest_parent_fd, dest_leaf,
-                                     sizeof(dest_leaf));
-        if (dest_result != RESTORE_RESOLVE_OK)
+        if (fds.dest_parent_fd >= 0)
+            close(fds.dest_parent_fd);
+        fds.dest_parent_fd = -1;
+        if (resolve_parent(destination_root_fd, destination_rel, 1,
+                           &fds.dest_parent_fd, fds.dest_leaf,
+                           sizeof(fds.dest_leaf)) != RESTORE_RESOLVE_OK)
         {
             restore_report_failure(report, source_rel,
                                    "create the folders above it", errno);
@@ -4461,16 +4525,14 @@ RestoreNativeStatus restore_native_at_report(
         }
     }
     if (rc == 0)
-        rc = restore_entry_at(ctx, RESTORE_APPLY, source_parent_fd,
-                              source_leaf, dest_parent_fd, dest_leaf,
-                              source_rel, &snapshots, NULL,
+        rc = restore_entry_at(ctx, RESTORE_APPLY, fds.source_parent_fd,
+                              fds.source_leaf, fds.dest_parent_fd,
+                              fds.dest_leaf, source_rel, &snapshots, NULL,
                               NULL, NULL, destination_root_fd, 0, report,
                               capture_report, 0);
     if (rc != RESTORE_NATIVE_OK && report->failed_count == 0)
         restore_report_failure(report, source_rel, NULL, 0);
-    close(source_parent_fd);
-    if (dest_parent_fd >= 0)
-        close(dest_parent_fd);
+    restore_root_close(&fds);
     metadata_snapshots_free(&snapshots);
     metadata_profiles_free(&profiles);
     return rc;

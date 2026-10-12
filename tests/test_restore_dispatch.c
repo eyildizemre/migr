@@ -3295,7 +3295,8 @@ static void test_restore_relabels_the_restored_roots(void)
     rc = run_keyring_restore(1, "login.keyring", 0, 0, output, sizeof(output));
     check(rc != 0 && relabelled_keyrings_once() &&
               strstr(output, "Could not set SELinux labels on the restored "
-                             "files; restorecon exited with 1") != NULL,
+                             "files: run restorecon: it exited with status "
+                             "1") != NULL,
           "a failed relabel is an error of the restore");
     restore_test_set_relabel_hook(NULL, NULL);
     remove_tree(record_dir);

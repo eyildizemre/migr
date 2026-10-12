@@ -113,9 +113,9 @@ static void test_validate_refusal(const char *source_root, const char *dest_root
 
     restore_native_test_set_source_read_mode(RESTORE_TEST_SOURCE_READ_VALIDATE);
     RestoreNativeStatus regular_status = restore_native_preflight_at(
-        &RESTORE_CTX, source_fd, "entry", dest_fd, "entry");
+        &RESTORE_CTX, source_fd, "entry", dest_fd, "entry", NULL);
     RestoreNativeStatus directory_status = restore_native_preflight_at(
-        &RESTORE_CTX, source_fd, "tree", dest_fd, "tree");
+        &RESTORE_CTX, source_fd, "tree", dest_fd, "tree", NULL);
     restore_native_test_set_source_read_mode(RESTORE_TEST_SOURCE_READ_NONE);
 
     check(regular_status == RESTORE_NATIVE_SOURCE_SAFE_READ,
@@ -234,13 +234,19 @@ static void test_destination_probe_rejection(int anchor_fd)
     metadata_profiles_init(&profiles);
     check(metadata_profiles_add(&profiles, anchor_fd, &desired, NULL, "probe") == 0,
           "foreign destination group enters the ownership profile");
+    MetadataProbeFailure failure;
     int probe_status = metadata_profiles_probe(
-        &profiles, (MetadataTimestampPolicy){ .configured = 1, .nsec_exact = 0 });
+        &profiles, (MetadataTimestampPolicy){ .configured = 1, .nsec_exact = 0 },
+        &failure);
     if (probe_status == 0)
         printf("  " BLUE "i" NC " ownership probe refusal skipped: CAP_CHOWN is available\n");
     else
-        check(probe_status != 0,
-              "destination ownership probe rejects an unavailable foreign group");
+        check(probe_status != 0 && failure.anchor_fd >= 0 &&
+                  failure.gid == foreign_gid && failure.step.step != NULL &&
+                  strcmp(failure.step.step, "give the test file the owner") == 0 &&
+                  failure.step.err == EPERM,
+              "destination ownership probe rejects an unavailable foreign "
+              "group, naming the folder, the owner, the step, and errno");
     metadata_profiles_free(&profiles);
 }
 

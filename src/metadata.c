@@ -256,59 +256,107 @@ static int set_probe_times(int fd, MetadataTimestampPolicy policy,
 }
 
 static int probe_one_profile(const MetadataProfile *profile,
-                             MetadataTimestampPolicy policy)
+                             MetadataTimestampPolicy policy,
+                             FailedStep *failed)
 {
     int fd = openat(profile->anchor_fd, ".",
                     O_TMPFILE | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
     if (fd < 0)
-        return -1;
-
-    int failed = 0;
-    struct stat st;
-    if (fstat(fd, &st) != 0)
-        failed = 1;
-    if (!failed && profile->has_initial_owner &&
-        fchown(fd, profile->initial_uid, profile->initial_gid) != 0)
-        failed = 1;
-    if (!failed && fchown(fd, profile->desired_uid, profile->desired_gid) != 0)
-        failed = 1;
-    if (!failed && fchmod(fd, profile->desired_mode) != 0)
-        failed = 1;
-
-    struct timespec times[2];
-    if (!failed && set_probe_times(fd, policy, times) != 0)
-        failed = 1;
-    if (!failed && fstat(fd, &st) != 0)
-        failed = 1;
-    if (!failed && (st.st_uid != profile->desired_uid ||
-                    st.st_gid != profile->desired_gid ||
-                    (st.st_mode & 07777) != profile->desired_mode ||
-                    !same_timespec(st.st_atim, times[0]) ||
-                    !same_timespec(st.st_mtim, times[1])))
     {
-        errno = EIO;
-        failed = 1;
+        failed_step_note(failed, "create a test file", errno);
+        return -1;
     }
 
+    struct stat st;
+    struct timespec times[2];
+    if (fstat(fd, &st) != 0)
+        failed_step_note(failed, "inspect the test file", errno);
+    else if (profile->has_initial_owner &&
+             fchown(fd, profile->initial_uid, profile->initial_gid) != 0)
+        failed_step_note(failed, "give the test file its existing owner",
+                         errno);
+    else if (fchown(fd, profile->desired_uid, profile->desired_gid) != 0)
+        failed_step_note(failed, "give the test file the owner", errno);
+    else if (fchmod(fd, profile->desired_mode) != 0)
+        failed_step_note(failed, "give the test file the permissions", errno);
+    else if (set_probe_times(fd, policy, times) != 0)
+        failed_step_note(failed, "set the test file's times", errno);
+    else if (fstat(fd, &st) != 0)
+        failed_step_note(failed, "inspect the test file again", errno);
+    else if (st.st_uid != profile->desired_uid ||
+             st.st_gid != profile->desired_gid ||
+             (st.st_mode & 07777) != profile->desired_mode ||
+             !same_timespec(st.st_atim, times[0]) ||
+             !same_timespec(st.st_mtim, times[1]))
+    {
+        failed_step_note(failed, "the test file did not keep them", 0);
+        errno = EIO;
+    }
+    int result = failed->step != NULL ? -1 : 0;
     if (close(fd) != 0)
-        failed = 1;
-    return failed ? -1 : 0;
+    {
+        failed_step_note(failed, "close the test file", errno);
+        result = -1;
+    }
+    return result;
 }
 
 int metadata_profiles_probe(const MetadataProfiles *profiles,
-                            MetadataTimestampPolicy policy)
+                            MetadataTimestampPolicy policy,
+                            MetadataProbeFailure *failure)
 {
 #ifdef METADATA_TEST_HOOKS
     metadata_ownership_probe_calls++;
     if (metadata_ownership_probe_hook != NULL)
         metadata_ownership_probe_hook(metadata_ownership_probe_hook_context);
 #endif
+    MetadataProbeFailure local;
+    if (failure == NULL)
+        failure = &local;
+    memset(failure, 0, sizeof(*failure));
+    failure->anchor_fd = -1;
     if (profiles == NULL)
+    {
+        failed_step_note(&failure->step, "there was nothing to check", 0);
         return -1;
+    }
     for (size_t i = 0; i < profiles->count; i++)
-        if (probe_one_profile(&profiles->items[i], policy) != 0)
+    {
+        const MetadataProfile *profile = &profiles->items[i];
+        if (probe_one_profile(profile, policy, &failure->step) != 0)
+        {
+            failure->anchor_fd = profile->anchor_fd;
+            failure->uid = profile->desired_uid;
+            failure->gid = profile->desired_gid;
+            failure->mode = profile->desired_mode;
             return -1;
+        }
+    }
     return 0;
+}
+
+void metadata_probe_failure_print(const MetadataProbeFailure *failure,
+                                  int warning, const char *followup)
+{
+    char place[PATH_MAX];
+    if (failure->anchor_fd >= 0)
+        describe_path_at(failure->anchor_fd, "", place, sizeof(place));
+    else
+        snprintf(place, sizeof(place), "?");
+    const char *format = "%s: %s cannot keep the owner %ju:%ju and "
+                         "permissions %04o its items need";
+    if (warning)
+        print_step_warning(&failure->step, format, "Warning", place,
+                           (uintmax_t)failure->uid, (uintmax_t)failure->gid,
+                           (unsigned)failure->mode);
+    else
+        print_step_failure(&failure->step, format, "Error", place,
+                           (uintmax_t)failure->uid, (uintmax_t)failure->gid,
+                           (unsigned)failure->mode);
+    if (warning)
+        print_warning("  %s\n", followup);
+    else
+        print_error("  %s\n", followup);
 }
 
 // A diagnostic for -v: which owners and modes the preflight checked.

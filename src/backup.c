@@ -2595,7 +2595,8 @@ static void capture_roots(const CloneContext *ctx, const BackupPlan *plan,
 // selection follows the same index-aligned, optional convention as
 // capture_roots() above.
 static int seed_native_hardlink_map(const CloneContext *ctx, const BackupPlan *plan,
-                                    const SelectionPlan *selection, int data_fd)
+                                    const SelectionPlan *selection, int data_fd,
+                                    FailedItem *failed)
 {
     // See capture_roots(): the same one-for-one index alignment with
     // selection->roots is assumed here and must hold, not just be documented.
@@ -2606,7 +2607,8 @@ static int seed_native_hardlink_map(const CloneContext *ctx, const BackupPlan *p
         CloneContext root_ctx = *ctx;
         root_ctx.selection = selection ? &selection->roots[(size_t)i] : NULL;
         if (native_inode_map_seed_existing(&root_ctx, root->capture_path, data_fd,
-                                           root->manifest_root.payload_path) != 0)
+                                           root->manifest_root.payload_path,
+                                           failed) != 0)
             return -1;
     }
     return 0;
@@ -2757,11 +2759,15 @@ static int backup_metadata_inventory(const char *source_path, int anchor_fd,
                                      const char *destination_rel,
                                      MetadataProfiles *profiles,
                                      SourceReadRefusals *refusals,
-                                     const SelectionRoot *selection)
+                                     const SelectionRoot *selection,
+                                     FailedItem *failure)
 {
     if (selection)
     {
         int owned = selection_source_owns(selection, source_path);
+        if (owned < 0)
+            failed_item_note(failure, source_path,
+                             "it lies outside its root in the selection", 0);
         if (owned <= 0) return owned;
     }
     // The source may change while it is walked (D63): an item gone since it
@@ -2769,26 +2775,43 @@ static int backup_metadata_inventory(const char *source_path, int anchor_fd,
     // one that changed is profiled as first seen.
     struct stat source_st;
     if (lstat(source_path, &source_st) != 0)
-        return errno == ENOENT ? 0 : -1;
+    {
+        if (errno == ENOENT)
+            return 0;
+        failed_item_note(failure, source_path, "inspect it", errno);
+        return -1;
+    }
 
     struct stat existing_st;
     int destination_exists = 0;
     if (metadata_existing_at(destination_root_fd, destination_rel,
                              &existing_st, &destination_exists) != 0)
+    {
+        failed_item_note(failure, source_path,
+                         "inspect what the backup holds there", errno);
         return -1;
+    }
 
     if (destination_exists &&
         ((S_ISDIR(source_st.st_mode) && !S_ISDIR(existing_st.st_mode)) ||
          (S_ISREG(source_st.st_mode) && !S_ISREG(existing_st.st_mode)) ||
          (S_ISFIFO(source_st.st_mode) && !S_ISFIFO(existing_st.st_mode))))
+    {
+        failed_item_note(failure, source_path,
+                         "the backup holds another kind of item there", 0);
         return -1;
+    }
 
     if (!S_ISSOCK(source_st.st_mode) && !S_ISCHR(source_st.st_mode) &&
         !S_ISBLK(source_st.st_mode) &&
         metadata_profiles_add(profiles, anchor_fd, &source_st,
                               destination_exists ? &existing_st : NULL,
                               source_path) != 0)
+    {
+        failed_item_note(failure, source_path,
+                         "note its owner and permissions for the check", errno);
         return -1;
+    }
 
     if (S_ISREG(source_st.st_mode))
     {
@@ -2804,9 +2827,15 @@ static int backup_metadata_inventory(const char *source_path, int anchor_fd,
                 source_read_refusal_record(refusals, source_path, 0);
                 return 0;
             }
-            return source_vanished(errno) ? 0 : -1;
+            if (source_vanished(errno))
+                return 0;
+            failed_item_note(failure, source_path, "open it", errno);
+            return -1;
         }
-        return close(fd) != 0 ? -1 : 0;
+        if (close(fd) == 0)
+            return 0;
+        failed_item_note(failure, source_path, "close it", errno);
+        return -1;
     }
 
     if (!S_ISDIR(source_st.st_mode))
@@ -2824,12 +2853,16 @@ static int backup_metadata_inventory(const char *source_path, int anchor_fd,
             source_read_refusal_record(refusals, source_path, 1);
             return 0;
         }
-        return source_vanished(errno) ? 0 : -1;
+        if (source_vanished(errno))
+            return 0;
+        failed_item_note(failure, source_path, "open the folder", errno);
+        return -1;
     }
     int scan_fd = fcntl(source_fd, F_DUPFD_CLOEXEC, 0);
     DIR *dir = scan_fd < 0 ? NULL : fdopendir(scan_fd);
     if (dir == NULL)
     {
+        failed_item_note(failure, source_path, "list the folder", errno);
         if (scan_fd >= 0)
             close(scan_fd);
         close(source_fd);
@@ -2844,7 +2877,11 @@ static int backup_metadata_inventory(const char *source_path, int anchor_fd,
         if (entry == NULL)
         {
             if (errno != 0)
+            {
+                failed_item_note(failure, source_path, "list the folder",
+                                 errno);
                 failed = 1;
+            }
             break;
         }
         if (strcmp(entry->d_name, ".") == 0 ||
@@ -2856,19 +2893,32 @@ static int backup_metadata_inventory(const char *source_path, int anchor_fd,
         if (path_join(child_source, sizeof(child_source), source_path,
                       entry->d_name) != 0 ||
             path_join(child_destination, sizeof(child_destination),
-                      destination_rel, entry->d_name) != 0 ||
-            backup_metadata_inventory(child_source, anchor_fd,
+                      destination_rel, entry->d_name) != 0)
+        {
+            failed_item_note(failure, source_path, "name an item in the folder",
+                             ENAMETOOLONG);
+            failed = 1;
+            break;
+        }
+        if (backup_metadata_inventory(child_source, anchor_fd,
                                       destination_root_fd, child_destination,
-                                      profiles, refusals, selection) != 0)
+                                      profiles, refusals, selection,
+                                      failure) != 0)
         {
             failed = 1;
             break;
         }
     }
     if (closedir(dir) != 0)
+    {
+        failed_item_note(failure, source_path, "list the folder", errno);
         failed = 1;
+    }
     if (close(source_fd) != 0)
+    {
+        failed_item_note(failure, source_path, "close the folder", errno);
         failed = 1;
+    }
     return failed ? -1 : 0;
 }
 
@@ -2938,7 +2988,8 @@ static int open_advisory_probe_fd(const char *target, int *out_used_parent)
 static int backup_metadata_preflight(const BackupPlan *plan, const SelectionPlan *selection,
                                      int anchor_fd, int destination_root_fd,
                                      MetadataProfiles *profiles,
-                                     SourceReadRefusals *refusals)
+                                     SourceReadRefusals *refusals,
+                                     FailedItem *failure)
 {
     // See capture_roots(): the same one-for-one index alignment with
     // selection->roots is assumed here and must hold, not just be documented.
@@ -2950,7 +3001,8 @@ static int backup_metadata_preflight(const BackupPlan *plan, const SelectionPlan
         if (backup_metadata_inventory(root->capture_path, anchor_fd,
                                       destination_root_fd,
                                       root->manifest_root.payload_path,
-                                      profiles, refusals, sel_root) != 0)
+                                      profiles, refusals, sel_root,
+                                      failure) != 0)
             return -1;
     }
     return 0;
@@ -2959,10 +3011,51 @@ static int backup_metadata_preflight(const BackupPlan *plan, const SelectionPlan
 static int backup_execution_metadata_preflight(
     const BackupPlan *plan, const SelectionPlan *selection, int anchor_fd,
     int destination_root_fd, MetadataProfiles *profiles,
-    SourceReadRefusals *refusals)
+    SourceReadRefusals *refusals, FailedItem *failure)
 {
     return backup_metadata_preflight(plan, selection, anchor_fd, destination_root_fd,
-                                     profiles, refusals);
+                                     profiles, refusals, failure);
+}
+
+// The live run's native metadata preflight: every source item readable
+// without changing its access time, and the destination able to keep its
+// owner, permissions, and times. On a refusal, says why, then unchanged.
+static int backup_metadata_check(const BackupPlan *plan,
+                                 const SelectionPlan *selection, int anchor_fd,
+                                 int destination_root_fd,
+                                 MetadataProfiles *profiles,
+                                 SourceReadRefusals *refusals,
+                                 const char *unchanged)
+{
+    FailedItem failure = {0};
+    int failed = backup_execution_metadata_preflight(
+        plan, selection, anchor_fd, destination_root_fd, profiles, refusals,
+        &failure) != 0;
+    if (refusals->refusal_count > 0)
+    {
+        source_read_refusals_report(refusals);
+        print_error("Error: native metadata preflight refused the source\n");
+        print_error("  %s\n", unchanged);
+        return -1;
+    }
+    if (failed)
+    {
+        print_item_failure("back up", failure.path, failure.step.step,
+                           failure.step.err);
+        print_error("  %s\n", unchanged);
+        return -1;
+    }
+    metadata_profiles_report(profiles);
+    MetadataProbeFailure probe_failure;
+    if (metadata_profiles_probe(profiles,
+                                (MetadataTimestampPolicy){ .nsec_exact = 0,
+                                                            .configured = 1 },
+                                &probe_failure) != 0)
+    {
+        metadata_probe_failure_print(&probe_failure, 0, unchanged);
+        return -1;
+    }
+    return 0;
 }
 
 static int backup_dry_run(const char *target, BackupMode mode,
@@ -3064,9 +3157,10 @@ static int backup_dry_run(const char *target, BackupMode mode,
 
     if (advisory_fd >= 0)
     {
+        FailedItem advisory_failure = {0};
         int advisory_failed = backup_execution_metadata_preflight(
             plan, selection, advisory_fd, -1, &advisory_profiles,
-            &advisory_refusals) != 0;
+            &advisory_refusals, &advisory_failure) != 0;
         if (advisory_refusals.refusal_count > 0)
         {
             source_read_refusals_report(&advisory_refusals);
@@ -3078,20 +3172,29 @@ static int backup_dry_run(const char *target, BackupMode mode,
             return MIGR_EXIT_FAILURE;
         }
         if (advisory_failed)
-            print_warning("Warning: could not complete the read-only metadata preview; "
-                   "the live backup will recheck it before writing.\n");
+        {
+            print_step_warning(&advisory_failure.step,
+                               "Warning: could not complete the read-only "
+                               "metadata preview at %s",
+                               advisory_failure.path);
+            print_warning("  The live backup will check it again before "
+                          "writing.\n");
+        }
         else
         {
             metadata_profiles_report(&advisory_profiles);
             // The ownership probe is privilege-relevant and native-only;
             // portable capture has no analogous native ownership step.
+            MetadataProbeFailure probe_failure;
             if (advisory_repr == CLONE_NATIVE_TREE &&
                 metadata_profiles_probe(
                     &advisory_profiles,
                     (MetadataTimestampPolicy){ .nsec_exact = 0,
-                                                .configured = 1 }) != 0)
-                print_warning("Warning: the ownership probe could not complete; "
-                       "the live backup will recheck it before writing.\n");
+                                                .configured = 1 },
+                    &probe_failure) != 0)
+                metadata_probe_failure_print(
+                    &probe_failure, 1,
+                    "The live backup will check it again before writing.");
         }
     }
 
@@ -3604,36 +3707,20 @@ static int backup_run(const char *target_arg, BackupMode mode,
         int adopted_data_fd = openat(container_root_fd(&container), "data",
                                      O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
                                      O_CLOEXEC);
-        int metadata_failed = 0;
         if (repr == CLONE_NATIVE_TREE)
         {
-            metadata_failed = adopted_data_fd < 0;
-            if (!metadata_failed)
-                metadata_failed = backup_execution_metadata_preflight(
-                    &plan, selection, adopted_data_fd, adopted_data_fd,
-                    &metadata_profiles, &source_read_refusals) != 0;
-            if (source_read_refusals.refusal_count > 0)
-                metadata_failed = 1;
-            if (!metadata_failed)
+            if (adopted_data_fd < 0)
             {
-                metadata_profiles_report(&metadata_profiles);
-                metadata_failed = metadata_profiles_probe(
-                    &metadata_profiles,
-                    (MetadataTimestampPolicy){ .nsec_exact = 0,
-                                                .configured = 1 }) != 0;
+                print_error("Error: Could not open data/ in the backup: %s\n",
+                            strerror(errno));
+                goto fail_pre_container;
             }
-            if (metadata_failed)
+            if (backup_metadata_check(&plan, selection, adopted_data_fd,
+                                      adopted_data_fd, &metadata_profiles,
+                                      &source_read_refusals,
+                                      "No payload was changed.") != 0)
             {
-                if (adopted_data_fd >= 0)
-                    close(adopted_data_fd);
-                if (source_read_refusals.refusal_count > 0)
-                {
-                    source_read_refusals_report(&source_read_refusals);
-                    print_error("Error: native metadata preflight refused the source; "
-                           "no payload was changed\n");
-                }
-                else
-                    print_error("Error: native metadata preflight failed; no payload was changed\n");
+                close(adopted_data_fd);
                 goto fail_pre_container;
             }
         }
@@ -3642,35 +3729,11 @@ static int backup_run(const char *target_arg, BackupMode mode,
     }
     else if (adopt_status == CONTAINER_ERR_NO_MATCH)
     {
-        int metadata_failed = 0;
-        if (repr == CLONE_NATIVE_TREE)
-        {
-            metadata_failed = backup_execution_metadata_preflight(
-                &plan, selection, target_fd, -1, &metadata_profiles,
-                &source_read_refusals) != 0;
-            if (source_read_refusals.refusal_count > 0)
-                metadata_failed = 1;
-            if (!metadata_failed)
-            {
-                metadata_profiles_report(&metadata_profiles);
-                metadata_failed = metadata_profiles_probe(
-                    &metadata_profiles,
-                    (MetadataTimestampPolicy){ .nsec_exact = 0,
-                                                .configured = 1 }) != 0;
-            }
-            if (metadata_failed)
-            {
-                if (source_read_refusals.refusal_count > 0)
-                {
-                    source_read_refusals_report(&source_read_refusals);
-                    print_error("Error: native metadata preflight refused the source; "
-                           "no container was created\n");
-                }
-                else
-                    print_error("Error: native metadata preflight failed; no container was created\n");
-                goto fail_pre_container;
-            }
-        }
+        if (repr == CLONE_NATIVE_TREE &&
+            backup_metadata_check(&plan, selection, target_fd, -1,
+                                  &metadata_profiles, &source_read_refusals,
+                                  "No container was created.") != 0)
+            goto fail_pre_container;
         if (container_reserve_fd(target_fd, invoker_name(), manifest.updated,
                                  &container) != CONTAINER_OK)
         {
@@ -3794,16 +3857,22 @@ static int backup_run(const char *target_arg, BackupMode mode,
             ctx.visited = native_visited_create();
             if (ctx.inode_map == NULL || ctx.visited == NULL)
             {
-                print_error("Error: Could not initialize native hardlink/resume tracking\n");
+                print_error("Error: Could not initialize native hardlink/resume tracking: %s\n", strerror(errno));
                 native_inode_map_free(ctx.inode_map);
                 native_visited_free(ctx.visited);
                 had_error = 1;
             }
             else
             {
-                if (adopted && seed_native_hardlink_map(&ctx, &plan, selection, data_fd) != 0)
+                FailedItem seed_failure = {0};
+                if (adopted && seed_native_hardlink_map(&ctx, &plan, selection,
+                                                        data_fd,
+                                                        &seed_failure) != 0)
                 {
-                    print_error("Error: Could not seed native hardlink/resume tracking\n");
+                    print_step_failure(&seed_failure.step,
+                                       "Error: Could not find the hardlinks "
+                                       "the backup already holds, at %s",
+                                       seed_failure.path);
                     had_error = 1;
                 }
                 if (!had_error)
@@ -4212,8 +4281,12 @@ int backup_selection_inventory(const SelectionPlan *plan, int anchor_fd,
     if (backup_plan_from_selection(plan, &backup_plan) != 0) return -1;
 
     SourceReadRefusals refusals = {0};
+    FailedItem failure = {0};
     int result = backup_metadata_preflight(&backup_plan, plan, anchor_fd, data_fd,
-                                           profiles, &refusals);
+                                           profiles, &refusals, &failure);
+    if (result != 0)
+        print_item_failure("back up", failure.path, failure.step.step,
+                           failure.step.err);
     backup_plan_free(&backup_plan);
     if (result == 0 && refusals.refusal_count > 0)
     {
@@ -4252,7 +4325,8 @@ BackupCaptureStatus backup_selection_capture(const CloneContext *ctx,
         int had_error = 0;
         int count = 0;
         BackupDeferral none = {0};
-        if (seed_native_hardlink_map(&run, &backup_plan, plan, data_fd) != 0)
+        if (seed_native_hardlink_map(&run, &backup_plan, plan, data_fd,
+                                     NULL) != 0)
             had_error = 1;
         if (!had_error)
             capture_roots(&run, &backup_plan, plan, data_fd, &none, &count,

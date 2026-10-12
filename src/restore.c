@@ -367,7 +367,8 @@ static int network_config_regular_count(DIR *dir, size_t *count)
         {
             if (errno != 0)
             {
-                print_error("Error: Could not enumerate network/ in the backup\n");
+                print_error("Error: Could not list network/ in the backup: "
+                            "%s\n", strerror(errno));
                 failed = 1;
             }
             break;
@@ -661,7 +662,8 @@ static void restore_system_lists(int source_root_fd, RestoreTodo *todo,
                                     &todo->packages_size);
     if (todo->stream == NULL || todo->packages == NULL)
     {
-        print_error("Error: Could not collect what is left to do by hand\n");
+        print_error("Error: Could not collect what is left to do by hand: "
+                    "%s\n", strerror(errno));
         *had_error = 1;
         return;
     }
@@ -984,8 +986,10 @@ static void restore_dconf_settings(int database_fd, int home_fd,
     if (home_rewrite_dconf_pairs_build(m, xdg_dirs, home, pairs,
                                        &pair_count) != 0)
         pair_count = 0;
+    FailedStep failed = {0};
     DconfRestoreStatus status = dconf_restore_apply(database_fd, home_fd,
-                                                    pairs, pair_count, &keys);
+                                                    pairs, pair_count, &keys,
+                                                    &failed);
     if (status == DCONF_RESTORE_APPLIED && keys != 0)
     {
         printf("\nDesktop settings (dconf)\n");
@@ -997,17 +1001,19 @@ static void restore_dconf_settings(int database_fd, int home_fd,
     else if (status == DCONF_RESTORE_FAILED)
     {
         printf("\nDesktop settings (dconf)\n");
-        print_warning("  Warning: could not apply the saved settings to the "
-                      "running session, which may overwrite them. Log out, "
-                      "then run the same restore again from a text console "
+        print_step_warning(&failed, "  Warning: could not apply the saved "
+                                    "settings to the running session");
+        print_warning("  The session may overwrite them. Log out, then run "
+                      "the same restore again from a text console "
                       "(Ctrl+Alt+F3).\n");
         if (had_error != NULL)
             *had_error = 1;
     }
     else if (status == DCONF_RESTORE_HOME_NOT_REWRITTEN)
     {
-        print_error("Error: Could not point the desktop settings in "
-                    "~/.config/dconf/user at this system's home folder\n");
+        print_step_failure(&failed, "Error: Could not point the desktop "
+                                    "settings in ~/.config/dconf/user at "
+                                    "this system's home folder");
         if (had_error != NULL)
             *had_error = 1;
     }
@@ -1280,8 +1286,10 @@ static void restore_selinux_labels(const char *const *paths, size_t count,
 #endif
         if (status != 0)
         {
-            print_error("Error: Could not set SELinux labels on the restored "
-                        "files; restorecon exited with %d\n", status);
+            FailedStep failed = {0};
+            failed_step_note_command(&failed, "run restorecon", status);
+            print_step_failure(&failed, "Error: Could not set SELinux labels "
+                                        "on the restored files");
             *had_error = 1;
         }
     }
@@ -1385,17 +1393,19 @@ static void restore_network_config(int source_root_fd, int *had_error)
         }
 
         size_t regular_count = 0;
-        if (network_config_regular_count(dir, &regular_count) != 0)
+        int count_failed = network_config_regular_count(dir,
+                                                        &regular_count) != 0;
+        if (count_failed || regular_count == 0)
         {
-            *had_error = 1;
-            if (closedir(dir) != 0)
+            if (count_failed)
                 *had_error = 1;
-            continue;
-        }
-        if (regular_count == 0)
-        {
             if (closedir(dir) != 0)
+            {
+                print_error("Error: Could not close network/%s in the backup: "
+                            "%s\n", backend->container_subdir,
+                            strerror(errno));
                 *had_error = 1;
+            }
             continue;
         }
 
@@ -1454,7 +1464,9 @@ static void restore_network_config(int source_root_fd, int *had_error)
             {
                 if (errno != 0)
                 {
-                    print_error("Error: Could not enumerate network/ in the backup\n");
+                    print_error("Error: Could not list network/%s in the "
+                                "backup: %s\n", backend->container_subdir,
+                                strerror(errno));
                     *had_error = 1;
                 }
                 break;
@@ -1702,15 +1714,18 @@ static int restore_timestamp_anchor_add(RestoreTimestampAnchors *anchors,
     return 0;
 }
 
-static int restore_timestamp_anchor_probe(RestoreTimestampAnchors *anchors)
+// On a failure, *failed_fd is the folder whose probe failed.
+static int restore_timestamp_anchor_probe(RestoreTimestampAnchors *anchors,
+                                          int *failed_fd)
 {
-    if (anchors == NULL)
-        return -1;
     for (size_t i = 0; i < anchors->count; i++)
     {
         if (fsprobe_timestamps_fd(anchors->items[i].fd,
                                   &anchors->items[i].nsec_exact) != 0)
+        {
+            *failed_fd = anchors->items[i].fd;
             return -1;
+        }
     }
     return 0;
 }
@@ -2019,7 +2034,8 @@ static int restore_item_at(const CloneContext *ctx,
     }
     if (status == RESTORE_SOURCE_ERROR)
     {
-        print_error("Error: Failed to inspect %s\n", label);
+        print_item_failure("restore", label, "inspect its copy in the backup",
+                           errno);
         return -1;
     }
 
@@ -2027,7 +2043,8 @@ static int restore_item_at(const CloneContext *ctx,
     int policy_anchor_fd = restore_destination_anchor_fd(dest_root_fd, dest_rel);
     if (policy_anchor_fd < 0)
     {
-        print_error("Error: Failed to inspect restore destination for %s\n", label);
+        print_item_failure("restore", label, "open the folder it goes into",
+                           errno);
         return -1;
     }
     if (timestamp_anchors != NULL &&
@@ -2043,21 +2060,25 @@ static int restore_item_at(const CloneContext *ctx,
         effective_ctx.timestamp_policy_configured = 1;
     if (close(policy_anchor_fd) != 0)
     {
-        print_error("Error: Failed to inspect restore destination for %s\n", label);
+        print_item_failure("restore", label, "close the folder it goes into",
+                           errno);
         return -1;
     }
     const CloneContext *run_ctx = &effective_ctx;
 
     if (dry_run)
     {
+        RestoreNativeReport preflight;
         RestoreNativeStatus native_status = restore_native_preflight_at(
-            run_ctx, source_root_fd, source_rel, dest_root_fd, dest_rel);
+            run_ctx, source_root_fd, source_rel, dest_root_fd, dest_rel,
+            &preflight);
         if (native_status != RESTORE_NATIVE_OK)
         {
             if (native_status == RESTORE_NATIVE_SOURCE_SAFE_READ)
                 report_source_safe_read_refusal(label, NULL);
             else
-                print_error("Error: Failed to restore %s\n", label);
+                report_native_restore_failure(dest_root_fd, dest_rel,
+                                              source_rel, &preflight);
             return -1;
         }
         return 1;
@@ -2173,7 +2194,9 @@ static int native_deferral_note(NativeDeferral *deferral, int source_root_fd,
     if (!written)
     {
         deferral->count--;
-        print_error("Error: Failed to restore %s\n", label);
+        print_item_failure("restore", label,
+                           "name the part held back until the end",
+                           ENAMETOOLONG);
         return -1;
     }
     RestoreSourceStatus status =
@@ -2183,7 +2206,8 @@ static int native_deferral_note(NativeDeferral *deferral, int source_root_fd,
     deferral->count--;
     if (status == RESTORE_SOURCE_MISSING)
         return 0;
-    print_error("Error: Failed to inspect %s\n", label);
+    print_item_failure("restore", label, "inspect its copy in the backup",
+                       errno);
     return -1;
 }
 
@@ -2445,7 +2469,8 @@ static int restore_legacy(const char *source, int source_root_fd, const char *ho
             continue;
         if (source_status == RESTORE_SOURCE_ERROR)
         {
-            print_error("Error: Failed to inspect %s\n", name);
+            print_item_failure("restore", name,
+                               "inspect its copy in the backup", errno);
             *had_error = 1;
             continue;
         }
@@ -2459,7 +2484,8 @@ static int restore_legacy(const char *source, int source_root_fd, const char *ho
         char destination_rel[PATH_MAX];
         if (open_xdg_destination_anchor(xdg_dirs[i], &xdg_dest_fd, destination_rel, sizeof(destination_rel)) != 0)
         {
-            print_error("Error: Failed to restore %s\n", name);
+            print_item_failure("restore", name, "open the folder it goes into",
+                               errno);
             *had_error = 1;
             continue;
         }
@@ -2731,44 +2757,55 @@ static int seed_native_restore_root(const CloneContext *ctx,
                                     const char *source,
                                     const char *source_rel,
                                     int destination_root_fd,
-                                    const char *destination_rel)
+                                    const char *destination_rel,
+                                    FailedItem *failed)
 {
     CloneContext effective_ctx = *ctx;
     int policy_anchor_fd = restore_destination_anchor_fd(destination_root_fd,
                                                          destination_rel);
-    if (policy_anchor_fd < 0 ||
-        restore_timestamp_anchor_policy(anchors, policy_anchor_fd,
+    if (policy_anchor_fd < 0)
+    {
+        failed_item_note(failed, destination_rel,
+                         "open the folder it goes into", errno);
+        return -1;
+    }
+    if (restore_timestamp_anchor_policy(anchors, policy_anchor_fd,
                                         &effective_ctx.nsec_exact) != 0)
     {
-        if (policy_anchor_fd >= 0)
-            close(policy_anchor_fd);
+        failed_item_note(failed, destination_rel,
+                         "find the time precision of the folder it goes into",
+                         errno);
+        close(policy_anchor_fd);
         return -1;
     }
     effective_ctx.timestamp_policy_configured = 1;
     if (close(policy_anchor_fd) != 0)
+    {
+        failed_item_note(failed, destination_rel,
+                         "close the folder it goes into", errno);
         return -1;
+    }
 
     char source_path[PATH_MAX];
-    if (source == NULL || source_rel == NULL || destination_rel == NULL)
-        return -1;
-    if (source_rel[0] == '\0')
+    if (source_rel[0] == '\0'
+            ? snprintf(source_path, sizeof(source_path), "%s", source) >=
+                  (int)sizeof(source_path)
+            : path_join(source_path, sizeof(source_path), source,
+                        source_rel) != 0)
     {
-        int n = snprintf(source_path, sizeof(source_path), "%s", source);
-        if (n < 0 || (size_t)n >= sizeof(source_path))
-            return -1;
-    }
-    else if (path_join(source_path, sizeof(source_path), source,
-                       source_rel) != 0)
+        failed_item_note(failed, source_rel, "name its copy in the backup",
+                         ENAMETOOLONG);
         return -1;
+    }
     return native_inode_map_seed_existing(&effective_ctx, source_path,
                                           destination_root_fd,
-                                          destination_rel);
+                                          destination_rel, failed);
 }
 
 static int seed_native_restore_v1_hardlink_map(
     const char *source, int source_root_fd, const Manifest *m,
     const RestoreTargetMap *target_map, const CloneContext *ctx,
-    const RestoreTimestampAnchors *anchors)
+    const RestoreTimestampAnchors *anchors, FailedItem *failed_item)
 {
     int failed = 0;
 
@@ -2779,10 +2816,18 @@ static int seed_native_restore_v1_hardlink_map(
             continue;
 
         char source_rel[PATH_MAX + 8];
-        if (v1_payload_rel(root, source_rel, sizeof(source_rel)) != 0 ||
-            restore_native_source_status_at(source_root_fd, source_rel) !=
-                RESTORE_SOURCE_PRESENT)
+        if (v1_payload_rel(root, source_rel, sizeof(source_rel)) != 0)
         {
+            failed_item_note(failed_item, root->id,
+                             "its payload address is invalid", 0);
+            failed = 1;
+            continue;
+        }
+        if (restore_native_source_status_at(source_root_fd, source_rel) !=
+            RESTORE_SOURCE_PRESENT)
+        {
+            failed_item_note(failed_item, source_rel,
+                             "inspect it in the backup", errno);
             failed = 1;
             continue;
         }
@@ -2790,7 +2835,8 @@ static int seed_native_restore_v1_hardlink_map(
         const RestoreTargetRoot *destination = &target_map->roots[i];
         if (seed_native_restore_root(ctx, anchors, source, source_rel,
                                      destination->route.anchor_fd,
-                                     destination->route.relative) != 0)
+                                     destination->route.relative,
+                                     failed_item) != 0)
             failed = 1;
     }
 
@@ -2799,12 +2845,15 @@ static int seed_native_restore_v1_hardlink_map(
 
 static int seed_native_restore_legacy_hardlink_map(
     const char *source, int source_root_fd, const char *home, int home_fd,
-    const CloneContext *ctx, const RestoreTimestampAnchors *anchors)
+    const CloneContext *ctx, const RestoreTimestampAnchors *anchors,
+    FailedItem *failed_item)
 {
     char *xdg_dirs[XDG_RESTORE_COUNT] = {0};
     if (xdg_resolve(home, xdg_keys, xdg_fallbacks, xdg_dirs,
                     XDG_RESTORE_COUNT) != 0)
     {
+        failed_item_note(failed_item, home, "find its user folders",
+                         ENAMETOOLONG);
         free_xdg_dirs(xdg_dirs);
         return -1;
     }
@@ -2822,6 +2871,8 @@ static int seed_native_restore_legacy_hardlink_map(
             continue;
         if (status != RESTORE_SOURCE_PRESENT)
         {
+            failed_item_note(failed_item, name, "inspect it in the backup",
+                             errno);
             failed = 1;
             continue;
         }
@@ -2832,14 +2883,21 @@ static int seed_native_restore_legacy_hardlink_map(
                                          destination_rel,
                                          sizeof(destination_rel)) != 0)
         {
+            failed_item_note(failed_item, xdg_dirs[i], "open the folder",
+                             errno);
             failed = 1;
             continue;
         }
         if (seed_native_restore_root(ctx, anchors, source, name,
-                                     destination_fd, destination_rel) != 0)
+                                     destination_fd, destination_rel,
+                                     failed_item) != 0)
             failed = 1;
         if (close(destination_fd) != 0)
+        {
+            failed_item_note(failed_item, xdg_dirs[i], "close the folder",
+                             errno);
             failed = 1;
+        }
     }
 
     for (int i = 0; i < LEGACY_HOME_ITEM_COUNT; i++)
@@ -2849,9 +2907,14 @@ static int seed_native_restore_legacy_hardlink_map(
             restore_native_source_status_at(source_root_fd, name);
         if (status == RESTORE_SOURCE_MISSING)
             continue;
-        if (status != RESTORE_SOURCE_PRESENT ||
-            seed_native_restore_root(ctx, anchors, source, name,
-                                     home_fd, name) != 0)
+        if (status != RESTORE_SOURCE_PRESENT)
+        {
+            failed_item_note(failed_item, name, "inspect it in the backup",
+                             errno);
+            failed = 1;
+        }
+        else if (seed_native_restore_root(ctx, anchors, source, name, home_fd,
+                                          name, failed_item) != 0)
             failed = 1;
     }
 
@@ -2890,8 +2953,8 @@ static int validate_v1_payloads(int source_root_fd, const Manifest *m)
         }
         else if (status == RESTORE_SOURCE_ERROR)
         {
-            print_error("Error: Could not safely inspect payload for manifest root %s\n",
-                   root->id);
+            print_error("Error: Could not safely inspect payload for manifest root %s: %s\n",
+                   root->id, strerror(errno));
             failed = 1;
         }
     }
@@ -2997,8 +3060,8 @@ static int restore_target_map_free(RestoreTargetMap *map)
         {
             if (close(map->roots[i].route.anchor_fd) != 0)
             {
-                print_error("Error: Failed to close restore destination anchor %s\n",
-                            map->roots[i].absolute);
+                print_error("Error: Failed to close restore destination anchor %s: %s\n",
+                            map->roots[i].absolute, strerror(errno));
                 failed = 1;
             }
         }
@@ -3130,8 +3193,8 @@ static int restore_target_identity_add(
             print_error("Error: Native restore destination identity budget exceeded while mapping manifest root %s entry %s\n",
                         root->id, entry_name);
         else
-            print_error("Error: Could not allocate destination identity state for manifest root %s entry %s\n",
-                        root->id, entry_name);
+            print_error("Error: Could not allocate destination identity state for manifest root %s entry %s: %s\n",
+                        root->id, entry_name, strerror(errno));
     }
     else if (restore_first_symlink(target->route.anchor_fd, relative,
                                    symlink_rel, sizeof(symlink_rel)))
@@ -3185,9 +3248,9 @@ static int restore_payload_inventory_walk(
         int saved = errno;
         close(directory_fd);
         errno = saved;
-        print_error("Error: Could not inspect payload entries for manifest root %s at %s\n",
+        print_error("Error: Could not inspect payload entries for manifest root %s at %s: %s\n",
                     manifest->roots[root_index].id,
-                    logical[0] == '\0' ? "." : logical);
+                    logical[0] == '\0' ? "." : logical, strerror(errno));
         return -1;
     }
 
@@ -3200,9 +3263,9 @@ static int restore_payload_inventory_walk(
         {
             if (errno != 0)
             {
-                print_error("Error: Could not enumerate payload entries for manifest root %s at %s\n",
+                print_error("Error: Could not enumerate payload entries for manifest root %s at %s: %s\n",
                             manifest->roots[root_index].id,
-                            logical[0] == '\0' ? "." : logical);
+                            logical[0] == '\0' ? "." : logical, strerror(errno));
                 failed = 1;
             }
             break;
@@ -3236,8 +3299,8 @@ static int restore_payload_inventory_walk(
         if (fstatat(dirfd(directory), entry->d_name, &st,
                     AT_SYMLINK_NOFOLLOW) != 0)
         {
-            print_error("Error: Could not safely inspect payload entry for manifest root %s: %s\n",
-                        manifest->roots[root_index].id, child);
+            print_error("Error: Could not safely inspect payload entry for manifest root %s: %s: %s\n",
+                        manifest->roots[root_index].id, child, strerror(errno));
             failed = 1;
             break;
         }
@@ -3270,8 +3333,8 @@ static int restore_payload_inventory_walk(
                                   O_NOATIME | O_CLOEXEC);
         if (child_fd < 0)
         {
-            print_error("Error: Could not safely open payload directory for manifest root %s: %s\n",
-                        manifest->roots[root_index].id, child);
+            print_error("Error: Could not safely open payload directory for manifest root %s: %s: %s\n",
+                        manifest->roots[root_index].id, child, strerror(errno));
             failed = 1;
             break;
         }
@@ -3286,9 +3349,9 @@ static int restore_payload_inventory_walk(
 
     if (closedir(directory) != 0 && !failed)
     {
-        print_error("Error: Could not close payload inventory for manifest root %s at %s\n",
+        print_error("Error: Could not close payload inventory for manifest root %s at %s: %s\n",
                     manifest->roots[root_index].id,
-                    logical[0] == '\0' ? "." : logical);
+                    logical[0] == '\0' ? "." : logical, strerror(errno));
         failed = 1;
     }
     return failed ? -1 : 0;
@@ -3306,7 +3369,8 @@ static int restore_target_identity_register_anchors(
             errno == E2BIG)
             print_error("Error: Native restore destination identity budget exceeded while registering destination HOME ancestry\n");
         else
-            print_error("Error: Could not inspect destination HOME ancestry for versioned restore\n");
+            print_error("Error: Could not inspect destination HOME ancestry for versioned restore: %s\n",
+                        strerror(errno));
         return -1;
     }
 
@@ -3317,7 +3381,7 @@ static int restore_target_identity_register_anchors(
             int key = xdg_key_index(manifest->roots[index].id);
             if (key < 0 || key >= XDG_RESTORE_COUNT)
             {
-                print_error("Error: Could not identify XDG restore destination for manifest root %s\n",
+                print_error("Error: Could not identify XDG restore destination for manifest root %s: it names no user folder\n",
                             manifest->roots[index].id);
                 return -1;
             }
@@ -3332,8 +3396,8 @@ static int restore_target_identity_register_anchors(
                         print_error("Error: Native restore destination identity budget exceeded while registering XDG ancestry for manifest root %s\n",
                                     manifest->roots[index].id);
                     else
-                        print_error("Error: Could not inspect XDG destination ancestry for manifest root %s\n",
-                                    manifest->roots[index].id);
+                        print_error("Error: Could not inspect XDG destination ancestry for manifest root %s: %s\n",
+                                    manifest->roots[index].id, strerror(errno));
                     return -1;
                 }
                 registered_xdg[key] = 1;
@@ -3354,7 +3418,8 @@ static int restore_target_identity_finalize(RestoreTargetMap *map)
     else if (status == DESTINATION_IDENTITY_RESOURCE_ERROR && errno == E2BIG)
         print_error("Error: Native restore destination identity budget exceeded while ordering the destination namespace\n");
     else
-        print_error("Error: Could not finalize the restore destination identity map\n");
+        print_error("Error: Could not finalize the restore destination identity map: %s\n",
+                    strerror(errno));
     return -1;
 }
 
@@ -3387,8 +3452,8 @@ static int restore_target_identity_root_preflight(
         if (selection_payload_open_at(data_fd, root->payload_path, &st,
                                       &root_fd) != 0)
         {
-            print_error("Error: Could not safely inspect payload for manifest root %s\n",
-                        root->id);
+            print_error("Error: Could not safely inspect payload for manifest root %s: %s\n",
+                        root->id, strerror(errno));
             return -1;
         }
         if (items[index].automatic)
@@ -3435,7 +3500,8 @@ static int restore_target_identity_build(
                              O_CLOEXEC);
     if (data_fd < 0)
     {
-        print_error("Error: Could not open versioned restore payload inventory\n");
+        print_error("Error: Could not open versioned restore payload inventory: %s\n",
+                    strerror(errno));
         return -1;
     }
 
@@ -3446,7 +3512,8 @@ static int restore_target_identity_build(
 
     if (close(data_fd) != 0 && !failed)
     {
-        print_error("Error: Could not close versioned restore payload inventory\n");
+        print_error("Error: Could not close versioned restore payload inventory: %s\n",
+                    strerror(errno));
         failed = 1;
     }
     if (failed)
@@ -3461,8 +3528,8 @@ static int restore_target_identity_build(
                 &map->identity_graph, &map->roots[index].placement,
                 &items[index].order) != 0)
         {
-            print_error("Error: Could not order restore destination for manifest root %s\n",
-                        manifest->roots[index].id);
+            print_error("Error: Could not order restore destination for manifest root %s: %s\n",
+                        manifest->roots[index].id, strerror(errno));
             return -1;
         }
     }
@@ -3567,8 +3634,8 @@ static int restore_target_map_build(int source_root_fd, const char *home,
                     roots[index].route.relative,
                     sizeof(roots[index].route.relative)) != 0)
             {
-                print_error("Error: Failed to anchor XDG restore destination for %s\n",
-                            root->id);
+                print_error("Error: Failed to anchor XDG restore destination for %s: %s\n",
+                            root->id, strerror(errno));
                 goto fail;
             }
             roots[index].owns_anchor = 1;
@@ -3655,29 +3722,39 @@ static RestoreNativeStatus restore_metadata_item(
     }
     if (status == RESTORE_SOURCE_ERROR)
     {
-        print_error("Error: Failed to inspect %s\n", label);
+        print_item_failure("restore", label, "inspect its copy in the backup",
+                           errno);
         return RESTORE_NATIVE_ERROR;
     }
     int metadata_anchor_fd = restore_destination_anchor_fd(destination_root_fd,
                                                            destination_rel);
     if (metadata_anchor_fd < 0)
     {
-        print_error("Error: Failed to inspect restore destination for %s\n", label);
+        print_item_failure("restore", label, "open the folder it goes into",
+                           errno);
         return RESTORE_NATIVE_ERROR;
     }
-    int anchor_failed = restore_timestamp_anchor_add(timestamp_anchors,
-                                                      metadata_anchor_fd) != 0;
+    FailedStep failed = {0};
+    if (restore_timestamp_anchor_add(timestamp_anchors,
+                                     metadata_anchor_fd) != 0)
+        failed_step_note(&failed, "check the time precision of the folder it "
+                                  "goes into", errno);
     if (close(metadata_anchor_fd) != 0)
-        anchor_failed = 1;
-    if (anchor_failed)
+        failed_step_note(&failed, "close the folder it goes into", errno);
+    if (failed.step != NULL)
     {
-        print_error("Error: Failed to inspect restore destination for %s\n", label);
+        print_item_failure("restore", label, failed.step, failed.err);
         return RESTORE_NATIVE_ERROR;
     }
-    return restore_native_metadata_inventory_at(ctx, source_root_fd, source_rel,
-                                                destination_root_fd,
-                                                destination_rel, profiles,
-                                                estimate);
+    RestoreNativeReport report;
+    RestoreNativeStatus result = restore_native_metadata_inventory_at(
+        ctx, source_root_fd, source_rel, destination_root_fd, destination_rel,
+        profiles, estimate, &report);
+    // The caller answers a refused no-atime read with the privilege it needs.
+    if (result == RESTORE_NATIVE_ERROR)
+        report_native_restore_failure(destination_root_fd, destination_rel,
+                                      source_rel, &report);
+    return result;
 }
 
 static RestoreNativeStatus restore_legacy_metadata_inventory(
@@ -3712,7 +3789,8 @@ static RestoreNativeStatus restore_legacy_metadata_inventory(
             continue;
         if (source_status == RESTORE_SOURCE_ERROR)
         {
-            print_error("Error: Failed to inspect %s\n", name);
+            print_item_failure("restore", name,
+                               "inspect its copy in the backup", errno);
             failed = 1;
             continue;
         }
@@ -3723,8 +3801,8 @@ static RestoreNativeStatus restore_legacy_metadata_inventory(
                                          destination_rel,
                                          sizeof(destination_rel)) != 0)
         {
-            print_error("Error: Failed to resolve restore destination %s\n",
-                   xdg_dirs[i]);
+            print_item_failure("restore", name, "open the folder it goes into",
+                               errno);
             failed = 1;
             continue;
         }
@@ -3738,7 +3816,11 @@ static RestoreNativeStatus restore_legacy_metadata_inventory(
                 result = RESTORE_NATIVE_SOURCE_SAFE_READ;
         }
         if (close(destination_fd) != 0)
+        {
+            print_item_failure("restore", name, "close the folder it goes into",
+                               errno);
             failed = 1;
+        }
     }
 
     for (int i = 0; i < LEGACY_HOME_ITEM_COUNT; i++)
@@ -3828,7 +3910,8 @@ static void restore_v1(const char *source, int source_root_fd,
         char source_rel[PATH_MAX + 8];
         if (v1_payload_rel(root, source_rel, sizeof(source_rel)) != 0)
         {
-            print_error("Error: Failed to restore %s\n", root->id);
+            print_error("Error: Manifest root %s has an invalid payload address\n",
+                        root->id);
             *had_error = 1;
             continue;
         }
@@ -3950,7 +4033,8 @@ int restore_with_options(const char *source, const RestoreOptions *options)
     int source_root_fd = open(source, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (source_root_fd < 0)
     {
-        print_error("Error: Could not open source directory: %s\n", source);
+        print_error("Error: Could not open source directory %s: %s\n", source,
+                    strerror(errno));
         return MIGR_EXIT_FAILURE;
     }
 
@@ -3973,7 +4057,8 @@ int restore_with_options(const char *source, const RestoreOptions *options)
     }
     if (mst == MANIFEST_STATUS_IO_ERROR)
     {
-        print_error("Error: Could not read manifest.txt.\n");
+        print_error("Error: Could not read manifest.txt: %s\n",
+                    strerror(errno));
         close(source_root_fd);
         return MIGR_EXIT_FAILURE;
     }
@@ -3999,7 +4084,8 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         if (errno == ENAMETOOLONG)
             print_error("Error: HOME path too long to resolve user directories\n");
         else
-            print_error("Error: Could not open home directory: %s\n", home);
+            print_error("Error: Could not open home directory %s: %s\n", home,
+                        strerror(errno));
         if (mst == MANIFEST_STATUS_VALID)
             manifest_free(&m);
         close(source_root_fd);
@@ -4334,7 +4420,7 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         // another user owns: the restore needs root, which the privilege
         // refusal says in terms the user can act on (D38).
         if (metadata_inventory_status != RESTORE_NATIVE_SOURCE_SAFE_READ)
-            print_error("Error: native metadata preflight failed; no destination was changed\n");
+            print_error("  No destination was changed.\n");
         else if (restore_privilege_preflight(1, network_config_needs_privilege) == 0)
             report_source_safe_read_refusal("native restore payload", NULL);
         native_restore_estimate_free(&restore_estimate);
@@ -4389,41 +4475,52 @@ int restore_with_options(const char *source, const RestoreOptions *options)
 
     if (!dry_run)
     {
-        if (restore_timestamp_anchor_probe(&timestamp_anchors) != 0)
+        int probe_fd = -1;
+        if (restore_timestamp_anchor_probe(&timestamp_anchors, &probe_fd) != 0)
         {
-            print_error("Error: native timestamp preflight failed; no destination was changed\n");
+            int err = errno;
+            char place[PATH_MAX];
+            describe_path_at(probe_fd, "", place, sizeof(place));
+            print_error("Error: Could not check how precisely %s keeps file "
+                        "times: %s\n", place, strerror(err));
+            print_error("  No destination was changed.\n");
             goto cleanup;
         }
         // ctx's own timestamp_policy_configured/nsec_exact are never read for
         // an actual apply: restore_item_at() always builds its own
         // per-destination-anchor copy from timestamp_anchors before using it.
+        MetadataProbeFailure probe_failure;
         if (metadata_profiles_probe(&metadata_profiles,
                                     (MetadataTimestampPolicy){
                                         .nsec_exact = 0,
                                         .configured = 1
-                                    }) != 0)
+                                    }, &probe_failure) != 0)
         {
-            print_error("Error: native metadata preflight failed; no destination was changed\n");
+            metadata_probe_failure_print(&probe_failure, 0,
+                                         "No destination was changed.");
             goto cleanup;
         }
         ctx.metadata_preflight_done = 1;
         ctx.inode_map = native_inode_map_create();
         if (ctx.inode_map == NULL)
         {
-            print_error("Error: Could not initialize native hardlink restore tracking\n");
+            print_error("Error: Could not initialize native hardlink restore tracking: %s\n", strerror(errno));
             goto cleanup;
         }
 
+        FailedItem seed_failure = {0};
         int seed_status = mst == MANIFEST_STATUS_VALID
             ? seed_native_restore_v1_hardlink_map(
                   source, source_root_fd, &m, &target_map, &ctx,
-                  &timestamp_anchors)
+                  &timestamp_anchors, &seed_failure)
             : seed_native_restore_legacy_hardlink_map(
                   source, source_root_fd, home, home_fd, &ctx,
-                  &timestamp_anchors);
+                  &timestamp_anchors, &seed_failure);
         if (seed_status != 0)
         {
-            print_error("Error: Could not seed native hardlink restore tracking\n");
+            print_step_failure(&seed_failure.step,
+                               "Error: Could not find the hardlinks already "
+                               "restored, at %s", seed_failure.path);
             goto cleanup;
         }
     }

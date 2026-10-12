@@ -4,6 +4,7 @@
 #include <stddef.h>
 
 #include "home_rewrite.h"
+#include "utils.h"
 
 typedef enum {
     /* The database's settings were loaded into the running dconf service. */
@@ -39,11 +40,14 @@ typedef enum {
  *                     be 0, which rewrites nothing.
  * @param applied_keys Receives the number of keys loaded on success; may be
  *                     NULL.
+ * @param failed       Receives the step that failed, for DCONF_RESTORE_FAILED
+ *                     and DCONF_RESTORE_HOME_NOT_REWRITTEN; may be NULL.
  */
 DconfRestoreStatus dconf_restore_apply(int database_fd, int home_fd,
                                        const HomeRewritePair *pairs,
                                        size_t pair_count,
-                                       size_t *applied_keys);
+                                       size_t *applied_keys,
+                                       FailedStep *failed);
 
 /* Nonzero when dconf_restore_apply() would load into a running session:
  * the target user has a session bus and dconf is installed. */

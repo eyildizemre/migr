@@ -417,18 +417,79 @@ void print_source_safe_read_refusal(const char *label)
            "CAP_FOWNER is required).\n", label);
 }
 
-void print_item_failure(const char *verb, const char *path,
-                        const char *operation, int err)
+void failed_step_note(FailedStep *failed, const char *step, int err)
 {
-    if (operation == NULL)
-        operation = "an internal step failed";
-    print_error("Error: could not %s %s: %s%s%s\n", verb, path, operation,
-                err != 0 ? ": " : "", err != 0 ? strerror(err) : "");
+    if (failed == NULL || failed->step != NULL)
+        return;
+    failed->step = step;
+    failed->err = err;
+}
+
+void failed_item_note(FailedItem *failed, const char *path, const char *step,
+                      int err)
+{
+    if (failed == NULL || failed->step.step != NULL)
+        return;
+    snprintf(failed->path, sizeof(failed->path), "%s", path);
+    failed_step_note(&failed->step, step, err);
+}
+
+void failed_step_note_command(FailedStep *failed, const char *step,
+                              int result)
+{
+    if (failed == NULL || failed->step != NULL)
+        return;
+    failed_step_note(failed, step, result < 0 ? errno : 0);
+    if (result > 0)
+        failed->exit_status = result;
+}
+
+static void print_step(int warning, const FailedStep *failed,
+                       const char *fmt, va_list args)
+{
+    char message[PATH_MAX * 2];
+    vsnprintf(message, sizeof(message), fmt, args);
+    const char *step = failed != NULL && failed->step != NULL
+        ? failed->step : "an internal step failed";
+    int err = failed != NULL ? failed->err : 0;
+    char cause[64] = "";
+    if (err != 0)
+        snprintf(cause, sizeof(cause), ": %s", strerror(err));
+    else if (failed != NULL && failed->exit_status != 0)
+        snprintf(cause, sizeof(cause), ": it exited with status %d",
+                 failed->exit_status);
+    if (warning)
+        print_warning("%s: %s%s\n", message, step, cause);
+    else
+        print_error("%s: %s%s\n", message, step, cause);
     if (err != 0)
     {
         const char *name = strerrorname_np(err);
         run_log_printf("  errno %d (%s)\n", err, name != NULL ? name : "?");
     }
+}
+
+void print_step_failure(const FailedStep *failed, const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    print_step(0, failed, fmt, args);
+    va_end(args);
+}
+
+void print_step_warning(const FailedStep *failed, const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    print_step(1, failed, fmt, args);
+    va_end(args);
+}
+
+void print_item_failure(const char *verb, const char *path,
+                        const char *operation, int err)
+{
+    FailedStep failed = { .step = operation, .err = err };
+    print_step_failure(&failed, "Error: could not %s %s", verb, path);
 }
 
 void print_warning(const char *fmt, ...)

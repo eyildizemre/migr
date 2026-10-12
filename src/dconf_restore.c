@@ -306,16 +306,24 @@ int dconf_restore_session_running(void)
 DconfRestoreStatus dconf_restore_apply(int database_fd, int home_fd,
                                        const HomeRewritePair *pairs,
                                        size_t pair_count,
-                                       size_t *applied_keys)
+                                       size_t *applied_keys,
+                                       FailedStep *failed)
 {
     if (applied_keys != NULL)
         *applied_keys = 0;
     if (database_fd < 0)
+    {
+        failed_step_note(failed, "the saved settings could not be opened", 0);
         return DCONF_RESTORE_FAILED;
+    }
 
     DconfTarget target;
     if (dconf_target_resolve(&target) != 0)
+    {
+        failed_step_note(failed, "find the user the settings belong to",
+                         errno);
         return DCONF_RESTORE_FAILED;
+    }
 
     char runtime_dir[PATH_MAX], bus_path[PATH_MAX];
     DconfRestoreStatus session = dconf_session_check(&target, runtime_dir,
@@ -325,6 +333,9 @@ DconfRestoreStatus dconf_restore_apply(int database_fd, int home_fd,
     if (session == DCONF_RESTORE_NO_SESSION &&
         (pair_count == 0 || !dconf_command_available()))
         return session;
+    if (session == DCONF_RESTORE_FAILED)
+        failed_step_note(failed, "find the session's runtime folder",
+                         ENAMETOOLONG);
     if (session == DCONF_RESTORE_UNAVAILABLE ||
         session == DCONF_RESTORE_FAILED)
         return session;
@@ -334,7 +345,10 @@ DconfRestoreStatus dconf_restore_apply(int database_fd, int home_fd,
                                       : DCONF_RESTORE_HOME_NOT_REWRITTEN;
     DconfWorkDir work;
     if (dconf_work_dir_create(&work, database_fd, &target) != 0)
+    {
+        failed_step_note(failed, "create a work folder for dconf", errno);
         return status;
+    }
 
     char *dump = NULL;
     char *rewritten = NULL;
@@ -348,7 +362,10 @@ DconfRestoreStatus dconf_restore_apply(int database_fd, int home_fd,
           fchownat(work.fd, "runtime", target.uid, target.gid,
                    AT_SYMLINK_NOFOLLOW) != 0) ||
          path_join(runtime_dir, PATH_MAX, work.path, "runtime") != 0))
+    {
+        failed_step_note(failed, "create a runtime folder for dconf", errno);
         goto done;
+    }
 
     dump = malloc(dconf_dump_limit);
     char profile_env[PATH_MAX + 32], config_env[PATH_MAX + 32];
@@ -363,7 +380,11 @@ DconfRestoreStatus dconf_restore_apply(int database_fd, int home_fd,
             (int)sizeof(bus_env) ||
         snprintf(runtime_env, sizeof(runtime_env), "XDG_RUNTIME_DIR=%s",
                  runtime_dir) >= (int)sizeof(runtime_env))
+    {
+        failed_step_note(failed, "prepare dconf's environment",
+                         dump == NULL ? ENOMEM : ENAMETOOLONG);
         goto done;
+    }
 
     // dconf keeps state in the runtime directory even to read; the invoker's
     // environment may name root's, which the user cannot write.
@@ -377,14 +398,21 @@ DconfRestoreStatus dconf_restore_apply(int database_fd, int home_fd,
         .env = dump_env
     };
     char *const dump_argv[] = { "dconf", "dump", "/", NULL };
-    if (run_command_capture_with(dump_argv, dump, dconf_dump_limit,
-                                 &dump_options) != 0)
+    int dump_result = run_command_capture_with(dump_argv, dump,
+                                               dconf_dump_limit, &dump_options);
+    if (dump_result != 0)
+    {
+        failed_step_note_command(failed, "run dconf dump", dump_result);
         goto done;
+    }
     size_t dump_length = strlen(dump);
     // A full buffer means the dump was cut short; loading a truncated dump
     // would apply an arbitrary subset.
     if (dump_length >= dconf_dump_limit - 1U)
+    {
+        failed_step_note(failed, "the settings are larger than migr reads", 0);
         goto done;
+    }
 
     // Paths under the backup's home folder (a wallpaper, a last-used folder)
     // name this system's (D101).
@@ -393,7 +421,11 @@ DconfRestoreStatus dconf_restore_apply(int database_fd, int home_fd,
     {
         rewritten = home_rewrite_text(dump, pairs, pair_count);
         if (rewritten == NULL)
+        {
+            failed_step_note(failed, "point them at this system's home folder",
+                             errno);
             goto done;
+        }
         settings = rewritten;
     }
     if (!loads)
@@ -401,6 +433,8 @@ DconfRestoreStatus dconf_restore_apply(int database_fd, int home_fd,
         if (strcmp(settings, dump) == 0 ||
             dconf_replace_database(&work, &target, settings, home_fd) == 0)
             status = DCONF_RESTORE_NO_SESSION;
+        else
+            failed_step_note(failed, "write the settings file", errno);
         goto done;
     }
 
@@ -423,9 +457,14 @@ DconfRestoreStatus dconf_restore_apply(int database_fd, int home_fd,
     };
     char load_output[256];
     char *const load_argv[] = { "dconf", "load", "/", NULL };
-    if (run_command_capture_with(load_argv, load_output, sizeof(load_output),
-                                 &load_options) != 0)
+    int load_result = run_command_capture_with(load_argv, load_output,
+                                               sizeof(load_output),
+                                               &load_options);
+    if (load_result != 0)
+    {
+        failed_step_note_command(failed, "run dconf load", load_result);
         goto done;
+    }
     if (applied_keys != NULL)
         *applied_keys = keys;
     status = DCONF_RESTORE_APPLIED;

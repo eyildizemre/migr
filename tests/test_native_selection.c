@@ -141,7 +141,7 @@ int main(void)
     MetadataProfiles profiles;
     metadata_profiles_init(&profiles);
     CHECK(backup_selection_inventory(&plan, data, -1, &profiles) == 0);
-    CHECK(metadata_profiles_probe(&profiles, (MetadataTimestampPolicy){.configured=1, .nsec_exact=1}) == 0);
+    CHECK(metadata_profiles_probe(&profiles, (MetadataTimestampPolicy){.configured=1, .nsec_exact=1}, NULL) == 0);
     metadata_profiles_free(&profiles);
     CloneContext ctx = {.operation=CLONE_BACKUP, .representation=CLONE_NATIVE_TREE,
                         .metadata_preflight_done=1, .timestamp_policy_configured=1, .nsec_exact=1};

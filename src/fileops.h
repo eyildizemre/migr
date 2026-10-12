@@ -58,11 +58,14 @@ void native_inode_map_free(void *map);
  * source inode, so a resumed capture or restore may visit the sibling before
  * the old representative without changing the selected destination inode.
  * destination_rel may be a safe relative path or "" for the destination root.
+ * failed, which may be NULL, receives the first item that could not be
+ * inspected.
  */
 int native_inode_map_seed_existing(const CloneContext *ctx,
                                    const char *source_path,
                                    int destination_root_fd,
-                                   const char *destination_rel);
+                                   const char *destination_rel,
+                                   FailedItem *failed);
 int native_hardlink_identity_matches(const struct stat *linked,
                                      const struct stat *reference);
 
@@ -378,10 +381,12 @@ RestoreSourceStatus restore_native_source_status_at(int source_root_fd,
  * for operational reasons such as permissions or free space. A source regular
  * file or directory that cannot be opened with O_NOATIME returns
  * RESTORE_NATIVE_SOURCE_SAFE_READ; no O_NOATIME-less read is attempted.
+ * report, which may be NULL, receives the first item that failed.
  */
 RestoreNativeStatus restore_native_preflight_at(
     const CloneContext *ctx, int source_root_fd, const char *source_rel,
-    int destination_root_fd, const char *destination_rel);
+    int destination_root_fd, const char *destination_rel,
+    RestoreNativeReport *report);
 
 /**
  * @brief Collects native-restore metadata profiles without probing or mutating.
@@ -394,11 +399,13 @@ RestoreNativeStatus restore_native_preflight_at(
  * by this inventory walk: on Linux, readlinkat() itself perturbs a symlink's
  * atime (docs/DECISIONS.md D17 as-built), while the later restore pass still
  * performs ordinary target validation before applying the saved metadata.
+ * report, which may be NULL, receives the first item that failed.
  */
 RestoreNativeStatus restore_native_metadata_inventory_at(
     const CloneContext *ctx, int source_root_fd, const char *source_rel,
     int destination_root_fd, const char *destination_rel,
-    MetadataProfiles *profiles, NativeRestoreEstimate *estimate);
+    MetadataProfiles *profiles, NativeRestoreEstimate *estimate,
+    RestoreNativeReport *report);
 
 /**
  * @brief FD-anchored native restore core (docs/DECISIONS.md D15 and D16).

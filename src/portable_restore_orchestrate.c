@@ -133,11 +133,14 @@ static PortableRestoreOutcome portable_restore_orchestrate_impl(
         replay_request.destination_timestamp_policy = policy;
     }
 
-    if (metadata_profiles_probe(&preflight.profiles, policy) != 0)
+    MetadataProbeFailure probe_failure;
+    if (metadata_profiles_probe(&preflight.profiles, policy,
+                                &probe_failure) != 0)
     {
         report->live_count = preflight.live_count;
         fflush(stdout);
-        print_error("Error: portable metadata probe failed; no destination was changed\n");
+        metadata_probe_failure_print(&probe_failure, 0,
+                                     "No destination was changed.");
         portable_restore_preflight_report_free(&preflight);
         return PORTABLE_RESTORE_ERROR;
     }

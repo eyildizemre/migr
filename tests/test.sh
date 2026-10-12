@@ -1040,7 +1040,7 @@ test_error_propagation() {
     # Native metadata preflight may reject the source before reserving a
     # container; either path must be reported as a failed backup, never plain
     # success.
-    if [[ "$output" != *"errors"* && "$output" != *"metadata preflight failed"* ]]; then
+    if [[ "$output" != *"errors"* && "$output" != *"could not back up"*"locked.txt: open it"* ]]; then
         echo -e "  ${RED}✗${NC} Failure was not reported as a backup error."
         echo "$output"
         exit 1
@@ -2054,7 +2054,7 @@ test_container_production() {
            [[ "$first_out" == *"kept for resume"* ]]; then
             echo -e "  ${GREEN}✓${NC} A failed capture publishes nothing and keeps a manifest-carrying partial."
         elif [ "$first_rc" -ne 0 ] &&
-             [[ "$first_out" == *"native metadata preflight failed"* ]] &&
+             [[ "$first_out" == *"could not back up"*"locked.txt: open it"* ]] &&
              [ -z "$(containers_matching "$resume_dest" partial)" ] &&
              [ -z "$(containers_matching "$resume_dest" final)" ]; then
             echo -e "  ${GREEN}✓${NC} Source metadata preflight rejected the inaccessible root before reserving a container."
