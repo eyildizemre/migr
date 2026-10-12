@@ -150,9 +150,7 @@ static void preflight_progress_render(const RestorePreflightProgress *display,
         line, sizeof(line),
         "Verifying backup contents: %s %zu/%zu checked, elapsed %s",
         phase, checked_count, display->total_count, elapsed_text);
-    progress_line_fit(line, sizeof(line));
-    printf("\r%s\033[K", line);
-    fflush(stdout);
+    progress_line_draw(line, sizeof(line));
 }
 
 static void preflight_progress_ticker_redraw(
@@ -217,7 +215,6 @@ static void preflight_progress_disable_ticker(RestorePreflightProgress *display,
                                               int saved_errno)
 {
     preflight_progress_stop_ticker(display);
-    putchar('\n');
     print_warning("  Warning: restore preflight stall redraw was disabled: %s\n",
                   strerror(saved_errno));
 }
@@ -291,8 +288,7 @@ static void preflight_progress_finish(RestorePreflightProgress *display,
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now) == 0)
         preflight_progress_render(display, checked_count, phase, &now);
-    putchar('\n');
-    fflush(stdout);
+    progress_line_end();
     display->active = 0;
 }
 
@@ -301,8 +297,7 @@ static void preflight_progress_cancel(RestorePreflightProgress *display)
     if (display == NULL || !display->active)
         return;
     preflight_progress_stop_ticker(display);
-    putchar('\n');
-    fflush(stdout);
+    progress_line_end();
     display->active = 0;
 }
 

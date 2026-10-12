@@ -278,6 +278,18 @@ void format_duration(long seconds, char *buf, size_t len);
 void progress_line_fit(char *line, size_t line_capacity);
 
 /**
+ * @brief Fits line (progress_line_fit()) and draws it over the progress line.
+ *
+ * Until progress_line_end(), the line counts as open: print_error(),
+ * print_warning(), and print_success() end it first, so a message never
+ * lands on its end. Safe to call from a ticker thread.
+ */
+void progress_line_draw(char *line, size_t line_capacity);
+
+/** @brief Ends an open progress line with a newline; otherwise does nothing. */
+void progress_line_end(void);
+
+/**
  * @brief Returns non-negative elapsed seconds between two timestamps.
  *
  * The timestamps are expected to come from the same monotonic clock. A

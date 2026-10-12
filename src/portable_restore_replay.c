@@ -2415,9 +2415,7 @@ static void replay_verification_progress_render(
     (void)snprintf(line, sizeof(line),
                    "Verifying restored content: %zu/%zu checked, elapsed %s",
                    checked_count, display->total_count, elapsed_text);
-    progress_line_fit(line, sizeof(line));
-    printf("\r%s\033[K", line);
-    fflush(stdout);
+    progress_line_draw(line, sizeof(line));
 }
 
 static void replay_verification_ticker_redraw(
@@ -2503,7 +2501,7 @@ static void replay_verification_progress_start(
     if (replay_verification_snapshot(display, 0, &now) != 0)
     {
         replay_verification_progress_stop_ticker(display);
-        putchar('\n');
+        progress_line_end();
         display->active = 0;
     }
 }
@@ -2526,7 +2524,7 @@ static void replay_verification_progress_note(
     if (replay_verification_snapshot(display, checked_count, &now) != 0)
     {
         replay_verification_progress_stop_ticker(display);
-        putchar('\n');
+        progress_line_end();
         display->active = 0;
         return;
     }
@@ -2542,8 +2540,7 @@ static void replay_verification_progress_finish(
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now) == 0)
         replay_verification_progress_render(display, checked_count, &now);
-    putchar('\n');
-    fflush(stdout);
+    progress_line_end();
     display->active = 0;
 }
 

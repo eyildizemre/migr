@@ -126,9 +126,7 @@ static void verify_progress_render(VerifyRun *run, const struct timespec *now)
     (void)snprintf(line, sizeof(line),
                    "Verifying backup: %zu/%zu items, %s of %s, elapsed %s",
                    run->checked, run->count, done, total, elapsed);
-    progress_line_fit(line, sizeof(line));
-    printf("\r%s\033[K", line);
-    fflush(stdout);
+    progress_line_draw(line, sizeof(line));
 }
 
 static void verify_progress_note(VerifyRun *run, int force)
@@ -782,7 +780,7 @@ static int verify_native(const char *path, const Manifest *manifest,
     if (run.progress)
     {
         verify_progress_note(&run, 1);
-        putchar('\n');
+        progress_line_end();
     }
     fflush(stdout);
 
@@ -941,7 +939,7 @@ int verify_backup(const char *path)
     if (run.progress)
     {
         verify_progress_note(&run, 1);
-        putchar('\n');
+        progress_line_end();
     }
 
     fflush(stdout);

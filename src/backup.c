@@ -1622,9 +1622,7 @@ static void backup_render_progress(BackupProgressDisplay *display,
                  "Progress: %s copied, %s free, elapsed %s, speed %s/s, "
                  "current: %s", copied_text, free_text, elapsed_text,
                  speed_text, path_text);
-    progress_line_fit(line, sizeof(line));
-    printf("\r%s\033[K", line);
-    fflush(stdout);
+    progress_line_draw(line, sizeof(line));
 }
 
 static void backup_ticker_redraw(const ProgressTickerSnapshot *snapshot,
@@ -2499,8 +2497,7 @@ static void backup_before_deferred(void *context)
     int ticking = progress != NULL && progress->ticker.running;
     if (ticking)
         backup_progress_stop_ticker(progress);
-    if (progress != NULL && progress->printed_anything)
-        putchar('\n');
+    progress_line_end();
     while (open_count != 0)
     {
         printf("\n");
@@ -3968,8 +3965,7 @@ static int backup_run(const char *target_arg, BackupMode mode,
                                        capture_report.bytes_unchanged,
                                        capture_report.current_path,
                                        capture_report.progress_userdata);
-            putchar('\n');
-            fflush(stdout);
+            progress_line_end();
         }
         source_snapshot_end(&source_snapshot);
         if (capture_report.live_state_changes != 0)

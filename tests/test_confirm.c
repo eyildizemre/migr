@@ -631,6 +631,48 @@ static void test_run_log(void)
         check(0, "run log fixture is removed");
 }
 
+// A message printed while a progress line is drawn starts on a line of its
+// own, and ending the line afterwards adds nothing.
+static void test_progress_line_ends_before_message(void)
+{
+    int pipefd[2];
+    int saved_stdout = dup(STDOUT_FILENO);
+    int saved_stderr = dup(STDERR_FILENO);
+    fflush(stdout);
+    if (pipe(pipefd) != 0 || saved_stdout < 0 || saved_stderr < 0 ||
+        dup2(pipefd[1], STDOUT_FILENO) < 0 ||
+        dup2(pipefd[1], STDERR_FILENO) < 0)
+    {
+        perror("progress-line message fixture");
+        exit(1);
+    }
+    close(pipefd[1]);
+
+    char line[] = "Progress: 1 MB copied";
+    progress_line_draw(line, sizeof(line));
+    print_error("Error: could not copy x\n");
+    progress_line_end();
+    print_warning("Warning: y\n");
+    fflush(stdout);
+
+    if (dup2(saved_stdout, STDOUT_FILENO) < 0 ||
+        dup2(saved_stderr, STDERR_FILENO) < 0)
+    {
+        perror("progress-line message restore");
+        exit(1);
+    }
+    close(saved_stdout);
+    close(saved_stderr);
+
+    char output[256];
+    ssize_t length = read(pipefd[0], output, sizeof(output) - 1U);
+    close(pipefd[0]);
+    output[length > 0 ? length : 0] = '\0';
+    check(strcmp(output, "\rProgress: 1 MB copied\033[K\n"
+                         "Error: could not copy x\nWarning: y\n") == 0,
+          "a message ends the progress line before it, and only once");
+}
+
 int main(void)
 {
     char output[256];
@@ -642,6 +684,7 @@ int main(void)
 #endif
     test_progress_ticker_stop_ignores_resolved_thread_error();
     test_progress_line_fit_fallback();
+    test_progress_line_ends_before_message();
 
     check(run_confirm("\n", 1, output, sizeof(output)) == 1,
           "bare Enter accepts the default-yes prompt");

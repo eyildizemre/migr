@@ -392,20 +392,57 @@ int resolve_sudo_identity_for_test(const char *sudo_uid_env,
 }
 #endif
 
-static void print_status(const char *color, const char *fmt, va_list args)
+// A progress line drawn and not yet ended: a message printed now would land
+// on its end. The lock keeps a ticker's redraw from slipping in between the
+// line break and the message.
+static pthread_mutex_t progress_line_lock = PTHREAD_MUTEX_INITIALIZER;
+static int progress_line_open;
+
+static void progress_line_end_locked(void)
 {
+    if (!progress_line_open)
+        return;
+    putchar('\n');
+    fflush(stdout);
+    progress_line_open = 0;
+}
+
+void progress_line_draw(char *line, size_t line_capacity)
+{
+    progress_line_fit(line, line_capacity);
+    pthread_mutex_lock(&progress_line_lock);
+    printf("\r%s\033[K", line);
+    fflush(stdout);
+    progress_line_open = 1;
+    pthread_mutex_unlock(&progress_line_lock);
+}
+
+void progress_line_end(void)
+{
+    pthread_mutex_lock(&progress_line_lock);
+    progress_line_end_locked();
+    pthread_mutex_unlock(&progress_line_lock);
+}
+
+static void print_status(const char *color, const char *prefix,
+                         const char *fmt, va_list args)
+{
+    pthread_mutex_lock(&progress_line_lock);
+    progress_line_end_locked();
     if (color_enabled)
         fputs(color, stderr);
+    fputs(prefix, stderr);
     vfprintf(stderr, fmt, args);
     if (color_enabled)
         fputs("\033[0m", stderr);
+    pthread_mutex_unlock(&progress_line_lock);
 }
 
 void print_error(const char *fmt, ...)
 {
     va_list args;
     va_start(args, fmt);
-    print_status("\033[1;31m", fmt, args);
+    print_status("\033[1;31m", "", fmt, args);
     va_end(args);
 }
 
@@ -516,7 +553,7 @@ void print_warning(const char *fmt, ...)
 {
     va_list args;
     va_start(args, fmt);
-    print_status("\033[1;33m", fmt, args);
+    print_status("\033[1;33m", "", fmt, args);
     va_end(args);
 }
 
@@ -524,12 +561,7 @@ void print_success(const char *fmt, ...)
 {
     va_list args;
     va_start(args, fmt);
-    if (color_enabled)
-        fputs("\033[1;32m", stderr);
-    fputs("  OK: ", stderr);
-    vfprintf(stderr, fmt, args);
-    if (color_enabled)
-        fputs("\033[0m", stderr);
+    print_status("\033[1;32m", "  OK: ", fmt, args);
     va_end(args);
 }
 

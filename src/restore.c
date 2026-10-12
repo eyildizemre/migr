@@ -1914,9 +1914,7 @@ static void restore_render_progress(RestoreProgressDisplay *display,
     snprintf(line, sizeof(line),
              "Restored: %s so far, elapsed %s, speed %s/s, current: %s",
              restored_text, elapsed_text, speed_text, path_text);
-    progress_line_fit(line, sizeof(line));
-    printf("\r%s\033[K", line);
-    fflush(stdout);
+    progress_line_draw(line, sizeof(line));
 }
 
 static void restore_ticker_redraw(const ProgressTickerSnapshot *snapshot,
@@ -2005,8 +2003,7 @@ static void restore_progress_finish_phase(RestoreProgressPhase *phase)
                                        phase->report->bytes_unchanged,
                                        phase->report->current_path,
                                        phase->report->progress_userdata);
-        putchar('\n');
-        fflush(stdout);
+        progress_line_end();
         phase->display->printed_anything = 0;
     }
 }

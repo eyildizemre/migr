@@ -668,9 +668,7 @@ static void copy_progress(RepairCopy *copy, int force)
     char line[128];
     (void)snprintf(line, sizeof(line), "Copying the backup: %s of %s", done,
                    total);
-    progress_line_fit(line, sizeof(line));
-    printf("\r%s\033[K", line);
-    fflush(stdout);
+    progress_line_draw(line, sizeof(line));
 }
 
 static int copy_file_at(int source_dir, const char *name, int dest_dir,
@@ -865,7 +863,7 @@ static int copy_container(int source_fd, int dest_fd, RepairCopy *copy)
     if (copy->progress)
     {
         copy_progress(copy, 1);
-        putchar('\n');
+        progress_line_end();
     }
     if (result != 0)
         print_error("Error: Could not copy %s into the repaired backup: %s\n",
