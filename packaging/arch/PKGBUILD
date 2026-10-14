@@ -7,7 +7,7 @@ arch=('x86_64')
 url='https://github.com/eyildizemre/migr'
 license=('MIT')
 depends=('glibc')
-source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
+source=("$url/releases/download/v$pkgver/$pkgname-$pkgver.tar.gz")
 sha256sums=('SKIP')
 
 build() {
