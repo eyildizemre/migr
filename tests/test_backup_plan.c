@@ -1545,7 +1545,7 @@ static void stall_before_capture(const char *source_path, void *context)
 
 static int progress_output_lines_fit(const char *output, size_t max_length)
 {
-    const char prefix[] = "\rProgress: ";
+    const char prefix[] = "\rCopied ";
     const char *cursor = output;
     int found = 0;
 
@@ -1562,9 +1562,24 @@ static int progress_output_lines_fit(const char *output, size_t max_length)
     return found;
 }
 
+// 1 when the last progress line drawn names a current path, 0 when it does
+// not, -1 when there is none.
+static int last_progress_line_names_path(const char *output)
+{
+    const char *last = NULL;
+    for (const char *at = strstr(output, "\rCopied "); at != NULL;
+         at = strstr(at + 1, "\rCopied "))
+        last = at;
+    const char *end = last != NULL ? strstr(last, "\033[K") : NULL;
+    if (end == NULL)
+        return -1;
+    const char *path = strstr(last, ", current: ");
+    return path != NULL && path < end;
+}
+
 static int stalled_progress_advanced_elapsed_without_bytes(const char *output)
 {
-    const char prefix[] = "\rProgress: ";
+    const char prefix[] = "\rCopied ";
     const char *cursor = output;
     char stable_bytes[32] = "";
     char first_elapsed[32] = "";
@@ -1575,7 +1590,7 @@ static int stalled_progress_advanced_elapsed_without_bytes(const char *output)
         if (line_end == NULL)
             break;
         const char *slash = strchr(cursor + sizeof(prefix) - 1U, '/');
-        const char *elapsed = strstr(cursor, "elapsed ");
+        const char *elapsed = strstr(cursor, " in ");
         if (slash == NULL || slash >= line_end ||
             elapsed == NULL || elapsed >= line_end)
         {
@@ -1585,7 +1600,7 @@ static int stalled_progress_advanced_elapsed_without_bytes(const char *output)
 
         const char *bytes_start = cursor + sizeof(prefix) - 1U;
         size_t bytes_len = (size_t)(slash - bytes_start);
-        elapsed += strlen("elapsed ");
+        elapsed += strlen(" in ");
         const char *elapsed_end = strchr(elapsed, ',');
         if (bytes_len == 0 || bytes_len >= sizeof(stable_bytes) ||
             elapsed_end == NULL || elapsed_end >= line_end)
@@ -2390,8 +2405,11 @@ static void test_allocation_aware_estimate(void)
     check(result == 0 && strstr(output, "Estimated backup size: 15B") != NULL &&
               strstr(output, "Estimated backup size: 20B") == NULL,
           "backup() displays the raw source estimate");
-    check(result == 0 && strstr(output, "\rProgress: 15B/15B copied") != NULL,
+    check(result == 0 && strstr(output, "\rCopied 15B/15B in ") != NULL &&
+              strstr(output, ", current: ") != NULL,
           "live progress uses the raw source total");
+    check(result == 0 && last_progress_line_names_path(output) == 0,
+          "the backup ends its progress on the totals, without a current path");
 
     dry_run = 1;
     char dry_output[8192];
@@ -2499,8 +2517,8 @@ static void test_update_counts_the_backup_it_replaces(int portable)
     backup_test_set_block_size_hook(NULL, NULL);
     backup_test_force_portable_representation(0);
     check(live_rc == 0, "the update fits when only its growth fits");
-    check(strstr(output, "Progress: 4.0K/") != NULL &&
-              strstr(output, " checked, 100B copied") != NULL,
+    check(strstr(output, "Checked 4.0K/") != NULL &&
+              strstr(output, ", copied 100B in ") != NULL,
           "update progress shows the checked bytes beside the copied ones");
 
     remove_tree(home);
@@ -3767,20 +3785,20 @@ static void test_live_progress(void)
               trace->seen_paths == 3 && trace->timing_valid &&
               trace->timing_count >= 3,
           "progress is monotonic and final-flushed at the estimated total");
-    check(strstr(output, "\rProgress:") != NULL &&
+    check(strstr(output, "\rCopied ") != NULL &&
               strstr(output, "\n\nFinalizing (syncing to disk)...") != NULL &&
               strstr(output, "Packages") == NULL &&
               strstr(output, "package list") == NULL,
           "progress overwrites in place and explicit backups omit package output");
     check(progress_output_lines_fit(output, 79U),
           "forced non-tty progress redraws fit the 80-column fallback row");
-    check(strstr(output, "elapsed 00:") != NULL &&
-              strstr(output, "speed ") != NULL,
+    check(strstr(output, " in 00:") != NULL &&
+              strstr(output, "B/s, ") != NULL,
           "progress output includes elapsed time and speed");
     const char *long_progress =
-        strstr(output, "\rProgress: 1000.0K/1.0M copied");
+        strstr(output, "\rCopied 1000.0K/1.0M in ");
     const char *short_progress =
-        strstr(output, "\rProgress: 1.0M/1.0M copied");
+        strstr(output, "\rCopied 1.0M/1.0M in ");
     const char *line_clear = long_progress == NULL
         ? NULL : strstr(long_progress, "\033[K");
     check(long_progress != NULL && short_progress != NULL &&
@@ -3793,7 +3811,7 @@ static void test_live_progress(void)
     char quiet_output[8192];
     result = run_backup_capturing(quiet_target, BACKUP_EXPLICIT_PATHS, paths,
                                    quiet_output, sizeof(quiet_output));
-    check(result == 0 && strstr(quiet_output, "\rProgress:") == NULL,
+    check(result == 0 && strstr(quiet_output, "\rCopied ") == NULL,
           "a captured non-tty backup installs no progress callback");
 
     char joined_target[PATH_MAX];

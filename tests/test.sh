@@ -861,7 +861,7 @@ test_restore() {
     output=$(echo "y" | "$MIGR" restore "$actual_backup" 2>&1)
 
     assert_contains "$output" "Restore complete"
-    assert_not_contains "$output" "Restored:"
+    assert_not_contains "$output" $'\rRestored '
 
     # A clean backup and restore keep no log (D79).
     assert_not_contains "$output" "Log: "
@@ -1752,10 +1752,9 @@ test_native_restore_progress() {
         2>&1)
     pty_rc=$?
     set -e
-    if [ "$pty_rc" -eq 0 ] && [[ "$pty_output" == *"Restored:"* ]] &&
+    if [ "$pty_rc" -eq 0 ] && [[ "$pty_output" == *"Restored "*" in 00:"* ]] &&
        [[ "$pty_output" == *"current:"* ]] &&
-       [[ "$pty_output" == *"elapsed 00:"* ]] &&
-       [[ "$pty_output" == *"speed "* ]] &&
+       [[ "$pty_output" == *"/s"* ]] &&
        [ -f "$progress_home/Documents/progress.txt" ]; then
         echo -e "  ${GREEN}✓${NC} Native restore shows progress on a real TTY."
     else
@@ -1766,7 +1765,7 @@ test_native_restore_progress() {
 
     redirected_output=$(printf 'y\n' | env HOME="$redirected_home" \
         "$MIGR" restore "$progress_src" 2>&1)
-    if [[ "$redirected_output" != *"Restored:"* ]] &&
+    if [[ "$redirected_output" != *$'\rRestored '* ]] &&
        [ -f "$redirected_home/Documents/progress.txt" ]; then
         echo -e "  ${GREEN}✓${NC} Native restore suppresses progress when stdout is redirected."
     else
@@ -2422,7 +2421,7 @@ test_portable_vfat_dispatch() {
     mkdir -p "$HOME"
     output=$(printf 'y\n' | "$MIGR" restore "$actual_backup" -v 2>&1)
     assert_contains "$output" "Restore complete"
-    assert_not_contains "$output" "Restored:"
+    assert_not_contains "$output" $'\rRestored '
     local restore_verbose_count
     restore_verbose_count=$(grep -F -c "  Restoring: XDG_DOCUMENTS_DIR" <<<"$output" || true)
     if [ "$restore_verbose_count" -eq 1 ]; then
@@ -2455,10 +2454,9 @@ test_portable_vfat_dispatch() {
     portable_pty_rc=$?
     set -e
     if [ "$portable_pty_rc" -eq 0 ] &&
-       [[ "$portable_pty_output" == *"Restored:"* ]] &&
+       [[ "$portable_pty_output" == *"Restored "*" in 00:"* ]] &&
        [[ "$portable_pty_output" == *"note.txt"* ]] &&
-       [[ "$portable_pty_output" == *"elapsed 00:"* ]] &&
-       [[ "$portable_pty_output" == *"speed "* ]] &&
+       [[ "$portable_pty_output" == *"/s"* ]] &&
        [ -f "$portable_progress_home/Documents/note.txt" ]; then
         echo -e "  ${GREEN}✓${NC} Portable restore shows progress on a real TTY."
     else

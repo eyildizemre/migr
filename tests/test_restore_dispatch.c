@@ -1562,8 +1562,17 @@ static void test_live_restore_joins_progress_ticker(void)
               "progress-dest/payload.txt");
     check(rc == 0 && file_content_is(restored, "progress payload"),
           "forced live progress leaves the restore result intact");
-    check(strstr(output, "\rRestored:") != NULL,
+    check(strstr(output, "\rRestored 16B in ") != NULL &&
+              strstr(output, ", current: ") != NULL,
           "the restore-only progress force installs the real display path");
+    const char *last = NULL;
+    for (const char *at = strstr(output, "\rRestored "); at != NULL;
+         at = strstr(at + 1, "\rRestored "))
+        last = at;
+    const char *last_end = last != NULL ? strstr(last, "\033[K") : NULL;
+    const char *last_path = last != NULL ? strstr(last, ", current: ") : NULL;
+    check(last_end != NULL && (last_path == NULL || last_path > last_end),
+          "the files step ends on its totals, without a current path");
     check(threads_before > 0 && threads_after == threads_before,
           "a live restore joins its progress ticker before returning");
 #ifdef PACKAGES_TEST_HOOKS

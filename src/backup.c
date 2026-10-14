@@ -1522,6 +1522,7 @@ typedef struct {
     int updating; /* an existing backup: unchanged files are checked, not copied */
     int data_fd;
     int printed_anything;
+    int finished; /* the last draw: totals, without the current path */
     struct timespec started_at;
     ProgressTicker ticker;
 } BackupProgressDisplay;
@@ -1587,9 +1588,6 @@ static void backup_render_progress(BackupProgressDisplay *display,
     format_size(bytes_copied, copied_text, sizeof(copied_text));
     format_size(bytes_copied + bytes_unchanged, checked_text,
                 sizeof(checked_text));
-    if (display->estimated_total_bytes > 0)
-        format_size(display->estimated_total_bytes, estimated_text,
-                    sizeof(estimated_text));
 
     if (free_bytes_known)
         format_size(free_bytes, free_text, sizeof(free_text));
@@ -1601,27 +1599,28 @@ static void backup_render_progress(BackupProgressDisplay *display,
     const char *path_text = current_path != NULL && current_path[0] != '\0'
         ? current_path : "unknown";
 
+    char of_estimate[40] = "";
+    if (display->estimated_total_bytes > 0)
+    {
+        format_size(display->estimated_total_bytes, estimated_text,
+                    sizeof(estimated_text));
+        snprintf(of_estimate, sizeof(of_estimate), "/%s", estimated_text);
+    }
+
     char line[PATH_MAX + 256U];
-    if (display->updating && display->estimated_total_bytes > 0)
-        snprintf(line, sizeof(line),
-                 "Progress: %s/%s checked, %s copied, %s free, elapsed %s, "
-                 "speed %s/s, current: %s", checked_text, estimated_text,
-                 copied_text, free_text, elapsed_text, speed_text, path_text);
-    else if (display->updating)
-        snprintf(line, sizeof(line),
-                 "Progress: %s checked, %s copied, %s free, elapsed %s, "
-                 "speed %s/s, current: %s", checked_text, copied_text,
-                 free_text, elapsed_text, speed_text, path_text);
-    else if (display->estimated_total_bytes > 0)
-        snprintf(line, sizeof(line),
-                 "Progress: %s/%s copied, %s free, elapsed %s, speed %s/s, "
-                 "current: %s", copied_text, estimated_text, free_text,
-                 elapsed_text, speed_text, path_text);
+    int length;
+    if (display->updating)
+        length = snprintf(line, sizeof(line),
+                          "Checked %s%s, copied %s in %s, %s/s, %s free",
+                          checked_text, of_estimate, copied_text,
+                          elapsed_text, speed_text, free_text);
     else
-        snprintf(line, sizeof(line),
-                 "Progress: %s copied, %s free, elapsed %s, speed %s/s, "
-                 "current: %s", copied_text, free_text, elapsed_text,
-                 speed_text, path_text);
+        length = snprintf(line, sizeof(line), "Copied %s%s in %s, %s/s, %s free",
+                          copied_text, of_estimate, elapsed_text, speed_text,
+                          free_text);
+    if (!display->finished && length > 0 && (size_t)length < sizeof(line))
+        snprintf(line + length, sizeof(line) - (size_t)length,
+                 ", current: %s", path_text);
     progress_line_draw(line, sizeof(line));
 }
 
@@ -3967,6 +3966,7 @@ static int backup_run(const char *target_arg, BackupMode mode,
             backup_progress_stop_ticker(&progress_display);
         if (progress_installed && progress_display.printed_anything)
         {
+            progress_display.finished = 1;
             capture_report.progress_cb(capture_report.bytes_copied,
                                        capture_report.bytes_unchanged,
                                        capture_report.current_path,

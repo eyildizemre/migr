@@ -1848,6 +1848,7 @@ static void restore_security_skipped_add(size_t *total, size_t count)
 
 typedef struct {
     int printed_anything;
+    int finished; /* the last draw: totals, without the current path */
     struct timespec started_at;
     ProgressTicker ticker;
 } RestoreProgressDisplay;
@@ -1911,9 +1912,11 @@ static void restore_render_progress(RestoreProgressDisplay *display,
     const char *path_text = current_path != NULL && current_path[0] != '\0'
         ? current_path : "unknown";
     char line[PATH_MAX + 256U];
-    snprintf(line, sizeof(line),
-             "Restored: %s so far, elapsed %s, speed %s/s, current: %s",
-             restored_text, elapsed_text, speed_text, path_text);
+    int length = snprintf(line, sizeof(line), "Restored %s in %s, %s/s",
+                          restored_text, elapsed_text, speed_text);
+    if (!display->finished && length > 0 && (size_t)length < sizeof(line))
+        snprintf(line + length, sizeof(line) - (size_t)length,
+                 ", current: %s", path_text);
     progress_line_draw(line, sizeof(line));
 }
 
@@ -1998,12 +2001,14 @@ static void restore_progress_finish_phase(RestoreProgressPhase *phase)
     }
     if (phase->display->printed_anything)
     {
+        phase->display->finished = 1;
         if (phase->report->progress_cb != NULL)
             phase->report->progress_cb(phase->report->bytes_copied,
                                        phase->report->bytes_unchanged,
                                        phase->report->current_path,
                                        phase->report->progress_userdata);
         progress_line_end();
+        phase->display->finished = 0;
         phase->display->printed_anything = 0;
     }
 }

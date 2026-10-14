@@ -5729,6 +5729,13 @@ the capture, so an update can briefly need more than the difference. A write
 failure stays the authoritative out-of-space signal, and the interrupted
 update resumes.
 
+**Revision (2026-10-14):** The progress line reads the same while it runs and
+once it ends: `Checked 21.4G/37.1G, copied 483.6M in 04:36, 1.7M/s, 90.2G
+free, current: ...` for an update, `Copied 30.2G/38.1G in ...` for a first
+backup. The last draw leaves out the current path, so the line that stays on
+screen states the totals. Restore's line takes the same form:
+`Restored 38.1G in 04:36, 141.3M/s`.
+
 ---
 
 ## D99 — 2026-10-04 — Install commands run without their output
