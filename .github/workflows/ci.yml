@@ -1,9 +1,9 @@
 name: CI
 
-# A push runs what the pre-commit hook cannot: the suite as root, and the
-# suite on other distributions. A pull request or a manual run adds every
-# gate of `make check`. Pushes that change nothing the build or the tests
-# read (the same files the hook looks at) are skipped.
+# Every run takes the suite as root, the suite on other distributions, and
+# every gate of `make check` in a clean Fedora: a fresh machine finds what
+# the developer's own one hides. Pushes that change nothing the build or the
+# tests read (the same files the pre-commit hook looks at) are skipped.
 on:
   push:
     paths:
@@ -61,7 +61,6 @@ jobs:
 
   full-check:
     name: make check (Fedora 44)
-    if: github.event_name != 'push'
     runs-on: ubuntu-24.04
     container:
       image: fedora:44
