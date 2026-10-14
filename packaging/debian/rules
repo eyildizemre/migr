@@ -1,0 +1,14 @@
+#!/usr/bin/make -f
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	dh_auto_build -- migr migr-static
+
+override_dh_auto_install:
+	dh_auto_install -- PREFIX=/usr install-static
+
+override_dh_auto_test:
+	$(MAKE) test

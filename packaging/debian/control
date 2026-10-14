@@ -1,0 +1,20 @@
+Source: migr
+Section: admin
+Priority: optional
+Maintainer: Emre Yıldız <eyildizemre@proton.me>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.2
+Homepage: https://github.com/eyildizemre/migr
+Rules-Requires-Root: no
+
+Package: migr
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: move your home, packages, and settings to a new Linux install
+ migr moves your home folder, packages, and desktop settings from one Linux
+ installation to another, across distributions too: back up to a drive,
+ reinstall, restore.
+ .
+ The package also installs migr-static, a statically linked copy that
+ "migr backup --include-self" puts in the backup, so the new system can run
+ migr before it is installed there.
