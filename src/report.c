@@ -106,25 +106,32 @@ static int report_depth_includes(ReportDepth depth, size_t level)
     return level <= 1;
 }
 
+static int vanished_errno(void)
+{
+    return errno == ENOENT || errno == ENOTDIR;
+}
+
 /*
  * Measures one root and records each requested directory subtotal during the
  * same bottom-up walk. Files and symlinks contribute to their containing
  * directory but never become breakdown entries, matching du's directory-only
- * listing semantics.
+ * listing semantics. Returns 1 when path disappeared during the walk; its
+ * parent then counts it as 0 bytes and goes on.
  */
 static int measure_report_tree(const char *path, size_t depth,
                                ReportDepth depth_limit,
                                ReportBreakdown *breakdown, off_t *size,
                                const SelectionRoot *selection)
 {
+    *size = 0;
     if (selection)
     {
         int owned = selection_source_owns(selection, path);
-        if (owned <= 0) { *size = 0; return owned; }
+        if (owned <= 0) return owned;
     }
     struct stat st;
     if (lstat(path, &st) != 0)
-        return -1;
+        return vanished_errno() ? 1 : -1;
 
     if (S_ISLNK(st.st_mode) || S_ISREG(st.st_mode))
     {
@@ -134,10 +141,7 @@ static int measure_report_tree(const char *path, size_t depth,
 
     if (S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode) ||
         S_ISCHR(st.st_mode) || S_ISBLK(st.st_mode))
-    {
-        *size = 0;
         return 0;
-    }
 
     if (!S_ISDIR(st.st_mode))
     {
@@ -145,16 +149,22 @@ static int measure_report_tree(const char *path, size_t depth,
         return -1;
     }
 
+    DIR *dir = opendir(path);
+    if (dir == NULL)
+        return vanished_errno() ? 1 : -1;
+
     size_t entry_index = SIZE_MAX;
     if (breakdown != NULL &&
         report_depth_includes(depth_limit, depth) &&
         report_breakdown_add(breakdown, path, depth, &entry_index) != 0)
+    {
+        int saved_errno = errno;
+        closedir(dir);
+        errno = saved_errno;
         return -1;
+    }
 
     off_t subtotal = st.st_size;
-    DIR *dir = opendir(path);
-    if (dir == NULL)
-        return -1;
 
     while (1)
     {
@@ -187,7 +197,7 @@ static int measure_report_tree(const char *path, size_t depth,
         size_t child_depth = depth == SIZE_MAX ? SIZE_MAX : depth + 1;
         off_t child_size = 0;
         if (measure_report_tree(child_path, child_depth, depth_limit,
-                                breakdown, &child_size, selection) != 0)
+                                breakdown, &child_size, selection) < 0)
         {
             int saved_errno = errno;
             closedir(dir);
@@ -279,40 +289,23 @@ static const char *scoped_root_name(const char *home,
 }
 
 /*
- * Measures one root. A root that has disappeared since plan construction --
- * or a directory child that disappears mid-walk -- is reported absent
- * (*present = 0), not a hard error; that benign-absence tolerance is shared
- * by every root category. breakdown may be NULL when the caller has no use
- * for per-directory subtotals (measure_report_tree() tolerates that, see
- * above).
+ * Measures one root. A root that has disappeared since plan construction is
+ * reported absent (*present = 0), not a hard error; that benign-absence
+ * tolerance is shared by every root category. An entry that disappears
+ * further down only leaves its own size out. breakdown may be NULL when the
+ * caller has no use for per-directory subtotals (measure_report_tree()
+ * tolerates that, see above).
  */
 static int measure_scoped_root(const char *path, ReportDepth depth_limit,
                                ReportBreakdown *breakdown, off_t *bytes,
                                int *present, const SelectionRoot *selection)
 {
-    struct stat st;
-    *bytes = 0;
     *present = 0;
-
-    if (lstat(path, &st) != 0)
-    {
-        if (errno == ENOENT || errno == ENOTDIR)
-            return 0;
+    int rc = measure_report_tree(path, 0, depth_limit, breakdown, bytes,
+                                 selection);
+    if (rc < 0)
         return -1;
-    }
-
-    errno = 0;
-    if (measure_report_tree(path, 0, depth_limit, breakdown, bytes, selection) != 0)
-    {
-        if (errno == ENOENT || errno == ENOTDIR)
-        {
-            *bytes = 0;
-            return 0;
-        }
-        return -1;
-    }
-
-    *present = 1;
+    *present = rc == 0;
     return 0;
 }
 

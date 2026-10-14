@@ -22,18 +22,26 @@ static struct stat target_directory;
 static int target_directory_valid;
 static unsigned int target_readdir_calls;
 static int readdir_failure_injected;
+static struct stat vanish_directory;
+static int vanish_directory_valid;
+static int vanish_injected;
 
 struct dirent *__real_readdir(DIR *directory);
 
-struct dirent *__wrap_readdir(DIR *directory)
+static int is_directory(DIR *directory, const struct stat *expected)
 {
     struct stat current_directory;
     int directory_fd = dirfd(directory);
 
-    if (target_directory_valid && directory_fd >= 0 &&
-        fstat(directory_fd, &current_directory) == 0 &&
-        current_directory.st_dev == target_directory.st_dev &&
-        current_directory.st_ino == target_directory.st_ino)
+    return directory_fd >= 0 &&
+           fstat(directory_fd, &current_directory) == 0 &&
+           current_directory.st_dev == expected->st_dev &&
+           current_directory.st_ino == expected->st_ino;
+}
+
+struct dirent *__wrap_readdir(DIR *directory)
+{
+    if (target_directory_valid && is_directory(directory, &target_directory))
     {
         /* Let . .. and one real child pass, then fail during the walk. */
         if (target_readdir_calls++ == 3U)
@@ -44,7 +52,15 @@ struct dirent *__wrap_readdir(DIR *directory)
         }
     }
 
-    return __real_readdir(directory);
+    struct dirent *entry = __real_readdir(directory);
+    /* Remove the named entry after the walk has seen it, as a program
+     * deleting a file during the report would. */
+    if (entry != NULL && vanish_directory_valid &&
+        strcmp(entry->d_name, "vanishing.txt") == 0 &&
+        is_directory(directory, &vanish_directory) &&
+        unlinkat(dirfd(directory), entry->d_name, 0) == 0)
+        vanish_injected = 1;
+    return entry;
 }
 
 static void check(int condition, const char *label)
@@ -96,6 +112,47 @@ static void remove_fixture(const char *base)
     rmdir(base);
 }
 
+/* Runs a plain critical report against base as HOME; output gets stdout. */
+static int run_report(const char *base, char *output, size_t output_size)
+{
+    const char *old_home = getenv("HOME");
+    char *old_home_copy = old_home == NULL ? NULL : strdup(old_home);
+    int home_set = setenv("HOME", base, 1) == 0;
+    verbose = 0;
+
+    int saved_stdout = dup(STDOUT_FILENO);
+    FILE *sink = tmpfile();
+    int report_result = -1;
+    output[0] = '\0';
+    if (home_set && saved_stdout >= 0 && sink != NULL)
+    {
+        fflush(stdout);
+        if (dup2(fileno(sink), STDOUT_FILENO) >= 0)
+        {
+            ReportDepth depth = { REPORT_DEPTH_DEFAULT, 0 };
+            report_result = report(BACKUP_CRITICAL, 0, depth);
+            fflush(stdout);
+            dup2(saved_stdout, STDOUT_FILENO);
+            if (fseek(sink, 0, SEEK_SET) == 0)
+            {
+                size_t length = fread(output, 1, output_size - 1U, sink);
+                output[length] = '\0';
+            }
+        }
+    }
+
+    if (saved_stdout >= 0)
+        close(saved_stdout);
+    if (sink != NULL)
+        fclose(sink);
+    if (old_home_copy != NULL)
+        setenv("HOME", old_home_copy, 1);
+    else
+        unsetenv("HOME");
+    free(old_home_copy);
+    return report_result;
+}
+
 static void test_plain_report_detects_readdir_failure(void)
 {
     char base[] = "/tmp/migr_report_XXXXXX";
@@ -124,44 +181,11 @@ static void test_plain_report_detects_readdir_failure(void)
         return;
     }
 
-    const char *old_home = getenv("HOME");
-    char *old_home_copy = old_home == NULL ? NULL : strdup(old_home);
-    int home_set = setenv("HOME", base, 1) == 0;
-    target_directory_valid = home_set;
+    target_directory_valid = 1;
     target_readdir_calls = 0;
     readdir_failure_injected = 0;
-    verbose = 0;
-
-    int saved_stdout = dup(STDOUT_FILENO);
-    FILE *sink = tmpfile();
-    int report_result = -1;
-    char output[4096] = { 0 };
-    if (home_set && saved_stdout >= 0 && sink != NULL)
-    {
-        fflush(stdout);
-        if (dup2(fileno(sink), STDOUT_FILENO) >= 0)
-        {
-            ReportDepth depth = { REPORT_DEPTH_DEFAULT, 0 };
-            report_result = report(BACKUP_CRITICAL, 0, depth);
-            fflush(stdout);
-            dup2(saved_stdout, STDOUT_FILENO);
-            if (fseek(sink, 0, SEEK_SET) == 0)
-            {
-                size_t length = fread(output, 1, sizeof(output) - 1U, sink);
-                output[length] = '\0';
-            }
-        }
-    }
-
-    if (saved_stdout >= 0)
-        close(saved_stdout);
-    if (sink != NULL)
-        fclose(sink);
-    if (old_home_copy != NULL)
-        setenv("HOME", old_home_copy, 1);
-    else
-        unsetenv("HOME");
-    free(old_home_copy);
+    char output[4096];
+    int report_result = run_report(base, output, sizeof(output));
     target_directory_valid = 0;
 
     check(readdir_failure_injected,
@@ -171,10 +195,54 @@ static void test_plain_report_detects_readdir_failure(void)
     remove_fixture(base);
 }
 
+static void test_report_skips_entry_that_vanishes(void)
+{
+    char base[] = "/tmp/migr_report_XXXXXX";
+    if (mkdtemp(base) == NULL)
+    {
+        check(0, "fixture directory can be created");
+        return;
+    }
+
+    char documents[PATH_MAX] = "";
+    char kept[PATH_MAX] = "";
+    char vanishing[PATH_MAX] = "";
+    int fixture_ok = join_path(documents, sizeof(documents), base,
+                               "Documents") == 0 &&
+                     mkdir(documents, 0700) == 0 &&
+                     join_path(kept, sizeof(kept), documents, "kept.txt") == 0 &&
+                     write_fixture_file(kept) == 0 &&
+                     join_path(vanishing, sizeof(vanishing), documents,
+                               "vanishing.txt") == 0 &&
+                     write_fixture_file(vanishing) == 0 &&
+                     stat(documents, &vanish_directory) == 0;
+    if (fixture_ok)
+    {
+        vanish_directory_valid = 1;
+        vanish_injected = 0;
+        char output[4096];
+        int report_result = run_report(base, output, sizeof(output));
+        vanish_directory_valid = 0;
+
+        check(vanish_injected, "a file is removed after readdir returns it");
+        check(report_result == 0 && strstr(output, "Documents") != NULL &&
+                  strstr(output, "report is incomplete") == NULL,
+              "a vanished file leaves its root in the report");
+    }
+    else
+        check(0, "vanishing entry fixture can be created");
+
+    unlink(vanishing);
+    unlink(kept);
+    rmdir(documents);
+    rmdir(base);
+}
+
 int main(void)
 {
     printf(BLUE "::" NC " report measurement (unit)\n");
     test_plain_report_detects_readdir_failure();
+    test_report_skips_entry_that_vanishes();
 
     if (failures > 0)
     {
