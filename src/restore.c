@@ -1549,17 +1549,19 @@ static void restore_network_config(int source_root_fd, int *had_error)
             strcmp(backend->name, "wpa_supplicant") == 0 &&
             network_manager_is_running())
         {
-            printf("  Restored %zu %s file(s) to %s/. NetworkManager manages "
+            printf("  Restored %zu %s file%s to %s/. NetworkManager manages "
                    "Wi-Fi on this system and does not read them; they were "
                    "restored for reference and need no restart.\n",
-                   restored, backend->name, dest_dir);
+                   restored, backend->name, restored == 1 ? "" : "s",
+                   dest_dir);
         }
         else if (backend->apply_mode == NETWORK_CONFIG_APPLY_MANUAL)
         {
-            printf("  Restored %zu %s file(s) to %s/. Run `%s` yourself when "
+            printf("  Restored %zu %s file%s to %s/. Run `%s` yourself when "
                    "ready. This can briefly interrupt network connectivity, "
                    "so migr does not run it automatically.\n",
-                   restored, backend->name, dest_dir, backend->manual_apply_hint);
+                   restored, backend->name, restored == 1 ? "" : "s",
+                   dest_dir, backend->manual_apply_hint);
         }
         else
         {
