@@ -17,6 +17,11 @@
 #include "utils.h"
 #include "verify.h"
 
+#define MIGR_VERSION "0.1.0"
+
+/* Long-only options, outside the range of the short option letters. */
+enum { OPT_VERSION = 256 };
+
 typedef enum {
     ACTION_NONE,
     ACTION_REPORT,
@@ -144,6 +149,7 @@ int main(int argc, char *argv[])
         {"include-self",   no_argument,       NULL, 'I'},
         {"include-network-config", no_argument, NULL, 'N'},
         {"no-verify",      no_argument,       NULL, 'V'},
+        {"version",        no_argument,       NULL, OPT_VERSION},
         {NULL,             0,                 NULL,  0 }
     };
 
@@ -179,6 +185,7 @@ int main(int argc, char *argv[])
     int no_verify = 0;
     int non_help_option_given = 0;
     int console = 0;
+    int show_version = 0;
 
     // Parse options only. optind was set above to skip the command word, or left
     // at 1 when no command was given (e.g. `migr --help`). getopt_long permutes
@@ -238,6 +245,9 @@ int main(int argc, char *argv[])
             non_help_option_given = 1;
             no_verify = 1;
             break;
+        case OPT_VERSION:
+            show_version = 1;
+            break;
         case '?':
         default:
             print_error("For help: ./migr --help\n");
@@ -253,6 +263,11 @@ int main(int argc, char *argv[])
     if (action == ACTION_HELP)
     {
         print_help();
+        return MIGR_EXIT_OK;
+    }
+    if (show_version)
+    {
+        printf("migr %s\n", MIGR_VERSION);
         return MIGR_EXIT_OK;
     }
 

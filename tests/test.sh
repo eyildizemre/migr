@@ -1295,6 +1295,16 @@ test_errors() {
     assert_succeeds_with "Usage:" "$MIGR" help --critical
     # ...but a genuine conflict detected before --help is even parsed still refuses.
     assert_exits_nonzero "$MIGR" backup --critical --comprehensive --help
+
+    # --version prints the version set in main.c, after any command too.
+    local version
+    version=$(sed -n 's/^#define MIGR_VERSION "\(.*\)"$/\1/p' ../src/main.c)
+    if [ -z "$version" ]; then
+        echo -e "  ${RED}✗${NC} MIGR_VERSION not found in ../src/main.c"
+        exit 1
+    fi
+    assert_succeeds_with "migr $version" "$MIGR" --version
+    assert_succeeds_with "migr $version" "$MIGR" backup --version
 }
 
 test_truncation() {

@@ -509,6 +509,7 @@ help                  Show this help
 -n, --dry-run         Preview actions without making changes
 -v, --verbose         Verbose output
 -h, --help            Show this help
+    --version         Show the version
 -s, --summary         Print only the selected report scope total
     --max-depth=<N>   Report directory breakdown depth (implies --verbose)
     --include-self    Include a validated static migr binary in the backup
