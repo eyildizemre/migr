@@ -1,5 +1,8 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -g -I src -pthread
+# Packagers pass their own CFLAGS, CPPFLAGS, and LDFLAGS (optimization,
+# hardening); the flags migr itself needs are added to whatever they give.
+CFLAGS ?= -g
+override CFLAGS += -Wall -Wextra -I src -pthread
 # Each object records the headers it includes, so a changed header rebuilds it:
 # -MMD writes that list beside the object as a make rule (foo.o -> foo.d),
 # -MP adds an empty rule per header so a deleted header does not break the
@@ -86,16 +89,16 @@ STATIC_OBJS = $(SRCS:.c=_static.o)
 ANALYZER_SRCS = $(wildcard src/*.c)
 
 $(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $(TARGET) $(OBJS)
 
 $(STATIC_TARGET): $(STATIC_OBJS)
-	$(CC) $(CFLAGS) -static -o $(STATIC_TARGET) $(STATIC_OBJS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -static -o $(STATIC_TARGET) $(STATIC_OBJS)
 
 %.o: %.c
-	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 %_static.o: %.c
-	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 TEST_DETECT = tests/test_detect
 TEST_MANIFEST_SELECTION = tests/test_manifest_selection
