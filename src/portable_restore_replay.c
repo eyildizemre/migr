@@ -2115,11 +2115,16 @@ static int replay_apply_hardlink(ReplayCollection *collection,
                 errno);
     }
 
+    // Held open until the link is verified: while it is, the reference's
+    // inode number cannot pass to a file put in its place, which a
+    // filesystem that reuses freed inode numbers would otherwise allow.
+    int ref_fd = -1;
     struct stat reference_before;
     if (result == 0 &&
         (ref_leaf[0] == '\0' ||
-         fstatat(ref_parent_fd, ref_leaf, &reference_before,
-                 AT_SYMLINK_NOFOLLOW) != 0 ||
+         (ref_fd = openat(ref_parent_fd, ref_leaf,
+                          O_PATH | O_NOFOLLOW | O_CLOEXEC)) < 0 ||
+         fstat(ref_fd, &reference_before) != 0 ||
          !S_ISREG(reference_before.st_mode)))
     {
         errno = EIO;
@@ -2183,6 +2188,8 @@ static int replay_apply_hardlink(ReplayCollection *collection,
     }
 
     int saved = errno;
+    if (ref_fd >= 0)
+        close(ref_fd);
     if (ref_parent_fd >= 0 && close(ref_parent_fd) != 0 && result == 0)
     {
         result = -1;
