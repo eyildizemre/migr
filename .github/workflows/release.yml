@@ -1,0 +1,132 @@
+name: Release
+
+# A v* tag builds the release files and opens a draft release with them. A
+# manual run builds and checks the same files without releasing, so a
+# packaging problem shows before the tag; its files stay on the run's page.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source:
+    name: Version check and source tarball
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: version
+        name: Check that every place names the same version
+        run: |
+          tag=
+          [ "$GITHUB_REF_TYPE" != tag ] || tag=$GITHUB_REF_NAME
+          version=$(.github/scripts/check-version.sh ${tag:+"$tag"})
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Make the source tarball
+        run: >-
+          git archive --prefix=migr-${{ steps.version.outputs.version }}/
+          -o migr-${{ steps.version.outputs.version }}.tar.gz HEAD
+      - uses: actions/upload-artifact@v7
+        with:
+          name: source
+          path: migr-*.tar.gz
+
+  deb:
+    name: Debian package and static binary
+    needs: source
+    runs-on: ubuntu-24.04
+    container: debian:12
+    env:
+      VERSION: ${{ needs.source.outputs.version }}
+    steps:
+      - name: Install build tools
+        run: apt-get update && apt-get install -y build-essential debhelper
+      - uses: actions/download-artifact@v8
+        with:
+          name: source
+      - name: Build from the tarball
+        # From the workspace, which receives the .deb beside the sources.
+        run: |
+          tar -xf "migr-$VERSION.tar.gz"
+          cp -r "migr-$VERSION/packaging/debian" "migr-$VERSION/debian"
+          "migr-$VERSION/.github/scripts/run-as-builder.sh" \
+              sh -c "cd migr-$VERSION && dpkg-buildpackage -b -us -uc"
+      - name: Take the static binary out of the package
+        run: |
+          deb=$(ls migr_"$VERSION"-*_amd64.deb)
+          dpkg-deb --fsys-tarfile "$deb" |
+              tar -xO ./usr/bin/migr-static > "migr-$VERSION-x86_64-static"
+          chmod 755 "migr-$VERSION-x86_64-static"
+          "./migr-$VERSION-x86_64-static" --version
+      - uses: actions/upload-artifact@v7
+        with:
+          name: deb
+          path: |
+            migr_*_amd64.deb
+            migr-*-x86_64-static
+
+  rpm:
+    name: RPM build (Fedora 44, not uploaded)
+    needs: source
+    runs-on: ubuntu-24.04
+    container: fedora:44
+    env:
+      VERSION: ${{ needs.source.outputs.version }}
+    steps:
+      - name: Install build tools
+        run: dnf install -y rpm-build gcc make glibc-static
+      - uses: actions/download-artifact@v8
+        with:
+          name: source
+      - name: rpmbuild from the tarball
+        run: |
+          tar -xf "migr-$VERSION.tar.gz" "migr-$VERSION/packaging/fedora/migr.spec" \
+              "migr-$VERSION/.github/scripts/run-as-builder.sh"
+          "migr-$VERSION/.github/scripts/run-as-builder.sh" \
+              rpmbuild -bb -D "_sourcedir $PWD" -D "_topdir $PWD/rpmbuild" \
+              "migr-$VERSION/packaging/fedora/migr.spec"
+
+  arch:
+    name: Arch package build (not uploaded)
+    needs: source
+    runs-on: ubuntu-24.04
+    container: archlinux:latest
+    env:
+      VERSION: ${{ needs.source.outputs.version }}
+    steps:
+      - name: Install build tools
+        run: pacman -Syu --noconfirm --needed base-devel
+      - uses: actions/download-artifact@v8
+        with:
+          name: source
+      - name: makepkg from the tarball
+        run: |
+          tar -xf "migr-$VERSION.tar.gz" "migr-$VERSION/packaging/arch/PKGBUILD" \
+              "migr-$VERSION/.github/scripts/run-as-builder.sh"
+          cp "migr-$VERSION/packaging/arch/PKGBUILD" .
+          "migr-$VERSION/.github/scripts/run-as-builder.sh" makepkg --noconfirm
+
+  release:
+    name: Draft release
+    if: github.ref_type == 'tag'
+    needs: [source, deb, rpm, arch]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          merge-multiple: true
+      - name: Checksums
+        run: sha256sum migr-*.tar.gz migr_*.deb migr-*-static > SHA256SUMS
+      - name: Open the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY"
+          --draft --verify-tag --title "migr ${{ needs.source.outputs.version }}"
+          migr-*.tar.gz migr_*.deb migr-*-static SHA256SUMS
