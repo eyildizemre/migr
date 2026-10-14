@@ -2678,6 +2678,28 @@ test_btrfs_snapshot_capture() {
     BTRFS_LOOP=""
 }
 
+test_install() {
+    echo -e "${BLUE}::${NC} Phase 18: make install"
+    local root="$TEST_DIR/install-root"
+    local installed="$root/usr/bin/migr"
+    make -C .. --no-print-directory install DESTDIR="$root" PREFIX=/usr >/dev/null
+    assert_file_exists "$installed"
+    if [ "$(stat -c %a "$installed")" = 755 ]; then
+        echo -e "  ${GREEN}✓${NC} migr is installed with mode 755."
+    else
+        echo -e "  ${RED}✗${NC} migr is installed with mode $(stat -c %a "$installed")"
+        exit 1
+    fi
+    assert_succeeds_with "migr " "$installed" --version
+    make -C .. --no-print-directory uninstall DESTDIR="$root" PREFIX=/usr >/dev/null
+    if [ ! -e "$installed" ]; then
+        echo -e "  ${GREEN}✓${NC} make uninstall removes it."
+    else
+        echo -e "  ${RED}✗${NC} make uninstall left $installed"
+        exit 1
+    fi
+}
+
 # --- 4. RUN TESTS ---
 echo -e "${BLUE}migr integration tests${NC}"
 setup
@@ -2702,4 +2724,5 @@ test_container_production
 test_portable_vfat_dispatch
 test_casefold_name_equivalence
 test_btrfs_snapshot_capture
+test_install
 echo -e "${GREEN}all tests passed${NC}"
