@@ -328,7 +328,7 @@ $(TEST_BACKUP_PLAN): tests/test_backup_plan.c $(call with_hooks,backup_test.o ba
 	$(CC) $(CFLAGS) -DBACKUP_TEST_HOOKS -DBACKUP_PLAN_TEST_HOOKS -DWRITER_APPS_TEST_HOOKS -o $@ $(filter %.c %.o,$^)
 
 $(TEST_METADATA_CONTRACT): tests/test_metadata_contract.c $(call with_hooks,metadata_xattr_test.o)
-	$(CC) $(CFLAGS) -DMETADATA_XATTR_TEST_HOOKS -o $@ $(filter %.c %.o,$^)
+	$(CC) $(CFLAGS) -DMETADATA_XATTR_TEST_HOOKS -Wl,--wrap=flistxattr -o $@ $(filter %.c %.o,$^)
 
 $(TEST_METADATA_SNAPSHOTS): tests/test_metadata_snapshots.c $(LIB_OBJS)
 	$(CC) $(CFLAGS) -o $@ $(filter %.c %.o,$^)

@@ -1750,6 +1750,54 @@ static void test_metadata_apply_xattrs_symlink_race(void)
 }
 #endif
 
+// Overlayfs counts its own hidden attributes in the size flistxattr reports
+// for an empty buffer, then leaves them out of the list it fills in.
+static int flistxattr_overstate_size;
+ssize_t __real_flistxattr(int fd, char *list, size_t size);
+ssize_t __wrap_flistxattr(int fd, char *list, size_t size)
+{
+    ssize_t length = __real_flistxattr(fd, list, size);
+    if (flistxattr_overstate_size && size == 0 && length >= 0)
+        return length + 24;
+    return length;
+}
+
+static void test_xattr_list_shorter_than_its_size(void)
+{
+    const char *case_name = "short-list";
+    char base[PATH_MAX], path[PATH_MAX];
+    make_temp_root(base, sizeof(base));
+    join_or_die(path, sizeof(path), base, "entry");
+    write_file(path, "listed");
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        fatal("could not open the short-list fixture");
+
+    unsigned int expected_namespaces = 0;
+    PortableXattrs expected = {0};
+    if (metadata_xattr_namespaces_fd(fd, &expected_namespaces) != 0 ||
+        collect_xattrs(fd, &expected) != 0)
+        fatal("could not read the short-list fixture's xattrs");
+
+    flistxattr_overstate_size = 1;
+    unsigned int namespaces = ~0U;
+    check_result(metadata_xattr_namespaces_fd(fd, &namespaces) == 0 &&
+                     namespaces == expected_namespaces,
+                 case_name,
+                 "a list shorter than its reported size is read as it is");
+    PortableXattrs collected = {0};
+    check_result(collect_xattrs(fd, &collected) == 0 &&
+                     collected.count == expected.count,
+                 case_name,
+                 "portable capture reads a list shorter than its size too");
+    flistxattr_overstate_size = 0;
+
+    xattrs_free(&expected);
+    xattrs_free(&collected);
+    close(fd);
+    remove_tree(base);
+}
+
 int main(void)
 {
     // A direct sudo run must not aim restores at the invoking user's home
@@ -1781,6 +1829,7 @@ int main(void)
     test_metadata_apply_split_equivalence();
     test_foreign_ownership_gap();
     test_native_xattrs_captured();
+    test_xattr_list_shorter_than_its_size();
 #ifdef METADATA_XATTR_TEST_HOOKS
     test_metadata_apply_xattrs_symlink_race();
 #endif

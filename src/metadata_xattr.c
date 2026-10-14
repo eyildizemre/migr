@@ -142,8 +142,11 @@ static int metadata_xattr_names_read(const MetadataXattrTarget *target,
     char *names = malloc((size_t)required);
     if (names == NULL)
         return -1;
+    // The list may come back shorter than the size asked first: overlayfs
+    // reports its own hidden attributes in the size but leaves them out of
+    // the list, and an attribute may be removed in between.
     ssize_t received = metadata_xattr_list(target, names, (size_t)required);
-    if (received != required || metadata_xattr_names_valid(
+    if (received < 0 || received > required || metadata_xattr_names_valid(
                                     names, (size_t)received, out_count) != 0)
     {
         free(names);

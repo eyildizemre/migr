@@ -585,8 +585,9 @@ int collect_xattrs(int fd, PortableXattrs *out)
     char *names = malloc((size_t)length);
     if (names == NULL)
         return -1;
+    /* Shorter than asked is fine, as in metadata_xattr_names_read(). */
     ssize_t received = flistxattr(fd, names, (size_t)length);
-    if (received != length) {
+    if (received < 0 || received > length) {
         free(names);
         return -1;
     }
@@ -679,8 +680,9 @@ int collect_symlink_xattrs(const char *path, PortableXattrs *out)
     char *names = malloc((size_t)length);
     if (names == NULL)
         return -1;
+    /* Shorter than asked is fine, as in metadata_xattr_names_read(). */
     ssize_t received = llistxattr(path, names, (size_t)length);
-    if (received != length) {
+    if (received < 0 || received > length) {
         free(names);
         return -1;
     }
