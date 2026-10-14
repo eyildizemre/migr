@@ -143,7 +143,6 @@ static void test_case_probe_hooks(const char *fixture)
         .scope = MANIFEST_SCOPE_EXPLICIT,
         .roots = &root,
         .root_count = 1,
-        .nsec_exact = 1,
         .case_sensitive = 0
     };
     PortablePrescanReport report;
@@ -233,7 +232,7 @@ int main(void)
                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (data_fd < 0 ||
         sidecar_log_create_at(container_fd, &sidecar) != SIDECAR_OPEN_FRESH ||
-        portable_capture_context_init(&context, data_fd, &sidecar, 1, 1) != 0)
+        portable_capture_context_init(&context, data_fd, &sidecar, 1) != 0)
         fixture_fatal("could not initialize portable capture");
 
     PortableRootSpec root = root_spec(source_path);
@@ -241,7 +240,6 @@ int main(void)
         .scope = MANIFEST_SCOPE_EXPLICIT,
         .roots = &root,
         .root_count = 1,
-        .nsec_exact = 1,
         .case_sensitive = 1
     };
     PortablePrescanReport initial_report;

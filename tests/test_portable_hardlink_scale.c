@@ -149,7 +149,6 @@ int main(void)
         .source_uid = getuid(),
         .roots = &root,
         .root_count = 1,
-        .nsec_exact = 1,
         .case_sensitive = 1
     };
     uint64_t groups = (uint64_t)SCALE_GROUP_COUNT;

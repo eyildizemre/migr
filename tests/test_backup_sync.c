@@ -209,7 +209,6 @@ static PortableCaptureRequest portable_request(PortableRootSpec *root)
         .source_uid = getuid(),
         .roots = root,
         .root_count = 1,
-        .nsec_exact = 1,
         .case_sensitive = 1
     };
 }

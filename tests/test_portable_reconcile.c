@@ -242,8 +242,7 @@ static int prepare_fixture(const char *base, const char *label,
         .machine_id = "b3c0",
         .source_uid = getuid(),
         .roots = &fixture->root,
-        .root_count = 1,
-        .nsec_exact = 1
+        .root_count = 1
     };
     fixture->container_fd = open(fixture->container,
                                  O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -314,8 +313,7 @@ static int prepare_claim_directory_fixture(const char *base,
         .machine_id = "c7a1",
         .source_uid = getuid(),
         .roots = &fixture->root,
-        .root_count = 1,
-        .nsec_exact = 1
+        .root_count = 1
     };
     fixture->container_fd = open(fixture->container,
                                  O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -540,8 +538,7 @@ static void test_deleted_symlink(const char *base)
         .machine_id = "c3c1",
         .source_uid = getuid(),
         .roots = &root,
-        .root_count = 1,
-        .nsec_exact = 1
+        .root_count = 1
     };
     int container_fd = open(container, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (container_fd < 0)
@@ -604,8 +601,7 @@ static void test_deleted_subtree(const char *base)
         .machine_id = "b3c0",
         .source_uid = getuid(),
         .roots = &root,
-        .root_count = 1,
-        .nsec_exact = 1
+        .root_count = 1
     };
     int container_fd = open(container, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (container_fd < 0)
@@ -665,7 +661,6 @@ static void test_stale_subtree_child_before_parent(const char *base)
         .source_uid = getuid(),
         .roots = &root,
         .root_count = 1,
-        .nsec_exact = 1,
         .case_sensitive = 1
     };
     int container_fd = open(container, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -838,7 +833,6 @@ static void test_collision_claim_foreign_child(const char *base)
         .source_uid = getuid(),
         .roots = &root,
         .root_count = 1,
-        .nsec_exact = 1,
         .case_sensitive = 0
     };
     int container_fd = open(container, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -1058,8 +1052,7 @@ static void test_capture_directory_scan_failure_frees_resources(
         .machine_id = "d1e2",
         .source_uid = getuid(),
         .roots = &root,
-        .root_count = 1,
-        .nsec_exact = 1
+        .root_count = 1
     };
     int container_fd = open(container, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (container_fd < 0)
@@ -1165,7 +1158,6 @@ static void test_collision_inventory_and_foreign_child(const char *base)
         .source_uid = getuid(),
         .roots = &root,
         .root_count = 1,
-        .nsec_exact = 1,
         .case_sensitive = 0
     };
     int container_fd = open(container, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -1229,7 +1221,6 @@ static void test_tombstone_parent_scope(const char *base)
         .source_uid = getuid(),
         .roots = &root,
         .root_count = 1,
-        .nsec_exact = 1,
         .case_sensitive = 1
     };
     int container_fd = open(container, O_RDONLY | O_DIRECTORY | O_CLOEXEC);

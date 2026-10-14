@@ -204,7 +204,6 @@ static PortableCaptureRequest request_for(const PortableRootSpec *roots,
         .source_uid = getuid(),
         .roots = roots,
         .root_count = root_count,
-        .nsec_exact = 1,
         .case_sensitive = case_sensitive
     };
 }

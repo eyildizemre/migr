@@ -100,7 +100,6 @@ typedef struct {
     const PortableRootSpec *roots;
     size_t root_count;
     const struct SelectionPlan *selection_plan; /* Borrowed, optional. */
-    int nsec_exact;
     int case_sensitive;
     /* The container's payload and journal matched when this run took it
      * over: a finished backup being updated (docs/DECISIONS.md D72). A
@@ -243,7 +242,6 @@ typedef struct PortableCaptureContext {
     int data_fd;
     SidecarLog *sidecar;
     BackupCaptureReport *progress_report; /* Borrowed; NULL disables counting callbacks. */
-    int nsec_exact;
     int case_sensitive;
     int resume_mode;
     int payload_matches_journal; /* See PortableCaptureRequest. */
@@ -262,7 +260,7 @@ typedef struct PortableCaptureContext {
  */
 int portable_capture_context_init(PortableCaptureContext *context,
                                   int data_fd, SidecarLog *sidecar,
-                                  int nsec_exact, int case_sensitive);
+                                  int case_sensitive);
 
 /** Releases allocations owned by a capture context without closing handles. */
 void portable_capture_context_close(PortableCaptureContext *context);

@@ -49,7 +49,7 @@ extern int entries_equal(const SidecarEntry *current,
 extern int entry_from_stat(const char *root_id, const char *logical,
                            const char *physical_leaf,
                            const char *collision_suffix,
-                           const struct stat *st, int nsec_exact,
+                           const struct stat *st,
                            PortableXattrs *xattrs, SidecarEntry *out,
                            const SidecarBytes *symlink_target,
                            const SidecarBytes *hardlink_root_id,
@@ -235,8 +235,7 @@ static PortableCaptureRequest request_for(const PortableRootSpec *root,
         .machine_id = machine_id,
         .source_uid = getuid(),
         .roots = root,
-        .root_count = 1,
-        .nsec_exact = 1
+        .root_count = 1
     };
 }
 
@@ -1696,12 +1695,12 @@ static int prepare_hardlink_sigkill(const char *base, const char *label,
     SidecarEntry member_entry = {0};
     SidecarBytes hardlink_root_id = resume_bytes("HL");
     SidecarBytes hardlink_logical_path = resume_bytes(old_representative);
-    if (entry_from_stat("HL", "", "", "", &source_root_stat, 1,
+    if (entry_from_stat("HL", "", "", "", &source_root_stat,
                         &empty_xattrs, &root_entry, NULL, NULL, NULL) != 0 ||
         entry_from_stat("HL", old_representative, old_representative, "",
-                        &representative_stat, 1, &representative_xattrs,
+                        &representative_stat, &representative_xattrs,
                         &representative_entry, NULL, NULL, NULL) != 0 ||
-        entry_from_stat("HL", old_member, old_member, "", &member_stat, 1,
+        entry_from_stat("HL", old_member, old_member, "", &member_stat,
                         &empty_xattrs, &member_entry, NULL,
                         &hardlink_root_id, &hardlink_logical_path) != 0)
         return -1;
@@ -2819,7 +2818,7 @@ static int prepare_foreign_destination(const char *base, const char *label,
     PortableXattrs no_xattrs = {0};
     SidecarEntry root_entry = {0};
     if (stat(source_path, &root_stat) != 0 ||
-        entry_from_stat("FOREIGN", "", "", "", &root_stat, 1,
+        entry_from_stat("FOREIGN", "", "", "", &root_stat,
                         &no_xattrs, &root_entry, NULL, NULL, NULL) != 0) {
         (void)sidecar_log_close(&log);
         close(container_fd);

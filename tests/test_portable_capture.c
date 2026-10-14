@@ -52,7 +52,7 @@
 extern int entry_from_stat(const char *root_id, const char *logical,
                            const char *physical_leaf,
                            const char *collision_suffix,
-                           const struct stat *st, int nsec_exact,
+                           const struct stat *st,
                            PortableXattrs *xattrs, SidecarEntry *out,
                            const SidecarBytes *symlink_target,
                            const SidecarBytes *hardlink_root_id,
@@ -629,7 +629,6 @@ static int run_case_fixture(const char *base, const char *label,
         .scope = MANIFEST_SCOPE_EXPLICIT,
         .roots = &root,
         .root_count = 1,
-        .nsec_exact = 1,
         .case_sensitive = case_sensitive
     };
     portable_prescan_report_init(report);
@@ -668,7 +667,6 @@ static int run_case_plan_fixture(const char *base, const char *label,
         .scope = MANIFEST_SCOPE_EXPLICIT,
         .roots = &root,
         .root_count = 1,
-        .nsec_exact = 1,
         .case_sensitive = case_sensitive
     };
     portable_prescan_report_init(report);
@@ -854,7 +852,6 @@ static void test_collision_plan(const char *base)
         .scope = MANIFEST_SCOPE_EXPLICIT,
         .roots = &root,
         .root_count = 1,
-        .nsec_exact = 1,
         .case_sensitive = 0
     };
     check(portable_collision_plan_build(container_fd, &request, &direct) == 0 &&
@@ -1147,7 +1144,6 @@ static void test_mixed_prescan_violations(const char *base)
         .scope = MANIFEST_SCOPE_EXPLICIT,
         .roots = &root,
         .root_count = 1,
-        .nsec_exact = 1,
         .case_sensitive = 0
     };
     portable_prescan_report_init(&report);
@@ -1214,7 +1210,6 @@ static void test_collision_plan_suffix_length_violation(const char *base)
         .scope = MANIFEST_SCOPE_EXPLICIT,
         .roots = &root,
         .root_count = 1,
-        .nsec_exact = 1,
         .case_sensitive = 0
     };
     PortablePrescanReport report;
@@ -1495,7 +1490,6 @@ static void test_current_source_membership(const char *base)
         .scope = MANIFEST_SCOPE_EXPLICIT,
         .roots = &root,
         .root_count = 1,
-        .nsec_exact = 1,
         .case_sensitive = 1
     };
     int container_fd = open(container_path,
@@ -1567,7 +1561,6 @@ static void test_prepared_shortening_plan_authority(const char *base)
         .scope = MANIFEST_SCOPE_EXPLICIT,
         .roots = &root,
         .root_count = 1,
-        .nsec_exact = 1,
         .case_sensitive = 1
     };
     PortablePreparedCapture prepared = {0};
@@ -1784,7 +1777,6 @@ static void test_shortened_ancestor_keeps_descendant_identity(const char *base)
         .scope = MANIFEST_SCOPE_EXPLICIT,
         .roots = &root,
         .root_count = 1,
-        .nsec_exact = 1,
         .case_sensitive = 0
     };
     PortablePrescanReport report;
@@ -2049,7 +2041,6 @@ static void test_case_collision_directory_scope(const char *base)
         .scope = MANIFEST_SCOPE_EXPLICIT,
         .roots = &root,
         .root_count = 1,
-        .nsec_exact = 1,
         .case_sensitive = 0
     };
     PortablePrescanReport report;
@@ -2101,7 +2092,6 @@ static int prepare_collision_plan_capture(const char *source_path,
         .scope = MANIFEST_SCOPE_EXPLICIT,
         .roots = root,
         .root_count = 1,
-        .nsec_exact = 1,
         .case_sensitive = 0
     };
     portable_prescan_report_init(report);
@@ -2123,7 +2113,6 @@ static int capture_root_with_current_prescan(int container_fd,
         .scope = MANIFEST_SCOPE_EXPLICIT,
         .roots = root,
         .root_count = 1,
-        .nsec_exact = context->nsec_exact,
         .case_sensitive = context->case_sensitive
     };
     PortablePrescanReport report;
@@ -2305,7 +2294,6 @@ static void test_prepared_missing_member_precedes_relocation(const char *base)
         .scope = MANIFEST_SCOPE_EXPLICIT,
         .roots = &root,
         .root_count = 1,
-        .nsec_exact = 1,
         .case_sensitive = 1,
         .has_source_identity = 1,
         .machine_id = "0123456789abcdef",
@@ -2386,7 +2374,6 @@ static void test_collision_resume_unplanning(const char *base)
         .scope = MANIFEST_SCOPE_EXPLICIT,
         .roots = &root,
         .root_count = 1,
-        .nsec_exact = 1,
         .case_sensitive = 0,
         .has_source_identity = 1,
         .machine_id = "0123456789abcdef",
@@ -2470,7 +2457,6 @@ static void test_suffix_induced_shortening_relocation(const char *base)
         .scope = MANIFEST_SCOPE_EXPLICIT,
         .roots = &root,
         .root_count = 1,
-        .nsec_exact = 1,
         .case_sensitive = 1,
         .has_source_identity = 1,
         .machine_id = "0123456789abcdef",
@@ -2546,7 +2532,6 @@ static void test_ancestor_relocation_keeps_descendant_leaf(const char *base)
         .scope = MANIFEST_SCOPE_EXPLICIT,
         .roots = &root,
         .root_count = 1,
-        .nsec_exact = 1,
         .case_sensitive = 1,
         .has_source_identity = 1,
         .machine_id = "0123456789abcdef",
@@ -2622,7 +2607,6 @@ static void test_shortened_stale_source(const char *base)
         .scope = MANIFEST_SCOPE_EXPLICIT,
         .roots = &root,
         .root_count = 1,
-        .nsec_exact = 1,
         .case_sensitive = 1,
         .has_source_identity = 1,
         .machine_id = "0123456789abcdef",
@@ -2696,7 +2680,6 @@ static void test_collision_resume(const char *base)
         .scope = MANIFEST_SCOPE_EXPLICIT,
         .roots = &root,
         .root_count = 1,
-        .nsec_exact = 1,
         .case_sensitive = 1,
         .has_source_identity = 1,
         .machine_id = "0123456789abcdef",
@@ -2890,10 +2873,10 @@ static void test_collision_resume_renumbering(const char *base)
     PortableXattrs empty_xattrs = {0};
     SidecarEntry root_predecessor = {0};
     SidecarEntry predecessor = {0};
-    if (entry_from_stat("CASE", "", "", "", &root_stat, 1,
+    if (entry_from_stat("CASE", "", "", "", &root_stat,
                         &empty_xattrs, &root_predecessor, NULL, NULL,
                         NULL) != 0 ||
-        entry_from_stat("CASE", loser, winner, "", &loser_stat, 1,
+        entry_from_stat("CASE", loser, winner, "", &loser_stat,
                         &empty_xattrs, &predecessor, NULL, NULL, NULL) != 0)
         fixture_fatal("could not prepare collision predecessor");
     SidecarClaim root_claim = {
@@ -2930,7 +2913,6 @@ static void test_collision_resume_renumbering(const char *base)
         .scope = MANIFEST_SCOPE_EXPLICIT,
         .roots = &root,
         .root_count = 1,
-        .nsec_exact = 1,
         .case_sensitive = 0,
         .has_source_identity = 1,
         .machine_id = "0123456789abcdef",
@@ -3011,7 +2993,6 @@ static void test_collision_foreign_resume(const char *base)
         .scope = MANIFEST_SCOPE_EXPLICIT,
         .roots = &root,
         .root_count = 1,
-        .nsec_exact = 1,
         .case_sensitive = 1,
         .has_source_identity = 1,
         .machine_id = "0123456789abcdef",
@@ -3108,7 +3089,6 @@ static void test_case_probe(const char *base)
         .scope = MANIFEST_SCOPE_EXPLICIT,
         .roots = &root,
         .root_count = 1,
-        .nsec_exact = 1,
         .case_sensitive = 0
     };
     portable_prescan_report_init(&report);
@@ -3151,7 +3131,6 @@ static void test_case_probe(const char *base)
         .scope = MANIFEST_SCOPE_EXPLICIT,
         .roots = &failure_root,
         .root_count = 1,
-        .nsec_exact = 1,
         .case_sensitive = 0
     };
     result = portable_capture_fresh_at(container_fd, &failure_request,
@@ -3250,7 +3229,6 @@ static void test_stale_case_probe_directory_recovers(const char *base)
         .scope = MANIFEST_SCOPE_EXPLICIT,
         .roots = &root,
         .root_count = 1,
-        .nsec_exact = 1,
         .case_sensitive = 0
     };
     PortablePrescanReport report;
@@ -3286,7 +3264,7 @@ static void test_entry_helpers(const char *source)
     PortableXattrs empty_xattrs = {0};
     SidecarBytes target = bytes("../target");
     SidecarEntry entry;
-    check(entry_from_stat("LINK", "item", "item", "", &link_stat, 1,
+    check(entry_from_stat("LINK", "item", "item", "", &link_stat,
                           &empty_xattrs, &entry, &target, NULL, NULL) == 0,
           "entry_from_stat accepts a symlink target");
     check(entry.kind == SIDECAR_KIND_SYMLINK && entry.size == 0 &&
@@ -3297,17 +3275,25 @@ static void test_entry_helpers(const char *source)
 
     SidecarEntry symlink_entry = entry;
 
-    check(entry_from_stat("LINK", "item", "item", "", &link_stat, 1,
+    check(entry_from_stat("LINK", "item", "item", "", &link_stat,
                           &empty_xattrs, &entry, NULL, NULL, NULL) != 0,
           "symlink entry without a target is rejected");
     SidecarBytes empty_target = {0};
-    check(entry_from_stat("LINK", "item", "item", "", &link_stat, 1,
+    check(entry_from_stat("LINK", "item", "item", "", &link_stat,
                           &empty_xattrs, &entry, &empty_target, NULL, NULL) != 0,
           "symlink entry with an empty target is rejected");
 
+    struct stat fine_stat = regular_stat;
+    fine_stat.st_atim.tv_nsec = 123456789;
+    fine_stat.st_mtim.tv_nsec = 987654321;
+    check(entry_from_stat("REG", "item", "item", "", &fine_stat,
+                          &empty_xattrs, &entry, NULL, NULL, NULL) == 0 &&
+              entry.atime_nsec == 123456789 && entry.mtime_nsec == 987654321,
+          "entry_from_stat records the source's nanoseconds");
+
     SidecarBytes hardlink_root = bytes("HL");
     SidecarBytes hardlink_logical = bytes("representative");
-    check(entry_from_stat("HL", "alias", "alias", "", &regular_stat, 1,
+    check(entry_from_stat("HL", "alias", "alias", "", &regular_stat,
                           &empty_xattrs, &entry, NULL, &hardlink_root,
                           &hardlink_logical) == 0 &&
               entry.kind == SIDECAR_KIND_HARDLINK && entry.size == 0 &&
@@ -3320,17 +3306,17 @@ static void test_entry_helpers(const char *source)
     SidecarXattr xattr_item = {0};
     one_xattr.items = &xattr_item;
     one_xattr.count = 1;
-    check(entry_from_stat("HL", "alias", "alias", "", &regular_stat, 1,
+    check(entry_from_stat("HL", "alias", "alias", "", &regular_stat,
                           &one_xattr, &entry, NULL, &hardlink_root,
                           &hardlink_logical) != 0,
           "a HARDLINK record with non-empty xattrs is rejected");
-    check(entry_from_stat("HL", "alias", "alias", "", &regular_stat, 1,
+    check(entry_from_stat("HL", "alias", "alias", "", &regular_stat,
                           &empty_xattrs, &entry, NULL, &hardlink_root,
                           NULL) != 0,
           "a HARDLINK record with one missing reference is rejected");
     unsigned char nul_reference[] = {'H', 'L', '\0', 'x'};
     SidecarBytes nul_root = {nul_reference, sizeof(nul_reference)};
-    check(entry_from_stat("HL", "alias", "alias", "", &regular_stat, 1,
+    check(entry_from_stat("HL", "alias", "alias", "", &regular_stat,
                           &empty_xattrs, &entry, NULL, &nul_root,
                           &hardlink_logical) != 0,
           "a HARDLINK reference containing NUL is rejected");
@@ -3480,8 +3466,7 @@ static void test_encoded_payload_names(const char *base)
     PortableCaptureRequest request = {
         .scope = MANIFEST_SCOPE_EXPLICIT,
         .roots = &root,
-        .root_count = 1,
-        .nsec_exact = 1
+        .root_count = 1
     };
     PortablePrescanReport report;
     portable_prescan_report_init(&report);
@@ -3558,8 +3543,7 @@ static void test_nested_encoded_directories(const char *base)
     PortableCaptureRequest request = {
         .scope = MANIFEST_SCOPE_EXPLICIT,
         .roots = &root,
-        .root_count = 1,
-        .nsec_exact = 1
+        .root_count = 1
     };
     check(portable_capture_fresh_at(container_fd, &request, NULL) == 0,
           "nested encoded directories capture successfully");
@@ -3636,8 +3620,7 @@ static void test_name_and_path_limits(const char *base)
     PortableCaptureRequest request = {
         .scope = MANIFEST_SCOPE_EXPLICIT,
         .roots = &root,
-        .root_count = 1,
-        .nsec_exact = 1
+        .root_count = 1
     };
     PortablePrescanReport report;
     portable_prescan_report_init(&report);
@@ -3819,7 +3802,6 @@ static void test_root_payload_namespace(const char *base)
         .scope = MANIFEST_SCOPE_EXPLICIT,
         .roots = roots,
         .root_count = 2,
-        .nsec_exact = 1,
         .case_sensitive = 1
     };
     PortablePrescanReport report;
@@ -4006,8 +3988,7 @@ static void test_root_probe_close_failure_does_not_double_close(
     PortableCaptureRequest request = {
         .scope = MANIFEST_SCOPE_EXPLICIT,
         .roots = roots,
-        .root_count = 2,
-        .nsec_exact = 1
+        .root_count = 2
     };
 
     int container_fd = open(container_path,
@@ -4070,8 +4051,7 @@ static void test_prescan_multiple_roots(const char *base)
     PortableCaptureRequest request = {
         .scope = MANIFEST_SCOPE_EXPLICIT,
         .roots = roots,
-        .root_count = 2,
-        .nsec_exact = 1
+        .root_count = 2
     };
     PortablePrescanReport report;
     portable_prescan_report_init(&report);
@@ -4409,7 +4389,7 @@ static int create_live_capture(const char *container_path, int *container_fd,
     int data_fd = openat(*container_fd, "data",
                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (data_fd < 0 ||
-        portable_capture_context_init(context, data_fd, log, 1, 1) != 0)
+        portable_capture_context_init(context, data_fd, log, 1) != 0)
         return -1;
     return 0;
 }
@@ -4434,7 +4414,7 @@ static void test_capture_context_flags(const char *base)
 
     int data_fd = context.data_fd;
     portable_capture_context_close(&context);
-    check(portable_capture_context_init(&context, data_fd, &log, 1, 0) == 0,
+    check(portable_capture_context_init(&context, data_fd, &log, 0) == 0,
           "capture context accepts a case-insensitive verdict");
     check(context.case_sensitive == 0,
           "capture context preserves a case-insensitive verdict");
@@ -4500,8 +4480,7 @@ static void test_fresh_capture(const char *source, int container_fd,
         .scope = MANIFEST_SCOPE_EXPLICIT,
         .has_source_identity = 0,
         .roots = &root,
-        .root_count = 1,
-        .nsec_exact = 1
+        .root_count = 1
     };
     check(portable_capture_fresh_at(container_fd, &request, NULL) == 0,
           "fresh portable capture succeeds");
@@ -4623,7 +4602,6 @@ static void test_portable_hardlinks(const char *base)
         .source_uid = getuid(),
         .roots = &root,
         .root_count = 1,
-        .nsec_exact = 1,
         .case_sensitive = 1
     };
     PortablePrescanReport prescan_report;
@@ -4940,12 +4918,12 @@ static void test_portable_hardlinks_sticky_seed(const char *base)
     SidecarEntry member_entry = {0};
     SidecarBytes hardlink_root_id = bytes("HL");
     SidecarBytes hardlink_logical_path = bytes(old_representative);
-    if (entry_from_stat("HL", "", "", "", &source_root_stat, 1,
+    if (entry_from_stat("HL", "", "", "", &source_root_stat,
                         &empty_xattrs, &root_entry, NULL, NULL, NULL) != 0 ||
         entry_from_stat("HL", old_representative, old_representative, "",
-                        &representative_stat, 1, &representative_xattrs,
+                        &representative_stat, &representative_xattrs,
                         &representative_entry, NULL, NULL, NULL) != 0 ||
-        entry_from_stat("HL", old_member, old_member, "", &member_stat, 1,
+        entry_from_stat("HL", old_member, old_member, "", &member_stat,
                         &empty_xattrs, &member_entry, NULL,
                         &hardlink_root_id, &hardlink_logical_path) != 0)
         fixture_fatal("could not prepare sticky-seed sidecar entries");
@@ -5002,7 +4980,6 @@ static void test_portable_hardlinks_sticky_seed(const char *base)
         .source_uid = getuid(),
         .roots = &root,
         .root_count = 1,
-        .nsec_exact = 1,
         .case_sensitive = 1
     };
     PortablePrescanReport report;
@@ -5085,7 +5062,6 @@ static void test_portable_hardlinks_cross_root(const char *base)
         .scope = MANIFEST_SCOPE_EXPLICIT,
         .roots = roots,
         .root_count = 2,
-        .nsec_exact = 1,
         .case_sensitive = 1
     };
     PortablePrescanReport prescan_report;
@@ -5154,7 +5130,6 @@ static void test_portable_hardlinks_cross_root_bare_file(const char *base)
         .scope = MANIFEST_SCOPE_EXPLICIT,
         .roots = roots,
         .root_count = 2,
-        .nsec_exact = 1,
         .case_sensitive = 1
     };
     check(portable_capture_fresh_at(container_fd, &request, NULL) == 0,
@@ -5216,7 +5191,6 @@ static void test_portable_hardlinks_collision(const char *base)
         .scope = MANIFEST_SCOPE_EXPLICIT,
         .roots = &root,
         .root_count = 1,
-        .nsec_exact = 1,
         .case_sensitive = 0
     };
     check(portable_capture_fresh_at(container_fd, &request, NULL) == 0,
@@ -5539,8 +5513,7 @@ static void test_portable_special_file_non_ascii_name_in_directory(
     PortableCaptureRequest request = {
         .scope = MANIFEST_SCOPE_EXPLICIT,
         .roots = &root,
-        .root_count = 1,
-        .nsec_exact = 1
+        .root_count = 1
     };
     check(portable_capture_fresh_at(container_fd, &request, NULL) == 0,
           "non-ASCII special-file child does not abort directory capture");
@@ -5664,7 +5637,6 @@ static void test_critical_roots_first(const char *base)
         .scope = MANIFEST_SCOPE_COMPREHENSIVE,
         .roots = roots,
         .root_count = 2,
-        .nsec_exact = 1,
         .case_sensitive = 1
     };
     int container_fd = open(container, O_RDONLY | O_DIRECTORY | O_CLOEXEC);

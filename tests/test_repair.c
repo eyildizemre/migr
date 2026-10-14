@@ -212,7 +212,6 @@ static void fixture_create_with(Fixture *fixture, int case_collisions)
         .source_uid = getuid(),
         .roots = &root,
         .root_count = 1,
-        .nsec_exact = 1,
         .case_sensitive = !case_collisions
     };
     if (mkdir(fixture->container, 0700) != 0)

@@ -1934,7 +1934,7 @@ static void portable_root_specs_from_plan(const BackupPlan *plan,
 // strings are borrowed from plan or machine_id and must outlive the request.
 static int portable_capture_request_from_plan(
     const BackupPlan *plan, const char *machine_id, int has_machine_id,
-    int nsec_exact, int case_sensitive, PortableRootSpec *roots_storage,
+    int case_sensitive, PortableRootSpec *roots_storage,
     PortableCaptureRequest *out)
 {
     if (plan == NULL || out == NULL ||
@@ -1951,7 +1951,6 @@ static int portable_capture_request_from_plan(
         .source_gid = backup_source_gid(),
         .roots = plan->root_count > 0 ? roots_storage : NULL,
         .root_count = (size_t)plan->root_count,
-        .nsec_exact = nsec_exact,
         .case_sensitive = case_sensitive
     };
     return 0;
@@ -1959,12 +1958,12 @@ static int portable_capture_request_from_plan(
 
 static int portable_capture_request_for_execution(
     const BackupPlan *plan, const SelectionPlan *selection,
-    const char *machine_id, int has_machine_id, int nsec_exact,
-    int case_sensitive, PortableRootSpec *roots_storage,
+    const char *machine_id, int has_machine_id, int case_sensitive,
+    PortableRootSpec *roots_storage,
     PortableCaptureRequest *out)
 {
     if (portable_capture_request_from_plan(
-            plan, machine_id, has_machine_id, nsec_exact, case_sensitive,
+            plan, machine_id, has_machine_id, case_sensitive,
             roots_storage, out) != 0)
         return -1;
     if (selection != NULL &&
@@ -3246,7 +3245,6 @@ static int backup_dry_run(const char *target, BackupMode mode,
         PortableCaptureRequest advisory_request;
         int request_result = portable_capture_request_for_execution(
             plan, selection, advisory_machine_id, advisory_has_machine_id,
-            advisory_profile.nsec_exact,
             advisory_profile.capabilities[FS_CAP_CASE_SENSITIVE].status ==
                 FS_CAP_SUPPORTED,
             advisory_roots, &advisory_request);
@@ -3675,7 +3673,6 @@ static int backup_run(const char *target_arg, BackupMode mode,
                                              sizeof(portable_machine_id)) == 0;
         if (portable_capture_request_for_execution(
                 &plan, selection, portable_machine_id, has_machine_id,
-                profile.nsec_exact,
                 profile.capabilities[FS_CAP_CASE_SENSITIVE].status ==
                     FS_CAP_SUPPORTED,
                 portable_roots, &portable_request) != 0 ||

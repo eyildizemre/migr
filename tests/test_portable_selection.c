@@ -356,7 +356,6 @@ static PortableCaptureRequest request_for_selection(
         .has_source_identity = 1,
         .machine_id = "0123456789abcdef",
         .source_uid = getuid(),
-        .nsec_exact = 1,
         .case_sensitive = 1
     };
     REQUIRE(portable_capture_request_set_selection(
@@ -388,7 +387,6 @@ static PortableCaptureRequest direct_test_request(
         .source_uid = getuid(),
         .roots = root,
         .root_count = 1,
-        .nsec_exact = 1,
         .case_sensitive = 1
     };
 }
@@ -686,7 +684,6 @@ int main(void)
         .has_source_identity = 1,
         .machine_id = "0123456789abcdef",
         .source_uid = getuid(),
-        .nsec_exact = 1,
         .case_sensitive = 1
     };
     REQUIRE(portable_capture_request_set_selection(

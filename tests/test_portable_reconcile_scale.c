@@ -148,8 +148,7 @@ int main(void)
         .machine_id = "b3c0",
         .source_uid = getuid(),
         .roots = &root,
-        .root_count = 1,
-        .nsec_exact = 1
+        .root_count = 1
     };
     check(portable_capture_fresh_at(container_fd, &request, NULL) == 0,
           "50,000-entry fixture captures successfully");

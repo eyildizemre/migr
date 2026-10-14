@@ -766,7 +766,7 @@ static int time_to_i64(time_t value, int64_t *out)
 
 int entry_from_stat(const char *root_id, const char *logical,
                     const char *physical_leaf, const char *collision_suffix,
-                    const struct stat *st, int nsec_exact,
+                    const struct stat *st,
                     PortableXattrs *xattrs, SidecarEntry *out,
                     const SidecarBytes *symlink_target,
                     const SidecarBytes *hardlink_root_id,
@@ -827,8 +827,8 @@ int entry_from_stat(const char *root_id, const char *logical,
     out->gid = (uint32_t)st->st_gid;
     out->atime_sec = atime_sec;
     out->mtime_sec = mtime_sec;
-    out->atime_nsec = nsec_exact ? (uint32_t)st->st_atim.tv_nsec : 0;
-    out->mtime_nsec = nsec_exact ? (uint32_t)st->st_mtim.tv_nsec : 0;
+    out->atime_nsec = (uint32_t)st->st_atim.tv_nsec;
+    out->mtime_nsec = (uint32_t)st->st_mtim.tv_nsec;
     out->size = out->kind == SIDECAR_KIND_HARDLINK
                     ? 0U
                     : ((S_ISREG(st->st_mode) || S_ISDIR(st->st_mode))
@@ -2773,9 +2773,8 @@ static int capture_directory(PortableCaptureContext *context,
 
     SidecarEntry sidecar_entry;
     if (entry_from_stat(root->id, logical, physical_leaf, collision_suffix,
-                        before,
-                        context->nsec_exact,
-                        xattrs, &sidecar_entry, NULL, NULL, NULL) != 0 ||
+                        before, xattrs, &sidecar_entry, NULL, NULL,
+                        NULL) != 0 ||
         append_group(context, &sidecar_entry, xattrs) != 0) {
         portable_capture_context_failure_record(
             context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
@@ -2956,10 +2955,8 @@ static int capture_regular(PortableCaptureContext *context,
 
     SidecarEntry sidecar_entry;
     failed = entry_from_stat(root->id, logical, physical_leaf,
-                             collision_suffix,
-                             &captured,
-                             context->nsec_exact,
-                             xattrs, &sidecar_entry, NULL, NULL, NULL) != 0;
+                             collision_suffix, &captured, xattrs,
+                             &sidecar_entry, NULL, NULL, NULL) != 0;
     if (!failed) {
         sidecar_entry.content_digest = content_digest;
         failed = append_group(context, &sidecar_entry, xattrs) != 0;
@@ -3128,9 +3125,8 @@ static int capture_symlink(PortableCaptureContext *context,
     };
     SidecarEntry entry;
     if (entry_from_stat(root->id, logical, physical_leaf, collision_suffix,
-                        before,
-                        context->nsec_exact,
-                        &xattrs, &entry, &target_bytes, NULL, NULL) != 0) {
+                        before, &xattrs, &entry, &target_bytes, NULL,
+                        NULL) != 0) {
         xattrs_free(&xattrs);
         return -1;
     }
@@ -3257,8 +3253,7 @@ static int capture_hardlink(PortableCaptureContext *context,
     SidecarEntry entry;
     PortableXattrs empty_xattrs = {0};
     if (entry_from_stat(root->id, logical, physical_leaf, collision_suffix,
-                        before,
-                        context->nsec_exact, &empty_xattrs, &entry, NULL,
+                        before, &empty_xattrs, &entry, NULL,
                         &hardlink_root_id, &hardlink_logical_path) != 0) {
         close(source_fd);
         return -1;
@@ -3612,8 +3607,7 @@ static int capture_node(PortableCaptureContext *context,
         if (live == 1) {
             SidecarEntry current;
             int built = entry_from_stat(root->id, logical, physical_leaf,
-                                        collision_suffix, &before,
-                                        context->nsec_exact, &xattrs,
+                                        collision_suffix, &before, &xattrs,
                                         &current, NULL, NULL, NULL) == 0;
             int matches = built && entries_equal(&current, &previous, &xattrs);
             int same_content = built && !matches && previous.entry != NULL &&
@@ -4120,7 +4114,7 @@ static int fresh_namespace_is_empty(int container_fd)
 
 int portable_capture_context_init(PortableCaptureContext *context,
                                   int data_fd, SidecarLog *sidecar,
-                                  int nsec_exact, int case_sensitive)
+                                  int case_sensitive)
 {
     if (context == NULL || data_fd < 0 || sidecar == NULL ||
         sidecar->implementation == NULL)
@@ -4153,7 +4147,6 @@ int portable_capture_context_init(PortableCaptureContext *context,
     }
     context->data_fd = data_fd;
     context->sidecar = sidecar;
-    context->nsec_exact = nsec_exact != 0;
     context->case_sensitive = case_sensitive != 0;
     visited->hash_salt = sidecar_process_salt();
     inode_map->hash_salt = sidecar_process_salt();
@@ -4339,7 +4332,6 @@ int portable_capture_fresh_prepared_at(
     sidecar_ready = 1;
 
     int failed = portable_capture_context_init(&context, data_fd, &sidecar,
-                                               request->nsec_exact,
                                                request->case_sensitive) != 0;
     if (failed)
         portable_capture_failure_record(
@@ -4567,7 +4559,6 @@ int portable_capture_resume_prepared_at(
     }
 
     if (!failed && portable_capture_context_init(&context, data_fd, &sidecar,
-                                                request->nsec_exact,
                                                 request->case_sensitive) != 0) {
         portable_capture_failure_record(
             progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,

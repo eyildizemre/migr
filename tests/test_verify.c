@@ -164,7 +164,6 @@ static void fixture_create(Fixture *fixture)
         .source_uid = getuid(),
         .roots = &root,
         .root_count = 1,
-        .nsec_exact = 1,
         .case_sensitive = 1
     };
     if (mkdir(fixture->container, 0700) != 0)

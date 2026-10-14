@@ -41,7 +41,7 @@
 extern int entry_from_stat(const char *root_id, const char *logical,
                            const char *physical,
                            const char *collision_suffix,
-                           const struct stat *st, int nsec_exact,
+                           const struct stat *st,
                            PortableXattrs *xattrs, SidecarEntry *out,
                            const SidecarBytes *symlink_target,
                            const SidecarBytes *hardlink_root_id,
@@ -171,7 +171,6 @@ static PortableCaptureRequest capture_request(const PortableRootSpec *root)
         .source_uid = getuid(),
         .roots = root,
         .root_count = 1,
-        .nsec_exact = 1,
         .case_sensitive = 0
     };
 }
@@ -313,7 +312,7 @@ static void rewrite_owned_predecessor(int container_fd, int source_fd)
         fixture_fatal("could not stat the collision predecessor");
     PortableXattrs empty_xattrs = {0};
     SidecarEntry predecessor = {0};
-    if (entry_from_stat("ROOT", "foo", "Foo", "", &source_stat, 1,
+    if (entry_from_stat("ROOT", "foo", "Foo", "", &source_stat,
                         &empty_xattrs, &predecessor, NULL, NULL, NULL) != 0)
         fixture_fatal("could not prepare the collision predecessor record");
 
@@ -385,7 +384,7 @@ static void rewrite_live_predecessor(int container_fd, int source_fd,
         fixture_fatal("could not stat the live collision predecessor");
     PortableXattrs empty_xattrs = {0};
     SidecarEntry predecessor = {0};
-    if (entry_from_stat("ROOT", logical, physical, "", &source_stat, 1,
+    if (entry_from_stat("ROOT", logical, physical, "", &source_stat,
                         &empty_xattrs, &predecessor, NULL, NULL, NULL) != 0)
         fixture_fatal("could not prepare the live collision predecessor");
 
