@@ -3921,6 +3921,38 @@ static RestoreNativeStatus restore_v1_metadata_inventory(
         ? result : (failed ? RESTORE_NATIVE_ERROR : RESTORE_NATIVE_OK);
 }
 
+// A line counts the items while the metadata inventory reads the backup,
+// which takes a while from a USB drive.
+typedef struct {
+    struct timespec started_at;
+    struct timespec last_redraw;
+} InventoryProgress;
+
+static void inventory_progress_render(const InventoryProgress *progress,
+                                      size_t items, int finished)
+{
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        return;
+    char elapsed[32];
+    format_duration(progress_elapsed_whole_seconds(
+                        timespec_elapsed_seconds(&progress->started_at, &now)),
+                    elapsed, sizeof(elapsed));
+    char line[128];
+    (void)snprintf(line, sizeof(line),
+                   finished ? "Checked the backup: %zu item%s in %s"
+                            : "Checking the backup: %zu item%s, elapsed %s",
+                   items, items == 1 ? "" : "s", elapsed);
+    progress_line_draw(line, sizeof(line));
+}
+
+static void inventory_progress_item(size_t items, void *context)
+{
+    InventoryProgress *progress = context;
+    if (backup_progress_should_fire(&progress->last_redraw, 0))
+        inventory_progress_render(progress, items, 0);
+}
+
 // Restores a valid native v1 manifest's root table (docs/DECISIONS.md D15,
 // D16). HOME_RELATIVE roots restore beneath home, XDG roots map to the target
 // locale, and MANUAL_NATIVE roots are reported without being auto-restored.
@@ -4436,6 +4468,13 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         ctx.left_out_count = left_out.count;
     }
 
+    InventoryProgress inventory_progress = {0};
+    if (isatty(STDOUT_FILENO) &&
+        clock_gettime(CLOCK_MONOTONIC, &inventory_progress.started_at) == 0)
+    {
+        restore_estimate.on_item = inventory_progress_item;
+        restore_estimate.on_item_context = &inventory_progress;
+    }
     RestoreNativeStatus metadata_inventory_status;
     if (mst == MANIFEST_STATUS_VALID)
         metadata_inventory_status = restore_v1_metadata_inventory(
@@ -4445,6 +4484,11 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         metadata_inventory_status = restore_legacy_metadata_inventory(
             source, source_root_fd, home, home_fd, &ctx, &metadata_profiles,
             &timestamp_anchors, &restore_estimate);
+    if (restore_estimate.on_item != NULL &&
+        metadata_inventory_status == RESTORE_NATIVE_OK)
+        inventory_progress_render(&inventory_progress, restore_estimate.items,
+                                  1);
+    progress_line_end();
     int network_config_needs_privilege =
         mst == MANIFEST_STATUS_VALID && m.has_network_config &&
         restore_network_config_would_write(source_root_fd);

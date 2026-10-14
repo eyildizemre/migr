@@ -150,12 +150,16 @@ typedef struct MetadataProfiles MetadataProfiles;
  * The estimate counts regular-file content once per source inode across all
  * restore roots, source directory sizes, and symlink target bytes. A failed
  * accounting operation is recorded in had_error so the caller can keep D27's
- * fail-open behaviour for an unmeasurable estimate.
+ * fail-open behaviour for an unmeasurable estimate. items counts the entries
+ * checked so far; on_item, when set, is called after each one.
  */
 typedef struct {
     off_t estimated_bytes;
     int had_error;
     void *seen_inodes;
+    size_t items;
+    void (*on_item)(size_t items, void *context);
+    void *on_item_context;
 } NativeRestoreEstimate;
 
 void native_restore_estimate_init(NativeRestoreEstimate *estimate);

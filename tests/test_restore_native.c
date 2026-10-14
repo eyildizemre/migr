@@ -548,6 +548,54 @@ static void test_restores_nested_files_and_directories(void)
     remove_tree(dest_root);
 }
 
+static void count_item(size_t items, void *context)
+{
+    size_t *last = context;
+    *last = items;
+}
+
+static void test_inventory_counts_items(void)
+{
+    printf(BLUE "::" NC " restore_native_metadata_inventory_at: counts every entry it checks\n");
+
+    char source_root[PATH_MAX], dest_root[PATH_MAX];
+    fresh_mkdtemp(source_root, sizeof(source_root), "restore_src");
+    fresh_mkdtemp(dest_root, sizeof(dest_root), "restore_dst");
+
+    char proj_path[PATH_MAX], sub_path[PATH_MAX];
+    join_path(proj_path, sizeof(proj_path), source_root, "proj");
+    check(mkdir(proj_path, 0755) == 0, "fixture: mkdir proj");
+    join_path(sub_path, sizeof(sub_path), proj_path, "sub");
+    check(mkdir(sub_path, 0755) == 0, "fixture: mkdir proj/sub");
+    write_file_under(source_root, "proj/sub/file.txt", "nested-content");
+
+    int source_fd = open_dir_fd(source_root);
+    int dest_fd = open_dir_fd(dest_root);
+    MetadataProfiles profiles;
+    metadata_profiles_init(&profiles);
+    NativeRestoreEstimate estimate;
+    native_restore_estimate_init(&estimate);
+    size_t last = 0;
+    estimate.on_item = count_item;
+    estimate.on_item_context = &last;
+    RestoreNativeReport report;
+
+    check(restore_native_metadata_inventory_at(&RESTORE_CTX, source_fd, "proj",
+                                               dest_fd, "proj", &profiles,
+                                               &estimate, &report) ==
+              RESTORE_NATIVE_OK,
+          "the inventory succeeds");
+    check(estimate.items == 3 && last == 3,
+          "proj, proj/sub and proj/sub/file.txt are counted and reported");
+
+    native_restore_estimate_free(&estimate);
+    metadata_profiles_free(&profiles);
+    close(source_fd);
+    close(dest_fd);
+    remove_tree(source_root);
+    remove_tree(dest_root);
+}
+
 static void test_intermediate_folder_owner(void)
 {
     printf(BLUE "::" NC " restore_native_at: a folder made on the way to the destination belongs to its parent's owner\n");
@@ -1307,6 +1355,7 @@ int main(void)
     test_rejects_lexically_invalid_relative_paths();
 
     test_restores_nested_files_and_directories();
+    test_inventory_counts_items();
     test_intermediate_folder_owner();
     test_relinks_hardlinked_payload_files();
     test_failed_hardlink_representative_is_not_recorded();

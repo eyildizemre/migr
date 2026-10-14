@@ -663,6 +663,15 @@ static void native_restore_estimate_add_bytes(NativeRestoreEstimate *estimate,
     estimate->estimated_bytes += bytes;
 }
 
+static void native_restore_estimate_item(NativeRestoreEstimate *estimate)
+{
+    if (estimate == NULL)
+        return;
+    estimate->items++;
+    if (estimate->on_item != NULL)
+        estimate->on_item(estimate->items, estimate->on_item_context);
+}
+
 static void native_restore_estimate_regular(NativeRestoreEstimate *estimate,
                                             const struct stat *st)
 {
@@ -4214,6 +4223,7 @@ static RestoreNativeStatus restore_entry_at(
     struct stat desired_st = source_st;
     if (pass == RESTORE_VALIDATE)
     {
+        native_restore_estimate_item(estimate);
         if (metadata_snapshot_record(snapshots, &source_st) != 0)
         {
             restore_report_failure(restore_report, logical_path,
