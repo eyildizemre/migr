@@ -2747,6 +2747,17 @@ static void test_collision_resume(const char *base)
     remove_tree(container_path);
 }
 
+/* Creates the colliding pair, the winner first when asked. */
+static void write_collision_pair(const char *loser_path,
+                                 const char *winner_path, int winner_first)
+{
+    if (winner_first)
+        write_file(winner_path, "new", 3);
+    write_file(loser_path, "original", 8);
+    if (!winner_first)
+        write_file(winner_path, "new", 3);
+}
+
 static void test_collision_resume_renumbering(const char *base)
 {
     printf(BLUE "::" NC " resume renumbers an owned collision predecessor\n");
@@ -2767,47 +2778,51 @@ static void test_collision_resume_renumbering(const char *base)
     };
     const char *winner = NULL;
     const char *loser = NULL;
+    int winner_created_first = 0;
     char winner_path[PATH_MAX];
     char loser_path[PATH_MAX];
     DIR *directory;
     struct dirent *first;
-    for (size_t index = 0; index < sizeof(winners) / sizeof(winners[0]);
+    for (size_t index = 0;
+         winner == NULL && index < sizeof(winners) / sizeof(winners[0]);
          index++) {
         join_path(winner_path, sizeof(winner_path), source_path,
                   winners[index]);
         join_path(loser_path, sizeof(loser_path), source_path,
                   losers[index]);
-        write_file(loser_path, "original", 8);
-        write_file(winner_path, "new", 3);
 
         /* The winner must be visited first; otherwise ordinary replacement
-         * can remove the occupied slot before the relocation pass is used. */
-        directory = opendir(source_path);
-        if (directory == NULL)
-            fixture_fatal("could not inspect collision source order");
-        first = readdir(directory);
-        while (first != NULL &&
-               (strcmp(first->d_name, ".") == 0 ||
-                strcmp(first->d_name, "..") == 0))
+         * can remove the occupied slot before the relocation pass is used.
+         * Some filesystems list newer names first and others older ones, so
+         * both creation orders are tried. */
+        for (int order = 0; winner == NULL && order < 2; order++) {
+            write_collision_pair(loser_path, winner_path, order);
+            directory = opendir(source_path);
+            if (directory == NULL)
+                fixture_fatal("could not inspect collision source order");
             first = readdir(directory);
-        int winner_first = first != NULL &&
-                           strcmp(first->d_name, winners[index]) == 0;
-        if (closedir(directory) != 0)
-            fixture_fatal("could not close collision source directory");
-        if (unlink(winner_path) != 0 || unlink(loser_path) != 0)
-            fixture_fatal("could not reset collision source fixture");
-        if (winner_first) {
-            winner = winners[index];
-            loser = losers[index];
-            break;
+            while (first != NULL &&
+                   (strcmp(first->d_name, ".") == 0 ||
+                    strcmp(first->d_name, "..") == 0))
+                first = readdir(directory);
+            int winner_first = first != NULL &&
+                               strcmp(first->d_name, winners[index]) == 0;
+            if (closedir(directory) != 0)
+                fixture_fatal("could not close collision source directory");
+            if (unlink(winner_path) != 0 || unlink(loser_path) != 0)
+                fixture_fatal("could not reset collision source fixture");
+            if (winner_first) {
+                winner = winners[index];
+                loser = losers[index];
+                winner_created_first = order;
+            }
         }
     }
     if (winner == NULL || loser == NULL)
         fixture_fatal("could not find a winner-first collision fixture");
     join_path(winner_path, sizeof(winner_path), source_path, winner);
     join_path(loser_path, sizeof(loser_path), source_path, loser);
-    write_file(loser_path, "original", 8);
-    write_file(winner_path, "new", 3);
+    write_collision_pair(loser_path, winner_path, winner_created_first);
     directory = opendir(source_path);
     if (directory == NULL)
         fixture_fatal("could not verify final collision source order");
