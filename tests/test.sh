@@ -3,8 +3,10 @@
 # Halt on any error, fail on undefined variables, and catch pipeline failures
 set -euo pipefail
 
-# This suite owns its fixture HOME even when invoked through sudo.
-unset SUDO_UID
+# This suite owns its fixture HOME even when invoked through sudo, and its
+# config under that HOME even where the caller's environment points
+# XDG_CONFIG_HOME elsewhere (CI runners do).
+unset SUDO_UID XDG_CONFIG_HOME
 # Nor does it wait for a keyboard: a question it does not answer itself, such
 # as a backup asking about an application open on this machine (D84), reads
 # end of input.
