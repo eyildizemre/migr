@@ -1801,6 +1801,13 @@ static int record_failed_network_command(char *const argv[], void *context)
     return 1;
 }
 
+static int record_failed_restart_command(char *const argv[], void *context)
+{
+    if (record_network_command(argv, context) != 0)
+        return -1;
+    return strcmp(argv[0], "systemctl") == 0 ? 1 : 0;
+}
+
 static void write_network_manifest(const char *source)
 {
     Manifest m;
@@ -4479,15 +4486,18 @@ static void test_network_config_restore_success(void)
           "non-regular network backup entries are skipped");
     check(file_content_is(reload_marker,
                           "nmcli\nconnection\nreload\n"
-                          "update-crypto-policies\n--set\nDEFAULT:SHA1\n"),
-          "reload runs nmcli connection reload once, then sets the source "
-          "crypto policy");
+                          "update-crypto-policies\n--set\nDEFAULT:SHA1\n"
+                          "systemctl\ntry-restart\nwpa_supplicant.service\n"),
+          "reload runs nmcli connection reload once, sets the source crypto "
+          "policy, then restarts wpa_supplicant so Wi-Fi uses it");
     check(strstr(output, "Restored 2 network connection files") != NULL,
           "the live restore reports the number of applied connection files");
     check(strstr(output, "Set the crypto policy to DEFAULT:SHA1, as on the "
-                         "source system (it was DEFAULT)") != NULL &&
+                         "source system (it was DEFAULT). Wi-Fi uses it from "
+                         "now on") != NULL &&
               strstr(output, "To undo: sudo update-crypto-policies --set "
-                             "DEFAULT\n") != NULL,
+                             "DEFAULT\n") != NULL &&
+              strstr(output, "could not restart wpa_supplicant") == NULL,
           "the changed crypto policy is reported with the command to undo it");
 
     remove_tree(source);
@@ -4742,7 +4752,24 @@ static void test_network_config_reload_failure_is_best_effort(void)
     check(file_content_is(reload_marker,
                           "nmcli\nconnection\nreload\n"
                           "update-crypto-policies\n--set\nDEFAULT:SHA1\n"),
-          "the failing path still receives the exact commands");
+          "the failing path still receives the exact commands, and a policy "
+          "not set restarts nothing");
+
+    restore_test_set_network_config_dest_dir("NetworkManager", dest_dir);
+    restore_test_set_network_command_hook(record_failed_restart_command,
+                                          reload_marker);
+    restore_test_set_crypto_policy_current(current_policy);
+    dry_run = 0;
+    rc = run_restore_capturing_with_input(source, "y\n", output,
+                                          sizeof(output));
+    dry_run = previous_dry_run;
+    restore_test_set_crypto_policy_current(NULL);
+    restore_test_set_network_command_hook(NULL, NULL);
+    restore_test_set_network_config_dest_dir("NetworkManager", NULL);
+    check(rc == 0 &&
+              strstr(output, "Set the crypto policy to DEFAULT:SHA1") != NULL &&
+              strstr(output, "could not restart wpa_supplicant") != NULL,
+          "a failed wpa_supplicant restart warns without failing restore");
 
     remove_tree(source);
     remove_tree(home);

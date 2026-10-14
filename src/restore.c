@@ -1052,10 +1052,26 @@ static void restore_crypto_policy(int network_fd)
     int set = run_network_command(set_argv);
     if (set == 0)
     {
+        // wpa_supplicant reads the policy when it starts, so a saved 802.1X
+        // network that needs it would not connect before a reboot.
+        // NetworkManager finds the restarted one again on D-Bus.
+        char *const restart_argv[] = {
+            "systemctl", "try-restart", "wpa_supplicant.service", NULL
+        };
+        int restarted = run_network_command(restart_argv);
         printf("  Set the crypto policy to %s, as on the source system "
-               "(it was %s). Services pick it up when they start, so "
-               "restart the computer. To undo: sudo update-crypto-policies "
-               "--set %s\n", saved, current, current);
+               "(it was %s). Wi-Fi uses it from now on, other services when "
+               "they start, so restart the computer. To undo: sudo "
+               "update-crypto-policies --set %s\n", saved, current, current);
+        if (restarted != 0)
+        {
+            char cause[128];
+            print_warning("  Warning: could not restart wpa_supplicant: %s. "
+                          "Saved Wi-Fi networks that need this policy "
+                          "connect after the restart.\n",
+                          command_failure_text(restarted, cause,
+                                               sizeof(cause)));
+        }
         return;
     }
     char cause[128];

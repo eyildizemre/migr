@@ -5056,6 +5056,15 @@ reported together with the command that undoes it.
 
 **Relationship:** Replaces D58's suggestion; D58's capture is unchanged.
 
+**Revision (2026-10-14):** After the policy is set, restore runs
+`systemctl try-restart wpa_supplicant.service`. wpa_supplicant reads the
+policy when it starts, so a saved 802.1X network that needs the new policy
+could not authenticate until the next boot, and the wait for a network (D90)
+took another saved network instead. NetworkManager finds the restarted supplicant again
+on D-Bus; `try-restart` starts nothing that was not running. A failed restart
+is a warning, and the network connects after the reboot the message already
+asks for.
+
 ## D84 — 2026-09-29 — A backup read live captures open applications' settings last
 
 **Status:** Implemented
