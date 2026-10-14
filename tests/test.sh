@@ -941,6 +941,13 @@ test_restore() {
 test_packages() {
     echo -e "${BLUE}::${NC} Phase 5: packages"
 
+    # A package build root, such as Fedora's mock, has no package manager:
+    # there is no real listing to check.
+    if ! PATH="$REAL_PATH" command -v dnf apt-mark pacman >/dev/null; then
+        echo -e "  ${BLUE}↷${NC} skipped: no package manager is installed."
+        return
+    fi
+
     local pkg_backup="$TEST_DIR/package-backup"
     mkdir -p "$pkg_backup"
     # The one phase that runs the distribution's genuine listing command: every
