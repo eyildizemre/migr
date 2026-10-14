@@ -380,7 +380,7 @@ static void test_inventory_race(uid_t uid, gid_t gid)
     check_result(result == 2, "ownership change after lstat rejects the backup");
     check_result(contains(output, "could not safely read 1 source object(s)"),
                  "the race is reported as a source-safe-read refusal");
-    check_result(contains(output, "no container was created"),
+    check_result(contains(output, "No container was created."),
                  "the refusal occurs before container reservation");
     check_result(directory_entry_count(target) == 0,
                  "the destination has no container after the refusal");
