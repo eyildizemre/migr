@@ -35,9 +35,14 @@ static int build(const char *home, BackupMode mode, const char *text, SelectionP
 static int find_root(const SelectionPlan *plan, const char *leaf)
 {
     char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s%s%s", plan->home, *leaf ? "/" : "", leaf);
+    const char *wanted = plan->home;
+    if (*leaf)
+    {
+        if (path_join(path, sizeof(path), plan->home, leaf) != 0) return -1;
+        wanted = path;
+    }
     for (size_t i = 0; i < plan->root_count; i++)
-        if (!strcmp(plan->roots[i].root.capture_path, path)) return (int)i;
+        if (!strcmp(plan->roots[i].root.capture_path, wanted)) return (int)i;
     return -1;
 }
 static int same(const SelectionPlan *a, const SelectionPlan *b)
