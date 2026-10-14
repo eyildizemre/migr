@@ -23,15 +23,24 @@ int console_restore_vt(void);
 int console_restore_hand_over(int vt, const char *source,
                               int skip_content_verification);
 
+/** How long the text screen waits for its code before giving up. */
+#define CONSOLE_CODE_SECONDS 60
+
+/**
+ * @brief Whether the last restore handed over got no code on its text screen
+ *        in time; forgets it, so the note is shown once.
+ */
+int console_restore_take_unanswered(void);
+
 /** @brief Nonzero in the service console_restore_hand_over() started. */
 int console_restore_service(void);
 
 /**
  * @brief In that service: waits for the desktop run to exit, closes the
- *        desktop, ends the invoker's remaining processes, and shows the
- *        service's console.
+ *        desktop, ends the invoker's remaining processes, shows the
+ *        service's console, and asks for a code shown only there.
  * @return 0, or -1 after an error message when the desktop could not be
- *         closed.
+ *         closed or the code was not typed in time.
  */
 int console_restore_take_over(void);
 
@@ -44,6 +53,9 @@ int console_test_graphical_session(const char *sessions_dir,
                                    const char *cgroup, uid_t uid);
 int console_test_free_vt(unsigned short in_use);
 int console_test_escape(const char *text, char *out, size_t size);
+int console_test_code_typed(int fd, const char *code, int timeout_ms);
+void console_test_set_unanswered_path(const char *path);
+void console_test_mark_unanswered(void);
 #endif
 
 #endif

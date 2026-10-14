@@ -881,11 +881,24 @@ static int restore_confirm(void *context)
     if (console_restore_service())
         return 1;
     int vt = console_restore_vt();
+    int unanswered = console_restore_take_unanswered();
     if (vt == 0)
         restore_warn_running_writers(confirmation->deferral);
     else
+    {
+        if (unanswered)
+            printf("The last restore did not start: the code on the text "
+                   "screen was not typed in %d seconds. If you missed it, "
+                   "answer y to try again. If that screen stayed black, "
+                   "answer N, log out, press Ctrl+Alt+F3, log in there, and "
+                   "run the same command: the restore then runs on that "
+                   "screen.\n\n", CONSOLE_CODE_SECONDS);
         printf("The restore runs on a text screen with the desktop closed; "
-               "the login screen comes back when it ends.\n");
+               "the login screen comes back when it ends. To start it, type "
+               "the code that screen shows. If the screen stays black, the "
+               "login screen comes back after %d seconds and nothing is "
+               "changed.\n", CONSOLE_CODE_SECONDS);
+    }
     if (!confirm_action(
             "This will restore files to your home directory. Continue?"))
         return 0;

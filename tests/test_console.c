@@ -155,11 +155,76 @@ static void test_escape(void)
           "a path that does not fit is refused");
 }
 
+// A pipe whose read end holds input, closed for writing when close_it.
+static int input_pipe(const char *input, int close_it, int *writer)
+{
+    int fds[2];
+    if (pipe(fds) != 0)
+        fixture_fatal("fixture: pipe");
+    size_t length = strlen(input);
+    if (write(fds[1], input, length) != (ssize_t)length)
+        fixture_fatal("fixture: write pipe");
+    if (close_it)
+        close(fds[1]);
+    else
+        *writer = fds[1];
+    return fds[0];
+}
+
+static void test_code(void)
+{
+    printf(BLUE "::" NC " the text screen starts only on the code it shows\n");
+    int writer = -1;
+    int fd = input_pipe("472\n", 1, NULL);
+    check(console_test_code_typed(fd, "472", 1000) == 1,
+          "the code shown starts the restore");
+    close(fd);
+
+    fd = input_pipe("\n\n123\n 472 \n", 1, NULL);
+    check(console_test_code_typed(fd, "472", 1000) == 1,
+          "empty lines and a wrong code ask again; spaces around it count");
+    close(fd);
+
+    fd = input_pipe("\n", 0, &writer);
+    check(console_test_code_typed(fd, "472", 200) == 0,
+          "Enter alone, or nothing, until the time runs out does not start it");
+    close(writer);
+    close(fd);
+
+    fd = input_pipe("47", 1, NULL);
+    check(console_test_code_typed(fd, "472", 1000) == 0,
+          "the end of input without the code does not start it");
+    close(fd);
+}
+
+static void test_unanswered(void)
+{
+    printf(BLUE "::" NC " an unanswered text screen is noted once for the next run\n");
+    char dir[] = "/tmp/migr-unanswered-XXXXXX";
+    if (mkdtemp(dir) == NULL)
+        fixture_fatal("fixture: mkdtemp");
+    char path[512];
+    snprintf(path, sizeof(path), "%s/unanswered", dir);
+    console_test_set_unanswered_path(path);
+    check(console_restore_take_unanswered() == 0,
+          "with no earlier attempt there is nothing to say");
+    console_test_mark_unanswered();
+    check(console_restore_take_unanswered() == 1,
+          "a timed-out attempt is reported to the next run");
+    check(console_restore_take_unanswered() == 0 && access(path, F_OK) != 0,
+          "and only once");
+    console_test_set_unanswered_path(NULL);
+    if (rmdir(dir) != 0)
+        fixture_fatal("fixture: rmdir");
+}
+
 int main(void)
 {
     test_graphical_session();
     test_free_vt();
     test_escape();
+    test_code();
+    test_unanswered();
 
     if (failures == 0)
         printf(GREEN "console tests passed" NC "\n");

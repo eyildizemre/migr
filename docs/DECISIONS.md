@@ -5260,7 +5260,7 @@ journal as the added records accumulate.
 **Status:** Implemented; desktop detection revised 2026-10-04; the console
 run no longer repeats the payload scan (2026-10-04); the wait for the user's
 processes revised 2026-10-04; systemctl's notes kept off the console
-(2026-10-04)
+(2026-10-04); a code typed on the console starts the restore (2026-10-14)
 
 **Decision:** A restore started under sudo from a desktop session closes that
 desktop and restores from a system service on a virtual console, after the
@@ -5354,6 +5354,24 @@ invoker's slice to empty. A program that ignores SIGTERM outlasts that (Plasma's
 shell has a 40-second stop timeout, the user's service manager one minute), and
 the restore then started with it running. Stopping the slice leaves the bound
 to each unit's stop timeout, after which systemd kills the unit's processes.
+
+**Revision (2026-10-14):** The screen can stay black once the display manager
+stops while text still reaches the console, and nothing in the service can
+tell. After the console is shown, the service asks for a random three-digit
+code it prints there, discarding what was typed before; a wrong line asks
+again. Only someone who can read the console can type it, whereas a single key
+pressed blind as the screen goes dark would start a long restore nobody can
+watch, which invites a power-off halfway. Digits, because console keymaps move
+letters and digits are on every layout and the keypad. With no code in 60
+seconds the service restores nothing and leaves `/run/migr-console-unanswered`;
+`ExecStopPost=` brings the login screen back. The desktop question says that
+the text screen asks for its code and that a black screen comes back after 60
+seconds, without showing the code. The next run from the desktop removes the
+file and, before the question, says that the code was not typed, that y tries
+again, and, for a screen that stayed black, to log out, switch to a text
+console, log in there, and run the same command. Naming the console only after
+a handover went unanswered keeps the rejection above, which is about making it
+the way every restore runs.
 
 ## D90 — 2026-10-01 — Restore brings the network up before packages
 

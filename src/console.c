@@ -4,11 +4,13 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <linux/vt.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/random.h>
 #include <sys/sendfile.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
@@ -26,6 +28,11 @@
 #define SESSIONS_DIR "/run/systemd/sessions"
 #define BINARY_DIR "/run/migr"
 #define BINARY BINARY_DIR "/migr"
+// Left when the text screen got no code, for the next run from the desktop;
+// /run is emptied at boot.
+#define UNANSWERED "/run/migr-console-unanswered"
+
+static const char *unanswered_path = UNANSWERED;
 
 // logind starts a getty on tty1 to tty6 when one of them is switched to
 // (NAutoVTs), which would take the console from migr.
@@ -349,6 +356,19 @@ static int stdin_vt(void)
     return (int)minor(st.st_rdev);
 }
 
+int console_restore_take_unanswered(void)
+{
+    return unlink(unanswered_path) == 0;
+}
+
+static void mark_unanswered(void)
+{
+    int fd = open(unanswered_path,
+                  O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd >= 0)
+        close(fd);
+}
+
 int console_restore_service(void)
 {
     return getenv(SERVICE_ENV) != NULL && stdin_vt() != 0;
@@ -383,6 +403,50 @@ static int run_quiet(char *const argv[])
     if (status != 0)
         fputs(errors, stderr);
     return status;
+}
+
+// Whether a line holding code is read from fd within timeout_ms; any other
+// line asks again.
+static int code_typed(int fd, const char *code, int timeout_ms)
+{
+    struct timespec start, now;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    char buffer[256];
+    for (;;)
+    {
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long left = timeout_ms - ((now.tv_sec - start.tv_sec) * 1000L +
+                                  (now.tv_nsec - start.tv_nsec) / 1000000L);
+        if (left <= 0)
+            return 0;
+        struct pollfd input = { .fd = fd, .events = POLLIN };
+        int ready = poll(&input, 1, (int)left);
+        if (ready < 0 && errno == EINTR)
+            continue;
+        if (ready <= 0)
+            return 0;
+        ssize_t length = read(fd, buffer, sizeof(buffer) - 1);
+        if (length < 0 && errno == EINTR)
+            continue;
+        if (length <= 0)
+            return 0;
+        buffer[length] = '\0';
+        // A console reads a line at a time; a pipe can hold several.
+        for (char *line = buffer, *end; (end = strchr(line, '\n')) != NULL;
+             line = end + 1)
+        {
+            *end = '\0';
+            while (*line == ' ')
+                line++;
+            size_t size = strlen(line);
+            while (size > 0 && (line[size - 1] == ' ' || line[size - 1] == '\r'))
+                line[--size] = '\0';
+            if (strcmp(line, code) == 0)
+                return 1;
+            printf("That is not the code. Type %s and press Enter: ", code);
+            fflush(stdout);
+        }
+    }
 }
 
 int console_restore_take_over(void)
@@ -441,6 +505,29 @@ int console_restore_take_over(void)
         print_error("  Nothing was changed.\n");
         return -1;
     }
+
+    // A screen can stay dark once the display manager stops while text still
+    // reaches the console, and nothing here can tell. Only someone reading
+    // this screen can type the code it shows, so a key pressed blind does not
+    // start a restore nobody can watch.
+    char code[4];
+    unsigned int value;
+    if (getrandom(&value, sizeof(value), 0) != (ssize_t)sizeof(value))
+        value = (unsigned int)time(NULL) ^ (unsigned int)getpid();
+    snprintf(code, sizeof(code), "%u", 100U + value % 900U);
+    tcflush(STDIN_FILENO, TCIFLUSH);
+    printf("\nTo start the restore, type %s and press Enter. With no code in "
+           "%d seconds, the login screen comes back and nothing is changed: ",
+           code, CONSOLE_CODE_SECONDS);
+    fflush(stdout);
+    if (!code_typed(STDIN_FILENO, code, CONSOLE_CODE_SECONDS * 1000))
+    {
+        mark_unanswered();
+        print_error("\nNo code was typed in %d seconds. Nothing was "
+                    "changed.\n", CONSOLE_CODE_SECONDS);
+        return -1;
+    }
+    printf("\n");
     return 0;
 }
 
@@ -470,5 +557,20 @@ int console_test_free_vt(unsigned short in_use)
 int console_test_escape(const char *text, char *out, size_t size)
 {
     return escape_dollars(text, out, size);
+}
+
+int console_test_code_typed(int fd, const char *code, int timeout_ms)
+{
+    return code_typed(fd, code, timeout_ms);
+}
+
+void console_test_set_unanswered_path(const char *path)
+{
+    unanswered_path = path != NULL ? path : UNANSWERED;
+}
+
+void console_test_mark_unanswered(void)
+{
+    mark_unanswered();
 }
 #endif

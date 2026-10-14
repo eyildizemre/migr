@@ -310,7 +310,7 @@ Restoring from: /mnt/usb/migr-eyildizemre
 Backup taken 2026-09-27 22:48
 Estimated restore size: 8.0M
 Destination free space: 90.2G
-The restore runs on a text screen with the desktop closed; the login screen comes back when it ends.
+The restore runs on a text screen with the desktop closed; the login screen comes back when it ends. To start it, type the code that screen shows. If the screen stays black, the login screen comes back after 60 seconds and nothing is changed.
 This will restore files to your home directory. Continue? [y/N]: y
 Continuing on a text screen.
 ```
@@ -318,6 +318,8 @@ Continuing on a text screen.
 On the text screen:
 
 ```text
+To start the restore, type 472 and press Enter. With no code in 60 seconds, the login screen comes back and nothing is changed: 472
+...
 Packages
   349 of 362 are already installed; installing 13 (this may take a while)... elapsed 02:41
   362 installed, 0 skipped.
@@ -331,7 +333,9 @@ Press Enter to return to the login screen.
 ```
 
 Your first login then reads the restored settings. The login screen also comes
-back if the restore fails. Over SSH, from a text console you logged in on, or
+back if the restore fails. The code shows that the text screen can be read: a
+screen that stays black after the desktop closes takes no answer, and the next
+run from the desktop says what to do. Over SSH, from a text console you logged in on, or
 while another user is logged in to a desktop, restore runs where you started
 it.
 
