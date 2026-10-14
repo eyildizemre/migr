@@ -71,6 +71,14 @@ ssize_t __wrap_read(int fd, void *buf, size_t count)
     return n;
 }
 
+/* Under _FORTIFY_SOURCE, a read() into a buffer of known size compiles to
+ * __read_chk, which --wrap=read does not intercept. */
+ssize_t __wrap___read_chk(int fd, void *buf, size_t count, size_t buflen)
+{
+    (void)buflen;
+    return __wrap_read(fd, buf, count);
+}
+
 static void write_file(const char *path, const char *text)
 {
     FILE *f = fopen(path, "w");

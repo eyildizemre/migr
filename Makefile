@@ -179,7 +179,7 @@ $(TEST_SELECTION): tests/test_selection.c $(LIB_OBJS) src/selection.h
 	$(CC) $(CFLAGS) -o $@ $(filter %.c %.o,$^)
 
 $(TEST_CONFIG): tests/test_config.c $(LIB_OBJS) src/config.h
-	$(CC) $(CFLAGS) -Wl,--wrap=read -Wl,--wrap=waitpid -o $@ $(filter %.c %.o,$^)
+	$(CC) $(CFLAGS) -Wl,--wrap=read -Wl,--wrap=__read_chk -Wl,--wrap=waitpid -o $@ $(filter %.c %.o,$^)
 
 $(TEST_REPORT): tests/test_report.c $(call with_hooks,report_test.o)
 	$(CC) $(CFLAGS) -Wl,--wrap=readdir -o $@ $(filter %.c %.o,$^)
