@@ -1417,7 +1417,10 @@ static int run_log_name_cmp(const void *a, const void *b)
 // RUN_LOG_KEPT; the names carry their time, so they sort by it.
 static void run_log_prune(int dir_fd, const char *prefix)
 {
-    int fd = dup_cloexec(dir_fd);
+    // A fresh descriptor, not a dup: btrfs lists a directory only as far as
+    // it was when that descriptor was opened, and dir_fd predates the log
+    // just created.
+    int fd = openat(dir_fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     DIR *dir = fd >= 0 ? fdopendir(fd) : NULL;
     if (dir == NULL)
     {
