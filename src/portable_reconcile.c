@@ -419,6 +419,9 @@ static int mutate_owned_node(PortableCaptureContext *context,
             close(directory_fd);
             return -1;
         }
+        /* Rewound: through an fd opened earlier, btrfs lists only the entries
+         * that existed then, and this folder has been written since. */
+        rewinddir(directory);
         int failed = 0;
         for (;;) {
             errno = 0;
@@ -771,6 +774,9 @@ int reconcile_destination_children(PortableCaptureContext *context,
                 close(scan_fd);
             result = -1;
         } else {
+            /* Rewound: through an fd opened earlier, btrfs lists only the entries
+             * that existed then, and this folder has been written since. */
+            rewinddir(directory);
             for (;;) {
                 errno = 0;
                 struct dirent *entry = readdir(directory);

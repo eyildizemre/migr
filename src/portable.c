@@ -524,6 +524,9 @@ static int verify_pending_readback_names(int destination_fd,
         free(found);
         return -1;
     }
+    /* Rewound: through an fd opened earlier, btrfs lists only the entries
+     * that existed then, and this folder has been written since. */
+    rewinddir(directory);
     portable_readback_scan_count();
 
     int scan_error = 0;
@@ -4064,6 +4067,9 @@ static int data_namespace_is_empty(int data_fd)
             close(scan_fd);
         return -1;
     }
+    /* Rewound: through an fd opened earlier, btrfs lists only the entries
+     * that existed then, and this folder has been written since. */
+    rewinddir(directory);
     for (;;) {
         errno = 0;
         struct dirent *entry = readdir(directory);
