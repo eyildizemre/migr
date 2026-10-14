@@ -1181,8 +1181,15 @@ static void test_empty_relative_path_means_root_object_itself(void)
     int source_fd = open_dir_fd(source_root);
     int dest_fd = open_dir_fd(dest_root);
 
-    check(restore_native_at(&RESTORE_CTX, source_fd, "", dest_fd, "") == 0,
+    RestoreNativeReport report;
+    int restored = restore_native_at_report(&RESTORE_CTX, source_fd, "",
+                                            dest_fd, "", &report, NULL) == 0;
+    check(restored,
           "an empty relative address on both sides restores the root directory itself (docs/DECISIONS.md D16)");
+    if (!restored)
+        printf("    failed at '%s': %s (%s)\n", report.failed_logical_path,
+               report.failed_operation != NULL ? report.failed_operation : "?",
+               report.failure_errno != 0 ? strerror(report.failure_errno) : "no errno");
 
     char dest_inside[PATH_MAX];
     join_path(dest_inside, sizeof(dest_inside), dest_root, "inside.txt");
