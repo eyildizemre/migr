@@ -185,6 +185,15 @@ the old one is left alone. With more than one such backup, migr does not ask.
 To update a backup, give the folder that holds it, as when you took it; given
 the backup's own folder, migr stops and names the one to give.
 
+```text
+$ sudo ./migr backup /mnt/usb
+...
+/mnt/usb/migr-eyildizemre was taken on another install (last updated 2026-10-05 20:55). Update it from this system? Files that are not here will be removed from it. [y/N]:
+```
+
+A copy made with rsync, or any backup taken before a reinstall, asks this
+once; after yes, it is this installation's backup.
+
 **Interrupted and repeated backups.** While running, the backup is called
 `migr-<user>.partial`; run the same command again to continue it. Backing up
 again to the same place updates the backup in place: unchanged files are
@@ -200,7 +209,11 @@ is never mistaken for a finished backup.
 btrfs, xfs, f2fs) the backup is a plain copy of your files. On exFAT, FAT32, or
 NTFS, file names are encoded so the drive accepts them, and the true names,
 owners, permissions, times, and extended attributes are kept in a journal next
-to them. migr picks the form by testing the drive; there is no option.
+to them. migr picks the form by testing the drive; there is no option. To
+format a drive as exFAT for a backup, give it 4 KiB clusters
+(`mkfs.exfat -c 4K`): on a large partition the default is 128 KiB, every file
+takes at least one cluster, and a backup of many small files can need far
+more room than its files.
 
 **A USB flash drive you can reformat.** Format it, or a partition of it, as
 f2fs. In testing, f2fs was substantially faster than ext4 on slow flash drives,
@@ -486,6 +499,10 @@ and settings as it does elsewhere, but installs no packages. It says so at the
 end of the run: the backup's `packages.txt` lists the old system's packages,
 under that system's names, for you to install with the new one's package
 manager.
+
+migr is developed and used daily on Fedora with GNOME. Other desktops are
+covered by the same mechanism, which takes all of `~/.config`, but were tried
+only in virtual machines: KDE Plasma on Fedora, Xfce on Arch.
 
 ## Reference
 
