@@ -204,9 +204,12 @@ to them. migr picks the form by testing the drive; there is no option.
 
 **A USB flash drive you can reformat.** Format it, or a partition of it, as
 f2fs. In testing, f2fs was substantially faster than ext4 on slow flash drives,
-which write many small files very slowly under ext4. A drive that has other
-uses can keep them: give the backup a partition of its own with GNOME Disks or
-KDE Partition Manager.
+which write many small files very slowly under ext4. Before you choose it,
+make sure the distribution you restore on can read f2fs: in a test, openSUSE
+did not mount it by default. If you are not sure about yours, use ext4
+(`mkfs.ext4 -L migr` in place of `mkfs.f2fs -l migr` below). A drive that has
+other uses can keep them: give the backup a partition of its own with GNOME
+Disks or KDE Partition Manager.
 
 **Encrypting the drive.** If the drive may be lost or reach someone else, put
 the backup partition inside LUKS encryption before formatting it; migr does
@@ -477,6 +480,12 @@ read-back. `--dry-run` shows what would be restored and writes nothing.
 | Arch | `pacman` | Arch, Manjaro, EndeavourOS, Garuda |
 
 Other derivatives are recognized through `ID_LIKE` in `/etc/os-release`.
+
+On any other distribution, such as openSUSE, restore brings back your files
+and settings as it does elsewhere, but installs no packages. It says so at the
+end of the run: the backup's `packages.txt` lists the old system's packages,
+under that system's names, for you to install with the new one's package
+manager.
 
 ## Reference
 
