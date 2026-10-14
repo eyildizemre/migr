@@ -74,7 +74,7 @@ static void note_set(char *note, size_t note_size, const char *format,
 {
     if (note == NULL || note_size == 0 || note[0] != '\0')
         return;
-    char text[PATH_MAX + 64];
+    char text[PATH_MAX + 128];
     snprintf(text, sizeof(text), format, path);
     if (error != 0)
         snprintf(note, note_size, "%s: %s", text, strerror(error));

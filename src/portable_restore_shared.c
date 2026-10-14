@@ -119,7 +119,7 @@ int relative_path_valid(const char *path, int allow_empty)
 {
     if (path == NULL)
         return 0;
-    size_t length = strnlen(path, PATH_MAX + 1U);
+    size_t length = strnlen(path, PATH_MAX);
     return portable_relative_bytes_valid(path, length, allow_empty);
 }
 

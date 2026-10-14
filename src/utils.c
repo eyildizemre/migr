@@ -1389,8 +1389,11 @@ static int run_log_open_dir(int base_fd, const char *dir, uid_t uid, gid_t gid)
         }
         int next = openat(current, component,
                           O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-        if (created && next >= 0 && uid != (uid_t)-1)
-            (void)fchown(next, uid, gid);
+        if (created && next >= 0 && uid != (uid_t)-1 &&
+            fchown(next, uid, gid) != 0)
+        {
+            /* Best effort: a folder left to root still takes the log. */
+        }
         if (created && run_log.created_count < RUN_LOG_DEPTH_MAX)
         {
             size_t slot = run_log.created_count++;
@@ -1509,8 +1512,10 @@ int run_log_attach(int base_fd, const char *dir, const char *prefix,
         run_log_undo_created();
         return -1;
     }
-    if (uid != (uid_t)-1)
-        (void)fchown(fd, uid, gid);
+    if (uid != (uid_t)-1 && fchown(fd, uid, gid) != 0)
+    {
+        /* Best effort: a log left to root is still written. */
+    }
 
     // What was printed before there was a place for it goes in first.
     fflush(stdout);

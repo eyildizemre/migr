@@ -741,8 +741,10 @@ static int restore_todo_write(const char *source, const char *text,
         return -1;
     uid_t uid;
     gid_t gid;
-    if (sudo_invoker(&uid, &gid, NULL) == 1)
-        (void)fchown(fd, uid, gid);
+    if (sudo_invoker(&uid, &gid, NULL) == 1 && fchown(fd, uid, gid) != 0)
+    {
+        /* Best effort: a list left to root is still written and readable. */
+    }
     FILE *out = fdopen(fd, "w");
     if (out == NULL)
     {
