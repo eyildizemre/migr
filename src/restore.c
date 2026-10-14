@@ -2728,8 +2728,14 @@ static int native_left_out_build(int source_root_fd, const Manifest *m,
         const char *suffix = &PODMAN_STORAGE[root_length];
         if (root_length != 0 && *suffix == '/')
             suffix++;
-        snprintf(storage_rel, sizeof(storage_rel), "%s%s%s", payload,
-                 suffix[0] != '\0' ? "/" : "", suffix);
+        if (suffix[0] == '\0')
+            snprintf(storage_rel, sizeof(storage_rel), "%s", payload);
+        else if (path_join(storage_rel, sizeof(storage_rel), payload,
+                           suffix) != 0)
+        {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
         int storage_fd = openat(source_root_fd, storage_rel,
                                 O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
         if (storage_fd < 0)
