@@ -2661,9 +2661,15 @@ SidecarStatus sidecar_check_complete_readonly(int container_fd,
         *valid_bytes = 0;
     if (file_bytes != NULL)
         *file_bytes = 0;
+    // The journal may be owned by another user (a drive mounted by root, read
+    // by verify), in which case O_NOATIME is refused; reading without it is
+    // still correct.
     int fd = openat(container_fd, SIDECAR_SLOT_NAME,
                     O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOATIME |
                         O_CLOEXEC);
+    if (fd < 0 && errno == EPERM)
+        fd = openat(container_fd, SIDECAR_SLOT_NAME,
+                    O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0)
         return SIDECAR_STATUS_IO_ERROR;
 
