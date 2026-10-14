@@ -2285,12 +2285,15 @@ static void portable_capture_failure_record(
     report->failed_operation = operation;
 
     report->failed_source_path[0] = '\0';
-    if (root != NULL && root->capture_path != NULL)
+    // A path too long to hold is named by its root alone.
+    if (root != NULL && root->capture_path != NULL &&
+        (logical == NULL || logical[0] == '\0' ||
+         path_join(report->failed_source_path,
+                   sizeof(report->failed_source_path), root->capture_path,
+                   logical) != 0))
         (void)snprintf(report->failed_source_path,
-                       sizeof(report->failed_source_path), "%s%s%s",
-                       root->capture_path,
-                       logical != NULL && logical[0] != '\0' ? "/" : "",
-                       logical != NULL ? logical : "");
+                       sizeof(report->failed_source_path), "%s",
+                       root->capture_path);
 }
 
 static void portable_capture_context_failure_record(
