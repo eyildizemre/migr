@@ -969,9 +969,10 @@ test_packages() {
     local line_count
     line_count=$(wc -l < "$pkg_file")
 
-    # A query format that emits no line separators still produces a large, non-empty
-    # file — so count lines, not bytes. Any real system has more than ten packages.
-    if [ "$line_count" -ge 10 ]; then
+    # A query format that emits no line separators still produces a non-empty file,
+    # one record long — so count lines, not bytes. Even a minimal build root has more
+    # than one package installed by hand.
+    if [ "$line_count" -ge 2 ]; then
         echo -e "  ${GREEN}✓${NC} Package list has $line_count lines."
     else
         echo -e "  ${RED}✗${NC} Only $line_count line(s) — export likely collapsed into one record."
