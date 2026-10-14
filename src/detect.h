@@ -1,6 +1,8 @@
 #ifndef DETECT_H
 #define DETECT_H
 
+#include <stddef.h>
+
 typedef enum
 {
     DISTRO_UNKNOWN, /**< Unrecognized distribution or /etc/os-release not found. */
@@ -61,5 +63,21 @@ char *const *get_package_cmd(distro_t distro);
  * @return A statically allocated string such as "Debian/Ubuntu" or "Unknown".
  */
 const char* get_distro_name(distro_t distro);
+
+/**
+ * @brief Reads the system's own name (PRETTY_NAME) from an os-release file.
+ *
+ * @param os_release_path Path to an os-release-formatted file.
+ * @param out             Receives the name, without quotes; truncated to fit.
+ * @param out_size        Size of out.
+ * @return 0 on success, -1 if the file is missing or names no system.
+ */
+int detect_system_name_from(const char *os_release_path, char *out,
+                            size_t out_size);
+
+/**
+ * @brief detect_system_name_from() on the system os-release path.
+ */
+int detect_system_name(char *out, size_t out_size);
 
 #endif

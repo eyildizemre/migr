@@ -1161,6 +1161,22 @@ static void test_restore_packages_leaves_module_packages(void)
           "without the list of such packages nothing is installed");
 }
 
+static void test_restore_packages_unknown_distro(void)
+{
+    printf(BLUE "::" NC " restore_packages on a distribution it does not support\n");
+
+    PackageRunFixture runner = {0};
+    PackageRestoreCaseResult result = {0};
+    int fixture_ok = run_restore_packages_case(
+        DISTRO_UNKNOWN, "alpha\nbeta\n", &runner, NULL, &result);
+    check(fixture_ok && runner.call_count == 0U &&
+              runner.installed_query_count == 0U && result.had_error == 0,
+          "nothing is installed or queried");
+    check(fixture_ok &&
+              strstr(result.todo, "packages.txt lists the 2 packages") != NULL,
+          "the todo points to packages.txt and counts its packages");
+}
+
 static void test_restore_packages_batch_alloc_failure_is_reported(void)
 {
     printf(BLUE "::" NC " restore_packages reports an error when the batch argv allocation fails\n");
@@ -1757,6 +1773,7 @@ int main(void)
     test_restore_packages_single_pass_accounting();
     test_restore_packages_skips_what_is_installed();
     test_restore_packages_leaves_module_packages();
+    test_restore_packages_unknown_distro();
     test_restore_packages_batch_alloc_failure_is_reported();
 
     test_groups_collect();

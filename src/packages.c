@@ -1192,8 +1192,22 @@ int restore_packages(int source_root_fd, int online, FILE *todo,
 
     if (distro == DISTRO_UNKNOWN)
     {
-        print_warning("Warning: Unrecognized distro, skipping package install.\n");
+        char name[128];
+        if (detect_system_name(name, sizeof(name)) != 0)
+            snprintf(name, sizeof(name), "this distribution");
+        print_warning("Warning: migr does not install packages on %s.\n",
+                      name);
+        char **pkgs = NULL;
+        int pkg_count = 0;
+        read_package_list(pkg_file, &pkgs, &pkg_count, had_error);
         fclose(pkg_file);
+        package_free_name_list(pkgs, pkg_count);
+        if (pkg_count > 0)
+            fprintf(todo, "  Packages were not installed: the backup's "
+                          "packages.txt lists the %d package%s the old "
+                          "system had, under that system's names; install "
+                          "the ones you need with this system's package "
+                          "manager.\n", pkg_count, pkg_count == 1 ? "" : "s");
         return 0;
     }
     if (dry_run)
