@@ -4075,6 +4075,7 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         close(source_root_fd);
         return MIGR_EXIT_FAILURE;
     }
+    printf("Restoring from: %s\n", source);
     if (mst == MANIFEST_STATUS_VALID)
         print_backup_time(m.updated);
     int home_fd = open(home, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -4447,7 +4448,7 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         goto cleanup;
 
     if (dry_run)
-        printf("Dry run mode enabled. No changes will be made.\n\n");
+        printf("Dry run mode enabled. No changes will be made.\n");
     else
     {
         restore_defer_running_writers(&open_settings);
@@ -4466,7 +4467,7 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         }
     }
 
-    printf("Restoring from: %s\n\n", source);
+    printf("\n");
 
     int had_error = 0;
     size_t skipped_security_xattrs = 0;

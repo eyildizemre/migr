@@ -289,9 +289,13 @@ backed-up symlink included; a symlink where the backup has a file or folder
 is refused and named.
 
 Before writing anything, restore checks the whole backup and the destination,
-shows when the backup was taken and how much room it needs, and asks once.
-Then it restores your files, writes the network configuration, installs
-packages and Flatpak applications, and adds you back to your groups.
+shows which backup it restores, when it was taken, and how much room it
+needs, and asks once. Then it restores your files, writes the network
+configuration, installs packages and Flatpak applications, and adds you back
+to your groups.
+
+Given no SOURCE, restore and verify use the backup in the current directory,
+or the one the running migr was copied into with `--include-self`.
 
 **Run from the desktop, restore continues on a text screen.** Desktops and
 their applications keep writing their settings while you are logged in, and
@@ -302,6 +306,7 @@ your session:
 
 ```text
 $ sudo ./migr restore /mnt/usb/migr-eyildizemre
+Restoring from: /mnt/usb/migr-eyildizemre
 Backup taken 2026-09-27 22:48
 Estimated restore size: 8.0M
 Destination free space: 90.2G
@@ -476,8 +481,8 @@ Other derivatives are recognized through `ID_LIKE` in `/etc/os-release`.
 ```
 report [SCOPE]        Show backup analysis report (default when no command given)
 backup <PATH>         Create a resumable backup container under PATH
-restore <SOURCE>      Restore files and packages from a backup at SOURCE
-verify <SOURCE>       Check a backup before you wipe the old system
+restore [SOURCE]      Restore files and packages from a backup at SOURCE
+verify [SOURCE]       Check a backup before you wipe the old system
 repair <SOURCE> <PATH>
                       Rebuild a damaged portable backup as a new copy under PATH
 conf                  Edit persistent critical/comprehensive selection rules

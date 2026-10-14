@@ -297,6 +297,29 @@ void print_backup_time(time_t taken)
         printf("Backup taken %s\n", text);
 }
 
+static int directory_holds_backup(const char *dir)
+{
+    char manifest[PATH_MAX];
+    struct stat st;
+    return path_join(manifest, sizeof(manifest), dir, "manifest.txt") == 0 &&
+           lstat(manifest, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+int find_backup_source(char out[PATH_MAX])
+{
+    if (getcwd(out, PATH_MAX) != NULL && directory_holds_backup(out))
+        return 0;
+    ssize_t length = readlink("/proc/self/exe", out, PATH_MAX - 1);
+    if (length <= 0)
+        return -1;
+    out[length] = '\0';
+    char *slash = strrchr(out, '/');
+    if (slash == NULL || slash == out)
+        return -1;
+    *slash = '\0';
+    return directory_holds_backup(out) ? 0 : -1;
+}
+
 int selinux_runs(void)
 {
     return access("/sys/fs/selinux/enforce", F_OK) == 0;
@@ -1025,8 +1048,8 @@ void print_help(void)
     printf("Commands:\n");
     printf("  report [SCOPE]        Show backup analysis report (default when no command given)\n");
     printf("  backup <PATH>         Create a resumable backup container under PATH\n");
-    printf("  restore <SOURCE>      Restore files and packages from a backup at SOURCE\n");
-    printf("  verify <SOURCE>       Check a backup before you wipe the old system\n");
+    printf("  restore [SOURCE]      Restore files and packages from a backup at SOURCE\n");
+    printf("  verify [SOURCE]       Check a backup before you wipe the old system\n");
     printf("  repair <SOURCE> <PATH>\n");
     printf("                        Rebuild a damaged portable backup as a new copy under PATH\n");
     printf("  conf                  Edit persistent critical/comprehensive selection rules\n");

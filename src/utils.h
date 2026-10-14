@@ -75,6 +75,15 @@ int selinux_runs(void);
 void print_backup_time(time_t taken);
 
 /**
+ * @brief Finds the backup a restore or verify given no SOURCE means: the
+ *        current directory when it holds a backup's manifest.txt, else the
+ *        directory of the running binary, which --include-self puts in the
+ *        backup (docs/DECISIONS.md D9).
+ * @return 0 with the directory in out, -1 when neither holds a backup.
+ */
+int find_backup_source(char out[PATH_MAX]);
+
+/**
  * @brief Starts the run log of a backup or restore (docs/DECISIONS.md D79).
  *
  * From here on everything printed to stdout and stderr also goes to the

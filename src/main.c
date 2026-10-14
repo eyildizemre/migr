@@ -166,6 +166,7 @@ int main(int argc, char *argv[])
     }
 
     char *path = NULL;
+    char found_source[PATH_MAX];
     BackupMode mode = BACKUP_CRITICAL;
     static char *no_paths[] = { NULL }; // Used when no user-supplied paths are given
     char **user_paths = no_paths;
@@ -372,6 +373,8 @@ int main(int argc, char *argv[])
             }
             break;
         case ACTION_RESTORE:
+            if (path == NULL && find_backup_source(found_source) == 0)
+                path = found_source;
             if (path == NULL)
             {
                 print_error("Usage: ./migr restore <SOURCE>\n");
@@ -405,6 +408,8 @@ int main(int argc, char *argv[])
             ret = restore_with_options(path, &restore_options);
             break;
         case ACTION_VERIFY:
+            if (path == NULL && find_backup_source(found_source) == 0)
+                path = found_source;
             if (path == NULL || user_paths[0] != NULL)
             {
                 print_error("Usage: ./migr verify <SOURCE>\n");

@@ -625,6 +625,23 @@ EOF
         assert_succeeds_with "Note: the real restore needs root. Run it with sudo." \
             "$MIGR" restore "$explicit_container" --dry-run
     fi
+
+    # Without SOURCE, restore and verify use the backup they run in: the
+    # current directory, else the one the binary was copied into.
+    local migr_path in_backup_container
+    migr_path=$(realpath "$MIGR")
+    in_backup_container=$(realpath "$explicit_container")
+    assert_succeeds_with "Restoring from: $in_backup_container" \
+        bash -c 'cd "$1" && "$2" restore --dry-run' _ "$explicit_container" "$migr_path"
+    local verify_here_out
+    verify_here_out=$(cd "$explicit_container" && "$migr_path" verify 2>&1 || true)
+    assert_contains "$verify_here_out" "in $in_backup_container"
+    cp "$migr_path" "$explicit_container/migr"
+    assert_succeeds_with "Restoring from: $in_backup_container" \
+        bash -c 'cd "$1" && "$2" restore --dry-run' _ "$TEST_DIR" "$explicit_container/migr"
+    rm "$explicit_container/migr"
+    assert_fails_with "Usage: ./migr restore <SOURCE>" \
+        bash -c 'cd "$1" && "$2" restore --dry-run' _ "$TEST_DIR" "$migr_path"
     assert_succeeds_with "Commands:" "$MIGR" --help
 
     set +e
@@ -1240,7 +1257,7 @@ test_errors() {
         "$MIGR" verify "$BACKUP_DIR" --dry-run
     assert_fails_with "Error: --no-verify applies only to 'restore'." \
         "$MIGR" verify "$BACKUP_DIR" --no-verify
-    assert_succeeds_with "verify <SOURCE>" "$MIGR" --help
+    assert_succeeds_with "verify [SOURCE]" "$MIGR" --help
 
     # repair reads one backup and writes its copy under exactly one PATH
     assert_fails_with "Usage: ./migr repair <SOURCE> <PATH>" "$MIGR" repair
