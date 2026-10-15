@@ -1,0 +1,9 @@
+#!/bin/sh
+# Test stub for SELinux's relabel command.
+#
+# Where SELinux runs, restore relabels the paths it restored (D92). Whether
+# the machine running the suite has SELinux, and restorecon with it, must not
+# decide its results: a package build chroot can see the first without the
+# second. No phase checks labels, so this stands in for the real command: it
+# reads the path list restore sends on stdin and succeeds.
+cat > /dev/null
