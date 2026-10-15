@@ -1082,7 +1082,7 @@ void print_help(void)
     printf("      --max-depth=<N>\n");
     printf("                        Report directory breakdown depth (implies --verbose)\n");
     printf("      --include-self    Include a validated static migr binary in the backup\n");
-    printf("                        (requires building migr-static)\n");
+    printf("                        (uses the migr-static next to the migr binary)\n");
     printf("      --include-network-config\n");
     printf("                        Back up NetworkManager, netplan,\n");
     printf("                        systemd-networkd, wpa_supplicant, and\n");

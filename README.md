@@ -253,10 +253,11 @@ back up to it and restore from it as from any other drive.
   text. With them, a restored system connects to your saved networks before
   packages install, without you typing a password.
 - `--include-self` puts a static migr binary in the backup, so the new system
-  can run migr before building it. Build it first with `make migr-static`,
-  which needs a static C library (`glibc-static` on Fedora). FAT and exFAT
-  drives may not let it run in place; copy it to your home first
-  (`cp migr ~/migr && chmod +x ~/migr`).
+  can run migr before it is installed there. It copies the `migr-static` next
+  to the `migr` binary; when building from source, build it first with
+  `make migr-static`, which needs a static C library (`glibc-static` on
+  Fedora). FAT and exFAT drives may not let it run in place; copy it to your
+  home first (`cp migr ~/migr && chmod +x ~/migr`).
 - `--dry-run` shows what would be backed up and writes nothing.
 
 ## Checking a backup
@@ -530,7 +531,7 @@ help                  Show this help
 -s, --summary         Print only the selected report scope total
     --max-depth=<N>   Report directory breakdown depth (implies --verbose)
     --include-self    Include a validated static migr binary in the backup
-                      (requires building migr-static)
+                      (uses the migr-static next to the migr binary)
     --include-network-config
                       Back up NetworkManager, netplan,
                       systemd-networkd, wpa_supplicant, and
