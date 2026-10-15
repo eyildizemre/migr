@@ -23,6 +23,7 @@
 #include <limits.h>
 #include <pwd.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -235,6 +236,25 @@ static void join_path(char *out, size_t out_size, const char *a, const char *b)
     memcpy(out + a_len + 1, b, b_len + 1);
 }
 
+// Writes a forked restore's stdin. A restore refused before its prompt exits
+// without reading it and may close the pipe before this write, which then
+// needs no reader: EPIPE is not a failure, and SIGPIPE is held off for it.
+static void write_child_input(int fd, const char *input, size_t length)
+{
+    void (*previous)(int) = signal(SIGPIPE, SIG_IGN);
+    ssize_t written = write(fd, input, length);
+    int saved_errno = errno;
+    signal(SIGPIPE, previous);
+    if (written < 0 && saved_errno == EPIPE)
+        return;
+    if (written < 0 || (size_t)written != length)
+    {
+        errno = saved_errno;
+        perror("write");
+        exit(1);
+    }
+}
+
 // Genuinely recursive (unlike mkdir(2)): creates every missing intermediate
 // component, since fixtures below need "data/<payload>" and "data" itself is
 // never created ahead of time.
@@ -389,15 +409,7 @@ static int run_restore_capturing_with_identity(const char *source,
     close(output_pipe[1]);
     close(input_pipe[0]);
     if (input != NULL)
-    {
-        size_t input_len = strlen(input);
-        ssize_t written = write(input_pipe[1], input, input_len);
-        if (written < 0 || (size_t)written != input_len)
-        {
-            perror("write");
-            exit(1);
-        }
-    }
+        write_child_input(input_pipe[1], input, strlen(input));
     close(input_pipe[1]);
 
     size_t total = 0;
@@ -645,12 +657,7 @@ static int run_bind_mount_restore(const char *source, const char *home,
     close(output_pipe[1]);
     close(input_pipe[0]);
     const char input[] = "y\n";
-    if (write(input_pipe[1], input, sizeof(input) - 1U) !=
-        (ssize_t)(sizeof(input) - 1U))
-    {
-        perror("write");
-        exit(1);
-    }
+    write_child_input(input_pipe[1], input, sizeof(input) - 1U);
     close(input_pipe[1]);
 
     size_t total = 0;
@@ -744,12 +751,7 @@ static int run_mount_view_restore_case(
     close(output_pipe[1]);
     close(input_pipe[0]);
     const char input[] = "y\n";
-    if (write(input_pipe[1], input, sizeof(input) - 1U) !=
-        (ssize_t)(sizeof(input) - 1U))
-    {
-        perror("write");
-        exit(1);
-    }
+    write_child_input(input_pipe[1], input, sizeof(input) - 1U);
     close(input_pipe[1]);
 
     size_t total = 0;
