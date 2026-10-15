@@ -91,6 +91,23 @@ static int proc_thread_count(void)
     return count;
 }
 
+// The kernel wakes pthread_join before it drops the joined thread from
+// /proc/self/task, so a count right after a join can still list it. The suite
+// runs no thread of its own, so the count is read again until it falls to the
+// main thread alone or 50 ms pass: far longer than that window, and shorter
+// than the 250 ms a progress ticker sleeps, so a ticker left running is still
+// counted.
+static int settled_thread_count(void)
+{
+    int count = proc_thread_count();
+    for (int waited_ms = 0; count > 1 && waited_ms < 50; waited_ms++)
+    {
+        usleep(1000);
+        count = proc_thread_count();
+    }
+    return count;
+}
+
 #ifdef PACKAGES_TEST_HOOKS
 typedef struct {
     int call_count;
@@ -110,7 +127,7 @@ static int package_progress_probe(char *const argv[], void *context)
     (void)argv;
     PackageProgressProbe *probe = context;
     probe->call_count++;
-    probe->thread_count = proc_thread_count();
+    probe->thread_count = settled_thread_count();
     fixture_package_installed = 1;
     return 0;
 }
@@ -529,9 +546,9 @@ static int run_restore_forced_progress_in_process(const char *source,
         exit(1);
 
     restore_test_set_progress_force(1);
-    *threads_before = proc_thread_count();
+    *threads_before = settled_thread_count();
     int rc = restore(source);
-    *threads_after = proc_thread_count();
+    *threads_after = settled_thread_count();
     restore_test_set_progress_force(0);
 
     fflush(stdout);
