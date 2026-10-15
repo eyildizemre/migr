@@ -4,8 +4,6 @@ migr moves your home folder, packages, and desktop settings from one Linux
 installation to another, across distributions too: back up to a drive,
 reinstall, restore.
 
-It is not released yet: there are no packages, so build it from source.
-
 ## Why migr
 
 - **More than files.** Besides your folders and dotfiles, it brings back the
@@ -31,30 +29,64 @@ It is not released yet: there are no packages, so build it from source.
   From an exFAT, FAT32, or NTFS backup, restore also reads back every file it
   wrote.
 
-## Build
+## Install
+
+**Fedora** (x86_64), from COPR:
+
+```bash
+sudo dnf copr enable eyildizemre/migr
+sudo dnf install migr
+```
+
+**Debian, Ubuntu, and their derivatives** (Debian 12, Ubuntu 22.04, or
+newer): download `migr_<version>-1_amd64.deb` from the
+[releases page](https://github.com/eyildizemre/migr/releases) and install it:
+
+```bash
+sudo apt install ./migr_*_amd64.deb
+```
+
+Each of these packages also installs `migr-static`, the copy of migr that
+`--include-self` puts in the backup.
+
+**Any other distribution** (x86_64): the releases page also has a static
+binary, `migr-<version>-x86_64-static`, which runs without installing
+anything else. Install it twice, as `migr` and as `migr-static` beside it:
+
+```bash
+sudo install -m 755 migr-<version>-x86_64-static /usr/local/bin/migr
+sudo install -m 755 migr-<version>-x86_64-static /usr/local/bin/migr-static
+```
+
+**From source**, with a C compiler and `make`:
 
 ```bash
 make
+sudo make install            # /usr/local/bin/migr
+make migr-static             # optional, for --include-self: needs a static C library
+sudo make install-static     # (glibc-static on Fedora)
 ```
 
-This needs a C compiler and `make`. Run migr from the source folder as
-`./migr`. Pre-built .deb, .rpm, and AUR packages are planned.
+`sudo make install PREFIX=/usr` installs to `/usr/bin` instead. On openSUSE,
+`sudo` does not look in `/usr/local/bin`; run `sudo /usr/local/bin/migr`
+there.
 
 ## Quick start
 
 ```bash
-./migr report                                  # what a backup takes, and what it leaves out
-./migr conf                                    # optional: add or exclude paths
-sudo ./migr backup /mnt/usb                    # back up to the drive mounted at /mnt/usb
-./migr verify /mnt/usb/migr-$USER              # check the backup before wiping this system
+migr report                                  # what a backup takes, and what it leaves out
+migr conf                                    # optional: add or exclude paths
+sudo migr backup /mnt/usb                    # back up to the drive mounted at /mnt/usb
+migr verify /mnt/usb/migr-$USER              # check the backup before wiping this system
 ```
 
 Then install the new distribution, create your user with the same user name
-and password you use now (see [Restoring](#restoring)), log in, build migr,
-and plug the drive in:
+and password you use now (see [Restoring](#restoring)), log in, install migr
+(or run the copy a backup taken with `--include-self` holds), and plug the
+drive in:
 
 ```bash
-sudo ./migr restore /mnt/usb/migr-$USER
+sudo migr restore /mnt/usb/migr-$USER
 ```
 
 `report`, `verify`, and every `--dry-run` preview run without root.
@@ -76,14 +108,14 @@ sudo ./migr restore /mnt/usb/migr-$USER
 
 That is the default scope, `--critical`. `--comprehensive` adds Videos and
 Music, and takes them after everything `--critical` covers, so an
-interrupted run already holds the rest. Listing paths after the destination (`sudo ./migr backup /mnt/usb
+interrupted run already holds the rest. Listing paths after the destination (`sudo migr backup /mnt/usb
 ~/Documents ~/Projects`) backs up exactly those paths and nothing else: no
 package, Flatpak, or group lists.
 
 `migr report` shows the scope, its size, and the largest folders it leaves out:
 
 ```text
-$ ./migr report
+$ migr report
 Backup Analysis · Fedora/RHEL
 /home/eyildizemre
 
@@ -130,7 +162,7 @@ backup belongs to you: you can look at it, preview a restore from it, and
 delete it without `sudo`.
 
 ```text
-$ sudo ./migr backup /mnt/usb
+$ sudo migr backup /mnt/usb
 Estimated backup size: 8.0M
 Destination free space: 4.0G
 
@@ -186,7 +218,7 @@ To update a backup, give the folder that holds it, as when you took it; given
 the backup's own folder, migr stops and names the one to give.
 
 ```text
-$ sudo ./migr backup /mnt/usb
+$ sudo migr backup /mnt/usb
 ...
 /mnt/usb/migr-eyildizemre was taken on another install (last updated 2026-10-05 20:55). Update it from this system? Files that are not here will be removed from it. [y/N]:
 ```
@@ -254,10 +286,10 @@ back up to it and restore from it as from any other drive.
   packages install, without you typing a password.
 - `--include-self` puts a static migr binary in the backup, so the new system
   can run migr before it is installed there. It copies the `migr-static` next
-  to the `migr` binary; when building from source, build it first with
-  `make migr-static`, which needs a static C library (`glibc-static` on
-  Fedora). FAT and exFAT drives may not let it run in place; copy it to your
-  home first (`cp migr ~/migr && chmod +x ~/migr`).
+  to the `migr` binary (see [Install](#install)). FAT and exFAT drives may not
+  let it run in place; copy it to your home first
+  (`cp migr ~/migr && chmod +x ~/migr`) and give `sudo ~/migr restore` the
+  backup's path.
 - `--dry-run` shows what would be backed up and writes nothing.
 
 ## Checking a backup
@@ -266,7 +298,7 @@ Run `migr verify` before you wipe the old system. It reads every file in the
 backup and compares it, without restoring anything:
 
 ```text
-$ ./migr verify /mnt/usb/migr-eyildizemre
+$ migr verify /mnt/usb/migr-eyildizemre
 Backup taken 2026-09-27 22:48
 Verifying 31 items (8.0M) in /mnt/usb/migr-eyildizemre
   OK: Backup verified: all 31 items match what was captured
@@ -322,7 +354,7 @@ screen, checks everything again, and restores there with nothing running in
 your session:
 
 ```text
-$ sudo ./migr restore /mnt/usb/migr-eyildizemre
+$ sudo migr restore /mnt/usb/migr-eyildizemre
 Restoring from: /mnt/usb/migr-eyildizemre
 Backup taken 2026-09-27 22:48
 Estimated restore size: 8.0M
@@ -501,9 +533,11 @@ end of the run: the backup's `packages.txt` lists the old system's packages,
 under that system's names, for you to install with the new one's package
 manager.
 
-migr is developed and used daily on Fedora with GNOME. Other desktops are
-covered by the same mechanism, which takes all of `~/.config`, but were tried
-only in virtual machines: KDE Plasma on Fedora, Xfce on Arch.
+migr is developed on Fedora with GNOME, where it is tested most. Other
+desktops are covered by the same mechanism, which takes all of `~/.config`,
+but were tried only in virtual machines: KDE Plasma on Fedora, Xfce on Arch.
+Reports from other distributions and desktops are especially welcome, as
+[issues](https://github.com/eyildizemre/migr/issues).
 
 ## Reference
 
