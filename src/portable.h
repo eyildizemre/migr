@@ -1,0 +1,351 @@
+#ifndef PORTABLE_H
+#define PORTABLE_H
+
+#include <stddef.h>
+#include <stdint.h>
+#include <sys/types.h>
+
+#include "fileops.h"
+#include "hash.h"
+#include "manifest.h"
+#include "sidecar.h"
+
+struct SelectionPlan;
+struct SelectionRoot;
+struct RecopyList;
+
+typedef struct {
+    SidecarXattr *items;
+    size_t count;
+    size_t capacity;
+} PortableXattrs;
+
+void xattrs_free(PortableXattrs *xattrs);
+int collect_xattrs(int fd, PortableXattrs *out);
+int collect_symlink_xattrs(const char *path, PortableXattrs *out);
+
+/** Validates one path component represented by an explicit byte length. */
+int portable_component_valid(const char *component, size_t length);
+
+/** Validates a relative path represented by an explicit byte length. */
+int portable_relative_bytes_valid(const char *data, size_t length,
+                                  int allow_empty);
+
+/** Returns non-zero for a valid non-empty suffix and writes its numeric value. */
+int portable_collision_suffix_parse(const char *data, size_t length,
+                                    uint64_t *out_value);
+
+/** Reports whether the relative paths are equal or one contains the other. */
+int relative_paths_overlap(const char *left, const char *right);
+
+/** Reports whether path equals or descends from prefix; suffix output is optional. */
+int relative_path_prefix_match(const char *prefix, const char *path,
+                               const char **relative_out);
+
+/**
+ * Opens or creates intermediate directories below base_fd and returns the
+ * parent fd plus the final path component. An empty relative path returns a
+ * duplicate of base_fd and an empty leaf.
+ */
+int portable_open_relative_parent(int base_fd, const char *relative,
+                                  int *parent_out, char *leaf,
+                                  size_t leaf_size);
+
+/**
+ * Same as portable_open_relative_parent() for a restore: each folder it
+ * creates gets the owner and group of the folder above it.
+ */
+int portable_open_restore_parent(int base_fd, const char *relative,
+                                 int *parent_out, char *leaf,
+                                 size_t leaf_size);
+
+/** Copies a regular payload while updating optional progress and sync state. */
+int portable_copy_regular(int source_fd, int destination_fd,
+                          off_t expected_size, BackupCaptureReport *report);
+
+/** Copies a regular payload and returns an FNV-1a digest of the bytes written. */
+int portable_copy_regular_digest(
+    int source_fd, int destination_fd, off_t expected_size,
+    BackupCaptureReport *report, uint64_t *digest);
+
+/**
+ * A source root and its container address for a portable capture.
+ *
+ * capture_path is opened as an absolute source path. The other fields are
+ * copied into the fresh versioned manifest; payload_path is relative to the
+ * container's data/ directory.
+ */
+typedef struct {
+    const char *id;
+    RootPolicy policy;
+    const char *capture_path;
+    const char *payload_path;
+    const char *source_path;
+    const char *restore_path;
+    int has_restore_path;
+    const struct SelectionRoot *selection; /* Borrowed compiled ownership, optional. */
+    int comprehensive_only; /* Captured after the critical roots. */
+} PortableRootSpec;
+
+/**
+ * Inputs for portable_capture_fresh_at(). The caller owns every pointer and
+ * keeps it valid for the duration of the call.
+ */
+typedef struct {
+    ManifestScope scope;
+    int has_source_identity;
+    const char *machine_id;
+    uid_t source_uid;
+    gid_t source_gid;
+    const PortableRootSpec *roots;
+    size_t root_count;
+    const struct SelectionPlan *selection_plan; /* Borrowed, optional. */
+    int case_sensitive;
+    /* The container's payload and journal matched when this run took it
+     * over: a finished backup being updated (docs/DECISIONS.md D72). A
+     * resume then checks each root's payload only at its top, not item by
+     * item, after capture. */
+    int payload_matches_journal;
+    /* Files to copy again although their source is unchanged
+     * (docs/DECISIONS.md D107). Borrowed; NULL for none. */
+    const struct RecopyList *recopy;
+    /* Roots captured after all the others, indexed like roots; NULL for
+     * none. before_deferred, if set, runs once before the first of them
+     * (docs/DECISIONS.md D84). */
+    const unsigned char *deferred;
+    void (*before_deferred)(void *context);
+    void *before_deferred_context;
+} PortableCaptureRequest;
+
+/* Binds a compiled D34 selection to an existing request. The caller owns roots
+ * and keeps both roots and plan alive for the request's lifetime. Existing
+ * source-identity and filesystem-capability fields in request are preserved. */
+int portable_capture_request_set_selection(
+    PortableCaptureRequest *request, const struct SelectionPlan *plan,
+    PortableRootSpec *roots, size_t root_capacity);
+
+typedef enum {
+    PORTABLE_PRESCAN_NAME_TOO_LONG,
+    PORTABLE_PRESCAN_PATH_TOO_LONG,
+    PORTABLE_PRESCAN_CASE_COLLISION,
+    PORTABLE_PRESCAN_UNSUPPORTED_KIND
+} PortablePrescanViolationKind;
+
+typedef struct {
+    char root_id[MANIFEST_ID_MAX];
+    char logical_path[SIDECAR_MAX_PATH + 1U];
+    PortablePrescanViolationKind kind;
+    int resolved;
+    size_t limit;
+    size_t actual;
+    char collides_with_logical_path[SIDECAR_MAX_PATH + 1U];
+} PortablePrescanViolation;
+
+#define PORTABLE_PRESCAN_MAX_EXAMPLES 64U
+
+typedef struct {
+    char root_id[MANIFEST_ID_MAX];
+    char logical_path[SIDECAR_MAX_PATH + 1U];
+    char physical_leaf[SIDECAR_MAX_PHYSICAL_LEAF + 1U];
+    char collision_suffix[SIDECAR_MAX_COLLISION_SUFFIX + 1U];
+} PortableCollisionPlanEntry;
+
+typedef struct {
+    PortableCollisionPlanEntry *entries;
+    size_t count;
+    size_t capacity;
+    int sorted;
+} PortableCollisionPlan;
+
+typedef struct {
+    char root_id[MANIFEST_ID_MAX];
+    char *logical_path;
+} PortableCurrentSourceEntry;
+
+typedef struct {
+    PortableCurrentSourceEntry *entries;
+    size_t count;
+    size_t capacity;
+    int sorted;
+} PortableCurrentSourceSet;
+
+typedef struct {
+    size_t total_count;
+    size_t collision_count;
+    size_t shortening_count;
+    size_t unresolved_count;
+    PortablePrescanViolation *examples;
+    size_t example_count;
+    size_t example_capacity;
+    PortableCollisionPlan collision_plan;
+    PortableCurrentSourceSet current_source;
+    size_t skipped_kind_count; /* Sockets/devices are capture warnings, not violations. */
+    int operational_failure;
+    int operational_failure_errno;
+    char operational_failure_path[SIDECAR_MAX_PATH + 1U];
+    uint64_t total_size; /* Dense-copy bytes; hardlink groups count once. */
+    void *inode_seen;    /* Opaque pre-scan inode set. */
+} PortablePrescanReport;
+
+void portable_prescan_report_init(PortablePrescanReport *report);
+void portable_prescan_report_free(PortablePrescanReport *report);
+
+void portable_collision_plan_init(PortableCollisionPlan *plan);
+void portable_collision_plan_free(PortableCollisionPlan *plan);
+const PortableCollisionPlanEntry *portable_collision_plan_find(
+    const PortableCollisionPlan *plan, const char *root_id,
+    const char *logical_path);
+int portable_current_source_contains(const PortableCurrentSourceSet *set,
+                                     const char *root_id,
+                                     const char *logical_path);
+
+/* Runs the read-only pre-scan and fills the canonical collision/shortening
+ * plan without applying the capture gate. Resolved case collisions and D39
+ * physical-name shortenings remain diagnostics but are excluded from
+ * unresolved_count. */
+int portable_collision_plan_build(int container_fd,
+                                  const PortableCaptureRequest *request,
+                                  PortablePrescanReport *report);
+
+/**
+ * The pre-scan and expected manifest for one PortableCaptureRequest,
+ * computed once and consumed by the prepared capture entry points and later
+ * production container adoption (docs/DECISIONS.md D24).
+ */
+typedef struct {
+    Manifest manifest;
+    Manifest request_identity; /* Owned selection identity before annotations. */
+    PortablePrescanReport report;
+    int ready;
+} PortablePreparedCapture;
+
+/**
+ * Runs the mandatory source pre-scan and builds the exact manifest a fresh or
+ * resumed capture will use, without creating or reserving a container.
+ * scratch_fd anchors the read-only case-collision probe and may be an
+ * existing destination parent rather than a claimed container.
+ * On a pre-scan or manifest-build refusal, ready remains zero while report
+ * retains diagnostics for the caller; both are owned by out until freed.
+ */
+int portable_capture_prepare(int scratch_fd,
+                             const PortableCaptureRequest *request,
+                             PortablePreparedCapture *out);
+
+/** Releases a prepared capture and is safe on zeroed or failed objects. */
+void portable_prepared_capture_free(PortablePreparedCapture *prepared);
+
+/**
+ * State used by the direct portable capture seam. The data and sidecar
+ * handles are borrowed; portable_capture_context_close() does not close them.
+ */
+typedef struct PortableCaptureContext {
+    int data_fd;
+    SidecarLog *sidecar;
+    BackupCaptureReport *progress_report; /* Borrowed; NULL disables counting callbacks. */
+    int case_sensitive;
+    int resume_mode;
+    int payload_matches_journal; /* See PortableCaptureRequest. */
+    const struct RecopyList *recopy; /* See PortableCaptureRequest. */
+    const PortableCollisionPlan *collision_plan;
+    const PortableCurrentSourceSet *current_source;
+    void *visited;
+    void *inode_map;
+    void *active_owners;
+    void *tombstone_owners;
+} PortableCaptureContext;
+
+/**
+ * Initializes a capture context over an already-created data directory and
+ * fresh or adopted sidecar log.
+ */
+int portable_capture_context_init(PortableCaptureContext *context,
+                                  int data_fd, SidecarLog *sidecar,
+                                  int case_sensitive);
+
+/** Releases allocations owned by a capture context without closing handles. */
+void portable_capture_context_close(PortableCaptureContext *context);
+
+/** Captures one regular-file or directory root into an existing context. */
+int portable_capture_root(PortableCaptureContext *context,
+                          const PortableRootSpec *root);
+
+/**
+ * Runs the mandatory D19 source pre-scan before writing a portable v1 manifest,
+ * then creates data/ and sidecar.migr and captures all roots into a fresh
+ * container directory. The caller initializes and owns report when non-NULL;
+ * NULL requests the same refusal behaviour without diagnostics. This direct
+ * API is intentionally separate from production backup() dispatch.
+ */
+int portable_capture_fresh_at(int container_fd,
+                              const PortableCaptureRequest *request,
+                              PortablePrescanReport *report);
+
+/**
+ * Runs the mandatory D19 source pre-scan, then resumes a portable capture in
+ * an existing versioned partial container. The manifest must match request; it
+ * is never rewritten by this function. report follows the fresh-entry-point
+ * ownership rules above.
+ */
+int portable_capture_resume_at(int container_fd,
+                               const PortableCaptureRequest *request,
+                               PortablePrescanReport *report);
+
+/** Captures into a fresh container using a previously prepared plan. */
+int portable_capture_fresh_prepared_at(
+    int container_fd, const PortableCaptureRequest *request,
+    const PortablePreparedCapture *prepared, size_t *live_count,
+    BackupCaptureReport *progress_report);
+
+/** Resumes a container using a previously prepared plan. */
+int portable_capture_resume_prepared_at(
+    int container_fd, const PortableCaptureRequest *request,
+    const PortablePreparedCapture *prepared, size_t *live_count,
+    BackupCaptureReport *progress_report);
+
+typedef enum {
+    PORTABLE_TEST_INTERRUPT_NONE = 0,
+    PORTABLE_TEST_AFTER_MANIFEST,
+    PORTABLE_TEST_BEFORE_REPLACEMENT_DELETE,
+    PORTABLE_TEST_AFTER_REPLACEMENT_DELETE,
+    PORTABLE_TEST_BEFORE_PAYLOAD_REPLACE,
+    PORTABLE_TEST_AFTER_PAYLOAD_REPLACE,
+    PORTABLE_TEST_BEFORE_PAYLOAD_WRITE,
+    PORTABLE_TEST_AFTER_PAYLOAD_WRITE,
+    PORTABLE_TEST_BEFORE_PAYLOAD_CLOSE,
+    PORTABLE_TEST_AFTER_PAYLOAD_CLOSE,
+    PORTABLE_TEST_AFTER_STALE_DELETE,
+    PORTABLE_TEST_BEFORE_STALE_UNLINK,
+    PORTABLE_TEST_AFTER_STALE_UNLINK,
+    PORTABLE_TEST_BEFORE_FINAL_INVENTORY
+} PortableTestInterruptPoint;
+
+/*
+ * Unlike SidecarTestInterruptPoint, this enum stays visible in every build:
+ * portable.c calls portable_test_interrupt_if() with these constants at
+ * unconditional call sites (not wrapped in #ifdef), relying on it compiling
+ * down to a real no-op stub when PORTABLE_CAPTURE_TEST_HOOKS is off. Only the
+ * setter below is part of the D14 seam.
+ */
+#ifdef PORTABLE_CAPTURE_TEST_HOOKS
+typedef void (*PortableCaptureTestHook)(void *userdata);
+
+void portable_capture_test_set_interrupt(PortableTestInterruptPoint point);
+void portable_capture_test_set_after_payload_write_hook(
+    PortableCaptureTestHook hook, void *userdata);
+uint64_t portable_capture_test_case_fs_probe_count(void);
+void portable_capture_test_reset_case_fs_probe_count(void);
+uint64_t portable_capture_test_inode_map_probe_count(void);
+void portable_capture_test_reset_inode_map_probe_count(void);
+uint64_t portable_capture_test_prescan_inode_probe_count(void);
+void portable_capture_test_reset_prescan_inode_probe_count(void);
+uint64_t portable_capture_test_sticky_seed_lstat_count(void);
+void portable_capture_test_reset_sticky_seed_lstat_count(void);
+uint64_t portable_capture_test_relocation_scan_count(void);
+void portable_capture_test_reset_relocation_scan_count(void);
+uint64_t portable_capture_test_relocation_remove_count(void);
+void portable_test_close_remove_payload_root_parent_early(void);
+void portable_test_close_remove_payload_payload_fd_early(void);
+void portable_test_close_capture_directory_scan_fd_early(void);
+#endif
+
+#endif

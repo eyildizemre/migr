@@ -1,0 +1,101 @@
+#ifndef SELECTION_H
+#define SELECTION_H
+
+#include "backup_plan.h"
+#include "config.h"
+#include "utils.h"
+#include <stdint.h>
+
+typedef struct {
+    char **paths;
+    size_t count;
+} SelectionPaths;
+
+typedef struct SelectionRoot {
+    BackupPlanRoot root;
+    int parent; /* -1 for a top-level owner; otherwise an earlier root index. */
+    uint32_t xdg_aliases; /* Bits in xdg_keys order, including the chosen key. */
+    SelectionPaths excluded; /* Root-relative user exclusions. */
+    SelectionPaths delegated; /* Root-relative immediate child boundaries. */
+} SelectionRoot;
+
+/* D34's compiled source ownership forest. This is deliberately distinct from
+ * BackupPlan: unfiltered walkers cannot safely consume delegated/excluded roots.
+ * No config file lookup, capture or manifest mutation occurs during compilation. */
+typedef struct SelectionPlan {
+    char home[PATH_MAX];
+    ManifestScope scope;
+    SelectionRoot *roots;
+    size_t root_count;
+    SelectionPaths excludes; /* Canonical absolute rules, including missing paths. */
+    /* The user Flatpak installation had no deployed apps or runtimes, so its
+     * reconstructible repository was excluded automatically (D57). */
+    int flatpak_repo_excluded;
+} SelectionPlan;
+
+int selection_plan_build(const char *home, BackupMode mode,
+                         const Config *config, SelectionPlan *out);
+void selection_plan_free(SelectionPlan *plan);
+/* Prints the plan's scope notes (automatic exclusions) for report/backup. */
+void selection_plan_print_notes(const SelectionPlan *plan);
+
+/* A top-level HOME entry that no planned root covers and no exclusion names. */
+typedef struct {
+    char name[NAME_MAX + 1];
+    off_t size;
+    /* 0 when size is a lower bound: parts were unreadable, on another
+     * filesystem, or beyond the walk's budget. */
+    int size_known;
+} SelectionUncovered;
+
+/* Lists top-level HOME entries the plan leaves out, largest first, skipping
+ * entries that contain a planned root, excluded entries, and .cache. The
+ * caller frees *out. Returns -1 when HOME cannot be listed. */
+int selection_plan_uncovered(const SelectionPlan *plan,
+                             SelectionUncovered **out, size_t *count);
+/* Prints selection_plan_uncovered()'s result, bounded, for report/backup.
+ * Returns 1 when it printed anything. */
+int selection_plan_print_uncovered(const SelectionPlan *plan);
+/* Owns a copied root/policy table. Uses VERSION=1 for unfiltered disjoint plans.
+ * Caller supplies source identity and representation/sidecar/optional flags. */
+int selection_plan_manifest(const SelectionPlan *plan, Manifest *out);
+/* Read-only structural validation of source ownership and payload separation. */
+int selection_plan_validate(const SelectionPlan *plan);
+/* Pure component matching; rel must be canonical, with "" denoting the root.
+ * Return 1 for owned entries, 0 for pruned entries, -1 for invalid input. */
+int selection_root_owns(const SelectionRoot *root, const char *rel);
+/* Absolute source-address counterpart; no filesystem resolution. */
+int selection_source_owns(const SelectionRoot *root, const char *source);
+void selection_plan_estimate_size(const SelectionPlan *plan, off_t block_size,
+                                  off_t *total, int *had_error);
+/* backup_plan_estimate_size(), or the selection's estimate when selection is
+ * not NULL, that also keeps the first root it could not measure, and why, in
+ * failed (which may be NULL). */
+void backup_estimate_size_report(const BackupPlan *plan,
+                                 const SelectionPlan *selection,
+                                 off_t block_size, off_t *total,
+                                 int *had_error, FailedItem *failed);
+/* Inventory is read-only; the caller probes the aggregated profiles before
+ * setting metadata_preflight_done and capturing an identically adopted policy. */
+int backup_selection_inventory(const SelectionPlan *plan, int anchor_fd,
+                                int data_fd, MetadataProfiles *profiles);
+/* Owns fresh cross-root hardlink/visited maps. Reconciles only after every root
+ * succeeds. report, if supplied, must be initialized by the caller; progress
+ * and sync settings are retained across roots. data_fd must belong to a fresh or identity-matched native container. */
+BackupCaptureStatus backup_selection_capture(const CloneContext *ctx,
+                                             const SelectionPlan *plan,
+                                             int data_fd, BackupCaptureReport *report);
+/* Preserve the conservative destination containment gate, even in exclusions. */
+int selection_destination_conflicts(const SelectionPlan *plan, const char *destination);
+
+/* Shared compiler primitives; normalization preserves the final symlink object.
+ * Missing ancestors of exclusion rules remain lexical. An excluded include is
+ * returned as 1 without inspecting the excluded subtree; failures return -1. */
+int selection_normalize(const char *home, const char *raw,
+                        const SelectionPaths *excludes, int allow_missing, char out[PATH_MAX]);
+int selection_path_covers(const char *parent, const char *path);
+int selection_paths_add(SelectionPaths *paths, const char *path);
+void selection_paths_free(SelectionPaths *paths);
+void selection_paths_reduce(SelectionPaths *paths);
+
+#endif

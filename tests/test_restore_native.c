@@ -1,0 +1,1389 @@
+// Unit tests for the FD-anchored native restore core (docs/DECISIONS.md D15
+// and D16): restore_native_at(), restore_native_preflight_at(), and
+// restore_native_source_status_at(), all declared in fileops.h. The capture
+// direction has its own walker (backup_capture_at(), which anchors only its
+// destination and reads the source by pathname); it is untouched by this
+// module and is covered separately by tests/test_special_files.c.
+//
+// restore_native_at() always runs restore_native_preflight_at()'s exact
+// validation pass before mutating anything, so the two can never disagree in
+// practice; most cases below exercise both through the single entry point.
+// A few symlink-escape cases additionally call restore_native_preflight_at()
+// and restore_native_source_status_at() directly, since those are the
+// functions restore.c's own dry-run path calls without ever reaching
+// restore_native_at() at all.
+//
+// Full end-to-end restore orchestration (XDG dirs, dotfiles, browser
+// profiles, manifest-driven naming) stays in tests/test.sh, which also
+// covers the two behavior changes this core introduces: a dangling payload
+// symlink is now previewed and restored rather than silently skipped, and
+// dry-run now refuses an unsafe destination exactly like a live restore does.
+
+#define _GNU_SOURCE
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <ftw.h>
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
+#include <sys/xattr.h>
+#include <time.h>
+#include <unistd.h>
+
+#include "fileops.h"
+
+#define GREEN "\033[0;32m"
+#define RED   "\033[0;31m"
+#define BLUE  "\033[0;34m"
+#define NC    "\033[0m"
+
+static int failures = 0;
+
+static void check(int cond, const char *label)
+{
+    if (cond)
+        printf("  " GREEN "v" NC " %s\n", label);
+    else
+    {
+        printf("  " RED "x" NC " %s\n", label);
+        failures++;
+    }
+}
+
+static const CloneContext RESTORE_CTX = { .operation = CLONE_RESTORE, .representation = CLONE_NATIVE_TREE };
+
+static void fresh_mkdtemp(char *buf, size_t bufsize, const char *prefix)
+{
+    if ((size_t)snprintf(buf, bufsize, "/tmp/%s_XXXXXX", prefix) >= bufsize || mkdtemp(buf) == NULL)
+    {
+        printf(RED "fixture: could not create a temp dir for %s" NC "\n", prefix);
+        exit(1);
+    }
+}
+
+static int remove_cb(const char *path, const struct stat *sb, int typeflag, struct FTW *ftwbuf)
+{
+    (void)sb;
+    (void)typeflag;
+    (void)ftwbuf;
+    return remove(path);
+}
+
+static void remove_tree(const char *path)
+{
+    if (nftw(path, remove_cb, 16, FTW_DEPTH | FTW_PHYS) != 0)
+    {
+        printf(RED "fixture: could not clean up %s" NC "\n", path);
+        exit(1);
+    }
+}
+
+static int open_dir_fd(const char *path)
+{
+    int fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0)
+    {
+        printf(RED "fixture: could not open directory %s" NC "\n", path);
+        exit(1);
+    }
+    return fd;
+}
+
+static int fd_still_names_same_directory(int fd, const struct stat *before)
+{
+    struct stat after;
+    return fcntl(fd, F_GETFD) >= 0 &&
+           fstat(fd, &after) == 0 &&
+           after.st_dev == before->st_dev &&
+           after.st_ino == before->st_ino &&
+           S_ISDIR(after.st_mode);
+}
+
+static void write_file(const char *path, const char *content)
+{
+    FILE *f = fopen(path, "w");
+    if (f == NULL)
+    {
+        printf(RED "fixture: could not write %s" NC "\n", path);
+        exit(1);
+    }
+    fputs(content, f);
+    fclose(f);
+}
+
+// snprintf(out, sizeof(out), "%s/%s", a, b) triggers -Wformat-truncation
+// here regardless of actual runtime lengths: with every fixture buffer the
+// same PATH_MAX size, gcc's worst-case analysis can't see that a and b are
+// each far short of it. A plain length-checked concatenation sidesteps that
+// warning class entirely (it isn't a printf-family call at all) while still
+// refusing -- not silently truncating -- a genuinely oversized join.
+static void join_path(char *out, size_t out_size, const char *a, const char *b)
+{
+    size_t a_len = strlen(a);
+    size_t b_len = strlen(b);
+    if (a_len + 1 + b_len + 1 > out_size)
+    {
+        printf(RED "fixture: path too long" NC "\n");
+        exit(1);
+    }
+    memcpy(out, a, a_len);
+    out[a_len] = '/';
+    memcpy(out + a_len + 1, b, b_len + 1);
+}
+
+static void write_file_under(const char *root, const char *rel, const char *content)
+{
+    char path[PATH_MAX];
+    join_path(path, sizeof(path), root, rel);
+    write_file(path, content);
+}
+
+static void read_file(const char *path, char *buf, size_t bufsize)
+{
+    FILE *f = fopen(path, "r");
+    if (f == NULL)
+    {
+        printf(RED "fixture: could not read %s" NC "\n", path);
+        exit(1);
+    }
+    size_t n = fread(buf, 1, bufsize - 1, f);
+    buf[n] = '\0';
+    fclose(f);
+}
+
+/* ========================================================================= */
+/* Escape rejection                                                         */
+/* ========================================================================= */
+
+static void test_rejects_destination_intermediate_symlink_escape(void)
+{
+    printf(BLUE "::" NC " restore_native_at: an intermediate destination symlink escape is rejected\n");
+
+    char source_root[PATH_MAX], dest_root[PATH_MAX], outside_root[PATH_MAX];
+    fresh_mkdtemp(source_root, sizeof(source_root), "restore_src");
+    fresh_mkdtemp(dest_root, sizeof(dest_root), "restore_dst");
+    fresh_mkdtemp(outside_root, sizeof(outside_root), "restore_outside");
+
+    char sentinel_path[PATH_MAX];
+    join_path(sentinel_path, sizeof(sentinel_path), outside_root, "sentinel.txt");
+    write_file(sentinel_path, "sentinel-content");
+
+    write_file_under(source_root, "note.txt", "note-content");
+
+    char link_path[PATH_MAX];
+    join_path(link_path, sizeof(link_path), dest_root, "escape_link");
+    check(symlink(outside_root, link_path) == 0,
+          "fixture: create an intermediate destination symlink pointing outside dest_root");
+
+    int source_fd = open_dir_fd(source_root);
+    int dest_fd = open_dir_fd(dest_root);
+
+    check(restore_native_preflight_at(&RESTORE_CTX, source_fd, "note.txt",
+                                      dest_fd, "escape_link/smuggled.txt", NULL) != 0,
+          "preflight refuses the intermediate destination symlink");
+    int rc = restore_native_at(&RESTORE_CTX, source_fd, "note.txt",
+                               dest_fd, "escape_link/smuggled.txt");
+    check(rc != 0, "restoring through an intermediate destination symlink is refused");
+
+    char check_path[PATH_MAX];
+    join_path(check_path, sizeof(check_path), outside_root, "smuggled.txt");
+    struct stat st;
+    check(stat(check_path, &st) != 0, "nothing was smuggled into the symlink's real target");
+
+    char content[64];
+    read_file(sentinel_path, content, sizeof(content));
+    check(strcmp(content, "sentinel-content") == 0, "the sentinel file outside dest_root is byte-for-byte unchanged");
+
+    close(source_fd);
+    close(dest_fd);
+    remove_tree(source_root);
+    remove_tree(dest_root);
+    remove_tree(outside_root);
+}
+
+static void test_rejects_final_destination_symlink(void)
+{
+    printf(BLUE "::" NC " restore_native_at: an existing final destination symlink is rejected\n");
+
+    char source_root[PATH_MAX], dest_root[PATH_MAX], outside_root[PATH_MAX];
+    fresh_mkdtemp(source_root, sizeof(source_root), "restore_src");
+    fresh_mkdtemp(dest_root, sizeof(dest_root), "restore_dst");
+    fresh_mkdtemp(outside_root, sizeof(outside_root), "restore_outside");
+
+    char sentinel_path[PATH_MAX];
+    join_path(sentinel_path, sizeof(sentinel_path), outside_root, "secret.txt");
+    write_file(sentinel_path, "do-not-touch");
+
+    write_file_under(source_root, "note.txt", "attacker-controlled-content");
+
+    char link_path[PATH_MAX];
+    join_path(link_path, sizeof(link_path), dest_root, "note.txt");
+    check(symlink(sentinel_path, link_path) == 0, "fixture: dest leaf is a pre-existing symlink to an outside file");
+
+    int source_fd = open_dir_fd(source_root);
+    int dest_fd = open_dir_fd(dest_root);
+
+    int rc = restore_native_at(&RESTORE_CTX, source_fd, "note.txt", dest_fd, "note.txt");
+    check(rc != 0, "restoring a file onto an existing destination symlink is refused");
+
+    char content[64];
+    read_file(sentinel_path, content, sizeof(content));
+    check(strcmp(content, "do-not-touch") == 0, "the symlink's real target is byte-for-byte unchanged");
+
+    struct stat st;
+    check(lstat(link_path, &st) == 0 && S_ISLNK(st.st_mode),
+          "the destination symlink itself is left in place, never replaced");
+
+    close(source_fd);
+    close(dest_fd);
+    remove_tree(source_root);
+    remove_tree(dest_root);
+    remove_tree(outside_root);
+}
+
+static int link_target_is(const char *path, const char *expected)
+{
+    char target[PATH_MAX];
+    ssize_t length = readlink(path, target, sizeof(target));
+    return length >= 0 && (size_t)length == strlen(expected) &&
+           memcmp(target, expected, (size_t)length) == 0;
+}
+
+static void test_backup_symlink_replaces_a_destination_symlink(void)
+{
+    printf(BLUE "::" NC " restore_native_at: the backup's symlink replaces a file or symlink at its place\n");
+
+    char source_root[PATH_MAX], dest_root[PATH_MAX], outside_root[PATH_MAX];
+    fresh_mkdtemp(source_root, sizeof(source_root), "restore_src");
+    fresh_mkdtemp(dest_root, sizeof(dest_root), "restore_dst");
+    fresh_mkdtemp(outside_root, sizeof(outside_root), "restore_outside");
+    char sentinel[PATH_MAX];
+    join_path(sentinel, sizeof(sentinel), outside_root, "secret.txt");
+    write_file(sentinel, "do-not-touch");
+
+    char source_link[PATH_MAX], other[PATH_MAX], same[PATH_MAX];
+    char file[PATH_MAX], folder[PATH_MAX];
+    join_path(source_link, sizeof(source_link), source_root, "link");
+    join_path(other, sizeof(other), dest_root, "other");
+    join_path(same, sizeof(same), dest_root, "same");
+    join_path(file, sizeof(file), dest_root, "file");
+    join_path(folder, sizeof(folder), dest_root, "folder");
+    write_file(file, "fresh install");
+    check(mkdir(folder, 0755) == 0, "fixture: a folder where the link goes");
+    check(symlink("backup-target", source_link) == 0 &&
+              symlink(sentinel, other) == 0 &&
+              symlink("backup-target", same) == 0,
+          "fixture: the backup's symlink, and the new system's symlinks "
+          "with another target and with the same one");
+
+    int source_fd = open_dir_fd(source_root);
+    int dest_fd = open_dir_fd(dest_root);
+
+    check(restore_native_at(&RESTORE_CTX, source_fd, "link", dest_fd,
+                            "other") == 0 &&
+              link_target_is(other, "backup-target"),
+          "a symlink with another target is replaced by the backup's");
+    char content[64];
+    read_file(sentinel, content, sizeof(content));
+    check(strcmp(content, "do-not-touch") == 0,
+          "the replaced symlink's target is never written through");
+    check(restore_native_at(&RESTORE_CTX, source_fd, "link", dest_fd,
+                            "same") == 0 &&
+              link_target_is(same, "backup-target"),
+          "a symlink with the same target stays the backup's symlink");
+    check(restore_native_at(&RESTORE_CTX, source_fd, "link", dest_fd,
+                            "file") == 0 &&
+              link_target_is(file, "backup-target"),
+          "a file is replaced by the backup's symlink");
+    struct stat st;
+    check(restore_native_at(&RESTORE_CTX, source_fd, "link", dest_fd,
+                            "folder") != 0 &&
+              lstat(folder, &st) == 0 && S_ISDIR(st.st_mode),
+          "a folder is not removed for the backup's symlink");
+
+    close(source_fd);
+    close(dest_fd);
+    remove_tree(source_root);
+    remove_tree(dest_root);
+    remove_tree(outside_root);
+}
+
+static void test_rejects_source_intermediate_symlink_redirect(void)
+{
+    printf(BLUE "::" NC " restore_native_at: an intermediate source symlink redirect is rejected\n");
+
+    char source_root[PATH_MAX], dest_root[PATH_MAX], outside_root[PATH_MAX];
+    fresh_mkdtemp(source_root, sizeof(source_root), "restore_src");
+    fresh_mkdtemp(dest_root, sizeof(dest_root), "restore_dst");
+    fresh_mkdtemp(outside_root, sizeof(outside_root), "restore_outside");
+
+    char secret_path[PATH_MAX];
+    join_path(secret_path, sizeof(secret_path), outside_root, "secret.txt");
+    write_file(secret_path, "outside-payload-content");
+
+    char link_path[PATH_MAX];
+    join_path(link_path, sizeof(link_path), source_root, "redirect");
+    check(symlink(outside_root, link_path) == 0,
+          "fixture: an intermediate source symlink points outside source_root");
+
+    int source_fd = open_dir_fd(source_root);
+    int dest_fd = open_dir_fd(dest_root);
+
+    check(restore_native_source_status_at(source_fd,
+                                          "redirect/secret.txt") ==
+              RESTORE_SOURCE_ERROR,
+          "source status reports an unsafe intermediate symlink as an error");
+    check(restore_native_preflight_at(&RESTORE_CTX, source_fd,
+                                      "redirect/secret.txt",
+                                      dest_fd, "out.txt", NULL) != 0,
+          "preflight refuses the intermediate source symlink");
+    int rc = restore_native_at(&RESTORE_CTX, source_fd,
+                               "redirect/secret.txt", dest_fd, "out.txt");
+    check(rc != 0, "reading through an intermediate source symlink is refused");
+
+    char dest_check[PATH_MAX];
+    join_path(dest_check, sizeof(dest_check), dest_root, "out.txt");
+    struct stat st;
+    check(stat(dest_check, &st) != 0, "nothing was written to the destination");
+
+    close(source_fd);
+    close(dest_fd);
+    remove_tree(source_root);
+    remove_tree(dest_root);
+    remove_tree(outside_root);
+}
+
+static void test_recreates_source_leaf_symlink_without_following(void)
+{
+    printf(BLUE "::" NC " restore_native_at: a genuine source leaf symlink is recreated by target string, not followed\n");
+
+    char source_root[PATH_MAX], dest_root[PATH_MAX];
+    fresh_mkdtemp(source_root, sizeof(source_root), "restore_src");
+    fresh_mkdtemp(dest_root, sizeof(dest_root), "restore_dst");
+
+    // Deliberately absolute AND containing "..": neither disqualifies a
+    // symlink *object* from being copied -- only the address used to reach
+    // the object being restored is validated, never the symlink's own
+    // stored target string.
+    const char *target = "/some/../weird/target-that-does-not-exist";
+    char link_path[PATH_MAX];
+    join_path(link_path, sizeof(link_path), source_root, "mylink");
+    check(symlink(target, link_path) == 0, "fixture: create the source symlink");
+
+    int source_fd = open_dir_fd(source_root);
+    int dest_fd = open_dir_fd(dest_root);
+
+    check(restore_native_source_status_at(source_fd, "mylink") ==
+              RESTORE_SOURCE_PRESENT,
+          "a dangling leaf symlink is a present source object");
+    check(restore_native_source_status_at(source_fd, "absent") ==
+              RESTORE_SOURCE_MISSING,
+          "an absent final component is reported as missing");
+    int rc = restore_native_at(&RESTORE_CTX, source_fd, "mylink", dest_fd, "mylink");
+    check(rc == 0, "restoring a genuine symlink object succeeds");
+
+    char dest_link[PATH_MAX];
+    join_path(dest_link, sizeof(dest_link), dest_root, "mylink");
+    struct stat st;
+    check(lstat(dest_link, &st) == 0 && S_ISLNK(st.st_mode),
+          "the destination is itself a symlink, never a followed/resolved file");
+
+    char readback[PATH_MAX];
+    ssize_t len = readlink(dest_link, readback, sizeof(readback) - 1);
+    check(len >= 0, "fixture: readlink the recreated symlink");
+    if (len >= 0)
+    {
+        readback[len] = '\0';
+        check(strcmp(readback, target) == 0,
+              "the recreated symlink's target string exactly matches the source's, absolute-and-'..' included");
+    }
+
+    close(source_fd);
+    close(dest_fd);
+    remove_tree(source_root);
+    remove_tree(dest_root);
+}
+
+/* ========================================================================= */
+/* Path lexical validation                                                  */
+/* ========================================================================= */
+
+typedef struct
+{
+    const char *source_rel;
+    const char *dest_rel;
+    const char *label;
+} InvalidRelCase;
+
+static const InvalidRelCase invalid_rel_cases[] = {
+    { "/etc/passwd", "out.txt",   "a leading '/' in source_rel is rejected" },
+    { "note.txt",    "/tmp/evil", "a leading '/' in destination_rel is rejected" },
+    { "../escape",   "out.txt",   "a leading '..' component in source_rel is rejected" },
+    { "note.txt",    "../escape", "a leading '..' component in destination_rel is rejected" },
+    { "a/../b",      "out.txt",   "an interior '..' component in source_rel is rejected" },
+    { "note.txt",    "a/../b",    "an interior '..' component in destination_rel is rejected" },
+    { "a//b",        "out.txt",   "an empty interior component (\"a//b\") in source_rel is rejected" },
+    { "note.txt",    "a/",        "a trailing slash in destination_rel is rejected" },
+    { "./note.txt",  "out.txt",   "a bare '.' component in source_rel is rejected" },
+};
+
+static int dir_is_empty(const char *path)
+{
+    DIR *d = opendir(path);
+    if (d == NULL)
+        return 0;
+    struct dirent *entry;
+    int empty = 1;
+    while ((entry = readdir(d)) != NULL)
+        if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0)
+            empty = 0;
+    closedir(d);
+    return empty;
+}
+
+static void test_rejects_lexically_invalid_relative_paths(void)
+{
+    printf(BLUE "::" NC " restore_native_at: lexically invalid relative addresses are rejected without any mutation\n");
+
+    for (size_t i = 0; i < sizeof(invalid_rel_cases) / sizeof(invalid_rel_cases[0]); i++)
+    {
+        char source_base[PATH_MAX], source_root[PATH_MAX];
+        char dest_base[PATH_MAX], dest_root[PATH_MAX];
+        fresh_mkdtemp(source_base, sizeof(source_base), "restore_src");
+        fresh_mkdtemp(dest_base, sizeof(dest_base), "restore_dst");
+        join_path(source_root, sizeof(source_root), source_base, "root");
+        join_path(dest_root, sizeof(dest_root), dest_base, "root");
+        check(mkdir(source_root, 0755) == 0, "fixture: create nested source root");
+        check(mkdir(dest_root, 0755) == 0, "fixture: create nested destination root");
+        write_file_under(source_root, "note.txt", "content");
+        write_file_under(source_root, "b", "normalized-source");
+
+        char source_a[PATH_MAX];
+        join_path(source_a, sizeof(source_a), source_root, "a");
+        check(mkdir(source_a, 0755) == 0, "fixture: create source a/");
+        write_file_under(source_root, "a/b", "collapsed-source");
+
+        char source_escape[PATH_MAX];
+        join_path(source_escape, sizeof(source_escape), source_base, "escape");
+        write_file(source_escape, "parent-source");
+
+        char absolute_dest[PATH_MAX];
+        join_path(absolute_dest, sizeof(absolute_dest), dest_base, "absolute");
+        char parent_dest[PATH_MAX];
+        join_path(parent_dest, sizeof(parent_dest), dest_base, "escape");
+        write_file(parent_dest, "outside-sentinel");
+        const char *source_rel = invalid_rel_cases[i].source_rel;
+        const char *dest_rel = invalid_rel_cases[i].dest_rel;
+        if (strcmp(dest_rel, "/tmp/evil") == 0)
+            dest_rel = absolute_dest;
+
+        int source_fd = open_dir_fd(source_root);
+        int dest_fd = open_dir_fd(dest_root);
+
+        int rc = restore_native_at(&RESTORE_CTX, source_fd, source_rel,
+                                   dest_fd, dest_rel);
+        check(rc != 0, invalid_rel_cases[i].label);
+        check(dir_is_empty(dest_root), "no mutation occurred in dest_root for this rejected address");
+        struct stat st;
+        check(lstat(absolute_dest, &st) != 0,
+              "an absolute destination address did not write outside dest_root");
+        char outside_content[32];
+        read_file(parent_dest, outside_content, sizeof(outside_content));
+        check(strcmp(outside_content, "outside-sentinel") == 0,
+              "a parent destination address did not alter its outside sentinel");
+
+        close(source_fd);
+        close(dest_fd);
+        remove_tree(source_base);
+        remove_tree(dest_base);
+    }
+}
+
+/* ========================================================================= */
+/* Normal restore behavior                                                  */
+/* ========================================================================= */
+
+static void test_restores_nested_files_and_directories(void)
+{
+    printf(BLUE "::" NC " restore_native_at: a normal nested tree of files and directories restores correctly\n");
+
+    char source_root[PATH_MAX], dest_root[PATH_MAX];
+    fresh_mkdtemp(source_root, sizeof(source_root), "restore_src");
+    fresh_mkdtemp(dest_root, sizeof(dest_root), "restore_dst");
+
+    char proj_path[PATH_MAX], sub_path[PATH_MAX], sub2_path[PATH_MAX];
+    join_path(proj_path, sizeof(proj_path), source_root, "proj");
+    check(mkdir(proj_path, 0755) == 0, "fixture: mkdir proj");
+    join_path(sub_path, sizeof(sub_path), proj_path, "sub");
+    check(mkdir(sub_path, 0755) == 0, "fixture: mkdir proj/sub");
+    join_path(sub2_path, sizeof(sub2_path), proj_path, "sub2");
+    check(mkdir(sub2_path, 0755) == 0, "fixture: mkdir proj/sub2 (left empty)");
+    write_file_under(source_root, "proj/sub/file.txt", "nested-content");
+
+    int source_fd = open_dir_fd(source_root);
+    int dest_fd = open_dir_fd(dest_root);
+
+    check(restore_native_at(&RESTORE_CTX, source_fd, "proj", dest_fd, "proj") == 0,
+          "restoring the nested tree succeeds");
+
+    char dest_file[PATH_MAX];
+    join_path(dest_file, sizeof(dest_file), dest_root, "proj/sub/file.txt");
+    char content[64];
+    read_file(dest_file, content, sizeof(content));
+    check(strcmp(content, "nested-content") == 0, "the nested file's content matches the source");
+
+    char dest_sub2[PATH_MAX];
+    join_path(dest_sub2, sizeof(dest_sub2), dest_root, "proj/sub2");
+    struct stat st;
+    check(stat(dest_sub2, &st) == 0 && S_ISDIR(st.st_mode), "the empty nested directory was recreated");
+
+    close(source_fd);
+    close(dest_fd);
+    remove_tree(source_root);
+    remove_tree(dest_root);
+}
+
+static void count_item(size_t items, void *context)
+{
+    size_t *last = context;
+    *last = items;
+}
+
+static void test_inventory_counts_items(void)
+{
+    printf(BLUE "::" NC " restore_native_metadata_inventory_at: counts every entry it checks\n");
+
+    char source_root[PATH_MAX], dest_root[PATH_MAX];
+    fresh_mkdtemp(source_root, sizeof(source_root), "restore_src");
+    fresh_mkdtemp(dest_root, sizeof(dest_root), "restore_dst");
+
+    char proj_path[PATH_MAX], sub_path[PATH_MAX];
+    join_path(proj_path, sizeof(proj_path), source_root, "proj");
+    check(mkdir(proj_path, 0755) == 0, "fixture: mkdir proj");
+    join_path(sub_path, sizeof(sub_path), proj_path, "sub");
+    check(mkdir(sub_path, 0755) == 0, "fixture: mkdir proj/sub");
+    write_file_under(source_root, "proj/sub/file.txt", "nested-content");
+
+    int source_fd = open_dir_fd(source_root);
+    int dest_fd = open_dir_fd(dest_root);
+    MetadataProfiles profiles;
+    metadata_profiles_init(&profiles);
+    NativeRestoreEstimate estimate;
+    native_restore_estimate_init(&estimate);
+    size_t last = 0;
+    estimate.on_item = count_item;
+    estimate.on_item_context = &last;
+    RestoreNativeReport report;
+
+    check(restore_native_metadata_inventory_at(&RESTORE_CTX, source_fd, "proj",
+                                               dest_fd, "proj", &profiles,
+                                               &estimate, &report) ==
+              RESTORE_NATIVE_OK,
+          "the inventory succeeds");
+    check(estimate.items == 3 && last == 3,
+          "proj, proj/sub and proj/sub/file.txt are counted and reported");
+
+    native_restore_estimate_free(&estimate);
+    metadata_profiles_free(&profiles);
+    close(source_fd);
+    close(dest_fd);
+    remove_tree(source_root);
+    remove_tree(dest_root);
+}
+
+static void test_intermediate_folder_owner(void)
+{
+    printf(BLUE "::" NC " restore_native_at: a folder made on the way to the destination belongs to its parent's owner\n");
+    if (geteuid() != 0)
+    {
+        printf(BLUE "  (skipped: needs root)\n" NC);
+        return;
+    }
+
+    char source_root[PATH_MAX], dest_root[PATH_MAX];
+    fresh_mkdtemp(source_root, sizeof(source_root), "restore_src");
+    fresh_mkdtemp(dest_root, sizeof(dest_root), "restore_dst");
+    char proj_path[PATH_MAX];
+    join_path(proj_path, sizeof(proj_path), source_root, "proj");
+    check(mkdir(proj_path, 0755) == 0, "fixture: mkdir proj");
+    write_file_under(source_root, "proj/file.txt", "data");
+
+    // The home of another user, as under sudo; a fresh install has no .var.
+    const uid_t owner = 65534;
+    const gid_t group = 65534;
+    check(chown(dest_root, owner, group) == 0,
+          "fixture: the destination belongs to another user");
+
+    int source_fd = open_dir_fd(source_root);
+    int dest_fd = open_dir_fd(dest_root);
+    check(restore_native_at(&RESTORE_CTX, source_fd, "proj", dest_fd,
+                            ".var/app") == 0,
+          "restoring below a missing folder succeeds");
+
+    struct stat made;
+    check(fstatat(dest_fd, ".var", &made, AT_SYMLINK_NOFOLLOW) == 0 &&
+              S_ISDIR(made.st_mode) && made.st_uid == owner &&
+              made.st_gid == group && (made.st_mode & 07777) == 0700,
+          "the missing folder is made 0700 for its parent's owner");
+
+    close(source_fd);
+    close(dest_fd);
+    remove_tree(source_root);
+    remove_tree(dest_root);
+}
+
+static void test_relinks_hardlinked_payload_files(void)
+{
+    printf(BLUE "::" NC " restore_native_at: hardlinked payload files relink to one destination inode\n");
+
+    char source_root[PATH_MAX], dest_root[PATH_MAX];
+    fresh_mkdtemp(source_root, sizeof(source_root), "restore_src");
+    fresh_mkdtemp(dest_root, sizeof(dest_root), "restore_dst");
+
+    char payload_root[PATH_MAX], source_first[PATH_MAX], source_second[PATH_MAX];
+    join_path(payload_root, sizeof(payload_root), source_root, "payload");
+    check(mkdir(payload_root, 0755) == 0,
+          "fixture: create hardlink payload directory");
+    join_path(source_first, sizeof(source_first), payload_root, "first");
+    join_path(source_second, sizeof(source_second), payload_root, "second");
+    write_file(source_first, "hardlink-content");
+    check(link(source_first, source_second) == 0,
+          "fixture: create two hardlinked payload files");
+    check(chmod(source_first, 0640) == 0,
+          "fixture: set representative mode on the source inode");
+
+    static const char xattr_name[] = "user.migr_native_restore";
+    static const char xattr_value[] = "hardlink-xattr";
+    int xattr_available =
+        setxattr(source_first, xattr_name, xattr_value,
+                 sizeof(xattr_value) - 1U, 0) == 0;
+    if (!xattr_available)
+        printf("  " BLUE "-" NC " user xattrs unavailable on this fixture filesystem\n");
+
+    struct stat source_first_st;
+    struct stat source_second_st;
+    int source_pair_ok = lstat(source_first, &source_first_st) == 0 &&
+                         lstat(source_second, &source_second_st) == 0 &&
+                         source_first_st.st_dev == source_second_st.st_dev &&
+                         source_first_st.st_ino == source_second_st.st_ino &&
+                         source_first_st.st_nlink == 2;
+    check(source_pair_ok,
+          "the restore fixture's payload files share one source inode");
+
+    int source_fd = open_dir_fd(source_root);
+    int dest_fd = open_dir_fd(dest_root);
+    void *map = native_inode_map_create();
+    check(map != NULL, "native restore creates a hardlink map");
+    CloneContext hardlink_ctx = RESTORE_CTX;
+    hardlink_ctx.timestamp_policy_configured = 1;
+    hardlink_ctx.nsec_exact = 1;
+    hardlink_ctx.inode_map = map;
+    check(map != NULL && restore_native_at(&hardlink_ctx, source_fd, "payload",
+                                           dest_fd, "payload") == 0,
+          "restoring a payload with hardlinked files succeeds");
+
+    char dest_first[PATH_MAX], dest_second[PATH_MAX];
+    join_path(dest_first, sizeof(dest_first), dest_root, "payload/first");
+    join_path(dest_second, sizeof(dest_second), dest_root, "payload/second");
+    struct stat dest_first_st;
+    struct stat dest_second_st;
+    int destination_files_ok = lstat(dest_first, &dest_first_st) == 0 &&
+                                lstat(dest_second, &dest_second_st) == 0 &&
+                                S_ISREG(dest_first_st.st_mode) &&
+                                S_ISREG(dest_second_st.st_mode);
+    check(destination_files_ok,
+          "both hardlinked payload paths restore as regular files");
+
+    check(destination_files_ok &&
+              native_hardlink_identity_matches(&dest_first_st, &dest_second_st) &&
+              dest_first_st.st_nlink == 2,
+          "native restore relinks both hardlink names to one destination inode");
+
+    check(destination_files_ok &&
+              (dest_first_st.st_mode & 07777) ==
+                  (source_first_st.st_mode & 07777) &&
+              (dest_second_st.st_mode & 07777) ==
+                  (source_second_st.st_mode & 07777) &&
+              dest_first_st.st_uid == source_first_st.st_uid &&
+              dest_second_st.st_uid == source_second_st.st_uid &&
+              dest_first_st.st_gid == source_first_st.st_gid &&
+              dest_second_st.st_gid == source_second_st.st_gid,
+          "native restore preserves mode and ownership through the shared inode");
+
+    char first_content[64], second_content[64];
+    read_file(dest_first, first_content, sizeof(first_content));
+    read_file(dest_second, second_content, sizeof(second_content));
+    check(destination_files_ok &&
+              strcmp(first_content, "hardlink-content") == 0 &&
+              strcmp(second_content, "hardlink-content") == 0,
+          "relinked hardlink payload files preserve their content");
+
+    if (xattr_available)
+    {
+        char first_value[64] = {0};
+        char second_value[64] = {0};
+        ssize_t first_length = getxattr(dest_first, xattr_name,
+                                        first_value, sizeof(first_value));
+        ssize_t second_length = getxattr(dest_second, xattr_name,
+                                         second_value, sizeof(second_value));
+        check(first_length == (ssize_t)(sizeof(xattr_value) - 1U) &&
+                  second_length == first_length &&
+                  memcmp(first_value, xattr_value, (size_t)first_length) == 0 &&
+                  memcmp(second_value, xattr_value, (size_t)second_length) == 0,
+              "native restore carries the representative xattr to both hardlink names");
+    }
+
+    native_inode_map_free(map);
+    close(source_fd);
+    close(dest_fd);
+    remove_tree(source_root);
+    remove_tree(dest_root);
+}
+
+static void test_failed_hardlink_representative_is_not_recorded(void)
+{
+    printf(BLUE "::" NC " restore_native_at: a failed hardlink representative never poisons the inode map\n");
+
+    char source_root[PATH_MAX], dest_root[PATH_MAX];
+    fresh_mkdtemp(source_root, sizeof(source_root), "restore_src");
+    fresh_mkdtemp(dest_root, sizeof(dest_root), "restore_dst");
+
+    char source_first[PATH_MAX], source_second[PATH_MAX];
+    join_path(source_first, sizeof(source_first), source_root, "first");
+    join_path(source_second, sizeof(source_second), source_root, "second");
+    write_file(source_first, "failed-representative-content");
+    check(link(source_first, source_second) == 0,
+          "fixture: create the failed-representative hardlink pair");
+
+    char destination_first[PATH_MAX];
+    join_path(destination_first, sizeof(destination_first), dest_root, "first");
+    check(mkdir(destination_first, 0755) == 0,
+          "fixture: place a wrong-type destination at the representative address");
+
+    int source_fd = open_dir_fd(source_root);
+    int dest_fd = open_dir_fd(dest_root);
+    void *map = native_inode_map_create();
+    CloneContext hardlink_ctx = RESTORE_CTX;
+    hardlink_ctx.timestamp_policy_configured = 1;
+    hardlink_ctx.nsec_exact = 1;
+    hardlink_ctx.inode_map = map;
+
+    check(map != NULL && restore_native_at(&hardlink_ctx, source_fd, "first",
+                                           dest_fd, "first") != 0,
+          "a representative type failure is reported before map insertion");
+
+    char destination_second[PATH_MAX];
+    join_path(destination_second, sizeof(destination_second), dest_root, "second");
+    check(map != NULL && restore_native_at(&hardlink_ctx, source_fd, "second",
+                                           dest_fd, "second") == 0,
+          "the sibling can become a new representative after that failure");
+    struct stat second_st;
+    check(lstat(destination_second, &second_st) == 0 &&
+              S_ISREG(second_st.st_mode) && second_st.st_nlink == 1,
+          "a failed representative leaves the later sibling independent");
+    struct stat first_st;
+    check(lstat(destination_first, &first_st) == 0 && S_ISDIR(first_st.st_mode),
+          "the wrong-type representative destination remains untouched");
+
+    native_inode_map_free(map);
+    close(source_fd);
+    close(dest_fd);
+    remove_tree(source_root);
+    remove_tree(dest_root);
+}
+
+static void test_restores_names_with_problem_bytes(void)
+{
+    printf(BLUE "::" NC " restore_native_at: native accepts every filename byte unencoded (D19)\n");
+
+    char source_root[PATH_MAX], dest_root[PATH_MAX];
+    fresh_mkdtemp(source_root, sizeof(source_root), "restore_src");
+    fresh_mkdtemp(dest_root, sizeof(dest_root), "restore_dst");
+
+    char problem_name[64] = "space:percent%";
+    size_t name_len = strlen(problem_name);
+    problem_name[name_len++] = (char)0xFF;
+    problem_name[name_len] = '\0';
+
+    char source_path[PATH_MAX];
+    join_path(source_path, sizeof(source_path), source_root, problem_name);
+    write_file(source_path, "native-problem-name");
+
+    int source_fd = open_dir_fd(source_root);
+    int dest_fd = open_dir_fd(dest_root);
+
+    check(restore_native_at(&RESTORE_CTX, source_fd, problem_name,
+                            dest_fd, problem_name) == 0,
+          "restoring a filename containing space, colon, percent, and 0xFF succeeds");
+
+    char dest_path[PATH_MAX];
+    join_path(dest_path, sizeof(dest_path), dest_root, problem_name);
+    struct stat st;
+    check(lstat(dest_path, &st) == 0 && S_ISREG(st.st_mode),
+          "the native destination contains the byte-identical problem name");
+
+    int found = 0;
+    DIR *dir = opendir(dest_root);
+    if (dir != NULL)
+    {
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL)
+        {
+            size_t entry_len = strlen(entry->d_name);
+            if (entry_len == name_len &&
+                memcmp(entry->d_name, problem_name, name_len) == 0)
+            {
+                found = 1;
+                break;
+            }
+        }
+        closedir(dir);
+    }
+    check(found, "readdir observes the original native filename bytes, without encoding");
+
+    close(source_fd);
+    close(dest_fd);
+    remove_tree(source_root);
+    remove_tree(dest_root);
+}
+
+static void test_regular_file_resume_and_overwrite(void)
+{
+    printf(BLUE "::" NC " restore_native_at: an existing regular file resumes (matching) or is overwritten (stale)\n");
+
+    char source_root[PATH_MAX], dest_root[PATH_MAX];
+    fresh_mkdtemp(source_root, sizeof(source_root), "restore_src");
+    fresh_mkdtemp(dest_root, sizeof(dest_root), "restore_dst");
+
+    write_file_under(source_root, "file.txt", "source-content-v1");
+    char source_file[PATH_MAX];
+    join_path(source_file, sizeof(source_file), source_root, "file.txt");
+    struct timespec times[2] = { { .tv_sec = 1700000000, .tv_nsec = 0 }, { .tv_sec = 1700000000, .tv_nsec = 0 } };
+    check(utimensat(AT_FDCWD, source_file, times, 0) == 0, "fixture: set a known mtime on the source file");
+
+    int source_fd = open_dir_fd(source_root);
+    int dest_fd = open_dir_fd(dest_root);
+
+    check(restore_native_at(&RESTORE_CTX, source_fd, "file.txt", dest_fd, "file.txt") == 0,
+          "first restore succeeds");
+
+    char dest_file[PATH_MAX];
+    join_path(dest_file, sizeof(dest_file), dest_root, "file.txt");
+    char content[64];
+    read_file(dest_file, content, sizeof(content));
+    check(strcmp(content, "source-content-v1") == 0, "the file was copied correctly");
+
+    // Tamper with dest's content while keeping its size and mtime identical
+    // to the source, then restore again: if the resume/skip path is
+    // genuinely exercised, this tampered content must survive untouched.
+    write_file(dest_file, "source-content-v2"); // same length as v1
+    check(utimensat(AT_FDCWD, dest_file, times, 0) == 0, "fixture: restore dest's mtime to match source exactly");
+
+    check(restore_native_at(&RESTORE_CTX, source_fd, "file.txt", dest_fd, "file.txt") == 0,
+          "second restore (matching size/mtime) succeeds");
+    read_file(dest_file, content, sizeof(content));
+    check(strcmp(content, "source-content-v2") == 0,
+          "a dest file matching source's size and mtime is left alone (resumed), not re-copied");
+
+    // Now make dest genuinely stale: restore must overwrite it.
+    struct timespec old_times[2] = { { .tv_sec = 1000000000, .tv_nsec = 0 }, { .tv_sec = 1000000000, .tv_nsec = 0 } };
+    check(utimensat(AT_FDCWD, dest_file, old_times, 0) == 0, "fixture: make dest's mtime stale");
+    check(restore_native_at(&RESTORE_CTX, source_fd, "file.txt", dest_fd, "file.txt") == 0,
+          "third restore (stale dest) succeeds");
+    read_file(dest_file, content, sizeof(content));
+    check(strcmp(content, "source-content-v1") == 0,
+          "a dest file with a stale mtime is overwritten with the source's content");
+
+    close(source_fd);
+    close(dest_fd);
+    remove_tree(source_root);
+    remove_tree(dest_root);
+}
+
+static void test_restores_fifo(void)
+{
+    printf(BLUE "::" NC " restore_native_at: a normal FIFO restores as a FIFO\n");
+
+    char source_root[PATH_MAX], dest_root[PATH_MAX];
+    fresh_mkdtemp(source_root, sizeof(source_root), "restore_src");
+    fresh_mkdtemp(dest_root, sizeof(dest_root), "restore_dst");
+
+    char fifo_path[PATH_MAX];
+    join_path(fifo_path, sizeof(fifo_path), source_root, "myfifo");
+    check(mkfifo(fifo_path, 0600) == 0, "fixture: create a source FIFO");
+
+    int source_fd = open_dir_fd(source_root);
+    int dest_fd = open_dir_fd(dest_root);
+
+    check(restore_native_at(&RESTORE_CTX, source_fd, "myfifo", dest_fd, "myfifo") == 0,
+          "restoring a FIFO succeeds");
+
+    char dest_fifo[PATH_MAX];
+    join_path(dest_fifo, sizeof(dest_fifo), dest_root, "myfifo");
+    struct stat st;
+    check(lstat(dest_fifo, &st) == 0 && S_ISFIFO(st.st_mode), "the destination is a genuine FIFO");
+
+    close(source_fd);
+    close(dest_fd);
+    remove_tree(source_root);
+    remove_tree(dest_root);
+}
+
+static void test_rejects_wrong_existing_destination_types(void)
+{
+    printf(BLUE "::" NC " restore_native_at: existing destination objects must have the source type\n");
+
+    char source_root[PATH_MAX], dest_root[PATH_MAX];
+    fresh_mkdtemp(source_root, sizeof(source_root), "restore_src");
+    fresh_mkdtemp(dest_root, sizeof(dest_root), "restore_dst");
+
+    write_file_under(source_root, "regular", "regular-source");
+    char source_dir[PATH_MAX];
+    join_path(source_dir, sizeof(source_dir), source_root, "directory");
+    check(mkdir(source_dir, 0755) == 0, "fixture: create source directory");
+    write_file_under(source_root, "directory/inside", "nested");
+    char source_fifo[PATH_MAX];
+    join_path(source_fifo, sizeof(source_fifo), source_root, "fifo");
+    check(mkfifo(source_fifo, 0600) == 0, "fixture: create source FIFO");
+
+    char dest_regular[PATH_MAX];
+    join_path(dest_regular, sizeof(dest_regular), dest_root, "regular");
+    check(mkdir(dest_regular, 0755) == 0,
+          "fixture: put a directory where a regular file would be restored");
+    char dest_directory[PATH_MAX];
+    join_path(dest_directory, sizeof(dest_directory), dest_root, "directory");
+    write_file(dest_directory, "directory-sentinel");
+    char dest_fifo[PATH_MAX];
+    join_path(dest_fifo, sizeof(dest_fifo), dest_root, "fifo");
+    write_file(dest_fifo, "fifo-sentinel");
+
+    int source_fd = open_dir_fd(source_root);
+    int dest_fd = open_dir_fd(dest_root);
+
+    check(restore_native_at(&RESTORE_CTX, source_fd, "regular",
+                            dest_fd, "regular") != 0,
+          "regular-to-directory replacement is refused");
+    check(restore_native_at(&RESTORE_CTX, source_fd, "directory",
+                            dest_fd, "directory") != 0,
+          "directory-to-regular replacement is refused");
+    check(restore_native_at(&RESTORE_CTX, source_fd, "fifo",
+                            dest_fd, "fifo") != 0,
+          "FIFO-to-regular replacement is refused");
+
+    RestoreNativeReport report;
+    check(restore_native_at_report(&RESTORE_CTX, source_fd, "regular",
+                                   dest_fd, "regular", &report, NULL) != 0 &&
+              strcmp(report.failed_logical_path, "regular") == 0 &&
+              report.failed_operation != NULL &&
+              strstr(report.failed_operation, "already there") != NULL &&
+              report.failure_errno == 0,
+          "the refusal names the item and says what stands in its place");
+
+    struct stat st;
+    check(lstat(dest_regular, &st) == 0 && S_ISDIR(st.st_mode),
+          "the wrong-type destination directory remains intact");
+    char content[64];
+    read_file(dest_directory, content, sizeof(content));
+    check(strcmp(content, "directory-sentinel") == 0,
+          "the directory target's regular-file sentinel remains intact");
+    read_file(dest_fifo, content, sizeof(content));
+    check(strcmp(content, "fifo-sentinel") == 0,
+          "the FIFO target's regular-file sentinel remains intact");
+
+    close(source_fd);
+    close(dest_fd);
+    remove_tree(source_root);
+    remove_tree(dest_root);
+}
+
+static void test_reports_the_failed_item_with_errno(void)
+{
+    printf(BLUE "::" NC " restore_native_at: a failure names the item, the step, and errno\n");
+
+    if (geteuid() == 0)
+    {
+        printf("  - skipped: root writes into a read-only folder\n");
+        return;
+    }
+    char source_root[PATH_MAX], dest_root[PATH_MAX];
+    fresh_mkdtemp(source_root, sizeof(source_root), "restore_src");
+    fresh_mkdtemp(dest_root, sizeof(dest_root), "restore_dst");
+    char source_dir[PATH_MAX], locked[PATH_MAX];
+    join_path(source_dir, sizeof(source_dir), source_root, "folder");
+    join_path(locked, sizeof(locked), dest_root, "locked");
+    check(mkdir(source_dir, 0755) == 0 && mkdir(locked, 0755) == 0,
+          "fixture: a folder in the backup and its place on the new system");
+    write_file_under(source_root, "folder/inside", "content");
+    check(chmod(locked, 0555) == 0, "fixture: the place cannot be written to");
+
+    int source_fd = open_dir_fd(source_root);
+    int dest_fd = open_dir_fd(dest_root);
+    RestoreNativeReport report;
+    check(restore_native_at_report(&RESTORE_CTX, source_fd, "folder",
+                                   dest_fd, "locked", &report, NULL) != 0 &&
+              strcmp(report.failed_logical_path, "folder/inside") == 0 &&
+              report.failed_operation != NULL &&
+              strcmp(report.failed_operation, "open it for writing") == 0 &&
+              report.failure_errno == EACCES,
+          "the file that could not be written is named with errno");
+
+    check(chmod(locked, 0755) == 0, "fixture: make the place writable again");
+    close(source_fd);
+    close(dest_fd);
+    remove_tree(source_root);
+    remove_tree(dest_root);
+}
+
+static void test_skips_socket_without_failing(void)
+{
+    printf(BLUE "::" NC " restore_native_at: a socket inside a restored directory is skipped, not failed\n");
+
+    char source_root[PATH_MAX], dest_root[PATH_MAX];
+    fresh_mkdtemp(source_root, sizeof(source_root), "restore_src");
+    fresh_mkdtemp(dest_root, sizeof(dest_root), "restore_dst");
+
+    char proj_path[PATH_MAX];
+    join_path(proj_path, sizeof(proj_path), source_root, "proj");
+    check(mkdir(proj_path, 0755) == 0, "fixture: create a source directory");
+    write_file_under(source_root, "proj/regular.txt", "still-restored");
+
+    char sock_path[PATH_MAX];
+    join_path(sock_path, sizeof(sock_path), source_root, "proj/sock");
+    int sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    check(sock_fd >= 0, "fixture: create a socket fd");
+    if (sock_fd >= 0)
+    {
+        struct sockaddr_un addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        size_t sock_path_len = strlen(sock_path);
+        check(sock_path_len < sizeof(addr.sun_path), "fixture: socket path fits sun_path");
+        if (sock_path_len < sizeof(addr.sun_path))
+        {
+            memcpy(addr.sun_path, sock_path, sock_path_len + 1);
+            int bind_rc =
+                bind(sock_fd, (struct sockaddr *)&addr, sizeof(addr));
+            if (bind_rc != 0)
+            {
+                if (errno == EPERM || errno == EACCES || errno == EAFNOSUPPORT)
+                    printf(BLUE "  (skipped: Unix socket bind unavailable on this host)\n" NC);
+                else
+                    check(0, "fixture: bind the socket into proj/");
+            }
+            else
+                check(1, "fixture: bind the socket into proj/");
+        }
+        close(sock_fd);
+    }
+
+    int source_fd = open_dir_fd(source_root);
+    int dest_fd = open_dir_fd(dest_root);
+
+    check(restore_native_at(&RESTORE_CTX, source_fd, "proj", dest_fd, "proj") == 0,
+          "restoring a directory containing a socket still succeeds overall");
+
+    char dest_regular[PATH_MAX];
+    join_path(dest_regular, sizeof(dest_regular), dest_root, "proj/regular.txt");
+    struct stat st;
+    check(stat(dest_regular, &st) == 0, "the sibling regular file was still restored");
+
+    char dest_sock[PATH_MAX];
+    join_path(dest_sock, sizeof(dest_sock), dest_root, "proj/sock");
+    check(lstat(dest_sock, &st) != 0, "no destination object was created for the skipped socket");
+
+    close(source_fd);
+    close(dest_fd);
+    remove_tree(source_root);
+    remove_tree(dest_root);
+}
+
+static void test_skips_device_node_without_failing(void)
+{
+    printf(BLUE "::" NC " restore_native_at: a device node is skipped without a destination\n");
+
+    char dest_root[PATH_MAX];
+    fresh_mkdtemp(dest_root, sizeof(dest_root), "restore_dst");
+
+    int source_fd = open_dir_fd("/dev");
+    int dest_fd = open_dir_fd(dest_root);
+    struct stat source_st;
+    int fixture_ok =
+        fstatat(source_fd, "null", &source_st, AT_SYMLINK_NOFOLLOW) == 0 &&
+        S_ISCHR(source_st.st_mode);
+    check(fixture_ok, "/dev/null is available as a character-device fixture");
+    if (fixture_ok)
+        check(restore_native_at(&RESTORE_CTX, source_fd, "null",
+                                dest_fd, "null") == 0,
+              "restoring the device-node fixture succeeds by skipping it");
+
+    char dest_device[PATH_MAX];
+    join_path(dest_device, sizeof(dest_device), dest_root, "null");
+    struct stat dest_st;
+    check(lstat(dest_device, &dest_st) != 0,
+          "skipping the device node creates no destination object");
+
+    close(source_fd);
+    close(dest_fd);
+    remove_tree(dest_root);
+}
+
+static void test_preserves_caller_owned_root_fds(void)
+{
+    printf(BLUE "::" NC " restore_native_at: caller-owned root fds remain open and unchanged\n");
+
+    char source_root[PATH_MAX], dest_root[PATH_MAX];
+    fresh_mkdtemp(source_root, sizeof(source_root), "restore_src");
+    fresh_mkdtemp(dest_root, sizeof(dest_root), "restore_dst");
+    write_file_under(source_root, "note.txt", "content");
+
+    int source_fd = open_dir_fd(source_root);
+    int dest_fd = open_dir_fd(dest_root);
+    struct stat source_before;
+    struct stat dest_before;
+    check(fstat(source_fd, &source_before) == 0 &&
+          fstat(dest_fd, &dest_before) == 0,
+          "fixture: record both root fd identities");
+
+    check(restore_native_at(&RESTORE_CTX, source_fd, "note.txt",
+                            dest_fd, "note.txt") == 0,
+          "a successful restore completes");
+    check(fd_still_names_same_directory(source_fd, &source_before) &&
+          fd_still_names_same_directory(dest_fd, &dest_before),
+          "both caller root fds survive a successful restore");
+
+    check(restore_native_at(&RESTORE_CTX, source_fd, "note.txt",
+                            dest_fd, "../escape") != 0,
+          "an unsafe restore request is refused");
+    check(fd_still_names_same_directory(source_fd, &source_before) &&
+          fd_still_names_same_directory(dest_fd, &dest_before),
+          "both caller root fds survive a refused restore");
+
+    close(source_fd);
+    close(dest_fd);
+    remove_tree(source_root);
+    remove_tree(dest_root);
+}
+
+static void test_empty_relative_path_means_root_object_itself(void)
+{
+    printf(BLUE "::" NC " restore_native_at: an empty relative address means the root object itself\n");
+
+    char source_root[PATH_MAX], dest_root[PATH_MAX];
+    fresh_mkdtemp(source_root, sizeof(source_root), "restore_src");
+    fresh_mkdtemp(dest_root, sizeof(dest_root), "restore_dst");
+    write_file_under(source_root, "inside.txt", "root-restore-content");
+
+    int source_fd = open_dir_fd(source_root);
+    int dest_fd = open_dir_fd(dest_root);
+
+    RestoreNativeReport report;
+    int restored = restore_native_at_report(&RESTORE_CTX, source_fd, "",
+                                            dest_fd, "", &report, NULL) == 0;
+    check(restored,
+          "an empty relative address on both sides restores the root directory itself (docs/DECISIONS.md D16)");
+    if (!restored)
+        printf("    failed at '%s': %s (%s)\n", report.failed_logical_path,
+               report.failed_operation != NULL ? report.failed_operation : "?",
+               report.failure_errno != 0 ? strerror(report.failure_errno) : "no errno");
+
+    char dest_inside[PATH_MAX];
+    join_path(dest_inside, sizeof(dest_inside), dest_root, "inside.txt");
+    char content[64];
+    read_file(dest_inside, content, sizeof(content));
+    check(strcmp(content, "root-restore-content") == 0, "the root directory's own contents were restored");
+
+    close(source_fd);
+    close(dest_fd);
+    remove_tree(source_root);
+    remove_tree(dest_root);
+}
+
+// The recursive dispatcher has no other bound on payload nesting depth
+// (the payload is untrusted), so an adversarial or corrupted backup could
+// otherwise drive thousands of stack frames and crash the restoring process
+// instead of failing the one offending entry. "root" itself sits at depth 0,
+// so 513 nested single-letter directories below it puts the deepest one at
+// depth 513 -- the first value RESTORE_MAX_DEPTH (512) rejects. The 512 levels
+// above it are still fully walked first (proving this isn't refusing at the
+// root), and using the read-only preflight pass keeps the fixture fast and
+// never touches the destination.
+static void test_rejects_excessive_recursion_depth(void)
+{
+    printf(BLUE "::" NC " restore_native_preflight_at: nesting past the depth limit is refused, not crashed on\n");
+
+    char source_root[PATH_MAX], dest_root[PATH_MAX];
+    fresh_mkdtemp(source_root, sizeof(source_root), "restore_deep_src");
+    fresh_mkdtemp(dest_root, sizeof(dest_root), "restore_deep_dst");
+
+    char cursor[PATH_MAX];
+    int n = snprintf(cursor, sizeof(cursor), "%s/root", source_root);
+    if (n < 0 || (size_t)n >= sizeof(cursor) || mkdir(cursor, 0755) != 0)
+    {
+        printf(RED "fixture: could not create the deep-nesting root" NC "\n");
+        exit(1);
+    }
+    for (int i = 0; i < 513; i++)
+    {
+        size_t len = strlen(cursor);
+        int step = snprintf(cursor + len, sizeof(cursor) - len, "/a");
+        if (step < 0 || (size_t)step >= sizeof(cursor) - len || mkdir(cursor, 0755) != 0)
+        {
+            printf(RED "fixture: could not build the deep-nesting chain" NC "\n");
+            exit(1);
+        }
+    }
+
+    int source_fd = open_dir_fd(source_root);
+    int dest_fd = open_dir_fd(dest_root);
+
+    check(restore_native_preflight_at(&RESTORE_CTX, source_fd, "root",
+                                      dest_fd, "root", NULL) != 0,
+          "excessive payload nesting is refused instead of exhausting the stack");
+
+    close(source_fd);
+    close(dest_fd);
+    remove_tree(source_root);
+    remove_tree(dest_root);
+}
+
+// Regression test for the guard-clause failure branches that used to return
+// an error without ever calling restore_report_failure(): before that fix, a
+// deep nested entry hitting a guard clause bubbled up as an unreported
+// failure through every ancestor directory's aggregator (each one assuming
+// its child already reported), and restore_native_at_report()'s own backstop
+// then attributed the whole failure to the top-level source_rel ("root")
+// instead of the actual entry that failed. The depth-limit guard is a fully
+// deterministic way to trigger a guard-clause failure at a known, deeply
+// nested logical_path -- no race or readdir-order dependency required.
+static void test_reports_the_actual_nested_entry_that_exceeded_depth(void)
+{
+    printf(BLUE "::" NC " restore_native_at_report: a guard-clause failure deep in the tree is attributed to its own nested path, not the restore root\n");
+
+    char source_root[PATH_MAX], dest_root[PATH_MAX];
+    fresh_mkdtemp(source_root, sizeof(source_root), "restore_deep_report_src");
+    fresh_mkdtemp(dest_root, sizeof(dest_root), "restore_deep_report_dst");
+
+    char cursor[PATH_MAX];
+    int n = snprintf(cursor, sizeof(cursor), "%s/root", source_root);
+    if (n < 0 || (size_t)n >= sizeof(cursor) || mkdir(cursor, 0755) != 0)
+    {
+        printf(RED "fixture: could not create the deep-nesting root" NC "\n");
+        exit(1);
+    }
+    for (int i = 0; i < 513; i++)
+    {
+        size_t len = strlen(cursor);
+        int step = snprintf(cursor + len, sizeof(cursor) - len, "/a");
+        if (step < 0 || (size_t)step >= sizeof(cursor) - len || mkdir(cursor, 0755) != 0)
+        {
+            printf(RED "fixture: could not build the deep-nesting chain" NC "\n");
+            exit(1);
+        }
+    }
+
+    int source_fd = open_dir_fd(source_root);
+    int dest_fd = open_dir_fd(dest_root);
+
+    RestoreNativeReport report;
+    RestoreNativeStatus result = restore_native_at_report(
+        &RESTORE_CTX, source_fd, "root", dest_fd, "root", &report, NULL);
+
+    check(result != RESTORE_NATIVE_OK,
+          "excessive payload nesting is still refused with a real report attached");
+    check(report.failed_count == 1,
+          "exactly one failure is recorded, not one per ancestor directory");
+    check(strcmp(report.failed_logical_path, "root") != 0,
+          "the failure is not misattributed to the restore root itself");
+    check(strncmp(report.failed_logical_path, "root/a/a/a", 10) == 0,
+          "the failure is attributed to the actual deeply nested entry that hit the depth limit");
+
+    close(source_fd);
+    close(dest_fd);
+    remove_tree(source_root);
+    remove_tree(dest_root);
+}
+
+/* ========================================================================= */
+/* CloneContext validation                                                  */
+/* ========================================================================= */
+
+static void test_rejects_invalid_context(void)
+{
+    printf(BLUE "::" NC " restore_native_at: an invalid or mismatched CloneContext is refused\n");
+
+    char source_root[PATH_MAX], dest_root[PATH_MAX];
+    fresh_mkdtemp(source_root, sizeof(source_root), "restore_src");
+    fresh_mkdtemp(dest_root, sizeof(dest_root), "restore_dst");
+    write_file_under(source_root, "note.txt", "content");
+
+    int source_fd = open_dir_fd(source_root);
+    int dest_fd = open_dir_fd(dest_root);
+
+    check(restore_native_at(NULL, source_fd, "note.txt", dest_fd, "note.txt") != 0,
+          "a NULL ctx is refused");
+
+    CloneContext backup_ctx = { .operation = CLONE_BACKUP, .representation = CLONE_NATIVE_TREE };
+    check(restore_native_at(&backup_ctx, source_fd, "note.txt", dest_fd, "note.txt") != 0,
+          "a CLONE_BACKUP operation is refused");
+
+    CloneContext portable_ctx = { .operation = CLONE_RESTORE, .representation = CLONE_PORTABLE_SIDECAR };
+    check(restore_native_at(&portable_ctx, source_fd, "note.txt", dest_fd, "note.txt") != 0,
+          "a CLONE_PORTABLE_SIDECAR representation is refused");
+
+    check(restore_native_at(&RESTORE_CTX, -1, "note.txt", dest_fd, "note.txt") != 0,
+          "a negative source_root_fd is refused");
+    check(restore_native_at(&RESTORE_CTX, source_fd, "note.txt", -1, "note.txt") != 0,
+          "a negative destination_root_fd is refused");
+
+    close(source_fd);
+    close(dest_fd);
+    remove_tree(source_root);
+    remove_tree(dest_root);
+}
+
+int main(void)
+{
+    // A direct sudo run must not aim restores at the invoking user's home
+    // (D38); make and test.sh drop SUDO_UID already.
+    unsetenv("SUDO_UID");
+    printf(BLUE "::" NC " restore_native_at (unit)\n");
+
+    test_rejects_destination_intermediate_symlink_escape();
+    test_rejects_final_destination_symlink();
+    test_backup_symlink_replaces_a_destination_symlink();
+    test_rejects_source_intermediate_symlink_redirect();
+    test_recreates_source_leaf_symlink_without_following();
+
+    test_rejects_lexically_invalid_relative_paths();
+
+    test_restores_nested_files_and_directories();
+    test_inventory_counts_items();
+    test_intermediate_folder_owner();
+    test_relinks_hardlinked_payload_files();
+    test_failed_hardlink_representative_is_not_recorded();
+    test_restores_names_with_problem_bytes();
+    test_regular_file_resume_and_overwrite();
+    test_restores_fifo();
+    test_rejects_wrong_existing_destination_types();
+    test_reports_the_failed_item_with_errno();
+    test_skips_socket_without_failing();
+    test_skips_device_node_without_failing();
+    test_preserves_caller_owned_root_fds();
+    test_empty_relative_path_means_root_object_itself();
+    test_rejects_excessive_recursion_depth();
+    test_reports_the_actual_nested_entry_that_exceeded_depth();
+
+    test_rejects_invalid_context();
+
+    if (failures > 0)
+    {
+        printf(RED "%d restore_native_at test(s) failed" NC "\n", failures);
+        return 1;
+    }
+    return 0;
+}

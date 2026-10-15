@@ -1,0 +1,29 @@
+# Maintainer: Emre Yıldız <eyildizemre@proton.me>
+# makepkg reads these variables, sets pkgdir, and runs each function with errexit.
+# shellcheck shell=bash disable=SC2034,SC2154,SC2164
+pkgname=migr
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Move your home, packages, and settings to a new Linux install'
+arch=('x86_64')
+url='https://github.com/eyildizemre/migr'
+license=('MIT')
+depends=('glibc')
+source=("$url/releases/download/v$pkgver/$pkgname-$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "$pkgname-$pkgver"
+  make migr migr-static
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  make test
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  make DESTDIR="$pkgdir" PREFIX=/usr install install-static
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

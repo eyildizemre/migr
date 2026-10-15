@@ -1,11 +1,19 @@
-#define _GNU_SOURCE
+#include <errno.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <limits.h>
 
 #include "xdg.h"
 #include "utils.h" // path_join
+
+const char * const xdg_keys[XDG_KEY_COUNT]      = {
+    "XDG_DOCUMENTS_DIR", "XDG_DOWNLOAD_DIR", "XDG_PICTURES_DIR",
+    "XDG_DESKTOP_DIR",   "XDG_VIDEOS_DIR",   "XDG_MUSIC_DIR"
+};
+const char * const xdg_fallbacks[XDG_KEY_COUNT] = {
+    "Documents", "Downloads", "Pictures",
+    "Desktop",   "Videos",   "Music"
+};
 
 int xdg_resolve(const char *home,
                 const char * const *keys,
@@ -18,8 +26,15 @@ int xdg_resolve(const char *home,
 
     char config[PATH_MAX];
     FILE *f = NULL;
-    if (path_join(config, sizeof(config), home, ".config/user-dirs.dirs") == 0)
+    int read_failed = 0;
+    if (path_join(config, sizeof(config), home, ".config/user-dirs.dirs") != 0)
+        read_failed = 1;
+    else
+    {
         f = fopen(config, "r");
+        if (f == NULL && errno != ENOENT)
+            read_failed = 1;
+    }
     if (f != NULL)
     {
         char line[PATH_MAX + 32];
@@ -52,7 +67,9 @@ int xdg_resolve(const char *home,
 
                 char resolved[PATH_MAX];
                 int rn;
-                if (strncmp(val, "$HOME/", 6) == 0)
+                if (strcmp(val, "$HOME") == 0)
+                    rn = snprintf(resolved, sizeof(resolved), "%s", home);
+                else if (strncmp(val, "$HOME/", 6) == 0)
                     rn = snprintf(resolved, sizeof(resolved), "%s/%s", home, val + 6);
                 else if (val[0] == '/')
                     rn = snprintf(resolved, sizeof(resolved), "%s", val);
@@ -61,12 +78,21 @@ int xdg_resolve(const char *home,
 
                 // On truncation leave out[i] NULL; the fallback loop below fills it.
                 if (rn >= 0 && (size_t)rn < sizeof(resolved))
+                {
                     out[i] = strdup(resolved);
+                    if (out[i] == NULL)
+                        read_failed = 1;
+                }
                 break;
             }
         }
+        if (ferror(f))
+            read_failed = 1;
         fclose(f);
     }
+
+    if (read_failed)
+        return -1;
 
     // Fill any key not found in the config with the English default. Every path
     // must stay absolute: a bare relative name would resolve against the caller's

@@ -1,20 +1,80 @@
 #ifndef RESTORE_H
 #define RESTORE_H
 
+#include <sys/types.h> /* off_t */
+#include <time.h> /* struct timespec */
+
+#ifdef RESTORE_TEST_HOOKS
+typedef int (*RestoreTestNetworkCommandHook)(char *const argv[], void *context);
+
+void restore_test_set_crypto_policy_current(const char *path);
+typedef void (*RestoreTestDconfHook)(int database_fd, void *context);
+void restore_test_set_dconf_hook(RestoreTestDconfHook hook, void *context);
+void restore_test_set_network_manager_runtime_dir(const char *path);
+void restore_test_set_network_config_dest_dir(const char *backend_name,
+                                              const char *dest_dir);
+void restore_test_set_network_command_hook(RestoreTestNetworkCommandHook hook,
+                                           void *context);
+/* Answers the nmcli queries of the wait for a network (D90) in place of
+ * NetworkManager, and shortens that wait's polling interval. */
+typedef int (*RestoreTestNetworkQueryHook)(char *const argv[], char *output,
+                                           size_t output_size, void *context);
+void restore_test_set_network_query_hook(RestoreTestNetworkQueryHook hook,
+                                         void *context, long interval_ms);
+/* Reads the restoring user's subordinate IDs (D93) from these files in
+ * place of /etc/subuid and /etc/subgid; NULL restores the real one. */
+void restore_test_set_subid_files(const char *subuid, const char *subgid);
+/* Runs the SELinux relabel of the restored paths (D92) in place of
+ * restorecon; paths is the NUL-separated list restorecon would read. Without
+ * a hook, a test restore treats SELinux as not running. */
+typedef int (*RestoreTestRelabelHook)(char *const argv[], const char *paths,
+                                      size_t paths_length, void *context);
+void restore_test_set_relabel_hook(RestoreTestRelabelHook hook, void *context);
+
+/* Exposes the progress display's cumulative-average speed formula
+ * (total_bytes / elapsed since started_at) for direct unit testing with
+ * synthetic timestamps, without needing to fake wall-clock delays. */
+off_t restore_test_progress_speed(off_t total_bytes,
+                                  const struct timespec *started_at,
+                                  const struct timespec *now);
+#endif
+
 /**
  * @brief Restores files and packages from a backup directory to HOME.
  *
- * Prompts for user confirmation, then copies main directories, dotfiles, and
- * browser profiles from source back to their correct locations in HOME. Reads
- * manifest.txt to resolve cross-locale XDG directory names (e.g. "Belgeler"
- * on the source system maps to Documents on an English target system). Falls
- * back to the target system's basename if manifest.txt is absent. If
- * packages.txt is present, installs the listed packages via the distro's
- * package manager.
+ * Refuses a ".partial" (in-progress or abandoned) container, an unknown or
+ * malformed manifest.txt, or a finalized versioned container with a missing
+ * or legacy manifest before prompting or mutating the destination. A valid v1
+ * manifest selects between two independent representation-driven code paths:
+ * a native tree (fd-anchored, exact metadata) or a portable sidecar
+ * (percent-encoded names, xattrs sidecar, hardlink groups). Legacy or
+ * unversioned backups use the native path. A free-space preflight check can
+ * abort the restore before any confirmation prompt if the destination can't
+ * hold it. --dry-run previews the same plan and checks without prompting or
+ * mutating anything. manifest.txt (when present) resolves cross-locale XDG
+ * directory names (e.g. "Belgeler" on the source system maps to Documents
+ * on an English target system); its absence falls back to the target system's
+ * basename. If packages.txt is present, installs the listed packages via the
+ * distro's package manager. A v1 manifest that records network configuration
+ * also restores container-root network/ backend directories after the main
+ * payload succeeds. NetworkManager profiles are reloaded best-effort; netplan
+ * and systemd-networkd configuration is written with manual apply instructions.
  *
- * @param source Path to the dated backup directory (e.g. /mnt/drive/migr_backup_20260519).
- * @return 0 on success or user cancellation, 1 on error.
+ * @param source Path to the backup container (e.g. /mnt/drive/migr-eyildizemre).
+ * @return MIGR_EXIT_OK on success or user cancellation, MIGR_EXIT_CHANGED
+ *         when it completed but other programs changed restored items
+ *         afterwards (D67), and MIGR_EXIT_FAILURE on error (D68).
  */
+typedef struct {
+    int skip_content_verification;
+} RestoreOptions;
+
+int restore_with_options(const char *source, const RestoreOptions *options);
 int restore(const char *source);
+
+/* Returns 1 when restoring the manifest's saved network configuration would
+ * encounter at least one regular file in a known backend directory, or when
+ * the read-only inspection cannot establish that safely. */
+int restore_network_config_would_write(int source_root_fd);
 
 #endif

@@ -1,0 +1,1412 @@
+// Unit tests for portable stale-entry reconciliation and the finalization
+// gate (docs/DECISIONS.md D17), the third and final step of the
+// portable capture core: after a full successful root walk, the previous
+// run's committed live-key set is diffed against the keys visited this run,
+// and every stale key is DELETE-committed in the sidecar and its physical
+// payload removed fd-anchored, never following symlinks. A cleanup or
+// final-inventory failure blocks finalization outright; a stale file must
+// never survive in the final backup.
+//
+// Coverage: a file deleted from the source between two runs of a resumed
+// capture does not survive in the final backup; a deleted subtree (directory
+// and payload) is removed; an unlink/rmdir failure (payload made
+// undeletable) blocks finalization; the final live-state/payload inventory
+// consistency check catches a planted-payload mismatch and fails; and real
+// SIGKILL fixtures (child processes, not synthetic stand-ins, sharing the
+// fork+kill harness with tests/test_portable_resume.c) cover the new
+// reconciliation interruption boundaries -- after the stale DELETE, before
+// and after the stale payload unlink, and before the final inventory check.
+// Each interrupted state must remain deterministically resumable, and the
+// resumed reconciliation must complete to the expected payload inventory.
+//
+// The inventory consistency walk resolves physical children through the
+// parent-relative live/tombstone ownership indexes while keeping logical
+// identity in sidecar state, so collision-suffixed payload names are covered
+// without treating their on-disk spelling as a logical path.
+
+#define _GNU_SOURCE
+
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <ftw.h>
+#include <limits.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include "portable.h"
+#include "portable_reconcile_internal.h"
+#include "sidecar.h"
+
+#define GREEN "\033[0;32m"
+#define RED   "\033[0;31m"
+#define BLUE  "\033[0;34m"
+#define YELLOW "\033[0;33m"
+#define NC    "\033[0m"
+
+static int failures;
+static int skips;
+
+static void check(int condition, const char *label)
+{
+    if (condition)
+        printf("  " GREEN "v" NC " %s\n", label);
+    else {
+        printf("  " RED "x" NC " %s\n", label);
+        failures++;
+    }
+}
+
+typedef struct {
+    size_t count;
+    int valid;
+    uint64_t expected_generation;
+} ClaimForeachResult;
+
+static int claim_foreach_callback(const SidecarClaimView *view, void *argument)
+{
+    ClaimForeachResult *result = argument;
+    if (result == NULL || view == NULL || view->claim == NULL)
+        return 1;
+    result->count++;
+    if (view->claim->root_id.length != 4U ||
+        memcmp(view->claim->root_id.data, "ROOT", 4) != 0 ||
+        view->claim->logical_path.length != 5U ||
+        memcmp(view->claim->logical_path.data, "claim", 5) != 0 ||
+        view->claim->physical_leaf.length != 5U ||
+        memcmp(view->claim->physical_leaf.data, "claim", 5) != 0 ||
+        view->claim->kind != SIDECAR_KIND_REGULAR ||
+        view->generation != result->expected_generation)
+        result->valid = 0;
+    return 0;
+}
+
+static void skip_check(const char *label)
+{
+    printf("  " YELLOW "-" NC " %s\n", label);
+    skips++;
+}
+
+static void fixture_fatal(const char *message)
+{
+    fprintf(stderr, "portable reconciliation fixture failure: %s\n", message);
+    exit(2);
+}
+
+static int remove_callback_fatal(const char *path, const struct stat *st,
+                                 int type, struct FTW *state)
+{
+    (void)st;
+    (void)type;
+    (void)state;
+    if (remove(path) != 0)
+        fixture_fatal("could not remove fixture tree");
+    return 0;
+}
+
+static void remove_tree(const char *path)
+{
+    struct stat st;
+    if (lstat(path, &st) != 0) {
+        if (errno == ENOENT)
+            return;
+        fixture_fatal("could not inspect fixture tree");
+    }
+    if (nftw(path, remove_callback_fatal, 16, FTW_DEPTH | FTW_PHYS) != 0)
+        fixture_fatal("could not walk fixture tree");
+}
+
+static void join_path(char *out, size_t size, const char *left,
+                      const char *right)
+{
+    int length = snprintf(out, size, "%s/%s", left, right);
+    if (length < 0 || (size_t)length >= size)
+        fixture_fatal("fixture path is too long");
+}
+
+static void make_directory(const char *path)
+{
+    if (mkdir(path, 0700) != 0)
+        fixture_fatal("could not create fixture directory");
+}
+
+static void write_file(const char *path, const char *text)
+{
+    size_t length = strlen(text);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0)
+        fixture_fatal("could not create fixture file");
+    size_t offset = 0;
+    while (offset < length) {
+        ssize_t written = write(fd, text + offset, length - offset);
+        if (written < 0 && errno == EINTR)
+            continue;
+        if (written <= 0)
+            fixture_fatal("could not write fixture file");
+        offset += (size_t)written;
+    }
+    if (close(fd) != 0)
+        fixture_fatal("could not close fixture file");
+}
+
+static int path_exists(const char *path)
+{
+    struct stat st;
+    return lstat(path, &st) == 0;
+}
+
+static int path_missing(const char *path)
+{
+    struct stat st;
+    return lstat(path, &st) != 0 && errno == ENOENT;
+}
+
+static int open_fd_count(void)
+{
+    DIR *directory = opendir("/proc/self/fd");
+    if (directory == NULL)
+        return -1;
+    int count = 0;
+    while (readdir(directory) != NULL)
+        count++;
+    if (closedir(directory) != 0)
+        return -1;
+    return count - 2;
+}
+
+typedef struct {
+    char source[PATH_MAX];
+    char container[PATH_MAX];
+    char payload_root[PATH_MAX];
+    char payload_gone[PATH_MAX];
+    PortableRootSpec root;
+    PortableCaptureRequest request;
+    int container_fd;
+} Fixture;
+
+typedef struct {
+    char source[PATH_MAX];
+    char container[PATH_MAX];
+    char payload_claimed[PATH_MAX];
+    PortableRootSpec root;
+    PortableCaptureRequest request;
+    int container_fd;
+} ClaimDirectoryFixture;
+
+static int prepare_fixture(const char *base, const char *label,
+                           Fixture *fixture)
+{
+    memset(fixture, 0, sizeof(*fixture));
+    fixture->container_fd = -1;
+    int source_length = snprintf(fixture->source, sizeof(fixture->source),
+                                 "%s/%s-source", base, label);
+    int container_length = snprintf(fixture->container,
+                                    sizeof(fixture->container), "%s/%s-container",
+                                    base, label);
+    if (source_length < 0 || container_length < 0 ||
+        (size_t)source_length >= sizeof(fixture->source) ||
+        (size_t)container_length >= sizeof(fixture->container))
+        return -1;
+    make_directory(fixture->source);
+    make_directory(fixture->container);
+
+    char keep[PATH_MAX];
+    char gone[PATH_MAX];
+    join_path(keep, sizeof(keep), fixture->source, "keep");
+    join_path(gone, sizeof(gone), fixture->source, "gone");
+    write_file(keep, "keep");
+    write_file(gone, "gone");
+
+    join_path(fixture->payload_root, sizeof(fixture->payload_root),
+              fixture->container, "data/ROOT");
+    join_path(fixture->payload_gone, sizeof(fixture->payload_gone),
+              fixture->payload_root, "gone");
+    fixture->root = (PortableRootSpec){
+        .id = "ROOT",
+        .policy = ROOT_POLICY_HOME_RELATIVE,
+        .capture_path = fixture->source,
+        .payload_path = "ROOT",
+        .source_path = fixture->source,
+        .restore_path = "fixture",
+        .has_restore_path = 1
+    };
+    fixture->request = (PortableCaptureRequest){
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .has_source_identity = 1,
+        .machine_id = "b3c0",
+        .source_uid = getuid(),
+        .roots = &fixture->root,
+        .root_count = 1
+    };
+    fixture->container_fd = open(fixture->container,
+                                 O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fixture->container_fd < 0)
+        return -1;
+    int result = portable_capture_fresh_at(fixture->container_fd,
+                                           &fixture->request, NULL);
+    if (result != 0) {
+        close(fixture->container_fd);
+        fixture->container_fd = -1;
+        return -1;
+    }
+    return 0;
+}
+
+static void close_fixture(Fixture *fixture)
+{
+    if (fixture != NULL && fixture->container_fd >= 0) {
+        close(fixture->container_fd);
+        fixture->container_fd = -1;
+    }
+}
+
+static int prepare_claim_directory_fixture(const char *base,
+                                           const char *label, int nested,
+                                           ClaimDirectoryFixture *fixture)
+{
+    if (base == NULL || label == NULL || fixture == NULL)
+        return -1;
+    memset(fixture, 0, sizeof(*fixture));
+    fixture->container_fd = -1;
+    int source_length = snprintf(fixture->source, sizeof(fixture->source),
+                                 "%s/%s-source", base, label);
+    int container_length = snprintf(fixture->container,
+                                    sizeof(fixture->container),
+                                    "%s/%s-container", base, label);
+    if (source_length < 0 || container_length < 0 ||
+        (size_t)source_length >= sizeof(fixture->source) ||
+        (size_t)container_length >= sizeof(fixture->container))
+        return -1;
+    make_directory(fixture->source);
+    make_directory(fixture->container);
+
+    char keep[PATH_MAX];
+    char claimed[PATH_MAX];
+    join_path(keep, sizeof(keep), fixture->source, "keep");
+    join_path(claimed, sizeof(claimed), fixture->source, "claimed");
+    write_file(keep, "keep");
+    make_directory(claimed);
+    if (nested) {
+        char child[PATH_MAX];
+        join_path(child, sizeof(child), claimed, "child");
+        write_file(child, "child");
+    }
+
+    fixture->root = (PortableRootSpec){
+        .id = "ROOT",
+        .policy = ROOT_POLICY_HOME_RELATIVE,
+        .capture_path = fixture->source,
+        .payload_path = "ROOT",
+        .source_path = fixture->source,
+        .restore_path = "fixture",
+        .has_restore_path = 1
+    };
+    fixture->request = (PortableCaptureRequest){
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .has_source_identity = 1,
+        .machine_id = "c7a1",
+        .source_uid = getuid(),
+        .roots = &fixture->root,
+        .root_count = 1
+    };
+    fixture->container_fd = open(fixture->container,
+                                 O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fixture->container_fd < 0)
+        return -1;
+    if (portable_capture_fresh_at(fixture->container_fd, &fixture->request,
+                                  NULL) != 0) {
+        close(fixture->container_fd);
+        fixture->container_fd = -1;
+        return -1;
+    }
+    join_path(fixture->payload_claimed, sizeof(fixture->payload_claimed),
+              fixture->container, "data/ROOT/claimed");
+    return 0;
+}
+
+static int convert_directory_to_claim(const ClaimDirectoryFixture *fixture)
+{
+    if (fixture == NULL || fixture->container_fd < 0)
+        return -1;
+    SidecarLog log = {0};
+    if (sidecar_log_adopt_at(fixture->container_fd, &log) !=
+        SIDECAR_OPEN_RESUMABLE)
+        return -1;
+    SidecarDelete deletion = {
+        .root_id = { (const unsigned char *)"ROOT", 4 },
+        .logical_path = { (const unsigned char *)"claimed", 7 }
+    };
+    SidecarClaim claim = {
+        .root_id = { (const unsigned char *)"ROOT", 4 },
+        .logical_path = { (const unsigned char *)"claimed", 7 },
+        .physical_leaf = { (const unsigned char *)"claimed", 7 },
+        .kind = SIDECAR_KIND_DIRECTORY
+    };
+    int result = sidecar_log_append_delete(&log, &deletion) ==
+                     SIDECAR_STATUS_OK &&
+                 sidecar_log_append_claim(&log, &claim) == SIDECAR_STATUS_OK;
+    if (sidecar_log_close(&log) != SIDECAR_STATUS_OK)
+        result = 0;
+    return result ? 0 : -1;
+}
+
+static int outstanding_claim_count(int container_fd)
+{
+    SidecarLog log = {0};
+    if (sidecar_log_adopt_at(container_fd, &log) != SIDECAR_OPEN_RESUMABLE)
+        return -1;
+    size_t count = sidecar_log_claim_count(&log);
+    if (sidecar_log_close(&log) != SIDECAR_STATUS_OK)
+        return -1;
+    return count > INT_MAX ? -1 : (int)count;
+}
+
+static void test_claim_foreach(const char *base)
+{
+    printf(BLUE "::" NC " outstanding CLAIM iteration\n");
+    Fixture fixture;
+    check(prepare_fixture(base, "claim-foreach", &fixture) == 0,
+          "claim foreach fixture is captured");
+    if (fixture.container_fd < 0)
+        return;
+
+    SidecarLog log = {0};
+    SidecarClaim first = {
+        .root_id = { (const unsigned char *)"ROOT", 4 },
+        .logical_path = { (const unsigned char *)"drop", 4 },
+        .physical_leaf = { (const unsigned char *)"drop", 4 },
+        .kind = SIDECAR_KIND_REGULAR
+    };
+    SidecarClaim second = {
+        .root_id = { (const unsigned char *)"ROOT", 4 },
+        .logical_path = { (const unsigned char *)"claim", 5 },
+        .physical_leaf = { (const unsigned char *)"claim", 5 },
+        .kind = SIDECAR_KIND_REGULAR
+    };
+    SidecarDelete cancel = {
+        .root_id = { (const unsigned char *)"ROOT", 4 },
+        .logical_path = { (const unsigned char *)"drop", 4 }
+    };
+    ClaimForeachResult result = { .valid = 1 };
+    int setup = sidecar_log_adopt_at(fixture.container_fd, &log) ==
+                    SIDECAR_OPEN_RESUMABLE &&
+                sidecar_log_append_claim(&log, &first) == SIDECAR_STATUS_OK &&
+                sidecar_log_append_claim(&log, &second) == SIDECAR_STATUS_OK &&
+                sidecar_log_append_delete(&log, &cancel) == SIDECAR_STATUS_OK;
+    SidecarClaimView surviving = {0};
+    if (setup && sidecar_log_find_claim(
+                     &log,
+                     (SidecarBytes){ (const unsigned char *)"ROOT", 4 },
+                     (SidecarBytes){ (const unsigned char *)"claim", 5 },
+                     &surviving) == 1)
+        result.expected_generation = surviving.generation;
+    int iterated = setup && result.expected_generation != 0U &&
+                   sidecar_log_claim_foreach(&log, claim_foreach_callback,
+                                             &result) == SIDECAR_STATUS_OK;
+    check(iterated && result.count == 1U && result.valid &&
+              sidecar_log_close(&log) == SIDECAR_STATUS_OK,
+          "claim iteration visits only the outstanding claim with its generation");
+    close_fixture(&fixture);
+}
+
+static int sidecar_state(const Fixture *fixture, const char *logical,
+                         int *live, int *deleted)
+{
+    SidecarLog log = {0};
+    if (sidecar_log_adopt_at(fixture->container_fd, &log) !=
+        SIDECAR_OPEN_RESUMABLE)
+        return -1;
+    SidecarLiveView view;
+    int found = sidecar_log_find(
+        &log,
+        (SidecarBytes){ (const unsigned char *)"ROOT", 4 },
+        (SidecarBytes){ (const unsigned char *)logical, strlen(logical) },
+        &view);
+    int tombstone = sidecar_log_find_deleted(
+        &log,
+        (SidecarBytes){ (const unsigned char *)"ROOT", 4 },
+        (SidecarBytes){ (const unsigned char *)logical, strlen(logical) },
+        &view);
+    int result = sidecar_log_close(&log) == SIDECAR_STATUS_OK ? 0 : -1;
+    if (result == 0) {
+        if (live != NULL)
+            *live = found;
+        if (deleted != NULL)
+            *deleted = tombstone;
+    }
+    return result;
+}
+
+static int child_killed(int status)
+{
+    return WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL;
+}
+
+static int run_request_interrupt(int container_fd,
+                                 const PortableCaptureRequest *request,
+                                 PortableTestInterruptPoint point)
+{
+    if (container_fd < 0 || request == NULL)
+        return -1;
+    pid_t child = fork();
+    if (child < 0)
+        return -1;
+    if (child == 0) {
+        portable_capture_test_set_interrupt(point);
+        int result = portable_capture_resume_at(container_fd, request, NULL);
+        _exit(result == 0 ? 0 : 1);
+    }
+    int status = 0;
+    if (waitpid(child, &status, 0) != child)
+        return -1;
+    return child_killed(status) ? 0 : -1;
+}
+
+static int run_resume_interrupt(const Fixture *fixture,
+                                PortableTestInterruptPoint point)
+{
+    if (fixture == NULL)
+        return -1;
+    return run_request_interrupt(fixture->container_fd, &fixture->request,
+                                 point);
+}
+
+static void reset_interrupts(void)
+{
+    portable_capture_test_set_interrupt(PORTABLE_TEST_INTERRUPT_NONE);
+}
+
+static void test_deleted_file(const char *base)
+{
+    printf(BLUE "::" NC " stale file reconciliation\n");
+    Fixture fixture;
+    check(prepare_fixture(base, "file", &fixture) == 0,
+          "initial capture creates a complete file fixture");
+    if (fixture.container_fd < 0)
+        return;
+
+    char source_gone[PATH_MAX];
+    join_path(source_gone, sizeof(source_gone), fixture.source, "gone");
+    if (unlink(source_gone) != 0)
+        fixture_fatal("could not remove source file");
+    check(portable_capture_resume_at(fixture.container_fd,
+                                     &fixture.request, NULL) == 0,
+          "resume reconciles a source file deleted between runs");
+    int live = -1;
+    int deleted = -1;
+    check(sidecar_state(&fixture, "gone", &live, &deleted) == 0 &&
+          live == 0 && deleted == 1,
+          "deleted file is non-live with retained deletion provenance");
+    check(path_missing(fixture.payload_gone),
+          "deleted file payload is removed from the container");
+    close_fixture(&fixture);
+}
+
+static void test_deleted_symlink(const char *base)
+{
+    printf(BLUE "::" NC " stale symlink reconciliation\n");
+    char source[PATH_MAX];
+    char container[PATH_MAX];
+    join_path(source, sizeof(source), base, "symlink-source");
+    join_path(container, sizeof(container), base, "symlink-container");
+    make_directory(source);
+    make_directory(container);
+
+    char link_path[PATH_MAX];
+    join_path(link_path, sizeof(link_path), source, "gone");
+    if (symlink("gone-target", link_path) != 0)
+        fixture_fatal("could not create stale symlink fixture");
+
+    PortableRootSpec root = {
+        .id = "ROOT",
+        .policy = ROOT_POLICY_HOME_RELATIVE,
+        .capture_path = source,
+        .payload_path = "ROOT",
+        .source_path = source,
+        .restore_path = "fixture",
+        .has_restore_path = 1
+    };
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .has_source_identity = 1,
+        .machine_id = "c3c1",
+        .source_uid = getuid(),
+        .roots = &root,
+        .root_count = 1
+    };
+    int container_fd = open(container, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open stale symlink container");
+    check(portable_capture_fresh_at(container_fd, &request, NULL) == 0,
+          "initial capture creates a symlink placeholder");
+
+    char payload[PATH_MAX];
+    join_path(payload, sizeof(payload), container, "data/ROOT/gone");
+    check(path_exists(payload),
+          "captured symlink has a payload placeholder before deletion");
+    if (unlink(link_path) != 0)
+        fixture_fatal("could not remove stale symlink source");
+    check(portable_capture_resume_at(container_fd, &request, NULL) == 0,
+          "resume reconciles a deleted source symlink");
+    int live = -1;
+    int deleted = -1;
+    check(sidecar_state(&(Fixture){ .container_fd = container_fd }, "gone",
+                         &live, &deleted) == 0 && live == 0 && deleted == 1,
+          "deleted symlink is non-live with retained deletion provenance");
+    check(path_missing(payload),
+          "deleted symlink placeholder is removed from the container");
+    close(container_fd);
+}
+
+static void test_deleted_subtree(const char *base)
+{
+    printf(BLUE "::" NC " stale subtree reconciliation\n");
+    char source[PATH_MAX];
+    char container[PATH_MAX];
+    int source_length = snprintf(source, sizeof(source), "%s/subtree-source",
+                                 base);
+    int container_length = snprintf(container, sizeof(container),
+                                    "%s/subtree-container", base);
+    if (source_length < 0 || container_length < 0 ||
+        (size_t)source_length >= sizeof(source) ||
+        (size_t)container_length >= sizeof(container))
+        fixture_fatal("subtree fixture path is too long");
+    make_directory(source);
+    make_directory(container);
+    char subtree[PATH_MAX];
+    char child[PATH_MAX];
+    join_path(subtree, sizeof(subtree), source, "tree");
+    join_path(child, sizeof(child), subtree, "child");
+    make_directory(subtree);
+    write_file(child, "child");
+
+    PortableRootSpec root = {
+        .id = "ROOT",
+        .policy = ROOT_POLICY_HOME_RELATIVE,
+        .capture_path = source,
+        .payload_path = "ROOT",
+        .source_path = source,
+        .restore_path = "fixture",
+        .has_restore_path = 1
+    };
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .has_source_identity = 1,
+        .machine_id = "b3c0",
+        .source_uid = getuid(),
+        .roots = &root,
+        .root_count = 1
+    };
+    int container_fd = open(container, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open subtree container");
+    check(portable_capture_fresh_at(container_fd, &request, NULL) == 0,
+          "subtree fixture is captured");
+    if (unlink(child) != 0 || rmdir(subtree) != 0)
+        fixture_fatal("could not remove source subtree");
+    check(portable_capture_resume_at(container_fd, &request, NULL) == 0,
+          "resume reconciles a deleted source subtree");
+    char payload_subtree[PATH_MAX];
+    join_path(payload_subtree, sizeof(payload_subtree), container,
+              "data/ROOT/tree");
+    check(path_missing(payload_subtree),
+          "deleted subtree payload is removed recursively");
+    int live = -1;
+    int deleted = -1;
+    check(sidecar_state(&(Fixture){ .container_fd = container_fd }, "tree",
+                        &live, &deleted) == 0 && live == 0,
+          "deleted subtree directory is no longer live");
+    check(sidecar_state(&(Fixture){ .container_fd = container_fd },
+                        "tree/child", &live, &deleted) == 0 && live == 0,
+          "deleted subtree child is no longer live");
+    close(container_fd);
+}
+
+static void test_stale_subtree_child_before_parent(const char *base)
+{
+    printf(BLUE "::" NC " stale subtree deletes descendants before ancestors\n");
+    char source[PATH_MAX];
+    char container[PATH_MAX];
+    join_path(source, sizeof(source), base, "stale-order-source");
+    join_path(container, sizeof(container), base, "stale-order-container");
+    make_directory(source);
+    make_directory(container);
+
+    char tree[PATH_MAX];
+    char child[PATH_MAX];
+    join_path(tree, sizeof(tree), source, "tree");
+    join_path(child, sizeof(child), tree, "child");
+    make_directory(tree);
+    write_file(child, "child");
+
+    PortableRootSpec root = {
+        .id = "ROOT",
+        .policy = ROOT_POLICY_HOME_RELATIVE,
+        .capture_path = source,
+        .payload_path = "ROOT",
+        .source_path = source,
+        .restore_path = "fixture",
+        .has_restore_path = 1
+    };
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .has_source_identity = 1,
+        .machine_id = "d390",
+        .source_uid = getuid(),
+        .roots = &root,
+        .root_count = 1,
+        .case_sensitive = 1
+    };
+    int container_fd = open(container, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open stale-order container");
+    check(portable_capture_fresh_at(container_fd, &request, NULL) == 0,
+          "stale-order fixture is captured");
+    if (unlink(child) != 0 || rmdir(tree) != 0)
+        fixture_fatal("could not remove stale-order source subtree");
+
+    check(run_request_interrupt(container_fd, &request,
+                                PORTABLE_TEST_AFTER_STALE_DELETE) == 0,
+          "resume is interrupted immediately after the first stale DELETE");
+    reset_interrupts();
+
+    Fixture state = { .container_fd = container_fd };
+    int tree_live = -1;
+    int tree_deleted = -1;
+    int child_live = -1;
+    int child_deleted = -1;
+    check(sidecar_state(&state, "tree/child", &child_live, &child_deleted) == 0 &&
+              child_live == 0 && child_deleted == 1 &&
+              sidecar_state(&state, "tree", &tree_live, &tree_deleted) == 0 &&
+              tree_live == 1 && tree_deleted == 0,
+          "the first stale DELETE tombstones the deepest child while its parent stays live");
+
+    char payload_tree[PATH_MAX];
+    char payload_child[PATH_MAX];
+    join_path(payload_tree, sizeof(payload_tree), container, "data/ROOT/tree");
+    join_path(payload_child, sizeof(payload_child), payload_tree, "child");
+    check(path_exists(payload_tree) && path_exists(payload_child),
+          "the interrupted DELETE keeps the old parent chain and child payload reachable");
+    check(portable_capture_resume_at(container_fd, &request, NULL) == 0,
+          "the next resume completes child-before-parent stale cleanup");
+    check(path_missing(payload_tree),
+          "resumed stale cleanup removes the complete old subtree");
+    close(container_fd);
+}
+
+static void remove_claimed_source(const ClaimDirectoryFixture *fixture,
+                                  int nested)
+{
+    char source_claimed[PATH_MAX];
+    join_path(source_claimed, sizeof(source_claimed), fixture->source,
+              "claimed");
+    if (nested) {
+        char source_child[PATH_MAX];
+        join_path(source_child, sizeof(source_child), source_claimed, "child");
+        if (unlink(source_child) != 0)
+            fixture_fatal("could not remove claimed source child");
+    }
+    if (rmdir(source_claimed) != 0)
+        fixture_fatal("could not remove claimed source directory");
+}
+
+static void test_stale_empty_claim(const char *base)
+{
+    printf(BLUE "::" NC " stale empty CLAIM reconciliation\n");
+    ClaimDirectoryFixture fixture;
+    check(prepare_claim_directory_fixture(base, "claim-empty", 0,
+                                          &fixture) == 0,
+          "empty claimed-directory fixture is captured");
+    if (fixture.container_fd < 0)
+        return;
+    check(convert_directory_to_claim(&fixture) == 0,
+          "empty directory becomes an outstanding CLAIM");
+    remove_claimed_source(&fixture, 0);
+    check(portable_capture_resume_at(fixture.container_fd,
+                                     &fixture.request, NULL) == 0,
+          "resume removes an unvisited empty claimed directory");
+    int live = -1;
+    int deleted = -1;
+    Fixture state = { .container_fd = fixture.container_fd };
+    check(path_missing(fixture.payload_claimed) &&
+              outstanding_claim_count(fixture.container_fd) == 0 &&
+              sidecar_state(&state, "claimed", &live, &deleted) == 0 &&
+              live == 0 && deleted == 1,
+          "empty CLAIM cleanup leaves zero outstanding claims and a DELETE");
+    close(fixture.container_fd);
+}
+
+static void test_stale_nested_claim(const char *base)
+{
+    printf(BLUE "::" NC " nested stale CLAIM reconciliation\n");
+    ClaimDirectoryFixture fixture;
+    check(prepare_claim_directory_fixture(base, "claim-nested", 1,
+                                          &fixture) == 0,
+          "nested claimed-directory fixture is captured");
+    if (fixture.container_fd < 0)
+        return;
+    check(convert_directory_to_claim(&fixture) == 0,
+          "nested directory becomes a CLAIM while its child stays LIVE");
+    remove_claimed_source(&fixture, 1);
+    check(portable_capture_resume_at(fixture.container_fd,
+                                     &fixture.request, NULL) == 0,
+          "resume cleans nested stale LIVE and CLAIM descendants deepest-first");
+    char payload_child[PATH_MAX];
+    join_path(payload_child, sizeof(payload_child), fixture.payload_claimed,
+              "child");
+    int live = -1;
+    int deleted = -1;
+    Fixture state = { .container_fd = fixture.container_fd };
+    check(path_missing(fixture.payload_claimed) && path_missing(payload_child) &&
+              outstanding_claim_count(fixture.container_fd) == 0 &&
+              sidecar_state(&state, "claimed", &live, &deleted) == 0 &&
+              live == 0 && deleted == 1 &&
+              sidecar_state(&state, "claimed/child", &live, &deleted) == 0 &&
+              live == 0 && deleted == 1,
+          "nested cleanup removes every payload and leaves no CLAIM");
+    close(fixture.container_fd);
+}
+
+static void test_foreign_child_blocks_claim_cleanup(const char *base)
+{
+    printf(BLUE "::" NC " foreign child blocks stale CLAIM cleanup\n");
+    ClaimDirectoryFixture fixture;
+    check(prepare_claim_directory_fixture(base, "claim-foreign", 0,
+                                          &fixture) == 0,
+          "foreign-child claimed-directory fixture is captured");
+    if (fixture.container_fd < 0)
+        return;
+    check(convert_directory_to_claim(&fixture) == 0,
+          "foreign-child directory becomes an outstanding CLAIM");
+    char foreign[PATH_MAX];
+    join_path(foreign, sizeof(foreign), fixture.payload_claimed, "foreign");
+    write_file(foreign, "foreign");
+    remove_claimed_source(&fixture, 0);
+    check(portable_capture_resume_at(fixture.container_fd,
+                                     &fixture.request, NULL) != 0,
+          "foreign child rejects stale CLAIM reconciliation");
+    check(path_exists(fixture.payload_claimed) && path_exists(foreign) &&
+              outstanding_claim_count(fixture.container_fd) == 1,
+          "foreign-child refusal leaves the whole payload and CLAIM intact");
+    close(fixture.container_fd);
+}
+
+static void test_collision_claim_foreign_child(const char *base)
+{
+    printf(BLUE "::" NC " collision-suffixed CLAIM ownership stays exact\n");
+    char source[PATH_MAX];
+    char container[PATH_MAX];
+    join_path(source, sizeof(source), base, "claim-collision-source");
+    join_path(container, sizeof(container), base, "claim-collision-container");
+    make_directory(source);
+    make_directory(container);
+
+    char claimed[PATH_MAX];
+    char upper[PATH_MAX];
+    char lower[PATH_MAX];
+    join_path(claimed, sizeof(claimed), source, "claimed");
+    join_path(upper, sizeof(upper), claimed, "Child");
+    join_path(lower, sizeof(lower), claimed, "child");
+    make_directory(claimed);
+    write_file(upper, "upper");
+    write_file(lower, "lower");
+
+    PortableRootSpec root = {
+        .id = "ROOT",
+        .policy = ROOT_POLICY_HOME_RELATIVE,
+        .capture_path = source,
+        .payload_path = "ROOT",
+        .source_path = source,
+        .restore_path = "fixture",
+        .has_restore_path = 1
+    };
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .has_source_identity = 1,
+        .machine_id = "d391",
+        .source_uid = getuid(),
+        .roots = &root,
+        .root_count = 1,
+        .case_sensitive = 0
+    };
+    int container_fd = open(container, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open collision-CLAIM container");
+    check(portable_capture_fresh_at(container_fd, &request, NULL) == 0,
+          "case-colliding children are captured before CLAIM conversion");
+
+    char payload_claimed[PATH_MAX];
+    char payload_upper[PATH_MAX];
+    char payload_lower[PATH_MAX];
+    join_path(payload_claimed, sizeof(payload_claimed), container,
+              "data/ROOT/claimed");
+    join_path(payload_upper, sizeof(payload_upper), payload_claimed, "Child");
+    join_path(payload_lower, sizeof(payload_lower), payload_claimed,
+              "child%7E1");
+    check(path_exists(payload_upper) && path_exists(payload_lower),
+          "the fixture contains an owned collision-suffixed physical child");
+
+    ClaimDirectoryFixture claim_fixture = { .container_fd = container_fd };
+    check(convert_directory_to_claim(&claim_fixture) == 0,
+          "the collision-bearing directory becomes an outstanding CLAIM");
+    if (unlink(upper) != 0 || unlink(lower) != 0 || rmdir(claimed) != 0)
+        fixture_fatal("could not remove collision-CLAIM source subtree");
+
+    char foreign[PATH_MAX];
+    join_path(foreign, sizeof(foreign), payload_claimed, "foreign");
+    write_file(foreign, "foreign");
+    check(portable_capture_resume_at(container_fd, &request, NULL) != 0,
+          "a foreign child blocks cleanup even beside collision-suffixed owned children");
+    check(path_exists(payload_claimed) && path_exists(payload_upper) &&
+              path_exists(payload_lower) && path_exists(foreign) &&
+              outstanding_claim_count(container_fd) == 1,
+          "foreign-child refusal leaves the CLAIM and every owned payload untouched");
+
+    if (unlink(foreign) != 0)
+        fixture_fatal("could not remove collision-CLAIM foreign child");
+    check(portable_capture_resume_at(container_fd, &request, NULL) == 0 &&
+              path_missing(payload_claimed) &&
+              outstanding_claim_count(container_fd) == 0,
+          "without the foreign child, parent-relative ownership cleans the suffixed CLAIM subtree");
+    close(container_fd);
+}
+
+static void test_stale_claim_child_vanishes_during_validation(
+    const char *base)
+{
+    printf(BLUE "::" NC " a payload entry vanishing during validation's "
+                 "directory scan is tolerated, not a hard failure\n");
+    ClaimDirectoryFixture fixture;
+    check(prepare_claim_directory_fixture(base, "claim-vanish-child", 0,
+                                          &fixture) == 0,
+          "vanish-during-validation fixture is captured");
+    if (fixture.container_fd < 0)
+        return;
+    check(convert_directory_to_claim(&fixture) == 0,
+          "empty directory becomes an outstanding CLAIM");
+    remove_claimed_source(&fixture, 0);
+    /* Nothing in the sidecar log owns this entry; it stands in for a payload
+     * dirent that readdir() still sees but that vanishes (here, by our own
+     * hand, deterministically) before the loop's fstatat() reaches it --
+     * the same race a concurrent stale-cleanup pass could cause. */
+    char ghost[PATH_MAX];
+    join_path(ghost, sizeof(ghost), fixture.payload_claimed, "ghost");
+    write_file(ghost, "ghost");
+    portable_reconcile_test_vanish_child_named("ghost");
+    int result = portable_capture_resume_at(fixture.container_fd,
+                                            &fixture.request, NULL);
+    portable_reconcile_test_vanish_child_named(NULL);
+    check(result == 0,
+          "an entry vanishing between readdir and fstatat during "
+          "validation does not abort reconciliation");
+    int live = -1;
+    int deleted = -1;
+    Fixture state = { .container_fd = fixture.container_fd };
+    check(path_missing(fixture.payload_claimed) && path_missing(ghost) &&
+              outstanding_claim_count(fixture.container_fd) == 0 &&
+              sidecar_state(&state, "claimed", &live, &deleted) == 0 &&
+              live == 0 && deleted == 1,
+          "cleanup still completes fully despite the mid-scan disappearance");
+    close(fixture.container_fd);
+}
+
+static void test_stale_claim_directory_vanishes_before_validation_descent(
+    const char *base)
+{
+    printf(BLUE "::" NC " a claimed directory vanishing right before "
+                 "validation descends into it is tolerated\n");
+    ClaimDirectoryFixture fixture;
+    check(prepare_claim_directory_fixture(base, "claim-vanish-validate", 0,
+                                          &fixture) == 0,
+          "vanish-before-validation-descent fixture is captured");
+    if (fixture.container_fd < 0)
+        return;
+    check(convert_directory_to_claim(&fixture) == 0,
+          "empty directory becomes an outstanding CLAIM");
+    remove_claimed_source(&fixture, 0);
+    portable_reconcile_test_vanish_descend_at(1);
+    int result = portable_capture_resume_at(fixture.container_fd,
+                                            &fixture.request, NULL);
+    portable_reconcile_test_vanish_descend_at(0);
+    check(result == 0,
+          "the directory vanishing between open_claim_node's stat and "
+          "validation's own descent does not abort reconciliation");
+    int live = -1;
+    int deleted = -1;
+    Fixture state = { .container_fd = fixture.container_fd };
+    check(path_missing(fixture.payload_claimed) &&
+              outstanding_claim_count(fixture.container_fd) == 0 &&
+              sidecar_state(&state, "claimed", &live, &deleted) == 0 &&
+              live == 0 && deleted == 1,
+          "cleanup still completes fully despite the pre-descent disappearance");
+    close(fixture.container_fd);
+}
+
+static void test_stale_claim_directory_vanishes_before_mutation_descent(
+    const char *base)
+{
+    printf(BLUE "::" NC " a claimed directory vanishing right before "
+                 "mutation descends into it is tolerated\n");
+    ClaimDirectoryFixture fixture;
+    check(prepare_claim_directory_fixture(base, "claim-vanish-mutate", 0,
+                                          &fixture) == 0,
+          "vanish-before-mutation-descent fixture is captured");
+    if (fixture.container_fd < 0)
+        return;
+    check(convert_directory_to_claim(&fixture) == 0,
+          "empty directory becomes an outstanding CLAIM");
+    remove_claimed_source(&fixture, 0);
+    /* Call #1 is validation's own descent into the still-intact directory;
+     * call #2 is mutation's separate, later descent into the same node --
+     * that's the one this test needs to catch mid-air. */
+    portable_reconcile_test_vanish_descend_at(2);
+    int result = portable_capture_resume_at(fixture.container_fd,
+                                            &fixture.request, NULL);
+    portable_reconcile_test_vanish_descend_at(0);
+    check(result == 0,
+          "the directory vanishing between open_claim_node's stat and "
+          "mutation's own descent does not abort reconciliation");
+    int live = -1;
+    int deleted = -1;
+    Fixture state = { .container_fd = fixture.container_fd };
+    check(path_missing(fixture.payload_claimed) &&
+              outstanding_claim_count(fixture.container_fd) == 0 &&
+              sidecar_state(&state, "claimed", &live, &deleted) == 0 &&
+              live == 0 && deleted == 1,
+          "cleanup still completes fully despite the pre-descent disappearance");
+    close(fixture.container_fd);
+}
+
+static void test_remove_payload_relative_close_failures(const char *base)
+{
+    printf(BLUE "::" NC " remove_payload_relative stays a no-op when an "
+                 "unrelated close() also fails\n");
+    char root[PATH_MAX];
+    join_path(root, sizeof(root), base, "remove-payload-relative");
+    make_directory(root);
+    char data[PATH_MAX];
+    join_path(data, sizeof(data), root, "data");
+    make_directory(data);
+    int data_fd = open(data, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (data_fd < 0)
+        fixture_fatal("could not open remove_payload_relative data fixture");
+
+    /* The payload root itself ("MISSING") doesn't exist -- the single-
+     * component path resolves trivially, but open_child_directory() fails
+     * with ENOENT -- and the subsequent close(root_parent) is forced to
+     * also fail with a genuine EBADF (closed one call early by the hook). */
+    portable_test_close_remove_payload_root_parent_early();
+    check(remove_payload_relative(data_fd, "MISSING", "leaf") == 0,
+          "an absent payload root is still a no-op when the root-parent "
+          "close also fails");
+
+    /* The payload root ("ROOT") exists, but the physical path's
+     * intermediate directory ("ROOT/subdir") doesn't -- and the subsequent
+     * close(payload_fd) is forced to also fail the same way. */
+    char payload_root[PATH_MAX];
+    join_path(payload_root, sizeof(payload_root), data, "ROOT");
+    make_directory(payload_root);
+    portable_test_close_remove_payload_payload_fd_early();
+    check(remove_payload_relative(data_fd, "ROOT", "subdir/leaf") == 0,
+          "an absent physical parent is still a no-op when the payload-fd "
+          "close also fails");
+
+    close(data_fd);
+    remove_tree(root);
+}
+
+static void test_capture_directory_scan_failure_frees_resources(
+    const char *base)
+{
+    printf(BLUE "::" NC " capture_directory frees the destination and "
+                 "source fds when fdopendir() fails\n");
+    char source[PATH_MAX];
+    char container[PATH_MAX];
+    join_path(source, sizeof(source), base, "capture-directory-leak-source");
+    join_path(container, sizeof(container), base,
+              "capture-directory-leak-container");
+    make_directory(source);
+    make_directory(container);
+    char subdir[PATH_MAX];
+    join_path(subdir, sizeof(subdir), source, "subdir");
+    make_directory(subdir);
+
+    PortableRootSpec root = {
+        .id = "ROOT",
+        .policy = ROOT_POLICY_HOME_RELATIVE,
+        .capture_path = source,
+        .payload_path = "ROOT",
+        .source_path = source,
+        .restore_path = "fixture",
+        .has_restore_path = 1
+    };
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .has_source_identity = 1,
+        .machine_id = "d1e2",
+        .source_uid = getuid(),
+        .roots = &root,
+        .root_count = 1
+    };
+    int container_fd = open(container, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open capture-directory-leak container");
+
+    int before_fds = open_fd_count();
+    portable_test_close_capture_directory_scan_fd_early();
+    int result = portable_capture_fresh_at(container_fd, &request, NULL);
+    int after_fds = open_fd_count();
+    check(result != 0, "the forced fdopendir failure aborts the capture");
+    check(before_fds >= 0 && after_fds == before_fds,
+          "the failure closes the destination and source fds instead of "
+          "leaking them");
+
+    close(container_fd);
+    remove_tree(source);
+    remove_tree(container);
+}
+
+static void test_cleanup_failure(const char *base)
+{
+    printf(BLUE "::" NC " stale cleanup failure gate\n");
+    if (geteuid() == 0) {
+        skip_check("permission-based unlink failure requires a non-root user");
+        return;
+    }
+    Fixture fixture;
+    check(prepare_fixture(base, "cleanup", &fixture) == 0,
+          "cleanup failure fixture is captured");
+    if (fixture.container_fd < 0)
+        return;
+    char source_gone[PATH_MAX];
+    join_path(source_gone, sizeof(source_gone), fixture.source, "gone");
+    if (unlink(source_gone) != 0 || chmod(fixture.payload_root, 0500) != 0)
+        fixture_fatal("could not prepare undeletable payload");
+    int result = portable_capture_resume_at(fixture.container_fd,
+                                             &fixture.request, NULL);
+    check(result != 0, "unlink failure blocks portable finalization");
+    check(path_exists(fixture.payload_gone),
+          "failed cleanup leaves the payload for a later resume");
+    if (chmod(fixture.payload_root, 0700) != 0)
+        fixture_fatal("could not restore payload permissions");
+    check(portable_capture_resume_at(fixture.container_fd,
+                                     &fixture.request, NULL) == 0,
+          "later resume retries and completes the cleanup");
+    check(path_missing(fixture.payload_gone),
+          "retry removes the previously protected payload");
+    close_fixture(&fixture);
+}
+
+static void test_inventory_mismatch(const char *base)
+{
+    printf(BLUE "::" NC " final inventory gate\n");
+    Fixture fixture;
+    check(prepare_fixture(base, "inventory", &fixture) == 0,
+          "inventory fixture is captured");
+    if (fixture.container_fd < 0)
+        return;
+    char planted[PATH_MAX];
+    join_path(planted, sizeof(planted), fixture.payload_root, "planted");
+    write_file(planted, "unexpected");
+    check(portable_capture_resume_at(fixture.container_fd,
+                                     &fixture.request, NULL) != 0,
+          "uncommitted payload blocks finalization");
+    check(path_exists(planted),
+          "inventory refusal does not delete an unknown payload");
+    close_fixture(&fixture);
+}
+
+static void test_collision_inventory_and_foreign_child(const char *base)
+{
+    printf(BLUE "::" NC " final inventory resolves collision-suffixed children\n");
+    char source[PATH_MAX];
+    char container[PATH_MAX];
+    join_path(source, sizeof(source), base, "inventory-collision-source");
+    join_path(container, sizeof(container), base, "inventory-collision-container");
+    make_directory(source);
+    make_directory(container);
+
+    char parent[PATH_MAX];
+    char upper[PATH_MAX];
+    char lower[PATH_MAX];
+    join_path(parent, sizeof(parent), source, "parent");
+    join_path(upper, sizeof(upper), parent, "Child");
+    join_path(lower, sizeof(lower), parent, "child");
+    make_directory(parent);
+    write_file(upper, "upper");
+    write_file(lower, "lower");
+
+    PortableRootSpec root = {
+        .id = "ROOT",
+        .policy = ROOT_POLICY_HOME_RELATIVE,
+        .capture_path = source,
+        .payload_path = "ROOT",
+        .source_path = source,
+        .restore_path = "fixture",
+        .has_restore_path = 1
+    };
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .has_source_identity = 1,
+        .machine_id = "d392",
+        .source_uid = getuid(),
+        .roots = &root,
+        .root_count = 1,
+        .case_sensitive = 0
+    };
+    int container_fd = open(container, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open collision-inventory container");
+    check(portable_capture_fresh_at(container_fd, &request, NULL) == 0 &&
+              portable_capture_resume_at(container_fd, &request, NULL) == 0,
+          "final inventory accepts a live child whose physical leaf is collision-suffixed");
+
+    char payload_parent[PATH_MAX];
+    char payload_suffixed[PATH_MAX];
+    char foreign[PATH_MAX];
+    join_path(payload_parent, sizeof(payload_parent), container,
+              "data/ROOT/parent");
+    join_path(payload_suffixed, sizeof(payload_suffixed), payload_parent,
+              "child%7E1");
+    join_path(foreign, sizeof(foreign), payload_parent, "foreign");
+    check(path_exists(payload_suffixed),
+          "inventory fixture actually uses a physical spelling different from its logical child");
+    write_file(foreign, "foreign");
+    check(portable_capture_resume_at(container_fd, &request, NULL) != 0,
+          "an extra foreign physical child still blocks final inventory");
+    check(path_exists(foreign),
+          "final inventory refuses rather than deleting the foreign child");
+    close(container_fd);
+}
+
+static void test_tombstone_parent_scope(const char *base)
+{
+    printf(BLUE "::" NC " tombstone ownership is scoped to its logical parent\n");
+    char source[PATH_MAX];
+    char container[PATH_MAX];
+    join_path(source, sizeof(source), base, "tombstone-parent-source");
+    join_path(container, sizeof(container), base, "tombstone-parent-container");
+    make_directory(source);
+    make_directory(container);
+
+    char parent_a[PATH_MAX];
+    char parent_b[PATH_MAX];
+    char source_leaf[PATH_MAX];
+    join_path(parent_a, sizeof(parent_a), source, "a");
+    join_path(parent_b, sizeof(parent_b), source, "b");
+    join_path(source_leaf, sizeof(source_leaf), parent_a, "L");
+    make_directory(parent_a);
+    make_directory(parent_b);
+    write_file(source_leaf, "owned");
+
+    PortableRootSpec root = {
+        .id = "ROOT",
+        .policy = ROOT_POLICY_HOME_RELATIVE,
+        .capture_path = source,
+        .payload_path = "ROOT",
+        .source_path = source,
+        .restore_path = "fixture",
+        .has_restore_path = 1
+    };
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .has_source_identity = 1,
+        .machine_id = "d393",
+        .source_uid = getuid(),
+        .roots = &root,
+        .root_count = 1,
+        .case_sensitive = 1
+    };
+    int container_fd = open(container, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open tombstone-parent container");
+    check(portable_capture_fresh_at(container_fd, &request, NULL) == 0,
+          "tombstone-parent fixture is captured");
+    if (unlink(source_leaf) != 0)
+        fixture_fatal("could not remove parent-A source leaf");
+    check(portable_capture_resume_at(container_fd, &request, NULL) == 0,
+          "parent-A deletion leaves recoverable tombstone provenance");
+
+    Fixture state = { .container_fd = container_fd };
+    int live = -1;
+    int deleted = -1;
+    check(sidecar_state(&state, "a/L", &live, &deleted) == 0 &&
+              live == 0 && deleted == 1,
+          "the current tombstone records the child under logical parent A");
+
+    char foreign[PATH_MAX];
+    join_path(foreign, sizeof(foreign), container, "data/ROOT/b/L");
+    write_file(foreign, "foreign");
+    check(portable_capture_resume_at(container_fd, &request, NULL) != 0,
+          "parent-A tombstone cannot authorize the same physical leaf under parent B");
+    check(path_exists(foreign),
+          "parent-scoped tombstone refusal leaves the foreign parent-B node untouched");
+    if (unlink(foreign) != 0)
+        fixture_fatal("could not remove parent-B foreign node");
+    check(portable_capture_resume_at(container_fd, &request, NULL) == 0,
+          "resume finalizes once the unrelated parent-B node is removed");
+    close(container_fd);
+}
+
+static void test_ambiguous_tombstone_owner_lookup(const char *base)
+{
+    printf(BLUE "::" NC " ambiguous tombstone ownership is not deletion authority\n");
+    Fixture fixture;
+    check(prepare_fixture(base, "tombstone-ambiguity", &fixture) == 0,
+          "tombstone-ambiguity fixture is captured");
+    if (fixture.container_fd < 0)
+        return;
+
+    SidecarLog log = {0};
+    SidecarClaim first_claim = {
+        .root_id = { (const unsigned char *)"ROOT", 4 },
+        .logical_path = { (const unsigned char *)"first", 5 },
+        .physical_leaf = { (const unsigned char *)"L", 1 },
+        .kind = SIDECAR_KIND_REGULAR
+    };
+    SidecarClaim second_claim = {
+        .root_id = { (const unsigned char *)"ROOT", 4 },
+        .logical_path = { (const unsigned char *)"second", 6 },
+        .physical_leaf = { (const unsigned char *)"L", 1 },
+        .kind = SIDECAR_KIND_REGULAR
+    };
+    SidecarEntry first_entry = {
+        .root_id = { (const unsigned char *)"ROOT", 4 },
+        .logical_path = { (const unsigned char *)"first", 5 },
+        .physical_leaf = { (const unsigned char *)"L", 1 },
+        .kind = SIDECAR_KIND_REGULAR,
+        .mode = 0644
+    };
+    SidecarEntry second_entry = first_entry;
+    second_entry.logical_path =
+        (SidecarBytes){ (const unsigned char *)"second", 6 };
+    SidecarDelete first_delete = {
+        .root_id = { (const unsigned char *)"ROOT", 4 },
+        .logical_path = { (const unsigned char *)"first", 5 }
+    };
+    SidecarDelete second_delete = {
+        .root_id = { (const unsigned char *)"ROOT", 4 },
+        .logical_path = { (const unsigned char *)"second", 6 }
+    };
+
+    int setup = sidecar_log_adopt_at(fixture.container_fd, &log) ==
+                    SIDECAR_OPEN_RESUMABLE &&
+                sidecar_log_append_claim(&log, &first_claim) ==
+                    SIDECAR_STATUS_OK &&
+                sidecar_log_append_entry(&log, &first_entry) ==
+                    SIDECAR_STATUS_OK &&
+                sidecar_log_append_entry_commit(&log) == SIDECAR_STATUS_OK &&
+                sidecar_log_append_claim(&log, &second_claim) ==
+                    SIDECAR_STATUS_OK &&
+                sidecar_log_append_entry(&log, &second_entry) ==
+                    SIDECAR_STATUS_OK &&
+                sidecar_log_append_entry_commit(&log) == SIDECAR_STATUS_OK &&
+                sidecar_log_append_delete(&log, &first_delete) ==
+                    SIDECAR_STATUS_OK &&
+                sidecar_log_append_delete(&log, &second_delete) ==
+                    SIDECAR_STATUS_OK;
+    check(setup,
+          "two logical tombstones can retain the same parent-relative physical leaf");
+
+    PortablePhysicalOwners owners = {0};
+    const PortablePhysicalOwner *owner = (const PortablePhysicalOwner *)1;
+    int loaded = setup && portable_tombstone_owners_load(&owners, &log) == 0;
+    int found = loaded ? portable_physical_owners_find(
+                             &owners, "ROOT", "", "L", &owner)
+                       : 1;
+    check(loaded && owners.count == 2U && found == -1 && owner == NULL,
+          "ambiguous tombstone parent/leaf lookup fails closed instead of authorizing deletion");
+    portable_physical_owners_free(&owners);
+    check(sidecar_log_close(&log) == SIDECAR_STATUS_OK,
+          "tombstone-ambiguity sidecar closes cleanly");
+    close_fixture(&fixture);
+}
+
+static void test_interrupt_boundary(const char *base,
+                                    const char *label,
+                                    PortableTestInterruptPoint point,
+                                    int delete_source,
+                                    int payload_survives)
+{
+    Fixture fixture;
+    check(prepare_fixture(base, label, &fixture) == 0,
+          "interruption fixture is captured");
+    if (fixture.container_fd < 0)
+        return;
+    if (delete_source) {
+        char source_gone[PATH_MAX];
+        join_path(source_gone, sizeof(source_gone), fixture.source, "gone");
+        if (unlink(source_gone) != 0)
+            fixture_fatal("could not remove stale interruption source");
+    }
+    check(run_resume_interrupt(&fixture, point) == 0,
+          "resume is killed at the requested reconciliation boundary");
+    reset_interrupts();
+    int live = -1;
+    int deleted = -1;
+    if (delete_source)
+        check(sidecar_state(&fixture, "gone", &live, &deleted) == 0 &&
+              live == 0 && deleted == 1,
+              "interrupted stale key remains non-live");
+    check(path_exists(fixture.payload_gone) == payload_survives,
+          "payload state at the interruption boundary is deterministic");
+    check(portable_capture_resume_at(fixture.container_fd,
+                                     &fixture.request, NULL) == 0,
+          "resume completes the interrupted reconciliation");
+    check(path_exists(fixture.payload_gone) == !delete_source,
+          "resumed reconciliation leaves the expected payload inventory");
+    close_fixture(&fixture);
+}
+
+static void test_interruption_boundaries(const char *base)
+{
+    printf(BLUE "::" NC " reconciliation SIGKILL boundaries\n");
+    test_interrupt_boundary(base, "after-delete", PORTABLE_TEST_AFTER_STALE_DELETE,
+                            1, 1);
+    test_interrupt_boundary(base, "before-unlink", PORTABLE_TEST_BEFORE_STALE_UNLINK,
+                            1, 1);
+    test_interrupt_boundary(base, "after-unlink", PORTABLE_TEST_AFTER_STALE_UNLINK,
+                            1, 0);
+    test_interrupt_boundary(base, "before-inventory",
+                            PORTABLE_TEST_BEFORE_FINAL_INVENTORY, 0, 1);
+}
+
+int main(void)
+{
+    printf(BLUE "::" NC " portable stale reconciliation\n");
+    char base[] = "/tmp/migr_portable_reconcile_XXXXXX";
+    if (mkdtemp(base) == NULL)
+        fixture_fatal("could not create fixture root");
+
+    test_deleted_file(base);
+    test_deleted_symlink(base);
+    test_deleted_subtree(base);
+    test_stale_subtree_child_before_parent(base);
+    test_claim_foreach(base);
+    test_stale_empty_claim(base);
+    test_stale_nested_claim(base);
+    test_foreign_child_blocks_claim_cleanup(base);
+    test_collision_claim_foreign_child(base);
+    test_stale_claim_child_vanishes_during_validation(base);
+    test_stale_claim_directory_vanishes_before_validation_descent(base);
+    test_stale_claim_directory_vanishes_before_mutation_descent(base);
+    test_remove_payload_relative_close_failures(base);
+    test_capture_directory_scan_failure_frees_resources(base);
+    test_cleanup_failure(base);
+    test_inventory_mismatch(base);
+    test_collision_inventory_and_foreign_child(base);
+    test_tombstone_parent_scope(base);
+    test_ambiguous_tombstone_owner_lookup(base);
+    test_interruption_boundaries(base);
+
+    remove_tree(base);
+    printf("portable reconciliation tests: %d failure(s), %d skipped\n",
+           failures, skips);
+    return failures == 0 ? 0 : 1;
+}

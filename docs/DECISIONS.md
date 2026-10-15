@@ -12,6 +12,8 @@ It is to record *why*, and what was rejected, so neither gets re-litigated later
   that is later reversed keeps its number; the reversal is a new entry that names
   what it supersedes. Removing reversed decisions would hide exactly the reasoning
   that makes the rest trustworthy.
+- Wording may be edited; what an entry decided and why may not. A changed
+  decision is a new entry.
 - Code comments cite entries as `docs/DECISIONS.md D9`.
 - Every entry carries a **Status**. `Implemented` means the code does this today.
   `Decided` means the reasoning is settled but nothing is built yet — those entries
@@ -21,7 +23,7 @@ It is to record *why*, and what was rejected, so neither gets re-litigated later
 
 ## D1 — 2026-06-27 — Unresolvable packages are written to `skipped-packages.txt`
 
-**Status:** Implemented
+**Status:** Superseded in part by D78 (the list moved next to the backup)
 
 **Decision:** Packages that fail to install on restore are written to
 `$HOME/skipped-packages.txt`, with a `N installed, N skipped` summary.
@@ -38,7 +40,7 @@ outgrows solo maintenance.
 
 ## D2 — 2026-06-27 — Batch package install first, per-package fallback on failure
 
-**Status:** Implemented
+**Status:** Superseded in part by D46
 
 **Decision:** Build one `argv[]` containing every package and run a single install
 command. Only if that exits non-zero, fall back to installing one package at a time,
@@ -111,10 +113,10 @@ pattern. No expectation of community involvement is implied by any of this.
 **Decision:** Cloud storage support is off the roadmap for now.
 
 **Why:** The feature's goal was a backup that reaches cloud storage without leaving
-the keyboard. The single first-hand attempt at such a flow — uploading a
-GPG-encrypted tar archive of a full backup — ran into transfer difficulties and was
-eventually completed by hand, through a browser. One attempt on one machine is not
-an experience base to design a backup feature on.
+the keyboard. The only such flow tried — uploading a GPG-encrypted tar archive
+of a full backup — ran into transfer difficulties and ended in a manual upload
+through a browser. A single attempt is not enough experience to design a backup
+feature on.
 
 **Recorded for any future revisit:** cloud support without built-in encryption is
 incomplete. The manual flow required GPG-encrypting the archive before upload; a
@@ -128,7 +130,7 @@ evaluate for the transfer layer.
 
 ## D6 — 2026-07-19 — Backups are plain file trees; a sidecar carries what the filesystem cannot
 
-**Status:** Decided — not yet implemented
+**Status:** Implemented
 
 **Decision:** The primary on-disk representation of a backup is a plain file tree.
 On destination filesystems that cannot represent Linux file semantics
@@ -174,7 +176,8 @@ Append-only so an interrupted backup resumes by replaying what was recorded.
 ## D7 — 2026-07-19 — Nothing distro-specific enters the codebase
 
 **Status:** Standing principle. The generic xattr mechanism it prescribes is part of
-the sidecar work (D6) and not yet implemented.
+the sidecar work (D6) and not yet implemented. Its SELinux worked example is
+reversed by D92.
 
 **Decision:** `migr` contains no code path that exists for one distribution's
 benefit. A distro-hopping tool with distro assumptions contradicts its own purpose.
@@ -192,7 +195,10 @@ neither.
 
 ## D8 — 2026-07-19 — Document that ext4/btrfs destinations need none of this
 
-**Status:** Decided — not yet written into README
+**Status:** Implemented — the no-encoding/no-sidecar/exit-rights claim is now stated
+explicitly in README's "Core Metadata Fidelity" section (2026-08-15). Substantively
+satisfied well before this date by the accumulated native-fidelity work in Phases
+B/E/G/H; only the explicit statement in these terms had never actually landed.
 
 **Decision:** README should state that formatting the backup drive as ext4 or btrfs
 gives full fidelity with no encoding and no sidecar.
@@ -213,7 +219,7 @@ gives full fidelity with no encoding and no sidecar.
 
 ## D9 — 2026-07-19 — `--include-self` ships a separate static binary
 
-**Status:** Decided — not yet implemented
+**Status:** Implemented
 
 **Decision:** Packaging produces two binaries: the dynamically-linked
 `/usr/bin/migr` for daily use, and a static build shipped inside the same package
@@ -232,11 +238,19 @@ cost of shipping both is a few hundred kilobytes.
 
 **Known caveats:**
 
-- Static glibc breaks NSS functions (`getpwnam`, `getpwuid`). Not currently an
-  issue — only `getenv("HOME")` is used. An NSS fallback would require building the
-  static binary with musl instead.
-- The exec bit is lost on FAT/NTFS destinations, so restore instructions must
-  include `chmod +x migr`. Not fixable from inside the tool.
+- Static glibc breaks NSS functions (`getpwnam`, `getpwuid`). D38 therefore
+  resolves elevated local-user homes by parsing `/etc/passwd` directly, keeping
+  the dynamic and static binaries on the same NSS-independent path. Identities
+  available only through NSS backends remain unsupported by that mechanism.
+- FAT32 destinations record no Unix permission bits; they synthesise a mode from
+  mount options. NTFS permission handling depends on the driver and mount options.
+  Measured on Arch, Ubuntu 26.04 and Fedora 44 (2026-09-05, FAT32 loopback): a
+  default mount reports 0755 and the copy runs in place, while `fmask=0177` or
+  `noexec` leaves it unrunnable and `chmod +x` there returns success without
+  changing anything. Restore instructions must therefore say to copy the binary
+  to a filesystem that supports Unix permissions and permits execution before
+  making it executable; `chmod +x migr` in place on those vfat mounts is either
+  unnecessary or silently useless. Not fixable from inside the tool.
 - The manifest must record the architecture, so an x86_64 binary restored on ARM
   fails with an explanation rather than `cannot execute binary file`.
 
@@ -312,6 +326,15 @@ workstation 432, fresh Ubuntu desktop 35, minimal Arch 12.
 **Consequence for D2:** batch installs now handle hundreds of names, not thousands;
 the single-transaction rationale carries the decision from here on.
 
+**Consequence (2026-08-26):** `migr` has no standalone `packages <FILE>` command;
+package export is reachable only through `backup`. The path-based and production
+entry points have different trust models: the former would open an arbitrary
+user-supplied path, while the latter writes `packages.txt` beneath an anchored
+container directory fd under the same single-component safety rules as the rest
+of the backup. A standalone export adds no user-facing role that backup does not
+already cover, so keeping only the production path removes a redundant,
+weaker-trust interface rather than preserving it as a compatibility alias.
+
 **Implementation records:**
 
 - dnf's queryformat requires the two-character escape `\n`; a literal newline byte
@@ -329,3 +352,5686 @@ the single-transaction rationale carries the decision from here on.
   line, no blank lines, no run-together records, architecture suffixes below a
   proportion threshold (an outright ban is impossible: `kmod-nvidia` on Fedora
   genuinely embeds kernel version and arch in its package *name*).
+
+---
+
+## D13 — 2026-07-26 — Sparse-file support is deferred out of the sidecar
+
+**Status:** Decided — deferred
+
+**Decision:** The sidecar (D6) will not preserve file sparseness in its initial
+implementation. A sparse file is backed up and restored as a full, non-sparse file of
+the same visible size and contents; only the on-disk hole structure is lost.
+
+**Why:** Of every dimension the sidecar handles, sparse files are the lowest value and
+the highest complexity. They are rare in a home directory — the main producers are VM
+disk images and similar, which are large enough that users typically exclude them
+anyway. Preserving sparseness needs `SEEK_HOLE`/`SEEK_DATA` extent mapping on backup
+and `ftruncate` + positioned `pwrite` on restore, a materially more involved code path
+than any other dimension. The cost/value ratio does not justify carrying it in the
+first version.
+
+**Consequence:** restoring a sparse file inflates it to its full allocated size on
+disk. For the rare large sparse file this can be a surprising space cost, which is the
+main reason to revisit.
+
+**Revisit if:** sparse files turn out to matter in practice, or once the higher-value
+dimensions (metadata, symlinks, filenames, xattrs) are complete and stable.
+
+See docs/sidecar-plan.md for the full implementation plan.
+
+---
+
+## D14 — 2026-07-27 — Backup representation is selected empirically, without a production override
+
+**Status:** Implemented
+
+**Decision:** Before a live backup creates its dated container, `fsprobe()` measures the
+destination filesystem and produces a per-capability profile, and a separate pure
+`select_representation()` reduces that profile with fail-closed precedence:
+
+- all required capabilities supported → native representation;
+- any capability unavailable, with no operational error → portable representation;
+- any operational error or invalid result → refuse the backup.
+
+The production CLI, environment, and configuration cannot force a representation or
+replace the measured profile. Until portable capture exists, a portable verdict is
+refused before the container is created — a temporary implementation boundary, not a
+rejection of lossy filesystems.
+
+**Why:** A false native verdict silently loses the exact metadata the sidecar exists to
+protect, so a user-facing force-native path would turn a safety check into an opt-out
+from data integrity. For the same reason an unexpected probe failure is refused, not
+read as "portable": it could equally mean a full, read-only, or damaged destination.
+
+Keeping measurement (`fsprobe`) separate from policy (`select_representation`) makes both
+reviewable — the selector's whole native/portable/refuse matrix is deterministic under
+synthetic profiles, so no production override is needed to test it, while mounted
+filesystems validate that the probe observes reality. That covers the selector, not
+portable orchestration; when that pipeline exists, a narrowly scoped test-only seam may
+drive it on a native development filesystem, but it must not be reachable through a
+release binary, CLI, environment, or configuration, and never replaces real
+exFAT/NTFS/vfat tests.
+
+**Rejected:** filesystem-name allowlists in place of empirical checks; production
+force-native/force-portable controls; treating an operational probe failure as a request
+for portable mode.
+
+**Revisit if:** a real user workflow requires portable representation on a filesystem
+that passed the native profile — a product decision with its own safety contract, not a
+testing shortcut.
+
+**Relationship:** Refines D6 by defining how migr chooses its native or portable
+representation.
+
+---
+
+## D15 — 2026-07-28 — Versioned backup containers isolate payload and finalize atomically
+
+**Status:** Implemented — container namespace and lifecycle
+
+**Decision:** A versioned backup container reserves its root for migr-owned control
+artifacts (`manifest.txt`, `packages.txt`, `sidecar.migr`, and the shipped binary when
+requested). Every user-derived filesystem object lives below `data/`.
+
+A live backup writes to:
+
+```
+migr_backup_YYYYMMDD_HHMMSS[-N].partial/
+```
+
+Candidate allocation considers both partial and final names and atomically claims a
+unique partial directory. Success atomically renames it to the same name without
+`.partial`; finalization must never replace an existing final container. A failed or
+interrupted backup therefore cannot look complete.
+
+The versioned manifest records the representation, normalized logical-root set, and a
+stable source identity for resume matching. The source identity is the machine id plus
+numeric uid when both are available; an invocation that cannot establish identity does
+not adopt an existing partial. A timestamp or scope label alone never proves that two
+invocations are the same job.
+
+**Why:** A payload named `manifest.txt` must not overwrite format state, and a second
+backup in the same second must not merge with either an in-progress or completed
+container. The `data/` boundary makes ownership visible instead of maintaining an
+ever-growing reserved-name list. Partial-to-final publication gives completion a single
+observable boundary while preserving interrupted work for resume.
+
+**Rejected:** flat control and payload names; reserved-name pre-scan; date-only
+containers; check-then-rename finalization that can replace a concurrent result; UUIDs
+in user-facing container names.
+
+**Relationship:** Supports D6's resume contract and follows D14's requirement that
+representation be selected before the container is created.
+
+---
+
+## D16 — 2026-07-28 — Explicit roots keep arbitrary capture, with bounded restore policies
+
+**Status:** Implemented
+
+**Decision:** `migr backup <DEST> <PATH...>` continues to accept valid filesystem paths
+both inside and outside the source `$HOME`; being outside `$HOME` is not itself an
+error. Each root receives an ordinal identity (`EXPLICIT_0`, `EXPLICIT_1`, …), a
+separate payload location below `data/`, and one manifest restore policy:
+
+- **`HOME_RELATIVE`:** when component-aware resolution proves that the selected object
+  is below the source `$HOME`, the manifest records its normalized home-relative path
+  and restore recreates it at the same relative address below the target `$HOME`.
+- **`MANUAL_NATIVE`:** every other valid root is captured on a native destination and
+  remains directly accessible in its `data/EXPLICIT_n` tree, but automatic restore does
+  not choose a destination for it. Restore must list every such root and its recorded
+  source path rather than silently ignoring it.
+
+Classification is not a string-prefix check. A selected symlink is the object being
+backed up and is not followed merely to classify it; ancestor traversal must not make an
+external object appear home-relative. All roots are validated before container creation.
+A missing, invalid, duplicate, or overlapping root rejects the whole invocation rather
+than silently producing less than the user requested. Existing unversioned explicit
+backups have no trustworthy root mapping and remain legacy/manual; restore does not
+guess.
+
+`MANUAL_NATIVE` is also a representation gate: portable capture must refuse an
+invocation containing such a root before writing payload until a faithful external-root
+restore policy exists. This is currently automatic because all portable capture is
+unimplemented and refused; later portable work must preserve the narrower gate rather
+than creating an encoded tree that migr cannot replay.
+
+**Why:** Explicit mode exists precisely to make no scope assumptions, so an arbitrary
+source path should not be rejected merely because automatic placement is undefined.
+Home-relative roots have one safe, locale-independent destination. External roots do
+not: restoring to the original absolute path may require privilege, overwrite unrelated
+state, or target a path that has different meaning on the new distribution. Native
+backups retain D8's `cp -a` exit right; portable backups do not, hence the representation
+gate.
+
+**Rejected:** rejecting every `$HOME`-external source; restoring external roots to their
+original absolute paths without an explicit safety contract; silently skipping invalid
+inputs; treating a restore-addressless portable tree as a usable backup.
+
+**Revisit if:** a concrete external-root workflow justifies a staging root, an explicit
+source-to-destination mapping, or a guarded original-location restore contract.
+
+**Relationship:** Refines D11's explicit-path syntax with root addressing and applies
+D8's native exit-right boundary.
+
+---
+
+## D17 — 2026-08-01 — Sidecar v1 and the core metadata contract are frozen
+
+**Status:** Implemented (Phase B closed 2026-08-04; as-built notes in "Restore atime exactness" and "Relationship" below); superseded in part by D85 (the backup user's items go to the restoring user)
+
+**Decision:** Phase B uses a versioned, NUL-framed, append-only sidecar as the
+authoritative state log for portable capture and resume. The sidecar and its payload
+form one committed state, and native metadata handling adopts the same exact numeric
+ownership, mode, and timestamp contract. This entry freezes the wire grammar,
+interruption rules, metadata policy, and the boundaries that remain outside Phase B.
+
+### Committed state and resume
+
+For a new entry, the writer completes and closes the payload before writing its
+`ENTRY` and `XATTR` records; `ENTRY_COMMIT` is the only operation that makes the group
+live. When replacing an already committed entry, the writer first commits a `DELETE`
+for the old key, then replaces the payload, then writes and commits the new entry
+group. An interruption after payload mutation therefore cannot leave old metadata
+describing incomplete new bytes.
+
+The reader applies **last committed state wins** per key: a later committed group for
+the same key supersedes the earlier group, and a committed `DELETE` removes the key's
+live state. Committed group order is the implicit generation. Because the writer
+always `DELETE`s before replacing, a duplicate committed `ENTRY` without an
+intervening `DELETE` is a reader-side last-wins case, not corruption.
+
+Portable resume reconciles the previous committed live-key set with the keys visited
+by the new source walk. Each stale key is deleted from the sidecar and its physical
+payload is removed without following symlinks; any cleanup or final inventory failure
+blocks finalization. A crash after a `DELETE` but before payload unlink leaves the key
+non-live, so a later resume can remove the orphan safely. This guarantees process
+interruption recovery, not power-loss durability; `fsync` is outside the contract.
+
+Native resume still has a separate stale-entry gap: without a committed key log, a
+source entry deleted between runs can remain in the native payload. That is explicitly
+owned by Phase H, whose acceptance criterion is that deleted files/subtrees do not
+survive a successful resumed final backup and that deletion failure blocks
+finalization.
+
+The live-state map's lookup and insert must not be a linear scan per operation once
+this log is wired into production capture/restore: a backup can hold up to
+`SIDECAR_MAX_LIVE_ENTRIES` (2^20) objects, and O(n) work per object makes the whole
+walk O(n^2) over the entry count -- not acceptable at that ceiling, regardless of
+which data structure eventually replaces the scan. The first state-log implementation
+uses one because it is not yet reachable from production and its own tests run with
+small fixture counts; that is the only reason it is tolerable today, and it must not
+reach production in that shape.
+
+The replacement is a hash table (open addressing, tombstoned deletes, salted
+FNV-1a over `(root_id, logical_path)`), not a balanced tree. The two access
+patterns this map actually serves -- capture is insert-heavy, restore is
+lookup-heavy -- are both O(1) amortized on a hash table; a sorted array's
+O(n) `memmove` per insert would leave capture at O(n^2) regardless of its
+O(log n) lookup, so it does not solve this on its own. A real balanced tree
+(red-black, AVL, B-tree) would give a guaranteed O(log n) bound with no
+insert-side gap, but its only structural advantage over a hash table --
+ordered iteration -- is never used: nothing here needs the live-state map
+itself to produce entries in any particular order. Insertion order for
+prioritized capture (e.g. backing up `--critical` paths first even when
+`--critical` was not passed) is a walk-scheduling concern that belongs to
+the caller enumerating source roots, not to this map, and is unaffected by
+which structure holds committed state. A hand-written balancing
+implementation is also simply more failure-prone in C than open addressing,
+in exactly the code that already carries the highest memory-safety bar in
+this codebase.
+
+The hash is seeded per process (using `getrandom()` when available, with a
+best-effort non-cryptographic fallback derived from the monotonic clock, pid,
+and a process-local address value) even though no realistic attacker scenario
+exists for `migr` today: adopting a resumed backup or reading a restore source
+is a single-user, single-machine, on-demand operation, not a shared, always-on
+service parsing anonymous input, and `SIDECAR_MAX_LIVE_ENTRIES` already bounds
+the worst case a crafted collision could produce. The randomized seed is kept
+anyway for three reasons, none of them a defence against a threat that does not
+exist yet: it costs nothing wire-format-side (the hash lives only in memory,
+never on disk, so it cannot bump the sidecar format); it costs only a few lines
+because the codebase already has an established pattern for obtaining
+process-local randomness; and it keeps faith with this document's own
+"sidecar and payload are untrusted input" posture, which the fixed-seed
+alternative would have been the one place to quietly abandon.
+
+### Core metadata and ownership preflight
+
+Atime, mtime, mode, and numeric uid/gid are core metadata. Native v1 and legacy
+restore read the desired ownership from the payload tree; portable restore reads it
+from committed sidecar state, while portable backup records true ownership without
+applying it to the destination. Required metadata capture, apply, or readback failure
+is fatal: backup returns nonzero and does not finalize, and restore leaves the
+destination unchanged on its rejection path. UID remapping and current-user
+normalization are not performed.
+
+Metadata application is ordered and verified as:
+
+```text
+fchown -> fchmod -> futimens -> fstat readback
+```
+
+The ownership preflight is read-only during inventory and uses an anonymous
+`O_TMPFILE|O_EXCL|O_RDWR|O_CLOEXEC` inode for each distinct privilege-relevant
+profile. A profile is privilege-relevant when any of the following is true:
+
+- the desired uid differs from the effective uid;
+- the desired gid is outside the effective and supplementary groups;
+- setuid or setgid is requested; or
+- an existing destination object has an initial uid different from the effective
+  uid, or an initial gid outside the effective and supplementary groups (including
+  the case where the desired uid happens to equal the effective uid).
+
+The probe applies the exact sequence above and verifies the resulting metadata. For
+an existing destination profile, it first models the observed initial uid/gid on the
+anonymous inode; failure there is itself a refusal because the real destination could
+not be transitioned safely either. A failure of any required profile rejects the whole
+invocation; no partial success is published. Self-owned, setid-free profiles do not
+need this write probe and rely on the POSIX ownership guarantee.
+
+The probe anchor is the actual destination root, or the nearest existing parent when
+that root does not yet exist. It is not the mount point. Mount identity is retained
+only as the uid-mapping domain in the profile key; a mount-wide identity must not make
+an unwritable mount root stand in for a writable descendant. The metadata profile
+limit is `MAX_METADATA_PROFILES = 65536`: exceeding it rejects the invocation before
+mutation, so the probe and report budgets stay bounded. Diagnostic path examples are
+bounded by `MAX_PREFLIGHT_EXAMPLES = 16`.
+
+If a privilege-relevant anchor cannot perform `O_TMPFILE`, migr has no mutation-free
+proof of the required authorization and refuses that invocation; there is no named
+scratch fallback. Dry-run performs only read-only inventory and may report which
+profiles require a live probe, but it must not claim that the live verdict is known.
+Probe success is evidence for that anchor and profile at that instant only; a later
+apply/readback failure remains fatal and is not silently reclassified.
+
+### Timestamp and resume policy
+
+Phase B adds a new destination capability, `FS_CAP_TIMESTAMPS`, which is supported
+when both regular files and directories preserve atime and mtime at second granularity
+and preserve the ordering of two distinct round-trip samples. Filesystem names and
+guessed resolutions are never used as evidence. Nanosecond round-trip equality is
+recorded separately in the destination capability profile as `nsec_exact` (it is a
+probe measurement, not a sidecar field) and does not affect the representation
+verdict.
+
+When `nsec_exact` is false, metadata application writes the canonical
+`{source_seconds, 0}` value for atime and mtime and verifies both the seconds and the
+zero nanoseconds. Native content resume-skip is allowed only when `nsec_exact` is true
+and `size + mtime_sec + mtime_nsec` matches. Otherwise regular-file content is copied
+again; metadata is always reapplied and verified. Portable resume uses committed
+sidecar state rather than destination timestamps.
+
+### Source and restore safety
+
+Native and portable capture use the same source snapshot contract: final objects are
+opened with `O_NOFOLLOW` and the type-appropriate flags, payload-readable regular
+files and directories are opened with `O_NOATIME` so migr's own reads do not perturb
+the captured source atime. If `O_NOATIME` is refused (a non-owner without
+`CAP_FOWNER`), capture fails closed before reading the payload rather than silently
+falling back to a read that would change atime. Metadata is captured from the open
+descriptor, and a post-copy `fstat` must match the pre-copy device, inode, type, size,
+mode, uid/gid, timestamps, and ctime. A source change is fatal; there is no retry that
+could silently join two different source states.
+
+Backup metadata preflight accumulates these source-safe-read blockers independently
+from destination ownership profiles and reports bounded path examples before the
+destination probe. An unopenable directory is also counted as an uninspected subtree;
+its descendants are not represented as a precise affected-object count. The capture
+pass preserves the same strict refusal if ownership changes after preflight.
+
+Native restore reads its own source (the payload tree it is restoring from) under the
+same discipline, not only capture's read of the user's original files. A concrete case of
+why this matters: `restore_entry_at()`'s directory branch always recurses during
+`RESTORE_VALIDATE` (unlike the FIFO/regular branches, which return before touching
+content), so its own `readdir()` could perturb the source directory's atime before
+`RESTORE_APPLY` took its metadata snapshot. The fix adopted -- a single read-only
+metadata snapshot taken once per source object, before `RESTORE_VALIDATE` runs,
+reused by `RESTORE_APPLY` rather than re-read from a second, later open -- is
+implemented. This is preferred over merely adding `O_NOATIME` to restore's reads
+(which would stop the atime corruption but leave the redundant double-read in place)
+because it is the same "read-only inventory before mutation" shape already required
+above for the ownership preflight, done in the same pass rather than deferred to a
+later one. The remaining symlink-atime limitation, and the additional preflight fix
+it required, are described in "Restore atime exactness (as-built)" below.
+
+### Restore atime exactness (as-built)
+
+Implemented as described above, with one kernel limitation now made explicit:
+destination symlink atime is exact (the pre-mutation snapshot is recorded before
+`RESTORE_VALIDATE` reads the target, and `RESTORE_APPLY` applies that recorded value),
+but the *source* symlink's atime cannot be preserved across restore. On Linux,
+`readlinkat()` itself updates the symlink's atime and no flag suppresses it —
+`O_NOATIME` applies only to `open()`, and `O_PATH` descriptors do not help — so any
+restore that must read a symlink target perturbs the source symlink's atime. This is
+outside migr's control (barring a `noatime` mount, which migr cannot assume), and the
+restore contract does not promise source-symlink atime preservation. To keep the
+destination exact, no walk may read a symlink target before the real restore's
+snapshot: the metadata-ownership preflight (`restore_native_metadata_inventory_at`)
+skips symlink target reads entirely (`skip_symlink_target_read`), while the dry-run
+preflight and the real `RESTORE_VALIDATE`/`RESTORE_APPLY` passes still perform
+ordinary target validation.
+
+Portable restore performs a global read-only preflight and then per-entry
+fd-anchored, component-by-component revalidation with `O_NOFOLLOW`. Absolute paths,
+`..`, empty interior components, symlink redirects, two distinct logical entries that
+resolve to the same physical address, file-as-ancestor relationships,
+manifest-external roots, unsupported types, and nonzero xattr counts before their
+respective phases are rejected before persistent destination mutation. (A repeated
+logical key across committed groups is collapsed by last-committed-wins, so it never
+becomes two entries.) Confirmation precedes the live probe, and a probe rejection
+guarantees no changed user payload, named scratch entry, or descriptor residue.
+
+The Phase B file-kind policy is:
+
+- regular files: content plus exact core metadata;
+- directories: children first, then exact post-order metadata;
+- symlinks: native no-follow behaviour remains; portable handling waits for Phase C;
+- FIFOs: native exact metadata, portable handling remains fail-closed;
+- sockets and device nodes: warning and skip, with an earlier committed state deleted
+  before the skip can leave stale payload visible.
+
+### Sidecar v1 wire grammar
+
+The file begins with the byte sequence `MIGR_SIDECAR\0` followed by canonical version
+`1\0`. Record tags are `ENTRY\0`, `XATTR\0`, `ENTRY_COMMIT\0`, and `DELETE\0`.
+Every field except the xattr value is a NUL-terminated byte sequence: NUL-free byte
+strings (root id, logical path, physical path, object kind, and xattr name) and
+numeric fields alike end at their NUL. Xattr values are arbitrary bytes and are
+encoded as a canonical length field followed by exactly that many raw bytes. Numeric
+fields use canonical ASCII decimal with fixed signedness (timestamp seconds are
+signed; nanoseconds, mode, uid, gid, size, and count are unsigned), explicit upper
+bounds, and checked overflow; host `long`, `uid_t`, and `off_t` representations never
+appear on disk. Nanoseconds are restricted to `0..999999999`.
+
+The field order is fixed:
+
+```text
+ENTRY:
+  tag, root_id, logical_path, physical_path, object_kind,
+  mode, uid, gid,
+  atime_sec, atime_nsec, mtime_sec, mtime_nsec,
+  size, xattr_count, kind-specific fields
+
+XATTR:
+  tag, name, value_length, value_bytes
+
+ENTRY_COMMIT:
+  tag
+
+DELETE:
+  tag, root_id, logical_path
+```
+
+`mode` contains permission and special bits; object type is carried separately by
+`object_kind`. `size` is meaningful for regular files. File, directory, and FIFO
+records have no type-extra field. Symlink target bytes and hardlink references have
+reserved type-specific positions in the v1 grammar, but their writers remain disabled
+until their respective phases, and portable restore refuses them meanwhile.
+
+An `ENTRY` must be followed by exactly its declared number of `XATTR` records and an
+`ENTRY_COMMIT`. A standalone `DELETE(root_id, logical_path)` becomes committed at the
+end of its path field. Unknown record, object-kind, or version; opening a second
+group before the first is committed; and illegal record order are fatal. An
+incomplete final record at EOF is a truncated tail and is discarded. A complete group
+without `ENTRY_COMMIT` produces no live state; malformed data in the interior of the
+file makes the sidecar unusable. A complete record whose content is invalid (unknown
+tag, out-of-range value) is corruption wherever it sits, including at EOF — only a
+record whose declared extent runs past EOF at the file's end is a truncated tail. The
+parser returns the last valid boundary after the header or the latest complete
+`ENTRY_COMMIT`/`DELETE`; adoption may truncate only to that boundary after proving
+there is no interior corruption.
+
+Resource ceilings cover root ids, logical/physical paths, xattr names and values,
+xattrs per entry, live entries, total sidecar bytes, parser allocation, numeric
+timestamps, uid/gid, mode, and regular-file size. Every length and arithmetic
+operation is checked before allocation or casting. This decision fixes the
+categories and fail-closed behaviour without making a host-dependent limit part
+of the wire format.
+
+The concrete constants, published here before the sidecar codec is implemented:
+
+| Constant | Value | Basis |
+|---|---|---|
+| `SIDECAR_MAX_ROOT_ID` | 64 | `MANIFEST_ID_MAX` (D16) -- a sidecar root id names a manifest root table entry |
+| `SIDECAR_MAX_PATH` | 4096 | `PATH_MAX`, logical and physical paths alike |
+| `SIDECAR_MAX_SYMLINK_TARGET` | 4096 | `PATH_MAX`; the type-specific field reserved above, not yet written |
+| `SIDECAR_MAX_XATTR_NAME` | 255 | Linux `XATTR_NAME_MAX` |
+| `SIDECAR_MAX_XATTR_VALUE` | 65536 | Linux `XATTR_SIZE_MAX`; `setxattr`/`getxattr` accept nothing larger |
+| `SIDECAR_MAX_XATTRS_PER_ENTRY` | 256 | generous relative to `XATTR_SIZE_MAX`/`XATTR_NAME_MAX`, still bounded |
+| `SIDECAR_MAX_LIVE_ENTRIES` | 2^20 (1,048,576) | resource-exhaustion ceiling, not an expected count -- same role as `MANIFEST_MAX_ROOTS`/`METADATA_MAX_PROFILES` |
+| `SIDECAR_MAX_TOTAL_BYTES` | 4 GiB | consistent with the live-entry ceiling at a generous per-entry average |
+| `SIDECAR_MAX_ALLOC_BUDGET` | 1 GiB | the parser's own heap use, live-state map included; the sidecar is streamed, never loaded whole, so this is smaller than `SIDECAR_MAX_TOTAL_BYTES` on purpose |
+| timestamp seconds | signed, full range | already fixed above ("timestamp seconds are signed") |
+| timestamp nanoseconds | `0..999999999` | already fixed above |
+| uid / gid | unsigned, 32-bit | matches `uid_t`/`gid_t` width; wire stays unsigned per the field above |
+| mode | unsigned, `0..07777` | permission and special bits only, per the field above |
+| regular-file size | unsigned | a file's size is never negative; this does not revisit "size... are unsigned" above, only gives it no further ceiling beyond the wire's own width |
+
+### Boundaries and relationships
+
+Production portable dispatch remains disabled through Phase B. Portable symlink/FIFO
+handling, xattrs/ACLs, illegal-name encoding, case collisions, hardlinks, and sparse
+preservation remain in their designated later phases; D13's sparse-file boundary is
+unchanged. D17 refines D8 by defining what “full fidelity” means for the accepted
+contract and does not claim that the implementation is already complete.
+
+**Why:** Sidecar state is both a format and a crash-recovery protocol. Freezing the
+commit boundary, metadata semantics, and rejection policy before writing the parser
+prevents an apparently valid partial backup from being published with stale metadata,
+silently degraded ownership, or an ambiguous tail. Keeping the grammar byte-oriented
+and resource-bounded also makes untrusted restore input reviewable and portable across
+architectures.
+
+**Rejected:** power-loss durability via `fsync`; silent UID/GID normalization; named
+probe scratch files; mount-point substitution for the actual destination anchor;
+atomic sidecar rewrite as an alternative to `DELETE` + last-committed-wins;
+timestamp-based content skipping when nanoseconds are not exact; treating probe
+errors as portable mode; production portable dispatch before the later safety phases;
+and preserving sparse layout in the initial sidecar.
+
+**Relationship:** D17 refines D6's append-only sidecar direction and D8's native
+fidelity promise, applies D13's sparse boundary and D14's empirical fail-closed
+representation policy, and records the Phase H native stale-reconciliation debt.
+Relative to D6's sketch, D17 supersedes the "symlink stored as a regular file holding
+the target path" representation in favour of reserved inline target bytes in the
+record; D6 keeps its number and this entry names the reversal, per the append-only
+rule.
+
+As-built (Phase B, 2026-08-04): the sidecar codec, portable capture/resume core,
+portable restore preflight/replay/orchestration, and the native core-metadata
+fidelity work are all implemented and gated (host `make check` matrix, Ubuntu/Arch
+VM matrix, Fedora parity with the known Phase E xattr gap). Production portable
+dispatch remains disabled, per "Boundaries and relationships" above. Two
+source-safe-read refusal classes surfaced by the VM matrix (restore-side and
+backup-side `O_NOATIME`/EPERM) are reflected in the "Source and restore safety"
+section; the restore symlink-atime limitation is reflected in "Restore atime
+exactness (as-built)".
+
+---
+
+## D18 — 2026-08-04 — Portable symlink handling: placeholder node + record
+
+**Status:** Implemented (Phase C closed 2026-08-06; as-built notes below)
+
+**Decision:** Portable symlinks use a payload placeholder and a sidecar record.
+The placeholder is an empty regular file (`size=0`) at the symlink's payload
+path; it never contains the target and is never read as the target. The sidecar
+entry has `kind=symlink` and carries the target plus the symlink's core metadata
+(`mode`, `uid`, `gid`, `atime`, and `mtime`). This preserves the invariant that
+every live sidecar key has a corresponding payload node.
+
+### C-1 — Symlink representation
+
+The target is read from the source link and stored only in the sidecar record;
+the placeholder's bytes are always empty and its type is always regular.
+
+### C-2 — Symlink metadata
+
+- Mode is recorded, but portable replay never calls `chmod` for a symlink,
+  because a path-based mode change follows the link. Replay applies ownership
+  with `fchownat(..., AT_SYMLINK_NOFOLLOW)`, applies timestamps with
+  `utimensat(..., AT_SYMLINK_NOFOLLOW)`, and verifies the result by readback.
+
+### C-3 — Source-change detection
+
+- Capture takes an `lstat` snapshot before `readlinkat`, reads the target, then
+  checks `metadata_symlink_unchanged` against a second no-follow metadata read.
+  A changed link is a fatal source-change error; capture does not retry it.
+
+### C-4 — Ownership preflight
+
+- Portable capture does not run an ownership preflight or call `chown` for a
+  source symlink; the source's true ownership is recorded in the sidecar.
+  Portable restore includes symlink entries in the ownership profile and applies
+  ownership with the no-follow operation above.
+
+### C-5 — Lossy destinations
+
+- If `FS_CAP_SYMLINK` is unavailable, representation selection already chooses
+  portable. If replay's `symlinkat` fails with `EOPNOTSUPP` or `EROFS`, the entry
+  is rejected fail-closed; it is never silently dropped or degraded.
+
+### C-6 — Portable FIFO boundary
+
+- Portable FIFO handling remains outside Phase C and fail-closed. Its
+  placeholder-versus-record policy is left open for a later decision.
+
+### C-7 — Test-only boundary
+
+- All Phase C orchestration is exposed only through D14 test-only seams.
+  Production portable dispatch remains disabled until the later safety gates.
+
+### C-8 — Symlink xattrs
+
+Symlink xattrs are collected with the no-follow path APIs `llistxattr` and
+`lgetxattr`; a symlink has no readable fd on which the regular fd-based xattr
+APIs could operate. Until Phase E implements replay, a symlink entry with
+`xattr_count != 0` is rejected fail-closed. Xattrs are never silently omitted
+or rewritten as an empty set.
+
+### Scope boundary
+
+The C-1 through C-8 rules apply to portable symlink handling only; native
+no-follow behaviour is covered by the existing metadata contract and its entry
+gate. Operational probe errors remain fatal under D14 rather than becoming a
+portable verdict.
+
+### As-built (Phase C, 2026-08-06)
+
+The D14 test-only portable capture and replay seams were exercised against real
+vfat loopback containers on Arch and Ubuntu. Both systems round-tripped a
+symlink byte-for-byte: capture wrote an empty regular placeholder in the
+container and replay recreated the destination link with the exact target.
+On Fedora, the same real-filesystem round-trip reached the deliberate Phase E
+boundary: the symlink carried an automatic `security.selinux` xattr, so replay
+refused it fail-closed and left no destination residue rather than silently
+discarding the xattr. Production portable dispatch remains disabled and still
+refuses lossy vfat destinations before creating a container, also without
+residue. FIFO handling was not changed by Phase C and remains fail-closed.
+
+**Why:** These rules freeze the representation and rejection boundaries before
+the symlink parser, capture walker, and replay walker are written. A
+payload-less representation was rejected because it would make the universal
+"every live key has a payload node" invariant exceptional in the capture,
+reconciliation, and restore-inventory paths. Keeping a placeholder preserves
+that invariant without putting target bytes in the payload, while the
+fail-closed rules prevent unsupported metadata or filesystem operations from
+becoming silent data loss.
+
+**Rejected:** payload-less symlink entries; silently writing `xattr_count=0`
+for a symlink with xattrs; bringing portable FIFO handling into Phase C;
+opening production portable dispatch in Phase C; and promising source-symlink
+atime preservation, which Linux `readlinkat` cannot guarantee under the
+no-atime discipline.
+
+**Relationship:** D18 keeps D17's replacement of D6's target-storage sketch:
+the target lives in the sidecar record, not in payload content. It settles the
+question D17 left open by retaining D6's payload node as an empty placeholder,
+so the live-key-to-payload-node invariant remains universal. It extends D7's
+fail-closed xattr rule to symlinks, remains subject to D14's empirical
+representation and test-only-dispatch boundary, and leaves hardlinks to Phase
+G, illegal-name encoding to Phase D, and xattr replay to Phase E.
+
+---
+
+## D19 — 2026-08-06 — Portable illegal-filename handling: encode on disk, true name in the record
+
+**Status:** Implemented (Phase D closed 2026-08-07; as-built notes below)
+
+**Decision:** A portable payload node is written under a percent-encoded name,
+while the sidecar keeps the true name. The logical path contains the original
+bytes and is the only path restore writes to the destination; the physical path
+contains the encoded name and exists only inside the payload tree. A mandatory
+read-only pre-scan reports every name that cannot be represented before any
+payload bytes are written. An unrepresentable name refuses the run by default;
+it is never silently skipped.
+
+### N-1 — Component safe set
+
+The encoding scheme is byte-oriented and injective: every byte outside the
+safe set becomes `%XX` with uppercase hexadecimal, and `%` itself is always
+encoded as `%25`. The payload safe set differs from the manifest's because it
+describes filename validity rather than line-parsing safety:
+
+- `/` is never safe. It cannot occur in a single `readdir` name, but allowing
+  it through would create an unintended directory component in the physical
+  path.
+- `.` is safe inside a component, but a component whose last byte is `.` has
+  that byte encoded as `%2E`. Encoding only the final byte prevents a
+  destination that strips trailing dots from changing the name.
+- Well-formed UTF-8 sequences pass through unencoded. Invalid UTF-8 is
+  escaped, including overlong forms, lone continuation bytes, truncated
+  sequences, surrogates, and code points beyond U+10FFFF.
+
+### N-2 — Encoded names and `NAME_MAX`
+
+The length limit applies to the encoded component, because escaping can
+triple its byte length. A component whose encoded form exceeds `NAME_MAX`
+refuses the run by default; it is never silently skipped, since a skipped
+entry would make the backup appear complete while being incomplete.
+
+### N-3 — Logical and physical paths
+
+The logical path is the original name and is the only path restore writes to a
+destination; POSIX destinations accept every byte. The physical path is the
+encoded name and is meaningful only relative to the payload tree. Visited-set
+and live-map keys remain logical, so encoding does not change resume or
+reconciliation identity.
+
+### N-4 — Binding physical to logical
+
+Replay re-encodes the logical path and verifies that the result is byte-for-byte
+identical to the recorded physical path, refusing the entry otherwise. The
+sidecar is untrusted input: path validation alone proves only that a physical
+path remains below the payload root, not that it names the node corresponding
+to the logical path. Because the encoder produced the physical path, malformed
+escapes are covered by this equality check and replay needs no decoder; the
+destination name always comes from the logical path.
+
+### N-5 — Mandatory pre-scan
+
+Before capture writes anything, a read-only pass maps every name and produces
+an unrepresentable-name report. The report contains a total and a bounded set
+of examples, each identifying the violated limit and the amount by which it is
+violated. The pass cannot be disabled. A later interface may suppress a
+confirmation prompt, but it may not suppress the scan.
+
+### N-6 — One encoding scheme, two safe sets
+
+The encoder and decoder live in one shared module used by both the manifest and
+the portable payload. The safe set is selected by an explicit mode argument;
+there is no implicit default. One implementation prevents the two copies from
+drifting apart, while the explicit mode prevents a caller from accidentally
+inheriting the wrong safe set.
+
+### N-7 — Test-only boundary
+
+All Phase D encoding and pre-scan behaviour remains behind the existing
+test-only portable seam. Production dispatch to the portable representation
+stays closed.
+
+### N-8 — Encoded paths and `PATH_MAX`
+
+A tree whose individual components fit `NAME_MAX` can still exceed `PATH_MAX`
+after encoding and joining. Capture checks the complete payload path, including
+the payload root, and refuses by default on overflow. This is a separate
+refusal class from the encoded-component `NAME_MAX` limit and is reported
+separately.
+
+### N-9 — The written name is verified, not predicted
+
+After creating a payload node, capture reads the name back from its parent
+directory and compares it byte-for-byte with the intended physical name. This
+verification makes UTF-8 pass-through safe without expanding the capability
+probe's raw-name corpus: it catches Unicode normalisation and any other
+destination-side name transformation that was not anticipated.
+
+### N-10 — Case folding is measured, not predicted
+
+A case-insensitive destination's non-ASCII folding rule cannot be predicted
+from mount options or filesystem format; it must be measured. The pre-scan finds
+candidate siblings cheaply with an ASCII-lowercased skeleton that replaces every
+non-ASCII byte with one placeholder. This is sound because a filesystem's
+case-folding table cannot change a name's length, so names with different
+skeletons cannot collide under any folding rule. Only real candidate groups are
+then probed by creating their encoded names in a destination scratch directory
+and reading back which names survived. Collision attribution uses the
+destination's directory listing rather than a by-name lookup: real vfat showed
+that a losing name's `open(..., O_CREAT|O_EXCL)` detects the collision reliably,
+while a subsequent `stat()`/`fstatat()` of that same byte string is not reliable
+for non-ASCII names. This directional inconsistency in the Linux vfat driver's
+`utf8` NLS handling was confirmed across three independent kernels. ASCII
+folding remains an in-memory check; only genuine non-ASCII candidates reach the
+destination probe, so an all-ASCII tree pays no extra I/O.
+
+### Scope boundary
+
+Native capture and restore are untouched: native destinations accept every
+byte, and no native path is encoded. Case-insensitive destinations may still
+map two distinct encoded names onto one node; the pre-scan detects that case
+collision and refuses by default, while resolving it with a disambiguating
+suffix remains part of the case-collision work. Encoding interacts with xattrs,
+hardlinks, and sparse files, but those concerns remain in their respective
+phases. A user-confirmed path that proceeds past an unrepresentable name is
+out of scope; supporting it would require the container to record its own
+incompleteness so restore could report it.
+
+**Why:** Portable payloads need names that survive filesystems with stricter
+filename rules without losing the original names that users must see on
+restore. Keeping logical and physical paths separate lets the payload use a
+validated, injective representation while the sidecar remains authoritative
+for the destination name. The mandatory pre-scan and fail-closed refusal keep
+an unsupported tree from being published as a complete backup, and read-back
+verification checks the destination's actual behaviour rather than assuming
+that a capability label predicts every name transformation.
+
+**Rejected:** reusing the manifest's safe set unchanged, because it leaves a
+trailing `.` untouched and escapes every non-ASCII byte, turning an ordinary
+28-character Japanese name into a `NAME_MAX` overflow (three bytes per
+character, three characters per escaped byte); adding a non-ASCII case to the
+raw-name capability corpus, because that corpus selects the representation and
+would turn a probe result into a blanket refusal while portable dispatch is
+closed; and skipping unrepresentable names with a final warning, because the
+resulting container would look complete while silently omitting data.
+
+**Relationship:** D19 builds on D17's grammar, where logical and physical paths
+are already separate fields (which capture has so far kept identical), and
+applies D14's test-only boundary and fail-closed representation policy. It
+follows D18's rule that a representation gap refuses rather than silently
+dropping data, while making the physical-name encoding and mandatory pre-scan
+explicit for the portable payload. Native metadata, xattrs, hardlinks, sparse
+layout, and production portable dispatch remain governed by their existing
+decisions and later phase boundaries.
+
+### As-built (Phase D, 2026-08-07)
+
+The mandatory pre-scan now refuses an encoded component over `NAME_MAX` or an
+encoded payload path over `PATH_MAX` before writing any payload byte. Real vfat
+loopback runs in the VM gate proved both refusal paths and left no container
+residue. The same matrix exercised ASCII and non-ASCII case collisions on Arch,
+Ubuntu, and Fedora: `Foo`/`foo` was refused on case-insensitive destinations,
+and `café`/`CAFÉ` was refused where the destination actually folded those
+names. A resume that would otherwise overwrite an existing captured file is
+also refused, with the existing payload left byte-for-byte unchanged.
+
+The VM gate exposed the concrete kernel behaviour behind N-10: the create-time
+`EEXIST` result and a later `fstatat()` lookup can disagree for a non-ASCII name.
+Non-ASCII folding also varied by kernel, not only by mount option. Kernel
+`7.1.5-arch1-2` folded non-ASCII case for an `iocharset=iso8859-1` mount,
+whereas `7.0.0-28-generic` and `6.19.10` did not. Measuring the destination on
+each run handled both outcomes without a code change. Production portable
+dispatch remains disabled under D14; all of this behaviour is reachable only
+through the existing test-only seam. Fedora's plain regular-file/directory
+portable round-trip still meets the same automatic `security.selinux` xattr
+wall already recorded for symlinks in D18, so that Phase E boundary is neither
+new nor a Phase D regression.
+
+---
+
+## D20 — 2026-08-07 — Portable and native xattr/ACL handling: generic capture and replay, no framework-specific code
+
+**Status:** Implemented (Phase E closed 2026-08-08; as-built notes below);
+`security.selinux` is not carried since D92
+
+**Decision:** Both portable and native destinations capture and replay
+every extended attribute through the generic `getxattr`/`setxattr` family,
+with no framework-specific code path for SELinux, AppArmor, or any other
+xattr consumer (D7). POSIX ACLs are not a separate mechanism: they travel
+as the `system.posix_acl_access`/`system.posix_acl_default` xattrs like any
+other extended attribute. Both capture and replay reconcile an **exact**
+set, not an additive one: an attribute present at the destination but
+absent from the source is removed, not left stale. Replay applies
+ownership, then mode, then the exact extended-attribute set, then
+timestamps; a destination that cannot hold a captured namespace or object
+kind at all is detected and refused before any payload mutation, and a
+`setxattr`/`lsetxattr`/`fsetxattr`/`removexattr` failure discovered after
+that refuses the affected entry fail-closed, the same way an
+unrepresentable name or a case collision already does.
+
+### E-1 — Namespace scope
+
+Every namespace is captured and replayed with no exception: `user.*`,
+`security.*`, `system.*`, `trusted.*`. D7's framework-agnosticism means no
+namespace question is asked at capture time; whatever `getxattr` returns is
+stored, and whatever the destination's `setxattr` accepts is written. A
+namespace an environment doesn't support is not a silent omission -- it
+surfaces through E-9's capability gate or E-3's fail-closed write rule,
+never through a quiet capture-side filter.
+
+### E-2 — Apply order and the POSIX ACL mask
+
+Extended attributes are applied **after** mode, not before:
+`chown → chmod → xattr → times`. A POSIX ACL's `mask` entry is recomputed
+by the kernel as a side effect of `chmod` whenever the file already carries
+an ACL. Writing the ACL before `chmod` would let the following `chmod`
+silently overwrite the mask that was just restored; applying it after
+`chmod` makes the captured ACL bytes the final, authoritative state.
+`rsync -A` and `cp --preserve=xattr` order their own ACL restore the same
+way, for the same reason -- this is not a migr-specific choice, it is what
+POSIX ACL semantics require.
+
+### E-3 — A failed read, write, or removal refuses the entry, never drops it
+
+A capture-side read failure, a replay-side `setxattr`/`lsetxattr`/
+`fsetxattr` failure, or a stale-attribute `removexattr` failure (other than
+`ENODATA`, which is an idempotent success when removing something already
+gone) refuses the affected entry fail-closed -- for every object kind,
+including symlinks, with no exception for any namespace. Backup cannot
+finalize over such a failure. If a replay/TOCTOU failure surfaces after
+E-9's capability gate has already passed, the invocation does not silently
+succeed and does not promise to roll back what was already applied: it
+returns non-zero with an honest applied/failed count, the same contract
+D17 already established for restore in general. This is the same rule D18
+and D19 established for a representation the destination cannot hold:
+refuse and say so, never silently omit the data.
+
+### E-4 — Symlinks are an ordinary case, not an exception
+
+`lsetxattr`/`lgetxattr`/`llistxattr`/`lremovexattr` are real, standard
+Linux syscalls -- portable capture has used the read side
+(`lgetxattr`/`llistxattr`) for symlinks since Phase C (D18 C-8). Symlink
+extended attributes are captured and replayed with the same `l*` family
+under the same E-3 fail-closed rule as every other kind; they are not
+collected-but-unwritable, and D18 C-8's own text already expected this
+("Until Phase E implements replay").
+
+### E-5 — Apply order is shared
+
+`create → chown → chmod → (remove stale, then set) extended attributes →
+times → readback` is the same sequence for both native and portable
+replay, extending D17's existing `chown → chmod → times` order (see D17's
+"Restore atime exactness" and its as-built notes) with one inserted step
+rather than replacing it.
+
+### E-6 — Ceilings are unchanged
+
+`SIDECAR_MAX_XATTRS_PER_ENTRY`, `MAX_XATTR_NAME`, and `MAX_XATTR_VALUE`
+stay exactly as D17 froze them. Phase E does not touch these limits.
+
+### E-7 — Test-only boundary
+
+All of Phase E's capture and replay behaviour remains behind the existing
+D14 test-only seam. Production portable dispatch stays disabled.
+
+### E-8 — Exact-set reconciliation, both directions
+
+Capture is not read-only with respect to the payload/destination's
+extended attributes: an attribute the destination already carries but the
+source no longer has is removed, not left behind. This applies symmetrically
+-- native capture reconciles the payload object's attribute set against the
+live source on every run (not only on first capture), and native/portable
+replay reconciles the destination object's set against the sidecar's
+recorded set. Resume equivalence for an entry is not size/mtime alone: an
+entry whose extended-attribute set no longer matches byte-for-byte is not
+eligible to be skipped as unchanged.
+
+**`security.*` stale removal tolerates, but still attempts, the LSM's own
+refusal.** A destination object gets a `security.*` value (typically
+`security.selinux`) assigned automatically by the kernel/LSM at creation
+time, independent of anything migr writes -- so a payload whose source
+never carried a `security.*` value (for example, one captured on a
+non-SELinux system, then restored onto an SELinux-enabled one) makes exact-
+set reconciliation see a destination attribute that "shouldn't" be there.
+Removing it requires privilege (`CAP_MAC_ADMIN` or an equivalent LSM
+grant) an ordinary restore does not have, so this specific removal
+tolerates `EACCES`/`EPERM` the same way removal already tolerates
+`ENODATA` for an attribute that's already gone -- an idempotent-style
+non-failure, not a silent skip. The removal is still attempted every time,
+not bypassed by namespace name: a caller that genuinely holds the
+privilege to remove a stale `security.*` value still does, and E-8's
+exact-set guarantee still holds wherever it's actually achievable. Only
+the specific, expected-for-most-callers privilege failure is tolerated,
+mirroring E-9's own `security.*` carve-out (that gate's probe is excluded
+entirely because no synthetic value can generalize the policy-specific
+accept/reject decision; this is the same underlying fact -- `security.*`
+is LSM-owned, not filesystem-owned -- showing up in the reconciliation
+step E-9 itself defers to).
+
+### E-9 — A pre-mutation capability gate, tightly scoped
+
+Before either native or portable replay mutates any user payload, a
+capability gate checks whether the destination can hold what the sidecar
+requires, and refuses the whole invocation before any mutation if not.
+Its scope is deliberately narrow, fixed here rather than left to whoever
+implements it:
+
+- **Once per invocation, not once per entry.** Namespace support is a
+  property of the destination, not of any individual file.
+- **Name only, not the captured value.** The gate attempts to set and
+  remove one representative attribute name per required namespace, in an
+  isolated scratch fixture that is always cleaned up. It does not write
+  the actual captured value. A value-specific rejection (for example a
+  destination's own per-value size ceiling) is not this gate's concern --
+  it surfaces later through E-3's ordinary replay-time fail-closed check,
+  since `MAX_XATTR_VALUE` is already a value ceiling migr enforces on its
+  own side regardless.
+- **One check per object kind actually present.** Regular/directory
+  objects (`f*` family) and symlinks (`l*` family) reach the destination
+  through mechanically different syscalls, so each required combination of
+  object kind and namespace is checked independently.
+- **`security.*` is out of this gate's probe, by name.** Unlike the other
+  three namespaces, `security.*` writes are validated by the destination's
+  loaded LSM policy (SELinux, AppArmor), not by generic filesystem/
+  namespace support. An invented probe name has no universally-valid
+  placeholder value the way `system.*`'s POSIX ACL wire format does --
+  whether a given `security.*` value is accepted is inherently policy- and
+  value-specific, exactly the class of rejection this gate's own
+  name-only design already excludes above ("a value-specific rejection
+  ... is not this gate's concern"). Probing it anyway would make the gate
+  refuse essentially every restore of a payload sourced from an
+  SELinux-enabled system, regardless of whether the destination genuinely
+  supports `security.*` (it almost always does -- it's using the
+  namespace on every file already). This is E-10's written, accepted
+  cross-policy boundary surfacing in the gate's own mechanism shape, not a
+  new exception. `security.*` presence is still tracked for the kind ×
+  namespace matrix's bookkeeping; it is simply never fed into the probe.
+  Its actual acceptance on replay remains E-3's ordinary fail-closed
+  check, same as any other value-specific rejection.
+
+A failure discovered after this gate has already passed (a race, a
+mid-replay policy change, anything the gate could not have observed) is
+not this gate's failure to catch -- it falls to E-3's ordinary fail-closed
+rule with an honest partial result, not a broken promise from the gate.
+
+### E-10 — The `security.*` semantic-transplant risk is a written boundary, not a filter or a runtime warning
+
+`security.*` is captured and replayed like any other namespace (E-1) --
+there is no default filter excluding it. But a successful `setxattr` of a
+`security.*` value does not mean the transplanted label is correct on the
+destination's own security policy; a label can be written successfully and
+still be semantically wrong on a system with a different policy, a class
+of error no syscall-failure check can ever catch, because the write itself
+does not fail. This decision does not solve that -- it is written down
+here as a known, accepted boundary, not a runtime warning (D14's test-only
+seam has no real runtime user to warn), and not resolved by silently
+excluding `security.*` from capture, which would leave the backup quietly
+incomplete for that namespace. A future, not-yet-designed user-confirmed
+omission mechanism is where this eventually gets a real answer.
+
+**Why:** D8's full-fidelity promise has stood with an acknowledged, empty
+gap for native xattrs since before Phase B; Phase C and Phase D's own
+capture code already collects xattrs on every portable entry, so the
+remaining work is replay, exact-set reconciliation, and the native side,
+not new collection logic. Ordering extended attributes after mode rather
+than before is required by POSIX ACL semantics, not a preference.
+Fail-closed on a write failure, and a pre-mutation capability gate ahead of
+it, keep a destination's real limitations from becoming silent data loss or
+a half-applied backup -- the same discipline D18 and D19 already
+established for symlink xattrs and unrepresentable names respectively. The
+capability gate's scope is fixed narrowly (E-9) rather than left
+open-ended, following the precedent D-10/N-10 already set: a
+measure-rather-than-predict mechanism's shape belongs in the decision, not
+rediscovered per-implementation.
+
+**Rejected:** a framework-specific code path for SELinux or any other xattr
+consumer, and calling `restorecon` or an equivalent, both ruled out by D7;
+treating symlink extended attributes as permanently unwritable, which is
+factually wrong (`lsetxattr` exists) and contradicts D18 C-8's own text;
+silently excluding the `security.*` namespace from capture by default to
+avoid cross-policy transplant risk, rejected because it would make the
+backup quietly incomplete for that namespace with no visible record, the
+same failure shape D16, D18, and D19 have consistently refused to allow
+elsewhere in this project; and a capability gate that probes captured
+values rather than names alone, rejected as unnecessary cost for a class of
+failure E-3's ordinary fail-closed replay-time check already covers.
+
+**Relationship:** D20 makes D7's framework-agnosticism concrete for
+extended attributes and ACLs. It keeps D17's `chown → chmod → times` apply
+order intact, inserting extended attributes as one more step rather than
+restructuring it, and shares that order between native and portable. It
+extends D18's C-5/C-8 and D19's N-2/N-5/N-8/N-10 rule -- a representation
+gap is measured and refused fail-closed, never silently dropped or
+predicted from a table -- to every extended attribute namespace and every
+object kind, and to the pre-mutation capability gate's own existence.
+Hardlink xattr-sharing remains Phase G's concern, and the `security.*`
+cross-policy semantic risk noted in E-10 is left to a future, not-yet-
+designed user-confirmed skip mechanism rather than solved here.
+
+### As-built (Phase E, 2026-08-08)
+
+Native capture, native restore, portable capture, and portable replay now
+reconcile the destination's extended-attribute set exactly against the
+source's in both directions, including removal of an attribute present only
+at the destination. The pre-mutation capability gate refuses an invocation
+before any payload write when a required object-kind and namespace combination
+is unusable at the destination. The host suite and `make check` (strict GCC
+and Clang, sanitizers, Valgrind, and `-fanalyzer`) passed on Arch, Ubuntu, and
+Fedora against `f563623`, with no compiler diagnostics and no Valgrind errors.
+
+The VM gate also exercised a real ext4 loopback destination: `user.*` values
+round-tripped byte-for-byte for both a regular file and a directory, and a
+stale destination attribute was removed by the next replay. A payload carrying 
+extended attributes was refused before any mutation against a real vfat loopback
+destination, leaving zero destination residue. On Fedora, an automatic
+`security.selinux` label round-tripped byte-for-byte, including on a symlink;
+this proved E-4's ordinary-symlink rule against a real label rather than a
+synthetic host fixture.
+
+E-8's two halves were both proven in the VM gate. Running as root, a stale
+`security.*` attribute absent from the payload was genuinely removed, while
+Fedora's own `security.selinux` remained non-removable even for root and was
+tolerated as the documented `EACCES` case. The test first established that
+root could set, read, and remove an arbitrary `security.*` name on ext4 and
+tmpfs on all three distributions, so the removal proof was measured rather
+than assumed. Production portable dispatch remains disabled under D14; all
+of these paths are reachable only through the existing test-only seam.
+
+This implementation supersedes D18 C-8's temporary rule that a symlink entry
+with `xattr_count != 0` is rejected until Phase E. Symlink extended attributes
+are now replayed through the no-follow `l*` family under E-3's ordinary
+fail-closed rule; D18 C-8 and the Phase C/D as-built records remain unchanged
+as historical entries.
+
+### E-11 — `security.*` apply refusal is visible, measured, and non-fatal
+
+The first implementation of E-8's tolerance covered only stale
+`security.*` removal. The set loop still treated an unprivileged
+`EACCES`/`EPERM` from `fsetxattr` or `lsetxattr` as an entry-fatal error.
+That asymmetry was exposed by the real migration workflow this project must
+serve: a backup captured on Fedora with SELinux labels was carried on a
+physical exFAT USB device and restored unprivileged on Arch without SELinux.
+The first file's `security.selinux` write refused, and the restore stopped
+before applying any of the remaining files.
+
+The correction keeps E-1's capture fidelity and E-10's framework agnosticism,
+but makes this value-specific cross-policy limitation explicit to the user.
+The restore preflight counts entries carrying `security.*` values and folds a
+warning into the existing single confirmation prompt. The warning explains
+that an unappliable attribute will be skipped while that entry's other
+content and metadata continue to restore. There is no second confirmation
+gate and no silent tolerance: a second prompt could leave an operation
+waiting after the user believed it had started, while a silent skip would
+violate D8's visible-loss rule.
+
+After confirmation, only `security.*` set or removal failures with
+`EACCES`/`EPERM` are tolerated, exactly matching E-8's existing removal
+exception. Each tolerated attribute is counted at apply time and the final
+restore summary reports the actual count; the preflight and dry-run messages
+report presence only and do not predict which values the destination policy
+will accept. All other namespaces and errno values retain E-3's fail-closed
+behaviour. The rule is shared by native and portable restore because both
+paths use `metadata_apply_xattrs_target()`.
+
+D81 later dropped the warning from the confirmation and the dry run; the
+apply-time tolerance and the summary count remain.
+
+---
+
+## D21 — 2026-08-08 — Portable case-collision resolution: deterministic suffix
+
+**Status:** Implemented (Phase F closed 2026-08-10; as-built notes below)
+
+**Decision:** Portable capture resolves case collisions in the payload namespace
+with a deterministic, `readdir`-order-independent suffix while preserving D19
+N-10's destination-backed measurement discipline. The suffix is a structural
+`collision_suffix` field in the sidecar v2 `ENTRY` record, present for every
+entry; an empty field means that the entry has no suffix. The **real physical
+path contains the suffix** when one is assigned, but the suffix is never carried
+to the restore destination, where the logical name is written.
+
+### F-1 — Deterministic assignment order
+
+Encoded sibling names are ordered by unsigned byte-wise lexicographic order,
+independent of `readdir()` order. Each candidate first tries an empty suffix;
+later members of a collision group begin with canonical `N=1,2,...`. If a
+destination reservation or readback rejects a candidate, the allocator advances
+to the next canonical suffix. Therefore the first sorted candidate is preferred
+without being promised a suffix-free name under every measured destination
+state.
+
+### F-2a — Structural wire field
+
+In sidecar v2, every `ENTRY` contains `collision_suffix` in a fixed position
+immediately after `physical_path`. The empty value is the semantic
+no-collision case; writing the field only for colliding entries is not a valid
+wire encoding because the NUL-separated grammar would become ambiguous.
+
+### F-2b — Canonical suffix form
+
+The suffix is `%7E` followed by a decimal `N` (`%7E1`, `%7E2`, ...). `N` is at
+least one, has no leading zeroes, uses an uppercase `E`, and is bounded before
+allocation by the sidecar, component, and path ceilings. The form stays inside
+D19's encoded on-disk alphabet because the raw `~` byte is encoded as `%7E`.
+
+### F-2c — Physical path carries the suffix
+
+`SidecarEntry.physical_path` is the actual payload path, including its suffix.
+The suffix is stored separately so restore can authenticate the relationship;
+it is not a reason to omit the suffix from the payload name and it is never
+re-derived from the logical name. A collision candidate's physical leaf is
+`encode_component(logical_leaf) + collision_suffix`.
+
+### F-2d — Destination authority for candidate allocation
+
+The source-set ordering and candidate numbering are deterministic, but final
+candidate names are verified on the destination with the existing probe and
+readback discipline. Reservation and attribution are hash-based and must not
+reintroduce a wall-clock dependency or an O(n^2) scan. On resume, a name owned
+by the current container/sidecar for the same logical entry is not an external
+collision; stale owned names and foreign names are handled explicitly rather
+than silently overwritten.
+
+An ASCII suffix alone cannot prove how an encoded candidate relates to every
+non-ASCII name on a particular filesystem. For example, a raw `foo~1` becomes
+`foo%7E1` and may still fold with another candidate. The destination, not a
+filesystem-name prediction, remains authoritative.
+
+### F-3 — Parent-prefix physical/logical invariant
+
+The restore invariant is not entry-local. Because capture derives a child's
+physical path from its parent's physical path, a directory suffix is embedded
+in every descendant physical path. For a non-root entry, the recorded
+`physical_path` must equal the **immediate parent's recorded `physical_path`**,
+then `/`, then `encode_component(logical_leaf) + collision_suffix`. A root-level
+entry uses the manifest root's `payload_path` as its parent and performs no
+parent-entry lookup. A missing parent entry is malformed and is refused. This
+single parent-prefix check inductively covers all ancestor suffixes without
+guessing them from logical paths.
+
+### F-4 — Complete assignment plan
+
+The pre-scan produces a bounded plan keyed by `(root_id, logical_path)` and
+containing the actual `physical_path`, `collision_suffix`, and reservation data.
+Fresh and resume capture contexts consume this plan; walkers never invent a
+fallback suffix. A source-set change between pre-scan and capture (including a
+new or missing entry) is a fail-closed source-plan mismatch rather than an
+opportunity to silently choose a different name.
+
+### F-5 — Root payload namespace
+
+`ManifestRoot.payload_path` addresses are a separate namespace. Overlapping,
+duplicate, or case-equivalent root payload paths are rejected before mutation;
+F does not introduce a root suffix field. Where non-ASCII equivalence cannot
+be inferred, the same destination probe/readback authority is used.
+
+### F-6 — Limits and report semantics
+
+`NAME_MAX` and `PATH_MAX` checks include the suffix. A suffix-induced overflow is
+fatal. The pre-scan's fatal count contains only unresolved violations; resolved
+collisions are tracked separately (with bounded diagnostics where useful) and
+must not be allowed to make the old `total_count != 0` gate reject a successful
+resolution.
+
+### F-7 — Resume and reconciliation
+
+Each invocation recomputes the plan from the complete current source set. Adding
+or removing a sibling can renumber a collision group and therefore changes
+physical paths; that is an explicit replacement, not an unchanged-entry skip.
+The old physical nodes must be reconciled and must not survive as stale payload
+after a successful finalization. The same rule applies when an interrupted
+partial is adopted.
+
+### F-8 — Source-change fail-closed behaviour
+
+If capture observes a logical entry outside the plan, a planned entry disappears,
+the source object no longer matches its snapshot/identity, or the reserved
+physical name no longer passes the final destination check, capture fails
+without fallback allocation and publishes no final container. Same-invocation
+source drift is not silently reconciled.
+
+### F-9 — Test-only boundary
+
+The planner, assignment seams, and probe counters remain behind D14's test-only
+boundary. Production portable dispatch stays disabled; no production override,
+environment switch, or broad callback framework is introduced for testing.
+
+### F-10 — Wire version
+
+`SIDECAR_VERSION` advances from 1 to 2. The sidecar header, manifest
+`sidecar_version`, writer, reader, state map, and restore path use the same v2
+contract; `MANIFEST_CURRENT_VERSION` does not change. A legacy v1 sidecar is an
+unknown version and is refused rather than being guessed into the new grammar.
+
+**Why:** These decisions must be fixed before the codec and collision planner
+are implemented. The wire field, the root namespace boundary, destination
+measurement, and parent-prefix restore rule are format and safety contracts,
+not implementation details that can be rediscovered independently in each
+walker. Keeping the plan a pure function of the ordered source set gives fresh
+and resume captures the same logical-to-physical mapping, while target-backed
+candidate verification prevents a convenient ASCII assumption from becoming a
+silent data-loss path.
+
+**Rejected:** target-independent, computation-only suffix allocation, because an
+ASCII suffix cannot prove non-ASCII folding; a suffix kept only in the sidecar
+and omitted from the physical payload path, because payload lookup must use the
+actual path on disk; an entry-local restore invariant, because an ancestor's
+suffix is embedded in the entire descendant subtree; carrying the suffix to the
+restore destination, because restore writes the logical name; and backward
+compatibility with v1, because no released containers exist and v1 is explicitly
+refused by the v2 grammar.
+
+**Relationship:** D21 preserves D19 N-10's destination-backed measurement and
+extends D19's N-2/N-8 `NAME_MAX`/`PATH_MAX` limits to include the suffix. It bumps
+D17's sidecar v1 grammar to v2, generalizes N-4's physical/logical invariant to
+the parent-prefix form, and remains subject to D14's test-only boundary. Root
+payload paths remain governed by the manifest/root policy, hardlinks are deferred
+to Phase G, and sparse-file layout remains deferred under D13.
+
+### As-built (Phase F, 2026-08-10)
+
+The host suite and `make check` (strict GCC and Clang, sanitizers, Valgrind, and
+`-fanalyzer`) passed on Arch, Ubuntu, and Fedora against `c7896a0`, with no
+compiler diagnostics, Valgrind errors, or sanitizer errors.
+
+The VM gate exercised a real case-insensitive vfat destination. ASCII
+`Foo`/`foo` and measured non-ASCII `café`/`CAFÉ` collisions were resolved with
+deterministic suffixes. A real source `foo~1` file forced the plan to skip to
+`%7E2`, and descendants (including a symlink) of a suffixed directory were
+placed beneath the correct physical parent. A capture declaring
+`case_sensitive=1` invented no suffixes.
+
+Resume renumbering is covered too: adding a new sibling that sorts before an
+existing owner releases the owner's old physical name and moves it to its new
+suffix-bearing name without changing its content. This path is verified on
+vfat.
+
+The F-5 root-payload namespace probe detected a measured root-pair collision on
+a real case-insensitive destination, closing a gap that host tests could not
+prove. Host-only scale tests kept collision-plan work within linear bounds for
+4,000 entries and measured risk-11 renumbering cost for both a single entry and
+a nested directory with 2,000 descendants.
+
+Production portable dispatch remains disabled under D14; all of these paths are
+reachable only through the existing test-only seam.
+
+---
+
+## D22 — 2026-08-11 — Hardlink handling: group reference, placeholder node, sticky-seed representative
+
+**Status:** Implemented (Phase G closed 2026-08-13; as-built notes below)
+
+**Decision:** Portable capture records the first-seen member of each `(st_dev,
+st_ino)` group as a regular file and later members as hardlink records carrying
+a group reference; every record still owns a payload node, with hardlink nodes
+represented by empty placeholders. Portable restore replays the group with
+`link()`. Native fresh capture preserves hardlink identity with real `link()`,
+while native restore continues to duplicate because it reads no sidecar; resume
+representatives are sticky-seeded from the existing sidecar state before the
+walk.
+
+### G-1 — Portable payload node: placeholder (D18 pattern)
+
+Every hardlink record owns its own zero-byte payload node. The first-seen
+representative carries the regular-file bytes; later hardlink members carry
+empty placeholders, and restore creates the links between those nodes. This
+keeps D18's live-key-to-payload-node invariant universal. Node-less records are
+rejected because they would require a separate restore branch and break that
+invariant. The rule does not alter D21 F-5's separate root-payload namespace.
+
+### G-2 — Restore ordering: capture's first-seen-first order
+
+The sidecar record order is authoritative: capture writes the first-seen
+representative as `REGULAR` before its hardlink members. Restore trusts that
+order, and a `HARDLINK` record whose referenced `REGULAR` record is absent is
+malformed and refused fail-closed. A two-pass restore is rejected as replay
+architecture bloat; deferred binding is rejected because it adds memory and
+postpones an unresolved-reference failure until the end.
+
+### G-3 — Cross-root reference validation
+
+`hardlink_root_id` may refer to a different manifest root. Restore must verify
+that the referenced root is present in the same container manifest before
+following the group reference. A missing root makes the group malformed and is
+refused fail-closed rather than guessed or silently copied.
+
+### G-4 — Xattr only on the representative member
+
+Capture collects extended attributes only for the first, `REGULAR` member; a
+`HARDLINK` record carries no xattrs. Because restore's `link()` shares the
+representative inode, its xattrs arrive automatically, so a second
+`setxattr` on the linked member is unnecessary and introduces avoidable risk
+under SELinux. A hardlink record with `xattr_count != 0` is malformed and is
+refused. This closes the hardlink xattr-sharing debt left by D20 E-10.
+
+### G-5 — Native fresh capture links; native restore duplicates
+
+Native fresh capture preserves hardlink identity with a real `link()`: a later
+occurrence of an already-seen `(st_dev, st_ino)` group links to the captured
+representative instead of recopying its bytes. Native restore continues to
+duplicate, as recorded by the sidecar plan's native column, because it has no
+hardlink record and reads no sidecar; a manifest v2 for native restore is out
+of scope. Native resume's stale/deleted handling remains Phase H's debt because
+native capture keeps no committed-key log.
+
+### G-6 — Resume representative stability: sticky-seed
+
+`readdir()` order is not stable across runs, and the Phase F resume-renumbering
+bug (`6e43026`) demonstrated the cost of treating a resumed walk as fresh. At
+the point where `portable_owned_paths_load` already scans the sidecar once,
+resume also reads each live entry's kind. A live `REGULAR` path that still
+carries the same inode seeds that inode's representative in the map before the
+walk, so other members encountered later become `HARDLINK` records
+automatically. If the former representative is gone from the source, the map
+starts empty for that inode and G-2's first-seen rule is the fallback. This
+follows the proven `prepare_collision_relocations` pattern: read current state
+from the sidecar first, then steer the walk.
+
+**Why:** Hardlink identity is part of filesystem fidelity, so portable capture
+must preserve one inode group without creating a second copy of its bytes or
+silently losing the relationship. Empty placeholder nodes preserve D18's
+universal payload invariant while record order gives restore a single-pass,
+bounded binding rule. Manifest roots and representative-only xattrs keep
+references and metadata explicit and fail-closed. Native capture can preserve
+the relationship directly with `link()` without expanding native restore into
+a sidecar reader, and sticky seeding prevents an unchanged resumed source from
+being needlessly rewritten merely because directory enumeration order changed.
+
+**Rejected:** node-less hardlink records, because they break D18's payload-node
+invariant; two-pass restore, because it bloats the replay architecture; deferred
+binding, because unresolved references would be discovered only after the walk;
+rebuilding an empty inode map on every resume, because unstable enumeration can
+flip the representative and force needless rewrites; and a manifest v2 for
+native restore, because native restore does not consume sidecar state and that
+compatibility expansion is outside G-5.
+
+**Relationship:** D22 preserves D17/D18's metadata and payload-node invariant,
+extends D19's encoded physical-path rules to hardlink groups, and closes the
+xattr-sharing debt explicitly left by D20 E-10. D21's collision suffixes and
+hardlink groups both shape the physical payload paths, while D14's test-only
+boundary remains in force through Phase G. Native stale-entry reconciliation is
+left to Phase H, and sparse-file handling remains governed by D13.
+
+### As-built (Phase G, 2026-08-13)
+
+The host suite and `make check` (strict GCC and Clang, sanitizers, Valgrind,
+and `-fanalyzer`) passed cleanly against `2f6327f`, with no compiler
+diagnostics, Valgrind errors, or sanitizer errors.
+
+G-2's decision text states that restore "trusts" capture's first-seen-first
+record order. Implementation-time investigation (G.3) found this assumption
+does not hold: `sidecar_log_foreach` iterates the sidecar's state map in
+hash-bucket order — a pure function of each entry's key hash, unrelated to
+append order — and `replay_run`'s own pre-apply sort orders entries by path
+depth then name, also unrelated to hardlink structure. No such order exists to
+trust; reverting to a single ordered pass broke `test_hardlink_orchestration`
+outright ("alias" sorts before "representative"). The as-built fix is not the
+"two-pass restore" G-2 rejected — a wholesale second pass over the entire
+entry set — but a targeted second pass restricted to `HARDLINK`-kind entries
+only: `replay_run` applies every `REGULAR`, `SYMLINK`, and directory-prep
+entry exactly as designed, then filters the same already-collected set for
+`HARDLINK` entries and applies those once every representative is guaranteed
+to be on disk. This costs one `O(n)` filter over data already in memory, not an
+additional traversal. G-2's fail-closed missing-reference rule and its
+rejection of deferred binding both hold as decided: reference resolution
+happens eagerly during collection, before `replay_run` runs at all, so an
+unresolved or malformed reference is refused before any hardlink-kind entry
+is ever considered for application.
+
+G-1, G-3, G-4, G-5, and G-6 matched their locked text with no corrections
+needed at implementation time; G-6's sticky-seed fallback was specifically
+traced across all four representative/member presence combinations across a
+resume boundary and found to already cover every one without additional code.
+
+The VM gate exercised real hardlink pairs on Arch, Ubuntu, and Fedora: a
+native capture (real `link()`) and a portable capture+replay (real sidecar
+`HARDLINK` record + `linkat()`) both correctly shared one inode across two
+separate manifest roots on a real ext4 destination
+(`hardlink-native-portable-seam`); a portable `HARDLINK` record replayed onto a
+real vfat destination — which cannot `linkat()` — failed with an honest
+partial count rather than a silent fallback or a false success
+(`portable-hardlink-vfat-dest`); and on Fedora specifically, a native
+hardlink alias's `security.selinux` label was confirmed genuinely automatic
+through the shared inode, with no second `setxattr` call
+(`hardlink-selinux-xattr-sharing`; correctly a no-op on Arch/Ubuntu, which
+carry no automatic security labelling). A full regression pass of every
+existing VM-gate scenario also ran clean on all three VMs alongside these
+three.
+
+Host-only scale tests (5,000 real hardlink pairs) kept the pre-scan inode set,
+the capture-time inode map, and the resume sticky-seed pass within their
+linear probe budgets; mutating the inode map's hash function to a constant
+confirmed the O(n²) guard actually fires (~25 million probes, four assertions
+broken).
+
+Production portable dispatch remains disabled under D14; every path above is
+reachable only through the existing test-only seam.
+
+---
+
+## D23 — 2026-08-13 — Native stale reconciliation without a new log format
+
+**Status:** Implemented (Phase H closed 2026-08-14; as-built notes below)
+
+**Decision:** Native resume keeps the existing nsec-gated content-resume
+oracle and reconciles stale destination entries by scanning the destination
+tree directly after a clean capture of every root. The destination tree is
+the complete record of what was captured; no additional committed-key log or
+wire format is introduced.
+
+### H-1 — Native resume-skip remains nsec-exact
+
+Native content resume-skip is allowed only when `nsec_exact` is true and the
+source and destination agree on size, `mtime_sec`, and `mtime_nsec`. Otherwise
+the content is copied again. The existing nsec-exact-gated comparison in
+`src/fileops.c` remains unchanged. A destination that cannot prove
+nsec-granular timestamp round-trip therefore cannot take the skip path and
+falls back to a safe recopy.
+
+### H-2 — Reconcile stale entries by scanning the destination tree
+
+After all roots' capture completes cleanly, each root's destination subtree is
+scanned directly with the established `openat`/`fstatat`/`O_NOFOLLOW`
+discipline. Every relative path absent from the walk's visited-set is stale
+and is deleted. Native `data/<root>` has no percent-encoding or collision
+suffix, so its destination tree is a lossless one-to-one mirror of the
+captured source. There is no committed-key log, new wire format,
+truncation rule, or log commit-ordering requirement.
+
+A deletion interrupted halfway through is found again on the next resume:
+the destination tree is rescanned, and deletion is idempotent because an
+already-absent entry is tolerated as `ENOENT`.
+
+### H-3 — Deletion safety and fail-closed boundaries
+
+Deletion is permitted only for destination entries absent from the visited-set
+and only after a clean walk. Although a root that completes cleanly has its own
+complete visited-set, deletion is withheld for every root until all roots
+succeed, as a deliberate additional safety margin rather than something the
+incomplete root's data alone would require. The capture path therefore keeps a
+single cumulative error flag across all roots; only when it is clear does the
+scan-and-delete phase begin.
+
+The per-root scan is safe because source `capture_path` overlap is already
+rejected by `validate_no_duplicates_or_overlap` in `src/backup_plan.c`, while
+destination `payload_path` uniqueness is guaranteed structurally by the root
+naming scheme rather than checked as a runtime overlap condition.
+
+Sockets and device nodes are skipped by native capture with a warning rather
+than failing the enclosing directory, and are not recorded in the visited-set.
+If a source path is now a socket or device node, the corresponding destination
+path must therefore be absent after reconciliation; an older regular file at
+that path must not be preserved as visited.
+
+Only user-derived objects below `data/` are eligible for this reconciliation;
+the container root remains migr-owned. Deletion uses `unlinkat`/`rmdir` with
+`AT_SYMLINK_NOFOLLOW` and never follows a symlink. Directories are deleted
+post-order. Any deletion failure sets the cumulative error flag and blocks
+finalization, so deleted files or subtrees cannot survive a successfully
+resumed final backup.
+
+### H-4 — No commit-ordering discipline
+
+There is no log whose records must be ordered against payload mutation. The
+destination tree is, at every moment, the complete and consistent record of
+what was actually captured. A half-finished deletion is handled by H-2's
+next-run rescan and does not require a separate commit protocol.
+
+The "committed key log" wording in D17 and D22 G-5 denotes a
+state-comparison capability, not a literal file format. D23 satisfies that
+requirement with the visited-set compared against the destination tree and
+introduces no new on-disk format.
+
+**Why:** Native capture already has a lossless destination namespace and a
+resume oracle for content. A post-walk comparison against a visited-set makes
+stale-entry removal explicit while preserving interruption safety: an
+incomplete walk cannot authorize deletion, and an interrupted deletion is
+rediscovered on the next run. The nsec-exact gate prevents a coarse timestamp
+filesystem from being treated as safely resumable.
+
+**Rejected:** A committed-key log plus a destination diff is rejected because
+it would add another file format, writer and reader, truncated-tail recovery
+rules, and commit-ordering discipline without providing information the
+destination tree does not already contain. Deleting each stale entry during
+the capture walk is rejected because it is more invasive and can leave a
+half-deleted tree when the process is interrupted.
+
+**Relationship:** D23 preserves D6's resume-oracle rationale: the sidecar has
+the true size and mtime, while native resume takes its skip path only under
+the measured `nsec_exact` gate. It assigns the native stale-entry gap noted in
+D17 to a direct destination-tree comparison, keeps D17's nsec-exact skip
+unchanged, and supplies the deletion acceptance condition described there.
+It uses D15's container ownership and `data/` boundary, and gives the same
+"without a committed key log" wording in D22 G-5 its concrete visited-set
+meaning. D14 continues to keep portable dispatch test-only; H's reconciliation
+is native production-path work, while direct portable dispatch remains
+disabled.
+
+### As-built (Phase H, 2026-08-14)
+
+The host suite and `make check` (strict GCC and Clang, sanitizers,
+Valgrind, and `-fanalyzer`) passed cleanly against `bbdcc02`, with no
+compiler diagnostics, Valgrind errors, or sanitizer errors.
+
+H-1 through H-4 matched their locked text with no corrections needed at
+implementation time -- unlike D22's G-2, nothing decided here turned out to
+rest on a false premise once built.
+
+One narrow, deliberately-unaddressed edge case was found and left as
+recorded debt rather than fixed: `native_reconcile_stale_at` (`fileops.c`)
+returns an error, rather than treating it as a no-op success, when a root
+is both absent from the visited-set *and* absent from the destination
+entirely (`fstatat` `ENOENT`). The only way to reach that combination is a
+root whose source object changes to a socket or device node between plan
+validation and actual capture -- a TOCTOU race outside this project's
+stated threat model (D17's "no realistic attacker scenario" reasoning),
+since `root_type_allowed` (`backup_plan.c`) already refuses to construct a
+socket/device-node root in the first place. The existing "a root that was
+never part of this run's own capture fails closed rather than being treated
+as empty" behavior is deliberately conservative and a real test locks it in
+on purpose; a clean fix would need the caller to distinguish "genuinely
+attempted and skipped this run" from "never part of the plan," which the
+current API does not do.
+
+The VM gate (Arch, Ubuntu, Fedora) exercised native stale reconciliation on
+real ext4 and btrfs (Arch's minimal image ships no btrfs-progs; recorded as
+not-applicable there, not a failure): a file deleted from source between a
+captured run and its resume is absent from the resumed final backup on
+both filesystems. A real `SIGKILL` mid-resume -- interrupting a run that
+had both fresh content still to capture and stale content still to
+reconcile -- specifically verified H-2/H-4's central claim that an
+interrupted deletion needs no commit protocol: the next clean resume
+converged to the fully correct final state (every stale survivor gone,
+every fresh file present) with no special recovery path, exactly as H-4
+predicted. A full regression pass of every existing VM-gate scenario also
+ran clean on all three VMs alongside these.
+
+Host-only scale tests (20,000 captured objects) kept the visited-set's
+insertion and reconciliation's lookup within linear probe budgets in both
+directions; mutating the visited-set's hash function to a constant
+confirmed the O(n²) guard actually fires (~200 million probes, all four
+assertions broken).
+
+Unlike the D14 test-only seam every portable-representation paragraph in
+this file and the README is gated behind, this phase's reconciliation is
+native production-path work: it runs on every real backup today, not only
+through a test-only entry point.
+
+---
+
+## D24 — 2026-08-19 — Production portable dispatch enablement
+
+**Status:** Implemented
+
+### As-built (2026-08-22)
+
+The atomic activation commit `383d338` opened production portable dispatch:
+`backup()` and `restore()` now route a `CLONE_PORTABLE_SIDECAR` verdict through
+the portable engines, live and dry-run paths use the real destination probes,
+and package handling stays in the shared control slot, with restore invoking it
+only after a complete file replay. At the current `8e70c0d` HEAD, `make clean
+&& make test`, `make check-strict` under GCC and Clang, `make check-analyze`,
+and `make check-valgrind` all pass; the root-gated real-vfat smoke was skipped
+here because loop/mount setup requires root, alongside the suite's expected
+privilege- and fixture-dependent skips.
+
+The Arch/Ubuntu/Fedora libvirt matrix exercised the production CLI against real
+loopback vfat for resume and SIGKILL recovery, dry-run/live parity for case
+collisions and unresolvable names, package install/restore, and a real Fedora
+SELinux label round-trip. A physical exFAT USB drive was then moved between the
+three running VMs: the cross-machine Arch → Ubuntu → Fedora → Arch chain and
+Fedora, Arch, and Ubuntu same-distro round trips each restored all 23940/23940
+items, with file counts and sizes checked after every leg.
+
+Three narrow bugs found during that live testing are fixed in the history:
+`f6bbbe7` resolves `ROOT_POLICY_XDG` destinations instead of flattening them
+into `$HOME`; `e66eb4f` makes cross-policy `security.*` apply refusals visible
+and non-fatal (D20 E-11); and `8e70c0d` names HOME-relative/XDG anchor failures
+with their offending logical path instead of using a generic preflight example.
+
+**Decision:** D14's refusal of a portable verdict is lifted for production
+`backup()` and `restore()`. Once the activation commit (I.2, below) lands, a
+destination that `select_representation()` classifies as
+`CLONE_PORTABLE_SIDECAR` is captured and restored through the portable engine
+built across Phases B–H, instead of being refused. This entry locks the
+adapter contract that connects that already-built, already-tested engine to
+the production CLI; it introduces no new sidecar or manifest wire format, and
+does not reopen `select_representation()`'s own decision matrix (D14).
+
+### I-1 — Backup dispatches inside `backup()`
+
+The container reserve/adopt/finalize lifecycle stays representation-agnostic,
+exactly as D15 established it. The native/portable split is confined to
+manifest and payload-namespace ownership and to the capture engine invoked;
+there is no separate `backup_portable()` duplicating the shared lifecycle.
+
+### I-2 — Restore dispatches inside `restore()`
+
+When the manifest is valid and its representation is portable, native payload
+validation, native metadata inventory, native timestamp-anchor probing, and
+native confirmation do not run; the portable branch never re-enters the
+native preflight chain. Fd/cleanup code may be shared where genuinely common;
+the two preflight chains, being semantically distinct, are never interleaved.
+
+### I-3 — `packages.txt` is representation-independent
+
+Portable backup writes the package list into the same control slot native
+backup already uses. Portable restore applies packages only after file
+replay has completed fully successfully; a cancelled confirmation or a
+replay error never reaches the packages call.
+
+### I-4 — Representation and case behavior are measured, never predicted
+
+Both a live run and a dry-run run the real `fsprobe()`, and — on a portable
+verdict — the real destination-backed case-collision probe, against the
+actual destination. A resolvable case collision is recorded but not fatal; a
+violation counted in `PortablePrescanReport.unresolved_count` (an
+unrepresentable name, an oversized path, a root-namespace collision) is
+fatal. `total_count` alone never refuses a capture.
+
+### I-6 — Dry-run runs the real pre-mutation probe gates
+
+Dry-run creates no container, payload, or package list, but it runs the same
+temporary, self-cleaning filesystem round-trips a live run would, so its
+report is actually true rather than assumed: the full destination capability
+probe on backup; the privilege-relevant `O_TMPFILE` ownership probe on a
+native backup profile; the timestamp-anchor and metadata-ownership probes on
+native restore; the timestamp and ownership probes on portable restore; the
+destination-backed case/root-namespace probe on a portable backup. Dry-run
+never asks for confirmation. A probe refusal produces the same nonzero
+result a live run would produce for the same destination. This is a
+measurement of the current, real state only: it makes no promise about a
+later source TOCTOU, a later I/O error, or data that changes between the
+dry-run probe and a subsequent live capture.
+
+### Destination identity is fd-anchored, never re-resolved by path
+
+The capability probe, the prepared portable plan, and the container
+reservation/adoption claim all consume one destination-root file descriptor
+opened once, not a path string resolved independently by each step. A
+path-based `fsprobe(path, ...)` and path-based container reserve/adopt remain
+as compatibility wrappers around the fd-anchored primitives, but production
+`backup()` calls the fd-anchored form. This closes a real gap: today
+`fsprobe(target)`, `container_adopt(target)`, and `container_reserve(target)`
+each re-resolve `target` from its path independently, so a symlink swap
+between calls could let a destination the probe measured as native silently
+diverge from the destination the container is actually written into.
+
+### Portable capture prepares a complete, exact plan before any container reservation
+
+The mandatory pre-scan and the expected manifest (built once, from the
+portable capture request, through the one builder portable capture already
+uses) are produced together, against the destination or its nearest existing
+parent, before `container_reserve`/`container_adopt` runs. Fresh capture,
+resume comparison, and container adoption all consume that same prepared
+object; none of them constructs a second, independent copy of the expected
+manifest. This closes two related gaps: first, the manifest `backup()` itself
+has always built for resume comparison hard-codes `sidecar_version = 0`
+(correct for native, wrong for portable, since the portable engine's own
+manifest carries the current sidecar wire version), which would make a
+portable partial's identity never match on resume; second, running the
+portable engine's own deterministic pre-scan only after `container_reserve`
+has already claimed a `.partial` directory would leave a manifest-less,
+unadoptable partial behind on every deterministic refusal (an
+unrepresentable name, for instance), since a container is only resumable
+once its manifest has been written.
+
+### Portable restore reports one of four distinct outcomes
+
+Portable restore orchestration distinguishes completion, a dry-run preview, a
+user's cancellation, and a preflight/probe/replay error as four separate
+results — not, as today's direct API does, the same return value for a
+genuine success and a user declining the confirmation prompt. `restore()`
+owns interpreting that outcome, dispatching packages only on completion
+(previewing them only on dry-run), and printing the one final summary; the
+portable engine itself never prints a second "complete" line. Restore's
+destination timestamp policy is measured for real, by the same fd-anchored
+timestamp probe the engine's own tests already exercise, run by the
+orchestration itself after confirmation and before the first persistent
+mutation — production never accepts an injected or predicted timestamp
+policy, matching D14's standing prohibition on any override.
+
+### Commit discipline: one atomic activation, no partial public dispatch
+
+The adapter contracts above are built and proven in commits that change no
+CLI-visible behavior (the portable and native refusals stay in place while
+the underlying primitives are readied and independently tested). Production
+dispatch itself — backup, restore, dry-run, packages, and the minimal
+public-surface correction (`--help`, README, and the two source comments in
+`portable.h`/`portable_restore.h` that currently and correctly say production
+never calls these entry points) — opens together, in one commit. No
+committed state exists in which `migr backup` can write a portable container
+that `migr restore` cannot yet read back, or in which dry-run's preview and
+backup's live behavior disagree about representation.
+
+### Dry-run's persistent-effect claim is scoped honestly
+
+Dry-run's probes create and remove real, named scratch objects on the
+destination (or its parent, for a destination that does not yet exist);
+every one is removed on every success and failure path. What is guaranteed
+is that no persistent container, `.partial`, manifest, sidecar, payload, or
+package file is left behind — not that the destination filesystem is
+completely unaffected, since a probe's own create/remove pair can still
+change a parent directory's ctime. Documentation states the former, not the
+latter.
+
+**Why:** The portable engine has been built and tested end to end since
+Phase B, entirely behind D14's test-only seam; the sidecar branch's own
+stated purpose (D6) is not complete until a user can actually reach it.
+Locking the adapter contract before writing it prevents exactly the class of
+defect a live-code review of the naive integration surfaced: a
+resume-identity field silently left at its native default, a native-only
+preflight applied where it does not belong, a success path with no way to
+report what it did, and container/probe/plan identity resolved by path more
+than once. Requiring one atomic activation commit, after readiness work that
+changes nothing observable, is the same "an incomplete state must never look
+complete" discipline D15 already applies to the container itself, applied
+here to the commit history around it.
+
+**Rejected:** Separate `backup_portable()`/`restore_portable()` functions
+duplicating the container lifecycle, rejected as unnecessary copying once
+that lifecycle is confirmed representation-agnostic. Landing backup dispatch
+and restore dispatch as two separate, individually-green commits, rejected
+because the intermediate state is a green build that cannot read back what
+it just wrote. Treating `fsprobe(path)`/`container_adopt(path)`/
+`container_reserve(path)`'s independent path re-resolution as acceptable,
+rejected once it was shown to open a real TOCTOU window between what was
+measured and what is written. Continuing to build a second, independent
+expected-manifest copy in `backup()` itself, rejected in favor of one shared
+builder, once the existing `sidecar_version` default was shown to break
+portable resume identity silently. A blanket "dry-run never touches the
+destination" claim, rejected as stronger than what the implementation
+actually provides once dry-run began running real probes to keep its
+preview honest.
+
+**Relationship:** D24 lifts D14's production-disabled boundary for the
+`CLONE_PORTABLE_SIDECAR` verdict once the activation commit described here
+lands; D14's own text is unchanged, per this file's append-only rule, and
+its selector logic (`fsprobe`/`select_representation`) is not reopened by
+this entry. It reuses D15's `data/`-namespace and atomic-finalization
+container lifecycle without modification and depends on D16's
+root-addressing policy for the `MANUAL_NATIVE` refusal, which portable
+capture continues to enforce. It relies on D17's resume-identity comparison
+(extending its exactness to the sidecar-version field for a portable
+partial) and on D19–D23's already-locked portable capture, illegal-name,
+case-collision, hardlink, and native-reconciliation contracts, none of which
+this entry revisits. Native restore's own hardlink-identity duplication
+(D22 G-5) remains open and is not touched by this entry; closing it, if it
+happens, is separate work.
+
+## D25 — 2026-08-20 — Portable resume uses write-ahead ownership claims
+
+**Status:** Implemented
+
+### As-built (2026-08-21)
+
+On the Fedora Linux 44 host, the complete suite passed with `make clean &&
+make test`, `make check-strict` (GCC and Clang), `make check-analyze`, and
+`make check-valgrind`. `make check-sanitize`, the sanitizer stage of `make
+check`, was also run; its first test stopped before any assertion because
+LeakSanitizer cannot run under this host's ptrace execution environment. An
+equivalent ASan/UBSan full-suite run with `detect_leaks=0` passed; that confirms sanitizer
+execution but does not provide leak validation. The 15-row D25 acceptance
+matrix is fully evidenced: codec and tail boundaries; replay/state transitions;
+per-kind fresh and SIGKILL recovery, including the nested three-CLAIM
+ancestor case; replacement, stale cleanup, collision and hardlink recovery;
+repeated interruption; zero-claim capture and restore gates; and foreign-node
+refusal. Production portable dispatch is already active on this branch through
+D24; D25 changes neither representation selection nor dispatch. The real-vfat
+SIGKILL/resume VM gate remains separate, deferred host/VM smoke-test work.
+
+**Decision:** Portable capture closes the interval between payload mutation and
+the sidecar's normal live-state commit with a standalone, write-ahead
+`CLAIM` record. A claim is durable ownership proof for one payload node; it is
+not a live restore entry, evidence that the payload is complete, permission to
+skip source or payload validation, preliminary directory metadata, or a
+replacement for the normal post-order directory entry. `ENTRY_COMMIT` remains
+the only operation that makes an `ENTRY` group live. Directory metadata and
+xattrs remain post-order, and this decision adds no new process-interruption
+or power-loss durability guarantee: the existing no-`fsync` boundary remains
+unchanged.
+
+### Wire record
+
+Sidecar version 3 retains the v2 grammar and adds exactly one standalone
+record; no parallel spelling or alias is supported:
+
+```text
+CLAIM:
+  tag, root_id, logical_path, physical_path, object_kind
+```
+
+The tag is `CLAIM\0`. Every field uses the existing NUL-framed string rules,
+field ceilings, allocation ceilings, and total-byte ceilings. `root_id` is
+non-empty; root logical and physical paths may be empty as they are elsewhere
+in the grammar. Valid claim kinds are the four portable payload-producing
+kinds: `regular`, `directory`, `symlink`, and `hardlink`. FIFO remains
+unsupported by portable capture and is not made claim-capable by this
+decision. Socket and device nodes publish no portable payload and receive no
+claim.
+
+`physical_path` already contains any D21 collision suffix; `CLAIM` does not
+duplicate `collision_suffix`. A complete claim becomes committed at the end of
+`object_kind` and advances `last_valid_boundary`. A claim cut short by EOF is
+a truncated tail. No payload mutation may follow a writer call that did not
+finish the claim. A malformed complete claim, an unknown tag or kind, or a
+claim interleaved inside a pending `ENTRY`/`XATTR`/`ENTRY_COMMIT` group is
+corruption.
+
+The append-only file retains historical consumed claims. “Zero outstanding
+claims” refers to replayed state, not to the absence of `CLAIM` bytes in the
+file.
+
+### Claim state machine
+
+The protocol specifies semantic transitions, not whether the implementation
+uses one map or separate live and claim maps:
+
+| Current semantic state | Record | Required result |
+| --- | --- | --- |
+| No live entry and no claim, or a tombstone with no claim | `CLAIM(C)` | `C` becomes the one outstanding claim for the key; an older tombstone may remain as history. |
+| Live entry exists | `CLAIM` | Invalid/corrupt. The writer must first perform D17's `DELETE`. |
+| A claim is already outstanding | another `CLAIM` | Invalid/corrupt, even if byte-identical. Resume reuses the matching claim. |
+| Matching claim `C` and a completed matching `ENTRY(E)` group | `ENTRY_COMMIT` | Consume `C`, replace prior tombstone state, and make `E` live. |
+| No claim, or a claim mismatching the pending entry | `ENTRY_COMMIT` | Invalid/corrupt; no live state is produced. |
+| Live entry, no claim | `DELETE(key)` | Existing D17 transition: the live entry becomes tombstoned. |
+| Outstanding claim | `DELETE(key)` | Cancel the claim without creating a live entry; any older tombstone remains. |
+| No live entry or claim | `DELETE(key)` | Existing idempotent no-op behaviour. |
+
+A claim and its consuming entry must match byte-for-byte on:
+
+```text
+root_id, logical_path, physical_path, object_kind
+```
+
+At most one outstanding claim may exist per logical key. Active physical
+ownership must also remain unambiguous: a claim cannot authorize a physical
+path currently owned by a different logical key. Claims consume the existing
+path, total-byte, allocation, and live-entry resource ceilings; outstanding
+claim cardinality is bounded by the existing live-entry ceiling.
+
+D17's reader tolerance for a duplicate committed entry without an intervening
+`DELETE` does not authorize a claimless v3 commit. Every v3
+`ENTRY_COMMIT`, including a same-key replacement, requires its own matching
+outstanding claim.
+
+### Claim cancellation and cleanup
+
+No `CLAIM_CANCEL` or `ABORT` record is introduced. `DELETE(root_id,
+logical_path)` is also the committed transition that cancels an outstanding
+claim when no `ENTRY_COMMIT` will follow, including when the source node
+disappears or changes kind, or when the current collision plan assigns a
+different physical path.
+
+Because a claim is ownership proof, cleanup follows this order:
+
+1. Remove the exact claimed payload node while the claim is still outstanding.
+2. Append `DELETE` to cancel the claim.
+3. If either step fails, return failure and leave the partial resumable.
+
+This order ensures that a successfully cancelled claim cannot leave its
+payload node unowned. If removal succeeds but interruption occurs before
+`DELETE`, the surviving claim safely authorizes an idempotent retry against an
+absent node.
+
+A directory claim owns the directory node, not arbitrary contents beneath it.
+Directory cleanup therefore reconciles known live and claimed descendants
+deepest-first and removes the directory non-recursively. An unknown or foreign
+child blocks cleanup; recursively deleting everything merely because the
+parent is claimed is forbidden by D21's ownership rule.
+
+### Capture ordering
+
+For every capture path that will mutate a payload, the required order is:
+
+1. Derive and validate the current source kind and collision-plan assignment.
+2. Reconcile any existing mismatching or stale claim.
+3. Before writing a new claim, establish that the destination is absent or is
+   already owned by the same logical node through a matching live entry,
+   tombstone, or exact outstanding claim.
+4. If replacing live state, commit D17's `DELETE` first.
+5. Append a new exact `CLAIM`, or reuse an already-outstanding exact claim.
+6. Only then perform the first mutation of the claimed payload path.
+7. Complete source-stability checks and payload work.
+8. Append the normal `ENTRY`/`XATTR`/`ENTRY_COMMIT` group; the commit consumes
+   the claim.
+
+Writing a claim never legitimizes a pre-existing foreign node. The foreign-node
+check precedes creation of a new claim. D17's old-path deletion remains valid:
+mutation that removes an old live physical path is authorized by its committed
+tombstone; the claim authorizes mutation of the new/current physical path.
+
+The node-specific consequences are:
+
+- **Directory:** the claim precedes `ensure_directory_leaf()`/`mkdirat()` and
+  remains outstanding throughout child traversal. The normal directory entry
+  remains post-order and consumes the claim.
+- **Regular file:** the claim precedes removal, creation, truncation, or write
+  of the destination regular file.
+- **Symlink:** the claim kind is `symlink`, although portable payload is an
+  ordinary placeholder; the claim precedes placeholder replacement.
+- **Hardlink:** the claim kind is `hardlink`; the claim precedes empty
+  placeholder replacement.
+- **Unchanged live entry:** an existing no-mutation fast path needs no new
+  claim.
+- **Socket/device and FIFO:** these publish no new portable payload entry and
+  gain no claim; FIFO remains fail-closed.
+
+### Resume and stale-claim reconciliation
+
+A claim is acceptable ownership proof only when it exactly matches the current
+`root_id`, `logical_path`, `physical_path`, and `object_kind`, and the current
+D21 collision plan still assigns that physical path to the same logical node.
+
+For an exact claim:
+
+- an absent payload node is valid and resume recreates it;
+- an existing payload node is considered owned and may be replaced or
+  completed;
+- payload content is not assumed complete and normal capture validation still
+  runs;
+- resume reuses the claim instead of appending a duplicate.
+
+A mismatching or stale claim is never transferred to another logical identity.
+The current plan remains authoritative; a claim does not pin or override an
+obsolete collision assignment. Its old physical node is cleaned using the
+claim as ownership proof, `DELETE` then cancels the claim, and only afterward
+may a new claim be written for the current assignment.
+
+Reconciliation includes outstanding claims, not merely the live entries
+currently traversed by the sidecar live-entry iterator. This is required for
+source deletion and collision renumbering when the new source walk will never
+visit the old claimed node.
+
+### Completion and restore gates
+
+A structurally valid log with outstanding claims is a valid resumable partial,
+not generic sidecar corruption. Therefore adoption exposes outstanding claims,
+and closing a failed capture is allowed to leave them in a resumable partial.
+Claims are excluded from live-entry iteration and from
+`sidecar_log_live_count()`.
+
+Successful capture requires exact payload inventory **and zero outstanding
+claims**. The zero-claim check is global, after all roots and their
+reconciliation have completed, and before the prepared fresh or resume entry
+point returns success or reports `live_count`. It is not enforced inside an
+individual root capture because a resumed multi-root container may still carry
+legitimate claims for roots not yet processed.
+
+Portable restore preflight refuses a sidecar with any outstanding claim before
+destination probing or mutation. `portable_restore_replay_at()` independently
+enforces the same condition before its capability probe or replay, because it
+is callable separately from orchestration. Consumed historical claims are
+ignored; only outstanding replay state is fatal for restore.
+
+### Version boundary
+
+D25 advances `SIDECAR_VERSION` from 2 to 3. The header writer, parser, state
+loader, manifest `sidecar_version`, capture path, and both restore paths move
+together. `MANIFEST_CURRENT_VERSION` does not change.
+
+There is no v2 compatibility layer: completed v2 containers are refused by
+the v3 reader, v2 partials are not resumed as v3, and no dual reader,
+migration path, or guessed recovery is introduced. Manifest resume identity
+already includes `sidecar_version`. This is an intentional pre-release format
+replacement: the branch has not merged to `main`, no release tag or real user
+base exists, and an unsafe v2 partial cannot supply the missing ownership
+proof.
+
+### Acceptance boundary
+
+Implementation is not complete until tests prove, at minimum:
+
+- claim codec round-trip, field ceilings, supported-kind validation, and
+  illegal ordering;
+- complete, mid-record, and truncated-claim tail behaviour;
+- adoption retaining an outstanding claim;
+- matching commit consumption;
+- claims with missing or mismatching entries being refused;
+- duplicate and conflicting claim refusal;
+- `DELETE` cancellation and restart-idempotent cleanup;
+- fresh directory, regular, symlink, and hardlink interruption recovery at
+  every applicable mutation boundary;
+- empty-directory and nested traversal recovery with multiple active ancestor
+  claims;
+- replacement with a committed predecessor;
+- source deletion, kind change, and collision renumbering with an outstanding
+  claim;
+- repeated SIGKILL/resume cycles;
+- capture success/finalization refusal while any claim remains;
+- portable restore preflight and standalone replay refusal without destination
+  mutation;
+- a genuinely foreign existing node without matching live, tombstone, or claim
+  proof remaining refused.
+
+Shared codec boundaries need not be multiplied mechanically when one state test
+proves the common primitive, but each node kind must directly prove that its
+first applicable payload mutation occurs only after a committed claim. The
+real-vfat SIGKILL/resume scenario remains part of the later VM gate.
+
+**Why:** D17's payload-first/live-last ordering is necessary to prevent
+incomplete bytes from becoming restore-visible metadata, but it leaves a
+window in which a newly created payload has no durable ownership proof. A
+positive write-ahead claim closes that ownership window without relaxing the
+foreign-node safety rule: the destination is still checked before a new claim
+is written, and a claim authorizes only its exact logical/physical identity.
+The normal post-order entry remains the completeness and restore boundary.
+
+**Rejected:** Directory-only tracking or an early normal `DIRECTORY` entry is
+rejected because it leaves regular, symlink, and hardlink gaps and conflates
+ownership with completeness. Treating every existing directory or payload
+node as safe is rejected because it permits foreign-node overwrite and
+collision-plan cross-contamination. Inferring ownership from descendants or
+from the current collision plan is rejected because it fails for empty or
+fresh nodes, and a desired mapping is not evidence of who created an existing
+node. Relying on collision relocation or final inventory alone is rejected
+because both occur too late to authorize the first mutation and currently
+begin from live state. Reusing normal `ENTRY_COMMIT` before payload completion
+is rejected because it reverses D17 and can expose incomplete bytes as live
+metadata. Extending v2 in place, temporary multi-version negotiation, and a
+test-only version path are rejected because they would make the on-disk
+boundary ambiguous. A new cancellation record is rejected because existing
+`DELETE` can cancel a claim safely. Power-loss durability via `fsync` remains
+outside D17 and is not introduced here.
+
+**Relationship:** D25 refines D17's process-interruption and commit protocol
+without changing its live-state, metadata, or no-`fsync` boundaries. It
+advances D21's v2 grammar to v3 while preserving collision suffixes and
+destination authority, including D21's refusal to overwrite unowned names.
+It covers D22's regular and hardlink placeholder model without changing
+restore ordering or sticky representatives. It completes D24's now-production
+portable path without changing representation selection or D15's
+representation-agnostic finalization lifecycle. It has no effect on native
+capture or native restore.
+
+---
+
+## D26 — 2026-08-22 — Native hardlink resume seeding and restore relinking
+
+**Status:** Implemented
+
+**Decision:** Native capture and restore both preserve hardlink identity without
+introducing a native sidecar or manifest extension. When resuming an adopted
+native partial, capture performs a read-only source/destination pre-seed of the
+existing resume-matching regular payloads into the existing `(st_dev, st_ino)`
+inode map before the live walk. Native `restore()` unconditionally performs
+the same read-only pre-seed for every automatically restored root, then owns
+one inode map for the whole apply phase; the first successfully applied member
+of a source inode group becomes its destination representative, and later
+members are created with `linkat()` to that representative.
+
+### Native capture resume
+
+The old native capture map was process-local and empty on every invocation. If
+the resumed walk visited a missing sibling before the member written by the
+interrupted run, it could select a new representative and then fail against
+the old independent destination file. Adopted native capture now walks the
+source and existing destination addresses without mutation before capturing.
+Every existing regular destination whose size and nsec-gated mtime prove the
+completed-work resume oracle seeds the source inode's representative. A seed
+failure aborts the resumed native capture before payload mutation; fresh
+capture remains unchanged, and no wire-format state is added.
+
+### Native restore resume
+
+A new restore process used to start with an empty inode map, so a hardlink
+group split by interruption could be visited in the opposite order on the
+next invocation: the new sibling became an independent representative and
+the already restored member then failed the identity check. Before any native
+apply walk, restore now scans the existing destination state for every
+auto-restored v1 or legacy root and seeds the same source-inode map. This is
+unconditional because restore has no reliable adopted-destination bit; the
+scan is read-only and uses the destination root's preflighted timestamp
+precision when deciding whether an existing regular payload proves completed
+work. Nested destination paths and an already existing destination root are
+resolved without creating or following intermediate symlinks. Dry-run and
+validation still leave the map unused and mutation-free.
+
+### Native restore apply contract
+
+Validation and metadata inventory never mutate the inode map. During apply,
+the first regular member is copied or resumed normally and enters the map only
+after its payload and metadata succeed. A later member with the same source
+inode is linked to that representative; it receives no second content,
+metadata, or xattr write because the shared inode already carries the
+representative's state. An existing destination at the sibling address is
+accepted only when it is already the same inode; an independent or wrong-type
+object is a failure, never an unlink-and-replace opportunity.
+
+If a representative fails, no map entry is installed. The current recursive
+walk stops its failed subtree; if a caller later retries another member with
+the same map, that member may become a new independent representative rather
+than linking to an unproven destination. This is fail-closed and prevents a
+failed or partial representative from poisoning subsequent links.
+
+This applies only to native payloads that still carry real shared inodes. A
+native payload whose hardlinks were already flattened by another tool remains
+indistinguishable from genuinely independent files and cannot be reconstructed
+without additional format metadata. Portable capture and restore remain on
+D22/D25's sidecar protocol.
+
+**Why:** Native capture already preserves the relationship with `link()` and
+the destination tree already supplies the only resume evidence needed; a
+read-only sticky seed closes the process-boundary/order gap without a new
+format. Native restore can use the source payload's inode identity directly,
+and its pre-seeded process-wide apply map makes the same guarantee hold across
+interrupted invocations while keeping representative-only metadata and xattrs
+safe.
+
+**Rejected:** Re-deriving hardlink groups from content, size, or timestamps is
+rejected because independent files can share those values. A native sidecar or
+manifest extension is rejected because native payload inode identity is already
+available and native restore does not need portable state. Mutating the map
+during validation is rejected because dry-run/preflight must remain
+mutation-free. Replacing an independent sibling destination is rejected as
+unsafe; it is reported as a collision instead.
+
+**Relationship:** D26 closes D22 G-5's native-restore duplication debt and
+extends D22 G-6's sticky-representative principle to the native destination
+tree. It preserves D15's fd-anchored native walkers, D17's source-stability
+checks, D23's nsec-gated native resume oracle, and D25's independent portable
+claim protocol. The host interruption, restore identity/metadata/xattr, and
+representative-failure tests cover the new invariants; the external VM gate
+must additionally run a real native capture interruption/resume and a real
+restore of a cross-root hardlink pair, checking `dev/ino/nlink`, mode,
+uid/gid, and xattrs on both names.
+
+---
+
+## D27 — 2026-08-24 — Destination free-space preflight
+
+**Status:** Implemented; an update counts the backup it replaces since D98
+
+**Decision:** Before reserving a backup container, backup estimates the
+selected plan's source bytes and compares that estimate with the destination
+filesystem's user-available free space. The check runs for live and --dry-run
+invocations and is independent of backup mode, so critical, comprehensive, and
+explicit-path plans all use the same preflight. A fitting backup prints both
+the estimated size and available space; a plan that clearly does not fit is
+refused before a container, manifest, or payload is written. If the estimate
+cannot be completed because of a real source-side measurement error, the
+preflight is skipped with a warning and the backup proceeds.
+
+The comparison is exact: needed > available refuses, with no invented
+percentage margin. The estimate remains approximate because sparse-file
+allocation, filesystem metadata, xattr overhead, and representation details
+can differ from the sum of source logical sizes. A guessed margin would add an
+unexamined policy without making that approximation more truthful; tuning it
+remains a separate evidence-based change.
+
+The available-space calculation uses statfs.f_bavail, not statfs.f_bfree.
+f_bavail reflects blocks available to migr as an unprivileged process,
+whereas f_bfree also includes blocks reserved for root and can therefore
+overstate what this invocation can consume. The filesystem fragment size is
+preferred when reported; the block size is the fallback when the fragment size
+is zero.
+
+**Why:** The check is a cheap, destination-local guard against a clearly
+undersized target while preserving the existing fail-open posture for an
+incomplete advisory estimate: report.c already treats measurement failures
+as an incomplete report rather than converting them into a hard refusal.
+Running it in both live and dry-run paths follows D24's established rule that
+dry-run performs the same destination preflight checks needed for an honest
+preview.
+
+**Rejected:** A safety-margin percentage is rejected because it would be a
+guess layered on an already approximate estimate. f_bfree is rejected
+because root-reserved blocks are not available to the ordinary process.
+A bypass flag is not added; if operational evidence shows that users need one,
+it is a separate decision rather than an implicit escape from this guard.
+
+---
+
+## D28 — 2026-08-24 — Interactive backup progress is informational and backup-only
+
+**Status:** Implemented; an update shows what it checked since D98
+
+**Decision:** A live backup counts successful regular-file content bytes and,
+when stdout is an interactive terminal, periodically displays those bytes
+against the D27 estimate together with freshly measured destination free space.
+The callback is installed only behind the `isatty(stdout)` gate; it is not
+installed for redirected, piped, or scripted output. Progress is sampled at
+most every 500 ms and is driven from the byte-copy loops, so one large file
+cannot make the display appear stalled until the next file. The free-space
+re-read is informational only: a low observation does not create a second
+abort path, and an actual write failure remains the authoritative ENOSPC
+failure. This feature covers backup capture, not restore.
+
+**Why:** Installing the callback only for an interactive terminal keeps the
+existing machine-readable and test-captured output byte-stable while still
+making the user-facing terminal useful. Chunk-level sampling is the smallest
+granularity that gives honest movement for large files, and the 500 ms throttle
+prevents terminal I/O from becoming hot-loop overhead. Reusing D27's estimate
+keeps the denominator consistent with the preflight, while re-reading free
+space exposes concurrent destination consumption without pretending that an
+observation is a reservation.
+
+**Rejected:** Installing the callback unconditionally and merely suppressing
+its print calls is rejected because it would still add clock and callback
+machinery to redirected/test runs and could leak carriage-return fragments
+into captured output. A new free-space refusal based on periodic observations
+is rejected because only the real write result can authoritatively determine
+whether the copy fits. Restore progress is deferred as a separate feature.
+
+**Revision (2026-08-26):** The interactive progress line also identifies the
+current file and reports elapsed time and current speed for the backup and the
+subsequently added restore paths. It deliberately omits an ETA: D30's periodic
+`syncfs()` may block for an unpredictable duration, so an ETA would not remain
+honest around those stalls.
+
+---
+
+## D29 — 2026-08-24 — Finalized containers cross a durable publication boundary
+
+**Status:** Implemented
+
+**Decision:** `container_finalize()` flushes the destination filesystem with
+`syncfs(container->partial_fd)` before renaming a `.partial` container to its
+final name. The pre-rename flush is fail-closed: a failure returns
+`CONTAINER_ERR_IO`, does not attempt the rename, and leaves the partial and its
+handle in the existing valid `CONTAINER_STATE_PARTIAL` contract. After a
+successful `RENAME_NOREPLACE`, the handle becomes
+`CONTAINER_STATE_FINALIZED`, and `fsync(container->dir_fd)` flushes the
+destination directory so the publication rename itself reaches durable
+directory metadata. A failure of that post-rename directory flush does not
+turn the call into an error: the rename already succeeded and the payload was
+confirmed durable before publication, so reporting an incomplete backup would
+be false. At worst, a crash in that narrow window can make the durable payload
+reappear under its resumable `.partial` name.
+
+**Why:** The payload must be durable before a final-looking container is
+published; otherwise a crash after rename could expose a completed-looking
+backup with missing or truncated data. The rename then needs its own directory
+flush because file-data durability does not make directory-entry metadata
+durable. This gives users a meaningful boundary: after `Backup complete` is
+printed, the destination has passed both flushes, while an interrupted run
+before that point is still governed by the existing partial/resume protocol.
+
+This decision does not make copying periodically durable and does not reduce
+the in-flight loss window of a process interruption during capture. Periodic
+syncing is a separate follow-up; D29 guarantees durability at successful
+finalization, not at every intermediate point.
+
+**Rejected:** Flushing only after the rename is rejected because it can expose
+a final-named container before its payload is durable. Failing after a
+successful rename when the directory flush fails is rejected because it would
+misreport a real publication as incomplete and would not undo the already
+durable payload. A new status value is unnecessary for that narrow metadata
+durability edge.
+
+**Relationship:** D29 refines D15's atomic container publication with a
+durable publication sequence. It supersedes D25's earlier no-`fsync` boundary
+for the container-finalization step only; D25's claim/replay protocol and its
+interrupted-capture semantics remain unchanged. Restore finalization and
+periodic capture syncing are outside this decision.
+
+---
+
+## D30 — 2026-08-24 — Periodic capture sync smooths backup writeback
+
+**Status:** Implemented
+
+**Decision:** During every live native or portable backup, migr accumulates
+successful regular-file content bytes in the capture's shared
+`BackupCaptureReport`. Once the accumulated amount reaches 8 MiB, it calls
+`syncfs()` on the destination filesystem and resets the counter. The report
+defaults to an interval of zero for direct/test callers, while production
+live backup unconditionally enables `BACKUP_SYNC_INTERVAL_BYTES`; the setting
+does not depend on whether stdout is a terminal. A periodic `syncfs()` failure
+is an ordinary capture I/O failure and aborts the backup.
+
+**Why:** `syncfs()` covers dirty pages belonging to the whole destination
+filesystem, not only the file that happened to trigger the check. That matters
+for both a single large file and the common many-small-files workload: a
+per-file `fdatasync()` would not bound the accumulated dirty data across files.
+The 8 MiB interval is a fixed compromise between keeping each writeback stall
+small and avoiding enough sync calls to make their overhead significant on
+slow removable media. The byte counter persists across files and roots so the
+interval describes the whole capture rather than resetting at arbitrary file
+boundaries.
+
+The sync is unconditional because it changes backup behavior, not presentation.
+Piped, redirected, and unattended backups receive the same reduced in-flight
+loss window as interactive backups; `isatty()` remains appropriate only for
+D28's informational progress display. No user-facing "syncing" message or
+configuration flag is added.
+
+**Relationship to D29:** D29's final `syncfs()` and post-rename directory
+flush establish the durable publication boundary before `Backup complete` is
+printed. D30 only smooths writeback during capture and reduces the amount of
+data exposed to a mid-copy interruption; it does not make intermediate data
+durable at every instant and does not replace D29's finalization sequence.
+
+**Rejected:** Calling `fdatasync()` on each destination file is rejected
+because it does not cover dirty pages accumulated across previously completed
+files. Gating the sync on terminal output is rejected because the behavior is
+correctness/reliability-related rather than UI-related. A configurable
+interval remains deferred; the evidence here supports correcting the fixed
+default rather than exposing an operational setting.
+
+**Revision (2026-08-26):** Live testing on a real exFAT USB destination
+showed that the original 8 MiB interval was too aggressive for a
+metadata-heavy workload: more than 10,000 small files spent much of their
+time in exFAT directory and FAT metadata work, while an independent sequential
+write measured 45.3 MB/s, so the device's raw throughput was not the
+bottleneck. The interval was roughly two orders of magnitude below the
+system's typical dirty-page throttling scale
+(`vm.dirty_ratio`/`vm.dirty_background_ratio`, hundreds of MiB to a few GiB
+on the tested host) and caused `migr` to force writeback far more frequently
+than necessary. `BACKUP_SYNC_INTERVAL_BYTES` is therefore raised from 8 MiB
+to 256 MiB, moving the trigger closer to the kernel's natural scale while
+retaining periodic smoothing for large captures. This reduces how often
+`migr` enters a sync wait; it does not make an individual `syncfs()` wait
+shorter or interruptible, so a metadata-heavy filesystem can still leave the
+process in kernel-uninterruptible sleep during one sync.
+
+**Revision (2026-09-19):** A second real-hardware measurement on the same
+removable exFAT USB destination and approximately 1.6G payload found that
+`syncfs()` accounted for roughly 98-99% of the live backup's total wall-clock
+time, confirmed with `strace -w -c` on the actual binary. Doubling the interval
+from 256 MiB to 512 MiB reduced the total `syncfs()` calls from 7 to 4 for
+that payload and produced a consistent approximately 14.2% wall-clock
+reduction across repeated trials in both run orderings. A 1 GiB interval did
+not provide a reliably distinguishable further gain: its marginal result
+changed sign with trial order. Disabling periodic sync produced a somewhat
+larger but not fundamentally different reduction, while removing the bounded
+data-loss-on-interruption property entirely, so it was rejected outright.
+`BACKUP_SYNC_INTERVAL_BYTES` is therefore raised from 256 MiB to 512 MiB;
+periodic syncing remains enabled to preserve D30's bounded interruption
+exposure.
+
+---
+
+## D31 — 2026-08-25 — Destination-allocation-aware, hardlink-deduplicated estimate
+
+**Status:** Implemented
+
+**Decision:** `backup_plan_estimate_size()` accepts a caller-supplied
+destination allocation block size. Its backup-specific walker rounds each
+regular file upward to that unit and counts a `(st_dev, st_ino)` hardlink group
+once across the entire plan, including when the group crosses root boundaries.
+Values <= 1 disable only the rounding; hardlink deduplication remains active.
+The rounded estimate feeds D27's free-space preflight for native and portable
+capture alike. D28's progress denominator uses a separate raw source-byte
+estimate so the display describes transferred source content rather than
+destination allocation.
+
+The block size is read by `backup()` from the destination fd with the existing
+`f_frsize`, then `f_bsize`, preference. The estimator itself remains entirely
+source-side and deterministic for its inputs; it never performs destination
+I/O. This adds one block-size `fstatfs()` beside the existing free-space
+preflight's own query, rather than coupling the planner to a destination fd.
+
+Only regular files receive allocation rounding. Symlinks and directories keep
+their existing raw `st_size` contribution, while FIFOs, sockets, and device
+nodes contribute zero. This is deliberate: regular-file allocation is the
+representation-independent correction evidenced on large-cluster removable
+media, whereas non-regular allocation can vary with the eventual native or
+portable representation and was not part of that evidence.
+
+**Why:** A live exFAT destination with 128 KiB clusters consumed materially
+more space than the raw source-byte counter suggested, consistent with
+per-file allocation rounding. A completed hardlink-heavy backup also reported
+more estimated bytes than it physically copied because `get_dir_size()` counted
+each linked name independently, while capture writes the shared content once.
+Both errors affect the destination fit check, and both are independent of the
+representation selected later in `backup()`.
+
+The estimate uses a new local walker rather than changing `get_dir_size()`.
+`get_dir_size()` remains the deliberately simple, raw, non-deduplicated walker
+used by report output; `report.c`'s separate `measure_report_tree()` is the
+established precedent for keeping a second walker when the accounting contract
+differs. The estimate's small linear `(dev, ino)` set is retained for the whole
+call, not reset per root, and entries from a root that fails measurement are
+rolled back so an incomplete root cannot suppress a later contribution.
+
+**Relationship to D27:** D31 refines only the per-file estimate formula. D27's
+exact `needed > available` comparison, no-margin policy, and fail-open behavior
+when source measurement is incomplete remain unchanged. D31 also makes D28's
+progress denominator use raw source bytes; it does not change progress
+presentation or D30's periodic durability sync.
+
+**Rejected:** Retrofitting `get_dir_size()` is rejected because report's raw
+logical-size contract is unrelated to backup destination allocation. A
+representation-specific estimate is rejected because both allocation rounding
+and hardlink sharing are established before native/portable selection and are
+valid for either representation. Symlink/directory rounding is deferred until
+their actual destination allocation semantics justify it.
+
+**Revision (2026-08-26):** Allocation rounding is retained only for the
+internal D27 free-space fit check. The user-facing `Estimated backup size`
+line and D28's live `Progress` total now use the raw source-byte total instead
+of destination-allocation-rounded bytes. On an exFAT destination with 128 KiB
+clusters, the rounded figures overstated the source by roughly 2--2.5x: about
+100M was displayed as 200.7M, and 646M as 1.6G.
+
+---
+
+## D32 — 2026-08-26 — Sidecar directory sizes are estimate-only
+
+**Status:** Implemented
+
+**Decision:** Sidecar `ENTRY` records may carry the source directory's
+`st_size` in `size`. Native and portable restore free-space estimates include
+those directory values alongside regular-file bytes and symlink target lengths.
+The v1 wire encoding and directory restore semantics do not change; hardlinks
+and symlinks continue to carry zero in `size`.
+
+A recorded directory size is source-filesystem metadata, not portable directory
+content. Restore must never compare it with a destination directory's
+`st_size` during payload inventory or replay: directory layout and filesystem
+representation make that value inherently non-reproducible. It is used only
+to make the destination-space estimate consistent with backup's directory
+accounting. This extends D17's core `size` contract without requiring a
+`SIDECAR_VERSION` bump.
+
+**Why:** The backup estimate already includes directory `st_size`, and omitting
+it on restore makes the same captured tree use different space models in the
+two directions. Allowing the recorded value through the writer, parser, and
+state map preserves that accounting without turning a filesystem artifact into
+an integrity claim.
+
+**Rejected:** Comparing a restored directory's `st_size` with the recorded
+source value is rejected because a correct restore can legitimately produce a
+different directory representation. Directory sizes are not used as resume or
+payload-content keys; only the free-space estimate consumes them.
+
+**Relationship:** D32 extends D17's `size` rule for directory entries and
+refines D27's restore-side estimate parity. D17's directory metadata and
+post-order restore requirements remain unchanged.
+
+
+---
+
+## D33 — 2026-09-05 — Capture network backends independently; apply disruptive changes manually
+
+**Status:** Implemented; restored before packages since D90
+
+**Decision:** `--include-network-config` checks five backends independently
+through a backend table: NetworkManager, netplan, systemd-networkd,
+wpa_supplicant, and netctl. Each available backend contributes regular files
+from its system configuration directory to its own subdirectory of container-root
+`network/`. Missing backends are skipped. A readable empty directory still counts
+as captured; `NETWORK_CONFIG=1` records that at least one backend was processed,
+not that it contained files. If every backend is absent, backup succeeds with a
+note and leaves the manifest flag unset. Restore discovers the captured backends
+from their subdirectories and attempts each independently.
+
+**Why absence is normal but unreadability fails:** Systems use different network
+managers; requiring every supported directory would reject ordinary installations.
+The original NetworkManager-only presence check refused an Ubuntu Server backup
+because that netplan-based system had no NetworkManager directory. Commit
+`fd8aaa2` corrected this: `ENOENT` means the backend is absent, while other access
+errors refuse backup. Insufficient permissions are a fixable problem requiring
+root access, not evidence that there is nothing to save. Copy failures also fail
+the backup rather than publishing incomplete network configuration.
+
+**Why only NetworkManager reloads automatically:** `nmcli connection reload`
+re-reads saved profiles without activating them, so restore invokes it best-effort
+once files have been restored. Failure warns without failing the restore. Applying
+netplan or restarting an interface's wpa_supplicant instance or netctl profile can
+drop the connection carrying the restore session. Reconfiguring networkd links can
+also interrupt connectivity. Those four backends receive files and manual apply
+instructions instead of an automatic command. Networkd's hint uses
+`sudo networkctl reload`, avoiding a full service restart. The wpa_supplicant and
+netctl hints require the user to substitute the target interface or profile.
+
+**Why only wpa_supplicant filters filenames:** Package-provided helper scripts can
+share `/etc/wpa_supplicant/` with configuration. Only names ending in `.conf` are
+captured there, including interface-specific configuration names; other regular
+files are skipped before being opened. This avoids carrying package helpers across
+systems or replacing the target's versions during restore. The other four backend
+directories conventionally hold profiles directly, so all their regular files are
+accepted without a suffix restriction. Symlinks and non-regular entries are skipped
+for every backend; netctl's `hooks/` and `interfaces/` directories are not traversed.
+
+**Known caveats:**
+
+- The container subdirectory names `networkmanager`, `netplan`,
+  `systemd-networkd`, `wpa_supplicant`, and `netctl` form a string contract between
+  the independent tables in `src/backup.c` and `src/restore.c`. No compiler check
+  ties them together; a spelling mismatch can leave captured files undiscovered
+  during restore. Keep both tables and backup-to-restore tests aligned.
+- NetworkManager, netplan, wpa_supplicant, and netctl configuration can contain
+  plaintext WiFi passwords or PSKs. Networkd handles WiFi authentication through
+  separate tools, but its `.netdev` files can hold WireGuard private keys, so
+  it is also treated as a secret-capable backend: the plaintext-secret warning
+  fires for a networkd-only backup too, worded generically ("secrets such as
+  WiFi passwords, PSKs, or VPN keys") rather than naming WiFi specifically.
+  See [systemd.netdev](https://www.freedesktop.org/software/systemd/man/systemd.netdev.html).
+- A destination that cannot be created or written during restore produces a note
+  and manual recovery instructions; it does not fail the overall restore. Source
+  corruption and per-file copy errors do fail restore, while other backends are
+  still attempted. Captured profiles may need adjustment for the target system.
+- Coverage is deliberately limited. `iwd` (`/var/lib/iwd/*.psk`) and Debian's
+  legacy `ifupdown` (`/etc/network/interfaces`) were considered and remain deferred.
+- `/etc/resolv.conf` and `/etc/hosts` are outside this flag's scope. Resolver
+  settings are commonly managed by the target's network stack; static host
+  mappings are separate system policy, not saved connection profiles. Custom
+  entries may need manual migration: DHCP does not recreate `/etc/hosts`.
+
+---
+
+## D34 — 2026-09-05 — Persistent scope configuration compiles to one selection and restore map
+
+**Status:** Implemented
+
+**Decision:** `migr conf` edits persistent filesystem selection rules for critical
+and comprehensive backups. Include entries are requests for coverage, not physical
+backup roots. Compile their union, minus the active scope's exclusions, into one
+immutable plan shared by reporting, estimation, preflight, native/portable capture,
+and resume. Preserve XDG restore addresses when a broader include covers an XDG
+root. Ordinary repeated or containing includes are supported, not user errors.
+
+### Interface and configuration lifecycle
+
+The file is `$XDG_CONFIG_HOME/migr/migr.conf` when XDG_CONFIG_HOME is nonempty and
+absolute, otherwise `$HOME/.config/migr/migr.conf`. Only this user file is read;
+there is no CWD search, system-file merging, or per-run `--conf` option. HOME and
+config lookup use the invocation's environment consistently. In particular, do not
+select another user's config from SUDO_USER while backup still selects the current
+HOME. Changed HOME/config variables under sudo select a different context.
+D38 supersedes this last elevated-context rule for invocations carrying
+`SUDO_UID`.
+
+`migr conf` takes no positional arguments or backup/report options. On first use it
+creates private missing directories (0700) and publishes a complete template file
+(0600) without replacement. Existing contents, permissions and comments are not
+rewritten. Concurrent initial creation must not expose an incomplete template.
+Regular files reached through symlinks are supported; open the resolved existing
+file in the editor. A dangling link or non-regular target is an error, not an
+invitation to replace it. Backup/report never create the file.
+
+Choose the first nonempty EDITOR, VISUAL, or fallback `vi`. Tokenize whitespace,
+single/double quotes and backslash quoting into bounded argv without shell
+expansion, append the absolute file path as one argument, and run via fork/exec
+with inherited terminal streams. No `sh -c`, pipelines, substitutions or command
+chaining; metacharacters are never executed by a shell. Malformed quoting fails.
+Do not silently substitute another editor after the chosen one fails. Editors
+that detach require a wait option. After successful editor exit, parse the saved
+file and report syntax errors with file/line; leave invalid edits available for
+repair. Existing invalid syntax must not prevent opening the editor.
+
+Missing config means empty rules. Other read failures and invalid syntax fail
+commands that consume it before target mutation. Read a bounded snapshot once per
+invocation; never re-read it during traversal. Detect observable concurrent
+in-place modification rather than combining snapshots. An atomic replacement can
+yield the complete old or new file. Restore, help and explicit-path backup do not
+consume scope config; conf can reopen invalid files and validate after editing.
+
+### Grammar and selection semantics
+
+The generated template contains only comments and these empty sections:
+
+```ini
+# Includes in critical also apply to comprehensive; do not repeat them.
+# Excludes apply only to their own scope. Repeat them to exclude from both.
+# Excludes win over includes. Paths are HOME-relative unless absolute.
+[critical]
+    [include]
+
+    [exclude]
+
+[comprehensive]
+    [include]
+
+    [exclude]
+```
+
+This is a small two-level grammar, not general INI. Indentation is presentation;
+section names select state. Each top-level section occurs at most once; each child
+occurs at most once within its parent. Missing sections and an empty file mean
+empty rules. Unknown/repeated headers or values outside include/exclude fail.
+Accept LF/CRLF, blank lines, and full-line `#` comments; no inline comments.
+
+One path per line: bare values trim outer whitespace but preserve interior spaces.
+A value beginning with a double quote must be a complete quoted value, with no
+trailing non-whitespace. Quoted values accept only `\\`, `\"`, `\n`, `\r`, `\t`,
+and `\xHH` escapes; bare backslashes are literal. Quote leading whitespace, `#`,
+and header-shaped filenames. Reject NUL, invalid escapes and truncated input.
+Limits are 1 MiB per file, 4096 rules total, and PATH_MAX-1 decoded bytes per path;
+enforce bounds before allocation or truncation. Existing manifest root limits
+still apply to the compiled plan, not to directory-entry counts.
+
+Let Bc/Bf be the built-in critical/comprehensive selections, Ic/If the configured
+includes, and Ec/Ef the exclusions. The selected source pathname sets are:
+
+- Critical: `(Bc union Ic) minus Ec`.
+- Comprehensive: `(Bf union Ic union If) minus Ef`.
+
+Excludes do not inherit. They apply to every selected occurrence of the path,
+regardless of which include selected it. A directory exclusion prunes the entire
+subtree, and an include cannot reopen a descendant. Rule order and duplicates have
+no effect. Paths, not inode identity or file content, determine exclusion; another
+included name for the same inode remains selected. Globs, regex, shell expansion,
+and nested config-file inclusion are outside this grammar.
+
+Relative paths and `~/...` are relative to HOME, not CWD or config location.
+Absolute paths are accepted. Normalize components using D16's leaf-preserving
+source addressing: final symlinks are selected objects, not traversed targets.
+Match only complete pathname components, never lexical prefixes. Resolve retained
+ancestors without opening intentionally excluded descendants. Missing exclusions
+remain valid rules. A missing or inaccessible include surviving exclusion fails;
+missing optional built-ins remain skippable. Invalid paths cannot be hidden by
+exclusion. Preserve D16's MANUAL_NATIVE external-root policy and portable refusal
+for surviving manual-only regions; config does not authorize arbitrary automatic
+system-file restore. Preserve the conservative backup-destination containment gate.
+
+Package export and the self/network flags remain independent. Payload exclusions
+do not cancel separately requested network capture. Explicit-path backups keep
+their current selection/validation contract. Restore never applies current config
+and never interprets exclusions as requests to delete existing target files.
+
+### Source ownership: a forest of roots with delegated subtrees
+
+Retain disjoint physical payload directories `data/<root-id>`. Allow *source*
+roots to nest when they have different restore mappings. A parent walk skips the
+entire source subtree assigned to a child root, including the child directory's
+own metadata; the child owns that subtree's root entry. Derive these internal
+boundaries from the nearest containing source root, not from user excludes and
+not by expanding every filesystem entry into a manifest root.
+
+Compilation proceeds as follows:
+
+1. Resolve the active built-in and configured candidates, apply whole-root
+   exclusions, collapse identical selections, and sort canonically. Retained XDG
+   boundaries come from the active built-in scope, not from guessing that every
+   directory named Documents has XDG meaning. A redundant configured descendant
+   inherits its selected ancestor's mapping and adds no root.
+2. For a selected source address, prefer its active XDG mapping over a broader
+   HOME_RELATIVE or MANUAL_NATIVE mapping. Deeper active XDG roots override
+   enclosing roots in their own subtrees. If multiple XDG keys resolve to the same
+   source address, select the first in the fixed `xdg_keys` order and report that
+   aliasing in preview; do not copy the same source tree to multiple destinations.
+   An XDG directory resolving to source HOME itself uses HOME-relative mapping,
+   avoiding relocation of all HOME contents into one target user directory.
+3. Collapse containing roots with equivalent restore mappings, including a broad
+   `.config` include and its HOME_RELATIVE browser roots. Retain boundaries where
+   the mapping differs. Canonicalize redundant requests before assigning ids.
+4. Keep surviving built-in ids. Give remaining configured roots `CONFIG_n` ids in
+   normalized absolute source-path order and use those ids for their payload
+   directories. Canonical sorting and alias choice must not depend on config order
+   or directory enumeration. A redundant include must not rename existing roots.
+5. For each root, derive its immediate child-root source boundaries and compile
+   applicable user excludes into root-relative matching rules. A source entry is
+   captured only by its deepest owning root and only if not user-excluded. A
+   global exclusion covering a delegated child removes that child as well; an
+   internal boundary never discards its child's selected data.
+
+Directory entries retained as ancestors of a delegated region belong to the
+parent; the delegated root directory belongs to the child. The physical parent
+payload contains no placeholder at the delegation boundary. All source scans,
+size calculations, hardlink seeding and reconciliation obey the same ownership
+forest. Validate the forest and physical payload disjointness before walking.
+The current source-prefix overlap validator cannot remain an unconditional
+rejection for these compiled scopes; positional explicit validation is unchanged.
+
+### Target mapping, collisions and directory metadata
+
+Resolve each automatic root to the target HOME-relative or XDG address and append
+its root-relative logical paths. Resolve target XDG once per restore. Source
+ownership decides what exists in the backup; target mapping must never prune an
+ordinary retained sibling merely because it lies under another root's target.
+
+**Target addressing is resolved once per invocation.** The restore resolves
+the target HOME and XDG trust roots before any destination is inspected, holds
+them as anchors for the whole run, and derives every mapped destination from
+that held map. No phase re-reads user directory configuration after mutation
+begins: restoring a source `.config` must never retarget the run that is
+restoring it. Collision validation, metadata and space inventory, timestamp
+probing, hardlink seeding, dry-run preview and replay all consume the same map,
+so the addresses that were checked are the addresses that are written. This is
+a property of restore addressing in general, not of configured selections: it
+applies to every versioned manifest, and the map is not permitted to differ
+between representations.
+
+**Competing mapped entries are detected by resolved destination identity.**
+Existing destination directories are interned by object identity
+`(st_dev, st_ino)` observed through the actual traversal route; planned
+directories are interned by their resolved parent node plus filename component.
+Entry placement is therefore a claim on a resolved parent plus component, and
+different path spelling — including symlinked trust roots and aliases — does
+not make two destinations distinct. This rule applies to every versioned
+manifest and to both native and portable representations. Filename components
+are compared byte-for-byte within a destination namespace node. Mount-view
+identity is tracked per node for diagnosis, but it must never be used to declare
+two equal-inode destinations disjoint: a route's fd, permissions or mount
+options must not be substituted for another route's. This rule applies to every
+versioned manifest and to both native and portable representations. When two
+distinct namespace slots could be equivalent under a directory's non-byte
+lookup semantics and at least one is not resolved to an existing on-disk
+object, the nearest existing ancestor is queried for a kernel-reported
+byte-exact property. A directory proven byte-exact keeps the byte comparison;
+a directory reported non-byte-exact, or one whose capability cannot be
+established, causes that destination to be refused rather than guessed. No
+Unicode or locale-aware equivalence engine is implied by this boundary.
+
+Preflight the combined mapped entry set before mutation on both representations.
+Reject two distinct source entries mapping to the same destination, including two
+directories with competing metadata, and reject non-directory ancestors, symlink
+redirects and destination-filesystem name collisions. Nested destination roots
+alone are not errors: a mapped child may be created below a retained parent
+*directory* without colliding with an entry at the child's exact path. Existing
+target directories keep the ordinary restore merge behavior; collisions between
+two planned source entries are not resolved by last-writer-wins.
+
+Restore creates necessary structural parents, places regular/special entries and
+hardlink aliases under existing safety contracts, then applies captured directory
+metadata globally in descending destination depth across roots. Structural parents
+without a captured source directory have no invented source metadata. Native
+per-root completion must not finalize HOME metadata before a later XDG child
+modifies it; extend the native replay orchestration accordingly. Portable's global
+three-pass replay is a useful existing seam, but its combined destination checks
+must also enforce this contract. Cross-root hardlinks retain existing fidelity and
+cross-filesystem behavior, never becoming selection deduplication keys.
+
+### Persistence and compatibility
+
+Use manifest **format VERSION=2** for plans carrying nonempty exclusions or source
+delegation boundaries. This is a storage compatibility boundary, not a staged
+feature release. Older binaries reject VERSION=2 through unknown-version handling.
+New readers retain legacy and VERSION=1 support. Ordinary unfiltered, source-disjoint
+plans continue to write VERSION=1; no config and an empty config remain identical,
+including adoption of existing compatible unfiltered partials.
+
+VERSION=2 retains the existing header and ROOT grammar and adds:
+
+- Required `SOURCE_HOME=<path>` immediately before ROOT_COUNT: canonical absolute
+  source HOME, encoded with ENCODING_MODE_MANIFEST_PATH. It anchors HOME_RELATIVE
+  SOURCE fields when reconstructing the source forest without the source machine.
+  When a HOME_RELATIVE built-in reaches an external source through an ancestor
+  symlink, VERSION=2 records that canonical absolute SOURCE and retains its
+  independent HOME-relative RESTORE. The original symlink is not needed to
+  reconstruct ownership on the target.
+- Required `EXCLUDE_COUNT=<decimal>` immediately after the ROOT lines, followed by
+  exactly that many `EXCLUDE PATH=<path>` lines and EOF. Paths are normalized
+  absolute source addresses, encoded with the same manifest path codec, sorted in
+  byte order and reduced by ancestor coverage. Empty paths, NUL, noncanonical
+  components, duplicates, unknown fields and trailing records fail closed.
+
+Counts are bounded by 4096 roots and 4096 excludes; decoded fields retain their
+existing PATH_MAX bounds and encoded lines must be bounded by the codec's worst
+case expansion. Check aggregate allocation arithmetic. Serialization is canonical.
+Exclusions whose paths are currently absent remain persisted. The roots express
+the canonical selected coverage and mappings; do not persist redundant original
+include lines, comments, inactive scopes or editor/config paths. Child boundaries
+are derived from root source containment, avoiding a second, contradictory list.
+Validate source addresses, deterministic ownership and payload-directory separation
+when reading; entries found inside a parent's delegated or excluded region make a
+finalized backup inconsistent, not silently ignorable. Sidecar entry formats and
+CLAIM/tombstone durability ordering remain unchanged; the manifest changes which
+root is allowed to own an entry, not its metadata encoding.
+
+Resume equality includes the canonical active exclusions, source forest and
+restore mappings, in addition to D15's existing identity fields. Compare policy
+before the zero-root fast path. Changed active policy starts a fresh job and leaves
+the old partial intact; never clean an old partial into compliance with new rules.
+Equivalent duplicates/reorderings and redundant includes preserve identity.
+Critical includes affect comprehensive identity; critical exclusions do not.
+Comprehensive-only edits do not affect critical identity. Internal traversal
+boundaries participate through the canonical root map. Restore requires neither
+the original config file nor source HOME to exist; SOURCE_HOME is an address
+anchor for validation, not a path to open on the target.
+
+### Report, implementation boundaries and acceptance examples
+
+All report invocations use BackupPlan, with bare migr/report selecting critical,
+independent of whether config exists. Remove legacy report membership/total arrays
+and the scope_requested branch. Do not add Dev Tools or other catalog entries to
+preserve obsolete presentation. Browser and `.profile` membership remain unchanged;
+shell-startup/catalog completeness is a separate decision. Selected pathname sets
+agree across report and backup, while logical size versus allocation rounding and
+source-directory st_size retain their existing accounting contracts.
+
+| Selection and layout | Required outcome |
+| --- | --- |
+| Built-in Chrome plus Chrome include repeated twice | One selected tree, unchanged root identity and resume eligibility. |
+| `.config` include plus built-in browser roots | Entire retained `.config` tree once, including future application directories. |
+| HOME include; source Documents is `HOME/Belgeler`, target Documents is `HOME/Documents` | HOME payload omits Belgeler; XDG payload owns it. Restore puts its content in Documents and ordinary siblings under HOME. |
+| Above, with a distinct selected source `HOME/Documents` directory | Restore refuses the competing destination directory before mutation; it does not discard either source selection during backup. |
+| Source XDG roots nested; target XDG roots disjoint or nested | Deeper source region owns its entries; all mapped entries undergo combined collision checks and global directory metadata ordering. |
+| Same XDG source address under multiple keys | Fixed key precedence, one capture, alias reported; no duplicate restore. |
+| Critical-only exclusion of `Downloads/ISO` | Critical omits that subtree from traversal/space need; comprehensive can still include it. No ISO-specific code. |
+| Exclusion added after interruption, root list unchanged | Old partial is not adopted; new policy creates a new job. |
+| Restore with missing or conflicting local migr.conf | Restore follows the backup's map and leaves unrelated target files alone. |
+
+Before production CLI wiring, tests must cover parser/editor failures, absent and
+empty config parity, byte-safe paths, excluded unreadable entries, native/portable
+selected-set parity, hardlinks across ownership boundaries, destination collisions,
+post-order metadata across roots, format compatibility, and interrupted capture.
+Use isolated configuration/editor fixtures and real removable-filesystem gates.
+No ordinary include containment is left as a reduced-feature overlap refusal.
+
+**Rejected:** copy-time "already seen" skipping cannot repair a duplicated
+manifest or an earlier inflated estimate. A root for every directory entry makes
+root count/identity depend on incidental contents. Flattening everything into
+HOME loses locale mappings; keeping overlapping unfiltered roots duplicates data.
+Treating a user exclusion as a root-local workaround silently loses selected data.
+Keeping legacy report until config becomes nonempty preserves an incorrect total
+and makes presentation depend on configuration presence.
+
+**Relationship:** Extends D15/D16's configured-scope addressing while retaining
+explicit-path policy; preserves D17/D22 metadata/hardlink guarantees and D25's
+ownership/durability ordering. Report unification and later code must implement
+this decided contract before the feature is marked implemented.
+
+---
+
+## D35 — 2026-09-07 — Scoped backup requires consent for shell history
+
+**Status:** Implemented
+
+**Decision:** Critical and comprehensive backups include `.bash_history` and
+`.zsh_history` when the compiled selection owns those existing paths, but a live
+backup must obtain explicit confirmation before capturing them. The prompt uses
+`[Y/n]`: an interactive blank or whitespace-only line accepts the default, while
+true EOF always declines regardless of the displayed default. Dry-run prints a
+notice and never prompts. Explicit-path backup remains literal under D16 and does
+not apply this gate even when the user explicitly names a history file.
+
+The gate is intentionally limited to shell history. Existing `.ssh`, `.gnupg`,
+and browser-profile roots are outside it: those are stores designed by their
+owning tools to contain sensitive material and have their own permission or
+encryption-at-rest models. Shell history is instead an incidental plaintext log
+that can acquire a password or token simply because it was typed at a prompt.
+
+**Why:** A warning that proceeds automatically cannot protect a user from
+silently copying accidentally recorded credentials to an untrusted backup
+destination. Default-yes keeps the ordinary interactive path lightweight, while
+EOF-as-decline makes unattended, closed-stdin, and empty-pipe invocations fail
+closed. Checking compiled source ownership also covers a history file selected
+through a broader configured root instead of relying on a particular manifest id.
+
+**Rejected:** warning without confirmation; treating EOF as the displayed
+default; gating every secret-capable root; detecting only the dedicated history
+root ids; applying scoped assumptions to explicitly named paths.
+
+---
+
+## D36 — 2026-09-07 — Progress elapsed time stays live across copy stalls
+
+**Status:** Implemented
+
+**Decision:** Interactive backup and restore progress keep their synchronous,
+copy-driven updates, but each installed progress display also owns one
+display-only ticker thread. Real updates publish a mutex-guarded snapshot of
+the copied byte count, current path, speed sample, and any display-only backup
+free-space value. If no real update arrives for `PROGRESS_STALL_MS`, the ticker
+redraws from that snapshot using the current monotonic time so elapsed time
+continues to advance while every copy-derived value remains unchanged. The
+ticker never reads mutable copy-engine state and is stopped and joined before
+the final forced redraw or before its owning restore frame can return.
+
+This is not the broader copy-engine multithreading or parallelization change.
+No read, write, traversal, metadata, sidecar, or reconciliation work moves to a
+background thread here; that transition still requires its own thread-safety
+audit. The only concurrent work introduced by this decision is terminal
+redrawing from an immutable snapshot.
+
+**Why:** Chunk-driven progress freezes completely when a read or write blocks,
+including the elapsed field that should tell the user the process is still
+alive. A delayed ticker makes that stall visible without inventing byte
+progress or contaminating the speed window with idle time. Keeping all
+filesystem queries on the synchronous path also prevents a stalled destination
+from blocking the display thread on the same I/O path it is meant to report.
+
+**Rejected:** moving copy work to worker threads; reading `BackupCaptureReport`
+directly from the ticker; updating the speed sample from timer redraws; polling
+the destination filesystem from the ticker; leaving a detached or cancelable
+thread alive past backup/restore return.
+
+---
+
+## D37 — 2026-09-07 — VS Code extension snapshots are capture-only
+
+**Status:** Implemented
+
+**Decision:** Critical and comprehensive backups best-effort capture
+`code --list-extensions --show-versions` as `vs-code-extensions.txt` at the
+container root. The snapshot is unconditional when `code` can produce usable
+output, like `packages.txt`; an unavailable command or empty result leaves the
+slot absent, and explicit-path backups clear it under D16. Extension ids and
+versions are not secret-bearing, so this control artifact has no consent gate.
+Restore never reads the file, installs VS Code, or installs extensions from it.
+
+**Why:** Restore is intended to run immediately after a distribution hop, when
+VS Code itself, its extension host, marketplace authentication and profile state
+may not yet be installed or settled. Automatically installing extensions at
+that point would couple migr to an external application whose own setup may
+still be incomplete. A plain snapshot preserves the useful inventory while
+letting the user replay it once VS Code is ready.
+
+**Rejected:** installing VS Code during restore; automatically replaying the
+extension list during restore; adding a dedicated include flag; prompting for
+consent before recording extension ids.
+
+---
+
+## D38 — 2026-09-08 — Elevated runs retain the invoking user's context
+
+**Status:** Implemented
+
+**Decision:** `migr` remains a single-user migration tool. An ordinary invocation
+targets the current user's environment. When `migr` is run through `sudo`, it
+targets the user who invoked `sudo`, not root, and never broadens itself to other
+accounts on the system.
+
+Privilege is requested only when an operation actually needs it. Ordinary backup
+and restore remain usable without root privileges. Operations that require access
+to privileged system state, such as `--include-network-config`, must fail before
+publishing a backup when the required files cannot be read and instruct the user
+to rerun the same command through `sudo`. `report` and `conf` do not require root.
+
+Under `sudo`, the target home directory must not be taken from the ambient `HOME`
+variable, because sudo policy may replace it with `/root`. The invoking identity is
+taken from `SUDO_UID`, and its home directory is resolved directly from
+`/etc/passwd`.
+
+The resolver must not use `getpwuid()` or `getpwnam()`. The bundled `migr-static`
+binary is linked with static glibc, and NSS-backed account lookup is not reliable in
+that environment. Parsing `/etc/passwd` directly gives the dynamic and static
+binaries one deterministic, NSS-independent path for ordinary local accounts.
+
+If `SUDO_UID` does not resolve to exactly one valid local passwd entry with an
+absolute home directory, `migr` must fail closed with a clear diagnostic. It must
+never fall back silently to `/root`, the elevated process's `HOME`, or another
+user's account.
+
+`XDG_CONFIG_HOME` remains environment-controlled. If it is present and absolute
+in the effective invocation environment, `migr` uses it as before. If it is absent,
+configuration falls back beneath the resolved target home at
+`$HOME/.config/migr/migr.conf`. Users who intentionally use a custom
+`XDG_CONFIG_HOME` and invoke `migr` through `sudo` are responsible for preserving
+that variable through sudo policy.
+
+There is no automatic enumeration of `/home`, no all-users mode, and no `--user`
+selection interface. Supporting another account, multiple accounts, or NSS-only
+identities would require a separate decision rather than expanding this behavior
+implicitly.
+
+**Why:** A privileged backup currently risks selecting `/root` when sudo rewrites
+`HOME`, producing a valid but silently incomplete backup of the wrong user. The
+privilege boundary and the user-selection boundary are separate concerns: root
+access may be needed to read system configuration, but that must not change whose
+personal data `migr` is backing up.
+
+This decision supersedes the elevated-context part of D34 that allowed changed
+`HOME` and configuration variables under sudo to select a different user context.
+It also resolves the D9 caveat by keeping account resolution out of libc NSS for
+the static binary.
+
+**Known caveats:**
+
+- Direct `/etc/passwd` lookup intentionally supports local passwd entries only.
+  Accounts provided exclusively through LDAP, SSSD, or another NSS backend are not
+  resolved by this mechanism and must be refused rather than guessed.
+- Preserving a custom `XDG_CONFIG_HOME` across sudo remains subject to the host's
+  sudo environment policy.
+- This decision does not introduce privilege separation or partial elevation
+  inside a running `migr` process; it only defines the identity and privilege
+  semantics of an elevated invocation.
+
+---
+
+## D39 — 2026-09-08 — Portable representation shortens physical leaves losslessly and addresses them parent-relatively
+
+**Status:** Decided — not yet implemented
+
+**Decision:** Portable capture must not require a user to rename source entries
+merely because migr's encoded payload representation exceeds a destination naming
+limit. The logical path remains the source and restore identity. Physical payload
+names are an internal, lossless representation and may be shortened automatically
+when necessary. Restore always reconstructs the exact logical name from
+authenticated sidecar state; no source entry that migr can otherwise represent may
+be silently skipped.
+
+This decision treats the two existing refusal classes differently. `NAME_MAX` is a
+real per-component filesystem limit and is handled by deterministic physical-leaf
+shortening. Cumulative encoded `PATH_MAX` is a limit of the current whole-physical-
+path addressing model and is removed from portable representation by moving that
+model to parent-relative physical leaves. This does not expand migr's logical-path
+model: a source logical path that migr cannot represent under its existing bounded
+logical identity rules remains unsupported.
+
+### R-1 — Canonical physical-leaf mapping
+
+For each non-root logical component, capture first applies D19's existing
+`ENCODING_MODE_COMPONENT` percent-encoding. The final physical leaf is then a pure
+function of the original logical component bytes, the requested D21 collision
+suffix, and this versioned mapping rule:
+
+1. If `encoded_length + suffix_length <= NAME_MAX`, the physical leaf is the
+   existing `encoded + suffix` form unchanged.
+2. Otherwise, compute 64-bit FNV-1a over the original logical component bytes,
+   starting from the repository's `HASH_FNV1A_OFFSET_BASIS`. Render the result as
+   exactly 16 uppercase hexadecimal digits.
+3. Form a shortening marker as `%7EH` followed by those 16 digits. `%7E` keeps the
+   marker inside D19's portable encoded alphabet; `H` distinguishes the shortening
+   marker from D21's decimal collision suffix form.
+4. Retain the longest prefix of the encoded component for which
+   `prefix + shortening_marker + collision_suffix` fits `NAME_MAX`, then append the
+   marker and suffix. Prefix selection operates on encoder output units: it may not
+   split a `%XX` escape or a literal well-formed UTF-8 code point.
+
+The fingerprint is not an ownership or uniqueness proof. An ordinary encoded name,
+another shortened name, or a deliberately colliding fingerprint may produce the
+same unsuffixed candidate. D21's collision planner remains the only authority that
+assigns unique physical sibling names.
+
+The shortening function never uses process salt, random input, wall-clock state,
+filesystem enumeration order, inode numbers, or destination-specific hidden state.
+Given the same logical component and collision suffix under sidecar v4 semantics,
+it produces the same physical leaf on every invocation.
+
+### R-2 — Collision planning and suffix budgeting
+
+All sibling candidates, shortened or not, participate in one collision namespace.
+The deterministic allocation order is unsigned byte-wise order of the unsuffixed
+physical candidate, with unsigned byte-wise logical-component bytes as the
+tie-breaker. The tie-breaker is mandatory because two different logical names may
+intentionally be forced to the same shortened candidate in tests; `readdir()` order
+must never decide which sibling receives a preferred name.
+
+Destination measurement and reservation remain authoritative under D21. The
+allocator first tries the empty suffix and then canonical `%7E<N>` suffixes as
+before. For every suffix candidate, R-1 recomputes the leaf with that suffix already
+included in the byte budget. A suffix-induced `NAME_MAX` overflow therefore
+shortens the base further instead of failing solely because the suffix grew.
+
+Pre-scan remains mandatory. A `NAME_MAX` expansion that R-1 maps safely is a
+resolved representation transformation, not an unresolved violation. Resolved
+shortenings are counted separately from fatal pre-scan failures and do not require
+interactive confirmation. Exact user-facing summary wording is presentation, not
+wire semantics.
+
+### R-3 — Parent-relative physical identity
+
+Portable state must no longer persist or require a complete joined physical path
+for each entry. Below each manifest root's existing `payload_path` namespace, one
+entry's physical address is its immediate physical leaf under the physical parent
+corresponding to its immediate logical parent.
+
+For logical path `a/b/c`, the physical node for `c` is reached by resolving the
+logical parent chain (`a`, then `a/b`) and opening each recorded physical leaf
+relative to the already-open parent directory fd. Filesystem access remains
+fd-anchored and component-by-component. Correctness code must not reconstruct a
+complete physical pathname merely to open, reserve, compare, deduplicate, reconcile,
+or authenticate a payload node.
+
+The same rule applies to prescan and collision planning. A physical reservation is
+identified by its planned parent identity plus physical leaf, not by a concatenated
+physical-path string. Directory shortening or collision suffixing therefore changes
+that directory's leaf assignment without requiring every descendant to carry a
+rewritten copy of the ancestor's physical path.
+
+The manifest-root payload namespace remains governed by D21 F-5 and is outside this
+leaf-shortening rule. D39 changes entry addressing below that anchor; it does not add
+root payload suffix allocation.
+
+### R-4 — Sidecar v4 wire boundary
+
+D39 advances `SIDECAR_VERSION` from 3 to 4. `MANIFEST_CURRENT_VERSION` does not
+change; the manifest's existing `sidecar_version` field records the new value.
+
+Version 4 replaces the v3 whole-path field with an immediate physical-leaf field.
+The fixed record order becomes:
+
+```text
+ENTRY:
+  tag, root_id, logical_path, physical_leaf, collision_suffix, object_kind,
+  mode, uid, gid,
+  atime_sec, atime_nsec, mtime_sec, mtime_nsec,
+  size, xattr_count, kind-specific fields
+
+CLAIM:
+  tag, root_id, logical_path, physical_leaf, object_kind
+```
+
+`XATTR`, `ENTRY_COMMIT`, and `DELETE` retain their existing grammar and ordering.
+Hardlink identity remains `(hardlink_root_id, hardlink_logical_path)` and therefore
+does not acquire a physical-path field.
+
+`physical_leaf` is the actual on-disk payload component and includes any D21
+collision suffix. `ENTRY.collision_suffix` remains a mandatory fixed-position field,
+including the empty value, so restore can authenticate R-1. `CLAIM` does not
+duplicate `collision_suffix`: as in v3, ownership proof records the exact physical
+node while the consuming entry carries the suffix needed for semantic validation.
+A claim and its consuming entry must match byte-for-byte on `root_id`,
+`logical_path`, `physical_leaf`, and `object_kind`.
+
+The root entry keeps the existing empty-address convention: an empty logical path
+has an empty physical leaf and empty collision suffix because its payload anchor is
+the manifest root. Every non-root payload-producing entry or claim has a non-empty
+physical leaf no longer than the portable component ceiling (`NAME_MAX`, 255 bytes
+in the current contract). `SIDECAR_MAX_PATH` continues to bound logical paths and
+other logical path fields; it no longer describes a persisted physical path.
+
+No explicit parent id or parent physical field is added to the wire. The immediate
+logical parent is derived from `(root_id, logical_path)`. For every non-root live
+entry or outstanding claim, replayed/adopted state must provide an unambiguous
+address-bearing chain of logical ancestors back to the manifest root. Missing,
+ambiguous, or structurally incompatible parent state is corruption and fails closed.
+Cleanup and reconciliation must process state in an order that never commits removal
+of an ancestor's address while a surviving descendant still depends on it.
+
+There is no v3 compatibility layer. A v4 reader refuses completed v3 portable
+sidecars, and v3 partials are not adopted or resumed as v4. This is an intentional
+pre-release format replacement, matching the earlier v1 -> v2 -> v3 transitions.
+
+### R-5 — Restore authentication and untrusted state
+
+Version 4 restore does not trust `physical_leaf` merely because it is syntactically
+valid. For each non-root entry it:
+
+1. derives the logical leaf and immediate logical parent;
+2. validates the recorded collision suffix under D21's canonical suffix grammar;
+3. recomputes R-1 from the logical leaf and that suffix and requires byte-for-byte
+   equality with `physical_leaf`;
+4. resolves the physical parent through the validated logical-parent chain;
+5. rejects duplicate physical leaves under one physical parent and physical
+   ancestor/type conflicts before mutation.
+
+The parent-chain invariant replaces D21 F-3's whole-string prefix equality. The
+physical duplicate check remains defense-in-depth even though valid assignments are
+expected to be unique: percent-encoding alone is injective, but R-1 shortening is
+deliberately not. Uniqueness now follows from authenticated deterministic mapping
+plus the collision planner's sibling allocation contract, not from encoder
+injectivity by itself.
+
+Replay and preflight independently enforce the v4 mapping before destination
+mutation, preserving the existing separate-gate model. Destination names always
+come from the logical path; no decoder or physical-to-logical guess is introduced.
+
+### R-6 — Resume, claims, and reconciliation
+
+D25's write-ahead ownership model remains unchanged in purpose and durability
+ordering. The owned physical object is now identified parent-relatively by the
+claim's logical ancestry plus `physical_leaf`.
+
+Each invocation still recomputes the complete deterministic collision plan from the
+current source set. A changed shortened assignment, collision suffix, or ancestor
+leaf assignment is an explicit replacement, not an unchanged-entry skip. Outstanding
+claims never pin an obsolete plan. Stale live entries and claims are cleaned using
+their old validated parent/leaf chain, and stale physical nodes may not survive a
+successful finalization.
+
+The existing claim ordering remains mandatory: ownership is durably claimed before
+payload mutation; a completed matching `ENTRY` consumes the claim; cleanup removes
+the exact claimed payload node before `DELETE` cancels the claim. Successful capture
+still requires exact payload inventory and zero outstanding claims. Restore still
+refuses any outstanding claim.
+
+### R-7 — `PATH_MAX` boundary after v4
+
+For a logical source path that migr's existing logical-path model accepts, portable
+capture and restore must not fail merely because joining its encoded/shortened
+physical components beneath the payload root would reach `PATH_MAX`. No correctness
+or ownership operation may require such a joined string.
+
+This does not promise arbitrary source logical paths beyond migr's current bounded
+identity model. Logical paths, source addressing, restore addressing, manifest
+fields, symlink targets, diagnostics, and unrelated native paths retain their
+existing limits unless another decision changes them. D39 removes only the
+encoding-induced cumulative **physical payload path** wall described by D19 N-8.
+
+### Acceptance boundary
+
+Implementation is not complete until focused and integration tests prove, at
+minimum:
+
+- an ordinary encoded name that already fits remains byte-for-byte unchanged;
+- punctuation-heavy names whose encoded form exceeds `NAME_MAX` shorten and restore
+  to the exact original logical name;
+- shortening never cuts a UTF-8 code point or `%XX` escape;
+- candidate generation is identical across invocations and reversed/different
+  source enumeration order;
+- an injected identical fingerprint for different logical names remains lossless
+  through deterministic collision allocation;
+- ordinary case collision and shortening can coexist in one sibling set;
+- collision-suffix growth rebudgets the shortened base without overflowing
+  `NAME_MAX`;
+- a supported logical path whose cumulative physical representation would exceed
+  `PATH_MAX` captures, resumes, reconciles, and restores through parent-relative
+  addressing;
+- shortening or renumbering an ancestor cannot orphan, duplicate, or misaddress its
+  descendants;
+- interruption at D25 claim/mutation/commit boundaries remains recoverable when
+  shortened names and changed ancestor assignments are involved;
+- malformed v4 physical leaves, suffixes, missing parent chains, duplicate sibling
+  physical leaves, and physical ancestor/type conflicts are refused before restore
+  mutation;
+- v3 sidecars and v3 partials are explicitly refused by the v4-only portable
+  reader/resume path;
+- the existing plain browsable payload-tree property remains true.
+
+Before D39 is marked Implemented, the full host gate and the existing Arch/Ubuntu/Fedora VM matrix must pass.
+
+**Why:** D19's fail-closed refusal prevents silent data loss, but requiring manual
+renames turns a representation detail into user work and does not scale to real
+homes containing many long names. D21 already established the more useful
+principle: physical payload spelling may differ from logical identity when the
+mapping is deterministic, authenticated, reversible through sidecar state, and
+collision-safe. Extending that principle to overlong encoded names preserves D19's
+safety goal without sacrificing usability.
+
+Treating cumulative physical `PATH_MAX` as another leaf-shortening problem would
+solve the wrong layer. The low-level filesystem walkers are already largely
+fd-relative, while prescan, state, reconciliation, and restore still carry joined
+physical paths for algorithmic identity. Parent-relative sidecar and planning state
+removes that artificial whole-string dependency coherently instead of distributing
+path-budget heuristics across ancestors.
+
+**Rejected:** silently skipping unrepresentable entries; asking the user to rename
+or approve each physical shortening; truncation without a retained fingerprint;
+using the fingerprint as the sole uniqueness guarantee; salted, random, time-based,
+inode-based, or enumeration-order-dependent physical names; shortening arbitrary
+ancestors until a joined path happens to fit; retaining complete physical paths in
+v4 sidecar state while only changing the syscall helper; trusting a recorded
+physical leaf without recomputation; introducing a v3 compatibility shim during the
+pre-release format replacement; expanding this change into arbitrary over-`PATH_MAX`
+logical-source support.
+
+**Relationship:** Supersedes D19 N-2's default `NAME_MAX` refusal, N-3/N-4's
+whole-physical-path representation/binding, and N-8's encoded cumulative `PATH_MAX`
+refusal for logical paths already supported by migr. It preserves D19's encoding
+safe set, mandatory pre-scan, written-name verification, and fail-closed principle.
+It supersedes D21 F-2c/F-3/F-4/F-6 where they require a full `physical_path` or make
+suffix-induced overflow fatal, while preserving D21's canonical suffix grammar,
+deterministic complete-set planning, destination authority, resume replacement
+semantics, and source-change refusal. It advances D25's v3 claim field from
+`physical_path` to v4 `physical_leaf` without weakening write-ahead ownership or
+cleanup ordering. D17/D21/D25 remain the historical grammar records for sidecar
+versions 1, 2, and 3 respectively.
+
+---
+
+## D40 — 2026-09-10 — Failed package batches are isolated with adaptive sub-batches
+
+**Status:** Superseded by D46
+
+**Decision:** Package restore still starts with one install transaction containing
+the complete package list. If that transaction fails, migr retries the remaining
+contiguous range in progressively smaller batches. A failed range is halved until
+one package remains; only a failing singleton is recorded in
+`skipped-packages.txt`. After a successful range, the next batch grows again so
+healthy stretches return quickly to large transactions.
+
+The same recovery algorithm is used for Debian/Ubuntu, Fedora/RHEL, and Arch.
+Their package-manager command lines remain distro-specific: apt keeps `-m`, dnf
+keeps its ordinary install semantics, and pacman keeps `--needed --noconfirm`.
+
+**Why:** D2's one-package fallback preserves exact knowledge of which requested
+packages failed, but one unavailable name can turn a restore of hundreds of
+packages into hundreds of package-manager processes. That is especially expensive
+for dnf, where each process may reload repository metadata, and the same structural
+problem applies to pacman when an unavailable target aborts a batch.
+
+Using dnf's `--skip-unavailable` only on the full batch would make a zero exit code
+ambiguous: migr could no longer tell which requested names were skipped and would
+incorrectly count them as installed unless it added a second Fedora-specific
+inventory protocol. Adaptive isolation preserves D1's exact skipped-package log,
+requires no package-manager output parsing, and gives all supported distro families
+the same bounded recovery policy.
+
+**Relationship:** Supersedes D2 only where D2 requires falling back immediately to
+one install process per package. D2's single full-batch first attempt, D1's skipped
+package reporting, D12's explicit-package export, and all distro-specific install
+options remain in force.
+
+---
+
+## D41 — 2026-09-10 — Rewrite source HOME in two known desktop-state files
+
+**Status:** Implemented; extended by D86 (VERSION=1 manifests, native restore)
+and D101 (dconf)
+
+**Decision:** A VERSION=2 portable restore whose recorded `SOURCE_HOME` differs
+from the destination HOME rewrites that exact source-home prefix in only these two
+regular files when they are present in the restored selection:
+
+- `~/.config/gtk-3.0/bookmarks`
+- `~/.local/share/recently-used.xbel`
+
+The file is identified from its manifest source root plus sidecar logical path, so
+the rule is independent of how the source tree happened to be split into roots.
+Only a literal `file://` URI whose path starts with `SOURCE_HOME` is eligible. The
+next byte must be `/`, a URI/token terminator used by these two formats, or
+end-of-file; a longer pathname component that merely shares the prefix and
+unrelated text containing the old HOME are left unchanged. Replacement is
+streamed with a bounded cross-read tail. Metadata replay is unchanged, and restore
+progress continues to account for source payload bytes.
+
+VERSION=1 manifests, equal source/destination HOME paths, every other regular file,
+and all non-regular entries retain byte-for-byte replay.
+
+**Why:** GTK bookmarks and the freedesktop recent-files store embed absolute
+`file://` paths as desktop-level state. Restoring them verbatim after a username
+change leaves links pointing at the old, nonexistent home. These two formats need
+only a bounded literal path-prefix substitution; general rewriting of arbitrary
+application configuration would require format-specific knowledge and has no safe
+generic rule.
+
+**Rejected:** scanning arbitrary restored files for HOME-looking strings; guessing
+a source HOME for older manifests; rewriting non-URI text in these files; XML
+parsing for the XBEL file; loading the whole file into memory merely to perform a
+prefix substitution.
+
+---
+
+## D42 — 2026-09-10 — Portable restore verifies applied content before success
+
+**Status:** Implemented; superseded in part by D53 and D59
+
+**Decision:** A live portable restore performs a post-copy verification pass by
+default after replay has applied file content and metadata and before the restore
+is reported successful or optional package/network restoration begins.
+
+For every regular file, replay computes a 64-bit FNV-1a digest incrementally over
+the exact bytes successfully written to the destination. Except for the explicit
+live-state exclusions defined by D44, the verification pass reopens the destination
+through existing-only, fd-relative, no-follow traversal, hashes its current bytes,
+and requires the digest to match. The expected digest therefore describes the
+bytes migr actually intended to leave at the destination, including D41's bounded
+HOME-URI rewrite, rather than blindly describing the original portable payload.
+
+Symlinks are verified by no-follow identity checks plus exact target-byte
+comparison. Because reading a symlink target may advance the symlink's atime, the
+verifier reapplies the recorded symlink timestamps with no-follow semantics before
+declaring that entry verified. A hardlink representative is content-verified as a regular file;
+aliases are then verified by matching `st_dev`/`st_ino` with their referenced
+representative, so the same file content is not read again through every hardlink
+name. Directories require no additional content read after their existing replay
+and metadata checks.
+
+Any verification path, read, content, symlink-target, or hardlink-identity failure
+is a restore failure and retains the existing failing root/path diagnostics. A
+known mismatch is not reported as successful merely because destination mutation
+already occurred. Verification does not roll back already-applied files.
+
+`--no-verify` is a restore-only opt-out from this post-copy destination read-back.
+It does not weaken portable preflight, payload authentication, destination-identity
+validation, or any apply-time metadata checks. Dry-run restore does not run the
+post-copy verifier because it does not perform replay mutation.
+
+**Why:** A successful copy syscall sequence proves that the write path returned
+success, not that the destination still contains the intended bytes at the
+completion boundary. One destination read-back catches copy/storage corruption and
+destination path replacement that is observable when the entry is verified.
+Computing the expected digest while replay already streams the bytes avoids a
+second read of the backup payload and gives transformed files the correct expected
+content. This verification boundary detects non-adversarial accidental corruption;
+it is not a tamper-evidence mechanism. Reusing the repository's 64-bit FNV-1a
+primitive is sufficient for that probabilistic checksum role while keeping the CPU
+cost of a default-on full-tree read-back low.
+
+**Rejected:** treating a detected mismatch as a successful restore plus a warning
+file; re-reading and hashing the backup payload again after copy; hashing hardlink
+aliases independently; following destination symlinks during verification; using a
+cryptographic digest for a non-adversarial checksum boundary at the cost of
+substantially lower unoptimized throughput; making verification opt-in.
+
+**Relationship:** Complements D17/D39's independent restore validation and
+fail-closed rules, and D41 defines why the expected bytes for its two transformed
+files are the rewritten output. Package and network publication remains downstream
+of a fully successful portable replay, so a failed verification cannot be followed
+by those optional restore steps.
+
+---
+
+## D43 — 2026-09-11 — Portable payload preflight overlaps regular-file metadata I/O
+
+**Status:** Reverted — see D45
+
+**Decision:** Portable restore preflight may use a bounded worker pool while
+inventorying a sufficiently large payload. The workers perform only the
+`fstatat(..., AT_SYMLINK_NOFOLLOW)` calls for already-resolved non-directory
+payload leaves. Directory enumeration, address-index lookup, directory traversal,
+and all semantic validation remain on the coordinator thread.
+
+Work is issued in bounded sibling batches. A batch is fully complete before its
+results are consumed, before traversal descends through a directory, and before a
+parent descriptor can leave scope. The coordinator consumes results in enumeration
+order and remains the sole writer of `seen[]`, checked-count/progress state, and
+preflight diagnostics. The final missing-entry sweep runs only after the payload
+walk has returned and every worker has been joined.
+
+On the first validation or I/O failure observed by the coordinator, no new work is
+dispatched. Operations already issued in the current bounded batch are allowed to
+finish, after which the existing fail-closed result is returned. Failure to create
+the pool before scanning starts falls back to the existing serial walk because
+concurrency is only a performance optimization. Once worker threads exist, their
+lifetime is joined before the pool's stack storage or any parent descriptor can be
+released.
+
+Production uses at most eight workers and skips pool creation for payload indexes
+smaller than 32 entries. The root-namespace walk and destination-identity graph
+remain serial; neither is part of this concurrency boundary.
+
+**Why:** Large portable backups can require hundreds of thousands of independent
+metadata syscalls against removable or virtualized storage, where per-operation
+latency dominates. Overlapping the common regular-file `fstatat()` calls reduces
+that latency cost without turning validation state, report aggregation, progress,
+or recursive directory ownership into shared mutable worker state. Keeping those
+invariants single-writer also preserves the serial path's deterministic validation
+order.
+
+**Rejected:** thread-per-entry fan-out; concurrent mutation of `seen[]`, reports,
+or progress counters; parallel recursive directory traversal; and parallel
+destination-identity graph construction. Those designs widen the synchronization
+and descriptor-lifetime surface substantially beyond the I/O operation that
+motivates this change.
+
+---
+
+## D44 — 2026-09-11 — Restore verification excludes confirmed live daemon-owned state
+
+**Status:** Implemented
+
+**Decision:** D42's post-copy destination read-back excludes regular-file entries
+whose root is exactly `BUILTIN_LOCAL_SHARE` and whose logical path is exactly
+`gvfs-metadata` or is below `gvfs-metadata/` on a path-component boundary. These
+entries are still selected, copied, restored, and hashed during replay like other
+regular files. They are omitted only from the later destination read-back and from
+its verification progress/accounting.
+
+This is an explicitly named exception list, not a classifier for mutable files.
+Additional live-state paths require independent evidence before being added. A
+similarly spelled sibling such as `gvfs-metadata-x`, or the same logical path under
+another manifest root, remains subject to normal D42 verification. `--no-verify`
+continues to be the broader opt-out from the entire post-copy verification pass.
+
+**Why:** `~/.local/share/gvfs-metadata` is owned by the desktop metadata service and
+may be rewritten independently while a restore is still running. A later digest
+comparison therefore cannot distinguish a bad restore from legitimate concurrent
+daemon mutation. Treating that comparison as a restore failure creates a false
+positive after migr has already written the intended bytes. D41 provides the
+precedent for handling a confirmed desktop-state exception with a narrow,
+format/path-specific rule instead of a broad heuristic.
+
+**Rejected:** disabling verification for all of `.local/share`; detecting running
+desktop services and dynamically guessing which files might change; matching by a
+loose string prefix; suppressing the file from backup or restore; and adding a
+second user-facing verification flag for this case.
+
+---
+
+## D45 — 2026-09-11 — Keep portable payload preflight scanning serial
+
+**Status:** Implemented
+
+**Decision:** Revert D43's bounded worker pool and keep the portable restore
+payload-inventory walk serial. The preflight therefore issues its payload metadata
+operations in the same single-threaded traversal used before D43. The dedicated
+ThreadSanitizer gate added solely for the worker pool is removed with that
+mechanism.
+
+No runtime storage heuristic or adaptive worker-count policy is added. The serial
+path is the default across local, removable, virtualized, and passthrough media
+until a future design has measured evidence that concurrent metadata submission is
+reliably beneficial under a distinguishable set of conditions.
+
+**Why:** A controlled cold-cache measurement on the same VM snapshot and the same
+39.1 GiB, 221,605-item USB-backed portable backup measured 71.92 seconds before
+D43 and 116.07 seconds with D43 enabled. The worker pool was therefore about 61%
+slower on the exact removable-media scenario that motivated the optimization.
+
+The observed behavior is consistent with the lower storage layer serializing the
+actual I/O: concurrent userspace submissions then cannot hide device latency, while
+mutex, condition-variable, queueing, and thread-wakeup costs are still paid for
+every dispatched batch. The implementation was correct and race-checked; the
+revert is based on measured performance, not a concurrency correctness failure.
+
+**Rejected:** tuning worker count or batch size without evidence that the medium
+can exploit concurrent metadata I/O; guessing from device class such as SSD,
+rotational, removable, or virtualized; retaining an unused worker-pool race gate;
+and keeping the parallel path as an unmeasured optional branch.
+
+---
+
+## D46 — 2026-09-11 — Package restore uses one install transaction and verifies final state
+
+**Status:** Implemented; apt runs without questions since D91; only the
+missing packages are installed since D95; apt's targets are checked against
+its repositories since 2026-10-04
+
+**Decision:** Package restore performs at most one real install transaction per
+restore. Debian/Ubuntu keeps `apt-get install -y -m`. Fedora/RHEL adds
+`--skip-unavailable` to its single dnf transaction. Arch has no equivalent
+skip-unavailable transaction option, so migr first reads the local sync-database
+package names with `pacman -Slq`, omits requested names that are unavailable there,
+and passes the remaining set to one `pacman -S --needed --noconfirm` transaction.
+
+The install command's exit status is not used to decide which requested packages
+succeeded. After the transaction, migr reads installed package state once and
+compares the original requested list against that state: `dpkg-query` with
+installed-status filtering on Debian, `rpm -qa` names on Fedora, and `pacman -Qq`
+on Arch. Every requested name present in final state counts as installed; every
+requested name absent from final state is written to `skipped-packages.txt` per
+D1. A package already installed on Arch therefore still counts as restored even if
+it is no longer present in the current sync databases and was omitted from the
+install transaction. A failed state query is an error because migr can no longer
+produce trustworthy package accounting.
+
+Successful accounting is authoritative for the skip-log artifact as well as the
+summary. When no requested package is skipped, a stale `skipped-packages.txt` from
+an earlier restore is removed instead of being left to describe the new restore
+incorrectly.
+
+**Why:** D40's adaptive halving preserves exact skip accounting, but several
+unavailable packages scattered through a realistic list cause repeated package
+manager transactions, repeated dependency solving, and pages of duplicate failure
+output. The package managers already have enough native behavior to avoid that
+retry loop: apt and dnf can tolerate unavailable targets directly, while pacman's
+sync database can cheaply identify names that would make its all-or-nothing target
+resolution fail. Verifying final installed state separates accounting from package
+manager diagnostics and also handles already-installed packages and partial
+transaction outcomes without parsing human-readable output.
+
+**Rejected:** retaining adaptive or per-package retries as a fallback; scraping
+package-manager output to infer per-package success; suppressing repeated output
+instead of eliminating repeated transactions; and issuing one installed-state
+query process per requested package.
+
+**Relationship:** Supersedes D40 and the per-package fallback portion of D2. D1's
+exact skipped-package artifact and summary, D12's explicit-package export, and the
+distro-specific install commands remain in force.
+
+**Revision (2026-10-04):** apt-get does not tolerate an unavailable target:
+`-m` covers package files that fail to download, while a name it cannot
+locate makes it refuse the whole transaction. Debian/Ubuntu therefore reads
+the names its repositories have with `apt-cache pkgnames`, as Arch reads
+`pacman -Slq`, and omits the others from the transaction. A name with an
+architecture (`libc6:i386`) is looked up without it. Accounting is
+unchanged: an omitted name is absent from final state and listed.
+
+---
+
+## D47 — 2026-09-16 — Translate XDG names in known desktop state and preserve destination user-dirs state
+
+**Status:** Implemented; extended by D86 (VERSION=1 manifests, native restore)
+and D101 (dconf)
+
+**Decision:** Extend D41's bounded `file://` rewrite for VERSION=2 portable
+selection restores with one source-to-destination pair for every captured XDG
+root. The source side comes from the manifest root's absolute source path and the
+destination side comes from the invocation's already-resolved, frozen XDG target
+map. When more than one pair can begin at the same byte position, the longest
+component-boundary-valid source prefix wins. The generic source-HOME to
+destination-HOME pair remains the lowest-priority fallback for paths outside the
+known XDG roots. No URI parser, Unicode normalizer, or locale-aware comparator is
+introduced.
+
+`~/.config/user-dirs.dirs` is destination-owned state. If it is selected in the
+same versioned portable restore, migr leaves the destination copy untouched and
+omits the source entry from content verification. The final report counts it as
+preserved locally authoritative state rather than as an applied entry.
+
+Same-HOME known desktop-state restores, legacy manifests without a recorded
+source HOME, and all other non-authoritative regular files retain their
+previous byte-for-byte behavior. The destination-owned `user-dirs.dirs` file
+remains preserved even when HOME paths are otherwise unchanged. The existing
+native restore path is unchanged; this decision applies to the portable replay
+boundary where D41 operates.
+
+**Why:** XDG directory names are locale-specific. Rewriting only the captured
+HOME leaves GTK bookmarks and recent-file URIs pointing at the source locale's
+directory names after a cross-locale restore, even though content placement already
+uses the destination locale's frozen XDG map. The destination's
+`user-dirs.dirs` is likewise generated and owned locally, so restoring the source
+copy would invalidate the same map for later desktop sessions. The bounded pair
+table keeps both fixes in the existing literal-prefix mechanism and computes the
+mapping once per restore.
+
+**Relationship:** Extends D41's known desktop-state rewrite and applies D44's
+locally-authoritative-state principle to `user-dirs.dirs`.
+
+## D48 — 2026-09-16 — Extend live-state verification exclusions with measured desktop paths
+
+**Status:** Implemented
+
+**Decision:** Extend D44's explicit regular-file verification exclusion table
+with `BUILTIN_DOT_CONFIG:dconf/user`,
+`BUILTIN_LOCAL_SHARE:gnome-shell/application_state`, and the
+`BUILTIN_LOCAL_SHARE:flatpak` and
+`BUILTIN_LOCAL_SHARE:org.gnome.TextEditor` subtrees. The first two paths match
+only at their named path-component boundary; the latter two match their named
+subtrees. All four groups remain selected, copied, replayed, and accounted for
+normally; only the post-copy destination content read-back and its verification
+accounting omit them. Similar names and paths under another root remain subject
+to normal verification.
+
+**Why:** An independent SHA-256 cross-check of every distinct payload content
+hash in a real 39 GB, 221,605-item backup and its restored destination found
+these four groups changing under live desktop management, with no indication of
+a backup or replay defect. The named exclusions therefore extend D44's measured
+exception-list approach rather than guessing from a process or filesystem
+classifier. Keeping the matching component-boundary-aware also preserves the
+existing protection against lookalike siblings such as `flatpak-notes` and
+`gnome-shell-extra`.
+
+**Rejected:** excluding all of `dconf` or `gnome-shell`; disabling verification
+for all of `.local/share`; detecting live ownership dynamically; delaying and
+retrying the comparison; or suppressing these paths from backup or replay.
+
+**Relationship:** Extends D44's named live-state verification exceptions. D47's
+destination-owned `user-dirs.dirs` handling and all backup/replay behavior are
+unchanged.
+
+## D49 — 2026-09-19 — Write each portable sidecar entry group as one synchronous buffer
+
+**Status:** Implemented
+
+**Decision:** The portable capture path appends each `ENTRY` + `XATTR*` +
+`ENTRY_COMMIT` group through one `sidecar_log_append_group()` call. The sidecar
+codec builds the entry and every xattr with the existing record encoders,
+appends the existing commit tag, and hands the complete buffer to the existing
+short-write-safe write path once. The state layer validates and prepares all
+owned state before the write; only a successful write applies the same claim
+consumption and live-map insertion sequence as the incremental commit path.
+
+The incremental entry, xattr, and commit APIs remain available for compatibility
+and direct state/replay fixtures. `CLAIM` and `DELETE` remain synchronous and
+unbatched. No buffer or logical-size state survives the function call, and the
+sidecar close, periodic sync, and capture report paths are unchanged.
+
+**Why:** Real removable-media measurements showed that sidecar journal latency
+was dominated by the number of small writes rather than by the journal's total
+byte volume. Combining only the records whose consistency boundary is already
+one complete entry group reduces that operation count while preserving the
+existing byte grammar and truncation recovery. The combined write is also an
+atomic state boundary in memory: a failed write poisons the log without
+applying the prepared live or claim-map mutation.
+
+This scope is explicitly constrained by D25. The ownership `CLAIM` must still
+reach the journal before the corresponding payload mutation, so claims are not
+deferred into the group buffer. The same write-ahead ordering is preserved for
+the live-owner cleanup `DELETE` path. A partial group remains a valid truncated
+tail and adoption discards it back to the preceding complete boundary.
+
+**Rejected:** buffering records across capture calls; changing close or
+periodic-sync flush behavior; tracking a separate logical journal size; and
+combining `CLAIM` or `DELETE` with entry groups. Those changes require a wider
+durability and resume design than this measured, synchronous optimization.
+
+**Relationship:** Extends D25's write-ahead ownership boundary without weakening
+it. The revision-3 journal-batching invariants analysis records the crash,
+resume, and interleaved-claim constraints that define this implementation
+scope.
+
+---
+
+## D50 — 2026-09-24 — Load the restored dconf database into a running session
+
+**Status:** Implemented; extended by D86 (VERSION=1 portable backups with SOURCE_HOME)
+
+**Decision:** When a portable replay applies the source HOME's
+`.config/dconf/user` (identified like D41's known files, from the manifest source
+root plus sidecar logical path, so only VERSION=2 manifests qualify), replay hands
+a read-only fd of that entry's backup payload to the caller. After a complete
+replay and before packages, restore copies the payload into a private
+`/tmp/migr-dconf-*` directory, reads it with `dconf dump /` through a profile
+naming only that copy (`DCONF_PROFILE`, `XDG_CONFIG_HOME`), and applies the dump
+with `dconf load /` over the target user's session bus
+(`/run/user/<uid>/bus`). Under sudo both commands run as the invoking user,
+resolved as in D38. Keys absent from the backup keep their current values.
+
+A native restore finds the same database directly in its container, under
+`data/<payload>/dconf/user` of the root captured from `.config`, and applies it
+the same way after its files are restored.
+
+With no session bus socket, nothing can hold the database in memory, so the
+restored file is already the result and no command runs. With no `dconf` on
+`PATH`, no dconf service can run either. A dump that fills its bounded buffer
+is never loaded. A failed dump or load is reported as a restore warning with
+the recovery path (log out, rerun from a text console).
+
+**Why:** `dconf-service` keeps the user database in memory and writes the
+whole file back on its next change, so a file replaced underneath a running
+session is lost, and with it most of the restored keys. D44/D48 exclude `dconf/user` from read-back verification because it is
+live, which also hid the loss. The payload, not the destination file, is the
+source because the destination may already have been overwritten.
+
+**Rejected:** terminating `dconf-service` after replacing the file (a write
+between replacement and termination still wins, and running clients see no
+change notifications); only warning (leaves the user's desktop settings to a
+manual step); adding a text dump to the backup format (the binary database
+already carries the data).
+
+**Relationship:** Complements D44/D48 rather than replacing them: the byte-level
+read-back exclusion stays, because the file remains live after the load.
+
+---
+
+## D51 — 2026-09-24 — Read the portable journal back from the device before publishing
+
+**Status:** Implemented
+
+**Decision:** Before `container_finalize()` publishes a portable container,
+backup syncs the container's filesystem, drops `sidecar.migr`'s clean pages
+with `posix_fadvise(POSIX_FADV_DONTNEED)`, and parses the whole journal again
+with `sidecar_parse_fd()`. Only a journal that parses to `SIDECAR_STATUS_OK`
+through its full size is published. A damaged journal is reported with its last
+valid record boundary and file size, and the container stays unpublished with a
+message to remove it and back up again, preferably to a different drive.
+Native containers have no journal and are unchanged.
+
+**Why:** A finished backup can report `OK` while its journal is already damaged
+on the device, for example by an exFAT cluster reused for a directory block.
+Every read during capture, including resume adoption, is served from the page
+cache, so such damage surfaces only when another machine reads the drive and
+restore refuses the backup. Parsing from the device before publication moves that
+failure to the moment the source machine still exists.
+
+**Limits:** Dropping cached pages is advisory and only affects clean pages, which
+the preceding sync guarantees; it cannot prove that later reads will match.
+Payload files are not read back; a capture-time content digest would be the
+basis for verifying them.
+
+---
+
+## D52 — 2026-09-24 — Journal adoption rewrites the recovered prefix instead of truncating in place
+
+**Status:** Implemented
+
+**Decision:** When `sidecar_log_adopt_at()` finds a truncated tail, it copies
+the journal up to the last valid boundary into `sidecar.migr.rewrite`, `fsync`s
+it, renames it over `sidecar.migr`, `fsync`s the container directory, and
+continues the log on the new file. It no longer calls `ftruncate()` on the slot.
+A rewrite file left by an interrupted adoption is removed at the start of the
+next adoption. The original journal is untouched until the rename, so a crash at
+any point leaves either the old journal with its tail or the rewritten prefix.
+
+**Why:** On a real exFAT stick, a resume truncated the journal back into cluster
+330, the destination probe then created and deleted a directory in the freed
+cluster, and the re-extended journal was stored in that same physical cluster.
+The drive ended up with a deleted directory block inside the journal and restore
+refused the backup. Whether the Linux exFAT driver or the device is at fault, a
+freshly created file receives freshly allocated clusters, and the freed ones
+leave with the old inode. The cost is one sequential copy of the journal, only
+on a resume that actually has a tail.
+
+**Relationship:** Keeps D25/D49's recovery rule (discard back to the last
+complete boundary) and only changes how the discard is performed. D51 checks
+the result from the device before publishing.
+
+---
+
+## D53 — 2026-09-24 — Verification reports every mismatch and no longer blocks dependent restore steps
+
+**Status:** Implemented
+
+**Decision:** D42's read-back pass now checks every non-excluded item even after
+a mismatch. The first mismatch remains the report's failing root/path and cause;
+every mismatch is counted, and up to eight are listed after the pass. Because
+verification runs only after every entry has been applied, a pass with
+mismatches ends in a distinct `PORTABLE_RESTORE_VERIFICATION_FAILED` outcome.
+Restore then still runs dconf (D50), package, and network restoration, and exits
+with an error summary pointing at the listed items. A content mismatch reads
+"content differs from the backup" instead of the internal `EIO`'s "Input/output
+error". Apply-phase failures keep the `PORTABLE_RESTORE_ERROR` outcome and still
+skip every dependent step.
+
+**Why:** One live-state file rewritten by a background service stopped
+verification at its first mismatch. The remaining items went unchecked, and
+packages and network configuration were skipped although every file was
+already on disk, so the whole restore had to run again. A mismatch found after
+application does not make the dependent steps less valid; it makes the specific
+items suspect, which listing them all addresses.
+
+**Relationship:** Supersedes D42's rule that a failed verification cannot be
+followed by package and network restoration. D42's default-on verification, its
+failure status, and D44/D48's exclusions are unchanged.
+
+---
+
+## D54 — 2026-09-24 — Restored network files get fixed per-backend modes
+
+**Status:** Implemented
+
+**Decision:** Restore writes each saved network file with a mode fixed by its
+backend instead of the mode recorded in the backup: `0600` for NetworkManager,
+netplan, wpa_supplicant, and netctl; `0644` for systemd-networkd, except
+`.netdev` files, which get `0640` and, when restore runs as root, the
+`systemd-network` group resolved from the local group file without NSS (as D38
+resolves accounts). A missing group leaves the file `0640 root:root`.
+
+**Why:** A portable container on exFAT reports every file as `0755`. On real
+hardware all six restored NetworkManager keyfiles were written `0755`;
+NetworkManager refused every one of them ("File permissions (100755) are
+insecure") although migr's own reload ran, and the Wi-Fi passwords in them were
+world-readable until a manual `chmod 600`. NetworkManager requires `0600`, and
+these backends store secrets in their files (D33). systemd-networkd parses its
+configuration as the unprivileged `systemd-network` user, so its files keep
+`0644`; a `.netdev` can hold a WireGuard private key, for which systemd documents
+`0640` with that group.
+
+**Relationship:** Extends D33's restore side. Capture is unchanged.
+
+---
+
+## D55 — 2026-09-24 — Portable backup tolerates changes in confirmed live desktop state
+
+**Status:** Implemented
+
+**Decision:** The confirmed live-state paths of D44/D48 move to one shared list
+(`src/live_state.c`) used by both restore verification and portable capture. For
+those paths only, a source change between pre-scan and capture no longer aborts
+the backup: a member that disappeared is left out, one that appeared after the
+pre-scan planned its directory is left out, one replaced before it could be
+opened is left out, and a file or directory that changed while it was read is
+kept as read. A regular file's entry keeps the pre-scan metadata that its copy
+was bounded by, so entry and payload stay consistent. Every tolerated change is
+counted and the backup prints one note. Changes to any other path still abort
+exactly as before.
+
+**Why:** Both real `--comprehensive` backups stopped at
+`gvfs-metadata/root-*.log`, one of them after 48 minutes. That abort left a
+partial journal whose resume truncation later cost a journal cluster (D52). GNOME's
+metadata service rotates those files whenever it pleases, so aborting on them
+reports ordinary desktop activity as an inconsistent source. D44 established that
+these paths are live; this applies the same evidence to capture.
+
+**Rejected:** removing gvfs-metadata from the backup scope (D44 already rejected
+suppressing it); retrying a changed file (a continuously written file can still
+fail); tolerating changes under arbitrary paths.
+
+**Relationship:** Extends D44/D48 from restore verification to capture; the list,
+its path-component boundary rule, and its evidence requirement are unchanged.
+
+---
+
+## D56 — 2026-09-24 — Podman's storage lock is confirmed live state
+
+**Status:** Implemented
+
+**Decision:** `BUILTIN_LOCAL_SHARE:containers/storage/storage.lock` joins the
+shared live-state list (D44/D48/D55). Nothing else under `containers/` does.
+
+**Why:** Rootless Podman rewrites its lock file on each access. A terminal
+that lists Toolbox or Distrobox containers (Ptyxis) queries Podman when it
+starts or opens a window, which launches a `podman-pause` scope, so the file
+changes during a restore without Podman being used. That is daemon-owned
+state changing independently of migr, the evidence D44 requires. Application
+files rewritten because an application was left open (such as VS Code) are not
+added; they are a warning matter, not live daemon state.
+
+---
+
+## D57 — 2026-09-24 — A user Flatpak installation with nothing deployed is left out
+
+**Status:** Implemented
+
+**Decision:** When building a critical or comprehensive plan, if
+`~/.local/share/flatpak` exists and neither its `app/` nor its `runtime/`
+directory has an entry, the directory is added to the plan's exclusions
+automatically, like a conf exclude, and `report` and backup print one note.
+A user installation with any deployed app or runtime is backed up as before.
+Explicit-path backups are unchanged.
+
+**Why:** A user installation whose applications are all installed
+system-wide can still hold an OSTree repository of a gigabyte or more.
+Restoring it recreates a user `flathub` remote, so every later `flatpak install`
+asks which installation to use, and GNOME Software refreshes its catalog into
+the directory while the restore writes it. With nothing deployed, the
+repository is only a download cache that Flatpak fetches again.
+
+**Relationship:** A narrow first step of backup-scope-overhaul's Flatpak
+adapter; recording and reinstalling deployed refs remains future work.
+
+## D58 — 2026-09-24 — Network capture records the crypto policy; restore only suggests it
+
+**Status:** Implemented
+
+**Decision:** With `--include-network-config`, backup reads the policy name
+from `/etc/crypto-policies/config` (first non-comment token, limited to
+letters, digits, and `:_-.`) and writes it as `network/crypto-policy`. A
+missing, unreadable, or unrecognized file records nothing; failing to write the
+record fails the network capture like any other network file. Restore compares
+it with the target's policy and, when they differ, prints the
+`sudo update-crypto-policies --set <policy>` command. It never runs it.
+
+**Why:** 802.1X (PEAP/MSCHAPv2) profiles that use TLS 1.0 carry
+`phase1-auth-flags` in their keyfiles, but also depend on a system crypto policy
+that allows it, such as `DEFAULT:SHA1`, which a fresh install does not have. The
+policy is a machine-wide security setting, so changing it is left to the user,
+with the exact command in hand.
+
+**Relationship:** Extends D54's network restore. Older restores ignore the
+extra file because they only open the known backend directories.
+
+**Note (D83):** Restore now sets the recorded policy instead of suggesting it.
+
+## D59 — 2026-09-24 — Sidecar v5 records a capture-time content digest
+
+**Status:** Implemented
+
+**Decision:** `SIDECAR_VERSION` advances from 4 to 5. A regular-file `ENTRY`
+gains one kind-specific field after `xattr_count`: `content_digest`, the 64-bit
+FNV-1a of the bytes capture read and wrote into the payload, as a canonical
+unsigned decimal. Other kinds carry no such field, and both the writer and the
+state layer refuse a non-zero digest on them. Capture computes the digest while
+streaming the copy; a resumed capture that keeps an unchanged payload keeps its
+recorded entry and digest.
+
+Replay hashes the bytes it reads from the payload separately from the bytes it
+writes (they differ only under D41's HOME-URI rewrite) and compares the former
+with the recorded digest. A mismatch does not stop the replay: the verification
+pass reports that item as "the backup's copy changed after it was captured",
+counted and listed like any other D53 mismatch. The D42 read-back of the
+destination is unchanged and still compares against the written bytes.
+
+There is no v4 compatibility layer, matching the earlier transitions (R-4): a
+v5 reader refuses v4 sidecars, and v4 partials are not adopted or resumed.
+
+**Why:** D42's expected digest came from the bytes replay wrote, so a payload
+damaged inside the container after capture was read, written, and "verified"
+as correct, and only a manual comparison against the container could tell. With
+the digest recorded at capture, restore verifies end to end, and a backup can be
+checked on its own before the source machine is wiped.
+
+**Relationship:** Supersedes D42's claim that replay needs no second source of
+truth. FNV-1a stays a corruption check, not tamper evidence.
+
+## D60 — 2026-09-24 — `migr verify` checks a portable backup against its journal
+
+**Status:** Implemented
+
+**Decision:** `migr verify <SOURCE>` opens a finished portable container the way
+restore preflight does (complete journal required, no outstanding claims, a
+consistent address index) and then checks every live entry against the payload
+tree, in path order, following each ancestor's recorded physical leaf: a
+directory must be a directory, a symlink or hardlink placeholder an empty
+regular file, and a regular file must have its recorded size and D59 content
+digest. Every mismatch is counted; the first eight are listed with their
+reason. It writes nothing: verify and restore load the journal with
+`sidecar_log_open_readonly_at()`, which neither repairs a tail nor removes a
+leftover rewrite, so a read-only mount works. Exit status is 0 only when everything matches
+(D68 splits the rest into 1 for differences and 2 for a backup it cannot
+check).
+Native containers and other journal versions are refused with the reason.
+
+**Why:** Before wiping the source machine, the only way to know a backup would
+restore was to restore it. The capture digest (D59) makes an independent,
+restore-free check possible; this command is that check.
+
+**Relationship:** Builds on D59. Native backups stay out of scope until they
+record digests of their own.
+
+## D61 — 2026-09-24 — `migr repair` rebuilds a damaged portable journal as a new backup
+
+**Status:** Implemented
+
+**Decision:** `migr repair <SOURCE> <PATH>` reads a finished portable
+container and never writes to it. `PATH` may be neither inside that
+container nor the folder holding it: since D72, the next backup to that folder
+would find two backups of the install and refuse to choose. It reserves a new
+container under `PATH`,
+replays the old journal into a fresh one through the state layer's append
+API, and handles damage in four ways:
+
+1. A record that does not parse starts a damaged region. Parsing resumes at
+   the next `CLAIM`, `ENTRY`, or `DELETE` record start after the last complete
+   boundary (the tag field follows a NUL), behind a copy of the header. The
+   open group, if any, is dropped with the region.
+2. A group the state layer refuses before writing (`INVALID_ARGUMENT` or
+   `CORRUPT`, for example a child whose parent's `CLAIM` was lost) is left out.
+   A refused record whose item is live at the end lost nothing and is not
+   reported. Any other status means the new log is no longer trustworthy and
+   the repair stops.
+3. A directory that is still only claimed at the end gets a synthesized
+   `ENTRY`: mode, ownership, times, and xattrs of the nearest live ancestor
+   directory (a root takes its payload directory's), and the collision suffix
+   that makes its recorded physical leaf authenticate. Its children stay
+   reachable.
+4. Any other item still only claimed is removed with a `DELETE`.
+
+The rebuilt journal must pass the restore address index. Every left-out and
+re-created path is reported (the first 20 of each list). If nothing was
+damaged, the reserved container is removed and the backup is reported intact.
+Otherwise the payload and the other top-level files are copied beside the new
+journal (`copy_file_range`, with a read/write fallback) after a free-space
+check, the filesystem is synced, and the container is published under a new
+finished name.
+
+**Why:** One damaged cluster in the journal makes a whole portable backup
+unrestorable, although its payload is intact. Recovering it by hand takes a
+splice, a record-by-record rebuild, and directory commits made by hand. This command is
+that procedure, with the manual guesses replaced by the rules above.
+
+**Relationship:** Complements D51 (read-back before publishing) and D52
+(rewriting a recovered prefix). Record checksums in the journal format remain
+future work; they would turn "damaged region" into exact record ranges.
+
+## D62 — 2026-09-26 — `backup` and `restore` run as root
+
+**Status:** Implemented
+
+**Decision:** The CLI refuses `backup` and `restore` without root, with the
+command to rerun under `sudo`. Their `--dry-run` previews, and `report`,
+`verify`, `repair`, and `conf`, keep running without root; a restore
+preview run that way notes that the real restore needs root. Under `sudo`,
+migr still acts for the invoking user (D38). The check lives in the CLI
+only: library entry points keep their own privilege checks (the restore
+preflight's "needs root" refusal). The integration suite links a build of
+the CLI compiled with `MIGR_ALLOW_UNPRIVILEGED`, which skips only this check,
+so it can drive both commands as an ordinary user. Phase 9 checks the real
+binary's refusal. The package install and `nmcli connection reload` commands that
+restore runs itself no longer carry a `sudo` prefix; hints printed for the
+user to run later keep theirs.
+
+**Why:** A non-root restore reached `sudo dnf install` and `sudo nmcli` only
+after it had copied everything, so an unattended run could stop at a password
+prompt hours in. Root is also what makes the rest of the live-environment
+design possible:
+- a btrfs snapshot of the source
+- reading files inside HOME owned by other uids (Podman's subuid-owned
+  storage)
+- restoring ownership and SELinux labels consistently
+
+Tools doing the same job (Timeshift, snapper, Migration Assistant, package
+managers) require administrator rights, and a distro hop always happens on
+one's own machine.
+
+**Relationship:** Supersedes D38's "ordinary backup and restore remain usable
+without root privileges"; D38's identity rules (acting for the sudo-invoking
+user) are unchanged.
+
+## D63 — 2026-09-26 — A backup completes when its source changes under it
+
+**Status:** Implemented
+
+**Decision:** Native and portable capture no longer stop when the source
+changes while it is read. Each change is one of three kinds:
+
+- **Changed:** A regular file whose metadata differs after a read is read
+  again: rewound, the payload truncated, up to three reads with a 50 ms,
+  100 ms pause between them. A file stable on a later read is captured
+  cleanly with nothing reported. One still changing after the third read is
+  kept as last read: its entry records that read's length with the
+  metadata from before it, so the file's newer times make the next update
+  read it again, and its D59 digest covers those bytes. Directories, symlinks, and hardlinks
+  whose metadata changed while captured are kept as read.
+- **Vanished:** An item removed after it was listed (the pre-scan for
+  portable, readdir for native) is left out and not marked visited, so a
+  resuming run removes its stale payload.
+- **Appeared** (portable only): An item created after the pre-scan planned
+  its folder's names is left out; it is never written under a name the
+  pre-scan did not plan.
+
+The native metadata preflight, which walks the source before capture,
+follows the same rule: an item gone by the time it is opened is left to
+capture, and one that changed is profiled as first seen, instead of
+refusing the whole backup.
+
+A different kind of object at the same path is left out. For a planned
+portable member, the membership check after its root reports it as vanished
+once. A read that returns fewer bytes than the file's size while its
+metadata stays unchanged is not a writer but a read anomaly, and still fails
+the capture with EIO.
+
+The capture report counts each kind and keeps the first eight source paths.
+Backup prints them after "Backup complete" and exits with status 1 when
+anything changed. Confirmed live state (D55, D56) is tolerated as before and
+only counted. A test build can make the next native source open fail
+(`backup_test_fail_next_source_open`), since removing a source no longer
+fails a capture.
+
+**Why:** A backup of a live system sees files change: another terminal
+commits to a repository, an editor saves. Stopping the whole backup for that
+left a partial to resume, which is not how archivers behave. GNU tar warns
+"file changed as we read it" and exits 1; rsync and restic continue. Most
+writes finish within milliseconds, so a reread usually captures the file
+cleanly.
+
+**Relationship:** Generalizes D55's tolerance from live state to every path.
+Part of the live-environment design. A btrfs snapshot of the source (later)
+removes most of these cases.
+
+## D64 — 2026-09-26 — Backups read btrfs sources from a read-only snapshot
+
+**Status:** Implemented
+
+**Decision:** Between the representation preflight and the end of capture, a
+live backup reads every source that lives on btrfs from a read-only snapshot.
+
+1. **Subvolume:** For each root, migr finds its subvolume by walking up to
+   inode 256.
+2. **Snapshot:** It creates a read-only snapshot inside the subvolume as
+   `.migr-snapshot-<pid>` (`BTRFS_IOC_SNAP_CREATE_V2`). A snapshot with that
+   prefix whose process is gone is deleted first.
+3. **Snapshot view:** Instead of rewriting any path, the capturing thread
+   enters a mount namespace of its own (`unshare(CLONE_NEWNS)`, then a
+   recursive private `/`) and bind-mounts each snapshot over its subvolume's
+   path. Every absolute source path then reads one point in time. Selection
+   matching, manifest source paths, live-state paths, and the progress
+   thread need no change; the progress thread stays in the original
+   namespace.
+4. **Nested content:** Nested subvolumes appear as empty directories in a
+   snapshot, and a bind hides the mounts below its path. Both are mounted
+   back from the live tree, recursively:
+   - nested subvolumes come from `BTRFS_IOC_GET_SUBVOL_ROOTREF` and
+     `BTRFS_IOC_INO_LOOKUP_USER`
+   - mounts come from `/proc/self/mountinfo`
+5. **Bind sources:** They are opened only after entering the namespace; a
+   bind source must belong to the caller's namespace.
+6. **End of capture:** migr returns to the original namespace (`setns`) and
+   deletes the snapshots, before packages and the VS Code list are
+   collected, and on every failure path.
+
+It needs root, which D62 guarantees. These are left live:
+- a subvolume mounted at `/`
+- a subvolume that holds the backup destination, so no write ever meets the
+  read-only view
+- dry runs
+
+Any failure to snapshot, list, or mount leaves every source live, with a
+one-line note. D63 still applies to live sources.
+
+**Why:** A backup that reads one point in time has nothing to reread,
+report, or leave out. Fedora installs on btrfs with `/home` as a subvolume,
+so the common case needs no filesystem change. Rewriting capture paths
+instead would have touched every place a source path is used: native
+selection matching compares absolute paths, and manifests must record the
+real ones. The namespace keeps all of them as they are.
+
+**Relationship:** Complements D63. Verified as root: test.sh's btrfs phase
+(loop image, a writer rewriting a file nonstop, a nested subvolume), and a
+real `sudo migr backup --critical` of a btrfs `/home` in a VM.
+
+## D65 — 2026-09-26 — Restore fills live desktop state but does not fight it
+
+**Status:** Implemented; limited to a running session by D100
+
+**Decision:** A regular file on the confirmed live-state list (D44, D48,
+D55, D56) is restored only when nothing is at its destination. If a running
+service has already written it, replay leaves it as it is, counts it in
+`live_state_kept_count`, and the summary says how many were left in place.
+It stays out of content verification, as before.
+
+**Why:** Even a restore right after a fresh install runs inside a desktop
+session: GNOME Software, the file indexer, gvfs, and Ptyxis' Podman queries
+start at login and write this state at once. Overwriting their files only
+lost to the next write, or broke the service's view of its own state. The
+state is regenerable, so the service's current version is the right one to
+keep. Missing files are still filled in.
+
+**Relationship:** Part of the live-environment design. Not backing this
+state up at all belongs to the backup-scope overhaul. D80 narrows it for the dconf
+database; D100 limits it to a running session.
+
+## D66 — 2026-09-26 — A portable restore restores open applications' settings last
+
+**Status:** Implemented
+
+**Decision:** `restore_writer_apps` gives each known writer application the
+path below HOME it owns (VS Code `.config/Code`, Firefox
+`.mozilla/firefox`, the Chromium family's `.config/<browser>`; none for GNOME
+Software).
+
+- **Detection:** When a portable restore starts, the applications of the
+  target user that are running have their paths passed in the request as
+  deferred paths.
+- **Replay:** It marks as deferred every regular file and symlink below one
+  of them (home-relative roots only), and every hardlink whose own name or
+  representative is there, so a link never precedes its target. Directories
+  are prepared as usual. Deferred items are skipped by the first two passes.
+- **The decision:** Once everything else is restored, replay calls
+  `before_deferred` once, then applies the deferred items or marks them
+  skipped. Skipped items are counted in `deferred_skipped_count` and left
+  out of verification. Directory metadata is finalized afterwards, as
+  always.
+- **Asking:** The CLI's `before_deferred` retires the progress line. If none
+  of the deferred applications is still open, it restores silently.
+  Otherwise it asks once:
+  - Enter checks again
+  - `s` leaves the settings out, and the summary tells the user to rerun the
+    restore after closing them
+  - `c` restores them anyway
+  - end of input (nobody to answer) restores them with a note that the
+    application may overwrite them on closing
+- **Before the confirmation prompt:** The warning says these settings are
+  restored last.
+
+A native restore printed only the plain warning before its prompt and did
+not defer, until D69.
+
+**Why:** An application that saves its state on exit overwrites restored
+settings after migr has finished, where no verification can see it; VS Code
+is one such application. Asking at the start would stall
+an unattended run for its whole length. At the end nothing else is left to
+do, so waiting costs nothing, and the application has had the whole restore
+to be closed.
+
+**Relationship:** Part of the live-environment design. D69 gives native
+restore the same behavior. Flatpak applications (`~/.var/app/<id>`,
+detectable with `flatpak ps`, once that scope is captured at all) are open.
+
+## D67 — 2026-09-26 — Verification tells later writes apart from corruption
+
+**Status:** Implemented
+
+**Decision:** Right after replay's last metadata step on a regular file (its
+times), it records the file's device, inode, size, and mtime. When
+verification then finds different content, or no file, the item is
+"changed afterwards" instead of a failure if:
+- it was removed, or
+- it is still a regular file whose inode, size, or mtime differs from the
+  recorded one.
+
+Replay set mtime to the backup's value; a program that writes the file sets
+it to now or changes its size, while corruption below the filesystem does
+neither. A different kind of object in its place (a planted symlink) and a
+damaged backup copy (D59) stay failures.
+
+Changed items are counted in `verification_changed_count`, listed after
+verification (the first eight), and mentioned in the final summary. The
+restore completes, and exits 1, as a backup does when its source changed
+(D63). Hardlink creation, which changes a representative's ctime, does not
+matter: ctime is not compared.
+
+**Why:** A running desktop writes some restored files right after replay
+wrote them. D53 reported those as "content differs from the backup", the same
+words as real corruption, so a routine later write read like damage.
+
+**Relationship:** Refines D53. Part of the live-environment design.
+
+## D68 — 2026-09-27 — Exit status 1 means "completed with changes", 2 means failure
+
+**Status:** Implemented
+
+**Decision:** Every command exits with one of three statuses, as GNU tar
+does:
+- 0: completed as asked, or cancelled at the confirmation.
+- 1: completed, but something changed or differs, and the run lists it:
+  - a backup whose source changed while being read (D63),
+  - a restore whose items another program changed afterwards (D67),
+  - `verify` finding items that differ from their capture (D59), as cmp and
+    diff exit 1 on a difference.
+- 2: failed or refused, including a wrong command line, a failed optional
+  restore step (packages, network), and a restore verification failure.
+
+`backup()`, `backup_selection()`, `restore_with_options()`, and
+`verify_backup()` return these statuses (`MIGR_EXIT_OK`,
+`MIGR_EXIT_CHANGED`, `MIGR_EXIT_FAILURE` in `utils.h`); `main` maps the
+other commands' success and failure to 0 and 2.
+
+**Why:** D63 and D67 made 1 mean "completed, but look at the list", while
+failures also exited 1, so a script could not tell a finished backup from a
+failed one. tar, which D63 already followed for status 1, uses 2 for
+failure.
+
+**Relationship:** Refines D59, D63, and D67.
+
+## D69 — 2026-09-27 — A native restore restores open applications' settings last too
+
+**Status:** Implemented
+
+**Decision:** A native restore (v1 and legacy layouts) defers the same
+paths as a portable one (D66), with the same warning, the same question at
+the end, and the same answers. The native walker restores whole trees, so
+deferral works on items below HOME:
+- **An item inside such settings** (a root such as
+  `.config/google-chrome`) waits whole.
+- **Settings inside an item** (`.config/Code` inside the `.config` root) are
+  left out of that item's apply pass. `CloneContext.skipped_paths` names
+  them by payload path; the validate pass still covers them.
+- **At the end:** Once every item is restored, the CLI asks as in D66. Each
+  held-back part is then restored as an item of its own; a whole item is
+  counted then. `s` leaves them out, and the summary names their paths.
+- **The folder above:** Restoring a part late creates it inside a folder
+  whose times were already applied. That folder's times are read before and
+  put back after, as if the part had been restored in its turn.
+
+XDG roots and dry runs do not defer.
+
+**Why:** The two representations must behave alike. A native restore named
+open applications but restored their settings in place, where the
+application overwrote them on closing.
+
+**Relationship:** Extends D66 to native restore.
+
+## D70 — 2026-09-27 — A sudo backup belongs to the user who ran sudo
+
+**Status:** Implemented
+
+**Decision:** When a native backup runs through sudo (D62), migr hands its
+own entries to the invoking user (`SUDO_UID`, resolved as in D38), both when
+the run succeeds and when it stops after creating the container:
+- the destination folder, if migr created it,
+- the container,
+- `data/`,
+- the regular files at the container's top (manifest, journal, package
+  lists, the bundled migr).
+
+Payload entries keep the owners they were captured with, which native
+restore depends on. `network/` stays root's, since it can hold Wi-Fi
+secrets. A portable backup changes nothing: FAT and exFAT take owners from
+the mount. A failed handover is a warning, not a failure.
+
+The manifest's source identity (D15) names the invoker too: its source uid
+is `SUDO_UID` under sudo. It had recorded root, so every sudo backup looked
+like root's.
+
+**Why:** Under sudo everything migr wrote belonged to root. The user could
+not delete their own backup, and a restore preview without sudo (which D62
+keeps root-free) stopped at the no-atime open of the root-owned `data/`.
+Restore itself is unaffected: it runs as root and takes owners from the
+payload, not from the container.
+
+**Relationship:** Follows D62. Uses D38's invoker identity.
+
+## D71 — 2026-09-27 — A backup is named after its user
+
+**Status:** Implemented
+
+**Decision:** A container is named `migr-<user>`, for the user a run acts
+for (`SUDO_USER` under sudo, otherwise `USER` or `LOGNAME`), and
+`migr-<user>.partial` while it is created. When that name is taken, the next
+candidates are `migr-<user>-YYYY-MM-DD`, with the local date of the run, then
+the same with `-2`, `-3`, and so on. Characters outside `[A-Za-z0-9._-]`
+become `_`, a leading dot too, and the user part is cut to 32 characters.
+- Reservation keeps D15's claim, lock, and recheck protocol; only the
+  candidate names change.
+- Adoption scans only the reserving user's names, parsed exactly, so another
+  user's names (including one that merely starts the same) are never
+  candidates.
+- `container_name_is_partial()` and `container_name_is_final()` check the
+  shape only (`migr-` and name characters, with or without `.partial`),
+  since restore and verify do not know the owner.
+- Which backup is whose is decided by the manifest's source identity (D15),
+  never by the name.
+
+**Why:** A timestamped name made every run a new backup. One backup per user
+and machine, updated in place, needs a stable name. A date suffix tells an
+older install's backup apart where a hostname cannot: a reinstall often
+gets the same hostname again.
+
+**Relationship:** Replaces D15's `migr_backup_YYYYMMDD_HHMMSS[-N]` naming;
+D15's claim, lock, adoption, and publication rules stay. Existing backups in
+the old naming are not migrated (pre-release).
+
+## D72 — 2026-09-27 — A backup is updated in place
+
+**Status:** Implemented; extended by D88 (another install's backup, and
+portable metadata-only changes)
+
+**Decision:** A backup run takes over this install's existing backup under
+PATH instead of creating another one.
+- **Which backup:** `container_adopt_fd()` scans the user's names (D71),
+  finished and in progress, and matches by install identity
+  (`manifest_install_identity_equal()`): machine-id, source uid (the sudo
+  invoker since D70), representation, and journal version. Scope, roots,
+  exclusions, and bundled extras may differ. More than one match is refused
+  as ambiguous, as before.
+- **Finished backups:** A finished match is renamed to `<name>.updating`
+  (`renameat2` with `RENAME_NOREPLACE`) while its lock is held, and checked to
+  be the locked directory. `.updating` names count as taken for reservation
+  and as in progress for restore and verify. Finalizing renames it back. A run
+  that stops before changing anything renames it back at once
+  (`container_restore_finished_name()`), and so does an interrupt (SIGINT,
+  SIGTERM, SIGHUP) in that time: the metadata preflight of a native backup
+  can take minutes (`container_guard_finished_name()`).
+- **Changed selection:** Right after adoption, roots of the old manifest
+  with no identical root in the new one (`manifest_root_equal()`) are
+  removed: in a portable backup their journal records (live and claimed) get
+  DELETE records, fsynced, then their payload trees are removed. Only then is
+  the new manifest written, so an interrupted run leaves them listed for the
+  next one to finish.
+- **The rest:** Capture runs as a resume does: unchanged files are skipped,
+  changed ones recopied, and reconcile removes what left the source or the
+  selection. The manifest is now written through `manifest.txt.new`, fsync,
+  and rename, and records `UPDATED=<seconds>` for when the run started; verify
+  and restore print it.
+
+- **Speed:** When the adopted backup was finished, its payload matched its
+  journal, and capture checks the payload of every item it keeps
+  (`existing_payload_matches()`) or copies it again. The final payload
+  inventory then checks each root only at its top
+  (`PortableCaptureRequest.payload_matches_journal`); the item-by-item walk,
+  which finds payload nodes the journal does not know, still runs for a
+  fresh capture and for a resumed interrupted run. For 187,000 files on a
+  vfat loop, an unchanged update took 9.0 s with the walk and 3.9 s without,
+  10 changed files 3.8 s, against 23 to 31 s for a fresh backup; on ext4
+  (native) an update took 2.4 s against 10 to 13 s.
+
+**Why:** Each run used to create a new timestamped backup, so keeping a
+backup current cost a full copy and left old ones to delete by hand. Most of
+the mechanism (resume, reconcile, the journal) already existed.
+
+**Relationship:** Builds on D15's resume and D25's claims; uses D71's names.
+Explicit-path roots are numbered in sorted path order, so adding a path can
+renumber, and thus recopy, the others.
+
+## D73 — 2026-09-27 — An updated journal is rewritten once dead records outweigh live ones
+
+**Status:** Implemented
+
+**Decision:** After a successful portable capture, `sidecar_compact_at()`
+reopens the journal and serializes each live item as a rewrite would. When
+the file is over twice that size (dead records, from deletions, replaced
+groups, and consumed claims, take more bytes than live ones), it writes a new
+journal beside the slot (`sidecar.migr.rewrite`): the header, then per live
+item its CLAIM and ENTRY group, since every group commits against a claim
+(D25). Items go out by depth, then in append order, so every parent is live
+before its children; the map itself is in hash order. The file is synced and
+renamed over the slot (D52's pattern), and the directory synced. A journal
+with claims pending is left as it is. A failure is a warning: the old
+journal is complete. The D51 readback then checks the file that is published.
+
+**Why:** Every update appends, so a backup updated many times would carry its
+whole history. Rewriting on every update would cost more than a small update
+itself.
+
+**Measured:** 187,000 items on a vfat loop: a full-change update grew the
+journal from 32.3 MB to 70.8 MB, and the rewrite brought it back to 32.3 MB
+in about 1.7 s, reading included, of a 38 s update; verify and a restore dry
+run passed on the result. Writing record by record took 12 s on vfat, so
+groups are serialized into 1 MiB writes. The check itself reads the journal
+once more: an unchanged update takes 4.3 s instead of 3.9 s.
+
+**Relationship:** Part of D72. Uses D52's rewrite-then-rename.
+
+## D74 — 2026-09-27 — Restore adds the user back to their groups
+
+**Status:** Implemented; a missing administrators' group is no longer listed
+(2026-10-04)
+
+**Decision:** Every scope but explicit paths records the user's
+supplementary groups by name in `groups.txt` at the container root, as it
+records `packages.txt`. They are the groups whose member list in
+`/etc/group` names the user, read without NSS as D38 reads accounts; the
+user is the sudo invoker under sudo (D70). Restore, after packages, adds the
+user it targets to every recorded group the system has and does not list
+them in yet, with one `usermod -a -G`, and lists the recorded groups the
+system lacks. It never creates a group: a missing one comes with software
+that is not installed yet, and a group made in advance would not get the
+system GID its package gives it. Admin groups are not special: `wheel` is
+added back where it exists and listed where it does not (Ubuntu names it
+`sudo`); migr does not translate between them, because that decides who
+administers the system.
+
+**Why:** Supplementary groups live in `/etc/group`, which no scope captures,
+so a new install leaves the user only in the groups its installer assigns.
+What depended on the others stops working quietly: without `libvirt`, for
+example, virt-manager asks for a password for `qemu:///system`.
+
+**Relationship:** Follows D62 (restore runs as root) and D38.
+
+**Revision (2026-10-04):** A recorded administrators' group (`wheel`, `sudo`,
+`admin`) the system lacks is no longer listed. The list tells the user to
+install the software that brings a missing group, and no software brings
+another distribution's administrators' group; the user restore targets runs
+it under sudo and is in this system's own. Where the group exists, the user
+is still added to it, and migr still does not translate between them.
+
+## D75 — 2026-09-27 — Flatpak applications' data is backed up without their caches
+
+**Status:** Implemented
+
+**Decision:** `~/.var/app` is a built-in root in every scope
+(`BUILTIN_FLATPAK_APPS`), where each Flatpak application keeps its
+settings and data. At planning time, `<app-id>/cache` is excluded for each
+application found there, the way D57 excludes an empty user installation.
+Everything else under an application's directory is kept: Signal keeps its
+message database under `config/`.
+
+At restore, a Flatpak application that is running is recognized by its
+systemd scope, `app-flatpak-<app-id>-<n>.scope` in `/proc/<pid>/cgroup`,
+and its `~/.var/app/<app-id>` is treated as the settings of an open
+application (D66, D69): restored last, with the same question. It is named
+by its app id.
+
+**Why:** Per-app settings of Flatpak applications (Spotify's preferences)
+were in no scope. Their caches can be large (Spotify's was 565 MB, about 10
+GB on an older install) and are rebuilt by the applications.
+
+**Relationship:** Extends D66 and D69 to Flatpak applications. Reinstalling
+the applications themselves is separate.
+
+## D76 — 2026-09-27 — Restore reinstalls system-wide Flatpak applications
+
+**Status:** Implemented; restore adds flathub itself since D102
+
+**Decision:** Every scope but explicit paths records the system Flatpak
+installation's applications in `flatpak-apps.txt` at the container root,
+the output of `flatpak list --system --app --columns=origin,application`
+(`<remote>\t<app-id>` per line). Restore, after packages (which may bring
+Flatpak itself) and before groups, skips the ones already installed and
+installs the rest with one `flatpak install --system -y <remote> <ids>` per
+remote the system has, then counts what is installed. Apps whose remote the
+system lacks are listed with the command to run once it is added: migr does
+not add remotes, since that needs the remote's signing key, which the
+backup does not have. A system without Flatpak gets the apps listed. A user
+installation needs no list: it is captured as files (D57).
+
+**Why:** Fedora installs Flatpaks system-wide, and `packages.txt` lists only
+the distribution's packages, so every Flatpak application was lost in a
+distro hop, and the data D75 restores had no application to use it.
+
+**Relationship:** Complements D75. Snap is not covered yet.
+
+## D77 — 2026-09-27 — VS Code extensions are backed up as files
+
+**Status:** Implemented
+
+**Decision:** `~/.vscode` and `~/.vscode-oss` (VSCodium) are built-in roots
+in every scope (`BUILTIN_DOT_VSCODE`, `BUILTIN_DOT_VSCODE_OSS`). Each holds
+the installed extensions, one directory per extension plus the editor's
+`extensions.json`, so a restore brings them back installed. While VS Code or
+VSCodium runs, these directories count as its settings (D66, D69) and are
+restored last, since the editor updates extensions on its own; the table of
+running applications lists one entry per path an application owns.
+`vs-code-extensions.txt` is still written: some extensions carry native
+binaries for one architecture (`linux-x64`), and the list is how a machine
+with another one reinstalls them.
+
+**Why:** Only the extension list was kept, and restore did not act on it, so
+every extension had to be reinstalled by hand.
+
+**Relationship:** Extends D66 and D69. A Flatpak VS Code keeps its
+extensions under `~/.var/app` (D75).
+
+## D78 — 2026-09-27 — Restore ends with what is left to do by hand
+
+**Status:** Implemented; package names are listed only in the copy next to
+the backup (2026-10-04)
+
+**Decision:** The restore steps that re-create system state (packages,
+Flatpak applications, groups) write what they could not do into one list,
+each part with the command to run: packages the system could not install,
+Flatpak applications that did not install or whose remote it lacks, and
+groups it does not have. Restore ends with that list under "What's left for
+you" and writes the same text next to the backup, as `<backup>-todo.txt` in
+the folder holding it (`migr-vii7-todo.txt` beside `migr-vii7/`). It goes
+there, not into the backup, which restore never changes, and not into
+HOME, so the new system holds only what was restored; the drive is what
+the user carries. A restore with nothing left removes an earlier list; a
+dry run writes none; an unwritable drive is a warning. The file belongs to
+the sudo invoker where the filesystem records owners.
+
+`$HOME/skipped-packages.txt` (D1) is gone: restore wrote it as root into
+the new home, and it covered packages only.
+
+**Why:** Some steps are left to the user: packages from third-party
+repositories, and, since D74 and D76, groups and Flatpak remotes the new
+system lacks.
+
+**Relationship:** Supersedes D1's file; keeps D40's final-state accounting.
+
+**Revision (2026-10-04):** The packages come last, after the steps, one name
+per line. The screen gives only their number and says the copy next to the
+backup names them; a copy that could not be written leaves the names on the
+screen. A restore from another distribution leaves hundreds of names that
+have no package of that name here, and listed in full they pushed the steps
+the user has to take off the screen.
+
+## D79 — 2026-09-27 — A backup or restore keeps a log only when it has something to say
+
+**Status:** Implemented
+
+**Decision:** `backup` and `restore` (not dry runs) log the run. At the
+start, `stdout` and `stderr` are replaced by `fopencookie()` streams that
+write to the terminal as before and to the log: fds 1 and 2 stay the
+terminal, so `isatty()`, colors, and the progress line are unchanged, and
+the log gets the text without ANSI sequences and a `\r`-redrawn line only
+as last drawn. The terminal checks use `isatty(STDOUT_FILENO)`, since a
+cookie stream has no fd. `run_log_printf()` writes to the log only: every
+source change during a backup (D63), and every restored item counted
+rather than listed (left as a running service wrote it, left as the
+destination had it, left out because its application stayed open,
+changed afterwards). Child processes (dnf, flatpak) write to the terminal
+directly and are not in the log.
+
+The log is held in a memfd until the run knows where it goes:
+- **Backup:** `logs/backup-YYYY-MM-DD-HHMMSS.log` in the container, owned
+  like migr's other entries (D70). The source system is usually reinstalled
+  next, so a log left on it would be gone when it is needed.
+- **Restore:** `~/.local/state/migr/restore-YYYY-MM-DD-HHMMSS.log`, owned by
+  the user; XDG puts logs in the state directory.
+
+A run that ends with status 1 or 2 (D68) keeps its log and names it last;
+one that ends with 0 removes it and the directories it created for it, and
+puts back the times their parent had just before, which a restore has set.
+A run killed midway keeps what it wrote. The newest 10 logs in each place
+are kept; directories are created 0700 and the log 0600.
+
+**Why:** A run left no record beyond scrollback, and the terminal shows
+only examples of long lists. migr runs once per distro hop, so a log of a
+run that went as asked would only be clutter on the new system.
+
+**Relationship:** Uses D68's exit statuses. Restore's list of what is left
+to do by hand (D78) goes next to the backup whatever the status.
+
+**Revision (2026-10-12):** The log mirrors the terminal, so it can say no
+more about a failure than the message does. Every error and warning names
+the item it concerns, what was being done to it, and the cause: errno's
+text, a command's exit status, or a fixed reason when neither applies. A
+refusal whose wording already says why (a malformed manifest, a name
+collision) needs nothing more. The terminal gets one line,
+`Error: could not <verb> <item>: <step>: <cause>`, naming a backup's item
+by its source path and a restore's by its path on this system, with the
+home folder as `~`. The log also gets errno's name and number, and for a backup the
+item's place in the container, for a restore its copy in the backup and
+the counts so far. A failure deep in a walk is recorded where it happens,
+before any cleanup can change errno, and only the first one is kept.
+
+## D80 — 2026-09-27 — An existing dconf database is kept only for a session load
+
+**Status:** Implemented
+
+**Decision:** Replay leaves an existing `~/.config/dconf/user` in place
+(D65) only when restore will load the backup's settings into a running
+session right after it (D50): the target user has a session bus and dconf
+is installed. Otherwise replay writes the backed-up database like any other
+file. Restore asks before replay and passes the answer in the request
+(`dconf_loads_into_session`).
+
+**Why:** The dconf database is the user's settings, not state a service
+regenerates. With no session, nothing loaded the backup's settings and
+nothing said so, although a restore from a text console is what the dconf
+failure message recommends.
+
+**Relationship:** Narrows D65 for one file; D50's load is unchanged.
+
+## D81 — 2026-09-27 — Restore asks one plain question and previews in the user's terms
+
+**Status:** Implemented; extended by D89 (a line before the question of a
+restore started on the desktop)
+
+**Decision:** Native and portable restore confirm with the same question,
+"This will restore files to your home directory. Continue?". It no longer
+folds in D20 E-11's count of items carrying `security.*` attributes, and
+dry runs no longer print that count. An attribute the destination refuses
+is still skipped as E-11 describes and counted in the final summary. The
+preflight's owner and mode detail (`Metadata preflight: …` with its
+examples) is printed only with `-v`, and restore previews name each root
+by where it goes (`~/.bashrc`, `Documents`) instead of by its manifest id.
+
+**Why:** E-11's warning was written for unprivileged restores. Since D62
+restore runs as root, and a backup from Fedora labels nearly every item, so
+every restore from Fedora asked about a refusal that is rare and that the
+summary reports when it happens. The profile detail and the manifest ids
+describe the implementation, not the user's files.
+
+**Relationship:** Replaces the preflight warning of D20 E-11; its apply-time
+tolerance and summary count are unchanged.
+
+## D82 — 2026-09-28 — Payload folders carry names the user can read
+
+**Status:** Implemented
+
+**Decision:** A root's payload folder under `data/` is named for the user, not
+by its manifest id. The id stays the manifest key restore maps by; only
+`payload_path` changes.
+- **Own folders at the top:** a root whose path (relative to HOME inside it,
+  absolute outside it) has no component starting with `.` keeps the last
+  component of its source path as it is on disk: `Belgeler`, `Projects`,
+  `notes.txt`.
+- **Everything else in `settings/`:** a built-in root takes its name from a
+  column of `builtin_home_catalog` (`ssh`, `config`, `local-share`,
+  `firefox`, ...). Any other root drops each component's leading dots, turns
+  `/` and `_` into `-`, and lowercases ASCII (`.config/Code` becomes
+  `config-code`).
+- **Names every destination accepts:** root payload paths bypass D19's
+  encoding, so control characters and `"*:<>?\|` become `-` and a trailing
+  dot or space is dropped. A name that is not UTF-8, is left empty, or is too
+  long for a suffix falls back to the id.
+- **Collisions:** in plan order, a name already taken, compared without ASCII
+  case, gets `-2`, `-3`, and so on. A top-level folder never takes `settings`.
+  Other case pairs are left to the portable prescan (D21), which measures them
+  on the drive.
+- **Two components:** native capture and stale reconciliation now walk a
+  payload path to its parent without following symlinks, and create
+  `settings/` when needed; portable capture creates it the same way.
+
+**Why:** The ids (`XDG_DOCUMENTS_DIR`, `BUILTIN_DOT_SSH`) describe migr's
+catalog. Someone opening a backup without migr, which D15 keeps possible for
+native backups, looks for `Documents`.
+
+**Relationship:** Replaces D16's `data/EXPLICIT_n` and the plan's
+`payload_path == id` rule. A backup made before this is updated in place
+through D72: each root whose payload path changed is left out and captured
+again, so its first update copies everything once more.
+
+## D83 — 2026-09-28 — Restore sets the saved crypto policy
+
+**Status:** Implemented
+
+**Decision:** When a restore writes network configuration and the backup's
+`network/crypto-policy` differs from the target's, restore runs
+`update-crypto-policies --set <policy>` and says what it changed, that
+services pick it up when they start, and the command that undoes it. A dry
+run says it would set it. A target without `/etc/crypto-policies/config`
+has nothing to set. A failure is a warning with the command to run, like a
+failed `nmcli connection reload` (D54), and does not change the exit
+status.
+
+**Why:** The policy is recorded only with `--include-network-config`, which
+asks for the saved connections to work on the new system. Some need a policy
+other than the default, such as 802.1X networks that still use TLS 1.0 and
+SHA-1 (`DEFAULT:SHA1`); as a suggestion, those connections kept failing
+until the command was found and run. The change is system-wide, so it is
+reported together with the command that undoes it.
+
+**Relationship:** Replaces D58's suggestion; D58's capture is unchanged.
+
+**Revision (2026-10-14):** After the policy is set, restore runs
+`systemctl try-restart wpa_supplicant.service`. wpa_supplicant reads the
+policy when it starts, so a saved 802.1X network that needs the new policy
+could not authenticate until the next boot, and the wait for a network (D90)
+took another saved network instead. NetworkManager finds the restarted supplicant again
+on D-Bus; `try-restart` starts nothing that was not running. A failed restart
+is a warning, and the network connects after the reboot the message already
+asks for.
+
+## D84 — 2026-09-29 — A backup read live captures open applications' settings last
+
+**Status:** Implemented
+
+**Decision:** Once the snapshot has begun (D64), a backup looks up the
+invoking user's running applications with the table restore uses (D66),
+now shared in `writer_apps.c`. A root is deferred when it holds, or lies
+inside, a path one of them owns and that path is read live: it exists and
+is not on a read-only btrfs subvolume (`source_snapshot_covers()`). VS
+Code's `.config/Code` defers the whole `.config` root.
+- **Up front:** The backup names the applications and the roots that wait.
+- **Order:** Native `capture_roots()` and the portable capture loop take
+  every other root first. The portable request carries the deferred flags
+  and a `before_deferred` callback, as `PortableRestoreRequest` does.
+- **Asking:** Before the first deferred root, the backup checks again. If
+  none of the applications is still running, it continues. Otherwise it
+  stops the progress line and asks: Enter checks again, `c` captures the
+  roots as they are. At end of input it captures them, and a note after
+  capture names the applications that were open.
+- **Not deferred:** roots read from a snapshot, dry runs, and applications
+  started after capture began, which D63 covers. A backup that already
+  failed does not ask.
+
+The exit status is unchanged: waiting is not a change.
+
+**Why:** A snapshot captures an application's files at one moment, as a
+power loss would leave them, which applications are built to survive. A
+source read live has no such moment. D63's reread keeps each file whole but
+not files that belong together: a browser's `places.sqlite` and
+`places.sqlite-wal` read minutes apart may not match. Whole roots wait
+because both capture paths reconcile a root against its previous copy, so a
+subtree left out of its root would read as deleted; moving roots only
+changes the loop order. There is no "skip": a backup without `.config` loses
+more than it protects, while a restore that skips still has the backup.
+
+**Relationship:** Applies D66's question to backups of live sources.
+Complements D63 and D64.
+
+## D85 — 2026-09-29 — Restore gives the backup user's items to the restoring user
+
+**Status:** Implemented; extended by D93 (the user's subordinate IDs)
+
+**Decision:** Restore gives every item the backup's user owned to the user it
+acts for: the sudo invoker (D38), otherwise the caller.
+- **Who the backup's user is:** the manifest's `SOURCE_UID` (D15), and a new
+  `SOURCE_GID` after it, the user's primary group. Backups record both;
+  `SOURCE_GID` is optional when read, so a manifest without it still
+  restores, with only the uid mapped.
+- **Where:** One `OwnerMap`, built by restore from the manifest, is applied
+  wherever restore decides an owner: native `apply_fd_metadata_tail()`, the
+  symlink and FIFO paths, portable replay's desired stat
+  (`replay_desired_stat()`), and both metadata-profile preflights, so the
+  privilege check and the chown probe see the owners actually written.
+  Change detection on the payload still compares the payload's own
+  metadata.
+- **Other owners:** Items the backup's user did not own keep their recorded
+  owner: files made with `sudo` in HOME stay root's, and rootless Podman's
+  subordinate ids stay as they were.
+
+**Why:** A new system may give the same person another uid, or another name
+and uid. Restoring numeric owners as recorded left the new user's own
+folders owned by an id that is not theirs: `.local/share` at 0700 became
+unreadable to them, and GNOME Files marked the folders read-only.
+
+**Relationship:** Supersedes D17's "UID remapping and current-user
+normalization are not performed" for the backup's own user; D17's metadata
+contract is otherwise unchanged.
+
+## D86 — 2026-09-29 — Every backup records its source HOME; native restore rewrites it too
+
+**Status:** Implemented
+
+**Decision:** D41 and D47 apply to every backup and both representations.
+- **Manifest:** VERSION=1 manifests carry `SOURCE_HOME` too, after the
+  source identity and before `ROOT_COUNT`, as VERSION=2 ones do.
+  `manifest_set_source_home()` records it only when it is a normalized
+  absolute path. A manifest without it still reads, and restores without
+  rewriting, as before. `manifest_root_source_path()` needs only
+  `SOURCE_HOME`, not VERSION=2: a VERSION=1 HOME-relative root's source is
+  relative to it, and XDG and external roots are absolute.
+- **Portable:** replay's rewrite table, known-file matching, and source paths
+  no longer require VERSION=2, so a VERSION=1 backup with `SOURCE_HOME` also
+  gets D47's kept `user-dirs.dirs` and D50's dconf session load.
+- **Native:** the destination's `.config/user-dirs.dirs` is left out of the
+  walk, as D69 leaves out deferred parts, and never restored. Once every item
+  is restored, `restore_native_rewrite_home()` rewrites the two known files
+  in place (`home_rewrite_file_at()`): through the same descriptor, so they
+  keep their inode, owner, mode, and extended attributes, with their times
+  put back. The rewrite table's XDG destinations come from the restore's
+  target map, resolved before anything was written.
+- **Shared code:** the rewrite table and the streaming copy moved from
+  portable replay to `home_rewrite.c`.
+
+**Why:** VERSION=2 is written only when `migr.conf` excludes something or
+nests roots, so an ordinary backup never recorded its HOME, and D41 and D47
+never ran for it: after a restore under another user name, GTK bookmarks
+pointed at the old, missing home and GNOME Files showed them as broken.
+Native restore had no rewrite at all.
+
+**Relationship:** Extends D41 and D47; completes D50 for VERSION=1 portable
+backups.
+
+## D87 — 2026-09-29 — The login keyring needs the same password; migr says so and asks nothing
+
+**Status:** Implemented; the restore note changed by D89 on a text console
+
+**Decision:** migr states what the login keyring
+(`~/.local/share/keyrings/login.keyring`) needs and never asks for
+confirmation about it.
+- **Backup:** When the selection backs the keyring up, the run ends by telling
+  the user to give their user the same password on the new system, and what a
+  different one costs. An explicit-path backup has no selection and gets no
+  note, as with D35.
+- **Restore:** When the keyring is a different file after the restore than
+  before it (another inode or a changed ctime), "What's left for you" says to
+  log out and back in before signing in anywhere, and that with a different
+  password the first application that needs the keyring asks for the old one
+  once. A dry run changes nothing and gets no note.
+
+**Why:** The login keyring is encrypted with the login password, and GNOME
+opens it at login with the password typed there.
+- **The restoring session:** The running keyring daemon keeps the replaced
+  keyring in memory. Its next write rereads the restored file, finds it
+  locked, and fails without a prompt, so a password saved before the next
+  login is lost.
+- **The next login:** With another password the keyring stays locked. The
+  first application that asks for a secret gets GNOME's prompt; once the old
+  password is typed there, GNOME re-encrypts the keyring with the login
+  password, and later logins open it on their own. Without the old password
+  its contents cannot be read, among them the cookies and saved passwords of
+  Chromium-based browsers.
+
+migr cannot re-encrypt the keyring without both passwords, and it does not ask
+for passwords. Unlike D35, where declining leaves the history out, no answer
+to a confirmation would change what migr does, so the requirement is stated
+instead.
+
+**Relationship:** KDE's KWallet opens with the login password the same way and
+is not covered.
+
+## D88 — 2026-09-30 — One backup can be updated across installs
+
+**Status:** Implemented
+
+**Decision:** A backup another install took can be updated from this one,
+with the user's consent, and a portable update no longer copies a file whose
+metadata alone changed.
+- **Candidates:** `container_survey_fd()` counts the user's backups under
+  PATH (D71) as adoption sees them: those of this install, and finished ones
+  of another install (another machine-id or source uid) with the same
+  representation and journal version. Backups in progress and backups locked
+  by a live process are never candidates.
+- **The question:** When no backup is this install's and exactly one other
+  is a candidate, backup asks, with no as the default, whether to update it;
+  its name and when it was last taken are shown, and that files not on this
+  system will be removed from it. The question comes right after the
+  destination probe settles the representation, before the snapshot and the
+  pre-scan, so nothing is read or written first. No, or end of input, keeps
+  the earlier behavior: a new backup next to it. With more than one
+  candidate there is no question.
+- **Adoption:** `container_adopt_other_fd()` adopts as `container_adopt_fd()`
+  does, also taking the finished backup of that name when it is in the same
+  format. The run then writes its own manifest into it, as D72 does, so the
+  backup is this install's from then on and later updates match without a
+  question.
+- **Metadata-only changes (portable):** When a regular file's live record
+  differs from it but the content signals match (address, collision suffix,
+  size, mtime to the recorded precision) and the payload exists at that size,
+  capture appends a DELETE, a CLAIM, and an ENTRY group with the current
+  metadata and the recorded content digest (D59), and leaves the payload
+  alone (`capture_metadata_change()`). An interruption after the claim leaves
+  the state an interrupted copy leaves before its payload is written, and
+  the next run copies that file again. Native updates already worked this
+  way: a file with the same size and mtime is not copied, and its metadata is
+  brought up to date.
+
+**Why:** A restored system has a new machine-id, so its first backup was a
+full new one next to the old, and after a distro hop almost every file
+differs from its record in metadata alone: SELinux labels present on one
+system and not the other, atimes, owners. The identity check exists so that
+two installs sharing a drive never overwrite each other's backups; adopting
+replaces the other install's backup with this system's files, which only the
+user can decide. No metadata is dropped from the record to make the update
+cheaper; recording a change costs a journal group (about 170 bytes, D73)
+instead of the file.
+
+**Relationship:** Extends D72; uses D59's content digest; D73 compacts the
+journal as the added records accumulate.
+
+
+## D89 — 2026-10-01 — A restore started on the desktop continues on a text console
+
+**Status:** Implemented; desktop detection revised 2026-10-04; the console
+run no longer repeats the payload scan (2026-10-04); the wait for the user's
+processes revised 2026-10-04; systemctl's notes kept off the console
+(2026-10-04); a code typed on the console starts the restore (2026-10-14)
+
+**Decision:** A restore started under sudo from a desktop session closes that
+desktop and restores from a system service on a virtual console, after the
+user's consent.
+- **When:** Not a dry run; sudo was run on the desktop: the first ancestor of
+  migr running as the invoker (sudo's own processes skipped) is either under
+  the invoker's service manager (`user@UID.service` in its
+  `/proc/PID/cgroup`) or in a session scope (`session-N.scope`) whose logind
+  record (`/run/systemd/sessions/N`) is the invoker's; the invoker's `wayland`
+  or `x11` session of class `user` is the only such session open (greeters
+  and closing sessions do not count); systemd running,
+  `display-manager.service` active, and a console from tty7 to tty15 that no
+  program has open (`VT_GETSTATE`). Otherwise the restore runs in place,
+  unchanged.
+- **The question:** D81's question, after every check, with one line before
+  it in place of the warning about open applications: the restore runs on a
+  text screen with the desktop closed, and the login screen comes back when
+  it ends. No, or end of input, changes nothing. A fresh install has no work
+  to save, so the line describes what migr does rather than warning.
+- **Handover:** migr copies itself to `/run/migr/migr`, with the SELinux label
+  of `/usr/bin` when it has one, and starts it with `systemd-run
+  --unit=migr-restore --collect` on that console (`TTYPath=`, standard input
+  and output, `TTYReset=`, `TTYVHangup=`, `TTYVTDisallocate=`), with
+  `ExecStopPost=systemctl start display-manager.service`, the invoker's
+  `SUDO_UID`, `SUDO_GID`, and `SUDO_USER`, `MIGR_CONSOLE_RESTORE` set to its
+  own PID, and the same options. The source is resolved to an absolute path
+  and each `$` in it doubled, since systemd expands variables in a service's
+  command line. The desktop run prints `Continuing on a text screen.` and
+  exits 0.
+- **The service:** It waits up to ten seconds for the desktop run to exit,
+  removes its binary, stops the display manager, ends the invoker's sessions
+  (`loginctl terminate-user`), and stops the invoker's slice (`systemctl
+  stop user-UID.slice`), which returns once every unit in it has stopped;
+  it warns if a process is still left. What these commands print shows only
+  when one fails: systemctl adds notes of its own to the console, such as a
+  unit file changed on disk since the last reload. It then switches
+  the screen to its console (`VT_ACTIVATE`, `VT_WAITACTIVE`) and restores:
+  every check again but the scan of a portable backup's payload against its
+  journal, which the desktop run made before asking, and no question. It ends with `Press Enter to return to the
+  login screen.`, discarding what was typed before. When the desktop cannot be
+  closed or the console shown, it restores nothing. However the service ends,
+  `ExecStopPost=` starts the display manager.
+- **On the console:** No application of the user runs, so D66 and D69 defer
+  nothing; with no session bus, D50 does not load dconf and the database file
+  is written (D80); D87's note keeps only what a different password costs.
+  D65 keeps nothing, and the backup's live desktop state is restored (D100).
+
+**Why:** A desktop session writes the files restore brings back: some programs
+while they run, others when they exit, which is at logout, after the restore
+(dconf, GNOME Shell, Plasma, xfconfd, browsers, editors). D50, D66, D69, and
+D87 each answer known programs, and every desktop environment adds programs.
+With no session running while files are written, none of them matters.
+- **Display manager first:** With automatic login, ending the session alone
+  lets the display manager log the user back in during the restore.
+- **Then the user's processes:** Some display managers leave the session and
+  its processes running after they stop.
+- **tty7 and up:** logind starts a getty on tty1 to tty6 when one is shown
+  (`NAutoVTs=`), which would take the console.
+- **The copy and its label:** SELinux policy does not let systemd start a
+  binary in a home directory, and a binary with the label of `/run` runs in
+  systemd's own confined domain, which cannot read a backup drive; with the
+  label of system binaries the service runs unconfined, as a command under
+  sudo does. A binary on the backup drive or in the home being restored is not
+  one to run from either.
+- **Asked on the desktop:** The user answers where they typed the command.
+  The service checks again because the desktop run's results describe the
+  system before the desktop closed.
+
+**Rejected:**
+- Telling the user to log out and run migr from a text console: the result is
+  the same, but each user would have to find a console, log in there, and know
+  why.
+- Warning before the question when the active Wi-Fi connection keeps its
+  password for the user alone, and so ends with the session: packages that
+  cannot install without a network are listed in "What's left for you"
+  (D78), which is what the warning would say in advance.
+
+**Relationship:** Extends D81. D50, D66, D69, and D87's request to log out
+remain for restores that run in a session.
+
+**Revision (2026-10-04):** The check first read migr's own cgroup and required
+a session scope there. GNOME and KDE start a terminal under the user's service
+manager, outside the session scope, and some systems give sudo a session of
+its own (`pam_systemd` in sudo's PAM stack), so a restore started from a
+terminal on those desktops stayed in place. The process that ran sudo is
+examined instead; an SSH or console login is a `tty` session and still stays
+in place.
+
+**Revision (2026-10-04):** The service waited at most thirty seconds for the
+invoker's slice to empty. A program that ignores SIGTERM outlasts that (Plasma's
+shell has a 40-second stop timeout, the user's service manager one minute), and
+the restore then started with it running. Stopping the slice leaves the bound
+to each unit's stop timeout, after which systemd kills the unit's processes.
+
+**Revision (2026-10-14):** The screen can stay black once the display manager
+stops while text still reaches the console, and nothing in the service can
+tell. After the console is shown, the service asks for a random three-digit
+code it prints there, discarding what was typed before; a wrong line asks
+again. Only someone who can read the console can type it, whereas a single key
+pressed blind as the screen goes dark would start a long restore nobody can
+watch, which invites a power-off halfway. Digits, because console keymaps move
+letters and digits are on every layout and the keypad. With no code in 60
+seconds the service restores nothing and leaves `/run/migr-console-unanswered`;
+`ExecStopPost=` brings the login screen back. The desktop question says that
+the text screen asks for its code and that a black screen comes back after 60
+seconds, without showing the code. The next run from the desktop removes the
+file and, before the question, says that the code was not typed, that y tries
+again, and, for a screen that stayed black, to log out, switch to a text
+console, log in there, and run the same command. Naming the console only after
+a handover went unanswered keeps the rejection above, which is about making it
+the way every restore runs.
+
+## D90 — 2026-10-01 — Restore brings the network up before packages
+
+**Status:** Implemented
+
+**Decision:** Restore writes the network configuration before packages, and
+waits for NetworkManager to be online before it installs them.
+- **Order:** files, dconf, network configuration, then packages, Flatpak
+  applications, and groups. The network configuration is restored as D33,
+  D54, and D58/D83 describe; only its place changes.
+- **Online:** NetworkManager's state (`nmcli -t -f STATE general`) is
+  `connected`. NetworkManager reports that once its connectivity check has
+  fetched the distribution's test file (Fedora, Ubuntu, and Arch configure
+  one), or, with the check turned off, once a default route exists. Restore
+  first asks for a fresh check (`nmcli networking connectivity check`).
+- **The wait:** When the backup lists packages or Flatpak applications
+  (`packages.txt`, `flatpak-apps.txt`), the run is not a dry run,
+  NetworkManager runs, and the system is not online, restore prints a
+  `Network` section and checks once a second for up to 90 seconds. It names
+  the profile NetworkManager is activating (`Connecting to <name>...`, again
+  when that changes), or says `Waiting for a network connection...` when none
+  is; online, it names the active profile (`Connected to <name>.`). The wait
+  does not depend on the backup's network configuration.
+- **Offline at the limit:** Restore installs no packages and no Flatpak
+  applications. It still counts what the system has (local queries) and lists
+  the rest in "What's left for you" (D78), under "to install once this system
+  is online", with their commands.
+- **Activation:** migr does not activate profiles. `nmcli connection reload`
+  (D33) loads the restored ones, and NetworkManager activates a saved profile
+  with autoconnect on for a device that is not connected; one that is
+  connected keeps its connection.
+
+**Why:** Packages and Flatpak applications are downloaded. With the network
+configuration restored after them, a restored system without a connection
+yet installed nothing although the backup held what would connect it, and
+on a text console (D89) there is no panel to connect from. Waiting covers
+networks that take long to join, such as 802.1X Wi-Fi, and a profile the
+installer created that is still connecting.
+- **NetworkManager's check:** It fetches a file from the distribution's
+  server, where packages come from. A ping is dropped by many networks, and
+  migr has no HTTP client or server of its own to ask.
+- **No trying by migr:** NetworkManager already chooses among saved profiles
+  for networks in range.
+- **A VPN profile** whose plugin a package installs later is loaded all the
+  same; its plugin is needed only to connect, so the earlier reload loses
+  nothing.
+- **90 seconds:** joining 802.1X Wi-Fi can take 30 to 40 seconds.
+- **No install offline:** a package manager without a network fails on every
+  repository, after timeouts that can add up to minutes each, and the result
+  is the same list.
+
+**Limits:** A Wi-Fi password kept in the user's keyring or KWallet is not in
+the profile (`psk-flags=1`), so that network does not connect before the user
+logs in, the wait ends at the limit, and packages are listed. Without
+NetworkManager there is nothing to ask, and the install is tried as before;
+the other backends (netplan, systemd-networkd, wpa_supplicant, netctl) keep
+D33's manual apply.
+
+**Relationship:** Changes the order of D33's restore; D78 lists what could not
+be installed.
+
+---
+
+## D91 — 2026-10-02 — apt installs without asking
+
+**Status:** Implemented
+
+**Decision:** Restore runs apt as `env DEBIAN_FRONTEND=noninteractive apt-get
+install -y -m`. A package's debconf questions are not asked: each takes its
+default, or the answer the system already holds.
+
+**Why:** `-y` answers apt's own confirmation, not the questions packages ask
+while they are configured. With the terminal attached, the first such question
+stops the restore until someone answers it. A backup taken under another
+desktop does this: on Ubuntu 26.04 Desktop, installing `sddm` from a KDE
+backup stopped at "Default display manager: 1. gdm3 2. sddm", and on a text
+console (D89) that is a dialog in the middle of a restore. Non-interactively,
+installing `sddm` and then `lightdm` kept gdm3 as the default
+(`/etc/X11/default-display-manager`, `display-manager.service`), and GDM
+started after a reboot. dnf (`-y`) and pacman (`--noconfirm`) ask nothing of
+this kind.
+
+**Limits:** Another answer is set afterwards with `dpkg-reconfigure <package>`.
+
+**Relationship:** Changes D46's apt command.
+
+---
+
+## D92 — 2026-10-02 — SELinux labels come from the restoring system's policy
+
+**Status:** Implemented
+
+**Decision:** migr does not carry SELinux labels.
+- **Backup** records no `security.selinux`. Portable capture leaves it out of
+  the sidecar; a native backup's copies keep the label the backup's own
+  filesystem gives them.
+- **Restore** neither writes nor removes one. A restored object keeps the
+  label the kernel gave it when restore created it, and a label recorded by
+  an earlier backup is ignored.
+- **Where SELinux runs** (`/sys/fs/selinux` is mounted), restore then gives
+  every restored path the label this system's policy sets: the roots it
+  restored, once the home rewrite (D86) is done, and a network configuration
+  folder it wrote into (D33). migr lists the paths and runs
+  `restorecon -F -0 -f -` on that list. `-F` sets the whole label, also of
+  the types a user may customize. The listing opens each folder with
+  `O_NOATIME`, since a folder restorecon read itself would lose its restored
+  access time, and stays on each root's filesystem, so a drive mounted below
+  a restored folder, such as the backup's own, is left alone. A failed
+  relabel is an error of the restore.
+- Other `security.*` attributes are carried as D20 describes.
+
+**Why:** A label is what a system's policy assigns to a path, not data of
+the file. Carried, it broke restores in both directions:
+- **Onto a system without SELinux**, root may write any `security.*` value,
+  so a Fedora backup's labels landed on Ubuntu and Arch as plain attributes.
+  A rootless container copies a file's attributes the first time it writes
+  to it, and a user namespace may not write `security.*`: no container from
+  the restored images started. Any unprivileged copy that keeps attributes
+  (`cp -a`, `rsync -X`) meets the same refusal.
+- **Onto a system with SELinux**, a file restored without a label took its
+  folder's: a container volume's data from an Ubuntu backup got
+  `data_home_t` instead of `container_file_t`, and the container could not
+  read it until it was relabelled. `~/.ssh` without `ssh_home_t` is the same
+  case for sshd.
+- **Between releases**, a recorded label is the old policy's; the restoring
+  system's policy is the one that applies.
+
+Checked on Fedora 44 with every restored path relabelled this way: a
+restored rootless container, whose writable layer became
+`container_ro_file_t` on disk, started and wrote to it, since podman mounts
+a container's files with its own label.
+
+**Limits:** A label set by hand with `chcon` is not kept. SELinux itself
+drops such labels on every relabel; lasting ones are `semanage fcontext`
+rules under `/etc`, outside the backup.
+
+**Rejected:**
+- Writing recorded labels only where SELinux runs and relabelling only what
+  has none: three cases for one attribute, and a recorded label is still
+  the old policy's.
+- `restorecon -R` on the roots: it reads every restored folder, which sets
+  their access times to the time of the restore.
+- Looking labels up with libselinux: Arch's repositories do not carry it,
+  and the static build (D9) could not load it at run time.
+
+**Relationship:** Reverses D7's worked example: the label is the policy's,
+so the policy's own tool sets it, on any distribution where SELinux runs.
+Ends D20 E-10 for `security.selinux`; E-8's removal tolerance and E-11's
+count no longer meet it.
+
+---
+
+## D93 — 2026-10-02 — Rootless containers' files follow the user's subordinate IDs
+
+**Status:** Implemented
+
+**Decision:** Restore moves files owned by the backup user's subordinate IDs
+to the restoring user's.
+- **Backup** records the user's ranges from `/etc/subuid` and `/etc/subgid`
+  (lines by name or by uid, in file order) in the manifest:
+  `SOURCE_SUBUID=<start>:<count>[,...]` and `SOURCE_SUBGID=...`, after
+  `SOURCE_GID`. A system that gives the user none records none.
+- **Restore** reads the restoring user's ranges and gives an owner or group
+  in the old ones the ID at the same position in the new ones, counted
+  across ranges, as D85 does for the user's own IDs. An ID the new ranges do
+  not reach is kept as recorded.
+- **Fewer IDs:** when the new system gives the user fewer IDs than the old
+  one, "What's left for you" (D78) says so and how many to add with `usermod
+  --add-subuids` and `--add-subgids`.
+- A manifest without these lines restores as before.
+
+**Why:** A rootless container's user N is, on disk, the user's Nth
+subordinate ID. Distributions start the ranges differently: Fedora gives the
+first user 524288-589823, Ubuntu and Arch 100000-165535 (`SUB_UID_MIN`), and
+a second user on one system gets the next range. Restored unchanged, the
+files of container users fell outside the new range, and inside a container
+`/etc/shadow` belonged to group 65534 instead of `shadow`. Moved by position,
+a Fedora backup's images worked on Arch and an Arch backup's on Fedora, with
+`podman system check` clean.
+
+**Limits:** Only the files are read; ranges a system serves from elsewhere
+(`subid` in `nsswitch.conf`) are not seen. At most 8 ranges per user are
+recorded.
+
+**Relationship:** Extends D85's owner map.
+
+---
+
+## D94 — 2026-10-02 — Containers that would not start are left out of a restore
+
+**Status:** Implemented
+
+**Decision:** Restore leaves out rootless podman's container state when the
+backup's home (`SOURCE_HOME`, D86) differs from the restoring user's, or
+when SELinux ran where the backup was taken and does not run on the
+restoring system. Backup records the first as before and the second as
+`SELINUX=1` in the manifest. Images and volumes are restored either way;
+otherwise everything is restored as before.
+- **Left out**, below `~/.local/share/containers/storage`: podman's database
+  (`db.sql` with its `-journal`, `-wal`, and `-shm` files,
+  `libpod/bolt_state.db`), the container registry `overlay-containers/`,
+  and each container's writable layer `overlay/<id>/` with its short link in
+  `overlay/l/`. The ids are the `layer` fields of the backup's
+  `overlay-containers/containers.json`.
+- **`layers.json`:** after replay, restore drops the entries of layers whose
+  folder is not there, keeping the file's owner, mode, and times, so the
+  restored file differs from the backup's by design.
+- **"What's left for you"** (D78) names the containers left out and says to
+  create them again. A portable restore's summary counts the items left out
+  on a line of its own, since they are neither restored nor failed.
+
+**Why:**
+- **Another home:** podman's database records its user's home, and under
+  another home every podman command stops (`database configuration
+  mismatch`). Without the database, the restored containers become
+  "external" containers that cannot start and keep their names taken; a
+  Toolbox container also carries the old user name and a bind mount of the
+  old home.
+- **SELinux lost:** podman records an SELinux mount label for a container
+  made where SELinux runs, and a kernel without SELinux refuses it when
+  podman mounts the container's shm (`invalid argument`). A container made
+  without SELinux starts where it runs.
+- **The writable layers** of left-out containers would be layers nothing
+  uses, and a Toolbox with packages installed in it holds gigabytes. Without
+  their entries in `layers.json`, `podman system check` reports damage.
+- Measured on Fedora 44 KDE, Ubuntu 26.04, and Arch (podman 5.8, 5.7, 6.1):
+  with this state left out, podman starts with a new database, lists the
+  images, a new container finds the volume's data, the old names are free,
+  and `podman system check` is clean. Each podman read the others'
+  databases, so a backup from the same home with SELinux on both sides or
+  neither keeps its containers.
+
+**Limits:** A volume is listed by `podman volume ls` only once a container
+uses it by name; its data is there. Rootless Docker's state is not handled.
+
+**Rejected:**
+- Rewriting podman's database: it is SQLite, which migr does not read, and
+  the containers it describes still name the old user and home.
+- Running podman during restore: it may not be installed until the package
+  step, a text-console restore has no user session (D89), and it would tie
+  restore to podman's command line.
+
+**Relationship:** Uses D86's `SOURCE_HOME`; `layers.json` is rewritten after
+replay as D86 rewrites desktop state.
+
+---
+
+## D95 — 2026-10-02 — Restore installs only the packages the system lacks
+
+**Status:** Implemented; the install's own output is not shown since D99
+
+**Decision:** Before the install transaction, restore reads which listed
+packages the system already has, with the installed-state query D46 runs
+afterwards, and which of those are explicitly installed, with D12's export
+command.
+- **Packages it lacks** go to the one install transaction (D46). When it
+  lacks none, no transaction runs.
+- **Packages it has as dependencies** are marked explicitly installed:
+  `apt-mark manual`, `dnf -y -q mark user`, or `pacman -D --asexplicit`. The
+  command's output is not shown; a failure prints a warning.
+- **Packages it has as explicit** are left alone.
+
+Accounting stays D46's: after a transaction the installed state is read
+again; without one, the first reading is the final state.
+
+**Why:** On a fresh install of the same distribution most of the list is
+already there, and each package manager prints a line for every given
+package it already has: `Package "…" is already installed.` (dnf), `… is
+already the newest version` (apt), `warning: … is up to date -- skipping`
+(pacman). Given its own list, Fedora 44 KDE printed 397 lines for 388
+packages, Ubuntu 26.04 49 for 43, and Arch 91 for 90; the packages actually
+installed were lost among them. Reading state instead of filtering that
+output keeps restore independent of the package manager's language, which
+follows the system locale. Restore also stops upgrading installed packages
+as a side effect: apt and pacman upgraded a listed package that was out of
+date, which on Arch is a partial upgrade.
+
+A package the backup listed as explicit can be on the new system as another
+package's dependency. apt-get install marks it manual, but dnf reports it
+already installed and pacman's `--needed` skips it, `--asexplicit` included,
+so both left it a dependency. The next backup's list (D12) then left it out,
+and removing the package that pulled it in let autoremove remove it too.
+
+**Relationship:** Extends D46: one install transaction, accounting from the
+final state. Uses D12's export commands.
+
+---
+
+## D96 — 2026-10-03 — A backed-up symlink replaces the new system's file or symlink
+
+**Status:** Implemented
+
+**Decision:** Where the backup has a symlink and the new system already has
+a symlink or a regular file at the same path, restore puts the backup's
+symlink there. The existing object itself is removed and the backup's link
+created in its place; nothing is written through a link. Portable restore
+keeps treating a link with the backup's target as the entry already
+restored. A folder where the backup has a symlink still fails that entry,
+and where the backup has a file or folder and the new system has a symlink,
+restore still refuses before writing anything and names the path.
+
+**Why:** Fresh installs create symlinks in the home before restore runs.
+Ubuntu 26.04 Desktop has three snap user-service links under
+`~/.config/systemd/user/*.wants/`; Fedora 44 KDE has
+`~/.local/share/akonadi/socket-<hostname>-default`, pointing to
+`/run/user/<uid>/akonadi`. The same links are in a backup of such a system.
+Native restore refused every existing destination symlink, so restoring an
+Ubuntu backup onto a fresh Ubuntu stopped before writing anything, naming one
+link per run; portable restore stopped on a link whose target differed, such
+as Akonadi's under another UID. Replacing a symlink writes nothing through
+it, which is what the refusal guards against. A symlink where the backup has
+a file or folder is not part of a fresh install: restore runs right after
+installing, with nothing in between.
+
+A fresh install also has regular files where a backup can hold symlinks: a
+dotfile manager links `~/.bashrc` into its own folder, and the new system
+ships its own `~/.bashrc`. Restore already replaces a fresh install's file
+with a backed-up file, so a backed-up link replaces it too. This departs from native restore's rule that an existing object must
+have the source's type, which still holds for every other pairing.
+
+**Relationship:** Keeps D17's no-follow handling of destinations; narrows the
+refusal of an existing destination symlink to file and folder entries.
+
+---
+
+## D97 — 2026-10-03 — A comprehensive backup takes the critical roots first
+
+**Status:** Implemented
+
+**Decision:** Each planned root records whether only `--comprehensive`
+takes it: the Videos and Music XDG folders, a catalog entry marked
+comprehensive-only, and a `comprehensive` include in the configuration. A
+path that a critical request also names is critical, and so is a root a
+critical include inherits into. Native and portable capture take the
+critical roots first and the comprehensive-only ones after them; within each
+group the order is as before. Roots deferred for a running application
+(D84) still come last of all.
+
+**Why:** Capture took the main folders first (native) or followed path order
+(portable), so Videos and Music, usually the largest folders, could come
+before `~/.ssh` or `~/.config`. A backup interrupted partway then held the
+folders that are easiest to replace and missed the ones that are not.
+
+**Relationship:** Keeps D84's deferral as the outermost order.
+
+---
+
+## D98 — 2026-10-03 — An update counts the backup it replaces
+
+**Status:** Implemented
+
+**Decision:** Every manifest records the backup's estimated size on its
+destination, D27's estimate, as `SIZE`. Before an update, the free-space
+preflight subtracts the size recorded in the backup it would update from the
+estimate and compares the rest with free space. That backup is this
+install's, when it is finished or being updated, or the finished backup of
+another install that the user chose to update (D88). An unfinished first
+backup and one without a recorded size are credited nothing. To know which
+backup applies, the destination's representation is probed and the D88
+question asked before the preflight. A dry run credits the backup a live run
+would update, or would offer to update.
+
+The progress line of an update or a resumed backup shows the bytes checked,
+those copied plus those found already in the backup, against the estimate,
+and the bytes copied beside them:
+`Progress: 21.4G/37.1G checked, 483.6M copied, ...`. A first backup's line
+is unchanged.
+
+**Why:** The preflight compared the whole estimate with free space, while the
+backup being updated already occupies most of that estimate on the same
+destination and an update rewrites only what changed. A destination with room
+for one copy of a backup refused every update of it. The progress line
+divided copied bytes by the whole estimate, so an update ended at a small
+fraction of it.
+
+**Rejected:** Measuring the exact difference in advance compares every source
+file with its copy before capture, a second pass of per-file metadata calls
+on destinations where D45 measured them as slow; summing the existing payload
+walks it for the same reason. The recorded size is approximate, as D27's
+estimate is: the payload of files deleted from the source is removed after
+the capture, so an update can briefly need more than the difference. A write
+failure stays the authoritative out-of-space signal, and the interrupted
+update resumes.
+
+**Revision (2026-10-14):** The progress line reads the same while it runs and
+once it ends: `Checked 21.4G/37.1G, copied 483.6M in 04:36, 1.7M/s, 90.2G
+free, current: ...` for an update, `Copied 30.2G/38.1G in ...` for a first
+backup. The last draw leaves out the current path, so the line that stays on
+screen states the totals. Restore's line takes the same form:
+`Restored 38.1G in 04:36, 141.3M/s`.
+
+---
+
+## D99 — 2026-10-04 — Install commands run without their output
+
+**Status:** Implemented
+
+**Decision:** The package install transaction (D46, D95) and each Flatpak
+install (D76) run with standard output discarded and standard error kept,
+its last 4 KiB. restore prints one line before the command; on a terminal,
+the time the command has taken follows that line and is redrawn until it
+ends. When the command exits with a nonzero status, a warning names it and
+its status and the kept errors follow. A successful command shows nothing of
+its own. The accounting after it is unchanged: packages and applications
+that did not install are counted and listed in "What's left for you".
+
+**Why:** Each tool prints its whole transaction: dnf a table of every
+package and dependency, a line for each download and install, and its
+scriptlets' output; Flatpak the permissions of each application and a
+progress table it redraws for the terminal's width, which breaks when the
+window changes size. A Fedora 44 restore installing 86 packages and their
+dependencies printed about 1,700 lines. What matters afterwards is already in
+restore's own summary: what installed, and what did not and why to look.
+
+**Rejected:** Parsing each tool's progress lines into one of migr's own
+depends on every tool's output format and language. Quiet flags differ
+between tools and still print some progress; discarding standard output
+does the same for all of them.
+
+## D100 — 2026-10-04 — Live desktop state is kept only while a session runs
+
+**Status:** Implemented
+
+**Decision:** Replay leaves live desktop state already at its destination in
+place (D65) only when the target user has a running session, which restore
+takes to be a session bus in the user's runtime directory, as D80 does.
+Without one, replay restores the backup's copy like any other file. Restore
+asks before replay and passes the answer in the request
+(`session_running`).
+
+**Why:** D65 assumed every restore runs inside a desktop session. A restore
+started on the desktop now continues on a text console after the session
+has ended (D89), and a restore may also start from a console or over SSH.
+The state on the list was then written by a session that is no longer
+running, and nothing rewrites it. Keeping the fresh install's copy lost what
+the backup held: `gvfs-metadata` records each folder's view and sort
+settings, custom icons and emblems.
+
+**Relationship:** Limits D65; D80's dconf rule is unchanged and applies
+within a running session.
+
+## D101 — 2026-10-04 — Desktop settings name the restoring system's home folder
+
+**Status:** Implemented
+
+**Decision:** Before the dconf settings are used, every path in them under
+the backup's home or XDG folders is rewritten to the matching folder of this
+system, with the pairs of D41 and D47. In the text of `dconf dump /`, a path
+appears as a `file://` URI or as the start of a quoted string (`'/home/...`
+or `"/home/...`); either form is rewritten when the path ends at a component.
+- **With a session (D50):** the rewritten dump is what `dconf load /`
+  applies.
+- **Without one (D80, D100):** the database file is already restored. When
+  the rewrite changed the dump, it is compiled into a new database (`dconf
+  compile`, which reads the format `dconf dump` writes) and that content
+  replaces the restored file's, which keeps its inode, owner, mode,
+  extended attributes, and times. A failure leaves the restored file as it
+  is and is reported. Without `dconf` installed nothing is rewritten, since
+  nothing reads the database. The user's runtime directory is gone with the
+  session, so `dconf dump` gets a folder of migr's private work directory
+  in its place; dconf would otherwise try to make the user's again and
+  print an error for each value it reads.
+
+**Why:** dconf stores absolute paths: the wallpaper (`picture-uri`), the last
+folder of each file dialog, an application's default directories. A restore
+to another user name left them naming a home folder that does not exist on
+the new system, so the wallpaper did not load although its file was
+restored.
+
+**Relationship:** Extends D41 and D47 to the dconf database; D50's load and
+D80's file rule are unchanged.
+
+## D102 — 2026-10-04 — Restore adds flathub when the saved applications need it
+
+**Status:** Implemented
+
+**Decision:** When a saved Flatpak application comes from the remote
+`flathub` and the system has no remote of that name, restore adds it before
+installing: `flatpak remote-add --if-not-exists --system flathub
+https://dl.flathub.org/repo/flathub.flatpakrepo`, with the address fixed in
+migr. Its applications are then installed with the others (D76).
+- **Consent:** No question of its own. The restore's question covers it, as
+  it covers the packages restore installs; a dry run says it would add it.
+- **Only flathub:** Any other remote the system lacks is listed with the
+  install command, as before.
+- **Turned off:** A flathub the system has but has disabled stays disabled;
+  "What's left for you" (D78) gives `flatpak remote-modify --system --enable
+  flathub` before the install command.
+- **Not added:** Offline, or when adding fails, "What's left for you" gives
+  the exact `remote-add` command before the install command.
+
+**Why:** Ubuntu does not set up flathub, and Fedora sets it up only when its
+third-party repositories are turned on, which the KDE edition never asks
+about; on both, every saved application from flathub was left out. D76
+leaves a missing remote to the user because the backup does not carry its
+signing key. Flathub's `.flatpakrepo` file carries the key and is fetched
+from its own address over HTTPS, so nothing is taken from the backup, and a
+backup that names another remote `flathub` still gets the real one.
+
+**Rejected:** Turning on Fedora's third-party repositories
+(`fedora-third-party enable`), which also turns on other vendors'
+repositories. Turning a disabled flathub back on: a disabled remote is a
+choice made on this system.
+
+**Relationship:** Narrows D76's rule on missing remotes for flathub alone.
+
+## D103 — 2026-10-10 — Restore leaves packages that bring kernel modules to the user
+
+**Status:** Implemented
+
+**Decision:** Restore does not install a package that brings kernel modules;
+it lists it under "What's left for you" (D78), under a heading of its own,
+with the packages the system could not install. Such a package is a module
+builder (`akmods`, `dkms`), a package built against a kernel, or one that
+needs either, directly or through other packages. The package manager tells
+which, from the repositories of the restoring system, once per restore and
+only when there are packages to install:
+- **Fedora:** `dnf repoquery --whatrequires akmods,dkms --recursive`.
+- **Debian, Ubuntu:** `apt-cache rdepends --recurse dkms`, without weak
+  dependencies; Ubuntu's prebuilt `linux-modules-nvidia-*` come in as the
+  alternatives of `nvidia-dkms-*`.
+- **Arch:** pacman has no recursive reverse query, so restore follows the
+  "Required By" field of `pacman -Sii` round by round from `dkms` and the
+  kernels (`linux`, `linux-lts`, `linux-zen`, `linux-hardened`). A package
+  counts when it needs `dkms`, a kernel by its name, or a package that
+  counts, or what that package provides (`V4L2LOOPBACK-MODULE`). One that
+  needs only a module the kernel itself provides (`ntsync-autoload` needs
+  `NTSYNC-MODULE`) does not count, nor do the packages that need it (`wine`).
+- **Unknown:** When the query fails, restore installs none of the missing
+  packages, since any of them could bring a module, and the error is
+  reported.
+
+**Why:** A driver package installed at the end of a restore blacklists the
+kernel's own driver, builds a module for the running kernel, and changes the
+boot chain, on hardware, firmware, and a kernel it was not set up for; the
+next boot can stop before the desktop. Names do not tell such packages
+apart: `xorg-x11-drv-nvidia-cuda` brings `akmod-nvidia` through its
+dependencies, as `nvidia-driver-580` brings `nvidia-dkms-580`. A driver
+belongs to the new system's own setup, done when it boots.
+
+**Rejected:** Name patterns (`akmod-*`, `*-dkms`, `*nvidia*`), which miss
+the packages that pull a module in under another name. Marking the packages
+at backup, which would leave existing backups out and needs the old
+system's dependency data rather than the new one's.
+
+**Relationship:** Narrows D46 and D95: the transaction leaves these packages
+out. The kernel-pinned `kmod-*` names are still dropped at backup.
+
+## D104 — 2026-10-10 — `~/.local/lib` is backed up
+
+**Status:** Implemented
+
+**Decision:** `~/.local/lib` is a built-in root, `BUILTIN_LOCAL_LIB`, beside
+`~/.local/bin`, in every backup scope, stored under `data/settings/local-lib`.
+Restore says nothing of its own about launchers whose program is missing.
+
+**Why:** Programs installed into the home put their files there: an AppImage
+installer keeps the program under `~/.local/lib/<name>/<version>/` and its
+launcher in `~/.local/bin` and `~/.local/share/applications`, and
+`pip install --user` keeps the modules its `~/.local/bin` commands import in
+`~/.local/lib/python3.X/site-packages`. With the launchers backed up and that
+folder not, the launchers came back pointing at nothing.
+
+**Rejected:** Reporting launchers whose program is missing. With
+`~/.local/lib` backed up, what remains are programs outside the home (`/opt`,
+`/usr/local`), which migr does not migrate; finding them takes parsing
+`Exec=` lines (quoting, `env`, field codes), and restore could only list
+them.
+
+**Relationship:** Adds to D16's built-in catalog. Python packages for another
+Python version come back but are not loaded there; the README says so.
+
+## D105 — 2026-10-10 — A backup given as the destination is refused
+
+**Status:** Implemented
+
+**Decision:** When the destination of `migr backup` holds a valid manifest at
+its root, so it is itself a migr backup, the backup stops before anything is
+read or written, with exit status 2, and names the folder that holds it:
+"Error: <destination> is a migr backup itself; to update it, give the folder
+that holds it: <parent>." A dry run stops the same way.
+
+**Why:** The destination is the folder a backup goes into; the backup is
+found inside it by name. Given the backup's own folder, migr looked for a
+backup inside it, found none, and planned a new one the size of the whole
+selection, refused for want of space or, with enough of it, written inside
+the old one. The intent, updating that backup, is clear, and the folder that
+does it is known.
+
+**Rejected:** Updating the given backup in place of the one the parent would
+find. The destination would then mean two things, a folder to back up into or
+a backup to update, depending on what is in it.
+
+## D106 — 2026-10-11 — `migr verify` checks a native backup against its source
+
+**Status:** Implemented
+
+**Decision:** `migr verify` checks a native backup by comparing each regular
+file and symlink in it with the item at the same place in its source, named
+by the manifest's roots. Nothing at capture records their content, so an
+item is compared only when its source has not changed since the backup: a
+regular file or a symlink with the backup's modification time, and with a
+change time before the backup started (the manifest's `UPDATED`), since a
+program can set a modification time back but not a change time. For such an
+item:
+- **Regular file:** another size, or other bytes, is a difference.
+- **Symlink:** another target is a difference.
+
+A source item that is missing, of another kind, changed since the backup,
+or unreadable is counted as not checked, never as a difference. Directories,
+and files outside `data/`, are not compared. Exit status follows D68: 0 when
+every item compared matches, 1 when some differ, with the first ones listed,
+and 2 when none could be compared, which names the reason: a native backup
+is checked on the system it was taken from, before that system is replaced.
+A manifest without the source home names home-relative roots against the
+home of the user running verify.
+
+**Why:** Before wiping the source machine, a native backup had no check
+short of restoring it, though a USB drive fails the same way under either
+representation, and Linux filesystems keep no checksum of file content. A
+record of digests at capture, as the sidecar keeps (D59), would need a
+second journal for native backups, kept across updates and resumed runs;
+the source it would stand for is still there at the moment the check is
+needed.
+
+**Rejected:** Recording content digests during native capture, for the cost
+above; it would also check a native backup without its source, which this
+does not.
+
+**Relationship:** Extends D60 to native backups, which it left out until
+they recorded digests of their own.
+
+## D107 — 2026-10-12 — An update copies again the files verify found damaged
+
+**Status:** Implemented
+
+**Decision:** When `migr verify` finds damaged files, it lists them in the
+backup as `recopy.list`, without asking, and says that an update of the
+backup from the system it was taken from copies them again. The list holds
+each file's root (its payload path in a native backup, its id in a portable
+one) and its path in that root, as NUL-terminated pairs; a later verify
+replaces it. The next update reads it and writes those files again even
+where their source looks unchanged, and removes it once the update has
+finished without errors. A list that cannot be read is warned about, kept,
+and not acted on.
+
+**Why:** An update skips a file whose source size and modification time
+match what it captured (D72), so a copy damaged on the drive after capture
+stayed damaged through every update; touching the source would change the
+file's own modification time, and taking the copy out by hand means working
+inside the backup. The list keeps the damaged copy until a new one replaces
+it.
+
+**Rejected:**
+- Verify stays read-only and leaves the repair to the user.
+- Verify removes the damaged copies itself: until the next update the
+  backup would hold less than it did, and nothing at all for a file whose
+  source is gone.
+- Every update compares the content of each kept file: it would read the
+  whole backup on each run.
+
+**Relationship:** Extends D60 and D106: verify now writes into the backup
+when it finds damage. Uses D72's update in place.

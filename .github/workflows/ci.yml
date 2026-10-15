@@ -1,0 +1,76 @@
+name: CI
+
+# Every run takes the suite as root, the suite on other distributions, and
+# every gate of `make check` in a clean Fedora: a fresh machine finds what
+# the developer's own one hides. Pushes that change nothing the build or the
+# tests read (the same files the pre-commit hook looks at) are skipped.
+on:
+  push:
+    paths:
+      - '**.c'
+      - '**.h'
+      - '**.sh'
+      - '**/Makefile'
+      - 'tests/stubs/**'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  root-test:
+    name: Test as root (Ubuntu)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the tools the root phases use
+        run: sudo apt-get update && sudo apt-get install -y dosfstools socat
+      - name: make test as root
+        run: sudo env -u SUDO_UID make test
+
+  debian-test:
+    name: Test (Debian 12)
+    runs-on: ubuntu-24.04
+    container: debian:12
+    steps:
+      # git also gives the image a second package installed by hand: Phase 5
+      # reads a one-line package list as one that lost its line breaks.
+      - name: Install build tools
+        run: apt-get update && apt-get install -y build-essential git
+      - uses: actions/checkout@v7
+      - name: make test
+        run: .github/scripts/run-as-builder.sh make test
+
+  arch-test:
+    name: Test (Arch Linux)
+    runs-on: ubuntu-24.04
+    container: archlinux:latest
+    steps:
+      - name: Install build tools
+        run: pacman -Syu --noconfirm --needed base-devel
+      - uses: actions/checkout@v7
+      - name: make test
+        run: .github/scripts/run-as-builder.sh make test
+
+  full-check:
+    name: make check (Fedora 44)
+    runs-on: ubuntu-24.04
+    container:
+      image: fedora:44
+      # LeakSanitizer stops the process's threads through ptrace.
+      options: --cap-add SYS_PTRACE
+    steps:
+      - name: Install build tools
+        run: >-
+          dnf install -y gcc clang make glibc-static libasan libubsan
+          valgrind socat util-linux
+      - uses: actions/checkout@v7
+      - name: make check
+        run: .github/scripts/run-as-builder.sh make check

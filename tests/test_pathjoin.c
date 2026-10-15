@@ -53,6 +53,8 @@ int main(void)
     ok("empty name", path_join(buf, sizeof(buf), "abc", ""), buf, "abc/");
     ok("nested name", path_join(buf, sizeof(buf), "/home/u", ".config/x"),
        buf, "/home/u/.config/x");
+    ok("root parent avoids double slash",
+       path_join(buf, sizeof(buf), "/", "leaf"), buf, "/leaf");
 
     // Boundary: "abc/de" is 6 chars and needs 7 bytes with the NUL.
     char small[7];
@@ -67,6 +69,21 @@ int main(void)
     ok("span full length", path_join_n(buf, sizeof(buf), "dir", "name", 4),
        buf, "dir/name");
     truncated("span truncates", path_join_n(small, 6, "dir", "foo/bar", 3));
+
+    // A folder typed with trailing slashes joins a name with one slash.
+    ok("trailing slash dropped",
+       path_trim_trailing_slashes(buf, sizeof(buf), "/media/Storage/"), buf,
+       "/media/Storage");
+    ok("repeated trailing slashes dropped",
+       path_trim_trailing_slashes(buf, sizeof(buf), "Storage//"), buf,
+       "Storage");
+    ok("no trailing slash unchanged",
+       path_trim_trailing_slashes(buf, sizeof(buf), "/media/x"), buf,
+       "/media/x");
+    ok("root stays root", path_trim_trailing_slashes(buf, sizeof(buf), "//"),
+       buf, "/");
+    truncated("trim truncates",
+              path_trim_trailing_slashes(small, sizeof(small), "abcdefg/"));
 
     if (failures > 0)
     {

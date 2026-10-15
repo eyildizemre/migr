@@ -1,4 +1,4 @@
-// Unit tests for detect_distro_from().
+// Unit tests for detect_distro_from() and detect_system_name_from().
 //
 // Distro detection cannot be exercised through the CLI: it reads /etc/os-release,
 // so on any given machine only one branch is reachable. These tests feed synthetic
@@ -59,6 +59,40 @@ static void check(const char *label, const char *contents, distro_t expected)
     }
 }
 
+// Runs detect_system_name_from() on contents; expected NULL means no name.
+static void check_name(const char *label, const char *contents,
+                       const char *expected)
+{
+    char path[] = "/tmp/migr_osrelease_XXXXXX";
+    int fd = mkstemp(path);
+    FILE *f = fd >= 0 ? fdopen(fd, "w") : NULL;
+    if (f == NULL)
+    {
+        printf("  " RED "x" NC " %s: could not create temp file\n", label);
+        failures++;
+        if (fd >= 0)
+        {
+            close(fd);
+            unlink(path);
+        }
+        return;
+    }
+    fputs(contents, f);
+    fclose(f);
+
+    char name[64] = "";
+    int rc = detect_system_name_from(path, name, sizeof(name));
+    unlink(path);
+
+    if (expected == NULL ? rc != 0 : rc == 0 && strcmp(name, expected) == 0)
+        printf("  " GREEN "v" NC " %s\n", label);
+    else
+    {
+        printf("  " RED "x" NC " %s: got \"%s\" (%d)\n", label, name, rc);
+        failures++;
+    }
+}
+
 int main(void)
 {
     printf(BLUE "::" NC " Phase 0: distro detection (unit)\n");
@@ -99,6 +133,13 @@ int main(void)
     check("no ID field at all",
           "NAME=\"Mystery Linux\"\nVERSION_ID=1\n", DISTRO_UNKNOWN);
     check("empty file", "", DISTRO_UNKNOWN);
+
+    check_name("PRETTY_NAME without its quotes",
+               "NAME=\"openSUSE Tumbleweed\"\nPRETTY_NAME=\"openSUSE Tumbleweed\"\n",
+               "openSUSE Tumbleweed");
+    check_name("PRETTY_NAME unquoted", "PRETTY_NAME=Gentoo\n", "Gentoo");
+    check_name("no PRETTY_NAME", "NAME=\"Mystery Linux\"\n", NULL);
+    check_name("empty PRETTY_NAME", "PRETTY_NAME=\"\"\n", NULL);
 
     // A missing file must not crash; checked directly since check() writes a file.
     if (detect_distro_from("/nonexistent/os-release") == DISTRO_UNKNOWN)

@@ -1,27 +1,146 @@
 #ifndef BACKUP_H
 #define BACKUP_H
 
+#include <stddef.h> /* size_t */
+#include <sys/types.h> /* off_t */
+#include <time.h> /* struct timespec */
+
 typedef enum {
     BACKUP_CRITICAL,      /**< Documents, Downloads, Pictures, dotfiles, browser profiles, and packages. */
     BACKUP_COMPREHENSIVE, /**< Everything in BACKUP_CRITICAL plus Desktop, Videos, Music, and Projects. */
-    BACKUP_EXPLICIT_PATHS          /**< Only the caller-supplied paths; no dotfiles, packages, or manifest. */
+    BACKUP_EXPLICIT_PATHS          /**< Only the caller-supplied paths; no dotfiles and no package list. */
 } BackupMode;
 
+struct SelectionPlan;
+
 /**
- * @brief Backs up files from HOME to a dated subdirectory inside target.
+ * @brief Backs up files from HOME into a versioned container inside target.
  *
- * Creates target/migr_backup_YYYYMMDD/ and copies files according to mode.
+ * Writes to target/migr-<user>.partial/ (docs/DECISIONS.md D71) and publishes it
+ * with an atomic no-replace rename to the same name without the suffix, so an
+ * interrupted backup can never look complete (docs/DECISIONS.md D15). Every
+ * captured object lives below the container's data/, addressed by its manifest
+ * root id; manifest.txt and packages.txt are migr-owned control artifacts at
+ * the container root.
+ *
  * BACKUP_CRITICAL copies Documents, Downloads, Pictures, dotfiles, browser
  * profiles, and the package list. BACKUP_COMPREHENSIVE adds Desktop, Videos,
- * Music, and Projects. BACKUP_EXPLICIT_PATHS copies only the caller-supplied paths.
- * A manifest.txt recording XDG directory names is written for all modes except
- * BACKUP_EXPLICIT_PATHS.
+ * Music, and Projects. BACKUP_EXPLICIT_PATHS copies only the caller-supplied
+ * paths and exports no package list. Every mode writes a versioned manifest.txt:
+ * it carries the format version, representation and root table, so a container
+ * without one is not a backup migr can restore.
  *
- * @param target Destination directory; the dated backup subdirectory is created inside it.
+ * When an earlier run of the same job (docs/DECISIONS.md D15: representation,
+ * scope, root table, machine id and uid, plus optional bundled migr and network
+ * configuration state) left exactly one unfinished container behind, this
+ * resumes into it instead of starting a second one.
+ *
+ * @param target Destination directory; the backup container is created inside it.
  * @param mode   Selects which files are included (BACKUP_CRITICAL, BACKUP_COMPREHENSIVE, or BACKUP_EXPLICIT_PATHS).
- * @param paths  NULL-terminated array of absolute paths; required when mode is BACKUP_EXPLICIT_PATHS, ignored otherwise.
- * @return 0 on success, 1 on error.
+ * @param paths  NULL-terminated array of paths (absolute, or relative to the
+ *               current working directory); required when mode is
+ *               BACKUP_EXPLICIT_PATHS, ignored otherwise.
+ * @param include_self Non-zero to require and copy the validated static migr
+ *                     binary into the container root (docs/DECISIONS.md D9).
+ * @param include_network_config Non-zero to capture supported system network
+ *                               configuration under container-root network/.
+ * @return MIGR_EXIT_OK on success or cancellation, MIGR_EXIT_CHANGED when
+ *         it completed but files changed while being read (D63), and
+ *         MIGR_EXIT_FAILURE on error (D68).
  */
-int backup(const char *target, BackupMode mode, char **paths);
+int backup(const char *target, BackupMode mode, char **paths, int include_self,
+           int include_network_config);
+/* Runs the same production lifecycle for an already compiled scoped selection.
+ * The caller retains ownership of plan for the whole call. */
+int backup_selection(const char *target, BackupMode mode,
+                     const struct SelectionPlan *plan, int include_self,
+                     int include_network_config);
+
+/* Shared by backup and restore destination free-space preflights. */
+int destination_block_size(int dest_fd, off_t *block_size);
+int destination_has_space(int dest_fd, off_t needed, off_t *free_bytes);
+
+/* Prints the restore size/free-space summary. Returns -1 only when the
+ * destination is definitively too small; probe/estimate failures warn and
+ * allow the caller to proceed without a space check.
+ */
+int restore_space_preflight(int destination_fd, const char *home,
+                            off_t estimated_bytes, int estimate_had_error);
+
+/* Restore-time equivalent of docs/DECISIONS.md D38's backup-side pattern
+ * ("fail before mutation when the required privilege is missing, instruct
+ * the user to rerun through sudo") -- shared by native and portable restore,
+ * called once their metadata preflight has already computed
+ * foreign_owner_count (docs/DECISIONS.md D38: an ordinary, same-owner
+ * restore must keep working without root), or once a native one stopped at
+ * a file of another user that it could not read without root. The network_config_needs_privilege
+ * parameter is non-zero when the saved network configuration contains a
+ * regular file that the restore would attempt to apply directly.
+ * Returns 0 to proceed (either privileged, or nothing found that needs it),
+ * or -1 to refuse (message already printed) -- always before any
+ * destination mutation or consent prompt.
+ */
+int restore_privilege_preflight(size_t foreign_owner_count,
+                                int network_config_needs_privilege);
+
+/* A dry run runs without root (D62), so it notes that the real restore
+ * needs it. */
+void restore_privilege_dry_run_note(void);
+
+#ifdef BACKUP_TEST_HOOKS
+typedef void (*BackupTestInventoryHook)(const char *source_path,
+                                        void *context);
+
+void backup_test_set_inventory_hook(BackupTestInventoryHook hook,
+                                    void *context);
+
+typedef void (*BackupTestFreeSpaceHook)(off_t needed, off_t *free_bytes,
+                                        void *context);
+
+void backup_test_set_free_space_hook(BackupTestFreeSpaceHook hook,
+                                     void *context);
+
+typedef void (*BackupTestBlockSizeHook)(off_t *block_size, void *context);
+
+void backup_test_set_block_size_hook(BackupTestBlockSizeHook hook,
+                                     void *context);
+
+typedef void (*BackupTestProgressHook)(off_t bytes_copied,
+                                       off_t bytes_unchanged,
+                                       off_t estimated_total,
+                                       const char *current_path,
+                                       void *context);
+
+void backup_test_set_progress_hook(BackupTestProgressHook hook,
+                                   void *context);
+
+void backup_test_set_network_config_source_dir(const char *backend_name,
+                                               const char *source_dir);
+void backup_test_set_crypto_policy_source(const char *path);
+
+/* Runs after the final sync and before the journal is read back from the
+ * destination, so a test can make the device's copy differ. */
+typedef void (*BackupTestSidecarReadbackHook)(int container_fd, void *context);
+
+void backup_test_set_sidecar_readback_hook(BackupTestSidecarReadbackHook hook,
+                                           void *context);
+
+void backup_test_force_portable_representation(int enabled);
+void backup_test_force_case_insensitive_destination(int enabled);
+void backup_test_set_restore_privilege_bypass(int enabled);
+/* Hands a native backup's container to uid:gid as if sudo had been run by
+ * them (D70); 0 restores the real lookup. */
+void backup_test_set_invoker(int enabled, uid_t uid, gid_t gid);
+/* Stands in for /etc/machine-id, as another install would; NULL restores
+ * the real one. */
+void backup_test_set_machine_id(const char *machine_id);
+
+/* Exposes the progress display's cumulative-average speed formula
+ * (total_bytes / elapsed since started_at) for direct unit testing with
+ * synthetic timestamps, without needing to fake wall-clock delays. */
+off_t backup_test_progress_speed(off_t total_bytes,
+                                 const struct timespec *started_at,
+                                 const struct timespec *now);
+#endif
 
 #endif

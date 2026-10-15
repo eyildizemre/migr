@@ -1,22 +1,39 @@
-// Unit tests for the special-file policy in clone_recursive() and get_dir_size().
+// Unit tests for the native capture and restore walkers. Capture's source side
+// is pathname-based while both walkers anchor their destination traversal to a
+// directory fd the caller owns (docs/DECISIONS.md D15).
 //
-// These types cannot be exercised reliably through the CLI: a socket must be
-// created with bind(), a device node needs root, and opening a FIFO as a regular
-// file would block the whole suite on a missing writer. So the nodes are built
-// directly here and the policy is asserted: a FIFO has its node recreated (never
-// its contents), while sockets and device nodes are skipped without a destination
-// and add no bytes to a size measurement. /dev/null stands in as a character
-// device the test can reach without privileges.
+// Two groups. The first is the special-file policy, which cannot be exercised
+// through the CLI: a socket must be created with bind(), a device node needs
+// root, and opening a FIFO as a regular file would block the whole suite on a
+// missing writer. So the nodes are built directly here and the policy is
+// asserted -- a FIFO has its node recreated (never its contents), while sockets
+// and device nodes are skipped without a destination and add no bytes to a size
+// measurement. /dev/null stands in as a character device the test can reach
+// without privileges.
+//
+// The second is the destination contract that makes writing into an adopted,
+// already-populated container safe: no symlink at any destination address is
+// followed, work a previous run finished is resumed past, and anything else
+// at an address is an older copy, removed and captured again. A sentinel
+// outside the destination directory proves nothing is written through.
+//
+// A final group checks the orchestration contract the entry point enforces: a
+// NULL, wrong-direction, or portable context is refused, never silently cloned,
+// and neither is a destination path with an empty, ".", or ".." component.
 
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
+#include <ftw.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <signal.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "fileops.h"
@@ -28,6 +45,7 @@
 #define NC    "\033[0m"
 
 static int failures = 0;
+static int skips = 0;
 
 static void check(int condition, const char *label)
 {
@@ -40,119 +58,1229 @@ static void check(int condition, const char *label)
     }
 }
 
+static void fatal(const char *message)
+{
+    printf(RED "%s" NC "\n", message);
+    exit(1);
+}
+
+static void skip_check(const char *label)
+{
+    printf("  " BLUE "-" NC " %s\n", label);
+    skips++;
+}
+
+// The kernel refuses to create a symlink whose target is >= PATH_MAX bytes
+// (do_symlinkat's own limit), so capture_symlink_at()'s truncation check can
+// never be exercised by a real on-disk fixture -- no local filesystem lets
+// you create the input that would trip it. This wrapper simulates what a
+// truncating readlink() would report (fully filling the caller's buffer,
+// exactly its own size) for one specific source path, chosen with strcmp so
+// every other readlink() call in the linked program -- there are several,
+// e.g. inside portable.c's own symlink handling -- passes through untouched.
+static const char *readlink_truncate_path;
+static int readlink_truncate_triggered;
+
+extern ssize_t __real_readlink(const char *path, char *buf, size_t bufsiz);
+
+ssize_t __wrap_readlink(const char *path, char *buf, size_t bufsiz)
+{
+    if (readlink_truncate_path != NULL && !readlink_truncate_triggered &&
+        strcmp(path, readlink_truncate_path) == 0)
+    {
+        readlink_truncate_triggered = 1;
+        memset(buf, 'a', bufsiz);
+        return (ssize_t)bufsiz;
+    }
+    return __real_readlink(path, buf, bufsiz);
+}
+
+static void write_file(const char *path, const char *content)
+{
+    FILE *f = fopen(path, "w");
+    if (f == NULL)
+        fatal("fixture: could not write a file");
+    fputs(content, f);
+    fclose(f);
+}
+
+static int remove_cb(const char *path, const struct stat *sb, int typeflag, struct FTW *ftwbuf)
+{
+    (void)sb;
+    (void)typeflag;
+    (void)ftwbuf;
+    return remove(path);
+}
+
+// FTW_PHYS so the symlink fixtures are removed as themselves rather than
+// followed out of the fixture tree.
+static void remove_tree(const char *path)
+{
+    if (nftw(path, remove_cb, 16, FTW_DEPTH | FTW_PHYS) != 0)
+        fatal("fixture: could not clean up the test root");
+}
+
+static int file_contains(const char *path, const char *expected)
+{
+    char buffer[512];
+    FILE *f = fopen(path, "r");
+    if (f == NULL)
+        return 0;
+    size_t n = fread(buffer, 1, sizeof(buffer) - 1, f);
+    fclose(f);
+    buffer[n] = '\0';
+    return strcmp(buffer, expected) == 0;
+}
+
+static void test_native_hardlinks(void)
+{
+    printf(BLUE "::" NC " native hardlink capture (unit)\n");
+
+    char root[] = "/tmp/migr_native_hardlink_XXXXXX";
+    if (mkdtemp(root) == NULL)
+        fatal("could not create native hardlink test root");
+
+    char source[PATH_MAX], destination[PATH_MAX];
+    if (path_join(source, sizeof(source), root, "source") != 0 ||
+        path_join(destination, sizeof(destination), root, "destination") != 0 ||
+        mkdir(source, 0755) != 0 || mkdir(destination, 0755) != 0)
+        fatal("could not create native hardlink test directories");
+
+    char first_dir[PATH_MAX], second_dir[PATH_MAX];
+    char first[PATH_MAX], second[PATH_MAX];
+    if (path_join(first_dir, sizeof(first_dir), source, "first") != 0 ||
+        path_join(second_dir, sizeof(second_dir), source, "second") != 0 ||
+        mkdir(first_dir, 0755) != 0 || mkdir(second_dir, 0755) != 0 ||
+        path_join(first, sizeof(first), first_dir, "representative") != 0 ||
+        path_join(second, sizeof(second), second_dir, "alias") != 0)
+        fatal("could not create native hardlink source layout");
+
+    write_file(first, "native-hardlink-content");
+    if (link(first, second) != 0)
+        fatal("could not create native hardlink source pair");
+    if (chmod(first, 0640) != 0)
+        fatal("could not set native hardlink source mode");
+    struct timespec times[2] = {
+        { .tv_sec = 1234567890, .tv_nsec = 123456789 },
+        { .tv_sec = 1234567890, .tv_nsec = 987654321 }
+    };
+    if (utimensat(AT_FDCWD, first, times, 0) != 0)
+        fatal("could not set native hardlink source times");
+
+    struct stat source_st;
+    check(lstat(first, &source_st) == 0 && lstat(second, &source_st) == 0,
+          "native hardlink source pair is present");
+    struct stat first_source_st;
+    struct stat second_source_st;
+    int source_pair_ok = lstat(first, &first_source_st) == 0 &&
+                         lstat(second, &second_source_st) == 0 &&
+                         first_source_st.st_dev == second_source_st.st_dev &&
+                         first_source_st.st_ino == second_source_st.st_ino &&
+                         first_source_st.st_nlink == 2;
+    check(source_pair_ok, "native hardlink source pair shares one inode");
+
+    int destination_fd = open(destination, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (destination_fd < 0)
+        fatal("could not open native hardlink destination");
+
+    void *map = native_inode_map_create();
+    if (map == NULL)
+        fatal("could not create native hardlink inode map");
+    CloneContext context = {
+        .operation = CLONE_BACKUP,
+        .representation = CLONE_NATIVE_TREE,
+        .timestamp_policy_configured = 1,
+        .nsec_exact = 1,
+        .metadata_preflight_done = 1,
+        .inode_map = map
+    };
+
+    check(backup_capture_at(&context, source, destination_fd, "tree") == 0,
+          "nested native hardlink capture succeeds");
+
+    char destination_first[PATH_MAX], destination_second[PATH_MAX];
+    if (path_join(destination_first, sizeof(destination_first), destination,
+                  "tree/first/representative") != 0 ||
+        path_join(destination_second, sizeof(destination_second), destination,
+                  "tree/second/alias") != 0)
+        fatal("could not build native hardlink destination paths");
+    struct stat destination_first_st;
+    struct stat destination_second_st;
+    int destination_pair_ok =
+        lstat(destination_first, &destination_first_st) == 0 &&
+        lstat(destination_second, &destination_second_st) == 0 &&
+        native_hardlink_identity_matches(&destination_first_st,
+                                         &destination_second_st) &&
+        destination_first_st.st_nlink == 2 &&
+        file_contains(destination_first, "native-hardlink-content") &&
+        file_contains(destination_second, "native-hardlink-content");
+    check(destination_pair_ok,
+          "nested native hardlink capture preserves the destination inode");
+    check(destination_pair_ok &&
+              (destination_first_st.st_mode & 07777) ==
+                  (first_source_st.st_mode & 07777) &&
+              destination_first_st.st_uid == first_source_st.st_uid &&
+              destination_first_st.st_gid == first_source_st.st_gid &&
+              destination_first_st.st_atim.tv_sec == first_source_st.st_atim.tv_sec &&
+              destination_first_st.st_atim.tv_nsec == first_source_st.st_atim.tv_nsec &&
+              destination_first_st.st_mtim.tv_sec == first_source_st.st_mtim.tv_sec &&
+              destination_first_st.st_mtim.tv_nsec == first_source_st.st_mtim.tv_nsec,
+          "native hardlink representative metadata is preserved");
+    native_inode_map_free(map);
+
+    map = native_inode_map_create();
+    if (map == NULL)
+        fatal("could not create native hardlink resume map");
+    context.inode_map = map;
+    check(backup_capture_at(&context, source, destination_fd, "tree") == 0,
+          "native hardlink capture resumes an existing pair");
+    struct stat resumed_first_st;
+    struct stat resumed_second_st;
+    int resumed_pair_ok = lstat(destination_first, &resumed_first_st) == 0 &&
+                          lstat(destination_second, &resumed_second_st) == 0 &&
+                          native_hardlink_identity_matches(&resumed_first_st,
+                                                           &resumed_second_st);
+    check(resumed_pair_ok, "resume keeps both native hardlink names linked");
+    native_inode_map_free(map);
+
+    char source_a[PATH_MAX], source_b[PATH_MAX];
+    char source_a_file[PATH_MAX], source_b_file[PATH_MAX];
+    char destination_a[PATH_MAX], destination_b[PATH_MAX];
+    if (path_join(source_a, sizeof(source_a), root, "source-a") != 0 ||
+        path_join(source_b, sizeof(source_b), root, "source-b") != 0 ||
+        mkdir(source_a, 0755) != 0 || mkdir(source_b, 0755) != 0 ||
+        path_join(source_a_file, sizeof(source_a_file), source_a, "payload") != 0 ||
+        path_join(source_b_file, sizeof(source_b_file), source_b, "payload") != 0)
+        fatal("could not create cross-root native hardlink sources");
+    write_file(source_a_file, "cross-root-content");
+    if (link(source_a_file, source_b_file) != 0)
+        fatal("could not create cross-root native hardlink pair");
+    if (path_join(destination_a, sizeof(destination_a), destination, "root-a") != 0 ||
+        path_join(destination_b, sizeof(destination_b), destination, "root-b") != 0 ||
+        mkdir(destination_a, 0755) != 0 || mkdir(destination_b, 0755) != 0)
+        fatal("could not create cross-root native hardlink destinations");
+
+    map = native_inode_map_create();
+    if (map == NULL)
+        fatal("could not create native cross-root hardlink map");
+    context.inode_map = map;
+    check(backup_capture_at(&context, source_a, destination_fd, "root-a") == 0 &&
+              backup_capture_at(&context, source_b, destination_fd, "root-b") == 0,
+          "cross-root native hardlink capture succeeds");
+    char destination_a_file[PATH_MAX], destination_b_file[PATH_MAX];
+    if (path_join(destination_a_file, sizeof(destination_a_file), destination_a,
+                  "payload") != 0 ||
+        path_join(destination_b_file, sizeof(destination_b_file), destination_b,
+                  "payload") != 0)
+        fatal("could not build cross-root native hardlink destinations");
+    struct stat destination_a_st;
+    struct stat destination_b_st;
+    check(lstat(destination_a_file, &destination_a_st) == 0 &&
+              lstat(destination_b_file, &destination_b_st) == 0 &&
+              native_hardlink_identity_matches(&destination_a_st,
+                                               &destination_b_st) &&
+              destination_a_st.st_nlink == 2,
+          "native hardlinks remain linked across capture roots");
+    native_inode_map_free(map);
+
+    struct stat identity_a = {0};
+    struct stat identity_b = {0};
+    identity_a.st_dev = 1;
+    identity_a.st_ino = 2;
+    identity_b = identity_a;
+    check(native_hardlink_identity_matches(&identity_a, &identity_b),
+          "native hardlink identity accepts matching device and inode");
+    identity_b.st_ino++;
+    check(!native_hardlink_identity_matches(&identity_a, &identity_b),
+          "native hardlink identity rejects an inode mismatch");
+    identity_b = identity_a;
+    identity_b.st_dev++;
+    check(!native_hardlink_identity_matches(&identity_a, &identity_b),
+          "native hardlink identity rejects a device mismatch");
+
+    close(destination_fd);
+    remove_tree(root);
+}
+
+typedef struct {
+    char source_first[PATH_MAX];
+    char source_second[PATH_MAX];
+    char destination_first[PATH_MAX];
+    char destination_second[PATH_MAX];
+} NativeHardlinkInterrupt;
+
+static void kill_after_first_native_hardlink_member(const char *source_path,
+                                                    void *opaque)
+{
+    NativeHardlinkInterrupt *fixture = opaque;
+    int current = strcmp(source_path, fixture->source_first) == 0 ? 0 :
+                  strcmp(source_path, fixture->source_second) == 0 ? 1 : -1;
+    if (current < 0)
+        return;
+
+    struct stat first_st;
+    struct stat second_st;
+    int first_exists = lstat(fixture->destination_first, &first_st) == 0;
+    int second_exists = lstat(fixture->destination_second, &second_st) == 0;
+    if (first_exists == second_exists)
+        return;
+
+    if ((current == 0 && !first_exists) ||
+        (current == 1 && !second_exists))
+        (void)kill(getpid(), SIGKILL);
+}
+
+static void test_native_hardlink_interrupt_resume(void)
+{
+    printf(BLUE "::" NC " native hardlink capture interruption/resume (unit)\n");
+
+    char root[] = "/tmp/migr_native_hardlink_resume_XXXXXX";
+    if (mkdtemp(root) == NULL)
+        fatal("could not create native hardlink resume test root");
+
+    char source_first_root[PATH_MAX], source_second_root[PATH_MAX];
+    char destination[PATH_MAX], source_first[PATH_MAX], source_second[PATH_MAX];
+    char destination_first[PATH_MAX], destination_second[PATH_MAX];
+    if (path_join(source_first_root, sizeof(source_first_root), root,
+                  "source-first") != 0 ||
+        path_join(source_second_root, sizeof(source_second_root), root,
+                  "source-second") != 0 ||
+        path_join(destination, sizeof(destination), root, "destination") != 0 ||
+        mkdir(source_first_root, 0755) != 0 ||
+        mkdir(source_second_root, 0755) != 0 ||
+        mkdir(destination, 0755) != 0 ||
+        path_join(source_first, sizeof(source_first), source_first_root,
+                  "payload") != 0 ||
+        path_join(source_second, sizeof(source_second), source_second_root,
+                  "payload") != 0 ||
+        path_join(destination_first, sizeof(destination_first), destination,
+                  "root-a/payload") != 0 ||
+        path_join(destination_second, sizeof(destination_second), destination,
+                  "root-b/payload") != 0)
+        fatal("could not create native hardlink resume fixture");
+
+    write_file(source_first, "native-hardlink-resume-content");
+    if (link(source_first, source_second) != 0)
+        fatal("could not create native hardlink resume source pair");
+
+    NativeHardlinkInterrupt hook = {0};
+    if (snprintf(hook.source_first, sizeof(hook.source_first), "%s", source_first) < 0 ||
+        snprintf(hook.source_second, sizeof(hook.source_second), "%s", source_second) < 0 ||
+        snprintf(hook.destination_first, sizeof(hook.destination_first), "%s",
+                 destination_first) < 0 ||
+        snprintf(hook.destination_second, sizeof(hook.destination_second), "%s",
+                 destination_second) < 0)
+        fatal("could not initialize native hardlink resume hook");
+
+    pid_t child = fork();
+    if (child < 0)
+        fatal("could not fork native hardlink interruption child");
+    if (child == 0)
+    {
+        int destination_fd = open(destination, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (destination_fd < 0)
+            _exit(2);
+        void *map = native_inode_map_create();
+        if (map == NULL)
+        {
+            close(destination_fd);
+            _exit(2);
+        }
+        CloneContext context = {
+            .operation = CLONE_BACKUP,
+            .representation = CLONE_NATIVE_TREE,
+            .timestamp_policy_configured = 1,
+            .nsec_exact = 1,
+            .metadata_preflight_done = 1,
+            .inode_map = map
+        };
+        backup_test_set_capture_hook(kill_after_first_native_hardlink_member,
+                                     &hook);
+        int result = backup_capture_at(&context, source_first_root,
+                                       destination_fd, "root-a");
+        if (result == 0)
+            result = backup_capture_at(&context, source_second_root,
+                                       destination_fd, "root-b");
+        backup_test_set_capture_hook(NULL, NULL);
+        native_inode_map_free(map);
+        close(destination_fd);
+        _exit(result == 0 ? 0 : 1);
+    }
+
+    int child_status = 0;
+    if (waitpid(child, &child_status, 0) != child)
+        fatal("could not wait for native hardlink interruption child");
+    int interrupted = WIFSIGNALED(child_status) &&
+                      WTERMSIG(child_status) == SIGKILL;
+    check(interrupted,
+          "native hardlink capture is interrupted after one member");
+    if (!interrupted)
+    {
+        remove_tree(root);
+        return;
+    }
+
+    struct stat first_destination_st;
+    struct stat second_destination_st;
+    int first_destination_exists =
+        lstat(destination_first, &first_destination_st) == 0;
+    int second_destination_exists =
+        lstat(destination_second, &second_destination_st) == 0;
+    check(first_destination_exists != second_destination_exists,
+          "interruption leaves exactly one native hardlink destination member");
+    if (first_destination_exists == second_destination_exists)
+    {
+        remove_tree(root);
+        return;
+    }
+
+    int destination_fd = open(destination, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (destination_fd < 0)
+        fatal("could not reopen native hardlink resume destination");
+    void *map = native_inode_map_create();
+    if (map == NULL)
+        fatal("could not create native hardlink resume map");
+    CloneContext context = {
+        .operation = CLONE_BACKUP,
+        .representation = CLONE_NATIVE_TREE,
+        .timestamp_policy_configured = 1,
+        .nsec_exact = 1,
+        .metadata_preflight_done = 1,
+        .inode_map = map
+    };
+    check(native_inode_map_seed_existing(&context, source_first_root,
+                                         destination_fd, "root-a", NULL) == 0 &&
+              native_inode_map_seed_existing(&context, source_second_root,
+                                             destination_fd, "root-b", NULL) == 0,
+          "native hardlink resume seeds existing representatives before walking");
+    int resume_result = backup_capture_at(&context, source_second_root,
+                                          destination_fd, "root-b");
+    if (resume_result == 0)
+        resume_result = backup_capture_at(&context, source_first_root,
+                                          destination_fd, "root-a");
+    check(resume_result == 0,
+          "native hardlink capture resumes after root-order reversal");
+    int resumed_pair_ok = lstat(destination_first, &first_destination_st) == 0 &&
+                          lstat(destination_second, &second_destination_st) == 0 &&
+                          native_hardlink_identity_matches(&first_destination_st,
+                                                           &second_destination_st) &&
+                          first_destination_st.st_nlink == 2;
+    check(resumed_pair_ok,
+          "native hardlink interruption/resume preserves one destination inode");
+
+    native_inode_map_free(map);
+    close(destination_fd);
+    remove_tree(root);
+}
+
+typedef struct {
+    char destination_first[PATH_MAX];
+    char destination_second[PATH_MAX];
+} NativeRestoreHardlinkInterrupt;
+
+static void kill_after_first_native_restore_member(const char *logical_path,
+                                                   void *opaque)
+{
+    (void)logical_path;
+    NativeRestoreHardlinkInterrupt *fixture = opaque;
+    struct stat first_st;
+    struct stat second_st;
+    int first_exists = lstat(fixture->destination_first, &first_st) == 0;
+    int second_exists = lstat(fixture->destination_second, &second_st) == 0;
+    if (first_exists != second_exists)
+        (void)kill(getpid(), SIGKILL);
+}
+
+static void test_native_restore_hardlink_interrupt_resume(void)
+{
+    printf(BLUE "::" NC " native hardlink restore interruption/resume (unit)\n");
+
+    char root[] = "/tmp/migr_native_restore_hardlink_resume_XXXXXX";
+    if (mkdtemp(root) == NULL)
+        fatal("could not create native restore hardlink resume test root");
+
+    char source[PATH_MAX], destination[PATH_MAX];
+    char source_first_root[PATH_MAX], source_second_root[PATH_MAX];
+    char source_first[PATH_MAX], source_second[PATH_MAX];
+    char destination_first[PATH_MAX], destination_second[PATH_MAX];
+    if (path_join(source, sizeof(source), root, "source") != 0 ||
+        path_join(destination, sizeof(destination), root, "destination") != 0 ||
+        mkdir(source, 0755) != 0 || mkdir(destination, 0755) != 0 ||
+        path_join(source_first_root, sizeof(source_first_root), source,
+                  "root-a") != 0 ||
+        path_join(source_second_root, sizeof(source_second_root), source,
+                  "root-b") != 0 ||
+        mkdir(source_first_root, 0755) != 0 ||
+        mkdir(source_second_root, 0755) != 0 ||
+        path_join(source_first, sizeof(source_first), source_first_root,
+                  "payload") != 0 ||
+        path_join(source_second, sizeof(source_second), source_second_root,
+                  "payload") != 0 ||
+        path_join(destination_first, sizeof(destination_first), destination,
+                  "root-a/payload") != 0 ||
+        path_join(destination_second, sizeof(destination_second), destination,
+                  "root-b/payload") != 0)
+        fatal("could not create native restore hardlink resume fixture");
+
+    write_file(source_first, "native-restore-hardlink-resume-content");
+    if (link(source_first, source_second) != 0)
+        fatal("could not create native restore hardlink source pair");
+
+    NativeRestoreHardlinkInterrupt hook = {0};
+    if (snprintf(hook.destination_first, sizeof(hook.destination_first), "%s",
+                 destination_first) < 0 ||
+        snprintf(hook.destination_second, sizeof(hook.destination_second), "%s",
+                 destination_second) < 0)
+        fatal("could not initialize native restore hardlink resume hook");
+
+    pid_t child = fork();
+    if (child < 0)
+        fatal("could not fork native restore hardlink interruption child");
+    if (child == 0)
+    {
+        int source_fd = open(source, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        int destination_fd =
+            open(destination, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        void *map = native_inode_map_create();
+        if (source_fd < 0 || destination_fd < 0 || map == NULL)
+            _exit(2);
+
+        CloneContext context = {
+            .operation = CLONE_RESTORE,
+            .representation = CLONE_NATIVE_TREE,
+            .timestamp_policy_configured = 1,
+            .nsec_exact = 1,
+            .metadata_preflight_done = 1,
+            .inode_map = map
+        };
+        restore_native_test_set_apply_hook(
+            kill_after_first_native_restore_member, &hook);
+        int result = restore_native_at(&context, source_fd, "root-a",
+                                       destination_fd, "root-a");
+        restore_native_test_set_apply_hook(NULL, NULL);
+        native_inode_map_free(map);
+        close(source_fd);
+        close(destination_fd);
+        _exit(result == RESTORE_NATIVE_OK ? 0 : 1);
+    }
+
+    int child_status = 0;
+    if (waitpid(child, &child_status, 0) != child)
+        fatal("could not wait for native restore hardlink interruption child");
+    int interrupted = WIFSIGNALED(child_status) &&
+                      WTERMSIG(child_status) == SIGKILL;
+    check(interrupted,
+          "native hardlink restore is interrupted after one member");
+    if (!interrupted)
+    {
+        remove_tree(root);
+        return;
+    }
+
+    struct stat first_destination_st;
+    struct stat second_destination_st;
+    int first_destination_exists =
+        lstat(destination_first, &first_destination_st) == 0;
+    int second_destination_exists =
+        lstat(destination_second, &second_destination_st) == 0;
+    check(first_destination_exists != second_destination_exists,
+          "restore interruption leaves exactly one hardlink destination member");
+    if (first_destination_exists == second_destination_exists)
+    {
+        remove_tree(root);
+        return;
+    }
+
+    int source_fd = open(source, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int destination_fd = open(destination, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    void *map = native_inode_map_create();
+    if (source_fd < 0 || destination_fd < 0 || map == NULL)
+        fatal("could not reopen native restore hardlink resume fixture");
+    CloneContext context = {
+        .operation = CLONE_RESTORE,
+        .representation = CLONE_NATIVE_TREE,
+        .timestamp_policy_configured = 1,
+        .nsec_exact = 1,
+        .metadata_preflight_done = 1,
+        .inode_map = map
+    };
+    check(native_inode_map_seed_existing(&context, source_first_root,
+                                         destination_fd, "root-a", NULL) == 0 &&
+              native_inode_map_seed_existing(&context, source_second_root,
+                                             destination_fd, "root-b", NULL) == 0,
+          "native restore resume seeds existing representatives before walking");
+
+    RestoreNativeReport sibling_report;
+    RestoreNativeReport representative_report;
+    RestoreNativeStatus sibling_status = restore_native_at_report(
+        &context, source_fd, "root-b", destination_fd, "root-b",
+        &sibling_report, NULL);
+    RestoreNativeStatus representative_status = restore_native_at_report(
+        &context, source_fd, "root-a", destination_fd, "root-a",
+        &representative_report, NULL);
+    check(sibling_status == RESTORE_NATIVE_OK &&
+              sibling_report.failed_count == 0,
+          "native restore resumes the reversed sibling without failure");
+    check(representative_status == RESTORE_NATIVE_OK &&
+              representative_report.failed_count == 0,
+          "previously restored representative is not reported as failed");
+
+    int resumed_pair_ok = lstat(destination_first, &first_destination_st) == 0 &&
+                          lstat(destination_second, &second_destination_st) == 0 &&
+                          native_hardlink_identity_matches(&first_destination_st,
+                                                           &second_destination_st) &&
+                          first_destination_st.st_nlink == 2 &&
+                          file_contains(destination_first,
+                                        "native-restore-hardlink-resume-content") &&
+                          file_contains(destination_second,
+                                        "native-restore-hardlink-resume-content");
+    check(resumed_pair_ok,
+          "native restore interruption/resume preserves one destination inode");
+
+    native_inode_map_free(map);
+    close(source_fd);
+    close(destination_fd);
+    remove_tree(root);
+}
+
+static void test_native_visited_paths(void)
+{
+    printf(BLUE "::" NC " native capture visited paths (unit)\n");
+
+    char root[] = "/tmp/migr_native_visited_XXXXXX";
+    if (mkdtemp(root) == NULL)
+        fatal("could not create native visited test root");
+
+    char source[PATH_MAX], destination[PATH_MAX], file[PATH_MAX];
+    char subdir[PATH_MAX], nested[PATH_MAX], link_path[PATH_MAX];
+    char fifo[PATH_MAX], socket_path[PATH_MAX];
+    if (path_join(source, sizeof(source), root, "source") != 0 ||
+        path_join(destination, sizeof(destination), root, "destination") != 0 ||
+        path_join(file, sizeof(file), source, "file.txt") != 0 ||
+        path_join(subdir, sizeof(subdir), source, "subdir") != 0 ||
+        path_join(nested, sizeof(nested), subdir, "nested.txt") != 0 ||
+        path_join(link_path, sizeof(link_path), source, "link") != 0 ||
+        path_join(fifo, sizeof(fifo), source, "fifo") != 0 ||
+        path_join(socket_path, sizeof(socket_path), source, "sock") != 0 ||
+        mkdir(source, 0755) != 0 || mkdir(destination, 0755) != 0 ||
+        mkdir(subdir, 0755) != 0)
+        fatal("could not create native visited test layout");
+    write_file(file, "visited-file");
+    write_file(nested, "visited-nested");
+    if (symlink("visited-target", link_path) != 0 ||
+        mkfifo(fifo, 0640) != 0)
+        fatal("could not create native visited test entries");
+
+    int socket_available = 0;
+    int socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (socket_fd < 0)
+    {
+        if (errno != EPERM && errno != EACCES && errno != EAFNOSUPPORT)
+            fatal("could not create native visited socket fixture");
+    }
+    else
+    {
+        struct sockaddr_un address;
+        memset(&address, 0, sizeof(address));
+        address.sun_family = AF_UNIX;
+        if (strlen(socket_path) >= sizeof(address.sun_path))
+            fatal("native visited socket fixture path is too long");
+        strcpy(address.sun_path, socket_path);
+        if (bind(socket_fd, (struct sockaddr *)&address, sizeof(address)) == 0)
+            socket_available = 1;
+        else if (errno != EPERM && errno != EACCES && errno != EAFNOSUPPORT)
+            fatal("could not bind native visited socket fixture");
+        close(socket_fd);
+        if (!socket_available)
+            unlink(socket_path);
+    }
+
+    int destination_fd = open(destination, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (destination_fd < 0)
+        fatal("could not open native visited destination");
+    void *visited = native_visited_create();
+    if (visited == NULL)
+        fatal("could not create native visited set");
+    CloneContext context = {
+        .operation = CLONE_BACKUP,
+        .representation = CLONE_NATIVE_TREE,
+        .timestamp_policy_configured = 1,
+        .nsec_exact = 1,
+        .metadata_preflight_done = 1,
+        .visited = visited
+    };
+
+    check(backup_capture_at(&context, source, destination_fd, "tree") == 0,
+          "native capture with visited tracking succeeds");
+    check(native_visited_contains(context.visited, "tree", "") == 1,
+          "visited set records the root object");
+    check(native_visited_contains(context.visited, "tree", "file.txt") == 1,
+          "visited set records a regular file");
+    check(native_visited_contains(context.visited, "tree", "subdir") == 1,
+          "visited set records a nested directory");
+    check(native_visited_contains(context.visited, "tree",
+                                  "subdir/nested.txt") == 1,
+          "visited set records a nested regular file without a leading slash");
+    check(native_visited_contains(context.visited, "tree", "link") == 1,
+          "visited set records a symlink");
+    check(native_visited_contains(context.visited, "tree", "fifo") == 1,
+          "visited set records a FIFO");
+    if (socket_available)
+        check(native_visited_contains(context.visited, "tree", "sock") == 0,
+              "visited set excludes a skipped socket");
+    else
+        printf("  " BLUE "-" NC " Unix socket fixture unavailable on this host\n");
+    struct stat device_st;
+    int device_available = lstat("/dev/null", &device_st) == 0 &&
+                           S_ISCHR(device_st.st_mode);
+    if (device_available)
+        check(backup_capture_at(&context, "/dev/null", destination_fd,
+                                "device") == 0 &&
+                  native_visited_contains(context.visited, "device", "") == 0,
+              "visited set excludes a skipped device node");
+    else
+        printf("  " BLUE "-" NC " device-node fixture unavailable on this host\n");
+    check(native_visited_contains(context.visited, "tree", "/file.txt") == 0,
+          "visited set does not add a leading slash to relative paths");
+
+    native_visited_free(context.visited);
+    close(destination_fd);
+    remove_tree(root);
+}
+
+static void test_native_reconciliation(void)
+{
+    printf(BLUE "::" NC " native stale reconciliation (unit)\n");
+
+    char root[] = "/tmp/migr_native_reconcile_XXXXXX";
+    if (mkdtemp(root) == NULL)
+        fatal("could not create native reconciliation test root");
+
+    char source[PATH_MAX], destination[PATH_MAX], source_file[PATH_MAX];
+    char source_keep[PATH_MAX];
+    char source_subdir[PATH_MAX], source_nested[PATH_MAX];
+    char tree[PATH_MAX], keep[PATH_MAX], nested[PATH_MAX];
+    char gone[PATH_MAX], stale_dir[PATH_MAX], stale_nested[PATH_MAX];
+    char walk_stale[PATH_MAX], blocked[PATH_MAX], blocked_child[PATH_MAX];
+    char outside_stale[PATH_MAX], single[PATH_MAX];
+    char empty_source[PATH_MAX], root_only[PATH_MAX], root_only_child[PATH_MAX];
+    char skipped_root[PATH_MAX], skipped_child[PATH_MAX];
+    if (path_join(source, sizeof(source), root, "source") != 0 ||
+        path_join(destination, sizeof(destination), root, "destination") != 0 ||
+        path_join(source_file, sizeof(source_file), source, "single.txt") != 0 ||
+        path_join(source_keep, sizeof(source_keep), source, "keep.txt") != 0 ||
+        path_join(source_subdir, sizeof(source_subdir), source, "subdir") != 0 ||
+        path_join(source_nested, sizeof(source_nested), source_subdir,
+                  "nested.txt") != 0 ||
+        path_join(tree, sizeof(tree), destination, "tree") != 0 ||
+        path_join(keep, sizeof(keep), tree, "keep.txt") != 0 ||
+        path_join(nested, sizeof(nested), tree, "subdir/nested.txt") != 0 ||
+        path_join(gone, sizeof(gone), tree, "gone.txt") != 0 ||
+        path_join(stale_dir, sizeof(stale_dir), tree, "stale_dir") != 0 ||
+        path_join(stale_nested, sizeof(stale_nested), stale_dir,
+                  "nested.txt") != 0 ||
+        path_join(walk_stale, sizeof(walk_stale), tree, "walk-stale.txt") != 0 ||
+        path_join(blocked, sizeof(blocked), tree, "blocked") != 0 ||
+        path_join(blocked_child, sizeof(blocked_child), blocked, "child.txt") != 0 ||
+        path_join(outside_stale, sizeof(outside_stale), tree,
+                  "outside-stale.txt") != 0 ||
+        path_join(single, sizeof(single), destination, "single") != 0 ||
+        path_join(empty_source, sizeof(empty_source), root, "empty-source") != 0 ||
+        path_join(root_only, sizeof(root_only), destination, "root-only") != 0 ||
+        path_join(root_only_child, sizeof(root_only_child), root_only,
+                  "stale.txt") != 0 ||
+        path_join(skipped_root, sizeof(skipped_root), destination,
+                  "skipped-root") != 0 ||
+        path_join(skipped_child, sizeof(skipped_child), skipped_root,
+                  "stale.txt") != 0)
+        fatal("could not build native reconciliation paths");
+    if (mkdir(source, 0755) != 0 || mkdir(destination, 0755) != 0 ||
+        mkdir(source_subdir, 0755) != 0 || mkdir(empty_source, 0755) != 0)
+        fatal("could not create native reconciliation directories");
+    write_file(source_file, "single-source");
+    write_file(source_keep, "keep");
+    write_file(source_nested, "nested");
+
+    int destination_fd = open(destination, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (destination_fd < 0)
+        fatal("could not open native reconciliation destination");
+    void *visited = native_visited_create();
+    if (visited == NULL)
+        fatal("could not create native reconciliation visited set");
+    CloneContext context = {
+        .operation = CLONE_BACKUP,
+        .representation = CLONE_NATIVE_TREE,
+        .timestamp_policy_configured = 1,
+        .nsec_exact = 1,
+        .metadata_preflight_done = 1,
+        .visited = visited
+    };
+    check(backup_capture_at(&context, source, destination_fd, "tree") == 0,
+          "native reconciliation fixture is captured");
+    write_file(gone, "stale-file");
+    if (mkdir(stale_dir, 0755) != 0)
+        fatal("could not create stale directory fixture");
+    write_file(stale_nested, "stale-subtree");
+
+    NativeReconcileReport report;
+    check(native_reconcile_stale_at(visited, "tree", destination_fd,
+                                    &report) == NATIVE_RECONCILE_OK,
+          "stale scan and deletion succeeds after a clean capture");
+    check(access(gone, F_OK) != 0 && access(keep, F_OK) == 0 &&
+              access(nested, F_OK) == 0,
+          "selective reconciliation removes only the unvisited file");
+    check(access(stale_dir, F_OK) != 0,
+          "reconciliation removes an unvisited subtree recursively");
+
+    if (geteuid() == 0)
+        skip_check("permission-based native reconciliation failures require a non-root user");
+    else
+    {
+        write_file(walk_stale, "must-survive-scan-error");
+        char captured_subdir[PATH_MAX];
+        if (path_join(captured_subdir, sizeof(captured_subdir), tree,
+                      "subdir") != 0 || chmod(captured_subdir, 0000) != 0)
+            fatal("could not make a visited directory unreadable");
+        native_reconcile_report_init(&report);
+        check(native_reconcile_stale_at(visited, "tree", destination_fd,
+                                        &report) == NATIVE_RECONCILE_ERROR &&
+                  access(walk_stale, F_OK) == 0,
+              "a scan error prevents every deletion in that run");
+        if (chmod(captured_subdir, 0755) != 0)
+            fatal("could not restore the visited directory permissions");
+
+        if (mkdir(blocked, 0755) != 0)
+            fatal("could not create blocked stale directory");
+        write_file(blocked_child, "blocked");
+        if (chmod(blocked, 0000) != 0)
+            fatal("could not make stale directory undeletable");
+        write_file(outside_stale, "outside");
+        native_reconcile_report_init(&report);
+        check(native_reconcile_stale_at(visited, "tree", destination_fd,
+                                        &report) == NATIVE_RECONCILE_ERROR &&
+                  report.failed_relative_path[0] != '\0' &&
+                  access(blocked, F_OK) == 0 && access(outside_stale, F_OK) != 0,
+              "a deletion failure is reported while later stale entries are attempted");
+        check(report.failed_operation != NULL &&
+                  strcmp(report.failed_operation,
+                         "remove it from the backup") == 0 &&
+                  report.failure_errno == EACCES,
+              "the deletion failure says what was being done and errno");
+        if (chmod(blocked, 0755) != 0)
+            fatal("could not restore blocked stale directory permissions");
+    }
+
+    check(backup_capture_at(&context, empty_source, destination_fd,
+                            "root-only") == 0,
+          "an empty source directory records its root object");
+    write_file(root_only_child, "stale-child");
+    native_reconcile_report_init(&report);
+    check(native_reconcile_stale_at(visited, "root-only", destination_fd,
+                                    &report) == NATIVE_RECONCILE_OK &&
+              access(root_only, F_OK) == 0 &&
+              access(root_only_child, F_OK) != 0,
+          "a visited root is preserved while its stale child is removed");
+
+    if (mkdir(skipped_root, 0755) != 0)
+        fatal("could not create skipped-root fixture");
+    write_file(skipped_child, "stale-child");
+    void *empty_visited = native_visited_create();
+    if (empty_visited == NULL)
+        fatal("could not create empty reconciliation visited set");
+    native_reconcile_report_init(&report);
+    check(native_reconcile_stale_at(empty_visited, "skipped-root",
+                                    destination_fd, &report) == NATIVE_RECONCILE_OK &&
+              access(skipped_root, F_OK) != 0,
+          "an unvisited skipped root and its stale subtree are removed");
+    native_visited_free(empty_visited);
+
+    check(backup_capture_at(&context, source_file, destination_fd, "single") == 0,
+          "a non-directory root can be captured for reconciliation");
+    native_reconcile_report_init(&report);
+    check(native_reconcile_stale_at(visited, "single", destination_fd,
+                                    &report) == NATIVE_RECONCILE_OK &&
+              access(single, F_OK) == 0,
+          "a non-directory root is left untouched");
+    check(native_reconcile_stale_at(visited, "missing", destination_fd,
+                                    &report) == NATIVE_RECONCILE_OK,
+          "a missing root is treated as an empty reconciliation target");
+
+    native_visited_free(visited);
+    close(destination_fd);
+    remove_tree(root);
+}
+
 int main(void)
 {
-    printf(BLUE "::" NC " special files (unit)\n");
+    // A direct sudo run must not aim restores at the invoking user's home
+    // (D38); make and test.sh drop SUDO_UID already.
+    unsetenv("SUDO_UID");
+    printf(BLUE "::" NC " backup capture walker (unit)\n");
+
+    test_native_hardlinks();
+    test_native_hardlink_interrupt_resume();
+    test_native_restore_hardlink_interrupt_resume();
+    test_native_visited_paths();
+    test_native_reconciliation();
+
+    CloneContext ctx = { .operation = CLONE_BACKUP, .representation = CLONE_NATIVE_TREE };
 
     char root[] = "/tmp/migr_special_XXXXXX";
     if (mkdtemp(root) == NULL)
-    {
-        printf(RED "could not create temporary directory" NC "\n");
-        return 1;
-    }
+        fatal("could not create temporary directory");
 
-    char src_fifo[PATH_MAX], dest_fifo[PATH_MAX];
-    char src_socket[PATH_MAX], dest_socket[PATH_MAX];
-    char dest_device[PATH_MAX];
-    if (path_join(src_fifo, sizeof(src_fifo), root, "source.fifo") != 0 ||
-        path_join(dest_fifo, sizeof(dest_fifo), root, "copied.fifo") != 0 ||
-        path_join(src_socket, sizeof(src_socket), root, "source.socket") != 0 ||
-        path_join(dest_socket, sizeof(dest_socket), root, "copied.socket") != 0 ||
-        path_join(dest_device, sizeof(dest_device), root, "copied.device") != 0)
-    {
-        rmdir(root);
-        printf(RED "could not build fixture paths" NC "\n");
-        return 1;
-    }
+    // dest/ is the container stand-in the walker is anchored to; outside/ is
+    // deliberately its sibling, so any symlink escape has somewhere visible to
+    // land.
+    char dest_dir[PATH_MAX], outside_dir[PATH_MAX], src_dir[PATH_MAX];
+    if (path_join(dest_dir, sizeof(dest_dir), root, "dest") != 0 ||
+        path_join(outside_dir, sizeof(outside_dir), root, "outside") != 0 ||
+        path_join(src_dir, sizeof(src_dir), root, "src") != 0)
+        fatal("could not build fixture paths");
+    if (mkdir(dest_dir, 0755) != 0 || mkdir(outside_dir, 0755) != 0 || mkdir(src_dir, 0755) != 0)
+        fatal("could not create fixture directories");
+
+    int dest_fd = open(dest_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dest_fd < 0)
+        fatal("could not open the destination directory");
+
+    /* --------------------------------------------------------------------- */
+    /* Special-file policy                                                    */
+    /* --------------------------------------------------------------------- */
+
+    char src_fifo[PATH_MAX], src_socket[PATH_MAX];
+    char dest_fifo[PATH_MAX], dest_socket[PATH_MAX], dest_device[PATH_MAX];
+    if (path_join(src_fifo, sizeof(src_fifo), src_dir, "source.fifo") != 0 ||
+        path_join(src_socket, sizeof(src_socket), src_dir, "source.socket") != 0 ||
+        path_join(dest_fifo, sizeof(dest_fifo), dest_dir, "copied.fifo") != 0 ||
+        path_join(dest_socket, sizeof(dest_socket), dest_dir, "copied.socket") != 0 ||
+        path_join(dest_device, sizeof(dest_device), dest_dir, "copied.device") != 0)
+        fatal("could not build fixture paths");
 
     if (mkfifo(src_fifo, 0640) != 0)
-    {
-        rmdir(root);
-        printf(RED "could not create FIFO fixture" NC "\n");
-        return 1;
-    }
+        fatal("could not create FIFO fixture");
 
     struct stat st = {0};
     struct stat src_st = {0};
-    int fifo_created = clone_recursive(src_fifo, dest_fifo) == 0 &&
+    int fifo_created = backup_capture_at(&ctx, src_fifo, dest_fd, "copied.fifo") == 0 &&
                        lstat(src_fifo, &src_st) == 0 &&
                        lstat(dest_fifo, &st) == 0 &&
                        S_ISFIFO(st.st_mode);
-    check(fifo_created,
-          "FIFO is recreated as a FIFO");
+    check(fifo_created, "FIFO is recreated as a FIFO");
     check(fifo_created && (st.st_mode & 0777) == (src_st.st_mode & 0777),
           "FIFO permissions are preserved");
-    check(clone_recursive(src_fifo, dest_fifo) == 0,
-          "an existing destination FIFO is accepted on resume");
+    check(backup_capture_at(&ctx, src_fifo, dest_fd, "copied.fifo") == 0,
+          "an existing destination FIFO of the right type is accepted on resume");
 
     off_t size = 17;
     check(get_dir_size(src_fifo, &size) == 0 && size == 17,
           "FIFO contributes no payload bytes");
 
     int socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    struct sockaddr_un address;
-    memset(&address, 0, sizeof(address));
-    address.sun_family = AF_UNIX;
-
-    if (strlen(src_socket) >= sizeof(address.sun_path) || socket_fd == -1)
+    if (socket_fd < 0 && (errno == EPERM || errno == EACCES ||
+                          errno == EAFNOSUPPORT))
     {
-        if (socket_fd != -1)
-            close(socket_fd);
-        unlink(dest_fifo);
-        unlink(src_fifo);
-        rmdir(root);
-        printf(RED "could not create Unix socket fixture" NC "\n");
-        return 1;
+        printf("  " BLUE "-" NC " Unix socket fixture unavailable on this host\n");
     }
-    strcpy(address.sun_path, src_socket);
-
-    if (bind(socket_fd, (struct sockaddr *)&address, sizeof(address)) != 0)
+    else
     {
-        perror("bind");
-        close(socket_fd);
-        unlink(dest_fifo);
-        unlink(src_fifo);
-        rmdir(root);
-        printf(RED "could not create Unix socket fixture" NC "\n");
-        return 1;
+        struct sockaddr_un address;
+        memset(&address, 0, sizeof(address));
+        address.sun_family = AF_UNIX;
+        if (strlen(src_socket) >= sizeof(address.sun_path))
+            fatal("Unix socket fixture path is too long");
+        strcpy(address.sun_path, src_socket);
+        if (bind(socket_fd, (struct sockaddr *)&address, sizeof(address)) != 0)
+        {
+            if (errno == EPERM || errno == EACCES || errno == EAFNOSUPPORT)
+                printf("  " BLUE "-" NC " Unix socket fixture unavailable on this host\n");
+            else
+                fatal("could not bind Unix socket fixture");
+        }
+        else
+        {
+            errno = 0;
+            check(backup_capture_at(&ctx, src_socket, dest_fd, "copied.socket") == 0 &&
+                  lstat(dest_socket, &st) == -1 && errno == ENOENT,
+                  "Unix socket is skipped without creating a destination");
+
+            size = 23;
+            check(get_dir_size(src_socket, &size) == 0 && size == 23,
+                  "Unix socket contributes no payload bytes");
+        }
     }
-
-    errno = 0;
-    check(clone_recursive(src_socket, dest_socket) == 0 &&
-          lstat(dest_socket, &st) == -1 &&
-          errno == ENOENT,
-          "Unix socket is skipped without creating a destination");
-
-    size = 23;
-    check(get_dir_size(src_socket, &size) == 0 && size == 23,
-          "Unix socket contributes no payload bytes");
 
     int device_fixture = lstat("/dev/null", &st) == 0 && S_ISCHR(st.st_mode);
-    check(device_fixture,
-          "/dev/null is available as the device-node fixture");
+    check(device_fixture, "/dev/null is available as the device-node fixture");
     errno = 0;
     check(device_fixture &&
-          clone_recursive("/dev/null", dest_device) == 0 &&
-          lstat(dest_device, &st) == -1 &&
-          errno == ENOENT,
+          backup_capture_at(&ctx, "/dev/null", dest_fd, "copied.device") == 0 &&
+          lstat(dest_device, &st) == -1 && errno == ENOENT,
           "device node is skipped without creating a destination");
 
     size = 29;
-    check(device_fixture &&
-          get_dir_size("/dev/null", &size) == 0 &&
-          size == 29,
+    check(device_fixture && get_dir_size("/dev/null", &size) == 0 && size == 29,
           "device node contributes no payload bytes");
 
-    close(socket_fd);
-    unlink(src_socket);
-    unlink(dest_fifo);
-    unlink(src_fifo);
-    rmdir(root);
+    /* --------------------------------------------------------------------- */
+    /* Destination anchoring: symlinks are never followed                     */
+    /* --------------------------------------------------------------------- */
+
+    char sentinel[PATH_MAX];
+    if (path_join(sentinel, sizeof(sentinel), outside_dir, "sentinel.txt") != 0)
+        fatal("could not build fixture paths");
+    write_file(sentinel, "untouched");
+
+    char src_file[PATH_MAX];
+    if (path_join(src_file, sizeof(src_file), src_dir, "payload.txt") != 0)
+        fatal("could not build fixture paths");
+    write_file(src_file, "payload");
+
+    // A symlink standing exactly where the walker would create its final
+    // object: writing through it would land in outside/, so it is replaced.
+    char final_link[PATH_MAX];
+    if (path_join(final_link, sizeof(final_link), dest_dir, "final_link") != 0)
+        fatal("could not build fixture paths");
+    if (symlink(sentinel, final_link) != 0)
+        fatal("could not create the final-destination symlink fixture");
+
+    check(backup_capture_at(&ctx, src_file, dest_fd, "final_link") == 0 &&
+          lstat(final_link, &st) == 0 && S_ISREG(st.st_mode) &&
+          file_contains(final_link, "payload"),
+          "a symlink at the final destination address is replaced, not written through");
+    check(file_contains(sentinel, "untouched"),
+          "the file outside the destination is unchanged by that replacement");
+
+    // The same escape one level down: the source is a directory, and the
+    // destination already holds a symlinked subdirectory the walker would
+    // otherwise descend into.
+    char nested_src[PATH_MAX], nested_child[PATH_MAX];
+    if (path_join(nested_src, sizeof(nested_src), src_dir, "tree") != 0)
+        fatal("could not build fixture paths");
+    if (mkdir(nested_src, 0755) != 0)
+        fatal("could not create the nested source fixture");
+    if (path_join(nested_child, sizeof(nested_child), nested_src, "inner") != 0)
+        fatal("could not build fixture paths");
+    if (mkdir(nested_child, 0755) != 0)
+        fatal("could not create the nested source fixture");
+
+    char smuggled_src[PATH_MAX];
+    if (path_join(smuggled_src, sizeof(smuggled_src), nested_child, "sentinel.txt") != 0)
+        fatal("could not build fixture paths");
+    write_file(smuggled_src, "smuggled");
+
+    char tree_dest[PATH_MAX], intermediate_link[PATH_MAX];
+    if (path_join(tree_dest, sizeof(tree_dest), dest_dir, "tree") != 0)
+        fatal("could not build fixture paths");
+    if (mkdir(tree_dest, 0755) != 0)
+        fatal("could not create the nested destination fixture");
+    if (path_join(intermediate_link, sizeof(intermediate_link), tree_dest, "inner") != 0)
+        fatal("could not build fixture paths");
+    if (symlink(outside_dir, intermediate_link) != 0)
+        fatal("could not create the intermediate symlink fixture");
+
+    check(backup_capture_at(&ctx, nested_src, dest_fd, "tree") == 0 &&
+          lstat(intermediate_link, &st) == 0 && S_ISDIR(st.st_mode),
+          "an intermediate destination symlink is replaced, not descended through");
+    check(file_contains(sentinel, "untouched"),
+          "the file outside the destination is unchanged by that replacement either");
+
+    /* --------------------------------------------------------------------- */
+    /* Resume and collision                                                   */
+    /* --------------------------------------------------------------------- */
+
+    char resumed_dest[PATH_MAX];
+    if (path_join(resumed_dest, sizeof(resumed_dest), dest_dir, "resumed.txt") != 0)
+        fatal("could not build fixture paths");
+
+    check(backup_capture_at(&ctx, src_file, dest_fd, "resumed.txt") == 0 &&
+          file_contains(resumed_dest, "payload"),
+          "a regular file is captured");
+    check(backup_capture_at(&ctx, src_file, dest_fd, "resumed.txt") == 0 &&
+          file_contains(resumed_dest, "payload"),
+          "an existing regular file with matching size and mtime is resumed past");
+
+    // A stale destination of the same name but different content is rewritten:
+    // matching size and mtime is what marks work as already done, and this
+    // matches neither.
+    write_file(resumed_dest, "stale-and-longer-than-the-source");
+    check(backup_capture_at(&ctx, src_file, dest_fd, "resumed.txt") == 0 &&
+          file_contains(resumed_dest, "payload"),
+          "a destination file that does not match the source is captured again");
+
+    char src_symlink[PATH_MAX];
+    if (path_join(src_symlink, sizeof(src_symlink), src_dir, "link") != 0)
+        fatal("could not build fixture paths");
+    if (symlink("target-of-the-source-link", src_symlink) != 0)
+        fatal("could not create the source symlink fixture");
+
+    check(backup_capture_at(&ctx, src_symlink, dest_fd, "copied.link") == 0,
+          "a symlink is captured as a symlink");
+    check(backup_capture_at(&ctx, src_symlink, dest_fd, "copied.link") == 0,
+          "an existing symlink with the identical target is resumed past");
+
+    char differing_link[PATH_MAX];
+    if (path_join(differing_link, sizeof(differing_link), dest_dir, "differing.link") != 0)
+        fatal("could not build fixture paths");
+    if (symlink("some-other-target", differing_link) != 0)
+        fatal("could not create the differing symlink fixture");
+    char differing_target[PATH_MAX];
+    ssize_t differing_length = -1;
+    check(backup_capture_at(&ctx, src_symlink, dest_fd, "differing.link") == 0 &&
+          (differing_length = readlink(differing_link, differing_target,
+                                       sizeof(differing_target) - 1U)) > 0 &&
+          (differing_target[differing_length] = '\0',
+           strcmp(differing_target, "target-of-the-source-link") == 0),
+          "an existing symlink with a different target is replaced");
+
+    readlink_truncate_path = src_symlink;
+    readlink_truncate_triggered = 0;
+    check(backup_capture_at(&ctx, src_symlink, dest_fd, "truncated.link") != 0,
+          "a readlink() that fills the whole buffer is refused, not silently truncated");
+    check(readlink_truncate_triggered, "the truncation fixture actually fired");
+    readlink_truncate_path = NULL;
+
+    char existing_dir_dest[PATH_MAX], existing_dir_child[PATH_MAX];
+    if (path_join(existing_dir_dest, sizeof(existing_dir_dest), dest_dir, "existing_tree") != 0)
+        fatal("could not build fixture paths");
+    if (mkdir(existing_dir_dest, 0755) != 0)
+        fatal("could not create the existing destination directory fixture");
+    check(backup_capture_at(&ctx, nested_child, dest_fd, "existing_tree") == 0,
+          "an existing destination directory of the right type is accepted on resume");
+    check(path_join(existing_dir_child, sizeof(existing_dir_child), existing_dir_dest, "sentinel.txt") == 0 &&
+          file_contains(existing_dir_child, "smuggled"),
+          "resuming into it still writes the source's own children");
+
+    // Another type at an address, in each direction: a regular file where a
+    // directory belongs, a directory where a regular file belongs, and one
+    // where a FIFO belongs.
+    char collide_file[PATH_MAX];
+    if (path_join(collide_file, sizeof(collide_file), dest_dir, "collide_file") != 0)
+        fatal("could not build fixture paths");
+    write_file(collide_file, "not a directory");
+    check(backup_capture_at(&ctx, nested_child, dest_fd, "collide_file") == 0 &&
+          lstat(collide_file, &st) == 0 && S_ISDIR(st.st_mode),
+          "a regular file where a directory belongs is replaced");
+
+    char collide_dir[PATH_MAX], collide_child[PATH_MAX];
+    if (path_join(collide_dir, sizeof(collide_dir), dest_dir, "collide_dir") != 0 ||
+        path_join(collide_child, sizeof(collide_child), collide_dir, "child") != 0)
+        fatal("could not build fixture paths");
+    if (mkdir(collide_dir, 0755) != 0)
+        fatal("could not create the colliding directory fixture");
+    write_file(collide_child, "older copy");
+    check(backup_capture_at(&ctx, src_file, dest_fd, "collide_dir") == 0 &&
+          file_contains(collide_dir, "payload"),
+          "a directory where a regular file belongs is replaced with its contents");
+
+    char collide_fifo[PATH_MAX];
+    if (path_join(collide_fifo, sizeof(collide_fifo), dest_dir, "collide_fifo") != 0)
+        fatal("could not build fixture paths");
+    if (mkdir(collide_fifo, 0755) != 0)
+        fatal("could not create the colliding directory fixture");
+    check(backup_capture_at(&ctx, src_fifo, dest_fd, "collide_fifo") == 0 &&
+          lstat(collide_fifo, &st) == 0 && S_ISFIFO(st.st_mode),
+          "a directory where a FIFO belongs is replaced");
+
+    // A failure names the item, what was being done, and errno.
+    BackupCaptureReport report;
+    backup_capture_report_init(&report);
+    char locked[PATH_MAX], locked_child[PATH_MAX];
+    if (path_join(locked, sizeof(locked), dest_dir, "locked") != 0 ||
+        path_join(locked_child, sizeof(locked_child), locked, "child") != 0)
+        fatal("could not build fixture paths");
+    if (mkdir(locked, 0755) != 0)
+        fatal("could not create the locked directory fixture");
+    write_file(locked_child, "older copy");
+    if (chmod(locked, 0555) != 0)
+        fatal("could not lock the directory fixture");
+    if (geteuid() == 0)
+        skip_check("an older copy that cannot be removed is named with errno "
+                   "(root removes it)");
+    else
+        check(backup_capture_at_report(&ctx, src_file, dest_fd, "locked",
+                                       &report) != 0 &&
+                  strcmp(report.failed_source_path, src_file) == 0 &&
+                  report.failed_operation != NULL &&
+                  strcmp(report.failed_operation,
+                         "remove its older copy in the backup") == 0 &&
+                  report.failure_errno == EACCES,
+              "an older copy that cannot be removed is named with errno");
+    if (chmod(locked, 0755) != 0)
+        fatal("could not unlock the directory fixture");
+
+    char unreadable[PATH_MAX];
+    if (path_join(unreadable, sizeof(unreadable), src_dir, "unreadable.txt") != 0)
+        fatal("could not build fixture paths");
+    write_file(unreadable, "secret");
+    if (chmod(unreadable, 0000) != 0)
+        fatal("could not make the unreadable fixture");
+    if (geteuid() == 0)
+        skip_check("an unreadable file is named with errno (root reads it)");
+    else
+        check(backup_capture_at_report(&ctx, unreadable, dest_fd,
+                                       "unreadable.txt", &report) != 0 &&
+                  strcmp(report.failed_source_path, unreadable) == 0 &&
+                  report.failed_operation != NULL &&
+                  strcmp(report.failed_operation, "open it") == 0 &&
+                  report.failure_errno == EACCES,
+              "an unreadable file is named with what failed and errno");
+    if (chmod(unreadable, 0644) != 0)
+        fatal("could not restore the unreadable fixture");
+
+    /* --------------------------------------------------------------------- */
+    /* Entry-point contract                                                   */
+    /* --------------------------------------------------------------------- */
+
+    CloneContext portable_ctx = { .operation = CLONE_BACKUP, .representation = CLONE_PORTABLE_SIDECAR };
+    CloneContext restore_ctx  = { .operation = CLONE_RESTORE, .representation = CLONE_NATIVE_TREE };
+
+    check(backup_capture_at(NULL, src_file, dest_fd, "refused") == -1,
+          "backup_capture_at refuses a NULL context");
+    check(backup_capture_at(&restore_ctx, src_file, dest_fd, "refused") == -1,
+          "backup_capture_at refuses a restore context");
+    check(backup_capture_at(&portable_ctx, src_file, dest_fd, "refused") == -1,
+          "portable representation is refused, not run as a native clone");
+    check(backup_capture_at(&ctx, src_file, -1, "refused") == -1,
+          "an invalid destination fd is refused");
+
+    static const char *const unsafe_leaves[] = {
+        "", ".", "..", "/abs", "a/../b", "a//b", "a/", NULL
+    };
+    int all_unsafe_refused = 1;
+    for (int i = 0; unsafe_leaves[i] != NULL; i++)
+        if (backup_capture_at(&ctx, src_file, dest_fd, unsafe_leaves[i]) != -1)
+            all_unsafe_refused = 0;
+    check(all_unsafe_refused && backup_capture_at(&ctx, src_file, dest_fd, NULL) == -1,
+          "a destination path with an empty, \".\", or \"..\" component is refused");
+
+    check(backup_capture_at(&ctx, src_file, dest_fd, "group/leaf") == 0 &&
+          fstatat(dest_fd, "group/leaf", &st, AT_SYMLINK_NOFOLLOW) == 0 &&
+          S_ISREG(st.st_mode),
+          "a destination path in a folder is captured, the folder created");
+    char outside_leaf[PATH_MAX];
+    check(symlinkat(outside_dir, dest_fd, "linked") == 0 &&
+          backup_capture_at(&ctx, src_file, dest_fd, "linked/leaf") == -1 &&
+          path_join(outside_leaf, sizeof(outside_leaf), outside_dir, "leaf") == 0 &&
+          lstat(outside_leaf, &st) == -1,
+          "a symlink in place of that folder is refused, not descended through");
+
+    char refused_path[PATH_MAX];
+    check(path_join(refused_path, sizeof(refused_path), dest_dir, "refused") == 0 &&
+          lstat(refused_path, &st) == -1,
+          "no refused call wrote a destination");
+
+    close(dest_fd);
+    if (socket_fd >= 0)
+        close(socket_fd); // must precede removal: the bound socket is a fixture file
+    remove_tree(root);
 
     if (failures > 0)
     {
-        printf(RED "%d special-file test(s) failed" NC "\n", failures);
+        printf(RED "%d capture walker test(s) failed" NC "\n", failures);
         return 1;
     }
+    if (skips > 0)
+        printf(BLUE "%d capture walker test(s) skipped" NC "\n", skips);
     return 0;
 }

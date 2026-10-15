@@ -1,0 +1,5289 @@
+// Unit tests for restore()'s manifest-driven dispatch (docs/DECISIONS.md D15/D16):
+// a valid v1 manifest routes to the root-table walker; an unversioned or
+// absent manifest routes to the isolated legacy path; an unknown version or
+// malformed v1 manifest refuses the whole restore before any confirmation or
+// mutation; a ".partial" source is refused outright (docs/DECISIONS.md D15).
+//
+// Most cases here run with dry_run forced on for the whole binary (set once
+// in main(), inherited by every fork()ed restore() call below), so none of
+// this ever needs an interactive confirm_action() prompt or touches a real
+// destination. The space-refusal case also runs once with dry_run disabled:
+// it must prove that the free-space gate precedes confirmation. Happy-path v1
+// fixtures are written with the real manifest_write_v1() so the fixture can
+// never silently drift from what the reader actually accepts;
+// malformed/unknown-version fixtures are raw strings, so a writer bug can
+// never mask a reader bug -- see tests/test_manifest.c for the same split.
+
+#define _GNU_SOURCE
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <ftw.h>
+#include <grp.h>
+#include <limits.h>
+#include <pwd.h>
+#include <sched.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mount.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include "backup.h"
+#include "hash.h"
+#include "manifest.h"
+#include "packages.h"
+#include "groups.h"
+#include "restore.h"
+#include "portable_restore_internal.h"
+#include "portable_restore_replay_internal.h"
+#include "sidecar.h"
+#include "utils.h"
+#include "writer_apps.h"
+
+#ifdef RESTORE_TEST_HOOKS
+void restore_test_set_progress_force(int force);
+#endif
+
+#define GREEN "\033[0;32m"
+#define RED   "\033[0;31m"
+#define BLUE  "\033[0;34m"
+#define YELLOW "\033[0;33m"
+#define NC    "\033[0m"
+
+enum { CHILD_SKIP = 77 };
+
+static int failures = 0;
+static int skips = 0;
+
+static int file_content_is(const char *path, const char *content);
+static void write_file_mode(const char *path, const char *content, mode_t mode);
+
+static void check(int cond, const char *label)
+{
+    if (cond)
+        printf("  " GREEN "v" NC " %s\n", label);
+    else
+    {
+        printf("  " RED "x" NC " %s\n", label);
+        failures++;
+    }
+}
+
+static int proc_thread_count(void)
+{
+    DIR *dir = opendir("/proc/self/task");
+    if (dir == NULL)
+        return -1;
+
+    int count = 0;
+    errno = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL)
+        if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0)
+            count++;
+    int saved_errno = errno;
+    if (closedir(dir) != 0 || saved_errno != 0)
+        return -1;
+    return count;
+}
+
+#ifdef PACKAGES_TEST_HOOKS
+typedef struct {
+    int call_count;
+    int thread_count;
+} PackageProgressProbe;
+
+typedef struct {
+    char marker_path[PATH_MAX];
+} PackagePrivilegeProbe;
+
+// Set by the install hooks; the next installed-state query reports the
+// fixture package and clears it.
+static int fixture_package_installed;
+
+static int package_progress_probe(char *const argv[], void *context)
+{
+    (void)argv;
+    PackageProgressProbe *probe = context;
+    probe->call_count++;
+    probe->thread_count = proc_thread_count();
+    fixture_package_installed = 1;
+    return 0;
+}
+
+static int package_progress_capture(char *const argv[], char *output,
+                                    size_t output_size, void *context)
+{
+    (void)context;
+    const char *text;
+    if (argv[0] != NULL && strcmp(argv[0], "rpm") == 0)
+    {
+        text = fixture_package_installed ? "fixture-package\n" : "";
+        fixture_package_installed = 0;
+    }
+    else if (argv[0] != NULL && strcmp(argv[0], "dnf") == 0 &&
+             argv[1] != NULL && strcmp(argv[1], "repoquery") == 0)
+        text = "";
+    else
+        return -1;
+    if (strlen(text) >= output_size)
+        return -1;
+    memcpy(output, text, strlen(text) + 1U);
+    return 0;
+}
+
+static int package_privilege_probe(char *const argv[], void *context)
+{
+    PackagePrivilegeProbe *probe = context;
+    if (argv == NULL || argv[0] == NULL || argv[1] == NULL ||
+        argv[2] == NULL || argv[3] == NULL || argv[4] == NULL ||
+        argv[5] != NULL || strcmp(argv[0], "dnf") != 0 ||
+        strcmp(argv[1], "install") != 0 || strcmp(argv[2], "-y") != 0 ||
+        strcmp(argv[3], "--skip-unavailable") != 0 ||
+        strcmp(argv[4], "fixture-package") != 0)
+        return -1;
+
+    int fd = open(probe->marker_path,
+                  O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0)
+        return -1;
+    const char marker[] = "package install hook\n";
+    ssize_t written = write(fd, marker, sizeof(marker) - 1U);
+    int saved_errno = errno;
+    int close_result = close(fd);
+    if (written < 0)
+        errno = saved_errno;
+    fixture_package_installed = 1;
+    return written == (ssize_t)(sizeof(marker) - 1U) && close_result == 0
+        ? 0 : -1;
+}
+#endif
+
+static void skip_case(const char *label, const char *reason)
+{
+    printf("  " YELLOW "-" NC " %s skipped: %s\n", label, reason);
+    skips++;
+}
+
+static int find_nobody(uid_t *uid, gid_t *gid)
+{
+    if (geteuid() != 0)
+        return 0;
+    struct passwd *nobody = getpwnam("nobody");
+    if (nobody == NULL || nobody->pw_uid == 0)
+        return 0;
+    *uid = nobody->pw_uid;
+    *gid = nobody->pw_gid;
+    return 1;
+}
+
+static void force_no_free_space(off_t needed, off_t *free_bytes,
+                                void *context)
+{
+    (void)needed;
+    (void)context;
+    if (free_bytes != NULL)
+        *free_bytes = 0;
+}
+
+static void set_test_block_size(off_t *block_size, void *context)
+{
+    if (block_size != NULL && context != NULL)
+        *block_size = *(const off_t *)context;
+}
+
+static void fresh_mkdtemp(char *buf, size_t bufsize, const char *prefix)
+{
+    if ((size_t)snprintf(buf, bufsize, "/tmp/%s_XXXXXX", prefix) >= bufsize || mkdtemp(buf) == NULL)
+    {
+        printf(RED "fixture: could not create a temp dir for %s" NC "\n", prefix);
+        exit(1);
+    }
+}
+
+static int remove_cb(const char *path, const struct stat *sb, int typeflag, struct FTW *ftwbuf)
+{
+    (void)sb;
+    (void)typeflag;
+    (void)ftwbuf;
+    return remove(path);
+}
+
+static void remove_tree(const char *path)
+{
+    if (nftw(path, remove_cb, 16, FTW_DEPTH | FTW_PHYS) != 0)
+    {
+        printf(RED "fixture: could not clean up %s" NC "\n", path);
+        exit(1);
+    }
+}
+
+static void join_path(char *out, size_t out_size, const char *a, const char *b)
+{
+    size_t a_len = strlen(a);
+    size_t b_len = strlen(b);
+    if (a_len + 1 + b_len + 1 > out_size)
+    {
+        printf(RED "fixture: path too long" NC "\n");
+        exit(1);
+    }
+    memcpy(out, a, a_len);
+    out[a_len] = '/';
+    memcpy(out + a_len + 1, b, b_len + 1);
+}
+
+// Genuinely recursive (unlike mkdir(2)): creates every missing intermediate
+// component, since fixtures below need "data/<payload>" and "data" itself is
+// never created ahead of time.
+static void mkdir_p(const char *path)
+{
+    char buf[PATH_MAX];
+    size_t len = strlen(path);
+    if (len >= sizeof(buf))
+    {
+        printf(RED "fixture: path too long: %s" NC "\n", path);
+        exit(1);
+    }
+    memcpy(buf, path, len + 1);
+
+    for (size_t i = 1; i < len; i++)
+    {
+        if (buf[i] != '/')
+            continue;
+        buf[i] = '\0';
+        if (mkdir(buf, 0755) != 0 && errno != EEXIST)
+        {
+            printf(RED "fixture: could not mkdir %s" NC "\n", buf);
+            exit(1);
+        }
+        buf[i] = '/';
+    }
+
+    if (mkdir(buf, 0755) != 0 && errno != EEXIST)
+    {
+        printf(RED "fixture: could not mkdir %s" NC "\n", buf);
+        exit(1);
+    }
+}
+
+static void make_deep_payload_directory(const char *source,
+                                        const char *payload, size_t levels)
+{
+    char data[PATH_MAX];
+    join_path(data, sizeof(data), source, "data");
+    mkdir_p(data);
+
+    int data_fd = open(data, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (data_fd < 0 || mkdirat(data_fd, payload, 0755) != 0)
+        exit(1);
+    int current = openat(data_fd, payload,
+                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (current < 0 || close(data_fd) != 0)
+        exit(1);
+    for (size_t level = 0; level < levels; level++)
+    {
+        if (mkdirat(current, "d", 0755) != 0)
+            exit(1);
+        int next = openat(current, "d",
+                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (next < 0 || close(current) != 0)
+            exit(1);
+        current = next;
+    }
+    if (close(current) != 0)
+        exit(1);
+}
+
+// Creates dir/rel (rel may have one level, e.g. "data/EXPLICIT_0") and writes
+// content into dir/rel/name.
+static void write_payload_file(const char *dir, const char *rel, const char *name, const char *content)
+{
+    char sub[PATH_MAX];
+    join_path(sub, sizeof(sub), dir, rel);
+    mkdir_p(sub);
+    char file_path[PATH_MAX];
+    join_path(file_path, sizeof(file_path), sub, name);
+    FILE *f = fopen(file_path, "w");
+    if (f == NULL)
+    {
+        printf(RED "fixture: could not write %s" NC "\n", file_path);
+        exit(1);
+    }
+    fputs(content, f);
+    fclose(f);
+}
+
+static void write_raw(const char *dir, const char *content)
+{
+    char path[PATH_MAX];
+    join_path(path, sizeof(path), dir, "manifest.txt");
+    FILE *f = fopen(path, "w");
+    if (f == NULL)
+    {
+        printf(RED "fixture: could not write %s" NC "\n", path);
+        exit(1);
+    }
+    fputs(content, f);
+    fclose(f);
+}
+
+static void remove_fixture_packages(const char *source)
+{
+    char path[PATH_MAX];
+    join_path(path, sizeof(path), source, "packages.txt");
+    if (unlink(path) != 0 && errno != ENOENT)
+    {
+        printf(RED "fixture: could not remove %s" NC "\n", path);
+        exit(1);
+    }
+}
+
+// Forks so restore()'s output can be captured in isolation per call without
+// one test's output or any accidental global mutation leaking into the next.
+// input may be NULL; live happy-path tests pass "y\n" through stdin so they
+// still exercise the production confirmation path.
+static int run_restore_capturing_with_identity(const char *source,
+                                               const char *input,
+                                               char *output,
+                                               size_t output_size,
+                                               int drop_privileges,
+                                               uid_t uid, gid_t gid)
+{
+    int output_pipe[2];
+    int input_pipe[2];
+    if (pipe(output_pipe) != 0 || pipe(input_pipe) != 0)
+    {
+        perror("pipe");
+        exit(1);
+    }
+    fflush(stdout);
+    fflush(stderr);
+    pid_t pid = fork();
+    if (pid < 0)
+    {
+        perror("fork");
+        exit(1);
+    }
+    if (pid == 0)
+    {
+        close(output_pipe[0]);
+        close(input_pipe[1]);
+        if (dup2(output_pipe[1], STDOUT_FILENO) < 0 ||
+            dup2(output_pipe[1], STDERR_FILENO) < 0 ||
+            dup2(input_pipe[0], STDIN_FILENO) < 0)
+            _exit(125);
+        close(output_pipe[1]);
+        close(input_pipe[0]);
+        if (drop_privileges &&
+            (setgroups(0, NULL) != 0 || setgid(gid) != 0 || setuid(uid) != 0))
+            _exit(CHILD_SKIP);
+        int rc = restore(source);
+        fflush(stdout);
+        fflush(stderr);
+        _exit(rc);
+    }
+
+    close(output_pipe[1]);
+    close(input_pipe[0]);
+    if (input != NULL)
+    {
+        size_t input_len = strlen(input);
+        ssize_t written = write(input_pipe[1], input, input_len);
+        if (written < 0 || (size_t)written != input_len)
+        {
+            perror("write");
+            exit(1);
+        }
+    }
+    close(input_pipe[1]);
+
+    size_t total = 0;
+    ssize_t n;
+    while (total < output_size - 1 &&
+           (n = read(output_pipe[0], output + total,
+                     output_size - 1 - total)) > 0)
+        total += n;
+    output[total] = '\0';
+    close(output_pipe[0]);
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+static int run_restore_capturing_with_input(const char *source,
+                                            const char *input,
+                                            char *output,
+                                            size_t output_size)
+{
+    return run_restore_capturing_with_identity(source, input, output,
+                                                output_size, 0, 0, 0);
+}
+
+static int run_restore_capturing(const char *source, char *output,
+                                 size_t output_size)
+{
+    return run_restore_capturing_with_input(source, NULL, output, output_size);
+}
+
+static int run_restore_privilege_preflight_capturing(
+    size_t foreign_owner_count, int network_config_needs_privilege,
+    char *output, size_t output_size)
+{
+    int output_pipe[2];
+    if (pipe(output_pipe) != 0)
+    {
+        perror("pipe");
+        exit(1);
+    }
+    int saved_stderr = dup(STDERR_FILENO);
+    if (saved_stderr < 0 || dup2(output_pipe[1], STDERR_FILENO) < 0)
+    {
+        perror("dup");
+        exit(1);
+    }
+    close(output_pipe[1]);
+    int result = restore_privilege_preflight(
+        foreign_owner_count, network_config_needs_privilege);
+    fflush(stderr);
+    if (dup2(saved_stderr, STDERR_FILENO) < 0)
+    {
+        perror("dup2");
+        exit(1);
+    }
+    close(saved_stderr);
+
+    size_t total = 0;
+    ssize_t received;
+    while (total < output_size - 1U &&
+           (received = read(output_pipe[0], output + total,
+                            output_size - 1U - total)) > 0)
+        total += (size_t)received;
+    output[total] = '\0';
+    close(output_pipe[0]);
+    return result;
+}
+
+static int run_restore_forced_progress_in_process(const char *source,
+                                                  const char *input,
+                                                  char *output,
+                                                  size_t output_size,
+                                                  int *threads_before,
+                                                  int *threads_after)
+{
+    int input_pipe[2];
+    FILE *capture = tmpfile();
+    if (capture == NULL || pipe(input_pipe) != 0)
+    {
+        perror("progress fixture");
+        exit(1);
+    }
+
+    int saved_stdin = dup(STDIN_FILENO);
+    int saved_stdout = dup(STDOUT_FILENO);
+    int saved_stderr = dup(STDERR_FILENO);
+    if (saved_stdin < 0 || saved_stdout < 0 || saved_stderr < 0)
+    {
+        perror("dup");
+        exit(1);
+    }
+
+    if (input != NULL)
+    {
+        size_t input_len = strlen(input);
+        ssize_t written = write(input_pipe[1], input, input_len);
+        if (written < 0 || (size_t)written != input_len)
+        {
+            perror("write");
+            exit(1);
+        }
+    }
+    if (close(input_pipe[1]) != 0)
+        exit(1);
+
+    fflush(stdout);
+    fflush(stderr);
+    if (dup2(input_pipe[0], STDIN_FILENO) < 0 ||
+        dup2(fileno(capture), STDOUT_FILENO) < 0 ||
+        dup2(fileno(capture), STDERR_FILENO) < 0)
+    {
+        perror("dup2");
+        exit(1);
+    }
+    if (close(input_pipe[0]) != 0)
+        exit(1);
+
+    restore_test_set_progress_force(1);
+    *threads_before = proc_thread_count();
+    int rc = restore(source);
+    *threads_after = proc_thread_count();
+    restore_test_set_progress_force(0);
+
+    fflush(stdout);
+    fflush(stderr);
+    if (dup2(saved_stdin, STDIN_FILENO) < 0 ||
+        dup2(saved_stdout, STDOUT_FILENO) < 0 ||
+        dup2(saved_stderr, STDERR_FILENO) < 0)
+    {
+        perror("dup2 restore");
+        exit(1);
+    }
+    if (close(saved_stdin) != 0 || close(saved_stdout) != 0 ||
+        close(saved_stderr) != 0)
+        exit(1);
+
+    if (fseek(capture, 0, SEEK_SET) != 0)
+        exit(1);
+    size_t total = fread(output, 1, output_size - 1U, capture);
+    if (ferror(capture))
+        exit(1);
+    output[total] = '\0';
+    if (fclose(capture) != 0)
+        exit(1);
+    return rc;
+}
+
+static int write_proc_file(const char *path, const char *content)
+{
+    int fd = open(path, O_WRONLY | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    size_t length = strlen(content);
+    ssize_t written = write(fd, content, length);
+    int saved_errno = errno;
+    int close_rc = close(fd);
+    if (written < 0)
+        errno = saved_errno;
+    return written == (ssize_t)length && close_rc == 0 ? 0 : -1;
+}
+
+static int setup_bind_mount_namespace(void)
+{
+    uid_t host_uid = getuid();
+    gid_t host_gid = getgid();
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0)
+        return -1;
+
+    char mapping[64];
+    int length = snprintf(mapping, sizeof(mapping), "0 %lu 1\n",
+                          (unsigned long)host_uid);
+    if (length < 0 || (size_t)length >= sizeof(mapping) ||
+        write_proc_file("/proc/self/uid_map", mapping) != 0 ||
+        write_proc_file("/proc/self/setgroups", "deny\n") != 0)
+        return -1;
+
+    length = snprintf(mapping, sizeof(mapping), "0 %lu 1\n",
+                      (unsigned long)host_gid);
+    if (length < 0 || (size_t)length >= sizeof(mapping) ||
+        write_proc_file("/proc/self/gid_map", mapping) != 0)
+        return -1;
+
+    return mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+}
+
+static int run_bind_mount_restore(const char *source, const char *home,
+                                  const char *documents_shared,
+                                  const char *downloads_shared,
+                                  char *output, size_t output_size)
+{
+    int output_pipe[2];
+    int input_pipe[2];
+    if (pipe(output_pipe) != 0 || pipe(input_pipe) != 0)
+    {
+        perror("pipe");
+        exit(1);
+    }
+    fflush(stdout);
+    fflush(stderr);
+    pid_t pid = fork();
+    if (pid < 0)
+    {
+        perror("fork");
+        exit(1);
+    }
+    if (pid == 0)
+    {
+        close(output_pipe[0]);
+        close(input_pipe[1]);
+        if (dup2(output_pipe[1], STDOUT_FILENO) < 0 ||
+            dup2(output_pipe[1], STDERR_FILENO) < 0 ||
+            dup2(input_pipe[0], STDIN_FILENO) < 0)
+            _exit(2);
+        close(output_pipe[1]);
+        close(input_pipe[0]);
+
+        if (setup_bind_mount_namespace() != 0 ||
+            mount(downloads_shared, documents_shared, NULL, MS_BIND, NULL) != 0)
+            _exit(CHILD_SKIP);
+
+        struct stat documents_st, downloads_st;
+        if (stat(documents_shared, &documents_st) != 0 ||
+            stat(downloads_shared, &downloads_st) != 0 ||
+            documents_st.st_dev != downloads_st.st_dev ||
+            documents_st.st_ino != downloads_st.st_ino)
+            _exit(CHILD_SKIP);
+
+        if (setenv("HOME", home, 1) != 0)
+            _exit(2);
+        dry_run = 0;
+        int restore_rc = restore(source);
+        char documents_file[PATH_MAX], downloads_file[PATH_MAX];
+        join_path(documents_file, sizeof(documents_file), documents_shared,
+                  "file");
+        join_path(downloads_file, sizeof(downloads_file), downloads_shared,
+                  "file");
+        int intact = file_content_is(documents_file, "ORIGINAL") &&
+                     file_content_is(downloads_file, "ORIGINAL");
+        fflush(stdout);
+        fflush(stderr);
+        _exit(restore_rc != 0 && intact ? 0 : 1);
+    }
+
+    close(output_pipe[1]);
+    close(input_pipe[0]);
+    const char input[] = "y\n";
+    if (write(input_pipe[1], input, sizeof(input) - 1U) !=
+        (ssize_t)(sizeof(input) - 1U))
+    {
+        perror("write");
+        exit(1);
+    }
+    close(input_pipe[1]);
+
+    size_t total = 0;
+    ssize_t n;
+    while (total < output_size - 1U &&
+           (n = read(output_pipe[0], output + total,
+                     output_size - 1U - total)) > 0)
+        total += (size_t)n;
+    output[total] = '\0';
+    close(output_pipe[0]);
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+static int path_mount_id(const char *path, unsigned int *mount_id)
+{
+    if (path == NULL || mount_id == NULL)
+        return -1;
+    struct statx state;
+    memset(&state, 0, sizeof(state));
+    if (statx(AT_FDCWD, path, AT_STATX_DONT_SYNC, STATX_MNT_ID, &state) != 0 ||
+        (state.stx_mask & STATX_MNT_ID) == 0)
+        return -1;
+    *mount_id = state.stx_mnt_id;
+    return 0;
+}
+
+static int run_mount_view_restore_case(
+    const char *source, const char *home, const char *documents_shared,
+    const char *downloads_shared, char *output, size_t output_size)
+{
+    int output_pipe[2];
+    int input_pipe[2];
+    if (pipe(output_pipe) != 0 || pipe(input_pipe) != 0)
+    {
+        perror("pipe");
+        exit(1);
+    }
+    fflush(stdout);
+    fflush(stderr);
+    pid_t pid = fork();
+    if (pid < 0)
+    {
+        perror("fork");
+        exit(1);
+    }
+    if (pid == 0)
+    {
+        close(output_pipe[0]);
+        close(input_pipe[1]);
+        if (dup2(output_pipe[1], STDOUT_FILENO) < 0 ||
+            dup2(output_pipe[1], STDERR_FILENO) < 0 ||
+            dup2(input_pipe[0], STDIN_FILENO) < 0)
+            _exit(2);
+        close(output_pipe[1]);
+        close(input_pipe[0]);
+
+        if (setup_bind_mount_namespace() != 0 ||
+            mount(downloads_shared, documents_shared, NULL, MS_BIND, NULL) != 0)
+            _exit(CHILD_SKIP);
+
+        struct stat documents_st, downloads_st;
+        unsigned int documents_mount_id, downloads_mount_id;
+        if (stat(documents_shared, &documents_st) != 0 ||
+            stat(downloads_shared, &downloads_st) != 0 ||
+            documents_st.st_dev != downloads_st.st_dev ||
+            documents_st.st_ino != downloads_st.st_ino ||
+            path_mount_id(documents_shared, &documents_mount_id) != 0 ||
+            path_mount_id(downloads_shared, &downloads_mount_id) != 0 ||
+            documents_mount_id == downloads_mount_id)
+            _exit(CHILD_SKIP);
+
+        if (setenv("HOME", home, 1) != 0)
+            _exit(2);
+        dry_run = 0;
+        int restore_rc = restore(source);
+        char documents_file[PATH_MAX], downloads_file[PATH_MAX];
+        join_path(documents_file, sizeof(documents_file), documents_shared,
+                  "file");
+        join_path(downloads_file, sizeof(downloads_file), downloads_shared,
+                  "file");
+        int intact = file_content_is(documents_file, "ORIGINAL") &&
+                     file_content_is(downloads_file, "ORIGINAL");
+        fflush(stdout);
+        fflush(stderr);
+        _exit(restore_rc != 0 && intact ? 0 : 1);
+    }
+
+    close(output_pipe[1]);
+    close(input_pipe[0]);
+    const char input[] = "y\n";
+    if (write(input_pipe[1], input, sizeof(input) - 1U) !=
+        (ssize_t)(sizeof(input) - 1U))
+    {
+        perror("write");
+        exit(1);
+    }
+    close(input_pipe[1]);
+
+    size_t total = 0;
+    ssize_t n;
+    while (total < output_size - 1U &&
+           (n = read(output_pipe[0], output + total,
+                     output_size - 1U - total)) > 0)
+        total += (size_t)n;
+    output[total] = '\0';
+    close(output_pipe[0]);
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+/* Keep this at the identity-graph boundary: a full restore with two directory
+ * metadata owners would correctly stop earlier on R2a's alias collision. */
+static int run_nested_mount_view_graph_case(
+    const char *documents_root, const char *downloads_root,
+    const char *documents_shared, const char *downloads_shared,
+    const char *alternate)
+{
+    pid_t pid = fork();
+    if (pid < 0)
+    {
+        perror("fork");
+        exit(1);
+    }
+    if (pid == 0)
+    {
+        if (setup_bind_mount_namespace() != 0 ||
+            mount(downloads_shared, documents_shared, NULL, MS_BIND, NULL) != 0)
+            _exit(CHILD_SKIP);
+
+        struct stat documents_st, downloads_st;
+        unsigned int documents_mount_id, downloads_mount_id;
+        if (stat(documents_shared, &documents_st) != 0 ||
+            stat(downloads_shared, &downloads_st) != 0 ||
+            documents_st.st_dev != downloads_st.st_dev ||
+            documents_st.st_ino != downloads_st.st_ino ||
+            path_mount_id(documents_shared, &documents_mount_id) != 0 ||
+            path_mount_id(downloads_shared, &downloads_mount_id) != 0 ||
+            documents_mount_id == downloads_mount_id)
+            _exit(CHILD_SKIP);
+
+        char documents_desc[PATH_MAX];
+        join_path(documents_desc, sizeof(documents_desc),
+                  documents_shared, "desc");
+        if (mount(alternate, documents_desc, NULL, MS_BIND, NULL) != 0)
+            _exit(CHILD_SKIP);
+
+        int documents_fd = open(documents_root,
+                                O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        int downloads_fd = open(downloads_root,
+                                O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (documents_fd < 0 || downloads_fd < 0)
+            _exit(1);
+
+        DestinationIdentityGraph graph;
+        destination_identity_graph_init(
+            &graph, DESTINATION_IDENTITY_NATIVE_BOUNDS);
+        DestinationIdentityPlacement placement;
+        size_t conflicting_owner;
+        DestinationIdentityNameConflict name_conflict;
+        errno = 0;
+        DestinationIdentityStatus first = destination_identity_graph_add(
+            &graph, downloads_fd, "shared/desc/docs-file",
+            DESTINATION_IDENTITY_NON_DIRECTORY, 1, &placement,
+            &conflicting_owner, &name_conflict);
+        errno = 0;
+        DestinationIdentityStatus second = destination_identity_graph_add(
+            &graph, documents_fd, "shared/desc/downloads-file",
+            DESTINATION_IDENTITY_NON_DIRECTORY, 2, &placement,
+            &conflicting_owner, &name_conflict);
+        int second_errno = errno;
+        destination_identity_graph_free(&graph);
+        close(documents_fd);
+        close(downloads_fd);
+        _exit(first == DESTINATION_IDENTITY_OK &&
+              second == DESTINATION_IDENTITY_COLLISION &&
+              second_errno == EISDIR ? 0 : 1);
+    }
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0)
+    {
+        perror("waitpid");
+        exit(1);
+    }
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+/* ========================================================================= */
+/* Dispatch: legacy vs. v1 vs. refusal                                     */
+/* ========================================================================= */
+
+static void test_dispatch_routes_missing_manifest_to_legacy(void)
+{
+    printf(BLUE "::" NC " restore dispatch: an absent manifest.txt routes to the legacy path\n");
+
+    char source[PATH_MAX], home[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_home");
+    setenv("HOME", home, 1);
+
+    write_payload_file(source, ".", "note.txt", "irrelevant"); // no manifest.txt at all
+
+    char output[8192];
+    int rc = run_restore_capturing(source, output, sizeof(output));
+    check(rc == 0, "restore succeeds with no manifest.txt present");
+    check(strstr(output, "Main Directories") != NULL, "the legacy section header appears");
+    check(strstr(output, "\nFiles\n") == NULL, "the v1 section header does not appear");
+
+    remove_tree(source);
+    remove_tree(home);
+}
+
+static void test_dispatch_routes_legacy_xdg_manifest_to_legacy(void)
+{
+    printf(BLUE "::" NC " restore dispatch: an unversioned XDG-key manifest routes to the legacy path\n");
+
+    char source[PATH_MAX], home[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_home");
+    setenv("HOME", home, 1);
+
+    write_raw(source, "XDG_DOCUMENTS_DIR=Belgeler\n");
+
+    char output[8192];
+    int rc = run_restore_capturing(source, output, sizeof(output));
+    check(rc == 0, "restore succeeds with an old-style XDG-key manifest.txt");
+    check(strstr(output, "Main Directories") != NULL, "the legacy section header appears");
+    check(strstr(output, "\nFiles\n") == NULL, "the v1 section header does not appear");
+
+    remove_tree(source);
+    remove_tree(home);
+}
+
+static void test_dispatch_refuses_unknown_version(void)
+{
+    printf(BLUE "::" NC " restore dispatch: an unrecognized manifest version refuses the whole restore\n");
+
+    char source[PATH_MAX], home[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_home");
+    setenv("HOME", home, 1);
+
+    write_raw(source, "MIGR_MANIFEST\nVERSION=999\n");
+
+    char output[8192];
+    int rc = run_restore_capturing(source, output, sizeof(output));
+    check(rc == 2, "restore refuses an unrecognized manifest version");
+    check(strstr(output, "Main Directories") == NULL, "the legacy path is never attempted");
+    check(strstr(output, "\nFiles\n") == NULL, "the v1 path is never attempted");
+
+    remove_tree(source);
+    remove_tree(home);
+}
+
+static void test_dispatch_refuses_malformed_v1(void)
+{
+    printf(BLUE "::" NC " restore dispatch: a malformed v1 manifest refuses the whole restore\n");
+
+    char source[PATH_MAX], home[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_home");
+    setenv("HOME", home, 1);
+
+    write_raw(source, "MIGR_MANIFEST\nVERSION=1\n"); // truncated: declares a header, nothing more
+
+    char output[8192];
+    int rc = run_restore_capturing(source, output, sizeof(output));
+    check(rc == 2, "restore refuses a malformed v1 manifest");
+    check(strstr(output, "Main Directories") == NULL, "the legacy path is never attempted");
+    check(strstr(output, "\nFiles\n") == NULL, "the v1 path is never attempted");
+
+    remove_tree(source);
+    remove_tree(home);
+}
+
+static void test_dispatch_refuses_partial_source(void)
+{
+    printf(BLUE "::" NC " restore dispatch: a \".partial\" source is refused before manifest dispatch\n");
+
+    char parent[PATH_MAX];
+    fresh_mkdtemp(parent, sizeof(parent), "dispatch_parent");
+    char source[PATH_MAX];
+    join_path(source, sizeof(source), parent, "migr-eyildizemre.partial");
+    mkdir_p(source);
+
+    char home[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "dispatch_home");
+    setenv("HOME", home, 1);
+
+    char output[8192];
+    int rc = run_restore_capturing(source, output, sizeof(output));
+    check(rc == 2, "restore refuses a .partial-named source directory");
+    check(strstr(output, "in-progress or abandoned") != NULL,
+          "the refusal names the reason: an in-progress/abandoned container");
+
+    remove_tree(parent);
+    remove_tree(home);
+}
+
+static void test_dispatch_requires_v1_manifest_for_final_container_name(void)
+{
+    printf(BLUE "::" NC " restore dispatch: a canonical final-container name requires a v1 manifest\n");
+
+    char parent[PATH_MAX];
+    fresh_mkdtemp(parent, sizeof(parent), "dispatch_parent");
+    char source[PATH_MAX];
+    join_path(source, sizeof(source), parent, "migr-eyildizemre");
+    mkdir_p(source);
+    write_payload_file(source, "data/EXPLICIT_0", "note.txt", "orphaned-v1-payload");
+
+    char home[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "dispatch_home");
+    setenv("HOME", home, 1);
+
+    char output[8192];
+    int rc = run_restore_capturing(source, output, sizeof(output));
+    check(rc != 0, "a finalized versioned name without manifest.txt is refused");
+    check(strstr(output, "missing manifest.txt") != NULL,
+          "the error identifies the missing versioned control artifact");
+    check(strstr(output, "Main Directories") == NULL,
+          "the manifest-absent container is not guessed to be legacy");
+
+    char legacy_source[PATH_MAX];
+    join_path(legacy_source, sizeof(legacy_source), parent,
+              "migr-eyildizemre-2026-01-01");
+    mkdir_p(legacy_source);
+    write_raw(legacy_source, "XDG_DOCUMENTS_DIR=Belgeler\n");
+
+    rc = run_restore_capturing(legacy_source, output, sizeof(output));
+    check(rc != 0, "a finalized versioned name carrying a legacy manifest is refused");
+    check(strstr(output, "carries a legacy manifest") != NULL,
+          "the error identifies the contradictory version boundary");
+    check(strstr(output, "Main Directories") == NULL,
+          "the canonical versioned container never enters the legacy walker");
+
+    remove_tree(parent);
+    remove_tree(home);
+}
+
+/* ========================================================================= */
+/* v1 root-table walker                                                    */
+/* ========================================================================= */
+
+static void make_v1_manifest(Manifest *m, ManifestRoot *roots, int root_count)
+{
+    memset(m, 0, sizeof(*m));
+    m->version = MANIFEST_CURRENT_VERSION;
+    m->representation = CLONE_NATIVE_TREE;
+    m->scope = MANIFEST_SCOPE_EXPLICIT;
+    m->sidecar_version = 0;
+    m->has_source_identity = 0;
+    m->root_count = root_count;
+    m->roots = roots;
+}
+
+static SidecarBytes sidecar_text(const char *text)
+{
+    return (SidecarBytes){
+        .data = (const unsigned char *)text,
+        .length = strlen(text)
+    };
+}
+
+static int append_committed_sidecar_entry(SidecarLog *log,
+                                          const SidecarEntry *entry)
+{
+    SidecarClaim claim = {
+        .root_id = entry->root_id,
+        .logical_path = entry->logical_path,
+        .physical_leaf = entry->physical_leaf,
+        .kind = entry->kind
+    };
+    return sidecar_log_append_claim(log, &claim) == SIDECAR_STATUS_OK &&
+           sidecar_log_append_entry(log, entry) == SIDECAR_STATUS_OK &&
+           sidecar_log_append_entry_commit(log) == SIDECAR_STATUS_OK
+        ? 0 : -1;
+}
+
+static void test_portable_replay_failure_names_entry(void)
+{
+    printf(BLUE "::" NC " portable replay failure identifies its entry\n");
+
+    char source[PATH_MAX], home[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_portable_failure_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_portable_failure_home");
+    setenv("HOME", home, 1);
+
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "ROOT");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "ROOT");
+    strcpy(root.source_path, "/source/ROOT");
+    strcpy(root.restore_path, "restored");
+    root.has_restore_path = 1;
+
+    Manifest manifest;
+    make_v1_manifest(&manifest, &root, 1);
+    manifest.representation = CLONE_PORTABLE_SIDECAR;
+    manifest.sidecar_version = SIDECAR_VERSION;
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write portable manifest for replay failure reporting");
+    write_payload_file(source, "data/ROOT", "link", "");
+
+    char payload_root[PATH_MAX];
+    join_path(payload_root, sizeof(payload_root), source, "data/ROOT");
+    struct stat root_st;
+    if (stat(payload_root, &root_st) != 0)
+    {
+        check(0, "fixture: inspect portable payload root");
+        remove_tree(source);
+        remove_tree(home);
+        return;
+    }
+
+    uint32_t uid = (uint32_t)geteuid();
+    uint32_t gid = (uint32_t)getegid();
+    SidecarEntry root_entry = {
+        .root_id = sidecar_text("ROOT"),
+        .logical_path = sidecar_text(""),
+        .physical_leaf = sidecar_text(""),
+        .kind = SIDECAR_KIND_DIRECTORY,
+        .mode = 0700,
+        .uid = uid,
+        .gid = gid,
+        .atime_sec = 1700000600,
+        .mtime_sec = 1700000601,
+        .size = (uint64_t)root_st.st_size
+    };
+    SidecarEntry link_entry = {
+        .root_id = sidecar_text("ROOT"),
+        .logical_path = sidecar_text("link"),
+        .physical_leaf = sidecar_text("link"),
+        .kind = SIDECAR_KIND_SYMLINK,
+        .mode = 0777,
+        .uid = uid,
+        .gid = gid,
+        .atime_sec = 1700000610,
+        .mtime_sec = 1700000611,
+        .symlink_target = sidecar_text("target")
+    };
+
+    int container_fd = open(source, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    SidecarLog sidecar = {0};
+    int sidecar_created = container_fd >= 0 &&
+        sidecar_log_create_at(container_fd, &sidecar) == SIDECAR_OPEN_FRESH;
+    int sidecar_ok = sidecar_created &&
+        append_committed_sidecar_entry(&sidecar, &root_entry) == 0 &&
+        append_committed_sidecar_entry(&sidecar, &link_entry) == 0;
+    if (sidecar_created && sidecar_log_close(&sidecar) != SIDECAR_STATUS_OK)
+        sidecar_ok = 0;
+    if (container_fd >= 0 && close(container_fd) != 0)
+        sidecar_ok = 0;
+    check(sidecar_ok, "fixture: commit portable sidecar for replay failure");
+    if (!sidecar_ok)
+    {
+        remove_tree(source);
+        remove_tree(home);
+        return;
+    }
+
+    char restored[PATH_MAX], existing[PATH_MAX];
+    join_path(restored, sizeof(restored), home, "restored");
+    mkdir_p(restored);
+    join_path(existing, sizeof(existing), restored, "link");
+    // A file or symlink would give way to the backup's symlink (D96).
+    if (mkfifo(existing, 0600) != 0)
+    {
+        check(0, "fixture: plant a FIFO where the symlink goes");
+        remove_tree(source);
+        remove_tree(home);
+        return;
+    }
+    remove_fixture_packages(source);
+
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    char output[16384];
+    int rc = run_restore_capturing_with_input(source, "y\n", output,
+                                               sizeof(output));
+    dry_run = previous_dry_run;
+
+    char replay_summary[512];
+    char final_summary[512];
+    snprintf(replay_summary, sizeof(replay_summary),
+             "Portable restore stopped at ROOT:link: 0 applied, 1 failed "
+             "(symlink, check destination: %s)",
+             strerror(EEXIST));
+    snprintf(final_summary, sizeof(final_summary),
+             "Restore finished with errors at ROOT:link: 0 applied, 1 failed "
+             "(symlink, check destination: %s)",
+             strerror(EEXIST));
+    check(rc != 0 &&
+              strstr(output, replay_summary) != NULL,
+          "portable replay summary identifies the failing entry and cause");
+    check(strstr(output, final_summary) != NULL,
+          "restore final summary preserves the failing entry and cause");
+    struct stat existing_st;
+    check(lstat(existing, &existing_st) == 0 && S_ISFIFO(existing_st.st_mode),
+          "reported replay conflict leaves the existing destination untouched");
+
+    remove_tree(source);
+    remove_tree(home);
+}
+
+static void make_v2_selection_manifest(Manifest *m, ManifestRoot roots[2])
+{
+    memset(m, 0, sizeof(*m));
+    memset(roots, 0, 2U * sizeof(*roots));
+
+    strcpy(roots[0].id, "CONFIG_0");
+    roots[0].policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(roots[0].payload_path, "CONFIG_0");
+    roots[0].has_restore_path = 1;
+
+    strcpy(roots[1].id, "XDG_DOCUMENTS_DIR");
+    roots[1].policy = ROOT_POLICY_XDG;
+    strcpy(roots[1].payload_path, "XDG_DOCUMENTS_DIR");
+    strcpy(roots[1].source_path, "/source/home/Belgeler");
+
+    m->version = MANIFEST_SELECTION_VERSION;
+    m->representation = CLONE_NATIVE_TREE;
+    m->scope = MANIFEST_SCOPE_CRITICAL;
+    strcpy(m->source_home, "/source/home");
+    m->root_count = 2;
+    m->roots = roots;
+}
+
+// Fills a restore_path[PATH_MAX] buffer with NAME_MAX-bounded components
+// (never ".", "..", or over NAME_MAX -- the same shape canonical_path() in
+// manifest.c requires of the real writer) packed as tightly as that
+// validation allows, so the string itself stays under PATH_MAX while still
+// being one join onto any real $HOME away from overflowing it.
+static void build_long_restore_path(char *out, size_t out_size)
+{
+    char segment[NAME_MAX + 1];
+    memset(segment, 'a', NAME_MAX);
+    segment[NAME_MAX] = '\0';
+
+    size_t pos = 0;
+    size_t limit = out_size - 2; // canonical_path rejects a string of exactly PATH_MAX
+    while (pos + 1 + NAME_MAX <= limit)
+    {
+        if (pos)
+            out[pos++] = '/';
+        memcpy(out + pos, segment, NAME_MAX);
+        pos += NAME_MAX;
+    }
+    size_t remaining = limit - pos;
+    if (remaining > 1)
+    {
+        out[pos++] = '/';
+        remaining--;
+        memcpy(out + pos, segment, remaining);
+        pos += remaining;
+    }
+    out[pos] = '\0';
+}
+
+static void write_file_mode(const char *path, const char *content, mode_t mode)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode);
+    if (fd < 0)
+    {
+        printf(RED "fixture: could not write %s" NC "\n", path);
+        exit(1);
+    }
+    size_t len = strlen(content);
+    ssize_t written = write(fd, content, len);
+    if (written < 0 || (size_t)written != len ||
+        fchmod(fd, mode) != 0 || close(fd) != 0)
+    {
+        printf(RED "fixture: could not finish %s" NC "\n", path);
+        exit(1);
+    }
+}
+
+static int file_matches(const char *path, const char *content, mode_t mode)
+{
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) ||
+        (st.st_mode & 0777) != mode || st.st_size < 0 ||
+        (size_t)st.st_size != strlen(content))
+        return 0;
+
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return 0;
+    char buf[256];
+    if ((size_t)st.st_size >= sizeof(buf))
+    {
+        close(fd);
+        return 0;
+    }
+    ssize_t n = read(fd, buf, sizeof(buf));
+    int saved_errno = errno;
+    int close_rc = close(fd);
+    errno = saved_errno;
+    return n == st.st_size && close_rc == 0 &&
+           memcmp(buf, content, (size_t)n) == 0;
+}
+
+static int file_content_is(const char *path, const char *content)
+{
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 ||
+        (size_t)st.st_size != strlen(content))
+        return 0;
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return 0;
+    char buf[256];
+    if ((size_t)st.st_size >= sizeof(buf))
+    {
+        close(fd);
+        return 0;
+    }
+    ssize_t n = read(fd, buf, sizeof(buf));
+    int close_rc = close(fd);
+    return n == st.st_size && close_rc == 0 &&
+           memcmp(buf, content, (size_t)n) == 0;
+}
+
+static void write_user_dirs(const char *home, const char *documents,
+                            const char *downloads)
+{
+    char content[PATH_MAX * 2U];
+    int length = snprintf(content, sizeof(content),
+                          "XDG_DOCUMENTS_DIR=\"$HOME/%s\"\n"
+                          "XDG_DOWNLOAD_DIR=\"$HOME/%s\"\n",
+                          documents, downloads);
+    if (length < 0 || (size_t)length >= sizeof(content))
+    {
+        printf(RED "fixture: user-dirs.dirs content is too long" NC "\n");
+        exit(1);
+    }
+    write_payload_file(home, ".config", "user-dirs.dirs", content);
+}
+
+static void make_v1_alias_manifest(Manifest *manifest,
+                                   ManifestRoot roots[2])
+{
+    memset(roots, 0, 2U * sizeof(*roots));
+    strcpy(roots[0].id, "XDG_DOCUMENTS_DIR");
+    roots[0].policy = ROOT_POLICY_XDG;
+    strcpy(roots[0].payload_path, "XDG_DOCUMENTS_DIR");
+    strcpy(roots[0].source_path, "Documents");
+
+    strcpy(roots[1].id, "XDG_DOWNLOAD_DIR");
+    roots[1].policy = ROOT_POLICY_XDG;
+    strcpy(roots[1].payload_path, "XDG_DOWNLOAD_DIR");
+    strcpy(roots[1].source_path, "Downloads");
+
+    make_v1_manifest(manifest, roots, 2);
+}
+
+static void test_versioned_restore_rejects_non_directory_payload_paths(void)
+{
+    printf(BLUE "::" NC " restore dispatch: disjoint roots inspect every payload entry\n");
+
+    const char *variants[] = { "regular file", "symlink" };
+    for (size_t variant = 0; variant < sizeof(variants) / sizeof(variants[0]);
+         variant++)
+    {
+        char source[PATH_MAX], home[PATH_MAX], documents[PATH_MAX];
+        char downloads[PATH_MAX], blocked[PATH_MAX], sentinel[PATH_MAX];
+        char output[16384];
+        ManifestRoot roots[2];
+        Manifest manifest;
+        int previous_dry_run = dry_run;
+
+        fresh_mkdtemp(source, sizeof(source), "dispatch_identity_entry_src");
+        fresh_mkdtemp(home, sizeof(home), "dispatch_identity_entry_home");
+        setenv("HOME", home, 1);
+        write_user_dirs(home, "Documents", "Downloads");
+        join_path(documents, sizeof(documents), home, "Documents");
+        join_path(downloads, sizeof(downloads), home, "Downloads");
+        mkdir_p(documents);
+        mkdir_p(downloads);
+        make_v1_alias_manifest(&manifest, roots);
+        check(manifest_write_v1(source, &manifest) == 0,
+              "fixture: write the disjoint-root payload-entry manifest");
+        write_payload_file(source, "data/XDG_DOCUMENTS_DIR/shared",
+                           "file", "DOCS");
+        write_payload_file(source, "data/XDG_DOWNLOAD_DIR", "file",
+                           "DOWNLOADS");
+
+        join_path(blocked, sizeof(blocked), documents, "shared");
+        if (variant == 0)
+        {
+            strcpy(sentinel, blocked);
+            write_file_mode(blocked, "ORIGINAL", 0600);
+        }
+        else
+        {
+            join_path(sentinel, sizeof(sentinel), documents,
+                      "symlink-target");
+            write_file_mode(sentinel, "ORIGINAL", 0600);
+            if (symlink("symlink-target", blocked) != 0)
+                exit(1);
+        }
+        remove_fixture_packages(source);
+
+        dry_run = 0;
+        int rc = run_restore_capturing_with_input(
+            source, "y\n", output, sizeof(output));
+        dry_run = previous_dry_run;
+
+        struct stat blocked_st;
+        int blocked_intact = lstat(blocked, &blocked_st) == 0 &&
+            ((variant == 0 && S_ISREG(blocked_st.st_mode) &&
+              file_content_is(blocked, "ORIGINAL")) ||
+             (variant == 1 && S_ISLNK(blocked_st.st_mode) &&
+              file_content_is(sentinel, "ORIGINAL")));
+        // A symlink is refused by its path, the other entries by the root
+        // and entry they belong to.
+        char symlink_refusal[PATH_MAX + 64];
+        snprintf(symlink_refusal, sizeof(symlink_refusal),
+                 "%s is a symbolic link", blocked);
+        check(rc != 0 &&
+                  strstr(output, variant == 0
+                             ? "manifest root XDG_DOCUMENTS_DIR entry shared"
+                             : symlink_refusal) != NULL &&
+                  blocked_intact,
+              variants[variant]);
+
+        remove_tree(source);
+        remove_tree(home);
+    }
+}
+
+static void test_versioned_restore_refuses_bind_mount_aliases(void)
+{
+    printf(BLUE "::" NC " restore dispatch: disjoint roots inspect bind-mounted aliases\n");
+
+    char source[PATH_MAX], home[PATH_MAX], documents_shared[PATH_MAX];
+    char downloads_shared[PATH_MAX], documents_file[PATH_MAX];
+    char downloads_file[PATH_MAX], output[16384];
+    ManifestRoot roots[2];
+    Manifest manifest;
+
+    fresh_mkdtemp(source, sizeof(source), "dispatch_identity_bind_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_identity_bind_home");
+    setenv("HOME", home, 1);
+    write_user_dirs(home, "Documents", "Downloads");
+    join_path(documents_shared, sizeof(documents_shared), home,
+              "Documents/shared");
+    join_path(downloads_shared, sizeof(downloads_shared), home,
+              "Downloads/shared");
+    mkdir_p(documents_shared);
+    mkdir_p(downloads_shared);
+    join_path(documents_file, sizeof(documents_file), documents_shared, "file");
+    join_path(downloads_file, sizeof(downloads_file), downloads_shared, "file");
+    write_file_mode(documents_file, "ORIGINAL", 0600);
+    write_file_mode(downloads_file, "ORIGINAL", 0600);
+    make_v1_alias_manifest(&manifest, roots);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the bind-alias payload-entry manifest");
+    write_payload_file(source, "data/XDG_DOCUMENTS_DIR/shared", "file",
+                       "DOCS");
+    write_payload_file(source, "data/XDG_DOWNLOAD_DIR/shared", "file",
+                       "DOWNLOADS");
+    remove_fixture_packages(source);
+
+    int rc = run_bind_mount_restore(source, home, documents_shared,
+                                    downloads_shared, output, sizeof(output));
+    if (rc == CHILD_SKIP)
+    {
+        skip_case("bind-mounted destination aliases",
+                  "user and mount namespaces are unavailable");
+    }
+    else
+    {
+        check(rc == 0 &&
+                  strstr(output, "XDG_DOCUMENTS_DIR") != NULL &&
+                  strstr(output, "XDG_DOWNLOAD_DIR") != NULL &&
+                  strstr(output, downloads_shared) != NULL,
+              "bind-mounted aliases name both roots and the unchanged destination");
+    }
+
+    remove_tree(source);
+    remove_tree(home);
+}
+
+static void test_versioned_restore_allows_ascii_case_distinct_names(void)
+{
+    printf(BLUE "::" NC " restore dispatch: byte-sensitive directories keep ASCII-case-distinct names\n");
+
+    char source[PATH_MAX], home[PATH_MAX], upper[PATH_MAX], lower[PATH_MAX];
+    char output[16384];
+    ManifestRoot root;
+    Manifest manifest;
+    int previous_dry_run = dry_run;
+
+    fresh_mkdtemp(source, sizeof(source), "dispatch_name_case_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_name_case_home");
+    setenv("HOME", home, 1);
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "CASE");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "CASE");
+    strcpy(root.source_path, "Case");
+    strcpy(root.restore_path, "target");
+    root.has_restore_path = 1;
+    make_v1_manifest(&manifest, &root, 1);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the ASCII-case restore manifest");
+    write_payload_file(source, "data/CASE", "Documents", "UPPER");
+    write_payload_file(source, "data/CASE", "documents", "LOWER");
+    remove_fixture_packages(source);
+
+    dry_run = 0;
+    int rc = run_restore_capturing_with_input(source, "y\n", output,
+                                               sizeof(output));
+    dry_run = previous_dry_run;
+    join_path(upper, sizeof(upper), home, "target/Documents");
+    join_path(lower, sizeof(lower), home, "target/documents");
+    check(rc == 0 && file_content_is(upper, "UPPER") &&
+              file_content_is(lower, "LOWER"),
+          "ordinary byte-sensitive directories restore ASCII-case-distinct entries");
+
+    remove_tree(source);
+    remove_tree(home);
+}
+
+static void test_restore_progress_speed_is_cumulative_average(void)
+{
+    printf(BLUE "::" NC " utility: restore progress speed is a cumulative "
+                "average, not the last-interval rate\n");
+    struct timespec started_at = { .tv_sec = 1000, .tv_nsec = 0 };
+
+    // A long syncfs()-style stall: 60s elapsed, almost nothing restored yet.
+    struct timespec after_stall = { .tv_sec = 1060, .tv_nsec = 0 };
+    off_t speed_during_stall =
+        restore_test_progress_speed(100, &started_at, &after_stall);
+    check(speed_during_stall == 100 / 60,
+          "speed during a stall reflects the (tiny) average so far");
+
+    // A one-second burst that lands the bulk of the bytes right after the
+    // stall unblocks. The interval-only formula would report the burst rate
+    // here (~609900 B/s); the cumulative average must not.
+    struct timespec after_burst = { .tv_sec = 1061, .tv_nsec = 0 };
+    off_t speed_after_burst =
+        restore_test_progress_speed(610000, &started_at, &after_burst);
+    check(speed_after_burst == 10000,
+          "speed after a burst is total_bytes / elapsed since start (10000), "
+          "not the burst-only rate");
+    check(speed_after_burst < 609900 / 2,
+          "speed after a burst is nowhere near the burst-only interval rate");
+
+    // Guard clauses carried over from the interval formula.
+    check(restore_test_progress_speed(0, &started_at, &after_burst) == 0,
+          "zero bytes restored yields zero speed");
+    check(restore_test_progress_speed(610000, &started_at, &started_at) == 0,
+          "non-positive elapsed time yields zero speed");
+}
+
+static void test_live_restore_joins_progress_ticker(void)
+{
+    printf(BLUE "::" NC " restore dispatch: live progress ticker is joined before optional restore steps\n");
+
+    char source[PATH_MAX], home[PATH_MAX], restored[PATH_MAX];
+    char output[16384];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_progress_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_progress_home");
+    setenv("HOME", home, 1);
+
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "PROGRESS");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "PROGRESS");
+    strcpy(root.source_path, "progress-source");
+    strcpy(root.restore_path, "progress-dest");
+    root.has_restore_path = 1;
+
+    Manifest manifest;
+    make_v1_manifest(&manifest, &root, 1);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the live-progress restore manifest");
+    write_payload_file(source, "data/PROGRESS", "payload.txt", "progress payload");
+    char packages_path[PATH_MAX];
+    join_path(packages_path, sizeof(packages_path), source, "packages.txt");
+    write_file_mode(packages_path, "fixture-package\n", 0644);
+
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    int threads_before = -1;
+    int threads_after = -1;
+#ifdef PACKAGES_TEST_HOOKS
+    PackageProgressProbe package_probe = {0};
+    packages_test_set_restore_hooks(DISTRO_FEDORA, package_progress_probe,
+                                    package_progress_capture,
+                                    &package_probe);
+#endif
+    int rc = run_restore_forced_progress_in_process(
+        source, "y\n", output, sizeof(output), &threads_before, &threads_after);
+#ifdef PACKAGES_TEST_HOOKS
+    packages_test_clear_restore_hooks();
+#endif
+    dry_run = previous_dry_run;
+
+    join_path(restored, sizeof(restored), home,
+              "progress-dest/payload.txt");
+    check(rc == 0 && file_content_is(restored, "progress payload"),
+          "forced live progress leaves the restore result intact");
+    check(strstr(output, "\rRestored 16B in ") != NULL &&
+              strstr(output, ", current: ") != NULL,
+          "the restore-only progress force installs the real display path");
+    const char *last = NULL;
+    for (const char *at = strstr(output, "\rRestored "); at != NULL;
+         at = strstr(at + 1, "\rRestored "))
+        last = at;
+    const char *last_end = last != NULL ? strstr(last, "\033[K") : NULL;
+    const char *last_path = last != NULL ? strstr(last, ", current: ") : NULL;
+    check(last_end != NULL && (last_path == NULL || last_path > last_end),
+          "the files step ends on its totals, without a current path");
+    check(threads_before > 0 && threads_after == threads_before,
+          "a live restore joins its progress ticker before returning");
+#ifdef PACKAGES_TEST_HOOKS
+    check(package_probe.call_count == 1 &&
+              package_probe.thread_count == threads_before,
+          "package restore starts only after the progress ticker is joined");
+#endif
+
+    remove_tree(source);
+    remove_tree(home);
+}
+
+#ifdef PACKAGES_TEST_HOOKS
+static void test_unprivileged_restore_reaches_package_install(void)
+{
+    printf(BLUE "::" NC " restore dispatch: packages.txt does not require root preflight\n");
+
+    char source[PATH_MAX], home[PATH_MAX], restored[PATH_MAX];
+    char manifest_path[PATH_MAX], data_path[PATH_MAX];
+    char payload_dir[PATH_MAX], payload_path[PATH_MAX], packages_path[PATH_MAX];
+    char output[16384];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_packages_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_packages_home");
+    setenv("HOME", home, 1);
+
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "PACKAGES");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "PACKAGES");
+    strcpy(root.source_path, "packages-source");
+    strcpy(root.restore_path, "packages-dest");
+    root.has_restore_path = 1;
+
+    Manifest manifest;
+    make_v1_manifest(&manifest, &root, 1);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the package-restore manifest");
+    write_payload_file(source, "data/PACKAGES", "payload.txt",
+                       "package restore payload");
+    join_path(packages_path, sizeof(packages_path), source, "packages.txt");
+    write_file_mode(packages_path, "fixture-package\n", 0644);
+
+    join_path(manifest_path, sizeof(manifest_path), source, "manifest.txt");
+    join_path(data_path, sizeof(data_path), source, "data");
+    join_path(payload_dir, sizeof(payload_dir), data_path, "PACKAGES");
+    join_path(payload_path, sizeof(payload_path), payload_dir, "payload.txt");
+    if (chmod(source, 0755) != 0 || chmod(home, 0755) != 0)
+    {
+        skip_case("unprivileged package restore", "fixture permissions could not be prepared");
+        remove_tree(source);
+        remove_tree(home);
+        return;
+    }
+
+    int drop_privileges = 0;
+    uid_t nobody_uid = 0;
+    gid_t nobody_gid = 0;
+    if (geteuid() == 0)
+    {
+        if (!find_nobody(&nobody_uid, &nobody_gid))
+        {
+            skip_case("unprivileged package restore",
+                      "root test requires an unprivileged nobody identity");
+            remove_tree(source);
+            remove_tree(home);
+            return;
+        }
+        const char *owned_paths[] = {
+            source, manifest_path, data_path, payload_dir, payload_path,
+            packages_path, home
+        };
+        for (size_t index = 0;
+             index < sizeof(owned_paths) / sizeof(owned_paths[0]); index++)
+        {
+            if (chown(owned_paths[index], nobody_uid, nobody_gid) != 0)
+            {
+                skip_case("unprivileged package restore",
+                          "fixture ownership could not be assigned to nobody");
+                remove_tree(source);
+                remove_tree(home);
+                return;
+            }
+        }
+        drop_privileges = 1;
+    }
+
+    PackagePrivilegeProbe probe = {0};
+    join_path(probe.marker_path, sizeof(probe.marker_path), home,
+              "package-install-hook-called");
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    packages_test_set_restore_hooks(DISTRO_FEDORA, package_privilege_probe,
+                                    package_progress_capture, &probe);
+    int rc = run_restore_capturing_with_identity(
+        source, "y\n", output, sizeof(output), drop_privileges,
+        nobody_uid, nobody_gid);
+    packages_test_clear_restore_hooks();
+    dry_run = previous_dry_run;
+
+    join_path(restored, sizeof(restored), home,
+              "packages-dest/payload.txt");
+    if (rc == CHILD_SKIP)
+        skip_case("unprivileged package restore",
+                  "the test child could not drop to nobody");
+    else
+    {
+        check(rc == 0 && strstr(output, "This restore needs root") == NULL &&
+                  file_content_is(restored, "package restore payload"),
+              "packages.txt does not stop an unprivileged restore before mutation");
+        check(file_content_is(probe.marker_path, "package install hook\n"),
+              "recognized package restore reaches the sudo-prefixed install hook");
+    }
+
+    remove_tree(source);
+    remove_tree(home);
+}
+#endif
+
+static void test_native_identity_graph_keeps_nested_mount_views_route_specific(void)
+{
+    printf(BLUE "::" NC " native restore identity graph: nested bind-mounted descendants keep route-specific views\n");
+
+    char home[PATH_MAX], documents_root[PATH_MAX];
+    char downloads_root[PATH_MAX], documents_shared[PATH_MAX];
+    char downloads_shared[PATH_MAX], alternate[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "dispatch_mount_nested_home");
+    write_user_dirs(home, "Documents", "Downloads");
+    join_path(documents_root, sizeof(documents_root), home, "Documents");
+    join_path(downloads_root, sizeof(downloads_root), home, "Downloads");
+    join_path(documents_shared, sizeof(documents_shared), documents_root,
+              "shared");
+    join_path(downloads_shared, sizeof(downloads_shared), downloads_root,
+              "shared");
+    join_path(alternate, sizeof(alternate), home, "alternate");
+    mkdir_p(documents_shared);
+    mkdir_p(downloads_shared);
+    char documents_desc[PATH_MAX], downloads_desc[PATH_MAX];
+    join_path(documents_desc, sizeof(documents_desc), documents_shared, "desc");
+    join_path(downloads_desc, sizeof(downloads_desc), downloads_shared, "desc");
+    mkdir_p(documents_desc);
+    mkdir_p(downloads_desc);
+    mkdir_p(alternate);
+    char alternate_file[PATH_MAX];
+    join_path(alternate_file, sizeof(alternate_file), alternate,
+              "downloads-file");
+    mkdir_p(alternate_file);
+
+    int rc = run_nested_mount_view_graph_case(
+        documents_root, downloads_root, documents_shared, downloads_shared,
+        alternate);
+    if (rc == CHILD_SKIP)
+        skip_case("nested bind-mounted descendant views",
+                  "user namespace, bind mounts, or distinct mount ids are unavailable");
+    else
+        check(rc == 0,
+              "equal root identity does not substitute another route's descendant fd");
+
+    remove_tree(home);
+}
+
+static void test_versioned_restore_refuses_differing_mount_id_aliases(void)
+{
+    printf(BLUE "::" NC " restore dispatch: differing mount ids do not make aliases disjoint\n");
+
+    char source[PATH_MAX], home[PATH_MAX], documents_shared[PATH_MAX];
+    char downloads_shared[PATH_MAX], sentinel[PATH_MAX], output[16384];
+    ManifestRoot roots[2];
+    Manifest manifest;
+
+    fresh_mkdtemp(source, sizeof(source), "dispatch_mount_id_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_mount_id_home");
+    setenv("HOME", home, 1);
+    write_user_dirs(home, "Documents", "Downloads");
+    join_path(documents_shared, sizeof(documents_shared), home,
+              "Documents/shared");
+    join_path(downloads_shared, sizeof(downloads_shared), home,
+              "Downloads/shared");
+    mkdir_p(documents_shared);
+    mkdir_p(downloads_shared);
+    join_path(sentinel, sizeof(sentinel), downloads_shared, "file");
+    write_file_mode(sentinel, "ORIGINAL", 0600);
+    make_v1_alias_manifest(&manifest, roots);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the differing-mount-id collision manifest");
+    write_payload_file(source, "data/XDG_DOCUMENTS_DIR/shared", "file", "DOCS");
+    write_payload_file(source, "data/XDG_DOWNLOAD_DIR/shared", "file", "DOWNLOADS");
+    remove_fixture_packages(source);
+
+    int rc = run_mount_view_restore_case(
+        source, home, documents_shared, downloads_shared,
+        output, sizeof(output));
+    if (rc == CHILD_SKIP)
+        skip_case("differing-mount-id alias collision",
+                  "user namespace, bind mounts, or distinct mount ids are unavailable");
+    else
+        check(rc == 0 && strstr(output, "XDG_DOCUMENTS_DIR") != NULL &&
+                  strstr(output, "XDG_DOWNLOAD_DIR") != NULL &&
+                  strstr(output, "competing entries for restore destination") != NULL &&
+                  file_content_is(sentinel, "ORIGINAL"),
+              "equal inode identity still refuses a collision before mutation");
+
+    remove_tree(source);
+    remove_tree(home);
+}
+
+static int record_network_command(char *const argv[], void *context)
+{
+    const char *marker_path = context;
+    FILE *f = fopen(marker_path, "a");
+    if (f == NULL)
+        return -1;
+    for (size_t i = 0; argv[i] != NULL; i++)
+        if (fprintf(f, "%s\n", argv[i]) < 0)
+        {
+            fclose(f);
+            return -1;
+    }
+    return fclose(f) == 0 ? 0 : -1;
+}
+
+static int record_failed_network_command(char *const argv[], void *context)
+{
+    if (record_network_command(argv, context) != 0)
+        return -1;
+    return 1;
+}
+
+static int record_failed_restart_command(char *const argv[], void *context)
+{
+    if (record_network_command(argv, context) != 0)
+        return -1;
+    return strcmp(argv[0], "systemctl") == 0 ? 1 : 0;
+}
+
+static void write_network_manifest(const char *source)
+{
+    Manifest m;
+    make_v1_manifest(&m, NULL, 0);
+    m.has_network_config = 1;
+    if (manifest_write_v1(source, &m) != 0)
+    {
+        printf(RED "fixture: could not write network manifest" NC "\n");
+        exit(1);
+    }
+}
+
+static int prepare_unprivileged_restore_fixture(
+    const char *source, const char *home, const char *const *owned_paths,
+    size_t owned_path_count, int *drop_privileges, uid_t *uid, gid_t *gid)
+{
+    if (chmod(source, 0755) != 0 || chmod(home, 0755) != 0)
+        return -1;
+
+    *drop_privileges = 0;
+    *uid = 0;
+    *gid = 0;
+    if (geteuid() != 0)
+        return 0;
+
+    if (!find_nobody(uid, gid))
+        return CHILD_SKIP;
+    for (size_t index = 0; index < owned_path_count; index++)
+        if (chown(owned_paths[index], *uid, *gid) != 0)
+            return -1;
+    *drop_privileges = 1;
+    return 0;
+}
+
+static void test_network_config_privilege_refusal(void)
+{
+    printf(BLUE "::" NC
+           " network config privilege preflight: nonempty saved config refuses before consent\n");
+
+    char source[PATH_MAX], home[PATH_MAX], network[PATH_MAX];
+    char backend[PATH_MAX], saved_file[PATH_MAX], manifest_path[PATH_MAX];
+    char sentinel[PATH_MAX], output[16384];
+    fresh_mkdtemp(source, sizeof(source), "network_privilege_src");
+    fresh_mkdtemp(home, sizeof(home), "network_privilege_home");
+    setenv("HOME", home, 1);
+    write_network_manifest(source);
+    join_path(network, sizeof(network), source, "network");
+    join_path(backend, sizeof(backend), network, "networkmanager");
+    mkdir_p(backend);
+    join_path(saved_file, sizeof(saved_file), backend, "wifi.nmconnection");
+    write_file_mode(saved_file, "wifi", 0644);
+    join_path(manifest_path, sizeof(manifest_path), source, "manifest.txt");
+    join_path(sentinel, sizeof(sentinel), home, "sentinel");
+    write_file_mode(sentinel, "untouched", 0600);
+
+    const char *owned_paths[] = {
+        source, manifest_path, network, backend, saved_file, home, sentinel
+    };
+    int drop_privileges;
+    uid_t uid;
+    gid_t gid;
+    int preparation = prepare_unprivileged_restore_fixture(
+        source, home, owned_paths,
+        sizeof(owned_paths) / sizeof(owned_paths[0]),
+        &drop_privileges, &uid, &gid);
+    if (preparation == CHILD_SKIP)
+        skip_case("network-config privilege refusal",
+                  "root test requires an unprivileged nobody identity");
+    else if (preparation != 0)
+        skip_case("network-config privilege refusal",
+                  "fixture permissions or ownership could not be prepared");
+    else
+    {
+        int previous_dry_run = dry_run;
+        dry_run = 0;
+        int rc = run_restore_capturing_with_identity(
+            source, "y\n", output, sizeof(output), drop_privileges,
+            uid, gid);
+        dry_run = previous_dry_run;
+        check(rc != 0 &&
+                  strstr(output,
+                         "This restore needs root: it would apply saved network configuration") != NULL,
+              "a nonempty saved network configuration is a standalone root requirement");
+        check(strstr(output, "Continue?") == NULL &&
+                  file_content_is(sentinel, "untouched"),
+              "network privilege refusal precedes consent and destination mutation");
+
+        dry_run = 1;
+        rc = run_restore_capturing_with_identity(
+            source, NULL, output, sizeof(output), drop_privileges, uid, gid);
+        dry_run = previous_dry_run;
+        check(rc == 0 &&
+                  strstr(output, "This restore needs root") == NULL &&
+                  strstr(output, "Note: the real restore needs root. Run it "
+                                 "with sudo.") != NULL &&
+                  file_content_is(sentinel, "untouched"),
+              "an unprivileged dry run previews and notes the root requirement");
+    }
+
+    remove_tree(source);
+    remove_tree(home);
+}
+
+static void test_network_config_and_foreign_owner_refusal(void)
+{
+    printf(BLUE "::" NC
+           " network config privilege preflight: foreign ownership and network config share one refusal\n");
+    if (geteuid() != 0)
+    {
+        char output[1024];
+        int result = run_restore_privilege_preflight_capturing(
+            1, 1, output, sizeof(output));
+        check(result == -1 &&
+                  strstr(output,
+                         "different user and apply saved network configuration") != NULL,
+              "foreign ownership and network configuration are reported together");
+        return;
+    }
+
+    char source[PATH_MAX], home[PATH_MAX], data[PATH_MAX];
+    char payload_dir[PATH_MAX], payload_file[PATH_MAX];
+    char network[PATH_MAX], backend[PATH_MAX], saved_file[PATH_MAX];
+    char manifest_path[PATH_MAX], sentinel[PATH_MAX], output[16384];
+    fresh_mkdtemp(source, sizeof(source), "network_both_src");
+    fresh_mkdtemp(home, sizeof(home), "network_both_home");
+    setenv("HOME", home, 1);
+
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "ROOT");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "ROOT");
+    strcpy(root.source_path, "network-both-source");
+    strcpy(root.restore_path, "network-both-destination");
+    root.has_restore_path = 1;
+    Manifest manifest;
+    make_v1_manifest(&manifest, &root, 1);
+    manifest.has_network_config = 1;
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write combined network/foreign-owner manifest");
+    write_payload_file(source, "data/ROOT", "payload.txt", "payload");
+    join_path(data, sizeof(data), source, "data");
+    join_path(payload_dir, sizeof(payload_dir), data, "ROOT");
+    join_path(payload_file, sizeof(payload_file), payload_dir, "payload.txt");
+    if (chmod(payload_file, 0644) != 0)
+    {
+        skip_case("combined network/foreign-owner privilege refusal",
+                  "foreign-owned payload permissions could not be prepared");
+        remove_tree(source);
+        remove_tree(home);
+        return;
+    }
+
+    join_path(network, sizeof(network), source, "network");
+    join_path(backend, sizeof(backend), network, "networkmanager");
+    mkdir_p(backend);
+    join_path(saved_file, sizeof(saved_file), backend, "wifi.nmconnection");
+    write_file_mode(saved_file, "wifi", 0644);
+    join_path(manifest_path, sizeof(manifest_path), source, "manifest.txt");
+    join_path(sentinel, sizeof(sentinel), home, "sentinel");
+    write_file_mode(sentinel, "untouched", 0600);
+
+    uid_t nobody_uid;
+    gid_t nobody_gid;
+    if (!find_nobody(&nobody_uid, &nobody_gid))
+    {
+        skip_case("combined network/foreign-owner privilege refusal",
+                  "root test requires an unprivileged nobody identity");
+        remove_tree(source);
+        remove_tree(home);
+        return;
+    }
+    const char *owned_paths[] = {
+        source, manifest_path, data, payload_dir, network, backend,
+        saved_file, home, sentinel
+    };
+    int drop_privileges;
+    uid_t uid;
+    gid_t gid;
+    int preparation = prepare_unprivileged_restore_fixture(
+        source, home, owned_paths,
+        sizeof(owned_paths) / sizeof(owned_paths[0]),
+        &drop_privileges, &uid, &gid);
+    if (preparation != 0)
+    {
+        skip_case("combined network/foreign-owner privilege refusal",
+                  "fixture ownership could not be assigned to nobody");
+        remove_tree(source);
+        remove_tree(home);
+        return;
+    }
+
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    int rc = run_restore_capturing_with_identity(
+        source, "y\n", output, sizeof(output), drop_privileges, uid, gid);
+    dry_run = previous_dry_run;
+    check(rc != 0 &&
+              strstr(output,
+                     "different user and apply saved network configuration") != NULL,
+          "foreign ownership and network configuration are reported together");
+    check(strstr(output, "Continue?") == NULL &&
+              file_content_is(sentinel, "untouched"),
+          "the combined privilege refusal precedes consent and mutation");
+
+    remove_tree(source);
+    remove_tree(home);
+}
+
+static void write_fake_process(const char *proc_root, const char *pid,
+                               const char *comm, uid_t uid, int with_status)
+{
+    char dir[PATH_MAX], file[PATH_MAX], content[128];
+    join_path(dir, sizeof(dir), proc_root, pid);
+    mkdir_p(dir);
+    join_path(file, sizeof(file), dir, "comm");
+    snprintf(content, sizeof(content), "%s\n", comm);
+    write_file_mode(file, content, 0644);
+    if (!with_status)
+        return;
+    join_path(file, sizeof(file), dir, "status");
+    snprintf(content, sizeof(content),
+             "Name:\t%s\nUmask:\t0022\nUid:\t%ju\t%ju\t%ju\t%ju\n",
+             comm, (uintmax_t)uid, (uintmax_t)uid, (uintmax_t)uid,
+             (uintmax_t)uid);
+    write_file_mode(file, content, 0644);
+}
+
+static void write_fake_cgroup(const char *proc_root, const char *pid,
+                              const char *cgroup)
+{
+    char file[PATH_MAX];
+    snprintf(file, sizeof(file), "%s/%s/cgroup", proc_root, pid);
+    write_file_mode(file, cgroup, 0644);
+}
+
+static void ignore_dconf_database(int database_fd, void *context)
+{
+    (void)database_fd;
+    (void)context;
+}
+
+static void record_dconf_database(int database_fd, void *context)
+{
+    const char *marker = context;
+    char content[128] = {0};
+    ssize_t got = pread(database_fd, content, sizeof(content) - 1U, 0);
+    if (got >= 0)
+        write_file_mode(marker, content, 0600);
+}
+
+static void test_native_restore_applies_dconf(void)
+{
+    printf(BLUE "::" NC " restore dispatch: a native restore hands its dconf database to the session step\n");
+    char source[PATH_MAX], home[PATH_MAX], marker[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_native_dconf_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_native_dconf_home");
+    setenv("HOME", home, 1);
+
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "BUILTIN_DOT_CONFIG");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "BUILTIN_DOT_CONFIG");
+    strcpy(root.source_path, ".config");
+    strcpy(root.restore_path, ".config");
+    root.has_restore_path = 1;
+    Manifest manifest;
+    make_v1_manifest(&manifest, &root, 1);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the native dconf manifest");
+    write_payload_file(source, "data/BUILTIN_DOT_CONFIG/dconf", "user",
+                       "GVDB-native");
+    remove_fixture_packages(source);
+
+    join_path(marker, sizeof(marker), home, "dconf-handed-over");
+    restore_test_set_dconf_hook(record_dconf_database, marker);
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    char output[16384];
+    int rc = run_restore_capturing_with_input(source, "y\n", output,
+                                               sizeof(output));
+    dry_run = previous_dry_run;
+    restore_test_set_dconf_hook(ignore_dconf_database, NULL);
+
+    char restored[PATH_MAX];
+    join_path(restored, sizeof(restored), home, ".config/dconf/user");
+    check(rc == 0 && file_content_is(restored, "GVDB-native"),
+          "the native restore writes the dconf database");
+    check(file_content_is(marker, "GVDB-native"),
+          "the backed-up database is handed to the running-session step");
+    remove_tree(source);
+    remove_tree(home);
+}
+
+static char verification_mutation_path[PATH_MAX];
+
+// Changes the restored bytes but keeps size and times, as corruption would;
+// a later write by another program is not a verification failure (D67).
+static void write_restored_file_after_apply(void)
+{
+    write_file_mode(verification_mutation_path, "written later", 0600);
+}
+
+static void rewrite_restored_file_after_apply(void)
+{
+    struct stat before;
+    if (stat(verification_mutation_path, &before) != 0)
+        return;
+    write_file_mode(verification_mutation_path, "CHANGED", 0600);
+    struct timespec times[2] = { before.st_atim, before.st_mtim };
+    (void)utimensat(AT_FDCWD, verification_mutation_path, times, 0);
+}
+
+static int package_marker_probe(char *const argv[], void *context)
+{
+    (void)argv;
+    PackagePrivilegeProbe *probe = context;
+    int fd = open(probe->marker_path,
+                  O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0)
+        return -1;
+    fixture_package_installed = 1;
+    return close(fd);
+}
+
+static void test_verification_failure_still_restores_packages(void)
+{
+    printf(BLUE "::" NC " restore dispatch: packages still run after a verification mismatch\n");
+
+    char source[PATH_MAX], home[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_verify_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_verify_home");
+    setenv("HOME", home, 1);
+
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "ROOT");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "ROOT");
+    strcpy(root.source_path, "/source/ROOT");
+    strcpy(root.restore_path, "restored");
+    root.has_restore_path = 1;
+
+    Manifest manifest;
+    make_v1_manifest(&manifest, &root, 1);
+    manifest.representation = CLONE_PORTABLE_SIDECAR;
+    manifest.sidecar_version = SIDECAR_VERSION;
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write portable manifest for verification mismatch");
+    write_payload_file(source, "data/ROOT", "file", "payload");
+    char packages_path[PATH_MAX];
+    join_path(packages_path, sizeof(packages_path), source, "packages.txt");
+    write_file_mode(packages_path, "fixture-package\n", 0644);
+
+    char payload_root[PATH_MAX];
+    join_path(payload_root, sizeof(payload_root), source, "data/ROOT");
+    struct stat root_st;
+    if (stat(payload_root, &root_st) != 0)
+    {
+        check(0, "fixture: inspect portable payload root");
+        remove_tree(source);
+        remove_tree(home);
+        return;
+    }
+    uint32_t uid = (uint32_t)geteuid();
+    uint32_t gid = (uint32_t)getegid();
+    SidecarEntry root_entry = {
+        .root_id = sidecar_text("ROOT"),
+        .logical_path = sidecar_text(""),
+        .physical_leaf = sidecar_text(""),
+        .kind = SIDECAR_KIND_DIRECTORY,
+        .mode = 0700, .uid = uid, .gid = gid,
+        .atime_sec = 1700000700, .mtime_sec = 1700000701,
+        .size = (uint64_t)root_st.st_size
+    };
+    SidecarEntry file_entry = {
+        .root_id = sidecar_text("ROOT"),
+        .logical_path = sidecar_text("file"),
+        .physical_leaf = sidecar_text("file"),
+        .kind = SIDECAR_KIND_REGULAR,
+        .mode = 0600, .uid = uid, .gid = gid,
+        .atime_sec = 1700000710, .mtime_sec = 1700000711,
+        .size = strlen("payload"),
+        .content_digest = hash_fnv1a_bytes(HASH_FNV1A_OFFSET_BASIS,
+                                           (const unsigned char *)"payload",
+                                           strlen("payload"))
+    };
+    int container_fd = open(source, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    SidecarLog sidecar = {0};
+    int sidecar_created = container_fd >= 0 &&
+        sidecar_log_create_at(container_fd, &sidecar) == SIDECAR_OPEN_FRESH;
+    int sidecar_ok = sidecar_created &&
+        append_committed_sidecar_entry(&sidecar, &root_entry) == 0 &&
+        append_committed_sidecar_entry(&sidecar, &file_entry) == 0;
+    if (sidecar_created && sidecar_log_close(&sidecar) != SIDECAR_STATUS_OK)
+        sidecar_ok = 0;
+    if (container_fd >= 0 && close(container_fd) != 0)
+        sidecar_ok = 0;
+    check(sidecar_ok, "fixture: commit portable sidecar for verification mismatch");
+    if (!sidecar_ok)
+    {
+        remove_tree(source);
+        remove_tree(home);
+        return;
+    }
+
+    join_path(verification_mutation_path, sizeof(verification_mutation_path),
+              home, "restored/file");
+    PackagePrivilegeProbe probe = {0};
+    join_path(probe.marker_path, sizeof(probe.marker_path), home,
+              "package-install-hook-called");
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    packages_test_set_restore_hooks(DISTRO_FEDORA, package_marker_probe,
+                                    package_progress_capture, &probe);
+    portable_restore_replay_test_set_after_apply_hook(
+        rewrite_restored_file_after_apply);
+    char proc_root[PATH_MAX];
+    join_path(proc_root, sizeof(proc_root), home, "fake-proc");
+    mkdir_p(proc_root);
+    write_fake_process(proc_root, "4242", "code", geteuid(), 1);
+    writer_apps_test_set_proc_root(proc_root);
+    char output[16384];
+    int rc = run_restore_capturing_with_input(source, "y\n", output,
+                                               sizeof(output));
+    writer_apps_test_set_proc_root("/nonexistent/migr-test-proc");
+    portable_restore_replay_test_set_after_apply_hook(NULL);
+    dry_run = previous_dry_run;
+
+    check(rc == 2 &&
+              strstr(output, "ROOT:file (regular file, content differs from "
+                             "the backup)") != NULL &&
+              strstr(output, "1 differs from the backup (listed above)") != NULL,
+          "the mismatch is listed and the restore fails with status 2");
+    struct stat marker;
+    check(stat(probe.marker_path, &marker) == 0,
+          "packages are still restored once every file was applied");
+    const char *warning = strstr(output, "Visual Studio Code is open.");
+    const char *prompt = strstr(output, "Continue?");
+    check(warning != NULL && prompt != NULL && warning < prompt,
+          "a running writer is named before the confirmation prompt");
+
+    // The same file written afterwards by another program (a new mtime) is
+    // not a failure: it is listed, and the restore ends with 1 (D67).
+    remove_tree(home);
+    mkdir_p(home);
+    dry_run = 0;
+    portable_restore_replay_test_set_after_apply_hook(
+        write_restored_file_after_apply);
+    rc = run_restore_capturing_with_input(source, "y\n", output,
+                                          sizeof(output));
+    portable_restore_replay_test_set_after_apply_hook(NULL);
+    packages_test_clear_restore_hooks();
+    dry_run = previous_dry_run;
+    check(rc == 1 && strstr(output, "Restore complete") != NULL &&
+              strstr(output, "1 restored item was changed by other programs "
+                             "after it was restored; not errors:\n"
+                             "  ROOT:file") != NULL &&
+              strstr(output, "1 of them was changed afterwards") != NULL &&
+              strstr(output, "differs from the backup") == NULL,
+          "a later write by another program is listed, not failed, and the "
+          "restore exits 1");
+
+    remove_tree(source);
+    remove_tree(home);
+}
+
+// A portable restore with Visual Studio Code open (a fake /proc entry that
+// stays running) restores its settings last and asks first (D66).
+static int run_deferred_settings_restore(const char *input, char *output,
+                                         size_t output_size,
+                                         int *settings_restored,
+                                         int *other_restored)
+{
+    char source[PATH_MAX], home[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_defer_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_defer_home");
+    setenv("HOME", home, 1);
+
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "CONFIG");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "CONFIG");
+    strcpy(root.source_path, "/source/.config");
+    strcpy(root.restore_path, ".config");
+    root.has_restore_path = 1;
+    Manifest manifest;
+    make_v1_manifest(&manifest, &root, 1);
+    manifest.representation = CLONE_PORTABLE_SIDECAR;
+    manifest.sidecar_version = SIDECAR_VERSION;
+    if (manifest_write_v1(source, &manifest) != 0)
+        return -1;
+    write_payload_file(source, "data/CONFIG/Code", "settings.json", "{}");
+    write_payload_file(source, "data/CONFIG", "other.txt", "other");
+
+    uint32_t uid = (uint32_t)geteuid(), gid = (uint32_t)getegid();
+    SidecarEntry entries[] = {
+        { .root_id = sidecar_text("CONFIG"), .logical_path = sidecar_text(""),
+          .physical_leaf = sidecar_text(""), .kind = SIDECAR_KIND_DIRECTORY,
+          .mode = 0700, .uid = uid, .gid = gid,
+          .atime_sec = 1700000950, .mtime_sec = 1700000951 },
+        { .root_id = sidecar_text("CONFIG"),
+          .logical_path = sidecar_text("Code"),
+          .physical_leaf = sidecar_text("Code"),
+          .kind = SIDECAR_KIND_DIRECTORY, .mode = 0700, .uid = uid,
+          .gid = gid, .atime_sec = 1700000952, .mtime_sec = 1700000953 },
+        { .root_id = sidecar_text("CONFIG"),
+          .logical_path = sidecar_text("Code/settings.json"),
+          .physical_leaf = sidecar_text("settings.json"),
+          .kind = SIDECAR_KIND_REGULAR, .mode = 0600, .uid = uid, .gid = gid,
+          .atime_sec = 1700000954, .mtime_sec = 1700000955, .size = 2,
+          .content_digest = hash_fnv1a_bytes(HASH_FNV1A_OFFSET_BASIS,
+                                             (const unsigned char *)"{}", 2) },
+        { .root_id = sidecar_text("CONFIG"),
+          .logical_path = sidecar_text("other.txt"),
+          .physical_leaf = sidecar_text("other.txt"),
+          .kind = SIDECAR_KIND_REGULAR, .mode = 0600, .uid = uid, .gid = gid,
+          .atime_sec = 1700000956, .mtime_sec = 1700000957, .size = 5,
+          .content_digest = hash_fnv1a_bytes(HASH_FNV1A_OFFSET_BASIS,
+                                             (const unsigned char *)"other",
+                                             5) }
+    };
+    int container_fd = open(source, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    SidecarLog sidecar = {0};
+    int ok = container_fd >= 0 &&
+             sidecar_log_create_at(container_fd, &sidecar) ==
+                 SIDECAR_OPEN_FRESH;
+    for (size_t index = 0; ok && index < sizeof(entries) / sizeof(entries[0]);
+         index++)
+        ok = append_committed_sidecar_entry(&sidecar, &entries[index]) == 0;
+    if (container_fd >= 0)
+    {
+        if (sidecar_log_close(&sidecar) != SIDECAR_STATUS_OK)
+            ok = 0;
+        close(container_fd);
+    }
+    if (!ok)
+        return -1;
+
+    char proc_root[PATH_MAX];
+    join_path(proc_root, sizeof(proc_root), home, "fake-proc");
+    mkdir_p(proc_root);
+    write_fake_process(proc_root, "4242", "code", geteuid(), 1);
+    writer_apps_test_set_proc_root(proc_root);
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    int rc = run_restore_capturing_with_input(source, input, output,
+                                              output_size);
+    dry_run = previous_dry_run;
+    writer_apps_test_set_proc_root("/nonexistent/migr-test-proc");
+
+    char settings[PATH_MAX], other[PATH_MAX];
+    join_path(settings, sizeof(settings), home, ".config/Code/settings.json");
+    join_path(other, sizeof(other), home, ".config/other.txt");
+    *settings_restored = file_content_is(settings, "{}");
+    *other_restored = file_content_is(other, "other");
+    remove_tree(source);
+    remove_tree(home);
+    return rc;
+}
+
+enum { BACKUP_USER_UID = 54321, BACKUP_USER_GID = 54322 };
+
+// A backup made by a user this system knows under another uid.
+static void make_foreign_user_manifest(Manifest *manifest, ManifestRoot *root,
+                                       const char *source_path)
+{
+    memset(root, 0, sizeof(*root));
+    strcpy(root->id, "NOTES");
+    root->policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root->payload_path, "NOTES");
+    strcpy(root->source_path, source_path);
+    strcpy(root->restore_path, "notes");
+    root->has_restore_path = 1;
+    make_v1_manifest(manifest, root, 1);
+    manifest->has_source_identity = 1;
+    strcpy(manifest->machine_id, "0123456789abcdef0123456789abcdef");
+    manifest->source_uid = BACKUP_USER_UID;
+    manifest->has_source_gid = 1;
+    manifest->source_gid = BACKUP_USER_GID;
+}
+
+static int restored_file_is_mine(const char *home)
+{
+    char path[PATH_MAX];
+    struct stat st;
+    join_path(path, sizeof(path), home, "notes/file.txt");
+    return file_content_is(path, "notes") && stat(path, &st) == 0 &&
+           st.st_uid == geteuid() && st.st_gid == getegid();
+}
+
+// The backup's user becomes the user restore acts for (D85): a new system
+// may give the same person another uid.
+static void test_restore_gives_the_backup_users_items_to_the_restorer(void)
+{
+    printf(BLUE "::" NC " restore dispatch: the backup user's items go to the restoring user\n");
+    char source[PATH_MAX], home[PATH_MAX], output[16384];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_owner_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_owner_home");
+    setenv("HOME", home, 1);
+
+    ManifestRoot root;
+    Manifest manifest;
+    make_foreign_user_manifest(&manifest, &root, "/source/notes");
+    manifest.representation = CLONE_PORTABLE_SIDECAR;
+    manifest.sidecar_version = SIDECAR_VERSION;
+    int ok = manifest_write_v1(source, &manifest) == 0;
+    write_payload_file(source, "data/NOTES", "file.txt", "notes");
+    SidecarEntry entries[] = {
+        { .root_id = sidecar_text("NOTES"), .logical_path = sidecar_text(""),
+          .physical_leaf = sidecar_text(""), .kind = SIDECAR_KIND_DIRECTORY,
+          .mode = 0700, .uid = BACKUP_USER_UID, .gid = BACKUP_USER_GID,
+          .atime_sec = 1700000960, .mtime_sec = 1700000961 },
+        { .root_id = sidecar_text("NOTES"),
+          .logical_path = sidecar_text("file.txt"),
+          .physical_leaf = sidecar_text("file.txt"),
+          .kind = SIDECAR_KIND_REGULAR, .mode = 0600, .uid = BACKUP_USER_UID,
+          .gid = BACKUP_USER_GID, .atime_sec = 1700000962,
+          .mtime_sec = 1700000963, .size = 5,
+          .content_digest = hash_fnv1a_bytes(HASH_FNV1A_OFFSET_BASIS,
+                                             (const unsigned char *)"notes",
+                                             5) }
+    };
+    int container_fd = open(source, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    SidecarLog sidecar = {0};
+    ok = ok && container_fd >= 0 &&
+         sidecar_log_create_at(container_fd, &sidecar) == SIDECAR_OPEN_FRESH;
+    for (size_t index = 0; ok && index < sizeof(entries) / sizeof(entries[0]);
+         index++)
+        ok = append_committed_sidecar_entry(&sidecar, &entries[index]) == 0;
+    if (container_fd >= 0)
+    {
+        if (sidecar_log_close(&sidecar) != SIDECAR_STATUS_OK)
+            ok = 0;
+        close(container_fd);
+    }
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    int rc = ok ? run_restore_capturing_with_input(source, "y\n", output,
+                                                   sizeof(output))
+                : -1;
+    check(rc == 0 && restored_file_is_mine(home),
+          "a portable restore gives them to the restoring user");
+    remove_tree(source);
+    remove_tree(home);
+
+    // A native payload carries its owners on the files, which only root can
+    // set to another user.
+    if (geteuid() != 0)
+    {
+        printf("  (native case needs root; skipped)\n");
+        dry_run = previous_dry_run;
+        return;
+    }
+    fresh_mkdtemp(source, sizeof(source), "dispatch_owner_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_owner_home");
+    setenv("HOME", home, 1);
+    make_foreign_user_manifest(&manifest, &root, ".notes");
+    ok = manifest_write_v1(source, &manifest) == 0;
+    write_payload_file(source, "data/NOTES", "file.txt", "notes");
+    remove_fixture_packages(source);
+    char payload[PATH_MAX], file[PATH_MAX];
+    join_path(payload, sizeof(payload), source, "data/NOTES");
+    join_path(file, sizeof(file), payload, "file.txt");
+    ok = ok && chown(payload, BACKUP_USER_UID, BACKUP_USER_GID) == 0 &&
+         chown(file, BACKUP_USER_UID, BACKUP_USER_GID) == 0;
+    rc = ok ? run_restore_capturing_with_input(source, "y\n", output,
+                                               sizeof(output))
+            : -1;
+    dry_run = previous_dry_run;
+    check(rc == 0 && restored_file_is_mine(home),
+          "a native restore gives them to the restoring user");
+    remove_tree(source);
+    remove_tree(home);
+}
+
+// Restores notes/file.txt from a native backup whose user had Fedora's
+// subordinate IDs, onto a system giving the restoring user target_ranges
+// (an /etc/subuid and /etc/subgid line's start:count). As root, the file
+// belongs to a container user, owner IDs above the first subordinate ID.
+static int run_subid_restore(const char *target_ranges, uint32_t owner,
+                             char *output, size_t output_size,
+                             struct stat *restored)
+{
+    char source[PATH_MAX], home[PATH_MAX], subids[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_subid_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_subid_home");
+    setenv("HOME", home, 1);
+    join_path(subids, sizeof(subids), home, "subid");
+    char line[64];
+    snprintf(line, sizeof(line), "%lu:%s\n", (unsigned long)geteuid(),
+             target_ranges);
+    write_file_mode(subids, line, 0644);
+    restore_test_set_subid_files(subids, subids);
+
+    ManifestRoot root;
+    Manifest manifest;
+    make_foreign_user_manifest(&manifest, &root, ".notes");
+    manifest.source_uid = geteuid();
+    manifest.source_gid = getegid();
+    manifest.source_subuids = (SubidRanges){ .count = 1,
+                                             .ranges = { { 524288, 65536 } } };
+    manifest.source_subgids = manifest.source_subuids;
+    int ok = manifest_write_v1(source, &manifest) == 0;
+    write_payload_file(source, "data/NOTES", "file.txt", "notes");
+    remove_fixture_packages(source);
+    char file[PATH_MAX];
+    join_path(file, sizeof(file), source, "data/NOTES/file.txt");
+    if (geteuid() == 0)
+        ok = ok && chown(file, 524288 + owner, 524288 + owner) == 0;
+
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    int rc = ok ? run_restore_capturing_with_input(source, "y\n", output,
+                                                   output_size)
+                : -1;
+    dry_run = previous_dry_run;
+    char restored_path[PATH_MAX];
+    join_path(restored_path, sizeof(restored_path), home, "notes/file.txt");
+    if (stat(restored_path, restored) != 0)
+        rc = -1;
+    restore_test_set_subid_files(NULL, NULL);
+    char todo[PATH_MAX + sizeof("-todo.txt")];
+    snprintf(todo, sizeof(todo), "%s-todo.txt", source);
+    unlink(todo);
+    remove_tree(source);
+    remove_tree(home);
+    return rc;
+}
+
+// Rootless containers' files move to the restoring user's subordinate IDs
+// (D93).
+static void test_restore_moves_container_users_to_the_new_ids(void)
+{
+    printf(BLUE "::" NC " restore dispatch: container users keep their place among the new IDs\n");
+    char output[16384];
+    struct stat restored;
+    int rc = run_subid_restore("100000:65536", 42, output, sizeof(output),
+                               &restored);
+    check(rc == 0 && strstr(output, "fewer subordinate IDs") == NULL,
+          "as many IDs as before need nothing from the user");
+    if (geteuid() == 0)
+        check(restored.st_uid == 100000 + 42 && restored.st_gid == 100000 + 42,
+              "a container user's file is owned by the same place in the "
+              "new range");
+    else
+        printf("  (moving owners needs root; skipped)\n");
+
+    rc = run_subid_restore("100000:100", 142, output, sizeof(output),
+                           &restored);
+    check(rc == 0 && strstr(output, "\nWhat's left for you\n  Rootless "
+                                    "containers (Podman, Toolbox): this "
+                                    "system gives you fewer subordinate "
+                                    "IDs") != NULL &&
+              strstr(output, "Give yourself 65536 of each") != NULL,
+          "fewer IDs than before are named at the end, with how many");
+    if (geteuid() == 0)
+        check(restored.st_uid == 524288 + 142,
+              "an owner the new IDs do not reach is kept as recorded");
+}
+
+#define PODMAN_IMAGE_LAYER \
+    "74d97c428c51a828f9051a7a40a53ff1fc99e54fc30323ce36760701b0b7f711"
+#define PODMAN_KEEP_LAYER \
+    "36e4a73b816d1df10ebd79e384109824196fd9ee2150abc61b9843fc46cbe7a3"
+
+// A rootless podman storage folder: an image's layer, the writable layer of
+// a container named keep, their short links, the database, and a volume.
+static const struct {
+    SidecarObjectKind kind;
+    const char *relative;
+    const char *content; /* a file's bytes, or a symlink's target */
+} podman_fixture[] = {
+    { SIDECAR_KIND_DIRECTORY, "", NULL },
+    { SIDECAR_KIND_REGULAR, "db.sql", "sqlite" },
+    { SIDECAR_KIND_DIRECTORY, "overlay", NULL },
+    { SIDECAR_KIND_DIRECTORY, "overlay/" PODMAN_IMAGE_LAYER, NULL },
+    { SIDECAR_KIND_REGULAR, "overlay/" PODMAN_IMAGE_LAYER "/shadow", "image" },
+    { SIDECAR_KIND_DIRECTORY, "overlay/" PODMAN_KEEP_LAYER, NULL },
+    { SIDECAR_KIND_REGULAR, "overlay/" PODMAN_KEEP_LAYER "/rwfile", "rw" },
+    { SIDECAR_KIND_DIRECTORY, "overlay/l", NULL },
+    { SIDECAR_KIND_SYMLINK, "overlay/l/IMAGELINK",
+      "../" PODMAN_IMAGE_LAYER "/diff" },
+    { SIDECAR_KIND_SYMLINK, "overlay/l/KEEPLINK",
+      "../" PODMAN_KEEP_LAYER "/diff" },
+    { SIDECAR_KIND_DIRECTORY, "overlay-containers", NULL },
+    { SIDECAR_KIND_REGULAR, "overlay-containers/containers.json",
+      "[{\"id\":\"77\",\"names\":[\"keep\"],\"layer\":\""
+      PODMAN_KEEP_LAYER "\"}]" },
+    { SIDECAR_KIND_DIRECTORY, "overlay-layers", NULL },
+    { SIDECAR_KIND_REGULAR, "overlay-layers/layers.json",
+      "[{\"id\":\"" PODMAN_IMAGE_LAYER "\"},{\"id\":\"" PODMAN_KEEP_LAYER
+      "\",\"parent\":\"" PODMAN_IMAGE_LAYER "\"}]" },
+    { SIDECAR_KIND_DIRECTORY, "volumes", NULL },
+    { SIDECAR_KIND_REGULAR, "volumes/v", "volume" }
+};
+
+// Writes the podman fixture as a native or portable backup of a user whose
+// home was source_home, and restores it into a fresh home. Returns the
+// restore's status; home names the restored home, removed by the caller.
+static int run_podman_restore(int portable, const char *source_home,
+                              int selinux, char home[PATH_MAX], char *output,
+                              size_t output_size)
+{
+    char source[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_podman_src");
+    fresh_mkdtemp(home, PATH_MAX, "dispatch_podman_home");
+    setenv("HOME", home, 1);
+
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "PODMAN");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "PODMAN");
+    snprintf(root.source_path, sizeof(root.source_path), "%s%s%s",
+             portable ? (source_home != NULL ? source_home : home) : "",
+             portable ? "/" : "", ".local/share/containers/storage");
+    strcpy(root.restore_path, ".local/share/containers/storage");
+    root.has_restore_path = 1;
+    Manifest manifest;
+    make_v1_manifest(&manifest, &root, 1);
+    snprintf(manifest.source_home, sizeof(manifest.source_home), "%s",
+             source_home != NULL ? source_home : home);
+    manifest.selinux = selinux;
+    if (portable)
+    {
+        manifest.representation = CLONE_PORTABLE_SIDECAR;
+        manifest.sidecar_version = SIDECAR_VERSION;
+    }
+    int ok = manifest_write_v1(source, &manifest) == 0;
+    remove_fixture_packages(source);
+
+    char payload[PATH_MAX];
+    join_path(payload, sizeof(payload), source, "data/PODMAN");
+    int container_fd = open(source, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    SidecarLog sidecar = {0};
+    ok = ok && container_fd >= 0 &&
+         (!portable ||
+          sidecar_log_create_at(container_fd, &sidecar) == SIDECAR_OPEN_FRESH);
+    for (size_t index = 0;
+         ok && index < sizeof(podman_fixture) / sizeof(podman_fixture[0]);
+         index++)
+    {
+        const char *relative = podman_fixture[index].relative;
+        const char *content = podman_fixture[index].content;
+        char path[PATH_MAX];
+        join_path(path, sizeof(path), payload, relative);
+        SidecarEntry entry = {
+            .root_id = sidecar_text("PODMAN"),
+            .logical_path = sidecar_text(relative),
+            .physical_leaf = sidecar_text(strrchr(relative, '/') != NULL
+                                              ? strrchr(relative, '/') + 1
+                                              : relative),
+            .kind = podman_fixture[index].kind,
+            .mode = 0700, .uid = (uint32_t)geteuid(),
+            .gid = (uint32_t)getegid(),
+            .atime_sec = 1700002000, .mtime_sec = 1700002001
+        };
+        if (entry.kind == SIDECAR_KIND_DIRECTORY)
+            mkdir_p(path);
+        else if (entry.kind == SIDECAR_KIND_REGULAR)
+        {
+            write_file_mode(path, content, 0600);
+            entry.mode = 0600;
+            entry.size = strlen(content);
+            entry.content_digest = hash_fnv1a_bytes(
+                HASH_FNV1A_OFFSET_BASIS, (const unsigned char *)content,
+                strlen(content));
+        }
+        else if (portable)
+        {
+            // A portable payload holds a symlink as an empty placeholder.
+            write_file_mode(path, "", 0600);
+            entry.mode = 0777;
+            entry.symlink_target = sidecar_text(content);
+        }
+        else
+            ok = symlink(content, path) == 0;
+        if (portable)
+            ok = ok && append_committed_sidecar_entry(&sidecar, &entry) == 0;
+    }
+    if (portable && sidecar_log_close(&sidecar) != SIDECAR_STATUS_OK)
+        ok = 0;
+    if (container_fd >= 0)
+        close(container_fd);
+
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    int rc = ok ? run_restore_capturing_with_input(source, "y\n", output,
+                                                   output_size)
+                : -1;
+    dry_run = previous_dry_run;
+    char todo[PATH_MAX + sizeof("-todo.txt")];
+    snprintf(todo, sizeof(todo), "%s-todo.txt", source);
+    unlink(todo);
+    remove_tree(source);
+    return rc;
+}
+
+static int podman_restored(const char *home, const char *relative)
+{
+    char storage[PATH_MAX], path[PATH_MAX];
+    struct stat st;
+    join_path(storage, sizeof(storage), home,
+              ".local/share/containers/storage");
+    join_path(path, sizeof(path), storage, relative);
+    return lstat(path, &st) == 0;
+}
+
+static char relabel_record[PATH_MAX];
+static int record_relabel(char *const argv[], const char *paths,
+                          size_t paths_length, void *context);
+
+// Containers made under another home, or with SELinux labels a system
+// without SELinux refuses, are left out; images and volumes are not (D94).
+static void test_restore_leaves_out_containers_that_would_not_work(void)
+{
+    printf(BLUE "::" NC " restore dispatch: containers of another home are left out, images and volumes kept\n");
+    for (int portable = 0; portable < 2; portable++)
+    {
+        char home[PATH_MAX], output[16384], layers[PATH_MAX];
+        int rc = run_podman_restore(portable, "/home/old", 0, home, output,
+                                    sizeof(output));
+        join_path(layers, sizeof(layers), home,
+                  ".local/share/containers/storage/overlay-layers/layers.json");
+        check(rc == 0 && !podman_restored(home, "db.sql") &&
+                  !podman_restored(home, "overlay-containers") &&
+                  !podman_restored(home, "overlay/" PODMAN_KEEP_LAYER) &&
+                  !podman_restored(home, "overlay/l/KEEPLINK"),
+              portable ? "portable: the database, the container, its layer "
+                         "and link are left out"
+                       : "native: the database, the container, its layer "
+                         "and link are left out");
+        check(podman_restored(home, "overlay/" PODMAN_IMAGE_LAYER "/shadow") &&
+                  podman_restored(home, "overlay/l/IMAGELINK") &&
+                  podman_restored(home, "volumes/v") &&
+                  file_content_is(layers, "[{\"id\":\"" PODMAN_IMAGE_LAYER
+                                          "\"}]"),
+              portable ? "portable: the image, its link, and the volume stay, "
+                         "and layers.json lists only the image's layer"
+                       : "native: the image, its link, and the volume stay, "
+                         "and layers.json lists only the image's layer");
+        check(strstr(output, "  Podman containers from the old system were "
+                             "left out, since they would not start here: "
+                             "keep. Their images and volumes are restored; "
+                             "create them again, with podman create or "
+                             "toolbox create.\n") != NULL,
+              portable ? "portable: the left-out container is named at the end"
+                       : "native: the left-out container is named at the end");
+        if (portable)
+            check(strstr(output, "Left out 6 items of podman's container "
+                                 "state, which would not work on this "
+                                 "system.\n") != NULL,
+                  "portable: the summary counts what was left out");
+        remove_tree(home);
+
+        rc = run_podman_restore(portable, NULL, 1, home, output,
+                                sizeof(output));
+        check(rc == 0 && !podman_restored(home, "db.sql") &&
+                  !podman_restored(home, "overlay/" PODMAN_KEEP_LAYER) &&
+                  podman_restored(home, "overlay/" PODMAN_IMAGE_LAYER),
+              portable ? "portable: containers made where SELinux ran are "
+                         "left out where it does not"
+                       : "native: containers made where SELinux ran are "
+                         "left out where it does not");
+        remove_tree(home);
+
+        // Where SELinux runs here as well, they are kept.
+        char record_dir[PATH_MAX];
+        fresh_mkdtemp(record_dir, sizeof(record_dir), "dispatch_podman_relabel");
+        join_path(relabel_record, sizeof(relabel_record), record_dir, "runs");
+        restore_test_set_relabel_hook(record_relabel, NULL);
+        rc = run_podman_restore(portable, NULL, 1, home, output,
+                                sizeof(output));
+        restore_test_set_relabel_hook(NULL, NULL);
+        remove_tree(record_dir);
+        check(rc == 0 && podman_restored(home, "db.sql") &&
+                  podman_restored(home, "overlay/" PODMAN_KEEP_LAYER "/rwfile") &&
+                  podman_restored(home, "overlay/l/KEEPLINK") &&
+                  podman_restored(home,
+                                  "overlay-containers/containers.json") &&
+                  strstr(output, "Podman containers") == NULL,
+              portable ? "portable: in the same home, everything is restored"
+                       : "native: in the same home, everything is restored");
+        remove_tree(home);
+    }
+}
+
+// A native restore onto another home path and locale points GTK bookmarks at
+// the new home's folders and keeps the new system's user-dirs.dirs (D86).
+static void test_native_restore_rewrites_the_source_home(void)
+{
+    printf(BLUE "::" NC " restore dispatch: native desktop state follows the new home\n");
+    char source[PATH_MAX], home[PATH_MAX], output[16384];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_home_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_home_home");
+    setenv("HOME", home, 1);
+
+    ManifestRoot roots[2];
+    memset(roots, 0, sizeof(roots));
+    strcpy(roots[0].id, "CONFIG");
+    roots[0].policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(roots[0].payload_path, "settings/config");
+    strcpy(roots[0].source_path, ".config");
+    strcpy(roots[0].restore_path, ".config");
+    roots[0].has_restore_path = 1;
+    strcpy(roots[1].id, "XDG_DOCUMENTS_DIR");
+    roots[1].policy = ROOT_POLICY_XDG;
+    strcpy(roots[1].payload_path, "Documents");
+    strcpy(roots[1].source_path, "/home/olduser/Belgeler");
+    Manifest manifest;
+    make_v1_manifest(&manifest, roots, 2);
+    strcpy(manifest.source_home, "/home/olduser");
+    int ok = manifest_write_v1(source, &manifest) == 0;
+    write_payload_file(source, "data/settings/config/gtk-3.0", "bookmarks",
+                       "file:///home/olduser/Belgeler\n"
+                       "file:///home/olduser/Music Music\n");
+    write_payload_file(source, "data/settings/config", "user-dirs.dirs",
+                       "XDG_DOCUMENTS_DIR=\"$HOME/Belgeler\"\n");
+    write_payload_file(source, "data/Documents", "doc.txt", "doc");
+    remove_fixture_packages(source);
+    static const char own_user_dirs[] =
+        "XDG_DOCUMENTS_DIR=\"$HOME/Documents\"\n";
+    write_payload_file(home, ".config", "user-dirs.dirs", own_user_dirs);
+
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    int rc = ok ? run_restore_capturing_with_input(source, "y\n", output,
+                                                   sizeof(output))
+                : -1;
+    dry_run = previous_dry_run;
+
+    char path[PATH_MAX], expected[PATH_MAX * 2 + 64];
+    snprintf(expected, sizeof(expected),
+             "file://%s/Documents\nfile://%s/Music Music\n", home, home);
+    join_path(path, sizeof(path), home, ".config/gtk-3.0/bookmarks");
+    int bookmarks = file_content_is(path, expected);
+    join_path(path, sizeof(path), home, ".config/user-dirs.dirs");
+    int user_dirs = file_content_is(path, own_user_dirs);
+    join_path(path, sizeof(path), home, "Documents/doc.txt");
+    check(rc == 0 && bookmarks && file_content_is(path, "doc"),
+          "GTK bookmarks point at the new home's folders");
+    check(user_dirs, "the new system's user-dirs.dirs is kept");
+    remove_tree(source);
+    remove_tree(home);
+}
+
+static void test_open_application_settings_are_deferred(void)
+{
+    printf(BLUE "::" NC " restore dispatch: an open application's settings are restored last\n");
+    char output[16384];
+    int settings = 0, other = 0;
+    int rc = run_deferred_settings_restore("y\ns\n", output, sizeof(output),
+                                           &settings, &other);
+    const char *prompt = strstr(output, "Continue?");
+    const char *question = strstr(output, "Visual Studio Code is still open. "
+                                          "Close it and press Enter");
+    check(rc == 0 && prompt != NULL && question != NULL && prompt < question &&
+              other && !settings &&
+              strstr(output, "Left out 1 settings file of applications that "
+                             "stayed open") != NULL,
+          "asked at the end, s leaves the open application's settings out "
+          "while everything else is restored");
+
+    rc = run_deferred_settings_restore("y\n", output, sizeof(output),
+                                       &settings, &other);
+    check(rc == 0 && other && settings &&
+              strstr(output, "No answer; restoring them now.") != NULL,
+          "with no one to answer, the settings are restored anyway, with a "
+          "note");
+
+    rc = run_deferred_settings_restore("y\n\nc\n", output, sizeof(output),
+                                       &settings, &other);
+    const char *first = strstr(output, "is still open.");
+    check(rc == 0 && settings && first != NULL &&
+              strstr(first + 1, "is still open.") != NULL,
+          "Enter checks again while the application is still open, and c "
+          "restores the settings anyway");
+}
+
+// A native restore with Visual Studio Code and Google Chrome open holds
+// back what they own until everything else is restored (D69): Code's folder
+// inside the .config root, and the whole Chrome and .vscode roots.
+typedef struct {
+    int code_restored;
+    int extensions_restored;
+    int chrome_restored;
+    int other_restored;
+    int config_mtime_kept;
+} NativeDeferredOutcome;
+
+static const time_t native_config_mtime = 1700001000;
+
+static int run_native_deferred_restore(const char *input, char *output,
+                                       size_t output_size,
+                                       NativeDeferredOutcome *outcome)
+{
+    char source[PATH_MAX], home[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_native_defer_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_native_defer_home");
+    setenv("HOME", home, 1);
+
+    ManifestRoot roots[3];
+    memset(roots, 0, sizeof(roots));
+    strcpy(roots[0].id, "CONFIG");
+    roots[0].policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(roots[0].payload_path, "CONFIG");
+    strcpy(roots[0].source_path, ".config");
+    strcpy(roots[0].restore_path, ".config");
+    roots[0].has_restore_path = 1;
+    strcpy(roots[1].id, "CHROME");
+    roots[1].policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(roots[1].payload_path, "CHROME");
+    strcpy(roots[1].source_path, ".config/google-chrome");
+    strcpy(roots[1].restore_path, ".config/google-chrome");
+    roots[1].has_restore_path = 1;
+    strcpy(roots[2].id, "VSCODE");
+    roots[2].policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(roots[2].payload_path, "VSCODE");
+    strcpy(roots[2].source_path, ".vscode");
+    strcpy(roots[2].restore_path, ".vscode");
+    roots[2].has_restore_path = 1;
+    Manifest manifest;
+    make_v1_manifest(&manifest, roots, 3);
+    if (manifest_write_v1(source, &manifest) != 0)
+        return -1;
+    write_payload_file(source, "data/CONFIG/Code", "settings.json", "{}");
+    write_payload_file(source, "data/VSCODE/extensions", "extensions.json",
+                       "[]");
+    write_payload_file(source, "data/CONFIG", "other.txt", "other");
+    write_payload_file(source, "data/CHROME", "Local State", "chrome");
+    remove_fixture_packages(source);
+    char config_payload[PATH_MAX];
+    join_path(config_payload, sizeof(config_payload), source, "data/CONFIG");
+    struct timespec times[2] = {
+        { .tv_sec = native_config_mtime, .tv_nsec = 0 },
+        { .tv_sec = native_config_mtime, .tv_nsec = 0 }
+    };
+    if (utimensat(AT_FDCWD, config_payload, times, 0) != 0)
+        return -1;
+
+    char proc_root[PATH_MAX];
+    join_path(proc_root, sizeof(proc_root), source, "fake-proc");
+    mkdir_p(proc_root);
+    write_fake_process(proc_root, "4242", "code", geteuid(), 1);
+    write_fake_process(proc_root, "4243", "chrome", geteuid(), 1);
+    writer_apps_test_set_proc_root(proc_root);
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    int rc = run_restore_capturing_with_input(source, input, output,
+                                              output_size);
+    dry_run = previous_dry_run;
+    writer_apps_test_set_proc_root("/nonexistent/migr-test-proc");
+
+    char path[PATH_MAX];
+    join_path(path, sizeof(path), home, ".config/Code/settings.json");
+    outcome->code_restored = file_content_is(path, "{}");
+    join_path(path, sizeof(path), home, ".vscode/extensions/extensions.json");
+    outcome->extensions_restored = file_content_is(path, "[]");
+    join_path(path, sizeof(path), home, ".config/google-chrome/Local State");
+    outcome->chrome_restored = file_content_is(path, "chrome");
+    join_path(path, sizeof(path), home, ".config/other.txt");
+    outcome->other_restored = file_content_is(path, "other");
+    join_path(path, sizeof(path), home, ".config");
+    struct stat config_st;
+    outcome->config_mtime_kept =
+        stat(path, &config_st) == 0 &&
+        config_st.st_mtim.tv_sec == native_config_mtime;
+    remove_tree(source);
+    remove_tree(home);
+    return rc;
+}
+
+static void test_native_open_application_settings_are_deferred(void)
+{
+    printf(BLUE "::" NC " restore dispatch: a native restore restores open applications' settings last\n");
+    char output[16384];
+    NativeDeferredOutcome outcome;
+    int rc = run_native_deferred_restore("y\ns\n", output, sizeof(output),
+                                         &outcome);
+    const char *warning = strstr(output, "are open. The settings each owns "
+                                         "are restored last");
+    const char *prompt = strstr(output, "Continue?");
+    // Both are named in /proc's order, which the test does not fix.
+    const char *question = strstr(output, " are still open. Close them and "
+                                          "press Enter");
+    check(rc == 0 && warning != NULL && prompt != NULL && question != NULL &&
+              warning < prompt && prompt < question &&
+              strstr(prompt, "Visual Studio Code") != NULL &&
+              strstr(prompt, "Google Chrome") != NULL,
+          "the open applications are named before the prompt and asked "
+          "about at the end");
+    const char *left_out = strstr(output, "Left out the settings of "
+                                          "applications that stayed open (");
+    const char *left_out_end = left_out != NULL ? strchr(left_out, '\n')
+                                                : NULL;
+    const char *chrome = strstr(output, "~/.config/google-chrome");
+    const char *code = strstr(output, "~/.config/Code");
+    const char *extensions = strstr(output, "~/.vscode");
+    check(outcome.other_restored && !outcome.code_restored &&
+              !outcome.chrome_restored && !outcome.extensions_restored &&
+              left_out_end != NULL &&
+              chrome > left_out && chrome < left_out_end &&
+              code > left_out && code < left_out_end &&
+              extensions > left_out && extensions < left_out_end,
+          "s leaves out a folder inside a root and whole roots, VS Code's "
+          "extensions included, while everything else is restored");
+
+    rc = run_native_deferred_restore("y\n", output, sizeof(output),
+                                     &outcome);
+    check(rc == 0 && outcome.other_restored && outcome.code_restored &&
+              outcome.chrome_restored && outcome.extensions_restored &&
+              strstr(output, "No answer; restoring them now.") != NULL &&
+              strstr(output, "Restore complete: 9 items restored") != NULL,
+          "with no one to answer, both are restored anyway, with a note, and "
+          "every item is counted once, the late ones included");
+    check(outcome.config_mtime_kept,
+          "the folder holding the late settings keeps its restored "
+          "modification time");
+
+    rc = run_native_deferred_restore("y\n\nc\n", output, sizeof(output),
+                                     &outcome);
+    const char *first = strstr(output, "are still open.");
+    check(rc == 0 && outcome.code_restored && outcome.chrome_restored &&
+              first != NULL && strstr(first + 1, "are still open.") != NULL,
+          "Enter checks again while they are still open, and c restores "
+          "them anyway");
+}
+
+// What is left to do by hand ends the run and is kept next to the backup,
+// as <backup>-todo.txt; a restore with nothing left removes it.
+static void test_restore_keeps_the_todo_next_to_the_backup(void)
+{
+    printf(BLUE "::" NC " restore dispatch: what is left to do by hand ends the run and stays next to the backup\n");
+    char source[PATH_MAX], home[PATH_MAX], packages[PATH_MAX];
+    char todo_path[PATH_MAX + sizeof("-todo.txt")], output[16384];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_todo_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_todo_home");
+    setenv("HOME", home, 1);
+    write_payload_file(source, ".config", "app.conf", "settings");
+    join_path(packages, sizeof(packages), source, "packages.txt");
+    write_file_mode(packages, "fixture-package\nmissing-package\n", 0644);
+    snprintf(todo_path, sizeof(todo_path), "%s-todo.txt", source);
+
+    PackagePrivilegeProbe probe = {0};
+    join_path(probe.marker_path, sizeof(probe.marker_path), home,
+              "package-install-hook-called");
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    packages_test_set_restore_hooks(DISTRO_FEDORA, package_marker_probe,
+                                    package_progress_capture, &probe);
+    int rc = run_restore_capturing_with_input(source, "y\n", output,
+                                              sizeof(output));
+    const char *section = strstr(output, "\nWhat's left for you\n");
+    check(rc == 0 && section != NULL &&
+              strstr(section, "  1 package this system does not have; the "
+                              "copy of this list names it.\n") != NULL &&
+              strstr(section, "missing-package") == NULL &&
+              strstr(section, todo_path) != NULL,
+          "the run ends with the number of packages left to install by hand "
+          "and says where the list naming them is kept");
+    FILE *todo = fopen(todo_path, "r");
+    char kept[512] = "";
+    if (todo != NULL)
+    {
+        kept[fread(kept, 1, sizeof(kept) - 1U, todo)] = '\0';
+        fclose(todo);
+    }
+    check(strncmp(kept, "What's left for you\n", 20) == 0 &&
+              strstr(kept, "    missing-package\n") != NULL,
+          "the same list is written next to the backup");
+
+    write_file_mode(packages, "fixture-package\nm1\nm2\nm3\nm4\nm5\nm6\nm7\n"
+                              "m8\nm9\nm10\nm11\n", 0644);
+    rc = run_restore_capturing_with_input(source, "y\n", output,
+                                          sizeof(output));
+    section = strstr(output, "\nWhat's left for you\n");
+    todo = fopen(todo_path, "r");
+    kept[0] = '\0';
+    if (todo != NULL)
+    {
+        kept[fread(kept, 1, sizeof(kept) - 1U, todo)] = '\0';
+        fclose(todo);
+    }
+    check(rc == 0 && section != NULL &&
+              strstr(section, "  11 packages this system does not have; the "
+                              "copy of this list names them.\n") != NULL &&
+              strstr(section, " m11") == NULL &&
+              strstr(kept, "could not install, often from a repository it "
+                           "does not have yet, or named differently on this "
+                           "distribution:\n    m1\n    m2\n") != NULL &&
+              strstr(kept, "    m10\n    m11\n") != NULL,
+          "a long list is counted on screen and named in the copy, one "
+          "package per line");
+
+    write_file_mode(packages, "fixture-package\n", 0644);
+    rc = run_restore_capturing_with_input(source, "y\n", output,
+                                          sizeof(output));
+    check(rc == 0 && strstr(output, "What's left for you") == NULL &&
+              access(todo_path, F_OK) != 0,
+          "a restore with nothing left to do removes the old list");
+    packages_test_clear_restore_hooks();
+    dry_run = previous_dry_run;
+    unlink(todo_path);
+    remove_tree(source);
+    remove_tree(home);
+}
+
+// Restores a backup whose one root is the keyrings folder, holding name, into
+// a new home that already has a login keyring when existing is set.
+static int run_keyring_restore(int portable, const char *name, int existing,
+                               int dry, char *output, size_t output_size)
+{
+    char source[PATH_MAX], home[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_keyring_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_keyring_home");
+    setenv("HOME", home, 1);
+    write_payload_file(home, ".local/share/keyrings",
+                       existing ? "login.keyring" : "other.keyring",
+                       "new system");
+
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "KEYRINGS");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "KEYRINGS");
+    strcpy(root.source_path,
+           portable ? "/source/keyrings" : ".local/share/keyrings");
+    strcpy(root.restore_path, ".local/share/keyrings");
+    root.has_restore_path = 1;
+    Manifest manifest;
+    make_v1_manifest(&manifest, &root, 1);
+    if (portable)
+    {
+        manifest.representation = CLONE_PORTABLE_SIDECAR;
+        manifest.sidecar_version = SIDECAR_VERSION;
+    }
+    int ok = manifest_write_v1(source, &manifest) == 0;
+    static const char content[] = "old system";
+    write_payload_file(source, "data/KEYRINGS", name, content);
+    remove_fixture_packages(source);
+
+    if (portable)
+    {
+        SidecarEntry entries[] = {
+            { .root_id = sidecar_text("KEYRINGS"),
+              .logical_path = sidecar_text(""),
+              .physical_leaf = sidecar_text(""),
+              .kind = SIDECAR_KIND_DIRECTORY, .mode = 0700,
+              .uid = (uint32_t)geteuid(), .gid = (uint32_t)getegid(),
+              .atime_sec = 1700001100, .mtime_sec = 1700001101 },
+            { .root_id = sidecar_text("KEYRINGS"),
+              .logical_path = sidecar_text(name),
+              .physical_leaf = sidecar_text(name),
+              .kind = SIDECAR_KIND_REGULAR, .mode = 0600,
+              .uid = (uint32_t)geteuid(), .gid = (uint32_t)getegid(),
+              .atime_sec = 1700001102, .mtime_sec = 1700001103,
+              .size = sizeof(content) - 1U,
+              .content_digest = hash_fnv1a_bytes(
+                  HASH_FNV1A_OFFSET_BASIS, (const unsigned char *)content,
+                  sizeof(content) - 1U) }
+        };
+        int container_fd = open(source, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        SidecarLog sidecar = {0};
+        ok = ok && container_fd >= 0 &&
+             sidecar_log_create_at(container_fd, &sidecar) ==
+                 SIDECAR_OPEN_FRESH;
+        for (size_t index = 0;
+             ok && index < sizeof(entries) / sizeof(entries[0]); index++)
+            ok = append_committed_sidecar_entry(&sidecar, &entries[index]) == 0;
+        if (container_fd >= 0)
+        {
+            if (sidecar_log_close(&sidecar) != SIDECAR_STATUS_OK)
+                ok = 0;
+            close(container_fd);
+        }
+    }
+
+    int previous_dry_run = dry_run;
+    dry_run = dry;
+    int rc = ok ? run_restore_capturing_with_input(source, "y\n", output,
+                                                   output_size)
+                : -1;
+    dry_run = previous_dry_run;
+    char todo[PATH_MAX + sizeof("-todo.txt")];
+    snprintf(todo, sizeof(todo), "%s-todo.txt", source);
+    unlink(todo);
+    remove_tree(source);
+    remove_tree(home);
+    return rc;
+}
+
+// A restore that replaces the login keyring says to log out before signing
+// in anywhere, and what a different password asks for (D87).
+static void test_restore_of_the_login_keyring_says_to_log_out(void)
+{
+    printf(BLUE "::" NC " restore dispatch: a restored login keyring asks for a new login\n");
+    static const char note[] = "\nWhat's left for you\n  Log out and back in "
+                               "before you sign in anywhere";
+    char output[16384];
+    int rc = run_keyring_restore(1, "login.keyring", 0, 0, output,
+                                 sizeof(output));
+    check(rc == 0 && strstr(output, note) != NULL,
+          "a portable restore that brings the keyring says so");
+    rc = run_keyring_restore(0, "login.keyring", 1, 0, output, sizeof(output));
+    check(rc == 0 && strstr(output, note) != NULL,
+          "a native restore over the new system's keyring says so");
+    rc = run_keyring_restore(0, "login.keyring", 1, 1, output, sizeof(output));
+    check(rc == 0 && strstr(output, "Log out and back in") == NULL,
+          "a dry run does not");
+    rc = run_keyring_restore(1, "other.keyring", 1, 0, output, sizeof(output));
+    check(rc == 0 && strstr(output, "Log out and back in") == NULL,
+          "a restore that leaves the login keyring alone does not");
+}
+
+// The restore runs in a child process, so the relabel is recorded in a file:
+// per restorecon run, its command line, then each path it was given.
+static char relabel_record[PATH_MAX];
+
+static int record_relabel(char *const argv[], const char *paths,
+                          size_t paths_length, void *context)
+{
+    FILE *f = fopen(relabel_record, "a");
+    if (f == NULL)
+        return -1;
+    for (size_t index = 0; argv[index] != NULL; index++)
+        fprintf(f, "%s%s", index == 0 ? "" : " ", argv[index]);
+    fputc('\n', f);
+    for (size_t offset = 0; offset < paths_length;
+         offset += strlen(paths + offset) + 1U)
+        fprintf(f, "%s\n", paths + offset);
+    if (fclose(f) != 0)
+        return -1;
+    return context != NULL ? 1 : 0;
+}
+
+static int line_ends_with(const char *line, const char *suffix)
+{
+    size_t length = strlen(line), suffix_length = strlen(suffix);
+    return length >= suffix_length &&
+           strcmp(line + length - suffix_length, suffix) == 0;
+}
+
+// Whether the restore ran restorecon once, on the keyrings root it restored
+// and what is in it: the restored login.keyring and the new system's
+// other.keyring.
+static int relabelled_keyrings_once(void)
+{
+    char lines[5][PATH_MAX];
+    int count = 0;
+    FILE *f = fopen(relabel_record, "r");
+    if (f == NULL)
+        return 0;
+    char buffer[PATH_MAX];
+    while (fgets(buffer, sizeof(buffer), f) != NULL)
+    {
+        if (count < 5)
+            memcpy(lines[count], buffer, sizeof(buffer));
+        count++;
+    }
+    fclose(f);
+    unlink(relabel_record);
+    if (count != 4 || strcmp(lines[0], "restorecon -F -0 -f -\n") != 0 ||
+        lines[1][0] != '/' ||
+        !line_ends_with(lines[1], "/.local/share/keyrings\n"))
+        return 0;
+    int restored = 0, existing = 0;
+    for (int index = 2; index < count; index++)
+    {
+        restored |= line_ends_with(lines[index],
+                                   "/.local/share/keyrings/login.keyring\n");
+        existing |= line_ends_with(lines[index],
+                                   "/.local/share/keyrings/other.keyring\n");
+    }
+    return restored && existing;
+}
+
+// Where SELinux runs, the restored roots get this system's policy labels
+// (D92).
+static void test_restore_relabels_the_restored_roots(void)
+{
+    printf(BLUE "::" NC " restore dispatch: restored roots get the policy's SELinux labels\n");
+    char output[16384], record_dir[PATH_MAX];
+    fresh_mkdtemp(record_dir, sizeof(record_dir), "dispatch_relabel");
+    join_path(relabel_record, sizeof(relabel_record), record_dir, "runs");
+    static int fail;
+    restore_test_set_relabel_hook(record_relabel, NULL);
+    int rc = run_keyring_restore(1, "login.keyring", 0, 0, output,
+                                 sizeof(output));
+    check(rc == 0 && relabelled_keyrings_once(),
+          "a portable restore relabels the root it restored");
+    rc = run_keyring_restore(0, "login.keyring", 0, 0, output, sizeof(output));
+    check(rc == 0 && relabelled_keyrings_once(),
+          "a native restore relabels the root it restored");
+    rc = run_keyring_restore(0, "login.keyring", 0, 1, output, sizeof(output));
+    check(rc == 0 && access(relabel_record, F_OK) != 0,
+          "a dry run relabels nothing");
+    restore_test_set_relabel_hook(record_relabel, &fail);
+    rc = run_keyring_restore(1, "login.keyring", 0, 0, output, sizeof(output));
+    check(rc != 0 && relabelled_keyrings_once() &&
+              strstr(output, "Could not set SELinux labels on the restored "
+                             "files: run restorecon: it exited with status "
+                             "1") != NULL,
+          "a failed relabel is an error of the restore");
+    restore_test_set_relabel_hook(NULL, NULL);
+    remove_tree(record_dir);
+}
+
+static void test_legacy_open_application_settings_are_deferred(void)
+{
+    printf(BLUE "::" NC " restore dispatch: a legacy restore holds back an open browser's profile too\n");
+    char source[PATH_MAX], home[PATH_MAX], proc_root[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_legacy_defer_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_legacy_defer_home");
+    setenv("HOME", home, 1);
+    write_payload_file(source, ".mozilla/firefox", "profiles.ini", "[General]");
+    write_payload_file(source, ".mozilla", "other.txt", "other");
+    remove_fixture_packages(source);
+    join_path(proc_root, sizeof(proc_root), source, "fake-proc");
+    mkdir_p(proc_root);
+    write_fake_process(proc_root, "4242", "firefox", geteuid(), 1);
+    writer_apps_test_set_proc_root(proc_root);
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    char output[16384];
+    int rc = run_restore_capturing_with_input(source, "y\ns\n", output,
+                                              sizeof(output));
+    dry_run = previous_dry_run;
+    writer_apps_test_set_proc_root("/nonexistent/migr-test-proc");
+
+    char profile[PATH_MAX], other[PATH_MAX];
+    join_path(profile, sizeof(profile), home, ".mozilla/firefox/profiles.ini");
+    join_path(other, sizeof(other), home, ".mozilla/other.txt");
+    check(rc == 0 && file_content_is(other, "other") &&
+              access(profile, F_OK) != 0 &&
+              strstr(output, "Firefox is still open.") != NULL &&
+              strstr(output, "(~/.mozilla/firefox)") != NULL,
+          "s leaves the profile out of the legacy .mozilla item");
+    remove_tree(source);
+    remove_tree(home);
+}
+
+static void test_running_writer_detection(void)
+{
+    printf(BLUE "::" NC " restore dispatch: running applications that own restored settings are named\n");
+    char proc_root[PATH_MAX];
+    fresh_mkdtemp(proc_root, sizeof(proc_root), "dispatch_fake_proc");
+    uid_t me = geteuid();
+    write_fake_process(proc_root, "101", "code", me, 1);
+    write_fake_process(proc_root, "102", "firefox", me + 1, 1);
+    write_fake_process(proc_root, "103", "code", me, 1);
+    write_fake_process(proc_root, "104", "gnome-software", me, 1);
+    write_fake_process(proc_root, "105", "brave", me, 0);
+    write_fake_process(proc_root, "106", "bash", me, 1);
+    write_fake_process(proc_root, "self", "code", me, 1);
+    const char *scope = "0::/user.slice/user-1000.slice/user@1000.service/"
+                        "app.slice/app-flatpak-com.spotify.Client-3353534066"
+                        ".scope\n";
+    write_fake_process(proc_root, "107", "spotify", me, 1);
+    write_fake_cgroup(proc_root, "107", scope);
+    write_fake_process(proc_root, "108", "zypak-sandbox", me, 1);
+    write_fake_cgroup(proc_root, "108", scope);
+    write_fake_process(proc_root, "109", "signal-desktop", me + 1, 1);
+    write_fake_cgroup(proc_root, "109", "0::/user.slice/app.slice/"
+                                        "app-flatpak-org.signal.Signal-12"
+                                        ".scope\n");
+    write_fake_process(proc_root, "110", "gnome-terminal-", me, 1);
+    write_fake_cgroup(proc_root, "110", "0::/user.slice/app.slice/"
+                                        "app-flatpak-../../etc-12.scope\n");
+
+    writer_apps_test_set_proc_root(proc_root);
+    RunningWriter writers[8];
+    size_t count = writer_apps_running(me, writers, 8);
+    writer_apps_test_set_proc_root("/nonexistent/migr-test-proc");
+    int code = 0, software = 0, spotify = 0;
+    for (size_t index = 0; index < count; index++)
+    {
+        const char *label = writers[index].label;
+        const char *settings = writers[index].settings;
+        code += strcmp(label, "Visual Studio Code") == 0 &&
+                (strcmp(settings, ".config/Code") == 0 ||
+                 strcmp(settings, ".vscode") == 0);
+        software += strcmp(label, "GNOME Software") == 0 &&
+                    settings[0] == '\0';
+        spotify += strcmp(label, "com.spotify.Client") == 0 &&
+                   strcmp(settings, ".var/app/com.spotify.Client") == 0;
+    }
+    check(count == 4 && code == 2 && software == 1,
+          "only the target user's known writers are named, once per path "
+          "they own");
+    check(spotify == 1,
+          "an open Flatpak app is named by its app id and owns its "
+          "~/.var/app directory, once for all its processes");
+    remove_tree(proc_root);
+}
+
+static void test_dispatch_refuses_portable_v1(void)
+{
+    printf(BLUE "::" NC " restore dispatch: portable v1 payload is never interpreted as a native tree\n");
+
+    char source[PATH_MAX], home[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_home");
+    setenv("HOME", home, 1);
+
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "EXPLICIT_0");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "EXPLICIT_0");
+    strcpy(root.source_path, "Documents/project");
+    strcpy(root.restore_path, "Documents/project");
+    root.has_restore_path = 1;
+
+    Manifest m;
+    make_v1_manifest(&m, &root, 1);
+    m.representation = CLONE_PORTABLE_SIDECAR;
+    m.sidecar_version = 1;
+    check(manifest_write_v1(source, &m) == 0,
+          "fixture: write a valid portable v1 manifest");
+    write_payload_file(source, "data/EXPLICIT_0", "note.txt", "encoded-or-degraded-content");
+
+    char output[8192];
+    int rc = run_restore_capturing(source, output, sizeof(output));
+    check(rc != 0, "portable v1 restore is refused while its replay path is absent");
+    check(strstr(output, "Portable restore preflight refused") != NULL,
+          "the refusal identifies the portable preflight path");
+    check(strstr(output, "\nFiles\n") == NULL,
+          "portable payload never reaches the native root walker");
+
+    remove_tree(source);
+    remove_tree(home);
+}
+
+static void test_v1_refuses_missing_declared_payloads(void)
+{
+    printf(BLUE "::" NC " restore dispatch: every v1 root must have its declared payload\n");
+
+    char source[PATH_MAX], home[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_home");
+    setenv("HOME", home, 1);
+
+    ManifestRoot roots[2];
+    memset(roots, 0, sizeof(roots));
+
+    strcpy(roots[0].id, "EXPLICIT_0");
+    roots[0].policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(roots[0].payload_path, "EXPLICIT_0");
+    strcpy(roots[0].source_path, "Documents/project");
+    strcpy(roots[0].restore_path, "Documents/project");
+    roots[0].has_restore_path = 1;
+
+    strcpy(roots[1].id, "EXPLICIT_1");
+    roots[1].policy = ROOT_POLICY_MANUAL_NATIVE;
+    strcpy(roots[1].payload_path, "EXPLICIT_1");
+    strcpy(roots[1].source_path, "/mnt/external/project");
+    roots[1].has_restore_path = 0;
+
+    Manifest m;
+    make_v1_manifest(&m, roots, 2);
+    check(manifest_write_v1(source, &m) == 0,
+          "fixture: write a valid v1 manifest without its declared payloads");
+
+    char output[8192];
+    int rc = run_restore_capturing(source, output, sizeof(output));
+    check(rc != 0, "missing declared payloads refuse the versioned restore");
+    check(strstr(output, "EXPLICIT_0 is missing its declared payload") != NULL,
+          "the missing automatic root is reported");
+    check(strstr(output, "EXPLICIT_1 is missing its declared payload") != NULL,
+          "the missing manual root is reported");
+    check(strstr(output, "backup location:") == NULL,
+          "restore never advertises a nonexistent MANUAL_NATIVE payload");
+    check(strstr(output, "\nFiles\n") == NULL,
+          "payload validation fails before the root walker starts");
+
+    remove_tree(source);
+    remove_tree(home);
+}
+
+static void test_v1_restores_home_relative_and_xdg_reports_manual_native(void)
+{
+    printf(BLUE "::" NC " restore dispatch: a valid v1 manifest restores HOME_RELATIVE/XDG roots and reports MANUAL_NATIVE\n");
+
+    char source[PATH_MAX], home[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_home");
+    setenv("HOME", home, 1);
+
+    ManifestRoot roots[3];
+    memset(roots, 0, sizeof(roots));
+
+    strcpy(roots[0].id, "EXPLICIT_0");
+    roots[0].policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(roots[0].payload_path, "EXPLICIT_0");
+    strcpy(roots[0].source_path, "Documents/project");
+    strcpy(roots[0].restore_path, "Documents/project");
+    roots[0].has_restore_path = 1;
+
+    strcpy(roots[1].id, "XDG_DOCUMENTS_DIR");
+    roots[1].policy = ROOT_POLICY_XDG;
+    strcpy(roots[1].payload_path, "XDG_DOCUMENTS_DIR");
+    strcpy(roots[1].source_path, "Belgeler");
+    roots[1].has_restore_path = 0;
+
+    strcpy(roots[2].id, "EXPLICIT_1");
+    roots[2].policy = ROOT_POLICY_MANUAL_NATIVE;
+    strcpy(roots[2].payload_path, "EXPLICIT_1");
+    strcpy(roots[2].source_path, "/mnt/external/project");
+    roots[2].has_restore_path = 0;
+
+    Manifest m;
+    make_v1_manifest(&m, roots, 3);
+    check(manifest_write_v1(source, &m) == 0, "fixture: write a valid v1 manifest via the real writer");
+
+    write_payload_file(source, "data/EXPLICIT_0", "note.txt", "home-relative-content");
+    write_payload_file(source, "data/XDG_DOCUMENTS_DIR", "doc.txt", "xdg-content");
+    write_payload_file(source, "data/EXPLICIT_1", "external.txt", "manual-native-content");
+
+    char output[8192];
+    int rc = run_restore_capturing(source, output, sizeof(output));
+    check(rc == 0, "restore succeeds on a valid v1 manifest");
+    check(strstr(output, "\nFiles\n") != NULL, "the v1 section header appears");
+    check(strstr(output, "Main Directories") == NULL, "the legacy path is never attempted");
+
+    check(strstr(output, "Would restore: ~/Documents/project\n") != NULL,
+          "the HOME_RELATIVE root is previewed at its recorded restore address");
+
+    char expected_xdg_preview[PATH_MAX + 64];
+    int expected_xdg_preview_length = snprintf(
+        expected_xdg_preview, sizeof(expected_xdg_preview),
+        "Would restore: %s/Documents/\n", home);
+    check(expected_xdg_preview_length > 0 &&
+              (size_t)expected_xdg_preview_length < sizeof(expected_xdg_preview) &&
+              strstr(output, expected_xdg_preview) != NULL,
+          "the XDG root is previewed against the target locale's resolved directory");
+
+    check(strstr(output, "Restore by hand") != NULL, "the restore-by-hand section appears");
+    check(strstr(output, "EXPLICIT_1") != NULL, "the MANUAL_NATIVE root's id is listed");
+    check(strstr(output, "/mnt/external/project") != NULL,
+          "the MANUAL_NATIVE root's recorded source path is listed (docs/DECISIONS.md D16)");
+    check(strstr(output, "data/EXPLICIT_1") != NULL,
+          "the MANUAL_NATIVE root's backup payload location is listed");
+
+    remove_tree(source);
+    remove_tree(home);
+}
+
+static void test_v1_empty_restore_path_means_home_itself(void)
+{
+    printf(BLUE "::" NC " restore dispatch: an empty HOME_RELATIVE restore_path addresses $HOME itself (docs/DECISIONS.md D16)\n");
+
+    char source[PATH_MAX], home[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_home");
+    setenv("HOME", home, 1);
+
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "EXPLICIT_0");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "EXPLICIT_0");
+    strcpy(root.source_path, "");
+    root.restore_path[0] = '\0';
+    root.has_restore_path = 1;
+
+    Manifest m;
+    make_v1_manifest(&m, &root, 1);
+    check(manifest_write_v1(source, &m) == 0, "fixture: write a valid v1 manifest with an empty restore_path");
+
+    write_payload_file(source, "data/EXPLICIT_0", "inside.txt", "home-root-content");
+
+    char output[8192];
+    int rc = run_restore_capturing(source, output, sizeof(output));
+    check(rc == 0, "restore succeeds");
+    check(strstr(output, "Would restore: ~\n") != NULL,
+          "an empty restore_path previews as the home directory itself, not a trailing-slash address");
+
+    remove_tree(source);
+    remove_tree(home);
+}
+
+static void test_v2_selection_restore_refusals(void)
+{
+    printf(BLUE "::" NC " restore dispatch: VERSION=2 ownership and target-map refusals\n");
+
+    char source[PATH_MAX], home[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_v2_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_v2_home");
+    setenv("HOME", home, 1);
+
+    ManifestRoot roots[2];
+    Manifest manifest;
+    make_v2_selection_manifest(&manifest, roots);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write a valid VERSION=2 selection manifest");
+    write_payload_file(source, "data/CONFIG_0", "Belgeler", "wrong owner");
+    write_payload_file(source, "data/XDG_DOCUMENTS_DIR", "doc.txt", "selected child");
+
+    char output[8192];
+    int rc = run_restore_capturing(source, output, sizeof(output));
+    check(rc != 0 && strstr(output, "outside its recorded selection") != NULL,
+          "a delegated child planted in the parent payload is refused before replay");
+    remove_tree(source);
+
+    fresh_mkdtemp(source, sizeof(source), "dispatch_v2_collision");
+    make_v2_selection_manifest(&manifest, roots);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the VERSION=2 target-collision manifest");
+    write_payload_file(source, "data/CONFIG_0/Documents", "parent.txt", "parent mapping");
+    write_payload_file(source, "data/XDG_DOCUMENTS_DIR", "child.txt", "xdg mapping");
+
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    rc = run_restore_capturing(source, output, sizeof(output));
+    dry_run = previous_dry_run;
+    check(rc != 0 && strstr(output, "competing entries for restore destination") != NULL,
+          "distinct selected entries mapping to one target are refused before confirmation");
+
+    char documents[PATH_MAX];
+    join_path(documents, sizeof(documents), home, "Documents");
+    check(access(documents, F_OK) != 0,
+          "VERSION=2 target collision leaves the destination untouched");
+
+    remove_tree(source);
+    remove_tree(home);
+}
+
+static void test_v2_payload_depth_is_bounded(void)
+{
+    printf(BLUE "::" NC " restore dispatch: VERSION=2 payload depth is bounded\n");
+
+    char source[PATH_MAX], home[PATH_MAX], output[16384];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_v2_depth_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_v2_depth_home");
+    setenv("HOME", home, 1);
+
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "CONFIG_0");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "CONFIG_0");
+    strcpy(root.source_path, "/source/home/deep");
+    strcpy(root.restore_path, "deep");
+    root.has_restore_path = 1;
+
+    Manifest manifest;
+    memset(&manifest, 0, sizeof(manifest));
+    manifest.version = MANIFEST_SELECTION_VERSION;
+    manifest.representation = CLONE_NATIVE_TREE;
+    manifest.scope = MANIFEST_SCOPE_CRITICAL;
+    strcpy(manifest.source_home, "/source/home");
+    manifest.root_count = 1;
+    manifest.roots = &root;
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the deep VERSION=2 manifest");
+    make_deep_payload_directory(source, root.payload_path, 513U);
+    remove_fixture_packages(source);
+
+    int rc = run_restore_capturing(source, output, sizeof(output));
+    check(rc != 0 && strstr(output, "maximum directory depth") != NULL &&
+              strstr(output, root.id) != NULL,
+          "an over-deep payload is refused cleanly with its manifest root named");
+
+    remove_tree(source);
+    remove_tree(home);
+}
+
+static void test_v2_home_relative_restore_destination_too_long(void)
+{
+    printf(BLUE "::" NC " restore dispatch: VERSION=2 HOME_RELATIVE restore destination overflow names its root\n");
+
+    char source[PATH_MAX], home[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_v2_long_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_v2_long_home");
+    setenv("HOME", home, 1);
+
+    ManifestRoot roots[2];
+    Manifest manifest;
+    make_v2_selection_manifest(&manifest, roots);
+    build_long_restore_path(roots[0].restore_path, sizeof(roots[0].restore_path));
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write a VERSION=2 manifest whose HOME_RELATIVE root has a restore_path too long to join onto HOME");
+
+    write_payload_file(source, "data/CONFIG_0", "inside.txt", "home-relative-content");
+    write_payload_file(source, "data/XDG_DOCUMENTS_DIR", "doc.txt", "selected child");
+
+    char output[8192];
+    int rc = run_restore_capturing(source, output, sizeof(output));
+    check(rc != 0,
+          "restore refuses when a HOME_RELATIVE restore destination cannot be joined onto $HOME");
+    check(strstr(output, "Error: Restore destination for manifest root CONFIG_0 is too long") != NULL,
+          "the overflow names the offending manifest root instead of failing silently (P4)");
+
+    remove_tree(source);
+    remove_tree(home);
+}
+
+static void test_versioned_restore_freezes_xdg_target_map(void)
+{
+    printf(BLUE "::" NC " restore dispatch: versioned restore freezes XDG target addresses for the invocation\n");
+
+    char source[PATH_MAX], home[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_frozen_map_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_frozen_map_home");
+    setenv("HOME", home, 1);
+
+    ManifestRoot roots[2];
+    Manifest manifest;
+    make_v2_selection_manifest(&manifest, roots);
+    strcpy(roots[0].source_path, ".config");
+    strcpy(roots[0].restore_path, ".config");
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the VERSION=2 frozen-map manifest");
+
+    write_payload_file(
+        source, "data/CONFIG_0", "user-dirs.dirs",
+        "XDG_DOCUMENTS_DIR=\"$HOME/Belgeler\"\n");
+    write_payload_file(source, "data/XDG_DOCUMENTS_DIR", "doc", "SAVED-DATA");
+
+    char source_doc[PATH_MAX], source_link[PATH_MAX], source_xdg[PATH_MAX];
+    join_path(source_xdg, sizeof(source_xdg), source,
+              "data/XDG_DOCUMENTS_DIR");
+    join_path(source_doc, sizeof(source_doc), source_xdg, "doc");
+    join_path(source_link, sizeof(source_link), source_xdg, "doc-link");
+    check(link(source_doc, source_link) == 0,
+          "fixture: add a hardlink inside the mapped XDG root");
+    struct timespec xdg_times[2] = {
+        { .tv_sec = 1700000900, .tv_nsec = 123456789 },
+        { .tv_sec = 1700000901, .tv_nsec = 234567890 }
+    };
+    check(chmod(source_xdg, 0750) == 0 &&
+              utimensat(AT_FDCWD, source_xdg, xdg_times, 0) == 0,
+          "fixture: set mapped XDG root metadata");
+
+    write_payload_file(
+        home, ".config", "user-dirs.dirs",
+        "XDG_DOCUMENTS_DIR=\"$HOME/Documents\"\n");
+    remove_fixture_packages(source);
+
+    char dry_output[16384];
+    int previous_dry_run = dry_run;
+    dry_run = 1;
+    int dry_rc = run_restore_capturing(source, dry_output, sizeof(dry_output));
+    char expected_preview[PATH_MAX + 80];
+    int preview_len = snprintf(
+        expected_preview, sizeof(expected_preview),
+        "Would restore: %s/Documents/\n", home);
+    check(dry_rc == 0 && preview_len > 0 &&
+              (size_t)preview_len < sizeof(expected_preview) &&
+              strstr(dry_output, expected_preview) != NULL,
+          "dry-run maps Documents using the target configuration present at invocation start");
+
+    dry_run = 0;
+    char live_output[16384];
+    int live_rc = run_restore_capturing_with_input(
+        source, "y\n", live_output, sizeof(live_output));
+    dry_run = previous_dry_run;
+
+    char documents[PATH_MAX], document[PATH_MAX], document_link[PATH_MAX];
+    char belgeler[PATH_MAX];
+    join_path(documents, sizeof(documents), home, "Documents");
+    join_path(document, sizeof(document), documents, "doc");
+    join_path(document_link, sizeof(document_link), documents, "doc-link");
+    join_path(belgeler, sizeof(belgeler), home, "Belgeler");
+
+    struct stat documents_st, document_st, document_link_st;
+    int mapped_metadata_ok =
+        stat(documents, &documents_st) == 0 &&
+        stat(document, &document_st) == 0 &&
+        stat(document_link, &document_link_st) == 0;
+    check(live_rc == 0 && file_content_is(document, "SAVED-DATA") &&
+              access(belgeler, F_OK) != 0,
+          "live restore uses the same Documents address after restoring user-dirs.dirs");
+    check(mapped_metadata_ok &&
+              document_st.st_dev == document_link_st.st_dev &&
+              document_st.st_ino == document_link_st.st_ino &&
+              (documents_st.st_mode & 07777) == 0750 &&
+              documents_st.st_mtim.tv_sec == xdg_times[1].tv_sec,
+          "hardlink seeding and directory metadata use the frozen mapped destination");
+
+    remove_tree(source);
+    remove_tree(home);
+
+    fresh_mkdtemp(source, sizeof(source), "dispatch_frozen_conflict_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_frozen_conflict_home");
+    setenv("HOME", home, 1);
+    make_v2_selection_manifest(&manifest, roots);
+    strcpy(roots[0].source_path, ".config");
+    strcpy(roots[0].restore_path, ".config");
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the VERSION=2 conflicting-retarget manifest");
+    write_payload_file(
+        source, "data/CONFIG_0", "user-dirs.dirs",
+        "XDG_DOCUMENTS_DIR=\"$HOME/.config\"\n");
+    write_payload_file(
+        source, "data/XDG_DOCUMENTS_DIR", "doc", "CONFLICT-SAFE");
+    write_payload_file(
+        home, ".config", "user-dirs.dirs",
+        "XDG_DOCUMENTS_DIR=\"$HOME/Documents\"\n");
+    remove_fixture_packages(source);
+
+    previous_dry_run = dry_run;
+    dry_run = 0;
+    live_rc = run_restore_capturing_with_input(
+        source, "y\n", live_output, sizeof(live_output));
+    dry_run = previous_dry_run;
+
+    char conflicting_entry[PATH_MAX];
+    join_path(documents, sizeof(documents), home, "Documents");
+    join_path(document, sizeof(document), documents, "doc");
+    join_path(conflicting_entry, sizeof(conflicting_entry), home, ".config/doc");
+    check(live_rc == 0 && file_content_is(document, "CONFLICT-SAFE") &&
+              access(conflicting_entry, F_OK) != 0,
+          "restored XDG configuration cannot redirect a later root into the CONFIG_0 destination");
+
+    remove_tree(source);
+    remove_tree(home);
+}
+
+static void test_versioned_restore_refuses_destination_alias_collisions(void)
+{
+    printf(BLUE "::" NC " restore dispatch: versioned destinations collide by resolved identity\n");
+
+    char source[PATH_MAX], home[PATH_MAX], shared[PATH_MAX], alias[PATH_MAX];
+    char sentinel[PATH_MAX], output[16384];
+    ManifestRoot roots[2];
+    Manifest manifest;
+    int previous_dry_run = dry_run;
+
+    fresh_mkdtemp(source, sizeof(source), "dispatch_identity_files_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_identity_files_home");
+    setenv("HOME", home, 1);
+    join_path(shared, sizeof(shared), home, "Shared");
+    mkdir_p(shared);
+    join_path(alias, sizeof(alias), home, "Alias");
+    if (symlink("Shared", alias) != 0)
+        exit(1);
+    write_user_dirs(home, "Shared", "Alias");
+    make_v1_alias_manifest(&manifest, roots);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the VERSION=1 Shared/Alias collision manifest");
+    write_payload_file(source, "data/XDG_DOCUMENTS_DIR", "file", "DOCS");
+    write_payload_file(source, "data/XDG_DOWNLOAD_DIR", "file", "DOWNLOADS");
+    join_path(sentinel, sizeof(sentinel), shared, "file");
+    write_file_mode(sentinel, "ORIGINAL", 0600);
+    remove_fixture_packages(source);
+
+    dry_run = 0;
+    int rc = run_restore_capturing_with_input(source, "y\n", output,
+                                               sizeof(output));
+    dry_run = previous_dry_run;
+    check(rc != 0 && strstr(output, "competing entries for restore destination") != NULL &&
+              strstr(output, "XDG_DOCUMENTS_DIR") != NULL &&
+              strstr(output, "XDG_DOWNLOAD_DIR") != NULL &&
+              strstr(output, alias) != NULL &&
+              file_content_is(sentinel, "ORIGINAL"),
+          "VERSION=1 Shared/Alias duplicate files name both roots and the destination before refusing");
+    remove_tree(source);
+    remove_tree(home);
+
+    fresh_mkdtemp(source, sizeof(source), "dispatch_identity_nested_file_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_identity_nested_file_home");
+    setenv("HOME", home, 1);
+    memset(roots, 0, sizeof(roots));
+    strcpy(roots[0].id, "PARENT");
+    roots[0].policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(roots[0].payload_path, "PARENT");
+    strcpy(roots[0].source_path, "Parent");
+    strcpy(roots[0].restore_path, "Parent");
+    roots[0].has_restore_path = 1;
+    strcpy(roots[1].id, "CHILD");
+    roots[1].policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(roots[1].payload_path, "CHILD");
+    strcpy(roots[1].source_path, "Parent/child");
+    strcpy(roots[1].restore_path, "Parent/child");
+    roots[1].has_restore_path = 1;
+    make_v1_manifest(&manifest, roots, 2);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the nested non-directory root manifest");
+    write_payload_file(source, "data/PARENT", "child", "PARENT");
+    char child_payload[PATH_MAX];
+    join_path(child_payload, sizeof(child_payload), source, "data/CHILD");
+    write_file_mode(child_payload, "CHILD", 0600);
+    join_path(shared, sizeof(shared), home, "Parent");
+    mkdir_p(shared);
+    join_path(sentinel, sizeof(sentinel), shared, "child");
+    write_file_mode(sentinel, "ORIGINAL", 0600);
+    remove_fixture_packages(source);
+
+    dry_run = 0;
+    rc = run_restore_capturing_with_input(source, "y\n", output,
+                                          sizeof(output));
+    dry_run = previous_dry_run;
+    check(rc != 0 && strstr(output, "PARENT") != NULL &&
+              strstr(output, "CHILD") != NULL &&
+              strstr(output, sentinel) != NULL &&
+              file_content_is(sentinel, "ORIGINAL"),
+          "a file root nested below a directory root triggers the entry walk and refuses before mutation");
+    remove_tree(source);
+    remove_tree(home);
+
+    fresh_mkdtemp(source, sizeof(source), "dispatch_identity_dirs_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_identity_dirs_home");
+    setenv("HOME", home, 1);
+    join_path(shared, sizeof(shared), home, "Shared");
+    mkdir_p(shared);
+    if (chmod(shared, 0701) != 0)
+        exit(1);
+    join_path(alias, sizeof(alias), home, "Alias");
+    if (symlink("Shared", alias) != 0)
+        exit(1);
+    write_user_dirs(home, "Shared", "Alias");
+    make_v1_alias_manifest(&manifest, roots);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the VERSION=1 duplicate-directory alias manifest");
+    char docs_payload[PATH_MAX], downloads_payload[PATH_MAX];
+    join_path(docs_payload, sizeof(docs_payload), source,
+              "data/XDG_DOCUMENTS_DIR");
+    join_path(downloads_payload, sizeof(downloads_payload), source,
+              "data/XDG_DOWNLOAD_DIR");
+    mkdir_p(docs_payload);
+    mkdir_p(downloads_payload);
+    if (chmod(docs_payload, 0750) != 0 || chmod(downloads_payload, 0755) != 0)
+        exit(1);
+    join_path(sentinel, sizeof(sentinel), shared, "sentinel");
+    write_file_mode(sentinel, "ORIGINAL", 0600);
+    remove_fixture_packages(source);
+
+    dry_run = 0;
+    rc = run_restore_capturing_with_input(source, "y\n", output,
+                                          sizeof(output));
+    dry_run = previous_dry_run;
+    struct stat shared_st;
+    int shared_ok = stat(shared, &shared_st) == 0;
+    check(rc != 0 && strstr(output, "competing entries for restore destination") != NULL &&
+              file_content_is(sentinel, "ORIGINAL") && shared_ok &&
+              (shared_st.st_mode & 07777) == 0701,
+          "distinct empty source directories cannot both own metadata for one aliased target");
+    remove_tree(source);
+    remove_tree(home);
+
+    fresh_mkdtemp(source, sizeof(source), "dispatch_identity_suffix_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_identity_suffix_home");
+    setenv("HOME", home, 1);
+    char existing[PATH_MAX], missing[PATH_MAX];
+    join_path(existing, sizeof(existing), home, "a");
+    mkdir_p(existing);
+    write_user_dirs(home, "a", "Downloads");
+    memset(roots, 0, sizeof(roots));
+    strcpy(roots[0].id, "EXPLICIT_0");
+    roots[0].policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(roots[0].payload_path, "EXPLICIT_0");
+    strcpy(roots[0].source_path, "source-new");
+    strcpy(roots[0].restore_path, "a/new");
+    roots[0].has_restore_path = 1;
+    strcpy(roots[1].id, "XDG_DOCUMENTS_DIR");
+    roots[1].policy = ROOT_POLICY_XDG;
+    strcpy(roots[1].payload_path, "XDG_DOCUMENTS_DIR");
+    strcpy(roots[1].source_path, "Documents");
+    make_v1_manifest(&manifest, roots, 2);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the converging missing-suffix manifest");
+    char explicit_payload[PATH_MAX], xdg_payload[PATH_MAX], xdg_new[PATH_MAX];
+    join_path(explicit_payload, sizeof(explicit_payload), source,
+              "data/EXPLICIT_0");
+    join_path(xdg_payload, sizeof(xdg_payload), source,
+              "data/XDG_DOCUMENTS_DIR");
+    join_path(xdg_new, sizeof(xdg_new), xdg_payload, "new");
+    mkdir_p(explicit_payload);
+    mkdir_p(xdg_new);
+    join_path(sentinel, sizeof(sentinel), existing, "sentinel");
+    write_file_mode(sentinel, "ORIGINAL", 0600);
+    join_path(missing, sizeof(missing), existing, "new");
+    remove_fixture_packages(source);
+
+    dry_run = 0;
+    rc = run_restore_capturing_with_input(source, "y\n", output,
+                                          sizeof(output));
+    dry_run = previous_dry_run;
+    check(rc != 0 && strstr(output, "competing entries for restore destination") != NULL &&
+              access(missing, F_OK) != 0 && file_content_is(sentinel, "ORIGINAL"),
+          "routes from different existing ancestors converge in memory before a missing suffix is created");
+    remove_tree(source);
+    remove_tree(home);
+
+    fresh_mkdtemp(source, sizeof(source), "dispatch_identity_home_xdg_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_identity_home_xdg_home");
+    setenv("HOME", home, 1);
+    join_path(shared, sizeof(shared), home, "Shared");
+    mkdir_p(shared);
+    join_path(alias, sizeof(alias), home, "Alias");
+    if (symlink("Shared", alias) != 0)
+        exit(1);
+    write_user_dirs(home, "Alias", "Downloads");
+    memset(roots, 0, sizeof(roots));
+    strcpy(roots[0].id, "EXPLICIT_0");
+    roots[0].policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(roots[0].payload_path, "EXPLICIT_0");
+    strcpy(roots[0].source_path, "home-child");
+    strcpy(roots[0].restore_path, "Shared/home-child");
+    roots[0].has_restore_path = 1;
+    strcpy(roots[1].id, "XDG_DOCUMENTS_DIR");
+    roots[1].policy = ROOT_POLICY_XDG;
+    strcpy(roots[1].payload_path, "XDG_DOCUMENTS_DIR");
+    strcpy(roots[1].source_path, "Documents");
+    make_v1_manifest(&manifest, roots, 2);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the HOME/XDG alias convergence manifest");
+    join_path(explicit_payload, sizeof(explicit_payload), source,
+              "data/EXPLICIT_0");
+    join_path(xdg_payload, sizeof(xdg_payload), source,
+              "data/XDG_DOCUMENTS_DIR");
+    join_path(xdg_new, sizeof(xdg_new), xdg_payload, "home-child");
+    mkdir_p(explicit_payload);
+    mkdir_p(xdg_new);
+    join_path(sentinel, sizeof(sentinel), shared, "sentinel");
+    write_file_mode(sentinel, "ORIGINAL", 0600);
+    join_path(missing, sizeof(missing), shared, "home-child");
+    remove_fixture_packages(source);
+
+    dry_run = 0;
+    rc = run_restore_capturing_with_input(source, "y\n", output,
+                                          sizeof(output));
+    dry_run = previous_dry_run;
+    check(rc != 0 && strstr(output, "competing entries for restore destination") != NULL &&
+              access(missing, F_OK) != 0 && file_content_is(sentinel, "ORIGINAL"),
+          "HOME-relative and XDG routes converging through an alias refuse before mutation");
+    remove_tree(source);
+    remove_tree(home);
+}
+
+static void test_versioned_restore_identity_order_and_cross_root_hardlinks(void)
+{
+    printf(BLUE "::" NC " restore dispatch: resolved namespace order preserves legitimate nested aliases\n");
+
+    char source[PATH_MAX], home[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_identity_success_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_identity_success_home");
+    setenv("HOME", home, 1);
+
+    char outer[PATH_MAX], middle[PATH_MAX], leaf[PATH_MAX];
+    char docs_alias[PATH_MAX], downloads_alias[PATH_MAX];
+    join_path(outer, sizeof(outer), home, "Outer");
+    join_path(middle, sizeof(middle), outer, "Middle");
+    join_path(leaf, sizeof(leaf), middle, "Leaf");
+    mkdir_p(leaf);
+    join_path(docs_alias, sizeof(docs_alias), home, "d");
+    join_path(downloads_alias, sizeof(downloads_alias), home,
+              "a-very-long-download-alias");
+    if (symlink("Outer/Middle", docs_alias) != 0 ||
+        symlink("Outer/Middle/Leaf", downloads_alias) != 0)
+        exit(1);
+    write_user_dirs(home, "d", "a-very-long-download-alias");
+
+    ManifestRoot roots[3];
+    memset(roots, 0, sizeof(roots));
+    strcpy(roots[0].id, "EXPLICIT_0");
+    roots[0].policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(roots[0].payload_path, "EXPLICIT_0");
+    strcpy(roots[0].source_path, "Outer");
+    strcpy(roots[0].restore_path, "Outer");
+    roots[0].has_restore_path = 1;
+    strcpy(roots[1].id, "XDG_DOCUMENTS_DIR");
+    roots[1].policy = ROOT_POLICY_XDG;
+    strcpy(roots[1].payload_path, "XDG_DOCUMENTS_DIR");
+    strcpy(roots[1].source_path, "Documents");
+    strcpy(roots[2].id, "XDG_DOWNLOAD_DIR");
+    roots[2].policy = ROOT_POLICY_XDG;
+    strcpy(roots[2].payload_path, "XDG_DOWNLOAD_DIR");
+    strcpy(roots[2].source_path, "Downloads");
+    Manifest manifest;
+    make_v1_manifest(&manifest, roots, 3);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the three-level nested alias manifest");
+
+    write_payload_file(source, "data/EXPLICIT_0", "outer.txt", "LINKED");
+    write_payload_file(source, "data/XDG_DOCUMENTS_DIR", "middle.txt", "MIDDLE");
+    char outer_payload[PATH_MAX], middle_payload[PATH_MAX], leaf_payload[PATH_MAX];
+    char outer_file[PATH_MAX], leaf_file[PATH_MAX];
+    join_path(outer_payload, sizeof(outer_payload), source, "data/EXPLICIT_0");
+    join_path(middle_payload, sizeof(middle_payload), source,
+              "data/XDG_DOCUMENTS_DIR");
+    join_path(leaf_payload, sizeof(leaf_payload), source,
+              "data/XDG_DOWNLOAD_DIR");
+    mkdir_p(leaf_payload);
+    join_path(outer_file, sizeof(outer_file), outer_payload, "outer.txt");
+    join_path(leaf_file, sizeof(leaf_file), leaf_payload, "leaf-link.txt");
+    check(link(outer_file, leaf_file) == 0,
+          "fixture: hardlink one payload across manifest roots");
+
+    struct timespec outer_times[2] = {
+        { .tv_sec = 1700001200, .tv_nsec = 100000001 },
+        { .tv_sec = 1700001201, .tv_nsec = 100000002 }
+    };
+    struct timespec middle_times[2] = {
+        { .tv_sec = 1700001210, .tv_nsec = 200000001 },
+        { .tv_sec = 1700001211, .tv_nsec = 200000002 }
+    };
+    struct timespec leaf_times[2] = {
+        { .tv_sec = 1700001220, .tv_nsec = 300000001 },
+        { .tv_sec = 1700001221, .tv_nsec = 300000002 }
+    };
+    check(chmod(outer_payload, 0711) == 0 &&
+              chmod(middle_payload, 0722) == 0 &&
+              chmod(leaf_payload, 0733) == 0 &&
+              utimensat(AT_FDCWD, outer_payload, outer_times, 0) == 0 &&
+              utimensat(AT_FDCWD, middle_payload, middle_times, 0) == 0 &&
+              utimensat(AT_FDCWD, leaf_payload, leaf_times, 0) == 0,
+          "fixture: set distinct metadata on the three physical levels");
+    remove_fixture_packages(source);
+
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    char output[16384];
+    int rc = run_restore_capturing_with_input(source, "y\n", output,
+                                               sizeof(output));
+    dry_run = previous_dry_run;
+
+    char restored_outer_file[PATH_MAX], restored_leaf_file[PATH_MAX];
+    join_path(restored_outer_file, sizeof(restored_outer_file), outer,
+              "outer.txt");
+    join_path(restored_leaf_file, sizeof(restored_leaf_file), leaf,
+              "leaf-link.txt");
+    struct stat outer_st, middle_st, leaf_st, first_st, second_st;
+    int metadata_ok = stat(outer, &outer_st) == 0 &&
+                      stat(middle, &middle_st) == 0 &&
+                      stat(leaf, &leaf_st) == 0;
+    int hardlink_ok = stat(restored_outer_file, &first_st) == 0 &&
+                      stat(restored_leaf_file, &second_st) == 0 &&
+                      first_st.st_dev == second_st.st_dev &&
+                      first_st.st_ino == second_st.st_ino;
+    check(rc == 0 && file_content_is(restored_outer_file, "LINKED") &&
+              file_content_is(restored_leaf_file, "LINKED") && hardlink_ok,
+          "non-conflicting nested alias targets restore with cross-root hardlink identity intact");
+    check(metadata_ok && (outer_st.st_mode & 07777) == 0711 &&
+              (middle_st.st_mode & 07777) == 0722 &&
+              (leaf_st.st_mode & 07777) == 0733 &&
+              outer_st.st_mtim.tv_sec == outer_times[1].tv_sec &&
+              middle_st.st_mtim.tv_sec == middle_times[1].tv_sec &&
+              leaf_st.st_mtim.tv_sec == leaf_times[1].tv_sec,
+          "directory metadata follows physical child-before-parent order despite alias spelling lengths");
+
+    remove_tree(source);
+    remove_tree(home);
+}
+
+static void test_v2_selection_restore_nested_metadata_order(void)
+{
+    printf(BLUE "::" NC " restore dispatch: VERSION=2 nested-root directory metadata order\n");
+
+    char source[PATH_MAX], home[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_v2_metadata");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_v2_metadata_home");
+    setenv("HOME", home, 1);
+
+    ManifestRoot roots[2];
+    Manifest manifest;
+    make_v2_selection_manifest(&manifest, roots);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the nested VERSION=2 selection manifest");
+    write_payload_file(source, "data/CONFIG_0", "ordinary.txt", "home sibling");
+    write_payload_file(source, "data/XDG_DOCUMENTS_DIR", "doc.txt", "localized document");
+
+    char parent_payload[PATH_MAX], child_payload[PATH_MAX];
+    join_path(parent_payload, sizeof(parent_payload), source, "data/CONFIG_0");
+    join_path(child_payload, sizeof(child_payload), source, "data/XDG_DOCUMENTS_DIR");
+    check(chmod(parent_payload, 0711) == 0 && chmod(child_payload, 0750) == 0,
+          "fixture: set distinct root directory modes");
+    struct timespec parent_times[2] = {
+        { .tv_sec = 1700000800, .tv_nsec = 123456789 },
+        { .tv_sec = 1700000801, .tv_nsec = 234567890 }
+    };
+    struct timespec child_times[2] = {
+        { .tv_sec = 1700000810, .tv_nsec = 345678901 },
+        { .tv_sec = 1700000811, .tv_nsec = 456789012 }
+    };
+    check(utimensat(AT_FDCWD, parent_payload, parent_times, 0) == 0 &&
+              utimensat(AT_FDCWD, child_payload, child_times, 0) == 0,
+          "fixture: set distinct root directory timestamps");
+
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    char output[8192];
+    int rc = run_restore_capturing_with_input(source, "y\n", output, sizeof(output));
+    dry_run = previous_dry_run;
+
+    char documents[PATH_MAX];
+    join_path(documents, sizeof(documents), home, "Documents");
+    struct stat home_st, documents_st;
+    int metadata_ok = stat(home, &home_st) == 0 && stat(documents, &documents_st) == 0;
+    check(rc == 0 && metadata_ok &&
+              (home_st.st_mode & 07777) == 0711 &&
+              (documents_st.st_mode & 07777) == 0750 &&
+              home_st.st_mtim.tv_sec == parent_times[1].tv_sec &&
+              documents_st.st_mtim.tv_sec == child_times[1].tv_sec,
+          "child replay cannot perturb final HOME or child directory metadata");
+
+    remove_tree(source);
+    remove_tree(home);
+}
+
+static void test_v1_restore_space_preflight(void)
+{
+    printf(BLUE "::" NC " native restore free-space preflight and hardlink estimate\n");
+
+    char source[PATH_MAX], home[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_home");
+    setenv("HOME", home, 1);
+
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "EXPLICIT_0");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "EXPLICIT_0");
+    strcpy(root.source_path, "Documents/hardlinks");
+    strcpy(root.restore_path, "Documents/hardlinks");
+    root.has_restore_path = 1;
+
+    Manifest manifest;
+    make_v1_manifest(&manifest, &root, 1);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write a valid v1 manifest for the space preflight");
+    write_payload_file(source, "data/EXPLICIT_0", "first", "payload");
+
+    char first[PATH_MAX], second[PATH_MAX];
+    join_path(first, sizeof(first), source, "data/EXPLICIT_0/first");
+    join_path(second, sizeof(second), source, "data/EXPLICIT_0/second");
+    if (link(first, second) != 0)
+    {
+        check(0, "fixture: create a hardlinked second payload member");
+        remove_tree(source);
+        remove_tree(home);
+        return;
+    }
+
+    char payload_root[PATH_MAX];
+    join_path(payload_root, sizeof(payload_root), source, "data/EXPLICIT_0");
+    struct stat payload_root_st;
+    int payload_root_ok = stat(payload_root, &payload_root_st) == 0 &&
+                          S_ISDIR(payload_root_st.st_mode) &&
+                          payload_root_st.st_size >= 0;
+    check(payload_root_ok, "fixture: inspect the native payload directory size");
+    if (!payload_root_ok)
+    {
+        remove_tree(source);
+        remove_tree(home);
+        return;
+    }
+    off_t expected_estimate = payload_root_st.st_size +
+                              (off_t)strlen("payload");
+    char expected_estimate_text[32];
+    format_size(expected_estimate, expected_estimate_text,
+                sizeof(expected_estimate_text));
+    char expected_estimate_line[64];
+    int expected_estimate_line_length = snprintf(
+        expected_estimate_line, sizeof(expected_estimate_line),
+        "Estimated restore size: %s", expected_estimate_text);
+    int expected_estimate_line_valid = expected_estimate_line_length >= 0 &&
+        (size_t)expected_estimate_line_length < sizeof(expected_estimate_line);
+
+    char output[8192];
+    int previous_dry_run = dry_run;
+    dry_run = 1;
+    int rc = run_restore_capturing(source, output, sizeof(output));
+    check(rc == 0 && expected_estimate_line_valid &&
+              strstr(output, expected_estimate_line) != NULL &&
+              strstr(output, "Estimated restore size: 7B") == NULL,
+          "native restore estimate counts directory size and a hardlink group only once");
+
+    off_t block_size = 1;
+    backup_test_set_block_size_hook(set_test_block_size, &block_size);
+    backup_test_set_free_space_hook(force_no_free_space, NULL);
+
+    rc = run_restore_capturing(source, output, sizeof(output));
+    check(rc != 0 && expected_estimate_line_valid &&
+              strstr(output, expected_estimate_line) != NULL &&
+              strstr(output, "Destination free space: 0B") != NULL &&
+              strstr(output, "Error: not enough free space at ") != NULL &&
+              strstr(output, home) != NULL && strstr(output, "Continue?") == NULL,
+          "native dry-run refuses before confirmation when space is insufficient");
+
+    dry_run = 0;
+    rc = run_restore_capturing(source, output, sizeof(output));
+    check(rc != 0 && expected_estimate_line_valid &&
+              strstr(output, expected_estimate_line) != NULL &&
+              strstr(output, "Destination free space: 0B") != NULL &&
+              strstr(output, "Error: not enough free space at ") != NULL &&
+              strstr(output, home) != NULL && strstr(output, "Continue?") == NULL,
+          "native live restore refuses before confirmation when space is insufficient");
+    dry_run = previous_dry_run;
+
+    backup_test_set_block_size_hook(NULL, NULL);
+    backup_test_set_free_space_hook(NULL, NULL);
+    char restored[PATH_MAX];
+    join_path(restored, sizeof(restored), home, "Documents/hardlinks");
+    check(access(restored, F_OK) != 0,
+          "native space refusal leaves the destination untouched");
+
+    remove_tree(source);
+    remove_tree(home);
+}
+
+static void test_network_config_restore_backend_modes(void)
+{
+    printf(BLUE "::" NC " network config: each backend gets its fixed file mode\n");
+
+    char source[PATH_MAX], home[PATH_MAX], dest_parent[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "network_mode_src");
+    fresh_mkdtemp(home, sizeof(home), "network_mode_home");
+    fresh_mkdtemp(dest_parent, sizeof(dest_parent), "network_mode_dest");
+    setenv("HOME", home, 1);
+    write_network_manifest(source);
+
+    char networkd_dir[PATH_MAX], wpa_dir[PATH_MAX], path[PATH_MAX];
+    join_path(networkd_dir, sizeof(networkd_dir), source,
+              "network/systemd-networkd");
+    join_path(wpa_dir, sizeof(wpa_dir), source, "network/wpa_supplicant");
+    mkdir_p(networkd_dir);
+    mkdir_p(wpa_dir);
+    join_path(path, sizeof(path), networkd_dir, "20-wired.network");
+    write_file_mode(path, "[Match]\nName=en*\n", 0755);
+    join_path(path, sizeof(path), networkd_dir, "30-wg.netdev");
+    write_file_mode(path, "[WireGuard]\nPrivateKey=fixture\n", 0755);
+    char group_file[PATH_MAX];
+    join_path(group_file, sizeof(group_file), dest_parent, "group");
+    write_file_mode(group_file,
+                    "systemd-networkd:x:4241:\nsystemd-network:x:4242:\n", 0644);
+    groups_test_set_group_file(group_file);
+    join_path(path, sizeof(path), wpa_dir, "wpa_supplicant.conf");
+    write_file_mode(path, "network={}\n", 0644);
+
+    char networkd_dest[PATH_MAX], wpa_dest[PATH_MAX];
+    join_path(networkd_dest, sizeof(networkd_dest), dest_parent, "network");
+    join_path(wpa_dest, sizeof(wpa_dest), dest_parent, "wpa_supplicant");
+    mkdir_p(networkd_dest);
+    mkdir_p(wpa_dest);
+    restore_test_set_network_config_dest_dir("systemd-networkd", networkd_dest);
+    restore_test_set_network_config_dest_dir("wpa_supplicant", wpa_dest);
+
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    char output[8192];
+    int rc = run_restore_capturing_with_input(source, "y\n", output,
+                                              sizeof(output));
+    dry_run = previous_dry_run;
+    restore_test_set_network_config_dest_dir("systemd-networkd", NULL);
+    restore_test_set_network_config_dest_dir("wpa_supplicant", NULL);
+    groups_test_set_group_file(NULL);
+
+    check(rc == 0, "live restore of networkd and wpa_supplicant files succeeds");
+    join_path(path, sizeof(path), networkd_dest, "20-wired.network");
+    check(file_matches(path, "[Match]\nName=en*\n", 0644),
+          "networkd configuration stays readable by systemd-network (0644)");
+    join_path(path, sizeof(path), networkd_dest, "30-wg.netdev");
+    check(file_matches(path, "[WireGuard]\nPrivateKey=fixture\n", 0640),
+          "a networkd .netdev that can hold keys is not world-readable (0640)");
+    struct stat netdev_st;
+    if (geteuid() == 0)
+        check(stat(path, &netdev_st) == 0 && netdev_st.st_gid == 4242,
+              "as root, a .netdev is handed to the systemd-network group");
+    else
+        skip_case(".netdev group assignment", "requires root");
+    join_path(path, sizeof(path), wpa_dest, "wpa_supplicant.conf");
+    check(file_matches(path, "network={}\n", 0600),
+          "wpa_supplicant configuration holding keys is written 0600");
+    check(strstr(output, "sudo systemctl restart wpa_supplicant@") != NULL,
+          "without NetworkManager the wpa_supplicant restart hint is shown");
+
+    // Every backend in the fixture stays redirected: a root test run must
+    // never write into the real /etc.
+    restore_test_set_network_config_dest_dir("systemd-networkd", networkd_dest);
+    restore_test_set_network_config_dest_dir("wpa_supplicant", wpa_dest);
+    groups_test_set_group_file(group_file);
+    restore_test_set_network_manager_runtime_dir(dest_parent);
+    dry_run = 0;
+    rc = run_restore_capturing_with_input(source, "y\n", output,
+                                          sizeof(output));
+    dry_run = previous_dry_run;
+    restore_test_set_network_manager_runtime_dir("/nonexistent/migr-test-nm");
+    groups_test_set_group_file(NULL);
+    restore_test_set_network_config_dest_dir("systemd-networkd", NULL);
+    restore_test_set_network_config_dest_dir("wpa_supplicant", NULL);
+    check(rc == 0 &&
+              strstr(output, "NetworkManager manages Wi-Fi on this system") !=
+                  NULL &&
+              strstr(output, "sudo systemctl restart wpa_supplicant@") == NULL,
+          "with NetworkManager running the wpa_supplicant files need no "
+          "restart");
+
+    remove_tree(source);
+    remove_tree(home);
+    remove_tree(dest_parent);
+}
+
+static void test_network_config_restore_success(void)
+{
+    printf(BLUE "::" NC " network config: live restore copies regular files and reloads NetworkManager\n");
+
+    char source[PATH_MAX], home[PATH_MAX], dest_parent[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "network_src");
+    fresh_mkdtemp(home, sizeof(home), "network_home");
+    fresh_mkdtemp(dest_parent, sizeof(dest_parent), "network_dest");
+    setenv("HOME", home, 1);
+    write_network_manifest(source);
+
+    char network_dir[PATH_MAX];
+    join_path(network_dir, sizeof(network_dir), source, "network/networkmanager");
+    mkdir_p(network_dir);
+    char office_source[PATH_MAX], wifi_source[PATH_MAX];
+    join_path(office_source, sizeof(office_source), network_dir,
+              "office.nmconnection");
+    join_path(wifi_source, sizeof(wifi_source), network_dir,
+              "wifi.nmconnection");
+    write_file_mode(office_source, "[connection]\nid=office\n", 0600);
+    // What a portable container on exFAT reports for every file.
+    write_file_mode(wifi_source, "[connection]\nid=wifi\n", 0755);
+
+    char ignored_dir[PATH_MAX], ignored_link[PATH_MAX];
+    join_path(ignored_dir, sizeof(ignored_dir), network_dir, "ignored-dir");
+    mkdir_p(ignored_dir);
+    join_path(ignored_link, sizeof(ignored_link), network_dir, "ignored-link");
+    if (symlink("office.nmconnection", ignored_link) != 0)
+    {
+        printf(RED "fixture: could not create network symlink" NC "\n");
+        exit(1);
+    }
+
+    char dest_dir[PATH_MAX];
+    join_path(dest_dir, sizeof(dest_dir), dest_parent, "system-connections");
+    mkdir_p(dest_dir);
+    char office_dest[PATH_MAX], wifi_dest[PATH_MAX];
+    join_path(office_dest, sizeof(office_dest), dest_dir,
+              "office.nmconnection");
+    join_path(wifi_dest, sizeof(wifi_dest), dest_dir, "wifi.nmconnection");
+    write_file_mode(office_dest, "stale", 0600);
+
+    char saved_policy[PATH_MAX], current_policy[PATH_MAX];
+    join_path(saved_policy, sizeof(saved_policy), source,
+              "network/crypto-policy");
+    join_path(current_policy, sizeof(current_policy), dest_parent,
+              "crypto-policies-config");
+    write_file_mode(saved_policy, "DEFAULT:SHA1\n", 0600);
+    write_file_mode(current_policy, "# comment\nDEFAULT\n", 0644);
+
+    char reload_marker[PATH_MAX];
+    join_path(reload_marker, sizeof(reload_marker), dest_parent,
+              "reload.marker");
+    restore_test_set_network_config_dest_dir("NetworkManager", dest_dir);
+    restore_test_set_network_command_hook(record_network_command, reload_marker);
+    restore_test_set_crypto_policy_current(current_policy);
+
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    char output[8192];
+    int rc = run_restore_capturing_with_input(source, "y\n", output,
+                                              sizeof(output));
+    dry_run = previous_dry_run;
+    restore_test_set_crypto_policy_current(NULL);
+    restore_test_set_network_command_hook(NULL, NULL);
+    restore_test_set_network_config_dest_dir("NetworkManager", NULL);
+
+    check(rc == 0, "live restore succeeds when the network destination is writable");
+    check(file_matches(office_dest, "[connection]\nid=office\n", 0600),
+          "an existing connection file is replaced with the saved bytes as 0600");
+    check(file_matches(wifi_dest, "[connection]\nid=wifi\n", 0600),
+          "a 0755 saved connection file is created 0600, as NetworkManager "
+          "requires");
+
+    char ignored_dest[PATH_MAX];
+    join_path(ignored_dest, sizeof(ignored_dest), dest_dir, "ignored-dir");
+    check(access(ignored_dest, F_OK) != 0,
+          "non-regular network backup entries are skipped");
+    check(file_content_is(reload_marker,
+                          "nmcli\nconnection\nreload\n"
+                          "update-crypto-policies\n--set\nDEFAULT:SHA1\n"
+                          "systemctl\ntry-restart\nwpa_supplicant.service\n"),
+          "reload runs nmcli connection reload once, sets the source crypto "
+          "policy, then restarts wpa_supplicant so Wi-Fi uses it");
+    check(strstr(output, "Restored 2 network connection files") != NULL,
+          "the live restore reports the number of applied connection files");
+    check(strstr(output, "Set the crypto policy to DEFAULT:SHA1, as on the "
+                         "source system (it was DEFAULT). Wi-Fi uses it from "
+                         "now on") != NULL &&
+              strstr(output, "To undo: sudo update-crypto-policies --set "
+                             "DEFAULT\n") != NULL &&
+              strstr(output, "could not restart wpa_supplicant") == NULL,
+          "the changed crypto policy is reported with the command to undo it");
+
+    remove_tree(source);
+    remove_tree(home);
+    remove_tree(dest_parent);
+}
+
+#ifdef PACKAGES_TEST_HOOKS
+// NetworkManager as the wait for a network sees it: offline at first, then
+// connecting to a network whose name needs nmcli's escaping, then online
+// after `connect_after` state queries (never, when negative). The success
+// line of the restore goes to stderr, so checks look for lines one by one.
+typedef struct {
+    int connect_after;
+    int state_queries;
+} FakeNetworkManager;
+
+static int answer_network_query(char *const argv[], char *output,
+                                size_t output_size, void *context)
+{
+    FakeNetworkManager *nm = context;
+    const char *answer = "";
+    if (strcmp(argv[1], "networking") == 0)
+        answer = nm->connect_after == 0 ? "full\n" : "none\n";
+    else if (strcmp(argv[3], "STATE") == 0)
+        answer = nm->connect_after >= 0 &&
+                         nm->state_queries++ >= nm->connect_after
+                     ? "connected\n" : "connecting\n";
+    else if (nm->connect_after < 0)
+        answer = "lo:loopback:activated\n";
+    else if (nm->state_queries > nm->connect_after)
+        answer = "Cafe\\:2:802-11-wireless:activated\nlo:loopback:activated\n";
+    else
+        answer = "lo:loopback:activated\nCafe\\:2:802-11-wireless:activating\n";
+    snprintf(output, output_size, "%s", answer);
+    return 0;
+}
+
+static void run_network_wait_restore(int connect_after, char *output,
+                                     size_t output_size)
+{
+    char source[PATH_MAX], home[PATH_MAX], dest_parent[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "network_wait_src");
+    fresh_mkdtemp(home, sizeof(home), "network_wait_home");
+    fresh_mkdtemp(dest_parent, sizeof(dest_parent), "network_wait_dest");
+    setenv("HOME", home, 1);
+    write_network_manifest(source);
+    char network_dir[PATH_MAX], saved[PATH_MAX], packages[PATH_MAX];
+    join_path(network_dir, sizeof(network_dir), source,
+              "network/networkmanager");
+    mkdir_p(network_dir);
+    join_path(saved, sizeof(saved), network_dir, "Cafe.nmconnection");
+    write_file_mode(saved, "[connection]\nid=Cafe:2\n", 0600);
+    join_path(packages, sizeof(packages), source, "packages.txt");
+    write_file_mode(packages, "fixture-package\n", 0644);
+    char dest_dir[PATH_MAX], reload_marker[PATH_MAX];
+    join_path(dest_dir, sizeof(dest_dir), dest_parent, "system-connections");
+    mkdir_p(dest_dir);
+    join_path(reload_marker, sizeof(reload_marker), dest_parent,
+              "reload.marker");
+
+    FakeNetworkManager nm = { .connect_after = connect_after };
+    PackageProgressProbe package_probe = {0};
+    restore_test_set_network_config_dest_dir("NetworkManager", dest_dir);
+    restore_test_set_network_command_hook(record_network_command, reload_marker);
+    restore_test_set_network_manager_runtime_dir(dest_parent);
+    restore_test_set_network_query_hook(answer_network_query, &nm, 0);
+    packages_test_set_restore_hooks(DISTRO_FEDORA, package_progress_probe,
+                                    package_progress_capture, &package_probe);
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    int rc = run_restore_capturing_with_input(source, "y\n", output,
+                                              output_size);
+    dry_run = previous_dry_run;
+    packages_test_clear_restore_hooks();
+    restore_test_set_network_query_hook(NULL, NULL, 0);
+    restore_test_set_network_manager_runtime_dir("/nonexistent/migr-test-nm");
+    restore_test_set_network_command_hook(NULL, NULL);
+    restore_test_set_network_config_dest_dir("NetworkManager", NULL);
+    check(rc == 0 && strstr(output, "\nPackages\n") != NULL,
+          "the restore finishes, packages included");
+
+    remove_tree(source);
+    remove_tree(home);
+    remove_tree(dest_parent);
+}
+
+static void test_restore_waits_for_a_network_before_packages(void)
+{
+    printf(BLUE "::" NC " network: restore waits for a connection before packages\n");
+    char output[16384];
+
+    run_network_wait_restore(2, output, sizeof(output));
+    const char *configured = strstr(output, "Network configuration (NetworkManager)");
+    const char *connecting = strstr(output, "\nNetwork\n  Connecting to Cafe:2...\n");
+    const char *packages = strstr(output, "\nPackages\n");
+    check(configured != NULL && connecting != NULL && packages != NULL &&
+              configured < connecting && connecting < packages,
+          "the network configuration is restored, then the wait names the "
+          "network being connected, then packages install");
+    check(strstr(output, "  Connected to Cafe:2.\n") != NULL &&
+              strstr(output, "Waiting for a network") == NULL,
+          "the connected network is named once it is online");
+
+    run_network_wait_restore(-1, output, sizeof(output));
+    const char *waiting = strstr(output, "\nNetwork\n  Waiting for a network "
+                                         "connection...\n");
+    const char *gave_up = strstr(output, "  No network connection after 90 "
+                                         "seconds. Packages and Flatpak "
+                                         "applications are listed at the end, "
+                                         "to install once this system is "
+                                         "online.\n");
+    check(waiting != NULL && gave_up != NULL && waiting < gave_up &&
+              strstr(waiting + strlen("\nNetwork\n  Waiting"),
+                     "Waiting for a network") == NULL &&
+              strstr(output, "Connecting to") == NULL &&
+              strstr(output, "\nPackages\n  No network connection; not "
+                             "installing.\n") != NULL,
+          "with nothing to connect to, the wait says so once, gives up at "
+          "the limit, and installs nothing");
+
+    run_network_wait_restore(0, output, sizeof(output));
+    check(strstr(output, "\nNetwork\n") == NULL,
+          "an online system waits for nothing and prints nothing");
+}
+#endif
+
+static void test_network_config_restore_dry_run(void)
+{
+    printf(BLUE "::" NC " network config: dry-run previews without touching the destination\n");
+
+    char source[PATH_MAX], home[PATH_MAX], dest_parent[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "network_dry_src");
+    fresh_mkdtemp(home, sizeof(home), "network_dry_home");
+    fresh_mkdtemp(dest_parent, sizeof(dest_parent), "network_dry_dest");
+    setenv("HOME", home, 1);
+    write_network_manifest(source);
+
+    char network_dir[PATH_MAX], saved_file[PATH_MAX];
+    join_path(network_dir, sizeof(network_dir), source, "network/networkmanager");
+    mkdir_p(network_dir);
+    join_path(saved_file, sizeof(saved_file), network_dir, "wifi.nmconnection");
+    write_file_mode(saved_file, "wifi", 0600);
+
+    char dest_dir[PATH_MAX], reload_marker[PATH_MAX];
+    join_path(dest_dir, sizeof(dest_dir), dest_parent, "system-connections");
+    join_path(reload_marker, sizeof(reload_marker), dest_parent,
+              "reload.marker");
+    char saved_policy[PATH_MAX], current_policy[PATH_MAX];
+    join_path(saved_policy, sizeof(saved_policy), source,
+              "network/crypto-policy");
+    join_path(current_policy, sizeof(current_policy), dest_parent,
+              "crypto-policies-config");
+    write_file_mode(saved_policy, "DEFAULT:SHA1\n", 0600);
+    write_file_mode(current_policy, "DEFAULT:SHA1\n", 0644);
+    restore_test_set_network_config_dest_dir("NetworkManager", dest_dir);
+    restore_test_set_network_command_hook(record_network_command, reload_marker);
+    restore_test_set_crypto_policy_current(current_policy);
+
+    int previous_dry_run = dry_run;
+    dry_run = 1;
+    char output[8192];
+    int rc = run_restore_capturing(source, output, sizeof(output));
+    dry_run = previous_dry_run;
+    restore_test_set_crypto_policy_current(NULL);
+    restore_test_set_network_command_hook(NULL, NULL);
+    restore_test_set_network_config_dest_dir("NetworkManager", NULL);
+
+    check(rc == 0, "network dry-run succeeds");
+    check(strstr(output, "Would restore 1 network connection file to") != NULL &&
+              strstr(output, dest_dir) != NULL,
+          "network dry-run previews the manifest-driven destination");
+    check(access(dest_dir, F_OK) != 0,
+          "network dry-run does not create the destination directory");
+    check(access(reload_marker, F_OK) != 0,
+          "network dry-run never invokes the reload command");
+    check(strstr(output, "crypto policy") == NULL,
+          "a matching crypto policy prints nothing");
+
+    write_file_mode(current_policy, "DEFAULT\n", 0644);
+    restore_test_set_network_command_hook(record_network_command, reload_marker);
+    restore_test_set_crypto_policy_current(current_policy);
+    dry_run = 1;
+    rc = run_restore_capturing(source, output, sizeof(output));
+    dry_run = previous_dry_run;
+    restore_test_set_crypto_policy_current(NULL);
+    restore_test_set_network_command_hook(NULL, NULL);
+    check(rc == 0 && strstr(output, "Would set the crypto policy to "
+                                    "DEFAULT:SHA1, as on the source system "
+                                    "(this system: DEFAULT)") != NULL &&
+              access(reload_marker, F_OK) != 0,
+          "a different crypto policy is previewed and not set");
+
+    remove_tree(source);
+    remove_tree(home);
+    remove_tree(dest_parent);
+}
+
+static void test_network_config_reload_failure_is_best_effort(void)
+{
+    printf(BLUE "::" NC " network config: a failed reload or crypto policy warns without failing restore\n");
+
+    char source[PATH_MAX], home[PATH_MAX], dest_parent[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "network_reload_src");
+    fresh_mkdtemp(home, sizeof(home), "network_reload_home");
+    fresh_mkdtemp(dest_parent, sizeof(dest_parent), "network_reload_dest");
+    setenv("HOME", home, 1);
+    write_network_manifest(source);
+
+    char network_dir[PATH_MAX], saved_file[PATH_MAX];
+    join_path(network_dir, sizeof(network_dir), source, "network/networkmanager");
+    mkdir_p(network_dir);
+    join_path(saved_file, sizeof(saved_file), network_dir, "wifi.nmconnection");
+    write_file_mode(saved_file, "wifi", 0600);
+
+    char dest_dir[PATH_MAX], reload_marker[PATH_MAX];
+    join_path(dest_dir, sizeof(dest_dir), dest_parent, "system-connections");
+    join_path(reload_marker, sizeof(reload_marker), dest_parent,
+              "reload.marker");
+    char saved_policy[PATH_MAX], current_policy[PATH_MAX];
+    join_path(saved_policy, sizeof(saved_policy), source,
+              "network/crypto-policy");
+    join_path(current_policy, sizeof(current_policy), dest_parent,
+              "crypto-policies-config");
+    write_file_mode(saved_policy, "DEFAULT:SHA1\n", 0600);
+    write_file_mode(current_policy, "DEFAULT\n", 0644);
+    restore_test_set_network_config_dest_dir("NetworkManager", dest_dir);
+    restore_test_set_network_command_hook(record_failed_network_command,
+                                          reload_marker);
+    restore_test_set_crypto_policy_current(current_policy);
+
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    char output[8192];
+    int rc = run_restore_capturing_with_input(source, "y\n", output,
+                                              sizeof(output));
+    dry_run = previous_dry_run;
+    restore_test_set_crypto_policy_current(NULL);
+    restore_test_set_network_command_hook(NULL, NULL);
+    restore_test_set_network_config_dest_dir("NetworkManager", NULL);
+
+    check(rc == 0, "a failed reload or crypto policy does not mark an "
+                   "otherwise successful restore failed");
+    check(strstr(output,
+                 "'nmcli connection reload' did not succeed") != NULL,
+          "reload failure emits the best-effort warning");
+    check(strstr(output, "could not set the crypto policy to DEFAULT:SHA1 "
+                         "(this system: DEFAULT)") != NULL &&
+              strstr(output, "run: sudo update-crypto-policies --set "
+                             "DEFAULT:SHA1") != NULL,
+          "a failed crypto policy warns with the command to run");
+    check(file_content_is(reload_marker,
+                          "nmcli\nconnection\nreload\n"
+                          "update-crypto-policies\n--set\nDEFAULT:SHA1\n"),
+          "the failing path still receives the exact commands, and a policy "
+          "not set restarts nothing");
+
+    restore_test_set_network_config_dest_dir("NetworkManager", dest_dir);
+    restore_test_set_network_command_hook(record_failed_restart_command,
+                                          reload_marker);
+    restore_test_set_crypto_policy_current(current_policy);
+    dry_run = 0;
+    rc = run_restore_capturing_with_input(source, "y\n", output,
+                                          sizeof(output));
+    dry_run = previous_dry_run;
+    restore_test_set_crypto_policy_current(NULL);
+    restore_test_set_network_command_hook(NULL, NULL);
+    restore_test_set_network_config_dest_dir("NetworkManager", NULL);
+    check(rc == 0 &&
+              strstr(output, "Set the crypto policy to DEFAULT:SHA1") != NULL &&
+              strstr(output, "could not restart wpa_supplicant") != NULL,
+          "a failed wpa_supplicant restart warns without failing restore");
+
+    remove_tree(source);
+    remove_tree(home);
+    remove_tree(dest_parent);
+}
+
+static void test_network_config_restore_continues_after_file_error(void)
+{
+    printf(BLUE "::" NC " network config: one bad destination entry does not cost the remaining files\n");
+
+    char source[PATH_MAX], home[PATH_MAX], dest_parent[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "network_error_src");
+    fresh_mkdtemp(home, sizeof(home), "network_error_home");
+    fresh_mkdtemp(dest_parent, sizeof(dest_parent), "network_error_dest");
+    setenv("HOME", home, 1);
+    write_network_manifest(source);
+
+    char network_dir[PATH_MAX];
+    join_path(network_dir, sizeof(network_dir), source, "network/networkmanager");
+    mkdir_p(network_dir);
+    char bad_source[PATH_MAX], good_source[PATH_MAX];
+    join_path(bad_source, sizeof(bad_source), network_dir, "bad.nmconnection");
+    join_path(good_source, sizeof(good_source), network_dir,
+              "good.nmconnection");
+    write_file_mode(bad_source, "bad", 0600);
+    write_file_mode(good_source, "good", 0600);
+
+    char dest_dir[PATH_MAX];
+    join_path(dest_dir, sizeof(dest_dir), dest_parent, "system-connections");
+    mkdir_p(dest_dir);
+    char bad_dest[PATH_MAX], good_dest[PATH_MAX], reload_marker[PATH_MAX];
+    join_path(bad_dest, sizeof(bad_dest), dest_dir, "bad.nmconnection");
+    mkdir_p(bad_dest);
+    join_path(good_dest, sizeof(good_dest), dest_dir, "good.nmconnection");
+    join_path(reload_marker, sizeof(reload_marker), dest_parent,
+              "reload.marker");
+    restore_test_set_network_config_dest_dir("NetworkManager", dest_dir);
+    restore_test_set_network_command_hook(record_network_command, reload_marker);
+
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    char output[8192];
+    int rc = run_restore_capturing_with_input(source, "y\n", output,
+                                              sizeof(output));
+    dry_run = previous_dry_run;
+    restore_test_set_network_command_hook(NULL, NULL);
+    restore_test_set_network_config_dest_dir("NetworkManager", NULL);
+
+    check(rc != 0, "an unexpected per-file failure marks the overall restore failed");
+    check(strstr(output, "Could not restore network/networkmanager/bad.nmconnection") != NULL,
+          "the failed connection file is identified");
+    check(file_matches(good_dest, "good", 0600),
+          "later regular connection files are still restored");
+    check(file_content_is(reload_marker,
+                          "nmcli\nconnection\nreload\n"),
+          "reload still runs after at least one connection file was restored");
+
+    remove_tree(source);
+    remove_tree(home);
+    remove_tree(dest_parent);
+}
+
+static void test_network_config_restore_empty(void)
+{
+    printf(BLUE "::" NC " network config: an empty saved directory is a no-op\n");
+
+    char source[PATH_MAX], home[PATH_MAX], dest_parent[PATH_MAX];
+    char network_root[PATH_MAX], manifest_path[PATH_MAX], sentinel[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "network_empty_src");
+    fresh_mkdtemp(home, sizeof(home), "network_empty_home");
+    fresh_mkdtemp(dest_parent, sizeof(dest_parent), "network_empty_dest");
+    setenv("HOME", home, 1);
+    write_network_manifest(source);
+
+    char network_dir[PATH_MAX];
+    join_path(network_root, sizeof(network_root), source, "network");
+    join_path(network_dir, sizeof(network_dir), source, "network/networkmanager");
+    mkdir_p(network_dir);
+    join_path(manifest_path, sizeof(manifest_path), source, "manifest.txt");
+    join_path(sentinel, sizeof(sentinel), home, "sentinel");
+    write_file_mode(sentinel, "untouched", 0600);
+    char dest_dir[PATH_MAX], reload_marker[PATH_MAX];
+    join_path(dest_dir, sizeof(dest_dir), dest_parent, "system-connections");
+    join_path(reload_marker, sizeof(reload_marker), dest_parent,
+              "reload.marker");
+    restore_test_set_network_config_dest_dir("NetworkManager", dest_dir);
+    restore_test_set_network_command_hook(record_network_command, reload_marker);
+
+    char output[8192];
+    const char *owned_paths[] = {
+        source, manifest_path, network_root, network_dir, home, sentinel
+    };
+    int drop_privileges;
+    uid_t uid;
+    gid_t gid;
+    int preparation = prepare_unprivileged_restore_fixture(
+        source, home, owned_paths,
+        sizeof(owned_paths) / sizeof(owned_paths[0]),
+        &drop_privileges, &uid, &gid);
+    int previous_dry_run = dry_run;
+    int rc = CHILD_SKIP;
+    if (preparation == 0)
+    {
+        dry_run = 0;
+        rc = run_restore_capturing_with_identity(
+            source, "y\n", output, sizeof(output), drop_privileges,
+            uid, gid);
+    }
+    dry_run = previous_dry_run;
+    restore_test_set_network_command_hook(NULL, NULL);
+    restore_test_set_network_config_dest_dir("NetworkManager", NULL);
+
+    if (preparation == CHILD_SKIP)
+        skip_case("empty network-config unprivileged restore",
+                  "root test requires an unprivileged nobody identity");
+    else if (preparation != 0)
+        skip_case("empty network-config unprivileged restore",
+                  "fixture permissions or ownership could not be prepared");
+    else
+    {
+        check(rc == 0 &&
+                  strstr(output, "This restore needs root") == NULL,
+              "an empty saved network directory does not require root");
+        check(strstr(output, "Network configuration") == NULL &&
+                  file_content_is(sentinel, "untouched"),
+              "an empty saved network directory remains a no-op");
+        check(access(dest_dir, F_OK) != 0,
+              "an empty saved network directory does not create the destination");
+        check(access(reload_marker, F_OK) != 0,
+              "an empty saved network directory does not reload NetworkManager");
+    }
+
+    remove_tree(source);
+    remove_tree(home);
+    remove_tree(dest_parent);
+}
+
+static void test_network_config_restore_unapplied_note(void)
+{
+    printf(BLUE "::" NC " network config: an unavailable destination is informational\n");
+
+    char source[PATH_MAX], home[PATH_MAX], dest_parent[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "network_note_src");
+    fresh_mkdtemp(home, sizeof(home), "network_note_home");
+    fresh_mkdtemp(dest_parent, sizeof(dest_parent), "network_note_dest");
+    setenv("HOME", home, 1);
+    write_network_manifest(source);
+
+    char network_dir[PATH_MAX], saved_file[PATH_MAX];
+    join_path(network_dir, sizeof(network_dir), source, "network/networkmanager");
+    mkdir_p(network_dir);
+    join_path(saved_file, sizeof(saved_file), network_dir, "wifi.nmconnection");
+    write_file_mode(saved_file, "wifi", 0600);
+
+    char blocker[PATH_MAX], dest_dir[PATH_MAX], reload_marker[PATH_MAX];
+    join_path(blocker, sizeof(blocker), dest_parent, "not-a-directory");
+    write_file_mode(blocker, "blocker", 0600);
+    join_path(dest_dir, sizeof(dest_dir), blocker, "system-connections");
+    join_path(reload_marker, sizeof(reload_marker), dest_parent,
+              "reload.marker");
+    restore_test_set_network_config_dest_dir("NetworkManager", dest_dir);
+    restore_test_set_network_command_hook(record_network_command, reload_marker);
+
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    char output[8192];
+    int rc = run_restore_capturing_with_input(source, "y\n", output,
+                                              sizeof(output));
+    dry_run = previous_dry_run;
+    restore_test_set_network_command_hook(NULL, NULL);
+    restore_test_set_network_config_dest_dir("NetworkManager", NULL);
+
+    check(rc == 0,
+          "an unavailable network destination does not mark the overall restore failed");
+    check(strstr(output, "Note: could not write saved network connections") != NULL &&
+              strstr(output, "saved files are still in the backup's network/networkmanager/ directory") != NULL,
+          "the note explains that the saved connections remain in the backup");
+    check(access(reload_marker, F_OK) != 0,
+          "an unapplied network restore does not invoke reload");
+
+    remove_tree(source);
+    remove_tree(home);
+    remove_tree(dest_parent);
+}
+
+static void test_network_config_restore_requires_declared_directory(void)
+{
+    printf(BLUE "::" NC " network config: NETWORK_CONFIG=1 requires network/ to exist\n");
+
+    char source[PATH_MAX], home[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "network_missing_src");
+    fresh_mkdtemp(home, sizeof(home), "network_missing_home");
+    setenv("HOME", home, 1);
+    write_network_manifest(source);
+
+    int previous_dry_run = dry_run;
+    dry_run = 1;
+    char output[8192];
+    int rc = run_restore_capturing(source, output, sizeof(output));
+    dry_run = previous_dry_run;
+
+    check(rc != 0,
+          "a manifest that declares network configuration but lacks network/ fails");
+    check(strstr(output,
+                 "manifest declares network configuration, but network/ is missing") != NULL,
+          "the inconsistent backup is diagnosed explicitly");
+
+    remove_tree(source);
+    remove_tree(home);
+}
+
+static void test_network_config_backends(unsigned int mask, int blocked_index,
+                                         int broken_index, int preview)
+{
+    const int running_as_root = geteuid() == 0;
+    printf(BLUE "::" NC " network config: backend isolation (%u, %d, %d, %d)\n",
+           mask, blocked_index, broken_index, preview);
+    const char *names[] = { "NetworkManager", "netplan", "systemd-networkd",
+                            "wpa_supplicant", "netctl" };
+    const char *subdirs[] = { "networkmanager", "netplan", "systemd-networkd",
+                            "wpa_supplicant", "netctl" };
+    const char *files[] = { "wifi.nmconnection", "01-network.yaml", "10-wired.network",
+                            "wpa_supplicant-wlan0.conf", "home-wifi" };
+    const char *contents[] = { "[connection]\nid=wifi\n", "network: {version: 2}\n",
+                               "[Match]\nName=eth0\n", "network={psk=\"fixture\"}\n",
+                               "Key=fixture\n" };
+    const size_t backend_count = sizeof(names) / sizeof(names[0]);
+    // Fixed per backend; networkd must stay readable by systemd-network.
+    const mode_t modes[] = { 0600, 0600, 0644, 0600, 0600 };
+    const char *hints[] = { NULL, "sudo netplan apply", "sudo networkctl reload",
+                           "sudo systemctl restart wpa_supplicant@<interface>",
+                           "sudo netctl restart <profile>" };
+    char source[PATH_MAX], home[PATH_MAX], target[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "backends_src");
+    fresh_mkdtemp(home, sizeof(home), "backends_home");
+    fresh_mkdtemp(target, sizeof(target), "backends_dest");
+    setenv("HOME", home, 1);
+    write_network_manifest(source);
+    char network[PATH_MAX], dest[sizeof(names) / sizeof(names[0])][PATH_MAX], marker[PATH_MAX];
+    join_path(network, sizeof(network), source, "network");
+    mkdir_p(network);
+    join_path(marker, sizeof(marker), target, "reload.marker");
+    for (size_t i = 0; i < backend_count; i++)
+    {
+        char backend[PATH_MAX], file[PATH_MAX];
+        join_path(backend, sizeof(backend), network, subdirs[i]);
+        join_path(dest[i], sizeof(dest[i]), target, subdirs[i]);
+        restore_test_set_network_config_dest_dir(names[i], dest[i]);
+        if (!(mask & (1u << i)))
+            continue;
+        if ((int)i == broken_index)
+        {
+            write_file_mode(backend, "not a directory", 0600);
+            continue;
+        }
+        mkdir_p(backend);
+        join_path(file, sizeof(file), backend, files[i]);
+        write_file_mode(file, contents[i], 0600);
+        if ((int)i == blocked_index)
+        {
+            mkdir_p(dest[i]);
+            if (chmod(dest[i], 0500) != 0)
+                exit(1);
+        }
+    }
+    restore_test_set_network_command_hook(record_network_command, marker);
+    int previous_dry_run = dry_run;
+    dry_run = preview;
+    char output[16384];
+    int rc = run_restore_capturing_with_input(source, "y\n", output, sizeof(output));
+    dry_run = previous_dry_run;
+    restore_test_set_network_command_hook(NULL, NULL);
+    for (size_t i = 0; i < backend_count; i++)
+        restore_test_set_network_config_dest_dir(names[i], NULL);
+    check((rc != 0) == (mask == 0 || broken_index >= 0),
+          "only missing backends or corrupt sources fail restore");
+    for (size_t i = 0; i < backend_count; i++)
+    {
+        char file[PATH_MAX];
+        join_path(file, sizeof(file), dest[i], files[i]);
+        int expected = (mask & (1u << i)) && !preview &&
+                       ((int)i != blocked_index || running_as_root) &&
+                       (int)i != broken_index;
+        check(expected ? file_matches(file, contents[i], modes[i])
+                       : access(file, F_OK) != 0,
+              "each backend restores only its own saved bytes with its fixed mode");
+    }
+    if ((mask & 1u) && !preview && blocked_index != 0 && broken_index != 0)
+        check(file_content_is(marker, "nmcli\nconnection\nreload\n"),
+              "only NetworkManager invokes the reload hook, exactly once");
+    else
+        check(access(marker, F_OK) != 0, "no automatic reload without live NetworkManager files");
+    for (size_t i = 1; i < backend_count; i++)
+    {
+        int should_hint = !preview && (mask & (1u << i)) && (int)i != broken_index;
+        check((strstr(output, hints[i]) != NULL) == should_hint,
+              "each manual backend emits its own hint only when applicable");
+        if (should_hint)
+            check(strstr(output, "interrupt network connectivity") != NULL,
+                  "manual apply explains the interruption risk");
+        if (should_hint && i >= 3)
+            check(strstr(output, i == 3 ? "replace <interface>" : "replace <profile>") != NULL,
+                  "manual restart identifies the value the user must substitute");
+    }
+    if (blocked_index >= 0)
+    {
+        if (running_as_root)
+            printf("  " YELLOW "-" NC
+                   " unwritable-backend diagnostic skipped: root can write the fixture directory\n");
+        else
+        {
+            char saved_path[128];
+            snprintf(saved_path, sizeof(saved_path), "network/%s/", subdirs[blocked_index]);
+            check(strstr(output, "Note: could not write") != NULL &&
+                  strstr(output, saved_path) != NULL,
+                  "unwritable backend identifies the saved source in an informational note");
+        }
+        if (chmod(dest[blocked_index], 0700) != 0)
+            exit(1);
+    }
+    if (broken_index >= 0)
+    {
+        char diagnostic[128];
+        snprintf(diagnostic, sizeof(diagnostic), "Could not read network/%s/",
+                 subdirs[broken_index]);
+        check(strstr(output, diagnostic) != NULL,
+              "a corrupt backend source is identified while healthy backends succeed");
+        if (mask == (1u << broken_index))
+            check(strstr(output, "none of the known backend directories were present") == NULL,
+                  "a corrupt sole backend is not also reported as entirely missing");
+    }
+    if (mask == 0)
+        check(strstr(output, "none of the known backend directories were present") != NULL &&
+              strstr(output, "network/ is missing") == NULL,
+              "missing backend directories are distinct from a missing network directory");
+    if (preview)
+        check(strstr(output, "sudo netplan apply") == NULL &&
+              strstr(output, "sudo networkctl reload") == NULL,
+              "dry-run emits no live apply instructions");
+    remove_tree(source);
+    remove_tree(home);
+    remove_tree(target);
+}
+
+static void test_network_config_roundtrip(const char *backend_name,
+                                           const char *filename,
+                                           const char *hint)
+{
+    printf(BLUE "::" NC " network config: %s backup-to-restore round trip\n", backend_name);
+    const char *names[] = { "NetworkManager", "netplan", "systemd-networkd",
+                            "wpa_supplicant", "netctl" };
+    char home[PATH_MAX], target[PATH_MAX], restored_home[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "network_roundtrip_home");
+    fresh_mkdtemp(target, sizeof(target), "network_roundtrip_backup");
+    fresh_mkdtemp(restored_home, sizeof(restored_home), "network_roundtrip_restore");
+    char source_dir[PATH_MAX], source_file[PATH_MAX], payload[PATH_MAX], missing[PATH_MAX];
+    join_path(source_dir, sizeof(source_dir), home, "network-source");
+    mkdir_p(source_dir);
+    join_path(source_file, sizeof(source_file), source_dir, filename);
+    write_file_mode(source_file, "fixture network configuration\n", 0600);
+    join_path(payload, sizeof(payload), home, "payload");
+    write_file_mode(payload, "fixture payload\n", 0600);
+    join_path(missing, sizeof(missing), home, "absent-backend");
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+        backup_test_set_network_config_source_dir(
+            names[i], strcmp(names[i], backend_name) == 0 ? source_dir : missing);
+    setenv("HOME", home, 1);
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    char *paths[] = { payload, NULL };
+    int backup_rc = backup(target, BACKUP_EXPLICIT_PATHS, paths, 0, 1);
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+        backup_test_set_network_config_source_dir(names[i], NULL);
+
+    char container[PATH_MAX] = "";
+    DIR *dir = opendir(target);
+    if (dir == NULL)
+        exit(1);
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL)
+        if (strncmp(entry->d_name, "migr-", 5) == 0 &&
+            strstr(entry->d_name, ".partial") == NULL)
+            join_path(container, sizeof(container), target, entry->d_name);
+    if (closedir(dir) != 0)
+        exit(1);
+    check(backup_rc == 0 && container[0] != '\0',
+          "production backup publishes a container for the sole backend");
+    if (backup_rc == 0 && container[0] != '\0')
+    {
+        char dest[PATH_MAX], restored[PATH_MAX], marker[PATH_MAX];
+        join_path(dest, sizeof(dest), restored_home, "network-destination");
+        join_path(restored, sizeof(restored), dest, filename);
+        join_path(marker, sizeof(marker), restored_home, "reload.marker");
+        setenv("HOME", restored_home, 1);
+        for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+            restore_test_set_network_config_dest_dir(names[i], dest);
+        restore_test_set_network_command_hook(record_network_command, marker);
+        char output[16384];
+        int rc = run_restore_capturing_with_input(container, "y\n", output, sizeof(output));
+        restore_test_set_network_command_hook(NULL, NULL);
+        for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+            restore_test_set_network_config_dest_dir(names[i], NULL);
+        check(rc == 0 && file_matches(restored, "fixture network configuration\n", 0600),
+              "restore consumes the actual backup layout and preserves network bytes and mode");
+        check(strstr(output, hint) != NULL &&
+              strstr(output, "interrupt network connectivity") != NULL &&
+              access(marker, F_OK) != 0,
+              "the round trip provides manual apply guidance without invoking automatic reload");
+    }
+    dry_run = previous_dry_run;
+    remove_tree(home);
+    remove_tree(target);
+    remove_tree(restored_home);
+}
+
+int main(void)
+{
+    // A direct sudo run must not aim restores at the invoking user's home
+    // (D38); make and test.sh drop SUDO_UID already.
+    unsetenv("SUDO_UID");
+    // No dispatch test may reach the real dconf of the user running it.
+    restore_test_set_dconf_hook(ignore_dconf_database, NULL);
+    // Network hints must not depend on whether this machine runs NetworkManager.
+    restore_test_set_network_manager_runtime_dir("/nonexistent/migr-test-nm");
+    // Nor on which applications happen to be running on the test machine.
+    writer_apps_test_set_proc_root("/nonexistent/migr-test-proc");
+    printf(BLUE "::" NC " restore dispatch (unit)\n");
+
+    dry_run = 1; // inherited by every fork()ed restore() call below; no confirm_action() prompt is ever reached
+
+    test_dispatch_routes_missing_manifest_to_legacy();
+    test_dispatch_routes_legacy_xdg_manifest_to_legacy();
+    test_dispatch_refuses_unknown_version();
+    test_dispatch_refuses_malformed_v1();
+    test_dispatch_refuses_partial_source();
+    test_dispatch_requires_v1_manifest_for_final_container_name();
+    test_dispatch_refuses_portable_v1();
+    test_running_writer_detection();
+    test_restore_gives_the_backup_users_items_to_the_restorer();
+    test_restore_moves_container_users_to_the_new_ids();
+    test_restore_leaves_out_containers_that_would_not_work();
+    test_native_restore_rewrites_the_source_home();
+    test_open_application_settings_are_deferred();
+    test_native_open_application_settings_are_deferred();
+    test_legacy_open_application_settings_are_deferred();
+    test_restore_keeps_the_todo_next_to_the_backup();
+    test_restore_of_the_login_keyring_says_to_log_out();
+    test_native_restore_applies_dconf();
+    test_verification_failure_still_restores_packages();
+    test_portable_replay_failure_names_entry();
+    test_v1_refuses_missing_declared_payloads();
+
+    test_v1_restores_home_relative_and_xdg_reports_manual_native();
+    test_v1_empty_restore_path_means_home_itself();
+    test_v2_selection_restore_refusals();
+    test_v2_payload_depth_is_bounded();
+    test_v2_home_relative_restore_destination_too_long();
+    test_versioned_restore_freezes_xdg_target_map();
+    test_versioned_restore_rejects_non_directory_payload_paths();
+    test_versioned_restore_refuses_bind_mount_aliases();
+    test_versioned_restore_allows_ascii_case_distinct_names();
+    test_restore_progress_speed_is_cumulative_average();
+    test_live_restore_joins_progress_ticker();
+#ifdef PACKAGES_TEST_HOOKS
+    test_unprivileged_restore_reaches_package_install();
+#endif
+    test_native_identity_graph_keeps_nested_mount_views_route_specific();
+    test_versioned_restore_refuses_differing_mount_id_aliases();
+    test_versioned_restore_refuses_destination_alias_collisions();
+    test_versioned_restore_identity_order_and_cross_root_hardlinks();
+    test_v2_selection_restore_nested_metadata_order();
+    test_v1_restore_space_preflight();
+    test_network_config_privilege_refusal();
+    test_network_config_and_foreign_owner_refusal();
+    backup_test_set_restore_privilege_bypass(1);
+    test_network_config_backends(2, -1, -1, 0);
+    test_network_config_backends(4, -1, -1, 0);
+    test_network_config_backends(7, -1, -1, 0);
+    test_network_config_backends(7, 1, -1, 0);
+    test_network_config_backends(7, -1, 1, 0);
+    test_network_config_backends(7, -1, -1, 1);
+    test_network_config_backends(0, -1, -1, 0);
+    test_network_config_backends(2, -1, 1, 0);
+    test_network_config_backends(8, -1, -1, 0);
+    test_network_config_backends(16, -1, -1, 0);
+    test_network_config_backends(8, -1, 3, 0);
+    test_network_config_backends(16, -1, 4, 0);
+    test_network_config_backends(31, -1, -1, 0);
+    test_network_config_backends(31, -1, -1, 1);
+    test_network_config_backends(31, 3, -1, 0);
+    test_network_config_backends(31, 4, -1, 0);
+    test_network_config_roundtrip("wpa_supplicant", "wpa_supplicant-wlan0.conf",
+                                  "sudo systemctl restart wpa_supplicant@<interface>");
+    test_network_config_roundtrip("netctl", "home-wifi", "sudo netctl restart <profile>");
+    test_network_config_restore_success();
+#ifdef PACKAGES_TEST_HOOKS
+    test_restore_waits_for_a_network_before_packages();
+#endif
+    test_restore_relabels_the_restored_roots();
+    test_network_config_restore_backend_modes();
+    test_network_config_restore_dry_run();
+    test_network_config_reload_failure_is_best_effort();
+    test_network_config_restore_continues_after_file_error();
+    backup_test_set_restore_privilege_bypass(0);
+    test_network_config_restore_empty();
+    backup_test_set_restore_privilege_bypass(1);
+    test_network_config_restore_unapplied_note();
+    backup_test_set_restore_privilege_bypass(0);
+    test_network_config_restore_requires_declared_directory();
+
+    if (failures > 0)
+    {
+        printf(RED "%d restore dispatch test(s) failed" NC "\n", failures);
+        return 1;
+    }
+    return 0;
+}

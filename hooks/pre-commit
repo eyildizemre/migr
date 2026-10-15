@@ -4,21 +4,24 @@
 # Halt immediately on any error, including those hidden within pipelines
 set -eo pipefail
 
-# Is this a C/shell/Makefile change? If not, skip the build and tests to save time
-if ! git diff --cached --name-only | grep -qE '\.(c|h|sh)$|(^|/)Makefile$'; then
-    echo "→ No C/shell/Makefile changes staged, skipping build & tests."
+# Does anything staged affect the build or the suite? If not, skip both to save
+# time. tests/stubs/* is matched by path rather than extension on purpose: those
+# files shadow real command names on PATH, so they cannot carry one.
+if ! git diff --cached --name-only | grep -qE '\.(c|h|sh)$|(^|/)Makefile$|^tests/stubs/'; then
+    echo "→ Nothing staged that the build or tests depend on, skipping both."
     exit 0
 fi
 
-echo "▶ Running pre-commit checks..."
+# Every gate runs on exactly what is staged, in a copy: unstaged edits can
+# neither hide a failure nor cause one, and the working tree's build stays.
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+git checkout-index --all --prefix="$work/"
 
-if ! make > /tmp/migr-build.log 2>&1; then
-    echo "× Build failed. See /tmp/migr-build.log for details."
-    exit 1
-fi
+echo "▶ Running every gate on the staged tree (this takes several minutes)..."
 
-if ! make test > /tmp/migr-test.log 2>&1; then
-    echo "× Tests failed. See /tmp/migr-test.log for details."
+if ! make -C "$work" check > /tmp/migr-check.log 2>&1; then
+    echo "× A gate failed. See /tmp/migr-check.log for details."
     exit 1
 fi
 

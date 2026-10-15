@@ -53,6 +53,41 @@ distro_t detect_distro(void)
     return detect_distro_from("/etc/os-release");
 }
 
+int detect_system_name_from(const char *os_release_path, char *out,
+                            size_t out_size)
+{
+    FILE *fp = fopen(os_release_path, "r");
+    if (fp == NULL)
+        return -1;
+
+    int found = 0;
+    char line[256];
+    while (!found && fgets(line, sizeof(line), fp))
+    {
+        if (strncmp(line, "PRETTY_NAME=", 12) != 0)
+            continue;
+        char *value = line + 12;
+        value[strcspn(value, "\n")] = '\0';
+        size_t length = strlen(value);
+        if (length >= 2 && (value[0] == '"' || value[0] == '\'') &&
+            value[length - 1] == value[0])
+        {
+            value[length - 1] = '\0';
+            value++;
+        }
+        found = value[0] != '\0' &&
+                snprintf(out, out_size, "%s", value) >= 0;
+    }
+
+    fclose(fp);
+    return found ? 0 : -1;
+}
+
+int detect_system_name(char *out, size_t out_size)
+{
+    return detect_system_name_from("/etc/os-release", out, out_size);
+}
+
 char *const *get_package_cmd(distro_t distro)
 {
     // Each command lists only explicitly-installed packages, one plain name per line.

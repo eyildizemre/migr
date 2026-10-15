@@ -1,24 +1,518 @@
 #ifndef FILEOPS_H
 #define FILEOPS_H
 
+#include <limits.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <time.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 
+#include "metadata.h"
+#include "utils.h"
+
 /**
- * @brief Recursively clones a file or directory from src to dest.
+ * @brief How a clone is oriented and represented.
  *
- * Handles regular files, directories, symlinks, and FIFOs. Unix sockets and
- * device nodes are skipped with a warning — a socket is a runtime endpoint and
- * a device node needs root to recreate, so neither can be copied meaningfully.
- * Preserves permissions, access time, and modification time via
- * chmod and utimensat. Regular files are skipped if dest already exists with
- * a matching size and modification timestamp, enabling interrupted backups
- * to resume without re-copying.
+ * `operation` is the direction the tree flows — a backup captures the source, a restore
+ * writes it back. `representation` is whether metadata a destination cannot hold natively
+ * is instead carried in a sidecar. The native capture/restore entry points
+ * implement CLONE_NATIVE_TREE; CLONE_PORTABLE_SIDECAR is served by portable.c.
+ */
+typedef enum { CLONE_BACKUP, CLONE_RESTORE } CloneOperation;
+typedef enum { CLONE_NATIVE_TREE, CLONE_PORTABLE_SIDECAR } CloneRepresentation;
+
+struct SelectionRoot;
+struct RecopyList;
+
+typedef struct CloneContext {
+    CloneOperation operation;
+    CloneRepresentation representation;
+    int timestamp_policy_configured;
+    int nsec_exact;
+    int metadata_preflight_done;
+    void *inode_map; /* NativeInodeMap; backup/restore tracking; NULL disables it. */
+    void *visited; /* Native visited-path set, backup-only; NULL disables tracking. */
+    const struct SelectionRoot *selection; /* Borrowed, native backup-only. */
+    /* Backup only: files to copy again although their source is unchanged
+     * (docs/DECISIONS.md D107). Borrowed; NULL for none. */
+    const struct RecopyList *recopy;
+    /* Restore only: payload paths, named as restore_native_at_report() names
+     * them (source_rel and the names below it), whose subtrees the apply pass
+     * leaves out so the caller can restore them last (D69). Borrowed. */
+    const char *const *skipped_paths;
+    size_t skipped_count;
+    /* Restore only: payload paths, named the same way, whose subtrees the
+     * apply pass leaves out altogether: podman container state that would
+     * not work on this system (D94). Borrowed. */
+    const char *const *left_out_paths;
+    size_t left_out_count;
+    OwnerMap owner_map; /* Restore only: who gets the backup user's items. */
+} CloneContext;
+
+/* Opaque native hardlink map ownership. */
+void *native_inode_map_create(void);
+void native_inode_map_free(void *map);
+
+/**
+ * @brief Seeds native hardlink representatives from existing destination state.
  *
- * @param src  Path to the source file, directory, or symlink.
- * @param dest Destination path to create.
+ * The source and destination trees are inspected without mutation. Existing
+ * regular payloads whose size and mtime prove completed work seed the map by
+ * source inode, so a resumed capture or restore may visit the sibling before
+ * the old representative without changing the selected destination inode.
+ * destination_rel may be a safe relative path or "" for the destination root.
+ * failed, which may be NULL, receives the first item that could not be
+ * inspected.
+ */
+int native_inode_map_seed_existing(const CloneContext *ctx,
+                                   const char *source_path,
+                                   int destination_root_fd,
+                                   const char *destination_rel,
+                                   FailedItem *failed);
+int native_hardlink_identity_matches(const struct stat *linked,
+                                     const struct stat *reference);
+
+/* Opaque native-capture visited-path set ownership (docs/DECISIONS.md D23). */
+void *native_visited_create(void);
+void native_visited_free(void *visited);
+int native_visited_contains(const void *visited, const char *root_key,
+                            const char *rel_path);
+
+#ifdef NATIVE_VISITED_TEST_HOOKS
+uint64_t native_visited_test_probe_count(void);
+void native_visited_test_reset_probe_count(void);
+uint64_t native_inode_map_test_probe_count(void);
+void native_inode_map_test_reset_probe_count(void);
+size_t native_inode_map_test_dir_fd_count(const void *map);
+#endif
+
+/* The first entry that could not be removed: its path below the root, what
+ * was being done (a fixed phrase), and errno, 0 when the phrase says why. */
+typedef struct {
+    char failed_relative_path[PATH_MAX];
+    const char *failed_operation;
+    int failure_errno;
+} NativeReconcileReport;
+
+void native_reconcile_report_init(NativeReconcileReport *report);
+
+typedef enum {
+    NATIVE_RECONCILE_ERROR = -1,
+    NATIVE_RECONCILE_OK = 0
+} NativeReconcileStatus;
+
+/**
+ * @brief Removes rel_path below root_fd and everything under it, following
+ * no symlink on the way. A path that is already gone is not an error. Meant
+ * for trees migr owns, such as a payload root left out of an updated backup
+ * (docs/DECISIONS.md D72).
+ *
  * @return 0 on success, -1 on error.
  */
-int clone_recursive(const char *src, const char *dest);
+int fileops_remove_tree_at(int root_fd, const char *rel_path);
+
+/**
+ * @brief Creates the folders above rel_path's last component beneath
+ * root_fd, keeping those that exist and following no symlink on the way.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int fileops_make_parents_at(int root_fd, const char *rel_path);
+
+/**
+ * @brief Creates leaf beneath parent_fd as a folder a restore needs on the
+ * way to a root, with mode 0700 and the owner and group of parent_fd. A
+ * leaf that exists is kept as it is.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int fileops_make_intermediate_dir_at(int parent_fd, const char *leaf);
+
+/**
+ * @brief Removes destination entries absent from a completed native capture.
+ *
+ * The caller must invoke this only after every root in the capture walk has
+ * completed successfully. The destination is traversed beneath data_fd with
+ * no-follow fd operations; a root object recorded by the capture is never a
+ * reconciliation target. A root deliberately skipped as an unsupported
+ * special file is unvisited and is therefore stale (docs/DECISIONS.md D23).
+ */
+NativeReconcileStatus native_reconcile_stale_at(
+    const void *visited, const char *root_key, int data_fd,
+    NativeReconcileReport *report);
+
+typedef struct MetadataProfiles MetadataProfiles;
+
+/**
+ * @brief Native restore byte estimate accumulated during metadata inventory.
+ *
+ * The estimate counts regular-file content once per source inode across all
+ * restore roots, source directory sizes, and symlink target bytes. A failed
+ * accounting operation is recorded in had_error so the caller can keep D27's
+ * fail-open behaviour for an unmeasurable estimate. items counts the entries
+ * checked so far; on_item, when set, is called after each one.
+ */
+typedef struct {
+    off_t estimated_bytes;
+    int had_error;
+    void *seen_inodes;
+    size_t items;
+    void (*on_item)(size_t items, void *context);
+    void *on_item_context;
+} NativeRestoreEstimate;
+
+void native_restore_estimate_init(NativeRestoreEstimate *estimate);
+void native_restore_estimate_free(NativeRestoreEstimate *estimate);
+
+/**
+ * @brief Result of a native backup capture.
+ *
+ * BACKUP_CAPTURE_SOURCE_SAFE_READ is distinct from an ordinary I/O failure: the
+ * source could not be opened with O_NOATIME and was not retried without it
+ * (docs/DECISIONS.md D17).
+ */
+typedef enum {
+    BACKUP_CAPTURE_ERROR = -1,
+    BACKUP_CAPTURE_OK = 0,
+    BACKUP_CAPTURE_SOURCE_SAFE_READ = -2,
+    /* Internal to native capture: the source vanished or changed kind and
+     * was left out (D63). Never returned to a caller. */
+    BACKUP_CAPTURE_SKIPPED = 1
+} BackupCaptureStatus;
+
+typedef void (*BackupProgressCallback)(off_t bytes_copied,
+                                       off_t bytes_unchanged,
+                                       const char *current_path,
+                                       void *userdata);
+
+/* First portable-capture failure retained for the caller. Source-change
+ * failures are semantic D17/D21 refusals and therefore carry no errno;
+ * operational failures preserve the syscall error that caused the stop. */
+typedef enum {
+    BACKUP_CAPTURE_FAILURE_NONE = 0,
+    BACKUP_CAPTURE_FAILURE_OPERATIONAL,
+    BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED,
+    BACKUP_CAPTURE_FAILURE_INTERNAL
+} BackupCaptureFailureKind;
+
+/* A source that changed under a running backup (docs/DECISIONS.md D63). The
+ * backup still completes; these are counted and summarized, and make it exit
+ * with a warning status. */
+typedef enum {
+    /* Still changing after every reread; kept as last read. */
+    BACKUP_SOURCE_CHANGED = 0,
+    /* Removed after the pre-scan, before it could be read. */
+    BACKUP_SOURCE_VANISHED,
+    /* Created after the pre-scan; not in this backup. */
+    BACKUP_SOURCE_APPEARED,
+    BACKUP_SOURCE_CHANGE_KINDS
+} BackupSourceChangeKind;
+
+/**
+ * @brief State shared by one native capture or restore across its roots.
+ *
+ * bytes_copied and the progress fields describe successful regular-file
+ * content bytes only. Hardlinked siblings add no new bytes because they are
+ * linked to an existing representative, matching the source-size accounting
+ * used by backup_plan_estimate_size().
+ * bytes_unchanged counts the regular-file bytes an update or resume found
+ * already in the backup and did not copy.
+ * bytes_since_sync accumulates the same content bytes until the configured
+ * periodic-sync interval is reached; an interval of zero disables syncing.
+ * items counts what a run backed up or restored: every file, folder, link,
+ * and FIFO.
+ * The failure fields keep the first item that failed: its path, the kind,
+ * errno (0 when failed_operation says why), and, for native capture, what was
+ * being done. A native source-safe-read refusal sets only
+ * failed_source_path.
+ */
+typedef struct {
+    char failed_source_path[PATH_MAX];
+    BackupCaptureFailureKind failure_kind;
+    int failure_errno;
+    const char *failed_operation;
+    off_t bytes_copied;
+    off_t bytes_unchanged;
+    size_t items;
+    char current_path[PATH_MAX];
+    off_t bytes_since_sync;
+    off_t sync_interval_bytes;
+    BackupProgressCallback progress_cb;
+    void *progress_userdata;
+    struct timespec progress_last_fired;
+    int progress_unthrottled;
+    /* Portable capture: confirmed live-state paths (D55) that changed,
+     * appeared, or disappeared during capture and were tolerated. */
+    size_t live_state_changes;
+    /* Every other source change, by kind (D63). */
+    ExampleList source_changes[BACKUP_SOURCE_CHANGE_KINDS];
+} BackupCaptureReport;
+
+void backup_capture_report_init(BackupCaptureReport *report);
+/* Records one source change; location is shown as given. */
+void backup_capture_report_note_change(BackupCaptureReport *report,
+                                       BackupSourceChangeKind kind,
+                                       const char *location);
+/* A file read again starts its count over: removes the bytes of the read
+ * before from bytes_copied (they stay in the sync accounting, since they were
+ * written). */
+void backup_capture_report_reread(BackupCaptureReport *report, off_t bytes);
+/* Nonzero when any source change other than live state was recorded. */
+int backup_capture_report_has_changes(const BackupCaptureReport *report);
+
+/* A file still changing after this many reads is kept as last read (D63). */
+#define BACKUP_CAPTURE_READ_ATTEMPTS 3U
+/* Waits a little longer before each reread of a changing file. */
+void backup_capture_reread_pause(unsigned int attempt);
+int backup_capture_report_tick(BackupCaptureReport *report,
+                               off_t chunk_size, int destination_fd);
+/* A file the backup already holds as it is now: counts its bytes as
+ * unchanged and shows path as the current one. */
+void backup_capture_report_unchanged(BackupCaptureReport *report,
+                                     off_t bytes, const char *path);
+
+#ifdef BACKUP_TEST_HOOKS
+typedef void (*BackupTestCaptureHook)(const char *source_path,
+                                      void *context);
+
+void backup_test_set_capture_hook(BackupTestCaptureHook hook, void *context);
+/* Runs after every native read of a regular source's content; a hook that
+ * writes the source makes that read a changed one. */
+void backup_test_set_after_copy_hook(BackupTestCaptureHook hook,
+                                     void *context);
+/* Makes the next native capture source open fail with error. */
+void backup_test_fail_next_source_open(int error);
+#endif
+
+/**
+ * @brief Captures a source tree into an open destination directory.
+ *
+ * Regular files, directories, symlinks and FIFOs are reproduced; Unix sockets and
+ * device nodes are skipped with a warning; permissions and access/modification times
+ * are preserved.
+ *
+ * The source is addressed by pathname, exactly as the caller named it. The
+ * destination never is: destination_root_fd is a directory fd the caller opens once
+ * and continues to own, and every step below it uses openat/mkdirat/fstatat with
+ * O_NOFOLLOW. No intermediate or final symlink inside the destination is ever
+ * followed, so payload cannot be redirected outside the container it belongs to
+ * (docs/DECISIONS.md D15) -- including when writing into a container a previous,
+ * interrupted run already populated.
+ *
+ * Resuming is address-by-address, and only where the existing object proves the work
+ * was already done: a regular file whose size and mtime match is skipped, a symlink
+ * with the identical target is accepted, and an existing directory or FIFO is
+ * accepted when it is genuinely that type. Everything at an address came from the
+ * same source path (docs/DECISIONS.md D72), so a symlink with another target or an
+ * object of another type is an older copy: it is removed, never written through,
+ * and captured again.
+ *
+ * The context is validated, not merely carried: a NULL ctx, a mismatched operation, or
+ * an unsupported representation is refused rather than run, so a dispatch mistake
+ * fails closed instead of writing a native tree to a destination that needed a
+ * sidecar.
+ *
+ * @param ctx                 Clone orientation and representation; must not be NULL.
+ * @param source_path         Path to the source file, directory, or symlink.
+ * @param destination_root_fd Open directory fd anchoring destination_path; never closed here.
+ * @param destination_path    Where to create it beneath that fd: one path component, or
+ *                            several when the payload sits in a folder of data/
+ *                            (docs/DECISIONS.md D82), which is created as needed. An
+ *                            empty component, ".", or ".." is refused.
+ * @return BACKUP_CAPTURE_OK on success, BACKUP_CAPTURE_ERROR on an ordinary
+ *         failure, or BACKUP_CAPTURE_SOURCE_SAFE_READ when O_NOATIME access
+ *         was refused.
+ */
+BackupCaptureStatus backup_capture_at_report(
+    const CloneContext *ctx, const char *source_path,
+    int destination_root_fd, const char *destination_path,
+    BackupCaptureReport *report);
+
+/**
+ * @brief Captures one root while preserving an already initialized report.
+ *
+ * This is used when one backup walks several roots and needs the byte counter
+ * and throttle state to remain continuous. The caller owns initialization.
+ */
+BackupCaptureStatus backup_capture_at_report_continue(
+    const CloneContext *ctx, const char *source_path,
+    int destination_root_fd, const char *destination_path,
+    BackupCaptureReport *report);
+
+/**
+ * @brief Captures a source object without requiring a refusal report.
+ */
+BackupCaptureStatus backup_capture_at(const CloneContext *ctx,
+                                       const char *source_path,
+                                       int destination_root_fd,
+                                       const char *destination_leaf);
+
+/**
+ * @brief Result of checking a restore source beneath a directory fd.
+ */
+typedef enum {
+    RESTORE_SOURCE_ERROR = -1,
+    RESTORE_SOURCE_MISSING = 0,
+    RESTORE_SOURCE_PRESENT = 1
+} RestoreSourceStatus;
+
+typedef enum {
+    RESTORE_NATIVE_ERROR = -1,
+    RESTORE_NATIVE_OK = 0,
+    RESTORE_NATIVE_SOURCE_SAFE_READ = -2
+} RestoreNativeStatus;
+
+typedef struct {
+    /* Items restored, or in a preflight, items it would restore. */
+    size_t applied_count;
+    size_t failed_count;
+    size_t skipped_security_xattr_count;
+    /* The first item that failed, below the restore root: what was being
+     * done (a fixed phrase) and errno, 0 when the phrase says why. */
+    char failed_logical_path[PATH_MAX];
+    const char *failed_operation;
+    int failure_errno;
+} RestoreNativeReport;
+
+/**
+ * @brief Checks whether a source object exists without following symlinks.
+ *
+ * Intermediate components are resolved beneath source_root_fd with O_NOFOLLOW.
+ * A dangling symlink at the final component is therefore PRESENT, while a
+ * missing component is MISSING. Unsafe relative addresses and operational
+ * failures are ERROR.
+ */
+RestoreSourceStatus restore_native_source_status_at(int source_root_fd,
+                                                     const char *source_rel);
+
+/**
+ * @brief Validates an FD-anchored native restore without mutating the destination.
+ *
+ * Uses the same recursive walker and safety rules as restore_native_at(). It
+ * checks lexical paths, source traversal, destination traversal and existing
+ * destination object types, but does not promise that later writes cannot fail
+ * for operational reasons such as permissions or free space. A source regular
+ * file or directory that cannot be opened with O_NOATIME returns
+ * RESTORE_NATIVE_SOURCE_SAFE_READ; no O_NOATIME-less read is attempted.
+ * report, which may be NULL, receives the first item that failed.
+ */
+RestoreNativeStatus restore_native_preflight_at(
+    const CloneContext *ctx, int source_root_fd, const char *source_rel,
+    int destination_root_fd, const char *destination_rel,
+    RestoreNativeReport *report);
+
+/**
+ * @brief Collects native-restore metadata profiles without probing or mutating.
+ *
+ * This is the read-only half of the restore ownership preflight. It is useful
+ * to aggregate all roots before confirmation, so a single later probe can
+ * reject the invocation before any destination payload is changed. It returns
+ * RESTORE_NATIVE_SOURCE_SAFE_READ when source inspection would require an
+ * atime-changing fallback. Symlink target strings are deliberately not read
+ * by this inventory walk: on Linux, readlinkat() itself perturbs a symlink's
+ * atime (docs/DECISIONS.md D17 as-built), while the later restore pass still
+ * performs ordinary target validation before applying the saved metadata.
+ * report, which may be NULL, receives the first item that failed.
+ */
+RestoreNativeStatus restore_native_metadata_inventory_at(
+    const CloneContext *ctx, int source_root_fd, const char *source_rel,
+    int destination_root_fd, const char *destination_rel,
+    MetadataProfiles *profiles, NativeRestoreEstimate *estimate,
+    RestoreNativeReport *report);
+
+/**
+ * @brief FD-anchored native restore core (docs/DECISIONS.md D15 and D16).
+ *
+ * source_root_fd and destination_root_fd are directory fds the caller opens
+ * exactly once (its own trust boundary), and source_rel/destination_rel are
+ * relative addresses resolved underneath them component-by-component -- never
+ * by string concatenation. Both the backup payload and the destination are
+ * treated as untrusted: neither an intermediate symlink nor a symlink at the
+ * final address is followed or silently replaced.
+ *
+ * source_rel must name an existing entry (no intermediate component is ever
+ * created reading the source). destination_rel's intermediate components are
+ * created as plain directories if missing; an existing intermediate that is
+ * not a genuine, non-symlink directory is refused, not silently accepted.
+ *
+ * An empty string ("") is a valid relative address on either side, meaning
+ * "the root object itself" (docs/DECISIONS.md D16: an empty HOME_RELATIVE
+ * restore_path legitimately addresses $HOME itself) -- this is the one case
+ * with zero path components, distinct from a rejected empty *interior*
+ * component. Anything else that is lexically invalid (a leading '/', any
+ * ".." component, an empty interior/trailing component, or a bare ".")  is
+ * refused before any mutation is attempted; nothing is normalized into some
+ * other address.
+ *
+ * This function never closes source_root_fd or destination_root_fd; the
+ * caller owns them for as long as it needs them (e.g. across several calls
+ * restoring several top-level items from the same backup into the same
+ * destination). Every fd this function itself opens while recursing is
+ * closed before returning.
+ *
+ * Before mutating the destination, this function runs the same recursive
+ * checks exposed by restore_native_preflight_at().
+ *
+ * When ctx->inode_map is supplied, regular payload paths that share a source
+ * inode are restored as one destination inode: the first successfully applied
+ * member becomes the representative and later members are recreated with
+ * linkat(). Validation never mutates that map. A NULL map deliberately keeps
+ * the low-level core's tracking disabled; the real native restore() supplies
+ * one for the complete apply walk.
+ *
+ * @param ctx                Clone orientation; must be CLONE_RESTORE +
+ *                            CLONE_NATIVE_TREE.
+ * @param source_root_fd      Open directory fd anchoring source_rel.
+ * @param source_rel          Relative address of the source object, or "".
+ * @param destination_root_fd Open directory fd anchoring destination_rel.
+ * @param destination_rel     Relative address of the destination object, or "".
+ * @param report            Optional per-call replay result; it is reset before
+ *                          use and records applied/failed entries.
+ * @param capture_report    Optional caller-owned byte/progress/sync state. The
+ *                          caller must initialize it with
+ *                          backup_capture_report_init() before the first call;
+ *                          it is not reset here, so one instance can span
+ *                          several sequential restore calls.
+ * @return RESTORE_NATIVE_OK on success, RESTORE_NATIVE_ERROR on an ordinary
+ *         failure, or RESTORE_NATIVE_SOURCE_SAFE_READ when a source open that
+ *         requires O_NOATIME is refused. No O_NOATIME-less retry is attempted.
+ */
+RestoreNativeStatus restore_native_at_report(
+    const CloneContext *ctx, int source_root_fd, const char *source_rel,
+    int destination_root_fd, const char *destination_rel,
+    RestoreNativeReport *report, BackupCaptureReport *capture_report);
+
+RestoreNativeStatus restore_native_at(
+    const CloneContext *ctx, int source_root_fd, const char *source_rel,
+    int destination_root_fd, const char *destination_rel);
+
+#ifdef FILEOPS_TEST_HOOKS
+typedef enum {
+    RESTORE_TEST_SOURCE_READ_NONE = 0,
+    RESTORE_TEST_SOURCE_READ_VALIDATE = 1,
+    RESTORE_TEST_SOURCE_READ_APPLY = 2
+} RestoreNativeTestSourceReadMode;
+
+typedef void (*RestoreNativeTestApplyHook)(const char *logical_path,
+                                           void *context);
+
+void restore_native_test_set_apply_hook(RestoreNativeTestApplyHook hook,
+                                        void *context);
+
+void restore_native_test_set_source_read_mode(
+    RestoreNativeTestSourceReadMode mode);
+
+void restore_native_test_fail_source_read_after(size_t successful_opens);
+
+char **fileops_test_build_identity_environment(char *const *base,
+                                               const char *home,
+                                               char **home_entry_out);
+char **fileops_test_build_command_environment(char *const *base,
+                                              const char *home,
+                                              const char *const *overrides,
+                                              char **home_entry_out);
+#endif
 
 /**
  * @brief Accumulates the total byte size of a file tree into *size.
@@ -38,8 +532,9 @@ int get_dir_size(const char *path, off_t *size);
  * @brief Executes a command via fork/execvp without invoking a shell.
  *
  * Forks a child process, executes argv[0] with the given argument vector,
- * and blocks until the child exits. Uses _exit in the child to avoid
- * flushing shared stdio buffers.
+ * and blocks until the child exits. stdout is flushed first, so the
+ * command's output follows what migr printed. A program that cannot be run
+ * exits the child with status 1 without printing anything.
  *
  * @param argv NULL-terminated argument vector; argv[0] is the program to run.
  * @return The child's exit status on success, -1 if fork or waitpid fails.
@@ -47,17 +542,77 @@ int get_dir_size(const char *path, off_t *size);
 int run_command(char *const argv[]);
 
 /**
+ * @brief run_command() with the command's standard output discarded and its
+ *        standard error kept: the last errors_size - 1 bytes of it, always
+ *        NUL-terminated, for the caller to show when the command fails.
+ *
+ * @return The child's exit status, or -1 if the arguments are invalid or
+ *         pipe, fork, or waitpid fails.
+ */
+int run_command_errors(char *const argv[], char *errors, size_t errors_size);
+
+/**
  * @brief Executes a command and captures its stdout into a caller-supplied buffer.
  *
  * Uses fork/execvp with an anonymous pipe redirecting the child's stdout.
  * The output buffer is always null-terminated. Output is silently truncated
  * if it exceeds output_size - 1 bytes.
+ * output must be non-NULL and output_size must be at least 1 (room for
+ * the null terminator even with zero bytes of captured output); both are
+ * rejected with -1 before anything is spawned. Child-side redirection or
+ * exec failures terminate the child with status 1 without printing.
  *
  * @param argv        NULL-terminated argument vector; argv[0] is the program to run.
- * @param output      Buffer to receive the captured stdout.
- * @param output_size Total size of the output buffer in bytes.
- * @return The child's exit status on success, -1 if pipe, fork, or waitpid fails.
+ * @param output      Buffer to receive the captured stdout; must be non-NULL.
+ * @param output_size Total size of the output buffer in bytes; must be at least 1.
+ * @return The child's exit status on success, -1 if the arguments are invalid
+ *         or pipe, fork, or waitpid fails.
  */
 int run_command_capture(char *const argv[], char *output, size_t output_size);
+
+/**
+ * @brief Captures a command after dropping the child to the supplied identity.
+ *
+ * The child clears supplementary groups, sets its primary gid, then sets its
+ * uid before exec. Any failed drop step exits without executing argv[0]. The
+ * child's environment carries HOME=home and omits the XDG base-directory
+ * overrides inherited from the elevated caller, so per-user paths resolve
+ * under the target user rather than root. Returns -1 before forking when
+ * home is NULL or not absolute. This variant is used for the best-effort
+ * VS Code extension snapshot.
+ */
+int run_command_capture_as_identity(char *const argv[], char *output,
+                                    size_t output_size, uid_t uid, gid_t gid,
+                                    const char *home);
+
+/** @brief Options for run_command_capture_with(); zero-initialize. */
+typedef struct {
+    /** Nonzero: drop the child to uid/gid with HOME=home, exactly like
+     *  run_command_capture_as_identity(). home is then required. */
+    int drop_identity;
+    uid_t uid;
+    gid_t gid;
+    const char *home;
+    /** NULL-terminated "NAME=value" entries set in the child's environment,
+     *  replacing inherited entries of the same name; may be NULL. */
+    const char *const *env;
+    /** Bytes written to the child's stdin, which is then closed. When NULL
+     *  the child inherits migr's stdin. */
+    const void *stdin_data;
+    size_t stdin_length;
+} RunCommandOptions;
+
+/**
+ * @brief run_command_capture() with an optional identity drop, environment
+ *        overrides, and stdin data.
+ *
+ * Stdin is written while stdout is captured, so a large input cannot deadlock
+ * against the child's output, and a child that exits without reading its
+ * stdin cannot kill migr with SIGPIPE. Returns -1 before forking for invalid
+ * options (a drop without home, a malformed env entry).
+ */
+int run_command_capture_with(char *const argv[], char *output,
+                             size_t output_size,
+                             const RunCommandOptions *options);
 
 #endif

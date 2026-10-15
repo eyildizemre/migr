@@ -1,0 +1,216 @@
+#define _GNU_SOURCE
+
+#include "portable_restore_replay_internal.h"
+#include "portable_restore.h"
+#include "backup.h"
+#include "restore.h"
+#include "fsprobe.h"
+#include "metadata.h"
+#include "utils.h"
+
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+
+// The preflight's roots follow the manifest's, index for index.
+static void portable_restore_preview(
+    const PortableRestorePreflightReport *report, const Manifest *manifest)
+{
+    for (size_t index = 0; index < report->root_count; index++)
+    {
+        size_t count = report->roots[index].live_count;
+        if (count != 0)
+            printf("  Would restore: %s (%zu item%s)\n",
+                   manifest_root_label(&manifest->roots[index]), count,
+                   count == 1 ? "" : "s");
+    }
+}
+
+static void portable_restore_print_preserved_local_state(size_t count,
+                                                         size_t live_kept)
+{
+    if (count != 0)
+        printf("Portable restore left %zu locally authoritative file%s "
+               "untouched\n",
+               count, count == 1 ? "" : "s");
+    if (live_kept != 0)
+        printf("Portable restore left %zu file%s that running desktop "
+               "services had already written in place\n",
+               live_kept, live_kept == 1 ? "" : "s");
+}
+
+static PortableRestoreOutcome portable_restore_orchestrate_impl(
+    const PortableRestoreRequest *request,
+    PortableRestoreReplayReport *report,
+    int measure_policy)
+{
+    portable_restore_replay_report_init(report);
+    if (request == NULL || report == NULL || request->source_container_fd < 0 ||
+        request->destination_home_fd < 0 || request->manifest == NULL)
+    {
+        errno = EINVAL;
+        return PORTABLE_RESTORE_ERROR;
+    }
+
+    PortableRestoreRequest replay_request = *request;
+    MetadataTimestampPolicy policy;
+    if (!measure_policy && replay_timestamp_policy(request, &policy) != 0)
+        return PORTABLE_RESTORE_ERROR;
+    PortableRestorePreflightReport preflight;
+    portable_restore_preflight_report_init(&preflight);
+    int result = portable_restore_preflight_at(request, &preflight);
+    if (result != 0)
+    {
+        portable_restore_preflight_report_free(&preflight);
+        return PORTABLE_RESTORE_ERROR;
+    }
+
+    // Runs before consent and before any destination mutation. A dry run
+    // only reads, so it previews and notes that the real restore needs root
+    // instead of refusing. The portable preflight already computed
+    // foreign_owner_count; the network check is a separate read-only scan of
+    // the manifest-declared container-root network directories.
+    int network_config_needs_privilege =
+        !dry_run && request->manifest->has_network_config &&
+        restore_network_config_would_write(request->source_container_fd);
+    if (dry_run)
+        restore_privilege_dry_run_note();
+    else if (restore_privilege_preflight(
+                 preflight.profiles.foreign_owner_count,
+                 network_config_needs_privilege) != 0)
+    {
+        report->live_count = preflight.live_count;
+        portable_restore_preflight_report_free(&preflight);
+        return PORTABLE_RESTORE_ERROR;
+    }
+
+    const char *destination_home = request->destination_home_path != NULL
+        ? request->destination_home_path : "destination home";
+    if (restore_space_preflight(request->destination_home_fd, destination_home,
+                                preflight.estimated_bytes,
+                                preflight.estimated_bytes < 0) != 0)
+    {
+        report->live_count = preflight.live_count;
+        portable_restore_preflight_report_free(&preflight);
+        return PORTABLE_RESTORE_ERROR;
+    }
+
+    if (dry_run)
+    {
+        report->live_count = preflight.live_count;
+        portable_restore_preview(&preflight, request->manifest);
+        portable_restore_preflight_report_free(&preflight);
+        return PORTABLE_RESTORE_DRY_RUN;
+    }
+
+    metadata_profiles_report(&preflight.profiles);
+    int confirmed = request->confirm != NULL
+        ? request->confirm(request->confirm_context)
+        : confirm_action(
+              "This will restore files to your home directory. Continue?");
+    if (!confirmed)
+    {
+        portable_restore_preflight_report_free(&preflight);
+        return PORTABLE_RESTORE_CANCELLED;
+    }
+
+    if (measure_policy)
+    {
+        int nsec_exact = 0;
+        if (fsprobe_timestamps_fd(request->destination_home_fd,
+                                  &nsec_exact) != 0)
+        {
+            report->live_count = preflight.live_count;
+            fflush(stdout);
+            print_error("Error: could not measure how precisely the "
+                        "destination keeps file times: %s\n",
+                        strerror(errno));
+            print_error("  No destination was changed.\n");
+            portable_restore_preflight_report_free(&preflight);
+            return PORTABLE_RESTORE_ERROR;
+        }
+        policy = (MetadataTimestampPolicy){
+            .nsec_exact = nsec_exact,
+            .configured = 1
+        };
+        replay_request.destination_timestamp_policy = policy;
+    }
+
+    MetadataProbeFailure probe_failure;
+    if (metadata_profiles_probe(&preflight.profiles, policy,
+                                &probe_failure) != 0)
+    {
+        report->live_count = preflight.live_count;
+        fflush(stdout);
+        metadata_probe_failure_print(&probe_failure, 0,
+                                     "No destination was changed.");
+        portable_restore_preflight_report_free(&preflight);
+        return PORTABLE_RESTORE_ERROR;
+    }
+
+    printf("\nFiles\n");
+    result = portable_restore_replay_at(&replay_request, report);
+    if (result != 0 && report->verification_failed_count != 0)
+    {
+        printf("Portable restore applied %zu item%s; %zu of %zu verified "
+               "item%s differ%s from the backup\n",
+               report->applied_count, report->applied_count == 1 ? "" : "s",
+               report->verification_failed_count,
+               report->verification_checked_count,
+               report->verification_checked_count == 1 ? "" : "s",
+               report->verification_failed_count == 1 ? "s" : "");
+        portable_restore_preflight_report_free(&preflight);
+        return PORTABLE_RESTORE_VERIFICATION_FAILED;
+    }
+    if (result != 0)
+    {
+        char reason[256];
+        char detail[sizeof(reason) + 4U] = "";
+        if (replay_failure_reason_format(report, reason, sizeof(reason)) == 1)
+            (void)snprintf(detail, sizeof(detail), " (%s)", reason);
+        if (report->failed_root_id[0] != '\0')
+            printf("Portable restore stopped at %s:%s: %zu applied, %zu failed%s\n",
+                   report->failed_root_id,
+                   report->failed_logical_path[0] != '\0'
+                       ? report->failed_logical_path : ".",
+                   report->applied_count, report->failed_count, detail);
+        else if (report->failed_logical_path[0] != '\0')
+            printf("Portable restore stopped at %s: %zu applied, %zu failed%s\n",
+                   report->failed_logical_path,
+                   report->applied_count, report->failed_count, detail);
+        else
+            printf("Portable restore stopped: %zu applied, %zu failed%s\n",
+                   report->applied_count, report->failed_count, detail);
+    }
+    portable_restore_preflight_report_free(&preflight);
+    return result == 0 ? PORTABLE_RESTORE_COMPLETE : PORTABLE_RESTORE_ERROR;
+}
+
+PortableRestoreOutcome portable_restore_orchestrate_at(
+    const PortableRestoreRequest *request,
+    PortableRestoreReplayReport *report)
+{
+    return portable_restore_orchestrate_impl(request, report, 1);
+}
+
+int portable_restore_at(const PortableRestoreRequest *request,
+                        PortableRestoreReplayReport *report)
+{
+    PortableRestoreOutcome outcome =
+        portable_restore_orchestrate_impl(request, report, 0);
+    if (outcome == PORTABLE_RESTORE_COMPLETE)
+    {
+        printf("Portable restore complete: %zu applied\n",
+               report->applied_count);
+        portable_restore_print_preserved_local_state(
+            report->preserved_local_state_count,
+            report->live_state_kept_count);
+        if (report->skipped_security_xattr_count != 0)
+            printf("Portable restore skipped %zu security.* attribute(s) "
+                   "that the destination could not apply\n",
+                   report->skipped_security_xattr_count);
+    }
+    return outcome == PORTABLE_RESTORE_ERROR ||
+                   outcome == PORTABLE_RESTORE_VERIFICATION_FAILED
+               ? -1 : 0;
+}

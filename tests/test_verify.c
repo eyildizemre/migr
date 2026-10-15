@@ -1,0 +1,538 @@
+// Tests for `migr verify` (docs/DECISIONS.md D59, D106): a real portable
+// capture is checked against its own journal, and a native copy against its
+// source, then each is damaged one way at a time.
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <ftw.h>
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+#include "manifest.h"
+#include "portable.h"
+#include "sidecar.h"
+#include "utils.h"
+#include "verify.h"
+
+#define GREEN "\033[0;32m"
+#define RED "\033[0;31m"
+#define BLUE "\033[0;34m"
+#define NC "\033[0m"
+
+static int failures = 0;
+
+static void check(int cond, const char *label)
+{
+    if (cond)
+        printf("  " GREEN "v" NC " %s\n", label);
+    else
+    {
+        printf("  " RED "x" NC " %s\n", label);
+        failures++;
+    }
+}
+
+static void fatal(const char *message)
+{
+    printf(RED "fixture: %s" NC "\n", message);
+    exit(1);
+}
+
+static int remove_cb(const char *path, const struct stat *sb, int typeflag,
+                     struct FTW *ftwbuf)
+{
+    (void)sb;
+    (void)typeflag;
+    (void)ftwbuf;
+    return remove(path);
+}
+
+static void remove_tree(const char *path)
+{
+    nftw(path, remove_cb, 64, FTW_DEPTH | FTW_PHYS);
+}
+
+static void join(char *out, size_t size, const char *left, const char *right)
+{
+    if (snprintf(out, size, "%s/%s", left, right) >= (int)size)
+        fatal("path too long");
+}
+
+static void write_text(const char *path, const char *text)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    size_t length = strlen(text);
+    if (fd < 0 || write(fd, text, length) != (ssize_t)length || close(fd) != 0)
+        fatal("could not write a file");
+}
+
+static void append_text(const char *path, const char *text)
+{
+    int fd = open(path, O_WRONLY | O_APPEND | O_CLOEXEC);
+    size_t length = strlen(text);
+    if (fd < 0 || write(fd, text, length) != (ssize_t)length || close(fd) != 0)
+        fatal("could not append to a file");
+}
+
+/* Runs verify_backup() in a child with stdout and stderr captured. */
+static int run_verify(const char *path, char *output, size_t size)
+{
+    char capture[] = "/tmp/migr_verify_output_XXXXXX";
+    int capture_fd = mkstemp(capture);
+    if (capture_fd < 0)
+        fatal("could not create the output capture");
+    unlink(capture);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child < 0)
+        fatal("could not fork");
+    if (child == 0)
+    {
+        dup2(capture_fd, STDOUT_FILENO);
+        dup2(capture_fd, STDERR_FILENO);
+        int result = verify_backup(path);
+        fflush(stdout);
+        fflush(stderr);
+        _exit(result);
+    }
+    int status = 0;
+    if (waitpid(child, &status, 0) != child)
+        fatal("could not wait for the verify child");
+    ssize_t length = pread(capture_fd, output, size - 1U, 0);
+    output[length > 0 ? length : 0] = '\0';
+    close(capture_fd);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+typedef struct {
+    char base[PATH_MAX];
+    char source[PATH_MAX];
+    char container[PATH_MAX];
+    char payload[PATH_MAX];
+} Fixture;
+
+static const char b_text[] = "content of b";
+static const char c_text[] = "content of c";
+
+static void fixture_create(Fixture *fixture)
+{
+    snprintf(fixture->base, sizeof(fixture->base), "/tmp/migr_verify_XXXXXX");
+    if (mkdtemp(fixture->base) == NULL)
+        fatal("could not create the fixture directory");
+    join(fixture->source, sizeof(fixture->source), fixture->base, "source");
+    join(fixture->container, sizeof(fixture->container), fixture->base,
+         "container");
+    join(fixture->payload, sizeof(fixture->payload), fixture->container,
+         "data/ROOT");
+
+    char path[PATH_MAX], other[PATH_MAX];
+    if (mkdir(fixture->source, 0700) != 0)
+        fatal("could not create the source");
+    join(path, sizeof(path), fixture->source, "a");
+    if (mkdir(path, 0700) != 0)
+        fatal("could not create a source directory");
+    join(path, sizeof(path), fixture->source, "a/b.txt");
+    write_text(path, b_text);
+    join(path, sizeof(path), fixture->source, "c.txt");
+    write_text(path, c_text);
+    join(other, sizeof(other), fixture->source, "hard");
+    if (link(path, other) != 0)
+        fatal("could not create a hardlink");
+    join(path, sizeof(path), fixture->source, "link");
+    if (symlink("a/b.txt", path) != 0)
+        fatal("could not create a symlink");
+
+    PortableRootSpec root = {
+        .id = "ROOT",
+        .policy = ROOT_POLICY_HOME_RELATIVE,
+        .capture_path = fixture->source,
+        .payload_path = "ROOT",
+        .source_path = fixture->source,
+        .restore_path = "",
+        .has_restore_path = 1
+    };
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .has_source_identity = 1,
+        .machine_id = "a1",
+        .source_uid = getuid(),
+        .roots = &root,
+        .root_count = 1,
+        .case_sensitive = 1
+    };
+    if (mkdir(fixture->container, 0700) != 0)
+        fatal("could not create the container");
+    int container_fd = open(fixture->container,
+                            O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0 ||
+        portable_capture_fresh_at(container_fd, &request, NULL) != 0 ||
+        close(container_fd) != 0)
+        fatal("could not capture the portable fixture");
+}
+
+static void test_clean_backup(void)
+{
+    printf(BLUE "::" NC " verify: an intact portable backup\n");
+    Fixture fixture;
+    fixture_create(&fixture);
+    char output[8192];
+    int rc = run_verify(fixture.container, output, sizeof(output));
+    check(rc == 0 && strstr(output, "Verifying 6 items") != NULL &&
+              strstr(output, "Backup verified: all 6 items match what was "
+                             "captured") != NULL &&
+              strstr(output, "Backup taken") == NULL,
+          "every item of an intact backup matches its capture record");
+
+    Manifest manifest;
+    int container_fd = open(fixture.container,
+                            O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0 ||
+        manifest_read_v1_at(container_fd, &manifest) != MANIFEST_STATUS_VALID)
+        fatal("could not read the fixture manifest");
+    manifest.updated = 1790500000; // 2026-09-27 09:06:40 UTC
+    if (manifest_write_v1_at(container_fd, &manifest) != 0)
+        fatal("could not stamp the fixture manifest");
+    manifest_free(&manifest);
+    close(container_fd);
+    setenv("TZ", "UTC", 1);
+    tzset();
+    rc = run_verify(fixture.container, output, sizeof(output));
+    check(rc == 0 && strstr(output, "Backup taken 2026-09-27 09:06\n") != NULL,
+          "when the backup was taken is shown before verifying it");
+    remove_tree(fixture.base);
+}
+
+// verify only reads: a journal it may not write is checked all the same,
+// and nothing in the container is removed.
+static void test_read_only_backup(void)
+{
+    printf(BLUE "::" NC " verify: a backup it may not write\n");
+    Fixture fixture;
+    fixture_create(&fixture);
+    char journal[PATH_MAX], leftover[PATH_MAX];
+    join(journal, sizeof(journal), fixture.container, "sidecar.migr");
+    join(leftover, sizeof(leftover), fixture.container,
+         "sidecar.migr.rewrite");
+    write_text(leftover, "left by an interrupted rewrite");
+    if (chmod(journal, 0444) != 0)
+        fatal("could not make the journal read-only");
+    char output[8192];
+    int rc = run_verify(fixture.container, output, sizeof(output));
+    check(rc == 0 && strstr(output, "Backup verified") != NULL,
+          "a read-only journal is verified");
+    check(access(leftover, F_OK) == 0,
+          "verify leaves every file in the container in place");
+    remove_tree(fixture.base);
+}
+
+static void test_damaged_payloads(void)
+{
+    printf(BLUE "::" NC " verify: damaged payloads are named\n");
+    Fixture fixture;
+    fixture_create(&fixture);
+    char path[PATH_MAX];
+    char output[8192];
+
+    // Same size, different bytes: only the capture digest can tell.
+    join(path, sizeof(path), fixture.payload, "a/b.txt");
+    write_text(path, "content of B");
+    int rc = run_verify(fixture.container, output, sizeof(output));
+    check(rc == 1 &&
+              strstr(output, "Verification found 1 item that differs from "
+                             "what was captured:") != NULL &&
+              strstr(output, "ROOT:a/b.txt (content differs from what was "
+                             "captured)") != NULL,
+          "a same-size content change is reported as a content difference");
+    write_text(path, b_text);
+
+    join(path, sizeof(path), fixture.payload, "link");
+    write_text(path, "x");
+    rc = run_verify(fixture.container, output, sizeof(output));
+    check(rc == 1 &&
+              strstr(output, "ROOT:link (its placeholder is not an empty "
+                             "file)") != NULL,
+          "a symlink placeholder with content is reported");
+    write_text(path, "");
+
+    join(path, sizeof(path), fixture.payload, "a/b.txt");
+    write_text(path, "short");
+    rc = run_verify(fixture.container, output, sizeof(output));
+    check(rc == 1 &&
+              strstr(output, "ROOT:a/b.txt (size is 5 bytes, captured as "
+                             "12)") != NULL,
+          "a truncated file is reported with both sizes");
+    write_text(path, b_text);
+
+    rc = run_verify(fixture.container, output, sizeof(output));
+    check(rc == 0, "restoring the damaged bytes makes the backup verify again");
+
+    join(path, sizeof(path), fixture.payload, "a");
+    char file[PATH_MAX];
+    join(file, sizeof(file), path, "b.txt");
+    if (unlink(file) != 0 || rmdir(path) != 0)
+        fatal("could not remove a payload directory");
+    rc = run_verify(fixture.container, output, sizeof(output));
+    check(rc == 1 &&
+              strstr(output, "Verification found 2 items that differ") !=
+                  NULL &&
+              strstr(output, "ROOT:a (missing from the backup)") != NULL &&
+              strstr(output, "ROOT:a/b.txt (missing from the backup)") != NULL,
+          "a missing directory and the file inside it are both reported");
+    remove_tree(fixture.base);
+}
+
+static void test_refusals(void)
+{
+    printf(BLUE "::" NC " verify: backups it cannot check are refused\n");
+    Fixture fixture;
+    fixture_create(&fixture);
+    char path[PATH_MAX];
+    char output[8192];
+
+    join(path, sizeof(path), fixture.container, SIDECAR_SLOT_NAME);
+    append_text(path, "ENTRY");
+    int rc = run_verify(fixture.container, output, sizeof(output));
+    check(rc == 2 && strstr(output, "Backup verified") == NULL &&
+              strstr(output, SIDECAR_SLOT_NAME) != NULL,
+          "an incomplete journal is refused and named");
+    remove_tree(fixture.base);
+
+}
+
+/* A native backup: the fixture's source copied file by file with its times,
+ * as native capture leaves it, under a manifest naming the source. */
+typedef struct {
+    char base[PATH_MAX];
+    char source[PATH_MAX];
+    char container[PATH_MAX];
+    char payload[PATH_MAX];
+} NativeFixture;
+
+// Gives path the access and modification times of model, as capture does.
+static void copy_times(const char *path, const char *model)
+{
+    struct stat st;
+    if (lstat(model, &st) != 0)
+        fatal("could not read times to copy");
+    struct timespec times[2] = { st.st_atim, st.st_mtim };
+    if (utimensat(AT_FDCWD, path, times, AT_SYMLINK_NOFOLLOW) != 0)
+        fatal("could not copy times");
+}
+
+static void native_copy(const NativeFixture *fixture, const char *relative)
+{
+    char from[PATH_MAX], to[PATH_MAX];
+    join(from, sizeof(from), fixture->source, relative);
+    join(to, sizeof(to), fixture->payload, relative);
+    struct stat st;
+    if (lstat(from, &st) != 0)
+        fatal("could not read a source item");
+    if (S_ISLNK(st.st_mode))
+    {
+        char target[PATH_MAX];
+        ssize_t length = readlink(from, target, sizeof(target) - 1U);
+        if (length < 0)
+            fatal("could not read a source symlink");
+        target[length] = '\0';
+        unlink(to);
+        if (symlink(target, to) != 0)
+            fatal("could not copy a symlink");
+    }
+    else
+    {
+        char buffer[256];
+        int in = open(from, O_RDONLY | O_CLOEXEC);
+        ssize_t length = in >= 0 ? read(in, buffer, sizeof(buffer) - 1U) : -1;
+        if (in < 0 || length < 0)
+            fatal("could not read a source file");
+        close(in);
+        buffer[length] = '\0';
+        write_text(to, buffer);
+    }
+    copy_times(to, from);
+}
+
+// The backup starts after every source item was last changed, as on a real
+// system: its time is the next second, which is waited for.
+static void native_fixture_create(NativeFixture *fixture)
+{
+    snprintf(fixture->base, sizeof(fixture->base),
+             "/tmp/migr_verify_native_XXXXXX");
+    if (mkdtemp(fixture->base) == NULL)
+        fatal("could not create the native fixture directory");
+    join(fixture->source, sizeof(fixture->source), fixture->base, "source");
+    join(fixture->container, sizeof(fixture->container), fixture->base,
+         "container");
+    join(fixture->payload, sizeof(fixture->payload), fixture->container,
+         "data/ROOT");
+
+    char path[PATH_MAX], other[PATH_MAX];
+    if (mkdir(fixture->source, 0700) != 0)
+        fatal("could not create the source");
+    join(path, sizeof(path), fixture->source, "a");
+    if (mkdir(path, 0700) != 0)
+        fatal("could not create a source directory");
+    join(path, sizeof(path), fixture->source, "a/b.txt");
+    write_text(path, b_text);
+    join(path, sizeof(path), fixture->source, "c.txt");
+    write_text(path, c_text);
+    join(other, sizeof(other), fixture->source, "hard");
+    if (link(path, other) != 0)
+        fatal("could not create a hardlink");
+    join(path, sizeof(path), fixture->source, "link");
+    if (symlink("a/b.txt", path) != 0)
+        fatal("could not create a symlink");
+
+    join(path, sizeof(path), fixture->container, "data");
+    if (mkdir(fixture->container, 0700) != 0 || mkdir(path, 0700) != 0 ||
+        mkdir(fixture->payload, 0700) != 0)
+        fatal("could not create the native container");
+    join(path, sizeof(path), fixture->payload, "a");
+    if (mkdir(path, 0700) != 0)
+        fatal("could not create a payload directory");
+    native_copy(fixture, "a/b.txt");
+    native_copy(fixture, "c.txt");
+    native_copy(fixture, "hard");
+    native_copy(fixture, "link");
+
+    time_t taken = time(NULL) + 1;
+    while (time(NULL) < taken)
+        usleep(10000);
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "ROOT");
+    root.policy = ROOT_POLICY_MANUAL_NATIVE;
+    strcpy(root.payload_path, "ROOT");
+    strcpy(root.source_path, fixture->source);
+    Manifest manifest = {
+        .version = MANIFEST_CURRENT_VERSION,
+        .representation = CLONE_NATIVE_TREE,
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .updated = taken,
+        .root_count = 1,
+        .roots = &root
+    };
+    int container_fd = open(fixture->container,
+                            O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0 || manifest_write_v1_at(container_fd, &manifest) != 0)
+        fatal("could not write the native manifest");
+    close(container_fd);
+}
+
+static void test_native_backup(void)
+{
+    printf(BLUE "::" NC " verify: a native backup against its source\n");
+    NativeFixture fixture;
+    native_fixture_create(&fixture);
+    char output[8192], path[PATH_MAX], source[PATH_MAX];
+
+    int rc = run_verify(fixture.container, output, sizeof(output));
+    check(rc == 0 && strstr(output, "Verifying 4 items") != NULL &&
+              strstr(output, "against their source") != NULL &&
+              strstr(output, "Backup verified: all 4 items compared match "
+                             "the source") != NULL &&
+              strstr(output, "Note:") == NULL,
+          "every file and symlink of an intact native backup matches");
+
+    // Damage keeps the backup's times, as a failing drive does.
+    join(path, sizeof(path), fixture.payload, "a/b.txt");
+    join(source, sizeof(source), fixture.source, "a/b.txt");
+    write_text(path, "content of B");
+    copy_times(path, source);
+    rc = run_verify(fixture.container, output, sizeof(output));
+    check(rc == 1 &&
+              strstr(output, "Verification found 1 item that differs from "
+                             "the source:") != NULL &&
+              strstr(output, "ROOT:a/b.txt (content differs from the "
+                             "source)") != NULL,
+          "same-size damage is reported as a content difference");
+
+    write_text(path, "short");
+    copy_times(path, source);
+    rc = run_verify(fixture.container, output, sizeof(output));
+    check(rc == 1 &&
+              strstr(output, "ROOT:a/b.txt (size is 5 bytes, the source has "
+                             "12)") != NULL,
+          "a backup file of another size is reported with both sizes");
+    native_copy(&fixture, "a/b.txt");
+
+    join(path, sizeof(path), fixture.payload, "link");
+    join(source, sizeof(source), fixture.source, "link");
+    if (unlink(path) != 0 || symlink("c.txt", path) != 0)
+        fatal("could not damage the payload symlink");
+    copy_times(path, source);
+    rc = run_verify(fixture.container, output, sizeof(output));
+    check(rc == 1 &&
+              strstr(output, "ROOT:link (target differs from the source)") !=
+                  NULL,
+          "a symlink pointing elsewhere is reported");
+    native_copy(&fixture, "link");
+
+    rc = run_verify(fixture.container, output, sizeof(output));
+    check(rc == 0, "copying the source again makes the backup verify");
+
+    // c.txt and hard are one file in the source.
+    join(source, sizeof(source), fixture.source, "c.txt");
+    write_text(source, "changed after the backup");
+    rc = run_verify(fixture.container, output, sizeof(output));
+    check(rc == 0 &&
+              strstr(output, "Note: 2 items changed in the source since the "
+                             "backup, or could not be read there, and were "
+                             "not checked.") != NULL &&
+              strstr(output, "all 2 items compared match") != NULL,
+          "a source changed since the backup is counted, not reported");
+
+    // Content changed with its modification time set back: the change time
+    // still tells.
+    join(source, sizeof(source), fixture.source, "a/b.txt");
+    struct stat original;
+    if (stat(source, &original) != 0)
+        fatal("could not read the source times");
+    write_text(source, "content of X");
+    struct timespec times[2] = { original.st_atim, original.st_mtim };
+    if (utimensat(AT_FDCWD, source, times, 0) != 0)
+        fatal("could not set the source time back");
+    rc = run_verify(fixture.container, output, sizeof(output));
+    check(rc == 0 && strstr(output, "Note: 3 items changed") != NULL &&
+              strstr(output, "differs") == NULL,
+          "a change whose modification time was set back is not taken for "
+          "damage");
+
+    char moved[PATH_MAX];
+    join(moved, sizeof(moved), fixture.base, "elsewhere");
+    if (rename(fixture.source, moved) != 0)
+        fatal("could not move the source away");
+    rc = run_verify(fixture.container, output, sizeof(output));
+    check(rc == 2 &&
+              strstr(output, "none of the backup's files could be compared "
+                             "with their source") != NULL,
+          "without its source a native backup cannot be checked");
+    remove_tree(fixture.base);
+}
+
+int main(void)
+{
+    // A direct sudo run must not aim restores at the invoking user's home
+    // (D38); make and test.sh drop SUDO_UID already.
+    unsetenv("SUDO_UID");
+    printf(BLUE "::" NC " migr verify\n");
+    test_clean_backup();
+    test_read_only_backup();
+    test_damaged_payloads();
+    test_refusals();
+    test_native_backup();
+    if (failures != 0)
+    {
+        printf(RED "%d verify test failure%s" NC "\n", failures,
+               failures == 1 ? "" : "s");
+        return 1;
+    }
+    printf(GREEN "verify tests passed" NC "\n");
+    return 0;
+}

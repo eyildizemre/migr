@@ -1,6 +1,9 @@
 *.o
+*.d
 migr
-tests/test_detect
-tests/test_pathjoin
-tests/test_special_files
-docs/TODO.md
+migr-static
+tests/test_*
+!tests/test_*.c
+!tests/test_*.sh
+tests/migr-unprivileged
+docs/scratch/

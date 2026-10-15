@@ -1,54 +1,29 @@
 #define _GNU_SOURCE
+#include <assert.h>
+#include <dirent.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <unistd.h>
 #include <limits.h>
+#include "backup_plan.h"
 #include "report.h"
+#include "selection.h"
 #include "detect.h"
-#include "fileops.h"
 #include "utils.h"
-
-extern int verbose;
-
-static int dir_exists(const char *path)
-{
-    struct stat st;
-    return (stat(path, &st) == 0 && S_ISDIR(st.st_mode));
-}
-
-static int file_exists(const char *path)
-{
-    struct stat st;
-    return (stat(path, &st) == 0);
-}
-
-
-static void format_size(off_t bytes, char *buf, size_t len)
-{
-    if (bytes >= 1073741824)
-    {
-        snprintf(buf, len, "%.1fG", bytes / 1073741824.0);
-    }
-    else if (bytes >= 1048576)
-    {
-        snprintf(buf, len, "%.1fM", bytes / 1048576.0);
-    }
-    else if (bytes >= 1024)
-    {
-        snprintf(buf, len, "%.1fK", bytes / 1024.0);
-    }
-    else
-    {
-        snprintf(buf, len, "%lldB", (long long)bytes);
-    }
-}
 
 static void print_section(const char *title)
 {
-    printf("\n[%s]\n", title);
-    printf("-----------------------------------------------------------\n");
+    printf("\n%s\n", title);
+}
+
+static void print_report_header(const char *home)
+{
+    distro_t distro = detect_distro();
+    printf("Backup Analysis · %s\n", get_distro_name(distro));
+    printf("%s\n", home);
 }
 
 static void print_item(const char *name, const char *size)
@@ -56,177 +31,408 @@ static void print_item(const char *name, const char *size)
     printf("  %-30s %10s\n", name, size);
 }
 
-int report(void)
+static const char *path_leaf(const char *path)
 {
-    char *home = getenv("HOME");
-    if (home == NULL)
-    {
-        printf("Error: Could not get HOME directory.\n");
-        return 1;
-    }
+    const char *slash = strrchr(path, '/');
+    if (slash == NULL || slash[1] == '\0')
+        return path;
+    return slash + 1;
+}
 
-    distro_t distro = detect_distro();
-    printf("===========================================================\n");
-    printf("              BACKUP ANALYSIS REPORT\n");
-    printf("===========================================================\n");
-    printf("Distro: %s\n", get_distro_name(distro));
-    printf("Home:   %s\n", home);
+static void print_item_with_path(const char *name, const char *size,
+                                 const char *path, size_t depth)
+{
+    fputs("  ", stdout);
+    for (size_t i = 0; i < depth; i++)
+        fputs("  ", stdout);
+    printf("%-30s %10s  (%s)\n", name, size, path);
+}
 
+typedef struct {
     char path[PATH_MAX];
-    char size[32];
-    int had_error = 0; // set if any path could not be built, so the estimate never lies
+    off_t size;
+    size_t depth;
+} ReportBreakdownEntry;
 
-    // main user directories
-    const char *main_dirs[] = {"Documents", "Desktop", "Downloads", "Pictures", "Videos", "Music", "Projects", NULL};
+typedef struct {
+    ReportBreakdownEntry *entries;
+    size_t count;
+    size_t capacity;
+} ReportBreakdown;
 
-    print_section("MAIN DIRECTORIES");
-    for (int i = 0; main_dirs[i] != NULL; i++)
+static void report_breakdown_free(ReportBreakdown *breakdown)
+{
+    free(breakdown->entries);
+    breakdown->entries = NULL;
+    breakdown->count = 0;
+    breakdown->capacity = 0;
+}
+
+static int report_breakdown_add(ReportBreakdown *breakdown,
+                               const char *path, size_t depth,
+                               size_t *entry_index)
+{
+    if (breakdown->count == breakdown->capacity)
     {
-        if (path_join(path, sizeof(path), home, main_dirs[i]) != 0)
-        {
-            had_error = 1;
-            continue;
-        }
-        if (dir_exists(path))
-        {
-            off_t bytes_size = 0;
-            if (get_dir_size(path, &bytes_size) != 0)
-            {
-                had_error = 1;
-                continue;
-            }
-            format_size(bytes_size, size, sizeof(size));
-            print_item(main_dirs[i], size);
-        }
+        ReportBreakdownEntry *new_entries = array_reserve(
+            breakdown->entries, &breakdown->capacity, breakdown->count, 1U,
+            sizeof(*new_entries), 16U,
+            SIZE_MAX / sizeof(*new_entries));
+        if (new_entries == NULL)
+            return -1;
+        breakdown->entries = new_entries;
     }
 
-    // Dotfiles
-    const char *dotfiles[] = {".ssh", ".gnupg", ".config", ".local/share", ".bashrc", ".profile", ".gitconfig", NULL};
-
-    print_section("DOTFILES & CONFIG");
-    for (int i = 0; dotfiles[i] != NULL; i++)
+    ReportBreakdownEntry *entry = &breakdown->entries[breakdown->count];
+    if (strlen(path) >= sizeof(entry->path))
     {
-        if (path_join(path, sizeof(path), home, dotfiles[i]) != 0)
-        {
-            had_error = 1;
-            continue;
-        }
-        if (file_exists(path))
-        {
-            off_t bytes_size = 0;
-            if (get_dir_size(path, &bytes_size) != 0)
-            {
-                had_error = 1;
-                continue;
-            }
-            format_size(bytes_size, size, sizeof(size));
-            print_item(dotfiles[i], size);
-        }
+        errno = ENAMETOOLONG;
+        return -1;
     }
-
-    // developer tools
-    const char *dev_dirs[] = {".npm", ".cargo", ".rustup", ".pub-cache", ".gradle", ".nvm", NULL};
-
-    print_section("DEV TOOLS (re-downloadable)");
-    for (int i = 0; dev_dirs[i] != NULL; i++)
-    {
-        if (path_join(path, sizeof(path), home, dev_dirs[i]) != 0)
-        {
-            had_error = 1;
-            continue;
-        }
-        if (dir_exists(path))
-        {
-            off_t bytes_size = 0;
-            if (get_dir_size(path, &bytes_size) != 0)
-            {
-                had_error = 1;
-                continue;
-            }
-            format_size(bytes_size, size, sizeof(size));
-            print_item(dev_dirs[i], size);
-        }
-    }
-
-    // browsers
-    const char *browsers[] = {".mozilla/firefox", ".config/google-chrome", ".config/chromium", ".config/BraveSoftware", NULL};
-    const char *browser_names[] = {"Firefox", "Chrome", "Chromium", "Brave", NULL};
-
-    print_section("BROWSERS");
-    for (int i = 0; browsers[i] != NULL; i++)
-    {
-        if (path_join(path, sizeof(path), home, browsers[i]) != 0)
-        {
-            had_error = 1;
-            continue;
-        }
-        if (dir_exists(path))
-        {
-            off_t bytes_size = 0;
-            if (get_dir_size(path, &bytes_size) != 0)
-            {
-                had_error = 1;
-                continue;
-            }
-            format_size(bytes_size, size, sizeof(size));
-            print_item(browser_names[i], size);
-        }
-    }
-
-    // most important paths for backup
-    const char *critical_dirs[] = {"Documents", "Downloads", "Pictures", NULL};
-    const char *critical_dots[] = {".ssh", ".gnupg", ".gitconfig", ".bashrc", NULL};
-    
-    off_t critical_total = 0;
-
-    for (int i = 0; critical_dirs[i] != NULL; i++)
-    {
-        if (path_join(path, sizeof(path), home, critical_dirs[i]) != 0)
-        {
-            had_error = 1;
-            continue;
-        }
-        if (file_exists(path))
-        {
-            off_t temp_size = 0;
-            if (get_dir_size(path, &temp_size) == 0)
-                critical_total += temp_size;
-            else
-                had_error = 1;
-        }
-    }
-
-    for (int i = 0; critical_dots[i] != NULL; i++)
-    {
-        if (path_join(path, sizeof(path), home, critical_dots[i]) != 0)
-        {
-            had_error = 1;
-            continue;
-        }
-        if (file_exists(path))
-        {
-            off_t temp_size = 0;
-            if (get_dir_size(path, &temp_size) == 0)
-                critical_total += temp_size;
-            else
-                had_error = 1;
-        }
-    }
-
-    char critical_size[32];
-    format_size(critical_total, critical_size, sizeof(critical_size));
-
-    printf("\n===========================================================\n");
-    printf("CRITICAL BACKUP ESTIMATE:\n");
-    printf("  %s\n", critical_size);
-    printf("  (Documents, Downloads, Pictures, .ssh, .gnupg, .gitconfig, .bashrc)\n");
-    printf("===========================================================\n");
-
-    if (had_error)
-    {
-        printf("\nWarning: some paths could not be measured; "
-               "this report is incomplete.\n");
-        return 1;
-    }
+    strcpy(entry->path, path);
+    entry->size = 0;
+    entry->depth = depth;
+    *entry_index = breakdown->count;
+    breakdown->count++;
     return 0;
+}
+
+static int report_depth_includes(ReportDepth depth, size_t level)
+{
+    if (level == 0)
+        return 0;
+    if (depth.kind == REPORT_DEPTH_LIMITED)
+        return level <= depth.value;
+    return level <= 1;
+}
+
+static int vanished_errno(void)
+{
+    return errno == ENOENT || errno == ENOTDIR;
+}
+
+/*
+ * Measures one root and records each requested directory subtotal during the
+ * same bottom-up walk. Files and symlinks contribute to their containing
+ * directory but never become breakdown entries, matching du's directory-only
+ * listing semantics. Returns 1 when path disappeared during the walk; its
+ * parent then counts it as 0 bytes and goes on.
+ */
+static int measure_report_tree(const char *path, size_t depth,
+                               ReportDepth depth_limit,
+                               ReportBreakdown *breakdown, off_t *size,
+                               const SelectionRoot *selection)
+{
+    *size = 0;
+    if (selection)
+    {
+        int owned = selection_source_owns(selection, path);
+        if (owned <= 0) return owned;
+    }
+    struct stat st;
+    if (lstat(path, &st) != 0)
+        return vanished_errno() ? 1 : -1;
+
+    if (S_ISLNK(st.st_mode) || S_ISREG(st.st_mode))
+    {
+        *size = st.st_size;
+        return 0;
+    }
+
+    if (S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode) ||
+        S_ISCHR(st.st_mode) || S_ISBLK(st.st_mode))
+        return 0;
+
+    if (!S_ISDIR(st.st_mode))
+    {
+        errno = EOPNOTSUPP;
+        return -1;
+    }
+
+    DIR *dir = opendir(path);
+    if (dir == NULL)
+        return vanished_errno() ? 1 : -1;
+
+    size_t entry_index = SIZE_MAX;
+    if (breakdown != NULL &&
+        report_depth_includes(depth_limit, depth) &&
+        report_breakdown_add(breakdown, path, depth, &entry_index) != 0)
+    {
+        int saved_errno = errno;
+        closedir(dir);
+        errno = saved_errno;
+        return -1;
+    }
+
+    off_t subtotal = st.st_size;
+
+    while (1)
+    {
+        errno = 0;
+        struct dirent *entry = readdir(dir);
+        if (entry == NULL)
+        {
+            if (errno != 0)
+            {
+                int saved_errno = errno;
+                closedir(dir);
+                errno = saved_errno;
+                return -1;
+            }
+            break;
+        }
+
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0)
+            continue;
+
+        char child_path[PATH_MAX];
+        if (path_join(child_path, sizeof(child_path), path, entry->d_name) != 0)
+        {
+            closedir(dir);
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+
+        size_t child_depth = depth == SIZE_MAX ? SIZE_MAX : depth + 1;
+        off_t child_size = 0;
+        if (measure_report_tree(child_path, child_depth, depth_limit,
+                                breakdown, &child_size, selection) < 0)
+        {
+            int saved_errno = errno;
+            closedir(dir);
+            errno = saved_errno;
+            return -1;
+        }
+        subtotal += child_size;
+    }
+
+    if (closedir(dir) != 0)
+        return -1;
+
+    if (entry_index != SIZE_MAX)
+        breakdown->entries[entry_index].size = subtotal;
+    *size = subtotal;
+    return 0;
+}
+
+static void print_report_breakdown(const ReportBreakdown *breakdown)
+{
+    for (size_t i = 0; i < breakdown->count; i++)
+    {
+        char size[32];
+        format_size(breakdown->entries[i].size, size, sizeof(size));
+        print_item_with_path(path_leaf(breakdown->entries[i].path), size,
+                             breakdown->entries[i].path,
+                             breakdown->entries[i].depth);
+    }
+}
+
+static const char *scoped_group_title(BackupRootGroup group)
+{
+    switch (group)
+    {
+    case BACKUP_ROOT_MAIN:
+        return "Main Directories";
+    case BACKUP_ROOT_DOTFILE:
+        return "Dotfiles & Config";
+    case BACKUP_ROOT_BROWSER:
+        return "Browsers";
+    case BACKUP_ROOT_EXPLICIT:
+        return "Explicit Paths";
+    }
+    assert(0 && "scoped_group_title: unhandled BackupRootGroup value");
+    return "Other";
+}
+
+static const char *scoped_root_name(const char *home,
+                                    const BackupPlanRoot *root)
+{
+    static const struct {
+        const char *home_relative;
+        const char *display_name;
+    } browser_names[] = {
+        { ".mozilla",              "Firefox" },
+        { ".config/google-chrome", "Chrome" },
+        { ".config/chromium",      "Chromium" },
+        { ".config/BraveSoftware", "Brave" },
+        { ".config/vivaldi",       "Vivaldi" },
+        { ".config/microsoft-edge", "Edge" },
+        { ".config/opera",         "Opera" },
+    };
+    char home_real[PATH_MAX];
+    const char *restore_rel = NULL;
+
+    /* backup_plan_build() canonicalizes HOME before building capture_path.
+     * A dotfile root is shown by its path below HOME (.local/share), since
+     * its last component alone (share) says little. */
+    if ((root->group == BACKUP_ROOT_BROWSER ||
+         root->group == BACKUP_ROOT_DOTFILE) && home != NULL &&
+        realpath(home, home_real) != NULL &&
+        backup_plan_home_relative(home_real, root->capture_path,
+                                  &restore_rel) && restore_rel[0] != '\0')
+    {
+        if (root->group == BACKUP_ROOT_DOTFILE)
+            return restore_rel;
+        for (size_t i = 0;
+             i < sizeof(browser_names) / sizeof(browser_names[0]); i++)
+        {
+            if (strcmp(restore_rel, browser_names[i].home_relative) == 0)
+                return browser_names[i].display_name;
+        }
+    }
+
+    const char *slash = strrchr(root->capture_path, '/');
+    if (slash == NULL || slash[1] == '\0')
+        return root->capture_path;
+    return slash + 1;
+}
+
+/*
+ * Measures one root. A root that has disappeared since plan construction is
+ * reported absent (*present = 0), not a hard error; that benign-absence
+ * tolerance is shared by every root category. An entry that disappears
+ * further down only leaves its own size out. breakdown may be NULL when the
+ * caller has no use for per-directory subtotals (measure_report_tree()
+ * tolerates that, see above).
+ */
+static int measure_scoped_root(const char *path, ReportDepth depth_limit,
+                               ReportBreakdown *breakdown, off_t *bytes,
+                               int *present, const SelectionRoot *selection)
+{
+    *present = 0;
+    int rc = measure_report_tree(path, 0, depth_limit, breakdown, bytes,
+                                 selection);
+    if (rc < 0)
+        return -1;
+    *present = rc == 0;
+    return 0;
+}
+
+static int report_plan(const char *home, const BackupPlan *plan,
+                        const SelectionPlan *selection, int summary, ReportDepth depth)
+{
+    ManifestScope scope = selection ? selection->scope : plan->scope;
+
+    off_t total = 0;
+    int had_error = 0;
+
+    if (!summary)
+        print_report_header(home);
+
+    // Roots come in path order; each is listed under its own group's
+    // heading, the groups in BackupRootGroup order.
+    size_t count = selection ? selection->root_count : (size_t)plan->root_count;
+    for (int group = BACKUP_ROOT_MAIN; group <= BACKUP_ROOT_EXPLICIT; group++)
+    {
+        int printed_group = 0;
+        for (size_t i = 0; i < count; i++)
+        {
+            const SelectionRoot *filter = selection ? &selection->roots[i] : NULL;
+            const BackupPlanRoot *root = selection ? &selection->roots[i].root
+                                                   : &plan->roots[i];
+            if ((int)root->group != group)
+                continue;
+            off_t bytes = 0;
+            int present = 0;
+            ReportBreakdown breakdown = { NULL, 0, 0 };
+            int want_breakdown = !summary && verbose;
+            int measure_rc = measure_scoped_root(root->capture_path, depth,
+                                                 want_breakdown ? &breakdown : NULL,
+                                                 &bytes, &present, filter);
+
+            if (measure_rc != 0)
+            {
+                had_error = 1;
+                report_breakdown_free(&breakdown);
+                continue;
+            }
+            if (!present)
+            {
+                report_breakdown_free(&breakdown);
+                continue;
+            }
+
+            total += bytes;
+            if (!summary)
+            {
+                if (!printed_group)
+                {
+                    print_section(scoped_group_title(root->group));
+                    printed_group = 1;
+                }
+
+                char size[32];
+                format_size(bytes, size, sizeof(size));
+                if (verbose)
+                {
+                    print_item_with_path(scoped_root_name(home, root), size,
+                                         root->capture_path, 0);
+                    print_report_breakdown(&breakdown);
+                }
+                else
+                {
+                    print_item(scoped_root_name(home, root), size);
+                }
+            }
+            report_breakdown_free(&breakdown);
+        }
+    }
+
+    char total_size[32];
+    format_size(total, total_size, sizeof(total_size));
+    if (summary)
+    {
+        printf("%s\n", total_size);
+        if (had_error)
+        {
+            /* Keep summary stdout to one value; this stderr warning is intentionally plain. */
+            fprintf(stderr, "Warning: some paths could not be measured; "
+                            "this report is incomplete.\n");
+        }
+    }
+    else
+    {
+        const char *label = scope == MANIFEST_SCOPE_COMPREHENSIVE
+                                ? "Comprehensive estimate"
+                                : "Critical estimate";
+        printf("\n");
+        print_item(label, total_size);
+        if (selection != NULL && selection->flatpak_repo_excluded)
+        {
+            printf("\n");
+            selection_plan_print_notes(selection);
+        }
+        if (selection != NULL)
+        {
+            printf("\n");
+            (void)selection_plan_print_uncovered(selection);
+        }
+        if (had_error)
+        {
+            printf("\nWarning: some paths could not be measured; "
+                   "this report is incomplete.\n");
+        }
+    }
+
+    return had_error ? 1 : 0;
+}
+
+int report(BackupMode mode, int summary, ReportDepth depth)
+{
+    char home[PATH_MAX];
+    if (resolve_target_home(home) != 0)
+        return 1;
+
+    BackupPlan plan;
+    if (backup_plan_build(home, mode, NULL, &plan) != 0) return 1;
+    int rc = report_plan(home, &plan, NULL, summary, depth);
+    backup_plan_free(&plan);
+    return rc;
+}
+
+int report_selection(const struct SelectionPlan *plan, int summary, ReportDepth depth)
+{
+    if (selection_plan_validate(plan) < 0) return 1;
+    return report_plan(plan->home, NULL, plan, summary, depth);
 }

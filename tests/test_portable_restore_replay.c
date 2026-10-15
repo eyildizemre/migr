@@ -1,0 +1,4531 @@
+// Portable restore replay tests (docs/DECISIONS.md D17/D21): this fixture drives
+// the mutation layer only after the read-only preflight, then checks exact core
+// metadata, fd-anchored payload revalidation, parent-first directory creation,
+// post-order directory metadata, and last-committed tombstone semantics.
+
+#define _GNU_SOURCE
+
+#include <errno.h>
+#include <fcntl.h>
+#include <ftw.h>
+#include <limits.h>
+#include <sched.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mount.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <sys/xattr.h>
+#include <unistd.h>
+
+#include "manifest.h"
+#include "portable.h"
+#include "portable_name.h"
+#include "portable_restore_internal.h"
+#include "portable_restore.h"
+#include "portable_restore_replay_internal.h"
+#include "sidecar.h"
+#include "fixture_content_digest.h"
+
+extern void replay_copy_bytes(char *destination, size_t destination_size,
+                              SidecarBytes source);
+
+#define GREEN "\033[0;32m"
+#define RED   "\033[0;31m"
+#define YELLOW "\033[0;33m"
+#define BLUE  "\033[0;34m"
+#define NC    "\033[0m"
+
+static int failures;
+static int skips;
+static int sync_calls;
+static int sync_should_fail;
+
+enum { CHILD_SKIP = 77 };
+
+extern int __real_syncfs(int fd);
+
+int __wrap_syncfs(int fd)
+{
+    sync_calls++;
+    if (sync_should_fail)
+    {
+        errno = EIO;
+        return -1;
+    }
+    return __real_syncfs(fd);
+}
+
+static void check(int condition, const char *label)
+{
+    if (condition)
+        printf("  " GREEN "v" NC " %s\n", label);
+    else
+    {
+        printf("  " RED "x" NC " %s\n", label);
+        failures++;
+    }
+}
+
+static void skip_case(const char *label, const char *reason)
+{
+    printf("  " YELLOW "-" NC " %s skipped: %s\n", label, reason);
+    skips++;
+}
+
+static void fatal(const char *message)
+{
+    fprintf(stderr, "portable restore replay fixture failure: %s\n", message);
+    exit(2);
+}
+
+static int remove_callback(const char *path, const struct stat *st,
+                           int type, struct FTW *state)
+{
+    (void)st;
+    (void)type;
+    (void)state;
+    return remove(path);
+}
+
+static int chmod_directory_callback(const char *path, const struct stat *st,
+                                    int type, struct FTW *state)
+{
+    (void)st;
+    (void)state;
+    if (type == FTW_D && chmod(path, 0700) != 0)
+        return -1;
+    return 0;
+}
+
+static void remove_tree(const char *path)
+{
+    struct stat st;
+    if (lstat(path, &st) != 0)
+    {
+        if (errno == ENOENT)
+            return;
+        fatal("could not inspect fixture tree");
+    }
+    if (nftw(path, chmod_directory_callback, 16, FTW_PHYS) != 0 ||
+        nftw(path, remove_callback, 16, FTW_DEPTH | FTW_PHYS) != 0)
+        fatal("could not remove fixture tree");
+}
+
+static void remove_deep_chain_at(int anchor_fd, const char *root_leaf,
+                                 const char *component, size_t depth,
+                                 const char *file_leaf, int *fds,
+                                 size_t fd_count)
+{
+    if (depth == 0 || fd_count < depth + 1U)
+        fatal("invalid deep fixture cleanup shape");
+
+    fds[0] = openat(anchor_fd, root_leaf,
+                    O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fds[0] < 0)
+        fatal("could not open deep fixture cleanup root");
+    for (size_t index = 0; index < depth; index++)
+    {
+        fds[index + 1U] = openat(fds[index], component,
+                                 O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                                     O_CLOEXEC);
+        if (fds[index + 1U] < 0)
+            fatal("could not descend through deep fixture cleanup chain");
+    }
+
+    if (unlinkat(fds[depth], file_leaf, 0) != 0)
+        fatal("could not remove deep fixture payload file");
+    for (size_t index = depth; index > 0; index--)
+    {
+        if (close(fds[index]) != 0 ||
+            unlinkat(fds[index - 1U], component, AT_REMOVEDIR) != 0)
+            fatal("could not remove deep fixture directory");
+    }
+    if (close(fds[0]) != 0 ||
+        unlinkat(anchor_fd, root_leaf, AT_REMOVEDIR) != 0)
+        fatal("could not remove deep fixture cleanup root");
+}
+
+static int write_proc_file(const char *path, const char *content)
+{
+    int fd = open(path, O_WRONLY | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    size_t length = strlen(content);
+    ssize_t written = write(fd, content, length);
+    int saved_errno = errno;
+    int close_rc = close(fd);
+    if (written < 0)
+        errno = saved_errno;
+    return written == (ssize_t)length && close_rc == 0 ? 0 : -1;
+}
+
+static int setup_bind_mount_namespace(void)
+{
+    uid_t host_uid = getuid();
+    gid_t host_gid = getgid();
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0)
+        return -1;
+
+    char mapping[64];
+    int length = snprintf(mapping, sizeof(mapping), "0 %lu 1\n",
+                          (unsigned long)host_uid);
+    if (length < 0 || (size_t)length >= sizeof(mapping) ||
+        write_proc_file("/proc/self/uid_map", mapping) != 0 ||
+        write_proc_file("/proc/self/setgroups", "deny\n") != 0)
+        return -1;
+
+    length = snprintf(mapping, sizeof(mapping), "0 %lu 1\n",
+                      (unsigned long)host_gid);
+    if (length < 0 || (size_t)length >= sizeof(mapping) ||
+        write_proc_file("/proc/self/gid_map", mapping) != 0)
+        return -1;
+
+    return mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+}
+
+static int path_mount_id(const char *path, unsigned int *mount_id)
+{
+    if (path == NULL || mount_id == NULL)
+        return -1;
+    struct statx state;
+    memset(&state, 0, sizeof(state));
+    if (statx(AT_FDCWD, path, AT_STATX_DONT_SYNC, STATX_MNT_ID, &state) != 0 ||
+        (state.stx_mask & STATX_MNT_ID) == 0)
+        return -1;
+    *mount_id = state.stx_mnt_id;
+    return 0;
+}
+
+static void path_concat(char *out, size_t out_size, const char *base,
+                      const char *suffix)
+{
+    size_t base_length = strlen(base);
+    size_t suffix_length = strlen(suffix);
+    if (base_length >= out_size ||
+        suffix_length > out_size - base_length - 1U)
+        fatal("fixture path is too long");
+    memcpy(out, base, base_length);
+    memcpy(out + base_length, suffix, suffix_length + 1U);
+}
+
+static void make_dir_at(int parent_fd, const char *name, mode_t mode)
+{
+    if (mkdirat(parent_fd, name, mode) != 0)
+        fatal("could not create fixture directory");
+}
+
+static int open_dir(const char *path)
+{
+    return open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+}
+
+static void write_file_at(int parent_fd, const char *name, const char *text)
+{
+    int fd = openat(parent_fd, name,
+                    O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    size_t length = strlen(text);
+    if (fd < 0 || write(fd, text, length) != (ssize_t)length ||
+        close(fd) != 0)
+        fatal("could not write fixture file");
+}
+
+static int file_equals_noatime(const char *path, const char *expected)
+{
+    int fd = open(path, O_RDONLY | O_NOATIME | O_CLOEXEC);
+    if (fd < 0)
+        return 0;
+    size_t length = strlen(expected);
+    char buffer[256];
+    ssize_t received = read(fd, buffer, sizeof(buffer));
+    int result = received == (ssize_t)length &&
+                 memcmp(buffer, expected, length) == 0;
+    if (close(fd) != 0)
+        result = 0;
+    return result;
+}
+
+static SidecarBytes text_bytes(const char *text)
+{
+    return (SidecarBytes){
+        .data = (const unsigned char *)text,
+        .length = strlen(text)
+    };
+}
+
+static SidecarEntry entry_for(const char *root, const char *logical,
+                              const char *physical, SidecarObjectKind kind,
+                              uint64_t size, uint32_t mode,
+                              int64_t atime_sec, uint32_t atime_nsec,
+                              int64_t mtime_sec, uint32_t mtime_nsec)
+{
+    SidecarEntry entry;
+    memset(&entry, 0, sizeof(entry));
+    entry.root_id = text_bytes(root);
+    entry.logical_path = text_bytes(logical);
+    const char *slash = strrchr(physical, '/');
+    const char *leaf = logical[0] == '\0' ? "" :
+                       (slash == NULL ? physical : slash + 1);
+    entry.physical_leaf = text_bytes(leaf);
+    entry.kind = kind;
+    entry.mode = mode;
+    entry.uid = (uint32_t)geteuid();
+    entry.gid = (uint32_t)getegid();
+    entry.atime_sec = atime_sec;
+    entry.atime_nsec = atime_nsec;
+    entry.mtime_sec = mtime_sec;
+    entry.mtime_nsec = mtime_nsec;
+    entry.size = size;
+    return entry;
+}
+
+static ManifestRoot root_for(void)
+{
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    snprintf(root.id, sizeof(root.id), "ROOT");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    snprintf(root.payload_path, sizeof(root.payload_path), "ROOT");
+    snprintf(root.source_path, sizeof(root.source_path), "/source/ROOT");
+    root.has_restore_path = 1;
+    snprintf(root.restore_path, sizeof(root.restore_path), "restored");
+    return root;
+}
+
+typedef struct {
+    char base[PATH_MAX];
+    char container[PATH_MAX];
+    char home[PATH_MAX];
+    int container_fd;
+    int data_fd;
+    int home_fd;
+} Fixture;
+
+static void fixture_close(Fixture *fixture)
+{
+    if (fixture == NULL)
+        return;
+    if (fixture->data_fd >= 0)
+        close(fixture->data_fd);
+    if (fixture->home_fd >= 0)
+        close(fixture->home_fd);
+    if (fixture->container_fd >= 0)
+        close(fixture->container_fd);
+    remove_tree(fixture->base);
+}
+
+static int write_v2_nested_manifest(Fixture *fixture, ManifestRoot roots[2])
+{
+    memset(roots, 0, 2U * sizeof(*roots));
+    strcpy(roots[0].id, "HOME");
+    roots[0].policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(roots[0].payload_path, "HOME");
+    roots[0].has_restore_path = 1;
+
+    strcpy(roots[1].id, "CHILD");
+    roots[1].policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(roots[1].payload_path, "CHILD");
+    strcpy(roots[1].source_path, "/source/home/Child");
+    roots[1].has_restore_path = 1;
+    strcpy(roots[1].restore_path, "Documents");
+
+    Manifest manifest = {
+        .version = MANIFEST_SELECTION_VERSION,
+        .representation = CLONE_PORTABLE_SIDECAR,
+        .scope = MANIFEST_SCOPE_CRITICAL,
+        .sidecar_version = SIDECAR_VERSION,
+        .root_count = 2,
+        .roots = roots
+    };
+    strcpy(manifest.source_home, "/source/home");
+    return manifest_write_v1_at(fixture->container_fd, &manifest);
+}
+
+static int write_v1_identity_manifest(Fixture *fixture, ManifestRoot *roots,
+                                      int root_count)
+{
+    Manifest manifest = {
+        .version = MANIFEST_CURRENT_VERSION,
+        .representation = CLONE_PORTABLE_SIDECAR,
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .sidecar_version = SIDECAR_VERSION,
+        .root_count = root_count,
+        .roots = roots
+    };
+    return manifest_write_v1_at(fixture->container_fd, &manifest);
+}
+
+static int fixture_open(Fixture *fixture, ManifestRoot *root)
+{
+    memset(fixture, 0, sizeof(*fixture));
+    fixture->container_fd = -1;
+    fixture->data_fd = -1;
+    fixture->home_fd = -1;
+    if (snprintf(fixture->base, sizeof(fixture->base),
+                 "/tmp/migr_portable_replay_XXXXXX") < 0 ||
+        mkdtemp(fixture->base) == NULL)
+        return -1;
+    path_concat(fixture->container, sizeof(fixture->container),
+              fixture->base, "/container");
+    path_concat(fixture->home, sizeof(fixture->home), fixture->base, "/home");
+    if (mkdir(fixture->container, 0700) != 0 ||
+        mkdir(fixture->home, 0700) != 0)
+    {
+        fixture_close(fixture);
+        return -1;
+    }
+    fixture->container_fd = open_dir(fixture->container);
+    fixture->home_fd = open_dir(fixture->home);
+    if (fixture->container_fd < 0 || fixture->home_fd < 0)
+    {
+        fixture_close(fixture);
+        return -1;
+    }
+    if (mkdirat(fixture->container_fd, "data", 0700) != 0)
+    {
+        fixture_close(fixture);
+        return -1;
+    }
+    fixture->data_fd = openat(fixture->container_fd, "data",
+                              O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fixture->data_fd < 0)
+    {
+        fixture_close(fixture);
+        return -1;
+    }
+    Manifest manifest = {
+        .version = MANIFEST_CURRENT_VERSION,
+        .representation = CLONE_PORTABLE_SIDECAR,
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .sidecar_version = SIDECAR_VERSION,
+        .root_count = 1,
+        .roots = root
+    };
+    if (manifest_write_v1_at(fixture->container_fd, &manifest) != 0)
+    {
+        fixture_close(fixture);
+        return -1;
+    }
+    return 0;
+}
+
+static int append_entries(SidecarLog *log, const SidecarEntry *entries,
+                          size_t count, const char *xattr_name)
+{
+    for (size_t index = 0; index < count; index++)
+    {
+        SidecarClaim claim = {
+            .root_id = entries[index].root_id,
+            .logical_path = entries[index].logical_path,
+            .physical_leaf = entries[index].physical_leaf,
+            .kind = entries[index].kind
+        };
+        if (sidecar_log_append_claim(log, &claim) != SIDECAR_STATUS_OK)
+            return -1;
+        if (sidecar_log_append_entry(log, &entries[index]) !=
+                SIDECAR_STATUS_OK ||
+            (entries[index].xattr_count != 0 &&
+             sidecar_log_append_xattr(log, &(SidecarXattr){
+                 .name = text_bytes(xattr_name != NULL
+                                        ? xattr_name : "user.migr_test"),
+                 .value = text_bytes("value")
+             }) != SIDECAR_STATUS_OK) ||
+            sidecar_log_append_entry_commit(log) != SIDECAR_STATUS_OK)
+            return -1;
+    }
+    return 0;
+}
+
+static int write_sidecar(Fixture *fixture, const SidecarEntry *entries,
+                         size_t count, const SidecarDelete *deletion,
+                         const char *xattr_name)
+{
+    SidecarLog log = {0};
+    SidecarEntry *filled = malloc((count != 0 ? count : 1U) * sizeof(*filled));
+    if (filled == NULL)
+        return -1;
+    fixture_fill_content_digests(fixture->data_fd, entries, count, filled);
+    int result = 0;
+    if (sidecar_log_create_at(fixture->container_fd, &log) !=
+            SIDECAR_OPEN_FRESH ||
+        append_entries(&log, filled, count, xattr_name) != 0 ||
+        (deletion != NULL && sidecar_log_append_delete(&log, deletion) !=
+             SIDECAR_STATUS_OK) ||
+        sidecar_log_close(&log) != SIDECAR_STATUS_OK)
+        result = -1;
+    free(filled);
+    return result;
+}
+
+static int write_raw_entries_sidecar(Fixture *fixture,
+                                     const SidecarEntry *entries,
+                                     size_t count)
+{
+    SidecarLog log = {0};
+    if ((entries == NULL && count != 0) ||
+        sidecar_log_create_at(fixture->container_fd, &log) !=
+            SIDECAR_OPEN_FRESH ||
+        sidecar_log_close(&log) != SIDECAR_STATUS_OK)
+        return -1;
+    int fd = openat(fixture->container_fd, SIDECAR_SLOT_NAME,
+                    O_WRONLY | O_APPEND | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    SidecarEntry *filled = malloc((count != 0 ? count : 1U) * sizeof(*filled));
+    int result = filled != NULL;
+    if (result)
+        fixture_fill_content_digests(fixture->data_fd, entries, count, filled);
+    for (size_t index = 0; index < count && result; index++)
+        result = sidecar_write_entry(fd, &filled[index]) == 0 &&
+                 sidecar_write_entry_commit(fd) == 0;
+    free(filled);
+    if (close(fd) != 0)
+        result = 0;
+    return result ? 0 : -1;
+}
+
+static int append_raw_sidecar(Fixture *fixture, const unsigned char *data,
+                               size_t length)
+{
+    int fd = openat(fixture->container_fd, SIDECAR_SLOT_NAME,
+                    O_WRONLY | O_APPEND | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    int result = write(fd, data, length) == (ssize_t)length ? 0 : -1;
+    if (close(fd) != 0)
+        result = -1;
+    return result;
+}
+
+static int raw_field(unsigned char *buffer, size_t capacity, size_t *length,
+                     const unsigned char *data, size_t data_length)
+{
+    if (buffer == NULL || length == NULL || *length >= capacity ||
+        data_length >= capacity - *length)
+        return -1;
+    if (data_length != 0)
+        memcpy(buffer + *length, data, data_length);
+    *length += data_length;
+    buffer[(*length)++] = '\0';
+    return 0;
+}
+
+static int raw_text_field(unsigned char *buffer, size_t capacity,
+                          size_t *length, const char *text)
+{
+    return raw_field(buffer, capacity, length,
+                     (const unsigned char *)text, strlen(text));
+}
+
+static int append_raw_suffix_entry_fields(Fixture *fixture,
+                                          const char *logical,
+                                          const char *physical_leaf,
+                                          const unsigned char *suffix,
+                                          size_t suffix_length,
+                                          const char *kind,
+                                          const char *mode)
+{
+    unsigned char raw[512];
+    size_t length = 0;
+    if (raw_text_field(raw, sizeof(raw), &length, "ENTRY") != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, "ROOT") != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, logical) != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, physical_leaf) != 0 ||
+        raw_field(raw, sizeof(raw), &length, suffix, suffix_length) != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, kind) != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, mode) != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, "0") != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, "0") != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, "0") != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, "0") != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, "0") != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, "0") != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, "0") != 0 ||
+        raw_text_field(raw, sizeof(raw), &length, "0") != 0)
+        return -1;
+
+    static const unsigned char commit[] = {
+        'E', 'N', 'T', 'R', 'Y', '_', 'C', 'O', 'M', 'M', 'I', 'T', '\0'
+    };
+    SidecarLog log = {0};
+    if (sidecar_log_create_at(fixture->container_fd, &log) !=
+            SIDECAR_OPEN_FRESH ||
+        sidecar_log_close(&log) != SIDECAR_STATUS_OK ||
+        append_raw_sidecar(fixture, raw, length) != 0 ||
+        append_raw_sidecar(fixture, commit, sizeof(commit)) != 0)
+        return -1;
+    return 0;
+}
+
+static int append_raw_suffix_entry(Fixture *fixture,
+                                   const unsigned char *suffix,
+                                   size_t suffix_length)
+{
+    return append_raw_suffix_entry_fields(fixture, "file", "file", suffix,
+                                          suffix_length, "regular", "600");
+}
+
+static int run_preflight_with_xdg(
+    Fixture *fixture, const char * const *destination_xdg_dirs)
+{
+    Manifest manifest;
+    if (manifest_read_v1_at(fixture->container_fd, &manifest) !=
+            MANIFEST_STATUS_VALID)
+        return -1;
+    PortableRestorePreflightReport report;
+    portable_restore_preflight_report_init(&report);
+    PortableRestoreRequest request = {
+        .source_container_fd = fixture->container_fd,
+        .manifest = &manifest,
+        .destination_home_fd = fixture->home_fd,
+        .destination_home_path = fixture->home,
+        .destination_timestamp_policy = {
+            .nsec_exact = 1,
+            .configured = 1
+        }
+    };
+    for (int index = 0; index < XDG_KEY_COUNT; index++)
+        request.destination_xdg_dirs[index] =
+            destination_xdg_dirs == NULL ? NULL : destination_xdg_dirs[index];
+    int result = portable_restore_preflight_at(&request, &report);
+    portable_restore_preflight_report_free(&report);
+    manifest_free(&manifest);
+    return result;
+}
+
+static int run_preflight(Fixture *fixture)
+{
+    return run_preflight_with_xdg(fixture, NULL);
+}
+
+static int run_replay_with_capture(
+    Fixture *fixture, PortableRestoreReplayReport *report,
+    BackupCaptureReport *capture_report);
+
+static int run_replay_with_options(
+    Fixture *fixture, PortableRestoreReplayReport *report,
+    BackupCaptureReport *capture_report, int skip_content_verification,
+    void (*before_content_verification)(void *),
+    void *before_content_verification_context);
+
+static int run_replay_with_xdg(
+    Fixture *fixture, PortableRestoreReplayReport *report,
+    const char * const *destination_xdg_dirs);
+
+static int run_replay(Fixture *fixture, PortableRestoreReplayReport *report)
+{
+    return run_replay_with_capture(fixture, report, NULL);
+}
+
+static int run_replay_with_capture(
+    Fixture *fixture, PortableRestoreReplayReport *report,
+    BackupCaptureReport *capture_report)
+{
+    return run_replay_with_options(fixture, report, capture_report, 0, NULL,
+                                   NULL);
+}
+
+// Deferral options every run_replay*() passes on (D66); unset by default.
+static const PortableRestoreDeferredPath *replay_deferred_paths;
+static size_t replay_deferred_path_count;
+static int (*replay_before_deferred)(void *);
+static void *replay_before_deferred_context;
+// A desktop session runs unless a test says otherwise (D65, D100).
+static int replay_session_running = 1;
+
+static int run_replay_with_options(
+    Fixture *fixture, PortableRestoreReplayReport *report,
+    BackupCaptureReport *capture_report, int skip_content_verification,
+    void (*before_content_verification)(void *),
+    void *before_content_verification_context)
+{
+    Manifest manifest;
+    if (manifest_read_v1_at(fixture->container_fd, &manifest) !=
+            MANIFEST_STATUS_VALID)
+        return -1;
+    PortableRestoreRequest request = {
+        .source_container_fd = fixture->container_fd,
+        .manifest = &manifest,
+        .destination_home_fd = fixture->home_fd,
+        .destination_home_path = fixture->home,
+        .destination_timestamp_policy = {
+            .nsec_exact = 1,
+            .configured = 1
+        },
+        .capture_report = capture_report,
+        .skip_content_verification = skip_content_verification,
+        .before_content_verification = before_content_verification,
+        .before_content_verification_context =
+            before_content_verification_context,
+        .deferred_paths = replay_deferred_paths,
+        .deferred_path_count = replay_deferred_path_count,
+        .before_deferred = replay_before_deferred,
+        .before_deferred_context = replay_before_deferred_context,
+        .session_running = replay_session_running
+    };
+    portable_restore_replay_report_init(report);
+    int result = portable_restore_replay_at(&request, report);
+    manifest_free(&manifest);
+    return result;
+}
+
+static int run_replay_with_xdg(
+    Fixture *fixture, PortableRestoreReplayReport *report,
+    const char * const *destination_xdg_dirs)
+{
+    Manifest manifest;
+    if (manifest_read_v1_at(fixture->container_fd, &manifest) !=
+            MANIFEST_STATUS_VALID)
+        return -1;
+    PortableRestoreRequest request = {
+        .source_container_fd = fixture->container_fd,
+        .manifest = &manifest,
+        .destination_home_fd = fixture->home_fd,
+        .destination_home_path = fixture->home,
+        .destination_timestamp_policy = {
+            .nsec_exact = 1,
+            .configured = 1
+        },
+        .session_running = replay_session_running
+    };
+    for (int index = 0; index < XDG_KEY_COUNT; index++)
+        request.destination_xdg_dirs[index] =
+            destination_xdg_dirs == NULL ? NULL : destination_xdg_dirs[index];
+    portable_restore_replay_report_init(report);
+    int result = portable_restore_replay_at(&request, report);
+    manifest_free(&manifest);
+    return result;
+}
+
+typedef enum {
+    VERIFICATION_MUTATION_NONE = 0,
+    VERIFICATION_MUTATION_REWRITE_FILE,
+    VERIFICATION_MUTATION_TRUNCATE_FILE,
+    VERIFICATION_MUTATION_REPLACE_FILE_WITH_SYMLINK,
+    VERIFICATION_MUTATION_REPLACE_PARENT_WITH_SYMLINK,
+    VERIFICATION_MUTATION_REPLACE_SYMLINK_TARGET,
+    VERIFICATION_MUTATION_REPLACE_HARDLINK_ALIAS,
+    VERIFICATION_MUTATION_REWRITE_TWO_OF_THREE,
+    VERIFICATION_MUTATION_WRITE_FILE,
+    VERIFICATION_MUTATION_REMOVE_FILE,
+    VERIFICATION_MUTATION_RESIZE_KEEPING_TIMES
+} VerificationMutation;
+
+// Changes content while keeping size and times, the way corruption below
+// the filesystem looks: nothing a writing program would leave behind.
+// Flips the first byte in place, keeping size and times.
+static void flip_first_byte_at(int dir_fd, const char *name)
+{
+    struct stat before;
+    unsigned char byte = 0;
+    int fd = openat(dir_fd, name, O_RDWR | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0 || fstat(fd, &before) != 0 || pread(fd, &byte, 1, 0) != 1)
+        fatal("could not read a file to corrupt");
+    byte ^= 0xFF;
+    if (pwrite(fd, &byte, 1, 0) != 1 || close(fd) != 0)
+        fatal("could not corrupt a file");
+    struct timespec times[2] = { before.st_atim, before.st_mtim };
+    if (utimensat(dir_fd, name, times, AT_SYMLINK_NOFOLLOW) != 0)
+        fatal("could not keep a corrupted file's times");
+}
+
+static void corrupt_file_at(int dir_fd, const char *name, const char *text)
+{
+    struct stat before;
+    if (fstatat(dir_fd, name, &before, AT_SYMLINK_NOFOLLOW) != 0)
+        fatal("could not inspect a file to corrupt");
+    write_file_at(dir_fd, name, text);
+    struct timespec times[2] = { before.st_atim, before.st_mtim };
+    if (utimensat(dir_fd, name, times, AT_SYMLINK_NOFOLLOW) != 0)
+        fatal("could not keep a corrupted file's times");
+}
+
+static Fixture *verification_mutation_fixture;
+static VerificationMutation verification_mutation;
+
+static void mutate_after_replay_apply(void)
+{
+    if (verification_mutation_fixture == NULL ||
+        verification_mutation == VERIFICATION_MUTATION_NONE)
+        fatal("invalid verification mutation hook state");
+
+    int root_fd = openat(verification_mutation_fixture->home_fd, "restored",
+                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (root_fd < 0)
+        fatal("could not open restored root for verification mutation");
+
+    switch (verification_mutation)
+    {
+        case VERIFICATION_MUTATION_REWRITE_FILE:
+            corrupt_file_at(root_fd, "file", "ABCDEFGH");
+            break;
+        case VERIFICATION_MUTATION_WRITE_FILE:
+            // Same length: only the new mtime tells a later write apart.
+            write_file_at(root_fd, "file", "ABCDEFGH");
+            break;
+        case VERIFICATION_MUTATION_REMOVE_FILE:
+            if (unlinkat(root_fd, "file", 0) != 0)
+                fatal("could not remove the restored file");
+            break;
+        case VERIFICATION_MUTATION_RESIZE_KEEPING_TIMES:
+            corrupt_file_at(root_fd, "file", "a longer text than before");
+            break;
+        case VERIFICATION_MUTATION_TRUNCATE_FILE:
+        {
+            int fd = openat(root_fd, "file", O_WRONLY | O_TRUNC | O_CLOEXEC);
+            if (fd < 0 || close(fd) != 0)
+                fatal("could not truncate restored file before verification");
+            break;
+        }
+        case VERIFICATION_MUTATION_REPLACE_FILE_WITH_SYMLINK:
+            if (unlinkat(root_fd, "file", 0) != 0 ||
+                symlinkat("../outside", root_fd, "file") != 0)
+                fatal("could not replace restored file with symlink");
+            break;
+        case VERIFICATION_MUTATION_REPLACE_PARENT_WITH_SYMLINK:
+        {
+            int nested_fd = openat(root_fd, "nested",
+                                   O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                                       O_CLOEXEC);
+            if (nested_fd < 0 || unlinkat(nested_fd, "file", 0) != 0 ||
+                close(nested_fd) != 0 ||
+                unlinkat(root_fd, "nested", AT_REMOVEDIR) != 0 ||
+                symlinkat("../outside-dir", root_fd, "nested") != 0)
+                fatal("could not replace restored parent with symlink");
+            break;
+        }
+        case VERIFICATION_MUTATION_REPLACE_SYMLINK_TARGET:
+            if (unlinkat(root_fd, "link", 0) != 0 ||
+                symlinkat("other-target", root_fd, "link") != 0)
+                fatal("could not replace restored symlink target");
+            break;
+        case VERIFICATION_MUTATION_REPLACE_HARDLINK_ALIAS:
+            if (unlinkat(root_fd, "alias", 0) != 0)
+                fatal("could not remove restored hardlink alias");
+            write_file_at(root_fd, "alias", "hardlink payload");
+            break;
+        case VERIFICATION_MUTATION_REWRITE_TWO_OF_THREE:
+            corrupt_file_at(root_fd, "a", "AAAA");
+            corrupt_file_at(root_fd, "c", "CCCC");
+            break;
+        case VERIFICATION_MUTATION_NONE:
+            break;
+    }
+
+    if (close(root_fd) != 0)
+        fatal("could not close restored root after verification mutation");
+}
+
+static void set_verification_mutation(Fixture *fixture,
+                                      VerificationMutation mutation)
+{
+    verification_mutation_fixture = fixture;
+    verification_mutation = mutation;
+    portable_restore_replay_test_set_after_apply_hook(
+        mutation == VERIFICATION_MUTATION_NONE ? NULL : mutate_after_replay_apply);
+}
+
+static void clear_verification_mutation(void)
+{
+    portable_restore_replay_test_set_after_apply_hook(NULL);
+    verification_mutation = VERIFICATION_MUTATION_NONE;
+    verification_mutation_fixture = NULL;
+}
+
+typedef struct {
+    PortableRestoreReplayReport *report;
+    int calls;
+    size_t checked_when_called;
+    size_t regular_reads_when_called;
+} VerificationBoundaryProbe;
+
+static void note_verification_boundary(void *context)
+{
+    VerificationBoundaryProbe *probe = context;
+    if (probe == NULL)
+        return;
+    probe->calls++;
+    probe->checked_when_called = probe->report == NULL ? SIZE_MAX :
+                                 probe->report->verification_checked_count;
+    probe->regular_reads_when_called =
+        portable_restore_replay_test_verification_regular_read_count();
+}
+
+static int regular_verification_fixture_open(Fixture *fixture,
+                                             const char *payload)
+{
+    ManifestRoot root = root_for();
+    if (fixture_open(fixture, &root) != 0)
+        return -1;
+    make_dir_at(fixture->data_fd, "ROOT", 0700);
+    write_file_at(fixture->data_fd, "ROOT/file", payload);
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000620, 1, 1700000621, 2),
+        entry_for("ROOT", "file", "file", SIDECAR_KIND_REGULAR,
+                  strlen(payload), 0600,
+                  1700000622, 3, 1700000623, 4)
+    };
+    if (write_sidecar(fixture, entries, 2, NULL, NULL) != 0)
+    {
+        fixture_close(fixture);
+        return -1;
+    }
+    return 0;
+}
+
+static int run_portable_mount_case(
+    Fixture *fixture, const char *documents_root, const char *downloads_root,
+    const char *documents_shared, const char *downloads_shared,
+    const char *sentinel)
+{
+    pid_t pid = fork();
+    if (pid < 0)
+        fatal("could not fork portable mount-view fixture");
+    if (pid == 0)
+    {
+        if (setup_bind_mount_namespace() != 0 ||
+            mount(downloads_shared, documents_shared, NULL, MS_BIND, NULL) != 0)
+            _exit(CHILD_SKIP);
+
+        struct stat documents_st, downloads_st;
+        unsigned int documents_mount_id, downloads_mount_id;
+        if (stat(documents_shared, &documents_st) != 0 ||
+            stat(downloads_shared, &downloads_st) != 0 ||
+            documents_st.st_dev != downloads_st.st_dev ||
+            documents_st.st_ino != downloads_st.st_ino ||
+            path_mount_id(documents_shared, &documents_mount_id) != 0 ||
+            path_mount_id(downloads_shared, &downloads_mount_id) != 0 ||
+            documents_mount_id == downloads_mount_id)
+            _exit(CHILD_SKIP);
+
+        const char *xdg_dirs[XDG_KEY_COUNT] = {0};
+        xdg_dirs[0] = documents_root;
+        xdg_dirs[1] = downloads_root;
+        int result = run_preflight_with_xdg(
+            fixture, (const char * const *)xdg_dirs);
+        _exit(result != 0 && file_equals_noatime(sentinel, "ORIGINAL")
+                  ? 0 : 1);
+    }
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0)
+        fatal("could not wait for portable mount-view fixture");
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+/* Keep this at the identity-graph boundary: a full restore with two directory
+ * metadata owners would correctly stop earlier on R2a's alias collision. */
+static int run_nested_mount_view_graph_case(
+    const char *documents_root, const char *downloads_root,
+    const char *documents_shared, const char *downloads_shared,
+    const char *alternate)
+{
+    pid_t pid = fork();
+    if (pid < 0)
+        fatal("could not fork portable nested mount-view fixture");
+    if (pid == 0)
+    {
+        if (setup_bind_mount_namespace() != 0 ||
+            mount(downloads_shared, documents_shared, NULL, MS_BIND, NULL) != 0)
+            _exit(CHILD_SKIP);
+
+        struct stat documents_st, downloads_st;
+        unsigned int documents_mount_id, downloads_mount_id;
+        if (stat(documents_shared, &documents_st) != 0 ||
+            stat(downloads_shared, &downloads_st) != 0 ||
+            documents_st.st_dev != downloads_st.st_dev ||
+            documents_st.st_ino != downloads_st.st_ino ||
+            path_mount_id(documents_shared, &documents_mount_id) != 0 ||
+            path_mount_id(downloads_shared, &downloads_mount_id) != 0 ||
+            documents_mount_id == downloads_mount_id)
+            _exit(CHILD_SKIP);
+
+        char documents_desc[PATH_MAX];
+        path_concat(documents_desc, sizeof(documents_desc),
+                  documents_shared, "/desc");
+        if (mount(alternate, documents_desc, NULL, MS_BIND, NULL) != 0)
+            _exit(CHILD_SKIP);
+
+        int documents_fd = open_dir(documents_root);
+        int downloads_fd = open_dir(downloads_root);
+        if (documents_fd < 0 || downloads_fd < 0)
+            _exit(1);
+
+        DestinationIdentityGraph graph;
+        destination_identity_graph_init(
+            &graph, DESTINATION_IDENTITY_PORTABLE_BOUNDS);
+        DestinationIdentityPlacement placement;
+        size_t conflicting_owner;
+        DestinationIdentityNameConflict name_conflict;
+        errno = 0;
+        DestinationIdentityStatus first = destination_identity_graph_add(
+            &graph, downloads_fd, "shared/desc/docs-file",
+            DESTINATION_IDENTITY_NON_DIRECTORY, 1, &placement,
+            &conflicting_owner, &name_conflict);
+        errno = 0;
+        DestinationIdentityStatus second = destination_identity_graph_add(
+            &graph, documents_fd, "shared/desc/downloads-file",
+            DESTINATION_IDENTITY_NON_DIRECTORY, 2, &placement,
+            &conflicting_owner, &name_conflict);
+        int second_errno = errno;
+        destination_identity_graph_free(&graph);
+        close(documents_fd);
+        close(downloads_fd);
+        _exit(first == DESTINATION_IDENTITY_OK &&
+              second == DESTINATION_IDENTITY_COLLISION &&
+              second_errno == EISDIR ? 0 : 1);
+    }
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0)
+        fatal("could not wait for portable nested mount-view fixture");
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+static void test_symlink_collection_validation(void)
+{
+    printf(BLUE "::" NC " portable symlink replay collection validation\n");
+    SidecarEntry entry = entry_for("ROOT", "link", "link",
+                                   SIDECAR_KIND_SYMLINK, 0, 0777,
+                                   1700000300, 11, 1700000301, 22);
+    entry.symlink_target = text_bytes("target");
+
+    struct stat desired;
+    check(replay_entry_valid(&entry),
+          "well-formed symlink entry is accepted by collection validation");
+    check(replay_stat_from_entry(&entry, &desired) == 0 &&
+              S_ISLNK(desired.st_mode) &&
+              (desired.st_mode & 07777) == 0777 &&
+              desired.st_uid == (uid_t)geteuid() &&
+              desired.st_gid == (gid_t)getegid() &&
+              desired.st_atim.tv_sec == 1700000300 &&
+              desired.st_atim.tv_nsec == 11 &&
+              desired.st_mtim.tv_sec == 1700000301 &&
+              desired.st_mtim.tv_nsec == 22,
+          "symlink desired stat carries type, ownership, and timestamps");
+
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "symlink collection fixture is created");
+    if (opened == 0)
+    {
+        make_dir_at(fixture.data_fd, "ROOT", 0700);
+        write_file_at(fixture.data_fd, "ROOT/link", "");
+        make_dir_at(fixture.home_fd, "restored", 0700);
+        // A file or symlink would give way to the backup's symlink (D96).
+        if (mkfifoat(fixture.home_fd, "restored/link", 0600) != 0)
+            fatal("could not plant the FIFO");
+        SidecarEntry entries[] = {
+            entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                      1700000200, 0, 1700000201, 0),
+            entry
+        };
+        check(write_sidecar(&fixture, entries, 2, NULL, NULL) == 0,
+              "well-formed symlink sidecar is committed");
+        PortableRestoreReplayReport report;
+        int result = run_replay(&fixture, &report);
+        char restored[PATH_MAX];
+        path_concat(restored, sizeof(restored), fixture.home, "/restored/link");
+        check(result != 0 && report.live_count == 2 &&
+                  report.failed_count == 1 &&
+                  strcmp(report.failed_logical_path, "link") == 0 &&
+                  report.failed_kind_valid &&
+                  report.failed_kind == SIDECAR_KIND_SYMLINK &&
+                  report.failure_step ==
+                      PORTABLE_RESTORE_REPLAY_FAILURE_CHECK_DESTINATION &&
+                  report.failure_errno == EEXIST,
+              "collection accepts the symlink before destination validation fails");
+        struct stat restored_st;
+        check(lstat(restored, &restored_st) == 0 &&
+                  S_ISFIFO(restored_st.st_mode),
+              "collection failure leaves the destination untouched");
+        fixture_close(&fixture);
+    }
+
+    Fixture missing;
+    opened = fixture_open(&missing, &root);
+    check(opened == 0, "missing-placeholder fixture is created");
+    if (opened == 0)
+    {
+        make_dir_at(missing.data_fd, "ROOT", 0700);
+        write_file_at(missing.home_fd, "sentinel", "untouched");
+        SidecarEntry entries[] = {
+            entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                      1700000200, 0, 1700000201, 0),
+            entry
+        };
+        check(write_sidecar(&missing, entries, 2, NULL, NULL) == 0,
+              "missing-placeholder sidecar is committed");
+        PortableRestoreReplayReport report;
+        int result = run_replay(&missing, &report);
+        char sentinel[PATH_MAX];
+        path_concat(sentinel, sizeof(sentinel), missing.home, "/sentinel");
+        check(result != 0 && report.failed_count == 1 &&
+                  strcmp(report.failed_logical_path, "link") == 0 &&
+                  report.failed_kind_valid &&
+                  report.failed_kind == SIDECAR_KIND_SYMLINK &&
+                  report.failure_step ==
+                      PORTABLE_RESTORE_REPLAY_FAILURE_VERIFY_PLACEHOLDER &&
+                  report.failure_errno == ENOENT &&
+                  file_equals_noatime(sentinel, "untouched"),
+              "missing symlink placeholder is rejected during collection");
+        fixture_close(&missing);
+    }
+
+    Fixture redirected;
+    opened = fixture_open(&redirected, &root);
+    check(opened == 0, "payload-redirect fixture is created");
+    if (opened == 0)
+    {
+        make_dir_at(redirected.data_fd, "ROOT", 0700);
+        write_file_at(redirected.home_fd, "sentinel", "untouched");
+        char outside[PATH_MAX], payload_link[PATH_MAX];
+        path_concat(outside, sizeof(outside), redirected.base, "/outside");
+        if (mkdir(outside, 0700) != 0)
+            fatal("could not create payload redirect target");
+        path_concat(payload_link, sizeof(payload_link), redirected.base,
+                  "/container/data/ROOT/link");
+        check(symlink(outside, payload_link) == 0,
+              "payload placeholder symlink is planted");
+        SidecarEntry entries[] = {
+            entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                      1700000200, 0, 1700000201, 0),
+            entry
+        };
+        check(write_sidecar(&redirected, entries, 2, NULL, NULL) == 0,
+              "payload-redirect sidecar is committed");
+        PortableRestoreReplayReport report;
+        int result = run_replay(&redirected, &report);
+        char sentinel[PATH_MAX];
+        path_concat(sentinel, sizeof(sentinel), redirected.home, "/sentinel");
+        check(result != 0 && report.failed_count == 1 &&
+                  strcmp(report.failed_logical_path, "link") == 0 &&
+                  report.failed_kind_valid &&
+                  report.failed_kind == SIDECAR_KIND_SYMLINK &&
+                  report.failure_step ==
+                      PORTABLE_RESTORE_REPLAY_FAILURE_VERIFY_PLACEHOLDER &&
+                  report.failure_errno != 0 &&
+                  file_equals_noatime(sentinel, "untouched"),
+              "payload placeholder redirect is rejected during collection");
+        fixture_close(&redirected);
+    }
+
+    SidecarEntry empty_target = entry;
+    empty_target.symlink_target = (SidecarBytes){0};
+    check(!replay_entry_valid(&empty_target),
+          "empty symlink target is rejected");
+
+    SidecarEntry xattr = entry;
+    xattr.xattr_count = 1;
+    check(replay_entry_valid(&xattr),
+          "xattr-bearing symlink entries are valid (replay now applies them)");
+
+    SidecarEntry sized = entry;
+    sized.size = 1;
+    check(!replay_entry_valid(&sized),
+          "nonzero symlink size is rejected");
+
+    unsigned char oversized_target[SIDECAR_MAX_SYMLINK_TARGET + 1U];
+    memset(oversized_target, 'x', sizeof(oversized_target));
+    SidecarEntry oversized = entry;
+    oversized.symlink_target = (SidecarBytes){
+        .data = oversized_target,
+        .length = sizeof(oversized_target)
+    };
+    check(!replay_entry_valid(&oversized),
+          "oversized symlink target is rejected");
+
+    SidecarEntry fifo = entry_for("ROOT", "fifo", "fifo",
+                                  SIDECAR_KIND_FIFO, 0, 0644,
+                                  1700000300, 11, 1700000301, 22);
+    struct stat fifo_desired;
+    errno = 0;
+    check(replay_stat_from_entry(&fifo, &fifo_desired) == -1 &&
+              errno == EINVAL,
+          "a FIFO entry is rejected, not silently treated as regular");
+}
+
+static void test_hardlink_identity_validation(void)
+{
+    printf(BLUE "::" NC " hardlink identity readback validation\n");
+    struct stat linked = {0};
+    struct stat reference = {0};
+    linked.st_dev = 1;
+    linked.st_ino = 42;
+    reference.st_dev = 1;
+    reference.st_ino = 42;
+    check(replay_hardlink_identity_matches(&linked, &reference),
+          "matching dev/ino is accepted");
+
+    reference.st_ino = 43;
+    check(!replay_hardlink_identity_matches(&linked, &reference),
+          "mismatched ino is rejected");
+
+    reference.st_ino = 42;
+    reference.st_dev = 2;
+    check(!replay_hardlink_identity_matches(&linked, &reference),
+          "mismatched dev is rejected");
+}
+
+static int metadata_exact(const char *path, mode_t mode, uid_t uid, gid_t gid,
+                          int64_t atime_sec, long atime_nsec,
+                          int64_t mtime_sec, long mtime_nsec)
+{
+    struct stat st;
+    if (stat(path, &st) != 0)
+        return 0;
+    return (st.st_mode & 07777) == mode && st.st_uid == uid &&
+           st.st_gid == gid && st.st_atim.tv_sec == (time_t)atime_sec &&
+           st.st_atim.tv_nsec == atime_nsec &&
+           st.st_mtim.tv_sec == (time_t)mtime_sec &&
+           st.st_mtim.tv_nsec == mtime_nsec;
+}
+
+static void test_physical_logical_mismatch(void)
+{
+    printf(BLUE "::" NC " physical/logical invariant during replay\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "physical-mismatch fixture is created");
+    if (opened != 0)
+        return;
+
+    make_dir_at(fixture.data_fd, "ROOT", 0700);
+    write_file_at(fixture.data_fd, "ROOT/something-else.txt", "payload");
+    write_file_at(fixture.home_fd, "sentinel", "untouched");
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000000, 0, 1700000000, 0),
+        entry_for("ROOT", "innocuous.txt", "something-else.txt",
+                  SIDECAR_KIND_REGULAR, 7, 0644,
+                  1700000000, 0, 1700000000, 0)
+    };
+    check(write_sidecar(&fixture, entries, 2, NULL, NULL) == 0,
+          "physical-mismatch sidecar is committed");
+
+    PortableRestoreReplayReport report;
+    int result = run_replay(&fixture, &report);
+    check(result != 0 && report.failed_count == 1 &&
+              strcmp(report.failed_logical_path, "innocuous.txt") == 0,
+          "replay refuses a mismatched physical path");
+    char sentinel[PATH_MAX];
+    path_concat(sentinel, sizeof(sentinel), fixture.home, "/sentinel");
+    check(file_equals_noatime(sentinel, "untouched"),
+          "physical-mismatch refusal leaves the destination untouched");
+    fixture_close(&fixture);
+}
+
+static void test_shortened_leaf_replay(void)
+{
+    printf(BLUE "::" NC " canonical shortened physical leaf replay\n");
+    char logical[NAME_MAX + 1U];
+    memset(logical, '!', NAME_MAX);
+    logical[NAME_MAX] = '\0';
+    PortablePhysicalName mapped;
+    check(portable_physical_name_map(logical, 0, &mapped) == 0 &&
+              mapped.shortened,
+          "replay fixture maps an overlong encoded component canonically");
+
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "shortened replay fixture is created");
+    if (opened == 0)
+    {
+        make_dir_at(fixture.data_fd, "ROOT", 0700);
+        int payload_root = openat(fixture.data_fd, "ROOT",
+                                  O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (payload_root < 0)
+            fatal("could not open shortened replay payload root");
+        write_file_at(payload_root, mapped.physical_leaf, "payload");
+        if (close(payload_root) != 0)
+            fatal("could not close shortened replay payload root");
+        SidecarEntry entries[] = {
+            entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                      1700000000, 0, 1700000001, 0),
+            entry_for("ROOT", logical, mapped.physical_leaf,
+                      SIDECAR_KIND_REGULAR, 7, 0600,
+                      1700000002, 0, 1700000003, 0)
+        };
+        check(write_sidecar(&fixture, entries, 2, NULL, NULL) == 0,
+              "shortened replay sidecar is committed");
+        PortableRestoreReplayReport report;
+        int result = run_replay(&fixture, &report);
+        char logical_suffix[NAME_MAX + sizeof("/restored/")];
+        int n = snprintf(logical_suffix, sizeof(logical_suffix),
+                         "/restored/%s", logical);
+        if (n < 0 || (size_t)n >= sizeof(logical_suffix))
+            fatal("shortened logical destination path is too long");
+        char restored[PATH_MAX];
+        path_concat(restored, sizeof(restored), fixture.home, logical_suffix);
+        check(result == 0 && report.live_count == 2 &&
+                  report.applied_count == 2 && report.failed_count == 0 &&
+                  file_equals_noatime(restored, "payload"),
+              "canonical shortened leaf replays under the original logical name");
+        char physical_suffix[NAME_MAX + sizeof("/restored/")];
+        n = snprintf(physical_suffix, sizeof(physical_suffix),
+                     "/restored/%s", mapped.physical_leaf);
+        if (n < 0 || (size_t)n >= sizeof(physical_suffix))
+            fatal("shortened physical destination path is too long");
+        char leaked[PATH_MAX];
+        path_concat(leaked, sizeof(leaked), fixture.home, physical_suffix);
+        check(access(leaked, F_OK) != 0,
+              "shortening marker is never exposed as the destination name");
+        fixture_close(&fixture);
+    }
+
+    PortablePhysicalName suffixed;
+    check(portable_physical_name_map(logical, 1, &suffixed) == 0 &&
+              suffixed.shortened &&
+              strcmp(suffixed.collision_suffix, "%7E1") == 0,
+          "suffix-bearing shortened replay mapping is canonical");
+    Fixture suffix_fixture;
+    opened = fixture_open(&suffix_fixture, &root);
+    check(opened == 0, "suffix-shortened replay fixture is created");
+    if (opened == 0)
+    {
+        make_dir_at(suffix_fixture.data_fd, "ROOT", 0700);
+        int payload_root = openat(suffix_fixture.data_fd, "ROOT",
+                                  O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (payload_root < 0)
+            fatal("could not open suffix-shortened payload root");
+        write_file_at(payload_root, suffixed.physical_leaf, "payload");
+        if (close(payload_root) != 0)
+            fatal("could not close suffix-shortened payload root");
+        SidecarEntry entries[] = {
+            entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                      1700000000, 0, 1700000001, 0),
+            entry_for("ROOT", logical, suffixed.physical_leaf,
+                      SIDECAR_KIND_REGULAR, 7, 0600,
+                      1700000002, 0, 1700000003, 0)
+        };
+        entries[1].collision_suffix = text_bytes(suffixed.collision_suffix);
+        check(write_sidecar(&suffix_fixture, entries, 2, NULL, NULL) == 0,
+              "suffix-shortened replay sidecar is committed");
+        PortableRestoreReplayReport report;
+        check(run_replay(&suffix_fixture, &report) == 0 &&
+                  report.failed_count == 0,
+              "suffix-bearing shortened leaf authenticates during direct replay");
+        fixture_close(&suffix_fixture);
+    }
+
+    char tampered[NAME_MAX + 1U];
+    snprintf(tampered, sizeof(tampered), "%s", mapped.physical_leaf);
+    tampered[0] = tampered[0] == 'X' ? 'Y' : 'X';
+    Fixture corrupt;
+    opened = fixture_open(&corrupt, &root);
+    check(opened == 0, "tampered shortened replay fixture is created");
+    if (opened == 0)
+    {
+        make_dir_at(corrupt.data_fd, "ROOT", 0700);
+        int payload_root = openat(corrupt.data_fd, "ROOT",
+                                  O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (payload_root < 0)
+            fatal("could not open tampered shortened payload root");
+        write_file_at(payload_root, tampered, "payload");
+        if (close(payload_root) != 0)
+            fatal("could not close tampered shortened payload root");
+        write_file_at(corrupt.home_fd, "sentinel", "untouched");
+        SidecarEntry entries[] = {
+            entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                      1700000000, 0, 1700000001, 0),
+            entry_for("ROOT", logical, tampered, SIDECAR_KIND_REGULAR, 7, 0600,
+                      1700000002, 0, 1700000003, 0)
+        };
+        check(write_sidecar(&corrupt, entries, 2, NULL, NULL) == 0,
+              "tampered shortened replay sidecar is committed");
+        PortableRestoreReplayReport report;
+        int result = run_replay(&corrupt, &report);
+        char sentinel[PATH_MAX];
+        path_concat(sentinel, sizeof(sentinel), corrupt.home, "/sentinel");
+        check(result != 0 && report.failed_count == 1 &&
+                  file_equals_noatime(sentinel, "untouched"),
+              "tampered shortened leaf is refused before destination mutation");
+        fixture_close(&corrupt);
+    }
+}
+
+static void test_deep_parent_relative_replay(void)
+{
+    printf(BLUE "::" NC " deep parent-relative payload replay\n");
+    enum { DEPTH = 17, COMPONENT_LENGTH = 100 };
+    char component[COMPONENT_LENGTH + 1U];
+    memset(component, '!', COMPONENT_LENGTH);
+    component[COMPONENT_LENGTH] = '\0';
+    PortablePhysicalName mapped;
+    check(portable_physical_name_map(component, 0, &mapped) == 0 &&
+              mapped.shortened &&
+              DEPTH * strlen(mapped.physical_leaf) + (DEPTH - 1U) >
+                  SIDECAR_MAX_PATH,
+          "deep replay fixture crosses the joined compatibility-cache ceiling");
+
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "deep parent-relative replay fixture is created");
+    if (opened != 0)
+        return;
+    make_dir_at(fixture.data_fd, "ROOT", 0700);
+    int payload_parent = openat(fixture.data_fd, "ROOT",
+                                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (payload_parent < 0)
+        fatal("could not open deep replay payload root");
+
+    SidecarEntry entries[DEPTH + 2U];
+    entries[0] = entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                           1700000000, 0, 1700000001, 0);
+    char logical[DEPTH][SIDECAR_MAX_PATH + 1U];
+    size_t logical_length = 0;
+    for (size_t index = 0; index < DEPTH; index++)
+    {
+        size_t parent_length = logical_length;
+        if (index != 0)
+        {
+            memcpy(logical[index], logical[index - 1], parent_length);
+            logical[index][parent_length++] = '/';
+        }
+        memcpy(logical[index] + parent_length, component, COMPONENT_LENGTH);
+        logical_length = parent_length + COMPONENT_LENGTH;
+        logical[index][logical_length] = '\0';
+        entries[index + 1U] = entry_for(
+            "ROOT", logical[index], mapped.physical_leaf,
+            SIDECAR_KIND_DIRECTORY, 0, 0700,
+            1700000002 + (int64_t)index * 2, 0,
+            1700000003 + (int64_t)index * 2, 0);
+        if (mkdirat(payload_parent, mapped.physical_leaf, 0700) != 0)
+            fatal("could not create deep replay payload directory");
+        int next = openat(payload_parent, mapped.physical_leaf,
+                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (next < 0 || close(payload_parent) != 0)
+            fatal("could not descend through deep replay payload");
+        payload_parent = next;
+    }
+    check(logical_length < SIDECAR_MAX_PATH,
+          "deep replay fixture remains within the logical path ceiling");
+    static const char payload_text[] = "deep-payload";
+    write_file_at(payload_parent, "payload.txt", payload_text);
+    if (close(payload_parent) != 0)
+        fatal("could not close deep replay payload parent");
+
+    char file_logical[SIDECAR_MAX_PATH + 1U];
+    int file_logical_length = snprintf(file_logical, sizeof(file_logical),
+                                       "%s/payload.txt", logical[DEPTH - 1U]);
+    if (file_logical_length < 0 ||
+        (size_t)file_logical_length >= sizeof(file_logical))
+        fatal("deep replay file logical path is too long");
+    entries[DEPTH + 1U] = entry_for(
+        "ROOT", file_logical, "payload.txt", SIDECAR_KIND_REGULAR,
+        sizeof(payload_text) - 1U, 0600,
+        1700000100, 0, 1700000101, 0);
+    check(write_sidecar(&fixture, entries, DEPTH + 2U, NULL, NULL) == 0,
+          "deep parent-relative replay sidecar is committed");
+    write_file_at(fixture.home_fd, "sentinel", "untouched");
+    PortableRestoreReplayReport report;
+    int result = run_replay(&fixture, &report);
+    char sentinel[PATH_MAX];
+    path_concat(sentinel, sizeof(sentinel), fixture.home, "/sentinel");
+    char restored[PATH_MAX];
+    int restored_length = snprintf(restored, sizeof(restored), "%s/restored/%s",
+                                   fixture.home, file_logical);
+    check(restored_length > 0 && (size_t)restored_length < sizeof(restored) &&
+              result == 0 && report.failed_count == 0 &&
+              report.live_count == DEPTH + 2U &&
+              report.applied_count == DEPTH + 2U &&
+              file_equals_noatime(restored, payload_text) &&
+              file_equals_noatime(sentinel, "untouched"),
+          "deep physical ancestry replays exact bytes under the logical path");
+
+    /* The source physical chain intentionally exceeds PATH_MAX, so clean both
+     * deep chains by descriptor before the fixture's path-based teardown. */
+    int cleanup_fds[DEPTH + 1U];
+    remove_deep_chain_at(fixture.data_fd, "ROOT", mapped.physical_leaf, DEPTH,
+                         "payload.txt", cleanup_fds,
+                         sizeof(cleanup_fds) / sizeof(cleanup_fds[0]));
+    remove_deep_chain_at(fixture.home_fd, "restored", component, DEPTH,
+                         "payload.txt", cleanup_fds,
+                         sizeof(cleanup_fds) / sizeof(cleanup_fds[0]));
+    fixture_close(&fixture);
+}
+
+static void run_replay_suffix_refusal(const char *label, const char *suffix,
+                                      const char *physical,
+                                      ManifestRoot *root)
+{
+    Fixture fixture;
+    int opened = fixture_open(&fixture, root);
+    check(opened == 0, "suffix-refusal replay fixture is created");
+    if (opened != 0)
+        return;
+    make_dir_at(fixture.data_fd, "ROOT", 0700);
+    char payload_path[PATH_MAX];
+    int payload_length = snprintf(payload_path, sizeof(payload_path),
+                                  "ROOT/%s", physical);
+    if (payload_length < 0 || (size_t)payload_length >= sizeof(payload_path))
+        fatal("suffix fixture payload path is too long");
+    write_file_at(fixture.data_fd, payload_path, "payload");
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000000, 0, 1700000001, 0),
+        entry_for("ROOT", "file", physical, SIDECAR_KIND_REGULAR, 0, 0600,
+                  1700000000, 0, 1700000001, 0)
+    };
+    entries[1].collision_suffix = text_bytes(suffix);
+    check(write_sidecar(&fixture, entries, 2, NULL, NULL) == 0,
+          "suffix-refusal replay sidecar is committed");
+    PortableRestoreReplayReport report;
+    int result = run_replay(&fixture, &report);
+    check(result != 0 && report.failed_count == 1 &&
+              strcmp(report.failed_logical_path, "file") == 0,
+          label);
+    fixture_close(&fixture);
+}
+
+static void run_raw_replay_suffix_refusal(const char *label,
+                                          const unsigned char *suffix,
+                                          size_t suffix_length,
+                                          ManifestRoot *root)
+{
+    Fixture fixture;
+    int opened = fixture_open(&fixture, root);
+    check(opened == 0, "raw suffix-refusal replay fixture is created");
+    if (opened != 0)
+        return;
+    make_dir_at(fixture.data_fd, "ROOT", 0700);
+    write_file_at(fixture.data_fd, "ROOT/file", "payload");
+    check(append_raw_suffix_entry(&fixture, suffix, suffix_length) == 0,
+          "raw malformed suffix replay record is committed");
+    PortableRestoreReplayReport report;
+    int result = run_replay(&fixture, &report);
+    check(result != 0 && report.failed_count == 1,
+          label);
+    fixture_close(&fixture);
+}
+
+static void test_collision_suffix_validation(void)
+{
+    printf(BLUE "::" NC " parent-prefix and collision-suffix replay\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "suffixed replay fixture is created");
+    if (opened == 0)
+    {
+        make_dir_at(fixture.data_fd, "ROOT", 0700);
+        int payload_root = openat(fixture.data_fd, "ROOT",
+                                  O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (payload_root < 0)
+            fatal("could not open suffixed replay payload root");
+        make_dir_at(payload_root, "dir%7E1", 0700);
+        int suffixed_dir = openat(payload_root, "dir%7E1",
+                                  O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (suffixed_dir < 0)
+            fatal("could not open suffixed replay directory");
+        write_file_at(suffixed_dir, "file", "nested");
+        close(suffixed_dir);
+        write_file_at(payload_root, "Foo%7E1", "leaf");
+        close(payload_root);
+
+        SidecarEntry entries[] = {
+            entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                      1700000000, 0, 1700000001, 0),
+            entry_for("ROOT", "dir", "dir%7E1",
+                      SIDECAR_KIND_DIRECTORY, 0, 0700,
+                      1700000002, 0, 1700000003, 0),
+            entry_for("ROOT", "dir/file", "dir%7E1/file",
+                      SIDECAR_KIND_REGULAR, 6, 0600,
+                      1700000004, 0, 1700000005, 0),
+            entry_for("ROOT", "Foo", "Foo%7E1", SIDECAR_KIND_REGULAR, 4,
+                      0600, 1700000006, 0, 1700000007, 0)
+        };
+        entries[1].collision_suffix = text_bytes("%7E1");
+        entries[3].collision_suffix = text_bytes("%7E1");
+        check(write_sidecar(&fixture, entries, 4, NULL, NULL) == 0,
+              "suffixed replay sidecar is committed");
+        check(run_preflight(&fixture) == 0,
+              "suffixed ancestor state passes preflight");
+        PortableRestoreReplayReport report;
+        int result = run_replay(&fixture, &report);
+        check(result == 0 && report.live_count == 4 &&
+                  report.applied_count == 4 && report.failed_count == 0,
+              "suffixed ancestor and suffixed leaf replay successfully");
+        char nested[PATH_MAX], leaf[PATH_MAX];
+        path_concat(nested, sizeof(nested), fixture.home,
+                  "/restored/dir/file");
+        path_concat(leaf, sizeof(leaf), fixture.home, "/restored/Foo");
+        check(file_equals_noatime(nested, "nested"),
+              "child beneath a suffixed directory is restored by logical name");
+        check(file_equals_noatime(leaf, "leaf"),
+              "suffixed physical leaf is not exposed at the destination");
+        fixture_close(&fixture);
+    }
+
+    run_replay_suffix_refusal("suffix-lower-e", "%7e1", "file%7e1", &root);
+    run_replay_suffix_refusal("suffix-zero", "%7E0", "file%7E0", &root);
+    run_replay_suffix_refusal("suffix-leading-zero", "%7E01",
+                              "file%7E01", &root);
+    run_replay_suffix_refusal("suffix-no-digits", "%7E", "file%7E", &root);
+    run_replay_suffix_refusal("suffix-overflow",
+                              "%7E18446744073709551616",
+                              "file%7E18446744073709551616", &root);
+    static const unsigned char embedded_nul[] = { '%', '7', 'E', '\0', '1' };
+    run_raw_replay_suffix_refusal("suffix-embedded-nul", embedded_nul,
+                                  sizeof(embedded_nul), &root);
+    unsigned char overlong[SIDECAR_MAX_COLLISION_SUFFIX + 1U];
+    memset(overlong, '1', sizeof(overlong));
+    overlong[0] = '%';
+    overlong[1] = '7';
+    overlong[2] = 'E';
+    run_raw_replay_suffix_refusal("suffix-over-ceiling", overlong,
+                                  sizeof(overlong), &root);
+
+    Fixture missing;
+    opened = fixture_open(&missing, &root);
+    check(opened == 0, "missing-parent replay fixture is created");
+    if (opened == 0)
+    {
+        make_dir_at(missing.data_fd, "ROOT", 0700);
+        SidecarEntry child = entry_for("ROOT", "dir/file", "dir/file",
+                                       SIDECAR_KIND_REGULAR, 0, 0600,
+                                       1700000010, 0, 1700000011, 0);
+        check(write_raw_entries_sidecar(&missing, &child, 1) == 0,
+              "missing-parent replay sidecar is committed");
+        PortableRestoreReplayReport report;
+        check(run_replay(&missing, &report) != 0 &&
+                  report.failed_count == 1,
+              "missing parent entry is refused during replay");
+        fixture_close(&missing);
+    }
+
+    Fixture mismatch;
+    opened = fixture_open(&mismatch, &root);
+    check(opened == 0, "parent-mismatch replay fixture is created");
+    if (opened == 0)
+    {
+        make_dir_at(mismatch.data_fd, "ROOT", 0700);
+        int payload_root = openat(mismatch.data_fd, "ROOT",
+                                  O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (payload_root < 0)
+            fatal("could not open parent-mismatch replay root");
+        make_dir_at(payload_root, "dir%7E1", 0700);
+        close(payload_root);
+        SidecarEntry entries[] = {
+            entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                      1700000010, 0, 1700000011, 0),
+            entry_for("ROOT", "dir", "dir%7E1",
+                      SIDECAR_KIND_DIRECTORY, 0, 0700,
+                      1700000012, 0, 1700000013, 0),
+            entry_for("ROOT", "dir/file", "dir%7E1/other",
+                      SIDECAR_KIND_REGULAR, 0, 0600,
+                      1700000014, 0, 1700000015, 0)
+        };
+        entries[1].collision_suffix = text_bytes("%7E1");
+        check(write_sidecar(&mismatch, entries, 3, NULL, NULL) == 0,
+              "parent-mismatch replay sidecar is committed");
+        PortableRestoreReplayReport report;
+        check(run_replay(&mismatch, &report) != 0 &&
+                  report.failed_count == 1,
+              "child physical mismatch beneath a suffixed parent is refused during replay");
+        fixture_close(&mismatch);
+    }
+
+    Fixture root_suffix;
+    opened = fixture_open(&root_suffix, &root);
+    check(opened == 0, "root-suffix replay fixture is created");
+    if (opened == 0)
+    {
+        make_dir_at(root_suffix.data_fd, "ROOT", 0700);
+        static const unsigned char root_suffix_bytes[] = "%7E1";
+        check(append_raw_suffix_entry_fields(
+                  &root_suffix, "", "", root_suffix_bytes,
+                  sizeof(root_suffix_bytes) - 1U, "directory", "700") == 0,
+              "root-suffix replay sidecar is committed");
+        PortableRestoreReplayReport report;
+        check(run_replay(&root_suffix, &report) != 0 &&
+                  report.failed_count == 1,
+              "root payload entry cannot carry a collision suffix");
+        fixture_close(&root_suffix);
+    }
+}
+
+static void test_normal_replay(void)
+{
+    printf(BLUE "::" NC " normal replay and exact metadata\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "normal replay fixture is created");
+    if (opened != 0)
+        return;
+
+    make_dir_at(fixture.data_fd, "ROOT", 0700);
+    int root_fd = openat(fixture.data_fd, "ROOT",
+                         O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (root_fd < 0)
+        fatal("could not open payload root");
+    make_dir_at(root_fd, "nested", 0700);
+    int nested_fd = openat(root_fd, "nested",
+                           O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (nested_fd < 0)
+        fatal("could not open nested payload directory");
+    write_file_at(nested_fd, "file", "portable payload");
+    close(nested_fd);
+    close(root_fd);
+
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0500,
+                  1700000000, 123456789, 1700000010, 987654321),
+        entry_for("ROOT", "nested", "nested", SIDECAR_KIND_DIRECTORY, 0,
+                  0500, 1700000020, 111111111, 1700000030, 222222222),
+        entry_for("ROOT", "nested/file", "nested/file",
+                  SIDECAR_KIND_REGULAR, strlen("portable payload"), 0640,
+                  1700000040, 333333333, 1700000050, 444444444)
+    };
+    check(write_sidecar(&fixture, entries, 3, NULL, NULL) == 0,
+          "normal replay sidecar is committed");
+    write_file_at(fixture.home_fd, "sentinel", "untouched");
+    check(run_preflight(&fixture) == 0, "normal state passes preflight");
+
+    PortableRestoreReplayReport report;
+    int result = run_replay(&fixture, &report);
+    check(result == 0 && report.live_count == 3 &&
+              report.applied_count == 3 && report.failed_count == 0 &&
+              report.verification_checked_count == 1 &&
+              report.verification_failed_count == 0,
+          "all live entries replay successfully");
+
+    char restored_root[PATH_MAX], restored_nested[PATH_MAX],
+        restored_file[PATH_MAX], sentinel[PATH_MAX];
+    path_concat(restored_root, sizeof(restored_root), fixture.home, "/restored");
+    path_concat(restored_nested, sizeof(restored_nested), restored_root, "/nested");
+    path_concat(restored_file, sizeof(restored_file), restored_nested, "/file");
+    path_concat(sentinel, sizeof(sentinel), fixture.home, "/sentinel");
+    check(file_equals_noatime(restored_file, "portable payload"),
+          "regular payload content is restored");
+    check(metadata_exact(restored_root, 0500, (uid_t)geteuid(),
+                         (gid_t)getegid(), 1700000000, 123456789,
+                         1700000010, 987654321),
+          "root directory metadata is applied post-order");
+    check(metadata_exact(restored_nested, 0500, (uid_t)geteuid(),
+                         (gid_t)getegid(), 1700000020, 111111111,
+                         1700000030, 222222222),
+          "nested directory metadata is applied post-order");
+    check(metadata_exact(restored_file, 0640, (uid_t)geteuid(),
+                         (gid_t)getegid(), 1700000040, 333333333,
+                         1700000050, 444444444),
+          "regular metadata is applied exactly");
+    check(file_equals_noatime(sentinel, "untouched"),
+          "unrelated destination content remains untouched");
+    fixture_close(&fixture);
+}
+
+static void test_intermediate_folder_owner(void)
+{
+    printf(BLUE "::" NC " a folder made on the way to a root belongs to "
+           "the home's owner\n");
+    if (geteuid() != 0)
+    {
+        skip_case("intermediate folder owner", "needs root");
+        return;
+    }
+
+    ManifestRoot root = root_for();
+    snprintf(root.restore_path, sizeof(root.restore_path), ".var/app");
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "intermediate-owner fixture is created");
+    if (opened != 0)
+        return;
+
+    // The home of another user, as under sudo; a fresh install has no .var.
+    const uid_t owner = 65534;
+    const gid_t group = 65534;
+    if (fchown(fixture.home_fd, owner, group) != 0)
+        fatal("could not hand the fixture home to another user");
+    make_dir_at(fixture.data_fd, "ROOT", 0700);
+    write_file_at(fixture.data_fd, "ROOT/file", "data");
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0755,
+                  1700000700, 1, 1700000701, 2),
+        entry_for("ROOT", "file", "file", SIDECAR_KIND_REGULAR, 4, 0600,
+                  1700000702, 3, 1700000703, 4)
+    };
+    check(write_sidecar(&fixture, entries, 2, NULL, NULL) == 0,
+          "intermediate-owner sidecar is committed");
+
+    PortableRestoreReplayReport report;
+    check(run_replay(&fixture, &report) == 0 && report.failed_count == 0,
+          "a root below a missing folder restores");
+
+    struct stat made;
+    check(fstatat(fixture.home_fd, ".var", &made, AT_SYMLINK_NOFOLLOW) == 0 &&
+              S_ISDIR(made.st_mode) && made.st_uid == owner &&
+              made.st_gid == group && (made.st_mode & 07777) == 0700,
+          "the missing folder is made 0700 for the home's owner");
+    fixture_close(&fixture);
+}
+
+static void test_regular_content_verification(void)
+{
+    printf(BLUE "::" NC " portable restore verifies regular content after replay\n");
+
+    Fixture success;
+    int opened = regular_verification_fixture_open(&success, "abcdefgh");
+    check(opened == 0, "regular verification fixture is created");
+    if (opened == 0)
+    {
+        PortableRestoreReplayReport report;
+        VerificationBoundaryProbe probe = { .report = &report };
+        portable_restore_replay_test_reset_verification_regular_read_count();
+        int result = run_replay_with_options(
+            &success, &report, NULL, 0, note_verification_boundary, &probe);
+        check(result == 0 && report.applied_count == 2 &&
+                  report.failed_count == 0 &&
+                  report.verification_checked_count == 1 &&
+                  report.verification_failed_count == 0 &&
+                  portable_restore_replay_test_verification_regular_read_count() == 1,
+              "regular destination bytes are read back exactly once");
+        check(probe.calls == 1 && probe.checked_when_called == 0 &&
+                  probe.regular_reads_when_called == 0,
+              "verification boundary callback runs before destination readback");
+        fixture_close(&success);
+    }
+
+    Fixture rewritten;
+    opened = regular_verification_fixture_open(&rewritten, "abcdefgh");
+    check(opened == 0, "same-size corruption fixture is created");
+    if (opened == 0)
+    {
+        set_verification_mutation(&rewritten,
+                                  VERIFICATION_MUTATION_REWRITE_FILE);
+        PortableRestoreReplayReport report;
+        int result = run_replay(&rewritten, &report);
+        clear_verification_mutation();
+        check(result != 0 && report.applied_count == 2 &&
+                  report.failed_count == 1 &&
+                  report.verification_checked_count == 1 &&
+                  report.verification_failed_count == 1 &&
+                  strcmp(report.failed_root_id, "ROOT") == 0 &&
+                  strcmp(report.failed_logical_path, "file") == 0 &&
+                  report.failed_kind_valid &&
+                  report.failed_kind == SIDECAR_KIND_REGULAR &&
+                  report.failure_step ==
+                      PORTABLE_RESTORE_REPLAY_FAILURE_COMPARE_DESTINATION_CONTENT &&
+                  report.failure_errno == EIO,
+              "same-size post-copy corruption is a restore failure");
+        char reason[256];
+        check(replay_failure_reason_format(&report, reason, sizeof(reason)) == 1 &&
+                  strcmp(reason,
+                         "regular file, content differs from the backup") == 0,
+              "a content mismatch is described as such, not as an I/O error");
+        fixture_close(&rewritten);
+    }
+
+    Fixture truncated;
+    opened = regular_verification_fixture_open(&truncated, "abcdefgh");
+    check(opened == 0, "truncation verification fixture is created");
+    if (opened == 0)
+    {
+        set_verification_mutation(&truncated,
+                                  VERIFICATION_MUTATION_TRUNCATE_FILE);
+        PortableRestoreReplayReport report;
+        int result = run_replay(&truncated, &report);
+        clear_verification_mutation();
+        check(result == 0 && report.verification_checked_count == 1 &&
+                  report.verification_failed_count == 0 &&
+                  report.verification_changed_count == 1,
+              "a file truncated after it was restored is reported as changed "
+              "by another program, not as a failure");
+        fixture_close(&truncated);
+    }
+
+    static const VerificationMutation later_writes[] = {
+        VERIFICATION_MUTATION_WRITE_FILE, VERIFICATION_MUTATION_REMOVE_FILE,
+        VERIFICATION_MUTATION_RESIZE_KEEPING_TIMES
+    };
+    static const char *const later_labels[] = {
+        "a file another program rewrote after restore is not a failure",
+        "a file another program removed after restore is not a failure",
+        ("a file whose size changed after restore, even with its times "
+         "kept, is not a failure")
+    };
+    for (size_t index = 0; index < 3; index++)
+    {
+        Fixture later;
+        opened = regular_verification_fixture_open(&later, "abcdefgh");
+        check(opened == 0, "later-write verification fixture is created");
+        if (opened != 0)
+            continue;
+        set_verification_mutation(&later, later_writes[index]);
+        PortableRestoreReplayReport report;
+        int result = run_replay(&later, &report);
+        clear_verification_mutation();
+        check(result == 0 && report.verification_failed_count == 0 &&
+                  report.verification_changed_count == 1 &&
+                  report.failure_step == PORTABLE_RESTORE_REPLAY_FAILURE_NONE,
+              later_labels[index]);
+        fixture_close(&later);
+    }
+
+    Fixture damaged;
+    opened = regular_verification_fixture_open(&damaged, "abcdefgh");
+    check(opened == 0, "damaged backup payload fixture is created");
+    if (opened == 0)
+    {
+        // Same size, different bytes: only the capture digest can tell.
+        write_file_at(damaged.data_fd, "ROOT/file", "abcdefgX");
+        PortableRestoreReplayReport report;
+        int result = run_replay(&damaged, &report);
+        char restored[PATH_MAX];
+        path_concat(restored, sizeof(restored), damaged.home, "/restored/file");
+        check(result != 0 && report.applied_count == 2 &&
+                  report.verification_checked_count == 1 &&
+                  report.verification_failed_count == 1 &&
+                  strcmp(report.failed_logical_path, "file") == 0 &&
+                  report.failure_step ==
+                      PORTABLE_RESTORE_REPLAY_FAILURE_COMPARE_BACKUP_CONTENT &&
+                  report.failure_errno == EIO &&
+                  file_equals_noatime(restored, "abcdefgX"),
+              "a backup payload that changed after capture fails verification");
+        char reason[256];
+        check(replay_failure_reason_format(&report, reason, sizeof(reason)) == 1 &&
+                  strcmp(reason, "regular file, the backup's copy changed "
+                                 "after it was captured") == 0,
+              "the mismatch is described as damage to the backup itself");
+        fixture_close(&damaged);
+    }
+
+    Fixture skipped;
+    opened = regular_verification_fixture_open(&skipped, "abcdefgh");
+    check(opened == 0, "verification opt-out fixture is created");
+    if (opened == 0)
+    {
+        PortableRestoreReplayReport report;
+        VerificationBoundaryProbe probe = { .report = &report };
+        portable_restore_replay_test_reset_verification_regular_read_count();
+        set_verification_mutation(&skipped,
+                                  VERIFICATION_MUTATION_REWRITE_FILE);
+        int result = run_replay_with_options(
+            &skipped, &report, NULL, 1, note_verification_boundary, &probe);
+        clear_verification_mutation();
+        char restored[PATH_MAX];
+        path_concat(restored, sizeof(restored), skipped.home, "/restored/file");
+        check(result == 0 && report.failed_count == 0 &&
+                  report.verification_checked_count == 0 &&
+                  report.verification_failed_count == 0 && probe.calls == 0 &&
+                  portable_restore_replay_test_verification_regular_read_count() == 0 &&
+                  file_equals_noatime(restored, "ABCDEFGH"),
+              "verification opt-out skips readback and its boundary callback");
+        fixture_close(&skipped);
+    }
+}
+
+static void test_verification_checks_every_item(void)
+{
+    printf(BLUE "::" NC " portable verification checks every item after a mismatch\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "multi-mismatch verification fixture is created");
+    if (opened != 0)
+        return;
+    make_dir_at(fixture.data_fd, "ROOT", 0700);
+    write_file_at(fixture.data_fd, "ROOT/a", "aaaa");
+    write_file_at(fixture.data_fd, "ROOT/b", "bbbb");
+    write_file_at(fixture.data_fd, "ROOT/c", "cccc");
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000960, 1, 1700000961, 2),
+        entry_for("ROOT", "a", "a", SIDECAR_KIND_REGULAR, 4, 0600,
+                  1700000962, 3, 1700000963, 4),
+        entry_for("ROOT", "b", "b", SIDECAR_KIND_REGULAR, 4, 0600,
+                  1700000964, 5, 1700000965, 6),
+        entry_for("ROOT", "c", "c", SIDECAR_KIND_REGULAR, 4, 0600,
+                  1700000966, 7, 1700000967, 8)
+    };
+    check(write_sidecar(&fixture, entries, 4, NULL, NULL) == 0,
+          "multi-mismatch sidecar is committed");
+
+    set_verification_mutation(&fixture, VERIFICATION_MUTATION_REWRITE_TWO_OF_THREE);
+    PortableRestoreReplayReport report;
+    int result = run_replay(&fixture, &report);
+    clear_verification_mutation();
+    check(result != 0 && report.applied_count == 4 &&
+              report.verification_checked_count == 3 &&
+              report.verification_failed_count == 2 &&
+              report.failed_count == 2,
+          "verification continues past the first mismatch and counts every one");
+    check(strcmp(report.failed_logical_path, "a") == 0 &&
+              report.failure_step ==
+                  PORTABLE_RESTORE_REPLAY_FAILURE_COMPARE_DESTINATION_CONTENT,
+          "the first mismatch remains the reported failure");
+    fixture_close(&fixture);
+}
+
+static void test_verification_refuses_destination_symlink_replacement(void)
+{
+    printf(BLUE "::" NC " portable verification refuses destination symlink replacement\n");
+
+    Fixture leaf;
+    int opened = regular_verification_fixture_open(&leaf, "abcdefgh");
+    check(opened == 0, "verification leaf-replacement fixture is created");
+    if (opened == 0)
+    {
+        write_file_at(leaf.home_fd, "outside", "abcdefgh");
+        set_verification_mutation(
+            &leaf, VERIFICATION_MUTATION_REPLACE_FILE_WITH_SYMLINK);
+        PortableRestoreReplayReport report;
+        int result = run_replay(&leaf, &report);
+        clear_verification_mutation();
+        char outside[PATH_MAX];
+        path_concat(outside, sizeof(outside), leaf.home, "/outside");
+        check(result != 0 && report.verification_failed_count == 1 &&
+                  report.failure_step ==
+                      PORTABLE_RESTORE_REPLAY_FAILURE_VERIFY_DESTINATION_PATH &&
+                  file_equals_noatime(outside, "abcdefgh"),
+              "verification rejects a final symlink without following it");
+        fixture_close(&leaf);
+    }
+
+    ManifestRoot root = root_for();
+    Fixture parent;
+    opened = fixture_open(&parent, &root);
+    check(opened == 0, "verification parent-replacement fixture is created");
+    if (opened == 0)
+    {
+        make_dir_at(parent.data_fd, "ROOT", 0700);
+        int payload_root = openat(parent.data_fd, "ROOT",
+                                  O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (payload_root < 0)
+            fatal("could not open verification payload root");
+        make_dir_at(payload_root, "nested", 0700);
+        int nested = openat(payload_root, "nested",
+                            O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (nested < 0)
+            fatal("could not open verification payload parent");
+        write_file_at(nested, "file", "abcdefgh");
+        close(nested);
+        close(payload_root);
+        SidecarEntry entries[] = {
+            entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                      1700000630, 1, 1700000631, 2),
+            entry_for("ROOT", "nested", "nested", SIDECAR_KIND_DIRECTORY,
+                      0, 0700, 1700000632, 3, 1700000633, 4),
+            entry_for("ROOT", "nested/file", "nested/file",
+                      SIDECAR_KIND_REGULAR, 8, 0600,
+                      1700000634, 5, 1700000635, 6)
+        };
+        if (write_sidecar(&parent, entries, 3, NULL, NULL) != 0)
+            fatal("could not write verification parent sidecar");
+        make_dir_at(parent.home_fd, "outside-dir", 0700);
+        int outside_dir = openat(parent.home_fd, "outside-dir",
+                                 O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (outside_dir < 0)
+            fatal("could not open verification outside directory");
+        write_file_at(outside_dir, "file", "abcdefgh");
+        close(outside_dir);
+        set_verification_mutation(
+            &parent, VERIFICATION_MUTATION_REPLACE_PARENT_WITH_SYMLINK);
+        PortableRestoreReplayReport report;
+        int result = run_replay(&parent, &report);
+        clear_verification_mutation();
+        char outside[PATH_MAX];
+        path_concat(outside, sizeof(outside), parent.home, "/outside-dir/file");
+        check(result != 0 && report.verification_failed_count == 1 &&
+                  report.failure_step ==
+                      PORTABLE_RESTORE_REPLAY_FAILURE_VERIFY_DESTINATION_PATH &&
+                  file_equals_noatime(outside, "abcdefgh"),
+              "verification refuses an intermediate symlink without following it");
+        fixture_close(&parent);
+    }
+}
+
+static int symlink_verification_fixture_open(Fixture *fixture)
+{
+    ManifestRoot root = root_for();
+    if (fixture_open(fixture, &root) != 0)
+        return -1;
+    make_dir_at(fixture->data_fd, "ROOT", 0700);
+    write_file_at(fixture->data_fd, "ROOT/link", "");
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000640, 1, 1700000641, 2),
+        entry_for("ROOT", "link", "link", SIDECAR_KIND_SYMLINK, 0, 0777,
+                  1700000642, 3, 1700000643, 4)
+    };
+    entries[1].symlink_target = text_bytes("target");
+    if (write_sidecar(fixture, entries, 2, NULL, NULL) != 0)
+    {
+        fixture_close(fixture);
+        return -1;
+    }
+    return 0;
+}
+
+static void test_symlink_content_verification(void)
+{
+    printf(BLUE "::" NC " portable restore verifies symlink target bytes\n");
+    Fixture success;
+    int opened = symlink_verification_fixture_open(&success);
+    check(opened == 0, "symlink verification fixture is created");
+    if (opened == 0)
+    {
+        PortableRestoreReplayReport report;
+        int result = run_replay(&success, &report);
+        check(result == 0 && report.verification_checked_count == 1 &&
+                  report.verification_failed_count == 0,
+              "restored symlink target passes post-copy verification");
+        struct stat restored;
+        int stat_result = fstatat(success.home_fd, "restored/link", &restored,
+                                  AT_SYMLINK_NOFOLLOW);
+        check(stat_result == 0 && S_ISLNK(restored.st_mode) &&
+                  restored.st_atim.tv_sec == (time_t)1700000642 &&
+                  restored.st_atim.tv_nsec == 3 &&
+                  restored.st_mtim.tv_sec == (time_t)1700000643 &&
+                  restored.st_mtim.tv_nsec == 4,
+              "symlink verification preserves the restored timestamps");
+        fixture_close(&success);
+    }
+
+    Fixture changed;
+    opened = symlink_verification_fixture_open(&changed);
+    check(opened == 0, "symlink target-mismatch fixture is created");
+    if (opened == 0)
+    {
+        set_verification_mutation(
+            &changed, VERIFICATION_MUTATION_REPLACE_SYMLINK_TARGET);
+        PortableRestoreReplayReport report;
+        int result = run_replay(&changed, &report);
+        clear_verification_mutation();
+        check(result != 0 && report.verification_checked_count == 1 &&
+                  report.verification_failed_count == 1 &&
+                  strcmp(report.failed_logical_path, "link") == 0 &&
+                  report.failed_kind_valid &&
+                  report.failed_kind == SIDECAR_KIND_SYMLINK &&
+                  report.failure_step ==
+                      PORTABLE_RESTORE_REPLAY_FAILURE_COMPARE_DESTINATION_CONTENT &&
+                  report.failure_errno == EIO,
+              "changed symlink target is a verification failure");
+        fixture_close(&changed);
+    }
+}
+
+static int hardlink_verification_fixture_open(Fixture *fixture)
+{
+    ManifestRoot root = root_for();
+    if (fixture_open(fixture, &root) != 0)
+        return -1;
+    make_dir_at(fixture->data_fd, "ROOT", 0700);
+    int root_fd = openat(fixture->data_fd, "ROOT",
+                         O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (root_fd < 0)
+        return -1;
+    write_file_at(root_fd, "representative", "hardlink payload");
+    write_file_at(root_fd, "alias", "");
+    close(root_fd);
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000660, 1, 1700000661, 2),
+        entry_for("ROOT", "representative", "representative",
+                  SIDECAR_KIND_REGULAR, strlen("hardlink payload"), 0600,
+                  1700000662, 3, 1700000663, 4),
+        entry_for("ROOT", "alias", "alias", SIDECAR_KIND_HARDLINK, 0, 0600,
+                  1700000664, 5, 1700000665, 6)
+    };
+    entries[2].hardlink_root_id = text_bytes("ROOT");
+    entries[2].hardlink_logical_path = text_bytes("representative");
+    if (write_sidecar(fixture, entries, 3, NULL, NULL) != 0)
+    {
+        fixture_close(fixture);
+        return -1;
+    }
+    return 0;
+}
+
+static void test_hardlink_content_verification(void)
+{
+    printf(BLUE "::" NC " portable restore verifies hardlinks by inode identity\n");
+    Fixture success;
+    int opened = hardlink_verification_fixture_open(&success);
+    check(opened == 0, "hardlink verification fixture is created");
+    if (opened == 0)
+    {
+        portable_restore_replay_test_reset_verification_regular_read_count();
+        PortableRestoreReplayReport report;
+        int result = run_replay(&success, &report);
+        struct stat representative;
+        struct stat alias;
+        int identity_ok =
+            fstatat(success.home_fd, "restored/representative",
+                    &representative, AT_SYMLINK_NOFOLLOW) == 0 &&
+            fstatat(success.home_fd, "restored/alias", &alias,
+                    AT_SYMLINK_NOFOLLOW) == 0 &&
+            replay_hardlink_identity_matches(&representative, &alias);
+        check(result == 0 && identity_ok &&
+                  report.verification_checked_count == 2 &&
+                  report.verification_failed_count == 0 &&
+                  portable_restore_replay_test_verification_regular_read_count() == 1,
+              "hardlink alias is verified without hashing its content again");
+        fixture_close(&success);
+    }
+
+    Fixture replaced;
+    opened = hardlink_verification_fixture_open(&replaced);
+    check(opened == 0, "hardlink identity-mismatch fixture is created");
+    if (opened == 0)
+    {
+        set_verification_mutation(
+            &replaced, VERIFICATION_MUTATION_REPLACE_HARDLINK_ALIAS);
+        PortableRestoreReplayReport report;
+        int result = run_replay(&replaced, &report);
+        clear_verification_mutation();
+        check(result != 0 && report.verification_checked_count == 2 &&
+                  report.verification_failed_count == 1 &&
+                  strcmp(report.failed_logical_path, "alias") == 0 &&
+                  report.failed_kind_valid &&
+                  report.failed_kind == SIDECAR_KIND_HARDLINK &&
+                  report.failure_step ==
+                      PORTABLE_RESTORE_REPLAY_FAILURE_VERIFY_DESTINATION_HARDLINK &&
+                  report.failure_errno == EIO,
+              "same-byte replacement cannot impersonate a hardlink alias");
+        fixture_close(&replaced);
+    }
+}
+
+static void test_destination_truncation(void)
+{
+    printf(BLUE "::" NC " restore truncates a longer existing regular file\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "destination-truncation fixture is created");
+    if (opened != 0)
+        return;
+
+    make_dir_at(fixture.data_fd, "ROOT", 0700);
+    write_file_at(fixture.data_fd, "ROOT/file", "short");
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000600, 1, 1700000601, 2),
+        entry_for("ROOT", "file", "file", SIDECAR_KIND_REGULAR, 5, 0600,
+                  1700000602, 3, 1700000603, 4)
+    };
+    check(write_sidecar(&fixture, entries, 2, NULL, NULL) == 0,
+          "destination-truncation sidecar is committed");
+
+    make_dir_at(fixture.home_fd, "restored", 0700);
+    write_file_at(fixture.home_fd, "restored/file",
+                  "stale destination content");
+    check(run_preflight(&fixture) == 0,
+          "destination-truncation state passes preflight");
+
+    PortableRestoreReplayReport report;
+    check(run_replay(&fixture, &report) == 0 && report.failed_count == 0,
+          "restore overwrites the existing regular file");
+
+    char restored_file[PATH_MAX];
+    path_concat(restored_file, sizeof(restored_file), fixture.home,
+              "/restored/file");
+    struct stat restored_stat;
+    check(fstatat(fixture.home_fd, "restored/file", &restored_stat,
+                  AT_SYMLINK_NOFOLLOW) == 0 && restored_stat.st_size == 5 &&
+              file_equals_noatime(restored_file, "short"),
+          "restored regular file has no stale trailing bytes");
+    fixture_close(&fixture);
+}
+
+static void home_rewrite_roots(ManifestRoot roots[2])
+{
+    memset(roots, 0, 2U * sizeof(*roots));
+
+    strcpy(roots[0].id, "BUILTIN_DOT_CONFIG");
+    roots[0].policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(roots[0].payload_path, "BUILTIN_DOT_CONFIG");
+    strcpy(roots[0].source_path, ".config");
+    roots[0].has_restore_path = 1;
+    strcpy(roots[0].restore_path, ".config");
+
+    strcpy(roots[1].id, "BUILTIN_LOCAL_SHARE");
+    roots[1].policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(roots[1].payload_path, "BUILTIN_LOCAL_SHARE");
+    strcpy(roots[1].source_path, ".local/share");
+    roots[1].has_restore_path = 1;
+    strcpy(roots[1].restore_path, ".local/share");
+}
+
+static int write_home_rewrite_manifest(Fixture *fixture, ManifestRoot roots[2],
+                                       int version, const char *source_home)
+{
+    home_rewrite_roots(roots);
+    Manifest manifest = {
+        .version = version,
+        .representation = CLONE_PORTABLE_SIDECAR,
+        .scope = MANIFEST_SCOPE_CRITICAL,
+        .sidecar_version = SIDECAR_VERSION,
+        .root_count = 2,
+        .roots = roots
+    };
+    if (source_home != NULL)
+        snprintf(manifest.source_home, sizeof(manifest.source_home), "%s",
+                 source_home);
+    return manifest_write_v1_at(fixture->container_fd, &manifest);
+}
+
+static void write_home_rewrite_payload(Fixture *fixture,
+                                       const char *bookmarks,
+                                       const char *recent)
+{
+    make_dir_at(fixture->data_fd, "BUILTIN_DOT_CONFIG", 0700);
+    int config_fd = openat(fixture->data_fd, "BUILTIN_DOT_CONFIG",
+                           O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (config_fd < 0)
+        fatal("could not open home-rewrite config payload root");
+    make_dir_at(config_fd, "gtk-3.0", 0700);
+    int gtk_fd = openat(config_fd, "gtk-3.0",
+                        O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (gtk_fd < 0)
+        fatal("could not open home-rewrite GTK payload directory");
+    write_file_at(gtk_fd, "bookmarks", bookmarks);
+    close(gtk_fd);
+    close(config_fd);
+
+    make_dir_at(fixture->data_fd, "BUILTIN_LOCAL_SHARE", 0700);
+    int share_fd = openat(fixture->data_fd, "BUILTIN_LOCAL_SHARE",
+                          O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (share_fd < 0)
+        fatal("could not open home-rewrite share payload root");
+    write_file_at(share_fd, "recently-used.xbel", recent);
+    close(share_fd);
+}
+
+static int write_home_rewrite_sidecar(Fixture *fixture,
+                                      const char *bookmarks,
+                                      const char *recent)
+{
+    SidecarEntry entries[] = {
+        entry_for("BUILTIN_DOT_CONFIG", "", "", SIDECAR_KIND_DIRECTORY,
+                  0, 0700, 1700000650, 1, 1700000651, 2),
+        entry_for("BUILTIN_DOT_CONFIG", "gtk-3.0", "gtk-3.0",
+                  SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000652, 3, 1700000653, 4),
+        entry_for("BUILTIN_DOT_CONFIG", "gtk-3.0/bookmarks",
+                  "gtk-3.0/bookmarks", SIDECAR_KIND_REGULAR,
+                  strlen(bookmarks), 0600,
+                  1700000654, 5, 1700000655, 6),
+        entry_for("BUILTIN_LOCAL_SHARE", "", "", SIDECAR_KIND_DIRECTORY,
+                  0, 0700, 1700000656, 7, 1700000657, 8),
+        entry_for("BUILTIN_LOCAL_SHARE", "recently-used.xbel",
+                  "recently-used.xbel", SIDECAR_KIND_REGULAR,
+                  strlen(recent), 0600,
+                  1700000658, 9, 1700000659, 10)
+    };
+    return write_sidecar(fixture, entries,
+                         sizeof(entries) / sizeof(entries[0]), NULL, NULL);
+}
+
+static int home_rewrite_fixture_open(Fixture *fixture, ManifestRoot roots[2],
+                                     int version, const char *source_home,
+                                     const char *bookmarks,
+                                     const char *recent)
+{
+    ManifestRoot initial = root_for();
+    if (fixture_open(fixture, &initial) != 0)
+        return -1;
+    if (write_home_rewrite_manifest(fixture, roots, version, source_home) != 0)
+        return -1;
+    write_home_rewrite_payload(fixture, bookmarks, recent);
+    if (write_home_rewrite_sidecar(fixture, bookmarks, recent) != 0)
+        return -1;
+    return 0;
+}
+
+static int run_replay_with_dconf(Fixture *fixture,
+                                 PortableRestoreReplayReport *report,
+                                 int *dconf_database_fd, int session_loads)
+{
+    Manifest manifest;
+    if (manifest_read_v1_at(fixture->container_fd, &manifest) !=
+            MANIFEST_STATUS_VALID)
+        return -1;
+    PortableRestoreRequest request = {
+        .source_container_fd = fixture->container_fd,
+        .manifest = &manifest,
+        .destination_home_fd = fixture->home_fd,
+        .destination_home_path = fixture->home,
+        .destination_timestamp_policy = {
+            .nsec_exact = 1,
+            .configured = 1
+        },
+        .dconf_database_fd_out = dconf_database_fd,
+        .dconf_loads_into_session = session_loads,
+        .session_running = 1
+    };
+    portable_restore_replay_report_init(report);
+    int result = portable_restore_replay_at(&request, report);
+    manifest_free(&manifest);
+    return result;
+}
+
+static int dconf_fixture_open(Fixture *fixture, ManifestRoot roots[2],
+                              int version, const char *source_home)
+{
+    ManifestRoot initial = root_for();
+    if (fixture_open(fixture, &initial) != 0 ||
+        write_home_rewrite_manifest(fixture, roots, version, source_home) != 0)
+        return -1;
+    make_dir_at(fixture->data_fd, "BUILTIN_DOT_CONFIG", 0700);
+    int config_fd = openat(fixture->data_fd, "BUILTIN_DOT_CONFIG",
+                           O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (config_fd < 0)
+        fatal("could not open dconf config payload root");
+    make_dir_at(config_fd, "dconf", 0700);
+    write_file_at(config_fd, "dconf/user", "GVDB-backup");
+    write_file_at(config_fd, "dconf/other", "not-the-database");
+    close(config_fd);
+    make_dir_at(fixture->data_fd, "BUILTIN_LOCAL_SHARE", 0700);
+
+    SidecarEntry entries[] = {
+        entry_for("BUILTIN_DOT_CONFIG", "", "", SIDECAR_KIND_DIRECTORY,
+                  0, 0700, 1700000950, 1, 1700000951, 2),
+        entry_for("BUILTIN_DOT_CONFIG", "dconf", "dconf",
+                  SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000952, 3, 1700000953, 4),
+        entry_for("BUILTIN_DOT_CONFIG", "dconf/other", "dconf/other",
+                  SIDECAR_KIND_REGULAR, strlen("not-the-database"), 0600,
+                  1700000954, 5, 1700000955, 6),
+        entry_for("BUILTIN_DOT_CONFIG", "dconf/user", "dconf/user",
+                  SIDECAR_KIND_REGULAR, strlen("GVDB-backup"), 0600,
+                  1700000956, 7, 1700000957, 8),
+        entry_for("BUILTIN_LOCAL_SHARE", "", "", SIDECAR_KIND_DIRECTORY,
+                  0, 0700, 1700000958, 9, 1700000959, 10)
+    };
+    return write_sidecar(fixture, entries,
+                         sizeof(entries) / sizeof(entries[0]), NULL, NULL);
+}
+
+static void test_dconf_database_handoff(void)
+{
+    printf(BLUE "::" NC " replay hands back the applied dconf database\n");
+    ManifestRoot roots[2];
+    Fixture fixture;
+    int opened = dconf_fixture_open(&fixture, roots,
+                                    MANIFEST_SELECTION_VERSION, "/home/vii");
+    check(opened == 0, "dconf handoff fixture is created");
+    if (opened != 0)
+    {
+        fixture_close(&fixture);
+        return;
+    }
+    PortableRestoreReplayReport report;
+    int dconf_fd = -1;
+    check(run_replay_with_dconf(&fixture, &report, &dconf_fd, 1) == 0 &&
+              report.failed_count == 0,
+          "replay with a dconf database succeeds");
+    char content[64] = {0};
+    ssize_t got = dconf_fd >= 0
+        ? pread(dconf_fd, content, sizeof(content) - 1U, 0) : -1;
+    check(got == (ssize_t)strlen("GVDB-backup") &&
+              strcmp(content, "GVDB-backup") == 0,
+          "the source HOME's .config/dconf/user payload is handed back");
+    if (dconf_fd >= 0)
+        close(dconf_fd);
+    fixture_close(&fixture);
+
+    opened = dconf_fixture_open(&fixture, roots, MANIFEST_CURRENT_VERSION,
+                                NULL);
+    check(opened == 0, "dconf fixture without a source HOME is created");
+    if (opened != 0)
+    {
+        fixture_close(&fixture);
+        return;
+    }
+    dconf_fd = -1;
+    check(run_replay_with_dconf(&fixture, &report, &dconf_fd, 1) == 0 &&
+              dconf_fd == -1,
+          "without a recorded source HOME nothing is handed back");
+    fixture_close(&fixture);
+}
+
+// An existing database is the user's settings too: it is left in place only
+// for a load into the running session, and written otherwise (D80).
+static void test_dconf_database_kept_only_for_a_session_load(void)
+{
+    printf(BLUE "::" NC " an existing dconf database is kept only for a session load\n");
+    for (int session_loads = 0; session_loads <= 1; session_loads++)
+    {
+        ManifestRoot roots[2];
+        Fixture fixture;
+        if (dconf_fixture_open(&fixture, roots, MANIFEST_SELECTION_VERSION,
+                               "/home/vii") != 0)
+        {
+            check(0, "dconf keep fixture is created");
+            fixture_close(&fixture);
+            return;
+        }
+        make_dir_at(fixture.home_fd, ".config", 0700);
+        make_dir_at(fixture.home_fd, ".config/dconf", 0700);
+        write_file_at(fixture.home_fd, ".config/dconf/user", "GVDB-live");
+        PortableRestoreReplayReport report;
+        int dconf_fd = -1;
+        int result = run_replay_with_dconf(&fixture, &report, &dconf_fd,
+                                           session_loads);
+        if (dconf_fd >= 0)
+            close(dconf_fd);
+        char database[PATH_MAX];
+        path_concat(database, sizeof(database), fixture.home,
+                  "/.config/dconf/user");
+        if (session_loads)
+            check(result == 0 && report.live_state_kept_count == 1 &&
+                      file_equals_noatime(database, "GVDB-live"),
+                  "with a session load to follow, the existing database "
+                  "is left to it");
+        else
+            check(result == 0 && report.live_state_kept_count == 0 &&
+                      file_equals_noatime(database, "GVDB-backup"),
+                  "without a session load, the backed-up database replaces "
+                  "the existing one");
+        fixture_close(&fixture);
+    }
+}
+
+static int xdg_home_rewrite_fixture_open(
+    Fixture *fixture, ManifestRoot roots[4], const char *bookmarks,
+    const char *recent)
+{
+    memset(roots, 0, 4U * sizeof(*roots));
+    strcpy(roots[0].id, "BUILTIN_DOT_CONFIG");
+    roots[0].policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(roots[0].payload_path, "BUILTIN_DOT_CONFIG");
+    strcpy(roots[0].source_path, ".config");
+    roots[0].has_restore_path = 1;
+    strcpy(roots[0].restore_path, ".config");
+
+    strcpy(roots[1].id, "BUILTIN_LOCAL_SHARE");
+    roots[1].policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(roots[1].payload_path, "BUILTIN_LOCAL_SHARE");
+    strcpy(roots[1].source_path, ".local/share");
+    roots[1].has_restore_path = 1;
+    strcpy(roots[1].restore_path, ".local/share");
+
+    strcpy(roots[2].id, "XDG_DOCUMENTS_DIR");
+    roots[2].policy = ROOT_POLICY_XDG;
+    strcpy(roots[2].payload_path, "XDG_DOCUMENTS_DIR");
+    strcpy(roots[2].source_path, "/source/home/Documents");
+
+    strcpy(roots[3].id, "XDG_DOWNLOAD_DIR");
+    roots[3].policy = ROOT_POLICY_XDG;
+    strcpy(roots[3].payload_path, "XDG_DOWNLOAD_DIR");
+    strcpy(roots[3].source_path, "/source/home/Downloads");
+
+    ManifestRoot initial = root_for();
+    if (fixture_open(fixture, &initial) != 0)
+        return -1;
+    Manifest manifest = {
+        .version = MANIFEST_SELECTION_VERSION,
+        .representation = CLONE_PORTABLE_SIDECAR,
+        .scope = MANIFEST_SCOPE_CRITICAL,
+        .sidecar_version = SIDECAR_VERSION,
+        .root_count = 4,
+        .roots = roots
+    };
+    strcpy(manifest.source_home, "/source/home");
+    if (manifest_write_v1_at(fixture->container_fd, &manifest) != 0)
+        return -1;
+
+    make_dir_at(fixture->data_fd, "BUILTIN_DOT_CONFIG", 0700);
+    int config_fd = openat(fixture->data_fd, "BUILTIN_DOT_CONFIG",
+                           O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (config_fd < 0)
+        fatal("could not open XDG rewrite config payload root");
+    make_dir_at(config_fd, "gtk-3.0", 0700);
+    int gtk_fd = openat(config_fd, "gtk-3.0",
+                        O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (gtk_fd < 0)
+        fatal("could not open XDG rewrite GTK payload directory");
+    write_file_at(gtk_fd, "bookmarks", bookmarks);
+    if (close(gtk_fd) != 0 || close(config_fd) != 0)
+        fatal("could not close XDG rewrite config payload root");
+
+    make_dir_at(fixture->data_fd, "BUILTIN_LOCAL_SHARE", 0700);
+    int share_fd = openat(fixture->data_fd, "BUILTIN_LOCAL_SHARE",
+                          O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (share_fd < 0)
+        fatal("could not open XDG rewrite share payload root");
+    write_file_at(share_fd, "recently-used.xbel", recent);
+    if (close(share_fd) != 0)
+        fatal("could not close XDG rewrite share payload root");
+    make_dir_at(fixture->data_fd, "XDG_DOCUMENTS_DIR", 0700);
+    make_dir_at(fixture->data_fd, "XDG_DOWNLOAD_DIR", 0700);
+
+    SidecarEntry entries[] = {
+        entry_for("BUILTIN_DOT_CONFIG", "", "",
+                  SIDECAR_KIND_DIRECTORY, 0, 0700, 1700000660, 1,
+                  1700000661, 2),
+        entry_for("BUILTIN_DOT_CONFIG", "gtk-3.0", "gtk-3.0",
+                  SIDECAR_KIND_DIRECTORY, 0, 0700, 1700000662, 3,
+                  1700000663, 4),
+        entry_for("BUILTIN_DOT_CONFIG", "gtk-3.0/bookmarks",
+                  "gtk-3.0/bookmarks", SIDECAR_KIND_REGULAR,
+                  strlen(bookmarks), 0600, 1700000664, 5,
+                  1700000665, 6),
+        entry_for("BUILTIN_LOCAL_SHARE", "", "",
+                  SIDECAR_KIND_DIRECTORY, 0, 0700, 1700000666, 7,
+                  1700000667, 8),
+        entry_for("BUILTIN_LOCAL_SHARE", "recently-used.xbel",
+                  "recently-used.xbel", SIDECAR_KIND_REGULAR,
+                  strlen(recent), 0600, 1700000668, 9,
+                  1700000669, 10),
+        entry_for("XDG_DOCUMENTS_DIR", "", "",
+                  SIDECAR_KIND_DIRECTORY, 0, 0700, 1700000670, 11,
+                  1700000671, 12),
+        entry_for("XDG_DOWNLOAD_DIR", "", "",
+                  SIDECAR_KIND_DIRECTORY, 0, 0700, 1700000672, 13,
+                  1700000673, 14)
+    };
+    if (write_sidecar(fixture, entries,
+                      sizeof(entries) / sizeof(entries[0]), NULL, NULL) != 0)
+        return -1;
+    return 0;
+}
+
+typedef struct {
+    const char *home;
+    int decision;
+    int calls;
+    int others_in_place;
+    int deferred_absent;
+} DeferralProbe;
+
+static int probe_before_deferred(void *context)
+{
+    DeferralProbe *probe = context;
+    char other[PATH_MAX], deferred[PATH_MAX], link[PATH_MAX];
+    path_concat(other, sizeof(other), probe->home, "/restored/other");
+    path_concat(deferred, sizeof(deferred), probe->home,
+              "/restored/app/settings");
+    path_concat(link, sizeof(link), probe->home, "/restored/app-link");
+    struct stat st;
+    probe->calls++;
+    probe->others_in_place = file_equals_noatime(other, "other file");
+    probe->deferred_absent = lstat(deferred, &st) != 0 &&
+                             lstat(link, &st) != 0;
+    return probe->decision;
+}
+
+static int deferral_fixture_open(Fixture *fixture)
+{
+    ManifestRoot root = root_for();
+    if (fixture_open(fixture, &root) != 0)
+        return -1;
+    make_dir_at(fixture->data_fd, "ROOT", 0700);
+    make_dir_at(fixture->data_fd, "ROOT/app", 0700);
+    write_file_at(fixture->data_fd, "ROOT/app/settings", "app settings");
+    write_file_at(fixture->data_fd, "ROOT/other", "other file");
+    write_file_at(fixture->data_fd, "ROOT/app-link", "");
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000900, 1, 1700000901, 2),
+        entry_for("ROOT", "app", "app", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000902, 3, 1700000903, 4),
+        entry_for("ROOT", "app/settings", "app/settings",
+                  SIDECAR_KIND_REGULAR, strlen("app settings"), 0600,
+                  1700000904, 5, 1700000905, 6),
+        entry_for("ROOT", "other", "other", SIDECAR_KIND_REGULAR,
+                  strlen("other file"), 0600, 1700000906, 7, 1700000907, 8),
+        entry_for("ROOT", "app-link", "app-link", SIDECAR_KIND_HARDLINK, 0,
+                  0600, 1700000908, 9, 1700000909, 10)
+    };
+    entries[4].hardlink_root_id = text_bytes("ROOT");
+    entries[4].hardlink_logical_path = text_bytes("app/settings");
+    if (write_sidecar(fixture, entries, sizeof(entries) / sizeof(entries[0]),
+                      NULL, NULL) != 0)
+    {
+        fixture_close(fixture);
+        return -1;
+    }
+    return 0;
+}
+
+// Files an open application owns are restored after everything else, or
+// left out, as the caller decides then (D66). A hardlink to one of them
+// follows its representative.
+static void test_deferred_paths_restore_last(void)
+{
+    printf(BLUE "::" NC " deferred application settings are restored last\n");
+    static const PortableRestoreDeferredPath paths[] = {
+        { "Test App", "restored/app" }
+    };
+    for (int decision = 0; decision <= 1; decision++)
+    {
+        Fixture fixture;
+        int opened = deferral_fixture_open(&fixture);
+        check(opened == 0, "deferral fixture is created");
+        if (opened != 0)
+            continue;
+        DeferralProbe probe = { .home = fixture.home, .decision = decision };
+        replay_deferred_paths = paths;
+        replay_deferred_path_count = 1;
+        replay_before_deferred = probe_before_deferred;
+        replay_before_deferred_context = &probe;
+        PortableRestoreReplayReport report;
+        int result = run_replay(&fixture, &report);
+        replay_deferred_paths = NULL;
+        replay_deferred_path_count = 0;
+        replay_before_deferred = NULL;
+        replay_before_deferred_context = NULL;
+
+        char deferred[PATH_MAX], link[PATH_MAX];
+        path_concat(deferred, sizeof(deferred), fixture.home,
+                  "/restored/app/settings");
+        path_concat(link, sizeof(link), fixture.home, "/restored/app-link");
+        struct stat st;
+        check(result == 0 && probe.calls == 1 && probe.others_in_place &&
+                  probe.deferred_absent && report.deferred_count == 2,
+              decision
+                  ? "the caller is asked once, after everything else is in "
+                    "place"
+                  : "the caller is asked with the deferred files not yet "
+                    "written");
+        if (decision)
+            check(file_equals_noatime(deferred, "app settings") &&
+                      stat(link, &st) == 0 && report.deferred_skipped_count == 0 &&
+                      report.verification_failed_count == 0,
+                  "restoring them writes the deferred file and its hardlink");
+        else
+            check(lstat(deferred, &st) != 0 && lstat(link, &st) != 0 &&
+                      report.deferred_skipped_count == 2 &&
+                      report.verification_failed_count == 0,
+                  "leaving them out writes neither and verification skips "
+                  "them");
+        fixture_close(&fixture);
+    }
+}
+
+static int verification_exclusion_fixture_open(Fixture *fixture)
+{
+    static const char gvfs_root_payload[] = "gvfs root payload";
+    static const char gvfs_home_payload[] = "gvfs home payload";
+    static const char lookalike_payload[] = "lookalike payload";
+    static const char other_root_payload[] = "other root payload";
+
+    ManifestRoot initial = root_for();
+    if (fixture_open(fixture, &initial) != 0)
+        return -1;
+
+    ManifestRoot roots[2];
+    if (write_home_rewrite_manifest(fixture, roots, MANIFEST_CURRENT_VERSION,
+                                    NULL) != 0)
+    {
+        fixture_close(fixture);
+        return -1;
+    }
+
+    make_dir_at(fixture->data_fd, "BUILTIN_LOCAL_SHARE", 0700);
+    int share_fd = openat(fixture->data_fd, "BUILTIN_LOCAL_SHARE",
+                          O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (share_fd < 0)
+        fatal("could not open verification-exclusion share payload root");
+    make_dir_at(share_fd, "gvfs-metadata", 0700);
+    write_file_at(share_fd, "gvfs-metadata/root", gvfs_root_payload);
+    write_file_at(share_fd, "gvfs-metadata/home", gvfs_home_payload);
+    write_file_at(share_fd, "gvfs-metadata-x", lookalike_payload);
+    if (close(share_fd) != 0)
+        fatal("could not close verification-exclusion share payload root");
+
+    make_dir_at(fixture->data_fd, "BUILTIN_DOT_CONFIG", 0700);
+    int config_fd = openat(fixture->data_fd, "BUILTIN_DOT_CONFIG",
+                           O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (config_fd < 0)
+        fatal("could not open verification-exclusion config payload root");
+    make_dir_at(config_fd, "gvfs-metadata", 0700);
+    write_file_at(config_fd, "gvfs-metadata/root", other_root_payload);
+    if (close(config_fd) != 0)
+        fatal("could not close verification-exclusion config payload root");
+
+    SidecarEntry entries[] = {
+        entry_for("BUILTIN_LOCAL_SHARE", "", "", SIDECAR_KIND_DIRECTORY,
+                  0, 0700, 1700000660, 1, 1700000661, 2),
+        entry_for("BUILTIN_LOCAL_SHARE", "gvfs-metadata", "gvfs-metadata",
+                  SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000662, 3, 1700000663, 4),
+        entry_for("BUILTIN_LOCAL_SHARE", "gvfs-metadata/root",
+                  "gvfs-metadata/root", SIDECAR_KIND_REGULAR,
+                  strlen(gvfs_root_payload), 0600,
+                  1700000664, 5, 1700000665, 6),
+        entry_for("BUILTIN_LOCAL_SHARE", "gvfs-metadata/home",
+                  "gvfs-metadata/home", SIDECAR_KIND_REGULAR,
+                  strlen(gvfs_home_payload), 0600,
+                  1700000666, 7, 1700000667, 8),
+        entry_for("BUILTIN_LOCAL_SHARE", "gvfs-metadata-x",
+                  "gvfs-metadata-x", SIDECAR_KIND_REGULAR,
+                  strlen(lookalike_payload), 0600,
+                  1700000668, 9, 1700000669, 10),
+        entry_for("BUILTIN_DOT_CONFIG", "", "", SIDECAR_KIND_DIRECTORY,
+                  0, 0700, 1700000670, 11, 1700000671, 12),
+        entry_for("BUILTIN_DOT_CONFIG", "gvfs-metadata", "gvfs-metadata",
+                  SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000672, 13, 1700000673, 14),
+        entry_for("BUILTIN_DOT_CONFIG", "gvfs-metadata/root",
+                  "gvfs-metadata/root", SIDECAR_KIND_REGULAR,
+                  strlen(other_root_payload), 0600,
+                  1700000674, 15, 1700000675, 16)
+    };
+    if (write_sidecar(fixture, entries,
+                      sizeof(entries) / sizeof(entries[0]), NULL, NULL) != 0)
+    {
+        fixture_close(fixture);
+        return -1;
+    }
+    return 0;
+}
+
+static const char additional_dconf_user_payload[] = "dconf user payload";
+static const char additional_dconf_user_lookalike_payload[] =
+    "dconf user lookalike payload";
+static const char additional_application_state_payload[] =
+    "application state payload";
+static const char additional_application_state_lookalike_payload[] =
+    "application state lookalike payload";
+static const char additional_flatpak_summary_payload[] =
+    "flatpak summary payload";
+static const char additional_flatpak_ref_payload[] = "flatpak ref payload";
+static const char additional_flatpak_appstream_payload[] =
+    "flatpak appstream payload";
+static const char additional_text_editor_session_payload[] =
+    "text editor session payload";
+static const char additional_text_editor_recent_payload[] =
+    "text editor recent payload";
+static const char additional_flatpak_lookalike_payload[] =
+    "flatpak lookalike payload";
+static const char additional_gnome_shell_lookalike_payload[] =
+    "gnome shell lookalike payload";
+
+static int additional_live_state_fixture_open(Fixture *fixture)
+{
+    ManifestRoot initial = root_for();
+    if (fixture_open(fixture, &initial) != 0)
+        return -1;
+
+    ManifestRoot roots[2];
+    if (write_home_rewrite_manifest(fixture, roots, MANIFEST_CURRENT_VERSION,
+                                    NULL) != 0)
+    {
+        fixture_close(fixture);
+        return -1;
+    }
+
+    make_dir_at(fixture->data_fd, "BUILTIN_DOT_CONFIG", 0700);
+    int config_fd = openat(fixture->data_fd, "BUILTIN_DOT_CONFIG",
+                           O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (config_fd < 0)
+        fatal("could not open additional live-state config payload root");
+    make_dir_at(config_fd, "dconf", 0700);
+    write_file_at(config_fd, "dconf/user", additional_dconf_user_payload);
+    write_file_at(config_fd, "dconf/user-extra",
+                  additional_dconf_user_lookalike_payload);
+    if (close(config_fd) != 0)
+        fatal("could not close additional live-state config payload root");
+
+    make_dir_at(fixture->data_fd, "BUILTIN_LOCAL_SHARE", 0700);
+    int share_fd = openat(fixture->data_fd, "BUILTIN_LOCAL_SHARE",
+                          O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (share_fd < 0)
+        fatal("could not open additional live-state share payload root");
+    make_dir_at(share_fd, "gnome-shell", 0700);
+    write_file_at(share_fd, "gnome-shell/application_state",
+                  additional_application_state_payload);
+    write_file_at(share_fd, "gnome-shell/application_state-extra",
+                  additional_application_state_lookalike_payload);
+    make_dir_at(share_fd, "flatpak", 0700);
+    make_dir_at(share_fd, "flatpak/repo", 0700);
+    make_dir_at(share_fd, "flatpak/repo/tmp", 0700);
+    make_dir_at(share_fd, "flatpak/repo/tmp/cache", 0700);
+    make_dir_at(share_fd, "flatpak/repo/tmp/cache/summaries", 0700);
+    write_file_at(share_fd, "flatpak/repo/tmp/cache/summaries/remote",
+                  additional_flatpak_summary_payload);
+    make_dir_at(share_fd, "flatpak/repo/refs", 0700);
+    make_dir_at(share_fd, "flatpak/repo/refs/remotes", 0700);
+    make_dir_at(share_fd, "flatpak/repo/refs/remotes/flathub", 0700);
+    make_dir_at(share_fd, "flatpak/repo/refs/remotes/flathub/appstream2",
+                0700);
+    write_file_at(share_fd,
+                  "flatpak/repo/refs/remotes/flathub/appstream2/x86_64",
+                  additional_flatpak_ref_payload);
+    make_dir_at(share_fd, "flatpak/appstream", 0700);
+    make_dir_at(share_fd, "flatpak/appstream/flathub", 0700);
+    make_dir_at(share_fd, "flatpak/appstream/flathub/x86_64", 0700);
+    write_file_at(share_fd,
+                  "flatpak/appstream/flathub/x86_64/appstream.xml.gz",
+                  additional_flatpak_appstream_payload);
+    make_dir_at(share_fd, "org.gnome.TextEditor", 0700);
+    write_file_at(share_fd, "org.gnome.TextEditor/session.gvariant",
+                  additional_text_editor_session_payload);
+    write_file_at(share_fd, "org.gnome.TextEditor/recently-used.xbel",
+                  additional_text_editor_recent_payload);
+    write_file_at(share_fd, "flatpak-notes",
+                  additional_flatpak_lookalike_payload);
+    write_file_at(share_fd, "gnome-shell-extra",
+                  additional_gnome_shell_lookalike_payload);
+    if (close(share_fd) != 0)
+        fatal("could not close additional live-state share payload root");
+
+    SidecarEntry entries[] = {
+        entry_for("BUILTIN_DOT_CONFIG", "", "", SIDECAR_KIND_DIRECTORY,
+                  0, 0700, 1700000700, 1, 1700000701, 2),
+        entry_for("BUILTIN_DOT_CONFIG", "dconf", "dconf",
+                  SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000702, 3, 1700000703, 4),
+        entry_for("BUILTIN_DOT_CONFIG", "dconf/user", "dconf/user",
+                  SIDECAR_KIND_REGULAR,
+                  strlen(additional_dconf_user_payload), 0600,
+                  1700000704, 5, 1700000705, 6),
+        entry_for("BUILTIN_DOT_CONFIG", "dconf/user-extra",
+                  "dconf/user-extra", SIDECAR_KIND_REGULAR,
+                  strlen(additional_dconf_user_lookalike_payload), 0600,
+                  1700000706, 7, 1700000707, 8),
+        entry_for("BUILTIN_LOCAL_SHARE", "", "", SIDECAR_KIND_DIRECTORY,
+                  0, 0700, 1700000708, 9, 1700000709, 10),
+        entry_for("BUILTIN_LOCAL_SHARE", "gnome-shell", "gnome-shell",
+                  SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000710, 11, 1700000711, 12),
+        entry_for("BUILTIN_LOCAL_SHARE", "gnome-shell/application_state",
+                  "gnome-shell/application_state", SIDECAR_KIND_REGULAR,
+                  strlen(additional_application_state_payload), 0600,
+                  1700000712, 13, 1700000713, 14),
+        entry_for("BUILTIN_LOCAL_SHARE",
+                  "gnome-shell/application_state-extra",
+                  "gnome-shell/application_state-extra", SIDECAR_KIND_REGULAR,
+                  strlen(additional_application_state_lookalike_payload), 0600,
+                  1700000714, 15, 1700000715, 16),
+        entry_for("BUILTIN_LOCAL_SHARE", "flatpak", "flatpak",
+                  SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000716, 17, 1700000717, 18),
+        entry_for("BUILTIN_LOCAL_SHARE", "flatpak/repo", "flatpak/repo",
+                  SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000718, 19, 1700000719, 20),
+        entry_for("BUILTIN_LOCAL_SHARE", "flatpak/repo/tmp",
+                  "flatpak/repo/tmp", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000720, 21, 1700000721, 22),
+        entry_for("BUILTIN_LOCAL_SHARE", "flatpak/repo/tmp/cache",
+                  "flatpak/repo/tmp/cache", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000722, 23, 1700000723, 24),
+        entry_for("BUILTIN_LOCAL_SHARE",
+                  "flatpak/repo/tmp/cache/summaries",
+                  "flatpak/repo/tmp/cache/summaries", SIDECAR_KIND_DIRECTORY,
+                  0, 0700, 1700000724, 25, 1700000725, 26),
+        entry_for("BUILTIN_LOCAL_SHARE",
+                  "flatpak/repo/tmp/cache/summaries/remote",
+                  "flatpak/repo/tmp/cache/summaries/remote",
+                  SIDECAR_KIND_REGULAR,
+                  strlen(additional_flatpak_summary_payload), 0600,
+                  1700000726, 27, 1700000727, 28),
+        entry_for("BUILTIN_LOCAL_SHARE", "flatpak/repo/refs",
+                  "flatpak/repo/refs", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000728, 29, 1700000729, 30),
+        entry_for("BUILTIN_LOCAL_SHARE", "flatpak/repo/refs/remotes",
+                  "flatpak/repo/refs/remotes", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000730, 31, 1700000731, 32),
+        entry_for("BUILTIN_LOCAL_SHARE", "flatpak/repo/refs/remotes/flathub",
+                  "flatpak/repo/refs/remotes/flathub", SIDECAR_KIND_DIRECTORY,
+                  0, 0700, 1700000732, 33, 1700000733, 34),
+        entry_for("BUILTIN_LOCAL_SHARE",
+                  "flatpak/repo/refs/remotes/flathub/appstream2",
+                  "flatpak/repo/refs/remotes/flathub/appstream2",
+                  SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000734, 35, 1700000735, 36),
+        entry_for("BUILTIN_LOCAL_SHARE",
+                  "flatpak/repo/refs/remotes/flathub/appstream2/x86_64",
+                  "flatpak/repo/refs/remotes/flathub/appstream2/x86_64",
+                  SIDECAR_KIND_REGULAR, strlen(additional_flatpak_ref_payload),
+                  0600, 1700000736, 37, 1700000737, 38),
+        entry_for("BUILTIN_LOCAL_SHARE", "flatpak/appstream",
+                  "flatpak/appstream", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000738, 39, 1700000739, 40),
+        entry_for("BUILTIN_LOCAL_SHARE", "flatpak/appstream/flathub",
+                  "flatpak/appstream/flathub", SIDECAR_KIND_DIRECTORY,
+                  0, 0700, 1700000740, 41, 1700000741, 42),
+        entry_for("BUILTIN_LOCAL_SHARE", "flatpak/appstream/flathub/x86_64",
+                  "flatpak/appstream/flathub/x86_64", SIDECAR_KIND_DIRECTORY,
+                  0, 0700, 1700000742, 43, 1700000743, 44),
+        entry_for("BUILTIN_LOCAL_SHARE",
+                  "flatpak/appstream/flathub/x86_64/appstream.xml.gz",
+                  "flatpak/appstream/flathub/x86_64/appstream.xml.gz",
+                  SIDECAR_KIND_REGULAR,
+                  strlen(additional_flatpak_appstream_payload), 0600,
+                  1700000744, 45, 1700000745, 46),
+        entry_for("BUILTIN_LOCAL_SHARE", "org.gnome.TextEditor",
+                  "org.gnome.TextEditor", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000746, 47, 1700000747, 48),
+        entry_for("BUILTIN_LOCAL_SHARE",
+                  "org.gnome.TextEditor/session.gvariant",
+                  "org.gnome.TextEditor/session.gvariant",
+                  SIDECAR_KIND_REGULAR,
+                  strlen(additional_text_editor_session_payload), 0600,
+                  1700000748, 49, 1700000749, 50),
+        entry_for("BUILTIN_LOCAL_SHARE",
+                  "org.gnome.TextEditor/recently-used.xbel",
+                  "org.gnome.TextEditor/recently-used.xbel",
+                  SIDECAR_KIND_REGULAR,
+                  strlen(additional_text_editor_recent_payload), 0600,
+                  1700000750, 51, 1700000751, 52),
+        entry_for("BUILTIN_LOCAL_SHARE", "flatpak-notes", "flatpak-notes",
+                  SIDECAR_KIND_REGULAR,
+                  strlen(additional_flatpak_lookalike_payload), 0600,
+                  1700000752, 53, 1700000753, 54),
+        entry_for("BUILTIN_LOCAL_SHARE", "gnome-shell-extra",
+                  "gnome-shell-extra", SIDECAR_KIND_REGULAR,
+                  strlen(additional_gnome_shell_lookalike_payload), 0600,
+                  1700000754, 55, 1700000755, 56)
+    };
+    if (write_sidecar(fixture, entries,
+                      sizeof(entries) / sizeof(entries[0]), NULL, NULL) != 0)
+    {
+        fixture_close(fixture);
+        return -1;
+    }
+    return 0;
+}
+
+typedef struct {
+    Fixture *fixture;
+    const char *relative_paths[2];
+    const char *expected_contents[2];
+    size_t count;
+    int restored_contents_match;
+} VerificationPathMutationProbe;
+
+static void mutate_verification_paths(void *context)
+{
+    VerificationPathMutationProbe *probe = context;
+    if (probe == NULL || probe->fixture == NULL || probe->count == 0 ||
+        probe->count > sizeof(probe->relative_paths) /
+                           sizeof(probe->relative_paths[0]))
+        fatal("invalid verification-path mutation probe");
+
+    probe->restored_contents_match = 1;
+    for (size_t index = 0; index < probe->count; index++)
+    {
+        const char *relative = probe->relative_paths[index];
+        const char *expected = probe->expected_contents[index];
+        if (relative == NULL || expected == NULL)
+            fatal("invalid verification-path mutation target");
+        char path[PATH_MAX];
+        int length = snprintf(path, sizeof(path), "%s/%s", probe->fixture->home,
+                              relative);
+        if (length < 0 || (size_t)length >= sizeof(path))
+            fatal("invalid verification-path mutation target");
+        if (!file_equals_noatime(path, expected))
+            probe->restored_contents_match = 0;
+        flip_first_byte_at(probe->fixture->home_fd, relative);
+    }
+}
+
+static void test_live_desktop_state_verification_exclusion(void)
+{
+    printf(BLUE "::" NC " live desktop state is excluded only from verification\n");
+
+    Fixture excluded;
+    int opened = verification_exclusion_fixture_open(&excluded);
+    check(opened == 0, "live-state verification-exclusion fixture is created");
+    if (opened == 0)
+    {
+        VerificationPathMutationProbe probe = {
+            .fixture = &excluded,
+            .relative_paths = {
+                ".local/share/gvfs-metadata/root",
+                ".local/share/gvfs-metadata/home"
+            },
+            .expected_contents = {
+                "gvfs root payload",
+                "gvfs home payload"
+            },
+            .count = 2
+        };
+        PortableRestoreReplayReport report;
+        portable_restore_replay_test_reset_verification_regular_read_count();
+        int result = run_replay_with_options(
+            &excluded, &report, NULL, 0, mutate_verification_paths, &probe);
+        char mutated_root[PATH_MAX];
+        path_concat(mutated_root, sizeof(mutated_root), excluded.home,
+                  "/.local/share/gvfs-metadata/root");
+        check(probe.restored_contents_match,
+              "excluded live-state files are restored before verification");
+        check(result == 0 && report.failed_count == 0 &&
+                  report.verification_checked_count == 2 &&
+                  report.verification_failed_count == 0 &&
+                  portable_restore_replay_test_verification_regular_read_count() == 2,
+              "gvfs-metadata descendants are omitted from readback and accounting");
+        check(!file_equals_noatime(mutated_root, "gvfs root payload"),
+              "post-replay live-state mutation does not become a false failure");
+        fixture_close(&excluded);
+    }
+
+    // Fill, don't fight (D65): live state a running service already wrote
+    // at the destination stays as it is; what is missing is restored.
+    Fixture kept;
+    opened = verification_exclusion_fixture_open(&kept);
+    check(opened == 0, "live-state fill fixture is created");
+    if (opened == 0)
+    {
+        make_dir_at(kept.home_fd, ".local", 0700);
+        make_dir_at(kept.home_fd, ".local/share", 0700);
+        make_dir_at(kept.home_fd, ".local/share/gvfs-metadata", 0700);
+        write_file_at(kept.home_fd, ".local/share/gvfs-metadata/root",
+                      "written by the running service");
+        PortableRestoreReplayReport report;
+        int result = run_replay(&kept, &report);
+        char service_file[PATH_MAX], missing_file[PATH_MAX];
+        path_concat(service_file, sizeof(service_file), kept.home,
+                  "/.local/share/gvfs-metadata/root");
+        path_concat(missing_file, sizeof(missing_file), kept.home,
+                  "/.local/share/gvfs-metadata/home");
+        check(result == 0 && report.live_state_kept_count == 1 &&
+                  file_equals_noatime(service_file,
+                                      "written by the running service") &&
+                  file_equals_noatime(missing_file, "gvfs home payload"),
+              "live state already written by a service is kept, and the "
+              "missing live file is filled in");
+        fixture_close(&kept);
+    }
+
+    // With no session running, nothing rewrites that state: the backup's
+    // copy replaces what a desktop wrote before a console restore (D100).
+    Fixture console;
+    opened = verification_exclusion_fixture_open(&console);
+    check(opened == 0, "console live-state fixture is created");
+    if (opened == 0)
+    {
+        make_dir_at(console.home_fd, ".local", 0700);
+        make_dir_at(console.home_fd, ".local/share", 0700);
+        make_dir_at(console.home_fd, ".local/share/gvfs-metadata", 0700);
+        write_file_at(console.home_fd, ".local/share/gvfs-metadata/root",
+                      "written before the console restore");
+        replay_session_running = 0;
+        PortableRestoreReplayReport report;
+        int result = run_replay(&console, &report);
+        replay_session_running = 1;
+        char restored_file[PATH_MAX];
+        path_concat(restored_file, sizeof(restored_file), console.home,
+                  "/.local/share/gvfs-metadata/root");
+        check(result == 0 && report.live_state_kept_count == 0 &&
+                  file_equals_noatime(restored_file, "gvfs root payload"),
+              "without a running session, the backup's live state replaces "
+              "what is there");
+        fixture_close(&console);
+    }
+
+    Fixture lookalike;
+    opened = verification_exclusion_fixture_open(&lookalike);
+    check(opened == 0, "verification-prefix boundary fixture is created");
+    if (opened == 0)
+    {
+        VerificationPathMutationProbe probe = {
+            .fixture = &lookalike,
+            .relative_paths = { ".local/share/gvfs-metadata-x" },
+            .expected_contents = { "lookalike payload" },
+            .count = 1
+        };
+        PortableRestoreReplayReport report;
+        int result = run_replay_with_options(
+            &lookalike, &report, NULL, 0, mutate_verification_paths, &probe);
+        check(probe.restored_contents_match && result != 0 &&
+                  report.verification_failed_count == 1 &&
+                  strcmp(report.failed_root_id, "BUILTIN_LOCAL_SHARE") == 0 &&
+                  strcmp(report.failed_logical_path, "gvfs-metadata-x") == 0 &&
+                  report.failure_step ==
+                      PORTABLE_RESTORE_REPLAY_FAILURE_COMPARE_DESTINATION_CONTENT &&
+                  report.failure_errno == EIO,
+              "a similarly named sibling remains content-verified");
+        fixture_close(&lookalike);
+    }
+
+    Fixture other_root;
+    opened = verification_exclusion_fixture_open(&other_root);
+    check(opened == 0, "verification-root boundary fixture is created");
+    if (opened == 0)
+    {
+        VerificationPathMutationProbe probe = {
+            .fixture = &other_root,
+            .relative_paths = { ".config/gvfs-metadata/root" },
+            .expected_contents = { "other root payload" },
+            .count = 1
+        };
+        PortableRestoreReplayReport report;
+        int result = run_replay_with_options(
+            &other_root, &report, NULL, 0, mutate_verification_paths, &probe);
+        check(probe.restored_contents_match && result != 0 &&
+                  report.verification_failed_count == 1 &&
+                  strcmp(report.failed_root_id, "BUILTIN_DOT_CONFIG") == 0 &&
+                  strcmp(report.failed_logical_path, "gvfs-metadata/root") == 0 &&
+                  report.failure_step ==
+                      PORTABLE_RESTORE_REPLAY_FAILURE_COMPARE_DESTINATION_CONTENT &&
+                  report.failure_errno == EIO,
+              "the same logical path under another root remains verified");
+        fixture_close(&other_root);
+    }
+}
+
+static void test_additional_live_state_path(
+    const char *relative_one, const char *expected_one,
+    const char *relative_two, const char *expected_two, size_t count,
+    size_t expected_checked_count, const char *label)
+{
+    Fixture fixture;
+    int opened = additional_live_state_fixture_open(&fixture);
+    check(opened == 0, "additional live-state verification fixture is created");
+    if (opened != 0)
+        return;
+
+    VerificationPathMutationProbe probe = {
+        .fixture = &fixture,
+        .relative_paths = { relative_one, relative_two },
+        .expected_contents = { expected_one, expected_two },
+        .count = count
+    };
+    PortableRestoreReplayReport report;
+    portable_restore_replay_test_reset_verification_regular_read_count();
+    int result = run_replay_with_options(
+        &fixture, &report, NULL, 0, mutate_verification_paths, &probe);
+    check(probe.restored_contents_match && result == 0 &&
+              report.failed_count == 0 &&
+              report.verification_failed_count == 0 &&
+              report.verification_checked_count == expected_checked_count &&
+              portable_restore_replay_test_verification_regular_read_count() ==
+                  expected_checked_count,
+          label);
+    fixture_close(&fixture);
+}
+
+static void test_additional_live_state_boundary(
+    const char *relative, const char *expected, const char *logical_path,
+    const char *label)
+{
+    Fixture fixture;
+    int opened = additional_live_state_fixture_open(&fixture);
+    check(opened == 0, "additional live-state boundary fixture is created");
+    if (opened != 0)
+        return;
+
+    VerificationPathMutationProbe probe = {
+        .fixture = &fixture,
+        .relative_paths = { relative },
+        .expected_contents = { expected },
+        .count = 1
+    };
+    PortableRestoreReplayReport report;
+    portable_restore_replay_test_reset_verification_regular_read_count();
+    int result = run_replay_with_options(
+        &fixture, &report, NULL, 0, mutate_verification_paths, &probe);
+    check(probe.restored_contents_match && result != 0 &&
+              report.verification_checked_count > 0 &&
+              report.verification_checked_count <= 4 &&
+              report.verification_failed_count == 1 &&
+              portable_restore_replay_test_verification_regular_read_count() ==
+                  report.verification_checked_count &&
+              strcmp(report.failed_root_id, "BUILTIN_LOCAL_SHARE") == 0 &&
+              strcmp(report.failed_logical_path, logical_path) == 0 &&
+              report.failure_step ==
+                  PORTABLE_RESTORE_REPLAY_FAILURE_COMPARE_DESTINATION_CONTENT &&
+              report.failure_errno == EIO,
+          label);
+    fixture_close(&fixture);
+}
+
+static void test_additional_live_desktop_state_verification_exclusions(void)
+{
+    printf(BLUE "::" NC " additional confirmed live state is excluded only from verification\n");
+
+    test_additional_live_state_path(
+        ".config/dconf/user", additional_dconf_user_payload, NULL, NULL, 1,
+        4, "dconf/user is restored but omitted from content verification");
+    test_additional_live_state_path(
+        ".local/share/gnome-shell/application_state",
+        additional_application_state_payload, NULL, NULL, 1, 4,
+        "gnome-shell/application_state is restored but omitted from content verification");
+    test_additional_live_state_path(
+        ".local/share/flatpak/repo/tmp/cache/summaries/remote",
+        additional_flatpak_summary_payload,
+        ".local/share/flatpak/appstream/flathub/x86_64/appstream.xml.gz",
+        additional_flatpak_appstream_payload, 2, 4,
+        "flatpak descendants are restored but omitted from content verification");
+    test_additional_live_state_path(
+        ".local/share/org.gnome.TextEditor/session.gvariant",
+        additional_text_editor_session_payload,
+        ".local/share/org.gnome.TextEditor/recently-used.xbel",
+        additional_text_editor_recent_payload, 2, 4,
+        "Text Editor state descendants are restored but omitted from content verification");
+
+    test_additional_live_state_boundary(
+        ".local/share/flatpak-notes", additional_flatpak_lookalike_payload,
+        "flatpak-notes",
+        "flatpak-notes remains content-verified despite the flatpak rule");
+    test_additional_live_state_boundary(
+        ".local/share/gnome-shell-extra",
+        additional_gnome_shell_lookalike_payload, "gnome-shell-extra",
+        "gnome-shell-extra remains content-verified despite the gnome-shell rule");
+}
+
+// VERSION=1 manifests record SOURCE_HOME too since D86.
+static void test_known_desktop_state_rewrites_home(int version)
+{
+    printf(BLUE "::" NC " known desktop-state files rewrite a changed HOME (VERSION=%d)\n",
+           version);
+    static const char source_home[] = "/home/vii";
+    static const char bookmarks[] =
+        "file:///home/vii/Downloads Downloads\n"
+        "file:///home/vii/Documents\n"
+        "file:///home/vii7/not-the-source Similar\n"
+        "file:///home/vii\n"
+        "file:///tmp /home/vii\n";
+    static const char recent[] =
+        "<xbel><bookmark href=\"file:///home/vii/Downloads/a\"/>"
+        "<bookmark href=\"file:///home/vii7/no\"/>"
+        "<bookmark href=\"file:///home/vii\"/>"
+        "<metadata>/home/vii</metadata></xbel>\n";
+
+    ManifestRoot roots[2];
+    Fixture fixture;
+    int opened = home_rewrite_fixture_open(
+        &fixture, roots, version, source_home, bookmarks, recent);
+    check(opened == 0, "changed-HOME rewrite fixture is created");
+    if (opened != 0)
+    {
+        fixture_close(&fixture);
+        return;
+    }
+
+    char expected_bookmarks[PATH_MAX * 4U];
+    char expected_recent[PATH_MAX * 3U];
+    snprintf(expected_bookmarks, sizeof(expected_bookmarks),
+             "file://%s/Downloads Downloads\n"
+             "file://%s/Documents\n"
+             "file:///home/vii7/not-the-source Similar\n"
+             "file://%s\n"
+             "file:///tmp /home/vii\n",
+             fixture.home, fixture.home, fixture.home);
+    snprintf(expected_recent, sizeof(expected_recent),
+             "<xbel><bookmark href=\"file://%s/Downloads/a\"/>"
+             "<bookmark href=\"file:///home/vii7/no\"/>"
+             "<bookmark href=\"file://%s\"/>"
+             "<metadata>/home/vii</metadata></xbel>\n",
+             fixture.home, fixture.home);
+
+    BackupCaptureReport capture_report = {0};
+    PortableRestoreReplayReport report;
+    int result = run_replay_with_capture(&fixture, &report, &capture_report);
+    check(result == 0 && report.failed_count == 0 &&
+              report.verification_checked_count == 2 &&
+              report.verification_failed_count == 0,
+          "changed-HOME desktop-state replay succeeds");
+
+    char restored_bookmarks[PATH_MAX], restored_recent[PATH_MAX];
+    path_concat(restored_bookmarks, sizeof(restored_bookmarks), fixture.home,
+              "/.config/gtk-3.0/bookmarks");
+    path_concat(restored_recent, sizeof(restored_recent), fixture.home,
+              "/.local/share/recently-used.xbel");
+    check(file_equals_noatime(restored_bookmarks, expected_bookmarks),
+          "GTK bookmarks rewrite only exact source-HOME path components");
+    check(file_equals_noatime(restored_recent, expected_recent),
+          "recent-files XBEL rewrites the source HOME without structural parsing");
+    check(capture_report.bytes_copied >= 0 &&
+              (size_t)capture_report.bytes_copied ==
+                  strlen(bookmarks) + strlen(recent),
+          "rewritten restore progress still counts source payload bytes");
+    fixture_close(&fixture);
+}
+
+static void test_known_desktop_state_rewrites_xdg_roots(void)
+{
+    printf(BLUE "::" NC
+           " known desktop-state files translate source XDG roots per key\n");
+    static const char bookmarks[] =
+        "file:///source/home/Documents/doc\n"
+        "file:///source/home/Downloads/download\n"
+        "file:///source/home/other fallback\n";
+    static const char recent[] =
+        "<bookmark href=\"file:///source/home/Downloads/recent\"/>"
+        "<bookmark href=\"file:///source/home/Documents/recent\"/>"
+        "<bookmark href=\"file:///source/home/other\"/>\n";
+
+    ManifestRoot roots[4];
+    Fixture fixture;
+    int opened = xdg_home_rewrite_fixture_open(
+        &fixture, roots, bookmarks, recent);
+    check(opened == 0, "per-key XDG rewrite fixture is created");
+    if (opened != 0)
+    {
+        fixture_close(&fixture);
+        return;
+    }
+
+    char documents[PATH_MAX], downloads[PATH_MAX];
+    path_concat(documents, sizeof(documents), fixture.home, "/Belgeler");
+    path_concat(downloads, sizeof(downloads), fixture.home, "/İndirilenler");
+    if (mkdir(documents, 0700) != 0 || mkdir(downloads, 0700) != 0)
+        fatal("could not create localized XDG destination directories");
+    const char *xdg_dirs[XDG_KEY_COUNT] = {0};
+    xdg_dirs[0] = documents;
+    xdg_dirs[1] = downloads;
+
+    PortableRestoreReplayReport report;
+    int result = run_replay_with_xdg(&fixture, &report, xdg_dirs);
+    check(result == 0 && report.failed_count == 0,
+          "per-key XDG desktop-state replay succeeds");
+
+    char expected_bookmarks[PATH_MAX * 4U];
+    char expected_recent[PATH_MAX * 4U];
+    snprintf(expected_bookmarks, sizeof(expected_bookmarks),
+             "file://%s/doc\n"
+             "file://%s/download\n"
+             "file://%s/other fallback\n",
+             documents, downloads, fixture.home);
+    snprintf(expected_recent, sizeof(expected_recent),
+             "<bookmark href=\"file://%s/recent\"/>"
+             "<bookmark href=\"file://%s/recent\"/>"
+             "<bookmark href=\"file://%s/other\"/>\n",
+             downloads, documents, fixture.home);
+
+    char restored_bookmarks[PATH_MAX], restored_recent[PATH_MAX];
+    path_concat(restored_bookmarks, sizeof(restored_bookmarks), fixture.home,
+              "/.config/gtk-3.0/bookmarks");
+    path_concat(restored_recent, sizeof(restored_recent), fixture.home,
+              "/.local/share/recently-used.xbel");
+    check(file_equals_noatime(restored_bookmarks, expected_bookmarks) &&
+              file_equals_noatime(restored_recent, expected_recent),
+          "longest per-key XDG prefixes beat the generic HOME fallback");
+    fixture_close(&fixture);
+}
+
+static void test_known_desktop_state_same_home_is_verbatim(void)
+{
+    printf(BLUE "::" NC " known desktop-state files stay verbatim when HOME is unchanged\n");
+    ManifestRoot roots[2];
+    Fixture fixture;
+    ManifestRoot initial = root_for();
+    int opened = fixture_open(&fixture, &initial);
+    check(opened == 0, "same-HOME rewrite fixture is created");
+    if (opened != 0)
+        return;
+
+    char bookmarks[PATH_MAX * 2U];
+    char recent[PATH_MAX * 2U];
+    snprintf(bookmarks, sizeof(bookmarks),
+             "file://%s/Downloads Same\n", fixture.home);
+    snprintf(recent, sizeof(recent),
+             "<bookmark href=\"file://%s/Documents/a\"/>\n", fixture.home);
+    if (write_home_rewrite_manifest(&fixture, roots,
+                                    MANIFEST_SELECTION_VERSION,
+                                    fixture.home) != 0)
+        fatal("could not write same-HOME manifest");
+    write_home_rewrite_payload(&fixture, bookmarks, recent);
+    if (write_home_rewrite_sidecar(&fixture, bookmarks, recent) != 0)
+        fatal("could not write same-HOME sidecar");
+
+    PortableRestoreReplayReport report;
+    check(run_replay(&fixture, &report) == 0 && report.failed_count == 0,
+          "same-HOME desktop-state replay succeeds");
+    char restored_bookmarks[PATH_MAX], restored_recent[PATH_MAX];
+    path_concat(restored_bookmarks, sizeof(restored_bookmarks), fixture.home,
+              "/.config/gtk-3.0/bookmarks");
+    path_concat(restored_recent, sizeof(restored_recent), fixture.home,
+              "/.local/share/recently-used.xbel");
+    check(file_equals_noatime(restored_bookmarks, bookmarks) &&
+              file_equals_noatime(restored_recent, recent),
+          "same-HOME files remain byte-for-byte unchanged");
+    fixture_close(&fixture);
+}
+
+static void test_known_desktop_state_legacy_is_verbatim(void)
+{
+    printf(BLUE "::" NC " desktop-state replay does not guess an unrecorded source HOME\n");
+    static const char bookmarks[] = "file:///home/old/Downloads Legacy\n";
+    static const char recent[] =
+        "<bookmark href=\"file:///home/old/Documents/a\"/>\n";
+    ManifestRoot roots[2];
+    Fixture fixture;
+    int opened = home_rewrite_fixture_open(
+        &fixture, roots, MANIFEST_CURRENT_VERSION, NULL,
+        bookmarks, recent);
+    check(opened == 0, "no-SOURCE_HOME rewrite fixture is created");
+    if (opened != 0)
+    {
+        fixture_close(&fixture);
+        return;
+    }
+
+    PortableRestoreReplayReport report;
+    check(run_replay(&fixture, &report) == 0 && report.failed_count == 0,
+          "desktop-state replay succeeds without source HOME");
+    char restored_bookmarks[PATH_MAX], restored_recent[PATH_MAX];
+    path_concat(restored_bookmarks, sizeof(restored_bookmarks), fixture.home,
+              "/.config/gtk-3.0/bookmarks");
+    path_concat(restored_recent, sizeof(restored_recent), fixture.home,
+              "/.local/share/recently-used.xbel");
+    check(file_equals_noatime(restored_bookmarks, bookmarks) &&
+              file_equals_noatime(restored_recent, recent),
+          "files remain byte-for-byte unchanged without SOURCE_HOME");
+    fixture_close(&fixture);
+}
+
+static void reset_sync(int should_fail)
+{
+    sync_calls = 0;
+    sync_should_fail = should_fail;
+}
+
+static void test_capture_report_sync_accumulates(void)
+{
+    printf(BLUE "::" NC " portable restore report accumulates bytes and syncs across files\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "portable sync fixture is created");
+    if (opened != 0)
+        return;
+
+    make_dir_at(fixture.data_fd, "ROOT", 0700);
+    char payload[81];
+    memset(payload, 'p', sizeof(payload) - 1U);
+    payload[sizeof(payload) - 1U] = '\0';
+    write_file_at(fixture.data_fd, "ROOT/one", payload);
+    write_file_at(fixture.data_fd, "ROOT/two", payload);
+    write_file_at(fixture.data_fd, "ROOT/three", payload);
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000500, 1, 1700000501, 2),
+        entry_for("ROOT", "one", "one", SIDECAR_KIND_REGULAR, 80, 0600,
+                  1700000502, 3, 1700000503, 4),
+        entry_for("ROOT", "two", "two", SIDECAR_KIND_REGULAR, 80, 0600,
+                  1700000504, 5, 1700000505, 6),
+        entry_for("ROOT", "three", "three", SIDECAR_KIND_REGULAR, 80, 0600,
+                  1700000506, 7, 1700000507, 8)
+    };
+    check(write_sidecar(&fixture, entries, 4, NULL, NULL) == 0,
+          "portable sync sidecar is committed");
+
+    BackupCaptureReport capture_report = {0};
+    capture_report.sync_interval_bytes = 200;
+    PortableRestoreReplayReport report;
+    reset_sync(0);
+    int result = run_replay_with_capture(&fixture, &report, &capture_report);
+    check(result == 0 && report.live_count == 4 &&
+              report.applied_count == 4 && report.failed_count == 0 &&
+              capture_report.bytes_copied == 240 &&
+              capture_report.bytes_since_sync == 0 && sync_calls == 1,
+          "portable restore report accumulates across smaller files and syncs once");
+    fixture_close(&fixture);
+}
+
+static void test_capture_report_sync_failure(void)
+{
+    printf(BLUE "::" NC " portable restore aborts when periodic sync fails\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "portable sync-failure fixture is created");
+    if (opened != 0)
+        return;
+
+    make_dir_at(fixture.data_fd, "ROOT", 0700);
+    char payload[81];
+    memset(payload, 'f', sizeof(payload) - 1U);
+    payload[sizeof(payload) - 1U] = '\0';
+    write_file_at(fixture.data_fd, "ROOT/file", payload);
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000510, 1, 1700000511, 2),
+        entry_for("ROOT", "file", "file", SIDECAR_KIND_REGULAR, 80, 0600,
+                  1700000512, 3, 1700000513, 4)
+    };
+    check(write_sidecar(&fixture, entries, 2, NULL, NULL) == 0,
+          "portable sync-failure sidecar is committed");
+
+    BackupCaptureReport capture_report = {0};
+    capture_report.sync_interval_bytes = 1;
+    PortableRestoreReplayReport report;
+    reset_sync(1);
+    int result = run_replay_with_capture(&fixture, &report, &capture_report);
+    check(result != 0 && sync_calls == 1 &&
+              capture_report.bytes_copied == 80 && report.failed_count != 0 &&
+              report.failed_kind_valid &&
+              report.failed_kind == SIDECAR_KIND_REGULAR &&
+              report.failure_step ==
+                  PORTABLE_RESTORE_REPLAY_FAILURE_COPY_CONTENT &&
+              report.failure_errno == EIO,
+          "a failed periodic sync aborts portable restore and records failure");
+    char reason[256];
+    int reason_result = replay_failure_reason_format(&report, reason,
+                                                     sizeof(reason));
+    check(reason_result == 1 && strstr(reason, "regular file") != NULL &&
+              strstr(reason, "copy content") != NULL &&
+              strstr(reason, strerror(EIO)) != NULL,
+          "portable restore failure reason formats kind, step, and errno");
+    reset_sync(0);
+    fixture_close(&fixture);
+}
+
+static void test_outstanding_claim_gate(void)
+{
+    printf(BLUE "::" NC " outstanding claims are rejected before replay\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "claim-gate replay fixture is created");
+    if (opened != 0)
+        return;
+    make_dir_at(fixture.data_fd, "ROOT", 0700);
+    write_file_at(fixture.data_fd, "ROOT/file", "payload");
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000200, 1, 1700000201, 2),
+        entry_for("ROOT", "file", "file", SIDECAR_KIND_REGULAR, 7, 0600,
+                  1700000202, 3, 1700000203, 4)
+    };
+    check(write_sidecar(&fixture, entries, 2, NULL, NULL) == 0,
+          "claim-gate replay sidecar has valid live entries");
+    SidecarClaim outstanding = {
+        .root_id = text_bytes("ROOT"),
+        .logical_path = text_bytes("blocked"),
+        .physical_leaf = text_bytes("blocked"),
+        .kind = SIDECAR_KIND_REGULAR
+    };
+    SidecarLog log = {0};
+    check(sidecar_log_adopt_at(fixture.container_fd, &log) ==
+              SIDECAR_OPEN_RESUMABLE &&
+              sidecar_log_append_claim(&log, &outstanding) ==
+                  SIDECAR_STATUS_OK &&
+              sidecar_log_close(&log) == SIDECAR_STATUS_OK,
+          "an outstanding claim is planted in the valid sidecar");
+
+    write_file_at(fixture.home_fd, "sentinel", "untouched");
+    PortableRestoreReplayReport report;
+    int result = run_replay(&fixture, &report);
+    check(result != 0 && report.live_count == 0 &&
+              report.failed_count == 1,
+          "replay rejects the claim before collecting or mutating entries");
+    char sentinel[PATH_MAX];
+    path_concat(sentinel, sizeof(sentinel), fixture.home, "/sentinel");
+    check(file_equals_noatime(sentinel, "untouched"),
+          "claim-gate replay leaves the destination untouched");
+    fixture_close(&fixture);
+}
+
+static void test_xattr_replay(void)
+{
+    printf(BLUE "::" NC " replay applies the payload's exact xattr set\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "xattr replay fixture is created");
+    if (opened != 0)
+        return;
+
+    make_dir_at(fixture.data_fd, "ROOT", 0700);
+    write_file_at(fixture.data_fd, "ROOT/file", "payload");
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000100, 1, 1700000101, 2),
+        entry_for("ROOT", "file", "file", SIDECAR_KIND_REGULAR, 7, 0600,
+                  1700000102, 3, 1700000103, 4)
+    };
+    entries[1].xattr_count = 1;
+    check(write_sidecar(&fixture, entries, 2, NULL, NULL) == 0,
+          "xattr-bearing sidecar is committed");
+    check(run_preflight(&fixture) == 0, "xattr state passes preflight");
+
+    PortableRestoreReplayReport report;
+    int result = run_replay(&fixture, &report);
+    check(result == 0 && report.applied_count == 2 &&
+              report.failed_count == 0,
+          "xattr-bearing entries replay successfully");
+
+    char restored_file[PATH_MAX];
+    path_concat(restored_file, sizeof(restored_file), fixture.home,
+              "/restored/file");
+    char value[64];
+    ssize_t length = getxattr(restored_file, "user.migr_test", value,
+                              sizeof(value));
+    check(length == (ssize_t)strlen("value") &&
+              memcmp(value, "value", (size_t)length) == 0,
+          "payload xattr is applied to the destination");
+
+    fixture_close(&fixture);
+}
+
+static void test_xattr_reconciliation(void)
+{
+    printf(BLUE "::" NC " replay reconciles stale and changed destination xattrs\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "xattr reconciliation fixture is created");
+    if (opened != 0)
+        return;
+
+    make_dir_at(fixture.data_fd, "ROOT", 0700);
+    write_file_at(fixture.data_fd, "ROOT/file", "payload");
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000100, 1, 1700000101, 2),
+        entry_for("ROOT", "file", "file", SIDECAR_KIND_REGULAR, 7, 0600,
+                  1700000102, 3, 1700000103, 4)
+    };
+    entries[1].xattr_count = 1;
+    check(write_sidecar(&fixture, entries, 2, NULL, NULL) == 0,
+          "xattr reconciliation sidecar is committed");
+    check(run_preflight(&fixture) == 0, "xattr reconciliation passes preflight");
+
+    PortableRestoreReplayReport report;
+    check(run_replay(&fixture, &report) == 0 && report.failed_count == 0,
+          "first replay applies the payload xattr set");
+
+    /* Plant a stale xattr and a changed value directly on the destination,
+     * then restore again over the same destination: exact-set reconciliation
+     * must remove the stale one and overwrite the changed one. */
+    char restored_file[PATH_MAX];
+    path_concat(restored_file, sizeof(restored_file), fixture.home,
+              "/restored/file");
+    check(setxattr(restored_file, "user.migr_stale", "stale", 5, 0) == 0,
+          "fixture: a stale destination xattr is planted");
+    check(setxattr(restored_file, "user.migr_test", "old-value", 9, 0) == 0,
+          "fixture: the payload xattr name is set to a different value");
+
+    PortableRestoreReplayReport second_report;
+    check(run_replay(&fixture, &second_report) == 0 &&
+              second_report.failed_count == 0,
+          "second replay succeeds over the same destination");
+
+    char value[64];
+    ssize_t length = getxattr(restored_file, "user.migr_test", value,
+                              sizeof(value));
+    check(length == (ssize_t)strlen("value") &&
+              memcmp(value, "value", (size_t)length) == 0,
+          "changed destination xattr is overwritten to the payload value");
+    check(getxattr(restored_file, "user.migr_stale", value, sizeof(value)) < 0 &&
+              errno == ENODATA,
+          "stale destination xattr is removed by exact-set reconciliation");
+
+    fixture_close(&fixture);
+}
+
+static void test_gate_refuses_trusted_before_mutation(void)
+{
+    printf(BLUE "::" NC " pre-mutation gate refuses a trusted.* payload\n");
+    if (geteuid() == 0)
+    {
+        printf(YELLOW "- " NC " trusted.* gate refusal skipped: running as root\n");
+        return;
+    }
+
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "gate-refusal fixture is created");
+    if (opened != 0)
+        return;
+
+    make_dir_at(fixture.data_fd, "ROOT", 0700);
+    write_file_at(fixture.data_fd, "ROOT/file", "payload");
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000100, 1, 1700000101, 2),
+        entry_for("ROOT", "file", "file", SIDECAR_KIND_REGULAR, 7, 0600,
+                  1700000102, 3, 1700000103, 4)
+    };
+    entries[1].xattr_count = 1;
+    check(write_sidecar(&fixture, entries, 2, NULL, "trusted.migr_test") == 0,
+          "trusted.* sidecar is committed");
+
+    char sentinel[PATH_MAX];
+    path_concat(sentinel, sizeof(sentinel), fixture.home, "/sentinel");
+    write_file_at(fixture.home_fd, "sentinel", "untouched");
+
+    PortableRestoreReplayReport report;
+    int result = run_replay(&fixture, &report);
+    check(result != 0, "gate refuses a trusted.* payload");
+    check(report.applied_count == 0 && report.failed_count == 1,
+          "gate refusal applies nothing and reports one failure");
+    check(file_equals_noatime(sentinel, "untouched"),
+          "gate refusal leaves the destination sentinel untouched");
+
+    char restored_file[PATH_MAX];
+    path_concat(restored_file, sizeof(restored_file), fixture.home,
+              "/restored/file");
+    check(access(restored_file, F_OK) != 0,
+          "gate refusal never creates the entry's destination path");
+    fixture_close(&fixture);
+}
+
+static void test_gate_allows_security_only(void)
+{
+    printf(BLUE "::" NC " pre-mutation gate does not refuse a security.*-only payload\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "security-only fixture is created");
+    if (opened != 0)
+        return;
+
+    make_dir_at(fixture.data_fd, "ROOT", 0700);
+    write_file_at(fixture.data_fd, "ROOT/file", "payload");
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000100, 1, 1700000101, 2),
+        entry_for("ROOT", "file", "file", SIDECAR_KIND_REGULAR, 7, 0600,
+                  1700000102, 3, 1700000103, 4)
+    };
+    entries[1].xattr_count = 1;
+    check(write_sidecar(&fixture, entries, 2, NULL, "security.selinux") == 0,
+          "security.*-only sidecar is committed");
+
+    PortableRestoreReplayReport report;
+    int result = run_replay(&fixture, &report);
+
+    char restored_file[PATH_MAX];
+    path_concat(restored_file, sizeof(restored_file), fixture.home,
+              "/restored/file");
+    /*
+     * The gate must not refuse a security.*-only payload (the probe masks
+     * that namespace out). The apply itself may still fail on hosts where
+     * writing an arbitrary security.* value is policy-refused -- so assert
+     * specifically that replay got past the gate and into replay_run: the
+     * destination tree was created. Do not assert overall success.
+     */
+    check(access(restored_file, F_OK) == 0,
+          "security.*-only payload passes the gate and reaches replay");
+    (void)result;
+    fixture_close(&fixture);
+}
+
+static void test_payload_swap(void)
+{
+    printf(BLUE "::" NC " per-entry payload revalidation\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "payload-swap fixture is created");
+    if (opened != 0)
+        return;
+    make_dir_at(fixture.data_fd, "ROOT", 0700);
+    write_file_at(fixture.data_fd, "ROOT/file", "original");
+    write_file_at(fixture.data_fd, "ROOT/a", "applied");
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000100, 1, 1700000101, 2),
+        entry_for("ROOT", "a", "a", SIDECAR_KIND_REGULAR, 7,
+                  0600, 1700000104, 5, 1700000105, 6),
+        entry_for("ROOT", "file", "file", SIDECAR_KIND_REGULAR, 8, 0600,
+                  1700000102, 3, 1700000103, 4)
+    };
+    check(write_sidecar(&fixture, entries, 3, NULL, NULL) == 0,
+          "payload-swap sidecar is committed");
+    check(run_preflight(&fixture) == 0, "payload-swap state passes preflight");
+
+    int root_fd = openat(fixture.data_fd, "ROOT",
+                         O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (root_fd < 0)
+        fatal("could not open payload root for swap");
+    write_file_at(root_fd, "replacement", "different-size");
+    if (renameat(root_fd, "replacement", root_fd, "file") != 0)
+        fatal("could not swap payload file");
+    close(root_fd);
+    write_file_at(fixture.home_fd, "sentinel", "untouched");
+
+    PortableRestoreReplayReport report;
+    int result = run_replay(&fixture, &report);
+    check(result != 0 && report.live_count == 3 &&
+              report.applied_count == 1 && report.failed_count == 1 &&
+              strcmp(report.failed_logical_path, "file") == 0 &&
+              report.failed_kind_valid &&
+              report.failed_kind == SIDECAR_KIND_REGULAR &&
+              report.failure_step ==
+                  PORTABLE_RESTORE_REPLAY_FAILURE_OPEN_PAYLOAD &&
+              report.failure_errno == EIO,
+          "payload replacement is caught after reporting prior progress");
+    char restored_first[PATH_MAX], restored_file[PATH_MAX], sentinel[PATH_MAX];
+    path_concat(restored_first, sizeof(restored_first), fixture.home,
+              "/restored/a");
+    path_concat(restored_file, sizeof(restored_file), fixture.home,
+              "/restored/file");
+    path_concat(sentinel, sizeof(sentinel), fixture.home, "/sentinel");
+    check(file_equals_noatime(restored_first, "applied"),
+          "entries before the swapped payload remain applied");
+    check(access(restored_file, F_OK) != 0,
+          "rejected payload has no destination file");
+    check(file_equals_noatime(sentinel, "untouched"),
+          "payload-swap refusal leaves the sentinel untouched");
+    fixture_close(&fixture);
+}
+
+static void test_tombstone_skipped(void)
+{
+    printf(BLUE "::" NC " tombstoned state is not replayed\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "tombstone fixture is created");
+    if (opened != 0)
+        return;
+    make_dir_at(fixture.data_fd, "ROOT", 0700);
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000200, 1, 1700000201, 2),
+        entry_for("ROOT", "deleted", "deleted", SIDECAR_KIND_REGULAR, 7,
+                  0600, 1700000202, 3, 1700000203, 4)
+    };
+    SidecarDelete deletion = {
+        .root_id = text_bytes("ROOT"),
+        .logical_path = text_bytes("deleted")
+    };
+    check(write_sidecar(&fixture, entries, 2, &deletion, NULL) == 0,
+          "tombstone sidecar is committed");
+    check(run_preflight(&fixture) == 0,
+          "tombstoned state passes preflight without payload");
+    PortableRestoreReplayReport report;
+    check(run_replay(&fixture, &report) == 0 && report.live_count == 1 &&
+              report.applied_count == 1 && report.failed_count == 0,
+          "only the live root is replayed");
+    char deleted[PATH_MAX];
+    path_concat(deleted, sizeof(deleted), fixture.home, "/restored/deleted");
+    check(access(deleted, F_OK) != 0,
+          "tombstoned entry is not resurrected");
+    fixture_close(&fixture);
+}
+
+static Fixture *hardlink_race_fixture;
+
+static void swap_representative_hook(void)
+{
+    if (hardlink_race_fixture == NULL)
+        return;
+    int root_fd = openat(hardlink_race_fixture->home_fd, "restored",
+                         O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (root_fd < 0)
+        fatal("could not open restored root during hardlink race hook");
+    if (unlinkat(root_fd, "representative", 0) != 0)
+        fatal("could not remove representative during hardlink race hook");
+    write_file_at(root_fd, "representative", "swapped payload");
+    if (close(root_fd) != 0)
+        fatal("could not close restored root during hardlink race hook");
+}
+
+static void test_hardlink_toctou_race(void)
+{
+    printf(BLUE "::" NC " hardlink post-link identity check catches a "
+                 "reference swapped after the pre-link validation\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "hardlink race fixture is created");
+    if (opened != 0)
+        return;
+
+    make_dir_at(fixture.data_fd, "ROOT", 0700);
+    int root_fd = openat(fixture.data_fd, "ROOT",
+                         O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (root_fd < 0)
+        fatal("could not open hardlink race payload root");
+    write_file_at(root_fd, "representative", "hardlink payload");
+    write_file_at(root_fd, "alias", "");
+    if (close(root_fd) != 0)
+        fatal("could not close hardlink race payload root");
+
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000700, 1, 1700000701, 2),
+        entry_for("ROOT", "representative", "representative",
+                  SIDECAR_KIND_REGULAR, strlen("hardlink payload"), 0640,
+                  1700000710, 3, 1700000711, 4),
+        entry_for("ROOT", "alias", "alias", SIDECAR_KIND_HARDLINK, 0, 0640,
+                  1700000720, 5, 1700000721, 6)
+    };
+    entries[2].hardlink_root_id = text_bytes("ROOT");
+    entries[2].hardlink_logical_path = text_bytes("representative");
+    check(write_sidecar(&fixture, entries, 3, NULL, NULL) == 0,
+          "hardlink race sidecar is committed");
+    check(run_preflight(&fixture) == 0,
+          "hardlink race state passes preflight");
+
+    hardlink_race_fixture = &fixture;
+    portable_restore_replay_test_set_hardlink_race_hook(
+        swap_representative_hook);
+    PortableRestoreReplayReport report;
+    int result = run_replay(&fixture, &report);
+    portable_restore_replay_test_set_hardlink_race_hook(NULL);
+    hardlink_race_fixture = NULL;
+
+    check(result != 0 && report.applied_count == 1 &&
+              report.failed_count == 1 && report.failed_kind_valid &&
+              report.failed_kind == SIDECAR_KIND_HARDLINK &&
+              report.failure_step ==
+                  PORTABLE_RESTORE_REPLAY_FAILURE_VERIFY_HARDLINK &&
+              report.failure_errno == EIO,
+          "the reference swapped between validation and linkat is "
+          "detected instead of silently accepted");
+
+    char representative[PATH_MAX];
+    path_concat(representative, sizeof(representative), fixture.home,
+              "/restored/representative");
+    check(file_equals_noatime(representative, "swapped payload"),
+          "the swap actually took effect between validation and linkat");
+    fixture_close(&fixture);
+}
+
+static void test_resolved_destination_identity_replay(void)
+{
+    printf(BLUE "::" NC " portable replay enforces resolved destination identity\n");
+
+    ManifestRoot bootstrap = root_for();
+    ManifestRoot roots[3];
+    Fixture fixture;
+    const char *xdg_dirs[XDG_KEY_COUNT] = {0};
+
+    int opened = fixture_open(&fixture, &bootstrap);
+    check(opened == 0, "direct replay alias-collision fixture is created");
+    if (opened != 0)
+        return;
+
+    memset(roots, 0, 2U * sizeof(*roots));
+    strcpy(roots[0].id, "XDG_DOCUMENTS_DIR");
+    roots[0].policy = ROOT_POLICY_XDG;
+    strcpy(roots[0].payload_path, "XDG_DOCUMENTS_DIR");
+    strcpy(roots[0].source_path, "/source/Documents");
+    strcpy(roots[1].id, "XDG_DOWNLOAD_DIR");
+    roots[1].policy = ROOT_POLICY_XDG;
+    strcpy(roots[1].payload_path, "XDG_DOWNLOAD_DIR");
+    strcpy(roots[1].source_path, "/source/Downloads");
+    check(write_v1_identity_manifest(&fixture, roots, 2) == 0,
+          "direct replay VERSION=1 alias manifest is written");
+
+    make_dir_at(fixture.data_fd, "XDG_DOCUMENTS_DIR", 0700);
+    make_dir_at(fixture.data_fd, "XDG_DOWNLOAD_DIR", 0700);
+    int docs_fd = openat(fixture.data_fd, "XDG_DOCUMENTS_DIR",
+                         O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int downloads_fd = openat(fixture.data_fd, "XDG_DOWNLOAD_DIR",
+                              O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (docs_fd < 0 || downloads_fd < 0)
+        fatal("could not open direct replay alias payload roots");
+    write_file_at(docs_fd, "file", "DOCS");
+    write_file_at(downloads_fd, "file", "DOWNLOADS");
+    if (close(docs_fd) != 0 || close(downloads_fd) != 0)
+        fatal("could not close direct replay alias payload roots");
+
+    SidecarEntry collision_entries[] = {
+        entry_for("XDG_DOCUMENTS_DIR", "", "", SIDECAR_KIND_DIRECTORY, 0,
+                  0750, 1700001100, 1, 1700001101, 2),
+        entry_for("XDG_DOCUMENTS_DIR", "file", "file",
+                  SIDECAR_KIND_REGULAR, 4, 0640,
+                  1700001102, 3, 1700001103, 4),
+        entry_for("XDG_DOWNLOAD_DIR", "", "", SIDECAR_KIND_DIRECTORY, 0,
+                  0755, 1700001110, 5, 1700001111, 6),
+        entry_for("XDG_DOWNLOAD_DIR", "file", "file",
+                  SIDECAR_KIND_REGULAR, 9, 0600,
+                  1700001112, 7, 1700001113, 8)
+    };
+    check(write_sidecar(&fixture, collision_entries, 4, NULL, NULL) == 0,
+          "direct replay alias sidecar is committed");
+    make_dir_at(fixture.home_fd, "Shared", 0700);
+    if (symlinkat("Shared", fixture.home_fd, "Alias") != 0)
+        fatal("could not create direct replay alias");
+    int shared_fd = openat(fixture.home_fd, "Shared",
+                           O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (shared_fd < 0)
+        fatal("could not open direct replay Shared target");
+    write_file_at(shared_fd, "file", "ORIGINAL");
+    if (close(shared_fd) != 0)
+        fatal("could not close direct replay Shared target");
+
+    char shared[PATH_MAX], alias[PATH_MAX], sentinel[PATH_MAX];
+    path_concat(shared, sizeof(shared), fixture.home, "/Shared");
+    path_concat(alias, sizeof(alias), fixture.home, "/Alias");
+    path_concat(sentinel, sizeof(sentinel), shared, "/file");
+    xdg_dirs[0] = shared;
+    xdg_dirs[1] = alias;
+    PortableRestoreReplayReport report;
+    int result = run_replay_with_xdg(&fixture, &report, xdg_dirs);
+    check(result != 0 && report.applied_count == 0 &&
+              file_equals_noatime(sentinel, "ORIGINAL"),
+          "direct replay refuses aliased duplicate files before any target content changes");
+    fixture_close(&fixture);
+
+    memset(xdg_dirs, 0, sizeof(xdg_dirs));
+    opened = fixture_open(&fixture, &bootstrap);
+    check(opened == 0, "nested alias replay fixture is created");
+    if (opened != 0)
+        return;
+
+    memset(roots, 0, sizeof(roots));
+    strcpy(roots[0].id, "HOME");
+    roots[0].policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(roots[0].payload_path, "HOME");
+    strcpy(roots[0].source_path, "/source/Outer");
+    strcpy(roots[0].restore_path, "Outer");
+    roots[0].has_restore_path = 1;
+    strcpy(roots[1].id, "XDG_DOCUMENTS_DIR");
+    roots[1].policy = ROOT_POLICY_XDG;
+    strcpy(roots[1].payload_path, "XDG_DOCUMENTS_DIR");
+    strcpy(roots[1].source_path, "/source/Documents");
+    strcpy(roots[2].id, "XDG_DOWNLOAD_DIR");
+    roots[2].policy = ROOT_POLICY_XDG;
+    strcpy(roots[2].payload_path, "XDG_DOWNLOAD_DIR");
+    strcpy(roots[2].source_path, "/source/Downloads");
+    check(write_v1_identity_manifest(&fixture, roots, 3) == 0,
+          "nested alias VERSION=1 manifest is written");
+
+    make_dir_at(fixture.data_fd, "HOME", 0700);
+    make_dir_at(fixture.data_fd, "XDG_DOCUMENTS_DIR", 0700);
+    make_dir_at(fixture.data_fd, "XDG_DOWNLOAD_DIR", 0700);
+    int home_payload_fd = openat(fixture.data_fd, "HOME",
+                                 O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    docs_fd = openat(fixture.data_fd, "XDG_DOCUMENTS_DIR",
+                     O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    downloads_fd = openat(fixture.data_fd, "XDG_DOWNLOAD_DIR",
+                          O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (home_payload_fd < 0 || docs_fd < 0 || downloads_fd < 0)
+        fatal("could not open nested alias payload roots");
+    write_file_at(home_payload_fd, "outer.txt", "LINKED");
+    write_file_at(docs_fd, "middle.txt", "MIDDLE");
+    write_file_at(downloads_fd, "leaf-link.txt", "");
+    if (close(home_payload_fd) != 0 || close(docs_fd) != 0 ||
+        close(downloads_fd) != 0)
+        fatal("could not close nested alias payload roots");
+
+    SidecarEntry success_entries[] = {
+        entry_for("HOME", "", "", SIDECAR_KIND_DIRECTORY, 0, 0711,
+                  1700001200, 1, 1700001201, 2),
+        entry_for("HOME", "outer.txt", "outer.txt", SIDECAR_KIND_REGULAR,
+                  6, 0640, 1700001202, 3, 1700001203, 4),
+        entry_for("XDG_DOCUMENTS_DIR", "", "", SIDECAR_KIND_DIRECTORY, 0,
+                  0722, 1700001210, 5, 1700001211, 6),
+        entry_for("XDG_DOCUMENTS_DIR", "middle.txt", "middle.txt",
+                  SIDECAR_KIND_REGULAR, 6, 0600,
+                  1700001212, 7, 1700001213, 8),
+        entry_for("XDG_DOWNLOAD_DIR", "", "", SIDECAR_KIND_DIRECTORY, 0,
+                  0733, 1700001220, 9, 1700001221, 10),
+        entry_for("XDG_DOWNLOAD_DIR", "leaf-link.txt", "leaf-link.txt",
+                  SIDECAR_KIND_HARDLINK, 0, 0640,
+                  1700001222, 11, 1700001223, 12)
+    };
+    success_entries[5].hardlink_root_id = text_bytes("HOME");
+    success_entries[5].hardlink_logical_path = text_bytes("outer.txt");
+    check(write_sidecar(&fixture, success_entries, 6, NULL, NULL) == 0,
+          "nested alias sidecar with a cross-root hardlink is committed");
+
+    make_dir_at(fixture.home_fd, "Outer", 0700);
+    int outer_fd = openat(fixture.home_fd, "Outer",
+                          O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (outer_fd < 0)
+        fatal("could not open nested alias Outer target");
+    make_dir_at(outer_fd, "Middle", 0700);
+    int middle_fd = openat(outer_fd, "Middle",
+                           O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (middle_fd < 0)
+        fatal("could not open nested alias Middle target");
+    make_dir_at(middle_fd, "Leaf", 0700);
+    if (close(middle_fd) != 0 || close(outer_fd) != 0)
+        fatal("could not close nested alias target directories");
+    if (symlinkat("Outer/Middle", fixture.home_fd, "d") != 0 ||
+        symlinkat("Outer/Middle/Leaf", fixture.home_fd,
+                  "a-very-long-download-alias") != 0)
+        fatal("could not create nested alias trust roots");
+
+    char outer[PATH_MAX], middle[PATH_MAX], leaf[PATH_MAX];
+    char documents_alias[PATH_MAX], downloads_alias[PATH_MAX];
+    char outer_file[PATH_MAX], leaf_file[PATH_MAX];
+    path_concat(outer, sizeof(outer), fixture.home, "/Outer");
+    path_concat(middle, sizeof(middle), outer, "/Middle");
+    path_concat(leaf, sizeof(leaf), middle, "/Leaf");
+    path_concat(documents_alias, sizeof(documents_alias), fixture.home, "/d");
+    path_concat(downloads_alias, sizeof(downloads_alias), fixture.home,
+              "/a-very-long-download-alias");
+    path_concat(outer_file, sizeof(outer_file), outer, "/outer.txt");
+    path_concat(leaf_file, sizeof(leaf_file), leaf, "/leaf-link.txt");
+    xdg_dirs[0] = documents_alias;
+    xdg_dirs[1] = downloads_alias;
+
+    check(run_preflight_with_xdg(&fixture, xdg_dirs) == 0,
+          "non-conflicting nested aliases pass portable preflight");
+    result = run_replay_with_xdg(&fixture, &report, xdg_dirs);
+    struct stat outer_st, middle_st, leaf_st, first_st, second_st;
+    int metadata_ok = stat(outer, &outer_st) == 0 &&
+                      stat(middle, &middle_st) == 0 &&
+                      stat(leaf, &leaf_st) == 0;
+    int hardlink_ok = stat(outer_file, &first_st) == 0 &&
+                      stat(leaf_file, &second_st) == 0 &&
+                      first_st.st_dev == second_st.st_dev &&
+                      first_st.st_ino == second_st.st_ino;
+    check(result == 0 && report.failed_count == 0 && hardlink_ok &&
+              file_equals_noatime(outer_file, "LINKED") &&
+              file_equals_noatime(leaf_file, "LINKED"),
+          "nested alias replay preserves cross-root hardlink identity");
+    check(metadata_ok && (outer_st.st_mode & 07777) == 0711 &&
+              (middle_st.st_mode & 07777) == 0722 &&
+              (leaf_st.st_mode & 07777) == 0733 &&
+              outer_st.st_mtim.tv_sec == 1700001201 &&
+              middle_st.st_mtim.tv_sec == 1700001211 &&
+              leaf_st.st_mtim.tv_sec == 1700001221,
+          "nested alias replay finalizes directory metadata by resolved namespace depth");
+    fixture_close(&fixture);
+}
+
+static void test_ascii_case_distinct_names(void)
+{
+    printf(BLUE "::" NC " portable replay: byte-sensitive directories keep ASCII-case-distinct names\n");
+
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "ASCII-case fixture is created");
+    if (opened != 0)
+        return;
+
+    make_dir_at(fixture.data_fd, "ROOT", 0700);
+    int root_fd = openat(fixture.data_fd, "ROOT",
+                         O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (root_fd < 0)
+        fatal("could not open ASCII-case payload root");
+    write_file_at(root_fd, "Documents", "UPPER");
+    write_file_at(root_fd, "documents", "LOWER");
+    if (close(root_fd) != 0)
+        fatal("could not close ASCII-case payload root");
+
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0,
+                  0755, 10, 1, 20, 2),
+        entry_for("ROOT", "Documents", "Documents", SIDECAR_KIND_REGULAR, 5,
+                  0600, 11, 1, 21, 2),
+        entry_for("ROOT", "documents", "documents", SIDECAR_KIND_REGULAR, 5,
+                  0600, 12, 1, 22, 2)
+    };
+    check(write_sidecar(&fixture, entries, 3, NULL, NULL) == 0,
+          "ASCII-case sidecar is committed");
+
+    check(run_preflight(&fixture) == 0,
+          "ordinary byte-sensitive directory passes portable preflight");
+
+    PortableRestoreReplayReport report;
+    int result = run_replay(&fixture, &report);
+    char upper[PATH_MAX], lower[PATH_MAX];
+    path_concat(upper, sizeof(upper), fixture.home, "/restored/Documents");
+    path_concat(lower, sizeof(lower), fixture.home, "/restored/documents");
+    check(result == 0 && report.failed_count == 0 &&
+              file_equals_noatime(upper, "UPPER") &&
+              file_equals_noatime(lower, "LOWER"),
+          "ordinary byte-sensitive directory restores both ASCII-case-distinct entries");
+    fixture_close(&fixture);
+}
+
+static void test_portable_identity_graph_keeps_nested_mount_views_route_specific(void)
+{
+    printf(BLUE "::" NC " portable restore identity graph: nested bind-mounted descendants keep route-specific views\n");
+
+    Fixture fixture;
+    ManifestRoot root = root_for();
+    int opened = fixture_open(&fixture, &root);
+    check(opened == 0, "nested mount-view fixture is created");
+    if (opened != 0)
+        return;
+
+    make_dir_at(fixture.home_fd, "Documents", 0700);
+    make_dir_at(fixture.home_fd, "Downloads", 0700);
+    make_dir_at(fixture.home_fd, "alternate", 0700);
+    char documents_root[PATH_MAX], downloads_root[PATH_MAX];
+    char documents_shared[PATH_MAX], downloads_shared[PATH_MAX];
+    char documents_desc[PATH_MAX], downloads_desc[PATH_MAX], alternate[PATH_MAX];
+    path_concat(documents_root, sizeof(documents_root), fixture.home,
+              "/Documents");
+    path_concat(downloads_root, sizeof(downloads_root), fixture.home,
+              "/Downloads");
+    path_concat(documents_shared, sizeof(documents_shared), fixture.home,
+              "/Documents/shared");
+    path_concat(downloads_shared, sizeof(downloads_shared), fixture.home,
+              "/Downloads/shared");
+    path_concat(documents_desc, sizeof(documents_desc), documents_shared, "/desc");
+    path_concat(downloads_desc, sizeof(downloads_desc), downloads_shared, "/desc");
+    path_concat(alternate, sizeof(alternate), fixture.home, "/alternate");
+    if (mkdir(documents_shared, 0700) != 0 || mkdir(downloads_shared, 0700) != 0 ||
+        mkdir(documents_desc, 0700) != 0 || mkdir(downloads_desc, 0700) != 0)
+        fatal("could not create nested mount-view destinations");
+
+    char alternate_file[PATH_MAX];
+    path_concat(alternate_file, sizeof(alternate_file), alternate,
+              "/downloads-file");
+    if (mkdir(alternate_file, 0700) != 0)
+        fatal("could not create alternate nested mount-view descendant");
+
+    int result = run_nested_mount_view_graph_case(
+        documents_root, downloads_root, documents_shared, downloads_shared,
+        alternate);
+    if (result == CHILD_SKIP)
+        skip_case("portable nested bind-mounted descendant views",
+                  "user namespace, bind mounts, or distinct mount ids are unavailable");
+    else
+        check(result == 0,
+              "portable replay resolves descendants through the current route");
+    fixture_close(&fixture);
+}
+
+static void test_differing_mount_ids_do_not_hide_portable_collisions(void)
+{
+    printf(BLUE "::" NC " portable replay: differing mount ids do not make aliases disjoint\n");
+
+    ManifestRoot bootstrap = root_for();
+    ManifestRoot roots[2];
+    memset(roots, 0, sizeof(roots));
+    strcpy(roots[0].id, "XDG_DOCUMENTS_DIR");
+    roots[0].policy = ROOT_POLICY_XDG;
+    strcpy(roots[0].payload_path, "XDG_DOCUMENTS_DIR");
+    strcpy(roots[0].source_path, "/source/Documents");
+    strcpy(roots[1].id, "XDG_DOWNLOAD_DIR");
+    roots[1].policy = ROOT_POLICY_XDG;
+    strcpy(roots[1].payload_path, "XDG_DOWNLOAD_DIR");
+    strcpy(roots[1].source_path, "/source/Downloads");
+
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &bootstrap);
+    check(opened == 0, "differing-mount-id fixture is created");
+    if (opened != 0)
+        return;
+    check(write_v1_identity_manifest(&fixture, roots, 2) == 0,
+          "differing-mount-id manifest is written");
+    make_dir_at(fixture.data_fd, "XDG_DOCUMENTS_DIR", 0700);
+    make_dir_at(fixture.data_fd, "XDG_DOWNLOAD_DIR", 0700);
+    int documents_payload = openat(fixture.data_fd, "XDG_DOCUMENTS_DIR",
+                                   O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int downloads_payload = openat(fixture.data_fd, "XDG_DOWNLOAD_DIR",
+                                   O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (documents_payload < 0 || downloads_payload < 0)
+        fatal("could not open differing-mount-id payload roots");
+    make_dir_at(documents_payload, "shared", 0700);
+    make_dir_at(downloads_payload, "shared", 0700);
+    int documents_shared_payload = openat(
+        documents_payload, "shared", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int downloads_shared_payload = openat(
+        downloads_payload, "shared", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (documents_shared_payload < 0 || downloads_shared_payload < 0)
+        fatal("could not open differing-mount-id shared payloads");
+    write_file_at(documents_shared_payload, "file", "DOCS");
+    write_file_at(downloads_shared_payload, "file", "DOWNLOADS");
+    if (close(documents_shared_payload) != 0 ||
+        close(downloads_shared_payload) != 0 || close(documents_payload) != 0 ||
+        close(downloads_payload) != 0)
+        fatal("could not close differing-mount-id payloads");
+
+    make_dir_at(fixture.home_fd, "Documents", 0700);
+    make_dir_at(fixture.home_fd, "Downloads", 0700);
+    char documents_root[PATH_MAX], downloads_root[PATH_MAX];
+    char documents_shared[PATH_MAX], downloads_shared[PATH_MAX];
+    char sentinel[PATH_MAX];
+    path_concat(documents_root, sizeof(documents_root), fixture.home,
+              "/Documents");
+    path_concat(downloads_root, sizeof(downloads_root), fixture.home,
+              "/Downloads");
+    path_concat(documents_shared, sizeof(documents_shared), fixture.home,
+              "/Documents/shared");
+    path_concat(downloads_shared, sizeof(downloads_shared), fixture.home,
+              "/Downloads/shared");
+    if (mkdir(documents_shared, 0700) != 0 || mkdir(downloads_shared, 0700) != 0)
+        fatal("could not create differing-mount-id destinations");
+    path_concat(sentinel, sizeof(sentinel), downloads_shared, "/file");
+    int sentinel_fd = open(sentinel, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+                           0600);
+    if (sentinel_fd < 0 || write(sentinel_fd, "ORIGINAL", 8) != 8 ||
+        close(sentinel_fd) != 0)
+        fatal("could not create differing-mount-id sentinel");
+
+    SidecarEntry entries[] = {
+        entry_for("XDG_DOCUMENTS_DIR", "", "", SIDECAR_KIND_DIRECTORY, 0,
+                  0755, 10, 1, 20, 2),
+        entry_for("XDG_DOCUMENTS_DIR", "shared", "shared",
+                  SIDECAR_KIND_DIRECTORY, 0, 0755, 11, 1, 21, 2),
+        entry_for("XDG_DOCUMENTS_DIR", "shared/file", "shared/file",
+                  SIDECAR_KIND_REGULAR, 4, 0600, 12, 1, 22, 2),
+        entry_for("XDG_DOWNLOAD_DIR", "", "", SIDECAR_KIND_DIRECTORY, 0,
+                  0755, 13, 1, 23, 2),
+        entry_for("XDG_DOWNLOAD_DIR", "shared", "shared",
+                  SIDECAR_KIND_DIRECTORY, 0, 0755, 14, 1, 24, 2),
+        entry_for("XDG_DOWNLOAD_DIR", "shared/file", "shared/file",
+                  SIDECAR_KIND_REGULAR, 8, 0600, 15, 1, 25, 2)
+    };
+    check(write_sidecar(&fixture, entries, 6, NULL, NULL) == 0,
+          "differing-mount-id sidecar is committed");
+
+    int result = run_portable_mount_case(
+        &fixture, documents_root, downloads_root, documents_shared,
+        downloads_shared, sentinel);
+    if (result == CHILD_SKIP)
+        skip_case("portable differing-mount-id alias collision",
+                  "user namespace, bind mounts, or distinct mount ids are unavailable");
+    else
+        check(result == 0 && file_equals_noatime(sentinel, "ORIGINAL"),
+              "portable preflight refuses the collision before mutation");
+    fixture_close(&fixture);
+}
+
+static void test_v2_nested_root_replay_order(void)
+{
+    printf(BLUE "::" NC " VERSION=2 replay uses combined destination order across roots\n");
+
+    ManifestRoot bootstrap = root_for();
+    ManifestRoot roots[2];
+    Fixture fixture;
+    int opened = fixture_open(&fixture, &bootstrap);
+    check(opened == 0, "VERSION=2 replay fixture is created");
+    if (opened != 0)
+        return;
+    check(write_v2_nested_manifest(&fixture, roots) == 0,
+          "VERSION=2 replay manifest is written");
+
+    make_dir_at(fixture.data_fd, "HOME", 0700);
+    make_dir_at(fixture.data_fd, "CHILD", 0700);
+    int home_payload_fd = openat(fixture.data_fd, "HOME",
+                                 O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int child_payload_fd = openat(fixture.data_fd, "CHILD",
+                                  O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (home_payload_fd < 0 || child_payload_fd < 0)
+        fatal("could not open VERSION=2 replay payload roots");
+    write_file_at(home_payload_fd, "home.txt", "home");
+    write_file_at(child_payload_fd, "child.txt", "child");
+    if (close(home_payload_fd) != 0 || close(child_payload_fd) != 0)
+        fatal("could not close VERSION=2 replay payload roots");
+
+    SidecarEntry entries[] = {
+        entry_for("HOME", "", "", SIDECAR_KIND_DIRECTORY, 0, 0711,
+                  1700000900, 1, 1700000901, 2),
+        entry_for("HOME", "home.txt", "home.txt", SIDECAR_KIND_REGULAR, 4, 0640,
+                  1700000902, 3, 1700000903, 4),
+        entry_for("CHILD", "", "", SIDECAR_KIND_DIRECTORY, 0, 0750,
+                  1700000910, 5, 1700000911, 6),
+        entry_for("CHILD", "child.txt", "child.txt", SIDECAR_KIND_REGULAR, 5, 0600,
+                  1700000912, 7, 1700000913, 8)
+    };
+    check(write_sidecar(&fixture, entries, 4, NULL, NULL) == 0,
+          "VERSION=2 replay sidecar is committed");
+    check(run_preflight(&fixture) == 0,
+          "VERSION=2 nested roots pass portable preflight");
+
+    PortableRestoreReplayReport report;
+    int result = run_replay(&fixture, &report);
+    char home_file[PATH_MAX], child_file[PATH_MAX], documents[PATH_MAX];
+    path_concat(home_file, sizeof(home_file), fixture.home, "/home.txt");
+    path_concat(child_file, sizeof(child_file), fixture.home, "/Documents/child.txt");
+    path_concat(documents, sizeof(documents), fixture.home, "/Documents");
+    struct stat home_st, documents_st;
+    int metadata_ok = stat(fixture.home, &home_st) == 0 &&
+                      stat(documents, &documents_st) == 0;
+    check(result == 0 && report.failed_count == 0 &&
+              file_equals_noatime(home_file, "home") &&
+              file_equals_noatime(child_file, "child"),
+          "VERSION=2 replay maps both roots to their recorded target destinations");
+    check(metadata_ok && (home_st.st_mode & 07777) == 0711 &&
+              (documents_st.st_mode & 07777) == 0750 &&
+              home_st.st_mtim.tv_sec == 1700000901 &&
+              documents_st.st_mtim.tv_sec == 1700000911,
+          "directory metadata is finalized deepest-first across VERSION=2 roots");
+    fixture_close(&fixture);
+}
+
+static void test_copy_bytes_rejects_corruption(void)
+{
+    printf(BLUE "::" NC " replay_copy_bytes rejects what it cannot "
+                 "faithfully represent\n");
+    char destination[8];
+
+    replay_copy_bytes(destination, sizeof(destination), text_bytes("short"));
+    check(strcmp(destination, "short") == 0,
+          "a source that fits is copied exactly");
+
+    replay_copy_bytes(destination, sizeof(destination),
+                      text_bytes("1234567"));
+    check(strcmp(destination, "1234567") == 0,
+          "a source that fits exactly at the boundary is copied exactly");
+
+    replay_copy_bytes(destination, sizeof(destination),
+                      text_bytes("exactly8"));
+    check(strcmp(destination, "") == 0,
+          "a source that doesn't fit is rejected, not truncated");
+
+    unsigned char embedded_nul[] = { 'a', 'b', '\0', 'c' };
+    SidecarBytes with_nul = { .data = embedded_nul,
+                              .length = sizeof(embedded_nul) };
+    strcpy(destination, "sentinl");
+    replay_copy_bytes(destination, sizeof(destination), with_nul);
+    check(strcmp(destination, "") == 0,
+          "a source with an embedded NUL is rejected, not silently "
+          "misrepresented as a shorter string");
+}
+
+static void test_collection_failure_reason_without_errno(void)
+{
+    printf(BLUE "::" NC " collection failure reasons do not invent errno\n");
+    PortableRestoreReplayReport report;
+    portable_restore_replay_report_init(&report);
+    report.failed_kind = SIDECAR_KIND_REGULAR;
+    report.failed_kind_valid = 1;
+    report.failure_step = PORTABLE_RESTORE_REPLAY_FAILURE_VALIDATE_ADDRESS_INDEX;
+    report.failure_errno = 0;
+
+    char reason[256];
+    int result = replay_failure_reason_format(&report, reason, sizeof(reason));
+    check(result == 1 &&
+              strcmp(reason, "regular file, validate restore address index") == 0,
+          "logical collection failures name their check without a fabricated errno");
+}
+
+int main(void)
+{
+    // A direct sudo run must not aim restores at the invoking user's home
+    // (D38); make and test.sh drop SUDO_UID already.
+    unsetenv("SUDO_UID");
+    test_deferred_paths_restore_last();
+    test_verification_checks_every_item();
+    test_dconf_database_handoff();
+    test_dconf_database_kept_only_for_a_session_load();
+    test_symlink_collection_validation();
+    test_hardlink_identity_validation();
+    test_physical_logical_mismatch();
+    test_shortened_leaf_replay();
+    test_deep_parent_relative_replay();
+    test_collision_suffix_validation();
+    test_normal_replay();
+    test_destination_truncation();
+    test_intermediate_folder_owner();
+    test_regular_content_verification();
+    test_verification_refuses_destination_symlink_replacement();
+    test_symlink_content_verification();
+    test_hardlink_content_verification();
+    test_live_desktop_state_verification_exclusion();
+    test_additional_live_desktop_state_verification_exclusions();
+    test_known_desktop_state_rewrites_home(MANIFEST_SELECTION_VERSION);
+    test_known_desktop_state_rewrites_home(MANIFEST_CURRENT_VERSION);
+    test_known_desktop_state_rewrites_xdg_roots();
+    test_known_desktop_state_same_home_is_verbatim();
+    test_known_desktop_state_legacy_is_verbatim();
+    test_capture_report_sync_accumulates();
+    test_capture_report_sync_failure();
+    test_outstanding_claim_gate();
+    test_xattr_replay();
+    test_xattr_reconciliation();
+    test_gate_refuses_trusted_before_mutation();
+    test_gate_allows_security_only();
+    test_payload_swap();
+    test_tombstone_skipped();
+    test_hardlink_toctou_race();
+    test_resolved_destination_identity_replay();
+    test_ascii_case_distinct_names();
+    test_portable_identity_graph_keeps_nested_mount_views_route_specific();
+    test_differing_mount_ids_do_not_hide_portable_collisions();
+    test_v2_nested_root_replay_order();
+    test_copy_bytes_rejects_corruption();
+    test_collection_failure_reason_without_errno();
+    if (skips != 0)
+        printf(YELLOW "%d portable restore replay test(s) skipped" NC "\n",
+               skips);
+    printf("%s%s%s\n", failures == 0 ? GREEN : RED,
+           failures == 0 ? "all portable restore replay tests passed" :
+           "portable restore replay tests failed", NC);
+    return failures == 0 ? 0 : 1;
+}
