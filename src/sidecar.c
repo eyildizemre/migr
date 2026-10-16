@@ -609,6 +609,17 @@ int sidecar_write_header(int fd)
     return result;
 }
 
+int sidecar_is_header_prefix(const unsigned char *data, size_t length)
+{
+    size_t magic_length = sizeof(sidecar_magic);
+    if (length >= magic_length + sizeof(sidecar_header_version))
+        return 0;
+    size_t magic_part = length < magic_length ? length : magic_length;
+    return memcmp(data, sidecar_magic, magic_part) == 0 &&
+           memcmp(data + magic_part, sidecar_header_version,
+                  length - magic_part) == 0;
+}
+
 int sidecar_write_entry(int fd, const SidecarEntry *entry)
 {
     SidecarBuffer buffer = {0};

@@ -186,6 +186,10 @@ int sidecar_claim_kind_valid(SidecarObjectKind kind);
 int sidecar_physical_leaf_valid(SidecarBytes logical_path,
                                 SidecarBytes physical_leaf);
 
+/* True when data, shorter than the header, is how the header begins: what a
+ * journal killed while its header was being written holds. */
+int sidecar_is_header_prefix(const unsigned char *data, size_t length);
+
 /*
  * Parses a regular sidecar fd without changing its offset or contents. The
  * callback is invoked for complete records only. A truncated EOF tail is

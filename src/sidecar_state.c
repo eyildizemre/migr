@@ -754,6 +754,18 @@ fail:
     return -1;
 }
 
+static int slot_cut_in_header(int fd, const struct stat *st)
+{
+    unsigned char prefix[32];
+    if (st->st_size < 0 || (uint64_t)st->st_size >= sizeof(prefix))
+        return 0;
+    ssize_t got;
+    do {
+        got = pread(fd, prefix, (size_t)st->st_size, 0);
+    } while (got < 0 && errno == EINTR);
+    return got == st->st_size && sidecar_is_header_prefix(prefix, (size_t)got);
+}
+
 // Loads the journal in the slot. A writable open repairs a truncated tail
 // and discards a leftover rewrite; a read-only one changes nothing in the
 // container and refuses a journal that would need that repair.
@@ -782,6 +794,16 @@ static SidecarOpenStatus open_existing_log(int container_fd, int writable,
     if (slot_status != SIDECAR_OPEN_RESUMABLE)
     {
         status = slot_status;
+        goto fail;
+    }
+    // A journal cut inside its header holds no records. Earlier versions
+    // could leave one; a writable open removes it, and the caller starts the
+    // journal again as if it were missing.
+    if (writable && slot_cut_in_header(fd, &initial_stat))
+    {
+        status = unlinkat(container_fd, SIDECAR_SLOT_NAME, 0) == 0 &&
+                         fsync(container_fd) == 0
+                     ? SIDECAR_OPEN_MISSING : SIDECAR_OPEN_IO_ERROR;
         goto fail;
     }
 

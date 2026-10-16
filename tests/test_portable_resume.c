@@ -1252,6 +1252,98 @@ static void test_killed_before_header(const char *base)
     }
 }
 
+// A slot holding the given bytes, as an earlier version's capture killed
+// while writing the header left it: manifest, empty data/, and that slot.
+static int container_with_cut_slot(const char *base, const char *name,
+                                   const unsigned char *bytes, size_t length,
+                                   PortableRootSpec *root,
+                                   PortableCaptureRequest *request)
+{
+    char source_path[PATH_MAX];
+    char container_path[PATH_MAX];
+    char leaf[64];
+    snprintf(leaf, sizeof(leaf), "%s-source", name);
+    join_path(source_path, sizeof(source_path), base, leaf);
+    snprintf(leaf, sizeof(leaf), "%s-container", name);
+    join_path(container_path, sizeof(container_path), base, leaf);
+    make_directory(source_path);
+    char source_file[PATH_MAX];
+    join_path(source_file, sizeof(source_file), source_path, "file");
+    write_file(source_file, name);
+    *root = root_spec("ROOT", strdup(source_file), "ROOT");
+    *request = request_for(root, "a2");
+    int container_fd = create_container(container_path);
+    if (container_fd < 0 ||
+        run_fresh_interrupt(container_fd, request,
+                            PORTABLE_TEST_AFTER_MANIFEST) != 0 ||
+        mkdirat(container_fd, "data", 0700) != 0)
+        fixture_fatal("could not create a cut-header container");
+    int slot_fd = openat(container_fd, SIDECAR_SLOT_NAME,
+                         O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (slot_fd < 0 || write(slot_fd, bytes, length) != (ssize_t)length ||
+        close(slot_fd) != 0)
+        fixture_fatal("could not write the cut slot");
+    return container_fd;
+}
+
+static void test_journal_cut_in_header(const char *base)
+{
+    printf(BLUE "::" NC " a journal an earlier version cut in its header\n");
+    static const unsigned char header_start[] = "MIGR_SI";
+    static const struct {
+        const char *name;
+        const unsigned char *bytes;
+        size_t length;
+        const char *label;
+    } cuts[] = {
+        { "cut-empty", header_start, 0,
+          "resume starts over from an empty journal" },
+        { "cut-partial", header_start, sizeof(header_start) - 1U,
+          "resume starts over from a journal holding part of its header" },
+    };
+    for (size_t index = 0; index < sizeof(cuts) / sizeof(cuts[0]); index++)
+    {
+        PortableRootSpec root;
+        PortableCaptureRequest request;
+        int container_fd = container_with_cut_slot(
+            base, cuts[index].name, cuts[index].bytes, cuts[index].length,
+            &root, &request);
+        struct stat st;
+        check(portable_capture_resume_at(container_fd, &request, NULL) == 0 &&
+                  fstatat(container_fd, SIDECAR_SLOT_NAME, &st,
+                          AT_SYMLINK_NOFOLLOW) == 0 &&
+                  st.st_size > (off_t)sizeof(SIDECAR_MAGIC),
+              cuts[index].label);
+        close(container_fd);
+        free((void *)root.capture_path);
+    }
+
+    PortableRootSpec root;
+    PortableCaptureRequest request;
+    static const unsigned char other[] = "MIGR_XX";
+    int container_fd = container_with_cut_slot(
+        base, "cut-other", other, sizeof(other) - 1U, &root, &request);
+    check(portable_capture_resume_at(container_fd, &request, NULL) != 0 &&
+              !missing_at(container_fd, SIDECAR_SLOT_NAME),
+          "a short journal that does not begin like the header is refused");
+    close(container_fd);
+    free((void *)root.capture_path);
+
+    container_fd = container_with_cut_slot(base, "cut-orphan", header_start, 0,
+                                           &root, &request);
+    int orphan_fd = openat(container_fd, "data/orphan",
+                           O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (orphan_fd < 0 || close(orphan_fd) != 0)
+        fixture_fatal("could not create the orphan payload");
+    struct stat st;
+    check(portable_capture_resume_at(container_fd, &request, NULL) != 0 &&
+              fstatat(container_fd, "data/orphan", &st,
+                      AT_SYMLINK_NOFOLLOW) == 0,
+          "an empty journal beside a nonempty data/ is still refused");
+    close(container_fd);
+    free((void *)root.capture_path);
+}
+
 static void test_nonempty_without_sidecar(const char *base)
 {
     printf(BLUE "::" NC " non-pristine sidecar refusal\n");
@@ -3292,6 +3384,7 @@ int main(void)
     test_symlink_resume(base);
     test_missing_sidecar(base);
     test_killed_before_header(base);
+    test_journal_cut_in_header(base);
     test_nonempty_without_sidecar(base);
     test_unsafe_sidecar(base);
     test_truncated_tail(base);
