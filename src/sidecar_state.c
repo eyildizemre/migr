@@ -620,23 +620,25 @@ static SidecarLogImplementation *allocate_log(int fd)
     return log;
 }
 
+/* The header is written into a new file that is then renamed into the empty
+ * slot, so a process killed at any point never leaves a slot without one. */
 SidecarOpenStatus sidecar_log_create_at(int container_fd, SidecarLog *out)
 {
     if (container_fd < 0 || out == NULL || out->implementation != NULL)
         return SIDECAR_OPEN_INVALID_ARGUMENT;
 
-    int fd = openat(container_fd, SIDECAR_SLOT_NAME,
+    if (unlinkat(container_fd, SIDECAR_REWRITE_NAME, 0) != 0 &&
+        errno != ENOENT)
+        return SIDECAR_OPEN_IO_ERROR;
+    int fd = openat(container_fd, SIDECAR_REWRITE_NAME,
                     O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
                     0600);
     if (fd < 0)
-    {
-        if (errno == EEXIST)
-            return SIDECAR_OPEN_EXISTS;
         return SIDECAR_OPEN_IO_ERROR;
-    }
 
     SidecarLogImplementation *log = NULL;
     SidecarOpenStatus status;
+    int renamed = 0;
 
     struct stat st;
     SidecarOpenStatus slot_status = validate_slot_fd(fd, &st);
@@ -658,13 +660,33 @@ SidecarOpenStatus sidecar_log_create_at(int container_fd, SidecarLog *out)
                                  : SIDECAR_OPEN_IO_ERROR;
         goto fail;
     }
+    if (fsync(fd) != 0)
+    {
+        status = SIDECAR_OPEN_IO_ERROR;
+        goto fail;
+    }
+    if (renameat2(container_fd, SIDECAR_REWRITE_NAME, container_fd,
+                  SIDECAR_SLOT_NAME, RENAME_NOREPLACE) != 0)
+    {
+        status = errno == EEXIST ? SIDECAR_OPEN_EXISTS : SIDECAR_OPEN_IO_ERROR;
+        goto fail;
+    }
+    renamed = 1;
+    if (fsync(container_fd) != 0)
+    {
+        status = SIDECAR_OPEN_IO_ERROR;
+        goto fail;
+    }
     out->implementation = log;
     return SIDECAR_OPEN_FRESH;
 
 fail:
     {
         int saved = errno;
-        unlink_owned_slot(container_fd, fd);
+        if (renamed)
+            unlink_owned_slot(container_fd, fd);
+        else
+            (void)unlinkat(container_fd, SIDECAR_REWRITE_NAME, 0);
         free_log_implementation(log);
         close(fd);
         errno = saved;

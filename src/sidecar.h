@@ -258,6 +258,8 @@ int sidecar_log_find_claim(const SidecarLog *log, SidecarBytes root_id,
 #ifdef SIDECAR_TEST_HOOKS
 typedef enum {
     SIDECAR_TEST_INTERRUPT_NONE = 0,
+    SIDECAR_TEST_BEFORE_HEADER,
+    SIDECAR_TEST_MID_HEADER,
     SIDECAR_TEST_BEFORE_ENTRY,
     SIDECAR_TEST_AFTER_ENTRY,
     SIDECAR_TEST_MID_ENTRY,

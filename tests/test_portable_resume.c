@@ -1212,6 +1212,46 @@ static void test_missing_sidecar(const char *base)
     close(container_fd);
 }
 
+static void test_killed_before_header(const char *base)
+{
+    printf(BLUE "::" NC " a journal killed before its header\n");
+    static const SidecarTestInterruptPoint points[] = {
+        SIDECAR_TEST_BEFORE_HEADER, SIDECAR_TEST_MID_HEADER
+    };
+    for (size_t index = 0; index < sizeof(points) / sizeof(points[0]);
+         index++)
+    {
+        char name[64];
+        char source_path[PATH_MAX];
+        char container_path[PATH_MAX];
+        snprintf(name, sizeof(name), "header-source-%zu", index);
+        join_path(source_path, sizeof(source_path), base, name);
+        snprintf(name, sizeof(name), "header-container-%zu", index);
+        join_path(container_path, sizeof(container_path), base, name);
+        make_directory(source_path);
+        char source_file[PATH_MAX];
+        join_path(source_file, sizeof(source_file), source_path, "file");
+        write_file(source_file, "header");
+        PortableRootSpec root = root_spec("ROOT", source_file, "ROOT");
+        PortableCaptureRequest request = request_for(&root, "a2");
+        int container_fd = create_container(container_path);
+        if (container_fd < 0)
+            fixture_fatal("could not create header container");
+
+        check(run_fresh_sidecar_interrupt(container_fd, &request,
+                                          PORTABLE_TEST_INTERRUPT_NONE,
+                                          points[index]) == 0 &&
+                  missing_at(container_fd, SIDECAR_SLOT_NAME),
+              index == 0 ? "SIGKILL before the header leaves no journal slot"
+                         : "SIGKILL inside the header leaves no journal slot");
+        check(portable_capture_resume_at(container_fd, &request, NULL) == 0 &&
+                  !missing_at(container_fd, SIDECAR_SLOT_NAME) &&
+                  missing_at(container_fd, SIDECAR_REWRITE_NAME),
+              "resume starts the journal and leaves no rewrite file");
+        close(container_fd);
+    }
+}
+
 static void test_nonempty_without_sidecar(const char *base)
 {
     printf(BLUE "::" NC " non-pristine sidecar refusal\n");
@@ -3251,6 +3291,7 @@ int main(void)
     test_shortened_resume_identity(base);
     test_symlink_resume(base);
     test_missing_sidecar(base);
+    test_killed_before_header(base);
     test_nonempty_without_sidecar(base);
     test_unsafe_sidecar(base);
     test_truncated_tail(base);

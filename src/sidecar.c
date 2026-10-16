@@ -48,6 +48,7 @@ void sidecar_test_set_interrupt(SidecarTestInterruptPoint point)
 #define SIDECAR_READ_BUFFER 16384U
 
 enum {
+    SIDECAR_APPEND_HEADER = -1,
     SIDECAR_APPEND_ENTRY_GROUP = -2
 };
 
@@ -319,7 +320,10 @@ static int append_buffer(int fd, const SidecarBuffer *buffer,
     SidecarTestInterruptPoint before = SIDECAR_TEST_INTERRUPT_NONE;
     SidecarTestInterruptPoint after = SIDECAR_TEST_INTERRUPT_NONE;
     SidecarTestInterruptPoint middle = SIDECAR_TEST_INTERRUPT_NONE;
-    if (record_type == SIDECAR_RECORD_ENTRY) {
+    if (record_type == SIDECAR_APPEND_HEADER) {
+        before = SIDECAR_TEST_BEFORE_HEADER;
+        middle = SIDECAR_TEST_MID_HEADER;
+    } else if (record_type == SIDECAR_RECORD_ENTRY) {
         before = SIDECAR_TEST_BEFORE_ENTRY;
         after = SIDECAR_TEST_AFTER_ENTRY;
         middle = SIDECAR_TEST_MID_ENTRY;
@@ -600,7 +604,7 @@ int sidecar_write_header(int fd)
     }
     if (buffer_append_field(&buffer, magic) == 0 &&
         buffer_append_field(&buffer, version) == 0)
-        result = append_buffer(fd, &buffer, -1);
+        result = append_buffer(fd, &buffer, SIDECAR_APPEND_HEADER);
     buffer_free(&buffer);
     return result;
 }
