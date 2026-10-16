@@ -2660,8 +2660,10 @@ static void test_include_self_backup(void)
         missing_output, sizeof(missing_output));
     check(missing_rc == 2 && !dir_exists(missing_target),
           "an absent migr-static fails before creating a destination container");
-    check(strstr(missing_output, "make migr-static") != NULL,
-          "the missing-static refusal tells the user how to build it");
+    check(strstr(missing_output, "/migr-static, which does not exist") !=
+                  NULL &&
+              strstr(missing_output, "README's Install section") != NULL,
+          "the missing-static refusal names the path and where to read on");
 
     make_static_sibling_fixture();
 

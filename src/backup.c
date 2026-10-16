@@ -589,9 +589,18 @@ static int probe_self_binary(int *out_fd, char *arch, size_t arch_size)
         case MIGR_STATIC_OK:
             return 0;
         case MIGR_STATIC_NOT_FOUND:
-            print_error("Error: --include-self could not find migr-static beside "
-                        "the running executable; build it with 'make migr-static'.\n");
+        {
+            char path[PATH_MAX];
+            if (migr_static_path(path) == 0)
+                print_error("Error: --include-self needs %s, which does not "
+                            "exist.\n", path);
+            else
+                print_error("Error: --include-self could not find migr-static "
+                            "beside the running executable.\n");
+            print_error("  Install the static migr there under that name, as "
+                        "the README's Install section shows.\n");
             break;
+        }
         case MIGR_STATIC_NOT_ELF:
             print_error("Error: migr-static beside the running executable is not "
                         "a usable 64-bit little-endian ELF binary.\n");

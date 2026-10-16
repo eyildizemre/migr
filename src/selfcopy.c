@@ -136,6 +136,39 @@ MigrStaticStatus migr_static_validate_fd(int fd, char *arch_out,
     return store_arch(ehdr.e_machine, arch_out, arch_size);
 }
 
+int migr_static_path(char out[PATH_MAX])
+{
+    char executable[PATH_MAX];
+    ssize_t length = readlink("/proc/self/exe", executable,
+                              sizeof(executable));
+    if (length < 0)
+        return -1;
+    if ((size_t)length >= sizeof(executable))
+    {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    executable[length] = '\0';
+
+    char *slash = strrchr(executable, '/');
+    if (slash == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    if (slash == executable)
+        slash[1] = '\0';
+    else
+        *slash = '\0';
+
+    if (path_join(out, PATH_MAX, executable, "migr-static") != 0)
+    {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
+}
+
 MigrStaticStatus migr_static_probe(int *out_fd, char *arch_out,
                                    size_t arch_size)
 {
@@ -153,36 +186,9 @@ MigrStaticStatus migr_static_probe(int *out_fd, char *arch_out,
         return MIGR_STATIC_IO_ERROR;
     }
 
-    char executable[PATH_MAX];
-    ssize_t length = readlink("/proc/self/exe", executable,
-                              sizeof(executable));
-    if (length < 0)
-        return MIGR_STATIC_IO_ERROR;
-    if ((size_t)length >= sizeof(executable))
-    {
-        errno = ENAMETOOLONG;
-        return MIGR_STATIC_IO_ERROR;
-    }
-    executable[length] = '\0';
-
-    char *slash = strrchr(executable, '/');
-    if (slash == NULL)
-    {
-        errno = EINVAL;
-        return MIGR_STATIC_IO_ERROR;
-    }
-    if (slash == executable)
-        slash[1] = '\0';
-    else
-        *slash = '\0';
-
     char candidate[PATH_MAX];
-    if (path_join(candidate, sizeof(candidate), executable,
-                  "migr-static") != 0)
-    {
-        errno = ENAMETOOLONG;
+    if (migr_static_path(candidate) != 0)
         return MIGR_STATIC_IO_ERROR;
-    }
 
     int fd = open(candidate, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0)

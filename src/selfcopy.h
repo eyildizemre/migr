@@ -1,6 +1,7 @@
 #ifndef SELFCOPY_H
 #define SELFCOPY_H
 
+#include <limits.h>
 #include <stddef.h>
 
 #define MIGR_ARCH_MAX 16
@@ -20,6 +21,12 @@ typedef enum {
  */
 MigrStaticStatus migr_static_validate_fd(int fd, char *arch_out,
                                          size_t arch_size);
+
+/*
+ * Writes where migr-static belongs: beside the running executable.
+ * 0, or -1 with errno.
+ */
+int migr_static_path(char out[PATH_MAX]);
 
 /*
  * Locates migr-static beside the running executable and validates it.
