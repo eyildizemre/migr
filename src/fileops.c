@@ -126,6 +126,15 @@ void backup_test_fail_next_source_open(int error)
     backup_test_open_fault = error;
 }
 
+static int backup_test_write_fault;
+static size_t backup_test_write_faults;
+
+void backup_test_fail_content_writes(int error, size_t count)
+{
+    backup_test_write_fault = error;
+    backup_test_write_faults = count;
+}
+
 static BackupTestCaptureHook backup_test_after_copy_hook;
 static void *backup_test_after_copy_context;
 
@@ -2283,6 +2292,14 @@ int backup_capture_report_has_changes(const BackupCaptureReport *report)
 int backup_capture_report_tick(BackupCaptureReport *report,
                                off_t chunk_size, int destination_fd)
 {
+#ifdef BACKUP_TEST_HOOKS
+    if (backup_test_write_faults > 0)
+    {
+        backup_test_write_faults--;
+        errno = backup_test_write_fault;
+        return -1;
+    }
+#endif
     if (report == NULL)
         return 0;
     report->bytes_copied += chunk_size;
@@ -2901,6 +2918,96 @@ NativeReconcileStatus native_reconcile_stale_at(const void *visited,
         reconcile_fail(report, "", "close its folder", errno);
         result = NATIVE_RECONCILE_ERROR;
     }
+    return result;
+}
+
+// Removes the entries of payload_fd whose name is gone from source_fd, and
+// does the same in every folder both hold. Only the payload is read item by
+// item; the source is asked by name, so its atimes stay as they were.
+static int remove_vanished_in(int source_fd, int payload_fd, size_t *removed)
+{
+    int scan_fd = openat(payload_fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    DIR *dir = scan_fd >= 0 ? fdopendir(scan_fd) : NULL;
+    if (dir == NULL)
+    {
+        if (scan_fd >= 0)
+            close(scan_fd);
+        return -1;
+    }
+    NativeStaleList gone = {0}, shared = {0};
+    int result = 0;
+    for (;;)
+    {
+        errno = 0;
+        struct dirent *entry = readdir(dir);
+        if (entry == NULL)
+        {
+            result = errno != 0 ? -1 : 0;
+            break;
+        }
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            continue;
+        struct stat source_st, payload_st;
+        NativeStaleList *list = NULL;
+        if (fstatat(source_fd, entry->d_name, &source_st,
+                    AT_SYMLINK_NOFOLLOW) != 0)
+            list = errno == ENOENT ? &gone : NULL;
+        else if (S_ISDIR(source_st.st_mode) &&
+                 fstatat(payload_fd, entry->d_name, &payload_st,
+                         AT_SYMLINK_NOFOLLOW) == 0 &&
+                 S_ISDIR(payload_st.st_mode))
+            list = &shared;
+        if (list != NULL && native_stale_list_append(list, entry->d_name) != 0)
+        {
+            result = -1;
+            break;
+        }
+    }
+    closedir(dir);
+
+    for (size_t i = 0; result == 0 && i < gone.count; i++)
+    {
+        if (fileops_remove_tree_at(payload_fd, gone.items[i]) != 0)
+            result = -1;
+        else
+            (*removed)++;
+    }
+    for (size_t i = 0; result == 0 && i < shared.count; i++)
+    {
+        int source_child = openat(source_fd, shared.items[i],
+                                  O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                                  O_CLOEXEC);
+        int payload_child = openat(payload_fd, shared.items[i],
+                                   O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                                   O_CLOEXEC);
+        // A folder that changed or went in the meantime is left as it is.
+        if (source_child >= 0 && payload_child >= 0)
+            result = remove_vanished_in(source_child, payload_child, removed);
+        if (source_child >= 0)
+            close(source_child);
+        if (payload_child >= 0)
+            close(payload_child);
+    }
+    native_stale_list_free(&gone);
+    native_stale_list_free(&shared);
+    return result;
+}
+
+int native_remove_vanished_at(const char *source_path, int data_fd,
+                              const char *payload_path, size_t *removed)
+{
+    // A root that is a file, or has no payload yet, holds nothing to remove.
+    int source_fd = open(source_path,
+                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (source_fd < 0)
+        return 0;
+    int payload_fd = openat(data_fd, payload_path,
+                            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    int result = payload_fd >= 0
+        ? remove_vanished_in(source_fd, payload_fd, removed) : 0;
+    if (payload_fd >= 0)
+        close(payload_fd);
+    close(source_fd);
     return result;
 }
 

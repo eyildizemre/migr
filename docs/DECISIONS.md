@@ -5740,7 +5740,8 @@ folders that are easiest to replace and missed the ones that are not.
 
 ## D98 — 2026-10-03 — An update counts the backup it replaces
 
-**Status:** Implemented
+**Status:** Implemented; an update that fills its destination removes what
+left the source and goes on (2026-10-16)
 
 **Decision:** Every manifest records the backup's estimated size on its
 destination, D27's estimate, as `SIZE`. Before an update, the free-space
@@ -5781,6 +5782,24 @@ free, current: ...` for an update, `Copied 30.2G/38.1G in ...` for a first
 backup. The last draw leaves out the current path, so the line that stays on
 screen states the totals. Restore's line takes the same form:
 `Restored 38.1G in 04:36, 141.3M/s`.
+
+**Revision (2026-10-16):** An update writes moved files to their new paths
+before their old copies are removed: a native capture reconciles after every
+root (D23), and a portable one removes what left a folder when it reaches
+that folder, so for it the files moved between roots. On a destination with
+room for the result but not for both copies, the capture failed with
+ENOSPC, and a resume met the same full destination, since the old copies go
+only after a capture that succeeds. Now, when an update's capture fails with
+ENOSPC, the items of the backup whose source is gone are removed and the
+capture runs once more, as a resume does. Native walks each root's payload
+and asks the source for each name (`native_remove_vanished_at()`); portable
+goes through the journal's live records and removes them as reconciliation
+does, records first (`reconcile_vanished()`). Nothing still in the source is
+removed, so an interrupted run leaves a backup the next one finishes. With
+nothing to remove, or no room on the second pass either, the run fails as
+before. The preflight is unchanged: measuring the moves in advance is what
+the paragraph above rejects. A destination probe that fails with ENOSPC says
+that the destination is full.
 
 ---
 

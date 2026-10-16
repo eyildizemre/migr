@@ -81,6 +81,10 @@ void portable_test_interrupt_if(int point);
 /* Defined in portable_reconcile.c, needed by portable.c. */
 int reconcile_root(PortableCaptureContext *context,
                    const PortableRootSpec *root);
+/* Removes root's items whose source is gone, records and payload, adding
+ * their number to *removed when not NULL. 0, or -1. */
+int reconcile_vanished(PortableCaptureContext *context,
+                       const PortableRootSpec *root, size_t *removed);
 int prepare_collision_relocations(PortableCaptureContext *context,
                                   const PortableRootSpec *root);
 int reconcile_stale_claim(PortableCaptureContext *context,

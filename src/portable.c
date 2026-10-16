@@ -4582,8 +4582,21 @@ int portable_capture_resume_prepared_at(
                 "load the owners and hardlinks already recorded", NULL, NULL);
             failed = 1;
         }
-        if (!failed && capture_roots(&context, request) != 0)
+        if (!failed && capture_roots(&context, request) != 0) {
             failed = 1;
+            // An update writes moved files before it removes their old
+            // copies; when that fills the destination, it removes them
+            // first, and the caller runs it again (D98).
+            if (progress_report != NULL &&
+                progress_report->failure_errno == ENOSPC)
+                for (size_t index = 0; index < request->root_count; index++)
+                    if (reconcile_vanished(
+                            &context, &request->roots[index],
+                            &progress_report->vanished_removed) != 0) {
+                        progress_report->vanished_removed = 0;
+                        break;
+                    }
+        }
     }
     if (!failed && sidecar_log_claim_count(&sidecar) != 0) {
         portable_capture_failure_record(

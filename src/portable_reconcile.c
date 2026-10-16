@@ -11,6 +11,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -1172,9 +1173,26 @@ fail:
     return -1;
 }
 
+// 1 when the source of root's item at logical is gone, 0 when it is there
+// or cannot be told (an unreadable folder, say).
+static int source_vanished(const PortableRootSpec *root, const char *logical)
+{
+    if (logical[0] == '\0')
+        return 0;
+    char path[PATH_MAX];
+    int length = snprintf(path, sizeof(path), "%s/%s", root->capture_path,
+                          logical);
+    struct stat st;
+    return length > 0 && (size_t)length < sizeof(path) &&
+           fstatat(AT_FDCWD, path, &st, AT_SYMLINK_NOFOLLOW) != 0 &&
+           (errno == ENOENT || errno == ENOTDIR);
+}
+
+// The items of root recorded in the journal that are stale: those this run
+// did not visit, or with vanished_only, those whose source is gone.
 static int stale_work_list_build(PortableCaptureContext *context,
                                  const PortableRootSpec *root,
-                                 ReconcileWorkList *work)
+                                 int vanished_only, ReconcileWorkList *work)
 {
     if (portable_capture_owners_reload(context) != 0)
         return -1;
@@ -1183,24 +1201,30 @@ static int stale_work_list_build(PortableCaptureContext *context,
         const PortablePhysicalOwner *owner = &active->items[index];
         if (strcmp(owner->root_id, root->id) != 0)
             continue;
-        int visited = visited_contains(context->visited, root->id,
-                                       owner->logical_path);
-        if (visited < 0)
-            return -1;
-        if (visited == 0 &&
-            work_list_append(work, owner, RECONCILE_REASON_STALE) != 0)
+        int stale;
+        if (vanished_only) {
+            stale = source_vanished(root, owner->logical_path);
+        } else {
+            int visited = visited_contains(context->visited, root->id,
+                                           owner->logical_path);
+            if (visited < 0)
+                return -1;
+            stale = visited == 0;
+        }
+        if (stale && work_list_append(work, owner, RECONCILE_REASON_STALE) != 0)
             return -1;
     }
     return 0;
 }
 
-int reconcile_root(PortableCaptureContext *context,
-                   const PortableRootSpec *root)
+// Removes root's stale items, their records and payload, deepest first.
+// Adds how many it removed to *removed when not NULL.
+static int remove_stale(PortableCaptureContext *context,
+                        const PortableRootSpec *root, int vanished_only,
+                        size_t *removed)
 {
-    if (context == NULL || root == NULL)
-        return -1;
     ReconcileWorkList work = {0};
-    if (stale_work_list_build(context, root, &work) != 0)
+    if (stale_work_list_build(context, root, vanished_only, &work) != 0)
         goto fail;
     if (work_list_validate_claims(context, root, &work) != 0)
         goto fail;
@@ -1209,14 +1233,30 @@ int reconcile_root(PortableCaptureContext *context,
     for (size_t index = 0; index < work.count; index++)
         if (cleanup_work_item(context, root, &work.items[index]) != 0)
             goto fail;
+    if (removed != NULL)
+        *removed += work.count;
     work_list_free(&work);
-
-    if (portable_capture_owners_reload(context) != 0)
-        return -1;
-    portable_test_interrupt_if(PORTABLE_TEST_BEFORE_FINAL_INVENTORY);
-    return reconcile_inventory(context, root);
+    return portable_capture_owners_reload(context);
 
 fail:
     work_list_free(&work);
     return -1;
+}
+
+int reconcile_root(PortableCaptureContext *context,
+                   const PortableRootSpec *root)
+{
+    if (context == NULL || root == NULL ||
+        remove_stale(context, root, 0, NULL) != 0)
+        return -1;
+    portable_test_interrupt_if(PORTABLE_TEST_BEFORE_FINAL_INVENTORY);
+    return reconcile_inventory(context, root);
+}
+
+int reconcile_vanished(PortableCaptureContext *context,
+                       const PortableRootSpec *root, size_t *removed)
+{
+    if (context == NULL || root == NULL)
+        return -1;
+    return remove_stale(context, root, 1, removed);
 }

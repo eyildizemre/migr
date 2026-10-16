@@ -4711,6 +4711,102 @@ static void test_update_asks_before_removing(int portable)
     remove_tree(target);
 }
 
+static size_t count_occurrences(const char *text, const char *needle)
+{
+    size_t count = 0;
+    for (const char *at = strstr(text, needle); at != NULL;
+         at = strstr(at + 1, needle))
+        count++;
+    return count;
+}
+
+// An update that fills its destination with moved files removes the copies
+// of what left the source and captures again; with nothing to remove, or
+// still no room after that, it fails once, as before (D98). The files move
+// between roots: within one, a portable capture already removes what left a
+// folder when it reaches that folder.
+static void test_update_makes_room_when_full(int portable)
+{
+    printf(BLUE "::" NC " production: a %s update that fills the destination "
+           "makes room and goes on\n", portable ? "portable" : "native");
+
+    char home[PATH_MAX], target[PATH_MAX], r1[PATH_MAX], r2[PATH_MAX];
+    char path[PATH_MAX], to[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_home");
+    setenv("HOME", home, 1);
+    join_path(r1, sizeof(r1), home, "r1");
+    join_path(r2, sizeof(r2), home, "r2");
+    mkdir_p(r1);
+    join_path(path, sizeof(path), r2, "A");
+    mkdir_p(path);
+    join_path(path, sizeof(path), r2, "C");
+    mkdir_p(path);
+    join_path(path, sizeof(path), r2, "A/file.txt");
+    write_file(path, "moved content");
+    join_path(path, sizeof(path), r2, "C/file.txt");
+    write_file(path, "moved later");
+    fresh_mkdtemp(target, sizeof(target), "plan_target");
+
+    dry_run = 0;
+    backup_test_force_portable_representation(portable);
+    char *paths[] = { r1, r2, NULL };
+    char output[16384], container[PATH_MAX];
+    int first_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                        output, sizeof(output));
+    int found = find_container_dir(target, container, sizeof(container));
+
+    join_path(path, sizeof(path), r2, "A");
+    join_path(to, sizeof(to), r1, "A");
+    check(rename(path, to) == 0, "fixture: move a folder to another root");
+    backup_test_fail_content_writes(ENOSPC, 1);
+    int room_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                       output, sizeof(output));
+    char old_copy[PATH_MAX], new_copy[PATH_MAX];
+    join_path(old_copy, sizeof(old_copy), container, "data/r2/A");
+    join_path(new_copy, sizeof(new_copy), container, "data/r1/A/file.txt");
+    check(first_rc == 0 && found && room_rc == 0 &&
+              strstr(output, "The backup drive is full. Removing the copies "
+                             "of files no longer on this system") != NULL &&
+              strstr(output, "No space left on device") == NULL &&
+              strstr(output, "Backup complete") != NULL &&
+              access(old_copy, F_OK) != 0 &&
+              file_text_is(new_copy, "moved content"),
+          "the copies of what left the source go, and the update completes");
+
+    join_path(path, sizeof(path), r1, "new.txt");
+    write_file(path, "new");
+    backup_test_fail_content_writes(ENOSPC, 1);
+    int none_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                       output, sizeof(output));
+    check(none_rc == 2 && strstr(output, "drive is full") == NULL &&
+              count_occurrences(output, "No space left on device") == 1,
+          "with nothing gone from the source, the full drive is the error");
+
+    join_path(path, sizeof(path), r2, "C");
+    join_path(to, sizeof(to), r1, "C");
+    check(rename(path, to) == 0, "fixture: move another folder");
+    backup_test_fail_content_writes(ENOSPC, 2);
+    int still_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                        output, sizeof(output));
+    check(still_rc == 2 && strstr(output, "drive is full") != NULL &&
+              count_occurrences(output, "No space left on device") == 1,
+          "still full after making room, it fails once");
+
+    backup_test_fail_content_writes(0, 0);
+    int done_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                       output, sizeof(output));
+    join_path(new_copy, sizeof(new_copy), container, "data/r1/C/file.txt");
+    join_path(old_copy, sizeof(old_copy), container, "data/r2/C");
+    check(done_rc == 0 && strstr(output, "Backup complete") != NULL &&
+              file_text_is(new_copy, "moved later") &&
+              access(old_copy, F_OK) != 0,
+          "the next run with room completes the backup");
+
+    backup_test_force_portable_representation(0);
+    remove_tree(home);
+    remove_tree(target);
+}
+
 // A root narrowed to a folder inside it loses the rest of its payload, which
 // the update lists without that folder's size; a root widened to the folder
 // around it loses nothing, so the update asks nothing (D72).
@@ -5705,6 +5801,8 @@ int main(void)
     test_update_asks_before_removing(0);
     test_update_asks_before_removing(1);
     test_update_lists_a_narrowed_root();
+    test_update_makes_room_when_full(0);
+    test_update_makes_room_when_full(1);
     test_update_takes_another_installs_backup_on_yes(0);
     test_update_takes_another_installs_backup_on_yes(1);
     test_portable_update_records_a_metadata_change();

@@ -556,8 +556,12 @@ static int backup_representation_preflight(int dest_fd, const char *target,
 {
     if (fsprobe_fd(dest_fd, out_profile) != 0)
     {
+        int error = errno;
         print_error("Error: could not probe the destination filesystem at "
-                    "%s: %s\n", target, strerror(errno));
+                    "%s: %s\n", target, strerror(error));
+        if (error == ENOSPC)
+            print_error("  The destination is full; free some space on it "
+                        "and run the backup again.\n");
         return -1;
     }
     if (select_representation(out_profile, out_repr) != 0)
@@ -2727,10 +2731,34 @@ static void backup_before_deferred(void *context)
                       strerror(errno));
 }
 
+static void print_root_capture_failure(const BackupPlanRoot *root,
+                                       BackupCaptureStatus status,
+                                       const BackupCaptureReport *report)
+{
+    const char *failed_source = report->failed_source_path[0] != '\0'
+        ? report->failed_source_path : root->capture_path;
+    if (status == BACKUP_CAPTURE_SOURCE_SAFE_READ)
+    {
+        print_source_safe_read_refusal(failed_source);
+        return;
+    }
+    print_item_failure("back up", failed_source, report->failed_operation,
+                       report->failure_errno);
+    size_t root_length = strlen(root->capture_path);
+    const char *below =
+        strncmp(failed_source, root->capture_path, root_length) == 0
+            ? failed_source + root_length : "";
+    run_log_printf("  Its place in the backup: data/%s%s\n",
+                   root->manifest_root.payload_path, below);
+}
+
+// With full_root not NULL, a root that fills the destination is not reported
+// as an error: full_root receives its index, for the caller to make room.
 static void capture_plan_root(const CloneContext *ctx, const BackupPlan *plan,
                               const SelectionPlan *selection, int index,
                               int data_fd, int *had_error,
-                              BackupCaptureReport *capture_report)
+                              BackupCaptureReport *capture_report,
+                              int *full_root)
 {
     const BackupPlanRoot *root = &plan->roots[index];
     if (verbose)
@@ -2747,28 +2775,16 @@ static void capture_plan_root(const CloneContext *ctx, const BackupPlan *plan,
     BackupCaptureStatus capture_status = backup_capture_at_report_continue(
         &root_ctx, root->capture_path, data_fd,
         root->manifest_root.payload_path, capture_report);
-    if (capture_status != BACKUP_CAPTURE_OK)
+    if (capture_status == BACKUP_CAPTURE_OK)
+        return;
+    if (full_root != NULL && capture_status == BACKUP_CAPTURE_ERROR &&
+        capture_report->failure_errno == ENOSPC)
     {
-        const char *failed_source =
-            capture_report->failed_source_path[0] != '\0'
-                ? capture_report->failed_source_path
-                : root->capture_path;
-        if (capture_status == BACKUP_CAPTURE_SOURCE_SAFE_READ)
-            print_source_safe_read_refusal(failed_source);
-        else
-        {
-            print_item_failure("back up", failed_source,
-                               capture_report->failed_operation,
-                               capture_report->failure_errno);
-            size_t root_length = strlen(root->capture_path);
-            const char *below =
-                strncmp(failed_source, root->capture_path, root_length) == 0
-                    ? failed_source + root_length : "";
-            run_log_printf("  Its place in the backup: data/%s%s\n",
-                           root->manifest_root.payload_path, below);
-        }
-        *had_error = 1;
+        *full_root = index;
+        return;
     }
+    print_root_capture_failure(root, capture_status, capture_report);
+    *had_error = 1;
 }
 
 // selection is the optional compiled plan (docs/DECISIONS.md D34) backing
@@ -2782,7 +2798,7 @@ static void capture_plan_root(const CloneContext *ctx, const BackupPlan *plan,
 static void capture_roots(const CloneContext *ctx, const BackupPlan *plan,
                           const SelectionPlan *selection, int data_fd,
                           BackupDeferral *deferral, int *had_error,
-                          BackupCaptureReport *capture_report)
+                          BackupCaptureReport *capture_report, int *full_root)
 {
     // A mismatched pair would index selection->roots past its end with no
     // error, silently capturing a root under the wrong filter -- this is a
@@ -2803,6 +2819,8 @@ static void capture_roots(const CloneContext *ctx, const BackupPlan *plan,
                         plan->roots[i].comprehensive_only != later ||
                         deferral->roots[i] != deferred)
                         continue;
+                    if (full_root != NULL && *full_root >= 0)
+                        return;
                     // Headings only group the verbose lines under them.
                     if (verbose && !printed_heading)
                     {
@@ -2810,7 +2828,7 @@ static void capture_roots(const CloneContext *ctx, const BackupPlan *plan,
                         printed_heading = 1;
                     }
                     capture_plan_root(ctx, plan, selection, i, data_fd,
-                                      had_error, capture_report);
+                                      had_error, capture_report, full_root);
                 }
             }
         }
@@ -2863,6 +2881,82 @@ static void reconcile_roots(const void *visited, const BackupPlan *plan,
             *had_error = 1;
         }
     }
+}
+
+// One native capture of every root, then the removal of what it did not
+// visit, with hardlink and visited tracking of its own. An adopted backup's
+// hardlinks are found first. full_root as for capture_plan_root(); a root
+// that filled the destination leaves reconciliation undone.
+static void native_capture_pass(CloneContext *ctx, const BackupPlan *plan,
+                                const SelectionPlan *selection, int data_fd,
+                                int adopted, BackupDeferral *deferral,
+                                int *had_error, BackupCaptureReport *report,
+                                int *full_root)
+{
+    ctx->inode_map = native_inode_map_create();
+    ctx->visited = native_visited_create();
+    if (ctx->inode_map == NULL || ctx->visited == NULL)
+    {
+        print_error("Error: Could not initialize native hardlink/resume "
+                    "tracking: %s\n", strerror(errno));
+        *had_error = 1;
+    }
+    FailedItem seed_failure = {0};
+    if (!*had_error && adopted &&
+        seed_native_hardlink_map(ctx, plan, selection, data_fd,
+                                 &seed_failure) != 0)
+    {
+        print_step_failure(&seed_failure.step,
+                           "Error: Could not find the hardlinks the backup "
+                           "already holds, at %s", seed_failure.path);
+        *had_error = 1;
+    }
+    if (!*had_error)
+        capture_roots(ctx, plan, selection, data_fd, deferral, had_error,
+                      report, full_root);
+    if (!*had_error && (full_root == NULL || *full_root < 0))
+        reconcile_roots(ctx->visited, plan, data_fd, had_error);
+    native_inode_map_free(ctx->inode_map);
+    ctx->inode_map = NULL;
+    native_visited_free(ctx->visited);
+    ctx->visited = NULL;
+}
+
+// An update writes moved files to their new paths before it removes their
+// old copies (D23), so a destination with room for the result can fill up
+// on the way. Says that the copies of what left the source are removed
+// first and the capture runs again (D98), and readies the progress counts
+// for that second pass: what the first copied, the second finds in place.
+static void begin_second_capture(BackupProgressDisplay *progress,
+                                 BackupCaptureReport *report,
+                                 off_t *copied_before)
+{
+    int ticking = progress != NULL && progress->ticker.running;
+    if (ticking)
+        backup_progress_stop_ticker(progress);
+    progress_line_end();
+    printf("The backup drive is full. Removing the copies of files no longer "
+           "on this system, then going on.\n");
+    fflush(stdout);
+    if (ticking &&
+        progress_ticker_start(&progress->ticker, backup_ticker_redraw,
+                              progress) != 0)
+        print_warning("  Warning: progress stall redraw is unavailable: %s\n",
+                      strerror(errno));
+    *copied_before = report->bytes_copied;
+    report->bytes_copied = 0;
+    report->bytes_unchanged = 0;
+    report->items = 0;
+}
+
+// After the second pass: the bytes the first copied count as copied once.
+static void end_second_capture(BackupCaptureReport *report,
+                               off_t copied_before)
+{
+    off_t found = report->bytes_unchanged < copied_before
+        ? report->bytes_unchanged : copied_before;
+    report->bytes_unchanged -= found;
+    report->bytes_copied += copied_before;
 }
 
 static int metadata_existing_at(int root_fd, const char *rel,
@@ -4141,40 +4235,37 @@ static int backup_run(const char *target_arg, BackupMode mode,
                 .metadata_preflight_done = 1,
                 .recopy = &recopy
             };
-            ctx.inode_map = native_inode_map_create();
-            ctx.visited = native_visited_create();
-            if (ctx.inode_map == NULL || ctx.visited == NULL)
+            int full_root = -1;
+            native_capture_pass(&ctx, &plan, selection, data_fd, adopted,
+                                &deferral, &had_error, &capture_report,
+                                adopted ? &full_root : NULL);
+            // Another failure already ends the run; the full destination
+            // is then reported with it.
+            int make_room = full_root >= 0 && !had_error;
+            size_t removed = 0;
+            for (int i = 0; make_room && i < plan.root_count; i++)
+                make_room = native_remove_vanished_at(
+                    plan.roots[i].capture_path, data_fd,
+                    plan.roots[i].manifest_root.payload_path, &removed) == 0;
+            if (make_room && removed > 0)
             {
-                print_error("Error: Could not initialize native hardlink/resume tracking: %s\n",
-                            strerror(errno));
-                native_inode_map_free(ctx.inode_map);
-                native_visited_free(ctx.visited);
+                off_t copied_before = 0;
+                begin_second_capture(progress_installed ? &progress_display
+                                                        : NULL,
+                                     &capture_report, &copied_before);
+                native_capture_pass(&ctx, &plan, selection, data_fd, adopted,
+                                    &deferral, &had_error, &capture_report,
+                                    NULL);
+                end_second_capture(&capture_report, copied_before);
+            }
+            else if (full_root >= 0)
+            {
+                print_root_capture_failure(&plan.roots[full_root],
+                                           BACKUP_CAPTURE_ERROR,
+                                           &capture_report);
                 had_error = 1;
             }
-            else
-            {
-                FailedItem seed_failure = {0};
-                if (adopted && seed_native_hardlink_map(&ctx, &plan, selection,
-                                                        data_fd,
-                                                        &seed_failure) != 0)
-                {
-                    print_step_failure(&seed_failure.step,
-                                       "Error: Could not find the hardlinks "
-                                       "the backup already holds, at %s",
-                                       seed_failure.path);
-                    had_error = 1;
-                }
-                if (!had_error)
-                    capture_roots(&ctx, &plan, selection, data_fd, &deferral,
-                                  &had_error, &capture_report);
-                count = capture_report.items;
-                if (!had_error)
-                    reconcile_roots(ctx.visited, &plan, data_fd, &had_error);
-                native_inode_map_free(ctx.inode_map);
-                ctx.inode_map = NULL;
-                native_visited_free(ctx.visited);
-                ctx.visited = NULL;
-            }
+            count = capture_report.items;
         }
         else
         {
@@ -4194,6 +4285,20 @@ static int backup_run(const char *target_arg, BackupMode mode,
                 : portable_capture_fresh_prepared_at(
                       container_fd, &portable_request, &prepared, &live_count,
                       &capture_report);
+            if (capture_result != 0 && capture_report.vanished_removed > 0)
+            {
+                off_t copied_before = 0;
+                begin_second_capture(progress_installed ? &progress_display
+                                                        : NULL,
+                                     &capture_report, &copied_before);
+                // The first pass stopped part way, so the payload is checked
+                // item by item again.
+                portable_request.payload_matches_journal = 0;
+                capture_result = portable_capture_resume_prepared_at(
+                    container_fd, &portable_request, &prepared, &live_count,
+                    &capture_report);
+                end_second_capture(&capture_report, copied_before);
+            }
             count = live_count;
             if (capture_result != 0)
             {
@@ -4635,7 +4740,7 @@ BackupCaptureStatus backup_selection_capture(const CloneContext *ctx,
             had_error = 1;
         if (!had_error)
             capture_roots(&run, &backup_plan, plan, data_fd, &none,
-                          &had_error, report);
+                          &had_error, report, NULL);
         if (!had_error)
             reconcile_roots(run.visited, &backup_plan, data_fd, &had_error);
         status = had_error ? BACKUP_CAPTURE_ERROR : BACKUP_CAPTURE_OK;

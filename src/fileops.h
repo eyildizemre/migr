@@ -142,6 +142,22 @@ NativeReconcileStatus native_reconcile_stale_at(
     const void *visited, const char *root_key, int data_fd,
     NativeReconcileReport *report);
 
+/**
+ * @brief Removes from a native root's payload what is gone from its source.
+ *
+ * An update writes moved files before reconciliation removes their old
+ * copies; when that fills the destination, this removes them first so the
+ * capture can run again (docs/DECISIONS.md D98). Entries whose source cannot
+ * be examined are kept.
+ *
+ * @param removed Incremented for each entry removed, a folder with its
+ *                contents counting once.
+ * @return 0, or -1 with errno when the payload could not be read or an
+ *         entry not removed.
+ */
+int native_remove_vanished_at(const char *source_path, int data_fd,
+                              const char *payload_path, size_t *removed);
+
 typedef struct MetadataProfiles MetadataProfiles;
 
 /**
@@ -247,6 +263,9 @@ typedef struct {
     size_t live_state_changes;
     /* Every other source change, by kind (D63). */
     ExampleList source_changes[BACKUP_SOURCE_CHANGE_KINDS];
+    /* An update that filled the destination: the items whose source is
+     * gone, removed from the backup to make room (D98). */
+    size_t vanished_removed;
 } BackupCaptureReport;
 
 void backup_capture_report_init(BackupCaptureReport *report);
@@ -283,6 +302,9 @@ void backup_test_set_after_copy_hook(BackupTestCaptureHook hook,
                                      void *context);
 /* Makes the next native capture source open fail with error. */
 void backup_test_fail_next_source_open(int error);
+/* Makes the next count content writes of a capture, native or portable,
+ * fail with error, as a full destination does. */
+void backup_test_fail_content_writes(int error, size_t count);
 #endif
 
 /**
