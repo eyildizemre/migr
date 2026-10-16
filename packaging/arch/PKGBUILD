@@ -2,7 +2,7 @@
 # makepkg reads these variables, sets pkgdir, and runs each function with errexit.
 # shellcheck shell=bash disable=SC2034,SC2154,SC2164
 pkgname=migr
-pkgver=0.1.1
+pkgver=0.1.2
 pkgrel=1
 pkgdesc='Move your home, packages, and settings to a new Linux install'
 arch=('x86_64')
