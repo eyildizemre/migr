@@ -67,9 +67,10 @@ make migr-static             # optional, for --include-self: needs a static C li
 sudo make install-static     # (glibc-static on Fedora)
 ```
 
-`sudo make install PREFIX=/usr` installs to `/usr/bin` instead. On openSUSE,
-`sudo` does not look in `/usr/local/bin`; run `sudo /usr/local/bin/migr`
-there.
+`sudo make install PREFIX=/usr` installs to `/usr/bin` instead.
+
+On openSUSE, `sudo` does not look in `/usr/local/bin`, where the static
+binary and `make install` put migr; run `sudo /usr/local/bin/migr` there.
 
 ## Quick start
 
