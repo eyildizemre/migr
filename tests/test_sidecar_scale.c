@@ -44,6 +44,7 @@ extern size_t sidecar_state_test_entry_probe_index(const SidecarLog *log,
                                                    SidecarBytes root_id,
                                                    SidecarBytes logical_path);
 extern uint64_t sidecar_state_test_entry_used_count(const SidecarLog *log);
+extern uint64_t sidecar_state_test_claim_rehash_slot_count(void);
 
 static int failures;
 
@@ -417,6 +418,54 @@ static void test_probe_churn(int container_fd)
     check(reset_slot(container_fd) == 0, "churn fixture is removed");
 }
 
+// Pending claims just under half of the claim map's capacity, then claims
+// that each commit at once: every commit leaves a tombstone, and the map must
+// not be rehashed in place every few of them.
+static void test_claim_churn_near_half(int container_fd)
+{
+    enum { PENDING = 2046U, CAPACITY = 4096U, PAIRS = 1000U };
+    printf(BLUE "::" NC " claim-map churn with pending claims near half\n");
+    check(reset_slot(container_fd) == 0, "claim churn fixture slot resets");
+
+    SidecarLog log = {0};
+    int ok = sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH &&
+             append_root_claim(&log, "claim-churn-root") == 0;
+    char logical[64];
+    for (unsigned int index = 1; ok && index < PENDING; index++)
+    {
+        snprintf(logical, sizeof(logical), "pending-%u", index);
+        SidecarClaim claim = {
+            .root_id = { (const unsigned char *)"claim-churn-root", 16 },
+            .logical_path = { (const unsigned char *)logical, strlen(logical) },
+            .physical_leaf = { (const unsigned char *)logical,
+                               strlen(logical) },
+            .kind = SIDECAR_KIND_REGULAR
+        };
+        ok = sidecar_log_append_claim(&log, &claim) == SIDECAR_STATUS_OK;
+    }
+    check(ok && sidecar_log_claim_count(&log) == PENDING,
+          "pending claims fill just under half of the claim map");
+
+    uint64_t before = sidecar_state_test_claim_rehash_slot_count();
+    for (unsigned int index = 0; ok && index < PAIRS; index++)
+    {
+        snprintf(logical, sizeof(logical), "pair-%u", index);
+        SidecarEntry entry = make_entry("claim-churn-root", logical, logical,
+                                        index);
+        ok = append_claimed_entry(&log, &entry) == 0;
+    }
+    uint64_t walked = sidecar_state_test_claim_rehash_slot_count() - before;
+    printf("  claim rehash slots walked=%" PRIu64 "\n", walked);
+    check(ok && sidecar_log_claim_count(&log) == PENDING &&
+              sidecar_log_live_count(&log) == PAIRS,
+          "every claimed entry commits and the pending claims stay");
+    check(walked <= (uint64_t)CAPACITY * 2U,
+          "commits rehash the claim map at most a few times");
+    check(sidecar_log_close(&log) == SIDECAR_STATUS_OK,
+          "claim churn fixture closes");
+    check(reset_slot(container_fd) == 0, "claim churn fixture is removed");
+}
+
 static void test_live_entry_ceiling(void)
 {
     printf(BLUE "::" NC " sidecar live-entry ceiling helper\n");
@@ -482,6 +531,7 @@ int main(void)
     test_tombstone_rehash_persistence(container_fd);
     test_resurrection_and_used_count(container_fd);
     test_probe_churn(container_fd);
+    test_claim_churn_near_half(container_fd);
 
     check(reset_slot(container_fd) == 0,
           "large fixture starts with an absent sidecar");

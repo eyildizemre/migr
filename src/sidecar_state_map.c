@@ -61,6 +61,19 @@ void sidecar_state_test_reset_probe_count(void)
     state_test_probe_count = 0;
 }
 
+static uint64_t state_test_claim_rehash_slots;
+
+static void count_rehash(const StateMap *map)
+{
+    if (map->value_kind == MAP_VALUE_CLAIM)
+        state_test_claim_rehash_slots += map->capacity;
+}
+
+uint64_t sidecar_state_test_claim_rehash_slot_count(void)
+{
+    return state_test_claim_rehash_slots;
+}
+
 size_t sidecar_state_test_entry_probe_index(const SidecarLog *log,
                                             SidecarBytes root_id,
                                             SidecarBytes logical_path)
@@ -86,6 +99,11 @@ uint64_t sidecar_state_test_entry_used_count(const SidecarLog *log)
 #else
 static void count_probe(void)
 {
+}
+
+static void count_rehash(const StateMap *map)
+{
+    (void)map;
 }
 #endif
 
@@ -123,6 +141,7 @@ static SidecarStatus map_rehash(StateMemory *memory, StateMap *map,
         return SIDECAR_STATUS_LIMIT;
     }
 
+    count_rehash(map);
     size_t new_size = new_capacity * sizeof(MapSlot);
     MapSlot *new_slots = state_alloc(memory, new_size);
     if (new_slots == NULL)
@@ -236,9 +255,14 @@ static SidecarStatus map_prepare_insert(StateMemory *memory, StateMap *map)
     if (used == SIZE_MAX || used + 1U <= map->capacity / 2U)
         return SIDECAR_STATUS_OK;
 
+    // A rehash drops claim tombstones. They may fill the claim map to three
+    // quarters first, so each rehash in place frees at least a quarter of it
+    // even with live claims just under half; it grows only past half.
     size_t new_capacity = map->capacity;
     int must_grow = map->value_kind == MAP_VALUE_ENTRY ||
                     map->count + 1U > map->capacity / 2U;
+    if (!must_grow && used + 1U <= map->capacity / 4U * 3U)
+        return SIDECAR_STATUS_OK;
     if (must_grow)
     {
         if (new_capacity > map_max_capacity() / 2U)
