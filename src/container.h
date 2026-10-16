@@ -139,6 +139,8 @@ typedef struct {
     off_t own_size; /**< the recorded size of the last of those, when it
                          holds a whole backup: finished or being updated,
                          not a first one interrupted (D98); else 0. */
+    char own_name[CONTAINER_NAME_MAX]; /**< the last of those, under its
+                                            current name. */
     size_t other; /**< finished backups of another install in the same
                        format (representation and journal version). */
     char other_name[CONTAINER_NAME_MAX]; /**< the first of those. */

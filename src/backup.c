@@ -508,23 +508,41 @@ static int backup_space_preflight(int dest_fd, off_t estimated_size,
     return 0;
 }
 
-/* The space the backup an update would take already holds under dest_fd,
- * most of which the update keeps (D98): this install's, or with take_other
- * the one finished backup of another install it offers to update instead.
- * 0 when there is none, its size is unrecorded, or it is a first backup
- * still unfinished.
+typedef enum {
+    UPDATE_NONE = 0, /* a new backup */
+    UPDATE_OWN,      /* this install's backup */
+    UPDATE_OTHER     /* the one finished backup of another install (D88) */
+} UpdateTarget;
+
+/* The backup a run would update under dest_fd, as adoption will find it:
+ * this install's, or with take_other the one finished backup of another
+ * install it offers to update instead. Its name goes to name, and to
+ * reused_size the space it already holds, most of which the update keeps
+ * (D98): 0 when unrecorded or a first backup still unfinished.
  */
-static off_t backup_reused_size(int dest_fd, const Manifest *wanted,
-                                int take_other)
+static UpdateTarget backup_update_target(int dest_fd, const Manifest *wanted,
+                                         int take_other,
+                                         char name[CONTAINER_NAME_MAX],
+                                         off_t *reused_size)
 {
+    name[0] = '\0';
+    *reused_size = 0;
     ContainerSurvey survey;
     if (container_survey_fd(dest_fd, invoker_name(), wanted, &survey) != 0)
-        return 0;
+        return UPDATE_NONE;
     if (survey.own == 1)
-        return survey.own_size;
+    {
+        memcpy(name, survey.own_name, CONTAINER_NAME_MAX);
+        *reused_size = survey.own_size;
+        return UPDATE_OWN;
+    }
     if (survey.own == 0 && survey.other == 1 && take_other)
-        return survey.other_size;
-    return 0;
+    {
+        memcpy(name, survey.other_name, CONTAINER_NAME_MAX);
+        *reused_size = survey.other_size;
+        return UPDATE_OTHER;
+    }
+    return UPDATE_NONE;
 }
 
 /* Returns 0 to proceed (*out_profile and *out_repr are set), or -1 if the
@@ -2176,6 +2194,190 @@ static void compact_journal(int container_fd)
     }
 }
 
+// A root as its user names it: "~/rest" inside the home it was taken from,
+// otherwise its absolute address. Built-in roots record a home-relative
+// address and XDG roots an absolute one, so this is what compares a backup's
+// roots with this run's, also when it was taken under another home (D86).
+static void root_user_path(const char *home, const ManifestRoot *root,
+                           char *out, size_t out_size)
+{
+    const char *rest = NULL;
+    if (root->policy == ROOT_POLICY_HOME_RELATIVE)
+        rest = root->source_path;
+    else if (home[0] != '\0' && path_covers(home, root->source_path))
+    {
+        rest = root->source_path + strlen(home);
+        rest += *rest == '/';
+    }
+    if (rest == NULL)
+        snprintf(out, out_size, "%s", root->source_path);
+    else
+        snprintf(out, out_size, "~%s%s", rest[0] != '\0' ? "/" : "", rest);
+}
+
+// The bytes of the regular files at or below dir_fd/name, whose links are not
+// followed; 0 when it is missing. Only shown, so a tree it cannot read or
+// deeper than 256 levels counts as far as it got.
+static off_t payload_size_at(int dir_fd, const char *name, int depth)
+{
+    struct stat st;
+    if (depth > 256 || fstatat(dir_fd, name, &st, AT_SYMLINK_NOFOLLOW) != 0)
+        return 0;
+    if (!S_ISDIR(st.st_mode))
+        return S_ISREG(st.st_mode) ? st.st_size : 0;
+    int fd = openat(dir_fd, name,
+                    O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    DIR *dir = fd >= 0 ? fdopendir(fd) : NULL;
+    if (dir == NULL)
+    {
+        if (fd >= 0)
+            close(fd);
+        return 0;
+    }
+    off_t total = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL)
+        if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0)
+            total += payload_size_at(dirfd(dir), entry->d_name, depth + 1);
+    closedir(dir);
+    return total;
+}
+
+// Starts a line of what an update removes, with its size unless negative,
+// under a heading before the first.
+static void print_removal(int *listed, const char *target, const char *name,
+                          const char *what, off_t size)
+{
+    if ((*listed)++ == 0)
+        printf("\nUpdating %s/%s would also remove what this run does not "
+               "select:\n", target, name);
+    printf("  %s", what);
+    if (size < 0)
+        return;
+    char size_text[32];
+    format_size(size, size_text, sizeof(size_text));
+    printf(" (%s)", size_text);
+}
+
+// Lists what updating the backup dest_fd/name with plan removes from it
+// beyond what left the source (D72): the roots this run does not select, the
+// bundled migr, network configuration, and the lists an explicit-path backup
+// keeps none of. A root this run selects folders of loses the rest, and the
+// folders are copied again; a root inside one this run selects is copied
+// again and not listed. Returns 1 when it listed something, 0 when nothing is
+// removed, and -1, reported, when the backup could not be read.
+static int print_update_removals(int dest_fd, const char *target,
+                                 const char *name, const BackupPlan *plan,
+                                 int include_self, int include_network_config,
+                                 unsigned int network_config_present_mask)
+{
+    int container_fd = openat(dest_fd, name, O_RDONLY | O_DIRECTORY |
+                                             O_NOFOLLOW | O_CLOEXEC);
+    Manifest previous;
+    if (container_fd < 0 ||
+        manifest_read_v1_at(container_fd, &previous) != MANIFEST_STATUS_VALID)
+    {
+        print_error("Error: could not read the backup %s/%s: %s\n", target,
+                    name, container_fd < 0 ? strerror(errno)
+                                           : "its manifest is not valid");
+        if (container_fd >= 0)
+            close(container_fd);
+        return -1;
+    }
+    char (*selected)[PATH_MAX + 2] =
+        calloc((size_t)plan->root_count + 1U, sizeof(*selected));
+    if (selected == NULL)
+    {
+        print_error("Error: out of memory listing what the update removes\n");
+        close(container_fd);
+        manifest_free(&previous);
+        return -1;
+    }
+    char home[PATH_MAX];
+    if (resolve_target_home(home) != 0)
+        home[0] = '\0';
+    for (int j = 0; j < plan->root_count; j++)
+        root_user_path(home, &plan->roots[j].manifest_root, selected[j],
+                       sizeof(selected[j]));
+    int data_fd = openat(container_fd, "data", O_RDONLY | O_DIRECTORY |
+                                               O_NOFOLLOW | O_CLOEXEC);
+
+    int listed = 0;
+    for (int i = 0; i < previous.root_count; i++)
+    {
+        const ManifestRoot *root = &previous.roots[i];
+        char path[PATH_MAX + 2];
+        root_user_path(previous.source_home, root, path, sizeof(path));
+        int kept = 0;
+        for (int j = 0; j < plan->root_count && !kept; j++)
+            kept = path_covers(selected[j], path);
+        if (kept)
+            continue;
+        off_t size = data_fd >= 0
+            ? payload_size_at(data_fd, root->payload_path, 0) : 0;
+        int inside = 0;
+        for (int j = 0; j < plan->root_count; j++)
+            if (path_covers(path, selected[j]))
+            {
+                char payload[PATH_MAX * 2 + 2];
+                snprintf(payload, sizeof(payload), "%s%s", root->payload_path,
+                         selected[j] + strlen(path));
+                off_t copied = data_fd >= 0
+                    ? payload_size_at(data_fd, payload, 0) : 0;
+                size -= copied < size ? copied : size;
+                inside++;
+            }
+        print_removal(&listed, target, name, path, size);
+        for (int j = 0, shown = 0; j < plan->root_count; j++)
+            if (path_covers(path, selected[j]))
+                printf("%s%s", shown++ == 0 ? ", except " : ", ",
+                       selected[j]);
+        printf("%s\n", inside ? ", copied again" : "");
+    }
+    if (previous.has_self_binary && !include_self)
+    {
+        print_removal(&listed, target, name, "the bundled migr",
+                      payload_size_at(container_fd, "migr", 0));
+        printf("\n");
+    }
+    if (previous.has_network_config &&
+        !(include_network_config && network_config_present_mask != 0))
+    {
+        print_removal(&listed, target, name, "network configuration",
+                      payload_size_at(container_fd, "network", 0));
+        printf("\n");
+    }
+    int paths_only = plan->scope == MANIFEST_SCOPE_EXPLICIT &&
+                     previous.scope != MANIFEST_SCOPE_EXPLICIT;
+    if (paths_only)
+    {
+        print_removal(&listed, target, name, "the package, VS Code "
+                      "extension, group, and Flatpak lists", -1);
+        printf("\n");
+    }
+
+    char options[96] = "";
+    if (previous.scope == MANIFEST_SCOPE_COMPREHENSIVE &&
+        plan->scope != MANIFEST_SCOPE_COMPREHENSIVE)
+        strcat(options, " --comprehensive");
+    if (previous.has_self_binary && !include_self)
+        strcat(options, " --include-self");
+    if (previous.has_network_config && !include_network_config)
+        strcat(options, " --include-network-config");
+    if (paths_only)
+        printf("  To keep them, run the backup without paths%s%s.\n",
+               options[0] != '\0' ? ", with" : "", options);
+    else if (listed && options[0] != '\0')
+        printf("  To keep them, add%s.\n", options);
+
+    if (data_fd >= 0)
+        close(data_fd);
+    close(container_fd);
+    free(selected);
+    manifest_free(&previous);
+    return listed > 0;
+}
+
 // O_NOFOLLOW | O_DIRECTORY: in an adopted container this entry may already
 // exist, and only a genuine directory is acceptable — a symlink there would
 // otherwise place the whole payload outside the container.
@@ -3133,10 +3335,12 @@ static int backup_dry_run(const char *target, BackupMode mode,
              backup_target_is_container(advisory_fd, target)) ||
             backup_representation_preflight(
                 advisory_fd, target, &advisory_profile, &advisory_repr) != 0;
+    // The backup a live run would update, which it offers to when it
+    // belongs to another install (D88, D98).
+    UpdateTarget update = UPDATE_NONE;
+    char update_name[CONTAINER_NAME_MAX] = "";
     if (advisory_fd >= 0 && !advisory_probe_failed)
     {
-        // The backup a live run would update, which it offers to when it
-        // belongs to another install (D88, D98).
         off_t reused_size = 0;
         if (!advisory_used_parent)
         {
@@ -3149,7 +3353,8 @@ static int backup_dry_run(const char *target, BackupMode mode,
             wanted.has_source_identity =
                 read_machine_id(wanted.machine_id,
                                 sizeof(wanted.machine_id)) == 0;
-            reused_size = backup_reused_size(advisory_fd, &wanted, 1);
+            update = backup_update_target(advisory_fd, &wanted, 1,
+                                          update_name, &reused_size);
         }
         off_t advisory_block_size = 0;
         (void)destination_block_size(advisory_fd, &advisory_block_size);
@@ -3282,12 +3487,20 @@ static int backup_dry_run(const char *target, BackupMode mode,
         portable_prepared_capture_free(&advisory_prepared);
     }
     metadata_profiles_free(&advisory_profiles);
-    if (advisory_fd >= 0)
-        close(advisory_fd);
 
     printf("Dry run mode enabled. No changes will be made.\n\n");
-    printf("Would create a versioned backup container under: %s\n", target);
-    printf("  Its name, migr-<user> or a dated one when that is taken, is chosen when the backup actually runs.\n");
+    if (update == UPDATE_OWN)
+        printf("Would update the backup %s/%s in place.\n", target,
+               update_name);
+    else if (update == UPDATE_OTHER)
+        printf("Would ask whether to update %s/%s, taken on another "
+               "install,\n  and create a new backup container next to it "
+               "otherwise.\n", target, update_name);
+    else
+    {
+        printf("Would create a versioned backup container under: %s\n", target);
+        printf("  Its name, migr-<user> or a dated one when that is taken, is chosen when the backup actually runs.\n");
+    }
 
     preview_roots(plan, &count);
 
@@ -3338,6 +3551,19 @@ static int backup_dry_run(const char *target, BackupMode mode,
                self_arch);
     if (include_network_config)
         print_network_config_dry_run(network_config_present_mask);
+
+    int removes = update != UPDATE_NONE
+        ? print_update_removals(advisory_fd, target, update_name, plan,
+                                include_self, include_network_config,
+                                network_config_present_mask)
+        : 0;
+    if (advisory_fd >= 0)
+        close(advisory_fd);
+    if (removes < 0)
+    {
+        backup_plan_free(plan);
+        return MIGR_EXIT_FAILURE;
+    }
 
     // The paths listed above; their files are counted when the backup runs.
     printf("\nDry run complete: %d path%s would be backed up\n", count,
@@ -3609,6 +3835,27 @@ static int backup_run(const char *target_arg, BackupMode mode,
     // later (D88).
     char other_install[CONTAINER_NAME_MAX];
     backup_offer_other_install(target_fd, target, &manifest, other_install);
+    char update_name[CONTAINER_NAME_MAX];
+    off_t reused_size = 0;
+    if (backup_update_target(target_fd, &manifest, other_install[0] != '\0',
+                             update_name, &reused_size) != UPDATE_NONE)
+    {
+        // An update removes what this run does not select from the backup,
+        // which only the user can decide, so it asks here as well (D72).
+        int removes = print_update_removals(
+            target_fd, target, update_name, &plan, include_self,
+            include_network_config, network_config_present_mask);
+        if (removes < 0)
+            goto fail_pre_container;
+        if (removes > 0 &&
+            !confirm_action("Remove them and update the backup?"))
+        {
+            printf("Backup cancelled; nothing was changed.\n");
+            goto cancel_pre_container;
+        }
+        if (removes > 0)
+            printf("\n");
+    }
 
     off_t target_block_size = 0;
     (void)destination_block_size(target_fd, &target_block_size);
@@ -3623,9 +3870,7 @@ static int backup_run(const char *target_arg, BackupMode mode,
 
     if (backup_space_preflight(target_fd, estimated_size, raw_estimated_size,
                                estimate_had_error, raw_estimate_had_error,
-                               &estimate_failure,
-                               backup_reused_size(target_fd, &manifest,
-                                                  other_install[0] != '\0'),
+                               &estimate_failure, reused_size,
                                target) != 0)
         goto fail_pre_container;
     selection_plan_print_notes(selection);

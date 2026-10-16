@@ -4559,9 +4559,13 @@ static void test_backup_updates_in_place(int portable)
     write_file(kept, "second, longer");
     check(unlink(removed) == 0, "fixture: remove a backed-up file");
     char *second_paths[] = { dir, NULL };
-    int second_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS,
-                                         second_paths, output, sizeof(output));
+    int second_rc = run_backup_capturing_input(target, BACKUP_EXPLICIT_PATHS,
+                                               second_paths, 0, 0, "y\n",
+                                               output, sizeof(output));
     backup_test_force_portable_representation(0);
+    check(strstr(output, "  ~/dropped.txt (7B)\n") != NULL &&
+              strstr(output, "Remove them and update the backup?") != NULL,
+          "the root the new selection lacks is named before it is removed");
 
     struct stat second_st = {0};
     char payload[PATH_MAX];
@@ -4599,6 +4603,157 @@ static void test_backup_updates_in_place(int portable)
                   journal_root_entries(container, "EXPLICIT_0") == 2,
               "the journal keeps the kept root's entries and none of the "
               "dropped root's");
+
+    remove_tree(home);
+    remove_tree(target);
+}
+
+// An update that would remove parts of the backup the run does not select
+// names them with their sizes, in a dry run too, and removes them only when
+// the user says so (D72).
+static void test_update_asks_before_removing(int portable)
+{
+    printf(BLUE "::" NC " production: a %s update asks before removing what "
+           "it does not select\n", portable ? "portable" : "native");
+
+    char home[PATH_MAX], target[PATH_MAX], dir[PATH_MAX], file[PATH_MAX];
+    char dropped[PATH_MAX], network_source[PATH_MAX], missing[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_home");
+    setenv("HOME", home, 1);
+    join_path(dir, sizeof(dir), home, "notes");
+    mkdir_p(dir);
+    join_path(file, sizeof(file), dir, "file.txt");
+    join_path(dropped, sizeof(dropped), home, "dropped.txt");
+    write_file(file, "kept");
+    write_file(dropped, "dropped");
+    fresh_mkdtemp(network_source, sizeof(network_source), "plan_network");
+    join_path(file, sizeof(file), network_source, "home.nmconnection");
+    write_file(file, "[wifi]\n");
+    join_path(missing, sizeof(missing), home, "missing");
+    backup_test_set_network_config_source_dir("NetworkManager",
+                                              network_source);
+    backup_test_set_network_config_source_dir("netplan", missing);
+    backup_test_set_network_config_source_dir("systemd-networkd", missing);
+    backup_test_set_network_config_source_dir("wpa_supplicant", missing);
+    backup_test_set_network_config_source_dir("netctl", missing);
+    make_static_sibling_fixture();
+    fresh_mkdtemp(target, sizeof(target), "plan_target");
+
+    dry_run = 0;
+    backup_test_force_portable_representation(portable);
+    char *first_paths[] = { dir, dropped, NULL };
+    char *second_paths[] = { dir, NULL };
+    char output[16384], container[PATH_MAX];
+    int first_rc = run_backup_capturing_with_options(
+        target, BACKUP_EXPLICIT_PATHS, first_paths, 1, 1, output,
+        sizeof(output));
+    int found = find_container_dir(target, container, sizeof(container));
+    char payload[PATH_MAX], self[PATH_MAX], network[PATH_MAX];
+    join_path(payload, sizeof(payload), container, "data/dropped.txt");
+    join_path(self, sizeof(self), container, "migr");
+    join_path(network, sizeof(network), container, "network");
+
+    dry_run = 1;
+    int dry_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS,
+                                      second_paths, output, sizeof(output));
+    dry_run = 0;
+    check(first_rc == 0 && found && dry_rc == 0 &&
+              strstr(output, "Would update the backup ") != NULL &&
+              strstr(output, "would also remove what this run does not "
+                             "select:\n"
+                             "  ~/dropped.txt (7B)\n"
+                             "  the bundled migr (") != NULL &&
+              strstr(output, "  network configuration (") != NULL &&
+              strstr(output, "  To keep them, add --include-self "
+                             "--include-network-config.\n") != NULL &&
+              access(payload, F_OK) == 0,
+          "a dry run names the backup it updates and what it would remove");
+
+    int no_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS,
+                                     second_paths, output, sizeof(output));
+    check(no_rc == 0 &&
+              strstr(output, "Remove them and update the backup?") != NULL &&
+              strstr(output, "Backup cancelled; nothing was changed.") !=
+                  NULL &&
+              count_final_containers(target) == 1 &&
+              access(payload, F_OK) == 0 && access(self, F_OK) == 0 &&
+              dir_exists(network),
+          "with nobody to answer, the backup is left as it was");
+
+    int yes_rc = run_backup_capturing_input(target, BACKUP_EXPLICIT_PATHS,
+                                            second_paths, 0, 0, "y\n",
+                                            output, sizeof(output));
+    check(yes_rc == 0 && strstr(output, "Backup complete") != NULL &&
+              count_final_containers(target) == 1 &&
+              access(payload, F_OK) != 0 && access(self, F_OK) != 0 &&
+              !dir_exists(network),
+          "on yes, they are removed and the backup is updated");
+
+    int again_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS,
+                                        second_paths, output, sizeof(output));
+    check(again_rc == 0 && strstr(output, "would also remove") == NULL &&
+              strstr(output, "Backup complete") != NULL,
+          "an update that removes nothing asks nothing");
+
+    backup_test_force_portable_representation(0);
+    backup_test_set_network_config_source_dir("NetworkManager", NULL);
+    backup_test_set_network_config_source_dir("netplan", NULL);
+    backup_test_set_network_config_source_dir("systemd-networkd", NULL);
+    backup_test_set_network_config_source_dir("wpa_supplicant", NULL);
+    backup_test_set_network_config_source_dir("netctl", NULL);
+    if (unlink("tests/migr-static") != 0 && errno != ENOENT)
+    {
+        printf(RED "fixture: could not remove tests/migr-static" NC "\n");
+        exit(1);
+    }
+    remove_tree(network_source);
+    remove_tree(home);
+    remove_tree(target);
+}
+
+// A root narrowed to a folder inside it loses the rest of its payload, which
+// the update lists without that folder's size; a root widened to the folder
+// around it loses nothing, so the update asks nothing (D72).
+static void test_update_lists_a_narrowed_root(void)
+{
+    printf(BLUE "::" NC " production: an update lists a narrowed root and "
+           "not a widened one\n");
+
+    char home[PATH_MAX], target[PATH_MAX], projects[PATH_MAX];
+    char kept[PATH_MAX], other[PATH_MAX], file[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_home");
+    setenv("HOME", home, 1);
+    join_path(projects, sizeof(projects), home, "Projects");
+    join_path(kept, sizeof(kept), projects, "migr");
+    join_path(other, sizeof(other), projects, "other");
+    mkdir_p(kept);
+    mkdir_p(other);
+    join_path(file, sizeof(file), kept, "file.txt");
+    write_file(file, "kept, 16 bytes.\n");
+    join_path(file, sizeof(file), other, "file.txt");
+    write_file(file, "gone\n");
+    fresh_mkdtemp(target, sizeof(target), "plan_target");
+
+    dry_run = 0;
+    char *wide[] = { projects, NULL };
+    char *narrow[] = { kept, NULL };
+    char output[16384];
+    int first_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, wide,
+                                        output, sizeof(output));
+    int narrow_rc = run_backup_capturing_input(target, BACKUP_EXPLICIT_PATHS,
+                                               narrow, 0, 0, "y\n", output,
+                                               sizeof(output));
+    check(first_rc == 0 && narrow_rc == 0 &&
+              strstr(output, "  ~/Projects (5B), except ~/Projects/migr, "
+                             "copied again\n") != NULL &&
+              strstr(output, "Backup complete") != NULL,
+          "a narrowed root is listed with only what leaves the backup");
+
+    int widen_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, wide,
+                                        output, sizeof(output));
+    check(widen_rc == 0 && strstr(output, "would also remove") == NULL &&
+              strstr(output, "Backup complete") != NULL,
+          "a widened root is copied again without a question");
 
     remove_tree(home);
     remove_tree(target);
@@ -5547,6 +5702,9 @@ int main(void)
     test_sudo_backup_belongs_to_invoker();
     test_backup_updates_in_place(0);
     test_backup_updates_in_place(1);
+    test_update_asks_before_removing(0);
+    test_update_asks_before_removing(1);
+    test_update_lists_a_narrowed_root();
     test_update_takes_another_installs_backup_on_yes(0);
     test_update_takes_another_installs_backup_on_yes(1);
     test_portable_update_records_a_metadata_change();

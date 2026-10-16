@@ -4694,7 +4694,8 @@ the old naming are not migrated (pre-release).
 ## D72 — 2026-09-27 — A backup is updated in place
 
 **Status:** Implemented; extended by D88 (another install's backup, and
-portable metadata-only changes)
+portable metadata-only changes); an update asks before removing what it does
+not select (2026-10-16)
 
 **Decision:** A backup run takes over this install's existing backup under
 PATH instead of creating another one.
@@ -4742,6 +4743,24 @@ the mechanism (resume, reconcile, the journal) already existed.
 **Relationship:** Builds on D15's resume and D25's claims; uses D71's names.
 Explicit-path roots are numbered in sorted path order, so adding a path can
 renumber, and thus recopy, the others.
+
+**Revision (2026-10-16):** An update asks before it removes what the run does
+not select. Right after the D88 question, before anything is read,
+`print_update_removals()` compares the roots of the backup it would update
+with this run's, each as its user names it (`~/rest` inside the home it was
+taken under, D86, otherwise its absolute address). It lists every root that
+no selected root covers, the bundled migr without `--include-self`, network
+configuration without `--include-network-config`, and the package, VS Code
+extension, group, and Flatpak lists when explicit paths update a scoped
+backup, each with the size of its payload, then the options that would keep
+them. A root narrowed to folders inside it is listed with those folders
+named and their size left out; they are still removed and copied again. A
+root inside a selected one, and an explicit root only renumbered, are copied
+again and not listed. The question defaults to no; no, or end of input, ends
+the run with nothing changed. A dry run names the backup it would update and
+lists the same. Without the question, an update that left out an option the
+backup was taken with, or named a single path, removed the rest silently, and
+a backup taken before a reinstall could lack parts the user believed it held.
 
 ## D73 — 2026-09-27 — An updated journal is rewritten once dead records outweigh live ones
 

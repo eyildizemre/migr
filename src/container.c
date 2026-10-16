@@ -469,6 +469,8 @@ int container_survey_fd(int dest_root_fd, const char *owner,
         {
             out->own++;
             out->own_size = state == NAME_PARTIAL ? 0 : manifest.size;
+            // parse_owned_name() accepted it as shorter than the field.
+            memcpy(out->own_name, entry->d_name, strlen(entry->d_name) + 1U);
         }
         else if (state == NAME_FINISHED &&
                  same_format(&manifest, wanted_identity))
