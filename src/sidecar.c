@@ -1300,17 +1300,26 @@ static SidecarStatus parse_header(SidecarReader *reader)
     return SIDECAR_STATUS_OK;
 }
 
-static SidecarStatus parse_fd_internal(SidecarReader *reader,
+static SidecarStatus parse_fd_internal(SidecarReader *reader, uint64_t start,
                                        SidecarRecordCallback callback,
                                        void *context,
                                        SidecarParseResult *result)
 {
     SidecarStatus status = parse_header(reader);
+    if (status == SIDECAR_STATUS_OK && start != 0 && start < reader->consumed)
+        status = SIDECAR_STATUS_INVALID_ARGUMENT;
     if (status != SIDECAR_STATUS_OK)
     {
         result->bytes_read = reader->consumed;
         result->allocation_peak = reader->allocations.peak;
         return status;
+    }
+    if (start > reader->consumed)
+    {
+        reader->file_position = start;
+        reader->consumed = start;
+        reader->buffer_position = 0;
+        reader->buffer_length = 0;
     }
     result->last_valid_boundary = reader->consumed;
 
@@ -1474,6 +1483,13 @@ static SidecarStatus parse_fd_internal(SidecarReader *reader,
 SidecarStatus sidecar_parse_fd(int fd, SidecarRecordCallback callback,
                                void *context, SidecarParseResult *result)
 {
+    return sidecar_parse_fd_from(fd, 0, callback, context, result);
+}
+
+SidecarStatus sidecar_parse_fd_from(int fd, uint64_t start,
+                                    SidecarRecordCallback callback,
+                                    void *context, SidecarParseResult *result)
+{
     if (fd < 0 || result == NULL)
         return SIDECAR_STATUS_INVALID_ARGUMENT;
     memset(result, 0, sizeof(*result));
@@ -1490,7 +1506,8 @@ SidecarStatus sidecar_parse_fd(int fd, SidecarRecordCallback callback,
         .fd = fd,
         .limit = (uint64_t)st.st_size
     };
-    SidecarStatus status = parse_fd_internal(&reader, callback, context, result);
+    SidecarStatus status = parse_fd_internal(&reader, start, callback, context,
+                                             result);
     if (reader.allocations.current != 0)
     {
         result->allocation_peak = reader.allocations.peak;

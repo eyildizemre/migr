@@ -974,6 +974,34 @@ static void test_tail_and_boundary(int fd)
     raw_free(&buffer);
 }
 
+static void test_parse_from_offset(int fd)
+{
+    printf(BLUE "::" NC " sidecar parse from an offset\n");
+    RawBuffer buffer = {0};
+    static const unsigned char junk[] = "#junk#";
+    check(append_header(&buffer, "5") == 0 &&
+              raw_append(&buffer, junk, sizeof(junk) - 1U) == 0,
+          "header and a damaged region are built");
+    uint64_t start = buffer.length;
+    check(append_claim(&buffer, "ROOT", "dir/file", "file", "regular") == 0 &&
+              set_raw_file(fd, &buffer) == 0,
+          "a CLAIM after the damage is written");
+
+    SidecarParseResult result;
+    check(sidecar_parse_fd(fd, NULL, NULL, &result) == SIDECAR_STATUS_CORRUPT,
+          "reading from the header meets the damage");
+    SidecarStatus status = sidecar_parse_fd_from(fd, start, NULL, NULL,
+                                                 &result);
+    check(status == SIDECAR_STATUS_OK && result.records_read == 1 &&
+              result.last_valid_boundary == buffer.length &&
+              result.bytes_read == buffer.length,
+          "records resume at the offset and boundaries count from the file");
+    check(sidecar_parse_fd_from(fd, 3, NULL, NULL, &result) ==
+              SIDECAR_STATUS_INVALID_ARGUMENT,
+          "an offset inside the header is refused");
+    raw_free(&buffer);
+}
+
 static void test_corruption_and_versions(int fd)
 {
     printf(BLUE "::" NC " sidecar corruption classification\n");
@@ -1259,6 +1287,7 @@ int main(void)
     test_collision_suffix(fd);
     test_symlink_and_hardlink_writer(fd);
     test_tail_and_boundary(fd);
+    test_parse_from_offset(fd);
     test_corruption_and_versions(fd);
     test_symlink_kind_parsing(fd);
     test_reader_path_ceiling(fd);

@@ -270,22 +270,22 @@ static size_t next_record_start(const unsigned char *data, size_t length,
                                 size_t from)
 {
     static const char *const tags[] = { "CLAIM", "ENTRY", "DELETE" };
-    size_t best = SIZE_MAX;
-    for (size_t index = 0; index < sizeof(tags) / sizeof(tags[0]); index++)
+    const unsigned char *end = data + length;
+    const unsigned char *nul = from < length
+                                   ? memchr(data + from, '\0', length - from)
+                                   : NULL;
+    for (; nul != NULL; nul = memchr(nul + 1, '\0', (size_t)(end - nul - 1)))
     {
-        char needle[16];
-        size_t tag_length = strlen(tags[index]);
-        needle[0] = '\0';
-        memcpy(needle + 1, tags[index], tag_length);
-        needle[tag_length + 1U] = '\0';
-        if (from >= length)
-            break;
-        const unsigned char *found = memmem(data + from, length - from,
-                                            needle, tag_length + 2U);
-        if (found != NULL && (size_t)(found - data) + 1U < best)
-            best = (size_t)(found - data) + 1U;
+        size_t start = (size_t)(nul - data) + 1U;
+        for (size_t index = 0; index < sizeof(tags) / sizeof(tags[0]); index++)
+        {
+            size_t tag_length = strlen(tags[index]) + 1U;
+            if (length - start >= tag_length &&
+                memcmp(data + start, tags[index], tag_length) == 0)
+                return start;
+        }
     }
-    return best;
+    return SIZE_MAX;
 }
 
 static void salvage_note_damage(RepairSalvage *salvage, uint64_t start,
@@ -298,7 +298,7 @@ static void salvage_note_damage(RepairSalvage *salvage, uint64_t start,
 }
 
 // Replays the journal into salvage->log, skipping each damaged region up to
-// the next record start. Each segment is parsed behind a copy of the header.
+// the next record start. Each segment is parsed in place, after the header.
 static int salvage_journal(RepairSalvage *salvage, const unsigned char *data,
                            size_t length)
 {
@@ -322,22 +322,22 @@ static int salvage_journal(RepairSalvage *salvage, const unsigned char *data,
                     strerror(errno));
         return -1;
     }
+    if (write_all(scratch, data, length) != 0)
+    {
+        print_error("Error: Could not write a scratch file: %s\n",
+                    strerror(errno));
+        close(scratch);
+        return -1;
+    }
     int result = -1;
     size_t start = header_length;
     for (;;)
     {
         pending_clear(salvage);
-        if (ftruncate(scratch, 0) != 0 || lseek(scratch, 0, SEEK_SET) != 0 ||
-            write_all(scratch, data, header_length) != 0 ||
-            write_all(scratch, data + start, length - start) != 0)
-        {
-            print_error("Error: Could not write a scratch file: %s\n",
-                        strerror(errno));
-            break;
-        }
         SidecarParseResult parsed;
-        SidecarStatus status = sidecar_parse_fd(scratch, salvage_record,
-                                                salvage, &parsed);
+        SidecarStatus status = sidecar_parse_fd_from(scratch, start,
+                                                     salvage_record, salvage,
+                                                     &parsed);
         pending_clear(salvage);
         if (salvage->fatal != SIDECAR_STATUS_OK ||
             status == SIDECAR_STATUS_CALLBACK ||
@@ -367,10 +367,7 @@ static int salvage_journal(RepairSalvage *salvage, const unsigned char *data,
                             "cannot be repaired.\n");
             break;
         }
-        uint64_t boundary = parsed.last_valid_boundary >= header_length
-                                ? start + (parsed.last_valid_boundary -
-                                           header_length)
-                                : start;
+        uint64_t boundary = parsed.last_valid_boundary;
         if (status == SIDECAR_STATUS_OK)
         {
             result = 0;
