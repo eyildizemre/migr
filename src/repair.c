@@ -352,6 +352,21 @@ static int salvage_journal(RepairSalvage *salvage, const unsigned char *data,
                             : strerror(errno != 0 ? errno : EIO));
             break;
         }
+        // The header is the same in every segment, so it fails on the first.
+        // A version this build does not write is never reinterpreted.
+        if (parsed.last_valid_boundary == 0)
+        {
+            const char *field = (const char *)data + strlen(SIDECAR_MAGIC) + 1U;
+            if (status == SIDECAR_STATUS_UNKNOWN_VERSION)
+                print_error("Error: the backup journal's header names version "
+                            "%s, but its manifest and this build use version "
+                            "%d; it cannot be repaired.\n", field,
+                            SIDECAR_VERSION);
+            else
+                print_error("Error: the backup journal's header is damaged; it "
+                            "cannot be repaired.\n");
+            break;
+        }
         uint64_t boundary = parsed.last_valid_boundary >= header_length
                                 ? start + (parsed.last_valid_boundary -
                                            header_length)

@@ -251,6 +251,18 @@ static void damage_record(Fixture *fixture, const char *type,
     free(data);
 }
 
+static int visible_entries(const char *directory)
+{
+    DIR *dir = opendir(directory);
+    int entries = 0;
+    struct dirent *item;
+    while (dir != NULL && (item = readdir(dir)) != NULL)
+        entries += item->d_name[0] != '.';
+    if (dir != NULL)
+        closedir(dir);
+    return entries;
+}
+
 static int find_final_container(const char *directory, char *out, size_t size)
 {
     DIR *dir = opendir(directory);
@@ -530,16 +542,46 @@ static void test_refusals(void)
     free(data);
     rc = run_captured(call_repair, fixture.container, fixture.output, output,
                       sizeof(output));
-    DIR *dir = opendir(fixture.output);
-    int entries = 0;
-    struct dirent *item;
-    while (dir != NULL && (item = readdir(dir)) != NULL)
-        entries += item->d_name[0] != '.';
-    if (dir != NULL)
-        closedir(dir);
     check(rc == 1 && strstr(output, "header is damaged") != NULL &&
-              entries == 0,
+              visible_entries(fixture.output) == 0,
           "a damaged header is refused and leaves nothing behind");
+    remove_tree(fixture.base);
+}
+
+// Sets the header's version field, whose one byte follows the magic and its
+// NUL, and runs repair on the journal.
+static int repair_with_version(Fixture *fixture, char version, char *output,
+                               size_t size)
+{
+    size_t length = 0;
+    unsigned char *data = read_all(fixture->journal, &length);
+    size_t field = strlen(SIDECAR_MAGIC) + 1U;
+    if (length < field + 2U || data[field + 1U] != '\0')
+        fatal("the journal header has an unexpected layout");
+    data[field] = (unsigned char)version;
+    write_all_to(fixture->journal, data, length);
+    free(data);
+    return run_captured(call_repair, fixture->container, fixture->output,
+                        output, size);
+}
+
+static void test_other_version(void)
+{
+    printf(BLUE "::" NC " repair: a header of another version\n");
+    Fixture fixture;
+    fixture_create(&fixture);
+    char output[8192];
+    int rc = repair_with_version(&fixture, '7', output, sizeof(output));
+    char expected[128];
+    snprintf(expected, sizeof(expected), "header names version 7, but its "
+             "manifest and this build use version %d", SIDECAR_VERSION);
+    check(rc == 1 && strstr(output, expected) != NULL &&
+              visible_entries(fixture.output) == 0,
+          "an intact journal of another version is refused, nothing published");
+    rc = repair_with_version(&fixture, 'x', output, sizeof(output));
+    check(rc == 1 && strstr(output, "header is damaged") != NULL &&
+              visible_entries(fixture.output) == 0,
+          "a version field that is not a number is refused as damage");
     remove_tree(fixture.base);
 }
 
@@ -556,6 +598,7 @@ int main(void)
     test_damaged_directory_claim();
     test_truncated_journal();
     test_refusals();
+    test_other_version();
     if (failures != 0)
     {
         printf(RED "%d repair test failure%s" NC "\n", failures,
