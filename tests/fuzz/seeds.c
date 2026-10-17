@@ -1,0 +1,432 @@
+// Generated seeds for the journal fuzzers: small journals written with the
+// real writer and portable name map, and the edge cases as edits of them, so
+// they follow the format when its version changes. Each seed states the
+// outcome every harness must report. The names are made up: a journal from a
+// real backup holds a home's real file names and never becomes a seed.
+
+#define _GNU_SOURCE
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include "fuzz.h"
+#include "portable_name.h"
+#include "sidecar.h"
+
+#define MAX_SEEDS 32U
+
+typedef struct {
+    FuzzSeed *seed;
+    int fd;
+} Builder;
+
+typedef struct {
+    const char *root;
+    const char *path;
+    SidecarObjectKind kind;
+    uint64_t collision;
+    // The symlink target, or the hardlink's logical path in link_root.
+    const char *target;
+    const char *link_root;
+    int xattrs;
+    int unclaimed;
+    int uncommitted;
+} Item;
+
+// One value holds a NUL and one is empty: the edges of the one
+// length-prefixed field.
+static const SidecarXattr standard_xattrs[] = {
+    { { (const unsigned char *)"user.a", 6 },
+      { (const unsigned char *)"v\0w", 3 } },
+    { { (const unsigned char *)"user.empty", 10 }, { NULL, 0 } }
+};
+
+static void die(const char *what)
+{
+    fprintf(stderr, "fuzz seeds: %s\n", what);
+    abort();
+}
+
+static SidecarBytes text(const char *value)
+{
+    return (SidecarBytes){ (const unsigned char *)value, strlen(value) };
+}
+
+static void begin(Builder *builder, FuzzSeed *seed, const char *name,
+                  const char *parse_outcome)
+{
+    memset(seed, 0, sizeof(*seed));
+    seed->name = name;
+    seed->parse_outcome = parse_outcome;
+    seed->writer_output = 1;
+    builder->seed = seed;
+    builder->fd = memfd_create("fuzz-seed", MFD_CLOEXEC);
+    if (builder->fd < 0 || sidecar_write_header(builder->fd) != 0)
+        die("cannot write a header");
+}
+
+static void mark_boundary(Builder *builder)
+{
+    FuzzSeed *seed = builder->seed;
+    struct stat st;
+    if (fstat(builder->fd, &st) != 0 ||
+        seed->boundary_count == FUZZ_MAX_BOUNDARIES)
+        die("cannot record a boundary");
+    seed->boundaries[seed->boundary_count++] = (size_t)st.st_size;
+}
+
+static void fill_entry(const Item *item, PortablePhysicalName *name,
+                       SidecarEntry *entry)
+{
+    const char *root = item->root != NULL ? item->root : "ROOT";
+    const char *slash = strrchr(item->path, '/');
+    const char *component = slash != NULL ? slash + 1 : item->path;
+    memset(name, 0, sizeof(*name));
+    if (item->path[0] != '\0' &&
+        portable_physical_name_map(component, item->collision, name) != 0)
+        die("cannot map a name");
+
+    memset(entry, 0, sizeof(*entry));
+    entry->root_id = text(root);
+    entry->logical_path = text(item->path);
+    entry->physical_leaf = text(name->physical_leaf);
+    entry->collision_suffix = text(name->collision_suffix);
+    entry->kind = item->kind;
+    entry->mode = item->kind == SIDECAR_KIND_DIRECTORY ? 0755 : 0644;
+    entry->uid = 1000;
+    entry->gid = 1000;
+    entry->atime_sec = 1700000000;
+    entry->atime_nsec = 5;
+    entry->mtime_sec = -1;
+    entry->mtime_nsec = 999999999;
+    if (item->kind == SIDECAR_KIND_REGULAR)
+    {
+        entry->size = 12;
+        entry->content_digest = 0x1234;
+    }
+    else if (item->kind == SIDECAR_KIND_SYMLINK)
+        entry->symlink_target = text(item->target);
+    else if (item->kind == SIDECAR_KIND_HARDLINK)
+    {
+        entry->hardlink_root_id =
+            text(item->link_root != NULL ? item->link_root : root);
+        entry->hardlink_logical_path = text(item->target);
+    }
+    if (item->xattrs)
+        entry->xattr_count = 2;
+}
+
+static void add(Builder *builder, Item item)
+{
+    PortablePhysicalName name;
+    SidecarEntry entry;
+    fill_entry(&item, &name, &entry);
+    if (!item.unclaimed)
+    {
+        SidecarClaim claim = { entry.root_id, entry.logical_path,
+                               entry.physical_leaf, entry.kind };
+        if (sidecar_write_claim(builder->fd, &claim) != 0)
+            die("cannot write a claim");
+        mark_boundary(builder);
+    }
+    if (item.uncommitted)
+    {
+        if (sidecar_write_entry(builder->fd, &entry) != 0)
+            die("cannot write an entry");
+        return;
+    }
+    if (sidecar_write_entry_group(builder->fd, &entry,
+                                  item.xattrs ? standard_xattrs : NULL) != 0)
+        die("cannot write an entry group");
+    mark_boundary(builder);
+}
+
+static void delete_item(Builder *builder, const char *path)
+{
+    SidecarDelete deletion = { text("ROOT"), text(path) };
+    if (sidecar_write_delete(builder->fd, &deletion) != 0)
+        die("cannot write a delete");
+    mark_boundary(builder);
+}
+
+static void claim_only(Builder *builder, const char *path)
+{
+    SidecarClaim claim = { text("ROOT"), text(path), text(path),
+                           SIDECAR_KIND_REGULAR };
+    if (sidecar_write_claim(builder->fd, &claim) != 0)
+        die("cannot write a claim");
+    mark_boundary(builder);
+}
+
+static void finish(Builder *builder)
+{
+    FuzzSeed *seed = builder->seed;
+    struct stat st;
+    if (fstat(builder->fd, &st) != 0)
+        die("cannot size a seed");
+    seed->size = (size_t)st.st_size;
+    seed->data = malloc(seed->size);
+    if (seed->data == NULL ||
+        pread(builder->fd, seed->data, seed->size, 0) != (ssize_t)seed->size)
+        die("cannot read a seed back");
+    close(builder->fd);
+}
+
+static void copy_seed(FuzzSeed *copy, const FuzzSeed *original,
+                      const char *name, const char *parse_outcome)
+{
+    memset(copy, 0, sizeof(*copy));
+    copy->name = name;
+    copy->parse_outcome = parse_outcome;
+    copy->size = original->size;
+    copy->data = malloc(original->size);
+    if (copy->data == NULL)
+        die("cannot copy a seed");
+    memcpy(copy->data, original->data, original->size);
+}
+
+static void cut(FuzzSeed *seed, size_t size)
+{
+    if (size > seed->size)
+        die("a cut past a seed's end");
+    seed->size = size;
+}
+
+// Replaces the first occurrence of old with replacement. The result is no
+// longer writer output.
+static void replace(FuzzSeed *seed, const void *old, size_t old_length,
+                    const void *replacement, size_t replacement_length)
+{
+    unsigned char *at = memmem(seed->data, seed->size, old, old_length);
+    if (at == NULL)
+        die("an edit finds nothing to replace");
+    size_t offset = (size_t)(at - seed->data);
+    size_t tail = seed->size - offset - old_length;
+    size_t size = seed->size - old_length + replacement_length;
+    unsigned char *data = malloc(size);
+    if (data == NULL)
+        die("cannot edit a seed");
+    memcpy(data, seed->data, offset);
+    memcpy(data + offset, replacement, replacement_length);
+    memcpy(data + offset + replacement_length, at + old_length, tail);
+    free(seed->data);
+    seed->data = data;
+    seed->size = size;
+    seed->writer_output = 0;
+    seed->boundary_count = 0;
+}
+
+// The header's version field, NUL-delimited on both sides, as written now
+// and replaced by version.
+static void replace_version(FuzzSeed *seed, const char *version)
+{
+    char current[32];
+    char edited[32];
+    int current_length = snprintf(current, sizeof(current), "%c%d%c", 0,
+                                  SIDECAR_VERSION, 0);
+    int edited_length = snprintf(edited, sizeof(edited), "%c%s%c", 0,
+                                 version, 0);
+    if (current_length <= 0 || edited_length <= 0 ||
+        (size_t)edited_length >= sizeof(edited))
+        die("cannot format a version");
+    replace(seed, current, (size_t)current_length, edited,
+            (size_t)edited_length);
+}
+
+static FuzzSeed *slot(FuzzSeed *seeds, size_t *count)
+{
+    if (*count == MAX_SEEDS)
+        die("more seeds than MAX_SEEDS");
+    return &seeds[(*count)++];
+}
+
+static void build_valid(FuzzSeed *seeds, size_t *count)
+{
+    Builder builder;
+
+    begin(&builder, slot(seeds, count), "basic", "ok");
+    add(&builder, (Item){ .path = "", .kind = SIDECAR_KIND_DIRECTORY });
+    add(&builder, (Item){ .path = "docs", .kind = SIDECAR_KIND_DIRECTORY,
+                          .xattrs = 1 });
+    add(&builder, (Item){ .path = "docs/notes.txt",
+                          .kind = SIDECAR_KIND_REGULAR, .xattrs = 1 });
+    add(&builder, (Item){ .path = "todo.txt", .kind = SIDECAR_KIND_REGULAR });
+    finish(&builder);
+
+    begin(&builder, slot(seeds, count), "kinds", "ok");
+    add(&builder, (Item){ .path = "", .kind = SIDECAR_KIND_DIRECTORY });
+    add(&builder, (Item){ .path = "file", .kind = SIDECAR_KIND_REGULAR,
+                          .xattrs = 1 });
+    add(&builder, (Item){ .path = "link", .kind = SIDECAR_KIND_SYMLINK,
+                          .target = "file" });
+    add(&builder, (Item){ .path = "hard", .kind = SIDECAR_KIND_HARDLINK,
+                          .target = "file" });
+    add(&builder, (Item){ .path = "Dup", .kind = SIDECAR_KIND_DIRECTORY });
+    add(&builder, (Item){ .path = "dup", .kind = SIDECAR_KIND_DIRECTORY,
+                          .collision = 1 });
+    add(&builder, (Item){ .path = "a:b?c.", .kind = SIDECAR_KIND_REGULAR });
+    add(&builder, (Item){ .path = "gone.txt", .kind = SIDECAR_KIND_REGULAR });
+    delete_item(&builder, "gone.txt");
+    add(&builder, (Item){ .root = "XDG_DOCUMENTS_DIR", .path = "",
+                          .kind = SIDECAR_KIND_DIRECTORY });
+    add(&builder, (Item){ .root = "XDG_DOCUMENTS_DIR", .path = "report.txt",
+                          .kind = SIDECAR_KIND_REGULAR });
+    finish(&builder);
+
+    begin(&builder, slot(seeds, count), "header-only", "ok");
+    finish(&builder);
+
+    // A capture killed after claiming its next item.
+    begin(&builder, slot(seeds, count), "pending-claim", "ok");
+    add(&builder, (Item){ .path = "", .kind = SIDECAR_KIND_DIRECTORY });
+    add(&builder, (Item){ .path = "done.txt", .kind = SIDECAR_KIND_REGULAR });
+    claim_only(&builder, "later.txt");
+    finish(&builder);
+
+    begin(&builder, slot(seeds, count), "entry-without-commit", "truncated");
+    add(&builder, (Item){ .path = "", .kind = SIDECAR_KIND_DIRECTORY });
+    add(&builder, (Item){ .path = "file", .kind = SIDECAR_KIND_REGULAR,
+                          .uncommitted = 1 });
+    finish(&builder);
+
+    // FIFO is a writer and parser kind, but claims exclude it.
+    begin(&builder, slot(seeds, count), "fifo", "ok");
+    add(&builder, (Item){ .path = "", .kind = SIDECAR_KIND_DIRECTORY });
+    add(&builder, (Item){ .path = "pipe", .kind = SIDECAR_KIND_FIFO,
+                          .unclaimed = 1 });
+    finish(&builder);
+
+    // The parser stores logical paths as they are; the layers above it
+    // refuse these.
+    begin(&builder, slot(seeds, count), "orphan", "ok");
+    add(&builder, (Item){ .path = "", .kind = SIDECAR_KIND_DIRECTORY });
+    add(&builder, (Item){ .path = "missing/file",
+                          .kind = SIDECAR_KIND_REGULAR });
+    finish(&builder);
+
+    begin(&builder, slot(seeds, count), "dotdot-path", "ok");
+    add(&builder, (Item){ .path = "", .kind = SIDECAR_KIND_DIRECTORY });
+    add(&builder, (Item){ .path = "../escape", .kind = SIDECAR_KIND_REGULAR });
+    finish(&builder);
+
+    begin(&builder, slot(seeds, count), "absolute-path", "ok");
+    add(&builder, (Item){ .path = "", .kind = SIDECAR_KIND_DIRECTORY });
+    add(&builder, (Item){ .path = "/etc/passwd",
+                          .kind = SIDECAR_KIND_REGULAR });
+    finish(&builder);
+
+    begin(&builder, slot(seeds, count), "delete-unknown", "ok");
+    add(&builder, (Item){ .path = "", .kind = SIDECAR_KIND_DIRECTORY });
+    delete_item(&builder, "never.txt");
+    finish(&builder);
+
+    begin(&builder, slot(seeds, count), "hardlink-missing-root", "ok");
+    add(&builder, (Item){ .path = "", .kind = SIDECAR_KIND_DIRECTORY });
+    add(&builder, (Item){ .path = "hard", .kind = SIDECAR_KIND_HARDLINK,
+                          .target = "file", .link_root = "NOPE" });
+    finish(&builder);
+}
+
+static void build_edited(FuzzSeed *seeds, size_t *count)
+{
+    const FuzzSeed *basic = &seeds[0];
+    const FuzzSeed *header_only = &seeds[2];
+    Builder builder;
+    FuzzSeed *seed;
+    char version[32];
+
+    seed = slot(seeds, count);
+    copy_seed(seed, header_only, "empty", "corrupt");
+    cut(seed, 0);
+
+    seed = slot(seeds, count);
+    copy_seed(seed, header_only, "magic-only", "corrupt");
+    cut(seed, strlen(SIDECAR_MAGIC) + 1U);
+
+    seed = slot(seeds, count);
+    copy_seed(seed, header_only, "next-version", "unknown-version");
+    snprintf(version, sizeof(version), "%d", SIDECAR_VERSION + 1);
+    replace_version(seed, version);
+
+    seed = slot(seeds, count);
+    copy_seed(seed, header_only, "version-too-long", "limit");
+    replace_version(seed, "12345678901234567");
+
+    seed = slot(seeds, count);
+    copy_seed(seed, header_only, "version-not-a-number", "corrupt");
+    replace_version(seed, "x5");
+
+    seed = slot(seeds, count);
+    copy_seed(seed, basic, "cut-inside-xattr", "truncated");
+    const unsigned char *xattr = memmem(basic->data, basic->size, "user.a", 6);
+    if (xattr == NULL)
+        die("the basic seed holds no xattr");
+    cut(seed, (size_t)(xattr - basic->data) + 3U);
+
+    seed = slot(seeds, count);
+    begin(&builder, seed, "unknown-kind", "corrupt");
+    add(&builder, (Item){ .path = "file", .kind = SIDECAR_KIND_REGULAR,
+                          .unclaimed = 1 });
+    finish(&builder);
+    replace(seed, "\0regular\0", 9, "\0socket\0", 8);
+
+    // An xattr_count one past SIDECAR_MAX_XATTRS_PER_ENTRY; 255 is a number
+    // no other field of this entry holds.
+    seed = slot(seeds, count);
+    begin(&builder, seed, "xattr-count-over-limit", "corrupt");
+    Item item = { .path = "file", .kind = SIDECAR_KIND_REGULAR,
+                  .unclaimed = 1 };
+    PortablePhysicalName name;
+    SidecarEntry entry;
+    fill_entry(&item, &name, &entry);
+    entry.xattr_count = 255;
+    if (sidecar_write_entry(builder.fd, &entry) != 0)
+        die("cannot write an entry");
+    finish(&builder);
+    replace(seed, "\000255\000", 5, "\000257\000", 5);
+
+    // A value one byte past SIDECAR_MAX_XATTR_VALUE, with the byte present.
+    seed = slot(seeds, count);
+    begin(&builder, seed, "xattr-value-over-limit", "corrupt");
+    static unsigned char value[SIDECAR_MAX_XATTR_VALUE + 1U];
+    memset(value, 'v', sizeof(value));
+    SidecarXattr big = { text("user.big"),
+                         { value, SIDECAR_MAX_XATTR_VALUE } };
+    item.xattrs = 0;
+    fill_entry(&item, &name, &entry);
+    entry.xattr_count = 1;
+    if (sidecar_write_entry_group(builder.fd, &entry, &big) != 0)
+        die("cannot write an entry group");
+    finish(&builder);
+    char length[32];
+    char longer[32];
+    int length_size = snprintf(length, sizeof(length), "%c%u%c", 0,
+                               SIDECAR_MAX_XATTR_VALUE, 0);
+    int longer_size = snprintf(longer, sizeof(longer), "%c%u%c", 0,
+                               SIDECAR_MAX_XATTR_VALUE + 1U, 0);
+    replace(seed, length, (size_t)length_size, longer,
+            (size_t)longer_size);
+    replace(seed, value, SIDECAR_MAX_XATTR_VALUE, value,
+            sizeof(value));
+}
+
+void fuzz_seeds_build(FuzzSeed **seeds, size_t *count)
+{
+    *seeds = calloc(MAX_SEEDS, sizeof(**seeds));
+    if (*seeds == NULL)
+        die("cannot allocate the seeds");
+    *count = 0;
+    build_valid(*seeds, count);
+    build_edited(*seeds, count);
+}
+
+void fuzz_seeds_free(FuzzSeed *seeds, size_t count)
+{
+    for (size_t index = 0; index < count; index++)
+        free(seeds[index].data);
+    free(seeds);
+}

@@ -6,4 +6,6 @@ tests/test_*
 !tests/test_*.c
 !tests/test_*.sh
 tests/migr-unprivileged
+tests/fuzz/replay_*
+!tests/fuzz/replay_*.c
 docs/scratch/
