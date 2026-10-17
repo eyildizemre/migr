@@ -3,9 +3,11 @@ name: CI
 # Every run takes the suite as root, the suite on other distributions, and
 # every gate of `make check` in a clean Fedora: a fresh machine finds what
 # the developer's own one hides. Pushes that change nothing the build or the
-# tests read (the same files the pre-commit hook looks at) are skipped.
+# tests read (the same files the pre-commit hook looks at) are skipped, and so
+# are tag pushes: a tag names a commit that already ran here from main.
 on:
   push:
+    branches: ['**']
     paths:
       - '**.c'
       - '**.h'
