@@ -129,6 +129,18 @@ int legacy_manifest_read(const char *backup_dir, char **out, int n)
 static const char MANIFEST_MAGIC[] = "MIGR_MANIFEST";
 
 static int root_ptr_id_cmp(const void *pa, const void *pb);
+static int canonical_path(const char *path, int absolute, int empty_ok);
+
+// A root's payload is opened, and on an update removed, under data/, and its
+// restore address under the target home, so both must stay inside them: a
+// relative path with no empty, "." or ".." component. Every VERSION checks
+// this, not only the selection manifest.
+static int root_addresses_valid(const ManifestRoot *root)
+{
+    return canonical_path(root->payload_path, 0, 0) &&
+           (!root->has_restore_path ||
+            canonical_path(root->restore_path, 0, 1));
+}
 
 static int is_id_safe_char(unsigned char c)
 {
@@ -433,7 +445,7 @@ static int parse_root_line(char *line, ManifestRoot *root)
     if (root->policy != ROOT_POLICY_HOME_RELATIVE && seen_restore)
         return -1;
 
-    return 0;
+    return root_addresses_valid(root) ? 0 : -1;
 }
 
 // Scans line1 (already read) and the remaining lines of f for at least one
@@ -950,6 +962,8 @@ static int manifest_model_is_invalid(const Manifest *m)
             {
                 return 1;
             }
+            if (!root_addresses_valid(r))
+                return 1;
             // manifest_read_v1() refuses any two roots sharing an id; the
             // writer must refuse the same thing, or it can truncate an
             // existing valid manifest.txt with content the reader rejects.

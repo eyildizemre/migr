@@ -734,6 +734,85 @@ static void test_malformed_variants(void)
 // runs after read_line() has already handed back a line). This exercises
 // read_line()'s own fgets()-level handling: strlen() stops at the embedded
 // NUL, and the fix must not let what's hidden past it be silently dropped.
+// An update removes a dropped root's payload under data/ as root, so a
+// payload or restore address that climbs out must never read as valid, in
+// VERSION=1 as in VERSION=2.
+static void test_root_addresses_stay_inside(void)
+{
+    printf(BLUE "::" NC " versioned manifest: payload and restore addresses stay inside data/ and the home\n");
+
+    static const char *const bad_payloads[] = {
+        "..%2F..%2Fvictim", "..", ".", "%2Fetc", "a%2F..%2F..%2Fb",
+        "a%2F%2Fb", "a%2F", "", "a%2F.%2Fb"
+    };
+    for (size_t i = 0; i < sizeof(bad_payloads) / sizeof(*bad_payloads); i++)
+    {
+        char line[256], label[256];
+        snprintf(line, sizeof(line),
+                 "ROOT ID=EXPLICIT_0 POLICY=MANUAL_NATIVE PAYLOAD=%s SOURCE=%%2Fsrv\n",
+                 bad_payloads[i]);
+        snprintf(label, sizeof(label), "payload address \"%s\" is refused",
+                 bad_payloads[i]);
+        check_malformed(line, label);
+    }
+
+    static const char *const bad_restores[] = {
+        "..", "..%2Fescaped", "%2Fhome%2Fother", "a%2F..%2F..", "a%2F"
+    };
+    for (size_t i = 0; i < sizeof(bad_restores) / sizeof(*bad_restores); i++)
+    {
+        char line[256], label[256];
+        snprintf(line, sizeof(line),
+                 "ROOT ID=EXPLICIT_0 POLICY=HOME_RELATIVE PAYLOAD=a SOURCE=a RESTORE=%s\n",
+                 bad_restores[i]);
+        snprintf(label, sizeof(label), "restore address \"%s\" is refused",
+                 bad_restores[i]);
+        check_malformed(line, label);
+    }
+
+    // What every released migr writes: a payload of one or two components
+    // and a restore address that is empty for the home itself.
+    char path[512];
+    snprintf(path, sizeof(path), "%s/manifest.txt", test_dir);
+    write_raw(path,
+        "MIGR_MANIFEST\n"
+        "VERSION=1\n"
+        "REPRESENTATION=native\n"
+        "SCOPE=explicit\n"
+        "SIDECAR_VERSION=0\n"
+        "ROOT_COUNT=3\n"
+        "ROOT ID=EXPLICIT_0 POLICY=HOME_RELATIVE PAYLOAD=migr SOURCE= RESTORE=\n"
+        "ROOT ID=EXPLICIT_1 POLICY=HOME_RELATIVE PAYLOAD=settings%2Fconfig-code-2 SOURCE=.config%2FCode RESTORE=.config%2FCode\n"
+        "ROOT ID=EXPLICIT_2 POLICY=MANUAL_NATIVE PAYLOAD=EXPLICIT_2 SOURCE=%2F\n");
+    Manifest m;
+    check(manifest_read_v1(test_dir, &m) == MANIFEST_STATUS_VALID,
+          "the addresses released versions write still read");
+    manifest_free(&m);
+    remove_manifest(test_dir);
+
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "EXPLICIT_0");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "../victim");
+    strcpy(root.source_path, "a");
+    strcpy(root.restore_path, "a");
+    root.has_restore_path = 1;
+    memset(&m, 0, sizeof(m));
+    m.version = MANIFEST_CURRENT_VERSION;
+    m.representation = CLONE_NATIVE_TREE;
+    m.scope = MANIFEST_SCOPE_EXPLICIT;
+    m.root_count = 1;
+    m.roots = &root;
+    check(manifest_write_v1(test_dir, &m) != 0,
+          "the writer refuses a payload address the reader would refuse");
+    strcpy(root.payload_path, "a");
+    strcpy(root.restore_path, "../escaped");
+    check(manifest_write_v1(test_dir, &m) != 0,
+          "the writer refuses a restore address the reader would refuse");
+    remove_manifest(test_dir);
+}
+
 static void test_embedded_nul_in_line_is_refused(void)
 {
     printf(BLUE "::" NC " versioned manifest: a raw embedded NUL byte in a line is refused, not silently truncated\n");
@@ -1197,6 +1276,7 @@ int main(void)
     test_legacy_read_strdup_failure();
     test_unknown_version();
     test_malformed_variants();
+    test_root_addresses_stay_inside();
     test_embedded_nul_in_line_is_refused();
     test_decode_overflow_is_refused();
     test_io_error();

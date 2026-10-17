@@ -4241,6 +4241,67 @@ static void test_update_reuses_a_dropped_root_id(int portable)
     remove_tree(target);
 }
 
+// An update removes the payload of every root the selection no longer has.
+// A manifest whose dropped root points out of data/ must not make it remove
+// anything there: the drive may have been changed by anyone.
+static void test_update_never_removes_outside_data(int portable)
+{
+    printf(BLUE "::" NC " production: a %s update never removes a dropped root's payload outside data/\n",
+           portable ? "portable" : "native");
+
+    char home[PATH_MAX], target[PATH_MAX], kept[PATH_MAX], file[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_home");
+    setenv("HOME", home, 1);
+    join_path(kept, sizeof(kept), home, "kept");
+    mkdir_p(kept);
+    join_path(file, sizeof(file), kept, "file.txt");
+    write_file(file, "kept");
+    fresh_mkdtemp(target, sizeof(target), "plan_target");
+
+    dry_run = 0;
+    backup_test_force_portable_representation(portable);
+    char output[8192];
+    char *paths[] = { kept, NULL };
+    int first_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                        output, sizeof(output));
+
+    // One more root, recorded as backed up from ~/gone, whose payload
+    // climbs from data/ into the folder that holds the backup.
+    char container[PATH_MAX], manifest[PATH_MAX], text[8192];
+    int found = find_container_dir(target, container, sizeof(container));
+    join_path(manifest, sizeof(manifest), container, "manifest.txt");
+    int fd = found ? open(manifest, O_RDONLY | O_CLOEXEC) : -1;
+    ssize_t length = fd >= 0 ? read(fd, text, sizeof(text) - 1U) : -1;
+    if (fd >= 0)
+        close(fd);
+    char *count = length > 0 ? (text[length] = '\0', strstr(text, "ROOT_COUNT=1\n"))
+                             : NULL;
+    if (count != NULL)
+    {
+        count[11] = '2';
+        strncat(text, "ROOT ID=EXPLICIT_9 POLICY=HOME_RELATIVE "
+                      "PAYLOAD=..%2F..%2Fvictim SOURCE=gone RESTORE=gone\n",
+                sizeof(text) - strlen(text) - 1U);
+        write_file(manifest, text);
+    }
+    char victim[PATH_MAX];
+    join_path(victim, sizeof(victim), target, "victim");
+    mkdir_p(victim);
+    join_path(file, sizeof(file), victim, "keep.txt");
+    write_file(file, "precious");
+
+    // Yes to removing what the selection left out.
+    run_backup_capturing_input(target, BACKUP_EXPLICIT_PATHS, paths, 0, 0,
+                               "y\n", output, sizeof(output));
+    backup_test_force_portable_representation(0);
+
+    check(first_rc == 0 && count != NULL && file_text_is(file, "precious"),
+          "the folder next to the backup is left alone");
+
+    remove_tree(home);
+    remove_tree(target);
+}
+
 static void write_fake_process(const char *proc_root, const char *pid,
                                const char *comm)
 {
@@ -6010,6 +6071,8 @@ int main(void)
     test_portable_update_records_a_metadata_change();
     test_update_reuses_a_dropped_root_id(0);
     test_update_reuses_a_dropped_root_id(1);
+    test_update_never_removes_outside_data(0);
+    test_update_never_removes_outside_data(1);
     test_update_recaptures_a_recreated_folder(0);
     test_update_recaptures_a_recreated_folder(1);
     test_open_application_settings_are_backed_up_last(0);

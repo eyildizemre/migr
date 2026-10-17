@@ -2625,7 +2625,9 @@ static int native_open_relative_parent(int root_fd, const char *rel_path,
                                        int *parent_out, char *leaf_out,
                                        size_t leaf_size)
 {
-    if (root_fd < 0 || rel_path == NULL || rel_path[0] == '\0' ||
+    // A ".." component would walk out of root_fd, and the callers remove
+    // what this opens.
+    if (root_fd < 0 || rel_path == NULL || !destination_path_is_safe(rel_path) ||
         parent_out == NULL || leaf_out == NULL || leaf_size == 0)
     {
         errno = EINVAL;
