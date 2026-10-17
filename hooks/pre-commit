@@ -5,9 +5,10 @@
 set -eo pipefail
 
 # Does anything staged affect the build or the suite? If not, skip both to save
-# time. tests/stubs/* is matched by path rather than extension on purpose: those
-# files shadow real command names on PATH, so they cannot carry one.
-if ! git diff --cached --name-only | grep -qE '\.(c|h|sh)$|(^|/)Makefile$|^tests/stubs/'; then
+# time. tests/stubs/* and tests/fuzz/corpus/* are matched by path rather than
+# extension on purpose: stubs shadow real command names on PATH, and a corpus
+# input's name is its expected outcome, so neither can carry one.
+if ! git diff --cached --name-only | grep -qE '\.(c|h|sh)$|(^|/)Makefile$|^tests/stubs/|^tests/fuzz/corpus/'; then
     echo "→ Nothing staged that the build or tests depend on, skipping both."
     exit 0
 fi

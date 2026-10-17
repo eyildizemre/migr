@@ -12,6 +12,7 @@ on:
       - '**.sh'
       - '**/Makefile'
       - 'tests/stubs/**'
+      - 'tests/fuzz/corpus/**'
       - '.github/workflows/ci.yml'
   pull_request:
     branches: [main]
