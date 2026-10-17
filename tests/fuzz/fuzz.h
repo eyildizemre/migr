@@ -20,7 +20,8 @@ typedef struct {
     const char *load_outcome;
     // Unedited writer output, so every prefix of it is what a killed process
     // leaves. boundaries holds the offset just past each record that ends a
-    // group (ENTRY_COMMIT, DELETE, CLAIM); edited seeds have none.
+    // group (ENTRY_COMMIT, DELETE, CLAIM) where the seed's builder knows
+    // them; edited seeds have none.
     int writer_output;
     size_t boundaries[FUZZ_MAX_BOUNDARIES];
     size_t boundary_count;

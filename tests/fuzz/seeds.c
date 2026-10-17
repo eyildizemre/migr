@@ -1,19 +1,25 @@
 // Generated seeds for the journal fuzzers: small journals written with the
-// real writer and portable name map, and the edge cases as edits of them, so
-// they follow the format when its version changes. Each seed states the
-// outcome every harness must report. The names are made up: a journal from a
-// real backup holds a home's real file names and never becomes a seed.
+// real writer and portable name map, the edge cases as edits of them, and one
+// journal the real portable capture writes for a small tree, so they follow
+// the format when its version changes. Each seed states the outcome every
+// harness must report. The names are made up: a journal from a real backup
+// holds a home's real file names and never becomes a seed.
 
 #define _GNU_SOURCE
 
+#include <fcntl.h>
+#include <ftw.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
 #include "fuzz.h"
+#include "portable.h"
 #include "portable_name.h"
 #include "sidecar.h"
 
@@ -444,6 +450,107 @@ static void build_edited(FuzzSeed *seeds, size_t *count)
             sizeof(value));
 }
 
+static void make_directory(int base_fd, const char *path)
+{
+    if (mkdirat(base_fd, path, 0755) != 0)
+        die("cannot create a source directory");
+}
+
+static int make_file(int base_fd, const char *path, const char *content)
+{
+    int fd = openat(base_fd, path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+                    0644);
+    if (fd < 0 || write(fd, content, strlen(content)) < 0)
+        die("cannot create a source file");
+    return fd;
+}
+
+static int remove_path(const char *path, const struct stat *st, int type,
+                       struct FTW *walk)
+{
+    (void)st;
+    (void)type;
+    (void)walk;
+    return remove(path);
+}
+
+// The capture's own record order: claims before their groups, a collision
+// suffix, a symlink, a hardlink, an xattr where the filesystem keeps one.
+// Times and inode order change the bytes from run to run, not the outcomes.
+static void build_captured(FuzzSeed *seeds, size_t *count)
+{
+    const char *temporary = getenv("TMPDIR");
+    char base[PATH_MAX / 2];
+    char source[PATH_MAX];
+    char backup[PATH_MAX];
+    snprintf(base, sizeof(base), "%s/migr-fuzz-seed-XXXXXX",
+             temporary != NULL && temporary[0] != '\0' ? temporary : "/tmp");
+    if (mkdtemp(base) == NULL)
+        die("cannot create a capture directory");
+    snprintf(source, sizeof(source), "%s/home", base);
+    snprintf(backup, sizeof(backup), "%s/backup", base);
+    if (mkdir(source, 0755) != 0)
+        die("cannot create the capture source");
+
+    int source_fd = open(source, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (source_fd < 0)
+        die("cannot open the capture source");
+    make_directory(source_fd, "docs");
+    make_directory(source_fd, "empty");
+    int notes = make_file(source_fd, "docs/notes.txt", "notes");
+    // Not every filesystem $TMPDIR may be on keeps user xattrs; the seed is
+    // still a capture without one.
+    (void)fsetxattr(notes, "user.comment", "made up", 7, 0);
+    close(notes);
+    close(make_file(source_fd, "docs/Report.md", "first"));
+    close(make_file(source_fd, "docs/report.md", "second"));
+    close(make_file(source_fd, "a:b?c.txt", "portable escapes"));
+    close(make_file(source_fd, "\xc3\xa7" "al" "\xc4\xb1" "\xc5\x9f" "ma.txt",
+                    "utf-8"));
+    if (linkat(source_fd, "docs/notes.txt", source_fd, "hard", 0) != 0 ||
+        symlinkat("docs/notes.txt", source_fd, "link") != 0)
+        die("cannot create a link");
+    close(source_fd);
+
+    PortableRootSpec root = {
+        .id = "HOME",
+        .policy = ROOT_POLICY_HOME_RELATIVE,
+        .capture_path = source,
+        .payload_path = "HOME",
+        .source_path = source,
+        .restore_path = "",
+        .has_restore_path = 1
+    };
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .has_source_identity = 1,
+        .machine_id = "f022",
+        .source_uid = getuid(),
+        .roots = &root,
+        .root_count = 1
+    };
+    if (mkdir(backup, 0700) != 0)
+        die("cannot create the capture container");
+    int container = open(backup, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container < 0 || portable_capture_fresh_at(container, &request, NULL) != 0)
+        die("the capture fails");
+
+    FuzzSeed *seed = slot(seeds, count);
+    memset(seed, 0, sizeof(*seed));
+    seed->name = "captured";
+    seed->parse_outcome = "ok";
+    seed->load_outcome = "accepted";
+    seed->writer_output = 1;
+    Builder builder = { seed, openat(container, SIDECAR_SLOT_NAME,
+                                     O_RDONLY | O_CLOEXEC) };
+    if (builder.fd < 0)
+        die("cannot open the captured journal");
+    finish(&builder);
+    close(container);
+    if (nftw(base, remove_path, 16, FTW_DEPTH | FTW_PHYS) != 0)
+        die("cannot remove the capture directory");
+}
+
 void fuzz_seeds_build(FuzzSeed **seeds, size_t *count)
 {
     *seeds = calloc(MAX_SEEDS, sizeof(**seeds));
@@ -452,6 +559,7 @@ void fuzz_seeds_build(FuzzSeed **seeds, size_t *count)
     *count = 0;
     build_valid(*seeds, count);
     build_edited(*seeds, count);
+    build_captured(*seeds, count);
 }
 
 void fuzz_seeds_free(FuzzSeed *seeds, size_t count)
