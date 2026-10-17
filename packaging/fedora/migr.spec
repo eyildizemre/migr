@@ -1,5 +1,5 @@
 Name:           migr
-Version:        0.2.2
+Version:        0.2.3
 Release:        1%{?dist}
 Summary:        Move your home, packages, and settings to a new Linux install
 License:        MIT
@@ -38,6 +38,10 @@ make test
 %{_bindir}/migr-static
 
 %changelog
+* Sun Oct 18 2026 Emre Yıldız <eyildizemre@proton.me> - 0.2.3-1
+- Read a backup manifest only if migr would have written it
+- Leave a backup's access times alone when listing what an update removes
+
 * Sat Oct 17 2026 Emre Yıldız <eyildizemre@proton.me> - 0.2.2-1
 - Install only plain package names from a backup
 - Give a sudo backup to its user without following links
