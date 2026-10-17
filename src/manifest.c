@@ -130,6 +130,7 @@ static const char MANIFEST_MAGIC[] = "MIGR_MANIFEST";
 
 static int root_ptr_id_cmp(const void *pa, const void *pb);
 static int canonical_path(const char *path, int absolute, int empty_ok);
+static int manifest_model_is_invalid(const Manifest *m);
 
 // A root's payload is opened, and on an update removed, under data/, and its
 // restore address under the target home, so both must stay inside them: a
@@ -694,8 +695,11 @@ static ManifestStatus manifest_parse_v1_body(FILE *f, Manifest *out)
             m.excludes[i] = strdup(decoded);
             if (!m.excludes[i]) { fail_status = MANIFEST_STATUS_IO_ERROR; goto fail; }
         }
-        if (!manifest_selection_valid(&m)) goto fail;
     }
+
+    // A manifest reads only as a model the writer would write, so an edited
+    // manifest.txt cannot carry anything migr itself never writes.
+    if (manifest_model_is_invalid(&m)) goto fail;
 
     // No trailing content beyond the declared roots.
     {
@@ -903,7 +907,8 @@ done:
 // before that happens is what guarantees a write either does nothing at all or
 // produces a file manifest_read_v1() is guaranteed to accept -- never a
 // truncated or content-invalid manifest.txt left behind by a failure
-// discovered partway through writing.
+// discovered partway through writing. The reader runs it too, so the two
+// accept the same models.
 static int manifest_model_is_invalid(const Manifest *m)
 {
     if (m == NULL)

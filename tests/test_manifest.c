@@ -813,6 +813,55 @@ static void test_root_addresses_stay_inside(void)
     remove_manifest(test_dir);
 }
 
+// The reader accepts exactly the models the writer writes; a VERSION=1
+// SOURCE_HOME is optional, but when present it is a canonical absolute path.
+static void test_source_home_matches_writer(void)
+{
+    printf(BLUE "::" NC " versioned manifest: a VERSION=1 SOURCE_HOME the writer would refuse is refused\n");
+    char path[512];
+    snprintf(path, sizeof(path), "%s/manifest.txt", test_dir);
+
+    // NULL leaves the line out, as a manifest written before D86 does.
+    static const struct
+    {
+        const char *home;
+        ManifestStatus status;
+    } cases[] = {
+        { "%2Fhome%2Fu%2F", MANIFEST_STATUS_MALFORMED },
+        { "home%2Fu", MANIFEST_STATUS_MALFORMED },
+        { "%2Fhome%2F%2Fu", MANIFEST_STATUS_MALFORMED },
+        { "%2Fhome%2F..%2Fu", MANIFEST_STATUS_MALFORMED },
+        { "%2Fhome%2Fu", MANIFEST_STATUS_VALID },
+        { NULL, MANIFEST_STATUS_VALID },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(*cases); i++)
+    {
+        char home_line[64] = "", content[512], label[128];
+        if (cases[i].home != NULL)
+            snprintf(home_line, sizeof(home_line), "SOURCE_HOME=%s\n", cases[i].home);
+        snprintf(content, sizeof(content),
+            "MIGR_MANIFEST\n"
+            "VERSION=1\n"
+            "REPRESENTATION=native\n"
+            "SCOPE=critical\n"
+            "SIDECAR_VERSION=0\n"
+            "%s"
+            "ROOT_COUNT=0\n",
+            home_line);
+        write_raw(path, content);
+        snprintf(label, sizeof(label), "SOURCE_HOME %s reads as %s",
+                 cases[i].home != NULL ? cases[i].home : "(absent)",
+                 cases[i].status == MANIFEST_STATUS_VALID ? "valid" : "malformed");
+
+        Manifest m;
+        ManifestStatus st = manifest_read_v1(test_dir, &m);
+        check(st == cases[i].status, label);
+        if (st == MANIFEST_STATUS_VALID)
+            manifest_free(&m);
+        remove_manifest(test_dir);
+    }
+}
+
 static void test_embedded_nul_in_line_is_refused(void)
 {
     printf(BLUE "::" NC " versioned manifest: a raw embedded NUL byte in a line is refused, not silently truncated\n");
@@ -1277,6 +1326,7 @@ int main(void)
     test_unknown_version();
     test_malformed_variants();
     test_root_addresses_stay_inside();
+    test_source_home_matches_writer();
     test_embedded_nul_in_line_is_refused();
     test_decode_overflow_is_refused();
     test_io_error();

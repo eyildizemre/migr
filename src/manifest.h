@@ -175,6 +175,8 @@ typedef struct {
  * manifest is never treated the same as "no manifest" or silently guessed at.
  * *out is populated only when the return value is MANIFEST_STATUS_VALID; on
  * every other status *out is left zeroed (no partial/inconsistent state).
+ * VALID means the writer would accept the model read; content it would
+ * refuse is MANIFEST_STATUS_MALFORMED.
  *
  * @param backup_dir Directory containing manifest.txt.
  * @param out        Populated on MANIFEST_STATUS_VALID; caller must eventually
