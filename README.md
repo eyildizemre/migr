@@ -232,7 +232,10 @@ once; after yes, it is this installation's backup.
 again to the same place updates the backup in place: unchanged files are
 skipped, changed ones copied again, and files you deleted leave the backup. A
 file whose permissions, owner, access time, or extended attributes changed but
-whose content did not is not copied again; only its record is. Give the
+whose content did not is not copied again; only its record is. A folder you
+moved inside a backed-up folder is moved inside the backup too, not copied
+again, and so is what stays selected when you give narrower or wider paths;
+the backup says how many folders it moved. Give the
 options the backup was taken with: what an update does not select leaves the
 backup, so migr first lists those parts with their sizes and the options that
 keep them, and asks. An update needs room only for what grew since the last backup, and its progress line

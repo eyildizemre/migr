@@ -382,6 +382,10 @@ int recopy_list_read(int container_fd, RecopyList *list);
 int recopy_list_contains(const RecopyList *list, const char *root,
                          const char *path);
 
+/* True when an item of root is path or below it; "" covers the whole root. */
+int recopy_list_covers(const RecopyList *list, const char *root,
+                       const char *path);
+
 /* Removes the container's list; none is not an error. 0, or -1 with errno. */
 int recopy_list_remove(int container_fd);
 

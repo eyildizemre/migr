@@ -994,6 +994,22 @@ int recopy_list_contains(const RecopyList *list, const char *root,
                    recopy_item_compare) != NULL;
 }
 
+int recopy_list_covers(const RecopyList *list, const char *root,
+                       const char *path)
+{
+    size_t length = strlen(path);
+    for (size_t i = 0; list != NULL && i < list->count; i++)
+    {
+        const char *item = list->items[i].path;
+        if (strcmp(list->items[i].root, root) == 0 &&
+            (length == 0 ||
+             (strncmp(item, path, length) == 0 &&
+              (item[length] == '\0' || item[length] == '/'))))
+            return 1;
+    }
+    return 0;
+}
+
 int recopy_list_remove(int container_fd)
 {
     if (unlinkat(container_fd, CONTAINER_RECOPY_NAME, 0) == 0 ||

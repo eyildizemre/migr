@@ -39,6 +39,7 @@
 #include <unistd.h>
 
 #include "manifest.h"
+#include "move.h"
 #include "portable.h"
 #include "portable_name.h"
 #include "sidecar.h"
@@ -3367,6 +3368,121 @@ static void test_identity_mismatch(const char *base)
     close(container_fd);
 }
 
+// Runs one folder move in a child killed at point, or not at all for
+// PORTABLE_TEST_INTERRUPT_NONE; 1 when it ended as intended.
+static int run_move_child(int container_fd,
+                          const PortableCaptureRequest *request,
+                          PortableTestInterruptPoint point)
+{
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid < 0)
+        fixture_fatal("could not fork the move child");
+    if (pid == 0)
+    {
+        PortablePreparedCapture prepared;
+        SidecarLog log = {0};
+        MovePlan plan = {0};
+        int data_fd = openat(container_fd, "data",
+                             O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (data_fd < 0 ||
+            portable_capture_prepare(container_fd, request, &prepared) != 0 ||
+            sidecar_log_adopt_at(container_fd, &log) !=
+                SIDECAR_OPEN_RESUMABLE ||
+            portable_moves_plan(&log, request, &prepared.report, NULL,
+                                &plan) != 0 ||
+            plan.count != 1)
+            _exit(3);
+        portable_capture_test_set_interrupt(point);
+        int result = portable_moves_apply(&log, container_fd, data_fd,
+                                          &prepared.report, &plan);
+        portable_capture_test_set_interrupt(PORTABLE_TEST_INTERRUPT_NONE);
+        _exit(result == 0 && plan.items[0].moved &&
+                      sidecar_log_close(&log) == SIDECAR_STATUS_OK
+                  ? 0 : 4);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) != pid)
+        fixture_fatal("could not wait for the move child");
+    return point == PORTABLE_TEST_INTERRUPT_NONE
+        ? WIFEXITED(status) && WEXITSTATUS(status) == 0
+        : child_killed_by(status);
+}
+
+// A folder move killed after its journal records or after its rename leaves
+// a backup the next capture completes: the folder at its new place and
+// nothing at the old one. Uninterrupted, the payload keeps its inode (D108).
+static void test_move_interruptions(const char *base)
+{
+    printf(BLUE "::" NC " folder move interruption boundaries\n");
+    static const struct {
+        PortableTestInterruptPoint point;
+        const char *label;
+    } cases[] = {
+        { PORTABLE_TEST_INTERRUPT_NONE, "move-whole" },
+        { PORTABLE_TEST_MOVE_AFTER_CLAIMS, "move-after-claims" },
+        { PORTABLE_TEST_MOVE_AFTER_RENAME, "move-after-rename" }
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+    {
+        char name[64], source[PATH_MAX], container[PATH_MAX];
+        char path[PATH_MAX], to[PATH_MAX], copy[PATH_MAX], label[160];
+        snprintf(name, sizeof(name), "%s-source", cases[i].label);
+        join_path(source, sizeof(source), base, name);
+        snprintf(name, sizeof(name), "%s-container", cases[i].label);
+        join_path(container, sizeof(container), base, name);
+        make_directory(source);
+        join_path(path, sizeof(path), source, "old");
+        make_directory(path);
+        join_path(path, sizeof(path), source, "old/a.txt");
+        write_file(path, "alpha");
+        join_path(path, sizeof(path), source, "old/sub");
+        make_directory(path);
+        join_path(path, sizeof(path), source, "old/sub/b.txt");
+        write_file(path, "beta");
+
+        PortableRootSpec root = root_spec("MOVE", source, "MOVE");
+        PortableCaptureRequest request = request_for(&root, "d108");
+        int container_fd = -1;
+        snprintf(label, sizeof(label), "%s: the first capture completes",
+                 cases[i].label);
+        check(fresh_capture(container, &request, &container_fd) == 0, label);
+        if (container_fd < 0)
+            continue;
+        struct stat before;
+        join_path(copy, sizeof(copy), container, "data/MOVE/old/a.txt");
+        if (stat(copy, &before) != 0)
+            fixture_fatal("the captured copy is missing");
+
+        join_path(path, sizeof(path), source, "new");
+        make_directory(path);
+        join_path(path, sizeof(path), source, "old");
+        join_path(to, sizeof(to), source, "new/old");
+        if (rename(path, to) != 0)
+            fixture_fatal("could not move the source folder");
+        snprintf(label, sizeof(label), "%s: the move ends where intended",
+                 cases[i].label);
+        check(run_move_child(container_fd, &request, cases[i].point), label);
+
+        struct stat after;
+        join_path(copy, sizeof(copy), container, "data/MOVE/new/old/a.txt");
+        join_path(path, sizeof(path), container, "data/MOVE/new/old/sub/b.txt");
+        join_path(to, sizeof(to), container, "data/MOVE/old");
+        int resumed = portable_capture_resume_at(container_fd, &request,
+                                                 NULL) == 0;
+        snprintf(label, sizeof(label),
+                 "%s: the next capture finishes with the folder at its new "
+                 "place only", cases[i].label);
+        check(resumed && file_equals(copy, "alpha") &&
+                  file_equals(path, "beta") && access(to, F_OK) != 0 &&
+                  stat(copy, &after) == 0 &&
+                  (cases[i].point != PORTABLE_TEST_INTERRUPT_NONE ||
+                   after.st_ino == before.st_ino),
+              label);
+        close(container_fd);
+    }
+}
+
 int main(void)
 {
     printf(BLUE "::" NC " portable resume and interruption tests\n");
@@ -3408,6 +3524,7 @@ int main(void)
     test_directory_sigkill_boundaries(base);
     test_hardlink_sigkill_boundaries(base);
     test_identity_mismatch(base);
+    test_move_interruptions(base);
 
     remove_tree(base);
     printf("portable resume tests: %d failure(s), %d skipped\n",

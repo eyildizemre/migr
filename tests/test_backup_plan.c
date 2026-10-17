@@ -4809,13 +4809,21 @@ static void test_update_makes_room_when_full(int portable)
     remove_tree(target);
 }
 
-// A root narrowed to a folder inside it loses the rest of its payload, which
-// the update lists without that folder's size; a root widened to the folder
-// around it loses nothing, so the update asks nothing (D72).
-static void test_update_lists_a_narrowed_root(void)
+static ino_t inode_of(const char *path)
 {
-    printf(BLUE "::" NC " production: an update lists a narrowed root and "
-           "not a widened one\n");
+    struct stat st;
+    return stat(path, &st) == 0 ? st.st_ino : 0;
+}
+
+// A root narrowed to a folder inside it loses the rest of its payload, which
+// the update lists without that folder's size; the folder itself moves to its
+// own root, and a root widened to the folder around it moves into it, so that
+// update asks nothing (D72, D108).
+static void test_update_lists_a_narrowed_root(int portable)
+{
+    printf(BLUE "::" NC " production: a %s update lists a narrowed root and "
+           "moves what both selections hold\n",
+           portable ? "portable" : "native");
 
     char home[PATH_MAX], target[PATH_MAX], projects[PATH_MAX];
     char kept[PATH_MAX], other[PATH_MAX], file[PATH_MAX];
@@ -4833,26 +4841,61 @@ static void test_update_lists_a_narrowed_root(void)
     fresh_mkdtemp(target, sizeof(target), "plan_target");
 
     dry_run = 0;
+    backup_test_force_portable_representation(portable);
     char *wide[] = { projects, NULL };
     char *narrow[] = { kept, NULL };
-    char output[16384];
+    char output[16384], container[PATH_MAX];
+    char wide_copy[PATH_MAX], narrow_copy[PATH_MAX];
     int first_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, wide,
                                         output, sizeof(output));
+    int found = find_container_dir(target, container, sizeof(container));
+    join_path(wide_copy, sizeof(wide_copy), container,
+              "data/Projects/migr/file.txt");
+    join_path(narrow_copy, sizeof(narrow_copy), container,
+              "data/migr/file.txt");
+    ino_t before = inode_of(wide_copy);
+
+    dry_run = 1;
+    int dry_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, narrow,
+                                      output, sizeof(output));
+    dry_run = 0;
+    check(first_rc == 0 && found && before != 0 && dry_rc == 0 &&
+              strstr(output, "Would move inside the backup: 1 folder, 16B\n") !=
+                  NULL,
+          "a dry run says the narrowed root's folder would move");
+
     int narrow_rc = run_backup_capturing_input(target, BACKUP_EXPLICIT_PATHS,
                                                narrow, 0, 0, "y\n", output,
                                                sizeof(output));
-    check(first_rc == 0 && narrow_rc == 0 &&
-              strstr(output, "  ~/Projects (5B), except ~/Projects/migr, "
-                             "copied again\n") != NULL &&
+    check(narrow_rc == 0 &&
+              strstr(output, "  ~/Projects (5B), except ~/Projects/migr\n") !=
+                  NULL &&
+              strstr(output, "Moved inside the backup: 1 folder, 16B\n") !=
+                  NULL &&
               strstr(output, "Backup complete") != NULL,
           "a narrowed root is listed with only what leaves the backup");
+    check(inode_of(narrow_copy) == before && access(wide_copy, F_OK) != 0 &&
+              file_text_is(narrow_copy, "kept, 16 bytes.\n"),
+          "the folder kept moved to its own root instead of being copied");
 
     int widen_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, wide,
                                         output, sizeof(output));
     check(widen_rc == 0 && strstr(output, "would also remove") == NULL &&
-              strstr(output, "Backup complete") != NULL,
-          "a widened root is copied again without a question");
+              strstr(output, "Moved inside the backup: 1 folder, 16B\n") !=
+                  NULL &&
+              strstr(output, "Backup complete") != NULL &&
+              inode_of(wide_copy) == before &&
+              access(narrow_copy, F_OK) != 0,
+          "a widened root moves into the new one without a question");
 
+    char again[16384];
+    int again_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, wide,
+                                        again, sizeof(again));
+    check(again_rc == 0 && strstr(again, "inside the backup") == NULL &&
+              inode_of(wide_copy) == before,
+          "an unchanged update moves nothing");
+
+    backup_test_force_portable_representation(0);
     remove_tree(home);
     remove_tree(target);
 }
@@ -5729,6 +5772,160 @@ static void test_unusable_target_does_not_leak_the_plan(void)
     remove_tree(home);
 }
 
+// Native verify compares only a source whose change time predates the
+// backup's start (D106).
+static void wait_next_second(void)
+{
+    time_t later = time(NULL) + 1;
+    while (time(NULL) < later)
+        usleep(10000);
+}
+
+static void set_mtime(const char *path, time_t seconds)
+{
+    struct timespec times[2] = { { seconds, 0 }, { seconds, 0 } };
+    if (utimensat(AT_FDCWD, path, times, AT_SYMLINK_NOFOLLOW) != 0)
+    {
+        printf(RED "fixture: could not set a modification time" NC "\n");
+        exit(1);
+    }
+}
+
+// A folder moved inside a root is moved inside the backup too, files and
+// hardlinks with it, and the backup still verifies; two equally good old
+// folders for one new one leave both to be copied again (D108).
+static void test_update_moves_folders(int portable)
+{
+    printf(BLUE "::" NC " production: a %s update moves the folders that "
+           "moved inside a root\n", portable ? "portable" : "native");
+
+    char home[PATH_MAX], target[PATH_MAX], work[PATH_MAX], path[PATH_MAX];
+    char to[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_home");
+    setenv("HOME", home, 1);
+    join_path(work, sizeof(work), home, "Work");
+    join_path(path, sizeof(path), work, "course/sub");
+    mkdir_p(path);
+    join_path(path, sizeof(path), work, "course/a.txt");
+    write_file(path, "alpha");
+    join_path(path, sizeof(path), work, "course/sub/c.txt");
+    write_file(path, "gamma");
+    join_path(path, sizeof(path), work, "course/hard1");
+    write_file(path, "hard");
+    join_path(to, sizeof(to), work, "course/hard2");
+    if (link(path, to) != 0)
+    {
+        printf(RED "fixture: could not link a file" NC "\n");
+        exit(1);
+    }
+    join_path(path, sizeof(path), work, "course/link");
+    if (symlink("a.txt", path) != 0)
+    {
+        printf(RED "fixture: could not make the link" NC "\n");
+        exit(1);
+    }
+    join_path(path, sizeof(path), work, "keep.txt");
+    write_file(path, "keep");
+    fresh_mkdtemp(target, sizeof(target), "plan_target");
+
+    dry_run = 0;
+    backup_test_force_portable_representation(portable);
+    char *paths[] = { work, NULL };
+    char output[16384], container[PATH_MAX];
+    int first_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                        output, sizeof(output));
+    int found = find_container_dir(target, container, sizeof(container));
+    char old_copy[PATH_MAX], new_copy[PATH_MAX];
+    join_path(old_copy, sizeof(old_copy), container, "data/Work/course/a.txt");
+    join_path(new_copy, sizeof(new_copy), container,
+              "data/Work/archive/course/a.txt");
+    ino_t before = inode_of(old_copy);
+
+    join_path(path, sizeof(path), work, "archive");
+    mkdir_p(path);
+    join_path(path, sizeof(path), work, "course");
+    join_path(to, sizeof(to), work, "archive/course");
+    check(rename(path, to) == 0, "fixture: move a folder inside the root");
+    wait_next_second();
+    dry_run = 1;
+    int dry_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                      output, sizeof(output));
+    dry_run = 0;
+    check(first_rc == 0 && found && before != 0 && dry_rc == 0 &&
+              strstr(output, "Would move inside the backup: 1 folder, 14B\n") !=
+                  NULL &&
+              inode_of(old_copy) == before,
+          "a dry run says the folder would move and moves nothing");
+
+    int previous_verbose = verbose;
+    verbose = 1;
+    int moved_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                        output, sizeof(output));
+    verbose = previous_verbose;
+    char hard1[PATH_MAX], hard2[PATH_MAX];
+    join_path(hard1, sizeof(hard1), container,
+              "data/Work/archive/course/hard1");
+    join_path(hard2, sizeof(hard2), container,
+              "data/Work/archive/course/hard2");
+    check(moved_rc == 0 &&
+              strstr(output, "Moved inside the backup: 1 folder, 14B\n"
+                             "  ~/Work/course -> ~/Work/archive/course\n") !=
+                  NULL &&
+              strstr(output, "Backup complete") != NULL,
+          "the update says what it moved");
+    check(inode_of(new_copy) == before && access(old_copy, F_OK) != 0 &&
+              file_text_is(new_copy, "alpha") &&
+              (portable || inode_of(hard1) == inode_of(hard2)),
+          "the folder's copy moved, hardlinks and all, instead of a new copy");
+    check(run_verify_capturing(container, output, sizeof(output)) == 0,
+          "the backup verifies after the move");
+
+    int again_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                        output, sizeof(output));
+    check(again_rc == 0 && strstr(output, "inside the backup") == NULL &&
+              inode_of(new_copy) == before,
+          "the next update moves nothing");
+
+    // Two old folders that match the new one equally well: neither moves.
+    for (int i = 0; i < 2; i++)
+    {
+        join_path(to, sizeof(to), work, i == 0 ? "one/src" : "two/src");
+        mkdir_p(to);
+        join_path(path, sizeof(path), to, "x.txt");
+        write_file(path, "same");
+        set_mtime(path, 1700000000);
+    }
+    int twins_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                        output, sizeof(output));
+    for (int i = 0; i < 2; i++)
+    {
+        char folder[PATH_MAX];
+        join_path(path, sizeof(path), work, i == 0 ? "one/src" : "two/src");
+        join_path(folder, sizeof(folder), work, i == 0 ? "new0" : "new1");
+        mkdir_p(folder);
+        join_path(to, sizeof(to), folder, "src");
+        if (rename(path, to) != 0)
+        {
+            printf(RED "fixture: could not move a twin" NC "\n");
+            exit(1);
+        }
+    }
+    wait_next_second();
+    int ambiguous_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS,
+                                            paths, output, sizeof(output));
+    join_path(new_copy, sizeof(new_copy), container,
+              "data/Work/new1/src/x.txt");
+    check(twins_rc == 0 && ambiguous_rc == 0 &&
+              strstr(output, "inside the backup") == NULL &&
+              file_text_is(new_copy, "same") &&
+              run_verify_capturing(container, output, sizeof(output)) == 0,
+          "with two equal candidates, nothing moves and the copies are new");
+
+    backup_test_force_portable_representation(0);
+    remove_tree(home);
+    remove_tree(target);
+}
+
 int main(void)
 {
     // A direct sudo run must not aim restores at the invoking user's home
@@ -5802,7 +5999,10 @@ int main(void)
     test_backup_updates_in_place(1);
     test_update_asks_before_removing(0);
     test_update_asks_before_removing(1);
-    test_update_lists_a_narrowed_root();
+    test_update_lists_a_narrowed_root(0);
+    test_update_lists_a_narrowed_root(1);
+    test_update_moves_folders(0);
+    test_update_moves_folders(1);
     test_update_makes_room_when_full(0);
     test_update_makes_room_when_full(1);
     test_update_takes_another_installs_backup_on_yes(0);

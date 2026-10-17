@@ -4695,7 +4695,8 @@ the old naming are not migrated (pre-release).
 
 **Status:** Implemented; extended by D88 (another install's backup, and
 portable metadata-only changes); an update asks before removing what it does
-not select (2026-10-16)
+not select (2026-10-16); superseded in part by D108 (what a changed selection
+still holds moves to its new root instead of being copied again)
 
 **Decision:** A backup run takes over this install's existing backup under
 PATH instead of creating another one.
@@ -5741,7 +5742,8 @@ folders that are easiest to replace and missed the ones that are not.
 ## D98 — 2026-10-03 — An update counts the backup it replaces
 
 **Status:** Implemented; an update that fills its destination removes what
-left the source and goes on (2026-10-16)
+left the source and goes on (2026-10-16); superseded in part by D108 (a
+folder that moved inside a root moves inside the backup first)
 
 **Decision:** Every manifest records the backup's estimated size on its
 destination, D27's estimate, as `SIZE`. Before an update, the free-space
@@ -6073,3 +6075,66 @@ it.
 
 **Relationship:** Extends D60 and D106: verify now writes into the backup
 when it finds damage. Uses D72's update in place.
+
+## D108 — 2026-10-17 — An update moves what moved instead of copying it again
+
+**Status:** Implemented
+
+**Decision:** Before its capture, an update moves inside the backup the parts
+of it whose source moved, so they are neither copied again nor held twice
+until their old copies are removed.
+- **Roots:** a root of the backup that no root of the update equals is
+  matched with the update's roots by source path, as its user names it (D72's
+  list): the same path under another id or payload folder, a root narrowed to
+  a folder inside it, or a root widened to the folder around it. That part of
+  the payload moves to the new root; the rest of a narrowed root is removed as
+  before.
+- **Folders inside a root:** a folder of the backup whose source is gone,
+  while its parent's is there, is a candidate. A new source folder of the same
+  name in the same root takes the candidate whose recorded children match its
+  own in name, kind, and for files size and modification time, the signals an
+  update already trusts to skip a file (D72), when at least half of the
+  candidate's children match and no other candidate matches as many.
+  Otherwise the folder is copied as before. A folder renamed in place and a
+  single moved file are not matched.
+- **Native:** the payload and the source are walked side by side, payload
+  folders opened with `O_NOATIME` so the times the backup records stay as they
+  are. Each move is one rename, with the folders above the new place created;
+  the capture then gives them their metadata.
+- **Portable:** candidates and new folders come from the journal and the
+  pre-scan, without reading the payload. A move appends a `DELETE` for each
+  old key and a `CLAIM` for each new one, syncs the journal, renames the
+  payload, syncs both folders, and then appends each `ENTRY` group (D25). An
+  interruption leaves claims that the next run reconciles by copying the
+  folder again, and tombstones whose payload it removes. A folder that a
+  hardlink record ties to anything outside it, a journal with unfinished
+  items, and a new place that the journal or the payload already holds leave
+  the folder to the capture.
+- **Damaged files:** a folder holding files verify found damaged (D107) is
+  copied again, never moved; a list that cannot be read moves nothing.
+- **Shown:** a dry run prints `Would move inside the backup: 3 folders,
+  1.2G`, a live run `Moved inside the backup: ...`, and with `--verbose` each
+  folder's old and new place. Nothing is asked: a move removes nothing the
+  update keeps.
+
+**Why:** Folders reorganized in the source were copied again to their new
+place, and their old copies removed only after the capture, so an update
+wrote their whole size and needed room for both copies (D98). The source's
+inode numbers are not used: a restored system has new ones, so the first
+update after a restore could not use them, and neither representation
+records them, so recording them would change the journal format and leave
+existing backups unmatched.
+
+**Rejected:**
+- Matching by inode number, for the reasons above.
+- Matching single files by size and modification time: files of the same
+  size and time are common, while a folder's children identify it.
+- Asking before moving.
+
+**Measured:** walking the 15,110 payload folders of a 41 GB native backup on
+a USB stick (f2fs) took 34 s with a cold cache and 0.09 s with a warm one.
+
+**Relationship:** Supersedes in part D72 (a narrowed or renumbered root is
+no longer copied again) and D98's revision of 2026-10-16 for folders that
+moved inside a root; moves between roots still take D98's path. Uses D25's
+claims, D72's root paths, and D107's list.

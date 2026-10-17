@@ -27,6 +27,7 @@
 #include "fsprobe.h"
 #include "manifest.h"
 #include "metadata.h"
+#include "move.h"
 #include "packages.h"
 #include "groups.h"
 #include "flatpak.h"
@@ -2024,6 +2025,8 @@ typedef struct {
 typedef struct {
     const Manifest *previous;
     const unsigned char *dropped; /* per root of previous */
+    const MovePlan *keep; /* Records planned to move are left; optional. */
+    int keep_moved; /* Records moved to their new place are left. */
     DroppedPath *paths;
     size_t count;
     size_t capacity;
@@ -2041,10 +2044,35 @@ static int root_is_dropped(const DroppedPaths *dropped, SidecarBytes root_id)
     return 0;
 }
 
+// Whether root_id's logical_path is at or below a folder the plan moves,
+// or with moved, at or below the place a moved folder took.
+static int kept_by_move(const MovePlan *plan, int moved, SidecarBytes root_id,
+                        SidecarBytes logical_path)
+{
+    for (size_t i = 0; plan != NULL && i < plan->count; i++)
+    {
+        const MoveItem *item = &plan->items[i];
+        const char *id = moved ? item->to_id : item->from_id;
+        const char *path = moved ? item->to_path : item->from_path;
+        size_t length = strlen(path);
+        if ((!moved || item->moved) && strlen(id) == root_id.length &&
+            memcmp(id, root_id.data, root_id.length) == 0 &&
+            (length == 0 ||
+             (logical_path.length >= length &&
+              memcmp(logical_path.data, path, length) == 0 &&
+              (logical_path.length == length ||
+               logical_path.data[length] == '/'))))
+            return 1;
+    }
+    return 0;
+}
+
 static int dropped_paths_add(DroppedPaths *dropped, SidecarBytes root_id,
                              SidecarBytes logical_path)
 {
-    if (!root_is_dropped(dropped, root_id))
+    if (!root_is_dropped(dropped, root_id) ||
+        kept_by_move(dropped->keep, dropped->keep_moved, root_id,
+                     logical_path))
         return 0;
     if (dropped->count == dropped->capacity)
     {
@@ -2077,6 +2105,16 @@ static int dropped_paths_add(DroppedPaths *dropped, SidecarBytes root_id,
     return 0;
 }
 
+static void dropped_paths_free(DroppedPaths *dropped)
+{
+    for (size_t i = 0; i < dropped->count; i++)
+    {
+        free(dropped->paths[i].root_id);
+        free(dropped->paths[i].logical_path);
+    }
+    free(dropped->paths);
+}
+
 static int collect_dropped_live(const SidecarLiveView *view, void *context)
 {
     return dropped_paths_add(context, view->entry->root_id,
@@ -2091,18 +2129,13 @@ static int collect_dropped_claim(const SidecarClaimView *view, void *context)
 
 // Deletes the journal records of dropped roots, live and claimed alike, and
 // makes the deletions durable before the caller writes the new manifest.
-static int forget_dropped_journal_paths(int container_fd, DroppedPaths *dropped)
+static int forget_dropped_journal_paths(SidecarLog *log, int container_fd,
+                                        DroppedPaths *dropped)
 {
-    SidecarLog log = {0};
-    SidecarOpenStatus open_status = sidecar_log_adopt_at(container_fd, &log);
-    if (open_status == SIDECAR_OPEN_MISSING)
-        return 0;
-    if (open_status != SIDECAR_OPEN_RESUMABLE)
-        return -1;
     int failed =
-        sidecar_log_foreach(&log, collect_dropped_live, dropped) !=
+        sidecar_log_foreach(log, collect_dropped_live, dropped) !=
             SIDECAR_STATUS_OK ||
-        sidecar_log_claim_foreach(&log, collect_dropped_claim, dropped) !=
+        sidecar_log_claim_foreach(log, collect_dropped_claim, dropped) !=
             SIDECAR_STATUS_OK ||
         dropped->failed;
     for (size_t i = 0; !failed && i < dropped->count; i++)
@@ -2114,11 +2147,9 @@ static int forget_dropped_journal_paths(int container_fd, DroppedPaths *dropped)
                 (const unsigned char *)dropped->paths[i].logical_path,
                 strlen(dropped->paths[i].logical_path) }
         };
-        failed = sidecar_log_append_delete(&log, &deletion) !=
+        failed = sidecar_log_append_delete(log, &deletion) !=
                  SIDECAR_STATUS_OK;
     }
-    if (sidecar_log_close(&log) != SIDECAR_STATUS_OK)
-        failed = 1;
     int journal_fd = openat(container_fd, SIDECAR_SLOT_NAME,
                             O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (journal_fd < 0 || fsync(journal_fd) != 0)
@@ -2129,11 +2160,14 @@ static int forget_dropped_journal_paths(int container_fd, DroppedPaths *dropped)
 }
 
 // Removes what an adopted backup holds for roots the current selection no
-// longer has: their journal records (portable) and their payload. The new
-// manifest is written only afterwards, so an interrupted run leaves them
-// listed for the next one to finish.
+// longer has: their journal records (portable) and their payload. What a
+// root of the current selection still selects is moved to it first
+// (D108). The new manifest is written only afterwards, so an interrupted
+// run leaves them listed for the next one to finish. report is the
+// pre-scan of a portable run.
 static int drop_left_out_roots(int container_fd, const Manifest *current,
-                               int *changed)
+                               const PortablePrescanReport *report,
+                               MovePlan *moves, int *changed)
 {
     Manifest previous;
     if (manifest_read_v1_at(container_fd, &previous) != MANIFEST_STATUS_VALID)
@@ -2155,31 +2189,130 @@ static int drop_left_out_roots(int container_fd, const Manifest *current,
     }
 
     *changed = any;
-    DroppedPaths dropped = { .previous = &previous, .dropped = flags };
-    int failed = any && previous.representation == CLONE_PORTABLE_SIDECAR &&
-                 forget_dropped_journal_paths(container_fd, &dropped) != 0;
+    int portable = previous.representation == CLONE_PORTABLE_SIDECAR;
+    // Files verify found damaged are copied again, never moved (D107); an
+    // unreadable list moves nothing.
+    RecopyList recopy = {0};
+    int movable = any && recopy_list_read(container_fd, &recopy) == 0;
+    int failed = movable &&
+                 move_plan_roots(&previous, flags, current, &recopy, portable,
+                                 moves) != 0;
     int data_fd = any && !failed
         ? openat(container_fd, "data",
                  O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
         : -1;
     if (any && !failed && data_fd < 0 && errno != ENOENT)
         failed = 1;
+    if (data_fd < 0)
+        movable = 0;
+
+    // The records nothing moves go first: a moved root may take the id of
+    // a dropped one, its own included.
+    DroppedPaths first = { .previous = &previous, .dropped = flags,
+                           .keep = moves };
+    DroppedPaths dropped = { .previous = &previous, .dropped = flags,
+                             .keep = moves, .keep_moved = 1 };
+    if (any && !failed && portable)
+    {
+        SidecarLog log = {0};
+        SidecarOpenStatus status = sidecar_log_adopt_at(container_fd, &log);
+        if (status == SIDECAR_OPEN_RESUMABLE)
+        {
+            failed = forget_dropped_journal_paths(&log, container_fd,
+                                                  &first) != 0 ||
+                     (movable && report != NULL &&
+                      portable_moves_apply(&log, container_fd, data_fd, report,
+                                           moves) != 0) ||
+                     forget_dropped_journal_paths(&log, container_fd,
+                                                  &dropped) != 0;
+            if (sidecar_log_close(&log) != SIDECAR_STATUS_OK)
+                failed = 1;
+        }
+        else if (status != SIDECAR_OPEN_MISSING)
+            failed = 1;
+    }
+    else if (any && !failed && movable)
+        failed = native_moves_apply(data_fd, moves) != 0;
+
     for (int i = 0; data_fd >= 0 && !failed && i < previous.root_count; i++)
-        if (flags[i] &&
+        if (flags[i] && !move_plan_moves_root(moves, previous.roots[i].id) &&
             fileops_remove_tree_at(data_fd, previous.roots[i].payload_path) != 0)
             failed = 1;
     if (data_fd >= 0)
         close(data_fd);
 
-    for (size_t i = 0; i < dropped.count; i++)
-    {
-        free(dropped.paths[i].root_id);
-        free(dropped.paths[i].logical_path);
-    }
-    free(dropped.paths);
+    dropped_paths_free(&first);
+    dropped_paths_free(&dropped);
+    recopy_list_free(&recopy);
     free(flags);
     manifest_free(&previous);
     return failed ? -1 : 0;
+}
+
+// Plans, and unless dry_run makes, the moves of folders that moved inside a
+// root of the backup in container_fd since it was taken, before a capture
+// would copy them again and remove their old copies (D108). A portable
+// backup is planned from its journal and request's pre-scan report.
+static int move_folders(int container_fd, const BackupPlan *plan,
+                        const SelectionPlan *selection,
+                        CloneRepresentation repr, int nsec_exact,
+                        const PortableCaptureRequest *request,
+                        const PortablePrescanReport *report,
+                        const RecopyList *recopy, int dry_run,
+                        MovePlan *moves)
+{
+    int data_fd = openat(container_fd, "data", O_RDONLY | O_DIRECTORY |
+                                               O_NOFOLLOW | O_CLOEXEC);
+    if (data_fd < 0)
+        return errno == ENOENT ? 0 : -1;
+    MovePlan found = {0};
+    int result = 0;
+    if (repr == CLONE_NATIVE_TREE)
+    {
+        NativeMoveRoot *roots = calloc((size_t)plan->root_count + 1U,
+                                       sizeof(*roots));
+        if (roots == NULL)
+            result = -1;
+        for (int i = 0; roots != NULL && i < plan->root_count; i++)
+            roots[i] = (NativeMoveRoot){
+                .capture_path = plan->roots[i].capture_path,
+                .payload_path = plan->roots[i].manifest_root.payload_path,
+                .selection = selection != NULL ? &selection->roots[i] : NULL
+            };
+        if (roots != NULL)
+            result = native_moves_plan(data_fd, roots,
+                                       (size_t)plan->root_count, nsec_exact,
+                                       recopy, &found);
+        if (result == 0 && !dry_run)
+            result = native_moves_apply(data_fd, &found);
+        free(roots);
+    }
+    else if (request != NULL && report != NULL)
+    {
+        SidecarLog log = {0};
+        SidecarOpenStatus status =
+            dry_run ? sidecar_log_open_readonly_at(container_fd, &log)
+                    : sidecar_log_adopt_at(container_fd, &log);
+        if (status == SIDECAR_OPEN_RESUMABLE)
+        {
+            result = portable_moves_plan(&log, request, report, recopy,
+                                         &found);
+            if (result == 0 && !dry_run)
+                result = portable_moves_apply(&log, container_fd, data_fd,
+                                              report, &found);
+            if (sidecar_log_close(&log) != SIDECAR_STATUS_OK)
+                result = -1;
+        }
+        else if (status != SIDECAR_OPEN_MISSING)
+            result = -1;
+    }
+    int saved = errno;
+    close(data_fd);
+    if (result == 0 && move_plan_append(moves, &found) != 0)
+        result = -1;
+    move_plan_free(&found);
+    errno = saved;
+    return result;
 }
 
 // Every update appends to the journal; once records no longer live outweigh
@@ -2255,9 +2388,10 @@ static void print_removal(int *listed, const char *target, const char *name,
 // beyond what left the source (D72): the roots this run does not select, the
 // bundled migr, network configuration, and the lists an explicit-path backup
 // keeps none of. A root this run selects folders of loses the rest, and the
-// folders are copied again; a root inside one this run selects is copied
-// again and not listed. Returns 1 when it listed something, 0 when nothing is
-// removed, and -1, reported, when the backup could not be read.
+// folders move to their own roots; a root inside one this run selects moves
+// into it and is not listed (D108). Returns 1 when it listed something, 0
+// when nothing is removed, and -1, reported, when the backup could not be
+// read.
 static int print_update_removals(int dest_fd, const char *target,
                                  const char *name, const BackupPlan *plan,
                                  int include_self, int include_network_config,
@@ -2308,24 +2442,22 @@ static int print_update_removals(int dest_fd, const char *target,
             continue;
         off_t size = data_fd >= 0
             ? payload_size_at(data_fd, root->payload_path, 0) : 0;
-        int inside = 0;
         for (int j = 0; j < plan->root_count; j++)
             if (path_covers(path, selected[j]))
             {
                 char payload[PATH_MAX * 2 + 2];
                 snprintf(payload, sizeof(payload), "%s%s", root->payload_path,
                          selected[j] + strlen(path));
-                off_t copied = data_fd >= 0
+                off_t kept = data_fd >= 0
                     ? payload_size_at(data_fd, payload, 0) : 0;
-                size -= copied < size ? copied : size;
-                inside++;
+                size -= kept < size ? kept : size;
             }
         print_removal(&listed, target, name, path, size);
         for (int j = 0, shown = 0; j < plan->root_count; j++)
             if (path_covers(path, selected[j]))
                 printf("%s%s", shown++ == 0 ? ", except " : ", ",
                        selected[j]);
-        printf("%s\n", inside ? ", copied again" : "");
+        printf("\n");
     }
     if (previous.has_self_binary && !include_self)
     {
@@ -2369,6 +2501,60 @@ static int print_update_removals(int dest_fd, const char *target,
     free(selected);
     manifest_free(&previous);
     return listed > 0;
+}
+
+// Says what updating the backup dest_fd/name with plan moves inside it
+// instead of copying it again (D108), as a dry run: the roots a root of plan
+// keeps, then the folders that moved inside roots. request and report are a
+// portable run's pre-scan. Payload folders are only read with O_NOATIME.
+static int print_update_moves(int dest_fd, const char *name,
+                              const BackupPlan *plan,
+                              const SelectionPlan *selection,
+                              CloneRepresentation repr, int nsec_exact,
+                              const PortableCaptureRequest *request,
+                              const PortablePrescanReport *report)
+{
+    int container_fd = openat(dest_fd, name, O_RDONLY | O_DIRECTORY |
+                                             O_NOFOLLOW | O_CLOEXEC);
+    Manifest previous, current;
+    if (container_fd < 0)
+        return -1;
+    if (manifest_read_v1_at(container_fd, &previous) != MANIFEST_STATUS_VALID)
+    {
+        close(container_fd);
+        return -1;
+    }
+    unsigned char *flags = calloc((size_t)previous.root_count + 1U, 1U);
+    RecopyList recopy = {0};
+    MovePlan moves = {0};
+    int result = flags != NULL && manifest_from_plan(plan, &current) == 0
+        ? 0 : -1;
+    if (result == 0)
+    {
+        for (int i = 0; i < previous.root_count; i++)
+        {
+            int kept = 0;
+            for (int j = 0; j < current.root_count && !kept; j++)
+                kept = manifest_root_equal(&previous.roots[i],
+                                           &current.roots[j]);
+            flags[i] = !kept;
+        }
+        if (recopy_list_read(container_fd, &recopy) == 0 &&
+            (move_plan_roots(&previous, flags, &current, &recopy,
+                             repr == CLONE_PORTABLE_SIDECAR, &moves) != 0 ||
+             move_folders(container_fd, plan, selection, repr, nsec_exact,
+                          request, report, &recopy, 1, &moves) != 0))
+            result = -1;
+        manifest_free(&current);
+    }
+    if (result == 0)
+        move_plan_print(&moves, 1);
+    move_plan_free(&moves);
+    recopy_list_free(&recopy);
+    free(flags);
+    manifest_free(&previous);
+    close(container_fd);
+    return result;
 }
 
 // O_NOFOLLOW | O_DIRECTORY: in an adopted container this entry may already
@@ -3514,9 +3700,11 @@ static int backup_dry_run(const char *target, BackupMode mode,
 
     PortablePrescanReport advisory_prescan = {0};
     int has_advisory_prescan = 0;
+    PortableRootSpec *advisory_roots = NULL;
+    PortableCaptureRequest advisory_request = {0};
     if (advisory_fd >= 0 && advisory_repr == CLONE_PORTABLE_SIDECAR)
     {
-        PortableRootSpec *advisory_roots = plan->root_count > 0
+        advisory_roots = plan->root_count > 0
             ? calloc((size_t)plan->root_count, sizeof(*advisory_roots))
             : NULL;
         if (plan->root_count > 0 && advisory_roots == NULL)
@@ -3530,7 +3718,6 @@ static int backup_dry_run(const char *target, BackupMode mode,
         char advisory_machine_id[MANIFEST_MACHINE_ID_MAX];
         int advisory_has_machine_id = read_machine_id(
             advisory_machine_id, sizeof(advisory_machine_id)) == 0;
-        PortableCaptureRequest advisory_request;
         int request_result = portable_capture_request_for_execution(
             plan, selection, advisory_machine_id, advisory_has_machine_id,
             advisory_profile.capabilities[FS_CAP_CASE_SENSITIVE].status ==
@@ -3541,9 +3728,9 @@ static int backup_dry_run(const char *target, BackupMode mode,
             ? portable_capture_prepare(advisory_fd, &advisory_request,
                                         &advisory_prepared)
             : -1;
-        free(advisory_roots);
         if (prepare_result != 0)
         {
+            free(advisory_roots);
             int has_manual_native = 0;
             for (int i = 0; i < plan->root_count; i++)
                 if (plan->roots[i].manifest_root.policy ==
@@ -3617,7 +3804,6 @@ static int backup_dry_run(const char *target, BackupMode mode,
         if (advisory_prescan.unresolved_count > 0)
             printf("  %zu naming conflict(s) found; the live run would refuse.\n",
                    advisory_prescan.unresolved_count);
-        portable_prescan_report_free(&advisory_prescan);
     }
 
     printf("\nControls\n");
@@ -3640,8 +3826,19 @@ static int backup_dry_run(const char *target, BackupMode mode,
                                 include_self, include_network_config,
                                 network_config_present_mask)
         : 0;
+    if (removes >= 0 && update != UPDATE_NONE &&
+        print_update_moves(advisory_fd, update_name, plan, selection,
+                           advisory_repr, advisory_profile.nsec_exact,
+                           has_advisory_prescan ? &advisory_request : NULL,
+                           has_advisory_prescan ? &advisory_prescan : NULL) !=
+            0)
+        print_warning("Warning: could not tell which folders the update "
+                      "would move inside %s/%s: %s\n", target, update_name,
+                      strerror(errno));
     if (advisory_fd >= 0)
         close(advisory_fd);
+    portable_prescan_report_free(&advisory_prescan);
+    free(advisory_roots);
     if (removes < 0)
     {
         backup_plan_free(plan);
@@ -3885,6 +4082,7 @@ static int backup_run(const char *target_arg, BackupMode mode,
     int adopted_changed = 0;
     RecopyList recopy = {0};
     int recopy_unread = 0;
+    MovePlan moves = {0};
 
     if (ensure_target_root(target, &target_created) != 0)
         goto fail_pre_container;
@@ -4050,7 +4248,10 @@ static int backup_run(const char *target_arg, BackupMode mode,
         // it no longer has are removed first, so the checks below see only
         // payload this run keeps, and before its manifest is replaced (D72).
         if (drop_left_out_roots(container_root_fd(&container),
-                                identity_manifest, &adopted_changed) != 0)
+                                identity_manifest,
+                                repr == CLONE_PORTABLE_SIDECAR
+                                    ? &prepared.report : NULL,
+                                &moves, &adopted_changed) != 0)
         {
             print_error("Error: Could not remove the parts of the backup that "
                         "are no longer selected: %s\n", strerror(errno));
@@ -4186,6 +4387,19 @@ static int backup_run(const char *target_arg, BackupMode mode,
                           strerror(errno));
             recopy_unread = 1;
         }
+        // Folders that moved in the source move inside the backup first; a
+        // list of damaged files that cannot be read leaves them to be
+        // copied again (D108).
+        if (adopted && !recopy_unread &&
+            move_folders(container_root_fd(&container), &plan, selection, repr,
+                         profile.nsec_exact, &portable_request,
+                         &prepared.report, &recopy, 0, &moves) != 0)
+        {
+            print_error("Error: Could not move folders inside the backup: "
+                        "%s\n", strerror(errno));
+            had_error = 1;
+        }
+        move_plan_print(&moves, 0);
 
         capture_report.sync_interval_bytes = BACKUP_SYNC_INTERVAL_BYTES;
         BackupProgressDisplay progress_display = {
@@ -4214,7 +4428,7 @@ static int backup_run(const char *target_arg, BackupMode mode,
             deferral.progress = &progress_display;
         }
 
-        if (repr == CLONE_NATIVE_TREE)
+        if (!had_error && repr == CLONE_NATIVE_TREE)
         {
             CloneContext ctx = {
                 .operation = CLONE_BACKUP,
@@ -4256,7 +4470,7 @@ static int backup_run(const char *target_arg, BackupMode mode,
             }
             count = capture_report.items;
         }
-        else
+        else if (!had_error)
         {
             size_t live_count = 0;
             portable_request.payload_matches_journal = container.from_finished;
@@ -4598,6 +4812,7 @@ finish:
     portable_prepared_capture_free(&prepared);
     free(portable_roots);
     recopy_list_free(&recopy);
+    move_plan_free(&moves);
     manifest_free(&manifest);
     backup_plan_free(&plan);
     return finish_result;
@@ -4621,6 +4836,7 @@ fail_pre_container:
     portable_prepared_capture_free(&prepared);
     free(portable_roots);
     recopy_list_free(&recopy);
+    move_plan_free(&moves);
     if (target_fd >= 0)
         close(target_fd);
     if (target_created)
