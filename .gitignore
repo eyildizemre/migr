@@ -8,4 +8,11 @@ tests/test_*
 tests/migr-unprivileged
 tests/fuzz/replay_*
 !tests/fuzz/replay_*.c
+fuzz-obj/
+fuzz-out/
+crash-*
+oom-*
+timeout-*
+leak-*
+slow-unit-*
 docs/scratch/

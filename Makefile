@@ -563,6 +563,64 @@ check:
 	$(MAKE) check-valgrind
 	$(MAKE) check-analyze
 
+# Discovery: libFuzzer runs one harness open-ended and nondeterministically,
+# so it is run by hand, never by make check, and needs clang and compiler-rt:
+#   make fuzz [FUZZ_TARGET=sidecar_parse|sidecar_load] [FUZZ_TIME=seconds]
+# Its objects are built with the sanitizers into FUZZ_OBJ_DIR, apart from the
+# GCC objects here. A run starts from the generated seeds and the checked-in
+# corpus, and keeps the corpus it grows and any crash, leak, or timeout input
+# in FUZZ_OUT_DIR/<target>; FUZZ_ARGS passes more libFuzzer options. The RSS
+# limit sits above the journal layer's 1 GiB allocation budget plus the
+# sanitizers' overhead. make fuzz-repro ART=<file> runs one input through the
+# fuzzer build; the replay binary, tests/fuzz/replay_<target> <file>, runs it
+# through the GCC build. A finding is minimized (libFuzzer's -minimize_crash=1)
+# and checked in under tests/fuzz/corpus/<target>/, named for the outcome it
+# must have once fixed; real backups' journals never become inputs.
+FUZZ_CC = clang
+FUZZ_TARGET = sidecar_parse
+FUZZ_TIME = 300
+FUZZ_ARGS =
+FUZZ_OBJ_DIR = fuzz-obj
+FUZZ_OUT_DIR = fuzz-out
+FUZZ_FLAGS = -g -O1 -Wall -Wextra -I src -pthread -fsanitize=address,undefined -fno-omit-frame-pointer
+FUZZ_BINARY = $(FUZZ_OBJ_DIR)/fuzz_$(FUZZ_TARGET)
+
+$(FUZZ_OBJ_DIR)/%.o: %.c
+	@mkdir -p $(FUZZ_OBJ_DIR)
+	$(FUZZ_CC) $(FUZZ_FLAGS) -fsanitize=fuzzer-no-link -c $< -o $@
+
+$(FUZZ_OBJ_DIR)/sidecar_state_test.o: src/sidecar_state.c
+	@mkdir -p $(FUZZ_OBJ_DIR)
+	$(FUZZ_CC) $(FUZZ_FLAGS) -fsanitize=fuzzer-no-link -DSIDECAR_STATE_TEST_HOOKS -c $< -o $@
+
+$(FUZZ_OBJ_DIR)/sidecar_state_map_test.o: src/sidecar_state_map.c
+	@mkdir -p $(FUZZ_OBJ_DIR)
+	$(FUZZ_CC) $(FUZZ_FLAGS) -fsanitize=fuzzer-no-link -DSIDECAR_STATE_TEST_HOOKS -c $< -o $@
+
+$(FUZZ_OBJ_DIR)/fuzz_sidecar_parse: tests/fuzz/fuzz_sidecar_parse.c tests/fuzz/fuzz.h $(addprefix $(FUZZ_OBJ_DIR)/,$(LIB_OBJS))
+	$(FUZZ_CC) $(FUZZ_FLAGS) -fsanitize=fuzzer -o $@ $(filter %.c %.o,$^)
+
+$(FUZZ_OBJ_DIR)/fuzz_sidecar_load: tests/fuzz/fuzz_sidecar_load.c tests/fuzz/fuzz.h $(addprefix $(FUZZ_OBJ_DIR)/,$(call with_hooks,sidecar_state_test.o sidecar_state_map_test.o))
+	$(FUZZ_CC) $(FUZZ_FLAGS) -fsanitize=fuzzer -o $@ $(filter %.c %.o,$^)
+
+fuzz-toolchain:
+	@printf 'int LLVMFuzzerTestOneInput(const unsigned char *d, unsigned long n) { (void)d; (void)n; return 0; }\n' | \
+		$(FUZZ_CC) -fsanitize=fuzzer,address,undefined -x c - -o /dev/null 2>/dev/null || \
+		{ echo "fuzz: $(FUZZ_CC) cannot build a libFuzzer binary; discovery needs clang and compiler-rt."; exit 1; }
+
+fuzz: fuzz-toolchain
+	$(MAKE) $(FUZZ_BINARY) tests/fuzz/replay_$(FUZZ_TARGET)
+	mkdir -p $(FUZZ_OUT_DIR)/$(FUZZ_TARGET)/corpus
+	./tests/fuzz/replay_$(FUZZ_TARGET) --write-seeds $(FUZZ_OUT_DIR)/$(FUZZ_TARGET)/corpus
+	./$(FUZZ_BINARY) -dict=tests/fuzz/sidecar.dict -max_total_time=$(FUZZ_TIME) -timeout=10 -rss_limit_mb=2560 \
+		-artifact_prefix=$(FUZZ_OUT_DIR)/$(FUZZ_TARGET)/ $(FUZZ_ARGS) \
+		$(FUZZ_OUT_DIR)/$(FUZZ_TARGET)/corpus $(wildcard tests/fuzz/corpus/$(FUZZ_TARGET))
+
+fuzz-repro: fuzz-toolchain
+	@test -n "$(ART)" || { echo "fuzz-repro: name the input with ART=<file>."; exit 1; }
+	$(MAKE) $(FUZZ_BINARY)
+	./$(FUZZ_BINARY) $(ART)
+
 # Packages install into a staging root: make install DESTDIR=... PREFIX=/usr.
 # The static binary sits beside migr, where --include-self looks for it; it
 # has its own target because building it needs a static C library.
@@ -579,8 +637,9 @@ uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/$(TARGET) $(DESTDIR)$(BINDIR)/$(STATIC_TARGET)
 
 clean:
+	rm -rf $(FUZZ_OBJ_DIR)
 	rm -f ./*.o ./*.d $(TARGET) $(STATIC_TARGET) $(TEST_NATIVE_SELECTION) $(TEST_MANIFEST_SELECTION) $(TEST_PORTABLE_SELECTION) $(TEST_SELECTION) $(TEST_CONFIG) $(TEST_DETECT) $(TEST_REPORT) $(TEST_PATHJOIN) $(TEST_FD_LIMIT) $(TEST_CONFIRM) $(TEST_PACKAGES) $(TEST_XDG) $(TEST_GET_DIR_SIZE) $(TEST_RUN_COMMAND) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE) $(TEST_MANIFEST) $(TEST_ENCODING) $(TEST_PORTABLE_NAME) $(TEST_CONTAINER) $(TEST_SELFCOPY) $(TEST_CONSOLE) $(TEST_SUBID) $(TEST_PODMAN_STATE) $(TEST_RESTORE_NATIVE) $(TEST_RESTORE_SYNC) $(TEST_RESTORE_SOURCE_READ) $(TEST_BACKUP_SOURCE_READ) $(TEST_VSCODE_CAPTURE) $(TEST_DCONF_RESTORE) $(TEST_LIVE_STATE) $(TEST_VERIFY) $(TEST_REPAIR) $(TEST_SOURCE_SNAPSHOT) $(TEST_MIGR_UNPRIVILEGED) $(TEST_BACKUP_SYNC) $(TEST_RESTORE_DISPATCH) $(TEST_RESTORE_ATIME) $(TEST_BACKUP_PLAN) $(TEST_METADATA_CONTRACT) $(TEST_METADATA_SNAPSHOTS) $(TEST_SIDECAR) $(TEST_SIDECAR_STATE) $(TEST_SIDECAR_SCALE) $(TEST_PORTABLE_HASHSET) $(TEST_PORTABLE_CAPTURE) $(TEST_PORTABLE_CAPTURE_SCALE) $(TEST_PORTABLE_PREPARE) $(TEST_NATIVE_RECONCILE_SCALE) $(TEST_NATIVE_HARDLINK_SCALE) $(TEST_PORTABLE_COLLISION_SCALE) $(TEST_PORTABLE_HARDLINK_SCALE) $(TEST_PORTABLE_RESUME) $(TEST_PORTABLE_RECONCILE) $(TEST_PORTABLE_RECONCILE_SCALE) $(TEST_PORTABLE_RESTORE_PREFLIGHT) $(TEST_PORTABLE_RESTORE_REPLAY) $(TEST_PORTABLE_RESTORE_ORCHESTRATE) $(TEST_PORTABLE_RESTORE_INVARIANT) $(FUZZ_REPLAY_SIDECAR_PARSE) $(FUZZ_REPLAY_SIDECAR_LOAD)
 
-.PHONY: clean test check-strict check-sanitize check-valgrind check-analyze check install install-static uninstall
+.PHONY: clean test check-strict check-sanitize check-valgrind check-analyze check install install-static uninstall fuzz fuzz-repro fuzz-toolchain
 
 -include $(wildcard *.d)

@@ -1,0 +1,20 @@
+# libFuzzer dictionary for the journal: its magic, record tags, kind names,
+# and the bytes its path and name rules turn on. The seeds carry the header's
+# version, so it is left out here and never goes stale.
+"MIGR_SIDECAR"
+"\x00"
+"ENTRY\x00"
+"XATTR\x00"
+"ENTRY_COMMIT\x00"
+"DELETE\x00"
+"CLAIM\x00"
+"regular\x00"
+"directory\x00"
+"fifo\x00"
+"symlink\x00"
+"hardlink\x00"
+"ROOT\x00"
+"%7E1"
+"/"
+"."
+".."
