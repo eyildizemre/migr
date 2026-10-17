@@ -1,3 +1,10 @@
+migr (0.2.2-1) unstable; urgency=high
+
+  * Install only plain package names from a backup.
+  * Give a sudo backup to its user without following links.
+
+ -- Emre Yıldız <eyildizemre@proton.me>  Sat, 17 Oct 2026 22:38:01 +0300
+
 migr (0.2.1-1) unstable; urgency=high
 
   * Never remove anything outside the backup when updating it.

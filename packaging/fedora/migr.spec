@@ -1,5 +1,5 @@
 Name:           migr
-Version:        0.2.1
+Version:        0.2.2
 Release:        1%{?dist}
 Summary:        Move your home, packages, and settings to a new Linux install
 License:        MIT
@@ -38,6 +38,10 @@ make test
 %{_bindir}/migr-static
 
 %changelog
+* Sat Oct 17 2026 Emre Yıldız <eyildizemre@proton.me> - 0.2.2-1
+- Install only plain package names from a backup
+- Give a sudo backup to its user without following links
+
 * Sat Oct 17 2026 Emre Yıldız <eyildizemre@proton.me> - 0.2.1-1
 - Never remove anything outside the backup when updating it
 - Speed up pointing desktop settings at the new home folder
