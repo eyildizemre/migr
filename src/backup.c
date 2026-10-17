@@ -2349,7 +2349,8 @@ static void compact_journal(int container_fd)
 
 // The bytes of the regular files at or below dir_fd/name, whose links are not
 // followed; 0 when it is missing. Only shown, so a tree it cannot read or
-// deeper than 256 levels counts as far as it got.
+// deeper than 256 levels counts as far as it got. It leaves the recorded
+// access times as they are; a folder another user owns refuses O_NOATIME.
 static off_t payload_size_at(int dir_fd, const char *name, int depth)
 {
     struct stat st;
@@ -2357,8 +2358,10 @@ static off_t payload_size_at(int dir_fd, const char *name, int depth)
         return 0;
     if (!S_ISDIR(st.st_mode))
         return S_ISREG(st.st_mode) ? st.st_size : 0;
-    int fd = openat(dir_fd, name,
-                    O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    int flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
+    int fd = openat(dir_fd, name, flags | O_NOATIME);
+    if (fd < 0 && errno == EPERM)
+        fd = openat(dir_fd, name, flags);
     DIR *dir = fd >= 0 ? fdopendir(fd) : NULL;
     if (dir == NULL)
     {

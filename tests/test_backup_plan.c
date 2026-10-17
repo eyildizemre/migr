@@ -4715,6 +4715,8 @@ static void test_update_asks_before_removing(int portable)
     join_path(payload, sizeof(payload), container, "data/dropped.txt");
     join_path(self, sizeof(self), container, "migr");
     join_path(network, sizeof(network), container, "network");
+    set_old_atime(self);
+    set_old_atime(network);
 
     dry_run = 1;
     int dry_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS,
@@ -4742,6 +4744,9 @@ static void test_update_asks_before_removing(int portable)
               access(payload, F_OK) == 0 && access(self, F_OK) == 0 &&
               dir_exists(network),
           "with nobody to answer, the backup is left as it was");
+    check(atime_is_old(self) && atime_is_old(network),
+          "listing what it would remove leaves their access times as they "
+          "are");
 
     int yes_rc = run_backup_capturing_input(target, BACKUP_EXPLICIT_PATHS,
                                             second_paths, 0, 0, "y\n",
