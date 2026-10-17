@@ -522,6 +522,13 @@ read-back. `--dry-run` shows what would be restored and writes nothing.
   is yours to copy. Listed explicitly, such paths can be backed up only to a
   Linux filesystem, and restore does not put them back: it shows where they
   came from and where the backup holds them.
+- **Authenticating a backup.** A backup is not signed or encrypted: anyone
+  who can write to the drive can change what it holds, the files you restore
+  and the `migr` that `--include-self` puts there among them. migr checks
+  that what it reads from a backup stays inside the backup and your home, so
+  a changed backup cannot make it touch anything else, but it cannot tell a
+  changed file from your own. Restore from a drive that has stayed in your
+  hands, and do not run the `migr` in a backup you do not trust.
 
 ### Supported distributions
 
