@@ -203,7 +203,8 @@ SidecarStatus sidecar_parse_fd(int fd, SidecarRecordCallback callback,
 /*
  * Like sidecar_parse_fd(), but after the header the records are read from
  * byte offset start, which is 0 (right after the header) or at or past the
- * header's end. Offsets in result count from the start of the file.
+ * header's end, and never past the file's end. Offsets in result count from
+ * the start of the file.
  */
 SidecarStatus sidecar_parse_fd_from(int fd, uint64_t start,
                                     SidecarRecordCallback callback,

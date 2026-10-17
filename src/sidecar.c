@@ -1516,6 +1516,8 @@ SidecarStatus sidecar_parse_fd_from(int fd, uint64_t start,
         return SIDECAR_STATUS_IO_ERROR;
     if ((uint64_t)st.st_size > SIDECAR_MAX_TOTAL_BYTES)
         return SIDECAR_STATUS_LIMIT;
+    if (start > (uint64_t)st.st_size)
+        return SIDECAR_STATUS_INVALID_ARGUMENT;
 
     SidecarReader reader = {
         .fd = fd,

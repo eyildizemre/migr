@@ -999,6 +999,14 @@ static void test_parse_from_offset(int fd)
     check(sidecar_parse_fd_from(fd, 3, NULL, NULL, &result) ==
               SIDECAR_STATUS_INVALID_ARGUMENT,
           "an offset inside the header is refused");
+    check(sidecar_parse_fd_from(fd, buffer.length, NULL, NULL, &result) ==
+                  SIDECAR_STATUS_OK &&
+              result.records_read == 0 &&
+              result.bytes_read == buffer.length,
+          "an offset at the file's end reads no records");
+    check(sidecar_parse_fd_from(fd, buffer.length + 1U, NULL, NULL,
+                                &result) == SIDECAR_STATUS_INVALID_ARGUMENT,
+          "an offset past the file's end is refused");
     raw_free(&buffer);
 }
 
