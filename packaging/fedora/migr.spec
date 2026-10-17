@@ -1,5 +1,5 @@
 Name:           migr
-Version:        0.1.2
+Version:        0.2.0
 Release:        1%{?dist}
 Summary:        Move your home, packages, and settings to a new Linux install
 License:        MIT
@@ -38,6 +38,9 @@ make test
 %{_bindir}/migr-static
 
 %changelog
+* Sat Oct 17 2026 Emre Yıldız <eyildizemre@proton.me> - 0.2.0-1
+- Move folders inside the backup instead of copying them again
+
 * Fri Oct 16 2026 Emre Yıldız <eyildizemre@proton.me> - 0.1.2-1
 - Refuse to repair a journal written with another journal version
 - Speed up repairing a journal with many damaged regions
