@@ -9,7 +9,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define FUZZ_MAX_BOUNDARIES 64U
+#define FUZZ_MAX_BOUNDARIES 256U
 
 typedef struct {
     const char *name;
@@ -17,6 +17,7 @@ typedef struct {
     size_t size;
     // The outcome each harness must report, by fuzz_outcome()'s names.
     const char *parse_outcome;
+    const char *load_outcome;
     // Unedited writer output, so every prefix of it is what a killed process
     // leaves. boundaries holds the offset just past each record that ends a
     // group (ENTRY_COMMIT, DELETE, CLAIM); edited seeds have none.
