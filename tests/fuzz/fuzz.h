@@ -23,6 +23,7 @@ typedef struct {
     // per journal harness, or outcome in a set only one harness reads.
     const char *parse_outcome;
     const char *load_outcome;
+    const char *salvage_outcome;
     const char *outcome;
     // Unedited writer output, so every prefix of it is what a killed process
     // leaves. boundaries holds the offset just past each record that ends a

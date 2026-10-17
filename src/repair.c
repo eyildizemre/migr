@@ -327,6 +327,24 @@ static int salvage_journal(RepairSalvage *salvage, const unsigned char *data,
     return result;
 }
 
+#ifdef REPAIR_TEST_HOOKS
+int repair_test_salvage(SidecarLog *log, const unsigned char *data,
+                        size_t length, size_t *damaged_regions,
+                        size_t *rejected)
+{
+    RepairSalvage salvage;
+    memset(&salvage, 0, sizeof(salvage));
+    salvage.log = log;
+    salvage.fatal = SIDECAR_STATUS_OK;
+    salvage.source_data_fd = -1;
+    int result = salvage_journal(&salvage, data, length);
+    *damaged_regions = salvage.damaged_regions;
+    *rejected = salvage.rejected.count;
+    path_list_free(&salvage.rejected);
+    return result;
+}
+#endif
+
 typedef struct {
     SidecarClaim *items;
     size_t count;

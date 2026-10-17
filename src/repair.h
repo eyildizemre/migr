@@ -18,4 +18,18 @@
  */
 int repair_backup(const char *source, const char *dest_root);
 
+#ifdef REPAIR_TEST_HOOKS
+#include <stddef.h>
+
+#include "sidecar.h"
+
+/* Replays journal bytes into log the way repair_backup() does, without a
+ * manifest or payload, so open claims stay as they are. Returns 0 when the
+ * journal was replayed and -1 when it was refused; the counts say how many
+ * damaged regions were skipped and records rejected. */
+int repair_test_salvage(SidecarLog *log, const unsigned char *data,
+                        size_t length, size_t *damaged_regions,
+                        size_t *rejected);
+#endif
+
 #endif
