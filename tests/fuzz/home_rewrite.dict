@@ -1,0 +1,13 @@
+# libFuzzer dictionary for the home-path rewrite: the prefixes its pairs
+# start with and the bytes that end a path component.
+"file://"
+"file:///home/"
+"'/home/"
+"\"/home/"
+"/"
+" "
+"\x09"
+"\x0d"
+"\x0a"
+"'"
+"\""
