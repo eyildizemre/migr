@@ -1355,29 +1355,26 @@ static int logical_parent_copy(char *out, size_t out_size,
     return 0;
 }
 
-int portable_current_assignment(
-    const PortableCaptureContext *context, const PortableRootSpec *root,
-    const char *logical,
+int portable_assignment_for(
+    const PortableCollisionPlan *plan, const PortableCurrentSourceSet *source,
+    const char *root_id, const char *logical,
     char physical_leaf[SIDECAR_MAX_PHYSICAL_LEAF + 1U],
     char collision_suffix[SIDECAR_MAX_COLLISION_SUFFIX + 1U])
 {
-    if (context == NULL || root == NULL || logical == NULL ||
-        physical_leaf == NULL || collision_suffix == NULL ||
-        context->current_source == NULL || context->collision_plan == NULL)
+    if (plan == NULL || source == NULL || root_id == NULL ||
+        logical == NULL || physical_leaf == NULL || collision_suffix == NULL)
         return -1;
     physical_leaf[0] = '\0';
     collision_suffix[0] = '\0';
 
-    int present = portable_current_source_contains(context->current_source,
-                                                   root->id, logical);
+    int present = portable_current_source_contains(source, root_id, logical);
     if (present != 1)
         return -1;
     if (logical[0] == '\0')
         return 0;
 
     const PortableCollisionPlanEntry *planned =
-        portable_collision_plan_find(context->collision_plan, root->id,
-                                     logical);
+        portable_collision_plan_find(plan, root_id, logical);
     if (planned != NULL) {
         if (!safe_component(planned->physical_leaf) ||
             copy_text(physical_leaf, SIDECAR_MAX_PHYSICAL_LEAF + 1U,
@@ -1399,6 +1396,19 @@ int portable_current_assignment(
                   mapped.physical_leaf) != 0)
         return -1;
     return 0;
+}
+
+int portable_current_assignment(
+    const PortableCaptureContext *context, const PortableRootSpec *root,
+    const char *logical,
+    char physical_leaf[SIDECAR_MAX_PHYSICAL_LEAF + 1U],
+    char collision_suffix[SIDECAR_MAX_COLLISION_SUFFIX + 1U])
+{
+    if (context == NULL || root == NULL)
+        return -1;
+    return portable_assignment_for(context->collision_plan,
+                                   context->current_source, root->id, logical,
+                                   physical_leaf, collision_suffix);
 }
 
 static int recorded_state_copy(

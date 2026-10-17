@@ -57,73 +57,11 @@ typedef struct {
     SidecarStatus fatal;
 } RepairSalvage;
 
-static SidecarBytes bytes_copy(SidecarBytes bytes)
-{
-    unsigned char *copy = malloc(bytes.length + 1U);
-    if (copy == NULL)
-        return (SidecarBytes){ NULL, 0 };
-    if (bytes.length != 0)
-        memcpy(copy, bytes.data, bytes.length);
-    copy[bytes.length] = '\0';
-    return (SidecarBytes){ copy, bytes.length };
-}
-
-static void bytes_release(SidecarBytes *bytes)
-{
-    free((void *)bytes->data);
-    bytes->data = NULL;
-    bytes->length = 0;
-}
-
-static void entry_release(SidecarEntry *entry)
-{
-    bytes_release(&entry->root_id);
-    bytes_release(&entry->logical_path);
-    bytes_release(&entry->physical_leaf);
-    bytes_release(&entry->collision_suffix);
-    bytes_release(&entry->symlink_target);
-    bytes_release(&entry->hardlink_root_id);
-    bytes_release(&entry->hardlink_logical_path);
-}
-
-static int entry_copy(const SidecarEntry *source, SidecarEntry *out)
-{
-    *out = *source;
-    out->root_id = bytes_copy(source->root_id);
-    out->logical_path = bytes_copy(source->logical_path);
-    out->physical_leaf = bytes_copy(source->physical_leaf);
-    out->collision_suffix = bytes_copy(source->collision_suffix);
-    out->symlink_target = bytes_copy(source->symlink_target);
-    out->hardlink_root_id = bytes_copy(source->hardlink_root_id);
-    out->hardlink_logical_path = bytes_copy(source->hardlink_logical_path);
-    if (out->root_id.data == NULL || out->logical_path.data == NULL ||
-        out->physical_leaf.data == NULL || out->collision_suffix.data == NULL ||
-        out->symlink_target.data == NULL ||
-        out->hardlink_root_id.data == NULL ||
-        out->hardlink_logical_path.data == NULL)
-    {
-        entry_release(out);
-        errno = ENOMEM;
-        return -1;
-    }
-    return 0;
-}
-
-static void xattrs_release(SidecarXattr *xattrs, size_t count)
-{
-    for (size_t index = 0; index < count; index++)
-    {
-        bytes_release(&xattrs[index].name);
-        bytes_release(&xattrs[index].value);
-    }
-    free(xattrs);
-}
-
 static void pending_clear(RepairSalvage *salvage)
 {
     if (salvage->has_pending)
-        entry_release(&salvage->pending);
-    xattrs_release(salvage->xattrs, salvage->xattr_count);
+        sidecar_entry_dup_free(&salvage->pending);
+    sidecar_xattrs_dup_free(salvage->xattrs, salvage->xattr_count);
     salvage->xattrs = NULL;
     salvage->xattr_count = 0;
     salvage->has_pending = 0;
@@ -141,12 +79,12 @@ static int path_list_add(RepairPathList *list, SidecarBytes root,
         list->items = items;
         list->capacity = capacity;
     }
-    SidecarBytes root_copy = bytes_copy(root);
-    SidecarBytes path_copy = bytes_copy(path);
+    SidecarBytes root_copy = sidecar_bytes_dup(root);
+    SidecarBytes path_copy = sidecar_bytes_dup(path);
     if (root_copy.data == NULL || path_copy.data == NULL)
     {
-        bytes_release(&root_copy);
-        bytes_release(&path_copy);
+        sidecar_bytes_dup_free(&root_copy);
+        sidecar_bytes_dup_free(&path_copy);
         return -1;
     }
     list->items[list->count].root = (char *)root_copy.data;
@@ -217,7 +155,7 @@ static int salvage_record(const SidecarRecord *record, void *context)
                 record->value.deletion.logical_path);
         case SIDECAR_RECORD_ENTRY:
             pending_clear(salvage);
-            if (entry_copy(&record->value.entry, &salvage->pending) != 0)
+            if (sidecar_entry_dup(&record->value.entry, &salvage->pending) != 0)
             {
                 salvage->fatal = SIDECAR_STATUS_ALLOCATION;
                 return -1;
@@ -236,8 +174,8 @@ static int salvage_record(const SidecarRecord *record, void *context)
             }
             salvage->xattrs = xattrs;
             SidecarXattr *copy = &xattrs[salvage->xattr_count];
-            copy->name = bytes_copy(record->value.xattr.name);
-            copy->value = bytes_copy(record->value.xattr.value);
+            copy->name = sidecar_bytes_dup(record->value.xattr.name);
+            copy->value = sidecar_bytes_dup(record->value.xattr.value);
             salvage->xattr_count++;
             if (copy->name.data == NULL || copy->value.data == NULL)
             {
@@ -410,9 +348,9 @@ static int collect_claim(const SidecarClaimView *view, void *context)
     }
     SidecarClaim *copy = &claims->items[claims->count];
     copy->kind = view->claim->kind;
-    copy->root_id = bytes_copy(view->claim->root_id);
-    copy->logical_path = bytes_copy(view->claim->logical_path);
-    copy->physical_leaf = bytes_copy(view->claim->physical_leaf);
+    copy->root_id = sidecar_bytes_dup(view->claim->root_id);
+    copy->logical_path = sidecar_bytes_dup(view->claim->logical_path);
+    copy->physical_leaf = sidecar_bytes_dup(view->claim->physical_leaf);
     claims->count++;
     return copy->root_id.data == NULL || copy->logical_path.data == NULL ||
                    copy->physical_leaf.data == NULL
@@ -423,9 +361,9 @@ static void claims_free(RepairClaims *claims)
 {
     for (size_t index = 0; index < claims->count; index++)
     {
-        bytes_release(&claims->items[index].root_id);
-        bytes_release(&claims->items[index].logical_path);
-        bytes_release(&claims->items[index].physical_leaf);
+        sidecar_bytes_dup_free(&claims->items[index].root_id);
+        sidecar_bytes_dup_free(&claims->items[index].logical_path);
+        sidecar_bytes_dup_free(&claims->items[index].physical_leaf);
     }
     free(claims->items);
     memset(claims, 0, sizeof(*claims));
@@ -481,20 +419,10 @@ static int synthesize_directory_metadata(RepairSalvage *salvage,
             entry->xattr_count = (uint32_t)view.xattr_count;
             if (view.xattr_count == 0)
                 return 0;
-            SidecarXattr *xattrs = calloc(view.xattr_count, sizeof(*xattrs));
+            SidecarXattr *xattrs = sidecar_xattrs_dup(view.xattrs,
+                                                      view.xattr_count);
             if (xattrs == NULL)
                 return -1;
-            for (size_t index = 0; index < view.xattr_count; index++)
-            {
-                xattrs[index].name = bytes_copy(view.xattrs[index].name);
-                xattrs[index].value = bytes_copy(view.xattrs[index].value);
-                if (xattrs[index].name.data == NULL ||
-                    xattrs[index].value.data == NULL)
-                {
-                    xattrs_release(xattrs, index + 1U);
-                    return -1;
-                }
-            }
             *xattrs_out = xattrs;
             return 0;
         }
@@ -565,7 +493,7 @@ static int close_open_claims(RepairSalvage *salvage, FailedStep *failed)
             {
                 SidecarStatus status = sidecar_log_append_group(
                     salvage->log, &entry, xattrs);
-                xattrs_release(xattrs, entry.xattr_count);
+                sidecar_xattrs_dup_free(xattrs, entry.xattr_count);
                 if (status == SIDECAR_STATUS_OK)
                 {
                     if (path_list_add(&salvage->recreated, claim->root_id,
@@ -587,7 +515,7 @@ static int close_open_claims(RepairSalvage *salvage, FailedStep *failed)
                 }
             }
             else
-                xattrs_release(xattrs, entry.xattr_count);
+                sidecar_xattrs_dup_free(xattrs, entry.xattr_count);
         }
         SidecarDelete deletion = {
             .root_id = claim->root_id,

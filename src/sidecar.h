@@ -182,6 +182,14 @@ int sidecar_write_delete(int fd, const SidecarDelete *deletion);
  * utils' write_all(), so it links without the rest of migr. */
 int sidecar_write_all(int fd, const unsigned char *data, size_t length);
 int sidecar_write_claim(int fd, const SidecarClaim *claim);
+/* Owned copies of records the log only lends, each byte field NUL-terminated
+ * after its length. A failed copy leaves nothing to free; errno is ENOMEM. */
+SidecarBytes sidecar_bytes_dup(SidecarBytes bytes);
+void sidecar_bytes_dup_free(SidecarBytes *bytes);
+int sidecar_entry_dup(const SidecarEntry *source, SidecarEntry *out);
+void sidecar_entry_dup_free(SidecarEntry *entry);
+SidecarXattr *sidecar_xattrs_dup(const SidecarXattr *xattrs, size_t count);
+void sidecar_xattrs_dup_free(SidecarXattr *xattrs, size_t count);
 int sidecar_claim_kind_valid(SidecarObjectKind kind);
 int sidecar_physical_leaf_valid(SidecarBytes logical_path,
                                 SidecarBytes physical_leaf);

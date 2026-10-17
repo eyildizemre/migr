@@ -309,6 +309,12 @@ void manifest_free(Manifest *m);
  * (".bashrc"), else the last component of its source ("Desktop"), else its
  * id. */
 const char *manifest_root_label(const ManifestRoot *root);
+/* A root as its user names it: "~/rest" inside the home it was taken from,
+ * otherwise its absolute address. Built-in roots record a home-relative
+ * address and XDG roots an absolute one, so this is what compares a backup's
+ * roots with this run's, also when it was taken under another home (D86). */
+void manifest_root_user_path(const char *home, const ManifestRoot *root,
+                             char *out, size_t out_size);
 /* Records home as the source HOME when it is a normalized absolute path;
  * otherwise leaves none, as manifests written before D86 have none. */
 void manifest_set_source_home(Manifest *m, const char *home);

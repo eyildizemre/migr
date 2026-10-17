@@ -271,6 +271,88 @@ static int buffer_append_int(SidecarBuffer *buffer, int64_t value)
     return buffer_append_field(buffer, field);
 }
 
+SidecarBytes sidecar_bytes_dup(SidecarBytes bytes)
+{
+    unsigned char *copy = malloc(bytes.length + 1U);
+    if (copy == NULL)
+        return (SidecarBytes){ NULL, 0 };
+    if (bytes.length != 0)
+        memcpy(copy, bytes.data, bytes.length);
+    copy[bytes.length] = '\0';
+    return (SidecarBytes){ copy, bytes.length };
+}
+
+void sidecar_bytes_dup_free(SidecarBytes *bytes)
+{
+    free((void *)bytes->data);
+    bytes->data = NULL;
+    bytes->length = 0;
+}
+
+void sidecar_entry_dup_free(SidecarEntry *entry)
+{
+    sidecar_bytes_dup_free(&entry->root_id);
+    sidecar_bytes_dup_free(&entry->logical_path);
+    sidecar_bytes_dup_free(&entry->physical_leaf);
+    sidecar_bytes_dup_free(&entry->collision_suffix);
+    sidecar_bytes_dup_free(&entry->symlink_target);
+    sidecar_bytes_dup_free(&entry->hardlink_root_id);
+    sidecar_bytes_dup_free(&entry->hardlink_logical_path);
+}
+
+int sidecar_entry_dup(const SidecarEntry *source, SidecarEntry *out)
+{
+    *out = *source;
+    out->root_id = sidecar_bytes_dup(source->root_id);
+    out->logical_path = sidecar_bytes_dup(source->logical_path);
+    out->physical_leaf = sidecar_bytes_dup(source->physical_leaf);
+    out->collision_suffix = sidecar_bytes_dup(source->collision_suffix);
+    out->symlink_target = sidecar_bytes_dup(source->symlink_target);
+    out->hardlink_root_id = sidecar_bytes_dup(source->hardlink_root_id);
+    out->hardlink_logical_path =
+        sidecar_bytes_dup(source->hardlink_logical_path);
+    if (out->root_id.data == NULL || out->logical_path.data == NULL ||
+        out->physical_leaf.data == NULL || out->collision_suffix.data == NULL ||
+        out->symlink_target.data == NULL ||
+        out->hardlink_root_id.data == NULL ||
+        out->hardlink_logical_path.data == NULL)
+    {
+        sidecar_entry_dup_free(out);
+        errno = ENOMEM;
+        return -1;
+    }
+    return 0;
+}
+
+SidecarXattr *sidecar_xattrs_dup(const SidecarXattr *xattrs, size_t count)
+{
+    SidecarXattr *copy = calloc(count != 0 ? count : 1U, sizeof(*copy));
+    if (copy == NULL)
+        return NULL;
+    for (size_t index = 0; index < count; index++)
+    {
+        copy[index].name = sidecar_bytes_dup(xattrs[index].name);
+        copy[index].value = sidecar_bytes_dup(xattrs[index].value);
+        if (copy[index].name.data == NULL || copy[index].value.data == NULL)
+        {
+            sidecar_xattrs_dup_free(copy, index + 1U);
+            errno = ENOMEM;
+            return NULL;
+        }
+    }
+    return copy;
+}
+
+void sidecar_xattrs_dup_free(SidecarXattr *xattrs, size_t count)
+{
+    for (size_t index = 0; xattrs != NULL && index < count; index++)
+    {
+        sidecar_bytes_dup_free(&xattrs[index].name);
+        sidecar_bytes_dup_free(&xattrs[index].value);
+    }
+    free(xattrs);
+}
+
 int sidecar_write_all(int fd, const unsigned char *data, size_t length)
 {
     size_t written = 0;

@@ -50,6 +50,13 @@ int portable_physical_owner_for_node(
     const PortablePhysicalOwners *owners, const char *root_id,
     const char *logical_parent, int parent_fd, const char *requested_leaf,
     const struct stat *requested_stat, const PortablePhysicalOwner **out);
+/* The physical leaf and collision suffix this run's pre-scan gives the
+ * source item at logical in root_id; -1 when the pre-scan did not see it. */
+int portable_assignment_for(
+    const PortableCollisionPlan *plan, const PortableCurrentSourceSet *source,
+    const char *root_id, const char *logical,
+    char physical_leaf[SIDECAR_MAX_PHYSICAL_LEAF + 1U],
+    char collision_suffix[SIDECAR_MAX_COLLISION_SUFFIX + 1U]);
 int portable_current_assignment(
     const PortableCaptureContext *context, const PortableRootSpec *root,
     const char *logical,

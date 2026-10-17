@@ -1165,6 +1165,23 @@ const char *manifest_root_label(const ManifestRoot *root)
     return leaf[0] != '\0' ? leaf : root->id;
 }
 
+void manifest_root_user_path(const char *home, const ManifestRoot *root,
+                             char *out, size_t out_size)
+{
+    const char *rest = NULL;
+    if (root->policy == ROOT_POLICY_HOME_RELATIVE)
+        rest = root->source_path;
+    else if (home[0] != '\0' && path_covers(home, root->source_path))
+    {
+        rest = root->source_path + strlen(home);
+        rest += *rest == '/';
+    }
+    if (rest == NULL)
+        snprintf(out, out_size, "%s", root->source_path);
+    else
+        snprintf(out, out_size, "~%s%s", rest[0] != '\0' ? "/" : "", rest);
+}
+
 void manifest_set_source_home(Manifest *m, const char *home)
 {
     m->source_home[0] = '\0';

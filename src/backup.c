@@ -2207,27 +2207,6 @@ static void compact_journal(int container_fd)
     }
 }
 
-// A root as its user names it: "~/rest" inside the home it was taken from,
-// otherwise its absolute address. Built-in roots record a home-relative
-// address and XDG roots an absolute one, so this is what compares a backup's
-// roots with this run's, also when it was taken under another home (D86).
-static void root_user_path(const char *home, const ManifestRoot *root,
-                           char *out, size_t out_size)
-{
-    const char *rest = NULL;
-    if (root->policy == ROOT_POLICY_HOME_RELATIVE)
-        rest = root->source_path;
-    else if (home[0] != '\0' && path_covers(home, root->source_path))
-    {
-        rest = root->source_path + strlen(home);
-        rest += *rest == '/';
-    }
-    if (rest == NULL)
-        snprintf(out, out_size, "%s", root->source_path);
-    else
-        snprintf(out, out_size, "~%s%s", rest[0] != '\0' ? "/" : "", rest);
-}
-
 // The bytes of the regular files at or below dir_fd/name, whose links are not
 // followed; 0 when it is missing. Only shown, so a tree it cannot read or
 // deeper than 256 levels counts as far as it got.
@@ -2310,8 +2289,8 @@ static int print_update_removals(int dest_fd, const char *target,
     if (resolve_target_home(home) != 0)
         home[0] = '\0';
     for (int j = 0; j < plan->root_count; j++)
-        root_user_path(home, &plan->roots[j].manifest_root, selected[j],
-                       sizeof(selected[j]));
+        manifest_root_user_path(home, &plan->roots[j].manifest_root,
+                                selected[j], sizeof(selected[j]));
     int data_fd = openat(container_fd, "data", O_RDONLY | O_DIRECTORY |
                                                O_NOFOLLOW | O_CLOEXEC);
 
@@ -2320,7 +2299,8 @@ static int print_update_removals(int dest_fd, const char *target,
     {
         const ManifestRoot *root = &previous.roots[i];
         char path[PATH_MAX + 2];
-        root_user_path(previous.source_home, root, path, sizeof(path));
+        manifest_root_user_path(previous.source_home, root, path,
+                                sizeof(path));
         int kept = 0;
         for (int j = 0; j < plan->root_count && !kept; j++)
             kept = path_covers(selected[j], path);
