@@ -260,9 +260,22 @@ int packages_at(int container_fd, const char *leaf)
     return write_result;
 }
 
+static int ends_with(const char *text, size_t length, const char *suffix)
+{
+    size_t suffix_length = strlen(suffix);
+    return length >= suffix_length &&
+           strcmp(text + length - suffix_length, suffix) == 0;
+}
+
 int package_token_is_safe(const char *token)
 {
-    return token != NULL && token[0] != '\0' && token[0] != '-';
+    if (token == NULL || token[0] == '\0' || strchr("@.+:-", token[0]) != NULL)
+        return 0;
+    size_t length = strlen(token);
+    return strspn(token, "abcdefghijklmnopqrstuvwxyz"
+                         "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@._+:-") ==
+               length &&
+           !ends_with(token, length, ".rpm") && !ends_with(token, length, ".deb");
 }
 
 void read_package_list(FILE *pkg_file, char ***pkgs_out, int *pkg_count_out,
@@ -295,9 +308,9 @@ void read_package_list(FILE *pkg_file, char ***pkgs_out, int *pkg_count_out,
         if (tab != NULL && strncmp(tab + 1, "install", 7) != 0)
             continue;
 
-        // Current backups never emit option-shaped names. Treat one as an
-        // invalid entry instead of allowing restored data to alter the
-        // privileged package-manager command line.
+        // Backups only ever write plain names. Anything else is an invalid
+        // entry, never something the privileged package-manager command
+        // line could take for an option or a package file.
         if (!package_token_is_safe(pkg_name))
             continue;
 

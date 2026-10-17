@@ -188,6 +188,10 @@ int main(void)
     check(rc == 0 && strlen(tail) == sizeof(tail) - 1U &&
               strcmp(tail + strlen(tail) - 10, "2999\n3000\n") == 0,
           "errors longer than the buffer keep their end");
+    char *const pwd_argv[] = { "sh", "-c", "pwd >&2", NULL };
+    rc = run_command_errors(pwd_argv, errors, sizeof(errors));
+    check(rc == 0 && strcmp(errors, "/\n") == 0,
+          "the command runs in /, not in the caller's working directory");
     check(run_command_errors(true_argv, NULL, sizeof(errors)) == -1 &&
               run_command_errors(true_argv, errors, 0) == -1,
           "a missing errors buffer is rejected before anything is spawned");

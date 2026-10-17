@@ -4875,7 +4875,7 @@ int run_command_errors(char *const argv[], char *errors, size_t errors_size)
         // No stdio until exec, as in run_command().
         int null_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
         if (null_fd < 0 || dup2(null_fd, STDOUT_FILENO) < 0 ||
-            dup2(pipefd[1], STDERR_FILENO) < 0)
+            dup2(pipefd[1], STDERR_FILENO) < 0 || chdir("/") != 0)
             _exit(1);
         execvp(argv[0], argv);
         _exit(1);

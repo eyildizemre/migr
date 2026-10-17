@@ -91,10 +91,13 @@ int packages_clear_at(int container_fd, const char *leaf);
  * @brief Reports whether a package name is safe to use as a package-manager
  * argv element.
  *
- * Real backups only ever write plain names (docs/DECISIONS.md D12); a token
- * beginning with '-' would otherwise be interpreted by apt-get/dnf/pacman as
- * an option rather than a package name when it reaches the privileged install
- * invocation. Exposed for direct testing.
+ * Real backups only ever write plain names (docs/DECISIONS.md D12), and
+ * group names pass through the same list reader. Anything else reaching the
+ * privileged install invocation would change what it does: a token
+ * beginning with '-' is an option, and apt-get and dnf take a path, a URL, or
+ * a name ending in .rpm as a package file to install. So a name begins with
+ * a letter, a digit, or '_', holds only those and "@.+:-", and does not end
+ * in .rpm or .deb. Exposed for direct testing.
  *
  * @param token NUL-terminated candidate package name; NULL is rejected.
  * @return 1 if safe to use as an argv element, 0 otherwise.

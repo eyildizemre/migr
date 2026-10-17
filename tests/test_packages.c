@@ -559,6 +559,38 @@ static void test_option_shaped_tokens(void)
     fclose(stream);
 }
 
+// apt-get and dnf install a path, a URL, or a name ending in .rpm as a
+// package file; only names from the target's repositories may reach them.
+static void test_only_plain_names_are_read(void)
+{
+    FILE *stream = fixture_stream(
+        "vim\n/tmp/x.rpm\nhttps://example.invalid/x.rpm\n./x.deb\nx.rpm\n"
+        "x.deb\n@group\n.hidden\n+plus\n:colon\nglob*\npkg(x86-64)\n"
+        "libc6:i386\ng++\npython3.12\nlib32-gcc-libs\nfont@2x\n_ssh\n");
+    check(stream != NULL, "fixture: package list with files and URLs opens");
+    if (stream == NULL)
+        return;
+
+    char **pkgs = NULL;
+    int pkg_count = 0;
+    int had_error = 0;
+    read_package_list(stream, &pkgs, &pkg_count, &had_error);
+
+    static const char *const kept[] = {
+        "vim", "libc6:i386", "g++", "python3.12", "lib32-gcc-libs", "font@2x",
+        "_ssh"
+    };
+    int same = pkg_count == (int)(sizeof(kept) / sizeof(*kept));
+    for (int i = 0; same && i < pkg_count; i++)
+        same = strcmp(pkgs[i], kept[i]) == 0;
+    check(had_error == 0 && same,
+          "paths, URLs, package files, and other specs never enter the list; "
+          "plain names do");
+
+    free_package_list(pkgs, pkg_count);
+    fclose(stream);
+}
+
 static void test_growth(void)
 {
     FILE *stream = tmpfile();
@@ -1765,6 +1797,7 @@ int main(void)
     test_normal_list();
     test_legacy_status_list();
     test_option_shaped_tokens();
+    test_only_plain_names_are_read();
     test_growth();
     test_stream_error();
 

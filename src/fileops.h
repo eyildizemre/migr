@@ -568,6 +568,10 @@ int run_command(char *const argv[]);
  *        standard error kept: the last errors_size - 1 bytes of it, always
  *        NUL-terminated, for the caller to show when the command fails.
  *
+ * The command runs in /, so a package name that a package manager would
+ * take for a file in its working directory names no file anyone but root
+ * could have put there.
+ *
  * @return The child's exit status, or -1 if the arguments are invalid or
  *         pipe, fork, or waitpid fails.
  */
