@@ -1,0 +1,19 @@
+# libFuzzer dictionary for the name codecs and checks: escapes, the
+# collision suffix and shortening marker, and the bytes the component and
+# path rules turn on.
+"%"
+"%7E"
+"%7E1"
+"%7EH"
+"%2E"
+"%2F"
+"%25"
+"%00"
+"%c3%a7"
+"\xc3\xa7"
+"~"
+"/"
+"."
+".."
+"\x00"
+"18446744073709551615"
