@@ -71,4 +71,9 @@ int home_rewrite_file_at(int dir_fd, const char *path,
  * times. */
 int home_rewrite_replace_at(int dir_fd, const char *path, int content_fd);
 
+#ifdef HOME_REWRITE_TEST_HOOKS
+/* The buffer positions the prefix search has examined so far. */
+uint64_t home_rewrite_test_scanned_positions(void);
+#endif
+
 #endif

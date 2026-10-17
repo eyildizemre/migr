@@ -452,8 +452,12 @@ repair_test.o: src/repair.c
 $(FUZZ_REPLAY_REPAIR_SALVAGE): tests/fuzz/fuzz_repair_salvage.c $(FUZZ_JOURNAL_SEEDS) $(FUZZ_REPLAY_SOURCES) $(call with_hooks,repair_test.o)
 	$(CC) $(CFLAGS) -DREPAIR_TEST_HOOKS -o $@ $(filter %.c %.o,$^)
 
-$(FUZZ_REPLAY_HOME_REWRITE): tests/fuzz/fuzz_home_rewrite.c tests/fuzz/seeds_home_rewrite.c $(FUZZ_REPLAY_SOURCES) $(LIB_OBJS)
-	$(CC) $(CFLAGS) -o $@ $(filter %.c %.o,$^)
+home_rewrite_test.o: src/home_rewrite.c
+	$(CC) $(CFLAGS) $(DEPFLAGS) -DHOME_REWRITE_TEST_HOOKS -c src/home_rewrite.c -o $@
+
+# The hook build counts the positions the prefix search examines.
+$(FUZZ_REPLAY_HOME_REWRITE): tests/fuzz/fuzz_home_rewrite.c tests/fuzz/seeds_home_rewrite.c $(FUZZ_REPLAY_SOURCES) $(call with_hooks,home_rewrite_test.o)
+	$(CC) $(CFLAGS) -DHOME_REWRITE_TEST_HOOKS -o $@ $(filter %.c %.o,$^)
 
 test: $(TEST_NATIVE_SELECTION) $(TEST_MANIFEST_SELECTION) $(TEST_PORTABLE_SELECTION) $(TEST_SELECTION) $(TEST_CONFIG) $(TARGET) $(TEST_DETECT) $(TEST_REPORT) $(TEST_PATHJOIN) $(TEST_FD_LIMIT) $(TEST_CONFIRM) $(TEST_PACKAGES) $(TEST_XDG) $(TEST_GET_DIR_SIZE) $(TEST_RUN_COMMAND) $(TEST_SPECIAL_FILES) $(TEST_FSPROBE) $(TEST_MANIFEST) $(TEST_ENCODING) $(TEST_PORTABLE_NAME) $(TEST_CONTAINER) $(TEST_SELFCOPY) $(TEST_CONSOLE) $(TEST_SUBID) $(TEST_PODMAN_STATE) $(TEST_RESTORE_NATIVE) $(TEST_RESTORE_SYNC) $(TEST_RESTORE_SOURCE_READ) $(TEST_BACKUP_SOURCE_READ) $(TEST_VSCODE_CAPTURE) $(TEST_DCONF_RESTORE) $(TEST_LIVE_STATE) $(TEST_VERIFY) $(TEST_REPAIR) $(TEST_SOURCE_SNAPSHOT) $(TEST_MIGR_UNPRIVILEGED) $(TEST_BACKUP_SYNC) $(TEST_RESTORE_DISPATCH) $(TEST_RESTORE_ATIME) $(TEST_BACKUP_PLAN) $(TEST_METADATA_CONTRACT) $(TEST_METADATA_SNAPSHOTS) $(TEST_SIDECAR) $(TEST_SIDECAR_STATE) $(TEST_SIDECAR_SCALE) $(TEST_PORTABLE_HASHSET) $(TEST_PORTABLE_CAPTURE) $(TEST_PORTABLE_CAPTURE_SCALE) $(TEST_PORTABLE_PREPARE) $(TEST_NATIVE_RECONCILE_SCALE) $(TEST_NATIVE_HARDLINK_SCALE) $(TEST_PORTABLE_COLLISION_SCALE) $(TEST_PORTABLE_HARDLINK_SCALE) $(TEST_PORTABLE_RESUME) $(TEST_PORTABLE_RECONCILE) $(TEST_PORTABLE_RECONCILE_SCALE) $(TEST_PORTABLE_RESTORE_PREFLIGHT) $(TEST_PORTABLE_RESTORE_REPLAY) $(TEST_PORTABLE_RESTORE_ORCHESTRATE) $(TEST_PORTABLE_RESTORE_INVARIANT) $(FUZZ_REPLAY_SIDECAR_PARSE) $(FUZZ_REPLAY_SIDECAR_LOAD) $(FUZZ_REPLAY_SIDECAR_ROUNDTRIP) $(FUZZ_REPLAY_NAMES) $(FUZZ_REPLAY_REPAIR_SALVAGE) $(FUZZ_REPLAY_HOME_REWRITE)
 	./$(TEST_DETECT)
@@ -633,6 +637,10 @@ $(FUZZ_OBJ_DIR)/repair_test.o: src/repair.c
 	@mkdir -p $(FUZZ_OBJ_DIR)
 	$(FUZZ_CC) $(FUZZ_FLAGS) -fsanitize=fuzzer-no-link -DREPAIR_TEST_HOOKS -c $< -o $@
 
+$(FUZZ_OBJ_DIR)/home_rewrite_test.o: src/home_rewrite.c
+	@mkdir -p $(FUZZ_OBJ_DIR)
+	$(FUZZ_CC) $(FUZZ_FLAGS) -fsanitize=fuzzer-no-link -DHOME_REWRITE_TEST_HOOKS -c $< -o $@
+
 $(FUZZ_OBJ_DIR)/fuzz_sidecar_parse: tests/fuzz/fuzz_sidecar_parse.c tests/fuzz/fuzz.h $(addprefix $(FUZZ_OBJ_DIR)/,$(LIB_OBJS))
 	$(FUZZ_CC) $(FUZZ_FLAGS) -fsanitize=fuzzer -o $@ $(filter %.c %.o,$^)
 
@@ -648,8 +656,8 @@ $(FUZZ_OBJ_DIR)/fuzz_names: tests/fuzz/fuzz_names.c tests/fuzz/fuzz.h $(addprefi
 $(FUZZ_OBJ_DIR)/fuzz_repair_salvage: tests/fuzz/fuzz_repair_salvage.c tests/fuzz/fuzz.h $(addprefix $(FUZZ_OBJ_DIR)/,$(call with_hooks,repair_test.o))
 	$(FUZZ_CC) $(FUZZ_FLAGS) -fsanitize=fuzzer -DREPAIR_TEST_HOOKS -o $@ $(filter %.c %.o,$^)
 
-$(FUZZ_OBJ_DIR)/fuzz_home_rewrite: tests/fuzz/fuzz_home_rewrite.c tests/fuzz/fuzz.h $(addprefix $(FUZZ_OBJ_DIR)/,$(LIB_OBJS))
-	$(FUZZ_CC) $(FUZZ_FLAGS) -fsanitize=fuzzer -o $@ $(filter %.c %.o,$^)
+$(FUZZ_OBJ_DIR)/fuzz_home_rewrite: tests/fuzz/fuzz_home_rewrite.c tests/fuzz/fuzz.h $(addprefix $(FUZZ_OBJ_DIR)/,$(call with_hooks,home_rewrite_test.o))
+	$(FUZZ_CC) $(FUZZ_FLAGS) -fsanitize=fuzzer -DHOME_REWRITE_TEST_HOOKS -o $@ $(filter %.c %.o,$^)
 
 fuzz-toolchain:
 	@printf 'int LLVMFuzzerTestOneInput(const unsigned char *d, unsigned long n) { (void)d; (void)n; return 0; }\n' | \

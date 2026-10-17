@@ -19,6 +19,11 @@
 // - Memory safety, from the sanitizers or Valgrind.
 // - The streamed output equals the whole-buffer output for any chunking.
 // - The copy's digests are those of the bytes it wrote and read.
+// - The prefix search stays linear: each pair examines a buffer's positions
+//   at most twice, once to find its first match and once more across the
+//   searches that resume past the matches the cursor overtakes. A stream's
+//   buffers are its reads plus the tail each carries, at most the longest
+//   source, into the next.
 
 #define _GNU_SOURCE
 
@@ -58,6 +63,14 @@ static void fail(const char *what)
     abort();
 }
 
+static void check_scanned(uint64_t before, size_t pair_count,
+                          size_t buffered)
+{
+    uint64_t scanned = home_rewrite_test_scanned_positions() - before;
+    if (scanned > 2U * (uint64_t)pair_count * buffered)
+        fail("the prefix search grows faster than the text");
+}
+
 static size_t take_number(Input *input, size_t width)
 {
     size_t value = 0;
@@ -91,9 +104,10 @@ static unsigned char *stream_copy(const char *text, size_t length,
     if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sockets) != 0)
         fail("cannot create a socket pair");
     size_t sent = 0;
-    for (size_t index = 0; sent < length; index++)
+    size_t messages = 0;
+    for (; sent < length; messages++)
     {
-        size_t chunk = index < chunk_count ? chunks[index] : MAX_CHUNK;
+        size_t chunk = messages < chunk_count ? chunks[messages] : MAX_CHUNK;
         if (chunk > length - sent)
             chunk = length - sent;
         if (send(sockets[0], text + sent, chunk, 0) != (ssize_t)chunk)
@@ -104,10 +118,17 @@ static unsigned char *stream_copy(const char *text, size_t length,
 
     int out = memfd_create("fuzz-rewrite", MFD_CLOEXEC);
     uint64_t digest = 0, source_digest = 0;
+    uint64_t before = home_rewrite_test_scanned_positions();
     if (out < 0 ||
         home_rewrite_copy(sockets[1], out, (off_t)length, pairs, pair_count,
                           NULL, &digest, &source_digest) != 0)
         fail("the streamed copy fails");
+    // One read per message, and the one that meets the end.
+    size_t longest = 0;
+    for (size_t pair = 0; pair < pair_count; pair++)
+        if (pairs[pair].source_uri_length > longest)
+            longest = pairs[pair].source_uri_length;
+    check_scanned(before, pair_count, length + (messages + 1U) * longest);
     off_t size = lseek(out, 0, SEEK_CUR);
     unsigned char *written = malloc(size > 0 ? (size_t)size : 1U);
     if (size < 0 || written == NULL ||
@@ -153,10 +174,12 @@ static const char *check_input(const uint8_t *data, size_t size)
         return "skipped";
 
     char *whole_text = strndup(text, length);
+    uint64_t before = home_rewrite_test_scanned_positions();
     char *expected = whole_text != NULL
         ? home_rewrite_text(whole_text, pairs, pair_count) : NULL;
     if (expected == NULL)
         fail("the whole-buffer rewrite fails");
+    check_scanned(before, pair_count, length);
     size_t streamed_length;
     unsigned char *streamed = stream_copy(text, length, chunks, chunk_count,
                                           pairs, pair_count,

@@ -152,6 +152,19 @@ static void build_whole(FuzzSeed *seeds, size_t *count)
     add(seeds, count, "self-overlapping-source", "changed", repeating,
         COUNT(repeating), NULL, 0, "/x/xx/x/x\n");
 
+    // Many matches of one pair while another never matches: searching
+    // every pair again after each match made the rewrite quadratic.
+    static const Pair one_absent[] = {
+        { "file:///home/old/Absent", "file:///home/new/Absent" },
+        { "file:///home/old", "file:///home/new" }
+    };
+    static char dense[400U * 20U + 1U];
+    for (size_t line = 0; line < 400U; line++)
+        memcpy(dense + line * 20U, "file:///home/old/ab\n", 20);
+    dense[sizeof(dense) - 1U] = '\0';
+    add(seeds, count, "dense-matches", "changed", one_absent,
+        COUNT(one_absent), NULL, 0, dense);
+
     const Pair longest[] = { { longest_source(), "file:///short" } };
     static char long_text[URI_MAX + 3U];
     snprintf(long_text, sizeof(long_text), "%s/\n", longest_source());

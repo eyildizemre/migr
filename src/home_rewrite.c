@@ -140,6 +140,25 @@ static int write_all_hashed(int fd, const unsigned char *data, size_t length,
     return 0;
 }
 
+#ifdef HOME_REWRITE_TEST_HOOKS
+static uint64_t test_scanned_positions;
+
+static void count_scanned(size_t positions)
+{
+    test_scanned_positions += positions;
+}
+
+uint64_t home_rewrite_test_scanned_positions(void)
+{
+    return test_scanned_positions;
+}
+#else
+static void count_scanned(size_t positions)
+{
+    (void)positions;
+}
+#endif
+
 static size_t bytes_find(const unsigned char *haystack,
                          size_t haystack_length, const unsigned char *needle,
                          size_t needle_length)
@@ -150,7 +169,11 @@ static size_t bytes_find(const unsigned char *haystack,
     for (size_t index = 0; index <= limit; index++)
         if (haystack[index] == needle[0] &&
             memcmp(haystack + index, needle, needle_length) == 0)
+        {
+            count_scanned(index + 1U);
             return index;
+        }
+    count_scanned(limit + 1U);
     return SIZE_MAX;
 }
 
@@ -171,7 +194,8 @@ static int rewrite_flush(
     size_t *consumed_out, uint64_t *hash)
 {
     if (destination_fd < 0 || buffer == NULL || pairs == NULL ||
-        pair_count == 0 || consumed_out == NULL)
+        pair_count == 0 || pair_count > HOME_REWRITE_DCONF_MAX_PAIRS ||
+        consumed_out == NULL)
     {
         errno = EINVAL;
         return -1;
@@ -195,6 +219,14 @@ static int rewrite_flush(
     size_t safe_start = final ? length :
         (length > max_source_uri_length ?
              length - max_source_uri_length : 0U);
+    /* Each pair's first match at or after the cursor, SIZE_MAX for none.
+     * The cursor only moves forward, so a pair is searched again only once
+     * the cursor passes its match, and each pair scans the buffer about
+     * once rather than once per replacement. */
+    size_t next_match[HOME_REWRITE_DCONF_MAX_PAIRS];
+    for (size_t index = 0; index < pair_count; index++)
+        next_match[index] = bytes_find(buffer, length, pairs[index].source_uri,
+                                       pairs[index].source_uri_length);
     size_t cursor = 0;
     while (cursor < length)
     {
@@ -204,12 +236,17 @@ static int rewrite_flush(
         for (size_t index = 0; index < pair_count; index++)
         {
             const HomeRewritePair *pair = &pairs[index];
-            size_t relative = bytes_find(
-                buffer + cursor, length - cursor,
-                pair->source_uri, pair->source_uri_length);
-            if (relative == SIZE_MAX)
+            if (next_match[index] != SIZE_MAX && next_match[index] < cursor)
+            {
+                size_t relative = bytes_find(
+                    buffer + cursor, length - cursor,
+                    pair->source_uri, pair->source_uri_length);
+                next_match[index] = relative == SIZE_MAX
+                    ? SIZE_MAX : cursor + relative;
+            }
+            size_t match = next_match[index];
+            if (match == SIZE_MAX)
                 continue;
-            size_t match = cursor + relative;
             if (!final && match >= safe_start)
                 continue;
             size_t after = match + pair->source_uri_length;
