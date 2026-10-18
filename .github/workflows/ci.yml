@@ -1,10 +1,11 @@
 name: CI
 
-# Every run takes the suite as root, the suite on other distributions, and
-# every gate of `make check` in a clean Fedora: a fresh machine finds what
-# the developer's own one hides. Pushes that change nothing the build or the
-# tests read (the same files the pre-commit hook looks at) are skipped, and so
-# are tag pushes: a tag names a commit that already ran here from main.
+# Every run takes the suite as root, the suite on other distributions,
+# every gate of `make check` in a clean Fedora, and the fault sweep: a fresh
+# machine finds what the developer's own one hides. Pushes that change
+# nothing the build or the tests read (the same files the pre-commit hook
+# looks at) are skipped, and so are tag pushes: a tag names a commit that
+# already ran here from main.
 on:
   push:
     branches: ['**']
@@ -77,3 +78,13 @@ jobs:
       - uses: actions/checkout@v7
       - name: make check
         run: .github/scripts/run-as-builder.sh make check
+
+  fault-sweep:
+    name: Fault sweep (Ubuntu, root)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the tools the portable scenarios use
+        run: sudo apt-get update && sudo apt-get install -y dosfstools
+      - name: make fault-sweep as root
+        run: sudo env -u SUDO_UID make fault-sweep
