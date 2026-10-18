@@ -1753,6 +1753,75 @@ static void test_native_identity_graph_keeps_nested_mount_views_route_specific(v
     remove_tree(home);
 }
 
+// The destination's own folder bound below itself, at loop/back: a path
+// through it leads back to where it started, which no order can create.
+static int run_destination_cycle_graph_case(const char *destination)
+{
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid < 0)
+    {
+        perror("fork");
+        exit(1);
+    }
+    if (pid == 0)
+    {
+        char back[PATH_MAX];
+        join_path(back, sizeof(back), destination, "loop/back");
+        if (setup_bind_mount_namespace() != 0 ||
+            mount(destination, back, NULL, MS_BIND, NULL) != 0)
+            _exit(CHILD_SKIP);
+        int anchor_fd = open(destination, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (anchor_fd < 0)
+            _exit(1);
+
+        DestinationIdentityGraph graph;
+        destination_identity_graph_init(&graph,
+                                        DESTINATION_IDENTITY_NATIVE_BOUNDS);
+        DestinationIdentityPlacement placement;
+        size_t conflicting_owner;
+        DestinationIdentityNameConflict name_conflict;
+        DestinationIdentityStatus added = destination_identity_graph_add(
+            &graph, anchor_fd, "loop/back/file",
+            DESTINATION_IDENTITY_NON_DIRECTORY, 1, &placement,
+            &conflicting_owner, &name_conflict);
+        DestinationIdentityStatus finalized =
+            added == DESTINATION_IDENTITY_OK
+                ? destination_identity_graph_finalize(&graph)
+                : added;
+        destination_identity_graph_free(&graph);
+        close(anchor_fd);
+        _exit(finalized == DESTINATION_IDENTITY_CYCLE ? 0 : 1);
+    }
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0)
+    {
+        perror("waitpid");
+        exit(1);
+    }
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+static void test_native_identity_graph_refuses_a_cycle(void)
+{
+    printf(BLUE "::" NC " native restore identity graph: a destination bound below itself is a cycle\n");
+
+    char destination[PATH_MAX], back[PATH_MAX];
+    fresh_mkdtemp(destination, sizeof(destination), "dispatch_mount_cycle");
+    join_path(back, sizeof(back), destination, "loop/back");
+    mkdir_p(back);
+
+    int rc = run_destination_cycle_graph_case(destination);
+    if (rc == CHILD_SKIP)
+        skip_case("destination bound below itself",
+                  "user namespace or bind mounts are unavailable");
+    else
+        check(rc == 0, "ordering the destination folders refuses the cycle");
+
+    remove_tree(destination);
+}
+
 static void test_versioned_restore_refuses_differing_mount_id_aliases(void)
 {
     printf(BLUE "::" NC " restore dispatch: differing mount ids do not make aliases disjoint\n");
@@ -5256,6 +5325,7 @@ int main(void)
     test_unprivileged_restore_reaches_package_install();
 #endif
     test_native_identity_graph_keeps_nested_mount_views_route_specific();
+    test_native_identity_graph_refuses_a_cycle();
     test_versioned_restore_refuses_differing_mount_id_aliases();
     test_versioned_restore_refuses_destination_alias_collisions();
     test_versioned_restore_identity_order_and_cross_root_hardlinks();
