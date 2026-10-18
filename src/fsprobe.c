@@ -8,6 +8,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <limits.h>
+#include <signal.h>
 #include <sys/xattr.h>
 #include <time.h>
 
@@ -433,9 +434,69 @@ static FsCapabilityResult probe_timestamps_dirfd(int dir_fd, int *nsec_exact)
     return result;
 }
 
+// The pid in a probe folder's name: prefix, the pid, and optionally _ and a
+// number. 0 for any other name.
+static long probe_dir_pid(const char *name, const char *prefix)
+{
+    size_t prefix_length = strlen(prefix);
+    if (strncmp(name, prefix, prefix_length) != 0)
+        return 0;
+    const char *cursor = name + prefix_length;
+    long pid = 0;
+    for (; *cursor >= '0' && *cursor <= '9'; cursor++)
+    {
+        if (pid > (LONG_MAX - 9) / 10)
+            return 0;
+        pid = pid * 10 + (*cursor - '0');
+    }
+    if (*cursor == '_')
+    {
+        const char *digits = ++cursor;
+        while (*cursor >= '0' && *cursor <= '9')
+            cursor++;
+        if (cursor == digits)
+            return 0;
+    }
+    return *cursor == '\0' ? pid : 0;
+}
+
+// A probe whose cleanup failed leaves its folder behind under its process's
+// pid, which no later run has; the next probe of the same root removes it
+// once that process is gone. This is best effort: the probe does not depend
+// on it.
+static void remove_stale_probe_dirs(int root_fd, const char *prefix)
+{
+    // A descriptor of its own: a duplicate would share root_fd's position.
+    int fd = openat(root_fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    DIR *dir = fd >= 0 ? fdopendir(fd) : NULL;
+    if (dir == NULL)
+    {
+        if (fd >= 0)
+            close(fd);
+        return;
+    }
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL)
+    {
+        long pid = probe_dir_pid(entry->d_name, prefix);
+        if (pid <= 0 || (pid_t)pid != pid)
+            continue;
+        // A process that runs, even one this user may not signal, may still
+        // be probing.
+        if (kill((pid_t)pid, 0) == 0 || errno != ESRCH)
+            continue;
+        struct stat st;
+        if (fstatat(root_fd, entry->d_name, &st, AT_SYMLINK_NOFOLLOW) == 0 &&
+            S_ISDIR(st.st_mode))
+            (void)fileops_remove_tree_at(root_fd, entry->d_name);
+    }
+    closedir(dir);
+}
+
 static int create_unique_probe_dir(int root_fd, const char *prefix,
                                    char *name_out, size_t name_out_size)
 {
+    remove_stale_probe_dirs(root_fd, prefix);
     for (unsigned int suffix = 0; suffix < 1000; suffix++)
     {
         int n = suffix == 0

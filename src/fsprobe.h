@@ -43,7 +43,8 @@ typedef struct {
  * Creates a private temporary subdirectory directly under existing_root (never
  * /tmp, so the probe measures the actual destination), exercises each capability
  * with a create -> read-back -> delete round-trip, and removes every artifact.
- * Fills *out with a per-capability result.
+ * Fills *out with a per-capability result. First it removes what an earlier
+ * probe of this root left behind, once that probe's process is gone.
  *
  * The probe only measures; it makes no native/portable decision and prints
  * nothing. The verdict is left to select_representation().
@@ -74,7 +75,8 @@ int fsprobe_fd(int root_fd, FsCapabilityProfile *out);
  *
  * The probe creates and removes a private child directory below root_fd and
  * performs the same regular-file and directory seconds/order round-trip as
- * fsprobe(), without constructing a full pathname.
+ * fsprobe(), without constructing a full pathname. Like fsprobe(), it first
+ * removes what an earlier one left behind.
  */
 int fsprobe_timestamps_fd(int root_fd, int *nsec_exact);
 

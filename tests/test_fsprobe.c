@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "fsprobe.h"
@@ -116,6 +117,94 @@ static void test_fsprobe_fd_is_anchored(char *root)
     check(mkdir(root, 0700) == 0, "fixture: recreate the probe root for later checks");
 }
 
+// A pid no process has: a child's, once it has been waited for.
+static pid_t dead_pid(void)
+{
+    pid_t child = fork();
+    if (child == 0)
+        _exit(0);
+    if (child > 0)
+        (void)waitpid(child, NULL, 0);
+    return child;
+}
+
+static int make_at(int dir_fd, const char *name, int directory)
+{
+    if (directory)
+        return mkdirat(dir_fd, name, 0700);
+    int fd = openat(dir_fd, name, O_CREAT | O_WRONLY | O_EXCL | O_CLOEXEC,
+                    0600);
+    return fd >= 0 ? close(fd) : -1;
+}
+
+static int exists_at(int dir_fd, const char *name)
+{
+    struct stat st;
+    return fstatat(dir_fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0;
+}
+
+static void test_stale_probes_removed(const char *root)
+{
+    printf(BLUE "::" NC " fsprobe: a probe removes what one of a gone process left\n");
+
+    int root_fd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    pid_t dead = dead_pid();
+    check(root_fd >= 0 && dead > 0, "fixture: open the root and find a gone pid");
+    if (root_fd < 0 || dead <= 0)
+    {
+        if (root_fd >= 0)
+            close(root_fd);
+        return;
+    }
+
+    char stale[64], stale_suffixed[64], stale_ts[64], live[64], other[64],
+        not_dir[64], nested[128];
+    snprintf(stale, sizeof(stale), ".migr-probe-fd-%ld", (long)dead);
+    snprintf(stale_suffixed, sizeof(stale_suffixed), ".migr-probe-fd-%ld_2",
+             (long)dead);
+    snprintf(stale_ts, sizeof(stale_ts), ".migr_ts_%ld", (long)dead);
+    snprintf(live, sizeof(live), ".migr-probe-fd-%ld_7", (long)getpid());
+    snprintf(other, sizeof(other), ".migr-probe-fd-%ldx", (long)dead);
+    snprintf(not_dir, sizeof(not_dir), ".migr_ts_%ld_1", (long)dead);
+    snprintf(nested, sizeof(nested), "%s/timestamp_dir", stale);
+    char nested_file[160];
+    snprintf(nested_file, sizeof(nested_file), "%s/file", nested);
+    char stale_ts_file[80];
+    snprintf(stale_ts_file, sizeof(stale_ts_file), "%s/file", stale_ts);
+
+    check(make_at(root_fd, stale, 1) == 0 && make_at(root_fd, nested, 1) == 0 &&
+              make_at(root_fd, nested_file, 0) == 0 &&
+              make_at(root_fd, stale_suffixed, 1) == 0 &&
+              make_at(root_fd, stale_ts, 1) == 0 &&
+              make_at(root_fd, stale_ts_file, 0) == 0 &&
+              make_at(root_fd, live, 1) == 0 &&
+              make_at(root_fd, other, 1) == 0 &&
+              make_at(root_fd, not_dir, 0) == 0,
+          "fixture: leave probe folders of a gone and a running process");
+
+    FsCapabilityProfile profile;
+    check(fsprobe_fd(root_fd, &profile) == 0, "the capability probe runs");
+    check(!exists_at(root_fd, stale) && !exists_at(root_fd, stale_suffixed),
+          "it removes its own kind's folders of the gone process, whole");
+    check(exists_at(root_fd, stale_ts),
+          "it leaves the timestamp probe's folders alone");
+
+    int nsec_exact = 0;
+    check(fsprobe_timestamps_fd(root_fd, &nsec_exact) == 0,
+          "the timestamp probe runs");
+    check(!exists_at(root_fd, stale_ts),
+          "it removes the timestamp probe's folder of the gone process");
+    check(exists_at(root_fd, live) && exists_at(root_fd, other) &&
+              exists_at(root_fd, not_dir),
+          "a running process's folder, another name, and a file are kept");
+
+    check(unlinkat(root_fd, live, AT_REMOVEDIR) == 0 &&
+              unlinkat(root_fd, other, AT_REMOVEDIR) == 0 &&
+              unlinkat(root_fd, not_dir, 0) == 0,
+          "fixture: remove what was kept");
+    close(root_fd);
+}
+
 int main(void)
 {
     printf(BLUE "::" NC " fsprobe (unit)\n");
@@ -212,6 +301,7 @@ int main(void)
     }
 
     test_fsprobe_fd_is_anchored(root);
+    test_stale_probes_removed(root);
 
     int root_fd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     check(root_fd >= 0, "timestamp probe root opens by fd");
