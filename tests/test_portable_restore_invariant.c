@@ -431,6 +431,90 @@ static void test_destination_casefold_index(void)
     check(rmdir(created) == 0, "casefold-index fixture directory is removed");
 }
 
+static DestinationIdentityStatus add_destination_path(
+    DestinationIdentityGraph *graph, int anchor_fd, const char *path,
+    DestinationIdentityClaim kind, size_t owner, size_t *conflicting_owner)
+{
+    DestinationIdentityPlacement placement;
+    DestinationIdentityNameConflict name_conflict;
+    *conflicting_owner = SIZE_MAX;
+    errno = 0;
+    return destination_identity_graph_add(graph, anchor_fd, path, kind, owner,
+                                          &placement, conflicting_owner,
+                                          &name_conflict);
+}
+
+static void test_destination_identity_collisions(void)
+{
+    printf(BLUE "::" NC " destination identity collisions\n");
+
+    enum { EXISTING_FOLDERS = 40 };
+    char directory[] = "/tmp/migr_restore_identity_collide_XXXXXX";
+    char *created = mkdtemp(directory);
+    check(created != NULL, "collision fixture directory is created");
+    if (created == NULL)
+        return;
+    int anchor_fd = open(created, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int folders_ok = anchor_fd >= 0;
+    for (int i = 0; folders_ok && i < EXISTING_FOLDERS; i++)
+    {
+        char name[16];
+        snprintf(name, sizeof(name), "d%02d", i);
+        folders_ok = mkdirat(anchor_fd, name, 0700) == 0;
+    }
+    check(folders_ok, "collision fixture folders are created");
+
+    DestinationIdentityGraph graph;
+    destination_identity_graph_init(&graph, DESTINATION_IDENTITY_PORTABLE_BOUNDS);
+    size_t conflicting = SIZE_MAX;
+    DestinationIdentityStatus folder = add_destination_path(
+        &graph, anchor_fd, "kept", DESTINATION_IDENTITY_DIRECTORY, 1,
+        &conflicting);
+    DestinationIdentityStatus inner = add_destination_path(
+        &graph, anchor_fd, "kept/inner", DESTINATION_IDENTITY_NON_DIRECTORY, 2,
+        &conflicting);
+    DestinationIdentityStatus file = add_destination_path(
+        &graph, anchor_fd, "kept", DESTINATION_IDENTITY_NON_DIRECTORY, 3,
+        &conflicting);
+    check(folder == DESTINATION_IDENTITY_OK &&
+              inner == DESTINATION_IDENTITY_OK &&
+              file == DESTINATION_IDENTITY_COLLISION && errno == EEXIST &&
+              conflicting == 1,
+          "a file is refused where another entry restores a folder");
+
+    // Every existing folder is one more node, enough to grow the tables
+    // that find a folder again by its identity.
+    int added_ok = folders_ok;
+    for (int i = 0; added_ok && i < EXISTING_FOLDERS; i++)
+    {
+        char path[16];
+        snprintf(path, sizeof(path), "d%02d/f", i);
+        added_ok = add_destination_path(
+                       &graph, anchor_fd, path,
+                       DESTINATION_IDENTITY_NON_DIRECTORY, 10U + (size_t)i,
+                       &conflicting) == DESTINATION_IDENTITY_OK;
+    }
+    DestinationIdentityStatus again = add_destination_path(
+        &graph, anchor_fd, "d07/f", DESTINATION_IDENTITY_NON_DIRECTORY, 100,
+        &conflicting);
+    check(added_ok && again == DESTINATION_IDENTITY_COLLISION &&
+              conflicting == 17 &&
+              destination_identity_graph_finalize(&graph) ==
+                  DESTINATION_IDENTITY_OK,
+          "after the tables grow, a file restored twice is still refused");
+
+    destination_identity_graph_free(&graph);
+    for (int i = 0; anchor_fd >= 0 && i < EXISTING_FOLDERS; i++)
+    {
+        char name[16];
+        snprintf(name, sizeof(name), "d%02d", i);
+        unlinkat(anchor_fd, name, AT_REMOVEDIR);
+    }
+    if (anchor_fd >= 0)
+        close(anchor_fd);
+    check(rmdir(created) == 0, "collision fixture directory is removed");
+}
+
 int main(void)
 {
     test_ordinary_leaf_authentication();
@@ -440,6 +524,7 @@ int main(void)
     test_physical_sibling_uniqueness();
     test_invalid_vector_input();
     test_destination_casefold_index();
+    test_destination_identity_collisions();
 
     if (failures != 0)
         printf(RED "portable restore invariant failed: %d assertion(s)\n" NC,
