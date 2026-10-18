@@ -17,7 +17,7 @@
 #include "utils.h"
 #include "verify.h"
 
-#define MIGR_VERSION "0.2.3"
+#define MIGR_VERSION "0.3.0"
 
 /* Long-only options, outside the range of the short option letters. */
 enum { OPT_VERSION = 256 };
