@@ -1575,29 +1575,6 @@ int portable_recorded_parent_open(
     return 0;
 }
 
-int relative_path_prefix_match(const char *prefix, const char *path,
-                               const char **relative_out)
-{
-    if (prefix == NULL || path == NULL)
-        return 0;
-    size_t prefix_length = strlen(prefix);
-    if (strcmp(prefix, path) == 0)
-    {
-        if (relative_out != NULL)
-            *relative_out = path + prefix_length;
-        return 1;
-    }
-    if (strncmp(prefix, path, prefix_length) == 0 &&
-        path[prefix_length] == '/')
-    {
-        if (relative_out != NULL)
-            *relative_out = path + prefix_length + 1U;
-        return 1;
-    }
-    return 0;
-}
-
-
 static int key_is_live(PortableCaptureContext *context,
                        const char *root_id, const char *logical)
 {

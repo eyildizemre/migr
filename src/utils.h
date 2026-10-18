@@ -308,7 +308,6 @@ double timespec_elapsed_seconds(const struct timespec *start,
                                 const struct timespec *end);
 
 int dup_cloexec(int fd);
-size_t relative_path_depth(const char *path);
 
 /*
  * Grows an array so it can hold at least count + extra elements, doubling

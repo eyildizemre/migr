@@ -38,10 +38,6 @@ int portable_collision_suffix_parse(const char *data, size_t length,
 /** Reports whether the relative paths are equal or one contains the other. */
 int relative_paths_overlap(const char *left, const char *right);
 
-/** Reports whether path equals or descends from prefix; suffix output is optional. */
-int relative_path_prefix_match(const char *prefix, const char *path,
-                               const char **relative_out);
-
 /**
  * Opens or creates intermediate directories below base_fd and returns the
  * parent fd plus the final path component. An empty relative path returns a

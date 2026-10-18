@@ -726,17 +726,6 @@ void *array_reserve(void *items, size_t *capacity, size_t count,
     return grown;
 }
 
-size_t relative_path_depth(const char *path)
-{
-    if (path == NULL || path[0] == '\0')
-        return 0;
-    size_t depth = 1U;
-    for (const char *cursor = path; *cursor != '\0'; cursor++)
-        if (*cursor == '/')
-            depth++;
-    return depth;
-}
-
 int backup_progress_should_fire(struct timespec *last_fired, int unthrottled)
 {
     if (last_fired == NULL)
