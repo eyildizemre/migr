@@ -5346,6 +5346,47 @@ static void test_update_failing_after_adoption_gives_the_name_back(void)
     remove_tree(target);
 }
 
+// A run stopped before it made data/ leaves a partial without it, which the
+// next run resumes.
+static void test_backup_resumes_a_partial_without_data(void)
+{
+    printf(BLUE "::" NC " production: a backup resumes one stopped before it made data/\n");
+
+    char home[PATH_MAX], target[PATH_MAX], file[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_home");
+    setenv("HOME", home, 1);
+    join_path(file, sizeof(file), home, "item");
+    write_file(file, "content");
+    fresh_mkdtemp(target, sizeof(target), "plan_target");
+    char *paths[] = { file, NULL };
+    char output[8192];
+    dry_run = 0;
+
+    backup_test_fail_content_writes(EIO, 1);
+    int stopped_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                          output, sizeof(output));
+    backup_test_fail_content_writes(0, 0);
+    char partial[PATH_MAX], data[PATH_MAX];
+    int found = find_partial_container_dir(target, partial, sizeof(partial));
+    join_path(data, sizeof(data), partial, "data");
+    remove_tree(data);
+    check(stopped_rc == 2 && found && access(data, F_OK) != 0,
+          "fixture: an unfinished backup without data/");
+
+    int resumed_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                          output, sizeof(output));
+    char container[PATH_MAX], copy[PATH_MAX];
+    found = find_container_dir(target, container, sizeof(container));
+    join_path(copy, sizeof(copy), container, "data/item");
+    check(resumed_rc == 0 && found &&
+              strstr(output, "Resuming an interrupted backup") != NULL &&
+              file_text_is(copy, "content"),
+          "the next run makes data/ and finishes the backup");
+
+    remove_tree(home);
+    remove_tree(target);
+}
+
 // Two finished backups of this install under one destination: updating
 // either would be a guess, so neither is touched.
 static void test_update_refuses_two_backups_of_one_install(void)
@@ -6475,6 +6516,7 @@ int main(void)
     test_backup_leaves_another_install_alone();
     test_failed_update_keeps_the_finished_backup();
     test_update_failing_after_adoption_gives_the_name_back();
+    test_backup_resumes_a_partial_without_data();
     test_update_refuses_two_backups_of_one_install();
     test_portable_backup_resumes_after_a_failed_write(0);
     test_portable_backup_resumes_after_a_failed_write(1);

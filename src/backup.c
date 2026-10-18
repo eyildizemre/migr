@@ -4231,13 +4231,19 @@ static int backup_run(const char *target_arg, BackupMode mode,
                                      O_CLOEXEC);
         if (repr == CLONE_NATIVE_TREE)
         {
-            if (adopted_data_fd < 0)
+            // A run stopped before it made data/ leaves none, and this one
+            // makes it; a finished backup without it is damaged.
+            if (adopted_data_fd < 0 &&
+                (errno != ENOENT || container.from_finished))
             {
                 print_error("Error: Could not open data/ in the backup: %s\n",
                             strerror(errno));
                 goto fail_pre_container;
             }
-            if (backup_metadata_check(&plan, selection, adopted_data_fd,
+            if (backup_metadata_check(&plan, selection,
+                                      adopted_data_fd >= 0
+                                          ? adopted_data_fd
+                                          : container_root_fd(&container),
                                       adopted_data_fd, &metadata_profiles,
                                       "No payload was changed.") != 0)
             {
