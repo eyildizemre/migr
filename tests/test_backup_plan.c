@@ -6155,6 +6155,36 @@ static void test_update_moves_folders(int portable)
               inode_of(new_copy) == before,
           "the next update moves nothing");
 
+    // From a nested place whose folder has a sibling differing only in
+    // case, so on a case-insensitive drive its copy carries another name.
+    backup_test_force_case_insensitive_destination(portable);
+    join_path(path, sizeof(path), work, "Archive");
+    mkdir_p(path);
+    int sibling_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                          output, sizeof(output));
+    join_path(path, sizeof(path), container, "data");
+    ino_t nested_before =
+        find_file_with_text(path, "alpha", new_copy, sizeof(new_copy))
+            ? inode_of(new_copy) : 0;
+    join_path(path, sizeof(path), work, "done");
+    mkdir_p(path);
+    join_path(path, sizeof(path), work, "archive/course");
+    join_path(to, sizeof(to), work, "done/course");
+    check(sibling_rc == 0 && nested_before != 0 && rename(path, to) == 0,
+          "fixture: move the folder out of a nested place");
+    wait_next_second();
+    int nested_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                         output, sizeof(output));
+    backup_test_force_case_insensitive_destination(0);
+    join_path(path, sizeof(path), container, "data");
+    check(nested_rc == 0 &&
+              strstr(output, "Moved inside the backup: 1 folder, 14B\n") !=
+                  NULL &&
+              find_file_with_text(path, "alpha", new_copy, sizeof(new_copy)) &&
+              inode_of(new_copy) == nested_before &&
+              run_verify_capturing(container, output, sizeof(output)) == 0,
+          "a folder moved from a nested place keeps its copy");
+
     // Two old folders that match the new one equally well: neither moves.
     for (int i = 0; i < 2; i++)
     {
