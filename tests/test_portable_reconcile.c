@@ -1024,8 +1024,8 @@ static void test_remove_payload_relative_close_failures(const char *base)
 static void test_capture_directory_scan_failure_frees_resources(
     const char *base)
 {
-    printf(BLUE "::" NC " capture_directory frees the destination and "
-                 "source fds when fdopendir() fails\n");
+    printf(BLUE "::" NC " capture_directory frees its scan fd and lists "
+                 "the folder when fdopendir() fails\n");
     char source[PATH_MAX];
     char container[PATH_MAX];
     join_path(source, sizeof(source), base, "capture-directory-leak-source");
@@ -1062,7 +1062,8 @@ static void test_capture_directory_scan_failure_frees_resources(
     portable_test_close_capture_directory_scan_fd_early();
     int result = portable_capture_fresh_at(container_fd, &request, NULL);
     int after_fds = open_fd_count();
-    check(result != 0, "the forced fdopendir failure aborts the capture");
+    check(result == 0,
+          "after the forced fdopendir failure the capture goes on (D109)");
     check(before_fds >= 0 && after_fds == before_fds,
           "the failure closes the destination and source fds instead of "
           "leaking them");

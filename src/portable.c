@@ -45,6 +45,9 @@ void portable_prescan_report_free(PortablePrescanReport *report)
     for (size_t index = 0; index < report->current_source.count; index++)
         free(report->current_source.entries[index].logical_path);
     free(report->current_source.entries);
+    for (size_t index = 0; index < report->unreadable.count; index++)
+        free(report->unreadable.entries[index].logical_path);
+    free(report->unreadable.entries);
     if (report->inode_seen != NULL)
     {
         prescan_inode_set_free(report->inode_seen);
@@ -2100,8 +2103,12 @@ static int source_symlink_target(int source_parent, const char *source_name,
             return -1;
         length = readlink(root_path, target, target_size);
     }
-    if (length <= 0 || (size_t)length >= target_size)
+    if (length < 0)
         return -1;
+    if (length == 0 || (size_t)length >= target_size) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
     target[length] = '\0';
     return (int)length;
 }
@@ -2141,9 +2148,11 @@ int open_source_node(int source_parent, const char *source_name,
 
 // expected_size < 0 accepts whatever length the source has when read and
 // reports it through copied_out; otherwise a different length is EIO.
+// *read_failed, when given, is set when reading the source failed.
 static int portable_copy_regular_impl(
     int source_fd, int destination_fd, off_t expected_size,
-    BackupCaptureReport *report, uint64_t *digest, uint64_t *copied_out)
+    BackupCaptureReport *report, uint64_t *digest, uint64_t *copied_out,
+    int *read_failed)
 {
     if (source_fd < 0 || destination_fd < 0)
     {
@@ -2161,8 +2170,11 @@ static int portable_copy_regular_impl(
         ssize_t received = read(source_fd, buffer, sizeof(buffer));
         if (received < 0 && errno == EINTR)
             continue;
-        if (received < 0)
+        if (received < 0) {
+            if (read_failed != NULL)
+                *read_failed = 1;
             return -1;
+        }
         if (received == 0)
             break;
         if ((uint64_t)received > UINT64_MAX - copied)
@@ -2196,7 +2208,7 @@ int portable_copy_regular(int source_fd, int destination_fd, off_t expected_size
                           BackupCaptureReport *report)
 {
     return portable_copy_regular_impl(source_fd, destination_fd, expected_size,
-                                      report, NULL, NULL);
+                                      report, NULL, NULL, NULL);
 }
 
 int portable_copy_regular_digest(
@@ -2209,19 +2221,22 @@ int portable_copy_regular_digest(
         return -1;
     }
     return portable_copy_regular_impl(source_fd, destination_fd, expected_size,
-                                      report, digest, NULL);
+                                      report, digest, NULL, NULL);
 }
 
 // Reads a source that may be changing: rewinds it, copies whatever it holds
 // now, and reports the length copied (D63).
 static int portable_copy_regular_as_is(int source_fd, int destination_fd,
                                        BackupCaptureReport *report,
-                                       uint64_t *digest, uint64_t *copied)
+                                       uint64_t *digest, uint64_t *copied,
+                                       int *read_failed)
 {
-    if (lseek(source_fd, 0, SEEK_SET) != 0)
+    if (lseek(source_fd, 0, SEEK_SET) != 0) {
+        *read_failed = 1;
         return -1;
+    }
     return portable_copy_regular_impl(source_fd, destination_fd, -1, report,
-                                      digest, copied);
+                                      digest, copied, read_failed);
 }
 
 
@@ -2281,19 +2296,22 @@ static void portable_capture_failure_reset(BackupCaptureReport *report)
 
 // Keeps the first failure: the item, as a source path (the root's own when
 // logical is empty or NULL, none without a root), what was being done, and
-// errno for an operational one.
+// errno for an operational one or an item that could not be read. A failure
+// of the backup replaces an item failure not listed yet (D109).
 static void portable_capture_failure_record(
     BackupCaptureReport *report, BackupCaptureFailureKind kind, int err,
     const char *operation, const PortableRootSpec *root, const char *logical)
 {
-    if (report == NULL || report->failure_kind != BACKUP_CAPTURE_FAILURE_NONE ||
-        kind == BACKUP_CAPTURE_FAILURE_NONE)
+    if (report == NULL || kind == BACKUP_CAPTURE_FAILURE_NONE ||
+        (report->failure_kind != BACKUP_CAPTURE_FAILURE_NONE &&
+         (kind == BACKUP_CAPTURE_FAILURE_ITEM ||
+          report->failure_kind != BACKUP_CAPTURE_FAILURE_ITEM)))
         return;
 
     report->failure_kind = kind;
     report->failure_errno = kind == BACKUP_CAPTURE_FAILURE_OPERATIONAL
         ? (err != 0 ? err : EIO)
-        : 0;
+        : kind == BACKUP_CAPTURE_FAILURE_ITEM ? err : 0;
     report->failed_operation = operation;
 
     report->failed_source_path[0] = '\0';
@@ -2365,6 +2383,66 @@ static int capture_leave_out(const PortableCaptureContext *context,
     return 0;
 }
 
+// An item the source would not give up (D109): listed, and the backup keeps
+// what it holds for it, with everything below it.
+static int capture_item_failed(PortableCaptureContext *context,
+                               const PortableRootSpec *root,
+                               const char *logical, const char *operation,
+                               int err, int *no_destination_object)
+{
+    SidecarBytes root_key = {
+        (const unsigned char *)root->id, strlen(root->id)
+    };
+    SidecarBytes logical_key = {
+        (const unsigned char *)logical, strlen(logical)
+    };
+    SidecarLiveView held;
+    int kept = sidecar_log_find(context->sidecar, root_key, logical_key,
+                                &held);
+    if (kept < 0 || visited_add(context->failed, root->id, logical) < 0) {
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+            "record it as not backed up", root, logical);
+        return -1;
+    }
+    portable_capture_context_failure_record(
+        context, BACKUP_CAPTURE_FAILURE_ITEM, err, operation, root, logical);
+    backup_capture_report_note_failure(context->progress_report, kept);
+    if (no_destination_object != NULL)
+        *no_destination_object = 1;
+    return 0;
+}
+
+// What the pre-scan could not read is kept as the backup holds it from the
+// start, before an update moves or removes anything (D109).
+static int capture_failed_seed(PortableCaptureContext *context,
+                               const PortableCurrentSourceSet *unreadable)
+{
+    for (size_t index = 0; index < unreadable->count; index++)
+        if (visited_add(context->failed, unreadable->entries[index].root_id,
+                        unreadable->entries[index].logical_path) < 0)
+            return -1;
+    return 0;
+}
+
+int portable_failed_covers(const PortableCaptureContext *context,
+                           const char *root_id, const char *logical)
+{
+    const PortableVisited *failed = context->failed;
+    if (failed == NULL || failed->count == 0)
+        return 0;
+    char path[SIDECAR_MAX_PATH + 1U];
+    if (copy_text(path, sizeof(path), logical) != 0)
+        return -1;
+    for (;;) {
+        int found = visited_contains(failed, root_id, path);
+        if (found != 0 || path[0] == '\0')
+            return found;
+        char *slash = strrchr(path, '/');
+        *(slash != NULL ? slash : path) = '\0';
+    }
+}
+
 static int capture_current_source_seen(const PortableCaptureContext *context,
                                        const PortableRootSpec *root)
 {
@@ -2387,6 +2465,9 @@ static int capture_current_source_seen(const PortableCaptureContext *context,
             continue;
         int present = visited_contains(context->visited, root->id,
                                        entry->logical_path);
+        if (present == 0)
+            present = portable_failed_covers(context, root->id,
+                                             entry->logical_path);
         if (present == 0) {
             capture_note_change(context, root, entry->logical_path,
                                 BACKUP_SOURCE_VANISHED);
@@ -2484,11 +2565,15 @@ static int prepared_source_validate_root(
         return -1;
     }
 
+    // What cannot be read is left to capture, which lists it (D109).
     struct stat root_stat;
     if (lstat(root->capture_path, &root_stat) != 0) {
         int saved_errno = errno;
+        if (source_lookup_failure_kind(saved_errno) ==
+            BACKUP_CAPTURE_FAILURE_OPERATIONAL)
+            return 0;
         portable_capture_context_failure_record(
-            context, source_lookup_failure_kind(saved_errno), saved_errno,
+            context, BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED, saved_errno,
             "inspect it", root, NULL);
         return -1;
     }
@@ -2507,8 +2592,11 @@ static int prepared_source_validate_root(
                        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
         if (root_fd < 0) {
             int saved_errno = errno;
+            if (source_lookup_failure_kind(saved_errno) ==
+                BACKUP_CAPTURE_FAILURE_OPERATIONAL)
+                return 0;
             portable_capture_context_failure_record(
-                context, source_lookup_failure_kind(saved_errno), saved_errno,
+                context, BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED, saved_errno,
                 "open the folder", root, NULL);
             return -1;
         }
@@ -2534,16 +2622,10 @@ static int prepared_source_validate_root(
                                         &member_stat) != 0) {
             int saved_errno = errno;
             if (source_lookup_failure_kind(saved_errno) ==
-                BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED) {
+                BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED)
                 capture_note_change(context, root, entry->logical_path,
                                     BACKUP_SOURCE_CHANGE_KINDS);
-                continue;
-            }
-            portable_capture_context_failure_record(
-                context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
-                "inspect it", root, entry->logical_path);
-            failed = 1;
-            break;
+            continue;
         }
         if (!source_kind_is_address_bearing(member_stat.st_mode))
             capture_note_change(context, root, entry->logical_path,
@@ -2596,18 +2678,14 @@ static int capture_directory(PortableCaptureContext *context,
         close(scan_fd);
     }
 #endif
+    // A folder that cannot be listed to its end is an item that failed
+    // (D109): it is recorded as read, and the backup keeps what it held below.
+    int listing_errno = 0;
     DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
     if (directory == NULL) {
-        int saved_errno = errno;
-        portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
-            "list the folder", root, logical);
+        listing_errno = errno;
         if (scan_fd >= 0)
             close(scan_fd);
-        xattrs_free(xattrs);
-        close(source_fd);
-        close(destination_fd);
-        return -1;
     }
     int failed = 0;
     PortableCaseFoldSet observed_skeletons = {0};
@@ -2616,16 +2694,11 @@ static int capture_directory(PortableCaptureContext *context,
         observed_skeletons.hash_salt = sidecar_process_salt();
     if (!context->case_sensitive)
         observed_ascii.hash_salt = sidecar_process_salt();
-    for (;;) {
+    while (directory != NULL) {
         errno = 0;
         struct dirent *entry = readdir(directory);
         if (entry == NULL) {
-            if (errno != 0) {
-                portable_capture_context_failure_record(
-                    context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, errno,
-                    "list the folder", root, logical);
-                failed = 1;
-            }
+            listing_errno = errno;
             break;
         }
         if (strcmp(entry->d_name, ".") == 0 ||
@@ -2740,7 +2813,7 @@ static int capture_directory(PortableCaptureContext *context,
         if (added_pending && no_destination_object)
             pending_readback_names_remove_last(&pending);
     }
-    if (closedir(directory) != 0) {
+    if (directory != NULL && closedir(directory) != 0) {
         int saved_errno = errno;
         portable_capture_context_failure_record(
             context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
@@ -2805,6 +2878,9 @@ static int capture_directory(PortableCaptureContext *context,
             "close the folder in the backup", root, logical);
         return -1;
     }
+    if (listing_errno != 0)
+        return capture_item_failed(context, root, logical, "list the folder",
+                                   listing_errno, NULL);
     return 0;
 }
 
@@ -2818,7 +2894,8 @@ static int capture_regular(PortableCaptureContext *context,
                            const char *destination_leaf,
                            int destination_is_root,
                            PortableXattrs *xattrs,
-                           const CapturePreviousEntry *previous_hint)
+                           const CapturePreviousEntry *previous_hint,
+                           int *no_destination_object)
 {
     int parent_fd = destination_parent;
     char root_leaf[NAME_MAX + 1U];
@@ -2886,44 +2963,52 @@ static int capture_regular(PortableCaptureContext *context,
     // BACKUP_CAPTURE_READ_ATTEMPTS times; one still changing after that is kept as
     // last read, with that read's length, and reported (D63). Live desktop
     // state is kept as read at once.
+    // A read that fails leaves the copy cut short. Its claim and payload are
+    // removed and the file listed (D109), unless the file has other names:
+    // they are recorded against it, so the backup stops.
     uint64_t content_digest = 0;
     struct stat captured = *before;
     int failed = 0;
+    const char *read_step = NULL;
+    int read_errno = 0;
     uint64_t copied = 0;
     for (unsigned int attempt = 1;; attempt++) {
         backup_capture_report_reread(context->progress_report, (off_t)copied);
         copied = 0;
+        int source_side = 0;
+        struct stat after;
         if (portable_copy_regular_as_is(source_fd, destination_fd,
                                         context->progress_report,
-                                        &content_digest, &copied) != 0) {
-            int saved_errno = errno;
-            portable_capture_context_failure_record(
-                context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
-                "copy its content", root, logical);
-            failed = 1;
-            break;
-        }
-        portable_test_interrupt_if(PORTABLE_TEST_AFTER_PAYLOAD_WRITE);
-        portable_test_after_payload_write();
-
-        struct stat after;
-        if (fstat(source_fd, &after) != 0) {
-            int saved_errno = errno;
-            portable_capture_context_failure_record(
-                context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
-                "inspect it again after reading", root, logical);
-            failed = 1;
-            break;
+                                        &content_digest, &copied,
+                                        &source_side) != 0) {
+            read_step = source_side ? "read the content" : "copy its content";
+            read_errno = errno;
+        } else {
+            portable_test_interrupt_if(PORTABLE_TEST_AFTER_PAYLOAD_WRITE);
+            portable_test_after_payload_write();
+            source_side = 1;
+            if (fstat(source_fd, &after) != 0) {
+                read_step = "inspect it again after reading";
+                read_errno = errno;
+            }
         }
         // Unchanged metadata with a different length read is not a writer
-        // but a short read, and stays an error.
-        int unchanged = metadata_source_unchanged(&captured, &after);
+        // but a read that failed.
+        int unchanged = read_step == NULL &&
+                        metadata_source_unchanged(&captured, &after);
         if (unchanged && copied != (uint64_t)after.st_size) {
-            portable_capture_context_failure_record(
-                context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, EIO,
-                "fewer or more bytes were read than its size", root, logical);
-            errno = EIO;
-            failed = 1;
+            read_step = "fewer or more bytes were read than its size";
+            read_errno = 0;
+        }
+        if (read_step != NULL) {
+            if (!source_side || before->st_nlink != 1) {
+                portable_capture_context_failure_record(
+                    context, BACKUP_CAPTURE_FAILURE_OPERATIONAL,
+                    read_errno != 0 ? read_errno : EIO, read_step, root,
+                    logical);
+                read_step = NULL;
+                failed = 1;
+            }
             break;
         }
         if (unchanged) {
@@ -2963,6 +3048,24 @@ static int capture_regular(PortableCaptureContext *context,
     if (failed) {
         xattrs_free(xattrs);
         return -1;
+    }
+    if (read_step != NULL) {
+        xattrs_free(xattrs);
+        SidecarClaim claim = {
+            .root_id = { (const unsigned char *)root->id, strlen(root->id) },
+            .logical_path = { (const unsigned char *)logical, strlen(logical) },
+            .physical_leaf = {
+                (const unsigned char *)physical_leaf, strlen(physical_leaf) },
+            .kind = SIDECAR_KIND_REGULAR
+        };
+        if (reconcile_stale_claim(context, root, logical, &claim) != 0) {
+            portable_capture_context_failure_record(
+                context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+                "remove its cut-short copy from the backup", root, logical);
+            return -1;
+        }
+        return capture_item_failed(context, root, logical, read_step,
+                                   read_errno, no_destination_object);
     }
 
     SidecarEntry sidecar_entry;
@@ -3078,19 +3181,16 @@ static int capture_symlink(PortableCaptureContext *context,
                            int destination_parent,
                            const char *destination_leaf,
                            int destination_is_root,
-                           const struct stat *before)
+                           const struct stat *before,
+                           int *no_destination_object)
 {
     char target[SIDECAR_MAX_SYMLINK_TARGET + 1U];
     int target_length = source_symlink_target(source_parent, source_name,
                                               root_path, target,
                                               sizeof(target));
-    if (target_length < 0) {
-        int saved_errno = errno;
-        portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
-            "read the link", root, logical);
-        return -1;
-    }
+    if (target_length < 0)
+        return capture_item_failed(context, root, logical, "read the link",
+                                   errno, no_destination_object);
 
     char source_path[PATH_MAX];
     if (source_symlink_xattr_path(source_parent, source_name, root_path,
@@ -3101,13 +3201,10 @@ static int capture_symlink(PortableCaptureContext *context,
         return -1;
     }
     PortableXattrs xattrs;
-    if (collect_symlink_xattrs(source_path, &xattrs) != 0) {
-        int saved_errno = errno;
-        portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
-            "read its extended attributes", root, logical);
-        return -1;
-    }
+    if (collect_symlink_xattrs(source_path, &xattrs) != 0)
+        return capture_item_failed(context, root, logical,
+                                   "read its extended attributes", errno,
+                                   no_destination_object);
 
     // The final consistency check runs after every path-based read (target,
     // then xattrs) rather than right after the target read: symlinks have no
@@ -3118,10 +3215,15 @@ static int capture_symlink(PortableCaptureContext *context,
     struct stat after;
     if (read_source_stat(source_parent, source_name, root_path, &after) != 0) {
         int saved_errno = errno;
-        portable_capture_context_failure_record(
-            context, source_lookup_failure_kind(saved_errno), saved_errno,
-            "inspect it again after reading", root, logical);
         xattrs_free(&xattrs);
+        if (source_lookup_failure_kind(saved_errno) ==
+            BACKUP_CAPTURE_FAILURE_OPERATIONAL)
+            return capture_item_failed(context, root, logical,
+                                       "inspect it again after reading",
+                                       saved_errno, no_destination_object);
+        portable_capture_context_failure_record(
+            context, BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED, saved_errno,
+            "inspect it again after reading", root, logical);
         return -1;
     }
     if (!metadata_symlink_unchanged(before, &after))
@@ -3418,10 +3520,8 @@ static int capture_node(PortableCaptureContext *context,
             return capture_leave_out(context, root, logical,
                                      BACKUP_SOURCE_CHANGE_KINDS,
                                      no_destination_object);
-        portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
-            "inspect it", root, logical);
-        return -1;
+        return capture_item_failed(context, root, logical, "inspect it",
+                                   saved_errno, no_destination_object);
     }
 
     if (logical == NULL || physical_leaf == NULL || collision_suffix == NULL ||
@@ -3503,7 +3603,7 @@ static int capture_node(PortableCaptureContext *context,
                                      collision_suffix, source_parent,
                                      source_name, root_path,
                                      destination_parent, destination_leaf,
-                                     is_root, &before);
+                                     is_root, &before, no_destination_object);
         if (result != 0)
             portable_capture_context_failure_record(
                 context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
@@ -3527,19 +3627,22 @@ static int capture_node(PortableCaptureContext *context,
             return capture_leave_out(context, root, logical,
                                      BACKUP_SOURCE_CHANGE_KINDS,
                                      no_destination_object);
-        portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno, "open it",
-            root, logical);
-        return -1;
+        // Refused with O_NOATIME: never read without it (D17).
+        int folder = S_ISDIR(before.st_mode);
+        const char *step =
+            saved_errno == EPERM
+                ? (folder ? "open the folder without changing its access time"
+                          : "open it without changing its access time")
+                : (folder ? "open the folder" : "open it");
+        return capture_item_failed(context, root, logical, step, saved_errno,
+                                   no_destination_object);
     }
     struct stat opened;
     if (fstat(source_fd, &opened) != 0) {
         int saved_errno = errno;
-        portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
-            "inspect it", root, logical);
         close(source_fd);
-        return -1;
+        return capture_item_failed(context, root, logical, "inspect it",
+                                   saved_errno, no_destination_object);
     }
     if (!metadata_source_unchanged(&before, &opened)) {
         // Changed between the stat and the open. The same kind of object is
@@ -3586,14 +3689,21 @@ static int capture_node(PortableCaptureContext *context,
         }
     }
 
+    // A file with other names is their representative by now, so it cannot
+    // be left out alone: the backup stops.
     PortableXattrs xattrs;
     if (collect_xattrs(source_fd, &xattrs) != 0) {
         int saved_errno = errno;
-        portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
-            "read its extended attributes", root, logical);
         close(source_fd);
-        return -1;
+        if (S_ISREG(before.st_mode) && before.st_nlink > 1) {
+            portable_capture_context_failure_record(
+                context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
+                "read its extended attributes", root, logical);
+            return -1;
+        }
+        return capture_item_failed(context, root, logical,
+                                   "read its extended attributes",
+                                   saved_errno, no_destination_object);
     }
 
     CapturePreviousEntry previous_hint = {0};
@@ -3666,7 +3776,8 @@ static int capture_node(PortableCaptureContext *context,
         int result = capture_regular(context, root, logical, physical_leaf,
                                      collision_suffix, source_fd, &before,
                                      destination_parent, destination_leaf,
-                                     is_root, &xattrs, &previous_hint);
+                                     is_root, &xattrs, &previous_hint,
+                                     no_destination_object);
         if (result != 0)
             portable_capture_context_failure_record(
                 context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
@@ -4151,7 +4262,10 @@ int portable_capture_context_init(PortableCaptureContext *context,
         return -1;
     }
     PortableInodeMap *inode_map = calloc(1, sizeof(*inode_map));
-    if (inode_map == NULL) {
+    PortableVisited *failed = calloc(1, sizeof(*failed));
+    if (inode_map == NULL || failed == NULL) {
+        free(failed);
+        free(inode_map);
         free(tombstone_owners);
         free(active_owners);
         free(visited);
@@ -4162,7 +4276,9 @@ int portable_capture_context_init(PortableCaptureContext *context,
     context->case_sensitive = case_sensitive != 0;
     visited->hash_salt = sidecar_process_salt();
     inode_map->hash_salt = sidecar_process_salt();
+    failed->hash_salt = sidecar_process_salt();
     context->visited = visited;
+    context->failed = failed;
     context->inode_map = inode_map;
     context->active_owners = active_owners;
     context->tombstone_owners = tombstone_owners;
@@ -4174,6 +4290,7 @@ void portable_capture_context_close(PortableCaptureContext *context)
     if (context == NULL)
         return;
     visited_free(context->visited);
+    visited_free(context->failed);
     inode_map_free(context->inode_map);
     portable_physical_owners_free(context->active_owners);
     free(context->active_owners);
@@ -4355,7 +4472,8 @@ int portable_capture_fresh_prepared_at(
         context.collision_plan = &prepared->report.collision_plan;
         context.current_source = &prepared->report.current_source;
         if (portable_capture_owners_reload(&context) != 0 ||
-            sticky_seed_inode_map(context.inode_map, request, &sidecar) != 0) {
+            sticky_seed_inode_map(context.inode_map, request, &sidecar) != 0 ||
+            capture_failed_seed(&context, &prepared->report.unreadable) != 0) {
             portable_capture_context_failure_record(
                 &context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
                 "load the owners and hardlinks already recorded", NULL, NULL);
@@ -4586,7 +4704,8 @@ int portable_capture_resume_prepared_at(
         context.collision_plan = &prepared->report.collision_plan;
         context.current_source = &prepared->report.current_source;
         if (portable_capture_owners_reload(&context) != 0 ||
-            sticky_seed_inode_map(context.inode_map, request, &sidecar) != 0) {
+            sticky_seed_inode_map(context.inode_map, request, &sidecar) != 0 ||
+            capture_failed_seed(&context, &prepared->report.unreadable) != 0) {
             portable_capture_context_failure_record(
                 &context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
                 "load the owners and hardlinks already recorded", NULL, NULL);

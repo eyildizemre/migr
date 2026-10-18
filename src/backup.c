@@ -925,6 +925,24 @@ static int print_source_changes(const BackupCaptureReport *report)
     return 1;
 }
 
+// Lists the items the backup could not read (D109); returns whether any.
+static int print_failed_items(const BackupCaptureReport *report)
+{
+    const ExampleList *list = &report->failed_items;
+    if (list->count == 0)
+        return 0;
+    printf("\n");
+    fflush(stdout);
+    if (list->count == 1)
+        print_warning("Could not read 1 item; it was not backed up this "
+                      "time:\n");
+    else
+        print_warning("Could not read %zu items; they were not backed up "
+                      "this time:\n", list->count);
+    example_list_print(list, "  ");
+    return 1;
+}
+
 static void print_portable_capture_failure(const BackupCaptureReport *report)
 {
     const char *path = report != NULL && report->failed_source_path[0] != '\0'
@@ -2917,16 +2935,10 @@ static void backup_before_deferred(void *context)
 }
 
 static void print_root_capture_failure(const BackupPlanRoot *root,
-                                       BackupCaptureStatus status,
                                        const BackupCaptureReport *report)
 {
     const char *failed_source = report->failed_source_path[0] != '\0'
         ? report->failed_source_path : root->capture_path;
-    if (status == BACKUP_CAPTURE_SOURCE_SAFE_READ)
-    {
-        print_source_safe_read_refusal(failed_source);
-        return;
-    }
     print_item_failure("back up", failed_source, report->failed_operation,
                        report->failure_errno);
     size_t root_length = strlen(root->capture_path);
@@ -2968,7 +2980,7 @@ static void capture_plan_root(const CloneContext *ctx, const BackupPlan *plan,
         *full_root = index;
         return;
     }
-    print_root_capture_failure(root, capture_status, capture_report);
+    print_root_capture_failure(root, capture_report);
     *had_error = 1;
 }
 
@@ -3004,7 +3016,7 @@ static void capture_roots(const CloneContext *ctx, const BackupPlan *plan,
                         plan->roots[i].comprehensive_only != later ||
                         deferral->roots[i] != deferred)
                         continue;
-                    if (full_root != NULL && *full_root >= 0)
+                    if (*had_error || (full_root != NULL && *full_root >= 0))
                         return;
                     // Headings only group the verbose lines under them.
                     if (verbose && !printed_heading)
@@ -3132,6 +3144,8 @@ static void begin_second_capture(BackupProgressDisplay *progress,
     report->bytes_copied = 0;
     report->bytes_unchanged = 0;
     report->items = 0;
+    // The second pass meets them again.
+    memset(&report->failed_items, 0, sizeof(report->failed_items));
 }
 
 // After the second pass: the bytes the first copied count as copied once.
@@ -3203,57 +3217,15 @@ static int metadata_existing_at(int root_fd, const char *rel,
     }
 }
 
-typedef struct {
-    size_t refusal_count;
-    size_t uninspected_subtree_count;
-    size_t example_count;
-    char examples[METADATA_MAX_PREFLIGHT_EXAMPLES][PATH_MAX];
-} SourceReadRefusals;
-
-static void source_read_refusals_init(SourceReadRefusals *refusals)
+// Notes a source item the preflight could not read. Capture lists it and
+// goes on (D109), so only a dry run shows these.
+static void unreadable_note(ExampleList *unreadable, const char *source_path,
+                            const char *step, int err)
 {
-    if (refusals != NULL)
-        memset(refusals, 0, sizeof(*refusals));
-}
-
-static void source_read_refusal_record(SourceReadRefusals *refusals,
-                                       const char *source_path,
-                                       int uninspected_subtree)
-{
-    if (refusals == NULL)
-        return;
-    if (refusals->refusal_count != SIZE_MAX)
-        refusals->refusal_count++;
-    if (uninspected_subtree &&
-        refusals->uninspected_subtree_count != SIZE_MAX)
-        refusals->uninspected_subtree_count++;
-    if (source_path == NULL ||
-        refusals->example_count >= METADATA_MAX_PREFLIGHT_EXAMPLES)
-        return;
-
-    int n = snprintf(refusals->examples[refusals->example_count],
-                     sizeof(refusals->examples[0]), "%s", source_path);
-    if (n >= 0 && (size_t)n < sizeof(refusals->examples[0]))
-        refusals->example_count++;
-}
-
-static void source_read_refusals_report(const SourceReadRefusals *refusals)
-{
-    if (refusals == NULL || refusals->refusal_count == 0)
-        return;
-
-    print_error("Error: could not safely read %zu source object(s): the kernel "
-           "refused the O_NOATIME open (ownership or CAP_FOWNER is "
-           "required); no O_NOATIME-less retry was attempted.\n",
-           refusals->refusal_count);
-    for (size_t i = 0; i < refusals->example_count; i++)
-        printf("  source-read example: %s\n", refusals->examples[i]);
-    if (refusals->refusal_count > refusals->example_count)
-        printf("  ... additional source-read refusals omitted\n");
-    if (refusals->uninspected_subtree_count > 0)
-        printf("  %zu source subtree(s) could not be inspected; their contents "
-               "are unknown, not zero.\n",
-               refusals->uninspected_subtree_count);
+    char *text = unreadable != NULL ? example_list_next(unreadable) : NULL;
+    if (text != NULL)
+        snprintf(text, EXAMPLE_TEXT_MAX, "%s: %s: %s", source_path, step,
+                 strerror(err));
 }
 
 // Opening an item listed a moment ago failed because it is gone, or was
@@ -3267,7 +3239,7 @@ static int backup_metadata_inventory(const char *source_path, int anchor_fd,
                                      int destination_root_fd,
                                      const char *destination_rel,
                                      MetadataProfiles *profiles,
-                                     SourceReadRefusals *refusals,
+                                     ExampleList *unreadable,
                                      const SelectionRoot *selection,
                                      FailedItem *failure)
 {
@@ -3281,14 +3253,14 @@ static int backup_metadata_inventory(const char *source_path, int anchor_fd,
     }
     // The source may change while it is walked (D63): an item gone since it
     // was listed is left to capture, which leaves it out and says so, and
-    // one that changed is profiled as first seen.
+    // one that changed is profiled as first seen. One that cannot be read
+    // is left to capture too, which lists it (D109).
     struct stat source_st;
     if (lstat(source_path, &source_st) != 0)
     {
-        if (errno == ENOENT)
-            return 0;
-        failed_item_note(failure, source_path, "inspect it", errno);
-        return -1;
+        if (errno != ENOENT)
+            unreadable_note(unreadable, source_path, "inspect it", errno);
+        return 0;
     }
 
     struct stat existing_st;
@@ -3306,6 +3278,33 @@ static int backup_metadata_inventory(const char *source_path, int anchor_fd,
         (source_st.st_mode & S_IFMT) != (existing_st.st_mode & S_IFMT))
         destination_exists = 0;
 
+    // Only what can be read is captured, so only that must keep its owner,
+    // permissions, and times.
+    int source_fd = -1;
+    if (S_ISREG(source_st.st_mode) || S_ISDIR(source_st.st_mode))
+    {
+        int folder = S_ISDIR(source_st.st_mode);
+#ifdef BACKUP_TEST_HOOKS
+        backup_test_before_source_open(source_path);
+#endif
+        source_fd = open(source_path, O_RDONLY | O_NOFOLLOW | O_NOATIME |
+                                          O_CLOEXEC |
+                                          (folder ? O_DIRECTORY : 0));
+        if (source_fd < 0)
+        {
+            if (!source_vanished(errno))
+                unreadable_note(
+                    unreadable, source_path,
+                    errno == EPERM
+                        ? (folder
+                               ? "open the folder without changing its access time"
+                               : "open it without changing its access time")
+                        : (folder ? "open the folder" : "open it"),
+                    errno);
+            return 0;
+        }
+    }
+
     if (!S_ISSOCK(source_st.st_mode) && !S_ISCHR(source_st.st_mode) &&
         !S_ISBLK(source_st.st_mode) &&
         metadata_profiles_add(profiles, anchor_fd, &source_st,
@@ -3314,63 +3313,27 @@ static int backup_metadata_inventory(const char *source_path, int anchor_fd,
     {
         failed_item_note(failure, source_path,
                          "note its owner and permissions for the check", errno);
+        if (source_fd >= 0)
+            close(source_fd);
         return -1;
     }
 
-    if (S_ISREG(source_st.st_mode))
+    if (!S_ISDIR(source_st.st_mode))
     {
-#ifdef BACKUP_TEST_HOOKS
-        backup_test_before_source_open(source_path);
-#endif
-        int fd = open(source_path, O_RDONLY | O_NOFOLLOW | O_NOATIME |
-                                      O_CLOEXEC);
-        if (fd < 0)
-        {
-            if (errno == EPERM)
-            {
-                source_read_refusal_record(refusals, source_path, 0);
-                return 0;
-            }
-            if (source_vanished(errno))
-                return 0;
-            failed_item_note(failure, source_path, "open it", errno);
-            return -1;
-        }
-        if (close(fd) == 0)
+        if (source_fd < 0 || close(source_fd) == 0)
             return 0;
         failed_item_note(failure, source_path, "close it", errno);
         return -1;
     }
 
-    if (!S_ISDIR(source_st.st_mode))
-        return 0;
-
-#ifdef BACKUP_TEST_HOOKS
-    backup_test_before_source_open(source_path);
-#endif
-    int source_fd = open(source_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
-                                      O_NOATIME | O_CLOEXEC);
-    if (source_fd < 0)
-    {
-        if (errno == EPERM)
-        {
-            source_read_refusal_record(refusals, source_path, 1);
-            return 0;
-        }
-        if (source_vanished(errno))
-            return 0;
-        failed_item_note(failure, source_path, "open the folder", errno);
-        return -1;
-    }
     int scan_fd = fcntl(source_fd, F_DUPFD_CLOEXEC, 0);
     DIR *dir = scan_fd < 0 ? NULL : fdopendir(scan_fd);
     if (dir == NULL)
     {
-        failed_item_note(failure, source_path, "list the folder", errno);
+        unreadable_note(unreadable, source_path, "list the folder", errno);
         if (scan_fd >= 0)
             close(scan_fd);
-        close(source_fd);
-        return -1;
+        return close(source_fd) == 0 ? 0 : -1;
     }
 
     int failed = 0;
@@ -3381,11 +3344,8 @@ static int backup_metadata_inventory(const char *source_path, int anchor_fd,
         if (entry == NULL)
         {
             if (errno != 0)
-            {
-                failed_item_note(failure, source_path, "list the folder",
-                                 errno);
-                failed = 1;
-            }
+                unreadable_note(unreadable, source_path, "list the folder",
+                                errno);
             break;
         }
         if (strcmp(entry->d_name, ".") == 0 ||
@@ -3399,14 +3359,13 @@ static int backup_metadata_inventory(const char *source_path, int anchor_fd,
             path_join(child_destination, sizeof(child_destination),
                       destination_rel, entry->d_name) != 0)
         {
-            failed_item_note(failure, source_path, "name an item in the folder",
-                             ENAMETOOLONG);
-            failed = 1;
-            break;
+            unreadable_note(unreadable, source_path,
+                            "name an item in the folder", ENAMETOOLONG);
+            continue;
         }
         if (backup_metadata_inventory(child_source, anchor_fd,
                                       destination_root_fd, child_destination,
-                                      profiles, refusals, selection,
+                                      profiles, unreadable, selection,
                                       failure) != 0)
         {
             failed = 1;
@@ -3486,13 +3445,12 @@ static int open_advisory_probe_fd(const char *target, int *out_used_parent)
 }
 
 // selection follows the same index-aligned, optional convention as
-// capture_roots() and seed_native_hardlink_map(): it never reports refusals
-// itself, only accumulates them, so both plan types feed the identical
-// hard/soft refusal logic in backup_dry_run() and backup_run() (D1).
+// capture_roots() and seed_native_hardlink_map(). unreadable, when not NULL,
+// collects the source items that could not be read (D109).
 static int backup_metadata_preflight(const BackupPlan *plan, const SelectionPlan *selection,
                                      int anchor_fd, int destination_root_fd,
                                      MetadataProfiles *profiles,
-                                     SourceReadRefusals *refusals,
+                                     ExampleList *unreadable,
                                      FailedItem *failure)
 {
     // See capture_roots(): the same one-for-one index alignment with
@@ -3505,7 +3463,7 @@ static int backup_metadata_preflight(const BackupPlan *plan, const SelectionPlan
         if (backup_metadata_inventory(root->capture_path, anchor_fd,
                                       destination_root_fd,
                                       root->manifest_root.payload_path,
-                                      profiles, refusals, sel_root,
+                                      profiles, unreadable, sel_root,
                                       failure) != 0)
             return -1;
     }
@@ -3515,33 +3473,26 @@ static int backup_metadata_preflight(const BackupPlan *plan, const SelectionPlan
 static int backup_execution_metadata_preflight(
     const BackupPlan *plan, const SelectionPlan *selection, int anchor_fd,
     int destination_root_fd, MetadataProfiles *profiles,
-    SourceReadRefusals *refusals, FailedItem *failure)
+    ExampleList *unreadable, FailedItem *failure)
 {
     return backup_metadata_preflight(plan, selection, anchor_fd, destination_root_fd,
-                                     profiles, refusals, failure);
+                                     profiles, unreadable, failure);
 }
 
-// The live run's native metadata preflight: every source item readable
-// without changing its access time, and the destination able to keep its
-// owner, permissions, and times. On a refusal, says why, then unchanged.
+// The live run's native metadata preflight: the destination able to keep
+// the source's owner, permissions, and times. An item that cannot be read is
+// left to capture, which lists it (D109). On a refusal, says why, then
+// unchanged.
 static int backup_metadata_check(const BackupPlan *plan,
                                  const SelectionPlan *selection, int anchor_fd,
                                  int destination_root_fd,
                                  MetadataProfiles *profiles,
-                                 SourceReadRefusals *refusals,
                                  const char *unchanged)
 {
     FailedItem failure = {0};
     int failed = backup_execution_metadata_preflight(
-        plan, selection, anchor_fd, destination_root_fd, profiles, refusals,
+        plan, selection, anchor_fd, destination_root_fd, profiles, NULL,
         &failure) != 0;
-    if (refusals->refusal_count > 0)
-    {
-        source_read_refusals_report(refusals);
-        print_error("Error: native metadata preflight refused the source\n");
-        print_error("  %s\n", unchanged);
-        return -1;
-    }
     if (failed)
     {
         print_item_failure("back up", failure.path, failure.step.step,
@@ -3595,8 +3546,7 @@ static int backup_dry_run(const char *target, BackupMode mode,
     FsCapabilityProfile advisory_profile;
     MetadataProfiles advisory_profiles;
     metadata_profiles_init(&advisory_profiles);
-    SourceReadRefusals advisory_refusals;
-    source_read_refusals_init(&advisory_refusals);
+    ExampleList advisory_unreadable = {0};
     int advisory_used_parent = 0;
     int advisory_fd = open_advisory_probe_fd(target, &advisory_used_parent);
     if (advisory_fd < 0)
@@ -3670,16 +3620,15 @@ static int backup_dry_run(const char *target, BackupMode mode,
         FailedItem advisory_failure = {0};
         int advisory_failed = backup_execution_metadata_preflight(
             plan, selection, advisory_fd, -1, &advisory_profiles,
-            &advisory_refusals, &advisory_failure) != 0;
-        if (advisory_refusals.refusal_count > 0)
+            &advisory_unreadable, &advisory_failure) != 0;
+        if (advisory_unreadable.count > 0)
         {
-            source_read_refusals_report(&advisory_refusals);
-            print_error("Error: native metadata preflight refused the source; "
-                   "no container was created\n");
-            close(advisory_fd);
-            metadata_profiles_free(&advisory_profiles);
-            backup_plan_free(plan);
-            return MIGR_EXIT_FAILURE;
+            print_warning("Warning: %zu item%s could not be read; the backup "
+                          "would go on without %s:\n",
+                          advisory_unreadable.count,
+                          advisory_unreadable.count == 1 ? "" : "s",
+                          advisory_unreadable.count == 1 ? "it" : "them");
+            example_list_print(&advisory_unreadable, "  ");
         }
         if (advisory_failed)
         {
@@ -4083,8 +4032,6 @@ static int backup_run(const char *target_arg, BackupMode mode,
     PortableRootSpec *portable_roots = NULL;
     MetadataProfiles metadata_profiles;
     metadata_profiles_init(&metadata_profiles);
-    SourceReadRefusals source_read_refusals;
-    source_read_refusals_init(&source_read_refusals);
     SourceSnapshot source_snapshot;
     source_snapshot_init(&source_snapshot);
     BackupDeferral deferral = {0};
@@ -4285,7 +4232,6 @@ static int backup_run(const char *target_arg, BackupMode mode,
             }
             if (backup_metadata_check(&plan, selection, adopted_data_fd,
                                       adopted_data_fd, &metadata_profiles,
-                                      &source_read_refusals,
                                       "No payload was changed.") != 0)
             {
                 close(adopted_data_fd);
@@ -4299,7 +4245,7 @@ static int backup_run(const char *target_arg, BackupMode mode,
     {
         if (repr == CLONE_NATIVE_TREE &&
             backup_metadata_check(&plan, selection, target_fd, -1,
-                                  &metadata_profiles, &source_read_refusals,
+                                  &metadata_profiles,
                                   "No container was created.") != 0)
             goto fail_pre_container;
         if (container_reserve_fd(target_fd, invoker_name(), manifest.updated,
@@ -4474,7 +4420,6 @@ static int backup_run(const char *target_arg, BackupMode mode,
             else if (full_root >= 0)
             {
                 print_root_capture_failure(&plan.roots[full_root],
-                                           BACKUP_CAPTURE_ERROR,
                                            &capture_report);
                 had_error = 1;
             }
@@ -4804,10 +4749,12 @@ static int backup_run(const char *target_arg, BackupMode mode,
     if (include_network_config)
         print_network_config_completion(network_config_processed_mask, target,
                                         container_current_name(&container));
-    // A source that changed under the backup does not fail it, but the run
-    // ends with the list and a warning status (D63).
-    finish_result = print_source_changes(&capture_report) ? MIGR_EXIT_CHANGED
-                                                          : MIGR_EXIT_OK;
+    // A source that changed under the backup does not fail it, nor does an
+    // item it could not read, but the run ends with the lists and a warning
+    // status (D63, D109).
+    int listed = print_source_changes(&capture_report);
+    listed |= print_failed_items(&capture_report);
+    finish_result = listed ? MIGR_EXIT_CHANGED : MIGR_EXIT_OK;
     if (keyring_selected)
         print_login_keyring_note();
 
@@ -4906,19 +4853,13 @@ int backup_selection_inventory(const SelectionPlan *plan, int anchor_fd,
     BackupPlan backup_plan;
     if (backup_plan_from_selection(plan, &backup_plan) != 0) return -1;
 
-    SourceReadRefusals refusals = {0};
     FailedItem failure = {0};
     int result = backup_metadata_preflight(&backup_plan, plan, anchor_fd, data_fd,
-                                           profiles, &refusals, &failure);
+                                           profiles, NULL, &failure);
     if (result != 0)
         print_item_failure("back up", failure.path, failure.step.step,
                            failure.step.err);
     backup_plan_free(&backup_plan);
-    if (result == 0 && refusals.refusal_count > 0)
-    {
-        source_read_refusals_report(&refusals);
-        return -1;
-    }
     return result;
 }
 

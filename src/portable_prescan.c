@@ -232,6 +232,22 @@ int portable_current_source_contains(const PortableCurrentSourceSet *set,
                : 0;
 }
 
+int portable_unreadable_covers(const PortablePrescanReport *report,
+                               const char *root_id, const char *logical)
+{
+    const PortableCurrentSourceSet *set = &report->unreadable;
+    for (size_t index = 0; index < set->count; index++) {
+        const char *path = set->entries[index].logical_path;
+        size_t length = strlen(path);
+        if (strcmp(set->entries[index].root_id, root_id) == 0 &&
+            (length == 0 ||
+             (strncmp(logical, path, length) == 0 &&
+              (logical[length] == '\0' || logical[length] == '/'))))
+            return 1;
+    }
+    return 0;
+}
+
 int prescan_report_add(PortablePrescanReport *report,
                        const PortablePrescanViolation *violation)
 {
@@ -831,9 +847,14 @@ static int portable_collision_assignments_build(
         count += groups->items[group_index].count;
     }
 
+    if (count == 0) {
+        *out = NULL;
+        *out_count = 0;
+        return 0;
+    }
     PortableCollisionAssignment *assignments =
-        count == 0 ? NULL : calloc(count, sizeof(*assignments));
-    if (count != 0 && assignments == NULL)
+        calloc(count, sizeof(*assignments));
+    if (assignments == NULL)
         return -1;
 
     size_t assignment_index = 0;
@@ -1192,15 +1213,15 @@ static int prescan_directory(int source_fd, const char *logical,
         probe_state == NULL || current_source == NULL)
         return -1;
 
+    // A folder that cannot be listed is left to capture, which lists it as
+    // an item it could not read (D109).
     int scan_fd = dup_cloexec(source_fd);
     DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
     if (directory == NULL) {
-        int saved_errno = errno;
-        prescan_record_operational_failure(report, logical, saved_errno);
         if (scan_fd >= 0)
             close(scan_fd);
-        errno = saved_errno;
-        return -1;
+        return portable_current_source_add(&report->unreadable, root_id,
+                                           logical);
     }
 
     PortableCaseFoldSet siblings = {0};
@@ -1212,13 +1233,10 @@ static int prescan_directory(int source_fd, const char *logical,
         errno = 0;
         struct dirent *entry = readdir(directory);
         if (entry == NULL) {
-            if (errno != 0) {
-                int saved_errno = errno;
-                prescan_record_operational_failure(report, logical,
-                                                   saved_errno);
-                errno = saved_errno;
+            if (errno != 0 &&
+                portable_current_source_add(&report->unreadable, root_id,
+                                            logical) != 0)
                 failed = 1;
-            }
             break;
         }
         if (strcmp(entry->d_name, ".") == 0 ||
@@ -1325,12 +1343,13 @@ static int prescan_directory(int source_fd, const char *logical,
 
         struct stat child_stat;
         if (read_source_stat(source_fd, entry->d_name, NULL, &child_stat) != 0) {
-            int saved_errno = errno;
-            prescan_record_operational_failure(report, child_logical,
-                                               saved_errno);
-            errno = saved_errno;
-            failed = 1;
-            break;
+            if (errno != ENOENT &&
+                portable_current_source_add(&report->unreadable, root_id,
+                                            child_logical) != 0) {
+                failed = 1;
+                break;
+            }
+            continue;
         }
         if ((S_ISDIR(child_stat.st_mode) || S_ISREG(child_stat.st_mode) ||
              S_ISLNK(child_stat.st_mode)) &&
@@ -1343,12 +1362,12 @@ static int prescan_directory(int source_fd, const char *logical,
             int child_fd = open_source_node(source_fd, entry->d_name, NULL,
                                             &child_stat);
             if (child_fd < 0) {
-                int saved_errno = errno;
-                prescan_record_operational_failure(report, child_logical,
-                                                   saved_errno);
-                errno = saved_errno;
-                failed = 1;
-                break;
+                if (portable_current_source_add(&report->unreadable, root_id,
+                                                child_logical) != 0) {
+                    failed = 1;
+                    break;
+                }
+                continue;
             }
             int child_result = prescan_directory(
                 child_fd, child_logical, root_id, report, case_sensitive,
@@ -1584,6 +1603,19 @@ static int prescan_root_payload_namespace(
     return failed ? -1 : 0;
 }
 
+static int prescan_root_unreadable(PortablePrescanReport *report,
+                                   const PortableRootSpec *root)
+{
+    int saved_errno = errno;
+    if (saved_errno != ENOENT && saved_errno != ENOTDIR &&
+        saved_errno != ELOOP)
+        return portable_current_source_add(&report->unreadable, root->id, "");
+    prescan_record_operational_failure(report, root->capture_path,
+                                       saved_errno);
+    errno = saved_errno;
+    return -1;
+}
+
 static int prescan_root(const PortableRootSpec *root,
                         PortablePrescanReport *report, int case_sensitive,
                         PortableCaseProbeState *probe_state,
@@ -1593,14 +1625,11 @@ static int prescan_root(const PortableRootSpec *root,
         current_source == NULL)
         return -1;
 
+    // A root that cannot be read is left to capture, as a folder is; one
+    // that is gone refuses the backup, as before.
     struct stat st;
-    if (read_source_stat(-1, NULL, root->capture_path, &st) != 0) {
-        int saved_errno = errno;
-        prescan_record_operational_failure(report, root->capture_path,
-                                           saved_errno);
-        errno = saved_errno;
-        return -1;
-    }
+    if (read_source_stat(-1, NULL, root->capture_path, &st) != 0)
+        return prescan_root_unreadable(report, root);
     if (S_ISFIFO(st.st_mode))
         return prescan_record_violation(report, root->id, "",
                                         PORTABLE_PRESCAN_UNSUPPORTED_KIND,
@@ -1618,13 +1647,8 @@ static int prescan_root(const PortableRootSpec *root,
         return 0;
 
     int root_fd = open_source_node(-1, NULL, root->capture_path, &st);
-    if (root_fd < 0) {
-        int saved_errno = errno;
-        prescan_record_operational_failure(report, root->capture_path,
-                                           saved_errno);
-        errno = saved_errno;
-        return -1;
-    }
+    if (root_fd < 0)
+        return prescan_root_unreadable(report, root);
     int result = prescan_directory(root_fd, "", root->id, report,
                                    case_sensitive, probe_state,
                                    root->selection, current_source);

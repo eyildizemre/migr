@@ -179,6 +179,9 @@ typedef struct {
     size_t example_capacity;
     PortableCollisionPlan collision_plan;
     PortableCurrentSourceSet current_source;
+    /* What could not be read or listed, so capture keeps what the backup
+     * holds there (D109). Unsorted. */
+    PortableCurrentSourceSet unreadable;
     size_t skipped_kind_count; /* Sockets/devices are capture warnings, not violations. */
     int operational_failure;
     int operational_failure_errno;
@@ -195,6 +198,10 @@ void portable_collision_plan_free(PortableCollisionPlan *plan);
 const PortableCollisionPlanEntry *portable_collision_plan_find(
     const PortableCollisionPlan *plan, const char *root_id,
     const char *logical_path);
+/* 1 when logical, or a folder above it, is one the pre-scan could not read
+ * (D109). */
+int portable_unreadable_covers(const PortablePrescanReport *report,
+                               const char *root_id, const char *logical);
 int portable_current_source_contains(const PortableCurrentSourceSet *set,
                                      const char *root_id,
                                      const char *logical_path);
@@ -249,6 +256,7 @@ typedef struct PortableCaptureContext {
     const PortableCollisionPlan *collision_plan;
     const PortableCurrentSourceSet *current_source;
     void *visited;
+    void *failed; /* Items that could not be read, kept with what is below them (D109). */
     void *inode_map;
     void *active_owners;
     void *tombstone_owners;

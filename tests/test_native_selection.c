@@ -15,20 +15,27 @@ static int failures;
 static int failure_triggered;
 // A source that vanishes is left out without failing (D63), so these
 // fixtures inject a read error instead: the named path's open fails with EIO,
-// an ordinary BACKUP_CAPTURE_ERROR, right as capture reaches it.
+// an item capture could not read (D109), right as capture reaches it.
 static void remove_child_before_open(const char *path, void *context)
 {
     if (strcmp(path, context) != 0) return;
     backup_test_fail_next_source_open(EIO);
     failure_triggered = 1;
 }
-// D2/D3 fixture: the same failure for a root that is neither first nor last
-// in a plan, as capture_roots() reaches it.
+// The same failure for a root that is neither first nor last in a plan, as
+// capture_roots() reaches it.
 static void remove_root_before_open(const char *path, void *context)
 {
     const char *target = context;
     if (strcmp(path, target) != 0) return;
     backup_test_fail_next_source_open(EIO);
+    failure_triggered = 1;
+}
+// A write of the named file's copy fails: a failure of the backup itself.
+static void fail_write_on_open(const char *path, void *context)
+{
+    if (strcmp(path, context) != 0) return;
+    backup_test_fail_content_writes(EIO, 1);
     failure_triggered = 1;
 }
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL %d: %s\n", __LINE__, #x); failures++; } } while (0)
@@ -194,14 +201,21 @@ int main(void)
     CHECK(a.st_mtim.tv_sec == times[1].tv_sec && a.st_mtim.tv_nsec == times[1].tv_nsec);
     CHECK(a.st_atim.tv_sec == times[0].tv_sec && a.st_atim.tv_nsec == times[0].tv_nsec);
 
-    /* A later source failure leaves stale payload intact for a safe retry. */
+    /* A root that cannot be read is listed and the capture goes on (D109):
+     * the backup keeps what it holds for it, and removes what is stale. */
     payload(q, &plan, parent, "stale");
     old = openat(data, q, O_CREAT | O_WRONLY | O_CLOEXEC, 0600);
     REQUIRE(old >= 0 && close(old) == 0);
+    backup_capture_report_init(&report);
     backup_test_set_capture_hook(remove_child_before_open, docs);
-    CHECK(backup_selection_capture(&ctx, &plan, data, &report) != BACKUP_CAPTURE_OK);
+    CHECK(backup_selection_capture(&ctx, &plan, data, &report) == BACKUP_CAPTURE_OK);
     backup_test_set_capture_hook(NULL, NULL);
     CHECK(failure_triggered);
+    CHECK(report.failed_items.count == 1 &&
+          strncmp(report.failed_items.text[0], docs, strlen(docs)) == 0 &&
+          strstr(report.failed_items.text[0], "keeps the copy it has") != NULL);
+    CHECK(fstatat(data, q, &a, 0) < 0);
+    payload(q, &plan, child, "alias");
     CHECK(fstatat(data, q, &a, 0) == 0);
     ctx.operation = CLONE_RESTORE;
     CHECK(backup_selection_capture(&ctx, &plan, data, &report) == BACKUP_CAPTURE_ERROR);
@@ -210,16 +224,13 @@ int main(void)
     selection_plan_free(&plan);
     free(home);
 
-    /* D2: a mid-plan capture failure must not block roots that come after
-     * it -- capture_roots() now continues through every root instead of the
-     * old backup_selection_capture() copy's goto-on-first-failure. D3: the
-     * failing root's own diagnostic must come from the shared per-root
-     * printing in capture_roots(), not the old blanket "Error: selected
-     * native capture failed" the caller used to print for every capture
-     * failure regardless of cause or root. Both need a root that is neither
-     * first nor last, so a fresh two-XDG-root home is built (Documents and
-     * Downloads are both always-included critical-scope XDG roots) rather
-     * than reusing the two-root `plan` above. */
+    /* A root that cannot be read mid-plan is listed, and the roots after it
+     * are still captured (D109); nothing is printed as an error, and the
+     * old blanket "Error: selected native capture failed" stays gone. This
+     * needs a root that is neither first nor last, so a fresh two-XDG-root
+     * home is built (Documents and Downloads are both always-included
+     * critical-scope XDG roots) rather than reusing the two-root `plan`
+     * above. */
     REQUIRE(mkdir("../home2", 0700) == 0);
     REQUIRE(mkdir("../data2", 0700) == 0);
     int data2 = open("../data2", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -280,10 +291,12 @@ int main(void)
     REQUIRE(fread(captured_text, 1, (size_t)captured_length, captured) == (size_t)captured_length);
     REQUIRE(fclose(captured) == 0);
 
-    CHECK(status2 != BACKUP_CAPTURE_OK);
+    CHECK(status2 == BACKUP_CAPTURE_OK);
     CHECK(failure_triggered);
-    CHECK(strstr(captured_text, "Error: could not back up") != NULL);
-    CHECK(strstr(captured_text, fail_path) != NULL);
+    CHECK(report2.failed_items.count == 1 &&
+          strncmp(report2.failed_items.text[0], fail_path,
+                  strlen(fail_path)) == 0);
+    CHECK(strstr(captured_text, "Error: could not back up") == NULL);
     CHECK(strstr(captured_text, "selected native capture failed") == NULL);
     free(captured_text);
 
@@ -291,6 +304,24 @@ int main(void)
     struct stat later_st;
     payload(later_payload, &plan2, later_index, "note");
     CHECK(fstatat(data2, later_payload, &later_st, 0) == 0);
+
+    /* A failure of the backup itself stops the capture at once: the roots
+     * after it are not captured (D109). */
+    REQUIRE(mkdir("../data3", 0700) == 0);
+    int data3 = open("../data3", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    REQUIRE(data3 >= 0);
+    char fail_note[PATH_MAX];
+    REQUIRE(path_join(fail_note, sizeof(fail_note), fail_path, "note") == 0);
+    BackupCaptureReport report3;
+    backup_capture_report_init(&report3);
+    failure_triggered = 0;
+    backup_test_set_capture_hook(fail_write_on_open, fail_note);
+    CHECK(backup_selection_capture(&ctx2, &plan2, data3, &report3) ==
+          BACKUP_CAPTURE_ERROR);
+    backup_test_set_capture_hook(NULL, NULL);
+    CHECK(failure_triggered);
+    CHECK(fstatat(data3, later_payload, &later_st, 0) < 0);
+    REQUIRE(close(data3) == 0);
 
     selection_plan_free(&plan2);
     free(home2);

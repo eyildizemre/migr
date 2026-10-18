@@ -1036,7 +1036,7 @@ test_packages() {
 }
 
 test_error_propagation() {
-    echo -e "${BLUE}::${NC} Phase 6: backup error propagation"
+    echo -e "${BLUE}::${NC} Phase 6: an item that cannot be read"
 
     # A 0000 file is denied even to its owner, so the copy's open() fails — a durable
     # failure that (unlike a FIFO) stays a failure after special-file support lands.
@@ -1056,22 +1056,36 @@ test_error_propagation() {
     if output=$("$MIGR" backup "$err_backup" "$HOME/locked.txt" 2>&1); then rc=0; else rc=$?; fi
     chmod 644 "$HOME/locked.txt"  # restore so teardown and later phases are unaffected
 
-    if [ "$rc" -ne 0 ]; then
-        echo -e "  ${GREEN}✓${NC} A failed copy exits non-zero ($rc), not 0."
+    # The backup goes on past it, lists it, and exits 1 (D109).
+    if [ "$rc" -eq 1 ]; then
+        echo -e "  ${GREEN}✓${NC} An item that cannot be read exits 1."
     else
-        echo -e "  ${RED}✗${NC} A failed copy still exited 0!"
+        echo -e "  ${RED}✗${NC} An item that cannot be read exited $rc, not 1!"
         echo "$output"
         exit 1
     fi
 
-    # Native metadata preflight may reject the source before reserving a
-    # container; either path must be reported as a failed backup, never plain
-    # success.
-    if [[ "$output" != *"errors"* && "$output" != *"could not back up"*"locked.txt: open it"* ]]; then
-        echo -e "  ${RED}✗${NC} Failure was not reported as a backup error."
+    if [[ "$output" != *"Could not read 1 item"*"locked.txt: open it: Permission denied"* ]]; then
+        echo -e "  ${RED}✗${NC} The item was not listed with what failed."
         echo "$output"
         exit 1
     fi
+    echo -e "  ${GREEN}✓${NC} The item is listed with what failed and why."
+
+    if [ ! -d "$err_backup/migr-$(id -un)" ]; then
+        echo -e "  ${RED}✗${NC} The backup was not published."
+        ls -la "$err_backup"
+        exit 1
+    fi
+    echo -e "  ${GREEN}✓${NC} The backup is published."
+
+    if ! grep -q "^Could not back up: .*locked.txt: open it: Permission denied" \
+            "$err_backup/migr-$(id -un)"/logs/*.log ||
+       ! grep -q "errno 13 (EACCES)" "$err_backup/migr-$(id -un)"/logs/*.log; then
+        echo -e "  ${RED}✗${NC} The log in the backup does not list the item with its errno."
+        exit 1
+    fi
+    echo -e "  ${GREEN}✓${NC} The log in the backup lists it with its errno."
 }
 
 test_comprehensive() {
@@ -1858,131 +1872,65 @@ test_probe_refusal() {
 
 
 test_native_stale_reconciliation() {
-    # The two roots are deliberately separate. capture_directory_at stops
-    # the current root at its first child error, so putting the broken
-    # fixture beside the file under test would make the result depend on
-    # readdir() order.
+    # An item that cannot be read is listed and the backup goes on (D109):
+    # the backup keeps what it held for it, with everything below it, while
+    # reconciliation still removes what left the source elsewhere.
     local sr_dest="$TEST_DIR/cp_stale_reconcile"
     local sr_keep="$TEST_DIR/cp_stale_reconcile_a_keep"
     local sr_broken="$TEST_DIR/cp_stale_reconcile_b_broken"
     mkdir -p "$sr_dest" "$sr_keep" "$sr_broken"
     echo will-be-deleted > "$sr_keep/gone.txt"
     echo stays-forever   > "$sr_keep/keeps.txt"
-    for i in $(seq -w 0 4999); do
-        echo filler > "$sr_keep/filler-$i"
-    done
     echo locked > "$sr_broken/locked.txt"
+    "$MIGR" backup "$sr_dest" "$sr_keep" "$sr_broken" >/dev/null 2>&1
 
-    local sr_race_pid sr_race_status
-    (
-        for _ in $(seq 1 1000); do
-            if compgen -G "$sr_dest/migr-*.partial" > /dev/null; then
-                chmod 000 "$sr_broken"
-                exit 0
-            fi
-        sleep 0.001
-        done
-        exit 1
-    ) &
-    sr_race_pid=$!
-    local sr_first_out sr_first_rc
-    set +e
-    sr_first_out=$("$MIGR" backup "$sr_dest" "$sr_keep" "$sr_broken" 2>&1)
-    sr_first_rc=$?
-    set -e
-    set +e
-    wait "$sr_race_pid"
-    sr_race_status=$?
-    set -e
-
-    local sr_partial
-    sr_partial=$(containers_matching "$sr_dest" partial)
-    if [ "$sr_first_rc" -eq 0 ] || [ "$sr_race_status" -ne 0 ] ||
-       [ -z "$sr_partial" ] || [ ! -f "$sr_partial/data/cp_stale_reconcile_a_keep/gone.txt" ]; then
-        echo -e "  ${RED}✗${NC} Reconciliation fixture did not produce a partial containing the keep root"
-        echo "  exit=$sr_first_rc race=$sr_race_status output: $sr_first_out"
-        return 1
-    fi
-    chmod 755 "$sr_broken"
     rm -f "$sr_keep/gone.txt"
-
-    local sr_final sr_second_out
-    sr_second_out=$("$MIGR" backup "$sr_dest" "$sr_keep" "$sr_broken" 2>&1)
+    chmod 000 "$sr_broken"
+    local sr_rc sr_out
+    set +e
+    sr_out=$("$MIGR" backup "$sr_dest" "$sr_keep" "$sr_broken" 2>&1)
+    sr_rc=$?
+    set -e
+    chmod 755 "$sr_broken"
+    local sr_final
     sr_final=$(sole_final_container "$sr_dest")
     assert_no_partial "$sr_dest"
-    if [ ! -e "$sr_final/data/cp_stale_reconcile_a_keep/gone.txt" ] &&
+    if [ "$sr_rc" -eq 1 ] && [[ "$sr_out" == *"cp_stale_reconcile_b_broken: open the folder"* ]] &&
+       [ ! -e "$sr_final/data/cp_stale_reconcile_a_keep/gone.txt" ] &&
        [ "$(cat "$sr_final/data/cp_stale_reconcile_a_keep/keeps.txt")" = "stays-forever" ] &&
        [ "$(cat "$sr_final/data/cp_stale_reconcile_b_broken/locked.txt")" = "locked" ]; then
-        echo -e "  ${GREEN}✓${NC} A disappeared source file is removed from the resumed final backup."
+        echo -e "  ${GREEN}✓${NC} An unreadable root keeps its copy; a disappeared file elsewhere is removed."
     else
         echo -e "  ${RED}✗${NC} Stale reconciliation removed the wrong thing, or not the right one"
-        echo "  output: $sr_second_out"
+        echo "  exit=$sr_rc output: $sr_out"
         return 1
     fi
 
+    # The same for a folder inside a root, beside a file that left the source.
     local sg_dest="$TEST_DIR/cp_stale_reconcile_gate"
-    local sg_keep="$TEST_DIR/cp_stale_reconcile_gate_a_keep"
-    local sg_broken="$TEST_DIR/cp_stale_reconcile_gate_b_broken"
-    mkdir -p "$sg_dest" "$sg_keep" "$sg_broken"
-    echo will-survive > "$sg_keep/gone.txt"
-    echo stays         > "$sg_keep/keeps.txt"
-    for i in $(seq -w 0 4999); do
-        echo filler > "$sg_keep/filler-$i"
-    done
-    echo locked > "$sg_broken/locked.txt"
+    local sg_root="$TEST_DIR/cp_stale_reconcile_gate_root"
+    mkdir -p "$sg_dest" "$sg_root/broken"
+    echo will-be-deleted > "$sg_root/gone.txt"
+    echo locked > "$sg_root/broken/locked.txt"
+    "$MIGR" backup "$sg_dest" "$sg_root" >/dev/null 2>&1
 
-    (
-        for _ in $(seq 1 1000); do
-            if compgen -G "$sg_dest/migr-*.partial" > /dev/null; then
-                chmod 000 "$sg_broken"
-                exit 0
-            fi
-            sleep 0.001
-        done
-        exit 1
-    ) &
-    local sg_race_pid=$!
+    rm -f "$sg_root/gone.txt" "$sg_root/broken/locked.txt"
+    chmod 000 "$sg_root/broken"
+    local sg_rc
     set +e
-    "$MIGR" backup "$sg_dest" "$sg_keep" "$sg_broken" >/dev/null 2>&1
-    local sg_first_rc=$?
-    wait "$sg_race_pid"
-    local sg_first_race=$?
+    "$MIGR" backup "$sg_dest" "$sg_root" >/dev/null 2>&1
+    sg_rc=$?
     set -e
-    local sg_partial
-    sg_partial=$(containers_matching "$sg_dest" partial)
-    if [ "$sg_first_rc" -eq 0 ] || [ "$sg_first_race" -ne 0 ] ||
-       [ -z "$sg_partial" ] || [ ! -f "$sg_partial/data/cp_stale_reconcile_gate_a_keep/gone.txt" ]; then
-        echo -e "  ${RED}✗${NC} Global reconciliation gate fixture did not produce its first partial"
-        return 1
-    fi
-
-    chmod 755 "$sg_broken"
-    rm -f "$sg_keep/gone.txt"
-    (
-        for _ in $(seq 1 1000); do
-            if compgen -G "$sg_dest/migr-*.partial" > /dev/null; then
-                chmod 000 "$sg_broken"
-                exit 0
-            fi
-            sleep 0.001
-        done
-        exit 1
-    ) &
-    local sg_second_race_pid=$!
-    set +e
-    "$MIGR" backup "$sg_dest" "$sg_keep" "$sg_broken" >/dev/null 2>&1
-    local sg_second_rc=$?
-    wait "$sg_second_race_pid"
-    local sg_second_race=$?
-    set -e
-    chmod 755 "$sg_broken"
-    sg_partial=$(containers_matching "$sg_dest" partial)
-    if [ "$sg_second_rc" -ne 0 ] && [ "$sg_second_race" -eq 0 ] &&
-       [ -z "$(containers_matching "$sg_dest" final)" ] &&
-       [ -f "$sg_partial/data/cp_stale_reconcile_gate_a_keep/gone.txt" ]; then
-        echo -e "  ${GREEN}✓${NC} An incomplete walk leaves stale payload untouched and blocks finalization."
+    chmod 755 "$sg_root/broken"
+    local sg_final
+    sg_final=$(sole_final_container "$sg_dest")
+    assert_no_partial "$sg_dest"
+    if [ "$sg_rc" -eq 1 ] &&
+       [ ! -e "$sg_final/data/cp_stale_reconcile_gate_root/gone.txt" ] &&
+       [ "$(cat "$sg_final/data/cp_stale_reconcile_gate_root/broken/locked.txt")" = "locked" ]; then
+        echo -e "  ${GREEN}✓${NC} An unreadable folder keeps what is below it; a disappeared sibling is removed."
     else
-        echo -e "  ${RED}✗${NC} An incomplete walk authorized stale deletion"
+        echo -e "  ${RED}✗${NC} An unreadable folder lost what was below it, or a stale sibling stayed"
         return 1
     fi
 }
@@ -2063,126 +2011,110 @@ test_container_production() {
         exit 1
     fi
 
-    # --- an unreadable root: fail, keep a valid partial, then resume it ---
-    # Root bypasses permission bits, so the unreadable-file reproduction only
-    # holds as a normal user.
-    if [ "$(id -u)" -eq 0 ]; then
-        echo -e "  ${BLUE}i${NC} Resume case skipped (root bypasses 0000 permissions)."
+    # --- a failed write: keep a valid partial, then resume it ---
+    # A file-size limit makes the copy of a large file fail with EFBIG, a
+    # failure of the backup itself, unlike a source it cannot read (D109).
+    # SIGXFSZ is ignored so that the write returns the error.
+    local resume_dest="$TEST_DIR/cp_resume" resume_src="$HOME/resume_root"
+    mkdir -p "$resume_dest" "$resume_src"
+    echo readable > "$resume_src/good.txt"
+    head -c 65536 /dev/zero > "$resume_src/large.bin"
+
+    local first_out first_rc
+    set +e
+    first_out=$( (trap '' XFSZ; ulimit -f 16; "$MIGR" backup "$resume_dest" "$resume_src") 2>&1)
+    first_rc=$?
+    set -e
+
+    local partial
+    partial=$(containers_matching "$resume_dest" partial)
+    if [ "$first_rc" -eq 2 ] &&
+       [ -z "$(containers_matching "$resume_dest" final)" ] &&
+       [ -n "$partial" ] &&
+       [ -f "$partial/manifest.txt" ] &&
+       [[ "$first_out" == *"kept for resume"* ]]; then
+        echo -e "  ${GREEN}✓${NC} A failed capture publishes nothing and keeps a manifest-carrying partial."
     else
-        local resume_dest="$TEST_DIR/cp_resume" resume_src="$HOME/resume_root"
-        mkdir -p "$resume_dest" "$resume_src"
-        echo readable > "$resume_src/good.txt"
-        echo locked   > "$resume_src/locked.txt"
-        chmod 000 "$resume_src/locked.txt"
+        echo -e "  ${RED}✗${NC} Failed backup did not leave a resumable partial"
+        echo "  exit=$first_rc output: $first_out"
+        exit 1
+    fi
 
-        local first_out first_rc
-        set +e
-        first_out=$("$MIGR" backup "$resume_dest" "$resume_src" 2>&1)
-        first_rc=$?
-        set -e
+    # Two control-slot hazards planted in the partial at once: a symlink
+    # (which must not be written through) and, on the next round, a plain
+    # file (which must not survive into the published container). Restore
+    # acts on whatever packages.txt it finds without re-deriving scope, so
+    # an explicit backup that publishes one would drive package installs it
+    # never recorded.
+    local pkg_sentinel="$TEST_DIR/cp_pkg_sentinel"
+    echo untouched > "$pkg_sentinel"
+    ln -s "$pkg_sentinel" "$partial/packages.txt"
 
-        local partial
-        partial=$(containers_matching "$resume_dest" partial)
-        if [ "$first_rc" -ne 0 ] &&
-           [ -z "$(containers_matching "$resume_dest" final)" ] &&
-           [ -n "$partial" ] &&
-           [ -f "$partial/manifest.txt" ] &&
-           [[ "$first_out" == *"kept for resume"* ]]; then
-            echo -e "  ${GREEN}✓${NC} A failed capture publishes nothing and keeps a manifest-carrying partial."
-        elif [ "$first_rc" -ne 0 ] &&
-             [[ "$first_out" == *"could not back up"*"locked.txt: open it"* ]] &&
-             [ -z "$(containers_matching "$resume_dest" partial)" ] &&
-             [ -z "$(containers_matching "$resume_dest" final)" ]; then
-            echo -e "  ${GREEN}✓${NC} Source metadata preflight rejected the inaccessible root before reserving a container."
-            rm -rf "$resume_dest" "$resume_src"
-            return 0
-        else
-            echo -e "  ${RED}✗${NC} Failed backup did not leave a resumable partial"
-            echo "  exit=$first_rc output: $first_out"
-            exit 1
-        fi
+    local second_out
+    second_out=$("$MIGR" backup "$resume_dest" "$resume_src" 2>&1)
 
-        # Two control-slot hazards planted in the partial at once: a symlink
-        # (which must not be written through) and, on the next round, a plain
-        # file (which must not survive into the published container). Restore
-        # acts on whatever packages.txt it finds without re-deriving scope, so
-        # an explicit backup that publishes one would drive package installs it
-        # never recorded.
-        local pkg_sentinel="$TEST_DIR/cp_pkg_sentinel"
-        echo untouched > "$pkg_sentinel"
-        ln -s "$pkg_sentinel" "$partial/packages.txt"
+    local resumed
+    resumed=$(sole_final_container "$resume_dest")
+    assert_no_partial "$resume_dest"
+    assert_contains "$second_out" "Resuming an interrupted backup"
+    if [ "$(cat "$resumed/data/resume_root/good.txt")" = "readable" ] &&
+       cmp -s "$resume_src/large.bin" "$resumed/data/resume_root/large.bin"; then
+        echo -e "  ${GREEN}✓${NC} The rerun adopted that partial and finalized it with the full payload."
+    else
+        echo -e "  ${RED}✗${NC} Resumed container is missing payload"
+        echo "  output: $second_out"
+        exit 1
+    fi
 
-        chmod 644 "$resume_src/locked.txt"
-        local second_out
-        second_out=$("$MIGR" backup "$resume_dest" "$resume_src" 2>&1)
+    if [ "$(cat "$pkg_sentinel")" = "untouched" ] && [ ! -e "$resumed/packages.txt" ]; then
+        echo -e "  ${GREEN}✓${NC} A symlinked packages.txt was neither written through nor published."
+    else
+        echo -e "  ${RED}✗${NC} A symlinked packages.txt was written through or survived into the final container"
+        exit 1
+    fi
 
-        local resumed
-        resumed=$(sole_final_container "$resume_dest")
-        assert_no_partial "$resume_dest"
-        assert_contains "$second_out" "Resuming an interrupted backup"
-        if [ "$(cat "$resumed/data/resume_root/good.txt")" = "readable" ] &&
-           [ "$(cat "$resumed/data/resume_root/locked.txt")" = "locked" ]; then
-            echo -e "  ${GREEN}✓${NC} The rerun adopted that partial and finalized it with the full payload."
-        else
-            echo -e "  ${RED}✗${NC} Resumed container is missing payload"
-            echo "  output: $second_out"
-            exit 1
-        fi
+    # Same shape, but a perfectly ordinary file: an explicit backup exports
+    # no package list, so a resumed container must not publish one.
+    local stale_dest="$TEST_DIR/cp_stale"
+    mkdir -p "$stale_dest"
+    (trap '' XFSZ; ulimit -f 16; "$MIGR" backup "$stale_dest" "$resume_src") >/dev/null 2>&1 || true
+    local stale_partial
+    stale_partial=$(containers_matching "$stale_dest" partial)
+    echo "malicious-package" > "$stale_partial/packages.txt"
+    "$MIGR" backup "$stale_dest" "$resume_src" >/dev/null 2>&1
 
-        if [ "$(cat "$pkg_sentinel")" = "untouched" ] && [ ! -e "$resumed/packages.txt" ]; then
-            echo -e "  ${GREEN}✓${NC} A symlinked packages.txt was neither written through nor published."
-        else
-            echo -e "  ${RED}✗${NC} A symlinked packages.txt was written through or survived into the final container"
-            exit 1
-        fi
+    local stale_final
+    stale_final=$(sole_final_container "$stale_dest")
+    if [ ! -e "$stale_final/packages.txt" ]; then
+        echo -e "  ${GREEN}✓${NC} A stale packages.txt in an adopted partial is cleared, not published."
+    else
+        echo -e "  ${RED}✗${NC} An explicit backup published a package list it never exported:"
+        cat "$stale_final/packages.txt"
+        exit 1
+    fi
 
-        # Same shape, but a perfectly ordinary file: an explicit backup exports
-        # no package list, so a resumed container must not publish one.
-        local stale_dest="$TEST_DIR/cp_stale"
-        mkdir -p "$stale_dest"
-        chmod 000 "$resume_src/locked.txt"
-        "$MIGR" backup "$stale_dest" "$resume_src" >/dev/null 2>&1 || true
-        local stale_partial
-        stale_partial=$(containers_matching "$stale_dest" partial)
-        echo "malicious-package" > "$stale_partial/packages.txt"
-        chmod 644 "$resume_src/locked.txt"
-        "$MIGR" backup "$stale_dest" "$resume_src" >/dev/null 2>&1
+    # A control slot that cannot be cleared at all must block publication
+    # rather than be finalized around.
+    local stuck_dest="$TEST_DIR/cp_stuck"
+    mkdir -p "$stuck_dest"
+    (trap '' XFSZ; ulimit -f 16; "$MIGR" backup "$stuck_dest" "$resume_src") >/dev/null 2>&1 || true
+    local stuck_partial
+    stuck_partial=$(containers_matching "$stuck_dest" partial)
+    mkdir -p "$stuck_partial/packages.txt/stuck"
 
-        local stale_final
-        stale_final=$(sole_final_container "$stale_dest")
-        if [ ! -e "$stale_final/packages.txt" ]; then
-            echo -e "  ${GREEN}✓${NC} A stale packages.txt in an adopted partial is cleared, not published."
-        else
-            echo -e "  ${RED}✗${NC} An explicit backup published a package list it never exported:"
-            cat "$stale_final/packages.txt"
-            exit 1
-        fi
-
-        # A control slot that cannot be cleared at all must block publication
-        # rather than be finalized around.
-        local stuck_dest="$TEST_DIR/cp_stuck"
-        mkdir -p "$stuck_dest"
-        chmod 000 "$resume_src/locked.txt"
-        "$MIGR" backup "$stuck_dest" "$resume_src" >/dev/null 2>&1 || true
-        local stuck_partial
-        stuck_partial=$(containers_matching "$stuck_dest" partial)
-        mkdir -p "$stuck_partial/packages.txt/stuck"
-        chmod 644 "$resume_src/locked.txt"
-
-        local stuck_out stuck_rc
-        set +e
-        stuck_out=$("$MIGR" backup "$stuck_dest" "$resume_src" 2>&1)
-        stuck_rc=$?
-        set -e
-        if [ "$stuck_rc" -ne 0 ] &&
-           [ -z "$(containers_matching "$stuck_dest" final)" ] &&
-           [[ "$stuck_out" == *"could not clear packages.txt"* ]]; then
-            echo -e "  ${GREEN}✓${NC} An unclearable control slot blocks finalization instead of being published."
-        else
-            echo -e "  ${RED}✗${NC} An unclearable packages.txt did not block finalization"
-            echo "  exit=$stuck_rc output: $stuck_out"
-            exit 1
-        fi
+    local stuck_out stuck_rc
+    set +e
+    stuck_out=$("$MIGR" backup "$stuck_dest" "$resume_src" 2>&1)
+    stuck_rc=$?
+    set -e
+    if [ "$stuck_rc" -ne 0 ] &&
+       [ -z "$(containers_matching "$stuck_dest" final)" ] &&
+       [[ "$stuck_out" == *"could not clear packages.txt"* ]]; then
+        echo -e "  ${GREEN}✓${NC} An unclearable control slot blocks finalization instead of being published."
+    else
+        echo -e "  ${RED}✗${NC} An unclearable packages.txt did not block finalization"
+        echo "  exit=$stuck_rc output: $stuck_out"
+        exit 1
     fi
 
     # --- a destination inside a selected root is refused before anything runs ---
@@ -2253,68 +2185,65 @@ test_container_production() {
     # already there would block the backup forever (a FIFO has no reader) or
     # destroy a file outside the container (a hardlink would be truncated and
     # overwritten with the package list).
-    if [ "$(id -u)" -eq 0 ]; then
-        echo -e "  ${BLUE}i${NC} Control-slot cases skipped (root bypasses 0000 permissions)."
+
+    # The large file has to sit inside a root --critical actually
+    # captures, or the first backup would simply succeed and leave no
+    # partial to plant anything in. A file-size limit fails its copy, as
+    # in the resume case above.
+    mkdir -p "$HOME/Documents"
+    local slot_large="$HOME/Documents/slot_large.bin"
+
+    # Leaves a partial behind, with its packages.txt removed so the hazard
+    # can be planted in an empty slot.
+    make_partial_with_empty_slot() {
+        local dest="$1" p
+        rm -rf "$dest"; mkdir -p "$dest"
+        head -c 65536 /dev/zero > "$slot_large"
+        (trap '' XFSZ; ulimit -f 16; "$MIGR" backup "$dest" --critical) >/dev/null 2>&1 || true
+        rm -f "$slot_large"
+        p=$(containers_matching "$dest" partial)
+        if [ -z "$p" ] || [ ! -d "$p" ]; then
+            echo -e "  ${RED}✗${NC} fixture: no partial container to plant a control-slot hazard in" >&2
+            exit 1
+        fi
+        rm -f "$p/packages.txt"
+        printf '%s' "$p"
+    }
+
+    local fifo_dest="$TEST_DIR/cp_slot_fifo" fifo_partial fifo_rc
+    fifo_partial=$(make_partial_with_empty_slot "$fifo_dest")
+    mkfifo "$fifo_partial/packages.txt"
+    set +e
+    timeout 60 "$MIGR" backup "$fifo_dest" --critical >/dev/null 2>&1
+    fifo_rc=$?
+    set -e
+    local fifo_final
+    fifo_final=$(sole_final_container "$fifo_dest")
+    if [ "$fifo_rc" -ne 124 ] && [ -f "$fifo_final/packages.txt" ] &&
+       [ ! -p "$fifo_final/packages.txt" ]; then
+        echo -e "  ${GREEN}✓${NC} A FIFO in the packages.txt slot neither blocks the backup nor survives it."
     else
-        # The unreadable file has to sit inside a root --critical actually
-        # captures, or the first backup would simply succeed and leave no
-        # partial to plant anything in.
-        mkdir -p "$HOME/Documents"
-        local slot_locked="$HOME/Documents/slot_locked.txt"
+        echo -e "  ${RED}✗${NC} A FIFO packages.txt blocked the backup or was published (exit=$fifo_rc)"
+        exit 1
+    fi
 
-        # Leaves a partial behind, with its packages.txt removed so the hazard
-        # can be planted in an empty slot.
-        make_partial_with_empty_slot() {
-            local dest="$1" p
-            rm -rf "$dest"; mkdir -p "$dest"
-            echo locked > "$slot_locked"
-            chmod 000 "$slot_locked"
-            "$MIGR" backup "$dest" --critical >/dev/null 2>&1 || true
-            chmod 644 "$slot_locked"
-            p=$(containers_matching "$dest" partial)
-            if [ -z "$p" ] || [ ! -d "$p" ]; then
-                echo -e "  ${RED}✗${NC} fixture: no partial container to plant a control-slot hazard in" >&2
-                exit 1
-            fi
-            rm -f "$p/packages.txt"
-            printf '%s' "$p"
-        }
+    local hl_dest="$TEST_DIR/cp_slot_hardlink" hl_partial
+    local hl_sentinel="$TEST_DIR/cp_slot_sentinel"
+    echo sentinel-original > "$hl_sentinel"
+    hl_partial=$(make_partial_with_empty_slot "$hl_dest")
+    ln "$hl_sentinel" "$hl_partial/packages.txt"
+    "$MIGR" backup "$hl_dest" --critical >/dev/null 2>&1
 
-        local fifo_dest="$TEST_DIR/cp_slot_fifo" fifo_partial fifo_rc
-        fifo_partial=$(make_partial_with_empty_slot "$fifo_dest")
-        mkfifo "$fifo_partial/packages.txt"
-        set +e
-        timeout 60 "$MIGR" backup "$fifo_dest" --critical >/dev/null 2>&1
-        fifo_rc=$?
-        set -e
-        local fifo_final
-        fifo_final=$(sole_final_container "$fifo_dest")
-        if [ "$fifo_rc" -ne 124 ] && [ -f "$fifo_final/packages.txt" ] &&
-           [ ! -p "$fifo_final/packages.txt" ]; then
-            echo -e "  ${GREEN}✓${NC} A FIFO in the packages.txt slot neither blocks the backup nor survives it."
-        else
-            echo -e "  ${RED}✗${NC} A FIFO packages.txt blocked the backup or was published (exit=$fifo_rc)"
-            exit 1
-        fi
-
-        local hl_dest="$TEST_DIR/cp_slot_hardlink" hl_partial
-        local hl_sentinel="$TEST_DIR/cp_slot_sentinel"
-        echo sentinel-original > "$hl_sentinel"
-        hl_partial=$(make_partial_with_empty_slot "$hl_dest")
-        ln "$hl_sentinel" "$hl_partial/packages.txt"
-        "$MIGR" backup "$hl_dest" --critical >/dev/null 2>&1
-
-        local hl_final
-        hl_final=$(sole_final_container "$hl_dest")
-        if [ "$(cat "$hl_sentinel")" = "sentinel-original" ] &&
-           [ "$(stat -c '%h' "$hl_sentinel")" -eq 1 ] &&
-           [ -s "$hl_final/packages.txt" ]; then
-            echo -e "  ${GREEN}✓${NC} A hardlinked packages.txt is unlinked, not truncated: the outside file survives."
-        else
-            echo -e "  ${RED}✗${NC} A hardlinked packages.txt was written through to a file outside the container"
-            echo "  sentinel: $(head -1 "$hl_sentinel")  links: $(stat -c '%h' "$hl_sentinel")"
-            exit 1
-        fi
+    local hl_final
+    hl_final=$(sole_final_container "$hl_dest")
+    if [ "$(cat "$hl_sentinel")" = "sentinel-original" ] &&
+       [ "$(stat -c '%h' "$hl_sentinel")" -eq 1 ] &&
+       [ -s "$hl_final/packages.txt" ]; then
+        echo -e "  ${GREEN}✓${NC} A hardlinked packages.txt is unlinked, not truncated: the outside file survives."
+    else
+        echo -e "  ${RED}✗${NC} A hardlinked packages.txt was written through to a file outside the container"
+        echo "  sentinel: $(head -1 "$hl_sentinel")  links: $(stat -c '%h' "$hl_sentinel")"
+        exit 1
     fi
 
     # --- an external root stays MANUAL_NATIVE: captured, reported, never restored ---

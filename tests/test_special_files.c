@@ -1133,10 +1133,21 @@ int main(void)
            strcmp(differing_target, "target-of-the-source-link") == 0),
           "an existing symlink with a different target is replaced");
 
+    // An item that cannot be read is listed and left out (D109).
+    BackupCaptureReport report;
+    backup_capture_report_init(&report);
+    char truncated_dest[PATH_MAX];
+    if (path_join(truncated_dest, sizeof(truncated_dest), dest_dir,
+                  "truncated.link") != 0)
+        fatal("could not build fixture paths");
     readlink_truncate_path = src_symlink;
     readlink_truncate_triggered = 0;
-    check(backup_capture_at(&ctx, src_symlink, dest_fd, "truncated.link") != 0,
-          "a readlink() that fills the whole buffer is refused, not silently truncated");
+    check(backup_capture_at_report(&ctx, src_symlink, dest_fd,
+                                   "truncated.link", &report) == 0 &&
+              report.failed_items.count == 1 &&
+              strstr(report.failed_items.text[0], ": read the link: ") != NULL &&
+              lstat(truncated_dest, &st) != 0,
+          "a readlink() that fills the whole buffer is listed, not silently truncated");
     check(readlink_truncate_triggered, "the truncation fixture actually fired");
     readlink_truncate_path = NULL;
 
@@ -1183,7 +1194,6 @@ int main(void)
           "a directory where a FIFO belongs is replaced");
 
     // A failure names the item, what was being done, and errno.
-    BackupCaptureReport report;
     backup_capture_report_init(&report);
     char locked[PATH_MAX], locked_child[PATH_MAX];
     if (path_join(locked, sizeof(locked), dest_dir, "locked") != 0 ||
@@ -1215,16 +1225,19 @@ int main(void)
     write_file(unreadable, "secret");
     if (chmod(unreadable, 0000) != 0)
         fatal("could not make the unreadable fixture");
+    char unreadable_line[PATH_MAX + 64];
+    snprintf(unreadable_line, sizeof(unreadable_line), "%s: open it: %s",
+             unreadable, strerror(EACCES));
+    backup_capture_report_init(&report);
     if (geteuid() == 0)
         skip_check("an unreadable file is named with errno (root reads it)");
     else
         check(backup_capture_at_report(&ctx, unreadable, dest_fd,
-                                       "unreadable.txt", &report) != 0 &&
-                  strcmp(report.failed_source_path, unreadable) == 0 &&
-                  report.failed_operation != NULL &&
-                  strcmp(report.failed_operation, "open it") == 0 &&
-                  report.failure_errno == EACCES,
-              "an unreadable file is named with what failed and errno");
+                                       "unreadable.txt", &report) == 0 &&
+                  report.failed_items.count == 1 &&
+                  strcmp(report.failed_items.text[0], unreadable_line) == 0 &&
+                  report.failure_kind == BACKUP_CAPTURE_FAILURE_NONE,
+              "an unreadable file is listed with what failed and errno");
     if (chmod(unreadable, 0644) != 0)
         fatal("could not restore the unreadable fixture");
 

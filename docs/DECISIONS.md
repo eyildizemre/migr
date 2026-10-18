@@ -519,7 +519,7 @@ D8's native exit-right boundary.
 
 ## D17 — 2026-08-01 — Sidecar v1 and the core metadata contract are frozen
 
-**Status:** Implemented (Phase B closed 2026-08-04; as-built notes in "Restore atime exactness" and "Relationship" below); superseded in part by D85 (the backup user's items go to the restoring user)
+**Status:** Implemented (Phase B closed 2026-08-04; as-built notes in "Restore atime exactness" and "Relationship" below); superseded in part by D85 (the backup user's items go to the restoring user) and D109 (a refused O_NOATIME open leaves the item out instead of failing the backup)
 
 **Decision:** Phase B uses a versioned, NUL-framed, append-only sidecar as the
 authoritative state log for portable capture and resume. The sidecar and its payload
@@ -4603,6 +4603,10 @@ failure.
 
 **Relationship:** Refines D59, D63, and D67.
 
+**Revision (2026-10-18):** Status 1 also covers a backup that could not read
+some items, which it lists (D109). A failure of the backup itself is still
+2.
+
 ## D69 — 2026-09-27 — A native restore restores open applications' settings last too
 
 **Status:** Implemented
@@ -4928,7 +4932,7 @@ the user has to take off the screen.
 
 ## D79 — 2026-09-27 — A backup or restore keeps a log only when it has something to say
 
-**Status:** Implemented
+**Status:** Implemented; revised in part by D109 (each item a backup could not read is listed, not only the first)
 
 **Decision:** `backup` and `restore` (not dry runs) log the run. At the
 start, `stdout` and `stderr` are replaced by `fopencookie()` streams that
@@ -6138,3 +6142,55 @@ a USB stick (f2fs) took 34 s with a cold cache and 0.09 s with a warm one.
 no longer copied again) and D98's revision of 2026-10-16 for folders that
 moved inside a root; moves between roots still take D98's path. Uses D25's
 claims, D72's root paths, and D107's list.
+
+## D109 — 2026-10-18 — A backup goes on past an item it cannot read
+
+**Status:** Implemented
+
+**Decision:** Native and portable backups no longer stop at the first item
+they cannot read. A failure is one of two kinds:
+- **An item failure:** the source item cannot be inspected, opened, listed,
+  or read, or the kernel refuses its O_NOATIME open (never retried without
+  it, D17); in a native backup also a path longer than PATH_MAX. The run
+  lists it and goes on with the next item.
+- **A backup failure:** a step in the backup fails (creating, writing,
+  linking, or removing there), or the journal or migr's own state does. The
+  run stops, as before; a full destination still makes room first (D98).
+  Native now stops at once, as portable did, instead of going on with the
+  other roots.
+
+A file with other names whose read fails midway is a backup failure: its
+copy is shared with them (native) or recorded as theirs (portable), so it
+cannot be left out alone. In a portable backup a path or name longer than
+the journal holds is still refused by the pre-scan, before anything is
+written.
+
+- **Before capture:** the native metadata preflight, the hardlink seeding of
+  a resumed native backup, and the portable pre-scan leave an item they
+  cannot read to capture instead of refusing the backup; such an item adds
+  nothing to the check that the destination can keep owners (D17). The
+  pre-scan remembers the folders it could not read, so an update neither
+  removes nor moves (D108) what the backup holds below them.
+- **The folder above:** a folder with an item that failed gets its own
+  metadata (native) and journal record (portable) as read; the list, not the
+  folder, says what is missing. So does a folder that could not be listed to
+  its end.
+- **The copy the backup has:** an update keeps what the backup holds for an
+  item that could not be opened, with everything below it; reconciliation
+  leaves it. A copy cut short by a read that failed is removed, with its
+  journal record and claim, so a finished backup never holds a cut-short
+  file.
+- **The end:** the backup is finalized. After "Backup complete" the run
+  prints how many items it could not read and the first eight, each with
+  the step that failed and the cause, marking those whose copy the backup
+  keeps; the log in the backup lists them all with errno's name. The run
+  exits with status 1. A dry run lists what it could not read.
+
+**Why:** One unreadable item left the backup unfinished. An update left a
+backup that restore could use under its `.updating` name, which restore and
+verify treat as in progress (D72), until a run with no failure at all.
+
+**Relationship:** Reports alongside D63's source changes and adds a case to
+D68's status 1. Supersedes in part D17: a refused O_NOATIME open leaves the
+item out instead of failing the capture. Revises D79's revision of
+2026-10-12 for items: each is listed, not only the first.

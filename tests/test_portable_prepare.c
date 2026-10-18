@@ -491,12 +491,13 @@ static void test_prepared_capture_reports_failure_reason(void)
         ? portable_capture_fresh_prepared_at(
               container_fd, &request, &prepared, NULL, &capture_report)
         : -1;
-    check(capture_result != 0 &&
-              capture_report.failure_kind ==
-                  BACKUP_CAPTURE_FAILURE_OPERATIONAL &&
-              capture_report.failure_errno == EBADF &&
-              strcmp(capture_report.failed_source_path, source) == 0,
-          "an errno-bearing capture failure reports its source and errno");
+    char expected[PATH_MAX + 64];
+    snprintf(expected, sizeof(expected), "%s: list the folder: %s", source,
+             strerror(EBADF));
+    check(capture_result == 0 && capture_report.failed_items.count == 1 &&
+              strncmp(capture_report.failed_items.text[0], expected,
+                      strlen(expected)) == 0,
+          "a folder that cannot be listed is listed with its source and errno");
 
     portable_prepared_capture_free(&prepared);
     if (close(scratch_fd) != 0 || close(container_fd) != 0)
@@ -880,48 +881,69 @@ static void test_fifo_is_rejected_before_mutation(void)
     remove_tree(base);
 }
 
-static void test_operational_failure_reports_path(void)
+// A folder the pre-scan cannot open is left to capture, which lists it and
+// goes on (D109).
+static void test_unreadable_subtree_is_listed(void)
 {
-    printf(BLUE "::" NC " portable preparation operational failure diagnostics\n");
+    printf(BLUE "::" NC " portable capture lists an unreadable folder\n");
     if (geteuid() == 0) {
-        skip_check("unreadable-subdirectory preparation fixture skipped: root bypasses DAC");
+        skip_check("unreadable-subdirectory fixture skipped: root bypasses DAC");
         return;
     }
 
     char base[PATH_MAX];
     char source[PATH_MAX];
     char scratch[PATH_MAX];
+    char container[PATH_MAX];
     char blocked[PATH_MAX];
+    char kept[PATH_MAX];
     make_base(base, sizeof(base));
     join_path(source, sizeof(source), base, "source");
     join_path(scratch, sizeof(scratch), base, "scratch");
+    join_path(container, sizeof(container), base, "container");
     join_path(blocked, sizeof(blocked), source, "blocked");
+    join_path(kept, sizeof(kept), source, "kept");
     make_directory(source);
     make_directory(scratch);
+    make_directory(container);
     make_directory(blocked);
+    write_file(kept, "readable");
     if (chmod(blocked, 0000) != 0)
         fixture_fatal("could not restrict portable pre-scan fixture");
 
     PortableRootSpec root = root_spec("ROOT", source, "ROOT");
     PortableCaptureRequest request = request_for(&root, 1, 1);
     int scratch_fd = open_directory(scratch);
+    int container_fd = open_directory(container);
     PortablePreparedCapture prepared = {0};
     int result = portable_capture_prepare(scratch_fd, &request, &prepared);
-    check(result != 0 && prepared.ready == 0,
-          "an unreadable subtree refuses portable preparation");
-    check(prepared.report.operational_failure == 1 &&
-              strcmp(prepared.report.operational_failure_path, "blocked") == 0 &&
-              (prepared.report.operational_failure_errno == EACCES ||
-               prepared.report.operational_failure_errno == EPERM),
-          "the first operational pre-scan failure retains its path and errno");
+    check(result == 0 && prepared.ready == 1 &&
+              prepared.report.operational_failure == 0,
+          "an unreadable subtree does not refuse portable preparation");
     check(directory_is_empty(scratch_fd) == 1,
-          "an operational pre-scan refusal leaves scratch untouched");
+          "preparation leaves scratch untouched");
+
+    BackupCaptureReport report;
+    backup_capture_report_init(&report);
+    size_t live_count = 0;
+    int capture_result = result == 0
+        ? portable_capture_fresh_prepared_at(container_fd, &request,
+                                             &prepared, &live_count, &report)
+        : -1;
+    char expected[PATH_MAX + 64];
+    snprintf(expected, sizeof(expected), "%s: open the folder: %s", blocked,
+             strerror(EACCES));
+    check(capture_result == 0 && report.failed_items.count == 1 &&
+              strcmp(report.failed_items.text[0], expected) == 0,
+          "capture lists the folder with what failed and errno");
+    check(live_count == 2 && !backup_capture_report_has_changes(&report),
+          "the rest is captured, and the folder is not reported as vanished");
 
     if (chmod(blocked, 0700) != 0)
         fixture_fatal("could not restore portable pre-scan fixture permissions");
     portable_prepared_capture_free(&prepared);
-    if (close(scratch_fd) != 0)
-        fixture_fatal("could not close operational-failure scratch directory");
+    if (close(scratch_fd) != 0 || close(container_fd) != 0)
+        fixture_fatal("could not close unreadable-folder fixture");
     remove_tree(base);
 }
 
@@ -1077,7 +1099,7 @@ int main(void)
     test_prepared_capture_does_not_prescan_again();
     test_resume_live_count();
     test_fifo_is_rejected_before_mutation();
-    test_operational_failure_reports_path();
+    test_unreadable_subtree_is_listed();
     test_socket_is_informational();
     test_prepared_at_rejects_invalid_prepared();
     test_live_state_changes_are_tolerated();

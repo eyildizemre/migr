@@ -80,6 +80,7 @@ static MoveKind kind_of_record(SidecarObjectKind kind)
 typedef struct {
     const PortableCaptureRequest *request;
     const PortableCurrentSourceSet *source;
+    const PortablePrescanReport *report;
     const struct RecopyList *recopy;
     MoveCandidates gone;
     int failed;
@@ -110,8 +111,10 @@ static int collect_gone(const SidecarLiveView *view, void *context)
         return 1;
     }
     char *slash = strrchr(logical, '/');
+    // What the pre-scan could not read is kept where it is (D109).
     int gone = !key_present(scan->source, root_id, logical) &&
-               !recopy_list_covers(scan->recopy, root_id, logical);
+               !recopy_list_covers(scan->recopy, root_id, logical) &&
+               !portable_unreadable_covers(scan->report, root_id, logical);
     if (gone)
     {
         if (slash != NULL)
@@ -236,6 +239,7 @@ int portable_moves_plan(SidecarLog *log,
     PortableScan scan = {
         .request = request,
         .source = &report->current_source,
+        .report = report,
         .recopy = recopy
     };
     int failed =

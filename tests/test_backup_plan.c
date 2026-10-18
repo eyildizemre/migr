@@ -1882,15 +1882,16 @@ typedef struct {
     int failed;
 } FailBeforeCapture;
 
-// A removed source is left out without failing the backup (D63), so a
-// failed capture comes from a read error injected into the source's open.
+// A removed source is left out (D63) and an unreadable one listed (D109)
+// without failing the backup, so a failed capture comes from a write error
+// injected into the file's copy.
 static void fail_before_capture(const char *source_path, void *context)
 {
     FailBeforeCapture *fixture = context;
     if (fixture == NULL || source_path == NULL ||
         fixture->failed || strcmp(source_path, fixture->path) != 0)
         return;
-    backup_test_fail_next_source_open(EIO);
+    backup_test_fail_content_writes(EIO, 1);
     fixture->failed = 1;
 }
 
@@ -3577,12 +3578,15 @@ static void test_portable_prescan_failure_diagnostics(void)
         rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
                                   output, sizeof(output));
         backup_test_force_portable_representation(0);
-        check(rc == 2 && directory_empty(target),
-              "an operational portable pre-scan failure refuses before container creation");
-        check(strstr(output, "could not scan blocked-directory") != NULL &&
-                  (strstr(output, "Permission denied") != NULL ||
-                   strstr(output, "Operation not permitted") != NULL),
-              "the portable refusal reports the unreadable path and operating-system error");
+        char published[PATH_MAX];
+        check(rc == 1 && find_container_dir(target, published,
+                                            sizeof(published)),
+              "an unreadable folder leaves the portable backup published, "
+              "with status 1 (D109)");
+        check(strstr(output, "Could not read 1 item") != NULL &&
+                  strstr(output, "blocked-directory: open the folder: "
+                                 "Permission denied") != NULL,
+              "the backup lists the unreadable path and operating-system error");
 
         if (chmod(blocked, 0700) != 0)
         {
@@ -4589,6 +4593,95 @@ static void test_portable_update_records_a_metadata_change(void)
 // A second backup of the same install updates the first in place (D72):
 // changed files are recopied, removed ones leave the payload, and a root
 // the new selection lacks is removed with its journal records.
+// An item the source would not give up is listed and the backup goes on
+// (D109): an update keeps the copy it has, with what is below it, and still
+// removes what left the source.
+static void test_update_lists_unreadable_items(int portable)
+{
+    printf(BLUE "::" NC " production: a %s update lists what it cannot read "
+                 "and keeps its copy\n",
+           portable ? "portable" : "native");
+    if (geteuid() == 0)
+    {
+        printf("  - skipped: root reads 0000 items\n");
+        return;
+    }
+
+    char home[PATH_MAX], target[PATH_MAX], dir[PATH_MAX], locked[PATH_MAX];
+    char folder[PATH_MAX], inner[PATH_MAX], gone[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_home");
+    setenv("HOME", home, 1);
+    join_path(dir, sizeof(dir), home, "notes");
+    join_path(locked, sizeof(locked), dir, "locked.txt");
+    join_path(folder, sizeof(folder), dir, "folder");
+    join_path(inner, sizeof(inner), folder, "inner.txt");
+    join_path(gone, sizeof(gone), dir, "gone.txt");
+    mkdir_p(folder);
+    write_file(locked, "first");
+    write_file(inner, "inside");
+    write_file(gone, "gone");
+    fresh_mkdtemp(target, sizeof(target), "plan_target");
+
+    dry_run = 0;
+    backup_test_force_portable_representation(portable);
+    char output[16384];
+    char *paths[] = { dir, NULL };
+    int first_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                        output, sizeof(output));
+
+    write_file(locked, "second, longer");
+    check(chmod(locked, 0000) == 0 && chmod(folder, 0000) == 0 &&
+              unlink(gone) == 0,
+          "fixture: two items cannot be read, one left the source");
+    dry_run = 1;
+    int dry_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                      output, sizeof(output));
+    dry_run = 0;
+    check(first_rc == 0 && dry_rc == 0 &&
+              strstr(output, "2 items could not be read; the backup would go "
+                             "on without them:") != NULL &&
+              strstr(output, locked) != NULL,
+          "a dry run lists what it cannot read");
+
+    int rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                  output, sizeof(output));
+    backup_test_force_portable_representation(0);
+    check(chmod(locked, 0644) == 0 && chmod(folder, 0755) == 0,
+          "fixture: make them readable again");
+    char line[PATH_MAX + 128];
+    snprintf(line, sizeof(line),
+             "%s: open it: Permission denied (the backup keeps the copy it "
+             "has)", locked);
+    char folder_line[PATH_MAX + 128];
+    snprintf(folder_line, sizeof(folder_line),
+             "%s: open the folder: Permission denied (the backup keeps the "
+             "copy it has)", folder);
+    check(rc == 1 && strstr(output, "Could not read 2 items") != NULL &&
+              strstr(output, line) != NULL &&
+              strstr(output, folder_line) != NULL,
+          "the update lists both with what failed, and exits 1");
+
+    char container[PATH_MAX], payload[PATH_MAX];
+    int found = find_container_dir(target, container, sizeof(container));
+    check(found && count_final_containers(target) == 1 &&
+              find_partial_container_dir(target, payload, sizeof(payload)) ==
+                  0,
+          "the backup is published");
+    join_path(payload, sizeof(payload), container, "data/notes/locked.txt");
+    check(found && file_text_is(payload, "first"),
+          "a file it cannot read keeps its copy");
+    join_path(payload, sizeof(payload), container,
+              "data/notes/folder/inner.txt");
+    check(found && file_text_is(payload, "inside"),
+          "a folder it cannot read keeps what is below it");
+    join_path(payload, sizeof(payload), container, "data/notes/gone.txt");
+    check(found && access(payload, F_OK) != 0,
+          "what left the source is still removed");
+
+    remove_tree(target);
+    remove_tree(home);
+}
+
 static void test_backup_updates_in_place(int portable)
 {
     printf(BLUE "::" NC " production: a second %s backup updates the first in place\n",
@@ -6063,6 +6156,8 @@ int main(void)
     test_sudo_backup_belongs_to_invoker();
     test_backup_updates_in_place(0);
     test_backup_updates_in_place(1);
+    test_update_lists_unreadable_items(0);
+    test_update_lists_unreadable_items(1);
     test_update_asks_before_removing(0);
     test_update_asks_before_removing(1);
     test_update_lists_a_narrowed_root(0);

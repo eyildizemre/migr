@@ -30,6 +30,10 @@ typedef struct {
 } PortablePhysicalOwners;
 
 /* Defined in portable.c, needed by portable_reconcile.c. */
+/* 1 when logical, or a folder above it, could not be read this run (D109),
+ * 0 when not, -1 on error. */
+int portable_failed_covers(const PortableCaptureContext *context,
+                           const char *root_id, const char *logical);
 int sidecar_bytes_equal(SidecarBytes left, SidecarBytes right);
 int sidecar_bytes_to_text(SidecarBytes bytes, char **out);
 int remove_payload_relative(int data_fd, const char *payload_root,

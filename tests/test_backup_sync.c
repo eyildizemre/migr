@@ -310,9 +310,11 @@ static void test_native_sync(void)
     remove_tree(base);
 }
 
-static void test_native_short_copy_refuses(void)
+// A short read with no change to the source is a read that failed, not a
+// writer (D63): the file is listed and its cut-short copy removed (D109).
+static void test_native_short_copy_listed(void)
 {
-    printf(":: native capture rejects a short source read\n");
+    printf(":: native capture lists a short source read\n");
     char base[PATH_MAX];
     char source_dir[PATH_MAX];
     char destination_dir[PATH_MAX];
@@ -342,21 +344,62 @@ static void test_native_short_copy_refuses(void)
 
     struct stat source_after;
     struct stat destination_st;
-    check(short_read_triggered && result == BACKUP_CAPTURE_ERROR,
-          "a short read is rejected instead of reported as a successful capture");
+    check(short_read_triggered && result == BACKUP_CAPTURE_OK &&
+              report.failed_items.count == 1 &&
+              strstr(report.failed_items.text[0],
+                     "fewer or more bytes were read than its size") != NULL,
+          "a short read is listed instead of reported as a successful capture");
     check(report.bytes_copied == 0 && stat(source, &source_after) == 0 &&
               metadata_source_unchanged(&source_before, &source_after) &&
-              lstat(destination, &destination_st) == 0 &&
-              destination_st.st_size == 0,
-          "the short-copy fixture leaves source metadata unchanged and copies no payload bytes");
+              lstat(destination, &destination_st) != 0 && errno == ENOENT,
+          "the short-copy fixture leaves source metadata unchanged and no cut-short copy");
+
+    // An update: the copy of the file before is rewritten in place, so the
+    // read that fails takes it with it (open-items 0.31).
+    backup_capture_report_init(&report);
+    check(capture_native(source, destination_dir, "payload", &report) ==
+                  BACKUP_CAPTURE_OK &&
+              report.failed_items.count == 0 &&
+              lstat(destination, &destination_st) == 0,
+          "a clean capture leaves a copy to update");
+    write_bytes(source, 81);
+    backup_capture_report_init(&report);
+    short_read_triggered = 0;
+    backup_test_set_capture_hook(arm_short_read_for_source, source);
+    result = capture_native(source, destination_dir, "payload", &report);
+    backup_test_set_capture_hook(NULL, NULL);
+    short_read_enabled = 0;
+    check(short_read_triggered && result == BACKUP_CAPTURE_OK &&
+              report.failed_items.count == 1 &&
+              strstr(report.failed_items.text[0], "keeps the copy") == NULL &&
+              lstat(destination, &destination_st) != 0 && errno == ENOENT,
+          "a short read in an update lists the file and removes the cut-short "
+          "copy, without claiming to keep one");
+
+    // A file with other names shares its copy with them, so a read of it
+    // that fails stops the backup instead.
+    char other_name[PATH_MAX];
+    join_path(other_name, sizeof(other_name), source_dir, "other-name");
+    if (link(source, other_name) != 0)
+        fixture_fatal("could not give the short-copy source another name");
+    backup_capture_report_init(&report);
+    short_read_triggered = 0;
+    backup_test_set_capture_hook(arm_short_read_for_source, source);
+    result = capture_native(source, destination_dir, "payload", &report);
+    backup_test_set_capture_hook(NULL, NULL);
+    short_read_enabled = 0;
+    check(short_read_triggered && result == BACKUP_CAPTURE_ERROR &&
+              report.failed_items.count == 0 &&
+              report.failure_kind == BACKUP_CAPTURE_FAILURE_OPERATIONAL,
+          "a short read of a file with other names stops the backup");
     remove_tree(base);
 }
 
-// A short read with no change to the source is a read anomaly, not a writer
-// (D63): it fails the portable capture instead of being kept as read.
-static void test_portable_short_copy_refuses(void)
+// A short read with no change to the source is a read that failed, not a
+// writer (D63): the file is listed and left out of the journal (D109).
+static void test_portable_short_copy_listed(void)
 {
-    printf(":: portable capture rejects a short source read\n");
+    printf(":: portable capture lists a short source read\n");
     char base[PATH_MAX];
     char source_dir[PATH_MAX];
     char scratch[PATH_MAX];
@@ -388,10 +431,10 @@ static void test_portable_short_copy_refuses(void)
     BackupCaptureReport report;
     backup_capture_report_init(&report);
     int result = -1;
+    size_t live_count = 0;
     short_read_triggered = 0;
     if (portable_capture_prepare(scratch_fd, &request, &prepared) == 0)
     {
-        size_t live_count = 0;
         short_read_enabled = 1;
         result = portable_capture_fresh_prepared_at(
             container_fd, &request, &prepared, &live_count, &report);
@@ -400,12 +443,46 @@ static void test_portable_short_copy_refuses(void)
     portable_prepared_capture_free(&prepared);
     close_fixture_fd(scratch_fd);
     close_fixture_fd(container_fd);
-    check(short_read_triggered && result != 0 &&
-              report.failure_kind == BACKUP_CAPTURE_FAILURE_OPERATIONAL &&
-              report.failure_errno == EIO &&
+    check(short_read_triggered && result == 0 &&
+              report.failed_items.count == 1 &&
+              strstr(report.failed_items.text[0],
+                     "fewer or more bytes were read than its size") != NULL &&
+              live_count == 1 &&
               !backup_capture_report_has_changes(&report),
-          "a short read with an unchanged source fails instead of being kept "
-          "as a changed file");
+          "a short read with an unchanged source is listed instead of being "
+          "kept as a changed file");
+
+    // An update: a clean capture records the file, then a changed source is
+    // read short. Its record and cut-short payload go (open-items 0.31).
+    scratch_fd = open_directory(scratch);
+    container_fd = open_directory(container);
+    int clean = -1;
+    if (portable_capture_prepare(scratch_fd, &request, &prepared) == 0)
+        clean = portable_capture_resume_prepared_at(
+            container_fd, &request, &prepared, &live_count, NULL);
+    portable_prepared_capture_free(&prepared);
+    check(clean == 0 && live_count == 2,
+          "a clean resume records the file to update");
+    write_bytes(source, 81);
+    backup_capture_report_init(&report);
+    result = -1;
+    short_read_triggered = 0;
+    if (portable_capture_prepare(scratch_fd, &request, &prepared) == 0)
+    {
+        short_read_enabled = 1;
+        result = portable_capture_resume_prepared_at(
+            container_fd, &request, &prepared, &live_count, &report);
+        short_read_enabled = 0;
+    }
+    portable_prepared_capture_free(&prepared);
+    close_fixture_fd(scratch_fd);
+    close_fixture_fd(container_fd);
+    check(short_read_triggered && result == 0 &&
+              report.failed_items.count == 1 &&
+              strstr(report.failed_items.text[0], "keeps the copy") == NULL &&
+              live_count == 1,
+          "a short read in an update lists the file and drops its record and "
+          "cut-short payload");
     remove_tree(base);
 }
 
@@ -538,8 +615,8 @@ static void test_portable_sync(void)
 int main(void)
 {
     test_native_sync();
-    test_native_short_copy_refuses();
-    test_portable_short_copy_refuses();
+    test_native_short_copy_listed();
+    test_portable_short_copy_listed();
     test_native_eintr_read_retries();
     test_portable_sync();
     return failures == 0 ? 0 : 1;

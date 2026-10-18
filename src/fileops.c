@@ -79,28 +79,44 @@ static int destination_path_is_safe(const char *path)
     return destination_leaf_is_safe(leaf);
 }
 
-static void capture_report_source_refusal(BackupCaptureReport *report,
-                                          const char *source_path)
+static void capture_record(BackupCaptureReport *report,
+                           BackupCaptureFailureKind kind,
+                           const char *source_path, const char *operation,
+                           int err)
 {
-    if (report == NULL || report->failed_source_path[0] != '\0' ||
-        source_path == NULL)
+    if (report == NULL ||
+        (report->failure_kind != BACKUP_CAPTURE_FAILURE_NONE &&
+         (kind == BACKUP_CAPTURE_FAILURE_ITEM ||
+          report->failure_kind != BACKUP_CAPTURE_FAILURE_ITEM)))
         return;
     (void)snprintf(report->failed_source_path,
-                   sizeof(report->failed_source_path), "%s", source_path);
+                   sizeof(report->failed_source_path), "%s",
+                   source_path != NULL ? source_path : "");
+    report->failure_kind = kind;
+    report->failure_errno = err;
+    report->failed_operation = operation;
 }
 
 // Keeps the first item a native capture could not handle, what was being
 // done, and err, 0 when operation says why on its own. Called before any
-// cleanup that could change errno.
+// cleanup that could change errno. It replaces an item failure not listed
+// yet: the backup stops, and that is what it says.
 static void capture_fail(BackupCaptureReport *report, const char *source_path,
                          const char *operation, int err)
 {
-    if (report == NULL || report->failed_source_path[0] != '\0')
-        return;
-    capture_report_source_refusal(report, source_path);
-    report->failure_kind = BACKUP_CAPTURE_FAILURE_OPERATIONAL;
-    report->failure_errno = err;
-    report->failed_operation = operation;
+    capture_record(report, BACKUP_CAPTURE_FAILURE_OPERATIONAL, source_path,
+                   operation, err);
+}
+
+// A source item that could not be read (D109): capture_entry_at() lists it
+// and the walk goes on.
+static BackupCaptureStatus capture_item_fail(BackupCaptureReport *report,
+                                             const char *source_path,
+                                             const char *operation, int err)
+{
+    capture_record(report, BACKUP_CAPTURE_FAILURE_ITEM, source_path,
+                   operation, err);
+    return BACKUP_CAPTURE_ITEM_FAILED;
 }
 
 #ifdef BACKUP_TEST_HOOKS
@@ -759,32 +775,18 @@ static int native_inode_map_seed_existing_directory_at(
     const CloneContext *ctx, const char *source_path, int source_fd,
     int destination_fd, FailedItem *failed)
 {
+    // What cannot be listed or named is left to the capture pass, which
+    // lists it (D109).
+    int result = 0;
     int scan_fd = fcntl(source_fd, F_DUPFD_CLOEXEC, 0);
     DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
-    if (directory == NULL)
+    if (directory == NULL && scan_fd >= 0)
+        close(scan_fd);
+    while (directory != NULL)
     {
-        failed_item_note(failed, source_path, "list the folder", errno);
-        if (scan_fd >= 0)
-            close(scan_fd);
-        close(source_fd);
-        close(destination_fd);
-        return -1;
-    }
-
-    int result = 0;
-    for (;;)
-    {
-        errno = 0;
         struct dirent *entry = readdir(directory);
         if (entry == NULL)
-        {
-            if (errno != 0)
-            {
-                failed_item_note(failed, source_path, "list the folder", errno);
-                result = -1;
-            }
             break;
-        }
         if (strcmp(entry->d_name, ".") == 0 ||
             strcmp(entry->d_name, "..") == 0)
             continue;
@@ -792,12 +794,7 @@ static int native_inode_map_seed_existing_directory_at(
         char child_source[PATH_MAX];
         if (path_join(child_source, sizeof(child_source), source_path,
                       entry->d_name) != 0)
-        {
-            failed_item_note(failed, source_path, "name an item in the folder",
-                             ENAMETOOLONG);
-            result = -1;
-            break;
-        }
+            continue;
         if (native_inode_map_seed_existing_at(ctx, child_source,
                                                destination_fd, entry->d_name,
                                                failed) != 0)
@@ -806,7 +803,7 @@ static int native_inode_map_seed_existing_directory_at(
             break;
         }
     }
-    if (closedir(directory) != 0)
+    if (directory != NULL && closedir(directory) != 0)
     {
         failed_item_note(failed, source_path, "list the folder", errno);
         result = -1;
@@ -826,29 +823,18 @@ static int native_inode_map_seed_existing_directory_at(
 }
 
 // Opens the source folder already known to be one, for the walk below it;
-// 1 to skip it (unreadable without changing its access time, or changed),
-// -1 on an error.
+// 1 to skip it (unreadable, which the capture pass lists, or changed).
 static int native_seed_open_folder(const char *source_path,
                                    const struct stat *source_st,
-                                   int *source_fd, FailedItem *failed)
+                                   int *source_fd)
 {
     *source_fd = open(source_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
                                        O_NOATIME | O_CLOEXEC);
     if (*source_fd < 0)
-    {
-        if (errno == EPERM)
-            return 1;
-        failed_item_note(failed, source_path, "open the folder", errno);
-        return -1;
-    }
+        return 1;
     struct stat opened;
-    if (fstat(*source_fd, &opened) != 0)
-    {
-        failed_item_note(failed, source_path, "inspect the folder", errno);
-        close(*source_fd);
-        return -1;
-    }
-    if (!metadata_source_unchanged(source_st, &opened))
+    if (fstat(*source_fd, &opened) != 0 ||
+        !metadata_source_unchanged(source_st, &opened))
     {
         close(*source_fd);
         return 1;
@@ -869,15 +855,11 @@ static int native_inode_map_seed_existing_at(
         if (owned <= 0) return owned;
     }
     // Seeding only saves relinking hardlinks on a resume; a source that
-    // vanished or changed since is left to the capture pass (D63).
+    // vanished or changed since is left to the capture pass (D63), and so is
+    // one that cannot be read, which it lists (D109).
     struct stat source_st;
     if (lstat(source_path, &source_st) != 0)
-    {
-        if (errno == ENOENT)
-            return 0;
-        failed_item_note(failed, source_path, "inspect it", errno);
-        return -1;
-    }
+        return 0;
 
     struct stat destination_st;
     if (fstatat(destination_dir_fd, destination_leaf, &destination_st,
@@ -900,20 +882,10 @@ static int native_inode_map_seed_existing_at(
         int source_fd = open(source_path,
                              O_RDONLY | O_NOATIME | O_CLOEXEC | O_NOFOLLOW);
         if (source_fd < 0)
-        {
-            if (errno == EPERM)
-                return 0;
-            failed_item_note(failed, source_path, "open it", errno);
-            return -1;
-        }
+            return 0;
         struct stat opened;
         int result = 0;
-        if (fstat(source_fd, &opened) != 0)
-        {
-            failed_item_note(failed, source_path, "inspect it", errno);
-            result = -1;
-        }
-        int changed = result == 0 &&
+        int changed = fstat(source_fd, &opened) != 0 ||
                       !metadata_source_unchanged(&source_st, &opened);
         if (close(source_fd) != 0)
         {
@@ -937,10 +909,8 @@ static int native_inode_map_seed_existing_at(
         return 0;
 
     int source_fd;
-    int opened = native_seed_open_folder(source_path, &source_st, &source_fd,
-                                         failed);
-    if (opened != 0)
-        return opened > 0 ? 0 : -1;
+    if (native_seed_open_folder(source_path, &source_st, &source_fd) != 0)
+        return 0;
 
     int destination_fd = openat(destination_dir_fd, destination_leaf,
                                 O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
@@ -970,12 +940,7 @@ static int native_inode_map_seed_existing_root_at(
     }
     struct stat source_st;
     if (lstat(source_path, &source_st) != 0)
-    {
-        if (errno == ENOENT)
-            return 0;
-        failed_item_note(failed, source_path, "inspect it", errno);
-        return -1;
-    }
+        return 0;
 
     struct stat destination_st;
     if (fstat(destination_root_fd, &destination_st) != 0)
@@ -988,10 +953,8 @@ static int native_inode_map_seed_existing_root_at(
         return 0;
 
     int source_fd;
-    int opened = native_seed_open_folder(source_path, &source_st, &source_fd,
-                                         failed);
-    if (opened != 0)
-        return opened > 0 ? 0 : -1;
+    if (native_seed_open_folder(source_path, &source_st, &source_fd) != 0)
+        return 0;
 
     int destination_fd = fcntl(destination_root_fd, F_DUPFD_CLOEXEC, 0);
     if (destination_fd < 0)
@@ -1066,6 +1029,7 @@ typedef struct {
     char *rel_path;
     size_t rel_path_length;
     uint64_t hash;
+    int kept; /* Could not be read: kept with everything below it (D109). */
 } NativeVisitedSlot;
 
 typedef struct {
@@ -1250,7 +1214,7 @@ void native_visited_free(void *opaque_set)
 }
 
 static int native_visited_add(void *opaque_set, const char *root_key,
-                              const char *rel_path)
+                              const char *rel_path, int kept)
 {
     NativeVisitedSet *set = opaque_set;
     if (set == NULL || root_key == NULL || rel_path == NULL)
@@ -1266,7 +1230,10 @@ static int native_visited_add(void *opaque_set, const char *root_key,
                                           rel_path, rel_path_length, hash,
                                           &index);
     if (location == 1)
+    {
+        set->slots[index].kept |= kept;
         return 1;
+    }
     if (location < 0)
         return -1;
 
@@ -1300,6 +1267,7 @@ static int native_visited_add(void *opaque_set, const char *root_key,
     slot->rel_path = rel_copy;
     slot->rel_path_length = rel_path_length;
     slot->hash = hash;
+    slot->kept = kept;
     set->count++;
     return 0;
 }
@@ -1323,7 +1291,9 @@ int native_visited_contains(const void *opaque_set, const char *root_key,
                                           &index);
     if (location < 0)
         return -1;
-    return location == 1 ? 1 : 0;
+    if (location == 0)
+        return 0;
+    return set->slots[index].kept ? 2 : 1;
 }
 
 static int append_relative(char *destination, size_t destination_size,
@@ -1399,11 +1369,8 @@ static int capture_symlink_at(const char *src, int dest_dir_fd, const char *leaf
         return BACKUP_CAPTURE_SKIPPED;
     }
     if (len < 0 || (size_t)len >= sizeof(link_target))
-    {
-        capture_fail(report, src, "read the link",
-                     len < 0 ? errno : ENAMETOOLONG);
-        return -1;
-    }
+        return capture_item_fail(report, src, "read the link",
+                                 len < 0 ? errno : ENAMETOOLONG);
     link_target[len] = '\0';
 
     if (symlinkat(link_target, dest_dir_fd, leaf) != 0)
@@ -1454,6 +1421,9 @@ static int capture_symlink_at(const char *src, int dest_dir_fd, const char *leaf
     return operation != NULL ? -1 : 0;
 }
 
+// Names a failed read of the source, as against a write of the copy.
+static const char copy_read_step[] = "read the content";
+
 // A write() that reports zero bytes for a non-zero request has made no
 // progress and never will on a retry, so it is treated as the failure it is
 // rather than spun on forever.
@@ -1473,7 +1443,7 @@ static int copy_file_contents(int src_fd, int dest_fd, off_t expected_size,
             continue;
         if (bytes_read < 0)
         {
-            *failed_step = "read the content";
+            *failed_step = copy_read_step;
             return -1;
         }
         if (bytes_read == 0)
@@ -1580,9 +1550,9 @@ static BackupCaptureStatus capture_hardlink_at(
     struct stat source_after;
     if (fstat(src_fd, &source_after) != 0)
     {
-        capture_fail(report, src, "inspect it", errno);
+        capture_item_fail(report, src, "inspect it", errno);
         close(src_fd);
-        return BACKUP_CAPTURE_ERROR;
+        return BACKUP_CAPTURE_ITEM_FAILED;
     }
     if (!metadata_source_unchanged(source_snapshot, &source_after))
         backup_capture_report_note_change(report, BACKUP_SOURCE_CHANGED, src);
@@ -1666,11 +1636,6 @@ static BackupCaptureStatus capture_regular_at(
                                               O_NOFOLLOW);
     if (src_fd < 0)
     {
-        if (errno == EPERM)
-        {
-            capture_report_source_refusal(report, src);
-            return BACKUP_CAPTURE_SOURCE_SAFE_READ;
-        }
         // Removed, or replaced by a symlink, since it was listed (D63).
         if (errno == ENOENT || errno == ELOOP)
         {
@@ -1679,8 +1644,12 @@ static BackupCaptureStatus capture_regular_at(
                                         : BACKUP_SOURCE_CHANGED, src);
             return BACKUP_CAPTURE_SKIPPED;
         }
-        capture_fail(report, src, "open it", errno);
-        return BACKUP_CAPTURE_ERROR;
+        // Refused with O_NOATIME: never read without it (D17).
+        return capture_item_fail(report, src,
+                                 errno == EPERM
+                                     ? "open it without changing its access time"
+                                     : "open it",
+                                 errno);
     }
 
     // The open fd is what gets captured; a file rewritten since it was
@@ -1689,9 +1658,9 @@ static BackupCaptureStatus capture_regular_at(
     struct stat source_snapshot;
     if (fstat(src_fd, &source_snapshot) != 0)
     {
-        capture_fail(report, src, "inspect it", errno);
+        capture_item_fail(report, src, "inspect it", errno);
         close(src_fd);
-        return BACKUP_CAPTURE_ERROR;
+        return BACKUP_CAPTURE_ITEM_FAILED;
     }
     if (!S_ISREG(source_snapshot.st_mode))
     {
@@ -1826,44 +1795,63 @@ static BackupCaptureStatus capture_regular_at(
     // A file written while it is read is read again, up to
     // BACKUP_CAPTURE_READ_ATTEMPTS times; one still changing after that is
     // kept as last read, with that read's length, and reported (D63).
+    // A read that fails leaves the copy cut short. It is removed, and the
+    // file listed (D109), unless the file has other names: they share the
+    // copy, so the backup stops.
     int failed = 0;
+    int read_failed = 0;
     int changed = 0;
     off_t copied = 0;
     for (unsigned int attempt = 1;; attempt++)
     {
         backup_capture_report_reread(report, copied);
         copied = 0;
+        step = NULL;
+        int source_step = 0;
         if (lseek(src_fd, 0, SEEK_SET) != 0)
+        {
             step = "go back to its start";
+            source_step = 1;
+        }
         else if (ftruncate(dest_fd, 0) != 0 ||
                  lseek(dest_fd, 0, SEEK_SET) != 0)
             step = "empty its copy in the backup";
         else
+        {
             (void)copy_file_contents(src_fd, dest_fd, 0, report, &copied,
                                      &step);
-        if (step != NULL)
-        {
-            capture_fail(report, src, step, errno);
-            failed = 1;
-            break;
+            source_step = step == copy_read_step;
         }
-        backup_test_after_capture_copy(src);
         struct stat after;
-        if (fstat(src_fd, &after) != 0)
+        int err = errno;
+        if (step == NULL)
         {
-            capture_fail(report, src, "inspect it again after reading", errno);
-            failed = 1;
-            break;
+            backup_test_after_capture_copy(src);
+            if (fstat(src_fd, &after) != 0)
+            {
+                step = "inspect it again after reading";
+                source_step = 1;
+                err = errno;
+            }
         }
         // Unchanged metadata with a different length read is not a writer
-        // but a short read, and stays an error.
-        int unchanged = metadata_source_unchanged(&source_snapshot, &after);
+        // but a read that failed.
+        int unchanged = step == NULL &&
+            metadata_source_unchanged(&source_snapshot, &after);
         if (unchanged && copied != after.st_size)
         {
-            capture_fail(report, src,
-                         "fewer or more bytes were read than its size", 0);
-            errno = EIO;
-            failed = 1;
+            step = "fewer or more bytes were read than its size";
+            source_step = 1;
+            err = 0;
+        }
+        if (step != NULL)
+        {
+            read_failed = source_step && source_snapshot.st_nlink == 1;
+            if (read_failed)
+                capture_item_fail(report, src, step, err);
+            else
+                capture_fail(report, src, step, err);
+            failed = !read_failed;
             break;
         }
         if (unchanged)
@@ -1882,14 +1870,14 @@ static BackupCaptureStatus capture_regular_at(
         source_snapshot = after;
         backup_capture_reread_pause(attempt);
     }
-    if (!failed &&
+    if (!failed && !read_failed &&
         apply_fd_metadata_tail(dest_fd, &source_snapshot, NULL, src_fd,
                                policy, NULL, &changed, &step) != 0)
     {
         capture_fail(report, src, step, errno);
         failed = 1;
     }
-    if (!failed && changed)
+    if (!failed && !read_failed && changed)
         backup_capture_report_note_change(report, BACKUP_SOURCE_CHANGED, src);
 
     // A write deferred by the kernel (quota, ENOSPC, a network filesystem)
@@ -1908,6 +1896,14 @@ static BackupCaptureStatus capture_regular_at(
     }
     if (failed)
         return BACKUP_CAPTURE_ERROR;
+    if (read_failed)
+    {
+        if (unlinkat(dest_dir_fd, leaf, 0) == 0)
+            return BACKUP_CAPTURE_ITEM_FAILED;
+        capture_fail(report, src, "remove its cut-short copy from the backup",
+                     errno);
+        return BACKUP_CAPTURE_ERROR;
+    }
     if (ctx->inode_map != NULL && source_snapshot.st_nlink > 1 &&
         native_inode_map_insert(ctx->inode_map, source_snapshot.st_dev,
                                 source_snapshot.st_ino, dest_dir_fd, leaf) != 0)
@@ -1957,11 +1953,6 @@ static BackupCaptureStatus capture_directory_at(
                                                  O_CLOEXEC);
     if (source_fd < 0)
     {
-        if (errno == EPERM)
-        {
-            capture_report_source_refusal(report, src);
-            return BACKUP_CAPTURE_SOURCE_SAFE_READ;
-        }
         // Removed, or replaced by something else, since it was listed (D63).
         if (errno == ENOENT || errno == ENOTDIR || errno == ELOOP)
         {
@@ -1970,8 +1961,12 @@ static BackupCaptureStatus capture_directory_at(
                                         : BACKUP_SOURCE_CHANGED, src);
             return BACKUP_CAPTURE_SKIPPED;
         }
-        capture_fail(report, src, "open the folder", errno);
-        return BACKUP_CAPTURE_ERROR;
+        // Refused with O_NOATIME: never read without it (D17).
+        return capture_item_fail(
+            report, src,
+            errno == EPERM ? "open the folder without changing its access time"
+                           : "open the folder",
+            errno);
     }
     (void)st;
     struct stat source_snapshot;
@@ -1980,9 +1975,9 @@ static BackupCaptureStatus capture_directory_at(
                                                                  : ENOTDIR;
     if (inspect_errno != 0)
     {
-        capture_fail(report, src, "inspect the folder", inspect_errno);
+        capture_item_fail(report, src, "inspect the folder", inspect_errno);
         close(source_fd);
-        return BACKUP_CAPTURE_ERROR;
+        return BACKUP_CAPTURE_ITEM_FAILED;
     }
 
     const char *step = NULL;
@@ -2000,21 +1995,20 @@ static BackupCaptureStatus capture_directory_at(
         return BACKUP_CAPTURE_ERROR;
     }
 
+    // A folder that cannot be listed to its end is an item that failed
+    // (D109): it gets its metadata, and the backup keeps what it held below.
+    BackupCaptureStatus result = BACKUP_CAPTURE_OK;
     int scan_fd = fcntl(source_fd, F_DUPFD_CLOEXEC, 0);
     DIR *dir = scan_fd < 0 ? NULL : fdopendir(scan_fd);
     if (dir == NULL)
     {
-        capture_fail(report, src, "list the folder", errno);
+        result = capture_item_fail(report, src, "list the folder", errno);
         if (scan_fd >= 0)
             close(scan_fd);
-        close(source_fd);
-        close(child_fd);
-        return BACKUP_CAPTURE_ERROR;
     }
 
-    BackupCaptureStatus result = BACKUP_CAPTURE_OK;
     struct dirent *entry;
-    for (;;)
+    while (dir != NULL)
     {
         // readdir() reports both "end of directory" and "read failed" as NULL;
         // only errno tells them apart. Without this reset a real read error
@@ -2025,10 +2019,8 @@ static BackupCaptureStatus capture_directory_at(
         if (entry == NULL)
         {
             if (errno != 0)
-            {
-                capture_fail(report, src, "list the folder", errno);
-                result = BACKUP_CAPTURE_ERROR;
-            }
+                result = capture_item_fail(report, src, "list the folder",
+                                           errno);
             break;
         }
 
@@ -2043,10 +2035,10 @@ static BackupCaptureStatus capture_directory_at(
             append_relative(child_rel, sizeof(child_rel), rel_path,
                             entry->d_name) != 0)
         {
-            capture_fail(report, src, "name an item in the folder",
-                         ENAMETOOLONG);
-            result = BACKUP_CAPTURE_ERROR;
-            break;
+            capture_item_fail(report, src, "name an item in the folder",
+                              ENAMETOOLONG);
+            backup_capture_report_note_failure(report, 0);
+            continue;
         }
         BackupCaptureStatus child_status = capture_entry_at(
             ctx, child_src, child_fd, entry->d_name, root_key, child_rel,
@@ -2058,15 +2050,14 @@ static BackupCaptureStatus capture_directory_at(
         }
     }
 
-    if (closedir(dir) != 0)
+    if (dir != NULL && closedir(dir) != 0)
     {
         capture_fail(report, src, "list the folder", errno);
-        if (result == BACKUP_CAPTURE_OK)
-            result = BACKUP_CAPTURE_ERROR;
+        result = BACKUP_CAPTURE_ERROR;
     }
     int directory_changed = 0;
     step = NULL;
-    if (result == BACKUP_CAPTURE_OK &&
+    if (result != BACKUP_CAPTURE_ERROR &&
         apply_fd_metadata_tail(child_fd, &source_snapshot, NULL, source_fd,
                                metadata_policy_from_context(ctx), NULL,
                                &directory_changed, &step) != 0)
@@ -2079,14 +2070,12 @@ static BackupCaptureStatus capture_directory_at(
     if (close(source_fd) != 0)
     {
         capture_fail(report, src, "close the folder", errno);
-        if (result == BACKUP_CAPTURE_OK)
-            result = BACKUP_CAPTURE_ERROR;
+        result = BACKUP_CAPTURE_ERROR;
     }
     if (close(child_fd) != 0)
     {
         capture_fail(report, src, "close the folder in the backup", errno);
-        if (result == BACKUP_CAPTURE_OK)
-            result = BACKUP_CAPTURE_ERROR;
+        result = BACKUP_CAPTURE_ERROR;
     }
     return result;
 }
@@ -2160,6 +2149,34 @@ static int capture_fifo_at(const CloneContext *ctx, const char *src,
     return failed ? -1 : 0;
 }
 
+// Lists an item capture could not read (D109). What the backup holds at its
+// address stays, with everything below it: reconciliation leaves it.
+static BackupCaptureStatus capture_list_failed(const CloneContext *ctx,
+                                               const char *src,
+                                               int dest_dir_fd,
+                                               const char *leaf,
+                                               const char *root_key,
+                                               const char *rel_path,
+                                               BackupCaptureReport *report)
+{
+    struct stat held;
+    int kept = fstatat(dest_dir_fd, leaf, &held, AT_SYMLINK_NOFOLLOW) == 0;
+    if (!kept && errno != ENOENT)
+    {
+        capture_fail(report, src, "inspect what the backup holds there",
+                     errno);
+        return BACKUP_CAPTURE_ERROR;
+    }
+    if (kept && ctx->visited != NULL &&
+        native_visited_add(ctx->visited, root_key, rel_path, 1) < 0)
+    {
+        capture_fail(report, src, "record it as kept", errno);
+        return BACKUP_CAPTURE_ERROR;
+    }
+    backup_capture_report_note_failure(report, kept);
+    return BACKUP_CAPTURE_OK;
+}
+
 static BackupCaptureStatus capture_entry_at(const CloneContext *ctx,
                                             const char *src,
                                             int dest_dir_fd, const char *leaf,
@@ -2180,8 +2197,9 @@ static BackupCaptureStatus capture_entry_at(const CloneContext *ctx,
     {
         if (errno != ENOENT)
         {
-            capture_fail(report, src, "inspect it", errno);
-            return BACKUP_CAPTURE_ERROR;
+            capture_item_fail(report, src, "inspect it", errno);
+            return capture_list_failed(ctx, src, dest_dir_fd, leaf, root_key,
+                                       rel_path, report);
         }
         // Listed by readdir, gone before it could be read (D63).
         backup_capture_report_note_change(report, BACKUP_SOURCE_VANISHED, src);
@@ -2228,9 +2246,12 @@ static BackupCaptureStatus capture_entry_at(const CloneContext *ctx,
     // Left out, so not visited: a resume then removes its stale payload.
     if (status == BACKUP_CAPTURE_SKIPPED)
         return BACKUP_CAPTURE_OK;
+    if (status == BACKUP_CAPTURE_ITEM_FAILED)
+        return capture_list_failed(ctx, src, dest_dir_fd, leaf, root_key,
+                                   rel_path, report);
 
     if (status == BACKUP_CAPTURE_OK && trackable && ctx->visited != NULL &&
-        native_visited_add(ctx->visited, root_key, rel_path) < 0)
+        native_visited_add(ctx->visited, root_key, rel_path, 0) < 0)
     {
         capture_fail(report, src, "record it as backed up", errno);
         return BACKUP_CAPTURE_ERROR;
@@ -2264,6 +2285,33 @@ void backup_capture_report_note_change(BackupCaptureReport *report,
     if (text != NULL)
         snprintf(text, EXAMPLE_TEXT_MAX, "%s",
                  location != NULL ? location : "");
+}
+
+void backup_capture_report_note_failure(BackupCaptureReport *report,
+                                        int kept)
+{
+    if (report == NULL || report->failure_kind != BACKUP_CAPTURE_FAILURE_ITEM)
+        return;
+    int err = report->failure_errno;
+    char line[EXAMPLE_TEXT_MAX];
+    snprintf(line, sizeof(line), "%s: %s%s%s%s", report->failed_source_path,
+             report->failed_operation != NULL ? report->failed_operation
+                                              : "read it",
+             err != 0 ? ": " : "", err != 0 ? strerror(err) : "",
+             kept ? " (the backup keeps the copy it has)" : "");
+    run_log_printf("Could not back up: %s\n", line);
+    if (err != 0)
+    {
+        const char *name = strerrorname_np(err);
+        run_log_printf("  errno %d (%s)\n", err, name != NULL ? name : "?");
+    }
+    char *text = example_list_next(&report->failed_items);
+    if (text != NULL)
+        snprintf(text, EXAMPLE_TEXT_MAX, "%s", line);
+    report->failed_source_path[0] = '\0';
+    report->failure_kind = BACKUP_CAPTURE_FAILURE_NONE;
+    report->failure_errno = 0;
+    report->failed_operation = NULL;
 }
 
 void backup_capture_reread_pause(unsigned int attempt)
@@ -2471,6 +2519,8 @@ static int native_reconcile_scan_node(const void *visited,
         reconcile_fail(report, rel_path, "list it for removal", errno);
         return -1;
     }
+    if (contains == 2)
+        return 0;
 
     struct stat st;
     if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) != 0)
@@ -2773,7 +2823,7 @@ static NativeReconcileStatus native_reconcile_root_at(
         reconcile_fail(report, "", "remove it from the backup", errno);
         return NATIVE_RECONCILE_ERROR;
     }
-    if (!S_ISDIR(root_st.st_mode))
+    if (root_visited == 2 || !S_ISDIR(root_st.st_mode))
         return NATIVE_RECONCILE_OK;
 
     int root_fd = openat(parent_fd, leaf,

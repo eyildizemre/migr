@@ -209,6 +209,13 @@ such as a browser's history database and its journal belong together, and
 read minutes apart they may not match. If the application is still open then,
 migr asks you to close it and press Enter, or to back them up as they are.
 
+**What it cannot read.** A file or folder migr cannot read, such as one on a
+network mount it has no access to, is listed with the reason, and the backup
+goes on without it. An update keeps the copy the backup already has, with
+everything below a folder. The backup still completes and exits with status 1.
+A failure on the backup drive itself stops the backup; the next run resumes
+it.
+
 **Where it goes.** The backup is a folder named after you, `migr-<user>`. If
 that name already holds another installation's backup (another computer, or
 this one before a reinstall), migr asks whether to update it from this system,
@@ -593,7 +600,7 @@ As with GNU tar:
 | Status | Meaning |
 |--------|---------|
 | 0 | Completed as asked (or cancelled at the confirmation). |
-| 1 | Completed, but something changed or differs, and the run lists it: files that changed while a backup read them, restored items another program changed afterwards, or items `verify` found different from their capture. |
+| 1 | Completed, but something changed or differs, and the run lists it: files that changed while a backup read them, items a backup could not read, restored items another program changed afterwards, or items `verify` found different from their capture. |
 | 2 | Failed or refused, including a wrong command line. |
 
 ### Logs

@@ -1,7 +1,9 @@
 // Source-safe-read refusal coverage for native backup metadata preflight and
-// capture (docs/DECISIONS.md D17). The root-only cases use a dropped child
-// identity so O_NOATIME receives a real kernel EPERM rather than a simulated
-// status; ordinary users skip these privilege-dependent fixtures.
+// capture (docs/DECISIONS.md D17): a refused O_NOATIME open is never retried
+// without it, and the item is listed while the backup goes on (D109). The
+// root-only cases use a dropped child identity so O_NOATIME receives a real
+// kernel EPERM rather than a simulated status; ordinary users skip these
+// privilege-dependent fixtures.
 
 #define _GNU_SOURCE
 
@@ -37,6 +39,7 @@ static int skips;
 
 static int has_effective_cap_chown(void);
 static int has_effective_cap_fowner(void);
+static int count_container_names(const char *path, int partial);
 
 static void check_result(int condition, const char *label)
 {
@@ -351,7 +354,7 @@ static int has_effective_cap_fowner(void)
 
 static void test_inventory_race(uid_t uid, gid_t gid)
 {
-    printf(BLUE "::" NC " backup metadata preflight: ownership race becomes a source-safe-read refusal\n");
+    printf(BLUE "::" NC " backup metadata preflight: a file refused after lstat is listed, not read\n");
 
     char base[PATH_MAX], source[PATH_MAX], home[PATH_MAX], target[PATH_MAX];
     char file[PATH_MAX];
@@ -377,13 +380,14 @@ static void test_inventory_race(uid_t uid, gid_t gid)
     char output[32768];
     int result = run_backup_race(target, home, source, file, uid, gid,
                                  output, sizeof(output), &after);
-    check_result(result == 2, "ownership change after lstat rejects the backup");
-    check_result(contains(output, "could not safely read 1 source object(s)"),
-                 "the race is reported as a source-safe-read refusal");
-    check_result(contains(output, "No container was created."),
-                 "the refusal occurs before container reservation");
-    check_result(directory_entry_count(target) == 0,
-                 "the destination has no container after the refusal");
+    check_result(result == 1, "the backup completes with status 1");
+    check_result(contains(output, "Could not read 1 item") &&
+                     contains(output, file) &&
+                     contains(output, "open it without changing its access time"),
+                 "the refused file is listed with the O_NOATIME step");
+    check_result(count_container_names(target, 0) == 1 &&
+                     count_container_names(target, 1) == 0,
+                 "the backup is published");
     check_result(same_times(&before, &after),
                  "the refused O_NOATIME read leaves source atime/mtime unchanged");
 
@@ -392,7 +396,7 @@ static void test_inventory_race(uid_t uid, gid_t gid)
 
 static void test_bounded_examples(uid_t uid, gid_t gid)
 {
-    printf(BLUE "::" NC " backup metadata preflight: refusal examples remain bounded\n");
+    printf(BLUE "::" NC " native backup: every foreign file is counted, examples stay bounded\n");
 
     char base[PATH_MAX], source[PATH_MAX], home[PATH_MAX], target[PATH_MAX];
     make_root(base, sizeof(base));
@@ -414,19 +418,21 @@ static void test_bounded_examples(uid_t uid, gid_t gid)
     char output[65536];
     int result = run_backup_as(target, home, source, uid, gid, 0,
                                output, sizeof(output));
-    check_result(result == 2, "foreign regular files reject the backup");
-    check_result(contains(output, "could not safely read 20 source object(s)"),
-                 "the refusal count includes every foreign file");
-    check_result(count_occurrences(output, "source-read example:") == 16,
-                 "only sixteen source-read examples are printed");
-    check_result(directory_entry_count(target) == 0,
-                 "bounded-example refusal leaves no container");
+    check_result(result == 1, "foreign regular files leave the backup at status 1");
+    check_result(contains(output, "Could not read 20 items"),
+                 "the count includes every foreign file");
+    check_result(count_occurrences(output,
+                                   "without changing its access time") == 8 &&
+                     contains(output, "... and 12 more"),
+                 "only eight examples are printed");
+    check_result(count_container_names(target, 0) == 1,
+                 "the backup is published");
     remove_tree(base);
 }
 
-static void test_uninspected_subtree(uid_t uid, gid_t gid)
+static void test_foreign_folder_listed(uid_t uid, gid_t gid)
 {
-    printf(BLUE "::" NC " backup metadata preflight: foreign directories are unknown subtrees\n");
+    printf(BLUE "::" NC " native backup: a foreign folder is listed once, not its contents\n");
 
     char base[PATH_MAX], source[PATH_MAX], home[PATH_MAX], target[PATH_MAX];
     char foreign_dir[PATH_MAX], hidden_file[PATH_MAX];
@@ -445,15 +451,14 @@ static void test_uninspected_subtree(uid_t uid, gid_t gid)
     char output[32768];
     int result = run_backup_as(target, home, source, uid, gid, 0,
                                output, sizeof(output));
-    check_result(result == 2, "a foreign directory rejects the backup");
-    check_result(contains(output, "could not safely read 1 source object(s)"),
-                 "the foreign directory is a source-read blocker");
-    check_result(contains(output, "1 source subtree(s) could not be inspected"),
-                 "the report distinguishes an unknown subtree");
-    check_result(!contains(output, "2 source object(s)"),
-                 "the report does not invent a descendant object count");
-    check_result(directory_entry_count(target) == 0,
-                 "unknown-subtree refusal leaves no container");
+    check_result(result == 1, "a foreign folder leaves the backup at status 1");
+    check_result(contains(output, "Could not read 1 item") &&
+                     contains(output, foreign_dir),
+                 "the foreign folder is listed");
+    check_result(!contains(output, "hidden"),
+                 "nothing below it is invented");
+    check_result(count_container_names(target, 0) == 1,
+                 "the backup is published");
     remove_tree(base);
 }
 
@@ -487,7 +492,7 @@ static void test_ownership_probe_rejection(uid_t uid, gid_t gid)
                      contains(output, "give the test file the owner") &&
                      contains(output, "No container was created."),
                  "ownership failure names the folder and the step, distinct "
-                 "from source-safe-read refusal");
+                 "from an item that could not be read");
     check_result(directory_entry_count(target) == 0,
                  "ownership-probe refusal leaves no container");
     remove_tree(base);
@@ -541,8 +546,12 @@ static int run_capture_as(const char *source, const char *destination,
                 .nsec_exact = 1,
                 .metadata_preflight_done = 1
             }, source, destination_fd, "entry", &report);
-        int okay = status == BACKUP_CAPTURE_SOURCE_SAFE_READ &&
-                   strcmp(report.failed_source_path, source) == 0;
+        int okay = status == BACKUP_CAPTURE_OK &&
+                   report.failed_items.count == 1 &&
+                   strncmp(report.failed_items.text[0], source,
+                           strlen(source)) == 0 &&
+                   strstr(report.failed_items.text[0],
+                          "without changing its access time") != NULL;
         close(destination_fd);
         _exit(okay ? 0 : 1);
     }
@@ -699,7 +708,7 @@ static int run_backup_capture_race(const char *target, const char *home,
 
 static void test_capture_refusal(uid_t uid, gid_t gid)
 {
-    printf(BLUE "::" NC " native capture: O_NOATIME refusal is typed and identifies its source\n");
+    printf(BLUE "::" NC " native capture: an O_NOATIME refusal lists its source and goes on\n");
 
     char base[PATH_MAX], source[PATH_MAX], source_dir[PATH_MAX];
     char destination[PATH_MAX], destination_dir[PATH_MAX];
@@ -720,13 +729,13 @@ static void test_capture_refusal(uid_t uid, gid_t gid)
         remove_tree(base);
         return;
     }
-    check_result(result == 0, "capture returns the source-safe-read status");
+    check_result(result == 0, "capture lists the refused file and succeeds");
     check_result(directory_entry_count(destination) == 0,
                  "capture refusal creates no destination entry");
 
     result = run_capture_as(source_dir, destination_dir, uid, gid);
     check_result(result == 0,
-                 "directory capture returns the source-safe-read status");
+                 "capture lists the refused folder and succeeds");
     check_result(directory_entry_count(destination_dir) == 0,
                  "directory refusal creates no destination entry");
     remove_tree(base);
@@ -734,7 +743,7 @@ static void test_capture_refusal(uid_t uid, gid_t gid)
 
 static void test_capture_race(uid_t uid, gid_t gid)
 {
-    printf(BLUE "::" NC " native capture: ownership change after inventory is a source-safe-read refusal\n");
+    printf(BLUE "::" NC " native capture: a file refused after the preflight is listed\n");
 
     char base[PATH_MAX], source[PATH_MAX], home[PATH_MAX], target[PATH_MAX];
     char file[PATH_MAX];
@@ -757,17 +766,13 @@ static void test_capture_race(uid_t uid, gid_t gid)
         remove_tree(base);
         return;
     }
-    check_result(result == 2, "capture-time ownership change rejects the backup");
-    check_result(contains(output, "Could not safely read source for"),
-                 "capture reports a distinct source-safe-read refusal");
-    check_result(contains(output, file),
-                 "capture refusal identifies the failed source path");
-    check_result(contains(output, "Incomplete backup kept for resume"),
-                 "capture refusal keeps the existing partial container policy");
-    check_result(count_container_names(target, 1) == 1,
-                 "capture refusal leaves one partial container");
-    check_result(count_container_names(target, 0) == 0,
-                 "capture refusal publishes no final container");
+    check_result(result == 1, "the backup completes with status 1");
+    check_result(contains(output, "Could not read 1 item") &&
+                     contains(output, file),
+                 "capture lists the refused source path");
+    check_result(count_container_names(target, 1) == 0 &&
+                     count_container_names(target, 0) == 1,
+                 "the backup is published");
     remove_tree(base);
 }
 
@@ -790,7 +795,7 @@ int main(void)
 
     test_inventory_race(uid, gid);
     test_bounded_examples(uid, gid);
-    test_uninspected_subtree(uid, gid);
+    test_foreign_folder_listed(uid, gid);
     test_ownership_probe_rejection(uid, gid);
     test_self_owned_tree(uid, gid);
     test_capture_refusal(uid, gid);

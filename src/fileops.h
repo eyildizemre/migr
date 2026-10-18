@@ -73,7 +73,9 @@ int native_inode_map_seed_existing(const CloneContext *ctx,
 int native_hardlink_identity_matches(const struct stat *linked,
                                      const struct stat *reference);
 
-/* Opaque native-capture visited-path set ownership (docs/DECISIONS.md D23). */
+/* Opaque native-capture visited-path set ownership (docs/DECISIONS.md D23).
+ * contains: 1 for a captured item, 2 for one capture could not read and kept
+ * with everything below it (D109), 0 when absent, -1 on error. */
 void *native_visited_create(void);
 void native_visited_free(void *visited);
 int native_visited_contains(const void *visited, const char *root_key,
@@ -184,17 +186,20 @@ void native_restore_estimate_free(NativeRestoreEstimate *estimate);
 /**
  * @brief Result of a native backup capture.
  *
- * BACKUP_CAPTURE_SOURCE_SAFE_READ is distinct from an ordinary I/O failure: the
- * source could not be opened with O_NOATIME and was not retried without it
- * (docs/DECISIONS.md D17).
+ * An item the source would not give up is listed and the capture goes on
+ * (docs/DECISIONS.md D109), so only a failure of the backup itself is
+ * BACKUP_CAPTURE_ERROR.
  */
 typedef enum {
     BACKUP_CAPTURE_ERROR = -1,
     BACKUP_CAPTURE_OK = 0,
-    BACKUP_CAPTURE_SOURCE_SAFE_READ = -2,
     /* Internal to native capture: the source vanished or changed kind and
      * was left out (D63). Never returned to a caller. */
-    BACKUP_CAPTURE_SKIPPED = 1
+    BACKUP_CAPTURE_SKIPPED = 1,
+    /* Internal to native capture: the source could not be read (D109); the
+     * report holds why until the item is listed. Never returned to a
+     * caller. */
+    BACKUP_CAPTURE_ITEM_FAILED = 2
 } BackupCaptureStatus;
 
 typedef void (*BackupProgressCallback)(off_t bytes_copied,
@@ -204,12 +209,15 @@ typedef void (*BackupProgressCallback)(off_t bytes_copied,
 
 /* First portable-capture failure retained for the caller. Source-change
  * failures are semantic D17/D21 refusals and therefore carry no errno;
- * operational failures preserve the syscall error that caused the stop. */
+ * operational failures preserve the syscall error that caused the stop.
+ * An item failure (D109) is held only until the item is listed, and a
+ * failure of the backup replaces it. */
 typedef enum {
     BACKUP_CAPTURE_FAILURE_NONE = 0,
     BACKUP_CAPTURE_FAILURE_OPERATIONAL,
     BACKUP_CAPTURE_FAILURE_SOURCE_CHANGED,
-    BACKUP_CAPTURE_FAILURE_INTERNAL
+    BACKUP_CAPTURE_FAILURE_INTERNAL,
+    BACKUP_CAPTURE_FAILURE_ITEM
 } BackupCaptureFailureKind;
 
 /* A source that changed under a running backup (docs/DECISIONS.md D63). The
@@ -240,8 +248,7 @@ typedef enum {
  * and FIFO.
  * The failure fields keep the first item that failed: its path, the kind,
  * errno (0 when failed_operation says why), and, for native capture, what was
- * being done. A native source-safe-read refusal sets only
- * failed_source_path.
+ * being done.
  */
 typedef struct {
     char failed_source_path[PATH_MAX];
@@ -263,6 +270,9 @@ typedef struct {
     size_t live_state_changes;
     /* Every other source change, by kind (D63). */
     ExampleList source_changes[BACKUP_SOURCE_CHANGE_KINDS];
+    /* Items the source would not give up, left as the backup held them
+     * (D109). */
+    ExampleList failed_items;
     /* An update that filled the destination: the items whose source is
      * gone, removed from the backup to make room (D98). */
     size_t vanished_removed;
@@ -273,6 +283,10 @@ void backup_capture_report_init(BackupCaptureReport *report);
 void backup_capture_report_note_change(BackupCaptureReport *report,
                                        BackupSourceChangeKind kind,
                                        const char *location);
+/* Lists the item failure the report holds and clears it; kept says the
+ * backup still holds a copy of the item (D109). */
+void backup_capture_report_note_failure(BackupCaptureReport *report,
+                                        int kept);
 /* A file read again starts its count over: removes the bytes of the read
  * before from bytes_copied (they stay in the sync accounting, since they were
  * written). */
@@ -342,9 +356,9 @@ void backup_test_fail_content_writes(int error, size_t count);
  *                            several when the payload sits in a folder of data/
  *                            (docs/DECISIONS.md D82), which is created as needed. An
  *                            empty component, ".", or ".." is refused.
- * @return BACKUP_CAPTURE_OK on success, BACKUP_CAPTURE_ERROR on an ordinary
- *         failure, or BACKUP_CAPTURE_SOURCE_SAFE_READ when O_NOATIME access
- *         was refused.
+ * @return BACKUP_CAPTURE_OK on success, items the source would not give up
+ *         included (they are in report->failed_items, D109), or
+ *         BACKUP_CAPTURE_ERROR when the backup itself failed.
  */
 BackupCaptureStatus backup_capture_at_report(
     const CloneContext *ctx, const char *source_path,

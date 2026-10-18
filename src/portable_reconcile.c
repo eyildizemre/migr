@@ -843,13 +843,17 @@ int prepare_collision_relocations(PortableCaptureContext *context,
         relocation_scan_count();
         int current = portable_current_source_contains(
             context->current_source, root->id, owner->logical_path);
-        if (current < 0) {
+        // What the pre-scan could not read stays as the backup holds it.
+        int kept = current == 0
+            ? portable_failed_covers(context, root->id, owner->logical_path)
+            : 0;
+        if (current < 0 || kept < 0) {
             work_list_free(&work);
             return -1;
         }
         if (current == 0) {
-            if (work_list_append(&work, owner,
-                                 RECONCILE_REASON_STALE) != 0) {
+            if (!kept && work_list_append(&work, owner,
+                                          RECONCILE_REASON_STALE) != 0) {
                 work_list_free(&work);
                 return -1;
             }
@@ -1207,6 +1211,10 @@ static int stale_work_list_build(PortableCaptureContext *context,
         } else {
             int visited = visited_contains(context->visited, root->id,
                                            owner->logical_path);
+            // What could not be read stays as the backup holds it (D109).
+            if (visited == 0)
+                visited = portable_failed_covers(context, root->id,
+                                                 owner->logical_path);
             if (visited < 0)
                 return -1;
             stale = visited == 0;
