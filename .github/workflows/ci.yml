@@ -1,11 +1,11 @@
 name: CI
 
 # Every run takes the suite as root, the suite on other distributions,
-# every gate of `make check` in a clean Fedora, and the fault sweep: a fresh
-# machine finds what the developer's own one hides. Pushes that change
-# nothing the build or the tests read (the same files the pre-commit hook
-# looks at) are skipped, and so are tag pushes: a tag names a commit that
-# already ran here from main.
+# every gate of `make check` in a clean Fedora, the fault sweep, and the
+# coverage of all of these: a fresh machine finds what the developer's own
+# one hides. Pushes that change nothing the build or the tests read (the
+# same files the pre-commit hook looks at) are skipped, and so are tag
+# pushes: a tag names a commit that already ran here from main.
 on:
   push:
     branches: ['**']
@@ -88,3 +88,47 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y dosfstools
       - name: make fault-sweep as root
         run: sudo env -u SUDO_UID make fault-sweep
+
+  # Counters add up across the runs on one coverage build: the suite as root
+  # takes the root phases, as the runner's user the unprivileged paths, and
+  # the sweep the failure paths. The per-file table goes to the run's
+  # summary and the annotated source to the coverage artifact.
+  coverage:
+    name: Coverage (Ubuntu)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the tools the root phases and the report use
+        run: |
+          sudo apt-get update && sudo apt-get install -y dosfstools socat
+          pipx install gcovr==8.6
+      - name: Run the suite and the sweep on a coverage build
+        run: |
+          gcc -c -O0 -o "$RUNNER_TEMP/gcov_exit.o" tests/gcov_exit.c
+          flags="-g -O0 --coverage -Wl,--wrap=_exit $RUNNER_TEMP/gcov_exit.o"
+          sudo env -u SUDO_UID make -j4 CFLAGS="$flags" test
+          sudo chown -R "$(id -u):$(id -g)" .
+          make -j4 CFLAGS="$flags" test
+          sudo env -u SUDO_UID make CFLAGS="$flags" fault-sweep
+          sudo chown -R "$(id -u):$(id -g)" .
+      - name: Report
+        run: |
+          mkdir coverage
+          gcovr --root . --filter src/ --merge-mode-functions=separate \
+              --txt coverage/lines.txt --html-details coverage/index.html
+          gcovr --root . --filter src/ --merge-mode-functions=separate \
+              --txt-metric branch --txt coverage/branches.txt
+          {
+            echo '### Lines'
+            echo '```'
+            cat coverage/lines.txt
+            echo '```'
+            echo '### Branches'
+            echo '```'
+            cat coverage/branches.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: coverage
+          path: coverage/

@@ -167,6 +167,14 @@ static int should_fail(const char *name)
         return real args; \
     }
 
+// A coverage build writes its counters through open() at exit; they are
+// not migr's files.
+static int coverage_file(const char *path)
+{
+    size_t length = path != NULL ? strlen(path) : 0;
+    return length > 5 && strcmp(path + length - 5, ".gcda") == 0;
+}
+
 int open(const char *path, int flags, ...)
 {
     mode_t mode = 0;
@@ -178,7 +186,7 @@ int open(const char *path, int flags, ...)
         va_end(arguments);
     }
     REAL(open);
-    if (should_fail("open"))
+    if (!coverage_file(path) && should_fail("open"))
     {
         errno = (flags & O_CREAT) ? ENOSPC : EIO;
         return -1;
@@ -197,7 +205,7 @@ int openat(int dir_fd, const char *path, int flags, ...)
         va_end(arguments);
     }
     REAL(openat);
-    if (should_fail("openat"))
+    if (!coverage_file(path) && should_fail("openat"))
     {
         errno = (flags & O_CREAT) ? ENOSPC : EIO;
         return -1;
