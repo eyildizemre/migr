@@ -107,6 +107,83 @@ static int pair_name(char *buffer, size_t size, unsigned int index,
     return length < 0 || (size_t)length >= size ? -1 : 0;
 }
 
+// Each group links folder i's "a" to folder i+1's "b", so every folder
+// holds both names and a pooled fd for the wrong folder would link to the
+// wrong file. Enough folders to grow the pool several times.
+static void test_groups_across_folders(const char *fixture)
+{
+    enum { FOLDERS = 64 };
+    char source[PATH_MAX], destination[PATH_MAX];
+    if (snprintf(source, sizeof(source), "%s/spread", fixture) < 0 ||
+        snprintf(destination, sizeof(destination), "%s/spread-copy",
+                 fixture) < 0 ||
+        mkdir(source, 0700) != 0 || mkdir(destination, 0700) != 0)
+        fixture_fatal("could not create spread fixture directories");
+    int source_fd = open(source, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (source_fd < 0)
+        fixture_fatal("could not open spread fixture source");
+    for (unsigned int i = 0; i < FOLDERS; i++)
+    {
+        char folder[16];
+        snprintf(folder, sizeof(folder), "dir-%02u", i);
+        if (mkdirat(source_fd, folder, 0700) != 0)
+            fixture_fatal("could not create spread fixture folder");
+    }
+    for (unsigned int i = 0; i < FOLDERS; i++)
+    {
+        char first[32], second[32];
+        snprintf(first, sizeof(first), "dir-%02u/a", i);
+        snprintf(second, sizeof(second), "dir-%02u/b", (i + 1U) % FOLDERS);
+        int fd = openat(source_fd, first,
+                        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        if (fd < 0 || close(fd) != 0 ||
+            linkat(source_fd, first, source_fd, second, 0) != 0)
+            fixture_fatal("could not create spread hardlink group");
+    }
+    if (close(source_fd) != 0)
+        fixture_fatal("could not close spread fixture source");
+
+    void *inode_map = native_inode_map_create();
+    int destination_fd = open(destination, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (inode_map == NULL || destination_fd < 0)
+        fixture_fatal("could not prepare the spread capture");
+    CloneContext context = {
+        .operation = CLONE_BACKUP,
+        .representation = CLONE_NATIVE_TREE,
+        .timestamp_policy_configured = 1,
+        .nsec_exact = 1,
+        .metadata_preflight_done = 1,
+        .inode_map = inode_map,
+        .visited = NULL
+    };
+    check(backup_capture_at(&context, source, destination_fd, "tree") == 0,
+          "native capture of groups spread over 64 folders succeeds");
+
+    int identity_ok = 1;
+    for (unsigned int i = 0; i < FOLDERS; i++)
+    {
+        char first[48], second[48];
+        snprintf(first, sizeof(first), "tree/dir-%02u/a", i);
+        snprintf(second, sizeof(second), "tree/dir-%02u/b",
+                 (i + 1U) % FOLDERS);
+        struct stat first_st, second_st;
+        if (fstatat(destination_fd, first, &first_st,
+                    AT_SYMLINK_NOFOLLOW) != 0 ||
+            fstatat(destination_fd, second, &second_st,
+                    AT_SYMLINK_NOFOLLOW) != 0 ||
+            !native_hardlink_identity_matches(&first_st, &second_st))
+            identity_ok = 0;
+    }
+    check(identity_ok, "every group links across its own two folders");
+    // Which folder first shows each group depends on the walk order.
+    check(native_inode_map_test_dir_fd_count(inode_map) > 16U,
+          "the pooled folder fds outgrow the pool's first table");
+
+    native_inode_map_free(inode_map);
+    if (close(destination_fd) != 0)
+        fixture_fatal("could not close spread fixture destination");
+}
+
 int main(void)
 {
     raise_fd_limit();
@@ -191,6 +268,7 @@ int main(void)
     native_inode_map_free(inode_map);
     if (close(destination_fd) != 0)
         fixture_fatal("could not close scale fixture destination");
+    test_groups_across_folders(fixture);
     remove_tree(fixture);
     printf("native hardlink inode-map scale tests: %d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;
