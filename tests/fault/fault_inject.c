@@ -94,8 +94,9 @@ static void site_of(const char *name, char *out, size_t size)
     int count = backtrace(frames, 32);
     int used = snprintf(out, size, "%s", name);
     int kept = 0;
-    // Frame 0 is site_of, frame 1 is should_fail, frame 2 the wrapper.
-    for (int i = 3; i < count && kept < SITE_FRAMES; i++)
+    // The shim's own frames lie outside the executable, however many the
+    // compiler kept.
+    for (int i = 0; i < count && kept < SITE_FRAMES; i++)
     {
         uintptr_t address = (uintptr_t)frames[i];
         if (address < exe_start || address >= exe_end)
