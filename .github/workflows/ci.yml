@@ -17,6 +17,7 @@ on:
       - 'tests/stubs/**'
       - 'tests/fuzz/corpus/**'
       - '.github/workflows/ci.yml'
+      - '.github/scripts/**'
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -91,8 +92,9 @@ jobs:
 
   # Counters add up across the runs on one coverage build: the suite as root
   # takes the root phases, as the runner's user the unprivileged paths, and
-  # the sweep the failure paths. The per-file table goes to the run's
-  # summary and the annotated source to the coverage artifact.
+  # the sweep the failure paths. A per-file table goes to the run's summary
+  # and the annotated source, which shows the lines missed, to the coverage
+  # artifact.
   coverage:
     name: Coverage (Ubuntu)
     runs-on: ubuntu-24.04
@@ -115,19 +117,10 @@ jobs:
         run: |
           mkdir coverage
           gcovr --root . --filter src/ --merge-mode-functions=separate \
-              --txt coverage/lines.txt --html-details coverage/index.html
-          gcovr --root . --filter src/ --merge-mode-functions=separate \
-              --txt-metric branch --txt coverage/branches.txt
-          {
-            echo '### Lines'
-            echo '```'
-            cat coverage/lines.txt
-            echo '```'
-            echo '### Branches'
-            echo '```'
-            cat coverage/branches.txt
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+              --json-summary coverage/summary.json \
+              --html-details coverage/index.html
+          python3 .github/scripts/coverage_summary.py coverage/summary.json \
+              >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v7
         with:
           name: coverage
