@@ -5268,6 +5268,45 @@ static void test_failed_update_keeps_the_finished_backup(void)
     remove_tree(target);
 }
 
+// A native update that has taken the finished backup and fails before it
+// writes puts the backup back under its finished name.
+static void test_update_failing_after_adoption_gives_the_name_back(void)
+{
+    printf(BLUE "::" NC " production: an update that fails after taking the backup gives it its name back\n");
+
+    char home[PATH_MAX], target[PATH_MAX], file[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_home");
+    setenv("HOME", home, 1);
+    join_path(file, sizeof(file), home, "item");
+    write_file(file, "before");
+    fresh_mkdtemp(target, sizeof(target), "plan_target");
+    char *paths[] = { file, NULL };
+    char output[8192];
+    dry_run = 0;
+
+    int first_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                        output, sizeof(output));
+    char container[PATH_MAX], data[PATH_MAX], moved[PATH_MAX];
+    int found = find_container_dir(target, container, sizeof(container));
+    join_path(data, sizeof(data), container, "data");
+    join_path(moved, sizeof(moved), container, "data.away");
+    check(first_rc == 0 && found && rename(data, moved) == 0,
+          "fixture: a finished backup whose data/ cannot be opened");
+
+    int second_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                         output, sizeof(output));
+    char updating[PATH_MAX + 16];
+    snprintf(updating, sizeof(updating), "%s.updating", container);
+    check(second_rc == 2 &&
+              strstr(output, "Could not open data/ in the backup") != NULL &&
+              access(container, F_OK) == 0 && access(updating, F_OK) != 0 &&
+              count_final_containers(target) == 1,
+          "the backup is finished again under its own name");
+
+    remove_tree(home);
+    remove_tree(target);
+}
+
 // What a native update finds at an item's address came from that item, so a
 // link with another target, another kind of item, or a separate copy of what
 // is now a hardlink is replaced (D72).
@@ -6252,6 +6291,7 @@ int main(void)
     test_open_application_settings_are_backed_up_last(1);
     test_backup_leaves_another_install_alone();
     test_failed_update_keeps_the_finished_backup();
+    test_update_failing_after_adoption_gives_the_name_back();
     test_native_update_replaces_changed_items();
     test_native_update_splits_a_broken_hardlink();
     test_native_preflight_of_a_changing_source();
