@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # Fault-injection sweep: runs each scenario once to list the call sites it
 # reaches (tests/fault/fault_inject.c), then once per site with that call
-# failing. After every failed run:
+# failing. The scenarios back up, update, restore, and verify, and repair a
+# portable backup with one journal record damaged; a backup and its restore
+# also run with the scope migr picks from HOME. After every failed run:
 #   - migr ended with 0, 1, or 2, not a crash or a hang;
-#   - what the run only reads is unchanged (the source of a backup, the
-#     backup a restore reads);
+#   - what the run only reads is unchanged (the source of a backup or a
+#     verify, the backup a restore or a repair reads);
 #   - a run that ended with 0 left a whole result;
 #   - the same command run again without a fault finishes, and its result
-#     is whole: the backup verifies against the source, the restored folder
+#     is whole: the backup or the repaired copy verifies, the restored home
 #     equals the source.
 # The portable scenarios need root to mount a vfat image and run only then.
 #
@@ -37,13 +39,19 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# A VS Code installed on the host would write its logs into HOME; this one
+# lists one extension and writes nothing.
+mkdir "$WORK/bin"
+printf '#!/bin/sh\necho ms-python.python@2026.1.0\n' > "$WORK/bin/code"
+chmod +x "$WORK/bin/code"
+
 failures=0
 
-# A folder with each kind of item a backup keeps; a portable one keeps no
-# FIFO.
+# A folder with each kind of item a backup keeps, and names that differ only
+# in case, which vfat takes for one; a portable backup keeps no FIFO.
 make_source() {
     local scenario="$1" notes="$2/notes"
-    mkdir -p "$notes/sub/deep"
+    mkdir -p "$notes/sub/deep" "$notes/Dir" "$notes/dir"
     echo "alpha" > "$notes/a.txt"
     echo "beta" > "$notes/sub/b.txt"
     echo "gamma" > "$notes/sub/deep/c.txt"
@@ -51,6 +59,10 @@ make_source() {
     head -c 200000 /dev/urandom > "$notes/large.bin"
     ln -s a.txt "$notes/link"
     ln "$notes/a.txt" "$notes/hard"
+    echo "upper" > "$notes/Case.txt"
+    echo "lower" > "$notes/case.txt"
+    echo "one" > "$notes/Dir/x"
+    echo "two" > "$notes/dir/x"
     case "$scenario" in
         native-*) mkfifo "$notes/pipe" ;;
     esac
@@ -62,26 +74,30 @@ make_source() {
 # content.
 snapshot() {
     (cd "$1" &&
-     find . -path ./logs -prune -o -type d -printf '%p|d|%m|%T@\n' -o \
+     find . -mindepth 1 -path ./logs -prune -o \
+         -type d -printf '%p|d|%m|%T@\n' -o \
          -printf '%p|%y|%m|%T@|%s|%n|%l\n' | LC_ALL=C sort &&
-     find . -path ./logs -prune -o -type f -print0 | LC_ALL=C sort -z |
-         xargs -0 -r md5sum)
+     find . -mindepth 1 -path ./logs -prune -o -type f -print0 |
+         LC_ALL=C sort -z | xargs -0 -r md5sum)
 }
 
-container_of() {
+# The finished backups in a folder, one per line.
+containers() {
     local found
     for found in "$1"/migr-*; do
         case "$found" in
             *.partial | *.updating) ;;
-            *) [ -d "$found" ] && { echo "$found"; return; } ;;
+            *) [ -d "$found" ] && echo "$found" ;;
         esac
     done
 }
 
 # Each scenario has its folder D: D/home is HOME, D/answer migr's input.
-# A backup or update writes D/target (or the vfat mount's target), copied
-# from its template before each run; a restore writes D/home, emptied
-# before each run, from the backup in the template.
+# A backup, an update, or a verify, which lists the files it finds damaged
+# in the backup, writes D/target (or the vfat mount's target), copied from
+# its template before each run; a repair writes its copy there, emptied
+# before each run. A restore writes D/home, emptied before each run. A
+# restore and a repair read the backup in the template.
 
 target_dir() {
     case "$1" in
@@ -101,33 +117,64 @@ template_dir() {
 run_migr() {
     local dir="$1"
     shift
-    HOME="$dir/home" PATH="$STUBS:$PATH" timeout 60 \
+    HOME="$dir/home" PATH="$WORK/bin:$STUBS:$PATH" timeout 60 \
         env ${PRELOAD:+LD_PRELOAD="$PRELOAD"} "$MIGR" "$@" \
         < "$dir/answer" > "$dir/output" 2>&1
 }
 
+# A scoped backup takes what migr picks from HOME, the others one folder.
+backup_into() {
+    local scenario="$1" dir="$2" target="$3"
+    case "$scenario" in
+        *-scoped-*) run_migr "$dir" backup "$target" ;;
+        *) run_migr "$dir" backup "$target" "$dir/home/notes" ;;
+    esac
+}
+
 setup() {
-    local scenario="$1" dir="$2" template
+    local scenario="$1" dir="$2" template journal record offset
     template=$(template_dir "$scenario" "$dir")
     rm -rf "$dir" "$template"
     mkdir -p "$dir/home" "$template"
     echo y > "$dir/answer"
-    make_source "$scenario" "$dir/home"
+    case "$scenario" in
+        *-scoped-*)
+            make_source "$scenario" "$dir/home/Documents"
+            mkdir -m 700 "$dir/home/.ssh"
+            echo "Host *" > "$dir/home/.ssh/config"
+            echo "alias ll='ls -l'" > "$dir/home/.bashrc"
+            ;;
+        *) make_source "$scenario" "$dir/home" ;;
+    esac
     # A source changed in the second its backup is taken is not compared.
     sleep 1
     case "$scenario" in
-        *-update | *-restore)
-            run_migr "$dir" backup "$template" "$dir/home/notes" || return
-            ;;
+        *-backup) ;;
+        *) backup_into "$scenario" "$dir" "$template" || return ;;
     esac
     case "$scenario" in
         *-update)
             echo "alpha, changed" > "$dir/home/notes/a.txt"
             rm "$dir/home/notes/sub/b.txt"
             echo "new" > "$dir/home/notes/sub/new.txt"
+            echo "upper again" > "$dir/home/notes/CASE.txt"
             sleep 1
             ;;
-        *-restore) mv "$dir/home/notes" "$dir/expected" ;;
+        *-restore)
+            mv "$dir/home" "$dir/expected"
+            # Without its lists of packages and Flatpak applications, a
+            # restore neither installs software nor waits for a network.
+            rm -f "$(containers "$template")"/{packages,flatpak-apps}.txt
+            ;;
+        *-repair)
+            # The kind of one record no longer parses.
+            journal="$(containers "$template")/sidecar.migr"
+            record='ENTRY\x00[^\x00]*\x00sub/b\.txt\x00b\.txt\x00\x00\K'
+            offset=$(grep -obaP "${record}regular" "$journal" | cut -d: -f1)
+            [ -n "$offset" ] || return
+            printf '#' | dd of="$journal" bs=1 seek="$offset" conv=notrunc \
+                status=none
+            ;;
     esac
 }
 
@@ -137,6 +184,10 @@ fresh() {
         *-restore)
             rm -rf "${dir:?}/home"
             mkdir "$dir/home"
+            ;;
+        *-repair)
+            rm -rf "$(target_dir "$scenario" "$dir")"
+            mkdir "$(target_dir "$scenario" "$dir")"
             ;;
         native-*)
             rm -rf "$dir/target"
@@ -151,38 +202,47 @@ fresh() {
 }
 
 act() {
-    local scenario="$1" dir="$2"
+    local scenario="$1" dir="$2" backup target
+    backup=$(containers "$(template_dir "$scenario" "$dir")")
+    target=$(target_dir "$scenario" "$dir")
     case "$scenario" in
-        *-restore)
-            run_migr "$dir" restore \
-                "$(container_of "$(template_dir "$scenario" "$dir")")"
-            ;;
-        *)
-            run_migr "$dir" backup "$(target_dir "$scenario" "$dir")" \
-                "$dir/home/notes"
-            ;;
+        *-restore) run_migr "$dir" restore "$backup" ;;
+        *-verify) run_migr "$dir" verify "$(containers "$target")" ;;
+        *-repair) run_migr "$dir" repair "$backup" "$target" ;;
+        *) backup_into "$scenario" "$dir" "$target" ;;
     esac
 }
 
 read_only() {
     local scenario="$1" dir="$2"
     case "$scenario" in
-        *-restore) container_of "$(template_dir "$scenario" "$dir")" ;;
+        *-restore | *-repair)
+            containers "$(template_dir "$scenario" "$dir")"
+            ;;
+        *-scoped-*) echo "$dir/home" ;;
         *) echo "$dir/home/notes" ;;
     esac
 }
 
+# Whether a run left a whole result; a verify's is the status it ended with.
 whole() {
-    local scenario="$1" dir="$2"
+    local scenario="$1" dir="$2" backup verified=0
     case "$scenario" in
+        *-verify) return 0 ;;
         *-restore)
-            [ "$(snapshot "$dir/expected")" = \
-              "$(snapshot "$dir/home/notes")" ]
+            # A failed restore keeps its log in HOME, in folders the source
+            # does not have.
+            rm -rf "$dir/home/.local/state/migr"
+            rmdir "$dir/home/.local/state" "$dir/home/.local" 2>/dev/null
+            [ "$(snapshot "$dir/expected")" = "$(snapshot "$dir/home")" ]
             ;;
         *)
-            HOME="$dir/home" "$MIGR" verify \
-                "$(container_of "$(target_dir "$scenario" "$dir")")" \
-                > "$dir/verify" 2>&1
+            while IFS= read -r backup; do
+                HOME="$dir/home" "$MIGR" verify "$backup" \
+                    > "$dir/verify" 2>&1 || return
+                verified=1
+            done < <(containers "$(target_dir "$scenario" "$dir")")
+            [ "$verified" -eq 1 ]
             ;;
     esac
 }
@@ -256,9 +316,12 @@ mount_vfat() {
 
 scenarios=("$@")
 if [ ${#scenarios[@]} -eq 0 ]; then
-    scenarios=(native-backup native-update native-restore)
+    scenarios=(native-backup native-update native-restore native-verify
+               native-scoped-backup native-scoped-restore)
     if [ "$(id -u)" -eq 0 ] && command -v mkfs.vfat > /dev/null; then
-        scenarios+=(portable-backup portable-update portable-restore)
+        scenarios+=(portable-backup portable-update portable-restore
+                    portable-verify portable-repair portable-scoped-backup
+                    portable-scoped-restore)
     else
         echo "Portable scenarios skipped: they need root and mkfs.vfat."
     fi
